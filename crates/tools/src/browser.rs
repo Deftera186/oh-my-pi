@@ -77,37 +77,37 @@ pub enum RunOperation {
 #[serde(deny_unknown_fields)]
 pub struct Params {
 	/// Lifecycle action.
-	pub action:    Action,
+	pub action:                  Action,
 	/// Stable tab name; defaults to `main`.
-	pub name:      Option<Str>,
+	pub name:                    Option<Str>,
 	/// Initial or navigated URL.
-	pub url:       Option<Str>,
+	pub url:                     Option<Str>,
 	/// Typed operation for `run`; defaults to `evaluate` when `code` is present.
-	pub operation: Option<RunOperation>,
+	pub operation:               Option<RunOperation>,
 	/// JavaScript evaluated by `run`.
-	pub code:      Option<Str>,
+	pub code:                    Option<Str>,
 	/// Primary selector accepted by the embedded automation engine.
-	pub selector:  Option<Str>,
+	pub selector:                Option<Str>,
 	/// Drag destination selector.
-	pub target:    Option<Str>,
+	pub target:                  Option<Str>,
 	/// Text/value/key/URL-pattern argument.
-	pub value:     Option<Str>,
+	pub value:                   Option<Str>,
 	/// Multiple select values or upload paths.
-	pub values:    Option<Vec<Str>>,
+	pub values:                  Option<Vec<Str>>,
 	/// Viewport width in CSS pixels.
-	pub width:     Option<u32>,
+	pub width:                   Option<u32>,
 	/// Viewport height in CSS pixels.
-	pub height:    Option<u32>,
+	pub height:                  Option<u32>,
 	/// Device scale factor.
-	pub scale:     Option<f64>,
+	pub scale:                   Option<f64>,
 	/// Bounded operation timeout in seconds.
-	pub timeout:   Option<u64>,
+	pub timeout:                 Option<u64>,
 	/// Close every managed tab.
 	#[serde(default)]
-	pub all:       bool,
+	pub all:                     bool,
 	/// Capture the full page rather than the viewport.
 	#[serde(default)]
-	pub full_page: bool,
+	pub full_page:               bool,
 	/// Private host-control signal used by `/browser` after persisting a mode
 	/// change. This is intentionally absent from the model-facing schema.
 	#[serde(default)]

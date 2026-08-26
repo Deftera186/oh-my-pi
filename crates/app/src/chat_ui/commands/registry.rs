@@ -343,12 +343,9 @@ impl CommandRoster {
 				let aliases: SmallVec<&str, 2> = declaration.aliases.iter().map(Str::as_str).collect();
 				let description =
 					describe(declaration).unwrap_or_else(|| declaration.description.clone());
-				let mut command = omp_tui::Command::new(
-					declaration.name.as_str(),
-					description.as_str(),
-					&aliases,
-				)
-				.with_icon(completion_icon(declaration));
+				let mut command =
+					omp_tui::Command::new(declaration.name.as_str(), description.as_str(), &aliases)
+						.with_icon(completion_icon(declaration));
 				if !declaration.hints.is_empty() {
 					let hints: Vec<_> = declaration
 						.hints

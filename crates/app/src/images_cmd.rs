@@ -1,4 +1,5 @@
-//! Image blob-store inspection, integrity probing, and reachability reclamation.
+//! Image blob-store inspection, integrity probing, and reachability
+//! reclamation.
 
 use std::{
 	fs,
@@ -27,7 +28,8 @@ struct Inventory {
 	temporary_bytes: u64,
 }
 
-/// Runs one image blob-store operation against the profile's authoritative store.
+/// Runs one image blob-store operation against the profile's authoritative
+/// store.
 pub fn run(args: ImagesArgs) -> miette::Result<()> {
 	if args.timeout == Some(0) {
 		return Err(miette!("--timeout must be a positive integer"));
@@ -61,11 +63,7 @@ fn status(store: &BlobStore, json_output: bool) -> miette::Result<()> {
 		println!("Image backends: content-addressed");
 		println!("Enabled: yes");
 		println!("Image blob store: {}", store.root().display());
-		println!(
-			"Blobs: {} ({})",
-			inventory.blobs.len(),
-			format_bytes(inventory.bytes)
-		);
+		println!("Blobs: {} ({})", inventory.blobs.len(), format_bytes(inventory.bytes));
 		println!(
 			"Temporary files: {} ({})",
 			inventory.temporary_count,
@@ -130,7 +128,10 @@ fn doctor(store: &BlobStore, json_output: bool) -> miette::Result<()> {
 	if json_output {
 		print_json(&report)?;
 	} else {
-		for check in report["checks"].as_array().expect("doctor checks are an array") {
+		for check in report["checks"]
+			.as_array()
+			.expect("doctor checks are an array")
+		{
 			println!(
 				"[{}] {}: {}",
 				check["severity"]
@@ -144,13 +145,13 @@ fn doctor(store: &BlobStore, json_output: bool) -> miette::Result<()> {
 		for path in &inventory.malformed {
 			println!("Malformed: {}", path.display());
 		}
-		for hash in report["corruptBlobs"].as_array().expect("corrupt blobs are an array") {
+		for hash in report["corruptBlobs"]
+			.as_array()
+			.expect("corrupt blobs are an array")
+		{
 			println!("Corrupt: {}", hash.as_str().expect("corrupt hash is text"));
 		}
-		println!(
-			"Image diagnostics {}.",
-			if healthy { "passed" } else { "found errors" }
-		);
+		println!("Image diagnostics {}.", if healthy { "passed" } else { "found errors" });
 	}
 	if healthy {
 		Ok(())
@@ -185,7 +186,8 @@ fn probe(store: &BlobStore, timeout_seconds: Option<u64>, json_output: bool) -> 
 	let ok = result.into_diagnostic()?;
 	cleanup.into_diagnostic()?;
 	let elapsed = started.elapsed();
-	let within_timeout = timeout_seconds.is_none_or(|seconds| elapsed < Duration::from_secs(seconds));
+	let within_timeout =
+		timeout_seconds.is_none_or(|seconds| elapsed < Duration::from_secs(seconds));
 	let passed = ok && within_timeout;
 	let detail = if !ok {
 		"Blob write or verified read returned inconsistent data"
@@ -233,16 +235,16 @@ fn purge(store: &BlobStore, apply: bool, all: bool, json_output: bool) -> miette
 			print_json(&report)?;
 		} else {
 			println!("Image purge dry-run; pass --apply to reclaim unreachable blobs.");
-			println!(
-				"Stored blobs: {} ({})",
-				inventory.blobs.len(),
-				format_bytes(inventory.bytes)
-			);
+			println!("Stored blobs: {} ({})", inventory.blobs.len(), format_bytes(inventory.bytes));
 		}
 		return Ok(());
 	}
 	let roots = gc::SessionRoots::discover(store, &[]).into_diagnostic()?;
-	let grace = if all { Duration::ZERO } else { DEFAULT_PURGE_GRACE };
+	let grace = if all {
+		Duration::ZERO
+	} else {
+		DEFAULT_PURGE_GRACE
+	};
 	let sweep = gc::sweep(store, &roots, grace).into_diagnostic()?;
 	let report = json!({
 		"action": "purge",

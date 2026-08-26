@@ -68,18 +68,13 @@ mod tests {
 
 	#[test]
 	fn snapshot_projects_browser_table() {
-		let snapshot = SettingsSnapshot::isolated(BrowserSettings {
-			enabled:  false,
-			headless: false,
-		})
-		.expect("browser settings snapshot");
+		let snapshot =
+			SettingsSnapshot::isolated(BrowserSettings { enabled: false, headless: false })
+				.expect("browser settings snapshot");
 		let projected = snapshot
 			.project::<BrowserSettings>()
 			.expect("browser settings projection");
-		assert_eq!(
-			projected.get(),
-			&BrowserSettings { enabled: false, headless: false }
-		);
+		assert_eq!(projected.get(), &BrowserSettings { enabled: false, headless: false });
 	}
 
 	#[test]
@@ -89,7 +84,11 @@ mod tests {
 			.find(|domain| domain.name == "browser")
 			.expect("browser domain");
 		assert_eq!(
-			domain.fields.iter().map(|field| field.path).collect::<Vec<_>>(),
+			domain
+				.fields
+				.iter()
+				.map(|field| field.path)
+				.collect::<Vec<_>>(),
 			vec!["browser.enabled", "browser.headless"]
 		);
 	}

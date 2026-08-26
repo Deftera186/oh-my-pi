@@ -44,21 +44,21 @@ pub(crate) async fn restart_for_mode_change(
 		return Ok(());
 	}
 	let params = Params {
-		action: Action::Close,
-		name: None,
-		url: None,
-		operation: None,
-		code: None,
-		selector: None,
-		target: None,
-		value: None,
-		values: None,
-		width: None,
-		height: None,
-		scale: None,
-		timeout: None,
-		all: true,
-		full_page: false,
+		action:                  Action::Close,
+		name:                    None,
+		url:                     None,
+		operation:               None,
+		code:                    None,
+		selector:                None,
+		target:                  None,
+		value:                   None,
+		values:                  None,
+		width:                   None,
+		height:                  None,
+		scale:                   None,
+		timeout:                 None,
+		all:                     true,
+		full_page:               false,
 		restart_for_mode_change: Some(headless),
 	};
 	let raw = serde_json::to_string(&params).into_diagnostic()?;
@@ -98,18 +98,9 @@ mod tests {
 	#[test]
 	fn parses_toggle_and_mode_aliases() {
 		assert_eq!(parse_browser("").expect("toggle"), BrowserRequest::Toggle);
-		assert_eq!(
-			parse_browser("hidden").expect("hidden alias"),
-			BrowserRequest::Headless
-		);
-		assert_eq!(
-			parse_browser("SHOW").expect("visible alias"),
-			BrowserRequest::Visible
-		);
-		assert_eq!(
-			parse_browser("headful").expect("headful alias"),
-			BrowserRequest::Visible
-		);
+		assert_eq!(parse_browser("hidden").expect("hidden alias"), BrowserRequest::Headless);
+		assert_eq!(parse_browser("SHOW").expect("visible alias"), BrowserRequest::Visible);
+		assert_eq!(parse_browser("headful").expect("headful alias"), BrowserRequest::Visible);
 	}
 
 	#[test]
@@ -132,10 +123,7 @@ mod tests {
 				.iter()
 				.map(|hint| (hint.value.as_str(), hint.description.as_str()))
 				.collect::<Vec<_>>(),
-			vec![
-				("headless", "Switch to headless mode"),
-				("visible", "Switch to visible mode"),
-			]
+			vec![("headless", "Switch to headless mode"), ("visible", "Switch to visible mode"),]
 		);
 	}
 

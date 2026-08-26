@@ -611,7 +611,7 @@ pub(super) fn declaration(
 			.iter()
 			.copied()
 			.map(|(value, description)| ArgumentHint {
-				value: Str::new_static(value),
+				value:       Str::new_static(value),
 				description: Str::new_static(description),
 			})
 			.collect(),

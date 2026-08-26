@@ -904,8 +904,11 @@ pub enum MarketplaceUpdateMode {
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum CredentialKeySourceSetting {
-	/// Refuse durable secret reads and writes.
+	/// Owner-only local file when the process is interactive; otherwise fail
+	/// closed.
 	#[default]
+	Auto,
+	/// Refuse durable secret reads and writes.
 	Unavailable,
 	/// Use an owner-only file beside the credential database.
 	LocalFile,
@@ -960,7 +963,7 @@ pub struct LifecycleSettings {
 impl Default for LifecycleSettings {
 	fn default() -> Self {
 		Self {
-			credential_key_source:   CredentialKeySourceSetting::Unavailable,
+			credential_key_source:   CredentialKeySourceSetting::Auto,
 			auth_broker_gateway:     None,
 			autoqa_reporting:        false,
 			codex_reset_auto_redeem: false,
@@ -989,8 +992,9 @@ impl SettingsDomain for LifecycleSettings {
 		FieldDescriptor {
 			path:        "lifecycle.credentialKeySource",
 			label:       "Credential Key Source",
-			description: "Global durable credential encryption source; unavailable fails closed.",
-			kind:        SettingKind::Enum(&["unavailable", "local-file", "os-keychain"]),
+			description: "Global durable credential encryption source; auto uses an owner-only local \
+			              file for interactive processes and otherwise fails closed.",
+			kind:        SettingKind::Enum(&["auto", "unavailable", "local-file", "os-keychain"]),
 			scopes:      GLOBAL,
 			order:       5,
 			options:     None,

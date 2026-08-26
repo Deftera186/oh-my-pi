@@ -2501,11 +2501,12 @@ impl Chat {
 	}
 
 	/// Appends an error transcript notice.
+	///
+	/// The transcript entry is the sole surface for one-off errors; the pinned
+	/// live-chrome status line is reserved for turn failures delivered via
+	/// [`Self::push_transcript_frame`], which own a retained diagnostic card.
 	pub fn push_error(&mut self, text: impl IntoStr) {
-		let text = text.into_str();
-		self.pinned_error = Some(text.clone());
-		self.enqueue_final(Entry::Notice { text, error: true });
-		self.bump_live();
+		self.enqueue_final(Entry::Notice { text: text.into_str(), error: true });
 	}
 
 	/// Applies an exact-key retained frame, enhancing known revisions and
@@ -5127,7 +5128,11 @@ mod tests {
 	#[test]
 	fn live_chrome_draws_error_download_and_celebration() {
 		let mut chat = Chat::new(&ctx());
-		chat.push_error("pinned failure");
+		chat.push_transcript_frame(TranscriptFrame {
+			kind:   TranscriptFrameKind::Error,
+			title:  Str::new_static("pinned failure"),
+			detail: None,
+		});
 		chat.download_activity = Some(DownloadActivity::new(
 			ModelDownloadProgress {
 				label:      "weights".into(),

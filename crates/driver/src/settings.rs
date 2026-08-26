@@ -460,18 +460,6 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		condition:   None,
 		secret:      false,
 	},
-	omp_settings::FieldDescriptor {
-		path:        "updates.checkOnStartup",
-		label:       "Startup update check",
-		description: "Read the signed core release registry in the background at interactive \
-		              startup.",
-		kind:        omp_settings::SettingKind::Boolean,
-		scopes:      PERSISTED_SCOPES,
-		order:       88,
-		options:     None,
-		condition:   None,
-		secret:      false,
-	},
 ];
 
 const fn default_true() -> bool {
@@ -703,20 +691,6 @@ impl Default for ExportSettings {
 		Self { share_redact_secrets: true }
 	}
 }
-/// Read-only core release-notice preferences.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UpdateSettings {
-	/// Whether interactive startup may inspect locally configured signed release
-	/// metadata in a background thread.
-	#[serde(default = "default_true", rename = "checkOnStartup")]
-	pub check_on_startup: bool,
-}
-
-impl Default for UpdateSettings {
-	fn default() -> Self {
-		Self { check_on_startup: true }
-	}
-}
 /// Live collaboration identity and endpoint settings.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollabSettings {
@@ -909,9 +883,6 @@ pub struct Settings {
 	/// Irreversible export-boundary policy.
 	#[serde(default)]
 	pub export:            ExportSettings,
-	/// Read-only signed core release checks.
-	#[serde(default)]
-	pub updates:           UpdateSettings,
 	/// Live collaboration endpoints and participant identity.
 	#[serde(default)]
 	pub collab:            CollabSettings,

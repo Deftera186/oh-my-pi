@@ -75,8 +75,7 @@ use crate::{
 	chat_ui::commands::{
 		BrowserRequest, CommandFuture, CommandResult, CommandRoster, ConfigCommandHost,
 		ConsumedResult, FlowCommandHost, McpRequest, ModelCommandHost, ParsedFlags,
-		SessionCommandHost,
-		SessionRequest, ShellCommandHost, WorkspaceRequest,
+		SessionCommandHost, SessionRequest, ShellCommandHost, WorkspaceRequest,
 	},
 	cli::{RpcArgs, turn_id},
 };
@@ -3412,18 +3411,13 @@ impl FlowCommandHost for RpcCommandHost {
 			};
 			runtime
 				.settings_manager
-				.set(
-					MutationScope::Project,
-					"browser.headless",
-					if next { "true" } else { "false" },
-				)
+				.set(MutationScope::Project, "browser.headless", if next { "true" } else { "false" })
 				.await
 				.into_diagnostic()?;
 			let registry = runtime.headless.lock().await.session.tool_registry();
 			let mode = if next { "headless" } else { "visible" };
 			let status =
-				match crate::chat_ui::commands::browser::restart_for_mode_change(&registry, next)
-					.await
+				match crate::chat_ui::commands::browser::restart_for_mode_change(&registry, next).await
 				{
 					Ok(()) => sf!("Browser mode: {mode}"),
 					Err(error) => sf!("Browser mode set to {mode}, but restart failed: {error}"),

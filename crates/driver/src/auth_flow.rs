@@ -12,7 +12,7 @@ use omp_inference::call::AuthInput;
 /// Explanation shown when encrypted credential storage is unavailable.
 pub const CREDENTIAL_STORAGE_LOCKED_MESSAGE: &str =
 	"Credential storage is locked. Run interactively for owner-only local storage, or set \
-	 OMP_LLM_KEYCHAIN=1 to use the OS keychain.";
+	 OMP_LLM_KEY_SOURCE=os-keychain to use the OS keychain.";
 
 /// Kind of caller response requested by an authentication provider.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

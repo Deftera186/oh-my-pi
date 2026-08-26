@@ -7,6 +7,7 @@ use std::{
 	fs,
 	future::Future,
 	io,
+	io::IsTerminal as _,
 	path::Path,
 	sync,
 	sync::{Arc, LazyLock},
@@ -179,17 +180,32 @@ pub enum CredentialKeyMode {
 
 impl CredentialKeyMode {
 	/// Selects the key source from an explicit environment override followed by
-	/// the typed settings value. Missing or malformed values fail closed.
+	/// the typed settings value. Malformed values fail closed; the `auto`
+	/// default uses an owner-only local key file (pi's filesystem security
+	/// boundary) for interactive processes and fails closed for unattended
+	/// ones.
 	pub fn from_configuration(configured: CredentialKeySourceSetting) -> Self {
-		Self::resolve(env::var(KEY_SOURCE_ENV).ok().as_deref(), configured)
+		let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+		Self::resolve(env::var(KEY_SOURCE_ENV).ok().as_deref(), configured, interactive)
 	}
 
-	fn resolve(explicit: Option<&str>, configured: CredentialKeySourceSetting) -> Self {
+	fn resolve(
+		explicit: Option<&str>,
+		configured: CredentialKeySourceSetting,
+		interactive: bool,
+	) -> Self {
+		let auto = if interactive {
+			Self::LocalFile
+		} else {
+			Self::Unavailable
+		};
 		match explicit.map(str::trim) {
 			Some("local-file") => Self::LocalFile,
 			Some("os-keychain") => Self::OsKeychain,
+			Some("auto") => auto,
 			Some("unavailable") | Some(_) => Self::Unavailable,
 			None => match configured {
+				CredentialKeySourceSetting::Auto => auto,
 				CredentialKeySourceSetting::Unavailable => Self::Unavailable,
 				CredentialKeySourceSetting::LocalFile => Self::LocalFile,
 				CredentialKeySourceSetting::OsKeychain => Self::OsKeychain,
@@ -975,31 +991,54 @@ mod tests {
 	#[test]
 	fn credential_key_mode_requires_deliberate_configuration() {
 		assert_eq!(
-			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::Unavailable),
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::Unavailable, true),
 			CredentialKeyMode::Unavailable,
 		);
 		assert_eq!(
-			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::LocalFile),
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::LocalFile, false),
 			CredentialKeyMode::LocalFile,
 		);
 		assert_eq!(
-			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::OsKeychain),
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::OsKeychain, false),
 			CredentialKeyMode::OsKeychain,
+		);
+	}
+	#[test]
+	fn auto_uses_a_local_key_file_only_for_interactive_processes() {
+		assert_eq!(
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::Auto, true),
+			CredentialKeyMode::LocalFile,
+		);
+		assert_eq!(
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::Auto, false),
+			CredentialKeyMode::Unavailable,
+		);
+		assert_eq!(
+			CredentialKeyMode::resolve(Some("auto"), CredentialKeySourceSetting::Unavailable, true),
+			CredentialKeyMode::LocalFile,
 		);
 	}
 
 	#[test]
 	fn explicit_environment_selection_precedes_config_and_invalid_values_fail_closed() {
 		assert_eq!(
-			CredentialKeyMode::resolve(Some("local-file"), CredentialKeySourceSetting::Unavailable,),
+			CredentialKeyMode::resolve(
+				Some("local-file"),
+				CredentialKeySourceSetting::Unavailable,
+				false,
+			),
 			CredentialKeyMode::LocalFile,
 		);
 		assert_eq!(
-			CredentialKeyMode::resolve(Some("os-keychain"), CredentialKeySourceSetting::LocalFile,),
+			CredentialKeyMode::resolve(
+				Some("os-keychain"),
+				CredentialKeySourceSetting::LocalFile,
+				false,
+			),
 			CredentialKeyMode::OsKeychain,
 		);
 		assert_eq!(
-			CredentialKeyMode::resolve(Some("typo"), CredentialKeySourceSetting::LocalFile),
+			CredentialKeyMode::resolve(Some("typo"), CredentialKeySourceSetting::LocalFile, true),
 			CredentialKeyMode::Unavailable,
 		);
 	}

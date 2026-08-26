@@ -609,6 +609,9 @@ async fn run_chat_login(
 		);
 	};
 	let mut awaiting_prompt = false;
+	// Device polling emits `Waiting` every poll tick; the transcript notice is
+	// append-only, so forward it once per login.
+	let mut waiting_notified = false;
 	loop {
 		tokio::select! {
 			event = session.events.recv_async() => {
@@ -657,6 +660,10 @@ async fn run_chat_login(
 						awaiting_prompt = true;
 					},
 					AuthEvent::Waiting => {
+						if waiting_notified {
+							continue;
+						}
+						waiting_notified = true;
 						events
 							.send(ChatAuthEvent::Notice(sf!(
 								"Waiting for `{provider}` authorization…"

@@ -19,14 +19,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 
 enum Request {
-	Execute {
-		params: Params,
-		reply:  flume::Sender<Result<Payload, Fault>>,
-	},
-	Restart {
-		headless: bool,
-		reply:    flume::Sender<Result<(), Fault>>,
-	},
+	Execute { params: Params, reply: flume::Sender<Result<Payload, Fault>> },
+	Restart { headless: bool, reply: flume::Sender<Result<(), Fault>> },
 }
 
 /// Process-local browser supervisor. One actor owns every non-`Send` webview

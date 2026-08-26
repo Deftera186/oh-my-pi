@@ -512,7 +512,8 @@ pub struct ImagesArgs {
 	/// Apply destructive purge operations; omission is a dry run.
 	#[arg(long)]
 	pub apply:   bool,
-	/// Purge all unreachable blobs, including those inside the normal grace period.
+	/// Purge all unreachable blobs, including those inside the normal grace
+	/// period.
 	#[arg(long)]
 	pub all:     bool,
 	/// Override the profile data directory containing the blob store.
@@ -524,9 +525,7 @@ pub struct ImagesArgs {
 }
 
 /// Image blob-store operation.
-#[derive(
-	Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, strum::IntoStaticStr,
-)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum ImagesAction {
@@ -2563,11 +2562,7 @@ async fn run_interactive_chat(
 	Box::pin(chat_cmd::run(args, start, presentation)).await
 }
 
-fn extension_shorthand_args(
-	command: ExtCommand,
-	scope: ExtScope,
-	json: bool,
-) -> ExtArgs {
+fn extension_shorthand_args(command: ExtCommand, scope: ExtScope, json: bool) -> ExtArgs {
 	ExtArgs {
 		project: ".".into(),
 		data_dir: None,
@@ -2613,7 +2608,10 @@ fn local_install_path(target: &str) -> PathBuf {
 	if target == "~" {
 		return omp_core::dirs::home_dir().unwrap_or_else(|| PathBuf::from(target));
 	}
-	if let Some(relative) = target.strip_prefix("~/").or_else(|| target.strip_prefix("~\\")) {
+	if let Some(relative) = target
+		.strip_prefix("~/")
+		.or_else(|| target.strip_prefix("~\\"))
+	{
 		if let Some(home) = omp_core::dirs::home_dir() {
 			return home.join(relative);
 		}
@@ -2627,10 +2625,7 @@ async fn install_shorthand(args: InstallArgs) -> miette::Result<()> {
 		if looks_like_local_install_target(target.as_str()) {
 			if args.dry_run {
 				if args.json {
-					println!(
-						"{}",
-						serde_json::json!({"action":"link","target":target,"applied":false})
-					);
+					println!("{}", serde_json::json!({"action":"link","target":target,"applied":false}));
 				} else {
 					println!("would link {}", target);
 				}
@@ -2894,12 +2889,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Acp(mut args) => {
 			if terminal_auth {
-				run_interactive_chat(
-					args.launch,
-					launch_extensions,
-					ChatPresentation::Terminal,
-				)
-				.await
+				run_interactive_chat(args.launch, launch_extensions, ChatPresentation::Terminal).await
 			} else {
 				args.launch.extension_launch = launch_extensions;
 				refresh_marketplace(&args.launch).await?;
@@ -4018,10 +4008,7 @@ mod tests {
 		assert_eq!(args.dir, Some(PathBuf::from("profile")));
 
 		for action in ["status", "doctor", "probe", "purge"] {
-			assert!(matches!(
-				parse(&["omp", "images", action]).command,
-				Some(Command::Images(_))
-			));
+			assert!(matches!(parse(&["omp", "images", action]).command, Some(Command::Images(_))));
 		}
 	}
 

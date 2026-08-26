@@ -13,8 +13,6 @@ use std::{
 use omp_core::Str;
 use parking_lot::Mutex;
 
-use crate::update_cmd;
-
 const NOTICE_VERSION_FILE: &str = "startup-notice-version";
 const MAX_CHANGELOG_BYTES: usize = 64 * 1024;
 const MAX_UNSEEN_RELEASES: usize = 3;
@@ -112,16 +110,6 @@ pub fn show_once(
 ) -> io::Result<()> {
 	if !eligibility.allows(io::stderr().is_terminal()) {
 		return Ok(());
-	}
-	if omp_driver::settings::current(data_dir)
-		.ok()
-		.is_some_and(|settings| settings.updates.check_on_startup)
-	{
-		thread::spawn(|| {
-			if let Some(version) = update_cmd::startup_available() {
-				eprintln!("OMP {version} is available; run `omp update`");
-			}
-		});
 	}
 	let seen_version = read_seen_version(data_dir)?;
 	if seen_version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {

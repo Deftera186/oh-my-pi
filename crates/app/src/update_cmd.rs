@@ -30,9 +30,6 @@ const CORE_PACKAGE: &str = "omp-cli";
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
 const GITHUB_LATEST_RELEASE: &str = "https://api.github.com/repos/can1357/oh-my-pi/releases/latest";
 const GITHUB_USER_AGENT: &str = concat!("omp/", env!("CARGO_PKG_VERSION"));
-const STARTUP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-const STARTUP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum InstallManager {
@@ -336,67 +333,6 @@ pub fn registry(args: RegistryArgs) -> miette::Result<()> {
 		}
 	}
 	Ok(())
-}
-
-/// Returns a newer verified core release configured for this platform.
-///
-/// The canonical GitHub response is cached for one hour; startup never
-/// downloads binaries, mutates TOFU pins, or refreshes extension indexes.
-pub fn startup_available() -> Option<Str> {
-	if env::var_os("OMP_RELEASE_INDEX").is_some() || env::var_os("OMP_RELEASE_INDEX_KEY").is_some() {
-		let (index, _) = load_index(None, None).ok()?;
-		let target = platform_target();
-		let selected = select(&index, CORE_PACKAGE, &target).ok()?;
-		return compare_versions(selected.release.version.as_str(), env!("CARGO_PKG_VERSION"))
-			.is_gt()
-			.then(|| selected.release.version.clone());
-	}
-	startup_github_release().and_then(|release| {
-		let asset_name = github_asset_name();
-		let asset = release
-			.assets
-			.iter()
-			.find(|asset| asset.name.as_str() == asset_name)?;
-		github_sha256(asset).ok()?;
-		let version = release.tag_name.as_str().trim_start_matches('v');
-		compare_versions(version, env!("CARGO_PKG_VERSION"))
-			.is_gt()
-			.then(|| Str::new(version))
-	})
-}
-fn startup_github_release() -> Option<GithubRelease> {
-	let cache = update_cache_dir().ok()?.join("latest.json");
-	let cached = || {
-		fs::read(&cache)
-			.ok()
-			.and_then(|bytes| serde_json::from_slice::<GithubRelease>(&bytes).ok())
-	};
-	let fresh = fs::metadata(&cache)
-		.and_then(|metadata| metadata.modified())
-		.and_then(|modified| modified.elapsed().map_err(io::Error::other))
-		.is_ok_and(|age| age <= STARTUP_CACHE_TTL);
-	if fresh {
-		return cached();
-	}
-	let runtime = tokio::runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.ok()?;
-	match runtime.block_on(fetch_github_release(STARTUP_FETCH_TIMEOUT)) {
-		Ok(release) => {
-			if let Some(parent) = cache.parent()
-				&& fs::create_dir_all(parent).is_ok()
-				&& let Ok(bytes) = serde_json::to_vec(&release)
-			{
-				let staged = cache.with_extension("json.tmp");
-				if fs::write(&staged, bytes).is_ok() {
-					let _ = fs::rename(staged, &cache);
-				}
-			}
-			Some(release)
-		},
-		Err(_) => cached(),
-	}
 }
 
 fn load_index(index: Option<&Path>, key: Option<&Path>) -> miette::Result<(SignedIndex, String)> {

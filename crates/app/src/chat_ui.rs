@@ -1715,9 +1715,8 @@ fn command_completions(
 	settings: &BrowserSettings,
 ) -> Vec<Command> {
 	roster.completions_for_described(role, |declaration| {
-		(declaration.name.as_str() == "browser").then(|| {
-			Str::new_static(commands::browser::autocomplete_description(settings))
-		})
+		(declaration.name.as_str() == "browser")
+			.then(|| Str::new_static(commands::browser::autocomplete_description(settings)))
 	})
 }
 
@@ -1728,8 +1727,7 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 		.map(|keyword| Str::from(keyword.text))
 		.collect();
 	chat.set_keyword_accent(KeywordAccent::from_shared(accent_keywords));
-	let mut commands =
-		command_completions(&seed.typed_commands, seed.role, &seed.browser_settings);
+	let mut commands = command_completions(&seed.typed_commands, seed.role, &seed.browser_settings);
 	commands.extend(seed.skills.all().iter().map(|skill| {
 		let name = format!("skill:{}", skill.name);
 		Command::new(&name, skill.description.as_str(), &[]).with_icon(Icon::Skill)
@@ -4029,9 +4027,9 @@ where
 				let now = Instant::now();
 				if !force
 					&& self
-					.state
-					.pending_session_delete
-					.is_none_or(|started| now.duration_since(started) > Duration::from_secs(30))
+						.state
+						.pending_session_delete
+						.is_none_or(|started| now.duration_since(started) > Duration::from_secs(30))
 				{
 					self.state.pending_session_delete = Some(now);
 					return Box::pin(async {
@@ -8925,21 +8923,25 @@ fn proto_to_json(value: &v1::Value) -> Option<serde_json::Value> {
 }
 
 fn model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> {
+	let roles = settings
+		.roles
+		.keys()
+		.filter(|role| !settings.role_tag(role).is_some_and(|tag| tag.hidden))
+		.filter_map(|role| {
+			resolve_model_selector(catalog, settings, role.as_str()).map(|model| (role, model))
+		})
+		.collect::<Vec<_>>();
 	catalog
 		.models()
 		.iter()
 		.filter(|model| model_selector_allowed(catalog, settings, model.key.as_str()))
 		.map(|model| {
-			let role = settings
-				.roles
+			let role = roles
 				.iter()
-				.filter(|(role, _)| {
-					!settings.role_tag(role).is_some_and(|tag| tag.hidden)
-						&& resolve_model_selector(catalog, settings, role.as_str())
-							.is_some_and(|resolved| resolved.key.as_str() == model.key.as_str())
-				})
-				.min_by_key(|(role, _)| settings.cycle_rank(role));
-			let tag = role.and_then(|(role, _)| settings.role_tag(role));
+				.filter(|(_, resolved)| resolved.key.as_str() == model.key.as_str())
+				.min_by_key(|(role, _)| settings.cycle_rank(role))
+				.map(|(role, _)| *role);
+			let tag = role.and_then(|role| settings.role_tag(role));
 			let (provider_id, provider) = model
 				.routes
 				.first()
