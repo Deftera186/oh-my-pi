@@ -45,6 +45,7 @@ concurrent connections run in parallel.
 
 from __future__ import annotations
 
+import collections
 import errno
 import functools
 import hashlib
@@ -76,6 +77,7 @@ __all__ = [
 _MAX_FRAME = 1 << 34  # 16 GiB sanity bound on any single frame
 _MAX_HEADER = 64 << 10  # headers are small protocol dictionaries
 _MAX_BUFFERS = 1 << 10  # plausible upper bound for pickle-5 OOB buffers
+_MAX_CACHED_FNS = 256  # per-connection LRU bound on registered functions
 
 
 class RemoteTraceback(Exception):
@@ -211,9 +213,9 @@ def _default_ship(fn):
 def _pack_function(fn, ship):
     """Builds the code bundle for ``fn`` and returns its cache key and payload.
 
-    The truncated SHA-256 value is strictly a non-security cache key retained
-    for wire cache compatibility. It provides no integrity guarantee and must
-    never be treated as an authentication or trust boundary.
+    The full SHA-256 hex digest is the function's identity in the wire
+    protocol and per-connection caches. It provides no integrity guarantee
+    and must never be treated as an authentication or trust boundary.
     """
     if ship is None:
         ship = _default_ship(fn)
@@ -251,8 +253,7 @@ def _pack_function(fn, ship):
     else:
         raise ValueError(f"unknown ship mode {ship!r}")
     payload = pickle.dumps(bundle, protocol=5)
-    # Keep the existing wire cache key; this truncated digest is not integrity.
-    return hashlib.sha256(payload).hexdigest()[:16], payload
+    return hashlib.sha256(payload).hexdigest(), payload
 
 
 def _load_function(payload, code_hash):
@@ -400,11 +401,13 @@ def connect(address, authkey=None):
 
 def serve(sock, authkey=None):
     """Serves one connected socket until the peer disconnects or sends
-    ``shutdown``. Function bodies are cached per connection by hash."""
+    ``shutdown``. Function bodies are cached per connection in a bounded
+    LRU keyed by full digest; an evicted function transparently re-registers
+    through the ``need_code`` round trip."""
     _validate_authkey(authkey, required=sock.family != socket.AF_UNIX)
     if authkey is not None:
         _authenticate(sock, authkey, server=True)
-    fns = {}
+    fns = collections.OrderedDict()  # LRU: full code hash -> callable
     pending = None  # buffered (hash, frames) awaiting code registration
     while True:
         try:
@@ -414,13 +417,17 @@ def serve(sock, authkey=None):
         op = header["op"]
         if op == "register":
             try:
-                fns[header["hash"]] = _load_function(frames[0], header["hash"])
+                fn = _load_function(frames[0], header["hash"])
             except BaseException as exc:  # noqa: BLE001 — reply, never hang the peer
                 _send_error(sock, exc)
                 pending = None
                 continue
+            fns[header["hash"]] = fn
+            fns.move_to_end(header["hash"])
+            while len(fns) > _MAX_CACHED_FNS:
+                fns.popitem(last=False)
             if pending and pending[0] == header["hash"]:
-                _execute(sock, fns[header["hash"]], pending[1])
+                _execute(sock, fn, pending[1])
                 pending = None
         elif op == "call":
             fn = fns.get(header["hash"])
@@ -428,6 +435,7 @@ def serve(sock, authkey=None):
                 pending = (header["hash"], frames)
                 _send(sock, {"op": "need_code"})
             else:
+                fns.move_to_end(header["hash"])
                 _execute(sock, fn, frames)
         elif op == "shutdown":
             return
