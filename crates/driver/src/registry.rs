@@ -63,13 +63,14 @@ use omp_inference::{
 		zai::ZaiUsageFetcher,
 	},
 	provider::builtin::{
-		AuthApplicationConfig, AzureEndpointConfig, GoogleCcaConfig, LocalRouteBackend,
-		ProductionDependencies, discover_antigravity_version,
+		AuthApplicationConfig, AzureEndpointConfig, GoogleCcaConfig, ProductionDependencies, discover_antigravity_version,
 	},
 	session::{ConversationError, ConversationSessionPlanner},
 	transport::{http::HttpTransport, websocket_transport::WebSocketTransport},
 };
 use omp_serve::inference::InferenceRpc;
+#[cfg(feature = "local-applefm")]
+use omp_inference::provider::builtin::LocalRouteBackend;
 use omp_settings::{
 	SettingsSnapshot,
 	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
