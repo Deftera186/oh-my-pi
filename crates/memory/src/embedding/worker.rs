@@ -1,6 +1,8 @@
 //! Isolated FastEmbed worker state machine.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "local-embedding")]
+use std::path::PathBuf;
 
 #[cfg(feature = "local-embedding")]
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
@@ -139,6 +141,7 @@ fn resolve_model(id: &str) -> Result<EmbeddingModel> {
 	}
 }
 
+#[cfg(feature = "local-embedding")]
 fn normalize(vector: &mut [f32]) -> Result<()> {
 	if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
 		return Err(Error::EmbeddingWorker);

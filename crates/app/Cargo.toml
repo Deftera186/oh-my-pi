@@ -22,14 +22,27 @@ path = "src/claude_trace.rs"
 required-features = ["claude-trace"]
 
 [features]
-default = ["local-applefm", "local-embedding", "local-text", "local-stt", "local-tts"]
+default = ["local"]
 claude-trace = []
-local = ["omp-inference/local"]
-local-applefm = ["local", "omp-inference/local-applefm"]
-local-embedding = ["local", "omp-inference/local-embedding"]
-local-text = ["local", "omp-inference/local-text"]
-local-stt = ["local", "omp-inference/local-stt"]
-local-tts = ["local", "omp-inference/local-tts"]
+local = ["omp-driver/local", "omp-inference/local"]
+gui = ["dep:omp-gui"]
+local-all = [
+	"local-applefm",
+	"local-embedding",
+	"local-text",
+	"local-stt",
+	"local-tts",
+]
+local-applefm = ["local", "omp-driver/local-applefm", "omp-inference/local-applefm"]
+local-embedding = [
+	"local",
+	"omp-driver/local-embedding",
+	"omp-inference/local-embedding",
+	"omp-memory/local-embedding",
+]
+local-text = ["local", "omp-driver/local-text", "omp-inference/local-text"]
+local-stt = ["local", "omp-driver/local-stt", "omp-inference/local-stt"]
+local-tts = ["local", "omp-driver/local-tts", "omp-inference/local-tts"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -54,11 +67,11 @@ omp-ar = { workspace = true }
 omp-chat-ui.workspace = true
 omp-collab.workspace = true
 omp-core.workspace = true
-omp-driver.workspace = true
+omp-driver = { workspace = true, default-features = false }
 omp-env = { workspace = true }
 omp-envd = { workspace = true }
 omp-ext.workspace = true
-omp-gui.workspace = true
+omp-gui = { workspace = true, optional = true }
 omp-grep.workspace = true
 omp-hashline.workspace = true
 omp-catalog.workspace = true
@@ -75,7 +88,7 @@ omp-storage.workspace = true
 omp-telemetry.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
-omp-voice = { workspace = true, features = ["realtime-transport"] }
+omp-voice = { workspace = true }
 omp-slopjson.workspace = true
 omp-shell.workspace = true
 omp-tools.workspace = true
