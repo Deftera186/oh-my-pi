@@ -23,6 +23,7 @@ use crate::{
 	tool_choice::{
 		DirectiveCallbacks, DirectivePriority, PushOptions, RejectOutcome, ToolChoiceQueue,
 	},
+	ttsr::StreamSource,
 };
 
 /// Stable identity of a regime declaration.
@@ -184,6 +185,21 @@ pub(crate) enum RegimeEffect {
 	RequireTool(Str),
 	SetScoped(ScopedSetting),
 	ReplaceState(Str),
+	Note(RegimeNote),
+}
+/// Typed durable side-record staged by a core lane and journaled by the
+/// arbiter once the resolution lands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RegimeNote {
+	/// One committed stream-rule injection, projected to extension hosts.
+	TtsrInjection {
+		/// Stream the rules matched on.
+		source:  StreamSource,
+		/// Matched rule names in delivery order.
+		rules:   Vec<Str>,
+		/// Injected reminder text.
+		content: Str,
+	},
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -196,18 +212,9 @@ impl RegimeDraft {
 		matches!(self.control, Some(RegimeControl::Retry))
 	}
 
-	pub(crate) fn failed(&self) -> bool {
-		matches!(self.control, Some(RegimeControl::Fail(_)))
-	}
-
-	pub(crate) fn into_appended(self) -> Vec<Item> {
-		let mut appended = Vec::new();
-		for effect in self.effects {
-			if let RegimeEffect::AppendContext(mut items) = effect {
-				appended.append(&mut items);
-			}
-		}
-		appended
+	/// Whether this draft selects no control and stages no effects.
+	pub(crate) fn is_empty(&self) -> bool {
+		self.control.is_none() && self.effects.is_empty()
 	}
 }
 
@@ -278,6 +285,11 @@ impl<'a> RegimeContext<'a> {
 	/// Stages replacement of the regime's durable state.
 	pub fn replace_state(&mut self, state: impl Into<Str>) {
 		self.effects.push(RegimeEffect::ReplaceState(state.into()));
+	}
+
+	/// Stages one typed durable side-record journaled with the resolution.
+	pub(crate) fn stage_note(&mut self, note: RegimeNote) {
+		self.effects.push(RegimeEffect::Note(note));
 	}
 }
 
@@ -624,8 +636,10 @@ pub(crate) enum ResolutionKind {
 pub(crate) struct RegimeResolution {
 	pub(crate) control:                ResolutionKind,
 	pub(crate) controlling_activation: Option<ActivationId>,
+	pub(crate) cancel_reason:          Option<Str>,
 	pub(crate) patches:                Vec<ContextPatch>,
 	pub(crate) injects:                Vec<Item>,
+	pub(crate) notes:                  Vec<RegimeNote>,
 	pub(crate) denials:                Vec<Str>,
 	pub(crate) waits:                  Vec<WaitTicket>,
 	pub(crate) settings:               Vec<ScopedSetting>,
@@ -639,8 +653,10 @@ impl Default for RegimeResolution {
 		Self {
 			control:                ResolutionKind::None,
 			controlling_activation: None,
+			cancel_reason:          None,
 			patches:                Vec::new(),
 			injects:                Vec::new(),
+			notes:                  Vec::new(),
 			denials:                Vec::new(),
 			waits:                  Vec::new(),
 			settings:               Vec::new(),
@@ -1308,6 +1324,7 @@ impl RegimeSet {
 						resolution.settings.push(setting);
 					},
 					RegimeEffect::ReplaceState(_) => {},
+					RegimeEffect::Note(note) => resolution.notes.push(note),
 				}
 			}
 			match draft.control {
@@ -1323,8 +1340,11 @@ impl RegimeSet {
 					resolution.denials.push(reason);
 					select_resolution(&mut resolution, ResolutionKind::Reject, &id);
 				},
-				Some(RegimeControl::Cancel(_)) => {
-					select_resolution(&mut resolution, ResolutionKind::Cancel, &id)
+				Some(RegimeControl::Cancel(reason)) => {
+					select_resolution(&mut resolution, ResolutionKind::Cancel, &id);
+					if resolution.controlling_activation.as_deref() == Some(id.as_str()) {
+						resolution.cancel_reason = Some(reason);
+					}
 				},
 				Some(RegimeControl::Complete) => resolution.terminated.push(id.clone()),
 				Some(RegimeControl::Fail(detail)) => {
@@ -1621,6 +1641,7 @@ pub(crate) fn absorb_draft(
 			RegimeEffect::AppendContext(mut items) => resolution.injects.append(&mut items),
 			RegimeEffect::RewriteContext(patch) => resolution.patches.push(patch),
 			RegimeEffect::SetScoped(setting) => resolution.settings.push(setting),
+			RegimeEffect::Note(note) => resolution.notes.push(note),
 			RegimeEffect::RequireTool(_) | RegimeEffect::ReplaceState(_) => {},
 		}
 	}
@@ -1637,8 +1658,11 @@ pub(crate) fn absorb_draft(
 			resolution.denials.push(reason);
 			select_resolution(resolution, ResolutionKind::Reject, &activation);
 		},
-		Some(RegimeControl::Cancel(_)) => {
+		Some(RegimeControl::Cancel(reason)) => {
 			select_resolution(resolution, ResolutionKind::Cancel, &activation);
+			if resolution.controlling_activation.as_deref() == Some(activation.as_str()) {
+				resolution.cancel_reason = Some(reason);
+			}
 		},
 		Some(RegimeControl::Complete) => resolution.terminated.push(activation),
 		Some(RegimeControl::Fail(detail)) => {
@@ -1656,6 +1680,9 @@ pub struct SubagentYieldRegime {
 
 impl Regime for SubagentYieldRegime {
 	fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
+		if ctx.facts().empty_output {
+			return Ok(());
+		}
 		match (self.rung, ctx.point()) {
 			(0, Point::Settle) => {
 				self.rung = 1;
@@ -1713,7 +1740,7 @@ impl QuiescenceBarrier {
 
 impl Regime for QuiescenceBarrier {
 	fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
-		if ctx.point() != Point::Settle {
+		if ctx.point() != Point::Settle || ctx.facts().empty_output {
 			return Ok(());
 		}
 		if self.jobs.is_empty() {
