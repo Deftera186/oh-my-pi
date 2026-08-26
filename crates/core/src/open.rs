@@ -83,7 +83,7 @@ fn opener_command(target: &str) -> Command {
 	let script =
 		format!("$ErrorActionPreference='Stop';Start-Process '{}'", target.replace('\'', "''"));
 	let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-	let encoded = omp_core::base64::encode(&utf16le).into_string();
+	let encoded = crate::base64::encode(&utf16le).into_string();
 
 	let mut command = Command::new(powershell);
 	command
