@@ -1,7 +1,0 @@
-{
-  "events": [
-    {"type": "text_delta", "text": "continued"},
-    {"type": "usage", "input": 5, "output": 1, "cache_read": 0, "cache_write": 0},
-    {"type": "done", "reason": "stop"}
-  ]
-}

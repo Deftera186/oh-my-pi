@@ -1,4 +1,0 @@
-{
-  "canonical_intent": {"model": "gemini-3.5-flash", "messages": [{"role": "assistant", "content": [{"type": "tool_call", "id": "call_a", "name": "read", "arguments": {"path": "a"}}, {"type": "tool_call", "id": "call_b", "name": "read", "arguments": {"path": "b"}}]}, {"role": "tool", "tool_call_id": "call_a", "content": "A"}, {"role": "tool", "tool_call_id": "call_b", "content": "B"}]},
-  "wire_body": {"contents": [{"role": "model", "parts": [{"functionCall": {"id": "call_a", "name": "read", "args": {"path": "a"}}}, {"functionCall": {"id": "call_b", "name": "read", "args": {"path": "b"}}}]}, {"role": "user", "parts": [{"functionResponse": {"id": "call_a", "name": "read", "response": {"output": "A"}}}, {"functionResponse": {"id": "call_b", "name": "read", "response": {"output": "B"}}}]}]}
-}

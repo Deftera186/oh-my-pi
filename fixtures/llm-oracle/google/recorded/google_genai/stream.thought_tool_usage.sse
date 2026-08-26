@@ -1,4 +1,0 @@
-data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello","thoughtSignature":"text-sig_REDACTED"}]}}]}
-
-data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}},"thoughtSignature":"toolcall-sig_REDACTED"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":14,"candidatesTokenCount":4,"cachedContentTokenCount":8,"totalTokenCount":18}}
-

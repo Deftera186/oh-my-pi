@@ -1,9 +1,0 @@
-{
-  "events": [
-    {"type": "thinking_delta", "text": "Need to inspect"},
-    {"type": "text_delta", "text": "Answer.\n"},
-    {"type": "tool_call", "name": "read", "arguments": {"path": "README.md"}},
-    {"type": "done", "reason": "tool_use"}
-  ],
-  "outcome": {"thinking": "Need to inspect", "text": "Answer.\n", "tool_calls": [{"name": "read", "arguments": {"path": "README.md"}}], "leaked_markup_removed": true}
-}

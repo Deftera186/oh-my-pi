@@ -1,5 +1,0 @@
-{
-  "canonical_intent": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "before"}, {"type": "tool_call", "id": "call_a", "name": "read", "arguments": {}}, {"type": "text", "text": "after"}, {"type": "tool_call", "id": "call_b", "name": "grep", "arguments": {}}]}]},
-  "wire_body": {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "before"}, {"type": "text", "text": "after"}, {"type": "tool_use", "id": "call_a", "name": "read", "input": {}}, {"type": "tool_use", "id": "call_b", "name": "grep", "input": {}}]}]},
-  "invariant": "All non-tool_use blocks precede every tool_use block; relative order within each partition is stable."
-}

@@ -1,9 +1,0 @@
-{
-  "events": [
-    {"type": "thinking_delta", "text": "Plan lookup", "signature": "sig_REDACTED"},
-    {"type": "tool_call", "id": "call_lookup", "name": "lookup", "arguments": {"q": "x"}, "signature": "function-call-sig_REDACTED"},
-    {"type": "usage", "input": 10, "output": 5, "cache_read": 6, "cache_write": 0},
-    {"type": "done", "reason": "tool_use"}
-  ],
-  "outcome": {"thinking": "Plan lookup", "tool_calls": [{"id": "call_lookup", "name": "lookup", "arguments": {"q": "x"}}]}
-}

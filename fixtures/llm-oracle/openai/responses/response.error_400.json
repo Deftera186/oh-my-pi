@@ -1,5 +1,0 @@
-{
-  "http": {"status": 400, "headers": {"content-type": "application/json", "x-request-id": "req_REDACTED"}},
-  "body": {"error": {"message": "Invalid parameter: 'temperature' is not supported with this model.", "type": "invalid_request_error", "param": "temperature", "code": "unsupported_parameter"}},
-  "expect": {"error_kind": "invalid_parameter", "parameter": "temperature", "retryable": false}
-}

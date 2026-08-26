@@ -1,9 +1,0 @@
-{
-  "events": [
-    {"type":"tool_call_start","index":0,"id":"call_len","name":"lookup"},
-    {"type":"tool_call_arguments_delta","index":0,"fragment":"{\"q\":\"hel"},
-    {"type":"tool_call_arguments_delta","index":0,"fragment":"lo\"}"},
-    {"type":"usage","input":3,"output":2,"cache_read":1,"cache_write":0},
-    {"type":"done","reason":"tool_use"}
-  ]
-}

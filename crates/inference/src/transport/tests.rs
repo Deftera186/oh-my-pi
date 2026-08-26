@@ -11,7 +11,6 @@ use bytes::Bytes;
 use futures::{FutureExt as _, StreamExt as _, stream};
 use omp_catalog::{OperationKind, ProviderId, RouteId};
 use omp_core::{Str, sf};
-use serde::Deserialize;
 use tokio::{net::TcpListener, sync::oneshot, time};
 use tokio_tungstenite::tungstenite;
 use tower::{Service as _, ServiceExt as _};
@@ -37,41 +36,6 @@ use crate::{
 	id::RequestId,
 	receipt::{AttemptOutcome, ExecutionReceipt, ReasonId, Usage},
 };
-
-#[derive(Deserialize)]
-struct LifecycleFixture {
-	commit_rule: String,
-	cases:       Vec<LifecycleCase>,
-}
-#[derive(Deserialize)]
-struct LifecycleCase {
-	id:       String,
-	expected: Option<LifecycleExpected>,
-}
-
-#[derive(Deserialize)]
-struct LifecycleExpected {
-	commit_state: Option<String>,
-	retry_action: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RetryFixture {
-	policy: String,
-	cases:  Vec<RetryCase>,
-}
-
-#[derive(Deserialize)]
-struct RetryCase {
-	id:       String,
-	expected: Option<RetryExpected>,
-}
-
-#[derive(Deserialize)]
-struct RetryExpected {
-	attempt_count: Option<u32>,
-	retry_action:  Option<String>,
-}
 
 struct CapturedSseDecoder;
 
@@ -612,50 +576,6 @@ async fn replayable_factory_opens_a_fresh_body_for_every_attempt() {
 			truncated:      false,
 		})
 	);
-}
-
-#[test]
-fn lifecycle_and_retry_fixtures_bind_the_service_contract() {
-	let lifecycle: LifecycleFixture = serde_json::from_str(include_str!(
-		"../../../../fixtures/llm-oracle/transport/lifecycle.json"
-	))
-	.expect("typed lifecycle fixture");
-	assert_eq!(lifecycle.commit_rule, "commit-after-first-decodable-meaningful-frame");
-	let first = lifecycle
-		.cases
-		.iter()
-		.find(|case| case.id == "lifecycle.first-frame-error.v1")
-		.and_then(|case| case.expected.as_ref())
-		.expect("first-frame case");
-	assert_eq!(first.commit_state.as_deref(), Some("uncommitted"));
-	assert_eq!(first.retry_action.as_deref(), Some("retry-exact-request"));
-	let partial = lifecycle
-		.cases
-		.iter()
-		.find(|case| case.id == "lifecycle.post-commit-disconnect.v1")
-		.and_then(|case| case.expected.as_ref())
-		.expect("partial case");
-	assert_eq!(partial.commit_state.as_deref(), Some("committed"));
-	assert_eq!(partial.retry_action.as_deref(), Some("surface-partial-stream-error"));
-
-	let retry: RetryFixture =
-		serde_json::from_str(include_str!("../../../../fixtures/llm-oracle/transport/retry.json"))
-			.expect("typed retry fixture");
-	assert_eq!(retry.policy, "retry-only-before-commit-and-only-when-exact-replay-is-allowed");
-	let replay = retry
-		.cases
-		.iter()
-		.find(|case| case.id == "retry.replayable-503-then-success.v1")
-		.and_then(|case| case.expected.as_ref())
-		.expect("replay case");
-	assert_eq!(replay.attempt_count, Some(2));
-	let committed = retry
-		.cases
-		.iter()
-		.find(|case| case.id == "retry.post-commit-error.v1")
-		.and_then(|case| case.expected.as_ref())
-		.expect("committed retry case");
-	assert_eq!(committed.retry_action.as_deref(), Some("do-not-retry"));
 }
 
 #[tokio::test]

@@ -1,4 +1,0 @@
-{
-  "events": [{"type": "text_delta", "text": "Café"}, {"type": "done", "reason": "stop"}],
-  "outcome": {"text": "Café", "replacement_characters": 0}
-}

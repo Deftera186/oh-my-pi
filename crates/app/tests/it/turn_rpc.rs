@@ -21,7 +21,7 @@ use omp_app::{
 	endpoint::LocalEndpoint,
 };
 use omp_catalog::{
-	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
+	ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
 use omp_core::{Str, sf};
@@ -138,9 +138,7 @@ fn completion(reason: FinishReason, blocks: u32) -> ChatEvent {
 fn scripted_registry(
 	database: &Path,
 ) -> (Registry, ConversationSessionPlanner, FakeProvider, String) {
-	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../../catalog/data/catalog.normalized.json"))
-			.expect("normalized catalog");
+	let mut compiled = Catalog::embedded().compiled().clone();
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
 			operations:        OperationBits::empty(),

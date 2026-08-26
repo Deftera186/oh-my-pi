@@ -1,13 +1,7 @@
 {
   "schema_version": 1,
-  "source_digest": "f0a2c494941345016cd29bf6e5655af6ad5f30457d5d47f560b3d89a21d258ee",
+  "source_digest": "a26357301a828d527b82c592e4a870a4b362ad1b10fed58222a0fd7e487d7c01",
   "inputs": [
-    {
-      "id": "catalog-policy.manifest.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/manifest.json",
-      "sha256": "0294ce166640fbd59d5a661fc4fd7ce0ffa95ed4e489f11c85d733f56c8ab5bf",
-      "source": "oracle:catalog-policy.manifest.v1"
-    },
     {
       "id": "catalog.census.v1",
       "path": "fixtures/llm-oracle/catalog/census.json",
@@ -15,28 +9,10 @@
       "source": "oracle:catalog.census.v1"
     },
     {
-      "id": "catalog.manifest.v1",
-      "path": "fixtures/llm-oracle/catalog/manifest.json",
-      "sha256": "d608cb4f8c0511ba0b4007657bcacf2178980fefd325b2c28d9e34ac148f66ab",
-      "source": "oracle:catalog.manifest.v1"
-    },
-    {
       "id": "catalog.models.compressed.v1",
       "path": "fixtures/llm-oracle/catalog/models.json.zst",
       "sha256": "a26a567b9402fb468c77d1d79f00a81df309ca36d60df0afda9198fa469a6a5f",
       "source": "oracle:catalog.models.compressed.v1"
-    },
-    {
-      "id": "catalog.models.normalized.v1",
-      "path": "fixtures/llm-oracle/catalog/models.normalized.json",
-      "sha256": "b570bbdcf1e762c0bad3fa2f42eec7855dbf29d9e1cda17b17b7a3c89387fc2c",
-      "source": "oracle:catalog.models.normalized.v1"
-    },
-    {
-      "id": "catalog.models.raw.v1",
-      "path": "fixtures/llm-oracle/catalog/models.raw.json",
-      "sha256": "8d45872b3805a4e053d151d62b8509438a6100ef7df4d5e3f9f1a386a32d0596",
-      "source": "oracle:catalog.models.raw.v1"
     },
     {
       "id": "catalog.oauth.source.v1",
@@ -51,40 +27,10 @@
       "source": "oracle:catalog.policy.aliases-tiers-deepseek.v1"
     },
     {
-      "id": "catalog.policy.compat-defaults-and-domains.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/compat-defaults-and-domains.json",
-      "sha256": "853e9c7e9c47262046227ff0ef1f8598017e279b1392bc32429b7d01c1210a52",
-      "source": "oracle:catalog.policy.compat-defaults-and-domains.v1"
-    },
-    {
       "id": "catalog.policy.compat-profiles.v1",
       "path": "fixtures/llm-oracle/catalog-policy/compat-profiles.json",
       "sha256": "813731312a7bf7624bbc6c331c1d28f4e4c4d1a375e0b599155e2df7fb6afb54",
       "source": "oracle:catalog.policy.compat-profiles.v1"
-    },
-    {
-      "id": "catalog.policy.dialect-classifier.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/dialect-classifier.json",
-      "sha256": "7b53aa23395c95d78f747dc04ed97641f9696528a9f2f86da87b0fe3c346f49c",
-      "source": "oracle:catalog.policy.dialect-classifier.v1"
-    },
-    {
-      "id": "catalog.policy.dialect-selection.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/dialect-selection.json",
-      "sha256": "6812c4ef7a35459165c14e4f0dcea9488e9b10871e38473ffcb59491fd6e9d63",
-      "source": "oracle:catalog.policy.dialect-selection.v1"
-    },
-    {
-      "id": "catalog.policy.dialect-thinking-policy.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/dialect-thinking-policy.json",
-      "sha256": "5d0df78df8dce55d6d48f44a8b658fc5b74be795118be661ed661c98873abd7a",
-      "source": "oracle:catalog.policy.dialect-thinking-policy.v1"
-    },
-    {
-      "id": "catalog.policy.dialect-transcript-headers.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/dialect-transcript-headers.json",
-      "sha256": "40a168c4973eab0628cc12c142cac5201747c09d4712a37e811115b8c6642254",
-      "source": "oracle:catalog.policy.dialect-transcript-headers.v1"
     },
     {
       "id": "catalog.policy.effort-tier-classifier.v1",
@@ -121,18 +67,6 @@
       "path": "fixtures/llm-oracle/catalog-policy/qwen-collapse-cases.json",
       "sha256": "91bb72527c20dd0673bb542ddb87ffc2e339336fc9bcf5860982cbf6a1024f52",
       "source": "oracle:catalog.policy.qwen-collapse-cases.v1"
-    },
-    {
-      "id": "catalog.policy.snapshot-invariants.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/catalog-snapshot-invariants.json",
-      "sha256": "fcd680196fe3744d48191bc3957b0b08b6214e58d3d5745ecb735a7e4e98c07d",
-      "source": "oracle:catalog.policy.snapshot-invariants.v1"
-    },
-    {
-      "id": "catalog.policy.thinking-loop-guard.v1",
-      "path": "fixtures/llm-oracle/catalog-policy/thinking-loop-guard.json",
-      "sha256": "f24b132b28483bb6be320e5ce3626d1b1af2de4450c57874f20e34f62666116f",
-      "source": "oracle:catalog.policy.thinking-loop-guard.v1"
     },
     {
       "id": "catalog.policy.thinking-profiles.v1",

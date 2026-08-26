@@ -1,7 +1,0 @@
-{
-  "events": [
-    {"type": "tool_call_start", "index": 0, "id": "tool_truncated", "name": "lookup_weather"},
-    {"type": "transport_error", "kind": "truncated_stream"}
-  ],
-  "outcome": {"status": "error", "error_kind": "truncated_stream", "partial_tool_arguments": "{\"city\":\"Montr"}
-}

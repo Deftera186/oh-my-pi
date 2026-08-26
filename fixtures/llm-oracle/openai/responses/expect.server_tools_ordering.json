@@ -1,7 +1,0 @@
-{
-  "events": [
-    {"type":"text_delta","text":"Found it."},
-    {"type":"usage","input":50,"output":12,"cache_read":32,"cache_write":0},
-    {"type":"done","reason":"stop"}
-  ]
-}

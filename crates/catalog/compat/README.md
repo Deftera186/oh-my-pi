@@ -291,13 +291,14 @@ Wire axes are considered for every matching target. Thinking axes are considered
 
 Run all commands from the workspace root. Keep inputs and generated output in stable sorted order; never accept a selector because it happens to cover only a sampled provider.
 
-### 1. Dump the full classified roster
+### 1. Review the full classified roster
 
-```sh
-cargo run -p omp-catalog --example dump_identity > /tmp/compat-identity.tsv
-```
-
-The TSV columns are `id`, `provider`, `class`, `family`, `revision`, and `reasoning`, in frozen normalized-catalog order. Join it with `fixtures/llm-oracle/catalog-policy/compat-profiles.json` and `thinking-profiles.json`. For each desired member set, test candidates against the entire roster and accept one only when it selects exactly that set within its class and any `on` provider scope. Use this deterministic candidate order:
+Use the generated review artifact `target/catalog.normalized.json` (written by
+`generate_snapshot`, step 3) as the complete compiled roster. Join its model
+identities and classifications with `fixtures/llm-oracle/catalog-policy/compat-profiles.json`
+and `thinking-profiles.json`. For each desired member set, test candidates against the entire
+roster and accept one only when it selects exactly that set within its class and any `on` provider
+scope. Use this deterministic candidate order:
 
 1. family;
 2. family plus a closed-open revision range (`>=a <b`);
@@ -360,81 +361,16 @@ Run the generator binary built before the source-lock update:
 
 This verifies the source lock and rewrites:
 
-- `crates/catalog/data/catalog.normalized.json`
-- `crates/catalog/data/catalog.postcard`
+- `crates/catalog/data/catalog.postcard` — the checked-in snapshot embedded at build time;
+- `target/catalog.normalized.json` — the full compiled catalog (providers, routes, models,
+  wire policies, thinking policies, revision) as a reviewable JSON artifact. Its SHA-256 rides
+  the postcard header, so the JSON is reproducible from the checked-in snapshot and stays out
+  of git.
 
-`crates/catalog/data/catalog.normalized.json` is the full compiled catalog: providers, routes, models, wire policies, thinking policies, and revision. `fixtures/llm-oracle/catalog/models.normalized.json` is a different, reduced 4,225-model archival schema. Never copy or compare the full compiled artifact over the reduced fixture.
-
-The reduced fixture changes only when `models.json.zst` changes or a reviewed collapse-policy port folds frozen siblings (for example the Cursor Grok `-fast` lane, pi PR #8988). Its loader is pinned to
-`52b111a4abc8d76064abc4f58afda931edee9833`; the checked-in projector preserves the
-historical baseline-plus-overlay encoding and sorts models by `(provider, model)`.
-
-```sh
-root=$PWD
-revision=52b111a4abc8d76064abc4f58afda931edee9833
-tree=/work/.tree/omp-catalog-oracle
-git worktree add --detach "$tree" "$revision"
-mkdir -p "$tree/crates/catalog/examples"
-cp "$root/fixtures/llm-oracle/catalog/project_normalized.rs" \
-  "$tree/crates/catalog/examples/project_normalized.rs"
-cargo run --locked --manifest-path "$tree/Cargo.toml" \
-  -p omp-catalog --example project_normalized -- \
-  "$tree/crates/catalog/models.json.zst" \
-  "$root/fixtures/llm-oracle/catalog/models.json.zst" \
-  "$root/fixtures/llm-oracle/catalog/models.normalized.json"
-git worktree remove "$tree"
-```
-
-If this rewrites the reduced fixture, repeat step 2, rebuild the generator against the
-new lock, then repeat step 3 before refreezing the oracle corpus. If the compressed
-source is unchanged, leave the reduced fixture unchanged.
-
-### 4. Refreeze the oracle corpus
-
-This command refreshes fixture hashes in every category manifest, then root-lock hashes, counts, and the aggregate digest. It updates existing indexed files; add any genuinely new fixture to its category manifest and root entries before running it.
+If this rewrites the postcard, repeat step 2 and rerun the prebuilt generator. Then verify the
+compiled catalog:
 
 ```sh
-python3 - <<'PY'
-from pathlib import Path
-import hashlib, json
-
-root = Path("fixtures/llm-oracle")
-lock_path = root / "manifest.lock.json"
-lock = json.loads(lock_path.read_text())
-sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-
-for category in lock["categories"]:
-    manifest_path = root / category["manifest_path"]
-    manifest = json.loads(manifest_path.read_text())
-    for fixture in manifest["fixtures"]:
-        fixture["sha256"] = sha(manifest_path.parent / fixture["path"])
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-
-for entry in lock["entries"]:
-    entry["sha256"] = sha(root / entry["path"])
-for category in lock["categories"]:
-    members = [e for e in lock["entries"] if e["provenance_category"] == category["id"]]
-    category["artifact_count"] = sum(e["kind"] == "artifact" for e in members)
-    category["indexed_file_count"] = len(members)
-lock["category_count"] = len(lock["categories"])
-lock["manifest_count"] = sum(e["kind"] == "category-manifest" for e in lock["entries"])
-lock["artifact_count"] = sum(e["kind"] == "artifact" for e in lock["entries"])
-lock["indexed_file_count"] = len(lock["entries"])
-lock["secret_free_count"] = sum(e["secret_free"] is True for e in lock["entries"])
-rows = ["\0".join((e["id"], e["path"], e["sha256"], e["provenance_category"],
-                   "true" if e["secret_free"] is True else "false"))
-        for e in lock["entries"]]
-lock["corpus_sha256"] = hashlib.sha256(("\n".join(rows) + "\n").encode()).hexdigest()
-lock_path.write_text(json.dumps(lock, indent=2) + "\n")
-PY
-python3 fixtures/llm-oracle/validate.py --self-test
-```
-
-If a refrozen corpus file is also a source-lock input, rebuild the generator while the current lock and snapshot still agree, repeat the source-lock update from step 2, and run the prebuilt generator directly. Then verify both the corpus and compiled catalog:
-
-```sh
-./target/debug/examples/generate_snapshot
-python3 fixtures/llm-oracle/validate.py --self-test
 cargo nextest run -p omp-catalog --lib taxonomy
 cargo nextest run -p omp-catalog --test compat_cascade
 ```

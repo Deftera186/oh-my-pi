@@ -24,28 +24,11 @@
       "secret_free": true
     },
     {
-      "id": "transport.lifecycle.cassettes.v1",
-      "path": "lifecycle.json",
-      "source": "archive/llm-legacy/llm-egress/src/retry.rs:Replayable/Committed/PreCommitFailure/Retry::poll_ready/Retry::call",
-      "sha256": "5ee9c8e3a1dd1f1a2b8bcb0263edf410744ba617a0a37d2e1bdb22b1f808aace",
-      "secret_free": true
-    },
-    {
       "id": "transport.ndjson.cassettes.v1",
       "path": "ndjson.json",
       "source": "archive/llm-legacy/llm-transport/src/ndjson.rs:NdjsonDecoder::push/tests::partial_trailing_line_is_retained_until_completed",
       "sha256": "dcd4c13b3c6016c817f54cc5257d4d7fe916300d4fb09df1566327c539b67ada",
       "secret_free": true
-    },
-    {
-      "id": "transport.retry.cassettes.v1",
-      "path": "retry.json",
-      "source": "archive/llm-legacy/llm-egress/src/retry.rs:RetryConfig/parse_retry_after/Retry::call/tests",
-      "sha256": "b3bf5740d52ae951171d0856348de35569f6bc555ef3b64b7c23bf7df95f80c8",
-      "secret_free": true,
-      "redactions": [
-        "account identifier replaced with shape-preserving typed placeholder"
-      ]
     },
     {
       "id": "transport.sse.cassettes.v1",

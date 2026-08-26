@@ -1,9 +1,0 @@
-{
-  "events": [
-    {"type": "text_delta", "text": "Hello", "signature": "text-sig_REDACTED"},
-    {"type": "tool_call", "name": "get_weather", "arguments": {"city": "SF"}, "signature": "toolcall-sig_REDACTED"},
-    {"type": "usage", "input": 14, "output": 4, "cache_read": 8, "cache_write": 0},
-    {"type": "done", "reason": "tool_use"}
-  ],
-  "outcome": {"text": "Hello", "tool_calls": [{"name": "get_weather", "arguments": {"city": "SF"}}]}
-}

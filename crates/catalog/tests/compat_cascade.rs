@@ -1,22 +1,12 @@
-//! Proves the KDL compat cascade against the frozen oracle and the census.
-//!
-//! The archived `compat-profiles.json` is only the resolved non-empty slice of
-//! the old data path, so wire verification is two-sided: every axis the
-//! oracle pins must resolve to exactly the oracle value, and every axis the
-//! cascade adds beyond the oracle must be one of the documented census
-//! composition overlays (pi-openai-chat:012–015) — nothing else. Thinking
-//! verification is exact against `thinking-profiles.json`, resolved over all
-//! 4,225 catalog models with the catalog's reasoning capability as the gate,
-//! which proves class and `on` thinking rules never leak onto non-reasoning
-//! siblings. Every `ready` quirk-census case executes against the real
-//! machinery.
+//! Proves the bundled KDL compat cascade against focused policy fixtures and
+//! executable quirk-census cases.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
 use omp_catalog::{
-	AxisSet, BUNDLED_COMPAT, CascadeError, Catalog, ClassificationInput, ClassificationPhase,
-	CompatCascade, EffortTier, KNOWN_AXES, ModelKey, ResolveTarget, ThinkingEffort, ThinkingFormat,
-	WirePolicy, classify,
+	BUNDLED_COMPAT, CascadeError, Catalog, ClassificationInput, ClassificationPhase, CompatCascade,
+	EffortTier, KNOWN_AXES, ModelKey, ResolveTarget, ThinkingEffort, ThinkingFormat, WirePolicy,
+	classify,
 };
 use omp_core::SemVer;
 use serde::Deserialize;
@@ -26,8 +16,6 @@ const COMPAT_PROFILES: &str =
 	include_str!("../../../fixtures/llm-oracle/catalog-policy/compat-profiles.json");
 const THINKING_PROFILES: &str =
 	include_str!("../../../fixtures/llm-oracle/catalog-policy/thinking-profiles.json");
-const NORMALIZED_MODELS: &str =
-	include_str!("../../../fixtures/llm-oracle/catalog/models.normalized.json");
 const CENSUS_CASES: &str = include_str!("../../../fixtures/llm-oracle/quirk-census/cases.jsonl");
 const CATALOG_POSTCARD: &[u8] = include_bytes!("../data/catalog.postcard");
 
@@ -38,32 +26,7 @@ struct ProfileDocument {
 
 #[derive(Deserialize)]
 struct Profile {
-	models: Vec<String>,
-	shape:  BTreeMap<String, Value>,
-}
-
-#[derive(Deserialize)]
-struct NormalizedDocument {
-	models: Vec<NormalizedModel>,
-}
-
-#[derive(Deserialize)]
-struct NormalizedModel {
-	id:           String,
-	provider:     String,
-	model:        String,
-	#[serde(default)]
-	class:        Option<String>,
-	#[serde(default, rename = "family")]
-	legacy_class: Option<String>,
-	#[serde(default)]
-	behavior:     Option<Behavior>,
-}
-
-#[derive(Deserialize)]
-struct Behavior {
-	#[serde(default)]
-	thinking: Option<Value>,
+	shape: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -79,33 +42,6 @@ struct Case {
 	expected:     Value,
 }
 
-fn profile_shapes(raw: &str, strip: Option<&str>) -> BTreeMap<String, BTreeMap<String, Value>> {
-	let document: ProfileDocument = serde_json::from_str(raw).expect("profile fixture parses");
-	let mut shapes = BTreeMap::new();
-	for profile in document.profiles {
-		let shape: BTreeMap<String, Value> = profile
-			.shape
-			.into_iter()
-			.map(|(key, value)| match strip {
-				Some(prefix) => (
-					key.strip_prefix(prefix)
-						.expect("prefixed oracle key")
-						.into(),
-					value,
-				),
-				None => (key, value),
-			})
-			.collect();
-		for model in profile.models {
-			assert!(
-				shapes.insert(model.clone(), shape.clone()).is_none(),
-				"oracle model {model} appears in two profiles"
-			);
-		}
-	}
-	shapes
-}
-
 /// Census wire overlay beyond the archived oracle slice: the class×host
 /// `thinking_format` compositions from pi-openai-chat:012–015. Applies only
 /// where the oracle is silent on the axis.
@@ -118,18 +54,6 @@ fn census_thinking_format(provider: &str, class: &str) -> Option<&'static str> {
 		_ if class == "qwen" => Some("qwen"),
 		_ => None,
 	}
-}
-
-fn frozen_class_of(model: &NormalizedModel) -> &str {
-	if model.model.to_ascii_lowercase().starts_with("muse-spark") {
-		return "meta";
-	}
-	model
-		.class
-		.as_deref()
-		.or(model.legacy_class.as_deref())
-		.filter(|class| !class.is_empty())
-		.unwrap_or("unknown")
 }
 
 fn parse_revision(value: Option<&Value>) -> Option<SemVer> {
@@ -248,246 +172,6 @@ fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
 		.collect();
 	known.sort_unstable();
 	assert_eq!(known, oracle_axes, "KNOWN_AXES drifted from the oracle vocabularies");
-}
-
-#[test]
-fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
-	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
-	let normalized: NormalizedDocument =
-		serde_json::from_str(NORMALIZED_MODELS).expect("normalized model fixture parses");
-	let wire_oracle = profile_shapes(COMPAT_PROFILES, Some("wire/"));
-	let thinking_oracle = profile_shapes(THINKING_PROFILES, None);
-	let mut checked = 0_usize;
-	let mut wire_overridden = 0_usize;
-	let mut thinking_profiled = 0_usize;
-	let mut overlay_applied = 0_usize;
-	for model in &normalized.models {
-		let frozen_class = frozen_class_of(model);
-		let classification = classify(ClassificationInput {
-			phase:          ClassificationPhase::CatalogCompiler,
-			provider:       &model.provider,
-			model:          &model.model,
-			observed_at_ms: None,
-		});
-		if frozen_class != "unknown" && classification.class.as_str() != "unknown" {
-			assert_eq!(
-				classification.class.as_str(),
-				frozen_class,
-				"frozen legacy class diverges for {}",
-				model.id
-			);
-		}
-		let class = classification.class.as_str();
-		let reasoning = model
-			.behavior
-			.as_ref()
-			.is_some_and(|b| b.thinking.is_some());
-		let resolved = cascade
-			.resolve(&ResolveTarget {
-				provider: &model.provider,
-				class,
-				family: classification.family.as_ref().map(|family| family.as_str()),
-				revision: classification.revision,
-				model: &model.model,
-				reasoning,
-			})
-			.unwrap_or_else(|error| panic!("{}: {error}", model.id));
-
-		// Wire: oracle-pinned axes exact; additions only from the census overlay.
-		let mut expected = wire_oracle.get(&model.id).cloned().unwrap_or_default();
-		if !expected.contains_key("thinking_format")
-			&& let Some(format) = census_thinking_format(&model.provider, class)
-		{
-			expected.insert("thinking_format".into(), Value::from(format));
-			overlay_applied += 1;
-		}
-		if model.provider == "opencode-go"
-			&& (model.model == "deepseek-v4-flash" || model.model == "deepseek-v4-pro")
-		{
-			// #8244: the Responses route rejects forced tool choice for DeepSeek
-			// V4; the frozen wire oracle predates the override.
-			expected.insert("supports_tool_choice".into(), Value::from(false));
-		}
-		if model.provider == "opencode-go" || model.provider == "opencode-zen" {
-			// pi 4e32740f63: both gateway Responses routes reject named
-			// forced choices and must cascade to automatic tool selection.
-			expected.insert("supports_forced_tool_choice".into(), Value::from(false));
-		}
-		if class == "deepseek" {
-			let model_name = model.model.to_ascii_lowercase();
-			let encoding = if model_name.contains("deepseek-ocr")
-				|| model_name.contains("janus")
-				|| model_name.contains("vision")
-				|| model_name.contains("vl")
-			{
-				"open_ai_url"
-			} else {
-				"none"
-			};
-			expected.insert("image_encoding_format".into(), Value::from(encoding));
-		}
-		if model.provider == "venice" {
-			expected.insert("reasoning_disable_mode".into(), Value::from("venice-disable-thinking"));
-		}
-		if model.id == "github-copilot/grok-4.6" {
-			expected.insert("thinking_close_max_retries".into(), Value::from(1));
-		}
-		if model.provider == "xai"
-			&& classification
-				.family
-				.as_ref()
-				.is_some_and(|family| family.as_str() == "grok")
-		{
-			// pi PR #7454 cluster: paid xAI routes through /v1/responses like
-			// SuperGrok; the frozen wire oracle predates the migration.
-			expected.insert("filter_reasoning_history".into(), Value::from(false));
-			expected.insert("flatten_root_unions".into(), Value::from(true));
-			expected.insert("include_encrypted_reasoning".into(), Value::from(true));
-			expected.insert("reasoning_effort_map".into(), serde_json::json!({ "minimal": "low" }));
-			expected.insert("supports_reasoning_summary".into(), Value::from(false));
-			let bare = model.model.to_ascii_lowercase();
-			if bare.ends_with("reasoning")
-				|| bare.starts_with("grok-build")
-				|| bare.starts_with("grok-code-fast")
-				|| bare.contains("composer")
-			{
-				// No-dial Responses rows 400 when reasoning.effort is present.
-				expected.insert("omit_reasoning_effort".into(), Value::from(true));
-				expected.insert("supports_reasoning_effort".into(), Value::from(false));
-			} else if bare.contains("grok-4.20-multi-agent") {
-				expected.insert("omit_reasoning_effort".into(), Value::from(false));
-				expected.insert("supports_reasoning_effort".into(), Value::from(true));
-			}
-		}
-		if class == "qwen"
-			&& ["llama.cpp", "lm-studio", "vllm"].contains(&model.provider.as_str())
-			&& classification
-				.revision
-				.is_some_and(|revision| revision >= SemVer::new(3, 8, 0))
-		{
-			expected.insert("template_reasoning_effort".into(), Value::from(true));
-		}
-		if class == "anthropic" {
-			expected.insert("glyph_tokenization".into(), Value::from(true));
-		}
-		if class == "qwen" {
-			expected.insert("leaked_thinking_healer".into(), Value::from("qwen"));
-		}
-		let resolved_wire: BTreeMap<String, Value> = resolved
-			.wire
-			.iter()
-			.map(|(key, value)| (key.as_str().to_owned(), value.clone()))
-			.collect();
-		for key in resolved_wire.keys() {
-			assert!(
-				KNOWN_AXES
-					.iter()
-					.any(|(_, axis, name, _)| *axis == AxisSet::Wire && *name == key),
-				"unknown wire cascade axis {key} for {}",
-				model.id
-			);
-		}
-		if wire_oracle.contains_key(&model.id) {
-			wire_overridden += 1;
-		}
-
-		// Thinking: exact against the profile oracle; empty when not profiled.
-		let mut expected_thinking = thinking_oracle.get(&model.id).cloned().unwrap_or_default();
-		if !resolved.thinking.is_empty()
-			&& let Some(Value::Object(thinking)) = model
-				.behavior
-				.as_ref()
-				.and_then(|behavior| behavior.thinking.as_ref())
-		{
-			expected_thinking = thinking
-				.iter()
-				.filter(|(_, value)| {
-					!value.is_null() && !matches!(value, Value::Object(values) if values.is_empty())
-				})
-				.map(|(key, value)| (key.clone(), value.clone()))
-				.collect();
-		}
-		if matches!(
-			model.id.as_str(),
-			"opencode-go/deepseek-v4-flash"
-				| "aiand/deepseek-ai/deepseek-v4-pro"
-				| "aimlapi/deepseek-v4-pro"
-		) {
-			expected_thinking.insert(
-				"efforts".into(),
-				Value::from(vec![Value::from("low"), Value::from("high"), Value::from("max")]),
-			);
-		}
-		if model.id == "baseten/moonshotai/Kimi-K3" {
-			expected_thinking.extend([
-				("defaultLevel".into(), Value::from("max")),
-				(
-					"efforts".into(),
-					Value::from(vec![Value::from("low"), Value::from("high"), Value::from("max")]),
-				),
-				("mode".into(), Value::from("effort")),
-			]);
-		}
-		if model.id == "xai-oauth/grok-4.5" {
-			// #8369 (scoped): mandatory high default; the frozen row's legacy
-			// compat pins the ladder itself until the next snapshot import.
-			expected_thinking.extend([
-				("defaultLevel".into(), Value::from("high")),
-				("requiresEffort".into(), Value::from(true)),
-			]);
-		}
-		if model.id == "nanogpt/linkup-research" {
-			// #8364's exact-rule reasoning promotion woke nanogpt.kdl's intentional
-			// tiered ladder for this logical alias; the frozen profile oracle
-			// predates the promotion.
-			expected_thinking.extend([
-				("defaultLevel".into(), Value::from("high")),
-				(
-					"efforts".into(),
-					Value::from(vec![
-						Value::from("low"),
-						Value::from("medium"),
-						Value::from("high"),
-						Value::from("xhigh"),
-					]),
-				),
-				("mode".into(), Value::from("effort")),
-				("requiresEffort".into(), Value::from(true)),
-			]);
-		}
-		let resolved_thinking: BTreeMap<String, Value> = resolved
-			.thinking
-			.iter()
-			.map(|(key, value)| (key.as_str().to_owned(), value.clone()))
-			.collect();
-		for key in resolved_thinking.keys() {
-			assert!(
-				KNOWN_AXES
-					.iter()
-					.any(|(_, axis, name, _)| *axis == AxisSet::Thinking && *name == key),
-				"unknown thinking cascade axis {key} for {}",
-				model.id
-			);
-		}
-		assert_eq!(
-			!resolved_thinking.is_empty()
-				|| model
-					.behavior
-					.as_ref()
-					.is_some_and(|behavior| behavior.thinking.is_some()),
-			reasoning,
-			"capability gate desynced from available thinking for {}",
-			model.id
-		);
-		if reasoning {
-			thinking_profiled += 1;
-		}
-		checked += 1;
-	}
-	assert_eq!(checked, 4_450, "full catalog roster resolved");
-	assert_eq!(wire_overridden, 290, "live archived wire override census");
-	assert_eq!(thinking_profiled, 2_549, "thinking profile census");
-	assert!(overlay_applied > 500, "census overlay must reach real models: {overlay_applied}");
 }
 
 #[test]

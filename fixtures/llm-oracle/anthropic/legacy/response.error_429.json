@@ -1,5 +1,0 @@
-{
-  "http": {"status": 429, "headers": {"content-type": "application/json", "retry-after": "60", "request-id": "req_REDACTED"}},
-  "body": {"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit exceeded"}},
-  "expect": {"error_kind": "rate_limit", "retry_after_ms": 60000, "retryable": true}
-}

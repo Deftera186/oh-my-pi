@@ -466,6 +466,16 @@ impl Catalog {
 		&self.normalized_json_sha256
 	}
 
+	/// Returns the compiled catalog backing this snapshot.
+	///
+	/// Test harnesses clone this to derive modified catalogs and re-[`encode`]
+	/// them; production code uses the indexed lookups instead.
+	///
+	/// [`encode`]: Catalog::encode
+	pub const fn compiled(&self) -> &CompiledCatalog {
+		&self.compiled
+	}
+
 	/// Looks up one provider by exact stable identifier.
 	pub fn provider(&self, id: &ProviderId<str>) -> Option<&ProviderDef> {
 		self

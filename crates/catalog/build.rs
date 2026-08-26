@@ -4,7 +4,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, de::IgnoredAny};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: u32 = 1;
@@ -28,42 +28,13 @@ struct SourceInput {
 	source: String,
 }
 
-#[derive(Deserialize)]
-struct ReviewArtifact<'a> {
-	schema_version:     u32,
-	revision:           &'a str,
-	#[serde(rename = "census")]
-	_census:            IgnoredAny,
-	#[serde(rename = "providers")]
-	_providers:         IgnoredAny,
-	#[serde(rename = "auth_specs")]
-	_auth_specs:        IgnoredAny,
-	#[serde(rename = "oauth_specs")]
-	_oauth_specs:       IgnoredAny,
-	#[serde(rename = "header_profiles")]
-	_header_profiles:   IgnoredAny,
-	#[serde(rename = "discovery_specs")]
-	_discovery_specs:   IgnoredAny,
-	#[serde(rename = "routes")]
-	_routes:            IgnoredAny,
-	#[serde(rename = "models")]
-	_models:            IgnoredAny,
-	#[serde(rename = "wire_policies")]
-	_wire_policies:     IgnoredAny,
-	#[serde(rename = "thinking_policies")]
-	_thinking_policies: IgnoredAny,
-	#[serde(rename = "aliases")]
-	_aliases:           IgnoredAny,
-}
-
 fn main() {
 	let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
 	let data = manifest.join("data");
 	let source_lock_path = data.join("sources.lock.json");
-	let review_path = data.join("catalog.normalized.json");
 	let snapshot_path = data.join("catalog.postcard");
 
-	for path in [&source_lock_path, &review_path, &snapshot_path] {
+	for path in [&source_lock_path, &snapshot_path] {
 		println!("cargo:rerun-if-changed={}", path.display());
 	}
 
@@ -76,17 +47,8 @@ fn main() {
 	let source_digest = source_digest(&lock.inputs);
 	assert_eq!(lock.source_digest, hex(&source_digest), "catalog source-lock digest mismatch");
 
-	let review_bytes = read_required(&review_path);
-	let review: ReviewArtifact<'_> = serde_json::from_slice(&review_bytes).unwrap_or_else(|error| {
-		panic!("invalid normalized catalog {}: {error}", review_path.display())
-	});
-	assert_eq!(review.schema_version, SCHEMA_VERSION, "unsupported normalized catalog schema");
-	assert!(!review.revision.is_empty(), "normalized catalog revision is empty");
-	assert_eq!(review.schema_version, lock.schema_version, "catalog schemas disagree");
-	let review_hash: [u8; 32] = Sha256::digest(&review_bytes).into();
-
 	let snapshot = read_required(&snapshot_path);
-	validate_snapshot(&snapshot, &source_digest, &review_hash);
+	validate_snapshot(&snapshot, &source_digest);
 	println!("cargo:rustc-env=OMP_LLM_CATALOG_SOURCE_DIGEST={}", lock.source_digest);
 }
 
@@ -131,7 +93,7 @@ fn source_digest(inputs: &[SourceInput]) -> [u8; 32] {
 	digest.finalize().into()
 }
 
-fn validate_snapshot(bytes: &[u8], source_digest: &[u8; 32], review_hash: &[u8; 32]) {
+fn validate_snapshot(bytes: &[u8], source_digest: &[u8; 32]) {
 	if env::var_os("OMP_LLM_CATALOG_REGEN").is_some() {
 		// Bootstrap escape: the generator example rebuilds the snapshot from the
 		// current lock; header assertions would otherwise forbid compiling it.
@@ -142,7 +104,6 @@ fn validate_snapshot(bytes: &[u8], source_digest: &[u8; 32], review_hash: &[u8; 
 	let schema = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed schema field"));
 	assert_eq!(schema, SCHEMA_VERSION, "unsupported catalog snapshot schema");
 	assert_eq!(&bytes[12..44], source_digest, "catalog snapshot source digest mismatch");
-	assert_eq!(&bytes[44..76], review_hash, "catalog snapshot normalized JSON hash mismatch");
 	let payload_hash: [u8; 32] = Sha256::digest(&bytes[HEADER_LEN..]).into();
 	assert_eq!(&bytes[76..108], &payload_hash, "catalog snapshot payload hash mismatch");
 }

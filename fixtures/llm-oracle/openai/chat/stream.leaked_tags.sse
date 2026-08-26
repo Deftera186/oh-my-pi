@@ -1,6 +1,0 @@
-data: {"id":"chatcmpl_leak","choices":[{"index":0,"delta":{"content":"<think>Need to inspect</think>Answer.\n```xml\n<tool_call><name>read</name><arguments>{\"path\":\"README.md\"}</arguments></tool_call>\n```"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl_leak","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
-
-data: [DONE]
-

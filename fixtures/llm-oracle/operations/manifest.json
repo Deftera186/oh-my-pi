@@ -2,13 +2,6 @@
   "category": "operations",
   "fixtures": [
     {
-      "id": "operations.audio.v1",
-      "path": "audio.json",
-      "secret_free": true,
-      "sha256": "fe77ebe6f64157ee9c0f86c707e48ea1b1d2b54bbafbcac9689f76ac8916fcaf",
-      "source": "archive/llm-legacy/llm-gateway/src/facade/audio.rs::handle"
-    },
-    {
       "id": "operations.blob.payload.v1",
       "path": "blob-payload.bin",
       "secret_free": true,
@@ -16,118 +9,11 @@
       "source": "archive/llm-legacy/llm-gateway/tests/blob_grpc.rs::remote_chunked_blob_lifecycle_ranges_limits_and_cancellation"
     },
     {
-      "id": "operations.blob.rpc.v1",
-      "path": "blob-rpc.json",
-      "secret_free": true,
-      "sha256": "a0a810789de797a6e855d40ebab978c096be97b344f83585c8e1d846652dd1dd",
-      "source": "archive/llm-legacy/llm-gateway/tests/blob_grpc.rs::remote_chunked_blob_lifecycle_ranges_limits_and_cancellation"
-    },
-    {
-      "id": "operations.embeddings.v1",
-      "path": "embeddings.json",
-      "secret_free": true,
-      "sha256": "aa0a6bf21f614a8e6aa553042a0eacc9960c46e8d9a826b5a56953305754e2c7",
-      "source": "archive/llm-legacy/llm-gateway/src/facade/embeddings.rs::handle"
-    },
-    {
-      "id": "operations.federation.cancel.v1",
-      "path": "federation-cancel.json",
-      "redactions": [
-        "sentinel credential replaced with bracketed label"
-      ],
-      "secret_free": true,
-      "sha256": "92a0fd32a1e8ec0c3b713b87c24c85083f76c80e6f7176e1b47fee20a60ce656",
-      "source": "archive/llm-legacy/llm-gateway/tests/federation_cancel.rs::dropping_direct_and_federated_turns_aborts_terminal_streams"
-    },
-    {
-      "id": "operations.gateway.errors.v1",
-      "path": "gateway-errors.json",
-      "redactions": [
-        "private provider diagnostic replaced with bracketed label"
-      ],
-      "secret_free": true,
-      "sha256": "dc1fe22904af70850b458ce27cc36b8c97764591fe8555c7e9d9dc2b8cd32981",
-      "source": "archive/llm-legacy/llm-gateway/src/facade/mod.rs::error_response"
-    },
-    {
-      "id": "operations.image.input.v1",
-      "path": "image-input.bin",
-      "secret_free": true,
-      "sha256": "1d60a7aaa91167db2bfdddfa7aacef3da0de7368a3c5ece3e378a9df6e49dccb",
-      "source": "archive/llm-legacy/llm-gateway/tests/facade_smoke.rs::openai_and_anthropic_sdk_routes"
-    },
-    {
-      "id": "operations.image.output.v1",
-      "path": "image-output.bin",
-      "secret_free": true,
-      "sha256": "887dea56f2f87762fb17a4026d180a6021993345bf18682e446471c066a1f152",
-      "source": "archive/llm-legacy/llm-gateway/tests/facade_smoke.rs::FakeImages::generate"
-    },
-    {
-      "id": "operations.image.v1",
-      "path": "image.json",
-      "secret_free": true,
-      "sha256": "9a8f7b4ec4e4c021c7332a2dd8a2eb4c3baa5bfdb07b83286e17adad78e25cb3",
-      "source": "archive/llm-legacy/llm-gateway/src/facade/images.rs::handle"
-    },
-    {
-      "id": "operations.models.v1",
-      "path": "models.json",
-      "redactions": [
-        "provider credential values replaced with bracketed labels"
-      ],
-      "secret_free": true,
-      "sha256": "69e99ad59c07859101f3a1699dde2ec38dfff6be249fbfa3c3f852e3e49c8518",
-      "source": "archive/llm-legacy/llm-gateway/src/facade/models.rs::handle"
-    },
-    {
       "id": "operations.native.wire.facades.v1",
       "path": "native-wire-facades.json",
       "secret_free": true,
       "sha256": "bc3ed3019b606762da0eac320e4e49a1da649a74594b1ad5321624e0542abeed",
       "source": "archive/llm-legacy/llm-gateway/src/facade/mod.rs::Router::route"
-    },
-    {
-      "id": "operations.pi.native.rpc.v1",
-      "path": "pi-native-rpc.json",
-      "secret_free": true,
-      "sha256": "e37488bc629a047b8209606e92b0d1b764727052f66e0e64401049ebc6f1f956",
-      "source": "archive/llm-legacy/llm-gateway/tests/turn_protocol.rs::incremental_open"
-    },
-    {
-      "id": "operations.search.v1",
-      "path": "search.json",
-      "secret_free": true,
-      "sha256": "ba792d3c9f5171c18a02de4c55cfd1ce7cd66e2e4a226f653b9ddf8acde8cdb7",
-      "source": "archive/llm-legacy/llm-gateway/src/search.rs::SearchRegistry::execute"
-    },
-    {
-      "id": "operations.speech.output.v1",
-      "path": "speech-output.bin",
-      "secret_free": true,
-      "sha256": "fd9fb63004bc39422ed2cec0a22b454bf4c1b35e8096e7b20fe2aad00ea5946e",
-      "source": "archive/llm-legacy/llm-gateway/tests/facade_smoke.rs::FakeSpeak::speak"
-    },
-    {
-      "id": "operations.transcription.input.v1",
-      "path": "transcription-input.bin",
-      "secret_free": true,
-      "sha256": "7fdeab626f4134da3bb5287a5edc208564d255e32e8c1286aec9b458626557cf",
-      "source": "archive/llm-legacy/llm-gateway/tests/facade_smoke.rs::FakeTranscribe::transcribe"
-    },
-    {
-      "id": "operations.video.output.v1",
-      "path": "video-output.bin",
-      "secret_free": true,
-      "sha256": "931d4064df098f5d1284a26c571cab77ebfbdc64db9d93938d1f7b914ce6db62",
-      "source": "archive/llm-legacy/llm-gateway/tests/facade_smoke.rs::openai_and_anthropic_sdk_routes"
-    },
-    {
-      "id": "operations.video.v1",
-      "path": "video.json",
-      "secret_free": true,
-      "sha256": "4eb0d7188658b096041300ca7d43242e855e058efe87ffb1bc3f70bcd21fc5a1",
-      "source": "archive/llm-legacy/llm-gateway/src/facade/videos.rs::handle"
     }
   ],
   "schema_version": 1

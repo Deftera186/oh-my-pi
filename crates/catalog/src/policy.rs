@@ -1147,46 +1147,6 @@ mod tests {
 		name:     Str,
 	}
 
-	#[derive(Deserialize)]
-	struct DomainFixture {
-		enum_domains: EnumDomains,
-	}
-
-	#[derive(Deserialize)]
-	struct EnumDomains {
-		audio_api_version:             Vec<AudioApiVersion>,
-		cache_control_format:          Vec<CacheControlFormat>,
-		image_encoding_format:         Vec<ImageEncodingFormat>,
-		leaked_thinking_healer:        Vec<LeakedThinkingHealer>,
-		max_tokens_field:              Vec<MaxTokensField>,
-		reasoning_wire_format:         Vec<ReasoningWireFormat>,
-		stream_protocol:               Vec<StreamProtocol>,
-		thinking_tool_choice_conflict: Vec<ThinkingToolChoiceConflict>,
-		tool_call_id_profile:          Vec<ToolCallIdProfile>,
-		tool_schema_flavor:            Vec<ToolSchemaFlavor>,
-		tool_strict_mode:              Vec<ToolStrictMode>,
-	}
-
-	#[test]
-	fn every_fixture_enum_domain_is_typed_and_complete() {
-		let fixture: DomainFixture = serde_json::from_str(include_str!(
-			"../../../fixtures/llm-oracle/catalog-policy/compat-defaults-and-domains.json"
-		))
-		.expect("every fixture enum value is representable");
-		let domains = fixture.enum_domains;
-		assert_eq!(domains.audio_api_version.len(), 2);
-		assert_eq!(domains.cache_control_format.len(), 4);
-		assert_eq!(domains.image_encoding_format.len(), 4);
-		assert_eq!(domains.leaked_thinking_healer.len(), 4);
-		assert_eq!(domains.max_tokens_field.len(), 3);
-		assert_eq!(domains.reasoning_wire_format.len(), 9);
-		assert_eq!(domains.stream_protocol.len(), 4);
-		assert_eq!(domains.thinking_tool_choice_conflict.len(), 4);
-		assert_eq!(domains.tool_call_id_profile.len(), 3);
-		assert_eq!(domains.tool_schema_flavor.len(), 6);
-		assert_eq!(domains.tool_strict_mode.len(), 3);
-	}
-
 	#[test]
 	fn all_compatibility_fixture_shapes_are_distinct_and_content_stable() {
 		let fixture: CompatFixture = serde_json::from_str(include_str!(

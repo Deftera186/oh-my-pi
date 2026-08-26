@@ -1,4 +1,0 @@
-data: {"error":{"code":429,"message":"Individual quota reached","status":"RESOURCE_EXHAUSTED"}}
-
-data: {"response":{"candidates":[{"content":{"parts":[{"text":"must not appear after terminal"}]},"finishReason":"STOP"}]}}
-

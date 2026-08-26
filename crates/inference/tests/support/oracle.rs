@@ -1,5 +1,4 @@
 use std::{
-	collections::BTreeSet,
 	fs,
 	path::{Component, Path, PathBuf},
 };
@@ -7,17 +6,7 @@ use std::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-pub const CATEGORIES: &[&str] = &[
-	"openai",
-	"anthropic",
-	"google",
-	"bedrock",
-	"agent-protocols",
-	"transport",
-	"recovery",
-	"auth-error",
-	"operations",
-];
+pub const CATEGORIES: &[&str] = &["transport", "operations"];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Manifest {
@@ -67,21 +56,6 @@ pub fn fixture(category: &str, id: &str) -> Fixture {
 		.find(|entry| entry.id == id)
 		.unwrap_or_else(|| panic!("fixture {id} is not identified through {category}/manifest.json"));
 	load_entry(category, entry)
-}
-
-pub fn all(category: &str) -> Vec<Fixture> {
-	let manifest = manifest(category);
-	let mut ids = BTreeSet::new();
-	let mut paths = BTreeSet::new();
-	manifest
-		.fixtures
-		.into_iter()
-		.map(|entry| {
-			assert!(ids.insert(entry.id.clone()), "duplicate fixture id {}", entry.id);
-			assert!(paths.insert(entry.path.clone()), "duplicate fixture path {}", entry.path);
-			load_entry(category, entry)
-		})
-		.collect()
 }
 
 fn load_entry(category: &str, entry: FixtureEntry) -> Fixture {

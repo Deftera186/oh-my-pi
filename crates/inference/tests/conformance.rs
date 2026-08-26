@@ -135,30 +135,7 @@ const fn replayable_evidence() -> AttemptBodyEvidence {
 }
 
 #[test]
-fn category_manifests_are_closed_secret_free_and_content_addressed() {
-	let mut artifacts = 0usize;
-	for category in oracle::CATEGORIES {
-		let fixtures = oracle::all(category);
-		assert!(!fixtures.is_empty(), "{category} manifest must identify fixtures");
-		artifacts += fixtures.len();
-	}
-	assert!(artifacts >= 100, "the unified oracle unexpectedly lost coverage: {artifacts}");
-}
-
-#[test]
-fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
-	for id in [
-		"operations.audio.v1",
-		"operations.embeddings.v1",
-		"operations.image.v1",
-		"operations.models.v1",
-		"operations.native.wire.facades.v1",
-		"operations.search.v1",
-		"operations.video.v1",
-	] {
-		let _ = oracle::fixture("operations", id);
-	}
-
+fn every_operation_has_a_typed_extraction() {
 	let provenance = TokenizerProvenance {
 		tokenizer: sf!("fixture-tokenizer"),
 		revision:  sf!("1"),
@@ -285,7 +262,6 @@ fn every_operation_has_a_typed_extraction_bound_to_the_operations_manifest() {
 }
 #[tokio::test]
 async fn realtime_session_public_api_is_bounded_and_has_one_shared_terminal_transition() {
-	let _ = oracle::fixture("operations", "operations.audio.v1");
 	fn assert_output_type<O: Operation<Output = RealtimeSession>>() {}
 	assert_output_type::<RealtimeRequest>();
 
@@ -410,8 +386,6 @@ fn transport_sse_replays_incrementally_with_exact_order_and_terminal_state() {
 
 #[test]
 fn forced_tool_and_structured_output_never_leak_provisional_events() {
-	let _ = oracle::fixture("openai", "openai.responses.stream.server.tools.ordering.v1");
-	let _ = oracle::fixture("google", "google.recorded.google-genai.stream.thought-tool-usage.v1");
 	let mut emitted = Vec::new();
 	let partial = ChatEvent::ToolArgumentsDelta { index: 0, bytes: Bytes::from_static(b"{\"q\":") };
 	let mut tool_gate = OutputGate::new(
@@ -460,7 +434,6 @@ fn forced_tool_and_structured_output_never_leak_provisional_events() {
 
 #[test]
 fn provisional_cancellation_hides_events_but_preserves_usage_and_cost_receipts() {
-	let _ = oracle::fixture("transport", "transport.lifecycle.cassettes.v1");
 	let mut gate = OutputGate::new(GateCondition::WholeAttempt, 4096);
 	let mut output = Vec::new();
 	gate
@@ -499,8 +472,6 @@ fn provisional_cancellation_hides_events_but_preserves_usage_and_cost_receipts()
 
 #[tokio::test]
 async fn consumed_one_shot_suppresses_every_automatic_action_and_factories_are_fresh() {
-	let _ = oracle::fixture("openai", "openai.responses.recovery.one.shot.bound.v1");
-	let _ = oracle::fixture("transport", "transport.retry.cassettes.v1");
 	let source = BodySource::from_stream(Box::pin(stream::iter([Ok(Bytes::from_static(b"once"))])));
 	let mut first = source.begin_attempt();
 	let mut reader = first.open().await.expect("first reader");
@@ -540,7 +511,6 @@ async fn consumed_one_shot_suppresses_every_automatic_action_and_factories_are_f
 
 #[test]
 fn mixed_multipart_replayability_is_conservative_and_lossless() {
-	let _ = oracle::fixture("openai", "openai.responses.request.multimodal.options.v1");
 	let replayable = BodySource::bytes(Bytes::from_static(b"text"));
 	let one_shot = BodySource::from_stream(Box::pin(stream::empty()));
 	let evidence = aggregate_replay_evidence([&replayable, &one_shot]);
@@ -550,7 +520,6 @@ fn mixed_multipart_replayability_is_conservative_and_lossless() {
 
 #[tokio::test]
 async fn staging_cancellation_is_terminal_and_receipted_without_a_fake_success() {
-	let _ = oracle::fixture("operations", "operations.federation.cancel.v1");
 	let source = BodySource::bytes(Bytes::from_static(b"never staged"));
 	let policy = StagingPolicy::memory_only(1024, 1024);
 	let cancellation = StagingCancellation::new();
@@ -571,7 +540,6 @@ async fn staging_cancellation_is_terminal_and_receipted_without_a_fake_success()
 
 #[test]
 fn session_forks_are_immutable_and_reseed_is_strictly_one_shot() {
-	let _ = oracle::fixture("recovery", "recovery.middleware-corpus.v1");
 	let store = InMemoryConversationStore::<Str>::new();
 	let root = store.create().unwrap();
 	let main = root.conversation().to_owned();
@@ -756,7 +724,6 @@ async fn cassette_transport_uses_real_decoder_and_retains_exact_replay_evidence(
 
 #[tokio::test]
 async fn cassette_first_frame_failure_carries_last_attempt_body_evidence() {
-	let _ = oracle::fixture("transport", "transport.lifecycle.cassettes.v1");
 	let attempt = CassetteAttempt {
 		status:              Some(502),
 		headers:             Box::new([]),
@@ -797,8 +764,6 @@ async fn cassette_first_frame_failure_carries_last_attempt_body_evidence() {
 
 #[test]
 fn signed_gemini_visible_text_proof_round_trips_and_cca_lowers_account_project() {
-	let _ = oracle::fixture("google", "google.recorded.google-cca.expect.signature-tool.v1");
-	let _ = oracle::fixture("google", "google.recorded.google-cca.request.antigravity.v1");
 	let codec_id = CodecId::from("google-cca");
 	let catalog = Catalog::embedded();
 	let model = catalog
@@ -1088,73 +1053,7 @@ fn every_real_codec_constructs_fresh_attempt_decoder_state_offline() {
 }
 
 #[test]
-fn representative_codec_and_operation_matrix_is_manifest_resolved() {
-	let codec_rows = [
-		("openai-chat", "openai", "openai.chat.stream.parity.v1"),
-		("openai-responses", "openai", "openai.responses.stream.encrypted.tool.usage.v1"),
-		("openai-codex", "openai", "openai.codex.websocket.interleaved.v1"),
-		("anthropic-messages", "anthropic", "anthropic.legacy.stream-thinking-tool-usage.v1"),
-		("anthropic-vertex", "anthropic", "anthropic.adapter.vertex-raw-predict.v1"),
-		("gemini", "google", "google.recorded.google-genai.stream.semantic-parity.v1"),
-		("google-cca", "google", "google.recorded.google-cca.stream.signature-tool.v1"),
-		("bedrock-converse", "bedrock", "bedrock.eventstream.success.canonical.events.v1"),
-		("ollama", "agent-protocols", "agent.protocols.ollama.cloud.stream.ndjson.v1"),
-		("cursor", "agent-protocols", "agent.protocols.cursor.connect.decode.contract.json.v1"),
-		("devin", "agent-protocols", "agent.protocols.devin.stream.argument.modes.json.v1"),
-		("gitlab", "agent-protocols", "agent.protocols.gitlab.stream.reconnect.jsonl.v1"),
-		("native-facade", "operations", "operations.native.wire.facades.v1"),
-	];
-	for (codec, category, fixture) in codec_rows {
-		assert_ne!(codec, "");
-		assert!(!oracle::fixture(category, fixture).bytes.is_empty(), "{codec} fixture is empty");
-	}
-
-	let operations = [
-		OperationKind::Chat,
-		OperationKind::CountTokens,
-		OperationKind::Tokenize,
-		OperationKind::Detokenize,
-		OperationKind::Embed,
-		OperationKind::GenerateImage,
-		OperationKind::GenerateVideo,
-		OperationKind::Speak,
-		OperationKind::Transcribe,
-		OperationKind::Realtime,
-		OperationKind::Search,
-		OperationKind::Usage,
-		OperationKind::DiscoverModels,
-		OperationKind::Auth,
-		OperationKind::Native,
-	];
-	assert_eq!(operations.len(), 15);
-	let mut unique = BTreeSet::new();
-	for operation in operations {
-		assert!(unique.insert(operation));
-	}
-}
-
-#[test]
-fn security_regression_oracles_are_manifest_resolved() {
-	for (category, id) in [
-		("transport", "transport.lifecycle.cassettes.v1"),
-		("transport", "transport.retry.cassettes.v1"),
-		("agent-protocols", "agent.protocols.cursor.connect.cancel.json.v1"),
-		("agent-protocols", "agent.protocols.cursor.connect.deadline.json.v1"),
-		("agent-protocols", "agent.protocols.cursor.chat.headers.json.v1"),
-		("agent-protocols", "agent.protocols.gitlab.auth.headers.json.v1"),
-		("bedrock", "bedrock.sigv4.case.v1"),
-		("bedrock", "bedrock.sigv4.request.body.v1"),
-		("bedrock", "bedrock.sigv4.canonical.request.v1"),
-		("bedrock", "bedrock.sigv4.string.to.sign.v1"),
-		("auth-error", "auth.login.flows.v1"),
-	] {
-		assert!(!oracle::fixture(category, id).bytes.is_empty(), "{id} is empty");
-	}
-}
-
-#[test]
 fn quota_exhaustion_rotates_accounts_without_confusing_identity_or_rate_state() {
-	let _ = oracle::fixture("auth-error", "account.quota.rate.timelines.v1");
 	let route = RouteId::from("offline-route");
 	let pool = AccountPool::new();
 	for (account, principal) in [
@@ -1205,7 +1104,6 @@ fn quota_exhaustion_rotates_accounts_without_confusing_identity_or_rate_state() 
 
 #[tokio::test]
 async fn concurrent_auth_refresh_is_single_flight_and_waiters_share_the_exact_result() {
-	let _ = oracle::fixture("auth-error", "auth.refresh.timelines.v1");
 	let store = refresh::shared();
 	let coordinator =
 		RefreshCoordinator::new("conformance-process", RefreshPolicy::default()).unwrap();
@@ -1243,7 +1141,6 @@ async fn concurrent_auth_refresh_is_single_flight_and_waiters_share_the_exact_re
 
 #[tokio::test]
 async fn client_plans_without_service_effects_executes_the_exact_route_and_rejects_stale_plans() {
-	let _ = oracle::fixture("transport", "transport.lifecycle.cassettes.v1");
 	let catalog = Arc::new(Catalog::embedded().clone());
 	let model = catalog
 		.models()

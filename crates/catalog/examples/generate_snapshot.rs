@@ -45,8 +45,12 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 	let oauth = fs::read_to_string(workspace.join("fixtures/llm-oracle/catalog/oauth.toml"))?;
 	let catalog = compile_oracle(&providers, &models, &oauth)?;
 	let artifacts = Catalog::encode(catalog, SnapshotProvenance { source_digest })?;
-	fs::write(crate_dir.join("data/catalog.normalized.json"), artifacts.normalized_json)?;
 	fs::write(crate_dir.join("data/catalog.postcard"), artifacts.postcard)?;
+	// The normalized JSON is a review artifact only: reproducible from the
+	// postcard (its hash rides the snapshot header), so it stays out of git.
+	let review = workspace.join("target/catalog.normalized.json");
+	fs::write(&review, artifacts.normalized_json)?;
+	println!("review artifact: {}", review.display());
 	Ok(())
 }
 
