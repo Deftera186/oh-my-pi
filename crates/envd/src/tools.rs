@@ -42,7 +42,6 @@ use omp_tool::{
 	Tool, ToolSpec, ToolsPolicy,
 };
 use omp_tools::{
-	BuiltinRendererIdentities,
 	ask::PresenterSlot,
 	checkpoint,
 	device::{DeviceCatalog, flatten_slots, xd_enabled},
@@ -55,7 +54,6 @@ use omp_tools::{
 		resolver::{ResolverTable, ResourceCompletion, ResourceList, SchemeEntry},
 		selector::ParsedSelector,
 	},
-	register_builtin_renderers,
 	shell::TimeoutBounds,
 	staging::StagedProposalRegistry,
 };
@@ -1863,13 +1861,17 @@ pub(crate) fn production_registry<
 	}
 	let search_bridge = Arc::new(SearchBridgeHost::new(search));
 	let browser_daemon = BrowserDaemon::start(blobs.clone());
-	let browser = omp_tools::browser::tool(browser_daemon);
-	let browser_identity = browser.spec().identity();
-	registry.register(browser, Presentation::Device, builtin_device_claims())?;
+	registry.register(
+		omp_tools::browser::tool(browser_daemon),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
 	let computer = ComputerSessionHost::new(blobs.clone());
-	let computer_tool = omp_tools::computer::tool(computer);
-	let computer_identity = computer_tool.spec().identity();
-	registry.register(computer_tool, Presentation::Device, builtin_device_claims())?;
+	registry.register(
+		omp_tools::computer::tool(computer),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
 	for device in [
 		media_devices::image_gen(
 			Arc::clone(&search_bridge),
@@ -1939,9 +1941,11 @@ pub(crate) fn production_registry<
 	if let Some(upload) = telemetry_upload {
 		upload.start(Arc::clone(telemetry), Arc::clone(&github_credentials));
 	}
-	let github_tool = omp_tools::github::tool(github);
-	let github_identity = github_tool.spec().identity();
-	registry.register(github_tool, Presentation::Device, builtin_device_claims())?;
+	registry.register(
+		omp_tools::github::tool(github),
+		Presentation::Device,
+		builtin_device_claims(),
+	)?;
 	let ssh = SshService::new(
 		HostStore::load(&state_dir.join("ssh/hosts.toml"))
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
@@ -1996,23 +2000,17 @@ pub(crate) fn production_registry<
 			hashline_headers:   tool_settings.enabled("edit") && selected_edit.family.as_str() == "hl",
 		},
 	);
-	let read_identity = read.spec().identity();
 	if tool_settings.enabled("read") {
 		registry.register(read, Presentation::Slot, core_claims())?;
 	}
 	let fetch = omp_tools::fetch::tool(read_sources.clone());
-	let fetch_identity = fetch.spec().identity();
 	if tool_settings.enabled("fetch") && tool_settings.fetch_enabled {
 		registry.register(fetch, Presentation::Slot, core_claims())?;
 	}
-	let web_search_identity = if tool_settings.enabled("web_search") {
+	if tool_settings.enabled("web_search") {
 		let web_search = omp_tools::web_search::tool(Arc::clone(&search_bridge));
-		let identity = web_search.spec().identity();
 		registry.register(web_search, Presentation::Slot, core_claims())?;
-		Some(identity)
-	} else {
-		None
-	};
+	}
 
 	let edit_observer = omp_tools::edit::observer::EditObserver::new(
 		omp_tools::edit::observer::EditBlackboxConfig {
@@ -2059,29 +2057,6 @@ pub(crate) fn production_registry<
 		tool_settings.format_policy,
 		edit_observer,
 	));
-	let edit_identity = [
-		hashline_edit
-			.as_ref()
-			.expect("constructed")
-			.spec()
-			.identity(),
-		replace_edit
-			.as_ref()
-			.expect("constructed")
-			.spec()
-			.identity(),
-		patch_edit.as_ref().expect("constructed").spec().identity(),
-		apply_patch_edit
-			.as_ref()
-			.expect("constructed")
-			.spec()
-			.identity(),
-		sloppy_edit.as_ref().expect("constructed").spec().identity(),
-	]
-	.into_iter()
-	.find(|identity| identity.rev == selected_edit)
-	.ok_or_else(|| EnvdError::EditDialect(sf!("selected edit revision is not registered")))?
-	.clone();
 	if tool_settings.enabled("edit") {
 		let mut edits = [
 			(
@@ -2148,30 +2123,30 @@ pub(crate) fn production_registry<
 		conflicts,
 		tool_settings.format_policy,
 	);
-	let write_identity = write.spec().identity();
 	if tool_settings.enabled("write") {
 		registry.register(write, Presentation::Slot, core_claims())?;
 	}
-	let mut lsp_identity = None;
 	if tool_settings.enabled("lsp") {
 		let maximum = tool_settings
 			.max_timeout
 			.and_then(|duration| duration.to_std().ok())
 			.unwrap_or_else(|| time::Duration::from_secs(300));
-		let lsp =
-			omp_tools::lsp::tool(DocumentLspControl::new(documents.clone(), exec.clone()), maximum);
-		lsp_identity = Some(lsp.spec().identity());
-		registry.register(lsp, Presentation::Slot, core_claims())?;
+		registry.register(
+			omp_tools::lsp::tool(DocumentLspControl::new(documents.clone(), exec.clone()), maximum),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
-	let mut debug_identity = None;
 	if tool_settings.enabled("debug") {
 		let maximum = tool_settings
 			.max_timeout
 			.and_then(|duration| duration.to_std().ok())
 			.unwrap_or_else(|| time::Duration::from_secs(300));
-		let debug = omp_tools::debug::tool(DocumentDebugControl::new(documents.clone()), maximum);
-		debug_identity = Some(debug.spec().identity());
-		registry.register(debug, Presentation::Slot, core_claims())?;
+		registry.register(
+			omp_tools::debug::tool(DocumentDebugControl::new(documents.clone()), maximum),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
 	let search = WorkspaceSearchAdapter::new(
 		workspace.clone(),
@@ -2180,26 +2155,26 @@ pub(crate) fn production_registry<
 		Arc::clone(&resolvers),
 	);
 	let grep = omp_tools::grep::tool(search.clone(), blobs.clone());
-	let grep_identity = grep.spec().identity();
 	if tool_settings.enabled("grep") {
 		registry.register(grep, Presentation::Slot, core_claims())?;
 	}
 	let glob = omp_tools::glob::tool(search, blobs.clone());
-	let glob_identity = glob.spec().identity();
 	if tool_settings.enabled("glob") {
 		registry.register(glob, Presentation::Slot, core_claims())?;
 	}
-	let mut ast_grep_identity = None;
-	let mut ast_edit_identity = None;
 	if tool_settings.enabled("ast_grep") {
-		let ast_grep = omp_tools::ast_grep::tool(workspace.root().to_path_buf());
-		ast_grep_identity = Some(ast_grep.spec().identity());
-		registry.register(ast_grep, Presentation::Slot, core_claims())?;
+		registry.register(
+			omp_tools::ast_grep::tool(workspace.root().to_path_buf()),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
 	if tool_settings.enabled("ast_edit") {
-		let ast_edit = omp_tools::ast_edit::tool(workspace.root().to_path_buf(), previews.clone());
-		ast_edit_identity = Some(ast_edit.spec().identity());
-		registry.register(ast_edit, Presentation::Slot, core_claims())?;
+		registry.register(
+			omp_tools::ast_edit::tool(workspace.root().to_path_buf(), previews.clone()),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
 	let prelude = Arc::new(build_prelude_table(workers)?);
 	let helper_docs = prelude
@@ -2211,7 +2186,7 @@ pub(crate) fn production_registry<
 		.collect::<Vec<_>>();
 	let eval_host = Arc::new(SessionBridgeHost::new());
 	let mut eval_control = EvalSessionControl::default();
-	let eval_identity = if tool_settings.enabled("eval") {
+	if tool_settings.enabled("eval") {
 		match preflight_python_eval(Arc::clone(&eval_host), interrupt_grace, blobs.clone()) {
 			Ok(eval_exec) => {
 				let mut task_snapshot = TaskDescriptionSnapshot {
@@ -2223,54 +2198,40 @@ pub(crate) fn production_registry<
 				}
 				let (eval_tool, control) =
 					omp_tools::eval::eval_controlled_with_task_snapshot(eval_exec, task_snapshot);
-				let identity = eval_tool.spec().identity();
 				registry.register(eval_tool, Presentation::Slot, core_claims())?;
 				eval_control = control;
-				Some(identity)
 			},
 			Err(error) => {
 				tracing::warn!(
 					error = %error,
 					"eval omitted because CPython is unreachable; run `just setup-python` and restart OMP"
 				);
-				None
 			},
 		}
-	} else {
-		None
-	};
-	let mut todo_identity = None;
+	}
 	if tool_settings.enabled("todo") {
-		let todo = omp_tools::todo::tool();
-		todo_identity = Some(todo.spec().identity());
-		registry.register(todo, Presentation::Slot, core_claims())?;
+		registry.register(omp_tools::todo::tool(), Presentation::Slot, core_claims())?;
 	}
-	let mut ask_identity = None;
 	if tool_settings.enabled("ask") {
-		let ask = omp_tools::ask::tool_with_vocalizer(
-			Arc::new(ask_presenter.clone()),
-			media_devices::ask_vocalizer(Arc::clone(&search_bridge)),
-		);
-		ask_identity = Some(ask.spec().identity());
-		registry.register(ask, Presentation::Slot, core_claims())?;
+		registry.register(
+			omp_tools::ask::tool_with_vocalizer(
+				Arc::new(ask_presenter.clone()),
+				media_devices::ask_vocalizer(Arc::clone(&search_bridge)),
+			),
+			Presentation::Slot,
+			core_claims(),
+		)?;
 	}
-	let mut think_identity = None;
 	if tool_settings.enabled("think") {
-		let think = omp_tools::think::tool();
-		think_identity = Some(think.spec().identity());
-		registry.register(think, Presentation::Slot, core_claims())?;
+		registry.register(omp_tools::think::tool(), Presentation::Slot, core_claims())?;
 	}
-	let mut goal_identity = None;
 	if let Some(goal_control) = goal_control {
-		let goal = omp_tools::goal::tool(GoalControlAdapter(goal_control));
-		goal_identity = Some(goal.spec().identity());
-		registry.register(goal, Presentation::Hidden, core_claims())?;
+		registry.register(
+			omp_tools::goal::tool(GoalControlAdapter(goal_control)),
+			Presentation::Hidden,
+			core_claims(),
+		)?;
 	}
-	let hub_identity = if tool_settings.enabled("hub") {
-		registry.live_spec("hub").ok().map(ToolSpec::identity)
-	} else {
-		None
-	};
 	if tool_settings.enabled("yield") {
 		// Children finalize through `yield`; the top-level agent never
 		// advertises it, so registration is selection-only (`Hidden`).
@@ -2293,7 +2254,7 @@ pub(crate) fn production_registry<
 			previews.clone(),
 		)));
 	}
-	let shell_identity = if tool_settings.enabled("shell") && shell_settings.enabled {
+	if tool_settings.enabled("shell") && shell_settings.enabled {
 		let sibling_tools = registry
 			.live_identities()
 			.filter_map(|(name, _)| {
@@ -2338,37 +2299,8 @@ pub(crate) fn production_registry<
 			shell_settings.auto_background.enabled,
 			time::Duration::from_millis(shell_settings.auto_background.threshold_ms),
 		);
-		let identity = shell.spec().identity();
 		registry.register(shell, Presentation::Slot, core_claims())?;
-		Some(identity)
-	} else {
-		None
-	};
-	register_builtin_renderers(registry.render_registry_mut(), BuiltinRendererIdentities {
-		edit:       tool_settings.enabled("edit").then_some(edit_identity),
-		grep:       tool_settings.enabled("grep").then_some(grep_identity),
-		web_search: web_search_identity,
-		fetch:      (tool_settings.enabled("fetch") && tool_settings.fetch_enabled)
-			.then_some(fetch_identity),
-		glob:       tool_settings.enabled("glob").then_some(glob_identity),
-		shell:      shell_identity,
-		hub:        hub_identity,
-		write:      tool_settings.enabled("write").then_some(write_identity),
-		read:       tool_settings.enabled("read").then_some(read_identity),
-		eval:       eval_identity,
-		ast_grep:   ast_grep_identity,
-		ast_edit:   ast_edit_identity,
-		ask:        ask_identity,
-		todo:       todo_identity,
-		think:      think_identity,
-		lsp:        lsp_identity,
-		debug:      debug_identity,
-		goal:       goal_identity,
-		github:     Some(github_identity),
-		browser:    Some(browser_identity),
-		computer:   Some(computer_identity),
-	})
-	.map_err(|error| EnvdError::WorkerDeclaration(Str::from(error.to_string())))?;
+	}
 	let flattened_slots = if policy == ToolsPolicy::ToolOnly {
 		let mut slots = Vec::new();
 		for registration in workers.registrations() {
