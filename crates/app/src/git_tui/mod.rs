@@ -231,7 +231,7 @@ mod tests {
 		assert!(output.status.success(), "fixture git {arguments:?} failed");
 	}
 
-	#[tokio::test]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn newer_load_cancels_stale_sequence_before_terminal_delivery() {
 		let fixture = tempfile::tempdir().expect("temporary repository");
 		fixture_git(fixture.path(), &["init", "-b", "main"]);
@@ -251,7 +251,9 @@ mod tests {
 			.unwrap();
 		let first_session = session.clone();
 		let (progress_tx, progress_rx) = flume::bounded(1);
+		let (release_tx, release_rx) = flume::bounded(1);
 		let first = tokio::spawn(async move {
+			let mut paused = false;
 			first_session
 				.handle_with_progress(
 					GitIntent::Load {
@@ -261,21 +263,38 @@ mod tests {
 						seq:       1,
 					},
 					|_| {
-						let _ = progress_tx.try_send(());
+						if !paused {
+							paused = true;
+							progress_tx
+								.send(())
+								.expect("test should observe first chunk");
+							release_rx.recv().expect("test should release first load");
+						}
 					},
 				)
 				.await
 		});
 		progress_rx.recv_async().await.expect("first load streamed");
-		let second = session
-			.handle(GitIntent::Load {
-				area:      GitArea::Unstaged,
-				path:      Str::new_static("large.txt"),
-				orig_path: None,
-				seq:       2,
-			})
-			.await;
+		let first_cancel = session.load_cancel.lock().clone();
+		let second_session = session.clone();
+		let second = tokio::spawn(async move {
+			second_session
+				.handle(GitIntent::Load {
+					area:      GitArea::Unstaged,
+					path:      Str::new_static("large.txt"),
+					orig_path: None,
+					seq:       2,
+				})
+				.await
+		});
+		first_cancel.cancelled().await;
+		release_tx
+			.send(())
+			.expect("first load should still be paused");
 		assert!(first.await.unwrap().updates.is_empty());
-		assert!(matches!(second.updates.as_slice(), [GitUpdate::Contents { seq: 2, .. }]));
+		assert!(matches!(second.await.unwrap().updates.as_slice(), [GitUpdate::Contents {
+			seq: 2,
+			..
+		}]));
 	}
 }

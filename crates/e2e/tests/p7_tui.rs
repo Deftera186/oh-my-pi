@@ -937,24 +937,31 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 
 	gateway.release(2);
 	let shell_live = wait_snapshot(&mut debug, &raw_capture, "shell live tail", |snapshot| {
-		snapshot.combined().contains("shell running · 10 bytes")
+		let surface = snapshot.combined();
+		surface.contains("bash bash ·") && surface.contains("10B") && surface.contains("live-tail")
 	});
 	assert_surface(&shell_live, "shell live");
 	assert!(
-		shell_live.frame.contains("read · scratch.txt")
-			&& shell_live.frame.contains("edit · scratch.txt"),
+		shell_live
+			.frame
+			.contains("read scratch.txt · Lines 1 · Size 24B")
+			&& shell_live.frame.contains("edit@hl.1 · edit · scratch.txt"),
 		"prior transcript vanished during shell stream: {}",
 		shell_live.frame
 	);
 	fs::write(&shell_release, b"release").expect("release shell fixture");
 	let shell_final = wait_snapshot(&mut debug, &raw_capture, "shell exit badge", |snapshot| {
-		snapshot.combined().contains("exit 7")
+		let surface = snapshot.combined();
+		surface.contains("bash@1 · bash ·")
+			&& surface.contains("live-error")
+			&& surface.contains("Exit 7")
 	});
 	assert_surface(&shell_final, "shell final");
 
 	gateway.release(3);
 	let unknown = wait_snapshot(&mut debug, &raw_capture, "unknown generic card", |snapshot| {
-		snapshot.combined().contains("think") && snapshot.combined().contains("recorded")
+		let surface = snapshot.combined();
+		surface.contains("think@1 · think") && surface.contains("P7 generic card proof")
 	});
 	assert_surface(&unknown, "unknown");
 	gateway.release(4);
@@ -980,7 +987,8 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	assert_surface(&multiline, "Shift+Enter multiline input");
 	debug.keys("enter");
 	let batch_live = wait_snapshot(&mut debug, &raw_capture, "batch running", |snapshot| {
-		snapshot.combined().contains("shell running · 18 bytes")
+		snapshot.combined().contains("bash bash ·")
+			&& snapshot.combined().contains("18B")
 			&& gateway.captured_text(5, "interrupt\nthe batch")
 			&& batch_one_marker.is_file()
 	});
@@ -991,7 +999,9 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		.op("resize")
 		.unwrap_or_else(|error| panic!("resize injection failed: {error}"));
 	let resized = wait_snapshot(&mut debug, &raw_capture, "streaming resize", |snapshot| {
-		snapshot.frame.contains("shell running · 18 bytes") && snapshot.frame.contains("Working")
+		snapshot.frame.contains("bash bash ·")
+			&& snapshot.frame.contains("18B")
+			&& snapshot.frame.contains("Working")
 	});
 	assert_surface(&resized, "resized");
 	let info = wait_info(&mut debug, "settled streaming resize", |info| {
@@ -1009,16 +1019,29 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 
 	debug.keys("esc");
 	let interrupted = wait_snapshot(&mut debug, &raw_capture, "batch interrupted", |snapshot| {
-		let surface = snapshot.combined().to_ascii_lowercase();
-		surface.contains("interrupted.") && surface.contains("shell cancelled")
+		let surface = snapshot.combined();
+		surface.contains("\"kind\":\"aborted\"")
+			&& surface.contains("\"kind\":\"interrupted\"")
+			&& !snapshot.frame.contains("Working")
 	});
 	assert_surface(&interrupted, "interrupt");
 	assert!(batch_two_marker.exists(), "concurrent batch-2 side-effect marker missing");
 	assert!(batch_three_marker.exists(), "concurrent batch-3 side-effect marker missing");
 
 	debug.keys("'/new' enter");
+	drop(debug);
+	thread::sleep(Duration::from_millis(100));
+	let mut debug =
+		DebugClient::connect(&debug_socket, Instant::now() + READY_TIMEOUT, &mut process);
+	let fresh_host_deadline = Instant::now() + READY_TIMEOUT;
+	while debug.op("slots").is_err() {
+		assert!(Instant::now() < fresh_host_deadline, "fresh chat host did not attach");
+		thread::sleep(Duration::from_millis(15));
+	}
 	let fresh = wait_snapshot(&mut debug, &raw_capture, "fresh session ready", |snapshot| {
-		snapshot.frame.contains("╰─") && !snapshot.frame.contains("Interrupted.")
+		snapshot.frame.contains("DeepSeek V4 Flash")
+			&& !snapshot.frame.contains("Working")
+			&& !snapshot.frame.contains("\"kind\":\"interrupted\"")
 	});
 	assert_surface(&fresh, "fresh session");
 	debug.keys("'continue' enter");
@@ -1026,7 +1049,8 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	let queue_marker = scratch.path().join("p7-queue-side-effect");
 	let queue_live =
 		wait_snapshot(&mut debug, &raw_capture, "next batch after interrupt", |snapshot| {
-			snapshot.frame.contains("shell running · 17 bytes")
+			snapshot.frame.contains("bash bash ·")
+				&& snapshot.frame.contains("17B")
 				&& queue_marker.is_file()
 				&& gateway.captured_text(6, "continue")
 				&& !gateway.captured_text(6, "steer now")
@@ -1105,16 +1129,6 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	let resumed_raw = resumed.raw.clone();
 	let mut resume_debug =
 		DebugClient::connect(&resume_debug_socket, Instant::now() + READY_TIMEOUT, &mut resumed);
-	let resume_index =
-		wait_snapshot(&mut resume_debug, &resumed_raw, "second session index ready", |snapshot| {
-			snapshot.text.contains("SESSION INDEX") && snapshot.text.contains("New session")
-		});
-	assert_surface(&resume_index, "second session index");
-	resume_debug.keys("enter");
-	drop(resume_debug);
-	thread::sleep(Duration::from_millis(100));
-	let mut resume_debug =
-		DebugClient::connect(&resume_debug_socket, Instant::now() + READY_TIMEOUT, &mut resumed);
 	let fresh = wait_snapshot(&mut resume_debug, &resumed_raw, "fresh second session", |snapshot| {
 		let frame = &snapshot.frame;
 		frame.contains("session")
@@ -1142,13 +1156,29 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		});
 	assert_surface(&second_idle, "second session idle");
 
-	resume_debug.keys("'/resume' enter");
+	resume_debug.keys("'/resume'");
+	let resume_draft =
+		wait_snapshot(&mut resume_debug, &resumed_raw, "resume command draft", |snapshot| {
+			snapshot.frame.contains("╰─ /resume")
+		});
+	assert_surface(&resume_draft, "resume command draft");
+	resume_debug.keys("enter enter");
 	let picker =
 		wait_snapshot(&mut resume_debug, &resumed_raw, "resume session picker", |snapshot| {
 			snapshot.text.contains("Resume session")
 		});
 	assert_surface(&picker, "resume session picker");
-	resume_debug.keys("down enter");
+	resume_debug.keys("esc");
+	let direct_resume = format!("'/resume {steering_session_id}'");
+	resume_debug.keys(direct_resume.as_str());
+	resume_debug.keys("enter enter");
+	let direct_picker =
+		wait_snapshot(&mut resume_debug, &resumed_raw, "selected resume session", |snapshot| {
+			snapshot.text.contains("Resume session")
+				&& snapshot.text.contains(steering_session_id.as_str())
+		});
+	assert_surface(&direct_picker, "selected resume session");
+	resume_debug.keys("enter");
 	drop(resume_debug);
 	thread::sleep(Duration::from_millis(100));
 	let mut resume_debug =
@@ -1160,14 +1190,15 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		|snapshot| {
 			let all = snapshot.combined();
 			all.contains("continue")
-				&& all.contains("shell cancelled")
-				&& snapshot.frame.contains(steering_session_id.as_str())
+				&& all.contains("\"kind\":\"interrupted\"")
+				&& all.contains("steer now")
+				&& all.contains("The queued follow-up ran after all prior work.")
 				&& !snapshot.frame.contains("second-session retained content")
 				&& !snapshot.frame.contains("Second session retained content.")
 		},
 	);
 	assert_surface(&rehydrated, "same-process resumed transcript");
-	resume_debug.keys("'/quit' enter");
+	resume_debug.keys("'/quit' enter enter");
 	drop(resume_debug);
 	let resumed_before = resumed.before.clone();
 	let (resumed_status, resumed_bytes, resumed_stdout, resumed_stderr, resumed_after) =
@@ -1182,4 +1213,5 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		resumed_status.success(),
 		"resumed omp chat did not exit cleanly\n{resumed_diagnostics}"
 	);
+	assert_restored(&resumed_bytes, &resumed_before, &resumed_after, &resumed_diagnostics);
 }

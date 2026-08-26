@@ -177,8 +177,9 @@ pub struct PathCandidate {
 
 /// Splits every recognized archive-extension boundary in `path`.
 ///
-/// Candidates are returned longest archive path first. An extension is a
-/// boundary only at end of input or immediately before `:`.
+/// Candidates with a member selector are returned before bare archive paths,
+/// then by longest archive path first. An extension is a boundary only at end
+/// of input or immediately before `:`.
 pub fn path_candidates(path: &str) -> Vec<PathCandidate> {
 	let normalized = path.replace('\\', "/");
 	let lower = normalized.to_ascii_lowercase();
@@ -205,7 +206,9 @@ pub fn path_candidates(path: &str) -> Vec<PathCandidate> {
 			break;
 		}
 	}
-	candidates.sort_by_key(|candidate| cmp::Reverse(candidate.archive_path.len()));
+	candidates.sort_by_key(|candidate| {
+		(candidate.member_path.is_empty(), cmp::Reverse(candidate.archive_path.len()))
+	});
 	candidates
 }
 
