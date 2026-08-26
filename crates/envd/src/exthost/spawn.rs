@@ -16,7 +16,9 @@ use flume::Receiver;
 #[cfg(unix)]
 use nix::{sys::signal, unistd::Pid};
 use omp_core::Str;
-use omp_sandbox::{SandboxError, SandboxPolicy};
+use omp_sandbox::{
+	DegradationPolicy, NetworkMode, PreparedSandbox, Runner, SandboxError, SandboxSpec, WriteMode,
+};
 use pyo3::{
 	prelude::*,
 	types::{PyList, PyModule},
@@ -109,6 +111,7 @@ pub struct SpawnedHost {
 	/// Captured stdout/stderr records.
 	pub logs:     Receiver<HostLog>,
 	restart_spec: SpawnSpec,
+	sandbox:      Option<PreparedSandbox>,
 }
 /// Live supervised child with its sole CONTROL pump and cancellation state.
 pub struct RunningHost {
@@ -123,6 +126,7 @@ pub struct RunningHost {
 	identity:     ControlConnectionIdentity,
 	authority:    Arc<dyn ControlAuthority>,
 	snapshot:     ControlAuthoritySnapshot,
+	sandbox:      Option<PreparedSandbox>,
 }
 
 /// Failure while driving a live child or its cancellation ladder.
@@ -150,7 +154,7 @@ impl SpawnedHost {
 		authority: Arc<dyn ControlAuthority>,
 		snapshot: &ControlAuthoritySnapshot,
 	) -> Result<RunningHost, RunningHostError> {
-		let Self { key, mut child, control, logs, restart_spec } = self;
+		let Self { key, mut child, control, logs, restart_spec, sandbox } = self;
 		let (runtime, handle) =
 			ControlRuntime::new(control, key.clone(), identity.clone(), Arc::clone(&authority));
 		let pump = tokio::spawn(runtime.serve());
@@ -170,6 +174,7 @@ impl SpawnedHost {
 			identity,
 			authority,
 			snapshot: snapshot.clone(),
+			sandbox,
 		})
 	}
 }
@@ -192,7 +197,11 @@ impl RunningHost {
 
 	/// Reports a child or CONTROL-pump exit without consuming its owner.
 	pub fn has_exited(&mut self) -> Result<bool, RunningHostError> {
-		Ok(self.pump.is_finished() || self.child.try_wait().map_err(SpawnError::Spawn)?.is_some())
+		let child_exited = self.child.try_wait().map_err(SpawnError::Spawn)?.is_some();
+		if child_exited {
+			self.sandbox.take();
+		}
+		Ok(self.pump.is_finished() || child_exited)
 	}
 
 	/// Returns whether repeated forced cancellation disabled this host.
@@ -270,6 +279,7 @@ impl RunningHost {
 			}
 		}
 		let _ = self.child.wait().await;
+		self.sandbox.take();
 	}
 
 	/// Waits for the sole CONTROL pump to finish.
@@ -360,24 +370,32 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	let fd = fd::AsRawFd::as_raw_fd(&child_control);
 	let sandbox_launch = match spec.key.tier().as_str() {
 		"sandboxed" => {
-			let mut policy = SandboxPolicy::new();
-			policy.allow_read(&spec.executable)?;
-			policy.allow_read(&spec.python_site)?;
-			policy.allow_write(&spec.env_socket)?;
-			Some(policy.prepare(&spec.executable)?)
+			let mut sandbox = SandboxSpec::new(spec.executable.as_os_str());
+			sandbox.arg(EXT_HOST_ARG);
+			sandbox.allow_read(&spec.executable)?;
+			sandbox.allow_read(&spec.python_site)?;
+			sandbox.set_write(WriteMode::Scoped);
+			sandbox.allow_write(&spec.env_socket)?;
+			sandbox.allow_unix_socket(&spec.env_socket)?;
+			sandbox.set_network(NetworkMode::Disabled);
+			sandbox.set_degradation(DegradationPolicy::Reject);
+			Some({
+				let runner = Runner::native_command()?;
+				let plan = runner.compile(&sandbox)?;
+				runner.prepare(plan, &sandbox)?
+			})
 		},
 		"trusted" => None,
 		tier => return Err(SpawnError::UnsupportedTier(Str::from(tier))),
 	};
 	let mut command = if let Some(launch) = &sandbox_launch {
-		let mut command = Command::new(launch.program());
-		command.args(launch.args());
-		command
+		Command::from(launch.command()?)
 	} else {
-		Command::new(&spec.executable)
+		let mut command = Command::new(&spec.executable);
+		command.arg(EXT_HOST_ARG);
+		command
 	};
 	command
-		.arg(EXT_HOST_ARG)
 		.env(CONTROL_FD_ENV, "3")
 		.env(PY_SITE_ENV, &spec.python_site)
 		.env(ENV_SOCKET_ENV, &spec.env_socket)
@@ -437,7 +455,14 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	if let Some(stderr) = child.stderr.take() {
 		capture(stderr, HostLogStream::Stderr, logs_tx);
 	}
-	Ok(SpawnedHost { key: spec.key, child, control: parent, logs, restart_spec })
+	Ok(SpawnedHost {
+		key: spec.key,
+		child,
+		control: parent,
+		logs,
+		restart_spec,
+		sandbox: sandbox_launch,
+	})
 }
 
 fn capture<R>(stream: R, source: HostLogStream, logs: flume::Sender<HostLog>)

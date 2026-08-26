@@ -1909,7 +1909,10 @@ fn open_journal_authorities(
 	state_dir: &Path,
 	writer: bool,
 ) -> Result<(Arc<SessionIndex>, Option<Arc<StateStore>>), EnvdError> {
-	let index_path = state_dir.join("sessions.sqlite3");
+	let sessions_dir = state_dir.join("sessions");
+	fs::create_dir_all(&sessions_dir)
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let index_path = sessions_dir.join("sessions.sqlite3");
 	let sessions_index = if writer {
 		SessionIndex::open(index_path)
 	} else {
@@ -2420,6 +2423,7 @@ impl EnvServer {
 		daemon_process_client: Option<EnvClient>,
 		mut ext_host_config: ExtHostConfig,
 		doc_connections: Option<watch::Sender<usize>>,
+		require_document_ownership: bool,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
 		settings_snapshot: Option<&SettingsSnapshot>,
 		bridges: RegistryBridges,
@@ -2435,7 +2439,7 @@ impl EnvServer {
 			&root,
 			docserver_socket,
 			doc_connections.clone(),
-			doc_connections.is_some(),
+			require_document_ownership,
 		)
 		.await?;
 		let hello = documents.hello().clone();
@@ -9482,13 +9486,16 @@ pub async fn run_with_registry(
 	let socket = args
 		.socket
 		.unwrap_or_else(|| omp_env::project_state::environment_socket(&state_dir));
+	let require_document_ownership = args.docserver_socket.is_none();
 	let docserver_socket = if let Some(socket) = args.docserver_socket {
 		socket
 	} else {
 		let socket = omp_env::project_state::document_socket(&state_dir);
 		socket
 	};
-	ensure_document_socket_free(&docserver_socket).await?;
+	if require_document_ownership {
+		ensure_document_socket_free(&docserver_socket).await?;
+	}
 	let (principal_authority, session_id, session_generation) = authenticated_runtime_identity()?;
 	let mut ext_host_config = ExtHostConfig::current(
 		principal_authority.principal().clone(),
@@ -9536,6 +9543,7 @@ pub async fn run_with_registry(
 			None,
 			ext_host_config,
 			Some(doc_connections),
+			require_document_ownership,
 			None,
 			None,
 			bridges,
@@ -9675,22 +9683,37 @@ async fn connect_or_start_docserver(
 	connections: Option<watch::Sender<usize>>,
 	require_ownership: bool,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
-	if let Ok(stream) = UnixStream::connect(socket).await {
-		if require_ownership {
+	if require_ownership {
+		if UnixStream::connect(socket).await.is_ok() {
 			return Err(EnvdError::DocumentAuthorityHeld);
 		}
-		let documents = DocumentHost::connect(stream).await?;
-		validate_document_root(root, documents.hello().root_uri.as_str())?;
-		if omp_env::build_id::is_stale(
-			omp_env::build_id::current(),
-			documents.hello().server_build.as_str(),
-		) {
-			tracing::warn!(
-				socket = %socket.display(),
-				"stale-build document daemon owns the socket and will be replaced once it drains"
-			);
+	} else {
+		let deadline = Instant::now() + Duration::from_secs(1);
+		loop {
+			match UnixStream::connect(socket).await {
+				Ok(stream) => match DocumentHost::connect(stream).await {
+					Ok(documents) => {
+						validate_document_root(root, documents.hello().root_uri.as_str())?;
+						if omp_env::build_id::is_stale(
+							omp_env::build_id::current(),
+							documents.hello().server_build.as_str(),
+						) {
+							tracing::warn!(
+								socket = %socket.display(),
+								"stale-build document daemon owns the socket and will be replaced once it drains"
+							);
+						}
+						return Ok((documents, None));
+					},
+					Err(error) if Instant::now() >= deadline => return Err(error.into()),
+					Err(_) => {},
+				},
+				Err(_) if !socket.exists() => break,
+				Err(_) if Instant::now() >= deadline => break,
+				Err(_) => {},
+			}
+			time::sleep(Duration::from_millis(25)).await;
 		}
-		return Ok((documents, None));
 	}
 	if let Some(parent) = socket.parent() {
 		fs::create_dir_all(parent)?;
@@ -9866,8 +9889,10 @@ mod tests {
 		let hello = documents.hello().clone();
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state.path().join("blobs")).expect("blob host");
+		fs::create_dir_all(state.path().join("sessions")).expect("sessions directory");
 		let sessions_index = Arc::new(
-			SessionIndex::open(state.path().join("sessions.sqlite3")).expect("sessions index"),
+			SessionIndex::open(state.path().join("sessions").join("sessions.sqlite3"))
+				.expect("sessions index"),
 		);
 		let state_store =
 			Arc::new(StateStore::open(state.path().join("state")).expect("state store"));

@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use omp_core::{Hash32, Str, Ulid};
-use omp_sandbox::Backend;
+use omp_sandbox::{Capability, CapabilitySet, backend_statuses};
 use omp_tool::{ArgPath, IncomingCursor, IncomingParams, PullMode, PulledKind};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -45,30 +45,44 @@ use crate::{
 	worker_pool::{WorkerControlOwner, WorkerProcessAuthority, WorkerSupervisor},
 };
 
-/// Returns only sandbox facilities proven by the native backend smoke check.
+/// Returns only sandbox facilities proven by cached live backend probes.
 pub fn detected_sandbox_capabilities() -> SandboxCapabilities {
-	match Backend::detect() {
-		Ok(backend) => SandboxCapabilities {
-			backends:         vec![Str::new_static(match backend {
-				Backend::Seatbelt => "seatbelt",
-				Backend::Bubblewrap => "bubblewrap",
-			})],
-			landlock_abi:     None,
-			filesystem:       true,
-			network:          true,
-			domain_filtering: false,
-			resource_limits:  false,
-			degraded:         Vec::new(),
-		},
-		Err(error) => SandboxCapabilities {
-			backends:         Vec::new(),
-			landlock_abi:     None,
-			filesystem:       false,
-			network:          false,
-			domain_filtering: false,
-			resource_limits:  false,
-			degraded:         vec![Str::from(error.to_string())],
-		},
+	let mut backends = Vec::new();
+	let mut enforced = CapabilitySet::empty();
+	let mut degraded = Vec::new();
+	for status in backend_statuses() {
+		if status.is_available() {
+			let backend = status.backend();
+			let name: &'static str = backend.into();
+			backends.push(Str::new_static(name));
+			enforced = enforced.union(backend.capabilities());
+		} else if let Some(failure) = status.failure() {
+			if !matches!(failure, omp_sandbox::ProbeFailure::WrongHost { .. }) {
+				degraded.push(Str::from(failure.to_string()));
+			}
+		}
+	}
+	SandboxCapabilities {
+		backends,
+		landlock_abi: None,
+		filesystem: [
+			Capability::FsReadHost,
+			Capability::FsReadScope,
+			Capability::FsReadDeny,
+			Capability::FsWriteDeny,
+			Capability::FsWriteScope,
+			Capability::FsWriteEphemeral,
+		]
+		.into_iter()
+		.any(|capability| enforced.contains(capability)),
+		network: [Capability::NetDisable, Capability::NetEnable, Capability::NetOutbound]
+			.into_iter()
+			.any(|capability| enforced.contains(capability)),
+		domain_filtering: false,
+		resource_limits: [Capability::ResCpu, Capability::ResMemory, Capability::ResPids]
+			.into_iter()
+			.any(|capability| enforced.contains(capability)),
+		degraded,
 	}
 }
 
