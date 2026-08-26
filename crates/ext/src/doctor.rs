@@ -6,7 +6,7 @@ use std::{
 };
 
 use omp_core::{Str, encoding::hex};
-use ring::digest::{SHA256, digest};
+use sha2::{Digest as _, Sha256};
 
 use super::{
 	ExtensionCode, Layer,
@@ -227,7 +227,7 @@ fn verify_artifact(path: &Path, locked: &LockedExtension) -> Result<(), Str> {
 	if blake3 != locked.wheel.blake3.as_str() {
 		return Err(Str::new_static("artifact BLAKE3 differs from lock"));
 	}
-	let sha256 = format!("sha256:{}", hex::encode(digest(&SHA256, &bytes).as_ref()));
+	let sha256 = format!("sha256:{}", hex::encode(&Sha256::digest(&bytes)));
 	if sha256 != locked.wheel.sha256.as_str() {
 		return Err(Str::new_static("artifact SHA-256 differs from lock"));
 	}
