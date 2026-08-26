@@ -149,7 +149,7 @@ impl Display for Fault {
 }
 impl error::Error for Fault {}
 
-/// Desktop operations do not stream partial updates.
+/// Desktop operations currently settle as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 

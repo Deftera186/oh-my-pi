@@ -84,10 +84,11 @@ use strum::{EnumString, IntoStaticStr};
 use crate::{
 	component::{Cached, Component},
 	components::{
-		Boxed, Button, Callout, Checkbox, Col, CustomElement, DiffKind, DiffView, EditorPane, Field,
-		Form, Hr, Icon, Img, Input, Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment,
-		Segmented, Select, SelectOption, Spacer, Spinner, Status, Table, TableCell, TableRow, Tabs,
-		TaskStatus, TextLeaf, Todo, TodoTask, Tree, TreeNode, Wizard,
+		Boxed, Button, Callout, Checkbox, Choice, Col, CustomElement, DiffKind, DiffStat, DiffView,
+		EditorPane, Fact, Field, Files, Form, Hr, Icon, Img, Input, JsonPreview, Latex, Markdown,
+		NumberLeaf, Pre, Progress, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
+		SelectOption, Spacer, Spinner, State, Status, Table, TableCell, TableRow, Tabs, TaskStatus,
+		TextLeaf, Time, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
 	context::{Charset, UiContext},
 	markdown,
@@ -515,12 +516,19 @@ impl Parser<'_> {
 			return finish_element(name, props, Vec::new(), Str::default(), at)
 				.map(|part| (part, body_start));
 		}
-		if matches!(name, "pre" | "latex" | "callout" | "diff") {
+		if matches!(
+			name,
+			"pre" | "latex" | "callout" | "diff" | "json" | "files" | "quote" | "choice"
+		) {
 			let closer = match name {
 				"pre" => "</pre>",
 				"latex" => "</latex>",
 				"callout" => "</callout>",
 				"diff" => "</diff>",
+				"json" => "</json>",
+				"files" => "</files>",
+				"quote" => "</quote>",
+				"choice" => "</choice>",
 				_ => unreachable!(),
 			};
 			let end = self.src[body_start..]
@@ -528,6 +536,8 @@ impl Parser<'_> {
 				.map_or(self.src.len(), |offset| body_start + offset);
 			let trim: &[_] = if name == "pre" {
 				&['\n', '\r']
+			} else if matches!(name, "json" | "files" | "quote" | "choice") {
+				&[]
 			} else {
 				&['\n']
 			};
@@ -1095,6 +1105,16 @@ fn is_catalog_tag(name: &str) -> bool {
 			| "icon"
 			| "table"
 			| "tr" | "td"
+			| "json"
+			| "files"
+			| "time"
+			| "num"
+			| "bytes"
+			| "diffstat"
+			| "state"
+			| "fact"
+			| "quote"
+			| "choice"
 	)
 }
 
@@ -1125,7 +1145,24 @@ fn is_interactive_tag(name: &str) -> bool {
 }
 
 fn is_leaf_tag(name: &str) -> bool {
-	matches!(name, "pre" | "hr" | "spacer" | "radio" | "checkbox" | "input" | "progress" | "img")
+	matches!(
+		name,
+		"pre"
+			| "hr" | "spacer"
+			| "radio"
+			| "checkbox"
+			| "input"
+			| "progress"
+			| "img"
+			| "json"
+			| "files"
+			| "time"
+			| "num"
+			| "bytes"
+			| "diffstat"
+			| "state"
+			| "choice"
+	)
 }
 
 fn has_matching_close(mut after: &str, name: &str) -> bool {
@@ -1240,9 +1277,14 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 	Some(match tag {
 		"col" => configured!(Col::new().child(children)),
 		"row" => configured!(Row::new().child(children)),
+		"fact" => configured!(Fact::new().child(children)),
 		"box" => configured!(Boxed::new().child(children)),
 		"text" => configured!(TextLeaf::new().text(body.clone())),
 		"pre" => configured!(Pre::new().text(body.clone())),
+		"json" => configured!(JsonPreview::new().text(body.clone())),
+		"files" => configured!(Files::new().text(body.clone())),
+		"quote" => configured!(Quote::new().text(body.clone())),
+		"choice" => configured!(Choice::new().text(body.clone())),
 		"md" => configured!(Markdown::text_of(body.clone()).child(children)),
 		"latex" => configured!(Latex::new().text(body.clone())),
 		"hr" => configured!(Hr::new()),
@@ -1252,6 +1294,11 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		"radio" => configured!(Radio::new()),
 		"checkbox" => configured!(Checkbox::new()),
 		"spinner" => configured!(Spinner::new().label(body.clone())),
+		"time" => configured!(Time::new()),
+		"num" => configured!(NumberLeaf::new()),
+		"bytes" => configured!(NumberLeaf::bytes()),
+		"diffstat" => configured!(DiffStat::new()),
+		"state" => configured!(State::new()),
 		"input" => configured!(Input::new()),
 		"button" => configured!(Button::new().child(body.clone())),
 		"scroll" => configured!(Scroll::new().child(children)),
@@ -1772,6 +1819,29 @@ mod tests {
 
 	fn child(node: &Cached, index: usize) -> &Cached {
 		&node.comp().children()[index]
+	}
+
+	#[test]
+	fn retained_primitive_catalog_dispatches_each_tag_once() {
+		let ctx = UiContext::default();
+		let source = Str::new(
+			"<json>{\"a\":1}</json><files>a/b</files><time ms=1/><num value=2 compact/><bytes \
+			 value=3/><diffstat added=1 removed=2 ops=3/><state status=running/><fact \
+			 label=X><text>v</text></fact><quote>x\n</quote><choice selected>x</choice>",
+		);
+		let root = parse(&source, &ctx).unwrap();
+		let children = root.comp().children();
+		assert_eq!(children.len(), 10);
+		assert!(children[0].comp().is::<JsonPreview>());
+		assert!(children[1].comp().is::<Files>());
+		assert!(children[2].comp().is::<Time>());
+		assert!(children[3].comp().is::<NumberLeaf>());
+		assert!(children[4].comp().is::<NumberLeaf>());
+		assert!(children[5].comp().is::<DiffStat>());
+		assert!(children[6].comp().is::<State>());
+		assert!(children[7].comp().is::<Fact>());
+		assert!(children[8].comp().is::<Quote>());
+		assert!(children[9].comp().is::<Choice>());
 	}
 
 	#[test]

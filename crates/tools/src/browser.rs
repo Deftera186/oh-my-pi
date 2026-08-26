@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Browser lifecycle operation.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, strum::Display)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Action {
@@ -143,7 +143,7 @@ impl Display for Fault {
 }
 impl error::Error for Fault {}
 
-/// Browser has no partial updates.
+/// Browser operations currently settle as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 

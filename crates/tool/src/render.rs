@@ -216,6 +216,17 @@ pub trait RenderFold: Send + Sync + 'static {
 
 	/// Incorporates one update in arrival order.
 	fn fold(&self, state: &mut Self::State, update: Self::Update);
+	/// Incorporates the latest lenient parse of the streaming argument text.
+	///
+	/// Hosts call this whenever more argument bytes arrive (`complete = false`)
+	/// and once more with the committed arguments (`complete = true`). `args`
+	/// is the accumulated parse of everything received so far, never a delta,
+	/// so overriding renderers replace prior argument state instead of
+	/// appending. The default ignores arguments; renderers that preview
+	/// arguments while they stream override it.
+	fn fold_args(&self, state: &mut Self::State, args: &omp_slopjson::Value, complete: bool) {
+		let _ = (state, args, complete);
+	}
 
 	/// Produces TML or deterministic display data for the current fold position.
 	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str>;
@@ -343,6 +354,13 @@ trait ErasedRender: Send + Sync {
 		state: &mut dyn Any,
 		update: &[u8],
 	) -> Result<(), RenderRegistryError>;
+	fn fold_args(
+		&self,
+		identity: &ToolIdentity,
+		state: &mut dyn Any,
+		args: &omp_slopjson::Value,
+		complete: bool,
+	) -> Result<(), RenderRegistryError>;
 	fn view(
 		&self,
 		identity: &ToolIdentity,
@@ -370,6 +388,20 @@ impl<R: RenderFold> ErasedRender for RegisteredRender<R> {
 		let update = serde_json::from_slice(update)
 			.map_err(|source| RenderRegistryError::Update { identity: identity.clone(), source })?;
 		self.0.fold(state, update);
+		Ok(())
+	}
+
+	fn fold_args(
+		&self,
+		identity: &ToolIdentity,
+		state: &mut dyn Any,
+		args: &omp_slopjson::Value,
+		complete: bool,
+	) -> Result<(), RenderRegistryError> {
+		let state = state
+			.downcast_mut::<R::State>()
+			.ok_or_else(|| RenderRegistryError::StateType(identity.clone()))?;
+		self.0.fold_args(state, args, complete);
 		Ok(())
 	}
 
@@ -401,6 +433,39 @@ impl RenderEntry<'_> {
 	/// Borrows the exact registered identity.
 	pub fn identity(&self) -> &ToolIdentity {
 		self.identity
+	}
+
+	/// Folds the accumulated streaming argument parse into retained state.
+	///
+	/// Retained raw updates are reduced first so argument context and typed
+	/// updates land in one accumulator regardless of arrival order.
+	pub fn fold_args(
+		self,
+		state: &mut ViewState,
+		args: &omp_slopjson::Value,
+		complete: bool,
+	) -> Result<(), RenderRegistryError> {
+		state.bind(self.identity)?;
+		match &mut state.fold {
+			FoldState::Reduced(reduced) => {
+				self
+					.render
+					.fold_args(self.identity.as_ref(), reduced.as_mut(), args, complete)
+			},
+			FoldState::Updates(updates) => {
+				let mut reduced = self.render.initial();
+				for prior in updates.iter() {
+					self
+						.render
+						.fold(self.identity.as_ref(), reduced.as_mut(), prior)?;
+				}
+				self
+					.render
+					.fold_args(self.identity.as_ref(), reduced.as_mut(), args, complete)?;
+				state.fold = FoldState::Reduced(reduced);
+				Ok(())
+			},
+		}
 	}
 
 	/// Folds one serialized update synchronously into retained state.
@@ -495,6 +560,37 @@ impl RenderRegistry {
 	pub fn get(&self, identity: &ToolIdentity) -> Option<RenderEntry<'_>> {
 		let (stored, render) = self.entries.get_key_value(identity)?;
 		Some(RenderEntry { identity: stored, render: render.as_ref() })
+	}
+
+	/// Folds the accumulated streaming argument parse for an exact revision.
+	///
+	/// Unknown revisions ignore arguments: the generic fallback renders
+	/// updates and outcomes only.
+	pub fn fold_args(
+		&self,
+		identity: &ToolIdentity,
+		state: &mut ViewState,
+		args: &omp_slopjson::Value,
+		complete: bool,
+	) -> Result<(), RenderRegistryError> {
+		match self.get(identity) {
+			Some(entry) => entry.fold_args(state, args, complete),
+			None => Ok(()),
+		}
+	}
+
+	/// Resolves the latest registered identity for a tool name.
+	///
+	/// Streaming argument previews run before the exact revision is known;
+	/// an active session invokes the newest registration, so ties across
+	/// revision families break toward the highest revision number.
+	pub fn resolve_name(&self, name: &str) -> Option<&ToolIdentity> {
+		self
+			.entries
+			.keys()
+			.filter(|identity| identity.name == name)
+			.max_by_key(|identity| identity.rev.n)
+			.map(Arc::as_ref)
 	}
 
 	/// Folds one update, retaining raw bytes only when the exact revision is

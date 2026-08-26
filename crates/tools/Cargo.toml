@@ -40,6 +40,7 @@ omp-py = { workspace = true }
 omp-settings = { workspace = true }
 omp-shell-engine = { workspace = true }
 omp-tool = { workspace = true }
+omp-macros = { workspace = true }
 omp-slopjson = { workspace = true }
 omp-walker = { workspace = true }
 parking_lot = { workspace = true }

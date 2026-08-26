@@ -497,11 +497,12 @@ fn registry_matching_and_first_match_precedence_are_explicit() {
 #[tokio::test]
 async fn a_matching_scraper_decline_preserves_plain_fetch_fallback() {
 	let rendered = web::read(
-		&CannedHttp::from_responses([response(
-			200,
-			"text/plain",
-			"ordinary fetch after scraper decline",
-		)]),
+		&CannedHttp::from_responses([
+			// The Actions scraper probes the workflows API first; its decline
+			// must fall back to an ordinary fetch of the authored URL.
+			response(404, "application/json", r#"{"message":"Not Found"}"#),
+			response(200, "text/plain", "ordinary fetch after scraper decline"),
+		]),
 		&Url::parse("https://github.com/owner/repo/actions").expect("fixture URL parses"),
 		false,
 	)

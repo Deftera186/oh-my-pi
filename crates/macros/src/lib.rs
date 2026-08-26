@@ -8,6 +8,8 @@ use proc_macro::TokenStream;
 
 mod cached;
 mod dom;
+mod markup;
+mod view;
 
 /// Memoizes a synchronous function in a fixed-capacity per-thread cache.
 ///
@@ -27,6 +29,15 @@ pub fn cached(attributes: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn dom(input: TokenStream) -> TokenStream {
 	match dom::expand(input.into()) {
+		Ok(tokens) => tokens.into(),
+		Err(error) => error.into_compile_error().into(),
+	}
+}
+/// Builds one typed renderer view tree from markup with child-level `for`,
+/// `if`, and `match` control flow.
+#[proc_macro]
+pub fn view(input: TokenStream) -> TokenStream {
+	match view::expand(input.into()) {
 		Ok(tokens) => tokens.into(),
 		Err(error) => error.into_compile_error().into(),
 	}

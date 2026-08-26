@@ -344,8 +344,15 @@ fn live_updates_and_durable_transcript_preserve_host_order() {
 			.iter()
 			.map(|update| update.sequence)
 			.collect::<Vec<_>>(),
-		[4, 5, 6]
+		[0, 4, 5, 6]
 	);
+	let started = &updates[0];
+	assert!(started.started);
+	assert_eq!(started.exec_id, Bytes::from_static(b"exec-ordered"));
+	assert!(started.data.is_empty());
+	assert_eq!(started.channel, OutputChannel::Stdout);
+	assert!(!started.terminal);
+	assert!(updates[1..].iter().all(|update| !update.started));
 	assert_eq!(
 		payload(&events)
 			.transcript

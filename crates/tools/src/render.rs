@@ -7,13 +7,29 @@ use omp_tool::{
 };
 
 use self::{
+	agentic::GoalRenderer,
+	ast::{AstEditRenderer, AstGrepRenderer},
+	codeintel::{DebugRenderer, LspRenderer},
 	edit::EditRenderer,
 	exec::{EvalRenderer, ShellRenderer},
 	fs::{ReadRenderer, WriteRenderer},
 	hub::HubRenderer,
+	interaction::{AskRenderer, ThinkRenderer, TodoRenderer},
+	misc::{BrowserRenderer, ComputerRenderer, GithubRenderer},
 	search::{GlobRenderer, GrepRenderer},
-	web::WebSearchRenderer,
+	web::{FetchRenderer, WebSearchRenderer},
 };
+
+/// Native goal renderer views.
+pub(crate) mod agentic;
+/// Native structural search and rewrite renderer views.
+pub(crate) mod ast;
+/// Native LSP and debugger renderer views.
+pub(crate) mod codeintel;
+/// Native ask, todo, and think renderer views.
+pub(crate) mod interaction;
+/// Native GitHub, browser, and computer renderer views.
+pub(crate) mod misc;
 
 /// Native edit renderer views.
 pub(crate) mod edit;
@@ -23,14 +39,14 @@ pub(crate) mod exec;
 pub(crate) mod fs;
 /// Native hub renderer views.
 pub(crate) mod hub;
-/// Bounded JSON-tree previews shared by structured tool views.
-pub mod json_tree;
 /// Grouped path and directory-tree rendering.
 pub mod paths;
 /// Native grep and glob renderer views.
 pub(crate) mod search;
 /// Shared line, byte, and column truncation.
 pub mod truncate;
+/// Typed renderer view construction and canonical serialization.
+pub mod view;
 /// Native web search renderer views.
 pub(crate) mod web;
 
@@ -48,6 +64,8 @@ pub struct BuiltinRendererIdentities {
 	pub grep:       Option<ToolIdentity>,
 	/// Identity of canonical web search, when enabled.
 	pub web_search: Option<ToolIdentity>,
+	/// Identity of the native URL fetcher, when enabled.
+	pub fetch:      Option<ToolIdentity>,
 	/// Identity of the native path matching tool, when enabled.
 	pub glob:       Option<ToolIdentity>,
 	/// Identity of the native persistent shell, when enabled.
@@ -60,6 +78,28 @@ pub struct BuiltinRendererIdentities {
 	pub read:       Option<ToolIdentity>,
 	/// Identity of the native persistent evaluator, when enabled.
 	pub eval:       Option<ToolIdentity>,
+	/// Identity of the native structural search tool, when enabled.
+	pub ast_grep:   Option<ToolIdentity>,
+	/// Identity of the native structural rewrite tool, when enabled.
+	pub ast_edit:   Option<ToolIdentity>,
+	/// Identity of the native question picker, when enabled.
+	pub ask:        Option<ToolIdentity>,
+	/// Identity of the native task checklist, when enabled.
+	pub todo:       Option<ToolIdentity>,
+	/// Identity of the native scratchpad note, when enabled.
+	pub think:      Option<ToolIdentity>,
+	/// Identity of the native language-server bridge, when enabled.
+	pub lsp:        Option<ToolIdentity>,
+	/// Identity of the native debugger bridge, when enabled.
+	pub debug:      Option<ToolIdentity>,
+	/// Identity of the native durable goal regime, when enabled.
+	pub goal:       Option<ToolIdentity>,
+	/// Identity of the native GitHub device, when enabled.
+	pub github:     Option<ToolIdentity>,
+	/// Identity of the native browser device, when enabled.
+	pub browser:    Option<ToolIdentity>,
+	/// Identity of the native computer device, when enabled.
+	pub computer:   Option<ToolIdentity>,
 }
 
 /// Registers every native renderer under the exact identities supplied by
@@ -81,6 +121,9 @@ pub fn register_builtin_renderers(
 	if let Some(identity) = identities.web_search {
 		registry.register(identity, WebSearchRenderer)?;
 	}
+	if let Some(identity) = identities.fetch {
+		registry.register(identity, FetchRenderer)?;
+	}
 	if let Some(identity) = identities.glob {
 		registry.register(identity, GlobRenderer)?;
 	}
@@ -99,97 +142,62 @@ pub fn register_builtin_renderers(
 	if let Some(identity) = identities.eval {
 		registry.register(identity, EvalRenderer)?;
 	}
+	if let Some(identity) = identities.ast_grep {
+		registry.register(identity, AstGrepRenderer)?;
+	}
+	if let Some(identity) = identities.ast_edit {
+		registry.register(identity, AstEditRenderer)?;
+	}
+	if let Some(identity) = identities.ask {
+		registry.register(identity, AskRenderer)?;
+	}
+	if let Some(identity) = identities.todo {
+		registry.register(identity, TodoRenderer)?;
+	}
+	if let Some(identity) = identities.think {
+		registry.register(identity, ThinkRenderer)?;
+	}
+	if let Some(identity) = identities.lsp {
+		registry.register(identity, LspRenderer)?;
+	}
+	if let Some(identity) = identities.debug {
+		registry.register(identity, DebugRenderer)?;
+	}
+	if let Some(identity) = identities.goal {
+		registry.register(identity, GoalRenderer)?;
+	}
+	if let Some(identity) = identities.github {
+		registry.register(identity, GithubRenderer)?;
+	}
+	if let Some(identity) = identities.browser {
+		registry.register(identity, BrowserRenderer)?;
+	}
+	if let Some(identity) = identities.computer {
+		registry.register(identity, ComputerRenderer)?;
+	}
 	Ok(())
 }
 
-/// Writes a compact human duration (`12ms`, `1.4s`, `2m36s`, `1h04m`).
-fn push_duration_ms(output: &mut String, ms: u64) {
-	use std::fmt::Write as _;
-	if ms < 1_000 {
-		write!(output, "{ms}ms").expect("writing to String cannot fail");
-	} else if ms < 60_000 {
-		let tenths = ms / 100;
-		write!(output, "{}.{}s", tenths / 10, tenths % 10).expect("writing to String cannot fail");
-	} else if ms < 3_600_000 {
-		let seconds = ms / 1_000;
-		write!(output, "{}m{:02}s", seconds / 60, seconds % 60)
-			.expect("writing to String cannot fail");
-	} else {
-		let minutes = ms / 60_000;
-		write!(output, "{}h{:02}m", minutes / 60, minutes % 60)
-			.expect("writing to String cannot fail");
+fn live_view(name: &str, status: &str) -> view::El {
+	omp_macros::view! {
+		<row gap=1>
+			<text bold>{name}</text>
+			<text fg=muted>{status}</text>
+		</row>
 	}
 }
 
-/// Writes a compact human byte count (`8B`, `2.4K`, `103K`, `1.2M`).
-fn push_bytes(output: &mut String, bytes: u64) {
-	use std::fmt::Write as _;
-	const UNITS: [&str; 4] = ["K", "M", "G", "T"];
-	if bytes < 1_000 {
-		write!(output, "{bytes}B").expect("writing to String cannot fail");
-		return;
+fn fault_view(name: &str, message: &str) -> view::El {
+	omp_macros::view! {
+		<row gap=1>
+			<text bold fg=err>{name}</text>
+			<text fg=err>{message}</text>
+		</row>
 	}
-	let mut scaled = bytes as f64;
-	let mut unit = 0usize;
-	while scaled >= 1_000.0 && unit + 1 < UNITS.len() {
-		scaled /= 1_000.0;
-		unit += 1;
-	}
-	if scaled >= 1_000.0 || scaled.fract() < 0.05 || scaled >= 100.0 {
-		write!(output, "{}{}", scaled.round() as u64, UNITS[unit])
-			.expect("writing to String cannot fail");
-	} else {
-		write!(output, "{scaled:.1}{}", UNITS[unit]).expect("writing to String cannot fail");
-	}
-}
-
-fn live_view(name: &str, status: &str) -> Str {
-	let mut output = String::from("<row gap=1><text bold>");
-	push_text(&mut output, name);
-	output.push_str("</text><text fg=muted>");
-	push_text(&mut output, status);
-	output.push_str("</text></row>");
-	Str::new(output)
-}
-
-fn fault_view(name: &str, message: &str) -> Str {
-	let mut output = String::from("<row gap=1><text bold fg=error>");
-	push_text(&mut output, name);
-	output.push_str("</text><text fg=error>");
-	push_text(&mut output, message);
-	output.push_str("</text></row>");
-	Str::new(output)
 }
 
 fn debug_label(value: impl fmt::Debug) -> String {
 	format!("{value:?}").to_ascii_lowercase()
-}
-
-fn push_attr(output: &mut String, text: &str) {
-	for character in text.chars() {
-		match character {
-			'&' => output.push_str("&amp;"),
-			'<' => output.push_str("&lt;"),
-			'>' => output.push_str("&gt;"),
-			'"' => output.push_str("&quot;"),
-			'\'' => output.push_str("&#39;"),
-			character if character.is_control() => output.push('\u{fffd}'),
-			character => output.push(character),
-		}
-	}
-}
-
-fn push_text(output: &mut String, text: &str) {
-	for character in text.chars() {
-		match character {
-			'&' => output.push_str("&amp;"),
-			'<' => output.push_str("&lt;"),
-			'>' => output.push_str("&gt;"),
-			'\t' | '\n' | '\r' => output.push(character),
-			character if character.is_control() => output.push('\u{fffd}'),
-			character => output.push(character),
-		}
-	}
 }
 
 /// Accumulates whole UTF-8 fragments without splitting a caller-owned unit.
@@ -250,12 +258,24 @@ pub(crate) mod test_support {
 			edit:       Some(identity("edit", 41)),
 			grep:       Some(identity("grep", 42)),
 			web_search: Some(identity("web_search", 48)),
+			fetch:      Some(identity("fetch", 49)),
 			glob:       Some(identity("glob", 43)),
 			shell:      Some(identity("shell", 44)),
 			hub:        Some(identity("hub", 45)),
 			write:      Some(identity("write", 45)),
 			read:       Some(identity("read", 46)),
 			eval:       Some(identity("eval", 47)),
+			ast_grep:   Some(identity("ast_grep", 50)),
+			ast_edit:   Some(identity("ast_edit", 51)),
+			ask:        Some(identity("ask", 52)),
+			todo:       Some(identity("todo", 53)),
+			think:      Some(identity("think", 54)),
+			lsp:        Some(identity("lsp", 55)),
+			debug:      Some(identity("debug", 56)),
+			goal:       Some(identity("goal", 57)),
+			github:     Some(identity("github", 58)),
+			browser:    Some(identity("browser", 59)),
+			computer:   Some(identity("computer", 60)),
 		}
 	}
 
@@ -286,12 +306,24 @@ mod tests {
 			identities.edit.as_ref().unwrap(),
 			identities.grep.as_ref().unwrap(),
 			identities.web_search.as_ref().unwrap(),
+			identities.fetch.as_ref().unwrap(),
 			identities.glob.as_ref().unwrap(),
 			identities.shell.as_ref().unwrap(),
 			identities.hub.as_ref().unwrap(),
 			identities.write.as_ref().unwrap(),
 			identities.read.as_ref().unwrap(),
 			identities.eval.as_ref().unwrap(),
+			identities.ast_grep.as_ref().unwrap(),
+			identities.ast_edit.as_ref().unwrap(),
+			identities.ask.as_ref().unwrap(),
+			identities.todo.as_ref().unwrap(),
+			identities.think.as_ref().unwrap(),
+			identities.lsp.as_ref().unwrap(),
+			identities.debug.as_ref().unwrap(),
+			identities.goal.as_ref().unwrap(),
+			identities.github.as_ref().unwrap(),
+			identities.browser.as_ref().unwrap(),
+			identities.computer.as_ref().unwrap(),
 		] {
 			assert!(
 				registry

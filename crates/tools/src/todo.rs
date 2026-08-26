@@ -109,10 +109,12 @@ pub struct Item {
 	JsonSchema,
 	PartialEq,
 	Serialize,
+	strum::AsRefStr,
 	strum::Display,
 	strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Status {
 	/// Not yet started.
 	#[default]
@@ -152,6 +154,14 @@ pub enum Fault {
 		/// Stable lookup explanation.
 		message: Str,
 	},
+}
+impl Fault {
+	/// Stable transition failure explanation.
+	pub(crate) fn message(&self) -> &str {
+		match self {
+			Self::Invalid { message } | Self::Missing { message } => message,
+		}
+	}
 }
 impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -6928,7 +6928,10 @@ fn handle_agent_event(
 				},
 				Ok(part_start::Kind::ToolCall) => {
 					let id = Str::from(start.tool_call_id.as_str());
-					let identity = missing_identity(&start.tool_name);
+					let identity = registry
+						.render_identity(&start.tool_name)
+						.cloned()
+						.unwrap_or_else(|| missing_identity(&start.tool_name));
 					state.tools.insert(id.clone(), ToolDisplay {
 						identity,
 						args: omp_slopjson::Value::Object(omp_slopjson::Object::new()),
@@ -6958,7 +6961,9 @@ fn handle_agent_event(
 					{
 						tool.args = omp_slopjson::parse_streaming(fragment);
 						ensure_tool_started(backend, id, tool, false);
-						if tool.started
+						if let Some(view) = fold_tool_args(registry, tool, false) {
+							send_backend(backend, BackendEvent::ToolView { id: id.clone(), view });
+						} else if tool.started
 							&& let Some(input) = tool.args.get("input").and_then(|value| value.as_str())
 						{
 							send_backend(backend, BackendEvent::ToolView {
@@ -6981,6 +6986,7 @@ fn handle_agent_event(
 			let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				tool.identity = identity;
+				let _ = fold_tool_args(registry, tool, true);
 			} else {
 				state.tools.insert(call_id.clone(), ToolDisplay {
 					identity,
@@ -6993,6 +6999,9 @@ fn handle_agent_event(
 		AgentEvent::ToolArgs { call_id, view, .. } => {
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				tool.args = view.clone();
+				if let Some(view) = fold_tool_args(registry, tool, true) {
+					send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
+				}
 				ensure_tool_started(backend, call_id, tool, false);
 			}
 		},
@@ -7239,7 +7248,9 @@ fn replay_items(
 					rev: Str::from(identity.rev.to_string()),
 					title,
 				});
-				tools.insert(id, ToolDisplay { identity, args, started: true, fold: ViewState::new() });
+				let mut tool = ToolDisplay { identity, args, started: true, fold: ViewState::new() };
+				let _ = fold_tool_args(registry, &mut tool, true);
+				tools.insert(id, tool);
 			},
 			Some(item::Kind::ToolResult(result)) => {
 				let id = Str::from(result.call_id.as_str());
@@ -7488,6 +7499,14 @@ fn durable_tool_ok(item: &Item) -> bool {
 
 fn structured_bytes_fallback(bytes: &Bytes) -> Str {
 	str::from_utf8(bytes).map_or_else(|_| Str::new_static("{}"), Str::from)
+}
+
+/// Folds the accumulated streaming argument parse and re-renders the live
+/// view, returning markup only when an exact-revision renderer produced one.
+fn fold_tool_args(registry: &Registry, tool: &mut ToolDisplay, complete: bool) -> Option<Str> {
+	let entry = registry.renderer(&tool.identity)?;
+	entry.fold_args(&mut tool.fold, &tool.args, complete).ok()?;
+	entry.view(&tool.fold, None).ok().flatten()
 }
 
 fn fold_tool_update(registry: &Registry, tool: &mut ToolDisplay, update: Bytes) -> Str {
@@ -8899,7 +8918,9 @@ mod tests {
 
 	#[derive(Default)]
 	struct TestFold {
-		updates: String,
+		updates:   String,
+		args:      String,
+		committed: bool,
 	}
 
 	#[derive(serde::Deserialize)]
@@ -8918,12 +8939,29 @@ mod tests {
 			state.updates.push_str(&update.text);
 		}
 
+		fn fold_args(&self, state: &mut Self::State, args: &omp_slopjson::Value, complete: bool) {
+			state.args = args
+				.get("query")
+				.and_then(|value| value.as_str())
+				.unwrap_or_default()
+				.to_owned();
+			state.committed = complete;
+		}
+
 		fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
 			let branch = outcome
 				.and_then(|outcome| outcome.get("kind"))
 				.and_then(serde_json::Value::as_str)
 				.unwrap_or("live");
-			Some(sf!("<row>{}:{}:{branch}</row>", self.0, state.updates))
+			if state.args.is_empty() {
+				return Some(sf!("<row>{}:{}:{branch}</row>", self.0, state.updates));
+			}
+			let commit = if state.committed {
+				"committed"
+			} else {
+				"partial"
+			};
+			Some(sf!("<row>{}:{}:{}:{commit}:{branch}</row>", self.0, state.args, state.updates))
 		}
 	}
 
@@ -8992,6 +9030,40 @@ mod tests {
 	fn edit_tool_title_keeps_hashline_header_fallback() {
 		let args = omp_slopjson::parse_streaming("{\"input\":\"[src/main.rs#abc]\\npatch\"}");
 		assert_eq!(tool_title(&Str::new_static("edit"), &args), "edit · src/main.rs");
+	}
+
+	#[test]
+	fn streaming_args_render_live_previews_before_any_update() {
+		let mut registry = Registry::new();
+		registry
+			.register_renderer(test_identity("test.1"), TestRenderer("one"))
+			.expect("register renderer");
+		let mut tool = ToolDisplay {
+			identity: test_identity("test.1"),
+			args:     omp_slopjson::parse_streaming(r#"{"query":"parti"#),
+			started:  false,
+			fold:     ViewState::new(),
+		};
+		assert_eq!(
+			fold_tool_args(&registry, &mut tool, false)
+				.expect("partial args render a live preview")
+				.as_str(),
+			"<row>one:parti::partial:live</row>"
+		);
+		tool.args = omp_slopjson::parse_streaming(r#"{"query":"partial search"}"#);
+		assert_eq!(
+			fold_tool_args(&registry, &mut tool, true)
+				.expect("committed args render a live preview")
+				.as_str(),
+			"<row>one:partial search::committed:live</row>"
+		);
+		let mut unknown = ToolDisplay {
+			identity: test_identity("test.9"),
+			args:     omp_slopjson::parse_streaming(r#"{"query":"x"}"#),
+			started:  false,
+			fold:     ViewState::new(),
+		};
+		assert!(fold_tool_args(&registry, &mut unknown, false).is_none());
 	}
 
 	#[test]

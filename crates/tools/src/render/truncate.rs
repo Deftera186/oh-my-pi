@@ -1,9 +1,9 @@
-use std::{borrow::Cow, fmt::Write as _};
+use std::fmt::Write as _;
 
 use bytes::Bytes;
 use omp_core::{Str, sf};
 use omp_tool::BlobRef;
-use xutf::{Encoding as _, Utf8, Utf16};
+use xutf::{Encoding as _, Utf8};
 
 use crate::read::{Fault as ReadFault, ReadBlobs};
 
@@ -114,15 +114,6 @@ pub struct ByteTruncationResult<'a> {
 	pub bytes: usize,
 }
 
-/// A possibly-owned result from [`truncate_line`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LineTruncationResult<'a> {
-	/// Original line, or its retained prefix followed by an ellipsis.
-	pub text:          Cow<'a, str>,
-	/// Whether the line exceeded the column limit.
-	pub was_truncated: bool,
-}
-
 /// Retains the longest valid UTF-8 prefix no larger than `max_bytes`.
 ///
 /// The returned text borrows the input and never ends inside a UTF-8 scalar.
@@ -144,56 +135,6 @@ pub fn truncate_head_bytes(text: &str, max_bytes: usize) -> ByteTruncationResult
 		rest = tail;
 	}
 	ByteTruncationResult { text: &text[..end], bytes: end }
-}
-
-/// Truncates one line at pi's JavaScript UTF-16 column boundary.
-///
-/// A truncated line ends with `…`; an unmodified line remains borrowed.
-pub fn truncate_line(line: &str, max_chars: usize) -> LineTruncationResult<'_> {
-	// Every UTF-16 code unit occupies at least one UTF-8 byte, so this is the
-	// overwhelmingly common no-truncation path without scanning the string.
-	if line.len() <= max_chars {
-		return LineTruncationResult { text: Cow::Borrowed(line), was_truncated: false };
-	}
-
-	let mut code_units = 0usize;
-	let mut rest = line.as_bytes();
-	while !rest.is_empty() {
-		let index = line.len() - rest.len();
-		let codepoint = Utf8::decode(&mut rest);
-		let codepoint_units = Utf16::<false>::encoded_length(codepoint);
-		let next_units = code_units + codepoint_units;
-		if next_units > max_chars {
-			let split_surrogate = code_units < max_chars;
-			let mut text =
-				String::with_capacity(index + usize::from(split_surrogate) * 3 + '…'.len_utf8());
-			text.push_str(&line[..index]);
-			// JavaScript String.slice can retain one half of a surrogate pair.
-			// Its UTF-8 projection is the replacement character.
-			if split_surrogate {
-				text.push('\u{FFFD}');
-			}
-			text.push('…');
-			return LineTruncationResult { text: Cow::Owned(text), was_truncated: true };
-		}
-
-		code_units = next_units;
-		if code_units == max_chars {
-			let end = line.len() - rest.len();
-			if rest.is_empty() {
-				return LineTruncationResult {
-					text:          Cow::Borrowed(line),
-					was_truncated: false,
-				};
-			}
-			let mut text = String::with_capacity(end + '…'.len_utf8());
-			text.push_str(&line[..end]);
-			text.push('…');
-			return LineTruncationResult { text: Cow::Owned(text), was_truncated: true };
-		}
-	}
-
-	LineTruncationResult { text: Cow::Borrowed(line), was_truncated: false }
 }
 
 /// Retains complete lines from the head within both line and UTF-8 byte limits.

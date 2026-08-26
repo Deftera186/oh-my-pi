@@ -12,6 +12,12 @@ pub struct RendererGalleryFixture {
 	pub identity:        ToolIdentity,
 	/// Human-readable card title.
 	pub title:           &'static str,
+	/// Partial argument JSON prefix folded for the streaming state, exactly as
+	/// a provider would have emitted it mid-generation. Empty skips the fold.
+	pub streaming_args:  &'static str,
+	/// Committed argument JSON folded before updates and outcomes. Empty skips
+	/// the fold.
+	pub args:            &'static str,
 	/// Serialized typed progress update, when this renderer streams updates.
 	pub progress_update: Option<&'static [u8]>,
 	/// Serialized typed successful tool outcome.
@@ -45,30 +51,59 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 	let edit = identity("edit", "hl");
 	let grep = identity("grep", "");
 	let web_search = identity("web_search", "");
+	let fetch = identity("fetch", "");
 	let glob = identity("glob", "");
 	let shell = identity("shell", "");
 	let hub = identity("hub", "");
 	let write = identity("write", "");
 	let read = identity("read", "");
 	let eval = identity("eval", "");
+	let ast_grep = identity("ast_grep", "");
+	let ast_edit = identity("ast_edit", "");
+	let ask = identity("ask", "");
+	let todo = identity("todo", "");
+	let think = identity("think", "");
+	let lsp = identity("lsp", "");
+	let debug = identity("debug", "");
+	let goal = identity("goal", "");
+	let github = identity("github", "");
+	let browser = identity("browser", "");
+	let computer = identity("computer", "");
 	let identities = BuiltinRendererIdentities {
 		edit:       Some(edit.clone()),
 		grep:       Some(grep.clone()),
 		web_search: Some(web_search.clone()),
+		fetch:      Some(fetch.clone()),
 		glob:       Some(glob.clone()),
 		shell:      Some(shell.clone()),
 		hub:        Some(hub.clone()),
 		write:      Some(write.clone()),
 		read:       Some(read.clone()),
 		eval:       Some(eval.clone()),
+		ast_grep:   Some(ast_grep.clone()),
+		ast_edit:   Some(ast_edit.clone()),
+		ask:        Some(ask.clone()),
+		todo:       Some(todo.clone()),
+		think:      Some(think.clone()),
+		lsp:        Some(lsp.clone()),
+		debug:      Some(debug.clone()),
+		goal:       Some(goal.clone()),
+		github:     Some(github.clone()),
+		browser:    Some(browser.clone()),
+		computer:   Some(computer.clone()),
 	};
 	let fixtures = [
 		crate::render::edit::gallery_fixtures(edit.clone()),
 		crate::render::fs::gallery_fixtures(write.clone(), read.clone()),
 		crate::render::search::gallery_fixtures(grep.clone(), glob.clone()),
 		crate::render::exec::gallery_fixtures(shell.clone(), eval.clone()),
-		crate::render::web::gallery_fixtures(web_search.clone()),
+		crate::render::web::gallery_fixtures(web_search.clone(), fetch.clone()),
 		crate::render::hub::gallery_fixtures(hub.clone()),
+		crate::render::ast::gallery_fixtures(ast_grep.clone(), ast_edit.clone()),
+		crate::render::interaction::gallery_fixtures(ask.clone(), todo.clone(), think.clone()),
+		crate::render::codeintel::gallery_fixtures(lsp.clone(), debug.clone()),
+		crate::render::agentic::gallery_fixtures(goal.clone()),
+		crate::render::misc::gallery_fixtures(github.clone(), browser.clone(), computer.clone()),
 	]
 	.concat();
 	BuiltinRendererGallery { identities, fixtures }

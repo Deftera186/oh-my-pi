@@ -65,6 +65,7 @@ foreign-types = "=0.5.0"
 fontdb = "0.24"
 fontdue = "0.9"
 futures = "0.3"
+futures-core = "0.3"
 futures-lite = "2"
 gix = { version = "0.86", default-features = false, features = ["max-performance-safe", "comfort", "sha1", "status", "revision"] }
 globset = "0.4"
@@ -456,6 +457,12 @@ split-debuginfo = "off"
 # Content-addressed storage and document hashing remain hot in debug builds.
 [profile.dev.package.blake3]
 opt-level = 3
+# Dependencies compile once and then sit in the cache; optimizing them keeps
+# debug tests and tools fast (tree-sitter grammars, crypto, decompression)
+# for a one-time cold-build cost. Workspace members stay at opt-level 0 for
+# fast iteration. blake3 above stays at 3 (specific override outranks glob).
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 opt-level = 2

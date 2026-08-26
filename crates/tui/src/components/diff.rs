@@ -1,5 +1,6 @@
 use omp_core::{IntoStr, Str};
 
+use super::{overflow_plan, paint_overflow_footer};
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	components::text::paint_rich,
@@ -352,15 +353,27 @@ impl Component for DiffView {
 
 	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		self.render(ctx, width);
+		let natural = RichText::rows(&self.rich);
 		self
 			.props
-			.max()
-			.map_or_else(|| RichText::rows(&self.rich), |max| RichText::rows(&self.rich).min(max))
+			.max_rows()
+			.map_or(natural, |max| natural.min(max))
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		self.render(pc.ctx, rect.width);
-		paint_rich(pc, rect, &self.rich, self.props.align());
+		let natural = RichText::rows(&self.rich);
+		let plan = overflow_plan(&self.props, natural, rect.height);
+		let content_rows = plan.map_or(rect.height, |plan| plan.content_rows);
+		paint_rich(
+			pc,
+			Rect::new(rect.x, rect.y, rect.width, content_rows),
+			&self.rich,
+			self.props.align(),
+		);
+		if let Some(plan) = plan {
+			paint_overflow_footer(pc, rect, plan);
+		}
 	}
 }
 
@@ -440,12 +453,23 @@ mod tests {
 	}
 	#[test]
 	fn max_rows_bounds_wrapped_physical_rows() {
-		let mut diff = DiffView::new().with(Prop::Max, 3_u16);
+		let mut diff = DiffView::new().with(Prop::MaxRows, 3_u16);
 		diff.push(DiffKind::Add, "abcdefghijklmnopqrstuvwxyz");
 		diff.push(DiffKind::Add, "another logical line");
 		let ctx = UiContext::default();
 
 		assert_eq!(diff.height(&ctx, 8), 3);
+	}
+	#[test]
+	fn overflow_footer_reserves_a_row_and_counts_wrapped_rows() {
+		let mut diff = DiffView::new()
+			.with(Prop::MaxRows, 3_u16)
+			.with(Prop::Overflow, "diff rows");
+		diff.push(DiffKind::Add, "abcdefghijklmnopqrstuvwxyz");
+		let ctx = UiContext::default();
+		assert_eq!(diff.height(&ctx, 8), 3);
+		let frame = paint(&mut diff, 8, 3);
+		assert_eq!(frame_row_text(&frame, 2), "… 3 more");
 	}
 	fn paint_with_ctx(
 		component: &mut dyn Component,

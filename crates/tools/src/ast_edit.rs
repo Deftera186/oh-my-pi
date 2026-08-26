@@ -62,6 +62,8 @@ pub struct ChangedFile {
 	pub before_hash:  Str,
 	/// Twelve-hex-character prefix of the proposed content's BLAKE3 digest.
 	pub after_hash:   Str,
+	/// Stable numbered source diff for this file.
+	pub diff:         Str,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -89,9 +91,9 @@ pub struct Payload {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-/// Empty update type because structural rewrites emit only a terminal staged
-/// result.
+/// Empty update type because structural rewrites emit only a terminal result.
 pub enum Update {}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 /// Terminal validation, target-discovery, staging, or rewrite failure.
 pub struct Fault {
@@ -197,7 +199,7 @@ impl Tool for AstEdit {
 				if replacements != 0 { prepared.push(Prepared { absolute, relative: file.relative_path, before: *Hash32::sum(&original).as_bytes(), after: *Hash32::sum(updated.as_bytes()).as_bytes(), original, updated, replacements }); }
 			}
 			if prepared.is_empty() { yield done(Ok(Payload { files: Vec::new(), advisories, recovery_root: None, pending_proposal: None })); return; }
-			let files = prepared.iter().map(|p| ChangedFile { path: p.relative.clone(), replacements: p.replacements, before_hash: short_hash(&p.before), after_hash: short_hash(&p.after) }).collect::<Vec<_>>();
+			let files = prepared.iter().map(|p| ChangedFile { path: p.relative.clone(), replacements: p.replacements, before_hash: short_hash(&p.before), after_hash: short_hash(&p.after), diff: prepared_diff(p) }).collect::<Vec<_>>();
 			let summary = sf!("Pending proposal: ast_edit would change {} file(s).", files.len());
 			let pending = match self.proposals.stage(
 				sf!("ast_edit"),
@@ -317,6 +319,7 @@ impl AstEditAction {
 				replacements: prepared.replacements,
 				before_hash:  short_hash(&prepared.before),
 				after_hash:   short_hash(&prepared.after),
+				diff:         prepared_diff(prepared),
 			})
 			.collect();
 		Ok(serde_json::to_value(Payload {
@@ -327,6 +330,16 @@ impl AstEditAction {
 		})?)
 	}
 }
+
+fn prepared_diff(prepared: &Prepared) -> Str {
+	omp_hashline::numbered_diff(
+		&prepared.original,
+		prepared.updated.as_bytes(),
+		Some(Path::new(prepared.relative.as_str())),
+	)
+	.map_or_else(|_| Str::new(""), |diff| diff.text)
+}
+
 fn short_hash(hash: &[u8; 32]) -> Str {
 	use omp_core::encoding::hex;
 	let mut out = [0_u8; 16];

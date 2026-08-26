@@ -86,7 +86,7 @@ pub struct Payload {
 	/// Whether the presentation host was noninteractive.
 	pub headless: bool,
 }
-/// Ask has no partial updates.
+/// Ask has no genuine output updates.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 /// Ask validation or presenter failure.

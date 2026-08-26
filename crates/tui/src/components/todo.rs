@@ -1,7 +1,7 @@
-use std::{borrow::Cow, slice};
+use std::{borrow::Cow, slice, str};
 
 use omp_core::{IntoStr, Str, sf};
-use smallvec::SmallVec;
+use smol_bitmap::SmolBitmap;
 use strum::{EnumString, IntoStaticStr};
 
 use crate::{
@@ -16,6 +16,102 @@ use crate::{
 
 const VISIBLE_STAGE_LIMIT: usize = 5;
 const SPINE_TAIL_CELLS: usize = 6;
+const MAX_ROMAN: usize = 3_999;
+const PREFIX_CAPACITY: usize = 22;
+const ROMAN_DIGITS: [(usize, &[u8]); 13] = [
+	(1000, b"M"),
+	(900, b"CM"),
+	(500, b"D"),
+	(400, b"CD"),
+	(100, b"C"),
+	(90, b"XC"),
+	(50, b"L"),
+	(40, b"XL"),
+	(10, b"X"),
+	(9, b"IX"),
+	(5, b"V"),
+	(4, b"IV"),
+	(1, b"I"),
+];
+
+struct PhasePrefix {
+	bytes: [u8; PREFIX_CAPACITY],
+	len:   usize,
+}
+
+impl PhasePrefix {
+	fn new(ordinal: usize) -> Self {
+		let mut prefix = Self { bytes: [0; PREFIX_CAPACITY], len: 0 };
+		if (1..=MAX_ROMAN).contains(&ordinal) {
+			let mut remaining = ordinal;
+			for &(value, digits) in &ROMAN_DIGITS {
+				while remaining >= value {
+					prefix.push(digits);
+					remaining -= value;
+				}
+			}
+		} else {
+			let mut reversed = [0u8; 20];
+			let mut value = ordinal;
+			let mut digits = 0;
+			if value == 0 {
+				prefix.push(b"0");
+			}
+			while value > 0 {
+				reversed[digits] = b'0' + (value % 10) as u8;
+				value /= 10;
+				digits += 1;
+			}
+			while digits > 0 {
+				digits -= 1;
+				prefix.push(&reversed[digits..=digits]);
+			}
+		}
+		prefix.push(b". ");
+		prefix
+	}
+
+	fn push(&mut self, bytes: &[u8]) {
+		let end = self.len + bytes.len();
+		self.bytes[self.len..end].copy_from_slice(bytes);
+		self.len = end;
+	}
+
+	fn as_str(&self) -> &str {
+		str::from_utf8(&self.bytes[..self.len]).expect("phase prefixes are ASCII")
+	}
+}
+
+fn has_canonical_roman_prefix(label: &str) -> bool {
+	let Some((token, rest)) = label.split_once('.') else {
+		return false;
+	};
+	if rest.is_empty() || !rest.starts_with(char::is_whitespace) || token.is_empty() {
+		return false;
+	}
+	let mut ordinal = 0usize;
+	let mut previous = 0usize;
+	for byte in token.bytes().rev() {
+		let value = match byte {
+			b'I' => 1,
+			b'V' => 5,
+			b'X' => 10,
+			b'L' => 50,
+			b'C' => 100,
+			b'D' => 500,
+			b'M' => 1000,
+			_ => return false,
+		};
+		if value < previous {
+			ordinal = ordinal.saturating_sub(value);
+		} else {
+			ordinal = ordinal.saturating_add(value);
+			previous = value;
+		}
+	}
+	(1..=MAX_ROMAN).contains(&ordinal)
+		&& PhasePrefix::new(ordinal).as_str().strip_suffix(". ") == Some(token)
+}
 
 /// Collapses multiline HUD copy onto one row using this terminal's return
 /// glyph.
@@ -186,7 +282,9 @@ impl Default for TodoTask {
 /// a progress-colored outer spine and tail. When every root is a group, roots
 /// are treated as stages: the active stage plus four successors are shown and
 /// any remaining stages collapse into a summary row. The list is display-only
-/// and has no focus or keys.
+/// and has no focus or keys. `numbering="roman"` prefixes root phases with
+/// canonical Roman numerals; canonical authored prefixes are preserved, and
+/// ordinals above 3,999 fall back to decimal.
 pub struct Todo {
 	props:           Props,
 	slot:            Slot,
@@ -232,6 +330,13 @@ impl Todo {
 
 	fn family(&self) -> Border {
 		self.props.guides().unwrap_or(Border::Square)
+	}
+
+	fn roman_numbering(&self) -> bool {
+		self
+			.props
+			.str_of(Prop::Numbering)
+			.is_some_and(|value| value.as_str() == "roman")
 	}
 
 	fn row_count(tasks: &[TodoTask]) -> usize {
@@ -337,7 +442,17 @@ impl Component for Todo {
 	}
 
 	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
-		(12, Self::max_width(&self.tasks, 0).max(20))
+		let numbering_width = if self.roman_numbering() {
+			cell_width(PhasePrefix::new(self.tasks.len().max(1)).as_str()).max(11)
+		} else {
+			0
+		};
+		(
+			12,
+			Self::max_width(&self.tasks, 0)
+				.saturating_add(numbering_width)
+				.max(20),
+		)
 	}
 
 	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
@@ -380,8 +495,9 @@ impl Component for Todo {
 			filled = filled.min(path_cells.saturating_sub(1));
 		}
 		let mut spine = Spine { filled, row: 0 };
-		let mut trail: SmallVec<bool, 8> = SmallVec::new();
+		let mut trail: SmolBitmap = SmolBitmap::with_capacity(8);
 		let (start, end) = self.stage_window();
+		let roman_numbering = self.roman_numbering();
 		if self.is_stage_list() {
 			if let Some(active) = self.tasks.get(start) {
 				paint_tasks(
@@ -390,21 +506,25 @@ impl Component for Todo {
 					&glyphs,
 					slice::from_ref(active),
 					&mut trail,
+					0,
 					&mut spine,
 					&mut y,
 					true,
+					roman_numbering.then_some(start + 1),
 				);
 			}
-			for stage in &self.tasks[start.saturating_add(1)..end] {
+			for (index, stage) in self.tasks[start.saturating_add(1)..end].iter().enumerate() {
 				paint_tasks(
 					pc,
 					rect,
 					&glyphs,
 					slice::from_ref(stage),
 					&mut trail,
+					0,
 					&mut spine,
 					&mut y,
 					false,
+					roman_numbering.then_some(start + index + 2),
 				);
 			}
 			if end < self.tasks.len() && y < rect.y.saturating_add(rect.height).min(pc.clip) {
@@ -422,9 +542,11 @@ impl Component for Todo {
 				&glyphs,
 				&self.tasks[start..end],
 				&mut trail,
+				0,
 				&mut spine,
 				&mut y,
 				true,
+				roman_numbering.then_some(start + 1),
 			);
 		}
 		paint_spine_tail(pc, rect, &glyphs, &spine, y);
@@ -479,10 +601,12 @@ fn paint_tasks(
 	rect: Rect,
 	glyphs: &Glyphs,
 	tasks: &[TodoTask],
-	trail: &mut SmallVec<bool, 8>,
+	trail: &mut SmolBitmap,
+	trail_depth: usize,
 	spine: &mut Spine,
 	y: &mut u16,
 	descend: bool,
+	root_ordinal: Option<usize>,
 ) {
 	let bottom = rect.y.saturating_add(rect.height).min(pc.clip);
 	let count = tasks.len();
@@ -495,7 +619,7 @@ fn paint_tasks(
 			pc,
 			rect.x,
 			*y,
-			if trail.is_empty() {
+			if trail_depth == 0 {
 				glyphs.branch
 			} else {
 				glyphs.cont
@@ -505,8 +629,9 @@ fn paint_tasks(
 		let guide = Style::new().fg(pc.ctx.theme.muted);
 		// Ancestor gutters, then this row's nested connector. The outer
 		// progress spine already owns the root connector.
-		if !trail.is_empty() {
-			for &more in &trail[1..] {
+		if trail_depth != 0 {
+			for level in 1..trail_depth {
+				let more = trail.get(level);
 				x = pc
 					.frame
 					.put(x, *y, if more { glyphs.cont } else { "  " }, guide);
@@ -517,6 +642,10 @@ fn paint_tasks(
 			x = pc.frame.put(x, *y, " ", guide);
 		}
 		let label = task.effective_label();
+		let prefix = root_ordinal
+			.map(|first| first.saturating_add(index))
+			.filter(|_| !has_canonical_roman_prefix(label))
+			.map(PhasePrefix::new);
 		if task.children.is_empty() {
 			let theme = &pc.ctx.theme;
 			let status = task.effective_status();
@@ -529,6 +658,11 @@ fn paint_tasks(
 			};
 			x = pc.frame.put(x, *y, glyph, style);
 			x = pc.frame.put(x, *y, " ", style);
+			if let Some(prefix) = &prefix {
+				x = pc
+					.frame
+					.put(x, *y, prefix.as_str(), Style::new().fg(pc.ctx.theme.muted).bold());
+			}
 			let label_style = match status {
 				TaskStatus::Done | TaskStatus::Dropped => style.strikethrough(),
 				_ => style,
@@ -540,6 +674,11 @@ fn paint_tasks(
 		} else {
 			// Group header: bold label plus an automatic closed/total count
 			// over its descendant leaves.
+			if let Some(prefix) = &prefix {
+				x = pc
+					.frame
+					.put(x, *y, prefix.as_str(), Style::new().fg(pc.ctx.theme.muted).bold());
+			}
 			x = pc
 				.frame
 				.put(x, *y, label, Style::new().fg(pc.ctx.theme.fg).bold());
@@ -547,9 +686,19 @@ fn paint_tasks(
 		}
 		*y = y.saturating_add(1);
 		if descend && !task.children.is_empty() {
-			trail.push(!is_last);
-			paint_tasks(pc, rect, glyphs, &task.children, trail, spine, y, true);
-			trail.pop();
+			trail.set(trail_depth, !is_last);
+			paint_tasks(
+				pc,
+				rect,
+				glyphs,
+				&task.children,
+				trail,
+				trail_depth + 1,
+				spine,
+				y,
+				true,
+				None,
+			);
 		}
 	}
 }
@@ -573,6 +722,14 @@ mod tests {
 			Rect::new(0, 0, 48, height),
 		);
 		(frame, ctx)
+	}
+
+	fn painted_text(todo: &mut Todo) -> String {
+		let (frame, _) = paint(todo);
+		(0..frame.size().height)
+			.map(|row| frame_row_text(&frame, row))
+			.collect::<Vec<_>>()
+			.join("\n")
 	}
 	#[test]
 	fn counts_walk_nested_closed_leaves_only() {
@@ -642,6 +799,56 @@ mod tests {
 					.all(|&color| color == ctx.theme.accent || color == ctx.theme.muted)
 			);
 		}
+	}
+
+	#[test]
+	fn phase_prefixes_are_canonical_and_bounded() {
+		for (ordinal, expected) in [
+			(0, "0. "),
+			(1, "I. "),
+			(4, "IV. "),
+			(9, "IX. "),
+			(49, "XLIX. "),
+			(944, "CMXLIV. "),
+			(3_999, "MMMCMXCIX. "),
+			(4_000, "4000. "),
+		] {
+			assert_eq!(PhasePrefix::new(ordinal).as_str(), expected);
+		}
+		assert_eq!(PhasePrefix::new(usize::MAX).as_str(), format!("{}. ", usize::MAX),);
+		assert!(has_canonical_roman_prefix("XLIX. phase"));
+		assert!(!has_canonical_roman_prefix("IL. phase"));
+		assert!(!has_canonical_roman_prefix("IV.phase"));
+	}
+
+	#[test]
+	fn roman_numbering_only_prefixes_unprefixed_roots() {
+		let mut todo = Todo::new()
+			.with(Prop::Numbering, "roman")
+			.task(
+				TodoTask::new()
+					.label("Plan")
+					.task(TodoTask::new().label("Nested")),
+			)
+			.task(
+				TodoTask::new()
+					.label("II. Authored")
+					.task(TodoTask::new().label("Later")),
+			);
+		let text = painted_text(&mut todo);
+		assert!(text.contains("I. Plan"), "{text}");
+		assert!(text.contains("Nested"), "{text}");
+		assert!(!text.contains("I. Nested"), "{text}");
+		assert_eq!(text.matches("II. Authored").count(), 1, "{text}");
+		assert!(!text.contains("II. II. Authored"), "{text}");
+	}
+
+	#[test]
+	fn absent_numbering_keeps_root_labels_unchanged() {
+		let mut todo = Todo::new().task(TodoTask::new().label("Plan"));
+		let text = painted_text(&mut todo);
+		assert!(text.contains("Plan"), "{text}");
+		assert!(!text.contains("I. Plan"), "{text}");
 	}
 
 	#[test]

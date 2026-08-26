@@ -156,6 +156,16 @@ fn fixture_chat<'a>(
 	state: GalleryState,
 ) -> miette::Result<Chat> {
 	let mut fold = ViewState::new();
+	let streamed_args = match state {
+		GalleryState::Streaming => fixture.streaming_args,
+		GalleryState::Progress | GalleryState::Success | GalleryState::Error => fixture.args,
+	};
+	if !streamed_args.is_empty() {
+		let args = omp_slopjson::parse_streaming(streamed_args);
+		registry
+			.fold_args(&fixture.identity, &mut fold, &args, state != GalleryState::Streaming)
+			.into_diagnostic()?;
+	}
 	if state != GalleryState::Streaming
 		&& let Some(update) = fixture.progress_update
 	{

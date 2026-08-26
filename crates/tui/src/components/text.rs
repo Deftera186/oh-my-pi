@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use omp_core::{IntoStr, Str, StrMut, sf};
 use smallvec::SmallVec;
 use xutf::Text;
 
+use super::{overflow_plan, paint_overflow_footer, text_limit::limit_utf16};
 use crate::{
 	Frame, UiContext,
 	anim::{self},
@@ -77,6 +78,14 @@ impl TextLeaf {
 		self
 	}
 
+	fn limited_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+		let truncate_from = self.props.truncate_from();
+		self.props.max_chars().map_or_else(
+			|| Cow::Borrowed(text),
+			|max_chars| limit_utf16(text, usize::from(max_chars), truncate_from),
+		)
+	}
+
 	fn render(&mut self, ctx: &UiContext, width: u16) {
 		let width = width.max(1);
 		let style = self.props.style(&ctx.theme);
@@ -98,7 +107,9 @@ impl TextLeaf {
 		{
 			return;
 		}
-		let visible = &self.text[..end];
+		let visible = self.limited_text(&self.text[..end]);
+		let limited_owned = matches!(&visible, std::borrow::Cow::Owned(_));
+		let visible = visible.as_ref();
 		self.rich.clear();
 		match self.props.truncate() {
 			Some(Truncate::End) => {
@@ -117,7 +128,14 @@ impl TextLeaf {
 						runs.push((style, sf!(" ")));
 					}
 					if !line.is_empty() {
-						runs.push((style, self.text.slice_ref(line)));
+						runs.push((
+							style,
+							if limited_owned {
+								Str::new(line)
+							} else {
+								self.text.slice_ref(line)
+							},
+						));
 					}
 				}
 				clip_start_runs(&mut self.rich, width, &runs);
@@ -187,19 +205,14 @@ impl Component for TextLeaf {
 	}
 
 	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
+		let text = self.limited_text(&self.text);
 		if self.props.text_wrap() == TextWrap::Pre {
-			let natural = self
-				.text
-				.as_str()
-				.split('\n')
-				.map(cell_width)
-				.max()
-				.unwrap_or(0);
+			let natural = text.as_ref().split('\n').map(cell_width).max().unwrap_or(0);
 			return (natural, natural);
 		}
 		let mut widest_word = 0;
 		let mut total = 0u16;
-		for word in self.text.split_whitespace() {
+		for word in text.split_whitespace() {
 			let width = cell_width(word);
 			widest_word = widest_word.max(width);
 			total = total.saturating_add(width).saturating_add(1);
@@ -376,18 +389,58 @@ fn count_clusters(text: &str, start: usize) -> (usize, usize) {
 	}
 	(count, tail)
 }
+fn decimal_width(mut value: u64) -> u16 {
+	let mut width = 1;
+	while value >= 10 {
+		value /= 10;
+		width += 1;
+	}
+	width
+}
+fn line_number_prefix<'a>(
+	number: u64,
+	digits: usize,
+	rail: &str,
+	buffer: &'a mut [u8; 32],
+) -> &'a str {
+	let number_width = usize::from(decimal_width(number));
+	let pad = digits.saturating_sub(number_width);
+	buffer[..pad].fill(b' ');
+	let mut cursor = digits;
+	let mut remaining = number;
+	loop {
+		cursor -= 1;
+		buffer[cursor] = b'0' + u8::try_from(remaining % 10).unwrap_or(0);
+		remaining /= 10;
+		if remaining == 0 {
+			break;
+		}
+	}
+	buffer[digits] = b' ';
+	let end = digits + 1 + rail.len();
+	buffer[digits + 1..end].copy_from_slice(rail.as_bytes());
+	std::str::from_utf8(&buffer[..end]).expect("line-number chrome is valid UTF-8")
+}
 
 /// Preformatted text backing the `<pre>` markup tag.
 pub struct Pre {
-	props: Props,
-	slot:  Slot,
-	text:  Str,
+	props:      Props,
+	slot:       Slot,
+	text:       Str,
+	line_count: u16,
+	max_width:  u16,
 }
 
 impl Pre {
 	/// Creates an empty preformatted block.
 	pub fn new() -> Self {
-		Self { props: Props::new(), slot: next_slot(), text: Str::default() }
+		Self {
+			props:      Props::new(),
+			slot:       next_slot(),
+			text:       Str::default(),
+			line_count: 0,
+			max_width:  0,
+		}
 	}
 
 	/// Sets one property.
@@ -404,6 +457,7 @@ impl Pre {
 	/// Appends preformatted text content.
 	pub fn text(mut self, text: impl IntoStr) -> Self {
 		append(&mut self.text, text.into_str());
+		self.refresh_metrics();
 		self
 	}
 
@@ -411,11 +465,50 @@ impl Pre {
 	pub(crate) const fn content(&self) -> &Str {
 		&self.text
 	}
+
+	fn refresh_metrics(&mut self) {
+		let mut line_count = 0_u16;
+		let mut max_width = 0_u16;
+		for line in self.text.lines() {
+			line_count = line_count.saturating_add(1);
+			max_width = max_width.max(cell_width(line));
+		}
+		self.line_count = line_count;
+		self.max_width = max_width;
+	}
 }
 
 impl Default for Pre {
 	fn default() -> Self {
 		Self::new()
+	}
+}
+
+impl Pre {
+	fn numbered(&self) -> bool {
+		self.props.numbers()
+	}
+
+	fn start(&self) -> u64 {
+		self.props.start()
+	}
+
+	fn line_count(&self) -> u16 {
+		self.line_count
+	}
+
+	fn visible_rows(&self, available: u16) -> u16 {
+		self.line_count().min(available)
+	}
+
+	fn gutter_width(&self, rows: u16) -> u16 {
+		if !self.numbered() || rows == 0 {
+			return 0;
+		}
+		let last = self
+			.start()
+			.saturating_add(u64::from(rows.saturating_sub(1)));
+		decimal_width(last).saturating_add(3)
 	}
 }
 
@@ -433,23 +526,42 @@ impl Component for Pre {
 	}
 
 	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
-		let width = self.text.lines().map(cell_width).max().unwrap_or(0);
+		let width = self.max_width;
+		let rows = overflow_plan(&self.props, self.line_count(), u16::MAX)
+			.map_or_else(|| self.line_count(), |plan| plan.content_rows);
+		let width = width.saturating_add(self.gutter_width(rows));
 		(width, width)
 	}
 
 	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
-		u16::try_from(self.text.lines().count()).unwrap_or(u16::MAX)
+		overflow_plan(&self.props, self.line_count(), u16::MAX).map_or_else(
+			|| self.line_count(),
+			|plan| {
+				plan
+					.content_rows
+					.saturating_add(u16::from(!plan.noun.is_empty()))
+			},
+		)
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
-		let width = self.text.lines().map(cell_width).max().unwrap_or(0);
-		let slack = rect.width.saturating_sub(width.min(rect.width));
+		let plan = overflow_plan(&self.props, self.line_count(), rect.height);
+		let content_rows = plan.map_or(rect.height, |plan| plan.content_rows);
+		let clip = pc.clip.min(rect.y.saturating_add(content_rows));
+		let rows = self.visible_rows(clip.saturating_sub(rect.y));
+		let gutter = self.gutter_width(rows);
+		let text_width = self.max_width;
+		let block_width = gutter.saturating_add(text_width).min(rect.width);
+		let slack = rect.width.saturating_sub(block_width);
 		let x = rect
 			.x
 			.saturating_add(alignment_slack(self.props.align(), slack));
 		let right = rect.x.saturating_add(rect.width);
+		let content_x = x.saturating_add(gutter).min(right);
 		let style = self.props.style(&pc.ctx.theme);
-		let clip = pc.clip.min(rect.y.saturating_add(rect.height));
+		let gutter_style = Style::new().fg(pc.ctx.theme.muted);
+		let digits = gutter.saturating_sub(3) as usize;
+		let mut prefix_buffer = [0_u8; 32];
 		for (row, line) in self.text.lines().enumerate() {
 			let y = rect
 				.y
@@ -457,25 +569,35 @@ impl Component for Pre {
 			if y >= clip {
 				break;
 			}
-			put_clipped(pc.frame, x, y, right, line, style);
+			if gutter > 0 {
+				let number = self
+					.start()
+					.saturating_add(u64::try_from(row).unwrap_or(u64::MAX));
+				let prefix =
+					line_number_prefix(number, digits, pc.ctx.charset.quote_rail(), &mut prefix_buffer);
+				put_clipped(pc.frame, x, y, content_x, &prefix, gutter_style);
+			}
+			put_clipped(pc.frame, content_x, y, right, line, style);
+		}
+		if let Some(plan) = plan {
+			paint_overflow_footer(pc, rect, plan);
 		}
 	}
 
 	fn gradient_bounds(&self, content: Rect) -> Option<Rect> {
-		let width = self
-			.text
-			.lines()
-			.map(cell_width)
-			.max()
-			.unwrap_or(0)
-			.min(content.width);
-		let slack = content.width.saturating_sub(width);
+		let height = self.visible_rows(
+			overflow_plan(&self.props, self.line_count(), content.height)
+				.map_or(content.height, |plan| plan.content_rows),
+		);
+		let gutter = self.gutter_width(height);
+		let text_width = self.max_width;
+		let block_width = gutter.saturating_add(text_width).min(content.width);
+		let slack = content.width.saturating_sub(block_width);
 		let x = content
 			.x
-			.saturating_add(alignment_slack(self.props.align(), slack));
-		let height = u16::try_from(self.text.lines().count())
-			.unwrap_or(u16::MAX)
-			.min(content.height);
+			.saturating_add(alignment_slack(self.props.align(), slack))
+			.saturating_add(gutter.min(content.width));
+		let width = text_width.min(content.x.saturating_add(content.width).saturating_sub(x));
 		Some(Rect::new(x, content.y, width, height))
 	}
 
@@ -484,6 +606,7 @@ impl Component for Pre {
 			return false;
 		}
 		self.text = text;
+		self.refresh_metrics();
 		true
 	}
 }
@@ -696,6 +819,7 @@ mod tests {
 		UiContext,
 		component::{Component, PaintCtx},
 		components::{Callout, Icon, Latex, Markdown},
+		context::Charset,
 		frame::{Frame, Rect, Size},
 		test_support::frame_row_text,
 		ui::Ui,
@@ -777,6 +901,86 @@ mod tests {
 		let frame = paint(&mut pre, 4, 2);
 		assert_eq!(frame_row_text(&frame, 0), "A");
 		assert_eq!(frame_row_text(&frame, 1), " B");
+	}
+
+	#[test]
+	fn numbered_pre_aligns_multi_digit_starts_and_keeps_height() {
+		let ctx = UiContext::default();
+		let mut pre = Pre::new()
+			.with(Prop::Numbers, true)
+			.with(Prop::Start, 9_u64)
+			.text("A\nB\nC");
+		assert_eq!(pre.height(&ctx, 1), 3, "gutters never introduce wrapped rows");
+		let frame = paint(&mut pre, 8, 2);
+		assert_eq!(frame_row_text(&frame, 0), " 9 │ A");
+		assert_eq!(frame_row_text(&frame, 1), "10 │ B");
+	}
+
+	#[test]
+	fn numbered_pre_uses_physically_visible_range_and_survives_narrow_widths() {
+		let ctx = UiContext::default();
+		let mut pre = Pre::new()
+			.with(Prop::Numbers, true)
+			.with(Prop::Start, 8_u64)
+			.with(Prop::MaxRows, 2_u16)
+			.text("A\nB\nC");
+		assert_eq!(pre.measure(&ctx), (5, 5), "clipped line 10 does not widen the gutter");
+		let frame = paint(&mut pre, 6, 2);
+		assert_eq!(frame_row_text(&frame, 0), "8 │ A");
+		assert_eq!(frame_row_text(&frame, 1), "9 │ B");
+
+		let frame = paint(&mut pre, 2, 2);
+		assert_eq!(frame_row_text(&frame, 0), "8");
+		assert_eq!(frame_row_text(&frame, 1), "9");
+	}
+
+	#[test]
+	fn numbered_pre_reserves_shared_overflow_footer_after_content_rows() {
+		let ctx = UiContext::default();
+		let mut pre = Pre::new()
+			.with(Prop::Numbers, true)
+			.with(Prop::Start, 9_u64)
+			.with(Prop::MaxRows, 3_u16)
+			.with(Prop::Overflow, "lines")
+			.text("A\nB\nC\nD");
+		assert_eq!(pre.height(&ctx, 20), 3);
+		let frame = paint(&mut pre, 20, 3);
+		assert_eq!(frame_row_text(&frame, 0), " 9 │ A");
+		assert_eq!(frame_row_text(&frame, 1), "10 │ B");
+		assert_eq!(frame_row_text(&frame, 2), "… 2 more lines");
+	}
+
+	#[test]
+	fn numbered_pre_preserves_offset_and_gradient_content_bounds() {
+		let ctx = UiContext { charset: Charset::Ascii, ..UiContext::default() };
+		let mut frame = Frame::new(Size::new(12, 2));
+		let mut hits = Vec::new();
+		let mut wakes = Vec::new();
+		let mut pc = PaintCtx::new(&mut frame, &ctx, &mut hits, &mut wakes);
+		let mut pre = Pre::new()
+			.with(Prop::Numbers, true)
+			.with(Prop::Start, 99_u64)
+			.text("A\nB");
+		pre.paint(&mut pc, Rect::new(2, 0, 10, 2));
+		assert_eq!(frame_row_text(&frame, 0), "   99 | A");
+		assert_eq!(pre.gradient_bounds(Rect::new(2, 0, 10, 2)), Some(Rect::new(8, 0, 1, 2)),);
+	}
+
+	#[test]
+	fn text_max_chars_uses_directional_utf16_limits() {
+		let mut end = TextLeaf::new()
+			.with(Prop::MaxChars, 3_u16)
+			.with(Prop::TruncateFrom, "end")
+			.text("A😀BC");
+		let frame = paint(&mut end, 20, 1);
+		assert_eq!(frame_row_text(&frame, 0), "A😀…");
+
+		let mut start = TextLeaf::new()
+			.with(Prop::MaxChars, 3_u16)
+			.with(Prop::TruncateFrom, "start")
+			.text("A😀BC");
+		let frame = paint(&mut start, 20, 1);
+		assert_eq!(frame_row_text(&frame, 0), "…�BC");
 	}
 
 	#[test]

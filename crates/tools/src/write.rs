@@ -76,12 +76,14 @@ pub struct Params {
 pub enum Update {}
 
 /// Whether the committed plain write created or replaced its target.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, strum::Display)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WriteDisposition {
 	/// The target did not exist before the transaction.
 	Created,
 	/// The target existed and was atomically replaced.
+	#[strum(to_string = "updated")]
 	Overwrote,
 }
 
@@ -892,7 +894,12 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 								}
 							};
 							if let Some(result) = archive_result {
-								yield done(Ok(special_payload(result, stripped.stripped, reported_len, canonical_recovery.clone())));
+								yield done(Ok(special_payload(
+									result,
+									stripped.stripped,
+									reported_len,
+									canonical_recovery.clone(),
+								)));
 								return;
 							}
 
@@ -922,7 +929,12 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 								}
 							};
 							if let Some(result) = sqlite_result {
-								yield done(Ok(special_payload(result, stripped.stripped, reported_len, canonical_recovery.clone())));
+								yield done(Ok(special_payload(
+									result,
+									stripped.stripped,
+									reported_len,
+									canonical_recovery.clone(),
+								)));
 								return;
 							}
 

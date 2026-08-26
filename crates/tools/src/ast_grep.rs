@@ -49,6 +49,8 @@ pub struct Match {
 	pub end_column: usize,
 	/// Exact source text covered by the matched AST node.
 	pub text:       Str,
+	/// Stable, display-ready metavariable bindings (`$A=value, $B=value`).
+	pub bindings:   Str,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -158,7 +160,7 @@ impl Tool for AstGrep {
 				let patterns = match omp_ast::ops::compile_search_patterns(&params.pat, language) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
 				let source = match fs::read_to_string(&file.absolute_path) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
 				for found in omp_ast::ops::collect_matches(&source, language, &patterns) {
-					matches.push(Match { path: file.relative_path.clone(), line: found.line, column: found.column, end_line: found.end_line, end_column: found.end_column, text: found.text });
+					matches.push(Match { path: file.relative_path.clone(), line: found.line, column: found.column, end_line: found.end_line, end_column: found.end_column, text: found.text, bindings: Str::new("") });
 				}
 			}
 			matches.sort_unstable_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)).then(a.column.cmp(&b.column)));

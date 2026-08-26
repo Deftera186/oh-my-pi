@@ -2,8 +2,10 @@ use std::slice;
 
 use omp_core::{IntoStr, Str, StrMut};
 use smallvec::SmallVec;
+use smol_bitmap::SmolBitmap;
 use xutf::Text;
 
+use super::{overflow_plan, paint_overflow_footer};
 use crate::{
 	component::{Component, EventCtx, Flow, Hit, HitTag, PaintCtx, Slot, next_slot},
 	context::{Theme, UiContext},
@@ -149,7 +151,8 @@ struct TreeRow {
 	dim:          bool,
 	has_children: bool,
 	/// Continuation bits for ancestor levels below the root.
-	gutters:      SmallVec<bool, 8>,
+	gutters:      SmolBitmap,
+	gutter_depth: usize,
 	last:         bool,
 }
 
@@ -251,8 +254,8 @@ impl Tree {
 			return;
 		}
 		self.rows.clear();
-		let mut trail = SmallVec::new();
-		walk_rows(&self.nodes, 0, "", &self.state.open, &mut trail, &mut self.rows);
+		let mut trail = SmolBitmap::new();
+		walk_rows(&self.nodes, 0, "", &self.state.open, &mut trail, 0, &mut self.rows);
 		if self.rows.is_empty() {
 			self.state.cursor = 0;
 			self.state.scroll_top = 0;
@@ -356,12 +359,19 @@ impl Component for Tree {
 
 	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
 		self.rebuild_rows();
-		u16::try_from(self.rows.len()).unwrap_or(u16::MAX)
+		let natural = u16::try_from(self.rows.len()).unwrap_or(u16::MAX);
+		self
+			.props
+			.max_rows()
+			.map_or(natural, |cap| natural.min(cap))
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		self.rebuild_rows();
-		let view_rows = usize::from(rect.height);
+		let natural = u16::try_from(self.rows.len()).unwrap_or(u16::MAX);
+		let content_rows = overflow_plan(&self.props, natural, rect.height)
+			.map_or(rect.height, |plan| plan.content_rows);
+		let view_rows = usize::from(content_rows);
 		self.clamp_scroll(view_rows);
 		let focused = pc.focus == Some(self.slot);
 		let hover_row = match pc.hover {
@@ -370,7 +380,7 @@ impl Component for Tree {
 			},
 			_ => None,
 		};
-		let bottom = rect.y.saturating_add(rect.height).min(pc.clip);
+		let bottom = rect.y.saturating_add(content_rows).min(pc.clip);
 		let visible = usize::from(bottom.saturating_sub(rect.y));
 		self.last_painted = 0;
 		for (screen_row, index) in (self.state.scroll_top..self.rows.len())
@@ -406,8 +416,10 @@ impl Component for Tree {
 			if let Some(family) = self.props.guides() {
 				let (branch, last, cont) = pc.ctx.charset.guides(family);
 				let guide = tint(Style::new().fg(pc.ctx.theme.muted));
-				for &more in &row.gutters {
-					x = pc.frame.put(x, y, if more { cont } else { "  " }, guide);
+				for gutter in 0..row.gutter_depth {
+					x = pc
+						.frame
+						.put(x, y, if row.gutters.get(gutter) { cont } else { "  " }, guide);
 				}
 				if row.depth > 0 {
 					x = pc
@@ -493,6 +505,11 @@ impl Component for Tree {
 				});
 			}
 			self.last_painted += 1;
+		}
+		if let Some(mut plan) = overflow_plan(&self.props, natural, rect.height) {
+			plan.omitted =
+				natural.saturating_sub(u16::try_from(self.last_painted).unwrap_or(u16::MAX));
+			paint_overflow_footer(pc, rect, plan);
 		}
 	}
 
@@ -672,7 +689,8 @@ fn walk_rows(
 	depth: u16,
 	path_prefix: &str,
 	open: &[Slot],
-	trail: &mut SmallVec<bool, 8>,
+	trail: &mut SmolBitmap,
+	trail_depth: usize,
 	rows: &mut Vec<TreeRow>,
 ) {
 	let count = nodes.len();
@@ -686,11 +704,11 @@ fn walk_rows(
 			.unwrap_or_else(|| path.clone());
 		let has_children = !node.children.is_empty();
 		let last = index + 1 == count;
-		let gutters = if depth > 1 {
-			trail[1..].into()
-		} else {
-			SmallVec::new()
-		};
+		let gutter_depth = trail_depth.saturating_sub(1);
+		let mut gutters = SmolBitmap::with_capacity(gutter_depth);
+		for gutter in 0..gutter_depth {
+			gutters.set(gutter, trail.get(gutter + 1));
+		}
 		let mut annotations = node.annotations.clone();
 		if let Some(text) = node.props.str_of(Prop::Annotation) {
 			annotations.push(TreeAnnotation {
@@ -714,12 +732,21 @@ fn walk_rows(
 			dim: node.props.flag(Prop::Dim),
 			has_children,
 			gutters,
+			gutter_depth,
 			last,
 		});
 		if open.contains(&node.slot) {
-			trail.push(!last);
-			walk_rows(&node.children, depth.saturating_add(1), &path, open, trail, rows);
-			trail.pop();
+			trail.set(trail_depth, !last);
+			walk_rows(
+				&node.children,
+				depth.saturating_add(1),
+				&path,
+				open,
+				trail,
+				trail_depth.saturating_add(1),
+				rows,
+			);
+			trail.set(trail_depth, false);
 		}
 	}
 }
@@ -932,6 +959,34 @@ mod tests {
 	}
 
 	#[test]
+	fn row_gutters_keep_logical_trailing_false_depth() {
+		let mut tree = Tree::new().node(
+			TreeNode::new()
+				.label("root")
+				.with(Prop::Open, true)
+				.node(
+					TreeNode::new().label("a").with(Prop::Open, true).node(
+						TreeNode::new()
+							.label("a1")
+							.with(Prop::Open, true)
+							.node(TreeNode::new().label("leaf")),
+					),
+				)
+				.node(TreeNode::new().label("b")),
+		);
+		tree.rebuild_rows();
+
+		let leaf = tree
+			.rows
+			.iter()
+			.find(|row| row.label.as_str() == "leaf")
+			.expect("leaf row");
+		assert_eq!(leaf.gutter_depth, 2);
+		assert!(leaf.gutters.get(0));
+		assert!(!leaf.gutters.get(1));
+	}
+
+	#[test]
 	fn virtualization_paints_only_window_and_scroll_chases_selection() {
 		let ctx = UiContext::default();
 		let mut tree = Tree::new();
@@ -969,6 +1024,29 @@ mod tests {
 		);
 		assert_eq!(tree.scroll_top(), 9_993);
 	}
+	#[test]
+	fn max_rows_reserves_shared_footer_and_counts_unpainted_items() {
+		let ctx = UiContext::default();
+		let mut tree = Tree::new()
+			.with(Prop::MaxRows, 3_u16)
+			.with(Prop::Overflow, "items")
+			.node(TreeNode::new().label("a"))
+			.node(TreeNode::new().label("b"))
+			.node(TreeNode::new().label("c"))
+			.node(TreeNode::new().label("d"));
+		assert_eq!(tree.height(&ctx, 20), 3);
+		let (frame, hits) = paint(&mut tree, &ctx, 20, 3);
+		assert_eq!(tree.painted_rows_len(), 2);
+		assert_eq!(
+			hits
+				.iter()
+				.filter(|hit| matches!(hit.tag, HitTag::TreeRow(_)))
+				.count(),
+			2
+		);
+		assert_eq!(frame_row_text(&frame, 2), "… 2 more items");
+	}
+
 	#[test]
 	fn selection_and_scroll_can_be_restored_by_key() {
 		let ctx = UiContext::default();

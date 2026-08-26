@@ -1564,6 +1564,24 @@ impl Registry {
 		self.renderers.fold(identity, state, update)
 	}
 
+	/// Folds the accumulated streaming argument parse through an
+	/// exact-revision renderer; unknown revisions ignore arguments.
+	pub fn fold_render_args(
+		&self,
+		identity: &ToolIdentity,
+		state: &mut ViewState,
+		args: &omp_slopjson::Value,
+		complete: bool,
+	) -> Result<(), RenderRegistryError> {
+		self.renderers.fold_args(identity, state, args, complete)
+	}
+
+	/// Resolves the single registered renderer identity for a tool name,
+	/// enabling streaming argument previews before the revision is known.
+	pub fn render_identity(&self, name: &str) -> Option<&ToolIdentity> {
+		self.renderers.resolve_name(name)
+	}
+
 	/// Renders an exact-revision fold or the generic built-in fallback.
 	pub fn render_view(
 		&self,

@@ -1,5 +1,6 @@
 use omp_core::{Str, StrMut};
 use smallvec::SmallVec;
+use smol_bitmap::SmolBitmap;
 
 use super::{MdTheme, ordinal_marker};
 use crate::{
@@ -20,7 +21,7 @@ enum HtmlList {
 #[derive(Default)]
 struct HtmlState {
 	lists:         SmallVec<HtmlList, 4>,
-	open_items:    SmallVec<bool, 4>,
+	open_items:    SmolBitmap,
 	at_line_start: bool,
 	has_content:   bool,
 }
@@ -649,9 +650,10 @@ fn render_html_tag(
 	if tag.name.eq_ignore_ascii_case("ol") || tag.name.eq_ignore_ascii_case("ul") {
 		if tag.closing {
 			state.lists.pop();
-			state.open_items.pop();
+			state.open_items.set(state.lists.len(), false);
 		} else if !tag.self_closing {
-			if state.open_items.last() == Some(&true) && !state.at_line_start {
+			let list_depth = state.lists.len();
+			if list_depth > 0 && state.open_items.get(list_depth - 1) && !state.at_line_start {
 				sink.newline();
 				state.at_line_start = true;
 			}
@@ -662,7 +664,7 @@ fn render_html_tag(
 			} else {
 				state.lists.push(HtmlList::Unordered);
 			}
-			state.open_items.push(false);
+			state.open_items.set(list_depth, false);
 		}
 		return;
 	}
@@ -674,11 +676,13 @@ fn render_html_tag(
 			state.at_line_start = true;
 			return;
 		}
-		if let Some(item_open) = state.open_items.last_mut() {
-			if *item_open && !state.at_line_start {
+		let list_depth = state.lists.len();
+		if list_depth > 0 {
+			let item_index = list_depth - 1;
+			if state.open_items.get(item_index) && !state.at_line_start {
 				sink.newline();
 			}
-			*item_open = true;
+			state.open_items.set(item_index, true);
 		} else if state.has_content && !state.at_line_start {
 			sink.newline();
 		}

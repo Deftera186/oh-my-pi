@@ -3,7 +3,7 @@ use core::fmt::{self, Write as _};
 use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 
-use super::hr::truncate_to_width;
+use super::{hr::truncate_to_width, number::write_compact_count};
 use crate::{
 	Icon, Style,
 	component::{Component, PaintCtx, Slot, next_slot},
@@ -139,17 +139,6 @@ impl fmt::Write for GaugeLabel {
 			self.len += 1;
 		}
 		Ok(())
-	}
-}
-
-/// Writes `value` in the compact `k`/`m` notation shared by context labels.
-pub fn write_compact_count(out: &mut impl fmt::Write, value: u64) -> fmt::Result {
-	if value >= 1_000_000 {
-		write!(out, "{:.1}m", value as f64 / 1_000_000.0)
-	} else if value >= 1_000 {
-		write!(out, "{:.0}k", value as f64 / 1_000.0)
-	} else {
-		write!(out, "{value}")
 	}
 }
 

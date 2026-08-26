@@ -5,6 +5,7 @@ use smallvec::SmallVec;
 
 use super::{
 	layout::{grid_measure, place_grid_row, solve_columns},
+	overflow_plan, paint_overflow_footer,
 	text::{Pre, TextLeaf, clip_start_runs, paint_rich},
 };
 use crate::{
@@ -25,13 +26,15 @@ use crate::{
 /// stat columns keep their alignment. Layout only: rows never capture
 /// input; interactive lists wrap cells in `<select>` options instead.
 pub struct Table {
-	props:    Props,
-	slot:     Slot,
+	props:        Props,
+	slot:         Slot,
 	/// Row-major cell containers.
-	children: Vec<Cached>,
-	rows:     SmallVec<RowMeta, 8>,
+	children:     Vec<Cached>,
+	rows:         SmallVec<RowMeta, 8>,
 	/// Per-row vertical bands recorded by `place` for row backgrounds.
-	bands:    SmallVec<(u16, u16), 8>,
+	bands:        SmallVec<(u16, u16), 8>,
+	/// Natural physical row count from the latest width-dependent layout.
+	natural_rows: u16,
 }
 
 struct RowMeta {
@@ -43,11 +46,12 @@ impl Table {
 	/// Creates an empty table.
 	pub fn new() -> Self {
 		Self {
-			props:    Props::new(),
-			slot:     next_slot(),
-			children: Vec::new(),
-			rows:     SmallVec::new(),
-			bands:    SmallVec::new(),
+			props:        Props::new(),
+			slot:         next_slot(),
+			children:     Vec::new(),
+			rows:         SmallVec::new(),
+			bands:        SmallVec::new(),
+			natural_rows: 0,
 		}
 	}
 
@@ -138,7 +142,8 @@ impl Component for Table {
 				.max(1);
 			height = height.saturating_add(tallest);
 		}
-		height
+		self.natural_rows = height;
+		self.props.max_rows().map_or(height, |cap| height.min(cap))
 	}
 
 	fn place(&mut self, ctx: &UiContext, content: Rect) {
@@ -153,9 +158,17 @@ impl Component for Table {
 			self.bands.push((y, row_height));
 			y = y.saturating_add(row_height);
 		}
+		self.natural_rows = y.saturating_sub(content.y);
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		let plan = overflow_plan(&self.props, self.natural_rows, rect.height);
+		let content_rows = plan.map_or(rect.height, |plan| plan.content_rows);
+		let original_clip = pc.clip;
+		if plan.is_some() {
+			pc.clip = pc.clip.min(rect.y.saturating_add(content_rows));
+		}
+		let paint_clip = pc.clip;
 		for (row, &(top, height)) in self.rows.iter().zip(&self.bands) {
 			let background = row.props.style(&pc.ctx.theme).background_color();
 			if background != Color::Default && top < pc.clip {
@@ -164,8 +177,18 @@ impl Component for Table {
 					.fill(Rect::new(rect.x, top, rect.width, rows), Style::new().bg(background));
 			}
 		}
-		for child in self.children.iter_mut().filter(|child| child.visible) {
+		for child in self
+			.children
+			.iter_mut()
+			.filter(|child| child.visible && (plan.is_none() || child.rect.y < paint_clip))
+		{
 			child.paint(pc);
+		}
+		if plan.is_some() {
+			pc.clip = original_clip;
+		}
+		if let Some(plan) = plan {
+			paint_overflow_footer(pc, rect, plan);
 		}
 	}
 }
@@ -416,5 +439,38 @@ impl Component for TableCell {
 			placed -= 1;
 			child.paint(pc);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		Frame, Size,
+		component::{Cached, PaintCtx},
+		context::UiContext,
+		test_support::frame_row_text,
+	};
+
+	#[test]
+	fn max_rows_clamps_table_and_counts_physical_rows() {
+		let ctx = UiContext::default();
+		let mut table = Table::new()
+			.with(Prop::MaxRows, 3_u16)
+			.with(Prop::Overflow, "rows");
+		for label in ["a", "b", "c", "d"] {
+			table =
+				table.row(TableRow::new().cell(TableCell::new().child(TextLeaf::new().text(label))));
+		}
+		let mut root = Cached::new(Box::new(table));
+		let height = root.height(&ctx, 20);
+		assert_eq!(height, 3);
+		root.place(&ctx, Rect::new(0, 0, 20, height));
+		let mut frame = Frame::new(Size::new(20, height));
+		let mut hits = Vec::new();
+		root.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
+		assert_eq!(frame_row_text(&frame, 0), "a");
+		assert_eq!(frame_row_text(&frame, 1), "b");
+		assert_eq!(frame_row_text(&frame, 2), "… 2 more rows");
 	}
 }

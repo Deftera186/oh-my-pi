@@ -23,15 +23,14 @@ pub struct Params {
 	pub thoughts: Str,
 }
 
-/// Durable acknowledgement. The thoughts remain in the call arguments rather
-/// than being copied into the model-facing result.
+/// Durable acknowledgement.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
 	/// Confirms that the note was committed with the tool call.
 	pub recorded: bool,
 }
 
-/// Think does not stream updates.
+/// Think has no genuine output updates.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 
@@ -39,6 +38,12 @@ pub enum Update {}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Fault {
 	message: Str,
+}
+impl Fault {
+	/// Stable scratch-note failure explanation.
+	pub(crate) fn message(&self) -> &str {
+		&self.message
+	}
 }
 impl Display for Fault {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

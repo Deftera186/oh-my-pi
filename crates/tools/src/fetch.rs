@@ -35,6 +35,8 @@ pub struct Params {
 pub struct Payload {
 	/// URL after redirects.
 	pub url:          Str,
+	/// Document title recovered from the rendered content, when present.
+	pub title:        Option<Str>,
 	/// Rendered MIME type.
 	pub content_type: Option<Str>,
 	/// Extraction or conversion method.
@@ -160,16 +162,25 @@ async fn execute<C: web::types::HttpClient + Sync>(
 	let fetched = web::read_resource(client, &target.url, raw)
 		.await
 		.map_err(fetch_fault)?;
+	let title = content_title(&fetched.render.content);
 	let mut content = fetched.render.content;
 	if !matches!(target.selector, ParsedSelector::None | ParsedSelector::Raw) {
 		content = select_lines(&content, &target.selector)?;
 	}
 	Ok(Payload {
 		url: fetched.final_url,
+		title,
 		content_type: fetched.render.content_type,
 		method: fetched.render.method,
 		content,
 		notes: fetched.render.notes.into_iter().collect(),
+	})
+}
+
+fn content_title(content: &str) -> Option<Str> {
+	content.lines().find_map(|line| {
+		let title = line.trim().strip_prefix("# ")?.trim();
+		(!title.is_empty()).then(|| Str::new(title))
 	})
 }
 
@@ -253,6 +264,15 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		assert_eq!(select_lines("one\ntwo\nthree\nfour", &target.selector).unwrap(), "two\nthree");
+	}
+
+	#[test]
+	fn content_title_uses_the_first_level_one_markdown_heading() {
+		assert_eq!(
+			content_title("intro\n## Section\n# Documentation title\nbody").as_deref(),
+			Some("Documentation title"),
+		);
+		assert_eq!(content_title("## Section only"), None);
 	}
 
 	#[derive(Clone)]

@@ -124,7 +124,7 @@ impl Display for Fault {
 }
 impl error::Error for Fault {}
 
-/// Run-watch currently settles as one bounded result.
+/// GitHub operations currently settle as one bounded result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 

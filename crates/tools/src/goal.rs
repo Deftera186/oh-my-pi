@@ -352,6 +352,7 @@ mod tests {
 			Some(0)
 		);
 	}
+
 	#[test]
 	fn resource_conflict_retains_mode_owner_data() {
 		let fault = Fault::ResourceConflict {

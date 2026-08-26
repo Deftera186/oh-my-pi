@@ -24,6 +24,8 @@ pub enum PropValue {
 	Bool(bool),
 	/// Unsigned cell count or angle.
 	U16(u16),
+	/// Unsigned application count or timestamp.
+	U64(u64),
 	/// Floating-point layout weight.
 	F32(f32),
 	/// Signed numeric field value.
@@ -70,6 +72,7 @@ enum Number {
 enum Scalar {
 	Bool(bool),
 	U16(u16),
+	U64(u64),
 	F32(f32),
 	I64(i64),
 	Str(Str),
@@ -341,6 +344,10 @@ define_props! {
 	Footer("footer") => footer: Str [ref Str; "Returns the footer shown on a framed container's bottom border."];
 	/// Horizontal placement of the border footer.
 	FooterAlign("footer-align") => footer_align: Align [default Align = Align::Start; "Returns the border-footer placement, defaulting to the start edge."];
+	/// Noun used by a row-clamped container's overflow summary.
+	Overflow("overflow") => overflow: Str [ref Str; "Returns the noun used by the overflow summary."];
+	/// Separator inserted between visible row children.
+	Sep("sep") => sep: Str [ref Str; "Returns the separator inserted between visible row children."];
 	/// Horizontal content alignment.
 	Align("align") => align: Align [default Align = Align::Start; "Returns horizontal alignment, defaulting to the start edge."];
 	/// Vertical content alignment.
@@ -389,6 +396,8 @@ define_props! {
 	Options("options") => options: Str;
 	/// User-facing field or item label.
 	Label("label") => label: Str;
+	/// Root-phase numbering style.
+	Numbering("numbering") => numbering: Str;
 	/// Dim leading segment rendered before a tree node label.
 	Prefix("prefix") => prefix: Str;
 	/// Right-aligned annotation on a tree node row.
@@ -407,6 +416,10 @@ define_props! {
 	Step("step") => step: i64;
 	/// Enables multiple selection.
 	Multi("multi") => multi: bool;
+	/// Uses compact magnitude formatting.
+	Compact("compact") => compact: bool [default bool = false; "Reports whether compact magnitude formatting is enabled."];
+	/// Marks a read-only choice as selected.
+	Selected("selected") => selected: bool [default bool = false; "Reports whether a read-only choice is selected."];
 	/// Enables interactive option filtering.
 	Filter("filter") => filter: FilterValue;
 	/// Allows values outside the listed options.
@@ -417,10 +430,20 @@ define_props! {
 	Checked("checked") => checked: bool;
 	/// Reference character limit used by the remaining-character counter.
 	Limit("limit") => limit: u16 [copy u16; "Returns the configured input character limit."];
+	/// Maximum retained preview depth.
+	MaxDepth("max-depth") => max_depth: u16 [copy u16; "Returns the configured preview depth cap."];
+	/// Maximum retained text character count.
+	MaxChars("max-chars") => max_chars: u16 [copy u16; "Returns the configured text character cap."];
 	/// Draws a focus-sensitive leading rail beside editable text.
 	Rail("rail") => rail: bool;
-	/// Maximum editor viewport height in rows.
-	MaxRows("max-rows") => max_rows: u16 [copy u16; "Returns the configured editor row cap."];
+	/// Maximum component content height in physical rows.
+	MaxRows("max-rows") => max_rows: u16 [copy u16; "Returns the configured physical-row cap."];
+	/// Side removed by a character limit.
+	TruncateFrom("truncate-from") => truncate_from: Truncate [default Truncate = Truncate::End; "Returns the side removed by a character limit."];
+	/// Enables line-number gutters.
+	Numbers("numbers") => numbers: bool [default bool = false; "Reports whether line-number gutters are enabled."];
+	/// First displayed line number.
+	Start("start") => start: u64 [default u64 = 1; "Returns the first displayed line number, defaulting to one."];
 	/// Marks an option as the recommended default.
 	Recommended("recommended") => recommended: bool;
 	/// Expands a tree node initially.
@@ -465,6 +488,14 @@ define_props! {
 	Guides("guides") => guides: Toggle<Border> [toggle Border; "Returns the tree guide connector family; a bare flag means square."];
 	/// Task lifecycle state on a todo item.
 	Status("status") => status: Str;
+	/// Millisecond timestamp or duration.
+	Ms("ms") => ms: u64 [copy u64; "Returns the configured millisecond value."];
+	/// Added-item count.
+	Added("added") => added: u64 [copy u64; "Returns the added-item count."];
+	/// Removed-item count.
+	Removed("removed") => removed: u64 [copy u64; "Returns the removed-item count."];
+	/// Operation count.
+	Ops("ops") => ops: u64 [copy u64; "Returns the operation count."];
 	/// Sweep period of the brightness crest across text content.
 	Shimmer("shimmer") => shimmer: Toggle<Ms<2000>> [toggle Duration; "Returns the shimmer period, with a bare flag selecting 2s."];
 	/// Catch-up horizon for progressively revealed streamed text.
@@ -508,6 +539,7 @@ macro_rules! to_prop_value {
 to_prop_value!(Color, Color);
 to_prop_value!(bool, Bool);
 to_prop_value!(u16, U16);
+to_prop_value!(u64, U64);
 to_prop_value!(f32, F32);
 to_prop_value!(i64, I64);
 to_prop_value!(Str, Str);
@@ -544,6 +576,7 @@ impl ToPropValue for Scalar {
 		match self {
 			Self::Bool(value) => PropValue::Bool(*value),
 			Self::U16(value) => PropValue::U16(*value),
+			Self::U64(value) => PropValue::U64(*value),
 			Self::F32(value) => PropValue::F32(*value),
 			Self::I64(value) => PropValue::I64(*value),
 			Self::Str(value) => PropValue::Str(value.clone()),
@@ -745,6 +778,8 @@ impl Props {
 		match prop {
 			Prop::Title => self.title.as_ref(),
 			Prop::Footer => self.footer.as_ref(),
+			Prop::Overflow => self.overflow.as_ref(),
+			Prop::Sep => self.sep.as_ref(),
 			Prop::Id => self.id.as_ref(),
 			Prop::When => self.when.as_ref(),
 			Prop::Value => match self.value.as_ref() {
@@ -755,6 +790,7 @@ impl Props {
 			Prop::Options => self.options.as_ref(),
 			Prop::Variant => self.variant.as_ref(),
 			Prop::Label => self.label.as_ref(),
+			Prop::Numbering => self.numbering.as_ref(),
 			Prop::Prefix => self.prefix.as_ref(),
 			Prop::Annotation => self.annotation.as_ref(),
 			Prop::Action => self.action.as_ref(),
@@ -889,6 +925,7 @@ macro_rules! from_prop_value {
 }
 
 from_prop_value!(u16, U16);
+from_prop_value!(u64, U64);
 from_prop_value!(f32, F32);
 from_prop_value!(Border, Border);
 from_prop_value!(Align, Align);
@@ -985,6 +1022,7 @@ impl FromPropValue for Scalar {
 		match value {
 			PropValue::Bool(value) => Ok(Self::Bool(value)),
 			PropValue::U16(value) => Ok(Self::U16(value)),
+			PropValue::U64(value) => Ok(Self::U64(value)),
 			PropValue::F32(value) => Ok(Self::F32(value)),
 			PropValue::I64(value) => Ok(Self::I64(value)),
 			PropValue::Str(value) => Ok(Self::Str(value)),
@@ -1065,6 +1103,7 @@ fn display_value(value: &PropValue) -> Str {
 	match value {
 		PropValue::Bool(value) => Str::new(if *value { "true" } else { "false" }),
 		PropValue::U16(value) => Str::from(value.to_string()),
+		PropValue::U64(value) => Str::from(value.to_string()),
 		PropValue::F32(value) => Str::from(value.to_string()),
 		PropValue::I64(value) => Str::from(value.to_string()),
 		PropValue::Color(Color::Default) => sf!("default"),
@@ -1094,6 +1133,7 @@ macro_rules! from_value {
 from_value!(Color, Color);
 from_value!(bool, Bool);
 from_value!(u16, U16);
+from_value!(u64, U64);
 from_value!(f32, F32);
 from_value!(i64, I64);
 from_value!(Str, Str);
@@ -1144,6 +1184,20 @@ mod tests {
 			.with(Prop::Limit, "72")
 			.with(Prop::Rail, true)
 			.with(Prop::MaxRows, "8")
+			.with(Prop::Overflow, "rows")
+			.with(Prop::Sep, " · ")
+			.with(Prop::Numbering, "roman")
+			.with(Prop::Selected, true)
+			.with(Prop::Compact, true)
+			.with(Prop::MaxDepth, "4")
+			.with(Prop::MaxChars, "80")
+			.with(Prop::TruncateFrom, "start")
+			.with(Prop::Numbers, true)
+			.with(Prop::Start, "42")
+			.with(Prop::Ms, "1000")
+			.with(Prop::Added, "2")
+			.with(Prop::Removed, "3")
+			.with(Prop::Ops, "4")
 			.with(Prop::Minimap, true);
 		assert_eq!(props.get(Prop::Variant), Some(PropValue::Str(Str::new("pill"))));
 		assert_eq!(props.get(Prop::Active), Some(PropValue::Bool(true)));
@@ -1152,6 +1206,20 @@ mod tests {
 		assert_eq!(props.get(Prop::Limit), Some(PropValue::U16(72)));
 		assert_eq!(props.get(Prop::Rail), Some(PropValue::Bool(true)));
 		assert_eq!(props.get(Prop::MaxRows), Some(PropValue::U16(8)));
+		assert_eq!(props.overflow().map(Str::as_str), Some("rows"));
+		assert_eq!(props.sep().map(Str::as_str), Some(" · "));
+		assert_eq!(props.str_of(Prop::Numbering).map(Str::as_str), Some("roman"));
+		assert!(props.selected());
+		assert!(props.compact());
+		assert_eq!(props.max_depth(), Some(4));
+		assert_eq!(props.max_chars(), Some(80));
+		assert_eq!(props.truncate_from(), Truncate::Start);
+		assert!(props.numbers());
+		assert_eq!(props.start(), 42);
+		assert_eq!(props.ms(), Some(1000));
+		assert_eq!(props.added(), Some(2));
+		assert_eq!(props.removed(), Some(3));
+		assert_eq!(props.ops(), Some(4));
 		assert_eq!(props.get(Prop::Minimap), Some(PropValue::Bool(true)));
 	}
 
@@ -1252,7 +1320,7 @@ mod tests {
 			assert_eq!(name.parse(), Ok(prop));
 			count += 1;
 		}
-		assert_eq!(count, 85);
+		assert_eq!(count, 99);
 	}
 
 	#[test]

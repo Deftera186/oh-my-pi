@@ -381,6 +381,30 @@ const fn walk_request(path: Str, hidden: bool, gitignore: bool, limit: u64) -> W
 	WalkRequest { path, hidden, gitignore, limit, timeout_ms: DEFAULT_TIMEOUT_MS }
 }
 
+pub(crate) fn display_scope(path: &str) -> Str {
+	if path.contains(';') {
+		return sf!(".");
+	}
+	let Some(wildcard) = path
+		.char_indices()
+		.find_map(|(index, character)| matches!(character, '*' | '?' | '[').then_some(index))
+	else {
+		return Str::new(path);
+	};
+	let prefix = &path[..wildcard];
+	if prefix.ends_with('/') {
+		let directory = prefix.trim_end_matches('/');
+		return if directory.is_empty() {
+			sf!(".")
+		} else {
+			Str::new(directory)
+		};
+	}
+	prefix
+		.rsplit_once('/')
+		.map_or_else(|| sf!("."), |(directory, _)| Str::new(directory))
+}
+
 fn contains_root_target(path: &str) -> bool {
 	path.split(';').any(|target| {
 		let target = target.trim();
@@ -583,6 +607,15 @@ mod tests {
 
 	fn walk_match(path: &str, modified_ms: u64, is_dir: bool) -> WalkMatch {
 		WalkMatch { path: Str::new(path), modified_ms, is_dir }
+	}
+
+	#[test]
+	fn renderer_scope_is_the_literal_directory_prefix() {
+		assert_eq!(display_scope("packages/**/*.{test,spec}.ts"), "packages");
+		assert_eq!(display_scope("src/foo*.rs"), "src");
+		assert_eq!(display_scope("*.rs"), ".");
+		assert_eq!(display_scope("src"), "src");
+		assert_eq!(display_scope("src; tests"), ".");
 	}
 
 	#[test]

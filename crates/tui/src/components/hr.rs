@@ -60,7 +60,8 @@ pub fn truncate_to_width(text: &str, max_width: u16) -> TruncatedText<'_> {
 	TruncatedText { text, width: u16::try_from(full_width).unwrap_or(u16::MAX), ellipsis: false }
 }
 
-/// A horizontal or vertical divider backing the `<hr>` markup tag.
+/// A horizontal or vertical divider backing `<hr>`, with an optional docked
+/// `label` (`title` remains a compatibility fallback).
 pub struct Hr {
 	props: Props,
 	slot:  Slot,
@@ -158,8 +159,14 @@ impl Component for Hr {
 		self.bar.clear();
 		repeated_char(&mut self.bar, horizontal, usize::from(rect.width));
 		pc.frame.put(rect.x, rect.y, &self.bar, line);
-		if let Some(title) = self.props.title()
-			&& !title.is_empty()
+		// `label` is the canonical section-header spelling. Keep `title` as a
+		// compatibility fallback because it also supplies the established
+		// alignment contract.
+		if let Some(label) = self
+			.props
+			.str_of(Prop::Label)
+			.or_else(|| self.props.title())
+			.filter(|label| !label.is_empty())
 			&& rect.width > 2
 		{
 			// The outermost rule cells are inviolable. Padding collapses only
@@ -170,8 +177,8 @@ impl Component for Hr {
 			let fit = interior
 				.saturating_sub(u16::from(left_pad))
 				.saturating_sub(u16::from(right_pad));
-			let title = truncate_to_width(title, fit);
-			let total = title
+			let label = truncate_to_width(label, fit);
+			let total = label
 				.width
 				.saturating_add(u16::from(left_pad))
 				.saturating_add(u16::from(right_pad));
@@ -188,13 +195,18 @@ impl Component for Hr {
 					.x
 					.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
 			);
+			let label_style = if self.props.contains(Prop::Fg) {
+				style.bold()
+			} else {
+				style.fg(pc.ctx.theme.fg).bold()
+			};
 			let mut end = x;
 			if left_pad {
 				end = pc.frame.put(end, rect.y, " ", style);
 			}
-			end = pc.frame.put(end, rect.y, title.text, style.bold());
-			if title.ellipsis {
-				end = pc.frame.put(end, rect.y, "…", style.bold());
+			end = pc.frame.put(end, rect.y, label.text, label_style);
+			if label.ellipsis {
+				end = pc.frame.put(end, rect.y, "…", label_style);
 			}
 			if right_pad {
 				pc.frame.put(end, rect.y, " ", style);
@@ -267,6 +279,7 @@ fn repeated_char(output: &mut String, character: char, count: usize) {
 mod tests {
 	use super::{Hr, truncate_to_width};
 	use crate::{
+		Style,
 		component::{Cached, Component, PaintCtx},
 		context::UiContext,
 		frame::{Frame, Rect, Size},
@@ -287,16 +300,58 @@ mod tests {
 	}
 
 	#[test]
-	fn titled_rule_truncates_between_boundary_cells() {
+	fn canonical_label_truncates_between_boundary_cells() {
 		let ctx = UiContext::default();
-		for (width, expected) in [(7, "─ al… ─"), (3, "─…─")] {
-			let mut hr = Cached::new(Box::new(Hr::new().with(Prop::Title, "alphabet")));
+		for (width, expected) in [(7, "─ al… ─"), (3, "─…─"), (2, "──"), (1, "─")] {
+			let mut hr = Cached::new(Box::new(Hr::new().with(Prop::Label, "alphabet")));
 			hr.place(&ctx, Rect::new(0, 0, width, 1));
 			let mut frame = Frame::new(Size::new(width, 1));
 			let mut hits = Vec::new();
 			hr.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
 			assert_eq!(frame_row_text(&frame, 0), expected);
 		}
+	}
+
+	#[test]
+	fn label_uses_theme_hierarchy_and_takes_precedence_over_title() {
+		let ctx = UiContext::default();
+		let mut hr = Hr::new()
+			.with(Prop::Label, "Output")
+			.with(Prop::Title, "Legacy");
+		let mut frame = Frame::new(Size::new(12, 1));
+		let mut hits = Vec::new();
+		hr.paint(
+			&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()),
+			Rect::new(0, 0, 12, 1),
+		);
+		assert_eq!(frame_row_text(&frame, 0), "── Output ──");
+		assert_eq!(frame.cell(3, 0).style, Style::new().fg(ctx.theme.fg).bold());
+	}
+
+	#[test]
+	fn title_remains_a_compatible_label_fallback() {
+		let ctx = UiContext::default();
+		let mut hr = Hr::new().with(Prop::Title, "Legacy");
+		let mut frame = Frame::new(Size::new(10, 1));
+		let mut hits = Vec::new();
+		hr.paint(
+			&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()),
+			Rect::new(0, 0, 10, 1),
+		);
+		assert_eq!(frame_row_text(&frame, 0), "─ Legacy ─");
+	}
+
+	#[test]
+	fn wide_label_keeps_both_rule_endpoints() {
+		let ctx = UiContext::default();
+		let mut hr = Hr::new().with(Prop::Label, "界界");
+		let mut frame = Frame::new(Size::new(7, 1));
+		let mut hits = Vec::new();
+		hr.paint(
+			&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()),
+			Rect::new(0, 0, 7, 1),
+		);
+		assert_eq!(frame_row_text(&frame, 0), "─ 界… ─");
 	}
 
 	#[test]
@@ -316,7 +371,9 @@ mod tests {
 	#[test]
 	fn vertical_rule_uses_one_column_and_fills_height() {
 		let ctx = UiContext::default();
-		let mut hr = Hr::new().with(Prop::Vertical, true);
+		let mut hr = Hr::new()
+			.with(Prop::Vertical, true)
+			.with(Prop::Label, "ignored");
 		assert_eq!(hr.measure(&ctx), (1, 1));
 		let mut frame = Frame::new(Size::new(1, 3));
 		let mut hits = Vec::new();

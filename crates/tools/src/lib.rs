@@ -5,6 +5,9 @@
 //! and process effects remain behind the explicit commitment gate. Durable
 //! payloads are revisioned truth and prompt parts are deterministic
 //! projections.
+// The `view!` macro expands absolute `::omp_tools::…` paths; alias the crate
+// to itself so expansions inside this crate resolve identically.
+extern crate self as omp_tools;
 
 /// Stable identity of one production native tool family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,11 +81,10 @@ pub mod settings;
 /// Shared staged-proposal lifecycle for preview-producing tools.
 pub mod staging;
 
-pub use render::{
-	BuiltinRendererIdentities,
-	json_tree::{JsonTreeBounds, JsonTreePreview, preview as preview_json_tree},
-	register_builtin_renderers,
-};
+/// Builds one typed renderer view tree from markup with child-level `for`,
+/// `if`, and `match` control flow (see [`render::view`]).
+pub use omp_macros::view;
+pub use render::{BuiltinRendererIdentities, register_builtin_renderers};
 
 /// Revisioned project debugger tool.
 pub mod debug;
