@@ -399,6 +399,7 @@ impl WorkspaceOperations {
 		fs::create_dir_all(state_root.as_ref())?;
 		fs::create_dir_all(state_root.as_ref().join(".records"))?;
 		fs::create_dir_all(state_root.as_ref().join(".snapshots"))?;
+		fs::create_dir_all(state_root.as_ref().join(".branches"))?;
 		let worktree_root = fs::canonicalize(state_root)?;
 		let (worktrees, next_generation) = load_worktree_records(&worktree_root)?;
 		let snapshots = load_snapshot_records(&worktree_root)?;

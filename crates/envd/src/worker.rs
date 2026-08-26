@@ -3360,9 +3360,19 @@ impl ExtensionRegime {
 			"turn_id": ctx.facts().turn_id,
 			"invocation_id": ctx.facts().invocation_id,
 			"stream_delta": ctx.facts().stream_delta,
+			"stream_part": ctx.facts().stream_part.map(|part| {
+				serde_json::json!({
+					"index": part.index,
+					"source": <&'static str>::from(part.source),
+					"tool_name": part.tool_name,
+				})
+			}),
 			"now_ms": ctx.facts().now_ms,
 			"delivered": ctx.facts().delivered,
 			"checkpoint_active": ctx.facts().checkpoint_active,
+			"hidden": ctx.facts().hidden,
+			"empty_output": ctx.facts().empty_output,
+			"trailing_aborts": ctx.facts().trailing_aborts,
 		}))
 		.map_err(ExtensionRegimeError::EventEncode)?;
 		let mut arguments = serde_json::Map::new();
