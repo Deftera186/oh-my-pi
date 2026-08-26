@@ -3,7 +3,7 @@
 use std::{env, fs, io, io::Read as _, path::Path};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{TtsrMatchContext, TtsrRegistry, TtsrSource};
+use omp_agent::{StreamSource, TtsrMatchContext, TtsrRegistry};
 use omp_walker::WalkRequest;
 use serde_json::json;
 
@@ -71,18 +71,18 @@ fn evaluate(
 ) -> miette::Result<()> {
 	let paths = [path];
 	let source = match source {
-		TtsrSourceArg::Text => TtsrSource::Text,
-		TtsrSourceArg::Thinking => TtsrSource::Thinking,
-		TtsrSourceArg::Tool => TtsrSource::Tool,
+		TtsrSourceArg::Text => StreamSource::Text,
+		TtsrSourceArg::Thinking => StreamSource::Thinking,
+		TtsrSourceArg::Tool => StreamSource::Tool,
 	};
 	let context = TtsrMatchContext {
 		source,
-		tool_name: (source == TtsrSource::Tool).then_some(tool),
+		tool_name: (source == StreamSource::Tool).then_some(tool),
 		file_paths: &paths,
 		stream_key: Some(path),
 	};
 	let mut matches = registry.check_snapshot(text, context).into_vec();
-	if source == TtsrSource::Tool && registry.has_ast_rules() {
+	if source == StreamSource::Tool && registry.has_ast_rules() {
 		matches.extend(
 			registry
 				.check_ast_snapshot(text, context)
@@ -144,7 +144,7 @@ fn scan(
 		let path = candidate.path.to_string_lossy();
 		let paths = [path.as_ref()];
 		let context = TtsrMatchContext {
-			source:     TtsrSource::Tool,
+			source:     StreamSource::Tool,
 			tool_name:  Some("edit"),
 			file_paths: &paths,
 			stream_key: Some(path.as_ref()),

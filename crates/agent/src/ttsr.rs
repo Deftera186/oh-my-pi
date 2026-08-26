@@ -22,7 +22,7 @@ use thiserror::Error;
 /// Stream carrying content currently evaluated by TTSR.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-pub enum TtsrSource {
+pub enum StreamSource {
 	/// Assistant-visible prose.
 	Text,
 	/// Assistant reasoning text.
@@ -57,11 +57,11 @@ pub enum TtsrInterruptMode {
 
 impl TtsrInterruptMode {
 	/// Reports whether this mode interrupts `source`.
-	pub const fn interrupts(self, source: TtsrSource) -> bool {
+	pub const fn interrupts(self, source: StreamSource) -> bool {
 		match self {
 			Self::Never => false,
-			Self::ProseOnly => matches!(source, TtsrSource::Text | TtsrSource::Thinking),
-			Self::ToolOnly => matches!(source, TtsrSource::Tool),
+			Self::ProseOnly => matches!(source, StreamSource::Text | StreamSource::Thinking),
+			Self::ToolOnly => matches!(source, StreamSource::Tool),
 			Self::Always => true,
 		}
 	}
@@ -133,7 +133,7 @@ pub struct TtsrRule {
 #[derive(Clone, Copy, Debug)]
 pub struct TtsrMatchContext<'a> {
 	/// Stream category.
-	pub source:     TtsrSource,
+	pub source:     StreamSource,
 	/// Harness tool name for tool streams.
 	pub tool_name:  Option<&'a str>,
 	/// Candidate file paths supplied by the tool's matcher projection.
@@ -148,9 +148,9 @@ impl TtsrMatchContext<'_> {
 			return Str::new(key);
 		}
 		match self.source {
-			TtsrSource::Text => Str::new_static("text"),
-			TtsrSource::Thinking => Str::new_static("thinking"),
-			TtsrSource::Tool => self.tool_name.map_or_else(
+			StreamSource::Text => Str::new_static("text"),
+			StreamSource::Thinking => Str::new_static("thinking"),
+			StreamSource::Tool => self.tool_name.map_or_else(
 				|| Str::new_static("tool"),
 				|name| sf!("tool:{}", name.trim().to_ascii_lowercase()),
 			),
@@ -357,8 +357,8 @@ impl TtsrRegistry {
 		delta: &str,
 		context: TtsrMatchContext<'_>,
 	) -> SmallVec<TtsrMatch, 4> {
-		if (context.source == TtsrSource::Text && !self.can_match_text)
-			|| (context.source == TtsrSource::Thinking && !self.can_match_thinking)
+		if (context.source == StreamSource::Text && !self.can_match_text)
+			|| (context.source == StreamSource::Thinking && !self.can_match_thinking)
 		{
 			return SmallVec::new();
 		}
@@ -396,14 +396,14 @@ impl TtsrRegistry {
 	}
 
 	/// Runs omp-ast conditions over a normalized tool snapshot. Identical
-	/// consecutive snapshots for the same stream key are skipped by BLAKE3
+	/// consecutive snapshots for the same stream key are skipped by content
 	/// digest before parsing.
 	pub fn check_ast_snapshot(
 		&mut self,
 		snapshot: &str,
 		context: TtsrMatchContext<'_>,
 	) -> Result<SmallVec<TtsrMatch, 4>, AstError> {
-		if !self.settings.enabled || context.source != TtsrSource::Tool {
+		if !self.settings.enabled || context.source != StreamSource::Tool {
 			return Ok(SmallVec::new());
 		}
 		let Some(language) = derive_language(context.file_paths) else {
@@ -470,16 +470,6 @@ impl TtsrRegistry {
 			let name = name.trim();
 			if !name.is_empty() && self.rules.iter().any(|entry| entry.rule.name == name) {
 				self.injected_at.insert(Str::new(name), self.message_count);
-			}
-		}
-	}
-
-	/// Restores once-per-session injection state from durable journal names.
-	pub fn restore_injected<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
-		for name in names {
-			let name = name.trim();
-			if !name.is_empty() {
-				self.injected_at.insert(Str::new(name), 0);
 			}
 		}
 	}
@@ -649,10 +639,10 @@ fn parse_tool_scope(token: &str) -> Option<(Option<&str>, Option<&str>)> {
 
 fn matches_scope(entry: &Entry, context: TtsrMatchContext<'_>) -> bool {
 	match context.source {
-		TtsrSource::Text => entry.scope.allow_text,
-		TtsrSource::Thinking => entry.scope.allow_thinking,
-		TtsrSource::Tool if entry.scope.allow_any_tool => true,
-		TtsrSource::Tool => {
+		StreamSource::Text => entry.scope.allow_text,
+		StreamSource::Thinking => entry.scope.allow_thinking,
+		StreamSource::Tool if entry.scope.allow_any_tool => true,
+		StreamSource::Tool => {
 			let tool_name = context.tool_name.map(str::trim);
 			entry.scope.tools.iter().any(|scope| {
 				scope.tool_name.as_ref().is_none_or(|required| {

@@ -49,17 +49,14 @@ use crate::{
 	CompactionTier, Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode,
 	ManualCompactionOutcome, ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome,
 	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
-	SnapcompactPreparation, StreamingEditGuard, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient,
-	TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	SnapcompactPreparation, StreamSource, StreamingEditGuard, TtsrRegistry, TurnClient, TurnInput,
+	TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	advisor::{ADVISOR_TOOL_LOOP_THRESHOLD, AdvisorToolLoopAction, AdvisorToolLoopGuard},
 	arbiter::{
-		Arbiter, PointCx,
+		Arbiter, PointCx, StreamPart,
 		context::{compaction_instruction, recover_checkpoint_state, rewind_background_warning},
 		settle::{EmptyOutputRetry, source_candidate},
-		stream::{
-			TtsrRegimeCancel, TtsrStreamPart, stream_recovery_item, ttsr_reminder_item,
-			ttsr_reminder_text,
-		},
+		stream::{StreamCancel, stream_recovery_item},
 	},
 	batch::{
 		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
@@ -443,12 +440,12 @@ type TurnCompletion =
 
 enum RunTurnResult {
 	Complete(TurnCompletion),
-	Ttsr(TtsrRegimeCancel),
+	Cancelled(StreamCancel),
 }
 
 enum DriveSessionResult {
 	Complete(Outcome, BTreeMap<Str, SpeculativeCall>),
-	Ttsr(TtsrRegimeCancel),
+	Cancelled(StreamCancel),
 }
 /// Cloneable request handle for state owned by the live agent loop.
 #[derive(Clone)]
@@ -1219,7 +1216,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					&options,
 					registry,
 					Arc::from([]),
-					false,
+					true,
 				);
 				tokio::pin!(session);
 				tokio::select! {
@@ -1506,7 +1503,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.journal.is_released_submission(turn_id.as_str()),
 				)
 			});
-		let continuing_recovery = resumed.is_some() || staged.is_some();
 		let mut supplied = items.into_iter();
 		let (mut pending_indexes, mut turn_id) = if let Some(start) = resumed {
 			if supplied.next().is_some() {
@@ -1540,7 +1536,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		} else {
 			self.drain_control();
 			let idle_fold =
-				self.resolve_point(Point::Idle, Some(root_turn_id.as_str()), None, None, false)?;
+				self.resolve_point(Point::Idle, self.point_cx(Some(root_turn_id.as_str())))?;
 			self.execute_scheduled_rewinds()?;
 			let snapshot = self.state.snapshot();
 			let queued = self.mailbox.drain_steering(
@@ -1573,14 +1569,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 		self.publish_live_history()?;
 		let mut committed_turns = 0_u32;
 		let mut last_outcome = None;
-		self
-			.arbiter
-			.restore_empty_output_retry(if continuing_recovery {
-				u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX)
-			} else {
-				0
-			});
-
 		loop {
 			if let Some(guard) = self.streaming_edit_guard.as_ref() {
 				guard.reset();
@@ -1594,15 +1582,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let turn = self.run_turn(turn_id.clone(), pending_indexes).await;
 			let (outcome, mut speculative, submitted_context_id, snapshot, enabled_tools) = match turn
 			{
-				Ok(RunTurnResult::Complete(turn)) => {
-					self.arbiter.reset_empty_output_retry();
-					turn
-				},
-				Ok(RunTurnResult::Ttsr(trigger)) => {
+				Ok(RunTurnResult::Complete(turn)) => turn,
+				Ok(RunTurnResult::Cancelled(cancel)) => {
+					tracing::info!(
+						activation = %cancel.activation,
+						reason = %cancel.reason,
+						"stream regime cancelled the turn"
+					);
 					self.journal.append_aborted_assistant(
 						now_ms(),
 						turn_id.as_str(),
-						ttsr_silent_abort_item(&trigger.matches),
+						silent_abort_item(cancel.reason.as_str()),
 						self.prompt_hash,
 					)?;
 					self
@@ -1611,15 +1601,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.clear_provider_context();
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
-					let reminder_text = ttsr_reminder_text(&trigger.matches);
-					let reminder = ttsr_reminder_item(reminder_text.clone());
-					self.record_ttsr_injection(
-						turn_id.as_str(),
-						trigger.source,
-						&trigger.matches,
-						reminder_text.as_str(),
-					)?;
-					pending_indexes = self.append_pending(&next_turn_id, [reminder])?;
+					pending_indexes = self.append_pending(&next_turn_id, cancel.injects)?;
 					turn_id = next_turn_id;
 					continue;
 				},
@@ -1669,34 +1651,30 @@ impl<C: TurnClient + Clone> Agent<C> {
 							turn_id: Str::new(turn_id.as_str()),
 						})
 						.await;
-					let draft = self.arbiter.apply_empty_output_retry(&PointCx {
-						turn_id: Some(turn_id.as_str()),
-						now_ms: now_ms(),
-						delivered: true,
-						..PointCx::default()
-					});
-					let exhausted = draft.failed();
-					let disposition = if exhausted {
-						AbortDisposition::Exhausted
-					} else {
+					let settle_cx = PointCx {
+						empty_output: true,
+						trailing_aborts: u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX),
+						..self.point_cx(Some(turn_id.as_str()))
+					};
+					let settle = self.resolve_point(Point::Settle, settle_cx)?;
+					let retrying = settle.regime.control == ResolutionKind::Retry
+						&& !settle.regime.injects.is_empty();
+					let disposition = if retrying {
 						AbortDisposition::Continue
+					} else {
+						AbortDisposition::Exhausted
 					};
 					self
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.clear_provider_context();
-					if exhausted {
+					if !retrying {
 						error.detail = EmptyOutputRetry::cap_detail(&error);
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
 					}
-					let retry = draft
-						.into_appended()
-						.pop()
-						.expect("empty-output retry regime appends one retry item");
-					let next_turn_id =
-						follow_up_id(&turn_id, u32::from(self.arbiter.empty_output_retry_spent()));
-					pending_indexes = self.append_pending(&next_turn_id, [retry])?;
+					let next_turn_id = follow_up_id(&turn_id, committed_turns);
+					pending_indexes = self.append_pending(&next_turn_id, settle.regime.injects)?;
 					turn_id = next_turn_id;
 					continue;
 				},
@@ -1839,7 +1817,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.publish_live_history()?;
 			self.retain_session_memory();
 			let turn_end =
-				self.resolve_point(Point::TurnEnd, Some(turn_id.as_str()), None, None, false)?;
+				self.resolve_point(Point::TurnEnd, self.point_cx(Some(turn_id.as_str())))?;
 			for item in turn_end.regime.injects {
 				let _ = self.mailbox.sender().try_enqueue(Interrupt {
 					class: InterruptClass::Immediate,
@@ -1958,7 +1936,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					)?;
 				}
 				let batch_fold =
-					self.resolve_point(Point::Batch, Some(turn_id.as_str()), None, None, false)?;
+					self.resolve_point(Point::Batch, self.point_cx(Some(turn_id.as_str())))?;
 				for item in batch_fold.regime.injects {
 					boundary.push(Interrupt {
 						class: InterruptClass::Immediate,
@@ -2091,15 +2069,18 @@ impl<C: TurnClient + Clone> Agent<C> {
 						}
 					}
 				}
-				if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
-					next.insert(0, reminder);
+				let batch_settled_cx =
+					PointCx { delivered: true, ..self.point_cx(Some(turn_id.as_str())) };
+				let batch_settled = self.resolve_point(Point::Batch, batch_settled_cx)?;
+				for (index, item) in batch_settled.regime.injects.into_iter().enumerate() {
+					next.insert(index, item);
 				}
 				match advisor_tool_loop {
 					AdvisorToolLoopAction::Continue if self.advisor_tool_loop.is_none() => {
 						self.loop_signal.observe(
 							call_digest,
 							made_environment_effect,
-							self.arbiter.empty_output_retry_spent(),
+							u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX),
 						);
 						if self.loop_signal.repeats >= 3 {
 							next.insert(
@@ -2184,8 +2165,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.transition(AgentPhase::Idle);
 				return Ok(run_summary(Some(outcome), committed_turns, false));
 			}
-			let idle_fold =
-				self.resolve_point(Point::Idle, Some(turn_id.as_str()), None, None, false)?;
+			let idle_fold = self.resolve_point(Point::Idle, self.point_cx(Some(turn_id.as_str())))?;
 			for item in idle_fold.regime.injects {
 				let _ = self.mailbox.sender().try_enqueue(Interrupt {
 					class: InterruptClass::Immediate,
@@ -2199,14 +2179,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 				snapshot.steering_mode.delivery_limit(),
 			);
 			boundary.append(&mut idle);
-			if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
-				let next_turn_id = follow_up_id(&turn_id, committed_turns);
-				pending_indexes = self.append_pending(&next_turn_id, [reminder])?;
-				pending_indexes.extend(self.stage_interrupts(&next_turn_id, boundary)?);
-				last_outcome = Some(outcome);
-				turn_id = next_turn_id;
-				continue;
-			}
 			if !boundary.is_empty() {
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.stage_interrupts(&next_turn_id, boundary)?;
@@ -2214,9 +2186,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				turn_id = next_turn_id;
 				continue;
 			}
-			self
-				.loop_signal
-				.observe(None, false, self.arbiter.empty_output_retry_spent());
+			self.loop_signal.observe(
+				None,
+				false,
+				u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX),
+			);
 			if let Some(interrupt) = self.settled_continuation(&turn_id).await? {
 				let _ = self.mailbox.sender().try_enqueue(interrupt);
 				boundary = self.mailbox.drain_steering(
@@ -2352,26 +2326,20 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.collect()
 	}
 
-	fn resolve_point(
-		&mut self,
-		point: Point,
-		turn_id: Option<&str>,
-		invocation_id: Option<&str>,
-		stream_delta: Option<&str>,
-		delivered: bool,
-	) -> Result<ResolvedEvent, AgentError> {
-		let checkpoint_active = self.checkpoint_state.lock().active.is_some();
-		let cx = PointCx {
-			turn_id,
-			invocation_id,
-			stream_delta,
-			now_ms: now_ms(),
-			delivered,
-			checkpoint_active,
-		};
+	fn resolve_point(&mut self, point: Point, cx: PointCx<'_>) -> Result<ResolvedEvent, AgentError> {
 		Ok(self
 			.arbiter
 			.resolve_and_record(point, &cx, None, &mut self.journal)?)
+	}
+
+	/// Builds the baseline facts shared by every loop-resolved point.
+	fn point_cx<'a>(&self, turn_id: Option<&'a str>) -> PointCx<'a> {
+		PointCx {
+			turn_id,
+			now_ms: now_ms(),
+			checkpoint_active: self.checkpoint_state.lock().active.is_some(),
+			..PointCx::default()
+		}
 	}
 
 	/// Runs the settled-boundary domain hook and converts an accepted decision
@@ -2499,7 +2467,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	/// Installs the compiled stream-rule generation used by subsequent turns.
 	pub fn set_ttsr_registry(&mut self, registry: TtsrRegistry) {
-		self.arbiter.ttsr_regime_mut().install(registry);
+		self.arbiter.install_ttsr_registry(registry);
 	}
 
 	/// Installs a host activity assertion acquired only while a turn is active.
@@ -2791,7 +2759,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.checkpoint_notice_mut()
 				.set_active(checkpoint_active);
 			let context_fold =
-				self.resolve_point(Point::Context, Some(turn_id.as_str()), None, None, false)?;
+				self.resolve_point(Point::Context, self.point_cx(Some(turn_id.as_str())))?;
 			for item in context_fold.regime.injects {
 				match &mut provider_input {
 					TurnInput::Full(thread) => thread.items.push(item),
@@ -2819,7 +2787,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					Some(wire_tool_choice::from_parts(mode as i32, name));
 			}
 			let pre_model =
-				self.resolve_point(Point::PreModel, Some(turn_id.as_str()), None, None, false)?;
+				self.resolve_point(Point::PreModel, self.point_cx(Some(turn_id.as_str())))?;
 			for setting in pre_model.regime.settings {
 				if let ScopedSetting { slot: SettingSlot::ModelRoute, value } = setting {
 					frozen_options.params.model = value.to_string();
@@ -2893,7 +2861,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					&frozen_options,
 					Arc::clone(&snapshot.registry),
 					Arc::clone(&frozen_enabled_tools),
-					true,
+					false,
 				);
 				tokio::pin!(session);
 				tokio::select! {
@@ -2976,7 +2944,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 						&outcome,
 					)?;
 					self.last_toolset_hash = Some(toolset_hash);
-					self.arbiter.ttsr_regime_mut().advance_message();
 					self.tool_choices.resolve();
 					return Ok(RunTurnResult::Complete((
 						outcome,
@@ -2986,9 +2953,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 						Arc::clone(&frozen_enabled_tools),
 					)));
 				},
-				Ok(DriveSessionResult::Ttsr(trigger)) => {
+				Ok(DriveSessionResult::Cancelled(cancel)) => {
 					self.tool_choices.reject(RejectReason::Aborted);
-					return Ok(RunTurnResult::Ttsr(trigger));
+					return Ok(RunTurnResult::Cancelled(cancel));
 				},
 				Err(TurnError::Conflict(error)) => {
 					if attempts >= latest.retry.max_attempts().get() {
@@ -3067,36 +3034,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 		});
 	}
 
-	fn record_ttsr_injection(
-		&mut self,
-		turn_id: &str,
-		source: TtsrSource,
-		matches: &[TtsrMatch],
-		content: &str,
-	) -> Result<(), AgentError> {
-		let names = matches
-			.iter()
-			.map(|matched| matched.name.clone())
-			.collect::<Vec<_>>();
-		self
-			.journal
-			.append_ttsr_injection(now_ms(), turn_id, source, &names, content)?;
-		self
-			.arbiter
-			.ttsr_regime_mut()
-			.mark_injected(names.iter().map(Str::as_str));
-		Ok(())
-	}
-
-	fn take_deferred_ttsr(&mut self, turn_id: &str) -> Result<Option<Item>, AgentError> {
-		let Some((source, matches, text, item)) = self.arbiter.ttsr_regime_mut().take_deferred()
-		else {
-			return Ok(None);
-		};
-		self.record_ttsr_injection(turn_id, source, &matches, text.as_str())?;
-		Ok(Some(item))
-	}
-
 	async fn drive_session(
 		&mut self,
 		turn_id: TurnId,
@@ -3104,7 +3041,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		options: &TurnOptions,
 		registry: Arc<ToolRegistry>,
 		enabled_tools: Arc<[Str]>,
-		enforce_ttsr: bool,
+		hidden: bool,
 	) -> Result<DriveSessionResult, TurnError> {
 		// The opened turn future borrows the client for the whole drive, while
 		// host control commands need `&mut self`; driving it through a cloned
@@ -3145,12 +3082,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.caps,
 			runtime_duration(INTERRUPT_GRACE),
 		);
-		if enforce_ttsr {
-			self.arbiter.ttsr_regime_mut().reset_streams();
-		}
 		let mut speculative = BTreeMap::new();
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
-		let mut ttsr_parts: BTreeMap<u32, TtsrStreamPart> = BTreeMap::new();
+		let mut stream_parts: BTreeMap<u32, (StreamSource, Option<Str>)> = BTreeMap::new();
 		let mut secret_streams: BTreeMap<u32, SecretStreamRestorer> = BTreeMap::new();
 		let mut saw_stream_event = false;
 		loop {
@@ -3338,18 +3272,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 				},
 				Some(turn_event::Event::PartStart(part)) => {
 					let source = match part.kind() {
-						part_start::Kind::Text => Some(TtsrSource::Text),
-						part_start::Kind::Thinking => Some(TtsrSource::Thinking),
-						part_start::Kind::ToolCall => Some(TtsrSource::Tool),
+						part_start::Kind::Text => Some(StreamSource::Text),
+						part_start::Kind::Thinking => Some(StreamSource::Thinking),
+						part_start::Kind::ToolCall => Some(StreamSource::Tool),
 						part_start::Kind::Unspecified => None,
 					};
-					if enforce_ttsr && let Some(source) = source {
-						ttsr_parts.insert(
+					if let Some(source) = source {
+						stream_parts.insert(
 							part.index,
-							TtsrStreamPart::new(
-								part.index,
+							(
 								source,
-								(source == TtsrSource::Tool).then_some(part.tool_name.as_str()),
+								(source == StreamSource::Tool).then(|| part.tool_name.as_str().to_str()),
 							),
 						);
 					}
@@ -3444,18 +3377,23 @@ impl<C: TurnClient + Clone> Agent<C> {
 					{
 						guard.push_fragment(call_id.as_str(), fragment);
 					}
-					let trigger = if let Some(state) = ttsr_parts.get_mut(&part.index) {
-						self.arbiter.ttsr_regime_mut().check_delta(state, fragment)
-					} else {
-						None
-					};
-					let stream_fold = self
+					let stream_part =
+						stream_parts
+							.get(&part.index)
+							.map(|(source, tool_name)| StreamPart {
+								index:     part.index,
+								source:    *source,
+								tool_name: tool_name.as_deref(),
+							});
+					let mut stream_fold = self
 						.arbiter
 						.resolve_and_record(
 							Point::Stream,
 							&PointCx {
 								turn_id: Some(turn_id.as_str()),
 								stream_delta: Some(fragment),
+								stream_part,
+								hidden,
 								now_ms: now_ms(),
 								..PointCx::default()
 							},
@@ -3464,10 +3402,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 						)
 						.map_err(|_| TurnError::Protocol("failed to journal stream regime resolution"))?;
 					if stream_fold.regime.control == ResolutionKind::Cancel {
-						if let Some(trigger) = trigger {
-							return Ok(DriveSessionResult::Ttsr(trigger));
-						}
-						return Err(TurnError::Protocol("regime cancelled the stream"));
+						return Ok(DriveSessionResult::Cancelled(StreamCancel {
+							activation: stream_fold
+								.regime
+								.controlling_activation
+								.take()
+								.unwrap_or_else(|| sf!("regime")),
+							reason:     stream_fold
+								.regime
+								.cancel_reason
+								.take()
+								.unwrap_or_else(|| sf!("regime cancelled the stream")),
+							injects:    mem::take(&mut stream_fold.regime.injects),
+						}));
 					}
 					if let Some(call_id) = part_calls.get(&part.index) {
 						speculative
@@ -3480,7 +3427,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				},
 				Some(turn_event::Event::PartEnd(part)) => {
 					part_calls.remove(&part.index);
-					ttsr_parts.remove(&part.index);
+					stream_parts.remove(&part.index);
 				},
 				Some(turn_event::Event::Invoke(invoke)) => duplex.start(invoke),
 				Some(turn_event::Event::InvokeCancel(cancel)) => {
@@ -4832,12 +4779,9 @@ fn terminal_error_item(error: &pb::TurnError) -> Item {
 		}),
 	}
 }
-fn ttsr_silent_abort_item(matches: &[TtsrMatch]) -> Item {
-	let names = matches
-		.iter()
-		.map(|matched| matched.name.as_str())
-		.collect::<Vec<_>>()
-		.join(", ");
+/// Builds the structurally suppressed assistant marker retained for one
+/// silently aborted, regime-cancelled turn.
+fn silent_abort_item(reason: &str) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: now_ms(),
@@ -4851,7 +4795,7 @@ fn ttsr_silent_abort_item(matches: &[TtsrMatch]) -> Item {
 					kind: Some(value::Kind::Bool(true)),
 				}),
 				(crate::journal_kinds::ABORT_REASON_PROP.to_owned(), pb::Value {
-					kind: Some(value::Kind::String(format!("TTSR matched rule: {names}"))),
+					kind: Some(value::Kind::String(reason.to_owned())),
 				}),
 			]),
 		}),
@@ -6161,13 +6105,9 @@ mod tests {
 		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
-	fn ttsr_abort_item_carries_structural_suppression_and_reason() {
-		let item = ttsr_silent_abort_item(&[TtsrMatch {
-			name:           sf!("no-unwrap"),
-			content:        sf!("avoid unwrap"),
-			interrupt_mode: crate::TtsrInterruptMode::Always,
-		}]);
-		let props = item.props.expect("TTSR abort item has properties");
+	fn silent_abort_item_carries_structural_suppression_and_reason() {
+		let item = silent_abort_item("TTSR matched rule: no-unwrap");
+		let props = item.props.expect("silent abort item has properties");
 		assert_eq!(
 			props
 				.fields
@@ -6182,6 +6122,92 @@ mod tests {
 				.and_then(|value| value.kind.as_ref()),
 			Some(&value::Kind::String("TTSR matched rule: no-unwrap".to_owned()))
 		);
+	}
+	#[tokio::test]
+	async fn stream_rule_cancel_recovers_with_reminder_turn() {
+		let (journal, path) = test_journal("ttsr-cancel");
+		let interrupting = vec![
+			Ok(pb::TurnEvent {
+				event: Some(turn_event::Event::PartStart(pb::PartStart {
+					index:        0,
+					kind:         part_start::Kind::Text as i32,
+					tool_call_id: String::new(),
+					tool_name:    String::new(),
+				})),
+			}),
+			Ok(pb::TurnEvent {
+				event: Some(turn_event::Event::PartDelta(pb::PartDelta {
+					index: 0,
+					chunk: Bytes::from_static(b"let value = FORBIDDEN_TOKEN;"),
+				})),
+			}),
+		];
+		let scripts = VecDeque::from([interrupting, outcome_script(end_outcome("clean"))]);
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client =
+			ScriptedClient { scripts: Arc::new(Mutex::new(scripts)), opened: Arc::clone(&opened) };
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let (registry, diagnostics) = TtsrRegistry::from_layers(
+			crate::TtsrSettings::default(),
+			[crate::TtsrRule {
+				name:           sf!("no-forbidden"),
+				content:        sf!("Never emit FORBIDDEN_TOKEN."),
+				conditions:     vec![sf!("FORBIDDEN_TOKEN")],
+				ast_conditions: Vec::new(),
+				scopes:         Vec::new(),
+				globs:          Vec::new(),
+				interrupt_mode: Some(crate::TtsrInterruptMode::Always),
+			}],
+			[],
+		);
+		assert!(diagnostics.is_empty(), "test rule compiles cleanly");
+		agent.set_ttsr_registry(registry);
+		let summary = agent
+			.submit([message(thread::Role::User, "write the code")], TurnId::new("turn-ttsr"))
+			.await
+			.expect("stream cancel recovers into a committed turn");
+		assert_eq!(summary.settlement, RunSettlement::Success);
+		assert_eq!(summary.committed_turns, 1);
+		assert_eq!(summary.final_assistant(), Some("clean"));
+		let opened = opened.lock();
+		assert_eq!(opened.len(), 2, "cancelled turn is replayed with the reminder");
+		let TurnInput::Full(thread) = &opened[1].1 else {
+			panic!("recovery turn reseeds a full thread");
+		};
+		let reminder = thread.items.iter().any(|item| {
+			matches!(
+				item.kind.as_ref(),
+				Some(item::Kind::Message(message)) if message.parts.iter().any(|part| {
+					matches!(
+						part.kind.as_ref(),
+						Some(part::Kind::Text(text)) if text.contains("Rule `no-forbidden`")
+					)
+				})
+			)
+		});
+		assert!(reminder, "recovery turn carries the stream-rule reminder");
+		let log = agent.journal().load().expect("load journal");
+		let injections = log
+			.as_ref()
+			.iter()
+			.filter(|index| {
+				matches!(
+					log.get(*index),
+					Some(omp_storage::transcript::Entry::Ok(event))
+						if matches!(
+							&event.kind,
+							omp_storage::transcript::Kind::Custom(custom)
+								if custom.kind() == crate::journal_kinds::TTSR_INJECTION_KIND
+						)
+				)
+			})
+			.count();
+		assert_eq!(injections, 1, "one durable TTSR injection record lands");
+		drop(log);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[test]

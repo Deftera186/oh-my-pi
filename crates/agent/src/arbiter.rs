@@ -1,4 +1,13 @@
 //! Named decision-point seams for the closed agent loop.
+//!
+//! The arbiter resolves each fixed [`Point`] by folding two sources through
+//! one draft vocabulary: durable [`RegimeSet`] activations and the always-on
+//! core lanes ([`CoreLanes`]). Lanes are ordinary [`Regime`] machines driven
+//! exclusively by [`PointCx`] facts; a lane whose draft is empty never
+//! participates, so uncontested resolutions stay immaterial. Resolutions
+//! carry typed effects (context injects, scoped settings, durable notes) and
+//! at most one control; the loop executes controls generically and never
+//! consults a lane by name.
 
 use std::{mem, sync};
 
@@ -9,11 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	Journal, JournalError,
 	regime::{
-		Regime, RegimeDraft, RegimeRecord, RegimeResolution, RegimeSet, RegimeSpec, RegimeStateError,
+		Regime, RegimeNote, RegimeRecord, RegimeResolution, RegimeSet, RegimeSpec, RegimeStateError,
 		RegimeStatus, RegimeStepResult, RevivalReport, StartError, StartOptions, StartReceipt,
 		StopError, absorb_draft, evaluate_regime,
 	},
 	tool_choice::ToolChoiceQueue,
+	ttsr::{StreamSource, TtsrRegistry},
 };
 
 /// Immutable facts available to lanes at one decision point.
@@ -25,12 +35,33 @@ pub struct PointCx<'a> {
 	pub invocation_id:     Option<&'a str>,
 	/// Current streamed UTF-8 fragment at STREAM.
 	pub stream_delta:      Option<&'a str>,
+	/// Streamed part identity at STREAM, when the delta belongs to a part.
+	pub stream_part:       Option<StreamPart<'a>>,
 	/// Current epoch milliseconds.
 	pub now_ms:            u64,
 	/// Whether the preceding operation delivered an observable effect.
 	pub delivered:         bool,
 	/// Whether an exploration checkpoint is currently active.
 	pub checkpoint_active: bool,
+	/// Whether the current turn is system-owned and hidden from the user
+	/// (for example the compaction summarizer), exempting it from
+	/// user-facing stream policy.
+	pub hidden:            bool,
+	/// Whether this SETTLE resolution follows an empty-output terminal stop.
+	pub empty_output:      bool,
+	/// Recoverable failed-turn settlements in the current recovery epoch,
+	/// populated at SETTLE.
+	pub trailing_aborts:   u8,
+}
+/// Identity of one streamed output part at the STREAM point.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamPart<'a> {
+	/// Provider part index within the current streamed message.
+	pub index:     u32,
+	/// Stream category carrying the delta.
+	pub source:    StreamSource,
+	/// Harness tool name for tool-call parts.
+	pub tool_name: Option<&'a str>,
 }
 
 /// Durable forensic representation of one resolved regime event.
@@ -95,16 +126,47 @@ pub(crate) struct ResolvedEvent {
 
 /// Arbiter owner for all point subscriptions and resolution facts.
 pub struct Arbiter {
-	regimes:            RegimeSet,
-	ttsr_regime:        stream::TtsrRegime,
-	empty_output_retry: settle::EmptyOutputRetry,
-	checkpoint_notice:  context::CheckpointNotice,
-	retry_chain:        Option<settle::RetryChainRegime>,
-	pending_facts:      Vec<RegimeFact>,
-	pending_records:    Vec<RegimeRecord>,
-	subscribed:         PointSet,
-	fact_tx:            flume::Sender<RegimeFact>,
-	fact_rx:            Receiver<RegimeFact>,
+	regimes:         RegimeSet,
+	lanes:           CoreLanes,
+	pending_facts:   Vec<RegimeFact>,
+	pending_records: Vec<RegimeRecord>,
+	pending_notes:   Vec<PendingNote>,
+	subscribed:      PointSet,
+	fact_tx:         flume::Sender<RegimeFact>,
+	fact_rx:         Receiver<RegimeFact>,
+}
+/// One staged durable side-record awaiting a safe journal boundary.
+struct PendingNote {
+	turn_id: Option<Str>,
+	note:    RegimeNote,
+}
+
+/// Always-on core lanes folded into every resolution beside durable
+/// activations.
+///
+/// Lanes are ordinary [`Regime`] machines; only configuration entry points
+/// (installing a TTSR registry, replacing failover routes, toggling the
+/// checkpoint notice) address them by type. Resolution folds them through
+/// [`CoreLanes::table`] exactly like stacked activations, and a lane whose
+/// draft is empty never participates in the resolved fact.
+#[derive(Default)]
+struct CoreLanes {
+	ttsr:         stream::TtsrRegime,
+	empty_output: settle::EmptyOutputRetry,
+	checkpoint:   context::CheckpointNotice,
+	retry_chain:  settle::RetryChainRegime,
+}
+
+impl CoreLanes {
+	/// Lane table in deterministic fold order: id, subscriptions, machine.
+	fn table(&mut self) -> [(&'static str, PointSet, &mut dyn Regime); 4] {
+		[
+			("ttsr", stream::TtsrRegime::POINTS, &mut self.ttsr),
+			("empty-output-retry", settle::EmptyOutputRetry::POINTS, &mut self.empty_output),
+			("checkpoint", context::CheckpointNotice::POINTS, &mut self.checkpoint),
+			("retry-chain", settle::RetryChainRegime::POINTS, &mut self.retry_chain),
+		]
+	}
 }
 
 impl Default for Arbiter {
@@ -112,12 +174,10 @@ impl Default for Arbiter {
 		let (fact_tx, fact_rx) = flume::unbounded();
 		Self {
 			regimes: RegimeSet::new(),
-			ttsr_regime: stream::TtsrRegime::default(),
-			empty_output_retry: settle::EmptyOutputRetry::default(),
-			checkpoint_notice: context::CheckpointNotice::default(),
-			retry_chain: None,
+			lanes: CoreLanes::default(),
 			pending_facts: Vec::new(),
 			pending_records: Vec::new(),
+			pending_notes: Vec::new(),
 			subscribed: PointSet::EMPTY,
 			fact_tx,
 			fact_rx,
@@ -141,44 +201,20 @@ impl Arbiter {
 		&mut self.regimes
 	}
 
-	pub(crate) const fn ttsr_regime_mut(&mut self) -> &mut stream::TtsrRegime {
-		&mut self.ttsr_regime
+	/// Installs the compiled stream-rule generation used by subsequent turns.
+	pub(crate) fn install_ttsr_registry(&mut self, registry: TtsrRegistry) {
+		self.lanes.ttsr.install(registry);
 	}
 
 	pub(crate) const fn checkpoint_notice_mut(&mut self) -> &mut context::CheckpointNotice {
-		&mut self.checkpoint_notice
-	}
-
-	pub(crate) fn restore_empty_output_retry(&mut self, committed_steps: u8) {
-		self.empty_output_retry = settle::EmptyOutputRetry::recovered(committed_steps);
-	}
-
-	pub(crate) const fn reset_empty_output_retry(&mut self) {
-		self.empty_output_retry.reset();
-	}
-
-	pub(crate) const fn empty_output_retry_spent(&self) -> u8 {
-		self.empty_output_retry.spent()
-	}
-
-	pub(crate) fn apply_empty_output_retry(&mut self, cx: &PointCx<'_>) -> RegimeDraft {
-		evaluate_regime(
-			Point::Settle,
-			cx,
-			"empty-output-retry",
-			u32::from(self.empty_output_retry.spent()),
-			|ctx, next| self.empty_output_retry.apply(ctx, next),
-		)
-		.expect("core empty-output regime is infallible")
+		&mut self.lanes.checkpoint
 	}
 
 	pub(crate) fn set_retry_chain(&mut self, routes: Vec<Str>) {
-		if let Some(chain) = self.retry_chain.as_mut()
-			&& chain.routes() == routes.as_slice()
-		{
-			chain.retry_now();
+		if self.lanes.retry_chain.routes() == routes.as_slice() {
+			self.lanes.retry_chain.retry_now();
 		} else {
-			self.retry_chain = Some(settle::RetryChainRegime::new(routes));
+			self.lanes.retry_chain = settle::RetryChainRegime::new(routes);
 		}
 	}
 
@@ -348,32 +384,18 @@ impl Arbiter {
 		tool_choices: Option<&mut ToolChoiceQueue>,
 	) -> ResolvedEvent {
 		let mut regime = self.regimes.resolve(point, cx, tool_choices);
-		if point == Point::Stream && self.ttsr_regime.has_pending() {
-			if let Ok(draft) =
-				evaluate_regime(point, cx, "ttsr", 0, |ctx, next| self.ttsr_regime.apply(ctx, next))
-			{
-				absorb_draft(&mut regime, Str::new_static("ttsr"), draft);
+		for (id, points, lane) in self.lanes.table() {
+			if !points.contains(point) {
+				continue;
 			}
-		}
-		if point == Point::Context && self.checkpoint_notice.is_active() {
-			if let Ok(draft) = evaluate_regime(point, cx, "checkpoint", 0, |ctx, next| {
-				self.checkpoint_notice.apply(ctx, next)
-			}) {
-				absorb_draft(&mut regime, Str::new_static("checkpoint"), draft);
+			let Ok(draft) = evaluate_regime(point, cx, id, 0, |ctx, next| lane.apply(ctx, next))
+			else {
+				continue;
+			};
+			if draft.is_empty() {
+				continue;
 			}
-		}
-		if matches!(point, Point::PreModel | Point::Stream)
-			&& self
-				.retry_chain
-				.as_ref()
-				.is_some_and(|chain| chain.is_active())
-			&& let Some(chain) = self.retry_chain.as_mut()
-		{
-			if let Ok(draft) =
-				evaluate_regime(point, cx, "retry-chain", 0, |ctx, next| chain.apply(ctx, next))
-			{
-				absorb_draft(&mut regime, Str::new_static("retry-chain"), draft);
-			}
+			absorb_draft(&mut regime, Str::new_static(id), draft);
 		}
 		let fact = RegimeFact::from_resolution(point, cx, &regime);
 		let _ = self.fact_tx.send(fact.clone());
@@ -391,7 +413,15 @@ impl Arbiter {
 		tool_choices: Option<&mut ToolChoiceQueue>,
 		journal: &mut Journal,
 	) -> Result<ResolvedEvent, JournalError> {
-		let resolved = self.resolve(point, cx, tool_choices);
+		let mut resolved = self.resolve(point, cx, tool_choices);
+		for note in mem::take(&mut resolved.regime.notes) {
+			self
+				.pending_notes
+				.push(PendingNote { turn_id: cx.turn_id.map(Str::new), note });
+		}
+		if journal.pending_turn().is_none() {
+			self.flush_notes(journal, cx.now_ms)?;
+		}
 		if !resolved.fact.is_material() {
 			return Ok(resolved);
 		}
@@ -415,7 +445,26 @@ impl Arbiter {
 		for record in mem::take(&mut self.pending_records) {
 			journal.append_regime_record(now_ms, &record)?;
 		}
+		self.flush_notes(journal, now_ms)?;
 		self.checkpoint(journal, now_ms)
+	}
+
+	/// Journals staged durable side-records once no turn is pending.
+	fn flush_notes(&mut self, journal: &mut Journal, now_ms: u64) -> Result<(), JournalError> {
+		for staged in mem::take(&mut self.pending_notes) {
+			match staged.note {
+				RegimeNote::TtsrInjection { source, rules, content } => {
+					journal.append_ttsr_injection(
+						now_ms,
+						staged.turn_id.as_deref().unwrap_or_default(),
+						source,
+						&rules,
+						content.as_str(),
+					)?;
+				},
+			}
+		}
+		Ok(())
 	}
 
 	/// Drains one telemetry fact without blocking.
@@ -461,21 +510,19 @@ pub(crate) mod context {
 	}
 
 	impl CheckpointNotice {
+		/// Points this lane subscribes to.
+		pub(crate) const POINTS: omp_core::PointSet = Point::Context.set();
+
 		pub(crate) const fn set_active(&mut self, active: bool) {
 			self.active = active;
-		}
-
-		pub(crate) const fn is_active(&self) -> bool {
-			self.active
 		}
 	}
 
 	impl Regime for CheckpointNotice {
 		fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
+			let _ = next;
 			if ctx.point() == Point::Context && self.active {
 				ctx.append_context(vec![crate::prompt::checkpoint_active_reminder()]);
-			} else if !self.active {
-				next.complete();
 			}
 			Ok(())
 		}
@@ -617,8 +664,7 @@ pub(crate) mod context {
 
 /// SETTLE-point core lanes.
 pub(crate) mod settle {
-	use bytes::Bytes;
-	use omp_core::{Point, Str};
+	use omp_core::{Point, PointSet, Str};
 	use omp_proto::{
 		inference::v1 as pb,
 		thread::v1::{self as thread, Item, item},
@@ -633,64 +679,48 @@ pub(crate) mod settle {
 		turn::empty_stop,
 	};
 
-	/// Behavior-preserving empty-output retry counter and finite cap.
+	/// Stateless empty-output retry lane.
+	///
+	/// The retry count is not lane state: it is exactly the journal's
+	/// recoverable-abort projection ([`crate::Journal::trailing_aborts`]),
+	/// delivered as the `trailing_aborts` SETTLE fact. Each retry aborts the
+	/// turn with a recoverable disposition (incrementing the projection) and a
+	/// committed receipt or exhausted abort fences it, so the count is
+	/// crash-consistent by construction with no parallel counter to restore.
 	#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-	pub(crate) struct EmptyOutputRetry {
-		spent: u8,
-	}
+	pub(crate) struct EmptyOutputRetry;
 	use crate::prompt_assets::render_empty_stop_retry;
 
 	impl EmptyOutputRetry {
 		pub(crate) const CAP: u8 = 3;
-
-		pub(crate) const fn recovered(spent: u8) -> Self {
-			Self { spent }
-		}
-
-		pub(crate) const fn spent(self) -> u8 {
-			self.spent
-		}
-
-		pub(crate) const fn can_retry(self) -> bool {
-			self.spent < Self::CAP
-		}
-
-		pub(crate) fn step(&mut self) -> Option<Item> {
-			if !self.can_retry() {
-				return None;
-			}
-			self.spent = self.spent.saturating_add(1);
-			Some(Self::item(self.spent))
-		}
-
-		pub(crate) const fn reset(&mut self) {
-			self.spent = 0;
-		}
+		/// Points this lane subscribes to.
+		pub(crate) const POINTS: PointSet = Point::Settle.set();
 	}
 	impl Regime for EmptyOutputRetry {
 		fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
-			if ctx.point() != Point::Settle {
+			if ctx.point() != Point::Settle || !ctx.facts().empty_output {
 				return Ok(());
 			}
-			let Some(item) = self.step() else {
+			let spent = ctx.facts().trailing_aborts;
+			if spent >= Self::CAP {
 				next.fail("Assistant returned no final output after retry cap; try switching models");
 				return Ok(());
-			};
-			ctx.rewrite_context(crate::ContextPatch(Bytes::from_static(b"drop:turn-tail")));
-			ctx.append_context(vec![item]);
+			}
+			ctx.append_context(vec![Self::item(spent.saturating_add(1))]);
 			next.retry();
 			Ok(())
 		}
 
 		fn state(&self) -> Str {
-			Str::from(self.spent.to_string())
+			Str::new_static("{}")
 		}
 
 		fn restore(&mut self, payload: &str) -> Result<(), RegimeStateError> {
-			self.spent = payload
-				.parse()
-				.map_err(|_| RegimeStateError::InvalidPayload)?;
-			Ok(())
+			if payload == "{}" {
+				Ok(())
+			} else {
+				Err(RegimeStateError::InvalidPayload)
+			}
 		}
 	}
 
@@ -701,8 +731,16 @@ pub(crate) mod settle {
 		cooldown_ms:    u64,
 		cooldown_until: Option<u64>,
 	}
+	impl Default for RetryChainRegime {
+		fn default() -> Self {
+			Self::new(Vec::new())
+		}
+	}
 
 	impl RetryChainRegime {
+		/// Points this lane subscribes to.
+		pub(crate) const POINTS: PointSet = Point::PreModel.set().with(Point::Stream);
+
 		pub(crate) fn new(routes: Vec<Str>) -> Self {
 			Self { routes, cursor: 0, cooldown_ms: 1_000, cooldown_until: None }
 		}
@@ -713,10 +751,6 @@ pub(crate) mod settle {
 
 		pub(crate) const fn retry_now(&mut self) {
 			self.cooldown_until = None;
-		}
-
-		pub(crate) fn is_active(&self) -> bool {
-			self.cursor < self.routes.len()
 		}
 	}
 
@@ -737,7 +771,6 @@ pub(crate) mod settle {
 			};
 			self.cursor = self.cursor.saturating_add(1);
 			self.cooldown_until = Some(ctx.facts().now_ms.saturating_add(self.cooldown_ms));
-			ctx.rewrite_context(crate::ContextPatch(bytes::Bytes::from_static(b"provider-failover")));
 			ctx.set_scoped(ScopedSetting { slot: SettingSlot::ModelRoute, value: route });
 			Ok(())
 		}
@@ -821,90 +854,92 @@ pub(crate) mod settle {
 	}
 }
 
-/// STREAM-point core lane retaining all TTSR splice state.
+/// STREAM-point core lane owning all stream-rule matching state.
+///
+/// The lane consumes only [`super::PointCx`] facts: per-part identity and the
+/// raw delta at STREAM, message boundaries at PRE_MODEL/TURN_END, and safe
+/// injection boundaries at BATCH (post-settlement) and IDLE. Interrupting
+/// matches stage the reminder and select the cancel control; the loop recovers
+/// through the generic [`StreamCancel`] transition without TTSR knowledge.
 pub(crate) mod stream {
-	use std::fmt::Write as _;
+	use std::{fmt::Write as _, mem};
 
-	use omp_core::{Point, Str, sf};
+	use omp_core::{FastHashMap, Point, PointSet, Str, sf};
+	use omp_inference::recovery::repetition::StreamRecoveryKind;
 	use omp_proto::thread::v1::{self as thread, Item, item};
 
-	use crate::{TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, r#loop::now_ms};
+	use crate::{
+		StreamSource, TtsrMatch, TtsrMatchContext, TtsrRegistry,
+		r#loop::now_ms,
+		regime::{Next, Regime, RegimeContext, RegimeError, RegimeNote, RegimeStateError},
+	};
 
-	#[derive(Clone)]
-	pub(crate) struct TtsrRegimeCancel {
-		pub(crate) matches: Vec<TtsrMatch>,
-		pub(crate) source:  TtsrSource,
+	/// Recoverable stream cancellation resolved at the STREAM point.
+	#[derive(Clone, Debug)]
+	pub(crate) struct StreamCancel {
+		/// Activation or lane that selected the cancel control.
+		pub(crate) activation: Str,
+		/// Durable cancellation reason.
+		pub(crate) reason:     Str,
+		/// Items opening the recovery turn.
+		pub(crate) injects:    Vec<Item>,
 	}
 
-	struct DeferredTtsr {
+	struct DeferredRule {
 		matched: TtsrMatch,
-		source:  TtsrSource,
+		source:  StreamSource,
 	}
 
-	pub(crate) struct TtsrStreamPart {
-		source:     TtsrSource,
-		tool_name:  Option<Str>,
+	/// Per-part accumulation for one streamed provider message.
+	struct PartState {
 		stream_key: Str,
 		arguments:  String,
 	}
 
-	impl TtsrStreamPart {
-		pub(crate) fn new(index: u32, source: TtsrSource, tool_name: Option<&str>) -> Self {
-			Self {
-				source,
-				tool_name: tool_name.map(Str::new),
-				stream_key: sf!("part:{}:{}", index, source),
-				arguments: String::new(),
-			}
-		}
-	}
-
 	#[derive(Default)]
 	pub(crate) struct TtsrRegime {
-		registry:    Option<TtsrRegistry>,
-		deferred:    Vec<DeferredTtsr>,
-		pending_cut: Option<TtsrRegimeCancel>,
+		registry: Option<TtsrRegistry>,
+		parts:    FastHashMap<u32, PartState>,
+		deferred: Vec<DeferredRule>,
 	}
-	use std::mem;
-
-	use omp_inference::recovery::repetition::StreamRecoveryKind;
-
-	use crate::regime::{Next, Regime, RegimeContext, RegimeError, RegimeStateError};
 
 	impl TtsrRegime {
+		/// Points this lane subscribes to.
+		pub(crate) const POINTS: PointSet = Point::Stream
+			.set()
+			.with(Point::PreModel)
+			.with(Point::TurnEnd)
+			.with(Point::Batch)
+			.with(Point::Idle);
+
 		pub(crate) fn install(&mut self, registry: TtsrRegistry) {
 			self.registry = Some(registry);
+			self.parts.clear();
 			self.deferred.clear();
-			self.pending_cut = None;
 		}
 
-		pub(crate) fn reset_streams(&mut self) {
-			if let Some(registry) = self.registry.as_mut() {
-				registry.reset_streams();
-			}
-		}
-
-		pub(crate) fn advance_message(&mut self) {
-			if let Some(registry) = self.registry.as_mut() {
-				registry.advance_message();
-			}
-		}
-
-		pub(crate) fn mark_injected<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
-			if let Some(registry) = self.registry.as_mut() {
-				registry.mark_injected(names);
-			}
-		}
-
-		pub(crate) fn check_delta(
+		fn on_delta(
 			&mut self,
-			state: &mut TtsrStreamPart,
-			fragment: &str,
-		) -> Option<TtsrRegimeCancel> {
-			let registry = self.registry.as_mut()?;
+			ctx: &mut RegimeContext<'_>,
+			next: Next<'_>,
+		) -> Result<(), RegimeError> {
+			let facts = *ctx.facts();
+			if facts.hidden {
+				return Ok(());
+			}
+			let (Some(part), Some(fragment)) = (facts.stream_part, facts.stream_delta) else {
+				return Ok(());
+			};
+			let Some(registry) = self.registry.as_mut() else {
+				return Ok(());
+			};
+			let state = self.parts.entry(part.index).or_insert_with(|| PartState {
+				stream_key: sf!("part:{}:{}", part.index, part.source),
+				arguments:  String::new(),
+			});
 			let mut paths = Vec::new();
 			let mut snapshot = None;
-			if state.source == TtsrSource::Tool {
+			if part.source == StreamSource::Tool {
 				state.arguments.push_str(fragment);
 				let parsed = omp_slopjson::parse_streaming(state.arguments.as_str());
 				collect_ttsr_paths(&parsed, &mut paths);
@@ -912,8 +947,8 @@ pub(crate) mod stream {
 			}
 			let path_refs = paths.iter().map(Str::as_str).collect::<Vec<_>>();
 			let context = TtsrMatchContext {
-				source:     state.source,
-				tool_name:  state.tool_name.as_ref().map(Str::as_str),
+				source:     part.source,
+				tool_name:  part.tool_name,
 				file_paths: path_refs.as_slice(),
 				stream_key: Some(state.stream_key.as_str()),
 			};
@@ -933,15 +968,29 @@ pub(crate) mod stream {
 				}
 			}
 			if matches.is_empty() {
-				return None;
+				return Ok(());
 			}
 			if matches
 				.iter()
-				.any(|matched| matched.interrupt_mode.interrupts(state.source))
+				.any(|matched| matched.interrupt_mode.interrupts(part.source))
 			{
-				let cut = TtsrRegimeCancel { matches, source: state.source };
-				self.pending_cut = Some(cut.clone());
-				return Some(cut);
+				registry.mark_injected(matches.iter().map(|matched| matched.name.as_str()));
+				let mut names = String::new();
+				for matched in &matches {
+					if !names.is_empty() {
+						names.push_str(", ");
+					}
+					names.push_str(matched.name.as_str());
+				}
+				let text = ttsr_reminder_text(&matches);
+				ctx.stage_note(RegimeNote::TtsrInjection {
+					source:  part.source,
+					rules:   matches.iter().map(|matched| matched.name.clone()).collect(),
+					content: Str::new(text.as_str()),
+				});
+				ctx.append_context(vec![ttsr_reminder_item(text)]);
+				next.cancel(sf!("TTSR matched rule: {names}"));
+				return Ok(());
 			}
 			for matched in matches {
 				if !self
@@ -951,15 +1000,16 @@ pub(crate) mod stream {
 				{
 					self
 						.deferred
-						.push(DeferredTtsr { matched, source: state.source });
+						.push(DeferredRule { matched, source: part.source });
 				}
 			}
-			None
+			Ok(())
 		}
 
-		pub(crate) fn take_deferred(&mut self) -> Option<(TtsrSource, Vec<TtsrMatch>, String, Item)> {
+		/// Emits accumulated non-interrupting matches at a safe boundary.
+		fn emit_deferred(&mut self, ctx: &mut RegimeContext<'_>) {
 			if self.deferred.is_empty() {
-				return None;
+				return;
 			}
 			let deferred = mem::take(&mut self.deferred);
 			let source = deferred[0].source;
@@ -967,26 +1017,37 @@ pub(crate) mod stream {
 				.into_iter()
 				.map(|entry| entry.matched)
 				.collect::<Vec<_>>();
+			if let Some(registry) = self.registry.as_mut() {
+				registry.mark_injected(matches.iter().map(|matched| matched.name.as_str()));
+			}
 			let text = ttsr_reminder_text(&matches);
-			let item = ttsr_reminder_item(text.clone());
-			Some((source, matches, text, item))
-		}
-
-		pub(crate) fn has_pending(&self) -> bool {
-			self.pending_cut.is_some() || !self.deferred.is_empty()
+			ctx.stage_note(RegimeNote::TtsrInjection {
+				source,
+				rules: matches.iter().map(|matched| matched.name.clone()).collect(),
+				content: Str::new(text.as_str()),
+			});
+			ctx.append_context(vec![ttsr_reminder_item(text)]);
 		}
 	}
 	impl Regime for TtsrRegime {
 		fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
-			if ctx.point() != Point::Stream {
-				return Ok(());
+			match ctx.point() {
+				Point::Stream => return self.on_delta(ctx, next),
+				Point::PreModel => {
+					if let Some(registry) = self.registry.as_mut() {
+						registry.reset_streams();
+					}
+					self.parts.clear();
+				},
+				Point::TurnEnd => {
+					if let Some(registry) = self.registry.as_mut() {
+						registry.advance_message();
+					}
+				},
+				Point::Batch if ctx.facts().delivered => self.emit_deferred(ctx),
+				Point::Idle => self.emit_deferred(ctx),
+				_ => {},
 			}
-			let Some(cancel) = self.pending_cut.take() else {
-				return Ok(());
-			};
-			let text = ttsr_reminder_text(&cancel.matches);
-			ctx.append_context(vec![ttsr_reminder_item(text)]);
-			next.cancel("stream rule interrupted generation");
 			Ok(())
 		}
 

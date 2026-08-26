@@ -54,7 +54,7 @@ use crate::{
 	project,
 	prompt::PromptHash,
 	regime::RegimeRecord,
-	ttsr::TtsrSource,
+	ttsr::StreamSource,
 };
 type ActivePrompt = (Hash32, Vec<u64>);
 type PendingItem = (u64, Item, Option<Hash32>);
@@ -3340,7 +3340,7 @@ impl Journal {
 		&mut self,
 		ts: u64,
 		turn_id: &str,
-		source: TtsrSource,
+		source: StreamSource,
 		rules: &[Str],
 		content: &str,
 	) -> Result<u64, JournalError> {

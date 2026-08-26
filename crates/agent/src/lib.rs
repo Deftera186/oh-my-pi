@@ -61,7 +61,7 @@ pub use approvals::{
 	ApprovalBook, ApprovalDecision, ApprovalGuard, ApprovalInbox, ApprovalRequest, ApprovalRoute,
 	ApprovalSource, ApprovalSpec, ApprovalTicket, TicketState,
 };
-pub use arbiter::{Arbiter, ArbiterError, PointCx, RegimeFact};
+pub use arbiter::{Arbiter, ArbiterError, PointCx, RegimeFact, StreamPart};
 pub use attachments::{
 	Attachment, AttachmentError, AttachmentIndex, DEFAULT_PROVIDER_IMAGE_BUDGET,
 	MAX_TRANSIENT_IMAGE_BYTES, NormalizeAttachmentError, NormalizedAttachmentImage,
@@ -221,8 +221,8 @@ pub use tree::{
 	YieldPayloadError, YieldPayloadValidator, enforce_minimum_phase, resolve_output_schema,
 };
 pub use ttsr::{
-	TtsrCompileError, TtsrContextMode, TtsrInterruptMode, TtsrMatch, TtsrMatchContext, TtsrRegistry,
-	TtsrRepeatMode, TtsrRule, TtsrSettings, TtsrSource,
+	StreamSource, TtsrCompileError, TtsrContextMode, TtsrInterruptMode, TtsrMatch, TtsrMatchContext,
+	TtsrRegistry, TtsrRepeatMode, TtsrRule, TtsrSettings,
 };
 pub use turn::{
 	Error, InvokeFrame, PROVIDER_RESET_PROP, Recovery, StreamWatchdog, TurnClient, TurnInput,
