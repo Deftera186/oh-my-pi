@@ -293,8 +293,25 @@ impl EditBuffer {
 			self.anchor = None;
 			return;
 		};
-		let (start, end) =
-			self.expand_to_atoms(word_left(&self.text, seed_end), word_right(&self.text, seed_start));
+		let class = word_class(&self.text[seed_start..seed_end]);
+		let (start, end) = if class == WordClass::Whitespace {
+			let start = self.text[..seed_start]
+				.grapheme_indices()
+				.rev()
+				.take_while(|(_, grapheme)| word_class(grapheme) == class)
+				.map(|(at, _)| at)
+				.last()
+				.unwrap_or(seed_start);
+			let end = self.text[seed_end..]
+				.grapheme_indices()
+				.take_while(|(_, grapheme)| word_class(grapheme) == class)
+				.map(|(at, grapheme)| seed_end + at + grapheme.len())
+				.last()
+				.unwrap_or(seed_end);
+			self.expand_to_atoms(start, end)
+		} else {
+			self.expand_to_atoms(word_left(&self.text, seed_end), word_right(&self.text, seed_start))
+		};
 		self.anchor = Some(start);
 		self.cursor = end;
 		self.desired = None;
@@ -398,6 +415,45 @@ impl EditBuffer {
 		self
 			.atoms
 			.push_back(Atom { start, end: start + marker.len(), payload: Str::new(payload) });
+		self.desired = None;
+		BufferOutcome::Changed
+	}
+
+	/// Inserts references and a suffix after each as one undoable action.
+	///
+	/// Invalid (empty or multiline) markers are ignored. This is used for one
+	/// terminal paste/drop gesture that produces one or more attachment chips.
+	pub fn insert_reference_group(
+		&mut self,
+		references: &[(String, String)],
+		suffix: &str,
+	) -> BufferOutcome {
+		if references
+			.iter()
+			.all(|(marker, _)| marker.is_empty() || marker.contains('\n'))
+		{
+			return BufferOutcome::Ignored;
+		}
+		self.snapshot();
+		self.break_sequence();
+		let range = self.selection().unwrap_or(self.cursor..self.cursor);
+		let start = range.start;
+		self.splice(range, "");
+		self.cursor = start;
+		self.anchor = None;
+		for (marker, payload) in references {
+			if marker.is_empty() || marker.contains('\n') {
+				continue;
+			}
+			let start = self.cursor;
+			self.splice(start..start, marker);
+			self.cursor += marker.len();
+			self
+				.atoms
+				.push_back(Atom { start, end: self.cursor, payload: Str::new(payload) });
+			self.splice(self.cursor..self.cursor, suffix);
+			self.cursor += suffix.len();
+		}
 		self.desired = None;
 		BufferOutcome::Changed
 	}
@@ -1971,6 +2027,22 @@ impl Editor {
 		}
 	}
 
+	/// Inserts one paste/drop gesture's attachment references as one undo unit.
+	pub fn insert_reference_group(
+		&mut self,
+		references: &[(String, String)],
+		suffix: &str,
+	) -> EditOutcome {
+		self.history_index = None;
+		self.history_query = None;
+		if matches!(self.buffer.insert_reference_group(references, suffix), BufferOutcome::Changed) {
+			self.refresh();
+			EditOutcome::Changed
+		} else {
+			EditOutcome::Ignored
+		}
+	}
+
 	/// Byte ranges of atomic markers in the visible text; see
 	/// [`EditBuffer::atom_ranges`].
 	pub fn atom_ranges(&self) -> SmallVec<(usize, usize), 4> {
@@ -3254,6 +3326,27 @@ mod tests {
 	}
 
 	#[test]
+	fn reference_groups_are_one_undoable_drop_action() {
+		let mut editor = editor();
+		let references = [
+			("[one]".to_owned(), "<ref one/>".to_owned()),
+			("[two]".to_owned(), "<ref two/>".to_owned()),
+		];
+		assert_eq!(editor.insert_reference_group(&references, " "), EditOutcome::Changed);
+		assert_eq!(editor.text(), "[one] [two] ");
+		assert_eq!(
+			editor.handle(Key::Enter),
+			EditOutcome::Submitted("<ref one/> <ref two/> ".into())
+		);
+
+		let mut editor = self::editor();
+		editor.insert_reference_group(&references, " ");
+		assert_eq!(editor.handle(Key::Ctrl('-')), EditOutcome::Changed);
+		assert_eq!(editor.text(), "");
+		assert!(editor.atom_ranges().is_empty());
+	}
+
+	#[test]
 	fn references_are_positional_atoms_immune_to_lookalike_text() {
 		let mut editor = editor();
 		assert_eq!(editor.insert_reference("* #1", "<ref image=1/>"), EditOutcome::Changed);
@@ -3345,6 +3438,14 @@ mod tests {
 		assert_eq!(editor.buffer.cursor(), 10);
 		editor.handle(Key::Up);
 		assert_eq!(editor.buffer.cursor(), 4);
+	}
+
+	#[test]
+	fn double_clicking_whitespace_selects_only_its_run() {
+		let mut buffer = EditBuffer::new("one  two");
+		buffer.select_word_visual_row(0, 3, 80);
+		assert_eq!(buffer.selection(), Some(3..5));
+		assert_eq!(buffer.selected_text(), Some("  "));
 	}
 
 	#[test]

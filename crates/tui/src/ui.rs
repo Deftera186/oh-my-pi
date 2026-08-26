@@ -200,6 +200,7 @@ impl Ui {
 	pub const fn context(&self) -> &UiContext {
 		&self.ctx
 	}
+
 	/// A custom (non-well-known) attribute declared on the first root-level
 	/// parsed element, e.g. a tool view's `chrome` presentation hint.
 	///
@@ -2233,107 +2234,18 @@ mod tests {
 		);
 	}
 
-	const ATTR_FIXTURE: &[&str] = &[
-		"gap",
-		"pad",
-		"pad-x",
-		"pad-y",
-		"grow",
-		"w",
-		"min",
-		"max",
-		"h",
-		"border",
-		"bc",
-		"edge",
-		"bleed",
-		"noselect",
-		"title",
-		"title-align",
-		"footer",
-		"footer-align",
-		"overflow",
-		"sep",
-		"align",
-		"valign",
-		"justify",
-		"fg",
-		"bg",
-		"on",
-		"bold",
-		"dim",
-		"italic",
-		"underline",
-		"reverse",
-		"strike",
-		"wrap",
-		"variant",
-		"active",
-		"color",
-		"truncate",
-		"trim",
-		"id",
-		"when",
-		"value",
-		"key",
-		"options",
-		"label",
-		"numbering",
-		"prefix",
-		"annotation",
-		"annotation-color",
-		"action",
-		"action-color",
-		"desc",
-		"kind",
-		"step",
-		"multi",
-		"compact",
-		"selected",
-		"filter",
-		"custom",
-		"focus",
-		"guides",
-		"status",
-		"mask",
-		"recommended",
-		"open",
-		"required",
-		"match",
-		"src",
-		"icon",
-		"badge",
-		"submit",
-		"cancel",
-		"confirm",
-		"placeholder",
-		"angle",
-		"accent",
-		"vertical",
-		"anim",
-		"ease",
-		"spin",
-		"hover",
-		"lift",
-		"shimmer",
-		"reveal",
-		"partial",
-		"context",
-		"checked",
-		"limit",
-		"max-depth",
-		"max-chars",
-		"rail",
-		"max-rows",
-		"truncate-from",
-		"numbers",
-		"start",
-		"ms",
-		"added",
-		"removed",
-		"ops",
-		"minimap",
-	];
+	macro_rules! assert_tag_types {
+		($($tag:ident => $type:ident;)+) => {
+			/// Every vocabulary tag lowers to its typed constructor.
+			#[test]
+			fn dom_macro_tags_construct_typed_components() {
+				$(let _: crate::components::$type = dom!(<$tag/>);)+
+				let _: crate::components::Icon = dom!(<icon name="check"/>);
+				let _: crate::components::CustomElement = dom!(<mystery/>);
+			}
+		};
+	}
+	omp_tui_vocab::for_each_component! { assert_tag_types }
 
 	fn frame_text(ui: &Ui) -> Vec<String> {
 		let size = ui.frame().size();
@@ -3840,28 +3752,6 @@ cd</pre>"##,
 		for skipped in ["if-zero", "if-one", "match-zero", "match-one"] {
 			assert!(!painted.contains(skipped), "rendered skipped child {skipped:?}");
 		}
-	}
-
-	/// The names contract for the derived `Prop` string mapping: every
-	/// markup attribute resolves, distinctly, and no variant exists outside
-	/// this list — a typoed `strum(serialize)` or an undocumented variant
-	/// fails here rather than silently changing the markup language.
-	#[test]
-	fn layout_macro_known_attributes_match_props_name_table() {
-		let mut resolved: Vec<Prop> = ATTR_FIXTURE
-			.iter()
-			.map(|&name| {
-				Props::prop_of(name).unwrap_or_else(|| panic!("missing Props entry for {name:?}"))
-			})
-			.collect();
-		resolved.sort_by_key(|&prop| prop as usize);
-		resolved.dedup();
-		assert_eq!(resolved.len(), ATTR_FIXTURE.len(), "two attribute names hit one property");
-		assert_eq!(
-			ATTR_FIXTURE.len(),
-			<Prop as strum::IntoEnumIterator>::iter().count(),
-			"a Prop variant is missing from ATTR_FIXTURE"
-		);
 	}
 
 	/// Paints the 10ms-step counter digit and re-requests wakes until `stop`.

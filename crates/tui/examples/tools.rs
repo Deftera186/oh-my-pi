@@ -115,17 +115,13 @@ fn status(ui: &mut Ui, height: u16, reduced: bool, browser_hidden: bool) {
 	ui.set_text(STATUS_ID, format!("TOOLS · height {height} · motion {motion}{browser}"));
 }
 
-fn main() -> io::Result<()> {
-	let executor = omp_executor::Executor::new(None);
-	executor.clone().block_on(run(executor))
-}
-
-async fn run(executor: omp_executor::Executor) -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
 	let hotkeys = [Key::Char('['), Key::Char(']'), Key::Char('f'), Key::Char('m')];
 	let mut app = AppOptions::new()
 		.quit([Key::Ctrl('c'), Key::Char('q'), Key::Esc])
 		.hotkeys(hotkeys)
-		.start(executor, |env| build_ui(env.viewport.width, env.ctx))
+		.start(|env| build_ui(env.viewport.width, env.ctx))
 		.await?;
 	let mut height = 3_u16;
 	let mut reduced = false;

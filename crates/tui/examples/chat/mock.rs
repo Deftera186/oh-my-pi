@@ -11,26 +11,20 @@ use std::{
 use flume::{Receiver, Sender};
 use omp_chat_ui::{
 	BackendEvent, CompactionBoundaries, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow,
-	SettingRow, StatusFacts, ThinkingLevel,
+	SettingRow, StatusFacts, ThinkingLevel, ToolTerminal, ToolViewContent,
 };
 use omp_core::{Str, sf};
 use omp_tui::components::ComposerStyle;
 use strum::IntoEnumIterator;
 
-pub fn start(executor: &omp_executor::Executor) -> (Receiver<BackendEvent>, Sender<Intent>) {
+pub fn start() -> (Receiver<BackendEvent>, Sender<Intent>) {
 	let (event_tx, event_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
-	executor
-		.spawn(run(executor.clone(), event_tx, intent_rx))
-		.detach();
+	drop(tokio::spawn(run(event_tx, intent_rx)));
 	(event_rx, intent_tx)
 }
 
-async fn run(
-	executor: omp_executor::Executor,
-	events: Sender<BackendEvent>,
-	intents: Receiver<Intent>,
-) {
+async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 	let models = models();
 	let generation = Arc::new(AtomicU64::new(0));
 	let mut model = 0_usize;
@@ -64,12 +58,7 @@ async fn run(
 				let events = events.clone();
 				let generation = Arc::clone(&generation);
 				let model_name = models[model].name.clone();
-				let stream_executor = executor.clone();
-				executor
-					.spawn(async move {
-						stream_turn(stream_executor, events, generation, turn, model_name).await;
-					})
-					.detach();
+				tokio::spawn(stream_turn(events, generation, turn, model_name));
 			},
 			Intent::Abort => {
 				generation.fetch_add(1, Ordering::SeqCst);
@@ -155,7 +144,6 @@ async fn run(
 }
 
 async fn stream_turn(
-	executor: omp_executor::Executor,
 	events: Sender<BackendEvent>,
 	generation: Arc<AtomicU64>,
 	turn: u64,
@@ -178,7 +166,7 @@ async fn stream_turn(
 		}
 		let _ =
 			events.send(BackendEvent::AssistantDelta { id: assistant.clone(), text: sf!(delta) });
-		executor.timer(Duration::from_millis(180)).await;
+		tokio::time::sleep(Duration::from_millis(180)).await;
 	}
 	if !active() {
 		return;
@@ -194,15 +182,15 @@ async fn stream_turn(
 			return;
 		}
 		let _ = events.send(BackendEvent::ToolOutput { id: tool.clone(), chunk: sf!(chunk) });
-		executor.timer(Duration::from_millis(160)).await;
+		tokio::time::sleep(Duration::from_millis(160)).await;
 	}
 	if !active() {
 		return;
 	}
 	let _ = events.send(BackendEvent::ToolFinished {
-		id:   tool,
-		ok:   true,
-		view: sf!("Host seam verified\n3 files inspected"),
+		id:       tool,
+		terminal: ToolTerminal::Succeeded,
+		view:     ToolViewContent::Plain(sf!("Host seam verified\n3 files inspected")),
 	});
 	let _ = events.send(BackendEvent::AssistantDelta {
 		id:   assistant.clone(),
@@ -262,6 +250,7 @@ fn models() -> Vec<ModelRow> {
 	.map(|(key, name, provider_id, provider, context, input, output)| ModelRow {
 		key:         Str::from(key),
 		name:        Str::from(name),
+		color:       None,
 		provider_id: Str::from(provider_id),
 		provider:    Str::from(provider),
 		context:     Some(context),

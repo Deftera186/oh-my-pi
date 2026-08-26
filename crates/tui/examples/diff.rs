@@ -74,12 +74,8 @@ fn describe(event: &UiEvent) -> String {
 	}
 }
 
-fn main() -> io::Result<()> {
-	let executor = omp_executor::Executor::new(None);
-	executor.clone().block_on(run(executor))
-}
-
-async fn run(executor: omp_executor::Executor) -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
 	let mut app = AppOptions::new()
 		.mouse()
 		.hotkeys([
@@ -92,7 +88,7 @@ async fn run(executor: omp_executor::Executor) -> io::Result<()> {
 			Key::Char('x'),
 		])
 		.quit([Key::Ctrl('c'), Key::Char('q')])
-		.start(executor, |env| build(env.viewport.width, env.viewport.height, env.ctx))
+		.start(|env| build(env.viewport.width, env.viewport.height, env.ctx))
 		.await?;
 
 	while let Some(event) = app.next().await? {

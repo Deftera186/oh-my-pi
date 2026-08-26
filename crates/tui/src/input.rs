@@ -8,6 +8,7 @@ use std::{
 };
 
 use omp_core::Str;
+use smallvec::{SmallVec, smallvec};
 use xutf::{IntoUnicodeNormalized, Text};
 
 use crate::{
@@ -405,9 +406,6 @@ impl InputDecoder {
 				.paste_last_input
 				.map(|at| at + PASTE_INACTIVITY_TIMEOUT),
 			self
-				.pending_kitty_print
-				.map(|(_, at)| at + KITTY_DEDUP_TIMEOUT),
-			self
 				.string_discard
 				.map(|discard| discard.last + STRING_DISCARD_INACTIVITY_TIMEOUT),
 		]
@@ -547,14 +545,21 @@ impl InputDecoder {
 	}
 
 	fn emit(&mut self, decoded: Decoded, now: Instant, out: &mut Vec<InputEvent>) {
-		let (event, chord, kitty_printable) = match decoded {
-			Decoded::Event(event) => (Some(event), None, false),
-			Decoded::Chord(chord) => (None, Some(chord), false),
-			Decoded::KittyChord(chord) => (None, Some(chord), true),
+		let (event, chords, kitty_dedup, bare) = match decoded {
+			Decoded::Event(event) => (Some(event), SmallVec::new(), None, false),
+			Decoded::Chord(chord) => (None, smallvec![chord], None, false),
+			Decoded::BareChord(chord) => (None, smallvec![chord], None, true),
+			Decoded::KittyChord(chord) => {
+				let dedup = chord_printable_codepoint(chord);
+				(None, smallvec![chord], dedup, false)
+			},
+			Decoded::KittyText { chords, dedup } => (None, chords, dedup, false),
 			Decoded::PasteStart | Decoded::None => return,
 		};
-		let printable = chord.and_then(chord_printable_codepoint);
-		if printable.is_some_and(|printable| {
+		let bare_printable = (bare && chords.len() == 1)
+			.then(|| chord_printable_codepoint(chords[0]))
+			.flatten();
+		if bare_printable.is_some_and(|printable| {
 			self.pending_kitty_print.is_some_and(|(codepoint, at)| {
 				printable == codepoint && now.saturating_duration_since(at) <= KITTY_DEDUP_TIMEOUT
 			})
@@ -562,18 +567,16 @@ impl InputDecoder {
 			self.pending_kitty_print = None;
 			return;
 		}
-		self.pending_kitty_print = if kitty_printable {
-			printable.map(|codepoint| (codepoint, now))
-		} else {
-			None
-		};
+		self.pending_kitty_print = kitty_dedup.map(|codepoint| (codepoint, now));
 		if let Some(InputEvent::Response(TerminalResponse::KittyKeyboardFlags(flags))) = event {
 			self.kitty_keyboard_active = flags != 0;
 			out.push(InputEvent::Response(TerminalResponse::KittyKeyboardFlags(flags)));
 		} else if let Some(event) = event {
 			out.push(event);
-		} else if let Some(chord) = chord {
-			emit_chord(&self.keymap, chord, out);
+		} else {
+			for chord in chords {
+				emit_chord(&self.keymap, chord, out);
+			}
 		}
 	}
 
@@ -631,7 +634,9 @@ fn is_string_sequence(bytes: &[u8]) -> bool {
 enum Decoded {
 	Event(InputEvent),
 	Chord(Chord),
+	BareChord(Chord),
 	KittyChord(Chord),
+	KittyText { chords: SmallVec<Chord, 4>, dedup: Option<u32> },
 	PasteStart,
 	None,
 }
@@ -737,7 +742,7 @@ fn resolve_escape(bytes: &[u8]) -> FrameResolution {
 
 fn decode_frame(bytes: &[u8]) -> Decoded {
 	if bytes[0] != 0x1b {
-		return decode_plain(bytes, false).map_or(Decoded::None, Decoded::Chord);
+		return decode_plain(bytes, false).map_or(Decoded::None, Decoded::BareChord);
 	}
 	if bytes == b"\x1b" {
 		return Decoded::Chord(Chord::plain(Key::Esc));
@@ -886,11 +891,15 @@ fn decode_csi(body: &[u8], final_byte: u8, meta: bool) -> Decoded {
 
 fn decode_kitty_key(body: &[u8], meta: bool) -> Decoded {
 	let mut fields = body.split(|byte| *byte == b';');
-	let codepoints = fields.next().unwrap_or_default();
-	let mut codepoints = codepoints.split(|byte| *byte == b':');
+	let mut codepoints = fields
+		.next()
+		.unwrap_or_default()
+		.split(|byte| *byte == b':');
 	let primary = codepoints.next().and_then(parse_decimal).unwrap_or(0);
 	let shifted = codepoints.next().and_then(parse_decimal);
+	let base_layout = codepoints.next().and_then(parse_decimal);
 	let modifier_field = fields.next().unwrap_or(b"1");
+	let associated_text = fields.next();
 	let mut modifier_parts = modifier_field.split(|byte| *byte == b':');
 	let mut modifiers = modifier_parts.next().and_then(parse_modifier).unwrap_or(0);
 	if meta {
@@ -903,7 +912,28 @@ fn decode_kitty_key(body: &[u8], meta: bool) -> Decoded {
 	if event_type == 3 {
 		return Decoded::None;
 	}
-	let codepoint = if modifiers & 0b0000_0001 != 0 {
+	// Caps/Num Lock describe terminal state, not application modifiers.
+	modifiers &= !(0b0100_0000 | 0b1000_0000);
+	if modifiers & 0b0000_1110 == 0
+		&& let Some(text) = associated_text
+	{
+		let chords: SmallVec<_, 4> = text
+			.split(|byte| *byte == b':')
+			.filter_map(parse_decimal)
+			.filter_map(char::from_u32)
+			.filter_map(character_to_key)
+			.map(Chord::plain)
+			.collect();
+		if !chords.is_empty() {
+			let dedup = (chords.len() == 1)
+				.then(|| chord_printable_codepoint(chords[0]))
+				.flatten();
+			return Decoded::KittyText { chords, dedup };
+		}
+	}
+	let codepoint = if modifiers & 0b0000_1110 != 0 {
+		base_layout.unwrap_or(primary)
+	} else if modifiers & 0b0000_0001 != 0 {
 		shifted.unwrap_or(primary)
 	} else {
 		primary
@@ -911,7 +941,7 @@ fn decode_kitty_key(body: &[u8], meta: bool) -> Decoded {
 	let Some(chord) = chord_from_codepoint(codepoint, modifiers) else {
 		return Decoded::None;
 	};
-	let printable = modifiers == 0 && codepoint >= 32;
+	let printable = modifiers & 0b0000_1110 == 0 && chord_printable_codepoint(chord).is_some();
 	if printable {
 		Decoded::KittyChord(chord)
 	} else {
@@ -1014,7 +1044,7 @@ fn decode_sgr_mouse(body: &[u8], final_byte: u8) -> Decoded {
 fn chord_from_codepoint(codepoint: u32, modifiers: u32) -> Option<Chord> {
 	let key = match codepoint {
 		57344 | 27 => Some(Key::Esc),
-		57345 | 10 | 13 => Some(Key::Enter),
+		57345 | 10 | 13 | 57414 => Some(Key::Enter),
 		57346 | 9 => Some(Key::Tab),
 		57347 | 127 => Some(Key::Backspace),
 		57348 => Some(Key::Insert),
@@ -1028,6 +1058,13 @@ fn chord_from_codepoint(codepoint: u32, modifiers: u32) -> Option<Chord> {
 		57356 => Some(Key::Home),
 		57357 => Some(Key::End),
 		57364..=57375 => Some(Key::Function(u8::try_from(codepoint - 57363).ok()?)),
+		57399..=57408 => char::from_digit(codepoint - 57399, 10).map(Key::Char),
+		57409 => Some(Key::Char('.')),
+		57410 => Some(Key::Char('/')),
+		57411 => Some(Key::Char('*')),
+		57412 => Some(Key::Char('-')),
+		57413 => Some(Key::Char('+')),
+		57415 => Some(Key::Char('=')),
 		_ => character_to_key(char::from_u32(codepoint)?),
 	}?;
 	Some(Chord::with_modifiers(key, modifiers))
@@ -1910,11 +1947,15 @@ pub fn word_rubout_start(text: &str, at: usize) -> usize {
 /// Normalizes terminal paste input before inserting it into a widget.
 pub fn sanitize_paste(text: &str) -> String {
 	let normalized_newlines = text.replace("\r\n", "\n").replace('\r', "\n");
-	normalized_newlines
-		.chars()
-		.filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-		.collect::<String>()
-		.into_nfc()
+	let mut sanitized = String::with_capacity(normalized_newlines.len());
+	for character in normalized_newlines.chars() {
+		if character == '\t' {
+			sanitized.push_str("   ");
+		} else if !character.is_control() || character == '\n' {
+			sanitized.push(character);
+		}
+	}
+	sanitized.into_nfc()
 }
 
 #[cfg(test)]
@@ -1928,6 +1969,11 @@ mod tests {
 		Chord, ChordParseError, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton,
 		MouseReport, STRING_DISCARD_MAX_BYTES, TerminalResponse, decode_keys, mods_from_bits,
 	};
+
+	#[test]
+	fn paste_sanitization_expands_tabs_to_visible_cells() {
+		assert_eq!(super::sanitize_paste("a\tb\r\nc\u{7}"), "a   b\nc");
+	}
 
 	#[test]
 	fn configurable_chords_accept_modifier_aliases_and_canonicalize() {
@@ -2028,6 +2074,56 @@ mod tests {
 			let mut keys = Vec::new();
 			decode_keys(bytes, &mut keys);
 			assert_eq!(keys, [expected], "{bytes:?}");
+		}
+	}
+
+	#[test]
+	fn kitty_printable_dedup_only_suppresses_the_bare_companion() {
+		let start = Instant::now();
+		let mut decoder = InputDecoder::new();
+		let mut events = Vec::new();
+
+		decoder.feed(b"\x1b[97u", start, &mut events);
+		assert_eq!(decoder.deadline(), None, "dedup state never schedules actor work");
+		decoder.feed(b"\x1b[97u", start + Duration::from_millis(1), &mut events);
+		decoder.feed(b"\x1b[97;1:2u", start + Duration::from_millis(2), &mut events);
+		decoder.feed(b"a", start + Duration::from_millis(3), &mut events);
+		assert_eq!(
+			events,
+			[
+				InputEvent::Key(Key::Char('a')),
+				InputEvent::Key(Key::Char('a')),
+				InputEvent::Key(Key::Char('a')),
+			],
+			"presses and repeats survive; only the raw companion is removed"
+		);
+
+		let mut decoder = InputDecoder::new();
+		let mut encoded = Vec::new();
+		decoder.feed(b"\x1b[97u", start, &mut encoded);
+		decoder.feed(b"\x1b[27;1;97~", start + Duration::from_millis(1), &mut encoded);
+		assert_eq!(
+			encoded,
+			[InputEvent::Key(Key::Char('a')), InputEvent::Key(Key::Char('a'))],
+			"an encoded printable is not the buggy one-scalar companion"
+		);
+	}
+
+	#[test]
+	fn kitty_csi_u_uses_layout_text_and_keypad_fields() {
+		let cases: &[(&[u8], &[Key])] = &[
+			(b"\x1b[1089::99;5u", &[Key::Ctrl('c')]),
+			(b"\x1b[97;1;120:121u", &[Key::Char('x'), Key::Char('y')]),
+			(b"\x1b[57399u", &[Key::Char('0')]),
+			(b"\x1b[57408u", &[Key::Char('9')]),
+			(b"\x1b[57410u", &[Key::Char('/')]),
+			(b"\x1b[57414u", &[Key::Enter]),
+			(b"\x1b[57415u", &[Key::Char('=')]),
+		];
+		for &(bytes, expected) in cases {
+			let mut keys = Vec::new();
+			decode_keys(bytes, &mut keys);
+			assert_eq!(keys, expected, "{bytes:?}");
 		}
 	}
 
@@ -2388,7 +2484,7 @@ mod tests {
 			start + Duration::from_millis(30),
 			&mut events,
 		);
-		assert_eq!(events, [InputEvent::Paste("a\nb\tc".into())]);
+		assert_eq!(events, [InputEvent::Paste("a\nb   c".into())]);
 
 		events.clear();
 		decoder.feed(b"\x1b[200~unterminated", start + Duration::from_millis(40), &mut events);

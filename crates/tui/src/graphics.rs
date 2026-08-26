@@ -748,12 +748,14 @@ pub fn negotiate(timeout: Duration) -> (TerminalCaps, ProbeResults) {
 	let caps = TerminalCaps::resolve(env_caps, probe.as_ref(), forced);
 	(caps, probe.unwrap_or_default())
 }
-/// [`negotiate`] on the executor's blocking pool.
-pub async fn negotiate_async(
-	executor: &omp_executor::Executor,
-	timeout: Duration,
-) -> (TerminalCaps, ProbeResults) {
-	executor.unblock(move || negotiate(timeout)).await
+/// [`negotiate`] on the blocking pool, for tokio hosts.
+///
+/// # Panics
+/// Panics outside a tokio runtime.
+pub async fn negotiate_async(timeout: Duration) -> (TerminalCaps, ProbeResults) {
+	tokio::task::spawn_blocking(move || negotiate(timeout))
+		.await
+		.unwrap_or_else(|_| (detect(), ProbeResults::default()))
 }
 
 fn forced_graphics_from_environment(caps: TerminalCaps) -> Option<Graphics> {

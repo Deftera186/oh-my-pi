@@ -158,6 +158,7 @@ struct DisplayRow {
 	logo_src: Option<Str>,
 	provider: Str,
 	name:     Str,
+	color:    Str,
 	current:  bool,
 	context:  Str,
 	input:    Str,
@@ -195,6 +196,7 @@ fn build(
 			} else {
 				row.name.clone()
 			},
+			color:    row.color.clone().unwrap_or_else(|| sf!("fg")),
 			current:  index == current,
 			context:  row
 				.context
@@ -223,7 +225,7 @@ fn build(
 								<pre fg=fg bg=border>{" "}{row.provider}{" "}</pre>
 							</td>
 							<td truncate=start grow>
-								<pre fg=fg>{row.name}</pre>
+								<pre fg={row.color}>{row.name}</pre>
 								if row.current { <pre fg=ok>{current_mark.clone()}</pre> }
 							</td>
 							if show_context { <td align=end><pre fg=muted>{row.context}</pre></td> }
@@ -289,6 +291,7 @@ mod tests {
 		ModelRow {
 			key:         sf!("{provider}/{name}"),
 			name:        sf!(name),
+			color:       None,
 			provider_id: sf!(provider),
 			provider:    sf!(provider),
 			context:     None,
@@ -302,6 +305,7 @@ mod tests {
 		let row = ModelRow {
 			key:         sf!("p/m"),
 			name:        sf!("Model"),
+			color:       None,
 			provider_id: sf!("p"),
 			provider:    sf!("Provider"),
 			context:     None,

@@ -49,18 +49,14 @@ const COST_SHORT: &str = "$60.07";
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1900);
 
-fn main() -> io::Result<()> {
-	let executor = omp_executor::Executor::new(None);
-	executor.clone().block_on(run_app(executor))
-}
-
-async fn run_app(executor: omp_executor::Executor) -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
 	let caps = detect();
 	let charset = UiContext::default().with_terminal_caps(&caps).charset;
-	let mut terminal = Terminal::enter(executor.clone(), TerminalOptions::new(caps).mouse(true))?;
+	let mut terminal = Terminal::enter(TerminalOptions::new(caps).mouse(true))?;
 	let mut renderer = Renderer::new(TtyOut::new()?);
 	renderer.apply_caps(&caps)?;
-	match run(&executor, &mut terminal, &mut renderer, charset).await {
+	match run(&mut terminal, &mut renderer, charset).await {
 		Ok(()) => terminal.leave_alt(),
 		Err(error) => {
 			let _ = terminal.leave_alt();
@@ -70,7 +66,6 @@ async fn run_app(executor: omp_executor::Executor) -> io::Result<()> {
 }
 
 async fn run<'a>(
-	executor: &'a omp_executor::Executor,
 	terminal: &'a mut Terminal,
 	renderer: &'a mut Renderer<TtyOut>,
 	charset: Charset,
@@ -111,7 +106,7 @@ async fn run<'a>(
 				TerminalEvent::Debug(_) | TerminalEvent::Effect(_) => {},
 				TerminalEvent::Closed => return Ok(()),
 			},
-			() = executor.timer(FRAME_INTERVAL) => {},
+			() = tokio::time::sleep(FRAME_INTERVAL) => {},
 		}
 		if viewport.width == 0 || viewport.height == 0 {
 			continue;

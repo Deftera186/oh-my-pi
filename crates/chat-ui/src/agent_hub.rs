@@ -251,7 +251,7 @@ impl AgentHub {
 	}
 
 	fn rebuild(&mut self) {
-		self.selected = fold_anchor(&self.rows, self.selected);
+		self.selected = self.selected.min(self.rows.len().saturating_sub(1));
 		self.ui = build(&self.rows, self.selected, self.view, self.list_rows, self.width, &self.ctx);
 		self.ui.focus_first();
 		self.refresh_inspector();
@@ -373,44 +373,6 @@ fn review_badge(row: &AgentRow) -> Str {
 	}
 }
 
-fn batch_groups(rows: &[AgentRow]) -> BTreeMap<Str, Vec<usize>> {
-	let mut groups = BTreeMap::<Str, Vec<usize>>::new();
-	for (index, row) in rows.iter().enumerate() {
-		if !row.frozen
-			&& let Some(parent) = row.parent.as_ref()
-		{
-			groups.entry(parent.clone()).or_default().push(index);
-		}
-	}
-	groups.retain(|_, indexes| indexes.len() >= 4);
-	groups
-}
-
-fn fold_anchor(rows: &[AgentRow], selected: usize) -> usize {
-	let groups = batch_groups(rows);
-	groups
-		.values()
-		.find(|indexes| indexes.contains(&selected))
-		.and_then(|indexes| indexes.first().copied())
-		.unwrap_or(selected)
-}
-
-fn batch_label(parent: &str, indexes: &[usize], rows: &[AgentRow]) -> Str {
-	let mut counts = BTreeMap::<&str, usize>::new();
-	for index in indexes {
-		*counts.entry(rows[*index].status.as_str()).or_default() += 1;
-	}
-	let mut detail = String::new();
-	for (index, (status, count)) in counts.into_iter().enumerate() {
-		if index != 0 {
-			detail.push_str(" · ");
-		}
-		use std::fmt::Write as _;
-		let _ = write!(detail, "{status}:{count}");
-	}
-	sf!("{parent} batch · {} agents · {detail}", indexes.len())
-}
-
 fn build(
 	rows: &[AgentRow],
 	selected: usize,
@@ -419,15 +381,10 @@ fn build(
 	width: u16,
 	ctx: &UiContext,
 ) -> Ui {
-	let groups = batch_groups(rows);
 	let labels = rows
 		.iter()
 		.enumerate()
-		.filter_map(|(index, row)| {
-			let batch = groups.values().find(|indexes| indexes.contains(&index));
-			if batch.is_some_and(|indexes| indexes.first().copied() != Some(index)) {
-				return None;
-			}
+		.map(|(index, row)| {
 			let indent = if view == HubView::Tree {
 				"  ".repeat(usize::from(row.depth))
 			} else {
@@ -435,16 +392,13 @@ fn build(
 			};
 			let badge = review_badge(row);
 			let frozen = if row.frozen { " [frozen]" } else { "" };
-			let label = batch.map_or_else(
-				|| sf!("{indent}{}{frozen} {badge}", row.name),
-				|indexes| {
-					sf!(
-						"{indent}{}",
-						batch_label(row.parent.as_deref().unwrap_or("root"), indexes, rows)
-					)
-				},
-			);
-			Some((index, label, row))
+			let identity = if row.name == row.id {
+				row.name.clone()
+			} else {
+				sf!("{} · {}", row.name, row.id)
+			};
+			let label = sf!("{indent}{identity}{frozen} {badge}");
+			(index, label, row)
 		})
 		.collect::<Vec<_>>();
 	let title = match view {
@@ -472,8 +426,9 @@ fn build(
 				<row gap=2>
 					<select id="agent-hub-list" w={list_width} h={height}>
 						for (index, label, row) in labels {
-							<option value={sf!("{index}")} label={label} recommended={index == selected}>
-								<td truncate grow><pre fg=fg>{row.status.clone()}</pre></td>
+							<option value={sf!("{index}")} label={label.clone()} recommended={index == selected}>
+								<td truncate grow><pre fg=fg>{label}</pre></td>
+								<td truncate><pre fg=muted>{row.status.clone()}</pre></td>
 							</option>
 						}
 					</select>
@@ -488,8 +443,9 @@ fn build(
 			<col>
 				<select id="agent-hub-list" w={list_width} h={height}>
 					for (index, label, row) in labels {
-						<option value={sf!("{index}")} label={label} recommended={index == selected}>
-							<td truncate grow><pre fg=fg>{row.status.clone()}</pre></td>
+						<option value={sf!("{index}")} label={label.clone()} recommended={index == selected}>
+							<td truncate grow><pre fg=fg>{label}</pre></td>
+							<td truncate><pre fg=muted>{row.status.clone()}</pre></td>
 						</option>
 					}
 				</select>
@@ -553,5 +509,36 @@ mod tests {
 
 		let mut parked = AgentHub::open(&[row("parked", false, true)], &ctx);
 		assert_eq!(parked.handle_key(Key::Enter), AgentHubEvent::Revive(Str::new_static("agent")),);
+	}
+	#[test]
+	fn parallel_siblings_remain_individually_selectable() {
+		let ctx = UiContext::default();
+		let mut rows = ["alpha", "beta", "gamma", "delta"]
+			.into_iter()
+			.map(|id| {
+				let mut row = row("running", true, false);
+				row.id = Str::new(id);
+				row.name = Str::new(id);
+				row
+			})
+			.collect::<Vec<_>>();
+		let mut hub = AgentHub::open(&rows, &ctx);
+		let frame = hub.ui.frame();
+		let painted = (0..frame.size().height)
+			.map(|line| omp_tui::test_support::frame_row_text(frame, line))
+			.collect::<Vec<_>>()
+			.join("\n");
+		for id in ["alpha", "beta", "gamma", "delta"] {
+			assert!(painted.contains(id), "missing {id} from {painted:?}");
+		}
+
+		assert_eq!(hub.handle_key(Key::Down), AgentHubEvent::Consumed);
+		assert_eq!(hub.selected, 1);
+		assert_eq!(hub.handle_key(Key::Enter), AgentHubEvent::Steer(Str::new_static("beta")));
+
+		rows.remove(0);
+		hub.update_rows(&rows);
+		assert_eq!(hub.selected, 0);
+		assert_eq!(hub.handle_key(Key::Enter), AgentHubEvent::Steer(Str::new_static("beta")));
 	}
 }

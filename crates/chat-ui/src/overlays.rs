@@ -270,6 +270,7 @@ pub struct PromptOverlay {
 	masked:  bool,
 	ctx:     UiContext,
 	options: OverlayOptions,
+	value:   Str,
 }
 
 impl PromptOverlay {
@@ -287,6 +288,7 @@ impl PromptOverlay {
 				.anchor(OverlayAnchor::Center)
 				.width(Dim::Cells(56))
 				.z(20),
+			value: Str::default(),
 		}
 	}
 
@@ -294,7 +296,10 @@ impl PromptOverlay {
 	pub fn open_prefilled(title: impl IntoStr, value: impl IntoStr, ctx: &UiContext) -> Self {
 		let mut prompt = Self::open(title, false, ctx);
 		let value = value.into_str();
+		prompt.ui.blur();
 		prompt.ui.set_text("prompt-input", value.as_str());
+		prompt.ui.focus_first();
+		prompt.value = value;
 		prompt
 	}
 
@@ -303,13 +308,18 @@ impl PromptOverlay {
 		if key == Key::Esc {
 			return PromptEvent::Cancel;
 		}
+		if key == Key::Enter {
+			return PromptEvent::Submit(self.value.clone());
+		}
 		let event = self.ui.handle_key(key);
+		self.sync_value();
 		self.route(event)
 	}
 
 	/// Routes pasted text into the prompt input.
 	pub fn handle_paste(&mut self, text: &str) -> PromptEvent {
 		let event = self.ui.handle_paste(text);
+		self.sync_value();
 		self.route(event)
 	}
 
@@ -319,7 +329,10 @@ impl PromptOverlay {
 			.ui
 			.handle_mouse_as_layer(&self.options, viewport, col, row, kind)
 		{
-			Some(event) => self.route(event),
+			Some(event) => {
+				self.sync_value();
+				self.route(event)
+			},
 			None if kind == Mouse::Click => PromptEvent::Cancel,
 			None => PromptEvent::Consumed,
 		}
@@ -329,9 +342,9 @@ impl PromptOverlay {
 	pub fn layer(&mut self, viewport: Size) -> Layer<'_> {
 		let width = viewport.width.saturating_sub(4).clamp(1, 56);
 		if self.ui.frame().size().width != width {
-			let value = self.value();
+			let value = self.value.clone();
 			self.ui = build_prompt(&self.title, self.masked, width, &self.ctx);
-			self.ui.set_text("prompt-input", value);
+			self.ui.set_text("prompt-input", value.as_str());
 			self.ui.focus_first();
 		}
 		self.options = self.options.width(Dim::Cells(width));
@@ -341,7 +354,7 @@ impl PromptOverlay {
 	fn route(&self, event: UiEvent) -> PromptEvent {
 		match event {
 			UiEvent::Cancel => PromptEvent::Cancel,
-			UiEvent::Submit => PromptEvent::Submit(Str::new(self.value())),
+			UiEvent::Submit => PromptEvent::Submit(self.value.clone()),
 			UiEvent::None
 			| UiEvent::Changed { .. }
 			| UiEvent::Highlighted { .. }
@@ -355,11 +368,10 @@ impl PromptOverlay {
 		}
 	}
 
-	fn value(&self) -> String {
-		self.ui.values()["prompt-input"]
-			.as_str()
-			.unwrap_or_default()
-			.to_owned()
+	fn sync_value(&mut self) {
+		if let Some(value) = self.ui.values()["prompt-input"].as_str() {
+			self.value = Str::new(value);
+		}
 	}
 }
 
@@ -405,10 +417,10 @@ mod tests {
 	fn prefilled_prompt_submits_default_or_custom_destination() {
 		let mut suggested =
 			PromptOverlay::open_prefilled("Save", "TOPIC_PLAN.md", &UiContext::default());
-		assert!(matches!(
-			suggested.handle_key(Key::Enter),
-			PromptEvent::Submit(path) if path == "TOPIC_PLAN.md"
-		));
+		match suggested.handle_key(Key::Enter) {
+			PromptEvent::Submit(path) => assert_eq!(path, "TOPIC_PLAN.md"),
+			PromptEvent::Consumed | PromptEvent::Cancel => panic!("prefilled prompt did not submit"),
+		}
 
 		let mut custom =
 			PromptOverlay::open_prefilled("Save", "TOPIC_PLAN.md", &UiContext::default());

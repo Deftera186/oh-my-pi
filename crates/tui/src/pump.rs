@@ -16,7 +16,7 @@
 //! - Keymap edits arrive as actor commands ([`Pump::set_keymap`]) and apply
 //!   before the next decoded chord.
 //!
-//! The byte source is an [`async_io::Async`] wherever the platform can poll the
+//! The byte source is an [`AsyncFd`] wherever the platform can poll the
 //! terminal handle (Linux and other non-macOS Unix, plus every pipe or pty
 //! in tests); macOS `/dev/tty` and Windows `CONIN$` are not readiness-
 //! pollable, so those bridge through a minimal reader thread whose only job
@@ -30,11 +30,9 @@ use std::os::fd;
 use std::{fs::File, future, io, mem, sync, sync::atomic, thread, time::Instant};
 
 use flume::Receiver;
-#[cfg(unix)]
-use futures_lite::StreamExt as _;
-#[cfg(unix)]
-use omp_executor::signal::{self, Signals};
 use parking_lot::Mutex;
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
 use crate::input::{InputDecoder, InputEvent, Keymap};
@@ -158,7 +156,7 @@ pub fn publish_ingress_for_test() -> Receiver<TerminalEvent> {
 /// Handle to a running event actor; stopping is idempotent and dropping
 /// stops it.
 pub struct Pump {
-	task:   Option<omp_executor::Task<()>>,
+	task:   tokio::task::JoinHandle<()>,
 	bridge: Option<Bridge>,
 	ctl:    flume::Sender<Ctl>,
 }
@@ -188,7 +186,7 @@ impl Pump {
 	/// Called by [`crate::Terminal::leave`] before the teardown drain reads
 	/// the descriptor directly.
 	pub(crate) fn stop(&mut self) {
-		drop(self.task.take());
+		self.task.abort();
 		if let Some(bridge) = self.bridge.as_mut() {
 			bridge.stop.store(true, atomic::Ordering::Release);
 			if let Some(worker) = bridge.worker.take() {
@@ -220,7 +218,7 @@ enum ByteSource {
 	/// Readiness-pollable handle (non-macOS Unix terminals; test pipes and
 	/// ptys everywhere on Unix).
 	#[cfg(unix)]
-	Fd(async_io::Async<fd::OwnedFd>),
+	Fd(AsyncFd<fd::OwnedFd>),
 	/// Reader-thread bridge for handles the OS cannot poll.
 	Thread(Receiver<Vec<u8>>),
 }
@@ -234,13 +232,13 @@ impl ByteSource {
 		match self {
 			#[cfg(unix)]
 			Self::Fd(fd) => loop {
-				fd.readable().await?;
+				let mut guard = fd.readable().await?;
 				let mut bytes = [0_u8; 4096];
-				match read_fd(fd.get_ref(), &mut bytes) {
-					Ok(0) => return Ok(None),
-					Ok(read) => return Ok(Some(bytes[..read].to_vec())),
-					Err(error) if error.kind() == io::ErrorKind::WouldBlock => {},
-					Err(error) => return Err(error),
+				match guard.try_io(|fd| read_fd(fd.get_ref(), &mut bytes)) {
+					Ok(Ok(0)) => return Ok(None),
+					Ok(Ok(read)) => return Ok(Some(bytes[..read].to_vec())),
+					Ok(Err(error)) => return Err(error),
+					Err(_) => {},
 				}
 			},
 			Self::Thread(rx) => Ok(rx.recv_async().await.ok()),
@@ -268,8 +266,11 @@ fn read_fd(fd: &fd::OwnedFd, bytes: &mut [u8]) -> io::Result<usize> {
 /// Spawns the event actor over `input` with `decoder`, seeded with
 /// `preserved` bytes from capability negotiation. On Unix, the actor owns
 /// the process SIGWINCH stream.
+///
+/// # Panics
+///
+/// Panics outside a tokio runtime.
 pub fn spawn(
-	executor: &omp_executor::Executor,
 	input: Input,
 	mut decoder: InputDecoder,
 	preserved: &[u8],
@@ -282,16 +283,18 @@ pub fn spawn(
 
 	let (source, bridge) = input.into_source()?;
 	#[cfg(unix)]
-	let resize = watch_resize.then(|| Signals::new(&[signal::Signal::SIGWINCH]));
+	let resize = watch_resize
+		.then(|| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()))
+		.transpose()?;
 	#[cfg(windows)]
 	let resize = ();
 
 	let mut events = Vec::new();
 	decoder.feed(preserved, Instant::now(), &mut events);
 
-	let task = executor.spawn(actor(source, decoder, events, events_tx, ctl_rx, resize, resize_tx));
+	let task = tokio::spawn(actor(source, decoder, events, events_tx, ctl_rx, resize, resize_tx));
 	Ok(PumpChannels {
-		pump:   Pump { task: Some(task), bridge, ctl: ctl_tx },
+		pump:   Pump { task, bridge, ctl: ctl_tx },
 		events: events_rx,
 		resize: resize_rx,
 	})
@@ -324,7 +327,7 @@ impl Input {
 				{
 					return Err(io::Error::last_os_error());
 				}
-				let fd = async_io::Async::new(fd::OwnedFd::from(file))?;
+				let fd = AsyncFd::new(fd::OwnedFd::from(file))?;
 				Ok((ByteSource::Fd(fd), None))
 			},
 			Self::Bridged(file) => {
@@ -419,7 +422,7 @@ async fn actor(
 	mut events: Vec<InputEvent>,
 	events_tx: flume::Sender<TerminalEvent>,
 	ctl_rx: Receiver<Ctl>,
-	#[cfg(unix)] mut resize: Option<Signals>,
+	#[cfg(unix)] mut resize: Option<tokio::signal::unix::Signal>,
 	#[cfg(windows)] resize: (),
 	resize_tx: watch::Sender<u64>,
 ) {
@@ -501,11 +504,15 @@ fn apply_ctl(
 
 /// Resolves once the next SIGWINCH arrives.
 #[cfg(unix)]
-async fn resize_readable(resize: &mut Option<Signals>) {
-	let Some(resize) = resize else {
-		return future::pending().await;
-	};
-	let _ = resize.next().await;
+async fn resize_readable(resize: &mut Option<tokio::signal::unix::Signal>) {
+	match resize {
+		Some(signal) => {
+			if signal.recv().await.is_none() {
+				future::pending().await
+			}
+		},
+		None => future::pending().await,
+	}
 }
 
 #[cfg(windows)]
@@ -517,7 +524,7 @@ async fn resize_readable(_resize: ()) {
 async fn deadline(at: Option<Instant>) {
 	match at {
 		Some(at) => {
-			async_io::Timer::at(at).await;
+			tokio::time::sleep_until(at.into()).await;
 		},
 		None => future::pending().await,
 	}

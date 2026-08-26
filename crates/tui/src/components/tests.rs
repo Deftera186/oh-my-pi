@@ -1270,6 +1270,16 @@ fn icon_catalog_resolves_short_names_and_qualified_aliases() {
 }
 
 #[test]
+fn icon_takes_coloring_attributes_directly() {
+	let ctx = UiContext { charset: Charset::Ascii, ..UiContext::default() };
+	for markup in ["<icon color=err>error</icon>", "<icon fg=err icon=error/>"] {
+		let ui = Ui::from_markup(markup, 6, ctx.clone()).unwrap();
+		assert_eq!(frame_row_text(ui.frame(), 0), "[!!]", "{markup}");
+		assert_eq!(frame_cell_style(ui.frame(), 0, 0).foreground_color(), ctx.theme.err, "{markup}");
+	}
+}
+
+#[test]
 fn callout_icon_accepts_short_catalog_names() {
 	let ui = Ui::from_markup("<callout icon=folder title=Files>body</callout>", 30, UiContext {
 		charset: Charset::Ascii,

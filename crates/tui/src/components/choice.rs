@@ -82,13 +82,19 @@ impl Choice {
 			return;
 		}
 		self.rich.clear();
+		let base = self.props.style(&ctx.theme);
+		let style = if self.props.foreground(&ctx.theme).is_some() {
+			base
+		} else {
+			base.fg(ctx.theme.fg)
+		};
 		let mut wrap = (&mut self.rich).wrap(label_width);
 		for (index, line) in self.text.split("\n").enumerate() {
 			if index > 0 {
 				wrap.newline();
 			}
 			if !line.is_empty() {
-				wrap.run(Style::new().fg(ctx.theme.fg), line.as_str());
+				wrap.run(style, line.as_str());
 			}
 		}
 		wrap.finish();
@@ -153,11 +159,16 @@ impl Component for Choice {
 				rect.x,
 				rect.y,
 				mark,
-				Style::new().fg(if selected {
-					pc.ctx.theme.accent
-				} else {
-					pc.ctx.theme.muted
-				}),
+				self.props.foreground(&pc.ctx.theme).map_or_else(
+					|| {
+						Style::new().fg(if selected {
+							pc.ctx.theme.accent
+						} else {
+							pc.ctx.theme.muted
+						})
+					},
+					|color| Style::new().fg(color),
+				),
 			);
 		}
 		if self.text.is_empty() {
@@ -195,7 +206,7 @@ mod tests {
 	use crate::{
 		Charset, UiContext,
 		component::{Component, EventCtx, Flow, HitTag, PaintCtx},
-		frame::{Frame, Rect, Size},
+		frame::{Color, Frame, Rect, Size},
 		input::{Key, Mouse},
 		props::Prop,
 		rich::cell_width,
@@ -259,6 +270,17 @@ mod tests {
 					"display choices do not handle input or emit events",
 				);
 			}
+		}
+	}
+
+	#[test]
+	fn explicit_foreground_recolors_mark_and_label() {
+		let custom = Color::Rgb(7, 8, 9);
+		for prop in [Prop::Fg, Prop::Color] {
+			let mut choice = Choice::new().with(prop, custom).text("label");
+			let (frame, _) = paint(&mut choice, Charset::Ascii, 20);
+			assert_eq!(frame.cell(0, 0).style.foreground_color(), custom, "mark tint");
+			assert_eq!(frame.cell(4, 0).style.foreground_color(), custom, "label tint");
 		}
 	}
 

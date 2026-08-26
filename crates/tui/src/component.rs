@@ -1182,7 +1182,7 @@ fn paint_border(
 	// falls back to the theme's border tone.
 	let edge_color = props.edge(&pc.ctx.theme);
 	let solid = edge_color.unwrap_or_else(|| {
-		if props.contains(Prop::Fg) {
+		if props.has_foreground() {
 			base.foreground_color()
 		} else {
 			pc.ctx.theme.border
@@ -1200,7 +1200,7 @@ fn paint_border(
 		base.fg(Color::Default)
 	} else if edge_color.is_some() {
 		base.fg(solid)
-	} else if props.contains(Prop::Fg) {
+	} else if props.has_foreground() {
 		base.dim()
 	} else {
 		base.fg(solid)

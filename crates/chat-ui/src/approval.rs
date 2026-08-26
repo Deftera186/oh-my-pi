@@ -14,8 +14,6 @@ const SUBJECT_MARGIN: u16 = 10;
 pub enum ApprovalEvent {
 	/// Event consumed while the dialog remains open.
 	Consumed,
-	/// The user dismissed the dialog without deciding.
-	Cancel,
 	/// The user selected a terminal action.
 	Decide(ApprovalAction),
 	/// The user requested an amended subject.
@@ -50,6 +48,11 @@ impl ApprovalOverlay {
 		&self.ticket.ticket_id
 	}
 
+	/// Borrows the complete durable ticket projection.
+	pub const fn ticket(&self) -> &ApprovalTicketView {
+		&self.ticket
+	}
+
 	/// Routes one key through the dialog.
 	pub fn handle_key(&mut self, key: Key) -> ApprovalEvent {
 		let event = self.ui.handle_key(key);
@@ -75,7 +78,7 @@ impl ApprovalOverlay {
 			.handle_mouse_as_layer(&self.options, viewport, col, row, kind)
 		{
 			Some(event) => Self::route(event),
-			None if kind == Mouse::Click => ApprovalEvent::Cancel,
+			None if kind == Mouse::Click => ApprovalEvent::Consumed,
 			None => ApprovalEvent::Consumed,
 		}
 	}
@@ -89,7 +92,7 @@ impl ApprovalOverlay {
 
 	fn route(event: UiEvent) -> ApprovalEvent {
 		match event {
-			UiEvent::Cancel => ApprovalEvent::Cancel,
+			UiEvent::Cancel => ApprovalEvent::Consumed,
 			UiEvent::Changed { value, .. } => match value.as_str() {
 				"once" => ApprovalEvent::Decide(ApprovalAction::AllowOnce),
 				"always" => ApprovalEvent::Decide(ApprovalAction::AllowAlways),
@@ -175,4 +178,33 @@ pub fn middle_elide(text: &str, max_chars: usize) -> Str {
 		.rev()
 		.collect();
 	Str::new(format!("{prefix}...{suffix}"))
+}
+#[cfg(test)]
+mod tests {
+	use omp_tui::{Key, Mouse, Size, UiContext};
+
+	use super::{ApprovalEvent, ApprovalOverlay};
+	use crate::ApprovalTicketView;
+
+	fn ticket() -> ApprovalTicketView {
+		ApprovalTicketView {
+			ticket_id:     "ticket".into(),
+			invocation_id: Some("invocation".into()),
+			title:         "Approval".into(),
+			detail:        "Policy detail".into(),
+			subject:       "bash command".into(),
+			always_scope:  None,
+			evidence:      Vec::new(),
+		}
+	}
+
+	#[test]
+	fn escape_and_outside_click_keep_durable_ticket_mounted() {
+		let mut overlay = ApprovalOverlay::open(ticket(), &UiContext::default());
+		assert!(matches!(overlay.handle_key(Key::Esc), ApprovalEvent::Consumed));
+		assert!(matches!(
+			overlay.handle_mouse(0, 0, Mouse::Click, Size::new(120, 40)),
+			ApprovalEvent::Consumed
+		));
+	}
 }

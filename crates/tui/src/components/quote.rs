@@ -4,7 +4,7 @@ use super::text::{append, put_clipped};
 use crate::{
 	UiContext,
 	component::{Component, MemoKey, PaintCtx, Slot, next_slot},
-	frame::{Color, Rect, Style},
+	frame::{Rect, Style},
 	props::{Prop, PropValue, Props},
 	rich::{Pipeline, RichSink, RichText, cell_width},
 };
@@ -55,33 +55,21 @@ impl Quote {
 			.is_some_and(|kind| kind == "error")
 	}
 
-	fn explicit_color(&self, ctx: &UiContext) -> Option<Color> {
-		self
-			.props
-			.color(Prop::Fg, &ctx.theme)
-			.or_else(|| self.props.color(Prop::Color, &ctx.theme))
-	}
-
 	fn text_style(&self, ctx: &UiContext) -> Style {
 		let style = self.props.style(&ctx.theme);
-		if let Some(color) = self.explicit_color(ctx) {
-			style.fg(color)
-		} else if self.is_error() {
-			style.fg(ctx.theme.err)
-		} else {
-			style
+		if self.props.foreground(&ctx.theme).is_none() && self.is_error() {
+			return style.fg(ctx.theme.err);
 		}
+		style
 	}
 
 	fn gutter_style(&self, ctx: &UiContext) -> Style {
-		let color = self.explicit_color(ctx).unwrap_or_else(|| {
-			if self.is_error() {
-				ctx.theme.err
-			} else {
-				ctx.theme.muted
-			}
-		});
-		self.props.style(&ctx.theme).fg(color)
+		let style = self.props.style(&ctx.theme);
+		match self.props.foreground(&ctx.theme) {
+			Some(_) => style,
+			None if self.is_error() => style.fg(ctx.theme.err),
+			None => style.fg(ctx.theme.muted),
+		}
 	}
 
 	fn render(&mut self, ctx: &UiContext, width: u16) {

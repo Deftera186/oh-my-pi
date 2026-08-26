@@ -195,7 +195,10 @@ impl Component for Fact {
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		let geometry = self.geometry(pc.ctx, rect.width);
 		if geometry.label_width > 0 && rect.height > 0 && rect.y < pc.clip {
-			let style = self.props.style(&pc.ctx.theme).fg(pc.ctx.theme.muted);
+			let mut style = self.props.style(&pc.ctx.theme);
+			if self.props.foreground(&pc.ctx.theme).is_none() {
+				style = style.fg(pc.ctx.theme.muted);
+			}
 			put_clipped(
 				pc.frame,
 				rect.x,
@@ -273,6 +276,21 @@ mod tests {
 		assert_eq!(frame_row_text(&frame, 0), "value");
 		let (_, frame) = paint(Fact::new().label("Kind"), 3);
 		assert_eq!(frame_row_text(&frame, 0), "Kin");
+	}
+
+	#[test]
+	fn explicit_foreground_recolors_the_label() {
+		let custom = Color::Rgb(4, 5, 6);
+		for prop in [Prop::Fg, Prop::Color] {
+			let (_, frame) = paint(
+				Fact::new()
+					.label("Kind")
+					.with(prop, custom)
+					.child(TextLeaf::new().text("v")),
+				12,
+			);
+			assert_eq!(frame_cell_style(&frame, 0, 0).foreground_color(), custom);
+		}
 	}
 
 	#[test]

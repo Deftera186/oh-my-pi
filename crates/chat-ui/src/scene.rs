@@ -13,7 +13,7 @@ use std::{
 use omp_core::{IntoStr, Str, StrMut, fmts_mut, sf};
 use omp_tui::{
 	Border, Cached, Charset, Color, Command, Component, Decor, DecorKind, Frame, HistoryReplay,
-	Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, Props, PropValue, Rect, Size, SlashCommands, Slot,
+	Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, PropValue, Props, Rect, Size, Slot,
 	SpellingFeatures, Style, Theme, Ui, UiContext, UiEvent,
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
@@ -30,8 +30,9 @@ use smallvec::SmallVec;
 use crate::{
 	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
 	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel, TodoHud,
-	TranscriptFrame, TranscriptFrameKind,
+	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind,
 	blocks::{BlockOrdinal, Blocks},
+	completion::{CompletionChain, ReloadableSlashCommands},
 	frame::{FrameError, FrameMutation, RetainedFrames, render_frame_tml},
 	slots::{Mount, Slots},
 };
@@ -43,6 +44,9 @@ const TOOL_IMAGE_MAX_ROWS: u16 = 12;
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1900);
 const BRAND_FADE: Duration = Duration::from_millis(450);
 const FADE_FRAME: Duration = Duration::from_millis(40);
+const STREAM_REVEAL_FRAME: Duration = Duration::from_millis(33);
+const STREAM_REVEAL_MIN: usize = 3;
+const STREAM_REVEAL_MAX: usize = 64;
 const SPECULATION_PULSE: Duration = Duration::from_millis(600);
 const STATUS_ID: &str = "status";
 
@@ -539,8 +543,12 @@ pub enum ChatKey {
 	Consumed,
 	/// The composer did not handle the key.
 	Ignored,
-	/// The scene requested host shutdown.
-	Quit,
+	/// Clear the composer or shut down when repeated within the host window.
+	Clear,
+	/// Request orderly host shutdown while preserving the current draft.
+	Exit,
+	/// Ask the backend voice coordinator to start or stop a session.
+	ToggleLive,
 }
 
 #[derive(Clone, Copy)]
@@ -568,9 +576,7 @@ impl RichText {
 	}
 
 	fn view(text: &str, width: u16, ctx: &UiContext) -> Option<Ui> {
-		(!text.contains("</md>"))
-			.then(|| Ui::from_markup(format!("<md>{text}</md>"), width, ctx.clone()).ok())
-			.flatten()
+		Some(Ui::from_root(Markdown::new().text(Str::new(text)), width.max(1), ctx.clone()))
 	}
 
 	fn resize(&mut self, width: u16, ctx: &UiContext) {
@@ -635,6 +641,25 @@ impl ToolView {
 		let chrome = Self::probe_chrome(&rendered);
 		Self { source, width, rendered, chrome, plain: false }
 	}
+
+	fn plain(source: Str, width: u16, ctx: &UiContext) -> Self {
+		let rendered = Ui::from_root(
+			TextLeaf::new()
+				.with(Prop::Wrap, "char")
+				.text(source.clone()),
+			width.max(1),
+			ctx.clone(),
+		);
+		Self { source, width, rendered, chrome: ViewChrome::Card, plain: true }
+	}
+
+	fn from_content(content: ToolViewContent, width: u16, ctx: &UiContext) -> Self {
+		match content {
+			ToolViewContent::Markup(source) => Self::structured(source, width, ctx),
+			ToolViewContent::Plain(source) => Self::plain(source, width, ctx),
+		}
+	}
+
 	/// Reads the renderer's `chrome` request from the parsed root element.
 	fn probe_chrome(rendered: &Ui) -> ViewChrome {
 		match rendered.root_custom("chrome") {
@@ -651,7 +676,11 @@ impl ToolView {
 		{
 			return root;
 		}
-		Cached::new(Box::new(TextLeaf::new().text(self.source.clone())))
+		Cached::new(Box::new(
+			TextLeaf::new()
+				.with(Prop::Wrap, "char")
+				.text(self.source.clone()),
+		))
 	}
 
 	fn render(source: &Str, width: u16, ctx: &UiContext) -> Ui {
@@ -660,22 +689,24 @@ impl ToolView {
 		})
 	}
 
-	fn replace(&mut self, source: Str, ctx: &UiContext) {
-		if self.source == source {
-			return;
+	fn replace_content(&mut self, content: ToolViewContent, ctx: &UiContext) {
+		let replacement = Self::from_content(content, self.width, ctx);
+		if self.source != replacement.source || self.plain != replacement.plain {
+			*self = replacement;
 		}
-		self.rendered = Self::render(&source, self.width, ctx);
-		self.chrome = Self::probe_chrome(&self.rendered);
-		self.source = source;
-		self.plain = false;
 	}
 
 	fn append_plain(&mut self, chunk: &str, ctx: &UiContext) {
 		let mut source = self.source.to_string();
 		source.push_str(chunk);
 		let source = Str::new(source);
-		self.rendered =
-			Ui::from_root(TextLeaf::new().text(source.clone()), self.width.max(1), ctx.clone());
+		self.rendered = Ui::from_root(
+			TextLeaf::new()
+				.with(Prop::Wrap, "char")
+				.text(source.clone()),
+			self.width.max(1),
+			ctx.clone(),
+		);
 		self.source = source;
 		self.chrome = ViewChrome::Card;
 		self.plain = true;
@@ -686,7 +717,13 @@ impl ToolView {
 		if self.width != width {
 			self.width = width;
 			self.rendered = if self.plain {
-				Ui::from_root(TextLeaf::new().text(self.source.clone()), width, ctx.clone())
+				Ui::from_root(
+					TextLeaf::new()
+						.with(Prop::Wrap, "char")
+						.text(self.source.clone()),
+					width,
+					ctx.clone(),
+				)
 			} else {
 				Self::render(&self.source, width, ctx)
 			};
@@ -700,7 +737,7 @@ impl ToolView {
 
 struct ToolEntry {
 	label:    Str,
-	ok:       Option<bool>,
+	terminal: ToolTerminal,
 	expanded: bool,
 	view:     ToolView,
 	images:   Vec<ToolImageEntry>,
@@ -805,13 +842,15 @@ fn append_thinking_ellipsis(lines: &mut Vec<String>) {
 }
 
 struct LiveAssistant {
-	ordinal:    BlockOrdinal,
-	id:         Str,
-	text:       StrMut,
-	view:       Ui,
-	started:    Duration,
-	thinking:   bool,
-	allocation: u16,
+	ordinal:     BlockOrdinal,
+	id:          Str,
+	text:        StrMut,
+	revealed:    usize,
+	last_reveal: Duration,
+	view:        Ui,
+	started:     Duration,
+	thinking:    bool,
+	allocation:  u16,
 }
 
 impl LiveAssistant {
@@ -821,13 +860,97 @@ impl LiveAssistant {
 			.with(Prop::Partial, true)
 			.text("");
 		let view = Ui::from_root(markdown, width.max(1), ctx.clone());
-		Self { ordinal, id, text: StrMut::new(""), view, started, thinking: false, allocation: 0 }
+		Self {
+			ordinal,
+			id,
+			text: StrMut::new(""),
+			revealed: 0,
+			last_reveal: started,
+			view,
+			started,
+			thinking: false,
+			allocation: 0,
+		}
 	}
 
-	fn append(&mut self, delta: &str) {
+	fn append(&mut self, delta: &str, smooth: bool, now: Duration) -> bool {
+		let caught_up = self.revealed == self.text.len();
+		let was_empty = self.text.is_empty();
 		self.text.push_str(delta);
-		let _ = self.view.set_text(LIVE_ASSISTANT_ID, self.text.as_str());
 		self.thinking |= self.text.as_str().starts_with("*Thinking:* ");
+		if !smooth {
+			return self.flush();
+		}
+		if caught_up {
+			self.last_reveal = if was_empty { Duration::ZERO } else { now };
+		}
+		false
+	}
+
+	fn advance(&mut self, now: Duration, smooth: bool) -> bool {
+		if !smooth {
+			return self.flush();
+		}
+		if self.revealed >= self.text.len() {
+			return false;
+		}
+		let frames =
+			now.saturating_sub(self.last_reveal).as_millis() / STREAM_REVEAL_FRAME.as_millis();
+		if frames == 0 {
+			return false;
+		}
+		let backlog = xutf::graphemes_str(&self.text.as_str()[self.revealed..]).count();
+		// Hold the final cluster until a later cluster or an ordering boundary
+		// proves its boundary. Provider chunks can split a base character from
+		// combining marks or a ZWJ sequence.
+		let revealable = if frames >= 2 {
+			backlog
+		} else {
+			backlog.saturating_sub(1)
+		};
+		if revealable == 0 {
+			return false;
+		}
+		let per_frame = STREAM_REVEAL_MIN
+			.max(revealable.div_ceil(8))
+			.min(STREAM_REVEAL_MAX);
+		let frame_count = usize::try_from(frames).unwrap_or(usize::MAX).min(4);
+		self.last_reveal = now;
+		self.reveal(per_frame.saturating_mul(frame_count).min(revealable))
+	}
+
+	fn reveal(&mut self, count: usize) -> bool {
+		let tail = &self.text.as_str()[self.revealed..];
+		let bytes = xutf::graphemes_str(tail)
+			.take(count)
+			.map(str::len)
+			.sum::<usize>();
+		if bytes == 0 {
+			return false;
+		}
+		self.revealed = self.revealed.saturating_add(bytes).min(self.text.len());
+		let _ = self
+			.view
+			.set_text(LIVE_ASSISTANT_ID, &self.text.as_str()[..self.revealed]);
+		true
+	}
+
+	fn flush(&mut self) -> bool {
+		if self.revealed >= self.text.len() {
+			return false;
+		}
+		self.revealed = self.text.len();
+		let _ = self.view.set_text(LIVE_ASSISTANT_ID, self.text.as_str());
+		true
+	}
+
+	fn next_reveal(&self) -> Option<Duration> {
+		let backlog = xutf::graphemes_str(&self.text.as_str()[self.revealed..]).count();
+		(backlog > 0).then_some(self.last_reveal.saturating_add(if backlog == 1 {
+			STREAM_REVEAL_FRAME.saturating_mul(2)
+		} else {
+			STREAM_REVEAL_FRAME
+		}))
 	}
 
 	fn resize(&mut self, width: u16) {
@@ -1334,56 +1457,61 @@ impl ChatStatus {
 					.with(Prop::Fg, speculation_color.unwrap_or(color)),
 			);
 		}
-		let spend = spend_label(facts.cost_nanos, facts.model_subscription, self.charset);
-		if !spend.is_empty() {
-			status = status.segment(
-				Segment::new()
-					.label(spend)
-					.with(Prop::Fg, self.theme.secondary),
-			);
-		}
-		let advisor_spend =
-			advisor_spend_label(facts.advisor_cost_nanos, facts.advisor_subscription, self.charset);
-		if !advisor_spend.is_empty() {
-			status = status.segment(
-				Segment::new()
-					.label(advisor_spend)
-					.with(Prop::Fg, self.theme.secondary),
-			);
-		}
-		if let Some(queued) = &work.labels.queued {
-			status = status.segment(
-				Segment::new()
-					.label(queued.clone())
-					.with(Prop::Fg, self.theme.warn),
-			);
-		}
-		if let Some(jobs) = &work.labels.jobs {
-			status = status.segment(
-				Segment::new()
-					.label(jobs.clone())
-					.with(Prop::Fg, self.theme.info),
-			);
-		}
-		if let Some(attempt) = &work.labels.attempt {
-			status = status.segment(
-				Segment::new()
-					.label(attempt.clone())
-					.with(Prop::Fg, self.theme.warn),
-			);
-		}
-		if let Some(dropped) = &work.labels.dropped {
-			status = status.segment(
-				Segment::new()
-					.label(dropped.clone())
-					.with(Prop::Fg, self.theme.err),
-			);
+		if facts.layout != StatusLayout::Minimal {
+			let spend = spend_label(facts.cost_nanos, facts.model_subscription, self.charset);
+			if !spend.is_empty() {
+				status = status.segment(
+					Segment::new()
+						.label(spend)
+						.with(Prop::Fg, self.theme.secondary),
+				);
+			}
+			let advisor_spend =
+				advisor_spend_label(facts.advisor_cost_nanos, facts.advisor_subscription, self.charset);
+			if !advisor_spend.is_empty() {
+				status = status.segment(
+					Segment::new()
+						.label(advisor_spend)
+						.with(Prop::Fg, self.theme.secondary),
+				);
+			}
+			if let Some(queued) = &work.labels.queued {
+				status = status.segment(
+					Segment::new()
+						.label(queued.clone())
+						.with(Prop::Fg, self.theme.warn),
+				);
+			}
+			if let Some(jobs) = &work.labels.jobs {
+				status = status.segment(
+					Segment::new()
+						.label(jobs.clone())
+						.with(Prop::Fg, self.theme.info),
+				);
+			}
+			if let Some(attempt) = &work.labels.attempt {
+				status = status.segment(
+					Segment::new()
+						.label(attempt.clone())
+						.with(Prop::Fg, self.theme.warn),
+				);
+			}
+			if let Some(dropped) = &work.labels.dropped {
+				status = status.segment(
+					Segment::new()
+						.label(dropped.clone())
+						.with(Prop::Fg, self.theme.err),
+				);
+			}
 		}
 		status
 	}
 
 	fn has_more(&self) -> bool {
 		let facts = &self.work.borrow().facts;
+		if facts.layout == StatusLayout::Minimal {
+			return facts.context_tokens > 0 || facts.context_window.is_some();
+		}
 		facts.live_activity.is_some()
 			|| facts.git.is_some()
 			|| facts.tokens_per_second.is_some()
@@ -1583,6 +1711,7 @@ pub struct Chat {
 	started_at:              Instant,
 	ctx:                     UiContext,
 	editor_ui:               Ui,
+	slash_commands:          ReloadableSlashCommands,
 	attachments:             Attachments,
 	pending_submit:          VecDeque<(String, Vec<Attachment>, SubmitMode)>,
 	copied:                  Option<Str>,
@@ -1622,6 +1751,7 @@ pub struct Chat {
 	live_voice:              Option<LiveVoiceVisualizer>,
 	live_voice_action:       Option<LiveVoiceAction>,
 	reduced_motion:          bool,
+	smooth_streaming:        bool,
 	suppress_history_replay: bool,
 	hide_thinking:           bool,
 }
@@ -1639,8 +1769,10 @@ impl Chat {
 			fade: Tween::settled(ctx.theme.muted),
 		}));
 		let style = ComposerStyle::default();
+		let slash_commands = ReloadableSlashCommands::new(Vec::new(), |_| 0);
 		let pane = EditorPane::new()
 			.composer_style(style)
+			.completion(Box::new(slash_commands.clone()))
 			.with(Prop::Id, INPUT_ID)
 			.with(Prop::Submit, true)
 			.status(ChatStatus::new(Rc::clone(&work), ctx.charset, ctx.theme, style));
@@ -1651,6 +1783,7 @@ impl Chat {
 			started_at: Instant::now(),
 			ctx: ctx.clone(),
 			editor_ui,
+			slash_commands,
 			attachments,
 			pending_submit: VecDeque::new(),
 			copied: None,
@@ -1686,6 +1819,7 @@ impl Chat {
 			live_voice: None,
 			live_voice_action: None,
 			reduced_motion: false,
+			smooth_streaming: true,
 			suppress_history_replay: false,
 			hide_thinking: false,
 		}
@@ -1779,6 +1913,11 @@ impl Chat {
 		self.live_voice.as_mut()
 	}
 
+	/// Whether realtime voice currently owns composer input.
+	pub const fn live_voice_active(&self) -> bool {
+		self.live_voice.is_some()
+	}
+
 	/// Takes the most recent mute/close action.
 	pub const fn take_live_voice_action(&mut self) -> Option<LiveVoiceAction> {
 		self.live_voice_action.take()
@@ -1787,12 +1926,7 @@ impl Chat {
 	/// Routes a key through the composer.
 	pub fn handle_key(&mut self, key: Key) -> ChatKey {
 		if key == Key::Ctrl('l') {
-			if self.live_voice.is_some() {
-				self.stop_live_voice();
-			} else {
-				self.start_live_voice();
-			}
-			return ChatKey::Consumed;
+			return ChatKey::ToggleLive;
 		}
 		if let Some(visualizer) = self.live_voice.as_mut() {
 			self.live_voice_action = match key {
@@ -1824,6 +1958,12 @@ impl Chat {
 			self.stage_submission(SubmitMode::FollowUp);
 			return ChatKey::Consumed;
 		}
+		if key == Key::Ctrl('c') {
+			return ChatKey::Clear;
+		}
+		if key == Key::Ctrl('d') {
+			return ChatKey::Exit;
+		}
 		match self.editor_ui.handle_key(key) {
 			UiEvent::Submit => {
 				self.stage_submission(SubmitMode::Steer);
@@ -1833,7 +1973,6 @@ impl Chat {
 				self.copied = Some(text);
 				ChatKey::Consumed
 			},
-			UiEvent::None if key == Key::Ctrl('c') => ChatKey::Quit,
 			UiEvent::None if key == Key::Esc => ChatKey::Ignored,
 			UiEvent::None => ChatKey::Consumed,
 			_ => ChatKey::Consumed,
@@ -1901,18 +2040,8 @@ impl Chat {
 				.find(|(_, top, height)| report.row == *top && *height > 0)
 				.map(|(ordinal, ..)| *ordinal);
 			if let Some(ordinal) = hit
-				&& let Some(tool) = self
-					.live_tools
-					.iter_mut()
-					.find(|tool| tool.ordinal == ordinal)
+				&& self.toggle_tool_ordinal(ordinal)
 			{
-				tool.expanded = !tool.expanded;
-				if tool.expanded && tool.body_folded {
-					tool.body_folded = false;
-					tool
-						.card_ui
-						.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| card.set_folded(false));
-				}
 				return;
 			}
 		}
@@ -1936,6 +2065,14 @@ impl Chat {
 		self.pending_submit.pop_front()
 	}
 
+	/// Stages the current composer contents as one immediate submission.
+	///
+	/// This follows the same queue splitting and attachment extraction path as
+	/// pressing Enter, and is intended for hosts with an initial message.
+	pub fn submit_composer(&mut self) {
+		self.stage_submission(SubmitMode::Steer);
+	}
+
 	/// Clones the staged attachment descriptors for read-only overlays.
 	pub fn composer_attachments(&self) -> Vec<Attachment> {
 		self.attachments.snapshot()
@@ -1944,6 +2081,13 @@ impl Chat {
 	/// Returns whether the composer contains no non-whitespace text.
 	pub fn composer_empty(&self) -> bool {
 		self.composer_text().trim().is_empty()
+	}
+
+	/// Clears composer text and staged attachments.
+	pub fn clear_composer(&mut self) {
+		self.editor_ui.set_text(INPUT_ID, "");
+		let _ = self.attachments.take();
+		self.refresh_composer();
 	}
 
 	/// Replaces composer text, preserving staged attachments.
@@ -1973,22 +2117,30 @@ impl Chat {
 
 	/// Replaces the composer's completion source.
 	pub fn set_completion(&mut self, completion: Box<dyn omp_tui::EditorCompletion>) {
+		let completion = CompletionChain::new()
+			.source(Box::new(self.slash_commands.clone()))
+			.source(completion);
 		self
 			.editor_ui
 			.update_component::<EditorPane>(INPUT_ID, |pane| {
-				pane.set_completion(completion);
+				pane.set_completion(Box::new(completion));
 				true
 			});
 	}
 
 	/// Replaces slash-command completion data.
 	pub fn set_slash_commands(&mut self, commands: Vec<Command>) {
-		self
-			.editor_ui
-			.update_component::<EditorPane>(INPUT_ID, |pane| {
-				pane.set_completion(Box::new(SlashCommands::new(commands)));
-				true
-			});
+		self.slash_commands.replace(commands);
+	}
+
+	/// Replaces slash-command data and its persisted usage ranker without
+	/// disturbing the completion providers chained behind it.
+	pub fn set_ranked_slash_commands(
+		&mut self,
+		commands: Vec<Command>,
+		usage: impl Fn(&str) -> u64 + Send + Sync + 'static,
+	) {
+		self.slash_commands.replace_ranked(commands, usage);
 	}
 
 	/// Reserves right-edge columns for host-composited chrome.
@@ -2041,7 +2193,7 @@ impl Chat {
 				tool.ordinal,
 				Entry::Tool(ToolEntry {
 					label,
-					ok: None,
+					terminal: ToolTerminal::Aborted,
 					expanded: tool.expanded,
 					view: tool.view,
 					images: tool.images,
@@ -2053,11 +2205,14 @@ impl Chat {
 
 	/// Appends a delta to a matching live assistant message.
 	pub fn append_assistant(&mut self, id: &str, text: &str) {
+		let now = self.started_at.elapsed();
+		let smooth = self.smooth_streaming;
 		if let Some(message) = &mut self.live_assistant
 			&& message.id.as_str() == id
 		{
-			message.append(text);
-			self.bump_live();
+			if message.append(text, smooth, now) {
+				self.bump_live();
+			}
 		}
 	}
 
@@ -2069,6 +2224,9 @@ impl Chat {
 			.as_ref()
 			.is_some_and(|message| message.id.as_str() == id)
 		{
+			if let Some(message) = self.live_assistant.as_mut() {
+				let _ = message.flush();
+			}
 			let message = self
 				.live_assistant
 				.take()
@@ -2131,6 +2289,13 @@ impl Chat {
 		rev: impl Into<Str>,
 		title: impl Into<Str>,
 	) {
+		if self
+			.live_assistant
+			.as_mut()
+			.is_some_and(LiveAssistant::flush)
+		{
+			self.bump_live();
+		}
 		let id = id.into();
 		let name = name.into();
 		let rev = rev.into();
@@ -2157,7 +2322,7 @@ impl Chat {
 			rev,
 			title,
 			expanded: true,
-			view: ToolView::structured(
+			view: ToolView::plain(
 				Default::default(),
 				Self::tool_view_width(self.layout_width),
 				&self.ctx,
@@ -2186,14 +2351,14 @@ impl Chat {
 	}
 
 	/// Replaces a matching live tool card's renderer-produced view.
-	pub fn tool_view(&mut self, id: &str, view: Str) {
+	pub fn tool_view(&mut self, id: &str, view: ToolViewContent) {
 		let ctx = self.ctx.clone();
 		if let Some(tool) = self
 			.live_tools
 			.iter_mut()
 			.find(|tool| tool.id.as_str() == id)
 		{
-			tool.view.replace(view, &ctx);
+			tool.view.replace_content(view, &ctx);
 			Self::refresh_live_tool_card(tool, self.layout_width.max(1), &ctx);
 			self.bump_live();
 		}
@@ -2223,7 +2388,7 @@ impl Chat {
 	}
 
 	/// Finalizes a matching live tool card with its terminal branch and view.
-	pub fn tool_finished(&mut self, id: &str, ok: bool, view: Str) {
+	pub fn tool_finished(&mut self, id: &str, terminal: ToolTerminal, view: ToolViewContent) {
 		if let Some(index) = self
 			.live_tools
 			.iter()
@@ -2233,17 +2398,19 @@ impl Chat {
 			let ordinal = tool.ordinal;
 			let width = tool.view.width;
 			let images = tool.images.clone();
-			let icon = if ok {
-				self.ctx.charset.check()
-			} else {
-				self.ctx.charset.icon(Icon::Error)
+			let icon = match terminal {
+				ToolTerminal::Succeeded => self.ctx.charset.check(),
+				ToolTerminal::Failed => self.ctx.charset.icon(Icon::Error),
+				ToolTerminal::ArgsRejected => self.ctx.charset.icon(Icon::Warning),
+				ToolTerminal::Aborted => self.ctx.charset.icon(Icon::Cancellable),
+				ToolTerminal::Skipped => self.ctx.charset.icon(Icon::Cancellable),
 			};
 			let label = fmts_mut!("{icon} {}@{} · {}", tool.name, tool.rev, tool.title).freeze();
 			let entry = ToolEntry {
 				label,
-				ok: Some(ok),
-				expanded: true,
-				view: ToolView::structured(view, width, &self.ctx),
+				terminal,
+				expanded: tool.expanded,
+				view: ToolView::from_content(view, width, &self.ctx),
 				images,
 			};
 			self.entries.insert(ordinal, Entry::Tool(entry));
@@ -2254,7 +2421,23 @@ impl Chat {
 
 	/// Toggles the most recent active tool card.
 	pub fn toggle_latest_tool(&mut self) {
-		if let Some(tool) = self.live_tools.last_mut() {
+		let live = self.live_tools.last().map(|tool| tool.ordinal);
+		let settled = self
+			.entries
+			.range(BlockOrdinal(self.blocks.frontier())..)
+			.rev()
+			.find_map(|(ordinal, entry)| matches!(entry, Entry::Tool(_)).then_some(*ordinal));
+		if let Some(ordinal) = live.into_iter().chain(settled).max() {
+			let _ = self.toggle_tool_ordinal(ordinal);
+		}
+	}
+
+	fn toggle_tool_ordinal(&mut self, ordinal: BlockOrdinal) -> bool {
+		if let Some(tool) = self
+			.live_tools
+			.iter_mut()
+			.find(|tool| tool.ordinal == ordinal)
+		{
 			tool.expanded = !tool.expanded;
 			if tool.expanded && tool.body_folded {
 				tool.body_folded = false;
@@ -2263,7 +2446,14 @@ impl Chat {
 					.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| card.set_folded(false));
 			}
 			self.bump_live();
+			return true;
 		}
+		if let Some(Entry::Tool(tool)) = self.entries.get_mut(&ordinal) {
+			tool.expanded = !tool.expanded;
+			self.bump_live();
+			return true;
+		}
+		false
 	}
 
 	/// Appends an in-place compaction divider with method, token delta, and
@@ -2671,7 +2861,9 @@ impl Chat {
 			BackendEvent::ToolOutput { id, chunk } => self.tool_output(id.as_str(), chunk.as_str()),
 			BackendEvent::ToolView { id, view } => self.tool_view(id.as_str(), view),
 			BackendEvent::ToolImage { id, source } => self.tool_image(id.as_str(), source),
-			BackendEvent::ToolFinished { id, ok, view } => self.tool_finished(id.as_str(), ok, view),
+			BackendEvent::ToolFinished { id, terminal, view } => {
+				self.tool_finished(id.as_str(), terminal, view);
+			},
 			BackendEvent::Compacted { summary, title, method, tokens_before, tokens_after } => {
 				self.push_compaction(summary, title, method, tokens_before, tokens_after);
 			},
@@ -2689,8 +2881,13 @@ impl Chat {
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
 			BackendEvent::ThemePreview(theme) => self.preview_theme(theme),
+			BackendEvent::ComposerReplaced(text) => self.set_composer_text(text.as_str()),
+			BackendEvent::ApplyUiEffect(effect) => {
+				let _ = self.apply_ui_effect(&effect);
+			},
 			BackendEvent::ComposerStyleChanged(style) => self.set_composer_style(style),
 			BackendEvent::SpellingFeaturesChanged(features) => self.set_spelling_features(features),
+			BackendEvent::SmoothStreamingChanged(smooth) => self.set_smooth_streaming(smooth),
 			BackendEvent::ModelDownloadProgress(progress) => {
 				let now = self.started_at.elapsed();
 				self.download_activity = Some(DownloadActivity::new(progress, now));
@@ -2752,6 +2949,11 @@ impl Chat {
 			| BackendEvent::SettingsSchema(_)
 			| BackendEvent::OpenSelection { .. }
 			| BackendEvent::OpenAgentTree
+			| BackendEvent::UiRequest { .. }
+			| BackendEvent::OpenRawStream { .. }
+			| BackendEvent::RawStreamFrame { .. }
+			| BackendEvent::RawStreamSnapshot { .. }
+			| BackendEvent::RawStreamClosed
 			| BackendEvent::CopyToClipboard(_)
 			| BackendEvent::Pause
 			| BackendEvent::NewSessionRequested) => return Some(event),
@@ -2826,14 +3028,14 @@ impl Chat {
 					.saturating_sub(elapsed)
 					.min(Duration::from_millis(50))
 			});
-		let active = (self
-			.live_assistant
-			.as_ref()
-			.is_some_and(|assistant| !(self.hide_thinking && assistant.thinking))
-			|| !self.live_tools.is_empty())
-		.then_some(anim::FRAME);
+		let active = (!self.live_tools.is_empty()).then_some(anim::FRAME);
+		let reveal = self.live_assistant.as_ref().and_then(|assistant| {
+			assistant
+				.next_reveal()
+				.map(|deadline| deadline.saturating_sub(elapsed))
+		});
 		let voice = self.live_voice.is_some().then_some(LIVE_VOICE_FRAME);
-		[editor, download, retained, celebration, active, voice]
+		[editor, download, retained, celebration, active, reveal, voice]
 			.into_iter()
 			.flatten()
 			.min()
@@ -2940,6 +3142,14 @@ impl Chat {
 		frontier: u64,
 		admission: AdmissionMode,
 	) -> ViewportFrame<'_> {
+		let smooth = self.smooth_streaming;
+		if self
+			.live_assistant
+			.as_mut()
+			.is_some_and(|assistant| assistant.advance(elapsed, smooth))
+		{
+			self.bump_live();
+		}
 		self.last_viewport = viewport;
 		if self.frame.size() != viewport {
 			self.frame = Frame::new(viewport);
@@ -3236,6 +3446,9 @@ impl Chat {
 			if allocation == 0 {
 				continue;
 			}
+			if *is_settled && matches!(self.entries.get(ordinal), Some(Entry::Tool(_))) {
+				self.live_layout.push((*ordinal, y, allocation));
+			}
 			if *is_settled && emergency_ordinal == Some(*ordinal) {
 				self.draw_settled_assistant_emergency(*ordinal, y, content_width);
 			} else if *is_settled {
@@ -3382,6 +3595,24 @@ impl Chat {
 					.set_prop(LIVE_TOOL_CARD_ID, Prop::H, tool.target_height);
 				tool.target_changed_at = now;
 			}
+		}
+	}
+
+	/// Enables or disables paced grapheme reveal for streamed assistant text.
+	///
+	/// Disabling the controller immediately flushes any buffered suffix.
+	pub fn set_smooth_streaming(&mut self, smooth: bool) {
+		if self.smooth_streaming == smooth {
+			return;
+		}
+		self.smooth_streaming = smooth;
+		if !smooth
+			&& self
+				.live_assistant
+				.as_mut()
+				.is_some_and(LiveAssistant::flush)
+		{
+			self.bump_live();
 		}
 	}
 
@@ -3690,8 +3921,7 @@ impl Chat {
 	}
 
 	const fn tool_view_width(width: u16) -> u16 {
-		let inset = if width >= 50 { 2 } else { 0 };
-		let narrowed = width.saturating_sub(inset).saturating_sub(4);
+		let narrowed = width.saturating_sub(4);
 		if narrowed == 0 { 1 } else { narrowed }
 	}
 
@@ -4072,9 +4302,8 @@ fn draw_rich(frame: &mut Frame, y: u16, body: &RichText, x: u16, width: u16, the
 }
 
 fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiContext) -> u16 {
-	let margin = u16::from(width >= 50);
 	let height = tool_height(tool, width);
-	let rect = Rect::new(margin, y, width.saturating_sub(margin * 2), height);
+	let rect = Rect::new(0, y, width, height);
 	if tool.view.chrome == ViewChrome::Flush {
 		let view_height = tool.view.height().min(height);
 		if view_height > 0 {
@@ -4100,10 +4329,12 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 		}
 		return height;
 	}
-	let state = match tool.ok {
-		Some(true) => ctx.theme.ok,
-		Some(false) => ctx.theme.err,
-		None => ctx.theme.warn,
+	let state = match tool.terminal {
+		ToolTerminal::Succeeded => ctx.theme.ok,
+		ToolTerminal::Failed => ctx.theme.err,
+		ToolTerminal::ArgsRejected => ctx.theme.warn,
+		ToolTerminal::Aborted => ctx.theme.muted,
+		ToolTerminal::Skipped => ctx.theme.secondary,
 	};
 	let style = ink(state);
 	let leading = if tool.expanded && height >= 3 {
@@ -4112,10 +4343,7 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 		"  "
 	};
 	let x = frame.put(rect.x, y, leading, style);
-	let label_width = rect
-		.x
-		.saturating_add(rect.width)
-		.saturating_sub(x);
+	let label_width = rect.x.saturating_add(rect.width).saturating_sub(x);
 	draw_line(frame, x, y, label_width, &[Span::new(&tool.label, style.bold())]);
 	if height == 1 {
 		return height;
@@ -4158,11 +4386,7 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 
 /// Aspect-fit cell box for one tool image inside a card of `width` columns.
 fn tool_image_box(image: &ToolImageEntry, width: u16) -> (u16, u16) {
-	let margin = u16::from(width >= 50);
-	let interior = width
-		.saturating_sub(margin * 2)
-		.saturating_sub(4)
-		.min(TOOL_IMAGE_MAX_COLS);
+	let interior = width.saturating_sub(4).min(TOOL_IMAGE_MAX_COLS);
 	if interior == 0 {
 		return (0, 0);
 	}
@@ -4437,6 +4661,30 @@ mod tests {
 		}
 	}
 	#[test]
+	fn clear_and_exit_bypass_editor_mutation() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_composer_text("draft");
+
+		assert_eq!(chat.handle_key(Key::Ctrl('c')), ChatKey::Clear);
+		assert_eq!(chat.composer_text(), "draft");
+		assert_eq!(chat.handle_key(Key::Ctrl('d')), ChatKey::Exit);
+		assert_eq!(chat.composer_text(), "draft");
+	}
+
+	#[test]
+	fn host_can_stage_initial_composer_text_through_enter_path() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_composer_text("launch message");
+		chat.submit_composer();
+
+		let (text, attachments, mode) = chat.take_submission().expect("initial submission");
+		assert_eq!(text, "launch message");
+		assert!(attachments.is_empty());
+		assert_eq!(mode, SubmitMode::Steer);
+		assert!(chat.composer_empty());
+	}
+
+	#[test]
 	fn resource_status_names_the_owner_and_fifo_queue_depth() {
 		let facts = StatusFacts {
 			model: sf!("Fable 5"),
@@ -4450,7 +4698,7 @@ mod tests {
 
 		let labels = StatusLabels::new(&facts, Charset::Ascii);
 		assert_eq!(labels.resources.len(), 1);
-		assert_eq!(labels.resources[0].as_str(), "mode plan +2");
+		assert_eq!(labels.resources[0].as_str(), ". mode plan +2");
 	}
 
 	#[test]
@@ -4531,6 +4779,31 @@ mod tests {
 	}
 
 	#[test]
+	fn minimal_status_omits_every_ancillary_right_segment() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_status(StatusFacts {
+			model: "Fable 5".into(),
+			working: true,
+			context_tokens: 1_000,
+			context_window: Some(10_000),
+			cost_nanos: 2_000_000_000,
+			advisor_cost_nanos: 3_000_000_000,
+			queued: 4,
+			jobs: 5,
+			attempt: 2,
+			dropped: 7,
+			layout: StatusLayout::Minimal,
+			..StatusFacts::default()
+		});
+		let text = frame_text(chat.render(Size::new(160, 8)).frame);
+		assert!(text.contains("Fable 5"), "{text}");
+		assert!(text.contains("10%/10k"), "{text}");
+		for hidden in ["queued 4", "jobs 5", "retry 2", "dropped 7", "$2", "$3"] {
+			assert!(!text.contains(hidden), "minimal status leaked {hidden}: {text}");
+		}
+	}
+
+	#[test]
 	fn viewport_damage_is_local() {
 		let mut chat = Chat::new(&ctx());
 		chat.begin_assistant("assistant");
@@ -4554,6 +4827,56 @@ mod tests {
 		settle(&mut chat, viewport);
 		let text = frame_text(chat.render_at(viewport, Duration::from_millis(500)).frame);
 		assert!(text.contains("streaming tail"), "{text}");
+		assert!(!text.contains("**"), "{text}");
+	}
+
+	#[test]
+	fn smooth_streaming_reveals_whole_graphemes_and_flushes_at_tool_boundary() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_assistant("assistant");
+		chat.append_assistant("assistant", "👨‍👩‍👧‍👦abcdef");
+		let family_bytes = "👨‍👩‍👧‍👦".len();
+		let assistant = chat.live_assistant.as_ref().expect("live assistant");
+		assert_eq!(assistant.revealed, 0);
+
+		let _ = chat.render_at(Size::new(40, 8), Duration::from_millis(33));
+		let assistant = chat.live_assistant.as_ref().expect("live assistant");
+		assert!(assistant.revealed >= family_bytes);
+		assert!(assistant.revealed < assistant.text.len());
+
+		chat.tool_started("tool", "read", "1", "ordered boundary");
+		let assistant = chat.live_assistant.as_ref().expect("live assistant");
+		assert_eq!(assistant.revealed, assistant.text.len());
+	}
+
+	#[test]
+	fn disabling_smooth_streaming_flushes_the_buffered_suffix() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_assistant("assistant");
+		chat.append_assistant("assistant", "buffered suffix");
+		assert!(
+			chat
+				.live_assistant
+				.as_ref()
+				.is_some_and(|assistant| assistant.revealed < assistant.text.len())
+		);
+
+		chat.set_smooth_streaming(false);
+
+		assert!(
+			chat
+				.live_assistant
+				.as_ref()
+				.is_some_and(|assistant| assistant.revealed == assistant.text.len())
+		);
+	}
+
+	#[test]
+	fn settled_markdown_treats_literal_closing_tag_as_message_text() {
+		let body = RichText::new("**bold** literal </md> tail", 40, &ctx());
+		assert!(body.view.is_some());
+		let text = frame_text(body.view.as_ref().expect("markdown view").frame());
+		assert!(text.contains("bold literal </md> tail"), "{text}");
 		assert!(!text.contains("**"), "{text}");
 	}
 
@@ -4590,7 +4913,7 @@ mod tests {
 		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::FinalizedPending));
 		assert!(matches!(
 			chat.entries.get(&BlockOrdinal(0)),
-			Some(Entry::Tool(ToolEntry { ok: None, .. }))
+			Some(Entry::Tool(ToolEntry { terminal: ToolTerminal::Aborted, .. }))
 		));
 	}
 
@@ -4619,11 +4942,92 @@ mod tests {
 	}
 
 	#[test]
+	fn settled_tool_card_draws_rail_chrome() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("card", "grep", "1", "find usages");
+		chat.tool_finished(
+			"card",
+			ToolTerminal::Succeeded,
+			ToolViewContent::Markup("<text>3 matches</text>".into()),
+		);
+		let batch = chat
+			.retirement_batch(Size::new(60, 0))
+			.expect("settled card retires");
+		let text = frame_text(&batch.frame);
+		assert!(text.contains("▾ ✓ grep@1 · find usages"), "{text}");
+		assert!(text.contains("│ 3 matches"), "{text}");
+		assert!(text.contains('╰'), "{text}");
+	}
+
+	#[test]
+	fn settled_tool_preserves_and_toggles_the_live_collapse_state() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("card", "read", "1", "long result");
+		chat.toggle_latest_tool();
+		assert!(!chat.live_tools[0].expanded);
+		chat.tool_finished(
+			"card",
+			ToolTerminal::Succeeded,
+			ToolViewContent::Plain("line one\nline two".into()),
+		);
+		let Some(Entry::Tool(tool)) = chat.entries.get(&BlockOrdinal(0)) else {
+			panic!("settled tool entry");
+		};
+		assert!(!tool.expanded);
+
+		chat.toggle_latest_tool();
+		let Some(Entry::Tool(tool)) = chat.entries.get(&BlockOrdinal(0)) else {
+			panic!("settled tool entry");
+		};
+		assert!(tool.expanded);
+	}
+
+	#[test]
+	fn plain_tool_fallback_never_parses_core_markup() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("plain", "unknown", "0", "fallback");
+		chat.tool_finished(
+			"plain",
+			ToolTerminal::ArgsRejected,
+			ToolViewContent::Plain("<approval>not chrome</approval>".into()),
+		);
+
+		let Some(Entry::Tool(tool)) = chat.entries.get(&BlockOrdinal(0)) else {
+			panic!("settled tool entry");
+		};
+		assert!(tool.view.plain);
+		assert_eq!(tool.view.chrome, ViewChrome::Card);
+		assert_eq!(tool.terminal, ToolTerminal::ArgsRejected);
+		assert_eq!(tool.view.source, "<approval>not chrome</approval>");
+	}
+
+	#[test]
+	fn flush_tool_view_settles_without_card_chrome() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("flush", "read", "1", "read src/lib.rs");
+		chat.tool_finished(
+			"flush",
+			ToolTerminal::Succeeded,
+			ToolViewContent::Markup(
+				"<row gap=1 chrome=flush><text>✔ read src/lib.rs</text></row>".into(),
+			),
+		);
+		let batch = chat
+			.retirement_batch(Size::new(60, 0))
+			.expect("flush view retires");
+		let text = frame_text(&batch.frame);
+		assert!(text.contains("✔ read src/lib.rs"), "{text}");
+		assert!(!text.contains('│'), "{text}");
+		assert!(!text.contains('╰'), "{text}");
+		assert!(!text.contains("read@1"), "{text}");
+	}
+
+	#[test]
 	fn replay_renders_the_same_committed_rows() {
 		let mut chat = Chat::new(&ctx());
 		for id in ["a", "b"] {
 			chat.tool_started(id, "read", "1", id);
-			chat.tool_finished(id, true, id.into());
+			chat.tool_finished(id, ToolTerminal::Succeeded, ToolViewContent::Plain(Str::from(id)));
 		}
 		let viewport = Size::new(40, 0);
 		let batch = chat
@@ -4668,7 +5072,7 @@ mod tests {
 		let source: Str = path.to_string_lossy().into_owned().into();
 		chat.tool_started("image", "render", "1", "render image");
 		chat.tool_image("image", source.clone());
-		chat.tool_finished("image", true, source.clone());
+		chat.tool_finished("image", ToolTerminal::Succeeded, ToolViewContent::Plain(source.clone()));
 		let batch = chat
 			.retirement_batch(Size::new(60, 0))
 			.expect("queued image snapshot retires");
@@ -4927,7 +5331,7 @@ mod tests {
 		chat.tool_started("head", "bash", "1", "head");
 		chat.tool_started("later", "read", "1", "later");
 		settle(&mut chat, Size::new(40, 8));
-		chat.tool_finished("later", true, "done".into());
+		chat.tool_finished("later", ToolTerminal::Succeeded, ToolViewContent::Plain("done".into()));
 		settle(&mut chat, Size::new(40, 8));
 		assert!(chat.retirement_batch(Size::new(40, 0)).is_none());
 	}
@@ -4938,8 +5342,16 @@ mod tests {
 		chat.tool_started("head", "bash", "1", "head");
 		chat.tool_started("later", "read", "1", "later");
 		settle(&mut chat, Size::new(40, 8));
-		chat.tool_finished("later", true, "later done".into());
-		chat.tool_finished("head", true, "head done".into());
+		chat.tool_finished(
+			"later",
+			ToolTerminal::Succeeded,
+			ToolViewContent::Plain("later done".into()),
+		);
+		chat.tool_finished(
+			"head",
+			ToolTerminal::Succeeded,
+			ToolViewContent::Plain("head done".into()),
+		);
 		settle(&mut chat, Size::new(40, 8));
 		let batch = chat
 			.retirement_batch(Size::new(40, 0))

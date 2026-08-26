@@ -1247,6 +1247,7 @@ mod tests {
 		}
 	}
 
+	#[test]
 	fn expands_home_path_when_available() {
 		if let Some(home) = env::home_dir() {
 			assert_eq!(dropped_paths("~/image.png").as_slice(), [sf!("{}/image.png", home.display())]);

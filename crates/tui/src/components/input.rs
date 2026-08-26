@@ -14,13 +14,32 @@ use crate::{
 	rich::cell_width,
 };
 
+const INPUT_UNDO_CAP: usize = 100;
+const INPUT_KILL_CAP: usize = 60;
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum InputAction {
+	#[default]
+	Other,
+	TypeWord,
+	Kill,
+	Yank,
+	YankPop,
+}
+
 #[derive(Default)]
 struct InputState {
-	text:    String,
-	cursor:  u16,
-	mask:    bool,
-	masked:  String,
-	counter: String,
+	text:        String,
+	/// UTF-8 byte boundary in `text`.
+	cursor:      usize,
+	mask:        bool,
+	masked:      String,
+	counter:     String,
+	undo:        Vec<(String, usize)>,
+	kill_ring:   Vec<String>,
+	kill_index:  usize,
+	last_yank:   Option<(usize, usize)>,
+	last_action: InputAction,
 }
 
 impl InputState {
@@ -29,11 +48,65 @@ impl InputState {
 		if self.mask {
 			self
 				.masked
-				.reserve(self.text.chars().count().saturating_mul('•'.len_utf8()));
+				.reserve(self.text.graphemes().count().saturating_mul('•'.len_utf8()));
 			self
 				.masked
-				.extend(iter::repeat_n('•', self.text.chars().count()));
+				.extend(iter::repeat_n('•', self.text.graphemes().count()));
 		}
+	}
+
+	fn cursor_column(&self) -> u16 {
+		if self.mask {
+			u16::try_from(self.text[..self.cursor].graphemes().count()).unwrap_or(u16::MAX)
+		} else {
+			cell_width(&self.text[..self.cursor])
+		}
+	}
+
+	fn cursor_at_column(&self, column: u16) -> usize {
+		if !self.mask {
+			return byte_at_column(&self.text, column);
+		}
+		self
+			.text
+			.grapheme_indices()
+			.nth(usize::from(column))
+			.map_or(self.text.len(), |(at, _)| at)
+	}
+
+	fn snapshot(&mut self) {
+		if self
+			.undo
+			.last()
+			.is_some_and(|(text, cursor)| text == &self.text && *cursor == self.cursor)
+		{
+			return;
+		}
+		if self.undo.len() == INPUT_UNDO_CAP {
+			self.undo.remove(0);
+		}
+		self.undo.push((self.text.clone(), self.cursor));
+	}
+
+	fn break_sequence(&mut self) {
+		self.last_action = InputAction::Other;
+		self.last_yank = None;
+	}
+
+	fn record_kill(&mut self, killed: String, backward: bool) {
+		if self.last_action == InputAction::Kill && !self.kill_ring.is_empty() {
+			if backward {
+				self.kill_ring[0].insert_str(0, &killed);
+			} else {
+				self.kill_ring[0].push_str(&killed);
+			}
+		} else {
+			self.kill_ring.insert(0, killed);
+			self.kill_ring.truncate(INPUT_KILL_CAP);
+		}
+		self.kill_index = 0;
+		self.last_action = InputAction::Kill;
+		self.last_yank = None;
 	}
 
 	fn refresh_counter(&mut self, limit: Option<usize>) {
@@ -89,7 +162,10 @@ impl Input {
 					.str_of(Prop::Value)
 					.map(ToString::to_string)
 					.unwrap_or_default();
-				self.state.cursor = cell_width(&self.state.text);
+				self.state.cursor = self.state.text.len();
+				self.state.undo.clear();
+				self.state.kill_ring.clear();
+				self.state.break_sequence();
 				self.state.refresh_mask();
 			},
 			Prop::Mask => {
@@ -113,81 +189,179 @@ impl Input {
 	}
 
 	fn edit(&mut self, key: Key) -> bool {
-		match key {
-			Key::Left | Key::Ctrl('b') => self.state.cursor = self.state.cursor.saturating_sub(1),
-			Key::Right | Key::Ctrl('f') => {
-				self.state.cursor = (self.state.cursor + 1).min(cell_width(&self.state.text));
+		let changed = match key {
+			Key::Left | Key::Ctrl('b') => {
+				self.state.cursor = self.state.text[..self.state.cursor]
+					.grapheme_indices()
+					.next_back()
+					.map_or(0, |(at, _)| at);
+				self.state.break_sequence();
+				true
 			},
-			Key::Home => self.state.cursor = 0,
-			Key::End => self.state.cursor = cell_width(&self.state.text),
+			Key::Right | Key::Ctrl('f') => {
+				self.state.cursor += self.state.text[self.state.cursor..]
+					.graphemes()
+					.next()
+					.map_or(0, str::len);
+				self.state.break_sequence();
+				true
+			},
+			Key::Home | Key::Ctrl('a') => {
+				self.state.cursor = 0;
+				self.state.break_sequence();
+				true
+			},
+			Key::End | Key::Ctrl('e') => {
+				self.state.cursor = self.state.text.len();
+				self.state.break_sequence();
+				true
+			},
 			Key::Backspace => {
-				if self.state.cursor > 0 {
-					let end = byte_at_column(&self.state.text, self.state.cursor);
-					let start = self.state.text[..end]
-						.grapheme_indices()
-						.next_back()
-						.map_or(0, |(offset, _)| offset);
-					let removed = cell_width(&self.state.text[start..end]);
+				let end = self.state.cursor;
+				let start = self.state.text[..end]
+					.grapheme_indices()
+					.next_back()
+					.map_or(0, |(offset, _)| offset);
+				if start == end {
+					false
+				} else {
+					self.state.snapshot();
 					self.state.text.replace_range(start..end, "");
-					self.state.cursor = self.state.cursor.saturating_sub(removed);
+					self.state.cursor = start;
+					self.state.break_sequence();
+					true
 				}
 			},
 			Key::Delete | Key::Ctrl('d') => {
-				let start = byte_at_column(&self.state.text, self.state.cursor);
-				if start < self.state.text.len() {
-					let grapheme_len = self.state.text[start..]
+				let start = self.state.cursor;
+				let end = start
+					+ self.state.text[start..]
 						.graphemes()
 						.next()
 						.map_or(0, str::len);
-					self
-						.state
-						.text
-						.replace_range(start..start + grapheme_len, "");
+				if start == end {
+					false
+				} else {
+					self.state.snapshot();
+					self.state.text.replace_range(start..end, "");
+					self.state.break_sequence();
+					true
 				}
 			},
 			Key::Space => {
-				let at = byte_at_column(&self.state.text, self.state.cursor);
-				self.state.text.insert(at, ' ');
+				self.state.snapshot();
+				self.state.text.insert(self.state.cursor, ' ');
 				self.state.cursor += 1;
+				self.state.break_sequence();
+				true
 			},
 			Key::Char(character) => {
-				let at = byte_at_column(&self.state.text, self.state.cursor);
-				self.state.text.insert(at, character);
-				self.state.cursor += cell_width(character.encode_utf8(&mut [0u8; 4]));
+				let word = character.is_alphanumeric() || character == '_';
+				if !word || self.state.last_action != InputAction::TypeWord {
+					self.state.snapshot();
+				}
+				self.state.text.insert(self.state.cursor, character);
+				self.state.cursor += character.len_utf8();
+				self.state.last_action = if word {
+					InputAction::TypeWord
+				} else {
+					InputAction::Other
+				};
+				self.state.last_yank = None;
+				true
 			},
-			Key::Ctrl('a') => self.state.cursor = 0,
-			Key::Ctrl('e') => self.state.cursor = cell_width(&self.state.text),
-			Key::Ctrl('k') => {
-				let at = byte_at_column(&self.state.text, self.state.cursor);
-				self.state.text.truncate(at);
+			Key::Ctrl('-' | '_') => {
+				let Some((text, cursor)) = self.state.undo.pop() else {
+					return false;
+				};
+				self.state.text = text;
+				self.state.cursor = cursor;
+				self.state.break_sequence();
+				true
 			},
-			Key::Ctrl('u') => {
-				let at = byte_at_column(&self.state.text, self.state.cursor);
-				self.state.text.replace_range(..at, "");
-				self.state.cursor = 0;
-			},
+			Key::Ctrl('k') => self.kill_range(self.state.cursor, self.state.text.len()),
+			Key::Ctrl('u') => self.kill_range(0, self.state.cursor),
 			Key::Ctrl('w') => {
-				let end = byte_at_column(&self.state.text, self.state.cursor);
-				let start = word_rubout_start(&self.state.text, end);
-				let removed = cell_width(&self.state.text[start..end]);
-				self.state.text.replace_range(start..end, "");
-				self.state.cursor = self.state.cursor.saturating_sub(removed);
+				let end = self.state.cursor;
+				self.kill_range(word_rubout_start(&self.state.text, end), end)
 			},
-			Key::WordLeft => self.state.cursor = word_left_column(&self.state.text, self.state.cursor),
+			Key::WordLeft => {
+				let column = cell_width(&self.state.text[..self.state.cursor]);
+				let target = word_left_column(&self.state.text, column);
+				self.state.cursor = byte_at_column(&self.state.text, target);
+				self.state.break_sequence();
+				true
+			},
 			Key::WordRight => {
-				self.state.cursor = word_right_column(&self.state.text, self.state.cursor);
+				let column = cell_width(&self.state.text[..self.state.cursor]);
+				let target = word_right_column(&self.state.text, column);
+				self.state.cursor = byte_at_column(&self.state.text, target);
+				self.state.break_sequence();
+				true
 			},
 			Key::WordDelete => {
-				let start = byte_at_column(&self.state.text, self.state.cursor);
-				let end_column = word_right_column(&self.state.text, self.state.cursor);
-				let end = byte_at_column(&self.state.text, end_column);
-				self.state.text.replace_range(start..end, "");
+				let column = cell_width(&self.state.text[..self.state.cursor]);
+				let target = word_right_column(&self.state.text, column);
+				let end = byte_at_column(&self.state.text, target);
+				self.kill_range(self.state.cursor, end)
 			},
+			Key::Ctrl('y') => self.yank(),
+			Key::Alt('y') => self.yank_pop(),
 			_ => return false,
+		};
+		if changed {
+			self.state.refresh_mask();
+			let limit = self.limit();
+			self.state.refresh_counter(limit);
 		}
-		self.state.refresh_mask();
-		let limit = self.limit();
-		self.state.refresh_counter(limit);
+		changed
+	}
+
+	fn kill_range(&mut self, start: usize, end: usize) -> bool {
+		if start == end {
+			return false;
+		}
+		self.state.snapshot();
+		let killed = self.state.text[start..end].to_owned();
+		let backward = end == self.state.cursor;
+		self.state.text.replace_range(start..end, "");
+		self.state.cursor = start;
+		self.state.record_kill(killed, backward);
+		true
+	}
+
+	fn yank(&mut self) -> bool {
+		let Some(value) = self.state.kill_ring.first().cloned() else {
+			self.state.break_sequence();
+			return false;
+		};
+		self.state.snapshot();
+		let start = self.state.cursor;
+		self.state.text.insert_str(start, &value);
+		self.state.cursor += value.len();
+		self.state.kill_index = 0;
+		self.state.last_yank = Some((start, self.state.cursor));
+		self.state.last_action = InputAction::Yank;
+		true
+	}
+
+	fn yank_pop(&mut self) -> bool {
+		if !matches!(self.state.last_action, InputAction::Yank | InputAction::YankPop)
+			|| self.state.kill_ring.len() < 2
+		{
+			self.state.break_sequence();
+			return false;
+		}
+		let Some((start, end)) = self.state.last_yank else {
+			return false;
+		};
+		self.state.snapshot();
+		self.state.kill_index = (self.state.kill_index + 1) % self.state.kill_ring.len();
+		let value = self.state.kill_ring[self.state.kill_index].clone();
+		self.state.text.replace_range(start..end, &value);
+		self.state.cursor = start + value.len();
+		self.state.last_yank = Some((start, self.state.cursor));
+		self.state.last_action = InputAction::YankPop;
 		true
 	}
 }
@@ -277,9 +451,10 @@ impl Component for Input {
 			}
 		} else if available > 0 {
 			let total = cell_width(shown);
+			let cursor = self.state.cursor_column();
 			let cursor_room = available.saturating_sub(u16::from(focused));
-			let left = if total > available || self.state.cursor > cursor_room {
-				self.state.cursor.saturating_sub(cursor_room)
+			let left = if total > available || cursor > cursor_room {
+				cursor.saturating_sub(cursor_room)
 			} else {
 				0
 			};
@@ -292,7 +467,7 @@ impl Component for Input {
 			if focused {
 				// The real terminal cursor marks the insertion point — one
 				// cursor treatment across every core single-line editor.
-				let split = byte_at_column(visible, self.state.cursor.saturating_sub(left));
+				let split = byte_at_column(visible, cursor.saturating_sub(left));
 				pc.frame
 					.set_cursor(content_x.saturating_add(cell_width(&visible[..split])), rect.y);
 			}
@@ -336,8 +511,16 @@ impl Component for Input {
 				} else {
 					cell_width(ec.ctx.charset.cursor())
 				};
-				let column = at.0.saturating_sub(rect.x.saturating_add(prefix_width));
-				self.state.cursor = column.min(cell_width(&self.state.text));
+				let column = at
+					.0
+					.saturating_sub(rect.x.saturating_add(prefix_width))
+					.min(cell_width(if self.state.mask {
+						&self.state.masked
+					} else {
+						&self.state.text
+					}));
+				self.state.cursor = self.state.cursor_at_column(column);
+				self.state.break_sequence();
 				Flow::Consumed
 			},
 			Mouse::Click
@@ -358,10 +541,11 @@ impl Component for Input {
 		if sanitized.is_empty() {
 			return Flow::Skip;
 		}
-		let paste = sanitized.replace(['\n', '\t'], " ");
-		let at = byte_at_column(&self.state.text, self.state.cursor);
-		self.state.text.insert_str(at, &paste);
-		self.state.cursor = self.state.cursor.saturating_add(cell_width(&paste));
+		let paste = sanitized.replace('\n', " ");
+		self.state.snapshot();
+		self.state.text.insert_str(self.state.cursor, &paste);
+		self.state.cursor += paste.len();
+		self.state.break_sequence();
 		self.state.refresh_mask();
 		let limit = self.limit();
 		self.state.refresh_counter(limit);
@@ -400,7 +584,48 @@ mod tests {
 		assert_eq!(input.paste(&mut event_ctx(&ctx), " c\td"), Flow::Consumed);
 		let mut values = serde_json::Map::new();
 		input.value(&mut values);
-		assert_eq!(values["name"], serde_json::json!("ab c d"));
+		assert_eq!(values["name"], serde_json::json!("ab c   d"));
+	}
+
+	#[test]
+	fn cursor_motion_stays_on_grapheme_boundaries() {
+		let mut input = Input::new().with(Prop::Value, "界a");
+		assert_eq!(input.state.cursor, "界a".len());
+		assert!(input.edit(Key::Left));
+		assert_eq!(input.state.cursor, "界".len());
+		assert!(input.edit(Key::Left));
+		assert_eq!(input.state.cursor, 0);
+		assert!(input.edit(Key::Right));
+		assert_eq!(input.state.cursor, "界".len());
+		assert!(input.edit(Key::Backspace));
+		assert_eq!(input.state.text, "a");
+		assert_eq!(input.state.cursor, 0);
+	}
+
+	#[test]
+	fn undo_and_kill_ring_restore_single_line_edits() {
+		let mut input = Input::new().with(Prop::Value, "one two");
+		assert!(input.edit(Key::Ctrl('w')));
+		assert_eq!(input.state.text, "one ");
+		assert!(input.edit(Key::Char('x')));
+		assert!(input.edit(Key::Ctrl('u')));
+		assert_eq!(input.state.text, "");
+		assert!(input.edit(Key::Ctrl('y')));
+		assert_eq!(input.state.text, "one x");
+		assert!(input.edit(Key::Alt('y')));
+		assert_eq!(input.state.text, "two");
+		assert!(input.edit(Key::Ctrl('-')));
+		assert_eq!(input.state.text, "one x");
+	}
+
+	#[test]
+	fn paste_is_one_undo_unit_and_keeps_tab_expansion_visible() {
+		let ctx = UiContext::default();
+		let mut input = Input::new().with(Prop::Value, "a");
+		assert_eq!(input.paste(&mut event_ctx(&ctx), "\tb"), Flow::Consumed);
+		assert_eq!(input.state.text, "a   b");
+		assert!(input.edit(Key::Ctrl('-')));
+		assert_eq!(input.state.text, "a");
 	}
 
 	#[test]

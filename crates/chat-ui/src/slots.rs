@@ -10,7 +10,7 @@ use omp_proto::omp::ui::{
 	v1,
 	v1::{UiEffect, ui_effect},
 };
-use omp_tui::{Rect, Ui, UiContext};
+use omp_tui::{Props, Rect, Ui, UiContext};
 use smallvec::SmallVec;
 /// Maximum live mounts admitted from one extension registry.
 pub const SLOT_MAX_PER_EXTENSION: usize = 32;
@@ -187,8 +187,40 @@ impl Slots {
 				}
 				Apply::Applied(Damage::mount(mount.rect))
 			},
-			Some(ui_effect::Kind::SetStatus(_)) => {
-				Apply::Applied(Damage { rects: SmallVec::new(), status: true, refusal: None })
+			Some(ui_effect::Kind::PatchNode(patch)) => self.patch(patch),
+			Some(ui_effect::Kind::SetStatus(status)) => {
+				let mount = v1::MountSlot {
+					key:       "__extension_status__".to_owned(),
+					placement: v1::SlotPlacement::Footer as i32,
+					content:   status.content.clone(),
+					options:   Some(v1::SlotOptions {
+						order:   i32::MAX,
+						visible: true,
+						width:   None,
+						height:  Some(1),
+						props:   None,
+					}),
+				};
+				match self.mount(&mount) {
+					Apply::Applied(mut damage) => {
+						damage.status = true;
+						Apply::Applied(damage)
+					},
+					refused => refused,
+				}
+			},
+			Some(ui_effect::Kind::FocusSlot(focus)) => {
+				let mut damage = Damage::default();
+				if focus.key.is_empty() {
+					for mount in self.mounts.values_mut() {
+						mount.ui.blur();
+						damage.rects.push(mount.rect);
+					}
+				} else if let Some(mount) = self.mounts.get_mut(&MountId::new(focus.key.clone())) {
+					mount.ui.focus_first();
+					damage.rects.push(mount.rect);
+				}
+				Apply::Applied(damage)
 			},
 			_ => Apply::Applied(Damage::default()),
 		}
@@ -287,6 +319,51 @@ impl Slots {
 			self.by_placement.entry(placement).or_default().push(id);
 		}
 		Apply::Applied(Damage::mount(rect))
+	}
+
+	fn patch(&mut self, patch: &v1::PatchNode) -> Apply {
+		use v1::prop_value;
+		let Some(mount) = self.mounts.get_mut(&MountId::new(patch.key.clone())) else {
+			return Apply::Applied(Damage::default());
+		};
+		let mut changed = false;
+		if patch.node_id.is_empty()
+			&& let Some(value) = patch.props.get("visible")
+			&& let Some(prop_value::Value::BoolValue(visible)) = value.value.as_ref()
+			&& mount.visible != *visible
+		{
+			mount.visible = *visible;
+			changed = true;
+		}
+		if let Some(text) = patch.text.as_ref()
+			&& let Ok(text) = str::from_utf8(&text.source)
+		{
+			changed |= mount.ui.set_text(patch.node_id.as_str(), text);
+		}
+		for (name, value) in &patch.props {
+			let Some(prop) = Props::prop_of(name) else {
+				continue;
+			};
+			let Some(source) = value.value.as_ref().map(|value| match value {
+				prop_value::Value::StringValue(value) => value.clone(),
+				prop_value::Value::IntegerValue(value) => value.to_string(),
+				prop_value::Value::BoolValue(value) => value.to_string(),
+				prop_value::Value::NumberValue(value) => value.to_string(),
+				prop_value::Value::BytesValue(_) => String::new(),
+			}) else {
+				continue;
+			};
+			if !patch.node_id.is_empty() && !source.is_empty() {
+				changed |= mount
+					.ui
+					.set_prop(patch.node_id.as_str(), prop, Str::new(source));
+			}
+		}
+		if changed {
+			Apply::Applied(Damage::mount(mount.rect))
+		} else {
+			Apply::Applied(Damage::default())
+		}
 	}
 
 	/// Produces mount keys and resolved rectangles for the `slots` debug op.

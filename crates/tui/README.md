@@ -675,6 +675,7 @@ These properties apply to standalone retained components. Parent-owned records s
 | Prop | Accepted values | Effect |
 | --- | --- | --- |
 | `fg` | Theme token, CSS color, or `start..end` gradient | Foreground/style color on rendering elements; a gradient recolors painted cells |
+| `color` | Theme token or CSS color | Foreground alias honored by every textual node (`<icon color=err/>`, `<spinner color=accent/>`); `fg` wins when both are present. Controls with a richer semantic base color (`<button>`, tree nodes) keep their own meaning |
 | `bg`, `on` | Theme token, CSS color, or gradient | Background aliases; `bg` wins when both are present |
 | `angle` | Degrees, optionally with `deg` | Gradient direction, normalized into `0..359` |
 | `bold` | Flag | Bold text/style |
@@ -862,10 +863,9 @@ use omp_tui::{AppEvent, AppOptions, Key, Ui};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let executor = omp_executor::Executor::new(None);
     let mut app = AppOptions::new()
         .quit([Key::Ctrl('c'), Key::Ctrl('q')])
-        .start(executor, |env| {
+        .start(|env| {
             Ui::from_markup(
                 r#"<scroll id="pane" h=12><text>Hello</text></scroll>"#,
                 env.viewport.width,

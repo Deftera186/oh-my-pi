@@ -133,7 +133,7 @@ impl Component for Hr {
 		// An unstyled rule takes the theme's border tone; `fg=`/`bc=` win.
 		let line = self.props.edge(&pc.ctx.theme).map_or_else(
 			|| {
-				if self.props.contains(Prop::Fg) {
+				if self.props.has_foreground() {
 					style.dim()
 				} else {
 					style.fg(pc.ctx.theme.border)
@@ -195,7 +195,7 @@ impl Component for Hr {
 					.x
 					.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
 			);
-			let label_style = if self.props.contains(Prop::Fg) {
+			let label_style = if self.props.has_foreground() {
 				style.bold()
 			} else {
 				style.fg(pc.ctx.theme.fg).bold()

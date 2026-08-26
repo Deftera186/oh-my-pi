@@ -19,7 +19,12 @@ use omp_tui::{
 };
 use parking_lot::Mutex;
 
-use crate::{OverlayPanel, panel_divider};
+use crate::{
+	PromptEvent, PromptOverlay,
+	overlays::{OverlayPanel, panel_divider},
+};
+
+const OTHER_VALUE: &str = "__omp_ask_other__";
 
 struct ActiveBinding {
 	generation: u64,
@@ -40,6 +45,11 @@ pub struct AskRequest {
 }
 
 impl AskRequest {
+	/// Whether the blocked caller has cancelled its presentation future.
+	pub fn is_cancelled(&self) -> bool {
+		self.reply.is_disconnected()
+	}
+
 	/// Resolves the blocked tool invocation with a UI answer.
 	pub fn answer(self, answer: Answer) {
 		let _ = self.reply.send(Ok(answer));
@@ -51,6 +61,12 @@ impl AskRequest {
 			.reply
 			.send(Err(Fault::Presenter { message: message.into_str() }));
 	}
+}
+#[cfg(test)]
+pub(crate) fn test_request(question: Question) -> (AskRequest, Receiver<Result<Answer, Fault>>) {
+	let (reply, result) = flume::bounded(1);
+	let request = AskRequest { request: dialog_request(&question), question, reply };
+	(request, result)
 }
 
 /// Exclusive binding installed by the active terminal host.
@@ -156,13 +172,19 @@ const fn presenter_fault(message: &'static str) -> Fault {
 }
 
 /// Result of routing input through an Ask dialog.
+#[derive(Debug, Eq, PartialEq)]
 pub enum AskDialogEvent {
 	/// Event consumed while the dialog remains open.
 	Consumed,
 	/// User cancelled the dialog.
 	Cancel,
-	/// User submitted selected labels.
-	Submit(Vec<Str>),
+	/// User submitted fixed selections or one custom answer.
+	Submit {
+		/// Selected model-authored option labels.
+		selected:     Vec<Str>,
+		/// User-authored answer entered through the always-present Other row.
+		custom_input: Option<Str>,
+	},
 }
 
 /// Core-owned Ask dialog supporting single and multi selection.
@@ -171,6 +193,8 @@ pub struct AskDialog {
 	options:  OverlayOptions,
 	question: Question,
 	selected: Vec<Str>,
+	custom:   Option<PromptOverlay>,
+	ctx:      UiContext,
 	width:    u16,
 }
 
@@ -178,25 +202,52 @@ impl AskDialog {
 	/// Opens a typed Ask question.
 	pub fn open(question: Question, ctx: &UiContext) -> Self {
 		let width = 72;
+		let mut ui = build_dialog(&question, width, ctx);
+		ui.focus_first();
 		Self {
-			ui: build_dialog(&question, width, ctx),
+			ui,
 			options: OverlayOptions::default()
 				.anchor(OverlayAnchor::Center)
 				.z(30),
 			question,
 			selected: Vec::new(),
+			custom: None,
+			ctx: ctx.clone(),
 			width,
 		}
 	}
 
 	/// Routes a key through the dialog.
 	pub fn handle_key(&mut self, key: Key) -> AskDialogEvent {
+		if let Some(custom) = self.custom.as_mut() {
+			return match custom.handle_key(key) {
+				PromptEvent::Consumed => AskDialogEvent::Consumed,
+				PromptEvent::Cancel => {
+					self.custom = None;
+					AskDialogEvent::Consumed
+				},
+				PromptEvent::Submit(value) if value.trim().is_empty() => AskDialogEvent::Consumed,
+				PromptEvent::Submit(value) => {
+					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value) }
+				},
+			};
+		}
 		let event = self.ui.handle_key(key);
 		self.route(event)
 	}
 
 	/// Routes pasted custom input.
 	pub fn handle_paste(&mut self, text: &str) -> AskDialogEvent {
+		if let Some(custom) = self.custom.as_mut() {
+			return match custom.handle_paste(text) {
+				PromptEvent::Submit(value) if !value.trim().is_empty() => {
+					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value) }
+				},
+				PromptEvent::Consumed | PromptEvent::Cancel | PromptEvent::Submit(_) => {
+					AskDialogEvent::Consumed
+				},
+			};
+		}
 		let event = self.ui.handle_paste(text);
 		self.route(event)
 	}
@@ -209,6 +260,19 @@ impl AskDialog {
 		kind: Mouse,
 		viewport: Size,
 	) -> AskDialogEvent {
+		if let Some(custom) = self.custom.as_mut() {
+			return match custom.handle_mouse(col, row, kind, viewport) {
+				PromptEvent::Consumed => AskDialogEvent::Consumed,
+				PromptEvent::Cancel => {
+					self.custom = None;
+					AskDialogEvent::Consumed
+				},
+				PromptEvent::Submit(value) if value.trim().is_empty() => AskDialogEvent::Consumed,
+				PromptEvent::Submit(value) => {
+					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value) }
+				},
+			};
+		}
 		match self
 			.ui
 			.handle_mouse_as_layer(&self.options, viewport, col, row, kind)
@@ -221,6 +285,9 @@ impl AskDialog {
 
 	/// Returns the centered composited layer.
 	pub fn layer(&mut self, viewport: Size) -> Layer<'_> {
+		if let Some(custom) = self.custom.as_mut() {
+			return custom.layer(viewport);
+		}
 		let width = self.width.min(viewport.width);
 		self.options = self.options.width(Dim::Cells(width));
 		Layer { frame: self.ui.frame(), options: &self.options, active: true }
@@ -229,8 +296,13 @@ impl AskDialog {
 	fn route(&mut self, event: UiEvent) -> AskDialogEvent {
 		match event {
 			UiEvent::Cancel => AskDialogEvent::Cancel,
-			UiEvent::Submit if self.question.multi => {
-				AskDialogEvent::Submit(mem::take(&mut self.selected))
+			UiEvent::Submit if self.question.multi => AskDialogEvent::Submit {
+				selected:     mem::take(&mut self.selected),
+				custom_input: None,
+			},
+			UiEvent::Changed { value, .. } if value == OTHER_VALUE => {
+				self.custom = Some(PromptOverlay::open("Other answer", false, &self.ctx));
+				AskDialogEvent::Consumed
 			},
 			UiEvent::Changed { value, .. } if self.question.multi => {
 				if let Some(at) = self.selected.iter().position(|chosen| chosen == &value) {
@@ -240,7 +312,9 @@ impl AskDialog {
 				}
 				AskDialogEvent::Consumed
 			},
-			UiEvent::Changed { value, .. } => AskDialogEvent::Submit(vec![value]),
+			UiEvent::Changed { value, .. } => {
+				AskDialogEvent::Submit { selected: vec![value], custom_input: None }
+			},
 			UiEvent::None
 			| UiEvent::Submit
 			| UiEvent::Filtered { .. }
@@ -259,24 +333,44 @@ fn build_dialog(question: &Question, width: u16, ctx: &UiContext) -> Ui {
 	let title = question.header.clone().unwrap_or_else(|| sf!("Ask"));
 	let prompt = question.question.clone();
 	let multi = question.multi;
-	let rows = u16::try_from(question.options.len())
+	let recommended = question
+		.recommended
+		.filter(|index| *index < question.options.len());
+	let rows = u16::try_from(question.options.len().saturating_add(1))
 		.unwrap_or(u16::MAX)
 		.clamp(3, 12);
-	let choices = question.options.clone();
+	let choices = question
+		.options
+		.iter()
+		.enumerate()
+		.map(|(index, choice)| {
+			let recommended = recommended == Some(index);
+			let label = if recommended {
+				sf!("{} (Recommended)", choice.label)
+			} else {
+				choice.label.clone()
+			};
+			(choice.clone(), label, recommended)
+		})
+		.collect::<Vec<_>>();
 	Ui::from_root(
 		OverlayPanel::new(title).child(dom! {
 			<col>
 				<markdown>{prompt}</markdown>
 				{panel_divider()}
 				<select id="ask" multi={multi} h={rows}>
-					for choice in choices {
-						<option value={choice.label.clone()} label={choice.label}>
+					for (choice, label, is_recommended) in choices {
+						<option value={choice.label.clone()} label={label.clone()} recommended={is_recommended}>
 							<col>
+								<text>{label}</text>
 								if let Some(description) = choice.description { <text dim>{description}</text> }
 								if let Some(preview) = choice.preview { <markdown dim>{preview}</markdown> }
 							</col>
 						</option>
 					}
+					<option value={OTHER_VALUE} label="Other">
+						<text>{"Other…"}</text>
+					</option>
 				</select>
 				{panel_divider()}
 				<text dim>{if multi { "Space toggle · Enter confirm · Esc cancel" } else { "Enter choose · Esc cancel" }}</text>
@@ -326,5 +420,33 @@ mod tests {
 		};
 		assert_eq!(dialog.kind, "ask");
 		assert_eq!(dialog.choices, ["Rust", "Python"]);
+	}
+	#[test]
+	fn recommended_option_owns_initial_cursor_and_submission() {
+		let ctx = UiContext::default();
+		let mut question = question(false);
+		question.recommended = Some(1);
+		let mut dialog = AskDialog::open(question, &ctx);
+
+		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Submit {
+			selected:     vec![sf!("Python")],
+			custom_input: None,
+		});
+	}
+
+	#[test]
+	fn other_opens_a_guarded_custom_answer_editor() {
+		let ctx = UiContext::default();
+		let mut dialog = AskDialog::open(question(false), &ctx);
+
+		assert_eq!(dialog.handle_key(Key::Down), AskDialogEvent::Consumed);
+		assert_eq!(dialog.handle_key(Key::Down), AskDialogEvent::Consumed);
+		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Consumed);
+		assert!(dialog.custom.is_some());
+		assert_eq!(dialog.handle_paste("DuckDB"), AskDialogEvent::Consumed);
+		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Submit {
+			selected:     Vec::new(),
+			custom_input: Some(sf!("DuckDB")),
+		});
 	}
 }

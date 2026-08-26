@@ -9,9 +9,9 @@ use std::{
 use omp_core::Str;
 use parking_lot::Mutex;
 use smol_bitmap::SmolBitmap;
-use xutf::{Text, width_char};
+use xutf::Text;
 
-use crate::markup::Border;
+use crate::{markup::Border, rich::cell_width};
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1006,7 +1006,7 @@ impl Frame {
 			if character.is_control() {
 				return column;
 			}
-			let glyph_width = u16::try_from(width_char(character)).unwrap_or(u16::MAX);
+			let glyph_width = cell_width(text);
 			if glyph_width == 0 || column >= right || glyph_width > right - column {
 				return column;
 			}
@@ -1022,7 +1022,7 @@ impl Frame {
 				continue;
 			}
 
-			let width = u16::try_from(grapheme.visible_width()).unwrap_or(u16::MAX);
+			let width = cell_width(grapheme);
 			if width == 0 {
 				continue;
 			}
@@ -1327,6 +1327,10 @@ impl Frame {
 #[cfg(test)]
 mod tests {
 	use super::{CellContent, Color, Decor, DecorFill, DecorKind, Frame, Rect, Size, Style};
+	use crate::{
+		context::JamoWidth,
+		rich::{jamo_width, set_jamo_width},
+	};
 
 	fn decor(rect: Rect) -> Decor {
 		Decor {
@@ -1357,6 +1361,29 @@ mod tests {
 		frame.put(0, 0, "a", Style::default());
 
 		assert!(matches!(frame.cell(1, 0).content, CellContent::Blank));
+	}
+
+	#[test]
+	fn frame_reserves_jamo_with_the_active_terminal_policy() {
+		let original = jamo_width();
+		set_jamo_width(JamoWidth::Wide);
+		let mut wide = Frame::new(Size::new(4, 1));
+		let wide_end = wide.put(0, 0, "\u{3131}x", Style::default());
+		let wide_continuation = matches!(wide.cell(1, 0).content, CellContent::Continuation);
+
+		set_jamo_width(JamoWidth::Narrow);
+		let mut narrow = Frame::new(Size::new(4, 1));
+		let narrow_end = narrow.put(0, 0, "\u{3131}x", Style::default());
+		let narrow_x = matches!(
+			narrow.cell(1, 0).content,
+			CellContent::Grapheme { ref text, width: 1 } if text == "x"
+		);
+		set_jamo_width(original);
+
+		assert_eq!(wide_end, 3);
+		assert!(wide_continuation);
+		assert_eq!(narrow_end, 2);
+		assert!(narrow_x);
 	}
 
 	#[test]

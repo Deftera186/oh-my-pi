@@ -172,6 +172,7 @@ impl ToolCard {
 		self.set_folded(folded);
 		self
 	}
+
 	/// In-place update: chrome suppression for self-presenting views.
 	///
 	/// A flush card draws no header, rail, or footer: its children paint at
@@ -511,6 +512,21 @@ mod tests {
 		assert!(row_0.contains("bash"));
 		assert_eq!(frame_row_text(ui.frame(), 1), "│ echo ok");
 		assert_eq!(frame_row_text(ui.frame(), 2), "╰───────────────────");
+	}
+	#[test]
+	fn flush_card_paints_children_without_chrome() {
+		let card = ToolCard::new()
+			.name("read")
+			.intent("src/lib.rs")
+			.flush(true)
+			.child(TextLeaf::new().text("✔ read src/lib.rs"))
+			.state(ToolState::Success);
+
+		let ui = Ui::from_root(card, 30, UiContext::default());
+		assert_eq!(ui.frame().size().height, 1);
+		let row = frame_row_text(ui.frame(), 0);
+		assert_eq!(row, "✔ read src/lib.rs");
+		assert!(!row.contains('│'));
 	}
 
 	#[test]

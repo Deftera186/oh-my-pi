@@ -15,6 +15,7 @@ pub mod blocks;
 pub mod completion;
 pub mod debug_selector;
 pub mod extension_inspector;
+pub mod extension_ui;
 pub mod frame;
 pub mod git;
 pub mod gradient;
@@ -50,6 +51,7 @@ pub use extension_inspector::{
 	ExtensionInspectorEvent, ExtensionKind, ExtensionOrigin, ExtensionRow, ExtensionSnapshot,
 	LiveToolView, McpCatalogEntry, McpHealth, McpLiveSnapshot, McpToolView,
 };
+pub use extension_ui::{ExtensionDialog, ExtensionModalEvent, ExtensionOverlay};
 pub use git::{
 	GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitIntent, GitPatchOp,
 	GitSnapshot, GitUpdate, GitWorkbench, GitWorkbenchEvent,
@@ -65,6 +67,7 @@ pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
 pub use provider_picker::ProviderPicker;
 pub use pty::{PtyEvent, PtyOutputQueue, PtyOverlay, PtyStatus, TerminalState};
+pub use raw_stream::{RawFrame, RawStreamEvent, RawStreamViewer, StreamSummary};
 pub use scene::{
 	Chat, ChatKey, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer, RetirementBatch,
 	ToolPresentation, ViewportFrame,
@@ -81,6 +84,8 @@ pub struct ModelRow {
 	pub key:         Str,
 	/// Human-readable model name.
 	pub name:        Str,
+	/// Optional configured role color token.
+	pub color:       Option<Str>,
 	/// Stable provider identifier used to resolve its packaged logo.
 	pub provider_id: Str,
 	/// Human-readable provider name.
@@ -411,6 +416,40 @@ pub enum SubmitMode {
 	/// Alt+Enter: queue the message as a follow-up after the active turn.
 	FollowUp,
 }
+/// Provenance-typed content for a tool card.
+///
+/// Only renderer-authored markup is parsed. Generic output and fallback text
+/// remain literal even when they contain valid TML tags.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolViewContent {
+	/// Trusted core or exact-revision renderer markup.
+	Markup(Str),
+	/// Untrusted generic output rendered as literal text.
+	Plain(Str),
+}
+impl ToolViewContent {
+	/// Borrows the underlying source without changing its provenance.
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Markup(source) | Self::Plain(source) => source.as_str(),
+		}
+	}
+}
+
+/// Semantic terminal branch of a tool invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolTerminal {
+	/// The tool produced a successful durable result.
+	Succeeded,
+	/// Execution faulted after accepting its arguments.
+	Failed,
+	/// Execution was cancelled or ended without a result.
+	Aborted,
+	/// Execution was intentionally skipped before effects began.
+	Skipped,
+	/// The tool rejected its arguments without executing.
+	ArgsRejected,
+}
 
 /// Host-agnostic projection of one pending durable approval ticket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -586,14 +625,29 @@ pub enum Intent {
 		/// Exact approved Markdown shown by the review overlay.
 		content: Str,
 	},
-	/// Toggle real-time voice mode.
+	/// Toggle real-time voice mode through the backend session coordinator.
 	ToggleLive,
-	/// Toggle speech-to-text capture.
+	/// Apply one action to the active realtime voice session.
+	LiveVoice(LiveVoiceAction),
+	/// Toggle speech-to-text capture through the backend audio coordinator.
 	ToggleStt,
 	/// Suspend the terminal application after restoring terminal modes.
 	Suspend,
 	/// Re-query terminal appearance and force a complete repaint.
 	ResetDisplay,
+	/// Settle one correlated extension UI request.
+	UiResponse {
+		/// Opaque application-owned request correlation.
+		correlation: Str,
+		/// Canonical protocol response.
+		response:    v1::UiResponse,
+	},
+	/// Forward one interaction from a retained extension overlay.
+	UiOverlayEvent(v1::OverlayEvent),
+	/// Release the inference-owned raw-stream subscription.
+	CloseRawStream,
+	/// Copy complete viewer text through the host clipboard authority.
+	CopyToClipboard(Str),
 	/// Apply schema-driven settings mutations as a preview or persistent commit.
 	ApplySettings {
 		/// Typed reflected field changes.
@@ -741,8 +795,8 @@ pub enum BackendEvent {
 	ToolView {
 		/// Stable tool-call identifier.
 		id:   Str,
-		/// Renderer-produced TML or structured generic fallback text.
-		view: Str,
+		/// Provenance-typed renderer markup or literal fallback text.
+		view: ToolViewContent,
 	},
 	/// Attach an inline image to a live tool invocation.
 	///
@@ -758,11 +812,11 @@ pub enum BackendEvent {
 	/// Finish a tool invocation.
 	ToolFinished {
 		/// Stable tool-call identifier.
-		id:   Str,
-		/// Whether the invocation succeeded.
-		ok:   bool,
-		/// Renderer-produced TML or structured generic fallback text.
-		view: Str,
+		id:       Str,
+		/// Semantic durable terminal branch.
+		terminal: ToolTerminal,
+		/// Provenance-typed renderer markup or literal fallback text.
+		view:     ToolViewContent,
 	},
 	/// Append an in-place compaction summary divider.
 	Compacted {
@@ -836,10 +890,46 @@ pub enum BackendEvent {
 	Status(StatusFacts),
 	/// Preview a parsed theme without committing settings.
 	ThemePreview(omp_tui::Theme),
+	/// Replace the composer only after a host-owned external editor succeeds.
+	ComposerReplaced(Str),
+	/// Present or query one correlated extension UI request.
+	UiRequest {
+		/// Opaque application-owned request correlation.
+		correlation: Str,
+		/// Canonical protocol request.
+		request:     v1::UiRequest,
+	},
+	/// Apply one typed retained extension UI effect.
+	ApplyUiEffect(v1::UiEffect),
+	/// Open the subscribed raw provider stream viewer.
+	OpenRawStream {
+		/// Complete initial bounded ring snapshot.
+		frames:  Vec<RawFrame>,
+		/// Initial ring/drop counters.
+		summary: StreamSummary,
+	},
+	/// Append one subscribed raw provider stream frame.
+	RawStreamFrame {
+		/// Newly delivered sanitized frame.
+		frame:   RawFrame,
+		/// Updated ring/drop counters.
+		summary: StreamSummary,
+	},
+	/// Atomically replace the raw provider stream snapshot after eviction.
+	RawStreamSnapshot {
+		/// Complete current bounded ring snapshot.
+		frames:  Vec<RawFrame>,
+		/// Updated ring/drop counters.
+		summary: StreamSummary,
+	},
+	/// Close the raw provider stream viewer after subscription teardown.
+	RawStreamClosed,
 	/// Replace the composer's live chrome without reconstructing the chat.
 	ComposerStyleChanged(ComposerStyle),
 	/// Replace the editor's live spelling feature policy.
 	SpellingFeaturesChanged(omp_tui::SpellingFeatures),
+	/// Enable or disable paced grapheme reveal for streamed assistant text.
+	SmoothStreamingChanged(bool),
 	/// Update tiny-title model download activity.
 	ModelDownloadProgress(ModelDownloadProgress),
 	/// Start realtime voice composer takeover.

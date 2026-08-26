@@ -1124,12 +1124,14 @@ impl Component for EditInput {
 					.iter()
 					.all(|path| is_image_path(path) && Path::new(path.as_str()).exists())
 			{
-				for path in paths {
-					let attachment = attachments.push_image(path.clone());
-					let chip = chip_label(&attachment, ec.ctx.charset);
-					let _ = self.editor.insert_reference(&chip, path.as_str());
-					let _ = self.editor.insert_text(" ");
-				}
+				let references: Vec<_> = paths
+					.into_iter()
+					.map(|path| {
+						let attachment = attachments.push_image(path.clone());
+						(chip_label(&attachment, ec.ctx.charset).to_string(), path.to_string())
+					})
+					.collect();
+				let _ = self.editor.insert_reference_group(&references, " ");
 				self.refresh_keyword_spans();
 				ec.request_layout();
 				return Flow::Consumed;
@@ -1139,10 +1141,9 @@ impl Component for EditInput {
 			&& collapses_to_chip(text)
 		{
 			let attachment = attachments.push_text(text);
-			let chip = chip_label(&attachment, ec.ctx.charset);
-			let payload = sanitize_paste(text);
-			let _ = self.editor.insert_reference(&chip, &payload);
-			let _ = self.editor.insert_text(" ");
+			let references =
+				[(chip_label(&attachment, ec.ctx.charset).to_string(), sanitize_paste(text))];
+			let _ = self.editor.insert_reference_group(&references, " ");
 			self.refresh_keyword_spans();
 			ec.request_layout();
 			return Flow::Consumed;
@@ -3056,6 +3057,12 @@ mod tests {
 		let visible = editor_pane(&ui).buffer().text();
 		assert!(visible.find("#1").unwrap() < visible.find("#2").unwrap());
 		assert_eq!(editor_pane(&ui).buffer().expanded_text(), format!("{first_text} {second_text} "));
+		ui.handle_key(Key::Ctrl('_'));
+		assert_eq!(
+			editor_pane(&ui).buffer().text(),
+			"",
+			"one undo removes every chip and suffix from one drop"
+		);
 		fs::remove_dir_all(first.parent().unwrap()).ok();
 	}
 
@@ -3160,6 +3167,21 @@ mod tests {
 		);
 		assert!(attachments.is_empty());
 		assert_eq!(attachments.push_image("/nope/d.png").marker, 1, "numbering restarts");
+	}
+
+	#[test]
+	fn collapsed_paste_chip_and_suffix_undo_together() {
+		let mut ui =
+			Ui::from_root(EditorPane::new().with(Prop::Id, "composer"), 40, UiContext::default());
+		ui.focus_first();
+		let paste = (0..12)
+			.map(|n| format!("line{n}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		ui.handle_paste(&paste);
+		assert!(editor_pane(&ui).buffer().text().ends_with(' '));
+		ui.handle_key(Key::Ctrl('_'));
+		assert_eq!(editor_pane(&ui).buffer().text(), "");
 	}
 
 	#[test]

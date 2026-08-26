@@ -4,7 +4,7 @@
 //! cargo run -p omp-tui --example companies
 //! ```
 
-use std::{collections::HashMap, env, fs, io, time::Duration};
+use std::{collections::HashMap, env, io, time::Duration};
 
 use omp_tui::{
 	App, AppEvent, AppOptions, Cached, Elements, Graphics, Prop, Props, Size, TerminalCaps, Ui,
@@ -188,22 +188,18 @@ fn forced_from_args(caps: &TerminalCaps) -> Option<Graphics> {
 	forced
 }
 
-fn main() -> io::Result<()> {
-	let executor = omp_executor::Executor::new(None);
-	executor.clone().block_on(run(executor))
-}
-
-async fn run(executor: omp_executor::Executor) -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
 	let mut app = AppOptions::new()
 		.mouse()
 		.probe(Duration::from_millis(150))
 		.graphics_with(forced_from_args)
-		.start(executor.clone(), |env| build_ui(env.viewport, env.ctx))
+		.start(|env| build_ui(env.viewport, env.ctx))
 		.await?;
 	if app.caps().graphics != Graphics::Cells {
 		for (index, provider) in PROVIDERS.iter().enumerate() {
 			let path = format!("{ASSET_DIR}/{}.png", provider.id);
-			let png = executor.unblock(move || fs::read(path)).await?;
+			let png = tokio::fs::read(path).await?;
 			app.renderer_mut().register_image(
 				u32::try_from(index + 1).expect("provider count fits image IDs"),
 				png,

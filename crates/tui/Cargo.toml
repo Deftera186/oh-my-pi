@@ -26,21 +26,20 @@ test = true
 workspace = true
 
 [dependencies]
-async-io = { workspace = true }
 arboard = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
-futures-lite = { workspace = true }
 image = { workspace = true }
 im = { workspace = true }
 layout-rs = { workspace = true }
 mermaid-text = { workspace = true }
 omp-core = { workspace = true }
-omp-executor = { workspace = true }
 omp-macros = { workspace = true }
 omp-snapcompact = { workspace = true }
+omp-tui-vocab = { workspace = true }
 png = { workspace = true }
 parking_lot = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smol_bitmap = { workspace = true }
@@ -59,6 +58,7 @@ nix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-app-kit = { workspace = true }

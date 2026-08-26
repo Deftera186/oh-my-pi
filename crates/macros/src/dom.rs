@@ -162,42 +162,12 @@ fn lower_constructor(element: &Element) -> TokenStream2 {
 		return quote!(::omp_tui::components::Icon::named(#icon));
 	}
 
-	let component = match element.name.text.as_str() {
-		"box" => Some("Boxed"),
-		"text" => Some("TextLeaf"),
-		"pre" => Some("Pre"),
-		"md" => Some("Markdown"),
-		"latex" => Some("Latex"),
-		"callout" => Some("Callout"),
-		"col" => Some("Col"),
-		"row" => Some("Row"),
-		"hr" => Some("Hr"),
-		"spacer" => Some("Spacer"),
-		"select" => Some("Select"),
-		"table" => Some("Table"),
-		"radio" => Some("Radio"),
-		"segmented" => Some("Segmented"),
-		"checkbox" => Some("Checkbox"),
-		"status" => Some("Status"),
-		"input" => Some("Input"),
-		"button" => Some("Button"),
-		"scroll" => Some("Scroll"),
-		"tabs" => Some("Tabs"),
-		"tree" => Some("Tree"),
-		"todo" => Some("Todo"),
-		"form" => Some("Form"),
-		"progress" => Some("Progress"),
-		"img" => Some("Img"),
-		"logo" => Some("Logo"),
-		"editor" => Some("EditorPane"),
-		"wizard" => Some("Wizard"),
-		"icon" => {
-			let name = attr_named(&element.attrs, "name").map_or_else(|| quote!(""), attr_tokens);
-			return quote!(::omp_tui::components::Icon::named(#name));
-		},
-		_ => None,
-	};
-	if let Some(component) = component {
+	if element.name.text == "icon" {
+		let name = attr_named(&element.attrs, "name").map_or_else(|| quote!(""), attr_tokens);
+		return quote!(::omp_tui::components::Icon::named(#name));
+	}
+
+	if let Some(component) = component_type(&element.name.text) {
 		let component = format_ident!("{component}", span = element.name.span);
 		quote!(::omp_tui::components::#component::new())
 	} else {
@@ -592,193 +562,79 @@ fn is_data_tag(name: &str) -> bool {
 	matches!(name, "option" | "segment" | "tab" | "node" | "task" | "field" | "step" | "tr" | "td")
 }
 
+macro_rules! prop_rows {
+	($(
+		$(#[$meta:meta])*
+		$variant:ident($name:literal)
+		$(@ $setter:ident)?
+		$(=> $field:ident: $type:ty $([$($getter:tt)+])?)?;
+	)+) => {
+		[$(($name, stringify!($variant)),)+]
+	};
+}
+const PROPS: &[(&str, &str)] = &omp_tui_vocab::for_each_prop! { prop_rows };
+
 fn prop_variant(name: &str) -> Option<&'static str> {
-	Some(match name {
-		"gap" => "Gap",
-		"pad" => "Pad",
-		"pad-x" => "PadX",
-		"pad-y" => "PadY",
-		"grow" => "Grow",
-		"w" => "W",
-		"min" => "Min",
-		"max" => "Max",
-		"h" => "H",
-		"border" => "Border",
-		"bc" => "Bc",
-		"edge" => "Edge",
-		"bleed" => "Bleed",
-		"title" => "Title",
-		"title-align" => "TitleAlign",
-		"footer" => "Footer",
-		"footer-align" => "FooterAlign",
-		"align" => "Align",
-		"valign" => "VAlign",
-		"justify" => "Justify",
-		"fg" => "Fg",
-		"bg" => "Bg",
-		"on" => "On",
-		"bold" => "Bold",
-		"dim" => "Dim",
-		"italic" => "Italic",
-		"underline" => "Underline",
-		"reverse" => "Reverse",
-		"strike" => "Strike",
-		"wrap" => "Wrap",
-		"variant" => "Variant",
-		"active" => "Active",
-		"color" => "Color",
-		"truncate" => "Truncate",
-		"trim" => "Trim",
-		"id" => "Id",
-		"when" => "When",
-		"value" => "Value",
-		"key" => "Key",
-		"options" => "Options",
-		"label" => "Label",
-		"prefix" => "Prefix",
-		"annotation" => "Annotation",
-		"annotation-color" => "AnnotationColor",
-		"action" => "Action",
-		"action-color" => "ActionColor",
-		"desc" => "Desc",
-		"kind" => "Kind",
-		"step" => "Step",
-		"multi" => "Multi",
-		"filter" => "Filter",
-		"custom" => "Custom",
-		"mask" => "Mask",
-		"checked" => "Checked",
-		"limit" => "Limit",
-		"rail" => "Rail",
-		"max-rows" => "MaxRows",
-		"noselect" => "NoSelect",
-		"recommended" => "Recommended",
-		"open" => "Open",
-		"required" => "Required",
-		"match" => "Match",
-		"src" => "Src",
-		"icon" => "Icon",
-		"badge" => "Badge",
-		"submit" => "Submit",
-		"cancel" => "Cancel",
-		"confirm" => "Confirm",
-		"placeholder" => "Placeholder",
-		"angle" => "Angle",
-		"accent" => "Accent",
-		"vertical" => "Vertical",
-		"anim" => "Anim",
-		"ease" => "Ease",
-		"spin" => "Spin",
-		"hover" => "Hover",
-		"lift" => "Lift",
-		"focus" => "Focus",
-		"guides" => "Guides",
-		"status" => "Status",
-		"shimmer" => "Shimmer",
-		"reveal" => "Reveal",
-		"context" => "Context",
-		"minimap" => "Minimap",
-		_ => return None,
-	})
+	PROPS
+		.iter()
+		.find_map(|&(attr, variant)| (attr == name).then_some(variant))
+}
+
+macro_rules! component_rows {
+	($($tag:ident => $type:ident;)+) => {
+		[$((stringify!($tag), stringify!($type)),)+]
+	};
+}
+const COMPONENTS: &[(&str, &str)] = &omp_tui_vocab::for_each_component! { component_rows };
+
+fn component_type(name: &str) -> Option<&'static str> {
+	COMPONENTS
+		.iter()
+		.find_map(|&(tag, component)| (name == tag).then_some(component))
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use syn::{Expr, parse2};
 
-	const ATTR_FIXTURE: &[&str] = &[
-		"gap",
-		"pad",
-		"pad-x",
-		"pad-y",
-		"grow",
-		"w",
-		"min",
-		"max",
-		"h",
-		"border",
-		"bc",
-		"edge",
-		"bleed",
-		"title",
-		"title-align",
-		"footer",
-		"footer-align",
-		"align",
-		"valign",
-		"justify",
-		"fg",
-		"bg",
-		"on",
-		"bold",
-		"dim",
-		"italic",
-		"underline",
-		"reverse",
-		"strike",
-		"wrap",
-		"variant",
-		"active",
-		"color",
-		"truncate",
-		"trim",
-		"id",
-		"when",
-		"value",
-		"key",
-		"options",
-		"label",
-		"prefix",
-		"annotation",
-		"annotation-color",
-		"action",
-		"action-color",
-		"desc",
-		"kind",
-		"step",
-		"multi",
-		"filter",
-		"custom",
-		"mask",
-		"checked",
-		"limit",
-		"rail",
-		"max-rows",
-		"noselect",
-		"recommended",
-		"open",
-		"required",
-		"match",
-		"src",
-		"icon",
-		"badge",
-		"submit",
-		"cancel",
-		"confirm",
-		"placeholder",
-		"angle",
-		"accent",
-		"vertical",
-		"anim",
-		"ease",
-		"spin",
-		"hover",
-		"lift",
-		"focus",
-		"guides",
-		"status",
-		"shimmer",
-		"reveal",
-		"context",
-		"minimap",
-	];
+	use super::*;
 
 	#[test]
-	fn known_attributes_match_mirrored_fixture() {
-		for &name in ATTR_FIXTURE {
-			assert!(prop_variant(name).is_some(), "missing macro entry for {name:?}");
+	fn prop_table_matches_vocabulary() {
+		let mut names = omp_core::FastHashSet::default();
+		let mut variants = omp_core::FastHashSet::default();
+		for &(name, variant) in PROPS {
+			assert!(names.insert(name), "duplicate attr name {name:?}");
+			assert!(variants.insert(variant), "duplicate prop variant {variant:?}");
 		}
+		assert_eq!(prop_variant("valign"), Some("VAlign"));
+		assert_eq!(prop_variant("noselect"), Some("NoSelect"));
+		assert_eq!(prop_variant("minimap"), Some("Minimap"));
+	}
+
+	#[test]
+	fn component_table_matches_vocabulary() {
+		let mut tags = omp_core::FastHashSet::default();
+		let mut components = omp_core::FastHashSet::default();
+		for &(tag, component) in COMPONENTS {
+			assert!(tags.insert(tag), "duplicate tag {tag:?}");
+			assert!(components.insert(component), "duplicate component {component:?}");
+		}
+		assert_eq!(component_type("box"), Some("Boxed"));
+		assert_eq!(component_type("editor"), Some("EditorPane"));
+	}
+
+	#[test]
+	fn lowers_previously_untabled_props_typed() {
+		let actual =
+			expand(quote! { <text max-chars=80 sep=", ">{x}</text> }).expect("example should expand");
+		let expected = quote! {
+			::omp_tui::components::TextLeaf::new()
+				.with(::omp_tui::Prop::MaxChars, 80)
+				.with(::omp_tui::Prop::Sep, ", ")
+				.text(x)
+		};
+		assert_eq!(actual.to_string(), expected.to_string());
 	}
 
 	#[test]

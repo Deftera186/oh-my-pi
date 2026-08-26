@@ -19,7 +19,6 @@ flume = { workspace = true }
 jiff = { workspace = true }
 md-5 = { workspace = true }
 omp-core = { workspace = true }
-omp-executor = { workspace = true }
 omp-storage = { workspace = true }
 omp-tui = { workspace = true }
 omp-tools = { workspace = true }

@@ -1,6 +1,7 @@
 //! Width-aware Markdown rendering into styled terminal lines.
 
 use std::{
+	collections::HashMap,
 	fmt::{self, Write as _},
 	str,
 };
@@ -238,19 +239,179 @@ pub(crate) fn render_partial_capturing(
 	sink: &mut dyn RichSink,
 ) -> Option<FastTail> {
 	let normalized = normalize_source(src, false);
+	let resolved = resolve_reference_links(&normalized);
+	let references_resolved = resolved != normalized;
 	let width = width.max(1);
-	let tail = render_document(&normalized, width, theme, sink);
+	let tail = render_document(&resolved, width, theme, sink);
 	(tail == Some(BlockKind::Paragraph)
+		&& !references_resolved
 		&& !src.as_str().ends_with('\n')
 		&& !src.as_str().ends_with('\r'))
 	.then(|| FastTail::capture(src, width, *theme))
 }
 
 fn render_inner(src: &Str, width: u16, theme: &MdTheme, sink: &mut dyn RichSink, partial: bool) {
-	let normalized = normalize_source(src, !partial);
+	let normalized = resolve_reference_links(&normalize_source(src, !partial));
 	// degenerate viewports still make progress: every block renders at
 	// one cell and the paint layer clips
 	render_document(&normalized, width.max(1), theme, sink);
+}
+
+fn normalize_reference_label(label: &str) -> String {
+	label
+		.split_whitespace()
+		.collect::<Vec<_>>()
+		.join(" ")
+		.to_lowercase()
+}
+
+fn link_definition(line: &str) -> Option<(String, String)> {
+	let trimmed = line.trim_start_matches(' ');
+	if line.len().saturating_sub(trimmed.len()) > 3 || !trimmed.starts_with('[') {
+		return None;
+	}
+	let close = trimmed.find("]:")?;
+	let label = &trimmed[1..close];
+	if label.is_empty() {
+		return None;
+	}
+	let rest = trimmed[close + 2..].trim_start();
+	let destination = if let Some(rest) = rest.strip_prefix('<') {
+		&rest[..rest.find('>')?]
+	} else {
+		rest.split_ascii_whitespace().next()?
+	};
+	(!destination.is_empty()).then(|| (normalize_reference_label(label), destination.to_owned()))
+}
+
+fn reference_bracket_close(text: &str, start: usize) -> Option<usize> {
+	let bytes = text.as_bytes();
+	let mut at = start;
+	while at < bytes.len() {
+		match bytes[at] {
+			b'\\' => at = at.saturating_add(2),
+			b']' => return Some(at),
+			_ => at += 1,
+		}
+	}
+	None
+}
+
+fn expand_reference_links(line: &str, definitions: &HashMap<String, String>) -> Option<Str> {
+	let bytes = line.as_bytes();
+	let mut output: Option<StrMut> = None;
+	let mut copied = 0;
+	let mut at = 0;
+	let mut code_run = 0;
+	while at < bytes.len() {
+		match bytes[at] {
+			b'\\' => at = (at + 2).min(bytes.len()),
+			b'`' => {
+				let run = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
+				if code_run == 0 && code_span_len(&line[at..]).is_some() {
+					code_run = run;
+				} else if code_run == run {
+					code_run = 0;
+				}
+				at += run;
+			},
+			b'[' if code_run == 0 && (at == 0 || bytes[at - 1] != b'!') => {
+				let Some(label_close) = reference_bracket_close(line, at + 1) else {
+					at += 1;
+					continue;
+				};
+				if bytes.get(label_close + 1) == Some(&b'(') {
+					at = label_close + 1;
+					continue;
+				}
+				let label = &line[at + 1..label_close];
+				let (id, consumed) = if bytes.get(label_close + 1) == Some(&b'[') {
+					let Some(id_close) = reference_bracket_close(line, label_close + 2) else {
+						at = label_close + 1;
+						continue;
+					};
+					let id = &line[label_close + 2..id_close];
+					(if id.is_empty() { label } else { id }, id_close + 1)
+				} else {
+					(label, label_close + 1)
+				};
+				let key = normalize_reference_label(id);
+				let Some(destination) = definitions.get(&key) else {
+					at = consumed;
+					continue;
+				};
+				let output = output.get_or_insert_with(|| StrMut::with_capacity(line.len()));
+				output.push_str(&line[copied..at]);
+				output.push('[');
+				output.push_str(label);
+				output.push_str("](");
+				output.push_str(destination);
+				output.push(')');
+				copied = consumed;
+				at = consumed;
+			},
+			_ => at += 1,
+		}
+	}
+	let mut output = output?;
+	output.push_str(&line[copied..]);
+	Some(output.freeze())
+}
+
+fn resolve_reference_links(source: &Str) -> Str {
+	let mut definitions = HashMap::new();
+	let mut fence = None;
+	for line in source.as_str().split('\n') {
+		if let Some((marker, count)) = fence {
+			if is_closing_fence(line, marker, count) {
+				fence = None;
+			}
+			continue;
+		}
+		if let Some((marker, _)) = fence_start(line) {
+			let count = line
+				.trim_start_matches(' ')
+				.chars()
+				.take_while(|ch| *ch == marker)
+				.count();
+			fence = Some((marker, count));
+		} else if let Some((label, destination)) = link_definition(line) {
+			definitions.entry(label).or_insert(destination);
+		}
+	}
+	if definitions.is_empty() {
+		return source.clone();
+	}
+	let mut output = StrMut::with_capacity(source.len());
+	fence = None;
+	for (index, line) in source.as_str().split('\n').enumerate() {
+		if index > 0 {
+			output.push('\n');
+		}
+		if let Some((marker, count)) = fence {
+			output.push_str(line);
+			if is_closing_fence(line, marker, count) {
+				fence = None;
+			}
+			continue;
+		}
+		if let Some((marker, _)) = fence_start(line) {
+			let count = line
+				.trim_start_matches(' ')
+				.chars()
+				.take_while(|ch| *ch == marker)
+				.count();
+			fence = Some((marker, count));
+			output.push_str(line);
+		} else if link_definition(line).is_none() {
+			if let Some(expanded) = expand_reference_links(line, &definitions) {
+				output.push_str(expanded.as_str());
+			} else {
+				output.push_str(line);
+			}
+		}
+	}
+	output.freeze()
 }
 
 fn render_document(
@@ -558,6 +719,9 @@ impl DiagramLanguage {
 
 fn is_closing_fence(line: &str, fence: char, opening_count: usize) -> bool {
 	let candidate = line.trim_start_matches(' ');
+	if line.len().saturating_sub(candidate.len()) > 3 {
+		return false;
+	}
 	let close_count = candidate
 		.chars()
 		.take_while(|character| *character == fence)
@@ -677,13 +841,14 @@ fn is_gfm_table_delimiter(line: &str, header_line: &str) -> bool {
 	if !line.contains('|') || !header_line.contains('|') {
 		return false;
 	}
-	let mut delimiter_cells = table_cell_iter(line);
-	let delimiter_count = delimiter_cells.clone().count();
-	let mut header_cells = table_cell_iter(header_line);
-	delimiter_count >= 2
-		&& header_cells.clone().count() == delimiter_count
-		&& delimiter_cells.all(|cell| table_delimiter_alignment(cell).is_some())
-		&& header_cells.all(|cell| !cell.is_empty())
+	let delimiter_cells = table_cells(line);
+	let header_cells = table_cells(header_line);
+	delimiter_cells.len() >= 2
+		&& header_cells.len() == delimiter_cells.len()
+		&& delimiter_cells
+			.iter()
+			.all(|cell| table_delimiter_alignment(cell).is_some())
+		&& header_cells.iter().all(|cell| !cell.is_empty())
 }
 
 fn render_fenced_code(
@@ -1308,24 +1473,57 @@ fn table_header<'a>(lines: &[&'a str], index: usize) -> Option<(Vec<Alignment>, 
 	(header.len() == alignments.len() && !header.is_empty()).then_some((alignments, header))
 }
 
-fn table_cell_iter(line: &str) -> impl Clone + Iterator<Item = &str> {
-	let trimmed = line.trim();
-	let body = trimmed.strip_prefix('|').unwrap_or(trimmed);
-	let body = body.strip_suffix('|').unwrap_or(body);
-	body.split('|').map(str::trim)
-}
-
 fn table_cells(line: &str) -> Vec<&str> {
-	table_cell_iter(line).collect()
+	let line = line.trim();
+	let bytes = line.as_bytes();
+	let mut delimiters = Vec::new();
+	let mut at = 0;
+	let mut code_run = 0;
+	while at < bytes.len() {
+		match bytes[at] {
+			b'\\' => at = (at + 2).min(bytes.len()),
+			b'`' => {
+				let run = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
+				if code_run == 0 && code_span_len(&line[at..]).is_some() {
+					code_run = run;
+				} else if code_run == run {
+					code_run = 0;
+				}
+				at += run;
+			},
+			b'|' if code_run == 0 => {
+				delimiters.push(at);
+				at += 1;
+			},
+			_ => at += 1,
+		}
+	}
+	if delimiters.is_empty() {
+		return vec![line];
+	}
+	let mut cells = Vec::with_capacity(delimiters.len() + 1);
+	let mut start = 0;
+	for delimiter in delimiters {
+		cells.push(line[start..delimiter].trim());
+		start = delimiter + 1;
+	}
+	cells.push(line[start..].trim());
+	if cells.first() == Some(&"") && line.starts_with('|') {
+		cells.remove(0);
+	}
+	if cells.last() == Some(&"") && line.ends_with('|') {
+		cells.pop();
+	}
+	cells
 }
 
 fn table_separator(line: &str) -> Option<Vec<Alignment>> {
 	if !line.contains('|') {
 		return None;
 	}
-	let cells = table_cell_iter(line);
-	cells.clone().next()?;
-	cells.map(table_alignment).collect()
+	let cells = table_cells(line);
+	(!cells.is_empty()).then_some(())?;
+	cells.into_iter().map(table_alignment).collect()
 }
 
 fn table_alignment(cell: &str) -> Option<Alignment> {
@@ -1940,6 +2138,44 @@ mod tests {
 			"│ that wraps"
 		]);
 		assert_eq!(plain(">Foo\nbar", 80), ["│ Foo", "│ bar"]);
+	}
+
+	#[test]
+	fn reference_links_resolve_document_global_definitions() {
+		let theme = MdTheme::default();
+		let rendered = rendered(
+			"[Alpha][target] [target][] [target]\n\n[target]: https://example.test",
+			300,
+			&theme,
+		);
+		assert_eq!(
+			rendered.row_text(0),
+			"Alpha (https://example.test) target (https://example.test) target (https://example.test)"
+		);
+		assert!(
+			rendered
+				.row_runs(0)
+				.filter(|(_, text)| matches!(*text, "Alpha" | "target"))
+				.all(|(style, _)| style.foreground_color() == theme.link.foreground_color())
+		);
+		assert_eq!(RichText::rows(&rendered), 1, "definition is not visible prose");
+	}
+
+	#[test]
+	fn table_scanner_ignores_escaped_and_code_span_pipes() {
+		let rows = plain("A \\| B | Code\n--- | ---\none \\| two | `a|b`", 80);
+		assert!(rows.iter().any(|row| row.contains("A | B")), "{rows:?}");
+		assert!(rows.iter().any(|row| row.contains("one | two")), "{rows:?}");
+		assert!(rows.iter().any(|row| row.contains("a|b")), "{rows:?}");
+		assert!(rows.first().is_some_and(|row| row.starts_with('┌')), "{rows:?}");
+	}
+
+	#[test]
+	fn closing_fences_allow_at_most_three_spaces() {
+		assert!(is_closing_fence("   ```", '`', 3));
+		assert!(!is_closing_fence("    ```", '`', 3));
+		let rows = plain("```\nbefore\n    ```\nafter\n```", 80);
+		assert!(rows.iter().any(|row| row.contains("after")), "{rows:?}");
 	}
 
 	#[test]

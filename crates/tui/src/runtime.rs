@@ -8,17 +8,15 @@
 //!
 //! use omp_tui::{AppOptions, Ui};
 //!
-//! fn main() -> io::Result<()> {
-//! 	let executor = omp_executor::Executor::new(None);
-//! 	executor.clone().block_on(async move {
-//! 		let mut app = AppOptions::new()
-//! 			.start(executor, |env| Ui::from_markup("hello", env.viewport.width, env.ctx).unwrap())
-//! 			.await?;
-//! 		while let Some(event) = app.next().await? {
-//! 			let _ = event;
-//! 		}
-//! 		Ok(())
-//! 	})
+//! #[tokio::main]
+//! async fn main() -> io::Result<()> {
+//! 	let mut app = AppOptions::new()
+//! 		.start(|env| Ui::from_markup("hello", env.viewport.width, env.ctx).unwrap())
+//! 		.await?;
+//! 	while let Some(event) = app.next().await? {
+//! 		let _ = event;
+//! 	}
+//! 	Ok(())
 //! }
 //! ```
 //!
@@ -156,16 +154,15 @@ impl ClipboardGate {
 /// Off-thread image decoder used by asynchronous UI hosts.
 #[derive(Clone)]
 pub struct ImageLoader {
-	tx:       flume::Sender<Msg>,
-	rx:       Receiver<Msg>,
-	executor: omp_executor::Executor,
+	tx: flume::Sender<Msg>,
+	rx: Receiver<Msg>,
 }
 
 impl ImageLoader {
-	/// Creates a loader attached to `executor`.
-	pub fn new(executor: omp_executor::Executor) -> Self {
+	/// Creates a loader; decodes run on the rayon global pool.
+	pub fn new() -> Self {
 		let (tx, rx) = flume::unbounded();
-		Self { tx, rx, executor }
+		Self { tx, rx }
 	}
 
 	pub(crate) fn request(
@@ -178,16 +175,19 @@ impl ImageLoader {
 		prepare_kitty: bool,
 	) {
 		let tx = self.tx.clone();
-		self
-			.executor
-			.unblock(move || {
-				if prepare_kitty {
-					let _ = imagereg::prepare_png(&source);
-				}
-				let state = components::decode_source(&source, width, height, trim);
-				let _ = tx.send(Msg::ImageDecoded { slot, state });
-			})
-			.detach();
+		rayon::spawn(move || {
+			if prepare_kitty {
+				let _ = imagereg::prepare_png(&source);
+			}
+			let state = components::decode_source(&source, width, height, trim);
+			let _ = tx.send(Msg::ImageDecoded { slot, state });
+		});
+	}
+}
+
+impl Default for ImageLoader {
+	fn default() -> Self {
+		Self::new()
 	}
 }
 
@@ -347,15 +347,11 @@ impl AppOptions {
 	/// # Errors
 	///
 	/// Propagates terminal, input, capability, and renderer failures.
-	pub async fn start(
-		self,
-		executor: omp_executor::Executor,
-		build: impl FnOnce(AppEnv) -> Ui + Send,
-	) -> io::Result<App> {
+	pub async fn start(self, build: impl FnOnce(AppEnv) -> Ui + Send) -> io::Result<App> {
 		let Self { probe, graphics, cursor_style, quit, hotkeys, quit_on_cancel, mouse, hold_alt } =
 			self;
 		let (base, probe) = match probe {
-			Some(timeout) => negotiate_async(&executor, timeout).await,
+			Some(timeout) => negotiate_async(timeout).await,
 			None => (detect(), ProbeResults::default()),
 		};
 		let forced = graphics.and_then(|forced| forced(&base));
@@ -364,10 +360,10 @@ impl AppOptions {
 		if let Some(style) = cursor_style {
 			terminal_options = terminal_options.cursor_style(style);
 		}
-		let mut terminal = Terminal::enter(executor.clone(), terminal_options)?;
+		let mut terminal = Terminal::enter(terminal_options)?;
 		let viewport = terminal.size()?;
 
-		let loader = ImageLoader::new(executor.clone());
+		let loader = ImageLoader::new();
 		let msgs = loader.rx.clone();
 		let tx = loader.tx.clone();
 		let mut ctx = UiContext::default().with_terminal_caps(&caps);
@@ -389,7 +385,6 @@ impl AppOptions {
 		};
 		let now = Instant::now();
 		Ok(App {
-			executor,
 			ui,
 			renderer,
 			msgs,
@@ -532,7 +527,6 @@ pub enum AppEvent {
 
 /// Running retained-UI terminal host.
 pub struct App {
-	executor:       omp_executor::Executor,
 	ui:             Ui,
 	renderer:       Renderer<TtyOut>,
 	msgs:           Receiver<Msg>,
@@ -634,7 +628,6 @@ impl App {
 			// same fixed viewport. Only the staged enter/leave prefix differs.
 			let want_hold = self.hold_request || self.ui.has_overlay();
 			if want_hold != self.alt_hold {
-				self.alt_hold = want_hold;
 				let prefix = if want_hold {
 					self
 						.terminal
@@ -646,6 +639,10 @@ impl App {
 				self.last_stats = self
 					.ui
 					.repaint(&mut self.renderer, self.viewport.height, &prefix)?;
+				if !want_hold {
+					self.terminal.commit_alt_leave();
+				}
+				self.alt_hold = want_hold;
 			} else if self.ui.has_damage() {
 				self.last_stats = self.ui.present(&mut self.renderer, self.viewport.height)?;
 			}
@@ -670,10 +667,10 @@ impl App {
 				() = self.cancel.cancelled() => Wakeup::Cancelled,
 				message = self.msgs.recv_async() => Wakeup::Message(message),
 				event = self.terminal.next() => Wakeup::Event(event),
-				() = deadline(&self.executor, wake) => Wakeup::Animation,
-				() = deadline(&self.executor, self.clipboard.deadline()) => Wakeup::ClipboardExpired,
-				() = deadline(&self.executor, self.resize_wait) => Wakeup::ResizeCheck,
-				() = deadline(&self.executor, self.resize_settle) => Wakeup::ResizeSettle,
+				() = deadline(wake) => Wakeup::Animation,
+				() = deadline(self.clipboard.deadline()) => Wakeup::ClipboardExpired,
+				() = deadline(self.resize_wait) => Wakeup::ResizeCheck,
+				() = deadline(self.resize_settle) => Wakeup::ResizeSettle,
 			};
 
 			match wakeup {
@@ -871,13 +868,10 @@ impl App {
 		let rx = paste::spawn_clipboard_read(scope);
 		let raw = scope == ClipboardRead::Text;
 		let tx = self.tx.clone();
-		self
-			.executor
-			.spawn(async move {
-				let clipboard = rx.await.unwrap_or(None);
-				let _ = tx.send(Msg::Pasted { generation, raw, clipboard });
-			})
-			.detach();
+		tokio::spawn(async move {
+			let clipboard = rx.await.unwrap_or(None);
+			let _ = tx.send(Msg::Pasted { generation, raw, clipboard });
+		});
 	}
 
 	/// Routes one decoded input event into the retained tree, mapping the
@@ -1087,13 +1081,9 @@ enum Wakeup {
 }
 
 /// Sleeps until `at`; `None` is a disabled select branch.
-async fn deadline(executor: &omp_executor::Executor, at: Option<Instant>) {
+async fn deadline(at: Option<Instant>) {
 	match at {
-		Some(at) => {
-			executor
-				.timer(at.saturating_duration_since(Instant::now()))
-				.await
-		},
+		Some(at) => tokio::time::sleep_until(at.into()).await,
 		None => future::pending().await,
 	}
 }
@@ -1171,22 +1161,23 @@ mod tests {
 		if env::var_os(HOLD_HELPER_FLAG).is_none() {
 			return;
 		}
-		let executor = omp_executor::Executor::new(None);
-		executor.clone().block_on(async {
-			let mut app = AppOptions::new()
-				.hold_alt()
-				.start(executor.clone(), |env| {
-					Ui::from_markup("<text>inline</text>", env.viewport.width, env.ctx).unwrap()
-				})
-				.await
-				.expect("helper app starts on the override device");
-			executor.timer(Duration::from_millis(250)).await;
-			app.hold_alt(false);
-			let _ = executor
-				.timeout(Duration::from_millis(200), app.next())
-				.await;
-			drop(app);
-		});
+		tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.expect("helper runtime builds")
+			.block_on(async {
+				let mut app = AppOptions::new()
+					.hold_alt()
+					.start(|env| {
+						Ui::from_markup("<text>inline</text>", env.viewport.width, env.ctx).unwrap()
+					})
+					.await
+					.expect("helper app starts on the override device");
+				tokio::time::sleep(Duration::from_millis(250)).await;
+				app.hold_alt(false);
+				let _ = tokio::time::timeout(Duration::from_millis(200), app.next()).await;
+				drop(app);
+			});
 	}
 
 	/// An `AppOptions::hold_alt()` start with no overlay paints frame one on
@@ -1417,13 +1408,8 @@ mod tests {
 		reason = "this helper runs only in current-thread Tokio tests with thread-confined UI \
 		          components"
 	)]
-	async fn receive_image<'a>(
-		executor: &omp_executor::Executor,
-		loader: &'a ImageLoader,
-		ui: &'a mut Ui,
-	) {
-		let message = executor
-			.timeout(Duration::from_secs(5), loader.rx.recv_async())
+	async fn receive_image<'a>(loader: &'a ImageLoader, ui: &'a mut Ui) {
+		let message = tokio::time::timeout(Duration::from_secs(5), loader.rx.recv_async())
 			.await
 			.expect("image decode completes")
 			.expect("image bus remains connected");
@@ -1433,56 +1419,52 @@ mod tests {
 		assert!(ui.deliver_image(slot, state));
 	}
 
-	#[test]
-	fn image_decode_delivers_without_blocking_initial_layout() {
-		let executor = omp_executor::Executor::new(None);
-		executor.clone().block_on(async {
-			let dir = env::temp_dir().join(format!("omp-tui-runtime-image-{}", process::id()));
-			fs::create_dir_all(&dir).unwrap();
-			let path = dir.join("async.ppm");
-			let mut ppm = b"P6\n4 4\n255\n".to_vec();
-			for y in 0..4 {
-				for _ in 0..4 {
-					ppm.extend(if y < 2 { [255, 0, 0] } else { [0, 0, 255] });
-				}
+	#[tokio::test(flavor = "current_thread")]
+	async fn image_decode_delivers_without_blocking_initial_layout() {
+		let dir = env::temp_dir().join(format!("omp-tui-runtime-image-{}", process::id()));
+		fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("async.ppm");
+		let mut ppm = b"P6\n4 4\n255\n".to_vec();
+		for y in 0..4 {
+			for _ in 0..4 {
+				ppm.extend(if y < 2 { [255, 0, 0] } else { [0, 0, 255] });
 			}
-			fs::write(&path, ppm).unwrap();
+		}
+		fs::write(&path, ppm).unwrap();
 
-			let loader = ImageLoader::new(executor.clone());
-			let ctx = UiContext { loader: Some(loader.clone()), ..UiContext::default() };
-			let mut ui =
-				Ui::from_markup(format!("<img src={} w=4/>", path.display()), 10, ctx).unwrap();
-			let initial_rows = (0..ui.height())
-				.map(|row| frame_row_text(ui.frame(), row))
-				.collect::<Vec<_>>();
-			assert_eq!(ui.height(), 3, "loading uses the fixed box placeholder");
-			assert!(initial_rows[0].contains('┌'));
-			assert!(!initial_rows.iter().any(|row| row.contains('▀')));
+		let loader = ImageLoader::new();
+		let ctx = UiContext { loader: Some(loader.clone()), ..UiContext::default() };
+		let mut ui = Ui::from_markup(format!("<img src={} w=4/>", path.display()), 10, ctx).unwrap();
+		let initial_rows = (0..ui.height())
+			.map(|row| frame_row_text(ui.frame(), row))
+			.collect::<Vec<_>>();
+		assert_eq!(ui.height(), 3, "loading uses the fixed box placeholder");
+		assert!(initial_rows[0].contains('┌'));
+		assert!(!initial_rows.iter().any(|row| row.contains('▀')));
 
-			receive_image(&executor, &loader, &mut ui).await;
-			assert_eq!(ui.height(), 2, "4px source relayouts to two half-block rows");
-			assert!((0..ui.height()).any(|row| frame_row_text(ui.frame(), row).contains('▀')));
+		receive_image(&loader, &mut ui).await;
+		assert_eq!(ui.height(), 2, "4px source relayouts to two half-block rows");
+		assert!((0..ui.height()).any(|row| frame_row_text(ui.frame(), row).contains('▀')));
 
-			let elements = Elements::builder()
-				.with("logo", |_: &str, props: Props, _: Vec<Cached>| {
-					let source = props.str_of(Prop::Src).map_or("", |value| value.as_str());
-					Box::new(Img::new().with_str(Prop::Src, source).with(Prop::W, 4_u16))
-						as Box<dyn Component>
-				})
-				.build();
-			let custom_loader = ImageLoader::new(executor.clone());
-			let mut custom_ctx = UiContext { elements, ..UiContext::default() };
-			custom_ctx.loader = Some(custom_loader.clone());
-			let mut custom_ui =
-				Ui::from_markup(format!("<logo src={}/>", path.display()), 10, custom_ctx).unwrap();
-			receive_image(&executor, &custom_loader, &mut custom_ui).await;
-			assert!(
-				(0..custom_ui.height()).any(|row| frame_row_text(custom_ui.frame(), row).contains('▀'))
-			);
+		let elements = Elements::builder()
+			.with("logo", |_: &str, props: Props, _: Vec<Cached>| {
+				let source = props.str_of(Prop::Src).map_or("", |value| value.as_str());
+				Box::new(Img::new().with_str(Prop::Src, source).with(Prop::W, 4_u16))
+					as Box<dyn Component>
+			})
+			.build();
+		let custom_loader = ImageLoader::new();
+		let mut custom_ctx = UiContext { elements, ..UiContext::default() };
+		custom_ctx.loader = Some(custom_loader.clone());
+		let mut custom_ui =
+			Ui::from_markup(format!("<logo src={}/>", path.display()), 10, custom_ctx).unwrap();
+		receive_image(&custom_loader, &mut custom_ui).await;
+		assert!(
+			(0..custom_ui.height()).any(|row| frame_row_text(custom_ui.frame(), row).contains('▀'))
+		);
 
-			fs::remove_file(path).unwrap();
-			fs::remove_dir(dir).unwrap();
-		});
+		fs::remove_file(path).unwrap();
+		fs::remove_dir(dir).unwrap();
 	}
 
 	#[test]

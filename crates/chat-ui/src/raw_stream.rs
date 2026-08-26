@@ -36,7 +36,7 @@ pub enum RawStreamEvent {
 	Consumed,
 	/// Close the overlay.
 	Close,
-	/// Copy this sanitized visible frame.
+	/// Copy the complete sanitized retained stream.
 	Copy(String),
 }
 
@@ -44,7 +44,6 @@ pub enum RawStreamEvent {
 pub struct RawStreamViewer {
 	frames:  Vec<RawFrame>,
 	summary: StreamSummary,
-	cursor:  usize,
 	follow:  bool,
 	pretty:  bool,
 	ui:      Ui,
@@ -57,11 +56,9 @@ pub struct RawStreamViewer {
 impl RawStreamViewer {
 	/// Opens a viewer on a bounded ring snapshot.
 	pub fn open(frames: Vec<RawFrame>, summary: StreamSummary, ctx: &UiContext) -> Self {
-		let cursor = frames.len().saturating_sub(1);
 		let mut viewer = Self {
 			frames,
 			summary,
-			cursor,
 			follow: true,
 			pretty: true,
 			ui: Ui::from_root(dom! { <text/> }, 1, ctx.clone()),
@@ -74,6 +71,7 @@ impl RawStreamViewer {
 			rows: 18,
 		};
 		viewer.rebuild();
+		viewer.scroll_to_tail();
 		viewer
 	}
 
@@ -82,57 +80,72 @@ impl RawStreamViewer {
 	pub fn push(&mut self, frame: RawFrame, summary: StreamSummary) {
 		self.frames.push(frame);
 		self.summary = summary;
+		self.refresh_content();
 		if self.follow {
-			self.cursor = self.frames.len().saturating_sub(1);
+			self.scroll_to_tail();
 		}
-		self.rebuild();
 	}
 
 	/// Replaces the viewer from a fresh bounded snapshot after ring eviction.
 	pub fn replace(&mut self, frames: Vec<RawFrame>, summary: StreamSummary) {
 		self.frames = frames;
 		self.summary = summary;
-		self.cursor = if self.follow {
-			self.frames.len().saturating_sub(1)
-		} else {
-			self.cursor.min(self.frames.len().saturating_sub(1))
-		};
-		self.rebuild();
+		self.refresh_content();
+		if self.follow {
+			self.scroll_to_tail();
+		}
 	}
 
 	/// Routes navigation, tail-follow, pretty-print, and clipboard keys.
 	pub fn handle_key(&mut self, key: Key) -> RawStreamEvent {
 		match key {
 			Key::Esc => return RawStreamEvent::Close,
-			Key::Up => self.move_cursor(-1),
-			Key::Down => self.move_cursor(1),
-			Key::PageUp => self.move_cursor(-(self.rows as isize)),
-			Key::PageDown => self.move_cursor(self.rows as isize),
-			Key::Home => {
-				self.cursor = 0;
+			Key::Up | Key::PageUp | Key::Home => {
 				self.follow = false;
+				let _ = self.ui.handle_key(key);
+			},
+			Key::Down | Key::PageDown => {
+				let _ = self.ui.handle_key(key);
 			},
 			Key::End => {
-				self.cursor = self.frames.len().saturating_sub(1);
 				self.follow = true;
+				self.scroll_to_tail();
 			},
-			Key::Char('f') => self.follow = !self.follow,
-			Key::Char('p') => self.pretty = !self.pretty,
-			Key::Copy | Key::Ctrl('c') => return RawStreamEvent::Copy(self.current_text()),
+			Key::Char('f') => {
+				self.follow = !self.follow;
+				if self.follow {
+					self.scroll_to_tail();
+				}
+			},
+			Key::Char('p') => {
+				self.pretty = !self.pretty;
+				self.rebuild();
+				if self.follow {
+					self.scroll_to_tail();
+				}
+			},
+			Key::Copy | Key::Ctrl('c') => return RawStreamEvent::Copy(self.complete_text()),
 			_ => return RawStreamEvent::Consumed,
 		}
-		self.rebuild();
 		RawStreamEvent::Consumed
 	}
 
 	/// Routes wheel navigation; any upward navigation disables tail-follow.
 	pub fn handle_mouse(&mut self, kind: Mouse) -> RawStreamEvent {
 		match kind {
-			Mouse::WheelUp => self.move_cursor(-3),
-			Mouse::WheelDown => self.move_cursor(3),
+			Mouse::WheelUp => {
+				self.follow = false;
+				for _ in 0..3 {
+					let _ = self.ui.handle_key(Key::Up);
+				}
+			},
+			Mouse::WheelDown => {
+				for _ in 0..3 {
+					let _ = self.ui.handle_key(Key::Down);
+				}
+			},
 			_ => return RawStreamEvent::Consumed,
 		}
-		self.rebuild();
 		RawStreamEvent::Consumed
 	}
 
@@ -149,33 +162,41 @@ impl RawStreamViewer {
 		Layer { frame: self.ui.frame(), options: &self.options, active: true }
 	}
 
-	fn move_cursor(&mut self, delta: isize) {
-		if self.frames.is_empty() {
-			return;
+	fn complete_text(&self) -> String {
+		let mut output = String::new();
+		for frame in &self.frames {
+			use std::fmt::Write as _;
+			let _ = writeln!(output, "#{} {}", frame.sequence, frame.event);
+			if self.pretty {
+				output.push_str(&pretty_payload(&frame.payload));
+			} else {
+				output.push_str(frame.payload.as_str());
+			}
+			if !output.ends_with('\n') {
+				output.push('\n');
+			}
 		}
-		self.cursor = self
-			.cursor
-			.saturating_add_signed(delta)
-			.min(self.frames.len() - 1);
-		self.follow = self.cursor + 1 == self.frames.len() && delta >= 0;
+		output
 	}
 
-	fn current_text(&self) -> String {
-		let Some(frame) = self.frames.get(self.cursor) else {
-			return String::new();
-		};
-		if !self.pretty {
-			return frame.payload.to_string();
-		}
-		pretty_payload(&frame.payload)
+	fn scroll_to_tail(&mut self) {
+		let _ = self.ui.handle_key(Key::End);
 	}
 
-	fn rebuild(&mut self) {
-		let current = self.frames.get(self.cursor);
-		let title = current
+	fn refresh_content(&mut self) {
+		let latest = self
+			.frames
+			.last()
 			.map_or_else(|| sf!("No frames"), |frame| sf!("#{} · {}", frame.sequence, frame.event));
-		let payload = self.current_text();
-		let summary = sf!(
+		self.ui.set_text("raw-stream-title", latest.as_str());
+		self.ui.set_text("raw-stream-content", self.complete_text());
+		self
+			.ui
+			.set_text("raw-stream-summary", self.summary_text().as_str());
+	}
+
+	fn summary_text(&self) -> Str {
+		sf!(
 			"{} retained · {} evicted · {} subscriber drops · {}",
 			self.summary.retained,
 			self.summary.evicted,
@@ -185,14 +206,23 @@ impl RawStreamViewer {
 			} else {
 				"paused"
 			}
-		);
+		)
+	}
+
+	fn rebuild(&mut self) {
+		let title = self
+			.frames
+			.last()
+			.map_or_else(|| sf!("No frames"), |frame| sf!("#{} · {}", frame.sequence, frame.event));
+		let payload = self.complete_text();
+		let summary = self.summary_text();
 		let height = self.rows;
 		self.ui = Ui::from_root(
 			OverlayPanel::new("Raw provider stream").child(dom! {
 				<col gap=1>
-					<text bold truncate>{title}</text>
-					<text dim truncate>{summary}</text>
-					<scroll id="raw-stream-scroll" h={height}><text wrap>{payload}</text></scroll>
+					<text id="raw-stream-title" bold truncate>{title}</text>
+					<text id="raw-stream-summary" dim truncate>{summary}</text>
+					<scroll id="raw-stream-scroll" h={height}><text id="raw-stream-content" wrap>{payload}</text></scroll>
 					{panel_divider()}
 					<text dim truncate>{"↑/↓ navigate · F follow · P pretty · Ctrl+C copy · Esc close"}</text>
 				</col>
@@ -200,6 +230,7 @@ impl RawStreamViewer {
 			self.width,
 			self.ctx.clone(),
 		);
+		let _ = self.ui.focus_id("raw-stream-scroll");
 	}
 }
 
@@ -226,4 +257,37 @@ fn pretty_payload(payload: &str) -> String {
 		output.push('\n');
 	}
 	output
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn frame(sequence: u64, payload: &'static str) -> RawFrame {
+		RawFrame { sequence, session: None, event: sf!("delta"), payload: Str::new_static(payload) }
+	}
+
+	#[test]
+	fn scrolling_pauses_follow_and_copy_returns_complete_stream() {
+		let ctx = UiContext::default();
+		let mut viewer = RawStreamViewer::open(
+			vec![frame(1, "{\"one\":1}"), frame(2, "{\"two\":2}")],
+			StreamSummary { retained: 2, ..StreamSummary::default() },
+			&ctx,
+		);
+		assert!(viewer.follow);
+		assert_eq!(viewer.handle_key(Key::PageUp), RawStreamEvent::Consumed);
+		assert!(!viewer.follow);
+		viewer.push(frame(3, "{\"three\":3}"), StreamSummary {
+			retained: 3,
+			..StreamSummary::default()
+		});
+		let RawStreamEvent::Copy(copied) = viewer.handle_key(Key::Ctrl('c')) else {
+			panic!("copy action");
+		};
+		for sequence in [1, 2, 3] {
+			assert!(copied.contains(&format!("#{sequence} delta")));
+		}
+		assert_eq!(viewer.handle_key(Key::End), RawStreamEvent::Consumed);
+		assert!(viewer.follow);
+	}
 }
