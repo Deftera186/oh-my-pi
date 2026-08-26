@@ -10,7 +10,6 @@ use omp_storage::{
 	telemetry_index::{PendingIssue, TelemetryIndex},
 };
 use serde_json::{Value, json};
-use wreq::redirect;
 
 const ENDPOINT: &str = "https://qa.omp.sh/v1/grievances";
 const BATCH: usize = 4;
@@ -49,10 +48,7 @@ pub(crate) fn start(store: Arc<TelemetryIndex>, credentials: Arc<GithubCredentia
 		return;
 	};
 	runtime.spawn(async move {
-		let client = wreq::Client::builder()
-			.redirect(redirect::Policy::none())
-			.build()
-			.expect("AutoQA client");
+		let client = omp_http::no_redirect_client();
 		loop {
 			let now = now_ms();
 			if let Ok(pending) = store.pending_uploads(now, BATCH) {
@@ -70,10 +66,7 @@ pub async fn manual_push(
 	store: &TelemetryIndex,
 	credentials: &GithubCredentialBridge,
 ) -> Result<ManualPushResult, omp_storage::telemetry_index::QueryError> {
-	let client = wreq::Client::builder()
-		.redirect(redirect::Policy::none())
-		.build()
-		.expect("AutoQA client");
+	let client = omp_http::no_redirect_client();
 	let endpoint = env::var("OMP_AUTO_QA_PUSH_URL").unwrap_or_else(|_| ENDPOINT.to_owned());
 	let mut pushed = 0;
 	loop {
@@ -92,7 +85,7 @@ pub async fn manual_push(
 }
 
 async fn deliver_to(
-	client: &wreq::Client,
+	client: &reqwest::Client,
 	endpoint: &str,
 	store: &TelemetryIndex,
 	credentials: &GithubCredentialBridge,

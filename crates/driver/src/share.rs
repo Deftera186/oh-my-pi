@@ -25,7 +25,6 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
-use wreq::redirect;
 use zeroize::Zeroizing;
 
 use crate::{secrets::session::SecretSessionSnapshot, settings::ExportSettings};
@@ -102,7 +101,7 @@ pub enum ShareError {
 	InvalidEndpoint,
 	/// Store transport failed.
 	#[error("share store transport failed")]
-	Http(#[from] wreq::Error),
+	Http(#[from] reqwest::Error),
 	/// Store returned a non-success response.
 	#[error("share store returned HTTP {status}")]
 	HttpStatus {
@@ -192,7 +191,7 @@ pub trait ShareStore {
 pub struct DirectShareStore {
 	http_base:   Url,
 	credentials: sync::Arc<GithubCredentialBridge>,
-	client:      wreq::Client,
+	client:      reqwest::Client,
 }
 
 impl DirectShareStore {
@@ -215,9 +214,7 @@ impl DirectShareStore {
 		}
 		let path = http_base.path().trim_end_matches('/').to_owned();
 		http_base.set_path(&path);
-		let client = wreq::Client::builder()
-			.redirect(redirect::Policy::none())
-			.build()?;
+		let client = omp_http::no_redirect_client();
 		Ok(Self { http_base, credentials, client })
 	}
 
@@ -327,7 +324,7 @@ fn enforce_ceiling(store: ShareStoreKind, actual: usize) -> Result<(), ShareErro
 	Ok(())
 }
 
-async fn read_bounded(response: wreq::Response) -> Result<BytesMut, ShareError> {
+async fn read_bounded(response: reqwest::Response) -> Result<BytesMut, ShareError> {
 	let mut body = BytesMut::new();
 	let mut stream = response.bytes_stream();
 	while let Some(chunk) = stream.next().await {

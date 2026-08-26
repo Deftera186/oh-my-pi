@@ -10,8 +10,15 @@ description = "Headless coding-agent harness: session composition, execution mod
 readme = "README.md"
 
 [features]
-default = ["local-applefm", "local-embedding", "local-text", "local-stt", "local-tts"]
+default = []
 local = ["omp-inference/local"]
+local-all = [
+	"local-applefm",
+	"local-embedding",
+	"local-text",
+	"local-stt",
+	"local-tts",
+]
 local-applefm = ["local", "omp-inference/local-applefm"]
 local-embedding = ["local", "omp-inference/local-embedding", "omp-memory/local-embedding"]
 local-text = ["local", "omp-inference/local-text"]
@@ -42,6 +49,7 @@ omp-envd = { workspace = true }
 omp-ext = { workspace = true }
 omp-catalog = { workspace = true }
 omp-inference = { workspace = true }
+omp-http = { workspace = true }
 omp-serve = { workspace = true }
 omp-memory = { workspace = true }
 omp-proto = { workspace = true, features = ["tonic"] }
@@ -69,7 +77,7 @@ tracing = { workspace = true }
 tonic = { workspace = true }
 
 url = { workspace = true }
-wreq = { workspace = true }
+reqwest.workspace = true
 zeroize = { workspace = true }
 
 libc = { workspace = true }

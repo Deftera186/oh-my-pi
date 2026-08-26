@@ -19,6 +19,8 @@ use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
 use omp_inference::auth::FallbackKeySource;
 #[cfg(feature = "local-applefm")]
+use omp_inference::provider::builtin::LocalRouteBackend;
+#[cfg(feature = "local-applefm")]
 use omp_inference::receipt::ReasonId;
 use omp_inference::{
 	Registry,
@@ -63,14 +65,13 @@ use omp_inference::{
 		zai::ZaiUsageFetcher,
 	},
 	provider::builtin::{
-		AuthApplicationConfig, AzureEndpointConfig, GoogleCcaConfig, ProductionDependencies, discover_antigravity_version,
+		AuthApplicationConfig, AzureEndpointConfig, GoogleCcaConfig, ProductionDependencies,
+		discover_antigravity_version,
 	},
 	session::{ConversationError, ConversationSessionPlanner},
 	transport::{http::HttpTransport, websocket_transport::WebSocketTransport},
 };
 use omp_serve::inference::InferenceRpc;
-#[cfg(feature = "local-applefm")]
-use omp_inference::provider::builtin::LocalRouteBackend;
 use omp_settings::{
 	SettingsSnapshot,
 	manager::{SettingsManager, SettingsManagerError, SettingsPaths},

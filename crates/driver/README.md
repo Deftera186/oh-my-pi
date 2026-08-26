@@ -46,3 +46,5 @@ prevents presentation code from acquiring environment-host internals.
 Run `just setup-python` once before commands that link embedded Python. Use
 `just check-pkg omp-driver` and `just test-pkg omp-driver`. For joined session
 behavior, use `just e2e` or an exact narrower E2E recipe from `just --list`.
+Local model engines are opt-in through `local-all` or the individual
+`local-*` features.
