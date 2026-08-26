@@ -31,7 +31,7 @@ fn provenance_is_compact_and_serializes_as_its_fields() {
 			"publisher": "publisher",
 			"extension_id": "example.extension",
 			"version": "1.2.3",
-			"artifact_digest": "b3:abababababababababababababababababababababababababababababababab",
+			"artifact_digest": "sha256:abababababababababababababababababababababababababababababababab",
 			"layer": "user",
 			"tier": "trusted",
 			"generation": 7,
