@@ -19,7 +19,13 @@ CMAKE_GENERATOR = "Ninja"
 # images overflow ld64's compact-unwind fast path (__eh_frame > 16 MB), and
 # lld links them several times faster. Same shim the release tree uses.
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/bin/ld64.lld"]
+# The parallel rustc frontend fills the serial tail where only a few workspace
+# crates remain. Eight is rustc's best-tested setting; Cargo's jobserver prevents
+# oversubscription while many crates compile. Requires the pinned nightly.
+rustflags = [
+	"-C", "link-arg=--ld-path=/opt/homebrew/bin/ld64.lld",
+	"-Z", "threads=8",
+]
 # Store each crate's metadata only in its .rmeta instead of duplicating it into
 # every rlib. Measured on a reqwest-sized graph: 196 MB -> 130 MB target dir at
 # identical build times. Requires the pinned nightly (rust-toolchain.toml).
@@ -28,6 +34,9 @@ rustflags = ["-C", "link-arg=--ld-path=/opt/homebrew/bin/ld64.lld"]
 # bump rust-toolchain.toml backwards, switch to `"DoNotEmbed"`.
 [unstable]
 embed-metadata = false
+# Selective dependency hints in Cargo.toml defer codegen for broad APIs until
+# consumers actually call them. Requires the pinned nightly.
+profile-hint-mostly-unused = true
 # Config profiles outrank manifest profiles, so a user-global
 # ~/.cargo/config.toml [profile.dev] (e.g. line-tables-only + unpacked
 # split-debuginfo) would silently re-inflate the target dir with retained

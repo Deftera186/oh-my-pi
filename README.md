@@ -97,6 +97,7 @@ names are `omp-` prefixed; directory names are not.
 | `settings` | Typed reflected settings schemas and immutable revisioned snapshots |
 | `secrets`  | Secret-rule validation, reversible keyed placeholders, and provider-bound text redaction |
 | `sandbox`  | Deferred isolation boundary for OMP process confinement |
+| `http`     | Process-wide outbound HTTP connection pools and TLS policy |
 
 ### Top level
 
