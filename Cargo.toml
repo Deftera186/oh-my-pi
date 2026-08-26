@@ -134,6 +134,7 @@ omp-exthost = { path = "crates/exthost", version = "0.1.0" }
 omp-grep = { path = "crates/grep", version = "0.1.0" }
 omp-gui = { path = "crates/gui", version = "0.1.0" }
 omp-hashline = { path = "crates/hashline", version = "0.1.0" }
+omp-http = { path = "crates/http", version = "0.1.0" }
 omp-catalog = { path = "crates/catalog", version = "0.1.0" }
 omp-inference = { path = "crates/inference", version = "0.1.0" }
 omp-serve = { path = "crates/serve", version = "0.1.0" }
@@ -301,7 +302,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_F
 x11rb = { version = "=0.13.2", features = ["randr", "xinput", "xtest"] }
 xcap = { version = "=0.9.6", default-features = false }
 xkeysym = "=0.2.1"
-wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["json", "prefix-symbols", "stream", "tokio-rt", "webpki-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 zune-jpeg = "0.5"
 zeroize = { version = "1.9", features = ["derive"] }
@@ -314,14 +315,6 @@ xxhash-rust = { version = "0.8", features = ["xxh32"] }
 # sanctioned journal-subscriber edge; implementation crates stay behind env/v1.
 allowed-world-boundary = ["omp-env", "omp-storage"]
 denied-direct = ["omp-docserver", "omp-shell-engine", "omp-walker"]
-
-[patch.crates-io]
-# btls-sys 0.5.6 rewrites archive symbols with objcopy, which does not rewrite
-# Mach-O archives. This pinned upstream fix uses BoringSSL's native source-level
-# prefixing and is covered by upstream macOS + openssl-sys CI. Prefix generation
-# requires Go 1.22+ and clang in PATH.
-# Upstream: https://github.com/0x676e67/btls/pull/184
-btls-sys = { git = "https://github.com/0x676e67/btls.git", rev = "462222413b5aecc44b3bb4db06563f25da1f0ea7" }
 
 [workspace.lints.rust]
 # ──────────────────────────────────────────────────────────────────────────────
@@ -450,17 +443,36 @@ too_many_lines = "allow"     # Arbitrary limits don't account for necessary comp
 [profile.dev]
 debug = false
 split-debuginfo = "off"
+# Cold builds do not benefit from incremental bookkeeping. Disabling it also
+# makes workspace crates cacheable by sccache; 256 CGUs preserve parallel
+# backend codegen rather than falling back to the non-incremental default.
+incremental = false
+codegen-units = 256
 
 # Extension artifact verification and the b3sum builtin stay hot in debug
 # builds; sha2 (Hash32) gets speed from the "*" glob below plus aarch64 asm.
 [profile.dev.package.blake3]
 opt-level = 3
-# Dependencies compile once and then sit in the cache; optimizing them keeps
-# debug tests and tools fast (tree-sitter grammars, crypto, decompression)
-# for a one-time cold-build cost. Workspace members stay at opt-level 0 for
-# fast iteration. blake3 above stays at 3 (specific override outranks glob).
+# Keep dependencies at the compile-first dev level. Runtime-critical hashes are
+# overridden above; release profiles retain production optimization.
 [profile.dev.package."*"]
-opt-level = 2
+opt-level = 0
+# Generated/broad APIs where omp consumes only a narrow slice. Rustc defers
+# unused function codegen instead of building code the linker later discards.
+[profile.dev.package.objc2-app-kit]
+hint-mostly-unused = true
+[profile.dev.package.objc2-av-foundation]
+hint-mostly-unused = true
+[profile.dev.package.objc2-foundation]
+hint-mostly-unused = true
+[profile.dev.package.objc2-web-kit]
+hint-mostly-unused = true
+[profile.dev.package.pdf-inspector]
+hint-mostly-unused = true
+[profile.dev.package.mermaid-text]
+hint-mostly-unused = true
+[profile.dev.package.gix]
+hint-mostly-unused = true
 
 [profile.release]
 opt-level = 2
