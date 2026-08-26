@@ -38,6 +38,11 @@ pub enum Point {
 	/// Per-invocation admission.
 	Admission  = 4,
 	/// In-flight tool batch supervision.
+	///
+	/// Resolved twice per committed batch: before execution with
+	/// `delivered: false` (admission-side supervision) and after settlement
+	/// with `delivered: true` (safe boundary for injecting items ahead of the
+	/// staged tool results).
 	Batch      = 5,
 	/// Observation after a committed turn.
 	TurnEnd    = 6,
