@@ -1051,7 +1051,7 @@ pub(super) async fn fetch_index(url: &str) -> miette::Result<Vec<u8>> {
 	if !url.starts_with("https://") {
 		return Err(miette!("marketplace index URL must use HTTPS or file://"));
 	}
-	let response = wreq::Client::new()
+	let response = omp_http::default_client()
 		.get(url)
 		.send()
 		.await

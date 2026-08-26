@@ -173,7 +173,7 @@ async fn run_github_update(args: UpdateArgs) -> miette::Result<()> {
 
 async fn fetch_github_release(timeout: std::time::Duration) -> miette::Result<GithubRelease> {
 	tokio::time::timeout(timeout, async {
-		let response = wreq::Client::new()
+		let response = omp_http::default_client()
 			.get(GITHUB_LATEST_RELEASE)
 			.header("User-Agent", GITHUB_USER_AGENT)
 			.header("Accept", "application/vnd.github+json")
@@ -245,7 +245,7 @@ async fn fetch_github_asset(asset: &GithubAsset) -> miette::Result<Vec<u8>> {
 	if !asset.browser_download_url.starts_with("https://") {
 		return Err(miette!("GitHub update asset URL must use HTTPS"));
 	}
-	let response = wreq::Client::new()
+	let response = omp_http::default_client()
 		.get(&asset.browser_download_url)
 		.header("User-Agent", GITHUB_USER_AGENT)
 		.send()
@@ -522,7 +522,7 @@ async fn fetch_asset(asset: &IndexArtifact) -> miette::Result<Vec<u8>> {
 	if !asset.url.starts_with("https://") {
 		return Err(miette!("signed update asset URL must use HTTPS"));
 	}
-	let response = wreq::Client::new()
+	let response = omp_http::default_client()
 		.get(&asset.url)
 		.send()
 		.await

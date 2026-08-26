@@ -74,6 +74,7 @@ omp-ext.workspace = true
 omp-gui = { workspace = true, optional = true }
 omp-grep.workspace = true
 omp-hashline.workspace = true
+omp-http.workspace = true
 omp-catalog.workspace = true
 omp-inference.workspace = true
 omp-memory.workspace = true
@@ -97,7 +98,7 @@ jiff.workspace = true
 nix.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true
-wreq.workspace = true
+reqwest.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

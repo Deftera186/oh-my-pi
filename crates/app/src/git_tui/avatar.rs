@@ -30,7 +30,7 @@ const MAX_AVATAR_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AvatarLoader {
 	cache_dir: PathBuf,
-	client:    wreq::Client,
+	client:    reqwest::Client,
 	commands:  GitCommands,
 }
 
@@ -40,7 +40,7 @@ impl AvatarLoader {
 		let cache_dir = cache_root()?.join("avatars");
 		Some(Self {
 			cache_dir,
-			client: wreq::Client::new(),
+			client: omp_http::default_client(),
 			commands: GitCommands::new(GitRunner::new(ExecHost::new())),
 		})
 	}

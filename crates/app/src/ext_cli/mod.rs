@@ -2127,7 +2127,7 @@ async fn fetch_signed_wheel(artifact: &omp_ext::index::IndexArtifact) -> miette:
 	if !artifact.url.starts_with("https://") {
 		return Err(miette!("signed extension wheel URL must use HTTPS or file://"));
 	}
-	let response = wreq::Client::new()
+	let response = omp_http::default_client()
 		.get(&artifact.url)
 		.send()
 		.await
