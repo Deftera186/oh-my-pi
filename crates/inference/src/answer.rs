@@ -23,6 +23,7 @@ use strum::IntoStaticStr;
 use tokio::sync::Notify;
 
 use crate::{
+	auth::LoginCancellation,
 	body::ByteStream,
 	call::{
 		AuthInput, RawJson, RealtimeContextAppend, RealtimeDelegationReceipt, ToolResultContent,
@@ -1268,11 +1269,19 @@ pub struct AuthResponse {
 /// Owned channels for an interactive authentication flow.
 pub struct AuthSession {
 	/// Stable login session identity.
-	pub id:        LoginSessionId,
+	pub id:                  LoginSessionId,
 	/// Stream-like channel of authentication events or structured errors.
-	pub events:    Receiver<Result<AuthEvent, Error>>,
+	pub events:              Receiver<Result<AuthEvent, Error>>,
 	/// Response channel back to the authentication engine.
-	pub responses: flume::Sender<AuthResponse>,
+	pub responses:           flume::Sender<AuthResponse>,
+	pub(crate) cancellation: LoginCancellation,
+}
+
+impl AuthSession {
+	/// Cancels the flow immediately, including any in-flight network request.
+	pub fn cancel(&self) {
+		self.cancellation.cancel();
+	}
 }
 
 /// Authentication or account-management operation answer.

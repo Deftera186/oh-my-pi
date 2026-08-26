@@ -105,11 +105,16 @@ impl CursorHandler {
 		pending: CursorPending,
 		driver: &LoginDriver,
 	) -> Result<OAuthTokenSet, OAuthError> {
-		let (max_polls, mut interval, max_interval) = spec
-			.polling
-			.map_or((DEFAULT_MAX_POLLS, DEFAULT_INTERVAL, DEFAULT_MAX_INTERVAL), |polling| {
-				(polling.max_polls, polling.default_interval, polling.max_interval)
-			});
+		let (max_polls, mut interval, max_interval) = spec.polling.map_or(
+			(DEFAULT_MAX_POLLS, DEFAULT_INTERVAL, DEFAULT_MAX_INTERVAL),
+			|polling| {
+				(
+					polling.max_polls.unwrap_or(DEFAULT_MAX_POLLS),
+					polling.default_interval,
+					polling.max_interval,
+				)
+			},
+		);
 		let mut consecutive_errors = 0_u8;
 		let mut polls = 0_u16;
 
@@ -572,7 +577,7 @@ mod tests {
 			Arc::new(TestClock { now: SystemTime::UNIX_EPOCH, sleeps: Mutex::new(Vec::new()) });
 		let (_session, driver, _) = default_login_channels(LoginSessionId::from("cursor-bound"));
 		let polling = OAuthPollingSpec {
-			max_polls:        2,
+			max_polls:        Some(2),
 			default_interval: Duration::from_secs(2),
 			max_interval:     Duration::from_millis(2_200),
 		};

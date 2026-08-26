@@ -11,7 +11,10 @@ use omp_core::{Str, sf};
 use serde_json::Value;
 use xutf::BufReadCharsExt as _;
 
-use super::{RecoveryError, Stage};
+use super::{
+	RecoveryError, Stage,
+	json::{JsonRepairLimits, parse_repaired_value},
+};
 use crate::{
 	call::{OpaqueJson, ToolDefinition, ToolInputConstraint},
 	event::ToolCall,
@@ -34,6 +37,8 @@ pub struct ToolAssemblyLimits {
 	pub max_schema_depth:   usize,
 	/// Maximum schema and argument nodes visited during validation.
 	pub max_schema_nodes:   usize,
+	/// Maximum tolerant syntax repairs applied to one argument document.
+	pub max_repair_steps:   u32,
 	/// Maximum recovery records retained by this stage.
 	pub max_evidence:       usize,
 }
@@ -47,6 +52,7 @@ impl Default for ToolAssemblyLimits {
 			max_total_calls:    1024,
 			max_schema_depth:   64,
 			max_schema_nodes:   65_536,
+			max_repair_steps:   128,
 			max_evidence:       64,
 		}
 	}
@@ -399,13 +405,27 @@ impl<'a> ToolAssembler<'a> {
 		};
 		let arguments = match &definition.input {
 			ToolInputConstraint::JsonSchema { parameters, strict } => {
-				let arguments: Value = match serde_json::from_slice(&call.arguments) {
-					Ok(arguments) => arguments,
+				let arguments: Value = match parse_repaired_value(&call.arguments, JsonRepairLimits {
+					max_bytes:        self.limits.max_argument_bytes,
+					max_depth:        self.limits.max_schema_depth,
+					max_steps:        self.limits.max_repair_steps,
+					diagnostic_bytes: 128,
+				}) {
+					Ok((arguments, repairs)) => {
+						if repairs > 0 {
+							self.record(
+								"tool.tolerant-argument-repair",
+								call.arguments.len() as u64,
+								repairs,
+							);
+						}
+						arguments
+					},
 					Err(error) => {
 						return ToolAssemblyEvent::Rejected {
 							source_index,
 							reason: ToolRejection::MalformedArguments {
-								offset: error.column(),
+								offset: 0,
 								reason: Str::new(error.to_string()),
 							},
 						};
@@ -1614,6 +1634,32 @@ mod tests {
 		let output = assembler.push(ToolFragment::End { source_index: 0 });
 		assert!(
 			matches!(output.as_slice(), [ToolAssemblyEvent::Ready { call, .. }] if call.id.as_str() == "call-1")
+		);
+	}
+	#[test]
+	fn tolerant_argument_repair_precedes_schema_authorization() {
+		let definitions = [definition()];
+		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		assembler.push(ToolFragment::Start {
+			source_index: 4,
+			id:           Some(ToolCallId::new("call-slop")),
+			name:         Bytes::from_static(b"search"),
+		});
+		assembler.push(ToolFragment::ArgumentsDelta {
+			source_index: 4,
+			bytes:        Bytes::from_static(b"{'query':'rust',"),
+		});
+		let output = assembler.push(ToolFragment::End { source_index: 4 });
+		assert!(matches!(
+			output.as_slice(),
+			[ToolAssemblyEvent::Ready { call, .. }]
+				if call.arguments.as_value() == &json!({"query":"rust"})
+		));
+		assert!(
+			assembler
+				.take_evidence()
+				.iter()
+				.any(|record| record.rule.0.as_str() == "tool.tolerant-argument-repair")
 		);
 	}
 

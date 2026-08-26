@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
 use crate::{
 	body::{
 		AttemptBodyEvidence, AttemptEvidenceHandle, BodyFactoryHandle, BodyOpenError, BodyReader,
-		BodySource, byte_stream,
+		BodySource, ByteStream, byte_stream,
 	},
 	catalog::OperationKind,
 	codec::{
@@ -383,6 +383,74 @@ impl Default for HttpTransport {
 	fn default() -> Self {
 		Self::new()
 	}
+}
+
+/// Creates a bounded deferred HTTPS download stream for a provider-returned
+/// artifact URL.
+pub(crate) fn remote_artifact_stream(uri: &str, maximum_bytes: u64) -> Result<ByteStream, Error> {
+	let parsed = Url::parse(uri)
+		.map_err(|_| protocol_error(ErrorPhase::Encoding, false, "artifact-url-invalid"))?;
+	if parsed.scheme() != "https"
+		|| parsed.host_str().is_none()
+		|| !parsed.username().is_empty()
+		|| parsed.password().is_some()
+		|| parsed.fragment().is_some()
+	{
+		return Err(protocol_error(ErrorPhase::Encoding, false, "artifact-url-untrusted"));
+	}
+	let uri = parsed
+		.as_str()
+		.parse::<Uri>()
+		.map_err(|_| protocol_error(ErrorPhase::Encoding, false, "artifact-url-invalid"))?;
+	Ok(Box::pin(stream::once(async move {
+		let download = async move {
+			let body = Full::new(Bytes::new())
+				.map_err(|never: Infallible| match never {})
+				.boxed_unsync();
+			let request = Request::builder()
+				.method(Method::GET)
+				.uri(uri)
+				.header(header::ACCEPT, "image/*")
+				.body(body)
+				.map_err(|_| protocol_error(ErrorPhase::Encoding, false, "artifact-request-invalid"))?;
+			let mut response = pooled_client().request(request).await.map_err(|_| {
+				connectivity(ErrorPhase::Connecting, false, "artifact-download-connect")
+			})?;
+			if !response.status().is_success() {
+				return Err(protocol_error(ErrorPhase::Handshake, false, "artifact-download-status"));
+			}
+			if response
+				.headers()
+				.get(header::CONTENT_LENGTH)
+				.and_then(|value| value.to_str().ok())
+				.and_then(|value| value.parse::<u64>().ok())
+				.is_some_and(|length| length > maximum_bytes)
+			{
+				return Err(protocol_error(ErrorPhase::Handshake, false, "artifact-download-limit"));
+			}
+			let mut bytes = BytesMut::new();
+			while let Some(frame) = response.body_mut().frame().await {
+				let frame = frame.map_err(|_| {
+					protocol_error(ErrorPhase::Streaming, true, "artifact-download-body")
+				})?;
+				if let Ok(data) = frame.into_data() {
+					let observed = (bytes.len() as u64).saturating_add(data.len() as u64);
+					if observed > maximum_bytes {
+						return Err(protocol_error(
+							ErrorPhase::Streaming,
+							true,
+							"artifact-download-limit",
+						));
+					}
+					bytes.extend_from_slice(&data);
+				}
+			}
+			Ok(bytes.freeze())
+		};
+		tokio::time::timeout(time::Duration::from_secs(60), download)
+			.await
+			.map_err(|_| protocol_error(ErrorPhase::Streaming, true, "artifact-download-timeout"))?
+	})))
 }
 
 impl HttpTransport {
@@ -1030,7 +1098,8 @@ fn classify_http_error(status: u16, body: &[u8]) -> Error {
 		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: time::Duration::ZERO })
 	} else {
 		match status {
-			401 | 403 => (ErrorKind::Authentication, RetryAction::Never),
+			401 => (ErrorKind::Authentication, RetryAction::RefreshCredential),
+			403 => (ErrorKind::Authorization, RetryAction::RotateAccount),
 			408 => {
 				(ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: time::Duration::ZERO })
 			},
@@ -1418,9 +1487,18 @@ impl ResponseFramer {
 			Self::RawChunks(framer) => framer
 				.push(chunk)
 				.map(|frames| frames.into_iter().map(Frame::Raw).collect()),
-			Self::Sse(framer) => framer
-				.push(chunk)
-				.map(|frames| frames.into_iter().map(Frame::Sse).collect()),
+			Self::Sse(framer) => {
+				let was_done = framer.is_done();
+				let mut frames: SmallVec<Frame, 4> =
+					framer.push(chunk)?.into_iter().map(Frame::Sse).collect();
+				if !was_done && framer.is_done() {
+					frames.push(Frame::Sse(crate::transport::SseEvent {
+						name: None,
+						data: Bytes::from_static(b"[DONE]"),
+					}));
+				}
+				Ok(frames)
+			},
 			Self::Ndjson(framer) => framer
 				.push(chunk)
 				.map(|frames| frames.into_iter().map(Frame::Ndjson).collect()),
@@ -1713,7 +1791,7 @@ mod tests {
 		for (status, kind, retryable) in [
 			(400, ErrorKind::InvalidRequest, false),
 			(401, ErrorKind::Authentication, false),
-			(403, ErrorKind::Authentication, false),
+			(403, ErrorKind::Authorization, false),
 			(404, ErrorKind::InvalidRequest, false),
 			(408, ErrorKind::DeadlineExceeded, true),
 			(413, ErrorKind::PayloadRejected, false),
@@ -1733,6 +1811,8 @@ mod tests {
 				"status {status}",
 			);
 		}
+		assert_eq!(classify_http_error(401, b"{}").action, RetryAction::RefreshCredential,);
+		assert_eq!(classify_http_error(403, b"{}").action, RetryAction::RotateAccount,);
 	}
 
 	#[test]

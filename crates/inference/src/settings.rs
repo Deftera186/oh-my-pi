@@ -535,9 +535,8 @@ impl InferenceSettings {
 		self.providers.apply_budget(&mut call.budget);
 	}
 
-	/// Applies request-level projections once before encoding.
+	/// Applies request-level projections after the immutable plan is selected.
 	pub fn apply_call(&self, call: &mut Call) {
-		self.apply_planning_call(call);
 		let codec = call
 			.execution
 			.as_ref()
@@ -619,6 +618,27 @@ mod tests {
 			RetrySettings { base_delay_ms: 500, max_delay_ms: 0, ..RetrySettings::default() };
 		assert!(settings.validate().is_ok());
 		assert_eq!(settings.backoff().maximum, Duration::ZERO);
+	}
+	#[test]
+	fn planning_projects_retry_budget_onto_the_real_call_once() {
+		let mut call = Call::new(
+			crate::call::CallMeta {
+				id:       crate::id::RequestId::from("settings-budget"),
+				target:   crate::call::Target::ProviderService(ProviderId::from("provider")),
+				deadline: None,
+				budget:   ExecutionBudget::default(),
+				session:  None,
+			},
+			OperationCall::Auth(sync::Arc::new(crate::call::AuthRequest::ListAccounts {
+				provider: None,
+			})),
+		);
+		let settings = InferenceSettings::default();
+		settings.apply_planning_call(&mut call);
+		assert_eq!(call.budget.max_attempts, settings.retry.max_attempts());
+		let planned_budget = call.budget.clone();
+		settings.apply_call(&mut call);
+		assert_eq!(call.budget, planned_budget, "late request projection cannot mutate budget");
 	}
 
 	#[test]

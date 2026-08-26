@@ -747,7 +747,7 @@ mod tests {
 		call::OpaqueJson,
 		event::ToolCall,
 		id::ToolCallId,
-		receipt::{AttemptOutcome, Cost, ProviderEvidence, Usage},
+		receipt::{AttemptOutcome, Cost, ExecutionBudget, ProviderEvidence, Usage},
 	};
 
 	fn text(value: &str) -> ChatEvent {
@@ -801,6 +801,34 @@ mod tests {
 			provider_evidence: ProviderEvidence::default(),
 			elapsed: Duration::ZERO,
 		}
+	}
+	#[test]
+	fn default_budget_buffers_first_block_marker_until_text_commits() {
+		let mut gate = OutputGate::new(
+			GateCondition::FirstValidEvent,
+			ExecutionBudget::default().max_provisional_bytes,
+		);
+		let mut public = Vec::new();
+		assert_eq!(
+			gate
+				.push(
+					ChatEvent::BlockStarted { index: 0, kind: crate::event::BlockKind::Text },
+					&mut |event| public.push(event),
+				)
+				.unwrap(),
+			GateProgress::Provisional
+		);
+		assert!(public.is_empty());
+		assert_eq!(
+			gate
+				.push(text("hello"), &mut |event| public.push(event))
+				.unwrap(),
+			GateProgress::Committed { flushed: 2 }
+		);
+		assert!(matches!(public.as_slice(), [
+			ChatEvent::BlockStarted { .. },
+			ChatEvent::TextDelta { .. }
+		]));
 	}
 
 	#[test]

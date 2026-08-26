@@ -1719,12 +1719,13 @@ struct ChoiceState {
 }
 
 struct PendingTool {
-	block:     u32,
-	id:        ToolCallId,
-	name:      Str,
-	arguments: BytesMut,
-	started:   bool,
-	completed: bool,
+	block:            u32,
+	id:               ToolCallId,
+	name:             Str,
+	arguments:        BytesMut,
+	object_arguments: Option<serde_json::Map<String, Value>>,
+	started:          bool,
+	completed:        bool,
 }
 
 impl Decoder for OpenAiChatDecoder {
@@ -1736,7 +1737,7 @@ impl Decoder for OpenAiChatDecoder {
 			return Err(self.decode_error(None));
 		};
 		if event.data.as_ref() == b"[DONE]" {
-			return self.complete(emit);
+			return self.complete(emit, true);
 		}
 		let chunk: WireChunk =
 			serde_json::from_slice(&event.data).map_err(|_| self.decode_error(None))?;
@@ -1763,7 +1764,7 @@ impl Decoder for OpenAiChatDecoder {
 		if self.done {
 			return Ok(());
 		}
-		self.complete(emit)
+		self.complete(emit, false)
 	}
 }
 
@@ -1838,6 +1839,7 @@ impl OpenAiChatDecoder {
 					id: ToolCallId::from(id.as_str()),
 					name: Str::default(),
 					arguments: BytesMut::new(),
+					object_arguments: None,
 					started: false,
 					completed: false,
 				});
@@ -1871,14 +1873,23 @@ impl OpenAiChatDecoder {
 				}
 				self.committed = true;
 			}
-			if let Some(arguments) = call.function.arguments.filter(|bytes| !bytes.is_empty()) {
-				tool.arguments.extend_from_slice(arguments.as_bytes());
-				if tool.started {
-					emit(RawEvent::Chat(ChatEvent::ToolArgumentsDelta {
-						index: tool.block,
-						bytes: Bytes::copy_from_slice(arguments.as_bytes()),
-					}));
-					self.committed = true;
+			if let Some(arguments) = call.function.arguments {
+				match arguments {
+					WireFunctionArguments::Text(arguments) if !arguments.is_empty() => {
+						tool.arguments.extend_from_slice(arguments.as_bytes());
+						if tool.started {
+							emit(RawEvent::Chat(ChatEvent::ToolArgumentsDelta {
+								index: tool.block,
+								bytes: Bytes::copy_from_slice(arguments.as_bytes()),
+							}));
+							self.committed = true;
+						}
+					},
+					WireFunctionArguments::Object(fragment) => {
+						let accumulated = tool.object_arguments.get_or_insert_with(Default::default);
+						merge_streaming_argument_objects(accumulated, fragment);
+					},
+					WireFunctionArguments::Text(_) => {},
 				}
 			}
 		}
@@ -1892,11 +1903,18 @@ impl OpenAiChatDecoder {
 		index
 	}
 
-	fn complete(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+	fn complete(
+		&mut self,
+		emit: &mut dyn FnMut(RawEvent),
+		authoritative_terminal: bool,
+	) -> Result<(), Error> {
 		if self.done {
 			return Ok(());
 		}
-		if self.committed && !self.choices.values().any(|state| state.finish.is_some()) {
+		if self.committed
+			&& !authoritative_terminal
+			&& !self.choices.values().any(|state| state.finish.is_some())
+		{
 			self.done = true;
 			return Err(incomplete_stream_error());
 		}
@@ -1917,8 +1935,16 @@ impl OpenAiChatDecoder {
 				if !tool.started || tool.name.is_empty() {
 					return Err(protocol_error(committed, None));
 				}
-				serde_json::from_slice::<Box<RawValue>>(&tool.arguments)
-					.map_err(|_| protocol_error(committed, None))?;
+				if let Some(arguments) = tool.object_arguments.take() {
+					let bytes =
+						serde_json::to_vec(&arguments).map_err(|_| protocol_error(committed, None))?;
+					tool.arguments.clear();
+					tool.arguments.extend_from_slice(&bytes);
+					emit(RawEvent::Chat(ChatEvent::ToolArgumentsDelta {
+						index: tool.block,
+						bytes: Bytes::from(bytes),
+					}));
+				}
 				tool.completed = true;
 				emit(RawEvent::ToolCallComplete {
 					index: tool.block,
@@ -2048,7 +2074,52 @@ struct WireFunctionDelta {
 	#[serde(default)]
 	name:      Option<Str>,
 	#[serde(default)]
-	arguments: Option<Str>,
+	arguments: Option<WireFunctionArguments>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireFunctionArguments {
+	Text(Str),
+	Object(serde_json::Map<String, Value>),
+}
+fn merge_streaming_argument_objects(
+	accumulated: &mut serde_json::Map<String, Value>,
+	fragment: serde_json::Map<String, Value>,
+) {
+	for (key, value) in fragment {
+		if matches!(key.as_str(), "__proto__" | "constructor" | "prototype") {
+			continue;
+		}
+		if let Some(previous) = accumulated.get_mut(&key) {
+			merge_streaming_argument_value(previous, value);
+		} else {
+			accumulated.insert(key, value);
+		}
+	}
+}
+
+fn merge_streaming_argument_value(previous: &mut Value, fragment: Value) {
+	match (previous, fragment) {
+		(Value::String(previous), Value::String(fragment)) => {
+			if fragment.starts_with(previous.as_str()) {
+				*previous = fragment;
+			} else {
+				previous.push_str(&fragment);
+			}
+		},
+		(Value::Array(previous), Value::Array(fragment)) => {
+			if fragment.starts_with(previous) {
+				*previous = fragment;
+			} else if !previous.starts_with(&fragment) {
+				previous.extend(fragment);
+			}
+		},
+		(Value::Object(previous), Value::Object(fragment)) => {
+			merge_streaming_argument_objects(previous, fragment);
+		},
+		(previous, fragment) => *previous = fragment,
+	}
 }
 
 #[derive(Deserialize)]
@@ -2268,9 +2339,23 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 	} else if generation_fault {
 		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: Duration::ZERO })
 	} else if matches!(code_text, "invalid_api_key" | "authentication_error" | "401") {
-		(ErrorKind::Authentication, RetryAction::Never)
+		(
+			ErrorKind::Authentication,
+			if committed {
+				RetryAction::Never
+			} else {
+				RetryAction::RefreshCredential
+			},
+		)
 	} else if matches!(code_text, "permission_denied" | "403") {
-		(ErrorKind::Authorization, RetryAction::Never)
+		(
+			ErrorKind::Authorization,
+			if committed {
+				RetryAction::Never
+			} else {
+				RetryAction::RotateAccount
+			},
+		)
 	} else if concurrency_admission {
 		// Concurrency-admission shed: surface immediately so the fallback walk
 		// owns retry instead of the transport's same-route sleep.
@@ -2524,12 +2609,20 @@ mod tests {
 		let mut framer = SseDecoder::new();
 		let mut decoder = OpenAiChatDecoder::default();
 		let mut events = Vec::new();
+		let mut done_sent = false;
 		for chunk in source.as_bytes().chunks(7) {
 			for event in framer
 				.push(Bytes::copy_from_slice(chunk))
 				.expect("valid SSE fixture")
 			{
 				decoder.push(Frame::Sse(event), &mut |event| events.push(event))?;
+			}
+			if framer.is_done() && !done_sent {
+				decoder.push(
+					Frame::Sse(SseEvent { name: None, data: Bytes::from_static(b"[DONE]") }),
+					&mut |event| events.push(event),
+				)?;
+				done_sent = true;
 			}
 		}
 		for event in framer.finish().expect("complete SSE fixture") {
@@ -3056,14 +3149,27 @@ mod tests {
 			assert!(matches!(error.action, RetryAction::SameRoute { .. }), "{code}");
 		}
 		// Deterministic denials never enter the transient lane.
-		for (code, kind) in [
-			("invalid_api_key", ErrorKind::Authentication),
-			("permission_denied", ErrorKind::Authorization),
-			("content_filter", ErrorKind::ContentFilter),
-			("invalid_request_error", ErrorKind::InvalidRequest),
+		for (code, kind, action) in [
+			("invalid_api_key", ErrorKind::Authentication, RetryAction::RefreshCredential),
+			("permission_denied", ErrorKind::Authorization, RetryAction::RotateAccount),
+			("content_filter", ErrorKind::ContentFilter, RetryAction::Never),
+			("invalid_request_error", ErrorKind::InvalidRequest, RetryAction::Never),
 		] {
 			let error = classify(code, "denied");
 			assert_eq!(error.kind, kind, "{code}");
+			assert_eq!(error.action, action, "{code}");
+		}
+		for code in ["invalid_api_key", "permission_denied"] {
+			let error = classify_error(
+				WireError {
+					code:            Some(ErrorCode::Text(code.into())),
+					message:         Some("denied".into()),
+					param:           None,
+					metadata:        None,
+					rate_limit_type: None,
+				},
+				true,
+			);
 			assert_eq!(error.action, RetryAction::Never, "{code}");
 		}
 		let generation_nan = classify(
@@ -3238,6 +3344,39 @@ mod tests {
 			.expect("resource finish emits a failure");
 		assert_eq!(failure.kind, ErrorKind::ResourceExhausted);
 		assert_eq!(failure.action, RetryAction::SemanticRetry);
+	}
+	#[test]
+	fn done_sentinel_is_authoritative_without_finish_reason() {
+		let events = decode_fixture(
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete\"}}]}\n\ndata: \
+			 [DONE]\n\n",
+		)
+		.expect("DONE authoritatively terminates the visible answer");
+		assert!(events.iter().any(|event| {
+			matches!(event, RawEvent::Completion(completion) if completion.reason == FinishReason::Stop)
+		}));
+	}
+
+	#[test]
+	fn object_valued_tool_arguments_deep_merge_and_flush_once() {
+		let events = decode_fixture(
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\
+			 call_1\",\"function\":{\"name\":\"read\",\"arguments\":{\"path\":\"a\",\"nested\":{\"\
+			 left\":\"x\"}}}}]}}]}\n\ndata: \
+			 {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"\
+			 arguments\":{\"path\":\".rs\",\"nested\":{\"right\":\"y\"}}}}]}}]}\n\ndata: [DONE]\n\n",
+		)
+		.expect("object arguments decode");
+		let arguments = events
+			.into_iter()
+			.find_map(|event| match event {
+				RawEvent::ToolCallComplete { call, .. } => Some(call.arguments),
+				_ => None,
+			})
+			.expect("tool completed");
+		let value: serde_json::Value =
+			serde_json::from_slice(&arguments).expect("merged arguments are concat-safe JSON");
+		assert_eq!(value, serde_json::json!({"path":"a.rs","nested":{"left":"x","right":"y"}}),);
 	}
 
 	#[test]

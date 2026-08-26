@@ -13,14 +13,14 @@ use super::{
 		ResponsesNamedToolKind, ResponsesOutputItem, ResponsesOutputItemKind, ResponsesReasoning,
 		ResponsesRequest, ResponsesRole, ResponsesStreamEvent, ResponsesStreamEventKind,
 		ResponsesStreamOptions, ResponsesTool, ResponsesToolChoice, ResponsesToolChoiceMode,
-		ResponsesToolKind,
+		ResponsesToolKind, hosted_image_body,
 	},
 };
 use crate::{
 	call::{AccountRoutingContext as CallAccountRoutingContext, OperationCall},
 	catalog::{
-		CodexTransportPreference, ModelCapabilities as CatalogModelCapabilities, OperationKind,
-		ProviderId, RouteId,
+		CodexTransportPreference, ModelCapabilities as CatalogModelCapabilities, OperationBits,
+		OperationKind, ProviderId, RouteId,
 	},
 	error::Error,
 	transport::Frame,
@@ -800,9 +800,7 @@ impl CodexModelsDecoder {
 
 impl Decoder for CodexModelsDecoder {
 	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
-		use crate::catalog::{
-			DiscoveredModel, ModelAvailability, ModelLimits, OperationBits, OperationKind, WireModelId,
-		};
+		use crate::catalog::{DiscoveredModel, ModelAvailability, ModelLimits, WireModelId};
 		if self.done {
 			return Ok(());
 		}
@@ -832,31 +830,33 @@ impl Decoder for CodexModelsDecoder {
 				continue;
 			};
 			let context_window = raw.context_window.unwrap_or(272_000);
+			let declared_operations = OperationBits::for_kind(OperationKind::Chat)
+				| omp_catalog::model_operation_overrides("openai-codex", wire_model.as_str());
 			rows.push(DiscoveredModel {
-				provider:              self.provider.clone(),
-				route:                 self.route.clone(),
-				wire_model:            WireModelId::from(wire_model.clone()),
-				aliases:               Box::new([]),
-				display_name:          raw
+				provider: self.provider.clone(),
+				route: self.route.clone(),
+				wire_model: WireModelId::from(wire_model.clone()),
+				aliases: Box::new([]),
+				display_name: raw
 					.display_name
 					.clone()
 					.filter(|name| !name.is_empty())
 					.or(Some(wire_model)),
-				declared_class:        None,
-				declared_operations:   OperationBits::for_kind(OperationKind::Chat),
+				declared_class: None,
+				declared_operations,
 				declared_capabilities: Some(Self::capabilities(&raw)),
-				declared_limits:       Some(ModelLimits {
+				declared_limits: Some(ModelLimits {
 					context_window:        Some(context_window),
 					maximum_input_tokens:  None,
 					maximum_output_tokens: Some(context_window.min(128_000)),
 					maximum_batch:         None,
 				}),
 				extended_context_mode: None,
-				availability:          Some(ModelAvailability::Available),
-				source:                Str::new(CODEX_DISCOVERY_SOURCE),
-				observed_at_ms:        None,
-				updated_at_ms:         None,
-				deprecated:            None,
+				availability: Some(ModelAvailability::Available),
+				source: Str::new(CODEX_DISCOVERY_SOURCE),
+				observed_at_ms: None,
+				updated_at_ms: None,
+				deprecated: None,
 			});
 		}
 		rows.sort_by(|left, right| left.wire_model.cmp(&right.wire_model));
@@ -941,6 +941,45 @@ impl Codec for OpenAiCodexCodec {
 				framing: FramingProtocol::Raw,
 				bounds: SizeBounds {
 					request_body: 0,
+					frame:        16 * 1024 * 1024,
+					response:     256 * 1024 * 1024,
+				},
+				sealed_body: None,
+			});
+		}
+		if let OperationCall::GenerateImage(request) = operation {
+			let target = context
+				.target
+				.ok_or_else(|| fail("missing_codex_image_wire_target"))?;
+			let endpoint = resolve_codex_responses_url(target.endpoint.base_url.as_str());
+			let mut headers = vec![
+				super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+				super::RequestHeader { name: sf!("accept"), value: sf!("text/event-stream") },
+			];
+			let account_id = context
+				.account
+				.and_then(|account| account.account.as_ref())
+				.map(|account| Str::new(account.as_str()))
+				.or_else(|| {
+					self
+						.options
+						.identity
+						.as_ref()
+						.and_then(|identity| identity.account_id.clone())
+				});
+			if let Some(account_id) = account_id {
+				headers.push(RequestHeader { name: sf!("chatgpt-account-id"), value: account_id });
+			}
+			apply_codex_residency_header(&mut headers, context.account);
+			return Ok(EncodedRequest {
+				operation:   OperationKind::GenerateImage,
+				method:      RequestMethod::Post,
+				uri:         endpoint,
+				headers:     headers.into_boxed_slice(),
+				body:        BodySource::Bytes(hosted_image_body(context, request)?),
+				framing:     FramingProtocol::Sse,
+				bounds:      SizeBounds {
+					request_body: 64 * 1024 * 1024,
 					frame:        16 * 1024 * 1024,
 					response:     256 * 1024 * 1024,
 				},
@@ -1070,6 +1109,20 @@ mod tests {
 		},
 		id::RegionId,
 	};
+
+	#[test]
+	fn discovered_codex_hosted_image_models_retain_image_generation() {
+		for model in ["gpt-5.5", "o3", "o3-pro"] {
+			assert!(
+				omp_catalog::model_operation_overrides("openai-codex", model)
+					.contains_kind(omp_catalog::OperationKind::GenerateImage)
+			);
+		}
+		assert!(
+			!omp_catalog::model_operation_overrides("openai-codex", "codex-mini-latest")
+				.contains_kind(omp_catalog::OperationKind::GenerateImage)
+		);
+	}
 
 	#[test]
 	fn responses_lite_fixture_is_an_exact_typed_rewrite() {

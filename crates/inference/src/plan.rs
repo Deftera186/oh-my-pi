@@ -410,8 +410,9 @@ pub struct FallbackScope {
 
 /// Clone-cheap side-effect-free planner used by typed clients.
 pub trait Planner: Clone + Send + Sync + 'static {
-	/// Produces an immutable credential-free execution plan for a call.
-	fn plan(&self, call: &Call, now: Instant) -> Result<ExecutionPlan, Error>;
+	/// Applies immutable planning settings to the real call, then produces its
+	/// credential-free execution plan.
+	fn plan(&self, call: &mut Call, now: Instant) -> Result<ExecutionPlan, Error>;
 
 	/// Revalidates expiry, catalog revision, and volatile registry generation.
 	fn validate(&self, plan: &ExecutionPlan, now: Instant) -> Result<(), Error>;
@@ -641,7 +642,10 @@ pub fn plan_replay(
 ) -> Result<ReplayPlan, Error> {
 	match requirements.replayability {
 		Replayability::Replayable | Replayability::Staged => Ok(ReplayPlan::Replayable),
-		Replayability::OneShot if requirements.semantic_retry_possible => {
+		Replayability::OneShot
+			if requirements.semantic_retry_possible
+				|| (requirements.staging_explicit && budget.max_attempts > 1) =>
+		{
 			if !requirements.staging_explicit {
 				return Err(replay_error(
 					ErrorKind::StagingRequired,

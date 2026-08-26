@@ -720,6 +720,9 @@ impl Decoder for CanonicalCcaDecoder {
 				);
 			},
 		};
+		if data.as_ref() == b"[DONE]" {
+			return Ok(());
+		}
 		let events = self
 			.inner
 			.push_json(&data)
@@ -1743,7 +1746,7 @@ mod tests {
 			event,
 			RawEvent::Chat(crate::event::ChatEvent::Usage(crate::event::UsageUpdate {
 				usage: crate::receipt::Usage {
-					input_tokens: 10,
+					input_tokens: 4,
 					output_tokens: 5,
 					cache_read_tokens: 6,
 					..

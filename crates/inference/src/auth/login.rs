@@ -1,12 +1,6 @@
 //! Typed bounded channels for interactive authentication protocols.
 
-use std::{
-	fmt,
-	sync::{
-		Arc,
-		atomic::{AtomicBool, Ordering},
-	},
-};
+use std::fmt;
 
 use flume::{Receiver, Sender, TryRecvError};
 use futures::{
@@ -14,6 +8,7 @@ use futures::{
 	future::{Either, select},
 };
 use omp_core::sf;
+use tokio_util::sync::CancellationToken;
 
 use super::{
 	lease::{CredentialLease, LeaseMeta},
@@ -34,26 +29,31 @@ pub const DEFAULT_LOGIN_CHANNEL_CAPACITY: usize = 8;
 /// Clone-cheap cancellation capability shared by a login driver and caller.
 #[derive(Clone)]
 pub struct LoginCancellation {
-	cancelled: Arc<AtomicBool>,
-	wake:      Sender<()>,
+	token: CancellationToken,
 }
 
 impl LoginCancellation {
 	/// Requests cancellation without waiting for a channel slot.
 	pub fn cancel(&self) {
-		if !self.cancelled.swap(true, Ordering::AcqRel) {
-			let _ = self.wake.try_send(());
-		}
+		self.token.cancel();
 	}
 
 	/// Returns whether cancellation has been requested.
 	pub fn is_cancelled(&self) -> bool {
-		self.cancelled.load(Ordering::Acquire)
+		self.token.is_cancelled()
 	}
 
-	fn channel() -> (Self, Receiver<()>) {
-		let (wake, receiver) = flume::bounded(1);
-		(Self { cancelled: Arc::new(AtomicBool::new(false)), wake }, receiver)
+	/// Waits until cancellation is requested.
+	pub async fn cancelled(&self) {
+		self.token.cancelled().await;
+	}
+
+	pub(crate) fn transport_token(&self) -> CancellationToken {
+		self.token.clone()
+	}
+
+	fn new() -> Self {
+		Self { token: CancellationToken::new() }
 	}
 }
 
@@ -72,7 +72,6 @@ pub struct LoginDriver {
 	events:       Sender<Result<AuthEvent, Error>>,
 	responses:    Receiver<AuthResponse>,
 	cancellation: LoginCancellation,
-	cancel_wake:  Receiver<()>,
 }
 
 impl LoginDriver {
@@ -96,7 +95,7 @@ impl LoginDriver {
 		self.check_cancelled()?;
 		loop {
 			let response = self.responses.recv_async().fuse();
-			let cancelled = self.cancel_wake.recv_async().fuse();
+			let cancelled = self.cancellation.cancelled().fuse();
 			futures::pin_mut!(response, cancelled);
 			let response = match select(response, cancelled).await {
 				Either::Left((response, _)) => response.map_err(|_| LoginChannelError::Closed)?,
@@ -148,15 +147,13 @@ impl LoginDriver {
 
 	/// Waits until out-of-band cancellation is requested.
 	pub async fn wait_cancelled(&self) {
-		if !self.cancellation.is_cancelled() {
-			let _ = self.cancel_wake.recv_async().await;
-		}
+		self.cancellation.cancelled().await;
 	}
 
 	async fn send_event(&self, event: Result<AuthEvent, Error>) -> Result<(), LoginChannelError> {
 		self.check_cancelled()?;
 		let send = self.events.send_async(event).fuse();
-		let cancelled = self.cancel_wake.recv_async().fuse();
+		let cancelled = self.cancellation.cancelled().fuse();
 		futures::pin_mut!(send, cancelled);
 		match select(send, cancelled).await {
 			Either::Left((result, _)) => result.map_err(|_| LoginChannelError::Closed),
@@ -191,14 +188,18 @@ pub fn login_channels(
 	}
 	let (event_tx, event_rx) = flume::bounded(capacity);
 	let (response_tx, response_rx) = flume::bounded(capacity);
-	let (cancellation, cancel_wake) = LoginCancellation::channel();
-	let session = AuthSession { id: id.clone(), events: event_rx, responses: response_tx };
+	let cancellation = LoginCancellation::new();
+	let session = AuthSession {
+		id:           id.clone(),
+		events:       event_rx,
+		responses:    response_tx,
+		cancellation: cancellation.clone(),
+	};
 	let driver = LoginDriver {
 		id,
 		events: event_tx,
 		responses: response_rx,
 		cancellation: cancellation.clone(),
-		cancel_wake,
 	};
 	Ok((session, driver, cancellation))
 }

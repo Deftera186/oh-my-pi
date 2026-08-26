@@ -17,17 +17,20 @@ use super::{
 	openai_chat,
 };
 use crate::{
-	answer::{Artifact, ArtifactBody},
+	answer::{Artifact, ArtifactBody, GenerationEvent, GenerationSummary, ImageArtifact},
 	body::BodySource,
-	call::{ChatRequest, MediaInput, OpaqueJson, OperationCall, ToolInputConstraint},
+	call::{
+		Background, ChatRequest, Dimensions, ImageFormat, ImageQuality, ImageRequest, MediaInput,
+		OpaqueJson, OperationCall, Setting, ToolInputConstraint,
+	},
 	catalog::{
 		OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
 		policy::{ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport},
 	},
-	error::Error,
+	error::{Error, ErrorKind, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
 	id::{RequestId, ToolCallId},
-	receipt::{Usage, UsageSource},
+	receipt::{Cost, Usage, UsageSource},
 	session::StoredProviderStateEvent,
 	transport::{Frame, FramingProtocol},
 };
@@ -1220,6 +1223,7 @@ pub struct OpenAiResponsesDecoder {
 	response_id:               Option<Str>,
 	model:                     Option<Str>,
 	outputs:                   BTreeMap<u32, OutputSlot>,
+	aliases:                   BTreeMap<Str, u32>,
 	ended:                     BTreeSet<u32>,
 	terminal:                  bool,
 	next_index:                u32,
@@ -1315,7 +1319,10 @@ impl OpenAiResponsesDecoder {
 					if !self.outputs.contains_key(&index) {
 						self.add_item(index, item, &mut out);
 					}
-					self.complete_item(index, item);
+					self.complete_item(index, item, &mut out);
+					if self.terminal {
+						return out;
+					}
 				}
 				self.end_slot(index, &mut out);
 			},
@@ -1413,15 +1420,52 @@ impl OpenAiResponsesDecoder {
 	}
 
 	fn lookup_index(&self, event: &ResponsesStreamEvent) -> Option<u32> {
-		event.output_index.or_else(|| {
-			event.item_id.as_ref().and_then(|id| {
-				self.outputs.iter().find_map(|(index, slot)| {
-					slot_item_id(slot)
-						.is_some_and(|candidate| candidate == id.as_str())
-						.then_some(*index)
-				})
+		self.lookup_index_for(event, None)
+	}
+
+	fn lookup_index_for(
+		&self,
+		event: &ResponsesStreamEvent,
+		class: Option<SlotClass>,
+	) -> Option<u32> {
+		event
+			.output_index
+			.or_else(|| {
+				event
+					.item_id
+					.as_ref()
+					.or_else(|| event.item.as_ref().and_then(|item| item.id.as_ref()))
+					.or_else(|| event.item.as_ref().and_then(|item| item.call_id.as_ref()))
+					.and_then(|id| {
+						self.aliases.get(id).copied().or_else(|| {
+							self.outputs.iter().find_map(|(index, slot)| {
+								slot_item_id(slot)
+									.is_some_and(|candidate| candidate == id.as_str())
+									.then_some(*index)
+							})
+						})
+					})
 			})
-		})
+			.or_else(|| {
+				if event.item_id.is_some()
+					|| event
+						.item
+						.as_ref()
+						.is_some_and(|item| item.id.is_some() || item.call_id.is_some())
+				{
+					return None;
+				}
+				let mut candidates = self
+					.outputs
+					.iter()
+					.filter(|(index, slot)| {
+						!self.ended.contains(index)
+							&& class.is_none_or(|class| slot_matches_class(slot, class))
+					})
+					.map(|(index, _)| *index);
+				let only = candidates.next()?;
+				candidates.next().is_none().then_some(only)
+			})
 	}
 
 	fn add_item(
@@ -1448,6 +1492,15 @@ impl OpenAiResponsesDecoder {
 		}
 		if let Some(id) = item.id.as_ref() {
 			out.push(ResponsesProjection::OutputItem { index, id: id.clone() });
+			self.aliases.insert(id.clone(), index);
+		}
+		if let Some(call_id) = item.call_id.as_ref() {
+			self.aliases.insert(call_id.clone(), index);
+			if let Some(bare) = call_id.strip_prefix("fc_") {
+				self.aliases.insert(Str::new(bare), index);
+			} else {
+				self.aliases.insert(sf!("fc_{call_id}"), index);
+			}
 		}
 		let slot = match item.kind {
 			ResponsesOutputItemKind::Message => {
@@ -1543,7 +1596,7 @@ impl OpenAiResponsesDecoder {
 		class: SlotClass,
 		out: &mut Vec<ResponsesProjection>,
 	) {
-		let Some(index) = self.lookup_index(event) else {
+		let Some(index) = self.lookup_index_for(event, Some(class)) else {
 			return;
 		};
 		if self.ended.contains(&index) {
@@ -1591,7 +1644,7 @@ impl OpenAiResponsesDecoder {
 		class: SlotClass,
 		out: &mut Vec<ResponsesProjection>,
 	) {
-		let Some(index) = self.lookup_index(event) else {
+		let Some(index) = self.lookup_index_for(event, Some(class)) else {
 			return;
 		};
 		let complete = match class {
@@ -1601,63 +1654,122 @@ impl OpenAiResponsesDecoder {
 		let Some(complete) = complete else {
 			return;
 		};
-		match (self.outputs.get_mut(&index), class) {
-			(Some(OutputSlot::Thinking { text, emitted, .. }), SlotClass::Thinking) => {
-				let previous = text.len();
-				if complete.as_bytes().starts_with(text.as_ref())
-					&& let Some(delta) = complete.get(previous..)
-					&& !delta.is_empty()
-				{
-					text.extend_from_slice(delta.as_bytes());
-					*emitted = true;
-					out.push(ResponsesProjection::Canonical(ChatEvent::ThinkingDelta {
-						index,
-						text: Str::new(delta),
-					}));
-				}
-			},
+		self.reconcile_authoritative(index, class, complete, out);
+	}
+
+	fn reconcile_authoritative(
+		&mut self,
+		index: u32,
+		class: SlotClass,
+		complete: &str,
+		out: &mut Vec<ResponsesProjection>,
+	) {
+		let prefix = match (self.outputs.get(&index), class) {
 			(Some(OutputSlot::Text { text, .. }), SlotClass::Text)
-			| (Some(OutputSlot::Tool { arguments: text, .. }), SlotClass::Tool) => {
-				text.clear();
-				text.extend_from_slice(complete.as_bytes());
+			| (Some(OutputSlot::Thinking { text, .. }), SlotClass::Thinking)
+			| (Some(OutputSlot::Tool { arguments: text, .. }), SlotClass::Tool) => text.as_ref(),
+			_ => return,
+		};
+		if !complete.as_bytes().starts_with(prefix) {
+			self.terminal = true;
+			out.push(ResponsesProjection::Error(ResponsesErrorEvidence {
+				code:         Some(sf!("authoritative_output_diverged")),
+				message:      sf!("Responses authoritative output diverged from emitted prefix"),
+				continuation: ResponsesContinuationFailure::Malformed,
+			}));
+			return;
+		}
+		let suffix = &complete[prefix.len()..];
+		if suffix.is_empty() {
+			return;
+		}
+		match (self.outputs.get_mut(&index), class) {
+			(Some(OutputSlot::Text { text, emitted, .. }), SlotClass::Text) => {
+				text.extend_from_slice(suffix.as_bytes());
+				*emitted = true;
+				self.saw_visible_output = true;
+				out.push(ResponsesProjection::Canonical(ChatEvent::TextDelta {
+					index,
+					text: Str::new(suffix),
+				}));
+			},
+			(Some(OutputSlot::Thinking { text, emitted, .. }), SlotClass::Thinking) => {
+				text.extend_from_slice(suffix.as_bytes());
+				*emitted = true;
+				out.push(ResponsesProjection::Canonical(ChatEvent::ThinkingDelta {
+					index,
+					text: Str::new(suffix),
+				}));
+			},
+			(Some(OutputSlot::Tool { arguments, .. }), SlotClass::Tool) => {
+				arguments.extend_from_slice(suffix.as_bytes());
+				self.saw_visible_output = true;
+				out.push(ResponsesProjection::Canonical(ChatEvent::ToolArgumentsDelta {
+					index,
+					bytes: Bytes::copy_from_slice(suffix.as_bytes()),
+				}));
 			},
 			_ => {},
 		}
 	}
 
-	fn complete_item(&mut self, index: u32, item: &ResponsesOutputItem) {
+	fn complete_item(
+		&mut self,
+		index: u32,
+		item: &ResponsesOutputItem,
+		out: &mut Vec<ResponsesProjection>,
+	) {
+		let authoritative = match self.outputs.get(&index) {
+			Some(OutputSlot::Text { .. }) if !item.content.is_empty() => {
+				let mut text = String::new();
+				for part in &item.content {
+					if let Some(value) = &part.text {
+						text.push_str(value);
+					}
+				}
+				Some((SlotClass::Text, Str::new(text)))
+			},
+			Some(OutputSlot::Thinking { .. }) if !item.summary.is_empty() => {
+				let mut text = String::new();
+				for (position, summary) in item.summary.iter().enumerate() {
+					if position != 0 {
+						text.push_str("\n\n");
+					}
+					text.push_str(summary.text.as_str());
+				}
+				Some((SlotClass::Thinking, Str::new(text)))
+			},
+			Some(OutputSlot::Tool { custom, .. }) => {
+				let value = if *custom {
+					item.input.as_ref()
+				} else {
+					item.arguments.as_ref()
+				};
+				value.cloned().map(|value| (SlotClass::Tool, value))
+			},
+			_ => None,
+		};
+		if let Some((class, complete)) = authoritative {
+			self.reconcile_authoritative(index, class, &complete, out);
+			if self.terminal {
+				return;
+			}
+		}
 		match self.outputs.get_mut(&index) {
-			Some(OutputSlot::Text { item_id, text, .. }) => {
+			Some(OutputSlot::Text { item_id, .. }) => {
 				if let Some(id) = &item.id {
 					*item_id = Some(id.clone());
 				}
-				if !item.content.is_empty() {
-					text.clear();
-					for part in &item.content {
-						if let Some(value) = &part.text {
-							text.extend_from_slice(value.as_bytes());
-						}
-					}
-				}
 			},
-			Some(OutputSlot::Thinking { item_id, text, encrypted, .. }) => {
+			Some(OutputSlot::Thinking { item_id, encrypted, .. }) => {
 				if let Some(id) = &item.id {
 					*item_id = Some(id.clone());
 				}
 				if let Some(value) = &item.encrypted_content {
 					*encrypted = Bytes::copy_from_slice(value.as_bytes());
 				}
-				if !item.summary.is_empty() {
-					text.clear();
-					for (position, summary) in item.summary.iter().enumerate() {
-						if position != 0 {
-							text.extend_from_slice(b"\n\n");
-						}
-						text.extend_from_slice(summary.text.as_bytes());
-					}
-				}
 			},
-			Some(OutputSlot::Tool { item_id, call_id, name, arguments, custom }) => {
+			Some(OutputSlot::Tool { item_id, call_id, name, .. }) => {
 				if let Some(id) = &item.id {
 					*item_id = Some(id.clone());
 				}
@@ -1666,15 +1778,6 @@ impl OpenAiResponsesDecoder {
 				}
 				if let Some(value) = &item.name {
 					*name = value.clone();
-				}
-				let complete = if *custom {
-					item.input.as_ref()
-				} else {
-					item.arguments.as_ref()
-				};
-				if let Some(value) = complete {
-					arguments.clear();
-					arguments.extend_from_slice(value.as_bytes());
 				}
 			},
 			Some(OutputSlot::Computer { item_id, call_id, arguments }) => {
@@ -1787,7 +1890,7 @@ impl OpenAiResponsesDecoder {
 				if !self.outputs.contains_key(&index) {
 					self.add_item(index, item, out);
 				}
-				self.complete_item(index, item);
+				self.complete_item(index, item, out);
 			}
 		}
 		let open = self
@@ -1873,6 +1976,14 @@ fn slot_item_id(slot: &OutputSlot) -> Option<&str> {
 		OutputSlot::Tool { item_id, call_id, .. } => item_id.as_deref().or(Some(call_id.as_str())),
 		OutputSlot::Hosted { .. } | OutputSlot::Image { .. } => None,
 	}
+}
+const fn slot_matches_class(slot: &OutputSlot, class: SlotClass) -> bool {
+	matches!(
+		(slot, class),
+		(OutputSlot::Text { .. }, SlotClass::Text)
+			| (OutputSlot::Thinking { .. }, SlotClass::Thinking)
+			| (OutputSlot::Tool { .. }, SlotClass::Tool)
+	)
 }
 
 fn error_from_response(
@@ -3166,9 +3277,6 @@ impl ResponsesDecoderAdapter {
 			error::{Error, ErrorKind, ErrorPhase, RetryAction},
 			receipt::ExecutionReceipt,
 		};
-		// A ChatGPT account not entitled to the requested Codex model is an
-		// account-scoped policy denial, not a plain provider error: rotate so an
-		// entitled sibling account can serve the request (pi PR #8756).
 		let model_policy_denial = evidence.continuation == ResponsesContinuationFailure::NotStale
 			&& is_codex_chatgpt_account_policy_denial(
 				self.provider.as_str(),
@@ -3178,7 +3286,14 @@ impl ResponsesDecoderAdapter {
 		let committed = self.inner.committed_output();
 		let premature_end = evidence.code.as_deref() == Some("premature_end");
 		let (kind, action) = if model_policy_denial {
-			(ErrorKind::Authorization, RetryAction::RotateAccount)
+			(
+				ErrorKind::Authorization,
+				if committed {
+					RetryAction::Never
+				} else {
+					RetryAction::RotateAccount
+				},
+			)
 		} else if premature_end && !committed {
 			(ErrorKind::Protocol, RetryAction::SameRouteLimited {
 				after:       Duration::ZERO,
@@ -3193,7 +3308,11 @@ impl ResponsesDecoderAdapter {
 				ResponsesContinuationFailure::Malformed => {
 					(ErrorKind::StreamCorruption, RetryAction::Never)
 				},
-				ResponsesContinuationFailure::NotStale => (ErrorKind::Protocol, RetryAction::Never),
+				ResponsesContinuationFailure::NotStale => classify_responses_provider_error(
+					evidence.code.as_deref(),
+					evidence.message.as_str(),
+					committed,
+				),
 			}
 		};
 		let code = if model_policy_denial {
@@ -3201,12 +3320,65 @@ impl ResponsesDecoderAdapter {
 		} else {
 			evidence.code
 		};
-		Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
-			.provider(self.provider.clone())
-			.route(self.route.clone())
-			.request_id(self.request_id.clone())
-			.optional_code(code)
-			.committed(committed)
+		Error::new(
+			kind,
+			if committed {
+				ErrorPhase::Streaming
+			} else {
+				ErrorPhase::Handshake
+			},
+			action,
+			ExecutionReceipt::default(),
+		)
+		.provider(self.provider.clone())
+		.route(self.route.clone())
+		.request_id(self.request_id.clone())
+		.optional_code(code)
+		.committed(committed)
+	}
+}
+fn classify_responses_provider_error(
+	code: Option<&str>,
+	message: &str,
+	committed: bool,
+) -> (ErrorKind, RetryAction) {
+	let code = code.unwrap_or_default().to_ascii_lowercase();
+	let message = message.to_ascii_lowercase();
+	let action = |action| {
+		if committed {
+			RetryAction::Never
+		} else {
+			action
+		}
+	};
+	if matches!(code.as_str(), "401" | "invalid_api_key" | "authentication_error" | "unauthorized")
+		|| message.contains("invalid api key")
+		|| message.contains("authentication")
+	{
+		(ErrorKind::Authentication, action(RetryAction::RefreshCredential))
+	} else if matches!(code.as_str(), "403" | "permission_denied" | "authorization_error") {
+		(ErrorKind::Authorization, action(RetryAction::RotateAccount))
+	} else if matches!(code.as_str(), "429" | "rate_limit_exceeded" | "rate_limit_error") {
+		(ErrorKind::RateLimited, action(RetryAction::SameRoute { after: Duration::from_secs(30) }))
+	} else if matches!(
+		code.as_str(),
+		"500" | "502" | "503" | "529" | "server_error" | "internal_server_error" | "overloaded_error"
+	) {
+		(
+			ErrorKind::ResourceExhausted,
+			action(RetryAction::SameRoute { after: Duration::from_millis(500) }),
+		)
+	} else if matches!(code.as_str(), "context_length_exceeded" | "context_window_exceeded")
+		|| message.contains("context length")
+		|| message.contains("context window")
+	{
+		(ErrorKind::ContextOverflow, RetryAction::Never)
+	} else if matches!(code.as_str(), "insufficient_quota" | "quota_exceeded") {
+		(ErrorKind::QuotaExhausted, RetryAction::Never)
+	} else if matches!(code.as_str(), "400" | "invalid_request_error" | "invalid_request") {
+		(ErrorKind::InvalidRequest, RetryAction::Never)
+	} else {
+		(ErrorKind::Protocol, RetryAction::Never)
 	}
 }
 
@@ -3230,6 +3402,9 @@ impl Decoder for ResponsesDecoderAdapter {
 				}));
 			},
 		};
+		if payload.as_ref() == b"[DONE]" {
+			return Ok(());
+		}
 		for projection in self.inner.push_json(&payload) {
 			self.emit_projection(projection, emit);
 		}
@@ -3262,14 +3437,241 @@ pub(super) fn responses_uri(base_url: &str) -> Str {
 	openai_chat::join_uri(base_url, "/responses")
 }
 
+#[derive(Serialize)]
+struct HostedImageRequest {
+	model:        Str,
+	input:        [ResponsesInputItem; 1],
+	tools:        [HostedImageTool; 1],
+	tool_choice:  HostedImageToolChoice,
+	store:        bool,
+	stream:       bool,
+	instructions: &'static str,
+}
+
+#[derive(Serialize)]
+struct HostedImageTool {
+	#[serde(rename = "type")]
+	kind:          &'static str,
+	action:        &'static str,
+	output_format: &'static str,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	size:          Option<&'static str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	quality:       Option<&'static str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	background:    Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct HostedImageToolChoice {
+	#[serde(rename = "type")]
+	kind: &'static str,
+}
+
+fn selected<T: Copy>(setting: &Setting<T>) -> Option<T> {
+	match setting {
+		Setting::Require(value) | Setting::Prefer(value) => Some(*value),
+		Setting::Unset => None,
+	}
+}
+
+pub(super) fn hosted_image_body(
+	context: &EncodeContext<'_>,
+	request: &ImageRequest,
+) -> Result<Bytes, Error> {
+	let target = context
+		.target
+		.ok_or_else(|| encoding_error("missing_responses_image_wire_target"))?;
+	if request.count != 1 {
+		return Err(encoding_error("responses_image_count_unsupported"));
+	}
+	if request.mask.is_some()
+		|| !request.safety.is_empty()
+		|| request.seed.is_some()
+		|| !matches!(request.style, Setting::Unset)
+	{
+		return Err(encoding_error("responses_image_option_unsupported"));
+	}
+	let mut content = Vec::with_capacity(request.references.len() + 1);
+	content.push(ResponsesContent::input_text(request.prompt.clone()));
+	for reference in request.references.iter() {
+		content.push(
+			encode_media_content(reference, true)
+				.map_err(|_| encoding_error("unresolved_responses_image_reference"))?,
+		);
+	}
+	let size = match selected(&request.dimensions) {
+		None => None,
+		Some(Dimensions { width: 1024, height: 1024 }) => Some("1024x1024"),
+		Some(Dimensions { width: 1024, height: 1536 }) => Some("1024x1536"),
+		Some(Dimensions { width: 1536, height: 1024 }) => Some("1536x1024"),
+		Some(_) => return Err(encoding_error("responses_image_dimensions_unsupported")),
+	};
+	let quality = selected(&request.quality).map(|quality| match quality {
+		ImageQuality::Draft => "low",
+		ImageQuality::Standard => "medium",
+		ImageQuality::High => "high",
+	});
+	let background = selected(&request.background).map(|background| match background {
+		Background::Opaque => "opaque",
+		Background::Transparent => "transparent",
+		Background::Auto => "auto",
+	});
+	let output_format = match selected(&request.format).unwrap_or(ImageFormat::Png) {
+		ImageFormat::Png => "png",
+		ImageFormat::Jpeg => "jpeg",
+		ImageFormat::Webp => "webp",
+	};
+	serde_json::to_vec(&HostedImageRequest {
+		model:        Str::new(target.wire_model.as_str()),
+		input:        [ResponsesInputItem::message(ResponsesRole::User, content)],
+		tools:        [HostedImageTool {
+			kind: "image_generation",
+			action: if request.references.is_empty() {
+				"generate"
+			} else {
+				"edit"
+			},
+			output_format,
+			size,
+			quality,
+			background,
+		}],
+		tool_choice:  HostedImageToolChoice { kind: "image_generation" },
+		store:        false,
+		stream:       true,
+		instructions: "Generate exactly one high-quality image matching the user's request.",
+	})
+	.map(Bytes::from)
+	.map_err(|_| encoding_error("responses_image_request_serialization"))
+}
+
+struct HostedImageDecoder {
+	inner:      ResponsesDecoderAdapter,
+	dimensions: Dimensions,
+	format:     ImageFormat,
+	artifacts:  u32,
+}
+
+impl HostedImageDecoder {
+	fn project(&mut self, event: RawEvent, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		match event {
+			RawEvent::Chat(ChatEvent::Artifact { mut artifact, .. }) => {
+				artifact.media_type = Str::new(match self.format {
+					ImageFormat::Png => "image/png",
+					ImageFormat::Jpeg => "image/jpeg",
+					ImageFormat::Webp => "image/webp",
+				});
+				self.artifacts = self.artifacts.saturating_add(1);
+				emit(RawEvent::ImageGeneration(GenerationEvent::Artifact(ImageArtifact {
+					artifact,
+					width: self.dimensions.width,
+					height: self.dimensions.height,
+					revised_prompt: None,
+				})));
+			},
+			RawEvent::Completion(completion) => {
+				if self.artifacts != 1 {
+					return Err(encoding_error("responses_image_result_missing"));
+				}
+				emit(RawEvent::ImageGeneration(GenerationEvent::Completed(GenerationSummary {
+					artifacts: self.artifacts,
+					elapsed:   Duration::ZERO,
+					usage:     completion.usage,
+					cost:      Cost::default(),
+				})));
+			},
+			RawEvent::Chat(_) => {},
+			event => emit(event),
+		}
+		Ok(())
+	}
+
+	fn forward(
+		&mut self,
+		result: Result<(), Error>,
+		events: Vec<RawEvent>,
+		emit: &mut dyn FnMut(RawEvent),
+	) -> Result<(), Error> {
+		result?;
+		for event in events {
+			self.project(event, emit)?;
+		}
+		Ok(())
+	}
+}
+
+impl Decoder for HostedImageDecoder {
+	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		let mut events = Vec::new();
+		let result = self.inner.push(frame, &mut |event| events.push(event));
+		self.forward(result, events, emit)
+	}
+
+	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		let mut events = Vec::new();
+		let result = self.inner.finish(&mut |event| events.push(event));
+		self.forward(result, events, emit)
+	}
+}
+
+fn responses_decoder(context: &DecodeContext<'_>) -> ResponsesDecoderAdapter {
+	ResponsesDecoderAdapter {
+		inner: OpenAiResponsesDecoder::default(),
+		request_id: context.request_id.clone(),
+		provider: context.provider.clone(),
+		route: context.route.clone(),
+		wire_model: context
+			.target
+			.map(|target| Str::new(target.wire_model.as_str())),
+		thinking_close_max_retries: context.policy.streaming.thinking_close_max_retries,
+	}
+}
+
+pub(super) fn hosted_image_decoder(
+	context: &DecodeContext<'_>,
+	request: &ImageRequest,
+) -> DecoderState {
+	Box::new(HostedImageDecoder {
+		inner:      responses_decoder(context),
+		dimensions: selected(&request.dimensions)
+			.unwrap_or(Dimensions { width: 1024, height: 1024 }),
+		format:     selected(&request.format).unwrap_or(ImageFormat::Png),
+		artifacts:  0,
+	})
+}
+
 impl Codec for OpenAiResponsesCodec {
 	fn encode(
 		&self,
 		context: &EncodeContext<'_>,
 		operation: &OperationCall,
 	) -> Result<EncodedRequest, Error> {
+		if let OperationCall::GenerateImage(request) = operation {
+			let target = context
+				.target
+				.ok_or_else(|| encoding_error("missing_responses_image_wire_target"))?;
+			return Ok(EncodedRequest {
+				operation:   OperationKind::GenerateImage,
+				method:      RequestMethod::Post,
+				uri:         responses_uri(target.endpoint.base_url.as_str()),
+				headers:     vec![
+					super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+					super::RequestHeader { name: sf!("accept"), value: sf!("text/event-stream") },
+				]
+				.into_boxed_slice(),
+				body:        BodySource::Bytes(hosted_image_body(context, request)?),
+				framing:     FramingProtocol::Sse,
+				bounds:      SizeBounds {
+					request_body: 64 * 1024 * 1024,
+					frame:        16 * 1024 * 1024,
+					response:     256 * 1024 * 1024,
+				},
+				sealed_body: None,
+			});
+		}
 		let OperationCall::Chat(request) = operation else {
-			return Err(encoding_error("responses_chat_only"));
+			return Err(encoding_error("responses_operation_unsupported"));
 		};
 		let encoded = self
 			.encode_chat(context, request)
@@ -3339,21 +3741,14 @@ impl Codec for OpenAiResponsesCodec {
 	}
 
 	fn decoder(&self, context: &DecodeContext<'_>) -> Result<DecoderState, Error> {
-		if context.operation != context.operation_call.kind()
-			|| !matches!(context.operation_call, crate::call::OperationCall::Chat(_))
-		{
+		if context.operation != context.operation_call.kind() {
 			return Err(encoding_error("responses_decode_operation_mismatch"));
 		}
-		Ok(Box::new(ResponsesDecoderAdapter {
-			inner: OpenAiResponsesDecoder::default(),
-			request_id: context.request_id.clone(),
-			provider: context.provider.clone(),
-			route: context.route.clone(),
-			wire_model: context
-				.target
-				.map(|target| Str::new(target.wire_model.as_str())),
-			thinking_close_max_retries: context.policy.streaming.thinking_close_max_retries,
-		}))
+		match context.operation_call {
+			OperationCall::GenerateImage(request) => Ok(hosted_image_decoder(context, request)),
+			OperationCall::Chat(_) => Ok(Box::new(responses_decoder(context))),
+			_ => Err(encoding_error("responses_decode_operation_mismatch")),
+		}
 	}
 }
 
@@ -3361,27 +3756,32 @@ impl Codec for OpenAiResponsesCodec {
 mod tests {
 	use std::{sync::Arc, time::Duration};
 
+	use bytes::Bytes;
 	use omp_catalog::{Catalog, ReasoningEffort, RouteDef, ThinkingEffort, WireTarget, policy};
 	use omp_core::{Str, sf};
 
 	use super::{
-		EncodedResponses, OpenAiResponsesCodec, OpenAiResponsesDecoder, ResponsesContinuationFailure,
-		ResponsesDecoderAdapter, ResponsesErrorEvidence, ResponsesInputItem, ResponsesInputItemKind,
-		ResponsesProjection, ResponsesProviderProof, ResponsesRole, classify_continuation_error,
-		encode_provider_proof, hoist_interleaved_tool_batch_messages,
+		EncodedResponses, HostedImageDecoder, OpenAiResponsesCodec, OpenAiResponsesDecoder,
+		ResponsesContinuationFailure, ResponsesDecoderAdapter, ResponsesErrorEvidence,
+		ResponsesInputItem, ResponsesInputItemKind, ResponsesProjection, ResponsesProviderProof,
+		ResponsesRole, classify_continuation_error, encode_provider_proof,
+		hoist_interleaved_tool_batch_messages,
 	};
 	use crate::{
 		TurnId,
+		answer::GenerationEvent,
 		call::{
-			ChatRequest, ContentPart, ContextStrategy, Message, NegotiationPolicy, OpaqueJson,
+			Background, ChatRequest, ContentPart, ContextStrategy, Dimensions, ImageFormat,
+			ImageQuality, ImageRequest, Message, NegotiationPolicy, OpaqueJson, OperationCall,
 			ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling, SessionRequest,
 			Setting, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
 			ToolResultContent,
 		},
 		catalog::{ProviderId, RouteId},
-		codec::EncodeContext,
+		codec::{Codec as _, Decoder as _, EncodeContext, RawEvent},
 		event::{ChatEvent, FinishReason},
 		id::{ConversationId, RequestId, Revision, ToolCallId},
+		transport::{Frame, SseEvent},
 	};
 
 	fn replay_sse(fixture: &str) -> Vec<ResponsesProjection> {
@@ -3536,6 +3936,116 @@ mod tests {
 			.expect("cache request encodes")
 			.request
 			.prompt_cache_key
+	}
+
+	fn image_request() -> ImageRequest {
+		ImageRequest {
+			prompt:      sf!("a blue hour cityscape"),
+			references:  Arc::from([]),
+			mask:        None,
+			count:       1,
+			dimensions:  Setting::Require(Dimensions { width: 1536, height: 1024 }),
+			quality:     Setting::Require(ImageQuality::High),
+			background:  Setting::Require(Background::Opaque),
+			format:      Setting::Require(ImageFormat::Png),
+			style:       Setting::Unset,
+			safety:      Arc::from([]),
+			seed:        None,
+			negotiation: NegotiationPolicy::default(),
+		}
+	}
+
+	#[test]
+	fn hosted_image_request_uses_responses_tool_contract() {
+		let catalog = Catalog::embedded();
+		let route = catalog
+			.routes()
+			.iter()
+			.find(|route| {
+				route.provider.as_str() == "openai" && route.codec.as_str() == "openai-responses"
+			})
+			.expect("OpenAI Responses route");
+		let target = WireTarget {
+			route:      route.id.clone(),
+			codec:      route.codec.clone(),
+			endpoint:   route.endpoint.clone(),
+			wire_model: sf!("gpt-5.5").into(),
+		};
+		let request_id = RequestId::new("responses-image");
+		let policy = policy::WirePolicy::baseline();
+		let context = EncodeContext {
+			request_id: &request_id,
+			route,
+			target: Some(&target),
+			policy: &policy,
+			..EncodeContext::default()
+		};
+		let encoded = OpenAiResponsesCodec::default()
+			.encode(&context, &OperationCall::GenerateImage(Arc::new(image_request())))
+			.expect("hosted image request");
+		assert_eq!(encoded.operation, omp_catalog::OperationKind::GenerateImage);
+		assert_eq!(encoded.uri.as_str(), "https://api.openai.com/v1/responses");
+		let crate::body::BodySource::Bytes(body) = encoded.body else {
+			panic!("Responses image body is buffered JSON");
+		};
+		let body: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
+		assert_eq!(body["tools"][0]["type"], "image_generation");
+		assert_eq!(body["tools"][0]["size"], "1536x1024");
+		assert_eq!(body["tool_choice"]["type"], "image_generation");
+		assert_eq!(body["stream"], true);
+	}
+
+	#[test]
+	fn hosted_image_result_projects_generation_artifact_and_completion() {
+		let request_id = RequestId::new("responses-image-result");
+		let provider = ProviderId::new("openai");
+		let route = RouteId::new("openai/primary");
+		let mut decoder = HostedImageDecoder {
+			inner:      ResponsesDecoderAdapter {
+				inner: OpenAiResponsesDecoder::default(),
+				request_id,
+				provider,
+				route,
+				wire_model: Some(sf!("gpt-5.5")),
+				thinking_close_max_retries: None,
+			},
+			dimensions: Dimensions { width: 1024, height: 1024 },
+			format:     ImageFormat::Png,
+			artifacts:  0,
+		};
+		let payload = serde_json::json!({
+			"type": "response.completed",
+			"response": {
+				"id": "resp_image",
+				"status": "completed",
+				"output": [{
+					"type": "image_generation_call",
+					"id": "ig_1",
+					"status": "completed",
+					"result": "aW1hZ2U="
+				}]
+			}
+		});
+		let mut events = Vec::new();
+		decoder
+			.push(
+				Frame::Sse(SseEvent {
+					name: None,
+					data: Bytes::from(serde_json::to_vec(&payload).expect("event JSON")),
+				}),
+				&mut |event| events.push(event),
+			)
+			.expect("terminal image response");
+		assert!(
+			events
+				.iter()
+				.any(|event| matches!(event, RawEvent::ImageGeneration(GenerationEvent::Artifact(_))))
+		);
+		assert!(
+			events
+				.iter()
+				.any(|event| matches!(event, RawEvent::ImageGeneration(GenerationEvent::Completed(_))))
+		);
 	}
 
 	#[test]
@@ -3998,6 +4508,83 @@ mod tests {
 			ResponsesProjection::Canonical(ChatEvent::ToolCallReady { .. })
 		)));
 	}
+	#[test]
+	fn call_id_aliases_route_interleaved_parallel_tool_deltas() {
+		let mut decoder = OpenAiResponsesDecoder::default();
+		let mut events = decoder.push_json(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","name":"a","arguments":""}}"#);
+		events.extend(decoder.push_json(br#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","name":"b","arguments":""}}"#));
+		events.extend(decoder.push_json(br#"{"type":"response.function_call_arguments.delta","item_id":"call_a","delta":"{\"a\":1"}"#));
+		events.extend(decoder.push_json(br#"{"type":"response.function_call_arguments.delta","item_id":"fc_call_b","delta":"{\"b\":2"}"#));
+		let routed = events
+			.iter()
+			.filter_map(|event| match event {
+				ResponsesProjection::Canonical(ChatEvent::ToolArgumentsDelta { index, bytes }) => {
+					Some((*index, bytes.clone()))
+				},
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(routed.len(), 2);
+		assert_eq!(routed[0].0, 0);
+		assert_eq!(routed[1].0, 1);
+		let mut guarded = OpenAiResponsesDecoder::default();
+		guarded.push_json(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg"}}"#);
+		guarded.push_json(br#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"only_call","name":"tool","arguments":""}}"#);
+		let events =
+			guarded.push_json(br#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#);
+		assert!(events.iter().any(|event| {
+			matches!(
+				event,
+				ResponsesProjection::Canonical(ChatEvent::ToolArgumentsDelta { index: 1, .. })
+			)
+		}));
+	}
+
+	#[test]
+	fn authoritative_done_emits_unseen_suffix_and_rejects_divergence() {
+		let mut decoder = OpenAiResponsesDecoder::default();
+		let mut events = decoder.push_json(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#);
+		events
+			.extend(decoder.push_json(
+				br#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"hel"}"#,
+			));
+		events
+			.extend(decoder.push_json(
+				br#"{"type":"response.output_text.done","item_id":"msg_1","text":"hello"}"#,
+			));
+		let text = events
+			.iter()
+			.filter_map(|event| match event {
+				ResponsesProjection::Canonical(ChatEvent::TextDelta { text, .. }) => {
+					Some(text.as_str())
+				},
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(text, ["hel", "lo"]);
+		let mut item_done = OpenAiResponsesDecoder::default();
+		item_done.push_json(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_item"}}"#);
+		item_done
+			.push_json(br#"{"type":"response.output_text.delta","item_id":"msg_item","delta":"hel"}"#);
+		let events = item_done.push_json(br#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_item","content":[{"type":"output_text","text":"hello"}]}}"#);
+		assert!(events.iter().any(|event| {
+			matches!(
+				event,
+				ResponsesProjection::Canonical(ChatEvent::TextDelta { text, .. })
+					if text == "lo"
+			)
+		}));
+
+		let mut divergent = OpenAiResponsesDecoder::default();
+		divergent.push_json(br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_2"}}"#);
+		divergent
+			.push_json(br#"{"type":"response.output_text.delta","item_id":"msg_2","delta":"hel"}"#);
+		let events = divergent
+			.push_json(br#"{"type":"response.output_text.done","item_id":"msg_2","text":"goodbye"}"#);
+		assert!(events.iter().any(|event| {
+			matches!(event, ResponsesProjection::Error(error) if error.code.as_deref() == Some("authoritative_output_diverged"))
+		}));
+	}
 
 	#[test]
 	fn preserves_leaked_tags_as_visible_text_for_recovery() {
@@ -4160,6 +4747,34 @@ mod tests {
 		assert_eq!(unrelated.kind, ErrorKind::Protocol);
 		assert_eq!(unrelated.action, RetryAction::Never);
 	}
+	#[test]
+	fn streamed_error_codes_preserve_precommit_retry_policy() {
+		use crate::error::{ErrorKind, RetryAction};
+		for (code, kind, action) in [
+			("authentication_error", ErrorKind::Authentication, RetryAction::RefreshCredential),
+			("permission_denied", ErrorKind::Authorization, RetryAction::RotateAccount),
+			("rate_limit_exceeded", ErrorKind::RateLimited, RetryAction::SameRoute {
+				after: Duration::from_secs(30),
+			}),
+			("server_error", ErrorKind::ResourceExhausted, RetryAction::SameRoute {
+				after: Duration::from_millis(500),
+			}),
+			("context_length_exceeded", ErrorKind::ContextOverflow, RetryAction::Never),
+			("invalid_request_error", ErrorKind::InvalidRequest, RetryAction::Never),
+		] {
+			let (actual_kind, actual_action) =
+				super::classify_responses_provider_error(Some(code), "provider failure", false);
+			assert_eq!(actual_kind, kind, "{code}");
+			assert_eq!(actual_action, action, "{code}");
+		}
+		let (_, action) = super::classify_responses_provider_error(
+			Some("rate_limit_exceeded"),
+			"provider failure",
+			true,
+		);
+		assert_eq!(action, RetryAction::Never);
+	}
+
 	#[test]
 	fn premature_close_retries_only_before_any_delta_commits() {
 		use crate::error::{ErrorKind, RetryAction};

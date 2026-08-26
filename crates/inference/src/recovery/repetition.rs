@@ -60,6 +60,14 @@ pub fn thinking_loop_redirect() -> Str {
 		 viable option, or finish now.</system-interrupt>",
 	)
 }
+/// Corrective prompt injected before another turn in a repeated tool loop.
+pub fn tool_loop_redirect() -> Str {
+	Str::new_static(
+		"<system-interrupt reason=\"tool_loop_detected\">The same tool call and result repeated \
+		 without textual progress. Do not issue that call again with equivalent arguments. Choose a \
+		 different concrete action or finish with the available result.</system-interrupt>",
+	)
+}
 
 /// Whether provisional output is still hidden from the consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

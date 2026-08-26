@@ -10,7 +10,7 @@ use tower::{Layer, Service};
 
 use crate::{
 	body::RetryDecision,
-	error::{Error, RetryAction},
+	error::{Error, ErrorPhase, RetryAction},
 	layer::{AttemptAction, LayerCall},
 };
 
@@ -66,7 +66,10 @@ where
 					.context
 					.body_evidence()
 					.is_some_and(|evidence| evidence.retry_decision == RetryDecision::Allow);
-				if error.committed || !replay_safe {
+				let prebody_route_reselection = error.action == RetryAction::ReselectRoute
+					&& error.receipt().attempts.is_empty()
+					&& matches!(error.phase, ErrorPhase::Admission | ErrorPhase::Authentication);
+				if error.committed || (!replay_safe && !prebody_route_reselection) {
 					error.action = RetryAction::Never;
 					request.context.finalize_error(&mut error);
 					return Err(error);
@@ -141,7 +144,7 @@ mod tests {
 
 	use futures::future::{Ready, ready};
 	use parking_lot::Mutex;
-	use tower::Service;
+	use tower::{Service, service_fn};
 
 	use super::AttemptService;
 	use crate::{
@@ -399,5 +402,26 @@ mod tests {
 			AttemptAction::RefreshCredential { previous_account: Some(AccountId::from("account")) },
 			AttemptAction::RotateAccount { previous_account: Some(AccountId::from("account")) },
 		]);
+	}
+	#[tokio::test]
+	async fn prebody_auth_reselection_reaches_registry_unchanged() {
+		let inner = service_fn(|_: LayerCall<()>| async {
+			Err::<(), _>(Error::new(
+				ErrorKind::Authentication,
+				ErrorPhase::Authentication,
+				RetryAction::ReselectRoute,
+				ExecutionReceipt::default(),
+			))
+		});
+		let mut service = AttemptService { inner };
+		let error = service
+			.call(LayerCall {
+				payload: (),
+				context: ExecutionContext::new(ExecutionBudget::default()),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.action, RetryAction::ReselectRoute);
+		assert!(error.receipt().attempts.is_empty());
 	}
 }

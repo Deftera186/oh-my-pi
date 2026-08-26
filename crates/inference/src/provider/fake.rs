@@ -884,6 +884,7 @@ mod tests {
 			session: None,
 			attribution: InferenceAttribution::core(),
 			execution: None,
+			staging: None,
 			operation,
 		}
 	}

@@ -19,6 +19,7 @@ pub mod secrets;
 pub mod semantic;
 pub mod session;
 pub mod stack;
+pub mod staging;
 
 use std::{
 	mem,

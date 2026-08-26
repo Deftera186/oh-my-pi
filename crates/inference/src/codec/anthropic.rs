@@ -21,11 +21,11 @@ use crate::{
 	body::BodySource,
 	call::{
 		CacheRetention, ChatRequest, ContentPart as CanonicalPart, CountTokensRequest, HostedTool,
-		MediaInput, OpaqueJson, OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility,
-		Role, Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolResultContent,
+		MediaInput, OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility, Role,
+		Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolResultContent,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
+	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
 	id::ToolCallId,
 	receipt::{ExecutionReceipt, ReasonId, Usage, UsageSource},
 	transport::{EventStreamMessage, Frame, FramingProtocol},
@@ -2130,6 +2130,9 @@ fn emit_anthropic_event(
 			AnthropicEvent::Chat(ChatEvent::ToolCallReady { call, .. }) => {
 				call.name = strip_claude_code_tool_prefix(call.name.clone());
 			},
+			AnthropicEvent::ToolCallComplete { name, .. } => {
+				*name = strip_claude_code_tool_prefix(name.clone());
+			},
 			AnthropicEvent::Completion(_) | AnthropicEvent::Chat(_) => {},
 		}
 	}
@@ -2150,6 +2153,12 @@ fn emit_anthropic_event(
 			});
 		},
 		AnthropicEvent::Chat(other) => emit(RawEvent::Chat(other)),
+		AnthropicEvent::ToolCallComplete { index, id, name, arguments } => {
+			emit(RawEvent::ToolCallComplete {
+				index,
+				call: UnvalidatedToolCall { id, name, input_kind: ToolInputKind::Json, arguments },
+			});
+		},
 	}
 	Ok(())
 }
@@ -2231,6 +2240,7 @@ pub struct AnthropicOutcome {
 #[derive(Debug)]
 pub(crate) enum AnthropicEvent {
 	Chat(ChatEvent),
+	ToolCallComplete { index: u32, id: ToolCallId, name: Str, arguments: Bytes },
 	Completion(Box<RawCompletion>),
 }
 
@@ -2493,18 +2503,14 @@ impl AnthropicDecoder {
 					.ok_or_else(|| protocol_error("anthropic.block.stop", true))?;
 				match state {
 					BlockState::Tool { id, name, arguments } => {
-						let value: Value = serde_json::from_slice(if arguments.is_empty() {
-							b"{}"
-						} else {
-							&arguments
-						})
-						.map_err(|_| protocol_error("anthropic.tool.arguments", true))?;
-						events.push(ChatEvent::ToolCallReady {
+						events.push(AnthropicEvent::ToolCallComplete {
 							index,
-							call: ToolCall {
-								id: ToolCallId::new(id),
-								name,
-								arguments: OpaqueJson::new(value),
+							id: ToolCallId::new(id),
+							name,
+							arguments: if arguments.is_empty() {
+								Bytes::from_static(b"{}")
+							} else {
+								arguments.freeze()
 							},
 						});
 					},
@@ -2805,8 +2811,24 @@ fn protocol_error(reason: &'static str, committed: bool) -> Error {
 fn provider_error(kind: Str, _message: Str, committed: bool) -> Error {
 	use std::time::Duration;
 	let (error_kind, status, action) = match kind.as_str() {
-		"authentication_error" => (ErrorKind::Authentication, Some(401), RetryAction::Never),
-		"permission_error" => (ErrorKind::Authorization, Some(403), RetryAction::Never),
+		"authentication_error" => (
+			ErrorKind::Authentication,
+			Some(401),
+			if committed {
+				RetryAction::Never
+			} else {
+				RetryAction::RefreshCredential
+			},
+		),
+		"permission_error" => (
+			ErrorKind::Authorization,
+			Some(403),
+			if committed {
+				RetryAction::Never
+			} else {
+				RetryAction::RotateAccount
+			},
+		),
 		// Transient throttle: short backoff on the same credential; the retry
 		// layer refuses once output has committed.
 		"rate_limit_error" => (ErrorKind::RateLimited, Some(429), RetryAction::SameRoute {
@@ -2905,7 +2927,7 @@ mod tests {
 		},
 		call::{
 			ContentPart as CanonicalContentPart, Message as CanonicalMessage, NegotiationPolicy,
-			Sampling, ToolDefinition, ToolInputConstraint,
+			OpaqueJson, Sampling, ToolDefinition, ToolInputConstraint,
 		},
 		id::{AccountId, PrincipalId, RequestId},
 		transport::{EventStreamDecoder, SseEvent},
@@ -3793,7 +3815,7 @@ mod tests {
 		assert!(
 			thinking_events
 				.iter()
-				.any(|event| matches!(event, AnthropicEvent::Chat(ChatEvent::ToolCallReady { .. })))
+				.any(|event| matches!(event, AnthropicEvent::ToolCallComplete { .. }))
 		);
 
 		let mut server = AnthropicDecoder::new();
@@ -3872,6 +3894,26 @@ mod tests {
 		);
 		assert_eq!(truncated.finish().unwrap_err().kind, ErrorKind::StreamCorruption);
 	}
+	#[test]
+	fn repairable_tool_arguments_remain_raw_until_recovery() {
+		let mut decoder = AnthropicDecoder::new();
+		let mut events = Vec::new();
+		for data in [
+			br#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{}}}"#.as_slice(),
+			br#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{'path':'a.rs',}"}}"#.as_slice(),
+			br#"{"type":"content_block_stop","index":0}"#.as_slice(),
+		] {
+			events.extend(decoder.push_data(data).expect("raw tool fragment is preserved"));
+		}
+		assert!(events.iter().any(|event| {
+			matches!(
+				event,
+				AnthropicEvent::ToolCallComplete { arguments, .. }
+					if arguments.as_ref() == b"{'path':'a.rs',}"
+			)
+		}));
+	}
+
 	#[test]
 	fn message_stop_marks_the_wire_decoder_complete_without_waiting_for_eof() {
 		let mut decoder = AnthropicWireDecoder {
@@ -4058,6 +4100,16 @@ mod tests {
 			br#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
 		);
 		assert_eq!(unauthenticated.kind, ErrorKind::Authentication);
-		assert_eq!(unauthenticated.action, RetryAction::Never);
+		assert_eq!(unauthenticated.action, RetryAction::RefreshCredential);
+		let forbidden = classify_http_error(
+			403,
+			br#"{"error":{"type":"permission_error","message":"account is not entitled"}}"#,
+		);
+		assert_eq!(forbidden.kind, ErrorKind::Authorization);
+		assert_eq!(forbidden.action, RetryAction::RotateAccount);
+		assert_eq!(
+			provider_error(sf!("authentication_error"), sf!("expired"), true).action,
+			RetryAction::Never,
+		);
 	}
 }

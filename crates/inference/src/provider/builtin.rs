@@ -3,12 +3,15 @@
 use std::{
 	array,
 	collections::BTreeMap,
-	future::{Ready, ready},
+	future::{Future, Ready, ready},
 	num::NonZeroU32,
+	pin::Pin,
 	sync::Arc,
+	task::{Context, Poll},
 	time::{Duration, Instant, SystemTime},
 };
 
+use futures::StreamExt as _;
 use http::HeaderValue;
 use omp_catalog::{
 	OperationBits, OperationKind,
@@ -16,7 +19,7 @@ use omp_catalog::{
 	snapshot::Catalog,
 };
 use omp_core::{ExposeSecret as _, Str, sf};
-use tower::{Service, util::BoxCloneSyncService};
+use tower::{Service, ServiceExt as _, util::BoxCloneSyncService};
 use url::Url;
 
 use crate::{
@@ -29,12 +32,16 @@ use crate::{
 		CredentialKind, CredentialLease, CredentialNeed, CredentialShaperRegistry, CredentialSource,
 		OAuthHttpClient, OAuthHttpRequest, ProviderShaper, spec::AuthSpec,
 	},
-	call::{AccountRoutingContext, Call, NativeResponseFraming, OperationCall, Setting, ToolChoice},
+	body::BodySource,
+	call::{
+		AccountRoutingContext, Call, NativeResponseFraming, OperationCall, Setting, StructuredOutput,
+		ToolChoice,
+	},
 	catalog::{AuthSpecId, RouteId},
 	codec::{
 		Cancellation, Codec, DecodeContext, DecoderState, EncodeAttempt, EncodeContext,
-		EncodedRequest, HandshakenResponse, NativeResponseFormat, RealtimeWireCodecState,
-		RequestHeader, TransportAttempt, TransportRequest,
+		EncodedRequest, HandshakenResponse, NativeResponseFormat, ProviderStateEvent, RawEvent,
+		RealtimeWireCodecState, RequestHeader, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
 		bedrock::{BedrockConverseCodec, BedrockGuardrail, BedrockOptions, guardrail_arn_region},
 		cursor::CursorCodec,
@@ -44,7 +51,10 @@ use crate::{
 			OpenAiModelsDiscoveryCodec,
 		},
 		gemini::GeminiCodec,
-		gitlab::GitLabWorkflowCodec,
+		gitlab::{
+			GitLabWorkflowCodec, WorkflowCreationDecoder, bind_created_workflow,
+			bind_workflow_decoder, workflow_creation_request,
+		},
 		glyph,
 		google_cca::{
 			ANTIGRAVITY_VERSION_MANIFEST_URL, AntigravityPolicy, CcaHeaders, GoogleCcaCodec,
@@ -97,7 +107,7 @@ use crate::{
 		parallel_extract::ParallelExtractCodec,
 		usage::{ConsoleUsageManager, UsageServiceConfig},
 	},
-	receipt::{ExecutionReceipt, ReasonId},
+	receipt::{Adjustment, ExecutionReceipt, FeatureId, ReasonId},
 	registry::RouteUnavailable,
 	session::ConversationSessionPlanner,
 	settings::InferenceSettings,
@@ -105,6 +115,60 @@ use crate::{
 		global_provider_capture, http::HttpTransport, websocket_transport::WebSocketTransport,
 	},
 };
+
+/// Validated endpoint coordinates for Azure OpenAI routes.
+#[derive(Clone, Debug)]
+pub struct AzureEndpointConfig {
+	/// Absolute Azure resource base, for example `https://example.openai.azure.com`.
+	pub resource_base:      Str,
+	/// Default deployment used when no model-specific mapping exists.
+	pub default_deployment: Option<Str>,
+	/// Deployment name keyed by provider wire-model id.
+	pub deployments:        Arc<BTreeMap<Str, Str>>,
+	/// Optional API version overriding the catalog route version.
+	pub api_version:        Option<Str>,
+}
+
+impl AzureEndpointConfig {
+	/// Validates and constructs Azure endpoint coordinates.
+	pub fn new(
+		resource_base: impl Into<Str>,
+		default_deployment: Option<Str>,
+		deployments: Arc<BTreeMap<Str, Str>>,
+		api_version: Option<Str>,
+	) -> Result<Self, &'static str> {
+		let resource_base = resource_base.into();
+		let url = Url::parse(resource_base.as_str()).map_err(|_| "azure-resource-base-invalid")?;
+		if url.scheme() != "https"
+			|| url.host_str().is_none()
+			|| !url.username().is_empty()
+			|| url.password().is_some()
+			|| url.query().is_some()
+			|| url.fragment().is_some()
+		{
+			return Err("azure-resource-base-invalid");
+		}
+		if default_deployment
+			.iter()
+			.chain(deployments.values())
+			.any(|deployment| {
+				deployment.trim().is_empty()
+					|| deployment.contains('/')
+					|| deployment.contains('?')
+					|| deployment.contains('#')
+			}) {
+			return Err("azure-deployment-invalid");
+		}
+		Ok(Self { resource_base, default_deployment, deployments, api_version })
+	}
+
+	fn deployment_for(&self, wire_model: &str) -> Option<&Str> {
+		self
+			.deployments
+			.get(wire_model)
+			.or(self.default_deployment.as_ref())
+	}
+}
 
 /// Explicit route construction settings for the two Cloud Code Assist clients.
 #[derive(Clone)]
@@ -153,6 +217,75 @@ pub struct AuthApplicationConfig {
 
 type WireService = BoxCloneSyncService<TransportRequest, HandshakenResponse, Error>;
 
+#[derive(Clone)]
+struct ProtocolTransport {
+	http:      HttpTransport,
+	websocket: WebSocketTransport,
+}
+
+impl Service<TransportRequest> for ProtocolTransport {
+	type Error = Error;
+	type Future =
+		Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+	type Response = HandshakenResponse;
+
+	fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn call(&mut self, mut request: TransportRequest) -> Self::Future {
+		let mut http = self.http.clone();
+		let mut websocket = self.websocket.clone();
+		Box::pin(async move {
+			let started = Instant::now();
+			if request.encoded.framing != crate::transport::FramingProtocol::WebSocket {
+				return http.ready().await?.call(request).await;
+			}
+			if request.attempt.provider.as_str() == "gitlab-duo-agent"
+				&& let BodySource::Bytes(start_body) = &request.encoded.body
+			{
+				let creation = workflow_creation_request(&request.encoded.uri, start_body)?;
+				let creation_request = TransportRequest {
+					encoded:     creation,
+					credentials: request.credentials.clone(),
+					decoder:     Some(Box::new(WorkflowCreationDecoder::new())),
+					realtime:    None,
+					cancel:      request.cancel.clone(),
+					attempt:     request.attempt.clone(),
+				};
+				let mut response = http.ready().await?.call(creation_request).await?;
+				let mut workflow_id = None;
+				if let Some(events) = response.events.as_mut() {
+					while let Some(event) = events.next().await {
+						if let RawEvent::ProviderState(ProviderStateEvent::Checkpoint {
+							id: Some(id),
+							..
+						}) = event?
+						{
+							workflow_id = Some(id);
+							break;
+						}
+					}
+				}
+				let workflow_id = workflow_id.ok_or_else(|| {
+					contract_error_for_attempt(&request.attempt, "gitlab-workflow-create-id-missing")
+				})?;
+				let bound_start = bind_created_workflow(start_body, &workflow_id)?;
+				request.encoded.body = BodySource::Bytes(bound_start);
+				let decoder = request.decoder.take().ok_or_else(|| {
+					contract_error_for_attempt(&request.attempt, "gitlab-workflow-decoder-missing")
+				})?;
+				request.decoder = Some(bind_workflow_decoder(decoder, workflow_id));
+			}
+			request.attempt.timeout = request.attempt.timeout.saturating_sub(started.elapsed());
+			if request.attempt.timeout.is_zero() {
+				return Err(attempt_deadline_error(&request.attempt));
+			}
+			websocket.ready().await?.call(request).await
+		})
+	}
+}
+
 /// Feature-gated in-process backend inserted beneath the canonical fixed stack.
 #[derive(Clone)]
 pub struct LocalRouteBackend {
@@ -190,6 +323,7 @@ pub struct ProductionDependencies {
 	transport_timeout:    Duration,
 	auth_application:     AuthApplicationConfig,
 	credential_shapers:   Arc<CredentialShaperRegistry>,
+	azure_endpoint:       Option<AzureEndpointConfig>,
 	usage_manager:        Option<ConsoleUsageManager>,
 	settings:             InferenceSettings,
 	provider_admission:   Arc<BTreeMap<ProviderId, AdmissionController>>,
@@ -199,6 +333,18 @@ pub struct ProductionDependencies {
 }
 
 impl ProductionDependencies {
+	/// Returns the immutable settings snapshot shared by planning and every
+	/// route stack.
+	pub(crate) const fn settings(&self) -> &InferenceSettings {
+		&self.settings
+	}
+
+	/// Installs validated Azure OpenAI endpoint coordinates.
+	pub fn with_azure_endpoint(mut self, endpoint: Option<AzureEndpointConfig>) -> Self {
+		self.azure_endpoint = endpoint;
+		self
+	}
+
 	/// Creates production dependencies with explicit policy and shared state.
 	pub fn new(
 		credentials: CredentialBroker,
@@ -226,6 +372,7 @@ impl ProductionDependencies {
 			auth_application,
 			transport_timeout,
 			credential_shapers,
+			azure_endpoint: None,
 			usage_manager: None,
 			settings: InferenceSettings::default(),
 			provider_admission: Arc::new(BTreeMap::new()),
@@ -355,7 +502,10 @@ impl RouteComposer for ProductionRouteComposer {
 					bedrock_guardrail,
 					bedrock_ambient_region,
 				)?,
-				WireService::new(self.dependencies.http.clone()),
+				WireService::new(ProtocolTransport {
+					http:      self.dependencies.http.clone(),
+					websocket: self.dependencies.websocket.clone(),
+				}),
 				self.dependencies.transport_timeout,
 			),
 			TransportKind::Websocket => (
@@ -366,7 +516,10 @@ impl RouteComposer for ProductionRouteComposer {
 					bedrock_guardrail,
 					bedrock_ambient_region,
 				)?,
-				WireService::new(self.dependencies.websocket.clone()),
+				WireService::new(ProtocolTransport {
+					http:      self.dependencies.http.clone(),
+					websocket: self.dependencies.websocket.clone(),
+				}),
 				self.dependencies.transport_timeout,
 			),
 			TransportKind::Webrtc => return Err(unavailable(route, "transport-not-implemented")),
@@ -399,6 +552,8 @@ impl RouteComposer for ProductionRouteComposer {
 			.auth_spec(&route.auth)
 			.ok_or_else(|| unavailable(route, "catalog-auth-spec-missing"))?;
 		let authenticated = auth.kind != AuthSpecKind::None;
+		let credential_required =
+			!matches!(auth.kind, AuthSpecKind::None | AuthSpecKind::OptionalBearer);
 		let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
 		let signing_region = route
 			.endpoint
@@ -437,7 +592,10 @@ impl RouteComposer for ProductionRouteComposer {
 				let Some(auth) = catalog.auth_spec(auth_id) else {
 					return Err(unavailable(route, "catalog-auth-spec-missing"));
 				};
-				if auth.kind != AuthSpecKind::Oauth {
+				if auth.kind != AuthSpecKind::Oauth
+					&& !(route.codec.as_str() == "anthropic"
+						&& matches!(auth.kind, AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer))
+				{
 					continue;
 				}
 				let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
@@ -463,6 +621,7 @@ impl RouteComposer for ProductionRouteComposer {
 			route_base_url: route.endpoint.base_url.clone(),
 			specs: auth_specs.iter().map(|(id, _)| id.clone()).collect(),
 			authenticated,
+			required: credential_required,
 		};
 		let encoder = RouteEncoder {
 			route: route.clone(),
@@ -485,6 +644,7 @@ impl RouteComposer for ProductionRouteComposer {
 				})
 				.unwrap_or_default(),
 			codec,
+			azure_endpoint: self.dependencies.azure_endpoint.clone(),
 			transport_timeout: self
 				.dependencies
 				.transport_timeout
@@ -513,7 +673,8 @@ impl RouteComposer for ProductionRouteComposer {
 			rate: RateLayer::new(PoolRateLimiter { pool: self.dependencies.accounts.clone() }),
 			encode: EncodeLayer::new(encoder, false),
 			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier {
-				auth: auth_specs.into_iter().map(|(_, auth)| auth).collect(),
+				auth:     auth_specs.into_iter().map(|(_, auth)| auth).collect(),
+				required: credential_required,
 			}),
 			provider_error: ProviderErrorLayer::new(),
 		});
@@ -704,13 +865,17 @@ fn codec_binding(
 		),
 		("openai-codex", CodecProfile::Standard) => (
 			Arc::new(OpenAiCodexCodec::default()),
-			operation_bits(&[OperationKind::Chat, OperationKind::DiscoverModels]),
+			operation_bits(&[
+				OperationKind::Chat,
+				OperationKind::GenerateImage,
+				OperationKind::DiscoverModels,
+			]),
 			None,
 			false,
 		),
 		("openai-responses", CodecProfile::Standard) => (
 			Arc::new(OpenAiResponsesCodec::default()),
-			operation_bits(&[OperationKind::Chat]),
+			operation_bits(&[OperationKind::Chat, OperationKind::GenerateImage]),
 			None,
 			false,
 		),
@@ -969,6 +1134,7 @@ struct RouteEncoder {
 	auth_schemes:      Box<[AuthScheme]>,
 	headers:           Box<[RequestHeader]>,
 	codec:             Arc<dyn Codec>,
+	azure_endpoint:    Option<AzureEndpointConfig>,
 	transport_timeout: Duration,
 }
 
@@ -1014,6 +1180,64 @@ fn scheme_for_credential(schemes: &[AuthScheme], kind: CredentialKind) -> Option
 		)
 	})
 }
+fn append_endpoint_api_version(
+	uri: &mut Str,
+	api_version: Option<&str>,
+	context: &ExecutionContext,
+) -> Result<(), Error> {
+	let Some(api_version) = api_version else {
+		return Ok(());
+	};
+	let mut parsed = Url::parse(uri.as_str())
+		.map_err(|_| contract_error(context, "endpoint-api-version-uri-invalid"))?;
+	if parsed.query_pairs().any(|(name, _)| name == "api-version") {
+		return Ok(());
+	}
+	parsed
+		.query_pairs_mut()
+		.append_pair("api-version", api_version);
+	*uri = Str::new(parsed.to_string());
+	Ok(())
+}
+
+fn azure_effective_route(
+	route: &RouteDef,
+	target: Option<&omp_catalog::WireTarget>,
+	config: Option<&AzureEndpointConfig>,
+	context: &ExecutionContext,
+) -> Result<Option<(RouteDef, omp_catalog::WireTarget)>, Error> {
+	if route.provider.as_str() != "azure" {
+		return Ok(None);
+	}
+	let config =
+		config.ok_or_else(|| azure_configuration_error(context, "azure-endpoint-not-configured"))?;
+	let target =
+		target.ok_or_else(|| azure_configuration_error(context, "azure-wire-target-missing"))?;
+	let resource = config
+		.resource_base
+		.as_str()
+		.trim_end_matches('/')
+		.trim_end_matches("/openai");
+	let base_url = if route.codec.as_str() == "openai-responses" {
+		sf!("{resource}/openai")
+	} else {
+		let deployment = config
+			.deployment_for(target.wire_model.as_str())
+			.ok_or_else(|| azure_configuration_error(context, "azure-deployment-not-configured"))?;
+		sf!("{resource}/openai/deployments/{deployment}")
+	};
+	let parsed = Url::parse(&base_url)
+		.map_err(|_| azure_configuration_error(context, "azure-effective-endpoint-invalid"))?;
+	let mut effective_route = route.clone();
+	effective_route.endpoint.base_url = base_url.clone();
+	if config.api_version.is_some() {
+		effective_route.endpoint.api_version = config.api_version.clone();
+	}
+	effective_route.trust_domain.origin = Str::new(parsed.origin().ascii_serialization());
+	let mut effective_target = target.clone();
+	effective_target.endpoint = effective_route.endpoint.clone();
+	Ok(Some((effective_route, effective_target)))
+}
 
 impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 	fn encode(
@@ -1035,6 +1259,12 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 		let account = execution.account_routing();
 		let server_state = execution.session_state();
 		let endpoint_override = lease.as_ref().and_then(CredentialLease::endpoint_override);
+		let azure = azure_effective_route(
+			&self.route,
+			plan.wire_target(),
+			self.azure_endpoint.as_ref(),
+			execution,
+		)?;
 		let (effective_route, effective_target) = if let Some(endpoint_override) = endpoint_override {
 			let mut route = self.route.clone();
 			route.endpoint.base_url = endpoint_override.clone();
@@ -1047,11 +1277,13 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 				target
 			});
 			(Some(route), target)
+		} else if let Some((route, target)) = azure {
+			(Some(route), Some(target))
 		} else {
 			(None, None)
 		};
 		let route = effective_route.as_ref().unwrap_or(&self.route);
-		if endpoint_override.is_some() {
+		if endpoint_override.is_some() || effective_route.is_some() {
 			execution.set_effective_trust_domain(route.trust_domain.clone());
 		}
 		if server_state
@@ -1084,8 +1316,36 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 						&& execution.provider_error_code_seen(openai_chat::TEMPLATE_EFFORT_REJECTED_CODE),
 				),
 		};
+		if matches!(self.route.codec.as_str(), "google-genai" | "google-vertex")
+			&& let OperationCall::Chat(request) = &call.operation
+			&& matches!(
+				&request.output,
+				Setting::Prefer(
+					StructuredOutput::Regex(_) | StructuredOutput::Lark(_) | StructuredOutput::Ebnf(_)
+				)
+			) {
+			execution.with_receipt(|receipt| {
+				let feature = FeatureId(sf!("chat.structured_output"));
+				if !receipt.adjustments.iter().any(|adjustment| {
+					matches!(
+						adjustment,
+						Adjustment::Dropped { feature: existing, .. } if existing == &feature
+					)
+				}) {
+					receipt.adjustments.push(Adjustment::Dropped {
+						feature,
+						reason: ReasonId(sf!("gemini-portable-grammar-unsupported")),
+					});
+				}
+			});
+		}
 		let mut encoded =
 			encode_wire_request(self.codec.as_ref(), &encode_context, &call.operation, execution)?;
+		append_endpoint_api_version(
+			&mut encoded.uri,
+			route.endpoint.api_version.as_deref(),
+			execution,
+		)?;
 		merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
 		let header_names = encoded
 			.headers
@@ -1237,10 +1497,10 @@ impl AccountSelector<Call> for RouteAccountSelector {
 				},
 			});
 		}
-		let (previous_account, rotate) = match context.attempt_action() {
-			AttemptAction::Initial => (None, false),
-			AttemptAction::RefreshCredential { previous_account } => (previous_account, false),
-			AttemptAction::RotateAccount { previous_account } => (previous_account, true),
+		let (previous_account, rotate, allow_brokered) = match context.attempt_action() {
+			AttemptAction::Initial => (None, false, true),
+			AttemptAction::RefreshCredential { previous_account } => (previous_account, false, false),
+			AttemptAction::RotateAccount { previous_account } => (previous_account, true, false),
 		};
 		let affinity = context.session_affinity();
 		let preserve_principal = affinity.is_some();
@@ -1256,16 +1516,18 @@ impl AccountSelector<Call> for RouteAccountSelector {
 		};
 		match self.pool.select(&request) {
 			Ok(selection) => Ok(RouteAccount::Authenticated(Box::new(selection))),
-			Err(error) if error.receipt.candidates.is_empty() => Ok(RouteAccount::Brokered {
-				_account: BrokeredAccount {
-					_provider: self.provider.clone(),
-					_route:    self.route.clone(),
-				},
-			}),
+			Err(error) if error.receipt.candidates.is_empty() && allow_brokered => {
+				Ok(RouteAccount::Brokered {
+					_account: BrokeredAccount {
+						_provider: self.provider.clone(),
+						_route:    self.route.clone(),
+					},
+				})
+			},
 			Err(_) => Err(Error::new(
 				ErrorKind::Authentication,
 				ErrorPhase::Authentication,
-				RetryAction::Never,
+				RetryAction::ReselectRoute,
 				context.receipt(),
 			)),
 		}
@@ -1287,6 +1549,7 @@ struct RouteLeaseProvider {
 	route_base_url: Str,
 	specs:          Box<[AuthSpecId]>,
 	authenticated:  bool,
+	required:       bool,
 }
 
 impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
@@ -1319,6 +1582,8 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 				},
 			};
 			let mut resolved = None;
+			let refreshing =
+				matches!(context.attempt_action(), AttemptAction::RefreshCredential { .. });
 			for spec in &self.specs {
 				let need = CredentialNeed {
 					spec:        spec.clone(),
@@ -1326,7 +1591,11 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 					principal:   principal.clone(),
 					valid_after: SystemTime::now(),
 				};
-				match self.source.lease(need).await {
+				match if refreshing {
+					self.source.refresh_account(need).await
+				} else {
+					self.source.lease(need).await
+				} {
 					Ok(lease) => {
 						resolved = Some(lease);
 						break;
@@ -1336,20 +1605,23 @@ impl LeaseProvider<Call, RouteAccount> for RouteLeaseProvider {
 						return Err(Error::new(
 							ErrorKind::Authentication,
 							ErrorPhase::Authentication,
-							RetryAction::Never,
+							RetryAction::ReselectRoute,
 							context.receipt(),
 						));
 					},
 				}
 			}
-			let lease = resolved.ok_or_else(|| {
-				Error::new(
+			let Some(lease) = resolved else {
+				if !self.required && !refreshing {
+					return Ok(None);
+				}
+				return Err(Error::new(
 					ErrorKind::Authentication,
 					ErrorPhase::Authentication,
-					RetryAction::Never,
+					RetryAction::ReselectRoute,
 					context.receipt(),
-				)
-			})?;
+				));
+			};
 			let Some(shaper) = self.shapers.get(&self.provider) else {
 				return Ok(Some(lease));
 			};
@@ -1393,7 +1665,8 @@ fn shaper_deadline(call: &Call, context: &ExecutionContext) -> Option<Instant> {
 
 #[derive(Clone)]
 struct RouteCredentialApplier {
-	auth: Box<[AuthSpec]>,
+	auth:     Box<[AuthSpec]>,
+	required: bool,
 }
 
 impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentialApplier {
@@ -1410,6 +1683,7 @@ impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentia
 				Err(authentication_error(context, "credential-on-anonymous-route"))
 			},
 			(None, _) => Err(authentication_error(context, "credential-auth-spec-missing")),
+			(_, None) if !self.required => Ok(()),
 			(_, None) => Err(authentication_error(context, "credential-lease-missing")),
 			(_, Some(lease)) => {
 				let signing_region =
@@ -1550,6 +1824,42 @@ fn authentication_error(context: &ExecutionContext, reason: &'static str) -> Err
 	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
 }
 
+fn azure_configuration_error(context: &ExecutionContext, reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::InvalidRequest,
+		ErrorPhase::Encoding,
+		RetryAction::Never,
+		context.receipt(),
+	)
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
+}
+
+fn attempt_deadline_error(attempt: &TransportAttempt) -> Error {
+	Error::new(
+		ErrorKind::DeadlineExceeded,
+		ErrorPhase::Connecting,
+		RetryAction::Never,
+		ExecutionReceipt::default(),
+	)
+	.provider(attempt.provider.clone())
+	.route(attempt.route.clone())
+	.request_id(attempt.request_id.clone())
+	.detail(ErrorDetail::protocol(ReasonId(sf!("provider-setup-exhausted-attempt-budget",))))
+}
+
+fn contract_error_for_attempt(attempt: &TransportAttempt, reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::ProviderContractMismatch,
+		ErrorPhase::Encoding,
+		RetryAction::Never,
+		ExecutionReceipt::default(),
+	)
+	.provider(attempt.provider.clone())
+	.route(attempt.route.clone())
+	.request_id(attempt.request_id.clone())
+	.detail(ErrorDetail::protocol(ReasonId(Str::new(reason))))
+}
+
 fn contract_error(context: &ExecutionContext, reason: &'static str) -> Error {
 	Error::new(
 		ErrorKind::ProviderContractMismatch,
@@ -1604,6 +1914,60 @@ mod tests {
 			},
 			SecretString::from(secret.to_owned()),
 		)
+	}
+	#[test]
+	fn azure_routes_shape_chat_deployments_and_resource_scoped_responses() {
+		let catalog = Catalog::embedded();
+		let chat = catalog
+			.routes()
+			.iter()
+			.find(|route| route.provider.as_str() == "azure" && route.codec.as_str() == "openai-chat")
+			.expect("Azure chat route");
+		let responses = catalog
+			.routes()
+			.iter()
+			.find(|route| {
+				route.provider.as_str() == "azure" && route.codec.as_str() == "openai-responses"
+			})
+			.expect("Azure Responses route");
+		let config = AzureEndpointConfig::new(
+			"https://resource.openai.azure.com",
+			Some(sf!("production-gpt")),
+			Arc::new(BTreeMap::new()),
+			Some(sf!("2025-04-01-preview")),
+		)
+		.expect("valid Azure configuration");
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		for (route, expected) in [
+			(chat, "https://resource.openai.azure.com/openai/deployments/production-gpt"),
+			(responses, "https://resource.openai.azure.com/openai"),
+		] {
+			let target = WireTarget {
+				route:      route.id.clone(),
+				codec:      route.codec.clone(),
+				endpoint:   route.endpoint.clone(),
+				wire_model: sf!("gpt-5").into(),
+			};
+			let (effective, target) =
+				azure_effective_route(route, Some(&target), Some(&config), &context)
+					.expect("Azure endpoint shapes")
+					.expect("Azure route");
+			assert_eq!(effective.endpoint.base_url.as_str(), expected);
+			assert_eq!(target.endpoint.base_url.as_str(), expected);
+			assert_eq!(effective.endpoint.api_version.as_deref(), Some("2025-04-01-preview"));
+			assert_eq!(effective.trust_domain.origin.as_str(), "https://resource.openai.azure.com");
+		}
+	}
+
+	#[test]
+	fn endpoint_api_version_is_appended_without_overwriting_query() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let mut uri = sf!("https://example.azure.com/openai/responses?trace=1");
+		append_endpoint_api_version(&mut uri, Some("2024-10-21"), &context).expect("valid endpoint");
+		assert_eq!(
+			uri.as_str(),
+			"https://example.azure.com/openai/responses?trace=1&api-version=2024-10-21",
+		);
 	}
 	#[test]
 	fn static_and_runtime_bedrock_routes_inherit_provider_guardrails() {
@@ -1718,6 +2082,7 @@ mod tests {
 			session: None,
 			attribution: InferenceAttribution::core(),
 			execution: Some(Arc::new(plan)),
+			staging: None,
 			operation,
 		};
 		let account = RouteAccount::Brokered {
@@ -1733,6 +2098,7 @@ mod tests {
 				auth_schemes: Box::new([AuthScheme::for_spec(&runtime_auth)]),
 				headers: Box::new([]),
 				codec,
+				azure_endpoint: None,
 				transport_timeout: Duration::from_secs(30),
 			},
 			call,
@@ -1751,7 +2117,7 @@ mod tests {
 		context: &ExecutionContext,
 		expected: &str,
 	) {
-		RouteCredentialApplier { auth: Box::new([auth]) }
+		RouteCredentialApplier { auth: Box::new([auth]), required: true }
 			.apply(account, Some(lease), &mut transport, context)
 			.expect("prepare credentials");
 		let credentials = transport.credentials.take().expect("prepared credentials");
@@ -1815,6 +2181,19 @@ mod tests {
 		assert_applied_bearer(transport, &account, auth, raw, &context, "Bearer raw");
 	}
 	#[test]
+	fn optional_bearer_applier_allows_an_absent_lease() {
+		let (encoder, call, account, auth, ..) = discovery_fixture();
+		let context = ExecutionContext::new(call.budget.clone());
+		let mut transport = encoder
+			.encode(&call, &None, &context, 0, false, Cancellation::default())
+			.expect("encode anonymous-capable request");
+		RouteCredentialApplier { auth: Box::new([auth]), required: false }
+			.apply(&account, None, &mut transport, &context)
+			.expect("optional bearer permits no credential");
+		assert!(transport.credentials.is_none());
+	}
+
+	#[test]
 	fn bedrock_endpoint_region_overrides_the_sigv4_scope() {
 		let (encoder, call, account, _, provider, _) = discovery_fixture();
 		let context = ExecutionContext::new(call.budget.clone());
@@ -1846,7 +2225,7 @@ mod tests {
 			SecretString::from("secret".to_owned()),
 			None,
 		);
-		RouteCredentialApplier { auth: Box::new([auth]) }
+		RouteCredentialApplier { auth: Box::new([auth]), required: true }
 			.apply(&account, Some(aws), &mut transport, &context)
 			.expect("prepare SigV4 credentials");
 		let credentials = transport.credentials.take().expect("prepared credentials");

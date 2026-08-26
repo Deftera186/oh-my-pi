@@ -445,9 +445,6 @@ struct CursorWireModel {
 	reasoning: Option<Str>,
 }
 
-/// Effort tiers Cursor appends to OpenAI sibling slugs, least to most intense.
-const CURSOR_EFFORT_TIERS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
-
 /// Splits a routed Cursor model id into its wire base id and reasoning tier.
 ///
 /// Cursor's `GetUsableModels` lists OpenAI reasoning models as per-effort
@@ -462,16 +459,7 @@ fn resolve_cursor_wire_model(model_id: &str) -> CursorWireModel {
 		Some(stem) => (stem, true),
 		None => (model_id, false),
 	};
-	for tier in CURSOR_EFFORT_TIERS {
-		let Some(base) = stem
-			.strip_suffix(tier)
-			.and_then(|prefix| prefix.strip_suffix('-'))
-		else {
-			continue;
-		};
-		if !is_openai_family(base) {
-			break;
-		}
+	if let Some((base, tier)) = omp_catalog::cursor_openai_effort_suffix(stem) {
 		let model_id = if fast {
 			sf!("{base}-fast")
 		} else {
@@ -480,17 +468,6 @@ fn resolve_cursor_wire_model(model_id: &str) -> CursorWireModel {
 		return CursorWireModel { model_id, reasoning: Some(Str::new_static(tier)) };
 	}
 	CursorWireModel { model_id: Str::new(model_id), reasoning: None }
-}
-
-/// OpenAI-family gate mirroring pi's `parseOpenAIModel`: the slug contains
-/// `gpt-` immediately followed by a version digit.
-fn is_openai_family(base: &str) -> bool {
-	base.match_indices("gpt-").any(|(index, matched)| {
-		base[index + matched.len()..]
-			.bytes()
-			.next()
-			.is_some_and(|byte| byte.is_ascii_digit())
-	})
 }
 
 fn serialized_fallback_wire_model(
@@ -2915,8 +2892,9 @@ mod tests {
 			route:      omp_catalog::RouteId::from("cursor"),
 			codec:      omp_catalog::CodecId::from("cursor"),
 			endpoint:   omp_catalog::EndpointSpec {
-				base_url: sf!("https://api2.cursor.sh"),
-				region:   None,
+				base_url:    sf!("https://api2.cursor.sh"),
+				region:      None,
+				api_version: None,
 			},
 			wire_model: WireModelId::new("gpt-5.6-terra-medium"),
 		};

@@ -22,6 +22,7 @@ use crate::{
 	operation::parallel_extract::{ParallelExtractRequest, ParallelExtractResult},
 	plan::{ExecutionPlan, Planner},
 	receipt::{ExecutionReceipt, ReasonId},
+	staging::{StagingCancellation, StagingPolicy},
 };
 
 /// Typed request that can enter the closed erased service center.
@@ -127,6 +128,7 @@ pub struct Client<S, P> {
 	service: S,
 	planner: P,
 	meta:    CallMeta,
+	staging: Option<crate::call::StagingRequest>,
 }
 
 impl<S, P> Client<S, P>
@@ -136,7 +138,7 @@ where
 	/// Creates a client with a clone-cheap planner and caller-supplied metadata
 	/// defaults.
 	pub const fn new(service: S, planner: P, meta: CallMeta) -> Self {
-		Self { service, planner, meta }
+		Self { service, planner, meta, staging: None }
 	}
 
 	/// Borrows the underlying service.
@@ -159,16 +161,28 @@ where
 		self.meta = meta;
 	}
 
-	/// Returns the service, planner, and current call metadata.
-	pub fn into_parts(self) -> (S, P, CallMeta) {
-		(self.service, self.planner, self.meta)
+	/// Authorizes secure staging for one-shot bodies in subsequent calls.
+	pub fn set_staging(&mut self, policy: StagingPolicy, cancellation: StagingCancellation) {
+		self.staging = Some(crate::call::StagingRequest { policy, cancellation });
+	}
+
+	/// Returns this client with secure staging authorized for one-shot bodies.
+	pub fn with_staging(mut self, policy: StagingPolicy, cancellation: StagingCancellation) -> Self {
+		self.set_staging(policy, cancellation);
+		self
+	}
+
+	/// Returns the service, planner, current call metadata, and staging policy.
+	pub fn into_parts(self) -> (S, P, CallMeta, Option<crate::call::StagingRequest>) {
+		(self.service, self.planner, self.meta, self.staging)
 	}
 
 	/// Selects and negotiates an immutable plan without polling or calling the
 	/// service.
 	pub fn plan<O: Operation>(&self, operation: &O) -> Result<PlannedOperation<O>, Error> {
 		let mut call = operation.to_call(self.meta.clone());
-		let plan = Arc::new(self.planner.plan(&call, Instant::now())?);
+		call.staging = self.staging.clone();
+		let plan = Arc::new(self.planner.plan(&mut call, Instant::now())?);
 		if plan.operation != O::KIND {
 			return Err(Error::planning(
 				ErrorKind::InternalInvariant,
@@ -402,7 +416,7 @@ mod tests {
 	struct RejectingPlanner;
 
 	impl Planner for RejectingPlanner {
-		fn plan(&self, _: &Call, _: Instant) -> Result<ExecutionPlan, Error> {
+		fn plan(&self, _: &mut Call, _: Instant) -> Result<ExecutionPlan, Error> {
 			Err(Error::planning(
 				ErrorKind::CapabilityMismatch,
 				ErrorDetail::protocol(ReasonId(sf!("unsupported-test-operation"))),

@@ -21,12 +21,14 @@ use parking_lot::Mutex;
 use zeroize::Zeroizing;
 
 use super::{
-	AuditedCredentialReveal, AuthSpec, CredentialBroker, CredentialError, CredentialMetadata,
-	CredentialNeed, CredentialOrigin, CredentialSource, CredentialStore, CredentialWrite, KeyError,
-	LeaseMeta, LoginChannelError, OAuthClientSpec, OAuthClock, OAuthCredentialImport,
-	OAuthCredentialManagerError, OAuthCustomDispatchError, OAuthCustomDispatcher, OAuthCustomSpec,
-	OAuthEngine, OAuthError, OAuthHttpClient, OAuthParameter, PROVIDER_NAME_PARAMETER,
-	ScopedCredentialGrant, ScopedCredentialToken, StoreError, default_login_channels,
+	AuditedCredentialReveal, AuthRejection, AuthSpec, CredentialBroker, CredentialError,
+	CredentialLease, CredentialMetadata, CredentialNeed, CredentialOrigin, CredentialSource,
+	CredentialStore, CredentialWrite, KeyError, LeaseMeta, LoginChannelError, OAuthClientSpec,
+	OAuthClock, OAuthCredentialImport, OAuthCredentialManagerError, OAuthCustomDispatchError,
+	OAuthCustomDispatcher, OAuthCustomSpec, OAuthEngine, OAuthError, OAuthHttpClient,
+	OAuthHttpRequest, OAuthHttpResponse, OAuthParameter, OAuthTransportError,
+	PROVIDER_NAME_PARAMETER, ScopedCredentialGrant, ScopedCredentialToken, StoreError,
+	default_login_channels,
 };
 use crate::{
 	account::{
@@ -473,7 +475,7 @@ impl AuthLoginEngine for SecretLoginEngine {
 			let auth = catalog.auth_spec(&spec).ok_or_else(auth_not_found)?;
 			let credential_kind = match (method, auth.kind) {
 				(AuthMethod::ApiKey, AuthSpecKind::ApiKey) => "api-key",
-				(AuthMethod::ApiKey, AuthSpecKind::Bearer) => "bearer",
+				(AuthMethod::ApiKey, AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer) => "bearer",
 				(AuthMethod::SessionToken, AuthSpecKind::OmpSession) => "session-token",
 				_ => return Err(auth_unavailable()),
 			};
@@ -671,6 +673,25 @@ impl AuthLoginEngine for CredentialAcquisitionLoginEngine {
 	}
 }
 
+/// Per-login OAuth transport that binds every standard request to session
+/// cancellation.
+#[derive(Clone)]
+struct LoginOAuthHttpClient<C> {
+	inner:        Arc<C>,
+	cancellation: super::LoginCancellation,
+}
+
+impl<C: OAuthHttpClient> OAuthHttpClient for LoginOAuthHttpClient<C> {
+	fn execute(
+		&self,
+		request: OAuthHttpRequest,
+	) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
+		self
+			.inner
+			.execute(request.with_cancellation(self.cancellation.transport_token()))
+	}
+}
+
 /// Construction failure for a concrete OAuth login adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("OAuth login engine supports only PKCE/paste or device methods")]
@@ -759,97 +780,108 @@ where
 			let routes = provider.routes.iter().cloned().collect();
 			let provider_id = request.provider;
 			let session_id = next_login_session_id();
-			let (session, driver, _) = default_login_channels(session_id);
+			let (session, driver, cancellation) = default_login_channels(session_id);
 			tokio::spawn(async move {
-				let result = async {
-					let engine = OAuthEngine::new(http.as_ref(), clock.as_ref());
-					let tokens = match runtime {
-						AuthSpec::OAuthPkce(spec) if method == AuthMethod::OAuthPkce => {
-							let mut pending = engine
-								.begin_pkce(&spec, &driver)
-								.await
-								.map_err(oauth_error)?;
-							let input = engine
-								.receive_pkce_input(&mut pending, &driver)
-								.await
-								.map_err(oauth_error)?;
-							engine
-								.complete_pkce(&spec, pending, input)
-								.await
-								.map_err(oauth_error)?
-						},
-						AuthSpec::OAuthPaste(spec) if method == AuthMethod::OAuthPkce => {
-							engine
-								.begin_paste(&spec, &driver)
-								.await
-								.map_err(oauth_error)?;
-							let input = driver.receive().await.map_err(login_channel_error)?;
-							engine
-								.complete_paste(&spec, input)
-								.await
-								.map_err(oauth_error)?
-						},
-						AuthSpec::OAuthDevice(spec) if method == AuthMethod::OAuthDevice => {
-							let pending = engine
-								.begin_device(&spec, &driver)
-								.await
-								.map_err(oauth_error)?;
-							engine
-								.poll_device(&spec, pending, &driver)
-								.await
-								.map_err(oauth_error)?
-						},
-						AuthSpec::OAuthCustom(spec) => custom
-							.exchange(&spec, &driver)
-							.await
-							.map_err(oauth_custom_error)?,
-						_ => return Err(auth_unavailable()),
-					};
-					let principal = tokens
-						.resolve_principal(&resolution, http.as_ref())
-						.await
-						.map_err(oauth_error)?;
-					let residency = tokens.codex_residency().map(RegionId::new);
-					let project = tokens.project().map(ToOwned::to_owned);
-					let account = AccountId::from(format!("{provider_id}:{principal}"));
-					let issued_at = clock.now();
-					let meta = LeaseMeta {
-						account:    account.clone(),
-						principal:  principal.clone(),
-						generation: 0,
-						expires_at: None,
-					};
-					let freshness = engine
-						.persist_login(&store, tokens, &meta, CredentialOrigin::Persistent, issued_at)
-						.map_err(oauth_manager_error)?;
-					accounts
-						.upsert(AccountRecord {
-							account: account.clone(),
-							principal: principal.clone(),
-							provider: provider_id.clone(),
-							routes,
-							enabled: true,
-							credential_generation: freshness.generation,
-							routing: AccountRoutingContext {
-								project,
-								region: residency,
-								..AccountRoutingContext::default()
+				let result = {
+					let flow = async {
+						let request_http = LoginOAuthHttpClient {
+							inner:        Arc::clone(&http),
+							cancellation: cancellation.clone(),
+						};
+						let engine = OAuthEngine::new(&request_http, clock.as_ref());
+						let tokens = match runtime {
+							AuthSpec::OAuthPkce(spec) if method == AuthMethod::OAuthPkce => {
+								let mut pending = engine
+									.begin_pkce(&spec, &driver)
+									.await
+									.map_err(oauth_error)?;
+								let input = engine
+									.receive_pkce_input(&mut pending, &driver)
+									.await
+									.map_err(oauth_error)?;
+								engine
+									.complete_pkce(&spec, pending, input)
+									.await
+									.map_err(oauth_error)?
 							},
-						})
-						.map_err(|_| auth_store_failure())?;
-					let summary = AccountSummary {
-						account,
-						provider: provider_id,
-						principal: Some(principal.clone()),
-						label: Some(Str::new(principal.as_str())),
-						state: AccountState::Active,
+							AuthSpec::OAuthPaste(spec) if method == AuthMethod::OAuthPkce => {
+								engine
+									.begin_paste(&spec, &driver)
+									.await
+									.map_err(oauth_error)?;
+								let input = driver.receive().await.map_err(login_channel_error)?;
+								engine
+									.complete_paste(&spec, input)
+									.await
+									.map_err(oauth_error)?
+							},
+							AuthSpec::OAuthDevice(spec) if method == AuthMethod::OAuthDevice => {
+								let pending = engine
+									.begin_device(&spec, &driver)
+									.await
+									.map_err(oauth_error)?;
+								engine
+									.poll_device(&spec, pending, &driver)
+									.await
+									.map_err(oauth_error)?
+							},
+							AuthSpec::OAuthCustom(spec) => custom
+								.exchange(&spec, &driver)
+								.await
+								.map_err(oauth_custom_error)?,
+							_ => return Err(auth_unavailable()),
+						};
+						let principal = tokens
+							.resolve_principal(&resolution, &request_http)
+							.await
+							.map_err(oauth_error)?;
+						let residency = tokens.codex_residency().map(RegionId::new);
+						let project = tokens.project().map(ToOwned::to_owned);
+						let account = AccountId::from(format!("{provider_id}:{principal}"));
+						let issued_at = clock.now();
+						let meta = LeaseMeta {
+							account:    account.clone(),
+							principal:  principal.clone(),
+							generation: 0,
+							expires_at: None,
+						};
+						let freshness = engine
+							.persist_login(&store, tokens, &meta, CredentialOrigin::Persistent, issued_at)
+							.map_err(oauth_manager_error)?;
+						accounts
+							.upsert(AccountRecord {
+								account: account.clone(),
+								principal: principal.clone(),
+								provider: provider_id.clone(),
+								routes,
+								enabled: true,
+								credential_generation: freshness.generation,
+								routing: AccountRoutingContext {
+									project,
+									region: residency,
+									..AccountRoutingContext::default()
+								},
+							})
+							.map_err(|_| auth_store_failure())?;
+						let summary = AccountSummary {
+							account,
+							provider: provider_id,
+							principal: Some(principal.clone()),
+							label: Some(Str::new(principal.as_str())),
+							state: AccountState::Active,
+						};
+						driver
+							.emit(AuthEvent::Complete(summary))
+							.await
+							.map_err(login_channel_error)
 					};
-					driver
-						.emit(AuthEvent::Complete(summary))
-						.await
-						.map_err(login_channel_error)
-				}
-				.await;
+					tokio::pin!(flow);
+					tokio::select! {
+						biased;
+						() = cancellation.cancelled() => Err(oauth_error(OAuthError::Cancelled)),
+						result = &mut flow => result,
+					}
+				};
 				if let Err(error) = result {
 					let _ = driver.emit_error(error).await;
 				}
@@ -863,6 +895,103 @@ where
 enum OAuthRefreshRuntime {
 	Standard(OAuthClientSpec),
 	Custom(OAuthCustomSpec),
+}
+
+/// Credential source that refreshes renewable stored credentials during
+/// ordinary acquisition.
+///
+/// Expiry is evaluated with a 60-second pre-expiry skew. Refresh uses the
+/// installed refresh engine's in-process and persistent single-flight
+/// coordinator, then acquisition is replayed exactly once.
+#[derive(Clone)]
+pub struct RefreshingCredentialSource {
+	stored:  Arc<dyn CredentialSource>,
+	refresh: Arc<dyn AuthRefreshEngine>,
+	skew:    time::Duration,
+}
+
+impl RefreshingCredentialSource {
+	/// Wraps a stored credential source with routine OAuth refresh.
+	pub fn new(stored: Arc<dyn CredentialSource>, refresh: Arc<dyn AuthRefreshEngine>) -> Self {
+		Self { stored, refresh, skew: time::Duration::from_secs(60) }
+	}
+
+	#[cfg(test)]
+	fn with_skew(
+		stored: Arc<dyn CredentialSource>,
+		refresh: Arc<dyn AuthRefreshEngine>,
+		skew: time::Duration,
+	) -> Self {
+		Self { stored, refresh, skew }
+	}
+
+	fn apply_skew(&self, need: &mut CredentialNeed) {
+		let now = SystemTime::now();
+		let refresh_after = now.checked_add(self.skew).unwrap_or(now);
+		if need.valid_after < refresh_after {
+			need.valid_after = refresh_after;
+		}
+	}
+}
+
+impl fmt::Debug for RefreshingCredentialSource {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("RefreshingCredentialSource")
+			.field("skew", &self.skew)
+			.finish_non_exhaustive()
+	}
+}
+
+impl CredentialSource for RefreshingCredentialSource {
+	fn lease(
+		&self,
+		mut need: CredentialNeed,
+	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+		let stored = Arc::clone(&self.stored);
+		let refresh = Arc::clone(&self.refresh);
+		self.apply_skew(&mut need);
+		async move {
+			let account = need.account.clone().ok_or(CredentialError::Unavailable)?;
+			match stored.lease(need.clone()).await {
+				Err(CredentialError::Expired) => {
+					refresh
+						.refresh(account)
+						.await
+						.map_err(|_| CredentialError::SourceFailure)?;
+					stored.lease(need).await
+				},
+				result => result,
+			}
+		}
+		.boxed()
+	}
+
+	fn refresh_lease(
+		&self,
+		mut need: CredentialNeed,
+	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+		let stored = Arc::clone(&self.stored);
+		let refresh = Arc::clone(&self.refresh);
+		self.apply_skew(&mut need);
+		async move {
+			let account = need.account.clone().ok_or(CredentialError::Unavailable)?;
+			refresh
+				.refresh(account)
+				.await
+				.map_err(|_| CredentialError::SourceFailure)?;
+			stored.lease(need).await
+		}
+		.boxed()
+	}
+
+	fn reject<'a>(
+		&'a self,
+		lease: &'a CredentialLease,
+		evidence: AuthRejection,
+	) -> BoxFuture<'a, Result<(), CredentialError>> {
+		self.stored.reject(lease, evidence)
+	}
 }
 
 /// Owned refresh adapter for encrypted OAuth credentials.
@@ -1013,6 +1142,13 @@ pub enum AuthManagerBuildError {
 }
 
 /// Direct, route-independent authentication and account-management service.
+#[derive(Clone)]
+struct AuthSessionControl {
+	responses:    Sender<AuthResponse>,
+	cancellation: super::LoginCancellation,
+}
+
+/// Direct, route-independent authentication and account-management service.
 ///
 /// Login engine selection is derived exclusively from typed catalog records.
 /// Secret inputs move through bounded session channels and are never retained
@@ -1027,7 +1163,7 @@ pub struct AuthManager {
 	affinity: Option<CredentialAffinityResolver>,
 	login:    Arc<BTreeMap<AuthMethodKey, Vec<Arc<dyn AuthLoginEngine>>>>,
 	refresh:  Arc<dyn AuthRefreshEngine>,
-	sessions: Arc<Mutex<BTreeMap<LoginSessionId, Sender<AuthResponse>>>>,
+	sessions: Arc<Mutex<BTreeMap<LoginSessionId, AuthSessionControl>>>,
 }
 
 impl AuthManager {
@@ -1099,23 +1235,25 @@ impl AuthManager {
 		match request {
 			AuthRequest::Login(request) => self.login(request).await,
 			AuthRequest::Submit { session, input } => {
-				let sender = self
+				let control = self
 					.sessions
 					.lock()
 					.get(&session)
 					.cloned()
 					.ok_or_else(auth_not_found)?;
-				let cancelled = matches!(input, crate::call::AuthInput::Cancel);
-				if sender
+				if matches!(input, crate::call::AuthInput::Cancel) {
+					control.cancellation.cancel();
+					self.sessions.lock().remove(&session);
+					return Ok(AuthAnswer::Submitted(session));
+				}
+				if control
+					.responses
 					.send_async(AuthResponse { session: session.clone(), input })
 					.await
 					.is_err()
 				{
 					self.sessions.lock().remove(&session);
 					return Err(auth_not_found());
-				}
-				if cancelled {
-					self.sessions.lock().remove(&session);
 				}
 				Ok(AuthAnswer::Submitted(session))
 			},
@@ -1184,7 +1322,20 @@ impl AuthManager {
 		self
 			.sessions
 			.lock()
-			.insert(session.id.clone(), session.responses.clone());
+			.insert(session.id.clone(), AuthSessionControl {
+				responses:    session.responses.clone(),
+				cancellation: session.cancellation.clone(),
+			});
+		let sessions = Arc::downgrade(&self.sessions);
+		let session_id = session.id.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(LOGIN_SESSION_TTL).await;
+			if let Some(sessions) = sessions.upgrade()
+				&& let Some(control) = sessions.lock().remove(&session_id)
+			{
+				control.cancellation.cancel();
+			}
+		});
 		Ok(AuthAnswer::Session(session))
 	}
 }
@@ -1297,7 +1448,9 @@ fn auth_method(
 ) -> Result<AuthMethod, Error> {
 	match spec.kind {
 		AuthSpecKind::None => Err(auth_unavailable()),
-		AuthSpecKind::ApiKey | AuthSpecKind::Bearer => Ok(AuthMethod::ApiKey),
+		AuthSpecKind::ApiKey | AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer => {
+			Ok(AuthMethod::ApiKey)
+		},
 		AuthSpecKind::Basic => Err(auth_unavailable()),
 		AuthSpecKind::AzureAd | AuthSpecKind::GithubApp => Ok(AuthMethod::SessionToken),
 		AuthSpecKind::GcpAdc => Ok(AuthMethod::ApplicationDefault),
@@ -1357,6 +1510,7 @@ fn auth_store_error(error: StoreError) -> Error {
 }
 
 static LOGIN_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const LOGIN_SESSION_TTL: time::Duration = time::Duration::from_secs(60 * 60);
 
 fn next_login_session_id() -> LoginSessionId {
 	let sequence = LOGIN_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1487,7 +1641,10 @@ mod tests {
 	use std::{
 		collections::{BTreeSet, VecDeque},
 		env, fs,
-		sync::Arc,
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		},
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
 
@@ -1500,19 +1657,20 @@ mod tests {
 
 	use super::{
 		AuthLoginEngine, AuthRefreshEngine, CredentialAffinityError, CredentialAffinityResolver,
-		OAuthLoginEngine, StoredOAuthRefreshEngine, auth_method, auth_store_error, select_auth_spec,
-		select_login_engine,
+		OAuthLoginEngine, RefreshingCredentialSource, StoredOAuthRefreshEngine, auth_method,
+		auth_store_error, select_auth_spec, select_login_engine,
 	};
 	use crate::{
 		account::{AccountPool, AccountRecord, RefreshCoordinator, RefreshPolicy},
-		answer::{AuthEvent, AuthResponse as AnswerAuthResponse},
+		answer::{AccountState, AccountSummary, AuthEvent, AuthResponse as AnswerAuthResponse},
 		auth::{
-			AlibabaTokenPlanLoginEngine, CredentialStore, HeadlessKeySource, KeyError, KeyId,
-			OAuthClock, OAuthCustomDispatcher, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
-			OAuthTransportError, SecretLoginEngine, StoreError,
+			AlibabaTokenPlanLoginEngine, AuthRejection, CredentialError, CredentialLease,
+			CredentialNeed, CredentialSource, CredentialStore, HeadlessKeySource, KeyError, KeyId,
+			LeaseMeta, OAuthClock, OAuthCustomDispatcher, OAuthHttpClient, OAuthHttpRequest,
+			OAuthHttpResponse, OAuthTransportError, SecretLoginEngine, StoreError,
 		},
 		call::{AccountRoutingContext, AuthInput, AuthMethod, LoginRequest},
-		error::ErrorKind,
+		error::{Error, ErrorKind},
 		id::{AccountId, PrincipalId},
 	};
 
@@ -1545,6 +1703,102 @@ mod tests {
 	fn unavailable_credential_key_has_distinct_error_kind() {
 		let error = auth_store_error(StoreError::Key(KeyError::Unavailable));
 		assert_eq!(error.kind, ErrorKind::CredentialStorageUnavailable);
+	}
+
+	struct ExpiringThenFresh {
+		calls: AtomicUsize,
+	}
+
+	impl CredentialSource for ExpiringThenFresh {
+		fn lease(
+			&self,
+			need: CredentialNeed,
+		) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+			let call = self.calls.fetch_add(1, Ordering::SeqCst);
+			async move {
+				if call == 0 {
+					return Err(CredentialError::Expired);
+				}
+				Ok(CredentialLease::bearer(
+					LeaseMeta {
+						account:    need.account.expect("account"),
+						principal:  need.principal.expect("principal"),
+						generation: 2,
+						expires_at: need.valid_after.checked_add(Duration::from_secs(3600)),
+					},
+					SecretString::from("refreshed"),
+				))
+			}
+			.boxed()
+		}
+
+		fn reject<'a>(
+			&'a self,
+			_: &'a CredentialLease,
+			_: AuthRejection,
+		) -> BoxFuture<'a, Result<(), CredentialError>> {
+			async { Ok(()) }.boxed()
+		}
+	}
+
+	struct SuccessfulRefresh {
+		calls: AtomicUsize,
+	}
+
+	impl AuthRefreshEngine for SuccessfulRefresh {
+		fn refresh(&self, account: AccountId) -> BoxFuture<'_, Result<AccountSummary, Error>> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			async move {
+				Ok(AccountSummary {
+					account,
+					provider: ProviderId::from("provider"),
+					principal: Some(PrincipalId::from("principal")),
+					label: None,
+					state: AccountState::Active,
+				})
+			}
+			.boxed()
+		}
+	}
+
+	#[tokio::test]
+	async fn forced_refresh_runs_before_leasing_and_never_reuses_rejected_generation() {
+		let stored = Arc::new(ExpiringThenFresh { calls: AtomicUsize::new(1) });
+		let refresh = Arc::new(SuccessfulRefresh { calls: AtomicUsize::new(0) });
+		let source =
+			RefreshingCredentialSource::with_skew(stored.clone(), refresh.clone(), Duration::ZERO);
+		let lease = source
+			.refresh_lease(CredentialNeed {
+				spec:        omp_catalog::AuthSpecId::new("oauth"),
+				account:     Some(AccountId::from("account")),
+				principal:   Some(PrincipalId::from("principal")),
+				valid_after: SystemTime::now(),
+			})
+			.await
+			.expect("forced refreshed lease");
+		assert_eq!(lease.meta().generation, 2);
+		assert_eq!(stored.calls.load(Ordering::SeqCst), 2);
+		assert_eq!(refresh.calls.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test]
+	async fn routine_acquisition_refreshes_and_replays_expired_oauth_once() {
+		let stored = Arc::new(ExpiringThenFresh { calls: AtomicUsize::new(0) });
+		let refresh = Arc::new(SuccessfulRefresh { calls: AtomicUsize::new(0) });
+		let source =
+			RefreshingCredentialSource::with_skew(stored.clone(), refresh.clone(), Duration::ZERO);
+		let lease = source
+			.lease(CredentialNeed {
+				spec:        omp_catalog::AuthSpecId::new("oauth"),
+				account:     Some(AccountId::from("account")),
+				principal:   Some(PrincipalId::from("principal")),
+				valid_after: SystemTime::now(),
+			})
+			.await
+			.expect("refreshed lease");
+		assert_eq!(lease.meta().generation, 2);
+		assert_eq!(stored.calls.load(Ordering::SeqCst), 2);
+		assert_eq!(refresh.calls.load(Ordering::SeqCst), 1);
 	}
 
 	struct ImmediateClock(SystemTime);

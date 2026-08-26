@@ -34,18 +34,6 @@ const DEFAULT_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 const CLIENT_METADATA: &str =
 	"ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI";
 const GEMINI_USER_AGENT: &str = "GeminiCLI/0.46.0/gemini-3.1-pro-preview (darwin; arm64; terminal)";
-const TIER_3_FLASH: &[&str] = &["gemini-3-flash-preview", "gemini-3-flash", "gemini-3.5-flash"];
-const TIER_FLASH: &[&str] =
-	&["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"];
-const TIER_PRO: &[&str] = &[
-	"gemini-2.5-pro",
-	"gemini-3-pro-preview",
-	"gemini-3.1-pro-preview",
-	"gemini-3-pro",
-	"gemini-3.1-pro",
-	"gemini-pro-agent",
-	"gemini-1.5-pro",
-];
 
 /// Application-registered Google Gemini CLI usage fetcher.
 #[derive(Clone)]
@@ -294,21 +282,6 @@ fn project_id(load: &Value) -> Option<Str> {
 		_ => None,
 	}
 }
-fn model_tier(model: &str) -> Option<&'static str> {
-	if TIER_3_FLASH.contains(&model) {
-		Some("3-Flash")
-	} else if TIER_FLASH.contains(&model) {
-		Some("Flash")
-	} else if TIER_PRO.contains(&model) {
-		Some("Pro")
-	} else if model.contains("flash") {
-		Some("Flash")
-	} else if model.contains("pro") {
-		Some("Pro")
-	} else {
-		None
-	}
-}
 fn q(value: f64) -> UsageQuantity {
 	UsageQuantity::new((value.clamp(0.0, 100.0) * 10.0).round() as u64, 1)
 }
@@ -331,7 +304,7 @@ fn parse_quota(
 			.clamp(0.0, 1.0);
 		let used = (1.0 - remaining).clamp(0.0, 1.0);
 		let model = bucket.get("modelId").and_then(Value::as_str);
-		let tier = model.and_then(model_tier);
+		let tier = model.and_then(|model| omp_catalog::quota_display_tier(PROVIDER, model));
 		let resets_at = bucket
 			.get("resetTime")
 			.and_then(Value::as_str)

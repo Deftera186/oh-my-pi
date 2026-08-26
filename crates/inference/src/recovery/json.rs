@@ -3,6 +3,8 @@
 use bytes::{Bytes, BytesMut};
 use omp_catalog::id::WirePolicyId;
 use omp_core::sf;
+use omp_slopjson::{Deserializer as SlopDeserializer, repair_json};
+use serde::Deserialize as _;
 use serde_json::Value;
 
 use super::{DiagnosticContext, RecoveryError, Stage};
@@ -149,8 +151,7 @@ impl JsonRepairStage {
 			self.reset();
 			return Err(RecoveryError::RepairRejected { stage: "json", diagnostic });
 		}
-		let (repaired, steps) = repair(&self.input, self.limits)?;
-		let value = serde_json::from_slice::<Value>(&repaired).map_err(|_| {
+		let (value, steps) = parse_repaired_value(&self.input, self.limits).map_err(|_| {
 			RecoveryError::InvalidDocument {
 				stage:      "json",
 				reason:     sf!("bounded deterministic repair did not produce valid JSON"),
@@ -336,7 +337,95 @@ fn repair(input: &[u8], limits: JsonRepairLimits) -> Result<(Vec<u8>, u32), Reco
 	if output.len() > limits.max_bytes {
 		return Err(RecoveryError::LimitExceeded { stage: "json", limit: limits.max_bytes });
 	}
+	let output = str::from_utf8(&output).map_err(|_| RecoveryError::InvalidInput {
+		stage:  "json",
+		reason: sf!("JSON repair input is not UTF-8"),
+	})?;
+	let escape_repairs = count_escape_repairs(output);
+	for _ in 0..escape_repairs {
+		bump(&mut steps, limits.max_steps)?;
+	}
+	let output = repair_json(output).into_owned().into_bytes();
+	if output.len() > limits.max_bytes {
+		return Err(RecoveryError::LimitExceeded { stage: "json", limit: limits.max_bytes });
+	}
 	Ok((output, steps))
+}
+pub(crate) fn parse_repaired_value(
+	input: &[u8],
+	limits: JsonRepairLimits,
+) -> Result<(Value, u32), RecoveryError> {
+	let (repaired, mut steps) = repair(input, limits)?;
+	let repaired = str::from_utf8(&repaired).map_err(|_| RecoveryError::InvalidInput {
+		stage:  "json",
+		reason: sf!("JSON repair output is not UTF-8"),
+	})?;
+	let mut deserializer = SlopDeserializer::new(repaired);
+	let value = Value::deserialize(&mut deserializer).map_err(|_| RecoveryError::InvalidInput {
+		stage:  "json",
+		reason: sf!("tolerant JSON parser rejected repaired input"),
+	})?;
+	deserializer
+		.end()
+		.map_err(|_| RecoveryError::InvalidInput {
+			stage:  "json",
+			reason: sf!("tolerant JSON parser found trailing input"),
+		})?;
+	for _ in 0..deserializer.repairs().len() {
+		bump(&mut steps, limits.max_steps)?;
+	}
+	Ok((value, steps))
+}
+
+fn count_escape_repairs(input: &str) -> u32 {
+	let bytes = input.as_bytes();
+	let mut count = 0u32;
+	let mut in_string = false;
+	let mut index = 0usize;
+	while index < bytes.len() {
+		let byte = bytes[index];
+		if !in_string {
+			if byte == b'"' {
+				in_string = true;
+			}
+			index += 1;
+			continue;
+		}
+		match byte {
+			b'"' => {
+				in_string = false;
+				index += 1;
+			},
+			b'\\' => {
+				let valid = match bytes.get(index + 1).copied() {
+					Some(b'u') => {
+						index + 6 <= bytes.len()
+							&& bytes[index + 2..index + 6]
+								.iter()
+								.all(u8::is_ascii_hexdigit)
+					},
+					Some(next) => matches!(next, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'),
+					None => false,
+				};
+				if !valid {
+					count = count.saturating_add(1);
+					index += 1;
+				} else {
+					index += if bytes.get(index + 1) == Some(&b'u') {
+						6
+					} else {
+						2
+					};
+				}
+			},
+			control if control < 0x20 => {
+				count = count.saturating_add(1);
+				index += 1;
+			},
+			_ => index += 1,
+		}
+	}
+	count
 }
 
 const fn bump(steps: &mut u32, limit: u32) -> Result<(), RecoveryError> {
@@ -412,6 +501,14 @@ mod tests {
 		let error = run(b"{answer:'yes'}", JsonEnforcement::Strict, 4).unwrap_err();
 		assert!(matches!(error, RecoveryError::RepairRejected { .. }));
 		assert!(!format!("{error:?}").contains("answer"));
+	}
+	#[test]
+	fn shared_repair_handles_invalid_escapes_and_raw_controls() {
+		let document =
+			run(b"{\"value\":\"bad\\q\ntruncated\\u12\"}", JsonEnforcement::NativeOrRepair, 11)
+				.expect("escape and control hazards repair");
+		assert_eq!(document.value, serde_json::json!({"value":"bad\\q\ntruncated\\u12"}),);
+		assert!(document.recovery.is_some());
 	}
 	#[test]
 	fn depth_and_step_limits_are_typed() {

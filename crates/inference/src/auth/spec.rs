@@ -113,7 +113,10 @@ impl AuthSpec {
 				};
 				Self::Basic { sources: require_sources(convert_sources(spec)?)?, placement }
 			},
-			AuthSpecKind::Bearer | AuthSpecKind::AzureAd | AuthSpecKind::GithubApp => Self::Bearer {
+			AuthSpecKind::Bearer
+			| AuthSpecKind::OptionalBearer
+			| AuthSpecKind::AzureAd
+			| AuthSpecKind::GithubApp => Self::Bearer {
 				sources:   require_sources(convert_sources(spec)?)?,
 				placement: placement()?,
 				scheme:    BearerScheme::OAuth,
@@ -145,7 +148,6 @@ impl AuthSpec {
 						Self::OAuthDevice(OAuthDeviceSpec {
 							client,
 							device_authorization_url: device_authorization_url.clone(),
-							max_polls: polling.maximum_polls,
 							default_interval: Duration::from_millis(polling.default_interval_ms),
 							max_interval: Duration::from_millis(polling.maximum_interval_ms),
 						})
@@ -659,8 +661,6 @@ pub struct OAuthDeviceSpec {
 	pub client:                   OAuthClientSpec,
 	/// Device authorization endpoint.
 	pub device_authorization_url: Str,
-	/// Hard upper bound on token polling attempts.
-	pub max_polls:                u16,
 	/// Default interval when the server omits one.
 	#[serde(with = "duration_millis")]
 	pub default_interval:         Duration,
@@ -673,9 +673,6 @@ impl OAuthDeviceSpec {
 	fn validate(&self) -> Result<(), AuthSpecError> {
 		self.client.validate()?;
 		valid_url(&self.device_authorization_url, "device authorization URL")?;
-		if self.max_polls == 0 {
-			return Err(AuthSpecError::ZeroBound("device max polls"));
-		}
 		if self.default_interval.is_zero() || self.max_interval < self.default_interval {
 			return Err(AuthSpecError::InvalidPollingInterval);
 		}
@@ -705,8 +702,8 @@ impl OAuthPasteSpec {
 /// Optional bounds for a typed custom OAuth exchange.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OAuthPollingSpec {
-	/// Hard upper bound on polling attempts.
-	pub max_polls:        u16,
+	/// Optional hard upper bound on polling attempts.
+	pub max_polls:        Option<u16>,
 	/// Default polling interval.
 	#[serde(with = "duration_millis")]
 	pub default_interval: Duration,
@@ -749,7 +746,7 @@ impl OAuthCustomSpec {
 		}
 		valid_url(&self.authorize_url, "custom OAuth authorization URL")?;
 		if let Some(polling) = self.polling
-			&& (polling.max_polls == 0
+			&& (polling.max_polls == Some(0)
 				|| polling.default_interval.is_zero()
 				|| polling.max_interval < polling.default_interval)
 		{
@@ -987,7 +984,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn specs_reject_unbounded_device_polling_and_invalid_header_prefixes() {
+	fn specs_reject_invalid_device_intervals_and_header_prefixes() {
 		let client = OAuthClientSpec {
 			sources:      vec![CredentialSourceSpec::Interactive],
 			client_id:    "client".into(),
@@ -1001,11 +998,10 @@ mod tests {
 		let device = AuthSpec::OAuthDevice(OAuthDeviceSpec {
 			client,
 			device_authorization_url: "https://auth.example/device".into(),
-			max_polls: 0,
-			default_interval: Duration::from_secs(5),
+			default_interval: Duration::ZERO,
 			max_interval: Duration::from_secs(10),
 		});
-		assert_eq!(device.validate(), Err(AuthSpecError::ZeroBound("device max polls")));
+		assert_eq!(device.validate(), Err(AuthSpecError::InvalidPollingInterval));
 		let placement = KeyPlacement::Header(HeaderPlacement {
 			name:   "authorization".into(),
 			prefix: "bad\r\n".into(),

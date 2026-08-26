@@ -34,8 +34,8 @@ pub use store::{
 use crate::{
 	answer::ArtifactBody,
 	call::{
-		CacheRetention, Call, ContextStrategy, Message, OperationCall, PrefixCachePolicy,
-		ServerStatePolicy, SessionRequest,
+		CacheRetention, Call, ContentPart, ContextStrategy, Message, OpaqueJson, OperationCall,
+		PrefixCachePolicy, Role, ServerStatePolicy, SessionRequest,
 	},
 	catalog::{
 		CodecId, ModelKey, ProviderId, RouteId, TrustDomain, capability::CacheRetentionBits,
@@ -50,7 +50,96 @@ use crate::{
 		session::{SessionAction, SessionCompletion, SessionPlanner},
 	},
 	receipt::{ExecutionReceipt, ReasonId, RecoveryKind, RecoveryRecord},
+	recovery::repetition::{
+		CrossTurnLimits, CrossTurnLoopGuard, LoopSignal, ToolExchangeObservation,
+		TurnRecoveryObservation, recovery_record, tool_loop_redirect,
+	},
 };
+#[derive(Default)]
+struct PendingRecoveryTurn {
+	calls:    Vec<(crate::id::ToolCallId, Str, OpaqueJson)>,
+	results:  HashMap<crate::id::ToolCallId, (OpaqueJson, bool)>,
+	progress: bool,
+}
+
+fn detect_cross_turn_loop(
+	history: &HistoryDelta<StoredMessage>,
+	input: &[StoredMessage],
+) -> Option<LoopSignal> {
+	let limits = CrossTurnLimits::default();
+	let mut messages = history
+		.segments()
+		.iter()
+		.skip(
+			history
+				.segments()
+				.len()
+				.saturating_sub(limits.history_limit),
+		)
+		.flat_map(|segment| segment.iter())
+		.chain(input.iter());
+	let mut guard = CrossTurnLoopGuard::new(limits);
+	let mut pending: Option<PendingRecoveryTurn> = None;
+	let mut latest = None;
+	for message in &mut messages {
+		if message.role == StoredRole::Assistant {
+			if let Some(turn) = pending.take() {
+				latest = observe_recovery_turn(&mut guard, turn);
+			}
+			let mut turn = PendingRecoveryTurn::default();
+			for content in message.content.iter() {
+				match content {
+					StoredContent::Text { text, .. } => {
+						turn.progress |= !text.trim().is_empty();
+					},
+					StoredContent::ToolCall { call, name, arguments, .. } => {
+						let Ok(arguments) = serde_json::from_slice(arguments) else {
+							continue;
+						};
+						turn
+							.calls
+							.push((call.clone(), name.clone(), OpaqueJson::new(arguments)));
+					},
+					_ => {},
+				}
+			}
+			pending = Some(turn);
+			continue;
+		}
+		let Some(turn) = pending.as_mut() else {
+			continue;
+		};
+		for content in message.content.iter() {
+			if let StoredContent::ToolResult { call, content, is_error, .. } = content {
+				let Ok(result) = serde_json::to_value(content.as_ref()) else {
+					continue;
+				};
+				turn
+					.results
+					.insert(call.clone(), (OpaqueJson::new(result), *is_error));
+			}
+		}
+	}
+	if let Some(turn) = pending {
+		latest = observe_recovery_turn(&mut guard, turn);
+	}
+	latest
+}
+
+fn observe_recovery_turn(
+	guard: &mut CrossTurnLoopGuard,
+	turn: PendingRecoveryTurn,
+) -> Option<LoopSignal> {
+	let tool_exchanges = turn
+		.calls
+		.into_iter()
+		.filter_map(|(call_id, name, arguments)| {
+			let (result, is_error) = turn.results.get(&call_id)?.clone();
+			Some(ToolExchangeObservation { call_id, name, arguments, result, is_error })
+		})
+		.collect();
+	guard.observe(&TurnRecoveryObservation { tool_exchanges, made_textual_progress: turn.progress })
+}
 
 /// Stable prefix-cache identity derived solely from immutable history and
 /// policy scope.
@@ -555,6 +644,15 @@ impl ConversationSessionPlanner {
 				(delta, SessionAction::Reuse, Some(*binding))
 			},
 		};
+		let recovery_history = if history.base().is_some() {
+			self
+				.store
+				.delta(None, &session.revision)
+				.map_err(|_| session_error(context, ErrorKind::SessionConflict, RetryAction::Never))?
+		} else {
+			history.clone()
+		};
+		let cross_turn_loop = detect_cross_turn_loop(&recovery_history, &input);
 		let mut messages = history
 			.items()
 			.cloned()
@@ -569,6 +667,24 @@ impl ConversationSessionPlanner {
 				.collect::<Result<Vec<_>, _>>()
 				.map_err(|_| session_error(context, ErrorKind::SessionConflict, RetryAction::Never))?,
 		);
+		if let Some(signal) = cross_turn_loop {
+			context.with_receipt(|receipt| {
+				if !receipt
+					.recoveries
+					.iter()
+					.any(|record| record.kind == RecoveryKind::CrossTurnToolLoop)
+				{
+					receipt
+						.recoveries
+						.push(recovery_record(context.attempts(), &signal));
+				}
+			});
+			messages.push(Message {
+				role:    Role::System,
+				content: Arc::from([ContentPart::Text { text: tool_loop_redirect(), proof: None }]),
+				name:    None,
+			});
+		}
 		let mut rewritten = (**request).clone();
 		rewritten.messages = messages.into();
 		call.operation = OperationCall::Chat(Arc::new(rewritten));
@@ -971,14 +1087,14 @@ mod tests {
 	use parking_lot::Mutex;
 
 	use super::{
-		ContextPlan, ConversationSessionPlanner, DurableCompletion, PlannerStore, PreparedTurn,
-		StoredMessage, StoredRole,
+		ContextPlan, ConversationSessionPlanner, DurableCompletion, HistoryDelta, PlannerStore,
+		PreparedTurn, StoredContent, StoredMessage, StoredRole, StoredToolResult,
 		binding::{
 			BindingContext, BindingValidity, CredentialGenerationPolicy, PendingServerStateBinding,
 			ProviderExpiryDecision, ReseedReason, ReseedState,
 		},
 		conversation::MessagePersistenceError,
-		plan_context,
+		detect_cross_turn_loop, plan_context,
 		store::{ConversationStore, InMemoryConversationStore, SqliteConversationStore},
 	};
 	use crate::{
@@ -989,7 +1105,7 @@ mod tests {
 			NegotiationPolicy, OperationCall, ProviderProof, Role, Sampling, ServerStatePolicy,
 			SessionRequest, Setting, Target,
 		},
-		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision, TurnId},
+		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision, ToolCallId, TurnId},
 		layer::{
 			ExecutionContext,
 			session::{SessionAction, SessionCompletion},
@@ -1007,6 +1123,36 @@ mod tests {
 			redirects:       RedirectTrust::SameOrigin,
 			allow_plaintext: false,
 		}
+	}
+	#[test]
+	fn committed_history_drives_cross_turn_tool_redirect_detection() {
+		let mut items = Vec::new();
+		for index in 0..3 {
+			let call = ToolCallId::new(format!("call-{index}"));
+			items.push(StoredMessage {
+				role:    StoredRole::Assistant,
+				content: Arc::from([StoredContent::ToolCall {
+					call:      call.clone(),
+					name:      Str::new_static("lookup"),
+					arguments: Bytes::from_static(br#"{"key":"same"}"#),
+					proof:     None,
+				}]),
+				name:    None,
+			});
+			items.push(StoredMessage {
+				role:    StoredRole::Tool,
+				content: Arc::from([StoredContent::ToolResult {
+					call,
+					name: Some(Str::new_static("lookup")),
+					content: Arc::from([StoredToolResult::Json(Bytes::from_static(br#"{"value":1}"#))]),
+					is_error: false,
+				}]),
+				name:    None,
+			});
+		}
+		let history = HistoryDelta::new(None, Revision::new("revision-3"), vec![Arc::from(items)]);
+		let signal = detect_cross_turn_loop(&history, &[]).expect("third repeated turn redirects");
+		assert_eq!(signal.evidence.kind, crate::recovery::repetition::LoopKind::CrossTurnTool);
 	}
 
 	fn pending(

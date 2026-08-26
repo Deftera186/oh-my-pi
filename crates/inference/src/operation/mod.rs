@@ -107,6 +107,7 @@ impl<T> OperationRequest<T> {
 			attribution: self.attribution,
 			execution:   self.execution,
 			operation:   wrap(self.payload),
+			staging:     None,
 		}
 	}
 }

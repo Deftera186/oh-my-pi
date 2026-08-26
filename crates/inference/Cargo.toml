@@ -61,6 +61,7 @@ omp-catalog = { workspace = true }
 omp-oauth = { workspace = true }
 omp-proto = { workspace = true }
 omp-secrets = { workspace = true }
+omp-slopjson = { workspace = true }
 omp-settings = { workspace = true }
 omp-voice-kokoro = { workspace = true, optional = true }
 parking_lot = { workspace = true }

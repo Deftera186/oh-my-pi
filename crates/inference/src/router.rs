@@ -49,7 +49,7 @@ pub async fn execute_registry_call(
 	plan_ttl: Duration,
 ) -> Result<Answer, Error> {
 	let router = Router::new(registry.clone(), plan_ttl);
-	let plan = <Router as Planner>::plan(&router, &call, Instant::now())?;
+	let plan = <Router as Planner>::plan(&router, &mut call, Instant::now())?;
 	call.execution = Some(Arc::new(plan));
 	registry.service().oneshot(call).await
 }
@@ -155,20 +155,11 @@ pub struct Router {
 
 impl Router {
 	/// Creates a router whose plans expire after the supplied short validity
-	/// window.
+	/// window, using the same immutable settings snapshot as the registry's
+	/// route stacks.
 	pub fn new(registry: Registry, plan_ttl: Duration) -> Self {
-		Self {
-			registry,
-			plan_ttl,
-			runtime: Arc::new(HashMap::new()),
-			settings: InferenceSettings::default(),
-		}
-	}
-
-	/// Installs the immutable runtime settings projection used for planning.
-	pub fn with_settings(mut self, settings: InferenceSettings) -> Self {
-		self.settings = settings;
-		self
+		let settings = registry.settings().clone();
+		Self { registry, plan_ttl, runtime: Arc::new(HashMap::new()), settings }
 	}
 
 	/// Returns the configured selector for one harness-owned auxiliary model
@@ -189,10 +180,9 @@ impl Router {
 
 	/// Resolves catalog candidates and operation intent directly from a
 	/// canonical call.
-	pub fn plan_call(&self, call: &Call, now: Instant) -> Result<ExecutionPlan, Error> {
-		let mut call = call.clone();
-		self.settings.apply_planning_call(&mut call);
-		self.plan_applied_call(&call, now)
+	pub fn plan_call(&self, call: &mut Call, now: Instant) -> Result<ExecutionPlan, Error> {
+		self.settings.apply_planning_call(call);
+		self.plan_applied_call(call, now)
 	}
 
 	fn model_candidates(
@@ -206,6 +196,13 @@ impl Router {
 			let Some(route) = self.registry.catalog().route(route_id) else {
 				continue;
 			};
+			if !model_identity_allowed(
+				&self.settings.model,
+				route.provider.as_str(),
+				spec.key.as_str(),
+			) {
+				continue;
+			}
 			if target.is_some_and(|target| !target_route_allowed(target, route_id, &route.provider)) {
 				continue;
 			}
@@ -260,13 +257,17 @@ impl Router {
 						primary_provider.as_deref(),
 						max_fallbacks,
 						|candidate| {
-							self
-								.registry
-								.catalog()
-								.model(candidate)
-								.and_then(|spec| spec.routes.first())
-								.and_then(|route| self.registry.catalog().route(route))
-								.map(|route| route.provider.clone())
+							self.registry.catalog().model(candidate).and_then(|spec| {
+								spec.routes.iter().find_map(|route_id| {
+									let route = self.registry.catalog().route(route_id)?;
+									model_identity_allowed(
+										&self.settings.model,
+										route.provider.as_str(),
+										spec.key.as_str(),
+									)
+									.then(|| route.provider.clone())
+								})
+							})
 						},
 					)
 				} else {
@@ -288,7 +289,7 @@ impl Router {
 					operation_call:   Some(call.operation.clone()),
 					native_option:    None,
 					policy:           operation_policy(&call.operation),
-					replay:           operation_replay(&call.operation),
+					replay:           operation_replay(&call.operation, call.staging.as_ref()),
 					budget:           call.budget.clone(),
 					declared_models:  Arc::from([]),
 					affinity_route:   None,
@@ -306,6 +307,9 @@ impl Router {
 		pinned_route: Option<&RouteId<str>>,
 		now: Instant,
 	) -> Result<ExecutionPlan, Error> {
+		if !self.settings.model.provider_allowed(provider.as_str()) {
+			return Err(target_not_found(&call.target));
+		}
 		let definition = self
 			.registry
 			.catalog()
@@ -459,7 +463,10 @@ impl Router {
 			thinking_selection: None,
 			decisions: decisions.into(),
 			fallback_scope: FallbackScope { primary: None, explicit: Arc::from([]) },
-			replay: plan_replay(&operation_replay(&call.operation), &call.budget)?,
+			replay: plan_replay(
+				&operation_replay(&call.operation, call.staging.as_ref()),
+				&call.budget,
+			)?,
 			budget: call.budget.clone(),
 			runtime_evidence: runtime,
 			wire_target: None,
@@ -530,6 +537,13 @@ impl Router {
 				.iter()
 				.filter(|candidate| candidate.model.as_str() == model.as_str())
 			{
+				if !model_identity_allowed(
+					&self.settings.model,
+					candidate.provider.as_str(),
+					candidate.model.as_str(),
+				) {
+					continue;
+				}
 				if !selector_accepts(
 					&request.selection.target,
 					primary,
@@ -819,7 +833,7 @@ impl Router {
 }
 
 impl Planner for Router {
-	fn plan(&self, call: &Call, now: Instant) -> Result<ExecutionPlan, Error> {
+	fn plan(&self, call: &mut Call, now: Instant) -> Result<ExecutionPlan, Error> {
 		self.plan_call(call, now)
 	}
 
@@ -1065,7 +1079,10 @@ fn operation_policy(operation: &OperationCall) -> PlanningPolicy {
 		),
 	}
 }
-fn operation_replay(operation: &OperationCall) -> ReplayRequirements {
+fn operation_replay(
+	operation: &OperationCall,
+	staging: Option<&crate::call::StagingRequest>,
+) -> ReplayRequirements {
 	let mut parts = Vec::new();
 	let mut semantic_retry_possible = false;
 	match operation {
@@ -1109,8 +1126,8 @@ fn operation_replay(operation: &OperationCall) -> ReplayRequirements {
 	ReplayRequirements {
 		replayability,
 		semantic_retry_possible,
-		staging_explicit: false,
-		staging_limit: None,
+		staging_explicit: staging.is_some(),
+		staging_limit: staging.map(|request| request.policy.max_bytes()),
 	}
 }
 
@@ -1264,9 +1281,16 @@ fn compare_evaluated(
 ) -> Ordering {
 	let left_affinity = left.runtime.affinity;
 	let right_affinity = right.runtime.affinity;
-	settings
-		.provider_rank(left.candidate.provider.as_str())
-		.cmp(&settings.provider_rank(right.candidate.provider.as_str()))
+	configured_model_rank(settings, left.candidate.provider.as_str(), left.candidate.model.as_str())
+		.unwrap_or(usize::MAX)
+		.cmp(
+			&configured_model_rank(
+				settings,
+				right.candidate.provider.as_str(),
+				right.candidate.model.as_str(),
+			)
+			.unwrap_or(usize::MAX),
+		)
 		.then_with(|| right_affinity.cmp(&left_affinity))
 		.then_with(|| health_rank(left.runtime.health).cmp(&health_rank(right.runtime.health)))
 		.then_with(|| {
@@ -1292,6 +1316,22 @@ fn compare_evaluated(
 				.codec
 				.cmp(&right.candidate.wire_target.codec)
 		})
+}
+fn model_identity_allowed(
+	settings: &omp_catalog::settings::ModelSettings,
+	provider: &str,
+	model: &str,
+) -> bool {
+	settings.provider_allowed(provider) && settings.model_allowed(provider, model)
+}
+fn configured_model_rank(
+	settings: &omp_catalog::settings::ModelSettings,
+	provider: &str,
+	model: &str,
+) -> Option<usize> {
+	model_identity_allowed(settings, provider, model)
+		.then(|| settings.model_rank(provider, model))
+		.flatten()
 }
 
 const fn health_rank(health: RouteHealth) -> u8 {
@@ -1402,6 +1442,26 @@ mod tests {
 		OperationKind::Auth,
 		OperationKind::Native,
 	];
+	#[test]
+	fn configured_model_policy_filters_and_ranks_before_route_evaluation() {
+		use omp_catalog::settings::PathScopedStringEntry;
+
+		let mut settings = omp_catalog::settings::ModelSettings::default();
+		settings.disabled_providers = Arc::from([PathScopedStringEntry::Bare(sf!("disabled"))]);
+		settings.enabled_models = Arc::from([
+			PathScopedStringEntry::Bare(sf!("preferred/model-*")),
+			PathScopedStringEntry::Bare(sf!("shared-*")),
+		]);
+		settings.provider_order = Arc::from([sf!("preferred"), sf!("secondary")]);
+
+		assert!(!model_identity_allowed(&settings, "disabled", "shared-model"));
+		assert!(model_identity_allowed(&settings, "preferred", "model-a"));
+		assert!(model_identity_allowed(&settings, "secondary", "shared-model"));
+		assert!(!model_identity_allowed(&settings, "secondary", "other"));
+		assert_eq!(configured_model_rank(&settings, "preferred", "model-a"), Some(0));
+		assert_eq!(configured_model_rank(&settings, "secondary", "shared-model"), Some(1),);
+		assert_eq!(configured_model_rank(&settings, "disabled", "shared-model"), None);
+	}
 
 	#[test]
 	fn provider_and_route_service_targets_obey_all_sixteen_catalog_operation_bits() {

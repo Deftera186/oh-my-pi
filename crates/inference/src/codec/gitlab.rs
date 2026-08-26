@@ -6,6 +6,7 @@ use bytes::Bytes;
 use omp_core::{IntoStr, SecretString, Str, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use url::Url;
 
 use super::{
 	anthropic::AnthropicCodec, openai_chat::OpenAiChatCodec, openai_responses::OpenAiResponsesCodec,
@@ -29,6 +30,200 @@ use crate::{
 
 const CLIENT_VERSION: &str = "1.0";
 const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 120_000;
+/// Internal marker replaced only after GitLab allocates the workflow.
+pub(crate) const PENDING_WORKFLOW_ID: &str = "omp-pending-workflow";
+
+/// Builds the authenticated REST request that allocates a GitLab workflow.
+pub(crate) fn workflow_creation_request(
+	socket_uri: &str,
+	start_body: &[u8],
+) -> Result<EncodedRequest, Error> {
+	let socket =
+		Url::parse(socket_uri).map_err(|_| invalid_request("gitlab.workflow.socket_invalid"))?;
+	let namespace = socket
+		.query_pairs()
+		.find_map(|(name, value)| (name == "root_namespace_id").then(|| value.into_owned()));
+	let start: serde_json::Value = serde_json::from_slice(start_body)
+		.map_err(|_| invalid_request("gitlab.workflow.start_invalid"))?;
+	let goal = start
+		.pointer("/startRequest/goal")
+		.and_then(serde_json::Value::as_str)
+		.unwrap_or_default();
+	let mut endpoint = socket;
+	endpoint
+		.set_scheme(if endpoint.scheme() == "ws" {
+			"http"
+		} else {
+			"https"
+		})
+		.map_err(|_| invalid_request("gitlab.workflow.endpoint_scheme"))?;
+	let prefix = endpoint
+		.path()
+		.strip_suffix("/api/v4/ai/duo_workflows/ws")
+		.ok_or_else(|| invalid_request("gitlab.workflow.socket_path"))?;
+	endpoint.set_path(&format!("{prefix}/api/v4/ai/duo_workflows/workflows"));
+	endpoint.set_query(None);
+	let mut creation = serde_json::json!({
+		"workflow_definition": "ambient",
+		"environment": "ide",
+		"allow_agent_to_request_user": false,
+		"agent_privileges": [6],
+		"pre_approved_agent_privileges": [6],
+		"requires_duo_cli_enabled": false,
+		"goal": goal,
+	});
+	if let Some(namespace) = namespace {
+		creation
+			.as_object_mut()
+			.expect("workflow creation body is an object")
+			.insert("namespace_id".to_owned(), serde_json::Value::String(namespace));
+	}
+	let body = serde_json::to_vec(&creation)
+		.map(Bytes::from)
+		.map_err(|_| protocol_error(ErrorPhase::Encoding, "gitlab.workflow.create_serialization"))?;
+	Ok(EncodedRequest {
+		operation:   omp_catalog::OperationKind::Auth,
+		method:      RequestMethod::Post,
+		uri:         Str::new(endpoint.to_string()),
+		headers:     Box::new([
+			RequestHeader { name: sf!("accept"), value: sf!("application/json") },
+			RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+		]),
+		body:        BodySource::Bytes(body),
+		framing:     FramingProtocol::Raw,
+		bounds:      SizeBounds {
+			request_body: 1024 * 1024,
+			frame:        1024 * 1024,
+			response:     1024 * 1024,
+		},
+		sealed_body: None,
+	})
+}
+
+/// Replaces the internal pending workflow marker with the REST-created id.
+pub(crate) fn bind_created_workflow(start_body: &[u8], workflow_id: &str) -> Result<Bytes, Error> {
+	let mut start: serde_json::Value = serde_json::from_slice(start_body)
+		.map_err(|_| invalid_request("gitlab.workflow.start_invalid"))?;
+	let field = start
+		.pointer_mut("/startRequest/workflowID")
+		.ok_or_else(|| invalid_request("gitlab.workflow.start_workflow_missing"))?;
+	if field.as_str() != Some(PENDING_WORKFLOW_ID) {
+		return Err(invalid_request("gitlab.workflow.start_already_bound"));
+	}
+	*field = serde_json::Value::String(workflow_id.to_owned());
+	serde_json::to_vec(&start)
+		.map(Bytes::from)
+		.map_err(|_| protocol_error(ErrorPhase::Encoding, "gitlab.workflow.bind_serialization"))
+}
+
+/// Decoder for the bounded workflow-creation REST response.
+pub(crate) struct WorkflowCreationDecoder {
+	done: bool,
+}
+
+impl WorkflowCreationDecoder {
+	/// Creates a fresh one-response decoder.
+	pub(crate) const fn new() -> Self {
+		Self { done: false }
+	}
+}
+
+impl Decoder for WorkflowCreationDecoder {
+	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		if self.done {
+			return Err(protocol_error(ErrorPhase::Handshake, "gitlab.workflow.create_duplicate"));
+		}
+		let Frame::Raw(bytes) = frame else {
+			return Err(protocol_error(ErrorPhase::Handshake, "gitlab.workflow.create_framing"));
+		};
+		let response: WorkflowCreationResponse = serde_json::from_slice(&bytes)
+			.map_err(|_| protocol_error(ErrorPhase::Handshake, "gitlab.workflow.create_response"))?;
+		let id = response
+			.id
+			.or(response.workflow_id)
+			.or(response.workflow_id_camel)
+			.map(WorkflowCreationId::into_str)
+			.ok_or_else(|| {
+				protocol_error(ErrorPhase::Handshake, "gitlab.workflow.create_id_missing")
+			})?;
+		emit(RawEvent::ProviderState(ProviderStateEvent::Checkpoint {
+			id:   Some(id),
+			data: Bytes::new(),
+		}));
+		self.done = true;
+		Ok(())
+	}
+
+	fn finish(&mut self, _emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		if self.done {
+			Ok(())
+		} else {
+			Err(protocol_error(ErrorPhase::Handshake, "gitlab.workflow.create_response_missing"))
+		}
+	}
+}
+
+/// Wraps the live workflow decoder so the REST-created identity is persisted
+/// with successful provider state.
+pub(crate) fn bind_workflow_decoder(inner: DecoderState, workflow_id: Str) -> DecoderState {
+	Box::new(WorkflowBoundDecoder { inner, workflow_id: Some(workflow_id) })
+}
+
+struct WorkflowBoundDecoder {
+	inner:       DecoderState,
+	workflow_id: Option<Str>,
+}
+
+impl WorkflowBoundDecoder {
+	fn emit_binding(&mut self, emit: &mut dyn FnMut(RawEvent)) {
+		let Some(workflow_id) = self.workflow_id.take() else {
+			return;
+		};
+		let data = serde_json::to_vec(&serde_json::json!({ "workflow_id": workflow_id }))
+			.map_or_else(|_| Bytes::new(), Bytes::from);
+		emit(RawEvent::ProviderState(ProviderStateEvent::Checkpoint { id: Some(workflow_id), data }));
+	}
+}
+
+impl Decoder for WorkflowBoundDecoder {
+	fn push(&mut self, frame: Frame, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		self.emit_binding(emit);
+		self.inner.push(frame, emit)
+	}
+
+	fn finish(&mut self, emit: &mut dyn FnMut(RawEvent)) -> Result<(), Error> {
+		self.emit_binding(emit);
+		self.inner.finish(emit)
+	}
+}
+
+#[derive(Deserialize)]
+struct WorkflowCreationResponse {
+	#[serde(default)]
+	id:                Option<WorkflowCreationId>,
+	#[serde(default)]
+	workflow_id:       Option<WorkflowCreationId>,
+	#[serde(rename = "workflowId", default)]
+	workflow_id_camel: Option<WorkflowCreationId>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkflowCreationId {
+	String(Str),
+	Unsigned(u64),
+	Signed(i64),
+}
+
+impl WorkflowCreationId {
+	fn into_str(self) -> Str {
+		match self {
+			Self::String(value) => value,
+			Self::Unsigned(value) => Str::new(value.to_string()),
+			Self::Signed(value) => Str::new(value.to_string()),
+		}
+	}
+}
 
 /// Stable GitLab GraphQL query for namespace-scoped Duo model availability.
 pub const GITLAB_DUO_MODELS_QUERY: &str =
@@ -396,11 +591,9 @@ impl Codec for GitLabWorkflowCodec {
 	) -> Result<EncodedRequest, Error> {
 		match operation {
 			OperationCall::Chat(request) => {
-				let _ = wire_target(context)?;
-				let workflow_id = context.session.map_or_else(
-					|| context.request_id.as_str(),
-					|session| session.conversation.as_str(),
-				);
+				let target = wire_target(context)?;
+				let root_namespace = gitlab_root_namespace(context).ok();
+				let workflow_id = PENDING_WORKFLOW_ID;
 				let session_id = context
 					.session
 					.map_or_else(|| context.request_id.as_str(), |session| session.turn.as_str());
@@ -409,31 +602,44 @@ impl Codec for GitLabWorkflowCodec {
 					context,
 					WorkflowSession::new(workflow_id, session_id),
 				)?;
+				let uri = gitlab_workflow_websocket_url(
+					context.route.endpoint.base_url.as_str(),
+					root_namespace.as_deref().unwrap_or_default(),
+					target.wire_model.as_str(),
+				)?;
 				let body = serde_json::to_vec(&start)
 					.map(Bytes::from)
 					.map_err(|_| protocol_error(ErrorPhase::Encoding, "gitlab.start.serialization"))?;
+				let mut headers = vec![
+					RequestHeader {
+						name:  sf!("user-agent"),
+						value: sf!(concat!("omp/", env!("CARGO_PKG_VERSION"))),
+					},
+					RequestHeader { name: sf!("x-gitlab-client-type"), value: sf!("node-websocket") },
+					RequestHeader {
+						name:  sf!("x-gitlab-language-server-version"),
+						value: sf!("8.104.0"),
+					},
+					RequestHeader { name: sf!("origin"), value: websocket_origin(&uri)? },
+				];
+				if let Some(namespace) = root_namespace.as_deref() {
+					let namespace = namespace
+						.strip_prefix("gid://gitlab/Group/")
+						.unwrap_or(namespace);
+					headers.push(RequestHeader {
+						name:  sf!("x-gitlab-namespace-id"),
+						value: Str::new(namespace),
+					});
+					headers.push(RequestHeader {
+						name:  sf!("x-gitlab-root-namespace-id"),
+						value: Str::new(namespace),
+					});
+				}
 				Ok(EncodedRequest {
 					operation:   omp_catalog::OperationKind::Chat,
 					method:      RequestMethod::Post,
-					uri:         context.route.endpoint.base_url.clone(),
-					headers:     Box::new([
-						RequestHeader {
-							name:  sf!("user-agent"),
-							value: sf!(concat!("omp/", env!("CARGO_PKG_VERSION"))),
-						},
-						RequestHeader {
-							name:  sf!("x-gitlab-client-type"),
-							value: sf!("node-websocket"),
-						},
-						RequestHeader {
-							name:  sf!("x-gitlab-language-server-version"),
-							value: sf!("8.104.0"),
-						},
-						RequestHeader {
-							name:  sf!("origin"),
-							value: websocket_origin(&context.route.endpoint.base_url)?,
-						},
-					]),
+					uri:         uri.clone(),
+					headers:     headers.into_boxed_slice(),
 					body:        BodySource::Bytes(body),
 					framing:     FramingProtocol::WebSocket,
 					bounds:      SizeBounds {
@@ -1316,6 +1522,39 @@ struct ContextUsage {
 	#[serde(default)]
 	_max_tokens:  u64,
 }
+pub(crate) fn gitlab_workflow_websocket_url(
+	base: &str,
+	root_namespace: &str,
+	selected_model: &str,
+) -> Result<Str, Error> {
+	let mut url =
+		Url::parse(base).map_err(|_| invalid_request("gitlab.workflow.endpoint_invalid"))?;
+	let scheme = match url.scheme() {
+		"https" => "wss",
+		"http" => "ws",
+		_ => return Err(invalid_request("gitlab.workflow.endpoint_scheme")),
+	};
+	url.set_scheme(scheme)
+		.map_err(|_| invalid_request("gitlab.workflow.endpoint_scheme"))?;
+	let prefix = url.path().trim_end_matches('/');
+	url.set_path(&format!("{prefix}/api/v4/ai/duo_workflows/ws"));
+	url.set_query(None);
+	url.set_fragment(None);
+	let namespace = root_namespace
+		.strip_prefix("gid://gitlab/Group/")
+		.unwrap_or(root_namespace);
+	{
+		let mut query = url.query_pairs_mut();
+		if !namespace.is_empty() {
+			query.append_pair("root_namespace_id", namespace);
+		}
+		query
+			.append_pair("user_selected_model_identifier", selected_model)
+			.append_pair("workflow_definition", "ambient");
+	}
+	Ok(Str::new(url.to_string()))
+}
+
 fn websocket_origin(endpoint: &str) -> Result<Str, Error> {
 	let (scheme, rest) = if let Some(rest) = endpoint.strip_prefix("wss://") {
 		("https://", rest)
@@ -1703,6 +1942,68 @@ mod tests {
 				.iter()
 				.any(|event| matches!(event, RawEvent::Completion(_)))
 		);
+	}
+
+	#[test]
+	fn workflow_setup_targets_rest_creation_and_scoped_socket() {
+		let socket = gitlab_workflow_websocket_url(
+			"https://gitlab.example/gitlab",
+			"gid://gitlab/Group/42",
+			"claude-sonnet-4",
+		)
+		.expect("valid socket URL");
+		assert_eq!(
+			socket.as_str(),
+			"wss://gitlab.example/gitlab/api/v4/ai/duo_workflows/ws?root_namespace_id=42&\
+			 user_selected_model_identifier=claude-sonnet-4&workflow_definition=ambient",
+		);
+		let pending = serde_json::json!({
+			"startRequest": {
+				"workflowID": PENDING_WORKFLOW_ID,
+				"goal": "repair the build"
+			}
+		});
+		let creation = workflow_creation_request(
+			socket.as_str(),
+			&serde_json::to_vec(&pending).expect("pending request"),
+		)
+		.expect("creation request");
+		assert_eq!(
+			creation.uri.as_str(),
+			"https://gitlab.example/gitlab/api/v4/ai/duo_workflows/workflows"
+		);
+		let BodySource::Bytes(body) = creation.body else {
+			panic!("workflow creation is buffered JSON");
+		};
+		let body: serde_json::Value = serde_json::from_slice(&body).expect("creation body");
+		assert_eq!(body["namespace_id"], "42");
+		assert_eq!(body["workflow_definition"], "ambient");
+		let bound = bind_created_workflow(
+			&serde_json::to_vec(&pending).expect("pending request"),
+			"workflow-7",
+		)
+		.expect("created identity binds");
+		let bound: serde_json::Value = serde_json::from_slice(&bound).expect("bound start");
+		assert_eq!(bound["startRequest"]["workflowID"], "workflow-7");
+	}
+
+	#[test]
+	fn workflow_creation_decoder_accepts_every_documented_id_spelling() {
+		for response in [
+			br#"{"id":"workflow-1"}"#.as_slice(),
+			br#"{"workflow_id":"workflow-2"}"#.as_slice(),
+			br#"{"workflowId":"workflow-3"}"#.as_slice(),
+			br#"{"id":4}"#.as_slice(),
+		] {
+			let mut decoder = WorkflowCreationDecoder::new();
+			let mut events = Vec::new();
+			decoder
+				.push(Frame::Raw(Bytes::copy_from_slice(response)), &mut |event| events.push(event))
+				.expect("creation response");
+			assert!(matches!(events.as_slice(), [RawEvent::ProviderState(
+				ProviderStateEvent::Checkpoint { id: Some(_), .. }
+			)]));
+		}
 	}
 
 	#[test]

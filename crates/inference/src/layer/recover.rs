@@ -26,9 +26,10 @@ use crate::{
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{ChatEvent, Completion, FinishReason},
 	layer::{ExecutionContext, LayerCall},
-	plan::ExecutionPlan,
+	plan::{ExecutionPlan, NegotiationDecision},
 	receipt::{
-		AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId, ServingModelAttribution,
+		Adjustment, AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId,
+		ServingModelAttribution,
 	},
 	recovery::{
 		Stage,
@@ -119,7 +120,8 @@ where
 		};
 		let structured = match &request.payload.operation {
 			OperationCall::Chat(chat) => match &chat.output {
-				Setting::Require(output) | Setting::Prefer(output) => Some(output.clone()),
+				Setting::Require(output) => Some((output.clone(), false)),
+				Setting::Prefer(output) => Some((output.clone(), true)),
 				Setting::Unset => None,
 			},
 			_ => None,
@@ -133,6 +135,10 @@ where
 		async move {
 			context.checkpoint(ErrorPhase::Recovery)?;
 			let mut response = inner.call(request).await?;
+			let structured = structured.and_then(|(output, preferred)| {
+				(!preferred || !structured_preference_dropped(plan.as_deref(), &context))
+					.then_some(output)
+			});
 			let evidence = response.body.clone();
 			let handshake = response.meta.clone();
 			if response.events.is_some() && response.realtime.is_some() {
@@ -329,6 +335,29 @@ where
 		}
 	}
 }
+fn structured_preference_dropped(plan: Option<&ExecutionPlan>, context: &ExecutionContext) -> bool {
+	let decision_dropped = plan.is_some_and(|plan| {
+		plan.decisions.iter().any(|decision| {
+			matches!(
+				decision,
+				NegotiationDecision::Dropped { feature, .. }
+					if feature.0.as_str() == "chat.structured_output"
+			)
+		})
+	});
+	decision_dropped
+		|| context.receipt().adjustments.iter().any(|adjustment| {
+			matches!(
+				adjustment,
+				Adjustment::Dropped { feature, .. }
+					if matches!(
+						feature.0.as_str(),
+						"chat.structured_output" | "response_format.grammar"
+					)
+			)
+		})
+}
+
 fn project_discovery(
 	projector: Option<&Arc<dyn DiscoveryProjector>>,
 	request: Option<&DiscoveryRequest>,
@@ -705,6 +734,17 @@ mod tests {
 
 	struct TestProjector {
 		fail: bool,
+	}
+	#[test]
+	fn dropped_preferred_structured_output_disables_repair() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		context.with_receipt(|receipt| {
+			receipt.adjustments.push(Adjustment::Dropped {
+				feature: crate::receipt::FeatureId(sf!("chat.structured_output")),
+				reason:  ReasonId(sf!("provider-dropped-preference")),
+			});
+		});
+		assert!(structured_preference_dropped(None, &context));
 	}
 
 	impl DiscoveryProjector for TestProjector {

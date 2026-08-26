@@ -1746,7 +1746,9 @@ impl GoogleUsageMetadata {
 	/// Projects Google counters into dimensioned canonical usage.
 	pub const fn canonical(self) -> Usage {
 		Usage {
-			input_tokens:       self.prompt_token_count,
+			input_tokens:       self
+				.prompt_token_count
+				.saturating_sub(self.cached_content_token_count),
 			output_tokens:      self
 				.candidates_token_count
 				.saturating_add(self.thoughts_token_count),
@@ -1781,6 +1783,12 @@ pub enum GoogleFinishReason {
 	MaxTokens,
 	/// Content or safety policy stopped output.
 	ContentFilter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContiguousPartKind {
+	Text,
+	Thinking,
 }
 
 /// Incremental typed output produced by [`GeminiDecoder`].
@@ -1861,6 +1869,7 @@ pub struct GeminiDecoder {
 	next_index:      u32,
 	text_index:      Option<u32>,
 	thinking_index:  Option<u32>,
+	active_part:     Option<ContiguousPartKind>,
 	completed:       bool,
 	observed_finish: bool,
 	response_id:     Option<Str>,
@@ -1995,6 +2004,7 @@ impl GeminiDecoder {
 		events: &mut Vec<GoogleDecodedEvent>,
 	) -> Result<(), GoogleCodecError> {
 		if let Some(call) = part.function_call {
+			self.transition_part(None, events);
 			if call.name.is_empty() {
 				self.completed = true;
 				return Err(GoogleCodecError::upstream(
@@ -2024,6 +2034,7 @@ impl GeminiDecoder {
 			&& !text.is_empty()
 		{
 			if part.thought.unwrap_or(false) {
+				self.transition_part(Some(ContiguousPartKind::Thinking), events);
 				// Structured thought parts bypass the visible-channel leaked
 				// reasoning healers, so a leaked ```thinking delimiter would
 				// reach display and persistence verbatim (pi #8719).
@@ -2039,6 +2050,7 @@ impl GeminiDecoder {
 					});
 				}
 			} else {
+				self.transition_part(Some(ContiguousPartKind::Text), events);
 				let index = *self
 					.text_index
 					.get_or_insert_with(|| take_index(&mut self.next_index));
@@ -2050,6 +2062,7 @@ impl GeminiDecoder {
 			}
 		}
 		if let Some(code) = part.executable_code {
+			self.transition_part(None, events);
 			let index = take_index(&mut self.next_index);
 			events.push(GoogleDecodedEvent::Auxiliary {
 				index,
@@ -2059,6 +2072,7 @@ impl GeminiDecoder {
 			});
 		}
 		if let Some(result) = part.code_execution_result {
+			self.transition_part(None, events);
 			let index = take_index(&mut self.next_index);
 			events.push(GoogleDecodedEvent::Auxiliary {
 				index,
@@ -2068,6 +2082,22 @@ impl GeminiDecoder {
 			});
 		}
 		Ok(())
+	}
+
+	fn transition_part(
+		&mut self,
+		next: Option<ContiguousPartKind>,
+		events: &mut Vec<GoogleDecodedEvent>,
+	) {
+		if self.active_part == next {
+			return;
+		}
+		if self.active_part == Some(ContiguousPartKind::Thinking) {
+			self.flush_thinking_fence(events);
+		}
+		self.text_index = None;
+		self.thinking_index = None;
+		self.active_part = next;
 	}
 }
 
@@ -2148,7 +2178,10 @@ impl Codec for GeminiCodec {
 		let projection = self
 			.project_for_encode(request, &options, context.thinking_policy, context.thinking_selection)
 			.map_err(|error| error.into_inference(false))?;
-		if let Some(adjustment) = projection.adjustments.first() {
+		if let Some(adjustment) = projection.adjustments.iter().find(|adjustment| {
+			adjustment.what != "response_format.grammar"
+				|| !matches!(&request.output, Setting::Prefer(_))
+		}) {
 			return Err(
 				GoogleCodecError::capability(format!(
 					"planning did not account for unsupported Google feature `{}`: {}",
@@ -2843,6 +2876,9 @@ impl Decoder for CanonicalGeminiDecoder {
 				);
 			},
 		};
+		if data.as_ref() == b"[DONE]" {
+			return Ok(());
+		}
 		let events = self
 			.inner
 			.push_json(&data)
@@ -3064,10 +3100,14 @@ impl error::Error for GoogleCodecError {}
 mod tests {
 	use std::sync::Arc;
 
+	use omp_catalog::{Catalog, WireTarget, policy};
 	use serde_json::Value;
 
 	use super::*;
-	use crate::call::{Sampling as CallSampling, ToolInputConstraint};
+	use crate::{
+		call::{Sampling as CallSampling, ToolInputConstraint},
+		id::RequestId,
+	};
 
 	fn opaque(source: &str) -> OpaqueJson {
 		OpaqueJson(Arc::new(serde_json::from_str(source).expect("valid test JSON")))
@@ -3653,6 +3693,44 @@ mod tests {
 	}
 
 	#[test]
+	fn preferred_portable_grammar_encodes_as_plain_generate_content() {
+		let catalog = Catalog::embedded();
+		let route = catalog
+			.routes()
+			.iter()
+			.find(|route| route.codec.as_str() == "google-genai")
+			.expect("Google GenerateContent route");
+		let target = WireTarget {
+			route:      route.id.clone(),
+			codec:      route.codec.clone(),
+			endpoint:   route.endpoint.clone(),
+			wire_model: omp_catalog::WireModelId::new("gemini-2.5-flash"),
+		};
+		let request_id = RequestId::new("gemini-preferred-grammar");
+		let policy = policy::WirePolicy::baseline();
+		let context = EncodeContext {
+			request_id: &request_id,
+			route,
+			target: Some(&target),
+			policy: &policy,
+			..EncodeContext::default()
+		};
+		let mut request = empty_chat_request();
+		request.output = Setting::Prefer(StructuredOutput::Regex(sf!("^[A-Z]+$")));
+		let encoded = GeminiCodec::generative_language(None)
+			.encode(&context, &OperationCall::Chat(Arc::new(request)))
+			.expect("preferred grammar is downgraded, not rejected");
+		let BodySource::Bytes(body) = encoded.body else {
+			panic!("GenerateContent request is buffered JSON");
+		};
+		let body: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
+		assert!(
+			body.pointer("/generationConfig/responseMimeType").is_none(),
+			"dropped grammar must not become JSON mode"
+		);
+	}
+
+	#[test]
 	fn encode_projection_uses_resolved_thinking_selection() {
 		let selection = ThinkingSelection {
 			effort:            ThinkingEffort::High,
@@ -3916,7 +3994,7 @@ mod tests {
 		assert!(last.iter().any(|event| matches!(
 			event,
 			GoogleDecodedEvent::Usage(Usage {
-				input_tokens: 12,
+				input_tokens: 7,
 				output_tokens: 12,
 				reasoning_tokens: 3,
 				cache_read_tokens: 5,
@@ -3929,6 +4007,24 @@ mod tests {
 				GoogleDecodedEvent::Completed(GoogleFinishReason::EndTurn)
 			))
 		);
+	}
+	#[test]
+	fn non_contiguous_text_parts_receive_new_block_indexes() {
+		let mut decoder = GeminiDecoder::default();
+		let events = decoder
+			.push_json(
+				br#"{"candidates":[{"content":{"parts":[{"text":"before"},{"functionCall":{"name":"lookup","args":{}}},{"text":"after"}]},"finishReason":"STOP"}]}"#,
+			)
+			.expect("interleaved parts decode");
+		let indexes = events
+			.iter()
+			.filter_map(|event| match event {
+				GoogleDecodedEvent::Text { index, .. }
+				| GoogleDecodedEvent::FunctionCall { index, .. } => Some(*index),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(indexes, [0, 1, 2]);
 	}
 
 	#[test]
@@ -4021,7 +4117,7 @@ mod tests {
 			event,
 			RawEvent::Chat(ChatEvent::Usage(UsageUpdate {
 				usage: Usage {
-					input_tokens: 12,
+					input_tokens: 7,
 					output_tokens: 12,
 					reasoning_tokens: 3,
 					cache_read_tokens: 5,
@@ -4036,7 +4132,7 @@ mod tests {
 				reason: FinishReason::ToolCalls,
 				blocks: 4,
 				usage:  Usage {
-					input_tokens: 12,
+					input_tokens: 7,
 					output_tokens: 12,
 					reasoning_tokens: 3,
 					cache_read_tokens: 5,

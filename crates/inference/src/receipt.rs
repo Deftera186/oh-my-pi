@@ -245,6 +245,10 @@ pub struct ExecutionBudget {
 	pub max_staging_bytes:     u64,
 }
 
+/// Bounded in-memory capacity available to transactional output gates unless a
+/// caller supplies a tighter explicit budget.
+pub const DEFAULT_PROVISIONAL_BYTES: u64 = 64 * 1024;
+
 impl Default for ExecutionBudget {
 	fn default() -> Self {
 		Self {
@@ -253,7 +257,7 @@ impl Default for ExecutionBudget {
 			max_input_tokens:      None,
 			max_output_tokens:     None,
 			max_cost:              None,
-			max_provisional_bytes: 0,
+			max_provisional_bytes: DEFAULT_PROVISIONAL_BYTES,
 			max_staging_bytes:     0,
 		}
 	}

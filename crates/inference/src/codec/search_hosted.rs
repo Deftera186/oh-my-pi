@@ -30,14 +30,6 @@ enum HostedProfile {
 }
 
 impl HostedProfile {
-	const fn model(self) -> &'static str {
-		match self {
-			Self::Kimi => "kimi-for-coding",
-			Self::Zai => "glm-4.7",
-			Self::Synthetic => "auto",
-		}
-	}
-
 	const fn tool(self) -> HostedTool<'static> {
 		match self {
 			Self::Kimi => HostedTool::Builtin {
@@ -127,7 +119,8 @@ fn encode_hosted(
 		return Err(encoding_error("hosted_search_query_empty"));
 	}
 	let body = serde_json::to_vec(&HostedRequest {
-		model:    profile.model(),
+		model:    omp_catalog::provider_default_wire_model(context.route.provider.as_str())
+			.expect("hosted search provider declares a default wire model"),
 		messages: [HostedMessage { role: "user", content: request.query.as_str() }],
 		tools:    [profile.tool()],
 		stream:   false,

@@ -315,7 +315,11 @@ static DEFAULT_ROUTE: RouteDef = RouteDef {
 	codec_profile:      CodecProfile::Standard,
 	codec:              CodecId::empty(),
 	transport:          TransportKind::Http,
-	endpoint:           EndpointSpec { base_url: Str::empty(), region: None },
+	endpoint:           EndpointSpec {
+		base_url:    Str::empty(),
+		region:      None,
+		api_version: None,
+	},
 	auth:               AuthSpecId::empty(),
 	headers:            HeaderProfileId::empty(),
 	discovery:          None,

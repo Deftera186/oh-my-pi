@@ -239,6 +239,76 @@ impl CredentialBroker {
 		Ok(broker)
 	}
 
+	/// Refreshes the renewable engine for an exact account/spec selection.
+	///
+	/// Stored OAuth is authoritative when installed. Environment, invocation,
+	/// ADC, AWS, and session engines are never considered and no ordinary
+	/// source fallback occurs.
+	pub fn refresh_account(
+		&self,
+		need: CredentialNeed,
+	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+		async move {
+			let plan = self
+				.plans
+				.get(&need.spec)
+				.ok_or(CredentialError::InvalidSource)?;
+			let selected = [EngineKind::Stored, EngineKind::OAuth]
+				.into_iter()
+				.find(|kind| {
+					self.engine(*kind).is_some()
+						&& plan
+							.sources
+							.iter()
+							.any(|source| source == &BrokerSource::Engine(*kind))
+				})
+				.ok_or(CredentialError::Unavailable)?;
+			self
+				.engine(selected)
+				.expect("selected installed renewable engine")
+				.refresh_lease(need.clone())
+				.await
+				.and_then(|lease| Self::validate_lease(lease, &need, plan.kind, selected.tag()))
+		}
+		.boxed()
+	}
+
+	/// Refreshes the exact source that produced a rejected lease and returns
+	/// its new generation once.
+	///
+	/// Environment and invocation credentials are nonrenewable and fail
+	/// closed; no later source is tried.
+	pub fn refresh_lease<'a>(
+		&'a self,
+		rejected: &'a CredentialLease,
+		need: CredentialNeed,
+	) -> BoxFuture<'a, Result<CredentialLease, CredentialError>> {
+		async move {
+			let Some(tag) = rejected.source_tag() else {
+				return Err(CredentialError::InvalidSource);
+			};
+			let kind = match tag {
+				STORED_TAG => EngineKind::Stored,
+				OAUTH_TAG => EngineKind::OAuth,
+				ENVIRONMENT_TAG | INVOCATION_TAG | ADC_TAG | AWS_TAG | SESSION_TAG => {
+					return Err(CredentialError::Unavailable);
+				},
+				_ => return Err(CredentialError::InvalidSource),
+			};
+			let plan = self
+				.plans
+				.get(&need.spec)
+				.ok_or(CredentialError::InvalidSource)?;
+			self
+				.engine(kind)
+				.ok_or(CredentialError::Unavailable)?
+				.refresh_lease(need.clone())
+				.await
+				.and_then(|lease| Self::validate_lease(lease, &need, plan.kind, kind.tag()))
+		}
+		.boxed()
+	}
+
 	fn invocation_lease(
 		&self,
 		need: &CredentialNeed,
@@ -443,6 +513,7 @@ const fn credential_kind(kind: AuthSpecKind) -> Option<CredentialKind> {
 		AuthSpecKind::ApiKey => Some(CredentialKind::ApiKey),
 		AuthSpecKind::Basic => Some(CredentialKind::Basic),
 		AuthSpecKind::Bearer
+		| AuthSpecKind::OptionalBearer
 		| AuthSpecKind::Oauth
 		| AuthSpecKind::GcpAdc
 		| AuthSpecKind::AzureAd
@@ -525,6 +596,13 @@ mod tests {
 				})
 			})
 			.expect("provider with scalar authentication");
+		let selected_kind = credential_kind(
+			catalog
+				.auth_spec(&selected.1)
+				.expect("selected authentication spec")
+				.kind,
+		)
+		.expect("selected scalar authentication kind");
 		let other = catalog
 			.auth_specs()
 			.iter()
@@ -552,12 +630,27 @@ mod tests {
 		};
 
 		let lease = broker
-			.lease(need(selected.1))
+			.lease(need(selected.1.clone()))
 			.await
 			.expect("invocation lease");
 		assert_eq!(lease.scalar_secret().expect("scalar key").expose_secret(), "invocation-only-key");
+		assert_eq!(lease.kind(), selected_kind);
 		assert_eq!(lease.meta().account.as_str(), "selected-account");
 		assert_eq!(lease.meta().principal.as_str(), "selected-principal");
+		assert_eq!(
+			broker
+				.refresh_lease(&lease, need(selected.1.clone()))
+				.await
+				.expect_err("invocation credentials are nonrenewable"),
+			CredentialError::Unavailable,
+		);
+		assert_eq!(
+			broker
+				.refresh_account(need(selected.1.clone()))
+				.await
+				.expect_err("account has no renewable stored credential"),
+			CredentialError::Unavailable,
+		);
 		assert_eq!(environment.reads.load(Ordering::Relaxed), 0);
 		assert_eq!(store.leases.load(Ordering::Relaxed), 0);
 

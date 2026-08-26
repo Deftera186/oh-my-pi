@@ -23,6 +23,7 @@ use crate::{
 	operation::{parallel_extract::ParallelExtractRequest, search_query, search_query::SearchQuery},
 	plan::ExecutionPlan,
 	receipt::ExecutionBudget,
+	staging::{StagingCancellation, StagingPolicy},
 };
 
 /// A shared, explicitly opaque JSON value.
@@ -248,6 +249,18 @@ pub struct Call {
 	pub execution:   Option<Arc<ExecutionPlan>>,
 	/// Shared operation-specific request payload.
 	pub operation:   OperationCall,
+	/// Explicit secure-staging policy and cancellation signal, when authorized
+	/// by the caller.
+	pub staging:     Option<StagingRequest>,
+}
+
+/// Caller-owned policy and cancellation input for secure request-body staging.
+#[derive(Clone, Debug)]
+pub struct StagingRequest {
+	/// Storage, encryption, and byte bounds for staging.
+	pub policy:       StagingPolicy,
+	/// Cancellation shared with staging and every resulting replayable reader.
+	pub cancellation: StagingCancellation,
 }
 
 impl Call {
@@ -262,12 +275,19 @@ impl Call {
 			attribution: InferenceAttribution::core(),
 			operation,
 			execution: None,
+			staging: None,
 		}
 	}
 
 	/// Replaces the default harness attribution before request dispatch.
 	pub fn with_attribution(mut self, attribution: InferenceAttribution) -> Self {
 		self.attribution = attribution;
+		self
+	}
+
+	/// Authorizes secure staging for one-shot request bodies before execution.
+	pub fn with_staging(mut self, policy: StagingPolicy, cancellation: StagingCancellation) -> Self {
+		self.staging = Some(StagingRequest { policy, cancellation });
 		self
 	}
 }

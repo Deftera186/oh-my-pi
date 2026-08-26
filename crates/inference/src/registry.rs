@@ -66,6 +66,7 @@ struct RegistryInner {
 	usage_manager:    Option<ConsoleUsageManager>,
 	inference_ledger: InferenceLedger,
 	generation:       u64,
+	settings:         settings::InferenceSettings,
 }
 
 impl Registry {
@@ -78,6 +79,7 @@ impl Registry {
 			usage_manager: None,
 			inference_ledger: InferenceLedger::default(),
 			generation: 1,
+			settings: settings::InferenceSettings::default(),
 		}
 	}
 
@@ -94,6 +96,12 @@ impl Registry {
 	/// Borrows the immutable catalog snapshot.
 	pub fn catalog(&self) -> &Catalog {
 		&self.inner.catalog
+	}
+
+	/// Returns the immutable settings snapshot shared by planning and route
+	/// execution.
+	pub fn settings(&self) -> &settings::InferenceSettings {
+		&self.inner.settings
 	}
 
 	/// Reports whether direct route-independent authentication operations are
@@ -245,6 +253,7 @@ pub struct RegistryBuilder {
 	usage_manager:    Option<ConsoleUsageManager>,
 	inference_ledger: InferenceLedger,
 	generation:       u64,
+	settings:         settings::InferenceSettings,
 }
 
 impl RegistryBuilder {
@@ -352,6 +361,7 @@ impl RegistryBuilder {
 	pub fn with_builtins(self, config: BuiltinConfig) -> Result<Self, Error> {
 		let auth_manager = config.auth_manager().cloned();
 		let usage_manager = config.usage_manager().cloned();
+		let settings = config.settings().clone();
 		let builder = match auth_manager {
 			Some(manager) => self.with_auth_manager(manager),
 			None => self,
@@ -360,7 +370,9 @@ impl RegistryBuilder {
 			Some(manager) => builder.with_usage_manager(manager),
 			None => builder,
 		};
-		builder.with_factory(Arc::new(BuiltinRouteStackFactory::new(config)))
+		let mut builder = builder.with_factory(Arc::new(BuiltinRouteStackFactory::new(config)))?;
+		builder.settings = settings;
+		Ok(builder)
 	}
 
 	/// Freezes all definitions and services into a clone-cheap immutable
@@ -402,8 +414,28 @@ impl RegistryBuilder {
 				usage_manager:    self.usage_manager,
 				inference_ledger: self.inference_ledger,
 				generation:       self.generation,
+				settings:         self.settings,
 			}),
 		})
+	}
+
+	/// Builds an explicitly non-routable catalog projection for control-plane
+	/// code that only needs immutable catalog and generation lookups.
+	///
+	/// The returned registry contains no route, authentication, or usage
+	/// services. Calls through [`Registry::service`] therefore fail closed.
+	pub fn build_catalog_projection(self) -> Registry {
+		Registry {
+			inner: Arc::new(RegistryInner {
+				catalog:          self.catalog,
+				bindings:         HashMap::new(),
+				auth_manager:     None,
+				usage_manager:    None,
+				inference_ledger: self.inference_ledger,
+				generation:       self.generation,
+				settings:         self.settings,
+			}),
+		}
 	}
 
 	fn require_catalog_route(&self, route: &RouteId<str>) -> Result<&RouteDef, Error> {
@@ -601,6 +633,9 @@ async fn dispatch_preplanned(
 			Err(mut error) => {
 				attribute_error(&mut error, &plan.provider, &plan.route, &layered.payload.id);
 				let has_next = index < candidates.len();
+				let credential_distinct = candidates
+					.get(index)
+					.is_some_and(|candidate| candidate.provider != plan.provider);
 				let context_promotion = !error.committed
 					&& error.kind == ErrorKind::ContextOverflow
 					&& plan.model.as_ref().is_some_and(|model| {
@@ -615,7 +650,7 @@ async fn dispatch_preplanned(
 							)
 							.is_some_and(|(target, next)| target == next)
 					});
-				if context_promotion || fallback_is_safe(&error, has_next) {
+				if context_promotion || fallback_is_safe(&error, has_next, credential_distinct) {
 					layered.context.merge_receipt(error.receipt());
 					hide_attempts_since(&layered.context, attempt_start);
 					continue;
@@ -645,12 +680,13 @@ fn attribute_error(
 	}
 }
 
-fn fallback_is_safe(error: &Error, has_next: bool) -> bool {
+fn fallback_is_safe(error: &Error, has_next: bool, credential_distinct: bool) -> bool {
 	if !has_next || error.committed || error.action != RetryAction::ReselectRoute {
 		return false;
 	}
 	if error.receipt().attempts.is_empty() {
-		return error.phase == ErrorPhase::Admission && error.kind == ErrorKind::QuotaExhausted;
+		return error.phase == ErrorPhase::Admission
+			|| (error.phase == ErrorPhase::Authentication && credential_distinct);
 	}
 	error.receipt().attempts.last().is_some_and(|attempt| {
 		attempt.outcome != AttemptOutcome::FailedCommitted
@@ -892,6 +928,7 @@ mod tests {
 				usage_manager:    None,
 				inference_ledger: InferenceLedger::default(),
 				generation:       7,
+				settings:         settings::InferenceSettings::default(),
 			}),
 		};
 		let handle = registry.into_handle();
@@ -904,23 +941,50 @@ mod tests {
 				usage_manager: None,
 				inference_ledger: InferenceLedger::default(),
 				generation: 8,
+				settings: settings::InferenceSettings::default(),
 			}),
 		});
 		assert_eq!(previous.generation(), 7);
 		assert_eq!(handle.load().generation(), 8);
 	}
+	#[test]
+	fn catalog_projection_is_explicitly_non_routable() {
+		let catalog = Arc::new(Catalog::embedded().clone());
+		let projection = Registry::builder(catalog.clone()).build_catalog_projection();
+		assert_eq!(projection.catalog_revision(), catalog.revision());
+		assert_eq!(projection.generation(), 1);
+		assert!(
+			!catalog
+				.routes()
+				.iter()
+				.any(|route| projection.contains_service(&route.id))
+		);
+		assert!(!projection.contains_auth_manager());
+	}
 
 	#[test]
 	fn fallback_requires_precommit_reselect_and_explicit_body_permission() {
-		assert!(fallback_is_safe(&route_error(Some(RetryDecision::Allow)), true));
-		assert!(!fallback_is_safe(&route_error(Some(RetryDecision::Suppress)), true));
-		assert!(!fallback_is_safe(&route_error(None), true));
-		assert!(!fallback_is_safe(&route_error(Some(RetryDecision::Allow)), false));
+		assert!(fallback_is_safe(&route_error(Some(RetryDecision::Allow)), true, false));
+		assert!(!fallback_is_safe(&route_error(Some(RetryDecision::Suppress)), true, false));
+		assert!(!fallback_is_safe(&route_error(None), true, false));
+		assert!(!fallback_is_safe(&route_error(Some(RetryDecision::Allow)), false, false));
 		let committed = route_error(Some(RetryDecision::Allow)).committed(true);
-		assert!(!fallback_is_safe(&committed, true));
+		assert!(!fallback_is_safe(&committed, true, false));
 		let mut committed_attempt = route_error(Some(RetryDecision::Allow));
 		committed_attempt.receipt_mut().attempts[0].outcome = AttemptOutcome::FailedCommitted;
-		assert!(!fallback_is_safe(&committed_attempt, true));
+		assert!(!fallback_is_safe(&committed_attempt, true, false));
+	}
+	#[test]
+	fn prebody_auth_fallback_requires_a_different_provider() {
+		let error = Error::new(
+			ErrorKind::Authentication,
+			ErrorPhase::Authentication,
+			RetryAction::ReselectRoute,
+			ExecutionReceipt::default(),
+		);
+		assert!(fallback_is_safe(&error, true, true));
+		assert!(!fallback_is_safe(&error, true, false));
+		assert!(!fallback_is_safe(&error, false, true));
 	}
 
 	#[test]
@@ -963,6 +1027,7 @@ mod tests {
 				usage_manager:    None,
 				inference_ledger: InferenceLedger::default(),
 				generation:       1,
+				settings:         settings::InferenceSettings::default(),
 			}),
 		};
 		let budget = ExecutionBudget::default();
@@ -1007,6 +1072,7 @@ mod tests {
 			attribution: CallInferenceAttribution::core(),
 			execution:   Some(Arc::new(plan)),
 			operation:   OperationCall::Auth(Arc::new(AuthRequest::ListAccounts { provider: None })),
+			staging:     None,
 		};
 		let answer = dispatch_preplanned(registry, LayerCall {
 			payload: call,

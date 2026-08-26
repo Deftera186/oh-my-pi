@@ -22,6 +22,7 @@ use super::{
 	retry::{TransportRetryLayer, TransportRetryService},
 	semantic::{SemanticLayer, SemanticService},
 	session::{SessionLayer, SessionService},
+	staging::{StagingLayer, StagingService},
 };
 use crate::{
 	Answer, Call, Error,
@@ -30,6 +31,7 @@ use crate::{
 	operation::usage::ConsoleUsageManager,
 	provider::builtin::{ProductionDependencies, ProductionRouteComposer},
 	registry::RouteUnavailable,
+	settings::InferenceSettings,
 };
 
 /// Construction-time erased route service that reuses the outer logical
@@ -66,12 +68,18 @@ pub struct BuiltinConfig {
 	composer:      sync::Arc<dyn RouteComposer>,
 	auth_manager:  Option<AuthManager>,
 	usage_manager: Option<ConsoleUsageManager>,
+	settings:      InferenceSettings,
 }
 impl BuiltinConfig {
 	/// Creates configuration from a production composer owning all route-scoped
 	/// dependencies.
 	pub fn new(composer: sync::Arc<dyn RouteComposer>) -> Self {
-		Self { composer, auth_manager: None, usage_manager: None }
+		Self {
+			composer,
+			auth_manager: None,
+			usage_manager: None,
+			settings: InferenceSettings::default(),
+		}
 	}
 
 	/// Creates the canonical production composer from explicit shared
@@ -79,10 +87,12 @@ impl BuiltinConfig {
 	pub fn production(dependencies: ProductionDependencies) -> Self {
 		let auth_manager = dependencies.auth_manager();
 		let usage_manager = dependencies.usage_manager();
+		let settings = dependencies.settings().clone();
 		Self {
 			composer: sync::Arc::new(ProductionRouteComposer::new(dependencies)),
 			auth_manager: Some(auth_manager),
 			usage_manager,
+			settings,
 		}
 	}
 
@@ -108,6 +118,12 @@ impl BuiltinConfig {
 	/// injection.
 	pub(crate) const fn usage_manager(&self) -> Option<&ConsoleUsageManager> {
 		self.usage_manager.as_ref()
+	}
+
+	/// Borrows the immutable settings snapshot shared by routing and route
+	/// execution.
+	pub(crate) const fn settings(&self) -> &InferenceSettings {
+		&self.settings
 	}
 }
 
@@ -218,7 +234,7 @@ pub type HookedRouteStack<W, CA, EN, RL, AC, AP, SM, SS, I, H> =
 	ProviderErrorService<IntentStack<W, CA, EN, RL, AC, AP, SM, SS, I, H>, H>;
 /// Outer execution service type wrapping the full registry fallback loop
 /// exactly once.
-pub type OuterExecutionService<S, O> = ObserveService<OverallBudgetService<S>, O>;
+pub type OuterExecutionService<S, O> = ObserveService<OverallBudgetService<StagingService<S>>, O>;
 
 /// Applies route-local layers exactly once; the returned service accepts an
 /// existing `LayerCall`.
@@ -268,5 +284,5 @@ pub fn build_execution_stack<S, O>(
 where
 	O: Clone,
 {
-	observer.layer(OverallBudgetLayer::new(ledger).layer(dispatch))
+	observer.layer(OverallBudgetLayer::new(ledger).layer(StagingLayer.layer(dispatch)))
 }

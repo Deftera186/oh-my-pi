@@ -388,35 +388,11 @@ fn classify_litellm_route(value: Option<&serde_json::Value>, id: &str) -> LiteLl
 	if normalized.starts_with("openai/") {
 		return LiteLlmRouteEvidence::OpenAi;
 	}
-	if likely_openai_responses_id(&normalized) {
+	if omp_catalog::is_likely_openai_responses_id(&normalized) {
 		LiteLlmRouteEvidence::OpenAi
 	} else {
 		LiteLlmRouteEvidence::Unknown
 	}
-}
-
-fn likely_openai_responses_id(id: &str) -> bool {
-	if [
-		"text-embedding",
-		"whisper-",
-		"tts-",
-		"omni-moderation",
-		"omni-transcribe",
-		"omni-speech",
-		"gpt-image-",
-		"gpt-realtime",
-	]
-	.iter()
-	.any(|prefix| id.starts_with(prefix))
-		|| id.contains("embedding")
-	{
-		return false;
-	}
-	id.starts_with("gpt-")
-		|| id.starts_with("o1")
-		|| id.starts_with("o3")
-		|| id.starts_with("o4")
-		|| id.starts_with("chatgpt")
 }
 
 fn route_for_evidence(probe: &DiscoveryProbe, evidence: LiteLlmRouteEvidence) -> RouteId {
@@ -554,9 +530,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn litellm_preserves_and_merges_route_evidence() {
-		assert!(likely_openai_responses_id("gpt-4.1"));
-		assert!(likely_openai_responses_id("chatgpt-4o-latest"));
-		assert!(!likely_openai_responses_id("text-embedding-3-large"));
+		assert!(omp_catalog::is_likely_openai_responses_id("gpt-4.1"));
+		assert!(omp_catalog::is_likely_openai_responses_id("chatgpt-4o-latest"));
+		assert!(!omp_catalog::is_likely_openai_responses_id("text-embedding-3-large"));
 
 		let endpoint = configured_endpoint(DiscoveryEndpointKind::LiteLlm, "http://primary:4000/v1")
 			.expect("endpoint");

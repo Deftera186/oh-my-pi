@@ -585,8 +585,9 @@ mod tests {
 			codec:              CodecId::new(CODEC_ID),
 			transport:          TransportKind::Http,
 			endpoint:           EndpointSpec {
-				base_url: sf!("https://api.perplexity.ai/"),
-				region:   None,
+				base_url:    sf!("https://api.perplexity.ai/"),
+				region:      None,
+				api_version: None,
 			},
 			auth:               AuthSpecId::new("perplexity-bearer"),
 			headers:            HeaderProfileId::new("json"),

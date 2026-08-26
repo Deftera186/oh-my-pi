@@ -439,17 +439,25 @@ where
 				None | Some(AuthInput::DeviceConfirmed) => {},
 				Some(_) => return Err(OAuthError::UnexpectedInput),
 			}
-			if pending.polls >= spec.max_polls || self.clock.now() >= pending.expires_at {
+			let now = self.clock.now();
+			if now >= pending.expires_at {
 				return Err(OAuthError::PollingExhausted { polls: pending.polls });
 			}
 			driver.emit(AuthEvent::Waiting).await?;
-			let sleep = self.clock.sleep(pending.interval).fuse();
+			let remaining = pending
+				.expires_at
+				.duration_since(now)
+				.map_err(|_| OAuthError::PollingExhausted { polls: pending.polls })?;
+			let sleep = self.clock.sleep(pending.interval.min(remaining)).fuse();
 			let cancelled = driver.wait_cancelled().fuse();
 			futures::pin_mut!(sleep, cancelled);
 			if matches!(select(sleep, cancelled).await, Either::Right(_)) {
 				return Err(OAuthError::Cancelled);
 			}
 			driver.check_cancelled()?;
+			if self.clock.now() >= pending.expires_at {
+				return Err(OAuthError::PollingExhausted { polls: pending.polls });
+			}
 			pending.polls = pending.polls.saturating_add(1);
 			let fields = vec![
 				("grant_type", FormValue::Public(DEVICE_GRANT)),
@@ -1149,8 +1157,8 @@ pub enum OAuthError {
 	/// Login was cancelled.
 	#[error("OAuth login was cancelled")]
 	Cancelled,
-	/// Device polling reached its catalog or expiry bound.
-	#[error("OAuth device polling exhausted its bound")]
+	/// Device polling reached the provider-issued expiry bound.
+	#[error("OAuth device code expired")]
 	PollingExhausted {
 		/// Number of token endpoint polls performed.
 		polls: u16,
@@ -1676,6 +1684,18 @@ mod tests {
 			async {}.boxed()
 		}
 	}
+	struct AdvancingClock(Mutex<SystemTime>);
+	impl OAuthClock for AdvancingClock {
+		fn now(&self) -> SystemTime {
+			*self.0.lock()
+		}
+
+		fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
+			let mut now = self.0.lock();
+			*now = now.checked_add(duration).expect("representable test time");
+			async {}.boxed()
+		}
+	}
 
 	struct TestHttp(Mutex<VecDeque<OAuthHttpResponse>>);
 	impl OAuthHttpClient for TestHttp {
@@ -1801,7 +1821,6 @@ mod tests {
 		let spec = OAuthDeviceSpec {
 			client:                   client(),
 			device_authorization_url: "https://auth.example/device".into(),
-			max_polls:                2,
 			default_interval:         Duration::from_secs(1),
 			max_interval:             Duration::from_secs(5),
 		};
@@ -2328,6 +2347,32 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn device_code_expiry_clamps_sleep_and_is_authoritative_without_poll_cap() {
+		let http = TestHttp(Mutex::new(VecDeque::new()));
+		let clock = AdvancingClock(Mutex::new(SystemTime::UNIX_EPOCH));
+		let engine = OAuthEngine::with_entropy(&http, &clock, FixedEntropy);
+		let (_events, driver, _cancellation) =
+			default_login_channels(LoginSessionId::from("device-expiry"));
+		let spec = OAuthDeviceSpec {
+			client:                   client(),
+			device_authorization_url: "https://auth.example/device".into(),
+			default_interval:         Duration::from_secs(5),
+			max_interval:             Duration::from_secs(10),
+		};
+		let pending = DevicePending {
+			device_code: SecretString::from("device-secret"),
+			interval:    Duration::from_secs(5),
+			expires_at:  SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+			polls:       0,
+		};
+		assert!(matches!(
+			engine.poll_device(&spec, pending, &driver).await,
+			Err(OAuthError::PollingExhausted { polls: 0 })
+		));
+		assert_eq!(clock.now(), SystemTime::UNIX_EPOCH + Duration::from_secs(3));
+	}
+
+	#[tokio::test]
 	async fn cancelled_device_poll_never_sends_a_request() {
 		let http = TestHttp(Mutex::new(VecDeque::new()));
 		let clock = TestClock(SystemTime::UNIX_EPOCH);
@@ -2337,7 +2382,6 @@ mod tests {
 		let spec = OAuthDeviceSpec {
 			client:                   client(),
 			device_authorization_url: "https://auth.example/device".into(),
-			max_polls:                2,
 			default_interval:         Duration::from_secs(1),
 			max_interval:             Duration::from_secs(5),
 		};

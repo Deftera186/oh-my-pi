@@ -478,6 +478,7 @@ impl AuthScheme {
 /// This value has no secret-bearing fields or mutation primitives exposed to
 /// codecs, policy, cassettes, or receipts. The wire transport may only finalize
 /// it into an exact buffered HTTP request at the last dispatch boundary.
+#[derive(Clone)]
 pub struct AppliedCredentials {
 	lease:     CredentialLease,
 	spec:      AuthSpec,
@@ -721,6 +722,18 @@ pub trait CredentialSource: Send + Sync {
 	/// Acquires one opaque credential generation.
 	fn lease(&self, need: CredentialNeed)
 	-> BoxFuture<'_, Result<CredentialLease, CredentialError>>;
+
+	/// Explicitly refreshes a renewable credential, then leases the resulting
+	/// generation once.
+	///
+	/// Nonrenewable sources fail closed rather than reacquiring unchanged
+	/// material.
+	fn refresh_lease(
+		&self,
+		_need: CredentialNeed,
+	) -> BoxFuture<'_, Result<CredentialLease, CredentialError>> {
+		Box::pin(async { Err(CredentialError::Unavailable) })
+	}
 
 	/// Rejects a generation using structured, secret-free provider evidence.
 	fn reject<'a>(

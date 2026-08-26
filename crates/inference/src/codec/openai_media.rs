@@ -143,7 +143,13 @@ impl Codec for OpenAiMediaCodec {
 				let dimensions =
 					setting(&request.dimensions).unwrap_or(self.profile.default_image_dimensions);
 				let format = setting(&request.format).unwrap_or(ImageFormat::Png);
-				Ok(Box::new(ImageDecoder { dimensions, format, count: request.count, finished: false }))
+				Ok(Box::new(ImageDecoder {
+					dimensions,
+					format,
+					count: request.count,
+					max_remote_bytes: self.profile.max_response_bytes,
+					finished: false,
+				}))
 			},
 			OperationCall::Speak(_) => Ok(Box::new(SpeechDecoder { pending: None, finished: false })),
 			OperationCall::Transcribe(request) => Ok(Box::new(TranscriptionDecoder {
@@ -211,6 +217,7 @@ fn encode_image(
 			quality: setting(&request.quality).map(quality_string),
 			background: setting(&request.background).map(background_string),
 			output_format: setting(&request.format).map(format_string),
+			response_format: "b64_json",
 			style: setting_ref(&request.style).map(Str::as_str),
 		};
 		let body = serde_json::to_vec(&wire)
@@ -235,6 +242,7 @@ fn encode_image(
 	if let Some(value) = setting(&request.format) {
 		push_text(&mut parts, &boundary, "output_format", format_string(value));
 	}
+	push_text(&mut parts, &boundary, "response_format", "b64_json");
 	if let Some(value) = setting_ref(&request.style) {
 		push_text(&mut parts, &boundary, "style", value);
 	}
@@ -333,19 +341,20 @@ fn encode_transcription(
 
 #[derive(Serialize)]
 struct ImageJsonRequest<'a> {
-	model:         &'a str,
-	prompt:        &'a str,
-	n:             u32,
+	model:           &'a str,
+	prompt:          &'a str,
+	n:               u32,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	size:          Option<String>,
+	size:            Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	quality:       Option<&'static str>,
+	quality:         Option<&'static str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	background:    Option<&'static str>,
+	background:      Option<&'static str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	output_format: Option<&'static str>,
+	output_format:   Option<&'static str>,
+	response_format: &'static str,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	style:         Option<&'a str>,
+	style:           Option<&'a str>,
 }
 
 fn push_text(parts: &mut Vec<BodySource>, boundary: &str, name: &str, value: &str) {
@@ -378,10 +387,11 @@ fn push_media(
 }
 
 struct ImageDecoder {
-	dimensions: Dimensions,
-	format:     ImageFormat,
-	count:      u32,
-	finished:   bool,
+	dimensions:       Dimensions,
+	format:           ImageFormat,
+	count:            u32,
+	max_remote_bytes: u64,
+	finished:         bool,
 }
 
 impl Decoder for ImageDecoder {
@@ -398,23 +408,28 @@ impl Decoder for ImageDecoder {
 			return Err(protocol_error(false));
 		}
 		for item in response.data {
-			let encoded = item.b64_json.ok_or_else(|| protocol_error(false))?;
-			let bytes = base64::decode(encoded.as_bytes())
-				.into_vec()
-				.map(Bytes::from)
-				.map_err(|_| protocol_error(false))?;
 			let media_type = match self.format {
 				ImageFormat::Png => "image/png",
 				ImageFormat::Jpeg => "image/jpeg",
 				ImageFormat::Webp => "image/webp",
 			};
+			let (body, size) = if let Some(encoded) = item.b64_json {
+				let bytes = base64::decode(encoded.as_bytes())
+					.into_vec()
+					.map(Bytes::from)
+					.map_err(|_| protocol_error(false))?;
+				let size = Some(bytes.len() as u64);
+				(ArtifactBody::Bytes(bytes), size)
+			} else if let Some(url) = item.url {
+				let stream =
+					crate::transport::http::remote_artifact_stream(url.as_str(), self.max_remote_bytes)
+						.map_err(|_| protocol_error(false))?;
+				(ArtifactBody::Stream(stream), None)
+			} else {
+				return Err(protocol_error(false));
+			};
 			emit(RawEvent::ImageGeneration(GenerationEvent::Artifact(ImageArtifact {
-				artifact:       Artifact {
-					media_type: Str::new(media_type),
-					size:       Some(bytes.len() as u64),
-					digest:     None,
-					body:       ArtifactBody::Bytes(bytes),
-				},
+				artifact:       Artifact { media_type: Str::new(media_type), size, digest: None, body },
 				width:          self.dimensions.width,
 				height:         self.dimensions.height,
 				revised_prompt: item.revised_prompt,
@@ -447,6 +462,8 @@ struct ImageResponse {
 struct ImageResponseItem {
 	#[serde(default)]
 	b64_json:       Option<Str>,
+	#[serde(default)]
+	url:            Option<Str>,
 	#[serde(default)]
 	revised_prompt: Option<Str>,
 }
@@ -685,6 +702,59 @@ mod tests {
 		] {
 			assert_eq!(join_uri("https://api.openai.com/v1", path.as_str()), expected);
 		}
+	}
+
+	#[test]
+	fn image_json_requests_force_inline_results() {
+		let request = ImageRequest {
+			prompt:      sf!("draw a lighthouse"),
+			references:  Arc::from([]),
+			mask:        None,
+			count:       1,
+			dimensions:  Setting::Unset,
+			quality:     Setting::Unset,
+			background:  Setting::Unset,
+			format:      Setting::Require(ImageFormat::Png),
+			style:       Setting::Unset,
+			safety:      Arc::from([]),
+			seed:        None,
+			negotiation: NegotiationPolicy::default(),
+		};
+		let (BodySource::Bytes(body), ..) =
+			encode_image("request", "image-model", &request, &OpenAiMediaProfile::default())
+				.expect("valid image request")
+		else {
+			panic!("text-to-image request is buffered JSON");
+		};
+		let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON request");
+		assert_eq!(body["response_format"], "b64_json");
+	}
+
+	#[test]
+	fn url_image_results_project_a_bounded_deferred_artifact() {
+		let mut decoder = ImageDecoder {
+			dimensions:       Dimensions { width: 1024, height: 1024 },
+			format:           ImageFormat::Png,
+			count:            1,
+			max_remote_bytes: 8 * 1024 * 1024,
+			finished:         false,
+		};
+		let mut events = Vec::new();
+		decoder
+			.push(
+				Frame::Raw(Bytes::from_static(
+					br#"{"data":[{"url":"https://cdn.example/image.png"}]}"#,
+				)),
+				&mut |event| events.push(event),
+			)
+			.expect("URL response decodes");
+		assert!(matches!(
+			events.first(),
+			Some(RawEvent::ImageGeneration(GenerationEvent::Artifact(ImageArtifact {
+				artifact: Artifact { body: ArtifactBody::Stream(_), size: None, .. },
+				..
+			})))
+		));
 	}
 
 	#[test]

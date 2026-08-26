@@ -59,8 +59,8 @@ pub use manager::{
 	AuthControlHandle, AuthLoginEngine, AuthManager, AuthManagerBuildError, AuthRefreshEngine,
 	CredentialAcquisitionLoginEngine, CredentialAcquisitionLoginEngineError,
 	CredentialAffinityError, CredentialAffinityResolver, CredentialControlWrite, OAuthControlImport,
-	OAuthLoginEngine, OAuthLoginEngineError, SecretLoginEngine, SecretLoginEngineError,
-	StoredOAuthRefreshEngine,
+	OAuthLoginEngine, OAuthLoginEngineError, RefreshingCredentialSource, SecretLoginEngine,
+	SecretLoginEngineError, StoredOAuthRefreshEngine,
 };
 pub use oauth::{
 	DevicePending, OAuthClock, OAuthCredentialManagerError, OAuthCustomDispatchError,
