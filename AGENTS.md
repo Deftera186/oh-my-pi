@@ -90,6 +90,23 @@ crates for these (`unicode-*`, `utf8-*`, `unicode-segmentation`,
 `unicode-width`, `ansi_*`, `strip-ansi-escapes`); remove redundant deps, don't
 wrap.
 
+Hashing: two primitives, both in `omp-core` — benchmarked on Apple Silicon,
+don't relitigate. Content/crypto digests → `omp_core::Hash32` (SHA-256 via
+`sha2`, hardware `asm` on aarch64; beat blake3 3.3× at 32 B, single-stream at
+every size). Discretionary in-memory maps/cache keys/dirty-check fingerprints
+→ `omp_core::{FastHashMap, FastHashSet, FastState, fast_hash64}` (foldhash;
+beat fxhash/ahash/xxh3/SipHash on ints, short keys, and buffers). NEVER add
+hasher crates (`blake3`, `xxhash-*`, `rustc-hash`, `ahash`, `fnv`,
+`twox-*`, …) for discretionary hashing; migrate on touch. Exceptions =
+externally fixed algorithms only: format/RFC/vendor contracts (git SHA-1,
+archive CRCs, PKCE/SigV4/JWT SHA-256, gravatar+identicon MD5, HF manifests,
+SSH fingerprints), checksum builtins where the algorithm is the feature,
+pi/Bun behavioral compat (secrets wyhash, hashline xxh32 tags, MCP wyhash
+name shortening), and the extension registry/trust dual-hash schema
+(`b3:`+`sha256:`, Ed25519-signed — blake3 stays until a schema bump).
+Durable artifact addresses are `artifact://sha256/<64-hex>`;
+`ArtifactDigest` renders `sha256:<hex>`.
+
 Crates: members `crates/*` (virtual workspace, resolver 3); dirs unprefixed
 (`crates/demo`); package names `omp-` prefixed (`name = "omp-demo"`). Every
 member: real `description` + workspace
