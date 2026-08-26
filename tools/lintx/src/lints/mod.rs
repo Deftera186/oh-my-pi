@@ -4,6 +4,7 @@
 mod arc_struct;
 mod import_alias;
 mod inline_path;
+mod model_name;
 mod mutex_arc;
 
 use crate::lint::AnyLint;
@@ -18,5 +19,7 @@ pub fn all(max_segments: usize) -> Vec<Box<dyn AnyLint>> {
 		Box::new(inline_path::RelativePath),
 		Box::new(arc_struct::ArcStruct),
 		Box::new(mutex_arc::MutexArc),
+		Box::new(model_name::ModelGate),
+		Box::new(model_name::ModelTable),
 	]
 }

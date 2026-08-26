@@ -74,7 +74,8 @@ lint-locked-maps:
     fi
 
 # Scan for banned inline qualified paths (`std::sync::atomic::AtomicU32`, `crate::`/`super::`),
-# mostly-Arc-wrapped structs, and `Mutex<Arc<…>>`-style locks (see tools/lintx).
+# mostly-Arc-wrapped structs, and `Mutex<Arc<…>>`-style locks, plus model-name
+# hardcoding in crates/inference (see tools/lintx).
 [group('format & lint')]
 lintx *paths='crates':
     cargo run --quiet --release --locked --manifest-path tools/lintx/Cargo.toml -- {{ paths }}
