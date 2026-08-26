@@ -10,7 +10,7 @@ use std::{
 	time::{SystemTime, UNIX_EPOCH},
 };
 
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -364,7 +364,7 @@ impl BankStore {
 			"{}:{}:{}",
 			window.session_id,
 			window.retained_through_user_turn,
-			blake3::hash(window.transcript.as_bytes()).to_hex()
+			Hash32::sum(window.transcript.as_bytes()).to_hex()
 		);
 		let id = new_memory_id(self.bank.as_str(), window.session_id, &stable_material);
 		let timestamp = unix_millis()?.to_string();
@@ -1078,7 +1078,7 @@ fn new_memory_id(bank: &str, session: &str, content: &str) -> Str {
 		.unwrap_or_default()
 		.as_nanos();
 	let material = format!("{bank}\0{session}\0{content}\0{now}\0{serial}");
-	let digest = blake3::hash(material.as_bytes());
+	let digest = Hash32::sum(material.as_bytes());
 	Str::new(format!("mem_{}", &digest.to_hex().as_str()[..24]))
 }
 

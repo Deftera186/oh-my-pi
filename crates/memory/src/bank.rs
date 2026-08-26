@@ -7,7 +7,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
 
@@ -198,7 +198,7 @@ fn project_bank(root: &Path, configured: Option<&str>) -> Result<BankId> {
 		.and_then(|name| name.to_str())
 		.and_then(sanitize)
 		.unwrap_or_else(|| Str::new_static("default"));
-	let digest = blake3::hash(root.to_string_lossy().as_bytes());
+	let digest = Hash32::sum(root.to_string_lossy().as_bytes());
 	let hex = digest.to_hex();
 	let hash = &hex.as_str()[..12];
 	let raw = match configured.and_then(sanitize) {
@@ -239,7 +239,7 @@ fn limit(name: &str) -> Str {
 	if name.len() <= MAX_BANK_BYTES {
 		return Str::new(name);
 	}
-	let digest = blake3::hash(name.as_bytes());
+	let digest = Hash32::sum(name.as_bytes());
 	let hex = digest.to_hex();
 	let suffix = &hex.as_str()[..12];
 	let prefix_bytes = MAX_BANK_BYTES - suffix.len() - 1;

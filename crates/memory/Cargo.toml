@@ -17,7 +17,6 @@ default = ["local-embedding"]
 local-embedding = ["dep:fastembed"]
 
 [dependencies]
-blake3.workspace = true
 fastembed = { workspace = true, optional = true }
 flume.workspace = true
 omp-core.workspace = true

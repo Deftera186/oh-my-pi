@@ -10,7 +10,7 @@ use std::{
 	},
 };
 
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -882,7 +882,7 @@ fn slot_generation(base: u64, content: Option<&str>) -> u64 {
 	let Some(content) = content else {
 		return 0;
 	};
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(&base.to_le_bytes());
 	hasher.update(content.as_bytes());
 	u64::from_le_bytes(

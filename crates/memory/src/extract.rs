@@ -1,6 +1,6 @@
 //! Bounded auxiliary-lane extraction and immutable fact persistence.
 
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 
 use crate::{
 	Error, Result,
@@ -118,7 +118,7 @@ pub fn parse_facts(output: &str, source_id: &str) -> (Vec<ExtractedFact>, usize)
 			continue;
 		}
 		let material = format!("{source_id}\0{line_number}\0{subject}\0{predicate}\0{object}");
-		let digest = blake3::hash(material.as_bytes());
+		let digest = Hash32::sum(material.as_bytes());
 		facts.push(ExtractedFact {
 			id:         Str::new(format!("fact_{}", &digest.to_hex().as_str()[..24])),
 			subject:    Str::new(subject),
