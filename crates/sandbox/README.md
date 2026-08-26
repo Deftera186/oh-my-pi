@@ -1,5 +1,7 @@
 # omp-sandbox
 
-`omp-sandbox` provides the fail-closed process-confinement boundary used by sandboxed extension and environment-host launches. Policies contain canonical read/write filesystem grants and an explicit network policy.
+`omp-sandbox` compiles backend-independent capability specifications into inspectable confinement plans. Supported backends are Seatbelt, Bubblewrap, gVisor, Docker, Docker with runsc, and Windows AppContainer.
 
-`SandboxPolicy::prepare` returns a native `SandboxLaunch` only after proving that the platform backend can install confinement. macOS uses Seatbelt and Linux uses bubblewrap. Missing, unsupported, or unusable backends return an error; callers must never retry a sandboxed launch without the returned launcher and argument prefix. Trusted execution remains a separate, explicit caller policy.
+Compilation is pure and secret-free. Preparation resolves filtered environments, private files, filesystem views, and cleanup ownership. Callers may retain `PreparedSandbox` beside a normal child command or use `Runner::run`; `Runner::native_command` selects only Seatbelt or Bubblewrap for inherited descriptors and caller `pre_exec` hooks.
+
+Strict specifications fail when the selected backend cannot enforce every requested capability. Caveated plans expose limitations structurally, and `Plan::enforced` is authoritative.

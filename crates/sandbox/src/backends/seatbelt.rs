@@ -1,0 +1,359 @@
+#[cfg(target_os = "macos")]
+use std::process::Command;
+use std::{
+	env,
+	ffi::OsString,
+	fmt::Write as _,
+	path::{Path, PathBuf},
+};
+
+#[cfg(target_os = "macos")]
+use omp_core::CowBytes;
+
+#[cfg(target_os = "macos")]
+use crate::SandboxOperation;
+use crate::{
+	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
+	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
+	WriteMode, paths::temp_roots,
+};
+
+const LAUNCHER: &str = "/usr/bin/sandbox-exec";
+pub(crate) const EPHEMERAL_ROOT_PLACEHOLDER: &str = "<omp-sandbox-ephemeral-root>";
+const TLS_TRUST_MACH_SERVICES: [&str; 3] =
+	["com.apple.trustd", "com.apple.trustd.agent", "com.apple.SecurityServer"];
+
+pub(crate) fn compile(
+	spec: &SandboxSpec,
+	program: &Path,
+	requested: CapabilitySet,
+	mut enforced: CapabilitySet,
+) -> Result<Plan, SandboxError> {
+	enforced = enforced.union(CapabilitySet::one(Capability::MachRestrict));
+	if spec.write == WriteMode::Overlay {
+		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteEphemeral));
+	}
+	let mut profile = String::from("(version 1)\n(allow default)\n(deny mach-lookup)\n");
+	let mut mach_services: Vec<&str> = spec
+		.mach_services
+		.iter()
+		.map(|service| service.as_str())
+		.collect();
+	if matches!(spec.network, NetworkMode::Enabled | NetworkMode::Outbound) {
+		for service in TLS_TRUST_MACH_SERVICES {
+			if !mach_services.contains(&service) {
+				mach_services.push(service);
+			}
+		}
+	}
+	for service in mach_services {
+		profile.push_str("(allow mach-lookup (global-name ");
+		push_string(&mut profile, service);
+		profile.push_str("))\n");
+	}
+	match spec.network {
+		NetworkMode::Disabled => profile.push_str("(deny network*)\n"),
+		NetworkMode::Enabled => {},
+		NetworkMode::Outbound => profile.push_str("(deny network-inbound)\n"),
+	}
+
+	if spec.readable.is_empty() {
+		// Broad reads still exclude raw disk and kernel-memory devices. Otherwise a
+		// privileged caller could bypass the filesystem policy entirely.
+		profile.push_str("(deny file-read* (regex #\"^/dev/r?disk\"))\n");
+		profile.push_str("(deny file-read* (regex #\"^/dev/(mem|kmem|kcore)$\"))\n");
+	} else {
+		profile.push_str("(deny file-read* (subpath \"/\"))\n");
+		push_paths(&mut profile, "allow", "file-read*", [
+			Path::new("/usr/lib"),
+			Path::new("/System"),
+			Path::new("/private/var/db/dyld"),
+		]);
+		// /System lexically includes this firmlink target. Put the denial after
+		// loader widening but before user scopes, so an explicit user grant wins.
+		profile.push_str("(deny file-read* (subpath \"/System/Volumes/Data\"))\n");
+		profile.push_str("(allow file-read-data (literal \"/\"))\n");
+		push_literals(&mut profile, "allow", "file-read*", [
+			Path::new("/dev/null"),
+			Path::new("/dev/zero"),
+			Path::new("/dev/random"),
+			Path::new("/dev/urandom"),
+		]);
+		push_scopes(
+			&mut profile,
+			"allow",
+			"file-read*",
+			spec
+				.readable
+				.iter()
+				.map(PathBuf::as_path)
+				.chain(std::iter::once(program)),
+		);
+		if spec.write == WriteMode::Ephemeral {
+			push_paths(&mut profile, "allow", "file-read*", [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)]);
+		}
+	}
+	// A deny must follow every built-in and caller allow because the last
+	// matching Seatbelt rule wins.
+	push_scopes(&mut profile, "deny", "file-read*", spec.read_deny.iter().map(PathBuf::as_path));
+
+	profile.push_str("(deny file-write* (subpath \"/\"))\n");
+	push_literals(&mut profile, "allow", "file-write*", [Path::new("/dev/null")]);
+	match spec.write {
+		WriteMode::Deny => {},
+		WriteMode::Scoped | WriteMode::Overlay => {
+			let temporary = spec.allow_temp.then(temp_roots).unwrap_or_default();
+			push_scopes(
+				&mut profile,
+				"allow",
+				"file-write*",
+				spec
+					.writable
+					.iter()
+					.map(PathBuf::as_path)
+					.chain(temporary.iter().map(PathBuf::as_path)),
+			);
+		},
+		WriteMode::Ephemeral => {
+			push_paths(&mut profile, "allow", "file-write*", [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)])
+		},
+	}
+
+	if spec.no_exec {
+		profile.push_str("(deny process-exec*)\n(allow process-exec* (literal ");
+		push_path_string(&mut profile, program);
+		profile.push_str("))\n");
+	}
+	// Socket exceptions deliberately follow the blanket IP-network denial.
+	for socket in &spec.unix_sockets {
+		profile.push_str("(allow network-outbound (remote unix-socket (path-literal ");
+		push_path_string(&mut profile, socket);
+		profile.push_str(")))\n");
+	}
+
+	let launcher = env::var_os("OMP_SANDBOX_EXEC").unwrap_or_else(|| OsString::from(LAUNCHER));
+	let mut argv = vec![
+		launcher,
+		OsString::from("-p"),
+		OsString::from(&profile),
+		program.as_os_str().to_owned(),
+	];
+	argv.extend(spec.args.iter().cloned());
+	let mut plan = Plan::new(Backend::Seatbelt, requested, enforced, argv, true);
+	plan.set_profile(profile);
+
+	match spec.write {
+		WriteMode::Ephemeral => {
+			plan.set_filesystem(FilesystemVirtualizationKind::WorkspaceClone);
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteEphemeral,
+				"macOS ephemeral writes are workspace-scoped to a private APFS clone of the working \
+				 directory, not a whole-host overlay",
+			));
+		},
+		WriteMode::Overlay => {
+			plan.set_filesystem(FilesystemVirtualizationKind::ScopedDeny);
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteEphemeral,
+				"Seatbelt denies writes outside persistent scopes instead of redirecting them",
+			));
+		},
+		WriteMode::Deny | WriteMode::Scoped => {},
+	}
+	if matches!(spec.write, WriteMode::Scoped | WriteMode::Overlay) {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsWriteScope,
+			"Seatbelt write scopes are path based; an in-scope hardlink can modify the same file \
+			 through an out-of-scope alias",
+		));
+		plan.add_caveat(Caveat::general(
+			"OMP does not enforce res.disk; scoped persistent writes can fill the backing host \
+			 filesystem unless separately constrained",
+		));
+	}
+	if !spec.readable.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsReadScope,
+			"Seatbelt additionally exposes /usr/lib, /System, and /private/var/db/dyld so dynamic \
+			 Mach-O programs can load; reading the root directory itself is allowed for cwd \
+			 resolution without exposing descendant contents",
+		));
+	} else {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsReadHost,
+			"Broad host reads rely on OS permissions; raw disk and kernel-memory devices are denied",
+		));
+	}
+	if !spec.read_deny.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsReadDeny,
+			"Seatbelt read denials are path based and can be bypassed through an allowed hardlink to \
+			 the same inode",
+		));
+	}
+	match spec.network {
+		NetworkMode::Disabled => plan.add_caveat(Caveat::capability(
+			Capability::NetDisable,
+			"Seatbelt network denial also blocks loopback IP sockets",
+		)),
+		NetworkMode::Enabled | NetworkMode::Outbound => plan.add_caveat(Caveat::general(
+			"Seatbelt re-allows Apple TLS trust Mach services so Security.framework clients can \
+			 validate certificates",
+		)),
+	}
+	if spec.network == NetworkMode::Outbound {
+		plan.add_caveat(Caveat::capability(
+			Capability::NetOutbound,
+			"net.outbound is not an egress filter or domain/CIDR allowlist; permitted connections \
+			 can exfiltrate data unless separately constrained",
+		));
+	}
+	if spec.no_exec {
+		plan.add_caveat(Caveat::capability(
+			Capability::ProcNoExec,
+			"Seatbelt path rules cannot prevent an interpreter from re-executing itself",
+		));
+	}
+	if spec.degradation == DegradationPolicy::AllowCaveats {
+		if spec.resources.cpu_cores().is_some() {
+			plan.add_caveat(Caveat::capability(
+				Capability::ResCpu,
+				"Seatbelt uses a best-effort process-group duty-cycle watchdog rather than a kernel \
+				 CPU quota",
+			));
+		}
+		if spec.resources.memory_bytes().is_some() {
+			plan.add_caveat(Caveat::capability(
+				Capability::ResMemory,
+				"Seatbelt uses a sampled process-group RSS watchdog rather than a kernel memory cap",
+			));
+		}
+		if spec.resources.pids().is_some() {
+			plan.add_caveat(Caveat::capability(
+				Capability::ResPids,
+				"Seatbelt has no process-count limit primitive",
+			));
+		}
+	}
+	Ok(plan)
+}
+
+pub(crate) fn probe() -> BackendStatus {
+	#[cfg(not(target_os = "macos"))]
+	{
+		return BackendStatus::unavailable(Backend::Seatbelt, ProbeFailure::WrongHost {
+			backend: Backend::Seatbelt,
+			os:      std::env::consts::OS,
+		});
+	}
+	#[cfg(target_os = "macos")]
+	{
+		let launcher = env::var_os("OMP_SANDBOX_EXEC").unwrap_or_else(|| OsString::from(LAUNCHER));
+		let output = match Command::new(&launcher)
+			.args(["-p", "(version 1) (allow default)", "/usr/bin/true"])
+			.output()
+		{
+			Ok(output) => output,
+			Err(source) => {
+				return BackendStatus::unavailable(Backend::Seatbelt, ProbeFailure::Start {
+					backend: Backend::Seatbelt,
+					operation: SandboxOperation::Probe,
+					source,
+				});
+			},
+		};
+		if output.status.success() {
+			BackendStatus::available(Backend::Seatbelt)
+		} else {
+			let mut diagnostic = output.stderr;
+			diagnostic.truncate(4096);
+			BackendStatus::unavailable(Backend::Seatbelt, ProbeFailure::Rejected {
+				backend:    Backend::Seatbelt,
+				operation:  SandboxOperation::Probe,
+				status:     output.status.code(),
+				diagnostic: CowBytes::from(diagnostic),
+			})
+		}
+	}
+}
+
+fn push_paths<'a>(
+	profile: &mut String,
+	verb: &str,
+	operation: &str,
+	paths: impl IntoIterator<Item = &'a Path>,
+) {
+	let mut paths = paths.into_iter().peekable();
+	if paths.peek().is_none() {
+		return;
+	}
+	let _ = write!(profile, "({verb} {operation}");
+	for path in paths {
+		profile.push_str(" (subpath ");
+		push_path_string(profile, path);
+		profile.push(')');
+	}
+	profile.push_str(")\n");
+}
+
+fn push_literals<'a>(
+	profile: &mut String,
+	verb: &str,
+	operation: &str,
+	paths: impl IntoIterator<Item = &'a Path>,
+) {
+	let mut paths = paths.into_iter().peekable();
+	if paths.peek().is_none() {
+		return;
+	}
+	let _ = write!(profile, "({verb} {operation}");
+	for path in paths {
+		profile.push_str(" (literal ");
+		push_path_string(profile, path);
+		profile.push(')');
+	}
+	profile.push_str(")\n");
+}
+
+fn push_scopes<'a>(
+	profile: &mut String,
+	verb: &str,
+	operation: &str,
+	paths: impl IntoIterator<Item = &'a Path>,
+) {
+	let mut paths = paths.into_iter().peekable();
+	if paths.peek().is_none() {
+		return;
+	}
+	let _ = write!(profile, "({verb} {operation}");
+	for path in paths {
+		let filter = if path.is_dir() { "subpath" } else { "literal" };
+		profile.push_str(" (");
+		profile.push_str(filter);
+		profile.push(' ');
+		push_path_string(profile, path);
+		profile.push(')');
+		if !path.exists() {
+			profile.push_str(" (subpath ");
+			push_path_string(profile, path);
+			profile.push(')');
+		}
+	}
+	profile.push_str(")\n");
+}
+
+fn push_path_string(profile: &mut String, path: &Path) {
+	push_string(profile, &path.as_os_str().to_string_lossy());
+}
+
+fn push_string(profile: &mut String, value: &str) {
+	profile.push('"');
+	for character in value.chars() {
+		match character {
+			'\\' => profile.push_str("\\\\"),
+			'"' => profile.push_str("\\\""),
+			character => profile.push(character),
+		}
+	}
+	profile.push('"');
+}
