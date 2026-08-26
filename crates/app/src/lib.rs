@@ -38,6 +38,7 @@ pub mod git_cmd;
 pub mod git_tui;
 pub mod grep_cmd;
 pub mod grievances_cmd;
+#[cfg(feature = "gui")]
 mod gui;
 pub mod help_extra;
 pub mod image_attachment;
@@ -51,7 +52,18 @@ pub mod progress_reporter;
 pub mod ps_cmd;
 pub mod render_cmd;
 pub mod rpc_mode;
+#[cfg(feature = "local-tts")]
 pub mod say_cmd;
+/// Feature-disabled local speech command.
+#[cfg(not(feature = "local-tts"))]
+pub mod say_cmd {
+	use crate::cli::SayArgs;
+
+	/// Reports that local speech synthesis was excluded from this build.
+	pub async fn run(_args: SayArgs) -> miette::Result<()> {
+		Err(miette::miette!("local speech synthesis is not built; rerun with `--features local-tts`"))
+	}
+}
 pub mod session_manager;
 pub mod setup_cmd;
 pub mod share_cmd;

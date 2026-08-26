@@ -1439,6 +1439,7 @@ pub struct Suggestion {
 	hint:        Option<Str>,
 	category:    Option<Str>,
 	match_spans: SmallVec<(u16, u16), 8>,
+	submits:     bool,
 }
 
 impl Suggestion {
@@ -1453,6 +1454,7 @@ impl Suggestion {
 			hint:        None,
 			category:    None,
 			match_spans: SmallVec::new(),
+			submits:     false,
 		}
 	}
 
@@ -1493,6 +1495,19 @@ impl Suggestion {
 			.filter(|(start, end)| start < end)
 			.collect();
 		self
+	}
+
+	/// Marks this row as a complete command: Enter both applies the
+	/// completion and submits the input when only whitespace precedes the
+	/// command token (pi's submitted-slash-command rule).
+	pub const fn with_submit(mut self) -> Self {
+		self.submits = true;
+		self
+	}
+
+	/// Whether Enter-acceptance may also submit the completed input.
+	pub const fn submits(&self) -> bool {
+		self.submits
 	}
 
 	/// Returns the row category, when present.
@@ -1848,7 +1863,7 @@ impl Editor {
 				Key::Down => self.select_next(),
 				Key::PageUp => self.select_page(false),
 				Key::PageDown => self.select_page(true),
-				Key::Enter => self.accept_picker(),
+				Key::Enter => self.enter_picker(),
 				Key::Tab => self.tab_complete(),
 				_ => self.handle_without_picker(key),
 			};
@@ -2127,11 +2142,58 @@ impl Editor {
 	fn accept_picker(&mut self) -> EditOutcome {
 		let picker = self.picker.take().expect("picker presence was checked");
 		let suggestion = &picker.suggestions[picker.selected];
+		// Accepting an already-typed value is a no-op; re-querying would
+		// reopen the identical dropdown and trap Enter forever. Close the
+		// dropdown and let the next keypress act on the finished text.
+		if self.buffer.text()[picker.prefix_start..self.buffer.cursor()] == *suggestion.value {
+			let cursor = self.buffer.cursor();
+			self.hint = self
+				.completion
+				.as_mut()
+				.and_then(|completion| completion.hint(self.buffer.text(), cursor));
+			return EditOutcome::Changed;
+		}
 		self
 			.buffer
 			.replace_range(picker.prefix_start..self.buffer.cursor(), &suggestion.value);
 		self.refresh();
 		EditOutcome::Changed
+	}
+
+	/// pi's Enter rule while the dropdown is open: a command row accepted
+	/// with nothing before its token completes the command and submits in
+	/// one keypress; every other row is accepted in place.
+	fn enter_picker(&mut self) -> EditOutcome {
+		if self.picker_enter_submits() {
+			self.accept_for_submit();
+			return self.submit();
+		}
+		self.accept_picker()
+	}
+
+	/// Whether Enter with the open dropdown should submit: the selected row
+	/// is a command completion (see [`Suggestion::with_submit`]) and only
+	/// whitespace precedes its token.
+	pub fn picker_enter_submits(&self) -> bool {
+		self.picker.as_ref().is_some_and(|picker| {
+			picker.suggestions[picker.selected].submits
+				&& self.buffer.text()[..picker.prefix_start].trim().is_empty()
+		})
+	}
+
+	/// Applies the selected dropdown row and closes the dropdown without
+	/// re-querying, leaving the completed text in place for the host's
+	/// submit path (pi: Enter on a submitted slash command applies, then
+	/// submits).
+	pub fn accept_for_submit(&mut self) {
+		let Some(picker) = self.picker.take() else {
+			return;
+		};
+		let suggestion = &picker.suggestions[picker.selected];
+		self
+			.buffer
+			.replace_range(picker.prefix_start..self.buffer.cursor(), &suggestion.value);
+		self.hint = None;
 	}
 
 	/// Re-queries the completion engine (dropdown and ghost hint), falling
@@ -2363,11 +2425,6 @@ impl SlashCommands {
 		}
 		let prefix_start = line_start + line.len() - trimmed.len();
 		let query = body.to_ascii_lowercase();
-		if self.find(body).is_some_and(|command| {
-			command.args.is_empty() && command.dynamic_args.is_none() && command.hint.is_none()
-		}) {
-			return None;
-		}
 		let expand_skills = query.starts_with(SKILL_NAMESPACE);
 		let skill_count = self
 			.commands
@@ -2412,6 +2469,7 @@ impl SlashCommands {
 						hint:        command.hint.clone(),
 						category:    Some(sf!("Commands")),
 						match_spans: fuzzy_match_spans(selected_name, &query),
+						submits:     true,
 					},
 				));
 			}
@@ -2428,6 +2486,7 @@ impl SlashCommands {
 				hint:        None,
 				category:    Some(sf!("Commands")),
 				match_spans: fuzzy_match_spans(SKILL_NAMESPACE, &query),
+				submits:     false,
 			}));
 		}
 		ranked.sort_by_key(|(score, usage, _)| (Reverse(*score), Reverse(*usage)));
@@ -2464,22 +2523,27 @@ impl SlashCommands {
 		let prefix_start = cursor - partial.len();
 		let query = partial.to_ascii_lowercase();
 		let mut ranked: SmallVec<(u16, Suggestion), 8> = SmallVec::new();
-		for arg in command
+		for (arg, spaced) in command
 			.args
 			.iter()
-			.map(|arg| CommandArgument {
-				value:       arg.name.clone(),
-				description: arg.description.clone(),
-				usage:       arg.usage.clone(),
+			.map(|arg| {
+				(
+					CommandArgument {
+						value:       arg.name.clone(),
+						description: arg.description.clone(),
+						usage:       arg.usage.clone(),
+					},
+					true,
+				)
 			})
-			.chain(dynamic.into_vec())
-			.chain(paths)
+			.chain(dynamic.into_vec().into_iter().map(|arg| (arg, true)))
+			.chain(paths.into_iter().map(|arg| (arg, false)))
 		{
 			let score = command_score(&query, &arg.value.to_ascii_lowercase());
 			if score > 0 {
 				let hint = argument_inline_hint(&arg.value, partial, arg.usage.as_ref());
 				ranked.push((score, Suggestion {
-					value: if arg.usage.is_some() {
+					value: if spaced {
 						sf!("{} ", arg.value)
 					} else {
 						arg.value.clone()
@@ -2490,6 +2554,7 @@ impl SlashCommands {
 					hint,
 					category: Some(sf!("Arguments")),
 					match_spans: fuzzy_match_spans(&arg.value, &query),
+					submits: false,
 				}));
 			}
 		}
@@ -2673,6 +2738,7 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				hint:        None,
 				category:    Some(sf!("Emoji")),
 				match_spans: SmallVec::new(),
+				submits:     false,
 			});
 		}
 	}
@@ -2691,6 +2757,7 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 				hint:        None,
 				category:    Some(sf!("Emoji")),
 				match_spans: SmallVec::new(),
+				submits:     false,
 			});
 		}
 	}
@@ -2915,7 +2982,7 @@ mod tests {
 		let mut editor = editor();
 		type_text(&mut editor, "/");
 		assert_eq!(editor.handle_key(key(Key::Down)), EditOutcome::Changed);
-		assert_eq!(editor.handle_key(key(Key::Enter)), EditOutcome::Changed);
+		assert_eq!(editor.handle_key(key(Key::Tab)), EditOutcome::Changed);
 		assert_eq!(editor.text(), "/settings ");
 	}
 	#[test]
@@ -3006,13 +3073,38 @@ mod tests {
 	}
 
 	#[test]
-	fn exact_no_argument_command_submits_without_completion_acceptance() {
+	fn enter_submits_a_command_straight_from_the_name_picker() {
 		let mut editor = editor();
 		type_text(&mut editor, "/settings");
+		assert!(editor.picker().is_some());
+		assert_eq!(
+			editor.handle_key(key(Key::Enter)),
+			EditOutcome::Submitted("/settings ".to_owned())
+		);
+	}
+
+	#[test]
+	fn enter_submits_a_bare_command_that_takes_optional_arguments() {
+		let mut editor = editor();
+		type_text(&mut editor, "/security");
+		assert!(editor.picker().is_some());
+		assert_eq!(
+			editor.handle_key(key(Key::Enter)),
+			EditOutcome::Submitted("/security ".to_owned())
+		);
+	}
+
+	#[test]
+	fn exact_argument_enter_accepts_once_then_submits() {
+		let mut editor = editor();
+		type_text(&mut editor, "/security plan");
+		assert!(editor.picker().is_some());
+		assert_eq!(editor.handle_key(key(Key::Enter)), EditOutcome::Changed);
+		assert_eq!(editor.text(), "/security plan ");
 		assert!(editor.picker().is_none());
 		assert_eq!(
 			editor.handle_key(key(Key::Enter)),
-			EditOutcome::Submitted("/settings".to_owned())
+			EditOutcome::Submitted("/security plan ".to_owned())
 		);
 	}
 
@@ -3072,7 +3164,7 @@ mod tests {
 		let mut editor = editor();
 		type_text(&mut editor, "/sec");
 		assert_eq!(editor.inline_hint().as_deref(), Some("plan|import|compare"));
-		assert_eq!(editor.handle_key(key(Key::Enter)), EditOutcome::Changed);
+		assert_eq!(editor.handle_key(key(Key::Tab)), EditOutcome::Changed);
 		assert_eq!(editor.text(), "/security ");
 		// bare `/name ` ghosts the command usage, picker open or not
 		assert_eq!(editor.inline_hint().as_deref(), Some("plan|import|compare"));

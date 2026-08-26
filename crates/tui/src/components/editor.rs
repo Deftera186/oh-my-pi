@@ -1006,11 +1006,23 @@ impl Component for EditInput {
 			self.spelling.request_guesses(self.editor.text(), range);
 			return Flow::Consumed;
 		}
-		if key == Key::Enter && self.props.flag(Prop::Submit) && self.editor.picker().is_none() {
-			if !self.editor.text().trim().is_empty() {
+		if key == Key::Enter && self.props.flag(Prop::Submit) {
+			// pi: Enter on a command row with nothing before its token
+			// applies the completion and submits it in one keypress.
+			if self.editor.picker_enter_submits() {
+				self.editor.accept_for_submit();
+				self.refresh_keyword_spans();
+				if self.reconcile(ec.ctx) {
+					ec.request_layout();
+				}
 				return Flow::Event(UiEvent::Submit);
 			}
-			return Flow::Consumed;
+			if self.editor.picker().is_none() {
+				if !self.editor.text().trim().is_empty() {
+					return Flow::Event(UiEvent::Submit);
+				}
+				return Flow::Consumed;
+			}
 		}
 
 		if self.editor.picker().is_none()

@@ -106,7 +106,9 @@ const GATEWAY_LOGIN_MESSAGE: &str = "Provider login is unavailable through a rem
                                      `omp auth login <provider>` on the gateway host.";
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
-use omp_chat_ui::{host::RetainedChat, status_line::TokenRateMeter};
+#[cfg(feature = "gui")]
+use omp_chat_ui::host::RetainedChat;
+use omp_chat_ui::status_line::TokenRateMeter;
 use omp_collab::{
 	guest::{GuestInputDisposition, GuestInputError, GuestSessionRestore},
 	presence::CollabRole,
@@ -134,8 +136,10 @@ use omp_tui::components;
 use tokio::sync::watch::Receiver;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "gui")]
+use crate::gui;
 use crate::{
-	chat_cmd::ChatPresentation, git_tui::GitSession, gui, session_manager::PinStore,
+	chat_cmd::ChatPresentation, git_tui::GitSession, session_manager::PinStore,
 	theme_watcher::ThemeWatcher,
 };
 
@@ -2598,6 +2602,11 @@ where
 			(host_result.into_diagnostic(), bridge_result)
 		},
 		ChatPresentation::Gui => {
+			#[cfg(not(feature = "gui"))]
+			return Err(miette::miette!(
+				"native GUI support is not built; rerun with `--features gui`"
+			));
+			#[cfg(feature = "gui")]
 			let (host_result, bridge_result) = gui::run(
 				move |ctx| {
 					let chat = chat_scene(&chat_seed, ctx);
@@ -2605,6 +2614,7 @@ where
 				},
 				bridge,
 			);
+			#[cfg(feature = "gui")]
 			(Ok(host_result), bridge_result)
 		},
 	};
@@ -6350,9 +6360,18 @@ where
 				roster: roster.clone(),
 				state,
 			};
-			let dispatch = roster
+			// A failed slash command (bad arguments, handler error) renders
+			// in-chat like pi; it never tears down the interactive shell.
+			let dispatch = match roster
 				.dispatch(&text, CommandSurface::Tui, &mut command_host)
-				.await?;
+				.await
+			{
+				Ok(dispatch) => dispatch,
+				Err(error) => {
+					send_backend(backend, BackendEvent::Error(sf!("{error}")));
+					return Ok(false);
+				},
+			};
 			let text = match dispatch {
 				DispatchResult::Passthrough(text) => text.to_string(),
 				DispatchResult::Handled(CommandResult::Prompt(prompt)) => prompt.text.to_string(),
