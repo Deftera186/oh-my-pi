@@ -630,7 +630,7 @@ mod tests {
 			expand(quote! { <text max-chars=80 sep=", ">{x}</text> }).expect("example should expand");
 		let expected = quote! {
 			::omp_tui::components::TextLeaf::new()
-				.with(::omp_tui::Prop::MaxChars, 80)
+				.with(::omp_tui::Prop::MaxChars, "80")
 				.with(::omp_tui::Prop::Sep, ", ")
 				.text(x)
 		};
