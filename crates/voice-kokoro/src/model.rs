@@ -83,7 +83,7 @@ impl KModel {
 	///   adds [0, ..., 0])
 	/// * `ref_s` - reference style tensor [1, 256] (first 128 = acoustic style,
 	///   last 128 = prosody style)
-	/// * `speed` - speed factor (1.0 = normal)
+	/// * `speed` - finite, positive speed factor (1.0 = normal)
 	///
 	/// Returns: audio waveform tensor [samples]
 	pub fn forward(
@@ -99,7 +99,8 @@ impl KModel {
 	/// Run inference with explicit synthesis-mode control.
 	///
 	/// Deterministic mode removes the decoder's random harmonic phase and noise
-	/// sources, making output reproducible on CPU and GPU backends.
+	/// sources, making output reproducible on CPU and GPU backends. `speed` must
+	/// be finite and greater than zero.
 	pub fn forward_with_mode(
 		&self,
 		input_ids: &[i64],
@@ -108,6 +109,8 @@ impl KModel {
 		device: &Device,
 		mode: SynthesisMode,
 	) -> Result<Tensor> {
+		validate_speed(speed)?;
+
 		// Pad with BOS=0 and EOS=0
 		let mut padded = Vec::with_capacity(input_ids.len() + 2);
 		padded.push(0i64);
@@ -184,7 +187,7 @@ impl KModel {
 			.map(|&v| v.max(1.0) as i64)
 			.collect();
 		let pred_dur_vec = normalize_boundary_token_durations(pred_dur_vec);
-		let total_frames: usize = pred_dur_vec.iter().sum::<i64>() as usize;
+		let total_frames = total_duration_frames(&pred_dur_vec)?;
 
 		// Build alignment rows on GPU: each row is [0..0, 1..1, 0..0]
 		let mut rows: Vec<Tensor> = Vec::with_capacity(seq_len);
@@ -250,6 +253,31 @@ fn validate_context_length(seq_len: usize, context_length: usize) -> Result<()> 
 	}
 	Ok(())
 }
+fn validate_speed(speed: f32) -> Result<()> {
+	if !speed.is_finite() || speed <= 0.0 {
+		return Err(Error::Msg(format!("speed must be finite and greater than zero, got {speed}")));
+	}
+	Ok(())
+}
+
+const MAX_TOTAL_DURATION_FRAMES: usize = 65_536;
+
+fn total_duration_frames(durations: &[i64]) -> Result<usize> {
+	let mut total = 0_usize;
+	for &duration in durations {
+		let duration = usize::try_from(duration)
+			.map_err(|_| Error::Msg(format!("predicted a negative duration: {duration}")))?;
+		total = total
+			.checked_add(duration)
+			.ok_or_else(|| Error::Msg("predicted duration frame sum overflowed".to_owned()))?;
+		if total > MAX_TOTAL_DURATION_FRAMES {
+			return Err(Error::Msg(format!(
+				"predicted duration exceeds {MAX_TOTAL_DURATION_FRAMES} frames"
+			)));
+		}
+	}
+	Ok(total)
+}
 
 const MAX_BOS_DURATION_FRAMES: i64 = 16;
 
@@ -270,7 +298,8 @@ fn normalize_boundary_token_durations(mut durations: Vec<i64>) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		MAX_BOS_DURATION_FRAMES, normalize_boundary_token_durations, validate_context_length,
+		MAX_BOS_DURATION_FRAMES, MAX_TOTAL_DURATION_FRAMES, normalize_boundary_token_durations,
+		total_duration_frames, validate_context_length, validate_speed,
 	};
 
 	#[test]
@@ -282,6 +311,24 @@ mod tests {
 	fn context_length_rejects_overlong_input() {
 		let err = validate_context_length(511, 510).unwrap_err();
 		assert!(err.to_string().contains("Input too long: 511 > 510"));
+	}
+	#[test]
+	fn speed_must_be_finite_and_positive() {
+		assert!(validate_speed(1.0).is_ok());
+		for speed in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+			assert!(validate_speed(speed).is_err(), "accepted speed {speed}");
+		}
+	}
+
+	#[test]
+	fn duration_frame_sum_checks_sign_overflow_and_capacity_boundary() {
+		assert_eq!(
+			total_duration_frames(&[MAX_TOTAL_DURATION_FRAMES as i64]).unwrap(),
+			MAX_TOTAL_DURATION_FRAMES
+		);
+		assert!(total_duration_frames(&[-1]).is_err());
+		assert!(total_duration_frames(&[MAX_TOTAL_DURATION_FRAMES as i64, 1]).is_err());
+		assert!(total_duration_frames(&[i64::MAX, i64::MAX]).is_err());
 	}
 
 	#[test]

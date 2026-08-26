@@ -156,13 +156,14 @@ impl StreamEndpointer {
 			self.noise_floor = self.noise_floor * (1.0 - attack) + energy * attack;
 		}
 		if !self.in_speech {
-			self.pre_roll.extend_from_slice(frame);
-			if self.pre_roll.len() > self.pre_roll_samples {
-				let drop = self.pre_roll.len() - self.pre_roll_samples;
-				self.pre_roll.drain(..drop);
-			}
 			if voiced {
 				self.begin_segment(frame);
+			} else {
+				self.pre_roll.extend_from_slice(frame);
+				if self.pre_roll.len() > self.pre_roll_samples {
+					let drop = self.pre_roll.len() - self.pre_roll_samples;
+					self.pre_roll.drain(..drop);
+				}
 			}
 			return;
 		}
@@ -249,4 +250,32 @@ fn rms(frame: &[f32]) -> f32 {
 		.map(|sample| f64::from(*sample) * f64::from(*sample))
 		.sum::<f64>();
 	(sum / frame.len() as f64).sqrt() as f32
+}
+#[cfg(test)]
+mod tests {
+	use super::{EndpointerConfig, EndpointerEvent, StreamEndpointer};
+
+	#[test]
+	fn speech_onset_frame_is_emitted_once_after_pre_roll() {
+		let config = EndpointerConfig {
+			sample_rate: 1_000,
+			frame_ms: 10,
+			end_silence_ms: 10,
+			min_speech_ms: 10,
+			pre_roll_ms: 20,
+			..EndpointerConfig::default()
+		};
+		let mut endpointer = StreamEndpointer::new(config);
+		assert!(endpointer.push(&[0.0; 10]).is_empty());
+		assert!(endpointer.push(&[0.0; 10]).is_empty());
+		assert!(endpointer.push(&[1.0; 10]).is_empty());
+		let events = endpointer.push(&[0.0; 10]);
+		let [EndpointerEvent::Segment(segment)] = events.as_slice() else {
+			panic!("expected one finalized segment");
+		};
+		assert_eq!(segment.len(), 40);
+		assert_eq!(&segment[..20], &[0.0; 20]);
+		assert_eq!(&segment[20..30], &[1.0; 10]);
+		assert_eq!(&segment[30..], &[0.0; 10]);
+	}
 }
