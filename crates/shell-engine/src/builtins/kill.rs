@@ -3,6 +3,7 @@
 use std::{io::Write, result};
 
 use clap::Parser;
+use smallvec::SmallVec;
 
 #[cfg(windows)]
 use crate::processes::{process_handle_is_running, terminate_process_handle};
@@ -131,6 +132,13 @@ impl builtins::Command for KillCommand {
 			return Ok(ExecutionExitCode::InvalidUsage.into());
 		}
 
+		let protected = matches!(signal, KillSignal::Signal(_)).then(ProtectedProcesses::resolve);
+		let blocks = |target| {
+			protected
+				.as_ref()
+				.is_some_and(|protected| protected.blocks_target(target))
+		};
+
 		#[cfg(unix)]
 		let exists = |target: i32| {
 			// SAFETY: signal 0 only checks target existence and permission.
@@ -170,6 +178,16 @@ impl builtins::Command for KillCommand {
 					}
 					targets.sort_unstable();
 					targets.dedup();
+					if targets.iter().copied().any(&blocks) {
+						writeln!(
+							context.stderr(),
+							"{}: {}: refusing to signal the shell process",
+							context.command_name,
+							operand
+						)?;
+						had_failure = true;
+						continue;
+					}
 					let succeeded = match signal {
 						KillSignal::Probe => targets.iter().copied().any(&exists),
 						KillSignal::Signal(signal) => {
@@ -227,6 +245,16 @@ impl builtins::Command for KillCommand {
 					continue;
 				},
 			};
+			if blocks(pid) {
+				writeln!(
+					context.stderr(),
+					"{}: {}: refusing to signal the shell process",
+					context.command_name,
+					operand
+				)?;
+				had_failure = true;
+				continue;
+			}
 			match signal {
 				KillSignal::Probe => {
 					if !exists(pid) {
@@ -303,6 +331,85 @@ fn split_attached(arg: &str) -> Option<(String, String)> {
 		_ => false,
 	};
 	split.then(|| (arg[..2].to_string(), rest.to_string()))
+}
+struct ProtectedProcesses {
+	pids:  SmallVec<i32, 16>,
+	pgids: SmallVec<i32, 16>,
+}
+
+impl ProtectedProcesses {
+	fn blocks_target(&self, target: i32) -> bool {
+		if target == 0 || target == -1 {
+			return true;
+		}
+		match target.checked_neg() {
+			Some(pgid) if pgid > 0 => self.pgids.contains(&pgid),
+			_ => self.pids.contains(&target),
+		}
+	}
+
+	#[cfg(unix)]
+	fn resolve() -> Self {
+		let self_pid = unsafe { libc::getpid() };
+		let mut protected = Self { pids: SmallVec::new(), pgids: SmallVec::new() };
+		let mut pid = self_pid;
+		while pid > 0 && !protected.pids.contains(&pid) {
+			protected.pids.push(pid);
+			let Some((parent, pgid)) = process_parent_and_group(pid) else {
+				if pid == self_pid {
+					let pgid = unsafe { libc::getpgid(pid) };
+					if pgid > 0 && !protected.pgids.contains(&pgid) {
+						protected.pgids.push(pgid);
+					}
+				}
+				break;
+			};
+			if pgid > 0 && !protected.pgids.contains(&pgid) {
+				protected.pgids.push(pgid);
+			}
+			pid = parent;
+		}
+		protected
+	}
+
+	#[cfg(windows)]
+	fn resolve() -> Self {
+		let pid = i32::try_from(std::process::id()).ok();
+		Self { pids: pid.into_iter().collect(), pgids: SmallVec::new() }
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_and_group(pid: i32) -> Option<(i32, i32)> {
+	let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+	let fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+	let mut fields = fields.skip(1);
+	let parent = fields.next()?.parse().ok()?;
+	let group = fields.next()?.parse().ok()?;
+	Some((parent, group))
+}
+
+#[cfg(target_os = "macos")]
+fn process_parent_and_group(pid: i32) -> Option<(i32, i32)> {
+	let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+	let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+	let read =
+		unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+	if read != size {
+		return None;
+	}
+	let info = unsafe { info.assume_init() };
+	Some((i32::try_from(info.pbi_ppid).ok()?, i32::try_from(info.pbi_pgid).ok()?))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_parent_and_group(pid: i32) -> Option<(i32, i32)> {
+	if pid != unsafe { libc::getpid() } {
+		return None;
+	}
+	let parent = unsafe { libc::getppid() };
+	let group = unsafe { libc::getpgid(pid) };
+	Some((parent, group))
 }
 
 #[cfg(windows)]
@@ -484,6 +591,19 @@ mod tests {
 		assert!(matches!(printed_signal("129"), Ok(PrintedSignal::Name("HUP"))));
 		assert!(printed_signal("128").is_err());
 		assert!(printed_signal("265").is_err());
+	}
+	#[test]
+	fn protected_processes_cover_special_pid_ancestor_and_group_targets() {
+		let protected = ProtectedProcesses {
+			pids:  SmallVec::from_slice_copy(&[100, 50, 1]),
+			pgids: SmallVec::from_slice_copy(&[100, 40]),
+		};
+		assert!(protected.blocks_target(0));
+		assert!(protected.blocks_target(-1));
+		assert!(protected.blocks_target(50));
+		assert!(protected.blocks_target(-40));
+		assert!(!protected.blocks_target(200));
+		assert!(!protected.blocks_target(-200));
 	}
 }
 

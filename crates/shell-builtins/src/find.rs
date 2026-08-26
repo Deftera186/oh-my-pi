@@ -2243,7 +2243,7 @@ pub mod matchers {
 				}
 			}
 
-			fn parse_format_width(&mut self) -> Option<usize> {
+			fn parse_format_width(&mut self) -> Result<Option<usize>, Box<dyn Error>> {
 				let start = self.string;
 				let mut digits = 0;
 
@@ -2254,11 +2254,12 @@ pub mod matchers {
 				}
 
 				if digits > 0 {
-					// safe to unwrap: we already know all the digits are valid due to
-					// the above checks.
-					Some((start[0..digits]).parse().unwrap())
+					start[0..digits]
+						.parse()
+						.map(Some)
+						.map_err(|error| format!("invalid format width: {error}").into())
 				} else {
-					None
+					Ok(None)
 				}
 			}
 
@@ -2295,7 +2296,7 @@ pub mod matchers {
 					self.advance_one().unwrap();
 				}
 
-				let width = self.parse_format_width();
+				let width = self.parse_format_width()?;
 
 				let first = self.advance_one()?;
 				if first == '%' {
@@ -2664,6 +2665,15 @@ pub mod matchers {
 
 			fn has_side_effects(&self) -> bool {
 				true
+			}
+		}
+		#[cfg(test)]
+		mod tests {
+			use super::Printf;
+
+			#[test]
+			fn oversized_user_format_width_returns_an_error() {
+				assert!(Printf::new("%999999999999999999999999999999p", None).is_err());
 			}
 		}
 	}

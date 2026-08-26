@@ -1,12 +1,15 @@
 //! Facilities for implementing and managing builtins
 
 mod alias;
+mod bg;
+mod bind;
 mod break_;
 mod builtin_;
 mod caller;
 mod cd;
 mod colon;
 mod command;
+mod complete;
 mod continue_;
 mod declare;
 mod dirs;
@@ -21,9 +24,12 @@ mod exit;
 mod export;
 mod factory;
 mod false_;
+mod fc;
+mod fg;
 mod getopts;
 mod hash;
 mod help;
+mod history;
 mod jobs;
 #[cfg(any(unix, windows))]
 mod kill;
@@ -41,6 +47,8 @@ mod return_;
 mod set;
 mod shift;
 mod shopt;
+#[cfg(unix)]
+mod suspend;
 pub(crate) mod terminal;
 mod test;
 mod times;

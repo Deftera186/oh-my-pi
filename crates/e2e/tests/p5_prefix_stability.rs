@@ -57,7 +57,7 @@ use omp_tool::{
 use parking_lot::Mutex;
 
 const MODEL: &str = "apple-intelligence/apple-intelligence";
-const ROUTE: &str = "route-15d4d866935964367e95fddfe4b98065053b172594f9334bdbe6e6cca7123886";
+const ROUTE: &str = "apple-intelligence/primary";
 const BODY_LIMIT: usize = 1024 * 1024;
 
 fn canonical_turn_id() -> TurnId {
@@ -219,15 +219,16 @@ fn catalog() -> Arc<Catalog> {
 	let mut value: serde_json::Value =
 		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
 			.expect("normalized catalog JSON");
-	let model = value["models"]
-		.as_array_mut()
-		.expect("models array")
-		.iter_mut()
-		.find(|model| model["key"] == MODEL)
-		.expect("offline local model");
+	let models = value["models"].as_array_mut().expect("models array");
+	let mut model = models.first().cloned().expect("catalog model fixture");
+	model["key"] = serde_json::json!(MODEL);
+	model["display_name"] = serde_json::json!("Offline Apple Intelligence");
+	model["routes"] = serde_json::json!([ROUTE]);
+	model["wire_ids"] = serde_json::json!([[ROUTE, "apple-intelligence"]]);
 	model["capabilities"]["chat"]["tools"] = serde_json::json!({
 		"native": { "features": 0, "maximum_tools": null }
 	});
+	models.push(model);
 	let compiled: CompiledCatalog = serde_json::from_value(value).expect("modified test catalog");
 	let artifacts = Catalog::encode(compiled, SnapshotProvenance { source_digest: [0; 32] })
 		.expect("encode test catalog");

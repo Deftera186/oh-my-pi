@@ -554,15 +554,17 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	fs::set_permissions(scratch.state(), fs::Permissions::from_mode(0o700))
 		.expect("secure binary-resume daemon state");
 	let journal_path = sessions.join(format!("{BINARY_SESSION}.jsonl"));
-	drop(
-		Journal::create(&journal_path, &Header {
-			v:       4,
-			id:      SessionId(Str::from(BINARY_SESSION)),
-			created: 1,
-			cwd:     project.clone(),
-		})
-		.expect("create resumable binary journal"),
-	);
+	let mut initial = Journal::create(&journal_path, &Header {
+		v:       4,
+		id:      SessionId(Str::from(BINARY_SESSION)),
+		created: 1,
+		cwd:     project.clone(),
+	})
+	.expect("create resumable binary journal");
+	initial
+		.append_title(1, sf!("binary resume"), transcript::TitleSource::System)
+		.expect("materialize resumable binary journal");
+	drop(initial);
 	fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o644))
 		.expect("use standard binary journal permissions");
 
@@ -638,7 +640,7 @@ fn binary_gateway_tools() -> Arc<Registry> {
 	for name in [
 		"read",
 		"edit",
-		"shell",
+		"bash",
 		"grep",
 		"glob",
 		"write",

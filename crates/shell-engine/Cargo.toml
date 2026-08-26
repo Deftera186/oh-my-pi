@@ -15,6 +15,7 @@ workspace = true
 async-recursion = { workspace = true }
 bon = { workspace = true }
 clap = { workspace = true }
+chrono = "0.4.45"
 fancy-regex = { workspace = true }
 futures = { workspace = true }
 im = { workspace = true }
@@ -28,6 +29,7 @@ peg = { workspace = true }
 rand = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -45,6 +47,7 @@ nix = { workspace = true, features = ["hostname"] }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 serde = { workspace = true }

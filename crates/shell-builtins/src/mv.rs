@@ -20,11 +20,11 @@ use std::{
 
 use clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, error::ErrorKind};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
-use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
-use parking_lot::Mutex;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "redox"))))]
 use omp_core::FastHashMap;
 use omp_core::{FastHashSet, FastState};
+use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
+use parking_lot::Mutex;
 use thiserror::Error;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation;
@@ -1228,7 +1228,8 @@ fn rename_dir_fallback(
 	};
 
 	#[cfg(all(unix, not(any(target_os = "macos", target_os = "redox"))))]
-	let xattrs = fsxattr::retrieve_xattrs(host.resolve(from)).unwrap_or_else(|_| FastHashMap::default());
+	let xattrs =
+		fsxattr::retrieve_xattrs(host.resolve(from)).unwrap_or_else(|_| FastHashMap::default());
 
 	// Use directory copying (with or without hardlink support)
 	let result = copy_dir_contents(

@@ -24,10 +24,10 @@ use clap::{
 #[cfg(unix)]
 use libc::{S_IXGRP, S_IXOTH, S_IXUSR};
 use lscolors::Colorable;
-use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 #[cfg(unix)]
 use omp_core::FastHashMap;
 use omp_core::FastHashSet;
+use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use thiserror::Error;
 
 use crate::{

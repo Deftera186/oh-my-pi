@@ -281,10 +281,11 @@ impl Display for FormatCallStack<'_> {
 /// Encapsulates a script call stack.
 #[derive(Clone, Debug, Default)]
 pub struct CallStack {
-	frames:              VecDeque<Frame>,
-	func_call_depth:     usize,
+	frames: VecDeque<Frame>,
+	func_call_depth: usize,
 	script_source_depth: usize,
 	active_trap_signals: HashSet<traps::TrapSignal>,
+	trap_delivery_suppress_count: usize,
 }
 
 impl CallStack {
@@ -597,6 +598,21 @@ impl CallStack {
 	/// independent of the parent shell's currently-executing traps.
 	pub fn clear_active_trap_signals(&mut self) {
 		self.active_trap_signals.clear();
+	}
+
+	/// Returns whether asynchronous trap delivery is temporarily suppressed.
+	pub const fn is_trap_delivery_suppressed(&self) -> bool {
+		self.trap_delivery_suppress_count > 0
+	}
+
+	/// Acquires a nested trap-delivery suppression block.
+	pub const fn acquire_trap_delivery_block(&mut self) {
+		self.trap_delivery_suppress_count += 1;
+	}
+
+	/// Releases one nested trap-delivery suppression block.
+	pub const fn release_trap_delivery_block(&mut self) {
+		self.trap_delivery_suppress_count = self.trap_delivery_suppress_count.saturating_sub(1);
 	}
 
 	/// Returns whether or not the shell is actively executing in a shell

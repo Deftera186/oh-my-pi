@@ -426,6 +426,16 @@ pub(crate) async fn full_expand_and_split_word(
 	let mut expander = WordExpander::new(shell, params);
 	expander.full_expand_with_splitting(word_str.as_ref()).await
 }
+/// Fully expands and field-splits a word using explicit expansion options.
+pub(crate) async fn full_expand_and_split_word_with_options(
+	shell: &mut Shell<impl extensions::ShellExtensions>,
+	params: &ExecutionParameters,
+	word_str: impl AsRef<str>,
+	options: &ExpanderOptions,
+) -> Result<Vec<String>, error::Error> {
+	let mut expander = WordExpander::new_from_options(shell, params, options);
+	expander.full_expand_with_splitting(word_str.as_ref()).await
+}
 
 /// Expands a word in assignment context (enables tilde-after-colon expansion).
 ///

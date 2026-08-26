@@ -62,6 +62,17 @@ pub enum WordParseError {
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct TestCommandParseError(#[from] peg::error::ParseError<usize>);
+/// Error produced while parsing a readline key-binding specification.
+#[derive(Debug, thiserror::Error)]
+pub enum BindingParseError {
+	/// The binding could not be parsed.
+	#[error("unknown error while parsing key-binding: '{0}'")]
+	Unknown(String),
+
+	/// A key code was missing from the binding.
+	#[error("missing key code in binding")]
+	MissingKeyCode,
+}
 
 pub(crate) fn convert_peg_parse_error(
 	err: &peg::error::ParseError<usize>,

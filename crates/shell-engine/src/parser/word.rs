@@ -665,10 +665,11 @@ peg::parser! {
 					 BraceExpressionMember::CharSequence { start, end, increment: increment.unwrap_or(1) }
 				}
 
-		  rule number() -> i64 = sign:number_sign()? n:$(['0'..='9']+) {
+		  rule number() -> i64 = sign:number_sign()? n:$(['0'..='9']+) {?
 				let sign = sign.unwrap_or(1);
-				let num: i64 = n.parse().unwrap();
-				num * sign
+				n.parse::<i64>()
+					 .map(|num| num * sign)
+					 .map_err(|_| "brace sequence number out of range")
 		  }
 
 		  rule number_sign() -> i64 =
@@ -868,9 +869,17 @@ peg::parser! {
 		  rule tilde_expression() -> TildeExpr =
 				&tilde_terminator() { TildeExpr::Home } /
 				"+" &tilde_terminator() { TildeExpr::WorkingDir } /
-				plus:("+"?) n:$(['0'..='9']*) &tilde_terminator() { TildeExpr::NthDirFromTopOfDirStack { n: n.parse().unwrap(), plus_used: plus.is_some() } } /
+				plus:("+"?) n:$(['0'..='9']+) &tilde_terminator() {?
+					 n.parse::<usize>()
+						  .map(|n| TildeExpr::NthDirFromTopOfDirStack { n, plus_used: plus.is_some() })
+						  .map_err(|_| "directory stack index out of range")
+				} /
 				"-" &tilde_terminator() { TildeExpr::OldWorkingDir } /
-				"-" n:$(['0'..='9']*) &tilde_terminator() { TildeExpr::NthDirFromBottomOfDirStack { n: n.parse().unwrap() } } /
+				"-" n:$(['0'..='9']+) &tilde_terminator() {?
+					 n.parse::<usize>()
+						  .map(|n| TildeExpr::NthDirFromBottomOfDirStack { n })
+						  .map_err(|_| "directory stack index out of range")
+				} /
 				user:$(portable_filename_char()*) &tilde_terminator() { TildeExpr::UserHome(user.to_owned()) }
 
 		  rule tilde_terminator() = ['/' | ':' | ';' | '}'] / ![_]
@@ -1334,6 +1343,23 @@ mod tests {
 		}
 
 		Ok(())
+	}
+	#[test]
+	fn oversized_numeric_word_syntax_returns_errors_instead_of_panicking() {
+		let options = ParserOptions::default();
+		let brace =
+			super::parse_brace_expansions("{999999999999999999999999999999999999..1}", &options);
+		assert!(brace.is_err() || matches!(brace, Ok(None)));
+		for input in
+			["~+999999999999999999999999999999999999", "~-999999999999999999999999999999999999"]
+		{
+			if let Ok(pieces) = parse(input, &options) {
+				assert!(matches!(
+					pieces.first().map(|piece| &piece.piece),
+					Some(WordPiece::TildeExpansion(TildeExpr::UserHome(_)))
+				));
+			}
+		}
 	}
 
 	#[test]

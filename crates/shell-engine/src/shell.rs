@@ -4,14 +4,19 @@ use std::{
 	borrow::Cow,
 	env::current_dir,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use im::HashMap;
+use tokio::sync::Mutex;
 
 use crate::{
 	ExecutionControlFlow, ExecutionResult, builtins, env::ShellEnvironment, error, extensions,
 	functions, jobs, keywords, openfiles, options::RuntimeOptions, pathcache, wellknownvars,
 };
+
+/// Shared key-binding backend used by interactive shell hosts.
+pub type KeyBindingsHelper = Arc<Mutex<dyn crate::interfaces::KeyBindings>>;
 
 /// Type alias for shell file descriptors.
 pub type ShellFd = i32;
@@ -26,11 +31,13 @@ pub type ShellFd = i32;
 mod builder;
 mod builtin_registry;
 mod callstack;
+mod completion;
 mod env;
 mod execution;
 mod expansion;
 mod fs;
 mod funcs;
+mod history;
 mod initscripts;
 mod io;
 mod parsing;
@@ -119,6 +126,9 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 	/// Directory stack used by pushd et al.
 	directory_stack: Vec<PathBuf>,
 
+	/// Programmable completion configuration.
+	completion_config: crate::completion::Config,
+
 	/// Shell built-in commands.
 	builtins: HashMap<String, builtins::Registration<SE>>,
 
@@ -132,7 +142,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 	last_stopwatch_offset: u32,
 
 	/// Parser implementation to use.
-	parser_impl: ParserImpl,
+	parser_impl:  ParserImpl,
+	/// Interactive input key bindings, when supplied by the host.
+	key_bindings: Option<KeyBindingsHelper>,
+
+	/// Command history, when history is enabled.
+	history: Option<crate::history::History>,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -163,13 +178,22 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
 				cs
 			},
 			directory_stack: self.directory_stack.clone(),
+			completion_config: self.completion_config.clone(),
 			builtins: self.builtins.clone(),
 			program_location_cache: self.program_location_cache.clone(),
 			last_stopwatch_time: self.last_stopwatch_time,
 			last_stopwatch_offset: self.last_stopwatch_offset,
 			parser_impl: self.parser_impl,
+			key_bindings: self.key_bindings.clone(),
+			history: self.history.clone(),
 			depth: self.depth + 1,
 		}
+	}
+}
+
+impl<SE: extensions::ShellExtensions> Drop for Shell<SE> {
+	fn drop(&mut self) {
+		self.jobs.abort_internal_tasks();
 	}
 }
 
@@ -196,20 +220,20 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 		// Compute runtime options before moving fields out of `options`.
 		let runtime_options = RuntimeOptions::defaults_from(&options);
 
-		// Instantiate the shell with some defaults.
-		let mut shell = Self {
-			error_formatter: options.error_formatter,
-			open_files: openfiles::OpenFiles::new(),
-			options: runtime_options,
-			name: options.shell_name,
-			args: options.shell_args.unwrap_or_default(),
-			version: options.shell_version,
-			product_display_str: options.shell_product_display_str,
-			working_dir: options.working_dir.map_or_else(current_dir, Ok)?,
-			builtins: options.builtins,
-			parser_impl: options.parser,
-			..Self::default()
-		};
+		// Instantiate the shell with defaults, then replace configured fields.
+		// Field update syntax cannot move from a type that owns a Drop implementation.
+		let mut shell = Self::default();
+		shell.error_formatter = options.error_formatter;
+		shell.open_files = openfiles::OpenFiles::new();
+		shell.options = runtime_options;
+		shell.name = options.shell_name;
+		shell.args = options.shell_args.unwrap_or_default();
+		shell.version = options.shell_version;
+		shell.product_display_str = options.shell_product_display_str;
+		shell.working_dir = options.working_dir.map_or_else(current_dir, Ok)?;
+		shell.builtins = options.builtins;
+		shell.parser_impl = options.parser;
+		shell.key_bindings = options.key_bindings;
 
 		// Add in any open files provided.
 		shell.open_files.update_from(options.fds.into_iter());
@@ -231,6 +255,13 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 		// Set any provided variables.
 		for (var_name, var_value) in options.vars {
 			shell.env.set_global(var_name, var_value)?;
+		}
+
+		if shell.options.enable_command_history {
+			shell.history = shell
+				.load_history()
+				.unwrap_or_default()
+				.or_else(|| Some(crate::history::History::default()));
 		}
 
 		Ok(shell)
@@ -299,6 +330,15 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 			&& result.is_normal_flow()
 		{
 			result.next_control_flow = ExecutionControlFlow::ExitShell;
+		}
+	}
+
+	/// Returns the keywords reserved by the current shell mode.
+	pub(crate) fn get_keywords(&self) -> Vec<&str> {
+		if self.options.sh_mode {
+			keywords::SH_MODE_KEYWORDS.iter().copied().collect()
+		} else {
+			keywords::KEYWORDS.iter().copied().collect()
 		}
 	}
 
@@ -417,6 +457,16 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 		&mut self.program_location_cache
 	}
 
+	/// Returns the programmable completion configuration.
+	pub fn completion_config(&self) -> &crate::completion::Config {
+		&self.completion_config
+	}
+
+	/// Returns the mutable programmable completion configuration.
+	pub fn completion_config_mut(&mut self) -> &mut crate::completion::Config {
+		&mut self.completion_config
+	}
+
 	/// Returns the shell's open files.
 	pub fn open_files(&self) -> &openfiles::OpenFiles {
 		&self.open_files
@@ -449,6 +499,21 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Returns the call stack for the shell.
 	pub fn call_stack(&self) -> &CallStack {
 		&self.call_stack
+	}
+
+	/// Returns command history when it is enabled.
+	pub fn history(&self) -> Option<&crate::history::History> {
+		self.history.as_ref()
+	}
+
+	/// Returns mutable command history when it is enabled.
+	pub fn history_mut(&mut self) -> Option<&mut crate::history::History> {
+		self.history.as_mut()
+	}
+
+	/// Returns the interactive key-binding backend when configured.
+	pub fn key_bindings(&self) -> Option<&KeyBindingsHelper> {
+		self.key_bindings.as_ref()
 	}
 
 	/// Returns the shell's official version string (if available).
@@ -603,5 +668,82 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 
 	fn product_display_str(&self) -> Option<&str> {
 		Shell::product_display_str(self)
+	}
+}
+#[cfg(test)]
+mod lifecycle_tests {
+	use std::{
+		future,
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		},
+		time::Duration,
+	};
+
+	use super::Shell;
+	use crate::{
+		ExecutionResult, SourceInfo,
+		builtins::default_builtins,
+		jobs::{Job, JobState, JobTask},
+	};
+
+	struct MarksDrop(Arc<AtomicBool>);
+
+	impl Drop for MarksDrop {
+		fn drop(&mut self) {
+			self.0.store(true, Ordering::SeqCst);
+		}
+	}
+
+	fn shell_with_pending_job(dropped: Arc<AtomicBool>) -> Shell {
+		let mut shell = Shell::default();
+		let handle = tokio::spawn(async move {
+			let _guard = MarksDrop(dropped);
+			future::pending::<()>().await;
+			Ok(ExecutionResult::success())
+		});
+		shell.jobs.add_as_current(Job::new(
+			[JobTask::Internal(handle)],
+			"pending".into(),
+			JobState::Running,
+		));
+		shell
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn dropping_shell_aborts_internal_jobs() {
+		let dropped = Arc::new(AtomicBool::new(false));
+		let shell = shell_with_pending_job(Arc::clone(&dropped));
+		tokio::task::yield_now().await;
+		drop(shell);
+		tokio::task::yield_now().await;
+		assert!(dropped.load(Ordering::SeqCst));
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn explicit_exit_aborts_internal_jobs() {
+		let dropped = Arc::new(AtomicBool::new(false));
+		let mut shell = shell_with_pending_job(Arc::clone(&dropped));
+		tokio::task::yield_now().await;
+		shell.on_exit().await.unwrap();
+		tokio::task::yield_now().await;
+		assert!(dropped.load(Ordering::SeqCst));
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn builtin_pipeline_does_not_block_current_thread_runtime() {
+		let mut shell: Shell<crate::extensions::DefaultShellExtensions> = Shell::default();
+		shell.builtins = default_builtins();
+		let input = format!("printf %s {} | mapfile values", "x".repeat(256 * 1024));
+		let params = shell.default_exec_params();
+		let result = tokio::time::timeout(
+			Duration::from_secs(5),
+			shell.run_string(input, &SourceInfo::from("(pipeline test)"), &params),
+		)
+		.await
+		.expect("builtin pipeline must not deadlock")
+		.unwrap();
+		assert!(result.is_success());
 	}
 }

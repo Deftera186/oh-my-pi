@@ -45,7 +45,6 @@ omp-core = { workspace = true }
 omp-docserver = { workspace = true }
 omp-env = { workspace = true }
 omp-envd = { workspace = true }
-omp-executor = { workspace = true }
 omp-ext = { workspace = true }
 omp-hashline = { workspace = true }
 omp-catalog = { workspace = true }

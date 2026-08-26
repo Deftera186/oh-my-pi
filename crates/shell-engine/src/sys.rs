@@ -25,4 +25,4 @@ pub mod fs;
 pub use platform::{
 	PlatformError, async_pipe, commands, fd, poll, process, resource, signal, terminal,
 };
-pub(crate) use platform::{env, network, users};
+pub(crate) use platform::{env, input, network, users};

@@ -33,6 +33,7 @@ use omp_envd::{
 	},
 	worker::{ExtHostConfig, ExtHostSpec, HostKey},
 };
+use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use omp_proto::{
 	SCHEMA_REV,
 	env::v1::{
@@ -134,7 +135,24 @@ fn test_config() -> ExtHostConfig {
 }
 
 fn test_manifest(key: &HostKey) -> ExtensionManifest {
-	ExtensionManifest::new(
+	let tools = [
+		ToolDeclarationKey::new("matrix_block", "py", 1),
+		ToolDeclarationKey::new("matrix_echo", "py", 1),
+	];
+	let ordered = tools
+		.iter()
+		.map(|tool| StaticDeclaration {
+			id: sf!("{}@{}.{}", tool.name, tool.family, tool.rev),
+			kind: sf!("soft"),
+			module: sf!("cancel_matrix_tools"),
+			trigger: sf!("lazy"),
+			key: sf!("{}@{}.{}", tool.name, tool.family, tool.rev),
+			api: 1,
+			failure: sf!("fault"),
+			..StaticDeclaration::default()
+		})
+		.collect::<Vec<_>>();
+	ExtensionManifest::new_with_static(
 		Provenance::new(
 			sf!("test-publisher"),
 			key.extension().clone(),
@@ -146,14 +164,13 @@ fn test_manifest(key: &HostKey) -> ExtensionManifest {
 		),
 		sf!("cancel_matrix_tools"),
 		[],
-		DeclarationSet::new(
-			[
-				ToolDeclarationKey::new("matrix_block", "py", 1),
-				ToolDeclarationKey::new("matrix_echo", "py", 1),
-			],
-			[],
-		),
+		DeclarationSet::new(tools, []),
 		ServiceManifest::default(),
+		StaticDeclarations {
+			ordered: ordered.clone().into_boxed_slice(),
+			tools: ordered.into_boxed_slice(),
+			..StaticDeclarations::default()
+		},
 		[],
 		[ActivationTrigger::FirstReach],
 	)

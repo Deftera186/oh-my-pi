@@ -75,6 +75,16 @@ impl<SE: ShellExtensions> Shell<SE> {
 		self.call_stack.pop();
 	}
 
+	/// Temporarily suppresses trap delivery during sensitive shell mutation.
+	pub(crate) const fn acquire_trap_delivery_block(&mut self) {
+		self.call_stack.acquire_trap_delivery_block();
+	}
+
+	/// Releases one temporary trap-delivery suppression block.
+	pub(crate) const fn release_trap_delivery_block(&mut self) {
+		self.call_stack.release_trap_delivery_block();
+	}
+
 	/// Updates the shell's internal tracking state to reflect that a new shell
 	/// function is being entered.
 	///

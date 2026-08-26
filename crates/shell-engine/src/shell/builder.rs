@@ -12,7 +12,9 @@ use crate::{
 	openfiles::{self, OpenFile},
 	options,
 	parser::ParserImpl,
-	pathcache, traps,
+	pathcache,
+	shell::KeyBindingsHelper,
+	traps,
 };
 
 impl<SE: extensions::ShellExtensions, S: shell_builder::IsComplete> ShellBuilder<SE, S> {
@@ -231,6 +233,8 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
 	pub command_string_mode: bool,
 	/// Maximum function call depth.
 	pub max_function_call_depth: Option<usize>,
+	/// Interactive key-binding backend.
+	pub key_bindings: Option<KeyBindingsHelper>,
 	/// Brush implementation version.
 	pub shell_version: Option<String>,
 }
@@ -257,11 +261,14 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
 			product_display_str: None,
 			call_stack: callstack::CallStack::new(),
 			directory_stack: vec![],
+			completion_config: crate::completion::Config::default(),
 			builtins: ImHashMap::default(),
 			program_location_cache: pathcache::PathCache::default(),
 			last_stopwatch_time: time::SystemTime::now(),
 			last_stopwatch_offset: 0,
 			parser_impl: ParserImpl::default(),
+			key_bindings: None,
+			history: None,
 		}
 	}
 }

@@ -94,10 +94,19 @@ impl builtins::Command for ReadCommand {
 		&self,
 		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
-		// Validate timeout value if provided.
-		if let Some(result) = self.validate_timeout(&context)? {
-			return Ok(result);
-		}
+		let timeout = if let Some(timeout) = self.timeout_in_seconds {
+			let Some(timeout) = parse_timeout_duration(timeout) else {
+				writeln!(
+					context.stderr(),
+					"{}: -t: invalid timeout specification",
+					context.command_name
+				)?;
+				return Ok(ExecutionResult::general_error());
+			};
+			Some(timeout)
+		} else {
+			None
+		};
 
 		// Find the input stream to use.
 		let fd_num = self
@@ -124,9 +133,6 @@ impl builtins::Command for ReadCommand {
 		// We convert to owned String to release the borrow before the mutable borrow
 		// needed for variable assignment.
 		let ifs = context.shell.ifs().into_owned();
-
-		// Convert timeout to Duration.
-		let timeout = self.timeout_in_seconds.map(Duration::from_secs_f64);
 
 		// Perform the read operation (potentially with timeout).
 		let read_result =
@@ -651,30 +657,13 @@ impl ReadCommand {
 
 		Ok(mode)
 	}
+}
 
-	/// Validates the timeout value and returns an error result if invalid.
-	///
-	/// Returns `Ok(Some(result))` if the timeout is invalid (caller should
-	/// return early), `Ok(None)` if the timeout is valid or not specified.
-	///
-	/// TODO(read): Bash uses $TMOUT as a default timeout for `read` when -t is
-	/// not specified.
-	fn validate_timeout(
-		&self,
-		context: &ExecutionContext<'_, impl ShellExtensions>,
-	) -> Result<Option<ExecutionResult>, Error> {
-		if let Some(timeout) = self.timeout_in_seconds {
-			if timeout < 0.0 {
-				writeln!(
-					context.stderr(),
-					"{}: -t: invalid timeout specification",
-					context.command_name
-				)?;
-				return Ok(Some(ExecutionResult::general_error()));
-			}
-		}
-		Ok(None)
+fn parse_timeout_duration(seconds: f64) -> Option<Duration> {
+	if !seconds.is_finite() || seconds < 0.0 {
+		return None;
 	}
+	Duration::try_from_secs_f64(seconds).ok()
 }
 
 /// Splits a line by IFS (Internal Field Separator) according to shell rules.
@@ -925,6 +914,15 @@ mod tests {
 			fd_num_to_read: None,
 			variable_names: Vec::new(),
 		}
+	}
+
+	#[test]
+	fn test_timeout_duration_rejects_non_finite_and_negative_values() {
+		assert!(parse_timeout_duration(f64::NAN).is_none());
+		assert!(parse_timeout_duration(f64::INFINITY).is_none());
+		assert!(parse_timeout_duration(f64::NEG_INFINITY).is_none());
+		assert!(parse_timeout_duration(-0.1).is_none());
+		assert_eq!(parse_timeout_duration(0.25), Some(Duration::from_millis(250)));
 	}
 
 	#[test]

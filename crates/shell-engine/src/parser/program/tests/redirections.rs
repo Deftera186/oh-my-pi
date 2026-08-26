@@ -78,6 +78,10 @@ fn parse_redirect_stdin_dup() -> Result<()> {
 	assert_snapshot_redacted!(ParseResult { input, result: &result });
 	Ok(())
 }
+#[test]
+fn oversized_redirection_fd_is_a_parse_error() {
+	assert!(test_with_snapshot("999999999999999999999999999999>file").is_err());
+}
 
 // Combined redirections
 

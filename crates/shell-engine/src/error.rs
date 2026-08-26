@@ -90,6 +90,9 @@ pub enum ErrorKind {
 	/// History item was not found.
 	#[error("history item not found")]
 	HistoryItemNotFound,
+	/// Command history is disabled for this shell.
+	#[error("command history is not enabled in this shell")]
+	HistoryNotEnabled,
 
 	/// The requested functionality has not yet been implemented in this shell.
 	#[error("not yet implemented: {0}")]

@@ -167,7 +167,7 @@ fn journal(path: &Path, root: &Path) -> Journal {
 fn state(root: &Path, registry: Arc<Registry>) -> AgentState {
 	let turn = TurnOptions { context_id: Some(sf!("p3-context")), ..Default::default() };
 	let snapshot = AgentSnapshot {
-		enabled_tools: Arc::from([sf!("shell")]),
+		enabled_tools: Arc::from([sf!("bash")]),
 		..AgentSnapshot::new(
 			turn,
 			PromptFacts::new(root, Arc::from([]))
@@ -193,14 +193,13 @@ fn end_outcome(head: u64) -> inference::Outcome {
 	}
 }
 
-fn shell_turn(name: &str, command: String) -> ScriptedTurn {
+fn shell_turn(command: String) -> ScriptedTurn {
 	let identity =
-		ToolIdentity { name: sf!("shell"), rev: omp_tool::Rev { family: Str::default(), n: 1 } };
+		ToolIdentity { name: sf!("bash"), rev: omp_tool::Rev { family: Str::default(), n: 1 } };
 	let args = Bytes::from(
 		serde_json::to_vec(&serde_json::json!({
 			"command": command,
 			"async": true,
-			"name": name,
 		}))
 		.expect("shell args serialize"),
 	);
@@ -211,7 +210,7 @@ fn shell_turn(name: &str, command: String) -> ScriptedTurn {
 			index:        0,
 			kind:         part_start::Kind::ToolCall as i32,
 			tool_call_id: "shell-detached".to_owned(),
-			tool_name:    "shell".to_owned(),
+			tool_name:    "bash".to_owned(),
 		})),
 		scripted_turn_event(turn_event::Event::PartDelta(inference::PartDelta {
 			index: 0,
@@ -221,7 +220,7 @@ fn shell_turn(name: &str, command: String) -> ScriptedTurn {
 			index:     0,
 			signature: Bytes::new(),
 		})),
-		outcome_event(tool_use_outcome(call, 3)),
+		outcome_event(tool_use_outcome(call, 4)),
 	])
 }
 
@@ -511,17 +510,16 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let journal_path = env.root.path().join("agent.jsonl");
 	let fifo = env.root.path().join("release.fifo");
 	mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create deterministic process gate");
-	let process_name = "p3-detached";
 	let command = format!(
 		"printf 'output-1\\noutput-2\\n'; read _ < '{}'; printf 'output-3\\n'",
 		fifo.display(),
 	);
 	let detached_gate = Gate::default();
 	let initial_client = ScriptedTurnClient::new([
-		shell_turn(process_name, command),
+		shell_turn(command),
 		ScriptedTurn::steps([
 			ScriptedStep::Wait(detached_gate.clone()),
-			ScriptedStep::from(outcome_event(end_outcome(4))),
+			ScriptedStep::from(outcome_event(end_outcome(5))),
 		]),
 	]);
 	let initial_capture = initial_client.clone();
@@ -556,12 +554,15 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let result = tool_result(&delta(&captures[1].input).append, "shell-detached");
 	assert!(!result.is_error, "detached shell failed: {result:?}");
 	let job = detached_ref(result);
-	assert_eq!(job.id, format!("{process_name}#1").as_str());
-	assert_eq!(job.owner, JobOwner::NamedProcess {
-		name:       Str::from(process_name),
-		generation: 1,
-	},);
-	assert_eq!(job.artifact.description, "named process settlement");
+	let JobOwner::NamedProcess { name: process_name, generation } = &job.owner else {
+		panic!("detached shell did not register a named process")
+	};
+	assert_eq!(job.id, format!("{process_name}#{generation}").as_str());
+	assert_eq!(*generation, 1);
+	assert_eq!(
+		job.artifact.description,
+		"named process settlement; detached because explicit async request"
+	);
 	assert_eq!(job.artifact.media_type.as_deref(), Some(SETTLEMENT_MIME));
 	assert_eq!(job.artifact.lifetime, ArtifactLifetime::Session);
 	let text = result
@@ -597,9 +598,9 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let next_client = ScriptedTurnClient::new([
 		ScriptedTurn::steps([
 			ScriptedStep::Wait(settlement_gate.clone()),
-			ScriptedStep::from(outcome_event(end_outcome(4))),
+			ScriptedStep::from(outcome_event(end_outcome(5))),
 		]),
-		ScriptedTurn::events([outcome_event(end_outcome(5))]),
+		ScriptedTurn::events([outcome_event(end_outcome(6))]),
 	]);
 	let next_capture = next_client.clone();
 	let reopened_journal = Journal::open(&journal_path).expect("reopen pending detached journal");
@@ -629,7 +630,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 		.await
 		.expect("replayed detached follow-up reached provider");
 	release_fifo(fifo).await;
-	wait_terminal(&env.client, process_name, 1).await;
+	wait_terminal(&env.client, process_name, *generation).await;
 	assert!(!resumed.is_finished(), "TurnBoundary settlement ended the active turn");
 	wait_board_empty(&board).await;
 	assert!(!resumed.is_finished(), "settlement bypassed the blocked turn boundary");
@@ -704,9 +705,9 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let final_client = ScriptedTurnClient::new([
 		ScriptedTurn::steps([
 			ScriptedStep::Wait(early_gate.clone()),
-			ScriptedStep::from(outcome_event(end_outcome(6))),
+			ScriptedStep::from(outcome_event(end_outcome(7))),
 		]),
-		ScriptedTurn::events([outcome_event(end_outcome(7))]),
+		ScriptedTurn::events([outcome_event(end_outcome(8))]),
 	]);
 	let final_capture = final_client.clone();
 	let mut final_agent = Agent::new(

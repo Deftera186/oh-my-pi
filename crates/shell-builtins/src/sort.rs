@@ -2488,8 +2488,8 @@ use clap::{
 use custom_str_cmp::custom_str_cmp;
 use ext_sort::ext_sort;
 use numeric_str_cmp::{NumInfo, NumInfoParseSettings, human_numeric_str_cmp, numeric_str_cmp};
-use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use omp_core::{FastHashMap, FastState};
+use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use rand::{RngExt as _, rng};
 #[cfg(not(target_os = "wasi"))]
 use rayon::slice::ParallelSliceMut;

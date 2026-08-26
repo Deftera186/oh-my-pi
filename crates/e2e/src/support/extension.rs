@@ -111,7 +111,6 @@ pub fn recording_ui_factory() -> (Arc<dyn ControlAuthorityFactory>, Receiver<Pre
 				capabilities:       Arc::clone(&identity.capabilities),
 			});
 			let owner = Arc::new(PresentationAuthority::new(
-				omp_executor::Executor::new(None),
 				presentation_identity,
 				Arc::new(RecordingPresentationClient { effects: effects.clone() }),
 				Arc::new(UnusedPresentationCallbacks),

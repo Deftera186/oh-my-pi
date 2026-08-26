@@ -479,9 +479,13 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 		args: Vec<CommandArg>,
 	) -> ExecutionSpawnResult {
 		let last_arg = Self::take_last_arg(&args);
-		let join_handle = tokio::spawn(async move {
+		let join_handle = tokio::task::spawn_blocking(move || {
 			let cmd_context = ExecutionContext { shell: &mut shell, command_name, params };
-			let result = execute_builtin_command(&builtin, cmd_context, args).await;
+			let result = tokio::runtime::Handle::current().block_on(execute_builtin_command(
+				&builtin,
+				cmd_context,
+				args,
+			));
 
 			// Update $_ after command execution.
 			shell.update_last_arg_variable(last_arg);

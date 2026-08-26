@@ -10,13 +10,16 @@ impl<SE: ShellExtensions> Shell<SE> {
 	///
 	/// This currently includes invoking the `EXIT` trap handler, if any.
 	pub async fn on_exit(&mut self) -> Result<(), error::Error> {
-		if self.traps.handles(TrapSignal::Exit) {
+		let result = if self.traps.handles(TrapSignal::Exit) {
 			self
 				.invoke_trap_handler(TrapSignal::Exit, &self.default_exec_params())
-				.await?;
-		}
-
-		Ok(())
+				.await
+				.map(|_| ())
+		} else {
+			Ok(())
+		};
+		self.jobs_mut().abort_internal_tasks();
+		result
 	}
 
 	/// Invokes the handler registered for `signal`, if any.
@@ -46,6 +49,10 @@ impl<SE: ShellExtensions> Shell<SE> {
 		signal: TrapSignal,
 		params: &ExecutionParameters,
 	) -> Result<ExecutionResult, error::Error> {
+		if self.call_stack().is_trap_delivery_suppressed() {
+			return Ok(ExecutionResult::success());
+		}
+
 		// Per-signal self-recursion guard: don't re-enter a trap that is
 		// already being handled. Different traps *can* fire from each
 		// other's handlers (e.g. ERR inside EXIT, EXIT inside ERR).

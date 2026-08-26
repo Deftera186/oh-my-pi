@@ -419,6 +419,13 @@ impl JobManager {
 
 		completed_jobs
 	}
+
+	/// Aborts every shell-internal task retained by the job table.
+	pub fn abort_internal_tasks(&mut self) {
+		for job in &mut self.jobs {
+			job.abort_internal_tasks();
+		}
+	}
 }
 
 /// Represents the current execution state of a job.

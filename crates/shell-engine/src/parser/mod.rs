@@ -9,6 +9,7 @@ pub mod arithmetic;
 pub mod ast;
 pub mod pattern;
 pub mod prompt;
+pub mod readline_binding;
 pub mod test_command;
 pub mod word;
 
@@ -17,7 +18,9 @@ mod program;
 mod source;
 mod tokenizer;
 
-pub use error::{ParseError, ParseErrorLocation, TestCommandParseError, WordParseError};
+pub use error::{
+	BindingParseError, ParseError, ParseErrorLocation, TestCommandParseError, WordParseError,
+};
 pub use program::{Parser, ParserBuilder, ParserImpl, ParserOptions, SourceInfo, parse_tokens};
 pub use source::{SourcePosition, SourcePositionOffset, SourceSpan};
 pub use tokenizer::{

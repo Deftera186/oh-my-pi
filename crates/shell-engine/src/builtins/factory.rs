@@ -30,12 +30,20 @@ pub fn default_builtins<SE: ShellExtensions>() -> HashMap<String, builtins::Regi
 	builtins.insert("source".into(), builtin::<dot::DotCommand, SE>().special());
 
 	builtins.insert("alias".into(), builtin::<alias::AliasCommand, SE>());
+	builtins.insert("bg".into(), builtin::<bg::BgCommand, SE>());
+	builtins.insert("bind".into(), builtin::<bind::BindCommand, SE>());
 	builtins.insert("cd".into(), builtin::<cd::CdCommand, SE>());
 	builtins.insert("command".into(), builtin::<command::CommandCommand, SE>());
+	builtins.insert("complete".into(), builtin::<complete::CompleteCommand, SE>());
+	builtins.insert("compgen".into(), builtin::<complete::CompGenCommand, SE>());
+	builtins.insert("compopt".into(), builtin::<complete::CompOptCommand, SE>());
 	builtins.insert("false".into(), simple_builtin::<false_::FalseCommand, SE>());
+	builtins.insert("fc".into(), builtin::<fc::FcCommand, SE>());
+	builtins.insert("fg".into(), builtin::<fg::FgCommand, SE>());
 	builtins.insert("getopts".into(), builtin::<getopts::GetOptsCommand, SE>());
 	builtins.insert("hash".into(), builtin::<hash::HashCommand, SE>());
 	builtins.insert("help".into(), builtin::<help::HelpCommand, SE>());
+	builtins.insert("history".into(), builtin::<history::HistoryCommand, SE>());
 	builtins.insert("jobs".into(), builtin::<jobs::JobsCommand, SE>());
 	#[cfg(any(unix, windows))]
 	builtins.insert("kill".into(), builtin::<kill::KillCommand, SE>());
@@ -60,6 +68,8 @@ pub fn default_builtins<SE: ShellExtensions>() -> HashMap<String, builtins::Regi
 	#[cfg(any(unix, windows))]
 	builtins.insert("printf".into(), builtin::<printf::PrintfCommand, SE>());
 	builtins.insert("shopt".into(), builtin::<shopt::ShoptCommand, SE>());
+	#[cfg(unix)]
+	builtins.insert("suspend".into(), builtin::<suspend::SuspendCommand, SE>());
 	builtins.insert("test".into(), builtin::<test::TestCommand, SE>());
 	builtins.insert("[".into(), builtin::<test::TestCommand, SE>());
 	builtins.insert("typeset".into(), decl_builtin::<declare::DeclareCommand, SE>());
@@ -70,4 +80,19 @@ pub fn default_builtins<SE: ShellExtensions>() -> HashMap<String, builtins::Regi
 	builtins.insert("disown".into(), builtin::<disown::DisownCommand, SE>());
 
 	builtins
+}
+#[cfg(test)]
+mod tests {
+	use super::default_builtins;
+	use crate::extensions::DefaultShellExtensions;
+
+	#[test]
+	fn registers_job_history_completion_and_input_builtins() {
+		let builtins = default_builtins::<DefaultShellExtensions>();
+		for name in ["bg", "fg", "bind", "complete", "compgen", "compopt", "fc", "history"] {
+			assert!(builtins.contains_key(name), "missing builtin {name}");
+		}
+		#[cfg(unix)]
+		assert!(builtins.contains_key("suspend"));
+	}
 }

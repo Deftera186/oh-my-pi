@@ -51,14 +51,17 @@ mod cli {
 		pub slurp:      bool,
 
 		// Output options
-		pub compact_output: bool,
-		pub raw_output:     bool,
+		pub compact_output:    bool,
+		pub raw_output:        bool,
 		/// This flag enables `--raw-output`.
-		pub join_output:    bool,
-		pub in_place:       bool,
-		pub sort_keys:      bool,
-		pub tab:            bool,
-		pub indent:         usize,
+		pub join_output:       bool,
+		pub in_place:          bool,
+		pub sort_keys:         bool,
+		pub color_output:      bool,
+		pub monochrome_output: bool,
+		pub use_color:         bool,
+		pub tab:               bool,
+		pub indent:            usize,
 
 		// Compilation options
 		pub from_file:    bool,
@@ -131,7 +134,8 @@ mod cli {
 				"join-output" => self.short('j', args)?,
 				"in-place" => self.short('i', args)?,
 				"sort-keys" => self.short('S', args)?,
-				"color-output" | "monochrome-output" => {},
+				"color-output" => self.short('C', args)?,
+				"monochrome-output" => self.short('M', args)?,
 				"tab" => self.tab = true,
 				"indent" => self.indent = args.next().and_then(int).ok_or(Error::Int("--indent"))?,
 				"from-file" => self.short('f', args)?,
@@ -170,7 +174,8 @@ mod cli {
 				'j' => self.join_output = true,
 				'i' => self.in_place = true,
 				'S' => self.sort_keys = true,
-				'C' | 'M' => {},
+				'C' => self.color_output = true,
+				'M' => self.monochrome_output = true,
 
 				'f' => self.from_file = true,
 				'L' => self
@@ -206,6 +211,16 @@ mod cli {
 				}
 			}
 			Ok(cli)
+		}
+
+		pub fn color_if(&self, fallback: impl FnOnce() -> bool) -> bool {
+			if self.monochrome_output {
+				false
+			} else if self.color_output {
+				true
+			} else {
+				fallback()
+			}
 		}
 	}
 
@@ -771,6 +786,7 @@ mod output {
 		compact:   bool,
 		indent:    String,
 		sort_keys: bool,
+		color:     bool,
 	}
 
 	impl PpOpts {
@@ -809,20 +825,36 @@ mod output {
 
 	fn fmt_val(f: &mut Formatter, opts: &PpOpts, level: usize, v: &Val) -> fmt::Result {
 		match v {
-			Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Num(_) | Val::Str(_) => {
-				v.fmt(f)
-			},
+			Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::Num(_) => v.fmt(f),
+			Val::Str(_) if opts.color => write!(f, "\x1b[32m{v}\x1b[0m"),
+			Val::Str(_) => v.fmt(f),
 			Val::Arr(a) => {
-				write!(f, "[")?;
+				if opts.color {
+					write!(f, "\x1b[1m[\x1b[0m")?;
+				} else {
+					write!(f, "[")?;
+				}
 				if !a.is_empty() {
 					fmt_seq(f, opts, level, &**a, |f, x| fmt_val(f, opts, level + 1, x))?;
 				}
-				write!(f, "]")
+				if opts.color {
+					write!(f, "\x1b[1m]\x1b[0m")
+				} else {
+					write!(f, "]")
+				}
 			},
 			Val::Obj(o) => {
-				write!(f, "{{")?;
+				if opts.color {
+					write!(f, "\x1b[1m{{\x1b[0m")?;
+				} else {
+					write!(f, "{{")?;
+				}
 				let kv = |f: &mut Formatter, (k, val): (&rc::Rc<String>, &Val)| {
-					write!(f, "{}:", Val::Str(k.clone()))?;
+					if opts.color {
+						write!(f, "\x1b[1m{}\x1b[0m:", Val::Str(k.clone()))?;
+					} else {
+						write!(f, "{}:", Val::Str(k.clone()))?;
+					}
 					if !opts.compact {
 						write!(f, " ")?;
 					}
@@ -837,7 +869,11 @@ mod output {
 						fmt_seq(f, opts, level, &**o, kv)
 					}?
 				}
-				write!(f, "}}")
+				if opts.color {
+					write!(f, "\x1b[1m}}\x1b[0m")
+				} else {
+					write!(f, "}}")
+				}
 			},
 		}
 	}
@@ -852,6 +888,7 @@ mod output {
 					" ".repeat(cli.indent)
 				},
 				sort_keys: cli.sort_keys,
+				color:     cli.use_color,
 			};
 			fmt_val(f, &opts, 0, val)
 		};
@@ -945,6 +982,7 @@ impl Utility for Jq {
 
 		let mut cli = self.cli;
 		resolve_cli_paths(&mut cli, host);
+		cli.use_color = !cli.in_place && cli.color_if(|| host.stdout.is_terminal());
 		let _runtime = RuntimeGuard::install(host);
 
 		let result = real_main(&cli, host);
@@ -1331,17 +1369,17 @@ mod tests {
 	}
 
 	#[test]
-	fn color_output_flag_produces_no_ansi_escapes() {
-		let (code, out, err) = run_jq(&["-C", "."], "{\"a\": 1}");
+	fn forced_color_and_monochrome_flags_override_stream_detection() {
+		let (code, out, err) = run_jq(&["-C", "."], "{\"a\": \"value\"}");
 		assert_eq!(code, 0);
-		assert_eq!(out, "{\n  \"a\": 1\n}\n");
-		assert!(!out.contains('\x1b'));
+		assert!(out.contains('\x1b'));
 		assert_eq!(err, "");
 
-		let (code, out, err) = run_jq(&["-C", "("], "null");
-		assert_eq!(code, 3);
-		assert_eq!(out, "");
-		assert!(!err.contains('\x1b'));
+		let (code, out, err) = run_jq(&["-C", "-M", "."], "{\"a\": \"value\"}");
+		assert_eq!(code, 0);
+		assert!(!out.contains('\x1b'));
+		assert_eq!(out, "{\n  \"a\": \"value\"\n}\n");
+		assert_eq!(err, "");
 	}
 
 	#[test]

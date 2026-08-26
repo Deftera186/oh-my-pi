@@ -694,9 +694,9 @@ peg::parser! {
 				[Token::Word(w, num_loc) if w.chars().all(|c: char| c.is_ascii_digit())]
 				&([Token::Operator(o, redir_loc) if
 						  o.starts_with(['<', '>']) &&
-						  locations_are_contiguous(num_loc, redir_loc)]) {
+						  locations_are_contiguous(num_loc, redir_loc)]) {?
 
-					 w.parse().unwrap()
+					 w.parse().map_err(|_| "redirection file descriptor out of range")
 				}
 
 		  //
