@@ -1,33 +1,38 @@
-use std::fmt::{self, Write as _};
+use std::fmt;
 
 use omp_core::Str;
 use omp_tool::{
-	CallOutcome, Part, PromptCaps, ToolIdentity,
-	render::{RenderFold, RenderRegistry, RenderRegistryError},
-};
-use serde::Deserialize;
-
-use crate::{
-	edit::{EditUpdate, Fault as EditFault, Payload as EditPayload},
-	eval::{Fault as EvalFault, Payload as EvalPayload, Update as EvalUpdate},
-	glob::{Fault as GlobFault, Payload as GlobPayload, Update as GlobUpdate},
-	grep::{Fault as GrepFault, Payload as GrepPayload, Update as GrepUpdate},
-	hub::{Fault as HubFault, Response as HubResponse},
-	read::{Fault as ReadFault, Payload as ReadPayload, PayloadPart, Update as ReadUpdate},
-	shell::{
-		ExecOutcome, Fault as ShellFault, Payload as ShellPayload, TranscriptFrame,
-		Update as ShellUpdate,
-	},
-	web_search::{Fault as WebSearchFault, Payload as WebSearchPayload, Update as WebSearchUpdate},
-	write::{Fault as WriteFault, Payload as WritePayload, Update as WriteUpdate},
+	Part, PromptCaps, ToolIdentity,
+	render::{RenderRegistry, RenderRegistryError},
 };
 
+use self::{
+	edit::EditRenderer,
+	exec::{EvalRenderer, ShellRenderer},
+	fs::{ReadRenderer, WriteRenderer},
+	hub::HubRenderer,
+	search::{GlobRenderer, GrepRenderer},
+	web::WebSearchRenderer,
+};
+
+/// Native edit renderer views.
+pub(crate) mod edit;
+/// Native shell and eval renderer views.
+pub(crate) mod exec;
+/// Native read and write renderer views.
+pub(crate) mod fs;
+/// Native hub renderer views.
+pub(crate) mod hub;
 /// Bounded JSON-tree previews shared by structured tool views.
 pub mod json_tree;
 /// Grouped path and directory-tree rendering.
 pub mod paths;
+/// Native grep and glob renderer views.
+pub(crate) mod search;
 /// Shared line, byte, and column truncation.
 pub mod truncate;
+/// Native web search renderer views.
+pub(crate) mod web;
 
 /// Exact production identities associated with enabled native renderer
 /// implementations.
@@ -97,251 +102,44 @@ pub fn register_builtin_renderers(
 	Ok(())
 }
 
-#[derive(Default)]
-struct EditState {
-	latest: Option<EditUpdate>,
-}
-
-struct EditRenderer;
-
-impl RenderFold for EditRenderer {
-	type Outcome = CallOutcome<EditPayload, EditFault>;
-	type State = EditState;
-	type Update = EditUpdate;
-
-	fn fold(&self, state: &mut Self::State, update: Self::Update) {
-		state.latest = Some(update);
-	}
-
-	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(render_edit_live(state.latest.as_ref())),
-			Some(CallOutcome::Ok(payload)) => Some(render_edit_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("edit", &edit_fault(fault))),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
+/// Writes a compact human duration (`12ms`, `1.4s`, `2m36s`, `1h04m`).
+fn push_duration_ms(output: &mut String, ms: u64) {
+	use std::fmt::Write as _;
+	if ms < 1_000 {
+		write!(output, "{ms}ms").expect("writing to String cannot fail");
+	} else if ms < 60_000 {
+		let tenths = ms / 100;
+		write!(output, "{}.{}s", tenths / 10, tenths % 10).expect("writing to String cannot fail");
+	} else if ms < 3_600_000 {
+		let seconds = ms / 1_000;
+		write!(output, "{}m{:02}s", seconds / 60, seconds % 60)
+			.expect("writing to String cannot fail");
+	} else {
+		let minutes = ms / 60_000;
+		write!(output, "{}h{:02}m", minutes / 60, minutes % 60)
+			.expect("writing to String cannot fail");
 	}
 }
 
-struct GrepRenderer;
-
-impl RenderFold for GrepRenderer {
-	type Outcome = CallOutcome<GrepPayload, GrepFault>;
-	type State = ();
-	type Update = GrepUpdate;
-
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
+/// Writes a compact human byte count (`8B`, `2.4K`, `103K`, `1.2M`).
+fn push_bytes(output: &mut String, bytes: u64) {
+	use std::fmt::Write as _;
+	const UNITS: [&str; 4] = ["K", "M", "G", "T"];
+	if bytes < 1_000 {
+		write!(output, "{bytes}B").expect("writing to String cannot fail");
+		return;
 	}
-
-	fn view(&self, _state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(live_view("grep", "searching")),
-			Some(CallOutcome::Ok(payload)) => Some(render_grep_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("grep", &fault.to_string())),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
+	let mut scaled = bytes as f64;
+	let mut unit = 0usize;
+	while scaled >= 1_000.0 && unit + 1 < UNITS.len() {
+		scaled /= 1_000.0;
+		unit += 1;
 	}
-}
-
-struct WebSearchRenderer;
-
-impl RenderFold for WebSearchRenderer {
-	type Outcome = CallOutcome<WebSearchPayload, WebSearchFault>;
-	type State = ();
-	type Update = WebSearchUpdate;
-
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
-	}
-
-	fn view(&self, _state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(live_view("web_search", "searching providers")),
-			Some(CallOutcome::Ok(payload)) => Some(render_web_search_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(render_web_search_fault(&fault.to_string())),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
-	}
-}
-
-struct GlobRenderer;
-
-impl RenderFold for GlobRenderer {
-	type Outcome = CallOutcome<GlobPayload, GlobFault>;
-	type State = ();
-	type Update = GlobUpdate;
-
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
-	}
-
-	fn view(&self, _state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(live_view("glob", "matching paths")),
-			Some(CallOutcome::Ok(payload)) => Some(render_glob_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("glob", &fault.to_string())),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
-	}
-}
-
-#[derive(Default)]
-struct StreamState {
-	bytes:         u64,
-	last_sequence: Option<u64>,
-	tail:          Vec<u8>,
-	cached:        Option<Str>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ShellRenderOutcome {
-	Call(CallOutcome<ShellPayload, ShellFault>),
-	Terminal(omp_tool::ToolTerminal<ShellPayload, ShellFault>),
-}
-
-struct ShellRenderer;
-
-impl RenderFold for ShellRenderer {
-	type Outcome = ShellRenderOutcome;
-	type State = StreamState;
-	type Update = ShellUpdate;
-
-	fn fold(&self, state: &mut Self::State, update: Self::Update) {
-		state.bytes = state
-			.bytes
-			.saturating_add(u64::try_from(update.data.len()).unwrap_or(u64::MAX));
-		state.last_sequence = Some(update.sequence);
-		append_bounded_tail(&mut state.tail, update.data.as_ref());
-		state.cached = Some(render_shell_live(state));
-	}
-
-	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(
-				state
-					.cached
-					.clone()
-					.unwrap_or_else(|| render_shell_live(state)),
-			),
-			Some(ShellRenderOutcome::Call(CallOutcome::Ok(payload)))
-			| Some(ShellRenderOutcome::Terminal(omp_tool::ToolTerminal::Done {
-				result: Ok(payload),
-				..
-			})) => Some(render_shell_payload(payload)),
-			Some(ShellRenderOutcome::Call(CallOutcome::Faulted(fault)))
-			| Some(ShellRenderOutcome::Terminal(omp_tool::ToolTerminal::Done {
-				result: Err(fault),
-				..
-			})) => Some(fault_view("shell", &shell_fault(fault))),
-			Some(ShellRenderOutcome::Terminal(omp_tool::ToolTerminal::Detached(job))) => {
-				Some(render_shell_detached(job))
-			},
-			Some(ShellRenderOutcome::Call(
-				CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. },
-			)) => None,
-		}
-	}
-}
-#[derive(Default)]
-struct HubState {
-	latest: Option<HubResponse>,
-}
-
-struct HubRenderer;
-
-impl RenderFold for HubRenderer {
-	type Outcome = CallOutcome<HubResponse, HubFault>;
-	type State = HubState;
-	type Update = HubResponse;
-
-	fn fold(&self, state: &mut Self::State, update: Self::Update) {
-		state.latest = Some(update);
-	}
-
-	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => state
-				.latest
-				.as_ref()
-				.and_then(render_hub_response)
-				.or_else(|| Some(live_view("hub", "waiting for peer, job, or process activity"))),
-			Some(CallOutcome::Ok(response)) => render_hub_response(response),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("hub", &fault.message)),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
-	}
-}
-
-struct WriteRenderer;
-
-impl RenderFold for WriteRenderer {
-	type Outcome = CallOutcome<WritePayload, WriteFault>;
-	type State = ();
-	type Update = WriteUpdate;
-
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
-	}
-
-	fn view(&self, _state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(live_view("write", "writing")),
-			Some(CallOutcome::Ok(payload)) => Some(render_write_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("write", &fault.to_string())),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
-	}
-}
-
-#[derive(Default)]
-struct ReadState {
-	phase: Option<Str>,
-}
-
-struct ReadRenderer;
-
-impl RenderFold for ReadRenderer {
-	type Outcome = CallOutcome<ReadPayload, ReadFault>;
-	type State = ReadState;
-	type Update = ReadUpdate;
-
-	fn fold(&self, state: &mut Self::State, update: Self::Update) {
-		state.phase = Some(update.phase);
-	}
-
-	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(live_view("read", state.phase.as_deref().unwrap_or("reading"))),
-			Some(CallOutcome::Ok(payload)) => Some(render_read_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("read", fault.message())),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
-	}
-}
-
-struct EvalRenderer;
-
-impl RenderFold for EvalRenderer {
-	type Outcome = CallOutcome<EvalPayload, EvalFault>;
-	type State = StreamState;
-	type Update = EvalUpdate;
-
-	fn fold(&self, state: &mut Self::State, update: Self::Update) {
-		state.bytes = state
-			.bytes
-			.saturating_add(u64::try_from(update.data.len()).unwrap_or(u64::MAX));
-		state.last_sequence = Some(update.sequence);
-	}
-
-	fn view(&self, state: &Self::State, outcome: Option<&Self::Outcome>) -> Option<Str> {
-		match outcome {
-			None => Some(stream_live_view("eval", state)),
-			Some(CallOutcome::Ok(payload)) => Some(render_eval_payload(payload)),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("eval", &eval_fault(fault))),
-			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
-		}
+	if scaled >= 1_000.0 || scaled.fract() < 0.05 || scaled >= 100.0 {
+		write!(output, "{}{}", scaled.round() as u64, UNITS[unit])
+			.expect("writing to String cannot fail");
+	} else {
+		write!(output, "{scaled:.1}{}", UNITS[unit]).expect("writing to String cannot fail");
 	}
 }
 
@@ -354,839 +152,12 @@ fn live_view(name: &str, status: &str) -> Str {
 	Str::new(output)
 }
 
-fn stream_live_view(name: &str, state: &StreamState) -> Str {
-	let status = if state.last_sequence.is_some() {
-		format!("running · {} bytes", state.bytes)
-	} else {
-		String::from("running")
-	};
-	live_view(name, &status)
-}
-
-fn append_bounded_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
-	const MAX_LIVE_OUTPUT_BYTES: usize = 16 * 1024;
-	if chunk.len() >= MAX_LIVE_OUTPUT_BYTES {
-		tail.clear();
-		tail.extend_from_slice(&chunk[chunk.len() - MAX_LIVE_OUTPUT_BYTES..]);
-		return;
-	}
-	let overflow = tail
-		.len()
-		.saturating_add(chunk.len())
-		.saturating_sub(MAX_LIVE_OUTPUT_BYTES);
-	if overflow > 0 {
-		tail.drain(..overflow);
-	}
-	tail.extend_from_slice(chunk);
-}
-
-fn render_shell_live(state: &StreamState) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=accent><col gap=0><row gap=1><text bold \
-		 fg=accent>$</text><text bold>shell</text>",
-	);
-	if state.last_sequence.is_some() {
-		output.push_str("<spinner>running</spinner><text fg=muted>");
-		write!(output, "{} bytes", state.bytes).expect("writing to String cannot fail");
-		output.push_str("</text>");
-	} else {
-		output.push_str("<spinner>starting</spinner>");
-	}
-	output.push_str("</row>");
-	if !state.tail.is_empty() {
-		output.push_str("<pre fg=muted>");
-		push_text(&mut output, &String::from_utf8_lossy(&state.tail));
-		output.push_str("</pre><text fg=muted>streaming tail · ctrl+o to expand</text>");
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_hub_response(response: &HubResponse) -> Option<Str> {
-	let value = serde_json::from_str::<serde_json::Value>(&response.text).ok()?;
-	let object = value.as_object()?;
-	if let Some(peers) = object.get("peers").and_then(serde_json::Value::as_array) {
-		return Some(render_hub_roster(peers));
-	}
-	if let Some(jobs) = object.get("jobs").and_then(serde_json::Value::as_array) {
-		return Some(render_hub_jobs(
-			jobs,
-			object.get("waitingMs").and_then(serde_json::Value::as_u64),
-		));
-	}
-	if let Some(processes) = object
-		.get("processes")
-		.and_then(serde_json::Value::as_array)
-	{
-		return Some(render_hub_processes(processes));
-	}
-	if object.contains_key("lines") {
-		return Some(render_hub_logs(object));
-	}
-	if object.contains_key("deliveries")
-		|| object.contains_key("messages")
-		|| object.contains_key("message")
-	{
-		return Some(render_hub_messages(object));
-	}
-	if object.contains_key("timeout")
-		|| object.contains_key("waitedMs")
-		|| object.contains_key("waitingMs")
-	{
-		return Some(render_hub_wait(object));
-	}
-	if object.contains_key("name") || object.contains_key("event") || object.contains_key("job") {
-		return Some(render_hub_process_or_job(object));
-	}
-	None
-}
-
-fn render_hub_roster(peers: &[serde_json::Value]) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
-		 fg=info>@</text><text bold>Hub roster</text><text fg=muted>",
-	);
-	write!(output, "{} peers", peers.len()).expect("writing to String cannot fail");
-	output.push_str("</text></row>");
-	for peer in peers.iter().take(24) {
-		let Some(peer) = peer.as_object() else {
-			continue;
-		};
-		let name = json_string(peer, &["name", "callerName", "id"]).unwrap_or("unknown");
-		let status = json_string(peer, &["status", "lifecycle"]).unwrap_or("unknown");
-		let parent = json_string(peer, &["parent", "parentId"]);
-		let unread = json_u64(peer, &["unread", "unreadCount"]).unwrap_or(0);
-		let active = matches!(status, "running" | "active" | "reviving" | "queued");
-		output.push_str("<row gap=1>");
-		if active {
-			output.push_str("<spinner></spinner>");
-		} else {
-			output.push_str("<text fg=muted>○</text>");
-		}
-		output.push_str("<text bold>");
-		push_text(&mut output, name);
-		output.push_str("</text><text fg=muted>");
-		push_text(&mut output, status);
-		if let Some(parent) = parent {
-			output.push_str(" · child of ");
-			push_text(&mut output, parent);
-		}
-		if unread > 0 {
-			write!(output, " · {unread} unread").expect("writing to String cannot fail");
-		}
-		if let Some(activity) = json_u64(peer, &["lastActivityMs", "activityMs", "updatedAtMs"]) {
-			write!(output, " · {activity} ms").expect("writing to String cannot fail");
-		}
-		output.push_str("</text></row>");
-	}
-	if peers.len() > 24 {
-		write!(output, "<text fg=muted>+{} more peers</text>", peers.len() - 24)
-			.expect("writing to String cannot fail");
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_hub_jobs(jobs: &[serde_json::Value], waiting_ms: Option<u64>) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
-		 fg=info>&amp;</text><text bold>Jobs</text><text fg=muted>",
-	);
-	write!(output, "{} tracked", jobs.len()).expect("writing to String cannot fail");
-	if let Some(waiting_ms) = waiting_ms {
-		output.push_str("</text><spinner>");
-		write!(output, "waiting {waiting_ms} ms").expect("writing to String cannot fail");
-		output.push_str("</spinner><text fg=muted>");
-	}
-	output.push_str("</text></row>");
-	for job in jobs.iter().take(24) {
-		let Some(job) = job.as_object() else {
-			continue;
-		};
-		let id = json_string(job, &["id", "job", "name"]).unwrap_or("unknown");
-		let status = json_string(job, &["status", "state", "lifecycle"]).unwrap_or("unknown");
-		let running = matches!(status, "queued" | "running" | "active" | "waiting");
-		output.push_str("<row gap=1>");
-		if running {
-			output.push_str("<spinner></spinner>");
-		} else {
-			output.push_str("<text fg=muted>└</text>");
-		}
-		output.push_str("<text bold>");
-		push_text(&mut output, id);
-		output.push_str("</text><text fg=muted>");
-		push_text(&mut output, status);
-		if let Some(kind) = json_string(job, &["kind", "model"]) {
-			output.push_str(" · ");
-			push_text(&mut output, kind);
-		}
-		if let Some(duration) = json_u64(job, &["durationMs", "elapsedMs"]) {
-			write!(output, " · {duration} ms").expect("writing to String cannot fail");
-		}
-		output.push_str("</text></row>");
-		if let Some(error) = json_string(job, &["error", "reason"]) {
-			output.push_str("<text fg=error>  ");
-			push_text(&mut output, error);
-			output.push_str("</text>");
-		}
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_hub_processes(processes: &[serde_json::Value]) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=secondary><col gap=0><row gap=1><text bold \
-		 fg=secondary>&gt;_</text><text bold>Processes</text><text fg=muted>",
-	);
-	write!(output, "{} supervised", processes.len()).expect("writing to String cannot fail");
-	output.push_str("</text></row>");
-	for process in processes.iter().take(24) {
-		let Some(process) = process.as_object() else {
-			continue;
-		};
-		let name = json_string(process, &["name"]).unwrap_or("unknown");
-		let state = json_string(process, &["status", "state"]).unwrap_or("unknown");
-		output.push_str("<row gap=1><text bold>");
-		push_text(&mut output, name);
-		output.push_str("</text><text fg=muted>");
-		push_text(&mut output, state);
-		if let Some(pid) = json_u64(process, &["pid"]) {
-			write!(output, " · pid {pid}").expect("writing to String cannot fail");
-		}
-		if let Some(uptime) = json_u64(process, &["uptimeMs", "elapsedMs"]) {
-			write!(output, " · up {uptime} ms").expect("writing to String cannot fail");
-		}
-		output.push_str("</text></row>");
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_hub_logs(object: &serde_json::Map<String, serde_json::Value>) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=secondary><col gap=0><row gap=1><text bold \
-		 fg=secondary>&gt;_</text><text bold>Process log</text>",
-	);
-	if let Some(name) = json_string(object, &["name"]) {
-		output.push_str("<text fg=muted>");
-		push_text(&mut output, name);
-		output.push_str("</text>");
-	}
-	output.push_str("</row><box border=round bc=muted><pre>");
-	if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_array) {
-		for (index, line) in lines.iter().take(80).enumerate() {
-			if index > 0 {
-				output.push('\n');
-			}
-			push_text(&mut output, line.as_str().unwrap_or_default());
-		}
-	} else if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_str) {
-		push_text(&mut output, lines);
-	}
-	output.push_str("</pre></box>");
-	if let Some(cursor) = json_u64(object, &["cursor"]) {
-		write!(output, "<text fg=muted>cursor {cursor}</text>")
-			.expect("writing to String cannot fail");
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_hub_messages(object: &serde_json::Map<String, serde_json::Value>) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
-		 fg=info>@</text><text bold>IRC</text></row>",
-	);
-	let rows = object
-		.get("messages")
-		.or_else(|| object.get("deliveries"))
-		.and_then(serde_json::Value::as_array);
-	if let Some(rows) = rows {
-		for row in rows.iter().take(24) {
-			render_hub_message_row(&mut output, row);
-		}
-	} else if let Some(message) = object.get("message") {
-		if !message.is_null() {
-			render_hub_message_row(&mut output, message);
-		} else {
-			output.push_str("<text fg=muted>no message received</text>");
-		}
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_hub_message_row(output: &mut String, value: &serde_json::Value) {
-	let Some(message) = value.as_object() else {
-		output.push_str("<text fg=muted>");
-		push_text(output, value.as_str().unwrap_or_default());
-		output.push_str("</text>");
-		return;
-	};
-	let from = json_string(message, &["from", "sender"]).unwrap_or("me");
-	let to = json_string(message, &["to", "recipient"]).unwrap_or("hub");
-	let text = json_string(message, &["text", "message", "outcome", "status"]).unwrap_or_default();
-	output.push_str("<row gap=1><text fg=info>");
-	push_text(output, from);
-	output.push_str(" → ");
-	push_text(output, to);
-	output.push_str("</text><text>");
-	push_text(output, text);
-	output.push_str("</text></row>");
-}
-
-fn render_hub_wait(object: &serde_json::Map<String, serde_json::Value>) -> Str {
-	let waited = json_u64(object, &["waitingMs", "waitedMs"]).unwrap_or(0);
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=info><row gap=1><spinner>waiting</spinner><text fg=muted>",
-	);
-	write!(output, "{waited} ms elapsed").expect("writing to String cannot fail");
-	if object.get("timeout").and_then(serde_json::Value::as_bool) == Some(true) {
-		output.push_str(" · timeout");
-	}
-	output.push_str("</text></row></box>");
-	Str::new(output)
-}
-
-fn render_hub_process_or_job(object: &serde_json::Map<String, serde_json::Value>) -> Str {
-	let label = if object.contains_key("job") {
-		"Job"
-	} else {
-		"Process"
-	};
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=secondary><col gap=0><row gap=1><text bold fg=secondary>",
-	);
-	push_text(&mut output, label);
-	output.push_str("</text><text bold>");
-	if let Some(name) = json_string(object, &["name", "job"]) {
-		push_text(&mut output, name);
-	}
-	output.push_str("</text></row>");
-	for (key, value) in object {
-		if matches!(key.as_str(), "name" | "job") {
-			continue;
-		}
-		output.push_str("<row gap=1><text fg=muted>");
-		push_text(&mut output, key);
-		output.push_str("</text><text truncate>");
-		push_text(&mut output, &json_compact(value));
-		output.push_str("</text></row>");
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn json_string<'a>(
-	object: &'a serde_json::Map<String, serde_json::Value>,
-	keys: &[&str],
-) -> Option<&'a str> {
-	keys
-		.iter()
-		.find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
-}
-
-fn json_u64(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u64> {
-	keys
-		.iter()
-		.find_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
-}
-
-fn json_compact(value: &serde_json::Value) -> String {
-	match value {
-		serde_json::Value::String(value) => value.clone(),
-		_ => serde_json::to_string(value).unwrap_or_default(),
-	}
-}
-
 fn fault_view(name: &str, message: &str) -> Str {
 	let mut output = String::from("<row gap=1><text bold fg=error>");
 	push_text(&mut output, name);
 	output.push_str("</text><text fg=error>");
 	push_text(&mut output, message);
 	output.push_str("</text></row>");
-	Str::new(output)
-}
-
-/// Physical wrapped-row budget for collapsed edit diff cards.
-const COLLAPSED_EDIT_DIFF_ROWS: u16 = omp_hashline::diff_preview::COLLAPSED_DIFF_ROWS;
-
-fn render_edit_live(update: Option<&EditUpdate>) -> Str {
-	let Some(update) = update else {
-		return live_view("edit", "preparing");
-	};
-	let mut output = String::from("<col gap=0><row gap=1><text bold>edit</text><text fg=muted>");
-	if let Some(path) = update.paths.first() {
-		output.push_str(" · ");
-		push_text(&mut output, path);
-		if update.paths.len() > 1 {
-			write!(output, " (+{} more)", update.paths.len() - 1)
-				.expect("writing to String cannot fail");
-		}
-		output.push_str(" · ");
-	}
-	write!(
-		output,
-		"preview · {} ops · +{} -{}",
-		update.applied_ops, update.added_lines, update.removed_lines
-	)
-	.expect("writing to String cannot fail");
-	write!(output, "</text></row><diff max={COLLAPSED_EDIT_DIFF_ROWS}>")
-		.expect("writing to String cannot fail");
-	push_text(&mut output, &update.preview);
-	output.push_str("</diff></col>");
-	Str::new(output)
-}
-
-fn render_edit_payload(payload: &EditPayload) -> Str {
-	let (added, removed) = payload
-		.sections
-		.iter()
-		.flat_map(|section| section.diff.lines())
-		.fold((0usize, 0usize), |(added, removed), line| {
-			(
-				added + usize::from(line.starts_with('+') && !line.starts_with("+++")),
-				removed + usize::from(line.starts_with('-') && !line.starts_with("---")),
-			)
-		});
-	let mut output = String::from("<col gap=0><row gap=1><text bold>edit</text><text>");
-	write!(output, "{} files changed · +{added} -{removed}", payload.sections.len())
-		.expect("writing to String cannot fail");
-	output.push_str("</text></row>");
-	for section in &payload.sections {
-		output.push_str("<row gap=1><text>");
-		push_text(&mut output, &section.path);
-		output.push_str("</text><text fg=muted>");
-		write!(output, "{} ops", section.applied_ops.len()).expect("writing to String cannot fail");
-		if section.rebased {
-			output.push_str(" · rebased");
-		}
-		write!(output, "</text></row><diff max={COLLAPSED_EDIT_DIFF_ROWS}>")
-			.expect("writing to String cannot fail");
-		push_text(&mut output, &section.diff);
-		for (index, diagnostic) in section.diagnostics.iter().enumerate() {
-			if !section.diff.is_empty() || index > 0 {
-				output.push('\n');
-			}
-			output.push_str("! ");
-			if !diagnostic.source.is_empty() {
-				push_text(&mut output, &diagnostic.source);
-				if !diagnostic.code.is_empty() {
-					output.push('[');
-					push_text(&mut output, &diagnostic.code);
-					output.push(']');
-				}
-				output.push_str(": ");
-			}
-			push_text(&mut output, &diagnostic.message);
-		}
-		if !section.diagnostics_complete {
-			if !section.diff.is_empty() || !section.diagnostics.is_empty() {
-				output.push('\n');
-			}
-			output.push_str("! Additional LSP diagnostics are still settling");
-		}
-		output.push_str("</diff>");
-	}
-	output.push_str("</col>");
-	Str::new(output)
-}
-
-fn edit_fault(fault: &EditFault) -> String {
-	use crate::edit::RejectionReason;
-	let mut output = match &fault.reason {
-		RejectionReason::Conflict => String::from("edit conflict"),
-		RejectionReason::StaleUnrecoverable { message }
-		| RejectionReason::Format { message }
-		| RejectionReason::InvalidPatch { message } => message.to_string(),
-	};
-	for conflict in &fault.conflicts {
-		write!(
-			output,
-			" · lines {}-{}: {}",
-			conflict.start_line, conflict.end_line, conflict.message
-		)
-		.expect("writing to String cannot fail");
-	}
-	output
-}
-
-fn render_grep_payload(payload: &GrepPayload) -> Str {
-	let matches = payload
-		.files
-		.iter()
-		.map(|file| file.matches.len())
-		.sum::<usize>();
-	let mut output = String::from("<col gap=0><row gap=1><text bold>grep</text><text>");
-	write!(output, "{matches} matches in {} files", payload.total_files)
-		.expect("writing to String cannot fail");
-	if payload.total_files_lower_bound {
-		output.push_str(" or more");
-	}
-	output.push_str("</text></row>");
-	for file in &payload.files {
-		output.push_str("<row gap=1><text>");
-		push_text(&mut output, &file.path);
-		output.push_str("</text><text fg=muted>");
-		write!(output, "{} matches", file.matches.len()).expect("writing to String cannot fail");
-		output.push_str("</text></row>");
-	}
-	for note in &payload.notes {
-		output.push_str("<text fg=muted>");
-		push_text(&mut output, note);
-		output.push_str("</text>");
-	}
-	output.push_str("</col>");
-	Str::new(output)
-}
-
-fn render_glob_payload(payload: &GlobPayload) -> Str {
-	let mut output = String::from("<col gap=0><row gap=1><text bold>glob</text><text>");
-	write!(output, "{} paths", payload.matches.len()).expect("writing to String cannot fail");
-	if payload.truncated {
-		write!(output, " · truncated from {} partial matches", payload.partial_match_count)
-			.expect("writing to String cannot fail");
-	}
-	if payload.timed_out {
-		write!(output, " · timed out after {} ms", payload.timeout_ms)
-			.expect("writing to String cannot fail");
-	}
-	output.push_str("</text></row>");
-	for entry in &payload.matches {
-		output.push_str("<text>");
-		push_text(&mut output, &entry.path);
-		if entry.is_dir {
-			output.push('/');
-		}
-		output.push_str("</text>");
-	}
-	output.push_str("</col>");
-	Str::new(output)
-}
-
-fn shell_fault(fault: &ShellFault) -> String {
-	match fault {
-		ShellFault::Resource { operation, message } => format!("{operation}: {message}"),
-		ShellFault::PtyDenied => String::from("PTY allocation denied by invocation scope"),
-		ShellFault::InvalidEnvironmentKey { key } => {
-			format!("invalid shell environment key {key:?}")
-		},
-		ShellFault::AsyncNameRequired => String::from("async shell execution requires a name"),
-	}
-}
-
-fn render_shell_detached(job: &omp_tool::JobRef) -> Str {
-	let mut output = String::from(
-		"<box border=round pad=\"0 1\" bc=info><col gap=0><row gap=1><text bold \
-		 fg=info>$</text><text bold>shell detached</text><spinner>running</spinner></row><row \
-		 gap=1><text fg=muted>job</text><text bold>",
-	);
-	push_text(&mut output, &job.id);
-	output.push_str("</text></row><text>");
-	push_text(&mut output, &job.metadata.label);
-	output.push_str("</text><text fg=muted>completion will be delivered by the job board</text>");
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn render_shell_payload(payload: &ShellPayload) -> Str {
-	const PREVIEW_LINES: usize = 20;
-	let retained = payload
-		.transcript
-		.iter()
-		.map(|frame| frame.data.len())
-		.sum::<usize>();
-	let outcome = debug_label(payload.status.outcome);
-	let color = match payload.status.outcome {
-		ExecOutcome::Exited if payload.status.exit_code.unwrap_or_default() == 0 => "success",
-		ExecOutcome::Timeout => "warning",
-		ExecOutcome::Exited | ExecOutcome::Failed | ExecOutcome::Cancelled | ExecOutcome::Denied => {
-			"error"
-		},
-	};
-	let mut output = String::from("<box border=round pad=\"0 1\" bc=");
-	output.push_str(color);
-	output.push_str(
-		"><col gap=0><row gap=1><text bold fg=accent>$</text><text bold>shell</text><text fg=",
-	);
-	output.push_str(color);
-	output.push('>');
-	push_text(&mut output, &outcome);
-	output.push_str("</text>");
-	if let Some(code) = payload.status.exit_code {
-		output.push_str("<text fg=");
-		output.push_str(color);
-		output.push('>');
-		write!(output, "exit {code}").expect("writing to String cannot fail");
-		output.push_str("</text>");
-	}
-	if let Some(signal) = &payload.status.signal {
-		output.push_str("<text fg=error>");
-		push_text(&mut output, signal);
-		output.push_str("</text>");
-	}
-	output.push_str("<text fg=muted>");
-	write!(output, "{} ms · {retained} bytes", payload.status.wall_clock_ms)
-		.expect("writing to String cannot fail");
-	output.push_str("</text></row><pre fg=accent>");
-	push_text(&mut output, "$ ");
-	push_text(&mut output, &payload.command);
-	output.push_str("</pre>");
-	if let Some(cwd) = &payload.status.final_cwd_uri {
-		output.push_str("<row gap=1><text fg=muted>cwd</text><text truncate>");
-		push_text(&mut output, cwd);
-		output.push_str("</text></row>");
-	}
-	let contains_sixel = payload.transcript.iter().any(|frame| {
-		frame.data.as_ref().contains(&0x90)
-			|| frame
-				.data
-				.as_ref()
-				.windows(2)
-				.any(|window| window == b"\x1bP")
-	});
-	let transcript = bounded_transcript_tail(&payload.transcript, contains_sixel);
-	if !transcript.is_empty() {
-		let text = String::from_utf8_lossy(&transcript);
-		let lines = text.lines().collect::<Vec<_>>();
-		let preview_start = lines.len().saturating_sub(PREVIEW_LINES);
-		output.push_str("<pre fg=muted>");
-		for (index, line) in lines[preview_start..].iter().enumerate() {
-			if index > 0 {
-				output.push('\n');
-			}
-			push_text(&mut output, line);
-		}
-		output.push_str("</pre>");
-		if preview_start > 0 {
-			write!(
-				output,
-				"<text fg=muted>{preview_start} earlier lines hidden · ctrl+o to expand</text>"
-			)
-			.expect("writing to String cannot fail");
-		}
-	}
-	if payload.status.spilled_output.is_some() {
-		output.push_str("<text fg=muted>full output stored as blob</text>");
-	}
-	if payload.status.effects_unknown {
-		output.push_str("<text fg=warning>final effect state is unknown</text>");
-	}
-	output.push_str("</col></box>");
-	Str::new(output)
-}
-
-fn bounded_transcript_tail(transcript: &[TranscriptFrame], retain_all: bool) -> Vec<u8> {
-	const MAX_RENDER_BYTES: usize = 64 * 1024;
-	let total = transcript
-		.iter()
-		.map(|frame| frame.data.len())
-		.sum::<usize>();
-	let retain = if retain_all {
-		total
-	} else {
-		total.min(MAX_RENDER_BYTES)
-	};
-	let skip = total.saturating_sub(retain);
-	let mut output = Vec::with_capacity(retain);
-	let mut offset = 0usize;
-	for frame in transcript {
-		let bytes = frame.data.as_ref();
-		let frame_end = offset.saturating_add(bytes.len());
-		if frame_end > skip {
-			let start = skip.saturating_sub(offset);
-			output.extend_from_slice(&bytes[start..]);
-		}
-		offset = frame_end;
-	}
-	output
-}
-
-fn render_write_payload(payload: &WritePayload) -> Str {
-	let disposition = debug_label(payload.disposition);
-	let mut output = String::from("<row gap=1><text bold>write</text><text>");
-	push_text(&mut output, &disposition);
-	output.push(' ');
-	push_text(&mut output, &payload.display_path);
-	output.push_str("</text><text fg=muted>");
-	write!(output, "{} bytes", payload.byte_len).expect("writing to String cannot fail");
-	if payload.made_executable {
-		output.push_str(" · executable");
-	}
-	if payload.stripped_wrapper {
-		output.push_str(" · stripped wrapper");
-	}
-	output.push_str("</text></row>");
-	Str::new(output)
-}
-
-fn render_read_payload(payload: &ReadPayload) -> Str {
-	let mut text_bytes = 0usize;
-	let mut blobs = 0usize;
-	let mut blob_bytes = 0u64;
-	for part in &payload.parts {
-		match part {
-			PayloadPart::Text { text } => {
-				text_bytes = text_bytes.saturating_add(text.len());
-			},
-			PayloadPart::Blob { blob, .. } => {
-				blobs = blobs.saturating_add(1);
-				blob_bytes = blob_bytes.saturating_add(blob.byte_len);
-			},
-		}
-	}
-	let mut output = String::from("<row gap=1><text bold>read</text><text>");
-	write!(output, "{} parts · {text_bytes} text bytes", payload.parts.len())
-		.expect("writing to String cannot fail");
-	if blobs != 0 {
-		write!(output, " · {blobs} blobs · {blob_bytes} blob bytes")
-			.expect("writing to String cannot fail");
-	}
-	output.push_str("</text></row>");
-	Str::new(output)
-}
-
-fn eval_fault(fault: &EvalFault) -> String {
-	match fault {
-		EvalFault::InvalidTimeout => String::from("timeout must be non-negative and finite"),
-		EvalFault::Resource { operation, message } => {
-			format!("{operation}: {message}")
-		},
-		EvalFault::SessionLost { message } => message.to_string(),
-	}
-}
-
-fn render_eval_payload(payload: &EvalPayload) -> Str {
-	let mut status = debug_label(payload.status.outcome);
-	if let Some(code) = payload.status.exit_code {
-		write!(status, " · exit {code}").expect("writing to String cannot fail");
-	}
-	let retained = payload
-		.frames
-		.iter()
-		.map(|frame| frame.data.len())
-		.sum::<usize>();
-	let mut output = String::from("<col gap=0><row gap=1><text bold>eval</text><text>");
-	push_text(&mut output, &status);
-	output.push_str("</text><text fg=muted>");
-	write!(
-		output,
-		"{retained} retained bytes · {} total bytes · {} ms",
-		payload.total_bytes, payload.status.duration_ms
-	)
-	.expect("writing to String cannot fail");
-	output.push_str("</text></row>");
-	if let Some(title) = &payload.title {
-		output.push_str("<text bold>");
-		push_text(&mut output, title);
-		output.push_str("</text>");
-	}
-	if let Some(exception) = &payload.status.exception {
-		output.push_str("<text fg=error>");
-		push_text(&mut output, &exception.name);
-		if !exception.message.is_empty() {
-			output.push_str(": ");
-			push_text(&mut output, &exception.message);
-		}
-		output.push_str("</text>");
-	}
-	if payload.truncated {
-		output.push_str("<text fg=muted>output truncated</text>");
-	}
-	output.push_str("</col>");
-	Str::new(output)
-}
-
-fn render_web_search_payload(payload: &WebSearchPayload) -> Str {
-	let response = &payload.response;
-	let mut output = String::from("<col gap=0><row gap=1><text bold>web_search</text>");
-	if !response.engine.is_empty() {
-		output.push_str("<text fg=accent bold>");
-		push_text(&mut output, &response.engine);
-		output.push_str("</text>");
-	}
-	if !response.auth_mode.is_empty() {
-		output.push_str("<text fg=muted>");
-		push_text(&mut output, &response.auth_mode);
-		output.push_str("</text>");
-	}
-	output.push_str("</row>");
-	if !response.answer.is_empty() {
-		output.push_str("<md>");
-		push_text(&mut output, &response.answer);
-		output.push_str("</md>");
-	}
-	if !response.sources.is_empty() {
-		output.push_str("<text bold>Sources</text><col gap=0>");
-		for (index, source) in response.sources.iter().enumerate() {
-			output.push_str("<row gap=1><text fg=muted>");
-			write!(output, "{}.", index + 1).expect("writing to a String cannot fail");
-			output.push_str("</text><text href=\"");
-			push_attr(&mut output, &source.url);
-			output.push_str("\" fg=accent underline>");
-			if source.title.is_empty() {
-				push_text(&mut output, &source.url);
-			} else {
-				push_text(&mut output, &source.title);
-			}
-			output.push_str("</text>");
-			if !source.snippet.is_empty() {
-				output.push_str("<text fg=muted truncate>");
-				push_text(&mut output, &source.snippet);
-				output.push_str("</text>");
-			}
-			output.push_str("</row>");
-		}
-		output.push_str("</col>");
-	}
-	if let Some(usage) = response.usage.as_ref() {
-		let total = usage
-			.total_tokens
-			.unwrap_or_else(|| usage.input_tokens.saturating_add(usage.output_tokens));
-		let searches = usage
-			.server_tools
-			.as_ref()
-			.and_then(|tools| tools.web_search_requests)
-			.unwrap_or(0);
-		if total != 0 || searches != 0 {
-			output.push_str("<row gap=1><text fg=muted>");
-			if total != 0 {
-				write!(output, "{total} tokens").expect("writing to a String cannot fail");
-			}
-			if total != 0 && searches != 0 {
-				output.push_str(" · ");
-			}
-			if searches != 0 {
-				write!(output, "{searches} search requests").expect("writing to a String cannot fail");
-			}
-			output.push_str("</text></row>");
-		}
-	}
-	for warning in &response.warnings {
-		output.push_str("<row gap=1><text fg=warn bold>relaxed</text><text fg=warn>");
-		push_text(&mut output, warning);
-		output.push_str("</text></row>");
-	}
-	for failure in &response.failures {
-		output.push_str("<row gap=1><text fg=muted>");
-		push_text(&mut output, &failure.provider);
-		output.push_str("</text><text fg=warn>");
-		push_text(&mut output, &failure.code);
-		if let Some(status) = failure.status {
-			write!(output, " · HTTP {status}").expect("writing to a String cannot fail");
-		}
-		output.push_str("</text></row>");
-	}
-	output.push_str("</col>");
-	Str::new(output)
-}
-
-fn render_web_search_fault(message: &str) -> Str {
-	let mut output = String::from("<col gap=0><row gap=1><text bold fg=error>web_search</text>");
-	output.push_str("<text fg=error>failed</text></row><text fg=error>");
-	push_text(&mut output, message);
-	output.push_str("</text></col>");
 	Str::new(output)
 }
 
@@ -1260,27 +231,21 @@ impl TextProjection {
 }
 
 #[cfg(test)]
-mod tests {
-	use bytes::Bytes;
+pub(crate) mod test_support {
+	//! Shared registry construction helpers for renderer tests.
+
 	use omp_core::{Str, sf};
-	use omp_tool::{
-		Abort, ArgIssue, ArgIssueKind, CallOutcome, Rev, ToolIdentity,
-		render::{RenderRegistry, ViewState},
-	};
+	use omp_tool::{Rev, ToolIdentity, render::RenderRegistry};
 
 	use super::{BuiltinRendererIdentities, register_builtin_renderers};
-	use crate::{
-		edit::{EditUpdate, Fault as EditFault, Payload as EditPayload},
-		hub::{Fault as HubFault, Response as HubResponse},
-		read::{Fault as ReadFault, Payload as ReadPayload},
-		write::{Fault as WriteFault, Payload as WritePayload, WriteDisposition, WriteOperation},
-	};
 
-	fn identity(name: &str, revision: u16) -> ToolIdentity {
+	/// Mints a test identity under the shared `test` revision family.
+	pub(crate) fn identity(name: &str, revision: u16) -> ToolIdentity {
 		ToolIdentity { name: Str::new(name), rev: Rev { family: sf!("test"), n: revision } }
 	}
 
-	fn identities() -> BuiltinRendererIdentities {
+	/// Full identity set covering every built-in renderer.
+	pub(crate) fn identities() -> BuiltinRendererIdentities {
 		BuiltinRendererIdentities {
 			edit:       Some(identity("edit", 41)),
 			grep:       Some(identity("grep", 42)),
@@ -1294,7 +259,8 @@ mod tests {
 		}
 	}
 
-	fn registry(
+	/// Registers every built-in renderer and echoes the identity set.
+	pub(crate) fn registry(
 		identities: BuiltinRendererIdentities,
 	) -> (RenderRegistry, BuiltinRendererIdentities) {
 		let mut registry = RenderRegistry::new();
@@ -1302,6 +268,16 @@ mod tests {
 			.expect("unique built-in identities register");
 		(registry, identities)
 	}
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_tool::render::{RenderRegistry, ViewState};
+
+	use super::{
+		BuiltinRendererIdentities, register_builtin_renderers,
+		test_support::{identities, identity, registry},
+	};
 
 	#[test]
 	fn registers_every_builtin_at_only_its_exact_revision() {
@@ -1347,162 +323,5 @@ mod tests {
 		.unwrap();
 		assert!(registry.get(&read).is_some());
 		assert!(registry.get(&identity("edit", 9)).is_none());
-	}
-
-	#[test]
-	fn edit_update_reduces_to_compact_state_then_settles() {
-		let (registry, identities) = registry(identities());
-		let update = EditUpdate {
-			applied_ops:   2,
-			paths:         vec![sf!("src/lib.rs"), sf!("src/other.rs")],
-			preview:       sf!("+&lt;already-markup"),
-			added_lines:   3,
-			removed_lines: 1,
-		};
-		let mut state = ViewState::new();
-		registry
-			.fold(
-				identities.edit.as_ref().unwrap(),
-				&mut state,
-				Bytes::from(serde_json::to_vec(&update).expect("update serializes")),
-			)
-			.expect("typed update folds");
-		assert_eq!(state.raw_update_count(), 0);
-		assert_eq!(
-			registry
-				.view(identities.edit.as_ref().unwrap(), &state, None)
-				.expect("live edit renders")
-				.as_str(),
-			"<col gap=0><row gap=1><text bold>edit</text><text fg=muted> · src/lib.rs (+1 more) · \
-			 preview · 2 ops · +3 -1</text></row><diff max=40>+&amp;lt;already-markup</diff></col>",
-		);
-
-		let outcome = CallOutcome::<EditPayload, EditFault>::Ok(EditPayload { sections: Vec::new() });
-		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
-		assert_eq!(
-			registry
-				.view(identities.edit.as_ref().unwrap(), &state, Some(&encoded))
-				.expect("settled edit renders")
-				.as_str(),
-			"<col gap=0><row gap=1><text bold>edit</text><text>0 files changed · +0 \
-			 -0</text></row></col>",
-		);
-	}
-
-	#[test]
-	fn hub_renderer_projects_wait_progress_roster_and_isolated_logs() {
-		let (registry, identities) = registry(identities());
-		let hub = identities.hub.as_ref().expect("hub identity");
-		let mut state = ViewState::new();
-		let progress =
-			HubResponse { text: Str::from(r#"{"waitingMs":500,"jobs":[]}"#), useless: true };
-		registry
-			.fold(
-				hub,
-				&mut state,
-				Bytes::from(serde_json::to_vec(&progress).expect("progress serializes")),
-			)
-			.expect("hub progress folds");
-		let live = registry
-			.view(hub, &state, None)
-			.expect("hub progress renders");
-		assert!(live.contains("<spinner>"));
-		assert!(live.contains("waiting 500 ms"));
-
-		let response = HubResponse {
-			text:    Str::from(
-				r#"{"peers":[{"name":"Scout","status":"running","unreadCount":2,"parent":"Main"}]}"#,
-			),
-			useless: false,
-		};
-		let encoded = serde_json::to_vec(&CallOutcome::<HubResponse, HubFault>::Ok(response))
-			.expect("outcome serializes");
-		let roster = registry
-			.view(hub, &state, Some(&encoded))
-			.expect("roster renders");
-		assert!(roster.contains("Hub roster"));
-		assert!(roster.contains("Scout"));
-		assert!(roster.contains("2 unread"));
-	}
-
-	#[test]
-	fn typed_fault_renders_while_args_and_abort_use_generic_facts() {
-		let (registry, identities) = registry(identities());
-		let state = ViewState::new();
-		let fault = CallOutcome::<ReadPayload, ReadFault>::Faulted(ReadFault::Source {
-			message: sf!("missing <file> & owner"),
-		});
-		let encoded_fault = serde_json::to_vec(&fault).expect("fault serializes");
-		assert_eq!(
-			registry
-				.view(identities.read.as_ref().unwrap(), &state, Some(&encoded_fault))
-				.expect("typed fault renders")
-				.as_str(),
-			"<row gap=1><text bold fg=error>read</text><text fg=error>missing &lt;file&gt; &amp; \
-			 owner</text></row>",
-		);
-
-		let args = CallOutcome::<ReadPayload, ReadFault>::ArgsRejected(ArgIssue {
-			path:     Vec::new(),
-			expected: sf!("path"),
-			kind:     ArgIssueKind::Missing,
-			example:  Some(sf!(r#"{{"path":"src/lib.rs"}}"#)),
-			found:    None,
-		});
-		let encoded_args = serde_json::to_vec(&args).expect("argument issue serializes");
-		assert_eq!(
-			registry
-				.view(identities.read.as_ref().unwrap(), &state, Some(&encoded_args))
-				.expect("argument fallback renders")
-				.as_str(),
-			std::str::from_utf8(&encoded_args).expect("JSON is UTF-8"),
-		);
-
-		let abort = CallOutcome::<ReadPayload, ReadFault>::aborted(Abort::Interrupted {
-			reason: sf!("cancelled"),
-		});
-		let encoded_abort = serde_json::to_vec(&abort).expect("abort serializes");
-		assert_eq!(
-			registry
-				.view(identities.read.as_ref().unwrap(), &state, Some(&encoded_abort))
-				.expect("abort fallback renders")
-				.as_str(),
-			std::str::from_utf8(&encoded_abort).expect("JSON is UTF-8"),
-		);
-	}
-
-	#[test]
-	fn settled_output_is_deterministic_and_escapes_payload_text() {
-		let (registry, identities) = registry(identities());
-		let outcome = CallOutcome::<WritePayload, WriteFault>::Ok(WritePayload {
-			resolved_path:      sf!("/tmp/a<&.txt"),
-			display_path:       sf!("a<&.txt"),
-			canonical_recovery: None,
-			byte_len:           9,
-			reported_len:       9,
-			disposition:        WriteDisposition::Created,
-			stripped_wrapper:   false,
-			made_executable:    true,
-			snapshot_tag:       Some(sf!("ABCD")),
-			operation:          WriteOperation::Plain,
-		});
-		let encoded = serde_json::to_vec(&outcome).expect("outcome serializes");
-		let state = ViewState::new();
-		let write_identity = identities
-			.write
-			.as_ref()
-			.expect("write identity registered");
-		let first = registry
-			.view(write_identity, &state, Some(&encoded))
-			.expect("write renders");
-		let second = registry
-			.view(write_identity, &state, Some(&encoded))
-			.expect("write rerenders");
-		assert_eq!(first, second);
-		assert_eq!(
-			first.as_str(),
-			"<row gap=1><text bold>write</text><text>created a&lt;&amp;.txt</text><text fg=muted>9 \
-			 bytes · executable</text></row>",
-		);
 	}
 }

@@ -62,79 +62,15 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 		read:       Some(read.clone()),
 		eval:       Some(eval.clone()),
 	};
-	let fixtures = vec![
-		RendererGalleryFixture {
-			identity: edit,
-			title: "edit src/gallery.rs",
-			progress_update: Some(
-				br#"{"applied_ops":2,"preview":"--- src/gallery.rs\n+++ src/gallery.rs\n+gallery","added_lines":1,"removed_lines":0}"#,
-			),
-			success_outcome: br#"{"kind":"ok","value":{"sections":[]}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"reason":{"kind":"invalid_patch","message":"gallery patch rejected"},"conflicts":[]}}"#,
-		},
-		RendererGalleryFixture {
-			identity: grep,
-			title: "grep gallery",
-			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"files":[],"total_files":1,"total_files_lower_bound":false,"multi_scope":true,"skip":0,"file_limit_reached":false,"per_file_limit_reached":false,"notes":[],"projected_text":"src/gallery.rs:1:gallery","output_blob":null,"output_shown_lines":1,"output_total_lines":1}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"invalid_regex","message":"unclosed group"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: web_search,
-			title: "web_search native gallery",
-			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"response":{"engine":"gallery","answer":"Native renderer gallery result.","sources":[],"citations":[],"searchQueries":[],"related":[],"warnings":[],"unsupported":[],"account":"","authMode":"","failures":[]}}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"search","code":"gallery","message":"sample provider failure"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: glob,
-			title: "glob crates/**/*.rs",
-			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"matches":[],"missing_paths":[],"timed_out":false,"truncated":false,"result_limit_reached":null,"partial_match_count":1,"timeout_ms":30000,"projected_text":"crates/app/src/gallery_cmd.rs","output_blob":null,"output_shown_lines":1,"output_total_lines":1}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"invalid_pattern","pattern":"[","message":"unclosed character class"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: shell,
-			title: "shell printf gallery",
-			progress_update: Some(
-				br#"{"channel":"stdout","data":[103,97,108,108,101,114,121,10],"sequence":1,"exec_id":[1],"started":true,"terminal":false}"#,
-			),
-			success_outcome: br#"{"kind":"ok","value":{"session_id":[1],"exec_id":[1],"command":"printf gallery","transcript":[{"channel":"stdout","data":[103,97,108,108,101,114,121,10],"sequence":1}],"adjustments":[],"status":{"outcome":"exited","exit_code":0,"signal":null,"wall_clock_ms":12,"spilled_output":null,"aborted":false,"effects_unknown":false,"final_cwd_uri":null,"final_cwd_revision":0}}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"resource","operation":"execute","message":"sample process failure"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: hub,
-			title: "hub jobs",
-			progress_update: Some(
-				br#"{"text":"{\"waitingMs\":250,\"jobs\":[]}","useless":true}"#,
-			),
-			success_outcome: br#"{"kind":"ok","value":{"text":"{\"peers\":[{\"name\":\"Gallery\",\"status\":\"running\",\"unreadCount\":0,\"parent\":\"Main\"}]}","useless":false}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"message":"sample coordination failure"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: write,
-			title: "write gallery.txt",
-			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"resolved_path":"/tmp/gallery.txt","display_path":"gallery.txt","byte_len":7,"reported_len":7,"disposition":"created","stripped_wrapper":false,"made_executable":false,"snapshot_tag":"ABCD","operation":{"kind":"plain"}}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"document","message":"sample write failure"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: read,
-			title: "read src/gallery.rs",
-			progress_update: Some(br#"{"phase":"reading source"}"#),
-			success_outcome: br#"{"kind":"ok","value":{"parts":[{"kind":"text","text":"1: gallery fixture"}]}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"source","message":"sample source failure"}}"#,
-		},
-		RendererGalleryFixture {
-			identity: eval,
-			title: "eval gallery",
-			progress_update: Some(
-				br#"{"channel":"stdout","data":[103,97,108,108,101,114,121,10],"sequence":1}"#,
-			),
-			success_outcome: br#"{"kind":"ok","value":{"session_id":[1],"cell_id":[1],"language":"py","title":"gallery","code":"print('gallery')","reset":false,"frames":[{"channel":"stdout","data":[103,97,108,108,101,114,121,10],"sequence":1}],"result":null,"display_outputs":[],"status":{"outcome":"complete","exit_code":0,"duration_ms":4,"exception":null},"truncated":false,"spilled_output":null,"total_lines":1,"total_bytes":8}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"resource","operation":"run","message":"sample eval failure"}}"#,
-		},
-	];
+	let fixtures = [
+		crate::render::edit::gallery_fixtures(edit.clone()),
+		crate::render::fs::gallery_fixtures(write.clone(), read.clone()),
+		crate::render::search::gallery_fixtures(grep.clone(), glob.clone()),
+		crate::render::exec::gallery_fixtures(shell.clone(), eval.clone()),
+		crate::render::web::gallery_fixtures(web_search.clone()),
+		crate::render::hub::gallery_fixtures(hub.clone()),
+	]
+	.concat();
 	BuiltinRendererGallery { identities, fixtures }
 }
 #[cfg(test)]
