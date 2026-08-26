@@ -2,10 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use omp_core::Str;
+use omp_core::{FastHashMap, Str};
 use omp_proto::omp::inference::v1;
-use rustc_hash::FxHashMap;
-
 use crate::semconv::ToolStatus;
 
 /// The full-fidelity wire shape is the single in-process provider-usage truth.
@@ -250,8 +248,8 @@ pub struct RunCollector {
 	invoked_tools:   BTreeSet<Str>,
 	models_used:     BTreeSet<Str>,
 	providers_used:  BTreeSet<Str>,
-	chat_starts:     FxHashMap<i64, ChatStart>,
-	tool_starts:     FxHashMap<Str, ToolStart>,
+	chat_starts:     FastHashMap<i64, ChatStart>,
+	tool_starts:     FastHashMap<Str, ToolStart>,
 	run_ended:       bool,
 }
 

@@ -26,8 +26,8 @@ use libc::{S_IXGRP, S_IXOTH, S_IXUSR};
 use lscolors::Colorable;
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 #[cfg(unix)]
-use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
+use omp_core::FastHashMap;
+use omp_core::FastHashSet;
 use thiserror::Error;
 
 use crate::{
@@ -49,7 +49,7 @@ mod colors {
 	};
 
 	use lscolors::{Indicator, LsColors, Style};
-	use rustc_hash::FxHashMap;
+	use omp_core::FastHashMap;
 
 	use super::PathData;
 	#[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
@@ -88,7 +88,7 @@ mod colors {
 		pub(crate) initial_reset_is_done: bool,
 		pub(crate) colors:                &'a LsColors,
 		/// raw indicator codes as specified in LS_COLORS (if available)
-		indicator_codes:                  FxHashMap<Indicator, String>,
+		indicator_codes:                  FastHashMap<Indicator, String>,
 		/// whether ln=target is active
 		ln_color_from_target:             bool,
 	}
@@ -783,8 +783,8 @@ mod colors {
 		)
 	}
 
-	fn parse_indicator_codes(ls_colors: Option<&str>) -> (FxHashMap<Indicator, String>, bool) {
-		let mut indicator_codes = FxHashMap::default();
+	fn parse_indicator_codes(ls_colors: Option<&str>) -> (FastHashMap<Indicator, String>, bool) {
+		let mut indicator_codes = FastHashMap::default();
 		let mut ln_color_from_target = false;
 
 		// LS_COLORS validity is checked before enabling color output, so parse
@@ -846,7 +846,7 @@ mod colors {
 
 		fn style_manager(
 			colors: &LsColors,
-			indicator_codes: FxHashMap<Indicator, String>,
+			indicator_codes: FastHashMap<Indicator, String>,
 		) -> StyleManager<'_> {
 			StyleManager {
 				current_style: None,
@@ -860,21 +860,21 @@ mod colors {
 		#[test]
 		fn has_indicator_style_ignores_fallback_styles() {
 			let colors = LsColors::from_string("ex=00:fi=32");
-			let manager = style_manager(&colors, FxHashMap::default());
+			let manager = style_manager(&colors, FastHashMap::default());
 			assert!(!manager.has_indicator_style(Indicator::ExecutableFile));
 		}
 
 		#[test]
 		fn has_indicator_style_detects_explicit_styles() {
 			let colors = LsColors::from_string("ex=01;32");
-			let manager = style_manager(&colors, FxHashMap::default());
+			let manager = style_manager(&colors, FastHashMap::default());
 			assert!(manager.has_indicator_style(Indicator::ExecutableFile));
 		}
 
 		#[test]
 		fn has_indicator_style_detects_raw_codes() {
 			let colors = LsColors::empty();
-			let mut indicator_codes = FxHashMap::default();
+			let mut indicator_codes = FastHashMap::default();
 			indicator_codes.insert(Indicator::Directory, "01;34".to_string());
 			let manager = style_manager(&colors, indicator_codes);
 			assert!(manager.has_indicator_style(Indicator::Directory));
@@ -2414,7 +2414,7 @@ mod display {
 	))]
 	use libc::dev_t;
 	#[cfg(unix)]
-	use rustc_hash::FxHashMap;
+	use omp_core::FastHashMap;
 
 	use super::{
 		Config, ListState, LsError, PathData,
@@ -3035,7 +3035,7 @@ mod display {
 	fn display_uname<'a>(
 		metadata: &Metadata,
 		config: &Config,
-		uid_cache: &'a mut FxHashMap<u32, String>,
+		uid_cache: &'a mut FastHashMap<u32, String>,
 	) -> &'a String {
 		let uid = metadata.uid();
 
@@ -3052,7 +3052,7 @@ mod display {
 	fn display_group<'a>(
 		metadata: &Metadata,
 		config: &Config,
-		gid_cache: &'a mut FxHashMap<u32, String>,
+		gid_cache: &'a mut FastHashMap<u32, String>,
 	) -> &'a String {
 		let gid = metadata.gid();
 		gid_cache.entry(gid).or_insert_with(|| {
@@ -4995,16 +4995,16 @@ struct ListState<'a> {
 	// performance was equivalent to BTreeMap.
 	// It's possible a simple vector linear(binary?) search implementation would be even faster.
 	#[cfg(unix)]
-	uid_cache:         FxHashMap<u32, String>,
+	uid_cache:         FastHashMap<u32, String>,
 	#[cfg(unix)]
-	gid_cache:         FxHashMap<u32, String>,
+	gid_cache:         FastHashMap<u32, String>,
 	#[cfg(not(unix))]
 	uid_cache:         (),
 	#[cfg(not(unix))]
 	gid_cache:         (),
 	recent_time_range: RangeInclusive<SystemTime>,
 	stack:             Vec<DirData>,
-	listed_ancestors:  FxHashSet<FileInformation>,
+	listed_ancestors:  FastHashSet<FileInformation>,
 	initial_locs_len:  usize,
 	display_buf:       Vec<u8>,
 }
@@ -5024,9 +5024,9 @@ pub fn list(locs: Vec<&Path>, config: &Config, stdout: OpenFile) -> io::Result<(
 			.as_ref()
 			.map(|colors| StyleManager::new(colors, config.ls_colors.as_deref())),
 		#[cfg(unix)]
-		uid_cache: FxHashMap::default(),
+		uid_cache: FastHashMap::default(),
 		#[cfg(unix)]
-		gid_cache: FxHashMap::default(),
+		gid_cache: FastHashMap::default(),
 		#[cfg(not(unix))]
 		uid_cache: (),
 		#[cfg(not(unix))]
@@ -5037,7 +5037,7 @@ pub fn list(locs: Vec<&Path>, config: &Config, stdout: OpenFile) -> io::Result<(
 		// average.
 		recent_time_range: (now - Duration::new(31_556_952 / 2, 0))..=now,
 		stack: Vec::new(),
-		listed_ancestors: FxHashSet::default(),
+		listed_ancestors: FastHashSet::default(),
 		initial_locs_len,
 		display_buf: Vec::with_capacity(if config.format == Format::Long {
 			128

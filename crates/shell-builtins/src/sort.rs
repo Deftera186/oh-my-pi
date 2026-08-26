@@ -2467,7 +2467,7 @@ use std::{
 	cmp::Ordering,
 	ffi::{OsStr, OsString},
 	fs::{self, File, OpenOptions},
-	hash::{Hash, Hasher},
+	hash::{BuildHasher, Hash, Hasher},
 	io,
 	io::{BufRead, BufReader, BufWriter, Read, Write},
 	num::IntErrorKind,
@@ -2489,10 +2489,10 @@ use custom_str_cmp::custom_str_cmp;
 use ext_sort::ext_sort;
 use numeric_str_cmp::{NumInfo, NumInfoParseSettings, human_numeric_str_cmp, numeric_str_cmp};
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
+use omp_core::{FastHashMap, FastState};
 use rand::{RngExt as _, rng};
 #[cfg(not(target_os = "wasi"))]
 use rayon::slice::ParallelSliceMut;
-use rustc_hash::{FxHashMap, FxHasher};
 use thiserror::Error;
 
 use crate::{
@@ -4103,7 +4103,7 @@ fn index_legacy_warnings(processed_args: &[OsString], legacy_warnings: &mut [Leg
 		return;
 	}
 
-	let mut index_by_arg = FxHashMap::default();
+	let mut index_by_arg = FastHashMap::default();
 	for (warning_idx, warning) in legacy_warnings.iter().enumerate() {
 		index_by_arg.insert(warning.arg_index, warning_idx);
 	}
@@ -5387,8 +5387,7 @@ fn salt_from_random_source(path: &Path) -> SortResult<[u8; SALT_LEN]> {
 	let mut reader = open_with_open_failed_error(path)?;
 	let mut buf = [0u8; BUF_LEN];
 	let mut total = 0usize;
-	// freeze seed for --random-source
-	let mut hasher = FxHasher::with_seed(1);
+	let mut hasher = FastState::default().build_hasher();
 
 	loop {
 		let n = reader
@@ -5410,8 +5409,7 @@ fn salt_from_random_source(path: &Path) -> SortResult<[u8; SALT_LEN]> {
 	}
 
 	let first = hasher.finish();
-	// freeze seed for --random-source
-	let mut second_hasher = FxHasher::with_seed(2);
+	let mut second_hasher = FastState::default().build_hasher();
 	second_hasher.write(RANDOM_SOURCE_TAG);
 	second_hasher.write_u64(first);
 	let second = second_hasher.finish();
@@ -5424,7 +5422,7 @@ fn salt_from_random_source(path: &Path) -> SortResult<[u8; SALT_LEN]> {
 
 fn get_hash<T: Hash>(t: &T) -> u64 {
 	// Is reproducibility of get_hash itself needed for --random-source ?
-	let mut s = FxHasher::default();
+	let mut s = FastState::default().build_hasher();
 	t.hash(&mut s);
 	s.finish()
 }

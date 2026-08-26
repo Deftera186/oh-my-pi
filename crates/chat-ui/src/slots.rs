@@ -5,15 +5,13 @@
 
 use std::{collections::HashMap, str};
 
-use omp_core::Str;
+use omp_core::{Str, fast_hash64};
 use omp_proto::omp::ui::{
 	v1,
 	v1::{UiEffect, ui_effect},
 };
 use omp_tui::{Rect, Ui, UiContext};
 use smallvec::SmallVec;
-use xxhash_rust::xxh3::xxh3_64;
-
 /// Maximum live mounts admitted from one extension registry.
 pub const SLOT_MAX_PER_EXTENSION: usize = 32;
 
@@ -245,7 +243,7 @@ impl Slots {
 		let source = content.map_or("", |tml| str::from_utf8(&tml.source).unwrap_or(""));
 		let hash = content.map_or(0, |tml| {
 			if tml.hash == 0 {
-				xxh3_64(tml.source.as_ref())
+				fast_hash64(tml.source.as_ref())
 			} else {
 				tml.hash
 			}

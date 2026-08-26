@@ -23,8 +23,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, T
 use omp_shell_engine::{ShellExtensions, builtins::Registration, openfiles::OpenFile};
 use parking_lot::Mutex;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "redox"))))]
-use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
+use omp_core::FastHashMap;
+use omp_core::{FastHashSet, FastState};
 use thiserror::Error;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation;
@@ -796,8 +796,8 @@ fn move_files_into_dir(
 	options: &Options,
 ) -> MvResult<()> {
 	// remember the moved destinations for further usage
-	let mut moved_destinations: FxHashSet<PathBuf> =
-		FxHashSet::with_capacity_and_hasher(files.len(), rustc_hash::FxBuildHasher);
+	let mut moved_destinations: FastHashSet<PathBuf> =
+		FastHashSet::with_capacity_and_hasher(files.len(), FastState::default());
 	// Create hardlink tracking context
 	#[cfg(unix)]
 	let (mut hardlink_tracker, hardlink_scanner) = {
@@ -1228,7 +1228,7 @@ fn rename_dir_fallback(
 	};
 
 	#[cfg(all(unix, not(any(target_os = "macos", target_os = "redox"))))]
-	let xattrs = fsxattr::retrieve_xattrs(host.resolve(from)).unwrap_or_else(|_| FxHashMap::default());
+	let xattrs = fsxattr::retrieve_xattrs(host.resolve(from)).unwrap_or_else(|_| FastHashMap::default());
 
 	// Use directory copying (with or without hardlink support)
 	let result = copy_dir_contents(
@@ -1673,7 +1673,7 @@ mod hardlink {
 		path::{Path, PathBuf},
 	};
 
-	use rustc_hash::FxHashMap;
+	use omp_core::FastHashMap;
 
 	use super::Host;
 	use crate::support::quote::Quotable;
@@ -1682,7 +1682,7 @@ mod hardlink {
 	#[derive(Debug, Default)]
 	pub struct HardlinkTracker {
 		/// Maps (device, inode) -> destination path for the first occurrence
-		inode_map: FxHashMap<(u64, u64), PathBuf>,
+		inode_map: FastHashMap<(u64, u64), PathBuf>,
 	}
 
 	/// Pre-scans files to identify hardlink groups with optimized memory usage
@@ -1690,7 +1690,7 @@ mod hardlink {
 	pub struct HardlinkGroupScanner {
 		/// Maps (device, inode) -> list of source paths that are hardlinked
 		/// together
-		hardlink_groups: FxHashMap<(u64, u64), Vec<PathBuf>>,
+		hardlink_groups: FastHashMap<(u64, u64), Vec<PathBuf>>,
 		/// List of source files/directories being moved (for destination mapping)
 		source_files:    Vec<PathBuf>,
 		/// Whether scanning has been performed

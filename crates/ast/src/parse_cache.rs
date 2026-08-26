@@ -23,11 +23,6 @@ use tree_sitter::{Parser, Tree};
 
 use crate::{AstError, Result, language::SupportLang};
 
-/// Arbitrary fixed seed (golden-ratio constant). Fixed, not random, so a key is
-/// reproducible across calls within a process; it never leaves the process, so
-/// there is nothing to harden against `HashDoS` here.
-const HASH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
-
 /// Largest source that may occupy a slot.
 ///
 /// A tree-sitter tree runs roughly an order of magnitude larger than its
@@ -66,7 +61,7 @@ struct Key {
 }
 
 fn key_for(code: &str, lang: SupportLang) -> Key {
-	Key { hash: xxhash_rust::xxh64::xxh64(code.as_bytes(), HASH_SEED), len: code.len(), lang }
+	Key { hash: omp_core::fast_hash64(code), len: code.len(), lang }
 }
 
 struct Entry {

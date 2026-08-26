@@ -78,4 +78,3 @@ tree-sitter-xml.workspace = true
 tree-sitter-yaml.workspace = true
 tree-sitter-zig.workspace = true
 parking_lot = { workspace = true }
-xxhash-rust = { workspace = true, features = ["xxh64"] }
