@@ -112,6 +112,11 @@ Each control method seals `next_`. Calling a second method is an error. Returnin
 control; any staged effects still participate in resolution. Process termination
 remains outside general regime control.
 
+A `STREAM` cancel is recoverable, not terminal: Core silently aborts the current turn, retains a
+structurally suppressed abort marker carrying the reason, and opens a recovery turn whose first
+items are the resolution's staged appends. The submission continues; only the interrupted
+generation is discarded.
+
 `Next` groups the complete control vocabulary for autocomplete. Runtime validation rejects any
 control that is meaningless for the current event.
 
@@ -121,11 +126,16 @@ Retry after rewriting context and appending a reminder:
 
 ```python
 def empty_output(ctx, next_):
-    ctx.context.rewrite(drop_turn_tail)
+    if not ctx.event.empty_output:
+        return None
+    if ctx.event.trailing_aborts >= 3:
+        return next_.fail(EmptyOutputLimit())
     ctx.context.append(retry_instruction)
-    ctx.state.replace(ctx.state.value.incremented())
     return next_.retry()
 ```
+
+Retry counting needs no regime state: `trailing_aborts` is the journal's recoverable-abort
+projection, so the count survives crash and restart by construction.
 
 Cancel a stream and retain a reminder:
 
@@ -159,12 +169,33 @@ Regimes subscribe to the existing closed loop. A regime cannot add an event or l
 | `CONTEXT` | provider context projection | append or rewrite context |
 | `TOOL_CHOICE` | tool-choice resolution | require one tool |
 | `PRE_MODEL` | before model sampling | wait for a required ticket |
-| `STREAM` | streamed model output | cancel active generation |
+| `STREAM` | streamed model output | cancel active generation; staged appends open the recovery turn |
 | `ADMISSION` | before one tool invocation | wait or reject |
-| `BATCH` | active tool batch | reject pending work or cancel the batch |
+| `BATCH` | active tool batch | reject pending work or cancel the batch; at settlement, prepend items to the staged tool results |
 | `TURN_END` | after the tool batch | append boundary context or update state |
 | `SETTLE` | before the agent stops | retry, complete, or fail |
 | `IDLE` | idle mailbox boundary | append deferred context or update state |
+
+`BATCH` resolves twice per committed batch: before execution with `delivered=False` (admission-side
+supervision) and after settlement with `delivered=True`, the safe boundary for injecting items
+ahead of the staged tool results.
+
+### Event facts
+
+`ctx.event` exposes the immutable facts captured at the event boundary:
+
+| Fact | Meaning |
+|---|---|
+| `turn_id` | Durable turn identity, when a turn exists. |
+| `invocation_id` | Invocation identity at `ADMISSION`. |
+| `stream_delta` | Streamed UTF-8 fragment at `STREAM`. |
+| `stream_part` | Part identity at `STREAM`: `index`, `source` (`text` / `thinking` / `tool`), and `tool_name` for tool-call parts. |
+| `now_ms` | Epoch milliseconds. |
+| `delivered` | Whether the preceding operation delivered an observable effect. |
+| `checkpoint_active` | Whether an exploration checkpoint is active. |
+| `hidden` | Whether the turn is system-owned and hidden from the user (for example the compaction summarizer). Stream policy should usually skip hidden turns. |
+| `empty_output` | Whether this `SETTLE` follows an empty-output terminal stop. Regimes acting on ordinary settles must ignore failure settles. |
+| `trailing_aborts` | Recoverable failed-turn settlements in the current recovery epoch, populated at `SETTLE`. |
 
 A meaningless event/control pair is rejected at declaration or extension FREEZE. It never becomes
 a runtime precedence surprise.
@@ -202,7 +233,6 @@ def empty_output_limit(ctx, next_):
     on_limit=empty_output_limit,
 )
 def empty_output(ctx, next_):
-    ctx.context.rewrite(drop_turn_tail)
     ctx.context.append(retry_instruction)
     return next_.retry()
 ```
@@ -360,6 +390,11 @@ crate must consume them.
 
 `crates/agent/src/loop.rs` owns event placement. It consumes resolved outcomes; it does not know
 individual regime implementations.
+
+Core's own cross-cutting behavior obeys the same contract: the built-in lanes (stream rules,
+empty-output retry, checkpoint notice, provider failover) are ordinary `Regime` machines folded
+through the same per-event resolution beside durable activations. Nothing resolves outside this
+vocabulary.
 
 ## Failure behavior
 
