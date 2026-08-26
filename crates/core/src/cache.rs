@@ -7,9 +7,11 @@
 
 use std::{
 	borrow::Borrow,
-	hash::{Hash, Hasher},
+	hash::{Hash, BuildHasher as _},
 	mem,
 };
+
+use crate::fasthash::FastState;
 
 /// A fixed-capacity hash cache with second-chance eviction.
 ///
@@ -51,7 +53,7 @@ impl<K: Hash + Eq, V> MemoCache<K, V> {
 			len: 0,
 			capacity,
 			hand: 0,
-			seed: avalanche(address ^ 0xa076_1d64_78bd_642f),
+			seed: address ^ 0xa076_1d64_78bd_642f,
 		}
 	}
 
@@ -133,9 +135,7 @@ impl<K: Hash + Eq, V> MemoCache<K, V> {
 
 	#[inline]
 	fn hash<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
-		let mut hasher = FastHasher(self.seed);
-		key.hash(&mut hasher);
-		hasher.finish()
+		FastState::with_seed(self.seed).hash_one(key)
 	}
 
 	fn find<Q>(&self, key: &Q, hash: u64) -> Option<usize>
@@ -203,44 +203,6 @@ impl<K: Hash + Eq, V> MemoCache<K, V> {
 	fn advance_hand(&mut self) {
 		self.hand = (self.hand + 1) & (self.slots.len() - 1);
 	}
-}
-
-struct FastHasher(u64);
-
-impl Hasher for FastHasher {
-	#[inline]
-	fn finish(&self) -> u64 {
-		avalanche(self.0)
-	}
-
-	#[inline]
-	fn write(&mut self, bytes: &[u8]) {
-		let (chunks, remainder) = bytes.as_chunks::<8>();
-		for chunk in chunks {
-			self.0 = mix(self.0, u64::from_le_bytes(*chunk));
-		}
-		if !remainder.is_empty() {
-			let mut tail = [0_u8; 8];
-			tail[..remainder.len()].copy_from_slice(remainder);
-			self.0 = mix(self.0, u64::from_le_bytes(tail) ^ remainder.len() as u64);
-		}
-		self.0 ^= bytes.len() as u64;
-	}
-}
-
-#[inline]
-const fn mix(state: u64, value: u64) -> u64 {
-	let product = (state ^ value).wrapping_mul(0xe703_7ed1_a0b4_28db);
-	product ^ product.rotate_left(37)
-}
-
-#[inline]
-const fn avalanche(mut value: u64) -> u64 {
-	value ^= value >> 32;
-	value = value.wrapping_mul(0xd6e8_feb8_6659_fd93);
-	value ^= value >> 32;
-	value = value.wrapping_mul(0xd6e8_feb8_6659_fd93);
-	value ^ (value >> 32)
 }
 
 #[cfg(test)]

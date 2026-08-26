@@ -20,6 +20,8 @@ pub mod cow_bytes;
 pub mod dirs;
 pub mod display_time;
 pub mod encoding;
+pub mod exclusive_sync;
+pub mod fasthash;
 /// Filesystem publication helpers.
 pub mod fs;
 pub mod hash32;
@@ -46,6 +48,8 @@ pub use display_time::{
 	DisplayTimeError, local_calendar_date, local_minute_with_offset, utc_minute,
 };
 pub use encoding::{base32, base32_dns, base32_hex, base64, base64_url, hex};
+pub use exclusive_sync::ExclusiveSync;
+pub use fasthash::{FastHashMap, FastHashSet, FastState, fast_hash64};
 pub use hash32::{Hash32, Hash32ParseError};
 pub use location::{
 	AgentUrl, ArtifactAddress, ArtifactUrl, ClientPath, EnvPath, HistoryUrl, LocationError,
