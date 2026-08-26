@@ -4,7 +4,7 @@ use std::{fs, iter, path::PathBuf};
 
 use omp_core::Str;
 use omp_storage::transcript::{
-	EntryUndecodable, Event, Header, Kind, SessionId, TitleSource, Writer,
+	EntryUndecodable, Event, Header, Kind, Reader, SessionId, TitleSource, Writer,
 	writer::{JournalError, MAX_ATOMIC_ENTRIES},
 };
 use serde_json::value::RawValue;
@@ -51,6 +51,53 @@ fn atomic_group_assigns_contiguous_physical_indexes_across_reopen() {
 		[2, 3]
 	);
 	assert!(!writer.is_poisoned());
+}
+
+#[test]
+fn crash_visible_atomic_group_is_prefix_atomic_and_retryable() {
+	let directory = tempdir().expect("temporary directory");
+	let path = directory.path().join("session.jsonl");
+	let mut writer = Writer::create(&path, &header()).expect("create transcript");
+	writer
+		.append(&title(2, "committed"))
+		.expect("append committed prefix");
+	let before_group = writer.byte_watermark().expect("prefix watermark");
+	writer
+		.append_atomic(&[title(3, "hidden one"), title(4, "hidden two")])
+		.expect("append group fixture");
+	let after_group = writer.byte_watermark().expect("group watermark");
+	drop(writer);
+
+	let file = fs::OpenOptions::new()
+		.write(true)
+		.open(&path)
+		.expect("open crash fixture");
+	file
+		.set_len(before_group + (after_group - before_group) / 2)
+		.expect("tear group envelope");
+	file.sync_all().expect("persist crash fixture");
+	drop(file);
+
+	let reader = Reader::open(&path).expect("read crash-visible prefix");
+	assert_eq!(reader.next_index(), 1);
+	assert!(reader.has_torn_tail());
+	drop(reader);
+
+	let mut writer = Writer::open_append(&path).expect("repair torn group");
+	assert_eq!(
+		writer
+			.append_atomic(&[title(3, "retry one"), title(4, "retry two")])
+			.expect("retry complete group")
+			.as_slice(),
+		[1, 2]
+	);
+	drop(writer);
+	assert_eq!(
+		Reader::open(&path)
+			.expect("read repaired journal")
+			.next_index(),
+		3
+	);
 }
 
 #[test]

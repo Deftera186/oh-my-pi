@@ -11,8 +11,8 @@ use omp_core::{ArtifactUrl, Str};
 use omp_storage::{
 	blob::{BlobRef, BlobStore},
 	gc::{
-		ArtifactCatalog, ArtifactLifetime, ArtifactRequest, DurableRoots, Error, MAX_ARTIFACT_PAGE,
-		SweepReport, sweep,
+		self, ArtifactCatalog, ArtifactLifetime, ArtifactRequest, DurableRoots, Error,
+		MAX_ARTIFACT_PAGE, SessionRoots, SweepReport,
 	},
 	transcript::SessionId,
 };
@@ -57,6 +57,19 @@ fn journal(root: &Path, id: &str, events: impl IntoIterator<Item = Value>) -> Pa
 	path
 }
 
+fn sweep(
+	store: &BlobStore,
+	_expected_roots: &[SessionId],
+	min_age: Duration,
+) -> Result<SweepReport, Error> {
+	let roots = SessionRoots::discover(store, &[])?;
+	gc::sweep(store, &roots, min_age)
+}
+
+fn anchor(store: &BlobStore) {
+	journal(store.root(), "gc-anchor", []);
+}
+
 fn artifact(reference: &BlobRef, lifetime: &str) -> Value {
 	json!({
 		"ts": 1,
@@ -74,6 +87,7 @@ fn artifact(reference: &BlobRef, lifetime: &str) -> Value {
 #[test]
 fn grace_window_closes_the_put_before_append_race() {
 	let (_directory, store) = fixture();
+	anchor(&store);
 	let first = store.put(b"first race payload").expect("put first");
 	let second = store.put(b"second race payload").expect("put second");
 
@@ -150,6 +164,7 @@ fn discard_and_compaction_consume_only_ephemeral_artifacts() {
 #[test]
 fn durable_pin_outlives_every_session_root() {
 	let (_directory, store) = fixture();
+	anchor(&store);
 	let reference = store
 		.put(b"month-later export")
 		.expect("put durable artifact");
@@ -240,6 +255,7 @@ fn catalog_rejects_peer_size_and_missing_content_before_adoption() {
 #[test]
 fn catalog_pin_is_monotonic_and_updates_durable_roots_atomically() {
 	let (_directory, store) = fixture();
+	anchor(&store);
 	let reference = store.put(b"catalog pin").expect("put artifact");
 	let mut catalog = ArtifactCatalog::open(&store).expect("open artifact catalog");
 	let adopted = catalog
@@ -424,12 +440,70 @@ fn artifact_urls_are_session_local_until_durable_digest_promotion() {
 	assert_eq!(adopted.url(), ArtifactUrl::from_ordinal(0));
 }
 
+#[test]
+fn profile_sweep_discovers_project_and_custom_session_authorities() {
+	let (directory, store) = fixture();
+	let project_blob = store.put(b"project attachment").expect("put project blob");
+	let custom_blob = store.put(b"custom attachment").expect("put custom blob");
+	let orphan = store.put(b"unreachable attachment").expect("put orphan");
+
+	fs::create_dir_all(directory.path().join("sessions")).expect("create empty legacy store");
+	journal(&directory.path().join("projects/project-a"), "project-session", [artifact(
+		&project_blob,
+		"session",
+	)]);
+	let custom = tempfile::tempdir().expect("create custom store");
+	journal(custom.path(), "custom-session", [artifact(&custom_blob, "session")]);
+	let custom_sessions = custom.path().join("sessions");
+
+	let roots =
+		SessionRoots::discover(&store, &[custom_sessions]).expect("discover every session authority");
+	assert_eq!(roots.store_count(), 3);
+	assert_eq!(roots.journal_count(), 2);
+	let report = gc::sweep(&store, &roots, Duration::ZERO).expect("profile sweep");
+
+	assert!(store.has(&project_blob));
+	assert!(store.has(&custom_blob));
+	assert!(!store.has(&orphan));
+	assert_eq!(report.reclaimed_count, 1);
+}
+
+#[test]
+fn empty_session_authorities_refuse_profile_wide_deletion() {
+	let (directory, store) = fixture();
+	fs::create_dir_all(directory.path().join("sessions")).expect("create empty session authority");
+	let orphan = store
+		.put(b"must survive incomplete roots")
+		.expect("put orphan");
+
+	let error = SessionRoots::discover(&store, &[]).expect_err("empty roots must fail closed");
+	assert!(matches!(error, Error::NoSessionJournals));
+	assert!(store.has(&orphan));
+}
+
+#[test]
+fn changed_journal_inventory_refuses_profile_wide_deletion() {
+	let (directory, store) = fixture();
+	journal(directory.path(), "known", []);
+	let roots = SessionRoots::discover(&store, &[]).expect("discover roots");
+	let orphan = store
+		.put(b"must survive stale discovery")
+		.expect("put orphan");
+	journal(directory.path(), "arrived-late", []);
+
+	let error =
+		gc::sweep(&store, &roots, Duration::ZERO).expect_err("stale root discovery must fail closed");
+	assert!(matches!(error, Error::SessionRootsChanged));
+	assert!(store.has(&orphan));
+}
+
 #[cfg(unix)]
 #[test]
 fn interrupted_sweep_returns_exact_cancellation_safe_accounting() {
 	use std::os::unix::fs::PermissionsExt as _;
 
 	let (_directory, store) = fixture();
+	anchor(&store);
 	let reference = store.put(b"cannot remove yet").expect("put artifact");
 	let artifact_path = store.path(&reference);
 	let shard = artifact_path.parent().expect("second shard");

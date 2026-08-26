@@ -6,8 +6,9 @@
 //! put-before-append interval; a zero window is appropriate only while writers
 //! are stopped.
 //!
-//! Session roots are transcript-v4 journals beneath `<store>/sessions`. Session
-//! artifacts remain reachable from every physical journal entry. Ephemeral
+//! Session roots are transcript-v4 journals discovered beneath every standard
+//! project store and each explicitly configured custom store. Session artifacts
+//! remain reachable from every physical journal entry. Ephemeral
 //! artifacts remain reachable only while their referencing entry belongs to the
 //! reconstructed live chain, so compaction/discard can consume them while a
 //! rewind that restores the entry keeps them alive. Durable artifacts are
@@ -17,7 +18,7 @@ use std::{
 	collections::HashSet,
 	fs::{self, File},
 	io::{self, BufRead as _, BufReader},
-	path::Path,
+	path::{Path, PathBuf},
 	str,
 	time::{Duration, SystemTime},
 };
@@ -34,7 +35,72 @@ use crate::{
 };
 
 const DURABLE_ROOTS_FILE: &str = "durable-roots.sqlite3";
+const PROJECTS_DIRECTORY: &str = "projects";
 const SESSIONS_DIRECTORY: &str = "sessions";
+
+/// A complete, validated snapshot of the journals that root one profile-wide
+/// blob sweep.
+///
+/// Construct this only through [`SessionRoots::discover`]. Keeping the fields
+/// private prevents destructive callers from substituting an arbitrary or
+/// accidentally empty session-id list for authoritative journal discovery.
+#[derive(Debug)]
+pub struct SessionRoots {
+	blob_root:     PathBuf,
+	custom_stores: Vec<PathBuf>,
+	journals:      Vec<(SessionId, PathBuf)>,
+	stores:        Vec<PathBuf>,
+}
+
+impl SessionRoots {
+	/// Discovers every standard project session store and every explicitly
+	/// configured custom store for `store`.
+	///
+	/// Standard discovery includes `<profile>/projects/*/sessions` and the
+	/// legacy `<profile>/sessions` location. Each custom path must name an
+	/// existing session-store directory. Every transcript-v4 journal is parsed
+	/// through its line-zero header; unreadable or malformed journals abort
+	/// discovery rather than being ignored.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::NoSessionStores`] when no authoritative store exists and
+	/// [`Error::NoSessionJournals`] when all discovered stores are empty.
+	pub fn discover(store: &BlobStore, custom_stores: &[PathBuf]) -> Result<Self, Error> {
+		let blob_root = fs::canonicalize(store.root())?;
+		let mut canonical_custom_stores = Vec::with_capacity(custom_stores.len());
+		for custom in custom_stores {
+			add_session_store(custom, &mut canonical_custom_stores)?;
+		}
+		canonical_custom_stores.sort_unstable();
+		let stores = discover_session_stores(store, &canonical_custom_stores)?;
+		if stores.is_empty() {
+			return Err(Error::NoSessionStores);
+		}
+
+		let mut journals = Vec::new();
+		for directory in &stores {
+			discover_journals(directory, &mut journals)?;
+		}
+		if journals.is_empty() {
+			return Err(Error::NoSessionJournals);
+		}
+		journals.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+		Ok(Self { blob_root, custom_stores: canonical_custom_stores, journals, stores })
+	}
+
+	/// Number of distinct authoritative session-store directories discovered.
+	#[must_use]
+	pub fn store_count(&self) -> usize {
+		self.stores.len()
+	}
+
+	/// Number of physical transcript journals that will be marked.
+	#[must_use]
+	pub fn journal_count(&self) -> usize {
+		self.journals.len()
+	}
+}
 
 /// Exact accounting for one completed or interrupted sweep.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -74,10 +140,26 @@ pub enum Error {
 	/// A blob supplied to the durable-roots API was unavailable or invalid.
 	#[error(transparent)]
 	Blob(#[from] blob::Error),
-	/// A requested retained session had no journal below the sessions directory.
-	#[error("retained session journal not found: {0}")]
-	MissingSession(Str),
-	/// The durable-roots table contained a hash that was not a BLAKE3 digest.
+	/// No standard or explicit session authority was available for a profile
+	/// sweep.
+	#[error("profile blob sweep requires at least one authoritative session store")]
+	NoSessionStores,
+	/// Session stores were discovered but contained no authoritative journals.
+	#[error("profile blob sweep refused because all authoritative session stores are empty")]
+	NoSessionJournals,
+	/// A standard or explicit session-store path was not a directory.
+	#[error("invalid session store: {}", .0.display())]
+	InvalidSessionStore(PathBuf),
+	/// A session-store symlink could hide a journal from bounded discovery.
+	#[error("session store contains unsupported symlink: {}", .0.display())]
+	UnsupportedSessionSymlink(PathBuf),
+	/// Roots were discovered for a different profile-wide blob store.
+	#[error("session roots belong to a different blob store")]
+	SessionRootMismatch,
+	/// The journal inventory changed after authoritative root discovery.
+	#[error("session journal inventory changed after root discovery")]
+	SessionRootsChanged,
+	/// The durable-roots table contained a hash that was not a SHA-256 digest.
 	#[error("durable-roots table contains an invalid blob hash")]
 	CorruptDurableRoot,
 	/// A caller-reported byte length disagreed with authoritative blob metadata.
@@ -793,30 +875,46 @@ const fn retention_rank(lifetime: ArtifactLifetime) -> u8 {
 	}
 }
 
-/// Removes old blobs unreachable from retained session journals and durable
+/// Removes old blobs unreachable from every journal in `roots` and from durable
 /// roots.
 ///
-/// Journal discovery recursively streams `<store>/sessions` and selects
-/// journals by their line-zero [`SessionId`], rather than trusting filenames.
-/// Blob bodies are never opened: the sweep uses only shard names, metadata, and
-/// root hashes. `min_age` is the grace period for the intentional
-/// put-before-append race.
+/// `roots` must come from [`SessionRoots::discover`] for this same profile-wide
+/// blob store. The complete journal inventory is re-read before deletion, so a
+/// missing, added, or replaced journal fails closed. Blob bodies are never
+/// opened: the sweep uses only shard names, metadata, and root hashes.
+/// `min_age` is the grace period for the intentional put-before-append race.
 ///
 /// # Errors
 ///
-/// Returns [`Error::MissingSession`] before deletion when a requested journal
-/// is absent. Parse/database failures also happen before deletion. A filesystem
-/// failure during blob traversal or removal returns [`Error::Interrupted`] with
-/// exact partial accounting.
+/// Returns [`Error::SessionRootMismatch`] when `roots` belongs to another blob
+/// store. Root revalidation, transcript parse, and database failures all happen
+/// before deletion. A filesystem failure during blob traversal or removal
+/// returns [`Error::Interrupted`] with exact partial accounting.
 pub fn sweep(
 	store: &BlobStore,
-	roots: &[SessionId],
+	roots: &SessionRoots,
 	min_age: Duration,
 ) -> Result<SweepReport, Error> {
+	if fs::canonicalize(store.root())? != roots.blob_root {
+		return Err(Error::SessionRootMismatch);
+	}
+	let current_stores = discover_session_stores(store, &roots.custom_stores)?;
+	if current_stores != roots.stores {
+		return Err(Error::SessionRootsChanged);
+	}
+	let mut current = Vec::new();
+	for directory in &current_stores {
+		discover_journals(directory, &mut current)?;
+	}
+	current.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+	if current != roots.journals {
+		return Err(Error::SessionRootsChanged);
+	}
+
 	let mut reachable = HashSet::new();
 	let mut artifact_uses = ArtifactUses::default();
 	let mut report = SweepReport::default();
-	mark_session_roots(store, roots, &mut reachable, &mut artifact_uses, &mut report)?;
+	mark_session_roots(roots, &mut reachable, &mut artifact_uses, &mut report)?;
 
 	let mut durable = DurableRoots::open(store)?;
 	let transaction = durable
@@ -842,47 +940,83 @@ pub fn sweep(
 }
 
 fn mark_session_roots(
-	store: &BlobStore,
-	roots: &[SessionId],
+	roots: &SessionRoots,
 	reachable: &mut HashSet<Hash32>,
 	artifact_uses: &mut ArtifactUses,
 	report: &mut SweepReport,
 ) -> Result<(), Error> {
-	if roots.is_empty() {
-		return Ok(());
-	}
-	let mut remaining: HashSet<&str> = roots.iter().map(|root| root.0.as_str()).collect();
-	let sessions = store.root().join(SESSIONS_DIRECTORY);
-	if sessions.is_dir() {
-		walk_journals(&sessions, &mut remaining, reachable, artifact_uses, report)?;
-	}
-	if let Some(missing) = roots
-		.iter()
-		.find(|root| remaining.contains(root.0.as_str()))
-	{
-		return Err(Error::MissingSession(missing.0.clone()));
+	for (session, path) in &roots.journals {
+		mark_journal(path, session, reachable, artifact_uses, report)?;
 	}
 	Ok(())
 }
 
-fn walk_journals(
-	directory: &Path,
-	remaining: &mut HashSet<&str>,
-	reachable: &mut HashSet<Hash32>,
-	artifact_uses: &mut ArtifactUses,
-	report: &mut SweepReport,
-) -> Result<(), Error> {
-	if remaining.is_empty() {
-		return Ok(());
+fn discover_session_stores(
+	store: &BlobStore,
+	custom_stores: &[PathBuf],
+) -> Result<Vec<PathBuf>, Error> {
+	let mut stores = Vec::new();
+	add_session_store_if_present(&store.root().join(SESSIONS_DIRECTORY), &mut stores)?;
+
+	let projects = store.root().join(PROJECTS_DIRECTORY);
+	match fs::metadata(&projects) {
+		Ok(metadata) if metadata.is_dir() => {
+			for entry in fs::read_dir(&projects)? {
+				let entry = entry?;
+				if fs::metadata(entry.path())?.is_dir() {
+					add_session_store_if_present(&entry.path().join(SESSIONS_DIRECTORY), &mut stores)?;
+				}
+			}
+		},
+		Ok(_) => return Err(Error::InvalidSessionStore(projects)),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+		Err(error) => return Err(error.into()),
 	}
-	for entry in fs::read_dir(directory)? {
-		if remaining.is_empty() {
-			break;
+	for custom in custom_stores {
+		add_session_store(custom, &mut stores)?;
+	}
+	stores.sort_unstable();
+	Ok(stores)
+}
+
+fn add_session_store_if_present(path: &Path, stores: &mut Vec<PathBuf>) -> Result<(), Error> {
+	match fs::metadata(path) {
+		Ok(_) => add_session_store(path, stores),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error.into()),
+	}
+}
+
+fn add_session_store(path: &Path, stores: &mut Vec<PathBuf>) -> Result<(), Error> {
+	let metadata = fs::metadata(path).map_err(|error| {
+		if error.kind() == io::ErrorKind::NotFound {
+			Error::InvalidSessionStore(path.to_owned())
+		} else {
+			Error::Io(error)
 		}
+	})?;
+	if !metadata.is_dir() {
+		return Err(Error::InvalidSessionStore(path.to_owned()));
+	}
+	let canonical = fs::canonicalize(path)?;
+	if !stores.contains(&canonical) {
+		stores.push(canonical);
+	}
+	Ok(())
+}
+
+fn discover_journals(
+	directory: &Path,
+	journals: &mut Vec<(SessionId, PathBuf)>,
+) -> Result<(), Error> {
+	for entry in fs::read_dir(directory)? {
 		let entry = entry?;
 		let file_type = entry.file_type()?;
+		if file_type.is_symlink() {
+			return Err(Error::UnsupportedSessionSymlink(entry.path()));
+		}
 		if file_type.is_dir() {
-			walk_journals(&entry.path(), remaining, reachable, artifact_uses, report)?;
+			discover_journals(&entry.path(), journals)?;
 		} else if file_type.is_file()
 			&& entry
 				.path()
@@ -890,35 +1024,21 @@ fn walk_journals(
 				.is_some_and(|extension| extension == "jsonl")
 		{
 			let path = entry.path();
-			let Some(session) = journal_session_id(&path)? else {
-				continue;
-			};
-			if remaining.remove(session.0.as_str()) {
-				mark_journal(&path, &session, reachable, artifact_uses, report)?;
-			}
+			journals.push((journal_session_id(&path)?, path));
 		}
 	}
 	Ok(())
 }
 
-fn journal_session_id(path: &Path) -> Result<Option<SessionId>, Error> {
+fn journal_session_id(path: &Path) -> Result<SessionId, Error> {
 	let file = File::open(path)?;
 	let mut reader = BufReader::new(file);
 	let mut line = Vec::new();
 	if reader.read_until(b'\n', &mut line)? == 0 {
-		return Ok(None);
+		return Err(transcript::Error::MissingHeader.into());
 	}
 	trim_line_end(&mut line);
-	match read_header(&line) {
-		Ok(header) => Ok(Some(header.id)),
-		Err(
-			transcript::Error::InvalidHeaderVersion(_)
-			| transcript::Error::Json(_)
-			| transcript::Error::Utf8(_)
-			| transcript::Error::MissingHeader,
-		) => Ok(None),
-		Err(error) => Err(error.into()),
-	}
+	Ok(read_header(&line)?.id)
 }
 
 fn mark_journal(

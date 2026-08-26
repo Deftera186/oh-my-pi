@@ -16,6 +16,17 @@ use super::{self as transcript, Event, Kind, SessionId, Writer};
 use crate::atomic;
 
 const HEADER_MAX_BYTES: usize = 16 * 1024;
+const OMISSION_KIND: &str = "collab_omitted";
+const OMISSION_REVISION: &str = "host_local.v1";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OmissionMarker {
+	#[serde(rename = "ts")]
+	_ts: u64,
+	k:   Str,
+	rev: Str,
+}
 
 /// Secret-free provenance stored in a collaboration replica's v4 header.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,8 +247,13 @@ impl Replica {
 fn validate_record(record: &RemoteRecord) -> Result<Event, ReplicaError> {
 	let event = transcript::read_line(&record.json)?;
 	match (record.visibility, &event.kind) {
-		(ReplicaVisibility::HostLocalOmitted, Kind::EntryUndecodable(omitted))
-			if omitted.kind.as_deref() == Some("collab_omitted") => {},
+		(ReplicaVisibility::HostLocalOmitted, Kind::EntryUndecodable(_)) => {
+			let marker: OmissionMarker =
+				serde_json::from_slice(&record.json).map_err(|_| ReplicaError::InvalidOmission)?;
+			if marker.k != OMISSION_KIND || marker.rev != OMISSION_REVISION {
+				return Err(ReplicaError::InvalidOmission);
+			}
+		},
 		(ReplicaVisibility::HostLocalOmitted, _) => return Err(ReplicaError::InvalidOmission),
 		(
 			ReplicaVisibility::PublicTranscript | ReplicaVisibility::PublicPresentation,
@@ -307,6 +323,14 @@ mod tests {
 		}
 	}
 
+	fn omission(revision: u64, ts: u64) -> RemoteRecord {
+		RemoteRecord {
+			revision,
+			visibility: ReplicaVisibility::HostLocalOmitted,
+			json: Bytes::from(format!(r#"{{"ts":{ts},"k":"collab_omitted","rev":"host_local.v1"}}"#)),
+		}
+	}
+
 	#[test]
 	fn reseed_preserves_local_identity_and_fences_old_live_frames() {
 		let directory = tempdir().expect("temporary directory");
@@ -329,6 +353,42 @@ mod tests {
 		assert_eq!(replica.session_id().as_str(), "replica");
 		assert_eq!(replica.local_cwd(), local);
 		assert_eq!(replica.host_revision_watermark(), 1);
+	}
+
+	#[test]
+	fn reseed_omissions_remain_physical_across_reopen_and_live_append() {
+		let directory = tempdir().expect("temporary directory");
+		let path = directory.path().join("replica.jsonl");
+		let mut replica = Replica::create(
+			&path,
+			SessionId(omp_core::sf!("replica")),
+			1,
+			directory.path().join("local"),
+			provenance(),
+		)
+		.expect("create replica");
+		let fence = replica.begin_reseed();
+		replica
+			.commit_reseed(fence, 3, &[record(1, 1), omission(2, 2), record(3, 3)])
+			.expect("commit snapshot with physical omission");
+		drop(replica);
+
+		let loaded = transcript::load(&path).expect("load replica transcript");
+		assert_eq!(loaded.len(), 3);
+		assert!(matches!(
+			loaded.get(1),
+			Some(transcript::Entry::Ok(event))
+				if matches!(&event.kind, Kind::EntryUndecodable(_))
+		));
+		let mut reopened = Replica::open(&path, "room").expect("reopen replica");
+		assert_eq!(reopened.host_revision_watermark(), 3);
+		let fence = reopened.begin_reseed();
+		assert_eq!(
+			reopened
+				.append_live(fence, &record(4, 4))
+				.expect("append next physical revision"),
+			4
+		);
 	}
 
 	#[test]

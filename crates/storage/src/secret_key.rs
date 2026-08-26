@@ -46,8 +46,11 @@ pub fn read_at(path: &Path) -> Result<Option<String>, SecretKeyError> {
 /// Loads a key at `path`, or creates one with mode 0600 and converges with
 /// racing creators.
 pub fn load_or_create_at(path: &Path) -> Result<String, SecretKeyError> {
-	if let Some(existing) = read_once(path, true)? {
-		return Ok(existing);
+	match read_once(path, true) {
+		Ok(Some(existing)) => return Ok(existing),
+		Ok(None) => {},
+		Err(SecretKeyError::InvalidKey { .. }) => return read_winner(path),
+		Err(error) => return Err(error),
 	}
 	let parent = path
 		.parent()

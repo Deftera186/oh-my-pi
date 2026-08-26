@@ -837,6 +837,12 @@ fn reusable_live_set_matches_live_vectors_for_navigation_and_rewrite() {
 	assert!(live.contains(6));
 	assert!(live.contains(3));
 	assert!(!live.contains(4));
+
+	assert!(log.live_through_into(4, &mut live));
+	assert!(live.iter().eq([4, 3]));
+	let before_absent = live.clone();
+	assert!(!log.live_through_into(8, &mut live));
+	assert_eq!(live, before_absent);
 }
 
 #[test]

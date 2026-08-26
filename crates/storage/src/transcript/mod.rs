@@ -1,10 +1,13 @@
 //! Transcript v4's append-only event journal.
 //!
-//! Line zero is the identity header and every later physical line is an event,
-//! so an event index is always its line number minus one. Malformed lines
-//! remain as tombstones rather than being dropped; otherwise every later
-//! reference would shift. Corrections and navigation are later events, never
-//! edits to old bytes. Replay capsules follow the complementary storage rule
+//! Line zero is the identity header. Later records are either legacy single
+//! events or committed event-group envelopes; indexes address the expanded
+//! durable event order. A group becomes visible only when its whole canonical
+//! newline-delimited envelope is present, so crash recovery exposes a prefix of
+//! committed groups. Malformed legacy lines remain tombstones rather than being
+//! dropped; otherwise every later reference would shift. Corrections and
+//! navigation are later events, never edits to old bytes. Replay capsules
+//! follow the complementary storage rule
 //! that every byte exists in exactly one place: neutral data in blocks,
 //! provider-only residue in capsules, and large payloads
 //! in the content-addressed blob store.

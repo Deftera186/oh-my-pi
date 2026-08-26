@@ -13,17 +13,17 @@ use omp_core::sparse_set::SparseSet;
 use serde_json::value::{RawValue, to_raw_value};
 
 use super::{
-	codec::{Error, Header, read_header, read_line},
+	codec::{Error, Header, read_atomic_group, read_header, read_line},
 	event::{Event, Kind},
 	raweq::raw_eq,
 };
 
-/// One physical event line in a loaded transcript.
+/// One indexed durable event in a loaded transcript.
 #[derive(Debug, Clone)]
 pub enum Entry {
 	/// A decoded event, including verbatim unknown events.
 	Ok(Box<Event>),
-	/// A malformed line retained at its physical event index.
+	/// A malformed legacy line retained at its durable event index.
 	Tombstone(Box<RawValue>),
 }
 /// Equality is byte equality of stored JSON text, preserving verbatim round
@@ -40,9 +40,9 @@ impl PartialEq for Entry {
 
 impl Eq for Entry {}
 
-/// Reusable live-chain membership and ordering over physical event indexes.
+/// Reusable live-chain membership and ordering over durable event indexes.
 ///
-/// Membership uses one bit per physical line while the retained order preserves
+/// Membership uses one bit per durable event while the retained order preserves
 /// the splice ordering required by compact and prompt-rewrite events. Clearing
 /// and recomputing the set retains both allocations.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -179,7 +179,7 @@ pub struct ReadCounters {
 	pub truncated: u64,
 }
 
-/// A loaded transcript with physical event indexes preserved.
+/// A loaded transcript with durable event indexes preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Log {
 	header:      Header,
@@ -193,7 +193,7 @@ impl Log {
 		&self.header
 	}
 
-	/// Returns the number of physical event lines, including tombstones.
+	/// Returns the number of durable events, including tombstones.
 	pub const fn len(&self) -> usize {
 		self.events.len()
 	}
@@ -220,7 +220,7 @@ impl Log {
 		self.events.is_empty()
 	}
 
-	/// Returns the entry at a physical event index.
+	/// Returns the entry at a durable event index.
 	pub fn get(&self, index: u64) -> Option<&Entry> {
 		usize::try_from(index)
 			.ok()
@@ -241,6 +241,26 @@ impl Log {
 	pub fn live_into(&self, out: &mut LiveSet) {
 		out.clear();
 		self.fold_from(0, out);
+	}
+
+	/// Recomputes live-chain membership through an inclusive physical
+	/// checkpoint into caller-owned reusable storage.
+	///
+	/// This applies the same reset, rewind, compaction, turn-publication, and
+	/// prompt-rewrite rules as [`Self::live_into`]. Returns `false` without
+	/// modifying `out` when `checkpoint` is not present in this log.
+	pub fn live_through_into(&self, checkpoint: u64, out: &mut LiveSet) -> bool {
+		let Ok(checkpoint) = usize::try_from(checkpoint) else {
+			return false;
+		};
+		if checkpoint >= self.events.len() {
+			return false;
+		}
+		out.clear();
+		for index in 0..=checkpoint {
+			self.fold_entry(index, out);
+		}
+		true
 	}
 
 	/// Reconstructs the current live chain with one forward fold.
@@ -390,7 +410,7 @@ impl Log {
 pub struct RefreshReport {
 	/// What changed since the previous refresh.
 	pub state:         RefreshState,
-	/// Physical index that the next complete event line will receive.
+	/// Durable index that the next committed event will receive.
 	pub next_index:    u64,
 	/// Byte offset where a writer may append after repairing any torn tail.
 	pub append_offset: u64,
@@ -482,7 +502,7 @@ impl Reader {
 				break;
 			}
 			line.pop();
-			push_entry_at(
+			let appended = push_record_at(
 				&mut events,
 				&mut diagnostics,
 				&line,
@@ -490,9 +510,20 @@ impl Reader {
 				offset,
 				DiagnosticKind::Malformed,
 			);
+			let Some(appended) = appended else {
+				tail_bytes = reader.get_ref().metadata()?.len().saturating_sub(offset);
+				tail_diagnostic = Some(ReadDiagnostic {
+					event_index,
+					byte_offset: offset,
+					byte_len: tail_bytes,
+					kind: DiagnosticKind::Truncated,
+				});
+				break;
+			};
 			watermark =
 				watermark.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
-			event_index = event_index.saturating_add(1);
+			event_index =
+				event_index.saturating_add(u64::try_from(appended).expect("event count fits in u64"));
 		}
 		let file = reader.into_inner();
 		let log = Log { header, events, diagnostics };
@@ -618,7 +649,7 @@ impl Reader {
 				break;
 			}
 			line.pop();
-			push_entry_at(
+			let appended = push_record_at(
 				&mut entries,
 				&mut diagnostics,
 				&line,
@@ -626,8 +657,19 @@ impl Reader {
 				offset,
 				DiagnosticKind::Malformed,
 			);
+			let Some(appended) = appended else {
+				self.tail_bytes = file_len.saturating_sub(offset);
+				self.tail_diagnostic = Some(ReadDiagnostic {
+					event_index: first_event_index.saturating_add(records),
+					byte_offset: offset,
+					byte_len:    self.tail_bytes,
+					kind:        DiagnosticKind::Truncated,
+				});
+				break;
+			};
 			consumed = consumed.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
-			records = records.saturating_add(1);
+			records =
+				records.saturating_add(u64::try_from(appended).expect("event count fits in u64"));
 		}
 
 		let path_metadata = fs::metadata(&self.path)?;
@@ -678,7 +720,7 @@ impl Reader {
 		counters
 	}
 
-	/// Returns the physical index assigned to the next complete event.
+	/// Returns the durable index assigned to the next committed event.
 	pub fn next_index(&self) -> u64 {
 		u64::try_from(self.log.len()).expect("event indexes fit in u64")
 	}
@@ -744,7 +786,7 @@ fn changed_file(message: &'static str) -> Error {
 pub struct VisitReport {
 	/// Decoded line-zero header.
 	pub header:      Header,
-	/// Number of physical event records visited.
+	/// Number of durable events visited.
 	pub records:     u64,
 	/// Damage counters observed during the scan.
 	pub counters:    ReadCounters,
@@ -752,7 +794,7 @@ pub struct VisitReport {
 	pub diagnostics: Vec<ReadDiagnostic>,
 }
 
-/// Loads a transcript while preserving every physical event index.
+/// Loads a transcript while preserving every durable event index.
 ///
 /// Input is consumed one JSONL record at a time; no whole-file byte buffer is
 /// allocated.
@@ -796,7 +838,7 @@ pub fn visit_batched(
 	let mut records = 0_u64;
 	let mut diagnostics = Vec::new();
 	let batch_entries = batch_entries.max(1);
-	loop {
+	'records: loop {
 		line.clear();
 		let read = reader.read_until(b'\n', &mut line)?;
 		if read == 0 {
@@ -805,24 +847,44 @@ pub fn visit_batched(
 		let terminated = line.last() == Some(&b'\n');
 		if terminated {
 			line.pop();
+		} else if read_atomic_group(&line).is_some() {
+			diagnostics.push(ReadDiagnostic {
+				event_index: records,
+				byte_offset: offset,
+				byte_len:    u64::try_from(line.len()).expect("record length fits in u64"),
+				kind:        DiagnosticKind::Truncated,
+			});
+			break;
 		}
-		let kind = if terminated {
+		let damage = if terminated {
 			DiagnosticKind::Malformed
 		} else {
 			DiagnosticKind::Truncated
 		};
 		let mut entries = Vec::with_capacity(1);
-		push_entry_at(&mut entries, &mut diagnostics, &line, records, offset, kind);
-		let entry = entries
-			.pop()
-			.expect("one source record yields one physical entry");
-		records = records.saturating_add(1);
-		let keep_going = visit(records - 1, entry);
-		offset = offset.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
-		if usize::try_from(records).is_ok_and(|records| records % batch_entries == 0) {
-			yield_batch();
+		let appended = push_record_at(&mut entries, &mut diagnostics, &line, records, offset, damage);
+		if appended.is_none() {
+			diagnostics.push(ReadDiagnostic {
+				event_index: records,
+				byte_offset: offset,
+				byte_len:    u64::try_from(read).expect("record length fits in u64"),
+				kind:        DiagnosticKind::Truncated,
+			});
+			break;
 		}
-		if !keep_going || !terminated {
+		offset = offset.saturating_add(u64::try_from(read).expect("file offsets fit in u64"));
+		for entry in entries {
+			let index = records;
+			records = records.saturating_add(1);
+			let keep_going = visit(index, entry);
+			if usize::try_from(records).is_ok_and(|records| records % batch_entries == 0) {
+				yield_batch();
+			}
+			if !keep_going {
+				break 'records;
+			}
+		}
+		if !terminated {
 			break;
 		}
 	}
@@ -836,7 +898,33 @@ pub fn visit_batched(
 	Ok(VisitReport { header, records, counters, diagnostics })
 }
 
-fn push_entry_at(
+fn push_record_at(
+	events: &mut Vec<Entry>,
+	diagnostics: &mut Vec<ReadDiagnostic>,
+	line: &[u8],
+	event_index: u64,
+	byte_offset: u64,
+	damage: DiagnosticKind,
+) -> Option<usize> {
+	if let Some(group) = read_atomic_group(line) {
+		return match group {
+			Ok(group) => {
+				let count = group.len();
+				events.extend(group.into_iter().map(|event| Entry::Ok(Box::new(event))));
+				Some(count)
+			},
+			Err(_) => None,
+		};
+	}
+	if let Ok(event) = read_line(line) {
+		events.push(Entry::Ok(Box::new(event)));
+	} else {
+		push_tombstone(events, diagnostics, line, event_index, byte_offset, damage);
+	}
+	Some(1)
+}
+
+fn push_tombstone(
 	events: &mut Vec<Entry>,
 	diagnostics: &mut Vec<ReadDiagnostic>,
 	line: &[u8],
@@ -844,17 +932,13 @@ fn push_entry_at(
 	byte_offset: u64,
 	damage: DiagnosticKind,
 ) {
-	if let Ok(event) = read_line(line) {
-		events.push(Entry::Ok(Box::new(event)));
-	} else {
-		diagnostics.push(ReadDiagnostic {
-			event_index,
-			byte_offset,
-			byte_len: u64::try_from(line.len()).expect("record length fits in u64"),
-			kind: damage,
-		});
-		let source = String::from_utf8_lossy(line);
-		let raw = to_raw_value(source.as_ref()).expect("a JSON string is always serializable");
-		events.push(Entry::Tombstone(raw));
-	}
+	diagnostics.push(ReadDiagnostic {
+		event_index,
+		byte_offset,
+		byte_len: u64::try_from(line.len()).expect("record length fits in u64"),
+		kind: damage,
+	});
+	let source = String::from_utf8_lossy(line);
+	let raw = to_raw_value(source.as_ref()).expect("a JSON string is always serializable");
+	events.push(Entry::Tombstone(raw));
 }

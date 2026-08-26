@@ -31,14 +31,14 @@ use thiserror::Error;
 
 use crate::transcript::{SessionId, TitleSource};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS index_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 3);
+INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 4);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT NOT NULL,
     kind TEXT NOT NULL,
     parent TEXT,
+    parent_checkpoint INTEGER,
     entries INTEGER NOT NULL DEFAULT 0,
     turns INTEGER NOT NULL DEFAULT 0,
     remote INTEGER NOT NULL,
@@ -214,7 +215,7 @@ pub struct NewSession<'a> {
 /// Committed physical and byte position returned by the journal closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalPosition {
-	/// Zero-based physical transcript event index.
+	/// Zero-based durable transcript event index.
 	pub event_index:    u64,
 	/// Complete-line byte watermark after this event is appended.
 	pub byte_watermark: u64,
@@ -266,6 +267,13 @@ pub enum EventProjection<'a> {
 	},
 	/// The event changes only terminal disposition.
 	Status(SessionStatus),
+	/// The event fixes the exact durable parent checkpoint for this child.
+	Fork {
+		/// Immediate parent session.
+		parent: &'a SessionId,
+		/// Parent event checkpoint inherited by the child.
+		at:     Option<u64>,
+	},
 }
 
 /// One event about to be durably appended and indexed.
@@ -375,6 +383,9 @@ pub enum Error {
 		/// Missing session identifier.
 		session: SessionId,
 	},
+	/// Cross-authority relocation requires indexes backed by SQLite files.
+	#[error("session relocation requires file-backed source and destination indexes")]
+	RelocationRequiresFileBackedIndexes,
 }
 
 /// Filters applied directly by `sessions.list` SQL.
@@ -419,7 +430,7 @@ pub struct SessionInfo {
 	pub kind:              SessionKind,
 	/// Immediate lineage parent.
 	pub parent:            Option<SessionId>,
-	/// Physical event count.
+	/// Durable event count.
 	pub entries:           u64,
 	/// Completed receipt count.
 	pub turns:             u64,
@@ -431,7 +442,7 @@ pub struct SessionInfo {
 	pub models:            SmallVec<Str, 4>,
 	/// Complete-line journal byte watermark.
 	pub journal_watermark: u64,
-	/// Most recent physical event index.
+	/// Most recent durable event index.
 	pub last_event_index:  Option<u64>,
 	/// Whether the session environment is remote.
 	pub remote:            bool,
@@ -966,19 +977,18 @@ impl SessionIndex {
 
 	/// Returns the durable ancestry ending at `session`, ordered root first.
 	///
-	/// The index currently retains only the parent session id; checkpoint
-	/// positions remain journal truth and are therefore reported as absent
-	/// rather than inferred.
+	/// Parent checkpoints are copied from the child's durable `ForkedFrom`
+	/// event; an absent value remains absent rather than being inferred.
 	pub fn lineage(&self, session: &SessionId) -> Result<Vec<SessionLink>, Error> {
 		let connection = self.connection.lock();
 		let mut statement = connection.prepare(
-			"WITH RECURSIVE ancestry(id, parent, depth) AS (
-			   SELECT id, parent, 0 FROM sessions WHERE id = ?1
+			"WITH RECURSIVE ancestry(id, parent, parent_checkpoint, depth) AS (
+			   SELECT id, parent, parent_checkpoint, 0 FROM sessions WHERE id = ?1
 			   UNION ALL
-			   SELECT parent.id, parent.parent, ancestry.depth + 1
+			   SELECT parent.id, parent.parent, parent.parent_checkpoint, ancestry.depth + 1
 			   FROM sessions parent JOIN ancestry ON parent.id = ancestry.parent
 			 )
-			 SELECT id, parent FROM ancestry ORDER BY depth DESC",
+			 SELECT id, parent, parent_checkpoint FROM ancestry ORDER BY depth DESC",
 		)?;
 		let rows = statement.query_map([session.0.as_str()], |row| {
 			Ok(SessionLink {
@@ -986,7 +996,7 @@ impl SessionIndex {
 				parent: row
 					.get::<_, Option<String>>(1)?
 					.map(|value| SessionId(Str::new(value))),
-				at:     None,
+				at:     row.get(2)?,
 			})
 		})?;
 		let mut links = Vec::new();
@@ -1300,6 +1310,13 @@ fn migrate_schema(connection: &Connection) -> Result<(), Error> {
 			 ) WITHOUT ROWID;
 			 UPDATE index_meta SET schema_version = 3 WHERE singleton = 1;",
 		)?;
+		version = 3;
+	}
+	if version == 3 {
+		connection.execute_batch(
+			"ALTER TABLE sessions ADD COLUMN parent_checkpoint INTEGER;
+			 UPDATE index_meta SET schema_version = 4 WHERE singleton = 1;",
+		)?;
 	}
 	Ok(())
 }
@@ -1461,6 +1478,15 @@ fn index_event_inner(
 				event.session.0.as_str(),
 				<&'static str>::from(status)
 			])?;
+		},
+		EventProjection::Fork { parent, at } => {
+			let at = at
+				.map(|value| sql_u64(value, "parent_checkpoint"))
+				.transpose()?;
+			transaction.execute(
+				"UPDATE sessions SET parent = ?2, parent_checkpoint = ?3 WHERE id = ?1",
+				params![event.session.0.as_str(), parent.0.as_str(), at],
+			)?;
 		},
 	}
 	Ok(())

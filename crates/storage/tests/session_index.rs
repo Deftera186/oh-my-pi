@@ -152,6 +152,29 @@ fn append_projection(
 }
 
 #[test]
+fn lineage_preserves_exact_fork_checkpoint() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let root = session_id("root");
+	let child = session_id("child");
+	create(&index, &root);
+	create_child(&index, &child, &root);
+	append_projection(&index, &child, 0, "forked_from", EventProjection::Fork {
+		parent: &root,
+		at:     Some(17),
+	});
+
+	let lineage = index.lineage(&child).expect("load exact lineage");
+	assert_eq!(lineage.len(), 2);
+	assert_eq!(lineage[0].id, root);
+	assert_eq!(lineage[0].parent, None);
+	assert_eq!(lineage[0].at, None);
+	assert_eq!(lineage[1].id, child);
+	assert_eq!(lineage[1].parent.as_ref(), Some(&root));
+	assert_eq!(lineage[1].at, Some(17));
+}
+
+#[test]
 fn command_usage_accumulates_and_survives_reopen() {
 	let directory = tempdir().expect("temporary directory");
 	let path = directory.path().join("sessions.sqlite3");
@@ -571,6 +594,127 @@ fn two_writer_connections_serialize_distinct_session_commits() {
 			.any(|session| session.id == session_id("second-writer"))
 	);
 }
+#[test]
+fn relocate_session_moves_complete_projection_and_updates_workspace_identity() {
+	let directory = tempdir().expect("temporary directory");
+	let source =
+		SessionIndex::open(directory.path().join("source.sqlite3")).expect("open source index");
+	let destination =
+		SessionIndex::open(directory.path().join("destination.sqlite3")).expect("open destination");
+	let moved = session_id("move-me");
+	create(&source, &moved);
+	let receipt = outcome(41, 42);
+	append_projection(&source, &moved, 0, "omp.turn_receipt", EventProjection::TurnReceipt {
+		outcome: &receipt,
+		failed:  false,
+	});
+	let item = thread_pb::Item {
+		kind: Some(item::Kind::Message(thread_pb::Message {
+			role:  thread_pb::Role::User as i32,
+			parts: Vec::new(),
+		})),
+		..thread_pb::Item::default()
+	};
+	append_projection(&source, &moved, 1, "omp.item", EventProjection::ThreadItem {
+		item:    &item,
+		prompt:  Some("relocated projection prompt"),
+		context: None,
+	});
+
+	assert!(
+		source
+			.relocate_session(&destination, &moved, "/workspace/destination", "/workspace/destination",)
+			.expect("relocate session projection")
+	);
+	assert!(
+		source
+			.list(&SessionFilter { limit: 10, ..SessionFilter::default() })
+			.expect("list source")
+			.sessions
+			.is_empty()
+	);
+	let destination_page = destination
+		.list(&SessionFilter { limit: 10, ..SessionFilter::default() })
+		.expect("list destination");
+	assert_eq!(destination_page.sessions.len(), 1);
+	assert_eq!(destination_page.sessions[0].id, moved);
+	assert_eq!(destination_page.sessions[0].cwd.as_str(), "/workspace/destination");
+	assert_eq!(destination_page.sessions[0].project.as_str(), "/workspace/destination");
+	assert_eq!(
+		destination
+			.receipt(&moved, 0)
+			.expect("query relocated receipt")
+			.expect("relocated receipt")
+			.usage
+			.input_tokens,
+		41
+	);
+	assert_eq!(
+		destination
+			.search_prompts("relocated projection prompt", 5)
+			.expect("query relocated prompt")[0]
+			.session,
+		moved
+	);
+	assert!(
+		!source
+			.relocate_session(&destination, &moved, "/workspace/destination", "/workspace/destination",)
+			.expect("repeat absent relocation")
+	);
+}
+
+#[test]
+fn delete_session_removes_the_projection_and_every_derived_row_atomically() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let deleted = session_id("delete-me");
+	let child = session_id("surviving-child");
+	create(&index, &deleted);
+	create_child(&index, &child, &deleted);
+	let receipt = outcome(7, 8);
+	append_projection(&index, &deleted, 0, "omp.turn_receipt", EventProjection::TurnReceipt {
+		outcome: &receipt,
+		failed:  false,
+	});
+	let item = thread_pb::Item {
+		kind: Some(item::Kind::Message(thread_pb::Message {
+			role:  thread_pb::Role::User as i32,
+			parts: Vec::new(),
+		})),
+		..thread_pb::Item::default()
+	};
+	append_projection(&index, &deleted, 1, "omp.item", EventProjection::ThreadItem {
+		item:    &item,
+		prompt:  Some("delete projection prompt"),
+		context: None,
+	});
+
+	assert!(
+		index
+			.delete_session(&deleted)
+			.expect("delete session projection")
+	);
+	let remaining = index
+		.list(&SessionFilter { limit: 10, ..SessionFilter::default() })
+		.expect("list after deletion");
+	assert_eq!(remaining.sessions.len(), 1);
+	assert_eq!(remaining.sessions[0].id, child);
+	assert_eq!(remaining.sessions[0].parent.as_ref(), Some(&deleted));
+	assert!(
+		index
+			.receipt(&deleted, 0)
+			.expect("query deleted receipt")
+			.is_none()
+	);
+	assert!(
+		index
+			.search_prompts("delete projection prompt", 5)
+			.expect("query deleted prompt")
+			.is_empty()
+	);
+	assert!(!index.delete_session(&deleted).expect("repeat deletion"));
+}
+
 #[test]
 fn lineage_rekey_moves_all_projections_retains_collision_winners_and_rolls_back_dry_run() {
 	let directory = tempdir().expect("temporary directory");

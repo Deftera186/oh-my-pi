@@ -20,7 +20,7 @@ use thiserror::Error as ThisError;
 
 use super::{
 	Entry, Reader,
-	codec::{Error, Header, write_header, write_line},
+	codec::{Error, Header, write_atomic_group, write_header, write_line},
 	event::{Event, Kind},
 };
 use crate::atomic;
@@ -28,7 +28,7 @@ use crate::atomic;
 /// Maximum number of events in one atomic transcript append.
 pub const MAX_ATOMIC_ENTRIES: usize = 1_024;
 
-/// A compact contiguous run of physical transcript indexes carried by errors.
+/// A compact contiguous run of durable event indexes carried by errors.
 ///
 /// Writer failures always identify either a proven prefix or a possibly written
 /// atomic group. Both are contiguous because physical indexes are assigned in
@@ -40,7 +40,7 @@ pub struct IndexRun {
 }
 
 impl IndexRun {
-	/// Creates a run from contiguous physical indexes.
+	/// Creates a run from contiguous durable event indexes.
 	///
 	/// Debug builds assert that every adjacent pair is consecutive. An empty
 	/// slice produces an empty run.
@@ -56,7 +56,7 @@ impl IndexRun {
 		}
 	}
 
-	/// Returns the first physical index, if this run is non-empty.
+	/// Returns the first durable event index, if this run is non-empty.
 	pub const fn first(self) -> Option<u64> {
 		if self.count == 0 {
 			None
@@ -65,18 +65,18 @@ impl IndexRun {
 		}
 	}
 
-	/// Returns the number of physical indexes in this run.
+	/// Returns the number of durable event indexes in this run.
 	pub fn len(self) -> usize {
 		usize::try_from(self.count).expect("index count fits in usize")
 	}
 
-	/// Returns whether this run contains no physical indexes.
+	/// Returns whether this run contains no durable event indexes.
 	pub const fn is_empty(self) -> bool {
 		self.count == 0
 	}
 }
 
-/// Iterator over the physical indexes in an [`IndexRun`].
+/// Iterator over the durable event indexes in an [`IndexRun`].
 #[derive(Debug, Clone)]
 pub struct IndexRunIter {
 	next:      u64,
@@ -116,7 +116,7 @@ impl IntoIterator for IndexRun {
 	type IntoIter = IndexRunIter;
 	type Item = u64;
 
-	/// Iterates over every physical index in the run.
+	/// Iterates over every durable event index in the run.
 	fn into_iter(self) -> Self::IntoIter {
 		IndexRunIter { next: self.first, remaining: self.count }
 	}
@@ -358,8 +358,8 @@ impl Writer {
 
 	/// Appends an event and returns its assigned event index.
 	///
-	/// The event index is the physical line number minus one. Empty inference
-	/// patches are rejected because they encode no state transition.
+	/// The event index is its position in expanded durable event order. Empty
+	/// inference patches are rejected because they encode no state transition.
 	pub fn append(&mut self, event: &Event) -> Result<u64, Error> {
 		match self.append_atomic(slice::from_ref(event)) {
 			Ok(mut indexes) => Ok(indexes.pop().expect("one event has one physical index")),
@@ -468,8 +468,10 @@ impl Writer {
 
 	/// Atomically appends an event group with contiguous physical indexes.
 	///
-	/// Every line is encoded before the file is touched, then the staged bytes
-	/// are written and synchronized at one durability point. A clean failure
+	/// Every event is encoded into one committed newline-delimited envelope
+	/// before the file is touched, then synchronized at one durability point.
+	/// Recovery publishes none of the group unless the whole canonical envelope
+	/// is present. A clean failure
 	/// restores and synchronizes the original length. If rollback itself fails,
 	/// the returned [`JournalIndeterminate`] poisons this writer permanently.
 	pub fn append_atomic(&mut self, events: &[Event]) -> Result<SmallVec<u64, 8>, JournalError> {
@@ -482,10 +484,10 @@ impl Writer {
 				maximum: MAX_ATOMIC_ENTRIES,
 			});
 		}
-		let ends = self
-			.stage(events)
+		self
+			.stage_atomic(events)
 			.map_err(|source| JournalError::RolledBack { source })?;
-		if ends.is_empty() {
+		if events.is_empty() {
 			return Ok(SmallVec::new());
 		}
 		if self.file.is_none() {
@@ -627,6 +629,19 @@ impl Writer {
 			ends.push(self.line.len());
 		}
 		Ok(ends)
+	}
+
+	fn stage_atomic(&mut self, events: &[Event]) -> Result<(), Error> {
+		self.line.clear();
+		if events.is_empty() {
+			return Ok(());
+		}
+		for event in events {
+			validate_event(event)?;
+		}
+		write_atomic_group(events, &mut self.line)?;
+		self.line.extend_from_slice(b"\n");
+		Ok(())
 	}
 
 	fn classify(&mut self, source: Error, written: IndexRun) -> JournalError {

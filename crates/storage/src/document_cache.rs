@@ -465,7 +465,7 @@ mod tests {
 	}
 
 	#[test]
-	fn key_is_blake3_and_normalizes_object_order() {
+	fn key_is_sha256_and_normalizes_object_order() {
 		let left = serde_json::json!({"page": 1, "nested": {"b": true, "a": false}});
 		let right = serde_json::json!({"nested": {"a": false, "b": true}, "page": 1});
 		assert_eq!(key(&left), key(&right));

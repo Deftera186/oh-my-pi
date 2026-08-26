@@ -74,6 +74,10 @@ pub enum Error {
 	/// An undecodable record was incorrectly paired with a decoded value.
 	#[error("an EntryUndecodable record must have value=None")]
 	UndecodableHasValue,
+	/// A committed event-group envelope was empty, unsupported, or
+	/// non-canonical.
+	#[error("invalid committed transcript event group")]
+	InvalidAtomicGroup,
 }
 
 /// The identity header stored at line zero of every transcript v4 file.
@@ -402,6 +406,65 @@ pub fn write_line(event: &Event, out: &mut impl BufMut) -> Result<(), Error> {
 	}
 	object.finish();
 	Ok(())
+}
+const ATOMIC_GROUP_PREFIX: &[u8] = br#"{"$omp_group":"#;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AtomicGroup {
+	#[serde(rename = "$omp_group")]
+	version: u8,
+	events:  Vec<Box<RawValue>>,
+}
+
+/// Writes one committed event group as a single newline-delimited record.
+///
+/// A reader publishes none of the enclosed events until this entire canonical
+/// envelope and its terminating newline are present.
+pub(crate) fn write_atomic_group(events: &[Event], out: &mut impl BufMut) -> Result<(), Error> {
+	out.put_slice(ATOMIC_GROUP_PREFIX);
+	out.put_u8(b'1');
+	out.put_slice(br#","events":["#);
+	for (index, event) in events.iter().enumerate() {
+		if index != 0 {
+			out.put_u8(b',');
+		}
+		if matches!(event.kind, Kind::Msg(_)) {
+			let mut bounded = event.clone();
+			if let Kind::Msg(message) = &mut bounded.kind {
+				message.truncate_for_persistence();
+			}
+			write_line(&bounded, out)?;
+		} else {
+			write_line(event, out)?;
+		}
+	}
+	out.put_slice(b"]}");
+	Ok(())
+}
+
+/// Decodes a committed event-group envelope, or reports that the record is an
+/// ordinary legacy event line.
+pub(crate) fn read_atomic_group(line: &[u8]) -> Option<Result<Vec<Event>, Error>> {
+	if !line.starts_with(ATOMIC_GROUP_PREFIX) {
+		return None;
+	}
+	Some((|| {
+		let group: AtomicGroup = serde_json::from_slice(line)?;
+		if group.version != 1 || group.events.is_empty() || group.events.len() > 1_024 {
+			return Err(Error::InvalidAtomicGroup);
+		}
+		let mut events = Vec::with_capacity(group.events.len());
+		for raw in group.events {
+			events.push(read_line(raw.get().as_bytes())?);
+		}
+		let mut canonical = Vec::with_capacity(line.len());
+		write_atomic_group(&events, &mut canonical)?;
+		if canonical != line {
+			return Err(Error::InvalidAtomicGroup);
+		}
+		Ok(events)
+	})())
 }
 
 fn write_msg_fields<B: BufMut>(object: &mut Object<'_, B>, message: &Msg) -> Result<(), Error> {

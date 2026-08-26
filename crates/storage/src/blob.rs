@@ -1,6 +1,6 @@
 //! Content-addressed storage for binary payloads.
 //!
-//! Blobs are addressed by their BLAKE3-256 digest, which deduplicates payloads
+//! Blobs are addressed by their SHA-256 digest, which deduplicates payloads
 //! across sessions, makes writes idempotent, and gives references the same
 //! meaning on every machine. Files live at `<root>/blobs/<hh>/<hh>/
 //! <full-64-hex>`; the two fanout levels use the first two digest bytes so that
@@ -42,7 +42,7 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 /// A stable reference to a content-addressed blob.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct BlobRef {
-	/// The BLAKE3-256 digest of the blob contents.
+	/// The SHA-256 digest of the blob contents.
 	pub hash: Hash32,
 	/// The blob length in bytes.
 	pub size: u64,
@@ -132,7 +132,7 @@ pub enum Error {
 		actual:   u64,
 	},
 	/// A digest was not exactly 64 lowercase hexadecimal characters.
-	#[error("invalid BLAKE3 hash hex")]
+	#[error("invalid SHA-256 hash hex")]
 	BadHex,
 	/// The referenced blob does not exist.
 	#[error("blob not found")]
@@ -141,7 +141,7 @@ pub enum Error {
 
 /// Immutable wheel identity used for unpacked-store directory names.
 ///
-/// A directory is named `<distribution>-<version>-<tag>-<blake3-16>`, tying
+/// A directory is named `<distribution>-<version>-<tag>-<sha256-16>`, tying
 /// its contents to the exact wheel blob without relying on a mutable index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WheelName {
@@ -198,6 +198,16 @@ impl BlobStore {
 		let store = Self { root: root.into() };
 		fs::create_dir_all(store.blobs_dir())?;
 		fs::create_dir_all(store.tmp_dir())?;
+		sync_directory(&store.root)?;
+		sync_directory(&store.blobs_dir())?;
+		sync_directory(&store.tmp_dir())?;
+		if let Some(parent) = store
+			.root
+			.parent()
+			.filter(|parent| !parent.as_os_str().is_empty())
+		{
+			sync_directory(parent)?;
+		}
 		Ok(store)
 	}
 
@@ -311,7 +321,7 @@ impl BlobStore {
 			.join(hash.as_str())
 	}
 
-	/// Fully verifies that a blob's byte length and BLAKE3 digest match its
+	/// Fully verifies that a blob's byte length and SHA-256 digest match its
 	/// reference.
 	///
 	/// # Errors
@@ -346,7 +356,7 @@ impl BlobStore {
 
 	/// Returns the immutable unpacked-wheel directory for `wheel`.
 	///
-	/// The path is `<root>/<distribution>-<version>-<tag>-<blake3-16>`, the
+	/// The path is `<root>/<distribution>-<version>-<tag>-<sha256-16>`, the
 	/// stable store convention shared by every materializer using this store.
 	pub fn unpacked_wheel_path(&self, wheel: &WheelName, reference: &BlobRef) -> PathBuf {
 		let digest = reference.to_hex();
@@ -427,6 +437,13 @@ impl BlobStore {
 			.parent()
 			.ok_or_else(|| io::Error::other("blob destination has no parent"))?;
 		fs::create_dir_all(parent)?;
+		sync_directory(parent)?;
+		if let Some(first_fanout) = parent.parent() {
+			sync_directory(first_fanout)?;
+			if let Some(blobs) = first_fanout.parent() {
+				sync_directory(blobs)?;
+			}
+		}
 		Ok(())
 	}
 
@@ -449,6 +466,11 @@ impl BlobStore {
 		match fs::rename(temporary.path(), destination) {
 			Ok(()) => {
 				temporary.disarm();
+				sync_directory(
+					destination
+						.parent()
+						.ok_or_else(|| io::Error::other("blob destination has no parent"))?,
+				)?;
 				Ok(())
 			},
 			Err(error)
@@ -463,7 +485,7 @@ impl BlobStore {
 
 /// A store-owned, single-pass writer for one content-addressed blob.
 ///
-/// Each successful write is incorporated into the blob's BLAKE3 digest and
+/// Each successful write is incorporated into the blob's SHA-256 digest and
 /// byte length exactly once. The temporary content is removed unless
 /// [`Self::finish`] successfully adopts it.
 pub struct BlobStage {
@@ -615,6 +637,11 @@ fn set_read_only(path: &Path) -> io::Result<()> {
 	fs::set_permissions(path, permissions)
 }
 
+fn sync_directory(path: &Path) -> Result<(), Error> {
+	File::open(path)?.sync_all()?;
+	Ok(())
+}
+
 fn parse_hash(hash: &str) -> Result<Hash32, Error> {
 	hash.parse().map_err(|_| Error::BadHex)
 }
@@ -670,6 +697,10 @@ mod tests {
 		let store = BlobStore::open(directory.path()).unwrap();
 		let reference = store.put(b"transcript payload").unwrap();
 
+		assert_eq!(
+			reference.to_hex().as_str(),
+			"fb86318f0628fefbdc509787aec007728afa63279e7025be3fbd3bf8ba0cf7bd"
+		);
 		assert_eq!(store.get(&reference).unwrap(), &b"transcript payload"[..]);
 		assert!(store.verify(&reference).unwrap());
 	}

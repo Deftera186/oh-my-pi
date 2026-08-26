@@ -1,6 +1,8 @@
 //! Transactional maintenance operations over the derived sessions index.
 
-use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 
 use crate::{
 	index::{Error, SessionIndex},
@@ -79,6 +81,78 @@ impl LineageTransferReport {
 }
 
 impl SessionIndex {
+	/// Relocates one complete session projection to another authoritative index,
+	/// updating its workspace identity while preserving all other session and
+	/// derived accounting fields.
+	///
+	/// Source removal and destination insertion share one SQLite immediate
+	/// transaction through an attached destination database. The destination
+	/// must not already contain `session`. When both handles name the same
+	/// database, this reduces to one transactional `cwd`/`project` update.
+	/// Returns `false` without mutation when the source projection is absent.
+	///
+	/// This moves only the rebuildable index projection. The caller remains
+	/// responsible for fencing the writer and relocating the journal through
+	/// the active journal authority before reporting success.
+	pub fn relocate_session(
+		&self,
+		destination: &Self,
+		session: &SessionId,
+		cwd: &str,
+		project: &str,
+	) -> Result<bool, Error> {
+		self.require_writer()?;
+		destination.require_writer()?;
+		if std::ptr::eq(self, destination) {
+			let mut connection = self.connection.lock();
+			return update_session_location(&mut connection, session, cwd, project);
+		}
+
+		let source_address = std::ptr::from_ref(self).addr();
+		let destination_address = std::ptr::from_ref(destination).addr();
+		let (mut source, destination_connection) = if source_address < destination_address {
+			(self.connection.lock(), destination.connection.lock())
+		} else {
+			let destination_connection = destination.connection.lock();
+			let source = self.connection.lock();
+			(source, destination_connection)
+		};
+		let source_path = main_database_path(&source)?;
+		let destination_path = main_database_path(&destination_connection)?;
+		if source_path.is_empty() || destination_path.is_empty() {
+			return Err(Error::RelocationRequiresFileBackedIndexes);
+		}
+		if source_path == destination_path {
+			return update_session_location(&mut source, session, cwd, project);
+		}
+
+		let mut relocation = Connection::open(&source_path)?;
+		relocation.busy_timeout(Duration::from_secs(5))?;
+		relocation.pragma_update(None, "foreign_keys", "ON")?;
+		relocation
+			.execute("ATTACH DATABASE ?1 AS relocation_destination", [destination_path.as_str()])?;
+		relocate_attached(&mut relocation, session, cwd, project)
+	}
+
+	/// Deletes one session projection and all rows derived from it in a single
+	/// immediate SQLite transaction.
+	///
+	/// The transcript journal remains durable truth and is intentionally not
+	/// touched by this index API. Callers must stop the writer and remove the
+	/// journal through the active session authority before reporting a complete
+	/// user-facing deletion. Returns `false` when the projection was already
+	/// absent.
+	pub fn delete_session(&self, session: &SessionId) -> Result<bool, Error> {
+		self.require_writer()?;
+		let mut connection = self.connection.lock();
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		transaction.execute("DELETE FROM prompts_fts WHERE session_id = ?1", [session.as_str()])?;
+		let removed =
+			transaction.execute("DELETE FROM sessions WHERE id = ?1", [session.as_str()])? != 0;
+		transaction.commit()?;
+		Ok(removed)
+	}
+
 	/// Rekeys every derived row owned by `archived` lineage members to
 	/// `retained`, then removes the archived session rows in the same immediate
 	/// SQLite transaction.
@@ -204,6 +278,88 @@ impl SessionIndex {
 		finish(transaction, mode)?;
 		Ok(removed)
 	}
+}
+
+fn main_database_path(connection: &Connection) -> Result<String, Error> {
+	Ok(connection.query_row(
+		"SELECT file FROM pragma_database_list WHERE name = 'main'",
+		[],
+		|row| row.get(0),
+	)?)
+}
+
+fn update_session_location(
+	connection: &mut Connection,
+	session: &SessionId,
+	cwd: &str,
+	project: &str,
+) -> Result<bool, Error> {
+	let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+	let updated =
+		transaction.execute("UPDATE sessions SET cwd = ?2, project = ?3 WHERE id = ?1", params![
+			session.as_str(),
+			cwd,
+			project
+		])? != 0;
+	transaction.commit()?;
+	Ok(updated)
+}
+
+fn relocate_attached(
+	source: &mut Connection,
+	session: &SessionId,
+	cwd: &str,
+	project: &str,
+) -> Result<bool, Error> {
+	let transaction = source.transaction_with_behavior(TransactionBehavior::Immediate)?;
+	let inserted = transaction.execute(
+		"INSERT INTO relocation_destination.sessions (
+		   id, title, title_source, cwd, project, created_ms, updated_ms, status, kind,
+		   parent, parent_checkpoint, entries, turns, remote, journal_watermark,
+		   last_event_index, repair_watermark, serving_provider, serving_model,
+		   context_anchor, context_revision, compaction_epoch
+		 )
+		 SELECT id, title, title_source, ?2, ?3, created_ms, updated_ms, status, kind,
+		        parent, parent_checkpoint, entries, turns, remote, journal_watermark,
+		        last_event_index, repair_watermark, serving_provider, serving_model,
+		        context_anchor, context_revision, compaction_epoch
+		 FROM main.sessions WHERE id = ?1",
+		params![session.as_str(), cwd, project],
+	)? != 0;
+	if !inserted {
+		transaction.rollback()?;
+		return Ok(false);
+	}
+
+	transaction.execute(
+		"INSERT INTO relocation_destination.session_entry_kinds
+		 SELECT * FROM main.session_entry_kinds WHERE session_id = ?1",
+		[session.as_str()],
+	)?;
+	transaction.execute(
+		"INSERT INTO relocation_destination.receipts
+		 SELECT * FROM main.receipts WHERE session_id = ?1",
+		[session.as_str()],
+	)?;
+	transaction.execute(
+		"INSERT INTO relocation_destination.item_outcomes
+		 SELECT * FROM main.item_outcomes WHERE session_id = ?1",
+		[session.as_str()],
+	)?;
+	transaction.execute(
+		"INSERT INTO relocation_destination.model_performance
+		 SELECT * FROM main.model_performance WHERE session_id = ?1",
+		[session.as_str()],
+	)?;
+	transaction.execute(
+		"INSERT INTO relocation_destination.prompts_fts(session_id, event_index, prompt)
+		 SELECT session_id, event_index, prompt FROM main.prompts_fts WHERE session_id = ?1",
+		[session.as_str()],
+	)?;
+	transaction.execute("DELETE FROM main.prompts_fts WHERE session_id = ?1", [session.as_str()])?;
+	transaction.execute("DELETE FROM main.sessions WHERE id = ?1", [session.as_str()])?;
+	transaction.commit()?;
+	Ok(true)
 }
 
 fn require_session(transaction: &Transaction<'_>, session: &SessionId) -> Result<(), Error> {
