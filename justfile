@@ -188,16 +188,6 @@ e2e: e2e-build e2e-core e2e-p7 e2e-p8
 # LLM catalog & compat cascade (crates/llm-catalog)
 # ---------------------------------------------------------------------------
 
-# Dump the classified model roster (id, provider, class, family, revision, reasoning) in frozen normalized-catalog order.
-[group('catalog')]
-catalog-identity:
-    cargo run -p omp-llm-catalog --example dump_identity
-
-# Self-test the offline compat-cascade oracle against fixtures/llm-oracle.
-[group('catalog')]
-catalog-oracle:
-    python3 fixtures/llm-oracle/validate.py --self-test
-
 # Run the taxonomy and compat-cascade test suites.
 [group('catalog')]
 catalog-test:
