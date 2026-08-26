@@ -1,13 +1,7 @@
 {
   "schema_version": 1,
-  "source_digest": "a26357301a828d527b82c592e4a870a4b362ad1b10fed58222a0fd7e487d7c01",
+  "source_digest": "ab3c692a2a93bec98ce90e16ca9bea160c826bd98dafec1692a084bdc1818cda",
   "inputs": [
-    {
-      "id": "catalog.census.v1",
-      "path": "fixtures/llm-oracle/catalog/census.json",
-      "sha256": "d9efc3b023474d7a6bad397b417ff9b5269468df344b85b9fc5aa5958df2255c",
-      "source": "oracle:catalog.census.v1"
-    },
     {
       "id": "catalog.models.compressed.v1",
       "path": "fixtures/llm-oracle/catalog/models.json.zst",

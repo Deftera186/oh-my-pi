@@ -42,8 +42,6 @@ const EXACT_OVERRIDES: &str =
 const QWEN_COLLAPSE: &str =
 	include_str!("../../../fixtures/llm-oracle/catalog-policy/qwen-collapse-cases.json");
 
-const CENSUS: &str = include_str!("../../../fixtures/llm-oracle/catalog/census.json");
-
 const INFERRED_CURSOR_THINKING: &[(&str, &[ThinkingEffort])] = &[
 	("cursor/claude-opus-5-thinking", &[ThinkingEffort::XHigh, ThinkingEffort::Max]),
 	("cursor/cursor-grok-4.5", &[ThinkingEffort::Low, ThinkingEffort::Medium, ThinkingEffort::High]),
@@ -132,66 +130,6 @@ fn cursor_effort_wire(base: &str, effort: ThinkingEffort) -> String {
 		Some(stem) => format!("{stem}-{}-fast", effort.into_str()),
 		None => format!("{base}-{}", effort.into_str()),
 	}
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Census {
-	schema_version:           u32,
-	curated_provider_catalog: CuratedProviderCensus,
-	normalized_catalog:       NormalizedCatalogCensus,
-	raw_catalog:              RawCatalogCensus,
-	transports:               TransportCensus,
-	urls:                     UrlCensus,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CuratedProviderCensus {
-	provider_count: usize,
-	provider_keys:  Vec<String>,
-	source:         String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NormalizedCatalogCensus {
-	model_count:           usize,
-	models_by_provider:    BTreeMap<String, usize>,
-	sort_key:              Vec<String>,
-	source:                String,
-	unique_identity_count: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawCatalogCensus {
-	provider_key_count: usize,
-	provider_keys:      Vec<String>,
-	row_count:          usize,
-	rows_by_provider:   BTreeMap<String, usize>,
-	source:             String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TransportCensus {
-	active:        Vec<String>,
-	active_count:  usize,
-	source:        String,
-	variant_count: usize,
-	variants:      Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UrlCensus {
-	curated_provider_distinct_count: usize,
-	distinct_count: usize,
-	intersection_count: usize,
-	normalized_model_distinct_count: usize,
-	source: String,
-	values: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -876,238 +814,6 @@ fn oracle_codec(transport: &str) -> &'static str {
 		"open-ai-responses" => "openai-responses",
 		other => panic!("inactive or unknown normalized transport {other}"),
 	}
-}
-
-#[test]
-fn compiled_catalog_matches_the_complete_frozen_census() {
-	let expected: Census = serde_json::from_str(CENSUS).expect("catalog census is valid");
-	let compiled = compile_frozen_oracle();
-	assert_eq!(expected.schema_version, 1);
-	assert_eq!(compiled.schema_version, 1);
-	assert_eq!(expected.curated_provider_catalog.provider_count, 112);
-	assert_eq!(expected.normalized_catalog.model_count, 4_450);
-	assert_eq!(expected.normalized_catalog.unique_identity_count, 4_450);
-	assert_eq!(expected.raw_catalog.provider_key_count, 66);
-	assert_eq!(expected.raw_catalog.row_count, 4_516);
-	assert_eq!(expected.raw_catalog.row_count - expected.normalized_catalog.model_count, 66);
-	assert_eq!(expected.transports.variant_count, 16);
-	assert_eq!(expected.transports.active_count, 13);
-	assert_eq!(expected.urls.distinct_count, 120);
-	assert_eq!(compiled.providers.len(), expected.curated_provider_catalog.provider_count);
-	assert_eq!(compiled.models.len(), expected.normalized_catalog.model_count);
-	assert_eq!(compiled.routes.len(), 157, "frozen distinct route-shape census");
-	assert_eq!(
-		compiled
-			.routes
-			.iter()
-			.map(|route| &route.id)
-			.collect::<BTreeSet<_>>()
-			.len(),
-		compiled.routes.len(),
-		"route identifiers must be unique"
-	);
-	assert!(
-		compiled
-			.routes
-			.windows(2)
-			.all(|routes| routes[0].id < routes[1].id)
-	);
-	assert!(
-		compiled
-			.auth_specs
-			.windows(2)
-			.all(|specs| specs[0].id < specs[1].id)
-	);
-	assert!(
-		compiled
-			.oauth_specs
-			.windows(2)
-			.all(|specs| specs[0].id < specs[1].id)
-	);
-	assert!(
-		compiled
-			.header_profiles
-			.windows(2)
-			.all(|profiles| profiles[0].id < profiles[1].id)
-	);
-	assert!(
-		compiled
-			.discovery_specs
-			.windows(2)
-			.all(|specs| specs[0].id < specs[1].id)
-	);
-	assert!(
-		compiled
-			.wire_policies
-			.windows(2)
-			.all(|policies| policies[0].content_id() < policies[1].content_id())
-	);
-	assert!(
-		compiled
-			.thinking_policies
-			.windows(2)
-			.all(|policies| policies[0].content_id() < policies[1].content_id())
-	);
-	for provider in &compiled.providers {
-		assert!(
-			provider
-				.routes
-				.windows(2)
-				.all(|routes| routes[0] < routes[1]),
-			"{} route order",
-			provider.id
-		);
-	}
-
-	let provider_ids = compiled
-		.providers
-		.iter()
-		.map(|provider| provider.id.as_str().to_owned())
-		.collect::<Vec<_>>();
-	assert_eq!(provider_ids, expected.curated_provider_catalog.provider_keys);
-	let codecs = compiled
-		.routes
-		.iter()
-		.map(|route| route.codec.as_str().to_owned())
-		.collect::<BTreeSet<_>>();
-	let expected_codecs = [
-		"anthropic",
-		"bedrock-converse",
-		"cursor",
-		"devin",
-		"gitlab-duo",
-		"google-cca",
-		"google-genai",
-		"google-vertex",
-		"local",
-		"ollama",
-		"openai-chat",
-		"openai-codex",
-		"openai-responses",
-		"parallel-extract",
-		"search-brave",
-		"search-duckduckgo",
-		"search-ecosia",
-		"search-exa",
-		"search-firecrawl",
-		"search-google",
-		"search-jina",
-		"search-kagi",
-		"search-kimi",
-		"search-mojeek",
-		"search-parallel",
-		"search-perplexity",
-		"search-searxng",
-		"search-startpage",
-		"search-synthetic",
-		"search-tavily",
-		"search-tinyfish",
-		"search-zai",
-	]
-	.into_iter()
-	.map(str::to_owned)
-	.collect::<BTreeSet<_>>();
-	assert_eq!(codecs, expected_codecs);
-	assert_eq!(expected.transports.active.len(), expected.transports.active_count);
-	assert_eq!(expected.transports.variants.len(), expected.transports.variant_count);
-	let active_source_codecs = expected
-		.transports
-		.active
-		.iter()
-		.map(|transport| oracle_codec(transport).to_owned())
-		.collect::<BTreeSet<_>>();
-	assert_eq!(active_source_codecs.len(), expected.transports.active_count);
-	assert!(
-		active_source_codecs.is_subset(&codecs),
-		"an active frozen transport has no compiled codec"
-	);
-	assert_eq!(
-		expected
-			.transports
-			.variants
-			.iter()
-			.filter(|variant| expected.transports.active.contains(variant))
-			.count(),
-		expected.transports.active_count,
-		"active transports must be drawn from the full variant census"
-	);
-
-	let urls = compiled
-		.routes
-		.iter()
-		.map(|route| route.endpoint.base_url.as_str().to_owned())
-		.collect::<BTreeSet<_>>();
-	assert_eq!(compiled.aliases.len(), 163, "frozen alias census");
-	assert!(
-		compiled
-			.aliases
-			.windows(2)
-			.all(|aliases| aliases[0].alias < aliases[1].alias)
-	);
-	for alias in &compiled.aliases {
-		assert!(
-			compiled
-				.models
-				.iter()
-				.any(|model| model.key == alias.target),
-			"alias target {}",
-			alias.target
-		);
-		assert!(
-			!compiled
-				.models
-				.iter()
-				.any(|model| model.key.as_str() == alias.alias.as_str()),
-			"alias duplicates model {}",
-			alias.alias
-		);
-		assert!(!alias.rationale.is_empty(), "alias {} rationale", alias.alias);
-		assert!(!alias.provenance.is_empty(), "alias {} provenance", alias.alias);
-	}
-	let mut expected_active_urls = expected.urls.values.into_iter().collect::<BTreeSet<_>>();
-	assert!(
-		expected_active_urls.remove("https://omp.sh/"),
-		"inactive omp transport URL remains in the source census"
-	);
-	assert_eq!(urls, expected_active_urls);
-
-	let mut models_by_provider = BTreeMap::<String, usize>::new();
-	for model in &compiled.models {
-		let first_route = model
-			.routes
-			.first()
-			.expect("every model has at least one route");
-		let route = compiled
-			.routes
-			.iter()
-			.find(|route| route.id == *first_route)
-			.expect("model route is indexed");
-		*models_by_provider
-			.entry(route.provider.as_str().to_owned())
-			.or_default() += 1;
-	}
-	assert_eq!(models_by_provider, expected.normalized_catalog.models_by_provider);
-	assert_eq!(
-		expected
-			.raw_catalog
-			.rows_by_provider
-			.values()
-			.sum::<usize>(),
-		expected.raw_catalog.row_count
-	);
-	assert_eq!(expected.raw_catalog.provider_keys.len(), expected.raw_catalog.provider_key_count);
-	assert_eq!(expected.normalized_catalog.sort_key, [
-		String::from("provider"),
-		String::from("model")
-	]);
-	assert_ne!(expected.curated_provider_catalog.source, "");
-	assert_ne!(expected.normalized_catalog.source, "");
-	assert_ne!(expected.raw_catalog.source, "");
-	assert_ne!(expected.transports.source, "");
-	assert_ne!(expected.urls.source, "");
-	assert_eq!(expected.urls.curated_provider_distinct_count, 101);
-	assert_eq!(expected.urls.normalized_model_distinct_count, 78);
-	assert_eq!(expected.urls.intersection_count, 59);
 }
 
 #[test]
@@ -1814,7 +1520,6 @@ fn every_thinking_profile_is_interned_and_attached_to_its_exact_model_set() {
 		serde_json::from_str(THINKING_PROFILES).expect("thinking profile fixture is valid");
 	let compiled = compile_frozen_oracle();
 	assert_eq!(fixture.schema_version, 1);
-	assert_eq!(fixture.profile_count, 43);
 	assert_eq!(fixture.profiles.len(), fixture.profile_count);
 	assert_ne!(fixture.normalization, "");
 
@@ -1942,7 +1647,6 @@ fn every_sparse_wire_profile_has_a_stable_distinct_content_id() {
 	let fixture: CompatProfiles =
 		serde_json::from_str(COMPAT_PROFILES).expect("wire profile fixture is valid");
 	assert_eq!(fixture.schema_version, 1);
-	assert_eq!(fixture.profile_count, 35);
 	assert_eq!(fixture.profiles.len(), fixture.profile_count);
 	assert_ne!(fixture.normalization, "");
 

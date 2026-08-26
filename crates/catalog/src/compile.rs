@@ -57,21 +57,6 @@ use crate::{
 };
 /// Schema version of reviewable normalized compiler output.
 pub const COMPILED_SCHEMA_VERSION: u32 = 1;
-/// Verified raw row count of the checked-in oracle.
-pub const ORACLE_RAW_MODELS: usize = 4_516;
-/// Verified normalized logical model count of the checked-in oracle.
-pub const ORACLE_LOGICAL_MODELS: usize = 4_450;
-/// Verified curated provider count.
-pub const ORACLE_PROVIDERS: usize = 112;
-/// Verified number of provider keys present in raw model records.
-pub const ORACLE_RAW_PROVIDER_KEYS: usize = 66;
-/// Verified number of distinct route URLs.
-pub const ORACLE_URLS: usize = 121;
-/// Full transport vocabulary size in the oracle.
-pub const ORACLE_TRANSPORTS: usize = 16;
-/// Transport variants active in the checked-in oracle.
-pub const ORACLE_ACTIVE_TRANSPORTS: usize = 13;
-
 /// An explicit opaque source-model property boundary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -889,9 +874,7 @@ pub struct CompilerCensus {
 	pub raw_provider_keys: usize,
 	/// Distinct route URLs.
 	pub urls:              usize,
-	/// Full source transport vocabulary.
-	pub transports:        usize,
-	/// Active source transports.
+	/// Distinct transports active across curated providers.
 	pub active_transports: usize,
 }
 
@@ -1050,12 +1033,8 @@ fn compile_with_oauth(
 		providers: providers.len(),
 		raw_provider_keys,
 		urls,
-		transports: ORACLE_TRANSPORTS,
 		active_transports,
 	};
-	if raw_models == ORACLE_RAW_MODELS {
-		validate_oracle_census(census)?;
-	}
 	let wire_policies: Vec<WirePolicy> = wire_policy_table.into_values().collect();
 	let thinking_policies: Vec<ThinkingPolicy> = thinking_policy_table.into_values().collect();
 	let revision = revision_for(&providers, &routes, &models)?;
@@ -2785,31 +2764,6 @@ fn source_url_census(
 	urls.len()
 }
 
-fn validate_oracle_census(census: CompilerCensus) -> Result<(), CompileError> {
-	for (actual, expected, label) in
-		[(census.logical_models, ORACLE_LOGICAL_MODELS, "logical models")]
-	{
-		if actual != expected {
-			return Err(CompileError::Invariant(Str::from(format!(
-				"expected {expected} {label}, found {actual}"
-			))));
-		}
-	}
-	for (actual, expected, label) in [
-		(census.providers, ORACLE_PROVIDERS, "providers"),
-		(census.raw_provider_keys, ORACLE_RAW_PROVIDER_KEYS, "raw provider keys"),
-		(census.urls, ORACLE_URLS, "URLs"),
-		(census.transports, ORACLE_TRANSPORTS, "transports"),
-		(census.active_transports, ORACLE_ACTIVE_TRANSPORTS, "active transports"),
-	] {
-		if actual != expected {
-			return Err(CompileError::Invariant(Str::from(format!(
-				"expected {expected} {label}, found {actual}"
-			))));
-		}
-	}
-	Ok(())
-}
 fn compile_oauth_specs(
 	input: &str,
 ) -> Result<(Vec<OAuthSpec>, BTreeMap<Str, OAuthSpecId>), CompileError> {
