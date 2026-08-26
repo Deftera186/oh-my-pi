@@ -130,7 +130,8 @@ fn owning_data_dir(state_dir: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn socket_path(state_dir: &Path, kind: &str) -> PathBuf {
-	let digest = Hash32::sum(state_dir.as_os_str().as_encoded_bytes());
+	let canonical = fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+	let digest = Hash32::sum(canonical.as_os_str().as_encoded_bytes());
 	let short: [u8; 16] = digest.as_bytes()[..16]
 		.try_into()
 		.expect("a Blake3 digest contains 16 prefix bytes");
