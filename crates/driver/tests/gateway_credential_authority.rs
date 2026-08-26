@@ -58,8 +58,8 @@ fn factory(reveal: &[&str]) -> omp_driver::auth_backend::GatewayCredentialSecret
 	)
 }
 
-#[test]
-fn reveal_scope_is_independent_and_provider_exact() {
+#[tokio::test]
+async fn reveal_scope_is_independent_and_provider_exact() {
 	let connection = identity(5);
 	let authority = factory(&["openai"])
 		.bind(Arc::clone(&connection))
@@ -91,8 +91,8 @@ async fn unauthorized_reveal_is_refused_before_remote_exposure() {
 	assert_eq!(error.code.as_str(), "PermissionError");
 }
 
-#[test]
-fn reveal_is_fenced_to_the_bound_host_and_session_identity() {
+#[tokio::test]
+async fn reveal_is_fenced_to_the_bound_host_and_session_identity() {
 	let bound = identity(5);
 	let authority = factory(&["openai"]).bind(bound).expect("authority");
 	let stale = ControlRequestContext { connection: identity(6), request_id: 43, invocation: None };

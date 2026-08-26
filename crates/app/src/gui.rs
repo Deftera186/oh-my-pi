@@ -3,13 +3,13 @@
 use std::{cell::RefCell, future::Future, rc::Rc, time::Duration};
 
 use omp_chat_ui::host::{HostExit, HostOutcome, RetainedChat, RetainedChatEffect};
-use omp_executor::Executor;
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
 use omp_tui::{Key, MouseReport, Size, UiContext};
 
+use crate::editor::{EditorOptions, edit_draft_detached};
+
 /// Runs one production chat scene in a single native GPU window.
 pub(crate) fn run<F>(
-	executor: &Executor,
 	build: impl FnOnce(&UiContext) -> RetainedChat,
 	bridge: F,
 ) -> (HostOutcome, miette::Result<()>)
@@ -19,7 +19,7 @@ where
 	let build = Rc::new(RefCell::new(Some(build)));
 	let outcome = Rc::new(RefCell::new(None));
 	let (result_tx, result_rx) = flume::bounded(1);
-	let bridge_task = executor.spawn(async move {
+	let bridge_task = tokio::spawn(async move {
 		let _ = result_tx.send(bridge.await);
 	});
 	omp_gui::run(HostConfig { multiplex: false, ..HostConfig::default() }, {
@@ -64,6 +64,16 @@ impl GuiScene {
 			},
 			RetainedChatEffect::Clipboard(scope) => Effect::Clipboard(scope),
 			RetainedChatEffect::SetClipboard(text) => Effect::SetClipboard(text),
+			RetainedChatEffect::ExternalEditor(draft) => {
+				match edit_draft_detached(draft.as_str(), EditorOptions::default()) {
+					Ok(Some(replacement)) => {
+						self.chat.replace_composer(replacement.into());
+					},
+					Ok(None) => {},
+					Err(error) => tracing::warn!(%error, "GUI external editor failed"),
+				}
+				Effect::Consumed
+			},
 		}
 	}
 

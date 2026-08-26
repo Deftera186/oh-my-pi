@@ -1110,6 +1110,11 @@ fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
 			environment_exception(py, "Disconnected", &error.to_string())
 		},
 		ClientError::InvalidEnvPath(_) => environment_exception(py, "Invalid", &error.to_string()),
+		ClientError::InvalidInvocationPrincipal => environment_exception(
+			py,
+			"Invalid",
+			"invocation principal requires nonempty session_id and agent_id",
+		),
 		ClientError::ScopedOperationDenied => environment_exception(py, "Denied", &error.to_string()),
 		ClientError::StreamLost(_) => environment_exception(py, "StreamLost", &error.to_string()),
 		ClientError::RequestIdExhausted | ClientError::UnexpectedResponse { .. } => {
@@ -1854,6 +1859,7 @@ impl PyEnvironmentBackend {
 					restart: Some(restart),
 					detached: false,
 					persist: false,
+					timeout_ms: None,
 					props: Default::default(),
 				}),
 				ready,

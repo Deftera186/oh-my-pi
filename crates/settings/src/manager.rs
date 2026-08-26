@@ -27,7 +27,7 @@ use crate::{
 pub enum MutationScope {
 	/// User/profile `config.toml`.
 	Global,
-	/// Nearest project `.omp/config.toml`.
+	/// Exact project `.omp/config.toml`.
 	Project,
 	/// Process-local, non-persistent override.
 	Runtime,
@@ -46,11 +46,11 @@ impl MutationScope {
 /// Native source paths used by the settings authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsPaths {
-	/// User/profile native settings file.
+	/// User/profile writable TOML settings file.
 	pub global:   PathBuf,
-	/// Optional nearest project native settings file.
+	/// Optional exact-project writable TOML settings file.
 	pub project:  Option<PathBuf>,
-	/// Ordered read-only native overlays.
+	/// Ordered read-only TOML or YAML overlays.
 	pub overlays: Vec<PathBuf>,
 }
 /// One reflected row consumed by the settings overlay.
@@ -78,18 +78,13 @@ pub struct SettingsEditorPanel {
 }
 
 impl SettingsPaths {
-	/// Resolves standard native paths and `OMP_CONFIG_FILES` overlays.
+	/// Resolves the standard user and exact-project paths plus
+	/// `OMP_CONFIG_FILES` overlays.
 	pub fn discover(data_dir: &Path, project_root: Option<&Path>) -> Self {
 		let overlays = env::var_os("OMP_CONFIG_FILES")
 			.map(|value| env::split_paths(&value).collect())
 			.unwrap_or_default();
-		let project = project_root.map(|root| {
-			root
-				.ancestors()
-				.find(|ancestor| ancestor.join(".omp").is_dir())
-				.unwrap_or(root)
-				.join(".omp/config.toml")
-		});
+		let project = project_root.map(|root| root.join(".omp/config.toml"));
 		Self { global: data_dir.join("config.toml"), project, overlays }
 	}
 }
@@ -147,7 +142,7 @@ impl SettingsManager {
 	fn load(paths: SettingsPaths, read_only: bool) -> Result<Self, SettingsManagerError> {
 		validate_registry()?;
 		let mut diagnostics = Vec::new();
-		let global = if read_only {
+		let global_toml = if read_only {
 			read_document(&paths.global)?
 		} else {
 			let read = read_or_quarantine(&paths.global)?;
@@ -157,7 +152,9 @@ impl SettingsManager {
 			}
 			read.document
 		};
-		let project = match &paths.project {
+		let mut global = load_yaml_compatibility(&paths.global)?;
+		deep_merge(&mut global, global_toml);
+		let project_toml = match &paths.project {
 			Some(path) if read_only => read_document(path)?,
 			Some(path) => {
 				let read = read_or_quarantine(path)?;
@@ -169,6 +166,13 @@ impl SettingsManager {
 			},
 			None => toml::Table::new(),
 		};
+		let mut project = paths
+			.project
+			.as_deref()
+			.map(load_yaml_compatibility)
+			.transpose()?
+			.unwrap_or_default();
+		deep_merge(&mut project, project_toml);
 		let overlays = load_overlays(&paths.overlays)?;
 		let document = compose_document(global, project, overlays, toml::Table::new());
 		validate_document(&document)?;
@@ -393,16 +397,17 @@ impl SettingsManager {
 		if let Some(diagnostic) = global_read.quarantine {
 			self.record_quarantine(diagnostic);
 		}
-		let global = global_read.document;
-		let project = if let Some(path) = self.paths.project.as_deref() {
+		let mut global = load_yaml_compatibility(&self.paths.global)?;
+		deep_merge(&mut global, global_read.document);
+		let mut project = toml::Table::new();
+		if let Some(path) = self.paths.project.as_deref() {
+			project = load_yaml_compatibility(path)?;
 			let read = read_or_quarantine(path)?;
 			if let Some(diagnostic) = read.quarantine {
 				self.record_quarantine(diagnostic);
 			}
-			read.document
-		} else {
-			toml::Table::new()
-		};
+			deep_merge(&mut project, read.document);
+		}
 		let overlays = load_overlays(&self.paths.overlays)?;
 		let document = compose_document(global, project, overlays, self.runtime.read().clone());
 		validate_document(&document)?;
@@ -544,6 +549,23 @@ fn load_overlays(paths: &[PathBuf]) -> Result<Vec<toml::Table>, SettingsManagerE
 		.map(|path| read_document(path).map_err(Into::into))
 		.collect()
 }
+/// Loads the first canonical Pi YAML sibling below a writable TOML layer.
+///
+/// `config.yml` is canonical and shadows `config.yaml` when both exist. The
+/// writable TOML layer is merged afterward, so native edits always win while
+/// untouched YAML keys remain effective.
+fn load_yaml_compatibility(path: &Path) -> Result<toml::Table, SettingsManagerError> {
+	let Some(parent) = path.parent() else {
+		return Ok(toml::Table::new());
+	};
+	for name in ["config.yml", "config.yaml"] {
+		let candidate = parent.join(name);
+		if candidate.is_file() {
+			return read_document(&candidate).map_err(Into::into);
+		}
+	}
+	Ok(toml::Table::new())
+}
 
 fn apply_runtime(document: &mut toml::Table, mutation: &DocumentMutation) {
 	fn set(document: &mut toml::Table, path: &str, value: toml::Value) {
@@ -648,13 +670,13 @@ mod tests {
 	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 	struct CoreProbe {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
-		default_model: Option<String>,
+		probe_value: Option<String>,
 	}
 
 	impl SettingsDomain for CoreProbe {
 		const DOMAIN: &'static str = "probe-core";
 		const FIELDS: &'static [FieldDescriptor] = &[FieldDescriptor {
-			path:        "default_model",
+			path:        "probe_value",
 			label:       "Default Model",
 			description: "Model selected by default.",
 			kind:        SettingKind::String,
@@ -719,7 +741,7 @@ mod tests {
 		.expect("manager");
 		let mut subscription = manager.subscribe::<CoreProbe>();
 		manager
-			.set_sync(MutationScope::Runtime, "default_model", "demo/model")
+			.set_sync(MutationScope::Runtime, "probe_value", "demo/model")
 			.expect("mutation");
 		let snapshot = subscription.recv().expect("revision");
 		assert_eq!(
@@ -727,7 +749,7 @@ mod tests {
 				.project::<CoreProbe>()
 				.expect("projection")
 				.get()
-				.default_model
+				.probe_value
 				.as_deref(),
 			Some("demo/model"),
 		);
@@ -741,9 +763,9 @@ mod tests {
 		let overlay = tree.path().join("overlay.toml");
 		fs::create_dir_all(global.parent().expect("global parent")).expect("global dir");
 		fs::create_dir_all(project.parent().expect("project parent")).expect("project dir");
-		fs::write(&global, "default_model = 'global'").expect("global");
-		fs::write(&project, "default_model = 'project'").expect("project");
-		fs::write(&overlay, "default_model = 'overlay'").expect("overlay");
+		fs::write(&global, "probe_value = 'global'").expect("global");
+		fs::write(&project, "probe_value = 'project'").expect("project");
+		fs::write(&overlay, "probe_value = 'overlay'").expect("overlay");
 		let manager = SettingsManager::open(SettingsPaths {
 			global,
 			project: Some(project),
@@ -754,15 +776,115 @@ mod tests {
 			.snapshot()
 			.project::<CoreProbe>()
 			.expect("projection");
-		assert_eq!(projected.get().default_model.as_deref(), Some("overlay"));
+		assert_eq!(projected.get().probe_value.as_deref(), Some("overlay"));
 		manager
-			.set_sync(MutationScope::Runtime, "default_model", "runtime")
+			.set_sync(MutationScope::Runtime, "probe_value", "runtime")
 			.expect("override");
 		let projected = manager
 			.snapshot()
 			.project::<CoreProbe>()
 			.expect("projection");
-		assert_eq!(projected.get().default_model.as_deref(), Some("runtime"));
+		assert_eq!(projected.get().probe_value.as_deref(), Some("runtime"));
+	}
+
+	#[test]
+	fn discovery_binds_only_the_exact_project_directory() {
+		let tree = tempfile::tempdir().expect("tree");
+		let project = tree.path().join("repo/package");
+		fs::create_dir_all(tree.path().join("repo/.omp")).expect("ancestor native dir");
+		fs::create_dir_all(&project).expect("exact project");
+		let paths = SettingsPaths::discover(tree.path(), Some(&project));
+		assert_eq!(paths.project, Some(project.join(".omp/config.toml")));
+	}
+
+	#[test]
+	fn canonical_yaml_and_yaml_overlay_participate_in_layering() {
+		let tree = tempfile::tempdir().expect("tree");
+		let data = tree.path().join("data");
+		let project = tree.path().join("project");
+		fs::create_dir_all(&data).expect("global dir");
+		fs::create_dir_all(project.join(".omp")).expect("project dir");
+		fs::write(data.join("config.yml"), "probe_value: global-yaml\n").expect("global yaml");
+		fs::write(project.join(".omp/config.yml"), "probe_value: project-yaml\n")
+			.expect("project yaml");
+		let overlay = tree.path().join("overlay.yaml");
+		fs::write(&overlay, "probe_value: overlay-yaml\n").expect("overlay yaml");
+		let mut paths = SettingsPaths::discover(&data, Some(&project));
+		paths.overlays.push(overlay);
+		let manager = SettingsManager::open(paths).expect("manager");
+		assert_eq!(
+			manager
+				.snapshot()
+				.project::<CoreProbe>()
+				.expect("projection")
+				.get()
+				.probe_value
+				.as_deref(),
+			Some("overlay-yaml"),
+		);
+	}
+
+	#[test]
+	fn pi_root_prompt_keys_migrate_per_layer_before_native_precedence() {
+		let tree = tempfile::tempdir().expect("tree");
+		let data = tree.path().join("data");
+		let project = tree.path().join("project");
+		fs::create_dir_all(&data).expect("global dir");
+		fs::create_dir_all(project.join(".omp")).expect("project dir");
+		fs::write(
+			data.join("config.yml"),
+			"includeModelInPrompt: false\nincludeWorkspaceTree: true\n",
+		)
+		.expect("global yaml");
+		fs::write(data.join("config.toml"), "[prompt]\nincludeModelInPrompt = true\n")
+			.expect("global native");
+		let global = SettingsManager::open(SettingsPaths::discover(&data, None)).expect("global");
+		let snapshot = global.snapshot();
+		let prompt = snapshot
+			.document()
+			.get("prompt")
+			.and_then(toml::Value::as_table)
+			.expect("global prompt");
+		assert_eq!(
+			prompt
+				.get("includeModelInPrompt")
+				.and_then(toml::Value::as_bool),
+			Some(true)
+		);
+		assert_eq!(
+			prompt
+				.get("includeWorkspaceTree")
+				.and_then(toml::Value::as_bool),
+			Some(true)
+		);
+
+		fs::write(
+			project.join(".omp/config.yml"),
+			"includeModelInPrompt: false\nincludeWorkspaceTree: false\n",
+		)
+		.expect("project yaml");
+		fs::write(project.join(".omp/config.toml"), "[prompt]\nincludeWorkspaceTree = true\n")
+			.expect("project native");
+		let layered =
+			SettingsManager::open(SettingsPaths::discover(&data, Some(&project))).expect("layered");
+		let snapshot = layered.snapshot();
+		let prompt = snapshot
+			.document()
+			.get("prompt")
+			.and_then(toml::Value::as_table)
+			.expect("layered prompt");
+		assert_eq!(
+			prompt
+				.get("includeModelInPrompt")
+				.and_then(toml::Value::as_bool),
+			Some(false)
+		);
+		assert_eq!(
+			prompt
+				.get("includeWorkspaceTree")
+				.and_then(toml::Value::as_bool),
+			Some(true)
+		);
 	}
 
 	#[test]

@@ -1,6 +1,6 @@
 //! Standalone encrypted transcript sharing over the production HTTP store.
 
-use std::{env, iter, sync::Arc};
+use std::{fs, iter, sync::Arc};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_driver::{
@@ -12,6 +12,7 @@ use omp_driver::{
 	},
 };
 use omp_envd::github_url::GithubCredentialBridge;
+use omp_storage::transcript::reader;
 
 use crate::{cli::ShareArgs, pickers};
 
@@ -33,8 +34,9 @@ pub async fn run(args: ShareArgs) -> miette::Result<()> {
 	};
 	let tree = SessionTree::load(&journal).map_err(|error| miette!("{error}"))?;
 	let value = serde_json::to_value(tree).into_diagnostic()?;
-	let project = env::current_dir().into_diagnostic()?;
-	let configured = omp_driver::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
+	let project = session_project(&journal)?;
+	let configured = omp_driver::settings::current_for_project(&data_dir, &project)
+		.map_err(|error| miette!("{error}"))?;
 	let secrets = SecretSessionSnapshot::build(
 		0,
 		&data_dir.join("secrets.toml"),
@@ -75,4 +77,45 @@ pub async fn run(args: ShareArgs) -> miette::Result<()> {
 	.map_err(|error| miette!("{error}"))?;
 	println!("{}", result.url);
 	Ok(())
+}
+fn session_project(journal: &std::path::Path) -> miette::Result<std::path::PathBuf> {
+	let journal = fs::canonicalize(journal).into_diagnostic()?;
+	let log = reader::load(&journal).map_err(|error| miette!("{error}"))?;
+	let project = fs::canonicalize(&log.header().cwd).map_err(|error| {
+		miette!("cannot resolve shared session project `{}`: {error}", log.header().cwd.display())
+	})?;
+	if !project.is_dir() {
+		return Err(miette!("shared session project `{}` is not a directory", project.display()));
+	}
+	Ok(project)
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::sf;
+	use omp_storage::transcript::{SessionId, codec};
+
+	use super::*;
+
+	#[test]
+	fn selected_journal_owns_share_project_policy() {
+		let directory = tempfile::tempdir().expect("project");
+		let journal = directory.path().join("session.jsonl");
+		let mut bytes = Vec::new();
+		codec::write_header(
+			&codec::Header {
+				v:       4,
+				id:      SessionId(sf!("01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+				created: 1,
+				cwd:     directory.path().to_path_buf(),
+			},
+			&mut bytes,
+		)
+		.expect("header");
+		bytes.push(b'\n');
+		fs::write(&journal, bytes).expect("journal");
+		assert_eq!(
+			session_project(&journal).expect("session project"),
+			directory.path().canonicalize().expect("canonical project")
+		);
+	}
 }

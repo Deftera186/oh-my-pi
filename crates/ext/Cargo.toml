@@ -12,6 +12,8 @@ readme = "README.md"
 [dependencies]
 blake3 = { workspace = true }
 omp-core = { workspace = true }
+jiff = { workspace = true }
+pep440_rs = "0.7"
 ring = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

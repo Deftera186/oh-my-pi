@@ -375,6 +375,7 @@ fn background_click(
 	let flags = modifier_flags(modifiers);
 	pointer_prologue(pid, wid, window, source, x, y, group, flags)?;
 	for click_state in 1..=count.max(1) {
+		crate::operation_checkpoint()?;
 		post_mouse(
 			pid,
 			wid,
@@ -509,6 +510,7 @@ fn background_drag(
 		flags,
 	)?;
 	for &(x, y) in &path[1..] {
+		crate::operation_checkpoint()?;
 		thread::sleep(Duration::from_millis(16));
 		post_mouse(
 			pid,
@@ -849,6 +851,7 @@ fn global_pointer(source: &CGEventSource, event: PointerEvent) -> CoreResult<()>
 			let (cg_button, down, up, _, number) = button_types(button);
 			let flags = modifier_flags(modifiers);
 			for click_state in 1..=count.max(1) {
+				crate::operation_checkpoint()?;
 				post_global_mouse(
 					source,
 					down,
@@ -898,6 +901,7 @@ fn global_pointer(source: &CGEventSource, event: PointerEvent) -> CoreResult<()>
 			)?;
 			post_global_mouse(source, down, cg_button, start_x, start_y, 1, number, flags)?;
 			for &(x, y) in &path[1..] {
+				crate::operation_checkpoint()?;
 				thread::sleep(Duration::from_millis(16));
 				post_global_mouse(source, dragged, cg_button, x, y, 1, number, flags)?;
 			}

@@ -1,10 +1,6 @@
 //! Deterministic account-pool selection simulation and opt-in live benchmark.
 
-use std::{
-	collections::BTreeMap,
-	sync,
-	time::SystemTime,
-};
+use std::{collections::BTreeMap, sync, time::SystemTime};
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_catalog::{ModelKey, snapshot::Catalog};

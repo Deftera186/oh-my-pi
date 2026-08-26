@@ -52,6 +52,17 @@ impl ThemeWatcher {
 		}
 	}
 
+	/// Clears the active custom theme at a newer revision.
+	pub fn clear(&self, revision: u64) -> Result<(), ThemeWatchError> {
+		let mut state = self.state.lock();
+		if revision <= state.revision {
+			return Err(ThemeWatchError::StaleRevision);
+		}
+		self.active.store(None);
+		state.revision = revision;
+		Ok(())
+	}
+
 	/// Parses and atomically publishes one Environment-authored update.
 	pub fn apply_environment_update(
 		&self,
@@ -130,5 +141,8 @@ mod tests {
 			Err(ThemeWatchError::StaleRevision)
 		));
 		assert_eq!(watcher.current().map(|active| active.revision), Some(4));
+		watcher.clear(5).expect("clear custom theme");
+		assert!(watcher.current().is_none());
+		assert!(matches!(watcher.clear(5), Err(ThemeWatchError::StaleRevision)));
 	}
 }

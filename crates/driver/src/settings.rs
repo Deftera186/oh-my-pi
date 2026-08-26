@@ -7,10 +7,11 @@ use omp_core::{Str, sf};
 use omp_inference::{Difficulty, DifficultyBackend};
 mod domains;
 pub use domains::{
-	AppearanceSettings, CompletionSettings, DisplaySettings, ErrorNotificationSettings,
-	HyperlinkMode, InteractionSettings, LifecycleSettings, NotifyToggle, ResizeScrollbackMode,
-	RootDisplaySettings, ShareSettings, ShareStore, ShimmerMode, TitleSettings, TtsrContextMode,
-	TtsrInterruptMode, TtsrSettings, TuiSettings, UnexpectedStopMode,
+	AppearanceSettings, CompletionSettings, CredentialKeySourceSetting, DisplaySettings,
+	ErrorNotificationSettings, HyperlinkMode, InteractionSettings, LifecycleSettings,
+	MarketplaceUpdateMode, NotifyToggle, ResizeScrollbackMode, RootDisplaySettings, ShareSettings,
+	ShareStore, ShimmerMode, SteeringMode, TitleSettings, TtsrContextMode, TtsrInterruptMode,
+	TtsrSettings, TuiSettings, UnexpectedStopMode,
 };
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 impl PromptSettings {
@@ -81,17 +82,6 @@ const PERSISTED_SCOPES: &[omp_settings::SettingScope] = &[
 
 const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 	omp_settings::FieldDescriptor {
-		path:        "default_model",
-		label:       "Default model",
-		description: "Default model selector for interactive chat.",
-		kind:        omp_settings::SettingKind::String,
-		scopes:      PERSISTED_SCOPES,
-		order:       10,
-		options:     None,
-		condition:   None,
-		secret:      false,
-	},
-	omp_settings::FieldDescriptor {
 		path:        "runtime.interrupt_grace",
 		label:       "Interrupt grace",
 		description: "Courtesy interval before forced interruption.",
@@ -114,12 +104,23 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		secret:      false,
 	},
 	omp_settings::FieldDescriptor {
+		path:        "compaction.mid_turn_enabled",
+		label:       "Mid-turn compaction",
+		description: "Check compaction thresholds at safe tool-loop boundaries.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       41,
+		options:     None,
+		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
 		path:        "compaction.async_enabled",
 		label:       "Speculative compaction",
 		description: "Allow latency-bearing methods to run speculatively.",
 		kind:        omp_settings::SettingKind::Boolean,
 		scopes:      PERSISTED_SCOPES,
-		order:       41,
+		order:       42,
 		options:     None,
 		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
 		secret:      false,
@@ -130,7 +131,7 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		description: "Ordered automatic compaction fallback ladder.",
 		kind:        omp_settings::SettingKind::Array,
 		scopes:      PERSISTED_SCOPES,
-		order:       42,
+		order:       43,
 		options:     None,
 		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
 		secret:      false,
@@ -141,7 +142,7 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		description: "Usable-context fraction that triggers compaction.",
 		kind:        omp_settings::SettingKind::Number,
 		scopes:      PERSISTED_SCOPES,
-		order:       43,
+		order:       44,
 		options:     None,
 		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
 		secret:      false,
@@ -152,9 +153,20 @@ const CORE_FIELDS: &[omp_settings::FieldDescriptor] = &[
 		description: "Recent-context growth retained around speculative summaries.",
 		kind:        omp_settings::SettingKind::Integer,
 		scopes:      PERSISTED_SCOPES,
-		order:       44,
+		order:       45,
 		options:     None,
 		condition:   Some(omp_settings::Condition { field: "compaction.enabled", equals: "true" }),
+		secret:      false,
+	},
+	omp_settings::FieldDescriptor {
+		path:        "context_promotion.enabled",
+		label:       "Context promotion",
+		description: "Promote to an eligible larger-context model before compaction.",
+		kind:        omp_settings::SettingKind::Boolean,
+		scopes:      PERSISTED_SCOPES,
+		order:       49,
+		options:     None,
+		condition:   None,
 		secret:      false,
 	},
 	omp_settings::FieldDescriptor {
@@ -478,12 +490,23 @@ fn default_compaction_method_order() -> Vec<CompactionTier> {
 	CompactionTier::ALL.to_vec()
 }
 
+/// Context-overflow model-promotion policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextPromotionSettings {
+	/// Promote to a larger-context eligible model before compacting.
+	#[serde(default)]
+	pub enabled: bool,
+}
+
 /// Persisted automatic context-maintenance policy.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionSettings {
 	/// Whether automatic context compaction is enabled.
 	#[serde(default = "default_true")]
 	pub enabled:            bool,
+	/// Whether to check compaction thresholds between tool-loop requests.
+	#[serde(default = "default_true")]
+	pub mid_turn_enabled:   bool,
 	/// Whether latency-bearing methods may run speculatively in the background.
 	#[serde(default = "default_true")]
 	pub async_enabled:      bool,
@@ -502,6 +525,7 @@ impl Default for CompactionSettings {
 	fn default() -> Self {
 		Self {
 			enabled:            true,
+			mid_turn_enabled:   true,
 			async_enabled:      true,
 			method_order:       default_compaction_method_order(),
 			threshold_fraction: default_compaction_threshold(),
@@ -801,96 +825,96 @@ fn os_username() -> Option<String> {
 /// Persisted client-scope preferences under `<data_dir>/config.toml`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Settings {
-	/// Model key selected as the default for interactive chat.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub default_model: Option<String>,
 	/// Runtime timeout and cancellation settings.
 	#[serde(default)]
-	pub runtime:       RuntimeDurations,
+	pub runtime:           RuntimeDurations,
 	/// Built-in tool exposure and execution timeout policy.
 	#[serde(default)]
-	pub tools:         ToolSettings,
+	pub tools:             ToolSettings,
+	/// Context-overflow model-promotion policy.
+	#[serde(default)]
+	pub context_promotion: ContextPromotionSettings,
 	/// Automatic context-maintenance options.
 	#[serde(default)]
-	pub compaction:    CompactionSettings,
+	pub compaction:        CompactionSettings,
 	/// Automatic per-turn reasoning classification.
 	#[serde(default)]
-	pub auto_thinking: AutoThinkingSettings,
+	pub auto_thinking:     AutoThinkingSettings,
 	/// Planning-mode availability and startup policy.
 	#[serde(default)]
-	pub plan:          PlanSettings,
+	pub plan:              PlanSettings,
 	/// Default-off memory backend selector.
 	#[serde(default)]
-	pub memory:        MemorySettings,
+	pub memory:            MemorySettings,
 	/// Mnemopi-specific durable bank and lifecycle settings.
 	#[serde(default)]
-	pub mnemopi:       MnemopiSettings,
+	pub mnemopi:           MnemopiSettings,
 	/// Automatic-learning capture settings.
 	#[serde(default)]
-	pub autolearn:     AutolearnSettings,
+	pub autolearn:         AutolearnSettings,
 	/// Isolated worktree placement policy.
 	#[serde(default)]
-	pub worktree:      WorktreeSettings,
+	pub worktree:          WorktreeSettings,
 	/// Interactive composer appearance.
 	#[serde(default)]
-	pub composer:      ComposerSettings,
+	pub composer:          ComposerSettings,
 	/// Platform spelling assistance for the interactive composer.
 	#[serde(default)]
-	pub spelling:      SpellingSettings,
+	pub spelling:          SpellingSettings,
 	/// Terminal display and rendering behavior.
 	#[serde(default)]
-	pub display:       DisplaySettings,
+	pub display:           DisplaySettings,
 	/// Pi-compatible TUI rendering and input settings.
 	#[serde(default)]
-	pub tui:           TuiSettings,
+	pub tui:               TuiSettings,
 	/// Root-level Pi-compatible display switches.
 	#[serde(flatten)]
-	pub root_display:  RootDisplaySettings,
+	pub root_display:      RootDisplaySettings,
 	/// Theme, status-line, and icon choices.
 	#[serde(default)]
-	pub appearance:    AppearanceSettings,
+	pub appearance:        AppearanceSettings,
 	/// Notifications, voice, loops, and input behavior.
 	#[serde(default)]
-	pub interaction:   InteractionSettings,
+	pub interaction:       InteractionSettings,
 	/// Successful-turn notification policy.
 	#[serde(default)]
-	pub completion:    CompletionSettings,
+	pub completion:        CompletionSettings,
 	/// Failed-turn notification policy.
 	#[serde(default)]
-	pub error:         ErrorNotificationSettings,
+	pub error:             ErrorNotificationSettings,
 	/// Time-traveling stream-rule policy.
 	#[serde(default)]
-	pub ttsr:          TtsrSettings,
+	pub ttsr:              TtsrSettings,
 	/// Miscellaneous startup, retention, and workspace policy.
 	#[serde(default)]
-	pub lifecycle:     LifecycleSettings,
+	pub lifecycle:         LifecycleSettings,
 	/// Encrypted session-sharing endpoint and backing store.
 	#[serde(default)]
-	pub share:         ShareSettings,
+	pub share:             ShareSettings,
 	/// Session title generation policy.
 	#[serde(default)]
-	pub title:         TitleSettings,
+	pub title:             TitleSettings,
 	/// Client-scope extension overlay.
 	#[serde(default)]
-	pub extensions:    ExtensionOverlay,
+	pub extensions:        ExtensionOverlay,
 	/// Prompt image attachment policy.
 	#[serde(default)]
-	pub images:        ImageSettings,
+	pub images:            ImageSettings,
 	/// Reversible provider-bound secret policy.
 	#[serde(default)]
-	pub secrets:       SecretsSettings,
+	pub secrets:           SecretsSettings,
 	/// Default-off local security-review registration.
 	#[serde(default)]
-	pub security:      SecuritySettings,
+	pub security:          SecuritySettings,
 	/// Irreversible export-boundary policy.
 	#[serde(default)]
-	pub export:        ExportSettings,
+	pub export:            ExportSettings,
 	/// Read-only signed core release checks.
 	#[serde(default)]
-	pub updates:       UpdateSettings,
+	pub updates:           UpdateSettings,
 	/// Live collaboration endpoints and participant identity.
 	#[serde(default)]
-	pub collab:        CollabSettings,
+	pub collab:            CollabSettings,
 }
 
 impl omp_settings::SettingsDomain for Settings {
@@ -899,11 +923,7 @@ impl omp_settings::SettingsDomain for Settings {
 	const PREFIX: Option<&'static str> = None;
 
 	fn validate(&self) -> Result<(), omp_settings::ValidationError> {
-		if self
-			.default_model
-			.as_deref()
-			.is_some_and(|model| model.trim().is_empty())
-			|| self.extensions.validate(Scope::Client).is_err()
+		if self.extensions.validate(Scope::Client).is_err()
 			|| !(0.0..=1.0).contains(&self.compaction.threshold_fraction)
 			|| self.compaction.threshold_fraction == 0.0
 			|| self.collab.relay_endpoint().is_err()
@@ -919,7 +939,7 @@ omp_settings::inventory::submit! {
 	omp_settings::DomainRegistration::of::<Settings>()
 }
 
-/// Loads the current typed projection through the single settings authority.
+/// Loads the current typed projection for the process working directory.
 pub fn current(data_dir: &Path) -> Result<Settings, SettingsManagerError> {
 	current_with_overlays(data_dir, &[])
 }
@@ -930,7 +950,26 @@ pub fn current_with_overlays(
 	overlays: &[PathBuf],
 ) -> Result<Settings, SettingsManagerError> {
 	let project = env::current_dir().ok();
-	let mut paths = SettingsPaths::discover(data_dir, project.as_deref());
+	current_for_project_with_overlays(data_dir, project.as_deref(), overlays)
+}
+
+/// Loads settings for exactly `project`, without walking ancestor `.omp`
+/// directories.
+pub fn current_for_project(
+	data_dir: &Path,
+	project: &Path,
+) -> Result<Settings, SettingsManagerError> {
+	current_for_project_with_overlays(data_dir, Some(project), &[])
+}
+
+/// Loads settings for exactly `project` plus ordered invocation-local TOML or
+/// YAML overlays.
+pub fn current_for_project_with_overlays(
+	data_dir: &Path,
+	project: Option<&Path>,
+	overlays: &[PathBuf],
+) -> Result<Settings, SettingsManagerError> {
+	let mut paths = SettingsPaths::discover(data_dir, project);
 	paths.overlays.extend_from_slice(overlays);
 	let manager = SettingsManager::open(paths)?;
 	let projection = manager
@@ -974,13 +1013,9 @@ mod tests {
 	use super::*;
 	#[test]
 	fn isolated_snapshot_round_trip() {
-		let settings = Settings {
-			default_model: Some("anthropic/claude-sonnet-4".to_owned()),
-			..Settings::default()
-		};
+		let settings = Settings::default();
 		let snapshot = omp_settings::SettingsSnapshot::isolated(settings.clone()).expect("snapshot");
 		let loaded = snapshot.project::<Settings>().expect("projection");
-		assert_eq!(loaded.get().default_model, settings.default_model);
 		assert_eq!(
 			loaded.get().runtime_durations().interrupt_grace,
 			settings.runtime_durations().interrupt_grace,
@@ -1011,6 +1046,9 @@ mod tests {
 		let settings: Settings = toml::from_str("").expect("defaults parse");
 		assert_eq!(settings.compaction.method_order().as_slice(), &CompactionTier::ALL);
 		assert!(settings.compaction.speculation_options().enabled);
+		assert!(settings.compaction.mid_turn_enabled);
+		assert!(!settings.context_promotion.enabled);
+		assert_eq!(settings.interaction.steering_mode, SteeringMode::OneAtATime);
 		assert_eq!(settings.compaction.keep_recent_tokens, 20_000);
 	}
 
@@ -1162,5 +1200,48 @@ mod tests {
 		assert_eq!(diagnostics[0].path, path);
 		assert!(diagnostics[0].backup_path.exists());
 		assert!(!path.exists());
+	}
+	#[test]
+	fn custom_legacy_theme_migrates_to_schema_valid_scalar_before_marker() {
+		let data_dir = tempfile::tempdir().expect("data");
+		fs::write(
+			data_dir.path().join("settings.json"),
+			r#"{"theme":"solarized","defaultThinkingLevel":"high"}"#,
+		)
+		.expect("legacy settings");
+		let paths = SettingsPaths::discover(data_dir.path(), None);
+		let manager = SettingsManager::open(paths.clone()).expect("first startup");
+		assert_eq!(
+			manager
+				.snapshot()
+				.project::<AppearanceSettings>()
+				.expect("appearance")
+				.get()
+				.theme
+				.as_str(),
+			"solarized",
+		);
+		assert_eq!(
+			manager
+				.snapshot()
+				.project::<omp_catalog::settings::ModelSettings>()
+				.expect("model")
+				.get()
+				.default_thinking,
+			omp_catalog::ThinkingEffort::High,
+		);
+		let persisted =
+			fs::read_to_string(data_dir.path().join("config.toml")).expect("native config");
+		let parsed: toml::Table = toml::from_str(&persisted).expect("schema-shaped TOML");
+		assert_eq!(
+			parsed
+				.get("appearance")
+				.and_then(toml::Value::as_table)
+				.and_then(|appearance| appearance.get("theme"))
+				.and_then(toml::Value::as_str),
+			Some("solarized"),
+		);
+		assert!(data_dir.path().join(".settings-migration-v2").is_file());
+		SettingsManager::open(paths).expect("subsequent startup");
 	}
 }

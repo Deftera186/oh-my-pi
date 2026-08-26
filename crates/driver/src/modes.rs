@@ -401,16 +401,17 @@ fn describe_loop_limit(limit: &LoopLimit) -> Str {
 /// App-owned metadata paired with the authoritative regime-resource projection.
 #[derive(Debug, Default)]
 struct RegimeProjectionState {
-	mode_holder:             Option<Str>,
-	mode_activation:         Option<Str>,
-	visible_resources:       Arc<[VisibleResourceFacts]>,
-	goal:                    Option<Goal>,
-	plan:                    PlanState,
-	plan_seen:               bool,
-	goal_usage_checkpoint:   GoalUsage,
-	budget_steering_pending: bool,
-	goal_todo_context:       Option<Str>,
-	loop_mode:               Option<LoopMode>,
+	mode_holder:              Option<Str>,
+	mode_activation:          Option<Str>,
+	visible_resources:        Arc<[VisibleResourceFacts]>,
+	goal:                     Option<Goal>,
+	plan:                     PlanState,
+	plan_seen:                bool,
+	outcome_usage_cumulative: GoalUsage,
+	goal_usage_checkpoint:    GoalUsage,
+	budget_steering_pending:  bool,
+	goal_todo_context:        Option<Str>,
+	loop_mode:                Option<LoopMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -878,7 +879,6 @@ impl RegimeHandle {
 			started_ms: now_ms,
 		};
 		state.goal = Some(goal.clone());
-		state.goal_usage_checkpoint = GoalUsage::default();
 		state.budget_steering_pending = false;
 		Ok(goal)
 	}
@@ -918,7 +918,6 @@ impl RegimeHandle {
 		let goal = self.update_goal(now_ms, |goal| goal.status = GoalStatus::Active)?;
 		let mut state = self.state.lock();
 		state.budget_steering_pending = false;
-		state.goal_usage_checkpoint = GoalUsage::default();
 		Ok(goal)
 	}
 
@@ -1039,6 +1038,40 @@ impl RegimeHandle {
 			}
 		};
 		self.record_goal_usage(delta, now_ms)
+	}
+
+	/// Records one provider-turn usage delta while advancing the same
+	/// monotonic session checkpoint used by cumulative tool receipts.
+	///
+	/// Call this for `Outcome.usage`, which is per-turn rather than cumulative.
+	/// The checkpoint advances even when no goal is active so a later goal
+	/// starts at the current session baseline instead of charging earlier work.
+	pub fn record_goal_usage_delta(
+		&self,
+		delta: GoalUsage,
+		now_ms: u64,
+	) -> Result<Goal, RegimeError> {
+		let cumulative = {
+			let mut state = self.state.lock();
+			state.outcome_usage_cumulative.input_tokens = state
+				.outcome_usage_cumulative
+				.input_tokens
+				.saturating_add(delta.input_tokens);
+			state.outcome_usage_cumulative.cache_write_tokens = state
+				.outcome_usage_cumulative
+				.cache_write_tokens
+				.saturating_add(delta.cache_write_tokens);
+			state.outcome_usage_cumulative.cached_input_tokens = state
+				.outcome_usage_cumulative
+				.cached_input_tokens
+				.saturating_add(delta.cached_input_tokens);
+			state.outcome_usage_cumulative.output_tokens = state
+				.outcome_usage_cumulative
+				.output_tokens
+				.saturating_add(delta.output_tokens);
+			state.outcome_usage_cumulative
+		};
+		self.checkpoint_goal_usage(cumulative, now_ms)
 	}
 
 	/// Pauses an active goal after a user interrupt while preserving its spend.
@@ -1252,6 +1285,32 @@ mod tests {
 			.expect("record usage");
 		assert_eq!(goal.tokens_used, 10);
 		assert_eq!(goal.status, GoalStatus::BudgetLimited);
+	}
+	#[test]
+	fn goal_accounting_preserves_session_baseline_and_mixes_delta_and_cumulative_receipts() {
+		let modes = RegimeHandle::new();
+		assert!(
+			modes
+				.record_goal_usage_delta(
+					GoalUsage { input_tokens: 100, output_tokens: 20, ..GoalUsage::default() },
+					500,
+				)
+				.is_err()
+		);
+		modes.set_goal("ship", Some(100), 1_000).expect("set goal");
+		modes
+			.checkpoint_goal_usage(
+				GoalUsage { input_tokens: 105, output_tokens: 22, ..GoalUsage::default() },
+				2_000,
+			)
+			.expect("partial cumulative tool receipt");
+		let goal = modes
+			.record_goal_usage_delta(
+				GoalUsage { input_tokens: 10, output_tokens: 5, ..GoalUsage::default() },
+				3_000,
+			)
+			.expect("turn delta");
+		assert_eq!(goal.tokens_used, 15);
 	}
 
 	#[test]

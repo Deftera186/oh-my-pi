@@ -44,8 +44,9 @@ pub fn config_roots(cwd: &Path, home: &Path, max_depth: usize) -> Vec<ConfigRoot
 	let mut current = cwd;
 	for _ in 0..=max_depth {
 		let path = current.join(".omp");
-		if path.is_dir() {
+		if directory_has_entries(&path) {
 			roots.push(ConfigRoot { path, user: false, priority: 2 });
+			break;
 		}
 		let Some(parent) = current.parent() else {
 			break;
@@ -136,11 +137,13 @@ pub fn user_config_root(home: &Path) -> PathBuf {
 pub fn discover_roots(cwd: &Path, home: &Path, max_depth: usize) -> NativeRoots {
 	let mut project = Vec::new();
 	let mut agents = Vec::new();
+	let mut native_owner_found = false;
 	let mut current = cwd;
 	for _ in 0..=max_depth {
 		let omp = current.join(".omp");
-		if omp.is_dir() {
+		if !native_owner_found && directory_has_entries(&omp) {
 			project.push(omp);
+			native_owner_found = true;
 		}
 		let agents_file = current.join("AGENTS.md");
 		if agents_file.is_file() {
@@ -158,6 +161,13 @@ pub fn discover_roots(cwd: &Path, home: &Path, max_depth: usize) -> NativeRoots 
 		current = parent;
 	}
 	NativeRoots { user: user_config_root(home), project, agents }
+}
+
+fn directory_has_entries(path: &Path) -> bool {
+	fs::read_dir(path)
+		.ok()
+		.and_then(|mut entries| entries.next())
+		.is_some()
 }
 
 /// Scans one capability directory without recursive imports, hidden entries,
@@ -186,12 +196,29 @@ pub enum NativeRootMode {
 }
 
 /// Native static capability discovery options.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NativeDiscoveryOptions {
 	/// Ordered explicit `.omp`/agent roots.
-	pub explicit_roots: Vec<PathBuf>,
+	pub explicit_roots:    Vec<PathBuf>,
 	/// Explicit-root merge behavior.
-	pub root_mode:      NativeRootMode,
+	pub root_mode:         NativeRootMode,
+	/// Skill source, name, and custom-directory policy for every native root.
+	pub skill_settings:    SkillDiscoverySettings,
+	/// Whether implicit project roots and standalone project files participate.
+	pub include_workspace: bool,
+	/// Authoritative selected-profile installed extension record.
+	pub client_installed:  Option<PathBuf>,
+}
+impl Default for NativeDiscoveryOptions {
+	fn default() -> Self {
+		Self {
+			explicit_roots:    Vec::new(),
+			root_mode:         NativeRootMode::Merge,
+			skill_settings:    SkillDiscoverySettings::default(),
+			include_workspace: true,
+			client_installed:  None,
+		}
+	}
 }
 
 /// Complete native static provider output.
@@ -220,12 +247,14 @@ pub fn discover_capabilities(
 		.map(|path| (path.clone(), SourceScope::Project))
 		.collect::<Vec<_>>();
 	if options.root_mode == NativeRootMode::Merge {
-		roots.extend(
-			discovered
-				.project
-				.into_iter()
-				.map(|path| (path, SourceScope::Project)),
-		);
+		if options.include_workspace {
+			roots.extend(
+				discovered
+					.project
+					.into_iter()
+					.map(|path| (path, SourceScope::Project)),
+			);
+		}
 		roots.push((discovered.user, SourceScope::User));
 	}
 	let mut seen = BTreeSet::new();
@@ -236,12 +265,27 @@ pub fn discover_capabilities(
 	});
 
 	let mut output = NativeDiscovery::default();
-	let install_records = roots
+	let custom_skills = skills::discover(&[], &options.skill_settings);
+	output.declarations.extend(custom_skills.declarations);
+	output.warnings.extend(
+		custom_skills
+			.warnings
+			.into_iter()
+			.map(|warning| warning.message),
+	);
+	let mut root_skill_settings = options.skill_settings.clone();
+	root_skill_settings.custom_directories.clear();
+	let mut install_records = roots
 		.iter()
 		.map(|(root, _)| root.join("installed.toml"))
 		.collect::<Vec<_>>();
+	if let Some(installed) = &options.client_installed
+		&& !install_records.contains(installed)
+	{
+		install_records.push(installed.clone());
+	}
 	for (root, scope) in roots {
-		load_root(&root, scope, &mut output);
+		load_root(&root, scope, &root_skill_settings, &mut output);
 	}
 	let mut extension_roots = BTreeSet::new();
 	for installed_path in install_records {
@@ -259,14 +303,20 @@ pub fn discover_capabilities(
 		output.warnings.extend(packages.warnings);
 		for extension in packages.roots {
 			if extension_roots.insert(extension.path.clone()) {
-				load_root(&extension.path, SourceScope::Package, &mut output);
+				load_root(&extension.path, SourceScope::Package, &root_skill_settings, &mut output);
 			}
 		}
 	}
-	for path in standalone_agents {
+	for path in standalone_agents
+		.into_iter()
+		.filter(|_| options.root_mode == NativeRootMode::Merge && options.include_workspace)
+	{
 		let Ok(content) = fs::read_to_string(&path) else {
 			continue;
 		};
+		if content.trim().is_empty() {
+			continue;
+		}
 		let key = Str::from(path.to_string_lossy().as_ref());
 		output.declarations.push(DiscoveredCapability::keyed(
 			key,
@@ -278,19 +328,21 @@ pub fn discover_capabilities(
 			SourceProvenance::native("native-project-context", path, SourceScope::Project),
 		));
 	}
-	let mut current = cwd;
-	for _ in 0..=max_depth {
-		load_standalone(current, &mut output);
-		if current == home {
-			break;
+	if options.root_mode == NativeRootMode::Merge && options.include_workspace {
+		let mut current = cwd;
+		for _ in 0..=max_depth {
+			load_standalone(current, &mut output);
+			if current == home {
+				break;
+			}
+			let Some(parent) = current.parent() else {
+				break;
+			};
+			if parent == current {
+				break;
+			}
+			current = parent;
 		}
-		let Some(parent) = current.parent() else {
-			break;
-		};
-		if parent == current {
-			break;
-		}
-		current = parent;
 	}
 	output
 }
@@ -339,7 +391,12 @@ fn load_standalone(root: &Path, output: &mut NativeDiscovery) {
 	}
 }
 
-fn load_root(root: &Path, scope: SourceScope, output: &mut NativeDiscovery) {
+fn load_root(
+	root: &Path,
+	scope: SourceScope,
+	skill_settings: &SkillDiscoverySettings,
+	output: &mut NativeDiscovery,
+) {
 	let source_id = match scope {
 		SourceScope::Project => Str::from("native-project"),
 		SourceScope::User => Str::from("native-user"),
@@ -355,7 +412,7 @@ fn load_root(root: &Path, scope: SourceScope, output: &mut NativeDiscovery) {
 			contain_root: None,
 			read_only: false,
 		}],
-		&SkillDiscoverySettings::default(),
+		skill_settings,
 	);
 	output.declarations.extend(skill_result.declarations);
 	output.warnings.extend(
@@ -438,6 +495,9 @@ fn load_root(root: &Path, scope: SourceScope, output: &mut NativeDiscovery) {
 		let Ok(content) = fs::read_to_string(&path) else {
 			continue;
 		};
+		if content.trim().is_empty() {
+			continue;
+		}
 		let payload = if filename == "SYSTEM.md" {
 			CapabilityPayload::SystemPrompt(SystemPromptPayload {
 				path:    path.clone(),
@@ -778,15 +838,17 @@ mod tests {
 		}],);
 	}
 	#[test]
-	fn walkups_are_nearest_first_and_depth_bounded() {
+	fn nearest_non_empty_native_root_owns_project_discovery() {
 		let tree = tempfile::tempdir().expect("tree");
 		let root = tree.path();
 		let cwd = root.join("a/b/c");
 		fs::create_dir_all(cwd.join(".omp")).expect("nested");
 		fs::create_dir_all(root.join("a/.omp")).expect("parent");
+		fs::write(cwd.join(".omp/AGENTS.md"), "nearest native").expect("nearest native");
+		fs::write(root.join("a/.omp/AGENTS.md"), "far native").expect("far native");
 		fs::write(root.join("a/AGENTS.md"), "parent").expect("agents");
 		let roots = discover_roots(&cwd, root, 2);
-		assert_eq!(roots.project, vec![cwd.join(".omp"), root.join("a/.omp")]);
+		assert_eq!(roots.project, vec![cwd.join(".omp")]);
 		assert_eq!(roots.agents, vec![root.join("a/AGENTS.md")]);
 	}
 	#[test]
@@ -812,7 +874,7 @@ mod tests {
 		.expect("command");
 		fs::write(root.join("commands/broken.md"), "---\ndescription: broken").expect("broken");
 		let mut output = NativeDiscovery::default();
-		load_root(&root, SourceScope::Project, &mut output);
+		load_root(&root, SourceScope::Project, &SkillDiscoverySettings::default(), &mut output);
 		assert!(output.declarations.iter().any(|declaration| {
 			matches!(
 				&declaration.payload,

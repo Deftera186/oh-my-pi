@@ -4,10 +4,14 @@
 //! opaque credential leases, and read-only events. They cannot replace provider
 //! message arrays or observe secret material after lease construction.
 
-use std::{future, pin::Pin, sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use futures::Future;
-use omp_agent::{AgentEvent, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, Props};
+use omp_agent::{
+	Agent, AgentEvent, ContextPatchSet as AgentContextPatchSet, ContextProjectionError,
+	ContextProjectionHandler, ContextView, EventBus, PatchOp, PromptError, PromptPatchSet, Props,
+	TurnClient,
+};
 pub use omp_core::SecretString;
 use omp_core::Str;
 use omp_inference::auth::{AuthRejection, CredentialSource};
@@ -81,6 +85,11 @@ impl ContextPatchCommit {
 	/// Returns stable-id projection operations.
 	pub fn patches(&self) -> &[PatchOp] {
 		&self.patches
+	}
+
+	/// Consumes the commit into its revision fence, IR revision, and operations.
+	pub fn into_parts(self) -> (u64, u32, Box<[PatchOp]>) {
+		(self.base_snapshot_rev, self.derived_ir_revision, self.patches)
 	}
 }
 
@@ -224,6 +233,20 @@ pub struct SdkCredentialSource {
 	session_id: Str,
 	callback:   CredentialCallback,
 }
+struct SdkContextProjectionHandler(ContextPatchHandler);
+
+impl ContextProjectionHandler for SdkContextProjectionHandler {
+	fn project(
+		&self,
+		base_snapshot_rev: u64,
+		view: &ContextView,
+	) -> Result<AgentContextPatchSet, ContextProjectionError> {
+		let commit = (self.0)(base_snapshot_rev, view)
+			.map_err(|error| ContextProjectionError::new(error.to_string()))?;
+		let (base_snapshot_rev, derived_ir_revision, patches) = commit.into_parts();
+		Ok(AgentContextPatchSet::new(base_snapshot_rev, derived_ir_revision, patches))
+	}
+}
 
 impl SdkCredentialSource {
 	/// Creates a process-local credential source for one session.
@@ -245,7 +268,7 @@ impl CredentialSource for SdkCredentialSource {
 		_lease: &'a CredentialLease,
 		_evidence: AuthRejection,
 	) -> futures::future::BoxFuture<'a, Result<(), CredentialError>> {
-		Box::pin(future::ready(Ok(())))
+		Box::pin(std::future::ready(Ok(())))
 	}
 }
 
@@ -258,8 +281,14 @@ pub type SystemPromptCallback =
 	Arc<dyn Fn(&Props) -> Result<PromptPatchSet, PromptError> + Send + Sync + 'static>;
 
 /// Stable-id context projection callback.
+///
+/// The first argument is the immutable durable context revision that must be
+/// copied into the returned [`ContextPatchCommit`].
 pub type ContextPatchHandler = Arc<
-	dyn Fn(&ContextView) -> Result<ContextPatchCommit, ContextPatchError> + Send + Sync + 'static,
+	dyn Fn(u64, &ContextView) -> Result<ContextPatchCommit, ContextPatchError>
+		+ Send
+		+ Sync
+		+ 'static,
 >;
 
 /// Read-only agent event subscriber.
@@ -352,5 +381,249 @@ impl CallbackSet {
 	/// Returns the handle-owned typed event fan-out.
 	pub const fn events_bus(&self) -> &EventBus {
 		&self.events_bus
+	}
+
+	pub(crate) const fn requires_production_install(&self) -> bool {
+		self.title_prompt.is_some()
+			|| self.credential.is_some()
+			|| self.request_tuning.is_some()
+			|| self.usage_confirmation.is_some()
+	}
+}
+/// Session-bound callback authority installed into production subsystems.
+///
+/// The authority is clone-cheap and contains no credential material. Cold
+/// revival receives the same authority so reconstructed runtimes install the
+/// identical callback set rather than silently reverting to defaults.
+#[derive(Clone)]
+pub struct RuntimeCallbacks {
+	session_id: Str,
+	callbacks:  CallbackSet,
+}
+
+impl RuntimeCallbacks {
+	pub(crate) const fn new(session_id: Str, callbacks: CallbackSet) -> Self {
+		Self { session_id, callbacks }
+	}
+
+	/// Installs agent-owned callback adapters on a newly composed runtime.
+	///
+	/// [`crate::SessionHandle`] applies this automatically to both warm and
+	/// cold-revived runtimes before they can accept a turn.
+	pub fn configure_agent<C>(&self, agent: &mut Agent<C>)
+	where
+		C: TurnClient + Clone,
+	{
+		if let Some(callback) = &self.callbacks.context {
+			agent.set_context_projection_handler(Arc::new(SdkContextProjectionHandler(Arc::clone(
+				callback,
+			))));
+		}
+	}
+
+	/// Returns title-system-prompt patches for immutable workspace facts.
+	pub fn title_prompt(&self, props: &Props) -> Option<Result<PromptPatchSet, PromptError>> {
+		self.callbacks.title_prompt.as_ref().map(|callback| {
+			let first = callback(props)?;
+			let second = callback(props)?;
+			if first != second {
+				return Err(PromptError::Volatile);
+			}
+			Ok(first)
+		})
+	}
+
+	/// Returns provider-context patches for an immutable projection.
+	pub fn project_context(
+		&self,
+		base_snapshot_rev: u64,
+		view: &ContextView,
+	) -> Option<Result<ContextPatchCommit, ContextPatchError>> {
+		self
+			.callbacks
+			.context
+			.as_ref()
+			.map(|callback| callback(base_snapshot_rev, view))
+	}
+
+	/// Returns the session-bound inference credential source.
+	pub fn credential_source(&self) -> Option<Arc<dyn CredentialSource>> {
+		self.callbacks.credential.as_ref().map(|callback| {
+			Arc::new(SdkCredentialSource::new(self.session_id.clone(), Arc::clone(callback)))
+				as Arc<dyn CredentialSource>
+		})
+	}
+
+	/// Returns typed tuning for one provider dispatch attempt.
+	pub fn tune_request(
+		&self,
+		provider: impl Into<Str>,
+		model: impl Into<Str>,
+		attempt: u32,
+	) -> Option<RequestTuning> {
+		self.callbacks.request_tuning.as_ref().map(|callback| {
+			callback(&RequestTuningInput { provider: provider.into(), model: model.into(), attempt })
+		})
+	}
+
+	/// Resolves a usage-reserve decision at candidate selection.
+	pub async fn confirm_usage(
+		&self,
+		request: UsageConfirmationRequest,
+	) -> UsageConfirmationDecision {
+		match &self.callbacks.usage_confirmation {
+			Some(callback) => callback(request).await,
+			None => UsageConfirmationDecision::Continue,
+		}
+	}
+
+	/// Publishes one host-owned UI context update.
+	pub fn update_ui_context(&self, update: &UiContextUpdate) {
+		if let Some(callback) = &self.callbacks.ui_context {
+			callback(update);
+		}
+	}
+
+	/// Resolves one URL through its declared host-local protocol boundary.
+	pub fn resolve_local_protocol(&self, url: &Url) -> Option<ProtocolResolution> {
+		self
+			.callbacks
+			.local_protocols
+			.iter()
+			.find(|(scheme, _)| scheme.as_str().eq_ignore_ascii_case(url.scheme()))
+			.and_then(|(_, resolver)| resolver(url))
+	}
+
+	pub(crate) const fn callback_set(&self) -> &CallbackSet {
+		&self.callbacks
+	}
+}
+#[cfg(test)]
+mod tests {
+	use std::{
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		},
+		time::SystemTime,
+	};
+
+	use omp_agent::ContextView;
+	use omp_catalog::AuthSpecId;
+	use omp_inference::auth::{CredentialError, CredentialNeed};
+
+	use super::*;
+
+	#[tokio::test]
+	async fn runtime_authority_dispatches_every_production_callback() {
+		let title_calls = Arc::new(AtomicUsize::new(0));
+		let context_calls = Arc::new(AtomicUsize::new(0));
+		let credential_calls = Arc::new(AtomicUsize::new(0));
+		let tuning_calls = Arc::new(AtomicUsize::new(0));
+		let usage_calls = Arc::new(AtomicUsize::new(0));
+		let ui_calls = Arc::new(AtomicUsize::new(0));
+		let protocol_calls = Arc::new(AtomicUsize::new(0));
+
+		let mut callbacks = CallbackSet::default();
+		let count = Arc::clone(&title_calls);
+		callbacks.title_prompt = Some(Arc::new(move |_| {
+			count.fetch_add(1, Ordering::Relaxed);
+			PromptPatchSet::new(Vec::new(), PromptPatchSet::DEFAULT_MAX_BYTE_EXPANSION)
+		}));
+		let count = Arc::clone(&context_calls);
+		callbacks.context = Some(Arc::new(move |base_snapshot_rev, _| {
+			assert_eq!(base_snapshot_rev, 7);
+			count.fetch_add(1, Ordering::Relaxed);
+			ContextPatchCommit::new(
+				base_snapshot_rev,
+				1,
+				Vec::new(),
+				ContextPatchCommit::DEFAULT_MAX_BYTE_EXPANSION,
+			)
+		}));
+		let count = Arc::clone(&credential_calls);
+		callbacks.credential = Some(Arc::new(move |request| {
+			assert_eq!(request.session_id, "session-7");
+			count.fetch_add(1, Ordering::Relaxed);
+			Box::pin(std::future::ready(Err(CredentialError::Unavailable)))
+		}));
+		let count = Arc::clone(&tuning_calls);
+		callbacks.request_tuning = Some(Arc::new(move |input| {
+			assert_eq!(input.provider, "provider");
+			assert_eq!(input.model, "model");
+			assert_eq!(input.attempt, 2);
+			count.fetch_add(1, Ordering::Relaxed);
+			RequestTuning::default()
+		}));
+		let count = Arc::clone(&usage_calls);
+		callbacks.usage_confirmation = Some(Arc::new(move |request| {
+			assert_eq!(request.reserve_percent, 90);
+			count.fetch_add(1, Ordering::Relaxed);
+			Box::pin(std::future::ready(UsageConfirmationDecision::UseFallback))
+		}));
+		let count = Arc::clone(&ui_calls);
+		callbacks.ui_context = Some(Arc::new(move |update| {
+			assert!(update.interactive);
+			count.fetch_add(1, Ordering::Relaxed);
+		}));
+		let count = Arc::clone(&protocol_calls);
+		callbacks.local_protocols.push((
+			Str::new_static("omp-local"),
+			Arc::new(move |url| {
+				count.fetch_add(1, Ordering::Relaxed);
+				Some(ProtocolResolution {
+					url:        url.clone(),
+					media_type: Some("text/plain".into()),
+				})
+			}),
+		));
+
+		let runtime = RuntimeCallbacks::new("session-7".into(), callbacks);
+		assert!(runtime.title_prompt(&Props::default()).unwrap().is_ok());
+		assert!(
+			runtime
+				.project_context(7, &ContextView { refs: Default::default() })
+				.unwrap()
+				.is_ok()
+		);
+		let source = runtime.credential_source().expect("credential source");
+		let need = CredentialNeed {
+			spec:        AuthSpecId::from("auth"),
+			account:     None,
+			principal:   None,
+			valid_after: SystemTime::UNIX_EPOCH,
+		};
+		assert_eq!(source.lease(need).await.unwrap_err(), CredentialError::Unavailable);
+		assert!(runtime.tune_request("provider", "model", 2).is_some());
+		assert_eq!(
+			runtime
+				.confirm_usage(UsageConfirmationRequest {
+					provider:        "provider".into(),
+					model:           "model".into(),
+					reserve_percent: 90,
+				})
+				.await,
+			UsageConfirmationDecision::UseFallback
+		);
+		runtime.update_ui_context(&UiContextUpdate {
+			surface:     Some("terminal".into()),
+			interactive: true,
+		});
+		let local = Url::parse("omp-local://asset/readme").expect("local URL");
+		assert_eq!(
+			runtime
+				.resolve_local_protocol(&local)
+				.expect("local resolution")
+				.media_type
+				.as_deref(),
+			Some("text/plain")
+		);
+
+		assert_eq!(title_calls.load(Ordering::Relaxed), 2);
+		for count in
+			[context_calls, credential_calls, tuning_calls, usage_calls, ui_calls, protocol_calls]
+		{
+			assert_eq!(count.load(Ordering::Relaxed), 1);
+		}
 	}
 }

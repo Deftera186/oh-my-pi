@@ -15,10 +15,17 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavio
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
-use crate::{Error, Result, bank::BankId};
+use crate::{
+	Error, Result,
+	bank::BankId,
+	extract::{
+		ExtractionRequest, MAX_EXTRACTION_BATCH_BYTES, MAX_EXTRACTION_BATCH_JOBS,
+		MAX_EXTRACTION_INPUT_BYTES,
+	},
+};
 
 /// Current memory-bank schema contract.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT_MS: u64 = 5000;
 static NEXT_MEMORY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -109,6 +116,8 @@ pub struct RetainedWindow<'a> {
 	pub transcript:                 &'a str,
 	/// Marker-free embedding text.
 	pub embed_text:                 &'a str,
+	/// Bounded user-only text durably queued for extraction.
+	pub extraction_text:            Option<&'a str>,
 	/// Structured metadata including source ids and canonical root.
 	pub metadata:                   &'a serde_json::Value,
 	/// Inclusive number of user turns durably covered by the window.
@@ -157,9 +166,11 @@ pub struct RankedCandidate {
 /// WAL and busy timeout.
 #[derive(Clone, Debug)]
 pub struct BankStore {
-	path:          PathBuf,
-	bank:          BankId,
-	identity_root: PathBuf,
+	path:              PathBuf,
+	bank:              BankId,
+	identity_root:     PathBuf,
+	working_limit:     usize,
+	working_ttl_hours: u64,
 }
 
 impl BankStore {
@@ -169,13 +180,27 @@ impl BankStore {
 		bank: BankId,
 		identity_root: impl Into<PathBuf>,
 	) -> Result<Self> {
-		let store = Self { path: path.into(), bank, identity_root: identity_root.into() };
+		let store = Self {
+			path: path.into(),
+			bank,
+			identity_root: identity_root.into(),
+			working_limit: 1000,
+			working_ttl_hours: 24,
+		};
 		if let Some(parent) = store.path.parent() {
 			fs::create_dir_all(parent)?;
 		}
 		let mut connection = store.connection()?;
 		store.migrate(&mut connection)?;
 		Ok(store)
+	}
+
+	/// Applies the normalized transient working-memory eviction policy to this
+	/// bank handle.
+	pub(crate) fn with_working_policy(mut self, limit: usize, ttl_hours: u64) -> Self {
+		self.working_limit = limit;
+		self.working_ttl_hours = ttl_hours;
+		self
 	}
 
 	/// Returns the non-secret SQLite path for diagnostics only.
@@ -240,6 +265,12 @@ impl BankStore {
 			],
 		)?;
 		if transaction.changes() > 0 {
+			prune_working_transaction(
+				&transaction,
+				input.session_id,
+				self.working_limit,
+				self.working_ttl_hours,
+			)?;
 			bump_durable(&transaction)?;
 		}
 		transaction.commit()?;
@@ -397,6 +428,24 @@ impl BankStore {
 				self.bank.as_str()
 			],
 		)?;
+		if let Some(input) = window.extraction_text {
+			if input.len() > MAX_EXTRACTION_INPUT_BYTES {
+				return Err(Error::InputTooLarge);
+			}
+			transaction.execute(
+				"INSERT OR IGNORE INTO extraction_jobs(source_memory_id, session_id, input, \
+				 created_at) VALUES (?1, ?2, ?3, ?4)",
+				params![id.as_str(), window.session_id, input, timestamp],
+			)?;
+		}
+		if transaction.changes() > 0 {
+			prune_working_transaction(
+				&transaction,
+				window.session_id,
+				self.working_limit,
+				self.working_ttl_hours,
+			)?;
+		}
 		transaction.execute(
 			"INSERT INTO retention_cursors(session_id, retained_user_turn, updated_at) VALUES (?1, \
 			 ?2, ?3)\nON CONFLICT(session_id) DO UPDATE SET retained_user_turn = \
@@ -419,6 +468,46 @@ impl BankStore {
 			)
 			.optional()?
 			.unwrap_or(0))
+	}
+
+	/// Reads the oldest durable extraction jobs under count and aggregate-byte
+	/// bounds. Jobs remain queued until [`Self::complete_extraction`] commits.
+	pub fn pending_extractions(&self, max_jobs: usize) -> Result<Vec<ExtractionRequest>> {
+		let max_jobs = max_jobs.min(MAX_EXTRACTION_BATCH_JOBS);
+		if max_jobs == 0 {
+			return Ok(Vec::new());
+		}
+		let connection = self.connection()?;
+		let mut statement = connection.prepare(
+			"SELECT input, session_id, source_memory_id FROM extraction_jobs ORDER BY rowid LIMIT ?1",
+		)?;
+		let rows = statement.query_map([max_jobs], |row| {
+			Ok(ExtractionRequest {
+				input:      Str::new(row.get::<_, String>(0)?),
+				session_id: Str::new(row.get::<_, String>(1)?),
+				source_id:  Str::new(row.get::<_, String>(2)?),
+			})
+		})?;
+		let mut requests = Vec::with_capacity(max_jobs);
+		let mut bytes = 0usize;
+		for request in rows {
+			let request = request?;
+			let next_bytes = bytes.saturating_add(request.input.len());
+			if !requests.is_empty() && next_bytes > MAX_EXTRACTION_BATCH_BYTES {
+				break;
+			}
+			bytes = next_bytes;
+			requests.push(request);
+		}
+		Ok(requests)
+	}
+
+	/// Counts durable extraction jobs for bounded worker drain decisions.
+	pub fn pending_extraction_count(&self) -> Result<usize> {
+		let connection = self.connection()?;
+		connection
+			.query_row("SELECT COUNT(*) FROM extraction_jobs", [], |row| row.get(0))
+			.map_err(Into::into)
 	}
 
 	/// Promotes unconsolidated working rows to episodic memory in one
@@ -521,9 +610,26 @@ impl BankStore {
 	/// Saves immutable model-extracted facts and invalidates derived
 	/// graph/vector generations.
 	pub fn save_extracted_facts(&self, facts: &[NewFact<'_>]) -> Result<usize> {
-		if facts.is_empty() {
-			return Ok(0);
-		}
+		self.persist_extracted_facts(facts, None)
+	}
+
+	/// Atomically saves an extraction result and acknowledges its durable job.
+	///
+	/// A successful empty or fully rejected completion still removes the job;
+	/// inference failures never call this method and therefore remain retryable.
+	pub fn complete_extraction(
+		&self,
+		source_memory_id: &str,
+		facts: &[NewFact<'_>],
+	) -> Result<usize> {
+		self.persist_extracted_facts(facts, Some(source_memory_id))
+	}
+
+	fn persist_extracted_facts(
+		&self,
+		facts: &[NewFact<'_>],
+		completed_source: Option<&str>,
+	) -> Result<usize> {
 		let mut connection = self.connection()?;
 		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 		let mut inserted = 0usize;
@@ -544,6 +650,11 @@ impl BankStore {
 					fact.confidence.clamp(0.0, 1.0),
 				])?;
 			}
+		}
+		if let Some(source_memory_id) = completed_source {
+			transaction.execute("DELETE FROM extraction_jobs WHERE source_memory_id = ?1", [
+				source_memory_id,
+			])?;
 		}
 		if inserted > 0 {
 			bump_durable(&transaction)?;
@@ -723,6 +834,12 @@ impl BankStore {
 
 	/// Lists bounded full records in deterministic newest-first order.
 	pub fn list(&self, limit: usize) -> Result<Vec<MemoryRecord>> {
+		self.list_page(0, limit.clamp(1, 1000))
+	}
+
+	/// Loads one deterministic page without imposing the resolver's 1000-row
+	/// display ceiling.
+	pub(crate) fn list_page(&self, offset: usize, limit: usize) -> Result<Vec<MemoryRecord>> {
 		let connection = self.connection()?;
 		let mut statement = connection.prepare(
 			"SELECT id, content, source, session_id, timestamp, importance, veracity, memory_type, \
@@ -731,11 +848,37 @@ impl BankStore {
 			 AS tier_name FROM working_memory\nUNION ALL\nSELECT id, content, source, session_id, \
 			 timestamp, importance, veracity, memory_type, metadata_json, superseded_by, 'episodic' \
 			 AS tier_name FROM episodic_memory\n) ORDER BY CAST(timestamp AS INTEGER) DESC, id LIMIT \
-			 ?1",
+			 ?1 OFFSET ?2",
 		)?;
-		let rows = statement.query_map([limit.clamp(1, 1000)], |row| {
+		let rows = statement.query_map(params![limit.max(1), offset], |row| {
 			let tier_name = row.get::<_, String>(10)?;
 			let tier = if tier_name == "working" {
+				MemoryTier::Working
+			} else {
+				MemoryTier::Episodic
+			};
+			row_to_record(row, &self.bank, tier)
+		})?;
+		rows
+			.collect::<result::Result<Vec<_>, _>>()
+			.map_err(Into::into)
+	}
+
+	/// Loads one deterministic page of unsuperseded rows for a complete vector
+	/// generation rebuild.
+	pub(crate) fn list_live_page(&self, offset: usize, limit: usize) -> Result<Vec<MemoryRecord>> {
+		let connection = self.connection()?;
+		let mut statement = connection.prepare(
+			"SELECT id, content, source, session_id, timestamp, importance, veracity, memory_type, \
+			 metadata_json, superseded_by, tier_name FROM (\nSELECT id, content, source, session_id, \
+			 timestamp, importance, veracity, memory_type, metadata_json, superseded_by, 'working' \
+			 AS tier_name FROM working_memory WHERE superseded_by IS NULL\nUNION ALL\nSELECT id, \
+			 content, source, session_id, timestamp, importance, veracity, memory_type, \
+			 metadata_json, superseded_by, 'episodic' AS tier_name FROM episodic_memory WHERE \
+			 superseded_by IS NULL\n) ORDER BY CAST(timestamp AS INTEGER) DESC, id LIMIT ?1 OFFSET ?2",
+		)?;
+		let rows = statement.query_map(params![limit.max(1), offset], |row| {
+			let tier = if row.get::<_, String>(10)? == "working" {
 				MemoryTier::Working
 			} else {
 				MemoryTier::Episodic
@@ -799,6 +942,7 @@ impl BankStore {
 			"triples",
 			"memory_links",
 			"memory_embeddings",
+			"extraction_jobs",
 			"retention_cursors",
 			"scope_adoptions",
 		] {
@@ -1089,6 +1233,87 @@ fn unix_millis() -> Result<u128> {
 		.as_millis())
 }
 
+fn prune_working_transaction(
+	transaction: &rusqlite::Transaction<'_>,
+	session_id: &str,
+	limit: usize,
+	ttl_hours: u64,
+) -> Result<usize> {
+	if limit == 0 {
+		return Ok(0);
+	}
+	let ttl_millis = u128::from(ttl_hours)
+		.saturating_mul(60)
+		.saturating_mul(60)
+		.saturating_mul(1000);
+	let cutoff = unix_millis()?.saturating_sub(ttl_millis).to_string();
+	let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+	transaction.execute_batch(
+		"CREATE TEMP TABLE IF NOT EXISTS working_eviction_ids (
+		    id TEXT PRIMARY KEY
+		 ) WITHOUT ROWID;
+		 DELETE FROM working_eviction_ids;",
+	)?;
+	transaction.execute(
+		"INSERT INTO working_eviction_ids(id)
+		 SELECT id FROM working_memory
+		 WHERE session_id = ?1
+		   AND lower(COALESCE(source, '')) NOT IN ('imported', 'import')
+		   AND (
+		     CAST(timestamp AS INTEGER) < CAST(?2 AS INTEGER)
+		     OR id NOT IN (
+		       SELECT id FROM working_memory
+		       WHERE session_id = ?1
+		         AND lower(COALESCE(source, '')) NOT IN ('imported', 'import')
+		       ORDER BY CAST(timestamp AS INTEGER) DESC, rowid DESC
+		       LIMIT ?3
+		     )
+		   )",
+		params![session_id, cutoff, limit],
+	)?;
+	transaction.execute_batch(
+		"DELETE FROM memory_embeddings
+		   WHERE memory_id IN (SELECT id FROM working_eviction_ids);
+		 DELETE FROM extraction_jobs
+		   WHERE source_memory_id IN (SELECT id FROM working_eviction_ids);
+		 DELETE FROM facts
+		   WHERE source_memory_id IN (SELECT id FROM working_eviction_ids);
+		 DELETE FROM triples
+		   WHERE source_memory_id IN (SELECT id FROM working_eviction_ids);",
+	)?;
+	transaction.execute(
+		"DELETE FROM memory_links
+		 WHERE source_memory_id IN (SELECT id FROM working_eviction_ids)
+		    OR target_memory_id IN (SELECT id FROM working_eviction_ids)",
+		[],
+	)?;
+	let removed = transaction
+		.execute("DELETE FROM working_memory WHERE id IN (SELECT id FROM working_eviction_ids)", [
+		])?;
+	if removed != 0 {
+		transaction.execute(
+			"UPDATE retention_cursors
+			 SET retained_user_turn = COALESCE((
+			   SELECT MAX(retained_through) FROM (
+			     SELECT CAST(json_extract(metadata_json, '$.retained_through_user_turn') AS INTEGER)
+			              AS retained_through
+			       FROM working_memory
+			      WHERE session_id = ?1 AND source = 'coding-agent-transcript'
+			     UNION ALL
+			     SELECT CAST(json_extract(metadata_json, '$.retained_through_user_turn') AS INTEGER)
+			              AS retained_through
+			       FROM episodic_memory
+			      WHERE session_id = ?1 AND source = 'coding-agent-transcript'
+			   )
+			 ), 0)
+			 WHERE session_id = ?1",
+			[session_id],
+		)?;
+	}
+	transaction.execute("DELETE FROM working_eviction_ids", [])?;
+	Ok(removed)
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS bank_scope (
 	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1170,6 +1395,12 @@ CREATE TABLE IF NOT EXISTS facts (
 	source_memory_id TEXT,
 	confidence REAL NOT NULL DEFAULT 1.0
 );
+CREATE TABLE IF NOT EXISTS extraction_jobs (
+	source_memory_id TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	input TEXT NOT NULL,
+	created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS memory_embeddings (
 	memory_id TEXT PRIMARY KEY,
 	vector_blob BLOB NOT NULL,
@@ -1207,3 +1438,169 @@ CREATE TABLE IF NOT EXISTS scope_adoptions (
 	PRIMARY KEY(identity_root, bank)
 );
 "#;
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn store(limit: usize, ttl_hours: u64) -> BankStore {
+		let root = std::env::temp_dir().join(format!("omp-memory-{}", omp_core::Ulid::generate()));
+		BankStore::open(
+			root.join("memory.sqlite3"),
+			BankId::configured("test").expect("bank"),
+			root.clone(),
+		)
+		.expect("store")
+		.with_working_policy(limit, ttl_hours)
+	}
+
+	fn save(store: &BankStore, id: &str) {
+		store
+			.save(NewMemory {
+				content:     id,
+				embed_text:  Some(id),
+				source:      "test",
+				session_id:  "session",
+				importance:  0.5,
+				veracity:    "user",
+				memory_type: "scratch",
+				metadata:    &serde_json::Value::Null,
+				stable_id:   Some(id),
+			})
+			.expect("save memory");
+	}
+
+	#[test]
+	fn working_memory_count_eviction_is_session_scoped() {
+		let store = store(2, 24);
+		save(&store, "oldest");
+		save(&store, "middle");
+		save(&store, "newest");
+
+		assert!(store.get("oldest").expect("lookup").is_none());
+		assert!(store.get("middle").expect("lookup").is_some());
+		assert!(store.get("newest").expect("lookup").is_some());
+		assert_eq!(store.counts().expect("counts").working, 2);
+	}
+
+	#[test]
+	fn ttl_eviction_purges_every_linked_projection() {
+		let store = store(10, 1);
+		save(&store, "stale");
+		store
+			.save_extracted_facts(&[NewFact {
+				fact_id:          "fact-stale",
+				session_id:       "session",
+				subject:          "stale",
+				predicate:        "is",
+				object:           "old",
+				timestamp:        None,
+				source_memory_id: "stale",
+				confidence:       1.0,
+			}])
+			.expect("save linked fact");
+		let generation = store.generations().expect("generation").durable;
+		store
+			.replace_vectors(generation, "test-model", &[VectorEntry {
+				memory_id: "stale",
+				vector:    &[1.0],
+			}])
+			.expect("save linked vector");
+		store
+			.connection()
+			.expect("connection")
+			.execute("UPDATE working_memory SET timestamp = '0' WHERE id = 'stale'", [])
+			.expect("age memory");
+
+		save(&store, "fresh");
+
+		assert!(store.get("stale").expect("lookup").is_none());
+		let integrity = store.integrity().expect("integrity");
+		assert_eq!(integrity.vector_rows, 0);
+		assert_eq!(store.counts().expect("counts").facts, 0);
+	}
+
+	#[test]
+	fn evicted_retention_window_rewinds_its_replay_cursor() {
+		let store = store(10, 1);
+		let metadata = serde_json::json!({"retained_through_user_turn": 4});
+		store
+			.retain_window(RetainedWindow {
+				session_id:                 "session",
+				transcript:                 "durable transcript",
+				embed_text:                 "durable transcript",
+				extraction_text:            None,
+				metadata:                   &metadata,
+				retained_through_user_turn: 4,
+			})
+			.expect("retain window");
+		store
+			.connection()
+			.expect("connection")
+			.execute(
+				"UPDATE working_memory SET timestamp = '0' WHERE source = 'coding-agent-transcript'",
+				[],
+			)
+			.expect("age retention");
+		save(&store, "fresh");
+
+		assert_eq!(store.retention_cursor("session").expect("cursor"), 0);
+	}
+
+	#[test]
+	fn retention_enqueues_one_durable_idempotent_extraction_job() {
+		let store = store(10, 24);
+		let metadata = serde_json::json!({"retained_through_user_turn": 1});
+		let window = || RetainedWindow {
+			session_id:                 "session",
+			transcript:                 "[role: user]\ndurable input\n[user:end]",
+			embed_text:                 "durable input",
+			extraction_text:            Some("[role: user]\ndurable input\n[user:end]"),
+			metadata:                   &metadata,
+			retained_through_user_turn: 1,
+		};
+		let source = store
+			.retain_window(window())
+			.expect("retain")
+			.expect("stored source");
+		assert!(
+			store
+				.retain_window(window())
+				.expect("idempotent retain")
+				.is_none()
+		);
+		assert_eq!(store.pending_extraction_count().expect("count"), 1);
+		assert!(store.pending_extractions(0).expect("zero bound").is_empty());
+		let jobs = store.pending_extractions(usize::MAX).expect("pending");
+		assert_eq!(jobs.len(), 1);
+		assert_eq!(jobs[0].source_id, source);
+		assert_eq!(jobs[0].session_id.as_str(), "session");
+		let reopened = BankStore::open(store.path(), store.bank.clone(), store.identity_root.clone())
+			.expect("reopen");
+		assert_eq!(
+			reopened
+				.pending_extraction_count()
+				.expect("recovered count"),
+			1
+		);
+		reopened
+			.complete_extraction(jobs[0].source_id.as_str(), &[])
+			.expect("acknowledge");
+		assert_eq!(reopened.pending_extraction_count().expect("drained count"), 0);
+	}
+
+	#[test]
+	fn rebuild_pages_cover_more_than_the_projection_limit() {
+		let store = store(2_000, 24);
+		for index in 0..1_005 {
+			save(&store, &format!("row-{index:04}"));
+		}
+		let first = store.list_live_page(0, 256).expect("first page");
+		let mut seen = first.len();
+		while seen < 1_005 {
+			let page = store.list_live_page(seen, 256).expect("next page");
+			assert!(!page.is_empty());
+			seen += page.len();
+		}
+		assert_eq!(seen, 1_005);
+	}
+}

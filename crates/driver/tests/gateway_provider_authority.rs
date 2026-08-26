@@ -27,9 +27,7 @@ impl RouteComposer for UnusedComposer {
 
 fn authority() -> Arc<dyn omp_serve::inference::ProviderGatewayAuthority> {
 	let catalog = Arc::new(snapshot::Catalog::embedded().clone());
-	let registry = omp_inference::Registry::builder(catalog)
-		.build()
-		.expect("registry");
+	let registry = omp_inference::Registry::builder(catalog).build_catalog_projection();
 	let blobs = BlobStore::open(tempfile::tempdir().expect("temporary blob root").keep())
 		.expect("blob store");
 	gateway_provider_rpc_authority(Arc::new(ProductionProviderApplicationOwner::new(

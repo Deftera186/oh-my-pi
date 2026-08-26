@@ -8,19 +8,32 @@ use std::{
 };
 
 use clap::{Args, Subcommand, ValueEnum};
+use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_core::Str;
+use omp_core::{Hash32, Str, base64, encoding::hex, sf};
 use omp_env::{BundleFile, pack_bundle, unpack_bundle};
 use omp_ext::{
 	Layer as BackendLayer,
 	config::{ExtensionEnvironment, SourceSpec},
 	doctor::{CredentialHealth, DoctorRequest, DoctorSeverity, RuntimeHealth, diagnose},
 	index::SignedIndex,
-	lock::{InstalledExtension, InstalledRecord, LockFile, LockedExtension, Wheel, index_source},
-	trust::{GrantsFile, KeysFile, verify_artifact_signature},
+	lock::{
+		InstalledExtension, InstalledRecord, LockFile, LockedExtension, LockedPackage, Wheel,
+		index_source,
+	},
+	resolver::{ResolvePlan, ResolveRequirement, SystemUv, minimal_unsat_core},
+	trust::{
+		Grant, GrantsFile, KeysFile, RevocationFreshness, RevocationsFile, grant_covers,
+		verify_artifact_signature,
+	},
 	upgrade::{Generation, PinsFile, apply_uninstall, gc_generations, plan_uninstall, set_enabled},
 };
+use omp_proto::env::v1::{MaterializeSite, SiteFile};
+use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_storage::blob::BlobStore;
+use sha2::{Digest as _, Sha256};
 use toml::map;
+const MAX_WHEEL_BYTES: usize = 256 * 1024 * 1024;
 
 /// Shared options accepted by every `omp ext` operation.
 #[derive(Clone, Debug, Args)]
@@ -571,7 +584,19 @@ pub struct ExtWhereArgs {
 
 /// Dispatches a parsed extension command to its dedicated backend seam.
 pub async fn run(args: ExtArgs) -> miette::Result<()> {
-	let ExtArgs { data_dir, project, scope, command, .. } = args;
+	let ExtArgs {
+		data_dir,
+		project,
+		scope,
+		uv,
+		index: resolution_indexes,
+		exclude_newer,
+		targets: resolution_targets,
+		locked,
+		offline,
+		command,
+		..
+	} = args;
 	let data_dir = omp_core::dirs::data_dir(data_dir).into_diagnostic()?;
 	let state = StatePaths::new(&data_dir, &project);
 	let scoped_state = state.scoped(scope);
@@ -583,7 +608,7 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	match command {
 		ExtCommand::List(args) => list(&state, args),
 		ExtCommand::Info(args) => info(&state, args),
-		ExtCommand::Install(args) => install(&scoped_state, args).await,
+		ExtCommand::Install(args) => install(&scoped_state, args, uv).await,
 		ExtCommand::Uninstall(args) => uninstall(&scoped_state, args),
 		ExtCommand::Link(args) => link(&scoped_state, args),
 		ExtCommand::Unlink { id } => unlink(&scoped_state, &id),
@@ -591,15 +616,32 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 		ExtCommand::Disable { id } => enable(&scoped_state, &id, false),
 		ExtCommand::Features(args) => features(&state, args),
 		ExtCommand::Lock(args) => lock(&state, args),
-		ExtCommand::Resolve(args) => resolve(args).await,
-		ExtCommand::Sync(args) => sync(&state, args).await,
-		ExtCommand::Upgrade(args) => upgrade(&scoped_state, args).await,
+		ExtCommand::Resolve(args) => {
+			resolve(
+				&scoped_state,
+				args,
+				uv,
+				resolution_indexes,
+				exclude_newer,
+				resolution_targets,
+				locked,
+			)
+			.await
+		},
+		ExtCommand::Sync(args) => sync(&state, args, uv.as_deref()).await,
+		ExtCommand::Upgrade(args) => upgrade(&scoped_state, args, uv).await,
 		ExtCommand::Pin { id, version } => pin(&state, id, version),
 		ExtCommand::Unpin { id } => unpin(&state, &id),
 		ExtCommand::Gc(args) => gc(&state, args),
 		ExtCommand::Doctor(args) => doctor(&state, args),
 		ExtCommand::Trust(args) => trust(&state, args),
-		ExtCommand::Verify(args) => verify(&state, args),
+		ExtCommand::Verify(args) => {
+			if offline && args.revocations {
+				Err(miette!("cannot refresh revocations while extension networking is offline"))
+			} else {
+				verify(&state, args).await
+			}
+		},
 		ExtCommand::Bundle(args) => bundle(&state, args).await,
 		ExtCommand::Publish(args) => publish(args),
 		ExtCommand::Search(args) => search(&state, args),
@@ -652,7 +694,11 @@ fn info(state: &StatePaths, args: ExtInfoArgs) -> miette::Result<()> {
 	);
 	Ok(())
 }
-async fn install(state: &StatePaths, args: ExtInstallArgs) -> miette::Result<()> {
+async fn install(
+	state: &StatePaths,
+	args: ExtInstallArgs,
+	uv: Option<PathBuf>,
+) -> miette::Result<()> {
 	validate_specs(&args.specs)?;
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
@@ -687,7 +733,9 @@ async fn install(state: &StatePaths, args: ExtInstallArgs) -> miette::Result<()>
 					enabled: true,
 				});
 			},
-			source => install_index_source(state, &args, &mut installed, source)?,
+			source => {
+				install_index_source(state, &args, &mut installed, source, uv.as_deref()).await?
+			},
 		}
 	}
 	if args.dry_run {
@@ -711,6 +759,16 @@ fn uninstall(state: &StatePaths, args: ExtUninstallArgs) -> miette::Result<()> {
 	apply_uninstall(&mut installed, &mut lock, &plan);
 	installed.write(&state.client_installed).into_diagnostic()?;
 	lock.write(&state.client_lock).into_diagnostic()?;
+	if !args.keep_grant {
+		let mut grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
+		let removed = plan
+			.installed
+			.iter()
+			.chain(&plan.locked)
+			.collect::<std::collections::BTreeSet<_>>();
+		grants.grants.retain(|grant| !removed.contains(&grant.id));
+		grants.write(&state.grants).into_diagnostic()?;
+	}
 	Ok(())
 }
 
@@ -760,6 +818,26 @@ fn unlink(state: &StatePaths, id: &str) -> miette::Result<()> {
 fn enable(state: &StatePaths, id: &str, enabled: bool) -> miette::Result<()> {
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+	if enabled && state.client_lock.exists() {
+		let lock =
+			LockFile::read(&state.client_lock, state.layer).map_err(|error| miette!("{error}"))?;
+		if let Some(extension) = lock.extensions.iter().find(|extension| extension.id == id) {
+			let grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
+			let workspace = (state.layer == BackendLayer::Workspace).then_some(&state.workspace);
+			if !grant_covers(
+				&grants,
+				&extension.id,
+				&extension.publisher,
+				state.layer,
+				workspace,
+				&extension.capability_digest,
+				extension.tier,
+				&extension.ship,
+			) {
+				return Err(miette!("no exact operator grant admits extension {id}"));
+			}
+		}
+	}
 	set_enabled(&mut installed, id, enabled).map_err(|error| miette!("{error}"))?;
 	installed.write(&state.client_installed).into_diagnostic()?;
 	Ok(())
@@ -791,16 +869,240 @@ fn lock(state: &StatePaths, args: ExtLockArgs) -> miette::Result<()> {
 	}
 	lock.write(&state.client_lock).into_diagnostic()
 }
-async fn resolve(args: ExtResolveArgs) -> miette::Result<()> {
+async fn resolve(
+	state: &StatePaths,
+	args: ExtResolveArgs,
+	uv: Option<PathBuf>,
+	indexes: Vec<Str>,
+	exclude_newer: Option<Str>,
+	default_targets: Vec<Str>,
+	locked: bool,
+) -> miette::Result<()> {
 	validate_specs(&args.specs)?;
-	for spec in args.specs {
-		let source = SourceSpec::parse(&spec).map_err(|error| miette!("{error}"))?;
-		println!("{source:?}");
+	let targets = if !args.target.is_empty() {
+		args.target
+	} else if !default_targets.is_empty() {
+		default_targets
+	} else {
+		vec![Str::new(default_resolution_target())]
+	};
+	let mut requirements = args
+		.specs
+		.iter()
+		.enumerate()
+		.map(|(ordinal, spec)| {
+			let source = SourceSpec::parse(spec).map_err(|error| miette!("{error}"))?;
+			Ok(ResolveRequirement {
+				extension_id: Str::new(format!("root-{ordinal}")),
+				requirement:  source_requirement(source)?,
+			})
+		})
+		.collect::<miette::Result<Vec<_>>>()?;
+	if args.as_if_local {
+		for (path, layer) in [
+			(&state.client_lock, BackendLayer::Client),
+			(&state.workspace_lock, BackendLayer::Workspace),
+		] {
+			if !path.exists() {
+				continue;
+			}
+			let lock = LockFile::read(path, layer).map_err(|error| miette!("{error}"))?;
+			for extension in lock.extensions {
+				for requirement in extension.requires {
+					requirements
+						.push(ResolveRequirement { extension_id: extension.id.clone(), requirement });
+				}
+			}
+		}
+		requirements.sort_by(|left, right| {
+			left
+				.extension_id
+				.cmp(&right.extension_id)
+				.then(left.requirement.cmp(&right.requirement))
+		});
+		requirements.dedup();
 	}
+	let requirements_root = state.generations.join(".resolve");
+	fs::create_dir_all(&requirements_root).into_diagnostic()?;
+	let requirements_file = requirements_root.join(format!("{}.txt", omp_core::Ulid::generate()));
+	fs::write(&requirements_file, b"").into_diagnostic()?;
+	let index_urls: Vec<String> = if indexes.is_empty() {
+		read_index_config(state)?
+			.entries
+			.into_iter()
+			.map(|entry| entry.url)
+			.collect()
+	} else {
+		indexes.into_iter().map(|value| value.to_string()).collect()
+	};
+	let plan = ResolvePlan::build(
+		uv.clone().unwrap_or_else(|| PathBuf::from("uv")),
+		&requirements,
+		&targets,
+		index_urls.clone(),
+		exclude_newer.clone(),
+		requirements_file.clone(),
+	)
+	.map_err(|error| miette!("{error}"))?;
+	if args.explain {
+		for argv in plan.explain() {
+			println!(
+				"{}",
+				argv
+					.into_iter()
+					.map(|argument| argument.to_string_lossy().into_owned())
+					.collect::<Vec<_>>()
+					.join(" ")
+			);
+		}
+	}
+	let existing = read_lock_or_empty(&state.client_lock, state.layer)?;
+	let frozen = existing
+		.frozen
+		.iter()
+		.map(|distribution| (distribution.name.as_str(), distribution.version.as_str()))
+		.collect::<Vec<_>>();
+	let outcomes = match plan.run(&SystemUv, &frozen) {
+		Ok(outcomes) => outcomes,
+		Err(error) if args.minimal_core => {
+			let core = minimal_unsat_core(&requirements, 32, |candidate| {
+				ResolvePlan::build(
+					uv.clone().unwrap_or_else(|| PathBuf::from("uv")),
+					candidate,
+					&targets,
+					index_urls.clone(),
+					exclude_newer.clone(),
+					requirements_file.clone(),
+				)
+				.is_ok_and(|candidate_plan| candidate_plan.run(&SystemUv, &frozen).is_err())
+			});
+			let _ = fs::remove_file(&requirements_file);
+			return Err(miette!(
+				"{error}; minimal unsatisfiable roots: {}",
+				core
+					.iter()
+					.map(|requirement| requirement.extension_id.as_str())
+					.collect::<Vec<_>>()
+					.join(", ")
+			));
+		},
+		Err(error) => {
+			let _ = fs::remove_file(&requirements_file);
+			return Err(miette!("{error}"));
+		},
+	};
+	let _ = fs::remove_file(&requirements_file);
+	let mut resolved = read_lock_or_empty(&state.client_lock, state.layer)?;
+	resolved.generated_by = "omp ext resolve".to_owned();
+	resolved.generated_at = jiff::Timestamp::now().to_string();
+	resolved.targets.clear();
+	resolved.packages.clear();
+	resolved.indexes = index_urls;
+	resolved.exclude_newer = exclude_newer;
+	for (target, outcome) in targets.iter().zip(outcomes) {
+		let mut target_lock = resolved.clone();
+		target_lock.targets = vec![target.clone()];
+		target_lock.packages = parse_uv_report(&outcome.stdout)?;
+		if resolved.targets.is_empty() {
+			resolved = target_lock;
+		} else {
+			resolved
+				.union_target(&target_lock)
+				.map_err(|error| miette!("{error}"))?;
+		}
+	}
+	resolved.targets.sort();
+	resolved
+		.packages
+		.sort_by(|left, right| left.name.cmp(&right.name));
+	if locked {
+		if existing != resolved {
+			return Err(miette!("resolution would change the locked extension closure"));
+		}
+		return Ok(());
+	}
+	resolved.write(&state.client_lock).into_diagnostic()?;
+	println!("resolved {} package(s) for {} target(s)", resolved.packages.len(), targets.len());
 	Ok(())
 }
 
-async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()> {
+fn source_requirement(source: SourceSpec) -> miette::Result<Str> {
+	Ok(match source {
+		SourceSpec::Index { distribution, .. } | SourceSpec::Pypi { distribution } => distribution,
+		SourceSpec::Git { repository, revision, subdirectory } => {
+			let mut requirement = format!("git+{repository}@{revision}");
+			if let Some(subdirectory) = subdirectory {
+				requirement.push_str("#subdirectory=");
+				requirement.push_str(&subdirectory.to_string_lossy());
+			}
+			Str::new(requirement)
+		},
+		SourceSpec::Path(path) => {
+			Str::new(path.canonicalize().into_diagnostic()?.display().to_string())
+		},
+		SourceSpec::Url { url, sha256 } => Str::new(format!("{url}#sha256={sha256}")),
+	})
+}
+
+fn default_resolution_target() -> &'static str {
+	if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+		"aarch64-apple-darwin"
+	} else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+		"x86_64-apple-darwin"
+	} else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+		"aarch64-unknown-linux-gnu"
+	} else {
+		"x86_64-unknown-linux-gnu"
+	}
+}
+
+fn parse_uv_report(bytes: &[u8]) -> miette::Result<Vec<LockedPackage>> {
+	#[derive(serde::Deserialize)]
+	struct Report {
+		#[serde(default)]
+		install: Vec<Install>,
+	}
+	#[derive(serde::Deserialize)]
+	struct Install {
+		metadata:      Metadata,
+		#[serde(default)]
+		download_info: Option<DownloadInfo>,
+	}
+	#[derive(serde::Deserialize)]
+	struct Metadata {
+		name:    Str,
+		version: Str,
+	}
+	#[derive(serde::Deserialize)]
+	struct DownloadInfo {
+		url: String,
+	}
+	let report: Report = serde_json::from_slice(bytes).into_diagnostic()?;
+	let mut packages = report
+		.install
+		.into_iter()
+		.map(|install| LockedPackage {
+			name:         Str::new(omp_ext::resolver::normalize_distribution_name(
+				install.metadata.name.as_str(),
+			)),
+			version:      install.metadata.version,
+			index:        install
+				.download_info
+				.map_or_else(String::new, |info| info.url),
+			requested_by: Vec::new(),
+			marker:       String::new(),
+			wheels:       Vec::new(),
+		})
+		.collect::<Vec<_>>();
+	packages.sort_by(|left, right| left.name.cmp(&right.name));
+	Ok(packages)
+}
+
+async fn upgrade(
+	state: &StatePaths,
+	args: ExtUpgradeArgs,
+	uv: Option<PathBuf>,
+) -> miette::Result<()> {
 	if let Some(generation) = args.rollback {
 		let previous =
 			omp_ext::upgrade::load_generation(&state.generations, &generation, state.layer)
@@ -845,11 +1147,7 @@ async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()>
 				.releases
 				.iter()
 				.find(|release| release.version == *version && !release.yanked),
-			None => extension
-				.releases
-				.iter()
-				.rev()
-				.find(|release| !release.yanked),
+			None => catalog.latest_release(extension, false),
 		}
 		.ok_or_else(|| miette!("no eligible release for {id}"))?;
 		let previous = lock.extensions.iter().find(|locked| locked.id == id);
@@ -865,22 +1163,26 @@ async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()>
 				id
 			));
 		}
-		install(state, ExtInstallArgs {
-			specs:          vec![Str::new(format!(
-				"index:{}/{}@{}",
-				catalog.name, id, release.version
-			))],
-			tier:           Tier::Sandboxed,
-			pool:           None,
-			features:       None,
-			capabilities:   None,
-			yes:            args.allow_capability_widening,
-			dry_run:        args.dry_run,
-			no_preresolved: false,
-			target:         lock.targets.clone(),
-			no_lock:        false,
-			force:          true,
-		})
+		install(
+			state,
+			ExtInstallArgs {
+				specs:          vec![Str::new(format!(
+					"index:{}/{}@{}",
+					catalog.name, id, release.version
+				))],
+				tier:           Tier::Sandboxed,
+				pool:           None,
+				features:       None,
+				capabilities:   None,
+				yes:            args.allow_capability_widening,
+				dry_run:        args.dry_run,
+				no_preresolved: false,
+				target:         lock.targets.clone(),
+				no_lock:        false,
+				force:          true,
+			},
+			uv.clone(),
+		)
 		.await?;
 	}
 	Ok(())
@@ -1008,8 +1310,251 @@ fn trust(state: &StatePaths, args: ExtTrustArgs) -> miette::Result<()> {
 	grants.write(&state.grants).into_diagnostic()
 }
 
-fn verify(state: &StatePaths, _args: ExtVerifyArgs) -> miette::Result<()> {
-	LockFile::read(&state.client_lock, BackendLayer::Client).map_err(|error| miette!("{error}"))?;
+async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
+	let verify_all = !args.deep && !args.signatures && !args.revocations;
+	let deep = args.deep || verify_all;
+	let signatures = args.signatures || verify_all;
+	let revocations = args.revocations || verify_all && state.revocations.exists();
+	let lock =
+		LockFile::read(&state.client_lock, state.layer).map_err(|error| miette!("{error}"))?;
+	let selected = lock
+		.extensions
+		.iter()
+		.filter(|extension| args.ids.is_empty() || args.ids.contains(&extension.id))
+		.collect::<Vec<_>>();
+	for id in &args.ids {
+		if !selected.iter().any(|extension| extension.id == *id) {
+			return Err(miette!("extension {id} is not locked"));
+		}
+	}
+	if signatures && !selected.is_empty() {
+		let catalog = read_catalog_for_verify(state)?;
+		let keys = KeysFile::read(&state.keys).map_err(|error| miette!("{error}"))?;
+		for extension in &selected {
+			let (indexed, release) = catalog
+				.release(extension.id.as_str(), extension.version.as_str())
+				.ok_or_else(|| {
+					miette!(
+						"{} {} is absent or yanked in the current signed index",
+						extension.id,
+						extension.version
+					)
+				})?;
+			if indexed.publisher_key != extension.publisher
+				|| release.capability_digest != extension.capability_digest
+			{
+				return Err(miette!(
+					"signed index authority differs from the lock for {}",
+					extension.id
+				));
+			}
+			if !keys
+				.keys
+				.iter()
+				.any(|pin| pin.id == extension.id && pin.key == extension.publisher)
+			{
+				return Err(miette!("publisher key for {} does not match its local pin", extension.id));
+			}
+			verify_artifact_signature(
+				extension.publisher.as_str(),
+				extension.wheel.blake3.as_str(),
+				extension.wheel.sha256.as_str(),
+				extension.capability_digest.as_str(),
+				extension.signature.as_str(),
+			)
+			.map_err(|error| miette!("{error}"))?;
+		}
+	}
+	if deep && !selected.is_empty() {
+		for extension in &selected {
+			let path = state
+				.artifacts
+				.join(extension.wheel.blake3.as_str().trim_start_matches("b3:"));
+			let bytes = fs::read(&path).into_diagnostic()?;
+			if bytes.len() as u64 != extension.wheel.size
+				|| sf!("b3:{}", blake3::hash(&bytes).to_hex()) != extension.wheel.blake3
+				|| sf!("sha256:{}", hex::encode(&Sha256::digest(&bytes))) != extension.wheel.sha256
+			{
+				return Err(miette!("artifact bytes for {} differ from the lock", extension.id));
+			}
+		}
+		verify_site_records(&state.sites)?;
+	}
+	if args.revocations {
+		refresh_revocations(state).await?;
+	}
+	if revocations {
+		verify_revocations(state, &selected)?;
+	}
+	println!("verified {} locked extension(s)", selected.len());
+	Ok(())
+}
+
+fn read_catalog_for_verify(state: &StatePaths) -> miette::Result<SignedIndex> {
+	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
+	SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))
+}
+
+fn verify_site_records(site_root: &Path) -> miette::Result<()> {
+	if !site_root.exists() {
+		return Err(miette!("materialized extension site root is unavailable"));
+	}
+	let mut pending = vec![site_root.to_path_buf()];
+	let mut records = Vec::new();
+	while let Some(directory) = pending.pop() {
+		for entry in fs::read_dir(&directory).into_diagnostic()? {
+			let entry = entry.into_diagnostic()?;
+			let metadata = fs::symlink_metadata(entry.path()).into_diagnostic()?;
+			if metadata.file_type().is_symlink() {
+				return Err(miette!("materialized site contains a symbolic link"));
+			}
+			if metadata.is_dir() {
+				pending.push(entry.path());
+			} else if entry.file_name().to_string_lossy() == "RECORD"
+				&& entry
+					.path()
+					.parent()
+					.and_then(Path::file_name)
+					.is_some_and(|parent| parent.to_string_lossy().ends_with(".dist-info"))
+			{
+				records.push(entry.path());
+			}
+		}
+	}
+	if records.is_empty() {
+		return Err(miette!("materialized extension site contains no wheel RECORD"));
+	}
+	for record in records {
+		let distribution_root = record
+			.parent()
+			.and_then(Path::parent)
+			.ok_or_else(|| miette!("wheel RECORD has no distribution root"))?;
+		for row in fs::read_to_string(&record).into_diagnostic()?.lines() {
+			let fields = parse_record_row(row)?;
+			let Some(hash) = fields.get(1).filter(|hash| !hash.is_empty()) else {
+				continue;
+			};
+			let encoded = hash
+				.strip_prefix("sha256=")
+				.ok_or_else(|| miette!("wheel RECORD uses an unsupported hash"))?;
+			let mut standard = encoded.replace('-', "+").replace('_', "/");
+			while standard.len() % 4 != 0 {
+				standard.push('=');
+			}
+			let expected = base64::decode(standard.as_bytes())
+				.into_vec()
+				.map_err(|_| miette!("wheel RECORD contains invalid base64"))?;
+			let relative = fields
+				.first()
+				.ok_or_else(|| miette!("wheel RECORD row has no path"))?;
+			let candidate = distribution_root.join(relative);
+			let canonical_root = distribution_root.canonicalize().into_diagnostic()?;
+			let candidate = candidate.canonicalize().into_diagnostic()?;
+			if !candidate.starts_with(&canonical_root) {
+				return Err(miette!("wheel RECORD path escapes the site tree"));
+			}
+			if Sha256::digest(fs::read(candidate).into_diagnostic()?).as_slice() != expected.as_slice()
+			{
+				return Err(miette!("materialized file differs from wheel RECORD"));
+			}
+		}
+	}
+	Ok(())
+}
+
+fn parse_record_row(row: &str) -> miette::Result<Vec<String>> {
+	let mut fields = Vec::with_capacity(3);
+	let mut field = String::new();
+	let mut characters = row.chars().peekable();
+	let mut quoted = false;
+	while let Some(character) = characters.next() {
+		match character {
+			'"' if quoted && characters.peek() == Some(&'"') => {
+				field.push('"');
+				characters.next();
+			},
+			'"' => quoted = !quoted,
+			',' if !quoted && fields.len() < 2 => {
+				fields.push(std::mem::take(&mut field));
+			},
+			_ => field.push(character),
+		}
+	}
+	if quoted {
+		return Err(miette!("wheel RECORD contains an unterminated quote"));
+	}
+	fields.push(field);
+	if fields.len() != 3 {
+		return Err(miette!("wheel RECORD row does not have three columns"));
+	}
+	Ok(fields)
+}
+
+async fn refresh_revocations(state: &StatePaths) -> miette::Result<()> {
+	let source = read_index_config(state)?
+		.entries
+		.into_iter()
+		.next()
+		.ok_or_else(|| miette!("no signed index is configured for revocation refresh"))?;
+	let (prefix, _) = source
+		.url
+		.rsplit_once('/')
+		.ok_or_else(|| miette!("signed index URL has no revocation metadata directory"))?;
+	let url = format!("{prefix}/revocations.json");
+	let bytes = service::fetch_index(&url).await?;
+	let parent = state
+		.revocations
+		.parent()
+		.ok_or_else(|| miette!("revocation path has no parent"))?;
+	fs::create_dir_all(parent).into_diagnostic()?;
+	let staged = state.revocations.with_extension("json.tmp");
+	fs::write(&staged, bytes).into_diagnostic()?;
+	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
+	let revocations = RevocationsFile::read(&staged).map_err(|error| miette!("{error}"))?;
+	if let Err(error) = revocations.verify(key.trim()) {
+		let _ = fs::remove_file(staged);
+		return Err(miette!("{error}"));
+	}
+	if !matches!(
+		revocations.freshness(&jiff::Timestamp::now().to_string(), true),
+		RevocationFreshness::Fresh
+	) {
+		let _ = fs::remove_file(staged);
+		return Err(miette!("refreshed revocation snapshot is not current"));
+	}
+	fs::rename(staged, &state.revocations).into_diagnostic()
+}
+
+fn verify_revocations(state: &StatePaths, extensions: &[&LockedExtension]) -> miette::Result<()> {
+	if !state.revocations.exists() {
+		return Err(miette!("signed revocation snapshot is unavailable"));
+	}
+	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
+	let revocations =
+		RevocationsFile::read(&state.revocations).map_err(|error| miette!("{error}"))?;
+	revocations
+		.verify(key.trim())
+		.map_err(|error| miette!("{error}"))?;
+	match revocations.freshness(&jiff::Timestamp::now().to_string(), true) {
+		RevocationFreshness::Fresh => {},
+		RevocationFreshness::Warn(code) | RevocationFreshness::Reject(code) => {
+			return Err(miette!("{code}: signed revocation snapshot is stale"));
+		},
+	}
+	for extension in extensions {
+		if let Some(revocation) = revocations
+			.revocation_for(&extension.id, &extension.version)
+			.map_err(|error| miette!("{error}"))?
+		{
+			return Err(miette!(
+				"{} {} is revoked: {} ({})",
+				extension.id,
+				extension.version,
+				revocation.reason,
+				revocation.advisory
+			));
+		}
+	}
 	Ok(())
 }
 fn publish(args: ExtPublishArgs) -> miette::Result<()> {
@@ -1111,6 +1656,9 @@ fn where_paths(state: &StatePaths, args: ExtWhereArgs) -> miette::Result<()> {
 
 #[derive(Clone)]
 struct StatePaths {
+	data_dir:            PathBuf,
+	project:             PathBuf,
+	project_state:       PathBuf,
 	client_installed:    PathBuf,
 	workspace_installed: PathBuf,
 	client_lock:         PathBuf,
@@ -1125,13 +1673,39 @@ struct StatePaths {
 	indexes:             PathBuf,
 	index_snapshot:      PathBuf,
 	index_key:           PathBuf,
+	marketplaces:        PathBuf,
+	marketplace_cache:   PathBuf,
+	user_plugins:        PathBuf,
+	project_plugins:     PathBuf,
+	workspace:           omp_ext::WorkspaceUri,
 	layer:               BackendLayer,
 }
 
 impl StatePaths {
 	fn new(data_dir: &Path, project: &Path) -> Self {
+		let project = project
+			.canonicalize()
+			.unwrap_or_else(|_| project.to_path_buf());
+		let project_state =
+			omp_env::project_state::directory(data_dir, &project).unwrap_or_else(|_| {
+				data_dir.join("projects").join(
+					Hash32::sum(project.as_os_str().as_encoded_bytes())
+						.to_hex()
+						.as_str(),
+				)
+			});
+		let workspace_uri = url::Url::from_directory_path(&project)
+			.map(|url| url.to_string())
+			.unwrap_or_else(|()| sf!("file://{}", project.display()).to_string());
+		let workspace_identity = omp_ext::WorkspaceUri {
+			digest: sf!("sha256:{}", Hash32::sum(workspace_uri.as_bytes()).to_hex()),
+			uri:    Str::new(workspace_uri),
+		};
 		let workspace = project.join(".omp");
 		Self {
+			data_dir:            data_dir.to_path_buf(),
+			project:             project.clone(),
+			project_state:       project_state.clone(),
 			client_installed:    data_dir.join("ext/installed.toml"),
 			workspace_installed: workspace.join("installed.toml"),
 			client_lock:         data_dir.join("ext/omp.lock"),
@@ -1141,13 +1715,29 @@ impl StatePaths {
 			pins:                data_dir.join("ext/pins.toml"),
 			revocations:         data_dir.join("ext/revocations.json"),
 			generations:         data_dir.join("ext/generations"),
-			sites:               data_dir.join("ext/sites"),
+			sites:               project_state.join("ext/sites"),
 			artifacts:           data_dir.join("ext/artifacts"),
 			indexes:             data_dir.join("ext/indexes.toml"),
 			index_snapshot:      data_dir.join("ext/index.json"),
 			index_key:           data_dir.join("ext/index.key"),
+			marketplaces:        data_dir.join("marketplaces.json"),
+			marketplace_cache:   data_dir.join("plugins/cache/marketplaces"),
+			user_plugins:        data_dir.join("plugins"),
+			project_plugins:     workspace.join("plugins"),
+			workspace:           workspace_identity,
 			layer:               BackendLayer::Client,
 		}
+	}
+
+	fn plugin_root(&self, scope: Scope) -> PathBuf {
+		match scope {
+			Scope::User => self.user_plugins.clone(),
+			Scope::Project => self.project_plugins.clone(),
+		}
+	}
+
+	fn plugin_registry(&self, scope: Scope) -> PathBuf {
+		self.plugin_root(scope).join("installed_plugins.json")
 	}
 
 	fn scoped(&self, scope: Scope) -> Self {
@@ -1170,7 +1760,7 @@ impl StatePaths {
 		}
 	}
 }
-async fn sync(state: &StatePaths, args: ExtSyncArgs) -> miette::Result<()> {
+async fn sync(state: &StatePaths, args: ExtSyncArgs, uv: Option<&Path>) -> miette::Result<()> {
 	if let Some(bundle) = args.from {
 		let bytes = fs::read(bundle).into_diagnostic()?;
 		let decoded = unpack_bundle(&bytes).map_err(|error| miette!("{error}"))?;
@@ -1184,14 +1774,67 @@ async fn sync(state: &StatePaths, args: ExtSyncArgs) -> miette::Result<()> {
 	if args.verify {
 		verify(state, ExtVerifyArgs {
 			ids:         Vec::new(),
-			deep:        true,
-			signatures:  true,
+			deep:        args.verify,
+			signatures:  args.verify,
 			revocations: false,
-		})?;
+		})
+		.await?;
 	}
-	let lock = LockFile::read(&state.client_lock, BackendLayer::Client)
+	let lock =
+		LockFile::read(&state.client_lock, state.layer).map_err(|error| miette!("{error}"))?;
+	if state.revocations.exists() {
+		let extensions = lock.extensions.iter().collect::<Vec<_>>();
+		verify_revocations(state, &extensions)?;
+	}
+	let catalog = read_catalog_for_verify(state)?;
+	let mut installed =
+		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+	for locked in &lock.extensions {
+		let (_, release) = catalog
+			.release(locked.id.as_str(), locked.version.as_str())
+			.ok_or_else(|| {
+				miette!("{} {} is absent from the signed index", locked.id, locked.version)
+			})?;
+		let artifact = release
+			.artifacts
+			.iter()
+			.find(|artifact| {
+				artifact.blake3 == locked.wheel.blake3
+					&& artifact.sha256 == locked.wheel.sha256
+					&& artifact.file == locked.wheel.file
+			})
+			.ok_or_else(|| {
+				miette!("{} {} has no lock-matching artifact", locked.id, locked.version)
+			})?;
+		let site_key = generation_id(locked.id.as_str(), locked.version.as_str());
+		let (environment, _, site_root) =
+			materialize_signed_wheel(state, uv, artifact, &site_key).await?;
+		drop(environment);
+		let entry = installed
+			.extensions
+			.iter_mut()
+			.find(|entry| entry.id == locked.id)
+			.ok_or_else(|| miette!("{} is locked but not installed", locked.id))?;
+		let mut source = locked.source.clone();
+		source
+			.as_table_mut()
+			.ok_or_else(|| miette!("{} has a malformed lock source", locked.id))?
+			.insert("root".to_owned(), toml::Value::String(site_root.display().to_string()));
+		entry.source = source;
+	}
+	if !lock.extensions.is_empty() {
+		let encoded = toml::to_string(&lock).into_diagnostic()?;
+		let generation = Generation { lock: lock.clone(), installed };
+		omp_ext::upgrade::commit_generation(
+			&state.client_lock,
+			&state.client_installed,
+			&state.generations,
+			&format!("sync-{}", &Hash32::sum(encoded.as_bytes()).to_hex().as_str()[..16]),
+			&generation,
+		)
 		.map_err(|error| miette!("{error}"))?;
-	println!("verified materialization inputs for {} locked extension(s)", lock.extensions.len());
+	}
+	println!("materialized {} locked extension(s)", lock.extensions.len());
 	Ok(())
 }
 
@@ -1207,11 +1850,12 @@ fn validate_specs(specs: &[Str]) -> miette::Result<()> {
 	Ok(())
 }
 
-fn install_index_source(
+async fn install_index_source(
 	state: &StatePaths,
 	args: &ExtInstallArgs,
 	installed: &mut InstalledRecord,
 	source: SourceSpec,
+	uv: Option<&Path>,
 ) -> miette::Result<()> {
 	let SourceSpec::Index { index, distribution } = source else {
 		return Err(miette!(
@@ -1228,6 +1872,7 @@ fn install_index_source(
 	let (extension, release) = catalog
 		.release(id, version)
 		.ok_or_else(|| miette!("{id}@{version} is absent or yanked in the signed index"))?;
+	ensure_not_revoked(state, &extension.id, &release.version)?;
 	let target = args.target.first().map_or("any", Str::as_str);
 	let artifact = release
 		.artifacts
@@ -1260,6 +1905,58 @@ fn install_index_source(
 			None,
 		)
 		.map_err(|error| miette!("{error}"))?;
+
+	let requested_digest = if let Some(capabilities) = args.capabilities.as_deref() {
+		omp_ext::trust::capability_digest(csv(capabilities), [])
+	} else {
+		release.capability_digest.clone()
+	};
+	if requested_digest != release.capability_digest {
+		return Err(miette!(
+			"requested capabilities do not exactly match the signed manifest capability digest"
+		));
+	}
+	let ship = Str::new_static("installed");
+	let workspace = (state.layer == BackendLayer::Workspace).then_some(&state.workspace);
+	let mut grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
+	if args.yes {
+		grants.grants.retain(|grant| {
+			grant.id != extension.id
+				|| grant.layer != state.layer
+				|| grant.workspace.as_ref() != workspace
+		});
+		grants.grants.push(Grant {
+			id:                extension.id.clone(),
+			publisher:         extension.publisher_key.clone(),
+			layer:             state.layer,
+			workspace:         workspace.cloned(),
+			capability_digest: release.capability_digest.clone(),
+			tier:              tier(args.tier),
+			ship:              ship.clone(),
+			granted_at:        Str::new(jiff::Timestamp::now().to_string()),
+			granted_by:        Str::new_static("explicit-install"),
+		});
+	}
+	if !grant_covers(
+		&grants,
+		&extension.id,
+		&extension.publisher_key,
+		state.layer,
+		workspace,
+		&release.capability_digest,
+		tier(args.tier),
+		&ship,
+	) {
+		return Err(miette!(
+			"no exact operator grant admits {} at {:?} tier with {} shipping",
+			extension.id,
+			args.tier,
+			ship
+		));
+	}
+	if !args.dry_run {
+		grants.write(&state.grants).into_diagnostic()?;
+	}
 
 	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	lock.indexes = vec![if index.is_empty() {
@@ -1296,35 +1993,261 @@ fn install_index_source(
 	lock
 		.extensions
 		.sort_by(|left, right| left.id.cmp(&right.id));
-	upsert_installed(installed, InstalledExtension {
-		id:      extension.id.clone(),
-		source:  index_source(
-			lock.indexes.first().map_or("", String::as_str),
-			&extension.distribution,
-		),
-		tier:    tier(args.tier),
-		enabled: true,
-	});
 	if args.dry_run {
 		println!("would install {} {}", extension.id, release.version);
 		return Ok(());
 	}
 	if args.no_lock {
-		installed.write(&state.client_installed).into_diagnostic()?;
-	} else {
-		let generation = Generation { lock, installed: installed.clone() };
-		omp_ext::upgrade::commit_generation(
-			&state.client_lock,
-			&state.client_installed,
-			&state.generations,
-			&format!("{}-{}", extension.id, release.version).replace('/', "_"),
-			&generation,
-		)
-		.map_err(|error| miette!("{error}"))?;
+		return Err(miette!(
+			"signed index installation requires the lock-controlled materialized generation"
+		));
 	}
+	let generation_id = generation_id(extension.id.as_str(), release.version.as_str());
+	let (environment, request, site_root) =
+		materialize_signed_wheel(state, uv, artifact, &generation_id).await?;
+	let mut source =
+		index_source(lock.indexes.first().map_or("", String::as_str), &extension.distribution);
+	source
+		.as_table_mut()
+		.expect("index source is a table")
+		.insert("root".to_owned(), toml::Value::String(site_root.display().to_string()));
+	upsert_installed(installed, InstalledExtension {
+		id: extension.id.clone(),
+		source,
+		tier: tier(args.tier),
+		enabled: true,
+	});
+	let generation = Generation { lock, installed: installed.clone() };
+	materialize::materialize_and_commit_generation(
+		environment.client(),
+		request,
+		&state.client_lock,
+		&state.client_installed,
+		&state.generations,
+		&generation_id,
+		&generation,
+	)
+	.await
+	.map_err(|error| miette!("{error}"))?;
 	keys.write(&state.keys).into_diagnostic()?;
 	println!("installed {} {}", extension.id, release.version);
 	Ok(())
+}
+
+async fn materialize_signed_wheel(
+	state: &StatePaths,
+	uv: Option<&Path>,
+	artifact: &omp_ext::index::IndexArtifact,
+	site_key: &str,
+) -> miette::Result<(omp_envd::ProjectEnvironment, MaterializeSite, PathBuf)> {
+	if artifact.size > MAX_WHEEL_BYTES as u64 {
+		return Err(miette!("signed extension wheel exceeds the 256 MiB safety ceiling"));
+	}
+	fs::create_dir_all(&state.artifacts).into_diagnostic()?;
+	let artifact_path = state
+		.artifacts
+		.join(artifact.blake3.as_str().trim_start_matches("b3:"));
+	let bytes = if artifact_path.is_file() {
+		fs::read(&artifact_path).into_diagnostic()?
+	} else {
+		let bytes = fetch_signed_wheel(artifact).await?;
+		let staged = artifact_path.with_extension("download.tmp");
+		fs::write(&staged, &bytes).into_diagnostic()?;
+		fs::rename(staged, &artifact_path).into_diagnostic()?;
+		bytes
+	};
+	verify_signed_wheel_bytes(&bytes, artifact)?;
+	let staging = state
+		.artifacts
+		.join(format!(".unpack-{site_key}-{}", std::process::id()));
+	if staging.exists() {
+		fs::remove_dir_all(&staging).into_diagnostic()?;
+	}
+	fs::create_dir_all(&staging).into_diagnostic()?;
+	let wheel_input = state.artifacts.join(format!(".wheel-{site_key}.whl"));
+	fs::copy(&artifact_path, &wheel_input).into_diagnostic()?;
+	let output = tokio::process::Command::new(uv.unwrap_or_else(|| Path::new("uv")))
+		.args(["pip", "install", "--no-deps", "--no-index", "--target"])
+		.arg(&staging)
+		.arg(&wheel_input)
+		.output()
+		.await;
+	let _ = fs::remove_file(&wheel_input);
+	let output = output.into_diagnostic()?;
+	if !output.status.success() {
+		let _ = fs::remove_dir_all(&staging);
+		return Err(miette!(
+			"uv could not unpack the verified extension wheel: {}",
+			String::from_utf8_lossy(&output.stderr)
+		));
+	}
+	let store = BlobStore::open(state.project_state.join("blobs")).into_diagnostic()?;
+	let files = site_files(&store, &staging)?;
+	let _ = fs::remove_dir_all(&staging);
+	if files.is_empty() {
+		return Err(miette!("verified extension wheel materialized no files"));
+	}
+	let request = MaterializeSite {
+		site_key: site_key.to_owned(),
+		files,
+		idempotency_key: format!("ext-install-{site_key}"),
+		..MaterializeSite::default()
+	};
+	let settings =
+		SettingsManager::open(SettingsPaths::discover(&state.data_dir, Some(&state.project)))
+			.into_diagnostic()?;
+	let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
+		&state.project,
+		&state.project_state,
+		&omp_env::project_state::document_socket(&state.project_state),
+		false,
+		&[],
+		&[],
+		settings.snapshot(),
+		omp_envd::RegistryBridges::default(),
+	)
+	.await
+	.map_err(|error| miette!("{error}"))?;
+	environment
+		.client()
+		.materialize_site(request.clone())
+		.await
+		.into_diagnostic()?;
+	let site_root = fs::canonicalize(state.sites.join(site_key)).into_diagnostic()?;
+	if !site_root.starts_with(fs::canonicalize(&state.sites).into_diagnostic()?) {
+		return Err(miette!("Environment materialized extension site outside its managed root"));
+	}
+	Ok((environment, request, site_root))
+}
+
+async fn fetch_signed_wheel(artifact: &omp_ext::index::IndexArtifact) -> miette::Result<Vec<u8>> {
+	if let Some(path) = artifact.url.strip_prefix("file://") {
+		return fs::read(path).into_diagnostic();
+	}
+	if !artifact.url.starts_with("https://") {
+		return Err(miette!("signed extension wheel URL must use HTTPS or file://"));
+	}
+	let response = wreq::Client::new()
+		.get(&artifact.url)
+		.send()
+		.await
+		.into_diagnostic()?;
+	if !response.status().is_success() {
+		return Err(miette!("extension wheel download returned HTTP {}", response.status()));
+	}
+	let mut bytes = Vec::with_capacity(usize::try_from(artifact.size).unwrap_or_default());
+	let mut stream = response.bytes_stream();
+	while let Some(chunk) = stream.next().await {
+		let chunk = chunk.into_diagnostic()?;
+		if bytes.len().saturating_add(chunk.len()) > MAX_WHEEL_BYTES {
+			return Err(miette!("extension wheel download exceeded the 256 MiB safety ceiling"));
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	Ok(bytes)
+}
+
+fn verify_signed_wheel_bytes(
+	bytes: &[u8],
+	artifact: &omp_ext::index::IndexArtifact,
+) -> miette::Result<()> {
+	if bytes.len() as u64 != artifact.size
+		|| sf!("b3:{}", blake3::hash(bytes).to_hex()) != artifact.blake3
+		|| sf!("sha256:{}", hex::encode(&Sha256::digest(bytes))) != artifact.sha256
+	{
+		return Err(miette!("extension wheel bytes differ from signed index metadata"));
+	}
+	Ok(())
+}
+
+fn site_files(store: &BlobStore, root: &Path) -> miette::Result<Vec<SiteFile>> {
+	let canonical_root = fs::canonicalize(root).into_diagnostic()?;
+	let mut pending = vec![canonical_root.clone()];
+	let mut files = Vec::new();
+	while let Some(directory) = pending.pop() {
+		for entry in fs::read_dir(&directory).into_diagnostic()? {
+			let entry = entry.into_diagnostic()?;
+			let metadata = fs::symlink_metadata(entry.path()).into_diagnostic()?;
+			if metadata.file_type().is_symlink() {
+				return Err(miette!("unpacked extension wheel contains a symbolic link"));
+			}
+			if metadata.is_dir() {
+				pending.push(entry.path());
+				continue;
+			}
+			if !metadata.is_file() {
+				return Err(miette!("unpacked extension wheel contains a non-regular file"));
+			}
+			let path = fs::canonicalize(entry.path()).into_diagnostic()?;
+			let relative = path
+				.strip_prefix(&canonical_root)
+				.map_err(|_| miette!("unpacked extension file escapes the staging root"))?;
+			let relative = relative.to_string_lossy().replace('\\', "/");
+			let bytes = fs::read(&path).into_diagnostic()?;
+			let blob = store.put(&bytes).into_diagnostic()?;
+			files.push(SiteFile {
+				path:      relative,
+				blob_hash: bytes::Bytes::copy_from_slice(blob.hash.as_bytes()),
+				mode:      site_file_mode(&metadata),
+			});
+		}
+	}
+	files.sort_by(|left, right| left.path.cmp(&right.path));
+	Ok(files)
+}
+
+#[cfg(unix)]
+fn site_file_mode(metadata: &fs::Metadata) -> u32 {
+	use std::os::unix::fs::PermissionsExt as _;
+	metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn site_file_mode(_metadata: &fs::Metadata) -> u32 {
+	0
+}
+
+fn ensure_not_revoked(state: &StatePaths, id: &Str, version: &Str) -> miette::Result<()> {
+	if !state.revocations.exists() {
+		return Ok(());
+	}
+	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
+	let revocations =
+		RevocationsFile::read(&state.revocations).map_err(|error| miette!("{error}"))?;
+	revocations
+		.verify(key.trim())
+		.map_err(|error| miette!("{error}"))?;
+	if !matches!(
+		revocations.freshness(&jiff::Timestamp::now().to_string(), true),
+		RevocationFreshness::Fresh
+	) {
+		return Err(miette!("signed revocation snapshot is stale"));
+	}
+	if let Some(revocation) = revocations
+		.revocation_for(id, version)
+		.map_err(|error| miette!("{error}"))?
+	{
+		return Err(miette!("{id} {version} is revoked: {}", revocation.reason));
+	}
+	Ok(())
+}
+
+fn generation_id(id: &str, version: &str) -> String {
+	let source = format!("{id}-{version}");
+	let mut safe = source
+		.chars()
+		.take(96)
+		.map(|character| {
+			if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+				character
+			} else {
+				'_'
+			}
+		})
+		.collect::<String>();
+	safe.push('-');
+	safe.push_str(&Hash32::sum(source.as_bytes()).to_hex().as_str()[..16]);
+	safe
 }
 
 fn read_lock_or_empty(path: &Path, layer: BackendLayer) -> miette::Result<LockFile> {
@@ -1381,4 +2304,41 @@ fn write_toml(path: &Path, value: &impl serde::Serialize) -> miette::Result<()> 
 	let temporary = path.with_extension("toml.tmp");
 	fs::write(&temporary, toml::to_string_pretty(value).into_diagnostic()?).into_diagnostic()?;
 	fs::rename(temporary, path).into_diagnostic()
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn verified_wheel_bytes_and_site_files_are_content_addressed() {
+		let bytes = b"wheel";
+		let artifact = omp_ext::index::IndexArtifact {
+			target:    Str::new_static("any"),
+			url:       "file:///wheel.whl".to_owned(),
+			file:      Str::new_static("review.whl"),
+			tag:       Str::new_static("py3-none-any"),
+			size:      bytes.len() as u64,
+			blake3:    Str::from(format!("b3:{}", blake3::hash(bytes).to_hex())),
+			sha256:    Str::from(format!("sha256:{}", hex::encode(&Sha256::digest(bytes)))),
+			signature: Str::new_static("signature"),
+		};
+		verify_signed_wheel_bytes(bytes, &artifact).expect("verified wheel");
+		assert!(verify_signed_wheel_bytes(b"changed", &artifact).is_err());
+
+		let directory = tempfile::tempdir().expect("site");
+		let root = directory.path().join("unpacked");
+		fs::create_dir_all(root.join("review")).expect("package directory");
+		fs::write(root.join("review/__init__.py"), b"value = 1\n").expect("module");
+		fs::write(root.join("review.dist-info"), b"metadata").expect("metadata");
+		let store = BlobStore::open(directory.path().join("blobs")).expect("blob store");
+		let files = site_files(&store, &root).expect("site files");
+		assert_eq!(
+			files
+				.iter()
+				.map(|file| file.path.as_str())
+				.collect::<Vec<_>>(),
+			["review.dist-info", "review/__init__.py"]
+		);
+		assert!(files.iter().all(|file| file.blob_hash.len() == 32));
+	}
 }

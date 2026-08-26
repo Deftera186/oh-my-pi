@@ -11,8 +11,13 @@ use crate::{
 pub const MAX_EXTRACTION_INPUT_BYTES: usize = 256 * 1024;
 /// Maximum completion bytes parsed from auxiliary inference.
 pub const MAX_EXTRACTION_OUTPUT_BYTES: usize = 256 * 1024;
+/// Maximum jobs returned by one durable-queue read.
+pub const MAX_EXTRACTION_BATCH_JOBS: usize = 16;
+/// Maximum aggregate input bytes returned by one durable-queue read.
+pub const MAX_EXTRACTION_BATCH_BYTES: usize = 1024 * 1024;
 
 /// One memory-extraction completion request.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractionRequest {
 	/// User-authored framed transcript only.
 	pub input:      Str,
@@ -83,7 +88,7 @@ pub async fn extract_and_store<L: ExtractionLane>(
 			confidence:       fact.confidence,
 		})
 		.collect::<Vec<_>>();
-	let inserted = store.save_extracted_facts(&borrowed)?;
+	let inserted = store.complete_extraction(request.source_id.as_str(), &borrowed)?;
 	Ok(ExtractionReport { parsed: facts.len(), inserted, rejected })
 }
 

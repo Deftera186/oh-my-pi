@@ -72,7 +72,7 @@ mod tests {
 		.expect("render");
 		assert_eq!(
 			rendered,
-			"\"one\" two|one,two|yes|```rs\nfn main() {}\n```|<note>&lt;ok&gt;</note>",
+			"\"one\" two|one,two|yes|```rs\nfn main() {}\n```|<note>\n&lt;ok&gt;\n</note>",
 		);
 	}
 

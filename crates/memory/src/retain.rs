@@ -7,6 +7,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::{
 	Result,
+	extract::MAX_EXTRACTION_INPUT_BYTES,
 	store::{BankStore, RetainedWindow},
 };
 
@@ -52,13 +53,13 @@ pub struct RetentionMessage<'a> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RetentionOutcome {
 	/// Whether a new durable episode was stored.
-	pub stored_id:        Option<Str>,
+	pub stored_id:           Option<Str>,
 	/// Highest covered user turn after the operation.
-	pub retained_through: u64,
-	/// User-only framed text supplied to extraction, when substantive.
-	pub extraction_text:  Option<Str>,
+	pub retained_through:    u64,
+	/// Whether a new durable extraction job was enqueued atomically.
+	pub extraction_enqueued: bool,
 	/// Marker-free text supplied to embeddings, when substantive.
-	pub embedding_text:   Option<Str>,
+	pub embedding_text:      Option<Str>,
 }
 
 /// Per-session retention coordinator backed by a durable cursor in the bank.
@@ -67,6 +68,7 @@ pub struct Retainer<'a> {
 	session_id:           &'a str,
 	canonical_root:       &'a str,
 	retain_every_n_turns: usize,
+	extraction_enabled:   bool,
 }
 
 impl<'a> Retainer<'a> {
@@ -76,8 +78,15 @@ impl<'a> Retainer<'a> {
 		session_id: &'a str,
 		canonical_root: &'a str,
 		retain_every_n_turns: usize,
+		extraction_enabled: bool,
 	) -> Self {
-		Self { store, session_id, canonical_root, retain_every_n_turns: retain_every_n_turns.max(1) }
+		Self {
+			store,
+			session_id,
+			canonical_root,
+			retain_every_n_turns: retain_every_n_turns.max(1),
+			extraction_enabled,
+		}
 	}
 
 	/// Retains only when the Pi-default user-turn interval has elapsed.
@@ -105,7 +114,10 @@ impl<'a> Retainer<'a> {
 		let Some(transcript) = format_durable_transcript(suffix) else {
 			return Ok(RetentionOutcome { retained_through: cursor, ..RetentionOutcome::default() });
 		};
-		let extraction_text = format_extraction_text(suffix);
+		let extraction_text = self
+			.extraction_enabled
+			.then(|| format_extraction_text(suffix))
+			.flatten();
 		let embedding_text = format_embedding_text(suffix);
 		let ids = suffix
 			.iter()
@@ -122,13 +134,15 @@ impl<'a> Retainer<'a> {
 			session_id:                 self.session_id,
 			transcript:                 transcript.as_str(),
 			embed_text:                 embedding_text.as_deref().unwrap_or(transcript.as_str()),
+			extraction_text:            extraction_text.as_deref(),
 			metadata:                   &metadata,
 			retained_through_user_turn: user_turns,
 		})?;
+		let extraction_enqueued = stored_id.is_some() && extraction_text.is_some();
 		Ok(RetentionOutcome {
 			stored_id,
 			retained_through: user_turns,
-			extraction_text,
+			extraction_enqueued,
 			embedding_text,
 		})
 	}
@@ -141,13 +155,30 @@ pub fn format_durable_transcript(messages: &[RetentionMessage<'_>]) -> Option<St
 
 /// Frames only user-authored messages for fact/entity extraction.
 pub fn format_extraction_text(messages: &[RetentionMessage<'_>]) -> Option<Str> {
-	format_messages(
+	let text = format_messages(
 		messages
 			.iter()
 			.copied()
 			.filter(|message| message.role == RetentionRole::User),
 		true,
-	)
+	)?;
+	Some(bound_extraction_text(text))
+}
+
+fn bound_extraction_text(text: Str) -> Str {
+	if text.len() <= MAX_EXTRACTION_INPUT_BYTES {
+		return text;
+	}
+	const CLOSING_MARKER: &str = "\n[user:end]";
+	let mut boundary = MAX_EXTRACTION_INPUT_BYTES - CLOSING_MARKER.len();
+	while !text.as_str().is_char_boundary(boundary) {
+		boundary -= 1;
+	}
+	let prefix = text.as_str()[..boundary].trim_end();
+	let mut bounded = String::with_capacity(prefix.len() + CLOSING_MARKER.len());
+	bounded.push_str(prefix);
+	bounded.push_str(CLOSING_MARKER);
+	Str::new(bounded)
 }
 
 /// Formats every substantive message without protocol markers for embedding and
@@ -258,4 +289,22 @@ fn strip_memory_blocks(content: &str) -> String {
 
 fn substantive(content: &str) -> bool {
 	content.chars().any(char::is_alphanumeric)
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn extraction_text_is_utf8_safe_and_hard_bounded() {
+		let content = "é".repeat(MAX_EXTRACTION_INPUT_BYTES);
+		let messages = [RetentionMessage {
+			stable_id: "message",
+			role:      RetentionRole::User,
+			content:   &content,
+		}];
+		let extraction = format_extraction_text(&messages).expect("substantive extraction");
+		assert!(extraction.len() <= MAX_EXTRACTION_INPUT_BYTES);
+		assert!(extraction.as_str().ends_with("[user:end]"));
+		assert!(extraction.as_str().is_char_boundary(extraction.len()));
+	}
 }

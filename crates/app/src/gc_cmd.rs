@@ -41,8 +41,9 @@ impl Drop for GcLock {
 /// Runs dry by default; destructive work requires `--apply`.
 pub fn run(args: GcArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
-	let sessions_dir = args
-		.sessions_dir
+	let explicit_sessions_dir = args.sessions_dir;
+	let sessions_dir = explicit_sessions_dir
+		.clone()
 		.unwrap_or_else(|| data_dir.join("sessions"));
 	let index_path = args
 		.index
@@ -123,12 +124,10 @@ pub fn run(args: GcArgs) -> miette::Result<()> {
 		.map(|session| session.id.clone())
 		.collect::<Vec<_>>();
 	let sweep = if args.apply {
-		gc::sweep(
-			&BlobStore::open(&data_dir).into_diagnostic()?,
-			&retained,
-			Duration::from_secs(args.min_age_seconds),
-		)
-		.into_diagnostic()?
+		let store = BlobStore::open(&data_dir).into_diagnostic()?;
+		let explicit_roots = explicit_sessions_dir.into_iter().collect::<Vec<_>>();
+		let roots = gc::SessionRoots::discover(&store, &explicit_roots).into_diagnostic()?;
+		gc::sweep(&store, &roots, Duration::from_secs(args.min_age_seconds)).into_diagnostic()?
 	} else {
 		gc::SweepReport::default()
 	};

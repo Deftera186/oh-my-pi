@@ -1,12 +1,16 @@
 //! Local grant, publisher-key, and revocation state.
 
-use std::{collections::BTreeSet, fs, io, path::Path};
+use std::{collections::BTreeSet, fs, io, path::Path, str::FromStr as _};
 
+use jiff::Timestamp;
 use omp_core::{Hash32, Str, base64, encoding::hex, sf};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use super::{ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml};
+use super::{
+	ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml,
+	resolver::version_satisfies,
+};
 
 /// An operator-originated capability grant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -43,7 +47,11 @@ pub struct GrantsFile {
 	pub grants:  Vec<Grant>,
 }
 
-/// Returns whether an existing grant covers exactly this identity and digest.
+/// Returns whether an existing operator grant exactly admits an extension.
+///
+/// Admission is intentionally equality-based: changing the publisher,
+/// workspace, capabilities, containment tier, or shipping level requires a
+/// fresh operator grant rather than silently widening an older decision.
 pub fn grant_covers(
 	grants: &GrantsFile,
 	id: &Str,
@@ -51,6 +59,8 @@ pub fn grant_covers(
 	layer: Layer,
 	workspace: Option<&WorkspaceUri>,
 	capability_digest: &Str,
+	tier: TrustTier,
+	ship: &Str,
 ) -> bool {
 	grants.grants.iter().any(|grant| {
 		grant.id == *id
@@ -58,6 +68,8 @@ pub fn grant_covers(
 			&& grant.layer == layer
 			&& grant.workspace.as_ref() == workspace
 			&& grant.capability_digest == *capability_digest
+			&& grant.tier == tier
+			&& grant.ship == *ship
 	})
 }
 
@@ -293,13 +305,18 @@ impl RevocationsFile {
 		verify_signature(index_key, &payload, self.signature.as_str())
 	}
 
-	/// Returns the matching revocation predicate for an extension id.
-	///
-	/// Resolver integration evaluates the recorded PEP 440 predicate against
-	/// its candidate version; callers must treat any returned predicate as a
-	/// hard R10 exclusion, including for locked candidates.
-	pub fn predicate_for(&self, id: &Str) -> Option<&RevokedVersion> {
-		self.revoked.iter().find(|entry| entry.id == *id)
+	/// Returns the matching revocation predicate for an exact locked version.
+	pub fn revocation_for(
+		&self,
+		id: &Str,
+		version: &Str,
+	) -> Result<Option<&RevokedVersion>, ExtensionError> {
+		for entry in self.revoked.iter().filter(|entry| entry.id == *id) {
+			if version_satisfies(version.as_str(), entry.versions.as_str())? {
+				return Ok(Some(entry));
+			}
+		}
+		Ok(None)
 	}
 
 	/// Atomically writes a revocation snapshot.
@@ -312,10 +329,17 @@ impl RevocationsFile {
 		fs::rename(temporary, path)
 	}
 
-	/// Returns the documented stale-list decision. RFC 3339 UTC strings sort
-	/// lexicographically, which keeps this policy allocation-free and explicit.
+	/// Returns the documented stale-list decision after parsing RFC 3339
+	/// instants, including non-UTC offsets.
 	pub fn freshness(&self, now: &str, strict_offline: bool) -> RevocationFreshness {
-		if self.valid_until.as_str() >= now {
+		let issued_at = Timestamp::from_str(self.issued_at.as_str());
+		let valid_until = Timestamp::from_str(self.valid_until.as_str());
+		let now = Timestamp::from_str(now);
+		if issued_at.is_ok_and(|issued_at| {
+			valid_until.is_ok_and(|valid_until| {
+				now.is_ok_and(|now| issued_at <= now && valid_until >= now && issued_at < valid_until)
+			})
+		}) {
 			RevocationFreshness::Fresh
 		} else if strict_offline {
 			RevocationFreshness::Reject(ExtensionCode::ERevoked)
@@ -452,6 +476,68 @@ mod tests {
 				granted_by:        sf!("interactive"),
 			}],
 		};
-		assert!(!grant_covers(&grants, &id, &publisher, Layer::Client, None, &widened));
+		assert!(!grant_covers(
+			&grants,
+			&id,
+			&publisher,
+			Layer::Client,
+			None,
+			&widened,
+			TrustTier::Sandboxed,
+			&sf!("installed"),
+		));
+		assert!(!grant_covers(
+			&grants,
+			&id,
+			&publisher,
+			Layer::Client,
+			None,
+			&grants.grants[0].capability_digest,
+			TrustTier::Trusted,
+			&sf!("installed"),
+		));
+		assert!(!grant_covers(
+			&grants,
+			&id,
+			&publisher,
+			Layer::Client,
+			None,
+			&grants.grants[0].capability_digest,
+			TrustTier::Sandboxed,
+			&sf!("pickle"),
+		));
+	}
+	#[test]
+	fn revocations_apply_pep_440_predicates_to_exact_locked_versions() {
+		let list = RevocationsFile {
+			version:     1,
+			issued_at:   sf!("2026-01-01T00:00:00Z"),
+			valid_until: sf!("2027-01-01T00:00:00Z"),
+			revoked:     vec![RevokedVersion {
+				id:       sf!("sample"),
+				versions: sf!(">=1.2,<2,!=1.5"),
+				reason:   sf!("security"),
+				advisory: "https://example.invalid/advisory".to_owned(),
+			}],
+			signature:   sf!("invalid"),
+		};
+		assert!(
+			list
+				.revocation_for(&sf!("sample"), &sf!("1.4"))
+				.unwrap()
+				.is_some()
+		);
+		assert!(
+			list
+				.revocation_for(&sf!("sample"), &sf!("1.5"))
+				.unwrap()
+				.is_none()
+		);
+		assert!(
+			list
+				.revocation_for(&sf!("sample"), &sf!("2.0"))
+				.unwrap()
+				.is_none()
+		);
 	}
 }

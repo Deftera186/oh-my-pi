@@ -109,11 +109,25 @@ impl Display for InitError {
 
 impl Error for InitError {}
 
-/// Configures and boots the embedded interpreter. Created by
-/// [`Engine::builder`].
+/// Processing policy for the one host-authorized site-packages directory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SitePolicy {
+	/// Exposes the directory directly without executing installation metadata.
+	Direct,
+	/// Processes `.pth` files, including their standard executable import lines.
+	PthFiles,
+	/// Processes `.pth` files and imports `sitecustomize`, but never
+	/// `usercustomize`.
+	#[default]
+	PthFilesAndSiteCustomize,
+}
+
+/// Configures the isolated embedded CPython runtime and its authorized-site
+/// policy. Created by [`Engine::builder`].
 #[derive(Debug, Default)]
 pub struct Builder {
 	site_packages: Option<PathBuf>,
+	site_policy:   SitePolicy,
 }
 
 impl Builder {
@@ -121,6 +135,18 @@ impl Builder {
 	/// on `sys.path`). Defaults to [`default_site_packages`].
 	pub fn site_packages(mut self, dir: impl Into<PathBuf>) -> Self {
 		self.site_packages = Some(dir.into());
+		self
+	}
+
+	/// Selects how the authorized site directory is initialized.
+	///
+	/// The default, [`SitePolicy::PthFilesAndSiteCustomize`], matches a normal
+	/// installed site while retaining isolated mode: `.pth` files may extend
+	/// the import path or execute their standard `import` lines, and only
+	/// `sitecustomize` reachable from that resulting path is imported.
+	/// `usercustomize` and ambient user/global site directories remain disabled.
+	pub const fn site_policy(mut self, policy: SitePolicy) -> Self {
+		self.site_policy = policy;
 		self
 	}
 
@@ -140,7 +166,9 @@ impl Builder {
 		bindings::register();
 		install_frozen_modules();
 		init_python(&site_c);
-		Ok(Engine { site_packages: site })
+		let engine = Engine { site_packages: site };
+		initialize_authorized_site(&engine, self.site_policy);
+		Ok(engine)
 	}
 }
 
@@ -251,6 +279,38 @@ fn check(status: ffi::PyStatus) {
 			ffi::Py_ExitStatusException(status);
 		}
 	}
+}
+
+/// Applies the selected policy only to the configured site directory.
+///
+/// Initialization failures follow CPython's embedding convention and abort
+/// with its diagnostic, like failures from [`init_python`]. `addsitedir`
+/// deliberately retains standard `.pth` semantics because this directory is
+/// the explicit installation authority selected by the host.
+fn initialize_authorized_site(engine: &Engine, policy: SitePolicy) {
+	if policy == SitePolicy::Direct {
+		return;
+	}
+	engine.attach(|py| {
+		let site = py.import("site").unwrap_or_else(|error| {
+			error.print(py);
+			panic!("embedded site module is unavailable");
+		});
+		site
+			.call_method1("addsitedir", (&engine.site_packages,))
+			.unwrap_or_else(|error| {
+				error.print(py);
+				panic!("failed to process authorized site directory");
+			});
+		if policy == SitePolicy::PthFilesAndSiteCustomize {
+			site
+				.call_method0("execsitecustomize")
+				.unwrap_or_else(|error| {
+					error.print(py);
+					panic!("failed to execute authorized site customization");
+				});
+		}
+	});
 }
 
 /// Boots the statically linked interpreter in isolated mode with the

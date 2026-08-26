@@ -4,7 +4,7 @@ pub mod presentation;
 pub mod template;
 
 use std::{
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, HashSet, VecDeque},
 	env, fs,
 	future::pending,
 	iter, mem,
@@ -16,27 +16,27 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use miette::IntoDiagnostic as _;
+use miette::{Context as _, IntoDiagnostic as _};
 use omp_agent::{
-	Agent, AgentEvent, AgentPhase, AgentState, AgentTree, ApprovalDecision, ApprovalInbox,
-	ApprovalRequest, ApprovalSource, DeferredCommand, DeferredCommandKind, DeferredCommands,
-	DeferredContext, DeliveryMode, Interrupt, InterruptClass, InterruptSource, PeerMessage,
-	RewindTarget, TurnClient,
+	Agent, AgentEvent, AgentPhase, AgentRunState, AgentState, AgentStatus, AgentTree,
+	ApprovalDecision, ApprovalInbox, ApprovalRequest, ApprovalSource, DeferredCommand,
+	DeferredCommandKind, DeferredCommands, DeferredContext, DeliveryMode, Interrupt, InterruptClass,
+	InterruptSource, PeerMessage, RewindTarget, TurnClient,
 	prompt_assets::{PromptAssetId, prompt_asset},
 };
 use omp_catalog::{
-	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, provider::AuthSpecKind,
+	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId,
+	provider::AuthSpecKind,
+	settings::{ModelRoleStorage, ModelSettings},
 	snapshot::Catalog,
 };
 use omp_chat_ui::{
 	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
-	Intent, ModelRow, RewindTargetRow, SessionRow, StatusFacts, StatusLayout, StatusSeparator,
-	SubmitMode, ThinkingLevel as StatusThinkingLevel, TranscriptFrame, TranscriptFrameKind,
-	VisibleResourceFacts,
-	completion::{
-		CompletionChain, CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion,
-	},
-	host::HostOptions,
+	Intent, LiveVoiceAction, ModelRow, RawFrame, RewindTargetRow, SessionRow, StatusFacts,
+	StatusLayout, StatusSeparator, StreamSummary, SubmitMode, ThinkingLevel as StatusThinkingLevel,
+	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, VisibleResourceFacts,
+	completion::{CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion},
+	host::{HostOptions, InputAction, InputBinding},
 };
 use omp_core::{EnvPath, Hash32, SecretString, Str, encoding::hex, sf};
 pub use omp_driver::auth_flow::{
@@ -45,11 +45,11 @@ pub use omp_driver::auth_flow::{
 };
 use omp_driver::{
 	advisor::engine::{AdvisorEngine, AdvisorEngineStatus, AdvisorRunState},
+	discovery::roles::{model_selector_allowed, resolve_role_selector},
 	modes::{Goal, GoalStatus, GoalUsage, RegimeHandle},
 	settings::{self, Settings},
 	subagent::settings::TaskSettings,
 };
-use omp_executor::Executor;
 use omp_inference::{call::AuthInput, id::TurnId};
 use omp_proto::{
 	env::v1::{
@@ -59,7 +59,10 @@ use omp_proto::{
 	},
 	inference::v1::{part_start, turn_event::Event, value},
 	omp::ui::v1::{
-		RetainedFrame, RetainedFrameEnvelope, RetainedFrameKey, Tml, retained_frame_envelope,
+		Bell, CloseOverlay, ComposerText, Dialog, FocusSlot, MountSlot, OverlayValues, PatchNode,
+		PropValue, RetainedFrame, RetainedFrameEnvelope, RetainedFrameKey, ShowOverlay, SlotOptions,
+		SlotPlacement, Tml, UiEffect, UiRequest, UiResponse, UnmountSlot, prop_value,
+		retained_frame_envelope, ui_effect, ui_request, ui_response,
 	},
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
@@ -73,10 +76,13 @@ use omp_storage::{
 use omp_telemetry::firehose::{
 	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
 };
-use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::{RenderRegistry, ViewState}};
+use omp_tool::{
+	Registry, Rev, TOOL_REV_PROP, ToolIdentity,
+	render::{RenderRegistry, ViewState},
+};
 use omp_tools::todo;
 use omp_tui::{
-	Command, Icon, SlashCommands, Suggestion, SuggestionList, UiContext,
+	Command, Icon, Suggestion, SuggestionList, UiContext,
 	components::{AttachmentContent, KeywordAccent},
 	detect,
 };
@@ -120,13 +126,13 @@ use omp_driver::{
 use omp_envd::github_url::GithubCredentialBridge;
 use omp_proto::inference::{v1, v1::Effort};
 use omp_settings::{
-	manager::{MutationScope, SettingsManager, SettingsPaths},
+	manager::{MutationScope, SettingsManager},
 	subscription::DomainSubscription,
 };
 use omp_tools::debug;
 use omp_tui::components;
-use tokio::{runtime, sync::watch::Receiver};
-use tokio_util::{context::TokioContext, sync::CancellationToken};
+use tokio::sync::watch::Receiver;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
 	chat_cmd::ChatPresentation, git_tui::GitSession, gui, session_manager::PinStore,
@@ -149,7 +155,6 @@ pub mod presentation_authority {
 			control::{self, ControlInvocationAuthority, ControlProtocolError},
 		},
 	};
-	use omp_executor::Executor;
 	use parking_lot::Mutex;
 	use serde::{Deserialize, Serialize};
 	use serde_json::Value;
@@ -306,7 +311,6 @@ pub mod presentation_authority {
 
 	/// Identity-fenced UI owner retaining effects and dialog correlations.
 	pub struct PresentationAuthority {
-		executor:  Executor,
 		identity:  Arc<PresentationIdentity>,
 		client:    Arc<dyn PresentationClient>,
 		callbacks: Arc<dyn PresentationCallbackDispatcher>,
@@ -315,12 +319,11 @@ pub mod presentation_authority {
 
 	impl PresentationAuthority {
 		pub fn new(
-			executor: Executor,
 			identity: Arc<PresentationIdentity>,
 			client: Arc<dyn PresentationClient>,
 			callbacks: Arc<dyn PresentationCallbackDispatcher>,
 		) -> Self {
-			Self { executor, identity, client, callbacks, state: Mutex::new(State::default()) }
+			Self { identity, client, callbacks, state: Mutex::new(State::default()) }
 		}
 
 		fn authorize(
@@ -490,7 +493,7 @@ pub mod presentation_authority {
 				.callbacks
 				.dispatch(self.identity.clone(), invocation, callback);
 			match deadline {
-				Some(deadline) => match self.executor.timeout(deadline, dispatch).await {
+				Some(deadline) => match tokio::time::timeout(deadline, dispatch).await {
 					Ok(Ok(value)) => Ok(value),
 					Ok(Err(_)) | Err(_) if kind == PresentationCallbackKind::Completion => {
 						Ok(Value::Array(Vec::new()))
@@ -725,6 +728,8 @@ fn css_color(color: omp_tui::Color) -> String {
 pub struct ChatUiSession {
 	/// Stable session identifier displayed by the status line.
 	pub session_id:     Str,
+	/// Canonical path owned by the active session storage authority.
+	pub journal_path:   PathBuf,
 	/// Canonical history replayed before live events.
 	pub initial_items:  Vec<Item>,
 	/// Selected model's total token window, when known by the catalog.
@@ -947,8 +952,8 @@ enum InspectImageMode {
 	Off,
 }
 
-fn model_accepts_images(model: &str) -> bool {
-	resolve_model(Catalog::embedded(), model)
+fn model_accepts_images(catalog: &Catalog, model: &str) -> bool {
+	resolve_model(catalog, model)
 		.and_then(|model| model.capabilities.chat.as_ref())
 		.is_some_and(|chat| {
 			matches!(
@@ -960,24 +965,30 @@ fn model_accepts_images(model: &str) -> bool {
 
 fn inspect_image_enabled(state: &BridgeState) -> bool {
 	match state.vision_override {
-		None => !model_accepts_images(&state.model),
+		None => !model_accepts_images(state.catalog.as_ref(), &state.model),
 		Some(InspectImageMode::On) => true,
 		Some(InspectImageMode::Off) => false,
 	}
 }
 
 struct BridgeState {
+	catalog: Arc<Catalog>,
 	model: String,
+	model_settings: ModelSettings,
 	pending_session_delete: Option<std::time::Instant>,
 	git: Option<GitWorkbenchBackend>,
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	session_id: Str,
+	session_path: PathBuf,
+	sessions_dir: PathBuf,
 	title: SessionTitleState,
 	title_replan_refresh_pending: bool,
 	local_root: PathBuf,
 	regimes: RegimeHandle,
 	regime_revision: u64,
 	collab: Option<CollabCommandHandle>,
+	collab_live: Option<omp_driver::collab::session::HostLiveHandle>,
+	collab_state: Option<omp_proto::collab::v1::SessionStateUpdate>,
 	environment: omp_env::EnvClient,
 	memory: Option<Arc<omp_driver::memory::ChatMemory>>,
 	workspace_root: Str,
@@ -992,7 +1003,7 @@ struct BridgeState {
 	cost_nanos: u64,
 	queued: usize,
 	queued_prompts: VecDeque<omp_chat_ui::QueuedPrompt>,
-	stt_enabled: bool,
+	audio: crate::audio_coordinator::InteractiveAudioController,
 	jobs: HashSet<Str>,
 	attempt: u32,
 	turn_started: Option<Instant>,
@@ -1004,7 +1015,6 @@ struct BridgeState {
 	tools: HashMap<Str, ToolDisplay>,
 	rewind_targets: Vec<RewindTarget>,
 	pending_auth_kind: Option<AuthPromptKind>,
-	live_enabled: bool,
 	live_activity: ActivityWaveform,
 	token_rate: Option<TokenRateMeter>,
 	tokens_per_second: Option<u64>,
@@ -1012,6 +1022,7 @@ struct BridgeState {
 	replaying_turn: bool,
 	vision_override: Option<InspectImageMode>,
 	settings: Settings,
+	prompt_discovery_settings: omp_driver::discovery::PromptDiscoverySettings,
 	commands: CommandRoster,
 	command_usage: Arc<CommandUsage>,
 	typed_commands: commands::CommandRoster,
@@ -1021,6 +1032,8 @@ struct BridgeState {
 	extension_mcp: Option<omp_env::McpSubscription>,
 	extension_live_mcp: HashMap<Str, omp_chat_ui::McpLiveSnapshot>,
 	approvals: HashMap<Str, ApprovalRequest>,
+	presentation_requests: HashMap<Str, (u64, presentation_authority::PresentationRequest)>,
+	raw_stream: Option<flume::Receiver<omp_inference::transport::CapturedFrame>>,
 }
 struct GitWorkbenchBackend {
 	session: GitSession,
@@ -1030,6 +1043,35 @@ impl Drop for GitWorkbenchBackend {
 	fn drop(&mut self) {
 		self.cancel.cancel();
 	}
+}
+
+fn raw_frame(frame: omp_inference::transport::CapturedFrame) -> RawFrame {
+	RawFrame {
+		sequence: frame.sequence,
+		session:  frame.session,
+		event:    frame.event,
+		payload:  frame.payload,
+	}
+}
+
+fn stream_summary(summary: omp_inference::transport::CaptureSummary) -> StreamSummary {
+	StreamSummary {
+		retained:         summary.retained,
+		evicted:          summary.evicted,
+		subscriber_drops: summary.subscriber_drops,
+	}
+}
+
+async fn next_raw_stream_frame(
+	stream: &mut Option<flume::Receiver<omp_inference::transport::CapturedFrame>>,
+) -> omp_inference::transport::CapturedFrame {
+	if let Some(stream) = stream.as_ref()
+		&& let Ok(frame) = stream.recv_async().await
+	{
+		return frame;
+	}
+	*stream = None;
+	pending().await
 }
 
 async fn next_extension_mcp_event(
@@ -1053,19 +1095,375 @@ async fn next_presentation_dispatch(
 	pending().await
 }
 
+fn presentation_tml(value: Option<&Value>) -> Option<Tml> {
+	let source = match value? {
+		Value::String(source) => source.as_str(),
+		Value::Object(value) => value.get("source")?.as_str()?,
+		_ => return None,
+	};
+	let digest = Hash32::sum(source.as_bytes());
+	let mut hash = [0_u8; 8];
+	hash.copy_from_slice(&digest.as_bytes()[..8]);
+	Some(Tml { source: Bytes::copy_from_slice(source.as_bytes()), hash: u64::from_le_bytes(hash) })
+}
+
+fn presentation_key(identity: &presentation_authority::PresentationIdentity, key: &str) -> String {
+	format!("{}:{key}", identity.extension)
+}
+
+fn presentation_prop(value: &Value) -> Option<PropValue> {
+	let value = match value {
+		Value::String(value) => prop_value::Value::StringValue(value.clone()),
+		Value::Bool(value) => prop_value::Value::BoolValue(*value),
+		Value::Number(value) => {
+			if let Some(value) = value.as_i64() {
+				prop_value::Value::IntegerValue(value)
+			} else {
+				prop_value::Value::NumberValue(value.as_f64()?)
+			}
+		},
+		_ => return None,
+	};
+	Some(PropValue { value: Some(value) })
+}
+
+fn presentation_props(value: Option<&Value>) -> BTreeMap<String, PropValue> {
+	value
+		.and_then(Value::as_object)
+		.into_iter()
+		.flatten()
+		.filter_map(|(key, value)| presentation_prop(value).map(|value| (key.clone(), value)))
+		.collect()
+}
+
+fn presentation_slot(value: &str) -> Option<SlotPlacement> {
+	Some(match value {
+		"header" => SlotPlacement::Header,
+		"footer" => SlotPlacement::Footer,
+		"above_editor" => SlotPlacement::AboveEditor,
+		"below_editor" => SlotPlacement::BelowEditor,
+		"sidebar_left" => SlotPlacement::LeftRail,
+		"sidebar_right" => SlotPlacement::RightRail,
+		_ => return None,
+	})
+}
+
+fn presentation_ui_effect(
+	identity: &presentation_authority::PresentationIdentity,
+	effect: &presentation_authority::PresentationEffect,
+) -> Result<UiEffect, presentation_authority::PresentationAuthorityError> {
+	use presentation_authority::PresentationAuthorityError;
+	let body = &effect.body;
+	let string = |name: &str| body.get(name).and_then(Value::as_str);
+	let kind = match effect.kind.as_str() {
+		"mount" => {
+			let key = string("key")
+				.ok_or_else(|| PresentationAuthorityError::Owner(sf!("mount effect requires key")))?;
+			let placement = string("placement")
+				.and_then(presentation_slot)
+				.ok_or_else(|| {
+					PresentationAuthorityError::Owner(sf!("mount effect has an unsupported placement"))
+				})?;
+			let content = presentation_tml(body.get("content")).ok_or_else(|| {
+				PresentationAuthorityError::Owner(sf!("mount effect requires TML content"))
+			})?;
+			let options = body.get("options").and_then(Value::as_object);
+			ui_effect::Kind::MountSlot(MountSlot {
+				key:       presentation_key(identity, key),
+				placement: placement as i32,
+				content:   Some(content),
+				options:   Some(SlotOptions {
+					order:   options
+						.and_then(|options| options.get("order"))
+						.and_then(Value::as_i64)
+						.and_then(|value| i32::try_from(value).ok())
+						.unwrap_or(100),
+					visible: true,
+					width:   options
+						.and_then(|options| options.get("width"))
+						.and_then(Value::as_u64)
+						.and_then(|value| u32::try_from(value).ok()),
+					height:  options
+						.and_then(|options| options.get("max_height"))
+						.and_then(Value::as_u64)
+						.and_then(|value| u32::try_from(value).ok()),
+					props:   None,
+				}),
+			})
+		},
+		"patch" => {
+			let key = string("key")
+				.ok_or_else(|| PresentationAuthorityError::Owner(sf!("patch effect requires key")))?;
+			let node_id = string("id")
+				.ok_or_else(|| PresentationAuthorityError::Owner(sf!("patch effect requires id")))?;
+			ui_effect::Kind::PatchNode(PatchNode {
+				key:     presentation_key(identity, key),
+				node_id: node_id.to_owned(),
+				text:    presentation_tml(body.get("text")),
+				props:   presentation_props(body.get("props")),
+			})
+		},
+		"unmount" => {
+			let key = string("key")
+				.ok_or_else(|| PresentationAuthorityError::Owner(sf!("unmount effect requires key")))?;
+			ui_effect::Kind::UnmountSlot(UnmountSlot { key: presentation_key(identity, key) })
+		},
+		"slot_visible" => {
+			let key = string("key").ok_or_else(|| {
+				PresentationAuthorityError::Owner(sf!("slot_visible effect requires key"))
+			})?;
+			let props = body
+				.get("visible")
+				.and_then(presentation_prop)
+				.map(|visible| BTreeMap::from([(String::from("visible"), visible)]))
+				.unwrap_or_default();
+			ui_effect::Kind::PatchNode(PatchNode {
+				key: presentation_key(identity, key),
+				node_id: String::new(),
+				text: None,
+				props,
+			})
+		},
+		"overlay_hidden" => {
+			let key = string("id").ok_or_else(|| {
+				PresentationAuthorityError::Owner(sf!("overlay_hidden effect requires id"))
+			})?;
+			let visible = !body.get("hidden").and_then(Value::as_bool).unwrap_or(false);
+			ui_effect::Kind::PatchNode(PatchNode {
+				key:     key.to_owned(),
+				node_id: String::new(),
+				text:    None,
+				props:   BTreeMap::from([(String::from("visible"), PropValue {
+					value: Some(prop_value::Value::BoolValue(visible)),
+				})]),
+			})
+		},
+		"overlay_focus" => {
+			ui_effect::Kind::FocusSlot(FocusSlot { key: string("id").unwrap_or_default().to_owned() })
+		},
+		"overlay_blur" => ui_effect::Kind::FocusSlot(FocusSlot { key: String::new() }),
+		"focus_slot" => {
+			let key = string("key").ok_or_else(|| {
+				PresentationAuthorityError::Owner(sf!("focus_slot effect requires key"))
+			})?;
+			ui_effect::Kind::FocusSlot(FocusSlot { key: presentation_key(identity, key) })
+		},
+		"blur_slot" => ui_effect::Kind::FocusSlot(FocusSlot { key: String::new() }),
+		"set_status" => {
+			let key = presentation_key(identity, string("key").unwrap_or("status"));
+			if let Some(content) = presentation_tml(body.get("content")) {
+				ui_effect::Kind::MountSlot(MountSlot {
+					key,
+					placement: SlotPlacement::Footer as i32,
+					content: Some(content),
+					options: Some(SlotOptions {
+						order:   body
+							.get("order")
+							.and_then(Value::as_i64)
+							.and_then(|value| i32::try_from(value).ok())
+							.unwrap_or(100),
+						visible: true,
+						width:   None,
+						height:  None,
+						props:   None,
+					}),
+				})
+			} else {
+				ui_effect::Kind::UnmountSlot(UnmountSlot { key })
+			}
+		},
+		"set_working_message" => {
+			let key = presentation_key(identity, "working");
+			if let Some(content) = presentation_tml(body.get("content")) {
+				ui_effect::Kind::MountSlot(MountSlot {
+					key,
+					placement: SlotPlacement::Footer as i32,
+					content: Some(content),
+					options: Some(SlotOptions {
+						order:   90,
+						visible: true,
+						width:   None,
+						height:  None,
+						props:   None,
+					}),
+				})
+			} else {
+				ui_effect::Kind::UnmountSlot(UnmountSlot { key })
+			}
+		},
+		"set_progress" => {
+			let key = presentation_key(identity, "progress");
+			let state = body.get("state").and_then(Value::as_object);
+			let kind = state
+				.and_then(|state| state.get("kind"))
+				.and_then(Value::as_str)
+				.unwrap_or("clear");
+			if kind == "clear" {
+				ui_effect::Kind::UnmountSlot(UnmountSlot { key })
+			} else {
+				let pct = state
+					.and_then(|state| state.get("pct"))
+					.and_then(Value::as_u64);
+				let label = pct.map_or_else(|| kind.to_owned(), |pct| format!("{kind} {pct}%"));
+				ui_effect::Kind::MountSlot(MountSlot {
+					key,
+					placement: SlotPlacement::Footer as i32,
+					content: presentation_tml(Some(&Value::String(format!("<text>{label}</text>")))),
+					options: Some(SlotOptions {
+						order:   95,
+						visible: true,
+						width:   None,
+						height:  None,
+						props:   None,
+					}),
+				})
+			}
+		},
+		"bell" => ui_effect::Kind::Bell(Bell {}),
+		_ => {
+			return Err(PresentationAuthorityError::Owner(sf!(
+				"presentation effect `{}` is not supported by the chat renderer",
+				effect.kind
+			)));
+		},
+	};
+	Ok(UiEffect { kind: Some(kind), props: None })
+}
+
+fn presentation_ui_request(
+	owner_invocation: u64,
+	request: &presentation_authority::PresentationRequest,
+) -> Option<UiRequest> {
+	use presentation_authority::PresentationRequest;
+	let kind = match request {
+		PresentationRequest::EditorText => ui_request::Kind::ComposerText(ComposerText {}),
+		PresentationRequest::Dialog { kind, fields } => {
+			let title = fields
+				.get("title")
+				.and_then(Value::as_str)
+				.unwrap_or(kind.as_str())
+				.to_owned();
+			let content = fields
+				.get("message")
+				.or_else(|| fields.get("content"))
+				.and_then(|value| presentation_tml(Some(value)));
+			let choices = fields
+				.get("items")
+				.or_else(|| fields.get("choices"))
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+				.filter_map(|choice| {
+					choice
+						.as_str()
+						.or_else(|| choice.get("label").and_then(Value::as_str))
+						.map(str::to_owned)
+				})
+				.collect();
+			ui_request::Kind::Dialog(Dialog { kind: kind.to_string(), title, content, choices })
+		},
+		PresentationRequest::Overlay { fields } => ui_request::Kind::ShowOverlay(ShowOverlay {
+			kind:    fields
+				.get("kind")
+				.and_then(Value::as_str)
+				.unwrap_or("tml")
+				.to_owned(),
+			content: fields
+				.get("content")
+				.and_then(|value| presentation_tml(Some(value))),
+			options: None,
+			props:   None,
+		}),
+		PresentationRequest::OverlayValues { id }
+		| PresentationRequest::OverlayWait { id }
+		| PresentationRequest::OverlayEvents { id } => ui_request::Kind::OverlayValues(OverlayValues {
+			overlay_id: id.to_string(),
+			values:     Vec::new(),
+		}),
+		PresentationRequest::OverlayClose { id } => {
+			ui_request::Kind::CloseOverlay(CloseOverlay { overlay_id: id.to_string() })
+		},
+		_ => return None,
+	};
+	Some(UiRequest { owner_invocation, kind: Some(kind), props: None })
+}
+
+fn presentation_response(
+	request: presentation_authority::PresentationRequest,
+	response: UiResponse,
+) -> Result<
+	presentation_authority::PresentationResponse,
+	presentation_authority::PresentationAuthorityError,
+> {
+	use presentation_authority::{
+		PresentationAuthorityError, PresentationRequest, PresentationResponse,
+	};
+	match (request, response.kind) {
+		(PresentationRequest::EditorText, Some(ui_response::Kind::Text(text))) => {
+			Ok(PresentationResponse::EditorText(Str::new(text.value)))
+		},
+		(PresentationRequest::Dialog { .. }, Some(ui_response::Kind::DialogOutcome(outcome)))
+		| (
+			PresentationRequest::OverlayWait { .. },
+			Some(ui_response::Kind::DialogOutcome(outcome)),
+		) => Ok(PresentationResponse::Dialog(serde_json::json!({
+			"accepted": outcome.accepted,
+			"cancelled": outcome.cancelled,
+			"value": outcome.value,
+			"values": outcome.values,
+		}))),
+		(PresentationRequest::Overlay { .. }, Some(ui_response::Kind::OverlayOpened(opened))) => {
+			Ok(PresentationResponse::OverlayOpened { id: Str::new(opened.overlay_id) })
+		},
+		(PresentationRequest::OverlayValues { .. }, Some(ui_response::Kind::Values(values))) => {
+			Ok(PresentationResponse::OverlayValues(
+				values
+					.values
+					.into_iter()
+					.enumerate()
+					.map(|(index, value)| (index.to_string(), Value::String(value)))
+					.collect(),
+			))
+		},
+		(PresentationRequest::OverlayEvents { .. }, Some(ui_response::Kind::Values(values))) => {
+			Ok(PresentationResponse::OverlayEvents(
+				values.values.into_iter().map(Value::String).collect(),
+			))
+		},
+		(PresentationRequest::OverlayClose { .. }, _) => Ok(PresentationResponse::Ack),
+		(_, Some(ui_response::Kind::Error(error))) => {
+			Err(PresentationAuthorityError::Owner(Str::new(error.message)))
+		},
+		_ => Err(PresentationAuthorityError::Owner(sf!(
+			"chat renderer returned an incompatible UI response"
+		))),
+	}
+}
+
 fn handle_presentation_dispatch(
 	endpoint: &presentation::PresentationEndpoint,
 	dispatch: presentation::PresentationDispatch,
 	backend: &flume::Sender<BackendEvent>,
-	state: &BridgeState,
+	state: &mut BridgeState,
 ) {
 	use presentation::PresentationOperation;
 	use presentation_authority::{
 		PresentationAuthorityError, PresentationRequest, PresentationResponse,
 	};
 
+	if let presentation::PresentationOperation::Request(request) = &dispatch.operation
+		&& let Some(request_wire) = presentation_ui_request(dispatch.id, request)
+	{
+		let correlation = Str::from(dispatch.id.to_string());
+		state
+			.presentation_requests
+			.insert(correlation.clone(), (dispatch.id, request.clone()));
+		send_backend(backend, BackendEvent::UiRequest { correlation, request: request_wire });
+		return;
+	}
+
 	let result = match dispatch.operation {
-		PresentationOperation::Effect(effect) => {
+		PresentationOperation::Effect { identity, effect } => {
 			let result = match effect.kind.as_str() {
 				"notify" => effect
 					.body
@@ -1089,10 +1487,8 @@ fn handle_presentation_dispatch(
 							"set_title effect requires title text",
 						))
 					}),
-				_ => Err(PresentationAuthorityError::Owner(sf!(
-					"presentation effect `{}` is not supported by the chat renderer",
-					effect.kind
-				))),
+				_ => presentation_ui_effect(identity.as_ref(), &effect)
+					.map(|effect| send_backend(backend, BackendEvent::ApplyUiEffect(effect))),
 			};
 			result.map(|()| PresentationResponse::Ack)
 		},
@@ -1153,6 +1549,18 @@ async fn next_replica_update(
 	updates.changed().await.ok()?;
 	let projection = updates.borrow_and_update().clone();
 	Some(projection)
+}
+
+async fn next_host_operation(
+	operations: &mut Option<omp_driver::collab::session::HostOperationReceiver>,
+) -> omp_driver::collab::session::HostOperation {
+	if let Some(operations) = operations.as_ref()
+		&& let Ok(operation) = operations.recv().await
+	{
+		return operation;
+	}
+	*operations = None;
+	pending().await
 }
 
 async fn next_presence_update(
@@ -1226,14 +1634,65 @@ fn command_role(collab: Option<&CollabCommandHandle>) -> CommandRole {
 	}
 }
 struct ChatSceneSeed {
-	typed_commands: commands::CommandRoster,
-	command_usage:  Arc<CommandUsage>,
-	skills:         Arc<omp_driver::skills::SkillSnapshot>,
-	role:           CommandRole,
-	workspace_root: PathBuf,
-	composer_style: components::ComposerStyle,
-	spelling:       omp_tui::SpellingFeatures,
-	hide_thinking:  bool,
+	typed_commands:   commands::CommandRoster,
+	command_usage:    Arc<CommandUsage>,
+	skills:           Arc<omp_driver::skills::SkillSnapshot>,
+	role:             CommandRole,
+	workspace_root:   PathBuf,
+	composer_style:   components::ComposerStyle,
+	spelling:         omp_tui::SpellingFeatures,
+	smooth_streaming: bool,
+	hide_thinking:    bool,
+}
+
+fn load_input_actions(data_dir: &Path) -> miette::Result<Vec<InputBinding>> {
+	let imported = crate::keybindings::config::import_legacy(data_dir)
+		.map_err(|error| miette::miette!("{error}"))?;
+	let native = data_dir.join("keybindings.toml");
+	let loaded = match imported {
+		Some(imported) => Some(imported),
+		None if native.is_file() => Some(
+			crate::keybindings::config::load(&native).map_err(|error| miette::miette!("{error}"))?,
+		),
+		None => None,
+	};
+	let resolved = loaded
+		.map(|loaded| loaded.config.resolve(None))
+		.transpose()
+		.map_err(|error| miette::miette!("{error}"))?
+		.unwrap_or_default();
+	if !resolved.conflicts.is_empty() {
+		let conflicts = resolved
+			.conflicts
+			.iter()
+			.map(|conflict| {
+				format!(
+					"{} ({})",
+					conflict.chord,
+					conflict
+						.actions
+						.iter()
+						.map(Str::as_str)
+						.collect::<Vec<_>>()
+						.join(", ")
+				)
+			})
+			.collect::<Vec<_>>()
+			.join("; ");
+		return Err(miette::miette!("conflicting keybindings: {conflicts}"));
+	}
+	let platform = crate::keybindings::KeyPlatform::current();
+	Ok(crate::keybindings::config::APP_ACTION_IDS
+		.iter()
+		.filter_map(|action| {
+			InputAction::from_action_id(action).map(|projected| {
+				resolved
+					.chords_for(action, platform)
+					.filter_map(move |chord| InputBinding::parse(chord, projected))
+			})
+		})
+		.flatten()
+		.collect())
 }
 
 fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
@@ -1249,41 +1708,42 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 		Command::new(&name, skill.description.as_str(), &[]).with_icon(Icon::Skill)
 	}));
 	let command_usage = Arc::clone(&seed.command_usage);
-	let completion = CompletionChain::new()
-		.source(Box::new(
-			SlashCommands::new(commands).with_usage(move |name| command_usage.count(name)),
-		))
-		.source(Box::new(DeferredCompletion::new(
-			[
-				('@', CompletionTrigger::Mention),
-				('#', CompletionTrigger::Hash),
-				(':', CompletionTrigger::Custom),
-			],
-			Arc::new(ProjectCompletionSource::scan(&seed.workspace_root)),
-		)));
-	chat.set_completion(Box::new(completion));
+	chat.set_ranked_slash_commands(commands, move |name| command_usage.count(name));
+	chat.set_completion(Box::new(DeferredCompletion::new(
+		[
+			('@', CompletionTrigger::Mention),
+			('#', CompletionTrigger::Hash),
+			(':', CompletionTrigger::Custom),
+		],
+		Arc::new(ProjectCompletionSource::scan(&seed.workspace_root)),
+	)));
 	chat.set_composer_style(seed.composer_style);
 	chat.set_spelling_features(seed.spelling);
+	chat.set_smooth_streaming(seed.smooth_streaming);
 	chat.set_hide_thinking(seed.hide_thinking);
 	chat
 }
 
 pub async fn run<C, R>(
-	executor: Executor,
 	mut agent: Agent<C>,
 	environment_host: &omp_envd::ProjectEnvironment,
 	session: ChatUiSession,
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	advisor_notices: flume::Receiver<Option<Str>>,
+	catalog: Arc<Catalog>,
 	registry: Arc<Registry>,
 	tree: Arc<AgentTree>,
 	parent: Arc<ChatParentHost<C>>,
 	collab: Option<CollabCommandHandle>,
+	collab_live: Option<omp_driver::collab::session::HostLiveHandle>,
+	mut collab_operations: Option<omp_driver::collab::session::HostOperationReceiver>,
+	collab_state: Option<omp_proto::collab::v1::SessionStateUpdate>,
 	modes: Arc<RegimeHandle>,
 	auth: Option<ChatAuth>,
 	auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	data_dir: PathBuf,
 	settings_manager: Arc<SettingsManager>,
+	prompt_discovery_settings: omp_driver::discovery::PromptDiscoverySettings,
 	telemetry_index: Arc<omp_storage::telemetry_index::TelemetryIndex>,
 	session_index: Arc<SessionIndex>,
 	workspace_root: PathBuf,
@@ -1299,6 +1759,7 @@ pub async fn run<C, R>(
 	mut list_sessions: R,
 	welcome: bool,
 	initial_draft: Str,
+	initial_submission: Option<Item>,
 	presentation: ChatPresentation,
 	presentation_endpoint: Option<presentation::PresentationEndpoint>,
 ) -> miette::Result<omp_chat_ui::host::HostOutcome>
@@ -1335,10 +1796,11 @@ where
 		.and_then(CollabCommandHandle::guest_replica)
 		.map(|replica| replica.subscribe());
 	let mut collab_presence = collab.as_ref().map(CollabCommandHandle::subscribe_presence);
-	let local_session_path = omp_env::project_state::directory(&data_dir, &workspace_root)
-		.into_diagnostic()?
-		.join("sessions")
-		.join(format!("{}.jsonl", session.session_id));
+	let local_session_path = session.journal_path.clone();
+	let sessions_dir = local_session_path
+		.parent()
+		.ok_or_else(|| miette::miette!("active session path has no storage directory"))?
+		.to_path_buf();
 	let mut session_restore = GuestSessionRestore::default();
 	let mut guest_projected = false;
 	// Turn deltas and their authoritative outcome share this stream. Dropping
@@ -1363,13 +1825,15 @@ where
 		.into_diagnostic()?;
 	let session_id = session.session_id.clone();
 	let mut roster_events = tree.watch_roster();
-	let mut roster_tick = executor.interval(Duration::from_millis(100));
+	let period = Duration::from_millis(100);
+	let mut roster_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+	roster_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 	let agent_state = agent.state().clone();
 	let abort = agent.abort_handle();
 	let startup_pending = startup_recovery_needed(
 		agent.journal().pending_turn().is_some(),
 		agent.journal().pending_input_submission().is_some(),
-	);
+	) || initial_submission.is_some();
 	modes.sync_regimes(agent.arbiter().regimes());
 
 	let submission_state = agent.state().clone();
@@ -1378,9 +1842,7 @@ where
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
 	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
 	let maintenance_registry = Arc::clone(&registry);
-	// The agent loop runs on the omp executor pool, whose threads have no tokio
-	// reactor; its deadline/watchdog/backoff timers need `TokioContext` to
-	// re-enter the app runtime on every poll.
+	let session_delete_index = Arc::clone(&session_index);
 	let agent_future = async move {
 		if startup_pending {
 			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
@@ -1475,15 +1937,10 @@ where
 							let journal = agent.journal().load().map_err(|error| error.to_string())?;
 							journal.header().cwd.clone()
 						};
-						let sessions_dir = child_path
+						let _sessions_dir = child_path
 							.parent()
 							.ok_or_else(|| String::from("child session path has no parent"))?;
-						let index_path = sessions_dir
-							.parent()
-							.unwrap_or(sessions_dir)
-							.join("sessions.sqlite3");
-						let index =
-							Arc::new(SessionIndex::open(index_path).map_err(|error| error.to_string())?);
+						let index = Arc::clone(&session_delete_index);
 						let session_id = SessionId(child_id);
 						let created_ms = now_ms();
 						let root_text = root.to_string_lossy();
@@ -1523,11 +1980,11 @@ where
 					let _ = reply.send(result);
 				},
 				UiCmd::DeleteCurrentSession { path, reply } => {
-					let expected = agent.journal().session_id().0.as_str();
+					let session_id = agent.journal().session_id().clone();
 					let matches = path
 						.file_stem()
 						.and_then(|stem| stem.to_str())
-						.is_some_and(|stem| stem == expected);
+						.is_some_and(|stem| stem == session_id.0.as_str());
 					if !matches {
 						let _ = reply.send(Err(String::from(
 							"refusing to delete a path that is not the live session",
@@ -1535,7 +1992,32 @@ where
 						continue;
 					}
 					drop(agent);
-					let result = fs::remove_file(&path).map_err(|error| error.to_string());
+					let tombstone =
+						path.with_extension(format!("jsonl.deleted-{}", omp_core::Ulid::generate()));
+					let result = (|| -> Result<(), String> {
+						fs::rename(&path, &tombstone).map_err(|error| error.to_string())?;
+						match session_delete_index.delete_session(&session_id) {
+							Ok(true) => {},
+							Ok(false) => {
+								let _ = fs::rename(&tombstone, &path);
+								return Err(String::from(
+									"session index no longer contains the live session",
+								));
+							},
+							Err(error) => {
+								let _ = fs::rename(&tombstone, &path);
+								return Err(error.to_string());
+							},
+						}
+						if let Err(error) = fs::remove_file(&tombstone) {
+							tracing::warn!(
+								path = %tombstone.display(),
+								%error,
+								"deleted session tombstone cleanup failed"
+							);
+						}
+						Ok(())
+					})();
 					let _ = reply.send(result);
 					break;
 				},
@@ -1567,14 +2049,14 @@ where
 			}
 		}
 	};
-	let mut agent_task = executor.spawn(TokioContext::new(agent_future, runtime::Handle::current()));
+	let mut agent_task = tokio::spawn(agent_future);
 
 	let caps = detect();
 	let ctx = terminal_ui_context(&caps);
 	let typed_commands = structural_roster(&command_sources, security_enabled);
 	let chat_commands = typed_commands.clone();
 	let commands = CommandRoster::new(command_sources);
-	let command_usage = Arc::new(CommandUsage::load(session_index).into_diagnostic()?);
+	let command_usage = Arc::new(CommandUsage::load(Arc::clone(&session_index)).into_diagnostic()?);
 	let initial_command_role = command_role(collab.as_ref());
 	let (backend_tx, backend_rx) = flume::unbounded();
 	let (intent_tx, intent_rx) = flume::unbounded();
@@ -1588,18 +2070,31 @@ where
 		.and_then(|reasoning| Effort::try_from(reasoning.effort).ok())
 		.and_then(status_thinking_level);
 	drop(snapshot);
+	let settings_home = env::var_os("HOME").map_or_else(|| workspace_root.clone(), PathBuf::from);
+	let model_settings = settings_manager
+		.snapshot()
+		.project::<ModelSettings>()
+		.into_diagnostic()?
+		.get()
+		.resolve_path_scopes(&workspace_root, &settings_home);
 	let mut state = BridgeState {
+		catalog,
 		model,
+		model_settings,
 		pending_session_delete: None,
 		git: None,
 		advisor,
 		session_id: session_id.clone(),
+		session_path: local_session_path.clone(),
+		sessions_dir,
 		title: session.title,
 		title_replan_refresh_pending: false,
 		local_root,
 		regimes: modes.as_ref().clone(),
 		regime_revision: modes.revision(),
 		collab,
+		collab_live,
+		collab_state,
 		environment,
 		memory: omp_driver::memory::chat_memory(&session_id),
 		workspace_root: Str::from(workspace_root.to_string_lossy().as_ref()),
@@ -1614,7 +2109,7 @@ where
 		cost_nanos: 0,
 		queued: 0,
 		queued_prompts: VecDeque::new(),
-		stt_enabled: false,
+		audio: crate::audio_coordinator::InteractiveAudioController::new(),
 		jobs: HashSet::new(),
 		attempt: 0,
 		turn_started: startup_pending.then(Instant::now),
@@ -1625,7 +2120,6 @@ where
 		streaming_tools: HashMap::new(),
 		tools: HashMap::new(),
 		rewind_targets: Vec::new(),
-		live_enabled: false,
 		live_activity: ActivityWaveform::new(),
 		token_rate: None,
 		tokens_per_second: None,
@@ -1634,6 +2128,7 @@ where
 		replaying_turn: false,
 		vision_override: None,
 		settings: omp_driver::settings::current(&data_dir).into_diagnostic()?,
+		prompt_discovery_settings,
 		commands,
 		command_usage: Arc::clone(&command_usage),
 		typed_commands,
@@ -1643,7 +2138,19 @@ where
 		extension_mcp: None,
 		extension_live_mcp: HashMap::new(),
 		approvals: HashMap::new(),
+		presentation_requests: HashMap::new(),
+		raw_stream: None,
 	};
+	if let Err(error) = apply_configured_theme(&backend_tx, &data_dir, &mut state) {
+		send_backend(
+			&backend_tx,
+			BackendEvent::Error(sf!("Could not apply configured theme: {error}")),
+		);
+		send_backend(
+			&backend_tx,
+			BackendEvent::ThemePreview(omp_tui::Theme::for_appearance(state.appearance)),
+		);
+	}
 	let chat_seed = ChatSceneSeed {
 		typed_commands: chat_commands,
 		command_usage,
@@ -1656,13 +2163,11 @@ where
 			autocomplete:   state.settings.spelling.autocomplete,
 			autocorrect:    state.settings.spelling.autocorrect,
 		},
+		smooth_streaming: state.settings.display.smooth_streaming,
 		hide_thinking,
 	};
 
-	send_backend(&backend_tx, BackendEvent::ModelsUpdated {
-		rows:    model_rows(Catalog::embedded()),
-		current: current_model_index(Catalog::embedded(), &state.model),
-	});
+	send_models_updated(&backend_tx, &state);
 	if welcome {
 		match list_sessions() {
 			Ok(choices) => send_backend(&backend_tx, BackendEvent::Sessions(session_rows(choices))),
@@ -1678,17 +2183,43 @@ where
 		&mut state.part_serial,
 		renderers.as_ref(),
 	);
+	if let Some(item) = initial_submission {
+		replay_items(
+			&backend_tx,
+			std::slice::from_ref(&item),
+			&mut state.tools,
+			&mut state.part_serial,
+			renderers.as_ref(),
+		);
+		ui_tx
+			.send_async(UiCmd::Submit { item: Box::new(item), budget: None })
+			.await
+			.into_diagnostic()?;
+	}
 	send_status(&backend_tx, &state, &bus, 0);
 	let mut last_roster = project_agent_roster(&parent, &tree, &session_id);
 	send_backend(&backend_tx, BackendEvent::AgentRoster(last_roster.clone()));
+	publish_collaboration_registry(state.collab_live.as_ref(), parent.as_ref(), session_id.as_str());
 
-	let bridge_executor = executor.clone();
+	let bridge_data_dir = data_dir.clone();
 	let mcp_inspector = environment_host.mcp_inspector();
 	let extension_reload = environment_host.extension_reload_handle();
 	let bridge = async move {
 		let mut presentation_endpoint = presentation_endpoint;
 		loop {
 			tokio::select! {
+							frame = next_raw_stream_frame(&mut state.raw_stream) => {
+								let summary = omp_inference::transport::global_provider_capture()
+									.snapshot(Some(state.session_id.as_str()))
+									.summary;
+								send_backend(
+									&backend_tx,
+									BackendEvent::RawStreamFrame {
+										frame: raw_frame(frame),
+										summary: stream_summary(summary),
+									},
+								);
+							},
 							Some(_event) = next_extension_mcp_event(&mut state.extension_mcp) => {
 								let live =
 									commands::snapshot_live_mcp(&mcp_inspector);
@@ -1728,11 +2259,49 @@ where
 									presentation_endpoint.as_ref().expect("dispatch requires endpoint"),
 									dispatch,
 									&backend_tx,
-									&state,
+									&mut state,
 								);
 							},
 							intent = intent_rx.recv_async() => {
 								let Ok(intent) = intent else { break };
+								if let Intent::UiResponse { correlation, response } = &intent {
+									if let Some((dispatch_id, request)) =
+										state.presentation_requests.remove(correlation.as_str())
+										&& let Some(endpoint) = presentation_endpoint.as_ref()
+									{
+										let result = presentation_response(request, response.clone());
+										let _ = endpoint.complete(dispatch_id, result);
+									}
+									continue;
+								}
+								if let Intent::UiOverlayEvent(event) = &intent {
+									let pending = state
+										.presentation_requests
+										.iter()
+										.find_map(|(correlation, (dispatch_id, request))| {
+											matches!(
+												request,
+												presentation_authority::PresentationRequest::OverlayEvents { id }
+													if id.as_str() == event.overlay_id
+											)
+											.then(|| (correlation.clone(), *dispatch_id))
+										});
+									if let Some((correlation, dispatch_id)) = pending {
+										state.presentation_requests.remove(correlation.as_str());
+										if let Some(endpoint) = presentation_endpoint.as_ref() {
+											let value = serde_json::json!({
+												"id": event.overlay_id,
+												"kind": event.kind,
+												"value": event.value,
+											});
+											let _ = endpoint.complete(
+												dispatch_id,
+												Ok(presentation_authority::PresentationResponse::OverlayEvents(vec![value])),
+											);
+										}
+									}
+									continue;
+								}
 								if matches!(&intent, Intent::InspectHistory) {
 									match crate::render_cmd::history_frame(
 										&local_session_path,
@@ -1753,7 +2322,6 @@ where
 									continue;
 								}
 								if handle_intent(
-									&bridge_executor,
 									&mcp_inspector,
 									intent,
 									&backend_tx,
@@ -1767,8 +2335,9 @@ where
 									auth.as_ref(),
 									auth_control.as_ref(),
 									&extension_reload,
-									&data_dir,
+									&bridge_data_dir,
 									settings_manager.as_ref(),
+									session_index.as_ref(),
 									telemetry_index.as_ref(),
 									&mut list_sessions,
 									&bus,
@@ -1936,13 +2505,37 @@ where
 								}
 								send_status(&backend_tx, &state, &bus, 0);
 							},
+							operation = next_host_operation(&mut collab_operations) => {
+								handle_collaboration_operation(
+									operation,
+									parent.as_ref(),
+									&abort,
+									modes.as_ref(),
+									&ui_tx,
+									&backend_tx,
+									&mut state,
+									&bus,
+								)
+								.await;
+							},
 							Ok(event) = agent_events.recv() => {
 								if guest_projected {
 									continue;
 								}
 								if matches!(&*event, AgentEvent::RosterChanged { .. }) {
 									publish_agent_roster(&backend_tx, &parent, &tree, &session_id, &mut last_roster);
+									publish_collaboration_registry(
+										state.collab_live.as_ref(),
+										parent.as_ref(),
+										session_id.as_str(),
+									);
 								} else {
+									if let Some(stream) = collaboration_stream_event(event.as_ref())
+										&& let Some(live) = state.collab_live.as_ref()
+										&& let Err(error) = live.send_stream(stream).await
+									{
+										tracing::warn!(%error, "collaboration stream projection failed");
+									}
 									handle_agent_event(
 										&backend_tx,
 										&mut state,
@@ -1958,7 +2551,7 @@ where
 								let generation = *roster_events.borrow_and_update();
 								bus.publish(AgentEvent::RosterChanged { generation });
 							},
-							_ = roster_tick.next() => {
+							_ = roster_tick.tick() => {
 								if project_agent_roster(&parent, &tree, &session_id) != last_roster {
 									bus.publish(AgentEvent::RosterChanged {
 										generation: tree.roster_generation(),
@@ -1985,15 +2578,16 @@ where
 		error_notify: true,
 		title_enabled,
 		resize_scrollback,
+		input_actions: load_input_actions(&data_dir)?,
 	};
 	let (host_result, bridge_result): (
 		miette::Result<omp_chat_ui::host::HostOutcome>,
 		miette::Result<()>,
 	) = match presentation {
 		ChatPresentation::Terminal => {
+			let chat = chat_scene(&chat_seed, &ctx);
 			let host = omp_chat_ui::host::run_with_draft(
-				executor.clone(),
-				chat_scene(&chat_seed, &ctx),
+				chat,
 				ctx,
 				backend_rx,
 				intent_tx,
@@ -2005,16 +2599,9 @@ where
 		},
 		ChatPresentation::Gui => {
 			let (host_result, bridge_result) = gui::run(
-				&executor,
 				move |ctx| {
-					RetainedChat::new(
-						chat_scene(&chat_seed, ctx),
-						ctx.clone(),
-						backend_rx,
-						intent_tx,
-						options,
-						initial_draft,
-					)
+					let chat = chat_scene(&chat_seed, ctx);
+					RetainedChat::new(chat, ctx.clone(), backend_rx, intent_tx, options, initial_draft)
 				},
 				bridge,
 			);
@@ -2023,21 +2610,54 @@ where
 	};
 	task_settings_watch.abort();
 	let _ = task_settings_watch.await;
-	if executor
-		.timeout(Duration::from_secs(3), &mut agent_task)
+	if tokio::time::timeout(Duration::from_secs(3), &mut agent_task)
 		.await
 		.is_err()
 	{
-		drop(agent_task);
+		agent_task.abort();
 	}
 	bridge_result?;
 	host_result
 }
 
+fn guest_ui_request(request: omp_proto::collab::v1::UiRequest) -> UiRequest {
+	use omp_proto::collab::v1::ui_request::Spec;
+	let kind = match request.spec {
+		Some(Spec::Select(select)) => ui_request::Kind::Dialog(Dialog {
+			kind:    String::from("select"),
+			title:   request.title,
+			content: None,
+			choices: select
+				.options
+				.into_iter()
+				.map(|option| option.label)
+				.collect(),
+		}),
+		Some(Spec::Editor(editor)) => ui_request::Kind::Dialog(Dialog {
+			kind:    String::from("editor"),
+			title:   request.title,
+			content: editor.prefill.as_deref().and_then(|prefill| {
+				presentation_tml(Some(&Value::String(format!("<text>{prefill}</text>"))))
+			}),
+			choices: Vec::new(),
+		}),
+		None => ui_request::Kind::Dialog(Dialog {
+			kind:    String::from("confirm"),
+			title:   request.title,
+			content: None,
+			choices: Vec::new(),
+		}),
+	};
+	UiRequest {
+		owner_invocation: u64::from(request.request_id),
+		kind:             Some(kind),
+		props:            None,
+	}
+}
+
 /// Runs a standalone collaboration composer backed only by the durable guest
 /// transcript projection and the host-authorized prompt forwarding handle.
 pub async fn run_guest(
-	executor: Executor,
 	replica: omp_collab::guest::GuestReplicaHandle,
 	collab: CollabCommandHandle,
 	registry: Arc<Registry>,
@@ -2074,8 +2694,9 @@ pub async fn run_guest(
 	);
 	send_backend(&backend_tx, BackendEvent::Status(guest_status(&collab)));
 	let mut presence = collab.subscribe_presence();
+	let mut guest_live = collab.subscribe_guest_live();
+	let guest_events = collab.guest_presentation();
 
-	let bridge_executor = executor.clone();
 	let bridge = async {
 		loop {
 			tokio::select! {
@@ -2095,6 +2716,27 @@ pub async fn run_guest(
 								),
 							}
 						},
+						Intent::UiResponse { correlation, response } => {
+							let request_id = correlation
+								.parse::<u32>()
+								.map_err(|_| miette::miette!("invalid collaboration UI correlation"))?;
+							let value = match response.kind {
+								Some(omp_proto::omp::ui::v1::ui_response::Kind::DialogOutcome(outcome)) => {
+									outcome.value.map(Str::from).or_else(|| outcome.values.into_iter().next().map(Str::from))
+								},
+								Some(omp_proto::omp::ui::v1::ui_response::Kind::Text(text)) => Some(Str::from(text.value)),
+								_ => None,
+							};
+							if let Err(error) = collab
+								.request(omp_driver::collab::session::CollabOwnerCommand::UiResponse {
+									request_id,
+									value,
+								})
+								.await
+							{
+								send_backend(&backend_tx, BackendEvent::Error(Str::new(error.to_string())));
+							}
+						},
 						Intent::Submit { text, attachments, .. } => {
 							let read_only = collab
 								.presence()
@@ -2112,9 +2754,7 @@ pub async fn run_guest(
 											AttachmentContent::Image { source, .. } => {
 												const REMOTE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
 												let source = source.to_string();
-												let metadata_path = source.clone();
-												let metadata = bridge_executor
-													.unblock(move || fs::metadata(metadata_path))
+												let metadata = tokio::fs::metadata(&source)
 													.await
 													.into_diagnostic()?;
 												if metadata.len() > REMOTE_IMAGE_MAX_BYTES {
@@ -2129,8 +2769,7 @@ pub async fn run_guest(
 												let mime_type = image::ImageFormat::from_path(source.as_str())
 													.map(|format| format.to_mime_type())
 													.unwrap_or("application/octet-stream");
-												let data = bridge_executor
-													.unblock(move || fs::read(source))
+												let data = tokio::fs::read(source)
 													.await
 													.into_diagnostic()?;
 												images.push(omp_driver::collab::session::RemoteImage {
@@ -2229,13 +2868,79 @@ pub async fn run_guest(
 					}
 					send_backend(&backend_tx, BackendEvent::Status(guest_status(&collab)));
 				},
+				changed = guest_live.changed() => {
+					if changed.is_err() {
+						break;
+					}
+					let projection = guest_live.borrow_and_update().clone();
+					send_backend(
+						&backend_tx,
+						BackendEvent::AgentRoster(guest_agent_rows(&projection.agents)),
+					);
+					if let Some(state) = projection.state {
+						let mut status = guest_status(&collab);
+						status.model = state
+							.model
+							.map_or_else(|| sf!("Collaboration"), |model| Str::new(model.name));
+						status.working = state.is_streaming;
+						status.queued = state.queued_message_count as usize;
+						status.context_tokens = state.context_usage.as_ref().map_or(0, |usage| usage.tokens);
+						status.context_window = state.context_usage.map(|usage| usage.context_window);
+						send_backend(&backend_tx, BackendEvent::Status(status));
+					}
+				},
+				event = guest_events.recv() => {
+					let Ok(event) = event else { break };
+					match event {
+						omp_driver::collab::session::GuestPresentationEvent::Resync => {
+							send_backend(&backend_tx, BackendEvent::AuthPromptClose);
+						},
+						omp_driver::collab::session::GuestPresentationEvent::Stream(stream) => {
+							if let Some(notice) = stream.notice {
+								let event = if notice.level
+									== omp_proto::collab::v1::notice::Level::Error as i32
+								{
+									BackendEvent::Error(Str::new(notice.message))
+								} else {
+									BackendEvent::Notice(Str::new(notice.message))
+								};
+								send_backend(&backend_tx, event);
+							}
+							if let Some(item) = stream.item {
+								replay_items(
+									&backend_tx,
+									&[item],
+									&mut tools,
+									&mut serial,
+									renderers.as_ref(),
+								);
+							}
+						},
+						omp_driver::collab::session::GuestPresentationEvent::UiRequest(request) => {
+							let correlation = Str::from(request.request_id.to_string());
+							send_backend(&backend_tx, BackendEvent::UiRequest {
+								correlation,
+								request: guest_ui_request(request),
+							});
+						},
+						omp_driver::collab::session::GuestPresentationEvent::UiRequestEnd(_) => {},
+						omp_driver::collab::session::GuestPresentationEvent::Transcript(chunk) => {
+							if let Some(error) = chunk.error {
+								send_backend(&backend_tx, BackendEvent::Error(Str::new(error)));
+							}
+						},
+						omp_driver::collab::session::GuestPresentationEvent::Bus(_) => {},
+						omp_driver::collab::session::GuestPresentationEvent::Error(error) => {
+							send_backend(&backend_tx, BackendEvent::Error(Str::new(error.message)));
+						},
+					}
+				},
 			}
 		}
 		Ok::<(), miette::Report>(())
 	};
 
 	let host = omp_chat_ui::host::run_with_draft(
-		executor,
 		chat,
 		ctx,
 		backend_rx,
@@ -2247,12 +2952,61 @@ pub async fn run_guest(
 			error_notify:           true,
 			title_enabled:          true,
 			resize_scrollback:      omp_chat_ui::host::ResizeScrollback::Rebuild,
+			input_actions:          Vec::new(),
 		},
 		initial_draft,
 	);
 	let (host_result, bridge_result) = tokio::join!(host, bridge);
 	bridge_result?;
 	host_result.into_diagnostic()
+}
+
+fn guest_agent_rows(snapshot: &omp_proto::collab::v1::RegistrySnapshot) -> Vec<AgentRow> {
+	snapshot
+		.agents
+		.iter()
+		.map(|agent| {
+			let status = omp_proto::collab::v1::agent_summary::Status::try_from(agent.status)
+				.unwrap_or(omp_proto::collab::v1::agent_summary::Status::Idle);
+			AgentRow {
+				id:               Str::new(&agent.id),
+				name:             Str::new(&agent.display_name),
+				parent:           agent.parent_id.as_deref().map(Str::new),
+				depth:            u16::from(agent.parent_id.is_some()),
+				status:           Str::new(status.as_str_name()),
+				tool:             None,
+				tokens:           None,
+				definition:       None,
+				model:            None,
+				serving_model:    None,
+				transcript:       Str::default(),
+				assignment:       None,
+				requests:         0,
+				tool_calls:       0,
+				context_tokens:   0,
+				cost_micros:      0,
+				terminal_kind:    None,
+				terminal_summary: None,
+				artifact_uri:     None,
+				frozen:           matches!(
+					status,
+					omp_proto::collab::v1::agent_summary::Status::Aborted
+				),
+				can_steer:        matches!(
+					status,
+					omp_proto::collab::v1::agent_summary::Status::Running
+				),
+				can_revive:       matches!(
+					status,
+					omp_proto::collab::v1::agent_summary::Status::Parked
+				),
+				can_kill:         matches!(
+					status,
+					omp_proto::collab::v1::agent_summary::Status::Running
+				),
+			}
+		})
+		.collect()
 }
 
 fn guest_status(collab: &CollabCommandHandle) -> StatusFacts {
@@ -2687,7 +3441,6 @@ fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 
 struct LiveCommandHost<'a, R> {
 	mcp_inspector:    &'a omp_envd::McpInspectorHandle,
-	executor:         &'a Executor,
 	backend:          &'a flume::Sender<BackendEvent>,
 	commands_tx:      &'a flume::Sender<UiCmd>,
 	abort:            &'a omp_agent::AbortHandle,
@@ -2700,6 +3453,8 @@ struct LiveCommandHost<'a, R> {
 	mailbox:          &'a omp_agent::MailboxSender,
 	extension_reload: &'a omp_envd::ExtensionReloadHandle,
 	data_dir:         &'a Path,
+	settings_manager: &'a SettingsManager,
+	session_index:    &'a SessionIndex,
 	list_sessions:    &'a mut R,
 	bus:              &'a omp_agent::EventBus,
 	registry:         &'a Registry,
@@ -2711,6 +3466,28 @@ struct LiveCommandHost<'a, R> {
 
 fn silent_command() -> CommandFuture<'static> {
 	Box::pin(async { Ok(CommandResult::Consumed(ConsumedResult::silent())) })
+}
+
+fn toggle_live_voice(backend: &flume::Sender<BackendEvent>, state: &mut BridgeState) {
+	if state.audio.live_active() {
+		state.audio.stop_live();
+		send_backend(backend, BackendEvent::LiveVoiceStopped);
+		send_backend(backend, BackendEvent::Notice(sf!("Live voice stopped.")));
+		return;
+	}
+	match state.audio.start_live() {
+		Ok(()) => {
+			state.live_activity = ActivityWaveform::new();
+			send_backend(backend, BackendEvent::LiveVoiceStarted);
+			send_backend(
+				backend,
+				BackendEvent::Notice(sf!("Live voice started. Space mutes; Escape or Ctrl+C closes.")),
+			);
+		},
+		Err(error) => {
+			send_backend(backend, BackendEvent::Error(sf!("Could not start live voice: {error}")))
+		},
+	}
 }
 
 fn append_hotkeys(mut help: String) -> String {
@@ -2743,7 +3520,7 @@ impl<R> LiveCommandHost<'_, R> {
 				switch_model(
 					self.backend,
 					self.agent_state,
-					self.data_dir,
+					self.settings_manager,
 					selector.as_str(),
 					self.state,
 					self.control,
@@ -3078,11 +3855,10 @@ where
 				}
 			};
 			let child_id = Str::from(omp_core::Ulid::generate().to_string());
-			let root = Path::new(self.state.workspace_root.as_str());
-			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
-				.into_diagnostic()?
-				.join("sessions");
-			let child_path = sessions_dir.join(sf!("{child_id}.jsonl").as_str());
+			let child_path = self
+				.state
+				.sessions_dir
+				.join(sf!("{child_id}.jsonl").as_str());
 			let (reply_tx, reply_rx) = flume::bounded(1);
 			self
 				.commands_tx
@@ -3126,11 +3902,10 @@ where
 				)));
 			}
 			let child_id = Str::from(omp_core::Ulid::generate().to_string());
-			let root = Path::new(self.state.workspace_root.as_str());
-			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
-				.into_diagnostic()?
-				.join("sessions");
-			let child_path = sessions_dir.join(sf!("{child_id}.jsonl").as_str());
+			let child_path = self
+				.state
+				.sessions_dir
+				.join(sf!("{child_id}.jsonl").as_str());
 			let label = title.clone().unwrap_or_else(|| child_id.clone());
 			let (reply_tx, reply_rx) = flume::bounded(1);
 			self
@@ -3169,27 +3944,20 @@ where
 
 	fn branch_tree(&mut self) -> CommandFuture<'_> {
 		let result = (|| -> miette::Result<Str> {
-			let root = Path::new(self.state.workspace_root.as_str());
-			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
-				.into_diagnostic()?
-				.join("sessions");
 			let current = SessionId(self.state.session_id.clone());
-			let index_path = sessions_dir
-				.parent()
-				.unwrap_or(sessions_dir.as_path())
-				.join("sessions.sqlite3");
-			let root_id = if index_path.is_file() {
-				SessionIndex::open_authoritative_reader(&index_path)
-					.into_diagnostic()?
-					.lineage(&current)
-					.into_diagnostic()?
-					.first()
-					.map_or_else(|| current.0.clone(), |link| link.id.0.clone())
-			} else {
-				current.0.clone()
-			};
-			let tree = SessionTree::load(&sessions_dir.join(sf!("{root_id}.jsonl").as_str()))
-				.map_err(|error| miette::miette!("{error}"))?;
+			let root_id = self
+				.session_index
+				.lineage(&current)
+				.into_diagnostic()?
+				.first()
+				.map_or_else(|| current.0.clone(), |link| link.id.0.clone());
+			let tree = SessionTree::load(
+				&self
+					.state
+					.sessions_dir
+					.join(sf!("{root_id}.jsonl").as_str()),
+			)
+			.map_err(|error| miette::miette!("{error}"))?;
 			Ok(Str::from(omp_driver::export::render_lineage(&tree, current.0.as_str())))
 		})();
 		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(result?))) })
@@ -3214,14 +3982,9 @@ where
 						)))
 					});
 				}
-				let root = Path::new(self.state.workspace_root.as_str());
-				let sessions_dir =
-					match omp_env::project_state::directory(self.data_dir, root).into_diagnostic() {
-						Ok(directory) => directory.join("sessions"),
-						Err(error) => return Box::pin(async move { Err(error) }),
-					};
+				let sessions_dir = self.state.sessions_dir.clone();
 				let session_id = self.state.session_id.clone();
-				let path = sessions_dir.join(sf!("{session_id}.jsonl").as_str());
+				let path = self.state.session_path.clone();
 				if !path.is_file() {
 					return Box::pin(async {
 						Ok(CommandResult::Consumed(ConsumedResult::status(
@@ -3294,13 +4057,7 @@ where
 				} else {
 					self.state.session_id.clone()
 				};
-				let root = Path::new(self.state.workspace_root.as_str());
-				let sessions_dir =
-					match omp_env::project_state::directory(self.data_dir, root).into_diagnostic() {
-						Ok(directory) => directory.join("sessions"),
-						Err(error) => return Box::pin(async move { Err(error) }),
-					};
-				let result = PinStore::new(&sessions_dir)
+				let result = PinStore::new(&self.state.sessions_dir)
 					.toggle(&SessionId(session))
 					.into_diagnostic();
 				Box::pin(async move {
@@ -3331,15 +4088,89 @@ where
 					if roots.primary() == root {
 						sf!("The future primary workspace root is already `{}`.", root.display())
 					} else {
-						control
-							.move_workspace_root(now_ms(), root.clone())
-							.await
-							.into_diagnostic()?;
+						let source_path = self.state.session_path.clone();
+						let source_default = omp_env::project_state::directory(self.data_dir, &current)
+							.into_diagnostic()?
+							.join("sessions");
+						let uses_project_store = self.state.sessions_dir == source_default;
+						let destination_state =
+							omp_env::project_state::directory(self.data_dir, &root).into_diagnostic()?;
+						let destination_dir = if uses_project_store {
+							destination_state.join("sessions")
+						} else {
+							self.state.sessions_dir.clone()
+						};
+						fs::create_dir_all(&destination_dir).into_diagnostic()?;
+						let destination_path = destination_dir.join(
+							source_path
+								.file_name()
+								.ok_or_else(|| miette::miette!("active session path has no filename"))?,
+						);
+						let destination_index = if uses_project_store {
+							Some(
+								SessionIndex::open(destination_state.join("sessions.sqlite3"))
+									.into_diagnostic()?,
+							)
+						} else {
+							None
+						};
+						let destination_index = destination_index.as_ref().unwrap_or(self.session_index);
+						let moved_file = destination_path != source_path;
+						if moved_file {
+							omp_driver::session_state::relocate_journal(&source_path, &destination_path)
+								.into_diagnostic()?;
+						}
+						let session_id = SessionId(self.state.session_id.clone());
+						let root_text = root.to_string_lossy();
+						match self.session_index.relocate_session(
+							destination_index,
+							&session_id,
+							root_text.as_ref(),
+							root_text.as_ref(),
+						) {
+							Ok(true) => {},
+							Ok(false) => {
+								if moved_file {
+									let _ = omp_driver::session_state::relocate_journal(
+										&destination_path,
+										&source_path,
+									);
+								}
+								return Err(miette::miette!("active session is absent from its index"));
+							},
+							Err(error) => {
+								if moved_file {
+									let _ = omp_driver::session_state::relocate_journal(
+										&destination_path,
+										&source_path,
+									);
+								}
+								return Err(miette::miette!(error));
+							},
+						}
+						if let Err(error) = control.move_workspace_root(now_ms(), root.clone()).await {
+							let current_text = current.to_string_lossy();
+							let _ = destination_index.relocate_session(
+								self.session_index,
+								&session_id,
+								current_text.as_ref(),
+								current_text.as_ref(),
+							);
+							if moved_file {
+								let _ = omp_driver::session_state::relocate_journal(
+									&destination_path,
+									&source_path,
+								);
+							}
+							return Err(error).into_diagnostic();
+						}
+						self.state.session_path = destination_path;
+						self.state.sessions_dir = destination_dir;
 						sf!(
-							"Future primary workspace root set to `{}`. The live session remains rooted \
-							 at `{}`; resume this session for the change to take effect.",
-							root.display(),
-							current.display()
+							"Session storage moved to `{}` and future workspace root set to `{}`. Resume \
+							 this session for the workspace change to take effect.",
+							self.state.session_path.display(),
+							root.display()
 						)
 					}
 				},
@@ -3355,11 +4186,22 @@ where
 	}
 
 	fn debug(&mut self, inspector: Option<Str>) -> CommandFuture<'_> {
+		if inspector.as_deref() == Some("raw-stream") {
+			let capture = omp_inference::transport::global_provider_capture();
+			let snapshot = capture.snapshot(Some(self.state.session_id.as_str()));
+			self.state.raw_stream = Some(capture.subscribe(Some(self.state.session_id.as_str())));
+			send_backend(self.backend, BackendEvent::OpenRawStream {
+				frames:  snapshot.frames.into_iter().map(raw_frame).collect(),
+				summary: stream_summary(snapshot.summary),
+			});
+			return silent_command();
+		}
 		let rendered = commands::render_debug(
 			inspector.as_deref(),
 			self.data_dir,
 			self.state.workspace_root.as_str(),
 			self.state.session_id.as_str(),
+			&self.state.session_path,
 		);
 		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(rendered?))) })
 	}
@@ -3390,7 +4232,7 @@ where
 				switch_model(
 					self.backend,
 					self.agent_state,
-					self.data_dir,
+					self.settings_manager,
 					target.as_str(),
 					self.state,
 					self.control,
@@ -3432,16 +4274,19 @@ where
 			send_backend(self.backend, BackendEvent::Error(sf!(GATEWAY_LOGIN_MESSAGE)));
 			return silent_command();
 		}
-		let current = model_provider(Catalog::embedded(), &self.state.model);
+		let current = model_provider(self.state.catalog.as_ref(), &self.state.model);
 		send_backend(
 			self.backend,
-			BackendEvent::LoginProviders(provider_rows(Catalog::embedded(), current.as_deref())),
+			BackendEvent::LoginProviders(provider_rows(
+				self.state.catalog.as_ref(),
+				current.as_deref(),
+			)),
 		);
 		silent_command()
 	}
 
 	fn providers(&mut self) -> CommandFuture<'_> {
-		let catalog = Catalog::embedded();
+		let catalog = self.state.catalog.as_ref();
 		let accounts = self
 			.auth_control
 			.map(|control| control.accounts(None))
@@ -3531,7 +4376,9 @@ where
 		let accounts = control.accounts(None);
 		let requested = provider;
 		let Some(requested) = requested else {
-			let rows = Catalog::embedded()
+			let rows = self
+				.state
+				.catalog
 				.providers()
 				.iter()
 				.filter_map(|provider| {
@@ -3582,7 +4429,10 @@ where
 				}
 			});
 		}
-		let Some(provider) = Catalog::embedded().provider(&ProviderId::from_ref(requested.as_str()))
+		let Some(provider) = self
+			.state
+			.catalog
+			.provider(&ProviderId::from_ref(requested.as_str()))
 		else {
 			send_backend(
 				self.backend,
@@ -4263,10 +5113,10 @@ where
 					return Ok(CommandResult::Consumed(ConsumedResult::status("No todos to copy.")));
 				}
 				let markdown = view.rendered.clone();
-				let copied = self
-					.executor
-					.unblock(move || omp_tui::paste::write_clipboard_text(&markdown))
-					.await;
+				let copied =
+					tokio::task::spawn_blocking(move || omp_tui::paste::write_clipboard_text(&markdown))
+						.await
+						.unwrap_or(false);
 				if !copied {
 					return Err(miette::miette!("system clipboard is unavailable"));
 				}
@@ -4430,7 +5280,7 @@ where
 			_ => return self.unavailable("Usage: /fast [on|off|status]"),
 		};
 		if requested == Some(true) {
-			let supported = resolve_model(Catalog::embedded(), self.state.model.as_str())
+			let supported = resolve_model(self.state.catalog.as_ref(), self.state.model.as_str())
 				.and_then(|model| model.capabilities.chat.as_ref())
 				.and_then(|chat| chat.service_tiers.constraints())
 				.is_some_and(|tiers| tiers.iter().any(|tier| tier.priority > 0));
@@ -4527,13 +5377,9 @@ where
 		let parent = Arc::clone(&self.parent);
 		let workspace_root = PathBuf::from(self.state.workspace_root.as_str());
 		Box::pin(async move {
-			let path = commands::asides::forge_ttsr(
-				self.executor,
-				parent.as_ref(),
-				workspace_root,
-				instruction.as_str(),
-			)
-			.await?;
+			let path =
+				commands::asides::forge_ttsr(parent.as_ref(), workspace_root, instruction.as_str())
+					.await?;
 			Ok(CommandResult::Consumed(ConsumedResult::status(Str::from(format!(
 				"Saved durable TTSR rule to `{}`.",
 				path.display()
@@ -4542,7 +5388,7 @@ where
 	}
 
 	fn live(&mut self, _: Str) -> CommandFuture<'_> {
-		self.state.live_enabled = !self.state.live_enabled;
+		toggle_live_voice(self.backend, self.state);
 		send_status(self.backend, self.state, self.bus, self.dropped);
 		silent_command()
 	}
@@ -4630,7 +5476,7 @@ where
 		} else {
 			"disabled"
 		};
-		let capability = if model_accepts_images(&self.state.model) {
+		let capability = if model_accepts_images(self.state.catalog.as_ref(), &self.state.model) {
 			"native image input"
 		} else {
 			"text-only image input"
@@ -4713,15 +5559,7 @@ where
 	fn export(&mut self, request: commands::ExportRequest) -> CommandFuture<'_> {
 		let backend = self.backend;
 		let workspace = PathBuf::from(self.state.workspace_root.as_str());
-		let state_dir = match omp_env::project_state::directory(self.data_dir, &workspace) {
-			Ok(state_dir) => state_dir,
-			Err(_) => {
-				return self.unavailable("project state directory is unavailable");
-			},
-		};
-		let journal = state_dir
-			.join("sessions")
-			.join(format!("{}.jsonl", self.state.session_id));
+		let journal = self.state.session_path.clone();
 		let export_theme = self
 			.state
 			.theme_watcher
@@ -4828,6 +5666,7 @@ where
 				let extension_reload = self.extension_reload;
 				let backend = self.backend;
 				let data_dir = self.data_dir;
+				let settings_manager = self.settings_manager;
 				let registry = self.registry;
 				let mcp_inspector = self.mcp_inspector;
 				let state = &mut *self.state;
@@ -4849,7 +5688,22 @@ where
 							.await
 							.map_err(|error| miette::miette!("{error}"))?;
 						let workspace = PathBuf::from(state.workspace_root.as_str());
-						let content = omp_driver::discovery::active_content_snapshots(&workspace);
+						let home = env::var_os("HOME").map_or_else(|| workspace.clone(), PathBuf::from);
+						let model_settings = settings_manager
+							.snapshot()
+							.project::<ModelSettings>()
+							.into_diagnostic()?
+							.get()
+							.resolve_path_scopes(&workspace, &home);
+						state.prompt_discovery_settings.model = model_settings.clone();
+						let content = omp_driver::discovery::active_prompt_snapshots(
+							&workspace,
+							&[],
+							&home,
+							&state.prompt_discovery_settings,
+						)
+						.content;
+						state.model_settings = model_settings;
 						let sources = vec![content.commands.iter().cloned().map(Into::into).collect()];
 						let security_enabled = state
 							.typed_commands
@@ -4887,15 +5741,7 @@ where
 	fn share(&mut self, args: Str) -> CommandFuture<'_> {
 		let backend = self.backend;
 		let workspace = PathBuf::from(self.state.workspace_root.as_str());
-		let state_dir = match omp_env::project_state::directory(self.data_dir, &workspace) {
-			Ok(state_dir) => state_dir,
-			Err(_) => {
-				return self.unavailable("project state directory is unavailable");
-			},
-		};
-		let journal = state_dir
-			.join("sessions")
-			.join(format!("{}.jsonl", self.state.session_id));
+		let journal = self.state.session_path.clone();
 		let data_dir = self.data_dir.to_owned();
 		let export_settings = self.state.settings.export;
 		let share_settings = self.state.settings.share.clone();
@@ -5299,7 +6145,6 @@ async fn maybe_generate_session_title<C>(
 }
 
 async fn handle_intent<C, R>(
-	executor: &Executor,
 	mcp_inspector: &omp_envd::McpInspectorHandle,
 	intent: Intent,
 	backend: &flume::Sender<BackendEvent>,
@@ -5315,6 +6160,7 @@ async fn handle_intent<C, R>(
 	extension_reload: &omp_envd::ExtensionReloadHandle,
 	data_dir: &Path,
 	settings_manager: &SettingsManager,
+	session_index: &SessionIndex,
 	telemetry_index: &omp_storage::telemetry_index::TelemetryIndex,
 	list_sessions: &mut R,
 	bus: &omp_agent::EventBus,
@@ -5328,6 +6174,23 @@ where
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	match intent {
+		Intent::UiResponse { correlation, .. } => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!(
+					"UI response `{correlation}` arrived after its presentation owner detached."
+				)),
+			);
+		},
+		Intent::UiOverlayEvent(event) => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!(
+					"Overlay event for `{}` arrived after its presentation owner detached.",
+					event.overlay_id
+				)),
+			);
+		},
 		Intent::Submit { text, attachments, mode } => {
 			if let Some(handle) = state.collab.clone()
 				&& let Some(presence) = handle.presence()
@@ -5347,10 +6210,7 @@ where
 								AttachmentContent::Image { source, .. } => {
 									const REMOTE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
 									let source = source.to_string();
-									let metadata_path = source.clone();
-									let Ok(metadata) =
-										executor.unblock(move || fs::metadata(metadata_path)).await
-									else {
+									let Ok(metadata) = tokio::fs::metadata(&source).await else {
 										send_backend(
 											backend,
 											BackendEvent::Error(sf!(
@@ -5371,7 +6231,7 @@ where
 									let mime_type = image::ImageFormat::from_path(source.as_str())
 										.map(|format| format.to_mime_type())
 										.unwrap_or("application/octet-stream");
-									let Ok(data) = executor.unblock(move || fs::read(source)).await else {
+									let Ok(data) = tokio::fs::read(source).await else {
 										send_backend(
 											backend,
 											BackendEvent::Error(sf!(
@@ -5468,7 +6328,6 @@ where
 			}
 			let mut command_host = LiveCommandHost {
 				mcp_inspector,
-				executor,
 				backend,
 				commands_tx,
 				abort,
@@ -5481,6 +6340,8 @@ where
 				mailbox,
 				extension_reload,
 				data_dir,
+				settings_manager,
+				session_index,
 				list_sessions,
 				bus,
 				registry,
@@ -5539,7 +6400,7 @@ where
 					switch_model(
 						backend,
 						agent_state,
-						data_dir,
+						settings_manager,
 						selector.as_str(),
 						state,
 						control,
@@ -5551,7 +6412,7 @@ where
 					switch_model(
 						backend,
 						agent_state,
-						data_dir,
+						settings_manager,
 						selector.as_str(),
 						state,
 						control,
@@ -5657,44 +6518,23 @@ where
 				Ok(ChatCommand::Settings) => {
 					send_backend(backend, BackendEvent::SettingsSchema(setting_rows(&state.settings)));
 				},
-				Ok(ChatCommand::Theme(args)) => {
-					match load_theme_preview(executor, state, args.as_str()).await {
-						Ok(theme) => {
-							send_backend(backend, BackendEvent::ThemePreview(theme));
-							send_backend(
-								backend,
-								BackendEvent::Notice(sf!(
-									"Theme preview active for this session; settings were not changed.",
-								)),
-							);
-						},
-						Err(error) => send_backend(
+				Ok(ChatCommand::Theme(args)) => match load_theme_preview(state, args.as_str()).await {
+					Ok(theme) => {
+						send_backend(backend, BackendEvent::ThemePreview(theme));
+						send_backend(
 							backend,
-							BackendEvent::Error(sf!("Could not preview theme: {error}")),
-						),
-					}
+							BackendEvent::Notice(sf!(
+								"Theme preview active for this session; settings were not changed.",
+							)),
+						);
+					},
+					Err(error) => send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not preview theme: {error}")),
+					),
 				},
 				Ok(ChatCommand::Live) => {
-					state.live_enabled = !state.live_enabled;
-					if state.live_enabled {
-						state.live_activity = ActivityWaveform::new();
-					}
-					send_backend(
-						backend,
-						if state.live_enabled {
-							BackendEvent::LiveVoiceStarted
-						} else {
-							BackendEvent::LiveVoiceStopped
-						},
-					);
-					send_backend(
-						backend,
-						BackendEvent::Notice(sf!(if state.live_enabled {
-							"Live voice started. Space mutes; Escape or Ctrl+C closes."
-						} else {
-							"Live voice stopped."
-						})),
-					);
+					toggle_live_voice(backend, state);
 					send_status(backend, state, bus, dropped);
 				},
 				Ok(ChatCommand::Plan(args)) => {
@@ -5992,9 +6832,12 @@ where
 			}
 		},
 		Intent::CycleModel { backward } => {
-			let rows = model_rows(Catalog::embedded());
+			let rows = cycle_model_rows(state.catalog.as_ref(), &state.model_settings);
 			if !rows.is_empty() {
-				let current = current_model_index(Catalog::embedded(), &state.model);
+				let current = rows
+					.iter()
+					.position(|row| row.key.as_str() == state.model)
+					.unwrap_or_default();
 				let next = if backward {
 					(current + rows.len() - 1) % rows.len()
 				} else {
@@ -6003,7 +6846,7 @@ where
 				switch_model(
 					backend,
 					agent_state,
-					data_dir,
+					settings_manager,
 					rows[next].key.as_str(),
 					state,
 					control,
@@ -6062,6 +6905,13 @@ where
 				}));
 			}
 		},
+		Intent::CloseRawStream => {
+			state.raw_stream = None;
+			send_backend(backend, BackendEvent::RawStreamClosed);
+		},
+		Intent::CopyToClipboard(text) => {
+			send_backend(backend, BackendEvent::CopyToClipboard(text));
+		},
 		Intent::TogglePlan => {
 			let operation = if modes.mode_holder().as_deref() == Some("plan") {
 				"off"
@@ -6080,25 +6930,55 @@ where
 			.await;
 		},
 		Intent::ToggleLive => {
-			state.live_enabled = !state.live_enabled;
+			toggle_live_voice(backend, state);
 			send_status(backend, state, bus, dropped);
 		},
-		Intent::ToggleStt => {
-			state.stt_enabled = !state.stt_enabled;
-			send_backend(
+		Intent::LiveVoice(LiveVoiceAction::SetMuted(muted)) => {
+			match state.audio.set_live_muted(muted) {
+				Ok(()) => send_backend(
+					backend,
+					BackendEvent::Notice(sf!(if muted {
+						"Live voice muted."
+					} else {
+						"Live voice unmuted."
+					})),
+				),
+				Err(error) => send_backend(backend, BackendEvent::Error(Str::new(error))),
+			}
+		},
+		Intent::LiveVoice(LiveVoiceAction::Close) => {
+			state.audio.stop_live();
+			send_backend(backend, BackendEvent::LiveVoiceStopped);
+			send_status(backend, state, bus, dropped);
+		},
+		Intent::ToggleStt => match state.audio.toggle_stt() {
+			Ok(enabled) => send_backend(
 				backend,
-				BackendEvent::Notice(sf!(if state.stt_enabled {
+				BackendEvent::Notice(sf!(if enabled {
 					"Speech-to-text capture enabled."
 				} else {
 					"Speech-to-text capture disabled."
 				})),
-			);
+			),
+			Err(error) => send_backend(
+				backend,
+				BackendEvent::Error(sf!("Could not change speech-to-text capture: {error}")),
+			),
 		},
 		Intent::Suspend | Intent::ResetDisplay | Intent::InspectHistory => {},
 		Intent::ApplySettings { changes, commit } => {
+			let previous_settings = state.settings.clone();
 			let composer_style = state.settings.composer.shape;
 			let spelling = state.settings.spelling;
+			let smooth_streaming = state.settings.display.smooth_streaming;
+			let appearance = state.settings.appearance.clone();
 			apply_setting_changes(&mut state.settings, &changes)?;
+			if state.settings.appearance != appearance
+				&& let Err(error) = apply_configured_theme(backend, data_dir, state)
+			{
+				state.settings = previous_settings;
+				return Err(error);
+			}
 			if state.settings.composer.shape != composer_style {
 				send_backend(
 					backend,
@@ -6115,6 +6995,12 @@ where
 						autocomplete:   state.settings.spelling.autocomplete,
 						autocorrect:    state.settings.spelling.autocorrect,
 					}),
+				);
+			}
+			if state.settings.display.smooth_streaming != smooth_streaming {
+				send_backend(
+					backend,
+					BackendEvent::SmoothStreamingChanged(state.settings.display.smooth_streaming),
 				);
 			}
 			if commit {
@@ -6375,7 +7261,16 @@ where
 			}
 		},
 		Intent::SwitchModel(model) => {
-			switch_model(backend, agent_state, data_dir, model.as_str(), state, control, false).await;
+			switch_model(
+				backend,
+				agent_state,
+				settings_manager,
+				model.as_str(),
+				state,
+				control,
+				false,
+			)
+			.await;
 		},
 		Intent::Login(provider) => {
 			if chat_active(state.submit_pending, bus.phase()) {
@@ -6397,7 +7292,6 @@ where
 				let roster = state.typed_commands.clone();
 				let mut command_host = LiveCommandHost {
 					mcp_inspector,
-					executor,
 					backend,
 					commands_tx,
 					abort,
@@ -6410,6 +7304,8 @@ where
 					mailbox,
 					extension_reload,
 					data_dir,
+					settings_manager,
+					session_index,
 					list_sessions,
 					bus,
 					registry,
@@ -6530,7 +7426,12 @@ async fn execute_deferred_command(
 		Err(error) => (false, sf!("{error}")),
 	};
 	let view = deferred_result_view(name, &preview, ok, command.context);
-	send_backend(backend, BackendEvent::ToolFinished { id: command.id.clone(), ok, view });
+	let terminal = if ok {
+		ToolTerminal::Succeeded
+	} else {
+		ToolTerminal::Failed
+	};
+	send_backend(backend, BackendEvent::ToolFinished { id: command.id.clone(), terminal, view });
 	send_retained_fact(
 		backend,
 		"async-job",
@@ -6695,7 +7596,12 @@ fn deferred_json_preview(bytes: &[u8]) -> String {
 	serde_json::to_string_pretty(&value).unwrap_or_default()
 }
 
-fn deferred_result_view(name: &str, preview: &Str, ok: bool, context: DeferredContext) -> Str {
+fn deferred_result_view(
+	name: &str,
+	preview: &Str,
+	ok: bool,
+	context: DeferredContext,
+) -> ToolViewContent {
 	let mut output = String::from("<col gap=0><row gap=1><text bold fg=");
 	output.push_str(if ok { "success" } else { "error" });
 	output.push('>');
@@ -6708,7 +7614,7 @@ fn deferred_result_view(name: &str, preview: &Str, ok: bool, context: DeferredCo
 	output.push_str("</text></row><text>");
 	push_tml_text(&mut output, preview.as_str());
 	output.push_str("</text></col>");
-	Str::from(output)
+	ToolViewContent::Markup(Str::from(output))
 }
 
 fn handle_login(
@@ -6722,7 +7628,7 @@ fn handle_login(
 		return;
 	};
 	if let Some(requested) = requested {
-		match resolve_login_provider(Catalog::embedded(), &requested) {
+		match resolve_login_provider(state.catalog.as_ref(), &requested) {
 			Ok(provider) => match auth.start(provider.clone()) {
 				Ok(()) => send_backend(
 					backend,
@@ -6733,19 +7639,74 @@ fn handle_login(
 			Err(error) => send_backend(backend, BackendEvent::Error(error)),
 		}
 	} else {
-		let current = model_provider(Catalog::embedded(), &state.model);
+		let current = model_provider(state.catalog.as_ref(), &state.model);
 		send_backend(
 			backend,
-			BackendEvent::LoginProviders(provider_rows(Catalog::embedded(), current.as_deref())),
+			BackendEvent::LoginProviders(provider_rows(state.catalog.as_ref(), current.as_deref())),
 		);
 	}
 }
 
-async fn load_theme_preview(
-	executor: &Executor,
+fn apply_configured_theme(
+	backend: &flume::Sender<BackendEvent>,
+	data_dir: &Path,
 	state: &mut BridgeState,
-	args: &str,
-) -> miette::Result<omp_tui::Theme> {
+) -> miette::Result<()> {
+	let configured = state.settings.appearance.theme.as_str();
+	let revision = state.theme_revision.saturating_add(1);
+	let builtin = match configured {
+		"default" => Some(omp_tui::Theme::for_appearance(state.appearance)),
+		"dark" => Some(omp_tui::Theme::for_appearance(omp_tui::Appearance::Dark)),
+		"light" => Some(omp_tui::Theme::for_appearance(omp_tui::Appearance::Light)),
+		_ => None,
+	};
+	let mut theme = if let Some(theme) = builtin {
+		state.theme_watcher.clear(revision).into_diagnostic()?;
+		theme
+	} else {
+		if configured.is_empty()
+			|| Path::new(configured).components().count() != 1
+			|| state
+				.settings
+				.appearance
+				.theme_variant
+				.as_deref()
+				.is_some_and(|variant| {
+					variant.is_empty() || Path::new(variant).components().count() != 1
+				}) {
+			return Err(miette::miette!("appearance.theme contains an invalid theme name"));
+		}
+		let themes = data_dir.join("themes");
+		let path = state
+			.settings
+			.appearance
+			.theme_variant
+			.as_deref()
+			.map(|variant| themes.join(format!("{configured}-{variant}.json")))
+			.filter(|path| path.is_file())
+			.unwrap_or_else(|| themes.join(format!("{configured}.json")));
+		let source = fs::read_to_string(&path)
+			.into_diagnostic()
+			.wrap_err_with(|| format!("could not load configured theme `{}`", path.display()))?;
+		state
+			.theme_watcher
+			.apply_environment_update(revision, &source)
+			.into_diagnostic()?;
+		state
+			.theme_watcher
+			.palette(state.appearance, true)
+			.ok_or_else(|| miette::miette!("configured theme was not published"))?
+	};
+	if let Some(accent) = state.settings.appearance.accent.as_deref() {
+		theme.accent = omp_tui::Color::parse(accent)
+			.ok_or_else(|| miette::miette!("appearance.accent is not a valid color"))?;
+	}
+	state.theme_revision = revision;
+	send_backend(backend, BackendEvent::ThemePreview(theme));
+	Ok(())
+}
+
+async fn load_theme_preview(state: &mut BridgeState, args: &str) -> miette::Result<omp_tui::Theme> {
 	let mut parts: Vec<_> = args.split_whitespace().collect();
 	let quantized = parts.last().is_some_and(|part| *part == "256");
 	if quantized {
@@ -6755,10 +7716,7 @@ async fn load_theme_preview(
 	if path.is_empty() {
 		return Err(miette::miette!("theme preview requires an Environment path"));
 	}
-	let bytes = executor
-		.unblock(move || fs::read(path))
-		.await
-		.into_diagnostic()?;
+	let bytes = tokio::fs::read(path).await.into_diagnostic()?;
 	let source = str::from_utf8(&bytes).into_diagnostic()?;
 	let revision = state.theme_revision.saturating_add(1);
 	state
@@ -6810,6 +7768,134 @@ fn handle_auth_event(
 	}
 }
 
+fn collaboration_stream_event(event: &AgentEvent) -> Option<omp_proto::collab::v1::StreamEvent> {
+	use omp_proto::collab::v1::{Notice, StreamEvent, notice, stream_event};
+	let (event_type, notice) = match event {
+		AgentEvent::Turn { event, .. } => match &event.event {
+			Some(Event::Accepted(_)) => (stream_event::EventType::TurnStart, None),
+			Some(Event::Outcome(_)) => (stream_event::EventType::TurnEnd, None),
+			Some(Event::PartStart(_)) => (stream_event::EventType::MessageStart, None),
+			Some(Event::PartDelta(_)) => (stream_event::EventType::MessageUpdate, None),
+			Some(Event::PartEnd(_)) => (stream_event::EventType::MessageEnd, None),
+			_ => return None,
+		},
+		AgentEvent::Failed { message, .. } => (
+			stream_event::EventType::Notice,
+			Some(Notice {
+				level:   notice::Level::Error as i32,
+				message: message.to_string(),
+				source:  String::from("agent"),
+			}),
+		),
+		_ => return None,
+	};
+	Some(StreamEvent { event_type: event_type as i32, item: None, tool: None, notice })
+}
+
+async fn handle_collaboration_operation<C>(
+	operation: omp_driver::collab::session::HostOperation,
+	parent: &ChatParentHost<C>,
+	abort: &omp_agent::AbortHandle,
+	modes: &RegimeHandle,
+	commands: &flume::Sender<UiCmd>,
+	backend: &flume::Sender<BackendEvent>,
+	state: &mut BridgeState,
+	bus: &omp_agent::EventBus,
+) where
+	C: TurnClient + Clone + Send + 'static,
+{
+	use omp_driver::collab::session::HostOperation;
+	match operation {
+		HostOperation::Abort { principal, reason } => {
+			if chat_active(state.submit_pending, bus.phase()) {
+				abort.abort();
+				modes.pause_loop();
+				send_backend(
+					backend,
+					BackendEvent::Notice(sf!(
+						"Collaboration participant `{}` interrupted the turn: {}",
+						principal.display_name(),
+						reason
+					)),
+				);
+			}
+		},
+		HostOperation::AgentChat { principal, agent_id, text } => {
+			let facts = parent.agent_hub_facts(state.session_id.as_str());
+			let Some(target) = facts.iter().find(|row| row.id == agent_id) else {
+				send_backend(backend, BackendEvent::Error(sf!("Unknown collaboration agent target.")));
+				return;
+			};
+			if !(target.capabilities.steer || target.capabilities.revive) || text.trim().is_empty() {
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Selected collaboration agent is not accepting chat.")),
+				);
+				return;
+			}
+			let Some(root) = facts.iter().find(|row| row.parent.is_none()) else {
+				return;
+			};
+			let message = PeerMessage {
+				id: Str::from(omp_core::Ulid::generate().to_string()),
+				from: root.id.clone(),
+				to: agent_id,
+				text,
+				mode: DeliveryMode::Steer,
+				reply_to: None,
+				sent_ms: now_ms(),
+				session_id: state.session_id.clone(),
+				expects_reply: false,
+			};
+			if parent.broker().send(message).is_err() {
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!(
+						"Collaboration agent chat from `{}` was refused.",
+						principal.display_name()
+					)),
+				);
+			}
+		},
+		HostOperation::AgentKill { agent_id, .. } => {
+			let allowed = parent
+				.agent_hub_facts(state.session_id.as_str())
+				.iter()
+				.find(|row| row.id == agent_id)
+				.is_some_and(|row| row.capabilities.kill);
+			if allowed {
+				parent.cancel_child(agent_id.as_str());
+			} else {
+				send_backend(backend, BackendEvent::Error(sf!("Selected agent cannot be killed.")));
+			}
+		},
+		HostOperation::AgentRevive { agent_id, .. } => {
+			let allowed = parent
+				.agent_hub_facts(state.session_id.as_str())
+				.iter()
+				.find(|row| row.id == agent_id)
+				.is_some_and(|row| row.capabilities.revive);
+			if !allowed {
+				send_backend(backend, BackendEvent::Error(sf!("Selected agent cannot be revived.")));
+			} else if let Err(error) = parent.supervisor().revive(agent_id.as_str()).await {
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Could not revive collaboration agent: {error}")),
+				);
+			}
+		},
+		HostOperation::UiAnswer { .. } => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!(
+					"Collaboration UI answer has no matching host presentation request."
+				)),
+			);
+		},
+	}
+	let _ = commands;
+}
+
 fn handle_agent_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
@@ -6828,7 +7914,6 @@ fn handle_agent_event(
 				modes.begin_streaming();
 			},
 			Some(Event::Outcome(outcome)) => {
-				let _ = modes.settle_plan_transition();
 				if state.replaying_turn {
 					replay_items(
 						backend,
@@ -6842,7 +7927,7 @@ fn handle_agent_event(
 				state.queued = 0;
 				state.queued_prompts.clear();
 				state.model.clone_from(&outcome.model);
-				state.context_window = resolve_model(Catalog::embedded(), &outcome.model)
+				state.context_window = resolve_model(state.catalog.as_ref(), &outcome.model)
 					.and_then(|spec| spec.limits.context_window);
 				if let Some(cost) = &outcome.cost {
 					state.cost_nanos = state.cost_nanos.saturating_add(cost.nanos_usd);
@@ -6889,7 +7974,7 @@ fn handle_agent_event(
 						rate.finalize(usage.output_tokens);
 						state.tokens_per_second = rate.rate(Instant::now());
 					}
-					let _ = modes.checkpoint_goal_usage(
+					let _ = modes.record_goal_usage_delta(
 						GoalUsage {
 							input_tokens:        usage.input_tokens,
 							cache_write_tokens:  usage.cache_write_tokens,
@@ -6982,7 +8067,7 @@ fn handle_agent_event(
 						{
 							send_backend(backend, BackendEvent::ToolView {
 								id:   id.clone(),
-								view: Str::from(input),
+								view: ToolViewContent::Plain(Str::from(input)),
 							});
 						}
 					}
@@ -7022,7 +8107,7 @@ fn handle_agent_event(
 		AgentEvent::ToolUpdate { call_id, json } => {
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				ensure_tool_started(backend, call_id, tool, true);
-				if tool.identity.name == "shell"
+				if tool.identity.name == "bash"
 					&& let Ok(update) = serde_json::from_slice::<omp_tools::shell::Update>(json)
 					&& update.terminal
 				{
@@ -7069,7 +8154,7 @@ fn handle_agent_event(
 				});
 			}
 			let mut tool = state.tools.remove(call_id.as_str());
-			let (identity, ok, view) = render_tool_result_view(renderers, item, tool.as_ref());
+			let (identity, terminal, view) = render_tool_result_view(renderers, item, tool.as_ref());
 			let is_report_issue = identity.name == "report_issue";
 			if let Some(tool) = tool.as_mut() {
 				ensure_tool_started(backend, call_id, tool, true);
@@ -7082,14 +8167,14 @@ fn handle_agent_event(
 				});
 			}
 			send_tool_result_images(backend, call_id, item);
-			send_backend(backend, BackendEvent::ToolFinished { id: call_id.clone(), ok, view });
-			if ok
+			send_backend(backend, BackendEvent::ToolFinished { id: call_id.clone(), terminal, view });
+			if terminal == ToolTerminal::Succeeded
 				&& identity.name == "todo"
 				&& let Some(payload) = completed_todo_payload(item)
 			{
 				send_backend(backend, BackendEvent::TodoHud(todo_hud(&payload)));
 			}
-			if ok
+			if terminal == ToolTerminal::Succeeded
 				&& is_report_issue
 				&& let Some(request) = autoqa_consent_request(item)
 			{
@@ -7146,6 +8231,7 @@ fn handle_agent_event(
 			);
 		},
 		AgentEvent::Failed { message, .. } => {
+			let _ = modes.settle_plan_transition();
 			// The failed turn will never deliver `PartEnd`/`ToolFinished` for
 			// work that was still streaming; settle those widgets instead of
 			// leaving frozen spinners and half-drawn tool boxes behind.
@@ -7165,9 +8251,9 @@ fn handle_agent_event(
 					});
 				}
 				send_backend(backend, BackendEvent::ToolFinished {
-					id:   call_id,
-					ok:   false,
-					view: sf!("turn failed before this tool ran"),
+					id:       call_id,
+					terminal: ToolTerminal::Failed,
+					view:     ToolViewContent::Plain(sf!("turn failed before this tool ran")),
 				});
 			}
 			state.active_ptys.clear();
@@ -7197,10 +8283,14 @@ fn handle_agent_event(
 			state.title = SessionTitleState { title: Some(title.clone()), source: Some(*source) };
 			send_backend(backend, BackendEvent::SessionTitle(title.clone()));
 		},
+		AgentEvent::RunStateChanged { to, .. } => {
+			if matches!(to, AgentRunState::Idle | AgentRunState::Attention) {
+				let _ = modes.settle_plan_transition();
+			}
+		},
 		AgentEvent::Snapshot(_)
 		| AgentEvent::ToolObserved { .. }
 		| AgentEvent::PlanStateChanged { .. }
-		| AgentEvent::RunStateChanged { .. }
 		| AgentEvent::PhaseChanged { .. }
 		| AgentEvent::RosterChanged { .. } => {},
 	}
@@ -7269,7 +8359,8 @@ fn replay_items(
 			Some(item::Kind::ToolResult(result)) => {
 				let id = Str::from(result.call_id.as_str());
 				let tool = tools.remove(id.as_str());
-				let (identity, ok, view) = render_tool_result_view(renderers, item, tool.as_ref());
+				let (identity, terminal, view) =
+					render_tool_result_view(renderers, item, tool.as_ref());
 				if tool.is_none() {
 					send_backend(backend, BackendEvent::ToolStarted {
 						id:    id.clone(),
@@ -7279,7 +8370,7 @@ fn replay_items(
 					});
 				}
 				send_tool_result_images(backend, &id, item);
-				send_backend(backend, BackendEvent::ToolFinished { id, ok, view });
+				send_backend(backend, BackendEvent::ToolFinished { id, terminal, view });
 			},
 			_ => {},
 		}
@@ -7492,9 +8583,9 @@ fn durable_tool_outcome(item: &Item) -> Option<Bytes> {
 	serde_json::to_vec(&details).ok().map(Bytes::from)
 }
 
-fn durable_tool_ok(item: &Item) -> bool {
+fn durable_tool_terminal(item: &Item) -> ToolTerminal {
 	let Some(item::Kind::ToolResult(result)) = &item.kind else {
-		return false;
+		return ToolTerminal::Failed;
 	};
 	let branch = result
 		.details
@@ -7508,9 +8599,34 @@ fn durable_tool_ok(item: &Item) -> bool {
 			_ => None,
 		});
 	match branch {
-		Some("ok") => true,
-		Some("faulted" | "fault" | "args_rejected" | "args" | "aborted") => false,
-		_ => !result.is_error,
+		Some("ok") => ToolTerminal::Succeeded,
+		Some("args_rejected" | "args") => ToolTerminal::ArgsRejected,
+		Some("aborted") => {
+			let skipped = result
+				.details
+				.as_ref()
+				.and_then(|details| match details.kind.as_ref()? {
+					value::Kind::Map(map) => map.fields.get("value"),
+					_ => None,
+				})
+				.and_then(|value| match value.kind.as_ref()? {
+					value::Kind::Map(map) => map.fields.get("kind"),
+					_ => None,
+				})
+				.and_then(|kind| match kind.kind.as_ref()? {
+					value::Kind::String(kind) => Some(kind.as_str()),
+					_ => None,
+				})
+				.is_some_and(|kind| kind == "skipped");
+			if skipped {
+				ToolTerminal::Skipped
+			} else {
+				ToolTerminal::Aborted
+			}
+		},
+		Some("faulted" | "fault") => ToolTerminal::Failed,
+		_ if result.is_error => ToolTerminal::Failed,
+		_ => ToolTerminal::Succeeded,
 	}
 }
 
@@ -7524,32 +8640,47 @@ fn fold_tool_args(
 	renderers: &RenderRegistry,
 	tool: &mut ToolDisplay,
 	complete: bool,
-) -> Option<Str> {
+) -> Option<ToolViewContent> {
 	let entry = renderers.get(&tool.identity)?;
 	entry.fold_args(&mut tool.fold, &tool.args, complete).ok()?;
-	entry.view(&tool.fold, None).ok().flatten()
+	entry
+		.view(&tool.fold, None)
+		.ok()
+		.flatten()
+		.map(ToolViewContent::Markup)
 }
 
-fn fold_tool_update(renderers: &RenderRegistry, tool: &mut ToolDisplay, update: Bytes) -> Str {
-	match renderers.fold(&tool.identity, &mut tool.fold, update.clone()) {
-		Ok(()) => renderers
-			.view(&tool.identity, &tool.fold, None)
-			.unwrap_or_else(|_| structured_bytes_fallback(&update)),
-		Err(_) => structured_bytes_fallback(&update),
-	}
+fn fold_tool_update(
+	renderers: &RenderRegistry,
+	tool: &mut ToolDisplay,
+	update: Bytes,
+) -> ToolViewContent {
+	let rendered = renderers
+		.fold(&tool.identity, &mut tool.fold, update.clone())
+		.ok()
+		.and_then(|()| renderers.get(&tool.identity))
+		.and_then(|entry| entry.view(&tool.fold, None).ok().flatten());
+	rendered.map_or_else(
+		|| ToolViewContent::Plain(structured_bytes_fallback(&update)),
+		ToolViewContent::Markup,
+	)
 }
 
 fn render_tool_result_view(
 	renderers: &RenderRegistry,
 	item: &Item,
 	tool: Option<&ToolDisplay>,
-) -> (ToolIdentity, bool, Str) {
+) -> (ToolIdentity, ToolTerminal, ToolViewContent) {
 	let outcome = durable_tool_outcome(item);
 	let Some(identity) = durable_tool_identity(item) else {
 		let view = outcome
 			.as_ref()
 			.map_or_else(|| Str::new_static("{}"), structured_bytes_fallback);
-		return (missing_tool_identity(item), durable_tool_ok(item), view);
+		return (
+			missing_tool_identity(item),
+			durable_tool_terminal(item),
+			ToolViewContent::Plain(view),
+		);
 	};
 	let empty_fold = ViewState::new();
 	if identity.name == "debug"
@@ -7558,19 +8689,27 @@ fn render_tool_result_view(
 		&& let Ok(omp_tool::CallOutcome::<debug::Payload, debug::Fault>::Ok(payload)) =
 			serde_json::from_slice(outcome)
 	{
-		return (identity, true, omp_tools::debug::render(payload.action, &payload.data));
+		return (
+			identity,
+			ToolTerminal::Succeeded,
+			ToolViewContent::Markup(omp_tools::debug::render(payload.action, &payload.data)),
+		);
 	}
 	let fold = tool
 		.filter(|tool| tool.identity == identity)
 		.map_or(&empty_fold, |tool| &tool.fold);
 	let view = renderers
-		.view(&identity, fold, outcome.as_deref())
-		.unwrap_or_else(|_| {
-			outcome
-				.as_ref()
-				.map_or_else(|| Str::new_static("{}"), structured_bytes_fallback)
+		.get(&identity)
+		.and_then(|entry| entry.view(fold, outcome.as_deref()).ok().flatten())
+		.map(ToolViewContent::Markup)
+		.unwrap_or_else(|| {
+			ToolViewContent::Plain(
+				outcome
+					.as_ref()
+					.map_or_else(|| Str::new_static("{}"), structured_bytes_fallback),
+			)
 		});
-	(identity, durable_tool_ok(item), view)
+	(identity, durable_tool_terminal(item), view)
 }
 
 fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
@@ -7672,11 +8811,22 @@ fn proto_to_json(value: &v1::Value) -> Option<serde_json::Value> {
 	}
 }
 
-fn model_rows(catalog: &Catalog) -> Vec<ModelRow> {
+fn model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> {
 	catalog
 		.models()
 		.iter()
+		.filter(|model| model_selector_allowed(catalog, settings, model.key.as_str()))
 		.map(|model| {
+			let role = settings
+				.roles
+				.iter()
+				.filter(|(role, _)| {
+					!settings.role_tag(role).is_some_and(|tag| tag.hidden)
+						&& resolve_model_selector(catalog, settings, role.as_str())
+							.is_some_and(|resolved| resolved.key.as_str() == model.key.as_str())
+				})
+				.min_by_key(|(role, _)| settings.cycle_rank(role));
+			let tag = role.and_then(|(role, _)| settings.role_tag(role));
 			let (provider_id, provider) = model
 				.routes
 				.first()
@@ -7698,7 +8848,8 @@ fn model_rows(catalog: &Catalog) -> Vec<ModelRow> {
 			};
 			ModelRow {
 				key: Str::from(model.key.to_string()),
-				name: model.display_name.clone(),
+				name: tag.map_or_else(|| model.display_name.clone(), |tag| tag.name.clone()),
+				color: tag.and_then(|tag| tag.color.clone()),
 				provider_id,
 				provider,
 				context: model.limits.context_window,
@@ -7709,26 +8860,51 @@ fn model_rows(catalog: &Catalog) -> Vec<ModelRow> {
 		.collect()
 }
 
-fn current_model_index(catalog: &Catalog, current: &str) -> usize {
-	catalog
-		.models()
+fn current_model_index(rows: &[ModelRow], current: &str) -> usize {
+	rows
 		.iter()
 		.position(|model| model.key.as_str() == current)
 		.unwrap_or_default()
 }
+fn cycle_model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> {
+	let all = model_rows(catalog, settings);
+	let mut ordered = Vec::new();
+	for role in settings.cycle_order.iter() {
+		if settings.role_tag(role).is_some_and(|tag| tag.hidden) {
+			continue;
+		}
+		if settings.role_selector(role).is_none() {
+			continue;
+		}
+		let Some(model) = resolve_model_selector(catalog, settings, role.as_str()) else {
+			continue;
+		};
+		if ordered
+			.iter()
+			.any(|row: &ModelRow| row.key.as_str() == model.key.as_str())
+		{
+			continue;
+		}
+		if let Some(row) = all
+			.iter()
+			.find(|row| row.key.as_str() == model.key.as_str())
+		{
+			ordered.push(row.clone());
+		}
+	}
+	if ordered.is_empty() { all } else { ordered }
+}
 
 fn send_open_models(backend: &flume::Sender<BackendEvent>, state: &BridgeState) {
-	send_backend(backend, BackendEvent::OpenModelPicker {
-		rows:    model_rows(Catalog::embedded()),
-		current: current_model_index(Catalog::embedded(), &state.model),
-	});
+	let rows = model_rows(state.catalog.as_ref(), &state.model_settings);
+	let current = current_model_index(&rows, &state.model);
+	send_backend(backend, BackendEvent::OpenModelPicker { rows, current });
 }
 
 fn send_models_updated(backend: &flume::Sender<BackendEvent>, state: &BridgeState) {
-	send_backend(backend, BackendEvent::ModelsUpdated {
-		rows:    model_rows(Catalog::embedded()),
-		current: current_model_index(Catalog::embedded(), &state.model),
-	});
+	let rows = model_rows(state.catalog.as_ref(), &state.model_settings);
+	let current = current_model_index(&rows, &state.model);
+	send_backend(backend, BackendEvent::ModelsUpdated { rows, current });
 }
 
 fn provider_rows(catalog: &Catalog, current: Option<&str>) -> Vec<SessionRow> {
@@ -7785,17 +8961,24 @@ fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
 async fn switch_model(
 	backend: &flume::Sender<BackendEvent>,
 	state_handle: &AgentState,
-	data_dir: &Path,
+	settings_manager: &SettingsManager,
 	selector: &str,
 	state: &mut BridgeState,
 	control: &omp_agent::ControlSender,
 	durable: bool,
 ) {
-	let catalog = Catalog::embedded();
-	let Some(spec) = resolve_model(catalog, selector) else {
-		send_backend(backend, BackendEvent::Error(sf!("Unknown model: {selector}")));
+	let catalog = state.catalog.as_ref();
+	let Some(spec) = resolve_model_selector(catalog, &state.model_settings, selector) else {
+		send_backend(backend, BackendEvent::Error(sf!("Unknown or disabled model: {selector}")));
 		return;
 	};
+	if !model_selector_allowed(catalog, &state.model_settings, spec.key.as_str()) {
+		send_backend(
+			backend,
+			BackendEvent::Error(sf!("Model is disabled by the effective model scope: {selector}")),
+		);
+		return;
+	}
 	if !durable {
 		let Some(change) = session_model_override(catalog, spec) else {
 			send_backend(
@@ -7815,19 +8998,19 @@ async fn switch_model(
 
 	let key = spec.key.to_string();
 	if durable {
-		let manager = SettingsManager::open(SettingsPaths::discover(data_dir, None));
-		if let Err(error) = manager.and_then(|manager| {
-			manager
-				.set_sync(MutationScope::Global, "default_model", &key)
-				.map(|_| ())
-		}) {
+		let raw = toml::Value::String(key.clone()).to_string();
+		let scope = model_role_scope(state.model_settings.role_storage);
+		if let Err(error) = settings_manager.set_sync(scope, "model.roles.default", &raw) {
 			send_backend(
 				backend,
-				BackendEvent::Error(sf!("Could not save the default model: {error}")),
+				BackendEvent::Error(sf!("Could not save the default model role: {error}")),
 			);
 			return;
 		}
-		state.settings.default_model = Some(key.clone());
+		state
+			.model_settings
+			.roles
+			.insert(Str::new_static("default"), Str::from(key.as_str()));
 	}
 	state_handle.update(|snapshot| {
 		snapshot.turn.params.model.clone_from(&key);
@@ -7845,6 +9028,26 @@ async fn switch_model(
 			sf!("Session model: `{}`.", state.model)
 		}),
 	);
+}
+fn resolve_model_selector<'a>(
+	catalog: &'a Catalog,
+	settings: &ModelSettings,
+	selector: &str,
+) -> Option<&'a ModelSpec> {
+	let role_selector = settings
+		.role_selector(selector)
+		.map(|_| format!("@{selector}"));
+	let selected =
+		resolve_role_selector(catalog, settings, role_selector.as_deref().unwrap_or(selector))
+			.ok()?;
+	catalog.model(&selected.model)
+}
+
+fn model_role_scope(storage: ModelRoleStorage) -> MutationScope {
+	match storage {
+		ModelRoleStorage::Global => MutationScope::Global,
+		ModelRoleStorage::Project => MutationScope::Project,
+	}
 }
 
 fn session_model_override(catalog: &Catalog, spec: &ModelSpec) -> Option<JournalModelChange> {
@@ -7899,6 +9102,103 @@ fn resolve_login_provider(catalog: &Catalog, requested: &Str) -> Result<Str, Str
 /// Projects the live roster for the HUD. The roster exists to surface
 /// subagent activity: a session whose only node is the root agent projects
 /// empty, so the HUD stays out of the way until subagents actually run.
+fn publish_collaboration_state(state: &BridgeState, bus: &omp_agent::EventBus) {
+	let (Some(live), Some(base)) = (&state.collab_live, &state.collab_state) else {
+		return;
+	};
+	let mut update = base.clone();
+	update.is_streaming = chat_active(state.submit_pending, bus.phase());
+	update.is_aborting = bus.run_state() == AgentRunState::Attention;
+	update.queued_message_count = u32::try_from(state.queued).unwrap_or(u32::MAX);
+	update.session_name = state.title.title.as_deref().unwrap_or_default().to_owned();
+	update.host_cwd = state.workspace_root.to_string();
+	let provider = model_provider(state.catalog.as_ref(), &state.model).unwrap_or_default();
+	update.model = Some(omp_proto::collab::v1::ModelMetadata {
+		id:             state.model.clone(),
+		name:           status_model_label(state.catalog.as_ref(), &state.model).to_string(),
+		provider:       provider.to_string(),
+		context_window: state
+			.context_window
+			.and_then(|window| u32::try_from(window).ok())
+			.unwrap_or_default(),
+	});
+	update.thinking_level = state.thinking.map(|thinking| {
+		match thinking {
+			StatusThinkingLevel::Minimal => "minimal",
+			StatusThinkingLevel::Low => "low",
+			StatusThinkingLevel::Medium => "medium",
+			StatusThinkingLevel::High => "high",
+			StatusThinkingLevel::Xhigh => "xhigh",
+			StatusThinkingLevel::Max => "max",
+		}
+		.to_owned()
+	});
+	update.context_usage = state
+		.context_window
+		.map(|window| omp_proto::collab::v1::ContextUsage {
+			tokens:         state.context_tokens,
+			context_window: window,
+			percent:        if window == 0 {
+				0.0
+			} else {
+				(state.context_tokens as f64 / window as f64 * 100.0) as f32
+			},
+		});
+	live.publish_state(update);
+}
+
+fn publish_collaboration_registry<C>(
+	live: Option<&omp_driver::collab::session::HostLiveHandle>,
+	parent: &ChatParentHost<C>,
+	session: &str,
+) where
+	C: TurnClient + Clone + Send + 'static,
+{
+	let Some(live) = live else {
+		return;
+	};
+	let mut agents = HashMap::new();
+	for fact in parent.agent_hub_facts(session) {
+		let transcript_path = parent
+			.broker()
+			.registry()
+			.record(fact.id.as_str())
+			.and_then(|(record, _)| record.transcript);
+		let summary = omp_proto::collab::v1::AgentSummary {
+			id:               fact.id.to_string(),
+			display_name:     fact.name.to_string(),
+			kind:             if fact.parent.is_none() {
+				omp_proto::collab::v1::agent_summary::Kind::Main as i32
+			} else {
+				omp_proto::collab::v1::agent_summary::Kind::Sub as i32
+			},
+			parent_id:        fact.parent.as_ref().map(ToString::to_string),
+			status:           match fact.status {
+				AgentStatus::Pending | AgentStatus::Running => {
+					omp_proto::collab::v1::agent_summary::Status::Running as i32
+				},
+				AgentStatus::Settled | AgentStatus::Completed => {
+					omp_proto::collab::v1::agent_summary::Status::Idle as i32
+				},
+				AgentStatus::Failed | AgentStatus::Cancelled | AgentStatus::Exhausted => {
+					omp_proto::collab::v1::agent_summary::Status::Aborted as i32
+				},
+			},
+			has_session_file: transcript_path.is_some(),
+			created_at_ms:    0,
+			last_activity_ms: 0,
+		};
+		agents.insert(fact.id, omp_driver::collab::session::HostAgentProjection {
+			summary,
+			transcript_path,
+		});
+	}
+	let snapshot = omp_proto::collab::v1::RegistrySnapshot {
+		agents: agents.values().map(|agent| agent.summary.clone()).collect(),
+	};
+	live.publish_registry(omp_driver::collab::session::HostRegistryUpdate { snapshot, agents });
+}
+
 fn project_agent_roster<C>(
 	parent: &ChatParentHost<C>,
 	tree: &AgentTree,
@@ -8008,11 +9308,11 @@ fn send_status(
 	send_backend(
 		backend,
 		BackendEvent::Status(StatusFacts {
-			model: status_model_label(state.model.as_str()),
-			model_subscription: model_uses_subscription(Catalog::embedded(), &state.model),
+			model: status_model_label(state.catalog.as_ref(), state.model.as_str()),
+			model_subscription: model_uses_subscription(state.catalog.as_ref(), &state.model),
 			advisor_subscription: advisor_model
 				.as_ref()
-				.is_some_and(|model| model_uses_subscription(Catalog::embedded(), model.as_str())),
+				.is_some_and(|model| model_uses_subscription(state.catalog.as_ref(), model.as_str())),
 			advisor_model,
 			working: chat_active(state.submit_pending, bus.phase()),
 			turn_started: state.turn_started,
@@ -8040,7 +9340,7 @@ fn send_status(
 			attempt: state.attempt,
 			dropped,
 			git: None,
-			live_activity: state.live_enabled.then_some(state.live_activity),
+			live_activity: state.audio.live_active().then_some(state.live_activity),
 			tokens_per_second: state.tokens_per_second,
 			cwd: Some(state.workspace_root.clone()),
 			worktree: None,
@@ -8055,6 +9355,7 @@ fn send_status(
 			separator: StatusSeparator::Dot,
 		}),
 	);
+	publish_collaboration_state(state, bus);
 }
 
 /// Auto-compaction boundary percents for the embedded context gauge, absent
@@ -8084,18 +9385,16 @@ fn compaction_boundaries(
 	})
 }
 
-fn status_model_label(model: &str) -> Str {
-	Catalog::embedded()
-		.model(ModelKey::from_ref(model))
-		.map_or_else(
-			|| Str::from(model),
-			|model| {
-				model
-					.display_name
-					.strip_prefix("Claude ")
-					.unwrap_or_else(|| model.display_name.clone())
-			},
-		)
+fn status_model_label(catalog: &Catalog, model: &str) -> Str {
+	catalog.model(ModelKey::from_ref(model)).map_or_else(
+		|| Str::from(model),
+		|model| {
+			model
+				.display_name
+				.strip_prefix("Claude ")
+				.unwrap_or_else(|| model.display_name.clone())
+		},
+	)
 }
 
 fn send_backend(sender: &flume::Sender<BackendEvent>, event: BackendEvent) {
@@ -8113,7 +9412,7 @@ fn drain_live_activity(events: &SubscriptionHandle, state: &mut BridgeState) -> 
 			FirehoseEvent::ToolCall(_) => 2,
 			_ => continue,
 		};
-		if state.live_enabled {
+		if state.audio.live_active() {
 			state.live_activity.push(band);
 			changed = true;
 		}
@@ -8325,15 +9624,67 @@ mod tests {
 		assert_eq!(plan_save_file_name("../../unsafe destination"), "UNSAFE_DESTINATION_PLAN.md");
 	}
 
-	use futures::executor::block_on;
 	use omp_agent::{AgentKind, AgentStatus, Budget};
 	use omp_core::ExposeSecret as _;
 	use omp_tui::{
 		Color, Size, UiContext, components::AttachmentContent, test_support::frame_row_text,
 	};
-	use tokio::time::sleep;
 
 	use super::*;
+
+	#[test]
+	fn model_tags_cycle_order_and_hidden_direct_resolution_are_preserved() {
+		let catalog = Catalog::embedded();
+		let first = catalog
+			.models()
+			.first()
+			.expect("embedded model")
+			.key
+			.to_string();
+		let second = catalog
+			.models()
+			.get(1)
+			.expect("second embedded model")
+			.key
+			.to_string();
+		let mut settings = ModelSettings::default();
+		settings
+			.roles
+			.insert(sf!("first"), Str::from(first.as_str()));
+		settings
+			.roles
+			.insert(sf!("second"), Str::from(second.as_str()));
+		settings
+			.tags
+			.insert(sf!("first"), omp_catalog::settings::ModelTag {
+				name:   sf!("Hidden first"),
+				color:  Some(sf!("red")),
+				hidden: true,
+			});
+		settings
+			.tags
+			.insert(sf!("second"), omp_catalog::settings::ModelTag {
+				name:   sf!("Review model"),
+				color:  Some(sf!("cyan")),
+				hidden: false,
+			});
+		settings.cycle_order = Arc::from([sf!("second"), sf!("first")]);
+
+		let rows = model_rows(catalog, &settings);
+		let tagged = rows
+			.iter()
+			.find(|row| row.key.as_str() == second)
+			.expect("visible tagged model");
+		assert_eq!(tagged.name, "Review model");
+		assert_eq!(tagged.color.as_deref(), Some("cyan"));
+		let cycle = cycle_model_rows(catalog, &settings);
+		assert_eq!(cycle.first().map(|row| row.key.as_str()), Some(second.as_str()));
+		assert!(cycle.iter().all(|row| row.key.as_str() != first));
+		assert_eq!(
+			resolve_model_selector(catalog, &settings, "first").map(|model| model.key.as_str()),
+			Some(first.as_str()),
+		);
+	}
 
 	struct StubSession;
 	impl omp_agent::TurnSession for StubSession {
@@ -8389,27 +9740,6 @@ mod tests {
 			Arc::new(SessionIndex::open(scratch.join("sessions.sqlite3")).expect("session index")),
 			false,
 		)
-	}
-
-	#[test]
-	fn pool_spawned_agent_futures_can_use_tokio_timers_through_the_context_wrapper() {
-		// The agent loop's deadline/watchdog/backoff arms create tokio sleeps;
-		// polled bare on an executor pool thread they panic with "no reactor
-		// running". The `TokioContext` wrapper at the spawn boundary must keep
-		// them working.
-		let runtime = runtime::Builder::new_current_thread()
-			.enable_time()
-			.build()
-			.expect("test runtime");
-		let executor = Executor::new(Some(1));
-		let task = executor.spawn(TokioContext::new(
-			async {
-				sleep(Duration::from_millis(1)).await;
-				7_u8
-			},
-			runtime.handle().clone(),
-		));
-		assert_eq!(block_on(task), 7);
 	}
 
 	#[test]
@@ -8496,8 +9826,9 @@ mod tests {
 	}
 	#[test]
 	fn status_model_label_uses_catalog_display_without_claude_prefix() {
-		assert_eq!(status_model_label("anthropic/claude-opus-5"), "Opus 5");
-		assert_eq!(status_model_label("not-catalogued"), "not-catalogued");
+		let catalog = Catalog::embedded();
+		assert_eq!(status_model_label(catalog, "anthropic/claude-opus-5"), "Opus 5");
+		assert_eq!(status_model_label(catalog, "not-catalogued"), "not-catalogued");
 	}
 	#[test]
 	fn session_model_override_uses_the_catalog_key_not_a_wire_id() {
@@ -8551,11 +9882,15 @@ mod tests {
 		);
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
+			catalog: Arc::new(Catalog::embedded().clone()),
 			model: "test/model".to_owned(),
+			model_settings: ModelSettings::default(),
 			pending_session_delete: None,
 			git: None,
 			advisor: None,
 			title: SessionTitleState::default(),
+			session_path: scratch.join("test-session.jsonl"),
+			sessions_dir: scratch.to_path_buf(),
 			title_replan_refresh_pending: false,
 			environment,
 			local_root: env::temp_dir(),
@@ -8563,6 +9898,8 @@ mod tests {
 			regimes: RegimeHandle::new(),
 			regime_revision: 0,
 			collab: None,
+			collab_live: None,
+			collab_state: None,
 			memory: None,
 			workspace_root: sf!("/workspace"),
 			appearance: omp_tui::Appearance::Dark,
@@ -8576,7 +9913,7 @@ mod tests {
 			cost_nanos: 0,
 			queued: 0,
 			queued_prompts: VecDeque::new(),
-			stt_enabled: false,
+			audio: crate::audio_coordinator::InteractiveAudioController::new(),
 			jobs: HashSet::new(),
 			attempt: 0,
 			turn_started: None,
@@ -8588,7 +9925,6 @@ mod tests {
 			tools: HashMap::new(),
 			rewind_targets: Vec::new(),
 			pending_auth_kind: None,
-			live_enabled: false,
 			live_activity: ActivityWaveform::new(),
 			token_rate: None,
 			tokens_per_second: None,
@@ -8596,6 +9932,7 @@ mod tests {
 			replaying_turn: false,
 			vision_override: None,
 			settings: Settings::default(),
+			prompt_discovery_settings: omp_driver::discovery::PromptDiscoverySettings::default(),
 			commands: CommandRoster::new(Vec::new()),
 			command_usage,
 			typed_commands: commands::CommandRoster::builtins(),
@@ -8605,6 +9942,8 @@ mod tests {
 			extension_mcp: None,
 			extension_live_mcp: HashMap::new(),
 			approvals: HashMap::new(),
+			presentation_requests: HashMap::new(),
+			raw_stream: None,
 		}
 	}
 
@@ -8746,7 +10085,8 @@ mod tests {
 		assert!(
 			events.iter().any(|event| matches!(
 				event,
-				BackendEvent::ToolFinished { id, ok: false, .. } if id.as_str() == "toolu_1"
+				BackendEvent::ToolFinished { id, terminal: ToolTerminal::Failed, .. }
+					if id.as_str() == "toolu_1"
 			)),
 			"started tool widget must settle as failed on turn failure"
 		);
@@ -9084,7 +10424,7 @@ mod tests {
 			started:  false,
 			fold:     ViewState::new(),
 		};
-		assert!(fold_tool_args(&registry, &mut unknown, false).is_none());
+		assert!(fold_tool_args(&renderers, &mut unknown, false).is_none());
 	}
 
 	#[test]
@@ -9129,25 +10469,45 @@ mod tests {
 			.register(test_identity("test.1"), TestRenderer("exact"))
 			.expect("register exact renderer");
 		for branch in ["ok", "faulted", "args_rejected", "aborted"] {
-			let (_, ok, view) =
+			let (_, terminal, view) =
 				render_tool_result_view(&renderers, &result_item("call", Some("test.1"), branch), None);
-			assert_eq!(ok, branch == "ok");
-			assert!(view.contains(branch), "{view}");
+			let expected = match branch {
+				"ok" => ToolTerminal::Succeeded,
+				"faulted" => ToolTerminal::Failed,
+				"args_rejected" => ToolTerminal::ArgsRejected,
+				"aborted" => ToolTerminal::Aborted,
+				_ => unreachable!(),
+			};
+			assert_eq!(terminal, expected);
+			assert!(view.as_str().contains(branch), "{}", view.as_str());
+			assert!(matches!(view, ToolViewContent::Markup(_)));
 		}
+		let mut skipped = result_item("skipped", Some("test.1"), "aborted");
+		let Some(item::Kind::ToolResult(result)) = skipped.kind.as_mut() else {
+			panic!("tool result fixture");
+		};
+		result.details = Some(json_proto(serde_json::json!({
+			"kind": "aborted",
+			"value": { "kind": "skipped", "reason": "steered" }
+		})));
+		let (_, terminal, _) = render_tool_result_view(&renderers, &skipped, None);
+		assert_eq!(terminal, ToolTerminal::Skipped);
 
 		let unknown = result_item("unknown", Some("unknown.9"), "faulted");
-		let (identity, ok, view) = render_tool_result_view(&renderers, &unknown, None);
+		let (identity, terminal, view) = render_tool_result_view(&renderers, &unknown, None);
 		assert_eq!(identity.rev.to_string(), "unknown.9");
-		assert!(!ok);
-		assert!(view.contains(r#""kind":"faulted""#));
-		assert!(view.contains("faulted-fact"));
+		assert_eq!(terminal, ToolTerminal::Failed);
+		assert!(matches!(&view, ToolViewContent::Plain(_)));
+		assert!(view.as_str().contains(r#""kind":"faulted""#));
+		assert!(view.as_str().contains("faulted-fact"));
 
 		let missing = result_item("missing", None, "aborted");
-		let (identity, ok, view) = render_tool_result_view(&renderers, &missing, None);
+		let (identity, terminal, view) = render_tool_result_view(&renderers, &missing, None);
 		assert_eq!(identity.rev.n, 0);
-		assert!(!ok);
-		assert!(view.contains(r#""kind":"aborted""#));
-		assert!(view.contains("aborted-fact"));
+		assert_eq!(terminal, ToolTerminal::Aborted);
+		assert!(matches!(&view, ToolViewContent::Plain(_)));
+		assert!(view.as_str().contains(r#""kind":"aborted""#));
+		assert!(view.as_str().contains("aborted-fact"));
 	}
 
 	#[test]
@@ -9190,5 +10550,6 @@ mod tests {
 		let second = replay();
 		assert_eq!(first, second);
 		assert_eq!(first.as_str(), "<row>two::ok</row>");
+		assert!(matches!(first, ToolViewContent::Markup(_)));
 	}
 }

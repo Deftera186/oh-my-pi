@@ -15,6 +15,7 @@ flume = { workspace = true }
 futures = { workspace = true }
 omp-docserver = { workspace = true }
 omp-agent = { workspace = true }
+omp-env = { workspace = true }
 omp-core = { workspace = true }
 omp-catalog = { workspace = true }
 omp-inference = { workspace = true }

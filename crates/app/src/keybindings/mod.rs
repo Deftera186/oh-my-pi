@@ -33,19 +33,49 @@ impl KeyPlatform {
 	}
 }
 
+const INTERRUPT: &[&str] = &["escape"];
+const CLEAR: &[&str] = &["ctrl+c"];
+const EXIT: &[&str] = &["ctrl+d"];
+const CYCLE_THINKING: &[&str] = &["shift+tab"];
+const TOGGLE_THINKING: &[&str] = &["ctrl+t"];
+const CYCLE_MODEL_FORWARD: &[&str] = &["ctrl+p"];
+const CYCLE_MODEL_BACKWARD: &[&str] = &["ctrl+shift+p"];
+const SELECT_MODEL: &[&str] = &["alt+p"];
+const TOGGLE_TOOL_TREE: &[&str] = &["ctrl+o"];
+const EXTERNAL_EDITOR: &[&str] = &["ctrl+g"];
 const FOLLOW_UP_DEFAULT: &[&str] = &["alt+enter"];
 const FOLLOW_UP_WINDOWS: &[&str] = &["alt+enter", "ctrl+q"];
+const RETRY: &[&str] = &["alt+r"];
 const DEQUEUE_MACOS: &[&str] = &["shift+up"];
 const DEQUEUE_DEFAULT: &[&str] = &["ctrl+up"];
+const TOGGLE_PLAN: &[&str] = &["alt+shift+p"];
+const TOGGLE_VOICE: &[&str] = &["ctrl+alt+s"];
+const TOGGLE_LIVE_VOICE: &[&str] = &["ctrl+alt+l"];
+const AGENT_HUB: &[&str] = &["alt+a"];
 const NO_FALLBACK: &[&str] = &[];
 
 /// Resolves platform-specific fallback chords for an unconfigured action.
 pub fn fallback_chords(action: &str, platform: KeyPlatform) -> &'static [&'static str] {
 	match (action, platform) {
+		("app.interrupt", _) => INTERRUPT,
+		("app.clear", _) => CLEAR,
+		("app.exit", _) => EXIT,
+		("app.thinking.cycle", _) => CYCLE_THINKING,
+		("app.thinking.toggle", _) => TOGGLE_THINKING,
+		("app.model.cycle_forward", _) => CYCLE_MODEL_FORWARD,
+		("app.model.cycle_backward", _) => CYCLE_MODEL_BACKWARD,
+		("app.model.select", _) => SELECT_MODEL,
+		("app.tools.toggle_tree", _) => TOGGLE_TOOL_TREE,
+		("app.editor.external", _) => EXTERNAL_EDITOR,
 		("app.message.follow_up", KeyPlatform::Windows) => FOLLOW_UP_WINDOWS,
 		("app.message.follow_up", _) => FOLLOW_UP_DEFAULT,
 		("app.message.dequeue", KeyPlatform::MacOs) => DEQUEUE_MACOS,
 		("app.message.dequeue", _) => DEQUEUE_DEFAULT,
+		("app.retry", _) => RETRY,
+		("app.plan.toggle", _) => TOGGLE_PLAN,
+		("app.voice.toggle", _) => TOGGLE_VOICE,
+		("app.voice.live_toggle", _) => TOGGLE_LIVE_VOICE,
+		("app.agent_hub", _) => AGENT_HUB,
 		_ => NO_FALLBACK,
 	}
 }

@@ -118,7 +118,7 @@ pub enum Format {
 
 /// Every recognized filename extension, longest first so `.tar.gz` wins over
 /// `.gz`. Shared by [`Format::from_path`] and single-member stem naming.
-const EXTENSION_TABLE: &[(&str, Format)] = &[
+pub const EXTENSION_TABLE: &[(&str, Format)] = &[
 	(".tar.bz2", Format::TarBz2),
 	(".tar.gz", Format::TarGz),
 	(".tar.xz", Format::TarXz),
@@ -163,6 +163,51 @@ const EXTENSION_TABLE: &[(&str, Format)] = &[
 	(".a", Format::Ar),
 	(".z", Format::Z),
 ];
+
+/// One plausible split between an archive path and a member selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathCandidate {
+	/// Authored archive container path.
+	pub archive_path: String,
+	/// Slash-normalized member path after the archive separator.
+	pub member_path:  String,
+	/// Format implied by the matched extension.
+	pub format:       Format,
+}
+
+/// Splits every recognized archive-extension boundary in `path`.
+///
+/// Candidates are returned longest archive path first. An extension is a
+/// boundary only at end of input or immediately before `:`.
+pub fn path_candidates(path: &str) -> Vec<PathCandidate> {
+	let normalized = path.replace('\\', "/");
+	let lower = normalized.to_ascii_lowercase();
+	let mut candidates = Vec::new();
+	for (start, byte) in lower.bytes().enumerate() {
+		if byte != b'.' {
+			continue;
+		}
+		for &(extension, format) in EXTENSION_TABLE {
+			if !lower[start..].starts_with(extension) {
+				continue;
+			}
+			let end = start + extension.len();
+			if end != lower.len() && lower.as_bytes().get(end) != Some(&b':') {
+				continue;
+			}
+			let archive_path = path[..end].to_owned();
+			let member_path = normalized[end..].trim_start_matches(':').to_owned();
+			if !candidates.iter().any(|candidate: &PathCandidate| {
+				candidate.archive_path == archive_path && candidate.member_path == member_path
+			}) {
+				candidates.push(PathCandidate { archive_path, member_path, format });
+			}
+			break;
+		}
+	}
+	candidates.sort_by_key(|candidate| cmp::Reverse(candidate.archive_path.len()));
+	candidates
+}
 
 impl Format {
 	/// Infers a format from a conventional archive filename.

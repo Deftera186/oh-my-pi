@@ -2,7 +2,7 @@
 
 pub mod finalize;
 
-use std::{error, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, env, error, path::PathBuf, sync::Arc};
 
 use omp_agent::{
 	Agent, AgentEvent, AgentKind, AgentRunSummary, AgentState, AgentStatus, AgentTree, ApprovalBook,
@@ -13,10 +13,15 @@ use omp_core::{SecretString, Str, sf};
 use omp_inference::Registry as InferenceRegistry;
 use omp_proto::thread::v1::Item;
 use omp_sdk::{SessionHandle, SessionIdentity, SessionRuntime};
-use omp_storage::transcript::{
-	ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
-	ProviderId as JournalProviderId,
+use omp_settings::manager::{MutationScope, SettingsManager, SettingsPaths};
+use omp_storage::{
+	index::SessionFilter,
+	transcript::{
+		ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
+		ProviderId as JournalProviderId,
+	},
 };
+use parking_lot::Mutex;
 
 use self::finalize::{FinalizerBudget, FinalizerReport, HeadlessFinalizerHandle};
 /// Typed failure while composing or mutating a headless session.
@@ -44,16 +49,20 @@ use omp_proto::inference::{v1, v1::response_format};
 use tokio::io;
 
 use crate::{
-	bridges::{AgentGoalBinding, AgentGoalControl, InferenceBridge, builtin},
+	bridges::{AgentGoalBinding, AgentGoalControl, InferenceBridge, builtin_with_content},
 	chat::{self},
 	discovery,
+	discovery::context,
+	memory::{ExtractionWorker, InferenceExtractionLane},
 	modes::RegimeHandle,
+	prompt_prep::{PromptSnapshot, settings::PromptSettings},
 	registry::{
 		InferenceSessionOverrides, ProductionInference, production_inference_for_session,
 		production_redemption_authority,
 	},
 	rulebook,
-	settings::current,
+	settings::Settings,
+	skills,
 };
 
 /// Inputs required to create one production headless session.
@@ -61,6 +70,8 @@ use crate::{
 pub struct HeadlessSessionOptions {
 	/// Project root whose Environment owns all effects.
 	pub project:               PathBuf,
+	/// Ordered invocation-local TOML or YAML settings overlays.
+	pub settings_overlays:     Box<[PathBuf]>,
 	/// Additional Environment-authorized workspace roots.
 	pub additional_roots:      Box<[PathBuf]>,
 	/// Resolved catalog model selector.
@@ -91,6 +102,116 @@ pub struct HeadlessSessionOptions {
 	/// Session-incarnation fence stamped onto observable events.
 	pub session_generation:    u64,
 }
+/// Persistence operation selected by a non-interactive launch.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HeadlessSessionOpen {
+	/// Create a fresh indexed durable session.
+	#[default]
+	New,
+	/// Resume one exact durable session.
+	Resume(Str),
+	/// Fork one exact durable session into a new identity.
+	Fork(Str),
+	/// Resume the newest indexed interactive session for the project.
+	ContinueLatest,
+	/// Create process-lifetime state removed when the headless owner drops.
+	Ephemeral,
+}
+
+/// Model-callable tool inclusion policy frozen at headless launch.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HeadlessToolPolicy {
+	/// Advertise every session-eligible Environment tool.
+	#[default]
+	All,
+	/// Advertise no tools.
+	None,
+	/// Advertise only the exact ordered tool names.
+	Only(Box<[Str]>),
+}
+
+/// Typed non-interactive launch policy shared by print, RPC, and ACP.
+#[derive(Clone, Debug)]
+pub struct HeadlessLaunchPolicy {
+	/// Durable or process-lifetime session operation.
+	pub session:            HeadlessSessionOpen,
+	/// Exact journal directory supplied by the caller's storage authority.
+	pub sessions_dir:       Option<PathBuf>,
+	/// Frozen tool inclusion policy.
+	pub tools:              HeadlessToolPolicy,
+	/// Whether the `lsp` tool remains callable.
+	pub lsp_enabled:        bool,
+	/// Automatic-thinking policy installed before the agent actor starts.
+	pub auto_thinking:      Option<crate::settings::AutoThinkingSettings>,
+	/// Invocation-local native extension/content root policy.
+	pub native_discovery:   discovery::native::NativeDiscoveryOptions,
+	/// Already-admitted trusted or contributed extension host specifications.
+	pub extension_specs:    Arc<[omp_envd::worker::ExtHostSpec]>,
+	/// Manifest-validated contributed CLI values delivered at extension start.
+	pub contributed_values: Arc<[omp_ext::config::ContributedCliValue]>,
+}
+impl Default for HeadlessLaunchPolicy {
+	fn default() -> Self {
+		Self {
+			session:            HeadlessSessionOpen::New,
+			sessions_dir:       None,
+			tools:              HeadlessToolPolicy::All,
+			lsp_enabled:        true,
+			auto_thinking:      None,
+			native_discovery:   discovery::native::NativeDiscoveryOptions::default(),
+			extension_specs:    Arc::from([]),
+			contributed_values: Arc::from([]),
+		}
+	}
+}
+
+fn apply_tool_policy(
+	snapshot: &mut omp_agent::AgentSnapshot,
+	policy: &HeadlessToolPolicy,
+	lsp_enabled: bool,
+) {
+	let allowed = |name: &str| lsp_enabled || name != "lsp";
+	let selected = match policy {
+		HeadlessToolPolicy::All => snapshot
+			.enabled_tools
+			.iter()
+			.filter(|name| allowed(name.as_str()))
+			.cloned()
+			.collect::<Vec<_>>(),
+		HeadlessToolPolicy::None => Vec::new(),
+		HeadlessToolPolicy::Only(names) => names
+			.iter()
+			.filter(|name| {
+				allowed(name.as_str())
+					&& snapshot
+						.enabled_tools
+						.iter()
+						.any(|available| available == *name)
+			})
+			.cloned()
+			.collect::<Vec<_>>(),
+	};
+	snapshot
+		.turn
+		.params
+		.tools
+		.retain(|tool| selected.iter().any(|name| name.as_str() == tool.name));
+	snapshot.enabled_tools = selected.into();
+}
+fn validate_extension_host_keys<'a>(
+	keys: impl IntoIterator<Item = &'a omp_envd::worker::HostKey>,
+) -> Result<(), HeadlessError> {
+	let mut seen = BTreeSet::new();
+	for key in keys {
+		if !seen.insert(key.clone()) {
+			return Err(composition(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("duplicate extension host identity: {key:?}"),
+			)));
+		}
+	}
+	Ok(())
+}
 
 /// Single owner of every authority needed by a non-interactive agent loop.
 ///
@@ -116,7 +237,16 @@ pub struct HeadlessSession {
 	session_id:          Str,
 	initial_items:       Vec<Item>,
 	_inference_registry: InferenceRegistry,
+	_catalog:            Arc<snapshot::Catalog>,
 	_edit_repair_task:   Option<tokio::task::JoinHandle<()>>,
+	_memory_extraction:  Option<ExtractionWorker>,
+	_ephemeral_sessions: Option<chat::EphemeralSessions>,
+	_tool_policy:        HeadlessToolPolicy,
+	_lsp_enabled:        bool,
+	_compaction_methods: omp_agent::CompactionMethodOrder,
+	_mid_turn_policy:    omp_agent::MidTurnCompactionPolicy,
+	_retry_policy:       omp_agent::RetryPolicy,
+	_forced_tool:        Mutex<Option<Str>>,
 	_environment:        omp_envd::ProjectEnvironment,
 }
 
@@ -127,7 +257,29 @@ impl HeadlessSession {
 		data_dir: PathBuf,
 		options: HeadlessSessionOptions,
 	) -> Result<Self, HeadlessError> {
-		Self::open_inner(data_dir, options, None).await
+		let session = if let Some(source) = options.fork.clone() {
+			HeadlessSessionOpen::Fork(source)
+		} else if let Some(source) = options.resume.clone() {
+			HeadlessSessionOpen::Resume(source)
+		} else {
+			HeadlessSessionOpen::New
+		};
+		Self::open_with_policy(data_dir, options, HeadlessLaunchPolicy {
+			session,
+			lsp_enabled: true,
+			..HeadlessLaunchPolicy::default()
+		})
+		.await
+	}
+
+	/// Constructs a production session with explicit persistence and tool
+	/// policies instead of reinterpreting protocol-specific flags.
+	pub async fn open_with_policy(
+		data_dir: PathBuf,
+		options: HeadlessSessionOptions,
+		policy: HeadlessLaunchPolicy,
+	) -> Result<Self, HeadlessError> {
+		Self::open_inner(data_dir, options, policy, None).await
 	}
 
 	/// Constructs a production session over an exact command-owned tool
@@ -137,21 +289,103 @@ impl HeadlessSession {
 		options: HeadlessSessionOptions,
 		registry: Arc<omp_tool::Registry>,
 	) -> Result<Self, HeadlessError> {
-		Self::open_inner(data_dir, options, Some(registry)).await
+		let session = if let Some(source) = options.fork.clone() {
+			HeadlessSessionOpen::Fork(source)
+		} else if let Some(source) = options.resume.clone() {
+			HeadlessSessionOpen::Resume(source)
+		} else {
+			HeadlessSessionOpen::New
+		};
+		Self::open_inner(
+			data_dir,
+			options,
+			HeadlessLaunchPolicy { session, ..HeadlessLaunchPolicy::default() },
+			Some(registry),
+		)
+		.await
 	}
 
 	async fn open_inner(
 		data_dir: PathBuf,
 		options: HeadlessSessionOptions,
+		policy: HeadlessLaunchPolicy,
 		registry_override: Option<Arc<omp_tool::Registry>>,
 	) -> Result<Self, HeadlessError> {
 		let root = chat::canonical_project(&options.project).map_err(composition)?;
-		let catalog = snapshot::Catalog::try_embedded().map_err(composition)?;
+		let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+		let catalog_owner = crate::registry::production_catalog(&data_dir).map_err(composition)?;
+		let catalog = catalog_owner.as_ref();
 		let model =
 			chat::resolve_model_selector(catalog, options.model.as_str()).map_err(composition)?;
-		let settings = current(&data_dir).map_err(composition)?;
+		let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&root));
+		settings_paths
+			.overlays
+			.extend(options.settings_overlays.iter().cloned());
+		let settings_manager = SettingsManager::open(settings_paths).map_err(composition)?;
+		if let Some(approval_mode) = options.approval_mode {
+			settings_manager
+				.set_sync(MutationScope::Runtime, "tools.approval_mode", &approval_mode.to_string())
+				.map_err(composition)?;
+		}
+		let settings_snapshot = settings_manager.snapshot();
+		let mut settings = settings_snapshot
+			.project::<Settings>()
+			.map_err(composition)?
+			.get()
+			.clone();
+		settings.mnemopi = settings.mnemopi.normalize();
+		let model_settings = settings_snapshot
+			.project::<omp_catalog::settings::ModelSettings>()
+			.map_err(composition)?
+			.get()
+			.resolve_path_scopes(&root, &home);
+		let prompt_discovery_settings = discovery::PromptDiscoverySettings {
+			model:   model_settings.clone(),
+			skills:  settings_snapshot
+				.project::<discovery::skills::SkillDiscoverySettings>()
+				.map_err(composition)?
+				.get()
+				.clone(),
+			foreign: settings_snapshot
+				.project::<discovery::foreign::ForeignContentSettings>()
+				.map_err(composition)?
+				.get()
+				.clone(),
+			rules:   settings_snapshot
+				.project::<crate::rulebook::RulebookSettings>()
+				.map_err(composition)?
+				.get()
+				.clone(),
+			native:  policy.native_discovery.clone(),
+		};
+		let prompt_discovery = discovery::active_prompt_snapshots(
+			&root,
+			&options.additional_roots,
+			&home,
+			&prompt_discovery_settings,
+		);
+		if !crate::discovery::roles::model_selector_allowed(catalog, &model_settings, model.as_str())
+		{
+			return Err(HeadlessError::MissingRoute(model));
+		}
 		let state_dir = omp_env::project_state::directory(&data_dir, &root).map_err(composition)?;
-		let sessions_dir = state_dir.join("sessions");
+		let mut ephemeral_sessions = None;
+		let sessions_dir = match (&policy.session, policy.sessions_dir.as_ref()) {
+			(HeadlessSessionOpen::Ephemeral, Some(_)) => {
+				return Err(composition(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"ephemeral headless sessions cannot use a durable sessions directory",
+				)));
+			},
+			(HeadlessSessionOpen::Ephemeral, None) => {
+				let owner = chat::EphemeralSessions::create().map_err(composition)?;
+				let path = owner.path().to_owned();
+				ephemeral_sessions = Some(owner);
+				path
+			},
+			(_, Some(directory)) => directory.clone(),
+			(_, None) => state_dir.join("sessions"),
+		};
 		chat::ensure_state_directory(&state_dir).map_err(composition)?;
 		chat::ensure_state_directory(&sessions_dir).map_err(composition)?;
 		let search = Arc::new(InferenceBridge::default());
@@ -159,19 +393,32 @@ impl HeadlessSession {
 		let advise_queue = omp_agent::advisor::AdvisorAdviceQueue::default();
 		let (edit_repair, edit_repair_requests) =
 			omp_tools::edit::observer::EditRepairClient::channel();
-		let mut bridges =
-			builtin(&root, Arc::clone(&search), goal_control.clone(), None, advise_queue.clone());
+		let extension_specs = prompt_discovery
+			.content
+			.extensions
+			.iter()
+			.chain(policy.extension_specs.iter())
+			.cloned()
+			.collect::<Vec<_>>();
+		validate_extension_host_keys(extension_specs.iter().map(|extension| &extension.key))?;
+		let mut bridges = builtin_with_content(
+			&root,
+			Arc::clone(&search),
+			goal_control.clone(),
+			None,
+			advise_queue.clone(),
+			&prompt_discovery.content,
+		);
 		bridges.edit_model = Some(model.clone());
 		bridges.edit_repair = settings.tools.edit_auto_repair.then_some(edit_repair);
-		let environment = omp_envd::ProjectEnvironment::connect_or_start(
+		let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
 			&root,
 			&state_dir,
-			&omp_env::project_state::environment_socket(&state_dir),
 			&omp_env::project_state::document_socket(&state_dir),
 			options.py_eval,
-			options.approval_mode,
-			&[],
-			settings.runtime_durations().interrupt_grace,
+			&extension_specs,
+			policy.contributed_values.as_ref(),
+			Arc::clone(&settings_snapshot),
 			bridges,
 		)
 		.await
@@ -184,21 +431,52 @@ impl HeadlessSession {
 		};
 		let env = environment.client().with_invocation_grant(grant);
 		let registry = registry_override.unwrap_or_else(|| environment.registry());
-		let open = if let Some(source) = options.fork.as_ref() {
-			chat::SessionOpen::Fork(source)
-		} else if let Some(source) = options.resume.as_ref() {
-			chat::SessionOpen::Resume(source)
+		let continue_latest = if policy.session == HeadlessSessionOpen::ContinueLatest {
+			let page = environment
+				.sessions_index()
+				.list(&SessionFilter {
+					project: Some(Str::from(root.to_string_lossy().as_ref())),
+					limit: 1,
+					..SessionFilter::default()
+				})
+				.map_err(composition)?;
+			Some(
+				page
+					.sessions
+					.first()
+					.map(|session| session.id.0.clone())
+					.ok_or_else(|| {
+						composition(io::Error::new(
+							io::ErrorKind::NotFound,
+							"no durable headless session exists for this project",
+						))
+					})?,
+			)
 		} else {
-			chat::SessionOpen::New
+			None
+		};
+		let open = match &policy.session {
+			HeadlessSessionOpen::New => chat::SessionOpen::New,
+			HeadlessSessionOpen::Resume(source) => chat::SessionOpen::Resume(source),
+			HeadlessSessionOpen::Fork(source) => chat::SessionOpen::Fork(source),
+			HeadlessSessionOpen::ContinueLatest => chat::SessionOpen::Resume(
+				continue_latest
+					.as_ref()
+					.expect("latest session resolved above"),
+			),
+			HeadlessSessionOpen::Ephemeral => chat::SessionOpen::Ephemeral,
 		};
 		let mut session = chat::open_session(
 			&root,
 			&sessions_dir,
 			open,
 			registry.as_ref(),
-			Some(environment.sessions_index()),
+			(policy.session != HeadlessSessionOpen::Ephemeral).then(|| environment.sessions_index()),
 		)
 		.map_err(composition)?;
+		let env = env
+			.with_principal(session.id.clone(), session.id.clone())
+			.map_err(composition)?;
 		let blueprint = chat::session_blueprint(
 			model.as_str(),
 			catalog,
@@ -209,12 +487,16 @@ impl HeadlessSession {
 		)
 		.map_err(composition)?;
 		let mut snapshot = chat::agent_snapshot(&blueprint, catalog, None).map_err(composition)?;
-		if options.resume.is_some() || options.fork.is_some() {
+		if matches!(
+			policy.session,
+			HeadlessSessionOpen::Resume(_)
+				| HeadlessSessionOpen::Fork(_)
+				| HeadlessSessionOpen::ContinueLatest
+		) {
 			let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
 			let revived = omp_agent::revive_existing(&journal_path, session.journal, snapshot)
 				.map_err(composition)?;
 			session.journal = revived.journal;
-			session.initial_items = revived.live_items;
 			snapshot = revived.snapshot;
 			if let Some(model) = revived.model_override
 				&& !model.fallback
@@ -223,8 +505,65 @@ impl HeadlessSession {
 					format!("{}/{}", model.model.provider.0, model.model.model.0);
 			}
 		}
-		snapshot.compaction = settings.compaction.method_order();
-		snapshot.unexpected_stop = settings.interaction.unexpected_stop_detection;
+		apply_tool_policy(&mut snapshot, &policy.tools, policy.lsp_enabled);
+		let content = prompt_discovery.content;
+		for warning in content.warnings.iter() {
+			tracing::warn!(%warning, "headless content discovery warning");
+		}
+		for diagnostic in prompt_discovery.context.diagnostics.iter() {
+			tracing::warn!(?diagnostic, "headless context discovery warning");
+		}
+		let prompt_settings = settings_snapshot
+			.project::<PromptSettings>()
+			.map_err(composition)?
+			.get()
+			.clone()
+			.resolve_inputs(&root, &home)
+			.map_err(composition)?;
+		let mut prompt_facts = blueprint.prompt_facts().clone();
+		prompt_facts.settings = prompt_settings.clone().into();
+		prompt_facts.model = omp_agent::ModelPromptInput {
+			identifier:        Str::new(&snapshot.turn.params.model),
+			codex_task_policy: crate::task::prompt_policy::uses_codex_task_prompt(
+				&snapshot.turn.params.model,
+			),
+		};
+		prompt_facts.context_files = context::prompt_files(&prompt_discovery.context);
+		let prompt_rules = rulebook::prompt_inputs(&content.rules);
+		let prompt_skills = if prompt_settings.skills_enabled {
+			skills::prompt_inputs(&content.skills)
+		} else {
+			Arc::from([])
+		};
+		let prepared_prompt = PromptSnapshot::freeze(
+			prompt_facts,
+			registry.as_ref(),
+			Some(&snapshot.enabled_tools),
+			Arc::from([]),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			prompt_rules,
+			prompt_skills,
+			Arc::from([]),
+		);
+		let mut prompt_facts = prepared_prompt.workspace;
+		let prepared =
+			crate::prompt_prep::prepare_environment_inputs_bounded(&env, &session.journal, &root)
+				.await;
+		prompt_facts.host = prepared.host;
+		prompt_facts.roots = prepared.roots;
+		snapshot.props = prompt_facts.props().map_err(composition)?;
+		let selected_model = catalog
+			.model(omp_catalog::ModelKey::from_ref(&snapshot.turn.params.model))
+			.or_else(|| catalog.resolve_alias(&snapshot.turn.params.model));
+		let promotion_target = selected_model
+			.and_then(|model| model.context_promotion_target.as_ref())
+			.map(|target| Str::new(target.as_str()));
+		let usable_context = chat::model_usable_context_window(catalog, &snapshot.turn.params.model)
+			.unwrap_or(u64::MAX);
+		let threshold_tokens =
+			((usable_context as f64) * settings.compaction.threshold_fraction) as u64;
 		let autolearn = omp_agent::AutolearnSettings {
 			enabled:        settings.autolearn.enabled
 				&& registry
@@ -240,6 +579,7 @@ impl HeadlessSession {
 			credential_authority,
 			mcp_authority,
 			mcp_oauth,
+			auth_control,
 			..
 		} = production_inference_for_session(
 			&data_dir,
@@ -250,13 +590,17 @@ impl HeadlessSession {
 				api_key:               options.api_key,
 				prompt_cache_affinity: options.prompt_cache_affinity,
 				usage_fetchers:        Some(environment.usage_fetchers()),
+				settings:              Some(Arc::clone(&settings_snapshot)),
 			},
 		)
 		.await
 		.map_err(composition)?;
 		let _ = search.bind(inference.clone());
 		let _ = environment.github_credentials().bind(credential_authority);
-		environment.bind_mcp_oauth(mcp_authority, mcp_oauth);
+		environment
+			.bind_mcp_oauth(mcp_authority, mcp_oauth, auth_control)
+			.await
+			.map_err(composition)?;
 		let client = InProcTurnClient::new(inference)
 			.await
 			.map_err(composition)?;
@@ -272,17 +616,57 @@ impl HeadlessSession {
 			settings.security.enabled,
 			Arc::clone(&tree),
 		));
+		advisor_parent.set_prompt_discovery_settings(prompt_discovery_settings);
+		if let Some(auto_thinking) = policy.auto_thinking {
+			advisor_parent.set_auto_thinking_settings(auto_thinking);
+		}
 		let edit_repair_task = settings.tools.edit_auto_repair.then(|| {
 			chat::spawn_edit_repair_service(Arc::clone(&advisor_parent), edit_repair_requests)
 		});
 		let journal_path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
-		let content = discovery::active_content_snapshots(&root);
 		let (ttsr, ttsr_diagnostics) = rulebook::ttsr_registry(content.rules.as_ref());
 		for error in ttsr_diagnostics {
 			tracing::warn!(%error, "headless TTSR rule condition was rejected");
 		}
+		let memory_lane = InferenceExtractionLane::from_settings(
+			client.clone(),
+			state.snapshot().turn.params.clone(),
+			&settings.mnemopi,
+			model_settings.memory_selector.as_str(),
+		);
+		if let Some(lane) = memory_lane.as_ref() {
+			environment
+				.reflection_bridge()
+				.bind(Arc::new(lane.clone()))
+				.map_err(composition)?;
+		}
+		let memory_extraction = memory_lane.map(|lane| {
+			ExtractionWorker::start(
+				environment.memory_runtime(),
+				lane,
+				settings.mnemopi.shutdown_timeout_ms,
+			)
+		});
 		let mut agent =
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
+		let compaction_methods = settings.compaction.method_order();
+		let mid_turn_policy = omp_agent::MidTurnCompactionPolicy {
+			enabled: settings.compaction.enabled && settings.compaction.mid_turn_enabled,
+			threshold_tokens,
+		};
+		let retry_policy = state.snapshot().retry;
+		if policy.auto_thinking.is_some() {
+			agent.set_difficulty_classifier(advisor_parent.clone());
+		}
+		agent.set_session_memory(omp_memory::session::SessionMemory::top_level(
+			environment.memory_runtime(),
+		));
+		agent.set_steering_mode(settings.interaction.steering_mode.into());
+		agent.set_context_promotion(omp_agent::ContextPromotionPolicy {
+			enabled: settings.context_promotion.enabled,
+			target:  promotion_target,
+		});
+		agent.set_mid_turn_compaction(mid_turn_policy);
 		agent.configure_streaming_edit_guard(root.clone(), settings.tools.edit_streaming_abort);
 		agent.set_unexpected_stop_classifier(advisor_parent.clone());
 		agent.set_autolearn(autolearn);
@@ -350,6 +734,7 @@ impl HeadlessSession {
 				SessionIdentity { id: session.id.clone(), journal_path, expected_revision: None },
 				SessionRuntime::from_agent(agent),
 				None,
+				None,
 			)
 			.map_err(composition)?;
 		let events = session_handle.subscribe_lossless();
@@ -378,7 +763,16 @@ impl HeadlessSession {
 			session_id: session.id,
 			initial_items: session.initial_items,
 			_inference_registry: inference_registry,
+			_catalog: catalog_owner,
 			_edit_repair_task: edit_repair_task,
+			_memory_extraction: memory_extraction,
+			_ephemeral_sessions: ephemeral_sessions,
+			_tool_policy: policy.tools,
+			_lsp_enabled: policy.lsp_enabled,
+			_compaction_methods: compaction_methods,
+			_mid_turn_policy: mid_turn_policy,
+			_retry_policy: retry_policy,
+			_forced_tool: Mutex::new(None),
 			_environment: environment,
 		})
 	}
@@ -389,7 +783,85 @@ impl HeadlessSession {
 		items: impl IntoIterator<Item = Item>,
 		turn_id: TurnId,
 	) -> Result<AgentRunSummary, omp_sdk::SessionHandleError> {
-		self.session.submit(items, turn_id).await
+		let forced = self._forced_tool.lock().take();
+		let previous = forced
+			.as_ref()
+			.map(|_| self.state.snapshot().turn.params.tool_choice.clone());
+		if let Some(name) = forced {
+			self.state.update(|snapshot| {
+				snapshot.turn.params.tool_choice = Some(v1::ToolChoice {
+					mode:           v1::tool_choice::Mode::Named as i32,
+					name:           name.to_string(),
+					on_unsupported: v1::Fallback::Error as i32,
+				});
+			});
+		}
+		let result = self.session.submit(items, turn_id).await;
+		if let Some(previous) = previous {
+			self
+				.state
+				.update(|snapshot| snapshot.turn.params.tool_choice = previous);
+		}
+		result
+	}
+
+	/// Forces one exact registered tool for the next submitted turn only.
+	pub fn force_tool_once(&self, name: Str) -> Result<(), HeadlessError> {
+		if !self.state.snapshot().enabled_tools.contains(&name) {
+			return Err(composition(io::Error::new(
+				io::ErrorKind::NotFound,
+				format!("tool `{name}` is not enabled"),
+			)));
+		}
+		*self._forced_tool.lock() = Some(name);
+		Ok(())
+	}
+
+	/// Enables or disables automatic and mid-turn compaction immediately.
+	pub fn set_auto_compaction(&self, enabled: bool) {
+		self.state.update(|snapshot| {
+			snapshot.compaction = if enabled {
+				self._compaction_methods.clone()
+			} else {
+				omp_agent::CompactionMethodOrder::resolve(&[])
+			};
+			snapshot.mid_turn_compaction = if enabled {
+				self._mid_turn_policy
+			} else {
+				omp_agent::MidTurnCompactionPolicy { enabled: false, ..self._mid_turn_policy }
+			};
+		});
+	}
+
+	/// Enables configured turn retries or restricts execution to one attempt.
+	pub fn set_auto_retry(&self, enabled: bool) {
+		let retry = if enabled {
+			self._retry_policy
+		} else {
+			omp_agent::RetryPolicy::new(
+				std::num::NonZeroU32::new(1).expect("one is non-zero"),
+				std::time::Duration::ZERO,
+				std::time::Duration::ZERO,
+			)
+			.expect("one-attempt retry policy is valid")
+		};
+		self.state.update(|snapshot| snapshot.retry = retry);
+	}
+
+	/// Aborts an active retry/submission immediately.
+	pub fn abort_retry(&self) {
+		self.interrupt();
+	}
+
+	/// Selects provider priority service or restores provider-default service.
+	pub fn set_fast_mode(&self, enabled: bool) {
+		self.state.update(|snapshot| {
+			snapshot.turn.params.service_tier = if enabled {
+				v1::ServiceTier::Priority as i32
+			} else {
+				v1::ServiceTier::Unspecified as i32
+			};
+		});
 	}
 
 	/// Rewinds and resubmits the latest durable user turn.
@@ -422,6 +894,70 @@ impl HeadlessSession {
 	/// Clone-shared session queue backing the environment's `advise@1` device.
 	pub fn advise_queue(&self) -> omp_agent::advisor::AdvisorAdviceQueue {
 		self.advise_queue.clone()
+	}
+
+	/// Returns the canonical Environment-owned native tool registry.
+	pub fn tool_registry(&self) -> Arc<omp_tool::Registry> {
+		self._environment.registry()
+	}
+
+	/// Returns the live extension-generation replacement authority.
+	pub fn extension_reload_handle(&self) -> omp_envd::ExtensionReloadHandle {
+		self._environment.extension_reload_handle()
+	}
+
+	/// Atomically replaces one attached host's model-visible tool roster.
+	///
+	/// Subsequent calls in the same durable session advertise and execute the
+	/// replacement generation through the ordinary agent tool loop.
+	pub fn replace_host_tools(
+		&self,
+		claimant: Str,
+		roster_revision: u64,
+		specs: Vec<omp_tool::HostToolSpec>,
+		executor: Arc<dyn omp_tool::HostToolExecutor>,
+	) -> Result<(), HeadlessError> {
+		let registry = self._environment.registry();
+		registry
+			.replace_host_tools(claimant, roster_revision, specs, executor)
+			.map_err(composition)?;
+		let advertised = if chat::model_rejects_tools(
+			self._catalog.as_ref(),
+			self.state.snapshot().turn.params.model.as_str(),
+		) {
+			Vec::new()
+		} else {
+			registry
+				.advertise(omp_tool::LoweringCaps {
+					strict_schema:  true,
+					grammar:        omp_catalog::GrammarBits::ALL,
+					maximum_tools:  None,
+					maximum_strict: None,
+				})
+				.map_err(composition)?
+		};
+		let mut names = Vec::new();
+		let mut tools = Vec::new();
+		for tool in advertised {
+			let name = &tool.identity.name;
+			let selected = self._lsp_enabled || name != "lsp";
+			let selected = selected
+				&& match &self._tool_policy {
+					HeadlessToolPolicy::All => true,
+					HeadlessToolPolicy::None => false,
+					HeadlessToolPolicy::Only(allowed) => allowed.contains(name),
+				};
+			if selected {
+				names.push(name.clone());
+				tools.push(chat::protocol_tool_definition(tool.definition).map_err(composition)?);
+			}
+		}
+		self.state.update(|snapshot| {
+			snapshot.registry = Arc::clone(&registry);
+			snapshot.enabled_tools = names.into();
+			snapshot.turn.params.tools = tools;
+		});
+		Ok(())
 	}
 
 	/// Lists model-callable environment tools available to advisor grant
@@ -477,7 +1013,7 @@ impl HeadlessSession {
 	/// Applies a validated session-only model override and records it in the
 	/// owning v4 journal before changing the live snapshot.
 	pub async fn set_model(&self, selector: &str) -> Result<(), HeadlessError> {
-		let catalog = snapshot::Catalog::try_embedded().map_err(composition)?;
+		let catalog = self._catalog.as_ref();
 		let model = chat::resolve_model_selector(catalog, selector).map_err(composition)?;
 		let spec = catalog
 			.model(ModelKey::from_ref(model.as_str()))
@@ -628,6 +1164,9 @@ impl HeadlessSession {
 	/// Disposes the live session without running mode-specific finalizers.
 	pub(crate) async fn dispose(&mut self) {
 		let _ = self.session.dispose().await;
+		if let Some(worker) = self._memory_extraction.as_mut() {
+			worker.shutdown().await;
+		}
 	}
 
 	/// Runs ordered bounded finalization. Dropping this session afterward
@@ -640,6 +1179,9 @@ impl HeadlessSession {
 			.finalize(stdout, budget)
 			.await;
 		let _ = self.session.dispose().await;
+		if let Some(worker) = self._memory_extraction.as_mut() {
+			worker.shutdown().await;
+		}
 		report
 	}
 
@@ -647,6 +1189,33 @@ impl HeadlessSession {
 	/// event bus. Intended for typed mode transitions owned by protocol hosts.
 	pub fn publish(&self, event: AgentEvent) {
 		self.session.publish(event);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn duplicate_extension_host_keys_fail_before_environment_freeze() {
+		let key = omp_envd::worker::HostKey::new("project", "trusted", "example/tool");
+		let error = validate_extension_host_keys([&key, &key]).expect_err("duplicate rejected");
+		assert_eq!(error.to_string(), "headless session composition failed");
+		let HeadlessError::Composition(source) = error else {
+			panic!("duplicate key must be a composition error");
+		};
+		assert_eq!(
+			source.to_string(),
+			"duplicate extension host identity: HostKey { layer: \"project\", tier: \"trusted\", \
+			 extension: \"example/tool\" }",
+		);
+	}
+
+	#[test]
+	fn distinct_extension_host_keys_are_admitted() {
+		let first = omp_envd::worker::HostKey::new("project", "trusted", "example/one");
+		let second = omp_envd::worker::HostKey::new("user", "trusted", "example/one");
+		validate_extension_host_keys([&first, &second]).expect("distinct scoped keys");
 	}
 }
 

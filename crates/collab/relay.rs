@@ -4,12 +4,12 @@ use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;
 use futures::{SinkExt as _, StreamExt as _};
-use omp_proto::collab::v1::{CollabFrame, Hello, PeerLeft, Welcome, collab_frame};
+use omp_proto::collab::v1::{CollabFrame, Hello, PeerJoined, PeerLeft, Welcome, collab_frame};
 use rand::RngExt as _;
 use serde::Deserialize;
 use strum::IntoStaticStr;
 use thiserror::Error;
-use tokio::{net::TcpStream, time};
+use tokio::net::TcpStream;
 use tokio_tungstenite::{
 	MaybeTlsStream, WebSocketStream, connect_async_with_config,
 	tungstenite::{
@@ -80,7 +80,7 @@ impl Handshake {
 	}
 
 	/// Accepts the expected peer handshake frame and refuses all revisions but
-	/// v1.
+	/// revision 3.
 	pub fn accept(&mut self, frame: &CollabFrame) -> Result<(), RelayError> {
 		if frame.protocol_revision != PROTOCOL_REVISION {
 			return Err(RelayError::ProtocolRevision {
@@ -178,11 +178,6 @@ impl ReconnectQueue {
 	pub const fn bytes(&self) -> usize {
 		self.bytes
 	}
-
-	fn clear(&mut self) {
-		self.frames.clear();
-		self.bytes = 0;
-	}
 }
 
 /// Exponential 1–30 second reconnect schedule with 0.75–1.25 jitter.
@@ -212,6 +207,8 @@ impl ReconnectBackoff {
 pub enum RelayInbound {
 	/// Authenticated peer frame with clear route metadata.
 	Frame(RoutedFrame),
+	/// Relay notification that one peer connected.
+	PeerJoined(PeerJoined),
 	/// Relay notification that one peer disconnected.
 	PeerLeft(PeerLeft),
 }
@@ -222,13 +219,13 @@ pub enum RelayInbound {
 /// receiving/opening therefore form one ordered chain without per-frame task or
 /// future allocation.
 pub struct RelayClient {
-	url:      Url,
-	role:     RelayRole,
-	key:      RoomKey,
-	socket:   Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-	pending:  ReconnectQueue,
-	backoff:  ReconnectBackoff,
-	terminal: bool,
+	url:              Url,
+	role:             RelayRole,
+	key:              RoomKey,
+	socket:           Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+	backoff:          ReconnectBackoff,
+	terminal:         bool,
+	inbound_revision: u64,
 }
 
 impl RelayClient {
@@ -243,9 +240,9 @@ impl RelayClient {
 			role,
 			key,
 			socket: None,
-			pending: ReconnectQueue::default(),
 			backoff: ReconnectBackoff::default(),
 			terminal: false,
+			inbound_revision: 0,
 		})
 	}
 
@@ -259,7 +256,7 @@ impl RelayClient {
 		request_url
 			.query_pairs_mut()
 			.append_pair("role", role)
-			.append_pair("revision", "1");
+			.append_pair("revision", "3");
 		let mut socket_config = WebSocketConfig::default();
 		socket_config.write_buffer_size = BACKPRESSURE_LOW_WATERMARK;
 		socket_config.max_write_buffer_size = BACKPRESSURE_HIGH_WATERMARK;
@@ -269,10 +266,14 @@ impl RelayClient {
 			.map_err(RelayError::Socket)?;
 		self.socket = Some(socket);
 		self.backoff.reset();
-		self.drain().await
+		Ok(())
 	}
 
-	/// Seals and sends in caller order, retaining a frame when disconnected.
+	/// Seals and sends in caller order.
+	///
+	/// A disconnected or ambiguous send is never retained. This prevents a
+	/// mutation from executing after its caller has observed a retryable
+	/// refusal.
 	pub async fn send(
 		&mut self,
 		route: RelayRoute,
@@ -283,13 +284,13 @@ impl RelayClient {
 		}
 		let encoded: Bytes = encode_envelope(&self.key, route, frame)?.into();
 		let Some(socket) = self.socket.as_mut() else {
-			return Ok(self.pending.push(encoded));
+			return Ok(SendDisposition::Queued);
 		};
-		match socket.send(Message::Binary(encoded.clone())).await {
+		match socket.send(Message::Binary(encoded)).await {
 			Ok(()) => Ok(SendDisposition::Sent),
 			Err(_) => {
 				self.socket = None;
-				Ok(self.pending.push(encoded))
+				Ok(SendDisposition::Queued)
 			},
 		}
 	}
@@ -304,9 +305,19 @@ impl RelayClient {
 				self.socket = None;
 				return Ok(None);
 			};
-			match message.map_err(RelayError::Socket)? {
+			let message = match message {
+				Ok(message) => message,
+				Err(_) => {
+					self.socket = None;
+					return Ok(None);
+				},
+			};
+			match message {
 				Message::Binary(bytes) => match decode_envelope(&self.key, &bytes) {
-					Ok(frame) => return Ok(Some(RelayInbound::Frame(frame))),
+					Ok(mut frame) => {
+						self.normalize_inbound_revisions(&mut frame);
+						return Ok(Some(RelayInbound::Frame(frame)));
+					},
 					Err(error @ CodecError::Crypto(_)) => {
 						self.fail_terminal();
 						return Err(RelayError::Authentication(error));
@@ -316,7 +327,16 @@ impl RelayClient {
 				Message::Text(text) => {
 					let control: TextControl =
 						serde_json::from_str(text.as_ref()).map_err(RelayError::Control)?;
-					return Ok(Some(RelayInbound::PeerLeft(PeerLeft { peer_id: control.peer_id() })));
+					return Ok(Some(match control {
+						TextControl::PeerJoined { peer_id } => {
+							RelayInbound::PeerJoined(PeerJoined { peer_id })
+						},
+						TextControl::PeerLeft { peer_id } => RelayInbound::PeerLeft(PeerLeft { peer_id }),
+						TextControl::RoomClosed => {
+							self.fail_terminal();
+							return Err(RelayError::FatalClose { code: 4001, reason: "room closed" });
+						},
+					}));
 				},
 				Message::Close(frame) => {
 					self.socket = None;
@@ -329,10 +349,10 @@ impl RelayClient {
 					return Ok(None);
 				},
 				Message::Ping(payload) => {
-					socket
-						.send(Message::Pong(payload))
-						.await
-						.map_err(RelayError::Socket)?;
+					if socket.send(Message::Pong(payload)).await.is_err() {
+						self.socket = None;
+						return Ok(None);
+					}
 				},
 				Message::Pong(_) | Message::Frame(_) => {},
 			}
@@ -348,54 +368,11 @@ impl RelayClient {
 		}
 	}
 
-	/// Waits through transient drops and yields the next authenticated inbound
-	/// item.
-	///
-	/// Connection failures follow the jittered bounded schedule; terminal close,
-	/// protocol, control, and AEAD faults return immediately.
-	pub async fn receive_reconnecting(&mut self) -> Result<RelayInbound, RelayError> {
-		loop {
-			if let Some(inbound) = self.receive().await? {
-				return Ok(inbound);
-			}
-			loop {
-				let delay = self.reconnect_delay()?;
-				time::sleep(delay).await;
-				match self.connect().await {
-					Ok(()) => break,
-					Err(RelayError::Socket(_)) => {},
-					Err(error) => return Err(error),
-				}
-			}
-		}
-	}
-
 	/// Intentionally closes the socket and permanently suppresses reconnect.
 	pub async fn close(&mut self) -> Result<(), RelayError> {
 		self.terminal = true;
-		self.pending.clear();
 		if let Some(mut socket) = self.socket.take() {
 			socket.close(None).await.map_err(RelayError::Socket)?;
-		}
-		Ok(())
-	}
-
-	/// Returns the reconnect/backpressure queue.
-	pub const fn pending(&self) -> &ReconnectQueue {
-		&self.pending
-	}
-
-	async fn drain(&mut self) -> Result<(), RelayError> {
-		let Some(socket) = self.socket.as_mut() else {
-			return Ok(());
-		};
-		while let Some(frame) = self.pending.pop() {
-			if let Err(error) = socket.send(Message::Binary(frame.clone())).await {
-				self.pending.frames.push_front(frame);
-				self.pending.bytes = self.pending.frames.iter().map(Bytes::len).sum();
-				self.socket = None;
-				return Err(RelayError::Socket(error));
-			}
 		}
 		Ok(())
 	}
@@ -403,27 +380,45 @@ impl RelayClient {
 	fn fail_terminal(&mut self) {
 		self.terminal = true;
 		self.socket = None;
-		self.pending.clear();
+	}
+
+	fn normalize_inbound_revisions(&mut self, routed: &mut RoutedFrame) {
+		match routed.frame.payload.as_mut() {
+			Some(collab_frame::Payload::Welcome(_)) => self.inbound_revision = 0,
+			Some(collab_frame::Payload::SnapshotChunk(chunk)) => {
+				for record in &mut chunk.entries {
+					self.inbound_revision = self.inbound_revision.saturating_add(1);
+					record.revision = self.inbound_revision;
+				}
+				if chunk.r#final {
+					chunk.host_revision_watermark = self.inbound_revision;
+				}
+			},
+			Some(collab_frame::Payload::JournalRecord(record)) => {
+				self.inbound_revision = self.inbound_revision.saturating_add(1);
+				record.revision = self.inbound_revision;
+			},
+			_ => {},
+		}
 	}
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "t")]
 enum TextControl {
-	#[serde(rename = "peer-left")]
-	PeerLeft {
-		#[serde(rename = "peerId")]
+	#[serde(rename = "peer-joined")]
+	PeerJoined {
+		#[serde(rename = "peer")]
 		peer_id: u32,
 	},
+	#[serde(rename = "peer-left")]
+	PeerLeft {
+		#[serde(rename = "peer")]
+		peer_id: u32,
+	},
+	#[serde(rename = "room-closed")]
+	RoomClosed,
 }
-impl TextControl {
-	const fn peer_id(&self) -> u32 {
-		match self {
-			Self::PeerLeft { peer_id } => *peer_id,
-		}
-	}
-}
-
 fn fatal_close(frame: &CloseFrame) -> Option<&'static str> {
 	match u16::from(frame.code) {
 		4001 => Some("room closed"),
@@ -443,7 +438,7 @@ pub enum RelayError {
 	/// WebSocket operation failed.
 	#[error("collaboration relay WebSocket operation failed")]
 	Socket(#[source] tungstenite::Error),
-	/// Protobuf encoding or bounds validation failed.
+	/// JSON framing, bounds validation, or encryption failed.
 	#[error("collaboration relay codec failed")]
 	Codec(#[from] CodecError),
 	/// AEAD authentication failure permanently closed the relay client.
@@ -496,6 +491,22 @@ mod tests {
 		}
 		assert!(queue.is_empty());
 	}
+	#[tokio::test]
+	async fn disconnected_application_frame_is_never_replayed() {
+		let (key, _) = RoomKey::generate().expect("key");
+		let mut client =
+			RelayClient::new(Url::parse("ws://localhost/r/test").expect("url"), RelayRole::Guest, key)
+				.expect("client");
+		let frame =
+			Handshake::hello(1, Hello { protocol_revision: PROTOCOL_REVISION, ..Default::default() });
+		assert_eq!(
+			client
+				.send(RelayRoute { peer_id: 0 }, &frame)
+				.await
+				.expect("send"),
+			SendDisposition::Queued,
+		);
+	}
 
 	#[test]
 	fn close_code_table_matches_terminal_contract() {
@@ -514,10 +525,10 @@ mod tests {
 		assert!(host.accept(&Handshake::hello(1, hello)).is_ok());
 		assert_eq!(host.state(), HandshakeState::Established);
 		let mut guest = Handshake::new(RelayRole::Guest);
-		let welcome = Welcome { protocol_revision: 3, ..Default::default() };
+		let welcome = Welcome { protocol_revision: 2, ..Default::default() };
 		assert!(matches!(
 			guest.accept(&Handshake::welcome(1, welcome)),
-			Err(RelayError::ProtocolRevision { actual: 3, .. })
+			Err(RelayError::ProtocolRevision { actual: 2, .. })
 		));
 	}
 

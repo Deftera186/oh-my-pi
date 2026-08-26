@@ -1,11 +1,14 @@
 //! Canonical signed native OMP extension index.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path, str::FromStr as _};
 
+use jiff::Timestamp;
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
-use super::{ExtensionCode, ExtensionError, trust::verify_signed_payload};
+use super::{
+	ExtensionCode, ExtensionError, resolver::compare_versions, trust::verify_signed_payload,
+};
 
 /// Current signed-index format.
 pub const INDEX_VERSION: u32 = 1;
@@ -115,14 +118,37 @@ impl SignedIndex {
 		Ok(index)
 	}
 
-	/// Verifies version, canonical ordering, uniqueness, and the detached index
-	/// signature. Signed bytes are canonical JSON of every field except
-	/// `signature`.
+	/// Verifies version, freshness, canonical ordering, uniqueness, and the
+	/// detached index signature. Signed bytes are canonical JSON of every field
+	/// except `signature`.
 	pub fn verify(&self, index_key: &str) -> Result<(), ExtensionError> {
+		self.verify_at(index_key, Timestamp::now())
+	}
+
+	/// Verifies a signed index at an authority-supplied instant.
+	pub fn verify_at(&self, index_key: &str, now: Timestamp) -> Result<(), ExtensionError> {
 		if self.version != INDEX_VERSION {
 			return Err(ExtensionError::new(
 				ExtensionCode::EManifestParse,
 				"unsupported signed-index version",
+			));
+		}
+		let issued_at = Timestamp::from_str(self.issued_at.as_str()).map_err(|error| {
+			ExtensionError::new(
+				ExtensionCode::EIntegrity,
+				format!("invalid signed-index issued_at: {error}"),
+			)
+		})?;
+		let valid_until = Timestamp::from_str(self.valid_until.as_str()).map_err(|error| {
+			ExtensionError::new(
+				ExtensionCode::EIntegrity,
+				format!("invalid signed-index valid_until: {error}"),
+			)
+		})?;
+		if issued_at > now || valid_until <= now || valid_until <= issued_at {
+			return Err(ExtensionError::new(
+				ExtensionCode::EIntegrity,
+				"signed index is not currently valid",
 			));
 		}
 		let mut previous: Option<&Str> = None;
@@ -144,6 +170,7 @@ impl SignedIndex {
 			previous = Some(&extension.id);
 			let mut release_versions = BTreeSet::new();
 			for release in &extension.releases {
+				compare_versions(release.version.as_str(), release.version.as_str())?;
 				if !release_versions.insert(&release.version) {
 					return Err(ExtensionError::new(
 						ExtensionCode::EManifestParse,
@@ -182,6 +209,22 @@ impl SignedIndex {
 		verify_signed_payload(index_key, &payload, self.signature.as_str())
 	}
 
+	/// Returns the greatest eligible PEP 440 release.
+	pub fn latest_release<'a>(
+		&self,
+		extension: &'a IndexExtension,
+		attested_only: bool,
+	) -> Option<&'a IndexRelease> {
+		extension
+			.releases
+			.iter()
+			.filter(|release| !release.yanked && (!attested_only || release.attested))
+			.max_by(|left, right| {
+				compare_versions(left.version.as_str(), right.version.as_str())
+					.expect("release versions were validated with the signed index")
+			})
+	}
+
 	/// Looks up one non-yanked exact release.
 	pub fn release(&self, id: &str, version: &str) -> Option<(&IndexExtension, &IndexRelease)> {
 		let extension = self
@@ -213,12 +256,19 @@ impl SignedIndex {
 			{
 				return None;
 			}
-			let release = extension.releases.iter().rev().find(|release| {
-				!release.yanked
-					&& (!attested_only || release.attested)
-					&& capability_shadow
-						.is_none_or(|name| release.shadows.iter().any(|shadow| shadow.name == name))
-			})?;
+			let release = extension
+				.releases
+				.iter()
+				.filter(|release| {
+					!release.yanked
+						&& (!attested_only || release.attested)
+						&& capability_shadow
+							.is_none_or(|name| release.shadows.iter().any(|shadow| shadow.name == name))
+				})
+				.max_by(|left, right| {
+					compare_versions(left.version.as_str(), right.version.as_str())
+						.expect("release versions were validated with the signed index")
+				})?;
 			Some((extension, release))
 		})
 	}
@@ -245,4 +295,56 @@ pub fn validate_shadow_consent(
 		));
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn release(version: &'static str) -> IndexRelease {
+		IndexRelease {
+			version:           Str::new_static(version),
+			manifest_digest:   Str::new_static("b3:manifest"),
+			capability_digest: Str::new_static("b3:capabilities"),
+			attested:          true,
+			yanked:            false,
+			shadows:           Vec::new(),
+			artifacts:         Vec::new(),
+		}
+	}
+
+	#[test]
+	fn latest_release_uses_pep_440_order_not_json_order() {
+		let index = SignedIndex {
+			version:     INDEX_VERSION,
+			name:        Str::new_static("test"),
+			issued_at:   Str::new_static("2026-01-01T00:00:00Z"),
+			valid_until: Str::new_static("2027-01-01T00:00:00Z"),
+			extensions:  Vec::new(),
+			signature:   Str::new_static("invalid"),
+		};
+		let extension = IndexExtension {
+			id:            Str::new_static("sample"),
+			distribution:  Str::new_static("sample"),
+			description:   Str::new_static(""),
+			publisher_key: Str::new_static("key"),
+			releases:      vec![release("2.0rc1"), release("1.9"), release("2.0")],
+		};
+		assert_eq!(index.latest_release(&extension, false).unwrap().version, "2.0");
+	}
+
+	#[test]
+	fn expired_index_is_rejected_before_signature_admission() {
+		let index = SignedIndex {
+			version:     INDEX_VERSION,
+			name:        Str::new_static("test"),
+			issued_at:   Str::new_static("2025-01-01T00:00:00Z"),
+			valid_until: Str::new_static("2025-01-02T00:00:00Z"),
+			extensions:  Vec::new(),
+			signature:   Str::new_static("invalid"),
+		};
+		let now = Timestamp::from_str("2026-01-01T00:00:00Z").unwrap();
+		let error = index.verify_at("invalid", now).unwrap_err();
+		assert_eq!(error.code, ExtensionCode::EIntegrity);
+	}
 }

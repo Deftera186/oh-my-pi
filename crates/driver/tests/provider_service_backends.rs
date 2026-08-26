@@ -70,7 +70,7 @@ impl ProviderApplicationOwner for RegistryOwner {
 #[tokio::test]
 async fn provider_catalog_backend_projects_the_live_registry_generation() {
 	let catalog = Arc::new(snapshot::Catalog::embedded().clone());
-	let registry = Registry::builder(catalog).build().expect("registry");
+	let registry = Registry::builder(catalog).build_catalog_projection();
 	let generation = registry.generation();
 	let backend = ChatProviderControlBackend::new(Arc::new(RegistryOwner { registry }));
 	let cards = backend.models(None).await.expect("model cards");

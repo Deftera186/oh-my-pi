@@ -52,9 +52,7 @@ pub async fn run(args: GitArgs) -> miette::Result<()> {
 		.await
 		.map_err(|error| miette!(git_open_error(&error)))?;
 
-	let executor = omp_executor::Executor::new(None);
-	let mut terminal =
-		Terminal::enter(executor, TerminalOptions::default().mouse(true)).into_diagnostic()?;
+	let mut terminal = Terminal::enter(TerminalOptions::default().mouse(true)).into_diagnostic()?;
 	let mut renderer = Renderer::new(TtyOut::new().into_diagnostic()?);
 	renderer.apply_caps(&terminal.caps()).into_diagnostic()?;
 	terminal.enter_alt().into_diagnostic()?;

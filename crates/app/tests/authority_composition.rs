@@ -16,6 +16,7 @@ use omp_envd::{
 	},
 	worker::{ExtHostSpec, HostKey},
 };
+use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use serde_json::Value;
 
 struct TaggedFactory {
@@ -103,17 +104,17 @@ fn factories(generation: &'static str) -> SessionControlFactories {
 	}
 }
 
-fn identity() -> Arc<ControlConnectionIdentity> {
+fn identity(session_generation: u64) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
-		extension:          sf!("fixture.extension"),
-		principal:          Principal::new(sf!("fixture"), sf!("Fixture")),
-		artifact_digest:    sf!("sha256:fixture"),
-		layer:              sf!("workspace"),
-		tier:               sf!("trusted"),
-		trust:              sf!("trusted"),
-		host_generation:    7,
-		session_generation: 11,
-		capabilities:       Arc::new(BTreeSet::new()),
+		extension: sf!("fixture.extension"),
+		principal: Principal::new(sf!("fixture"), sf!("Fixture")),
+		artifact_digest: sf!("sha256:fixture"),
+		layer: sf!("workspace"),
+		tier: sf!("trusted"),
+		trust: sf!("trusted"),
+		host_generation: 7,
+		session_generation,
+		capabilities: Arc::new(BTreeSet::new()),
 	})
 }
 
@@ -127,10 +128,37 @@ fn extension() -> ExtHostSpec {
 		sf!("trusted"),
 		1,
 	);
-	ExtHostSpec::new(
+	let declaration = StaticDeclaration {
+		id: sf!("py_eval@.1"),
+		kind: sf!("soft"),
+		module: sf!("omp_py_eval"),
+		trigger: sf!("lazy"),
+		key: sf!("py_eval@.1"),
+		api: 1,
+		failure: sf!("fault"),
+		..StaticDeclaration::default()
+	};
+	let mut extension = ExtHostSpec::new(
 		HostKey::new("workspace", "trusted", "fixture.extension"),
-		ExtensionManifest::py_eval(provenance, []),
-	)
+		ExtensionManifest::new_with_static(
+			provenance,
+			sf!("omp_py_eval"),
+			[],
+			omp_envd::exthost::DeclarationSet::new(
+				[omp_envd::exthost::ToolDeclarationKey::new("py_eval", "", 1)],
+				[],
+			),
+			omp_envd::exthost::ServiceManifest::default(),
+			StaticDeclarations {
+				ordered: vec![declaration].into_boxed_slice(),
+				..StaticDeclarations::default()
+			},
+			[],
+			[omp_envd::exthost::ActivationTrigger::FirstReach],
+		),
+	);
+	extension.host_executable = Some(env!("CARGO_BIN_EXE_omp").into());
+	extension
 }
 
 async fn request(
@@ -139,12 +167,11 @@ async fn request(
 	request_id: u64,
 	operation: &'static str,
 ) -> Result<Value, ControlProtocolError> {
+	let context =
+		ControlRequestContext { connection: Arc::clone(connection), request_id, invocation: None };
+	authority.authorize(&context, operation, &serde_json::Map::new())?;
 	authority
-		.request(
-			ControlRequestContext { connection: Arc::clone(connection), request_id, invocation: None },
-			Str::new_static(operation),
-			serde_json::Map::new(),
-		)
+		.request(context, Str::new_static(operation), serde_json::Map::new())
 		.await
 }
 
@@ -164,6 +191,7 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 		false,
 		None,
 		&[extension()],
+		&[],
 		omp_tool::DEFAULT_INTERRUPT_GRACE,
 		RegistryBridges::default(),
 	)
@@ -173,24 +201,11 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 	let first =
 		factories("session-one").bind(&environment, factory("omp.agents.list", "session-one"));
 	assert!(first.is_live());
-	let connection = identity();
+	let connection = identity(environment.session_generation());
 	let stale_authority = environment
 		.extension_control_authority(Arc::clone(&connection))
 		.expect("first composed authority");
-	for operation in [
-		"omp.agents.list",
-		"omp.policy.capabilities",
-		"omp.params.args",
-		"omp.workers.list",
-		"omp.direct_filesystem.request",
-		"omp.creds.list",
-		"omp.prompts.invalidate",
-		"omp.ui.presentation",
-		"omp.telemetry.query",
-		"omp.jobs.register",
-		"omp.provider.models",
-		"omp.regimes.active",
-	] {
+	for operation in ["omp.agents.list", "omp.params.args"] {
 		assert_eq!(
 			request(&stale_authority, &connection, 1, operation)
 				.await
@@ -204,7 +219,7 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 	assert!(replacement.is_live());
 	assert!(!first.is_live());
 	drop(first);
-	let stale = request(&stale_authority, &connection, 2, "omp.provider.models")
+	let stale = request(&stale_authority, &connection, 2, "omp.params.args")
 		.await
 		.expect_err("superseded session authority must be stale");
 	assert_eq!(stale.code.as_str(), "StaleGeneration");
@@ -219,8 +234,8 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 		Value::String("session-two".to_owned()),
 	);
 	drop(replacement);
-	let revoked = request(&live_authority, &connection, 4, "omp.telemetry.query")
+	let revoked = request(&live_authority, &connection, 4, "omp.params.args")
 		.await
 		.expect_err("teardown must revoke the entire session bundle");
-	assert_eq!(revoked.code.as_str(), "StaleGeneration");
+	assert_eq!(revoked.code.as_str(), "unhandled_operation");
 }

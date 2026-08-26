@@ -18,5 +18,6 @@ grep-pcre2.workspace = true
 grep-regex.workspace = true
 omp-core.workspace = true
 omp-walker.workspace = true
+regex.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true

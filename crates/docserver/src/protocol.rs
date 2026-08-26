@@ -3033,7 +3033,7 @@ mod tests {
 	}
 
 	#[test]
-	fn revisions_require_an_exact_blake3_hash() {
+	fn revisions_require_an_exact_sha256_hash() {
 		let malformed =
 			proto::Revision { sequence: 9, content_hash: Bytes::from_static(&[1; 31]) };
 		assert_eq!(

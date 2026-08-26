@@ -10,6 +10,7 @@ use omp_settings::{
 use serde::{Deserialize, Serialize};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
+const GLOBAL: &[SettingScope] = &[SettingScope::Global];
 
 const fn field(
 	path: &'static str,
@@ -455,10 +456,44 @@ impl SettingsDomain for AppearanceSettings {
 	];
 }
 
+/// Queued steering delivery policy.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	Serialize,
+	Deserialize,
+	strum::Display,
+	strum::EnumString,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
+pub enum SteeringMode {
+	/// Deliver every queued steering message at the next safe boundary.
+	All,
+	/// Deliver one queued steering message per safe boundary.
+	#[default]
+	OneAtATime,
+}
+
+impl From<SteeringMode> for omp_agent::SteeringMode {
+	fn from(mode: SteeringMode) -> Self {
+		match mode {
+			SteeringMode::All => Self::All,
+			SteeringMode::OneAtATime => Self::OneAtATime,
+		}
+	}
+}
+
 /// Interactive notification, voice, loop, and input behavior.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct InteractionSettings {
+	/// Queued steering delivery policy.
+	pub steering_mode:             SteeringMode,
 	/// Approval timeout for an unanswered interactive question, in seconds.
 	pub ask_timeout_seconds:       u64,
 	/// Per-event notification overrides.
@@ -488,6 +523,7 @@ pub struct InteractionSettings {
 impl Default for InteractionSettings {
 	fn default() -> Self {
 		Self {
+			steering_mode:             SteeringMode::OneAtATime,
 			ask_timeout_seconds:       0,
 			notifications:             BTreeMap::new(),
 			tts_enabled:               false,
@@ -507,6 +543,13 @@ impl Default for InteractionSettings {
 impl SettingsDomain for InteractionSettings {
 	const DOMAIN: &'static str = "interaction";
 	const FIELDS: &'static [FieldDescriptor] = &[
+		field(
+			"interaction.steeringMode",
+			"Steering Mode",
+			"How queued steering messages are delivered at safe boundaries.",
+			SettingKind::Enum(&["all", "one-at-a-time"]),
+			5,
+		),
 		field(
 			"interaction.askTimeoutSeconds",
 			"Ask Timeout",
@@ -819,10 +862,63 @@ impl SettingsDomain for TitleSettings {
 	)];
 }
 
+/// Marketplace catalog refresh and update policy.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	Serialize,
+	Deserialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum MarketplaceUpdateMode {
+	/// Never refresh or install marketplace packages automatically.
+	Off,
+	/// Refresh stale catalogs and report available updates.
+	Notify,
+	/// Refresh stale catalogs and install eligible updates.
+	#[default]
+	Auto,
+}
+
+/// Credential database encryption-key source selected deliberately at startup.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	Serialize,
+	Deserialize,
+	strum::Display,
+	strum::EnumString,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
+pub enum CredentialKeySourceSetting {
+	/// Refuse durable secret reads and writes.
+	#[default]
+	Unavailable,
+	/// Use an owner-only file beside the credential database.
+	LocalFile,
+	/// Use the operating-system credential service.
+	OsKeychain,
+}
+
 /// Miscellaneous startup, retention, gateway, and workspace policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LifecycleSettings {
+	/// Credential database encryption-key source.
+	pub credential_key_source:   CredentialKeySourceSetting,
 	/// Optional authentication broker gateway origin.
 	pub auth_broker_gateway:     Option<Str>,
 	/// Submit anonymized automatic QA failure reports.
@@ -841,8 +937,8 @@ pub struct LifecycleSettings {
 	pub startup_update_check:    bool,
 	/// Changelog display policy.
 	pub changelog_mode:          Str,
-	/// Update installed marketplace extensions automatically.
-	pub marketplace_auto_update: bool,
+	/// Marketplace catalog refresh and package update policy.
+	pub marketplace_auto_update: MarketplaceUpdateMode,
 	/// Enabled extension identifiers.
 	pub extensions:              Vec<Str>,
 	/// Permit session sharing.
@@ -864,6 +960,7 @@ pub struct LifecycleSettings {
 impl Default for LifecycleSettings {
 	fn default() -> Self {
 		Self {
+			credential_key_source:   CredentialKeySourceSetting::Unavailable,
 			auth_broker_gateway:     None,
 			autoqa_reporting:        false,
 			codex_reset_auto_redeem: false,
@@ -873,7 +970,7 @@ impl Default for LifecycleSettings {
 			startup_wizard:          true,
 			startup_update_check:    true,
 			changelog_mode:          Str::new_static("unread"),
-			marketplace_auto_update: true,
+			marketplace_auto_update: MarketplaceUpdateMode::Auto,
 			extensions:              Vec::new(),
 			share_enabled:           true,
 			prompt_injection_scan:   true,
@@ -889,6 +986,17 @@ impl Default for LifecycleSettings {
 impl SettingsDomain for LifecycleSettings {
 	const DOMAIN: &'static str = "lifecycle";
 	const FIELDS: &'static [FieldDescriptor] = &[
+		FieldDescriptor {
+			path:        "lifecycle.credentialKeySource",
+			label:       "Credential Key Source",
+			description: "Global durable credential encryption source; unavailable fails closed.",
+			kind:        SettingKind::Enum(&["unavailable", "local-file", "os-keychain"]),
+			scopes:      GLOBAL,
+			order:       5,
+			options:     None,
+			condition:   None,
+			secret:      false,
+		},
 		field(
 			"lifecycle.authBrokerGateway",
 			"Auth Broker Gateway",
@@ -955,8 +1063,8 @@ impl SettingsDomain for LifecycleSettings {
 		field(
 			"lifecycle.marketplaceAutoUpdate",
 			"Marketplace Auto-update",
-			"Update installed extensions automatically.",
-			SettingKind::Boolean,
+			"Refresh stale catalogs and optionally install eligible updates.",
+			SettingKind::Enum(&["off", "notify", "auto"]),
 			90,
 		),
 		field(

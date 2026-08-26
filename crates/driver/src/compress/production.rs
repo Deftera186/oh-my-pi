@@ -30,10 +30,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Action, CompressHost, IsolationPolicy, Loss, Status};
 use crate::{
-	bridges::{AgentGoalControl, InferenceBridge, builtin},
-	chat,
+	bridges::{AgentGoalControl, InferenceBridge, builtin_with_content},
+	chat, discovery,
 	headless::{HeadlessSession, HeadlessSessionOptions},
-	settings::current,
 };
 
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.txt");
@@ -75,7 +74,7 @@ pub enum ProductionError {
 	#[error(transparent)]
 	ToolRegistry(#[from] omp_tool::RegistryError),
 	/// No configured default model exists.
-	#[error("compress requires --model or config.default_model")]
+	#[error("compress requires --model or model.roles.default")]
 	MissingModel,
 }
 
@@ -94,11 +93,12 @@ pub trait CompressProgress: Send + Sync + 'static {
 
 /// Production owner for document I/O and isolated child sessions.
 pub struct ProductionCompressHost {
-	root:         PathBuf,
-	data_dir:     PathBuf,
-	documents:    omp_envd::docs::DocumentHost,
-	_environment: omp_envd::ProjectEnvironment,
-	progress:     Arc<dyn CompressProgress>,
+	root:           PathBuf,
+	data_dir:       PathBuf,
+	documents:      omp_envd::docs::DocumentHost,
+	model_settings: omp_catalog::settings::ModelSettings,
+	_environment:   omp_envd::ProjectEnvironment,
+	progress:       Arc<dyn CompressProgress>,
 }
 
 impl ProductionCompressHost {
@@ -109,41 +109,78 @@ impl ProductionCompressHost {
 		progress: Arc<dyn CompressProgress>,
 	) -> Result<Self, ProductionError> {
 		let root = chat::canonical_project(&root).map_err(|_| ProductionError::Session)?;
-		let settings = current(&data_dir).map_err(|_| ProductionError::Session)?;
+		let manager = omp_settings::manager::SettingsManager::open(
+			omp_settings::manager::SettingsPaths::discover(&data_dir, Some(&root)),
+		)
+		.map_err(|_| ProductionError::Session)?;
+		let settings_snapshot = manager.snapshot();
+		let home = std::env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+		let model_settings = settings_snapshot
+			.project::<omp_catalog::settings::ModelSettings>()
+			.map_err(|_| ProductionError::Session)?
+			.get()
+			.resolve_path_scopes(&root, &home);
 		let state_dir = omp_env::project_state::directory(&data_dir, &root)
 			.map_err(|_| ProductionError::Session)?;
 		chat::ensure_state_directory(&state_dir).map_err(|_| ProductionError::Session)?;
-		let bridges = builtin(
+		let prompt_settings = discovery::PromptDiscoverySettings {
+			model:   model_settings.clone(),
+			skills:  settings_snapshot
+				.project::<discovery::skills::SkillDiscoverySettings>()
+				.map_err(|_| ProductionError::Session)?
+				.get()
+				.clone(),
+			foreign: settings_snapshot
+				.project::<discovery::foreign::ForeignContentSettings>()
+				.map_err(|_| ProductionError::Session)?
+				.get()
+				.clone(),
+			rules:   settings_snapshot
+				.project::<crate::rulebook::RulebookSettings>()
+				.map_err(|_| ProductionError::Session)?
+				.get()
+				.clone(),
+			native:  discovery::native::NativeDiscoveryOptions::default(),
+		};
+		let active = discovery::active_prompt_snapshots(&root, &[], &home, &prompt_settings).content;
+		let bridges = builtin_with_content(
 			&root,
 			Arc::new(InferenceBridge::default()),
 			AgentGoalControl::default(),
 			None,
 			omp_agent::advisor::AdvisorAdviceQueue::default(),
+			&active,
 		);
-		let environment = omp_envd::ProjectEnvironment::connect_or_start(
+		let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
 			&root,
 			&state_dir,
-			&omp_env::project_state::environment_socket(&state_dir),
 			&omp_env::project_state::document_socket(&state_dir),
 			false,
-			None,
+			active.extensions.as_ref(),
 			&[],
-			settings.runtime_durations().interrupt_grace,
+			settings_snapshot,
 			bridges,
 		)
 		.await?;
 		let documents = environment.documents().clone();
-		Ok(Self { root, data_dir, documents, _environment: environment, progress })
+		Ok(Self { root, data_dir, documents, model_settings, _environment: environment, progress })
 	}
 
 	fn resolve_model(&self, requested: Option<&str>) -> Result<Str, ProductionError> {
-		if let Some(model) = requested {
-			return Ok(Str::new(model));
-		}
-		current(&self.data_dir)
-			.map_err(|_| ProductionError::Session)?
-			.default_model
-			.map(Str::from)
+		let catalog =
+			omp_catalog::snapshot::Catalog::try_embedded().map_err(|_| ProductionError::Session)?;
+		let roles = crate::discovery::roles::resolve_launch_roles(
+			catalog,
+			&self.model_settings,
+			requested,
+			None,
+			None,
+			None,
+		)
+		.map_err(|_| ProductionError::Session)?;
+		roles
+			.primary
+			.map(|model| Str::new(model.as_str()))
 			.ok_or(ProductionError::MissingModel)
 	}
 }
@@ -203,6 +240,7 @@ impl CompressHost for ProductionCompressHost {
 				self.data_dir.clone(),
 				HeadlessSessionOptions {
 					project:               self.root.clone(),
+					settings_overlays:     Box::new([]),
 					additional_roots:      Box::new([]),
 					model:                 model?,
 					initial_regime:        None,

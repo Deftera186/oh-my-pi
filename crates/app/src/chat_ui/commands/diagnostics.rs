@@ -103,13 +103,14 @@ pub(crate) fn render_debug(
 	data_dir: &Path,
 	workspace_root: &str,
 	session_id: &str,
+	journal: &Path,
 ) -> miette::Result<Str> {
 	let project_dir = omp_env::project_state::directory(data_dir, Path::new(workspace_root))
 		.map_err(|error| miette::miette!("could not resolve session paths: {error}"))?;
-	let journal = project_dir
-		.join("sessions")
-		.join(format!("{session_id}.jsonl"));
-	let artifacts = project_dir.join("sessions").join(session_id);
+	let artifacts = journal
+		.parent()
+		.unwrap_or(project_dir.as_path())
+		.join(session_id);
 	let logs = data_dir.join("logs");
 	match inspector.map(str::trim).filter(|value| !value.is_empty()) {
 		None => Ok(sf!(
@@ -152,9 +153,6 @@ pub(crate) fn render_debug(
 }
 
 fn render_raw_stream(session_id: &str) -> miette::Result<Str> {
-	const MAX_FRAMES: usize = 16;
-	const MAX_PAYLOAD_CHARS: usize = 8 * 1024;
-
 	let snapshot = omp_inference::transport::global_provider_capture().snapshot(Some(session_id));
 	let mut text = format!(
 		"## Raw provider stream\n\nSession `{session_id}` has {} retained frame(s). The process \
@@ -165,31 +163,13 @@ fn render_raw_stream(session_id: &str) -> miette::Result<Str> {
 		snapshot.summary.evicted,
 		snapshot.summary.subscriber_drops,
 	);
-	let skipped = snapshot.frames.len().saturating_sub(MAX_FRAMES);
-	if skipped > 0 {
-		let _ = writeln!(
-			text,
-			"\nShowing the newest {MAX_FRAMES} frames ({skipped} older frame(s) omitted)."
-		);
-	}
-	for frame in snapshot.frames.iter().skip(skipped) {
-		let payload = frame
-			.payload
-			.chars()
-			.take(MAX_PAYLOAD_CHARS)
-			.collect::<String>();
-		let truncated = frame.payload.chars().count() > MAX_PAYLOAD_CHARS;
+	for frame in &snapshot.frames {
 		let _ = write!(
 			text,
-			"\n### #{} `{}`\n\n```text\n{}{}\n```\n",
+			"\n### #{} `{}`\n\n```text\n{}\n```\n",
 			frame.sequence,
 			frame.event,
-			payload.replace("```", "` ` `"),
-			if truncated {
-				"\n…[frame truncated by /debug]"
-			} else {
-				""
-			},
+			frame.payload.replace("```", "` ` `"),
 		);
 	}
 	Ok(Str::from(text))
@@ -261,9 +241,15 @@ mod tests {
 	#[test]
 	fn debug_menu_and_raw_stream_expose_live_diagnostics() {
 		let root = tempfile::tempdir().expect("temporary workspace");
-		let menu =
-			render_debug(None, root.path(), root.path().to_str().expect("UTF-8 path"), "session")
-				.expect("debug menu renders");
+		let journal = root.path().join("session.jsonl");
+		let menu = render_debug(
+			None,
+			root.path(),
+			root.path().to_str().expect("UTF-8 path"),
+			"session",
+			&journal,
+		)
+		.expect("debug menu renders");
 		assert!(menu.contains("/debug raw-stream"));
 		assert!(menu.contains("Session journal"));
 
@@ -278,6 +264,7 @@ mod tests {
 			root.path(),
 			root.path().to_str().expect("UTF-8 path"),
 			session,
+			&journal,
 		)
 		.expect("raw stream renders");
 		assert!(raw.contains("test-frame"));

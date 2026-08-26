@@ -5,7 +5,10 @@ use std::{
 	future::Future,
 	marker,
 	pin::Pin,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,7 +29,8 @@ use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwne
 use omp_tools::yield_tool::YieldType;
 use parking_lot::RwLock;
 use thiserror::Error;
-use tokio::{time, time::Instant};
+use tokio::{sync::Notify, time, time::Instant};
+use tokio_util::sync::CancellationToken;
 
 use super::settings::TaskSettings;
 
@@ -73,6 +77,7 @@ impl<C: TurnClient + Clone> SupervisedRuntime<C> {
 struct ChildHandle {
 	commands:      flume::Sender<ChildCommand>,
 	abort:         Arc<RwLock<Option<AbortHandle>>>,
+	cancellations: Arc<RwLock<Vec<Arc<CancellationToken>>>>,
 	mailbox:       Arc<RwLock<Option<MailboxSender>>>,
 	state:         Arc<SubagentRunState>,
 	metadata:      RwLock<Option<serde_json::Value>>,
@@ -84,7 +89,74 @@ struct RunCommand {
 	items:    Vec<Item>,
 	turn_id:  TurnId,
 	settings: Arc<TaskSettings>,
+	cancel:   Arc<CancellationToken>,
 	reply:    flume::Sender<Result<AgentRunSummary, SupervisorError>>,
+}
+
+#[derive(Default)]
+struct SessionAdmission {
+	active: AtomicUsize,
+	queued: AtomicUsize,
+	notify: Notify,
+}
+
+impl SessionAdmission {
+	async fn acquire(
+		self: &Arc<Self>,
+		limit: usize,
+		cancel: &CancellationToken,
+	) -> Result<SessionPermit, SupervisorError> {
+		let mut queued = false;
+		loop {
+			if cancel.is_cancelled() {
+				if queued {
+					self.queued.fetch_sub(1, Ordering::AcqRel);
+				}
+				return Err(SupervisorError::CancelledBeforeStart);
+			}
+			let active = self.active.load(Ordering::Acquire);
+			if limit == 0 || active < limit {
+				if self
+					.active
+					.compare_exchange_weak(
+						active,
+						active.saturating_add(1),
+						Ordering::AcqRel,
+						Ordering::Acquire,
+					)
+					.is_ok()
+				{
+					if queued {
+						self.queued.fetch_sub(1, Ordering::AcqRel);
+					}
+					return Ok(SessionPermit { admission: Arc::clone(self) });
+				}
+				continue;
+			}
+			if !queued {
+				self.queued.fetch_add(1, Ordering::AcqRel);
+				queued = true;
+			}
+			tokio::select! {
+				() = self.notify.notified() => {},
+				() = cancel.cancelled() => {
+					self.queued.fetch_sub(1, Ordering::AcqRel);
+					return Err(SupervisorError::CancelledBeforeStart);
+				},
+			}
+		}
+	}
+}
+
+struct SessionPermit {
+	admission: Arc<SessionAdmission>,
+}
+
+impl Drop for SessionPermit {
+	fn drop(&mut self) {
+		self.admission.active.fetch_sub(1, Ordering::AcqRel);
+		self.admission.notify.notify_waiters();
+	}
 }
 
 enum ChildCommand {
@@ -103,6 +175,7 @@ enum ParkReason {
 /// Session-owned durable child-loop authority.
 pub struct SessionSupervisor<C: TurnClient + Clone + Send + 'static> {
 	tree:        Arc<AgentTree>,
+	admission:   Arc<SessionAdmission>,
 	children:    RwLock<HashMap<Str, ChildHandle>>,
 	settings:    RwLock<Arc<TaskSettings>>,
 	parent_jobs: RwLock<Option<Arc<JobBoard>>>,
@@ -114,6 +187,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 	pub fn new(tree: Arc<AgentTree>) -> Self {
 		Self {
 			tree,
+			admission: Arc::new(SessionAdmission::default()),
 			children: RwLock::new(HashMap::new()),
 			settings: RwLock::new(Arc::new(TaskSettings::default())),
 			parent_jobs: RwLock::new(None),
@@ -146,6 +220,9 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 				.max_depth
 				.min(u16::try_from(configured).unwrap_or_default());
 		}
+		limits.max_concurrency = self.settings.read().max_concurrency;
+		limits.active = self.admission.active.load(Ordering::Acquire);
+		limits.queued = self.admission.queued.load(Ordering::Acquire);
 		limits
 	}
 
@@ -193,16 +270,18 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		let state = Arc::new(SubagentRunState::new(id.clone()));
 		let abort = Arc::new(RwLock::new(Some(runtime.agent.abort_handle())));
+		let cancellations = Arc::new(RwLock::new(Vec::new()));
 		let mailbox = Arc::new(RwLock::new(Some(runtime.agent.mailbox())));
 		let (commands, receiver) = flume::unbounded();
-		let tree = Arc::clone(&self.tree);
+		let admission = Arc::clone(&self.admission);
 		let loop_state = Arc::clone(&state);
 		tokio::spawn(child_loop(
 			node,
-			tree,
+			admission,
 			Some(runtime),
 			reviver,
 			Arc::clone(&abort),
+			Arc::clone(&cancellations),
 			Arc::clone(&mailbox),
 			loop_state,
 			receiver,
@@ -210,6 +289,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		children.insert(id, ChildHandle {
 			commands,
 			abort,
+			cancellations,
 			mailbox,
 			state: Arc::clone(&state),
 			metadata: RwLock::new(None),
@@ -235,16 +315,18 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		state.transition(SubagentLifecycle::Settled)?;
 		state.transition(SubagentLifecycle::Parked)?;
 		let abort = Arc::new(RwLock::new(None));
+		let cancellations = Arc::new(RwLock::new(Vec::new()));
 		let mailbox = Arc::new(RwLock::new(None));
 		let (commands, receiver) = flume::unbounded();
-		let tree = Arc::clone(&self.tree);
+		let admission = Arc::clone(&self.admission);
 		let loop_state = Arc::clone(&state);
 		tokio::spawn(child_loop(
 			node,
-			tree,
+			admission,
 			None,
 			Some(reviver),
 			Arc::clone(&abort),
+			Arc::clone(&cancellations),
 			Arc::clone(&mailbox),
 			loop_state,
 			receiver,
@@ -252,6 +334,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		children.insert(id, ChildHandle {
 			commands,
 			abort,
+			cancellations,
 			mailbox,
 			state: Arc::clone(&state),
 			metadata: RwLock::new(None),
@@ -268,16 +351,18 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		items: Vec<Item>,
 		turn_id: TurnId,
 	) -> Result<AgentRunSummary, SupervisorError> {
-		let commands = self
+		let (commands, cancellations) = self
 			.children
 			.read()
 			.get(id)
-			.map(|child| child.commands.clone())
+			.map(|child| (child.commands.clone(), Arc::clone(&child.cancellations)))
 			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
 		let (reply, response) = flume::bounded(1);
 		let settings = Arc::clone(&self.settings.read());
+		let cancel = Arc::new(CancellationToken::new());
+		cancellations.write().push(Arc::clone(&cancel));
 		commands
-			.send_async(ChildCommand::Run(RunCommand { items, turn_id, settings, reply }))
+			.send_async(ChildCommand::Run(RunCommand { items, turn_id, settings, cancel, reply }))
 			.await
 			.map_err(|_| SupervisorError::Stopped { id: Str::from(id) })?;
 		response
@@ -296,11 +381,11 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		items: Vec<Item>,
 		turn_id: TurnId,
 	) -> Result<JobRef, SupervisorError> {
-		let commands = self
+		let (commands, cancellations) = self
 			.children
 			.read()
 			.get(id)
-			.map(|child| child.commands.clone())
+			.map(|child| (child.commands.clone(), Arc::clone(&child.cancellations)))
 			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
 		let board = self
 			.parent_jobs
@@ -326,8 +411,10 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		}
 		let (reply, response) = flume::bounded(1);
 		let settings = Arc::clone(&self.settings.read());
+		let cancel = Arc::new(CancellationToken::new());
+		cancellations.write().push(Arc::clone(&cancel));
 		commands
-			.send_async(ChildCommand::Run(RunCommand { items, turn_id, settings, reply }))
+			.send_async(ChildCommand::Run(RunCommand { items, turn_id, settings, cancel, reply }))
 			.await
 			.map_err(|_| SupervisorError::Stopped { id: Str::from(id) })?;
 		let settlement_board = board;
@@ -353,6 +440,9 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			.ok_or_else(|| SupervisorError::UnknownAgent { id: Str::from(id) })?;
 		if let Some(abort) = child.abort.read().as_ref() {
 			abort.abort();
+		}
+		for cancellation in child.cancellations.read().iter() {
+			cancellation.cancel();
 		}
 		Ok(())
 	}
@@ -655,10 +745,11 @@ impl<C: TurnClient + Clone + Send + 'static> Drop for SessionSupervisor<C> {
 
 async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 	node: Arc<AgentNode>,
-	tree: Arc<AgentTree>,
+	admission: Arc<SessionAdmission>,
 	mut runtime: Option<SupervisedRuntime<C>>,
 	reviver: Option<Arc<dyn ChildReviver<C>>>,
 	abort: Arc<RwLock<Option<AbortHandle>>>,
+	cancellations: Arc<RwLock<Vec<Arc<CancellationToken>>>>,
 	mailbox: Arc<RwLock<Option<MailboxSender>>>,
 	state: Arc<SubagentRunState>,
 	commands: Receiver<ChildCommand>,
@@ -668,17 +759,21 @@ async fn child_loop<C: TurnClient + Clone + Send + 'static>(
 			ChildCommand::Run(command) => {
 				let result = run_child(
 					&node,
-					&tree,
+					&admission,
 					&state,
 					&mut runtime,
 					reviver.as_ref(),
 					&abort,
 					&mailbox,
+					&command.cancel,
 					command.items,
 					command.turn_id,
 					&command.settings,
 				)
 				.await;
+				cancellations
+					.write()
+					.retain(|candidate| !Arc::ptr_eq(candidate, &command.cancel));
 				let _ = command.reply.send(result);
 			},
 			ChildCommand::Revive(reply) => {
@@ -751,12 +846,13 @@ async fn revive_child<C: TurnClient + Clone + Send + 'static>(
 
 async fn run_child<C: TurnClient + Clone + Send + 'static>(
 	node: &AgentNode,
-	tree: &AgentTree,
+	admission: &Arc<SessionAdmission>,
 	state: &SubagentRunState,
 	runtime: &mut Option<SupervisedRuntime<C>>,
 	reviver: Option<&Arc<dyn ChildReviver<C>>>,
 	abort: &RwLock<Option<AbortHandle>>,
 	mailbox: &RwLock<Option<MailboxSender>>,
+	cancel: &CancellationToken,
 	items: Vec<Item>,
 	turn_id: TurnId,
 	settings: &TaskSettings,
@@ -770,10 +866,27 @@ async fn run_child<C: TurnClient + Clone + Send + 'static>(
 		},
 		lifecycle => return Err(SupervisorError::NotIdleState { id: node.id.clone(), lifecycle }),
 	}
+	let permit = match admission.acquire(settings.max_concurrency, cancel).await {
+		Ok(permit) => permit,
+		Err(SupervisorError::CancelledBeforeStart) => {
+			settle(state, SubagentTerminalKind::Cancelled)?;
+			node.set_status(AgentStatus::Cancelled);
+			return Err(SupervisorError::CancelledBeforeStart);
+		},
+		Err(error) => return Err(error),
+	};
 	if runtime.is_none() {
-		let factory =
-			reviver.ok_or_else(|| SupervisorError::RevivalUnavailable { id: node.id.clone() })?;
-		*runtime = Some(factory.revive().await?);
+		let Some(factory) = reviver else {
+			rollback_pre_run(state, reopening)?;
+			return Err(SupervisorError::RevivalUnavailable { id: node.id.clone() });
+		};
+		*runtime = match factory.revive().await {
+			Ok(runtime) => Some(runtime),
+			Err(error) => {
+				rollback_pre_run(state, reopening)?;
+				return Err(error);
+			},
+		};
 		*abort.write() = Some(
 			runtime
 				.as_ref()
@@ -792,7 +905,7 @@ async fn run_child<C: TurnClient + Clone + Send + 'static>(
 	let runtime = runtime
 		.as_mut()
 		.expect("runtime was restored before lifecycle publication");
-	record_lifecycle(
+	let publication = record_lifecycle(
 		runtime,
 		state,
 		&node.id,
@@ -804,11 +917,18 @@ async fn run_child<C: TurnClient + Clone + Send + 'static>(
 			"turn-started"
 		},
 		None,
-	)?;
-	if first_turn || reopening {
-		record_lifecycle(runtime, state, &node.id, "turn-started", None)?;
+	)
+	.and_then(|()| {
+		if first_turn || reopening {
+			record_lifecycle(runtime, state, &node.id, "turn-started", None)
+		} else {
+			Ok(())
+		}
+	});
+	if let Err(error) = publication {
+		rollback_pre_run(state, reopening)?;
+		return Err(error);
 	}
-	let permit = tree.admit(1).await?;
 	state.transition(SubagentLifecycle::Running)?;
 	state.record_activity(SubagentActivity {
 		kind: Some(if first_turn {
@@ -1190,6 +1310,14 @@ fn settle(state: &SubagentRunState, kind: SubagentTerminalKind) -> Result<(), Su
 	Ok(())
 }
 
+fn rollback_pre_run(state: &SubagentRunState, reopening: bool) -> Result<(), SupervisorError> {
+	settle(state, SubagentTerminalKind::Failed)?;
+	if reopening {
+		state.transition(SubagentLifecycle::Parked)?;
+	}
+	Ok(())
+}
+
 /// Durable supervisor operation failure.
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -1205,6 +1333,9 @@ pub enum SupervisorError {
 	/// Admission failed.
 	#[error(transparent)]
 	Admission(#[from] omp_agent::SpawnRefusal),
+	/// Cancellation won while this run was waiting for its parent-local slot.
+	#[error("subagent run was cancelled before execution")]
+	CancelledBeforeStart,
 	/// Configured wall-clock limit stopped this generation.
 	#[error("subagent runtime limit reached after {max_runtime_ms}ms")]
 	RuntimeLimit {
@@ -1373,5 +1504,49 @@ mod tests {
 			budget_killed.terminal().map(|terminal| terminal.kind),
 			Some(SubagentTerminalKind::Failed)
 		);
+	}
+
+	#[tokio::test]
+	async fn parent_local_admission_is_cancellable_without_consuming_capacity() {
+		let admission = Arc::new(SessionAdmission::default());
+		let first = admission
+			.acquire(1, &CancellationToken::new())
+			.await
+			.expect("first permit");
+		let nested_session = Arc::new(SessionAdmission::default());
+		let nested = nested_session
+			.acquire(1, &CancellationToken::new())
+			.await
+			.expect("nested session has independent sibling admission");
+		drop(nested);
+		let cancel = CancellationToken::new();
+		let waiting = {
+			let admission = Arc::clone(&admission);
+			let cancel = cancel.clone();
+			tokio::spawn(async move { admission.acquire(1, &cancel).await })
+		};
+		tokio::task::yield_now().await;
+		assert_eq!(admission.queued.load(Ordering::Acquire), 1);
+		cancel.cancel();
+		assert!(matches!(
+			waiting.await.expect("waiter joined"),
+			Err(SupervisorError::CancelledBeforeStart)
+		));
+		assert_eq!(admission.queued.load(Ordering::Acquire), 0);
+		drop(first);
+		assert_eq!(admission.active.load(Ordering::Acquire), 0);
+	}
+
+	#[test]
+	fn failed_cold_revival_returns_parked_generation_to_retryable_state() {
+		let state = SubagentRunState::new(sf!("parked-child"));
+		state
+			.transition(SubagentLifecycle::Settled)
+			.expect("settled");
+		state.transition(SubagentLifecycle::Parked).expect("parked");
+		state.begin_generation().expect("begin revival");
+		rollback_pre_run(&state, true).expect("rollback");
+		assert_eq!(state.lifecycle(), SubagentLifecycle::Parked);
+		state.begin_generation().expect("retry revival");
 	}
 }

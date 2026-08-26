@@ -194,6 +194,11 @@ def _authenticate(sock, authkey, *, server):
 # ------------------------------------------------------------ code shipping
 
 
+def _source_qualname_resolvable(fn):
+    """Whether source execution can recover ``fn`` by attribute traversal."""
+    return all(part.isidentifier() for part in fn.__qualname__.split("."))
+
+
 def _default_ship(fn):
     """Picks the shipping mode: ``"source"`` for top-level functions in
     file-backed, package-less modules (the worker cannot be assumed to have
@@ -201,7 +206,11 @@ def _default_ship(fn):
     otherwise — by value for dynamic functions (closures, lambdas,
     ``__main__``/REPL), by reference for package modules, which the worker
     must have installed."""
-    if "." in fn.__module__ or "<locals>" in fn.__qualname__:
+    if (
+        "." in fn.__module__
+        or "<locals>" in fn.__qualname__
+        or not _source_qualname_resolvable(fn)
+    ):
         return "pickle"
     mod = sys.modules.get(fn.__module__)
     file = getattr(mod, "__file__", None)
@@ -224,7 +233,11 @@ def _pack_function(fn, ship):
     elif ship == "source":
         mod = sys.modules.get(fn.__module__)
         file = getattr(mod, "__file__", None)
-        if not (file and os.path.isfile(file)) or "<locals>" in fn.__qualname__:
+        if (
+            not (file and os.path.isfile(file))
+            or "<locals>" in fn.__qualname__
+            or not _source_qualname_resolvable(fn)
+        ):
             raise RuntimeError(
                 f"ship='source' needs {fn.__qualname__} at top level of a "
                 "module with a source file"

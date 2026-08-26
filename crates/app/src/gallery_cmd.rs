@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use miette::{IntoDiagnostic, miette};
-use omp_chat_ui::{Chat, ViewportFrame};
+use omp_chat_ui::{Chat, ToolTerminal, ToolViewContent, ViewportFrame};
 use omp_core::Str;
 use omp_tool::render::{RenderRegistry, ViewState};
 use omp_tools::{gallery::RendererGalleryFixture, register_builtin_renderers};
@@ -190,9 +190,15 @@ fn fixture_chat<'a>(
 	};
 	chat.tool_started("gallery", fixture.identity.name.as_str(), &revision, fixture.title);
 	match state {
-		GalleryState::Streaming | GalleryState::Progress => chat.tool_view("gallery", view),
-		GalleryState::Success => chat.tool_finished("gallery", true, view),
-		GalleryState::Error => chat.tool_finished("gallery", false, view),
+		GalleryState::Streaming | GalleryState::Progress => {
+			chat.tool_view("gallery", ToolViewContent::Markup(view))
+		},
+		GalleryState::Success => {
+			chat.tool_finished("gallery", ToolTerminal::Succeeded, ToolViewContent::Markup(view))
+		},
+		GalleryState::Error => {
+			chat.tool_finished("gallery", ToolTerminal::Failed, ToolViewContent::Markup(view))
+		},
 	}
 	Ok(chat)
 }

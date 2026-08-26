@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt as _, future::BoxFuture};
@@ -14,18 +14,23 @@ use hyper_util::{
 };
 use omp_core::{ExposeSecret as _, SecretString};
 use rustls::crypto::ring;
+use tokio::time;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 /// Hard ceiling for a single OAuth response body.
 pub const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Default end-to-end deadline for one OAuth HTTP exchange.
+pub const DEFAULT_OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A secret-bearing OAuth request handed directly to an injected transport.
 pub struct OAuthHttpRequest {
-	method:  Method,
-	url:     Url,
-	headers: HeaderMap,
-	body:    Option<SecretString>,
+	method:       Method,
+	url:          Url,
+	headers:      HeaderMap,
+	body:         Option<SecretString>,
+	cancellation: CancellationToken,
 }
 
 impl OAuthHttpRequest {
@@ -40,7 +45,13 @@ impl OAuthHttpRequest {
 		if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
 			return Err(OAuthRequestError::InvalidUrl);
 		}
-		Ok(Self { method, url, headers, body })
+		Ok(Self { method, url, headers, body, cancellation: CancellationToken::new() })
+	}
+
+	/// Binds caller cancellation to this request.
+	pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+		self.cancellation = cancellation;
+		self
 	}
 
 	/// Creates a form-encoded secret POST request.
@@ -54,6 +65,12 @@ impl OAuthHttpRequest {
 	/// Consumes the request into transport-ready parts.
 	pub fn into_parts(self) -> (Method, Url, HeaderMap, Option<SecretString>) {
 		(self.method, self.url, self.headers, self.body)
+	}
+
+	fn into_transport_parts(
+		self,
+	) -> (Method, Url, HeaderMap, Option<SecretString>, CancellationToken) {
+		(self.method, self.url, self.headers, self.body, self.cancellation)
 	}
 }
 
@@ -84,9 +101,10 @@ pub trait OAuthHttpClient: Send + Sync {
 	) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>>;
 }
 
-/// OAuth transport failed or exceeded its bounded response ceiling.
+/// OAuth transport failed, was cancelled, exceeded its deadline, or exceeded
+/// its bounded response ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("OAuth HTTP transport failed")]
+#[error("OAuth HTTP transport failed or was bounded")]
 pub struct OAuthTransportError;
 
 type PooledOAuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -94,7 +112,8 @@ type PooledOAuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 /// Production rustls OAuth transport with a one-MiB response ceiling.
 #[derive(Clone)]
 pub struct SystemOAuthHttpClient {
-	inner: PooledOAuthClient,
+	inner:   PooledOAuthClient,
+	timeout: Duration,
 }
 
 impl SystemOAuthHttpClient {
@@ -107,7 +126,17 @@ impl SystemOAuthHttpClient {
 			.enable_http1()
 			.enable_http2()
 			.build();
-		Self { inner: Client::builder(TokioExecutor::new()).build(connector) }
+		Self {
+			inner:   Client::builder(TokioExecutor::new()).build(connector),
+			timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
+		}
+	}
+
+	/// Constructs a pooled client with one end-to-end request deadline.
+	pub fn with_timeout(timeout: Duration) -> Self {
+		let mut client = Self::new();
+		client.timeout = timeout;
+		client
 	}
 }
 
@@ -129,37 +158,91 @@ impl OAuthHttpClient for SystemOAuthHttpClient {
 		request: OAuthHttpRequest,
 	) -> BoxFuture<'_, Result<OAuthHttpResponse, OAuthTransportError>> {
 		let client = self.inner.clone();
+		let timeout = self.timeout;
 		async move {
-			let (method, url, headers, body) = request.into_parts();
-			let body = body.as_ref().map_or_else(Bytes::new, |body| {
-				Bytes::copy_from_slice(body.expose_secret().as_bytes())
-			});
-			let mut outbound = Request::builder()
-				.method(method)
-				.uri(url.as_str())
-				.body(Full::new(body))
-				.map_err(|_| OAuthTransportError)?;
-			*outbound.headers_mut() = headers;
-			let response = client
-				.request(outbound)
-				.await
-				.map_err(|_| OAuthTransportError)?;
-			let status = response.status().as_u16();
-			let headers = response.headers().clone();
-			let mut incoming = response.into_body();
-			let mut bytes = BytesMut::new();
-			while let Some(frame) = incoming.frame().await {
-				let frame = frame.map_err(|_| OAuthTransportError)?;
-				if let Some(data) = frame.data_ref() {
-					if bytes.len().saturating_add(data.len()) > MAX_OAUTH_RESPONSE_BYTES {
-						return Err(OAuthTransportError);
+			let (method, url, headers, body, cancellation) = request.into_transport_parts();
+			let exchange = async move {
+				let body = body.as_ref().map_or_else(Bytes::new, |body| {
+					Bytes::copy_from_slice(body.expose_secret().as_bytes())
+				});
+				let mut outbound = Request::builder()
+					.method(method)
+					.uri(url.as_str())
+					.body(Full::new(body))
+					.map_err(|_| OAuthTransportError)?;
+				*outbound.headers_mut() = headers;
+				let response = client
+					.request(outbound)
+					.await
+					.map_err(|_| OAuthTransportError)?;
+				let status = response.status().as_u16();
+				let headers = response.headers().clone();
+				let mut incoming = response.into_body();
+				let mut bytes = BytesMut::new();
+				while let Some(frame) = incoming.frame().await {
+					let frame = frame.map_err(|_| OAuthTransportError)?;
+					if let Some(data) = frame.data_ref() {
+						if bytes.len().saturating_add(data.len()) > MAX_OAUTH_RESPONSE_BYTES {
+							return Err(OAuthTransportError);
+						}
+						bytes.extend_from_slice(data);
 					}
-					bytes.extend_from_slice(data);
 				}
+				let body = String::from_utf8(bytes.to_vec()).map_err(|_| OAuthTransportError)?;
+				Ok(OAuthHttpResponse { status, headers, body: SecretString::from(body) })
+			};
+			tokio::select! {
+				biased;
+				() = cancellation.cancelled() => Err(OAuthTransportError),
+				result = time::timeout(timeout, exchange) => {
+					result.map_err(|_| OAuthTransportError)?
+				},
 			}
-			let body = String::from_utf8(bytes.to_vec()).map_err(|_| OAuthTransportError)?;
-			Ok(OAuthHttpResponse { status, headers, body: SecretString::from(body) })
 		}
 		.boxed()
+	}
+}
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use http::{HeaderMap, Method};
+	use tokio::net::TcpListener;
+	use tokio_util::sync::CancellationToken;
+
+	use super::{OAuthHttpClient, OAuthHttpRequest, OAuthTransportError, SystemOAuthHttpClient};
+
+	#[tokio::test]
+	async fn system_transport_observes_caller_cancellation() {
+		let cancellation = CancellationToken::new();
+		cancellation.cancel();
+		let client = SystemOAuthHttpClient::with_timeout(Duration::from_secs(30));
+		let request =
+			OAuthHttpRequest::new(Method::GET, "http://127.0.0.1:9/token", HeaderMap::new(), None)
+				.expect("valid local URL")
+				.with_cancellation(cancellation);
+		assert!(matches!(client.execute(request).await, Err(OAuthTransportError)));
+	}
+
+	#[tokio::test]
+	async fn system_transport_deadline_bounds_hung_request() {
+		let listener = TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("loopback listener");
+		let address = listener.local_addr().expect("listener address");
+		let server = tokio::spawn(async move {
+			let (_socket, _) = listener.accept().await.expect("accepted OAuth request");
+			futures::future::pending::<()>().await;
+		});
+		let client = SystemOAuthHttpClient::with_timeout(Duration::from_millis(10));
+		let request = OAuthHttpRequest::new(
+			Method::GET,
+			&format!("http://{address}/token"),
+			HeaderMap::new(),
+			None,
+		)
+		.expect("valid local URL");
+		assert!(matches!(client.execute(request).await, Err(OAuthTransportError)));
+		server.abort();
 	}
 }

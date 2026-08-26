@@ -19,7 +19,8 @@ use omp_core::{Hash32, Str};
 use omp_driver::{
 	discovery::roles,
 	headless::{
-		HeadlessSession, HeadlessSessionOptions,
+		HeadlessLaunchPolicy, HeadlessSession, HeadlessSessionOpen, HeadlessSessionOptions,
+		HeadlessToolPolicy,
 		finalize::{FinalizerBudget, FinalizerReport},
 	},
 	plan::ModelSelection,
@@ -30,7 +31,9 @@ use omp_proto::{
 	inference::v1::{part_start, turn_event},
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
+use omp_settings::manager::{SettingsManager, SettingsPaths};
 use omp_tools::read::dirtree;
+use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Stderr, Stdout, stderr, stdin, stdout};
 
 use crate::{
@@ -46,6 +49,12 @@ const MAX_TOTAL_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_AUTO_READ_TEXT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_AUTO_READ_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const DIRECTORY_MENTION_LIMIT: usize = 500;
+#[derive(Default)]
+struct JsonTurnState {
+	part_kinds:        BTreeMap<u32, part_start::Kind>,
+	assistant_started: bool,
+	settled_items:     Vec<Item>,
+}
 
 #[derive(Debug, thiserror::Error)]
 enum PrintTurnError {
@@ -59,12 +68,36 @@ enum PrintTurnError {
 
 /// Runs prompts through the durable headless agent loop.
 pub async fn run(args: PrintArgs) -> miette::Result<()> {
+	let Some(max_time) = args.max_time.map(|duration| duration.0) else {
+		return run_inner(args).await;
+	};
+	tokio::time::timeout(max_time, run_inner(args))
+		.await
+		.map_err(|_| miette!("print mode exceeded --max-time"))?
+}
+
+async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let settings =
-		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
+	let cwd = fs::canonicalize(&args.project).into_diagnostic()?;
+	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
+	let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&cwd));
+	settings_paths.overlays.extend(args.config.iter().cloned());
+	let settings_manager = SettingsManager::open(settings_paths).into_diagnostic()?;
+	let settings_snapshot = settings_manager.snapshot();
+	let settings = settings_snapshot
+		.project::<omp_driver::settings::Settings>()
+		.into_diagnostic()?
+		.get()
+		.clone();
+	let model_settings = settings_snapshot
+		.project::<omp_catalog::settings::ModelSettings>()
+		.into_diagnostic()?
+		.get()
+		.resolve_path_scopes(&cwd, &home);
 	let catalog = snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
 	let roles = roles::resolve_launch_roles(
 		catalog,
+		&model_settings,
 		args.model.as_deref(),
 		args.smol.as_deref(),
 		args.slow.as_deref(),
@@ -77,15 +110,8 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		.into_iter()
 		.flat_map(|selectors| selectors.0.iter())
 	{
-		omp_catalog::select_model(
-			catalog.models(),
-			catalog.routes(),
-			catalog.aliases(),
-			&[],
-			&Default::default(),
-			selector,
-		)
-		.map_err(|error| miette!(error))?;
+		roles::resolve_role_selector(catalog, &model_settings, selector)
+			.map_err(|error| miette!(error))?;
 	}
 	for root in &args.add_dir {
 		fs::canonicalize(root).into_diagnostic()?;
@@ -93,19 +119,15 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	let model = roles
 		.primary
 		.map(|model| Str::from(model.as_str()))
-		.or_else(|| args.model.clone())
-		.or_else(|| settings.default_model.clone().map(Str::from))
-		.ok_or_else(|| miette!("print mode requires --model or config.default_model"))?;
+		.ok_or_else(|| miette!("print mode requires a configured default model role"))?;
 	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
 		return Err(miette!("--api-key requires a model to be specified via --model or --models"));
 	}
-	let model = omp_driver::chat::resolve_model_selector(catalog, model.as_str())
-		.map_err(|error| miette!(error))?;
 	let plan_handoff = if args.plan_yolo {
 		match args.plan_yolo_into.as_deref() {
 			Some(selector) => {
-				let selected =
-					roles::resolve_role_selector(catalog, selector).map_err(|error| miette!(error))?;
+				let selected = roles::resolve_role_selector(catalog, &model_settings, selector)
+					.map_err(|error| miette!(error))?;
 				Some(
 					ModelSelection::resolved(selected.model.as_str(), selected.thinking.as_deref())
 						.map_err(|error| miette!(error))?,
@@ -133,8 +155,6 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 			CliUsageError::new("print mode requires a prompt or piped standard input").into(),
 		);
 	}
-	let cwd = env::current_dir().into_diagnostic()?;
-	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
 	let system = spec::resolve_prompt_slots(
 		&cwd,
 		&home,
@@ -142,23 +162,84 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 		args.prompt_settings.append_prompt.as_deref(),
 	)?
 	.combined();
-	let mut session = HeadlessSession::open(data_dir, HeadlessSessionOptions {
-		project: env::current_dir().into_diagnostic()?,
-		additional_roots: args.add_dir.clone().into_boxed_slice(),
-		model,
-		initial_regime: args.plan_yolo.then_some("plan"),
-		initial_prompt_slot: args.plan_yolo.then_some("plan-yolo"),
-		plan_handoff,
-		resume: None,
-		fork: None,
-		py_eval: false,
-		approval_mode: args.effective_approval().map(Into::into),
-		pty_denied: args.no_pty,
-		credential_provider,
-		api_key: args.api_key.clone(),
-		prompt_cache_affinity: args.prompt_cache_key.clone(),
-		session_generation: 1,
-	})
+	let session_open = if args.no_session {
+		HeadlessSessionOpen::Ephemeral
+	} else if args.continue_session {
+		HeadlessSessionOpen::ContinueLatest
+	} else if let Some(source) = args.fork.clone() {
+		HeadlessSessionOpen::Fork(source)
+	} else if let Some(source) = args.resume.clone() {
+		HeadlessSessionOpen::Resume(source)
+	} else {
+		HeadlessSessionOpen::New
+	};
+	let tool_policy = if args.no_tools {
+		HeadlessToolPolicy::None
+	} else if let Some(tools) = args.tools.as_ref() {
+		HeadlessToolPolicy::Only(tools.0.clone().into_boxed_slice())
+	} else {
+		HeadlessToolPolicy::All
+	};
+	let mut session = HeadlessSession::open_with_policy(
+		data_dir.clone(),
+		HeadlessSessionOptions {
+			project: cwd.clone(),
+			settings_overlays: args.config.clone().into_boxed_slice(),
+			additional_roots: args.add_dir.clone().into_boxed_slice(),
+			model,
+			initial_regime: args.plan_yolo.then_some("plan"),
+			initial_prompt_slot: args.plan_yolo.then_some("plan-yolo"),
+			plan_handoff,
+			resume: args.resume.clone(),
+			fork: args.fork.clone(),
+			py_eval: args.py_eval,
+			approval_mode: args.effective_approval().map(Into::into),
+			pty_denied: args.no_pty,
+			credential_provider,
+			api_key: args.api_key.clone(),
+			prompt_cache_affinity: args.prompt_cache_key.clone(),
+			session_generation: 1,
+		},
+		HeadlessLaunchPolicy {
+			session:            session_open,
+			sessions_dir:       args.session_dir.clone(),
+			tools:              tool_policy,
+			lsp_enabled:        !args.no_lsp,
+			auto_thinking:      None,
+			native_discovery:   omp_driver::discovery::native::NativeDiscoveryOptions {
+				explicit_roots:    if matches!(
+					args.extension_launch.mode,
+					crate::cli::InvocationExtensionMode::Disabled
+				) {
+					Vec::new()
+				} else {
+					args.extension_launch.native_roots.clone()
+				},
+				root_mode:         match args.extension_launch.mode {
+					crate::cli::InvocationExtensionMode::Merge => {
+						omp_driver::discovery::native::NativeRootMode::Merge
+					},
+					crate::cli::InvocationExtensionMode::ExplicitOnly
+					| crate::cli::InvocationExtensionMode::Disabled => {
+						omp_driver::discovery::native::NativeRootMode::ExplicitOnly
+					},
+				},
+				skill_settings:    settings_snapshot
+					.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
+					.into_diagnostic()?
+					.get()
+					.clone(),
+				include_workspace: !args.extension_launch.no_workspace
+					&& !matches!(
+						args.extension_launch.mode,
+						crate::cli::InvocationExtensionMode::Disabled
+					),
+				client_installed:  Some(data_dir.join("ext/installed.toml")),
+			},
+			extension_specs:    Arc::from(args.extension_launch.trusted.clone()),
+			contributed_values: Arc::from(args.extension_launch.contributed.clone()),
+		},
+	)
 	.await
 	.into_diagnostic()?;
 	let advisor_runtime = if args.advisor {
@@ -214,26 +295,28 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	let json = args.mode == "json";
 	let mut stdout = stdout();
 	if json {
-		write_json(
-			&mut stdout,
-			&format!(
-				"{{\"type\":\"session_start\",\"session_id\":{}}}\n",
-				json_string(session.session_id())
-			),
-		)
-		.await?;
+		let header = serde_json::json!({
+			"type": "session",
+			"version": 3,
+			"id": session.session_id(),
+			"timestamp": jiff::Timestamp::now().to_string(),
+			"cwd": cwd,
+			"additionalDirectories": args.add_dir.clone(),
+		});
+		write_json(&mut stdout, &format!("{}\n", serde_json::to_string(&header).into_diagnostic()?))
+			.await?;
 	} else {
 		stderr.write_all(b"Working...\n").await.into_diagnostic()?;
 	}
 
-	let mut part_kinds = BTreeMap::new();
+	let mut json_state = JsonTurnState::default();
 	let mut summary = submit_print_turn(
 		&mut session,
 		&events,
 		&lifecycle_events,
 		advisor_runtime.as_deref(),
 		initial_message(initial, system),
-		&mut part_kinds,
+		&mut json_state,
 		json,
 		args.shape_transcript,
 		&mut stdout,
@@ -255,7 +338,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 			vec![message(Role::User, vec![Part {
 				kind: Some(part::Kind::Text(follow_up.to_string())),
 			}])],
-			&mut part_kinds,
+			&mut json_state,
 			json,
 			args.shape_transcript,
 			&mut stdout,
@@ -296,22 +379,7 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	}
 
 	if !json {
-		if args.print_thoughts {
-			if let Some(thinking) = final_thinking(&summary) {
-				stdout
-					.write_all(sanitize(thinking.as_str()).as_bytes())
-					.await
-					.into_diagnostic()?;
-				stdout.write_all(b"\n").await.into_diagnostic()?;
-			}
-		}
-		if let Some(text) = summary.final_assistant() {
-			stdout
-				.write_all(sanitize(text).as_bytes())
-				.await
-				.into_diagnostic()?;
-			stdout.write_all(b"\n").await.into_diagnostic()?;
-		}
+		write_final_assistant(&summary, args.print_thoughts, &mut stdout).await?;
 	}
 	let report = session
 		.finalize(&mut stdout, FinalizerBudget::success(Duration::from_secs(30)))
@@ -333,13 +401,17 @@ async fn submit_print_turn(
 	lifecycle_events: &HeadlessLifecycleSubscription,
 	advisor: Option<&AppAdvisorRuntime<InProcTurnClient>>,
 	items: Vec<Item>,
-	part_kinds: &mut BTreeMap<u32, part_start::Kind>,
+	json_state: &mut JsonTurnState,
 	json: bool,
 	shape_transcript: bool,
 	stdout: &mut Stdout,
 	stderr: &mut Stderr,
 ) -> Result<AgentRunSummary, PrintTurnError> {
-	let submit = session.submit(items, omp_agent::TurnId::new(turn_id()));
+	let turn_id = omp_agent::TurnId::new(turn_id());
+	json_state.part_kinds.clear();
+	json_state.assistant_started = false;
+	json_state.settled_items.clear();
+	let submit = session.submit(items, turn_id.clone());
 	tokio::pin!(submit);
 	let result = loop {
 		tokio::select! {
@@ -349,7 +421,7 @@ async fn submit_print_turn(
 				if let Some(advisor) = advisor {
 					advisor.observe(event.as_ref()).await;
 				}
-				emit_event(&event, part_kinds, json, shape_transcript, stdout, stderr).await?;
+				emit_event(&event, json_state, json, shape_transcript, stdout, stderr).await?;
 			},
 			event = lifecycle_events.recv() => {
 				let Ok(event) = event else { continue; };
@@ -361,9 +433,13 @@ async fn submit_print_turn(
 		if let Some(advisor) = advisor {
 			advisor.observe(event.as_ref()).await;
 		}
-		emit_event(&event, part_kinds, json, shape_transcript, stdout, stderr).await?;
+		emit_event(&event, json_state, json, shape_transcript, stdout, stderr).await?;
 	}
-	Ok(result?)
+	let summary = result?;
+	if json {
+		emit_json_settlement(&summary, turn_id.as_str(), json_state, stdout).await?;
+	}
+	Ok(summary)
 }
 
 async fn emit_lifecycle(kind: &HeadlessLifecycleKind, stderr: &mut Stderr) {
@@ -378,9 +454,9 @@ async fn emit_lifecycle(kind: &HeadlessLifecycleKind, stderr: &mut Stderr) {
 
 async fn emit_event(
 	event: &AgentEvent,
-	part_kinds: &mut BTreeMap<u32, part_start::Kind>,
+	state: &mut JsonTurnState,
 	json: bool,
-	shape_transcript: bool,
+	_shape_transcript: bool,
 	stdout: &mut Stdout,
 	stderr: &mut Stderr,
 ) -> Result<(), PrintTurnError> {
@@ -396,101 +472,251 @@ async fn emit_event(
 		AgentEvent::Turn { turn_id, event } => match event.event.as_ref() {
 			Some(turn_event::Event::PartStart(start)) => {
 				if let Ok(kind) = part_start::Kind::try_from(start.kind) {
-					part_kinds.insert(start.index, kind);
+					state.part_kinds.insert(start.index, kind);
 				}
-				serde_json::json!({"type":"part_start","turn_id":turn_id.as_str(),"index":start.index,"kind":start.kind})
+				if state.assistant_started {
+					return Ok(());
+				}
+				state.assistant_started = true;
+				serde_json::json!({
+					"type":"message_start",
+					"message":{"role":"assistant","content":[]},
+					"turnId":turn_id.as_str()
+				})
 			},
 			Some(turn_event::Event::PartDelta(delta)) => {
-				let kind = part_kinds.get(&delta.index).copied();
+				let kind = state.part_kinds.get(&delta.index).copied();
 				let text = String::from_utf8_lossy(&delta.chunk);
 				serde_json::json!({
-					"type": match kind {
-						Some(part_start::Kind::Text) => "text_delta",
-						Some(part_start::Kind::Thinking) => "thinking_delta",
-						Some(part_start::Kind::ToolCall) => "tool_args_delta",
-						_ => "part_delta",
-					},
-					"turn_id":turn_id.as_str(),
-					"index":delta.index,
-					"text":sanitize(&text),
+					"type":"message_update",
+					"assistantMessageEvent": {
+						"type": match kind {
+							Some(part_start::Kind::Text) => "text_delta",
+							Some(part_start::Kind::Thinking) => "thinking_delta",
+							Some(part_start::Kind::ToolCall) => "toolcall_delta",
+							_ => "text_delta",
+						},
+						"delta":sanitize(&text),
+					}
 				})
 			},
 			Some(turn_event::Event::PartEnd(end)) => {
-				part_kinds.remove(&end.index);
-				serde_json::json!({"type":"part_end","turn_id":turn_id.as_str(),"index":end.index})
-			},
-			Some(turn_event::Event::Outcome(outcome)) if shape_transcript => {
-				serde_json::json!({"type":"outcome","turn_id":turn_id.as_str(),"stop":outcome.stop})
+				state.part_kinds.remove(&end.index);
+				return Ok(());
 			},
 			Some(turn_event::Event::Outcome(outcome)) => {
-				serde_json::json!({"type":"outcome","turn_id":turn_id.as_str(),"stop":outcome.stop,"model":outcome.model,"provider":outcome.provider})
+				state.settled_items.extend(outcome.output.iter().cloned());
+				return Ok(());
 			},
-			Some(_) => serde_json::json!({"type":"turn_event","turn_id":turn_id.as_str()}),
-			None => serde_json::json!({"type":"turn_event","turn_id":turn_id.as_str(),"empty":true}),
+			Some(_) | None => return Ok(()),
 		},
-		AgentEvent::ToolObserved {
-			call_id,
-			identity,
-			path,
-			visibility,
-			provenance,
-			session_generation,
-		} => serde_json::json!({
-			"type":"tool_observed",
-			"call_id":call_id.as_str(),
-			"name":identity.name.as_str(),
-			"rev":identity.rev.to_string(),
-			"path":path.as_ref().map(|path| path.as_str()),
-			"visibility":<&str>::from(*visibility),
-			"provenance":<&str>::from(*provenance),
-			"session_generation":session_generation,
-		}),
-		AgentEvent::PlanStateChanged { from, to, session_generation } => serde_json::json!({
-			"type":"plan_state_changed",
-			"from":<&str>::from(*from),
-			"to":<&str>::from(*to),
-			"session_generation":session_generation,
-		}),
+		AgentEvent::ToolObserved { .. } | AgentEvent::PlanStateChanged { .. } => return Ok(()),
 		AgentEvent::ToolOpened { call_id, name, rev } => {
-			serde_json::json!({"type":"tool_opened","call_id":call_id.as_str(),"name":name.as_str(),"rev":rev.to_string()})
+			serde_json::json!({"type":"tool_execution_start","toolCallId":call_id.as_str(),"toolName":name.as_str(),"rev":rev.to_string()})
 		},
 		AgentEvent::ToolArgs { call_id, fragment, .. } => {
-			serde_json::json!({"type":"tool_args","call_id":call_id.as_str(),"fragment":String::from_utf8_lossy(fragment)})
+			serde_json::json!({
+				"type":"message_update",
+				"assistantMessageEvent":{
+					"type":"toolcall_delta",
+					"toolCallId":call_id.as_str(),
+					"delta":String::from_utf8_lossy(fragment)
+				}
+			})
 		},
 		AgentEvent::ToolUpdate { call_id, json } => {
-			serde_json::json!({"type":"tool_update","call_id":call_id.as_str(),"json":String::from_utf8_lossy(json)})
+			serde_json::json!({"type":"tool_execution_update","toolCallId":call_id.as_str(),"content":String::from_utf8_lossy(json)})
 		},
 		AgentEvent::ToolFinished { call_id, .. } => {
-			serde_json::json!({"type":"tool_finished","call_id":call_id.as_str()})
+			serde_json::json!({"type":"tool_execution_end","toolCallId":call_id.as_str()})
 		},
-		AgentEvent::PhaseChanged { from, to } => {
-			serde_json::json!({"type":"phase_changed","from":format!("{from:?}"),"to":format!("{to:?}")})
-		},
-		AgentEvent::RosterChanged { generation } => {
-			serde_json::json!({"type":"roster_changed","generation":generation})
-		},
-		AgentEvent::JobRegistered { job_id } => {
-			serde_json::json!({"type":"job_registered","job_id":job_id.as_str()})
-		},
-		AgentEvent::JobSettled { job_id } => {
-			serde_json::json!({"type":"job_settled","job_id":job_id.as_str()})
-		},
-		AgentEvent::Failed { turn_id, message } => {
-			serde_json::json!({"type":"failed","turn_id":turn_id.as_ref().map(|id| id.as_str()),"message":sanitize(message.as_str())})
+		AgentEvent::PhaseChanged { .. }
+		| AgentEvent::RosterChanged { .. }
+		| AgentEvent::JobRegistered { .. }
+		| AgentEvent::JobSettled { .. } => return Ok(()),
+		AgentEvent::Failed { message, .. } => {
+			serde_json::json!({
+				"type":"message_update",
+				"assistantMessageEvent":{"type":"error","reason":"error","error":sanitize(message.as_str())}
+			})
 		},
 		AgentEvent::TitleChanged { title, source } => {
-			serde_json::json!({"type":"title_changed","title":title.as_str(),"source":format!("{source:?}")})
+			serde_json::json!({"type":"session_info_update","name":title.as_str(),"source":format!("{source:?}")})
 		},
 		AgentEvent::RunStateChanged { from, to } => {
-			serde_json::json!({"type":"run_state_changed","from":<&str>::from(*from),"to":<&str>::from(*to)})
+			if <&str>::from(*to) != "running" {
+				return Ok(());
+			}
+			serde_json::json!({
+				"type":"agent_start",
+				"from":<&str>::from(*from),
+				"to":<&str>::from(*to)
+			})
 		},
-		AgentEvent::Snapshot(_) => serde_json::json!({"type":"snapshot"}),
+		AgentEvent::Snapshot(_) => return Ok(()),
 		AgentEvent::PeerRelay(_) => return Ok(()),
 	};
 	let mut encoded = serde_json::to_string(&line)?;
 	encoded.push('\n');
 	stdout.write_all(encoded.as_bytes()).await?;
 	Ok(())
+}
+
+async fn emit_json_settlement(
+	summary: &AgentRunSummary,
+	turn_id: &str,
+	state: &mut JsonTurnState,
+	stdout: &mut Stdout,
+) -> Result<(), PrintTurnError> {
+	let assistant = summary
+		.outcome
+		.as_ref()
+		.and_then(|outcome| {
+			outcome.output.iter().rev().find_map(|item| {
+				let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+					return None;
+				};
+				(message.role() == Role::Assistant).then_some(message)
+			})
+		})
+		.map(|message| message_json(message, Some(stop_reason(summary))))
+		.unwrap_or_else(|| {
+			serde_json::json!({
+				"role":"assistant",
+				"content":[],
+				"stopReason":stop_reason(summary),
+			})
+		});
+	if !state.assistant_started {
+		write_json_value(
+			stdout,
+			&serde_json::json!({
+				"type":"message_start",
+				"message":{"role":"assistant","content":[]},
+				"turnId":turn_id,
+			}),
+		)
+		.await?;
+	}
+	write_json_value(
+		stdout,
+		&serde_json::json!({"type":"message_end","message":assistant,"turnId":turn_id}),
+	)
+	.await?;
+	let tool_results = state
+		.settled_items
+		.iter()
+		.filter_map(|item| match item.kind.as_ref() {
+			Some(item::Kind::ToolResult(result)) => Some(tool_result_json(result)),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	write_json_value(
+		stdout,
+		&serde_json::json!({"type":"turn_end","message":assistant,"toolResults":tool_results}),
+	)
+	.await?;
+	let messages = state
+		.settled_items
+		.iter()
+		.filter_map(canonical_item_json)
+		.collect::<Vec<_>>();
+	write_json_value(stdout, &serde_json::json!({"type":"agent_end","messages":messages})).await
+}
+
+async fn write_json_value(stdout: &mut Stdout, value: &Value) -> Result<(), PrintTurnError> {
+	let mut encoded = serde_json::to_string(value)?;
+	encoded.push('\n');
+	stdout.write_all(encoded.as_bytes()).await?;
+	Ok(())
+}
+
+fn canonical_item_json(item: &Item) -> Option<Value> {
+	match item.kind.as_ref()? {
+		item::Kind::Message(message) => Some(message_json(message, None)),
+		item::Kind::ToolCall(call) => Some(serde_json::json!({
+			"role":"assistant",
+			"content":[{
+				"type":"toolCall",
+				"id":call.id,
+				"name":call.name,
+				"arguments":serde_json::from_slice::<Value>(&call.args_json).unwrap_or(Value::Null),
+			}],
+		})),
+		item::Kind::ToolResult(result) => Some(tool_result_json(result)),
+	}
+}
+
+fn message_json(message: &Message, stop_reason: Option<&str>) -> Value {
+	let content = message
+		.parts
+		.iter()
+		.filter_map(|part| match part.kind.as_ref()? {
+			part::Kind::Text(text) => Some(serde_json::json!({"type":"text","text":sanitize(text)})),
+			part::Kind::Thinking(thinking) => {
+				Some(serde_json::json!({"type":"thinking","thinking":sanitize(&thinking.text)}))
+			},
+			part::Kind::Blob(blob) => Some(serde_json::json!({
+				"type":if blob.mime.starts_with("image/") {"image"} else {"document"},
+				"mimeType":blob.mime,
+				"data":omp_core::base64::encode(&blob.inline),
+			})),
+			part::Kind::Fallback(fallback) => Some(serde_json::json!({
+				"type":"modelFallback",
+				"fromModel":fallback.from_model,
+				"toModel":fallback.to_model,
+			})),
+			part::Kind::ServerTool(tool) => Some(serde_json::json!({
+				"type":"serverTool",
+				"id":tool.id,
+				"name":tool.name,
+				"payload":serde_json::from_slice::<Value>(&tool.payload_json).unwrap_or(Value::Null),
+			})),
+		})
+		.collect::<Vec<_>>();
+	let role = match message.role() {
+		Role::System => "system",
+		Role::User => "user",
+		Role::Assistant => "assistant",
+		Role::Unspecified => "unknown",
+	};
+	let mut value = serde_json::json!({"role":role,"content":content});
+	if let Some(stop_reason) = stop_reason {
+		value["stopReason"] = Value::String(stop_reason.to_owned());
+	}
+	value
+}
+
+fn tool_result_json(result: &omp_proto::thread::v1::ToolResult) -> Value {
+	let content = result
+		.parts
+		.iter()
+		.filter_map(|part| match part.kind.as_ref()? {
+			part::Kind::Text(text) => Some(serde_json::json!({"type":"text","text":sanitize(text)})),
+			part::Kind::Blob(blob) if blob.mime.starts_with("image/") => Some(serde_json::json!({
+				"type":"image",
+				"mimeType":blob.mime,
+				"data":omp_core::base64::encode(&blob.inline),
+			})),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	serde_json::json!({
+		"role":"toolResult",
+		"toolCallId":result.call_id,
+		"toolName":result.name,
+		"content":content,
+		"isError":result.is_error,
+	})
+}
+
+fn stop_reason(summary: &AgentRunSummary) -> &'static str {
+	match summary.settlement {
+		RunSettlement::Success | RunSettlement::Warning => "stop",
+		RunSettlement::SilentCompactionTransition | RunSettlement::CallerAbort => "aborted",
+		RunSettlement::MaxTokens => "length",
+		RunSettlement::TerminalFault => "error",
+	}
 }
 
 async fn emit_warning(summary: &AgentRunSummary, stderr: &mut Stderr) -> miette::Result<()> {
@@ -534,7 +760,7 @@ async fn emit_finalizer_report(report: FinalizerReport, stderr: &mut Stderr) -> 
 	Ok(())
 }
 
-fn initial_message(parts: Vec<ContentPart>, system: Option<Str>) -> Vec<Item> {
+pub(crate) fn initial_message(parts: Vec<ContentPart>, system: Option<Str>) -> Vec<Item> {
 	let mut items = Vec::with_capacity(usize::from(system.is_some()) + 1);
 	if let Some(system) = system {
 		items.push(message(Role::System, vec![Part {
@@ -571,26 +797,43 @@ fn message(role: Role, parts: Vec<Part>) -> Item {
 	Item { kind: Some(item::Kind::Message(Message { role: role as i32, parts })), ..Item::default() }
 }
 
-fn final_thinking(summary: &AgentRunSummary) -> Option<Str> {
-	let outcome = summary.outcome.as_ref()?;
-	let message = outcome.output.iter().rev().find_map(|item| {
-		let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
-			return None;
-		};
-		(message.role() == Role::Assistant).then_some(message)
-	})?;
-	let mut text = String::new();
+async fn write_final_assistant(
+	summary: &AgentRunSummary,
+	print_thoughts: bool,
+	stdout: &mut Stdout,
+) -> miette::Result<()> {
+	let Some(message) = summary.outcome.as_ref().and_then(|outcome| {
+		outcome.output.iter().rev().find_map(|item| {
+			let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+				return None;
+			};
+			(message.role() == Role::Assistant).then_some(message)
+		})
+	}) else {
+		return Ok(());
+	};
 	for part in &message.parts {
-		if let Some(part::Kind::Thinking(thinking)) = part.kind.as_ref()
-			&& !thinking.text.trim().is_empty()
-		{
-			text.push_str(&thinking.text);
+		let text = match part.kind.as_ref() {
+			Some(part::Kind::Text(text)) => Some(text.as_str()),
+			Some(part::Kind::Thinking(thinking))
+				if print_thoughts && !thinking.text.trim().is_empty() =>
+			{
+				Some(thinking.text.as_str())
+			},
+			_ => None,
+		};
+		if let Some(text) = text {
+			stdout
+				.write_all(sanitize(text).as_bytes())
+				.await
+				.into_diagnostic()?;
+			stdout.write_all(b"\n").await.into_diagnostic()?;
 		}
 	}
-	(!text.is_empty()).then(|| Str::from(text))
+	Ok(())
 }
 
-async fn initial_parts(
+pub(crate) async fn initial_parts(
 	words: &[Str],
 	auto_resize_images: bool,
 ) -> miette::Result<Vec<ContentPart>> {
@@ -614,14 +857,29 @@ async fn initial_parts(
 			append_text(&mut text, word);
 		}
 	}
-	if text.is_empty() && !io::stdin().is_terminal() {
-		let mut stdin = stdin();
-		stdin.read_to_string(&mut text).await.into_diagnostic()?;
+	if !io::stdin().is_terminal() {
+		let mut piped = String::new();
+		stdin().read_to_string(&mut piped).await.into_diagnostic()?;
+		text = combine_stdin_and_body(piped, text);
 	}
 	if !text.is_empty() {
 		parts.insert(0, ContentPart::Text { text: text.into(), proof: None });
 	}
 	Ok(parts)
+}
+
+fn combine_stdin_and_body(mut piped: String, body: String) -> String {
+	if piped.is_empty() {
+		return body;
+	}
+	if body.is_empty() {
+		return piped;
+	}
+	if !piped.ends_with('\n') {
+		piped.push('\n');
+	}
+	piped.push_str(&body);
+	piped
 }
 
 fn append_text(target: &mut String, value: &str) {
@@ -787,9 +1045,6 @@ async fn write_json(stdout: &mut Stdout, line: &str) -> miette::Result<()> {
 fn sanitize(text: &str) -> String {
 	text.replace('\0', "")
 }
-fn json_string(text: &str) -> String {
-	format!("{:?}", sanitize(text))
-}
 
 #[cfg(test)]
 mod tests {
@@ -797,6 +1052,17 @@ mod tests {
 	use omp_driver::settings::Settings;
 
 	use super::*;
+	#[test]
+	fn piped_stdin_precedes_the_positional_body() {
+		assert_eq!(
+			combine_stdin_and_body("context".into(), "review this".into()),
+			"context\nreview this"
+		);
+		assert_eq!(
+			combine_stdin_and_body("context\n".into(), "review this".into()),
+			"context\nreview this"
+		);
+	}
 	#[test]
 	fn print_suppresses_only_fresh_startup_plan_without_yolo() {
 		let mut settings = Settings::default();
@@ -815,6 +1081,49 @@ mod tests {
 			Some("application/pdf")
 		);
 		assert!(document_media_type(Path::new("sheet.xlsx"), b"PK\x03\x04").is_some());
+	}
+	#[test]
+	fn canonical_json_messages_retain_complete_text_and_thinking() {
+		let message = Message {
+			role:  Role::Assistant as i32,
+			parts: vec![Part { kind: Some(part::Kind::Text("answer".into())) }, Part {
+				kind: Some(part::Kind::Thinking(omp_proto::thread::v1::Thinking {
+					text: "reason".into(),
+					..Default::default()
+				})),
+			}],
+		};
+		assert_eq!(
+			message_json(&message, Some("stop")),
+			serde_json::json!({
+				"role":"assistant",
+				"content":[
+					{"type":"text","text":"answer"},
+					{"type":"thinking","thinking":"reason"}
+				],
+				"stopReason":"stop"
+			})
+		);
+	}
+
+	#[test]
+	fn canonical_json_tool_results_retain_authoritative_content() {
+		let result = omp_proto::thread::v1::ToolResult {
+			call_id: "call-1".into(),
+			name: "echo".into(),
+			parts: vec![Part { kind: Some(part::Kind::Text("done".into())) }],
+			..Default::default()
+		};
+		assert_eq!(
+			tool_result_json(&result),
+			serde_json::json!({
+				"role":"toolResult",
+				"toolCallId":"call-1",
+				"toolName":"echo",
+				"content":[{"type":"text","text":"done"}],
+				"isError":false
+			})
+		);
 	}
 	#[test]
 	fn attachment_budget_returns_an_explicit_skip_notice() {

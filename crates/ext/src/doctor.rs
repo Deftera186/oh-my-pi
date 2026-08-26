@@ -160,7 +160,9 @@ pub fn diagnose(request: &DoctorRequest<'_>, health: &impl RuntimeHealth) -> Vec
 		if let Some(revocations) = request
 			.revocations_path
 			.and_then(|path| RevocationsFile::read(path).ok())
-			&& revocations.predicate_for(&entry.id).is_some()
+			&& revocations
+				.revocation_for(&entry.id, &locked.version)
+				.is_ok_and(|revocation| revocation.is_some())
 		{
 			findings.push(finding(
 				Some(ExtensionCode::ERevoked),

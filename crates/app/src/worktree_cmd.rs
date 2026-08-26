@@ -72,6 +72,10 @@ pub struct WorktreeRow {
 	pub error:       Option<String>,
 	#[serde(skip)]
 	record_path:     Option<PathBuf>,
+	#[serde(skip)]
+	managed_root:    PathBuf,
+	#[serde(skip)]
+	record_valid:    bool,
 }
 
 fn configured_base(data_dir: &Path) -> io::Result<PathBuf> {
@@ -155,81 +159,104 @@ fn discover(data_dir: &Path) -> io::Result<Vec<WorktreeRow>> {
 }
 
 fn discover_root(root: &Path, rows: &mut Vec<WorktreeRow>) -> io::Result<()> {
-	let records_dir = root.join(".records");
+	let managed_root = fs::canonicalize(root)?;
+	let records_dir = managed_root.join(".records");
 	if records_dir.is_dir() {
 		for entry in fs::read_dir(&records_dir)? {
 			let entry = entry?;
 			if !entry.file_type()?.is_file() {
 				continue;
 			}
-			let Ok(record) = fs::read(entry.path()).and_then(|bytes| {
+			let record_path = entry.path();
+			let record = fs::read(&record_path).and_then(|bytes| {
 				serde_json::from_slice::<DurableRecord>(&bytes)
 					.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-			}) else {
-				rows.push(WorktreeRow {
-					id:          entry.file_name().to_string_lossy().into_owned(),
-					path:        entry.path(),
-					class:       "stray",
-					orphan:      true,
-					owner_pid:   None,
-					source_root: None,
-					branch:      None,
-					parent_repo: None,
-					removed:     None,
-					error:       None,
-					record_path: Some(entry.path()),
-				});
+			});
+			let Ok(record) = record else {
+				rows.push(stray_record(record_path, managed_root.clone()));
 				continue;
 			};
-			let class = if record.version == 1 {
-				match record.class.as_str() {
-					"pr-checkout" => "pr-checkout",
-					"task-isolation" => "task-isolation",
-					_ => "stray",
-				}
-			} else {
-				"stray"
+			let class = match (record.version, record.class.as_str()) {
+				(1, "pr-checkout") => Some("pr-checkout"),
+				(1, "task-isolation") => Some("task-isolation"),
+				_ => None,
 			};
+			let canonical_path = fs::canonicalize(&record.root).ok();
+			let valid = safe_component(&record.id)
+				&& entry.file_name() == ffi::OsStr::new(&format!("{}.json", record.id))
+				&& canonical_path.as_ref().is_some_and(|path| {
+					path.parent() == Some(managed_root.as_path())
+						&& path.file_name() == Some(ffi::OsStr::new(&record.id))
+				}) && class.is_some();
+			if !valid {
+				rows.push(stray_record(record_path, managed_root.clone()));
+				continue;
+			}
 			rows.push(WorktreeRow {
-				id: record.id,
-				path: record.root,
-				class,
-				orphan: !process_is_live(record.owner_pid),
-				owner_pid: Some(record.owner_pid),
-				source_root: Some(record.source_root),
-				branch: record.branch,
-				parent_repo: None,
-				removed: None,
-				error: None,
-				record_path: Some(entry.path()),
+				id:           record.id,
+				path:         canonical_path.expect("validated canonical worktree"),
+				class:        class.expect("validated record class"),
+				orphan:       !process_is_live(record.owner_pid),
+				owner_pid:    Some(record.owner_pid),
+				source_root:  Some(record.source_root),
+				branch:       record.branch,
+				parent_repo:  None,
+				removed:      None,
+				error:        None,
+				record_path:  Some(record_path),
+				managed_root: managed_root.clone(),
+				record_valid: true,
 			});
 		}
 	}
-	for entry in fs::read_dir(root)? {
+	for entry in fs::read_dir(&managed_root)? {
 		let entry = entry?;
 		let name = entry.file_name();
 		if name.to_string_lossy().starts_with('.') || !entry.file_type()?.is_dir() {
 			continue;
 		}
-		if rows.iter().any(|row| row.path == entry.path()) {
+		let path = fs::canonicalize(entry.path())?;
+		if rows.iter().any(|row| row.path == path) {
 			continue;
 		}
-		let classified = classify_unregistered(&entry.path())?;
+		let classified = classify_unregistered(&path)?;
 		rows.push(WorktreeRow {
-			id:          name.to_string_lossy().into_owned(),
-			path:        entry.path(),
-			class:       classified.class,
-			orphan:      classified.orphan,
-			owner_pid:   classified.owner_pid,
+			id: name.to_string_lossy().into_owned(),
+			path,
+			class: classified.class,
+			orphan: classified.orphan,
+			owner_pid: classified.owner_pid,
 			source_root: classified.source_root,
-			branch:      classified.branch,
+			branch: classified.branch,
 			parent_repo: classified.parent_repo,
-			removed:     None,
-			error:       None,
+			removed: None,
+			error: None,
 			record_path: None,
+			managed_root: managed_root.clone(),
+			record_valid: false,
 		});
 	}
 	Ok(())
+}
+
+fn stray_record(record_path: PathBuf, managed_root: PathBuf) -> WorktreeRow {
+	WorktreeRow {
+		id: record_path
+			.file_name()
+			.map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+		path: record_path.clone(),
+		class: "stray",
+		orphan: true,
+		owner_pid: None,
+		source_root: None,
+		branch: None,
+		parent_repo: None,
+		removed: None,
+		error: None,
+		record_path: Some(record_path),
+		managed_root,
+		record_valid: false,
+	}
 }
 
 fn classify_unregistered(path: &Path) -> io::Result<Classification> {
@@ -356,56 +383,110 @@ fn validate_pr_checkout(path: &Path) -> Option<(PathBuf, String)> {
 }
 
 fn remove_worktree(row: &WorktreeRow) -> io::Result<Option<PathBuf>> {
+	let target = validated_mutation_path(row)?;
 	let mut parent_to_prune = row.parent_repo.clone();
-	if let Some(parent) = &row.parent_repo
-		&& row.class == "pr-checkout"
-	{
-		match run_git(parent, &[
-			ffi::OsStr::new("worktree"),
-			ffi::OsStr::new("remove"),
-			ffi::OsStr::new("--force"),
-			row.path.as_os_str(),
-		]) {
-			Ok(true) => {},
-			Ok(false) | Err(_) => {
-				remove_path(&row.path, row.record_path.as_deref())?;
-				parent_to_prune = Some(parent.clone());
-			},
+	if let Some(path) = target.as_deref() {
+		if let Some(parent) = &row.parent_repo
+			&& row.class == "pr-checkout"
+		{
+			match run_git(parent, &[
+				ffi::OsStr::new("worktree"),
+				ffi::OsStr::new("remove"),
+				ffi::OsStr::new("--force"),
+				path.as_os_str(),
+			]) {
+				Ok(true) => {},
+				Ok(false) | Err(_) => {
+					remove_path(path)?;
+					parent_to_prune = Some(parent.clone());
+				},
+			}
+		} else {
+			remove_path(path)?;
 		}
-	} else {
-		remove_path(&row.path, row.record_path.as_deref())?;
 	}
-	if let Some(record) = &row.record_path
-		&& let Some(container) = record.parent().and_then(Path::parent)
+	if row.record_valid
+		&& let Some(record) = &row.record_path
 	{
-		let branch = container.join(".branches").join(&row.id);
+		let branch = row.managed_root.join(".branches").join(&row.id);
 		match fs::remove_file(branch) {
 			Ok(()) => {},
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(error),
 		}
-		prune_empty(&container.join(".branches"))?;
+		prune_empty(&row.managed_root.join(".branches"))?;
+		validate_record_path(record, &row.managed_root, Some(&row.id))?;
 	}
 	if let Some(record) = &row.record_path {
+		validate_record_path(record, &row.managed_root, row.record_valid.then_some(row.id.as_str()))?;
 		match fs::remove_file(record) {
 			Ok(()) => {},
 			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 			Err(error) => return Err(error),
 		}
-		if let Some(parent) = record.parent() {
-			prune_empty(parent)?;
-		}
+		prune_empty(&row.managed_root.join(".records"))?;
 	}
-	if let Some(parent) = row.path.parent() {
+	if let Some(path) = target
+		&& let Some(parent) = path.parent()
+	{
 		prune_empty(parent)?;
 	}
 	Ok(parent_to_prune)
 }
 
-fn remove_path(path: &Path, record_path: Option<&Path>) -> io::Result<()> {
+fn validated_mutation_path(row: &WorktreeRow) -> io::Result<Option<PathBuf>> {
+	let managed_root = fs::canonicalize(&row.managed_root)?;
+	if !row.record_valid && row.record_path.as_ref() == Some(&row.path) {
+		if let Some(record) = &row.record_path {
+			validate_record_path(record, &managed_root, None)?;
+		}
+		return Ok(None);
+	}
+	if !safe_component(&row.id) {
+		return Err(io::Error::other("worktree id is not a safe path component"));
+	}
+	let path = fs::canonicalize(&row.path)?;
+	if path.parent() != Some(managed_root.as_path())
+		|| path.file_name() != Some(ffi::OsStr::new(&row.id))
+	{
+		return Err(io::Error::other("worktree deletion target is outside the managed root"));
+	}
+	if row.record_valid {
+		let record = row
+			.record_path
+			.as_deref()
+			.ok_or_else(|| io::Error::other("registered worktree has no durable record"))?;
+		validate_record_path(record, &managed_root, Some(&row.id))?;
+	}
+	Ok(Some(path))
+}
+
+fn validate_record_path(record: &Path, managed_root: &Path, id: Option<&str>) -> io::Result<()> {
+	let records = fs::canonicalize(managed_root.join(".records"))?;
+	let record = fs::canonicalize(record)?;
+	let expected_name = id.map(|id| format!("{id}.json"));
+	if record.parent() != Some(records.as_path())
+		|| expected_name
+			.as_deref()
+			.is_some_and(|name| record.file_name() != Some(ffi::OsStr::new(name)))
+	{
+		return Err(io::Error::other("worktree record is outside the managed record directory"));
+	}
+	Ok(())
+}
+
+fn safe_component(value: &str) -> bool {
+	!value.is_empty()
+		&& !value.starts_with('.')
+		&& value
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn remove_path(path: &Path) -> io::Result<()> {
 	if path.is_dir() {
 		fs::remove_dir_all(path)
-	} else if path.exists() && record_path != Some(path) {
+	} else if path.exists() {
 		fs::remove_file(path)
 	} else {
 		Ok(())
@@ -514,5 +595,37 @@ mod tests {
 		fs::create_dir(&stray).expect("stray");
 		fs::write(stray.join("file"), b"x").expect("file");
 		assert_eq!(classify_unregistered(&stray).unwrap().class, "stray");
+	}
+
+	#[test]
+	fn corrupt_record_cannot_delete_outside_managed_root() {
+		let container = tempfile::tempdir().expect("container");
+		let managed = container.path().join("managed");
+		let victim = container.path().join("victim");
+		fs::create_dir_all(managed.join(".records")).expect("records");
+		fs::create_dir(&victim).expect("victim");
+		fs::write(victim.join("keep"), b"safe").expect("victim file");
+		let record = managed.join(".records/evil.json");
+		fs::write(
+			&record,
+			serde_json::to_vec(&serde_json::json!({
+				"version": 1,
+				"id": "../../victim",
+				"root": victim,
+				"branch": "../../victim",
+				"owner_pid": u32::MAX,
+				"class": "task-isolation",
+				"source_root": container.path(),
+			}))
+			.expect("record json"),
+		)
+		.expect("record");
+		let mut rows = Vec::new();
+		discover_root(&managed, &mut rows).expect("discovery");
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].class, "stray");
+		remove_worktree(&rows[0]).expect("quarantine corrupt record");
+		assert!(victim.join("keep").is_file());
+		assert!(!record.exists());
 	}
 }

@@ -133,19 +133,13 @@ impl blob_server::Blob for BlobRpc {
 			}
 			bytes.extend_from_slice(&chunk.data);
 		}
-		let actual_size = u64::try_from(bytes.len())
-			.map_err(|_| Status::resource_exhausted("blob exceeds supported size"))?;
-		if expected_size.is_some_and(|expected| expected != actual_size) {
-			return Err(Status::invalid_argument("uploaded blob size does not match declared size"));
-		}
 		let store = Arc::clone(&self.store);
+		let digest = validate_upload(&bytes, expected_hash, expected_size)?;
 		let reference = task::spawn_blocking(move || store.put(&bytes))
 			.await
 			.map_err(join_status)?
 			.map_err(storage_status)?;
-		if expected_hash.is_some_and(|expected| expected != reference.hash) {
-			return Err(Status::invalid_argument("uploaded blob hash does not match declared digest"));
-		}
+		debug_assert_eq!(reference.hash, digest);
 		Ok(Response::new(pb::PutResponse {
 			hash: Bytes::copy_from_slice(reference.hash.as_bytes()),
 			size: reference.size,
@@ -170,6 +164,23 @@ impl blob_server::Blob for BlobRpc {
 	}
 }
 
+fn validate_upload(
+	bytes: &[u8],
+	expected_hash: Option<Hash32>,
+	expected_size: Option<u64>,
+) -> Result<Hash32, Status> {
+	let actual_size = u64::try_from(bytes.len())
+		.map_err(|_| Status::resource_exhausted("blob exceeds supported size"))?;
+	if expected_size.is_some_and(|expected| expected != actual_size) {
+		return Err(Status::invalid_argument("uploaded blob size does not match declared size"));
+	}
+	let digest = Hash32::sum(bytes);
+	if expected_hash.is_some_and(|expected| expected != digest) {
+		return Err(Status::invalid_argument("uploaded blob hash does not match declared digest"));
+	}
+	Ok(digest)
+}
+
 fn parse_hash(bytes: &[u8]) -> Result<Hash32, Status> {
 	<[u8; 32]>::try_from(bytes)
 		.map(Hash32::new)
@@ -192,5 +203,25 @@ fn storage_status(error: blob::Error) -> Status {
 	match error {
 		blob::Error::NotFound => Status::not_found("blob not found"),
 		other => Status::internal(format!("blob store failed: {other}")),
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::Hash32;
+
+	use super::validate_upload;
+
+	#[test]
+	fn rejected_declared_digest_is_detected_before_storage() {
+		let bytes = b"bounded upload";
+		let wrong = Hash32::sum(b"different upload");
+		let error = validate_upload(bytes, Some(wrong), Some(bytes.len() as u64))
+			.expect_err("mismatched digest must be rejected");
+		assert_eq!(error.code(), tonic::Code::InvalidArgument);
+		assert_eq!(
+			validate_upload(bytes, Some(Hash32::sum(bytes)), Some(bytes.len() as u64))
+				.expect("matching digest"),
+			Hash32::sum(bytes)
+		);
 	}
 }

@@ -29,17 +29,33 @@ pub enum ThinkingCeiling {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryPolicy {
 	/// Native extension manifests or roots.
-	pub extension_paths: Box<[PathBuf]>,
+	pub extension_paths:  Box<[PathBuf]>,
+	/// Installed plugin roots.
+	pub plugin_paths:     Box<[PathBuf]>,
 	/// Explicit skill roots.
-	pub skill_paths:     Box<[PathBuf]>,
-	/// Explicit rules and context files.
-	pub context_paths:   Box<[PathBuf]>,
+	pub skill_paths:      Box<[PathBuf]>,
+	/// Plugin agent-definition roots.
+	pub agent_paths:      Box<[PathBuf]>,
+	/// Explicit persistent context files.
+	pub context_paths:    Box<[PathBuf]>,
+	/// Rule roots distinct from general context.
+	pub rule_paths:       Box<[PathBuf]>,
 	/// Prompt-template roots.
-	pub template_paths:  Box<[PathBuf]>,
+	pub template_paths:   Box<[PathBuf]>,
 	/// Slash-command roots.
-	pub command_paths:   Box<[PathBuf]>,
+	pub command_paths:    Box<[PathBuf]>,
 	/// MCP declaration roots.
-	pub mcp_paths:       Box<[PathBuf]>,
+	pub mcp_paths:        Box<[PathBuf]>,
+	/// Hook roots.
+	pub hook_paths:       Box<[PathBuf]>,
+	/// Tool module roots.
+	pub tool_paths:       Box<[PathBuf]>,
+	/// LSP configuration roots.
+	pub lsp_paths:        Box<[PathBuf]>,
+	/// DAP configuration roots.
+	pub dap_paths:        Box<[PathBuf]>,
+	/// JavaScript extension-module roots.
+	pub javascript_paths: Box<[PathBuf]>,
 }
 
 /// Session policy restrictions applied before the first turn.

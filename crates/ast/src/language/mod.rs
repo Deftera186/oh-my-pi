@@ -709,13 +709,13 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 		Make => &["mk", "mak"],
 		Markdown => &["md", "markdown", "mdx"],
 		Nix => &["nix"],
-		ObjC => &["m"],
+		ObjC => &["m", "mm"],
 		Ocaml => &["ml"],
 		Odin => &["odin"],
 		Php => &["php"],
 		Powershell => &["ps1", "psm1"],
 		Proto => &["proto"],
-		Python => &["py", "py3", "pyi", "bzl"],
+		Python => &["py", "py3", "pyi"],
 		R => &["r"],
 		Regex => &[],
 		Ruby => &["rb", "rbw", "gemspec"],
@@ -814,5 +814,10 @@ mod tests {
 			Some(LanguageIds { highlight: "env", lsp: "plaintext" })
 		);
 		assert_eq!(lsp_language_id(Path::new("unknown.bin")), "plaintext");
+	}
+	#[test]
+	fn extension_inference_selects_starlark_and_objective_cpp_grammars() {
+		assert_eq!(from_extension(Path::new("rules.bzl")), Some(SupportLang::Starlark));
+		assert_eq!(from_extension(Path::new("bridge.mm")), Some(SupportLang::ObjC));
 	}
 }

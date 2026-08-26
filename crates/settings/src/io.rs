@@ -139,7 +139,18 @@ pub fn atomic_replace(path: &Path, content: &str) -> Result<(), SettingsIoError>
 }
 
 fn parse_table(path: &Path, source: &str) -> Result<toml::Table, SettingsIoError> {
-	toml::from_str(source).map_err(|source| SettingsIoError::Parse { path: path.to_owned(), source })
+	if path
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.is_some_and(|extension| {
+			extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
+		}) {
+		serde_yaml::from_str(source)
+			.map_err(|source| SettingsIoError::ParseYaml { path: path.to_owned(), source })
+	} else {
+		toml::from_str(source)
+			.map_err(|source| SettingsIoError::Parse { path: path.to_owned(), source })
+	}
 }
 
 fn read_or_quarantine_locked(path: &Path) -> Result<ReadDocument, SettingsIoError> {
@@ -426,6 +437,15 @@ pub enum SettingsIoError {
 		#[source]
 		/// TOML failure returned while parsing the settings file.
 		source: de::Error,
+	},
+	/// A YAML compatibility source was malformed.
+	#[error("failed to parse YAML settings file {path}")]
+	ParseYaml {
+		/// YAML compatibility file containing malformed settings.
+		path:   PathBuf,
+		#[source]
+		/// YAML failure returned while parsing the settings file.
+		source: serde_yaml::Error,
 	},
 	/// Corrupt settings could not be moved aside.
 	#[error("refusing to overwrite corrupt settings file {path}; quarantine {backup_path} failed")]

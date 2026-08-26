@@ -5,7 +5,11 @@ mod diagnostics;
 mod handle;
 mod options;
 
-pub use builder::{SessionBlueprint, SessionBuildError, SessionBuilder, WorkspaceRootDescriptor};
+pub use builder::{
+	ProductionCallbackBoundary, ProductionSessionComposition, ProductionSessionError,
+	SessionBlueprint, SessionBuildError, SessionBuilder, SessionCreateError,
+	WorkspaceRootDescriptor,
+};
 pub use diagnostics::{
 	LaunchDiagnostic, LspSessionBinding, LspWarmupStatus, ModelCandidateState,
 	ModelFallbackDiagnostic, ServiceTierDiagnostic, SessionDiagnostics, ThinkingDiagnostic,

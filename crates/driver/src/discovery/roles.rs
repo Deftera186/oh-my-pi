@@ -3,15 +3,10 @@
 use std::env;
 
 use omp_catalog::{
-	ModelKey, ModelRole, SelectedModel, SelectionError, select_model, snapshot::Catalog,
-	upsert_role_assignment,
+	ModelKey, ModelRole, SelectedModel, SelectionError, select_model, settings::ModelSettings,
+	snapshot::Catalog,
 };
 use omp_core::Str;
-use omp_storage::state::{DurableRequest, Error, StateAuthority, StateScope, StateStore};
-use thiserror::Error as ThisError;
-
-const ROLE_KIND: &str = "model-roles";
-const ROLE_SCHEMA: &str = "2";
 /// Invocation-local resolved model roles after CLI-over-environment precedence.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LaunchRoles {
@@ -32,30 +27,36 @@ pub struct LaunchRoles {
 /// selection rather than clamped client-side.
 pub fn resolve_launch_roles(
 	catalog: &Catalog,
+	settings: &ModelSettings,
 	primary: Option<&str>,
 	smol: Option<&str>,
 	slow: Option<&str>,
 	plan: Option<&str>,
 ) -> Result<LaunchRoles, SelectionError> {
-	let resolve_selected = |cli: Option<&str>, variable: &str| {
+	let configured_roles = configured_roles(settings)?;
+	let models = eligible_models(catalog, settings);
+	let resolve_selected = |cli: Option<&str>, variable: &str, role: &str| {
 		let environment = env::var(variable).ok();
-		let Some(selector) = cli.or(environment.as_deref()) else {
+		let Some(selector) = cli
+			.or(environment.as_deref())
+			.or_else(|| settings.role_selector(role).map(Str::as_str))
+		else {
 			return Ok(None);
 		};
 		select_model(
-			catalog.models(),
+			&models,
 			catalog.routes(),
 			catalog.aliases(),
-			&[],
+			&configured_roles,
 			&Default::default(),
 			selector,
 		)
 		.map(Some)
 	};
-	let primary = resolve_selected(primary, "OMP_DEFAULT_MODEL")?;
-	let smol = resolve_selected(smol, "OMP_SMOL_MODEL")?;
-	let slow = resolve_selected(slow, "OMP_SLOW_MODEL")?;
-	let plan = resolve_selected(plan, "OMP_PLAN_MODEL")?;
+	let primary = resolve_selected(primary, "OMP_DEFAULT_MODEL", "default")?;
+	let smol = resolve_selected(smol, "OMP_SMOL_MODEL", "smol")?;
+	let slow = resolve_selected(slow, "OMP_SLOW_MODEL", "slow")?;
+	let plan = resolve_selected(plan, "OMP_PLAN_MODEL", "plan")?;
 	Ok(LaunchRoles {
 		primary:       primary.map(|selected| selected.model),
 		smol:          smol.map(|selected| selected.model),
@@ -68,126 +69,91 @@ pub fn resolve_launch_roles(
 /// environment fallback (e.g. `--plan-yolo-into`, `--prewalk-into`).
 pub fn resolve_role_selector(
 	catalog: &Catalog,
+	settings: &ModelSettings,
 	selector: &str,
 ) -> Result<SelectedModel, SelectionError> {
-	select_model(
-		catalog.models(),
-		catalog.routes(),
-		catalog.aliases(),
-		&[],
-		&Default::default(),
-		selector,
-	)
-}
-/// Failure while validating or durably saving a role assignment.
-#[derive(Debug, ThisError)]
-pub enum RolePersistenceError {
-	/// The model selector or role id is invalid.
-	#[error(transparent)]
-	Selection(#[from] SelectionError),
-	/// Durable project state could not be loaded or appended.
-	#[error(transparent)]
-	Storage(#[from] Error),
+	let roles = configured_roles(settings)?;
+	let models = eligible_models(catalog, settings);
+	select_model(&models, catalog.routes(), catalog.aliases(), &roles, &Default::default(), selector)
 }
 
-fn load_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-	scope: StateScope,
-) -> Result<Vec<ModelRole>, Error> {
-	let Some(entry) = store.latest(authority, scope, authority.namespace(), ROLE_KIND)? else {
-		return Ok(Vec::new());
-	};
-	Ok(serde_json::from_slice(&entry.raw)?)
-}
-
-/// Loads the latest project role assignment snapshot for the core namespace.
-pub fn load_project_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-) -> Result<Vec<ModelRole>, Error> {
-	load_roles(store, authority, StateScope::Project)
-}
-
-/// Loads the latest global/user role assignment snapshot.
-pub fn load_global_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-) -> Result<Vec<ModelRole>, Error> {
-	load_roles(store, authority, StateScope::User)
-}
-
-/// Merges global and project roles with project records winning per stable role
-/// id.
-pub fn load_effective_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-) -> Result<Vec<ModelRole>, Error> {
-	let mut roles = load_global_roles(store, authority)?;
-	for project in load_project_roles(store, authority)? {
-		if let Some(existing) = roles.iter_mut().find(|role| role.id == project.id) {
-			*existing = project;
-		} else {
-			roles.push(project);
-		}
-	}
-	Ok(omp_catalog::known_roles(&roles))
-}
-
-/// Appends a complete replacement snapshot for project-scoped role resolution.
-///
-/// `StateStore` supplies durable ordering and idempotency; callers use the
-/// returned request's project authority rather than writing workspace files.
-fn save_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-	scope: StateScope,
-	roles: &[ModelRole],
-	request: &DurableRequest,
-) -> Result<(), Error> {
-	let data = serde_json::to_vec(roles)?;
-	store.append(authority, scope, ROLE_KIND, ROLE_SCHEMA, &data, request)?;
-	Ok(())
-}
-
-/// Saves project-scoped roles.
-pub fn save_project_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-	roles: &[ModelRole],
-	request: &DurableRequest,
-) -> Result<(), Error> {
-	save_roles(store, authority, StateScope::Project, roles, request)
-}
-
-/// Saves global/user-scoped roles.
-pub fn save_global_roles(
-	store: &StateStore,
-	authority: &StateAuthority,
-	roles: &[ModelRole],
-	request: &DurableRequest,
-) -> Result<(), Error> {
-	save_roles(store, authority, StateScope::User, roles, request)
-}
-
-/// Validates and durably upserts one project-scoped role assignment.
-///
-/// The thinking annotation is stored in the role selector itself, including
-/// explicit `auto` for non-default roles. This persistence-only boundary has no
-/// access to the active session and therefore cannot switch its model.
-pub fn save_project_role_assignment(
-	store: &StateStore,
-	authority: &StateAuthority,
-	role: impl Into<Str>,
-	selector: &str,
-	thinking: Option<&str>,
-	request: &DurableRequest,
-) -> Result<Vec<ModelRole>, RolePersistenceError> {
-	let mut roles = load_project_roles(store, authority)?;
-	if upsert_role_assignment(&mut roles, role, selector, thinking)? {
-		save_project_roles(store, authority, &roles, request)?;
-	}
+fn configured_roles(settings: &ModelSettings) -> Result<Vec<ModelRole>, SelectionError> {
+	let mut roles = settings
+		.roles
+		.iter()
+		.map(|(id, selector)| {
+			let mut role = ModelRole::assignment(id.clone(), selector.as_str(), None)?;
+			if let Some(tag) = settings.role_tag(id) {
+				role.display_name = Some(tag.name.clone());
+				role.color = tag.color.clone();
+				role.hidden = tag.hidden;
+			}
+			role.cycle_order = settings
+				.cycle_order
+				.iter()
+				.position(|candidate| candidate == id)
+				.and_then(|index| u32::try_from(index).ok());
+			role.provider_rank = settings
+				.provider_order
+				.iter()
+				.cloned()
+				.map(omp_catalog::ProviderId::from)
+				.collect::<Vec<_>>()
+				.into_boxed_slice();
+			Ok(role)
+		})
+		.collect::<Result<Vec<_>, SelectionError>>()?;
+	roles = omp_catalog::known_roles(&roles);
 	Ok(roles)
+}
+
+/// Reports whether one concrete selector remains inside configured model and
+/// provider admission.
+pub fn model_selector_allowed(catalog: &Catalog, settings: &ModelSettings, selector: &str) -> bool {
+	catalog
+		.model(ModelKey::from_ref(selector))
+		.or_else(|| catalog.resolve_alias(selector))
+		.is_some_and(|model| {
+			model.routes.iter().any(|route_id| {
+				catalog.route(route_id).is_some_and(|route| {
+					let model_id = model
+						.key
+						.as_str()
+						.split_once('/')
+						.map_or(model.key.as_str(), |(_, model)| model);
+					settings.model_allowed(route.provider.as_str(), model_id)
+				})
+			})
+		})
+}
+
+/// Chooses the deterministic allowed fallback model.
+pub fn fallback_model_selector(catalog: &Catalog, settings: &ModelSettings) -> Option<Str> {
+	let models = eligible_models(catalog, settings);
+	let mru = Default::default();
+	omp_catalog::find_smol(&models, catalog.routes(), &mru)
+		.or_else(|| omp_catalog::pick_default(&models, catalog.routes(), &mru))
+		.map(|selected| Str::new(selected.model.as_str()))
+}
+
+fn eligible_models(catalog: &Catalog, settings: &ModelSettings) -> Vec<omp_catalog::ModelSpec> {
+	catalog
+		.models()
+		.iter()
+		.filter(|model| {
+			model.routes.iter().any(|route_id| {
+				catalog.route(route_id).is_some_and(|route| {
+					let model_id = model
+						.key
+						.as_str()
+						.split_once('/')
+						.map_or(model.key.as_str(), |(_, model)| model);
+					settings.model_allowed(route.provider.as_str(), model_id)
+				})
+			})
+		})
+		.cloned()
+		.collect()
 }
 
 #[cfg(test)]
@@ -204,5 +170,39 @@ mod tests {
 		let decoded: Vec<ModelRole> = serde_json::from_slice(&encoded).expect("decode role snapshot");
 		assert_eq!(decoded, roles);
 		assert_eq!(decoded[1].selectors[0].as_str(), "openai-codex/worker:auto");
+	}
+	#[test]
+	fn configured_role_and_model_admission_drive_launch_resolution() {
+		let catalog = omp_catalog::snapshot::Catalog::try_embedded().expect("catalog");
+		let model = catalog.models().first().expect("model");
+		let mut settings = ModelSettings::default();
+		settings
+			.roles
+			.insert(Str::new_static("default"), Str::new(model.key.as_str()));
+		let launch = resolve_launch_roles(catalog, &settings, None, None, None, None).expect("roles");
+		assert_eq!(launch.primary.as_ref(), Some(&model.key));
+		let provider = catalog
+			.route(model.routes.first().expect("route"))
+			.expect("route")
+			.provider
+			.clone();
+		settings.disabled_providers =
+			[omp_catalog::settings::PathScopedStringEntry::Bare(Str::new(provider.as_str()))].into();
+		assert!(resolve_launch_roles(catalog, &settings, None, None, None, None).is_err(),);
+	}
+
+	#[test]
+	fn configured_role_aliases_reach_recursive_catalog_resolution() {
+		let catalog = omp_catalog::snapshot::Catalog::try_embedded().expect("catalog");
+		let mut settings = ModelSettings::default();
+		settings
+			.roles
+			.insert(Str::new_static("task"), Str::new_static("@slow"));
+		settings
+			.roles
+			.insert(Str::new_static("default"), Str::new_static("@task"));
+		let launch =
+			resolve_launch_roles(catalog, &settings, None, None, None, None).expect("aliased roles");
+		assert!(launch.primary.is_some());
 	}
 }

@@ -141,8 +141,7 @@ fn replay_chat(items: &[v1::Item], renderers: &RenderRegistry) -> Chat {
 fn builtin_renderers() -> miette::Result<RenderRegistry> {
 	let gallery = omp_tools::gallery::builtin_renderer_gallery();
 	let mut renderers = RenderRegistry::new();
-	omp_tools::register_builtin_renderers(&mut renderers, gallery.identities)
-		.into_diagnostic()?;
+	omp_tools::register_builtin_renderers(&mut renderers, gallery.identities).into_diagnostic()?;
 	Ok(renderers)
 }
 

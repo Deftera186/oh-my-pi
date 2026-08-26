@@ -225,6 +225,8 @@ pub fn sum_fleet_tokens(clients: &[ClientUsageClientSummary]) -> Option<BTreeMap
 pub struct UsageWindowSnapshot {
 	/// Provider identifier.
 	pub provider:      Str,
+	/// Stable credential identity key.
+	pub account_key:   Str,
 	/// Stable provider-defined limit identifier.
 	pub limit_id:      Str,
 	/// Human-readable limit label.
@@ -244,40 +246,74 @@ pub struct UsageWindowSnapshot {
 /// Derived reset, exhaustion, and capacity signals for one provider usage
 /// limit.
 pub struct UsageWindowAnalytics {
-	/// Number of observed reset-boundary transitions or usage-fraction
-	/// rollbacks.
+	/// Number of reset cycles derived independently within each account.
 	pub resets:             u64,
-	/// Number of snapshots carrying explicit quota-exhaustion evidence.
+	/// Number of transitions into explicit quota exhaustion.
 	pub exhaustion_count:   u64,
 	/// Timestamped maximum used fraction for each bounded chronological bucket.
 	pub peak_curve:         Vec<(u64, f64)>,
-	/// Largest reciprocal nonzero used fraction, representing inferred account
-	/// capacity.
-	pub estimated_capacity: Option<f64>,
-	/// Ceiling of the estimated capacity, expressed as a whole-account
-	/// recommendation.
-	pub ideal_accounts:     Option<u64>,
+	/// Estimated provider tokens purchased by one full usage window.
+	pub estimated_capacity: Option<u64>,
+	/// Account count required to keep peak concurrent demand below 90%.
+	pub ideal_accounts:     u64,
 }
 
-/// Derives bounded quota analytics from one stable limit's chronological
-/// observations.
+const RESET_DROP_THRESHOLD: f64 = 0.05;
+const MIN_EXTRAPOLATION_FRACTION: f64 = 0.1;
+const TARGET_PEAK_UTILIZATION: f64 = 0.9;
+
+/// Derives bounded quota analytics from one stable limit's observations.
+///
+/// `provider_tokens` must cover the same observation interval as the snapshots.
 pub fn analyze_usage_window(
 	group: &UsageWindowGroup<'_>,
+	provider_tokens: u64,
 	curve_points: usize,
 ) -> UsageWindowAnalytics {
 	let mut snapshots = group.snapshots.clone();
 	snapshots.sort_by_key(|snapshot| snapshot.observed_at);
-	let resets = snapshots
-		.windows(2)
-		.filter(|pair| {
-			pair[1].resets_at != pair[0].resets_at
-				|| matches!((pair[0].used_fraction, pair[1].used_fraction), (Some(a), Some(b)) if b < a)
-		})
-		.count() as u64;
-	let exhaustion_count = snapshots
-		.iter()
-		.filter(|snapshot| snapshot.exhausted)
-		.count() as u64;
+
+	let mut accounts = BTreeMap::<Str, Vec<&UsageWindowSnapshot>>::new();
+	for snapshot in &snapshots {
+		accounts
+			.entry(snapshot.account_key.clone())
+			.or_default()
+			.push(snapshot);
+	}
+
+	let mut resets = 0_u64;
+	let mut exhaustion_count = 0_u64;
+	let mut fraction_consumed = 0.0_f64;
+	for account in accounts.values_mut() {
+		account.sort_by_key(|snapshot| snapshot.observed_at);
+		let mut previous_fraction = None;
+		let mut previous_reset = None;
+		let mut previously_exhausted = false;
+		for snapshot in account {
+			if snapshot.exhausted && !previously_exhausted {
+				exhaustion_count = exhaustion_count.saturating_add(1);
+			}
+			previously_exhausted = snapshot.exhausted;
+			let reset_timestamp_changed = matches!((previous_reset, snapshot.resets_at), (Some(previous), Some(current)) if previous != current);
+			let mut fraction_reset = false;
+			if let Some(fraction) = snapshot.used_fraction.filter(|value| value.is_finite()) {
+				if let Some(previous) = previous_fraction {
+					let delta = fraction - previous;
+					if delta > 0.0 {
+						fraction_consumed += delta;
+					} else if delta < -RESET_DROP_THRESHOLD {
+						fraction_reset = true;
+					}
+				}
+				previous_fraction = Some(fraction);
+			}
+			if reset_timestamp_changed || fraction_reset {
+				resets = resets.saturating_add(1);
+			}
+			previous_reset = snapshot.resets_at.or(previous_reset);
+		}
+	}
+
 	let points = curve_points.max(1);
 	let bucket = snapshots.len().div_ceil(points).max(1);
 	let peak_curve = snapshots
@@ -286,17 +322,34 @@ pub fn analyze_usage_window(
 			let peak = chunk
 				.iter()
 				.filter_map(|snapshot| snapshot.used_fraction)
+				.filter(|fraction| fraction.is_finite())
 				.reduce(f64::max)?;
 			Some((chunk.last()?.observed_at, peak))
 		})
 		.collect();
-	let estimated_capacity = snapshots
+
+	let mut events = snapshots
 		.iter()
-		.filter_map(|snapshot| snapshot.used_fraction)
-		.filter(|fraction| fraction.is_finite() && *fraction > 0.0)
-		.map(|fraction| 1.0 / fraction)
-		.reduce(f64::max);
-	let ideal_accounts = estimated_capacity.map(f64::ceil).map(|value| value as u64);
+		.filter_map(|snapshot| {
+			snapshot
+				.used_fraction
+				.filter(|fraction| fraction.is_finite())
+				.map(|fraction| (snapshot.observed_at, snapshot.account_key.clone(), fraction))
+		})
+		.collect::<Vec<_>>();
+	events.sort_by_key(|event| event.0);
+	let mut current = BTreeMap::<Str, f64>::new();
+	let mut concurrent = 0.0_f64;
+	let mut peak = 0.0_f64;
+	for (_, account, fraction) in events {
+		concurrent += fraction - current.insert(account, fraction).unwrap_or_default();
+		peak = peak.max(concurrent);
+	}
+
+	let estimated_capacity = (provider_tokens > 0
+		&& fraction_consumed >= MIN_EXTRAPOLATION_FRACTION)
+		.then(|| (provider_tokens as f64 / fraction_consumed).round() as u64);
+	let ideal_accounts = ((peak / TARGET_PEAK_UTILIZATION).ceil() as u64).max(1);
 	UsageWindowAnalytics { resets, exhaustion_count, peak_curve, estimated_capacity, ideal_accounts }
 }
 
@@ -402,6 +455,7 @@ mod tests {
 		let snapshots = [
 			UsageWindowSnapshot {
 				provider:      "anthropic".into(),
+				account_key:   "account-a".into(),
 				limit_id:      "anthropic:7d".into(),
 				label:         "Claude 7 Day".into(),
 				window_label:  Some("7 Day".into()),
@@ -412,6 +466,7 @@ mod tests {
 			},
 			UsageWindowSnapshot {
 				provider:      "anthropic".into(),
+				account_key:   "account-a".into(),
 				limit_id:      "anthropic:7d:fable".into(),
 				label:         "Claude 7 Day (Fable)".into(),
 				window_label:  Some("7 Day".into()),
@@ -427,5 +482,52 @@ mod tests {
 		assert_eq!(groups[1].key.limit_id.as_str(), "anthropic:7d:fable");
 		assert_eq!(groups[0].snapshots.len(), 1);
 		assert_eq!(groups[1].snapshots.len(), 1);
+	}
+
+	fn snapshot(account: &str, observed_at: u64, used_fraction: f64) -> UsageWindowSnapshot {
+		UsageWindowSnapshot {
+			provider: "anthropic".into(),
+			account_key: account.into(),
+			limit_id: "weekly".into(),
+			label: "Weekly".into(),
+			window_label: None,
+			used_fraction: Some(used_fraction),
+			observed_at,
+			resets_at: None,
+			exhausted: false,
+		}
+	}
+
+	#[test]
+	fn account_resets_ignore_jitter_and_capacity_tracks_consumed_demand() {
+		let mut snapshots = vec![
+			snapshot("account-a", 0, 0.20),
+			snapshot("account-b", 1, 0.80),
+			snapshot("account-a", 2, 0.18),
+			snapshot("account-b", 3, 0.10),
+			snapshot("account-a", 4, 0.38),
+		];
+		snapshots[1].exhausted = true;
+		snapshots[3].exhausted = true;
+		let group = group_usage_windows_by_limit_id(&snapshots).remove(0);
+		let analytics = analyze_usage_window(&group, 2_000, 100);
+		assert_eq!(analytics.resets, 1);
+		assert_eq!(analytics.exhaustion_count, 2);
+		assert_eq!(analytics.estimated_capacity, Some(10_000));
+		assert_eq!(analytics.ideal_accounts, 2);
+	}
+
+	#[test]
+	fn capacity_requires_meaningful_consumption_and_account_switch_is_not_reset() {
+		let snapshots = vec![
+			snapshot("account-a", 0, 0.90),
+			snapshot("account-b", 1, 0.01),
+			snapshot("account-a", 2, 0.95),
+		];
+		let group = group_usage_windows_by_limit_id(&snapshots).remove(0);
+		let analytics = analyze_usage_window(&group, 1_000, 100);
+		assert_eq!(analytics.resets, 0);
+		assert_eq!(analytics.estimated_capacity, None);
+		assert_eq!(analytics.ideal_accounts, 2);
 	}
 }

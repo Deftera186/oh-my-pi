@@ -10,7 +10,9 @@ use std::{
 
 use bytes::Bytes;
 use nix::{errno::Errno, sys::signal, unistd::Pid};
-use omp_core::{ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, sf};
+use omp_core::{
+	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
+};
 use omp_envd::{
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
@@ -22,6 +24,7 @@ use omp_envd::{
 		WorkerOutcomeKind,
 	},
 };
+use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt, InterruptClass},
 	inference::v1::tool_def,
@@ -397,7 +400,12 @@ async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
 		.await
 		.expect("trusted worker activation timed out")
 		.expect("activate exact trusted module");
-	assert_eq!(fs::read_to_string(&marker).expect("activation marker"), module.to_string_lossy(),);
+	assert_eq!(
+		fs::read_to_string(&marker).expect("activation marker"),
+		fs::canonicalize(&module)
+			.expect("canonical trusted module")
+			.to_string_lossy(),
+	);
 	assert!(supervisor.registrations().is_empty());
 	supervisor.shutdown().await;
 }
@@ -453,7 +461,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 				.as_str()
 		})
 		.collect::<Vec<_>>();
-	assert_eq!(names, ["echo_update", "reject_args", "native_block", "stable_echo"]);
+	assert_eq!(names, ["echo_update", "native_block", "reject_args", "stable_echo"]);
 	assert!(
 		supervisor
 			.registrations()
@@ -864,7 +872,29 @@ fn test_config(executable: PathBuf) -> ExtHostConfig {
 }
 
 fn py_eval_manifest(key: &HostKey) -> ExtensionManifest {
-	ExtensionManifest::py_eval(test_provenance(key), [])
+	let declaration = StaticDeclaration {
+		id: sf!("py_eval@.1"),
+		kind: sf!("soft"),
+		module: sf!("omp_py_eval"),
+		trigger: sf!("lazy"),
+		key: sf!("py_eval@.1"),
+		api: 1,
+		failure: sf!("fault"),
+		..StaticDeclaration::default()
+	};
+	ExtensionManifest::new_with_static(
+		test_provenance(key),
+		sf!("omp_py_eval"),
+		[],
+		DeclarationSet::new([ToolDeclarationKey::new("py_eval", "", 1)], []),
+		ServiceManifest::default(),
+		StaticDeclarations {
+			ordered: vec![declaration].into_boxed_slice(),
+			..StaticDeclarations::default()
+		},
+		[],
+		[ActivationTrigger::FirstReach],
+	)
 }
 
 fn test_manifest<const N: usize>(
@@ -872,17 +902,30 @@ fn test_manifest<const N: usize>(
 	entry: &'static str,
 	tools: [&'static str; N],
 ) -> ExtensionManifest {
-	ExtensionManifest::new(
+	let tools = tools
+		.into_iter()
+		.map(|name| ToolDeclarationKey::new(name, "", 1))
+		.collect::<Vec<_>>();
+	let ordered = tools
+		.iter()
+		.map(|tool| StaticDeclaration {
+			id: Str::from(format!("{}@.1", tool.name)),
+			kind: sf!("soft"),
+			module: Str::from(entry),
+			trigger: sf!("lazy"),
+			key: Str::from(format!("{}@.1", tool.name)),
+			api: 1,
+			failure: sf!("fault"),
+			..StaticDeclaration::default()
+		})
+		.collect::<Vec<_>>();
+	ExtensionManifest::new_with_static(
 		test_provenance(key),
 		entry,
 		[],
-		DeclarationSet::new(
-			tools
-				.into_iter()
-				.map(|name| ToolDeclarationKey::new(name, "", 1)),
-			[],
-		),
+		DeclarationSet::new(tools, []),
 		ServiceManifest::default(),
+		StaticDeclarations { ordered: ordered.into_boxed_slice(), ..StaticDeclarations::default() },
 		[],
 		[ActivationTrigger::FirstReach],
 	)

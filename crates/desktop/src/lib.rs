@@ -18,13 +18,17 @@ mod types;
 mod win32;
 
 use std::{
+	cell::RefCell,
 	collections::HashMap,
 	iter,
 	panic::{self, AssertUnwindSafe},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	thread,
 	thread::JoinHandle,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use ax::{AxRegistry, register_node};
@@ -55,6 +59,60 @@ enum Response {
 }
 
 type Reply = flume::Sender<CoreResult<Response>>;
+struct OperationState {
+	cancelled: AtomicBool,
+	deadline:  Instant,
+}
+
+impl OperationState {
+	fn check(&self) -> CoreResult<()> {
+		if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+			Err(DesktopError::timeout("native desktop operation expired before execution"))
+		} else {
+			Ok(())
+		}
+	}
+}
+
+struct Work {
+	request: Request,
+	state:   Arc<OperationState>,
+}
+
+struct CancelOnDrop(Arc<OperationState>);
+
+impl Drop for CancelOnDrop {
+	fn drop(&mut self) {
+		self.0.cancelled.store(true, Ordering::Release);
+	}
+}
+
+thread_local! {
+	static ACTIVE_OPERATION: RefCell<Option<Arc<OperationState>>> = const { RefCell::new(None) };
+}
+
+struct OperationScope;
+
+impl OperationScope {
+	fn enter(state: Arc<OperationState>) -> Self {
+		ACTIVE_OPERATION.with_borrow_mut(|active| *active = Some(state));
+		Self
+	}
+}
+
+impl Drop for OperationScope {
+	fn drop(&mut self) {
+		ACTIVE_OPERATION.with_borrow_mut(Option::take);
+	}
+}
+
+pub(crate) fn operation_checkpoint() -> CoreResult<()> {
+	ACTIVE_OPERATION.with_borrow(|active| {
+		active
+			.as_ref()
+			.map_or(Ok(()), |operation| operation.check())
+	})
+}
 
 enum Request {
 	Capabilities {
@@ -294,7 +352,8 @@ impl Worker {
 			.ok_or_else(DesktopError::ax_unsupported)
 	}
 
-	fn process(&mut self, request: &Request) -> CoreResult<Response> {
+	fn process(&mut self, request: &Request, operation: &OperationState) -> CoreResult<Response> {
+		operation.check()?;
 		match request {
 			Request::Capabilities { .. } => {
 				let caps = match self.backend.as_mut() {
@@ -352,6 +411,7 @@ impl Worker {
 			},
 			Request::Click { target, x, y, options, .. } => {
 				let (x, y, frame) = self.map_point(target, *x, *y)?;
+				operation.check()?;
 				self.backend()?.pointer(
 					target,
 					PointerEvent::Click {
@@ -368,6 +428,7 @@ impl Worker {
 			},
 			Request::MoveMouse { target, x, y, mode, .. } => {
 				let (x, y, frame) = self.map_point(target, *x, *y)?;
+				operation.check()?;
 				self
 					.backend()?
 					.pointer(target, PointerEvent::Move { x, y }, &frame, *mode)?;
@@ -384,6 +445,7 @@ impl Worker {
 					.iter()
 					.map(|(x, y)| frame.map_point(*x, *y, current.as_ref()))
 					.collect::<CoreResult<Vec<_>>>()?;
+				operation.check()?;
 				self.backend()?.pointer(
 					target,
 					PointerEvent::Drag {
@@ -398,6 +460,7 @@ impl Worker {
 			},
 			Request::Scroll { target, x, y, dx, dy, mode, .. } => {
 				let (x, y, frame) = self.map_point(target, *x, *y)?;
+				operation.check()?;
 				self.backend()?.pointer(
 					target,
 					PointerEvent::Scroll { x, y, dx: *dx, dy: *dy },
@@ -407,14 +470,17 @@ impl Worker {
 				Ok(Response::Unit)
 			},
 			Request::TypeText { target, text, mode, .. } => {
+				operation.check()?;
 				self.backend()?.type_text(target, text, *mode)?;
 				Ok(Response::Unit)
 			},
 			Request::KeyChord { target, keys, mode, .. } => {
+				operation.check()?;
 				self.backend()?.key_chord(target, keys, *mode)?;
 				Ok(Response::Unit)
 			},
 			Request::RaiseWindow { id, .. } => {
+				operation.check()?;
 				self.backend()?.raise_window(id)?;
 				Ok(Response::Unit)
 			},
@@ -514,6 +580,7 @@ impl Worker {
 			},
 			Request::AxPerform { reference, action, .. } => {
 				let h = self.registry.resolve(reference)?;
+				operation.check()?;
 				if action.eq_ignore_ascii_case("press") {
 					ax::ax_press(self.ax()?, &h)?;
 				} else {
@@ -523,11 +590,13 @@ impl Worker {
 			},
 			Request::AxSetValue { reference, value, .. } => {
 				let h = self.registry.resolve(reference)?;
+				operation.check()?;
 				self.ax()?.set_value(&h, value)?;
 				Ok(Response::Unit)
 			},
 			Request::AxFocus { reference, .. } => {
 				let h = self.registry.resolve(reference)?;
+				operation.check()?;
 				self.ax()?.focus(&h)?;
 				Ok(Response::Unit)
 			},
@@ -551,6 +620,7 @@ impl Worker {
 						DesktopError::window_not_found(format!("no window contains {reference}"))
 					})?;
 				let target = Target::Window(window.id);
+				operation.check()?;
 				self.backend()?.pointer(
 					&target,
 					PointerEvent::Click {
@@ -610,7 +680,7 @@ fn create_backend(_: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
 }
 
 struct Lifecycle {
-	tx:     Option<flume::Sender<Request>>,
+	tx:     Option<flume::Sender<Work>>,
 	done:   Option<Receiver<()>>,
 	join:   Option<JoinHandle<()>>,
 	closed: bool,
@@ -619,6 +689,7 @@ struct SessionCore {
 	selector:     DisplaySelector,
 	lifecycle:    Mutex<Lifecycle>,
 	capabilities: Arc<Mutex<DesktopCapabilities>>,
+	shutdown:     Arc<AtomicBool>,
 }
 impl SessionCore {
 	fn new(selector: DisplaySelector) -> Arc<Self> {
@@ -631,10 +702,11 @@ impl SessionCore {
 				closed: false,
 			}),
 			capabilities: Arc::new(Mutex::new(DesktopCapabilities::unavailable())),
+			shutdown: Arc::new(AtomicBool::new(false)),
 		})
 	}
 
-	fn ensure_started(&self) -> CoreResult<flume::Sender<Request>> {
+	fn ensure_started(&self) -> CoreResult<flume::Sender<Work>> {
 		let mut lifecycle = self.lifecycle.lock();
 		if lifecycle.closed {
 			return Err(DesktopError::closed());
@@ -642,20 +714,27 @@ impl SessionCore {
 		if let Some(tx) = &lifecycle.tx {
 			return Ok(tx.clone());
 		}
-		let (tx, rx) = flume::unbounded::<Request>();
+		let (tx, rx) = flume::unbounded::<Work>();
 		let (done_tx, done_rx) = flume::bounded(1);
 		let selector = self.selector.clone();
 		let caps = Arc::clone(&self.capabilities);
+		let shutdown = Arc::clone(&self.shutdown);
 		let join = thread::Builder::new()
 			.name("omp-desktop-session".into())
 			.spawn(move || {
 				let mut worker = Worker::new(selector, caps);
-				while let Ok(request) = rx.recv() {
+				while let Ok(work) = rx.recv() {
+					let Work { request, state } = work;
 					let close = request.is_close();
-					let result = panic::catch_unwind(AssertUnwindSafe(|| worker.process(&request)))
-						.unwrap_or_else(|_| {
-							Err(DesktopError::internal("native desktop worker panicked"))
-						});
+					let result = if shutdown.load(Ordering::Acquire) && !close {
+						Err(DesktopError::closed())
+					} else {
+						let _scope = OperationScope::enter(Arc::clone(&state));
+						panic::catch_unwind(AssertUnwindSafe(|| worker.process(&request, &state)))
+							.unwrap_or_else(|_| {
+								Err(DesktopError::internal("native desktop worker panicked"))
+							})
+					};
 					request.reply(result);
 					if close {
 						break;
@@ -672,26 +751,41 @@ impl SessionCore {
 		Ok(tx)
 	}
 
-	fn call(&self, make: impl FnOnce(Reply) -> Request) -> CoreResult<Response> {
+	fn call(
+		&self,
+		make: impl FnOnce(Reply) -> Request,
+		state: Arc<OperationState>,
+	) -> CoreResult<Response> {
 		let (txr, rxr) = flume::bounded(1);
 		self
 			.ensure_started()?
-			.send(make(txr))
+			.send(Work { request: make(txr), state: Arc::clone(&state) })
 			.map_err(|_| DesktopError::internal("native desktop worker stopped unexpectedly"))?;
-		rxr.recv_timeout(OPERATION_TIMEOUT).map_err(|e| {
+		let result = rxr.recv_deadline(state.deadline).map_err(|e| {
 			DesktopError::timeout(format!("native desktop operation did not complete: {e}"))
-		})?
+		});
+		if result.is_err() {
+			state.cancelled.store(true, Ordering::Release);
+		}
+		result?
 	}
 
 	fn close(&self) -> CoreResult<()> {
 		let mut lifecycle = self.lifecycle.lock();
 		lifecycle.closed = true;
+		self.shutdown.store(true, Ordering::Release);
 		let Some(tx) = lifecycle.tx.take() else {
 			return Ok(());
 		};
 		let (rtx, rrx) = flume::bounded(1);
-		tx.send(Request::Close { reply: rtx })
-			.map_err(|_| DesktopError::closed())?;
+		tx.send(Work {
+			request: Request::Close { reply: rtx },
+			state:   Arc::new(OperationState {
+				cancelled: AtomicBool::new(false),
+				deadline:  Instant::now() + CLOSE_TIMEOUT,
+			}),
+		})
+		.map_err(|_| DesktopError::closed())?;
 		let _ = rrx.recv_timeout(CLOSE_TIMEOUT).map_err(|e| {
 			DesktopError::timeout(format!("timed out closing native desktop worker: {e}"))
 		})?;
@@ -713,7 +807,14 @@ impl Drop for SessionCore {
 		let lifecycle = self.lifecycle.get_mut();
 		if let Some(tx) = lifecycle.tx.take() {
 			let (reply, _) = flume::bounded(1);
-			let _ = tx.send(Request::Close { reply });
+			self.shutdown.store(true, Ordering::Release);
+			let _ = tx.send(Work {
+				request: Request::Close { reply },
+				state:   Arc::new(OperationState {
+					cancelled: AtomicBool::new(false),
+					deadline:  Instant::now() + CLOSE_TIMEOUT,
+				}),
+			});
 		}
 		let _ = lifecycle.join.take();
 	}
@@ -1016,11 +1117,18 @@ impl DesktopSession {
 		D: FnOnce(Response) -> CoreResult<T> + Send + 'static,
 	{
 		let core = Arc::clone(&self.core);
-		task::spawn_blocking(move || decode(core.call(make)?))
+		let state = Arc::new(OperationState {
+			cancelled: AtomicBool::new(false),
+			deadline:  Instant::now() + OPERATION_TIMEOUT,
+		});
+		let cancel = CancelOnDrop(Arc::clone(&state));
+		let result = task::spawn_blocking(move || decode(core.call(make, state)?))
 			.await
 			.map_err(|error| {
 				DesktopError::internal(format!("desktop operation task failed: {error}"))
-			})?
+			})?;
+		drop(cancel);
+		result
 	}
 
 	async fn unit<M>(&self, make: M) -> CoreResult<()>
@@ -1169,6 +1277,12 @@ mod capture_tests {
 		let (reply, _rx) = flume::bounded(1);
 		Request::Capture { target, caps: CaptureCaps::default(), reply }
 	}
+	fn live_operation() -> OperationState {
+		OperationState {
+			cancelled: AtomicBool::new(false),
+			deadline:  Instant::now() + Duration::from_secs(1),
+		}
+	}
 
 	/// Regression for #7701: a composite AT-SPI window id minted by the Wayland
 	/// backend's own `windows()` must reach the backend, not be rejected by a
@@ -1177,7 +1291,7 @@ mod capture_tests {
 	fn capture_accepts_non_numeric_wayland_window_id() {
 		let mut worker = worker_with(FakeWaylandBackend::new());
 		let response = worker
-			.process(&capture_request(Target::Window(WAYLAND_ID.to_string())))
+			.process(&capture_request(Target::Window(WAYLAND_ID.to_string())), &live_operation())
 			.expect("wayland window id should be accepted by capture");
 		let Response::Capture(capture) = response else {
 			panic!("expected a capture response");
@@ -1193,10 +1307,22 @@ mod capture_tests {
 	#[test]
 	fn capture_rejects_unknown_window_id_via_backend_lookup() {
 		let mut worker = worker_with(FakeWaylandBackend::new());
-		let Err(err) = worker.process(&capture_request(Target::Window("does-not-exist".to_string())))
-		else {
+		let Err(err) = worker.process(
+			&capture_request(Target::Window("does-not-exist".to_string())),
+			&live_operation(),
+		) else {
 			panic!("unknown window id should fail");
 		};
 		assert_eq!(err.code, ErrorCode::WindowNotFound);
+	}
+	#[test]
+	fn expired_work_is_rejected_before_backend_access() {
+		let mut worker = worker_with(FakeWaylandBackend::new());
+		let expired = OperationState { cancelled: AtomicBool::new(false), deadline: Instant::now() };
+		let error = worker
+			.process(&capture_request(Target::Window(WAYLAND_ID.to_string())), &expired)
+			.err()
+			.expect("expired operation must not reach capture backend");
+		assert_eq!(error.code, ErrorCode::Timeout);
 	}
 }

@@ -30,7 +30,7 @@ use omp_tools::hub::{
 	DEFAULT_LIST_LIMIT, Fault, HubBackend, HubRouter, ListStatus, Op, Params, Request, Response,
 	RestartPolicy,
 };
-use parking_lot::Mutex;
+use regex::Regex;
 use serde_json::json;
 use tokio::{sync::broadcast::error::RecvError, task::JoinHandle, time};
 
@@ -40,6 +40,7 @@ static ROUTER: LazyLock<HubRouter<ChatHubBackend>> = LazyLock::new(HubRouter::ne
 const DEFAULT_ROUTE: &str = "*";
 const HUB_TERMINAL_COLUMNS: usize = 120;
 const HUB_TERMINAL_ROWS: usize = 40;
+const HUB_WAIT_MATCH_BYTES: usize = 256 * 1024;
 #[derive(Debug, Eq, PartialEq, serde::Serialize)]
 struct RosterCounts {
 	running:   usize,
@@ -297,7 +298,6 @@ pub struct ChatHubBackend {
 	env:        EnvClient,
 	agent_id:   Str,
 	session:    Str,
-	launches:   Mutex<BTreeMap<Str, Params>>,
 	relay_task: Option<JoinHandle<()>>,
 	canceller:  Option<Arc<dyn AgentCancellation>>,
 }
@@ -335,17 +335,7 @@ impl ChatHubBackend {
 				}
 			})
 		});
-		Self {
-			broker,
-			inbox,
-			jobs,
-			env,
-			agent_id,
-			session,
-			launches: Mutex::new(BTreeMap::new()),
-			relay_task,
-			canceller,
-		}
+		Self { broker, inbox, jobs, env, agent_id, session, relay_task, canceller }
 	}
 
 	fn response(value: serde_json::Value) -> Result<Response, Fault> {
@@ -689,13 +679,7 @@ impl ChatHubBackend {
 					.info()
 					.map_or_else(String::new, |info| info.root_uri)
 			},
-			|cwd| {
-				if cwd.contains("://") {
-					cwd.to_string()
-				} else {
-					format!("file://{cwd}")
-				}
-			},
+			ToString::to_string,
 		);
 		let cwd =
 			omp_core::EnvPath::new(Str::from(cwd_uri)).map_err(|error| fault(error.to_string()))?;
@@ -704,9 +688,9 @@ impl ChatHubBackend {
 			.start_process(&cwd, StartProcess {
 				name: name.to_string(),
 				spec: Some(ProcessSpec {
-					source:    Some(Script { text: command, props: None }),
-					cwd_uri:   String::new(),
-					env_delta: Some(EnvironmentDelta {
+					source:     Some(Script { text: command, props: None }),
+					cwd_uri:    String::new(),
+					env_delta:  Some(EnvironmentDelta {
 						set:   params
 							.env
 							.clone()
@@ -717,21 +701,21 @@ impl ChatHubBackend {
 						unset: Vec::new(),
 						props: None,
 					}),
-					pty:       params
+					pty:        params
 						.pty
 						.unwrap_or(true)
 						.then(|| PtySpec { terminal: "xterm-256color".to_owned(), ..Default::default() }),
-					restart:   Some(RestartSpec { policy: restart as i32, ..Default::default() }),
-					detached:  params.detached,
-					persist:   params.persist,
-					props:     Some(owner_process_props(&self.session, &self.agent_id)),
+					restart:    Some(RestartSpec { policy: restart as i32, ..Default::default() }),
+					timeout_ms: None,
+					detached:   params.detached,
+					persist:    params.persist,
+					props:      Some(owner_process_props(&self.session, &self.agent_id)),
 				}),
 				ready,
 				props: None,
 			})
 			.await
 			.map_err(|error| fault(error.to_string()))?;
-		self.launches.lock().insert(name.clone(), params.clone());
 		let lifetime = if params.detached {
 			ArtifactLifetime::Durable
 		} else {
@@ -815,6 +799,7 @@ impl ChatHubBackend {
 			.as_deref()
 			.ok_or_else(|| fault("process name is required"))?;
 		let generation = self.process_generation(name).await?;
+		let pattern = compile_regex(params.pattern.as_deref(), "wait pattern")?;
 		let mut attachment = self
 			.env
 			.attach_output(AttachOutput {
@@ -831,22 +816,68 @@ impl ChatHubBackend {
 			.map_err(|error| fault(error.to_string()))?;
 		let deadline = StdDuration::from_secs_f64(params.timeout.unwrap_or(30.0));
 		let event = time::timeout(deadline, async {
-			while let Some(event) = attachment.next_event().await.map_err(|error| fault(error.to_string()))? {
+			let mut accumulated = String::new();
+			while let Some(event) = attachment
+				.next_event()
+				.await
+				.map_err(|error| fault(error.to_string()))?
+			{
 				match event {
-					ProcessAttachmentEvent::Output(output) if params.pattern.as_deref().is_none_or(|pattern| String::from_utf8_lossy(&output.data).contains(pattern)) => return Ok(Some(json!({ "name": output.name, "cursor": output.sequence, "output": String::from_utf8_lossy(&output.data) }))),
+					ProcessAttachmentEvent::Output(output) => {
+						let text = String::from_utf8_lossy(&output.data);
+						if pattern.is_none() {
+							return Ok(Some(json!({
+								"name": output.name,
+								"cursor": output.sequence,
+								"output": text,
+							})));
+						}
+						append_bounded(&mut accumulated, &text, HUB_WAIT_MATCH_BYTES);
+						if pattern
+							.as_ref()
+							.is_some_and(|pattern| pattern.is_match(&accumulated))
+						{
+							return Ok(Some(json!({
+								"name": output.name,
+								"cursor": output.sequence,
+								"output": accumulated,
+							})));
+						}
+					},
 					ProcessAttachmentEvent::State(state) => {
 						let target = params.wait_for.as_deref().unwrap_or("exit");
 						let process_state = v1::ProcessState::try_from(
 							state.process.as_ref().map_or(0, |process| process.state),
 						)
 						.ok();
-						if (target == "ready" && matches!(process_state, Some(omp_proto::env::v1::ProcessState::Ready | omp_proto::env::v1::ProcessState::Running))) || (target == "exit" && matches!(process_state, Some(omp_proto::env::v1::ProcessState::Exited | omp_proto::env::v1::ProcessState::Stopped | omp_proto::env::v1::ProcessState::Failed))) { return Ok(Some(json!({ "name": name, "state": format!("{process_state:?}") }))); }
+						if (target == "ready"
+							&& matches!(
+								process_state,
+								Some(
+									omp_proto::env::v1::ProcessState::Ready
+										| omp_proto::env::v1::ProcessState::Running
+								)
+							)) || (target == "exit"
+							&& matches!(
+								process_state,
+								Some(
+									omp_proto::env::v1::ProcessState::Exited
+										| omp_proto::env::v1::ProcessState::Stopped
+										| omp_proto::env::v1::ProcessState::Failed
+								)
+							)) {
+							return Ok(Some(
+								json!({ "name": name, "state": format!("{process_state:?}") }),
+							));
+						}
 					},
 					_ => {},
 				}
 			}
 			Ok::<_, Fault>(None)
-		}).await.map_err(|_| fault("process wait timed out"))??;
+		})
+		.await
+		.map_err(|_| fault("process wait timed out"))??;
 		Self::response(json!({ "event": event }))
 	}
 
@@ -856,6 +887,7 @@ impl ChatHubBackend {
 			.as_deref()
 			.ok_or_else(|| fault("process name is required"))?;
 		let generation = self.process_generation(name).await?;
+		let grep = compile_regex(params.grep.as_deref(), "log filter")?;
 		let mut attachment = self
 			.env
 			.attach_output(AttachOutput {
@@ -888,11 +920,7 @@ impl ChatHubBackend {
 						terminal_bytes.extend_from_slice(&output.data);
 					} else {
 						for line in String::from_utf8_lossy(&output.data).lines() {
-							if params
-								.grep
-								.as_deref()
-								.is_none_or(|pattern| line.contains(pattern))
-							{
+							if grep.as_ref().is_none_or(|pattern| pattern.is_match(line)) {
 								lines.push(line.to_owned());
 							}
 						}
@@ -916,12 +944,7 @@ impl ChatHubBackend {
 			lines = replay
 				.into_lines()
 				.into_iter()
-				.filter(|line| {
-					params
-						.grep
-						.as_deref()
-						.is_none_or(|pattern| line.contains(pattern))
-				})
+				.filter(|line| grep.as_ref().is_none_or(|pattern| pattern.is_match(line)))
 				.collect();
 		}
 		if !params.head && lines.len() > limit {
@@ -1067,31 +1090,29 @@ impl HubBackend for ChatHubBackend {
 					.name
 					.as_deref()
 					.ok_or_else(|| fault("process name is required"))?;
-				let launch = self
-					.launches
-					.lock()
-					.get(name)
-					.cloned()
-					.ok_or_else(|| fault("process launch specification is not retained"))?;
 				let generation = self.process_generation(name).await?;
-				self
+				let restarted = self
 					.env
-					.stop_process(StopProcess {
+					.restart_process(v1::RestartProcess {
 						name: name.to_owned(),
-						grace_ms: 5_000,
 						generation,
+						wire_revision: omp_proto::SCHEMA_REV,
 						props: None,
 					})
 					.await
 					.map_err(|error| fault(error.to_string()))?;
-				self.start(&launch).await
+				self.ensure_owned_process_jobs().await?;
+				Self::response(json!({
+					"name": restarted.name,
+					"generation": restarted.generation,
+					"restarted": true,
+				}))
 			},
 			Op::Describe => {
 				let name = params
 					.name
 					.as_deref()
 					.ok_or_else(|| fault("process name is required"))?;
-				let launch = self.launches.lock().get(name).cloned();
 				let list = self
 					.env
 					.list_processes(ListProcesses { props: None })
@@ -1103,8 +1124,8 @@ impl HubBackend for ChatHubBackend {
 					.find(|process| process.name == name);
 				Self::response(json!({
 					"name": name,
+					"retained": process.is_some(),
 					"process": process.map(process_json),
-					"retained": launch.is_some(),
 				}))
 			},
 		}
@@ -1246,6 +1267,26 @@ fn command_text(application: &str, args: &[Str]) -> String {
 		.collect::<Vec<_>>()
 		.join(" ")
 }
+fn compile_regex(pattern: Option<&str>, label: &str) -> Result<Option<Regex>, Fault> {
+	pattern
+		.map(|pattern| {
+			Regex::new(pattern)
+				.map_err(|error| fault(format!("invalid {label} regex `{pattern}`: {error}")))
+		})
+		.transpose()
+}
+
+fn append_bounded(buffer: &mut String, text: &str, limit: usize) {
+	buffer.push_str(text);
+	if buffer.len() <= limit {
+		return;
+	}
+	let mut start = buffer.len().saturating_sub(limit);
+	while !buffer.is_char_boundary(start) {
+		start = start.saturating_add(1);
+	}
+	buffer.drain(..start);
+}
 
 fn shell_word(word: &str) -> String {
 	if !word.is_empty()
@@ -1340,7 +1381,10 @@ mod tests {
 	use omp_core::{Str, sf};
 	use omp_tools::hub::ListStatus;
 
-	use super::{DEFAULT_LIST_LIMIT, TerminalRowReplay, select_roster};
+	use super::{
+		DEFAULT_LIST_LIMIT, HUB_WAIT_MATCH_BYTES, TerminalRowReplay, append_bounded, compile_regex,
+		select_roster,
+	};
 
 	#[test]
 	fn terminal_row_replay_applies_cursor_motion_and_carriage_return() {
@@ -1349,6 +1393,22 @@ mod tests {
 		let lines = replay.into_lines();
 		assert_eq!(lines[0], "XWO");
 		assert_eq!(lines[1], "three");
+	}
+	#[test]
+	fn hub_patterns_are_validated_regexes_and_wait_buffers_cross_chunk_matches() {
+		let pattern = compile_regex(Some(r"ready\s+\d+"), "wait pattern")
+			.expect("valid regex")
+			.expect("pattern");
+		let mut accumulated = String::new();
+		append_bounded(&mut accumulated, "rea", HUB_WAIT_MATCH_BYTES);
+		assert!(!pattern.is_match(&accumulated));
+		append_bounded(&mut accumulated, "dy 42", HUB_WAIT_MATCH_BYTES);
+		assert!(pattern.is_match(&accumulated));
+		assert!(compile_regex(Some("("), "log filter").is_err());
+
+		let mut bounded = String::new();
+		append_bounded(&mut bounded, &"x".repeat(HUB_WAIT_MATCH_BYTES + 10), HUB_WAIT_MATCH_BYTES);
+		assert_eq!(bounded.len(), HUB_WAIT_MATCH_BYTES);
 	}
 	#[test]
 	fn default_roster_is_live_bounded_and_reports_parked_count() {

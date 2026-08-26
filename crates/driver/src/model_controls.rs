@@ -1297,8 +1297,9 @@ pub fn lower_provider_declaration(
 			codec: omp_catalog::CodecId::from(codec),
 			transport,
 			endpoint: EndpointSpec {
-				base_url: Str::from(raw_route.base_url.as_str()),
-				region:   raw_route.region.as_deref().map(Str::from),
+				base_url:    Str::from(raw_route.base_url.as_str()),
+				region:      raw_route.region.as_deref().map(Str::from),
+				api_version: None,
 			},
 			auth: auth.id.clone(),
 			headers: header_id,

@@ -172,6 +172,7 @@ impl ProductionCleanseHost {
 	) -> Result<RepairOutcome, ProductionError> {
 		let mut session = HeadlessSession::open(self.data_dir.clone(), HeadlessSessionOptions {
 			project:               self.root.clone(),
+			settings_overlays:     Box::new([]),
 			additional_roots:      Box::new([]),
 			model:                 Str::new(model),
 			initial_regime:        None,
@@ -233,6 +234,7 @@ impl ProductionCleanseHost {
 	) -> Result<RepairOutcome, ProductionError> {
 		let mut session = HeadlessSession::open(self.data_dir.clone(), HeadlessSessionOptions {
 			project:               self.root.clone(),
+			settings_overlays:     Box::new([]),
 			additional_roots:      Box::new([]),
 			model:                 Str::new(model),
 			initial_regime:        None,

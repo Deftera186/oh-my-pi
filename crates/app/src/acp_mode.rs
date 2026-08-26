@@ -1,7 +1,5 @@
 //! Agent Client Protocol (ACP) server over newline-delimited JSON on stdio.
 
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	env, fs,
@@ -10,7 +8,6 @@ use std::{
 	io::IsTerminal as _,
 	path::{Path, PathBuf},
 	pin::Pin,
-	process::{self, Stdio},
 	sync::{Arc, Weak},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +23,10 @@ use omp_agent::{
 use omp_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort, snapshot};
 use omp_core::{CowBytes, Hash32, Str, ToolPath, sf};
 use omp_driver::{
-	headless::{HeadlessSession, HeadlessSessionOptions},
+	headless::{
+		HeadlessLaunchPolicy, HeadlessSession, HeadlessSessionOpen, HeadlessSessionOptions,
+		HeadlessToolPolicy,
+	},
 	plan::PlanArtifactStore,
 	skills::SkillInvocationKind,
 };
@@ -42,6 +42,7 @@ use omp_proto::{
 	thread::v1::{self as thread, Blob, Item, Message, Part, Role, blob, item, part},
 	ui::v1::{ui_effect, ui_request},
 };
+use omp_settings::manager::{SettingsManager, SettingsPaths};
 use omp_storage::index::{SessionFilter, SessionIndex};
 use omp_tool::{Presentation, ToolIdentity};
 use omp_tools::{
@@ -52,7 +53,6 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use tokio::{
 	io::{AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader, stdin, stdout},
-	process::Command,
 	sync::oneshot,
 	task::{self, JoinHandle},
 	time,
@@ -80,31 +80,164 @@ enum AcpPromptIntercept {
 
 /// Runs ACP using stdin for NDJSON requests and stdout for NDJSON responses.
 pub async fn run(args: AcpArgs) -> miette::Result<()> {
+	let Some(max_time) = args.max_time.map(|duration| duration.0) else {
+		return run_inner(args).await;
+	};
+	time::timeout(max_time, run_inner(args))
+		.await
+		.map_err(|_| miette!("ACP mode exceeded --max-time"))?
+}
+
+async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 	if io::stdin().is_terminal() {
 		eprintln!("warning: `omp acp` expects newline-delimited JSON on stdin");
 	}
 	let root = fs::canonicalize(&args.project).into_diagnostic()?;
+	let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let state_dir = omp_env::project_state::directory(&data_dir, &root).into_diagnostic()?;
 	fs::create_dir_all(state_dir.join("sessions")).into_diagnostic()?;
 	let index = Arc::new(SessionIndex::open(state_dir.join("sessions.sqlite3")).into_diagnostic()?);
 	let local_root = state_dir.join("local");
 	fs::create_dir_all(&local_root).into_diagnostic()?;
-	let content = omp_driver::discovery::active_content_snapshots(&root);
-	let configured_model = omp_driver::settings::current(&data_dir)
+	let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&root));
+	settings_paths.overlays.extend(args.config.iter().cloned());
+	let settings_manager = SettingsManager::open(settings_paths).into_diagnostic()?;
+	let settings_snapshot = settings_manager.snapshot();
+	let model_settings = settings_snapshot
+		.project::<omp_catalog::settings::ModelSettings>()
 		.into_diagnostic()?
-		.default_model
-		.map(Str::from);
-	let model = args
-		.model
-		.or(configured_model)
-		.ok_or_else(|| miette!("acp mode requires --model or config.default_model"))?;
+		.get()
+		.resolve_path_scopes(&root, &home);
+	let skill_settings = settings_snapshot
+		.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
+		.into_diagnostic()?
+		.get()
+		.clone();
+	let disabled_extensions =
+		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
+	let prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
+		model:   model_settings.clone(),
+		skills:  skill_settings.clone(),
+		foreign: settings_snapshot
+			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		rules:   settings_snapshot
+			.project::<omp_driver::rulebook::RulebookSettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		native:  omp_driver::discovery::native::NativeDiscoveryOptions {
+			explicit_roots: if disabled_extensions {
+				Vec::new()
+			} else {
+				args.extension_launch.native_roots.clone()
+			},
+			root_mode: match args.extension_launch.mode {
+				crate::cli::InvocationExtensionMode::Merge => {
+					omp_driver::discovery::native::NativeRootMode::Merge
+				},
+				crate::cli::InvocationExtensionMode::ExplicitOnly
+				| crate::cli::InvocationExtensionMode::Disabled => {
+					omp_driver::discovery::native::NativeRootMode::ExplicitOnly
+				},
+			},
+			skill_settings,
+			include_workspace: !args.extension_launch.no_workspace && !disabled_extensions,
+			client_installed: Some(data_dir.join("ext/installed.toml")),
+		},
+	};
+	let content = omp_driver::discovery::active_prompt_snapshots(
+		&root,
+		&args.add_dir,
+		&home,
+		&prompt_discovery_settings,
+	)
+	.content;
 	let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
-	let models = catalog
+	let roles = omp_driver::discovery::roles::resolve_launch_roles(
+		catalog,
+		&model_settings,
+		args.model.as_deref(),
+		args.smol.as_deref(),
+		args.slow.as_deref(),
+		args.plan.as_deref(),
+	)
+	.map_err(|error| miette!(error))?;
+	let model = roles
+		.primary
+		.ok_or_else(|| miette!("acp mode requires a configured default model role"))?;
+	let mut models = catalog
 		.models()
 		.iter()
-		.map(|entry| entry.key.as_str().to_owned())
-		.collect();
+		.filter_map(|entry| {
+			let (provider, model) = entry.key.as_str().split_once('/')?;
+			model_settings
+				.model_allowed(provider, model)
+				.then(|| entry.key.as_str().to_owned())
+		})
+		.collect::<Vec<_>>();
+	models.sort_by_key(|selector| {
+		let (provider, model) = selector.split_once('/').unwrap_or(("", selector.as_str()));
+		(
+			model_settings
+				.model_rank(provider, model)
+				.unwrap_or(usize::MAX),
+			selector.clone(),
+		)
+	});
+	let cycle_selectors = args.models.as_ref().map_or_else(
+		|| {
+			model_settings
+				.cycle_order
+				.iter()
+				.cloned()
+				.collect::<Vec<_>>()
+		},
+		|configured| configured.0.clone(),
+	);
+	let mut cycle_models = cycle_selectors
+		.iter()
+		.filter_map(|selector| {
+			omp_driver::discovery::roles::resolve_role_selector(catalog, &model_settings, selector)
+				.ok()
+				.map(|selected| selected.model.as_str().to_owned())
+		})
+		.collect::<Vec<_>>();
+	cycle_models.extend(models);
+	let mut seen_models = BTreeSet::new();
+	cycle_models.retain(|model| seen_models.insert(model.clone()));
+	let models = cycle_models;
+	let session_open = if args.no_session {
+		HeadlessSessionOpen::Ephemeral
+	} else if args.continue_session {
+		HeadlessSessionOpen::ContinueLatest
+	} else if let Some(source) = args.fork.clone() {
+		HeadlessSessionOpen::Fork(source)
+	} else if let Some(source) = args.resume.clone() {
+		HeadlessSessionOpen::Resume(source)
+	} else {
+		HeadlessSessionOpen::New
+	};
+	let tool_policy = if args.no_tools {
+		HeadlessToolPolicy::None
+	} else if let Some(tools) = args.tools.as_ref() {
+		HeadlessToolPolicy::Only(tools.0.clone().into_boxed_slice())
+	} else {
+		HeadlessToolPolicy::All
+	};
+	let launch_policy = HeadlessLaunchPolicy {
+		session:            session_open,
+		sessions_dir:       args.session_dir.clone(),
+		tools:              tool_policy,
+		lsp_enabled:        !args.no_lsp,
+		auto_thinking:      None,
+		native_discovery:   prompt_discovery_settings.native.clone(),
+		extension_specs:    Arc::from(args.extension_launch.trusted.clone()),
+		contributed_values: Arc::from(args.extension_launch.contributed.clone()),
+	};
 	let (output_tx, output_rx) = flume::unbounded();
 	let writer = tokio::spawn(write_ndjson(stdout(), output_rx));
 	let runtime = Arc::new(Runtime {
@@ -112,18 +245,22 @@ pub async fn run(args: AcpArgs) -> miette::Result<()> {
 		state:  Mutex::new(State {
 			initialized: false,
 			data_dir,
+			settings_overlays: args.config.clone().into_boxed_slice(),
+			additional_roots: args.add_dir.clone().into_boxed_slice(),
+			launch_policy,
 			root,
 			local_root,
 			index,
 			content,
+			prompt_discovery_settings,
 			sessions: HashMap::new(),
 			active: HashMap::new(),
 			approvals: ApprovalBook::new(),
 			model: model.to_string(),
+			explicit_model: args.model.clone(),
 			models,
 			mode: "default".into(),
 			thinking: "auto".into(),
-			terminal_auth: args.acp_terminal_auth,
 			capabilities: PeerCapabilities::default(),
 			next_peer_request: 1,
 			pending_peer: HashMap::new(),
@@ -213,25 +350,29 @@ struct Runtime {
 }
 
 struct State {
-	initialized:             bool,
-	data_dir:                PathBuf,
-	root:                    PathBuf,
-	local_root:              PathBuf,
-	index:                   Arc<SessionIndex>,
-	content:                 omp_driver::discovery::ActiveContentSnapshots,
-	sessions:                HashMap<Str, Arc<AcpSession>>,
-	active:                  HashMap<Str, CancellationToken>,
-	approvals:               ApprovalBook,
-	model:                   String,
-	models:                  Vec<String>,
-	mode:                    String,
-	thinking:                String,
-	terminal_auth:           bool,
-	capabilities:            PeerCapabilities,
-	next_peer_request:       u64,
-	pending_peer:            HashMap<u64, oneshot::Sender<Result<Value, Value>>>,
+	initialized: bool,
+	data_dir: PathBuf,
+	settings_overlays: Box<[PathBuf]>,
+	additional_roots: Box<[PathBuf]>,
+	launch_policy: HeadlessLaunchPolicy,
+	root: PathBuf,
+	local_root: PathBuf,
+	index: Arc<SessionIndex>,
+	content: omp_driver::discovery::ActiveContentSnapshots,
+	prompt_discovery_settings: omp_driver::discovery::PromptDiscoverySettings,
+	sessions: HashMap<Str, Arc<AcpSession>>,
+	active: HashMap<Str, CancellationToken>,
+	approvals: ApprovalBook,
+	model: String,
+	explicit_model: Option<Str>,
+	models: Vec<String>,
+	mode: String,
+	thinking: String,
+	capabilities: PeerCapabilities,
+	next_peer_request: u64,
+	pending_peer: HashMap<u64, oneshot::Sender<Result<Value, Value>>>,
 	next_session_generation: u64,
-	command_generation:      u64,
+	command_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -239,6 +380,7 @@ struct PeerCapabilities {
 	read_text_file:  bool,
 	write_text_file: bool,
 	terminal:        bool,
+	auth_terminal:   bool,
 	elicitation:     bool,
 }
 
@@ -1040,7 +1182,7 @@ impl Runtime {
 			"session/propose_plan" => self.propose_plan(&params).await,
 			"session/reload_extensions" => {
 				let session_id = Str::from(required_text(&params, "sessionId")?);
-				self.reload_commands(&session_id)?;
+				self.reload_commands(&session_id).await?;
 				Ok(json!({"generation":self.state.lock().command_generation}))
 			},
 			"speech.models.list" => self.speech_models().await,
@@ -1049,7 +1191,7 @@ impl Runtime {
 			"_omp/chats/byCwd" => self.list_chats_by_cwd(&params),
 			"_omp/usage" => self.usage(&params),
 			"_omp/extensions" => self.list_extensions(),
-			"_omp/extensions/toggle" => self.toggle_extension(&params),
+			"_omp/extensions/toggle" => self.toggle_extension(&params).await,
 			_ => Err(miette!("unknown ACP method `{method}`")),
 		};
 		if let Some(id) = id {
@@ -1101,32 +1243,36 @@ impl Runtime {
 			terminal:        client
 				.and_then(|value| value.get("terminal"))
 				.is_some_and(|value| value.as_bool().unwrap_or(value.is_object())),
+			auth_terminal:   client
+				.and_then(|value| value.get("auth"))
+				.and_then(Value::as_object)
+				.and_then(|value| value.get("terminal"))
+				.and_then(Value::as_bool)
+				.unwrap_or(false),
 			elicitation:     client
 				.and_then(|value| value.get("elicitation"))
 				.and_then(Value::as_object)
 				.is_some_and(|value| value.contains_key("form")),
 		};
-		let mut auth = vec![json!({"id":"none","name":"Configured credentials"})];
-		if state.terminal_auth {
-			auth.push(json!({"id":"terminal","name":"Authenticate in terminal"}));
-		}
-		Ok(
-			json!({"protocolVersion":1,"agentInfo":{"name":"omp","version":env!("CARGO_PKG_VERSION")},"authMethods":auth,"agentCapabilities":{"loadSession":true,"resumeSession":true,"sessionCapabilities":{"fork":{},"list":{},"close":{}},"promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true,"stdio":true},"modes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"}]}}),
-		)
+		let auth = acp_auth_methods(state.capabilities.auth_terminal);
+		Ok(json!({
+			"protocolVersion":1,
+			"agentInfo":{"name":"oh-my-pi","title":"Oh My Pi","version":env!("CARGO_PKG_VERSION")},
+			"authMethods":auth,
+			"agentCapabilities":{
+				"loadSession":true,
+				"sessionCapabilities":{"fork":{},"list":{},"resume":{},"close":{}},
+				"promptCapabilities":{"image":true,"embeddedContext":true},
+				"mcpCapabilities":{"http":true,"sse":true}
+			}
+		}))
 	}
 
 	async fn authenticate(&self, params: &Map<String, Value>) -> miette::Result<Value> {
 		let method = required_text(params, "methodId")?;
-		if method == "none" {
-			return Ok(json!({}));
-		}
-		if method != "terminal" || !self.state.lock().terminal_auth {
+		let terminal = self.state.lock().capabilities.auth_terminal;
+		if method != "agent" && !(method == "terminal" && terminal) {
 			return Err(miette!("authentication method `{method}` was not advertised"));
-		}
-		let provider = required_text(params, "provider")?;
-		let status = spawn_terminal_auth(provider).await?;
-		if !status.success() {
-			return Err(miette!("terminal authentication exited with {status}"));
 		}
 		Ok(json!({}))
 	}
@@ -1163,9 +1309,11 @@ impl Runtime {
 	) -> miette::Result<Value> {
 		let (
 			data_dir,
-			root,
+			settings_overlays,
+			additional_roots,
+			mut launch_policy,
 			default_model,
-			models,
+			explicit_model,
 			default_mode,
 			default_thinking,
 			capabilities,
@@ -1176,15 +1324,52 @@ impl Runtime {
 			state.next_session_generation = generation.wrapping_add(1).max(1);
 			(
 				state.data_dir.clone(),
-				state.root.clone(),
+				state.settings_overlays.clone(),
+				state.additional_roots.clone(),
+				state.launch_policy.clone(),
 				state.model.clone(),
-				state.models.clone(),
+				state.explicit_model.clone(),
 				state.mode.clone(),
 				state.thinking.clone(),
 				state.capabilities,
 				generation,
 			)
 		};
+		let root = canonical_session_root(required_text(params, "cwd")?)?;
+		let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+		let mut paths = SettingsPaths::discover(&data_dir, Some(&root));
+		paths.overlays.extend(settings_overlays.iter().cloned());
+		let manager = SettingsManager::open(paths).into_diagnostic()?;
+		let settings_snapshot = manager.snapshot();
+		let model_settings = settings_snapshot
+			.project::<omp_catalog::settings::ModelSettings>()
+			.into_diagnostic()?
+			.get()
+			.resolve_path_scopes(&root, &home);
+		let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
+		let resolved = omp_driver::discovery::roles::resolve_launch_roles(
+			catalog,
+			&model_settings,
+			explicit_model.as_deref(),
+			None,
+			None,
+			None,
+		)
+		.map_err(|error| miette!(error))?;
+		let default_model = resolved
+			.primary
+			.map(|model| model.as_str().to_owned())
+			.unwrap_or(default_model);
+		let models = catalog
+			.models()
+			.iter()
+			.filter_map(|entry| {
+				let (provider, model) = entry.key.as_str().split_once('/')?;
+				model_settings
+					.model_allowed(provider, model)
+					.then(|| entry.key.as_str().to_owned())
+			})
+			.collect::<Vec<_>>();
 		let mode = params
 			.get("modeId")
 			.and_then(Value::as_str)
@@ -1204,23 +1389,35 @@ impl Runtime {
 			.and_then(Value::as_str)
 			.unwrap_or(&default_thinking);
 		let thinking = clamp_thinking_level(model, requested)?.to_owned();
-		let mut headless = HeadlessSession::open(data_dir, HeadlessSessionOptions {
-			project: root.clone(),
-			additional_roots: Box::default(),
-			model: Str::from(model),
-			initial_regime: (mode == "plan").then_some("plan"),
-			initial_prompt_slot: None,
-			plan_handoff: None,
-			resume,
-			fork,
-			py_eval: false,
-			approval_mode: None,
-			pty_denied: false,
-			credential_provider: None,
-			api_key: None,
-			prompt_cache_affinity: None,
-			session_generation: generation,
-		})
+		launch_policy.session = if let Some(source) = fork {
+			HeadlessSessionOpen::Fork(source)
+		} else if let Some(source) = resume {
+			HeadlessSessionOpen::Resume(source)
+		} else {
+			launch_policy.session
+		};
+		let mut headless = HeadlessSession::open_with_policy(
+			data_dir,
+			HeadlessSessionOptions {
+				project: root.clone(),
+				settings_overlays,
+				additional_roots,
+				model: Str::from(model),
+				initial_regime: (mode == "plan").then_some("plan"),
+				initial_prompt_slot: None,
+				plan_handoff: None,
+				resume: None,
+				fork: None,
+				py_eval: false,
+				approval_mode: None,
+				pty_denied: false,
+				credential_provider: None,
+				api_key: None,
+				prompt_cache_affinity: None,
+				session_generation: generation,
+			},
+			launch_policy,
+		)
 		.await
 		.into_diagnostic()?;
 		if mode == "plan" {
@@ -1429,7 +1626,7 @@ impl Runtime {
 				session_id,
 				json!({"sessionUpdate":"extension_generation_update","generation":event.generation}),
 			),
-			HeadlessLifecycleKind::CommandRosterInvalidated => self.reload_commands(session_id),
+			HeadlessLifecycleKind::CommandRosterInvalidated => self.refresh_commands(session_id),
 			HeadlessLifecycleKind::ExtensionError { extension, error } => self.update(
 				session_id,
 				json!({"sessionUpdate":"extension_error","extension":extension,"message":error.to_string()}),
@@ -1503,10 +1700,29 @@ impl Runtime {
 		}
 	}
 
-	fn reload_commands(&self, session_id: &Str) -> miette::Result<()> {
+	async fn reload_commands(&self, session_id: &Str) -> miette::Result<()> {
+		let session = self.session(session_id)?;
+		let reload = session
+			.asynchronous
+			.headless
+			.lock()
+			.await
+			.extension_reload_handle();
+		reload.reload().await.into_diagnostic()?;
+		self.refresh_commands(session_id)
+	}
+
+	fn refresh_commands(&self, session_id: &Str) -> miette::Result<()> {
 		let (commands, generation) = {
 			let mut state = self.state.lock();
-			state.content = omp_driver::discovery::active_content_snapshots(&state.root);
+			let home = env::var_os("HOME").map_or_else(|| state.root.clone(), PathBuf::from);
+			state.content = omp_driver::discovery::active_prompt_snapshots(
+				&state.root,
+				&state.additional_roots,
+				&home,
+				&state.prompt_discovery_settings,
+			)
+			.content;
 			state.command_generation = state.command_generation.wrapping_add(1).max(1);
 			(available_commands(&state.content, state.command_generation), state.command_generation)
 		};
@@ -1649,7 +1865,7 @@ impl Runtime {
 		}))
 	}
 
-	fn toggle_extension(&self, params: &Map<String, Value>) -> miette::Result<Value> {
+	async fn toggle_extension(&self, params: &Map<String, Value>) -> miette::Result<Value> {
 		use omp_ext::{lock::InstalledRecord, upgrade::set_enabled};
 		let id = required_text(params, "id")?;
 		let enabled = params
@@ -1679,7 +1895,7 @@ impl Runtime {
 			.cloned()
 			.collect::<Vec<_>>();
 		for session_id in sessions {
-			self.reload_commands(&session_id)?;
+			self.reload_commands(&session_id).await?;
 		}
 		Ok(json!({"id":id,"enabled":enabled,"scope":scope}))
 	}
@@ -2050,7 +2266,7 @@ impl Runtime {
 				return Ok(Some(AcpPromptIntercept::Consumed));
 			},
 			"reload-plugins" => {
-				self.reload_commands(session_id)?;
+				self.reload_commands(session_id).await?;
 				self.command_output(session_id, sf!("Extensions and commands reloaded."))?;
 				return Ok(Some(AcpPromptIntercept::Consumed));
 			},
@@ -2555,33 +2771,6 @@ impl Runtime {
 	}
 }
 
-#[cfg(unix)]
-async fn spawn_terminal_auth(provider: &str) -> miette::Result<process::ExitStatus> {
-	let terminal = OpenOptions::new()
-		.read(true)
-		.write(true)
-		.open("/dev/tty")
-		.into_diagnostic()?;
-	let input = terminal.try_clone().into_diagnostic()?;
-	let output = terminal.try_clone().into_diagnostic()?;
-	Command::new(env::current_exe().into_diagnostic()?)
-		.args(["auth", "login", provider])
-		.stdin(Stdio::from(input))
-		.stdout(Stdio::from(output))
-		.stderr(Stdio::from(terminal))
-		.status()
-		.await
-		.into_diagnostic()
-}
-
-#[cfg(not(unix))]
-async fn spawn_terminal_auth(_provider: &str) -> miette::Result<process::ExitStatus> {
-	Err(miette!(
-		"terminal authentication is unavailable: this platform has no isolated terminal spawning \
-		 backend"
-	))
-}
-
 fn map_settlement(summary: &AgentRunSummary) -> &'static str {
 	match summary.settlement {
 		RunSettlement::Success
@@ -2730,15 +2919,37 @@ fn convert_blocks(value: &Value) -> miette::Result<(Vec<ContentPart>, Vec<Value>
 				replay.push(json!({"sessionUpdate":"user_message_chunk","content":bounded}));
 			},
 			"resource" | "resource_link" => {
-				let uri = block
+				let resource = block
+					.get("resource")
+					.and_then(Value::as_object)
+					.unwrap_or_else(|| {
+						block
+							.as_object()
+							.expect("ACP content blocks are JSON objects")
+					});
+				let uri = resource
 					.get("uri")
 					.and_then(Value::as_str)
 					.unwrap_or("resource");
-				let text = block
-					.get("text")
-					.and_then(Value::as_str)
-					.map_or_else(|| format!("[Resource: {uri}]"), bounded_text);
-				parts.push(ContentPart::Text { text: Str::from(text), proof: None });
+				if let Some(text) = resource.get("text").and_then(Value::as_str) {
+					parts.push(ContentPart::Text { text: Str::from(bounded_text(text)), proof: None });
+				} else if let Some(blob) = resource.get("blob").and_then(Value::as_str)
+					&& let Some(media_type) = resource
+						.get("mimeType")
+						.or_else(|| resource.get("mediaType"))
+						.and_then(Value::as_str)
+						.filter(|media_type| media_type.starts_with("image/"))
+				{
+					let data = omp_core::base64::decode(blob)
+						.into_vec()
+						.map_err(|error| miette!("invalid resource image base64: {error}"))?;
+					parts.push(ContentPart::Image(MediaInput::Bytes {
+						media_type: Str::from(media_type),
+						data:       Bytes::from(data),
+					}));
+				} else {
+					parts.push(ContentPart::Text { text: sf!("[Resource: {uri}]"), proof: None });
+				}
 				let mut bounded = block.clone();
 				bound_embedded_block(&mut bounded);
 				replay.push(json!({"sessionUpdate":"user_message_chunk","content":bounded}));
@@ -2757,10 +2968,13 @@ fn convert_blocks(value: &Value) -> miette::Result<(Vec<ContentPart>, Vec<Value>
 }
 
 fn bound_embedded_block(block: &mut Value) {
-	for field in ["text", "data"] {
+	for field in ["text", "data", "blob"] {
 		if let Some(text) = block.get(field).and_then(Value::as_str) {
 			block[field] = Value::String(bounded_text(text));
 		}
+	}
+	if let Some(resource) = block.get_mut("resource") {
+		bound_embedded_block(resource);
 	}
 }
 
@@ -3201,7 +3415,7 @@ fn ask_answers(
 					.iter()
 					.any(|option| option.label.as_str() == candidate)
 			};
-			let mut selected: Vec<Str> = if question.multi {
+			let selected: Vec<Str> = if question.multi {
 				content
 					.get(&key)
 					.and_then(Value::as_array)
@@ -3220,24 +3434,58 @@ fn ask_answers(
 					.into_iter()
 					.collect()
 			};
-			if let Some(other) = content
+			let custom_input = content
 				.get(&format!("{key}__other"))
 				.and_then(Value::as_str)
 				.map(str::trim)
 				.filter(|value| !value.is_empty())
-			{
-				if !question.multi {
-					selected.clear();
-				}
-				selected.push(Str::from(other));
+				.map(Str::from);
+			omp_tools::ask::Answer {
+				id: question.id.clone(),
+				selected,
+				custom_input,
+				note: None,
+				timed_out: false,
 			}
-			omp_tools::ask::Answer { id: question.id.clone(), selected, timed_out: false }
 		})
 		.collect()
 }
 
 fn ask_fault(message: &'static str) -> ask::Fault {
 	ask::Fault::Presenter { message: Str::new_static(message) }
+}
+
+fn acp_auth_methods(terminal: bool) -> Vec<Value> {
+	let mut methods = vec![json!({
+		"id":"agent",
+		"name":"Use existing local credentials",
+		"description":"Authenticate via provider keys or OAuth state already configured under ~/.omp."
+	})];
+	if terminal {
+		methods.push(json!({
+			"type":"terminal",
+			"id":"terminal",
+			"name":"Set up Oh My Pi in terminal",
+			"description":"Launch the omp TUI to add provider keys and select models.",
+			"args":["--acp-terminal-auth"]
+		}));
+	}
+	methods
+}
+
+fn canonical_session_root(raw: &str) -> miette::Result<PathBuf> {
+	let requested = PathBuf::from(raw);
+	if !requested.is_absolute() {
+		return Err(miette!("ACP session cwd must be an absolute path"));
+	}
+	let root = requested
+		.canonicalize()
+		.into_diagnostic()
+		.map_err(|error| miette!("ACP session cwd is unavailable: {error}"))?;
+	if !root.is_dir() {
+		return Err(miette!("ACP session cwd must be a directory"));
+	}
+	Ok(root)
 }
 
 fn required_text<'a>(params: &'a Map<String, Value>, name: &str) -> miette::Result<&'a str> {
@@ -3399,6 +3647,27 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn canonical_auth_methods_follow_client_terminal_capability() {
+		let agent_only = acp_auth_methods(false);
+		assert_eq!(agent_only.len(), 1);
+		assert_eq!(agent_only[0]["id"], "agent");
+		let terminal = acp_auth_methods(true);
+		assert_eq!(terminal[1]["type"], "terminal");
+		assert_eq!(terminal[1]["id"], "terminal");
+		assert_eq!(terminal[1]["args"], json!(["--acp-terminal-auth"]));
+	}
+
+	#[test]
+	fn session_cwd_must_be_absolute_and_is_canonicalized() {
+		assert!(canonical_session_root("relative").is_err());
+		let directory = tempfile::tempdir().unwrap();
+		assert_eq!(
+			canonical_session_root(directory.path().to_str().unwrap()).unwrap(),
+			directory.path().canonicalize().unwrap()
+		);
+	}
+
+	#[test]
 	fn converts_all_acp_content_families() {
 		let (parts, updates) = convert_blocks(&json!([
 			{"type":"text","text":"a"},
@@ -3409,6 +3678,25 @@ mod tests {
 		.unwrap();
 		assert_eq!(parts.len(), 4);
 		assert_eq!(updates.len(), 4);
+	}
+	#[test]
+	fn converts_nested_acp_text_and_image_resources() {
+		let encoded = omp_core::base64::encode(b"image");
+		let (parts, updates) = convert_blocks(&json!([
+			{"type":"resource","resource":{"uri":"file:///context.txt","text":"IMPORTANT CONTEXT"}},
+			{"type":"resource","resource":{"uri":"file:///image.png","mimeType":"image/png","blob":encoded}}
+		]))
+		.unwrap();
+		assert!(matches!(
+			&parts[0],
+			ContentPart::Text { text, .. } if text.as_str() == "IMPORTANT CONTEXT"
+		));
+		assert!(matches!(
+			&parts[1],
+			ContentPart::Image(MediaInput::Bytes { media_type, data })
+				if media_type.as_str() == "image/png" && data.as_ref() == b"image"
+		));
+		assert_eq!(updates[0]["content"]["resource"]["text"], "IMPORTANT CONTEXT");
 	}
 	#[test]
 	fn command_prompt_settlements_always_close_the_turn() {
@@ -3502,8 +3790,10 @@ mod tests {
 				.as_object()
 				.expect("form content"),
 		);
-		assert_eq!(answers[0].selected, vec![sf!("custom")]);
+		assert_eq!(answers[0].selected, vec![sf!("A")]);
+		assert_eq!(answers[0].custom_input.as_deref(), Some("custom"));
 		assert_eq!(answers[1].selected, vec![sf!("auth")]);
+		assert_eq!(answers[1].custom_input, None);
 		assert!(answers.iter().all(|answer| !answer.timed_out));
 		let free_text = omp_tools::ask::Question {
 			id:          sf!("details"),
@@ -3526,7 +3816,8 @@ mod tests {
 				.as_object()
 				.expect("free-text form content"),
 		);
-		assert_eq!(free_answers[0].selected, vec![sf!("free form")]);
+		assert!(free_answers[0].selected.is_empty());
+		assert_eq!(free_answers[0].custom_input.as_deref(), Some("free form"));
 	}
 
 	#[test]

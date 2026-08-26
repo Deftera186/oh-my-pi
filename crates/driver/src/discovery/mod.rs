@@ -26,7 +26,7 @@ pub mod slash_commands;
 
 use std::{
 	collections::BTreeMap,
-	env,
+	env, iter,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -36,7 +36,13 @@ use omp_catalog::{
 	ContextStrategy, Pricing, RouteId, ThinkingPolicyId, WirePolicyId,
 	discover::{DiscoveredModel, DiscoveryDefaults, DiscoveryNormalizer, NormalizedDiscovery},
 };
-use omp_core::Str;
+use omp_core::{ArtifactDigest, Hash32, Provenance, Str};
+use omp_envd::{
+	exthost::{
+		DeclarationSet, ExtensionManifest, HookDeclarationKey, ServiceManifest, ToolDeclarationKey,
+	},
+	worker::{ExtHostSpec, HostKey},
+};
 
 use self::{
 	foreign::ForeignContentSettings,
@@ -51,6 +57,21 @@ use crate::{
 	rulebook::{RuleSnapshot, RulebookSettings},
 	skills::SkillSnapshot,
 };
+
+/// Immutable settings authority consumed by one static discovery pass.
+#[derive(Clone, Debug, Default)]
+pub struct PromptDiscoverySettings {
+	/// Model/provider admission and path-scoped provider exclusions.
+	pub model:   omp_catalog::settings::ModelSettings,
+	/// Skill source, name, and custom-directory policy.
+	pub skills:  SkillDiscoverySettings,
+	/// Read-only foreign content family policy.
+	pub foreign: ForeignContentSettings,
+	/// Built-in and blocked-rule policy.
+	pub rules:   RulebookSettings,
+	/// Invocation-local native root and installed-record admission policy.
+	pub native:  NativeDiscoveryOptions,
+}
 /// One command contributed by native content discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandContribution {
@@ -94,38 +115,133 @@ fn embedded_workflow_commands() -> [CommandContribution; 1] {
 #[derive(Clone, Debug)]
 pub struct ActiveContentSnapshots {
 	/// Active skills.
-	pub skills:       Arc<SkillSnapshot>,
+	pub skills:        Arc<SkillSnapshot>,
 	/// Active declarative rules.
-	pub rules:        Arc<RuleSnapshot>,
+	pub rules:         Arc<RuleSnapshot>,
 	/// Active native Markdown slash commands in discovery precedence order.
-	pub commands:     Arc<[CommandContribution]>,
+	pub commands:      Arc<[CommandContribution]>,
 	/// Bounded non-fatal diagnostics emitted while loading static content.
-	pub warnings:     Arc<[Str]>,
+	pub warnings:      Arc<[Str]>,
 	/// Frozen declarations from the same startup discovery pass.
-	pub declarations: Arc<[DiscoveredCapability]>,
+	pub declarations:  Arc<[DiscoveredCapability]>,
+	/// Authenticated native extension workers admitted from those declarations.
+	pub extensions:    Arc<[ExtHostSpec]>,
+	/// Environment-bound process custom tools admitted from those declarations.
+	pub process_tools: Arc<custom_tools::ProcessToolFactory>,
+}
+
+/// Static prompt inputs frozen together for interactive and headless session
+/// composition.
+#[derive(Clone, Debug)]
+pub struct ActivePromptSnapshots {
+	/// Rules, skills, commands, declarations, and warnings from one pass.
+	pub content: ActiveContentSnapshots,
+	/// Context-file winners collated across every granted workspace root.
+	pub context: context::ContextSnapshot,
+}
+
+/// Discovers the complete static prompt surface with identical provider,
+/// priority, user-scope, and native-root semantics for every session mode.
+pub fn active_prompt_snapshots(
+	root: &Path,
+	additional_roots: &[PathBuf],
+	home: &Path,
+	settings: &PromptDiscoverySettings,
+) -> ActivePromptSnapshots {
+	let disabled_providers = settings.model.resolved_disabled_providers(root, home);
+	let content =
+		active_content_snapshots_with_home(root, home, disabled_providers.as_ref(), settings);
+	let roots = iter::once(root)
+		.chain(additional_roots.iter().map(PathBuf::as_path))
+		.map(|path| context::GrantedContextRoot {
+			root:  context_repository_boundary(path, home),
+			start: path.to_path_buf(),
+		})
+		.collect::<Vec<_>>();
+	let context = context::discover(&roots, &context::ContextDiscoveryOptions {
+		home: Some(home.to_path_buf()),
+		disabled_providers,
+		..context::ContextDiscoveryOptions::default()
+	});
+	ActivePromptSnapshots { content, context }
+}
+
+fn context_repository_boundary(start: &Path, home: &Path) -> PathBuf {
+	start
+		.ancestors()
+		.find(|ancestor| ancestor.join(".git").exists())
+		.map(Path::to_path_buf)
+		.unwrap_or_else(|| {
+			if start.starts_with(home) {
+				home.to_path_buf()
+			} else {
+				start.to_path_buf()
+			}
+		})
 }
 
 /// Discovers native repository/user content once and freezes the skill/rule
 /// winners used by a session composition.
 pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
-	let mut discovered =
-		native::discover_capabilities(root, &home, 64, &NativeDiscoveryOptions::default());
-	let foreign = foreign::discover(root, &ForeignContentSettings::default());
+	active_content_snapshots_with_home(root, &home, &[], &PromptDiscoverySettings::default())
+}
+
+fn active_content_snapshots_with_home(
+	root: &Path,
+	home: &Path,
+	disabled_providers: &[Str],
+	settings: &PromptDiscoverySettings,
+) -> ActiveContentSnapshots {
+	let mut discovered = native::discover_capabilities(root, home, 64, &NativeDiscoveryOptions {
+		skill_settings: settings.skills.clone(),
+		..settings.native.clone()
+	});
+	let foreign = foreign::discover(root, &settings.foreign, &settings.skills);
 	discovered.declarations.extend(foreign.skills);
 	discovered.declarations.extend(foreign.rules);
 	discovered.declarations.extend(foreign.prompts);
 	discovered.declarations.extend(foreign.instructions);
-	discovered.declarations.extend(foreign.commands);
 	discovered.warnings.extend(foreign.warnings);
-	let managed = managed_skills::discover_dead_last(
-		&native::user_config_root(&home),
-		&SkillDiscoverySettings::default(),
-	);
+	let mut managed_skill_settings = settings.skills.clone();
+	managed_skill_settings.custom_directories.clear();
+	let managed =
+		managed_skills::discover_dead_last(&native::user_config_root(home), &managed_skill_settings);
 	discovered.declarations.extend(managed.declarations);
 	discovered
 		.warnings
 		.extend(managed.warnings.into_iter().map(|warning| warning.message));
+	discovered.declarations.retain(|declaration| {
+		discovery_provider_id(declaration.source.source_id.as_str()).is_none_or(|provider| {
+			!disabled_providers
+				.iter()
+				.any(|disabled| disabled == provider)
+		})
+	});
+	let (extensions, extension_warnings) = admit_extension_specs(&discovered.declarations);
+	discovered.warnings.extend(extension_warnings);
+	let admitted_extensions = extensions
+		.iter()
+		.map(|spec| Str::new(spec.key.extension().as_str()))
+		.collect::<std::collections::BTreeSet<_>>();
+	discovered.declarations.retain(|declaration| {
+		!matches!(
+			&declaration.payload,
+			CapabilityPayload::Extensions(extension)
+				if extension.worker.is_some() && !admitted_extensions.contains(&extension.name)
+		)
+	});
+	let mut process_names = std::collections::BTreeSet::new();
+	let process_tools = custom_tools::ProcessToolFactory::new(
+		discovered.declarations.iter().filter_map(|declaration| {
+			let CapabilityPayload::Tools(tool) = &declaration.payload else {
+				return None;
+			};
+			process_names
+				.insert(tool.name.clone())
+				.then(|| tool.clone())
+		}),
+	);
 	let mut commands = discovered
 		.declarations
 		.iter()
@@ -158,14 +274,182 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 		commands.extend(embedded_workflow_commands());
 	}
 	ActiveContentSnapshots {
-		skills:       Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
-		rules:        Arc::new(RuleSnapshot::from_declarations(
+		skills:        Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
+		rules:         Arc::new(RuleSnapshot::from_declarations(
 			&discovered.declarations,
-			&RulebookSettings::default(),
+			&settings.rules,
 		)),
-		commands:     commands.into(),
-		warnings:     discovered.warnings.into(),
-		declarations: discovered.declarations.into(),
+		commands:      commands.into(),
+		warnings:      discovered.warnings.into(),
+		declarations:  discovered.declarations.into(),
+		extensions:    extensions.into(),
+		process_tools: Arc::new(process_tools),
+	}
+}
+fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostSpec>, Vec<Str>) {
+	let mut seen = std::collections::BTreeSet::new();
+	let mut specs = Vec::new();
+	let mut warnings = Vec::new();
+	for declaration in declarations {
+		let CapabilityPayload::Extensions(extension) = &declaration.payload else {
+			continue;
+		};
+		if !seen.insert(extension.name.clone()) {
+			continue;
+		}
+		let Some(worker) = &extension.worker else {
+			continue;
+		};
+		let static_declarations = match extension.static_declarations() {
+			Ok(declarations) => declarations,
+			Err(error) => {
+				warnings.push(Str::from(format!(
+					"extension {} was not admitted: invalid static declarations: {error}",
+					extension.name
+				)));
+				continue;
+			},
+		};
+		let tools = static_declarations
+			.tools
+			.iter()
+			.filter_map(|row| {
+				let name = if row.key.is_empty() {
+					&row.id
+				} else {
+					&row.key
+				};
+				if name.is_empty() {
+					return None;
+				}
+				let family = row
+					.properties
+					.get("family")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or(extension.name.as_str());
+				let rev = row
+					.properties
+					.get("rev")
+					.and_then(serde_json::Value::as_u64)
+					.and_then(|rev| u16::try_from(rev).ok())
+					.unwrap_or_else(|| u16::try_from(row.api).unwrap_or(1).max(1));
+				Some(ToolDeclarationKey::new(name.clone(), family, rev))
+			})
+			.collect::<Vec<_>>();
+		let hooks = static_declarations
+			.hooks
+			.iter()
+			.filter_map(|row| {
+				let event = row
+					.properties
+					.get("event")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or(row.key.as_str());
+				let phase = row
+					.properties
+					.get("phase")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or("observe")
+					.parse::<omp_agent::HookPhase>()
+					.ok()?;
+				(!event.is_empty()).then(|| HookDeclarationKey::new(event, phase))
+			})
+			.collect::<Vec<_>>();
+		let declarations = DeclarationSet::new(tools, hooks);
+		let requested_grants = static_declarations
+			.capability_grants
+			.values()
+			.flat_map(|value| {
+				value
+					.as_array()
+					.into_iter()
+					.flatten()
+					.filter_map(serde_json::Value::as_str)
+					.map(Str::new)
+			})
+			.collect::<Vec<_>>();
+		let data_grants = omp_envd::policy::Grants::supported(requested_grants);
+		let declaration_modules = static_declarations
+			.ordered
+			.iter()
+			.map(|row| row.module.clone())
+			.filter(|module| !module.is_empty())
+			.collect::<Vec<_>>();
+		let manifest_bytes = std::fs::read(&declaration.source.path).unwrap_or_default();
+		let digest = ArtifactDigest::new(Hash32::sum(&manifest_bytes).into_bytes());
+		let layer = match declaration.source.scope {
+			SourceScope::Project => Str::new_static("project"),
+			SourceScope::User => Str::new_static("user"),
+			SourceScope::Package => Str::new_static("package"),
+			SourceScope::Native => Str::new_static("native"),
+			SourceScope::BuiltIn => Str::new_static("builtin"),
+		};
+		let publisher = declaration
+			.source
+			.installed_package_id
+			.clone()
+			.unwrap_or_else(|| Str::new_static("local"));
+		let version = extension
+			.manifest
+			.get("version")
+			.and_then(serde_json::Value::as_str)
+			.map_or_else(|| Str::new_static("0"), Str::new);
+		let provenance = Provenance::new(
+			publisher,
+			extension.name.clone(),
+			version,
+			digest,
+			layer.clone(),
+			Str::new_static("native"),
+			declaration
+				.source
+				.revision
+				.as_ref()
+				.map_or(1, |revision| revision.sequence.max(1)),
+		);
+		let manifest = ExtensionManifest::new_with_static(
+			provenance,
+			worker.module.clone(),
+			declaration_modules,
+			declarations,
+			ServiceManifest::default(),
+			static_declarations,
+			[],
+			[],
+		);
+		let key = HostKey::new(layer, "native", extension.name.clone());
+		let mut spec = ExtHostSpec::new(key, manifest);
+		spec.data_grants = data_grants;
+		spec.python_site = Some(extension.root.clone());
+		let entry = extension
+			.root
+			.join(worker.module.as_str().replace('.', "/"))
+			.with_extension("py");
+		if entry.is_file() {
+			spec.entry_path = Some(entry);
+		}
+		match omp_ext::config::CliContributionSet::build(extension.cli.clone(), []) {
+			Ok(cli) => spec.cli_contributions = cli,
+			Err(error) => {
+				warnings
+					.push(Str::from(format!("extension {} was not admitted: {error}", extension.name)));
+				continue;
+			},
+		}
+		specs.push(spec);
+	}
+	(specs, warnings)
+}
+
+fn discovery_provider_id(source_id: &str) -> Option<&str> {
+	if source_id == "native-project-context" {
+		Some("agents-md")
+	} else if let Some(provider) = source_id.strip_prefix("foreign-") {
+		Some(provider)
+	} else if source_id.starts_with("native") {
+		Some("native")
+	} else {
+		None
 	}
 }
 
@@ -283,4 +567,54 @@ pub fn normalize(
 /// Returns the route restriction carried by an authenticated discovery request.
 pub const fn route_scope(route: RouteId) -> RouteId {
 	route
+}
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use super::*;
+
+	#[test]
+	fn shared_prompt_snapshot_freezes_repo_walk_and_user_context() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let repo = home.join("repo");
+		let cwd = repo.join("packages/api");
+		fs::create_dir_all(home.join(".omp/agent")).expect("user native");
+		fs::create_dir_all(repo.join(".git")).expect("repository");
+		fs::create_dir_all(&cwd).expect("cwd");
+		fs::write(home.join(".omp/agent/AGENTS.md"), "user").expect("user context");
+		fs::write(repo.join("AGENTS.md"), "repository").expect("repo context");
+		fs::write(cwd.join("AGENTS.md"), "package").expect("package context");
+		let snapshot = active_prompt_snapshots(&cwd, &[], &home, &PromptDiscoverySettings::default());
+		assert_eq!(
+			snapshot
+				.context
+				.items
+				.iter()
+				.map(|item| item.content.as_str())
+				.collect::<Vec<_>>(),
+			["repository", "package", "user"],
+		);
+	}
+
+	#[test]
+	fn native_extension_workers_and_process_tools_are_admitted_from_one_snapshot() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let repo = home.join("repo");
+		fs::create_dir_all(repo.join(".omp/tools")).expect("native root");
+		fs::write(
+			repo.join(".omp/extension.json"),
+			r#"{"name":"demo","worker":{"module":"worker"}}"#,
+		)
+		.expect("manifest");
+		fs::write(repo.join(".omp/worker.py"), "def activate(): pass\n").expect("worker");
+		fs::write(repo.join(".omp/tools/check.sh"), "#!/bin/sh\ncat\n").expect("tool");
+		let snapshot =
+			active_prompt_snapshots(&repo, &[], &home, &PromptDiscoverySettings::default());
+		assert_eq!(snapshot.content.extensions.len(), 1);
+		assert_eq!(snapshot.content.extensions[0].key.extension().as_str(), "demo");
+		assert!(!snapshot.content.process_tools.is_empty());
+	}
 }

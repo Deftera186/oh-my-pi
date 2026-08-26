@@ -1,4 +1,5 @@
-//! Content-Length transport framing and protocol-v2 logical frame chunking.
+//! Newline-delimited JSON transport framing and protocol-v2 logical frame
+//! chunking.
 
 use std::{
 	collections::HashSet,
@@ -11,7 +12,7 @@ use std::{
 use omp_core::base64;
 use serde_json::{Map, Value, json};
 
-/// Maximum size of one physical Content-Length payload.
+/// Maximum size of one physical JSON line, excluding the trailing newline.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum size of a reassembled protocol-v2 JSON payload.
 pub const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
@@ -30,10 +31,69 @@ pub struct FramingDiagnostic {
 /// Frames and recovery notices produced by one incremental decoder call.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct DecodeBatch {
-	/// Complete physical payloads, without their Content-Length headers.
+	/// Complete physical payloads, without their trailing newlines.
 	pub frames:      Vec<Vec<u8>>,
 	/// Non-fatal stream recovery notices.
 	pub diagnostics: Vec<FramingDiagnostic>,
+}
+
+/// Incremental decoder for newline-delimited JSON streams.
+///
+/// Empty lines are ignored. Lines exceeding [`MAX_FRAME_BYTES`] are discarded
+/// through their next newline and reported without poisoning subsequent frames.
+#[derive(Debug, Default)]
+pub struct JsonLineDecoder {
+	buffer:     Vec<u8>,
+	discarding: bool,
+}
+
+impl JsonLineDecoder {
+	/// Creates an empty decoder.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Appends bytes and returns each complete non-empty JSON line.
+	pub fn push(&mut self, input: &[u8]) -> DecodeBatch {
+		self.buffer.extend_from_slice(input);
+		let mut output = DecodeBatch::default();
+		while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+			let mut line = self.buffer.drain(..=end).collect::<Vec<_>>();
+			line.pop();
+			if line.last() == Some(&b'\r') {
+				line.pop();
+			}
+			if self.discarding {
+				self.discarding = false;
+				continue;
+			}
+			if line.is_empty() {
+				continue;
+			}
+			if line.len() > MAX_FRAME_BYTES {
+				output.diagnostics.push(FramingDiagnostic {
+					skipped_bytes: line.len(),
+					reason:        "JSON line exceeds transport limit",
+				});
+				continue;
+			}
+			output.frames.push(line);
+		}
+		if self.buffer.len() > MAX_FRAME_BYTES && !self.discarding {
+			let skipped_bytes = self.buffer.len();
+			self.buffer.clear();
+			self.discarding = true;
+			output
+				.diagnostics
+				.push(FramingDiagnostic { skipped_bytes, reason: "JSON line exceeds transport limit" });
+		}
+		output
+	}
+
+	/// Returns buffered bytes that do not yet form a complete line.
+	pub fn remainder(&self) -> &[u8] {
+		&self.buffer
+	}
 }
 
 /// A physical or logical framing error.
@@ -232,7 +292,7 @@ pub fn encode_content_length(payload: &[u8]) -> Result<Vec<u8>, FramingError> {
 /// Serializes a JSON value for protocol v2, chunking logical frames when
 /// needed.
 ///
-/// Returned elements are complete Content-Length-framed physical messages.
+/// Returned elements are complete newline-terminated physical messages.
 pub fn encode_json_v2(value: &Value, sequence_id: &str) -> Result<Vec<Vec<u8>>, FramingError> {
 	encode_json_v2_payload(value, sequence_id)
 }
@@ -257,7 +317,7 @@ fn encode_json_v2_payload(value: &Value, sequence_id: &str) -> Result<Vec<Vec<u8
 		return Err(FramingError::LogicalFrameTooLarge { bytes: payload.len() });
 	}
 	if payload.len() <= MAX_FRAME_BYTES {
-		return Ok(vec![encode_content_length(&payload)?]);
+		return Ok(vec![encode_json_line(&payload)?]);
 	}
 	let count = payload.len().div_ceil(RPC_CHUNK_BYTES);
 	payload
@@ -272,9 +332,19 @@ fn encode_json_v2_payload(value: &Value, sequence_id: &str) -> Result<Vec<Vec<u8
 				"byteLength": payload.len(),
 				"data": base64::encode(chunk).into_string(),
 			});
-			encode_content_length(&serde_json::to_vec(&envelope)?)
+			encode_json_line(&serde_json::to_vec(&envelope)?)
 		})
 		.collect()
+}
+
+fn encode_json_line(payload: &[u8]) -> Result<Vec<u8>, FramingError> {
+	if payload.len() > MAX_FRAME_BYTES {
+		return Err(FramingError::FrameTooLarge { bytes: payload.len() });
+	}
+	let mut framed = Vec::with_capacity(payload.len() + 1);
+	framed.extend_from_slice(payload);
+	framed.push(b'\n');
+	Ok(framed)
 }
 
 #[derive(Debug)]
@@ -440,7 +510,7 @@ fn encode_json_v1_candidate(candidate: &Value) -> Vec<u8> {
 
 fn serialize_fitting(value: &Value) -> Option<Vec<u8>> {
 	let payload = serde_json::to_vec(value).ok()?;
-	encode_content_length(&payload).ok()
+	encode_json_line(&payload).ok()
 }
 
 fn encode_overflow(value: &Value) -> Vec<u8> {
@@ -463,7 +533,7 @@ fn encode_overflow(value: &Value) -> Vec<u8> {
 			"error": "RPC frame exceeded the transport limit",
 		}),
 	};
-	encode_content_length(&serde_json::to_vec(&overflow).expect("overflow frame serializes"))
+	encode_json_line(&serde_json::to_vec(&overflow).expect("overflow frame serializes"))
 		.expect("overflow frame fits transport limit")
 }
 
@@ -564,6 +634,16 @@ mod tests {
 		assert_eq!(batch.diagnostics.len(), 1);
 		assert_eq!(decoder.resync_count(), 1);
 	}
+	#[test]
+	fn json_lines_decode_fragmented_and_batched_frames() {
+		let mut decoder = JsonLineDecoder::new();
+		assert!(decoder.push(br#"{"type":"pro"#).frames.is_empty());
+		let batch = decoder.push(b"mpt\"}\n\n{\"type\":\"abort\"}\r\n");
+		assert_eq!(batch.frames, vec![
+			br#"{"type":"prompt"}"#.to_vec(),
+			br#"{"type":"abort"}"#.to_vec(),
+		]);
+	}
 
 	#[test]
 	fn physical_limit_is_reported_and_oversized_input_is_discarded() {
@@ -583,7 +663,7 @@ mod tests {
 		let original = json!({"type":"large", "text":"x".repeat(MAX_FRAME_BYTES + 123_456)});
 		let encoded = encode_json_v2(&original, "sequence-1").unwrap();
 		assert!(encoded.len() > 1);
-		let mut physical = ContentLengthDecoder::new();
+		let mut physical = JsonLineDecoder::new();
 		let mut logical = RpcFrameDecoder::new();
 		let mut decoded = None;
 		for wire in encoded {
@@ -616,7 +696,7 @@ mod tests {
 		let value =
 			json!({"type":"agent_end","messages":[{"id":"sent","text":"a"},{"id":"new","text":"b"}]});
 		let wire = encode_json_v1(&value, &HashSet::from(["sent".to_owned()]));
-		let mut decoder = ContentLengthDecoder::new();
+		let mut decoder = JsonLineDecoder::new();
 		let frames = decoder.push(&wire).frames;
 		let decoded: Value = serde_json::from_slice(&frames[0]).unwrap();
 		assert_eq!(decoded["messages"].as_array().unwrap().len(), 1);
@@ -634,7 +714,7 @@ mod tests {
 			"result": "x".repeat(MAX_FRAME_BYTES + 1),
 		});
 		let wire = encode_json_v1(&value, &HashSet::new());
-		let frames = ContentLengthDecoder::new().push(&wire).frames;
+		let frames = JsonLineDecoder::new().push(&wire).frames;
 		let decoded: Value = serde_json::from_slice(&frames[0]).unwrap();
 		assert_eq!(decoded["type"], "response");
 		assert_eq!(decoded["success"], true);

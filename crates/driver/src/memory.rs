@@ -3,7 +3,7 @@
 //!
 //! The runtime itself is environment-owned; see
 //! [`omp_envd::memory`](omp_envd::memory).
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use omp_agent::{PromptMemoryInput, TurnClient, TurnId, TurnInput, TurnOptions, TurnSession as _};
@@ -22,6 +22,8 @@ use omp_proto::{
 };
 use omp_tools::memory::{ReflectionHost, ReflectionHostError, ReflectionRequest};
 use parking_lot::RwLock;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Memory runtime exposed to presentation without leaking its owning crate.
 pub type ChatMemory = MemoryRuntime;
@@ -92,6 +94,138 @@ pub async fn extract<C: TurnClient + Clone>(
 	request: ExtractionRequest,
 ) -> omp_memory::Result<ExtractionReport> {
 	extract_and_store(lane, runtime.retain_store()?, request).await
+}
+
+/// Session-owned durable extraction worker with bounded shutdown drain.
+pub struct ExtractionWorker {
+	cancel:  CancellationToken,
+	task:    Option<JoinHandle<()>>,
+	timeout: Duration,
+}
+
+impl ExtractionWorker {
+	/// Starts one sequential worker and immediately inspects recovered jobs
+	/// before waiting for live retention notifications.
+	pub fn start<C>(
+		runtime: Arc<MemoryRuntime>,
+		lane: InferenceExtractionLane<C>,
+		shutdown_timeout_ms: u64,
+	) -> Self
+	where
+		C: TurnClient + Clone + Send + Sync + 'static,
+	{
+		let cancel = CancellationToken::new();
+		let worker_cancel = cancel.clone();
+		let task = tokio::spawn(async move {
+			run_extraction_worker(runtime, lane, worker_cancel).await;
+		});
+		Self { cancel, task: Some(task), timeout: Duration::from_millis(shutdown_timeout_ms.max(1)) }
+	}
+
+	/// Requests a final durable-queue drain and waits only through the
+	/// configured shutdown budget. Timed-out work remains durable for the next
+	/// launch.
+	pub async fn shutdown(&mut self) {
+		self.cancel.cancel();
+		let Some(mut task) = self.task.take() else {
+			return;
+		};
+		if tokio::time::timeout(self.timeout, &mut task).await.is_err() {
+			task.abort();
+			let _ = task.await;
+		}
+	}
+}
+
+impl Drop for ExtractionWorker {
+	fn drop(&mut self) {
+		self.cancel.cancel();
+	}
+}
+
+async fn run_extraction_worker<C>(
+	runtime: Arc<MemoryRuntime>,
+	lane: InferenceExtractionLane<C>,
+	cancel: CancellationToken,
+) where
+	C: TurnClient + Clone + Send + Sync + 'static,
+{
+	const BATCH: usize = 8;
+	const INITIAL_RETRY: Duration = Duration::from_millis(250);
+	const MAX_RETRY: Duration = Duration::from_secs(5);
+
+	let notifications = runtime.extraction_notifications();
+	let mut draining = false;
+	let mut retry = INITIAL_RETRY;
+	loop {
+		let pending = match runtime.pending_extractions(BATCH) {
+			Ok(pending) => pending,
+			Err(error) => {
+				tracing::warn!(%error, "memory extraction queue read failed");
+				if !wait_extraction_retry(&cancel, draining, retry).await {
+					return;
+				}
+				retry = retry.saturating_mul(2).min(MAX_RETRY);
+				continue;
+			},
+		};
+		if pending.is_empty() {
+			retry = INITIAL_RETRY;
+			if draining || cancel.is_cancelled() {
+				return;
+			}
+			tokio::select! {
+				_ = cancel.cancelled() => draining = true,
+				notification = notifications.recv_async() => {
+					if notification.is_err() {
+						return;
+					}
+				},
+			}
+			continue;
+		}
+		let mut failed = false;
+		for request in pending {
+			match extract(runtime.as_ref(), &lane, request).await {
+				Ok(_) => {
+					if let Err(error) = runtime.enqueue() {
+						tracing::warn!(%error, "memory extraction reconciliation failed");
+						failed = true;
+						break;
+					}
+				},
+				Err(error) => {
+					tracing::warn!(%error, "memory extraction failed; durable job retained");
+					failed = true;
+					break;
+				},
+			}
+		}
+		if failed {
+			if !wait_extraction_retry(&cancel, draining, retry).await {
+				return;
+			}
+			retry = retry.saturating_mul(2).min(MAX_RETRY);
+		} else {
+			retry = INITIAL_RETRY;
+			draining |= cancel.is_cancelled();
+		}
+	}
+}
+
+async fn wait_extraction_retry(
+	cancel: &CancellationToken,
+	draining: bool,
+	delay: Duration,
+) -> bool {
+	if draining {
+		tokio::time::sleep(delay).await;
+		return true;
+	}
+	tokio::select! {
+		_ = cancel.cancelled() => true,
+		_ = tokio::time::sleep(delay) => true,
+	}
 }
 
 /// Stateless auxiliary-completion adapter used by Mnemopi extraction.

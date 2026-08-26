@@ -30,7 +30,14 @@ static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(||
 		definitions
 			.into_iter()
 			.map(|(name, frontmatter, asset)| {
-				let markdown = format!("{frontmatter}{}", prompt_asset(asset).content);
+				let content = prompt_asset(asset).content;
+				let markdown = if let Some((_, body)) = content.split_once("\n---\n\n") {
+					format!("{frontmatter}{body}")
+				} else if let Some((_, body)) = content.split_once("\n---\n") {
+					format!("{frontmatter}{body}")
+				} else {
+					format!("{frontmatter}{content}")
+				};
 				let definition = AgentDefinition::parse_markdown(name, &markdown)
 					.expect("bundled agent definitions are build-time constants");
 				(sf!(name), definition)
@@ -38,6 +45,11 @@ static BUNDLED: LazyLock<Arc<BTreeMap<Str, AgentDefinition>>> = LazyLock::new(||
 			.collect(),
 	)
 });
+
+/// Returns only the immutable build-time bundled agent definitions.
+pub fn bundled() -> Arc<BTreeMap<Str, AgentDefinition>> {
+	Arc::clone(&BUNDLED)
+}
 
 /// Returns the complete native catalog using project → user → extension →
 /// bundled precedence.

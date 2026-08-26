@@ -37,8 +37,13 @@ use super::presentation_authority::{
 /// One data-only operation delivered to the attached presentation surface.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PresentationOperation {
-	/// Apply a retained UI effect.
-	Effect(PresentationEffect),
+	/// Apply a retained UI effect under its authenticated extension identity.
+	Effect {
+		/// Authenticated extension incarnation owning every retained key.
+		identity: Arc<PresentationIdentity>,
+		/// Validated effect body.
+		effect:   PresentationEffect,
+	},
 	/// Resolve a correlated UI request.
 	Request(PresentationRequest),
 }
@@ -158,10 +163,13 @@ impl Default for PresentationBridge {
 impl PresentationClient for PresentationBridge {
 	async fn effect(
 		&self,
-		_identity: Arc<PresentationIdentity>,
+		identity: Arc<PresentationIdentity>,
 		effect: PresentationEffect,
 	) -> Result<(), PresentationAuthorityError> {
-		match self.dispatch(PresentationOperation::Effect(effect)).await? {
+		match self
+			.dispatch(PresentationOperation::Effect { identity, effect })
+			.await?
+		{
 			PresentationResponse::Ack => Ok(()),
 			_ => Err(PresentationAuthorityError::Owner(Str::new_static(
 				"presentation surface returned a non-ack effect response",

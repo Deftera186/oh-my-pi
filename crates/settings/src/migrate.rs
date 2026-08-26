@@ -8,11 +8,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	deep_merge,
+	LayerNormalizer, ValidationError, deep_merge,
 	io::{SettingsIoError, atomic_replace},
+	registered_domains,
 };
 
-const MARKER: &str = ".settings-migration-v1";
+const MARKER: &str = ".settings-migration-v2";
 const RECORD: &str = "settings-migration.toml";
 
 /// Stable migration action vocabulary.
@@ -70,8 +71,9 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 		return Ok(MigrationOutcome::AlreadyCompleted);
 	}
 
-	let mut record = MigrationRecord { revision: 1, ..MigrationRecord::default() };
+	let mut record = MigrationRecord { revision: 2, ..MigrationRecord::default() };
 	let mut document = toml::Table::new();
+	let mut backups = Vec::new();
 	let settings_json = data_dir.join("settings.json");
 	if settings_json.exists() {
 		let source = fs::read_to_string(&settings_json)
@@ -80,7 +82,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 		let table = json_table(value)?;
 		deep_merge(&mut document, table);
 		record.sources.push("settings.json".to_owned());
-		backup_file(&settings_json)?;
+		backups.push(settings_json.clone());
 	}
 
 	let database = data_dir.join("agent.db");
@@ -88,7 +90,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 		if let Some(table) = read_database_settings(&database)? {
 			deep_merge(&mut document, table);
 			record.sources.push("agent.db:settings".to_owned());
-			backup_file(&database)?;
+			backups.push(database.clone());
 		}
 	}
 
@@ -97,7 +99,7 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 	reject_credentials(&mut document, &mut record, "");
 
 	let config = data_dir.join("config.toml");
-	if !document.is_empty() {
+	if !document.is_empty() || config.is_file() {
 		let mut current = match fs::read_to_string(&config) {
 			Ok(source) => toml::from_str::<toml::Table>(&source)
 				.map_err(|source| MigrationError::ExistingConfig { path: config.clone(), source })?,
@@ -108,13 +110,22 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 		let mut imported = document;
 		deep_merge(&mut imported, current);
 		current = imported;
+		normalize_legacy_layer(&mut current);
+		validate_migration_candidate(&current)?;
+		for source in &backups {
+			backup_file(source)?;
+		}
 		atomic_replace(&config, &toml::to_string_pretty(&current)?)?;
+	} else {
+		for source in &backups {
+			backup_file(source)?;
+		}
 	}
 	if let Some(version) = changelog_version {
 		atomic_replace(&data_dir.join("last-changelog-version"), &version)?;
 	}
 	atomic_replace(&data_dir.join(RECORD), &toml::to_string_pretty(&record)?)?;
-	atomic_replace(&marker, "revision = 1\n")?;
+	atomic_replace(&marker, "revision = 2\n")?;
 	Ok(MigrationOutcome::Completed(record))
 }
 
@@ -221,9 +232,44 @@ fn backup_file(path: &Path) -> Result<(), MigrationError> {
 }
 
 fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> Option<String> {
-	move_key(document, "queueMode", "steering_mode", record);
-	move_key(document, "defaultModel", "default_model", record);
-	move_key(document, "worktreeDir", "worktree.base", record);
+	for (old, new) in [
+		("queueMode", "interaction.steeringMode"),
+		("includeModelInPrompt", "prompt.includeModelInPrompt"),
+		("includeWorkspaceTree", "prompt.includeWorkspaceTree"),
+		("steeringMode", "interaction.steeringMode"),
+		("defaultModel", "model.roles.default"),
+		("default_model", "model.roles.default"),
+		("worktreeDir", "worktree.base"),
+		("modelProviderOrder", "model.provider_order"),
+		("defaultThinkingLevel", "model.default_thinking"),
+		("thinkingBudgets", "model.thinking_budgets"),
+		("modelRoles", "model.roles"),
+		("modelRoleStorage", "model.role_storage"),
+		("modelTags", "model.tags"),
+		("cycleOrder", "model.cycle_order"),
+		("enabledModels", "model.enabled_models"),
+		("disabledProviders", "model.disabled_providers"),
+		("tier.openai", "model.tier_openai"),
+		("tier.anthropic", "model.tier_anthropic"),
+		("tier.google", "model.tier_google"),
+		("tier.fireworks", "model.tier_fireworks"),
+		("tier.subagent", "model.tier_subagent"),
+		("tier.advisor", "model.tier_advisor"),
+		("providers.openaiWebsockets", "model.openai_websockets"),
+		("providers.openrouterVariant", "model.openrouter_variant"),
+		("providers.kimiApiFormat", "model.kimi_api_format"),
+		("providers.cacheRetention", "model.cache_retention"),
+		("tools.approvalMode", "tools.approval_mode"),
+		("compaction.methodOrder", "compaction.method_order"),
+		("compaction.keepRecentTokens", "compaction.keep_recent_tokens"),
+		("compaction.asyncEnabled", "compaction.async_enabled"),
+		("compaction.midTurnEnabled", "compaction.mid_turn_enabled"),
+		("contextPromotion.enabled", "context_promotion.enabled"),
+		("statusLine.preset", "appearance.statusPreset"),
+		("marketplace.autoUpdate", "lifecycle.marketplaceAutoUpdate"),
+	] {
+		move_key(document, old, new, record);
+	}
 	if let Some(legacy) = take_path(document, "features.unexpectedStopDetection") {
 		let mode = match legacy {
 			toml::Value::Boolean(true) => Some("smart"),
@@ -259,10 +305,16 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 		("async.maxJobs", "async.max_jobs"),
 		("async.pollWaitDuration", "async.poll_wait_duration"),
 		("bash.enabled", "shell.enabled"),
+		("bash.profile", "shell.profile"),
+		("bash.args", "shell.args"),
+		("bash.login", "shell.login"),
+		("bash.commandPrefix", "shell.command_prefix"),
+		("bash.embeddedBuiltins", "shell.embedded_builtins"),
 		("bash.autoBackground.enabled", "shell.auto_background.enabled"),
 		("bash.autoBackground.thresholdMs", "shell.auto_background.threshold_ms"),
 		("bash.direnv", "shell.direnv"),
 		("bash.direnvLoadTimeoutMs", "shell.direnv_load_timeout_ms"),
+		("bash.patterns", "shell.interceptor.patterns"),
 		("bashInterceptor.enabled", "shell.interceptor.enabled"),
 		("bashInterceptor.patterns", "shell.interceptor.patterns"),
 		("shellMinimizer.enabled", "shell.minimizer.enabled"),
@@ -292,11 +344,50 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 	if changelog_version.is_some() {
 		converted(record, "lastChangelogVersion", "last-changelog-version state marker");
 	}
-	if let Some(toml::Value::String(theme)) = take_path(document, "theme") {
-		if theme != "light" && theme != "dark" {
-			set_dotted(document, "appearance.theme.dark", toml::Value::String(theme));
+	if let Some(theme) = take_path(document, "theme") {
+		match theme {
+			toml::Value::String(theme) => {
+				set_dotted(document, "appearance.theme", toml::Value::String(theme));
+				converted(record, "theme", "appearance.theme");
+			},
+			toml::Value::Table(mut themes) => {
+				let selected = themes
+					.remove("dark")
+					.or_else(|| themes.remove("light"))
+					.and_then(|value| value.as_str().map(str::to_owned));
+				if let Some(theme) = selected {
+					set_dotted(document, "appearance.theme", toml::Value::String(theme));
+					converted(record, "theme.dark/theme.light", "appearance.theme");
+				} else {
+					dropped(record, "theme", "theme table did not contain a string variant");
+				}
+			},
+			_ => dropped(record, "theme", "theme value was not a string or variant table"),
 		}
-		converted(record, "theme", "appearance.theme");
+	}
+	if value_at_mut(document, "appearance.theme").is_some_and(|value| value.is_table())
+		&& let Some(toml::Value::Table(mut themes)) = take_path(document, "appearance.theme")
+	{
+		let selected = themes
+			.remove("dark")
+			.or_else(|| themes.remove("light"))
+			.and_then(|value| value.as_str().map(str::to_owned));
+		if let Some(theme) = selected {
+			set_dotted(document, "appearance.theme", toml::Value::String(theme));
+			converted(record, "appearance.theme.dark", "appearance.theme");
+		} else {
+			dropped(record, "appearance.theme", "theme table did not contain a string variant");
+		}
+	}
+	if let Some(toml::Value::Boolean(enabled)) =
+		value_at_mut(document, "lifecycle.marketplaceAutoUpdate").map(|value| value.clone())
+	{
+		set_dotted(
+			document,
+			"lifecycle.marketplaceAutoUpdate",
+			toml::Value::String(if enabled { "auto" } else { "off" }.to_owned()),
+		);
+		converted(record, "lifecycle.marketplaceAutoUpdate", "lifecycle.marketplaceAutoUpdate enum");
 	}
 	for (old, new, on, off) in [
 		("inspect_image.enabled", "inspect_image.mode", "on", "off"),
@@ -311,29 +402,7 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 			converted(record, old, new);
 		}
 	}
-	if value_at_mut(document, "power.sleep_prevention").is_none() {
-		let flags = [
-			("power.preventIdleSleep", "idle"),
-			("power.preventDisplaySleep", "display"),
-			("power.declareUserActive", "system"),
-			("power.preventSystemSleep", "system"),
-		];
-		let mut selected = None;
-		let mut any_set = false;
-		for (path, mode) in flags {
-			if let Some(toml::Value::Boolean(enabled)) = take_path(document, path) {
-				any_set = true;
-				if enabled {
-					selected = Some(mode);
-				}
-			}
-		}
-		if any_set {
-			let mode = selected.unwrap_or("off");
-			set_dotted(document, "power.sleep_prevention", toml::Value::String(mode.to_owned()));
-			converted(record, "power.*Sleep", "power.sleep_prevention");
-		}
-	}
+	normalize_power_sleep_prevention(document, record);
 	if let Some(toml::Value::Boolean(enabled)) = take_path(document, "task.isolation.enabled") {
 		set_dotted(
 			document,
@@ -388,12 +457,14 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 			converted(record, "compaction.strategy", "compaction.method_order");
 		}
 	}
-	if let Some(toml::Value::Integer(timeout)) =
-		value_at_mut(document, "ask.timeout").map(|value| value.clone())
-		&& timeout > 1000
-	{
-		set_dotted(document, "ask.timeout", toml::Value::Integer((timeout + 500) / 1000));
-		converted(record, "ask.timeout", "ask.timeout (milliseconds to seconds)");
+	if let Some(toml::Value::Integer(timeout)) = take_path(document, "ask.timeout") {
+		let seconds = if timeout > 1_000 {
+			(timeout + 500) / 1_000
+		} else {
+			timeout
+		};
+		set_dotted(document, "interaction.askTimeoutSeconds", toml::Value::Integer(seconds.max(0)));
+		converted(record, "ask.timeout", "interaction.askTimeoutSeconds");
 	}
 	for (old, new) in [
 		("providers.webSearch", "providers.web_search_order"),
@@ -501,6 +572,97 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 	changelog_version
 }
 
+fn normalize_power_sleep_prevention(document: &mut toml::Table, record: &mut MigrationRecord) {
+	let destination = "power.sleep_prevention";
+	let native_explicit = value_at_mut(document, destination).is_some();
+	if let Some(value) = take_compat_value(document, "power.sleepPrevention", record) {
+		if native_explicit {
+			dropped(record, "power.sleepPrevention", "native destination already has precedence");
+		} else {
+			set_dotted(document, destination, value);
+			converted(record, "power.sleepPrevention", destination);
+		}
+	}
+	let destination_explicit = value_at_mut(document, destination).is_some();
+	let flags = [
+		"power.preventIdleSleep",
+		"power.preventSystemSleep",
+		"power.declareUserActive",
+		"power.preventDisplaySleep",
+	]
+	.map(|path| (path, take_compat_value(document, path, record)));
+	if destination_explicit {
+		for (path, value) in flags {
+			if value.is_some() {
+				dropped(record, path, "explicit sleep-prevention mode already has precedence");
+			}
+		}
+		return;
+	}
+	let flag = |path: &str| {
+		flags
+			.iter()
+			.find(|(candidate, _)| *candidate == path)
+			.and_then(|(_, value)| value.as_ref())
+			.and_then(toml::Value::as_bool)
+	};
+	let any_valid = flags
+		.iter()
+		.any(|(_, value)| value.as_ref().is_some_and(toml::Value::is_bool));
+	if any_valid {
+		let mode = if flag("power.preventSystemSleep") == Some(true)
+			|| flag("power.declareUserActive") == Some(true)
+		{
+			"system"
+		} else if flag("power.preventDisplaySleep") == Some(true) {
+			"display"
+		} else if flag("power.preventIdleSleep") != Some(false) {
+			"idle"
+		} else {
+			"off"
+		};
+		set_dotted(document, destination, toml::Value::String(mode.to_owned()));
+	}
+	for (path, value) in flags {
+		match value {
+			Some(toml::Value::Boolean(_)) => converted(record, path, destination),
+			Some(_) => dropped(record, path, "legacy sleep-prevention flag was not boolean"),
+			None => {},
+		}
+	}
+}
+
+fn take_compat_value(
+	document: &mut toml::Table,
+	path: &str,
+	record: &mut MigrationRecord,
+) -> Option<toml::Value> {
+	let nested = take_path(document, path);
+	let flat = document.remove(path);
+	if nested.is_some() && flat.is_some() {
+		dropped(record, path, "duplicate flat spelling was ignored");
+	}
+	nested.or(flat)
+}
+
+fn normalize_legacy_layer(document: &mut toml::Table) {
+	let mut ignored = MigrationRecord::default();
+	let _ = convert_legacy(document, &mut ignored);
+	remove_unsupported(document, &mut ignored);
+	reject_credentials(document, &mut ignored, "");
+}
+
+crate::inventory::submit! {
+	LayerNormalizer::new(normalize_legacy_layer)
+}
+
+fn validate_migration_candidate(document: &toml::Table) -> Result<(), MigrationError> {
+	for domain in registered_domains() {
+		(domain.validate)(document)?;
+	}
+	Ok(())
+}
+
 fn remove_unsupported(document: &mut toml::Table, record: &mut MigrationRecord) {
 	for path in [
 		"bm25",
@@ -591,11 +753,14 @@ fn dropped(record: &mut MigrationRecord, path: &str, reason: &str) {
 }
 
 fn move_key(document: &mut toml::Table, old: &str, new: &str, record: &mut MigrationRecord) {
-	if value_at_mut(document, new).is_none()
-		&& let Some(value) = take_path(document, old)
-	{
-		set_dotted(document, new, value);
-		converted(record, old, new);
+	let destination_exists = value_at_mut(document, new).is_some();
+	if let Some(value) = take_path(document, old) {
+		if destination_exists {
+			dropped(record, old, "native destination already has precedence");
+		} else {
+			set_dotted(document, new, value);
+			converted(record, old, new);
+		}
 	}
 }
 
@@ -706,6 +871,9 @@ pub enum MigrationError {
 		/// JSON failure returned while decoding the stored setting.
 		source: serde_json::Error,
 	},
+	/// The normalized migration candidate violated a linked runtime schema.
+	#[error(transparent)]
+	Validation(#[from] ValidationError),
 	/// Native TOML encoding failed.
 	#[error(transparent)]
 	Encode(#[from] ser::Error),
@@ -741,11 +909,292 @@ mod tests {
 		let report = fs::read_to_string(directory.path().join(RECORD)).expect("record");
 		assert!(!report.contains("never-report"));
 		let config = fs::read_to_string(directory.path().join("config.toml")).expect("config");
-		assert!(config.contains("default_model = \"demo/model\""));
+		assert!(config.contains("default = \"demo/model\""));
 		assert!(!config.contains("apiKey"));
 		assert_eq!(
 			migrate_legacy_settings(directory.path()).expect("idempotent"),
 			MigrationOutcome::AlreadyCompleted,
+		);
+	}
+	#[test]
+	fn prompt_compatibility_migration_records_conversion_and_preserves_native_values() {
+		let directory = tempfile::tempdir().expect("directory");
+		fs::write(
+			directory.path().join("settings.json"),
+			"{ includeModelInPrompt: false, includeWorkspaceTree: true }",
+		)
+		.expect("legacy");
+		fs::write(directory.path().join("config.toml"), "[prompt]\nincludeModelInPrompt = true\n")
+			.expect("native");
+		let MigrationOutcome::Completed(record) =
+			migrate_legacy_settings(directory.path()).expect("migrate")
+		else {
+			panic!("migration completed")
+		};
+		assert!(record.entries.iter().any(|entry| {
+			entry.path == "includeModelInPrompt"
+				&& entry.action == MigrationAction::Converted
+				&& entry.reason == "moved to prompt.includeModelInPrompt"
+		}));
+		assert!(record.entries.iter().any(|entry| {
+			entry.path == "includeWorkspaceTree"
+				&& entry.action == MigrationAction::Converted
+				&& entry.reason == "moved to prompt.includeWorkspaceTree"
+		}));
+		let document: toml::Table =
+			toml::from_str(&fs::read_to_string(directory.path().join("config.toml")).expect("config"))
+				.expect("native document");
+		let prompt = document
+			.get("prompt")
+			.and_then(toml::Value::as_table)
+			.expect("prompt");
+		assert_eq!(
+			prompt
+				.get("includeModelInPrompt")
+				.and_then(toml::Value::as_bool),
+			Some(true),
+		);
+		assert_eq!(
+			prompt
+				.get("includeWorkspaceTree")
+				.and_then(toml::Value::as_bool),
+			Some(true),
+		);
+	}
+	fn normalized_power_mode(document: &mut toml::Table) -> Option<&str> {
+		value_at_mut(document, "power.sleep_prevention").and_then(|value| value.as_str())
+	}
+
+	#[test]
+	fn power_sleep_prevention_precedence_removes_legacy_keys_and_records_decisions() {
+		let mut document: toml::Table = toml::from_str(
+			r#"
+"power.preventDisplaySleep" = true
+
+[power]
+sleep_prevention = "off"
+sleepPrevention = "system"
+preventIdleSleep = true
+preventSystemSleep = true
+declareUserActive = true
+"#,
+		)
+		.expect("power settings");
+		let mut record = MigrationRecord::default();
+		normalize_power_sleep_prevention(&mut document, &mut record);
+		assert_eq!(normalized_power_mode(&mut document), Some("off"));
+		for path in [
+			"power.sleepPrevention",
+			"power.preventIdleSleep",
+			"power.preventSystemSleep",
+			"power.declareUserActive",
+			"power.preventDisplaySleep",
+		] {
+			assert!(value_at_mut(&mut document, path).is_none(), "{path}");
+			assert!(!document.contains_key(path), "{path}");
+			assert!(
+				record
+					.entries
+					.iter()
+					.any(|entry| { entry.path == path && entry.action == MigrationAction::Dropped })
+			);
+		}
+	}
+
+	#[test]
+	fn power_sleep_prevention_maps_pi_enum_and_boolean_defaults() {
+		for (source, expected) in [
+			("[power]\nsleepPrevention = \"display\"\npreventSystemSleep = true\n", "display"),
+			("\"power.sleepPrevention\" = \"system\"\n", "system"),
+			("[power]\npreventSystemSleep = true\n", "system"),
+			("[power]\ndeclareUserActive = true\n", "system"),
+			("[power]\npreventDisplaySleep = true\n", "display"),
+			("[power]\npreventIdleSleep = true\n", "idle"),
+			("[power]\npreventIdleSleep = false\n", "off"),
+			("[power]\npreventSystemSleep = false\n", "idle"),
+			("\"power.preventIdleSleep\" = false\n", "off"),
+		] {
+			let mut document: toml::Table = toml::from_str(source).expect("power case");
+			let mut record = MigrationRecord::default();
+			normalize_power_sleep_prevention(&mut document, &mut record);
+			assert_eq!(normalized_power_mode(&mut document), Some(expected), "{source}");
+			assert!(!record.entries.is_empty(), "{source}");
+		}
+		let mut defaults = toml::Table::new();
+		normalize_power_sleep_prevention(&mut defaults, &mut MigrationRecord::default());
+		assert_eq!(normalized_power_mode(&mut defaults), None);
+	}
+
+	#[test]
+	fn legacy_key_normalizer_maps_every_supported_runtime_owner() {
+		let mut document: toml::Table = toml::from_str(
+			r#"
+queueMode = "all"
+includeModelInPrompt = false
+includeWorkspaceTree = true
+modelProviderOrder = ["anthropic", "openai"]
+defaultThinkingLevel = "high"
+theme = "solarized"
+modelRoleStorage = "project"
+modelRoles = { smol = "openai/gpt-5-mini" }
+modelTags = { smol = { name = "Small", hidden = false } }
+cycleOrder = ["smol", "default", "slow"]
+enabledModels = ["openai/gpt-5-mini"]
+disabledProviders = ["anthropic"]
+
+[thinkingBudgets]
+low = 1024
+medium = 2048
+
+[tier]
+openai = "priority"
+
+[providers]
+openaiWebsockets = "on"
+cacheRetention = "long"
+
+[tools]
+approvalMode = "write"
+
+[compaction]
+methodOrder = ["remote", "soft"]
+keepRecentTokens = 1234
+asyncEnabled = true
+midTurnEnabled = false
+
+[contextPromotion]
+enabled = true
+
+[ask]
+timeout = 2500
+
+[bash]
+profile = "interactive"
+patterns = [{ pattern = "sudo", action = "ask" }]
+
+[statusLine]
+preset = "compact"
+
+[marketplace]
+autoUpdate = false
+"#,
+		)
+		.expect("legacy document");
+		normalize_legacy_layer(&mut document);
+		assert_eq!(
+			value_at_mut(&mut document, "interaction.steeringMode").and_then(|value| value.as_str()),
+			Some("all"),
+		);
+		assert!(value_at_mut(&mut document, "enabledModels").is_none());
+		assert!(value_at_mut(&mut document, "includeModelInPrompt").is_none());
+		assert!(value_at_mut(&mut document, "includeWorkspaceTree").is_none());
+		assert_eq!(
+			value_at_mut(&mut document, "prompt.includeModelInPrompt")
+				.and_then(|value| value.as_bool()),
+			Some(false),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "prompt.includeWorkspaceTree")
+				.and_then(|value| value.as_bool()),
+			Some(true),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.role_storage").and_then(|value| value.as_str()),
+			Some("project"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.roles.smol").and_then(|value| value.as_str()),
+			Some("openai/gpt-5-mini"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.tags.smol.name").and_then(|value| value.as_str()),
+			Some("Small"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.cycle_order")
+				.and_then(|value| value.as_array())
+				.map(Vec::len),
+			Some(3),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.enabled_models")
+				.and_then(|value| value.as_array())
+				.map(Vec::len),
+			Some(1),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.disabled_providers")
+				.and_then(|value| value.as_array())
+				.map(Vec::len),
+			Some(1),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.provider_order")
+				.and_then(|value| value.as_array())
+				.map(Vec::len),
+			Some(2),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.default_thinking").and_then(|value| value.as_str()),
+			Some("high"),
+		);
+		assert!(value_at_mut(&mut document, "model.thinking_budgets").is_some());
+		assert_eq!(
+			value_at_mut(&mut document, "model.tier_openai").and_then(|value| value.as_str()),
+			Some("priority"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.openai_websockets").and_then(|value| value.as_str()),
+			Some("on"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "model.cache_retention").and_then(|value| value.as_str()),
+			Some("long"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "appearance.theme").and_then(|value| value.as_str()),
+			Some("solarized"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "appearance.statusPreset").and_then(|value| value.as_str()),
+			Some("compact"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "lifecycle.marketplaceAutoUpdate")
+				.and_then(|value| value.as_str()),
+			Some("off"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "interaction.askTimeoutSeconds")
+				.and_then(|value| value.as_integer()),
+			Some(3),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "context_promotion.enabled").and_then(|value| value.as_bool()),
+			Some(true),
+		);
+		assert!(value_at_mut(&mut document, "shell.interceptor.patterns").is_some());
+		assert_eq!(
+			value_at_mut(&mut document, "shell.profile").and_then(|value| value.as_str()),
+			Some("interactive"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "tools.approval_mode").and_then(|value| value.as_str()),
+			Some("write"),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "compaction.keep_recent_tokens")
+				.and_then(|value| value.as_integer()),
+			Some(1234),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "compaction.async_enabled").and_then(|value| value.as_bool()),
+			Some(true),
+		);
+		assert_eq!(
+			value_at_mut(&mut document, "compaction.mid_turn_enabled")
+				.and_then(|value| value.as_bool()),
+			Some(false),
 		);
 	}
 }

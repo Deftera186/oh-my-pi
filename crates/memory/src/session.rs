@@ -13,6 +13,7 @@ use omp_core::Str;
 
 use crate::{
 	Error, Result,
+	config::MemoryLlmMode,
 	recall::RecallBounds,
 	retain,
 	retain::{OwnedRetentionMessage, Retainer, RetentionMessage, RetentionOutcome, RetentionRole},
@@ -125,6 +126,9 @@ impl SessionMemory {
 		if !self.top_level || !self.shared.runtime.is_active() {
 			return Ok(RetentionOutcome::default());
 		}
+		if !self.shared.runtime.mnemopi_settings()?.auto_retain {
+			return Ok(RetentionOutcome::default());
+		}
 		let borrowed = borrow_messages(messages);
 		let root = self.shared.runtime.identity_root()?.to_string_lossy();
 		let retainer = Retainer::new(
@@ -132,8 +136,13 @@ impl SessionMemory {
 			self.shared.runtime.session_id()?,
 			root.as_ref(),
 			self.shared.runtime.mnemopi_settings()?.retain_every_n_turns,
+			self.shared.runtime.mnemopi_settings()?.llm_mode != MemoryLlmMode::None,
 		);
-		retainer.retain_periodic(&borrowed)
+		let outcome = retainer.retain_periodic(&borrowed)?;
+		if outcome.extraction_enqueued {
+			self.shared.runtime.notify_extraction();
+		}
+		Ok(outcome)
 	}
 
 	/// Force-retains the current session and then performs full enqueue/index
@@ -193,8 +202,13 @@ fn force_retain_runtime(
 		runtime.session_id()?,
 		root.as_ref(),
 		runtime.mnemopi_settings()?.retain_every_n_turns,
+		runtime.mnemopi_settings()?.llm_mode != MemoryLlmMode::None,
 	);
-	retainer.retain_force(&borrowed)
+	let outcome = retainer.retain_force(&borrowed)?;
+	if outcome.extraction_enqueued {
+		runtime.notify_extraction();
+	}
+	Ok(outcome)
 }
 
 fn borrow_messages(messages: &[OwnedRetentionMessage]) -> Vec<RetentionMessage<'_>> {
@@ -268,4 +282,108 @@ fn truncate_chars(value: &str, max_bytes: usize) -> &str {
 		boundary -= 1;
 	}
 	&value[..boundary]
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		config::{MemoryBackend, MnemopiSettings},
+		runtime::RuntimeStart,
+	};
+
+	#[test]
+	fn auto_retain_false_suppresses_settled_lifecycle_writes() {
+		let root = std::env::temp_dir().join(format!("omp-memory-{}", omp_core::Ulid::generate()));
+		let runtime = MemoryRuntime::start(RuntimeStart {
+			session_id:             Str::new("session"),
+			data_dir:               root.join("data"),
+			workspace_root:         root.clone(),
+			canonical_primary_root: Some(root.clone()),
+			backend:                MemoryBackend::Mnemopi,
+			mnemopi:                MnemopiSettings {
+				auto_retain: false,
+				retain_every_n_turns: 1,
+				..MnemopiSettings::default()
+			},
+		})
+		.expect("runtime");
+		let session = SessionMemory::top_level(Arc::clone(&runtime));
+		let outcome = session
+			.retain_settled(&[OwnedRetentionMessage {
+				stable_id: Str::new("message-1"),
+				role:      RetentionRole::User,
+				content:   Str::new("remember this"),
+			}])
+			.expect("settled hook");
+
+		assert_eq!(outcome, RetentionOutcome::default());
+		assert_eq!(runtime.stats().expect("stats").counts.working, 0);
+	}
+
+	#[test]
+	fn automatic_retention_durably_enqueues_and_notifies_once() {
+		let root = std::env::temp_dir().join(format!("omp-memory-{}", omp_core::Ulid::generate()));
+		let runtime = MemoryRuntime::start(RuntimeStart {
+			session_id:             Str::new("session"),
+			data_dir:               root.join("data"),
+			workspace_root:         root.clone(),
+			canonical_primary_root: Some(root.clone()),
+			backend:                MemoryBackend::Mnemopi,
+			mnemopi:                MnemopiSettings {
+				retain_every_n_turns: 1,
+				..MnemopiSettings::default()
+			},
+		})
+		.expect("runtime");
+		let notifications = runtime.extraction_notifications();
+		let session = SessionMemory::top_level(Arc::clone(&runtime));
+		let messages = [OwnedRetentionMessage {
+			stable_id: Str::new("message-1"),
+			role:      RetentionRole::User,
+			content:   Str::new("remember this durable preference"),
+		}];
+		let outcome = session.retain_settled(&messages).expect("settled hook");
+		assert!(outcome.extraction_enqueued);
+		assert!(notifications.try_recv().is_ok());
+		assert_eq!(runtime.pending_extraction_count().expect("pending"), 1);
+
+		let duplicate = session.retain_settled(&messages).expect("duplicate hook");
+		assert!(!duplicate.extraction_enqueued);
+		assert!(notifications.try_recv().is_err());
+		assert_eq!(
+			runtime
+				.pending_extraction_count()
+				.expect("still one pending"),
+			1
+		);
+	}
+
+	#[test]
+	fn disabled_extraction_lane_retains_without_enqueuing() {
+		let root = std::env::temp_dir().join(format!("omp-memory-{}", omp_core::Ulid::generate()));
+		let runtime = MemoryRuntime::start(RuntimeStart {
+			session_id:             Str::new("session"),
+			data_dir:               root.join("data"),
+			workspace_root:         root.clone(),
+			canonical_primary_root: Some(root.clone()),
+			backend:                MemoryBackend::Mnemopi,
+			mnemopi:                MnemopiSettings {
+				retain_every_n_turns: 1,
+				llm_mode: MemoryLlmMode::None,
+				..MnemopiSettings::default()
+			},
+		})
+		.expect("runtime");
+		let session = SessionMemory::top_level(Arc::clone(&runtime));
+		let outcome = session
+			.retain_settled(&[OwnedRetentionMessage {
+				stable_id: Str::new("message-1"),
+				role:      RetentionRole::User,
+				content:   Str::new("retain this episode without model extraction"),
+			}])
+			.expect("settled hook");
+		assert!(outcome.stored_id.is_some());
+		assert!(!outcome.extraction_enqueued);
+		assert_eq!(runtime.pending_extraction_count().expect("pending"), 0);
+	}
 }

@@ -308,13 +308,17 @@ async fn live_host_agents_requests_follow_the_exact_bound_chat_parent() {
 		.request(first_context, sf!("omp.agents.list"), serde_json::Map::new())
 		.await
 		.expect_err("replaced host authority must be revoked");
-	assert_eq!(stale.code.as_str(), "StaleGeneration");
+	assert_eq!(stale.code.as_str(), "AgentsOwnerUnavailable");
 
 	let second_authority = supervisor
 		.control_authority(Arc::clone(&identity))
 		.expect("replacement live host authority");
+	let second_context = request_context(Arc::clone(&identity));
+	second_authority
+		.authorize(&second_context, "omp.agents.list", &serde_json::Map::new())
+		.expect("replacement request authorized");
 	let second_roster = second_authority
-		.request(request_context(identity), sf!("omp.agents.list"), serde_json::Map::new())
+		.request(second_context, sf!("omp.agents.list"), serde_json::Map::new())
 		.await
 		.expect("replacement live host request");
 	let second_roster = second_roster.as_array().expect("second roster");
@@ -330,6 +334,11 @@ async fn live_host_agents_requests_follow_the_exact_bound_chat_parent() {
 	);
 
 	drop(second_lease);
-	let revoked = supervisor.control_authority(control_identity());
-	assert!(matches!(revoked, Err(error) if error.domain() == "agents"));
+	let revoked = supervisor
+		.control_authority(control_identity())
+		.expect("dynamic authority remains generation-bound");
+	let error = revoked
+		.authorize(&request_context(identity), "omp.agents.list", &serde_json::Map::new())
+		.expect_err("released owner must reject new requests");
+	assert_eq!(error.code.as_str(), "AgentsOwnerUnavailable");
 }

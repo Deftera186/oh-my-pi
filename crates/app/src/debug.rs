@@ -275,13 +275,13 @@ pub fn artifact_url(path: &Path) -> Option<Url> {
 	Url::from_file_path(path).ok()
 }
 
-/// Sweeps only blobs unreachable from retained sessions and durable roots.
+/// Sweeps only blobs unreachable from the authoritative profile session roots.
 pub fn garbage_collect(
 	store: &BlobStore,
-	roots: &[omp_storage::transcript::SessionId],
 	min_age: Duration,
 ) -> Result<omp_storage::gc::SweepReport, gc::Error> {
-	omp_storage::gc::sweep(store, roots, min_age)
+	let roots = omp_storage::gc::SessionRoots::discover(store, &[])?;
+	omp_storage::gc::sweep(store, &roots, min_age)
 }
 
 #[cfg(target_os = "linux")]

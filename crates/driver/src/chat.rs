@@ -1,13 +1,10 @@
 //! Durable project-chat composition.
 
-mod agents;
+pub mod agents;
 use std::{
 	cmp,
 	collections::{BTreeMap, BTreeSet},
-	env, ffi, fs,
-	fs::File,
-	io::{self, BufRead as _, BufReader},
-	iter, num,
+	env, ffi, fs, io, iter, num,
 	path::{Path, PathBuf},
 	pin::Pin,
 	process,
@@ -69,7 +66,7 @@ use omp_storage::{
 	gc,
 	index::{self, IndexedWriteError, NewSession, SessionIndex, SessionKind},
 	transcript,
-	transcript::{Header, Kind, SessionId, read_header, read_line},
+	transcript::{Header, Kind, SessionId},
 };
 use omp_telemetry::firehose::Firehose;
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
@@ -827,31 +824,69 @@ pub struct AgentHubCapabilities {
 
 /// Session-owned parent authority shared with interactive presentation.
 pub struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
-	client:           C,
-	env:              omp_env::EnvClient,
-	broker:           omp_agent::Broker,
-	supervisor:       Arc<SessionSupervisor<C>>,
-	context:          Mutex<ChatParentContext>,
+	client: C,
+	env: omp_env::EnvClient,
+	broker: omp_agent::Broker,
+	supervisor: Arc<SessionSupervisor<C>>,
+	context: Mutex<ChatParentContext>,
 	advisor_children: Mutex<AdvisorChildren>,
-	revival:          Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
-	inboxes:          Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
-	controls:         Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	revival: Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
+	inboxes: Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
+	controls: Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	discovery_model_settings: Mutex<Option<discovery::PromptDiscoverySettings>>,
+	auto_thinking: Mutex<AutoThinkingSettings>,
+	difficulty_classifier: omp_inference::DifficultyClassifier,
+}
+
+struct EvalRunCancelGuard<C: TurnClient + Clone + Send + 'static> {
+	supervisor: Arc<SessionSupervisor<C>>,
+	id:         Str,
+	armed:      bool,
+}
+
+impl<C: TurnClient + Clone + Send + 'static> Drop for EvalRunCancelGuard<C> {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		let supervisor = Arc::clone(&self.supervisor);
+		let id = self.id.clone();
+		let _ = supervisor.cancel(id.as_str());
+		drop(tokio::spawn(async move {
+			let _ = time::timeout(Duration::from_secs(5), async {
+				loop {
+					let settled = supervisor.state(id.as_str()).is_none_or(|state| {
+						matches!(
+							state.lifecycle(),
+							SubagentLifecycle::Settled | SubagentLifecycle::Parked
+						)
+					});
+					if settled {
+						return;
+					}
+					time::sleep(Duration::from_millis(10)).await;
+				}
+			})
+			.await;
+		}));
+	}
 }
 struct ProductionChildReviver<C: TurnClient + Clone + Send + 'static> {
-	client:         C,
-	base_env:       omp_env::EnvClient,
-	broker:         omp_agent::Broker,
-	supervisor:     Arc<SessionSupervisor<C>>,
-	node:           Arc<AgentNode>,
-	snapshot:       AgentSnapshot,
-	journal_path:   PathBuf,
-	project_root:   PathBuf,
-	workspace_root: PathBuf,
-	isolated_state: Option<PathBuf>,
-	session_index:  Arc<SessionIndex>,
-	parent_session: SessionId,
-	inboxes:        Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
-	controls:       Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	client:                   C,
+	base_env:                 omp_env::EnvClient,
+	broker:                   omp_agent::Broker,
+	supervisor:               Arc<SessionSupervisor<C>>,
+	node:                     Arc<AgentNode>,
+	snapshot:                 AgentSnapshot,
+	journal_path:             PathBuf,
+	project_root:             PathBuf,
+	workspace_root:           PathBuf,
+	isolated_state:           Option<PathBuf>,
+	session_index:            Arc<SessionIndex>,
+	parent_session:           SessionId,
+	inboxes:                  Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
+	controls:                 Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	discovery_model_settings: Option<discovery::PromptDiscoverySettings>,
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -890,6 +925,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 		let parent_session = self.parent_session.clone();
 		let inboxes = Arc::clone(&self.inboxes);
 		let controls = Arc::clone(&self.controls);
+		let discovery_model_settings = self.discovery_model_settings.clone();
 		Box::pin(async move {
 			let isolated_environment = if let Some(state) = isolated_state {
 				Some(
@@ -907,9 +943,19 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 			} else {
 				None
 			};
-			let child_env = isolated_environment
-				.as_ref()
-				.map_or_else(|| base_env.clone(), |environment| environment.client().clone());
+			let child_env = isolated_environment.as_ref().map_or_else(
+				|| {
+					base_env
+						.with_principal(parent_session.0.clone(), node.id.clone())
+						.expect("validated revived child identity is a valid Environment principal")
+				},
+				|environment| {
+					environment
+						.client()
+						.with_principal(parent_session.0.clone(), node.id.clone())
+						.expect("validated revived child identity is a valid Environment principal")
+				},
+			);
 			let journal = create_indexed_journal(
 				&journal_path,
 				&project_root,
@@ -922,7 +968,15 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 				tracing::warn!(agent = %node.id, %error, "child journal revival failed");
 				SupervisorError::RevivalFailed { id: node.id.clone() }
 			})?;
-			let child_content = discovery::active_content_snapshots(&workspace_root);
+			let child_content = match discovery_model_settings.as_ref() {
+				Some(settings) => {
+					let home = env::var_os("HOME")
+						.map(PathBuf::from)
+						.unwrap_or_else(|| workspace_root.clone());
+					discovery::active_prompt_snapshots(&workspace_root, &[], &home, settings).content
+				},
+				None => discovery::active_content_snapshots(&workspace_root),
+			};
 			let (ttsr, diagnostics) = rulebook::ttsr_registry(child_content.rules.as_ref());
 			for error in diagnostics {
 				tracing::warn!(%error, agent = %node.id, "revived subagent TTSR rule was rejected");
@@ -1035,6 +1089,9 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		tree: Arc<AgentTree>,
 	) -> Self {
 		let definitions = discover_chat_agents(&root, security_enabled);
+		let env = env
+			.with_principal(session_id.clone(), session_id.clone())
+			.expect("validated durable session identity is a valid Environment principal");
 		if let Err(error) =
 			artifacts::reserve_historical_stems(tree.as_ref(), &sessions_dir.join("eval-agents"))
 		{
@@ -1064,7 +1121,22 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			revival: Mutex::new(BTreeMap::new()),
 			inboxes: Arc::new(Mutex::new(BTreeMap::new())),
 			controls: Arc::new(Mutex::new(BTreeMap::new())),
+			discovery_model_settings: Mutex::new(None),
+			auto_thinking: Mutex::new(AutoThinkingSettings::default()),
+			difficulty_classifier: omp_inference::DifficultyClassifier::new(),
 		}
+	}
+
+	/// Installs the complete settings and invocation policy frozen for child
+	/// prompt/content discovery.
+	pub fn set_prompt_discovery_settings(&self, settings: discovery::PromptDiscoverySettings) {
+		*self.discovery_model_settings.lock() = Some(settings);
+	}
+
+	/// Installs the immutable automatic-thinking policy used to classify each
+	/// ordinary user turn before inference dispatch.
+	pub fn set_auto_thinking_settings(&self, settings: AutoThinkingSettings) {
+		*self.auto_thinking.lock() = settings;
 	}
 
 	/// Binds the main agent inbox used by the hub presentation.
@@ -1521,6 +1593,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			parent_session: SessionId(record.session.clone()),
 			inboxes: Arc::clone(&self.inboxes),
 			controls: Arc::clone(&self.controls),
+			discovery_model_settings: self.discovery_model_settings.lock().clone(),
 		});
 		self.supervisor.register_parked(node, reviver)?;
 		self.ensure_revival_transport(&record.id);
@@ -1608,10 +1681,16 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			.state(id)
 			.map(|state| (state.generation(), state.progress().output_tokens));
 		let run = self.supervisor.run(id, items, turn_id);
+		let mut cancellation = EvalRunCancelGuard {
+			supervisor: Arc::clone(&self.supervisor),
+			id:         Str::new(id),
+			armed:      true,
+		};
 		tokio::pin!(run);
 		loop {
 			tokio::select! {
 				result = &mut run => {
+					cancellation.armed = false;
 										let _ = self.broker.set_idle(id, true);
 					if let Some(terminal) = self
 						.supervisor
@@ -3858,9 +3937,9 @@ fn retain_security_review_result(
 }
 
 impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
-	async fn complete_auxiliary_text(
+	async fn complete_auxiliary_model(
 		&self,
-		role: &str,
+		model: &str,
 		system_prompt: &str,
 		input: &str,
 	) -> Result<Option<Str>, Str> {
@@ -3869,7 +3948,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		params.tools.clear();
 		params.tool_choice = None;
 		params.response_format = None;
-		params.model = format!("@{role}");
+		params.model = model.to_owned();
 		let options = TurnOptions {
 			context_id: None,
 			params,
@@ -3901,6 +3980,77 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			}
 		}
 		Ok(None)
+	}
+
+	async fn complete_auxiliary_text(
+		&self,
+		role: &str,
+		system_prompt: &str,
+		input: &str,
+	) -> Result<Option<Str>, Str> {
+		self
+			.complete_auxiliary_model(&format!("@{role}"), system_prompt, input)
+			.await
+	}
+
+	async fn classify_turn_difficulty(&self, input: &str) -> Effort {
+		let settings = *self.auto_thinking.lock();
+		let auto = settings.for_turn();
+		let selector = self
+			.discovery_model_settings
+			.lock()
+			.as_ref()
+			.map(|settings| settings.model.auto_thinking_selector.clone())
+			.unwrap_or_else(|| sf!("@tiny"));
+		let decision = match settings.backend {
+			omp_inference::DifficultyBackend::Online => {
+				let classified = self
+					.difficulty_classifier
+					.classify_online(input, auto, |request| {
+						let selector = selector.clone();
+						async move {
+							self
+								.complete_auxiliary_model(
+									selector.as_str(),
+									request.instruction.as_str(),
+									request.input.as_str(),
+								)
+								.await
+								.and_then(|answer| {
+									answer.ok_or_else(|| Str::new_static("classifier-empty-output"))
+								})
+								.map_err(|message| {
+									omp_inference::OnlineDifficultyError::new(message, false)
+								})
+						}
+					});
+				match time::timeout(Duration::from_secs(4), classified).await {
+					Ok(decision) => decision,
+					Err(_) => self.difficulty_classifier.fallback(
+						input,
+						omp_inference::DifficultyBackend::Online,
+						auto,
+					),
+				}
+			},
+			omp_inference::DifficultyBackend::Local => self.difficulty_classifier.fallback(
+				input,
+				omp_inference::DifficultyBackend::Local,
+				auto,
+			),
+		};
+		decision.level.effort()
+	}
+}
+
+impl<C: TurnClient + Clone + Send + Sync + 'static> omp_agent::TurnDifficultyClassifier
+	for ChatParentHost<C>
+{
+	fn classify<'a>(
+		&'a self,
+		user_text: &'a str,
+	) -> Pin<Box<dyn Future<Output = Effort> + Send + 'a>> {
+		Box::pin(self.classify_turn_difficulty(user_text))
 	}
 }
 
@@ -4497,10 +4647,29 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 		if !child_can_spawn {
 			suppress_eval_spawn_guidance(&mut child_snapshot.turn.params);
 		}
-		let child_env = isolated_environment
-			.as_ref()
-			.map_or_else(|| self.env.clone(), |environment| environment.client().clone());
-		let child_content = discovery::active_content_snapshots(&child_root);
+		let child_env = isolated_environment.as_ref().map_or_else(
+			|| {
+				self
+					.env
+					.with_principal(context.session_id.clone(), id.clone())
+					.expect("validated child identity is a valid Environment principal")
+			},
+			|environment| {
+				environment
+					.client()
+					.with_principal(context.session_id.clone(), id.clone())
+					.expect("validated child identity is a valid Environment principal")
+			},
+		);
+		let child_content = match self.discovery_model_settings.lock().as_ref() {
+			Some(settings) => {
+				let home = env::var_os("HOME")
+					.map(PathBuf::from)
+					.unwrap_or_else(|| child_root.clone());
+				discovery::active_prompt_snapshots(&child_root, &[], &home, settings).content
+			},
+			None => discovery::active_content_snapshots(&child_root),
+		};
 		let (child_ttsr, child_ttsr_diagnostics) =
 			rulebook::ttsr_registry(child_content.rules.as_ref());
 		for error in child_ttsr_diagnostics {
@@ -4633,6 +4802,7 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			parent_session: parent,
 			inboxes: Arc::clone(&self.inboxes),
 			controls: Arc::clone(&self.controls),
+			discovery_model_settings: self.discovery_model_settings.lock().clone(),
 		});
 		self
 			.supervisor
@@ -5449,11 +5619,23 @@ pub fn model_context_window(catalog: &snapshot::Catalog, model: &str) -> Option<
 		.and_then(|spec| spec.limits.context_window)
 }
 
+/// Resolves input-usable context after reserving the model's maximum output.
+pub fn model_usable_context_window(catalog: &snapshot::Catalog, model: &str) -> Option<u64> {
+	catalog
+		.model(omp_catalog::ModelKey::from_ref(model))
+		.or_else(|| catalog.resolve_alias(model))
+		.and_then(|spec| {
+			spec.limits.context_window.map(|context| {
+				context.saturating_sub(spec.limits.maximum_output_tokens.unwrap_or_default())
+			})
+		})
+}
+
 /// Returns whether the catalog proves the model cannot accept declared tools.
 ///
 /// Unknown or missing capability evidence keeps tools advertised; only
 /// explicit `Unsupported` evidence (e.g. Apple's on-device model) strips them.
-fn model_rejects_tools(catalog: &snapshot::Catalog, model: &str) -> bool {
+pub(crate) fn model_rejects_tools(catalog: &snapshot::Catalog, model: &str) -> bool {
 	catalog
 		.model(omp_catalog::ModelKey::from_ref(model))
 		.or_else(|| catalog.resolve_alias(model))
@@ -5932,54 +6114,46 @@ struct SessionMetadata {
 }
 
 fn session_metadata(path: &Path) -> Option<SessionMetadata> {
-	let mut reader = BufReader::new(File::open(path).ok()?);
-	let mut line = Vec::new();
-	if reader.read_until(b'\n', &mut line).ok()? == 0 {
-		return None;
-	}
-	while line
-		.last()
-		.is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
-	{
-		line.pop();
-	}
-	let header = read_header(&line).ok()?;
+	let reader = transcript::Reader::open(path).ok()?;
+	let log = reader.log();
+	let header = log.header().clone();
 	let mut title = None;
 	let mut first_message = None;
-	let mut has_entries = false;
-	loop {
-		line.clear();
-		if reader.read_until(b'\n', &mut line).ok()? == 0 {
-			break;
-		}
-		while line
-			.last()
-			.is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
-		{
-			line.pop();
-		}
-		let Ok(event) = read_line(&line) else {
+	for index in 0..u64::try_from(log.len()).ok()? {
+		let Some(transcript::Entry::Ok(event)) = log.get(index) else {
 			continue;
 		};
-		has_entries = true;
 		match &event.kind {
 			Kind::Title { title: value, .. } => title = sanitize_session_label(value),
-			Kind::Item(record) if first_message.is_none() => {
-				let Some(item::Kind::Message(message)) = &record.item.kind else {
-					continue;
-				};
-				if !matches!(Role::try_from(message.role), Ok(Role::User)) {
-					continue;
-				}
-				first_message = message.parts.iter().find_map(|part| match &part.kind {
-					Some(part::Kind::Text(text)) => sanitize_session_label(text),
-					_ => None,
+			Kind::Msg(transcript::Msg::User { content, .. }) if first_message.is_none() => {
+				first_message = content.iter().find_map(|block| match block {
+					transcript::UserBlock::Text { text } => sanitize_session_label(text),
+					transcript::UserBlock::Image { .. } => None,
 				});
+			},
+			Kind::TurnInput(record) if first_message.is_none() => {
+				first_message = session_item_label(&record.item);
+			},
+			Kind::Item(record) if first_message.is_none() => {
+				first_message = session_item_label(&record.item);
 			},
 			_ => {},
 		}
 	}
-	Some(SessionMetadata { header, label: title.or(first_message), has_entries })
+	Some(SessionMetadata { header, label: title.or(first_message), has_entries: !log.is_empty() })
+}
+
+fn session_item_label(value: &Item) -> Option<Str> {
+	let Some(item::Kind::Message(message)) = &value.kind else {
+		return None;
+	};
+	if !matches!(Role::try_from(message.role), Ok(Role::User)) {
+		return None;
+	}
+	message.parts.iter().find_map(|part| match &part.kind {
+		Some(part::Kind::Text(text)) => sanitize_session_label(text),
+		_ => None,
+	})
 }
 
 fn sanitize_session_label(value: &str) -> Option<Str> {
@@ -6331,11 +6505,12 @@ mod tests {
 	#[test]
 	fn model_selector_resolution_covers_keys_aliases_routes_and_unknowns() {
 		let catalog = snapshot::Catalog::try_embedded().expect("embedded catalog");
+		let model = catalog.models().first().expect("catalog model");
 		assert_eq!(
-			resolve_model_selector(catalog, "apple-intelligence/apple-intelligence")
+			resolve_model_selector(catalog, model.key.as_str())
 				.expect("exact key resolves")
 				.as_str(),
-			"apple-intelligence/apple-intelligence",
+			model.key.as_str(),
 		);
 		assert_eq!(
 			resolve_model_selector(catalog, "@smol")
@@ -6344,32 +6519,43 @@ mod tests {
 			"@smol",
 		);
 
-		// A route serving exactly one model recommends that model.
-		let unique = resolve_model_selector(catalog, "apple-intelligence/primary").unwrap_err();
+		let (unique_route, unique_model) = catalog
+			.routes()
+			.iter()
+			.find_map(|route| {
+				let models = catalog
+					.models()
+					.iter()
+					.filter(|model| model.routes.contains(&route.id))
+					.collect::<Vec<_>>();
+				(models.len() == 1).then(|| (route, models[0]))
+			})
+			.expect("catalog has a uniquely served route");
+		let unique = resolve_model_selector(catalog, unique_route.id.as_str()).unwrap_err();
 		let ChatError::ModelSelectorIsRoute { hint, .. } = &unique else {
 			panic!("expected route error, got {unique}");
 		};
-		assert_eq!(hint.as_str(), "; use `--model apple-intelligence/apple-intelligence`");
+		assert_eq!(hint.as_str(), format!("; use `--model {}`", unique_model.key));
 
-		// A route shared by a multi-model provider must not recommend one
-		// arbitrary model.
-		let shared = resolve_model_selector(catalog, "agnes-plan/primary").unwrap_err();
+		let shared_route = catalog
+			.routes()
+			.iter()
+			.find(|route| {
+				catalog
+					.models()
+					.iter()
+					.filter(|model| model.routes.contains(&route.id))
+					.count() > 1
+			})
+			.expect("catalog has a shared route");
+		let shared = resolve_model_selector(catalog, shared_route.id.as_str()).unwrap_err();
 		let ChatError::ModelSelectorIsRoute { hint, .. } = &shared else {
 			panic!("expected route error, got {shared}");
 		};
-		assert!(
-			hint.starts_with("; provider `agnes-plan` serves: "),
-			"shared route hint lists candidates: {hint}",
-		);
+		assert!(hint.starts_with("; provider `"), "shared route hint lists candidates: {hint}");
 
-		let unknown = resolve_model_selector(catalog, "apple/apple-intelligence").unwrap_err();
-		let ChatError::UnknownModel { suggestions, .. } = &unknown else {
-			panic!("expected unknown-model error, got {unknown}");
-		};
-		assert!(
-			suggestions.contains("apple-intelligence/apple-intelligence"),
-			"suggestions name the canonical key: {suggestions}",
-		);
+		let unknown = resolve_model_selector(catalog, "__unknown__/__missing__").unwrap_err();
+		assert!(matches!(unknown, ChatError::UnknownModel { .. }));
 	}
 
 	/// Port of pi PR #8833: a provider-qualified selector must resolve within

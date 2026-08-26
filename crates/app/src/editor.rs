@@ -6,7 +6,7 @@ use std::{
 	io,
 	io::{Read as _, Write as _},
 	path::{Path, PathBuf},
-	process::{Command, Stdio},
+	process::{Command, ExitStatus, Stdio},
 };
 
 use omp_tui::components::editor::{
@@ -94,35 +94,67 @@ pub fn edit_draft_with_command<T: ExternalEditorTerminal + ?Sized>(
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
-	let mut draft = DraftFile::create(options.extension)?;
-	draft.write_all(content.as_bytes())?;
+	let mut draft = prepared_draft(content, options.extension)?;
 	let suspension = ExternalEditorSuspension::new(terminal).map_err(|source| EditorError::Io {
 		operation: "terminal suspend",
 		path: PathBuf::from("<terminal>"),
 		source,
 	})?;
-	let mut child = Command::new(command.program.as_str());
-	child
-		.args(command.arguments.iter().map(|argument| argument.as_str()))
-		.arg(draft.path())
-		.stdin(Stdio::inherit())
-		.stdout(Stdio::inherit())
-		.stderr(Stdio::inherit());
-	let status = child.status().map_err(|source| EditorError::Io {
-		operation: "launch",
-		path: PathBuf::from(command.program.as_str()),
-		source,
-	})?;
+	let status = launch_editor(command, draft.path())?;
 	suspension.restore().map_err(|source| EditorError::Io {
 		operation: "terminal restore",
 		path: PathBuf::from("<terminal>"),
 		source,
 	})?;
+	finish_draft(&mut draft, status, options.trim_trailing_newline)
+}
+
+/// Opens a draft after the terminal host has already restored terminal modes.
+///
+/// GUI hosts and terminal lifecycle owners use this at a reconstruction
+/// boundary, so no second suspension or raw-mode transition occurs.
+pub fn edit_draft_detached(
+	content: &str,
+	options: EditorOptions<'_>,
+) -> Result<Option<String>, EditorError> {
+	let configured = resolve_editor_command();
+	let command = parse_external_editor_command(&configured)?;
+	let mut draft = prepared_draft(content, options.extension)?;
+	let status = launch_editor(&command, draft.path())?;
+	finish_draft(&mut draft, status, options.trim_trailing_newline)
+}
+
+fn prepared_draft(content: &str, extension: &str) -> Result<DraftFile, EditorError> {
+	let mut draft = DraftFile::create(extension)?;
+	draft.write_all(content.as_bytes())?;
+	Ok(draft)
+}
+
+fn launch_editor(command: &ExternalEditorCommand, path: &Path) -> Result<ExitStatus, EditorError> {
+	let mut child = Command::new(command.program.as_str());
+	child
+		.args(command.arguments.iter().map(|argument| argument.as_str()))
+		.arg(path)
+		.stdin(Stdio::inherit())
+		.stdout(Stdio::inherit())
+		.stderr(Stdio::inherit());
+	child.status().map_err(|source| EditorError::Io {
+		operation: "launch",
+		path: PathBuf::from(command.program.as_str()),
+		source,
+	})
+}
+
+fn finish_draft(
+	draft: &mut DraftFile,
+	status: ExitStatus,
+	trim_trailing_newline: bool,
+) -> Result<Option<String>, EditorError> {
 	if !status.success() {
 		return Ok(None);
 	}
 	let mut edited = draft.read_to_string()?;
-	if options.trim_trailing_newline && edited.ends_with('\n') {
+	if trim_trailing_newline && edited.ends_with('\n') {
 		edited.pop();
 	}
 	Ok(Some(edited))

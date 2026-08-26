@@ -83,6 +83,7 @@ mod tests {
 
 	#[test]
 	fn power_projection_round_trips_and_is_registered() {
+		assert_eq!(PowerSettings::default().sleep_prevention, SleepPrevention::Idle);
 		let expected = PowerSettings { sleep_prevention: SleepPrevention::Display };
 		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated snapshot");
 		assert_eq!(

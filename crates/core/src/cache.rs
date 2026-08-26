@@ -7,7 +7,7 @@
 
 use std::{
 	borrow::Borrow,
-	hash::{Hash, BuildHasher as _},
+	hash::{BuildHasher as _, Hash},
 	mem,
 };
 

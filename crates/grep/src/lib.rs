@@ -926,6 +926,42 @@ fn build_pcre_matcher(
 	builder.build(pattern)
 }
 
+/// Quotes literal parentheses after both regex engines report invalid group
+/// syntax, while preserving already escaped parentheses and all other regex
+/// operators.
+fn escape_unescaped_parentheses(pattern: &str) -> Cow<'_, str> {
+	let bytes = pattern.as_bytes();
+	if !bytes.contains(&b'(') && !bytes.contains(&b')') {
+		return Cow::Borrowed(pattern);
+	}
+
+	let mut escaped = String::with_capacity(pattern.len() + 4);
+	let mut modified = false;
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] == b'\\' && index + 1 < bytes.len() {
+			escaped.push('\\');
+			index += 1;
+			let character = pattern[index..].chars().next().expect("non-empty suffix");
+			escaped.push(character);
+			index += character.len_utf8();
+			continue;
+		}
+		let character = pattern[index..].chars().next().expect("non-empty suffix");
+		if matches!(character, '(' | ')') {
+			escaped.push('\\');
+			modified = true;
+		}
+		escaped.push(character);
+		index += character.len_utf8();
+	}
+	if modified {
+		Cow::Owned(escaped)
+	} else {
+		Cow::Borrowed(pattern)
+	}
+}
+
 fn build_matcher(
 	pattern: &str,
 	ignore_case: bool,
@@ -936,13 +972,30 @@ fn build_matcher(
 		Ok(matcher) => return Ok(CompiledMatcher::Rust(matcher)),
 		Err(error) => error,
 	};
-	match build_pcre_matcher(sanitized.as_ref(), ignore_case, multiline) {
-		Ok(matcher) => Ok(CompiledMatcher::Pcre2(matcher)),
-		Err(pcre2_error) => Err(GrepError::InvalidRegex {
-			regex: Str::from(regex_error.to_string()),
-			pcre2: Str::from(pcre2_error.to_string()),
-		}),
+	let pcre2_error = match build_pcre_matcher(sanitized.as_ref(), ignore_case, multiline) {
+		Ok(matcher) => return Ok(CompiledMatcher::Pcre2(matcher)),
+		Err(error) => error,
+	};
+
+	let message = regex_error.to_string();
+	if message.contains("unclosed group") || message.contains("unopened group") {
+		let escaped = escape_unescaped_parentheses(sanitized.as_ref());
+		if escaped.as_ref() != sanitized.as_ref() {
+			if let Ok(matcher) = build_regex_matcher(escaped.as_ref(), ignore_case, multiline) {
+				return Ok(CompiledMatcher::Rust(matcher));
+			}
+			if let Ok(matcher) = build_pcre_matcher(escaped.as_ref(), ignore_case, multiline) {
+				return Ok(CompiledMatcher::Pcre2(matcher));
+			}
+		}
 	}
+
+	build_regex_matcher(&regex::escape(pattern), ignore_case, multiline)
+		.map(CompiledMatcher::Rust)
+		.map_err(|_| GrepError::InvalidRegex {
+			regex: Str::from(message),
+			pcre2: Str::from(pcre2_error.to_string()),
+		})
 }
 
 fn sanitize_braces(pattern: &str) -> Cow<'_, str> {
@@ -1404,9 +1457,25 @@ mod tests {
 	}
 
 	#[test]
-	fn invalid_pattern_preserves_both_engine_diagnostics() {
-		let error = search(b"text", &options("(")).unwrap_err();
-		assert!(matches!(error, GrepError::InvalidRegex { .. }));
+	fn invalid_regex_falls_back_to_literal() {
+		for (pattern, haystack, miss) in [
+			("foo[bar", &b"x foo[bar y"[..], &b"foobar"[..]),
+			("+++", &b"a+++b"[..], &b"ab"[..]),
+			("fail)", &b"(1 fail)"[..], &b"failure"[..]),
+		] {
+			let matcher = build_matcher(pattern, false, false)
+				.unwrap_or_else(|error| panic!("`{pattern}` should be literal: {error}"));
+			assert!(matcher.is_match(haystack).expect("match succeeds"));
+			assert!(!matcher.is_match(miss).expect("miss succeeds"));
+		}
+	}
+
+	#[test]
+	fn stray_parenthesis_retry_preserves_surrounding_regex() {
+		assert_eq!(escape_unescaped_parentheses(r"foo\(bar\)").as_ref(), r"foo\(bar\)");
+		let matcher = build_matcher("foo.*(bar", false, false).expect("parenthesis retry");
+		assert!(matcher.is_match(b"fooXYZ(bar").expect("match succeeds"));
+		assert!(!matcher.is_match(b"foobar").expect("miss succeeds"));
 	}
 
 	#[test]

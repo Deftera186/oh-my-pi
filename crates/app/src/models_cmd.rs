@@ -24,14 +24,16 @@ use crate::cli::{ModelRole, ModelsArgs, ModelsCommand};
 /// routes and credentials used at call time, then atomically updates only the
 /// runtime discovery cache.
 pub async fn run(args: &ModelsArgs) -> miette::Result<()> {
-	let catalog = Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
+	let catalog =
+		omp_driver::registry::production_catalog(&omp_core::dirs::data_dir(None).into_diagnostic()?)
+			.into_diagnostic()?;
 	match args.command.as_ref() {
-		None => print_rows(&select(catalog, args.filter.as_deref(), args.role), args.json),
+		None => print_rows(&select(catalog.as_ref(), args.filter.as_deref(), args.role), args.json),
 		Some(ModelsCommand::List { filter, json, role }) => {
-			print_rows(&select(catalog, filter.as_deref(), *role), *json)
+			print_rows(&select(catalog.as_ref(), filter.as_deref(), *role), *json)
 		},
 		Some(ModelsCommand::Find { pattern, json }) => {
-			print_rows(&select(catalog, Some(pattern), None), *json)
+			print_rows(&select(catalog.as_ref(), Some(pattern), None), *json)
 		},
 		Some(ModelsCommand::Refresh) => refresh().await,
 	}

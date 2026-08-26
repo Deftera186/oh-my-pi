@@ -27,16 +27,32 @@ pub enum DiscoveryScope {
 pub enum AssetKind {
 	/// Native static extension manifest.
 	Extension,
+	/// Plugin package or Claude-compatible manifest.
+	PluginManifest,
 	/// Skill document.
 	Skill,
+	/// Plugin-provided agent definition.
+	Agent,
 	/// Persistent context file.
 	Context,
+	/// Rule document distinct from general persistent context.
+	Rule,
 	/// Reusable prompt template.
 	Template,
 	/// Markdown slash command.
 	Command,
 	/// Static MCP declaration.
 	Mcp,
+	/// Hook declaration or executable hook module.
+	Hook,
+	/// Native or JavaScript tool declaration.
+	Tool,
+	/// LSP server configuration.
+	Lsp,
+	/// DAP adapter configuration.
+	Dap,
+	/// JavaScript extension module declared by a plugin package.
+	JavaScript,
 }
 
 /// One discovery root and the asset families accepted beneath it.
@@ -195,14 +211,42 @@ fn classify(path: &str, accepted: &[AssetKind]) -> Option<AssetKind> {
 	let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
 	let kind = if file == "extension.json" {
 		AssetKind::Extension
+	} else if matches!(file, "package.json" | "plugin.json") {
+		AssetKind::PluginManifest
 	} else if file == "SKILL.md" {
 		AssetKind::Skill
-	} else if matches!(file, "AGENTS.md" | "RULES.md")
+	} else if directory_named(parent, "agents") && file.ends_with(".md") {
+		AssetKind::Agent
+	} else if file == "RULES.md" || directory_named(parent, "rules") && file.ends_with(".md") {
+		AssetKind::Rule
+	} else if file == "AGENTS.md"
 		|| (directory_named(parent, "instructions") && file.ends_with(".md"))
 	{
 		AssetKind::Context
 	} else if matches!(file, "mcp.json" | ".mcp.json") || directory_named(parent, "mcp") {
 		AssetKind::Mcp
+	} else if matches!(file, "hooks.json" | ".hooks.json") || directory_named(parent, "hooks") {
+		AssetKind::Hook
+	} else if matches!(file, "lsp.json" | ".lsp.json") || directory_named(parent, "lsp") {
+		AssetKind::Lsp
+	} else if matches!(
+		file,
+		"dap.json" | ".dap.json" | "dap.yaml" | ".dap.yaml" | "dap.yml" | ".dap.yml"
+	) || directory_named(parent, "dap")
+	{
+		AssetKind::Dap
+	} else if directory_named(parent, "tools")
+		&& matches!(
+			path.rsplit_once('.').map(|(_, extension)| extension),
+			Some("js" | "mjs" | "cjs" | "ts")
+		) {
+		AssetKind::Tool
+	} else if directory_named(parent, "extensions")
+		&& matches!(
+			path.rsplit_once('.').map(|(_, extension)| extension),
+			Some("js" | "mjs" | "cjs" | "ts")
+		) {
+		AssetKind::JavaScript
 	} else if (directory_named(parent, "prompts") || directory_named(parent, "templates"))
 		&& file.ends_with(".md")
 	{
@@ -217,4 +261,29 @@ fn classify(path: &str, accepted: &[AssetKind]) -> Option<AssetKind> {
 
 fn directory_named(path: &str, name: &str) -> bool {
 	path.rsplit('/').next() == Some(name)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn plugin_resource_families_remain_distinct() {
+		let accepted = [
+			AssetKind::Agent,
+			AssetKind::Rule,
+			AssetKind::Hook,
+			AssetKind::Tool,
+			AssetKind::Lsp,
+			AssetKind::Dap,
+			AssetKind::JavaScript,
+		];
+		assert_eq!(classify("agents/reviewer.md", &accepted), Some(AssetKind::Agent));
+		assert_eq!(classify("rules/security.md", &accepted), Some(AssetKind::Rule));
+		assert_eq!(classify("hooks/pre-tool.js", &accepted), Some(AssetKind::Hook));
+		assert_eq!(classify("tools/custom.ts", &accepted), Some(AssetKind::Tool));
+		assert_eq!(classify(".lsp.json", &accepted), Some(AssetKind::Lsp));
+		assert_eq!(classify(".dap.yaml", &accepted), Some(AssetKind::Dap));
+		assert_eq!(classify("extensions/provider.js", &accepted), Some(AssetKind::JavaScript));
+	}
 }

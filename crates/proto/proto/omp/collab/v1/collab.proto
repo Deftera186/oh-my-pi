@@ -5,14 +5,6 @@ package omp.collab.v1;
 import "omp/inference/v1/common.proto";
 import "omp/thread/v1/thread.proto";
 
-// OMP-only relay envelope. Routing metadata is cleartext; only sealed_frame is
-// encrypted. Revision changes are explicit and never negotiate a legacy wire.
-message RelayEnvelope {
-  uint32 protocol_revision = 1;
-  uint32 peer_id = 2;
-  bytes sealed_frame = 3;
-}
-
 message RelayControl {
   oneof kind {
     PeerJoined peer_joined = 1;

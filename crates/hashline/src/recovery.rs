@@ -164,6 +164,7 @@ impl LineMapping {
 pub struct RecoveryResult {
 	content:         Bytes,
 	canonical_edits: Vec<ExactByteEdit>,
+	live_edits:      Vec<ExactByteEdit>,
 	recovered_edits: Vec<RecoveredEdit>,
 	changed_ranges:  Vec<ByteRange>,
 	line_mappings:   Vec<LineMapping>,
@@ -179,6 +180,16 @@ impl RecoveryResult {
 	/// Returns canonical live-coordinate edits producing `content`.
 	pub fn canonical_edits(&self) -> &[ExactByteEdit] {
 		&self.canonical_edits
+	}
+
+	/// Returns live-coordinate edits retaining each authored edit's mapped
+	/// identity.
+	///
+	/// Unlike a canonical before/after diff, these ranges cannot migrate among
+	/// repeated equal lines. Callers that will apply or rebase the edit must use
+	/// this representation.
+	pub fn live_edits(&self) -> &[ExactByteEdit] {
+		&self.live_edits
 	}
 
 	/// Returns authored original/live/final coordinate provenance.
@@ -359,6 +370,7 @@ pub fn recover_exact(
 	let mut output = Vec::with_capacity(output_len);
 	let mut cursor = 0usize;
 	let mut final_delta: i128 = 0;
+	let mut live_edits = Vec::with_capacity(mapped.len());
 	let mut recovered_edits = Vec::with_capacity(mapped.len());
 	for (edit, range, original_lines, current_lines) in &mapped {
 		let start = usize::try_from(range.start).map_err(|_| RecoveryError::OutputTooLarge)?;
@@ -382,6 +394,7 @@ pub fn recover_exact(
 			},
 			current_lines:  *current_lines,
 		});
+		live_edits.push(ExactByteEdit { range: *range, replacement: edit.replacement.clone() });
 		final_delta += i128::from(replacement_len) - i128::from(range.end - range.start);
 	}
 	output.extend_from_slice(&current[cursor..]);
@@ -395,7 +408,14 @@ pub fn recover_exact(
 		.collect::<Vec<_>>();
 	line_mappings.sort_unstable_by_key(|mapping| mapping.original);
 	line_mappings.dedup();
-	Ok(RecoveryResult { content, canonical_edits, recovered_edits, changed_ranges, line_mappings })
+	Ok(RecoveryResult {
+		content,
+		canonical_edits,
+		live_edits,
+		recovered_edits,
+		changed_ranges,
+		line_mappings,
+	})
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -827,5 +847,15 @@ mod tests {
 		assert!(!result.changed_ranges().is_empty());
 		assert_eq!(result.recovered_edits()[0].current_range(), ByteRange { start: 2, end: 4 });
 		assert_eq!(result.recovered_edits()[0].final_range(), ByteRange { start: 2, end: 9 });
+	}
+	#[test]
+	fn live_edits_preserve_authored_duplicate_line_identity() {
+		let bytes = Bytes::from_static(b"top\nduplicate\nmiddle\nduplicate\nbottom\n");
+		let start = b"top\nduplicate\nmiddle\n".len() as u64;
+		let end = start + b"duplicate\n".len() as u64;
+		let result = recover_exact(&bytes, &bytes, &[edit(start, end, b"")]).unwrap();
+		assert_eq!(result.live_edits().len(), 1);
+		assert_eq!(result.live_edits()[0].range(), ByteRange { start, end });
+		assert!(result.live_edits()[0].replacement().is_empty());
 	}
 }

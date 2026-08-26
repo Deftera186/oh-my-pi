@@ -32,9 +32,9 @@ pub fn configured(data_dir: &Path) -> Result<SleepPrevention, SettingsManagerErr
 #[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum SleepPrevention {
 	/// Do not acquire a power assertion.
-	#[default]
 	Off,
 	/// Prevent idle system sleep while the agent is actively running.
+	#[default]
 	Idle,
 	/// Prevent display idle sleep while the agent is actively running.
 	Display,

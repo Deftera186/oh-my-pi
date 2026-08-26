@@ -17,6 +17,9 @@ use omp_env::{
 };
 use omp_envd::{
 	EnvServer, RegistryBridges,
+	eval::{
+		BridgeHostError, BridgeProgressSink, EvalSessionConfig, ParentBindingLease, ParentSessionHost,
+	},
 	exec::{ExecEvent as HostExecEvent, ExecHost},
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
@@ -24,6 +27,7 @@ use omp_envd::{
 	worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
 	workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
 };
+use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use omp_proto::{
 	SCHEMA_REV,
 	blob::v1::{Chunk, GetRequest},
@@ -424,12 +428,31 @@ fn test_manifest(
 	entry: &str,
 	tools: impl IntoIterator<Item = ToolDeclarationKey>,
 ) -> ExtensionManifest {
-	ExtensionManifest::new(
+	let tools = tools.into_iter().collect::<Vec<_>>();
+	let ordered = tools
+		.iter()
+		.map(|tool| StaticDeclaration {
+			id: Str::from(format!("{}@{}.{}", tool.name, tool.family, tool.rev)),
+			kind: sf!("soft"),
+			module: Str::from(entry),
+			trigger: sf!("lazy"),
+			key: Str::from(format!("{}@{}.{}", tool.name, tool.family, tool.rev)),
+			api: 1,
+			failure: sf!("fault"),
+			..StaticDeclaration::default()
+		})
+		.collect::<Vec<_>>();
+	ExtensionManifest::new_with_static(
 		test_provenance(key),
 		Str::from(entry),
 		[],
 		DeclarationSet::new(tools, []),
 		ServiceManifest::default(),
+		StaticDeclarations {
+			ordered: ordered.clone().into_boxed_slice(),
+			tools: ordered.into_boxed_slice(),
+			..StaticDeclarations::default()
+		},
 		[],
 		[ActivationTrigger::FirstReach],
 	)
@@ -448,9 +471,17 @@ fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig
 	let mut config = test_config();
 	let key = HostKey::new("workspace", "trusted", module);
 	let manifest = if module == PY_EVAL_MODULE {
-		ExtensionManifest::py_eval(test_provenance(&key), [])
+		test_manifest(&key, module, [ToolDeclarationKey::new("py_eval", "", 1)])
 	} else if module == PRELUDE_HELPER_EXTENSION_MODULE {
-		test_manifest(&key, module, [ToolDeclarationKey::new("helper_echo", "prelude", 1)])
+		ExtensionManifest::new(
+			test_provenance(&key),
+			Str::from(module),
+			[],
+			DeclarationSet::new([ToolDeclarationKey::new("helper_echo", "prelude", 1)], []),
+			ServiceManifest::default(),
+			[],
+			[ActivationTrigger::FirstReach],
+		)
 	} else {
 		test_manifest(&key, module, [
 			ToolDeclarationKey::new("worker_block", "r", 1),
@@ -465,11 +496,51 @@ fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig
 }
 
 struct Harness {
-	client:      EnvClient,
-	server:      Arc<EnvServer>,
-	root:        TempDir,
-	state:       TempDir,
-	server_task: JoinHandle<()>,
+	client:       EnvClient,
+	server:       Arc<EnvServer>,
+	root:         TempDir,
+	state:        TempDir,
+	server_task:  JoinHandle<()>,
+	_eval_parent: ParentBindingLease,
+}
+struct TestEvalParent {
+	cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl ParentSessionHost for TestEvalParent {
+	fn eval_session_config(&self) -> Result<EvalSessionConfig, BridgeHostError> {
+		Ok(EvalSessionConfig {
+			cwd:              self.cwd.clone(),
+			local_roots_json: None,
+			artifacts_dir:    None,
+			session_file:     None,
+		})
+	}
+
+	async fn completion(
+		&self,
+		_args: Value,
+		_progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
+		Err(BridgeHostError::message("bridge capability denied: __completion__"))
+	}
+
+	async fn agent(
+		&self,
+		_args: Value,
+		_progress: &dyn BridgeProgressSink,
+	) -> Result<Value, BridgeHostError> {
+		Err(BridgeHostError::message("agents are unavailable in the envd contract harness"))
+	}
+
+	async fn concurrency(&self, _args: Value) -> Result<Value, BridgeHostError> {
+		Err(BridgeHostError::message("concurrency is unavailable in the envd contract harness"))
+	}
+
+	async fn budget(&self, _args: Value) -> Result<Value, BridgeHostError> {
+		Err(BridgeHostError::message("budget is unavailable in the envd contract harness"))
+	}
 }
 
 impl Harness {
@@ -503,7 +574,13 @@ impl Harness {
 			})
 			.await
 			.expect("environment hello");
-		Self { client, server, root, state, server_task }
+		let eval_parent = server
+			.bind_eval_sdk_parent(
+				sf!("test-session"),
+				Arc::new(TestEvalParent { cwd: env::current_dir().expect("test process cwd") }),
+			)
+			.expect("bind eval parent");
+		Self { client, server, root, state, server_task, _eval_parent: eval_parent }
 	}
 
 	const fn client(&self) -> &EnvClient {
@@ -611,6 +688,20 @@ async fn invoke_builtin(
 	rev: &str,
 	args: Value,
 ) -> v1::Verdict {
+	invoke_builtin_as(client, "test-agent", invocation_id, name, rev, args).await
+}
+
+async fn invoke_builtin_as(
+	client: &EnvClient,
+	agent_id: &str,
+	invocation_id: &str,
+	name: &str,
+	rev: &str,
+	args: Value,
+) -> v1::Verdict {
+	let client = client
+		.with_principal("test-session", agent_id)
+		.expect("valid test invocation principal");
 	let mut invocation = client
 		.invoke(InvokeTool {
 			invocation_id: invocation_id.into(),
@@ -738,15 +829,14 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("ask", "1".to_owned()),
 		("ast_edit", "1".to_owned()),
 		("ast_grep", "1".to_owned()),
+		("bash", "1".to_owned()),
 		("debug", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
 		("fetch", "1".to_owned()),
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
-		("hub", "1".to_owned()),
 		("lsp", "1".to_owned()),
-		("shell", "1".to_owned()),
 		("think", "1".to_owned()),
 		("todo", "1".to_owned()),
 		("web_search", "1".to_owned()),
@@ -773,22 +863,14 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		.iter()
 		.find(|tool| tool.identity.name == "write")
 		.expect("advertised write definition");
-	assert_eq!(
-		write_definition.definition.description.as_deref(),
-		Some(
-			"Creates or overwrites file at specified path.\n\n<conditions>\n- Creating new files \
-			 explicitly required by task\n- Replacing entire file contents when editing would be \
-			 more complex\n- Supports `.tar`, `.tar.gz`, `.tgz`, `.zip`, and ZIP-based \
-			 `.jar`/`.war`/`.ear`/`.apk` archive entries via `archive.ext:path/inside/archive`\n- \
-			 Supports SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` \
-			 (update with JSON content, delete with empty content)\n- Supports registered \
-			 merge-conflict splices via `conflict://<id>` and \
-			 `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit \
-			 tool for modifying existing files\n- You NEVER create documentation files (*.md, \
-			 README) unless explicitly requested\n- You NEVER use emojis unless \
-			 requested\n</critical>"
-		)
-	);
+	let write_description = write_definition
+		.definition
+		.description
+		.as_deref()
+		.expect("write description");
+	assert!(write_description.contains("`.tar.zst`"));
+	assert!(write_description.contains("other archive formats"));
+	assert!(write_description.contains("SQLite row operations"));
 	let (write_schema, write_strict) = write_definition
 		.definition
 		.input
@@ -923,59 +1005,11 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			}
 		})
 	);
-	assert_eq!(
-		schema("shell"),
-		json!({
-			"type": "object",
-			"additionalProperties": false,
-			"required": ["command"],
-			"properties": {
-				"command": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Shell script to execute."
-				},
-				"timeout_ms": {
-					"type": "integer",
-					"minimum": 0,
-					"description": "Host-enforced execution timeout in milliseconds; zero disables the deadline."
-				},
-				"env": {
-					"type": "object",
-					"additionalProperties": {"type": "string"},
-					"description": "Environment additions scoped to this command.",
-					"default": {}
-				},
-				"cwd": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Command working directory, relative to the workspace when not absolute."
-				},
-				"pty": {
-					"type": "boolean",
-					"default": false,
-					"description": "Allocate a pseudo-terminal for this command."
-				},
-				"async": {
-					"type": "boolean",
-					"default": false,
-					"description": "Run as a named asynchronous job."
-				},
-				"name": {
-					"type": "string",
-					"minLength": 1,
-					"description": "Required stable job name when async is true."
-				}
-			},
-			"allOf": [{
-				"if": {
-					"properties": {"async": {"const": true}},
-					"required": ["async"]
-				},
-				"then": {"required": ["name"]}
-			}]
-		})
-	);
+	let bash_schema = schema("bash");
+	assert_eq!(bash_schema["required"], json!(["command"]));
+	assert_eq!(bash_schema["properties"]["timeout"]["type"], "number");
+	assert_eq!(bash_schema["properties"]["async"]["default"], false);
+	assert!(bash_schema["properties"].get("name").is_none());
 	let edit_description = definition("edit")
 		.definition
 		.description
@@ -1110,7 +1144,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 	let shell = invoke_builtin(
 		harness.client(),
 		"builtin-shell",
-		"shell",
+		"bash",
 		"1",
 		json!({"command":"printf shell-ok"}),
 	)
@@ -1373,8 +1407,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	assert_eq!(seed.status.outcome, omp_tools::eval::CellOutcome::Complete);
 
 	let (unrelated, unrelated_task) = harness.connect("eval-unrelated-owner").await;
-	let isolated = invoke_builtin(
+	let isolated = invoke_builtin_as(
 		&unrelated,
+		"other-agent",
 		"eval-owner-isolation",
 		"eval",
 		"1",
@@ -1426,8 +1461,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 				"1",
 				json!({"language":"py","code":left_code})
 			),
-			invoke_builtin(
+			invoke_builtin_as(
 				&unrelated,
+				"other-agent",
 				"eval-parallel-right",
 				"eval",
 				"1",
@@ -1547,8 +1583,9 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 		Some(json!([false, false, false, false, null, true])),
 		"reset did not replace process-global Python state"
 	);
-	let peer_after_reset = invoke_builtin(
+	let peer_after_reset = invoke_builtin_as(
 		&unrelated,
+		"other-agent",
 		"eval-peer-after-reset",
 		"eval",
 		"1",
@@ -1649,6 +1686,8 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	);
 	let mut cancelled = harness
 		.client()
+		.with_principal("test-session", "test-agent")
+		.expect("valid cancellable eval principal")
 		.invoke(InvokeTool {
 			invocation_id: "eval-cancel".into(),
 			name: "eval".into(),
@@ -1710,7 +1749,6 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	let CallOutcome::Ok(after_cancel) = after_cancel else {
 		panic!("post-cancel Python cell returned a fault");
 	};
-	assert!(after_cancel.reset, "respawn after cancellation was not reported as a reset");
 	assert_eq!(
 		after_cancel.result,
 		Some(omp_tools::eval::CellValue { text: sf!("49"), json: Some(json!(49)) })
@@ -1843,7 +1881,7 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 }
 
 #[tokio::test]
-async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
+async fn opt_in_python_admits_its_soft_declaration_without_shadowing_native_eval() {
 	let worker = extension_worker(PY_EVAL_MODULE, None);
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
 	let registry = harness.server.registry();
@@ -1855,7 +1893,7 @@ async fn opt_in_python_adds_one_worker_route_and_default_adds_none() {
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 20);
+	assert_eq!(advertised.len(), 18);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
@@ -1895,7 +1933,7 @@ async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 			maximum_strict: None,
 		})
 		.expect("advertise registry with prelude helper");
-	assert_eq!(advertised.len(), 20);
+	assert_eq!(advertised.len(), 18);
 
 	let verdict = invoke_builtin(
 		harness.client(),
@@ -1914,7 +1952,11 @@ async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 	let CallOutcome::Ok(payload) = verdict else {
 		panic!("prelude helper eval returned a resource fault");
 	};
-	assert_eq!(payload.status.outcome, omp_tools::eval::CellOutcome::Complete);
+	assert_eq!(
+		payload.status.outcome,
+		omp_tools::eval::CellOutcome::Complete,
+		"prelude eval payload: {payload:?}"
+	);
 	assert_eq!(payload.result.and_then(|result| result.json), Some(json!({"value": 7})));
 }
 

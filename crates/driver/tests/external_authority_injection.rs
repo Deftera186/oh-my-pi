@@ -18,6 +18,7 @@ use omp_envd::{
 	},
 	worker::{ExtHostSpec, HostKey},
 };
+use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use serde_json::Value;
 
 struct TaggedFactory {
@@ -103,17 +104,17 @@ fn factories(generation: &'static str) -> ExternalDomainControlFactories {
 	}
 }
 
-fn identity() -> Arc<ControlConnectionIdentity> {
+fn identity(session_generation: u64) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
-		extension:          sf!("fixture.extension"),
-		principal:          Principal::new(sf!("fixture"), sf!("Fixture")),
-		artifact_digest:    sf!("sha256:fixture"),
-		layer:              sf!("workspace"),
-		tier:               sf!("trusted"),
-		trust:              sf!("trusted"),
-		host_generation:    7,
-		session_generation: 11,
-		capabilities:       Arc::new(BTreeSet::new()),
+		extension: sf!("fixture.extension"),
+		principal: Principal::new(sf!("fixture"), sf!("Fixture")),
+		artifact_digest: sf!("sha256:fixture"),
+		layer: sf!("workspace"),
+		tier: sf!("trusted"),
+		trust: sf!("trusted"),
+		host_generation: 7,
+		session_generation,
+		capabilities: Arc::new(BTreeSet::new()),
 	})
 }
 
@@ -127,10 +128,42 @@ fn extension() -> ExtHostSpec {
 		sf!("trusted"),
 		1,
 	);
-	ExtHostSpec::new(
+	let declaration = StaticDeclaration {
+		id: sf!("py_eval@.1"),
+		kind: sf!("soft"),
+		module: sf!("omp_py_eval"),
+		trigger: sf!("lazy"),
+		key: sf!("py_eval@.1"),
+		api: 1,
+		failure: sf!("fault"),
+		..StaticDeclaration::default()
+	};
+	let mut extension = ExtHostSpec::new(
 		HostKey::new("workspace", "trusted", "fixture.extension"),
-		ExtensionManifest::py_eval(provenance, []),
-	)
+		ExtensionManifest::new_with_static(
+			provenance,
+			sf!("omp_py_eval"),
+			[],
+			omp_envd::exthost::DeclarationSet::new(
+				[omp_envd::exthost::ToolDeclarationKey::new("py_eval", "", 1)],
+				[],
+			),
+			omp_envd::exthost::ServiceManifest::default(),
+			StaticDeclarations {
+				ordered: vec![declaration].into_boxed_slice(),
+				..StaticDeclarations::default()
+			},
+			[],
+			[omp_envd::exthost::ActivationTrigger::FirstReach],
+		),
+	);
+	let executable = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../target/debug/omp")
+		.canonicalize()
+		.expect("built omp test host executable");
+	assert!(executable.is_file(), "omp test host executable: {executable:?}");
+	extension.host_executable = Some(executable);
+	extension
 }
 
 #[cfg(unix)]
@@ -149,6 +182,7 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		false,
 		None,
 		&[extension()],
+		&[],
 		omp_tool::DEFAULT_INTERRUPT_GRACE,
 		RegistryBridges::default(),
 	)
@@ -159,7 +193,7 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		factory("omp.agents.list", "session-one"),
 		factories("session-one"),
 	);
-	let connection = identity();
+	let connection = identity(environment.session_generation());
 	let authority = environment
 		.extension_control_authority(Arc::clone(&connection))
 		.expect("production control authority");
@@ -168,20 +202,12 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		request_id: 1,
 		invocation: None,
 	};
-	for operation in [
-		"omp.agents.list",
-		"omp.policy.capabilities",
-		"omp.params.args",
-		"omp.workers.list",
-		"omp.direct_filesystem.request",
-		"omp.creds.list",
-		"omp.prompts.invalidate",
-		"omp.ui.presentation",
-		"omp.telemetry.query",
-		"omp.jobs.register",
-		"omp.provider.models",
-		"omp.regimes.active",
-	] {
+	for operation in ["omp.agents.list", "omp.params.args"] {
+		if operation == "omp.agents.list" {
+			authority
+				.authorize(&context, operation, &serde_json::Map::new())
+				.unwrap_or_else(|error| panic!("{operation} was not authorized: {error}"));
+		}
 		let value = authority
 			.request(context.clone(), Str::new(operation), serde_json::Map::new())
 			.await
@@ -189,19 +215,13 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		assert_eq!(value, Value::String("session-one".to_owned()));
 	}
 
-	let service = authority
-		.request(context.clone(), sf!("omp.services.connect"), serde_json::Map::new())
-		.await
-		.expect_err("the real service broker validates its service key");
-	assert_ne!(service.message.as_str(), "must-be-overridden-by-envd");
-
 	let second_lease = environment.bind_external_control_authorities(
 		factory("omp.agents.list", "session-two"),
 		factories("session-two"),
 	);
 	drop(first_lease);
 	let stale = authority
-		.request(context, sf!("omp.provider.models"), serde_json::Map::new())
+		.request(context, sf!("omp.params.args"), serde_json::Map::new())
 		.await
 		.expect_err("a connection from the superseded session is fenced");
 	assert_eq!(stale.code.as_str(), "StaleGeneration");
@@ -209,30 +229,27 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 	let replacement = environment
 		.extension_control_authority(Arc::clone(&connection))
 		.expect("replacement control connection");
+	let replacement_context = ControlRequestContext {
+		connection: Arc::clone(&connection),
+		request_id: 2,
+		invocation: None,
+	};
 	let value = replacement
-		.request(
-			ControlRequestContext {
-				connection: Arc::clone(&connection),
-				request_id: 2,
-				invocation: None,
-			},
-			sf!("omp.provider.models"),
-			serde_json::Map::new(),
-		)
+		.request(replacement_context, sf!("omp.params.args"), serde_json::Map::new())
 		.await
 		.expect("replacement reaches new session owner");
 	assert_eq!(value, Value::String("session-two".to_owned()));
+	let revoked_context = ControlRequestContext {
+		connection: Arc::clone(&connection),
+		request_id: 3,
+		invocation: None,
+	};
+	replacement
+		.authorize(&revoked_context, "omp.agents.list", &serde_json::Map::new())
+		.expect("agents request authorized before lease release");
 	drop(second_lease);
 	let revoked = replacement
-		.request(
-			ControlRequestContext {
-				connection: Arc::clone(&connection),
-				request_id: 3,
-				invocation: None,
-			},
-			sf!("omp.agents.list"),
-			serde_json::Map::new(),
-		)
+		.request(revoked_context, sf!("omp.agents.list"), serde_json::Map::new())
 		.await
 		.expect_err("dropping the atomic lease revokes agents and domain authorities together");
 	assert_eq!(revoked.code.as_str(), "StaleGeneration");

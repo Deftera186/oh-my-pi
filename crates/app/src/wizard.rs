@@ -66,7 +66,6 @@ enum AuthLocation {
 /// completed inside this retained terminal host before it is dropped.
 #[expect(clippy::future_not_send, reason = "the setup wizard owns a thread-confined omp_tui::App")]
 pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<Str>> {
-	let executor = omp_executor::Executor::new(None);
 	fs::create_dir_all(data_dir).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
 		.into_diagnostic()?;
@@ -80,7 +79,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 	let mut app = AppOptions::new()
 		.hold_alt()
 		.keep_on_cancel()
-		.start(executor, |env: omp_tui::AppEnv| {
+		.start(|env: omp_tui::AppEnv| {
 			Ui::from_root(
 				Shader::new(Eclipse::default()).size(env.viewport.width, env.viewport.height),
 				env.viewport.width,
@@ -177,17 +176,27 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(AppEvent::Changed { id, value })
 					if id.as_str() == MODEL_SELECT_ID && step == Step::Model =>
 				{
-					omp_settings::manager::SettingsManager::open(
+					let manager = omp_settings::manager::SettingsManager::open(
 						omp_settings::manager::SettingsPaths::discover(data_dir, None),
 					)
-					.into_diagnostic()?
-					.set(
-						omp_settings::manager::MutationScope::Global,
-						"default_model",
-						value.as_str(),
-					)
-					.await
 					.into_diagnostic()?;
+					let mut roles = manager
+						.snapshot()
+						.project::<omp_catalog::settings::ModelSettings>()
+						.into_diagnostic()?
+						.get()
+						.roles
+						.clone();
+					roles.insert(Str::new_static("default"), value.clone());
+					let encoded = serde_json::to_string(&roles).into_diagnostic()?;
+					manager
+						.set(
+							omp_settings::manager::MutationScope::Global,
+							"model.roles",
+							&encoded,
+						)
+						.await
+						.into_diagnostic()?;
 					break 'wizard Some(value);
 				},
 				Some(AppEvent::OverlayClosed(_)) => match step {

@@ -6,7 +6,6 @@ use miette::miette;
 use omp_agent::{AgentEvent, TtsrRegistry, TtsrRule, TtsrSettings};
 use omp_core::{Str, sf};
 use omp_envd::eval::{NoopBridgeProgress, ParentSessionHost};
-use omp_executor::Executor;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -127,7 +126,6 @@ pub(crate) fn spawn_tan(
 }
 
 pub(crate) async fn forge_ttsr(
-	executor: &Executor,
 	parent: &dyn ParentSessionHost,
 	workspace_root: PathBuf,
 	instruction: &str,
@@ -211,17 +209,17 @@ pub(crate) async fn forge_ttsr(
 		.join("rules")
 		.join(format!("{name}.md"));
 	let written = target.clone();
-	executor
-		.unblock(move || -> miette::Result<()> {
-			let Some(directory) = written.parent() else {
-				return Err(miette!("generated TTSR rule path has no parent"));
-			};
-			fs::create_dir_all(directory)
-				.map_err(|error| miette!("could not create {}: {error}", directory.display()))?;
-			fs::write(&written, content)
-				.map_err(|error| miette!("could not write {}: {error}", written.display()))
-		})
-		.await?;
+	tokio::task::spawn_blocking(move || -> miette::Result<()> {
+		let Some(directory) = written.parent() else {
+			return Err(miette!("generated TTSR rule path has no parent"));
+		};
+		fs::create_dir_all(directory)
+			.map_err(|error| miette!("could not create {}: {error}", directory.display()))?;
+		fs::write(&written, content)
+			.map_err(|error| miette!("could not write {}: {error}", written.display()))
+	})
+	.await
+	.map_err(|error| miette!("TTSR rule write task failed: {error}"))??;
 	Ok(target)
 }
 

@@ -1,4 +1,5 @@
-//! OMP-v1 room-link formatting, parsing, and endpoint validation.
+//! Revision-3 browser-compatible room-link formatting, parsing, and endpoint
+//! validation.
 
 use std::fmt;
 
@@ -11,11 +12,10 @@ use crate::crypto::{
 	CryptoError, ROOM_ID_BYTES, ROOM_KEY_BYTES, RoomId, RoomKey, WRITE_TOKEN_BYTES, WriteToken,
 };
 
-/// Public OMP-v1 relay used by compact bare links.
+/// Public collaboration relay used by compact bare links.
 pub const DEFAULT_RELAY_URL: &str = "wss://my.omp.sh";
-/// OMP-v1 room route. The revision-bearing path prevents accidental pi relay
-/// interoperability.
-pub const ROOM_PATH_PREFIX: &str = "/v1/r/";
+/// Browser and native collaboration room route.
+pub const ROOM_PATH_PREFIX: &str = "/r/";
 const OSC8_OPEN: &str = "\x1b]8;;";
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 const STRING_TERMINATOR: &str = "\x1b\\";
@@ -35,7 +35,7 @@ pub struct TerminalJoinPresentation {
 	pub min_columns: usize,
 }
 
-/// A query-free native OMP collaboration relay origin.
+/// A query-free collaboration relay origin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayEndpoint(Url);
 
@@ -63,7 +63,7 @@ impl RelayEndpoint {
 		&self.0
 	}
 
-	/// Returns the room-specific OMP-v1 WebSocket endpoint.
+	/// Returns the room-specific WebSocket endpoint.
 	pub fn room_url(&self, room_id: &RoomId) -> Url {
 		let mut url = self.0.clone();
 		url.set_path(&format!("{ROOM_PATH_PREFIX}{}", encode_room_id(room_id)));
@@ -182,7 +182,7 @@ impl fmt::Debug for LinkCredentials {
 	}
 }
 
-/// Parsed native OMP-v1 collaboration room link.
+/// Parsed native collaboration room link.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollabLink {
 	relay:       RelayEndpoint,
@@ -239,7 +239,7 @@ impl CollabLink {
 		&self.credentials
 	}
 
-	/// Returns the exact OMP-v1 WebSocket room endpoint.
+	/// Returns the exact WebSocket room endpoint.
 	pub fn room_url(&self) -> Url {
 		self.relay.room_url(&self.room_id)
 	}
@@ -302,7 +302,7 @@ impl CollabLink {
 	}
 
 	/// Parses compact, relay, legacy-hash, percent-mangled, scheme-less, and
-	/// nested browser forms without accepting a non-v1 room route.
+	/// nested browser forms.
 	pub fn parse(input: &str) -> Result<Self, LinkError> {
 		parse_inner(input, 0)
 	}
@@ -489,7 +489,7 @@ pub enum TerminalLinkError {
 	Qr(#[from] qrcode::types::QrError),
 }
 
-/// Invalid OMP-v1 collaboration room link.
+/// Invalid collaboration room link.
 #[derive(Debug, Error)]
 pub enum LinkError {
 	/// URL syntax was invalid.
@@ -501,8 +501,8 @@ pub enum LinkError {
 	/// A nested deep link exceeded the normalization bound.
 	#[error("collaboration link nesting is too deep")]
 	Nested,
-	/// Only the OMP-v1 route is accepted.
-	#[error("collaboration link must contain an OMP-v1 /v1/r/<room> route")]
+	/// Only the route is accepted.
+	#[error("collaboration link must contain a /r/<room> route")]
 	RoomPath,
 	/// The room route omitted credentials.
 	#[error("collaboration link is missing credentials")]
@@ -581,12 +581,10 @@ mod tests {
 	}
 
 	#[test]
-	fn parser_refuses_pi_room_route() {
-		let secret = link(false).credentials.encoded();
-		assert!(matches!(
-			CollabLink::parse(&format!("wss://relay.example/r/room.{secret}")),
-			Err(LinkError::RoomPath)
-		));
+	fn parser_accepts_collab_web_room_route() {
+		let original = link(false);
+		assert_eq!(original.room_url().path(), format!("/r/{}", encode_room_id(original.room_id())));
+		assert_eq!(CollabLink::parse(&original.compact()).expect("collab-web route"), original);
 	}
 	#[test]
 	fn terminal_join_is_scannable_and_osc8_linked() {

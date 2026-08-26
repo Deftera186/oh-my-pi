@@ -1,7 +1,8 @@
 //! Disk-free hashline and replace engines over immutable exact-byte snapshots.
 //!
-//! Parsing, application, stale recovery, and fuzzy replacement produce
-//! canonical byte edits for a caller-owned transaction coordinator.
+//! Parsing, application, stale recovery, and fuzzy replacement produce exact
+//! byte edits for a caller-owned transaction coordinator. Anchor-scoped
+//! hashline edits preserve authored source identity through stale recovery.
 
 /// Exact-byte hashline application.
 pub mod apply;
@@ -46,6 +47,7 @@ pub mod unified_hunk;
 
 pub use apply::{
 	ApplyError, ApplyMode, ApplyOptions, ApplyResult, ByteEdit, apply_edits, apply_parsed_patch,
+	is_head_tail_only,
 };
 pub use clipboard::Clipboard;
 pub use diff_preview::{NumberedDiff, numbered_diff};

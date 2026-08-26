@@ -517,6 +517,7 @@ struct Worker {
 	generation: u64,
 	running:    bool,
 	stopped:    bool,
+	job_id:     Option<Str>,
 	outcome:    Option<WorkerOutcome>,
 	notify:     Arc<Notify>,
 }
@@ -591,6 +592,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				generation: 1,
 				running:    true,
 				stopped:    false,
+				job_id:     None,
 				outcome:    None,
 				notify:     Arc::new(Notify::new()),
 			});
@@ -639,6 +641,16 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 		{
 			return Err(Fault::new("vibe job identifier collision"));
 		}
+		{
+			let mut workers = self.workers.lock();
+			let Some(worker) = workers.get_mut(&id) else {
+				return Err(Fault::new("vibe worker disappeared before launch"));
+			};
+			if worker.generation != generation || !worker.running {
+				return Err(Fault::new("vibe worker generation changed before launch"));
+			}
+			worker.job_id = Some(job_id.clone());
+		}
 		let parent = Arc::clone(&self.parent);
 		let workers = Arc::clone(&self.workers);
 		let monitor = Arc::clone(&self.monitor);
@@ -664,21 +676,26 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 				Err(error) => WorkerOutcome::Failed(Str::from(error.to_string())),
 			};
 			let delivery = delivery_text(&id, &outcome);
+			let mut workers = workers.lock();
+			let Some(worker) = workers.get_mut(&id) else {
+				drop(workers);
+				let _ = board.settle(job_id.as_str(), system_item(delivery));
+				return;
+			};
+			if !completion_is_current(worker, generation, &job_id) {
+				drop(workers);
+				let _ = board.settle(job_id.as_str(), system_item(delivery));
+				return;
+			}
 			{
 				let mut monitor = monitor.lock();
 				monitor.push_output(id.as_str(), delivery.as_str());
 				monitor.settle(id.as_str(), matches!(outcome, WorkerOutcome::Failed(_)));
 			}
 			let _ = board.settle(job_id.as_str(), system_item(delivery));
-			let mut workers = workers.lock();
-			let Some(worker) = workers.get_mut(&id) else {
-				return;
-			};
-			if worker.generation != generation {
-				return;
-			}
 			worker.running = false;
 			worker.stopped = false;
+			worker.job_id = None;
 			worker.outcome = Some(outcome);
 			worker.notify.notify_waiters();
 		}));
@@ -859,9 +876,22 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 			worker.generation = worker.generation.saturating_add(1);
 			worker.running = false;
 			worker.stopped = true;
+			let job_id = worker.job_id.take();
 			worker.outcome = None;
 			worker.notify.notify_waiters();
 			drop(workers);
+			if let Some(job_id) = job_id {
+				let board = self
+					.parent
+					.job_board()
+					.ok_or_else(|| Fault::new("vibe job manager disappeared during stop"))?;
+				let mut watch = board.watch(Some(std::slice::from_ref(&job_id)));
+				drop(tokio::spawn(async move {
+					if let Some(settlement) = watch.next().await {
+						let _ = settlement.lease.claim();
+					}
+				}));
+			}
 			self.parent.cancel_child(id.as_str());
 			if let Some(node) = tree.node(id.as_str()) {
 				node.set_status(AgentStatus::Cancelled);
@@ -898,6 +928,9 @@ fn delivery_text(id: &str, outcome: &WorkerOutcome) -> Str {
 		preview.push_str("\n[preview truncated]");
 	}
 	Str::from(format!("Vibe worker {id} {status}:\n{preview}\n\nFull output: agent://{id}"))
+}
+fn completion_is_current(worker: &Worker, generation: u64, job_id: &Str) -> bool {
+	worker.generation == generation && worker.job_id.as_ref() == Some(job_id)
 }
 
 fn valid_worker_name(name: &str) -> bool {
@@ -1018,5 +1051,21 @@ mod tests {
 		let steer: Params =
 			serde_json::from_value(json!({ "op": "steer", "id": "worker" })).expect("shape");
 		assert!(steer.validate().is_err());
+	}
+
+	#[test]
+	fn stale_vibe_generation_cannot_publish_its_job() {
+		let job_id = sf!("job-1");
+		let worker = Worker {
+			label:      sf!("worker"),
+			tier:       WorkerTier::Fast,
+			generation: 2,
+			running:    false,
+			stopped:    true,
+			job_id:     None,
+			outcome:    None,
+			notify:     Arc::new(Notify::new()),
+		};
+		assert!(!completion_is_current(&worker, 1, &job_id));
 	}
 }

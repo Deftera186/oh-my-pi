@@ -338,6 +338,7 @@ impl ActorLibei {
 						MouseButton::Middle => 0x112,
 					};
 					for _ in 0..count.max(1) {
+						crate::operation_checkpoint()?;
 						button_interface.button(code, ButtonState::Press);
 						device.device.device().frame(device.serial, time);
 						time = time.saturating_add(1);
@@ -372,6 +373,7 @@ impl ActorLibei {
 					device.device.device().frame(device.serial, time);
 					time = time.saturating_add(1);
 					for &(x, y) in path.iter().skip(1) {
+						crate::operation_checkpoint()?;
 						Self::move_absolute(device, x, y, time)?;
 						time = time.saturating_add(1);
 					}

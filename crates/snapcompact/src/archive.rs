@@ -356,7 +356,8 @@ pub struct SavingsRecord {
 pub struct Archive {
 	/// Oldest-to-newest rendered frames.
 	pub frames:          Vec<Frame>,
-	/// Characters dropped from the oldest side after hitting a hard budget.
+	/// Characters omitted from provider-visible frames. Successful archives are
+	/// lossless and therefore always record zero.
 	pub truncated_chars: usize,
 	/// Measured savings used for admission.
 	pub savings:         SavingsRecord,
@@ -368,6 +369,21 @@ pub enum ArchiveError {
 	/// The bitmap renderer rejected a frame.
 	#[error(transparent)]
 	Renderer(#[from] SnapcompactError),
+	/// The provider has no remaining image slots for a lossless archive.
+	#[error("snapcompact provider image budget has no remaining frame")]
+	NoFrameBudget,
+	/// Lossless pagination requires more frames than the provider admits.
+	#[error("snapcompact history exceeds the {maximum}-frame provider budget")]
+	FrameBudgetExceeded {
+		/// Maximum provider-visible frames available to this archive.
+		maximum: usize,
+	},
+	/// Lossless PNG publication would exceed the request byte budget.
+	#[error("snapcompact frames exceed the {maximum_bytes}-byte request budget")]
+	DataBudgetExceeded {
+		/// Maximum aggregate encoded frame bytes.
+		maximum_bytes: usize,
+	},
 	/// Image input would not save the required ten-percent margin.
 	#[error(
 		"snapcompact image cost {image_tokens} tokens exceeds the {maximum_tokens}-token admission \
@@ -500,7 +516,7 @@ fn take_frame_end(
 	for (offset, ch) in text[start..].char_indices() {
 		let units = cell_units(ch as u32, wide_cells);
 		let row_offset = cells % cols;
-		let pad = usize::from(units == 2 && row_offset + units > capacity);
+		let pad = usize::from(units == 2 && cols >= 2 && row_offset == cols - 1);
 		if chars != 0 && cells.saturating_add(pad).saturating_add(units) > capacity {
 			break;
 		}
@@ -528,32 +544,45 @@ pub fn render_archive(
 	let text = text.as_ref();
 	let shape = resolve_shape(target);
 	let max_frames = provider_frame_budget(provider, existing_images);
+	if max_frames == 0 {
+		return Err(ArchiveError::NoFrameBudget);
+	}
 	let (capacity, cols, rows) = frame_capacity(shape);
-	let mut frames = Vec::with_capacity(max_frames.min(16));
+	let mut pages = Vec::with_capacity(max_frames.min(16));
 	let mut cursor = 0usize;
-	let mut png_bytes = 0usize;
-	while cursor < text.len() && frames.len() < max_frames {
+	while cursor < text.len() {
+		if pages.len() == max_frames {
+			return Err(ArchiveError::FrameBudgetExceeded { maximum: max_frames });
+		}
 		let (end, chars) =
 			take_frame_end(text, cursor, capacity, cols as usize, shape.font != "silver");
 		if end == cursor {
-			break;
+			return Err(ArchiveError::NoFrameBudget);
 		}
-		let png = render_snapcompact_png(&text[cursor..end], &shape_options(shape))?;
-		if png_bytes.saturating_add(png.len()) > FRAME_DATA_BYTES_BUDGET {
-			break;
-		}
-		png_bytes += png.len();
-		frames.push(Frame { png, cols, rows, chars, shape });
+		pages.push((cursor, end, chars));
 		cursor = end;
+	}
+	if pages.is_empty() {
+		return Err(ArchiveError::NoFrameBudget);
 	}
 	let image_tokens = shape
 		.frame_token_estimate
-		.saturating_mul(frames.len() as u64);
+		.saturating_mul(pages.len() as u64);
 	let maximum_tokens = (source_tokens as f64 * SAVINGS_MARGIN).floor() as u64;
 	if image_tokens > maximum_tokens {
 		return Err(ArchiveError::InsufficientSavings { image_tokens, maximum_tokens });
 	}
-	let truncated_chars = text[cursor..].chars().count();
+	let mut frames = Vec::with_capacity(pages.len());
+	let mut png_bytes = 0usize;
+	for (start, end, chars) in pages {
+		let png = render_snapcompact_png(&text[start..end], &shape_options(shape))?;
+		if png_bytes.saturating_add(png.len()) > FRAME_DATA_BYTES_BUDGET {
+			return Err(ArchiveError::DataBudgetExceeded { maximum_bytes: FRAME_DATA_BYTES_BUDGET });
+		}
+		png_bytes += png.len();
+		frames.push(Frame { png, cols, rows, chars, shape });
+	}
+	let truncated_chars = 0;
 	let ratio = if source_tokens == 0 {
 		0.0
 	} else {
@@ -604,5 +633,32 @@ mod tests {
 		assert_eq!(provider_frame_budget(Some("unknown-gateway"), 0), 5);
 		assert_eq!(provider_frame_budget(Some("umans"), 7), 3);
 		assert_eq!(provider_frame_budget(Some("openai"), 0), 17);
+	}
+	#[test]
+	fn cjk_row_straddles_start_on_the_next_frame_row_without_loss() {
+		let text = "aaa界z";
+		let (first_end, first_chars) = take_frame_end(text, 0, 4, 4, true);
+		assert_eq!((&text[..first_end], first_chars), ("aaa", 3));
+		let (second_end, second_chars) = take_frame_end(text, first_end, 4, 4, true);
+		assert_eq!((&text[first_end..second_end], second_chars), ("界z", 2));
+		assert_eq!(second_end, text.len());
+	}
+
+	#[test]
+	fn exhausted_provider_budget_cannot_publish_an_empty_archive() {
+		assert!(matches!(
+			render_archive("durable history", 10_000, ShapeTarget::default(), Some("unknown"), 5),
+			Err(ArchiveError::NoFrameBudget)
+		));
+	}
+	#[test]
+	fn frame_limit_rejects_instead_of_dropping_recent_history() {
+		let shape = resolve_shape(ShapeTarget::default());
+		let (capacity, ..) = frame_capacity(shape);
+		let text = "x".repeat(capacity.saturating_mul(6));
+		assert!(matches!(
+			render_archive(&text, u64::MAX, ShapeTarget::default(), Some("unknown"), 0),
+			Err(ArchiveError::FrameBudgetExceeded { maximum: 5 })
+		));
 	}
 }

@@ -161,15 +161,13 @@ pub fn commit_generation(
 	generation: &Generation,
 ) -> Result<PathBuf, ExtensionError> {
 	generation.lock.validate_for(generation.lock.layer)?;
-	if generation_id.is_empty() || generation_id.contains('/') || generation_id.contains('\\') {
-		return Err(ExtensionError::new(ExtensionCode::EIntegrity, "invalid generation id"));
-	}
-	let stage = generation_root.join(format!("{generation_id}.staging"));
-	let committed = generation_root.join(generation_id);
-	if stage.exists() {
-		fs::remove_dir_all(&stage).map_err(integrity)?;
-	}
-	fs::create_dir_all(&stage).map_err(integrity)?;
+	validate_generation_id(generation_id)?;
+	fs::create_dir_all(generation_root).map_err(integrity)?;
+	let stage_id = format!("{generation_id}.staging");
+	let stage = contained_generation_path(generation_root, &stage_id, false)?;
+	let committed = contained_generation_path(generation_root, generation_id, false)?;
+	remove_contained_directory(generation_root, &stage)?;
+	fs::create_dir(&stage).map_err(integrity)?;
 	generation
 		.lock
 		.write(&stage.join("omp.lock"))
@@ -178,9 +176,7 @@ pub fn commit_generation(
 		.installed
 		.write(&stage.join("installed.toml"))
 		.map_err(integrity)?;
-	if committed.exists() {
-		fs::remove_dir_all(&committed).map_err(integrity)?;
-	}
+	remove_contained_directory(generation_root, &committed)?;
 	fs::rename(&stage, &committed).map_err(integrity)?;
 
 	let old_lock = fs::read(lock_path).ok();
@@ -202,7 +198,8 @@ pub fn load_generation(
 	generation_id: &str,
 	layer: Layer,
 ) -> Result<Generation, ExtensionError> {
-	let root = generation_root.join(generation_id);
+	validate_generation_id(generation_id)?;
+	let root = contained_generation_path(generation_root, generation_id, true)?;
 	Ok(Generation {
 		lock:      LockFile::read(&root.join("omp.lock"), layer)?,
 		installed: InstalledRecord::read(&root.join("installed.toml"))?,
@@ -260,6 +257,74 @@ fn directory_bytes(root: &Path) -> Result<u64, ExtensionError> {
 	Ok(total)
 }
 
+fn validate_generation_id(generation_id: &str) -> Result<(), ExtensionError> {
+	if generation_id.is_empty()
+		|| matches!(generation_id, "." | "..")
+		|| generation_id.len() > 128
+		|| !generation_id
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+	{
+		return Err(ExtensionError::new(ExtensionCode::EIntegrity, "invalid generation id"));
+	}
+	Ok(())
+}
+
+fn contained_generation_path(
+	generation_root: &Path,
+	generation_id: &str,
+	must_exist: bool,
+) -> Result<PathBuf, ExtensionError> {
+	validate_generation_id(generation_id)?;
+	let canonical_root = generation_root.canonicalize().map_err(integrity)?;
+	let candidate = canonical_root.join(generation_id);
+	if must_exist {
+		let metadata = fs::symlink_metadata(&candidate).map_err(integrity)?;
+		if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+			return Err(ExtensionError::new(
+				ExtensionCode::EIntegrity,
+				"generation is not an owned directory",
+			));
+		}
+		let canonical_candidate = candidate.canonicalize().map_err(integrity)?;
+		if canonical_candidate.parent() != Some(canonical_root.as_path()) {
+			return Err(ExtensionError::new(
+				ExtensionCode::EIntegrity,
+				"generation escapes the generation root",
+			));
+		}
+		return Ok(canonical_candidate);
+	}
+	if candidate.parent() != Some(canonical_root.as_path()) {
+		return Err(ExtensionError::new(
+			ExtensionCode::EIntegrity,
+			"generation escapes the generation root",
+		));
+	}
+	Ok(candidate)
+}
+
+fn remove_contained_directory(generation_root: &Path, path: &Path) -> Result<(), ExtensionError> {
+	let Ok(metadata) = fs::symlink_metadata(path) else {
+		return Ok(());
+	};
+	if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+		return Err(ExtensionError::new(
+			ExtensionCode::EIntegrity,
+			"generation cache entry is not an owned directory",
+		));
+	}
+	let canonical_root = generation_root.canonicalize().map_err(integrity)?;
+	let canonical_path = path.canonicalize().map_err(integrity)?;
+	if canonical_path.parent() != Some(canonical_root.as_path()) {
+		return Err(ExtensionError::new(
+			ExtensionCode::EIntegrity,
+			"generation cache entry escapes the generation root",
+		));
+	}
+	fs::remove_dir_all(canonical_path).map_err(integrity)
+}
+
 fn restore(path: &Path, bytes: Option<&[u8]>) {
 	match bytes {
 		Some(bytes) => {
@@ -273,4 +338,35 @@ fn restore(path: &Path, bytes: Option<&[u8]>) {
 
 fn integrity(error: io::Error) -> ExtensionError {
 	ExtensionError::new(ExtensionCode::EIntegrity, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn generation_ids_are_single_safe_components() {
+		for invalid in ["", ".", "..", "../outside", "a/b", "a\\b", "white space"] {
+			assert!(validate_generation_id(invalid).is_err(), "{invalid:?}");
+		}
+		for valid in ["01J6FZB5QNF3J1XW7TG6QY7A4V", "plugin-1.2.3", "rollback_2"] {
+			assert!(validate_generation_id(valid).is_ok(), "{valid:?}");
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn generation_load_rejects_symlink_escape() {
+		use std::os::unix::fs::symlink;
+
+		let temporary = tempfile::tempdir().unwrap();
+		let root = temporary.path().join("generations");
+		let outside = temporary.path().join("outside");
+		fs::create_dir_all(&root).unwrap();
+		fs::create_dir_all(&outside).unwrap();
+		symlink(&outside, root.join("escaped")).unwrap();
+
+		let error = load_generation(&root, "escaped", Layer::Client).unwrap_err();
+		assert_eq!(error.code, ExtensionCode::EIntegrity);
+	}
 }

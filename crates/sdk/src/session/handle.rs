@@ -5,8 +5,8 @@ use std::{error, future::Future, path::PathBuf, pin::Pin, sync, sync::Arc, time,
 use flume::Receiver;
 use omp_agent::{
 	AbortHandle, ActivationId, Agent, AgentError, AgentEvent, AgentRunSummary, EventSubscription,
-	ManualCompactionOutcome, ManualCompactionRequest, Regime, RegimeRecord, RegimeSpec,
-	StartOptions, StartReceipt, TurnClient, TurnId,
+	ManualCompactionOutcome, ManualCompactionRequest, PromptError, PromptPatchSet, Props, Regime,
+	RegimeRecord, RegimeSpec, StartOptions, StartReceipt, TurnClient, TurnId,
 };
 use omp_core::Str;
 use omp_proto::thread::v1::Item;
@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::{runtime, sync::watch};
 
 use super::SessionDiagnostics;
-use crate::CallbackSet;
+use crate::{ProtocolResolution, RuntimeCallbacks, UiContextUpdate};
 
 /// Stable durable identity retained when a live loop is disposed or parked.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,10 +41,22 @@ impl SessionIdentity {
 }
 
 /// Non-secret request passed to an application-owned cold-revival factory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct SessionRevivalRequest {
 	/// Stable durable session identity.
-	pub identity: SessionIdentity,
+	pub identity:  SessionIdentity,
+	/// Complete session-bound callback authority that the reconstructed runtime
+	/// must reinstall before accepting work.
+	pub callbacks: RuntimeCallbacks,
+}
+
+impl std::fmt::Debug for SessionRevivalRequest {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("SessionRevivalRequest")
+			.field("identity", &self.identity)
+			.finish_non_exhaustive()
+	}
 }
 
 /// Typed failure returned by a cold-revival factory.
@@ -162,6 +174,7 @@ type StopRegimeFuture<'a> =
 	Pin<Box<dyn Future<Output = Result<(bool, Vec<RegimeRecord>), AgentError>> + Send + 'a>>;
 
 trait RuntimeDriver: Send {
+	fn install_callbacks(&mut self, callbacks: &RuntimeCallbacks);
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a>;
 	fn retry<'a>(&'a mut self, turn_id: TurnId) -> RetryFuture<'a>;
 	fn compact<'a>(&'a mut self, request: ManualCompactionRequest) -> CompactFuture<'a>;
@@ -180,6 +193,10 @@ struct AgentRuntime<C: TurnClient + Clone + Send + 'static> {
 }
 
 impl<C: TurnClient + Clone + Send + 'static> RuntimeDriver for AgentRuntime<C> {
+	fn install_callbacks(&mut self, callbacks: &RuntimeCallbacks) {
+		callbacks.configure_agent(&mut self.agent);
+	}
+
 	fn submit<'a>(&'a mut self, items: Vec<Item>, turn_id: TurnId) -> SubmitFuture<'a> {
 		Box::pin(self.agent.submit(items, turn_id))
 	}
@@ -230,6 +247,10 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+	fn install_callbacks(&mut self, callbacks: &RuntimeCallbacks) {
+		self.driver.install_callbacks(callbacks);
+	}
+
 	/// Takes ownership of one fully composed native agent loop.
 	pub fn from_agent<C>(agent: Agent<C>) -> Self
 	where
@@ -292,7 +313,7 @@ enum Command {
 struct HandleInner {
 	identity:    SessionIdentity,
 	diagnostics: SessionDiagnostics,
-	callbacks:   CallbackSet,
+	callbacks:   RuntimeCallbacks,
 	commands:    flume::Sender<Command>,
 	abort:       Mutex<Option<AbortHandle>>,
 	lifecycle:   watch::Sender<SessionLifecycle>,
@@ -318,12 +339,15 @@ impl SessionHandle {
 	pub(crate) fn launch(
 		identity: SessionIdentity,
 		diagnostics: SessionDiagnostics,
-		callbacks: CallbackSet,
-		runtime: Option<SessionRuntime>,
+		callbacks: RuntimeCallbacks,
+		mut runtime: Option<SessionRuntime>,
 		revival: Option<SessionRevivalFactory>,
 		constructed_at: Instant,
 		firehose: Option<Arc<Firehose>>,
 	) -> Result<Self, SessionHandleError> {
+		if let Some(runtime) = runtime.as_mut() {
+			runtime.install_callbacks(&callbacks);
+		}
 		let initial = if runtime.is_some() {
 			SessionLifecycle::Ready
 		} else {
@@ -358,27 +382,54 @@ impl SessionHandle {
 		&self.inner.diagnostics
 	}
 
+	/// Returns the complete callback authority installed for this session.
+	pub fn runtime_callbacks(&self) -> &RuntimeCallbacks {
+		&self.inner.callbacks
+	}
+
 	/// Publishes a host-owned typed event through the handle fan-out.
 	pub fn publish(&self, event: AgentEvent) {
-		for callback in &self.inner.callbacks.events {
+		let callbacks = self.inner.callbacks.callback_set();
+		for callback in &callbacks.events {
 			callback(&event);
 		}
-		self
-			.inner
-			.callbacks
-			.events_bus()
-			.publish_shared(Arc::new(event));
+		callbacks.events_bus().publish_shared(Arc::new(event));
+	}
+
+	/// Publishes one UI-context update to the installed host boundary.
+	pub fn update_ui_context(&self, update: &UiContextUpdate) {
+		self.inner.callbacks.update_ui_context(update);
+	}
+
+	/// Resolves a URL through its installed host-local protocol boundary.
+	pub fn resolve_local_protocol(&self, url: &url::Url) -> Option<ProtocolResolution> {
+		self.inner.callbacks.resolve_local_protocol(url)
+	}
+
+	/// Produces title-system-prompt patches from the live session authority.
+	pub fn title_prompt(&self, props: &Props) -> Option<Result<PromptPatchSet, PromptError>> {
+		self.inner.callbacks.title_prompt(props)
 	}
 
 	/// Adds a bounded lossy typed-event subscription suitable for host UI.
 	pub fn subscribe(&self, capacity: usize) -> omp_agent::LossyEventSubscription {
-		self.inner.callbacks.events_bus().subscribe_ui(capacity)
+		self
+			.inner
+			.callbacks
+			.callback_set()
+			.events_bus()
+			.subscribe_ui(capacity)
 	}
 
 	/// Adds an ordered lossless typed-event subscription suitable for an SDK
 	/// host.
 	pub fn subscribe_lossless(&self) -> EventSubscription {
-		self.inner.callbacks.events_bus().subscribe_lossless()
+		self
+			.inner
+			.callbacks
+			.callback_set()
+			.events_bus()
+			.subscribe_lossless()
 	}
 
 	/// Subscribes to in-memory lifecycle transitions.
@@ -626,12 +677,17 @@ async fn run_handle_actor(
 				if runtime.is_none() {
 					shared.lifecycle.send_replace(SessionLifecycle::Reviving);
 					let revived = if let Some(factory) = &revival {
-						factory(SessionRevivalRequest { identity: shared.identity.clone() }).await
+						factory(SessionRevivalRequest {
+							identity:  shared.identity.clone(),
+							callbacks: shared.callbacks.clone(),
+						})
+						.await
 					} else {
 						Err(SessionRevivalError::Unavailable)
 					};
 					match revived {
-						Ok(next) => {
+						Ok(mut next) => {
+							next.install_callbacks(&shared.callbacks);
 							*shared.abort.lock() = Some(next.abort.clone());
 							runtime = Some(next);
 							shared.lifecycle.send_replace(SessionLifecycle::Ready);
@@ -679,6 +735,7 @@ async fn run_handle_actor(
 }
 
 fn publish_event(inner: &HandleInner, event: Arc<AgentEvent>, constructed_at: Instant) {
+	let callbacks = inner.callbacks.callback_set();
 	let first_provider_event =
 		matches!(event.as_ref(), AgentEvent::PhaseChanged { to: omp_agent::AgentPhase::Turning, .. })
 			&& inner.diagnostics.launch().first_dispatch_ms.is_none();
@@ -697,18 +754,81 @@ fn publish_event(inner: &HandleInner, event: Arc<AgentEvent>, constructed_at: In
 				latency_ms: elapsed_ms,
 			}));
 		}
-		if let Some(callback) = &inner.callbacks.first_dispatch {
+		if let Some(callback) = &callbacks.first_dispatch {
 			callback(elapsed);
 		}
 	}
-	for callback in &inner.callbacks.events {
+	for callback in &callbacks.events {
 		callback(&event);
 	}
-	inner.callbacks.events_bus().publish_shared(event);
+	callbacks.events_bus().publish_shared(event);
 }
 
 fn now_ms() -> u64 {
 	time::SystemTime::now()
 		.duration_since(time::UNIX_EPOCH)
 		.map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+#[cfg(test)]
+mod tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	};
+
+	use omp_inference::transport::http::PreconnectLaunch;
+	use parking_lot::RwLock;
+
+	use super::*;
+	use crate::{
+		CallbackSet, LaunchDiagnostic, RuntimeCallbacks, ServiceTierDiagnostic, ThinkingDiagnostic,
+		UiContextUpdate,
+	};
+
+	#[tokio::test]
+	async fn cold_revival_receives_the_installed_callback_authority() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut callbacks = CallbackSet::default();
+		let callback_calls = Arc::clone(&calls);
+		callbacks.ui_context = Some(Arc::new(move |update| {
+			assert_eq!(update.surface.as_deref(), Some("revived"));
+			callback_calls.fetch_add(1, Ordering::Relaxed);
+		}));
+		let revival_calls = Arc::clone(&calls);
+		let revival: SessionRevivalFactory = Arc::new(move |request| {
+			assert_eq!(request.identity.id, "cold-session");
+			request.callbacks.update_ui_context(&UiContextUpdate {
+				surface:     Some("revived".into()),
+				interactive: true,
+			});
+			revival_calls.fetch_add(1, Ordering::Relaxed);
+			Box::pin(async { Err(SessionRevivalError::Unavailable) })
+		});
+		let diagnostics = SessionDiagnostics {
+			models:       Box::new([]),
+			thinking:     ThinkingDiagnostic::default(),
+			service_tier: ServiceTierDiagnostic::default(),
+			launch:       Arc::new(RwLock::new(LaunchDiagnostic {
+				preconnect:        PreconnectLaunch::NoRuntime,
+				first_dispatch_ms: None,
+			})),
+			lsp:          Box::new([]),
+		};
+		let handle = SessionHandle::launch(
+			SessionIdentity::new("cold-session", "cold-session.jsonl"),
+			diagnostics,
+			RuntimeCallbacks::new("cold-session".into(), callbacks),
+			None,
+			Some(revival),
+			Instant::now(),
+			None,
+		)
+		.expect("launch cold handle");
+
+		let result = handle
+			.submit(Vec::<Item>::new(), TurnId::new("cold-turn"))
+			.await;
+		assert!(matches!(result, Err(SessionHandleError::Revival(SessionRevivalError::Unavailable))));
+		assert_eq!(calls.load(Ordering::Relaxed), 2);
+	}
 }

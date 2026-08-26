@@ -143,6 +143,8 @@ pub const TUI_ACTION_IDS: &[&str] = &[
 /// Application actions merged with the TUI primitive registry.
 pub const APP_ACTION_IDS: &[&str] = &[
 	"app.interrupt",
+	"app.clear",
+	"app.exit",
 	"app.thinking.cycle",
 	"app.thinking.toggle",
 	"app.model.cycle_forward",

@@ -470,6 +470,20 @@ pub fn builtin(
 	advise_queue: omp_agent::advisor::AdvisorAdviceQueue,
 ) -> omp_envd::RegistryBridges {
 	let active = discovery::active_content_snapshots(root);
+	builtin_with_content(root, search, goal_control, host_resources, advise_queue, &active)
+}
+
+/// Builds driver-owned bridges from the exact frozen discovery snapshot used
+/// by the owning session composition.
+pub fn builtin_with_content(
+	root: &Path,
+	search: Arc<InferenceBridge>,
+	goal_control: AgentGoalControl,
+	host_resources: Option<Arc<dyn omp_envd::HostResources>>,
+	advise_queue: omp_agent::advisor::AdvisorAdviceQueue,
+	active: &discovery::ActiveContentSnapshots,
+) -> omp_envd::RegistryBridges {
+	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
 	let authored_skills = active
 		.skills
 		.all()
@@ -477,7 +491,6 @@ pub fn builtin(
 		.filter(|skill| skill.source.as_str() != omp_envd::managed_skills_domain::PROVIDER_ID)
 		.map(|skill| skill.name.clone())
 		.collect::<BTreeSet<_>>();
-	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
 	let managed_skills_root = Some(managed_skills::root(&native::user_config_root(&home)));
 	let skill = ResolverBridge {
 		inner: SkillResolver::new(Arc::clone(&active.skills)),
@@ -520,6 +533,7 @@ pub fn builtin(
 				},
 			),
 		],
+		dynamic_tool_factories: vec![active.process_tools.clone()],
 		url_resolvers: vec![Arc::new(skill), Arc::new(rule)],
 		goal_control: Some(Arc::new(goal_control)),
 		search: Some(search),

@@ -2,7 +2,7 @@
 //! operations.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	pin::Pin,
 	sync::{
 		Arc,
@@ -41,14 +41,131 @@ use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const AUTH_FLOW_TTL: Duration = Duration::from_secs(60 * 60);
 type AuthEventStream =
 	Pin<Box<dyn Stream<Item = Result<pb::CredentialEvent, Status>> + Send + 'static>>;
+
+struct AuthFlow {
+	session:    AuthSession,
+	expires_at: Instant,
+}
+struct ActiveFlow(Option<AuthSession>);
+
+impl ActiveFlow {
+	fn new(session: AuthSession) -> Self {
+		Self(Some(session))
+	}
+
+	fn session(&self) -> &AuthSession {
+		self.0.as_ref().expect("active auth flow")
+	}
+
+	fn disarm(mut self) -> AuthSession {
+		self.0.take().expect("active auth flow")
+	}
+}
+
+impl Drop for ActiveFlow {
+	fn drop(&mut self) {
+		if let Some(session) = &self.0 {
+			session.cancel();
+		}
+	}
+}
+fn reap_expired_flow(
+	flows: &Mutex<BTreeMap<String, AuthFlow>>,
+	flow_id: &str,
+	now: Instant,
+) -> bool {
+	let mut flows = flows.lock();
+	if flows.get(flow_id).is_none_or(|flow| flow.expires_at > now) {
+		return false;
+	}
+	let flow = flows.remove(flow_id).expect("checked flow exists");
+	flow.session.cancel();
+	true
+}
+
+/// Server-authenticated identity and provider grants for credential reveal.
+///
+/// This value must be inserted into tonic request extensions by a trusted
+/// transport interceptor. Wire metadata and protobuf identity fields never
+/// construct it.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedRevealContext {
+	extension:          Str,
+	caller_principal:   Str,
+	providers:          Arc<BTreeSet<ProviderId>>,
+	host_generation:    u64,
+	session_generation: u64,
+}
+
+impl AuthenticatedRevealContext {
+	/// Constructs trusted CONTROL identity and provider scope for one server
+	/// session.
+	pub fn new(
+		extension: impl Into<Str>,
+		caller_principal: impl Into<Str>,
+		providers: impl IntoIterator<Item = ProviderId>,
+		host_generation: u64,
+		session_generation: u64,
+	) -> Self {
+		Self {
+			extension: extension.into(),
+			caller_principal: caller_principal.into(),
+			providers: Arc::new(providers.into_iter().collect()),
+			host_generation,
+			session_generation,
+		}
+	}
+
+	fn audited_reveal(
+		&self,
+		request: &pb::RevealCredentialRequest,
+	) -> Result<omp_inference::auth::AuditedCredentialReveal, Status> {
+		let provider = ProviderId::from(request.provider.as_str());
+		if request.extension != self.extension.as_str()
+			|| request.caller_principal != self.caller_principal.as_str()
+			|| request.host_generation != self.host_generation
+			|| request.session_generation != self.session_generation
+			|| !self.providers.contains(&provider)
+		{
+			return Err(Status::permission_denied(
+				"credential reveal identity or provider scope is not authenticated",
+			));
+		}
+		Ok(omp_inference::auth::AuditedCredentialReveal {
+			extension:          self.extension.clone(),
+			caller_principal:   self.caller_principal.clone(),
+			provider:           provider.into(),
+			host_generation:    self.host_generation,
+			session_generation: self.session_generation,
+			request_id:         request.request_id,
+			reason:             request.reason.as_str().into(),
+		})
+	}
+}
+
+/// Extracts only server-inserted CONTROL reveal authority.
+fn authenticated_reveal_context<T>(
+	request: &Request<T>,
+) -> Result<AuthenticatedRevealContext, Status> {
+	request
+		.extensions()
+		.get::<AuthenticatedRevealContext>()
+		.cloned()
+		.ok_or_else(|| {
+			Status::permission_denied(
+				"credential reveal requires authenticated CONTROL identity and scope",
+			)
+		})
+}
 
 /// RPC server that retains interactive login channels while a flow is active.
 #[derive(Clone)]
 pub struct AuthRpc {
 	registry: Registry,
-	flows:    Arc<Mutex<BTreeMap<String, AuthSession>>>,
+	flows:    Arc<Mutex<BTreeMap<String, AuthFlow>>>,
 	control:  Option<AuthControlHandle>,
 }
 
@@ -69,6 +186,30 @@ impl AuthRpc {
 			.control
 			.as_ref()
 			.ok_or_else(|| Status::failed_precondition("auth lifecycle owner is not bound"))
+	}
+
+	fn insert_flow(&self, flow_id: String, session: AuthSession) {
+		let expires_at = Instant::now() + AUTH_FLOW_TTL;
+		self
+			.flows
+			.lock()
+			.insert(flow_id.clone(), AuthFlow { session, expires_at });
+		let flows = Arc::downgrade(&self.flows);
+		tokio::spawn(async move {
+			tokio::time::sleep(AUTH_FLOW_TTL).await;
+			if let Some(flows) = flows.upgrade() {
+				reap_expired_flow(&flows, &flow_id, Instant::now());
+			}
+		});
+	}
+
+	fn take_flow(&self, flow_id: &str) -> Result<ActiveFlow, Status> {
+		self
+			.flows
+			.lock()
+			.remove(flow_id)
+			.map(|flow| ActiveFlow::new(flow.session))
+			.ok_or_else(|| Status::not_found("auth flow not found"))
 	}
 
 	fn control_account(&self, id: u64) -> Result<AccountId, Status> {
@@ -299,15 +440,17 @@ impl pb::auth_server::Auth for AuthRpc {
 		let AuthAnswer::Session(session) = answer else {
 			return Err(Status::internal("auth login returned the wrong typed answer"));
 		};
-		let flow_id = session.id.as_str().to_owned();
-		let event = session
+		let flow = ActiveFlow::new(session);
+		let flow_id = flow.session().id.as_str().to_owned();
+		let event = flow
+			.session()
 			.events
 			.recv_async()
 			.await
 			.map_err(|_| Status::unavailable("auth flow ended before its first step"))?
 			.map_err(inference_status)?;
 		let step = login_step(event)?;
-		self.flows.lock().insert(flow_id.clone(), session);
+		self.insert_flow(flow_id.clone(), flow.disarm());
 		Ok(Response::new(pb::BeginLoginResponse { flow_id, step: Some(step) }))
 	}
 
@@ -316,24 +459,18 @@ impl pb::auth_server::Auth for AuthRpc {
 		request: Request<pb::SubmitCodeRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
 		let request = request.into_inner();
-		let (responses, events) = {
-			let flows = self.flows.lock();
-			let session = flows
-				.get(&request.flow_id)
-				.ok_or_else(|| Status::not_found("auth flow not found"))?;
-			(session.responses.clone(), session.events.clone())
-		};
+		let flow = self.take_flow(&request.flow_id)?;
 		let session = LoginSessionId::from(request.flow_id.as_str());
-		responses
+		flow
+			.session()
+			.responses
 			.send_async(omp_inference::answer::AuthResponse {
 				session,
 				input: AuthInput::AuthorizationCode(SecretString::from(request.code)),
 			})
 			.await
 			.map_err(|_| Status::unavailable("auth flow no longer accepts input"))?;
-		let account = await_account(events).await?;
-		self.flows.lock().remove(&request.flow_id);
-		Ok(Response::new(account_meta(account)?))
+		Ok(Response::new(account_meta(await_account(flow.session().events.clone()).await?)?))
 	}
 
 	async fn wait_login(
@@ -341,16 +478,8 @@ impl pb::auth_server::Auth for AuthRpc {
 		request: Request<pb::WaitLoginRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
 		let flow_id = request.into_inner().flow_id;
-		let events = self
-			.flows
-			.lock()
-			.get(&flow_id)
-			.ok_or_else(|| Status::not_found("auth flow not found"))?
-			.events
-			.clone();
-		let account = await_account(events).await?;
-		self.flows.lock().remove(&flow_id);
-		Ok(Response::new(account_meta(account)?))
+		let flow = self.take_flow(&flow_id)?;
+		Ok(Response::new(account_meta(await_account(flow.session().events.clone()).await?)?))
 	}
 
 	async fn put_api_key(
@@ -428,7 +557,9 @@ impl pb::auth_server::Auth for AuthRpc {
 		&self,
 		request: Request<pb::RevealCredentialRequest>,
 	) -> Result<Response<pb::RevealCredentialResponse>, Status> {
+		let authority = authenticated_reveal_context(&request)?;
 		let request = request.into_inner();
+		let audit = authority.audited_reveal(&request)?;
 		let account = self.control_account(request.id)?;
 		let record = self
 			.control()?
@@ -441,7 +572,6 @@ impl pb::auth_server::Auth for AuthRpc {
 				"credential does not belong to the authorized provider",
 			));
 		}
-		let audit = reveal_audit(request);
 		let secret = self
 			.control()?
 			.reveal(&account, &audit, |secret| secret.expose(|bytes| bytes.to_vec()))
@@ -700,19 +830,6 @@ fn account_meta(account: AccountSummary) -> Result<pb::CredentialMeta, Status> {
 
 fn parse_account_id(account: &AccountId<str>) -> Result<u64, Status> {
 	Ok(wire_account_id(account))
-}
-fn reveal_audit(
-	request: pb::RevealCredentialRequest,
-) -> omp_inference::auth::AuditedCredentialReveal {
-	omp_inference::auth::AuditedCredentialReveal {
-		extension:          request.extension.into(),
-		caller_principal:   request.caller_principal.into(),
-		provider:           request.provider.into(),
-		host_generation:    request.host_generation,
-		session_generation: request.session_generation,
-		request_id:         request.request_id,
-		reason:             request.reason.into(),
-	}
 }
 
 fn store_status(error: auth::StoreError) -> Status {
@@ -990,11 +1107,32 @@ mod tests {
 		receipt::ExecutionReceipt,
 	};
 
-	use super::{credential_health, error_class, pb, reveal_audit};
+	use super::{
+		AuthFlow, AuthenticatedRevealContext, authenticated_reveal_context, credential_health,
+		error_class, pb, reap_expired_flow,
+	};
 
 	#[test]
-	fn reveal_rpc_preserves_authenticated_audit_evidence() {
-		let audit = reveal_audit(pb::RevealCredentialRequest {
+	fn reveal_rpc_rejects_requests_without_server_authenticated_context() {
+		let request = tonic::Request::new(pb::RevealCredentialRequest::default());
+		assert_eq!(
+			authenticated_reveal_context(&request)
+				.expect_err("wire claims cannot authenticate credential reveal")
+				.code(),
+			tonic::Code::PermissionDenied,
+		);
+	}
+
+	#[test]
+	fn reveal_rpc_uses_only_server_authenticated_identity_and_scope() {
+		let authority = AuthenticatedRevealContext::new(
+			"fixture.extension",
+			"principal",
+			[omp_catalog::ProviderId::from("openai")],
+			11,
+			13,
+		);
+		let request = pb::RevealCredentialRequest {
 			id:                 7,
 			provider:           "openai".to_owned(),
 			extension:          "fixture.extension".to_owned(),
@@ -1003,14 +1141,38 @@ mod tests {
 			session_generation: 13,
 			request_id:         17,
 			reason:             "extension_control_reveal".to_owned(),
-		});
+		};
+		let audit = authority
+			.audited_reveal(&request)
+			.expect("matching authenticated reveal");
 		assert_eq!(audit.extension.as_str(), "fixture.extension");
 		assert_eq!(audit.caller_principal.as_str(), "principal");
 		assert_eq!(audit.provider.as_str(), "openai");
 		assert_eq!(audit.host_generation, 11);
 		assert_eq!(audit.session_generation, 13);
-		assert_eq!(audit.request_id, 17);
-		assert_eq!(audit.reason.as_str(), "extension_control_reveal");
+
+		let forged = pb::RevealCredentialRequest { caller_principal: "forged".to_owned(), ..request };
+		assert_eq!(
+			authority
+				.audited_reveal(&forged)
+				.expect_err("caller-asserted identity must not authorize reveal")
+				.code(),
+			tonic::Code::PermissionDenied
+		);
+	}
+
+	#[test]
+	fn expired_auth_flow_is_removed_and_cancelled() {
+		let (session, driver, _) = omp_inference::auth::default_login_channels(
+			omp_inference::LoginSessionId::from("expired-flow"),
+		);
+		let flows = parking_lot::Mutex::new(std::collections::BTreeMap::from([(
+			"expired-flow".to_owned(),
+			AuthFlow { session, expires_at: std::time::Instant::now() },
+		)]));
+		assert!(reap_expired_flow(&flows, "expired-flow", std::time::Instant::now(),));
+		assert!(driver.cancellation().is_cancelled());
+		assert!(flows.lock().is_empty());
 	}
 
 	#[test]

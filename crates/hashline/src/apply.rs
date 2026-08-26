@@ -14,12 +14,17 @@ use crate::{
 	block::{BlockError, BlockLowering, UnresolvedBlockMode, resolve_block_edits},
 	clipboard::{Clipboard, ClipboardError, EmptyPasteMode, resolve_clipboard_edits},
 	format::split_addressable_file_lines,
-	normalize::{detect_line_ending, normalize_to_lf, restore_bom, restore_line_endings, strip_bom},
+	normalize::{
+		LineEnding, detect_line_ending, normalize_to_lf, restore_bom, restore_line_endings, strip_bom,
+	},
 	syntax,
 	types::{Anchor, ApplyWarning, BlockResolution, Cursor, Edit, InsertMode, ParsedPatch},
 };
 
-/// One canonical replacement in coordinates of the exact input bytes.
+/// One exact replacement in coordinates of the exact input bytes.
+///
+/// Anchor-scoped operations retain their authored source-line identity rather
+/// than being re-diffed into an equivalent location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByteEdit {
 	/// Inclusive byte start in the input.
@@ -59,7 +64,8 @@ impl Default for ApplyOptions<'_> {
 pub struct ApplyResult {
 	/// Final bytes with the original BOM and line-ending convention restored.
 	pub bytes:              Bytes,
-	/// Canonical non-overlapping edits in exact input-byte coordinates.
+	/// Non-overlapping edits in exact input-byte coordinates, retaining authored
+	/// source-line identity for anchor-scoped operations.
 	pub edits:              Vec<ByteEdit>,
 	/// First changed model-facing line, when any.
 	pub first_changed_line: Option<usize>,
@@ -96,6 +102,12 @@ pub enum ApplyError {
 		 paste operations before applying the patch"
 	)]
 	UnresolvedEdit,
+	/// Anchor-aware byte edits failed to reproduce the materialized output.
+	#[error(
+		"could not preserve authored line identity while materializing exact byte edits; re-read \
+		 the file and re-issue the edit against its fresh tag"
+	)]
+	AuthoredIdentityLost,
 	/// An edit refers to a source line outside the addressable file.
 	#[error(
 		"line {line} does not exist (file has {total} addressable lines); re-read the file and use \
@@ -176,6 +188,15 @@ const fn anchor_line(edit: &Edit) -> Option<usize> {
 		} => Some(anchor.line),
 		_ => None,
 	}
+}
+/// Returns whether a parsed patch contains one or more content-independent
+/// beginning/end-of-file inserts and no anchor-scoped operation.
+pub fn is_head_tail_only(patch: &ParsedPatch) -> bool {
+	!patch.edits.is_empty()
+		&& patch
+			.edits
+			.iter()
+			.all(|edit| matches!(edit, Edit::Insert { cursor: Cursor::Bof | Cursor::Eof, .. }))
 }
 
 fn closer(text: &str) -> bool {
@@ -1329,6 +1350,33 @@ fn repair_boundaries(
 	Ok(())
 }
 
+fn materialize_line_rows(original: &Str, bucket: &[(usize, &Edit)]) -> Vec<Str> {
+	let mut before = Vec::new();
+	let mut replacement = Vec::new();
+	let mut after = Vec::new();
+	let mut delete = false;
+	for (_, edit) in bucket {
+		match edit {
+			Edit::Delete { .. } => delete = true,
+			Edit::Insert { text, mode: InsertMode::Replacement, .. } => {
+				replacement.push(text.clone());
+			},
+			Edit::Insert { cursor: Cursor::AfterAnchor { .. }, text, .. } => {
+				after.push(text.clone());
+			},
+			Edit::Insert { text, .. } => before.push(text.clone()),
+			_ => {},
+		}
+	}
+	let mut rows = before;
+	rows.extend(replacement);
+	if !delete {
+		rows.push(original.clone());
+	}
+	rows.extend(after);
+	rows
+}
+
 fn materialize(lines: &[Str], edits: &[Edit]) -> (String, Option<usize>) {
 	let mut buckets: BTreeMap<usize, Vec<(usize, &Edit)>> = BTreeMap::new();
 	let mut bof = Vec::new();
@@ -1347,35 +1395,11 @@ fn materialize(lines: &[Str], edits: &[Edit]) -> (String, Option<usize>) {
 	let mut out = lines.to_vec();
 	let mut first = None;
 	for (line, bucket) in buckets.into_iter().rev() {
-		let mut before = Vec::new();
-		let mut replacement = Vec::new();
-		let mut after = Vec::new();
-		let mut delete = false;
-		for (_, edit) in bucket {
-			match edit {
-				Edit::Delete { .. } => {
-					delete = true;
-				},
-				Edit::Insert { text, mode: InsertMode::Replacement, .. } => {
-					replacement.push(text.clone());
-				},
-				Edit::Insert { cursor: Cursor::AfterAnchor { .. }, text, .. } => {
-					after.push(text.clone());
-				},
-				Edit::Insert { text, .. } => before.push(text.clone()),
-				_ => {},
-			}
-		}
-		if before.is_empty() && replacement.is_empty() && after.is_empty() && !delete {
+		let idx = line - 1;
+		let rows = materialize_line_rows(&out[idx], &bucket);
+		if rows.len() == 1 && rows[0] == out[idx] {
 			continue;
 		}
-		let idx = line - 1;
-		let mut rows = before;
-		rows.extend(replacement);
-		if !delete {
-			rows.push(out[idx].clone());
-		}
-		rows.extend(after);
 		out.splice(idx..=idx, rows);
 		first = Some(first.map_or(line, |old: usize| old.min(line)));
 	}
@@ -1406,6 +1430,161 @@ fn materialize(lines: &[Str], edits: &[Edit]) -> (String, Option<usize>) {
 		text.push_str(line);
 	}
 	(text, first)
+}
+
+fn exact_line_ranges(text: &str) -> Vec<(usize, usize)> {
+	let bytes = text.as_bytes();
+	let mut ranges = Vec::new();
+	let mut start = 0;
+	let mut index = 0;
+	while index < bytes.len() {
+		let end = match bytes[index] {
+			b'\n' => Some(index + 1),
+			b'\r' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
+			b'\r' => Some(index + 1),
+			_ => None,
+		};
+		if let Some(end) = end {
+			ranges.push((start, end));
+			start = end;
+			index = end;
+		} else {
+			index += 1;
+		}
+	}
+	ranges.push((start, bytes.len()));
+	ranges
+}
+
+fn encoded_rows(rows: &[Str], trailing_ending: bool, ending: LineEnding) -> Bytes {
+	let capacity = rows.iter().map(Str::len).sum::<usize>()
+		+ rows.len().saturating_sub(1)
+		+ usize::from(trailing_ending);
+	let mut normalized = String::with_capacity(capacity);
+	for (index, row) in rows.iter().enumerate() {
+		if index > 0 {
+			normalized.push('\n');
+		}
+		normalized.push_str(row);
+	}
+	if trailing_ending && !rows.is_empty() {
+		normalized.push('\n');
+	}
+	let restored = restore_line_endings(&normalized, ending);
+	Bytes::copy_from_slice(restored.as_bytes())
+}
+
+fn localized_byte_edit(start: usize, end: usize, source: &[u8], replacement: Bytes) -> ByteEdit {
+	let original = &source[start..end];
+	let mut prefix = 0;
+	while prefix < original.len()
+		&& prefix < replacement.len()
+		&& original[prefix] == replacement[prefix]
+	{
+		prefix += 1;
+	}
+	let mut suffix = 0;
+	while suffix < original.len() - prefix
+		&& suffix < replacement.len() - prefix
+		&& original[original.len() - 1 - suffix] == replacement[replacement.len() - 1 - suffix]
+	{
+		suffix += 1;
+	}
+	let localized_start = start + prefix;
+	let localized_end = end - suffix;
+	if localized_start == localized_end && localized_start == end && start < end {
+		return ByteEdit { start, end, replacement };
+	}
+	ByteEdit {
+		start:       localized_start,
+		end:         localized_end,
+		replacement: replacement.slice(prefix..replacement.len() - suffix),
+	}
+}
+
+fn anchored_byte_edits(
+	source: &[u8],
+	exact: &str,
+	normalized: &str,
+	lines: &[Str],
+	edits: &[Edit],
+	ending: LineEnding,
+	final_bytes: &[u8],
+) -> Result<Vec<ByteEdit>, ApplyError> {
+	let bom_len = source.len() - exact.len();
+	let ranges = exact_line_ranges(exact);
+	if ranges.len() != lines.len() {
+		return Err(ApplyError::AuthoredIdentityLost);
+	}
+	let mut buckets: BTreeMap<usize, Vec<(usize, &Edit)>> = BTreeMap::new();
+	let mut bof = Vec::new();
+	let mut eof = Vec::new();
+	for (order, edit) in edits.iter().enumerate() {
+		match edit {
+			Edit::Insert { cursor: Cursor::Bof, text, .. } => bof.push(text.clone()),
+			Edit::Insert { cursor: Cursor::Eof, text, .. } => eof.push(text.clone()),
+			_ => {
+				if let Some(line) = anchor_line(edit) {
+					buckets.entry(line).or_default().push((order, edit));
+				}
+			},
+		}
+	}
+
+	let mut exact_edits = Vec::with_capacity(buckets.len() + 2);
+	if !bof.is_empty() {
+		exact_edits.push(ByteEdit {
+			start:       bom_len,
+			end:         bom_len,
+			replacement: encoded_rows(&bof, !normalized.is_empty(), ending),
+		});
+	}
+	for (line, bucket) in buckets {
+		let original = lines
+			.get(line - 1)
+			.ok_or(ApplyError::AuthoredIdentityLost)?;
+		let rows = materialize_line_rows(original, &bucket);
+		if rows.len() == 1 && rows[0] == *original {
+			continue;
+		}
+		let (start, end) = ranges[line - 1];
+		exact_edits.push(localized_byte_edit(
+			bom_len + start,
+			bom_len + end,
+			source,
+			encoded_rows(&rows, line < lines.len(), ending),
+		));
+	}
+	if !eof.is_empty() {
+		let mut replacement =
+			encoded_rows(&eof, normalized.ends_with('\n') || normalized.is_empty(), ending);
+		if !normalized.is_empty() && !normalized.ends_with('\n') {
+			let mut prefixed = Vec::with_capacity(replacement.len() + 2);
+			prefixed.extend_from_slice(match ending {
+				LineEnding::Lf => b"\n",
+				LineEnding::CrLf => b"\r\n",
+			});
+			prefixed.extend_from_slice(&replacement);
+			replacement = Bytes::from(prefixed);
+		}
+		exact_edits.push(ByteEdit { start: source.len(), end: source.len(), replacement });
+	}
+
+	let mut replayed = Vec::with_capacity(final_bytes.len());
+	let mut cursor = 0;
+	for edit in &exact_edits {
+		if edit.start < cursor || edit.end > source.len() {
+			return Err(ApplyError::AuthoredIdentityLost);
+		}
+		replayed.extend_from_slice(&source[cursor..edit.start]);
+		replayed.extend_from_slice(&edit.replacement);
+		cursor = edit.end;
+	}
+	replayed.extend_from_slice(&source[cursor..]);
+	if replayed != final_bytes {
+		return Err(ApplyError::AuthoredIdentityLost);
+	}
+	Ok(exact_edits)
 }
 
 fn canonical_edit(base: &[u8], final_bytes: &[u8]) -> Vec<ByteEdit> {
@@ -1487,7 +1666,11 @@ pub fn apply_parsed_patch(
 	let restored_endings = restore_line_endings(&model, ending);
 	let restored = restore_bom(&restored_endings, bom.had_bom);
 	let bytes = Bytes::copy_from_slice(restored.as_bytes());
-	let edits = canonical_edit(&source, &bytes);
+	let edits = if concrete.iter().any(|edit| anchor_line(edit).is_some()) {
+		anchored_byte_edits(&source, bom.text, &normalized, &lines, &concrete, ending, &bytes)?
+	} else {
+		canonical_edit(&source, &bytes)
+	};
 	Ok(ApplyResult { bytes, edits, first_changed_line, warnings, block_resolutions: resolutions })
 }
 
@@ -1539,6 +1722,18 @@ mod tests {
 			&mut Clipboard::default(),
 			ApplyOptions { mode: ApplyMode::Strict, path: Some(path) },
 		)
+	}
+	#[test]
+	fn repeated_line_edits_retain_the_authored_byte_range() {
+		let source = "top\nduplicate\nmiddle\nduplicate\nbottom\n";
+		let result = apply_patch(source, "CUT 4", "fixture.txt").expect("delete authored duplicate");
+		let authored_start = source
+			.find("duplicate\nbottom")
+			.expect("fourth line offset");
+		assert_eq!(result.edits.len(), 1);
+		assert_eq!(result.edits[0].start, authored_start);
+		assert_eq!(result.edits[0].end, authored_start + "duplicate\n".len());
+		assert_eq!(result.bytes, Bytes::from_static(b"top\nduplicate\nmiddle\nbottom\n"));
 	}
 
 	#[test]

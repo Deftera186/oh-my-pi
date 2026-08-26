@@ -30,22 +30,14 @@ pub async fn run(args: AuthGatewayArgs) -> miette::Result<()> {
 	let data_dir = omp_core::dirs::data_dir(args.data_dir).into_diagnostic()?;
 	fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command {
-		AuthGatewayCommand::Serve { bind, no_auth } => {
-			let config = if no_auth {
-				DaemonConfig::loopback_without_auth(bind).into_diagnostic()?
-			} else {
-				ensure_token(&data_dir, false)?;
-				DaemonConfig::tcp(bind, token_path(&data_dir))
-			};
+		AuthGatewayCommand::Serve { bind } => {
+			ensure_token(&data_dir, false)?;
+			let config = DaemonConfig::tcp(bind, token_path(&data_dir));
 			let handle = DaemonHandle::start(config.with_data_dir(data_dir.clone()))
 				.await
 				.into_diagnostic()?;
 			println!("auth-gateway listening on http://{bind}");
-			if no_auth {
-				println!("auth: disabled (--no-auth, loopback only)");
-			} else {
-				println!("bearer token: {}", token_path(&data_dir).display());
-			}
+			println!("bearer token: {}", token_path(&data_dir).display());
 			handle.wait().await.into_diagnostic()
 		},
 		AuthGatewayCommand::Token { regenerate, json } => {

@@ -567,6 +567,7 @@ impl DocumentStore {
 			registry: Arc::downgrade(&self.inner),
 			document_id,
 			path: Some(new_path),
+			retired: None,
 		})
 	}
 
@@ -722,10 +723,22 @@ impl RegistryInner {
 			.retain(|_, owner| *owner != document_id);
 	}
 
-	fn release_path_reservation(&self, document_id: DocumentId, path: &Path) {
+	fn release_path_reservation(
+		&self,
+		document_id: DocumentId,
+		path: &Path,
+		retired: Option<RetiredPathAuthority>,
+	) {
 		let mut maps = self.lock_maps();
-		if maps.rebind_reservations.get(path) == Some(&document_id) {
-			maps.rebind_reservations.remove(path);
+		if maps.rebind_reservations.get(path) != Some(&document_id) {
+			return;
+		}
+		maps.rebind_reservations.remove(path);
+		if let Some(retired) = retired {
+			debug_assert!(!maps.by_path.contains_key(path));
+			debug_assert!(!maps.by_id.contains_key(&retired.document_id));
+			maps.by_path.insert(path.to_path_buf(), retired.document_id);
+			maps.by_id.insert(retired.document_id, retired.handle);
 		}
 	}
 
@@ -746,7 +759,10 @@ impl RegistryInner {
 				reason: sf!("move destination became active or changed"),
 			});
 		}
-		maps.by_id.remove(&incumbent);
+		let incumbent_handle = maps
+			.by_id
+			.remove(&incumbent)
+			.expect("validated incumbent authority exists");
 		maps.by_path.remove(path);
 		maps
 			.rebind_reservations
@@ -755,6 +771,10 @@ impl RegistryInner {
 			registry:    Arc::downgrade(self),
 			document_id: replacement,
 			path:        Some(path.to_path_buf()),
+			retired:     Some(RetiredPathAuthority {
+				document_id: incumbent,
+				handle:      incumbent_handle,
+			}),
 		})
 	}
 
@@ -792,6 +812,12 @@ pub struct PathReservation {
 	registry:    Weak<RegistryInner>,
 	document_id: DocumentId,
 	path:        Option<PathBuf>,
+	retired:     Option<RetiredPathAuthority>,
+}
+
+struct RetiredPathAuthority {
+	document_id: DocumentId,
+	handle:      ActorHandle,
 }
 
 impl PathReservation {
@@ -804,9 +830,15 @@ impl PathReservation {
 	}
 
 	fn commit(mut self, old_path: &Path) -> Result<PathBuf> {
-		let path = self.path.take().expect("live path reservation has a path");
+		let path = self
+			.path
+			.as_ref()
+			.expect("live path reservation has a path")
+			.clone();
 		let registry = self.registry.upgrade().ok_or_else(actor_unavailable)?;
 		registry.commit_path_reservation(self.document_id, old_path, &path)?;
+		self.path = None;
+		self.retired = None;
 		Ok(path)
 	}
 }
@@ -814,7 +846,7 @@ impl PathReservation {
 impl Drop for PathReservation {
 	fn drop(&mut self) {
 		if let (Some(registry), Some(path)) = (self.registry.upgrade(), self.path.as_deref()) {
-			registry.release_path_reservation(self.document_id, path);
+			registry.release_path_reservation(self.document_id, path, self.retired.take());
 		}
 	}
 }
@@ -2675,6 +2707,36 @@ mod tests {
 			.await
 			.expect("retained memory read");
 		assert_eq!(whole(&retained), b"cached");
+	}
+	#[tokio::test]
+	async fn dropped_move_destination_reservation_restores_incumbent_authority() {
+		let root = TempDir::new().expect("temporary directory");
+		let path = root.path().join("destination.txt");
+		fs::write(&path, b"incumbent").expect("write fixture");
+		let store = store(&root, 4);
+		let opened = store.open(path.clone()).await.expect("open destination");
+		let incumbent_id = opened.head().document_id();
+		let incumbent_revision = opened.head().revision();
+		store
+			.close(opened.lease_id())
+			.await
+			.expect("close destination lease");
+		drop(opened);
+
+		let replacement = DocumentId::from_bytes([91; 16]);
+		let reservation = store
+			.reserve_move_destination(
+				replacement,
+				store.local_fs().root_path().join("destination.txt"),
+				DestinationExpectation::Revision(incumbent_revision),
+			)
+			.await
+			.expect("reserve inactive destination");
+		drop(reservation);
+
+		let reopened = store.open(path).await.expect("reopen destination");
+		assert_eq!(reopened.head().document_id(), incumbent_id);
+		assert_eq!(reopened.head().revision(), incumbent_revision);
 	}
 
 	#[tokio::test]

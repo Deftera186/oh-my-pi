@@ -1,6 +1,13 @@
 //! Interactive terminal and GUI host for durable project chat.
 
-use std::{collections::BTreeMap, env, fs, iter, path::PathBuf, sync, sync::Arc, time::Duration};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	env, fs, iter,
+	path::PathBuf,
+	sync,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use miette::IntoDiagnostic as _;
 #[cfg(unix)]
@@ -28,16 +35,13 @@ use omp_driver::{
 		ChatAuthWorker, ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend,
 		ChatScope, EphemeralSessions, LaunchToolSelection, RegimeControlAuthorityFactory, Session,
 		SessionOpen, agent_snapshot, apply_launch_tool_selection, canonical_project,
-		ensure_state_directory, fallback_model_selector, interrupted_reasoning_dialect,
-		model_context_window, model_selector_is_selectable, now_ms, open_session,
+		ensure_state_directory, interrupted_reasoning_dialect, model_context_window,
+		model_selector_is_selectable, model_usable_context_window, now_ms, open_session,
 		resolve_model_provider, resolve_model_selector, resume_choices, session_blueprint,
 		strict_session_id, thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
-	discovery::{
-		context::{self, ContextDiscoveryOptions, GrantedContextRoot},
-		roles, runtime,
-	},
+	discovery::{context, roles, runtime},
 	hub as hub_backend,
 	memory::{InferenceExtractionLane, RuntimePromptMemorySource},
 	model_controls::{ProductionProviderApplicationOwner, ProviderControlAuthorityFactory},
@@ -73,7 +77,7 @@ use omp_proto::{
 	thread::v1::{item, part},
 };
 use omp_sdk::SessionBlueprint;
-use omp_settings::manager::{SettingsManager, SettingsManagerError, SettingsPaths};
+use omp_settings::manager::{MutationScope, SettingsManager, SettingsManagerError, SettingsPaths};
 use omp_storage::{
 	blob,
 	blob::BlobStore,
@@ -90,6 +94,7 @@ use omp_storage::{
 use omp_tools::eval::EvalSessionControl;
 use parking_lot::Mutex;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tonic::transport;
 
 use crate::{
@@ -103,6 +108,10 @@ use crate::{
 	session_manager::{DraftError, DraftStore},
 	wizard,
 };
+
+fn absolute_invocation_deadline(now: Instant, max_time: Option<Duration>) -> Option<Instant> {
+	max_time.and_then(|duration| now.checked_add(duration))
+}
 
 /// Complete app-owned CONTROL factory bundle for one production chat session.
 ///
@@ -163,7 +172,6 @@ impl SessionControlFactories {
 }
 
 fn presentation_control_factory(
-	executor: omp_executor::Executor,
 	bridge: Arc<PresentationBridge>,
 	dispatcher: Arc<dyn CallbackDispatcher>,
 ) -> Arc<dyn ControlAuthorityFactory> {
@@ -180,12 +188,8 @@ fn presentation_control_factory(
 			Arc::clone(&identity),
 			Arc::clone(&dispatcher),
 		));
-		let owner = Arc::new(PresentationAuthority::new(
-			executor.clone(),
-			presentation_identity,
-			bridge.clone(),
-			callbacks,
-		));
+		let owner =
+			Arc::new(PresentationAuthority::new(presentation_identity, bridge.clone(), callbacks));
 		Ok(Arc::new(UiControlAuthority::new(identity, owner)) as Arc<dyn ControlAuthority>)
 	})
 }
@@ -425,7 +429,6 @@ mod resume_hint_tests {
 	reason = "the interactive chat future owns a thread-confined terminal scene"
 )]
 pub(crate) async fn run(
-	executor: omp_executor::Executor,
 	args: ChatArgs,
 	mut start: ChatStart,
 	presentation: ChatPresentation,
@@ -544,17 +547,108 @@ pub(crate) async fn run(
 		picked_resume = Some(imported_id);
 		selected_sessions_dir = Some(import_sessions_dir);
 	}
-	let catalog = snapshot::Catalog::try_embedded().map_err(|e| miette::miette!(e))?;
-	let settings =
-		omp_driver::settings::current_with_overlays(&data_dir, &args.config).into_diagnostic()?;
+	let catalog_owner = omp_driver::registry::production_catalog(&data_dir)
+		.map_err(|error| miette::miette!(error))?;
+	let catalog = catalog_owner.as_ref();
+	let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&root));
+	settings_paths.overlays.extend(args.config.iter().cloned());
+	let settings_manager =
+		Arc::new(SettingsManager::open(settings_paths).map_err(|error| miette::miette!(error))?);
+	if let Some(approval_mode) = args
+		.effective_approval()
+		.map(omp_envd::tool_settings::ApprovalMode::from)
+	{
+		settings_manager
+			.set_sync(MutationScope::Runtime, "tools.approval_mode", &approval_mode.to_string())
+			.map_err(|error| miette::miette!(error))?;
+	}
+	let settings_snapshot = settings_manager.snapshot();
+	let mut settings = settings_snapshot
+		.project::<omp_driver::settings::Settings>()
+		.map_err(|error| miette::miette!(error))?
+		.get()
+		.clone();
+	settings.mnemopi = settings.mnemopi.normalize();
+	let marketplace_mode: &'static str = settings.lifecycle.marketplace_auto_update.into();
+	for notice in
+		crate::ext_cli::service::refresh_stale_and_update(&data_dir, &root, marketplace_mode).await?
+	{
+		eprintln!("Marketplace: {notice}");
+	}
 	let security_enabled = settings.security.enabled;
 	let resize_scrollback = match settings.tui.resize_scrollback {
 		omp_driver::settings::ResizeScrollbackMode::Append => host::ResizeScrollback::Append,
 		omp_driver::settings::ResizeScrollbackMode::Rebuild => host::ResizeScrollback::Rebuild,
 		omp_driver::settings::ResizeScrollbackMode::Preserve => host::ResizeScrollback::Preserve,
 	};
+	let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+	let model_settings = settings_snapshot
+		.project::<omp_catalog::settings::ModelSettings>()
+		.map_err(|error| miette::miette!(error))?
+		.get()
+		.resolve_path_scopes(&root, &home);
+	let skill_settings = settings_snapshot
+		.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
+		.map_err(|error| miette::miette!(error))?
+		.get()
+		.clone();
+	let extensions_disabled =
+		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
+	let prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
+		model:   model_settings.clone(),
+		skills:  skill_settings.clone(),
+		foreign: settings_snapshot
+			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
+			.map_err(|error| miette::miette!(error))?
+			.get()
+			.clone(),
+		rules:   settings_snapshot
+			.project::<omp_driver::rulebook::RulebookSettings>()
+			.map_err(|error| miette::miette!(error))?
+			.get()
+			.clone(),
+		native:  omp_driver::discovery::native::NativeDiscoveryOptions {
+			explicit_roots: if extensions_disabled {
+				Vec::new()
+			} else {
+				args.extension_launch.native_roots.clone()
+			},
+			root_mode: match args.extension_launch.mode {
+				crate::cli::InvocationExtensionMode::Merge => {
+					omp_driver::discovery::native::NativeRootMode::Merge
+				},
+				crate::cli::InvocationExtensionMode::ExplicitOnly
+				| crate::cli::InvocationExtensionMode::Disabled => {
+					omp_driver::discovery::native::NativeRootMode::ExplicitOnly
+				},
+			},
+			skill_settings,
+			include_workspace: !args.extension_launch.no_workspace && !extensions_disabled,
+			client_installed: Some(data_dir.join("ext/installed.toml")),
+		},
+	};
+	let prompt_discovery = omp_driver::discovery::active_prompt_snapshots(
+		&root,
+		&args.add_dir,
+		&home,
+		&prompt_discovery_settings,
+	);
+	let mut extension_keys = BTreeSet::new();
+	let admitted_extensions = prompt_discovery
+		.content
+		.extensions
+		.iter()
+		.chain(args.extension_launch.trusted.iter())
+		.map(|extension| {
+			if !extension_keys.insert(extension.key.clone()) {
+				return Err(miette::miette!("duplicate extension host identity: {:?}", extension.key));
+			}
+			Ok(extension.clone())
+		})
+		.collect::<miette::Result<Vec<_>>>()?;
 	let roles = roles::resolve_launch_roles(
 		catalog,
+		&model_settings,
 		args.model.as_deref(),
 		args.smol.as_deref(),
 		args.slow.as_deref(),
@@ -583,7 +677,7 @@ pub(crate) async fn run(
 	let plan_handoff = if args.plan_yolo {
 		match args.plan_yolo_into.as_deref() {
 			Some(selector) => {
-				let selected = roles::resolve_role_selector(catalog, selector)
+				let selected = roles::resolve_role_selector(catalog, &model_settings, selector)
 					.map_err(|error| miette::miette!(error))?;
 				Some(
 					ModelSelection::resolved(selected.model.as_str(), selected.thinking.as_deref())
@@ -600,27 +694,37 @@ pub(crate) async fn run(
 	} else {
 		None
 	};
-	let interrupt_grace = settings.runtime_durations().interrupt_grace;
 	let auto_thinking = settings.auto_thinking;
-	let power_mode = omp_driver::power::configured(&data_dir).into_diagnostic()?;
+	let power_mode = settings_snapshot
+		.project::<omp_driver::power::PowerSettings>()
+		.map_err(|error| miette::miette!(error))?
+		.get()
+		.sleep_prevention;
 	let explicit_model = roles
 		.primary
 		.as_ref()
 		.map(|model| Str::from(model.as_str()))
 		.or_else(|| args.model.clone());
-	let model = match explicit_model
-		.clone()
-		.or_else(|| settings.default_model.map(Str::from))
-	{
+	let model = match explicit_model.clone() {
 		Some(model) => model,
 		None => wizard::run(&data_dir, catalog)
 			.await?
 			.ok_or_else(|| miette::miette!("no model configured — run `omp` again to finish setup"))?,
 	};
 	let model = match resolve_model_selector(catalog, model.as_str()) {
-		Ok(model) => model,
-		Err(error) if explicit_model.is_none() => {
-			let fallback = fallback_model_selector(catalog).ok_or_else(|| miette::miette!(error))?;
+		Ok(resolved)
+			if roles::model_selector_allowed(catalog, &model_settings, resolved.as_str()) =>
+		{
+			resolved
+		},
+		Ok(resolved) if explicit_model.is_some() => {
+			return Err(
+				miette::miette!("model `{resolved}` is disabled by effective model settings").into(),
+			);
+		},
+		Ok(_) | Err(_) if explicit_model.is_none() => {
+			let fallback = roles::fallback_model_selector(catalog, &model_settings)
+				.ok_or_else(|| miette::miette!("no model is allowed by effective settings"))?;
 			eprintln!(
 				"Saved model `{}` is unavailable; using `{}` for this session without changing the \
 				 saved preference.",
@@ -629,6 +733,11 @@ pub(crate) async fn run(
 			fallback
 		},
 		Err(error) => return Err(miette::miette!(error).into()),
+		Ok(resolved) => {
+			return Err(
+				miette::miette!("model `{resolved}` is disabled by effective model settings").into(),
+			);
+		},
 	};
 	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
 		return Err(miette::miette!(
@@ -661,7 +770,6 @@ pub(crate) async fn run(
 	};
 	ensure_state_directory(&sessions_dir).map_err(|e| miette::miette!(e))?;
 	let requested_resume = picked_resume.or_else(|| args.resume.clone());
-	let env_socket = omp_env::project_state::environment_socket(&state_dir);
 	let document_socket = omp_env::project_state::document_socket(&state_dir);
 	let search_bridge = Arc::new(InferenceBridge::default());
 	let goal_control = AgentGoalControl::default();
@@ -674,12 +782,13 @@ pub(crate) async fn run(
 	} else {
 		None
 	};
-	let bridges = omp_driver::bridges::builtin(
+	let bridges = omp_driver::bridges::builtin_with_content(
 		&root,
 		Arc::clone(&search_bridge),
 		goal_control.clone(),
 		None,
 		advise_queue.clone(),
+		&prompt_discovery.content,
 	);
 	let bridges = omp_envd::RegistryBridges {
 		ask_presenter: Some(omp_chat_ui::ask::presenter()),
@@ -695,22 +804,21 @@ pub(crate) async fn run(
 		},
 		..bridges
 	};
-	let prompt_head = Arc::new(ProductionPromptHead::from_extension_specs(&args.trusted_extensions));
-	let environment = omp_envd::ProjectEnvironment::connect_or_start(
+	let prompt_head = Arc::new(ProductionPromptHead::from_extension_specs(&admitted_extensions));
+	let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
 		&root,
 		&state_dir,
-		&env_socket,
 		&document_socket,
 		args.py_eval,
-		args.effective_approval().map(Into::into),
-		&args.trusted_extensions,
-		interrupt_grace,
+		&admitted_extensions,
+		&args.extension_launch.contributed,
+		Arc::clone(&settings_snapshot),
 		bridges,
 	)
 	.await
 	.map_err(|e| miette::miette!(e))?;
 	let credential_control_grants =
-		omp_driver::secrets::credential_control_grants(&args.trusted_extensions);
+		omp_driver::secrets::credential_control_grants(&admitted_extensions);
 	let session_index = if let Some(database) = selected_index_path {
 		Arc::new(
 			SessionIndex::open(database)
@@ -744,27 +852,11 @@ pub(crate) async fn run(
 					.0,
 			)
 		}
-	} else if let Some(selector) = args.continue_session.as_deref() {
-		if selector == "@terminal" {
-			breadcrumbs
-				.read(terminal_id.as_str())
-				.map_err(|error| miette::miette!(error))?
-				.map(|session| session.0)
-		} else {
-			let root_text = root.to_string_lossy();
-			let page = session_index
-				.list(&omp_storage::index::SessionFilter {
-					project: Some(Str::from(root_text.as_ref())),
-					limit: 200,
-					..Default::default()
-				})
-				.map_err(|error| miette::miette!(error))?;
-			Some(
-				omp_driver::session_state::resolve_session_selector(&page.sessions, selector)
-					.map_err(|error| miette::miette!(error))?
-					.0,
-			)
-		}
+	} else if args.continue_session {
+		breadcrumbs
+			.read(terminal_id.as_str())
+			.map_err(|error| miette::miette!(error))?
+			.map(|session| session.0)
 	} else {
 		None
 	};
@@ -840,8 +932,11 @@ pub(crate) async fn run(
 	let mut snapshot = agent_snapshot(&blueprint, catalog, args.external_thinking.then_some(true))
 		.map_err(|error| miette::miette!(error))?;
 	let mut prompt_facts = blueprint.prompt_facts().clone();
-	let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
-	let prompt_settings = PromptSettings::default()
+	let prompt_settings = settings_snapshot
+		.project::<PromptSettings>()
+		.map_err(|error| miette::miette!(error))?
+		.get()
+		.clone()
 		.with_cli(&args.prompt_settings)
 		.resolve_inputs(&root, &home)
 		.map_err(|error| miette::miette!(error))?;
@@ -851,6 +946,7 @@ pub(crate) async fn run(
 		codex_task_policy: prompt_policy::uses_codex_task_prompt(model.as_str()),
 	};
 	if let Some(level) = args.thinking
+		&& level != crate::cli::ThinkingLevel::Auto
 		&& !args.external_thinking
 	{
 		let effort = thinking_effort(level.into(), auto_thinking);
@@ -859,19 +955,21 @@ pub(crate) async fn run(
 	}
 	if resume.is_some() {
 		let path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
-		let Session { id, journal, initial_items: _ } = session;
+		let Session { id, journal, initial_items } = session;
 		let revived = omp_agent::revive_existing(&path, journal, snapshot)
 			.map_err(|error| miette::miette!(error))?;
-		session = Session { id, journal: revived.journal, initial_items: revived.live_items };
+		session = Session { id, journal: revived.journal, initial_items };
 		snapshot = revived.snapshot;
 		if let Some(model) = revived.model_override
 			&& !model.fallback
 		{
 			snapshot.turn.params.model = format!("{}/{}", model.model.provider.0, model.model.model.0);
 		}
-		if !model_selector_is_selectable(catalog, &snapshot.turn.params.model) {
+		if !model_selector_is_selectable(catalog, &snapshot.turn.params.model)
+			|| !roles::model_selector_allowed(catalog, &model_settings, &snapshot.turn.params.model)
+		{
 			let saved = snapshot.turn.params.model.clone();
-			let fallback = fallback_model_selector(catalog)
+			let fallback = roles::fallback_model_selector(catalog, &model_settings)
 				.ok_or_else(|| miette::miette!("no selectable model is available to resume"))?;
 			snapshot.turn.params.model = fallback.as_str().to_owned();
 			eprintln!(
@@ -898,10 +996,6 @@ pub(crate) async fn run(
 	)
 	.map_err(|error| miette::miette!(error))?;
 	let env = environment.client().with_invocation_grant(invocation_grant);
-	let settings_manager = Arc::new(
-		SettingsManager::open(SettingsPaths::discover(&data_dir, Some(&root)))
-			.map_err(|error| miette::miette!(error))?,
-	);
 	let configured_autolearn = settings_manager
 		.snapshot()
 		.project::<omp_driver::settings::Settings>()
@@ -916,9 +1010,12 @@ pub(crate) async fn run(
 		auto_continue:  configured_autolearn.auto_continue,
 		min_tool_calls: configured_autolearn.min_tool_calls,
 	};
-	let active_content = omp_driver::discovery::active_content_snapshots(&root);
+	let active_content = prompt_discovery.content;
 	for warning in active_content.warnings.iter() {
 		eprintln!("Extension load warning: {warning}");
+	}
+	for diagnostic in prompt_discovery.context.diagnostics.iter() {
+		eprintln!("Context load warning: {diagnostic:?}");
 	}
 	let prompt_rules = if args.no_rules {
 		Arc::from([])
@@ -939,12 +1036,7 @@ pub(crate) async fn run(
 			None => discovered,
 		}
 	};
-	let context_roots = iter::once(&root)
-		.chain(args.add_dir.iter())
-		.map(|path| GrantedContextRoot { root: path.clone(), start: path.clone() })
-		.collect::<Vec<_>>();
-	let context = context::discover(&context_roots, &ContextDiscoveryOptions::default());
-	prompt_facts.context_files = context::prompt_files(&context);
+	prompt_facts.context_files = context::prompt_files(&prompt_discovery.context);
 	let prepared_prompt = PromptSnapshot::freeze(
 		prompt_facts,
 		registry.as_ref(),
@@ -969,7 +1061,16 @@ pub(crate) async fn run(
 	let state = AgentState::new(snapshot);
 	let initial_regime = (args.plan_mode || args.plan_yolo).then_some("plan");
 	let initial_prompt_slot = args.plan_yolo.then_some("plan-yolo");
+	let initial_parts =
+		crate::print_mode::initial_parts(&args.prompt, settings.images.auto_resize).await?;
+	let initial_submission = if initial_parts.is_empty() {
+		None
+	} else {
+		crate::print_mode::initial_message(initial_parts, None).pop()
+	};
 	let initial_session = session.id.clone();
+	let invocation_deadline =
+		absolute_invocation_deadline(Instant::now(), args.max_time.map(|duration| duration.0));
 
 	let final_session = if let Some(endpoint) = args.gateway {
 		if args.api_key.is_some() || args.prompt_cache_key.is_some() {
@@ -987,7 +1088,6 @@ pub(crate) async fn run(
 			.bind_remote(channel.clone())
 			.into_diagnostic()?;
 		Box::pin(run_ui(
-			executor.clone(),
 			RpcTurnClient::new(channel.clone()),
 			&environment,
 			env,
@@ -1012,13 +1112,19 @@ pub(crate) async fn run(
 			power_mode,
 			initial_regime,
 			initial_prompt_slot,
+			initial_submission.clone(),
 			plan_selection,
 			plan_handoff.clone(),
+			auto_thinking,
+			args.thinking == Some(crate::cli::ThinkingLevel::Auto),
+			invocation_deadline,
 			args.external_thinking.then_some(true),
 			args.hide_thinking,
 			security_enabled,
 			!args.no_title,
 			resize_scrollback,
+			prompt_discovery_settings.clone(),
+			Arc::clone(&catalog_owner),
 			ChatScope {
 				catalog,
 				root: &root,
@@ -1050,6 +1156,7 @@ pub(crate) async fn run(
 				api_key:               args.api_key.clone(),
 				prompt_cache_affinity: args.prompt_cache_key.clone(),
 				usage_fetchers:        Some(environment.usage_fetchers()),
+				settings:              Some(Arc::clone(&settings_snapshot)),
 			},
 		)
 		.await
@@ -1066,7 +1173,6 @@ pub(crate) async fn run(
 			.map_err(ChatError::from)
 			.into_diagnostic()?;
 		Box::pin(run_ui(
-			executor,
 			client,
 			&environment,
 			env,
@@ -1091,13 +1197,19 @@ pub(crate) async fn run(
 			power_mode,
 			initial_regime,
 			initial_prompt_slot,
+			initial_submission,
 			plan_selection,
 			plan_handoff,
+			auto_thinking,
+			args.thinking == Some(crate::cli::ThinkingLevel::Auto),
+			invocation_deadline,
 			args.external_thinking.then_some(true),
 			args.hide_thinking,
 			security_enabled,
 			!args.no_title,
 			resize_scrollback,
+			prompt_discovery_settings.clone(),
+			Arc::clone(&catalog_owner),
 			ChatScope {
 				catalog,
 				root: &root,
@@ -1142,7 +1254,6 @@ pub(crate) async fn run(
 /// Reports the platform limitation before touching project state.
 #[cfg(not(any(unix, windows)))]
 pub(crate) async fn run(
-	_executor: omp_executor::Executor,
 	_args: ChatArgs,
 	_start: ChatStart,
 	_presentation: ChatPresentation,
@@ -1491,12 +1602,70 @@ fn advisor_parts_text(parts: &[omp_proto::thread::v1::Part]) -> Option<Str> {
 	(!rendered.is_empty()).then(|| Str::from(rendered))
 }
 
+async fn run_memory_extractions<C>(
+	runtime: Arc<omp_memory::MemoryRuntime>,
+	lane: InferenceExtractionLane<C>,
+	shutdown: CancellationToken,
+) where
+	C: TurnClient + Clone + Send + Sync + 'static,
+{
+	let notifications = runtime.extraction_notifications();
+	let mut draining = false;
+	loop {
+		let pending = match runtime.pending_extractions(16) {
+			Ok(pending) => pending,
+			Err(error) => {
+				tracing::warn!(%error, "memory extraction queue read failed");
+				if draining {
+					time::sleep(Duration::from_millis(250)).await;
+				} else {
+					tokio::select! {
+						() = shutdown.cancelled() => draining = true,
+						() = time::sleep(Duration::from_millis(250)) => {},
+					}
+				}
+				continue;
+			},
+		};
+		if pending.is_empty() {
+			if draining {
+				break;
+			}
+			tokio::select! {
+				() = shutdown.cancelled() => draining = true,
+				_ = notifications.recv_async() => {},
+			}
+			continue;
+		}
+		for request in pending {
+			if let Err(error) = omp_driver::memory::extract(runtime.as_ref(), &lane, request).await {
+				tracing::warn!(%error, "automatic memory extraction failed; job remains queued");
+				if draining {
+					time::sleep(Duration::from_millis(250)).await;
+				} else {
+					tokio::select! {
+						() = shutdown.cancelled() => draining = true,
+						() = time::sleep(Duration::from_millis(250)) => {},
+					}
+				}
+				break;
+			}
+			if let Err(error) = runtime.enqueue() {
+				tracing::error!(
+					%error,
+					"memory extraction persisted but graph reconciliation failed; queued maintenance \
+					 will retry on the next runtime enqueue"
+				);
+			}
+		}
+	}
+}
+
 #[expect(
 	clippy::future_not_send,
 	reason = "the designed terminal host remains confined to its event-loop thread"
 )]
 async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
-	executor: omp_executor::Executor,
 	client: C,
 	environment: &omp_envd::ProjectEnvironment,
 	env: omp_env::EnvClient,
@@ -1521,26 +1690,50 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	power_mode: omp_driver::power::SleepPrevention,
 	initial_regime: Option<&'static str>,
 	initial_prompt_slot: Option<&'static str>,
+	mut initial_submission: Option<omp_proto::thread::v1::Item>,
 	plan_selection: Option<ModelSelection>,
 	plan_handoff: Option<ModelSelection>,
+	auto_thinking: omp_driver::settings::AutoThinkingSettings,
+	auto_thinking_selected: bool,
+	invocation_deadline: Option<Instant>,
 	external_thinking: Option<bool>,
 	hide_thinking: bool,
 	security_enabled: bool,
 	title_enabled: bool,
 	resize_scrollback: host::ResizeScrollback,
+	prompt_discovery_settings: omp_driver::discovery::PromptDiscoverySettings,
+	catalog_owner: Arc<omp_catalog::snapshot::Catalog>,
 	scope: ChatScope<'_>,
 	mut start: ChatStart,
 	presentation: ChatPresentation,
 ) -> Result<Str, ChatError> {
+	state.update(|snapshot| snapshot.deadline = invocation_deadline);
+	let memory_runtime = environment.memory_runtime();
+	let mnemopi = memory_runtime.mnemopi_settings().ok().cloned();
+	let memory_params = state.snapshot().turn.params.clone();
+	let extraction_shutdown = CancellationToken::new();
+	let mut extraction_task = mnemopi
+		.as_ref()
+		.and_then(|mnemopi| {
+			InferenceExtractionLane::from_settings(
+				client.clone(),
+				memory_params.clone(),
+				mnemopi,
+				"@memory",
+			)
+		})
+		.map(|lane| {
+			tokio::spawn(run_memory_extractions(
+				Arc::clone(&memory_runtime),
+				lane,
+				extraction_shutdown.clone(),
+			))
+		});
 	let memory_source =
-		Arc::new(RuntimePromptMemorySource::new(environment.memory_runtime(), usize::MAX));
-	let memory_prompt = omp_driver::memory::prompt_snapshot(
-		environment.memory_runtime().as_ref(),
-		None,
-		None,
-		usize::MAX,
-	)
-	.map_err(DriverChatError::from)?;
+		Arc::new(RuntimePromptMemorySource::new(Arc::clone(&memory_runtime), usize::MAX));
+	let memory_prompt =
+		omp_driver::memory::prompt_snapshot(memory_runtime.as_ref(), None, None, usize::MAX)
+			.map_err(DriverChatError::from)?;
 	state.update(|snapshot| {
 		let values = [
 			("memory", memory_prompt.memory.content.clone()),
@@ -1562,6 +1755,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		Arc::clone(&scope.session_index),
 		security_enabled,
 	));
+	parent.set_prompt_discovery_settings(prompt_discovery_settings.clone());
+	parent.set_auto_thinking_settings(auto_thinking);
 	let edit_repair_service = edit_repair_requests
 		.map(|requests| omp_driver::chat::spawn_edit_repair_service(parent.clone(), requests));
 	environment
@@ -1577,7 +1772,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		.reflection_bridge()
 		.bind(Arc::new(InferenceExtractionLane::with_selector(
 			client.clone(),
-			state.snapshot().turn.params.clone(),
+			memory_params,
 			"@smol",
 		)))
 		.map_err(DriverChatError::from)?;
@@ -1592,7 +1787,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	let drafts = DraftStore::new(&data_dir)?;
 	let breadcrumbs = TerminalBreadcrumbs::new(&data_dir)?;
 	let terminal_id = omp_tui::ttyid::terminal_id();
+	let mut reconstructed_draft: Option<Str> = None;
 	let final_id = loop {
+		state.update(|snapshot| snapshot.deadline = invocation_deadline);
 		if scope.persist_sessions {
 			breadcrumbs.restamp(terminal_id.as_str(), &SessionId(session.id.clone()))?;
 		}
@@ -1619,16 +1816,35 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		};
 		let Session { id, journal, initial_items } = session;
 		let current_id = id.clone();
-		let content = omp_driver::discovery::active_content_snapshots(scope.root);
+		let agent_env = env
+			.with_principal(id.clone(), id.clone())
+			.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		let home = env::var_os("HOME")
+			.map(PathBuf::from)
+			.unwrap_or_else(|| scope.root.to_path_buf());
+		let content = omp_driver::discovery::active_prompt_snapshots(
+			scope.root,
+			&[],
+			&home,
+			&prompt_discovery_settings,
+		)
+		.content;
 		let (ttsr, ttsr_diagnostics) = omp_driver::rulebook::ttsr_registry(content.rules.as_ref());
 		for error in ttsr_diagnostics {
 			tracing::warn!(%error, "TTSR rule condition was rejected");
 		}
-		let mut agent =
-			Agent::new(client.clone(), env.clone(), state.clone(), journal, CHAT_CAPS_BASE);
+		let mut agent = Agent::new(client.clone(), agent_env, state.clone(), journal, CHAT_CAPS_BASE);
 		parent.bind_host_control(id.clone(), agent.host_control());
 		agent.set_unexpected_stop_classifier(parent.clone());
-		let runtime_settings = omp_driver::settings::current(&data_dir)?;
+		if auto_thinking_selected {
+			agent.set_difficulty_classifier(parent.clone());
+		}
+		let runtime_settings = settings_manager
+			.snapshot()
+			.project::<omp_driver::settings::Settings>()
+			.map_err(|source| SettingsManagerError::Projection { source })?
+			.get()
+			.clone();
 		agent.configure_streaming_edit_guard(
 			scope.root.to_path_buf(),
 			runtime_settings.tools.edit_streaming_abort,
@@ -1649,6 +1865,33 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		});
 		agent.set_ttsr_registry(ttsr);
 		agent.set_prompt_memory_source(memory_source.clone());
+		agent.set_session_memory(omp_memory::session::SessionMemory::top_level(
+			environment.memory_runtime(),
+		));
+		agent.set_steering_mode(runtime_settings.interaction.steering_mode.into());
+		let selected_model = {
+			let snapshot = state.snapshot();
+			scope
+				.catalog
+				.model(omp_catalog::ModelKey::from_ref(&snapshot.turn.params.model))
+				.or_else(|| scope.catalog.resolve_alias(&snapshot.turn.params.model))
+		};
+		agent.set_context_promotion(omp_agent::ContextPromotionPolicy {
+			enabled: runtime_settings.context_promotion.enabled,
+			target:  selected_model
+				.and_then(|model| model.context_promotion_target.as_ref())
+				.map(|target| Str::new(target.as_str())),
+		});
+		agent.set_mid_turn_compaction(omp_agent::MidTurnCompactionPolicy {
+			enabled:          runtime_settings.compaction.enabled
+				&& runtime_settings.compaction.mid_turn_enabled,
+			threshold_tokens: ((model_usable_context_window(
+				scope.catalog,
+				&state.snapshot().turn.params.model,
+			)
+			.unwrap_or(u64::MAX) as f64)
+				* runtime_settings.compaction.threshold_fraction) as u64,
+		});
 		blueprint.configure_agent(&mut agent);
 		match omp_driver::registry::production_redemption_authority(&data_dir) {
 			Ok(Some(authority)) => agent.set_redemption_authority(authority),
@@ -1680,7 +1923,6 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		};
 		let prompt_factory = prompt_control_factory(prompt_head.clone());
 		let presentation_factory = presentation_control_factory(
-			executor.clone(),
 			Arc::clone(&presentation_bridge),
 			Arc::clone(&extension_callbacks),
 		);
@@ -1881,20 +2123,52 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				advisor_runtime.observe(event.as_ref()).await;
 			}
 		});
-		let initial_draft = if scope.persist_sessions {
+		let saved_draft = if let Some(draft) = reconstructed_draft.take() {
+			draft.to_string()
+		} else if scope.persist_sessions {
 			drafts
 				.consume(&SessionId(current_id.clone()))?
 				.unwrap_or_default()
 		} else {
 			String::new()
 		};
-		let (_approval_route, approval_inbox) =
+		let initial_draft = Str::from(saved_draft);
+		let submission = initial_submission.take();
+		let (approval_route, approval_inbox) =
 			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
+		environment.bind_approval_authority(Some(Arc::clone(&approval_book)), Some(approval_route));
 		let (replica_pump, replica) =
 			GuestRelayPump::new(data_dir.join("collab"), scope.root.to_path_buf(), now_ms());
 		let replica_shutdown = replica.clone();
 		let mut replica_task = tokio::spawn(replica_pump.run());
-		let (collab_authority, collab) = CollabSessionAuthority::with_guest_replica(Some(replica));
+		let collab_subscription = agent
+			.subscribe_collaboration()
+			.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		let collab_state = omp_proto::collab::v1::SessionStateUpdate {
+			host_cwd: scope.root.to_string_lossy().into_owned(),
+			participants: vec![omp_proto::collab::v1::Participant {
+				display_name: runtime_settings.collab.resolved_display_name().to_string(),
+				is_host:      true,
+				read_only:    false,
+				peer_id:      0,
+			}],
+			..Default::default()
+		};
+		let (host, host_ports) = omp_driver::collab::session::HostRuntime::new(
+			collab_subscription,
+			omp_proto::collab::v1::SessionHeader {
+				session_id:    id.to_string(),
+				title:         String::new(),
+				created_at_ms: now_ms(),
+				host_cwd:      scope.root.to_string_lossy().into_owned(),
+			},
+			collab_state.clone(),
+			Default::default(),
+			agent.mailbox(),
+		)
+		.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		let (collab_authority, collab) =
+			CollabSessionAuthority::with_runtimes(Some(replica), Some(host));
 		let mut collab_task = session::spawn_session_owner(collab_authority);
 		let title = scope
 			.session_index
@@ -1905,22 +2179,27 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				title:  session.title,
 				source: session.title_source,
 			});
+		let journal_path = scope.sessions_dir.join(format!("{id}.jsonl"));
 		let outcome = chat_ui::run(
-			executor.clone(),
 			agent,
 			environment,
-			ChatUiSession { session_id: id, initial_items, context_window, title },
+			ChatUiSession { session_id: id, journal_path, initial_items, context_window, title },
 			Some(advisor_engine),
 			advisor_notices,
+			Arc::clone(&catalog_owner),
 			Arc::clone(&scope.registry),
 			parent.tree(),
 			Arc::clone(&parent),
 			Some(collab),
+			Some(host_ports.live),
+			Some(host_ports.operations),
+			Some(collab_state),
 			modes,
 			auth.as_ref().map(|worker| worker.ui().clone()),
 			auth_control.clone(),
 			data_dir.clone(),
 			Arc::clone(&settings_manager),
+			prompt_discovery_settings.clone(),
 			Arc::clone(&telemetry_index),
 			Arc::clone(&scope.session_index),
 			scope.root.to_path_buf(),
@@ -1947,11 +2226,13 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				move || resume_choices(&sessions_dir, &root, Some(&current_id)).into_diagnostic()
 			},
 			matches!(start, ChatStart::SessionIndex),
-			Str::from(initial_draft),
+			initial_draft,
+			submission,
 			presentation,
 			Some(presentation_bridge.attach()),
 		)
 		.await;
+		environment.bind_approval_authority(None, None);
 		replica_shutdown.stop().await;
 		if time::timeout(Duration::from_secs(3), &mut replica_task)
 			.await
@@ -1985,6 +2266,41 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		start = ChatStart::Session;
 		match outcome.exit {
 			host::HostExit::Quit => break current_id,
+			host::HostExit::ExternalEditor => {
+				let draft = crate::editor::edit_draft_detached(
+					outcome.draft.as_str(),
+					crate::editor::EditorOptions::default(),
+				)
+				.map_err(|error| ChatError::Ui(miette::miette!("{error}")))?
+				.unwrap_or_else(|| outcome.draft.to_string());
+				reconstructed_draft = Some(Str::from(draft.as_str()));
+				if scope.persist_sessions {
+					drafts.save(&SessionId(current_id.clone()), draft.as_str())?;
+				}
+				let model = state.snapshot().turn.params.model.clone();
+				let prompt_props = state.snapshot().props.clone();
+				session = open_session(
+					scope.root,
+					scope.sessions_dir,
+					SessionOpen::Resume(&current_id),
+					scope.registry.as_ref(),
+					scope
+						.persist_sessions
+						.then(|| Arc::clone(&scope.session_index)),
+				)?;
+				let additional_roots = blueprint.options().additional_roots.clone();
+				blueprint = session_blueprint(
+					&model,
+					scope.catalog,
+					scope.root,
+					&additional_roots,
+					&session.id,
+					Arc::clone(&scope.registry),
+				)?;
+				let mut next = agent_snapshot(&blueprint, scope.catalog, external_thinking)?;
+				next.props = replace_model_props(prompt_props, &model);
+				state = AgentState::new(next);
+			},
 			host::HostExit::Suspend => {
 				#[cfg(unix)]
 				if let Err(error) = signal::kill(Pid::from_raw(0), signal::Signal::SIGSTOP) {
@@ -2091,6 +2407,18 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			},
 		}
 	};
+	extraction_shutdown.cancel();
+	if let Some(mut task) = extraction_task.take()
+		&& time::timeout(
+			Duration::from_millis(mnemopi.as_ref().map_or(1000, |m| m.shutdown_timeout_ms)),
+			&mut task,
+		)
+		.await
+		.is_err()
+	{
+		task.abort();
+		let _ = task.await;
+	}
 	if let Some(auth) = auth {
 		auth.shutdown().await;
 	}
@@ -2098,4 +2426,18 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		service.abort();
 	}
 	Ok(final_id)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn max_time_is_one_absolute_deadline() {
+		let now = Instant::now();
+		let deadline =
+			absolute_invocation_deadline(now, Some(Duration::from_secs(30))).expect("deadline");
+		assert_eq!(deadline.duration_since(now), Duration::from_secs(30));
+		assert_eq!(absolute_invocation_deadline(now, None), None);
+	}
 }

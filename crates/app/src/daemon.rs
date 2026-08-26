@@ -356,14 +356,6 @@ impl DaemonConfig {
 		config
 	}
 
-	/// Creates an unauthenticated loopback TCP daemon configuration.
-	pub fn loopback_without_auth(address: SocketAddr) -> Result<Self, DaemonError> {
-		if !address.ip().is_loopback() {
-			return Err(DaemonError::UnauthenticatedRemoteTcp);
-		}
-		Ok(Self::local(LocalEndpoint::tcp(address)))
-	}
-
 	/// Overrides the directory containing encrypted credentials and session
 	/// state.
 	pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
@@ -447,9 +439,9 @@ pub enum DaemonError {
 	/// TCP RPC listener could not bind.
 	#[error("could not bind TCP gateway endpoint")]
 	TcpListen(#[source] io::Error),
-	/// A TCP listener was configured without bearer authentication off loopback.
-	#[error("unauthenticated TCP gateway endpoints must bind to loopback")]
-	UnauthenticatedRemoteTcp,
+	/// A TCP listener was configured without bearer authentication.
+	#[error("TCP gateway endpoints require bearer authentication")]
+	UnauthenticatedTcp,
 	/// The gateway bearer token could not be loaded.
 	#[error("could not load gateway bearer token")]
 	GatewayToken(#[source] io::Error),
@@ -665,14 +657,12 @@ impl DaemonHandle {
 				(task, None)
 			},
 			LocalEndpoint::Tcp(address) => {
-				if bearer_token_file.is_none() && !address.ip().is_loopback() {
-					return Err(DaemonError::UnauthenticatedRemoteTcp);
-				}
+				let path = bearer_token_file.ok_or(DaemonError::UnauthenticatedTcp)?;
 				let listener = TcpListener::bind(address)
 					.await
 					.map_err(DaemonError::TcpListen)?;
 				let incoming = TcpListenerStream::new(listener);
-				if let Some(path) = bearer_token_file {
+				{
 					let auth_state =
 						BearerAuth { token: Arc::new(RwLock::new(load_gateway_token(&path)?)) };
 					let token_shutdown = rpc_shutdown.clone();
@@ -709,25 +699,6 @@ impl DaemonHandle {
 							.await
 					});
 					(task, Some(token_task))
-				} else {
-					let inference_service = InferenceServer::new(inference.clone());
-					let gateway = GatewayServer::new(hello());
-					let forward = ForwardProxyServer::new(GatewayRpc::new(inference.clone()));
-					let auth = AuthServer::new(auth_rpc.clone());
-					let blobs = BlobServer::new(BlobRpc::new(blobs.clone()));
-					let task = tokio::spawn(async move {
-						Server::builder()
-							.add_service(gateway)
-							.add_service(forward)
-							.add_service(inference_service)
-							.add_service(blobs)
-							.add_service(auth)
-							.serve_with_incoming_shutdown(incoming, async move {
-								while !*rpc_shutdown.borrow() && rpc_shutdown.changed().await.is_ok() {}
-							})
-							.await
-					});
-					(task, None)
 				}
 			},
 		};

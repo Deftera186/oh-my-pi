@@ -3007,6 +3007,45 @@ impl IgnoreEntryNames {
 fn has_repo_marker(dir: &Path) -> bool {
 	dir.join(".git").exists() || dir.join(".jj").exists()
 }
+/// Resolves the repository-local exclude file for both normal repositories and
+/// linked worktrees whose `.git` entry is a `gitdir:` pointer file.
+fn git_exclude_path(dir: &Path) -> Option<PathBuf> {
+	let marker = dir.join(".git");
+	if marker.is_dir() {
+		return Some(marker.join("info/exclude"));
+	}
+	if !marker.is_file() {
+		return None;
+	}
+	let pointer = fs::read_to_string(marker).ok()?;
+	let gitdir = pointer
+		.lines()
+		.find_map(|line| line.trim().strip_prefix("gitdir:").map(str::trim))
+		.filter(|path| !path.is_empty())?;
+	let gitdir = PathBuf::from(gitdir);
+	let gitdir = if gitdir.is_absolute() {
+		gitdir
+	} else {
+		dir.join(gitdir)
+	};
+	let common = fs::read_to_string(gitdir.join("commondir"))
+		.ok()
+		.and_then(|value| {
+			let path = PathBuf::from(value.trim());
+			(!path.as_os_str().is_empty()).then_some(path)
+		})
+		.map_or_else(
+			|| gitdir.clone(),
+			|path| {
+				if path.is_absolute() {
+					path
+				} else {
+					gitdir.join(path)
+				}
+			},
+		);
+	Some(common.join("info/exclude"))
+}
 
 fn ignore_line_covers_root(
 	matcher_root: &Path,
@@ -3072,13 +3111,15 @@ fn load_gitignore(
 impl IgnoreState {
 	fn build(dir: &Path, parent: Option<Arc<Self>>) -> Arc<Self> {
 		let has_git = has_repo_marker(dir);
-		let git_exclude = dir.join(".git/info/exclude");
+		let git_exclude = git_exclude_path(dir);
 		Self::new(
 			parent,
 			load_gitignore(dir, &dir.join(".ignore"), None),
 			load_gitignore(dir, &dir.join(".gitignore"), None),
 			if has_git {
-				load_gitignore(dir, &git_exclude, None)
+				git_exclude
+					.as_deref()
+					.and_then(|path| load_gitignore(dir, path, None))
 			} else {
 				None
 			},
@@ -3088,13 +3129,15 @@ impl IgnoreState {
 
 	fn build_parent(dir: &Path, parent: Option<Arc<Self>>, explicit_root: &Path) -> Arc<Self> {
 		let has_git = has_repo_marker(dir);
-		let git_exclude = dir.join(".git/info/exclude");
+		let git_exclude = git_exclude_path(dir);
 		Self::new(
 			parent,
 			load_gitignore(dir, &dir.join(".ignore"), Some(explicit_root)),
 			load_gitignore(dir, &dir.join(".gitignore"), Some(explicit_root)),
 			if has_git {
-				load_gitignore(dir, &git_exclude, Some(explicit_root))
+				git_exclude
+					.as_deref()
+					.and_then(|path| load_gitignore(dir, path, Some(explicit_root)))
 			} else {
 				None
 			},
@@ -3106,7 +3149,7 @@ impl IgnoreState {
 		if !names.has_relevant() {
 			return Arc::clone(parent);
 		}
-		let git_exclude = dir.join(".git/info/exclude");
+		let git_exclude = git_exclude_path(dir);
 		Self::new(
 			Some(Arc::clone(parent)),
 			if names.ignore_file {
@@ -3120,7 +3163,9 @@ impl IgnoreState {
 				None
 			},
 			if names.git_dir {
-				load_gitignore(dir, &git_exclude, None)
+				git_exclude
+					.as_deref()
+					.and_then(|path| load_gitignore(dir, path, None))
 			} else {
 				None
 			},
@@ -4357,6 +4402,25 @@ mod tests {
 			paths.is_empty(),
 			"repo-root .gitignore should still apply when walking a subdirectory root, got {paths:?}"
 		);
+	}
+	#[test]
+	fn linked_worktree_honors_gitdir_info_exclude() {
+		let tree = temp_tree("linked-worktree-exclude");
+		let common = tree.path().join("repository").join(".git");
+		let gitdir = common.join("worktrees").join("fixture");
+		fs::create_dir_all(gitdir.clone()).expect("linked gitdir should be created");
+		fs::create_dir_all(common.join("info")).expect("common git info should be created");
+		fs::write(gitdir.join("commondir"), "../..\n").expect("commondir should be written");
+		fs::write(common.join("info").join("exclude"), "generated.txt\n")
+			.expect("repository exclude should be written");
+		let worktree = tree.path().join("checkout");
+		fs::create_dir_all(&worktree).expect("worktree should be created");
+		fs::write(worktree.join(".git"), "gitdir: ../repository/.git/worktrees/fixture\n")
+			.expect("gitdir pointer should be written");
+		fs::write(worktree.join("generated.txt"), "generated").expect("ignored file");
+		fs::write(worktree.join("kept.txt"), "kept").expect("kept file");
+
+		assert_eq!(collect_file_paths(&worktree, true), vec!["kept.txt"]);
 	}
 
 	#[test]

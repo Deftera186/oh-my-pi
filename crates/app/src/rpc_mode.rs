@@ -1,11 +1,12 @@
-//! Stateful Content-Length framed RPC server for headless clients.
+//! Stateful newline-delimited JSON RPC server for headless clients.
 
 use std::{
 	collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry},
-	env,
+	env, fs,
 	future::Future,
 	io, mem,
 	path::{Path, PathBuf},
+	pin::Pin,
 	process::{self, Stdio},
 	sync::{
 		Arc,
@@ -14,31 +15,34 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use flume::{Receiver, Sender};
-use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_catalog::{ModelKey, ProviderId, ServiceTier};
-use omp_core::{ExposeSecret as _, SecretString, Str, sf};
-use omp_driver::skills::SkillInvocationKind;
+use omp_agent::{AgentEvent, EventSubscription, RunSettlement};
+use omp_catalog::ProviderId;
+use omp_core::{ExposeSecret as _, Hash32, SecretString, Str, sf};
+use omp_driver::{
+	headless::{
+		HeadlessLaunchPolicy, HeadlessSession, HeadlessSessionOpen, HeadlessSessionOptions,
+		HeadlessToolPolicy,
+	},
+	skills::SkillInvocationKind,
+};
 use omp_envd::tool_url::host;
 use omp_inference::{
-	Client, Registry,
 	answer::{AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPromptKind, AuthSession},
 	auth::manager::AuthManager,
-	call::{
-		AuthInput, AuthMethod, AuthRequest, CallMeta, ChatRequest, ContentPart, LoginRequest,
-		Message, NegotiationPolicy, OpaqueJson, Role, Sampling, Setting, Target, ToolChoice,
-		ToolDefinition, ToolInputConstraint,
-	},
-	event::ChatEvent,
-	id::{LoginSessionId, RequestId as InferenceRequestId},
-	receipt::ExecutionBudget,
-	router,
+	call::{AuthInput, AuthMethod, AuthRequest, LoginRequest},
+	id::LoginSessionId,
+};
+use omp_proto::{
+	inference::v1::{Effort, Reasoning, part_start, turn_event},
+	thread::v1::{Blob, Item, Message as ThreadMessage, Part, Role as ThreadRole, blob, item, part},
 };
 use omp_rpc::{
 	framing::{
-		ContentLengthDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES, RpcFrameDecoder,
-		encode_json_v1, encode_json_v2,
+		JsonLineDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES, RpcFrameDecoder, encode_json_v1,
+		encode_json_v2,
 	},
 	protocol::{
 		ExtensionUiRequest, ExtensionUiResponse, HostToolCall, HostToolCancel, HostToolDefinition,
@@ -48,16 +52,17 @@ use omp_rpc::{
 		PROTOCOL_V1, PROTOCOL_V2, ReadyFrame, RequestId, RpcAuthAccount, RpcAuthAnswerFrame,
 		RpcAuthEvent, RpcAuthEventFrame, RpcAuthInputKind, RpcAuthMethod, RpcAuthPromptKind,
 		RpcAuthTerminalFrame, RpcAuthTerminalOutcome, RpcErrorCode, RpcRequest, RpcResponse,
-		RpcTurnOutcome, SubagentMessages,
+		SubagentMessages,
 	},
 };
+use omp_settings::manager::{SettingsManager, SettingsPaths};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
 	io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, stdin, stdout},
 	process::Command,
-	sync::oneshot,
+	sync::{Mutex as AsyncMutex, oneshot},
 	task::JoinHandle,
 	time,
 };
@@ -86,31 +91,137 @@ static STDIN_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Runs the stateful RPC server using stdin exclusively for protocol input and
 /// stdout exclusively for protocol output.
-pub async fn run(args: RpcArgs) -> miette::Result<()> {
+pub async fn run(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
+	let Some(max_time) = args.max_time.map(|duration| duration.0) else {
+		return run_inner(args, ui_enabled).await;
+	};
+	time::timeout(max_time, run_inner(args, ui_enabled))
+		.await
+		.map_err(|_| miette!("RPC mode exceeded --max-time"))?
+}
+
+async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	let _stdin_claim = StdinClaim::claim()?;
 	// RPC stdout is protocol-only; process notifications are suppressed by the
 	// embedding client before this process starts.
 
 	let data = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let configured_model = omp_driver::settings::current(&data)
+	let project = fs::canonicalize(&args.project).into_diagnostic()?;
+	let home = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
+	let mut settings_paths = SettingsPaths::discover(&data, Some(&project));
+	settings_paths.overlays.extend(args.config.iter().cloned());
+	let settings_manager = SettingsManager::open(settings_paths).into_diagnostic()?;
+	let settings_snapshot = settings_manager.snapshot();
+	let model_settings = settings_snapshot
+		.project::<omp_catalog::settings::ModelSettings>()
 		.into_diagnostic()?
-		.default_model
-		.map(Str::from);
-	let model = args
-		.model
-		.or(configured_model)
-		.ok_or_else(|| miette!("rpc mode requires --model or config.default_model"))?;
+		.get()
+		.resolve_path_scopes(&project, &home);
+	let skill_settings = settings_snapshot
+		.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
+		.into_diagnostic()?
+		.get()
+		.clone();
+	let disabled_extensions =
+		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
+	let prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
+		model:   model_settings.clone(),
+		skills:  skill_settings.clone(),
+		foreign: settings_snapshot
+			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		rules:   settings_snapshot
+			.project::<omp_driver::rulebook::RulebookSettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		native:  omp_driver::discovery::native::NativeDiscoveryOptions {
+			explicit_roots: if disabled_extensions {
+				Vec::new()
+			} else {
+				args.extension_launch.native_roots.clone()
+			},
+			root_mode: match args.extension_launch.mode {
+				crate::cli::InvocationExtensionMode::Merge => {
+					omp_driver::discovery::native::NativeRootMode::Merge
+				},
+				crate::cli::InvocationExtensionMode::ExplicitOnly
+				| crate::cli::InvocationExtensionMode::Disabled => {
+					omp_driver::discovery::native::NativeRootMode::ExplicitOnly
+				},
+			},
+			skill_settings,
+			include_workspace: !args.extension_launch.no_workspace && !disabled_extensions,
+			client_installed: Some(data.join("ext/installed.toml")),
+		},
+	};
+	let catalog = omp_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let roles = omp_driver::discovery::roles::resolve_launch_roles(
+		catalog,
+		&model_settings,
+		args.model.as_deref(),
+		args.smol.as_deref(),
+		args.slow.as_deref(),
+		args.plan.as_deref(),
+	)
+	.map_err(|error| miette!(error))?;
+	let model = roles
+		.primary
+		.ok_or_else(|| miette!("rpc mode requires a configured default model role"))?;
 	let store =
 		omp_driver::registry::open_credential_store(data.join("credentials.db")).into_diagnostic()?;
-	let (registry, auth) = omp_driver::registry::production_rpc_registry(&data, store)
-		.await
-		.into_diagnostic()?;
-	let models = registry
+	let (registry, auth) = omp_driver::registry::production_rpc_registry_with_settings(
+		&data,
+		store,
+		Arc::clone(&settings_snapshot),
+		Some(&project),
+	)
+	.await
+	.into_diagnostic()?;
+	let mut models = registry
 		.catalog()
 		.models()
 		.iter()
-		.map(|entry| entry.key.as_str().to_owned())
+		.filter_map(|entry| {
+			let (provider, model) = entry.key.as_str().split_once('/')?;
+			model_settings
+				.model_allowed(provider, model)
+				.then(|| entry.key.as_str().to_owned())
+		})
 		.collect::<Vec<_>>();
+	models.sort_by_key(|selector| {
+		let (provider, model) = selector.split_once('/').unwrap_or(("", selector.as_str()));
+		(
+			model_settings
+				.model_rank(provider, model)
+				.unwrap_or(usize::MAX),
+			selector.clone(),
+		)
+	});
+	let cycle_selectors = args.models.as_ref().map_or_else(
+		|| {
+			model_settings
+				.cycle_order
+				.iter()
+				.cloned()
+				.collect::<Vec<_>>()
+		},
+		|configured| configured.0.clone(),
+	);
+	let mut cycle_models = cycle_selectors
+		.iter()
+		.filter_map(|selector| {
+			omp_driver::discovery::roles::resolve_role_selector(catalog, &model_settings, selector)
+				.ok()
+				.map(|selected| selected.model.as_str().to_owned())
+		})
+		.collect::<Vec<_>>();
+	cycle_models.extend(models);
+	let mut seen_models = HashSet::new();
+	cycle_models.retain(|model| seen_models.insert(model.clone()));
+	let models = cycle_models;
 	let authenticated = match auth
 		.execute(AuthRequest::ListAccounts { provider: None })
 		.await
@@ -126,6 +237,7 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 		.catalog()
 		.providers()
 		.iter()
+		.filter(|entry| model_settings.provider_allowed(entry.id.as_str()))
 		.map(|entry| OAuthProvider {
 			id:            entry.id.as_str().to_owned(),
 			name:          entry.name.to_string(),
@@ -133,12 +245,80 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 			authenticated: authenticated.contains(entry.id.as_str()),
 		})
 		.collect::<Vec<_>>();
-	let preferred_provider = args.provider.map(|provider| provider.to_string());
+	let preferred_provider = args.provider.clone().map(|provider| provider.to_string());
 	if let Some(provider) = preferred_provider.as_deref()
 		&& !providers.iter().any(|candidate| candidate.id == provider)
 	{
 		return Err(miette!("unknown RPC provider `{provider}`"));
 	}
+	let state_dir =
+		omp_env::project_state::directory(&data, &project).map_err(|error| miette!(error))?;
+	let sessions_dir = args
+		.session_dir
+		.clone()
+		.unwrap_or_else(|| state_dir.join("sessions"));
+	fs::create_dir_all(&sessions_dir).into_diagnostic()?;
+	let session_open = if args.no_session {
+		HeadlessSessionOpen::Ephemeral
+	} else if args.continue_session {
+		HeadlessSessionOpen::ContinueLatest
+	} else if let Some(source) = args.fork.clone() {
+		HeadlessSessionOpen::Fork(source)
+	} else if let Some(source) = args.resume.clone() {
+		HeadlessSessionOpen::Resume(source)
+	} else {
+		HeadlessSessionOpen::New
+	};
+	let tool_policy = if args.no_tools {
+		HeadlessToolPolicy::None
+	} else if let Some(tools) = args.tools.as_ref() {
+		HeadlessToolPolicy::Only(tools.0.clone().into_boxed_slice())
+	} else {
+		HeadlessToolPolicy::All
+	};
+	let credential_provider = args
+		.api_key
+		.as_ref()
+		.map(|_| omp_driver::chat::resolve_model_provider(catalog, model.as_str(), None))
+		.transpose()
+		.map_err(|error| miette!(error))?;
+	let mut headless = HeadlessSession::open_with_policy(
+		data.clone(),
+		HeadlessSessionOptions {
+			project: project.clone(),
+			settings_overlays: args.config.clone().into_boxed_slice(),
+			additional_roots: args.add_dir.clone().into_boxed_slice(),
+			model: Str::from(model.as_str()),
+			initial_regime: args.plan_mode.then_some("plan"),
+			initial_prompt_slot: None,
+			plan_handoff: None,
+			resume: None,
+			fork: None,
+			py_eval: args.py_eval,
+			approval_mode: args.effective_approval().map(Into::into),
+			pty_denied: args.no_pty,
+			credential_provider,
+			api_key: args.api_key.clone(),
+			prompt_cache_affinity: args.prompt_cache_key.clone(),
+			session_generation: 1,
+		},
+		HeadlessLaunchPolicy {
+			session:            session_open,
+			sessions_dir:       args.session_dir.clone(),
+			tools:              tool_policy,
+			lsp_enabled:        !args.no_lsp,
+			auto_thinking:      None,
+			native_discovery:   prompt_discovery_settings.native.clone(),
+			extension_specs:    Arc::from(args.extension_launch.trusted.clone()),
+			contributed_values: Arc::from(args.extension_launch.contributed.clone()),
+		},
+	)
+	.await
+	.into_diagnostic()?;
+	let headless_id = headless.session_id().to_owned();
+	let headless_events = headless
+		.take_events()
+		.expect("RPC headless session owns its lossless event stream");
 	let negotiated = Arc::new(AtomicU8::new(PROTOCOL_V1));
 	let (output_tx, output_rx) = flume::unbounded();
 	let writer = tokio::spawn(write_frames(stdout(), output_rx, negotiated.clone()));
@@ -151,9 +331,16 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 	host::bind(&host_resources_authority)
 		.map_err(|_| miette!("RPC host URI resolver is already bound"))?;
 	let runtime = Arc::new(Runtime {
-		registry,
+		headless: AsyncMutex::new(HeadlessRuntime { session: headless, events: headless_events }),
 		auth,
-		commands: Mutex::new(rpc_command_roster(&args.project, 1)),
+		ui_enabled,
+		commands: Mutex::new(rpc_command_roster(
+			&project,
+			&args.add_dir,
+			&home,
+			&prompt_discovery_settings,
+			1,
+		)),
 		output: output_tx.clone(),
 		host_resources,
 		shutdown: ShutdownCoordinator::default(),
@@ -163,10 +350,19 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 			models,
 			providers,
 			preferred_provider,
-			args.project,
-			args.session_dir,
+			project,
+			sessions_dir,
+			prompt_discovery_settings,
+			args.add_dir.clone(),
+			headless_id,
 		)),
 	});
+	{
+		let state = runtime.state.lock();
+		state
+			.persist(&state.current)
+			.map_err(|error| miette!(error.message))?;
+	}
 	runtime.notify_session_start()?;
 	runtime.notify_available_commands()?;
 
@@ -182,6 +378,9 @@ pub async fn run(args: RpcArgs) -> miette::Result<()> {
 			active.cancellation.cancel();
 		}
 		state.pending_host_tools.clear();
+		for (_, pending) in state.pending_agent_host_tools.drain() {
+			let _ = pending.reply.send(Err(sf!("RPC client disconnected")));
+		}
 		for pending in state.pending_auth.values() {
 			pending.cancellation.cancel();
 		}
@@ -226,7 +425,7 @@ async fn read_frames<R>(mut input: R, sender: Sender<Input>) -> miette::Result<(
 where
 	R: AsyncRead + Unpin,
 {
-	let mut physical = ContentLengthDecoder::new();
+	let mut physical = JsonLineDecoder::new();
 	let mut logical = RpcFrameDecoder::new();
 	let mut buffer = [0_u8; 16 * 1024];
 	loop {
@@ -713,9 +912,36 @@ impl ShutdownCoordinator {
 	}
 }
 
+struct HeadlessRuntime {
+	session: HeadlessSession,
+	events:  EventSubscription,
+}
+
+struct RpcHostToolExecutor {
+	runtime: std::sync::Weak<Runtime>,
+}
+
+impl omp_tool::HostToolExecutor for RpcHostToolExecutor {
+	fn execute(
+		&self,
+		invocation: omp_tool::HostToolInvocation,
+		updates: omp_tool::HostToolUpdateSink,
+		cancellation: CancellationToken,
+	) -> Pin<Box<dyn Future<Output = Result<omp_tool::HostToolResult, Str>> + Send + 'static>> {
+		let runtime = self.runtime.upgrade();
+		Box::pin(async move {
+			let runtime = runtime.ok_or_else(|| sf!("RPC host disconnected"))?;
+			runtime
+				.invoke_agent_host_tool(invocation, updates, cancellation)
+				.await
+		})
+	}
+}
+
 struct Runtime {
-	registry:       Registry,
+	headless:       AsyncMutex<HeadlessRuntime>,
 	auth:           AuthManager,
+	ui_enabled:     bool,
 	commands:       Mutex<CommandRoster>,
 	output:         Sender<Value>,
 	host_resources: Arc<HostResourceBroker>,
@@ -725,6 +951,58 @@ struct Runtime {
 }
 
 impl Runtime {
+	async fn invoke_agent_host_tool(
+		self: &Arc<Self>,
+		invocation: omp_tool::HostToolInvocation,
+		updates: omp_tool::HostToolUpdateSink,
+		cancellation: CancellationToken,
+	) -> Result<omp_tool::HostToolResult, Str> {
+		let (reply, result) = oneshot::channel();
+		{
+			let mut state = self.state.lock();
+			if state
+				.pending_agent_host_tools
+				.insert(invocation.invocation_id.to_string(), PendingAgentHostTool { updates, reply })
+				.is_some()
+			{
+				return Err(sf!("duplicate host tool invocation `{}`", invocation.invocation_id));
+			}
+		}
+		let frame = HostToolCall {
+			kind:         "host_tool_call".into(),
+			id:           invocation.invocation_id.to_string(),
+			tool_call_id: invocation.tool_call_id.to_string(),
+			tool_name:    invocation.name.to_string(),
+			arguments:    invocation.arguments,
+		};
+		if let Err(error) =
+			self.notify(serde_json::to_value(frame).map_err(|error| Str::from(error.to_string()))?)
+		{
+			self
+				.state
+				.lock()
+				.pending_agent_host_tools
+				.remove(invocation.invocation_id.as_str());
+			return Err(Str::from(error.to_string()));
+		}
+		tokio::select! {
+			result = result => result.unwrap_or_else(|_| Err(sf!("RPC host tool result channel closed"))),
+			() = cancellation.cancelled() => {
+				self
+					.state
+					.lock()
+					.pending_agent_host_tools
+					.remove(invocation.invocation_id.as_str());
+				let _ = self.notify(json!({
+					"type":"host_tool_cancel",
+					"id":new_id("host-tool-cancel"),
+					"targetId":invocation.invocation_id,
+				}));
+				Err(sf!("host tool invocation cancelled"))
+			},
+		}
+	}
+
 	async fn handle_request(self: &Arc<Self>, value: Value) -> miette::Result<()> {
 		let request = match serde_json::from_value::<RpcRequest>(value) {
 			Ok(request) => request,
@@ -961,32 +1239,36 @@ impl Runtime {
 				let text = text(params, "message")
 					.or_else(|_| text(params, "text"))?
 					.to_owned();
-				let text = self.expand_skill(&text)?.unwrap_or(text);
+				let mut prompt = prompt_input(params, text)?;
+				prompt.message = self
+					.expand_skill(&prompt.message)?
+					.unwrap_or(prompt.message);
 				let behavior = params
 					.get("streamingBehavior")
 					.and_then(Value::as_str)
 					.unwrap_or("prompt");
-				match self.intercept_command(&text).await? {
+				match self.intercept_command(&prompt.message).await? {
 					CommandIntercept::Passthrough => {
-						self.submit_prompt(text, behavior)?;
-						self
-							.notify(json!({ "type": "prompt_result", "invoked": true }))
-							.map_err(CommandError::transport)?;
-						Ok(json!({ "invoked": true }))
-					},
-					CommandIntercept::Prompt(prompt) => {
 						self.submit_prompt(prompt, behavior)?;
 						self
-							.notify(json!({ "type": "prompt_result", "invoked": true }))
+							.notify(json!({ "type": "prompt_result", "agentInvoked": true }))
 							.map_err(CommandError::transport)?;
-						Ok(json!({ "invoked": true, "command": true }))
+						Ok(json!({ "agentInvoked": true }))
+					},
+					CommandIntercept::Prompt(message) => {
+						prompt.message = message;
+						self.submit_prompt(prompt, behavior)?;
+						self
+							.notify(json!({ "type": "prompt_result", "agentInvoked": true }))
+							.map_err(CommandError::transport)?;
+						Ok(json!({ "agentInvoked": true, "command": true }))
 					},
 					CommandIntercept::Consumed(agent_invoked) => {
-						Ok(json!({ "invoked": agent_invoked, "command": true }))
+						Ok(json!({ "agentInvoked": agent_invoked, "command": true }))
 					},
 					CommandIntercept::Exit => {
 						let _ = self.abort(false, None)?;
-						Ok(json!({ "invoked": false, "command": true, "exit": true }))
+						Ok(json!({ "agentInvoked": false, "command": true, "exit": true }))
 					},
 				}
 			},
@@ -994,14 +1276,14 @@ impl Runtime {
 				let message = text(params, "message")
 					.or_else(|_| text(params, "text"))?
 					.to_owned();
-				self.submit_prompt(message, "steer")?;
+				self.submit_prompt(prompt_input(params, message)?, "steer")?;
 				Ok(json!({ "queued": true, "mode": "steer" }))
 			},
 			"follow_up" => {
 				let message = text(params, "message")
 					.or_else(|_| text(params, "text"))?
 					.to_owned();
-				self.submit_prompt(message, "followUp")?;
+				self.submit_prompt(prompt_input(params, message)?, "followUp")?;
 				Ok(json!({ "queued": true, "mode": "followUp" }))
 			},
 			"abort" => Ok(json!({ "aborted": self.abort(false, None)? })),
@@ -1009,7 +1291,9 @@ impl Runtime {
 				let message = text(params, "message")
 					.or_else(|_| text(params, "text"))?
 					.to_owned();
-				Ok(json!({ "aborted": self.abort(true, Some(message))? }))
+				Ok(json!({
+					"aborted":self.abort(true, Some(prompt_input(params, message)?))?
+				}))
 			},
 			"new_session" => self.new_session(params),
 			"get_state" => Ok(self.state_value()),
@@ -1020,13 +1304,51 @@ impl Runtime {
 			"cycle_model" => self.cycle_model(),
 			"set_model" => {
 				let params = parse_params::<SetModelParams>(params)?;
-				self.set_model(&params.provider, &params.model_id)
+				let result = self.set_model(&params.provider, &params.model_id)?;
+				let selector = result
+					.get("model")
+					.and_then(Value::as_str)
+					.expect("set_model returns its validated selector");
+				self
+					.headless
+					.lock()
+					.await
+					.session
+					.set_model(selector)
+					.await
+					.map_err(|error| CommandError::new("model_not_found", error.to_string()))?;
+				Ok(result)
 			},
-			"set_fast_mode" => self.set_bool_config("fastMode", boolean(params, "enabled")?),
-			"set_thinking_level" => self.set_string_config("thinkingLevel", text(params, "level")?),
-			"cycle_thinking_level" => self.cycle_thinking(),
-			"set_steering_mode" => self.set_string_config("steeringMode", text(params, "mode")?),
-			"set_follow_up_mode" => self.set_string_config("followUpMode", text(params, "mode")?),
+			"set_fast_mode" => {
+				let enabled = boolean(params, "enabled")?;
+				self.headless.lock().await.session.set_fast_mode(enabled);
+				self.set_bool_config("fastMode", enabled)
+			},
+			"set_thinking_level" => {
+				let level = text(params, "level")?;
+				let reasoning = rpc_reasoning(level)?;
+				let result = self.set_string_config("thinkingLevel", level)?;
+				self.headless.lock().await.session.set_thinking(reasoning);
+				Ok(result)
+			},
+			"cycle_thinking_level" => {
+				let result = self.cycle_thinking()?;
+				let level = result
+					.get("level")
+					.and_then(Value::as_str)
+					.expect("cycle_thinking returns its selected level");
+				let reasoning = rpc_reasoning(level)?;
+				self.headless.lock().await.session.set_thinking(reasoning);
+				Ok(result)
+			},
+			"set_steering_mode" => {
+				let mode = queue_mode(params)?;
+				self.set_string_config("steeringMode", mode)
+			},
+			"set_follow_up_mode" => {
+				let mode = queue_mode(params)?;
+				self.set_string_config("followUpMode", mode)
+			},
 			"set_interrupt_mode" => {
 				let mode = text(params, "mode")?;
 				if !matches!(mode, "immediate" | "wait") {
@@ -1038,12 +1360,35 @@ impl Runtime {
 				self.set_string_config("interruptMode", mode)
 			},
 			"set_auto_compaction" => {
-				self.set_bool_config("autoCompaction", boolean(params, "enabled")?)
+				let enabled = boolean(params, "enabled")?;
+				self
+					.headless
+					.lock()
+					.await
+					.session
+					.set_auto_compaction(enabled);
+				self.set_bool_config("autoCompaction", enabled)
 			},
-			"set_auto_retry" => self.set_bool_config("autoRetry", boolean(params, "enabled")?),
-			"abort_retry" => Ok(json!({ "aborted": false })),
+			"set_auto_retry" => {
+				let enabled = boolean(params, "enabled")?;
+				self.headless.lock().await.session.set_auto_retry(enabled);
+				self.set_bool_config("autoRetry", enabled)
+			},
+			"abort_retry" => {
+				let active = self.state.lock().active.is_some();
+				self.headless.lock().await.session.abort_retry();
+				Ok(json!({"aborted":active}))
+			},
 			"set_todos" => self.set_todos(params),
-			"compact" => self.compact(),
+			"compact" => {
+				let focus = params
+					.get("customInstructions")
+					.and_then(Value::as_str)
+					.map(Str::from);
+				self
+					.compact(omp_agent::ManualCompactionRequest { mode: None, focus })
+					.await
+			},
 			"get_session_stats" => self.session_stats(),
 			"switch_session" => {
 				let params = parse_params::<SwitchSessionParams>(params)?;
@@ -1055,16 +1400,16 @@ impl Runtime {
 			"get_last_assistant_text" => self.last_assistant(),
 			"set_session_name" => self.rename_session(text(params, "name")?),
 			"handoff" => self.handoff(params),
-			"export_html" => self.export_html(),
+			"export_html" => self.export_html(params),
 			"get_login_providers" => self.login_providers(),
-			"set_host_tools" => self.set_host_tools(params),
+			"set_host_tools" => self.set_host_tools(params).await,
 			"call_host_tool" => self.call_host_tool(params),
 			"set_host_uri_schemes" => self.host_resources.replace(params),
 			"set_subagent_subscription" => self.set_subscription(params),
 			"get_subagents" => self.get_subagents(),
 			"get_subagent_messages" => self.get_subagent_messages(params).await,
 			"get_available_commands" => Ok(self.available_commands_value()),
-			"reload_extensions" => self.reload_extensions(),
+			"reload_extensions" => self.reload_extensions().await,
 			"extension_ui_request" => self.forward_extension_ui(params).await,
 			"extension_error" => self.notify_extension_error(params),
 			"bash" | "abort_bash" => Err(CommandError::new(
@@ -1185,14 +1530,33 @@ impl Runtime {
 		Ok(Some(rendered.to_string()))
 	}
 
-	fn reload_extensions(&self) -> Result<Value, CommandError> {
-		let (root, generation) = {
+	async fn reload_extensions(&self) -> Result<Value, CommandError> {
+		let reload = self.headless.lock().await.session.extension_reload_handle();
+		reload
+			.reload()
+			.await
+			.map_err(|error| CommandError::new("extension_reload_failed", error.to_string()))?;
+		let (root, additional_roots, discovery_settings, generation) = {
 			let mut state = self.state.lock();
 			state.command_generation = state.command_generation.wrapping_add(1).max(1);
-			state.content = omp_driver::discovery::active_content_snapshots(&state.project);
-			(state.project.clone(), state.command_generation)
+			let home = env::var_os("HOME").map_or_else(|| state.project.clone(), PathBuf::from);
+			state.content = omp_driver::discovery::active_prompt_snapshots(
+				&state.project,
+				&state.additional_roots,
+				&home,
+				&state.discovery_settings,
+			)
+			.content;
+			(
+				state.project.clone(),
+				state.additional_roots.clone(),
+				state.discovery_settings.clone(),
+				state.command_generation,
+			)
 		};
-		*self.commands.lock() = rpc_command_roster(&root, generation);
+		let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+		*self.commands.lock() =
+			rpc_command_roster(&root, &additional_roots, &home, &discovery_settings, generation);
 		let (skills, commands) = {
 			let state = self.state.lock();
 			(state.content.skills.all().len(), state.content.commands.len())
@@ -1214,6 +1578,12 @@ impl Runtime {
 		&self,
 		params: &Map<String, Value>,
 	) -> Result<Value, CommandError> {
+		if !self.ui_enabled {
+			return Err(CommandError::new(
+				"ui_unavailable",
+				"extension UI requests require rpc-ui mode",
+			));
+		}
 		let method = text(params, "method")?.to_owned();
 		let id = params
 			.get("id")
@@ -1267,17 +1637,33 @@ impl Runtime {
 		Ok(json!({"notified":true}))
 	}
 
-	fn submit_prompt(self: &Arc<Self>, message: String, behavior: &str) -> Result<(), CommandError> {
+	fn submit_prompt(
+		self: &Arc<Self>,
+		prompt: RpcPrompt,
+		behavior: &str,
+	) -> Result<(), CommandError> {
 		let mut state = self.state.lock();
 		if let Some(active) = state.active.as_ref() {
 			match behavior {
 				"steer" => {
 					active.cancel();
-					state.queue.push_front(message);
+					if state.config.steering_mode == "all"
+						&& let Some(queued) = state.queue.front_mut()
+					{
+						merge_rpc_prompt(queued, prompt);
+					} else {
+						state.queue.push_front(prompt);
+					}
 					return Ok(());
 				},
 				"followUp" | "follow_up" => {
-					state.queue.push_back(message);
+					if state.config.follow_up_mode == "all"
+						&& let Some(queued) = state.queue.back_mut()
+					{
+						merge_rpc_prompt(queued, prompt);
+					} else {
+						state.queue.push_back(prompt);
+					}
 					return Ok(());
 				},
 				_ => return Err(CommandError::new("session_busy", "an agent turn is already active")),
@@ -1289,18 +1675,22 @@ impl Runtime {
 		let runtime = self.clone();
 		self
 			.shutdown
-			.spawn(async move { runtime.conversation_loop(message, cancellation).await });
+			.spawn(async move { runtime.conversation_loop(prompt, cancellation).await });
 		Ok(())
 	}
 
 	async fn conversation_loop(
 		self: Arc<Self>,
-		mut message: String,
+		mut prompt: RpcPrompt,
 		mut cancellation: CancellationToken,
 	) {
 		loop {
-			self.state.lock().flow_modes.capture_loop_prompt(&message);
-			let _ = self.run_turn(message, cancellation.clone()).await;
+			self
+				.state
+				.lock()
+				.flow_modes
+				.capture_loop_prompt(&prompt.message);
+			let _ = self.run_turn(prompt, cancellation.clone()).await;
 			let next = {
 				let mut state = self.state.lock();
 				state.active = None;
@@ -1308,11 +1698,11 @@ impl Runtime {
 					state
 						.flow_modes
 						.take_loop_prompt(unix_millis())
-						.map(|prompt| prompt.to_string())
+						.map(|message| RpcPrompt { message: message.to_string(), images: Vec::new() })
 				})
 			};
 			let Some(next) = next else { break };
-			message = next;
+			prompt = next;
 			cancellation = CancellationToken::new();
 			self.state.lock().active = Some(cancellation.clone());
 		}
@@ -1320,111 +1710,229 @@ impl Runtime {
 
 	async fn run_turn(
 		&self,
-		prompt: String,
+		prompt: RpcPrompt,
 		cancellation: CancellationToken,
 	) -> Result<(), CommandError> {
-		let (session_id, model, request) = {
+		let (session_id, forced_tool) = {
 			let mut state = self.state.lock();
 			let session_id = state.current.clone();
-			let model = state.config.model.clone();
-			let model = if mem::take(&mut state.prewalk_armed) {
-				omp_driver::chat::fallback_model_selector(omp_catalog::snapshot::Catalog::embedded())
-					.map_or(model, |selector| selector.to_string())
-			} else {
-				model
-			};
 			let forced_tool = state.forced_tool.take();
-			let fast_mode = state.config.fast_mode;
-			let host_tools = state.host_tools.clone();
 			let session = state.current_mut();
-			session.push_message("user", &prompt);
-			let request = build_request(
-				session,
-				contains_orchestrate(&prompt),
-				&host_tools,
-				forced_tool.as_deref(),
-				fast_mode,
-			);
-			(session_id, model, request)
+			session.push_message_with_images("user", &prompt.message, prompt.images.clone());
+			state.persist(&session_id)?;
+			(session_id, forced_tool)
 		};
 		self
-			.notify(json!({ "type": "agent_start", "sessionId": session_id }))
+			.notify(json!({"type":"agent_start","sessionId":session_id}))
 			.map_err(CommandError::transport)?;
-		let planner = router::Router::new(self.registry.clone(), Duration::from_secs(30));
-		let meta = CallMeta {
-			id:       InferenceRequestId::from(turn_id()),
-			target:   Target::Model(ModelKey::from(model)),
-			deadline: None,
-			budget:   ExecutionBudget::default(),
-			session:  None,
-		};
-		let mut client = Client::new(self.registry.service(), planner, meta);
-		let mut events = match client.execute(request).await {
-			Ok(events) => events,
-			Err(error) => {
-				self.notify(json!({ "type": "agent_end", "sessionId": session_id, "outcome": RpcTurnOutcome::Fault, "error": error.to_string(), "aborted": false }))
-					.map_err(CommandError::transport)?;
-				return Err(CommandError::new("inference_error", error.to_string()));
-			},
-		};
-		let mut assistant = String::new();
-		let mut completed = false;
-		let mut aborted = false;
-		let mut fault = false;
-		loop {
-			tokio::select! {
-				() = cancellation.cancelled() => {
-					aborted = true;
-					break;
-				}
-				event = events.next() => {
-					let Some(event) = event else { break };
-					match event {
-						Ok(ChatEvent::TextDelta { text, .. }) => {
-							assistant.push_str(text.as_str());
-							self.notify(json!({ "type": "agent_event", "event": { "type": "text_delta", "text": text.as_str() }, "sessionId": session_id }))
-								.map_err(CommandError::transport)?;
-						},
-						Ok(ChatEvent::ThinkingDelta { text, .. }) => {
-							self.notify(json!({ "type": "agent_event", "event": { "type": "thinking_delta", "text": text.as_str() }, "sessionId": session_id }))
-								.map_err(CommandError::transport)?;
-						},
-						Ok(ChatEvent::Completed(_)) => completed = true,
-						Ok(_) => {},
-						Err(error) => {
-							fault = true;
-							self.notify(json!({ "type": "agent_event", "event": { "type": "error", "message": error.to_string() }, "sessionId": session_id }))
-								.map_err(CommandError::transport)?;
-							break;
-						},
-					}
-				}
+		self
+			.notify(json!({"type":"turn_start"}))
+			.map_err(CommandError::transport)?;
+		let user_message = rpc_user_message(&prompt);
+		self
+			.notify(json!({"type":"message_start","message":user_message.clone()}))
+			.map_err(CommandError::transport)?;
+		self
+			.notify(json!({"type":"message_end","message":user_message.clone()}))
+			.map_err(CommandError::transport)?;
+
+		let items = rpc_prompt_items(prompt)?;
+		let mut projection = RpcTurnProjection::default();
+		let summary = {
+			let mut runtime = self.headless.lock().await;
+			let interrupt = runtime.session.interrupt_handle();
+			let HeadlessRuntime { session, events } = &mut *runtime;
+			if let Some(tool) = forced_tool {
+				session
+					.force_tool_once(Str::from(tool))
+					.map_err(|error| CommandError::new("host_tool_not_found", error.to_string()))?;
 			}
-		}
-		if !assistant.is_empty()
-			&& let Some(session) = self.state.lock().sessions.get_mut(&session_id)
-		{
-			session.push_message("assistant", &assistant);
-		}
-		let outcome = if aborted {
-			RpcTurnOutcome::CallerAbort
-		} else if completed && !fault {
-			RpcTurnOutcome::Success
-		} else {
-			RpcTurnOutcome::Fault
+			let submit = session.submit(items, omp_agent::TurnId::new(turn_id()));
+			tokio::pin!(submit);
+			let mut interrupted = false;
+			let result = loop {
+				tokio::select! {
+					() = cancellation.cancelled(), if !interrupted => {
+						interrupted = true;
+						interrupt.interrupt();
+					},
+					result = &mut submit => break result,
+					event = events.recv() => {
+						let Ok(event) = event else { continue; };
+						self.project_agent_event(event.as_ref(), &mut projection).await?;
+					},
+				}
+			};
+			while let Ok(event) = events.try_recv() {
+				self
+					.project_agent_event(event.as_ref(), &mut projection)
+					.await?;
+			}
+			result.map_err(|error| CommandError::new("agent_error", error.to_string()))?
 		};
-		self.notify(json!({
-			"type": "agent_end",
-			"sessionId": session_id,
-			"outcome": outcome,
-			"aborted": aborted,
-			"completed": completed,
-			"message": if assistant.is_empty() { Value::Null } else { json!({ "role": "assistant", "content": assistant }) },
-		}))
-		.map_err(CommandError::transport)
+
+		let assistant = summary.outcome.as_ref().and_then(|outcome| {
+			outcome.output.iter().rev().find_map(|item| {
+				let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+					return None;
+				};
+				(message.role() == ThreadRole::Assistant).then_some(message)
+			})
+		});
+		let assistant_message = assistant
+			.map(|message| rpc_thread_message(message, Some(rpc_stop_reason(summary.settlement))))
+			.unwrap_or_else(|| {
+				json!({
+					"role":"assistant",
+					"content":[],
+					"stopReason":rpc_stop_reason(summary.settlement),
+				})
+			});
+		if !projection.assistant_started {
+			self
+				.notify(json!({
+					"type":"message_start",
+					"message":{"role":"assistant","content":[]},
+				}))
+				.map_err(CommandError::transport)?;
+		}
+		self
+			.notify(json!({"type":"message_end","message":assistant_message.clone()}))
+			.map_err(CommandError::transport)?;
+		let tool_results = projection
+			.settled_items
+			.iter()
+			.filter_map(|item| match item.kind.as_ref() {
+				Some(item::Kind::ToolResult(result)) => Some(rpc_tool_result(result)),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		self
+			.notify(json!({
+				"type":"turn_end",
+				"message":assistant_message.clone(),
+				"toolResults":tool_results,
+			}))
+			.map_err(CommandError::transport)?;
+		if let Some(text) = assistant.and_then(thread_message_text)
+			&& !text.is_empty()
+		{
+			let mut state = self.state.lock();
+			if let Some(session) = state.sessions.get_mut(&session_id) {
+				session.push_message("assistant", &text);
+			}
+			state.persist(&session_id)?;
+		}
+		let mut messages = vec![user_message];
+		messages.extend(projection.settled_items.iter().filter_map(rpc_thread_item));
+		if !messages.iter().any(|message| message == &assistant_message) {
+			messages.push(assistant_message);
+		}
+		self
+			.notify(json!({"type":"agent_end","messages":messages}))
+			.map_err(CommandError::transport)
 	}
 
-	fn abort(&self, replace_queue: bool, message: Option<String>) -> Result<bool, CommandError> {
+	async fn project_agent_event(
+		&self,
+		event: &AgentEvent,
+		projection: &mut RpcTurnProjection,
+	) -> Result<(), CommandError> {
+		let value = match event {
+			AgentEvent::Turn { event, .. } => match event.event.as_ref() {
+				Some(turn_event::Event::PartStart(start)) => {
+					if let Ok(kind) = part_start::Kind::try_from(start.kind) {
+						projection.part_kinds.insert(start.index, kind);
+					}
+					if projection.assistant_started {
+						return Ok(());
+					}
+					projection.assistant_started = true;
+					json!({
+						"type":"message_start",
+						"message":{
+							"role":"assistant",
+							"content":[],
+							"timestamp":unix_millis(),
+							"id":projection.assistant_id,
+						},
+					})
+				},
+				Some(turn_event::Event::PartDelta(delta)) => {
+					let kind = projection.part_kinds.get(&delta.index).copied();
+					json!({
+						"type":"message_update",
+						"assistantMessageEvent":{
+							"type":match kind {
+								Some(part_start::Kind::Thinking) => "thinking_delta",
+								Some(part_start::Kind::ToolCall) => "toolcall_delta",
+								_ => "text_delta",
+							},
+							"delta":String::from_utf8_lossy(&delta.chunk),
+						},
+					})
+				},
+				Some(turn_event::Event::PartEnd(end)) => {
+					projection.part_kinds.remove(&end.index);
+					return Ok(());
+				},
+				Some(turn_event::Event::Outcome(outcome)) => {
+					projection
+						.settled_items
+						.extend(outcome.output.iter().cloned());
+					return Ok(());
+				},
+				Some(_) | None => return Ok(()),
+			},
+			AgentEvent::ToolOpened { call_id, name, rev } => json!({
+				"type":"tool_execution_start",
+				"toolCallId":call_id,
+				"toolName":name,
+				"rev":rev.to_string(),
+			}),
+			AgentEvent::ToolArgs { call_id, fragment, .. } => json!({
+				"type":"message_update",
+				"assistantMessageEvent":{
+					"type":"toolcall_delta",
+					"toolCallId":call_id,
+					"delta":String::from_utf8_lossy(fragment),
+				},
+			}),
+			AgentEvent::ToolUpdate { call_id, json: update } => json!({
+				"type":"tool_execution_update",
+				"toolCallId":call_id,
+				"content":String::from_utf8_lossy(update),
+			}),
+			AgentEvent::ToolFinished { call_id, .. } => {
+				json!({"type":"tool_execution_end","toolCallId":call_id})
+			},
+			AgentEvent::Failed { message, .. } => json!({
+				"type":"message_update",
+				"assistantMessageEvent":{
+					"type":"error",
+					"reason":"error",
+					"error":message,
+				},
+			}),
+			AgentEvent::TitleChanged { title, source } => json!({
+				"type":"session_info_update",
+				"name":title,
+				"source":format!("{source:?}"),
+			}),
+			AgentEvent::ToolObserved { .. }
+			| AgentEvent::PlanStateChanged { .. }
+			| AgentEvent::PhaseChanged { .. }
+			| AgentEvent::RunStateChanged { .. }
+			| AgentEvent::RosterChanged { .. }
+			| AgentEvent::JobRegistered { .. }
+			| AgentEvent::JobSettled { .. }
+			| AgentEvent::Snapshot(_)
+			| AgentEvent::PeerRelay(_) => return Ok(()),
+		};
+		self.notify(value).map_err(CommandError::transport)
+	}
+
+	fn abort(&self, replace_queue: bool, prompt: Option<RpcPrompt>) -> Result<bool, CommandError> {
 		let (active, pending) = {
 			let mut state = self.state.lock();
 			let active = state.active.as_ref().is_some_and(|token| {
@@ -1433,12 +1941,15 @@ impl Runtime {
 			});
 			if replace_queue {
 				state.queue.clear();
-				if let Some(message) = message {
-					state.queue.push_front(message);
+				if let Some(prompt) = prompt {
+					state.queue.push_front(prompt);
 				}
 			}
 			let pending = state.pending_host_tools.keys().cloned().collect::<Vec<_>>();
 			state.pending_host_tools.clear();
+			for (_, pending) in state.pending_agent_host_tools.drain() {
+				let _ = pending.reply.send(Err(sf!("host tool invocation aborted")));
+			}
 			(active, pending)
 		};
 		for target_id in pending {
@@ -1469,11 +1980,12 @@ impl Runtime {
 			.sessions
 			.insert(id.clone(), Session::new(id.clone(), parent));
 		state.current = id.clone();
+		state.persist(&id)?;
 		drop(state);
 		self
 			.notify_session_start()
 			.map_err(CommandError::transport)?;
-		Ok(json!({ "sessionId": id }))
+		Ok(json!({ "cancelled": false }))
 	}
 
 	fn state_value(&self) -> Value {
@@ -1481,21 +1993,22 @@ impl Runtime {
 		let session = state.current_session();
 		json!({
 			"model": state.config.model,
-			"provider": state.config.provider,
 			"thinkingLevel": state.config.thinking_level,
 			"isStreaming": state.active.is_some(),
 			"isCompacting": false,
-			"fastMode": state.config.fast_mode,
 			"steeringMode": state.config.steering_mode,
 			"followUpMode": state.config.follow_up_mode,
 			"interruptMode": state.config.interrupt_mode,
-			"autoCompaction": state.config.auto_compaction,
-			"autoRetry": state.config.auto_retry,
-			"session": { "id": session.id, "name": session.name, "parentSession": session.parent },
-			"messageCount": session.messages.len(),
+			"sessionFile": state.session_path(&session.id),
+			"sessionId": session.id,
+			"sessionName": session.name,
+			"autoCompactionEnabled": state.config.auto_compaction,
+			"fastModeEnabled": state.config.fast_mode,
+			"fastModeActive": state.config.fast_mode,
 			"tokensPerSecond": Value::Null,
-			"todos": state.config.todos,
-			"project": state.project,
+			"messageCount": session.messages.len(),
+			"queuedMessageCount": state.queue.len(),
+			"todoPhases": state.config.todos,
 		})
 	}
 
@@ -1614,24 +2127,35 @@ impl Runtime {
 		self
 			.notify(json!({ "type": "config_update", "todos": phases }))
 			.map_err(CommandError::transport)?;
-		Ok(json!({ "phases": phases }))
+		Ok(json!({ "todoPhases": phases }))
 	}
 
-	fn compact(&self) -> Result<Value, CommandError> {
-		let mut state = self.state.lock();
-		if state.active.is_some() {
+	async fn compact(
+		&self,
+		request: omp_agent::ManualCompactionRequest,
+	) -> Result<Value, CommandError> {
+		if self.state.lock().active.is_some() {
 			return Err(CommandError::new(
 				"session_busy",
 				"cannot compact while an agent turn is active",
 			));
 		}
-		let session = state.current_mut();
-		let removed = session.messages.len().saturating_sub(32);
-		if removed > 0 {
-			session.messages.drain(..removed);
-			session.bump_revision();
-		}
-		Ok(json!({ "compacted": removed > 0, "removedMessages": removed }))
+		let outcome = self
+			.headless
+			.lock()
+			.await
+			.session
+			.compact_manual(request)
+			.await
+			.map_err(|error| CommandError::new("compaction_failed", error.to_string()))?;
+		Ok(json!({
+			"compacted":true,
+			"method":outcome.method.to_string(),
+			"event":outcome.event,
+			"tokensBefore":outcome.tokens_before,
+			"tokensAfter":outcome.tokens_after,
+			"frameCount":outcome.frame_count,
+		}))
 	}
 
 	fn session_stats(&self) -> Result<Value, CommandError> {
@@ -1658,24 +2182,42 @@ impl Runtime {
 				"cannot switch sessions during an active turn",
 			));
 		}
-		let id = if state.sessions.contains_key(session_path) {
-			session_path.to_owned()
-		} else {
-			Path::new(session_path)
-				.file_stem()
-				.and_then(|stem| stem.to_str())
-				.filter(|id| state.sessions.contains_key(*id))
-				.map(str::to_owned)
-				.ok_or_else(|| {
+		let matching = state
+			.sessions
+			.keys()
+			.filter(|id| id.as_str() == session_path || id.starts_with(session_path))
+			.cloned()
+			.collect::<Vec<_>>();
+		let id = match matching.as_slice() {
+			[id] => id.clone(),
+			[] => {
+				let requested = PathBuf::from(session_path);
+				let path = if requested.is_file() {
+					requested
+				} else {
+					state.session_path(session_path)
+				};
+				let bytes = fs::read(&path).map_err(|_| {
 					CommandError::new("session_not_found", format!("unknown session `{session_path}`"))
-				})?
+				})?;
+				let session: Session = serde_json::from_slice(&bytes).map_err(CommandError::json)?;
+				let id = session.id.clone();
+				state.sessions.insert(id.clone(), session);
+				id
+			},
+			_ => {
+				return Err(CommandError::new(
+					"session_ambiguous",
+					format!("session prefix `{session_path}` is ambiguous"),
+				));
+			},
 		};
-		state.current = id.clone();
+		state.current = id;
 		drop(state);
 		self
 			.notify_session_info()
 			.map_err(CommandError::transport)?;
-		Ok(json!({ "sessionId": id, "sessionPath": session_path }))
+		Ok(json!({ "cancelled": false }))
 	}
 
 	fn branch(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
@@ -1699,6 +2241,7 @@ impl Runtime {
 		branch.bump_revision();
 		state.sessions.insert(id.clone(), branch);
 		state.current = id.clone();
+		state.persist(&id)?;
 		drop(state);
 		self
 			.notify_session_start()
@@ -1750,7 +2293,10 @@ impl Runtime {
 			let mut state = self.state.lock();
 			let session = state.current_mut();
 			session.name = Some(name.to_owned());
-			session.id.clone()
+			session.bump_revision();
+			let id = session.id.clone();
+			state.persist(&id)?;
+			id
 		};
 		self
 			.notify_session_info()
@@ -1774,6 +2320,7 @@ impl Runtime {
 		target.push_message("user", instructions);
 		state.sessions.insert(id.clone(), target);
 		state.current = id.clone();
+		state.persist(&id)?;
 		drop(state);
 		self
 			.notify_session_start()
@@ -1781,12 +2328,20 @@ impl Runtime {
 		Ok(json!({ "sessionId": id }))
 	}
 
-	fn export_html(&self) -> Result<Value, CommandError> {
-		let state = self.state.lock();
-		let session = state.current_session();
+	fn export_html(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+		let (session_id, messages, project) = {
+			let state = self.state.lock();
+			let session = state.current_session();
+			(session.id.clone(), session.messages.clone(), state.project.clone())
+		};
+		let path = params
+			.get("outputPath")
+			.and_then(Value::as_str)
+			.map(PathBuf::from)
+			.unwrap_or_else(|| project.join(format!("{session_id}.html")));
 		let mut html =
 			String::from("<!doctype html><meta charset=\"utf-8\"><title>OMP transcript</title><main>");
-		for message in &session.messages {
+		for message in &messages {
 			html.push_str("<article data-role=\"");
 			html.push_str(&escape_html(&message.role));
 			html.push_str("\"><pre>");
@@ -1794,7 +2349,19 @@ impl Runtime {
 			html.push_str("</pre></article>");
 		}
 		html.push_str("</main>");
-		Ok(json!({ "sessionId": session.id, "html": html }))
+		if let Some(parent) = path
+			.parent()
+			.filter(|parent| !parent.as_os_str().is_empty())
+		{
+			fs::create_dir_all(parent)
+				.map_err(|error| CommandError::new("export_failed", error.to_string()))?;
+		}
+		fs::write(&path, html)
+			.map_err(|error| CommandError::new("export_failed", error.to_string()))?;
+		let path = path
+			.canonicalize()
+			.map_err(|error| CommandError::new("export_failed", error.to_string()))?;
+		Ok(json!({ "path": path }))
 	}
 
 	fn login_providers(&self) -> Result<Value, CommandError> {
@@ -2044,23 +2611,29 @@ impl Runtime {
 		self.notify(serde_json::to_value(frame).into_diagnostic()?)
 	}
 
-	fn set_host_tools(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
+	async fn set_host_tools(
+		self: &Arc<Self>,
+		params: &Map<String, Value>,
+	) -> Result<Value, CommandError> {
 		let tools = params
 			.get("tools")
 			.and_then(Value::as_array)
 			.ok_or_else(|| CommandError::new("invalid_params", "tools must be an array"))?;
-		let mut parsed = BTreeMap::new();
-		for tool in tools {
-			let definition = serde_json::from_value::<HostToolDefinition>(tool.clone())
-				.map_err(|error| CommandError::new("invalid_params", error.to_string()))?;
-			if !definition.parameters.is_object() {
-				return Err(CommandError::new(
-					"invalid_params",
-					"host tool parameters must be JSON Schema objects",
-				));
-			}
-			parsed.insert(definition.name, tool.clone());
-		}
+		let (parsed, specs) = parse_host_tool_specs(tools)?;
+		let revision = {
+			let mut state = self.state.lock();
+			state.host_tool_revision = state.host_tool_revision.wrapping_add(1).max(1);
+			state.host_tool_revision
+		};
+		let executor: Arc<dyn omp_tool::HostToolExecutor> =
+			Arc::new(RpcHostToolExecutor { runtime: Arc::downgrade(self) });
+		self
+			.headless
+			.lock()
+			.await
+			.session
+			.replace_host_tools(sf!("rpc/host"), revision, specs, executor)
+			.map_err(|error| CommandError::new("host_tool_registration_failed", error.to_string()))?;
 		let tool_names = parsed.keys().cloned().collect::<Vec<_>>();
 		self.state.lock().host_tools = parsed;
 		Ok(host_tool_names_value(tool_names))
@@ -2162,6 +2735,9 @@ impl Runtime {
 				return self.send_error(None, &kind, "invalid_request", error.to_string());
 			},
 		};
+		if self.settle_agent_host_side_channel(&frame)? {
+			return Ok(());
+		}
 		let (event, subagent_event) = {
 			let mut state = self.state.lock();
 			match frame {
@@ -2287,6 +2863,66 @@ impl Runtime {
 		Ok(())
 	}
 
+	fn settle_agent_host_side_channel(&self, frame: &HostSideChannel) -> miette::Result<bool> {
+		match frame {
+			HostSideChannel::Update(update) => {
+				let sink = self
+					.state
+					.lock()
+					.pending_agent_host_tools
+					.get(&update.id)
+					.map(|pending| pending.updates.clone());
+				let Some(sink) = sink else {
+					return Ok(false);
+				};
+				let _ = sink.send(update.partial_result.clone());
+				self.notify(json!({
+					"type":"host_tool_progress",
+					"invocationId":update.id,
+					"update":update.partial_result,
+				}))?;
+				Ok(true)
+			},
+			HostSideChannel::Result(result) => {
+				let pending = self
+					.state
+					.lock()
+					.pending_agent_host_tools
+					.remove(&result.id);
+				let Some(pending) = pending else {
+					return Ok(false);
+				};
+				let _ = pending.reply.send(Ok(omp_tool::HostToolResult {
+					result:   result.result.clone(),
+					is_error: result.is_error,
+				}));
+				self.notify(json!({
+					"type":"host_tool_complete",
+					"invocationId":result.id,
+					"result":result.result,
+					"isError":result.is_error,
+				}))?;
+				Ok(true)
+			},
+			HostSideChannel::Cancel(cancel) => {
+				let pending = self
+					.state
+					.lock()
+					.pending_agent_host_tools
+					.remove(&cancel.target_id);
+				let Some(pending) = pending else {
+					return Ok(false);
+				};
+				let _ = pending.reply.send(Err(sf!("host cancelled invocation")));
+				self.notify(json!({
+					"type":"host_tool_cancelled",
+					"invocationId":cancel.target_id,
+				}))?;
+				Ok(true)
+			},
+		}
+	}
+
 	fn set_subscription(&self, params: &Map<String, Value>) -> Result<Value, CommandError> {
 		let level = text(params, "level")?;
 		let subscription = match level {
@@ -2324,9 +2960,7 @@ impl Runtime {
 		let requested_from = params.from_byte.unwrap_or(0);
 		let (root, relative) = {
 			let state = self.state.lock();
-			let root = state.session_dir.clone().ok_or_else(|| {
-				CommandError::new("unsupported_operation", "no --session-dir was configured")
-			})?;
+			let root = state.session_dir.clone();
 			let relative = if let Some(session_file) = params.session_file {
 				PathBuf::from(session_file)
 			} else {
@@ -2404,7 +3038,12 @@ impl Runtime {
 	fn notify_session_start(&self) -> miette::Result<()> {
 		let state = self.state.lock();
 		let session = state.current_session();
-		self.notify(json!({ "type": "session_start", "sessionId": session.id, "name": session.name }))
+		self.notify(json!({
+			"type": "session_start",
+			"sessionId": session.id,
+			"sessionFile": state.session_path(&session.id),
+			"name": session.name
+		}))
 	}
 
 	fn notify_session_info(&self) -> miette::Result<()> {
@@ -2531,7 +3170,7 @@ impl SessionCommandHost for RpcCommandHost {
 				return Ok(CommandResult::Consumed(ConsumedResult::status("Nothing to retry.")));
 			};
 			runtime
-				.submit_prompt(prompt, "prompt")
+				.submit_prompt(RpcPrompt { message: prompt, images: Vec::new() }, "prompt")
 				.map_err(|error| miette!(error.message))?;
 			Ok(CommandResult::Consumed(ConsumedResult::agent("Retry started.")))
 		})
@@ -2757,10 +3396,13 @@ impl FlowCommandHost for RpcCommandHost {
 		command_status(value)
 	}
 
-	fn compact(&mut self, _request: omp_agent::ManualCompactionRequest) -> CommandFuture<'_> {
+	fn compact(&mut self, request: omp_agent::ManualCompactionRequest) -> CommandFuture<'_> {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
-			runtime.compact().map_err(|error| miette!(error.message))?;
+			runtime
+				.compact(request)
+				.await
+				.map_err(|error| miette!(error.message))?;
 			command_status("Context compacted.").await
 		})
 	}
@@ -2842,7 +3484,10 @@ impl FlowCommandHost for RpcCommandHost {
 		let runtime = self.runtime.clone();
 		Box::pin(async move {
 			runtime
-				.submit_prompt(prompt.to_string(), "followUp")
+				.submit_prompt(
+					RpcPrompt { message: prompt.to_string(), images: Vec::new() },
+					"followUp",
+				)
 				.map_err(|error| miette!(error.message))?;
 			command_status("Prompt queued.").await
 		})
@@ -3008,6 +3653,38 @@ struct ActiveBash {
 	id:           String,
 	cancellation: CancellationToken,
 }
+#[derive(Clone, Debug)]
+struct RpcPrompt {
+	message: String,
+	images:  Vec<RpcImage>,
+}
+struct RpcTurnProjection {
+	part_kinds:        BTreeMap<u32, part_start::Kind>,
+	assistant_started: bool,
+	assistant_id:      String,
+	settled_items:     Vec<Item>,
+}
+
+impl Default for RpcTurnProjection {
+	fn default() -> Self {
+		Self {
+			part_kinds:        BTreeMap::new(),
+			assistant_started: false,
+			assistant_id:      new_id("message"),
+			settled_items:     Vec::new(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcImage {
+	#[serde(default)]
+	kind:      Option<String>,
+	data:      String,
+	#[serde(alias = "mediaType")]
+	mime_type: String,
+}
 
 struct PendingAuth {
 	cancellation: CancellationToken,
@@ -3021,28 +3698,32 @@ enum HostSideChannel {
 }
 
 struct ServerState {
-	current:              String,
-	sessions:             HashMap<String, Session>,
-	active:               Option<CancellationToken>,
-	active_bash:          Option<ActiveBash>,
-	queue:                VecDeque<String>,
-	config:               ConfigState,
-	models:               Vec<String>,
-	providers:            Vec<OAuthProvider>,
-	project:              PathBuf,
-	session_dir:          Option<PathBuf>,
-	host_tools:           BTreeMap<String, Value>,
-	pending_host_tools:   HashMap<String, PendingHostTool>,
-	pending_auth:         HashMap<String, PendingAuth>,
-	pending_extension_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
-	subscription:         Subscription,
-	command_generation:   u64,
-	content:              omp_driver::discovery::ActiveContentSnapshots,
-	subagents:            HashMap<String, SubagentSnapshot>,
-	transcript_lru:       VecDeque<(String, u64)>,
-	flow_modes:           omp_driver::modes::RegimeHandle,
-	forced_tool:          Option<String>,
-	prewalk_armed:        bool,
+	current:                  String,
+	sessions:                 HashMap<String, Session>,
+	active:                   Option<CancellationToken>,
+	active_bash:              Option<ActiveBash>,
+	queue:                    VecDeque<RpcPrompt>,
+	config:                   ConfigState,
+	models:                   Vec<String>,
+	providers:                Vec<OAuthProvider>,
+	project:                  PathBuf,
+	session_dir:              PathBuf,
+	discovery_settings:       omp_driver::discovery::PromptDiscoverySettings,
+	additional_roots:         Vec<PathBuf>,
+	host_tools:               BTreeMap<String, Value>,
+	host_tool_revision:       u64,
+	pending_host_tools:       HashMap<String, PendingHostTool>,
+	pending_agent_host_tools: HashMap<String, PendingAgentHostTool>,
+	pending_auth:             HashMap<String, PendingAuth>,
+	pending_extension_ui:     HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
+	subscription:             Subscription,
+	command_generation:       u64,
+	content:                  omp_driver::discovery::ActiveContentSnapshots,
+	subagents:                HashMap<String, SubagentSnapshot>,
+	transcript_lru:           VecDeque<(String, u64)>,
+	flow_modes:               omp_driver::modes::RegimeHandle,
+	forced_tool:              Option<String>,
+	prewalk_armed:            bool,
 }
 
 impl ServerState {
@@ -3052,11 +3733,34 @@ impl ServerState {
 		providers: Vec<OAuthProvider>,
 		preferred_provider: Option<String>,
 		project: PathBuf,
-		session_dir: Option<PathBuf>,
+		session_dir: PathBuf,
+		discovery_settings: omp_driver::discovery::PromptDiscoverySettings,
+		additional_roots: Vec<PathBuf>,
+		id: String,
 	) -> Self {
-		let id = new_id("session");
-		let content = omp_driver::discovery::active_content_snapshots(&project);
+		let home = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
+		let content = omp_driver::discovery::active_prompt_snapshots(
+			&project,
+			&additional_roots,
+			&home,
+			&discovery_settings,
+		)
+		.content;
 		let mut sessions = HashMap::new();
+		if let Ok(entries) = fs::read_dir(&session_dir) {
+			for entry in entries.flatten() {
+				let path = entry.path();
+				if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+					continue;
+				}
+				let Ok(bytes) = fs::read(&path) else {
+					continue;
+				};
+				if let Ok(session) = serde_json::from_slice::<Session>(&bytes) {
+					sessions.insert(session.id.clone(), session);
+				}
+			}
+		}
 		sessions.insert(id.clone(), Session::new(id.clone(), None));
 		Self {
 			current: id,
@@ -3080,8 +3784,12 @@ impl ServerState {
 			providers,
 			project,
 			session_dir,
+			discovery_settings,
+			additional_roots,
 			host_tools: BTreeMap::new(),
+			host_tool_revision: 0,
 			pending_host_tools: HashMap::new(),
+			pending_agent_host_tools: HashMap::new(),
 			pending_auth: HashMap::new(),
 			pending_extension_ui: HashMap::new(),
 			subscription: Subscription::Off,
@@ -3109,6 +3817,24 @@ impl ServerState {
 			.expect("current session is retained")
 	}
 
+	fn session_path(&self, id: &str) -> PathBuf {
+		self.session_dir.join(format!("{id}.rpc.json"))
+	}
+
+	fn persist(&self, id: &str) -> Result<(), CommandError> {
+		let session = self
+			.sessions
+			.get(id)
+			.ok_or_else(|| CommandError::new("session_not_found", "session is not loaded"))?;
+		let path = self.session_path(id);
+		let temporary = path.with_extension("rpc.json.tmp");
+		let bytes = serde_json::to_vec(session).map_err(CommandError::json)?;
+		fs::write(&temporary, bytes)
+			.map_err(|error| CommandError::new("session_write_failed", error.to_string()))?;
+		fs::rename(&temporary, &path)
+			.map_err(|error| CommandError::new("session_write_failed", error.to_string()))
+	}
+
 	fn touch_transcript(&mut self, id: &str, length: u64) {
 		self.transcript_lru.retain(|(entry, _)| entry != id);
 		self.transcript_lru.push_back((id.to_owned(), length));
@@ -3122,6 +3848,10 @@ struct PendingHostTool {
 	name:        String,
 	updates:     Vec<Value>,
 	subagent_id: Option<String>,
+}
+struct PendingAgentHostTool {
+	updates: omp_tool::HostToolUpdateSink,
+	reply:   oneshot::Sender<Result<omp_tool::HostToolResult, Str>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3159,10 +3889,12 @@ struct TranscriptMessage {
 	id:        String,
 	role:      String,
 	content:   String,
+	#[serde(default)]
+	images:    Vec<RpcImage>,
 	timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Session {
 	id:         String,
 	name:       Option<String>,
@@ -3190,10 +3922,15 @@ impl Session {
 	}
 
 	fn push_message(&mut self, role: &str, content: &str) {
+		self.push_message_with_images(role, content, Vec::new());
+	}
+
+	fn push_message_with_images(&mut self, role: &str, content: &str, images: Vec<RpcImage>) {
 		self.messages.push(TranscriptMessage {
-			id:        new_id("message"),
-			role:      role.to_owned(),
-			content:   content.to_owned(),
+			id: new_id("message"),
+			role: role.to_owned(),
+			content: content.to_owned(),
+			images,
 			timestamp: unix_millis(),
 		});
 		self.bump_revision();
@@ -3203,73 +3940,6 @@ impl Session {
 		self.revision = self.revision.wrapping_add(1);
 		self.leaf_id = new_id("leaf");
 		self.updated_at = unix_millis();
-	}
-}
-
-fn build_request(
-	session: &Session,
-	orchestration: bool,
-	host_tools: &BTreeMap<String, Value>,
-	forced_tool: Option<&str>,
-	fast_mode: bool,
-) -> ChatRequest {
-	let mut messages = Vec::with_capacity(session.messages.len() + usize::from(orchestration));
-	if orchestration {
-		messages.push(Message {
-			role:    Role::System,
-			content: Arc::from([ContentPart::Text {
-				text:  Str::from(ORCHESTRATE_NOTICE),
-				proof: None,
-			}]),
-			name:    None,
-		});
-	}
-	messages.extend(session.messages.iter().map(|message| Message {
-		role:    match message.role.as_str() {
-			"assistant" => Role::Assistant,
-			"system" => Role::System,
-			_ => Role::User,
-		},
-		content: Arc::from([ContentPart::Text {
-			text:  Str::from(message.content.clone()),
-			proof: None,
-		}]),
-		name:    None,
-	}));
-	let tools = forced_tool.map_or_else(Vec::new, |_| {
-		host_tools
-			.values()
-			.filter_map(|value| serde_json::from_value::<HostToolDefinition>(value.clone()).ok())
-			.map(|tool| ToolDefinition {
-				name:        Str::from(tool.name),
-				description: Some(Str::from(tool.description)),
-				input:       ToolInputConstraint::JsonSchema {
-					parameters: OpaqueJson::new(tool.parameters),
-					strict:     false,
-				},
-			})
-			.collect::<Vec<_>>()
-	});
-	ChatRequest {
-		messages:          Arc::from(messages),
-		tools:             Arc::from(tools),
-		hosted_tools:      Arc::from([]),
-		tool_choice:       forced_tool
-			.map_or(Setting::Unset, |tool| Setting::Require(ToolChoice::Named(Str::new(tool)))),
-		output:            Setting::Unset,
-		reasoning:         Setting::Unset,
-		verbosity:         Setting::Unset,
-		cache_retention:   Setting::Unset,
-		service_tier:      if fast_mode {
-			Setting::Require(ServiceTier { name: sf!("priority"), priority: 10 })
-		} else {
-			Setting::Unset
-		},
-		sampling:          Sampling::default(),
-		max_output_tokens: None,
-		top_logprobs:      None,
-		safety:            Arc::from([]),
-		negotiation:       NegotiationPolicy::default(),
 	}
 }
 
@@ -3360,12 +4030,24 @@ fn message_page(
 	)
 }
 
-fn rpc_command_roster(root: &Path, generation: u64) -> CommandRoster {
+fn rpc_command_roster(
+	root: &Path,
+	additional_roots: &[PathBuf],
+	home: &Path,
+	discovery_settings: &omp_driver::discovery::PromptDiscoverySettings,
+	generation: u64,
+) -> CommandRoster {
 	use crate::chat_ui::commands::{
 		CommandDeclaration, CommandGeneration, CommandImplementation, CommandProvenance,
 		CommandSourceKind, CommandSurface, ShadowPolicy,
 	};
-	let content = omp_driver::discovery::active_content_snapshots(root);
+	let content = omp_driver::discovery::active_prompt_snapshots(
+		root,
+		additional_roots,
+		home,
+		discovery_settings,
+	)
+	.content;
 	let generations = content
 		.commands
 		.iter()
@@ -3555,12 +4237,259 @@ fn host_tool_names_value(tool_names: Vec<String>) -> Value {
 	json!({ "toolNames": tool_names })
 }
 
+fn parse_host_tool_specs(
+	tools: &[Value],
+) -> Result<(BTreeMap<String, Value>, Vec<omp_tool::HostToolSpec>), CommandError> {
+	let mut parsed = BTreeMap::new();
+	let mut specs = Vec::with_capacity(tools.len());
+	for tool in tools {
+		let definition = serde_json::from_value::<HostToolDefinition>(tool.clone())
+			.map_err(|error| CommandError::new("invalid_params", error.to_string()))?;
+		if !definition.parameters.is_object() {
+			return Err(CommandError::new(
+				"invalid_params",
+				"host tool parameters must be JSON Schema objects",
+			));
+		}
+		specs.push(omp_tool::HostToolSpec {
+			name:        Str::from(definition.name.clone()),
+			description: Str::from(definition.description.clone()),
+			parameters:  definition.parameters.clone(),
+		});
+		parsed.insert(definition.name, tool.clone());
+	}
+	Ok((parsed, specs))
+}
+
 fn parse_params<P>(params: &Map<String, Value>) -> Result<P, CommandError>
 where
 	P: for<'de> Deserialize<'de>,
 {
 	serde_json::from_value(Value::Object(params.clone()))
 		.map_err(|error| CommandError::new("invalid_params", error.to_string()))
+}
+
+fn rpc_prompt_items(prompt: RpcPrompt) -> Result<Vec<Item>, CommandError> {
+	let orchestration = contains_orchestrate(&prompt.message);
+	let mut parts = Vec::with_capacity(1 + prompt.images.len());
+	parts.push(Part { kind: Some(part::Kind::Text(prompt.message)) });
+	for image in prompt.images {
+		let data = omp_core::base64::decode(&image.data)
+			.into_vec()
+			.map_err(|error| {
+				CommandError::new(
+					"invalid_params",
+					format!("`images[].data` must be valid base64: {error}"),
+				)
+			})?;
+		parts.push(Part {
+			kind: Some(part::Kind::Blob(Blob {
+				hash:   Bytes::copy_from_slice(Hash32::sum(&data).as_bytes()),
+				mime:   image.mime_type,
+				size:   data.len() as u64,
+				inline: data.into(),
+				detail: blob::Detail::Auto as i32,
+			})),
+		});
+	}
+	let mut items = Vec::with_capacity(1 + usize::from(orchestration));
+	if orchestration {
+		items.push(Item {
+			kind: Some(item::Kind::Message(ThreadMessage {
+				role:  ThreadRole::System as i32,
+				parts: vec![Part { kind: Some(part::Kind::Text(ORCHESTRATE_NOTICE.to_owned())) }],
+			})),
+			..Item::default()
+		});
+	}
+	items.push(Item {
+		kind: Some(item::Kind::Message(ThreadMessage { role: ThreadRole::User as i32, parts })),
+		..Item::default()
+	});
+	Ok(items)
+}
+
+fn rpc_thread_message(message: &ThreadMessage, stop_reason: Option<&str>) -> Value {
+	let content = message
+		.parts
+		.iter()
+		.filter_map(|part| match part.kind.as_ref()? {
+			part::Kind::Text(text) => Some(json!({"type":"text","text":text})),
+			part::Kind::Thinking(thinking) => {
+				Some(json!({"type":"thinking","thinking":thinking.text}))
+			},
+			part::Kind::Blob(blob) => Some(json!({
+				"type":if blob.mime.starts_with("image/") {"image"} else {"document"},
+				"data":omp_core::base64::encode(&blob.inline),
+				"mimeType":blob.mime,
+			})),
+			part::Kind::Fallback(fallback) => Some(json!({
+				"type":"modelFallback",
+				"fromModel":fallback.from_model,
+				"toModel":fallback.to_model,
+			})),
+			part::Kind::ServerTool(tool) => Some(json!({
+				"type":"serverTool",
+				"id":tool.id,
+				"name":tool.name,
+				"payload":serde_json::from_slice::<Value>(&tool.payload_json).unwrap_or(Value::Null),
+			})),
+		})
+		.collect::<Vec<_>>();
+	let role = match message.role() {
+		ThreadRole::System => "system",
+		ThreadRole::User => "user",
+		ThreadRole::Assistant => "assistant",
+		ThreadRole::Unspecified => "unknown",
+	};
+	let mut value = json!({"role":role,"content":content});
+	if let Some(reason) = stop_reason {
+		value["stopReason"] = Value::String(reason.to_owned());
+	}
+	value
+}
+
+fn rpc_tool_result(result: &omp_proto::thread::v1::ToolResult) -> Value {
+	let content = result
+		.parts
+		.iter()
+		.filter_map(|part| match part.kind.as_ref()? {
+			part::Kind::Text(text) => Some(json!({"type":"text","text":text})),
+			part::Kind::Blob(blob) if blob.mime.starts_with("image/") => Some(json!({
+				"type":"image",
+				"data":omp_core::base64::encode(&blob.inline),
+				"mimeType":blob.mime,
+			})),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	json!({
+		"role":"toolResult",
+		"toolCallId":result.call_id,
+		"toolName":result.name,
+		"content":content,
+		"isError":result.is_error,
+	})
+}
+
+fn rpc_thread_item(item: &Item) -> Option<Value> {
+	match item.kind.as_ref()? {
+		item::Kind::Message(message) => Some(rpc_thread_message(message, None)),
+		item::Kind::ToolCall(call) => Some(json!({
+			"role":"assistant",
+			"content":[{
+				"type":"toolCall",
+				"id":call.id,
+				"name":call.name,
+				"arguments":serde_json::from_slice::<Value>(&call.args_json).unwrap_or(Value::Null),
+			}],
+		})),
+		item::Kind::ToolResult(result) => Some(rpc_tool_result(result)),
+	}
+}
+
+fn thread_message_text(message: &ThreadMessage) -> Option<String> {
+	let mut output = String::new();
+	for part in &message.parts {
+		if let Some(part::Kind::Text(text)) = part.kind.as_ref() {
+			output.push_str(text);
+		}
+	}
+	(!output.is_empty()).then_some(output)
+}
+
+const fn rpc_stop_reason(settlement: RunSettlement) -> &'static str {
+	match settlement {
+		RunSettlement::Success | RunSettlement::Warning => "stop",
+		RunSettlement::SilentCompactionTransition | RunSettlement::CallerAbort => "aborted",
+		RunSettlement::MaxTokens => "length",
+		RunSettlement::TerminalFault => "error",
+	}
+}
+
+fn rpc_reasoning(level: &str) -> Result<Option<Reasoning>, CommandError> {
+	let effort = match level {
+		"auto" => return Ok(None),
+		"none" => Effort::Off,
+		"minimal" => Effort::Minimal,
+		"low" => Effort::Low,
+		"medium" => Effort::Medium,
+		"high" => Effort::High,
+		"xhigh" => Effort::Xhigh,
+		"max" => Effort::Max,
+		_ => {
+			return Err(CommandError::new(
+				"invalid_params",
+				format!("unknown thinking level `{level}`"),
+			));
+		},
+	};
+	Ok(Some(Reasoning {
+		effort:         effort as i32,
+		budget_tokens:  None,
+		hide_summary:   None,
+		on_unsupported: 0,
+	}))
+}
+
+fn queue_mode(params: &Map<String, Value>) -> Result<&str, CommandError> {
+	let mode = text(params, "mode")?;
+	if matches!(mode, "all" | "one-at-a-time") {
+		Ok(mode)
+	} else {
+		Err(CommandError::new("invalid_params", "queue mode must be `all` or `one-at-a-time`"))
+	}
+}
+
+fn merge_rpc_prompt(target: &mut RpcPrompt, mut incoming: RpcPrompt) {
+	if !target.message.is_empty() && !incoming.message.is_empty() {
+		target.message.push('\n');
+	}
+	target.message.push_str(&incoming.message);
+	target.images.append(&mut incoming.images);
+}
+
+fn prompt_input(params: &Map<String, Value>, message: String) -> Result<RpcPrompt, CommandError> {
+	let images = params.get("images").map_or_else(
+		|| Ok(Vec::new()),
+		|images| {
+			serde_json::from_value::<Vec<RpcImage>>(images.clone())
+				.map_err(|error| CommandError::new("invalid_params", error.to_string()))
+		},
+	)?;
+	for image in &images {
+		if !image.mime_type.starts_with("image/") {
+			return Err(CommandError::new(
+				"invalid_params",
+				"`images[].mimeType` must be an image media type",
+			));
+		}
+		omp_core::base64::decode(&image.data)
+			.into_vec()
+			.map_err(|error| {
+				CommandError::new(
+					"invalid_params",
+					format!("`images[].data` must be valid base64: {error}"),
+				)
+			})?;
+	}
+	Ok(RpcPrompt { message, images })
+}
+
+fn rpc_user_message(prompt: &RpcPrompt) -> Value {
+	let mut content = vec![json!({"type":"text","text":prompt.message})];
+	content.extend(prompt.images.iter().map(|image| {
+		json!({
+			"type":image.kind.as_deref().unwrap_or("image"),
+			"data":image.data,
+			"mimeType":image.mime_type,
+		})
+	}));
+	json!({
+		"role":"user",
+		"content":content,
+		"timestamp":unix_millis(),
+	})
 }
 
 #[cfg(not(windows))]
@@ -3858,25 +4787,80 @@ mod tests {
 	}
 
 	#[test]
-	fn request_consumes_forced_host_tool_and_fast_tier() {
-		let session = Session::new("session".into(), None);
-		let tools = BTreeMap::from([(
-			"read".into(),
-			json!({
-				"name": "read",
-				"description": "Read a file",
-				"parameters": {"type": "object"},
-			}),
-		)]);
-		let request = build_request(&session, false, &tools, Some("read"), true);
-		assert_eq!(request.tools.len(), 1);
+	fn host_tool_roster_preserves_direct_names_and_schemas() {
+		let tools = vec![json!({
+			"name":"echo",
+			"description":"Echo input",
+			"parameters":{
+				"type":"object",
+				"properties":{"text":{"type":"string"}},
+				"required":["text"]
+			}
+		})];
+		let (wire, specs) = parse_host_tool_specs(&tools).expect("host roster");
+		assert!(wire.contains_key("echo"));
+		assert_eq!(specs.len(), 1);
+		assert_eq!(specs[0].name, "echo");
+		assert_eq!(specs[0].parameters["required"], json!(["text"]));
+	}
+
+	#[test]
+	fn queue_all_mode_merges_text_and_images_without_loss() {
+		let mut queued = RpcPrompt {
+			message: "first".into(),
+			images:  vec![RpcImage {
+				kind:      Some("image".into()),
+				data:      omp_core::base64::encode(b"one").into_string(),
+				mime_type: "image/png".into(),
+			}],
+		};
+		merge_rpc_prompt(&mut queued, RpcPrompt {
+			message: "second".into(),
+			images:  vec![RpcImage {
+				kind:      Some("image".into()),
+				data:      omp_core::base64::encode(b"two").into_string(),
+				mime_type: "image/png".into(),
+			}],
+		});
+		assert_eq!(queued.message, "first\nsecond");
+		assert_eq!(queued.images.len(), 2);
+	}
+
+	#[test]
+	fn live_thinking_levels_lower_to_provider_reasoning() {
+		assert!(rpc_reasoning("auto").unwrap().is_none());
+		assert_eq!(rpc_reasoning("high").unwrap().unwrap().effort, Effort::High as i32);
+		assert!(rpc_reasoning("invalid").is_err());
+	}
+
+	#[test]
+	fn prompt_images_survive_validation_persistence_and_request_projection() {
+		let params = json!({
+			"images":[{
+				"type":"image",
+				"data":omp_core::base64::encode(b"png"),
+				"mimeType":"image/png"
+			}]
+		});
+		let prompt =
+			prompt_input(params.as_object().expect("params"), "describe".into()).expect("prompt");
+		let mut session = Session::new("session".into(), None);
+		session.push_message_with_images("user", &prompt.message, prompt.images);
+		let encoded = serde_json::to_vec(&session).expect("serialize");
+		let restored: Session = serde_json::from_slice(&encoded).expect("restore");
+		let restored = &restored.messages[0];
+		let items = rpc_prompt_items(RpcPrompt {
+			message: restored.content.clone(),
+			images:  restored.images.clone(),
+		})
+		.expect("canonical items");
+		let Some(item::Kind::Message(message)) = items[0].kind.as_ref() else {
+			panic!("message");
+		};
 		assert!(matches!(
-			&request.tool_choice,
-			Setting::Require(ToolChoice::Named(name)) if name == "read"
-		));
-		assert!(matches!(
-			&request.service_tier,
-			Setting::Require(ServiceTier { name, .. }) if name == "priority"
+			&message.parts[1].kind,
+			Some(part::Kind::Blob(blob))
+				if blob.mime == "image/png" && blob.inline.as_ref() == b"png"
 		));
 	}
 

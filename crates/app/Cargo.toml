@@ -57,13 +57,13 @@ omp-core.workspace = true
 omp-driver.workspace = true
 omp-env = { workspace = true }
 omp-envd = { workspace = true }
-omp-executor = { workspace = true }
 omp-ext.workspace = true
 omp-gui.workspace = true
 omp-grep.workspace = true
 omp-hashline.workspace = true
 omp-catalog.workspace = true
 omp-inference.workspace = true
+omp-memory.workspace = true
 omp-serve.workspace = true
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-py.workspace = true
@@ -77,6 +77,7 @@ omp-tool.workspace = true
 omp-tui.workspace = true
 omp-voice = { workspace = true, features = ["realtime-transport"] }
 omp-slopjson.workspace = true
+omp-shell.workspace = true
 omp-tools.workspace = true
 omp-walker.workspace = true
 jiff.workspace = true
@@ -91,7 +92,7 @@ sha2 = { workspace = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-util = { workspace = true, features = ["rt"] }
+tokio-util.workspace = true
 tonic.workspace = true
 rand.workspace = true
 tracing.workspace = true

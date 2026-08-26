@@ -5,16 +5,356 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fs, io,
+	fmt, fs, io,
 	path::{Component, Path, PathBuf},
+	sync::Arc,
 };
 
+use async_stream::stream;
+use bytes::Bytes;
+use futures::Stream;
 use omp_core::Str;
-use serde::Deserialize;
+use omp_env::{EnvClient, ExecEvent};
+use omp_proto::env::v1::{
+	CloseSessionRequest, ExecOutcome, ExecRequest, OpenSessionRequest, OutputChannel, Script,
+	StdinFrame, stdin_frame,
+};
+use omp_tool::{
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, ExecEffects,
+	IncomingParams, ParamError, Part, Presentation, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use super::manifest::{ToolHandlerDeclaration, ToolPayload};
+#[derive(Clone)]
+struct ProcessBinding {
+	client: EnvClient,
+	cwd:    omp_core::EnvPath,
+}
+
+/// Post-connect factory for declaration-fixed native process tools.
+pub struct ProcessToolFactory {
+	tools:   Vec<ToolPayload>,
+	binding: Arc<RwLock<Option<ProcessBinding>>>,
+}
+impl fmt::Debug for ProcessToolFactory {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("ProcessToolFactory")
+			.field("tools", &self.tools.len())
+			.finish_non_exhaustive()
+	}
+}
+
+impl ProcessToolFactory {
+	/// Retains only process-backed winners for registration before freeze.
+	pub fn new(tools: impl IntoIterator<Item = ToolPayload>) -> Self {
+		Self {
+			tools:   tools
+				.into_iter()
+				.filter(|tool| matches!(tool.handler, ToolHandlerDeclaration::Process { .. }))
+				.collect(),
+			binding: Arc::new(RwLock::new(None)),
+		}
+	}
+
+	/// Returns whether the factory has any executable declarations.
+	pub fn is_empty(&self) -> bool {
+		self.tools.is_empty()
+	}
+}
+
+impl omp_envd::DynamicToolFactory for ProcessToolFactory {
+	fn register(&self, registry: &mut omp_tool::Registry) -> Result<(), omp_tool::RegistryError> {
+		for declaration in &self.tools {
+			registry.register(
+				ProcessCustomTool::new(declaration.clone(), Arc::clone(&self.binding)),
+				Presentation::Device,
+				omp_tool::Claims {
+					precedence: omp_tool::Precedence::ENHANCEMENT,
+					claimant:   Str::new_static("omp/native-custom-tools"),
+					replaces:   None,
+				},
+			)?;
+		}
+		Ok(())
+	}
+
+	fn bind(&self, client: EnvClient, root: &Path) {
+		let cwd = url::Url::from_file_path(root)
+			.ok()
+			.and_then(|url| omp_core::EnvPath::new(Str::new(url.as_str())).ok());
+		if let Some(cwd) = cwd {
+			*self.binding.write() = Some(ProcessBinding { client, cwd });
+		}
+	}
+}
+
+struct ProcessCustomTool {
+	spec:        ToolSpec,
+	declaration: ToolPayload,
+	binding:     Arc<RwLock<Option<ProcessBinding>>>,
+}
+
+impl ProcessCustomTool {
+	fn new(declaration: ToolPayload, binding: Arc<RwLock<Option<ProcessBinding>>>) -> Self {
+		let commands: Arc<[Str]> = match &declaration.handler {
+			ToolHandlerDeclaration::Process { program, .. } => {
+				Arc::from([Str::from(program.to_string_lossy().into_owned())])
+			},
+			ToolHandlerDeclaration::Python { .. } => Arc::from([]),
+		};
+		let spec = ToolSpec {
+			name:            declaration.name.clone(),
+			rev:             Rev { family: Str::new_static("native"), n: 1 },
+			description:     declaration.description.clone(),
+			schema:          Bytes::from(
+				serde_json::to_vec(&declaration.input_schema)
+					.expect("discovered tool schema is serializable"),
+			),
+			constraint:      Constraint::Schema {
+				priority:       100,
+				on_unsupported: omp_tool::Fallback::Unspecified,
+			},
+			effects:         Effects {
+				exec: Some(ExecEffects { commands, network: false }),
+				..Effects::empty()
+			},
+			projection_code: omp_tool::native_projection_code(
+				env!("CARGO_PKG_NAME"),
+				env!("CARGO_PKG_VERSION"),
+				include_bytes!("custom_tools.rs"),
+			)
+			.into_bytes(),
+		};
+		Self { spec, declaration, binding }
+	}
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProcessPayload {
+	stdout:    Str,
+	stderr:    Str,
+	exit_code: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProcessFault {
+	message: Str,
+}
+
+impl fmt::Display for ProcessFault {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.message.as_str())
+	}
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum ProcessUpdate {}
+
+impl Tool for ProcessCustomTool {
+	type Fault = ProcessFault;
+	type Params = Value;
+	type Payload = ProcessPayload;
+	type Update = ProcessUpdate;
+
+	fn spec(&self) -> &ToolSpec {
+		&self.spec
+	}
+
+	fn call<'c>(
+		&'c self,
+		mut incoming: IncomingParams<'c>,
+	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+		stream! {
+			let params = match incoming.whole::<Value>().await {
+				Ok(value) => value,
+				Err(error) => { yield process_param_event(error); return; }
+			};
+			if let Err(error) = incoming.interruptable().committed().await {
+				yield process_commit_event(error);
+				return;
+			}
+			let Some(binding) = self.binding.read().clone() else {
+				yield Ev::Done(ToolTerminal::Done {
+					result: Err(ProcessFault { message: Str::new_static("custom tool environment is not bound") }),
+					useless: true,
+				});
+				return;
+			};
+			let result = execute_process_tool(&binding, &self.declaration, &params).await;
+			yield Ev::Done(ToolTerminal::Done { result, useless: false });
+		}
+	}
+
+	fn prompt(&self, view: Result<&ProcessPayload, &ProcessFault>, _: &PromptCaps) -> Vec<Part> {
+		let text = match view {
+			Ok(payload) => serde_json::to_string(payload).unwrap_or_else(|_| {
+				"{\"error\":\"custom tool result serialization failed\"}".to_owned()
+			}),
+			Err(error) => error.to_string(),
+		};
+		vec![Part::Text { text: Str::from(text) }]
+	}
+}
+
+async fn execute_process_tool(
+	binding: &ProcessBinding,
+	declaration: &ToolPayload,
+	params: &Value,
+) -> Result<ProcessPayload, ProcessFault> {
+	let ToolHandlerDeclaration::Process { program, args } = &declaration.handler else {
+		return Err(ProcessFault {
+			message: Str::new_static("custom tool handler is not a process"),
+		});
+	};
+	let opened = binding
+		.client
+		.open_session(&binding.cwd, OpenSessionRequest::default())
+		.await
+		.map_err(process_fault)?;
+	let session = opened.session.clone();
+	let command = std::iter::once(program.to_string_lossy().into_owned())
+		.chain(args.iter().map(ToString::to_string))
+		.map(|argument| process_shell_word(&argument))
+		.collect::<Vec<_>>()
+		.join(" ");
+	let result = async {
+		let mut run = binding
+			.client
+			.exec(ExecRequest {
+				session: opened.session,
+				source: Some(Script { text: command, ..Script::default() }),
+				..ExecRequest::default()
+			})
+			.await
+			.map_err(process_fault)?;
+		let exec = match run.next_event().await.map_err(process_fault)? {
+			Some(ExecEvent::Started(started)) => started.exec,
+			Some(_) => {
+				return Err(ProcessFault {
+					message: Str::new_static("custom tool process omitted its start frame"),
+				});
+			},
+			None => {
+				return Err(ProcessFault {
+					message: Str::new_static("custom tool process stream ended before start"),
+				});
+			},
+		};
+		let mut input = serde_json::to_vec(params).map_err(process_fault)?;
+		input.push(b'\n');
+		run.stdin(StdinFrame {
+			exec:  exec.clone(),
+			input: Some(stdin_frame::Input::Data(Bytes::from(input))),
+			props: None,
+		})
+		.await
+		.map_err(process_fault)?;
+		run.stdin(StdinFrame { exec, input: Some(stdin_frame::Input::Eof(true)), props: None })
+			.await
+			.map_err(process_fault)?;
+		let mut stdout = Vec::new();
+		let mut stderr = Vec::new();
+		loop {
+			match run.next_event().await.map_err(process_fault)? {
+				Some(ExecEvent::Output(frame)) => {
+					let target = if frame.channel == OutputChannel::Stdout as i32 {
+						&mut stdout
+					} else {
+						&mut stderr
+					};
+					if target.len().saturating_add(frame.data.len()) > 1024 * 1024 {
+						return Err(ProcessFault {
+							message: Str::new_static("custom tool output exceeds 1 MiB"),
+						});
+					}
+					target.extend_from_slice(&frame.data);
+				},
+				Some(ExecEvent::Exit(exit)) => {
+					let status = exit.status.ok_or_else(|| ProcessFault {
+						message: Str::new_static("custom tool exited without status"),
+					})?;
+					if status.outcome != ExecOutcome::Exited as i32 {
+						return Err(ProcessFault {
+							message: Str::from(format!(
+								"custom tool process ended with outcome {}",
+								status.outcome
+							)),
+						});
+					}
+					return Ok(ProcessPayload {
+						stdout:    Str::from(String::from_utf8_lossy(&stdout).into_owned()),
+						stderr:    Str::from(String::from_utf8_lossy(&stderr).into_owned()),
+						exit_code: status.exit_code.unwrap_or(-1),
+					});
+				},
+				Some(ExecEvent::Started(_)) => {},
+				None => {
+					return Err(ProcessFault {
+						message: Str::new_static("custom tool process stream ended early"),
+					});
+				},
+			}
+		}
+	}
+	.await;
+	let _ = binding
+		.client
+		.close_session(CloseSessionRequest { session, ..CloseSessionRequest::default() })
+		.await;
+	result
+}
+
+fn process_fault(error: impl fmt::Display) -> ProcessFault {
+	ProcessFault { message: Str::new(error.to_string()) }
+}
+
+fn process_param_event(error: ParamError) -> Ev<ProcessUpdate, ProcessPayload, ProcessFault> {
+	match error {
+		ParamError::Args(issue) => Ev::Args(*issue),
+		ParamError::Interrupted(interrupt) => {
+			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+		},
+		ParamError::Protocol(message) => Ev::Args(ArgIssue {
+			path:     Vec::new(),
+			expected: Str::new_static("one custom tool argument object"),
+			kind:     ArgIssueKind::Protocol,
+			example:  Some(Str::new_static("{}")),
+			found:    Some(message),
+		}),
+	}
+}
+
+fn process_commit_event(error: CommitError) -> Ev<ProcessUpdate, ProcessPayload, ProcessFault> {
+	match error {
+		CommitError::Aborted => Ev::Aborted(Abort::InputDropped),
+		CommitError::Interrupted(interrupt) => {
+			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+		},
+		CommitError::Protocol(message) => Ev::Args(ArgIssue {
+			path:     Vec::new(),
+			expected: Str::new_static("one committed custom tool argument object"),
+			kind:     ArgIssueKind::Protocol,
+			example:  Some(Str::new_static("{}")),
+			found:    Some(message),
+		}),
+	}
+}
+
+fn process_shell_word(word: &str) -> String {
+	if !word.is_empty()
+		&& word
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || b"-_./:".contains(&byte))
+	{
+		return word.to_owned();
+	}
+	format!("'{}'", word.replace('\'', "'\\''"))
+}
 
 /// Native source tier for deterministic tool precedence.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

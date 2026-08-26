@@ -39,6 +39,9 @@ pub mod tar;
 pub mod unix_ar;
 pub mod zip;
 
-pub use archive::{Archive, Files, Format, Limits, unpack, unpack_with_format};
+pub use archive::{
+	Archive, EXTENSION_TABLE, Files, Format, Limits, PathCandidate, path_candidates, unpack,
+	unpack_with_format,
+};
 pub use entry::Entry;
 pub use error::{Error, Result};

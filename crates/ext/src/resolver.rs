@@ -6,9 +6,11 @@ use std::{
 	io,
 	path::PathBuf,
 	process::{Command, Output},
+	str::FromStr as _,
 };
 
 use omp_core::Str;
+use pep440_rs::{Version, VersionSpecifiers};
 
 use super::{ExtensionCode, ExtensionError};
 
@@ -49,6 +51,8 @@ impl UvRequest {
 			OsString::from("pip"),
 			OsString::from("install"),
 			OsString::from("--dry-run"),
+			OsString::from("--report"),
+			OsString::from("-"),
 			OsString::from("--only-binary"),
 			OsString::from(":all:"),
 			OsString::from("--require-hashes"),
@@ -78,21 +82,33 @@ impl UvRequest {
 		argv
 	}
 
-	/// R7 checks requirements against the actual frozen runtime metadata before
-	/// invoking uv, preventing a silently shadowed site copy.
+	/// R7 checks PEP 508 requirements against actual frozen runtime metadata
+	/// before invoking uv, preventing a silently shadowed site copy.
 	pub fn reject_frozen_conflicts(&self, frozen: &[(&str, &str)]) -> Result<(), ExtensionError> {
 		for requirement in &self.requirements {
-			let Some((name, version)) = requirement.requirement.as_str().split_once("==") else {
+			let Some(parsed) = FrozenRequirement::parse(requirement.requirement.as_str())? else {
 				continue;
 			};
-			if let Some((_, frozen_version)) = frozen
+			if !parsed.marker_applies {
+				continue;
+			}
+			let Some((frozen_name, frozen_version)) = frozen
 				.iter()
-				.find(|(frozen_name, _)| name.eq_ignore_ascii_case(frozen_name))
-				&& version != *frozen_version
-			{
+				.find(|(name, _)| normalize_distribution_name(name) == parsed.name)
+			else {
+				continue;
+			};
+			let satisfied = match parsed.specifiers {
+				Some(specifiers) => version_satisfies(frozen_version, &specifiers)?,
+				None => !parsed.direct_url,
+			};
+			if !satisfied {
 				return Err(ExtensionError::new(
 					ExtensionCode::EFrozenConflict,
-					format!("{name}=={version} conflicts with frozen {name}=={frozen_version}"),
+					format!(
+						"{} conflicts with frozen {}=={}",
+						requirement.requirement, frozen_name, frozen_version
+					),
 				));
 			}
 		}
@@ -100,6 +116,164 @@ impl UvRequest {
 	}
 }
 
+/// Returns a PEP 503-normalized distribution name.
+pub fn normalize_distribution_name(name: &str) -> String {
+	let mut normalized = String::with_capacity(name.len());
+	let mut separator = false;
+	for character in name.chars() {
+		if matches!(character, '-' | '_' | '.') {
+			if !separator {
+				normalized.push('-');
+				separator = true;
+			}
+		} else {
+			normalized.extend(character.to_lowercase());
+			separator = false;
+		}
+	}
+	normalized
+}
+
+/// Evaluates a PEP 440 specifier set against one exact version.
+pub fn version_satisfies(version: &str, specifiers: &str) -> Result<bool, ExtensionError> {
+	let version = Version::from_str(version).map_err(|error| {
+		ExtensionError::new(
+			ExtensionCode::EManifestParse,
+			format!("invalid PEP 440 version {version:?}: {error}"),
+		)
+	})?;
+	let specifiers = VersionSpecifiers::from_str(specifiers).map_err(|error| {
+		ExtensionError::new(
+			ExtensionCode::EManifestParse,
+			format!("invalid PEP 440 specifier {specifiers:?}: {error}"),
+		)
+	})?;
+	Ok(specifiers.contains(&version))
+}
+
+/// Compares two exact PEP 440 versions.
+pub fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering, ExtensionError> {
+	let left = Version::from_str(left).map_err(|error| {
+		ExtensionError::new(
+			ExtensionCode::EManifestParse,
+			format!("invalid PEP 440 version {left:?}: {error}"),
+		)
+	})?;
+	let right = Version::from_str(right).map_err(|error| {
+		ExtensionError::new(
+			ExtensionCode::EManifestParse,
+			format!("invalid PEP 440 version {right:?}: {error}"),
+		)
+	})?;
+	Ok(left.cmp(&right))
+}
+
+struct FrozenRequirement {
+	name:           String,
+	specifiers:     Option<String>,
+	direct_url:     bool,
+	marker_applies: bool,
+}
+
+impl FrozenRequirement {
+	fn parse(requirement: &str) -> Result<Option<Self>, ExtensionError> {
+		let (requirement, marker) = requirement
+			.split_once(';')
+			.map_or((requirement, None), |(requirement, marker)| (requirement, Some(marker)));
+		let requirement = requirement.trim();
+		if requirement.is_empty() {
+			return Err(ExtensionError::new(
+				ExtensionCode::EFrozenConflict,
+				"empty PEP 508 requirement",
+			));
+		}
+		let name_len = requirement
+			.bytes()
+			.take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+			.count();
+		if name_len == 0 {
+			return Err(ExtensionError::new(
+				ExtensionCode::EFrozenConflict,
+				format!("invalid PEP 508 requirement {requirement:?}"),
+			));
+		}
+		let name = normalize_distribution_name(&requirement[..name_len]);
+		let mut remainder = requirement[name_len..].trim_start();
+		if let Some(extras) = remainder.strip_prefix('[') {
+			let Some(end) = extras.find(']') else {
+				return Err(ExtensionError::new(
+					ExtensionCode::EFrozenConflict,
+					format!("unterminated extras in {requirement:?}"),
+				));
+			};
+			remainder = extras[end + 1..].trim_start();
+		}
+		let direct_url = remainder.starts_with('@');
+		let specifiers = if remainder.is_empty() || direct_url {
+			None
+		} else {
+			VersionSpecifiers::from_str(remainder).map_err(|error| {
+				ExtensionError::new(
+					ExtensionCode::EFrozenConflict,
+					format!("invalid PEP 508 requirement {requirement:?}: {error}"),
+				)
+			})?;
+			Some(remainder.to_owned())
+		};
+		Ok(Some(Self {
+			name,
+			specifiers,
+			direct_url,
+			marker_applies: marker.is_none_or(marker_applies),
+		}))
+	}
+}
+
+fn marker_applies(marker: &str) -> bool {
+	marker.split(" or ").any(|disjunction| {
+		disjunction
+			.split(" and ")
+			.all(|expression| marker_atom_applies(expression.trim()))
+	})
+}
+
+fn marker_atom_applies(expression: &str) -> bool {
+	for operator in [" not in ", " in ", "==", "!=", ">=", "<=", ">", "<"] {
+		let Some((variable, expected)) = expression.split_once(operator) else {
+			continue;
+		};
+		let actual = match variable.trim() {
+			"python_version" => "3.14",
+			"python_full_version" => "3.14.0",
+			"implementation_name" => "cpython",
+			"sys_platform" => std::env::consts::OS,
+			"platform_machine" => std::env::consts::ARCH,
+			"extra" => "",
+			_ => return true,
+		};
+		let expected = expected.trim().trim_matches(['\'', '"']);
+		return match operator.trim() {
+			"==" => actual == expected,
+			"!=" => actual != expected,
+			"in" => expected.split(',').any(|value| value.trim() == actual),
+			"not in" => !expected.split(',').any(|value| value.trim() == actual),
+			">=" | "<=" | ">" | "<"
+				if matches!(variable.trim(), "python_version" | "python_full_version") =>
+			{
+				let ordering = compare_versions(actual, expected).unwrap_or(std::cmp::Ordering::Equal);
+				match operator.trim() {
+					">=" => ordering.is_ge(),
+					"<=" => ordering.is_le(),
+					">" => ordering.is_gt(),
+					"<" => ordering.is_lt(),
+					_ => unreachable!(),
+				}
+			},
+			_ => true,
+		};
+	}
+	true
+}
 /// A declared enabled extension root. It is an alias that makes the
 /// host-child resolution boundary explicit at CLI call sites.
 pub type EnabledExtension = ResolveRequirement;
@@ -319,6 +493,8 @@ mod tests {
 			"pip",
 			"install",
 			"--dry-run",
+			"--report",
+			"-",
 			"--only-binary",
 			":all:",
 			"--require-hashes",
@@ -335,5 +511,45 @@ mod tests {
 			"--requirement",
 			"requirements.txt"
 		]);
+	}
+	#[test]
+	fn frozen_conflicts_parse_pep_508_names_extras_markers_and_specifiers() {
+		let request = |requirement: &'static str| UvRequest {
+			executable:        PathBuf::from("uv"),
+			target:            sf!("aarch64-apple-darwin"),
+			indexes:           Vec::new(),
+			exclude_newer:     None,
+			requirements_file: PathBuf::from("requirements.txt"),
+			requirements:      vec![ResolveRequirement {
+				extension_id: sf!("example"),
+				requirement:  sf!("{requirement}"),
+			}],
+		};
+		let frozen = [("cloudpickle", "4.0.0")];
+
+		assert!(
+			request("Cloud_Pickle[remote]>=4,<5; python_version >= '3.14'")
+				.reject_frozen_conflicts(&frozen)
+				.is_ok()
+		);
+		assert_eq!(
+			request("cloudpickle~=3.1")
+				.reject_frozen_conflicts(&frozen)
+				.unwrap_err()
+				.code,
+			ExtensionCode::EFrozenConflict
+		);
+		assert!(
+			request("cloudpickle<4; python_version < '3.14'")
+				.reject_frozen_conflicts(&frozen)
+				.is_ok()
+		);
+		assert_eq!(
+			request("cloudpickle @ https://example.invalid/cloudpickle.whl")
+				.reject_frozen_conflicts(&frozen)
+				.unwrap_err()
+				.code,
+			ExtensionCode::EFrozenConflict
+		);
 	}
 }

@@ -278,6 +278,14 @@ message PrincipalRef {
   string display = 2;
   omp.inference.v1.ValueMap props = 15;
 }
+message ActivationCliValue {
+  string sink = 1;
+  oneof value {
+    bool boolean = 2;
+    string string = 3;
+  }
+  omp.inference.v1.ValueMap props = 15;
+}
 
 message ActivateExtension {
   string extension_id = 1;
@@ -286,6 +294,7 @@ message ActivateExtension {
   uint64 generation = 4;
   PrincipalRef principal = 5;
   optional RestartReason restart_reason = 6;
+  repeated ActivationCliValue cli_values = 7;
   omp.inference.v1.ValueMap props = 15;
 }
 

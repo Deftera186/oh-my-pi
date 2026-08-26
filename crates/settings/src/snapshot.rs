@@ -162,23 +162,48 @@ impl<D> TypedProjection<D> {
 /// Broadcasts new snapshots to domain-filtered subscribers.
 #[derive(Debug, Default)]
 pub struct SnapshotPublisher {
-	subscribers: Mutex<Vec<flume::Sender<Arc<SettingsSnapshot>>>>,
+	subscribers: Mutex<Vec<DomainSubscriber>>,
+}
+
+#[derive(Debug)]
+struct DomainSubscriber {
+	domain:    &'static str,
+	last_sent: DomainRevision,
+	sender:    flume::Sender<Arc<SettingsSnapshot>>,
+	drain:     Receiver<Arc<SettingsSnapshot>>,
 }
 
 impl SnapshotPublisher {
 	/// Creates a subscription that wakes only when `domain` advances.
 	pub fn subscribe(&self, domain: &'static str, current: DomainRevision) -> Subscription {
-		let (sender, receiver) = flume::unbounded();
-		self.subscribers.lock().push(sender);
+		let (sender, receiver) = flume::bounded(1);
+		self.subscribers.lock().push(DomainSubscriber {
+			domain,
+			last_sent: current,
+			sender,
+			drain: receiver.clone(),
+		});
 		Subscription { domain, current, receiver }
 	}
 
-	/// Publishes a committed snapshot, removing disconnected subscribers.
+	/// Publishes a committed snapshot only to domains that advanced. Each
+	/// subscriber retains at most the latest pending snapshot.
 	pub fn publish(&self, snapshot: Arc<SettingsSnapshot>) {
-		self
-			.subscribers
-			.lock()
-			.retain(|sender| sender.send(Arc::clone(&snapshot)).is_ok());
+		self.subscribers.lock().retain_mut(|subscriber| {
+			let revision = snapshot.domain_revision(subscriber.domain);
+			if revision <= subscriber.last_sent {
+				return !subscriber.sender.is_disconnected();
+			}
+			subscriber.last_sent = revision;
+			match subscriber.sender.try_send(Arc::clone(&snapshot)) {
+				Ok(()) => true,
+				Err(flume::TrySendError::Disconnected(_)) => false,
+				Err(flume::TrySendError::Full(latest)) => {
+					let _ = subscriber.drain.try_recv();
+					subscriber.sender.try_send(latest).is_ok() || !subscriber.sender.is_disconnected()
+				},
+			}
+		});
 	}
 }
 
@@ -321,5 +346,31 @@ mod tests {
 		assert_eq!(resolve_path_scoped(&entries, Path::new("src/lib.rs")).expect("resolve"), [
 			&1, &2, &3
 		]);
+	}
+	#[test]
+	fn domain_publisher_filters_irrelevant_changes_and_coalesces_latest() {
+		fn snapshot(whole: u64, demo: u64) -> Arc<SettingsSnapshot> {
+			Arc::new(SettingsSnapshot::persistent(
+				Revision(whole),
+				BTreeMap::from([("demo", DomainRevision(demo))]),
+				toml::Table::new(),
+			))
+		}
+
+		let publisher = SnapshotPublisher::default();
+		let subscription = publisher.subscribe("demo", DomainRevision(1));
+		publisher.publish(snapshot(2, 1));
+		assert!(subscription.receiver.try_recv().is_err());
+		publisher.publish(snapshot(3, 2));
+		publisher.publish(snapshot(4, 3));
+		assert_eq!(
+			subscription
+				.receiver
+				.try_recv()
+				.expect("latest pending snapshot")
+				.revision(),
+			Revision(4),
+		);
+		assert!(subscription.receiver.try_recv().is_err());
 	}
 }

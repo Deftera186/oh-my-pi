@@ -1,5 +1,5 @@
 # omp-sandbox
 
-`omp-sandbox` reserves the crate boundary for OMP's future process-confinement integration. OS-specific isolation primitives belong here, beside the environment daemon that spawns processes, rather than in `omp-env` or the agent loop.
+`omp-sandbox` provides the fail-closed process-confinement boundary used by sandboxed extension and environment-host launches. Policies contain canonical read/write filesystem grants and an explicit network policy.
 
-Sandbox enforcement is explicitly deferred for v1. This crate currently exposes no confinement API and does not confine extensions, shell builtins, or child processes. Extensions are not a security boundary. Future enforcement must be built on the planned VM-grade vibevmm and isobox architecture before this crate can make an isolation claim.
+`SandboxPolicy::prepare` returns a native `SandboxLaunch` only after proving that the platform backend can install confinement. macOS uses Seatbelt and Linux uses bubblewrap. Missing, unsupported, or unusable backends return an error; callers must never retry a sandboxed launch without the returned launcher and argument prefix. Trusted execution remains a separate, explicit caller policy.

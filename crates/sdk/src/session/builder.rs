@@ -1,19 +1,23 @@
 //! Callback-capable native session construction.
 
 use std::{
-	iter,
+	error, iter,
 	path::PathBuf,
 	sync::Arc,
 	time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use omp_agent::{PromptFacts, PromptHash, RenderedPrompt};
+use omp_agent::{
+	Agent, AgentSnapshot, Journal, PromptError, PromptFacts, PromptHash, PromptSource,
+	RenderedPrompt, RpcTurnClient,
+};
 use omp_catalog::{CandidateProvenance, Catalog, TransportKind};
 use omp_core::{Hash32, Str, sf};
+use omp_env::EnvClient;
 use omp_inference::transport::http::{HttpTransport, PreconnectLaunch};
 use omp_secrets::obfuscator::SecretObfuscator;
 use omp_telemetry::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionStart};
-use omp_tool::Registry;
+use omp_tool::{CapsBase, Registry};
 use parking_lot::Mutex;
 use thiserror::Error;
 use url::Url;
@@ -26,9 +30,8 @@ use super::{
 use crate::{
 	CallbackSet, ContextPatchHandler, CredentialCallback, EventCallback, FirstDispatchCallback,
 	LocalProtocolResolver, ModelPlan, ModelPlanError, PromptCompiler, PromptContribution,
-	PromptPatchError, RequestTuningCallback, SystemPromptCallback, UiContextCallback,
-	UsageConfirmationCallback, UsageConfirmationDecision, UsageConfirmationRequest,
-	model::default_model_plan, resolve_model_plan,
+	PromptPatchError, RequestTuningCallback, RuntimeCallbacks, SystemPromptCallback,
+	UiContextCallback, UsageConfirmationCallback, model::default_model_plan, resolve_model_plan,
 };
 
 /// Stable Environment root descriptor prepared for session composition.
@@ -42,6 +45,81 @@ pub struct WorkspaceRootDescriptor {
 	pub path:    PathBuf,
 	/// Whether this is the primary working root.
 	pub primary: bool,
+}
+
+/// Installs session-bound callbacks into the production title, context,
+/// credential, request-tuning, and usage-selection owners.
+///
+/// Implementations retain the clone-cheap authority for the life of the
+/// runtime. Installation must complete before provider work can start.
+pub trait ProductionCallbackBoundary: Send + Sync + 'static {
+	/// Installs every callback dispatcher into its named production subsystem.
+	fn install(
+		&self,
+		callbacks: RuntimeCallbacks,
+	) -> Result<(), Box<dyn error::Error + Send + Sync>>;
+}
+
+/// Authority inputs needed to compose a production SDK session.
+///
+/// All types are re-exported by `omp-sdk`; embedders do not need to depend on
+/// internal crates or construct an [`Agent`] themselves.
+pub struct ProductionSessionComposition {
+	/// Established owner-authenticated inference channel.
+	pub inference:         RpcTurnClient,
+	/// Environment authority used by tools and extension CONTROL.
+	pub environment:       EnvClient,
+	/// Durable session journal.
+	pub journal:           Journal,
+	/// Initial per-turn policy. The blueprint installs its registry, prompt
+	/// facts, and compiled prompt source before launch.
+	pub snapshot:          AgentSnapshot,
+	/// Hard output and context ceilings.
+	pub caps:              CapsBase,
+	/// Application-owned installer for callback classes that cross the agent,
+	/// inference, and title-generation boundaries.
+	pub callback_boundary: Option<Arc<dyn ProductionCallbackBoundary>>,
+}
+
+/// Failure while composing and launching a complete production session.
+#[derive(Debug, Error)]
+pub enum ProductionSessionError {
+	/// Workspace prompt facts could not be projected into agent state.
+	#[error(transparent)]
+	Prompt(#[from] PromptError),
+	/// A registered production callback has no subsystem installer.
+	#[error("production callbacks require a callback boundary")]
+	MissingCallbackBoundary,
+	/// The application callback boundary rejected installation.
+	#[error("production callback installation failed")]
+	CallbackInstallation {
+		/// Typed application installation failure.
+		#[source]
+		source: Box<dyn error::Error + Send + Sync>,
+	},
+	/// The live handle could not be launched.
+	#[error(transparent)]
+	Launch(#[from] SessionHandleError),
+}
+
+/// Failure from the high-level build-and-launch entrypoint.
+#[derive(Debug, Error)]
+pub enum SessionCreateError {
+	/// Credential-blind session planning failed.
+	#[error(transparent)]
+	Build(#[from] SessionBuildError),
+	/// Production authority composition failed.
+	#[error(transparent)]
+	Production(#[from] ProductionSessionError),
+}
+
+#[derive(Clone)]
+struct CompiledPromptSource(Arc<[omp_agent::Item]>);
+
+impl PromptSource for CompiledPromptSource {
+	fn render(&self, _workspace: &omp_agent::Props) -> Result<Vec<omp_agent::Item>, PromptError> {
+		Ok(self.0.to_vec())
+	}
 }
 
 /// Fully resolved, credential-blind session construction result.
@@ -119,31 +197,73 @@ impl SessionBlueprint {
 		self.secret_obfuscator.as_ref()
 	}
 
-	/// Resolves a deferred usage-reserve decision through the host authority.
-	/// Absence fails open by retaining the selected candidate.
-	pub async fn confirm_usage(
-		&self,
-		request: UsageConfirmationRequest,
-	) -> UsageConfirmationDecision {
-		if let Some(callback) = &self.callbacks.usage_confirmation {
-			callback(request).await
-		} else {
-			UsageConfirmationDecision::Continue
+	/// Composes the production agent loop and returns a launchable session
+	/// handle without exposing internal construction APIs.
+	pub fn launch_production(
+		self,
+		identity: SessionIdentity,
+		mut composition: ProductionSessionComposition,
+		revival: Option<SessionRevivalFactory>,
+	) -> Result<SessionHandle, ProductionSessionError> {
+		let runtime_callbacks = RuntimeCallbacks::new(identity.id.clone(), self.callbacks.clone());
+		install_production_callbacks(
+			&self.callbacks,
+			&runtime_callbacks,
+			composition.callback_boundary.as_ref(),
+		)?;
+		composition.snapshot.registry = Arc::clone(&self.registry);
+		composition.snapshot.props = self.workspace.props()?;
+		composition.snapshot.prompt_source =
+			Arc::new(CompiledPromptSource(Arc::clone(&self.prompt.items)));
+		if let Some(candidate) = self.model_plan.candidates().first() {
+			composition.snapshot.turn.params.model = candidate.selector.to_string();
 		}
+		if let Some(active_tools) = &self.options.policies.active_tools {
+			composition.snapshot.enabled_tools = Arc::from(active_tools.to_vec());
+		}
+		if let Some(deadline) = self.options.turn_deadline {
+			composition.snapshot.deadline = Instant::now().checked_add(deadline);
+		}
+		let mut agent = Agent::new(
+			composition.inference,
+			composition.environment,
+			omp_agent::AgentState::new(composition.snapshot),
+			composition.journal,
+			composition.caps,
+		);
+		self.configure_agent(&mut agent);
+		let runtime = SessionRuntime::from_agent(agent);
+		Ok(self.launch_with_callbacks(identity, runtime, revival, runtime_callbacks)?)
 	}
 
 	/// Consumes the blueprint into a durable handle over a fully composed live
 	/// runtime and an optional journal-backed cold-revival factory.
+	///
+	/// Callback classes crossing subsystem ownership require the same explicit
+	/// production boundary as [`Self::launch_production`].
 	pub fn launch(
 		self,
 		identity: SessionIdentity,
 		runtime: SessionRuntime,
 		revival: Option<SessionRevivalFactory>,
+		callback_boundary: Option<Arc<dyn ProductionCallbackBoundary>>,
+	) -> Result<SessionHandle, ProductionSessionError> {
+		let callbacks = RuntimeCallbacks::new(identity.id.clone(), self.callbacks.clone());
+		install_production_callbacks(&self.callbacks, &callbacks, callback_boundary.as_ref())?;
+		Ok(self.launch_with_callbacks(identity, runtime, revival, callbacks)?)
+	}
+
+	fn launch_with_callbacks(
+		self,
+		identity: SessionIdentity,
+		runtime: SessionRuntime,
+		revival: Option<SessionRevivalFactory>,
+		callbacks: RuntimeCallbacks,
 	) -> Result<SessionHandle, SessionHandleError> {
 		SessionHandle::launch(
 			identity,
 			self.diagnostics,
-			self.callbacks,
+			callbacks,
 			Some(runtime),
 			revival,
 			self.constructed_at,
@@ -158,10 +278,11 @@ impl SessionBlueprint {
 		identity: SessionIdentity,
 		revival: SessionRevivalFactory,
 	) -> Result<SessionHandle, SessionHandleError> {
+		let callbacks = RuntimeCallbacks::new(identity.id.clone(), self.callbacks.clone());
 		SessionHandle::launch(
 			identity,
 			self.diagnostics,
-			self.callbacks,
+			callbacks,
 			None,
 			Some(revival),
 			self.constructed_at,
@@ -368,6 +489,21 @@ impl SessionBuilder {
 		&mut self.callbacks
 	}
 
+	/// Builds and launches a complete production session through the stable SDK
+	/// facade.
+	pub fn create_session(
+		self,
+		catalog: &Catalog,
+		workspace: &PromptFacts,
+		identity: SessionIdentity,
+		composition: ProductionSessionComposition,
+		revival: Option<SessionRevivalFactory>,
+	) -> Result<SessionHandle, SessionCreateError> {
+		Ok(self
+			.build(catalog, workspace)?
+			.launch_production(identity, composition, revival)?)
+	}
+
 	/// Resolves roots, models, prompt bytes, and fork-cache inheritance without
 	/// touching credential material or starting processes.
 	pub fn build(
@@ -543,6 +679,20 @@ fn preconnect_model_host(catalog: &Catalog, plan: &ModelPlan) -> PreconnectLaunc
 	HttpTransport::preconnect_host(&url)
 }
 
+fn install_production_callbacks(
+	callbacks: &CallbackSet,
+	runtime_callbacks: &RuntimeCallbacks,
+	boundary: Option<&Arc<dyn ProductionCallbackBoundary>>,
+) -> Result<(), ProductionSessionError> {
+	if !callbacks.requires_production_install() {
+		return Ok(());
+	}
+	let boundary = boundary.ok_or(ProductionSessionError::MissingCallbackBoundary)?;
+	boundary
+		.install(runtime_callbacks.clone())
+		.map_err(|source| ProductionSessionError::CallbackInstallation { source })
+}
+
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -654,4 +804,54 @@ fn session_shape(
 	}
 	hasher.update(&[options.strict_output_schema as u8, options.defer_usage_confirmation as u8]);
 	hasher.finalize()
+}
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use omp_agent::{PromptPatchSet, Props};
+
+	use super::*;
+
+	struct TitleBoundary {
+		installs: Arc<AtomicUsize>,
+	}
+
+	impl ProductionCallbackBoundary for TitleBoundary {
+		fn install(
+			&self,
+			callbacks: RuntimeCallbacks,
+		) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+			self.installs.fetch_add(1, Ordering::Relaxed);
+			callbacks
+				.title_prompt(&Props::default())
+				.expect("title callback installed")
+				.expect("title callback succeeds");
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn production_callbacks_cannot_launch_without_their_boundary() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut callbacks = CallbackSet::default();
+		let callback_calls = Arc::clone(&calls);
+		callbacks.title_prompt = Some(Arc::new(move |_| {
+			callback_calls.fetch_add(1, Ordering::Relaxed);
+			PromptPatchSet::new(Vec::new(), PromptPatchSet::DEFAULT_MAX_BYTE_EXPANSION)
+		}));
+		let runtime = RuntimeCallbacks::new("session".into(), callbacks.clone());
+		assert!(matches!(
+			install_production_callbacks(&callbacks, &runtime, None),
+			Err(ProductionSessionError::MissingCallbackBoundary)
+		));
+
+		let installs = Arc::new(AtomicUsize::new(0));
+		let boundary: Arc<dyn ProductionCallbackBoundary> =
+			Arc::new(TitleBoundary { installs: Arc::clone(&installs) });
+		install_production_callbacks(&callbacks, &runtime, Some(&boundary))
+			.expect("callback boundary installs");
+		assert_eq!(installs.load(Ordering::Relaxed), 1);
+		assert_eq!(calls.load(Ordering::Relaxed), 2);
+	}
 }

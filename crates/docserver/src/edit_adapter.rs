@@ -7,8 +7,8 @@ use bytes::Bytes;
 use omp_core::{IntoStr, Str, sf};
 use omp_hashline::{
 	ApplyMode, ApplyOptions, Clipboard, Patch, RecoveryEdit, ReplaceOptions, RevisionToken,
-	SnapshotStore, apply_parsed_patch, apply_replace, loop_guard::NoopLoopGuard, recover_exact,
-	recovery::ByteRange as RecoveryByteRange,
+	SnapshotStore, apply_parsed_patch, apply_replace, is_head_tail_only, loop_guard::NoopLoopGuard,
+	recover_exact, recovery::ByteRange as RecoveryByteRange,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
@@ -288,13 +288,19 @@ impl TextEditAdapter for HashlineAdapter {
 			});
 		}
 
+		let head_tail_live =
+			retained.bytes() != base_snapshot.content() && is_head_tail_only(&parsed);
+		let application_base = if head_tail_live {
+			base_snapshot.content().clone()
+		} else {
+			retained.bytes().clone()
+		};
 		let mut clipboard = state.clipboard.start_batch();
-		let applied =
-			apply_parsed_patch(retained.bytes().clone(), &parsed, &mut clipboard, ApplyOptions {
-				mode: ApplyMode::Strict,
-				path: Some(&path),
-			})
-			.map_err(|source| Error::HashlineApply { source })?;
+		let applied = apply_parsed_patch(application_base, &parsed, &mut clipboard, ApplyOptions {
+			mode: ApplyMode::Strict,
+			path: Some(&path),
+		})
+		.map_err(|source| Error::HashlineApply { source })?;
 		let authored = applied
 			.edits
 			.iter()
@@ -310,16 +316,32 @@ impl TextEditAdapter for HashlineAdapter {
 				Ok(RecoveryEdit::new(range, edit.replacement.clone()))
 			})
 			.collect::<Result<Vec<_>>>()?;
-		let recovered = recover_exact(retained.bytes(), base_snapshot.content(), &authored)
-			.map_err(|source| Error::HashlineRecovery { source })?;
-		let edits = recovered
-			.canonical_edits()
-			.iter()
-			.map(|edit| {
-				let range = ByteRange::new(edit.range().start(), edit.range().end())?;
-				Ok(ByteEdit::new(range, edit.replacement().clone()))
-			})
-			.collect::<Result<Vec<_>>>()?;
+		let edits = if head_tail_live {
+			applied
+				.edits
+				.iter()
+				.map(|edit| {
+					let start = u64::try_from(edit.start).map_err(|_| Error::InvalidContent {
+						reason: sf!("hashline edit start exceeds byte coordinates"),
+					})?;
+					let end = u64::try_from(edit.end).map_err(|_| Error::InvalidContent {
+						reason: sf!("hashline edit end exceeds byte coordinates"),
+					})?;
+					Ok(ByteEdit::new(ByteRange::new(start, end)?, edit.replacement.clone()))
+				})
+				.collect::<Result<Vec<_>>>()?
+		} else {
+			let recovered = recover_exact(retained.bytes(), base_snapshot.content(), &authored)
+				.map_err(|source| Error::HashlineRecovery { source })?;
+			recovered
+				.live_edits()
+				.iter()
+				.map(|edit| {
+					let range = ByteRange::new(edit.range().start(), edit.range().end())?;
+					Ok(ByteEdit::new(range, edit.replacement().clone()))
+				})
+				.collect::<Result<Vec<_>>>()?
+		};
 
 		state.clipboard.commit_named_from(&clipboard);
 		if edits.is_empty() {
@@ -535,6 +557,55 @@ mod tests {
 		assert_eq!(edits.len(), 1);
 		assert_eq!(edits[0].range(), ByteRange::new(6, 10).expect("range"));
 		assert_eq!(edits[0].replacement().as_ref(), b"BETA");
+	}
+	#[test]
+	fn hashline_rejects_stale_duplicate_when_authored_line_changed() {
+		let registry = EditAdapterRegistry::with_built_ins();
+		let old = snapshot(1, b"top\nduplicate\nmiddle\nduplicate\nbottom\n");
+		registry
+			.record_snapshot(Path::new("file.txt"), old.clone(), &ReadSelection::Whole)
+			.expect("record");
+		let tag = omp_hashline::compute_snapshot_tag(old.content());
+		let patch = Bytes::from(format!("[file.txt#{tag}]\nCUT 4\n"));
+		let error = registry
+			.lower(
+				HASHLINE_EDIT_FORMAT,
+				Path::new("file.txt"),
+				snapshot(2, b"top\nduplicate\nmiddle\nchanged\nbottom\n"),
+				patch,
+				Bytes::new(),
+			)
+			.expect_err("changed authored duplicate must fail closed");
+		assert!(matches!(error, Error::HashlineRecovery {
+			source: omp_hashline::RecoveryError::ChangedLine { line: 4 },
+		}));
+	}
+
+	#[test]
+	fn stale_head_tail_only_patch_applies_to_live_boundaries() {
+		let registry = EditAdapterRegistry::with_built_ins();
+		let old = snapshot(1, b"old first\nold last\n");
+		registry
+			.record_snapshot(Path::new("file.txt"), old.clone(), &ReadSelection::Whole)
+			.expect("record");
+		let tag = omp_hashline::compute_snapshot_tag(old.content());
+		let patch = Bytes::from(format!("[file.txt#{tag}]\nPUT <1:\n+HEAD\nPUT >$:\n+TAIL\n"));
+		let current = b"changed first\nchanged last\n";
+		let edits = registry
+			.lower(
+				HASHLINE_EDIT_FORMAT,
+				Path::new("file.txt"),
+				snapshot(2, current),
+				patch,
+				Bytes::new(),
+			)
+			.expect("content-independent boundaries apply to live bytes");
+		assert_eq!(edits.len(), 2);
+		assert_eq!(edits[0].range(), ByteRange::new(0, 0).expect("head range"));
+		assert_eq!(edits[0].replacement().as_ref(), b"HEAD\n");
+		let end = u64::try_from(current.len()).expect("fixture length");
+		assert_eq!(edits[1].range(), ByteRange::new(end, end).expect("tail range"));
+		assert_eq!(edits[1].replacement().as_ref(), b"TAIL\n");
 	}
 
 	#[test]

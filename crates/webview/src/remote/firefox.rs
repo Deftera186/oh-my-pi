@@ -276,6 +276,7 @@ async fn setup(
 			json!({
 				"functionDeclaration": "(chan)=>{window.ipc={postMessage:m=>chan(String(m))}}",
 				"arguments": [{ "type": "channel", "value": { "channel": IPC_CHANNEL } }],
+				"contexts": [&*driver.top],
 			}),
 		)
 		.await?;
@@ -286,7 +287,10 @@ async fn setup(
 			.call(
 				&mut link,
 				"script.addPreloadScript",
-				json!({ "functionDeclaration": sf!("()=>{{{script}}}") }),
+				json!({
+					"functionDeclaration": sf!("()=>{{{script}}}"),
+					"contexts": [&*driver.top],
+				}),
 			)
 			.await?;
 	}
@@ -303,6 +307,7 @@ async fn setup(
 				json!({
 					"functionDeclaration": DIRTY_SCRIPT,
 					"arguments": [{ "type": "channel", "value": { "channel": DIRTY_CHANNEL } }],
+					"contexts": [&*driver.top],
 				}),
 			)
 			.await?;
@@ -468,8 +473,9 @@ impl Driver {
 			},
 			"browsingContext.contextDestroyed" if ours => self.closed = true,
 			"script.message" => {
-				// Keyed by channel, not context: subframe realms of our page
-				// share the preload shim and may post too.
+				if !script_message_is_from_top(params, self.top.as_str()) {
+					return;
+				}
 				match params["channel"].as_str() {
 					Some(IPC_CHANNEL) => {
 						if let Some(payload) = params["data"]["value"].as_str() {
@@ -783,7 +789,13 @@ fn pointer_move(x: f64, y: f64) -> Value {
 	json!({ "type": "pointerMove", "x": x, "y": y, "duration": 0 })
 }
 
+/// Checks the source browsing context carried by a BiDi script message.
+fn script_message_is_from_top(params: &Value, top: &str) -> bool {
+	params.pointer("/source/context").and_then(Value::as_str) == Some(top)
+}
+
 /// Wrap pointer actions in the persistent mouse input source.
+
 fn pointer_source(actions: Vec<Value>) -> Value {
 	json!({
 		"type": "pointer",
@@ -849,5 +861,16 @@ fn key_value(key: Key) -> char {
 		Key::PageDown => '\u{e00f}',
 		// F1..=F12 occupy \u{e031}..=\u{e03c}; out-of-range input clamps.
 		Key::F(n) => char::from_u32(0xe030 + u32::from(n.clamp(1, 12))).unwrap_or('\u{e031}'),
+	}
+}
+#[cfg(test)]
+mod ipc_tests {
+	use super::*;
+
+	#[test]
+	fn script_message_requires_top_level_source_context() {
+		assert!(script_message_is_from_top(&json!({ "source": { "context": "top" } }), "top",));
+		assert!(!script_message_is_from_top(&json!({ "source": { "context": "iframe" } }), "top",));
+		assert!(!script_message_is_from_top(&json!({}), "top"));
 	}
 }

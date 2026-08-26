@@ -8,30 +8,13 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_ext::config::{CliCollision, CliContribution, CliContributionSet, CliValueKind};
+use omp_ext::config::{
+	CliCollision, CliContribution, CliContributionSet, CliValueKind, ContributedCliValue,
+	ContributedValue,
+};
 use serde::Deserialize;
 use thiserror::Error;
 use toml::de;
-
-/// One typed value delivered to an extension activation sink.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ContributedValue {
-	/// Presence-only value.
-	Boolean(bool),
-	/// String value.
-	String(Str),
-}
-
-/// A declaration-linked contributed value.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContributedCliValue {
-	/// Qualified extension owner.
-	pub owner: Str,
-	/// Declared sink key.
-	pub sink:  Str,
-	/// Parsed typed value.
-	pub value: ContributedValue,
-}
 
 /// Final bootstrap output passed to clap exactly once.
 #[derive(Clone, Debug, Default)]
@@ -101,21 +84,39 @@ fn explicit_manifest_paths(arguments: &[OsString]) -> Vec<PathBuf> {
 	let mut index = 1;
 	while index < arguments.len() {
 		let text = arguments[index].to_string_lossy();
-		let inline = text
-			.strip_prefix("--ext-only=")
-			.or_else(|| text.strip_prefix("--trusted-extension="));
+		let inline = [
+			"--extension=",
+			"--ext=",
+			"--hook=",
+			"--plugin-dir=",
+			"--ext-only=",
+			"--trusted-extension=",
+		]
+		.into_iter()
+		.find_map(|prefix| text.strip_prefix(prefix));
 		let value = if let Some(value) = inline {
-			Some(PathBuf::from(value))
-		} else if matches!(text.as_ref(), "--ext-only" | "--trusted-extension") {
+			Some(PathBuf::from(value.strip_prefix("path:").unwrap_or(value)))
+		} else if matches!(
+			text.as_ref(),
+			"--extension"
+				| "--ext"
+				| "--hook"
+				| "-e" | "--plugin-dir"
+				| "--ext-only"
+				| "--trusted-extension"
+		) {
 			index += 1;
-			arguments.get(index).map(PathBuf::from)
+			arguments.get(index).map(|value| {
+				let value = value.to_string_lossy();
+				PathBuf::from(value.strip_prefix("path:").unwrap_or(value.as_ref()))
+			})
 		} else {
 			None
 		};
-		if let Some(value) = value {
-			if let Some(path) = manifest_path(&value) {
-				paths.push(path);
-			}
+		if let Some(value) = value
+			&& let Some(path) = manifest_path(&value)
+		{
+			paths.push(path);
 		}
 		index += 1;
 	}
@@ -231,6 +232,61 @@ mod tests {
 		.expect("parse");
 		assert_eq!(parsed.values.len(), 3);
 		assert_eq!(parsed.arguments, ["omp"].map(OsString::from));
+	}
+
+	#[test]
+	fn every_local_invocation_spelling_participates_in_manifest_bootstrap() {
+		let directory = tempfile::tempdir().expect("extension root");
+		let manifest = directory.path().join("omp-extension.toml");
+		fs::write(&manifest, "").expect("manifest");
+		for flag in ["--extension", "--ext", "--hook", "-e", "--plugin-dir", "--ext-only"] {
+			let arguments =
+				[OsString::from("omp"), OsString::from(flag), directory.path().as_os_str().to_owned()];
+			assert_eq!(explicit_manifest_paths(&arguments), vec![manifest.clone()], "{flag}");
+		}
+		let inline = OsString::from(format!("--extension=path:{}", directory.path().display()));
+		assert_eq!(explicit_manifest_paths(&[OsString::from("omp"), inline]), vec![manifest]);
+	}
+
+	#[test]
+	fn explicit_extension_values_reach_the_typed_launch_output() {
+		let directory = tempfile::tempdir().expect("extension root");
+		fs::write(
+			directory.path().join("omp-extension.toml"),
+			r#"
+[[cli]]
+publisher = "publisher"
+extension = "review"
+name = "spawn-peer"
+description = "Select peer"
+kind = "string"
+[cli.sink]
+key = "peer"
+"#,
+		)
+		.expect("manifest");
+		let parsed = run(
+			[
+				OsString::from("omp"),
+				OsString::from("--extension"),
+				directory.path().as_os_str().to_owned(),
+				OsString::from("--spawn-peer"),
+				OsString::from("reviewer"),
+				OsString::from("prompt"),
+			]
+			.to_vec(),
+			Vec::<Str>::new(),
+		)
+		.expect("bootstrap");
+		assert_eq!(parsed.values.len(), 1);
+		assert_eq!(parsed.values[0].sink, "peer");
+		assert_eq!(parsed.values[0].value, ContributedValue::String(sf!("reviewer")));
+		assert_eq!(parsed.arguments, [
+			OsString::from("omp"),
+			OsString::from("--extension"),
+			directory.path().as_os_str().to_owned(),
+			OsString::from("prompt"),
+		]);
 	}
 
 	fn contribution(name: &str, kind: CliValueKind) -> CliContribution {

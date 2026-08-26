@@ -3,11 +3,13 @@
 //! Production application CLI, TUI, and command dispatch.
 
 pub mod acp_mode;
+pub mod agents_cmd;
 pub mod audio_coordinator;
 pub mod auth_broker_cmd;
 pub mod auth_cli;
 pub mod auth_gateway_cmd;
 pub mod bench_cmd;
+pub mod browser_relay_cmd;
 pub mod chat_cmd;
 /// Native chat surface, public so command-template prompt goldens can freeze
 /// its output.
@@ -15,6 +17,7 @@ pub mod chat_cmd;
 pub mod chat_ui;
 pub mod cleanse_cmd;
 pub mod cli;
+pub mod commit_cmd;
 pub mod complete_cmd;
 pub mod completions;
 pub mod compress_cmd;
@@ -45,19 +48,23 @@ pub(crate) mod pickers;
 pub mod print_mode;
 pub mod profile_alias;
 pub mod progress_reporter;
+pub mod ps_cmd;
 pub mod render_cmd;
 pub mod rpc_mode;
 pub mod say_cmd;
 pub mod session_manager;
 pub mod setup_cmd;
 pub mod share_cmd;
+pub mod shell_cmd;
 pub mod smoke_test;
 pub mod spec;
 pub mod ssh_cmd;
+pub mod standalone_tool_cmd;
 pub mod startup_notice;
 pub mod stats_cmd;
 pub mod theme_watcher;
 pub mod tiny_models_cmd;
+pub mod token_cmd;
 pub mod tool_installer;
 pub mod ttsr_cmd;
 pub mod update_cmd;

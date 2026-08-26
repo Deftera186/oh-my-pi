@@ -18,7 +18,7 @@ use flume::{Receiver, Sender};
 use omp_chat_ui::{
 	BackendEvent, Chat, ChatKey, CommandPalette, CompactionBoundaries, GitFacts, Intent,
 	ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, SessionRow,
-	Sidebar, StatusFacts, Welcome, WelcomeEvent,
+	Sidebar, StatusFacts, ToolTerminal, ToolViewContent, Welcome, WelcomeEvent,
 };
 use omp_core::{Str, sf};
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
@@ -325,7 +325,15 @@ impl Scene for ChatScene {
 		let effect = match state.chat.handle_key(key) {
 			ChatKey::Consumed => Effect::Consumed,
 			ChatKey::Ignored => Effect::Ignored,
-			ChatKey::Quit => Effect::Quit,
+			ChatKey::Clear => {
+				state.chat.clear_composer();
+				Effect::Consumed
+			},
+			ChatKey::Exit => Effect::Quit,
+			ChatKey::ToggleLive => {
+				let _ = self.intents.send(Intent::ToggleLive);
+				Effect::Consumed
+			},
 		};
 		if let Some((text, attachments, mode)) = state.chat.take_submission() {
 			let _ = self
@@ -444,9 +452,9 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 						chunk: sf!("checking damage ranges\n"),
 					});
 					let _ = events.send(BackendEvent::ToolFinished {
-						id:   tool,
-						ok:   true,
-						view: sf!("Host seam verified"),
+						id:       tool,
+						terminal: ToolTerminal::Succeeded,
+						view:     ToolViewContent::Plain(sf!("Host seam verified")),
 					});
 				}
 				if generation.load(Ordering::SeqCst) == turn {
@@ -496,6 +504,7 @@ fn mock_models() -> Vec<ModelRow> {
 	.map(|(key, name, provider_id, provider)| ModelRow {
 		key:         Str::from(key),
 		name:        Str::from(name),
+		color:       None,
 		provider_id: Str::from(provider_id),
 		provider:    Str::from(provider),
 		context:     Some(200_000),

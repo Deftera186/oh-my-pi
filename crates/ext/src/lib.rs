@@ -9,6 +9,7 @@ pub mod config;
 pub mod doctor;
 pub mod index;
 pub mod lock;
+pub mod marketplace;
 pub mod resolver;
 pub mod trust;
 pub mod upgrade;

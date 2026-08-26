@@ -29,8 +29,8 @@ use tokio::{
 
 use crate::{
 	framing::{
-		ContentLengthDecoder, FramingError, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES, RpcFrameDecoder,
-		encode_content_length, encode_json_v2,
+		FramingError, JsonLineDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES, RpcFrameDecoder,
+		encode_json_v1, encode_json_v2,
 	},
 	protocol::{
 		Environment, EventCategory, ExtensionUiRequest, ExtensionUiResponse, HostToolCall,
@@ -436,7 +436,7 @@ impl ClientState {
 			let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
 			encode_json_v2(value, &format!("sdk_{sequence}"))?
 		} else {
-			vec![encode_content_length(&serde_json::to_vec(value)?)?]
+			vec![encode_json_v1(value, &HashSet::new())]
 		};
 		let sender = self
 			.writer
@@ -781,7 +781,7 @@ impl RpcClient {
 		let reader_task = tokio::spawn(async move {
 			let mut stdout = stdout;
 			let mut bytes = [0_u8; 16 * 1024];
-			let mut physical = ContentLengthDecoder::new();
+			let mut physical = JsonLineDecoder::new();
 			let mut logical = RpcFrameDecoder::new();
 			loop {
 				let count = match stdout.read(&mut bytes).await {
@@ -1594,7 +1594,7 @@ mod tests {
 			encode_json_v2(&serde_json::to_value(response).unwrap(), "response_7").unwrap();
 		assert!(physical_frames.len() > 1);
 
-		let mut content_length = ContentLengthDecoder::new();
+		let mut content_length = JsonLineDecoder::new();
 		let mut logical = RpcFrameDecoder::new();
 		for framed in physical_frames {
 			for bytes in framed.chunks(7919) {

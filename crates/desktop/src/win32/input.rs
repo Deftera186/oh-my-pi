@@ -87,6 +87,7 @@ fn global_pointer(input: &mut Enigo, event: PointerEvent) -> CoreResult<()> {
 					.move_mouse(x.round() as i32, y.round() as i32, Coordinate::Abs)
 					.map_err(enigo_error)?;
 				for _ in 0..count {
+					crate::operation_checkpoint()?;
 					input
 						.button(button_to_enigo(button), Direction::Click)
 						.map_err(enigo_error)?;
@@ -310,6 +311,7 @@ mod background {
 					let (down, up, double, button_flag) = mouse_messages(button);
 					let flags = mouse_flags(modifiers);
 					for index in 0..count {
+						crate::operation_checkpoint()?;
 						post(hwnd, if index == 1 { double } else { down }, flags | button_flag, point)?;
 						post(hwnd, up, flags, point)?;
 					}
@@ -327,6 +329,7 @@ mod background {
 					post(hwnd, WM_MOUSEMOVE, flags, client_point(hwnd, x, y)?)?;
 					post(hwnd, down, flags | button_flag, client_point(hwnd, x, y)?)?;
 					for &(x, y) in path.iter().skip(1) {
+						crate::operation_checkpoint()?;
 						post(hwnd, WM_MOUSEMOVE, flags | button_flag, client_point(hwnd, x, y)?)?;
 					}
 					let &(x, y) = path
@@ -687,6 +690,7 @@ mod foreground {
 				with_modifiers(modifiers, || {
 					let (down, up) = button_flags(button);
 					for _ in 0..count {
+						crate::operation_checkpoint()?;
 						send(mouse_event(down, 0))?;
 						send(mouse_event(up, 0))?;
 					}

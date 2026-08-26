@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use omp_core::{FastHashMap, Str};
 use omp_proto::omp::inference::v1;
+
 use crate::semconv::ToolStatus;
 
 /// The full-fidelity wire shape is the single in-process provider-usage truth.
@@ -136,15 +137,19 @@ pub struct Usage {
 /// allocating or discarding the source record.
 impl From<&InferenceUsage> for Usage {
 	fn from(value: &InferenceUsage) -> Self {
+		let input = value
+			.input_tokens
+			.saturating_add(value.cache_read_tokens)
+			.saturating_add(value.cache_write_tokens);
 		Self {
-			input:            value.input_tokens,
-			output:           value.output_tokens,
-			cached_input:     value.cache_read_tokens,
-			cache_write:      value.cache_write_tokens,
+			input,
+			output: value.output_tokens,
+			cached_input: value.cache_read_tokens,
+			cache_write: value.cache_write_tokens,
 			reasoning_output: value.reasoning_tokens.unwrap_or_default(),
-			total:            value
+			total: value
 				.total_tokens
-				.unwrap_or_else(|| value.input_tokens.saturating_add(value.output_tokens)),
+				.unwrap_or_else(|| input.saturating_add(value.output_tokens)),
 		}
 	}
 }
@@ -701,6 +706,35 @@ mod tests {
 		let rates = CostRates { input: 10.0, cache_write: 12.5, ..CostRates::default() };
 		let usage = CostUsage { cache_write: 2_000_000.0, ..CostUsage::default() };
 		assert_eq!(cache_write_cost(rates, usage), 25.0);
+	}
+	#[test]
+	fn inference_usage_projection_includes_cached_input_in_input_and_fallback_total() {
+		let source = InferenceUsage {
+			input_tokens: 10,
+			output_tokens: 7,
+			cache_read_tokens: 20,
+			cache_write_tokens: 30,
+			total_tokens: None,
+			..InferenceUsage::default()
+		};
+		assert_eq!(Usage::from(&source), Usage {
+			input: 60,
+			output: 7,
+			cached_input: 20,
+			cache_write: 30,
+			total: 67,
+			..Usage::default()
+		});
+
+		let saturated = InferenceUsage {
+			input_tokens: u64::MAX,
+			output_tokens: 1,
+			cache_read_tokens: 1,
+			total_tokens: None,
+			..InferenceUsage::default()
+		};
+		assert_eq!(Usage::from(&saturated).input, u64::MAX);
+		assert_eq!(Usage::from(&saturated).total, u64::MAX);
 	}
 
 	#[test]

@@ -1,6 +1,12 @@
 //! Granted-root context-file discovery and immutable prompt projection.
 
-use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
+use std::{
+	cmp::Reverse,
+	collections::{BTreeMap, BTreeSet},
+	fs,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use omp_agent::{ContextFile, dedupe_context_file_indices};
 use omp_core::Str;
@@ -12,8 +18,9 @@ use super::{
 	},
 };
 
-/// Foreign repo-surface context filenames admitted by §8.2.
-pub const REPO_SURFACE_CONTEXT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", ".cursorrules"];
+/// Standalone repository context filenames accepted during ancestor discovery.
+pub const REPO_SURFACE_CONTEXT_FILES: &[&str] =
+	&["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules"];
 
 /// One Environment-granted root and the working directory whose ancestor chain
 /// is eligible within that root.
@@ -30,21 +37,28 @@ pub struct GrantedContextRoot {
 pub struct ContextDiscoveryOptions {
 	/// Manifest-declared native context names. Foreign imports remain restricted
 	/// to `REPO_SURFACE_CONTEXT_FILES` regardless of this list.
-	pub filenames: Arc<[Str]>,
+	pub filenames:          Arc<[Str]>,
 	/// Maximum ancestor edges per root.
-	pub max_depth: usize,
+	pub max_depth:          usize,
+	/// Explicit user home used for user-scope provider conventions. `None`
+	/// disables user-scope discovery for deterministic embedded callers.
+	pub home:               Option<PathBuf>,
+	/// Discovery provider ids disabled by the effective model/settings policy.
+	pub disabled_providers: Arc<[Str]>,
 }
 
 impl Default for ContextDiscoveryOptions {
 	fn default() -> Self {
 		Self {
-			filenames: REPO_SURFACE_CONTEXT_FILES
+			filenames:          REPO_SURFACE_CONTEXT_FILES
 				.iter()
 				.copied()
 				.map(Str::from)
 				.collect::<Vec<_>>()
 				.into(),
-			max_depth: 64,
+			max_depth:          64,
+			home:               None,
+			disabled_providers: Arc::from([]),
 		}
 	}
 }
@@ -97,8 +111,13 @@ pub fn discover(
 		.map(|name| name.as_str())
 		.filter(|name| REPO_SURFACE_CONTEXT_FILES.contains(name))
 		.collect::<BTreeSet<_>>();
+	let disabled = options
+		.disabled_providers
+		.iter()
+		.map(Str::as_str)
+		.collect::<BTreeSet<_>>();
 	let mut diagnostics = Vec::new();
-	let mut candidates = Vec::new();
+	let mut project_winners = BTreeMap::<(usize, u16), ContextCandidate>::new();
 	for (root_index, grant) in roots.iter().enumerate() {
 		let root = fs::canonicalize(&grant.root).unwrap_or_else(|_| grant.root.clone());
 		let start = fs::canonicalize(&grant.start).unwrap_or_else(|_| grant.start.clone());
@@ -108,20 +127,64 @@ pub fn discover(
 		}
 		let mut current = start.as_path();
 		let mut reached_root = false;
+		let mut native_owner_found = false;
 		for depth in 0..=options.max_depth {
+			let depth = u16::try_from(depth).unwrap_or(u16::MAX);
+			if !native_owner_found && !disabled.contains("native") {
+				let native = current.join(".omp");
+				if directory_has_entries(&native) {
+					native_owner_found = true;
+					admit_candidate(
+						&mut project_winners,
+						(root_index, depth),
+						ContextCandidate::project(root_index, depth, 100, native.join("AGENTS.md")),
+						&mut diagnostics,
+					);
+				}
+			}
 			for name in &allowed {
-				let path = current.join(name);
-				if !path.is_file() {
+				let (provider, priority) = match *name {
+					"CLAUDE.md" => ("claude", 80),
+					"GEMINI.md" => ("gemini", 60),
+					".cursorrules" => ("cursor", 50),
+					_ => ("agents-md", 10),
+				};
+				if disabled.contains(provider) {
 					continue;
 				}
-				match expand_at_paths(&path) {
-					Ok(content) => candidates.push(ContextItem {
-						root_index,
-						path: fs::canonicalize(&path).unwrap_or(path),
-						depth: u16::try_from(depth).unwrap_or(u16::MAX),
-						content: Str::from(content),
-					}),
-					Err(_) => diagnostics.push(ContextDiagnostic::Unreadable(path)),
+				admit_candidate(
+					&mut project_winners,
+					(root_index, depth),
+					ContextCandidate::project(root_index, depth, priority, current.join(name)),
+					&mut diagnostics,
+				);
+			}
+			for (relative, priority) in [(".agent/AGENTS.md", 70), (".agents/AGENTS.md", 70)] {
+				if disabled.contains("agents") {
+					continue;
+				}
+				admit_candidate(
+					&mut project_winners,
+					(root_index, depth),
+					ContextCandidate::project(root_index, depth, priority, current.join(relative)),
+					&mut diagnostics,
+				);
+			}
+			if depth == 0 {
+				for (provider, relative, priority) in [
+					("claude", ".claude/CLAUDE.md", 80),
+					("gemini", ".gemini/GEMINI.md", 60),
+					("github", ".github/copilot-instructions.md", 30),
+				] {
+					if disabled.contains(provider) {
+						continue;
+					}
+					admit_candidate(
+						&mut project_winners,
+						(root_index, depth),
+						ContextCandidate::project(root_index, depth, priority, current.join(relative)),
+						&mut diagnostics,
+					);
 				}
 			}
 			if current == root {
@@ -141,18 +204,147 @@ pub fn discover(
 		}
 	}
 
-	let comparable = candidates
+	let mut candidates = project_winners.into_values().collect::<Vec<_>>();
+	candidates.sort_by_key(|candidate| {
+		(candidate.item.root_index, Reverse(candidate.item.depth), Reverse(candidate.priority))
+	});
+	if let Some(home) = options.home.as_deref() {
+		let mut user_winner = None;
+		let native = super::native::user_config_root(home).join("AGENTS.md");
+		for (provider, path, priority) in [
+			("native", native, 100),
+			("claude", home.join(".claude/CLAUDE.md"), 80),
+			("codex", home.join(".codex/AGENTS.md"), 70),
+			("agents", home.join(".agent/AGENTS.md"), 70),
+			("agents", home.join(".agents/AGENTS.md"), 70),
+			("gemini", home.join(".gemini/GEMINI.md"), 60),
+			("opencode", home.join(".config/opencode/AGENTS.md"), 55),
+			("github", home.join(".copilot/copilot-instructions.md"), 30),
+		] {
+			if disabled.contains(provider) {
+				continue;
+			}
+			admit_user_candidate(&mut user_winner, path, priority, &mut diagnostics);
+		}
+		if !disabled.contains("github")
+			&& let Some(copilot_home) =
+				std::env::var_os("COPILOT_HOME").filter(|value| !value.is_empty())
+		{
+			admit_user_candidate(
+				&mut user_winner,
+				PathBuf::from(copilot_home).join("copilot-instructions.md"),
+				30,
+				&mut diagnostics,
+			);
+		}
+		if let Some(candidate) = user_winner {
+			candidates.push(candidate);
+		}
+	}
+	let mut items = candidates
+		.into_iter()
+		.map(|candidate| candidate.item)
+		.collect::<Vec<_>>();
+	let mut exact = BTreeSet::new();
+	let mut keep = vec![false; items.len()];
+	for (index, item) in items.iter().enumerate().rev() {
+		if exact.insert(item.content.clone()) {
+			keep[index] = true;
+		}
+	}
+	items = items
+		.into_iter()
+		.enumerate()
+		.filter_map(|(index, item)| keep[index].then_some(item))
+		.collect();
+	let comparable = items
 		.iter()
 		.map(|item| {
 			ContextFile::new(item.path.clone(), item.content.as_bytes().to_vec())
 				.with_depth(item.depth)
 		})
 		.collect::<Vec<_>>();
-	candidates = dedupe_context_file_indices(&comparable)
+	items = dedupe_context_file_indices(&comparable)
 		.into_iter()
-		.map(|index| candidates[index].clone())
+		.map(|index| items[index].clone())
 		.collect();
-	ContextSnapshot { items: candidates.into(), diagnostics: diagnostics.into() }
+	ContextSnapshot { items: items.into(), diagnostics: diagnostics.into() }
+}
+
+#[derive(Clone, Debug)]
+struct ContextCandidate {
+	item:     ContextItem,
+	priority: u8,
+}
+
+impl ContextCandidate {
+	fn project(root_index: usize, depth: u16, priority: u8, path: PathBuf) -> Self {
+		Self { item: ContextItem { root_index, path, depth, content: Str::new_static("") }, priority }
+	}
+}
+
+fn directory_has_entries(path: &Path) -> bool {
+	fs::read_dir(path)
+		.ok()
+		.and_then(|mut entries| entries.next())
+		.is_some()
+}
+
+fn read_candidate(
+	mut candidate: ContextCandidate,
+	diagnostics: &mut Vec<ContextDiagnostic>,
+) -> Option<ContextCandidate> {
+	if !candidate.item.path.is_file() {
+		return None;
+	}
+	match expand_at_paths(&candidate.item.path) {
+		Ok(content) if !content.trim().is_empty() => {
+			candidate.item.path =
+				fs::canonicalize(&candidate.item.path).unwrap_or(candidate.item.path);
+			candidate.item.content = Str::from(content);
+			Some(candidate)
+		},
+		Ok(_) => None,
+		Err(_) => {
+			diagnostics.push(ContextDiagnostic::Unreadable(candidate.item.path));
+			None
+		},
+	}
+}
+
+fn admit_candidate(
+	winners: &mut BTreeMap<(usize, u16), ContextCandidate>,
+	key: (usize, u16),
+	candidate: ContextCandidate,
+	diagnostics: &mut Vec<ContextDiagnostic>,
+) {
+	let Some(candidate) = read_candidate(candidate, diagnostics) else {
+		return;
+	};
+	if winners
+		.get(&key)
+		.is_none_or(|current| candidate.priority > current.priority)
+	{
+		winners.insert(key, candidate);
+	}
+}
+
+fn admit_user_candidate(
+	winner: &mut Option<ContextCandidate>,
+	path: PathBuf,
+	priority: u8,
+	diagnostics: &mut Vec<ContextDiagnostic>,
+) {
+	let candidate = ContextCandidate::project(usize::MAX, 0, priority, path);
+	let Some(candidate) = read_candidate(candidate, diagnostics) else {
+		return;
+	};
+	if winner
+		.as_ref()
+		.is_none_or(|current| candidate.priority > current.priority)
+	{
+		*winner = Some(candidate);
+	}
 }
 
 /// Projects exact context bytes into the agent prompt contract without
@@ -222,5 +414,69 @@ mod tests {
 			&ContextDiscoveryOptions::default(),
 		);
 		assert!(matches!(snapshot.diagnostics.first(), Some(ContextDiagnostic::OutsideGrant(_))));
+	}
+	#[test]
+	fn provider_priority_and_nearest_non_empty_native_owner_are_enforced() {
+		let tree = tempfile::tempdir().expect("tree");
+		let root = tree.path().join("repo");
+		let cwd = root.join("packages/api");
+		fs::create_dir_all(cwd.join(".omp")).expect("nearest native");
+		fs::create_dir_all(cwd.join(".github")).expect("github");
+		fs::create_dir_all(root.join(".omp")).expect("far native");
+		fs::write(cwd.join("AGENTS.md"), "standalone").expect("standalone");
+		fs::write(cwd.join(".github/copilot-instructions.md"), "github").expect("github");
+		fs::write(cwd.join(".omp/AGENTS.md"), "nearest-native").expect("native");
+		fs::write(root.join(".omp/AGENTS.md"), "far-native").expect("far native");
+		fs::write(root.join("AGENTS.md"), "root-standalone").expect("root standalone");
+		let snapshot =
+			discover(&[GrantedContextRoot { root, start: cwd }], &ContextDiscoveryOptions::default());
+		assert_eq!(snapshot.items.len(), 2);
+		assert_eq!(snapshot.items[0].content.as_str(), "root-standalone");
+		assert_eq!(snapshot.items[1].content.as_str(), "nearest-native");
+		assert!(snapshot.items.iter().all(|item| {
+			item.content.as_str() != "github" && item.content.as_str() != "far-native"
+		}));
+	}
+
+	#[test]
+	fn highest_priority_user_context_sorts_after_project_context() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let root = tree.path().join("repo");
+		fs::create_dir_all(home.join(".omp/agent")).expect("user native");
+		fs::create_dir_all(home.join(".claude")).expect("user claude");
+		fs::create_dir_all(&root).expect("project");
+		fs::write(home.join(".omp/agent/AGENTS.md"), "user-native").expect("user native");
+		fs::write(home.join(".claude/CLAUDE.md"), "user-claude").expect("user claude");
+		fs::write(root.join("AGENTS.md"), "project").expect("project");
+		let snapshot = discover(
+			&[GrantedContextRoot { root: root.clone(), start: root }],
+			&ContextDiscoveryOptions { home: Some(home), ..ContextDiscoveryOptions::default() },
+		);
+		assert_eq!(
+			snapshot
+				.items
+				.iter()
+				.map(|item| item.content.as_str())
+				.collect::<Vec<_>>(),
+			["project", "user-native"],
+		);
+	}
+	#[test]
+	fn disabled_provider_releases_its_shadowed_context_scope() {
+		let tree = tempfile::tempdir().expect("tree");
+		let root = tree.path().join("repo");
+		fs::create_dir_all(root.join(".github")).expect("github");
+		fs::write(root.join("AGENTS.md"), "standalone").expect("standalone");
+		fs::write(root.join(".github/copilot-instructions.md"), "github").expect("github");
+		let snapshot = discover(
+			&[GrantedContextRoot { root: root.clone(), start: root }],
+			&ContextDiscoveryOptions {
+				disabled_providers: Arc::from([Str::new_static("github")]),
+				..ContextDiscoveryOptions::default()
+			},
+		);
+		assert_eq!(snapshot.items.len(), 1);
+		assert_eq!(snapshot.items[0].content.as_str(), "standalone");
 	}
 }

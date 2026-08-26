@@ -7,14 +7,13 @@ use std::{
 	fs,
 	future::Future,
 	io,
-	io::IsTerminal as _,
 	path::Path,
 	sync,
 	sync::{Arc, LazyLock},
 	time::Duration,
 };
 
-use omp_catalog::snapshot;
+use omp_catalog::{DiscoveryNormalizer, OverlaySource, OverlayStore, UnsafeTrustScope, snapshot};
 use omp_core::{Hash32, SecretString, Str, sf};
 use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
@@ -33,8 +32,8 @@ use omp_inference::{
 		CredentialBrokerEngines, CredentialShaperRegistry, CredentialStore, FileCredentialKeySource,
 		FileKeyError, GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher,
 		OAuthLoginEngine, OAuthLoginEngineError, OsCredentialKeySource, ProviderShaper,
-		SecretLoginEngine, SecretLoginEngineError, StoreError, StoredOAuthRefreshEngine,
-		SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
+		RefreshingCredentialSource, SecretLoginEngine, SecretLoginEngineError, StoreError,
+		StoredOAuthRefreshEngine, SystemOAuthClock, SystemOAuthHttpClient, UnavailableKeySource,
 		oauth::OAuthCustomDispatchError,
 	},
 	call::AuthMethod,
@@ -42,6 +41,7 @@ use omp_inference::{
 		AntigravityFingerprint, AntigravityPolicy, CcaHeaders, DEFAULT_ANTIGRAVITY_ARCH,
 		DEFAULT_ANTIGRAVITY_CL, DEFAULT_ANTIGRAVITY_OS, DEFAULT_ANTIGRAVITY_VERSION,
 	},
+	discovery::{DiscoveryCacheKey, DiscoveryStore},
 	id::AccountId,
 	layer::{admission::AdmissionController, stack::BuiltinConfig},
 	operation::usage::{
@@ -63,22 +63,31 @@ use omp_inference::{
 		zai::ZaiUsageFetcher,
 	},
 	provider::builtin::{
-		AuthApplicationConfig, GoogleCcaConfig, LocalRouteBackend, ProductionDependencies,
-		discover_antigravity_version,
+		AuthApplicationConfig, AzureEndpointConfig, GoogleCcaConfig, LocalRouteBackend,
+		ProductionDependencies, discover_antigravity_version,
 	},
 	session::{ConversationError, ConversationSessionPlanner},
 	transport::{http::HttpTransport, websocket_transport::WebSocketTransport},
 };
 use omp_serve::inference::InferenceRpc;
-use omp_settings::manager::{SettingsManager, SettingsManagerError, SettingsPaths};
+use omp_settings::{
+	SettingsSnapshot,
+	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
+};
 use tokio::time;
 
 use crate::{
-	auth_backend, auth_backend::GithubCredentialAuthority,
+	auth_backend,
+	auth_backend::GithubCredentialAuthority,
 	codex_redemption::CodexRedemptionAuthority,
+	discovery::{
+		models::{load_or_import_legacy, lower_user_overlay},
+		runtime::{CachedDiscoveryHydration, DiscoveryRuntime},
+	},
+	settings::{CredentialKeySourceSetting, LifecycleSettings},
 };
 
-const KEYCHAIN_OPT_IN_ENV: &str = "OMP_LLM_KEYCHAIN";
+const KEY_SOURCE_ENV: &str = "OMP_LLM_KEY_SOURCE";
 const KEYCHAIN_SERVICE: &str = "dev.omp.llm";
 const KEYCHAIN_ACCOUNT: &str = "credential-store-master";
 const ANTIGRAVITY_VERSION_ENV: &str = "OMP_ANTIGRAVITY_VERSION";
@@ -87,6 +96,10 @@ const ANTIGRAVITY_OS_ENV: &str = "OMP_ANTIGRAVITY_OS";
 const ANTIGRAVITY_ARCH_ENV: &str = "OMP_ANTIGRAVITY_ARCH";
 const ANTIGRAVITY_VERSION_CACHE_FILE: &str = "antigravity-version";
 const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const AZURE_BASE_URL_ENV: &str = "OMP_AZURE_OPENAI_BASE_URL";
+const AZURE_RESOURCE_NAME_ENV: &str = "OMP_AZURE_OPENAI_RESOURCE_NAME";
+const AZURE_DEPLOYMENT_ENV: &str = "OMP_AZURE_OPENAI_DEPLOYMENT";
+const AZURE_API_VERSION_ENV: &str = "OMP_AZURE_OPENAI_API_VERSION";
 
 /// Production inference-registry or credential-state construction failure.
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +110,9 @@ pub enum RegistryError {
 	/// The checked-in catalog snapshot is invalid.
 	#[error("embedded catalog snapshot is invalid")]
 	Catalog(#[source] &'static omp_catalog::snapshot::SnapshotError),
+	/// Native configuration or discovery cache could not be composed.
+	#[error("live catalog composition failed")]
+	CatalogComposition(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 	/// Registry construction or route service failed.
 	#[error(transparent)]
 	Inference(#[from] Box<omp_inference::Error>),
@@ -160,13 +176,22 @@ pub enum CredentialKeyMode {
 }
 
 impl CredentialKeyMode {
-	/// Selects the key source from the environment and process interactivity.
-	pub fn from_environment() -> Self {
-		let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-		match env::var_os(KEYCHAIN_OPT_IN_ENV).as_deref() {
-			Some(value) if value == "1" => Self::OsKeychain,
-			None if interactive && cfg!(target_os = "macos") => Self::LocalFile,
-			_ => Self::Unavailable,
+	/// Selects the key source from an explicit environment override followed by
+	/// the typed settings value. Missing or malformed values fail closed.
+	pub fn from_configuration(configured: CredentialKeySourceSetting) -> Self {
+		Self::resolve(env::var(KEY_SOURCE_ENV).ok().as_deref(), configured)
+	}
+
+	fn resolve(explicit: Option<&str>, configured: CredentialKeySourceSetting) -> Self {
+		match explicit.map(str::trim) {
+			Some("local-file") => Self::LocalFile,
+			Some("os-keychain") => Self::OsKeychain,
+			Some("unavailable") | Some(_) => Self::Unavailable,
+			None => match configured {
+				CredentialKeySourceSetting::Unavailable => Self::Unavailable,
+				CredentialKeySourceSetting::LocalFile => Self::LocalFile,
+				CredentialKeySourceSetting::OsKeychain => Self::OsKeychain,
+			},
 		}
 	}
 }
@@ -189,7 +214,22 @@ fn placeholder_affinity_key() -> &'static str {
 pub fn open_credential_store(
 	database: impl AsRef<Path>,
 ) -> Result<Arc<CredentialStore>, RegistryError> {
-	match CredentialKeyMode::from_environment() {
+	let database = database.as_ref();
+	let data_dir = database.parent().unwrap_or_else(|| Path::new("."));
+	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, None))?;
+	let configured = manager
+		.snapshot()
+		.project::<LifecycleSettings>()?
+		.get()
+		.credential_key_source;
+	open_credential_store_with_mode(database, CredentialKeyMode::from_configuration(configured))
+}
+
+fn open_credential_store_with_mode(
+	database: &Path,
+	mode: CredentialKeyMode,
+) -> Result<Arc<CredentialStore>, RegistryError> {
+	match mode {
 		CredentialKeyMode::Unavailable => {
 			open_credential_store_with_key_source(database, Arc::new(UnavailableKeySource))
 		},
@@ -238,14 +278,73 @@ pub fn open_credential_store_with_key_source(
 	Ok(Arc::new(CredentialStore::open(database.as_ref(), key_source)?))
 }
 
+/// Composes the immutable production catalog from bundled facts, the fresh
+/// credential-blind discovery cache, and native user configuration.
+pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, RegistryError> {
+	let base = snapshot::Catalog::try_embedded()
+		.map_err(RegistryError::Catalog)?
+		.clone();
+	let overlays = Arc::new(OverlayStore::default());
+	let cache_path = data_dir.join("models.db");
+	if cache_path.exists() {
+		let cache = Arc::new(
+			DiscoveryStore::open(&cache_path)
+				.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?,
+		);
+		let runtime = DiscoveryRuntime::new(cache, Arc::clone(&overlays), []);
+		let requests = base
+			.providers()
+			.iter()
+			.filter_map(|provider| {
+				let defaults = provider.discovery_defaults.clone()?;
+				base
+					.routes()
+					.iter()
+					.any(|route| route.provider == provider.id && route.discovery.is_some())
+					.then(|| CachedDiscoveryHydration {
+						key:        DiscoveryCacheKey::provider(provider.id.clone()),
+						normalizer: DiscoveryNormalizer::new(defaults),
+					})
+			})
+			.collect::<Vec<_>>();
+		let now_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis()
+			.try_into()
+			.unwrap_or(u64::MAX);
+		runtime
+			.hydrate_cached(&requests, now_ms)
+			.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?;
+	}
+	if let Some(loaded) = load_or_import_legacy(data_dir)
+		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?
+	{
+		let overlay = lower_user_overlay(&loaded.config)
+			.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?;
+		overlays.replace(OverlaySource::UserConfig, overlay);
+	}
+	base
+		.with_overlay_stack(&overlays.load(), UnsafeTrustScope::ALL)
+		.map(Arc::new)
+		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))
+}
+
 /// Builds the production inference registry over durable daemon state.
 pub async fn production_registry(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
 ) -> Result<Registry, RegistryError> {
-	production_assembly(data_dir, credential_store)
-		.await
-		.map(|(registry, ..)| registry)
+	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, None))?.snapshot();
+	production_assembly_for_session(
+		data_dir,
+		credential_store,
+		None,
+		UsageFetcherRegistry::default(),
+		inference_settings(settings.as_ref(), None)?,
+	)
+	.await
+	.map(|(registry, ..)| registry)
 }
 /// Builds the production console-usage authority over the canonical
 /// credential and account stores.
@@ -312,9 +411,26 @@ pub async fn production_rpc_registry(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
 ) -> Result<(Registry, AuthManager), RegistryError> {
-	production_assembly(data_dir, credential_store)
-		.await
-		.map(|(registry, _, _, _, auth, ..)| (registry, auth))
+	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, None))?.snapshot();
+	production_rpc_registry_with_settings(data_dir, credential_store, settings, None).await
+}
+
+/// Builds the RPC registry from the exact session settings snapshot.
+pub async fn production_rpc_registry_with_settings(
+	data_dir: &Path,
+	credential_store: Arc<CredentialStore>,
+	settings: Arc<SettingsSnapshot>,
+	project_root: Option<&Path>,
+) -> Result<(Registry, AuthManager), RegistryError> {
+	production_assembly_for_session(
+		data_dir,
+		credential_store,
+		None,
+		UsageFetcherRegistry::default(),
+		inference_settings(settings.as_ref(), project_root)?,
+	)
+	.await
+	.map(|(registry, _, _, _, auth, ..)| (registry, auth))
 }
 /// Invocation-owned inference values that must not enter agent or durable
 /// state.
@@ -328,6 +444,8 @@ pub struct InferenceSessionOverrides {
 	pub prompt_cache_affinity: Option<Str>,
 	/// Shared extension-host usage registry allocated before inference assembly.
 	pub usage_fetchers:        Option<UsageFetcherRegistry>,
+	/// Exact layered settings snapshot frozen by the session composer.
+	pub settings:              Option<Arc<SettingsSnapshot>>,
 }
 
 /// Session-owned production inference authorities assembled from one credential
@@ -378,6 +496,10 @@ pub async fn production_inference_for_session(
 	project_root: Option<&Path>,
 	overrides: InferenceSessionOverrides,
 ) -> Result<ProductionInference, RegistryError> {
+	let settings = match overrides.settings.as_ref() {
+		Some(snapshot) => Arc::clone(snapshot),
+		None => SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?.snapshot(),
+	};
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
 	let usage_fetchers = overrides.usage_fetchers.unwrap_or_default();
@@ -392,13 +514,18 @@ pub async fn production_inference_for_session(
 			))));
 		},
 	};
+	let inference_settings = inference_settings(settings.as_ref(), project_root)?;
 	let (registry, sessions, authority, mcp_authority, auth_manager, usage_manager, builtins) =
-		production_assembly_for_session(data_dir, credential_store, invocation_key, usage_fetchers)
-			.await?;
+		production_assembly_for_session(
+			data_dir,
+			credential_store,
+			invocation_key,
+			usage_fetchers,
+			inference_settings,
+		)
+		.await?;
 	let usage_fetchers = usage_manager.fetchers();
-	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?;
 	let search_settings = settings
-		.snapshot()
 		.project::<omp_inference::search_settings::WebSearchSettings>()?
 		.get()
 		.clone();
@@ -424,6 +551,35 @@ pub async fn production_inference_for_session(
 	})
 }
 
+fn inference_settings(
+	settings: &SettingsSnapshot,
+	project_root: Option<&Path>,
+) -> Result<omp_inference::InferenceSettings, RegistryError> {
+	let cwd = project_root
+		.map(Path::to_path_buf)
+		.or_else(|| env::current_dir().ok())
+		.unwrap_or_default();
+	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), std::path::PathBuf::from);
+	Ok(omp_inference::InferenceSettings {
+		retry:     settings
+			.project::<omp_inference::settings::RetrySettings>()?
+			.get()
+			.clone(),
+		sampling:  settings
+			.project::<omp_inference::settings::SamplingSettings>()?
+			.get()
+			.clone(),
+		providers: settings
+			.project::<omp_inference::settings::ProviderRuntimeSettings>()?
+			.get()
+			.clone(),
+		model:     settings
+			.project::<omp_catalog::settings::ModelSettings>()?
+			.get()
+			.resolve_path_scopes(&cwd, &home),
+	})
+}
+
 async fn production_assembly(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
@@ -444,6 +600,7 @@ async fn production_assembly(
 		credential_store,
 		None,
 		UsageFetcherRegistry::default(),
+		omp_inference::InferenceSettings::default(),
 	)
 	.await
 }
@@ -453,6 +610,7 @@ async fn production_assembly_for_session(
 	credential_store: Arc<CredentialStore>,
 	invocation_key: Option<(omp_catalog::ProviderId, SecretString)>,
 	usage_fetchers: UsageFetcherRegistry,
+	inference_settings: omp_inference::InferenceSettings,
 ) -> Result<
 	(
 		Registry,
@@ -466,11 +624,7 @@ async fn production_assembly_for_session(
 	RegistryError,
 > {
 	fs::create_dir_all(data_dir).map_err(RegistryError::PrepareState)?;
-	let catalog = Arc::new(
-		snapshot::Catalog::try_embedded()
-			.map_err(RegistryError::Catalog)?
-			.clone(),
-	);
+	let catalog = production_catalog(data_dir)?;
 	#[cfg(feature = "local-applefm")]
 	let apple_routes = catalog
 		.routes()
@@ -482,29 +636,6 @@ async fn production_assembly_for_session(
 		.map(|route| route.id.clone())
 		.collect::<Vec<_>>();
 	let stored = Arc::new(auth_backend::combined_authority(credential_store.clone()));
-	let credentials = CredentialBroker::system(&catalog, CredentialBrokerEngines {
-		stored: Some(stored.clone()),
-		..CredentialBrokerEngines::default()
-	})
-	.map_err(|_| {
-		RegistryError::Inference(Box::new(omp_inference::Error::planning(
-			omp_inference::ErrorKind::InvalidRequest,
-			omp_inference::ErrorDetail::target(sf!("catalog-credential-broker-invalid",)),
-			Default::default(),
-		)))
-	})?;
-	let credentials = match invocation_key {
-		Some((provider, secret)) => credentials
-			.with_api_key_override(&catalog, &provider, secret)
-			.map_err(|_| {
-				RegistryError::Inference(Box::new(omp_inference::Error::planning(
-					omp_inference::ErrorKind::InvalidRequest,
-					omp_inference::ErrorDetail::target(sf!("invocation-credential-override-invalid")),
-					Default::default(),
-				)))
-			})?,
-		None => credentials,
-	};
 	let database = data_dir.join("credentials.db");
 	let accounts = AccountPool::with_store(Arc::new(AccountStateStore::open(&database)?))?;
 	let oauth_http = Arc::new(SystemOAuthHttpClient::new());
@@ -517,6 +648,17 @@ async fn production_assembly_for_session(
 		Arc::new(OAuthCustomDispatcher::builtin(oauth_http.clone(), oauth_clock.clone())?);
 	let refresh_coordinator =
 		Arc::new(RefreshCoordinator::new("omp-auth-refresh", RefreshPolicy::default())?);
+	let acquisition_credentials = CredentialBroker::system(&catalog, CredentialBrokerEngines {
+		stored: Some(stored.clone()),
+		..CredentialBrokerEngines::default()
+	})
+	.map_err(|_| {
+		RegistryError::Inference(Box::new(omp_inference::Error::planning(
+			omp_inference::ErrorKind::InvalidRequest,
+			omp_inference::ErrorDetail::target(sf!("catalog-credential-broker-invalid")),
+			Default::default(),
+		)))
+	})?;
 	let login_engines: Vec<Arc<dyn AuthLoginEngine>> = vec![
 		// Provider-scoped engines must precede generic engines for the same method.
 		Arc::new(AlibabaTokenPlanLoginEngine::new(
@@ -543,14 +685,14 @@ async fn production_assembly_for_session(
 			AuthMethod::ApplicationDefault,
 			sf!("application-default"),
 			catalog.clone(),
-			credentials.clone(),
+			acquisition_credentials.clone(),
 			accounts.clone(),
 		)?),
 		Arc::new(CredentialAcquisitionLoginEngine::new(
 			AuthMethod::AwsCredentialChain,
 			sf!("aws-credential-chain"),
 			catalog.clone(),
-			credentials.clone(),
+			acquisition_credentials.clone(),
 			accounts.clone(),
 		)?),
 		Arc::new(OAuthLoginEngine::new(
@@ -581,6 +723,30 @@ async fn production_assembly_for_session(
 		oauth_custom,
 		refresh_coordinator,
 	));
+	let refreshing = Arc::new(RefreshingCredentialSource::new(stored.clone(), refresh.clone()));
+	let credentials = CredentialBroker::system(&catalog, CredentialBrokerEngines {
+		stored: Some(refreshing),
+		..CredentialBrokerEngines::default()
+	})
+	.map_err(|_| {
+		RegistryError::Inference(Box::new(omp_inference::Error::planning(
+			omp_inference::ErrorKind::InvalidRequest,
+			omp_inference::ErrorDetail::target(sf!("catalog-credential-broker-invalid",)),
+			Default::default(),
+		)))
+	})?;
+	let credentials = match invocation_key {
+		Some((provider, secret)) => credentials
+			.with_api_key_override(&catalog, &provider, secret)
+			.map_err(|_| {
+				RegistryError::Inference(Box::new(omp_inference::Error::planning(
+					omp_inference::ErrorKind::InvalidRequest,
+					omp_inference::ErrorDetail::target(sf!("invocation-credential-override-invalid")),
+					Default::default(),
+				)))
+			})?,
+		None => credentials,
+	};
 	let auth_manager = AuthManager::new(
 		catalog.clone(),
 		credential_store,
@@ -654,7 +820,9 @@ async fn production_assembly_for_session(
 		Duration::from_secs(60),
 		Arc::new(BTreeMap::new()),
 		Arc::new(credential_shapers),
-	);
+	)
+	.with_settings(inference_settings)
+	.with_azure_endpoint(production_azure_endpoint()?);
 	let dependencies = dependencies.with_usage_manager(usage_manager);
 	#[cfg(feature = "local-applefm")]
 	let dependencies = {
@@ -764,4 +932,189 @@ fn env_override(name: &str) -> Option<Str> {
 		let value = value.trim();
 		(!value.is_empty()).then(|| Str::from(value))
 	})
+}
+fn production_azure_endpoint() -> Result<Option<AzureEndpointConfig>, RegistryError> {
+	let base = match (env_override(AZURE_BASE_URL_ENV), env_override(AZURE_RESOURCE_NAME_ENV)) {
+		(Some(base), _) => Some(base),
+		(None, Some(resource))
+			if resource
+				.chars()
+				.all(|character| character.is_ascii_alphanumeric() || character == '-') =>
+		{
+			Some(Str::from(format!("https://{}.openai.azure.com", resource.as_str())))
+		},
+		(None, Some(_)) => {
+			return Err(RegistryError::CatalogComposition(Box::new(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"OMP_AZURE_OPENAI_RESOURCE_NAME is invalid",
+			))));
+		},
+		(None, None) => None,
+	};
+	let Some(base) = base else {
+		return Ok(None);
+	};
+	AzureEndpointConfig::new(
+		base,
+		env_override(AZURE_DEPLOYMENT_ENV),
+		Arc::new(BTreeMap::new()),
+		env_override(AZURE_API_VERSION_ENV),
+	)
+	.map(Some)
+	.map_err(|code| {
+		RegistryError::CatalogComposition(Box::new(io::Error::new(io::ErrorKind::InvalidInput, code)))
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn credential_key_mode_requires_deliberate_configuration() {
+		assert_eq!(
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::Unavailable),
+			CredentialKeyMode::Unavailable,
+		);
+		assert_eq!(
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::LocalFile),
+			CredentialKeyMode::LocalFile,
+		);
+		assert_eq!(
+			CredentialKeyMode::resolve(None, CredentialKeySourceSetting::OsKeychain),
+			CredentialKeyMode::OsKeychain,
+		);
+	}
+
+	#[test]
+	fn explicit_environment_selection_precedes_config_and_invalid_values_fail_closed() {
+		assert_eq!(
+			CredentialKeyMode::resolve(Some("local-file"), CredentialKeySourceSetting::Unavailable,),
+			CredentialKeyMode::LocalFile,
+		);
+		assert_eq!(
+			CredentialKeyMode::resolve(Some("os-keychain"), CredentialKeySourceSetting::LocalFile,),
+			CredentialKeyMode::OsKeychain,
+		);
+		assert_eq!(
+			CredentialKeyMode::resolve(Some("typo"), CredentialKeySourceSetting::LocalFile),
+			CredentialKeyMode::Unavailable,
+		);
+	}
+	#[test]
+	fn production_catalog_composes_native_unknown_provider_and_model() {
+		let directory = tempfile::tempdir().expect("temporary profile");
+		fs::write(
+			directory.path().join("models.toml"),
+			r#"
+[providers.local]
+baseUrl = "https://models.example.test"
+
+[providers.local.models."my-model"]
+name = "My Model"
+api = "openai"
+contextWindow = 8192
+maxTokens = 1024
+"#,
+		)
+		.expect("models.toml");
+		let catalog = production_catalog(directory.path()).expect("composed catalog");
+		let provider = omp_catalog::ProviderId::from("local");
+		let model = omp_catalog::ModelKey::from("my-model");
+		assert!(catalog.provider(&provider).is_some());
+		assert!(catalog.model_for_provider(&provider, &model).is_some());
+		assert!(
+			catalog
+				.model_for_provider(&provider, &model)
+				.expect("configured model")
+				.routes
+				.iter()
+				.any(|route| catalog
+					.route(route)
+					.is_some_and(|route| route.provider == provider))
+		);
+	}
+
+	#[test]
+	fn production_catalog_hydrates_fresh_discovery_cache() {
+		let directory = tempfile::tempdir().expect("temporary profile");
+		let embedded = snapshot::Catalog::try_embedded().expect("embedded catalog");
+		let route = embedded
+			.routes()
+			.iter()
+			.find(|route| {
+				route.discovery.is_some()
+					&& embedded
+						.provider(&route.provider)
+						.and_then(|provider| provider.discovery_defaults.as_ref())
+						.is_some()
+			})
+			.expect("discovery-capable route");
+		let now_ms = 1_900_000_000_000_u64;
+		let row = omp_catalog::DiscoveredModel {
+			provider:              route.provider.clone(),
+			route:                 route.id.clone(),
+			wire_model:            omp_catalog::WireModelId::from("cached-driver-composition-test"),
+			aliases:               Box::new([]),
+			display_name:          Some(Str::new_static("Cached Driver Composition Test")),
+			declared_class:        None,
+			declared_operations:   omp_catalog::OperationBits::empty(),
+			declared_capabilities: None,
+			declared_limits:       None,
+			extended_context_mode: None,
+			availability:          None,
+			source:                Str::new_static("driver-test"),
+			observed_at_ms:        Some(now_ms),
+			updated_at_ms:         None,
+			deprecated:            None,
+		};
+		DiscoveryStore::open(&directory.path().join("models.db"))
+			.expect("discovery store")
+			.publish(
+				&DiscoveryCacheKey::provider(route.provider.clone()),
+				&[row],
+				now_ms,
+				Duration::from_secs(24 * 60 * 60),
+			)
+			.expect("cache generation");
+		let catalog = production_catalog(directory.path()).expect("composed catalog");
+		assert!(
+			catalog
+				.models()
+				.iter()
+				.any(|model| model.display_name == "Cached Driver Composition Test")
+		);
+	}
+
+	#[test]
+	fn frozen_snapshot_projects_model_policy_into_inference_composition() {
+		let document: toml::Table = toml::from_str(
+			r#"
+[model]
+default_thinking = "high"
+provider_order = ["anthropic", "openai"]
+openai_websockets = "off"
+cache_retention = "long"
+"#,
+		)
+		.expect("settings document");
+		let manager = SettingsManager::isolated(document).expect("settings manager");
+		let settings =
+			inference_settings(manager.snapshot().as_ref(), None).expect("inference settings");
+		assert_eq!(settings.model.default_thinking, omp_catalog::ThinkingEffort::High,);
+		assert_eq!(
+			settings
+				.model
+				.provider_order
+				.iter()
+				.map(Str::as_str)
+				.collect::<Vec<_>>(),
+			["anthropic", "openai"],
+		);
+		assert_eq!(settings.model.openai_websockets, omp_catalog::settings::WireToggle::Off,);
+		assert_eq!(
+			settings.model.cache_retention,
+			omp_catalog::settings::CacheRetentionSetting::Long,
+		);
+	}
 }

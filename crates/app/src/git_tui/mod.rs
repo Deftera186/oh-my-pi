@@ -124,8 +124,11 @@ impl GitSession {
 						},
 					)
 					.await;
-				if load_cancel.is_cancelled() {
-					return GitIntentResult::default();
+				{
+					let active = self.load_cancel.lock();
+					if load_cancel.is_cancelled() || active.is_cancelled() {
+						return GitIntentResult::default();
+					}
 				}
 				match result {
 					Ok(contents) => one(GitUpdate::Contents { seq, contents }),

@@ -161,8 +161,7 @@ pub(crate) async fn run_list(title: &str, rows: &[ListRow]) -> Result<Option<usi
 	if rows.is_empty() {
 		return Ok(None);
 	}
-	let mut terminal =
-		Terminal::enter(omp_executor::Executor::new(None), TerminalOptions::default())?;
+	let mut terminal = Terminal::enter(TerminalOptions::default())?;
 	let mut renderer = Renderer::new(TtyOut::new()?);
 	renderer.apply_caps(&terminal.caps())?;
 	terminal.enter_alt()?;

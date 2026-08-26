@@ -18,8 +18,8 @@ use omp_ext::{
 	index::{IndexArtifact, IndexExtension, IndexRelease, SignedIndex},
 	trust::{KeysFile, verify_artifact_signature},
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use serde::Serialize;
 
 use crate::{
 	cli::{RegistryArgs, UpdateArgs},
@@ -28,6 +28,10 @@ use crate::{
 
 const CORE_PACKAGE: &str = "omp-cli";
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+const GITHUB_LATEST_RELEASE: &str = "https://api.github.com/repos/can1357/oh-my-pi/releases/latest";
+const GITHUB_USER_AGENT: &str = concat!("omp/", env!("CARGO_PKG_VERSION"));
+const STARTUP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const STARTUP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +73,19 @@ struct Selected<'a> {
 	release:   &'a IndexRelease,
 	artifact:  &'a IndexArtifact,
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GithubRelease {
+	tag_name: Str,
+	assets:   Vec<GithubAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GithubAsset {
+	name:                 Str,
+	browser_download_url: String,
+	size:                 u64,
+	digest:               Option<Str>,
+}
 
 #[must_use]
 struct UpdateLock(PathBuf);
@@ -89,6 +106,9 @@ pub async fn run(args: UpdateArgs) -> miette::Result<()> {
 			));
 		}
 		return upgrade_extensions().await;
+	}
+	if !release_override_requested(&args) {
+		return run_github_update(args).await;
 	}
 	let (index, _) = load_index(args.index.as_deref(), args.index_key.as_deref())?;
 	let target = platform_target();
@@ -111,6 +131,154 @@ pub async fn run(args: UpdateArgs) -> miette::Result<()> {
 	install(selected).await?;
 	println!("updated omp to {version} ({target})");
 	Ok(())
+}
+fn release_override_requested(args: &UpdateArgs) -> bool {
+	args.index.is_some()
+		|| args.index_key.is_some()
+		|| env::var_os("OMP_RELEASE_INDEX").is_some()
+		|| env::var_os("OMP_RELEASE_INDEX_KEY").is_some()
+}
+
+async fn run_github_update(args: UpdateArgs) -> miette::Result<()> {
+	let release = fetch_github_release(std::time::Duration::from_secs(15)).await?;
+	let target = platform_target();
+	let asset_name = github_asset_name();
+	let asset = release
+		.assets
+		.iter()
+		.find(|asset| asset.name.as_str() == asset_name)
+		.ok_or_else(|| miette!("latest GitHub release has no exact `{asset_name}` asset"))?;
+	let digest = github_sha256(asset)?;
+	let version = release.tag_name.as_str().trim_start_matches('v');
+	if version.is_empty() {
+		return Err(miette!("latest GitHub release has an empty version tag"));
+	}
+	let manager = classify_installation(&env::current_exe().into_diagnostic()?);
+	let current = env!("CARGO_PKG_VERSION");
+	let newer = compare_versions(version, current).is_gt();
+	if args.check || (!newer && !args.force) {
+		println!(
+			"current={current}\tlatest={version}\ttarget={target}\tmanager={manager:?}\\
+			 tupdate_available={newer}"
+		);
+		return Ok(());
+	}
+	if manager != InstallManager::Native {
+		return Err(miette!("{}", manager_instruction(manager)));
+	}
+	install_github_asset(asset, digest, version).await?;
+	println!("updated omp to {version} ({target})");
+	Ok(())
+}
+
+async fn fetch_github_release(timeout: std::time::Duration) -> miette::Result<GithubRelease> {
+	tokio::time::timeout(timeout, async {
+		let response = wreq::Client::new()
+			.get(GITHUB_LATEST_RELEASE)
+			.header("User-Agent", GITHUB_USER_AGENT)
+			.header("Accept", "application/vnd.github+json")
+			.send()
+			.await
+			.into_diagnostic()?;
+		if !response.status().is_success() {
+			return Err(miette!("GitHub release lookup returned HTTP {}", response.status()));
+		}
+		response.json::<GithubRelease>().await.into_diagnostic()
+	})
+	.await
+	.map_err(|_| miette!("GitHub release lookup timed out"))?
+}
+
+fn github_sha256(asset: &GithubAsset) -> miette::Result<&str> {
+	let digest = asset
+		.digest
+		.as_deref()
+		.and_then(|digest| digest.strip_prefix("sha256:"))
+		.ok_or_else(|| miette!("GitHub release asset `{}` has no SHA-256 digest", asset.name))?;
+	if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+		return Err(miette!("GitHub release asset `{}` has a malformed SHA-256 digest", asset.name));
+	}
+	Ok(digest)
+}
+
+async fn install_github_asset(
+	asset: &GithubAsset,
+	expected_sha256: &str,
+	version: &str,
+) -> miette::Result<()> {
+	if asset.size > MAX_ASSET_BYTES {
+		return Err(miette!("GitHub update asset exceeds the 256 MiB safety ceiling"));
+	}
+	let cache = update_cache_dir()?;
+	fs::create_dir_all(&cache).into_diagnostic()?;
+	let lock_path = cache.join("update.lock");
+	OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&lock_path)
+		.map_err(|error| miette!("another updater owns {}: {error}", lock_path.display()))?;
+	let _lock = UpdateLock(lock_path);
+	let bytes = fetch_github_asset(asset).await?;
+	if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != asset.size {
+		return Err(miette!("GitHub update asset size differs from release metadata"));
+	}
+	let actual = hex::encode(&Sha256::digest(&bytes)).to_string();
+	if !actual.eq_ignore_ascii_case(expected_sha256) {
+		return Err(miette!("GitHub update asset SHA-256 differs from release metadata"));
+	}
+	let current = env::current_exe().into_diagnostic()?;
+	let destination = renamed_destination(&current);
+	let install_dir = destination.parent().unwrap_or_else(|| Path::new("."));
+	prune_stale(install_dir)?;
+	let timestamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.into_diagnostic()?
+		.as_millis();
+	let attempt = format!("{timestamp}.{}", process::id());
+	let (staged, backup) = update_artifact_paths(&destination, &attempt)?;
+	write_executable(&staged, &bytes)?;
+	atomic_replace(&staged, &destination, &backup, version)?;
+	retire_renamed_source(&current, &destination, &attempt)
+}
+
+async fn fetch_github_asset(asset: &GithubAsset) -> miette::Result<Vec<u8>> {
+	if !asset.browser_download_url.starts_with("https://") {
+		return Err(miette!("GitHub update asset URL must use HTTPS"));
+	}
+	let response = wreq::Client::new()
+		.get(&asset.browser_download_url)
+		.header("User-Agent", GITHUB_USER_AGENT)
+		.send()
+		.await
+		.into_diagnostic()?;
+	if !response.status().is_success() {
+		return Err(miette!("update download returned HTTP {}", response.status()));
+	}
+	let mut bytes = Vec::with_capacity(usize::try_from(asset.size).unwrap_or_default());
+	let mut stream = response.bytes_stream();
+	while let Some(chunk) = stream.next().await {
+		let chunk = chunk.into_diagnostic()?;
+		if bytes.len().saturating_add(chunk.len())
+			> usize::try_from(MAX_ASSET_BYTES).unwrap_or(usize::MAX)
+		{
+			return Err(miette!("update download exceeded the 256 MiB safety ceiling"));
+		}
+		bytes.extend_from_slice(&chunk);
+	}
+	Ok(bytes)
+}
+
+fn update_cache_dir() -> miette::Result<PathBuf> {
+	if let Some(cache) = env::var_os("OMP_CACHE_DIR").filter(|value| !value.is_empty()) {
+		return Ok(PathBuf::from(cache).join("updates"));
+	}
+	let home = env::var_os("HOME")
+		.filter(|value| !value.is_empty())
+		.map(PathBuf::from)
+		.ok_or_else(|| miette!("HOME or OMP_CACHE_DIR must be set for native update staging"))?;
+	Ok(omp_core::dirs::native_directories(&home)
+		.cache
+		.join("updates"))
 }
 
 /// Inspects the verified package registry without mutating locks or TOFU pins.
@@ -170,17 +338,65 @@ pub fn registry(args: RegistryArgs) -> miette::Result<()> {
 	Ok(())
 }
 
-/// Returns a newer signed core release configured for this platform.
+/// Returns a newer verified core release configured for this platform.
 ///
-/// This path is intentionally read-only: it does not download artifacts,
-/// mutate TOFU pins, refresh extension indexes, or write a seen marker.
+/// The canonical GitHub response is cached for one hour; startup never
+/// downloads binaries, mutates TOFU pins, or refreshes extension indexes.
 pub fn startup_available() -> Option<Str> {
-	let (index, _) = load_index(None, None).ok()?;
-	let target = platform_target();
-	let selected = select(&index, CORE_PACKAGE, &target).ok()?;
-	compare_versions(selected.release.version.as_str(), env!("CARGO_PKG_VERSION"))
-		.is_gt()
-		.then(|| selected.release.version.clone())
+	if env::var_os("OMP_RELEASE_INDEX").is_some() || env::var_os("OMP_RELEASE_INDEX_KEY").is_some() {
+		let (index, _) = load_index(None, None).ok()?;
+		let target = platform_target();
+		let selected = select(&index, CORE_PACKAGE, &target).ok()?;
+		return compare_versions(selected.release.version.as_str(), env!("CARGO_PKG_VERSION"))
+			.is_gt()
+			.then(|| selected.release.version.clone());
+	}
+	startup_github_release().and_then(|release| {
+		let asset_name = github_asset_name();
+		let asset = release
+			.assets
+			.iter()
+			.find(|asset| asset.name.as_str() == asset_name)?;
+		github_sha256(asset).ok()?;
+		let version = release.tag_name.as_str().trim_start_matches('v');
+		compare_versions(version, env!("CARGO_PKG_VERSION"))
+			.is_gt()
+			.then(|| Str::new(version))
+	})
+}
+fn startup_github_release() -> Option<GithubRelease> {
+	let cache = update_cache_dir().ok()?.join("latest.json");
+	let cached = || {
+		fs::read(&cache)
+			.ok()
+			.and_then(|bytes| serde_json::from_slice::<GithubRelease>(&bytes).ok())
+	};
+	let fresh = fs::metadata(&cache)
+		.and_then(|metadata| metadata.modified())
+		.and_then(|modified| modified.elapsed().map_err(io::Error::other))
+		.is_ok_and(|age| age <= STARTUP_CACHE_TTL);
+	if fresh {
+		return cached();
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.ok()?;
+	match runtime.block_on(fetch_github_release(STARTUP_FETCH_TIMEOUT)) {
+		Ok(release) => {
+			if let Some(parent) = cache.parent()
+				&& fs::create_dir_all(parent).is_ok()
+				&& let Ok(bytes) = serde_json::to_vec(&release)
+			{
+				let staged = cache.with_extension("json.tmp");
+				if fs::write(&staged, bytes).is_ok() {
+					let _ = fs::rename(staged, &cache);
+				}
+			}
+			Some(release)
+		},
+		Err(_) => cached(),
+	}
 }
 
 fn load_index(index: Option<&Path>, key: Option<&Path>) -> miette::Result<(SignedIndex, String)> {
@@ -551,6 +767,21 @@ const fn manager_instruction(manager: InstallManager) -> &'static str {
 	}
 }
 
+fn github_asset_name() -> String {
+	let arch = match consts::ARCH {
+		"x86_64" => "x64",
+		"aarch64" => "arm64",
+		other => other,
+	};
+	match consts::OS {
+		"macos" => format!("omp-darwin-{arch}"),
+		"windows" => format!("omp-windows-{arch}.exe"),
+		"linux" if cfg!(target_env = "musl") => format!("omp-linux-musl-{arch}"),
+		"linux" => format!("omp-linux-{arch}"),
+		other => format!("omp-{other}-{arch}"),
+	}
+}
+
 fn platform_target() -> String {
 	let arch = match consts::ARCH {
 		"x86_64" => "x86_64",
@@ -640,6 +871,22 @@ mod tests {
 
 	#[test]
 	fn windows_release_selects_its_attested_target_asset() {
+		let asset = GithubAsset {
+			name:                 Str::new_static("omp-x86_64-apple-darwin"),
+			browser_download_url: "https://example.invalid/omp".to_owned(),
+			size:                 1,
+			digest:               Some(Str::new_static(
+				"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			)),
+		};
+		assert_eq!(
+			github_sha256(&asset).expect("digest"),
+			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		);
+		let mut missing = asset;
+		missing.digest = None;
+		assert!(github_sha256(&missing).is_err());
+
 		let windows = "x86_64-pc-windows-msvc";
 		let release = IndexRelease {
 			version:           Str::new_static("18.0.0"),

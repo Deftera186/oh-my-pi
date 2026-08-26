@@ -21,6 +21,7 @@ use crate::{
 	config::{BankScoping, MemoryBackend, MnemopiSettings},
 	diagnose::{BankDiagnostic, inspect},
 	embedding::{EmbeddingSupervisor, ModelId},
+	extract::ExtractionRequest,
 	link,
 	recall::{RecallBounds, RecallEngine, RecallResult},
 	retain::strip_protocol_markers,
@@ -207,8 +208,10 @@ pub enum MemoryProjection {
 /// One selected memory runtime. Off is effect-free; Mnemopi owns its bank
 /// handles.
 pub struct MemoryRuntime {
-	backend:    RuntimeBackend,
-	generation: AtomicU64,
+	backend:       RuntimeBackend,
+	generation:    AtomicU64,
+	extraction_tx: flume::Sender<()>,
+	extraction_rx: flume::Receiver<()>,
 }
 
 enum RuntimeBackend {
@@ -229,10 +232,13 @@ impl MemoryRuntime {
 	/// Constructs the selected backend. Off opens no files and performs no
 	/// effects.
 	pub fn start(input: RuntimeStart) -> Result<Arc<Self>> {
+		let (extraction_tx, extraction_rx) = flume::bounded(1);
 		if input.backend == MemoryBackend::Off {
 			return Ok(Arc::new(Self {
-				backend:    RuntimeBackend::Off,
+				backend: RuntimeBackend::Off,
 				generation: AtomicU64::new(0),
+				extraction_tx,
+				extraction_rx,
 			}));
 		}
 		let settings = input.mnemopi.normalize();
@@ -250,7 +256,8 @@ impl MemoryRuntime {
 			.unwrap_or_else(|| input.data_dir.join("mnemopi"));
 		let retain_path =
 			selected_database_path(&db_dir, settings.db_path.as_deref(), &scope.global, &scope.retain);
-		let retain = BankStore::open(retain_path, scope.retain.clone(), scope.identity_root.clone())?;
+		let retain = BankStore::open(retain_path, scope.retain.clone(), scope.identity_root.clone())?
+			.with_working_policy(settings.working_memory_limit, settings.working_memory_ttl_hours);
 		let mut adopted = retain.adopted_banks()?;
 		let discovered = discover_legacy_banks(
 			&db_dir,
@@ -273,10 +280,15 @@ impl MemoryRuntime {
 			}
 			let path =
 				selected_database_path(&db_dir, settings.db_path.as_deref(), &scope.global, bank);
-			recall.push(BankStore::open(path, bank.clone(), scope.identity_root.clone())?);
+			recall.push(
+				BankStore::open(path, bank.clone(), scope.identity_root.clone())?.with_working_policy(
+					settings.working_memory_limit,
+					settings.working_memory_ttl_hours,
+				),
+			);
 		}
 		Ok(Arc::new(Self {
-			backend:    RuntimeBackend::Mnemopi(MnemopiRuntime {
+			backend: RuntimeBackend::Mnemopi(MnemopiRuntime {
 				session_id: input.session_id,
 				settings,
 				scope,
@@ -285,6 +297,8 @@ impl MemoryRuntime {
 				cache: RecallCache::new(),
 			}),
 			generation: AtomicU64::new(1),
+			extraction_tx,
+			extraction_rx,
 		}))
 	}
 
@@ -585,25 +599,38 @@ impl MemoryRuntime {
 		let mut indexed = 0usize;
 		for store in unique_stores(&runtime.recall, &runtime.retain) {
 			let expected = store.generations()?.durable;
-			let records = store.list(1000)?;
-			if records.is_empty() {
-				store.replace_vectors(expected, model.0.as_str(), &[])?;
-				continue;
+			let mut rebuilt = Vec::<(Str, Vec<f32>)>::new();
+			let mut offset = 0usize;
+			loop {
+				let records = store.list_live_page(offset, 256)?;
+				if records.is_empty() {
+					break;
+				}
+				let count = records.len();
+				let texts = records
+					.iter()
+					.map(|record| record.content.to_string())
+					.collect::<Vec<_>>();
+				let vectors = supervisor
+					.embed(model.clone(), cache_dir.clone(), texts, Some(32))
+					.await?;
+				if vectors.len() != count {
+					return Err(Error::EmbeddingWorker);
+				}
+				rebuilt.extend(
+					records
+						.into_iter()
+						.zip(vectors)
+						.map(|(record, vector)| (record.id, vector)),
+				);
+				offset = offset.saturating_add(count);
 			}
-			let texts = records
+			let entries = rebuilt
 				.iter()
-				.map(|record| record.content.to_string())
-				.collect::<Vec<_>>();
-			let vectors = supervisor
-				.embed(model.clone(), cache_dir.clone(), texts, Some(32))
-				.await?;
-			let entries = records
-				.iter()
-				.zip(&vectors)
-				.map(|(record, vector)| VectorEntry { memory_id: record.id.as_str(), vector })
+				.map(|(id, vector)| VectorEntry { memory_id: id.as_str(), vector })
 				.collect::<Vec<_>>();
 			store.replace_vectors(expected, model.0.as_str(), &entries)?;
-			indexed += entries.len();
+			indexed = indexed.saturating_add(entries.len());
 		}
 		runtime.cache.clear();
 		self.generation.fetch_add(1, Ordering::AcqRel);
@@ -745,6 +772,31 @@ impl MemoryRuntime {
 			RuntimeBackend::Mnemopi(runtime) => Ok(&runtime.retain),
 			RuntimeBackend::Off => Err(Error::Inactive),
 		}
+	}
+
+	/// Reads the oldest durable extraction jobs under owner-enforced count and
+	/// aggregate-byte bounds.
+	pub fn pending_extractions(&self, max_jobs: usize) -> Result<Vec<ExtractionRequest>> {
+		self.retain_store()?.pending_extractions(max_jobs)
+	}
+
+	/// Counts durable extraction jobs awaiting a successful completion.
+	pub fn pending_extraction_count(&self) -> Result<usize> {
+		self.retain_store()?.pending_extraction_count()
+	}
+
+	/// Subscribes one session worker to coalesced durable-queue wakeups.
+	///
+	/// The worker must inspect [`Self::pending_extractions`] before its first
+	/// receive so jobs recovered from an earlier process are also drained.
+	pub fn extraction_notifications(&self) -> flume::Receiver<()> {
+		self.extraction_rx.clone()
+	}
+
+	/// Coalesces a wakeup after retention atomically commits a new extraction
+	/// job. Queue fullness is harmless because the job itself is durable.
+	pub fn notify_extraction(&self) {
+		let _ = self.extraction_tx.try_send(());
 	}
 
 	/// Top-level session id.

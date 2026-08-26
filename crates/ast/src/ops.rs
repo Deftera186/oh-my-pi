@@ -7,6 +7,7 @@ use std::{
 use ast_grep_core::{
 	MatchStrictness,
 	matcher::{Pattern, PatternError},
+	meta_var::MetaVariable,
 	source::Edit,
 	tree_sitter::LanguageExt,
 };
@@ -64,6 +65,17 @@ pub struct AstMatch {
 	pub byte_end:   usize,
 	/// Matched source text.
 	pub text:       Str,
+	/// Deterministically ordered metavariable captures.
+	pub bindings:   Vec<AstBinding>,
+}
+
+/// One metavariable captured by a structural match.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AstBinding {
+	/// Pattern spelling, including `$` or `$$$`.
+	pub name:  Str,
+	/// Exact source text captured for the metavariable.
+	pub value: Str,
 }
 
 /// A filesystem match with absolute and workspace-relative paths.
@@ -283,14 +295,32 @@ pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]
 			let end = matched.end_pos();
 			let range = matched.range();
 			let node = matched.get_node();
+			let environment = matched.get_env();
+			let mut bindings = environment
+				.get_matched_variables()
+				.filter_map(|variable| {
+					let name = match &variable {
+						MetaVariable::Capture(name, _) => format!("${name}"),
+						MetaVariable::MultiCapture(name) => format!("$$${name}"),
+						MetaVariable::Dropped(_) | MetaVariable::Multiple => return None,
+					};
+					let value = environment.get_var_bytes(&variable)?;
+					Some(AstBinding {
+						name:  Str::new(name),
+						value: Str::new(String::from_utf8_lossy(value)),
+					})
+				})
+				.collect::<Vec<_>>();
+			bindings.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 			matches.push(AstMatch {
-				line:       start.line() + 1,
-				column:     start.column(node) + 1,
-				end_line:   end.line() + 1,
+				line: start.line() + 1,
+				column: start.column(node) + 1,
+				end_line: end.line() + 1,
 				end_column: end.column(node) + 1,
 				byte_start: range.start,
-				byte_end:   range.end,
-				text:       Str::new(matched.text()),
+				byte_end: range.end,
+				text: Str::new(matched.text()),
+				bindings,
 			});
 		}
 	}
@@ -434,6 +464,7 @@ fn compile_rust_contextual_pattern(pattern: &str) -> Option<Pattern> {
 #[cfg(test)]
 mod tests {
 	use ast_grep_core::source::Edit;
+	use omp_core::Str;
 
 	use super::{SupportLang, apply_edits, compile_search_patterns};
 
@@ -442,6 +473,19 @@ mod tests {
 		let patterns = compile_search_patterns("foo($$$ARGS)", SupportLang::Rust)
 			.expect("rust pattern should compile");
 		assert!(!patterns.is_empty());
+	}
+
+	#[test]
+	fn collect_matches_retains_sorted_metavariable_bindings() {
+		let patterns = compile_search_patterns("const $NAME = $VALUE", SupportLang::TypeScript)
+			.expect("TypeScript pattern should compile");
+		let matches =
+			super::collect_matches("const answer = 42;", SupportLang::TypeScript, &patterns);
+		assert_eq!(matches.len(), 1);
+		assert_eq!(matches[0].bindings, [
+			super::AstBinding { name: Str::new("$NAME"), value: Str::new("answer") },
+			super::AstBinding { name: Str::new("$VALUE"), value: Str::new("42") },
+		]);
 	}
 
 	#[test]

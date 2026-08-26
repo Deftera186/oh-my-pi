@@ -7,9 +7,11 @@ use std::{
 };
 
 use omp_catalog::{
-	Availability, CatalogOverlay, CatalogOverlayBuilder, EvidenceConfidence, ModalityBits, ModelKey,
-	ModelLimits, ModelOverlay, ModelPatch, OverlaySource, OverlayStore, PremiumMultiplier, Pricing,
-	ProvenanceKind, ProvenanceSource, RouteOverlay, RoutePatch, ThinkingPolicy,
+	Availability, CatalogOverlay, CatalogOverlayBuilder, ClassId, ContextStrategy,
+	EvidenceConfidence, ModalityBits, ModelAvailability, ModelKey, ModelLimits, ModelOverlay,
+	ModelPatch, ModelProvenance, ModelSpec, OverlaySource, OverlayStore, PremiumMultiplier, Pricing,
+	ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, RouteOverlay,
+	RoutePatch, ThinkingPolicy, ThinkingRouting, WireModelId,
 };
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -221,12 +223,11 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 		confidence:     EvidenceConfidence::Declared,
 		observed_at_ms: None,
 	};
-	let mut builder = CatalogOverlayBuilder::new(source);
+	let mut builder = CatalogOverlayBuilder::new(source.clone());
 	let catalog = omp_catalog::Catalog::embedded();
 	for (provider, definition) in &config.providers {
-		if let Some(base_provider) =
-			catalog.provider(omp_catalog::ProviderId::from_ref(provider.as_str()))
-		{
+		let base_provider = catalog.provider(ProviderId::from_ref(provider.as_str()));
+		let configured_route = if let Some(base_provider) = base_provider {
 			for route_id in &base_provider.routes {
 				let Some(route) = catalog.route(route_id) else {
 					continue;
@@ -235,8 +236,9 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 					.base_url
 					.as_ref()
 					.map(|base_url| omp_catalog::EndpointSpec {
-						base_url: base_url.clone(),
-						region:   route.endpoint.region.clone(),
+						base_url:    base_url.clone(),
+						region:      route.endpoint.region.clone(),
+						api_version: route.endpoint.api_version.clone(),
 					});
 				let discovery = definition.discovery.as_ref().and_then(|value| {
 					value
@@ -259,7 +261,55 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 					},
 				});
 			}
-		}
+			None
+		} else {
+			let (template_provider, template_route) =
+				configured_provider_template(catalog, definition);
+			let route_id = RouteId::from(format!("{provider}-configured"));
+			let mut added_provider: ProviderDef = template_provider.clone();
+			added_provider.id = ProviderId::from(provider.as_str());
+			added_provider.name = provider.clone();
+			added_provider.routes = Box::new([route_id.clone()]);
+			if let Some(auth) = definition.auth.as_deref() {
+				added_provider.auth = Box::new([omp_catalog::AuthSpecId::from(auth)]);
+			}
+			builder = builder.with_provider(added_provider);
+			let mut added_route: RouteDef = template_route.clone();
+			added_route.id = route_id.clone();
+			added_route.provider = ProviderId::from(provider.as_str());
+			if let Some(base_url) = &definition.base_url {
+				added_route.endpoint.base_url = base_url.clone();
+				if let Ok(url) = url::Url::parse(base_url)
+					&& let Some(host) = url.host_str()
+				{
+					let mut origin = format!("{}://{host}", url.scheme());
+					if let Some(port) = url.port() {
+						origin.push(':');
+						origin.push_str(&port.to_string());
+					}
+					added_route.trust_domain.origin = Str::from(origin);
+					added_route.trust_domain.allow_plaintext = url.scheme() == "http";
+				}
+			}
+			if let Some(auth) = definition.auth.as_deref() {
+				added_route.auth = omp_catalog::AuthSpecId::from(auth);
+			}
+			added_route.discovery = definition
+				.discovery
+				.as_ref()
+				.and_then(|value| value.get("id"))
+				.and_then(toml::Value::as_str)
+				.map(omp_catalog::DiscoverySpecId::from);
+			if let Some(disabled) = definition.disable_strict_tools {
+				added_route.capability_limits.disable_strict_tools = disabled;
+			}
+			builder = builder.with_route(RouteOverlay {
+				route: route_id.clone(),
+				added: Some(added_route),
+				patch: RoutePatch::default(),
+			});
+			Some(route_id)
+		};
 		for (name, model) in definition
 			.models
 			.iter()
@@ -367,10 +417,32 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 				})
 				.transpose()?
 				.map(|value| Some(PremiumMultiplier::from_millionths(value)));
+			let existing = catalog.models().iter().find(|candidate| {
+				candidate.key.as_str() == key
+					&& candidate.routes.iter().any(|route_id| {
+						catalog
+							.route(route_id)
+							.is_some_and(|route| route.provider.as_str() == provider.as_str())
+					})
+			});
+			let added = existing.is_none().then(|| {
+				configured_model_record(
+					catalog,
+					provider,
+					key,
+					model,
+					definition,
+					configured_route
+						.clone()
+						.or_else(|| base_provider.and_then(|base| base.routes.first().cloned()))
+						.expect("configured provider template always has a route"),
+					&source,
+				)
+			});
 			builder = builder.with_model(ModelOverlay {
 				selector: omp_catalog::ExactSelector::new(provider.clone(), ModelKey::from(key)),
-				added:    None,
-				patch:    ModelPatch {
+				added,
+				patch: ModelPatch {
 					display_name: model.name.clone(),
 					capabilities,
 					limits,
@@ -392,6 +464,88 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 		}
 	}
 	Ok(builder.build())
+}
+
+fn configured_provider_template<'a>(
+	catalog: &'a omp_catalog::Catalog,
+	definition: &ProviderConfig,
+) -> (&'a ProviderDef, &'a RouteDef) {
+	let api = definition
+		.models
+		.values()
+		.chain(definition.model_overrides.values())
+		.find_map(|model| model.api.as_deref())
+		.unwrap_or_default();
+	let preferred = if api.contains("anthropic") {
+		"anthropic"
+	} else if api.contains("google") || api.contains("gemini") {
+		"google"
+	} else {
+		"openai"
+	};
+	let provider = catalog
+		.provider(ProviderId::from_ref(preferred))
+		.or_else(|| catalog.providers().first())
+		.expect("embedded catalog has a provider template");
+	let route = provider
+		.routes
+		.iter()
+		.find_map(|route| catalog.route(route))
+		.or_else(|| catalog.routes().first())
+		.expect("embedded catalog has a route template");
+	(provider, route)
+}
+
+fn configured_model_record(
+	catalog: &omp_catalog::Catalog,
+	_provider: &str,
+	key: &str,
+	model: &ModelConfig,
+	definition: &ProviderConfig,
+	route: RouteId,
+	source: &ProvenanceSource,
+) -> ModelSpec {
+	let (template_provider, _) = configured_provider_template(catalog, definition);
+	let template = catalog
+		.models()
+		.iter()
+		.find(|candidate| candidate.routes.contains(&route))
+		.or_else(|| {
+			catalog.models().iter().find(|candidate| {
+				candidate
+					.routes
+					.iter()
+					.any(|route| template_provider.routes.contains(route))
+			})
+		})
+		.or_else(|| catalog.models().first())
+		.expect("embedded catalog has a model template");
+	ModelSpec {
+		key: ModelKey::from(key),
+		class: ClassId::from(key),
+		display_name: model.name.clone().unwrap_or_else(|| Str::new(key)),
+		wire_ids: Box::new([(route.clone(), WireModelId::from(key))]),
+		routes: Box::new([route]),
+		capabilities: omp_catalog::unknown_capabilities(),
+		limits: ModelLimits::default(),
+		thinking: None,
+		thinking_routing: ThinkingRouting::default(),
+		wire_policy: template.wire_policy.clone(),
+		context: ContextStrategy::Replay,
+		pricing: Pricing::default(),
+		availability: ModelAvailability::Available,
+		provenance: ModelProvenance {
+			sources:          Box::new([source.clone()]),
+			updated_at_ms:    None,
+			blocked_until_ms: None,
+			deprecated:       false,
+		},
+		context_promotion_target: None,
+		compaction_model: None,
+		edit_revision: None,
+		remote_compaction: None,
+		premium_multiplier_millionths: None,
+	}
 }
 
 fn parse_modalities(
@@ -552,5 +706,32 @@ mod tests {
 		let store = OverlayStore::default();
 		publish_user_overlay(&store, &value).expect("publish");
 		assert_eq!(store.load().sources(), &[OverlaySource::UserConfig]);
+	}
+
+	#[test]
+	fn unknown_provider_lowers_complete_provider_route_and_model_records() {
+		let value: ModelsConfig = toml::from_str(
+			"[providers.demo]\nbaseUrl='https://example.test/v1'\nauth='apiKey'\n[providers.demo.models.fast]\napi='openai-completions'\ncontextWindow=128000\n",
+		)
+		.expect("decode");
+		let overlay = lower_user_overlay(&value).expect("overlay");
+		let stack = omp_catalog::OverlayStack::from_layers([(OverlaySource::UserConfig, overlay)]);
+		let catalog = omp_catalog::Catalog::embedded()
+			.with_overlay_stack(&stack, omp_catalog::UnsafeTrustScope::ALL)
+			.expect("materialize configured provider");
+		let provider = catalog
+			.provider(ProviderId::from_ref("demo"))
+			.expect("provider");
+		assert_eq!(provider.routes.as_ref(), &[RouteId::from("demo-configured")]);
+		let route = catalog.route(&provider.routes[0]).expect("route");
+		assert_eq!(route.endpoint.base_url, "https://example.test/v1");
+		assert_eq!(route.provider.as_str(), "demo");
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| model.key.as_str() == "fast")
+			.expect("model");
+		assert_eq!(model.routes.as_ref(), provider.routes.as_ref());
+		assert_eq!(model.limits.context_window, Some(128_000));
 	}
 }

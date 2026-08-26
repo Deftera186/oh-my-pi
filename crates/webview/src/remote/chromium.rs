@@ -7,6 +7,7 @@
 //! window the user can interact with directly.
 
 use std::{
+	collections::HashSet,
 	ffi::OsString,
 	fs,
 	path::{Path, PathBuf},
@@ -343,6 +344,12 @@ async fn wire_page(cdp: &mut Cdp, page: &PageOptions) -> Result<()> {
 			.await?;
 	}
 	cdp.cmd("Page.enable", json!({})).await?;
+	let frame_tree = cdp.cmd("Page.getFrameTree", json!({})).await?;
+	cdp.main_frame = frame_tree
+		.pointer("/frameTree/frame/id")
+		.and_then(Value::as_str)
+		.ok_or_else(|| Error::Protocol("Page.getFrameTree: missing main frame id".to_str()))?
+		.to_str();
 	cdp.cmd("DOM.enable", json!({})).await?;
 	cdp.cmd("Accessibility.enable", json!({})).await.map(drop)
 }
@@ -357,6 +364,10 @@ struct Cdp {
 	session:        Str,
 	/// Target id of the page; doubles as its main-frame id.
 	target:         Str,
+	/// Current top-level frame id reported by `Page.frameNavigated`.
+	main_frame:     Str,
+	/// Default execution contexts belonging to the current top-level frame.
+	main_contexts:  HashSet<u64>,
 	/// Event sink towards the host.
 	events:         flume::Sender<WebViewEvent>,
 	/// Shared url/title cache kept current from protocol events.
@@ -392,6 +403,8 @@ impl Cdp {
 			next_id: 1,
 			session: Str::default(),
 			target: Str::default(),
+			main_frame: Str::default(),
+			main_contexts: HashSet::new(),
 			events,
 			state,
 			frame_cfg,
@@ -913,12 +926,32 @@ impl Cdp {
 			"Page.frameNavigated" => {
 				// Only the main frame (no parentId) commits a view navigation.
 				let frame = &params["frame"];
-				if frame.get("parentId").is_none()
-					&& let Some(url) = frame.get("url").and_then(Value::as_str)
-				{
-					self.set_url(url);
+				if frame.get("parentId").is_none() {
+					if let Some(frame_id) = frame.get("id").and_then(Value::as_str) {
+						self.main_frame = frame_id.to_str();
+						self.main_contexts.clear();
+					}
+					if let Some(url) = frame.get("url").and_then(Value::as_str) {
+						self.set_url(url);
+					}
 				}
 			},
+			"Runtime.executionContextCreated" => {
+				let context = &params["context"];
+				let auxiliary = &context["auxData"];
+				if auxiliary.get("isDefault").and_then(Value::as_bool) == Some(true)
+					&& auxiliary.get("frameId").and_then(Value::as_str) == Some(self.main_frame.as_str())
+					&& let Some(id) = context.get("id").and_then(Value::as_u64)
+				{
+					self.main_contexts.insert(id);
+				}
+			},
+			"Runtime.executionContextDestroyed" => {
+				if let Some(id) = params.get("executionContextId").and_then(Value::as_u64) {
+					self.main_contexts.remove(&id);
+				}
+			},
+			"Runtime.executionContextsCleared" => self.main_contexts.clear(),
 			"Page.navigatedWithinDocument" => {
 				if let Some(url) = params.get("url").and_then(Value::as_str) {
 					self.set_url(url);
@@ -937,6 +970,7 @@ impl Cdp {
 			},
 			"Runtime.bindingCalled" => {
 				if params.get("name").and_then(Value::as_str) == Some(IPC_BINDING)
+					&& binding_is_from_main_context(params, &self.main_contexts)
 					&& let Some(payload) = params.get("payload").and_then(Value::as_str)
 				{
 					let _ = self.events.send(WebViewEvent::Ipc(payload.to_str()));
@@ -1033,6 +1067,13 @@ impl Cdp {
 	}
 }
 
+fn binding_is_from_main_context(params: &Value, main_contexts: &HashSet<u64>) -> bool {
+	params
+		.get("executionContextId")
+		.and_then(Value::as_u64)
+		.is_some_and(|id| main_contexts.contains(&id))
+}
+
 /// Extract a human-readable message from `Runtime.evaluate` exception details.
 fn exception_text(details: &Value) -> Str {
 	if let Some(text) = details
@@ -1082,4 +1123,16 @@ fn modifier_bits(m: Modifiers) -> u32 {
 		| (u32::from(m.ctrl) << 1)
 		| (u32::from(m.meta) << 2)
 		| (u32::from(m.shift) << 3)
+}
+#[cfg(test)]
+mod ipc_tests {
+	use super::*;
+
+	#[test]
+	fn binding_requires_current_top_level_execution_context() {
+		let contexts = HashSet::from([41]);
+		assert!(binding_is_from_main_context(&json!({ "executionContextId": 41 }), &contexts,));
+		assert!(!binding_is_from_main_context(&json!({ "executionContextId": 42 }), &contexts,));
+		assert!(!binding_is_from_main_context(&json!({}), &contexts));
+	}
 }

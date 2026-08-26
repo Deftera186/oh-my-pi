@@ -171,64 +171,71 @@ pub struct MnemopiSettings {
 	/// Optional primary database path; otherwise the app supplies its memory
 	/// data root.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub db_path:                Option<PathBuf>,
+	pub db_path:                  Option<PathBuf>,
 	/// Optional shared bank base name.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub bank:                   Option<Str>,
+	pub bank:                     Option<Str>,
 	/// Bank scoping policy.
 	#[serde(default)]
-	pub scoping:                BankScoping,
+	pub scoping:                  BankScoping,
 	/// Embedding model family.
 	#[serde(default)]
-	pub embedding_variant:      EmbeddingVariant,
+	pub embedding_variant:        EmbeddingVariant,
 	/// Optional explicit local model identifier.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub embedding_model:        Option<Str>,
+	pub embedding_model:          Option<Str>,
 	/// Optional Environment-routed remote embeddings.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub remote_embeddings:      Option<RemoteEmbeddingSettings>,
+	pub remote_embeddings:        Option<RemoteEmbeddingSettings>,
 	/// Recall automatically on the first top-level turn.
 	#[serde(default = "default_true")]
-	pub auto_recall:            bool,
+	pub auto_recall:              bool,
 	/// Retain settled top-level turns automatically.
 	#[serde(default = "default_true")]
-	pub auto_retain:            bool,
+	pub auto_retain:              bool,
 	/// Enable four-voice reciprocal-rank recall.
 	#[serde(default)]
-	pub polyphonic_recall:      bool,
+	pub polyphonic_recall:        bool,
 	/// Enable exact/similar tiered recall caching.
 	#[serde(default)]
-	pub enhanced_recall:        bool,
+	pub enhanced_recall:          bool,
 	/// Derive graph links as memories enter the durable store.
 	#[serde(default)]
-	pub proactive_linking:      bool,
+	pub proactive_linking:        bool,
+	/// Maximum transient working rows retained per session. Zero disables
+	/// count/TTL eviction.
+	#[serde(default = "default_working_memory_limit")]
+	pub working_memory_limit:     usize,
+	/// Maximum transient working-row age in hours.
+	#[serde(default = "default_working_memory_ttl_hours")]
+	pub working_memory_ttl_hours: u64,
 	/// User-turn interval for periodic retention.
 	#[serde(default = "default_retain_turns")]
-	pub retain_every_n_turns:   usize,
+	pub retain_every_n_turns:     usize,
 	/// Maximum recalled rows.
 	#[serde(default = "default_recall_limit")]
-	pub recall_limit:           usize,
+	pub recall_limit:             usize,
 	/// User-bounded turns included in an automatic recall query.
 	#[serde(default = "default_recall_context_turns")]
-	pub recall_context_turns:   usize,
+	pub recall_context_turns:     usize,
 	/// Maximum recall-query characters.
 	#[serde(default = "default_recall_query_chars")]
-	pub recall_max_query_chars: usize,
+	pub recall_max_query_chars:   usize,
 	/// Maximum approximate tokens injected into prompts or resolver projections.
 	#[serde(default = "default_injection_tokens")]
-	pub injection_token_limit:  usize,
+	pub injection_token_limit:    usize,
 	/// Extraction and consolidation model lane.
 	#[serde(default)]
-	pub llm_mode:               MemoryLlmMode,
+	pub llm_mode:                 MemoryLlmMode,
 	/// Environment-routed remote completion settings used only in remote mode.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub remote_llm:             Option<RemoteLlmSettings>,
+	pub remote_llm:               Option<RemoteLlmSettings>,
 	/// Emit memory debug diagnostics.
 	#[serde(default)]
-	pub debug:                  bool,
+	pub debug:                    bool,
 	/// Bounded shutdown drain in milliseconds.
 	#[serde(default = "default_shutdown_timeout_ms")]
-	pub shutdown_timeout_ms:    u64,
+	pub shutdown_timeout_ms:      u64,
 }
 
 const fn default_true() -> bool {
@@ -236,6 +243,12 @@ const fn default_true() -> bool {
 }
 const fn default_retain_turns() -> usize {
 	4
+}
+const fn default_working_memory_limit() -> usize {
+	1000
+}
+const fn default_working_memory_ttl_hours() -> u64 {
+	24
 }
 const fn default_recall_limit() -> usize {
 	8
@@ -256,26 +269,28 @@ const fn default_shutdown_timeout_ms() -> u64 {
 impl Default for MnemopiSettings {
 	fn default() -> Self {
 		Self {
-			db_path:                None,
-			bank:                   None,
-			scoping:                BankScoping::PerProject,
-			embedding_variant:      EmbeddingVariant::English,
-			embedding_model:        None,
-			remote_embeddings:      None,
-			auto_recall:            true,
-			auto_retain:            true,
-			polyphonic_recall:      false,
-			enhanced_recall:        false,
-			proactive_linking:      false,
-			retain_every_n_turns:   default_retain_turns(),
-			recall_limit:           default_recall_limit(),
-			recall_context_turns:   default_recall_context_turns(),
-			recall_max_query_chars: default_recall_query_chars(),
-			injection_token_limit:  default_injection_tokens(),
-			llm_mode:               MemoryLlmMode::Smol,
-			remote_llm:             None,
-			debug:                  false,
-			shutdown_timeout_ms:    default_shutdown_timeout_ms(),
+			db_path:                  None,
+			bank:                     None,
+			scoping:                  BankScoping::PerProject,
+			embedding_variant:        EmbeddingVariant::English,
+			embedding_model:          None,
+			remote_embeddings:        None,
+			auto_recall:              true,
+			auto_retain:              true,
+			polyphonic_recall:        false,
+			enhanced_recall:          false,
+			proactive_linking:        false,
+			working_memory_limit:     default_working_memory_limit(),
+			working_memory_ttl_hours: default_working_memory_ttl_hours(),
+			retain_every_n_turns:     default_retain_turns(),
+			recall_limit:             default_recall_limit(),
+			recall_context_turns:     default_recall_context_turns(),
+			recall_max_query_chars:   default_recall_query_chars(),
+			injection_token_limit:    default_injection_tokens(),
+			llm_mode:                 MemoryLlmMode::Smol,
+			remote_llm:               None,
+			debug:                    false,
+			shutdown_timeout_ms:      default_shutdown_timeout_ms(),
 		}
 	}
 }
@@ -283,6 +298,8 @@ impl Default for MnemopiSettings {
 impl MnemopiSettings {
 	/// Applies parity floors and bounded operational ceilings.
 	pub fn normalize(mut self) -> Self {
+		self.working_memory_limit = self.working_memory_limit.min(1_000_000);
+		self.working_memory_ttl_hours = self.working_memory_ttl_hours.clamp(1, 24 * 365 * 10);
 		self.retain_every_n_turns = self.retain_every_n_turns.clamp(1, 10_000);
 		self.recall_limit = self.recall_limit.clamp(1, 50);
 		self.recall_context_turns = self.recall_context_turns.clamp(1, 64);
