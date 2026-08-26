@@ -1,5 +1,6 @@
 //! Typed settings reflection and immutable snapshot primitives.
 
+pub mod browser;
 pub mod io;
 pub mod manager;
 pub mod migrate;
@@ -7,6 +8,7 @@ pub mod schema;
 pub mod snapshot;
 pub mod subscription;
 
+pub use browser::BrowserSettings;
 pub use inventory;
 pub use schema::{
 	Condition, DomainDescriptor, DomainRegistration, DynamicOption, FieldDescriptor, OptionProvider,

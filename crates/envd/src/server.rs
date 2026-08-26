@@ -39,6 +39,7 @@ use omp_proto::{
 	thread::v1 as thread_pb,
 };
 use omp_settings::{
+	BrowserSettings,
 	manager::{SettingsManager, SettingsPaths},
 	snapshot::SettingsSnapshot,
 };
@@ -1828,7 +1829,7 @@ pub struct EnvServer {
 fn execution_settings(
 	data_dir: &Path,
 	project_root: &Path,
-) -> Result<(HostSettings, ShellSettings, AcpSettings), EnvdError> {
+) -> Result<(HostSettings, BrowserSettings, ShellSettings, AcpSettings), EnvdError> {
 	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
@@ -1837,13 +1838,17 @@ fn execution_settings(
 
 fn execution_settings_from_snapshot(
 	snapshot: &SettingsSnapshot,
-) -> Result<(HostSettings, ShellSettings, AcpSettings), EnvdError> {
+) -> Result<(HostSettings, BrowserSettings, ShellSettings, AcpSettings), EnvdError> {
 	let mut host = snapshot
 		.project::<HostSettings>()
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 		.get()
 		.clone();
 	host.mnemopi = host.mnemopi.normalize();
+	let browser = snapshot
+		.project::<BrowserSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let browser = *browser.get();
 	let shell = snapshot
 		.project::<ShellSettings>()
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
@@ -1854,7 +1859,7 @@ fn execution_settings_from_snapshot(
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 		.get()
 		.clone();
-	Ok((host, shell, acp))
+	Ok((host, browser, shell, acp))
 }
 fn mcp_settings(
 	data_dir: &Path,
@@ -2305,7 +2310,7 @@ impl EnvServer {
 			state_dir,
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
-		let (host_settings, shell_settings, acp_settings) =
+		let (host_settings, browser_settings, shell_settings, acp_settings) =
 			execution_settings(state_dir, workspace.root())?;
 		let mcp_settings = mcp_settings(state_dir, workspace.root(), None)?;
 		mcp.start_native_configs(mcp_settings.enable_project_config)
@@ -2351,6 +2356,7 @@ impl EnvServer {
 			ext_hosts.as_ref(),
 			interrupt_grace,
 			&host_settings.tools,
+			&browser_settings,
 			&shell_settings,
 			&acp_settings,
 			acp_exec.clone(),
@@ -2510,7 +2516,7 @@ impl EnvServer {
 			state_dir,
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
-		let (mut host_settings, shell_settings, acp_settings) =
+		let (mut host_settings, browser_settings, shell_settings, acp_settings) =
 			if let Some(snapshot) = settings_snapshot {
 				execution_settings_from_snapshot(snapshot)?
 			} else {
@@ -2563,6 +2569,7 @@ impl EnvServer {
 			ext_hosts.as_ref(),
 			interrupt_grace,
 			&host_settings.tools,
+			&browser_settings,
 			&shell_settings,
 			&acp_settings,
 			acp_exec.clone(),

@@ -325,6 +325,15 @@ impl CommandRoster {
 
 	/// Slash completion entries filtered for the collaboration role.
 	pub fn completions_for(&self, role: CommandRole) -> Vec<omp_tui::Command> {
+		self.completions_for_described(role, |_| None)
+	}
+
+	/// Slash completion entries with a caller-projected live-state description.
+	pub fn completions_for_described(
+		&self,
+		role: CommandRole,
+		describe: impl Fn(&CommandDeclaration) -> Option<Str>,
+	) -> Vec<omp_tui::Command> {
 		use smallvec::SmallVec;
 		self
 			.commands
@@ -332,9 +341,11 @@ impl CommandRoster {
 			.filter(|declaration| role == CommandRole::Owner || declaration.guest_visible)
 			.map(|declaration| {
 				let aliases: SmallVec<&str, 2> = declaration.aliases.iter().map(Str::as_str).collect();
+				let description =
+					describe(declaration).unwrap_or_else(|| declaration.description.clone());
 				let mut command = omp_tui::Command::new(
 					declaration.name.as_str(),
-					declaration.description.as_str(),
+					description.as_str(),
 					&aliases,
 				)
 				.with_icon(completion_icon(declaration));

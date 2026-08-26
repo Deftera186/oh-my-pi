@@ -16,7 +16,7 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Browser lifecycle operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
@@ -108,6 +108,12 @@ pub struct Params {
 	/// Capture the full page rather than the viewport.
 	#[serde(default)]
 	pub full_page: bool,
+	/// Private host-control signal used by `/browser` after persisting a mode
+	/// change. This is intentionally absent from the model-facing schema.
+	#[serde(default)]
+	#[schemars(skip)]
+	#[doc(hidden)]
+	pub restart_for_mode_change: Option<bool>,
 }
 
 /// Browser operation result.
@@ -152,6 +158,8 @@ pub enum Update {}
 pub trait BrowserHost: Send + Sync + 'static {
 	/// Execute one lifecycle operation.
 	async fn execute(&self, params: Params) -> Result<Payload, Fault>;
+	/// Drop live browser surfaces and apply a new headless/windowed mode.
+	async fn restart_for_mode_change(&self, headless: bool) -> Result<(), Fault>;
 }
 
 /// Browser tool routed to one supervised daemon.
@@ -214,6 +222,19 @@ impl Tool for Browser {
 			};
 			if let Err(error) = incoming.interruptable().committed().await {
 				yield commit_event(error);
+				return;
+			}
+			if let Some(headless) = params.restart_for_mode_change {
+				let name = params.name.clone().unwrap_or_else(|| sf!("main"));
+				let result = self.host.restart_for_mode_change(headless).await.map(|()| Payload {
+					action: Action::Close,
+					name,
+					url: None,
+					title: None,
+					result: Some(json!({ "headless": headless })),
+					artifacts: Vec::new(),
+				});
+				yield Ev::Done(ToolTerminal::Done { result, useless: false });
 				return;
 			}
 			yield Ev::Done(ToolTerminal::Done { result: self.host.execute(params).await, useless: false });

@@ -480,7 +480,7 @@ fn panel_for_domain(domain: &str) -> &'static str {
 		"interaction" | "voice" | "collaboration" => "interaction",
 		"agent" | "memory" | "compaction" => "context",
 		"files" | "shell" | "lsp" | "eval" => "files_shell",
-		"tools" | "tasks" | "approvals" => "tools_tasks",
+		"tools" | "tasks" | "approvals" | "browser" => "tools_tasks",
 		"orchestration" | "subagent" => "orchestration",
 		"providers" | "search" => "providers",
 		"extensions" | "mcp" => "extensions",

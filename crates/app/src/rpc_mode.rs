@@ -55,7 +55,10 @@ use omp_rpc::{
 		SubagentMessages,
 	},
 };
-use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_settings::{
+	BrowserSettings,
+	manager::{MutationScope, SettingsManager, SettingsPaths},
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -70,8 +73,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	chat_ui::commands::{
-		CommandFuture, CommandResult, CommandRoster, ConfigCommandHost, ConsumedResult,
-		FlowCommandHost, McpRequest, ModelCommandHost, ParsedFlags, SessionCommandHost,
+		BrowserRequest, CommandFuture, CommandResult, CommandRoster, ConfigCommandHost,
+		ConsumedResult, FlowCommandHost, McpRequest, ModelCommandHost, ParsedFlags,
+		SessionCommandHost,
 		SessionRequest, ShellCommandHost, WorkspaceRequest,
 	},
 	cli::{RpcArgs, turn_id},
@@ -110,7 +114,7 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	let home = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
 	let mut settings_paths = SettingsPaths::discover(&data, Some(&project));
 	settings_paths.overlays.extend(args.config.iter().cloned());
-	let settings_manager = SettingsManager::open(settings_paths).into_diagnostic()?;
+	let settings_manager = Arc::new(SettingsManager::open(settings_paths).into_diagnostic()?);
 	let settings_snapshot = settings_manager.snapshot();
 	let model_settings = settings_snapshot
 		.project::<omp_catalog::settings::ModelSettings>()
@@ -333,6 +337,7 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	let runtime = Arc::new(Runtime {
 		headless: AsyncMutex::new(HeadlessRuntime { session: headless, events: headless_events }),
 		auth,
+		settings_manager,
 		ui_enabled,
 		commands: Mutex::new(rpc_command_roster(
 			&project,
@@ -939,15 +944,16 @@ impl omp_tool::HostToolExecutor for RpcHostToolExecutor {
 }
 
 struct Runtime {
-	headless:       AsyncMutex<HeadlessRuntime>,
-	auth:           AuthManager,
-	ui_enabled:     bool,
-	commands:       Mutex<CommandRoster>,
-	output:         Sender<Value>,
-	host_resources: Arc<HostResourceBroker>,
-	shutdown:       ShutdownCoordinator,
-	negotiated:     Arc<AtomicU8>,
-	state:          Mutex<ServerState>,
+	headless:         AsyncMutex<HeadlessRuntime>,
+	auth:             AuthManager,
+	settings_manager: Arc<SettingsManager>,
+	ui_enabled:       bool,
+	commands:         Mutex<CommandRoster>,
+	output:           Sender<Value>,
+	host_resources:   Arc<HostResourceBroker>,
+	shutdown:         ShutdownCoordinator,
+	negotiated:       Arc<AtomicU8>,
+	state:            Mutex<ServerState>,
 }
 
 impl Runtime {
@@ -3388,6 +3394,44 @@ impl ConfigCommandHost for RpcCommandHost {
 }
 
 impl FlowCommandHost for RpcCommandHost {
+	fn browser(&mut self, request: BrowserRequest) -> CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			let settings = runtime
+				.settings_manager
+				.snapshot()
+				.project::<BrowserSettings>()
+				.into_diagnostic()?;
+			if !settings.get().enabled {
+				return command_status("Browser tool is disabled (enable in settings).").await;
+			}
+			let next = match request {
+				BrowserRequest::Toggle => !settings.get().headless,
+				BrowserRequest::Headless => true,
+				BrowserRequest::Visible => false,
+			};
+			runtime
+				.settings_manager
+				.set(
+					MutationScope::Project,
+					"browser.headless",
+					if next { "true" } else { "false" },
+				)
+				.await
+				.into_diagnostic()?;
+			let registry = runtime.headless.lock().await.session.tool_registry();
+			let mode = if next { "headless" } else { "visible" };
+			let status =
+				match crate::chat_ui::commands::browser::restart_for_mode_change(&registry, next)
+					.await
+				{
+					Ok(()) => sf!("Browser mode: {mode}"),
+					Err(error) => sf!("Browser mode set to {mode}, but restart failed: {error}"),
+				};
+			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+		})
+	}
+
 	fn context(&mut self) -> CommandFuture<'_> {
 		let value = self
 			.runtime

@@ -2,6 +2,7 @@
 
 mod advisor;
 pub(super) mod asides;
+pub(crate) mod browser;
 pub(crate) mod collab;
 mod config;
 mod diagnostics;
@@ -54,7 +55,10 @@ pub enum SessionRequest {
 	/// Show durable session information.
 	Info,
 	/// Delete through the guarded session authority.
-	Delete,
+	Delete {
+		/// Skip the 30-second re-run confirmation window (`/drop`).
+		force: bool,
+	},
 	/// Toggle one durable session's resume-list pin.
 	Pin(Option<Str>),
 }
@@ -125,6 +129,16 @@ pub enum VisionRequest {
 	Auto,
 	/// Show effective image-tool exposure.
 	Status,
+}
+/// Parsed browser surface-mode operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserRequest {
+	/// Invert the current headless setting.
+	Toggle,
+	/// Use an offscreen frame surface.
+	Headless,
+	/// Use an engine-owned visible window.
+	Visible,
 }
 
 /// Parsed utility command operation.
@@ -439,6 +453,11 @@ pub trait FlowCommandHost {
 	fn omfg(&mut self, instruction: Str) -> CommandFuture<'_>;
 	/// Start or stop realtime voice.
 	fn live(&mut self, args: Str) -> CommandFuture<'_>;
+	/// Persist browser mode and restart live surfaces so it takes effect.
+	fn browser(&mut self, request: BrowserRequest) -> CommandFuture<'_> {
+		let _ = request;
+		Box::pin(async { Err(miette::miette!("browser mode control is unavailable")) })
+	}
 	/// Control the synthetic advisor watchdog.
 	fn advisor(&mut self, request: AdvisorRequest) -> CommandFuture<'_> {
 		let _ = request;
@@ -576,7 +595,7 @@ pub(super) fn declaration(
 	aliases: &'static [&'static str],
 	description: &'static str,
 	argument_hint: &'static str,
-	candidates: &'static [&'static str],
+	candidates: &'static [(&'static str, &'static str)],
 	capabilities: &'static [CommandCapability],
 	guest_visible: bool,
 	handler: CommandHandler,
@@ -591,9 +610,9 @@ pub(super) fn declaration(
 		hints: candidates
 			.iter()
 			.copied()
-			.map(|value| ArgumentHint {
-				value:       Str::new(value),
-				description: Str::new_static(""),
+			.map(|(value, description)| ArgumentHint {
+				value: Str::new_static(value),
+				description: Str::new_static(description),
 			})
 			.collect(),
 		capabilities: Arc::from(capabilities),
@@ -669,7 +688,7 @@ macro_rules! command_icon {
 
 macro_rules! command_common {
 	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
-	 $hint:literal, [$($candidate:literal),* $(,)?], [$($capability:ident),* $(,)?], $guest:literal,
+	 $hint:literal, [$(($candidate:literal, $candidate_description:literal)),* $(,)?], [$($capability:ident),* $(,)?], $guest:literal,
 		$parse:expr, |$host:ident, $args:ident| $body:expr) => {
 		mod $module {
 			#[allow(unused_imports, reason = "commands reference file-scope parsers and types")]
@@ -693,7 +712,7 @@ macro_rules! command_common {
 					&[$($alias),*],
 					$description,
 					$hint,
-					&[$($candidate),*],
+					&[$(($candidate, $candidate_description)),*],
 					&[$($crate::chat_ui::commands::CommandCapability::$capability),*],
 					$guest,
 					handle,
@@ -738,19 +757,24 @@ macro_rules! command {
 	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, raw($hint:literal, [$($candidate:literal),* $(,)?]) => |$host:ident, $arg:ident| $body:expr) => {
 		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
-			[$($candidate),*], [$($capability),*], $guest,
+			[$(($candidate, "")),*], [$($capability),*], $guest,
 			$crate::chat_ui::commands::parse_raw, |$host, $arg| $body);
 	};
 	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, flags($hint:literal, [$($candidate:literal),* $(,)?]) => |$host:ident, $arg:ident| $body:expr) => {
 		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
-			[$($candidate),*], [$($capability),*], $guest,
+			[$(($candidate, "")),*], [$($capability),*], $guest,
 			$crate::chat_ui::commands::parse_flags, |$host, $arg| $body);
+	};
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
+	 [$($capability:ident),* $(,)?], $guest:literal, typed($hint:literal, [$(($candidate:literal, $candidate_description:literal)),* $(,)?], $parse:path) => |$host:ident, $arg:ident| $body:expr) => {
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
+			[$(($candidate, $candidate_description)),*], [$($capability),*], $guest, $parse, |$host, $arg| $body);
 	};
 	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, typed($hint:literal, [$($candidate:literal),* $(,)?], $parse:path) => |$host:ident, $arg:ident| $body:expr) => {
 		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
-			[$($candidate),*], [$($capability),*], $guest, $parse, |$host, $arg| $body);
+			[$(($candidate, "")),*], [$($capability),*], $guest, $parse, |$host, $arg| $body);
 	};
 }
 

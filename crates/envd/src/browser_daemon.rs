@@ -5,9 +5,10 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration
 use async_trait::async_trait;
 use flume::Receiver;
 use omp_core::{ArtifactUrl, Str, sf};
+use omp_settings::BrowserSettings;
 use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload, RunOperation};
 use omp_webview::{
-	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder,
+	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig,
 	automation::{ExtractFormat, ObserveOptions, Selector},
 };
 use serde_json::{Value, json};
@@ -17,9 +18,15 @@ use crate::blobs::{BlobError, BlobHost};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 
-struct Request {
-	params: Params,
-	reply:  flume::Sender<Result<Payload, Fault>>,
+enum Request {
+	Execute {
+		params: Params,
+		reply:  flume::Sender<Result<Payload, Fault>>,
+	},
+	Restart {
+		headless: bool,
+		reply:    flume::Sender<Result<(), Fault>>,
+	},
 }
 
 /// Process-local browser supervisor. One actor owns every non-`Send` webview
@@ -29,12 +36,13 @@ pub(crate) struct BrowserDaemon {
 }
 
 impl BrowserDaemon {
-	/// Starts one daemon actor with content-addressed artifact storage.
-	pub(crate) fn start(blobs: BlobHost) -> Arc<Self> {
+	/// Starts one daemon actor with content-addressed artifact storage and its
+	/// initial typed surface-mode projection.
+	pub(crate) fn start(blobs: BlobHost, settings: BrowserSettings) -> Arc<Self> {
 		let (requests, receiver) = flume::unbounded::<Request>();
 		thread::Builder::new()
 			.name("omp-browser-daemon".to_owned())
-			.spawn(move || run(receiver, blobs))
+			.spawn(move || run(receiver, blobs, settings.headless))
 			.expect("browser daemon actor starts");
 		Arc::new(Self { requests })
 	}
@@ -46,29 +54,49 @@ impl BrowserHost for BrowserDaemon {
 		let (reply, response) = flume::bounded(1);
 		self
 			.requests
-			.send_async(Request { params, reply })
+			.send_async(Request::Execute { params, reply })
+			.await
+			.map_err(|_| daemon_closed())?;
+		response.recv_async().await.map_err(|_| daemon_closed())?
+	}
+
+	async fn restart_for_mode_change(&self, headless: bool) -> Result<(), Fault> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.requests
+			.send_async(Request::Restart { headless, reply })
 			.await
 			.map_err(|_| daemon_closed())?;
 		response.recv_async().await.map_err(|_| daemon_closed())?
 	}
 }
 
-fn run(receiver: Receiver<Request>, blobs: BlobHost) {
+fn run(receiver: Receiver<Request>, blobs: BlobHost, mut headless: bool) {
 	let mut tabs = HashMap::<Str, WebView>::new();
 	while let Ok(request) = receiver.recv() {
-		let result = execute(&mut tabs, &blobs, request.params);
-		let _ = request.reply.send(result);
+		match request {
+			Request::Execute { params, reply } => {
+				let result = execute(&mut tabs, &blobs, headless, params);
+				let _ = reply.send(result);
+			},
+			Request::Restart { headless: next, reply } => {
+				tabs.clear();
+				headless = next;
+				let _ = reply.send(Ok(()));
+			},
+		}
 	}
 }
 
 fn execute(
 	tabs: &mut HashMap<Str, WebView>,
 	blobs: &BlobHost,
+	headless: bool,
 	params: Params,
 ) -> Result<Payload, Fault> {
 	let name = params.name.clone().unwrap_or_else(|| sf!("main"));
 	match params.action {
-		Action::Open => open(tabs, name, params),
+		Action::Open => open(tabs, name, headless, params),
 		Action::Close => {
 			if params.all {
 				tabs.clear();
@@ -88,19 +116,38 @@ fn execute(
 	}
 }
 
-fn open(tabs: &mut HashMap<Str, WebView>, name: Str, params: Params) -> Result<Payload, Fault> {
-	let engine = Engine::find(SurfaceKind::Frames).map_err(webview_fault)?;
+fn open(
+	tabs: &mut HashMap<Str, WebView>,
+	name: Str,
+	headless: bool,
+	params: Params,
+) -> Result<Payload, Fault> {
+	let surface = if headless {
+		SurfaceKind::Frames
+	} else {
+		SurfaceKind::Window
+	};
+	let engine = Engine::find(surface).map_err(webview_fault)?;
 	let mut builder = WebViewBuilder::new(engine).incognito(true);
 	if let Some(url) = params.url.as_ref() {
 		builder = builder.url(url.clone());
 	}
-	let config = FrameConfig {
-		width: params.width.unwrap_or(1280).clamp(320, 4096),
-		height: params.height.unwrap_or(800).clamp(240, 4096),
-		scale: params.scale.unwrap_or(1.0).clamp(0.5, 4.0),
-		..FrameConfig::default()
+	let width = params.width.unwrap_or(1280).clamp(320, 4096);
+	let height = params.height.unwrap_or(800).clamp(240, 4096);
+	let view = if headless {
+		builder
+			.build_frames(FrameConfig {
+				width,
+				height,
+				scale: params.scale.unwrap_or(1.0).clamp(0.5, 4.0),
+				..FrameConfig::default()
+			})
+			.map_err(webview_fault)?
+	} else {
+		builder
+			.build_window(WindowConfig { width, height })
+			.map_err(webview_fault)?
 	};
-	let view = builder.build_frames(config).map_err(webview_fault)?;
 	let timeout = timeout(&params);
 	view
 		.automation()

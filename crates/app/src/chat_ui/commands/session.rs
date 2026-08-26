@@ -8,6 +8,9 @@ command!(help, 10, "help", icon: Keyboard, ["hotkeys"], "Show commands and keybo
 command!(new_session, 20, "new", icon: Add, [], "Start a new session", [Session], false, none => |host| host.new_session());
 command!(clear, 30, "clear", icon: Broom, [], "Clear context inside this session", [Session], false, none => |host| host.clear());
 command!(fresh, 40, "fresh", icon: Refresh, [], "Reset provider affinity for the next turn", [Session], false, none => |host| host.fresh());
+command!(drop_session, 45, "drop", icon: Trash, [], "Delete the current session and start a new one", [Session, Owner], false, none => |host| async move {
+	host.session(SessionRequest::Delete { force: true }).await
+});
 command!(rename, 50, "rename", icon: Pencil, [], "Rename this session", [Session], false, required("<title>") => |host, title| host.rename(title));
 command!(retry, 60, "retry", icon: Redo, [], "Retry the previous user turn", [Session, Execution], false, none => |host| host.retry());
 command!(resume, 70, "resume", icon: History, [], "Resume a native session", [Session], false, selector("[session]") => |host, selector| host.resume(selector));
@@ -38,7 +41,7 @@ fn parse_session(args: &str) -> miette::Result<SessionRequest> {
 	let mut words = args.split_whitespace();
 	match (words.next(), words.next(), words.next()) {
 		(Some("info"), None, None) => Ok(SessionRequest::Info),
-		(Some("delete"), None, None) => Ok(SessionRequest::Delete),
+		(Some("delete"), None, None) => Ok(SessionRequest::Delete { force: false }),
 		(Some("pin"), None, None) => Ok(SessionRequest::Pin(None)),
 		(Some("pin"), Some(session), None) => Ok(SessionRequest::Pin(Some(Str::new(session)))),
 		_ => Err(miette::miette!("usage: /session info|delete|pin [session id]")),

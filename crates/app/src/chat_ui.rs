@@ -128,6 +128,7 @@ use omp_driver::{
 use omp_envd::github_url::GithubCredentialBridge;
 use omp_proto::inference::{v1, v1::Effort};
 use omp_settings::{
+	BrowserSettings,
 	manager::{MutationScope, SettingsManager},
 	subscription::DomainSubscription,
 };
@@ -1640,6 +1641,7 @@ fn command_role(collab: Option<&CollabCommandHandle>) -> CommandRole {
 struct ChatSceneSeed {
 	typed_commands:   commands::CommandRoster,
 	command_usage:    Arc<CommandUsage>,
+	browser_settings: BrowserSettings,
 	skills:           Arc<omp_driver::skills::SkillSnapshot>,
 	role:             CommandRole,
 	workspace_root:   PathBuf,
@@ -1699,6 +1701,26 @@ fn load_input_actions(data_dir: &Path) -> miette::Result<Vec<InputBinding>> {
 		.collect())
 }
 
+fn current_browser_settings(manager: &SettingsManager) -> BrowserSettings {
+	let settings = manager
+		.snapshot()
+		.project::<BrowserSettings>()
+		.expect("settings manager holds a validated browser projection");
+	*settings.get()
+}
+
+fn command_completions(
+	roster: &commands::CommandRoster,
+	role: CommandRole,
+	settings: &BrowserSettings,
+) -> Vec<Command> {
+	roster.completions_for_described(role, |declaration| {
+		(declaration.name.as_str() == "browser").then(|| {
+			Str::new_static(commands::browser::autocomplete_description(settings))
+		})
+	})
+}
+
 fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 	let mut chat = Chat::new(ctx);
 	let accent_keywords: Arc<[Str]> = omp_agent::prompt_assets::PROMPT_KEYWORDS
@@ -1706,7 +1728,8 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 		.map(|keyword| Str::from(keyword.text))
 		.collect();
 	chat.set_keyword_accent(KeywordAccent::from_shared(accent_keywords));
-	let mut commands = seed.typed_commands.completions_for(seed.role);
+	let mut commands =
+		command_completions(&seed.typed_commands, seed.role, &seed.browser_settings);
 	commands.extend(seed.skills.all().iter().map(|skill| {
 		let name = format!("skill:{}", skill.name);
 		Command::new(&name, skill.description.as_str(), &[]).with_icon(Icon::Skill)
@@ -2158,6 +2181,7 @@ where
 	let chat_seed = ChatSceneSeed {
 		typed_commands: chat_commands,
 		command_usage,
+		browser_settings: current_browser_settings(settings_manager.as_ref()),
 		skills,
 		role: initial_command_role,
 		workspace_root,
@@ -3984,7 +4008,7 @@ where
 				);
 				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
 			},
-			SessionRequest::Delete => {
+			SessionRequest::Delete { force } => {
 				if chat_active(self.state.submit_pending, self.bus.phase()) {
 					return Box::pin(async {
 						Ok(CommandResult::Consumed(ConsumedResult::status(
@@ -4003,7 +4027,8 @@ where
 					});
 				}
 				let now = Instant::now();
-				if self
+				if !force
+					&& self
 					.state
 					.pending_session_delete
 					.is_none_or(|started| now.duration_since(started) > Duration::from_secs(30))
@@ -5435,6 +5460,57 @@ where
 		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(result))) })
 	}
 
+	fn browser(&mut self, request: commands::BrowserRequest) -> CommandFuture<'_> {
+		let settings = match self
+			.settings_manager
+			.snapshot()
+			.project::<BrowserSettings>()
+		{
+			Ok(settings) => *settings.get(),
+			Err(error) => {
+				return Box::pin(async move { Err(miette::miette!("{error}")) });
+			},
+		};
+		if !settings.enabled {
+			return Box::pin(async {
+				Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Browser tool is disabled (enable in settings)",
+				)))
+			});
+		}
+		let next = match request {
+			commands::BrowserRequest::Toggle => !settings.headless,
+			commands::BrowserRequest::Headless => true,
+			commands::BrowserRequest::Visible => false,
+		};
+		if let Err(error) = self.settings_manager.set_sync(
+			MutationScope::Project,
+			"browser.headless",
+			if next { "true" } else { "false" },
+		) {
+			return Box::pin(async move { Err(miette::miette!("{error}")) });
+		}
+		let backend = self.backend;
+		let registry = self.registry;
+		let roster = self.roster.clone();
+		let role = command_role(self.state.collab.as_ref());
+		let projected = BrowserSettings { enabled: true, headless: next };
+		Box::pin(async move {
+			send_backend(
+				backend,
+				BackendEvent::SlashCommands(command_completions(&roster, role, &projected)),
+			);
+			let mode = if next { "headless" } else { "visible" };
+			let status = match commands::browser::restart_for_mode_change(registry, next).await {
+				Ok(()) => sf!("Browser mode: {mode}"),
+				Err(error) => {
+					sf!("Browser mode set to {mode}, but restart failed: {error}")
+				},
+			};
+			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+		})
+	}
+
 	fn utility(&mut self, request: commands::UtilityRequest) -> CommandFuture<'_> {
 		let request = match request {
 			commands::UtilityRequest::Changelog(request) => {
@@ -5513,6 +5589,7 @@ where
 		};
 		let backend = self.backend;
 		let roster = self.roster.clone();
+		let browser_settings = current_browser_settings(self.settings_manager);
 		let command = match commands::collab::owner_command(request, &self.state.settings.collab) {
 			Ok(command) => command,
 			Err(error) => return Box::pin(async move { Err(error) }),
@@ -5521,7 +5598,11 @@ where
 			let result = handle.request(command).await.into_diagnostic()?;
 			send_backend(
 				backend,
-				BackendEvent::SlashCommands(roster.completions_for(command_role(Some(&handle)))),
+				BackendEvent::SlashCommands(command_completions(
+					&roster,
+					command_role(Some(&handle)),
+					&browser_settings,
+				)),
 			);
 			Ok(CommandResult::Consumed(ConsumedResult::status(commands::collab::render(result))))
 		})
@@ -5533,6 +5614,7 @@ where
 		};
 		let backend = self.backend;
 		let roster = self.roster.clone();
+		let browser_settings = current_browser_settings(self.settings_manager);
 		let command = match commands::collab::join_command(&link, &self.state.settings.collab) {
 			Ok(command) => command,
 			Err(error) => return Box::pin(async move { Err(error) }),
@@ -5541,7 +5623,11 @@ where
 			let result = handle.request(command).await.into_diagnostic()?;
 			send_backend(
 				backend,
-				BackendEvent::SlashCommands(roster.completions_for(command_role(Some(&handle)))),
+				BackendEvent::SlashCommands(command_completions(
+					&roster,
+					command_role(Some(&handle)),
+					&browser_settings,
+				)),
 			);
 			Ok(CommandResult::Consumed(ConsumedResult::status(commands::collab::render(result))))
 		})
@@ -5553,6 +5639,7 @@ where
 		};
 		let backend = self.backend;
 		let roster = self.roster.clone();
+		let browser_settings = current_browser_settings(self.settings_manager);
 		Box::pin(async move {
 			let result = handle
 				.request(CollabOwnerCommand::Leave)
@@ -5560,7 +5647,11 @@ where
 				.into_diagnostic()?;
 			send_backend(
 				backend,
-				BackendEvent::SlashCommands(roster.completions_for(command_role(Some(&handle)))),
+				BackendEvent::SlashCommands(command_completions(
+					&roster,
+					command_role(Some(&handle)),
+					&browser_settings,
+				)),
 			);
 			Ok(CommandResult::Consumed(ConsumedResult::status(commands::collab::render(result))))
 		})
@@ -5724,9 +5815,12 @@ where
 						state.skills = content.skills;
 						state.extension_declarations = content.declarations;
 						state.extension_generation = state.extension_generation.wrapping_add(1).max(1);
-						let mut completions = state
-							.typed_commands
-							.completions_for(command_role(state.collab.as_ref()));
+						let browser_settings = current_browser_settings(settings_manager);
+						let mut completions = command_completions(
+							&state.typed_commands,
+							command_role(state.collab.as_ref()),
+							&browser_settings,
+						);
 						completions.extend(state.skills.all().iter().map(|skill| {
 							let name = format!("skill:{}", skill.name);
 							Command::new(&name, skill.description.as_str(), &[]).with_icon(Icon::Skill)
@@ -5855,13 +5949,13 @@ where
 					runtime.clear().into_diagnostic()?;
 					serde_json::json!({"reset": true, "generation": runtime.generation()})
 				},
-				"enqueue" => {
+				"enqueue" | "rebuild" => {
 					let promoted = runtime.enqueue().into_diagnostic()?;
 					serde_json::json!({"promoted": promoted, "generation": runtime.generation()})
 				},
 				_ => {
 					return Err(miette::miette!(
-						"usage: /memory view|stats|diagnose|clear|reset|enqueue",
+						"usage: /memory view|stats|diagnose|clear|reset|enqueue|rebuild",
 					));
 				},
 			};

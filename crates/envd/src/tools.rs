@@ -35,7 +35,10 @@ use omp_proto::{
 		GrammarSyntax as WorkerGrammarSyntax, PreludeParamKind, ToolDecl, tool_constraint,
 	},
 };
-use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_settings::{
+	BrowserSettings,
+	manager::{SettingsManager, SettingsPaths},
+};
 use omp_storage::{github_cache::GithubCache, telemetry_index::TelemetryIndex};
 use omp_tool::{
 	AvailabilityDelta, Claims, Constraint, GrammarSyntax, LeafOwner, LeafReplacementError,
@@ -1776,6 +1779,7 @@ pub(crate) fn production_registry<
 	workers: &ExtHostSupervisor,
 	interrupt_grace: Duration,
 	tool_settings: &ToolSettings,
+	browser_settings: &BrowserSettings,
 	shell_settings: &ShellSettings,
 	acp_settings: &AcpSettings,
 	acp_exec: AcpExecSlot,
@@ -1877,12 +1881,14 @@ pub(crate) fn production_registry<
 		factory.register(&mut registry)?;
 	}
 	let search_bridge = Arc::new(SearchBridgeHost::new(search));
-	let browser_daemon = BrowserDaemon::start(blobs.clone());
-	registry.register(
-		omp_tools::browser::tool(browser_daemon),
-		Presentation::Device,
-		builtin_device_claims(),
-	)?;
+	if browser_settings.enabled && tool_settings.enabled("browser") {
+		let browser_daemon = BrowserDaemon::start(blobs.clone(), *browser_settings);
+		registry.register(
+			omp_tools::browser::tool(browser_daemon),
+			Presentation::Device,
+			builtin_device_claims(),
+		)?;
+	}
 	let computer = ComputerSessionHost::new(blobs.clone());
 	registry.register(
 		omp_tools::computer::tool(computer),
