@@ -15,7 +15,7 @@ use std::{
 };
 
 use omp_catalog::snapshot;
-use omp_core::{SecretString, Str, sf};
+use omp_core::{Hash32, SecretString, Str, sf};
 use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
 use omp_inference::auth::FallbackKeySource;
@@ -590,7 +590,7 @@ async fn production_assembly_for_session(
 		refresh,
 	)?
 	.with_affinity_resolver(CredentialAffinityResolver::new(
-		*blake3::hash(placeholder_affinity_key().as_bytes()).as_bytes(),
+		Hash32::sum(placeholder_affinity_key().as_bytes()).into_bytes(),
 	));
 	let exposed_auth_manager = auth_manager.clone();
 	usage_fetchers.install_builtins([

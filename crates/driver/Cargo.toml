@@ -21,7 +21,6 @@ local-tts = ["local", "omp-inference/local-tts"]
 [dependencies]
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-blake3 = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 flume = { workspace = true }

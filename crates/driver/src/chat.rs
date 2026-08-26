@@ -4700,7 +4700,7 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 				.then(|| omp_core::hex::encode(&merged.artifact_hash).into_string());
 			let artifact_uri = artifact_hash
 				.as_deref()
-				.map(|hash| sf!("artifact://b3/{}", hash));
+				.map(|hash| sf!("artifact://sha256/{}", hash));
 			let conflict_count = conflicts.len();
 			let conflict_facts = conflicts
 				.iter()

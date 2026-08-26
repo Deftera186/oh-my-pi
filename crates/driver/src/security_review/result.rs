@@ -171,7 +171,7 @@ pub fn validate_and_retain(
 		output,
 		report,
 		agent_uri,
-		artifact_uri: sf!("artifact://b3/{}", reference.to_hex()),
+		artifact_uri: sf!("artifact://sha256/{}", reference.to_hex()),
 	})
 }
 
