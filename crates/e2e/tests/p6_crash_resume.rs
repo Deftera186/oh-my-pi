@@ -47,7 +47,7 @@ use omp_app::{
 	endpoint::LocalEndpoint,
 };
 use omp_catalog::{
-	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
+	ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
 use omp_core::{Str, sf};
@@ -74,7 +74,10 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1::{self as thread, item},
 };
-use omp_storage::transcript::{self, AmendPatch, Entry, Header, Kind, SessionId};
+use omp_storage::{
+	index::{NewSession, SessionIndex, SessionKind},
+	transcript::{self, AmendPatch, Entry, Header, Kind, SessionId},
+};
 use omp_tool::{
 	Abort, CallOutcome, CapsBase, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams,
 	ModelClass, Part as ToolPart, Precedence, Presentation, PromptCaps, Registry, Rev,
@@ -324,9 +327,7 @@ async fn rpc_host(
 	root: &Path,
 	first: bool,
 ) -> (DaemonHandle, RpcTurnClient, String, Receiver<WorkflowResponse>) {
-	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
-			.expect("normalized catalog");
+	let mut compiled = Catalog::embedded().compiled().clone();
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
 			operations:        OperationBits::empty(),
@@ -554,17 +555,34 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	fs::set_permissions(scratch.state(), fs::Permissions::from_mode(0o700))
 		.expect("secure binary-resume daemon state");
 	let journal_path = sessions.join(format!("{BINARY_SESSION}.jsonl"));
-	let mut initial = Journal::create(&journal_path, &Header {
-		v:       4,
-		id:      SessionId(Str::from(BINARY_SESSION)),
-		created: 1,
-		cwd:     project.clone(),
-	})
-	.expect("create resumable binary journal");
-	initial
-		.append_title(1, sf!("binary resume"), transcript::TitleSource::System)
-		.expect("materialize resumable binary journal");
-	drop(initial);
+	let session_id = SessionId(Str::from(BINARY_SESSION));
+	let session_index =
+		Arc::new(SessionIndex::open(sessions.join("sessions.sqlite3")).expect("session index"));
+	let project_text = project.to_string_lossy();
+	let request = NewSession {
+		id:         &session_id,
+		cwd:        project_text.as_ref(),
+		project:    project_text.as_ref(),
+		created_ms: 1,
+		kind:       SessionKind::Interactive,
+		parent:     None,
+		remote:     false,
+	};
+	session_index
+		.create_session(&request, || {
+			let header = Header {
+				v:       4,
+				id:      session_id.clone(),
+				created: 1,
+				cwd:     project.clone(),
+			};
+			let mut bytes = serde_json::to_vec(&header).map_err(io::Error::other)?;
+			bytes.push(b'\n');
+			fs::write(&journal_path, &bytes)?;
+			Ok::<_, io::Error>(((), 0))
+		})
+		.expect("create indexed resumable binary journal");
+	drop(session_index);
 	fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o644))
 		.expect("use standard binary journal permissions");
 
@@ -590,7 +608,22 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 	first_ui.wait_text("idle", Duration::from_secs(10));
 	first_ui.keys("'exercise binary resume' enter");
 	first_ui.wait_text("exercise binary resume", Duration::from_secs(10));
-	let pending_turn = wait_pending_turn(&journal_path, Duration::from_secs(10)).await;
+	let pending_turn = match wait_pending_turn(&journal_path, Duration::from_secs(10)).await {
+		Some(turn) => turn,
+		None => {
+			let screen = first_ui.request(json!({ "op": "text" }));
+			let envd_log = fs::read_to_string(state_dir.join("envd.log")).unwrap_or_default();
+			let journal = fs::read_to_string(&journal_path).unwrap_or_default();
+			let indexed = SessionIndex::open(sessions.join("sessions.sqlite3"))
+				.and_then(|index| index.get(&SessionId(Str::from(BINARY_SESSION))));
+			let journal_len = fs::metadata(&journal_path).map(|metadata| metadata.len());
+			panic!(
+				"binary chat did not durably start a turn\nscreen: \
+				 {screen}\nenvd:\n{envd_log}\nindex: {indexed:?}\njournal_len: \
+				 {journal_len:?}\njournal:\n{journal}"
+			);
+		},
+	};
 	if let Err(error) = gateway.wait_response_gated(Duration::from_secs(30)).await {
 		let screen = first_ui.request(json!({ "op": "text" }));
 		let envd_log = fs::read_to_string(state_dir.join("envd.log")).unwrap_or_default();
@@ -627,6 +660,7 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 		ChatDebug::connect(&second_debug, Instant::now() + Duration::from_secs(30), &mut second);
 	second_ui.wait_text("binary resume outcome", Duration::from_secs(30));
 	second_ui.request(json!({ "op": "quit" }));
+	second_ui.request(json!({ "op": "quit" }));
 	drop(second_ui);
 	let status = second.wait(Duration::from_secs(15));
 
@@ -638,25 +672,25 @@ async fn real_chat_resume_replays_pending_turn_through_cli_startup() {
 fn binary_gateway_tools() -> Arc<Registry> {
 	let mut registry = Registry::new();
 	for name in [
-		"read",
-		"edit",
-		"bash",
-		"grep",
-		"glob",
-		"write",
-		"eval",
-		"todo",
-		"ask",
-		"fetch",
-		"think",
-		"yield",
 		"checkpoint",
 		"rewind",
+		"ask",
+		"ast_edit",
+		"ast_grep",
+		"bash",
+		"debug",
+		"edit",
+		"eval",
+		"fetch",
+		"glob",
+		"grep",
 		"hub",
-		"image_gen",
-		"tts",
-		"report_issue",
-		"vibe",
+		"lsp",
+		"think",
+		"todo",
+		"web_search",
+		"write",
+		"read",
 	] {
 		registry
 			.register_worker(
@@ -691,7 +725,7 @@ fn chat_resume_args(gateway: &ScriptedGateway, project: &Path) -> Vec<String> {
 	]
 }
 
-async fn wait_pending_turn(path: &Path, limit: Duration) -> String {
+async fn wait_pending_turn(path: &Path, limit: Duration) -> Option<String> {
 	let deadline = Instant::now() + limit;
 	loop {
 		if let Ok(log) = transcript::load(path) {
@@ -699,11 +733,13 @@ async fn wait_pending_turn(path: &Path, limit: Duration) -> String {
 				if let Some(Entry::Ok(event)) = log.get(index)
 					&& let Kind::TurnStart(start) = &event.kind
 				{
-					return start.turn_id.to_string();
+					return Some(start.turn_id.to_string());
 				}
 			}
 		}
-		assert!(Instant::now() < deadline, "binary chat did not durably start a turn");
+		if Instant::now() >= deadline {
+			return None;
+		}
 		time::sleep(Duration::from_millis(10)).await;
 	}
 }

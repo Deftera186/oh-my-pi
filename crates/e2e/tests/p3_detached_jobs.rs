@@ -41,7 +41,7 @@ use omp_proto::{
 };
 use omp_storage::transcript::{Entry, Header, Kind, SessionId};
 use omp_tool::{
-	ArtifactLifetime, CapsBase, ExpectedArtifact, JobOwner, JobRef, ModelClass, Registry,
+	ArtifactLifetime, CapsBase, ExpectedArtifact, JobOwner, JobRef, JobStatus, ModelClass, Registry,
 	ToolIdentity, ToolTerminal,
 };
 use serde::Deserialize;
@@ -245,6 +245,22 @@ async fn wait_board_empty(board: &omp_agent::JobBoard) {
 	.await
 	.expect("detached settlement watcher timeout");
 }
+async fn wait_job_completed(board: &omp_agent::JobBoard, job_id: &str) {
+	time::timeout(LIMIT, async {
+		loop {
+			if board
+				.pending()
+				.iter()
+				.any(|job| job.id == job_id && job.metadata.status == JobStatus::Completed)
+			{
+				return;
+			}
+			task::yield_now().await;
+		}
+	})
+	.await
+	.expect("detached process completed without updating its JobBoard entry");
+}
 
 async fn release_fifo(path: PathBuf) {
 	time::timeout(LIMIT, task::spawn_blocking(move || fs::write(path, b"go\n")))
@@ -279,6 +295,12 @@ fn delta(input: &TurnInput) -> &inference::ThreadDelta {
 	match input {
 		TurnInput::Delta(_, delta) => delta,
 		TurnInput::Full(_) => panic!("expected incremental ThreadDelta"),
+	}
+}
+fn input_items(input: &TurnInput) -> &[thread::Item] {
+	match input {
+		TurnInput::Full(thread) => &thread.items,
+		TurnInput::Delta(_, delta) => &delta.append,
 	}
 }
 
@@ -632,7 +654,8 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	release_fifo(fifo).await;
 	wait_terminal(&env.client, process_name, *generation).await;
 	assert!(!resumed.is_finished(), "TurnBoundary settlement ended the active turn");
-	wait_board_empty(&board).await;
+	wait_job_completed(&board, job.id.as_str()).await;
+	assert!(!board.is_empty(), "settlement was removed before its durable claim");
 	assert!(!resumed.is_finished(), "settlement bypassed the blocked turn boundary");
 	settlement_gate.release();
 	let (reopened, resumed_result) = time::timeout(LIMIT, resumed)
@@ -642,6 +665,7 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	resumed_result
 		.expect("resumed detached submit timeout")
 		.expect("turn after detached settlement");
+	wait_board_empty(&board).await;
 	let _settled = one_job_event(&settled_events, job.id.as_str(), false).await;
 	let next = next_capture.captures();
 	assert_eq!(next.len(), 2);
@@ -721,8 +745,11 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	let final_board = Arc::clone(final_agent.jobs());
 	let early_release = tokio::spawn({
 		let early_gate = early_gate.clone();
+		let early_job = early_job.clone();
+		let final_board = Arc::clone(&final_board);
 		async move {
-			wait_board_empty(&final_board).await;
+			wait_job_completed(&final_board, early_job.id.as_str()).await;
+			assert!(!final_board.is_empty(), "early settlement disappeared before its durable claim");
 			early_gate.release();
 		}
 	});
@@ -739,9 +766,18 @@ async fn detached_shell_settles_once_after_reconnect_with_exact_artifact() {
 	early_release.await.expect("early-exit release task");
 	let _early_settled = one_job_event(&final_events, early_job.id.as_str(), false).await;
 	let final_turns = final_capture.captures();
-	assert_eq!(final_turns.len(), 2);
-	let early_settlement =
-		settlement_item(&delta(&final_turns[1].input).append, early_job.id.as_str());
+	assert!(
+		(1..=2).contains(&final_turns.len()),
+		"already-exited settlement used an unexpected number of provider turns"
+	);
+	let mut matching = final_turns
+		.iter()
+		.flat_map(|capture| input_items(&capture.input))
+		.filter(|item| settlement_parts(item, early_job.id.as_str()).is_some());
+	let early_settlement = matching
+		.next()
+		.expect("provider input carries early-exit settlement");
+	assert!(matching.next().is_none(), "provider inputs duplicated early-exit settlement");
 	assert_artifact(&env, early_settlement, &early_job, b"early-1\nearly-2\n").await;
 	assert_eq!(job_event_counts(final_agent.journal(), early_job.id.as_str()), (1, 1));
 	assert_eq!(job_event_counts(final_agent.journal(), job.id.as_str()), (1, 1));

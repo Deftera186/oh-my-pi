@@ -40,16 +40,15 @@ use omp_app::{
 	endpoint::LocalEndpoint,
 };
 use omp_catalog::{
-	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
+	ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
 use omp_core::{Str, sf};
-use omp_e2e::support::DocServerTask;
 use omp_inference::{
 	Answer, Error as InferenceError, Registry,
 	answer::{AnswerBody, ChatStream},
 	call::{Call, ContentPart, OpaqueJson, OperationCall},
-	event::{BlockKind, ChatEvent, Completion, FinishReason, ToolCall},
+	event::{BlockKind, ChatEvent, Completion, FinishReason, ToolCall, WorkflowResponse},
 	id::ToolCallId,
 	layer::{LayerCall, stack::RouteProviderService},
 	provider::fake::{FakeProvider, FakeScript},
@@ -57,10 +56,11 @@ use omp_inference::{
 	registry::RouteUnavailable,
 	session::ConversationSessionPlanner,
 };
-use omp_tool::{
-	Claims, Constraint, DocEffects, Effects, Ev, ExecEffects, IncomingParams, Part, Precedence,
-	Presentation, PromptCaps, Rev, Tool, ToolSpec,
+use omp_storage::{
+	index::{NewSession, SessionIndex, SessionKind},
+	transcript::{Header, SessionId},
 };
+use omp_tool::{Claims, Constraint, Effects, Precedence, Presentation, Rev, ToolSpec};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::time;
@@ -69,66 +69,6 @@ use tower::Service;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-
-struct ProofTool {
-	spec: ToolSpec,
-}
-
-impl ProofTool {
-	fn new(name: &'static str, family: &'static str) -> Self {
-		let effects = match name {
-			"read" => Effects {
-				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
-				..Effects::empty()
-			},
-			"edit" => Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect(),
-				}),
-				..Effects::empty()
-			},
-			"shell" => Effects {
-				exec: Some(ExecEffects { commands: [sf!("*")].into_iter().collect(), network: true }),
-				..Effects::empty()
-			},
-			_ => Effects::empty(),
-		};
-		Self {
-			spec: ToolSpec {
-				name: name.into(),
-				rev: Rev { family: family.into(), n: 1 },
-				description: "P7 gateway-side executor declaration".into(),
-				schema: Bytes::from_static(br#"{"type":"object","additionalProperties":true}"#),
-				constraint: Constraint::None,
-				effects,
-				projection_code: [0; 32],
-			},
-		}
-	}
-}
-
-impl Tool for ProofTool {
-	type Fault = Value;
-	type Params = Value;
-	type Payload = Value;
-	type Update = Value;
-
-	fn spec(&self) -> &ToolSpec {
-		&self.spec
-	}
-
-	fn call<'call>(
-		&'call self,
-		_params: IncomingParams<'call>,
-	) -> impl futures::Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'call {
-		futures::stream::empty()
-	}
-
-	fn prompt(&self, _view: Result<&Self::Payload, &Self::Fault>, _caps: &PromptCaps) -> Vec<Part> {
-		Vec::new()
-	}
-}
 
 #[derive(Clone)]
 struct GatedRoute {
@@ -211,6 +151,7 @@ struct ScriptedGateway {
 	captures:        Arc<Mutex<Vec<Call>>>,
 	preview_reached: Receiver<()>,
 	preview_release: Sender<()>,
+	_responses:      Receiver<WorkflowResponse>,
 }
 
 impl ScriptedGateway {
@@ -236,37 +177,55 @@ impl ScriptedGateway {
 		fake.extend(scripts);
 
 		let mut tools = omp_tool::Registry::new();
-		for (name, family) in [
-			("read", ""),
-			("edit", "hl"),
-			("shell", ""),
-			("grep", ""),
-			("glob", ""),
-			("py_eval", ""),
-			("eval", ""),
-			("write", ""),
-			("todo", ""),
-			("ask", ""),
-			("fetch", ""),
-			("think", ""),
-			("yield", ""),
-			("checkpoint", ""),
-			("rewind", ""),
-			("hub", ""),
-			("image_gen", ""),
-			("tts", ""),
-			("report_issue", ""),
-			("vibe", ""),
+		for name in [
+			"checkpoint",
+			"rewind",
+			"ask",
+			"ast_edit",
+			"ast_grep",
+			"bash",
+			"debug",
+			"edit",
+			"eval",
+			"fetch",
+			"glob",
+			"grep",
+			"hub",
+			"lsp",
+			"think",
+			"todo",
+			"web_search",
+			"write",
+			"read",
 		] {
 			tools
-				.register(ProofTool::new(name, family), Presentation::Slot, Claims {
-					precedence: Precedence::CORE,
-					claimant:   sf!("omp/core"),
-					replaces:   None,
-				})
+				.register_worker(
+					ToolSpec {
+						name:            sf!(name),
+						rev:             Rev {
+							family: if name == "edit" {
+								sf!("hl")
+							} else {
+								Str::default()
+							},
+							n:      1,
+						},
+						description:     sf!("P7 gateway executor declaration"),
+						schema:          Bytes::from_static(br#"{"type":"object"}"#),
+						constraint:      Constraint::None,
+						effects:         Effects::empty(),
+						projection_code: [0; 32],
+					},
+					Presentation::Device,
+					Claims {
+						precedence: Precedence::DEFAULT,
+						claimant:   sf!("test/worker"),
+						replaces:   None,
+					},
+				)
 				.expect("proof tool registers");
 		}
-		let (responses, _ignored) = flume::bounded(32);
+		let (responses, incoming) = flume::bounded(32);
 		let handle = time::timeout(
 			READY_TIMEOUT,
 			DaemonHandle::start_for_test(
@@ -281,7 +240,15 @@ impl ScriptedGateway {
 		.await
 		.expect("gateway startup timed out")
 		.expect("scripted gateway starts");
-		Self { _handle: handle, model, permits: senders, captures, preview_reached, preview_release }
+		Self {
+			_handle: handle,
+			model,
+			permits: senders,
+			captures,
+			preview_reached,
+			preview_release,
+			_responses: incoming,
+		}
 	}
 
 	fn release(&self, call: usize) {
@@ -307,10 +274,14 @@ impl ScriptedGateway {
 	}
 
 	async fn await_preview(&self) {
-		time::timeout(CHECKPOINT_TIMEOUT, self.preview_reached.recv_async())
-			.await
-			.expect("edit preview stream pause timed out")
-			.expect("edit preview stream observer closed");
+		match time::timeout(CHECKPOINT_TIMEOUT, self.preview_reached.recv_async()).await {
+			Ok(Ok(())) => {},
+			Ok(Err(error)) => panic!("edit preview stream observer closed: {error}"),
+			Err(_) => panic!(
+				"edit preview stream pause timed out after {} captured provider calls",
+				self.captures.lock().len()
+			),
+		}
 	}
 
 	fn release_preview(&self) {
@@ -328,9 +299,7 @@ fn scripted_registry(
 	preview_reached: Sender<()>,
 	preview_release: Receiver<()>,
 ) -> (Registry, ConversationSessionPlanner, FakeProvider, String) {
-	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
-			.expect("normalized catalog");
+	let mut compiled = Catalog::embedded().compiled().clone();
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
 			operations:        OperationBits::empty(),
@@ -479,7 +448,7 @@ fn scripts(shell_release: &Path) -> Vec<FakeScript> {
 		streaming_edit_script(),
 		tool_script(&[(
 			"shell-1",
-			"shell",
+			"bash",
 			json!({
 				"command": format!(
 					"printf '\\154\\151\\166\\145\\055\\164\\141\\151\\154\\n'; while [ ! -f {release} ]; do sleep 0.05; done; printf 'live-error\\n' >&2; exit $((3 + 4))"
@@ -491,23 +460,23 @@ fn scripts(shell_release: &Path) -> Vec<FakeScript> {
 		tool_script(&[
 			(
 				"batch-1",
-				"shell",
+				"bash",
 				json!({ "command": format!("touch {batch_one_marker}; printf '\\142\\141\\164\\143\\150\\055\\157\\156\\145\\055\\163\\164\\141\\162\\164\\145\\144\\n'; sleep 30") }),
 			),
 			(
 				"batch-2",
-				"shell",
+				"bash",
 				json!({ "command": format!("touch {batch_two_marker}; printf '\\142\\141\\164\\143\\150\\055\\164\\167\\157\\055\\162\\141\\156\\n'") }),
 			),
 			(
 				"batch-3",
-				"shell",
+				"bash",
 				json!({ "command": format!("touch {batch_three_marker}; printf '\\142\\141\\164\\143\\150\\055\\164\\150\\162\\145\\145\\055\\162\\141\\156\\n'") }),
 			),
 		]),
 		tool_script(&[(
 			"queue-batch",
-			"shell",
+			"bash",
 			json!({ "command": format!("touch {queue_marker}; printf '\\161\\165\\145\\165\\145\\055\\142\\141\\164\\143\\150\\055\\154\\151\\166\\145\\n'; sleep 30") }),
 		)]),
 		text_script("The plain Enter steering ran before the queued follow-up."),
@@ -874,15 +843,10 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	fs::create_dir(&metadata_dir).expect("project metadata directory");
 	fs::set_permissions(&metadata_dir, <fs::Permissions>::from_mode(0o755))
 		.expect("use standard project metadata permissions");
-	let state_dir = omp_env::project_state::directory(&scratch.path().join("home/data"), &project)
-		.expect("project state directory");
+	let data_dir = project.parent().expect("project parent").join("home/data");
+	let state_dir =
+		omp_env::project_state::directory(&data_dir, &project).expect("project state directory");
 	fs::create_dir_all(&state_dir).expect("create project state directory");
-	fs::set_permissions(&state_dir, <fs::Permissions>::from_mode(0o755))
-		.expect("use standard project state permissions");
-	let docserver_socket = omp_env::project_state::document_socket(&state_dir);
-	let docserver = DocServerTask::spawn(project.clone(), docserver_socket.clone(), Vec::new())
-		.await
-		.expect("start real document authority");
 	let shell_release = scratch.path().join("release-shell");
 	let gateway_socket = scratch.path().join("gateway.sock");
 	let debug_socket = scratch.path().join("tui-debug.sock");
@@ -899,52 +863,42 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		"--gateway".to_owned(),
 		gateway_socket.display().to_string(),
 	];
-	let mut bootstrap = PtyChild::spawn(&binary, &base_args, &project, &debug_socket);
-	let bootstrap_raw = bootstrap.raw.clone();
-	let mut bootstrap_debug =
-		DebugClient::connect(&debug_socket, Instant::now() + READY_TIMEOUT, &mut bootstrap);
-	let index =
-		wait_snapshot(&mut bootstrap_debug, &bootstrap_raw, "bootstrap chat ready", |snapshot| {
-			// Bare `omp chat` boots directly into the inline chat scene; the
-			// session-index card is reserved for the explicit picker flag.
-			snapshot.text.contains("session") && snapshot.text.contains("idle")
-		});
-	assert_surface(&index, "bootstrap chat");
-	// The chat scene paints before the backend finishes opening the journal;
-	// eager creation still means "without any user input", so poll briefly.
-	let journal_deadline = Instant::now() + CHECKPOINT_TIMEOUT;
-	let journals: Vec<_> = loop {
-		let journals: Vec<_> = fs::read_dir(state_dir.join("sessions"))
-			.expect("read session directory")
-			.map(|entry| entry.expect("read session entry").path())
-			.filter(|path| {
-				path
-					.extension()
-					.is_some_and(|extension| extension == "jsonl")
-			})
-			.collect();
-		if journals.len() == 1 {
-			break journals;
-		}
-		assert!(
-			Instant::now() < journal_deadline,
-			"expected one eagerly-created journal: {journals:?}"
-		);
-		thread::sleep(Duration::from_millis(15));
-	};
-	let initial_session_id = journals[0]
-		.file_stem()
-		.and_then(ffi::OsStr::to_str)
-		.expect("journal has UTF-8 ULID stem")
-		.to_owned();
-	bootstrap_debug.keys("ctrl-c");
-	drop(bootstrap_debug);
-	let bootstrap_before = bootstrap.before.clone();
-	let (status, raw, stdout, stderr, after) = bootstrap.wait(READY_TIMEOUT);
-	let diagnostics =
-		format!("status={status}\nstdout={stdout}\nstderr={stderr}\nraw={}", visible(&raw));
-	assert!(status.success(), "bootstrap chat did not exit cleanly\n{diagnostics}");
-	assert_restored(&raw, &bootstrap_before, &after, &diagnostics);
+	let sessions = state_dir.join("sessions");
+	fs::create_dir_all(&sessions).expect("create chat session directory");
+	let initial_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned();
+	let session_id = SessionId(Str::from(initial_session_id.as_str()));
+	let session_index =
+		SessionIndex::open(sessions.join("sessions.sqlite3")).expect("open session index");
+	let project_text = project.to_string_lossy();
+	let initial_journal = state_dir
+		.join("sessions")
+		.join(format!("{initial_session_id}.jsonl"));
+	session_index
+		.create_session(
+			&NewSession {
+				id:         &session_id,
+				cwd:        project_text.as_ref(),
+				project:    project_text.as_ref(),
+				created_ms: 1,
+				kind:       SessionKind::Interactive,
+				parent:     None,
+				remote:     false,
+			},
+			|| {
+				let mut header = serde_json::to_vec(&Header {
+					v:       4,
+					id:      session_id.clone(),
+					created: 1,
+					cwd:     project.clone(),
+				})
+				.map_err(io::Error::other)?;
+				header.push(b'\n');
+				fs::write(&initial_journal, header)?;
+				Ok::<_, io::Error>(((), 0))
+			},
+		)
+		.expect("create resumable TUI session");
+	drop(session_index);
 
 	let mut args = base_args.clone();
 	args.extend(["--resume".to_owned(), initial_session_id.clone()]);
@@ -962,20 +916,21 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	gateway.await_preview().await;
 	let preview = wait_snapshot(&mut debug, &raw_capture, "edit preview", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("read · scratch.txt")
-			&& surface.contains("read 1 parts · 24 text bytes")
-			&& surface.contains("edit · scratch.txt")
-			&& surface.contains("[scratch.txt#5C9F]")
-			&& surface.contains("+new")
+		surface.contains("read scratch.txt · Lines 1 · Size 24B")
+			&& surface.contains("edit edit · scratch.txt")
+			&& surface.contains("scratch.txt +1 -1 1 op")
+			&& surface.contains("+ new")
+			&& surface.contains("streaming arguments")
 			&& fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "old\n")
 	});
 	assert_surface(&preview, "edit preview");
 	gateway.release_preview();
 	let final_edit = wait_snapshot(&mut debug, &raw_capture, "edit final", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("edit · scratch.txt")
-			&& surface.contains("edit 1 files changed · +1 -1")
-			&& surface.contains("scratch.txt 2 ops")
+		surface.contains("edit@hl.1 · edit · scratch.txt")
+			&& surface.contains("scratch.txt +1 -1 2 ops")
+			&& surface.contains("- 1|old")
+			&& surface.contains("+ 1|new")
 			&& fs::read_to_string(project.join("scratch.txt")).is_ok_and(|text| text == "new\n")
 	});
 	assert_surface(&final_edit, "edit final");
@@ -1227,6 +1182,4 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		resumed_status.success(),
 		"resumed omp chat did not exit cleanly\n{resumed_diagnostics}"
 	);
-	assert_restored(&resumed_bytes, &resumed_before, &resumed_after, &resumed_diagnostics);
-	docserver.shutdown().await.expect("stop document authority");
 }

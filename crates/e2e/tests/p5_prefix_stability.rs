@@ -216,9 +216,8 @@ fn tool_def(revision: u16) -> pb::ToolDef {
 }
 
 fn catalog() -> Arc<Catalog> {
-	let mut value: serde_json::Value =
-		serde_json::from_str(include_str!("../../catalog/data/catalog.normalized.json"))
-			.expect("normalized catalog JSON");
+	let mut value =
+		serde_json::to_value(Catalog::embedded().compiled()).expect("normalized catalog JSON");
 	let models = value["models"].as_array_mut().expect("models array");
 	let mut model = models.first().cloned().expect("catalog model fixture");
 	model["key"] = serde_json::json!(MODEL);
@@ -630,13 +629,22 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 		})
 		.collect::<Vec<_>>();
 	assert_eq!(
-		rewind_messages,
+		rewind_messages[0].0,
+		thread::Role::System as i32,
+		"prompt rewind must begin with the rebuilt system head"
+	);
+	assert!(
+		rewind_messages[0].1.contains("<system-conventions>"),
+		"prompt rewind omitted the canonical system contract"
+	);
+	assert_eq!(rewind_messages[1].0, thread::Role::System as i32);
+	assert!(
+		rewind_messages[1].1.contains("stable prompt v2"),
+		"prompt rewind omitted the refreshed repository context"
+	);
+	assert_eq!(
+		&rewind_messages[2..],
 		vec![
-			(
-				thread::Role::System as i32,
-				format!("Workspace\nDirectory: {}", scratch.project().display()),
-			),
-			(thread::Role::System as i32, "Context file: AGENTS.md\nstable prompt v2\n".to_owned(),),
 			(thread::Role::User as i32, "steady one".to_owned()),
 			(thread::Role::Assistant as i32, "ok".to_owned()),
 			(thread::Role::User as i32, "steady two".to_owned()),
@@ -644,7 +652,8 @@ async fn delta_context_prompt_rewind_preserves_exact_provider_prefixes() {
 			(thread::Role::User as i32, "steady tri".to_owned()),
 			(thread::Role::Assistant as i32, "ok".to_owned()),
 			(thread::Role::User as i32, "after prompt".to_owned()),
-		],
+		]
+		.as_slice(),
 		"prompt rewind replaces only the head and preserves the exact prior user/assistant tail"
 	);
 	let fourth_json = serde_json::to_vec(&fourth_delta.append).expect("serialize rewind append");

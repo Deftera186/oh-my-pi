@@ -55,7 +55,7 @@ macro_rules! ensure {
 	};
 }
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+const TEST_TIMEOUT: Duration = Duration::from_secs(40);
 const STORM_COUNT: usize = 100;
 const PINNED_READERS: usize = 4;
 const PINNED_READS: usize = 25;

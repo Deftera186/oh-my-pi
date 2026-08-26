@@ -15,7 +15,7 @@ use omp_app::{
 	endpoint::LocalEndpoint,
 };
 use omp_catalog::{
-	CompiledCatalog, ManagementCapabilities, OperationBits, OperationKind,
+	ManagementCapabilities, OperationBits, OperationKind,
 	snapshot::{Catalog, SnapshotProvenance},
 };
 use omp_core::{Str, sf};
@@ -297,9 +297,7 @@ fn scripted_registry(
 	scripts: impl IntoIterator<Item = FakeScript>,
 	response_gate: Option<Gate>,
 ) -> Result<(Registry, FakeProvider, Str, Arc<Catalog>)> {
-	let mut compiled: CompiledCatalog =
-		serde_json::from_str(include_str!("../../../catalog/data/catalog.normalized.json"))
-			.context("decoding normalized test catalog")?;
+	let mut compiled = Catalog::embedded().compiled().clone();
 	for provider in &mut compiled.providers {
 		provider.management = ManagementCapabilities {
 			operations:        OperationBits::empty(),
