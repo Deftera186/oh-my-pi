@@ -2,9 +2,8 @@
 
 use std::{
 	borrow::Cow,
-	collections::{HashMap, hash_map::DefaultHasher},
+	collections::HashMap,
 	future::Future,
-	hash::Hasher as _,
 	path::Path,
 	str,
 	sync::Arc,
@@ -409,9 +408,7 @@ struct RepeatReadTracker {
 
 impl RepeatReadTracker {
 	fn observe(&mut self, path: &str, text: &str) -> Option<u32> {
-		let mut hasher = DefaultHasher::new();
-		hasher.write(text.as_bytes());
-		let hash = hasher.finish();
+		let hash = omp_core::fast_hash64(text);
 		if let Some(read) = self.reads.get_mut(path) {
 			if read.hash != hash {
 				*read = RepeatedRead { hash, count: 1 };
