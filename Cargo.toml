@@ -61,6 +61,7 @@ fancy-regex = "0.17"
 fastembed = { version = "5.17.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 flume = "0.11"
+foldhash = "0.2"
 foreign-types = "=0.5.0"
 fontdb = "0.24"
 fontdue = "0.9"
@@ -310,7 +311,7 @@ zune-jpeg = "0.5"
 zeroize = { version = "1.9", features = ["derive"] }
 zstd = "0.13"
 xutf = "1.4"
-xxhash-rust = { version = "0.8", features = ["xxh3", "xxh32"] }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [workspace.metadata.omp.dependency-lints.omp-agent]
 # D2: the agent reaches the world through omp-env. omp-storage is the single

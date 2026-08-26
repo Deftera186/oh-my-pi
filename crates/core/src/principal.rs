@@ -152,17 +152,17 @@ impl fmt::Debug for Principal {
 	}
 }
 
-/// A BLAKE3-256 digest identifying the exact extension artifact that acted.
+/// A SHA-256 digest identifying the exact extension artifact that acted.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArtifactDigest([u8; 32]);
 
 impl ArtifactDigest {
-	/// Creates an artifact digest from its raw BLAKE3-256 bytes.
+	/// Creates an artifact digest from its raw SHA-256 bytes.
 	pub const fn new(bytes: [u8; 32]) -> Self {
 		Self(bytes)
 	}
 
-	/// Returns the raw BLAKE3-256 digest bytes.
+	/// Returns the raw SHA-256 digest bytes.
 	pub const fn as_bytes(&self) -> &[u8; 32] {
 		&self.0
 	}
@@ -175,7 +175,7 @@ impl ArtifactDigest {
 
 impl Display for ArtifactDigest {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str("b3:")?;
+		formatter.write_str("sha256:")?;
 		Display::fmt(&hex::encode(&self.0), formatter)
 	}
 }
@@ -189,8 +189,8 @@ impl fmt::Debug for ArtifactDigest {
 /// Failure to parse an extension artifact digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ArtifactDigestError {
-	/// The digest did not use the canonical `b3:` prefix.
-	#[error("artifact digest must start with `b3:`")]
+	/// The digest did not use the canonical `sha256:` prefix.
+	#[error("artifact digest must start with `sha256:`")]
 	MissingPrefix,
 	/// The hexadecimal payload was not exactly 32 bytes.
 	#[error("artifact digest must contain exactly 64 lowercase hexadecimal digits")]
@@ -205,7 +205,7 @@ impl FromStr for ArtifactDigest {
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		let encoded = value
-			.strip_prefix("b3:")
+			.strip_prefix("sha256:")
 			.ok_or(ArtifactDigestError::MissingPrefix)?;
 		if encoded.len() != 64 {
 			return Err(ArtifactDigestError::InvalidLength);

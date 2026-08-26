@@ -7801,9 +7801,9 @@ dependencies = [
 name = "omp-core"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "bytes-utils",
+ "foldhash 0.2.0",
  "futures",
  "futures-core",
  "heapless 0.9.3",
@@ -7816,6 +7816,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "smallvec 2.0.0-alpha.12",
  "smol_bitmap",
  "strum",

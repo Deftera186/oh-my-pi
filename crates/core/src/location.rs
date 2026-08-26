@@ -234,14 +234,14 @@ const fn valid_claimant_byte(byte: u8) -> bool {
 pub enum ArtifactAddress<'a> {
 	/// A session-local artifact ordinal.
 	Ordinal(u64),
-	/// A durable cross-session BLAKE3 digest, without the `b3/` prefix.
+	/// A durable cross-session SHA-256 digest, without the `sha256/` prefix.
 	Digest(&'a str),
 }
 
 /// A typed artifact address.
 ///
 /// The canonical resource is either a session-local decimal `u64` ordinal or
-/// `b3/` followed by exactly 64 lowercase hexadecimal digest digits.
+/// `sha256/` followed by exactly 64 lowercase hexadecimal digest digits.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ArtifactUrl(Str);
@@ -275,9 +275,9 @@ impl ArtifactUrl {
 		Self(Str::from(format!("artifact://{ordinal}")))
 	}
 
-	/// Creates a canonical durable artifact URL from a BLAKE3-256 digest.
+	/// Creates a canonical durable artifact URL from a SHA-256 digest.
 	pub fn from_digest(digest: [u8; 32]) -> Self {
-		Self(Str::from(format!("artifact://b3/{}", crate::hex::encode(&digest))))
+		Self(Str::from(format!("artifact://sha256/{}", crate::hex::encode(&digest))))
 	}
 
 	/// Returns the complete wire-form URL without allocating.
@@ -298,7 +298,7 @@ impl ArtifactUrl {
 
 	/// Returns the parsed canonical artifact address.
 	pub fn address(&self) -> ArtifactAddress<'_> {
-		if let Some(digest) = self.resource().strip_prefix("b3/") {
+		if let Some(digest) = self.resource().strip_prefix("sha256/") {
 			ArtifactAddress::Digest(digest)
 		} else {
 			ArtifactAddress::Ordinal(
@@ -345,7 +345,7 @@ fn valid_artifact_resource(resource: &str) -> bool {
 	{
 		return resource.parse::<u64>().is_ok();
 	}
-	let Some(digest) = resource.strip_prefix("b3/") else {
+	let Some(digest) = resource.strip_prefix("sha256/") else {
 		return false;
 	};
 	digest.len() == 64
@@ -500,7 +500,7 @@ mod tests {
 		const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 		let url = ArtifactUrl::new(
 			concat!(
-				"artifact://b3/",
+				"artifact://sha256/",
 				"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 				":raw"
 			)
@@ -528,8 +528,8 @@ mod tests {
 			"artifact://01",
 			"artifact://+1",
 			"artifact://18446744073709551616",
-			"artifact://b3/abcdef",
-			"artifact://b3/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+			"artifact://sha256/abcdef",
+			"artifact://sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 			"artifact://1:",
 		] {
 			assert_eq!(ArtifactUrl::new(value.into_str()), Err(LocationError::InvalidArtifactAddress));

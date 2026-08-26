@@ -1,6 +1,6 @@
 //! Canonical 32-byte digest representation.
 //!
-//! [`Hash32`] is the workspace-wide content digest: BLAKE3-256 bytes rendered
+//! [`Hash32`] is the workspace-wide content digest: SHA-256 bytes rendered
 //! as 64 lowercase hexadecimal characters in text form. [`Hash32::sum`] hashes
 //! one buffer; [`Hash32::hasher`] returns an incremental [`Hasher`] for
 //! multi-part input.
@@ -8,11 +8,11 @@
 use std::{
 	fmt::{self, Display},
 	io,
-	path::Path,
 	str::FromStr,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::encoding::{hex, hex::ArrayStr};
@@ -43,29 +43,29 @@ impl Hash32 {
 		hex::encode_n(&self.0)
 	}
 
-	/// Returns the BLAKE3-256 digest of `bytes` in one shot.
+	/// Returns the SHA-256 digest of `bytes` in one shot.
 	pub fn sum(bytes: impl AsRef<[u8]>) -> Self {
-		Self(*blake3::hash(bytes.as_ref()).as_bytes())
+		Self(Sha256::digest(bytes.as_ref()).into())
 	}
 
-	/// Returns an incremental BLAKE3-256 hasher finalizing into a [`Hash32`].
+	/// Returns an incremental SHA-256 hasher finalizing into a [`Hash32`].
 	pub fn hasher() -> Hasher {
 		Hasher::new()
 	}
 }
 
-/// Incremental BLAKE3-256 state produced by [`Hash32::hasher`].
+/// Incremental SHA-256 state produced by [`Hash32::hasher`].
 ///
 /// Accepts input through chained [`Hasher::update`] calls or as an
 /// [`io::Write`] sink (e.g. `serde_json::to_writer`), then yields the digest
 /// via [`Hasher::finalize`].
 #[derive(Clone, Debug, Default)]
-pub struct Hasher(blake3::Hasher);
+pub struct Hasher(Sha256);
 
 impl Hasher {
 	/// Creates an empty hasher.
 	pub fn new() -> Self {
-		Self(blake3::Hasher::new())
+		Self(Sha256::new())
 	}
 
 	/// Absorbs `bytes` and returns the hasher for chaining.
@@ -75,19 +75,9 @@ impl Hasher {
 		self
 	}
 
-	/// Absorbs an entire file by memory-mapping it, avoiding a full
-	/// in-memory copy of large inputs.
-	///
-	/// # Errors
-	/// Propagates the underlying open/map failure.
-	pub fn update_mmap(&mut self, path: impl AsRef<Path>) -> io::Result<&mut Self> {
-		self.0.update_mmap(path)?;
-		Ok(self)
-	}
-
 	/// Returns the digest of everything absorbed so far.
 	pub fn finalize(&self) -> Hash32 {
-		Hash32(*self.0.finalize().as_bytes())
+		Hash32(self.0.clone().finalize().into())
 	}
 }
 
@@ -246,11 +236,11 @@ mod tests {
 	}
 
 	#[test]
-	fn sum_is_blake3_256() {
-		// Known BLAKE3-256 digest of the empty input.
+	fn sum_is_sha256() {
+		// Known SHA-256 digest of the empty input.
 		assert_eq!(
 			Hash32::sum(b"").to_string(),
-			"af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 		);
 	}
 
