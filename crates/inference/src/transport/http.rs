@@ -317,7 +317,6 @@ static POOLED_CLIENT: LazyLock<PooledClient> = LazyLock::new(|| {
 		.wrap_connector(EnvProxyConnector::new());
 	Client::builder(TokioExecutor::new()).build(connector)
 });
-
 /// Outcome of scheduling a credential-free best-effort host preconnect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
