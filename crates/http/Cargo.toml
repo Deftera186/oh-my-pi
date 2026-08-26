@@ -1,0 +1,17 @@
+[package]
+name = "omp-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Shared outbound HTTP client pools and TLS policy for OMP"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest.workspace = true
+rustls.workspace = true
