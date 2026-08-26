@@ -28,7 +28,10 @@ use tokio::{
 	time,
 };
 
-use crate::mailbox::{Interrupt, InterruptClass, InterruptSource, MailboxSender};
+use crate::{
+	events::{AgentEvent, EventBus},
+	mailbox::{Interrupt, InterruptClass, InterruptSource, MailboxSender},
+};
 
 const SETTLEMENT_MEDIA_TYPE: &str = "application/vnd.omp.process-settlement+json";
 const UPLOAD_CHUNK_BYTES: usize = 16 * 1024;
@@ -58,6 +61,7 @@ pub struct JobBoard {
 struct JobBoardInner {
 	env:          EnvClient,
 	mailbox:      MailboxSender,
+	events:       Option<EventBus>,
 	pending:      Mutex<BTreeMap<Str, JobEntry>>,
 	watchers:     Mutex<BTreeMap<Str, AbortHandle>>,
 	settled:      Mutex<BTreeSet<Str>>,
@@ -96,7 +100,13 @@ impl Drop for JobBoardInner {
 impl JobBoard {
 	/// Creates an empty board over the authoritative environment client.
 	pub fn new(env: EnvClient, mailbox: MailboxSender) -> Self {
-		Self::with_limits(env, mailbox, 15, DEFAULT_RETENTION)
+		Self::with_limits_and_events(env, mailbox, None, 15, DEFAULT_RETENTION)
+	}
+
+	/// Creates an Agent-owned board that publishes terminal job lifecycle
+	/// events.
+	pub(crate) fn with_events(env: EnvClient, mailbox: MailboxSender, events: EventBus) -> Self {
+		Self::with_limits_and_events(env, mailbox, Some(events), 15, DEFAULT_RETENTION)
 	}
 
 	/// Creates a board with an explicit running capacity and terminal retention.
@@ -108,10 +118,21 @@ impl JobBoard {
 		max_running: usize,
 		retention: StdDuration,
 	) -> Self {
+		Self::with_limits_and_events(env, mailbox, None, max_running, retention)
+	}
+
+	fn with_limits_and_events(
+		env: EnvClient,
+		mailbox: MailboxSender,
+		events: Option<EventBus>,
+		max_running: usize,
+		retention: StdDuration,
+	) -> Self {
 		Self {
 			inner: Arc::new(JobBoardInner {
 				env,
 				mailbox,
+				events,
 				pending: Mutex::new(BTreeMap::new()),
 				watchers: Mutex::new(BTreeMap::new()),
 				settled: Mutex::new(BTreeSet::new()),
@@ -610,6 +631,9 @@ impl JobBoardInner {
 		metadata.status = JobStatus::Completed;
 		metadata.settled_at_ms = Some(now_ms());
 		entry.job.metadata = Arc::new(metadata);
+		if let Some(events) = &self.events {
+			events.publish(AgentEvent::JobSettled { job_id: Str::new(job_id) });
+		}
 		self.flush_locked(job_id, &mut pending)?;
 		self.bump();
 		Ok(true)
@@ -1359,6 +1383,24 @@ mod tests {
 		assert_eq!(jobs.next().unwrap().id, "job-b");
 		assert_eq!(jobs.next(), None);
 		assert_eq!(pending.iter().next().unwrap().artifact.lifetime, ArtifactLifetime::Session);
+	}
+
+	#[tokio::test]
+	async fn agent_board_publishes_terminal_transition_exactly_once() {
+		let mailbox = Mailbox::new();
+		let events = EventBus::new();
+		let subscription = events.subscribe_lossless();
+		let (env, _transport) = EnvClient::in_process(0);
+		let board = JobBoard::with_events(env, mailbox.sender(), events);
+		assert!(board.register(job("job-event", ArtifactLifetime::Session)));
+		assert!(board.settle("job-event", thread::Item::default()).unwrap());
+		assert!(!board.settle("job-event", thread::Item::default()).unwrap());
+		let event = subscription.try_recv().expect("terminal event");
+		assert!(matches!(
+			event.as_ref(),
+			AgentEvent::JobSettled { job_id } if job_id == "job-event"
+		));
+		assert!(subscription.try_recv().is_err(), "terminal event is exactly once");
 	}
 
 	#[tokio::test]

@@ -585,8 +585,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 		caps: CapsBase,
 	) -> Self {
 		let mailbox = Mailbox::new();
-		let jobs = Arc::new(JobBoard::new(env.clone(), mailbox.sender()));
 		let events = EventBus::new();
+		let jobs = Arc::new(JobBoard::with_events(env.clone(), mailbox.sender(), events.clone()));
 		let (abort_tx, abort_rx) = watch::channel(0_u64);
 		let (hook_bus, hook_requests) = InvocationHookBus::channel();
 		let (invocation_fact_tx, invocation_fact_rx) = flume::unbounded();
@@ -2485,9 +2485,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 				);
 				let claimed = settlement.lease.claim();
 				debug_assert!(claimed.is_ok(), "delivery lease must remain exclusive through commit");
-				self
-					.events
-					.publish(AgentEvent::JobSettled { job_id: id.clone() });
 			} else {
 				indexes.push(self.journal.append_turn_input(
 					ts,

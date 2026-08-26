@@ -4049,7 +4049,7 @@ mod tests {
 	use std::{
 		env, fs,
 		fs::OpenOptions,
-		io::Write as _,
+		io::{self, Write as _},
 		sync::atomic::{AtomicU64, Ordering},
 	};
 
@@ -4091,6 +4091,36 @@ mod tests {
 			})),
 			..Default::default()
 		}
+	}
+	#[test]
+	fn materialized_header_indexes_first_turn_input() {
+		let journal_path = path("materialized-header");
+		let index_path = journal_path.with_extension("sqlite3");
+		let header = header();
+		let session_id = header.id.clone();
+		let index = Arc::new(SessionIndex::open(&index_path).expect("session index"));
+		let cwd = header.cwd.to_string_lossy();
+		let request = omp_storage::index::NewSession {
+			id:         &session_id,
+			cwd:        cwd.as_ref(),
+			project:    cwd.as_ref(),
+			created_ms: header.created,
+			kind:       omp_storage::index::SessionKind::Interactive,
+			parent:     None,
+			remote:     false,
+		};
+		index
+			.create_session(&request, || {
+				let mut bytes = serde_json::to_vec(&header).map_err(io::Error::other)?;
+				bytes.push(b'\n');
+				fs::write(&journal_path, bytes)?;
+				Ok::<_, io::Error>(((), 0))
+			})
+			.unwrap_or_else(|_| panic!("create indexed session"));
+		let mut journal = Journal::open(&journal_path).expect("open materialized journal");
+		journal.attach_session_index(index, session_id);
+		let result = journal.append_turn_input(2, "turn", message("input"), None);
+		assert!(result.is_ok(), "{result:?}");
 	}
 
 	#[test]
