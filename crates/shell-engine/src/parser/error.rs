@@ -32,6 +32,10 @@ pub struct ParseErrorLocation {
 /// Represents an error that occurred while parsing a word.
 #[derive(Debug, thiserror::Error)]
 pub enum WordParseError {
+	/// A numeric literal used by word syntax exceeds its supported range.
+	#[error("{0} out of range")]
+	NumericLiteralOutOfRange(&'static str),
+
 	/// An error occurred while parsing an arithmetic expression.
 	#[error("failed to parse arithmetic expression")]
 	ArithmeticExpression(ParseErrorLocation),

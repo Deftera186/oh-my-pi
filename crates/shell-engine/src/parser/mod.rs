@@ -5,6 +5,8 @@
 	reason = "parser diagnostics retain source locations during recovery"
 )]
 
+use std::str::FromStr;
+
 pub mod arithmetic;
 pub mod ast;
 pub mod pattern;
@@ -39,3 +41,7 @@ mod test_result {
 
 #[cfg(test)]
 pub(crate) use test_result::TestResult;
+
+fn parse_bounded_number<T: FromStr>(value: &str, context: &'static str) -> Result<T, &'static str> {
+	value.parse().map_err(|_| context)
+}

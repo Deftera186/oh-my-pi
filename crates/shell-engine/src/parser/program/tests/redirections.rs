@@ -1,7 +1,10 @@
 //! Tests for redirection parsing.
 
 use super::{ParseResult, test_with_snapshot};
-use crate::{assert_snapshot_redacted, parser::TestResult as Result};
+use crate::{
+	assert_snapshot_redacted,
+	parser::{ParseError, TestResult as Result},
+};
 
 // File redirections
 
@@ -80,7 +83,11 @@ fn parse_redirect_stdin_dup() -> Result<()> {
 }
 #[test]
 fn oversized_redirection_fd_is_a_parse_error() {
-	assert!(test_with_snapshot("999999999999999999999999999999>file").is_err());
+	assert!(matches!(
+		test_with_snapshot("999999999999999999999999999999>file"),
+		Err(ParseError::ParsingNear(_))
+	));
+	assert!(test_with_snapshot("2147483647>file").is_ok());
 }
 
 // Combined redirections

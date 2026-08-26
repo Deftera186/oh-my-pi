@@ -550,9 +550,6 @@ peg::parser! {
 		  rule io_fd_duplication_source() -> ast::IoFileRedirectTarget =
 				w:word() { ast::IoFileRedirectTarget::Duplicate(ast::Word::from(w)) }
 
-		  rule io_fd() -> u32 =
-				w:[Token::Word(_, _)] {? w.to_str().parse().or(Err("io_fd u32")) }
-
 		  rule io_filename() -> ast::IoFileRedirectTarget =
 				non_posix_extensions_enabled() sub:process_substitution() {
 					 let (kind, subshell) = sub;
@@ -696,7 +693,7 @@ peg::parser! {
 						  o.starts_with(['<', '>']) &&
 						  locations_are_contiguous(num_loc, redir_loc)]) {?
 
-					 w.parse().map_err(|_| "redirection file descriptor out of range")
+					 crate::parser::program::parse_redirection_fd(w)
 				}
 
 		  //

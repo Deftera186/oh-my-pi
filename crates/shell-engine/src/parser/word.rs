@@ -493,6 +493,82 @@ pub enum BraceExpressionMember {
 	Child(Vec<BraceExpressionOrText>),
 }
 
+const BRACE_SEQUENCE_NUMBER: &str = "brace sequence number";
+const DIRECTORY_STACK_INDEX: &str = "directory stack index";
+
+fn parse_brace_number(sign: Option<i64>, digits: &str) -> Result<i64, &'static str> {
+	let magnitude = crate::parser::parse_bounded_number::<u64>(digits, BRACE_SEQUENCE_NUMBER)?;
+	if sign == Some(-1) {
+		if magnitude == i64::MAX as u64 + 1 {
+			return Ok(i64::MIN);
+		}
+		i64::try_from(magnitude)
+			.map(|number| -number)
+			.map_err(|_| BRACE_SEQUENCE_NUMBER)
+	} else {
+		i64::try_from(magnitude).map_err(|_| BRACE_SEQUENCE_NUMBER)
+	}
+}
+
+fn number_sequence(
+	start: Result<i64, &'static str>,
+	end: Result<i64, &'static str>,
+	increment: Option<Result<i64, &'static str>>,
+) -> Result<BraceExpressionMember, &'static str> {
+	Ok(BraceExpressionMember::NumberSequence {
+		start:     start?,
+		end:       end?,
+		increment: increment.transpose()?.unwrap_or(1),
+	})
+}
+
+fn char_sequence(
+	start: char,
+	end: char,
+	increment: Option<Result<i64, &'static str>>,
+) -> Result<BraceExpressionMember, &'static str> {
+	Ok(BraceExpressionMember::CharSequence {
+		start,
+		end,
+		increment: increment.transpose()?.unwrap_or(1),
+	})
+}
+
+fn validate_numeric_word_syntax(
+	word: &str,
+	options: &ParserOptions,
+	pieces: &[WordPieceWithSource],
+) -> Result<(), &'static str> {
+	if options.tilde_expansion_at_word_start
+		&& let Some(candidate) = word.strip_prefix('~')
+	{
+		let digits = candidate
+			.strip_prefix('+')
+			.or_else(|| candidate.strip_prefix('-'))
+			.unwrap_or(candidate);
+		let end = digits
+			.find(|ch: char| !ch.is_ascii_digit())
+			.unwrap_or(digits.len());
+		let (digits, suffix) = digits.split_at(end);
+		if !digits.is_empty() && (suffix.is_empty() || suffix.starts_with(['/', ':', ';', '}'])) {
+			crate::parser::parse_bounded_number::<usize>(digits, DIRECTORY_STACK_INDEX)?;
+		}
+	}
+	for piece in pieces {
+		let WordPiece::TildeExpansion(TildeExpr::UserHome(user)) = &piece.piece else {
+			continue;
+		};
+		let digits = user
+			.strip_prefix('+')
+			.or_else(|| user.strip_prefix('-'))
+			.unwrap_or(user);
+		if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+			crate::parser::parse_bounded_number::<usize>(digits, DIRECTORY_STACK_INDEX)?;
+		}
+	}
+	Ok(())
+}
+
 /// Parse a word into its constituent pieces.
 ///
 /// # Arguments
@@ -515,6 +591,8 @@ fn cacheable_parse(
 
 	let pieces = expansion_parser::unexpanded_word(word.as_str(), &options)
 		.map_err(|err| error::WordParseError::Word(word.clone(), err.into()))?;
+	validate_numeric_word_syntax(word.as_str(), &options, &pieces)
+		.map_err(error::WordParseError::NumericLiteralOutOfRange)?;
 
 	tracing::debug!(target: "expansion", "Parsed word '{}' => {{{:?}}}", word, pieces);
 
@@ -561,6 +639,7 @@ pub fn parse_brace_expansions(
 ) -> Result<Option<Vec<BraceExpressionOrText>>, error::WordParseError> {
 	expansion_parser::brace_expansions(word, options)
 		.map_err(|err| error::WordParseError::BraceExpansion(word.to_owned(), err.into()))
+		.and_then(|result| result.map_err(error::WordParseError::NumericLiteralOutOfRange))
 }
 
 pub(crate) fn parse_assignment_word(
@@ -614,17 +693,21 @@ peg::parser! {
 				}
 
 		  // Takes a word as input.
-		  pub(crate) rule brace_expansions() -> Option<Vec<BraceExpressionOrText>> =
-				pieces:(brace_expansion_piece(<![_]>)+) { Some(pieces) } /
-				[_]* { None }
+		  pub(crate) rule brace_expansions() -> Result<Option<Vec<BraceExpressionOrText>>, &'static str> =
+				pieces:(brace_expansion_piece(<![_]>)+) {
+					 pieces.into_iter().collect::<Result<Vec<_>, _>>().map(Some)
+				} /
+				[_]* { Ok(None) }
 
 		  // Returns either a complete brace expression (without any prefix or suffix), or a
 		  // non-brace-expression string.
-		  rule brace_expansion_piece<T>(stop_condition: rule<T>) -> BraceExpressionOrText =
+		  rule brace_expansion_piece<T>(stop_condition: rule<T>) -> Result<BraceExpressionOrText, &'static str> =
 				expr:brace_expr() {
-					 BraceExpressionOrText::Expr(expr)
+					 expr.map(BraceExpressionOrText::Expr)
 				} /
-				text:$(non_brace_expr_text(<stop_condition()>)+) { BraceExpressionOrText::Text(text.to_owned()) }
+				text:$(non_brace_expr_text(<stop_condition()>)+) {
+					 Ok(BraceExpressionOrText::Text(text.to_owned()))
+				}
 
 		  // Parses text that is not considered to contain a brace expression.
 		  rule non_brace_expr_text<T>(stop_condition: rule<T>) -> () =
@@ -632,45 +715,48 @@ peg::parser! {
 				!brace_expr() !stop_condition() "{" {}
 
 		  // Parses a complete brace expression, with no prefix or suffix.
-		  pub(crate) rule brace_expr() -> BraceExpression =
+		  pub(crate) rule brace_expr() -> Result<BraceExpression, &'static str> =
 				"{" inner:brace_expr_inner() "}" { inner }
 
 		  // Parses the text inside a complete brace expression; basically the complete brace
 		  // expression without the opening and closing brace characters.
-		  pub(crate) rule brace_expr_inner() -> BraceExpression =
+		  pub(crate) rule brace_expr_inner() -> Result<BraceExpression, &'static str> =
 				brace_text_list_expr() /
-				seq:brace_sequence_expr() { vec![seq] }
+				seq:brace_sequence_expr() { seq.map(|member| vec![member]) }
 
 		  // Parses a list of brace expression members, including the separating commas; does
 		  // not include the opening and closing braces.
-		  pub(crate) rule brace_text_list_expr() -> BraceExpression =
-				brace_text_list_member() **<2,> ","
+		  pub(crate) rule brace_text_list_expr() -> Result<BraceExpression, &'static str> =
+				members:(brace_text_list_member() **<2,> ",") {
+					 members.into_iter().collect()
+				}
 
 		  // Parses an element that can occur in a brace expression member list, not including the
 		  // terminating comma or closing brace.
-		  pub(crate) rule brace_text_list_member() -> BraceExpressionMember =
+		  pub(crate) rule brace_text_list_member() -> Result<BraceExpressionMember, &'static str> =
 				// Matches an empty-string member, without consuming the comma or closing brace that terminates it.
-				&[',' | '}'] { BraceExpressionMember::Child(vec![BraceExpressionOrText::Text(String::new())]) } /
+				&[',' | '}'] {
+					 Ok(BraceExpressionMember::Child(vec![BraceExpressionOrText::Text(String::new())]))
+				} /
 				// Matches a nested string that may include some combination of concatenated textual strings
 				// and brace expressions.
 				child_pieces:(brace_expansion_piece(<[',' | '}']>)+) {
-					 BraceExpressionMember::Child(child_pieces)
+					 child_pieces
+						  .into_iter()
+						  .collect::<Result<Vec<_>, _>>()
+						  .map(BraceExpressionMember::Child)
 				}
 
-		  pub(crate) rule brace_sequence_expr() -> BraceExpressionMember =
+		  pub(crate) rule brace_sequence_expr() -> Result<BraceExpressionMember, &'static str> =
 				start:number() ".." end:number() increment:(".." n:number() { n })? {
-					 BraceExpressionMember::NumberSequence { start, end, increment: increment.unwrap_or(1) }
+					 number_sequence(start, end, increment)
 				} /
 				start:character() ".." end:character() increment:(".." n:number() { n })? {
-					 BraceExpressionMember::CharSequence { start, end, increment: increment.unwrap_or(1) }
+					 char_sequence(start, end, increment)
 				}
 
-		  rule number() -> i64 = sign:number_sign()? n:$(['0'..='9']+) {?
-				let sign = sign.unwrap_or(1);
-				n.parse::<i64>()
-					 .map(|num| num * sign)
-					 .map_err(|_| "brace sequence number out of range")
-		  }
+		  rule number() -> Result<i64, &'static str> =
+				sign:number_sign()? n:$(['0'..='9']+) { parse_brace_number(sign, n) }
 
 		  rule number_sign() -> i64 =
 				['-'] { -1 } /
@@ -870,15 +956,13 @@ peg::parser! {
 				&tilde_terminator() { TildeExpr::Home } /
 				"+" &tilde_terminator() { TildeExpr::WorkingDir } /
 				plus:("+"?) n:$(['0'..='9']+) &tilde_terminator() {?
-					 n.parse::<usize>()
+					 crate::parser::parse_bounded_number::<usize>(n, DIRECTORY_STACK_INDEX)
 						  .map(|n| TildeExpr::NthDirFromTopOfDirStack { n, plus_used: plus.is_some() })
-						  .map_err(|_| "directory stack index out of range")
 				} /
 				"-" &tilde_terminator() { TildeExpr::OldWorkingDir } /
 				"-" n:$(['0'..='9']+) &tilde_terminator() {?
-					 n.parse::<usize>()
+					 crate::parser::parse_bounded_number::<usize>(n, DIRECTORY_STACK_INDEX)
 						  .map(|n| TildeExpr::NthDirFromBottomOfDirStack { n })
-						  .map_err(|_| "directory stack index out of range")
 				} /
 				user:$(portable_filename_char()*) &tilde_terminator() { TildeExpr::UserHome(user.to_owned()) }
 
@@ -1019,9 +1103,13 @@ peg::parser! {
 				p:variable_name() { Parameter::Named(p.to_owned()) }
 
 		  rule positional_parameter() -> u32 =
-				n:$(['1'..='9'](['0'..='9']*)) {? n.parse().or(Err("u32")) }
+				n:$(['1'..='9'](['0'..='9']*)) {?
+					 crate::parser::parse_bounded_number(n, "positional parameter")
+				}
 		  rule unbraced_positional_parameter() -> u32 =
-				n:$(['1'..='9']) {? n.parse().or(Err("u32")) }
+				n:$(['1'..='9']) {?
+					 crate::parser::parse_bounded_number(n, "positional parameter")
+				}
 
 		  rule special_parameter() -> SpecialParameter =
 				"@" { SpecialParameter::AllPositionalParameters { concatenate: false } } /
@@ -1349,17 +1437,34 @@ mod tests {
 		let options = ParserOptions::default();
 		let brace =
 			super::parse_brace_expansions("{999999999999999999999999999999999999..1}", &options);
-		assert!(brace.is_err() || matches!(brace, Ok(None)));
+		assert!(matches!(
+			brace,
+			Err(error::WordParseError::NumericLiteralOutOfRange(BRACE_SEQUENCE_NUMBER))
+		));
 		for input in
 			["~+999999999999999999999999999999999999", "~-999999999999999999999999999999999999"]
 		{
-			if let Ok(pieces) = parse(input, &options) {
-				assert!(matches!(
-					pieces.first().map(|piece| &piece.piece),
-					Some(WordPiece::TildeExpansion(TildeExpr::UserHome(_)))
-				));
-			}
+			assert!(matches!(
+				parse(input, &options),
+				Err(error::WordParseError::NumericLiteralOutOfRange(DIRECTORY_STACK_INDEX))
+			));
 		}
+
+		assert!(matches!(
+			super::parse_brace_expansions("{9223372036854775807..-9223372036854775808}", &options),
+			Ok(Some(_))
+		));
+		let max_stack_index = format!("~+{}", usize::MAX);
+		assert!(matches!(
+			parse(&max_stack_index, &options),
+			Ok(pieces) if matches!(
+				pieces.first().map(|piece| &piece.piece),
+				Some(WordPiece::TildeExpansion(TildeExpr::NthDirFromTopOfDirStack {
+					n: usize::MAX,
+					..
+				}))
+			)
+		));
 	}
 
 	#[test]

@@ -5,6 +5,7 @@ use bon::bon;
 use crate::parser::{
 	ast,
 	error::{ParseError, convert_peg_parse_error},
+	parse_bounded_number,
 	tokenizer::{Token, TokenEndReason, Tokenizer, TokenizerOptions, Tokens},
 };
 
@@ -158,6 +159,7 @@ impl<R: io::BufRead> Parser<R> {
 	/// be preceded by "()", but no function name.
 	pub fn parse_function_parens_and_body(&mut self) -> Result<ast::FunctionBody, ParseError> {
 		let tokens = self.tokenize()?;
+		validate_redirection_fds(&tokens)?;
 		let parse_result =
 			peg::token_parser::function_parens_and_body(&Tokens { tokens: &tokens }, &self.options);
 		parse_result_to_error(parse_result, &tokens)
@@ -207,8 +209,29 @@ impl<R: io::BufRead> Parser<R> {
 /// * `tokens` - The tokens to parse.
 /// * `options` - The options to use when parsing.
 pub fn parse_tokens(tokens: &[Token], options: &ParserOptions) -> Result<ast::Program, ParseError> {
+	validate_redirection_fds(tokens)?;
 	let parse_result = peg::token_parser::program(&Tokens { tokens }, options);
 	parse_result_to_error(parse_result, tokens)
+}
+
+fn validate_redirection_fds(tokens: &[Token]) -> Result<(), ParseError> {
+	for pair in tokens.windows(2) {
+		let [Token::Word(word, word_loc), Token::Operator(operator, operator_loc)] = pair else {
+			continue;
+		};
+		if word.chars().all(|c| c.is_ascii_digit())
+			&& operator.starts_with(['<', '>'])
+			&& word_loc.end.index == operator_loc.start.index
+			&& parse_redirection_fd(word).is_err()
+		{
+			return Err(ParseError::ParsingNear((*word_loc.start).clone()));
+		}
+	}
+	Ok(())
+}
+
+pub(super) fn parse_redirection_fd(word: &str) -> Result<ast::IoFd, &'static str> {
+	parse_bounded_number(word, "redirection file descriptor")
 }
 
 fn parse_result_to_error<R>(
