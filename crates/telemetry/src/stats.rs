@@ -248,7 +248,7 @@ pub struct UsageWindowSnapshot {
 pub struct UsageWindowAnalytics {
 	/// Number of reset cycles derived independently within each account.
 	pub resets:             u64,
-	/// Number of transitions into explicit quota exhaustion.
+	/// Number of reset-cycle transitions into explicit quota exhaustion.
 	pub exhaustion_count:   u64,
 	/// Timestamped maximum used fraction for each bounded chronological bucket.
 	pub peak_curve:         Vec<(u64, f64)>,
@@ -290,10 +290,6 @@ pub fn analyze_usage_window(
 		let mut previous_reset = None;
 		let mut previously_exhausted = false;
 		for snapshot in account {
-			if snapshot.exhausted && !previously_exhausted {
-				exhaustion_count = exhaustion_count.saturating_add(1);
-			}
-			previously_exhausted = snapshot.exhausted;
 			let reset_timestamp_changed = matches!((previous_reset, snapshot.resets_at), (Some(previous), Some(current)) if previous != current);
 			let mut fraction_reset = false;
 			if let Some(fraction) = snapshot.used_fraction.filter(|value| value.is_finite()) {
@@ -307,9 +303,14 @@ pub fn analyze_usage_window(
 				}
 				previous_fraction = Some(fraction);
 			}
-			if reset_timestamp_changed || fraction_reset {
+			let reset = reset_timestamp_changed || fraction_reset;
+			if reset {
 				resets = resets.saturating_add(1);
 			}
+			if snapshot.exhausted && (!previously_exhausted || reset) {
+				exhaustion_count = exhaustion_count.saturating_add(1);
+			}
+			previously_exhausted = snapshot.exhausted;
 			previous_reset = snapshot.resets_at.or(previous_reset);
 		}
 	}
