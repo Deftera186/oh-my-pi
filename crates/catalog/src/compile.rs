@@ -14,13 +14,15 @@ use toml::de;
 
 use crate::{
 	capability::{
-		AudioFormatBits, Availability, ChatCapabilities, DimensionRange, EmbeddingCapabilities,
-		EmbeddingFormatBits, EmbeddingInputBits, ImageCapabilities, ImageDecoderFamily,
-		ImageFeatureBits, ImageInputCapabilities, ImageInputFormatBits, ModalityBits,
-		ModelCapabilities, OperationBits, OperationKind, RealtimeCapabilities, RealtimeFeatureBits,
-		SearchCapabilities, SearchFeatureBits, SpeechCapabilities, SpeechFeatureBits,
-		TokenizationCapabilities, TokenizationFeatureBits, ToolCapabilities, ToolFeatureBits,
-		TranscriptionCapabilities, TranscriptionFeatureBits, VideoCapabilities, VideoFeatureBits,
+		AudioFormatBits, Availability, CacheRetentionBits, ChatCapabilities, DimensionRange,
+		EmbeddingCapabilities, EmbeddingFormatBits, EmbeddingInputBits, ImageCapabilities,
+		ImageDecoderFamily, ImageFeatureBits, ImageInputCapabilities, ImageInputFormatBits,
+		ModalityBits, ModelCapabilities, OperationBits, OperationKind, PromptCacheCapabilities,
+		RealtimeCapabilities, RealtimeFeatureBits, ReasoningCapabilities, ReasoningEffort,
+		ReasoningFeatureBits, SearchCapabilities, SearchFeatureBits, SpeechCapabilities,
+		SpeechFeatureBits, TokenizationCapabilities, TokenizationFeatureBits, ToolCapabilities,
+		ToolFeatureBits, TranscriptionCapabilities, TranscriptionFeatureBits, VideoCapabilities,
+		VideoFeatureBits,
 	},
 	cascade::{AxisMap, CascadeError, CompatCascade, ResolveTarget},
 	classify::{
@@ -37,9 +39,9 @@ use crate::{
 		ModelRemoteCompaction, ModelSpec, ProvenanceKind, ProvenanceSource,
 	},
 	policy::{
-		ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport, ExtendedContextMode,
-		MaxOutputTokensEmission, ReasoningBodyOverride, StreamWatchdog, ToolCallIdProfile,
-		WhenThinkingPolicy, WirePolicy,
+		ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
+		ExtendedContextMode, MaxOutputTokensEmission, PromptCacheMode, ReasoningBodyOverride,
+		StreamWatchdog, ToolCallIdProfile, WhenThinkingPolicy, WirePolicy,
 	},
 	pricing::{PremiumMultiplier, Price, PriceTier, PriceUnit, Pricing},
 	provider::{
@@ -56,15 +58,15 @@ use crate::{
 /// Schema version of reviewable normalized compiler output.
 pub const COMPILED_SCHEMA_VERSION: u32 = 1;
 /// Verified raw row count of the checked-in oracle.
-pub const ORACLE_RAW_MODELS: usize = 4_303;
+pub const ORACLE_RAW_MODELS: usize = 4_516;
 /// Verified normalized logical model count of the checked-in oracle.
-pub const ORACLE_LOGICAL_MODELS: usize = 4_178;
+pub const ORACLE_LOGICAL_MODELS: usize = 4_450;
 /// Verified curated provider count.
 pub const ORACLE_PROVIDERS: usize = 112;
 /// Verified number of provider keys present in raw model records.
-pub const ORACLE_RAW_PROVIDER_KEYS: usize = 81;
+pub const ORACLE_RAW_PROVIDER_KEYS: usize = 66;
 /// Verified number of distinct route URLs.
-pub const ORACLE_URLS: usize = 120;
+pub const ORACLE_URLS: usize = 121;
 /// Full transport vocabulary size in the oracle.
 pub const ORACLE_TRANSPORTS: usize = 16;
 /// Transport variants active in the checked-in oracle.
@@ -188,19 +190,22 @@ pub struct SourceCost {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceLongContextCost {
 	/// Exclusive prompt-token threshold.
-	pub input_threshold: u64,
+	pub input_threshold:           u64,
+	/// Whether the source threshold itself activates the replacement schedule.
+	#[serde(default)]
+	pub input_threshold_inclusive: bool,
 	/// Input price.
 	#[serde(default = "zero_number")]
-	pub input:           Number,
+	pub input:                     Number,
 	/// Output price.
 	#[serde(default = "zero_number")]
-	pub output:          Number,
+	pub output:                    Number,
 	/// Cache-read price.
 	#[serde(default = "zero_number")]
-	pub cache_read:      Number,
+	pub cache_read:                Number,
 	/// Cache-write price.
 	#[serde(default = "zero_number")]
-	pub cache_write:     Number,
+	pub cache_write:               Number,
 }
 
 /// Closed typed record parsed from one oracle model row.
@@ -306,6 +311,19 @@ pub struct SourceModelRecord {
 	/// Typed compatibility properties.
 	#[serde(default)]
 	pub compat: Option<SourceWirePolicy>,
+	/// Verbatim sparse compatibility properties retained by pi alongside the
+	/// resolved compatibility record.
+	#[serde(default)]
+	pub compat_config: Option<SourceWirePolicy>,
+	/// Whether the model requires reversible private-use glyph tokenization.
+	#[serde(default)]
+	pub requires_glyph_tokenization: Option<bool>,
+	/// Catalog-resolved local tokenizer family, retained as source metadata.
+	#[serde(default)]
+	pub tokenizer: Option<Str>,
+	/// Provider tool-surface restriction, retained as source metadata.
+	#[serde(default)]
+	pub tool_mode: Option<Str>,
 	/// Compiler-derived canonical metadata reference.
 	#[serde(skip)]
 	pub inherited_from: Option<ModelKey>,
@@ -983,6 +1001,10 @@ fn compile_with_oauth(
 		.iter()
 		.map(|(provider, source)| (provider.clone(), source.facets.clone()))
 		.collect::<BTreeMap<_, _>>();
+	let provider_transports = provider_sources
+		.iter()
+		.map(|(provider, source)| (provider.clone(), source.transport))
+		.collect::<BTreeMap<_, _>>();
 	inherit_source_references(&mut model_sources);
 	let raw_models = model_sources.values().map(BTreeMap::len).sum();
 	let active_transports = provider_sources
@@ -1018,8 +1040,10 @@ fn compile_with_oauth(
 		&mut wire_policy_table,
 		&mut thinking_policy_table,
 		&provider_facets,
+		&provider_transports,
 		&cascade,
 	)?;
+	enable_hosted_image_routes(&models, &mut routes);
 	let census = CompilerCensus {
 		raw_models,
 		logical_models: models.len(),
@@ -2829,7 +2853,7 @@ fn compile_oauth_specs(
 			SourceOAuthKind::DeviceCode => OAuthFlowSpec::DeviceCode {
 				device_authorization_url: source.authorize_url.clone(),
 				polling:                  OAuthPollingSpec {
-					maximum_polls:       120,
+					maximum_polls:       None,
 					default_interval_ms: 5_000,
 					maximum_interval_ms: 30_000,
 				},
@@ -2922,6 +2946,16 @@ fn facet_operations(facets: &[SourceFacet]) -> OperationBits {
 	clippy::type_complexity,
 	reason = "compiler phase returns each independently interned table"
 )]
+fn canonical_provider_base(provider: &str, base_url: Str) -> Str {
+	if provider == "azure"
+		&& (base_url.as_str().contains("{region}") || base_url.as_str().contains("{deployment}"))
+	{
+		Str::new_static("https://openai.azure.com/openai")
+	} else {
+		base_url
+	}
+}
+
 fn compile_providers(
 	providers: BTreeMap<Str, SourceProviderRecord>,
 	oauth_ids: &BTreeMap<Str, OAuthSpecId>,
@@ -2952,7 +2986,12 @@ fn compile_providers(
 		let auth = compile_auth(&source.auth, oauth_ids)?;
 		let auth_id = auth.id.clone();
 		auth_by_id.entry(auth_id.clone()).or_insert(auth);
-		let mut provider_auth_ids = Vec::with_capacity(2);
+		let mut provider_auth_ids = Vec::with_capacity(3);
+		let oauth_auth = source
+			.oauth_auth
+			.as_ref()
+			.map(|auth| compile_auth(auth, oauth_ids))
+			.transpose()?;
 		let login_auth = if let Some(flow) = source.oauth_flow.as_ref()
 			&& !matches!(&source.auth, SourceAuth::Oauth { flow: request_flow } if request_flow == flow)
 		{
@@ -2975,6 +3014,12 @@ fn compile_providers(
 			provider_auth_ids.push(login_auth.id.clone());
 		}
 		provider_auth_ids.push(auth_id.clone());
+		if let Some(oauth_auth) = oauth_auth {
+			provider_auth_ids.push(oauth_auth.id.clone());
+			auth_by_id
+				.entry(oauth_auth.id.clone())
+				.or_insert(oauth_auth);
+		}
 		if let Some(login_auth) = login_auth {
 			if !prefer_login {
 				provider_auth_ids.push(login_auth.id.clone());
@@ -3021,6 +3066,7 @@ fn compile_providers(
 			route_operations.insert_kind(OperationKind::Usage);
 		}
 		for (index, url) in urls.into_iter().enumerate() {
+			let url = canonical_provider_base(&provider_key, url);
 			validate_url(&url)?;
 			let suffix = if index == 0 {
 				"primary".to_owned()
@@ -3043,7 +3089,11 @@ fn compile_providers(
 				codec_profile: source.codec_profile,
 				codec,
 				transport,
-				endpoint: EndpointSpec { base_url: url, region: None },
+				endpoint: EndpointSpec {
+					base_url:    url,
+					region:      None,
+					api_version: source.api_version.clone(),
+				},
 				auth: auth_id.clone(),
 				headers: header_id.clone(),
 				discovery: discovery_id.clone(),
@@ -3069,14 +3119,14 @@ fn compile_providers(
 		}
 		for additional in &source.additional_transports {
 			let (codec, transport) = translate_transport(*additional);
+			let base_url = canonical_provider_base(&provider_key, source.base_url.clone());
 			let route_id = RouteId::new(format!("{provider_key}/{}", codec.as_str()));
 			if owned_routes.contains(&route_id) {
 				return Err(CompileError::Invariant(sf!(
 					"provider `{provider_key}` declares duplicate route `{route_id}`"
 				)));
 			}
-			let origin = source
-				.base_url
+			let origin = base_url
 				.as_str()
 				.split('/')
 				.take(3)
@@ -3088,7 +3138,11 @@ fn compile_providers(
 				codec_profile: source.codec_profile,
 				codec,
 				transport,
-				endpoint: EndpointSpec { base_url: source.base_url.clone(), region: None },
+				endpoint: EndpointSpec {
+					base_url,
+					region: None,
+					api_version: source.api_version.clone(),
+				},
 				auth: auth_id.clone(),
 				headers: header_id.clone(),
 				discovery: discovery_id.clone(),
@@ -3202,11 +3256,16 @@ fn compile_model_routes(
 		for (model, row) in rows {
 			let embedding_override = exact_capability_override(provider, model)
 				.is_some_and(|override_| override_.correction == CapabilityCorrection::Embedding);
-			let has_override = row
+			let endpoint_override = row
 				.base_url
 				.as_ref()
-				.is_some_and(|url| !url.trim().is_empty())
-				|| row.api.is_some()
+				.filter(|url| !url.trim().is_empty() && **url != primary.endpoint.base_url);
+			let transport_override = row.api.filter(|transport| {
+				let (codec, kind) = translate_transport(*transport);
+				codec != primary.codec || kind != primary.transport
+			});
+			let has_override = endpoint_override.is_some()
+				|| transport_override.is_some()
 				|| !row.headers.is_empty()
 				|| row.use_responses_lite.is_some()
 				|| row.prefer_websockets.is_some()
@@ -3217,7 +3276,7 @@ fn compile_model_routes(
 				continue;
 			}
 			let mut route = primary.clone();
-			if let Some(url) = row.base_url.as_ref().filter(|url| !url.trim().is_empty()) {
+			if let Some(url) = endpoint_override {
 				validate_url(url)?;
 				route.endpoint.base_url = url.clone();
 				route.trust_domain.origin = Str::from(
@@ -3228,7 +3287,7 @@ fn compile_model_routes(
 						.join("/"),
 				);
 			}
-			if let Some(transport) = row.api {
+			if let Some(transport) = transport_override {
 				(route.codec, route.transport) = translate_transport(transport);
 			}
 			if embedding_override {
@@ -3293,6 +3352,12 @@ fn compile_model_routes(
 			output.insert((provider.clone(), model.clone()), vec![route_id]);
 		}
 	}
+	for provider in providers {
+		let mut owned = provider.routes.to_vec();
+		owned.sort();
+		owned.dedup();
+		provider.routes = owned.into_boxed_slice();
+	}
 	routes.sort_by(|left, right| left.id.cmp(&right.id));
 	header_profiles.sort_by(|left, right| left.id.cmp(&right.id));
 	Ok(output)
@@ -3305,6 +3370,7 @@ fn compile_models(
 	policies: &mut BTreeMap<WirePolicyId, WirePolicy>,
 	thinking_policies: &mut BTreeMap<ThinkingPolicyId, ThinkingPolicy>,
 	provider_facets: &BTreeMap<Str, Vec<SourceFacet>>,
+	provider_transports: &BTreeMap<Str, SourceTransport>,
 	cascade: &CompatCascade,
 ) -> Result<(Vec<ModelSpec>, Vec<CatalogAlias>), CompileError> {
 	let mut output = Vec::new();
@@ -3320,6 +3386,10 @@ fn compile_models(
 			.get(&provider)
 			.map(Vec::as_slice)
 			.unwrap_or_default();
+		let provider_transport = provider_transports
+			.get(&provider)
+			.copied()
+			.ok_or_else(|| CompileError::Invariant(sf!("provider transport is missing")))?;
 		let identities: BTreeMap<Str, ModelClassification> = rows
 			.keys()
 			.map(|model| {
@@ -3374,6 +3444,16 @@ fn compile_models(
 				.1
 				.name
 				.clone()
+				.map(|name| {
+					if provider == "cursor"
+						&& logical_id.as_str().starts_with("cursor-grok-")
+						&& !name.as_str().starts_with("Cursor ")
+					{
+						Str::from(format!("Cursor {name}"))
+					} else {
+						name
+					}
+				})
 				.unwrap_or_else(|| humanize(&logical_id));
 			let context_window = members
 				.iter()
@@ -3432,16 +3512,28 @@ fn compile_models(
 			if resolved.thinking.contains_key("efforts") {
 				merged_row.reasoning = true;
 			}
-			let capabilities = conservative_capabilities(
+			let mut capabilities = conservative_capabilities(
 				&merged_row,
 				facets,
 				capability_override.map(|override_| override_.correction),
 			);
+			if hosted_image_model(&provider, &logical_id, &members, provider_transport) {
+				capabilities
+					.operations
+					.insert_kind(OperationKind::GenerateImage);
+				capabilities.image = Some(ImageCapabilities {
+					features:         ImageFeatureBits::GENERATE,
+					input_modalities: ModalityBits::TEXT,
+					maximum_outputs:  None,
+					maximum_pixels:   None,
+				});
+			}
 			let has_wire_overrides = !resolved.wire.is_empty();
 			let wire_overrides = axis_map_to_source_wire_policy(resolved.wire)?;
 			let thinking_profile = if capabilities.chat.is_none()
 				|| !merged_row.reasoning
 				|| !resolved.thinking.contains_key("efforts")
+				|| !resolved.thinking.contains_key("mode")
 			{
 				None
 			} else {
@@ -3452,21 +3544,18 @@ fn compile_models(
 			} else {
 				WirePolicy::baseline()
 			};
-			// Source-model compat remains a migration invariant until the upstream
-			// oracle drops the field.
-			for (wire, row, _) in &members {
-				if let Some(legacy) = row.compat.as_ref() {
-					let with_legacy = compile_wire_policy(wire_policy.clone(), legacy)?;
-					if with_legacy != wire_policy {
-						return Err(CompileError::Invariant(Str::from(format!(
-							"legacy source compat disagrees with cascade for `{provider}/{wire}`: \
-							 with_legacy={with_legacy:?} vs wire_policy={wire_policy:?}"
-						))));
-					}
+			// Verbatim source-stage compatibility metadata is authoritative for
+			// model-specific policy; the cascade supplies only absent defaults.
+			for (_, row, _) in &members {
+				if let Some(source) = row.compat_config.as_ref().or(row.compat.as_ref()) {
+					wire_policy = compile_wire_policy(wire_policy, source)?;
 				}
 			}
 			if let Some(enabled) = first.1.cursor_max_mode {
 				wire_policy.context.extended_mode = Some(ExtendedContextMode::from_enabled(enabled));
+			}
+			if first.1.requires_glyph_tokenization == Some(true) {
+				wire_policy.context.glyph_tokenization = Some(true);
 			}
 			if let Some(omit) = first.1.omit_max_output_tokens {
 				wire_policy.context.max_output_tokens = Some(if omit {
@@ -3497,15 +3586,19 @@ fn compile_models(
 					ComputerUseConfigSupport::Unsupported
 				});
 			}
-			let wire_policy_id = wire_policy.content_id();
-			policies
-				.entry(wire_policy_id.clone())
-				.or_insert(wire_policy);
 			let (thinking, mut thinking_routing) = if capabilities.chat.is_some() {
 				compile_thinking(provider.as_str(), &members, thinking_profile)?
 			} else {
 				(None, ThinkingRouting::default())
 			};
+			if let Some(chat) = capabilities.chat.as_mut() {
+				chat.reasoning = reasoning_capabilities(merged_row.reasoning, thinking.as_ref());
+				chat.prompt_caching = prompt_cache_capabilities(&wire_policy, &pricing);
+			}
+			let wire_policy_id = wire_policy.content_id();
+			policies
+				.entry(wire_policy_id.clone())
+				.or_insert(wire_policy);
 			if thinking.is_some()
 				&& let Some(mode) = first.1.reasoning_mode.as_deref()
 			{
@@ -3529,6 +3622,21 @@ fn compile_models(
 						target:     key.clone(),
 						rationale:  classified.evidence.rationale.clone(),
 						provenance: classified.evidence.provenance.clone(),
+					});
+				}
+			}
+			for wire in thinking_routing.effort_routing.values() {
+				if provider == "cursor"
+					&& wire.as_str() != logical_id.as_str()
+					&& !members
+						.iter()
+						.any(|(member, ..)| member.as_str() == wire.as_str())
+				{
+					aliases.push(CatalogAlias {
+						alias:      Str::from(format!("{provider}/{wire}")),
+						target:     key.clone(),
+						rationale:  sf!("provider-declared effort route of one logical model"),
+						provenance: sf!("catalog-oracle:thinking-routing"),
 					});
 				}
 			}
@@ -3661,6 +3769,50 @@ fn compile_models(
 		.collect::<BTreeSet<_>>();
 	thinking_policies.retain(|id, _| attached.contains(id));
 	Ok((output, aliases))
+}
+
+fn hosted_image_model(
+	provider: &str,
+	logical_id: &str,
+	members: &[(Str, SourceModelRecord, ModelClassification)],
+	provider_transport: SourceTransport,
+) -> bool {
+	if !crate::model_operation_overrides(provider, logical_id)
+		.contains_kind(OperationKind::GenerateImage)
+	{
+		return false;
+	}
+	members.iter().any(|(_, row, _)| {
+		matches!(
+			row.api.unwrap_or(provider_transport),
+			SourceTransport::OpenAiResponses | SourceTransport::OpenAiCodex
+		)
+	})
+}
+
+fn enable_hosted_image_routes(models: &[ModelSpec], routes: &mut [RouteDef]) {
+	let image_routes = models
+		.iter()
+		.filter(|model| {
+			model
+				.capabilities
+				.operations
+				.contains_kind(OperationKind::GenerateImage)
+		})
+		.flat_map(|model| model.routes.iter())
+		.collect::<BTreeSet<_>>();
+	for route in routes {
+		if image_routes.contains(&route.id)
+			&& matches!(route.provider.as_str(), "openai" | "openai-codex")
+			&& matches!(route.codec.as_str(), "openai-responses" | "openai-codex")
+		{
+			route
+				.capability_limits
+				.operations
+				.get_or_insert_with(OperationBits::empty)
+				.insert_kind(OperationKind::GenerateImage);
+		}
+	}
 }
 
 fn retarget_collapsed_model_references(models: &mut [ModelSpec], aliases: &[CatalogAlias]) {
@@ -3930,6 +4082,24 @@ where
 		.map(|parsed| parsed.or(inherited))
 }
 
+fn inferred_cursor_default(model: &str) -> Option<ThinkingEffort> {
+	match model {
+		"claude-opus-5-thinking" => Some(ThinkingEffort::XHigh),
+		"gemini-3.6-flash" => Some(ThinkingEffort::Minimal),
+		"glm-5.2" => Some(ThinkingEffort::High),
+		"cursor-grok-4.5"
+		| "cursor-grok-4.5-fast"
+		| "gpt-5.4"
+		| "gpt-5.4-mini"
+		| "gpt-5.4-nano"
+		| "gpt-5.5"
+		| "gpt-5.6-luna"
+		| "gpt-5.6-sol"
+		| "gpt-5.6-terra" => Some(ThinkingEffort::Low),
+		_ => None,
+	}
+}
+
 fn compile_thinking(
 	provider: &str,
 	members: &[(Str, SourceModelRecord, ModelClassification)],
@@ -3945,7 +4115,7 @@ fn compile_thinking(
 	let tier_collapsed = classified_efforts.len() >= 2;
 	let synthesize_cursor =
 		supports_dynamic_effort_siblings(provider) && tier_collapsed && source.is_none();
-	let profile = if synthesize_cursor {
+	let mut profile = if synthesize_cursor {
 		let efforts = classified_efforts
 			.iter()
 			.copied()
@@ -3987,6 +4157,15 @@ fn compile_thinking(
 	} else {
 		profile
 	};
+	if supports_dynamic_effort_siblings(provider)
+		&& let Some(profile) = profile.as_mut()
+		&& profile.default_level.is_none()
+		&& let Some(default) = inferred_cursor_default(members[0].2.logical_model.as_str())
+		&& profile.supports(default)
+	{
+		profile.default_level = Some(default);
+		profile.requires_effort = Some(true);
+	}
 	if let Some(profile) = &profile {
 		profile.validate().map_err(|error| {
 			CompileError::Invariant(Str::from(format!("invalid thinking profile: {error}")))
@@ -4001,6 +4180,15 @@ fn compile_thinking(
 			.map(|(effort, wire)| (*effort, WireModelId::new(wire.clone())))
 			.collect();
 		routing.reasoning_mode = thinking.reasoning_mode;
+		if provider != "cursor" && !routing.effort_routing.is_empty() {
+			let (wire, row, _) = &members[0];
+			routing
+				.effort_routing
+				.entry(ThinkingEffort::Off)
+				.or_insert_with(|| {
+					WireModelId::new(row.request_model_id.clone().unwrap_or_else(|| wire.clone()))
+				});
+		}
 	}
 	for (wire, row, classified) in members {
 		if tier_collapsed
@@ -4058,6 +4246,12 @@ fn compile_thinking(
 		);
 	}
 	if let Some(profile) = &profile {
+		routing
+			.effort_map
+			.retain(|effort, _| profile.supports(*effort));
+		routing.effort_routing.retain(|effort, _| {
+			(*effort == ThinkingEffort::Off && provider != "cursor") || profile.supports(*effort)
+		});
 		routing.validate(profile).map_err(|error| {
 			CompileError::Invariant(Str::from(format!("invalid thinking routing: {error}")))
 		})?;
@@ -4361,7 +4555,10 @@ fn conservative_capabilities(
 					maximum_tools: None,
 				}),
 				Some(false) => Availability::Unsupported,
-				None => Availability::Unknown,
+				None => Availability::Native(ToolCapabilities {
+					features:      ToolFeatureBits::empty(),
+					maximum_tools: None,
+				}),
 			},
 			hosted_tools:      Availability::Unknown,
 			prompt_caching:    Availability::Unknown,
@@ -4459,6 +4656,114 @@ fn conservative_capabilities(
 	}
 }
 
+fn reasoning_effort(effort: ThinkingEffort) -> ReasoningEffort {
+	match effort {
+		ThinkingEffort::Off => ReasoningEffort::Off,
+		ThinkingEffort::Minimal => ReasoningEffort::Minimal,
+		ThinkingEffort::Low => ReasoningEffort::Low,
+		ThinkingEffort::Medium => ReasoningEffort::Medium,
+		ThinkingEffort::High => ReasoningEffort::High,
+		ThinkingEffort::XHigh => ReasoningEffort::Xhigh,
+		ThinkingEffort::Max => ReasoningEffort::Max,
+	}
+}
+
+fn reasoning_capabilities(
+	declared: bool,
+	policy: Option<&ThinkingPolicy>,
+) -> Availability<ReasoningCapabilities> {
+	let Some(policy) = policy else {
+		return if declared {
+			Availability::Native(ReasoningCapabilities {
+				features:              ReasoningFeatureBits::empty(),
+				efforts:               Box::new([]),
+				minimum_budget_tokens: None,
+				maximum_budget_tokens: None,
+			})
+		} else {
+			Availability::Unsupported
+		};
+	};
+	let mut features = ReasoningFeatureBits::empty();
+	if !policy.efforts.is_empty() {
+		features |= ReasoningFeatureBits::EFFORT;
+	}
+	if matches!(policy.mode, ThinkingMode::Budget | ThinkingMode::AnthropicBudgetEffort)
+		|| !policy.effort_budgets.is_empty()
+	{
+		features |= ReasoningFeatureBits::BUDGET;
+	}
+	if policy.supports_display != Some(false) {
+		features |= ReasoningFeatureBits::VISIBLE;
+	}
+	let mut budgets = policy
+		.effort_budgets
+		.values()
+		.filter_map(|value| u32::try_from(*value).ok());
+	let first_budget = budgets.next();
+	let (minimum_budget_tokens, maximum_budget_tokens) =
+		budgets.fold((first_budget, first_budget), |(minimum, maximum), value| {
+			(
+				Some(minimum.map_or(value, |current| current.min(value))),
+				Some(maximum.map_or(value, |current| current.max(value))),
+			)
+		});
+	Availability::Native(ReasoningCapabilities {
+		features,
+		efforts: policy
+			.efforts
+			.iter()
+			.copied()
+			.map(reasoning_effort)
+			.collect(),
+		minimum_budget_tokens,
+		maximum_budget_tokens,
+	})
+}
+
+fn prompt_cache_capabilities(
+	policy: &WirePolicy,
+	pricing: &Pricing,
+) -> Availability<PromptCacheCapabilities> {
+	let explicit = matches!(
+		policy.cache.control_format,
+		Some(CacheControlFormat::Anthropic | CacheControlFormat::OpenAi | CacheControlFormat::Google)
+	);
+	let automatic_or_explicit = policy
+		.cache
+		.prompt_cache_mode
+		.is_some_and(|mode| matches!(mode, PromptCacheMode::Automatic | PromptCacheMode::Explicit));
+	let priced = pricing.components.iter().any(|price| {
+		matches!(price.unit, PriceUnit::MtokCacheRead | PriceUnit::MtokCacheWrite)
+			&& price.nanos_usd > 0
+	});
+	if !explicit
+		&& !automatic_or_explicit
+		&& !priced
+		&& policy.cache.supports_long_retention != Some(true)
+	{
+		return Availability::Unknown;
+	}
+	let mut retention = CacheRetentionBits::empty();
+	if explicit || automatic_or_explicit {
+		retention |= CacheRetentionBits::EPHEMERAL;
+	}
+	if priced {
+		retention |= CacheRetentionBits::STANDARD;
+	}
+	if policy.cache.supports_long_retention == Some(true) {
+		retention |= CacheRetentionBits::LONG;
+	}
+	Availability::Native(PromptCacheCapabilities {
+		retention,
+		minimum_prefix_tokens: policy
+			.cache
+			.minimum_tokens
+			.and_then(|value| u32::try_from(value).ok()),
+		maximum_breakpoints: policy.cache.maximum_checkpoints,
+	})
+}
+
 fn modalities(values: &[SourceModality]) -> ModalityBits {
 	values.iter().fold(ModalityBits::empty(), |bits, value| {
 		bits
@@ -4542,7 +4847,11 @@ fn compile_pricing(
 	let mut tiers = Vec::new();
 	if let Some(tier) = long_context {
 		tiers.push(PriceTier {
-			prompt_tokens_above: tier.input_threshold,
+			prompt_tokens_above: if tier.input_threshold_inclusive {
+				tier.input_threshold.saturating_sub(1)
+			} else {
+				tier.input_threshold
+			},
 			components:          price_components(
 				&tier.input,
 				&tier.output,
@@ -4662,7 +4971,11 @@ fn compile_auth(
 				}
 				credential_sources.push(CredentialSourceSpec::Stored);
 				(
-					AuthSpecKind::Bearer,
+					if matches!(source, SourceAuth::OptionalBearer { .. }) {
+						AuthSpecKind::OptionalBearer
+					} else {
+						AuthSpecKind::Bearer
+					},
 					Some(sf!("authorization")),
 					None,
 					Some(sf!("Bearer ")),
@@ -4952,6 +5265,12 @@ mod tests {
 
 	use super::*;
 	use crate::pricing::{NanoUsd, UsageDimensions};
+	fn compile_provider_registry() -> CompiledCatalog {
+		let providers = include_str!("../../../fixtures/llm-oracle/catalog/providers.toml");
+		let models = zstd::stream::encode_all(&br"{}"[..], 1).expect("fixture compression");
+		compile(parse_oracle(providers, &models).expect("provider registry parses"))
+			.expect("provider registry compiles")
+	}
 	fn source_model(value: Value) -> SourceModelRecord {
 		serde_json::from_value(value).expect("source model")
 	}
@@ -5195,6 +5514,220 @@ discovery = { kind = "open-ai-models", label = "Synthetic", authoritative = fals
 			.find(|model| model.key.as_str() == "synthetic/model")
 			.expect("compiled model");
 		assert_eq!(model.routes.as_ref(), &[RouteId::from("synthetic/primary")]);
+	}
+
+	#[test]
+	fn redundant_model_transport_metadata_reuses_the_provider_route() {
+		let providers = r#"
+[providers.synthetic]
+transport = "open-ai-responses"
+base_url = "https://example.test/v1"
+facets = ["chat"]
+"#;
+		let models = br#"{"synthetic":{"model":{"api":"openai-responses","baseUrl":"https://example.test/v1","input":["text"]}}}"#;
+		let compressed = zstd::stream::encode_all(&models[..], 1).expect("fixture compression");
+		let compiled = compile(parse_oracle(providers, &compressed).expect("typed source"))
+			.expect("catalog compilation");
+		let model = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == "synthetic/model")
+			.expect("compiled model");
+		assert_eq!(model.routes.as_ref(), &[RouteId::from("synthetic/primary")]);
+	}
+
+	#[test]
+	fn responses_models_admit_hosted_image_generation_by_exact_contract() {
+		let providers = r#"
+[providers.openai]
+transport = "open-ai-responses"
+base_url = "https://api.openai.test/v1"
+facets = ["chat"]
+"#;
+		let models = br#"{"openai":{"gpt-image-chat":{"api":"openai-responses","input":["text"]},"legacy-image":{"api":"openai-responses","input":["text"]},"gpt-chat-completions":{"api":"openai-completions","input":["text"]}}}"#;
+		let compressed = zstd::stream::encode_all(&models[..], 1).expect("fixture compression");
+		let compiled = compile(parse_oracle(providers, &compressed).expect("typed source"))
+			.expect("catalog compilation");
+		for (model, expected) in [
+			("openai/gpt-image-chat", true),
+			("openai/legacy-image", false),
+			("openai/gpt-chat-completions", false),
+		] {
+			let model = compiled
+				.models
+				.iter()
+				.find(|candidate| candidate.key.as_str() == model)
+				.expect("compiled model");
+			assert_eq!(
+				model
+					.capabilities
+					.operations
+					.contains_kind(OperationKind::GenerateImage),
+				expected,
+				"{}",
+				model.key
+			);
+			assert_eq!(model.capabilities.image.is_some(), expected, "{}", model.key);
+		}
+		let image_model = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == "openai/gpt-image-chat")
+			.expect("image model");
+		for route_id in &image_model.routes {
+			let route = compiled
+				.routes
+				.iter()
+				.find(|route| route.id == *route_id)
+				.expect("image route");
+			assert!(
+				route
+					.capability_limits
+					.operations
+					.is_some_and(|operations| {
+						operations.contains_kind(OperationKind::GenerateImage)
+					})
+			);
+		}
+	}
+
+	#[test]
+	fn provider_metadata_preserves_optional_oauth_bearer_and_azure_version() {
+		let compiled = compile_provider_registry();
+		let ollama = compiled
+			.providers
+			.iter()
+			.find(|provider| provider.id.as_str() == "ollama")
+			.expect("Ollama provider");
+		let ollama_auth = compiled
+			.auth_specs
+			.iter()
+			.find(|auth| auth.id == ollama.auth[0])
+			.expect("Ollama auth");
+		assert_eq!(ollama_auth.kind, AuthSpecKind::OptionalBearer);
+
+		let anthropic = compiled
+			.providers
+			.iter()
+			.find(|provider| provider.id.as_str() == "anthropic")
+			.expect("Anthropic provider");
+		let anthropic_auth = anthropic
+			.auth
+			.iter()
+			.filter_map(|id| compiled.auth_specs.iter().find(|auth| &auth.id == id))
+			.collect::<Vec<_>>();
+		let api_key_names = anthropic_auth
+			.iter()
+			.find(|auth| auth.kind == AuthSpecKind::ApiKey)
+			.and_then(|auth| auth.credential_sources.first())
+			.and_then(|source| match source {
+				CredentialSourceSpec::Environment { ordered_names } => Some(ordered_names),
+				_ => None,
+			})
+			.expect("Anthropic API-key environment");
+		assert!(
+			!api_key_names
+				.iter()
+				.any(|name| name.as_str() == "OMP_ANTHROPIC_OAUTH_TOKEN")
+		);
+		let bearer_names = anthropic_auth
+			.iter()
+			.find(|auth| auth.kind == AuthSpecKind::Bearer)
+			.and_then(|auth| auth.credential_sources.first())
+			.and_then(|source| match source {
+				CredentialSourceSpec::Environment { ordered_names } => Some(ordered_names),
+				_ => None,
+			})
+			.expect("Anthropic OAuth bearer environment");
+		assert_eq!(bearer_names.as_ref(), &[sf!("OMP_ANTHROPIC_OAUTH_TOKEN")]);
+
+		let azure = compiled
+			.routes
+			.iter()
+			.find(|route| route.id.as_str() == "azure/primary")
+			.expect("Azure primary route");
+		assert_eq!(azure.endpoint.api_version.as_deref(), Some("2024-10-21"));
+		for route in compiled
+			.routes
+			.iter()
+			.filter(|route| route.provider.as_str() == "azure")
+		{
+			assert_eq!(route.endpoint.base_url.as_str(), "https://openai.azure.com/openai");
+			assert_eq!(route.trust_domain.origin.as_str(), "https://openai.azure.com");
+			assert!(
+				!route.endpoint.base_url.as_str().contains('{')
+					&& !route.endpoint.base_url.as_str().contains('}')
+			);
+		}
+		let gitlab = compiled
+			.routes
+			.iter()
+			.find(|route| route.id.as_str() == "gitlab-duo-agent/primary")
+			.expect("GitLab Duo agent route");
+		assert_eq!(gitlab.endpoint.base_url.as_str(), "https://gitlab.com");
+		assert_eq!(gitlab.codec.as_str(), "gitlab-duo");
+		assert!(gitlab.discovery.is_some());
+		let operations = gitlab
+			.capability_limits
+			.operations
+			.expect("GitLab route operations");
+		assert!(operations.contains_kind(OperationKind::Chat));
+		assert!(operations.contains_kind(OperationKind::DiscoverModels));
+	}
+
+	#[test]
+	fn device_polling_defers_attempt_limit_to_provider_expiry() {
+		let (specs, _) =
+			compile_oauth_specs(include_str!("../../../fixtures/llm-oracle/catalog/oauth.toml"))
+				.expect("OAuth specs compile");
+		for polling in specs.iter().filter_map(|spec| match &spec.flow {
+			OAuthFlowSpec::DeviceCode { polling, .. } => Some(polling),
+			OAuthFlowSpec::Custom { polling: Some(polling), .. } => Some(polling),
+			_ => None,
+		}) {
+			assert_eq!(polling.maximum_polls, None);
+		}
+	}
+
+	#[test]
+	fn affirmative_and_default_chat_capabilities_lower_to_native_constraints() {
+		let row = source_model(serde_json::json!({
+			"reasoning": true,
+			"input": ["text"],
+			"thinking": {
+				"mode": "effort",
+				"efforts": ["low", "high"]
+			}
+		}));
+		let capabilities = conservative_capabilities(&row, &[SourceFacet::Chat], None);
+		let chat = capabilities.chat.expect("chat capabilities");
+		assert!(chat.tools.constraints().is_some(), "absent supportsTools defaults to native");
+
+		let thinking =
+			ThinkingPolicy::new(ThinkingMode::Effort, [ThinkingEffort::Low, ThinkingEffort::High])
+				.expect("thinking policy");
+		let reasoning = reasoning_capabilities(true, Some(&thinking));
+		let reasoning = reasoning.constraints().expect("native reasoning");
+		assert!(reasoning.features.contains(ReasoningFeatureBits::EFFORT));
+		assert_eq!(reasoning.efforts.as_ref(), &[ReasoningEffort::Low, ReasoningEffort::High]);
+
+		let mut wire = WirePolicy::overrides();
+		wire.cache.control_format = Some(CacheControlFormat::Anthropic);
+		wire.cache.supports_long_retention = Some(true);
+		wire.cache.minimum_tokens = Some(1_024);
+		wire.cache.maximum_checkpoints = Some(4);
+		let pricing =
+			Pricing::new(vec![Price { unit: PriceUnit::MtokCacheRead, nanos_usd: 100 }], Vec::new())
+				.expect("cache pricing");
+		let cache_capabilities = prompt_cache_capabilities(&wire, &pricing);
+		let cache = cache_capabilities
+			.constraints()
+			.expect("native prompt caching");
+		assert!(cache.retention.contains(CacheRetentionBits::EPHEMERAL));
+		assert!(cache.retention.contains(CacheRetentionBits::STANDARD));
+		assert!(cache.retention.contains(CacheRetentionBits::LONG));
+		assert_eq!(cache.minimum_prefix_tokens, Some(1_024));
+		assert_eq!(cache.maximum_breakpoints, Some(4));
 	}
 
 	#[test]

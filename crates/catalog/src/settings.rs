@@ -2,7 +2,12 @@
 
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 
-use std::{collections::BTreeMap, sync, time::Duration};
+use std::{
+	collections::BTreeMap,
+	path::{Component, Path, PathBuf},
+	sync,
+	time::Duration,
+};
 
 use omp_core::Str;
 use omp_settings::{
@@ -210,10 +215,65 @@ pub enum CacheRetentionSetting {
 	Long,
 }
 
+/// Persistence scope for configured model role assignments.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Display,
+	EnumString,
+	Eq,
+	IntoStaticStr,
+	PartialEq,
+	Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
+pub enum ModelRoleStorage {
+	/// Persist role assignments in the active global profile.
+	#[default]
+	Global,
+	/// Persist role assignments in project settings with global fallback.
+	Project,
+}
+
+/// Presentation metadata for one configured model role.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelTag {
+	/// Human-readable role label.
+	pub name:   Str,
+	/// Optional presentation color.
+	#[serde(default)]
+	pub color:  Option<Str>,
+	/// Whether the role is functional but omitted from selectors.
+	#[serde(default)]
+	pub hidden: bool,
+}
+
+/// Model selector assignments keyed by role name.
+pub type ModelRoles = BTreeMap<Str, Str>;
+
+/// Presentation metadata keyed by role name.
+pub type ModelTags = BTreeMap<Str, ModelTag>;
+
 /// Catalog-owned model and provider policy projection.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ModelSettings {
+	/// Model selector assignments keyed by role name.
+	pub roles:                    ModelRoles,
+	/// Persistence scope for model role assignments.
+	pub role_storage:             ModelRoleStorage,
+	/// Presentation metadata keyed by model role.
+	pub tags:                     ModelTags,
+	/// Role names in quick-cycle order.
+	pub cycle_order:              ArcStrList,
+	/// Optional canonical model selector allow-list.
+	pub enabled_models:           PathScopedStrList,
+	/// Provider ids excluded from discovery, selection, and routing.
+	pub disabled_providers:       PathScopedStrList,
 	/// Default thinking effort used when a caller leaves effort unset.
 	pub default_thinking:         ThinkingEffort,
 	/// Universal configured reasoning ceiling.
@@ -252,12 +312,67 @@ pub struct ModelSettings {
 	pub unexpected_stop_selector: Str,
 }
 
-/// Clone-cheap provider priority sequence.
+/// Clone-cheap string sequence.
 pub type ArcStrList = sync::Arc<[Str]>;
+
+/// One string or a string sequence in path-scoped settings syntax.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum OneOrManyStr {
+	/// One value.
+	One(Str),
+	/// Multiple values.
+	Many(Box<[Str]>),
+}
+
+/// One mixed bare or path-scoped string-list entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum PathScopedStringEntry {
+	/// A value active in every working directory.
+	Bare(Str),
+	/// Values active below at least one configured path prefix.
+	Scoped(PathScopedStringValues),
+}
+
+/// Path predicates and values for one scoped list entry.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PathScopedStringValues {
+	/// Singular path prefix.
+	pub path:          Option<OneOrManyStr>,
+	/// Path-prefix sequence.
+	pub paths:         Option<OneOrManyStr>,
+	/// Singular legacy path-prefix spelling.
+	pub path_prefix:   Option<OneOrManyStr>,
+	/// Legacy path-prefix sequence spelling.
+	pub path_prefixes: Option<OneOrManyStr>,
+	/// Generic values.
+	pub values:        Option<OneOrManyStr>,
+	/// Generic item spelling.
+	pub items:         Option<OneOrManyStr>,
+	/// Model selectors used by enabled-model entries.
+	pub models:        Option<OneOrManyStr>,
+	/// Provider ids used by disabled-provider entries.
+	pub providers:     Option<OneOrManyStr>,
+}
+
+/// Clone-cheap mixed global/path-scoped string-list source.
+pub type PathScopedStrList = sync::Arc<[PathScopedStringEntry]>;
 
 impl Default for ModelSettings {
 	fn default() -> Self {
 		Self {
+			roles:                    BTreeMap::new(),
+			role_storage:             ModelRoleStorage::Global,
+			tags:                     BTreeMap::new(),
+			cycle_order:              sync::Arc::from([
+				Str::new_static("smol"),
+				Str::new_static("default"),
+				Str::new_static("slow"),
+			]),
+			enabled_models:           sync::Arc::from([]),
+			disabled_providers:       sync::Arc::from([]),
 			default_thinking:         ThinkingEffort::Medium,
 			thinking_ceiling:         ThinkingEffort::Max,
 			thinking_budgets:         ThinkingBudgets::default(),
@@ -301,6 +416,114 @@ impl ModelSettings {
 			.iter()
 			.position(|item| item == provider)
 			.unwrap_or(usize::MAX)
+	}
+
+	/// Returns the configured selector for one role.
+	pub fn role_selector(&self, role: &str) -> Option<&Str> {
+		self.roles.get(role)
+	}
+
+	/// Returns presentation metadata for one role.
+	pub fn role_tag(&self, role: &str) -> Option<&ModelTag> {
+		self.tags.get(role)
+	}
+
+	/// Returns a role's quick-cycle rank; unlisted roles follow configured ones.
+	pub fn cycle_rank(&self, role: &str) -> usize {
+		self
+			.cycle_order
+			.iter()
+			.position(|configured| configured == role)
+			.unwrap_or(usize::MAX)
+	}
+
+	/// Resolves enabled-model entries for an exact working directory.
+	pub fn resolved_enabled_models(&self, cwd: &Path, home: &Path) -> ArcStrList {
+		resolve_path_scoped(&self.enabled_models, cwd, home, ScopedValueKind::Models)
+	}
+
+	/// Resolves disabled-provider entries for an exact working directory.
+	pub fn resolved_disabled_providers(&self, cwd: &Path, home: &Path) -> ArcStrList {
+		resolve_path_scoped(&self.disabled_providers, cwd, home, ScopedValueKind::Providers)
+	}
+
+	/// Clones these settings into one frozen working-directory projection.
+	///
+	/// The returned enabled-model and disabled-provider lists contain only bare
+	/// entries, so downstream routing, inference, and discovery do not retain
+	/// filesystem context.
+	pub fn resolve_path_scopes(&self, cwd: &Path, home: &Path) -> Self {
+		let mut resolved = self.clone();
+		resolved.enabled_models = self
+			.resolved_enabled_models(cwd, home)
+			.iter()
+			.cloned()
+			.map(PathScopedStringEntry::Bare)
+			.collect::<Vec<_>>()
+			.into();
+		resolved.disabled_providers = self
+			.resolved_disabled_providers(cwd, home)
+			.iter()
+			.cloned()
+			.map(PathScopedStringEntry::Bare)
+			.collect::<Vec<_>>()
+			.into();
+		resolved
+	}
+
+	/// Reports whether a provider remains eligible using bare global entries.
+	pub fn provider_allowed(&self, provider: &str) -> bool {
+		!self
+			.disabled_providers
+			.iter()
+			.any(|entry| matches!(entry, PathScopedStringEntry::Bare(value) if value == provider))
+	}
+
+	/// Reports whether a provider remains eligible at an exact working
+	/// directory.
+	pub fn provider_allowed_at(&self, cwd: &Path, home: &Path, provider: &str) -> bool {
+		!self
+			.resolved_disabled_providers(cwd, home)
+			.iter()
+			.any(|disabled| disabled == provider)
+	}
+
+	/// Reports whether a canonical identity is inside the bare global model
+	/// scope.
+	pub fn model_allowed(&self, provider: &str, model: &str) -> bool {
+		let patterns = self.enabled_models.iter().filter_map(|entry| match entry {
+			PathScopedStringEntry::Bare(value) => Some(value),
+			PathScopedStringEntry::Scoped(_) => None,
+		});
+		self.provider_allowed(provider) && model_matches(patterns, provider, model)
+	}
+
+	/// Reports whether a canonical identity is inside the resolved
+	/// working-directory scope.
+	pub fn model_allowed_at(&self, cwd: &Path, home: &Path, provider: &str, model: &str) -> bool {
+		let patterns = self.resolved_enabled_models(cwd, home);
+		self.provider_allowed_at(cwd, home, provider)
+			&& model_matches(patterns.iter(), provider, model)
+	}
+
+	/// Returns the stable routing rank for an eligible model.
+	pub fn model_rank(&self, provider: &str, model: &str) -> Option<usize> {
+		self
+			.model_allowed(provider, model)
+			.then(|| self.provider_rank(provider))
+	}
+
+	/// Returns the stable routing rank in a resolved working-directory scope.
+	pub fn model_rank_at(
+		&self,
+		cwd: &Path,
+		home: &Path,
+		provider: &str,
+		model: &str,
+	) -> Option<usize> {
+		self
+			.model_allowed_at(cwd, home, provider, model)
+			.then(|| self.provider_rank(provider))
 	}
 
 	/// Resolves route family and provider-specific tier policy.
@@ -409,6 +632,17 @@ pub enum SpecialModelPurpose {
 impl SettingsDomain for ModelSettings {
 	const DOMAIN: &'static str = "model";
 	const FIELDS: &'static [FieldDescriptor] = &[
+		field("model.roles", "Model Roles", SettingKind::Table, 1),
+		field(
+			"model.role_storage",
+			"Model Role Storage",
+			SettingKind::Enum(&["global", "project"]),
+			2,
+		),
+		field("model.tags", "Model Role Tags", SettingKind::Table, 3),
+		field("model.cycle_order", "Model Cycle Order", SettingKind::Array, 4),
+		field("model.enabled_models", "Enabled Models", SettingKind::Array, 5),
+		field("model.disabled_providers", "Disabled Providers", SettingKind::Array, 6),
 		field(
 			"model.default_thinking",
 			"Default Thinking",
@@ -501,20 +735,24 @@ impl SettingsDomain for ModelSettings {
 		]
 		.into_iter()
 		.all(|value| !value.trim().is_empty());
-		let priority_valid = self
-			.provider_order
+		let lists_valid = unique_nonempty(&self.provider_order)
+			&& unique_nonempty(&self.cycle_order)
+			&& scoped_entries_valid(&self.enabled_models, ScopedValueKind::Models)
+			&& scoped_entries_valid(&self.disabled_providers, ScopedValueKind::Providers);
+		let roles_valid = self
+			.roles
 			.iter()
-			.enumerate()
-			.all(|(index, value)| {
-				!value.is_empty()
-					&& self.provider_order[..index]
-						.iter()
-						.all(|prior| prior != value)
-			});
+			.all(|(role, selector)| !role.trim().is_empty() && !selector.trim().is_empty());
+		let tags_valid = self
+			.tags
+			.iter()
+			.all(|(role, tag)| !role.trim().is_empty() && !tag.name.trim().is_empty());
 		if ordered.iter().all(|value| *value > 0)
 			&& ordered.windows(2).all(|pair| pair[0] <= pair[1])
 			&& selectors_valid
-			&& priority_valid
+			&& lists_valid
+			&& roles_valid
+			&& tags_valid
 		{
 			Ok(())
 		} else {
@@ -540,6 +778,162 @@ const fn field(
 		condition: None,
 		secret: false,
 	}
+}
+
+impl OneOrManyStr {
+	fn as_slice(&self) -> &[Str] {
+		match self {
+			Self::One(value) => std::slice::from_ref(value),
+			Self::Many(values) => values,
+		}
+	}
+}
+
+#[derive(Clone, Copy)]
+enum ScopedValueKind {
+	Models,
+	Providers,
+}
+
+fn scoped_values(source: &PathScopedStringValues, kind: ScopedValueKind) -> Vec<&Str> {
+	match kind {
+		ScopedValueKind::Models => source.models.iter(),
+		ScopedValueKind::Providers => source.providers.iter(),
+	}
+	.chain(source.values.iter())
+	.chain(source.items.iter())
+	.flat_map(OneOrManyStr::as_slice)
+	.collect()
+}
+
+fn scoped_prefixes(source: &PathScopedStringValues) -> impl Iterator<Item = &Str> {
+	source
+		.path
+		.iter()
+		.chain(source.paths.iter())
+		.chain(source.path_prefix.iter())
+		.chain(source.path_prefixes.iter())
+		.flat_map(OneOrManyStr::as_slice)
+}
+
+fn resolve_path_scoped(
+	entries: &[PathScopedStringEntry],
+	cwd: &Path,
+	home: &Path,
+	kind: ScopedValueKind,
+) -> ArcStrList {
+	let cwd = normalize_path(cwd, cwd, home);
+	let mut resolved = Vec::new();
+	for entry in entries {
+		match entry {
+			PathScopedStringEntry::Bare(value) => resolved.push(value.clone()),
+			PathScopedStringEntry::Scoped(source)
+				if scoped_prefixes(source).any(|prefix| {
+					cwd.starts_with(normalize_path(Path::new(prefix.as_str()), &cwd, home))
+				}) =>
+			{
+				resolved.extend(scoped_values(source, kind).into_iter().cloned());
+			},
+			PathScopedStringEntry::Scoped(_) => {},
+		}
+	}
+	resolved.into()
+}
+
+fn normalize_path(path: &Path, cwd: &Path, home: &Path) -> PathBuf {
+	let expanded = path.to_str().map_or_else(
+		|| path.to_owned(),
+		|text| {
+			if text == "~" {
+				home.to_owned()
+			} else if let Some(relative) = text.strip_prefix("~/") {
+				home.join(relative)
+			} else if path.is_absolute() {
+				path.to_owned()
+			} else {
+				cwd.join(path)
+			}
+		},
+	);
+	let mut normalized = PathBuf::new();
+	for component in expanded.components() {
+		match component {
+			Component::CurDir => {},
+			Component::ParentDir => {
+				normalized.pop();
+			},
+			Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+			Component::RootDir => normalized.push(Path::new("/")),
+			Component::Normal(value) => normalized.push(value),
+		}
+	}
+	normalized
+}
+
+fn model_matches<'a>(patterns: impl Iterator<Item = &'a Str>, provider: &str, model: &str) -> bool {
+	let logical_id = model
+		.split_once('/')
+		.map_or(model, |(_, logical_id)| logical_id);
+	let mut configured = false;
+	let mut matched = false;
+	for pattern in patterns {
+		configured = true;
+		matched |= pattern.split_once('/').map_or_else(
+			|| glob_matches(pattern.as_bytes(), logical_id.as_bytes()),
+			|(provider_pattern, model_pattern)| {
+				glob_matches(provider_pattern.as_bytes(), provider.as_bytes())
+					&& glob_matches(model_pattern.as_bytes(), logical_id.as_bytes())
+			},
+		);
+	}
+	!configured || matched
+}
+
+fn scoped_entries_valid(entries: &[PathScopedStringEntry], kind: ScopedValueKind) -> bool {
+	entries.iter().all(|entry| match entry {
+		PathScopedStringEntry::Bare(value) => !value.trim().is_empty(),
+		PathScopedStringEntry::Scoped(source) => {
+			let prefixes = scoped_prefixes(source).collect::<Vec<_>>();
+			let values = scoped_values(source, kind);
+			!prefixes.is_empty()
+				&& !values.is_empty()
+				&& prefixes.iter().all(|value| !value.trim().is_empty())
+				&& values.iter().all(|value| !value.trim().is_empty())
+		},
+	})
+}
+
+fn unique_nonempty(values: &[Str]) -> bool {
+	values.iter().enumerate().all(|(index, value)| {
+		!value.trim().is_empty() && values[..index].iter().all(|prior| prior != value)
+	})
+}
+
+fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
+	let (mut pattern_index, mut value_index) = (0, 0);
+	let (mut star, mut retry_value) = (None, 0);
+	while value_index < value.len() {
+		if pattern_index < pattern.len()
+			&& (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+		{
+			pattern_index += 1;
+			value_index += 1;
+		} else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+			star = Some(pattern_index);
+			pattern_index += 1;
+			retry_value = value_index;
+		} else if let Some(star_index) = star {
+			retry_value += 1;
+			value_index = retry_value;
+			pattern_index = star_index + 1;
+		} else {
+			return false;
+		}
+	}
+	while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+		pattern_index += 1;
+	}
+	pattern_index == pattern.len()
 }
 
 omp_settings::inventory::submit! { DomainRegistration::of::<ModelSettings>() }
@@ -572,3 +966,115 @@ pub fn provider_family(provider: &str, model: Option<&str>) -> ProviderFamily {
 
 /// Exact configured model fallback chains keyed by model id or `provider/*`.
 pub type FallbackChains = BTreeMap<Str, Vec<Str>>;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn role_metadata_and_canonical_paths_round_trip() {
+		let mut settings = ModelSettings::default();
+		settings
+			.roles
+			.insert(Str::new_static("smol"), Str::new_static("openai/gpt-5-mini"));
+		settings.tags.insert(Str::new_static("smol"), ModelTag {
+			name:   Str::new_static("Small"),
+			color:  Some(Str::new_static("cyan")),
+			hidden: false,
+		});
+		settings.role_storage = ModelRoleStorage::Project;
+		assert_eq!(settings.role_selector("smol").map(Str::as_str), Some("openai/gpt-5-mini"));
+		assert_eq!(settings.role_tag("smol").map(|tag| tag.name.as_str()), Some("Small"));
+		assert_eq!(settings.cycle_rank("smol"), 0);
+		assert_eq!(settings.cycle_rank("other"), usize::MAX);
+		let encoded = serde_json::to_value(&settings).expect("settings serialize");
+		let decoded: ModelSettings = serde_json::from_value(encoded).expect("settings deserialize");
+		assert_eq!(decoded, settings);
+		for path in [
+			"model.roles",
+			"model.role_storage",
+			"model.tags",
+			"model.cycle_order",
+			"model.enabled_models",
+			"model.disabled_providers",
+		] {
+			assert!(ModelSettings::FIELDS.iter().any(|field| field.path == path), "{path}");
+		}
+	}
+
+	#[test]
+	fn model_scope_filters_before_provider_ranking() {
+		let mut settings = ModelSettings::default();
+		settings.provider_order =
+			sync::Arc::from([Str::new_static("openai"), Str::new_static("anthropic")]);
+		settings.enabled_models = sync::Arc::from([
+			PathScopedStringEntry::Bare(Str::new_static("openai/gpt-5.*")),
+			PathScopedStringEntry::Bare(Str::new_static("claude-*")),
+		]);
+		settings.disabled_providers =
+			sync::Arc::from([PathScopedStringEntry::Bare(Str::new_static("anthropic"))]);
+		assert_eq!(settings.model_rank("openai", "gpt-5.6"), Some(0));
+		assert_eq!(settings.model_rank("openai", "openai/gpt-5.6"), Some(0));
+		assert_eq!(settings.model_rank("openai", "gpt-4.1"), None);
+		assert_eq!(settings.model_rank("anthropic", "claude-opus-4-6"), None);
+		assert!(settings.model_allowed("openrouter", "claude-sonnet-4-6"));
+		assert!(settings.validate().is_ok());
+		settings.cycle_order =
+			sync::Arc::from([Str::new_static("default"), Str::new_static("default")]);
+		assert!(settings.validate().is_err());
+	}
+
+	#[test]
+	fn mixed_path_scoped_lists_resolve_against_exact_cwd_and_home() {
+		let settings: ModelSettings = serde_json::from_value(serde_json::json!({
+			"enabled_models": [
+				"openai/gpt-5.*",
+				{
+					"pathPrefix": "/work/project",
+					"models": ["anthropic/claude-*"],
+					"items": "openrouter/*"
+				},
+				{
+					"paths": ["~/private"],
+					"values": "google/gemini-*"
+				}
+			],
+			"disabled_providers": [
+				"legacy",
+				{
+					"pathPrefixes": ["/work/project", "/other"],
+					"providers": ["anthropic"]
+				}
+			]
+		}))
+		.expect("mixed scoped settings");
+		let cwd = Path::new("/work/project/subdir");
+		let home = Path::new("/Users/test");
+		assert_eq!(settings.resolved_enabled_models(cwd, home).as_ref(), &[
+			Str::new_static("openai/gpt-5.*"),
+			Str::new_static("anthropic/claude-*"),
+			Str::new_static("openrouter/*"),
+		]);
+		assert_eq!(settings.resolved_disabled_providers(cwd, home).as_ref(), &[
+			Str::new_static("legacy"),
+			Str::new_static("anthropic")
+		]);
+		assert!(settings.model_allowed_at(cwd, home, "openai", "gpt-5.6"));
+		assert!(!settings.model_allowed_at(cwd, home, "anthropic", "claude-opus-4-6"));
+		let frozen = settings.resolve_path_scopes(cwd, home);
+		assert!(
+			frozen
+				.enabled_models
+				.iter()
+				.all(|entry| matches!(entry, PathScopedStringEntry::Bare(_)))
+		);
+		assert!(frozen.model_allowed("openai", "gpt-5.6"));
+		assert!(!frozen.model_allowed("anthropic", "claude-opus-4-6"));
+		assert_eq!(
+			settings
+				.resolved_enabled_models(Path::new("/Users/test/private/repo"), home)
+				.as_ref(),
+			&[Str::new_static("openai/gpt-5.*"), Str::new_static("google/gemini-*")]
+		);
+	}
+}

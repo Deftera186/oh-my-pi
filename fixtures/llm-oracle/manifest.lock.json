@@ -2,7 +2,7 @@
   "schema_version": 1,
   "corpus": "llm-oracle",
   "hash_algorithm": "sha256",
-  "corpus_sha256": "d960505c7126d47a7f32bf49978ab148ecd29b99edb8b8880d3941802b1c88b3",
+  "corpus_sha256": "aa2e092ab4b1ebba1fd12d3d451a4a41d5b489ea33e1569840987da27b477fae",
   "category_count": 14,
   "manifest_count": 14,
   "artifact_count": 268,
@@ -1149,7 +1149,7 @@
       "path": "catalog/census.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "49d623c86d34b2fe73c9af71648b42dc0fc69d53ef9cade38cfabf9b5cc81960"
+      "sha256": "fd23bc2c4e42d6d4eb216052ab86a86186d556e83afc547450f2f8d69cb0c3b2"
     },
     {
       "id": "oracle.category.catalog.manifest.v1",
@@ -1157,7 +1157,7 @@
       "path": "catalog/manifest.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "79568f83d45ead03b17097b6a38a76102e0ef672ef706198884e8b0265b07dac"
+      "sha256": "d608cb4f8c0511ba0b4007657bcacf2178980fefd325b2c28d9e34ac148f66ab"
     },
     {
       "id": "catalog.models.compressed.v1",
@@ -1165,7 +1165,7 @@
       "path": "catalog/models.json.zst",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "499bc740d00a4551d4ddf30f2c4b0ece30991af007754b269cb8cc21bc73964b"
+      "sha256": "a26a567b9402fb468c77d1d79f00a81df309ca36d60df0afda9198fa469a6a5f"
     },
     {
       "id": "catalog.models.normalized.v1",
@@ -1173,7 +1173,7 @@
       "path": "catalog/models.normalized.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "95037fe800b694f6162bc09022db92f1edf5ec61c0cc74ed661137d0b4b5ca86"
+      "sha256": "844ed4b612a218038586d09d2782767e46c7bebd5daebbcc033e2412101e9ccf"
     },
     {
       "id": "catalog.models.raw.v1",
@@ -1181,7 +1181,7 @@
       "path": "catalog/models.raw.json",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "310e4e09256a1a4a9562cafbdf5c9da3c8854311361e2bc5ec68b9820549a3f6"
+      "sha256": "8d45872b3805a4e053d151d62b8509438a6100ef7df4d5e3f9f1a386a32d0596"
     },
     {
       "id": "catalog.oauth.source.v1",
@@ -1189,7 +1189,7 @@
       "path": "catalog/oauth.toml",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "410928f94d0f26fd431de302118de2b50907763b8e5cf75dc6d3dad1deffdbf0"
+      "sha256": "61c7c07eeb1e1f141c5b8ffdb87a4b508cfb202b79302fabdede415cbdd25491"
     },
     {
       "id": "catalog.models.normalized.projector.v1",
@@ -1205,7 +1205,7 @@
       "path": "catalog/providers.toml",
       "provenance_category": "catalog",
       "secret_free": true,
-      "sha256": "4878842fe3d7a49abbf8afde97867f5f89bcf5ff775254d2e91b8e6d323e7a13"
+      "sha256": "f377f0f3ad0c5b9fa5d64dbcecaf130cfc51c4adcdb9a413ce4e47b96b0807f6"
     },
     {
       "id": "google.generated.cca.behavior.v1",

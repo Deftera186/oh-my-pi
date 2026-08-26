@@ -24,6 +24,9 @@ provider "cursor" {
 	models "claude-opus-5" {
 		thinking-efforts "low" "medium" "high"
 	}
+	models "gpt-5.5" {
+		thinking-efforts "low" "medium" "high"
+	}
 	// residue: taxonomy ranks and exact globs do not isolate these models.
 	models "gpt-5.1" {
 		thinking-efforts "low" "high"

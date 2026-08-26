@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-	CatalogOverlay,
+	CatalogOverlay, OverlayStack, ResolveError, UnsafeTrustScope,
 	compile::{CatalogAlias, CompileError, CompiledCatalog, CompilerCensus},
 	contrib::RuntimeProviderRecords,
 	discover::DiscoveryDefaults,
@@ -164,6 +164,9 @@ pub enum SnapshotError {
 	/// A compiled record or lookup index violates a catalog invariant.
 	#[error("catalog snapshot invariant failed: {0}")]
 	Invariant(&'static str),
+	/// An overlay stack failed precedence or trust validation.
+	#[error(transparent)]
+	Overlay(#[from] ResolveError),
 }
 
 impl Catalog {
@@ -337,6 +340,59 @@ impl Catalog {
 		let normalized_json = compiled
 			.normalized_json()
 			.map_err(|_| SnapshotError::Invariant("runtime catalog normalization failed"))?;
+		Ok(Self {
+			compiled,
+			provider_models,
+			model_index,
+			wire_policy_ids,
+			thinking_policy_ids,
+			source_digest: self.source_digest,
+			normalized_json_sha256: Sha256::digest(normalized_json).into(),
+		})
+	}
+
+	/// Materializes an admitted overlay stack into a validated immutable
+	/// catalog snapshot.
+	///
+	/// Layers are applied in stack precedence order. Security-sensitive route
+	/// changes require the corresponding explicit [`UnsafeTrustScope`].
+	pub fn with_overlay_stack(
+		&self,
+		stack: &OverlayStack,
+		scope: UnsafeTrustScope,
+	) -> Result<Self, SnapshotError> {
+		let mut compiled =
+			crate::resolve::materialize_overlay_stack(self.compiled.clone(), stack, scope)?;
+		compiled.census.providers = compiled.providers.len();
+		compiled.census.logical_models = compiled.models.len();
+		let contribution = serde_json::to_vec(stack.overlays())
+			.map_err(|_| SnapshotError::Invariant("overlay stack does not serialize"))?;
+		let digest = Sha256::digest(contribution);
+		let mut suffix = String::with_capacity(16);
+		for byte in &digest[..8] {
+			use std::fmt::Write as _;
+			let _ = write!(suffix, "{byte:02x}");
+		}
+		compiled.revision =
+			CatalogRevision::from(format!("{}+overlay-{suffix}", self.compiled.revision.as_str()));
+		validate_catalog(&compiled)?;
+		let provider_models = provider_model_index(&compiled)?;
+		let model_index = model_index(&compiled)?;
+		let wire_policy_ids = compiled
+			.wire_policies
+			.iter()
+			.map(WirePolicy::content_id)
+			.collect::<Vec<_>>()
+			.into_boxed_slice();
+		let thinking_policy_ids = compiled
+			.thinking_policies
+			.iter()
+			.map(ThinkingPolicy::content_id)
+			.collect::<Vec<_>>()
+			.into_boxed_slice();
+		let normalized_json = compiled
+			.normalized_json()
+			.map_err(|_| SnapshotError::Invariant("overlay catalog normalization failed"))?;
 		Ok(Self {
 			compiled,
 			provider_models,
@@ -735,6 +791,10 @@ fn decode_hex_digest(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{
+		CatalogOverlayBuilder, ExactSelector, ModelOverlay, ModelPatch, OverlaySource,
+		ProvenanceKind, ProvenanceSource, RouteOverlay, RoutePatch,
+	};
 
 	#[test]
 	fn embedded_snapshot_opens_and_indexes_deterministically() {
@@ -772,6 +832,112 @@ mod tests {
 			catalog
 				.discovery_defaults(ProviderId::from_ref("missing-provider"))
 				.is_none()
+		);
+	}
+
+	#[test]
+	fn overlay_stack_materializes_patches_into_catalog_indexes() {
+		let catalog = Catalog::embedded();
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| !model.routes.is_empty())
+			.expect("catalog model");
+		let route = catalog.route(&model.routes[0]).expect("model route");
+		let source = ProvenanceSource {
+			kind:           ProvenanceKind::Configured,
+			origin:         omp_core::Str::new_static("test-overlay"),
+			revision:       None,
+			confidence:     crate::EvidenceConfidence::Verified,
+			observed_at_ms: None,
+		};
+		let overlay = CatalogOverlayBuilder::new(source)
+			.with_model(ModelOverlay {
+				selector: ExactSelector::new(route.provider.clone(), model.key.clone()),
+				added:    None,
+				patch:    ModelPatch {
+					availability: Some(crate::ModelAvailability::Disabled),
+					..ModelPatch::default()
+				},
+			})
+			.build();
+		let stack = OverlayStack::from_layers([(OverlaySource::UserConfig, overlay)]);
+		let materialized = catalog
+			.with_overlay_stack(&stack, UnsafeTrustScope::NONE)
+			.expect("materialized overlay");
+		assert_eq!(
+			materialized
+				.model(&model.key)
+				.expect("patched model")
+				.availability,
+			crate::ModelAvailability::Disabled
+		);
+		assert_eq!(
+			materialized.model_for_provider(&route.provider, &model.key),
+			materialized.model(&model.key)
+		);
+	}
+
+	#[test]
+	fn overlay_stack_materializes_complete_unknown_provider() {
+		let catalog = Catalog::embedded();
+		let source_model = catalog
+			.models()
+			.iter()
+			.find(|model| !model.routes.is_empty())
+			.expect("source model");
+		let source_route = catalog
+			.route(&source_model.routes[0])
+			.expect("source route");
+		let source_provider = catalog
+			.provider(&source_route.provider)
+			.expect("source provider");
+		let provider_id = ProviderId::from("configured-provider");
+		let route_id = RouteId::from("configured-provider/primary");
+		let model_key = ModelKey::from("configured-provider/model");
+		let mut provider = source_provider.clone();
+		provider.id = provider_id.clone();
+		provider.routes = Box::new([route_id.clone()]);
+		let mut route = source_route.clone();
+		route.id = route_id.clone();
+		route.provider = provider_id.clone();
+		let mut model = source_model.clone();
+		model.key = model_key.clone();
+		model.routes = Box::new([route_id.clone()]);
+		model.wire_ids =
+			Box::new([(route_id.clone(), crate::WireModelId::from("configured-wire-model"))]);
+		let source = ProvenanceSource {
+			kind:           ProvenanceKind::Configured,
+			origin:         omp_core::Str::new_static("configured-provider-test"),
+			revision:       None,
+			confidence:     crate::EvidenceConfidence::Declared,
+			observed_at_ms: None,
+		};
+		let overlay = CatalogOverlayBuilder::new(source)
+			.with_provider(provider)
+			.with_route(RouteOverlay {
+				route: route_id.clone(),
+				added: Some(route),
+				patch: RoutePatch::default(),
+			})
+			.with_model(ModelOverlay {
+				selector: ExactSelector::new(provider_id.clone(), model_key.clone()),
+				added:    Some(model),
+				patch:    ModelPatch::default(),
+			})
+			.build();
+		let materialized = catalog
+			.with_overlay_stack(
+				&OverlayStack::from_layers([(OverlaySource::UserConfig, overlay)]),
+				UnsafeTrustScope::ALL,
+			)
+			.expect("unknown provider materializes");
+		assert!(materialized.provider(&provider_id).is_some());
+		assert!(materialized.route(&route_id).is_some());
+		assert!(
+			materialized
+				.model_for_provider(&provider_id, &model_key)
+				.is_some()
 		);
 	}
 

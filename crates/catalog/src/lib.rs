@@ -16,6 +16,7 @@ pub mod policy;
 pub mod pricing;
 pub mod provider;
 pub mod resolve;
+pub mod runtime;
 pub mod selection;
 pub mod settings;
 pub mod snapshot;
@@ -34,6 +35,7 @@ pub use policy::*;
 pub use pricing::*;
 pub use provider::*;
 pub use resolve::*;
+pub use runtime::*;
 pub use selection::*;
 pub use snapshot::*;
 pub use taxonomy::*;
@@ -119,8 +121,9 @@ mod tests {
 		assert_eq!(decoded, capability);
 
 		let endpoint = EndpointSpec {
-			base_url: "https://example.test/v1".to_str(),
-			region:   Some("test-1".to_str()),
+			base_url:    "https://example.test/v1".to_str(),
+			region:      Some("test-1".to_str()),
+			api_version: Some("2024-10-21".to_str()),
 		};
 		let encoded = serde_json::to_vec(&endpoint).expect("record serializes");
 		let decoded: EndpointSpec = serde_json::from_slice(&encoded).expect("record deserializes");
@@ -144,7 +147,7 @@ mod tests {
 			flow:                 OAuthFlowSpec::DeviceCode {
 				device_authorization_url: "https://auth.example.test/device".to_str(),
 				polling:                  OAuthPollingSpec {
-					maximum_polls:       60,
+					maximum_polls:       Some(60),
 					default_interval_ms: 5_000,
 					maximum_interval_ms: 30_000,
 				},

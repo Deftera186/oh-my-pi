@@ -5,22 +5,22 @@
       "id": "catalog.models.compressed.v1",
       "path": "models.json.zst",
       "provenance": {
-        "kind": "verbatim-source-snapshot"
+        "kind": "current-pi-source-stage-projection"
       },
       "secret_free": true,
-      "sha256": "0555b6916390bf524ec913f9e321a59f9d580e3a750e5a64382c068cbf180851",
-      "source": "archive/llm-legacy/llm-catalog/models.json.zst"
+      "sha256": "a26a567b9402fb468c77d1d79f00a81df309ca36d60df0afda9198fa469a6a5f",
+      "source": "6a3662e70c4eaec05fab7ad7eb06d1b4f7beaf96:packages/catalog/src/models.json"
     },
     {
       "id": "catalog.models.raw.v1",
       "path": "models.raw.json",
       "provenance": {
-        "input": "archive/llm-legacy/llm-catalog/models.json.zst",
-        "kind": "verbatim-zstd-decompression"
+        "input": "6a3662e70c4eaec05fab7ad7eb06d1b4f7beaf96:packages/catalog/src/models.json",
+        "kind": "current-pi-source-stage-projection"
       },
       "secret_free": true,
-      "sha256": "62a43a09c3c6f8d406f62cbd5799a18553246b1a0b9a5d806a81dc023afb8eb5",
-      "source": "archive/llm-legacy/llm-catalog/models.json.zst"
+      "sha256": "8d45872b3805a4e053d151d62b8509438a6100ef7df4d5e3f9f1a386a32d0596",
+      "source": "6a3662e70c4eaec05fab7ad7eb06d1b4f7beaf96:packages/catalog/src/models.json"
     },
     {
       "id": "catalog.models.normalized.v1",
@@ -28,7 +28,8 @@
       "provenance": {
         "baseline": "52b111a4abc8d76064abc4f58afda931edee9833:crates/llm-catalog/models.json.zst",
         "input": "models.json.zst",
-        "kind": "archived-loader-projection",
+        "kind": "archived-loader-and-compiler-projection",
+        "compiler": "crates/catalog/src/compile.rs",
         "loader": "52b111a4abc8d76064abc4f58afda931edee9833:crates/llm-catalog/src/models.rs::load_catalog_zstd",
         "ordering": [
           "provider",
@@ -37,7 +38,7 @@
         "projector": "project_normalized.rs"
       },
       "secret_free": true,
-      "sha256": "c857ce7d0867b26ab6e053ff4f0987fac00e41dded1a3d8a0de06e7017888da6",
+      "sha256": "844ed4b612a218038586d09d2782767e46c7bebd5daebbcc033e2412101e9ccf",
       "source": "52b111a4abc8d76064abc4f58afda931edee9833:crates/llm-catalog/src/models.rs"
     },
     {
@@ -58,7 +59,7 @@
         "kind": "verbatim-source-snapshot"
       },
       "secret_free": true,
-      "sha256": "f6ec0b664ee67f295d63c4fe17ea975c51b49885154b603297a4397e815932bd",
+      "sha256": "f377f0f3ad0c5b9fa5d64dbcecaf130cfc51c4adcdb9a413ce4e47b96b0807f6",
       "source": "archive/llm-legacy/llm-catalog/providers.toml"
     },
     {
@@ -77,15 +78,15 @@
       "provenance": {
         "kind": "derived-census",
         "sources": [
-          "archive/llm-legacy/llm-catalog/models.json.zst",
+          "6a3662e70c4eaec05fab7ad7eb06d1b4f7beaf96:packages/catalog/src/models.json",
           "archive/llm-legacy/llm-catalog/providers.toml",
           "archive/llm-legacy/llm-catalog/src/models.rs::load_catalog_zstd",
           "archive/llm-legacy/llm-catalog/src/provider.rs::TransportId"
         ]
       },
       "secret_free": true,
-      "sha256": "dcac785cdab54b8c2e26fb954658763deccb9fcbf5914e7b457d254a7a053535",
-      "source": "archive/llm-legacy/llm-catalog/src/models.rs::load_catalog_zstd"
+      "sha256": "fd23bc2c4e42d6d4eb216052ab86a86186d556e83afc547450f2f8d69cb0c3b2",
+      "source": "6a3662e70c4eaec05fab7ad7eb06d1b4f7beaf96:packages/catalog/src/models.json + crates/catalog/src/compile.rs"
     }
   ],
   "schema_version": 1

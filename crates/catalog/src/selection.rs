@@ -5,7 +5,6 @@
 //! resolver remains the only authority that makes a route usable.
 
 use std::{
-	borrow::Cow,
 	cmp,
 	collections::{BTreeMap, BTreeSet},
 };
@@ -44,27 +43,33 @@ pub struct ModelRole {
 	pub provider_rank: Box<[ProviderId]>,
 }
 impl ModelRole {
-	/// Creates a single-selector role assignment with an optional explicit
-	/// thinking level.
+	/// Creates an ordered role assignment from a comma-separated selector
+	/// chain with an optional explicit thinking level.
 	///
-	/// `auto` is retained in the selector itself. This keeps non-default role
-	/// configuration independent from an active session's thinking state.
+	/// Empty comma-separated elements are ignored. `auto` is retained on every
+	/// selector in the chain, keeping role configuration independent from an
+	/// active session's thinking state.
 	pub fn assignment(
 		id: impl Into<Str>,
 		selector: &str,
 		thinking: Option<&str>,
 	) -> Result<Self, SelectionError> {
 		let id = id.into();
-		let mut chars = id.chars();
-		if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
-			|| !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-		{
+		if !valid_role_id(&id) {
 			return Err(SelectionError::Invalid(id));
 		}
-		let selector = role_assignment_selector(selector, thinking)?;
+		let selectors = selector
+			.split(',')
+			.map(str::trim)
+			.filter(|selector| !selector.is_empty())
+			.map(|selector| role_assignment_selector(selector, thinking))
+			.collect::<Result<Vec<_>, _>>()?;
+		if selectors.is_empty() {
+			return Err(SelectionError::Empty);
+		}
 		Ok(Self {
 			id,
-			selectors: Box::new([selector]),
+			selectors: selectors.into_boxed_slice(),
 			display_name: None,
 			color: None,
 			hidden: false,
@@ -84,6 +89,16 @@ pub fn role_assignment_selector(
 	thinking: Option<&str>,
 ) -> Result<Str, SelectionError> {
 	let selector = selector.trim();
+	if let Some((_, configured_thinking)) = role_reference(selector)? {
+		let thinking = thinking.or(configured_thinking);
+		return Ok(match thinking {
+			Some(thinking) => sf!(
+				"{}:{thinking}",
+				&selector[..selector.len() - configured_thinking.map_or(0, |level| level.len() + 1)]
+			),
+			None => Str::new(selector),
+		});
+	}
 	let parsed = parse_selector(selector)?;
 	let Some(thinking) = thinking else {
 		return Ok(Str::new(selector));
@@ -107,6 +122,33 @@ pub fn role_assignment_selector(
 		formatted.push_str(&upstream);
 	}
 	Ok(formatted.into())
+}
+
+fn valid_role_id(id: &str) -> bool {
+	let mut chars = id.chars();
+	chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+		&& chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn role_reference(selector: &str) -> Result<Option<(&str, Option<&str>)>, SelectionError> {
+	let Some(reference) = selector
+		.strip_prefix('@')
+		.or_else(|| selector.strip_prefix("pi/"))
+	else {
+		return Ok(None);
+	};
+	if reference.contains('/') {
+		return Ok(None);
+	}
+	let (role, thinking) = match reference.rsplit_once(':') {
+		Some((role, thinking)) if is_thinking_level(thinking) => (role, Some(thinking)),
+		Some(_) => return Err(SelectionError::Invalid(Str::new(selector))),
+		None => (reference, None),
+	};
+	if !valid_role_id(role) {
+		return Err(SelectionError::Invalid(Str::new(selector)));
+	}
+	Ok(Some((role, thinking)))
 }
 
 /// Inserts or replaces one role assignment, returning whether it changed.
@@ -199,13 +241,18 @@ impl ModelScope {
 	/// provider/model selectors and bare logical model ids.
 	pub fn compile(patterns: &[Str]) -> Result<Self, SelectionError> {
 		let mut compiled = Vec::with_capacity(patterns.len());
-		for pattern in patterns {
+		for pattern in patterns
+			.iter()
+			.flat_map(|chain| chain.as_str().split(','))
+			.map(str::trim)
+			.filter(|pattern| !pattern.is_empty())
+		{
 			let base = scope_pattern_base(pattern);
 			let glob = GlobBuilder::new(base)
 				.case_insensitive(true)
 				.literal_separator(false)
 				.build()
-				.map_err(|_| SelectionError::Invalid(pattern.clone()))?;
+				.map_err(|_| SelectionError::Invalid(Str::new(pattern)))?;
 			compiled.push((Str::new(base), glob.compile_matcher()));
 		}
 		Ok(Self { patterns: compiled.into_boxed_slice() })
@@ -217,15 +264,35 @@ impl ModelScope {
 			return true;
 		}
 		let bare = logical_id(model);
-		let full = if model.as_str().contains('/') {
-			model.as_str()
-		} else {
-			bare
-		};
 		self.patterns.iter().any(|(_, pattern)| {
-			pattern.is_match(full)
-				|| pattern.is_match(bare)
-				|| pattern.is_match(format!("{provider}/{bare}"))
+			pattern.is_match(bare) || pattern.is_match(format!("{provider}/{bare}"))
+		})
+	}
+
+	fn allows_selected(
+		&self,
+		models: &[ModelSpec],
+		routes: &[RouteDef],
+		aliases: &[CatalogAlias],
+		roles: &[ModelRole],
+		mru: &BTreeMap<(ProviderId, ModelKey), u64>,
+		selected: &SelectedModel,
+	) -> bool {
+		if self.patterns.is_empty() {
+			return true;
+		}
+		self.patterns.iter().any(|(source, pattern)| {
+			if contains_glob_meta(source) {
+				return pattern.is_match(logical_id(&selected.model))
+					|| pattern.is_match(format!(
+						"{}/{}",
+						selected.provider,
+						logical_id(&selected.model)
+					));
+			}
+			select_model(models, routes, aliases, roles, mru, source).is_ok_and(|allowed| {
+				allowed.provider == selected.provider && allowed.model == selected.model
+			})
 		})
 	}
 
@@ -371,14 +438,7 @@ fn select_inner(
 	if selector == "*" {
 		return select_inner(models, routes, aliases, roles, mru, "@default", visiting);
 	}
-	if let Some(role) = selector
-		.strip_prefix('@')
-		.or_else(|| selector.strip_prefix("pi/"))
-	{
-		let role = if role == "*" { "default" } else { role };
-		if role.contains('/') || role.contains(':') {
-			return Err(SelectionError::Invalid(Str::new(selector)));
-		}
+	if let Some((role, thinking)) = role_reference(selector)? {
 		if !visiting.insert(Str::new(role)) {
 			return Err(SelectionError::RoleCycle(Str::new(role)));
 		}
@@ -397,7 +457,14 @@ fn select_inner(
 				_ => pick_default(models, routes, mru),
 			};
 			visiting.remove(role);
-			return selected.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
+			return selected
+				.map(|mut selected| {
+					if let Some(thinking) = thinking {
+						selected.thinking = Some(Str::new(thinking));
+					}
+					selected
+				})
+				.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
 		}
 		let preferred = found.provider_rank.iter().find_map(|provider| {
 			found.selectors.iter().find_map(|pattern| {
@@ -419,7 +486,14 @@ fn select_inner(
 				select_inner(models, routes, aliases, roles, mru, &selector, visiting).ok()
 			});
 		}
-		let result = selected.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
+		let result = selected
+			.map(|mut selected| {
+				if let Some(thinking) = thinking {
+					selected.thinking = Some(Str::new(thinking));
+				}
+				selected
+			})
+			.ok_or_else(|| SelectionError::NotFound(Str::new(selector)));
 		visiting.remove(role);
 		return result;
 	}
@@ -449,13 +523,12 @@ fn select_inner(
 	if id.is_empty() {
 		return Err(SelectionError::Invalid(Str::new(selector)));
 	}
-	// Catalog keys are `provider/logical` composites; a provider-qualified
-	// selector reconstructs the composite while a bare selector matches the
-	// logical portion exactly (see `choose`).
-	let exact: Cow<'_, ModelKey<str>> = match provider {
-		Some(provider) => Cow::Owned(ModelKey::new(format!("{provider}/{id}"))),
-		None => Cow::Borrowed(ModelKey::from_ref(id)),
-	};
+	if let Ok(found) = choose_alias(models, routes, aliases, mru, &parsed, provider, selector) {
+		return Ok(found);
+	}
+	// A qualified selector binds its provider to the route provider and always
+	// compares the model portion with the canonical logical id. If that exact
+	// pair is absent, the full spelling gets the bare-id rung of the cascade.
 	if let Ok(found) = choose(
 		models,
 		routes,
@@ -464,22 +537,21 @@ fn select_inner(
 		provider,
 		parsed.route.as_ref().map(|route| &**route),
 		parsed.upstream.clone(),
-		exact.as_ref(),
+		ModelKey::from_ref(id),
 		selector,
 	) {
-		return Ok(with_annotations(found, parsed));
+		return Ok(with_annotations(found, parsed.clone()));
 	}
-	if provider.is_none()
-		&& let Some(alias) = aliases.iter().find(|alias| alias.alias == parsed.model)
+	if provider.is_some()
 		&& let Ok(found) = choose(
 			models,
 			routes,
 			mru,
-			alias.target.as_str(),
+			parsed.model.as_str(),
 			None,
 			parsed.route.as_ref().map(|route| &**route),
 			parsed.upstream.clone(),
-			&alias.target,
+			ModelKey::from_ref(parsed.model.as_str()),
 			selector,
 		) {
 		return Ok(with_annotations(found, parsed));
@@ -517,6 +589,36 @@ fn with_annotations(mut selected: SelectedModel, parsed: ParsedSelector) -> Sele
 	selected.upstream = parsed.upstream;
 	selected.route = parsed.route;
 	selected
+}
+
+fn choose_alias(
+	models: &[ModelSpec],
+	routes: &[RouteDef],
+	aliases: &[CatalogAlias],
+	mru: &BTreeMap<(ProviderId, ModelKey), u64>,
+	parsed: &ParsedSelector,
+	provider: Option<&str>,
+	original: &str,
+) -> Result<SelectedModel, SelectionError> {
+	let route = parsed.route.as_ref().map(|route| &**route);
+	let candidates = aliases
+		.iter()
+		.filter(|alias| {
+			alias.alias == parsed.model
+				|| provider.is_none()
+					&& alias
+						.alias
+						.split_once('/')
+						.is_some_and(|(_, id)| id == parsed.model)
+		})
+		.flat_map(|alias| {
+			candidates(models, routes, provider, alias.target.as_str(), route)
+				.into_iter()
+				.filter(move |(_, model)| model.key == alias.target)
+		})
+		.collect();
+	let selected = choose_candidates(candidates, routes, mru, parsed.clone(), original)?;
+	Ok(selected)
 }
 
 fn choose(
@@ -944,7 +1046,9 @@ pub fn candidate_plan(
 	{
 		match select_model(models, routes, aliases, roles, mru, selector) {
 			Ok(selected)
-				if scope.is_none_or(|scope| scope.allows(&selected.provider, &selected.model)) =>
+				if scope.is_none_or(|scope| {
+					scope.allows_selected(models, routes, aliases, roles, mru, &selected)
+				}) =>
 			{
 				if plan
 					.iter()
@@ -1072,6 +1176,46 @@ mod tests {
 			)
 			.expect("unchanged task assignment")
 		);
+	}
+
+	#[test]
+	fn role_assignment_normalizes_ordered_comma_chains() {
+		let role = ModelRole::assignment(
+			"default",
+			" missing/provider, openai-codex/gpt-5.3-codex-spark ,, ",
+			Some("high"),
+		)
+		.expect("role chain");
+		assert_eq!(role.selectors.as_ref(), [
+			Str::new_static("missing/provider:high"),
+			Str::new_static("openai-codex/gpt-5.3-codex-spark:high"),
+		]);
+	}
+
+	#[test]
+	fn configured_roles_can_delegate_to_role_aliases() {
+		let catalog = Catalog::embedded();
+		let target =
+			pick_default(catalog.models(), catalog.routes(), &BTreeMap::new()).expect("default model");
+		let roles = [
+			ModelRole::assignment("slow", target.model.as_str(), None).expect("slow"),
+			ModelRole::assignment("task", "@slow", Some("high")).expect("task"),
+			ModelRole::assignment("advisor", "pi/slow", None).expect("advisor"),
+		];
+		assert_eq!(roles[1].selectors.as_ref(), [Str::new_static("@slow:high")]);
+		for (selector, thinking) in [("@task", Some("high")), ("@advisor", None)] {
+			let selected = select_model(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				&roles,
+				&BTreeMap::new(),
+				selector,
+			)
+			.expect(selector);
+			assert_eq!(selected.model, target.model);
+			assert_eq!(selected.thinking.as_deref(), thinking);
+		}
 	}
 
 	#[test]
@@ -1232,6 +1376,82 @@ mod tests {
 			.expect(&selector);
 			assert_eq!(selected.provider.as_str(), provider, "{selector}");
 			assert_eq!(selected.model, model.key, "{selector}");
+		}
+	}
+
+	#[test]
+	fn qualified_collapsed_variant_alias_resolves_to_canonical_target() {
+		let catalog = Catalog::embedded();
+		let alias = catalog
+			.aliases()
+			.iter()
+			.find(|alias| alias.alias == "cursor/claude-4.6-opus-high")
+			.expect("shipped collapsed Cursor alias");
+		let selected = select_model(
+			catalog.models(),
+			catalog.routes(),
+			catalog.aliases(),
+			&[],
+			&BTreeMap::new(),
+			alias.alias.as_str(),
+		)
+		.expect("qualified alias");
+		assert_eq!(selected.model, alias.target);
+		assert_eq!(selected.provider.as_str(), "cursor");
+	}
+
+	#[test]
+	fn enabled_scope_uses_selection_grammar_without_key_prefix_confusion() {
+		let catalog = Catalog::embedded();
+		let mru = BTreeMap::new();
+		let alias = catalog
+			.aliases()
+			.iter()
+			.find_map(|alias| {
+				let selected = select_model(
+					catalog.models(),
+					catalog.routes(),
+					catalog.aliases(),
+					&[],
+					&mru,
+					alias.alias.as_str(),
+				)
+				.ok()?;
+				let bare = logical_id(&selected.model);
+				(select_model(catalog.models(), catalog.routes(), catalog.aliases(), &[], &mru, bare)
+					.ok() == Some(selected.clone()))
+				.then_some((alias, selected))
+			})
+			.expect("resolvable catalog alias");
+		let selected = alias.1;
+		let logical = logical_id(&selected.model);
+		let role = ModelRole::assignment("task", alias.0.alias.as_str(), None).expect("role");
+		for enabled in [
+			selected.model.as_str().to_owned(),
+			logical.to_owned(),
+			alias.0.alias.as_str().to_owned(),
+			"@task".to_owned(),
+			format!("{}/*", selected.provider),
+		] {
+			let scope = ModelScope::compile(&[Str::new(&enabled)]).expect("scope");
+			let plan = candidate_plan(
+				catalog.models(),
+				catalog.routes(),
+				catalog.aliases(),
+				std::slice::from_ref(&role),
+				&mru,
+				&[Str::new(alias.0.alias.as_str())],
+				Some(&scope),
+			)
+			.unwrap_or_else(|error| panic!("{enabled}: {error}"));
+			assert_eq!(plan[0].selected.as_ref(), Some(&selected), "{enabled}");
+		}
+		if let Some((key_provider, _)) = selected.model.as_str().split_once('/')
+			&& selected.provider != key_provider
+		{
+			let scope =
+				ModelScope::compile(&[Str::new(format!("{key_provider}/{logical}"))]).expect("scope");
+			assert!(!scope.allows(&selected.provider, &selected.model));
 		}
 	}
 

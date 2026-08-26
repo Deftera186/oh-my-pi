@@ -25,9 +25,9 @@ usage = true
 [providers."anthropic"]
 transport = "anthropic-messages"
 base_url = "https://api.anthropic.com"
-auth = { type = "header", name = "x-api-key", env = ["OMP_ANTHROPIC_FOUNDRY_API_KEY", "OMP_ANTHROPIC_OAUTH_TOKEN", "OMP_ANTHROPIC_API_KEY"] }
+auth = { type = "header", name = "x-api-key", env = ["OMP_ANTHROPIC_FOUNDRY_API_KEY", "OMP_ANTHROPIC_API_KEY"] }
 oauth_flow = "anthropic"
-oauth_auth = { type = "bearer" }
+oauth_auth = { type = "bearer", env = ["OMP_ANTHROPIC_OAUTH_TOKEN"] }
 discovery = { kind = "open-ai-models", label = "Anthropic", authoritative = false }
 facets = ["chat"]
 headers = { "anthropic-version" = "2023-06-01" }

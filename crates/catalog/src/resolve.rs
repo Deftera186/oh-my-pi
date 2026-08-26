@@ -21,6 +21,7 @@ use crate::{
 	ProviderId, ReasoningFeatureBits, RoleBits, RouteDef, RouteId, RouteRestrictions,
 	SamplingControlBits, StructuredOutputBits, TextVerbosityBits, ThinkingPolicyId, ThinkingRouting,
 	ToolFeatureBits, TransportKind, TrustDomain, WireModelId, WirePolicyId,
+	compile::CompiledCatalog,
 };
 
 /// An exact provider and normalized-model selector.
@@ -323,13 +324,16 @@ pub struct RouteOverlay {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogOverlay {
 	/// Evidence source assigned to every field changed by this layer.
-	pub(crate) source:  ProvenanceSource,
+	pub(crate) source:    ProvenanceSource,
+	/// Complete provider additions or higher-precedence replacements.
+	#[serde(default)]
+	pub(crate) providers: Box<[ProviderDef]>,
 	/// Model additions and patches.
-	pub(crate) models:  Box<[ModelOverlay]>,
+	pub(crate) models:    Box<[ModelOverlay]>,
 	/// Route additions and patches.
-	pub(crate) routes:  Box<[RouteOverlay]>,
+	pub(crate) routes:    Box<[RouteOverlay]>,
 	/// Exact alias additions or replacements.
-	pub(crate) aliases: Box<[ScopedAlias]>,
+	pub(crate) aliases:   Box<[ScopedAlias]>,
 }
 
 /// Explicit authority for security-sensitive configured route changes.
@@ -659,12 +663,7 @@ impl<'a> CatalogResolver<'a> {
 		wildcard: &ExactSelector,
 		constraints: &ResolutionConstraints,
 	) -> Result<ResolvedModel, ResolveError> {
-		if !self
-			.base
-			.providers
-			.iter()
-			.any(|provider| provider.id == wildcard.provider)
-		{
+		if !self.provider_exists(&wildcard.provider) {
 			return Err(ResolveError::ProviderNotFound(wildcard.provider.clone()));
 		}
 		let matcher = GlobBuilder::new(wildcard.model.as_str())
@@ -721,12 +720,7 @@ impl<'a> CatalogResolver<'a> {
 		if contains_glob_meta(exact.model.as_str()) {
 			return self.resolve_wildcard(&exact, constraints);
 		}
-		if !self
-			.base
-			.providers
-			.iter()
-			.any(|provider| provider.id == exact.provider)
-		{
+		if !self.provider_exists(&exact.provider) {
 			return Err(ResolveError::ProviderNotFound(exact.provider));
 		}
 		let mut model = self
@@ -852,6 +846,20 @@ impl<'a> CatalogResolver<'a> {
 		})
 	}
 
+	fn provider_exists(&self, provider: &ProviderId<str>) -> bool {
+		self
+			.base
+			.providers
+			.iter()
+			.any(|candidate| candidate.id == *provider)
+			|| self.overlays.iter().any(|overlay| {
+				overlay
+					.providers
+					.iter()
+					.any(|candidate| candidate.id == *provider)
+			})
+	}
+
 	fn expand_selector(&self, selector: &ModelSelector) -> Result<ExactSelector, ResolveError> {
 		match selector {
 			ModelSelector::Exact(exact) => Ok(exact.clone()),
@@ -878,6 +886,141 @@ impl<'a> CatalogResolver<'a> {
 		}
 		target
 	}
+}
+
+pub(crate) fn materialize_overlay_stack(
+	mut catalog: CompiledCatalog,
+	stack: &OverlayStack,
+	scope: UnsafeTrustScope,
+) -> Result<CompiledCatalog, ResolveError> {
+	let base = BundledCatalog {
+		providers: &catalog.providers,
+		routes:    &catalog.routes,
+		models:    &catalog.models,
+		aliases:   &catalog.aliases,
+		source:    ProvenanceSource {
+			kind:           ProvenanceKind::Bundled,
+			origin:         Str::new_static("embedded"),
+			revision:       Some(catalog.revision.clone()),
+			confidence:     EvidenceConfidence::Verified,
+			observed_at_ms: None,
+		},
+	};
+	let mut resolver = CatalogResolver::new(base);
+	resolver.add_stack(stack, scope)?;
+	let overlays = resolver.overlays;
+	let mut providers = catalog.providers.into_vec();
+	let mut routes = catalog.routes.into_vec();
+	let mut models = catalog.models.into_vec();
+	let mut aliases = catalog.aliases.into_vec();
+	for overlay in overlays {
+		for provider in overlay.providers {
+			if let Some(existing) = providers
+				.iter_mut()
+				.find(|existing| existing.id == provider.id)
+			{
+				*existing = provider;
+			} else {
+				providers.push(provider);
+			}
+		}
+		for entry in overlay.routes {
+			let route = if let Some(index) = routes.iter().position(|route| route.id == entry.route) {
+				if entry
+					.added
+					.as_ref()
+					.is_some_and(|added| added.id != entry.route)
+				{
+					return Err(ResolveError::MismatchedRouteAddition(entry.route));
+				}
+				&mut routes[index]
+			} else {
+				let Some(added) = entry.added else {
+					return Err(ResolveError::MismatchedRouteAddition(entry.route));
+				};
+				if added.id != entry.route {
+					return Err(ResolveError::MismatchedRouteAddition(entry.route));
+				}
+				routes.push(added);
+				routes.last_mut().expect("inserted route")
+			};
+			apply_route_patch(
+				route,
+				&entry.patch,
+				&overlay.source,
+				&mut all_route_sources(overlay.source.clone()),
+			);
+		}
+		for entry in overlay.models {
+			let model = if let Some(index) = models
+				.iter()
+				.position(|model| model.key == entry.selector.model)
+			{
+				if entry
+					.added
+					.as_ref()
+					.is_some_and(|added| added.key != entry.selector.model)
+				{
+					return Err(ResolveError::MismatchedModelAddition(entry.selector));
+				}
+				if let Some(added) = &entry.added {
+					let mut evidence = models[index].provenance.sources.to_vec();
+					for source in &added.provenance.sources {
+						if !evidence.contains(source) {
+							evidence.push(source.clone());
+						}
+					}
+					models[index].provenance.sources = evidence.into_boxed_slice();
+				}
+				&mut models[index]
+			} else {
+				let Some(added) = entry.added else {
+					return Err(ResolveError::MismatchedModelAddition(entry.selector));
+				};
+				if added.key != entry.selector.model {
+					return Err(ResolveError::MismatchedModelAddition(entry.selector));
+				}
+				models.push(added);
+				models.last_mut().expect("inserted model")
+			};
+			apply_model_patch(
+				model,
+				&entry.patch,
+				&overlay.source,
+				&mut all_model_sources(overlay.source.clone()),
+			);
+		}
+		for alias in overlay.aliases {
+			let alias_name = if alias.definition.alias.as_str().contains('/') {
+				alias.definition.alias.clone()
+			} else {
+				Str::from(format!("{}/{}", alias.provider, alias.definition.alias))
+			};
+			let replacement = CatalogAlias {
+				alias:      alias_name,
+				target:     alias.definition.target.clone(),
+				rationale:  alias.definition.rationale.clone(),
+				provenance: alias.definition.provenance.clone(),
+			};
+			if let Some(existing) = aliases
+				.iter_mut()
+				.find(|existing| existing.alias == replacement.alias)
+			{
+				*existing = replacement;
+			} else {
+				aliases.push(replacement);
+			}
+		}
+	}
+	providers.sort_by(|left, right| left.id.cmp(&right.id));
+	routes.sort_by(|left, right| left.id.cmp(&right.id));
+	models.sort_by(|left, right| left.key.cmp(&right.key));
+	aliases.sort_by(|left, right| left.alias.cmp(&right.alias));
+	catalog.providers = providers.into_boxed_slice();
+	catalog.routes = routes.into_boxed_slice();
+	catalog.models = models.into_boxed_slice();
+	catalog.aliases = aliases.into_boxed_slice();
+	Ok(catalog)
 }
 
 fn validate_overlay(overlay: &CatalogOverlay, scope: UnsafeTrustScope) -> Result<(), ResolveError> {
@@ -1231,8 +1374,8 @@ mod tests {
 	use super::*;
 	use crate::{
 		ChatCapabilities, CodecProfile, CodexTransportPreference, EndpointSpec, HeaderProfileId,
-		ManagementCapabilities, ModelProvenance, OperationBits, RedirectTrust, RegistryMapping,
-		StructuredOutputBits, TransportKind,
+		ManagementCapabilities, ModelProvenance, OperationBits, ReasoningCapabilities, RedirectTrust,
+		RegistryMapping, StructuredOutputBits, ToolCapabilities, TransportKind,
 	};
 
 	fn source(kind: ProvenanceKind, origin: &str) -> ProvenanceSource {
@@ -1275,8 +1418,9 @@ mod tests {
 			codec_profile:      CodecProfile::default(),
 			transport:          TransportKind::Http,
 			endpoint:           EndpointSpec {
-				base_url: format!("https://{id}.test").into(),
-				region:   None,
+				base_url:    format!("https://{id}.test").into(),
+				region:      None,
+				api_version: None,
 			},
 			auth:               AuthSpecId::from("auth"),
 			headers:            HeaderProfileId::from("headers"),
@@ -1393,8 +1537,9 @@ mod tests {
 		});
 		resolver
 			.add_discovery(CatalogOverlay {
-				source:  source(ProvenanceKind::Discovered, "discovery"),
-				models:  Box::new([ModelOverlay {
+				source:    source(ProvenanceKind::Discovered, "discovery"),
+				providers: Box::new([]),
+				models:    Box::new([ModelOverlay {
 					selector: ExactSelector::new("p", "m"),
 					added:    None,
 					patch:    ModelPatch {
@@ -1404,19 +1549,20 @@ mod tests {
 						..ModelPatch::default()
 					},
 				}]),
-				routes:  Box::new([RouteOverlay {
+				routes:    Box::new([RouteOverlay {
 					route: RouteId::from("r"),
 					added: None,
 					patch: RoutePatch { priority: Some(Some(2)), ..RoutePatch::default() },
 				}]),
-				aliases: Box::new([]),
+				aliases:   Box::new([]),
 			})
 			.expect("discovery overlay accepted");
 		resolver
 			.add_user(
 				CatalogOverlay {
-					source:  source(ProvenanceKind::Configured, "user"),
-					models:  Box::new([ModelOverlay {
+					source:    source(ProvenanceKind::Configured, "user"),
+					providers: Box::new([]),
+					models:    Box::new([ModelOverlay {
 						selector: ExactSelector::new("p", "m"),
 						added:    None,
 						patch:    ModelPatch {
@@ -1425,12 +1571,12 @@ mod tests {
 							..ModelPatch::default()
 						},
 					}]),
-					routes:  Box::new([RouteOverlay {
+					routes:    Box::new([RouteOverlay {
 						route: RouteId::from("r"),
 						added: None,
 						patch: RoutePatch { priority: Some(Some(3)), ..RoutePatch::default() },
 					}]),
-					aliases: Box::new([]),
+					aliases:   Box::new([]),
 				},
 				UnsafeTrustScope::NONE,
 			)
@@ -1458,21 +1604,23 @@ mod tests {
 		let routes = [route("r", "p", 1)];
 		let models = [model("m", &["r"], true)];
 		let make = || CatalogOverlay {
-			source:  source(ProvenanceKind::Configured, "user"),
-			models:  Box::new([]),
-			routes:  Box::new([RouteOverlay {
+			source:    source(ProvenanceKind::Configured, "user"),
+			providers: Box::new([]),
+			models:    Box::new([]),
+			routes:    Box::new([RouteOverlay {
 				route: RouteId::from("r"),
 				added: None,
 				patch: RoutePatch {
 					endpoint: Some(EndpointSpec {
-						base_url: "https://changed.test".into_str(),
-						region:   None,
+						base_url:    "https://changed.test".into_str(),
+						region:      None,
+						api_version: None,
 					}),
 					auth: Some(AuthSpecId::from("other-auth")),
 					..RoutePatch::default()
 				},
 			}]),
-			aliases: Box::new([]),
+			aliases:   Box::new([]),
 		};
 		let mut denied = CatalogResolver::new(BundledCatalog {
 			providers: &providers,
@@ -1584,10 +1732,11 @@ mod tests {
 		});
 		resolver
 			.add_discovery(CatalogOverlay {
-				source:  source(ProvenanceKind::Discovered, "discovery"),
-				models:  Box::new([]),
-				routes:  Box::new([]),
-				aliases: Box::new([ScopedAlias {
+				source:    source(ProvenanceKind::Discovered, "discovery"),
+				providers: Box::new([]),
+				models:    Box::new([]),
+				routes:    Box::new([]),
+				aliases:   Box::new([ScopedAlias {
 					provider:   ProviderId::from("p"),
 					definition: CatalogAlias {
 						alias:      "current".into_str(),
@@ -1601,10 +1750,11 @@ mod tests {
 		resolver
 			.add_user(
 				CatalogOverlay {
-					source:  source(ProvenanceKind::Configured, "user"),
-					models:  Box::new([]),
-					routes:  Box::new([]),
-					aliases: Box::new([ScopedAlias {
+					source:    source(ProvenanceKind::Configured, "user"),
+					providers: Box::new([]),
+					models:    Box::new([]),
+					routes:    Box::new([]),
+					aliases:   Box::new([ScopedAlias {
 						provider:   ProviderId::from("p"),
 						definition: CatalogAlias {
 							alias:      "current".into_str(),
@@ -1698,6 +1848,35 @@ mod tests {
 			Err(ResolveError::FallbacksExhausted(errors))
 				if matches!(&errors[0], ResolveError::Constraints { failures, .. }
 					if failures.contains(&ConstraintFailure::Unknown(CapabilityConstraint::Grammar(GrammarBits::EBNF))))
+		));
+	}
+	#[test]
+	fn native_default_tools_and_reasoning_satisfy_typed_constraints() {
+		let mut capabilities = model("m", &["r"], true).capabilities;
+		let chat = capabilities.chat.as_mut().expect("chat capabilities");
+		chat.tools = Availability::Native(ToolCapabilities {
+			features:      ToolFeatureBits::empty(),
+			maximum_tools: None,
+		});
+		chat.reasoning = Availability::Native(ReasoningCapabilities {
+			features:              ReasoningFeatureBits::EFFORT,
+			efforts:               Box::new([]),
+			minimum_budget_tokens: None,
+			maximum_budget_tokens: None,
+		});
+		assert!(matches!(
+			capability_support(
+				&capabilities,
+				&CapabilityConstraint::ToolFeatures(ToolFeatureBits::empty())
+			),
+			CapabilitySupport::Supported
+		));
+		assert!(matches!(
+			capability_support(
+				&capabilities,
+				&CapabilityConstraint::Reasoning(ReasoningFeatureBits::EFFORT)
+			),
+			CapabilitySupport::Supported
 		));
 	}
 }

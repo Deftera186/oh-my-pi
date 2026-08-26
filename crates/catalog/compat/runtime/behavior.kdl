@@ -1,0 +1,49 @@
+// Provider and model behavior needed before or outside exact bundled-model lookup.
+
+behavior {
+	// LiteLLM may discover ids absent from the bundled catalog. This conservative
+	// heuristic routes likely OpenAI text/reasoning ids to Responses while
+	// excluding other OpenAI product surfaces.
+	openai-responses-heuristic {
+		include-prefix "gpt-" "o1" "o3" "o4" "chatgpt"
+		exclude-prefix "text-embedding" "whisper-" "tts-" "omni-moderation" "omni-transcribe" \
+			"omni-speech" "gpt-image-" "gpt-realtime"
+		exclude-substring "embedding"
+	}
+
+	// Discovered Responses/Codex models receive these additional operations.
+	model-operations provider="openai" {
+		exact "o3"
+		prefix "gpt-" "o3-"
+		operation "generate_image"
+	}
+	model-operations provider="openai-codex" {
+		exact "o3"
+		prefix "gpt-" "o3-"
+		operation "generate_image"
+	}
+
+	// Cursor advertises OpenAI reasoning effort as sibling model ids. The
+	// family marker intentionally mirrors pi parseOpenAIModel: `gpt-` must be
+	// followed immediately by an ASCII version digit.
+	cursor-effort family-marker="gpt-" {
+		tier "minimal" "low" "medium" "high" "xhigh" "max"
+	}
+
+	// Exact quota bucket memberships reported by Google Gemini CLI.
+	quota-tiers provider="google-gemini-cli" {
+		tier "3-Flash" "gemini-3-flash-preview" "gemini-3-flash" "gemini-3.5-flash"
+		tier "Flash" "gemini-2.5-flash" "gemini-2.5-flash-lite" "gemini-2.0-flash" \
+			"gemini-1.5-flash"
+		tier "Pro" "gemini-2.5-pro" "gemini-3-pro-preview" "gemini-3.1-pro-preview" \
+			"gemini-3-pro" "gemini-3.1-pro" "gemini-pro-agent" "gemini-1.5-pro"
+		// Unknown discovered quota ids retain the upstream display heuristic.
+		fallback "Flash" substring="flash"
+		fallback "Pro" substring="pro"
+	}
+
+	// Provider-default wire model for model-less hosted search operations.
+	hosted-default provider="kimi-search" model="kimi-for-coding"
+	hosted-default provider="zai-search" model="glm-4.7"
+	hosted-default provider="synthetic-search" model="auto"
+}

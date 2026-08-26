@@ -992,8 +992,9 @@ mod tests {
 			codec:              CodecId::from("codec"),
 			transport:          TransportKind::Http,
 			endpoint:           EndpointSpec {
-				base_url: sf!("https://provider.test"),
-				region:   None,
+				base_url:    sf!("https://provider.test"),
+				region:      None,
+				api_version: None,
 			},
 			auth:               AuthSpecId::from("auth"),
 			headers:            HeaderProfileId::from("headers"),

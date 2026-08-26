@@ -309,7 +309,7 @@ Emit class files before provider residues, sort provider/model alternatives dete
 
 ### 2. Refresh `data/sources.lock.json`
 
-The ID scheme is `compat.cascade.<group>.<stem>.v1`, where group is `taxonomy`, `classes`, or `providers`; paths are workspace-relative. Build the generator while the current lock and snapshots still agree, then refresh the lock. This avoids the intentional build-time check rejecting an old snapshot after its source digest changes.
+The ID scheme is `compat.cascade.<group>.<stem>.v1`, where group is `taxonomy`, `classes`, `providers`, or `runtime`; paths are workspace-relative. Build the generator while the current lock and snapshots still agree, then refresh the lock. This avoids the intentional build-time check rejecting an old snapshot after its source digest changes.
 
 The following runnable update preserves non-compat IDs and provenance, replaces every compat KDL entry, refreshes every locked hash, sorts by ID, and recomputes `source_digest` as `sha256(concat(id + NUL + path + NUL + sha256 + NUL))`:
 

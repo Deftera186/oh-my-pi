@@ -163,17 +163,30 @@ impl OverlayStore {
 /// Public construction path for one immutable [`CatalogOverlay`].
 #[derive(Clone, Debug)]
 pub struct CatalogOverlayBuilder {
-	source:  ProvenanceSource,
-	models:  Vec<ModelOverlay>,
-	routes:  Vec<RouteOverlay>,
-	aliases: Vec<ScopedAlias>,
+	source:    ProvenanceSource,
+	providers: Vec<ProviderDef>,
+	models:    Vec<ModelOverlay>,
+	routes:    Vec<RouteOverlay>,
+	aliases:   Vec<ScopedAlias>,
 }
 
 impl CatalogOverlayBuilder {
 	/// Starts an overlay with one auditable source applied to every changed
 	/// field during resolution.
 	pub const fn new(source: ProvenanceSource) -> Self {
-		Self { source, models: Vec::new(), routes: Vec::new(), aliases: Vec::new() }
+		Self {
+			source,
+			providers: Vec::new(),
+			models: Vec::new(),
+			routes: Vec::new(),
+			aliases: Vec::new(),
+		}
+	}
+
+	/// Adds one complete provider definition.
+	pub fn with_provider(mut self, provider: ProviderDef) -> Self {
+		self.providers.push(provider);
+		self
 	}
 
 	/// Adds one model addition or field-granular patch.
@@ -203,10 +216,11 @@ impl CatalogOverlayBuilder {
 	/// Freezes the accumulated layer for publication in an [`OverlayStack`].
 	pub fn build(self) -> CatalogOverlay {
 		CatalogOverlay {
-			source:  self.source,
-			models:  self.models.into_boxed_slice(),
-			routes:  self.routes.into_boxed_slice(),
-			aliases: self.aliases.into_boxed_slice(),
+			source:    self.source,
+			providers: self.providers.into_boxed_slice(),
+			models:    self.models.into_boxed_slice(),
+			routes:    self.routes.into_boxed_slice(),
+			aliases:   self.aliases.into_boxed_slice(),
 		}
 	}
 }
@@ -506,16 +520,17 @@ mod tests {
 
 	fn overlay(origin: &str) -> CatalogOverlay {
 		CatalogOverlay {
-			source:  ProvenanceSource {
+			source:    ProvenanceSource {
 				kind:           ProvenanceKind::Configured,
 				origin:         origin.to_str(),
 				revision:       None,
 				confidence:     EvidenceConfidence::Declared,
 				observed_at_ms: None,
 			},
-			models:  Box::new([]),
-			routes:  Box::new([]),
-			aliases: Box::new([]),
+			providers: Box::new([]),
+			models:    Box::new([]),
+			routes:    Box::new([]),
+			aliases:   Box::new([]),
 		}
 	}
 

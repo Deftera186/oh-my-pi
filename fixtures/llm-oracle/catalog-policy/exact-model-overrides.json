@@ -41,27 +41,6 @@
     },
     {
       "expected": {
-        "compat": {
-          "wire/thinking_format": "qwen-chat-template"
-        },
-        "supports_computer_use": false,
-        "supports_tools": true,
-        "thinking": {
-          "efforts": [
-            "minimal",
-            "low",
-            "medium",
-            "high"
-          ],
-          "mode": "effort"
-        }
-      },
-      "model": "agnes/agnes-2.0-flash",
-      "provenance": "archive/llm-legacy/llm-catalog/tests/generated_models.rs::checked_in_snapshot_retains_representative_server_behavior",
-      "rationale": "Agnes explicitly supports tools, not computer use, and uses the Qwen chat-template thinking format."
-    },
-    {
-      "expected": {
         "apply_patch_tool_type": "freeform",
         "context_promotion_target": "openai-codex/gpt-5.5",
         "prefer_websockets": true,

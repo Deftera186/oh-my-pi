@@ -7,6 +7,9 @@ provider "aimlapi" {
 		requires-reasoning-content-for-all-assistant-turns #true
 		thinking-efforts "high" "max"
 	}
+	models "deepseek-v4-pro" {
+		thinking-efforts "low" "high" "max"
+	}
 	// residue: taxonomy ranks and exact globs do not isolate these models.
 	models "gpt-5.1-codex" {
 		thinking-efforts "minimal" "low" "medium" "high"
@@ -14,5 +17,8 @@ provider "aimlapi" {
 	// residue: taxonomy ranks and exact globs do not isolate these models.
 	models "gpt-5.1-codex-mini" {
 		thinking-efforts "medium" "high"
+	}
+	models "xiaomi/mimo-v2.5" "stepfun/step-3.7-flash" {
+		edit-revision "sloppy.1"
 	}
 }

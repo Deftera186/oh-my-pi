@@ -101,6 +101,9 @@ pub enum AuthSpecKind {
 	Basic,
 	/// Bearer token authentication.
 	Bearer,
+	/// Bearer token authentication that permits anonymous requests when no
+	/// credential is available.
+	OptionalBearer,
 	/// OAuth authorization and refresh.
 	Oauth,
 	/// AWS Signature Version 4.
@@ -342,8 +345,10 @@ pub enum OAuthExchangeKind {
 /// OAuth device polling bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OAuthPollingSpec {
-	/// Hard upper bound on token polling attempts.
-	pub maximum_polls:       u16,
+	/// Optional catalog safety bound on token polling attempts.
+	/// Provider-reported expiry remains authoritative when this bound is
+	/// absent.
+	pub maximum_polls:       Option<u16>,
 	/// Default polling interval in milliseconds.
 	pub default_interval_ms: u64,
 	/// Largest accepted or slowed-down interval in milliseconds.
@@ -501,9 +506,12 @@ pub struct AuthSpec {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EndpointSpec {
 	/// Base endpoint URL, possibly containing compiler-validated placeholders.
-	pub base_url: Str,
+	pub base_url:    Str,
 	/// Stable region name used for routing and account scope.
-	pub region:   Option<Str>,
+	pub region:      Option<Str>,
+	/// Required provider API version appended at final URL construction.
+	#[serde(default)]
+	pub api_version: Option<Str>,
 }
 
 /// Redirect behavior at an endpoint trust boundary.
