@@ -18,7 +18,7 @@ use omp_ext::{
 	index::{IndexArtifact, IndexExtension, IndexRelease, SignedIndex},
 	trust::{KeysFile, verify_artifact_signature},
 };
-use ring::digest::{SHA256, digest};
+use sha2::{Digest as _, Sha256};
 use serde::Serialize;
 
 use crate::{
@@ -332,7 +332,7 @@ fn verify_bytes(bytes: &[u8], asset: &IndexArtifact) -> miette::Result<()> {
 	if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != asset.size {
 		return Err(miette!("update asset size differs from signed registry metadata"));
 	}
-	let sha256 = format!("sha256:{}", hex::encode(digest(&SHA256, bytes).as_ref()));
+	let sha256 = format!("sha256:{}", hex::encode(&Sha256::digest(bytes)));
 	if sha256 != asset.sha256.as_str() {
 		return Err(miette!("update asset SHA-256 differs from signed registry metadata"));
 	}

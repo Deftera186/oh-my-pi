@@ -448,9 +448,7 @@ fn nearest_rank(sorted: &[f64], percentile: usize) -> f64 {
 }
 
 fn topic_index(nonce: &str, run: u32, topic_count: usize) -> usize {
-	let hash = nonce.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-		hash.wrapping_mul(0x100_0000_01b3) ^ u64::from(byte)
-	}) ^ u64::from(run);
+	let hash = omp_core::fast_hash64(nonce.as_bytes()) ^ u64::from(run);
 	usize::try_from(hash % topic_count as u64).unwrap_or(0)
 }
 

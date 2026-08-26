@@ -9,7 +9,7 @@ use bytes::{Bytes, BytesMut};
 use omp_chat_ui::git::{
 	GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitPatchOp, GitSnapshot,
 };
-use omp_core::{IntoStr as _, Str};
+use omp_core::{Hash32, IntoStr as _, Str};
 use omp_envd::{
 	exec::ExecHost,
 	vcs::git::{
@@ -996,11 +996,11 @@ fn is_binary(bytes: &[u8]) -> bool {
 }
 
 fn fingerprint(head: &[u8], status: &[u8]) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	hasher.update(head);
 	hasher.update(&[0]);
 	hasher.update(status);
-	*hasher.finalize().as_bytes()
+	hasher.finalize().into_bytes()
 }
 
 fn line_range((start, end): (u32, u32)) -> Option<LineRange> {

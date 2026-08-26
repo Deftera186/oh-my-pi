@@ -46,7 +46,7 @@ impl DraftStore {
 		let digest = omp_core::Hash32::sum(session.0.as_bytes());
 		let short: &[u8; 16] = digest.as_bytes()[..16]
 			.try_into()
-			.expect("a Blake3 digest contains 16 prefix bytes");
+			.expect("a SHA-256 digest contains 16 prefix bytes");
 		self.directory.join(hex::encode_n(short).as_str())
 	}
 

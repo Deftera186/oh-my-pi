@@ -1,15 +1,14 @@
 //! Deterministic account-pool selection simulation and opt-in live benchmark.
 
 use std::{
-	collections::{BTreeMap, hash_map::DefaultHasher},
-	hash::{Hash as _, Hasher as _},
+	collections::BTreeMap,
 	sync,
 	time::SystemTime,
 };
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_catalog::{ModelKey, snapshot::Catalog};
-use omp_core::Str;
+use omp_core::{Str, fast_hash64};
 use omp_inference::account::{
 	AccountPool, AccountSelectionRequest, AccountStateStore, RotationPolicy,
 };
@@ -61,9 +60,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 		// same distribution into the canonical pool by making the hashed
 		// session bucket the preferred preceding account.
 		let session_id = cli::turn_id();
-		let mut hasher = DefaultHasher::new();
-		session_id.hash(&mut hasher);
-		let bucket = usize::try_from(hasher.finish()).unwrap_or_default() % accounts.len();
+		let bucket = fast_hash64(session_id.as_bytes()) as usize % accounts.len();
 		let preferred = accounts[bucket].account.clone();
 		let selection = pool
 			.select(&AccountSelectionRequest {
