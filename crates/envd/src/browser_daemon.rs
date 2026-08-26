@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration
 
 use async_trait::async_trait;
 use flume::Receiver;
-use omp_core::{Hash32, Str, sf};
+use omp_core::{ArtifactUrl, Str, sf};
 use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload, RunOperation};
 use omp_webview::{
 	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder,
@@ -172,7 +172,7 @@ fn run_tab(
 				.screenshot(selector(params.selector.as_deref())?, params.full_page, timeout)
 				.map_err(webview_fault)?;
 			let id = blobs.put(&screenshot.data).map_err(blob_fault)?;
-			let url = sf!("artifact://b3/{}", Hash32::new(id.hash).to_hex());
+			let url = Str::new(ArtifactUrl::from_digest(id.hash).as_str());
 			artifacts.push(url.clone());
 			json!({ "artifact": url, "bytes": id.size, "clip": screenshot.clip })
 		},

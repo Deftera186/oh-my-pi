@@ -1429,7 +1429,9 @@ fn parse_blob_source(source: &str) -> Result<([u8; 32], Option<u64>), Str> {
 	let (resource, query) = source
 		.split_once('?')
 		.map_or((source, None), |(resource, query)| (resource, Some(query)));
-	let digest = resource.strip_prefix("b3/").unwrap_or(resource);
+	let digest = resource
+		.strip_prefix("sha256/")
+		.ok_or_else(|| sf!("invalid blob source URL"))?;
 	let claimed_size = query
 		.and_then(|query| {
 			query
@@ -2277,7 +2279,7 @@ mod tests {
 			stamp:      stamp("wrong-size"),
 			author:     author(),
 			request:    AdoptArtifact {
-				source_url: format!("blob://b3/{digest}?size={}", stored.size + 1),
+				source_url: format!("blob://sha256/{digest}?size={}", stored.size + 1),
 				lifetime: "session".to_owned(),
 				..AdoptArtifact::default()
 			},
@@ -2292,7 +2294,7 @@ mod tests {
 			stamp:      stamp("not-found"),
 			author:     author(),
 			request:    AdoptArtifact {
-				source_url: format!("blob://b3/{missing}"),
+				source_url: format!("blob://sha256/{missing}"),
 				lifetime: "session".to_owned(),
 				..AdoptArtifact::default()
 			},
@@ -2306,7 +2308,7 @@ mod tests {
 			stamp:      stamp("adopt"),
 			author:     author(),
 			request:    AdoptArtifact {
-				source_url: format!("blob://b3/{digest}?size={}", stored.size),
+				source_url: format!("blob://sha256/{digest}?size={}", stored.size),
 				lifetime: "session".to_owned(),
 				..AdoptArtifact::default()
 			},
@@ -2324,7 +2326,7 @@ mod tests {
 			stamp:      stamp("adopt"),
 			author:     author(),
 			request:    AdoptArtifact {
-				source_url: format!("blob://b3/{digest}?size={}", stored.size),
+				source_url: format!("blob://sha256/{digest}?size={}", stored.size),
 				lifetime: "session".to_owned(),
 				..AdoptArtifact::default()
 			},
@@ -2340,7 +2342,7 @@ mod tests {
 			stamp:      stamp("adopt"),
 			author:     author(),
 			request:    AdoptArtifact {
-				source_url: format!("blob://b3/{digest}?size={}", stored.size),
+				source_url: format!("blob://sha256/{digest}?size={}", stored.size),
 				lifetime: "durable".to_owned(),
 				..AdoptArtifact::default()
 			},
@@ -2370,7 +2372,7 @@ mod tests {
 		let durable = call(&actor, ExternalJournalRequest::StatArtifact {
 			request_id: 6,
 			request:    StatArtifact {
-				url: format!("artifact://b3/{digest}"),
+				url: format!("artifact://sha256/{digest}"),
 				..StatArtifact::default()
 			},
 		})

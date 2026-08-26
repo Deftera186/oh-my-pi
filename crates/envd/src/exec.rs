@@ -71,7 +71,7 @@ const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
 pub struct WorkspaceEnvironmentDigest(Hash32);
 
 impl WorkspaceEnvironmentDigest {
-	/// Returns the BLAKE3 digest over sorted environment name/value pairs.
+	/// Returns the SHA-256 digest over sorted environment name/value pairs.
 	pub const fn as_bytes(&self) -> &[u8; 32] {
 		self.0.as_bytes()
 	}

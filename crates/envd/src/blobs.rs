@@ -22,7 +22,7 @@ use tokio::task;
 /// Stable content identity returned by blob host operations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BlobId {
-	/// Raw BLAKE3-256 content digest.
+	/// Raw SHA-256 content digest.
 	pub hash: [u8; 32],
 	/// Exact byte length of the content.
 	pub size: u64,
@@ -207,7 +207,7 @@ impl BlobHost {
 		self.store.begin_put().map_err(BlobError::from)
 	}
 
-	/// Stores exact bytes and returns their BLAKE3-derived identity.
+	/// Stores exact bytes and returns their SHA-256-derived identity.
 	pub fn put(&self, data: &[u8]) -> Result<BlobId, BlobError> {
 		self
 			.store
@@ -242,7 +242,7 @@ impl BlobHost {
 		Ok(blob_pb::PutResponse { hash: Bytes::copy_from_slice(&id.hash), size: id.size })
 	}
 
-	/// Returns presence and size for a raw BLAKE3 digest.
+	/// Returns presence and size for a raw SHA-256 digest.
 	pub fn stat(&self, hash: &[u8]) -> Result<blob_pb::StatResponse, BlobError> {
 		let hash = parse_hash(hash)?;
 		let probe = BlobRef { hash: Hash32::new(hash), size: 0 };

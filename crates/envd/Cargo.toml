@@ -12,7 +12,6 @@ readme = "README.md"
 [dependencies]
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-blake3 = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }

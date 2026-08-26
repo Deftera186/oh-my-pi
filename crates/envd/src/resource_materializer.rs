@@ -13,6 +13,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use omp_core::{Hash32, hash32::Hasher};
 use omp_proto::env::v1::{
 	MaterializationLease, MaterializationReleased, MaterializeRequest, ReleaseMaterialization,
 };
@@ -328,8 +329,8 @@ fn copy_resource(
 	source: &Path,
 	destination: &Path,
 	limit: u64,
-) -> Result<(u64, blake3::Hash), MaterializationError> {
-	let mut hasher = blake3::Hasher::new();
+) -> Result<(u64, Hash32), MaterializationError> {
+	let mut hasher = Hash32::hasher();
 	let mut size = 0_u64;
 	copy_entry(source, destination, source, limit, &mut size, &mut hasher)?;
 	Ok((size, hasher.finalize()))
@@ -341,7 +342,7 @@ fn copy_entry(
 	root: &Path,
 	limit: u64,
 	size: &mut u64,
-	hasher: &mut blake3::Hasher,
+	hasher: &mut Hasher,
 ) -> Result<(), MaterializationError> {
 	let metadata = fs::symlink_metadata(source)?;
 	if metadata.file_type().is_symlink() {
@@ -394,7 +395,7 @@ fn copy_entry(
 
 fn write_back_local(source: &Path, target: &Path) -> Result<(), MaterializationError> {
 	let mut size = 0;
-	let mut hasher = blake3::Hasher::new();
+	let mut hasher = Hash32::hasher();
 	copy_entry(source, target, source, DEFAULT_MAX_BYTES, &mut size, &mut hasher)
 }
 

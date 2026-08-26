@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use omp_core::{Hash32, Str, sf};
+use omp_core::{ArtifactUrl, Str, sf};
 use omp_desktop::{
 	AxNode, AxQuery, AxSnapshotOptions, CaptureCaps, DesktopPoint, DesktopSession, Target,
 };
@@ -91,7 +91,7 @@ impl ComputerHost for ComputerSessionHost {
 					.await
 					.map_err(native_fault)?;
 				let id = self.blobs.put(&capture.data).map_err(blob_fault)?;
-				let artifact = sf!("artifact://b3/{}", Hash32::new(id.hash).to_hex());
+				let artifact = Str::new(ArtifactUrl::from_digest(id.hash).as_str());
 				artifacts.push(artifact.clone());
 				json!({
 					"artifact": artifact,

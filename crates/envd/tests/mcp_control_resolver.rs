@@ -138,7 +138,7 @@ fn identity(
 	Arc::new(ControlConnectionIdentity {
 		extension:          Str::new_static(extension),
 		principal:          Principal::new(Str::new_static("fixture"), Str::new_static("Fixture")),
-		artifact_digest:    Str::new_static("b3:fixture"),
+		artifact_digest:    Str::new_static("sha256:fixture"),
 		layer:              Str::new_static("workspace"),
 		tier:               Str::new_static("trusted"),
 		trust:              Str::new_static("trusted"),

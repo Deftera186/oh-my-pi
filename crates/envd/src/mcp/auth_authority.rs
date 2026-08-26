@@ -4,7 +4,7 @@ use std::{fmt, sync::Arc, time::SystemTime};
 
 use futures::future::BoxFuture;
 use omp_catalog::AuthSpecId;
-use omp_core::{ExposeSecret as _, SecretBox, SecretString, Str};
+use omp_core::{ExposeSecret as _, Hash32, SecretBox, SecretString, Str};
 use omp_inference::{
 	auth::{
 		AuthRejection, CredentialError, CredentialLease, CredentialNeed, CredentialOrigin,
@@ -83,14 +83,14 @@ impl CombinedAuthAuthority {
 		server_identity: &str,
 		principal: PrincipalId,
 	) -> AuthAffinity {
-		let mut hasher = blake3::Hasher::new();
+		let mut hasher = Hash32::hasher();
 		hasher.update(b"omp-mcp-affinity/v1\0");
 		hasher.update(profile.as_bytes());
 		hasher.update(b"\0");
 		hasher.update(server_identity.as_bytes());
 		let digest = hasher.finalize();
 		AuthAffinity {
-			account: AccountId::new(format!("mcp/{}", omp_core::hex::encode(digest.as_bytes()))),
+			account: AccountId::new(format!("mcp/{}", digest.to_hex())),
 			principal,
 		}
 	}

@@ -32,7 +32,7 @@ pub enum SiteError {
 	/// A farm member path was not a safe relative path.
 	#[error("invalid site file path: {0}")]
 	InvalidFilePath(Str),
-	/// A requested blob hash was not a BLAKE3-256 digest.
+	/// A requested blob hash was not a SHA-256 digest.
 	#[error("site file blob hash must be exactly 32 bytes")]
 	InvalidBlobHash,
 	/// The source or destination content-addressed store failed.
@@ -104,7 +104,7 @@ pub struct TrustedModule {
 	pub path:            PathBuf,
 	/// Importable single-module name.
 	pub module:          Str,
-	/// BLAKE3 digest of the exact operator-approved module bytes.
+	/// SHA-256 digest of the exact operator-approved module bytes.
 	pub artifact_digest: ArtifactDigest,
 }
 

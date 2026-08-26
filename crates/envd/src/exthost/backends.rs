@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use omp_core::{Str, Ulid};
+use omp_core::{Hash32, Str, Ulid};
 use omp_tool::{ArgPath, IncomingCursor, IncomingParams, PullMode, PulledKind};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -719,7 +719,7 @@ impl DirectFilesystemJournal for DurableDirectFilesystemJournal {
 			operation:          request.operation.as_str(),
 			path:               &request.path,
 			payload_bytes:      request.data.len(),
-			payload_digest:     blake3::hash(&request.data).to_hex().to_string(),
+			payload_digest:     Hash32::sum(&request.data).to_hex().to_string(),
 			grant_id:           request.grant.grant_id.as_str(),
 			publisher:          request.grant.publisher.as_str(),
 			capability_digest:  request.grant.capability_digest.as_str(),

@@ -14,7 +14,7 @@ use std::{
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use omp_core::{Str, sf};
+use omp_core::{ArtifactUrl, Str, sf};
 use omp_proto::{
 	inference::v1::{self as inference_pb, generate_image_request, value},
 	thread::v1::{self as thread_pb, blob},
@@ -356,7 +356,7 @@ impl MediaDevice {
 			.map(|path| write_media_output(&self.root, path, &audio))
 			.transpose()?;
 		Ok(MediaPayload {
-			artifact_id: sf!("artifact://b3/{}", omp_core::Hash32::new(id.hash).to_hex()),
+			artifact_id: Str::new(ArtifactUrl::from_digest(id.hash).as_str()),
 			media_type: Str::new(match format {
 				"mp3" => "audio/mpeg",
 				"wav" => "audio/wav",
@@ -532,7 +532,7 @@ fn store_blob(blobs: &BlobHost, blob: &thread_pb::Blob) -> Result<Str, MediaFaul
 	} else {
 		blobs.put(&blob.inline).map_err(media_blob_fault)?.hash
 	};
-	Ok(sf!("artifact://b3/{}", omp_core::Hash32::new(hash).to_hex()))
+	Ok(Str::new(ArtifactUrl::from_digest(hash).as_str()))
 }
 
 fn media_fault(code: &'static str, backend: &'static str, message: &'static str) -> MediaFault {
