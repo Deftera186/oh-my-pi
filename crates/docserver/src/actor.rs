@@ -731,14 +731,24 @@ impl RegistryInner {
 	) {
 		let mut maps = self.lock_maps();
 		if maps.rebind_reservations.get(path) != Some(&document_id) {
+			drop(maps);
+			if let Some(retired) = retired {
+				retired.handle.release_retired_authority(document_id, false);
+			}
 			return;
 		}
 		maps.rebind_reservations.remove(path);
-		if let Some(retired) = retired {
+		let restored_handle = retired.map(|retired| {
 			debug_assert!(!maps.by_path.contains_key(path));
 			debug_assert!(!maps.by_id.contains_key(&retired.document_id));
+			let handle = retired.handle.clone();
 			maps.by_path.insert(path.to_path_buf(), retired.document_id);
 			maps.by_id.insert(retired.document_id, retired.handle);
+			handle
+		});
+		drop(maps);
+		if let Some(handle) = restored_handle {
+			handle.release_retired_authority(document_id, true);
 		}
 	}
 
@@ -838,15 +848,27 @@ impl PathReservation {
 		let registry = self.registry.upgrade().ok_or_else(actor_unavailable)?;
 		registry.commit_path_reservation(self.document_id, old_path, &path)?;
 		self.path = None;
-		self.retired = None;
+		if let Some(retired) = self.retired.take() {
+			retired
+				.handle
+				.release_retired_authority(self.document_id, false);
+		}
 		Ok(path)
 	}
 }
 
 impl Drop for PathReservation {
 	fn drop(&mut self) {
-		if let (Some(registry), Some(path)) = (self.registry.upgrade(), self.path.as_deref()) {
-			registry.release_path_reservation(self.document_id, path, self.retired.take());
+		let Some(path) = self.path.as_deref() else {
+			return;
+		};
+		let retired = self.retired.take();
+		if let Some(registry) = self.registry.upgrade() {
+			registry.release_path_reservation(self.document_id, path, retired);
+		} else if let Some(retired) = retired {
+			retired
+				.handle
+				.release_retired_authority(self.document_id, false);
 		}
 	}
 }
@@ -939,7 +961,14 @@ impl ActorHandle {
 	}
 
 	fn cancel_open(&self, lease_id: LeaseId) {
-		let command = Command::CancelOpen { lease_id };
+		self.send_detached(Command::CancelOpen { lease_id });
+	}
+
+	fn release_retired_authority(&self, replacement: DocumentId, restored: bool) {
+		self.send_detached(Command::RetiredAuthorityReleased { replacement, restored });
+	}
+
+	fn send_detached(&self, command: Command) {
 		match self.sender.try_send(command) {
 			Ok(()) | Err(flume::TrySendError::Disconnected(_)) => {},
 			Err(flume::TrySendError::Full(command)) => {
@@ -1203,6 +1232,10 @@ enum Command {
 		expectation: DestinationExpectation,
 		reply:       oneshot::Sender<Result<PathReservation>>,
 	},
+	RetiredAuthorityReleased {
+		replacement: DocumentId,
+		restored:    bool,
+	},
 
 	Release {
 		reservation: DocumentReservation,
@@ -1343,6 +1376,7 @@ struct DocumentActor {
 	generation: ActorGeneration,
 	reservations: HashMap<TransactionId, ActorGeneration>,
 	pending_invalidated_transactions: Vec<TransactionId>,
+	retired_for: Option<DocumentId>,
 	idle_deadline: Option<Instant>,
 	shutdown_requested: bool,
 	shutdown_replies: Vec<oneshot::Sender<()>>,
@@ -1396,6 +1430,7 @@ impl DocumentActor {
 			pending_invalidated_transactions: Vec::new(),
 			generation: ActorGeneration(0),
 			reservations: HashMap::new(),
+			retired_for: None,
 			idle_deadline: None,
 			shutdown_requested: false,
 			shutdown_replies: Vec::new(),
@@ -1483,10 +1518,16 @@ impl DocumentActor {
 			},
 			Command::RetireDestination { replacement, path, expectation, reply } => {
 				let result = self.retire_destination(replacement, &path, expectation);
-				let retired = result.is_ok();
 				let _ = reply.send(result);
-				if retired {
-					return true;
+			},
+			Command::RetiredAuthorityReleased { replacement, restored } => {
+				if self.retired_for == Some(replacement) {
+					self.retired_for = None;
+					if restored {
+						self.schedule_idle_eviction();
+					} else {
+						return true;
+					}
 				}
 			},
 
@@ -1552,7 +1593,8 @@ impl DocumentActor {
 	}
 
 	fn schedule_idle_eviction(&mut self) {
-		if self.leases.is_empty()
+		if self.retired_for.is_none()
+			&& self.leases.is_empty()
 			&& self.reservations.is_empty()
 			&& self.pending_opens.is_empty()
 			&& self.queued_opens.is_empty()
@@ -2175,6 +2217,7 @@ impl DocumentActor {
 			|| self.background_in_flight()
 			|| self.invalidated
 			|| !self.reservations.is_empty()
+			|| self.retired_for.is_some()
 		{
 			return Err(Error::InvalidTarget {
 				target: Str::new(path.to_string_lossy()),
@@ -2182,7 +2225,10 @@ impl DocumentActor {
 			});
 		}
 		let registry = self.registry.upgrade().ok_or_else(actor_unavailable)?;
-		registry.retire_and_reserve_path(self.document_id, replacement, path)
+		let reservation = registry.retire_and_reserve_path(self.document_id, replacement, path)?;
+		self.retired_for = Some(replacement);
+		self.idle_deadline = None;
+		Ok(reservation)
 	}
 
 	fn validate(&self, reservation: DocumentReservation) -> Result<()> {
