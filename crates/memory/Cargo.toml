@@ -13,7 +13,7 @@ readme = "README.md"
 workspace = true
 
 [features]
-default = ["local-embedding"]
+default = []
 local-embedding = ["dep:fastembed"]
 
 [dependencies]
