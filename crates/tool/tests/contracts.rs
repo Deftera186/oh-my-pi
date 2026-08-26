@@ -31,7 +31,7 @@ use omp_tool::{
 	Precedence, Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall,
 	RecordedCallOwned, Registry, RegistryError, RegistryLeaf, RepairKind, Rev, Tool, ToolIdentity,
 	ToolSpec, ToolTerminal, Usd, call_outcome_details,
-	render::{RenderFold, RenderRegistryError, ViewState},
+	render::{RenderFold, RenderRegistry, RenderRegistryError, ViewState},
 };
 use serde::{Deserialize, Serialize, ser};
 use serde_json::json;
@@ -2037,45 +2037,39 @@ fn revision_stamps_round_trip_through_the_canonical_parser() {
 }
 
 #[test]
-fn render_registry_is_exact_revision_cached_and_falls_back_without_name_lookup() {
+fn renderers_are_exact_revision_cached_and_fall_back_without_name_lookup() {
 	let exact = ToolIdentity { name: sf!("counter"), rev: Rev { family: sf!("counter"), n: 1 } };
 	let unknown = ToolIdentity {
 		name: exact.name.clone(),
 		rev:  Rev { family: exact.rev.family.clone(), n: 2 },
 	};
-	let mut registry = Registry::new();
-	let hashes = (registry.slot_hash(), registry.device_hash(), registry.projection_hash());
-	registry
-		.register_renderer(exact.clone(), CountRender)
-		.unwrap();
-	assert_eq!((registry.slot_hash(), registry.device_hash(), registry.projection_hash()), hashes,);
+	let mut renderers = RenderRegistry::new();
+	renderers.register(exact.clone(), CountRender).unwrap();
 	assert!(matches!(
-		registry.register_renderer(exact.clone(), CountRender),
+		renderers.register(exact.clone(), CountRender),
 		Err(RenderRegistryError::Duplicate(identity)) if identity == exact
 	));
-	assert!(registry.renderer(&exact).is_some());
-	assert!(registry.renderer(&unknown).is_none());
+	assert!(renderers.get(&exact).is_some());
+	assert!(renderers.get(&unknown).is_none());
 
 	let mut state = ViewState::new();
-	registry
-		.fold_render(&exact, &mut state, Bytes::from_static(br#"{"count":2}"#))
+	renderers
+		.fold(&exact, &mut state, Bytes::from_static(br#"{"count":2}"#))
 		.unwrap();
-	registry
-		.fold_render(&exact, &mut state, Bytes::from_static(br#"{"count":3}"#))
+	renderers
+		.fold(&exact, &mut state, Bytes::from_static(br#"{"count":3}"#))
 		.unwrap();
 	assert_eq!(
-		registry
-			.render_view(&exact, &state, Some(br#"{"kind":"ok"}"#))
-			.unwrap(),
+		renderers.view(&exact, &state, Some(br#"{"kind":"ok"}"#)).unwrap(),
 		"count=5;settled=true",
 	);
 	assert_eq!(state.raw_update_count(), 0);
 
 	let mut fallback = ViewState::new();
-	registry
-		.fold_render(&unknown, &mut fallback, Bytes::from_static(br#"{"progress":7}"#))
+	renderers
+		.fold(&unknown, &mut fallback, Bytes::from_static(br#"{"progress":7}"#))
 		.unwrap();
-	assert_eq!(registry.render_view(&unknown, &fallback, None).unwrap(), r#"{"progress":7}"#,);
+	assert_eq!(renderers.view(&unknown, &fallback, None).unwrap(), r#"{"progress":7}"#,);
 	assert_eq!(fallback.raw_update_count(), 1);
 }
 

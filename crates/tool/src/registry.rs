@@ -33,7 +33,6 @@ use crate::{
 	CallOutcome, Constraint, DeviceIssue, DevicePath, Effects, GrammarSyntax, IncomingParams,
 	JobRef, LiftedCall, Part, Presentation, PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool,
 	ToolIdentity, ToolPromptExample, ToolSpec,
-	render::{RenderEntry, RenderFold, RenderRegistry, RenderRegistryError, ViewState},
 };
 
 /// Catalog capabilities needed for deterministic tool lowering.
@@ -1382,7 +1381,6 @@ pub struct Registry {
 	protected_core:   BTreeSet<Str>,
 	unmounted:        RwLock<BTreeMap<Str, Option<Str>>>,
 	arg_specs:        ArgSpecRegistry,
-	renderers:        RenderRegistry,
 	projection_cache: Arc<ProjectionCache>,
 }
 
@@ -1526,70 +1524,6 @@ impl Registry {
 	/// path.
 	pub fn arg_spec(&self, rev: &Rev, path: &[ArgPath]) -> Option<&ArgSpec> {
 		self.arg_specs.get(rev, path)
-	}
-
-	/// Registers one pure renderer for one exact tool identity.
-	pub fn register_renderer<R: RenderFold>(
-		&mut self,
-		identity: ToolIdentity,
-		renderer: R,
-	) -> Result<(), RenderRegistryError> {
-		self.renderers.register(identity, renderer)
-	}
-
-	/// Borrows the exact-revision renderer registry.
-	pub const fn render_registry(&self) -> &RenderRegistry {
-		&self.renderers
-	}
-
-	/// Mutably borrows renderer registration storage during composition.
-	///
-	/// Renderer entries remain excluded from every execution and prompt hash.
-	pub const fn render_registry_mut(&mut self) -> &mut RenderRegistry {
-		&mut self.renderers
-	}
-
-	/// Borrows a cached renderer for one exact identity.
-	pub fn renderer(&self, identity: &ToolIdentity) -> Option<RenderEntry<'_>> {
-		self.renderers.get(identity)
-	}
-
-	/// Folds one serialized update through an exact-revision renderer.
-	pub fn fold_render(
-		&self,
-		identity: &ToolIdentity,
-		state: &mut ViewState,
-		update: Bytes,
-	) -> Result<(), RenderRegistryError> {
-		self.renderers.fold(identity, state, update)
-	}
-
-	/// Folds the accumulated streaming argument parse through an
-	/// exact-revision renderer; unknown revisions ignore arguments.
-	pub fn fold_render_args(
-		&self,
-		identity: &ToolIdentity,
-		state: &mut ViewState,
-		args: &omp_slopjson::Value,
-		complete: bool,
-	) -> Result<(), RenderRegistryError> {
-		self.renderers.fold_args(identity, state, args, complete)
-	}
-
-	/// Resolves the single registered renderer identity for a tool name,
-	/// enabling streaming argument previews before the revision is known.
-	pub fn render_identity(&self, name: &str) -> Option<&ToolIdentity> {
-		self.renderers.resolve_name(name)
-	}
-
-	/// Renders an exact-revision fold or the generic built-in fallback.
-	pub fn render_view(
-		&self,
-		identity: &ToolIdentity,
-		state: &ViewState,
-		outcome: Option<&[u8]>,
-	) -> Result<Str, RenderRegistryError> {
-		self.renderers.view(identity, state, outcome)
 	}
 
 	fn next_projection_cache_id(&self) -> Result<u32, RegistryError> {
