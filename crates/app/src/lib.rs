@@ -42,6 +42,7 @@ pub mod grievances_cmd;
 mod gui;
 pub mod help_extra;
 pub mod image_attachment;
+pub mod images_cmd;
 pub mod join_cmd;
 pub mod keybindings;
 pub mod models_cmd;

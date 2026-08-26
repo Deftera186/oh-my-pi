@@ -36,7 +36,6 @@ pub fn redirect(arguments: &[OsString]) -> Option<Str> {
 			| "plugins"
 			| "extensions"
 			| "marketplace"
-			| "install"
 			| "uninstall"
 			| "upgrade"
 			| "enable"
@@ -60,5 +59,6 @@ mod tests {
 	fn redirects_management_but_preserves_sentences() {
 		assert!(redirect(&["omp", "marketplace", "add", "repo"].map(OsString::from)).is_some());
 		assert!(redirect(&["omp", "upgrade", "the", "dependencies"].map(OsString::from)).is_none());
+		assert!(redirect(&["omp", "install", "name@marketplace"].map(OsString::from)).is_none());
 	}
 }

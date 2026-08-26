@@ -70,7 +70,9 @@ use crate::{
 	dry_balance_cmd,
 	endpoint::LocalEndpoint,
 	ext_cli,
-	ext_cli::ExtArgs,
+	ext_cli::{
+		ExtArgs, ExtCommand, ExtInstallArgs, ExtLinkArgs, Scope as ExtScope, Tier as ExtTier,
+	},
 	gallery_cmd,
 	gallery_cmd::GalleryArgs,
 	gc_cmd, git_cmd,
@@ -497,6 +499,65 @@ pub struct GcArgs {
 	/// Emit machine-readable JSON.
 	#[arg(long)]
 	pub json:                    bool,
+}
+/// Image blob-store inspection and maintenance options.
+#[derive(Clone, Debug, Args)]
+pub struct ImagesArgs {
+	/// Blob-store operation.
+	#[arg(value_enum)]
+	pub action:  ImagesAction,
+	/// Emit machine-readable JSON.
+	#[arg(long)]
+	pub json:    bool,
+	/// Apply destructive purge operations; omission is a dry run.
+	#[arg(long)]
+	pub apply:   bool,
+	/// Purge all unreachable blobs, including those inside the normal grace period.
+	#[arg(long)]
+	pub all:     bool,
+	/// Override the profile data directory containing the blob store.
+	#[arg(long, value_name = "PATH")]
+	pub dir:     Option<PathBuf>,
+	/// Positive probe timeout in seconds.
+	#[arg(long, value_name = "SECONDS")]
+	pub timeout: Option<u64>,
+}
+
+/// Image blob-store operation.
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, ValueEnum, serde::Serialize, strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum ImagesAction {
+	/// Show blob inventory and storage usage.
+	Status,
+	/// Verify the on-disk blob layout and every content digest.
+	Doctor,
+	/// Exercise a write, verified read, and cleanup against the real store.
+	Probe,
+	/// Reclaim blobs not rooted by sessions or the durable artifact catalog.
+	Purge,
+}
+
+/// Top-level extension installation shorthand.
+#[derive(Clone, Debug, Args)]
+pub struct InstallArgs {
+	/// Local paths, signed index specifications, or marketplace references.
+	#[arg(required = true, num_args = 1.., value_name = "TARGET")]
+	pub targets: Vec<Str>,
+	/// Emit machine-readable output.
+	#[arg(long)]
+	pub json:    bool,
+	/// Reinstall already satisfied remote specifications.
+	#[arg(long)]
+	pub force:   bool,
+	/// Show actions without changing extension state.
+	#[arg(long)]
+	pub dry_run: bool,
+	/// Install-record scope.
+	#[arg(long, value_enum, default_value_t = ExtScope::User)]
+	pub scope:   ExtScope,
 }
 
 /// Durable quota-history options.
@@ -1014,6 +1075,11 @@ pub enum Command {
 	/// Manage Python extension resolution, trust, and site trees.
 	#[command(alias = "plugin")]
 	Ext(ExtArgs),
+	/// Install or link extensions, classifying local paths automatically.
+	Install(InstallArgs),
+	/// Inspect image blob storage.
+	#[command(alias = "img")]
+	Images(ImagesArgs),
 	/// Inspect or update the schema-validated application configuration.
 	Config(ConfigArgs),
 	/// Inspect and control Environment-supervised processes.
@@ -1415,6 +1481,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "local", aliases: &[] },
 	CommandSpec { name: "ext", aliases: &["plugin"] },
 	CommandSpec { name: "install", aliases: &[] },
+	CommandSpec { name: "images", aliases: &["img"] },
 	CommandSpec { name: "config", aliases: &[] },
 	CommandSpec { name: "ps", aliases: &[] },
 	CommandSpec { name: "read", aliases: &[] },
@@ -2371,6 +2438,8 @@ enum DispatchTarget {
 	CatalogImport,
 	LocalInfer,
 	Ext,
+	Install,
+	Images,
 	Config,
 	Ps,
 	Read,
@@ -2428,6 +2497,8 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 			DispatchTarget::LocalInfer
 		},
 		Some(Command::Ext(_)) => DispatchTarget::Ext,
+		Some(Command::Install(_)) => DispatchTarget::Install,
+		Some(Command::Images(_)) => DispatchTarget::Images,
 		Some(Command::Config(_)) => DispatchTarget::Config,
 		Some(Command::Ps(_)) => DispatchTarget::Ps,
 		Some(Command::Read(_)) => DispatchTarget::Read,
@@ -2469,6 +2540,131 @@ fn chat_start(args: &mut ChatArgs) -> ChatStart {
 	} else {
 		ChatStart::Session
 	}
+}
+
+async fn run_interactive_chat(
+	mut args: ChatArgs,
+	extension_launch: LaunchExtensions,
+	presentation: ChatPresentation,
+) -> miette::Result<()> {
+	args.extension_launch = extension_launch;
+	let start = chat_start(&mut args);
+	startup_notice::show_once(
+		&omp_core::dirs::data_dir(None).into_diagnostic()?,
+		args.model.as_ref(),
+		args.thinking.map(<&'static str>::from),
+		Eligibility {
+			resume: args.resume.is_some() || args.continue_session || args.fork.is_some(),
+			quiet:  false,
+			timing: env::var_os("OMP_TIMING").is_some(),
+		},
+	)
+	.into_diagnostic()?;
+	Box::pin(chat_cmd::run(args, start, presentation)).await
+}
+
+fn extension_shorthand_args(
+	command: ExtCommand,
+	scope: ExtScope,
+	json: bool,
+) -> ExtArgs {
+	ExtArgs {
+		project: ".".into(),
+		data_dir: None,
+		store: None,
+		cache: None,
+		index: Vec::new(),
+		index_keys: None,
+		offline: false,
+		locked: false,
+		exclude_newer: None,
+		disable: Vec::new(),
+		grant: None,
+		allow_build: false,
+		sign_key: None,
+		uv: None,
+		targets: Vec::new(),
+		trace: false,
+		env_socket: None,
+		layer: None,
+		scope,
+		json,
+		verbose: false,
+		command,
+	}
+}
+
+fn looks_like_local_install_target(target: &str) -> bool {
+	if target.starts_with('.') || target.starts_with('/') || target.starts_with('~') {
+		return true;
+	}
+	let bytes = target.as_bytes();
+	if bytes.len() >= 3
+		&& bytes[0].is_ascii_alphabetic()
+		&& bytes[1] == b':'
+		&& matches!(bytes[2], b'/' | b'\\')
+	{
+		return true;
+	}
+	Path::new(target).try_exists().unwrap_or(false)
+}
+
+fn local_install_path(target: &str) -> PathBuf {
+	if target == "~" {
+		return omp_core::dirs::home_dir().unwrap_or_else(|| PathBuf::from(target));
+	}
+	if let Some(relative) = target.strip_prefix("~/").or_else(|| target.strip_prefix("~\\")) {
+		if let Some(home) = omp_core::dirs::home_dir() {
+			return home.join(relative);
+		}
+	}
+	PathBuf::from(target)
+}
+
+async fn install_shorthand(args: InstallArgs) -> miette::Result<()> {
+	let mut remote = Vec::new();
+	for target in args.targets {
+		if looks_like_local_install_target(target.as_str()) {
+			if args.dry_run {
+				if args.json {
+					println!(
+						"{}",
+						serde_json::json!({"action":"link","target":target,"applied":false})
+					);
+				} else {
+					println!("would link {}", target);
+				}
+				continue;
+			}
+			let command = ExtCommand::Link(ExtLinkArgs {
+				path:       local_install_path(target.as_str()),
+				tier:       ExtTier::Sandboxed,
+				name:       None,
+				features:   None,
+				no_resolve: false,
+			});
+			ext_cli::run(extension_shorthand_args(command, args.scope, args.json)).await?;
+		} else {
+			remote.push(target);
+		}
+	}
+	if remote.is_empty() {
+		return Ok(());
+	}
+	let command = ExtCommand::Install(ExtInstallArgs {
+		specs:          remote,
+		tier:           ExtTier::Sandboxed,
+		pool:           None,
+		features:       None,
+		capabilities:   None,
+		yes:            false,
+		dry_run:        args.dry_run,
+		no_preresolved: false,
+		target:         Vec::new(),
+		no_lock:        false,
+		force:          args.force,
+	});
+	ext_cli::run(extension_shorthand_args(command, args.scope, args.json)).await
 }
 
 fn lower_launch_extensions(cli: &OmpCli) -> miette::Result<LaunchExtensions> {
@@ -2611,7 +2807,12 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	if let Some(cwd) = cli.cwd.as_deref() {
 		env::set_current_dir(cwd).into_diagnostic()?;
 	}
-	if !cli.allow_home && matches!(cli.command, None | Some(Command::Chat(_))) && is_home_dir()? {
+	let terminal_auth = cli.acp_terminal_auth;
+	if !cli.allow_home
+		&& (matches!(cli.command, None | Some(Command::Chat(_)))
+			|| terminal_auth && matches!(cli.command, Some(Command::Acp(_))))
+		&& is_home_dir()?
+	{
 		switch_from_home()?;
 	}
 	let gui = cli.gui;
@@ -2661,29 +2862,16 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			);
 			omp_envd::run(args.into_config(), bridges).await
 		},
-		Command::Chat(mut args) => {
-			args.extension_launch = launch_extensions;
-			let start = chat_start(&mut args);
-			startup_notice::show_once(
-				&omp_core::dirs::data_dir(None).into_diagnostic()?,
-				args.model.as_ref(),
-				args.thinking.map(<&'static str>::from),
-				Eligibility {
-					resume: args.resume.is_some() || args.continue_session || args.fork.is_some(),
-					quiet:  false,
-					timing: env::var_os("OMP_TIMING").is_some(),
-				},
-			)
-			.into_diagnostic()?;
-			Box::pin(chat_cmd::run(
+		Command::Chat(args) => {
+			run_interactive_chat(
 				args,
-				start,
+				launch_extensions,
 				if gui {
 					ChatPresentation::Gui
 				} else {
 					ChatPresentation::Terminal
 				},
-			))
+			)
 			.await
 		},
 		Command::Print(mut args) => {
@@ -2705,9 +2893,18 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			rpc_mode::run(args, true).await
 		},
 		Command::Acp(mut args) => {
-			args.launch.extension_launch = launch_extensions;
-			refresh_marketplace(&args.launch).await?;
-			acp_mode::run(args).await
+			if terminal_auth {
+				run_interactive_chat(
+					args.launch,
+					launch_extensions,
+					ChatPresentation::Terminal,
+				)
+				.await
+			} else {
+				args.launch.extension_launch = launch_extensions;
+				refresh_marketplace(&args.launch).await?;
+				acp_mode::run(args).await
+			}
 		},
 		Command::Infer(args) => infer(args).await,
 		Command::Join(args) => join_cmd::run(args).await,
@@ -2717,6 +2914,8 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Local(LocalArgs { command: LocalCommand::Infer(args) }) => local_infer(args).await,
 		Command::Ext(args) => ext_cli::run(args).await,
+		Command::Install(args) => install_shorthand(args).await,
+		Command::Images(args) => crate::images_cmd::run(args),
 		Command::Config(args) => {
 			config_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args.command)
 		},
@@ -2802,7 +3001,6 @@ fn parse_with_terminal(
 	profile_bootstrap::remove_boundaries(&mut bootstrap.arguments);
 	let mut arguments = bootstrap.arguments;
 	normalize_hidden_command(&mut arguments);
-	normalize_install_command(&mut arguments);
 	if !interactive
 		&& first_positional(&arguments).is_none()
 		&& !arguments.iter().skip(1).any(|argument| {
@@ -2896,26 +3094,6 @@ fn builtin_contribution_names() -> impl Iterator<Item = Str> {
 	]
 	.into_iter()
 	.map(Str::new_static)
-}
-
-fn normalize_install_command(arguments: &mut Vec<OsString>) {
-	let Some(index) = arguments.iter().position(|argument| argument == "install") else {
-		return;
-	};
-	if index == 0
-		|| arguments[..index]
-			.iter()
-			.skip(1)
-			.any(|argument| !argument.to_string_lossy().starts_with('-'))
-	{
-		return;
-	}
-	arguments[index] = OsString::from("ext");
-	let operation = arguments
-		.get(index + 1)
-		.filter(|target| Path::new(target).is_dir())
-		.map_or("install", |_| "link");
-	arguments.insert(index + 1, OsString::from(operation));
 }
 
 fn normalize_hidden_command(arguments: &mut Vec<OsString>) {
@@ -3599,6 +3777,8 @@ mod tests {
 			),
 			(&["omp", "local", "infer", "--prompt", "hello"][..], DispatchTarget::LocalInfer),
 			(&["omp", "ext", "list"][..], DispatchTarget::Ext),
+			(&["omp", "install", "publisher/example"][..], DispatchTarget::Install),
+			(&["omp", "images", "status"][..], DispatchTarget::Images),
 		];
 		for (arguments, expected) in cases {
 			assert_eq!(dispatch_target(parse(arguments).command.as_ref()), expected);
@@ -3801,12 +3981,59 @@ mod tests {
 		] {
 			assert!(matches!(parse(arguments).command, Some(Command::Ext(_))), "{arguments:?}");
 		}
-		let installed = parse_from_os(["omp", "install", "publisher/example"].map(OsString::from))
-			.expect("install alias");
-		assert!(matches!(
-			installed.command,
-			Some(Command::Ext(ExtArgs { command: ExtCommand::Install(_), .. }))
-		));
+		let installed = parse_from_os(
+			[
+				"omp",
+				"install",
+				"--force",
+				"--dry-run",
+				"--scope=project",
+				"publisher/example",
+				"./local",
+			]
+			.map(OsString::from),
+		)
+		.expect("top-level install");
+		let Some(Command::Install(args)) = installed.command else {
+			panic!("install command");
+		};
+		assert_eq!(args.targets, [sf!("publisher/example"), sf!("./local")]);
+		assert!(args.force && args.dry_run);
+		assert_eq!(args.scope, ExtScope::Project);
+		assert!(!looks_like_local_install_target("publisher/example"));
+		assert!(looks_like_local_install_target("./local"));
+		assert!(looks_like_local_install_target("~/local"));
+		assert!(looks_like_local_install_target(r"C:\local"));
+	}
+
+	#[test]
+	fn parses_images_actions_alias_and_flags() {
+		let Some(Command::Images(args)) =
+			parse(&["omp", "img", "purge", "--apply", "--all", "--dir", "profile"]).command
+		else {
+			panic!("images command");
+		};
+		assert_eq!(args.action, ImagesAction::Purge);
+		assert!(args.apply && args.all);
+		assert_eq!(args.dir, Some(PathBuf::from("profile")));
+
+		for action in ["status", "doctor", "probe", "purge"] {
+			assert!(matches!(
+				parse(&["omp", "images", action]).command,
+				Some(Command::Images(_))
+			));
+		}
+	}
+
+	#[test]
+	fn acp_terminal_auth_flag_is_retained_for_dispatch() {
+		let cli = parse(&["omp", "acp", "--acp-terminal-auth"]);
+		assert!(cli.acp_terminal_auth);
+		assert!(matches!(cli.command, Some(Command::Acp(_))));
+
+		let default = parse(&["omp", "--acp-terminal-auth"]);
+		assert!(default.acp_terminal_auth);
+		assert!(default.command.is_none());
 	}
 
 	#[test]

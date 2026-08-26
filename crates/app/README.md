@@ -48,3 +48,7 @@ Run `just setup-python` once before commands that link embedded Python. Use
 `just check-pkg omp-app` and `just test-pkg omp-app`. Exercise the command
 surface with `just run -- <args>`; use `just e2e` or an exact narrower E2E
 recipe from `just --list` for joined behavior.
+
+The default `omp` build keeps optional native engines off the critical path.
+Use `--features local-all` for all local model backends and `--features gui`
+for the native GPU presentation host.
