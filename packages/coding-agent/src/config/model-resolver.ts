@@ -329,6 +329,14 @@ function resolveBedrockInferenceProfileModelId(
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: null,
 		maxTokens: null,
+		// Carry the provider's Bedrock guardrail config onto the synthetic model.
+		// Catalog ids get it via the registry's provider-guardrail overlay; a raw
+		// inference-profile ARN has no registered entry, so without this copy the
+		// Converse request drops `guardrailConfig` and IAM policies that gate
+		// `bedrock:InvokeModel*` on `bedrock:GuardrailIdentifier` return 403.
+		guardrailIdentifier: template.guardrailIdentifier,
+		guardrailVersion: template.guardrailVersion,
+		guardrailTrace: template.guardrailTrace,
 	});
 }
 

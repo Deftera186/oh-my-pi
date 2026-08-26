@@ -1586,6 +1586,37 @@ describe("resolveCliModel", () => {
 		expect(offResult.thinkingLevel).toBe("off");
 	});
 
+	test("carries provider guardrail config onto synthetic Bedrock inference-profile ARN models", () => {
+		const guardedBedrockModel = buildModel({
+			id: "us.anthropic.claude-opus-4-8",
+			name: "Claude Opus 4.8 (US)",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+			baseUrl: "https://bedrock-runtime.eu-west-2.amazonaws.com",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 1000000,
+			maxTokens: 128000,
+			guardrailIdentifier: "arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234",
+			guardrailVersion: "DRAFT",
+			guardrailTrace: "enabled",
+		});
+		const profileArn = "arn:aws:bedrock:eu-west-2:123456789012:application-inference-profile/example-profile";
+
+		const result = resolveCliModel({
+			cliProvider: "amazon-bedrock",
+			cliModel: profileArn,
+			modelRegistry: { getAll: () => [guardedBedrockModel], getAvailable: () => [guardedBedrockModel] },
+		});
+
+		expect(result.error).toBeUndefined();
+		expect(result.model?.id).toBe(profileArn);
+		expect(result.model?.guardrailIdentifier).toBe("arn:aws:bedrock:eu-west-2:123456789012:guardrail/abcd1234");
+		expect(result.model?.guardrailVersion).toBe("DRAFT");
+		expect(result.model?.guardrailTrace).toBe("enabled");
+	});
+
 	test("returns a clear error when there are no models", () => {
 		const registry = { getAll: () => [], getAvailable: () => [] } as unknown as Parameters<
 			typeof resolveCliModel

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Amazon Bedrock guardrail config (`guardrailIdentifier`/`guardrailVersion`/`guardrailTrace`) being dropped for cross-region inference-profile ARNs referenced directly from `model:`/`enabledModels:`/`modelRoles:`, which caused an IAM explicit-deny 403 on accounts gating `bedrock:InvokeModel*` on `bedrock:GuardrailIdentifier` ([#9862](https://github.com/can1357/oh-my-pi/issues/9862)).
+
 ## [18.0.6] - 2026-08-26
 
 ### Added
