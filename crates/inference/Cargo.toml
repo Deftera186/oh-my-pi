@@ -26,7 +26,7 @@ local-stt = [
 	"dep:candle-transformers",
 	"dep:tokenizers",
 ]
-local-text = ["local", "dep:llama-cpp-2"]
+local-text = ["local", "dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 local-tts = [
 	"local",
 	"dep:candle-core",
@@ -55,7 +55,7 @@ hyper-rustls = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio"] }
 im = { workspace = true }
 libc = { workspace = true }
-llama-cpp-2 = { workspace = true, optional = true }
+llama-cpp-sys-2 = { workspace = true, optional = true }
 omp-core = { workspace = true }
 omp-catalog = { workspace = true }
 omp-oauth = { workspace = true }

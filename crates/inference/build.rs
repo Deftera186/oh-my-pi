@@ -40,6 +40,27 @@ fn main() {
 		.expect("prost-build failed to generate Cursor bindings");
 
 	compile_devin(manifest);
+	ensure_llama_link_dirs();
+}
+
+/// llama-cpp-sys-2's build script emits `rustc-link-search` for both `lib` and
+/// `lib64` under its OUT_DIR, but the CMake install populates only one of them
+/// (`lib` on macOS), so ld64.lld warns `directory not found for option -L…/lib64`
+/// on every downstream link (surfaced by the `linker_messages` lint). Pre-create
+/// both dirs so the emitted search paths always exist. The sys OUT_DIR is derived
+/// from its `links = "llama"` metadata (`DEP_LLAMA_GGML_CMAKE_DIR` =
+/// `<out>/lib{,64}/cmake`); Cargo runs this script after the sys build script,
+/// so the layout is final. Absent without the `local-text` feature → no-op.
+fn ensure_llama_link_dirs() {
+	let Some(cmake_dir) = env::var_os("DEP_LLAMA_GGML_CMAKE_DIR") else {
+		return;
+	};
+	let Some(out) = Path::new(&cmake_dir).parent().and_then(Path::parent) else {
+		return;
+	};
+	for libdir in ["lib", "lib64"] {
+		let _ = fs::create_dir_all(out.join(libdir));
+	}
 }
 
 #[derive(Deserialize)]

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time:
 
 use omp_core::{SecretString, Str};
 use parking_lot::Mutex;
-use tokio::{sync::Notify, time::Instant};
+use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Boxed environment-execution future at the cold command-credential boundary.
@@ -46,7 +46,7 @@ pub enum CommandCredentialError {
 
 #[derive(Debug)]
 enum CacheEntry {
-	Resolving(Arc<Notify>),
+	Resolving(watch::Sender<()>),
 	Ready(SecretString),
 	FailedUntil(Instant),
 }
@@ -88,30 +88,31 @@ impl CommandCredentialResolver {
 					Some(CacheEntry::FailedUntil(until)) if *until > Instant::now() => {
 						return Err(CommandCredentialError::FailureCached);
 					},
-					Some(CacheEntry::Resolving(notify)) => Some(Arc::clone(notify)),
+					// Subscribing under the lock snapshots the sender's version, so a
+					// completion between releasing the lock and awaiting `changed()`
+					// still resolves the wait — no lost wakeup.
+					Some(CacheEntry::Resolving(done)) => Some(done.subscribe()),
 					Some(CacheEntry::FailedUntil(_)) | None => {
-						let notify = Arc::new(Notify::new());
-						cache.insert(key.clone(), CacheEntry::Resolving(Arc::clone(&notify)));
+						let (done, _) = watch::channel(());
+						cache.insert(key.clone(), CacheEntry::Resolving(done));
 						None
 					},
 				}
 			};
-			if let Some(notify) = pending {
+			if let Some(mut done) = pending {
 				tokio::select! {
 					() = cancellation.cancelled() => return Err(CommandCredentialError::Cancelled),
-					() = notify.notified() => continue,
+					_ = done.changed() => continue,
 				}
 			}
 			let result = self
 				.executor
 				.execute(key.clone(), cancellation.clone())
 				.await;
-			let notify = {
+			{
+				// Replacing the entry drops the `Resolving` sender, which wakes every
+				// subscribed waiter via `changed()` returning a closed error.
 				let mut cache = self.cache.lock();
-				let notify = match cache.remove(&key) {
-					Some(CacheEntry::Resolving(notify)) => notify,
-					_ => Arc::new(Notify::new()),
-				};
 				match &result {
 					Ok(secret) => {
 						cache.insert(key.clone(), CacheEntry::Ready(secret.clone()));
@@ -123,9 +124,7 @@ impl CommandCredentialResolver {
 						);
 					},
 				}
-				notify
-			};
-			notify.notify_waiters();
+			}
 			return result;
 		}
 	}
