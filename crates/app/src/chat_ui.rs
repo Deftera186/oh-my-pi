@@ -73,7 +73,7 @@ use omp_storage::{
 use omp_telemetry::firehose::{
 	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
 };
-use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::ViewState};
+use omp_tool::{Registry, Rev, TOOL_REV_PROP, ToolIdentity, render::{RenderRegistry, ViewState}};
 use omp_tools::todo;
 use omp_tui::{
 	Command, Icon, SlashCommands, Suggestion, SuggestionList, UiContext,
@@ -1306,6 +1306,9 @@ where
 	C: TurnClient + Clone + Send + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send + 'static,
 {
+	let renderers = Arc::new(
+		omp_tools::live_renderers(registry.as_ref()).map_err(|error| miette::miette!(error))?,
+	);
 	let bus = agent.events().clone();
 	let task_settings = settings_manager
 		.snapshot()
@@ -1673,7 +1676,7 @@ where
 		&session.initial_items,
 		&mut state.tools,
 		&mut state.part_serial,
-		registry.as_ref(),
+		renderers.as_ref(),
 	);
 	send_status(&backend_tx, &state, &bus, 0);
 	let mut last_roster = project_agent_roster(&parent, &tree, &session_id);
@@ -1734,6 +1737,7 @@ where
 									match crate::render_cmd::history_frame(
 										&local_session_path,
 										registry.as_ref(),
+										renderers.as_ref(),
 									) {
 										Ok(frame) => send_backend(
 											&backend_tx,
@@ -1769,6 +1773,7 @@ where
 									&mut list_sessions,
 									&bus,
 									registry.as_ref(),
+									renderers.as_ref(),
 									0,
 									&mut state,
 								).await? {
@@ -1811,7 +1816,7 @@ where
 											&items,
 											&mut state.tools,
 											&mut state.part_serial,
-											registry.as_ref(),
+											renderers.as_ref(),
 										);
 										send_backend(
 											&backend_tx,
@@ -1891,7 +1896,7 @@ where
 												&items,
 												&mut state.tools,
 												&mut state.part_serial,
-												registry.as_ref(),
+												renderers.as_ref(),
 											);
 										},
 										Err(error) => send_backend(
@@ -1916,7 +1921,7 @@ where
 													&items,
 													&mut state.tools,
 													&mut state.part_serial,
-													registry.as_ref(),
+													renderers.as_ref(),
 												),
 												Err(error) => send_backend(
 													&backend_tx,
@@ -1943,7 +1948,7 @@ where
 										&mut state,
 										&event,
 										modes.as_ref(),
-										registry.as_ref(),
+										renderers.as_ref(),
 										&bus,
 										0,
 									);
@@ -2038,6 +2043,11 @@ pub async fn run_guest(
 	registry: Arc<Registry>,
 	initial_draft: Str,
 ) -> miette::Result<omp_chat_ui::host::HostOutcome> {
+	let gallery = omp_tools::gallery::builtin_renderer_gallery();
+	let mut renderers = RenderRegistry::new();
+	omp_tools::register_builtin_renderers(&mut renderers, gallery.identities)
+		.map_err(|error| miette::miette!(error))?;
+	let renderers = Arc::new(renderers);
 	let caps = detect();
 	let ctx = terminal_ui_context(&caps);
 	let chat = Chat::new(&ctx);
@@ -2060,7 +2070,7 @@ pub async fn run_guest(
 		&replica_items(path, registry.as_ref())?,
 		&mut tools,
 		&mut serial,
-		registry.as_ref(),
+		renderers.as_ref(),
 	);
 	send_backend(&backend_tx, BackendEvent::Status(guest_status(&collab)));
 	let mut presence = collab.subscribe_presence();
@@ -2074,7 +2084,7 @@ pub async fn run_guest(
 					match intent {
 						Intent::Quit => break,
 						Intent::InspectHistory => {
-							match crate::render_cmd::history_frame(path, registry.as_ref()) {
+							match crate::render_cmd::history_frame(path, registry.as_ref(), renderers.as_ref()) {
 								Ok(frame) => send_backend(
 									&backend_tx,
 									BackendEvent::HistoryInspect { frame },
@@ -2201,7 +2211,7 @@ pub async fn run_guest(
 									&items,
 									&mut tools,
 									&mut serial,
-									registry.as_ref(),
+									renderers.as_ref(),
 								);
 							},
 							Err(error) => send_backend(
@@ -2693,6 +2703,7 @@ struct LiveCommandHost<'a, R> {
 	list_sessions:    &'a mut R,
 	bus:              &'a omp_agent::EventBus,
 	registry:         &'a Registry,
+	renderers:        &'a RenderRegistry,
 	dropped:          u64,
 	roster:           commands::CommandRoster,
 	state:            &'a mut BridgeState,
@@ -2965,7 +2976,7 @@ where
 						&items,
 						&mut self.state.tools,
 						&mut self.state.part_serial,
-						self.registry,
+						self.renderers,
 					);
 					send_backend(self.backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
 					Ok(CommandResult::Consumed(ConsumedResult::silent()))
@@ -5308,6 +5319,7 @@ async fn handle_intent<C, R>(
 	list_sessions: &mut R,
 	bus: &omp_agent::EventBus,
 	registry: &Registry,
+	renderers: &RenderRegistry,
 	dropped: u64,
 	state: &mut BridgeState,
 ) -> miette::Result<bool>
@@ -5472,6 +5484,7 @@ where
 				list_sessions,
 				bus,
 				registry,
+				renderers,
 				dropped,
 				roster: roster.clone(),
 				state,
@@ -5973,7 +5986,7 @@ where
 				{
 					state.tools.clear();
 					send_backend(backend, BackendEvent::HistoryCleared);
-					replay_items(backend, &items, &mut state.tools, &mut state.part_serial, registry);
+					replay_items(backend, &items, &mut state.tools, &mut state.part_serial, renderers);
 					send_backend(backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
 				}
 			}
@@ -6342,7 +6355,7 @@ where
 								&items,
 								&mut state.tools,
 								&mut state.part_serial,
-								registry,
+								renderers,
 							);
 							send_backend(backend, BackendEvent::HistoryReplayFinished);
 							state.rewind_targets.clear();
@@ -6400,6 +6413,7 @@ where
 					list_sessions,
 					bus,
 					registry,
+					renderers,
 					dropped,
 					roster,
 					state,
@@ -6801,7 +6815,7 @@ fn handle_agent_event(
 	state: &mut BridgeState,
 	event: &AgentEvent,
 	modes: &RegimeHandle,
-	registry: &Registry,
+	renderers: &RenderRegistry,
 	bus: &omp_agent::EventBus,
 	dropped: u64,
 ) {
@@ -6821,7 +6835,7 @@ fn handle_agent_event(
 						&outcome.output,
 						&mut state.tools,
 						&mut state.part_serial,
-						registry,
+						renderers,
 					);
 					state.replaying_turn = false;
 				}
@@ -6928,8 +6942,8 @@ fn handle_agent_event(
 				},
 				Ok(part_start::Kind::ToolCall) => {
 					let id = Str::from(start.tool_call_id.as_str());
-					let identity = registry
-						.render_identity(&start.tool_name)
+					let identity = renderers
+						.resolve_name(&start.tool_name)
 						.cloned()
 						.unwrap_or_else(|| missing_identity(&start.tool_name));
 					state.tools.insert(id.clone(), ToolDisplay {
@@ -6961,7 +6975,7 @@ fn handle_agent_event(
 					{
 						tool.args = omp_slopjson::parse_streaming(fragment);
 						ensure_tool_started(backend, id, tool, false);
-						if let Some(view) = fold_tool_args(registry, tool, false) {
+						if let Some(view) = fold_tool_args(renderers, tool, false) {
 							send_backend(backend, BackendEvent::ToolView { id: id.clone(), view });
 						} else if tool.started
 							&& let Some(input) = tool.args.get("input").and_then(|value| value.as_str())
@@ -6986,7 +7000,7 @@ fn handle_agent_event(
 			let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				tool.identity = identity;
-				let _ = fold_tool_args(registry, tool, true);
+				let _ = fold_tool_args(renderers, tool, true);
 			} else {
 				state.tools.insert(call_id.clone(), ToolDisplay {
 					identity,
@@ -6999,7 +7013,7 @@ fn handle_agent_event(
 		AgentEvent::ToolArgs { call_id, view, .. } => {
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				tool.args = view.clone();
-				if let Some(view) = fold_tool_args(registry, tool, true) {
+				if let Some(view) = fold_tool_args(renderers, tool, true) {
 					send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 				}
 				ensure_tool_started(backend, call_id, tool, false);
@@ -7033,7 +7047,7 @@ fn handle_agent_event(
 						});
 					}
 				}
-				let view = fold_tool_update(registry, tool, json.clone());
+				let view = fold_tool_update(renderers, tool, json.clone());
 				send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 			}
 		},
@@ -7055,7 +7069,7 @@ fn handle_agent_event(
 				});
 			}
 			let mut tool = state.tools.remove(call_id.as_str());
-			let (identity, ok, view) = render_tool_result_view(registry, item, tool.as_ref());
+			let (identity, ok, view) = render_tool_result_view(renderers, item, tool.as_ref());
 			let is_report_issue = identity.name == "report_issue";
 			if let Some(tool) = tool.as_mut() {
 				ensure_tool_started(backend, call_id, tool, true);
@@ -7225,7 +7239,7 @@ fn replay_items(
 	items: &[Item],
 	tools: &mut HashMap<Str, ToolDisplay>,
 	serial: &mut u64,
-	registry: &Registry,
+	renderers: &RenderRegistry,
 ) {
 	for item in items {
 		match &item.kind {
@@ -7249,13 +7263,13 @@ fn replay_items(
 					title,
 				});
 				let mut tool = ToolDisplay { identity, args, started: true, fold: ViewState::new() };
-				let _ = fold_tool_args(registry, &mut tool, true);
+				let _ = fold_tool_args(renderers, &mut tool, true);
 				tools.insert(id, tool);
 			},
 			Some(item::Kind::ToolResult(result)) => {
 				let id = Str::from(result.call_id.as_str());
 				let tool = tools.remove(id.as_str());
-				let (identity, ok, view) = render_tool_result_view(registry, item, tool.as_ref());
+				let (identity, ok, view) = render_tool_result_view(renderers, item, tool.as_ref());
 				if tool.is_none() {
 					send_backend(backend, BackendEvent::ToolStarted {
 						id:    id.clone(),
@@ -7273,11 +7287,14 @@ fn replay_items(
 }
 /// Projects canonical transcript items into the backend events used by offline
 /// rendering.
-pub(crate) fn replay_backend_events(items: &[Item], registry: &Registry) -> Vec<BackendEvent> {
+pub(crate) fn replay_backend_events(
+	items: &[Item],
+	renderers: &RenderRegistry,
+) -> Vec<BackendEvent> {
 	let (backend, events) = flume::unbounded();
 	let mut tools = HashMap::new();
 	let mut serial = 0;
-	replay_items(&backend, items, &mut tools, &mut serial, registry);
+	replay_items(&backend, items, &mut tools, &mut serial, renderers);
 	drop(backend);
 	events.try_iter().collect()
 }
@@ -7503,23 +7520,27 @@ fn structured_bytes_fallback(bytes: &Bytes) -> Str {
 
 /// Folds the accumulated streaming argument parse and re-renders the live
 /// view, returning markup only when an exact-revision renderer produced one.
-fn fold_tool_args(registry: &Registry, tool: &mut ToolDisplay, complete: bool) -> Option<Str> {
-	let entry = registry.renderer(&tool.identity)?;
+fn fold_tool_args(
+	renderers: &RenderRegistry,
+	tool: &mut ToolDisplay,
+	complete: bool,
+) -> Option<Str> {
+	let entry = renderers.get(&tool.identity)?;
 	entry.fold_args(&mut tool.fold, &tool.args, complete).ok()?;
 	entry.view(&tool.fold, None).ok().flatten()
 }
 
-fn fold_tool_update(registry: &Registry, tool: &mut ToolDisplay, update: Bytes) -> Str {
-	match registry.fold_render(&tool.identity, &mut tool.fold, update.clone()) {
-		Ok(()) => registry
-			.render_view(&tool.identity, &tool.fold, None)
+fn fold_tool_update(renderers: &RenderRegistry, tool: &mut ToolDisplay, update: Bytes) -> Str {
+	match renderers.fold(&tool.identity, &mut tool.fold, update.clone()) {
+		Ok(()) => renderers
+			.view(&tool.identity, &tool.fold, None)
 			.unwrap_or_else(|_| structured_bytes_fallback(&update)),
 		Err(_) => structured_bytes_fallback(&update),
 	}
 }
 
 fn render_tool_result_view(
-	registry: &Registry,
+	renderers: &RenderRegistry,
 	item: &Item,
 	tool: Option<&ToolDisplay>,
 ) -> (ToolIdentity, bool, Str) {
@@ -7542,8 +7563,8 @@ fn render_tool_result_view(
 	let fold = tool
 		.filter(|tool| tool.identity == identity)
 		.map_or(&empty_fold, |tool| &tool.fold);
-	let view = registry
-		.render_view(&identity, fold, outcome.as_deref())
+	let view = renderers
+		.view(&identity, fold, outcome.as_deref())
 		.unwrap_or_else(|_| {
 			outcome
 				.as_ref()
@@ -8603,7 +8624,7 @@ mod tests {
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state(scratch.path());
 		let modes = RegimeHandle::new();
-		let registry = Registry::new();
+		let renderers = RenderRegistry::new();
 		let bus = omp_agent::EventBus::new();
 		for event in [
 			Event::PartStart(v1::PartStart {
@@ -8623,7 +8644,7 @@ mod tests {
 					event:   Box::new(v1::TurnEvent { event: Some(event) }),
 				},
 				&modes,
-				&registry,
+				&renderers,
 				&bus,
 				0,
 			);
@@ -8666,7 +8687,7 @@ mod tests {
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state(scratch.path());
 		let modes = RegimeHandle::new();
-		let registry = Registry::new();
+		let renderers = RenderRegistry::new();
 		let bus = omp_agent::EventBus::new();
 		for event in [
 			Event::PartStart(v1::PartStart {
@@ -8694,7 +8715,7 @@ mod tests {
 					event:   Box::new(v1::TurnEvent { event: Some(event) }),
 				},
 				&modes,
-				&registry,
+				&renderers,
 				&bus,
 				0,
 			);
@@ -8708,7 +8729,7 @@ mod tests {
 				message: sf!("terminal turn error (Upstream)"),
 			},
 			&modes,
-			&registry,
+			&renderers,
 			&bus,
 			0,
 		);
@@ -9034,9 +9055,9 @@ mod tests {
 
 	#[test]
 	fn streaming_args_render_live_previews_before_any_update() {
-		let mut registry = Registry::new();
-		registry
-			.register_renderer(test_identity("test.1"), TestRenderer("one"))
+		let mut renderers = RenderRegistry::new();
+		renderers
+			.register(test_identity("test.1"), TestRenderer("one"))
 			.expect("register renderer");
 		let mut tool = ToolDisplay {
 			identity: test_identity("test.1"),
@@ -9045,14 +9066,14 @@ mod tests {
 			fold:     ViewState::new(),
 		};
 		assert_eq!(
-			fold_tool_args(&registry, &mut tool, false)
+			fold_tool_args(&renderers, &mut tool, false)
 				.expect("partial args render a live preview")
 				.as_str(),
 			"<row>one:parti::partial:live</row>"
 		);
 		tool.args = omp_slopjson::parse_streaming(r#"{"query":"partial search"}"#);
 		assert_eq!(
-			fold_tool_args(&registry, &mut tool, true)
+			fold_tool_args(&renderers, &mut tool, true)
 				.expect("committed args render a live preview")
 				.as_str(),
 			"<row>one:partial search::committed:live</row>"
@@ -9068,12 +9089,12 @@ mod tests {
 
 	#[test]
 	fn exact_revision_renderers_fold_streamed_updates_independently() {
-		let mut registry = Registry::new();
-		registry
-			.register_renderer(test_identity("test.1"), TestRenderer("one"))
+		let mut renderers = RenderRegistry::new();
+		renderers
+			.register(test_identity("test.1"), TestRenderer("one"))
 			.expect("register revision one");
-		registry
-			.register_renderer(test_identity("test.2"), TestRenderer("two"))
+		renderers
+			.register(test_identity("test.2"), TestRenderer("two"))
 			.expect("register revision two");
 		let mut first = ToolDisplay {
 			identity: test_identity("test.1"),
@@ -9088,41 +9109,41 @@ mod tests {
 			fold:     ViewState::new(),
 		};
 		assert_eq!(
-			fold_tool_update(&registry, &mut first, Bytes::from_static(br#"{"text":"a"}"#)).as_str(),
+			fold_tool_update(&renderers, &mut first, Bytes::from_static(br#"{"text":"a"}"#)).as_str(),
 			"<row>one:a:live</row>"
 		);
 		assert_eq!(
-			fold_tool_update(&registry, &mut first, Bytes::from_static(br#"{"text":"b"}"#)).as_str(),
+			fold_tool_update(&renderers, &mut first, Bytes::from_static(br#"{"text":"b"}"#)).as_str(),
 			"<row>one:ab:live</row>"
 		);
 		assert_eq!(
-			fold_tool_update(&registry, &mut second, Bytes::from_static(br#"{"text":"z"}"#)).as_str(),
+			fold_tool_update(&renderers, &mut second, Bytes::from_static(br#"{"text":"z"}"#)).as_str(),
 			"<row>two:z:live</row>"
 		);
 	}
 
 	#[test]
 	fn durable_branches_and_missing_revisions_preserve_structured_facts() {
-		let mut registry = Registry::new();
-		registry
-			.register_renderer(test_identity("test.1"), TestRenderer("exact"))
+		let mut renderers = RenderRegistry::new();
+		renderers
+			.register(test_identity("test.1"), TestRenderer("exact"))
 			.expect("register exact renderer");
 		for branch in ["ok", "faulted", "args_rejected", "aborted"] {
 			let (_, ok, view) =
-				render_tool_result_view(&registry, &result_item("call", Some("test.1"), branch), None);
+				render_tool_result_view(&renderers, &result_item("call", Some("test.1"), branch), None);
 			assert_eq!(ok, branch == "ok");
 			assert!(view.contains(branch), "{view}");
 		}
 
 		let unknown = result_item("unknown", Some("unknown.9"), "faulted");
-		let (identity, ok, view) = render_tool_result_view(&registry, &unknown, None);
+		let (identity, ok, view) = render_tool_result_view(&renderers, &unknown, None);
 		assert_eq!(identity.rev.to_string(), "unknown.9");
 		assert!(!ok);
 		assert!(view.contains(r#""kind":"faulted""#));
 		assert!(view.contains("faulted-fact"));
 
 		let missing = result_item("missing", None, "aborted");
-		let (identity, ok, view) = render_tool_result_view(&registry, &missing, None);
+		let (identity, ok, view) = render_tool_result_view(&renderers, &missing, None);
 		assert_eq!(identity.rev.n, 0);
 		assert!(!ok);
 		assert!(view.contains(r#""kind":"aborted""#));
@@ -9133,12 +9154,12 @@ mod tests {
 	fn replay_uses_durable_revision_and_is_deterministic() {
 		use omp_proto::thread::v1;
 
-		let mut registry = Registry::new();
-		registry
-			.register_renderer(test_identity("test.1"), TestRenderer("one"))
+		let mut renderers = RenderRegistry::new();
+		renderers
+			.register(test_identity("test.1"), TestRenderer("one"))
 			.expect("register revision one");
-		registry
-			.register_renderer(test_identity("test.2"), TestRenderer("two"))
+		renderers
+			.register(test_identity("test.2"), TestRenderer("two"))
 			.expect("register revision two");
 		let items = [
 			Item {
@@ -9157,7 +9178,7 @@ mod tests {
 			let (tx, rx) = flume::unbounded();
 			let mut tools = HashMap::new();
 			let mut serial = 0;
-			replay_items(&tx, &items, &mut tools, &mut serial, &registry);
+			replay_items(&tx, &items, &mut tools, &mut serial, &renderers);
 			rx.drain()
 				.find_map(|event| match event {
 					BackendEvent::ToolFinished { view, .. } => Some(view),

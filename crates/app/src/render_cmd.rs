@@ -14,7 +14,7 @@ use omp_chat_ui::Chat;
 use omp_core::Str;
 use omp_proto::thread::v1;
 use omp_storage::transcript;
-use omp_tool::Registry;
+use omp_tool::{Registry, render::RenderRegistry};
 use omp_tui::{CellContent, Frame, RichSink as _, Size, Style, UiContext};
 
 use crate::{chat_ui, chat_ui::ResumeChoice};
@@ -91,17 +91,15 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	let project_start = Instant::now();
 	let mut live = transcript::LiveSet::new();
 	log.live_into(&mut live);
-	let mut registry = Registry::new();
-	let gallery = omp_tools::gallery::builtin_renderer_gallery();
-	omp_tools::register_builtin_renderers(registry.render_registry_mut(), gallery.identities)
-		.into_diagnostic()?;
+	let registry = Registry::new();
+	let renderers = builtin_renderers()?;
 	let projection =
 		omp_agent::project_journal(&log, &live, &registry, &omp_driver::chat::CHAT_CAPS_BASE)
 			.into_diagnostic()?;
 	let project = project_start.elapsed();
 
 	let replay_start = Instant::now();
-	let mut chat = replay_chat(&projection.items, &registry);
+	let mut chat = replay_chat(&projection.items, &renderers);
 	let replay = replay_start.elapsed();
 
 	let width = args.width.unwrap_or(120);
@@ -131,12 +129,21 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	})
 }
 
-fn replay_chat(items: &[v1::Item], registry: &Registry) -> Chat {
+fn replay_chat(items: &[v1::Item], renderers: &RenderRegistry) -> Chat {
 	let mut chat = Chat::new(&UiContext::default());
-	for event in chat_ui::replay_backend_events(items, registry) {
+	for event in chat_ui::replay_backend_events(items, renderers) {
 		let _ = chat.apply_backend_event(event);
 	}
 	chat
+}
+/// Builds the default builtin renderer registry used by headless replay,
+/// where no live tool registry exists to derive revisions from.
+fn builtin_renderers() -> miette::Result<RenderRegistry> {
+	let gallery = omp_tools::gallery::builtin_renderer_gallery();
+	let mut renderers = RenderRegistry::new();
+	omp_tools::register_builtin_renderers(&mut renderers, gallery.identities)
+		.into_diagnostic()?;
+	Ok(renderers)
 }
 
 fn retirement_frame(chat: &mut Chat, width: u16) -> Frame {
@@ -148,14 +155,18 @@ fn retirement_frame(chat: &mut Chat, width: u16) -> Frame {
 }
 
 /// Renders the canonical journal as a finalized history frame for inspection.
-pub(crate) fn history_frame(path: &Path, registry: &Registry) -> miette::Result<Frame> {
+pub(crate) fn history_frame(
+	path: &Path,
+	registry: &Registry,
+	renderers: &RenderRegistry,
+) -> miette::Result<Frame> {
 	let log = omp_storage::transcript::load(path).into_diagnostic()?;
 	let mut live = transcript::LiveSet::new();
 	log.live_into(&mut live);
 	let projection =
 		omp_agent::project_journal(&log, &live, registry, &omp_driver::chat::CHAT_CAPS_BASE)
 			.into_diagnostic()?;
-	let mut chat = replay_chat(&projection.items, registry);
+	let mut chat = replay_chat(&projection.items, renderers);
 	Ok(retirement_frame(&mut chat, 120))
 }
 
