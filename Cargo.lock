@@ -944,7 +944,6 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
- "memmap2",
 ]
 
 [[package]]
@@ -7721,7 +7720,6 @@ dependencies = [
  "tree-sitter-xml",
  "tree-sitter-yaml",
  "tree-sitter-zig",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -7770,7 +7768,6 @@ dependencies = [
  "tokio",
  "tracing",
  "xutf",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -8220,6 +8217,7 @@ dependencies = [
  "im",
  "libc",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "omp-catalog",
  "omp-core",
  "omp-oauth",
