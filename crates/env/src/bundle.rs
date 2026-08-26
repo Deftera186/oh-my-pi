@@ -29,8 +29,8 @@ pub struct BundleFile {
 pub struct BundleEntry {
 	/// Fixed-layout bundle-relative pathname.
 	pub path:   Str,
-	/// Lowercase BLAKE3-256 hex digest of the payload.
-	pub blake3: Str,
+	/// Lowercase SHA-256 hex digest of the payload.
+	pub sha256: Str,
 	/// Exact payload length in bytes.
 	pub size:   u64,
 }
@@ -111,7 +111,7 @@ pub fn pack_bundle(
 		}
 		contents.push(BundleEntry {
 			path:   file.path.clone(),
-			blake3: Str::new(digest.as_str()),
+			sha256: Str::new(digest.as_str()),
 			size:   u64::try_from(file.contents.len())
 				.map_err(|_| BundleError::Layout(sf!("payload length exceeds u64")))?,
 		});
@@ -131,7 +131,7 @@ pub fn pack_bundle(
 /// # Errors
 ///
 /// Returns [`BundleError::Integrity`] when an indexed payload is missing,
-/// unexpected, or differs from its BLAKE3 address.
+/// unexpected, or differs from its SHA-256 address.
 pub fn unpack_bundle(bytes: &[u8]) -> Result<AirgapBundle, BundleError> {
 	let mut archive = Archive::from_bytes_with_format(bytes, Format::Zip)?;
 	let mut files = archive.read_all()?;
@@ -152,7 +152,7 @@ pub fn unpack_bundle(bytes: &[u8]) -> Result<AirgapBundle, BundleError> {
 			.remove(entry.path.as_str())
 			.ok_or_else(|| BundleError::Integrity(entry.path.clone()))?;
 		verify_entry(entry, &contents)?;
-		if !payload_name_matches_digest(&entry.path, &entry.blake3) {
+		if !payload_name_matches_digest(&entry.path, &entry.sha256) {
 			return Err(BundleError::Integrity(entry.path.clone()));
 		}
 		decoded.push(BundleFile { path: entry.path.clone(), contents: Bytes::from(contents) });
@@ -183,11 +183,11 @@ pub async fn push_bundle(client: &EnvClient, bundle: &AirgapBundle) -> Result<()
 			return Err(BundleError::Layout(sf!("bundle payload order differs from manifest",)));
 		}
 		validate_payload_path(&entry.path)?;
-		if !payload_name_matches_digest(&entry.path, &entry.blake3) {
+		if !payload_name_matches_digest(&entry.path, &entry.sha256) {
 			return Err(BundleError::Integrity(entry.path.clone()));
 		}
 		verify_entry(entry, &file.contents)?;
-		let hash = hash_bytes(&entry.blake3)?;
+		let hash = hash_bytes(&entry.sha256)?;
 		let stat = client.blob_stat(StatRequest { hash: hash.clone() }).await?;
 		if stat.present {
 			if stat.size != entry.size {
@@ -238,10 +238,10 @@ pub async fn pull_bundle(
 	let mut files = Vec::with_capacity(manifest.contents.len());
 	for entry in &manifest.contents {
 		validate_payload_path(&entry.path)?;
-		if !payload_name_matches_digest(&entry.path, &entry.blake3) {
+		if !payload_name_matches_digest(&entry.path, &entry.sha256) {
 			return Err(BundleError::Integrity(entry.path.clone()));
 		}
-		let hash = hash_bytes(&entry.blake3)?;
+		let hash = hash_bytes(&entry.sha256)?;
 		let mut download = client
 			.blob_get(GetRequest { hash, offset: 0, length: 0 })
 			.await?;
@@ -271,8 +271,8 @@ fn validate_payload_path(path: &str) -> Result<(), BundleError> {
 		_ if path.starts_with("wheels/") => path
 			.strip_prefix("wheels/")
 			.and_then(|name| name.strip_suffix(".whl"))
-			.is_some_and(is_blake3_hex),
-		_ if path.starts_with("bin/") => path.strip_prefix("bin/").is_some_and(is_blake3_hex),
+			.is_some_and(is_sha256_hex),
+		_ if path.starts_with("bin/") => path.strip_prefix("bin/").is_some_and(is_sha256_hex),
 		_ => false,
 	};
 	if !valid_root
@@ -286,7 +286,7 @@ fn validate_payload_path(path: &str) -> Result<(), BundleError> {
 	Ok(())
 }
 
-fn is_blake3_hex(value: &str) -> bool {
+fn is_sha256_hex(value: &str) -> bool {
 	value.parse::<Hash32>().is_ok()
 }
 
@@ -294,7 +294,7 @@ fn verify_entry(entry: &BundleEntry, contents: &[u8]) -> Result<(), BundleError>
 	let size =
 		u64::try_from(contents.len()).map_err(|_| BundleError::Integrity(entry.path.clone()))?;
 	let digest = Hash32::sum(contents).to_hex();
-	if size != entry.size || digest.as_str() != entry.blake3 {
+	if size != entry.size || digest.as_str() != entry.sha256 {
 		return Err(BundleError::Integrity(entry.path.clone()));
 	}
 	Ok(())
@@ -319,11 +319,11 @@ fn hash_bytes(value: &str) -> Result<Bytes, BundleError> {
 			.bytes()
 			.all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 	{
-		return Err(BundleError::Layout(sf!("bundle digest is not lowercase BLAKE3 hex",)));
+		return Err(BundleError::Layout(sf!("bundle digest is not lowercase SHA-256 hex",)));
 	}
 	let hash = hex::decode(value)
 		.into_array::<32>()
-		.map_err(|_| BundleError::Layout(sf!("bundle digest is not BLAKE3-256")))?;
+		.map_err(|_| BundleError::Layout(sf!("bundle digest is not SHA-256")))?;
 	Ok(Bytes::copy_from_slice(&hash))
 }
 

@@ -90,6 +90,9 @@ pub enum ClientError {
 	/// A typed environment path could not be resolved to a valid file URI.
 	#[error("invalid environment path URI: {0}")]
 	InvalidEnvPath(Str),
+	/// A durable invocation principal omitted its session or agent identity.
+	#[error("invalid invocation principal: session_id and agent_id must both be nonempty")]
+	InvalidInvocationPrincipal,
 	/// A response did not have the body required by the typed operation.
 	#[error("unexpected environment response while waiting for {expected}")]
 	UnexpectedResponse {
@@ -135,6 +138,10 @@ pub struct DataScope {
 	pub session_generation: u64,
 	/// Whether this invocation is forbidden from allocating pseudo-terminals.
 	pub pty_denied:         bool,
+	/// Stable durable session principal authenticated by the composing client.
+	pub session_id:         Str,
+	/// Stable durable agent principal within `session_id`.
+	pub agent_id:           Str,
 }
 
 impl DataScope {
@@ -151,7 +158,17 @@ impl DataScope {
 			host_generation,
 			session_generation,
 			pty_denied: false,
+			session_id: Str::default(),
+			agent_id: Str::default(),
 		}
+	}
+
+	/// Binds the stable durable session and agent principals for this scope.
+	#[must_use]
+	pub fn with_principal(mut self, session_id: impl Into<Str>, agent_id: impl Into<Str>) -> Self {
+		self.session_id = session_id.into();
+		self.agent_id = agent_id.into();
+		self
 	}
 
 	/// Narrows this invocation so no environment operation can allocate a PTY.
@@ -168,8 +185,31 @@ impl DataScope {
 			host_generation: self.host_generation,
 			session_generation: self.session_generation,
 			pty_denied: self.pty_denied,
+			session_id: self.session_id.to_string(),
+			agent_id: self.agent_id.to_string(),
 			..InvocationScope::default()
 		}
+	}
+}
+
+/// Stable authenticated owner of top-level tool invocations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationPrincipal {
+	/// Durable chat/session identity.
+	pub session_id: Str,
+	/// Durable agent identity within the session.
+	pub agent_id:   Str,
+}
+
+impl InvocationPrincipal {
+	/// Validates and constructs a durable invocation principal.
+	pub fn new(session_id: impl Into<Str>, agent_id: impl Into<Str>) -> Result<Self, ClientError> {
+		let session_id = session_id.into();
+		let agent_id = agent_id.into();
+		if session_id.is_empty() || agent_id.is_empty() {
+			return Err(ClientError::InvalidInvocationPrincipal);
+		}
+		Ok(Self { session_id, agent_id })
 	}
 }
 
@@ -200,10 +240,12 @@ impl InvocationGrant {
 		self.pty_denied
 	}
 
-	fn wire(self, invocation_id: &str) -> InvocationScope {
+	fn wire(self, invocation_id: &str, principal: Option<&InvocationPrincipal>) -> InvocationScope {
 		InvocationScope {
 			invocation_id: invocation_id.to_owned(),
 			pty_denied: self.pty_denied,
+			session_id: principal.map_or_else(String::new, |owner| owner.session_id.to_string()),
+			agent_id: principal.map_or_else(String::new, |owner| owner.agent_id.to_string()),
 			..InvocationScope::default()
 		}
 	}
@@ -216,8 +258,9 @@ impl InvocationGrant {
 /// same boundary from flume channels for a colocated environment host.
 #[derive(Clone, Debug)]
 pub struct EnvClient {
-	inner: Arc<ClientInner>,
-	grant: InvocationGrant,
+	inner:     Arc<ClientInner>,
+	grant:     InvocationGrant,
+	principal: Option<InvocationPrincipal>,
 }
 /// Cloneable out-of-band control for one active environment execution.
 ///
@@ -382,11 +425,12 @@ pub struct RequestStream {
 /// One open tool invocation and its correlated event stream.
 #[derive(Debug)]
 pub struct Invocation {
-	client: EnvClient,
-	id:     Str,
-	grant:  InvocationGrant,
-	guard:  Option<RunGuard>,
-	stream: RequestStream,
+	client:    EnvClient,
+	id:        Str,
+	grant:     InvocationGrant,
+	principal: Option<InvocationPrincipal>,
+	guard:     Option<RunGuard>,
+	stream:    RequestStream,
 }
 
 /// A typed event on a tool invocation stream.
@@ -682,7 +726,7 @@ impl EnvClient {
 		let _ = thread::spawn(move || route_cancellations(canceller, cancellations));
 		let closer = Arc::downgrade(&inner);
 		let _ = thread::spawn(move || route_lease_closes(closer, lease_closes));
-		Self { inner, grant: InvocationGrant::unrestricted() }
+		Self { inner, grant: InvocationGrant::unrestricted(), principal: None }
 	}
 
 	/// Returns a transport-sharing client whose tool invocations carry `grant`.
@@ -690,7 +734,23 @@ impl EnvClient {
 	/// The grant is immutable and local to the returned clone.
 	#[must_use]
 	pub fn with_invocation_grant(&self, grant: InvocationGrant) -> Self {
-		Self { inner: Arc::clone(&self.inner), grant }
+		Self { inner: Arc::clone(&self.inner), grant, principal: self.principal.clone() }
+	}
+
+	/// Returns a transport-sharing client bound to one durable invocation owner.
+	///
+	/// The principal is stamped on every top-level tool invocation and remains
+	/// stable across reconnects because it never derives from the transport.
+	pub fn with_principal(
+		&self,
+		session_id: impl Into<Str>,
+		agent_id: impl Into<Str>,
+	) -> Result<Self, ClientError> {
+		Ok(Self {
+			inner:     Arc::clone(&self.inner),
+			grant:     self.grant,
+			principal: Some(InvocationPrincipal::new(session_id, agent_id)?),
+		})
 	}
 
 	/// Creates an in-process client/server frame channel.
@@ -1187,10 +1247,17 @@ impl EnvClient {
 		let (stream, guard) = self
 			.open_guarded_wire(
 				client_frame::Body::InvokeTool(request),
-				Some(self.grant.wire(id.as_str())),
+				Some(self.grant.wire(id.as_str(), self.principal.as_ref())),
 			)
 			.await?;
-		Ok(Invocation { client: self.clone(), id, grant: self.grant, stream, guard: Some(guard) })
+		Ok(Invocation {
+			client: self.clone(),
+			id,
+			grant: self.grant,
+			principal: self.principal.clone(),
+			stream,
+			guard: Some(guard),
+		})
 	}
 
 	/// Opens a persistent, server-owned exec session rooted at `cwd`.
@@ -1222,6 +1289,34 @@ impl EnvClient {
 		self.exec_scoped(request, None).await
 	}
 
+	/// Transfers one live exec generation to a named Environment process.
+	///
+	/// The correlated exec guard is relinquished only after the daemon
+	/// acknowledges ownership, so disconnects cannot silently orphan it.
+	pub async fn detach_exec(
+		&self,
+		run: ExecRun,
+		exec: Bytes,
+		name: String,
+	) -> Result<ProcessStarted, ClientError> {
+		let response = self
+			.data_request_owned(DataRequest {
+				body: Some(data_request::Body::DetachExec(DetachExec {
+					exec,
+					name,
+					props: Default::default(),
+				})),
+				..DataRequest::default()
+			})
+			.await?;
+		let Some(data_response::Body::DetachedExec(started)) = response.body else {
+			return Err(ClientError::UnexpectedResponse { expected: "ProcessStarted" });
+		};
+		let mut stream = run.relinquish();
+		stream.finish();
+		Ok(started)
+	}
+
 	/// Starts or replaces a server-owned named process rooted at `cwd`.
 	pub async fn start_process(
 		&self,
@@ -1246,6 +1341,20 @@ impl EnvClient {
 		{
 			server_frame::Body::ProcessList(response) => Ok(response),
 			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessList" }),
+		}
+	}
+
+	/// Restarts one exact server-owned named-process generation.
+	pub async fn restart_process(
+		&self,
+		request: RestartProcess,
+	) -> Result<ProcessStarted, ClientError> {
+		match self
+			.one_shot(client_frame::Body::RestartProcess(request), None)
+			.await?
+		{
+			server_frame::Body::ProcessRestarted(response) => Ok(response),
+			_ => Err(ClientError::UnexpectedResponse { expected: "ProcessStarted" }),
 		}
 	}
 
@@ -2584,6 +2693,7 @@ impl RequestStream {
 
 	fn unregister(&self) {
 		if let Some(client) = self.client.upgrade() {
+			client.pending.lock().remove(&self.request_id);
 			client.request_scopes.lock().remove(&self.request_id);
 		}
 	}
@@ -2611,7 +2721,7 @@ mod policy_effects {
 			authorized_at_ms: u64,
 			effects: Option<v1::EffectEnvelope>,
 		) -> Result<(), ClientError> {
-			let mut scope = self.grant.wire(self.id.as_str());
+			let mut scope = self.grant.wire(self.id.as_str(), self.principal.as_ref());
 			scope.effect_token = effect_token.clone();
 			self
 				.client
@@ -3551,4 +3661,32 @@ async fn read_extension_frame_length<R: AsyncRead + Unpin>(
 		}
 	}
 	Err(io::Error::new(io::ErrorKind::InvalidData, "invalid frame length"))
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn terminal_request_streams_remove_all_correlation_state() {
+		let (client, _transport) = EnvClient::in_process(0);
+		for request_id in 1..=1_000 {
+			client
+				.inner
+				.request_scopes
+				.lock()
+				.insert(request_id, InvocationScope {
+					invocation_id: request_id.to_string(),
+					..InvocationScope::default()
+				});
+			let mut stream = client.register(request_id);
+			stream.finish();
+		}
+		assert!(client.inner.pending.lock().is_empty());
+		assert!(client.inner.request_scopes.lock().is_empty());
+
+		let request_id = 1_001;
+		let stream = client.register(request_id);
+		drop(stream);
+		assert!(!client.inner.pending.lock().contains_key(&request_id));
+	}
 }

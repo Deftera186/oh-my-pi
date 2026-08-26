@@ -23,8 +23,8 @@ pub use client::{
 	ActiveExecControl, BlobDownload, BlobDownloadEvent, BlobUpload, ClientError, DapStream,
 	DapStreamEvent, DataScope, DataStream, DataStreamItem, DocumentEvents, DocumentLease,
 	DocumentRead, EnvClient, ExecEvent, ExecRun, ExtensionEnvClient, InProcessEnvTransport,
-	Invocation, InvocationEvent, InvocationGrant, LspEvents, LspStreamEvent, McpSubscription,
-	McpSubscriptionEvent, ProcessAttachment, ProcessAttachmentEvent, RequestStream,
+	Invocation, InvocationEvent, InvocationGrant, InvocationPrincipal, LspEvents, LspStreamEvent,
+	McpSubscription, McpSubscriptionEvent, ProcessAttachment, ProcessAttachmentEvent, RequestStream,
 	ResourceCompletionEvent, ResourceCompletionStream, SearchEvent, SearchStream, StreamLost,
 	TransactionId, TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
 };

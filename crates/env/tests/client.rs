@@ -162,6 +162,51 @@ fn invocation_grants_are_clone_local_and_stamped_on_each_request() {
 	.expect("commit allowed scope");
 	server.join().expect("server");
 }
+#[test]
+fn invocation_principals_are_stable_and_stamped_on_open_and_commit() {
+	let (client, transport) = EnvClient::in_process(0);
+	let client = client
+		.with_principal("session-7", "agent-child-2")
+		.expect("valid durable principal");
+	let (requests, responses) = transport.into_parts();
+	let server = thread::spawn(move || {
+		let opened = receive(&requests);
+		let request_id = opened.request_id;
+		assert!(matches!(
+			opened.scope,
+			Some(scope)
+				if scope.session_id == "session-7"
+					&& scope.agent_id == "agent-child-2"
+					&& scope.invocation_id == "principal"
+		));
+		respond(
+			&responses,
+			request_id,
+			server_frame::Body::InvocationAccepted(frame::InvokeAccepted {
+				invocation_id: "principal".into(),
+				..frame::InvokeAccepted::default()
+			}),
+		);
+		let committed = receive(&requests);
+		assert!(matches!(
+			committed.scope,
+			Some(scope)
+				if scope.session_id == "session-7"
+					&& scope.agent_id == "agent-child-2"
+					&& scope.effect_token == Bytes::from_static(b"authorized")
+		));
+	});
+	let invocation =
+		block_on(client.invoke(invoke_request("principal"))).expect("principal invocation");
+	block_on(invocation.commit_args(
+		Bytes::from_static(b"{}"),
+		Bytes::from_static(b"authorized"),
+		1,
+		None,
+	))
+	.expect("principal commit");
+	server.join().expect("server");
+}
 
 #[test]
 fn hello_and_concurrent_requests_are_correlated_while_events_remain_observable() {
