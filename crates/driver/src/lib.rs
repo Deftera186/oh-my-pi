@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Headless coding-agent harness: session composition, execution modes,
 //! orchestration, discovery, and settings for OMP.
 
