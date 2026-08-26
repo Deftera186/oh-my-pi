@@ -2,7 +2,7 @@ use std::fmt;
 
 use omp_core::Str;
 use omp_tool::{
-	Part, PromptCaps, ToolIdentity,
+	Part, PromptCaps, Registry, ToolIdentity,
 	render::{RenderRegistry, RenderRegistryError},
 };
 
@@ -177,6 +177,42 @@ pub fn register_builtin_renderers(
 	}
 	Ok(())
 }
+/// Builds the app-owned renderer registry for every enabled native tool.
+///
+/// Identities resolve from the live tool registry, so renderers auto-follow
+/// tool enablement and revision selection without environment-side wiring.
+///
+/// # Errors
+///
+/// Returns the first duplicate-identity error reported by the registry.
+pub fn live_renderers(tools: &Registry) -> Result<RenderRegistry, RenderRegistryError> {
+	let identity = |name: &str| tools.live_spec(name).ok().map(omp_tool::ToolSpec::identity);
+	let mut renderers = RenderRegistry::new();
+	register_builtin_renderers(&mut renderers, BuiltinRendererIdentities {
+		edit:       identity("edit"),
+		grep:       identity("grep"),
+		web_search: identity("web_search"),
+		fetch:      identity("fetch"),
+		glob:       identity("glob"),
+		shell:      identity("shell"),
+		hub:        identity("hub"),
+		write:      identity("write"),
+		read:       identity("read"),
+		eval:       identity("eval"),
+		ast_grep:   identity("ast_grep"),
+		ast_edit:   identity("ast_edit"),
+		ask:        identity("ask"),
+		todo:       identity("todo"),
+		think:      identity("think"),
+		lsp:        identity("lsp"),
+		debug:      identity("debug"),
+		goal:       identity("goal"),
+		github:     identity("github"),
+		browser:    identity("browser"),
+		computer:   identity("computer"),
+	})?;
+	Ok(renderers)
+}
 
 fn live_view(name: &str, status: &str) -> view::El {
 	omp_macros::view! {
@@ -292,10 +328,13 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-	use omp_tool::render::{RenderRegistry, ViewState};
+	use omp_tool::{
+		Claims, Precedence, Presentation, Registry,
+		render::{RenderRegistry, ViewState},
+	};
 
 	use super::{
-		BuiltinRendererIdentities, register_builtin_renderers,
+		BuiltinRendererIdentities, live_renderers, register_builtin_renderers,
 		test_support::{identities, identity, registry},
 	};
 
@@ -355,5 +394,25 @@ mod tests {
 		.unwrap();
 		assert!(registry.get(&read).is_some());
 		assert!(registry.get(&identity("edit", 9)).is_none());
+	}
+	#[test]
+	fn live_renderers_follow_live_tool_specs() {
+		let mut tools = Registry::new();
+		tools
+			.register(
+				crate::think::tool(),
+				Presentation::Slot,
+				Claims {
+					precedence: Precedence::CORE,
+					claimant:   "omp/test".into(),
+					replaces:   None,
+				},
+			)
+			.expect("register think");
+
+		let identity = tools.live_spec("think").expect("think is live").identity();
+		let renderers = live_renderers(&tools).expect("build live renderer registry");
+		assert_eq!(renderers.resolve_name("think"), Some(&identity));
+		assert!(renderers.resolve_name("grep").is_none());
 	}
 }

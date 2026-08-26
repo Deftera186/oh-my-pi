@@ -84,7 +84,7 @@ pub mod staging;
 /// Builds one typed renderer view tree from markup with child-level `for`,
 /// `if`, and `match` control flow (see [`render::view`]).
 pub use omp_macros::view;
-pub use render::{BuiltinRendererIdentities, register_builtin_renderers};
+pub use render::{BuiltinRendererIdentities, live_renderers, register_builtin_renderers};
 
 /// Revisioned project debugger tool.
 pub mod debug;
