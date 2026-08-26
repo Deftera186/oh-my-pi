@@ -48,10 +48,14 @@ before `Builder::init` (`crates/py/src/lib.rs`); bindings live in
    must outlive `'py` (Send+Sync, still zero-copy); `PyBuffer<T>` for
    bytearray/array/ndarray views. `extract::<String>`/`Vec<u8>` copies —
    only when ownership is genuinely needed.
+   Treat borrowed, owned, and transferred foreign buffers as distinct states.
+   Require unique transfer through vetted PyO3 or CPython APIs before taking
+   mutable Rust ownership.
 8. **`cast` for branching, `extract` for conversion.** `cast::<PyList>()`
    is a type-slot check; a failed `extract` materializes a full `PyErr`.
    Intern every repeated attr/method/dict-key literal:
    `obj.getattr(intern!(py, "name"))`.
+   Never intern dynamic or user-derived strings.
 9. **Statics that hold Python objects use `PyOnceLock`** (detaches while
    waiting → deadlock-free). Plain `LazyLock` + `parking_lot` is fine for
    pure-Rust state (see `RUNTIME` in `bindings.rs`) — but never call back
