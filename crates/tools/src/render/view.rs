@@ -204,6 +204,10 @@ pub enum Prop {
 	Reveal,
 	/// Marks live streaming text.
 	Partial,
+	/// Host card chrome requested by the view's root element: `flush` makes
+	/// the view self-presenting — the chat host draws no card header, rail,
+	/// or outline around it.
+	Chrome,
 }
 
 /// Theme-token palette accepted by tone-valued properties.

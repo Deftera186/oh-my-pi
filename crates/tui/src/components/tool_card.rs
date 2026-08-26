@@ -37,6 +37,7 @@ pub struct ToolCard {
 	activity:      Str,
 	badge:         Str,
 	folded:        bool,
+	flush:         bool,
 	last_paint_at: Duration,
 	finalized_at:  Option<Duration>,
 	children:      Vec<Cached>,
@@ -54,6 +55,7 @@ impl ToolCard {
 			activity:      Str::default(),
 			badge:         Str::default(),
 			folded:        false,
+			flush:         false,
 			last_paint_at: Duration::ZERO,
 			finalized_at:  None,
 			children:      Vec::new(),
@@ -160,7 +162,7 @@ impl ToolCard {
 		}
 		self.folded = folded;
 		for child in &mut self.children {
-			child.visible = !folded;
+			child.visible = !folded || self.flush;
 		}
 		true
 	}
@@ -170,14 +172,36 @@ impl ToolCard {
 		self.set_folded(folded);
 		self
 	}
+	/// In-place update: chrome suppression for self-presenting views.
+	///
+	/// A flush card draws no header, rail, or footer: its children paint at
+	/// the card's full rect and own the entire presentation, including any
+	/// state or progress indication. Fold state is ignored while flush.
+	pub fn set_flush(&mut self, flush: bool) -> bool {
+		if self.flush == flush {
+			return false;
+		}
+		self.flush = flush;
+		let visible = !self.folded || flush;
+		for child in &mut self.children {
+			child.visible = visible;
+		}
+		true
+	}
+
+	/// Sets chrome suppression for self-presenting views.
+	pub fn flush(mut self, flush: bool) -> Self {
+		self.set_flush(flush);
+		self
+	}
 
 	/// Replaces the card body children.
 	pub fn replace_body(&mut self, children: impl IntoChildren) -> bool {
 		self.children.clear();
 		children.extend_children(&mut self.children);
-		let folded = self.folded;
+		let visible = !self.folded || self.flush;
 		for child in &mut self.children {
-			child.visible = !folded;
+			child.visible = visible;
 		}
 		true
 	}
@@ -185,9 +209,9 @@ impl ToolCard {
 	/// Appends child components to the card's body.
 	pub fn child(mut self, children: impl IntoChildren) -> Self {
 		children.extend_children(&mut self.children);
-		let folded = self.folded;
+		let visible = !self.folded || self.flush;
 		for child in &mut self.children {
-			child.visible = !folded;
+			child.visible = visible;
 		}
 		self
 	}
@@ -250,6 +274,9 @@ impl Component for ToolCard {
 	}
 
 	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
+		if self.flush && !self.children.is_empty() {
+			return stack_measure(ctx, &mut self.children);
+		}
 		let name_len = cell_width(&self.name);
 		let intent_len = cell_width(&self.intent).max(cell_width(&self.activity));
 		let badge_len = cell_width(&self.badge);
@@ -268,6 +295,9 @@ impl Component for ToolCard {
 	}
 
 	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
+		if self.flush && !self.children.is_empty() {
+			return stack_height(ctx, &mut self.children, width, 0).max(1);
+		}
 		if self.folded || self.children.is_empty() {
 			1
 		} else {
@@ -278,6 +308,10 @@ impl Component for ToolCard {
 	}
 
 	fn place(&mut self, ctx: &UiContext, content: Rect) {
+		if self.flush && !self.children.is_empty() {
+			stack_place(ctx, &mut self.children, content, 0, Some(VAlign::Start), Align::Start);
+			return;
+		}
 		if !self.folded && !self.children.is_empty() {
 			let child_rect = Rect::new(
 				content.x.saturating_add(2),
@@ -295,6 +329,15 @@ impl Component for ToolCard {
 		}
 		self.last_paint_at = pc.now;
 		let granted_height = rect.height;
+		if self.flush && !self.children.is_empty() {
+			let outer_clip = pc.clip;
+			pc.clip = pc.clip.min(rect.y.saturating_add(granted_height));
+			for child in self.children.iter_mut().filter(|child| child.visible) {
+				child.paint(pc);
+			}
+			pc.clip = outer_clip;
+			return;
+		}
 
 		let header_color = self.header_color(pc.ctx);
 		let header_style = Style::new().fg(header_color);

@@ -3,10 +3,11 @@
 use omp_core::{Str, sf};
 use omp_tool::{CallOutcome, ToolIdentity, render::RenderFold};
 
-use super::{fault_view, live_view, view::El};
+use super::{fault_view, live_view, view::El, view::Prop as ViewProp};
 use crate::{
 	gallery::RendererGalleryFixture,
 	read::{Fault as ReadFault, Payload as ReadPayload, PayloadPart, Update as ReadUpdate},
+	read::{resolver::Scheme, selector::parse_uri},
 	view,
 	write::{Fault as WriteFault, Payload as WritePayload, Update as WriteUpdate},
 };
@@ -80,7 +81,13 @@ impl RenderFold for ReadRenderer {
 			},
 			None => Some(render_read_live(state).into()),
 			Some(CallOutcome::Ok(payload)) => Some(render_read_payload(&state.path, payload).into()),
-			Some(CallOutcome::Faulted(fault)) => Some(fault_view("read", fault.message()).into()),
+			Some(CallOutcome::Faulted(fault)) => {
+				Some(if grouped_read_target(&state.path) && !state.path.is_empty() {
+					render_read_fault_grouped(&state.path, fault.message()).into()
+				} else {
+					fault_view("read", fault.message()).into()
+				})
+			},
 			Some(CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }) => None,
 		}
 	}
@@ -90,11 +97,42 @@ const WRITE_PREVIEW_LINES: usize = 6;
 const READ_PREVIEW_LINES: usize = 8;
 
 fn render_read_live(state: &ReadState) -> El {
-	view! {
+	let live = view! {
 		<row sep=" · ">
 			<spinner color=accent/>
 			<fact label="Path">{&state.path}</fact>
 			<fact label="Status">{state.phase.as_deref().unwrap_or("reading")}</fact>
+		</row>
+	};
+	if grouped_read_target(&state.path) {
+		live.prop(ViewProp::Chrome, "flush")
+	} else {
+		live
+	}
+}
+
+/// Whether a read target collapses into the compact, chrome-free grouped
+/// presentation.
+///
+/// Filesystem paths, web URLs, and unrecognized schemes (including `xd://`
+/// devices) collapse — mirroring pi's read grouping — while recognized
+/// internal URLs (`skill://`, `agent://`, `pr://`, …) keep the full card so
+/// their resolved content stays visible.
+fn grouped_read_target(path: &str) -> bool {
+	match parse_uri(path) {
+		Ok(Some(uri)) => matches!(uri.scheme, Scheme::File | Scheme::Http | Scheme::Unknown),
+		Ok(None) | Err(_) => true,
+	}
+}
+
+/// One-line, chrome-free settled fault for a grouped read target.
+fn render_read_fault_grouped(path: &str, message: &str) -> El {
+	view! {
+		<row gap=1 chrome="flush">
+			<icon name="error" color="err"/>
+			<text bold fg=err>{"read"}</text>
+			<text>{path}</text>
+			<text fg=err>{message}</text>
 		</row>
 	}
 }
@@ -183,6 +221,19 @@ fn render_read_payload(path: &str, payload: &ReadPayload) -> El {
 	}
 	let part_count = payload.parts.len();
 	let byte_count = text_bytes.saturating_add(blob_bytes);
+	if grouped_read_target(path) {
+		return view! {
+			<row sep=" · " chrome="flush">
+				<row gap=1>
+					<icon name="success" color="ok"/>
+					<text bold>{"read"}</text>
+					<text>{path}</text>
+				</row>
+				<fact label="Lines">{sf!("{text_lines}")}</fact>
+				<fact label="Size"><bytes value={byte_count}/></fact>
+			</row>
+		};
+	}
 	view! {
 		<col gap=1>
 			<fact label="Path">{path}</fact>
@@ -350,7 +401,7 @@ mod tests {
 				.view(identity, &state, None)
 				.expect("live read renders")
 				.as_str(),
-			"<row sep=\" · \"><spinner color=accent/><fact \
+			"<row sep=\" · \" chrome=flush><spinner color=accent/><fact \
 			 label=Path>src/&lt;&amp;&gt;.rs:9-</fact><fact label=Status>resolving &lt;source&gt; \
 			 &amp; range</fact></row>",
 		);

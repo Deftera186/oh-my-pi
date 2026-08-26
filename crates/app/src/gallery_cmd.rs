@@ -88,7 +88,7 @@ pub fn run(args: GalleryArgs) -> miette::Result<()> {
 			if args.screenshot {
 				let context = UiContext::default();
 				let mut chat = fixture_chat(&context, &registry, fixture, *state)?;
-				let rendered = render_settled(&mut chat, Size::new(width, 18));
+				let rendered = render_settled(&mut chat, Size::new(width, 40));
 				let png = omp_tui::frame_png(&card_frame(rendered.frame)).into_diagnostic()?;
 				let state_name = state.to_string();
 				let path = args
@@ -115,7 +115,7 @@ fn render_fixture(
 ) -> miette::Result<String> {
 	let context = UiContext::default();
 	let mut chat = fixture_chat(&context, registry, fixture, state)?;
-	let rendered = render_settled(&mut chat, Size::new(width, 18));
+	let rendered = render_settled(&mut chat, Size::new(width, 40));
 	let card = card_frame(rendered.frame);
 	Ok(if io::stdout().is_terminal() {
 		omp_tui::frame_ansi(&card)

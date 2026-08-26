@@ -641,7 +641,7 @@ pub(crate) fn gallery_fixtures(
 			streaming_args: r#"{"action":"capture","read_only":true,"max_width":1440,"max_height":9"#,
 			args: r#"{"action":"capture","read_only":true,"max_width":1440,"max_height":900}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"action":"capture","result":{"message":"Captured 1440\u00d7900 screenshot","width":1440,"height":900,"bytes":482193},"artifacts":["artifact://b3/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a"]}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"action":"capture","result":{"message":"Captured 1440\u00d7900 screenshot","width":1440,"height":900,"bytes":482193},"artifacts":["artifact://sha256/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a"]}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"code":"desktop_permission","message":"Screen Recording permission is required to capture the primary display"}}"#,
 		},
 	]

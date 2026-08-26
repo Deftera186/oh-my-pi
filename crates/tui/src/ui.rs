@@ -200,6 +200,22 @@ impl Ui {
 	pub const fn context(&self) -> &UiContext {
 		&self.ctx
 	}
+	/// A custom (non-well-known) attribute declared on the first root-level
+	/// parsed element, e.g. a tool view's `chrome` presentation hint.
+	///
+	/// Markup parses into a synthetic root column; this probes its first
+	/// child, which is the document's authored root element. Returns `None`
+	/// for empty documents and trees built from [`Ui::from_root`].
+	pub fn root_custom(&self, name: &str) -> Option<&PropValue> {
+		self
+			.root
+			.comp()
+			.children()
+			.first()?
+			.comp()
+			.props()
+			.custom(name)
+	}
 
 	/// Swaps the presentation context and refreshes the whole document.
 	///

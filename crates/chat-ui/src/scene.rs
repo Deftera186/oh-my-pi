@@ -13,7 +13,7 @@ use std::{
 use omp_core::{IntoStr, Str, StrMut, fmts_mut, sf};
 use omp_tui::{
 	Border, Cached, Charset, Color, Command, Component, Decor, DecorKind, Frame, HistoryReplay,
-	Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot,
+	Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, Props, PropValue, Rect, Size, SlashCommands, Slot,
 	SpellingFeatures, Style, Theme, Ui, UiContext, UiEvent,
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
@@ -609,11 +609,22 @@ struct ToolImageEntry {
 	source: Str,
 	px:     omp_tui::imagefmt::ImageDimensions,
 }
+/// Host chrome requested by a tool view's root `chrome` attribute.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ViewChrome {
+	/// Chat-owned rail card: header line, guide rail, and footer.
+	#[default]
+	Card,
+	/// Self-presenting view: the host draws no card chrome around it.
+	Flush,
+}
 
 struct ToolView {
 	source:   Str,
 	width:    u16,
 	rendered: Ui,
+	/// Chrome the renderer requested on its root element.
+	chrome:   ViewChrome,
 	/// The source is appended plain output, never markup.
 	plain:    bool,
 }
@@ -621,7 +632,15 @@ struct ToolView {
 impl ToolView {
 	fn structured(source: Str, width: u16, ctx: &UiContext) -> Self {
 		let rendered = Self::render(&source, width, ctx);
-		Self { source, width, rendered, plain: false }
+		let chrome = Self::probe_chrome(&rendered);
+		Self { source, width, rendered, chrome, plain: false }
+	}
+	/// Reads the renderer's `chrome` request from the parsed root element.
+	fn probe_chrome(rendered: &Ui) -> ViewChrome {
+		match rendered.root_custom("chrome") {
+			Some(PropValue::Str(value)) if value == "flush" => ViewChrome::Flush,
+			_ => ViewChrome::Card,
+		}
 	}
 
 	/// The card-embeddable body: the parsed markup tree, or a text leaf for
@@ -646,6 +665,7 @@ impl ToolView {
 			return;
 		}
 		self.rendered = Self::render(&source, self.width, ctx);
+		self.chrome = Self::probe_chrome(&self.rendered);
 		self.source = source;
 		self.plain = false;
 	}
@@ -657,6 +677,7 @@ impl ToolView {
 		self.rendered =
 			Ui::from_root(TextLeaf::new().text(source.clone()), self.width.max(1), ctx.clone());
 		self.source = source;
+		self.chrome = ViewChrome::Card;
 		self.plain = true;
 	}
 
@@ -2980,7 +3001,9 @@ impl Chat {
 			sampled.push((tool.ordinal, tool.card_ui.height()));
 			natural.push((
 				tool.ordinal,
-				if tool.expanded {
+				if tool.view.chrome == ViewChrome::Flush {
+					tool.view.height().max(1)
+				} else if tool.expanded {
 					tool.view.height().saturating_add(2).max(1)
 				} else {
 					1
@@ -3651,6 +3674,7 @@ impl Chat {
 				dirty |= card.set_activity(presentation.activity);
 				dirty |= card.set_badge(presentation.badge.unwrap_or_default());
 				dirty |= card.set_state(ToolState::Streaming);
+				dirty |= card.set_flush(tool.view.chrome == ViewChrome::Flush);
 				dirty |= card.replace_body(body);
 				dirty
 			});
@@ -4051,17 +4075,49 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 	let margin = u16::from(width >= 50);
 	let height = tool_height(tool, width);
 	let rect = Rect::new(margin, y, width.saturating_sub(margin * 2), height);
+	if tool.view.chrome == ViewChrome::Flush {
+		let view_height = tool.view.height().min(height);
+		if view_height > 0 {
+			frame.blit(tool.view.rendered.frame(), 0, view_height, rect.x, y);
+		}
+		let mut row = y.saturating_add(view_height);
+		let bottom = y.saturating_add(height);
+		for image in &tool.images {
+			let (cols, rows) = tool_image_box(image, width);
+			if rows == 0 || row.saturating_add(rows) > bottom {
+				break;
+			}
+			omp_tui::components::draw_image_inline(
+				frame,
+				ctx,
+				rect.x,
+				row,
+				image.source.as_str(),
+				cols,
+				rows,
+			);
+			row = row.saturating_add(rows);
+		}
+		return height;
+	}
 	let state = match tool.ok {
 		Some(true) => ctx.theme.ok,
 		Some(false) => ctx.theme.err,
 		None => ctx.theme.warn,
 	};
-	draw_box(frame, rect, ink(state), panel_style(ctx.theme), ctx.charset, ctx.native_decor);
-	draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
-		&tool.label,
-		ink(state).bold(),
-	)]);
-	if !tool.expanded {
+	let style = ink(state);
+	let leading = if tool.expanded && height >= 3 {
+		ctx.charset.expander(true)
+	} else {
+		"  "
+	};
+	let x = frame.put(rect.x, y, leading, style);
+	let label_width = rect
+		.x
+		.saturating_add(rect.width)
+		.saturating_sub(x);
+	draw_line(frame, x, y, label_width, &[Span::new(&tool.label, style.bold())]);
+	if height == 1 {
 		return height;
 	}
 	let mut row = y.saturating_add(1);
@@ -4087,6 +4143,16 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 		);
 		row = row.saturating_add(rows);
 	}
+	let (_, last, rail) = ctx.charset.guides(Border::Round);
+	for rail_row in y.saturating_add(1)..bottom {
+		frame.put(rect.x, rail_row, rail, style);
+	}
+	let mut bx = frame.put(rect.x, bottom, last, style);
+	let mut buf = [0_u8; 4];
+	let rule = ctx.charset.rule().encode_utf8(&mut buf);
+	for _ in 0..rect.width.saturating_sub(2) {
+		bx = frame.put(bx, bottom, rule, style);
+	}
 	height
 }
 
@@ -4104,19 +4170,18 @@ fn tool_image_box(image: &ToolImageEntry, width: u16) -> (u16, u16) {
 }
 
 fn tool_height(tool: &ToolEntry, width: u16) -> u16 {
-	if !tool.expanded {
-		return 1;
-	}
 	let image_rows = tool
 		.images
 		.iter()
 		.fold(0_u16, |rows, image| rows.saturating_add(tool_image_box(image, width).1));
-	tool
-		.view
-		.height()
-		.saturating_add(image_rows)
-		.saturating_add(2)
-		.max(3)
+	if tool.view.chrome == ViewChrome::Flush {
+		return tool.view.height().saturating_add(image_rows).max(1);
+	}
+	if !tool.expanded {
+		return 1;
+	}
+	let body = tool.view.height().saturating_add(image_rows);
+	if body == 0 { 1 } else { body.saturating_add(2) }
 }
 
 fn mask_keywords(mut text: String, accent: &KeywordAccent) -> String {

@@ -157,7 +157,7 @@ impl Charset {
 	}
 
 	/// Tree expander for `(has_children, open)`.
-	pub(crate) const fn expander(self, open: bool) -> &'static str {
+	pub const fn expander(self, open: bool) -> &'static str {
 		match (self, open) {
 			(Self::Ascii, true) => "v ",
 			(Self::Ascii, false) => "> ",
@@ -170,7 +170,7 @@ impl Charset {
 	///
 	/// Each is two cells wide; ASCII terminals collapse every family to the
 	/// same 7-bit set.
-	pub(crate) const fn guides(self, family: Border) -> (&'static str, &'static str, &'static str) {
+	pub const fn guides(self, family: Border) -> (&'static str, &'static str, &'static str) {
 		match self {
 			Self::Ascii => ("|-", "`-", "| "),
 			_ => match family {
@@ -184,7 +184,7 @@ impl Charset {
 	}
 
 	/// Horizontal rule / divider fill character.
-	pub(crate) const fn rule(self) -> char {
+	pub const fn rule(self) -> char {
 		match self {
 			Self::Ascii => '-',
 			_ => '─',
