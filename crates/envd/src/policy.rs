@@ -1261,7 +1261,7 @@ fn command_json(command: &v1::BashCommand) -> Value {
 }
 
 fn bash_ir_json(script: &str, cwd: &Path, root: &Path) -> Value {
-	let ir = admission::bash_ir("shell", &json!({"command": script}), cwd, root)
+	let ir = admission::bash_ir("bash", &json!({"command": script}), cwd, root)
 		.expect("shell analysis always returns BashIr");
 	let parse_error = ir
 		.parse_error
@@ -1841,32 +1841,32 @@ impl Drop for QuotaAccount {
 				self.table.release(host, quota, self.usage[quota.index]);
 			}
 		}
+	}
+}
 
-		#[cfg(test)]
-		mod tests {
-			use super::*;
+#[cfg(test)]
+mod tests {
+	use super::*;
 
-			#[test]
-			fn dap_tiers_match_pi_and_unknown_actions_fail_closed() {
-				assert_eq!(dap_command_capability("variables"), "env.dap.read");
-				assert_eq!(dap_command_capability("read_memory"), "env.dap.read");
-				assert_eq!(dap_command_capability("evaluate"), "env.dap.execute");
-				assert_eq!(dap_command_capability("continue"), "env.dap.execute");
-				assert_eq!(dap_command_capability("vendor_mutation"), "env.dap.execute");
-			}
+	#[test]
+	fn dap_tiers_match_pi_and_unknown_actions_fail_closed() {
+		assert_eq!(dap_command_capability("variables"), "env.dap.read");
+		assert_eq!(dap_command_capability("read_memory"), "env.dap.read");
+		assert_eq!(dap_command_capability("evaluate"), "env.dap.execute");
+		assert_eq!(dap_command_capability("continue"), "env.dap.execute");
+		assert_eq!(dap_command_capability("vendor_mutation"), "env.dap.execute");
+	}
 
-			#[test]
-			fn mutative_lsp_methods_require_write_before_effects_authorization() {
-				assert_eq!(lsp_tier_capability(lsp_request_tier("textDocument/hover")), "env.lsp");
-				assert_eq!(
-					lsp_tier_capability(lsp_request_tier("workspace/executeCommand")),
-					"env.doc.write"
-				);
-				assert_eq!(
-					lsp_tier_capability(lsp_notification_tier("workspace/didRenameFiles")),
-					"env.doc.write"
-				);
-			}
-		}
+	#[test]
+	fn mutative_lsp_methods_require_write_before_effects_authorization() {
+		assert_eq!(lsp_tier_capability(lsp_request_tier("textDocument/hover")), "env.lsp");
+		assert_eq!(
+			lsp_tier_capability(lsp_request_tier("workspace/executeCommand")),
+			"env.doc.write"
+		);
+		assert_eq!(
+			lsp_tier_capability(lsp_notification_tier("workspace/didRenameFiles")),
+			"env.doc.write"
+		);
 	}
 }

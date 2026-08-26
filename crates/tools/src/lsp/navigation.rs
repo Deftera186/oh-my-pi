@@ -1,6 +1,7 @@
 //! Symbol targeting and bounded normalization for LSP navigation results.
 
 use omp_core::Str;
+use omp_docserver::position::PositionEncoding;
 use serde_json::Value;
 
 /// Parsed `symbol#N` target, where occurrence is one-based.
@@ -34,8 +35,13 @@ pub fn parse_symbol_target(value: &str) -> Result<SymbolTarget, &'static str> {
 	Ok(SymbolTarget { symbol: Str::from(symbol), occurrence })
 }
 
-/// Resolves a target's zero-based UTF-8 byte column on one source line.
-pub fn resolve_symbol_column(line: &str, target: &SymbolTarget) -> Option<u32> {
+/// Resolves a target's zero-based column in the negotiated LSP position
+/// encoding on one source line.
+pub fn resolve_symbol_column(
+	line: &str,
+	target: &SymbolTarget,
+	encoding: PositionEncoding,
+) -> Option<u32> {
 	let bytes = line.as_bytes();
 	let needle = target.symbol.as_bytes();
 	let mut offset = 0;
@@ -51,12 +57,28 @@ pub fn resolve_symbol_column(line: &str, target: &SymbolTarget) -> Option<u32> {
 		if left_boundary && right_boundary {
 			occurrence += 1;
 			if occurrence == target.occurrence {
-				return u32::try_from(start).ok();
+				return encoding
+					.offset_to_position(line, start)
+					.ok()
+					.map(|position| position.character);
 			}
 		}
 		offset = end;
 	}
 	None
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn symbol_columns_follow_negotiated_position_encoding() {
+		let line = r#"let _ = "😀"; foo();"#;
+		let target = parse_symbol_target("foo").expect("valid target");
+		assert_eq!(resolve_symbol_column(line, &target, PositionEncoding::Utf8), Some(16));
+		assert_eq!(resolve_symbol_column(line, &target, PositionEncoding::Utf16), Some(14));
+		assert_eq!(resolve_symbol_column(line, &target, PositionEncoding::Utf32), Some(13));
+	}
 }
 
 const fn is_word_byte(byte: u8) -> bool {

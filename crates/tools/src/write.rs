@@ -46,14 +46,14 @@ pub mod backends;
 const DESCRIPTION: &str =
 	"Creates or overwrites file at specified path.\n\n<conditions>\n- Creating new files \
 	 explicitly required by task\n- Replacing entire file contents when editing would be more \
-	 complex\n- Supports `.tar`, `.tar.gz`, `.tgz`, `.zip`, and ZIP-based \
-	 `.jar`/`.war`/`.ear`/`.apk` archive entries via `archive.ext:path/inside/archive`\n- Supports \
-	 SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON \
-	 content, delete with empty content)\n- Supports registered merge-conflict splices via \
-	 `conflict://<id>` and `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You \
-	 SHOULD use Edit tool for modifying existing files\n- You NEVER create documentation files \
-	 (*.md, README) unless explicitly requested\n- You NEVER use emojis unless \
-	 requested\n</critical>";
+	 complex\n- Supports `.zip` (and ZIP-based `.jar`/`.war`/`.ear`/`.apk`), `.tar`, \
+	 `.tar.gz`/`.tgz`, and `.tar.zst` archive entries via `archive.ext:path/inside/archive`; other \
+	 archive formats (including `.asar`) are read-only\n- Supports SQLite row operations via \
+	 `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON content, delete with \
+	 empty content)\n- Supports registered merge-conflict splices via `conflict://<id>` and \
+	 `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit tool \
+	 for modifying existing files\n- You NEVER create documentation files (*.md, README) unless \
+	 explicitly requested\n- You NEVER use emojis unless requested\n</critical>";
 const EXECUTABLE_NOTICE: &str = "[Notice: Made executable via chmod +x]";
 const STRIPPED_NOTICE: &str =
 	"Note: auto-stripped hashline display prefixes from content before writing.";
@@ -153,11 +153,13 @@ pub enum WriteOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlainWriteRequest {
 	/// Authored local path, after strict hashline-header unwrapping.
-	pub path:          Str,
+	pub path:            Str,
 	/// Exact text to persist, after display-prefix stripping.
-	pub content:       Str,
+	pub content:         Str,
 	/// Frozen formatter policy for this transaction.
-	pub format_policy: FormatPolicy,
+	pub format_policy:   FormatPolicy,
+	/// Whether the document owner must reject generated files.
+	pub guard_generated: bool,
 }
 
 /// Resource-owned truth returned after one atomic plain-file transaction.
@@ -494,10 +496,11 @@ pub trait WriteDocuments: Send + Sync + 'static {
 
 /// `write@1` executor.
 pub struct WriteTool<D> {
-	documents:     D,
-	conflicts:     Arc<ConflictRegistry>,
-	format_policy: FormatPolicy,
-	spec:          ToolSpec,
+	documents:       D,
+	conflicts:       Arc<ConflictRegistry>,
+	format_policy:   FormatPolicy,
+	guard_generated: bool,
+	spec:            ToolSpec,
 }
 
 /// Construct the built-in whole-file write tool.
@@ -510,7 +513,7 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,
 ) -> WriteTool<D> {
-	tool_with_policy_and_conflicts(documents, conflicts, FormatPolicy::BestEffort)
+	tool_with_policy_and_conflicts(documents, conflicts, FormatPolicy::BestEffort, true)
 }
 
 /// Constructs `write@1` with frozen formatting policy and shared conflicts.
@@ -518,11 +521,13 @@ pub fn tool_with_policy_and_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,
 	format_policy: FormatPolicy,
+	guard_generated: bool,
 ) -> WriteTool<D> {
 	WriteTool {
 		documents,
 		conflicts,
 		format_policy,
+		guard_generated,
 		spec: ToolSpec {
 			name:            sf!("write"),
 			rev:             Rev { family: Str::new(""), n: 1 },
@@ -977,6 +982,7 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 								path,
 								content: stripped.text,
 								format_policy: self.format_policy,
+								guard_generated: self.guard_generated,
 							};
 							let operation = self.documents.write_plain(request).fuse();
 							let interruption = params.next_interrupt().fuse();
@@ -1270,11 +1276,11 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 fn device_guidance(tool_path: Option<&str>) -> String {
 	match tool_path.filter(|path| !path.is_empty()) {
 		Some(path) => format!(
-			" `xd` runs in the shell tool: `xd` lists devices, `xd {path} --help` shows usage, `xd \
+			" `xd` runs in the bash tool: `xd` lists devices, `xd {path} --help` shows usage, `xd \
 			 {path} [args…]` invokes."
 		),
-		None => " `xd` runs in the shell tool: `xd` lists devices, `xd <device> --help` shows \
-		         usage, `xd <device> [args…]` invokes."
+		None => " `xd` runs in the bash tool: `xd` lists devices, `xd <device> --help` shows usage, \
+		         `xd <device> [args…]` invokes."
 			.to_owned(),
 	}
 }
@@ -1582,7 +1588,7 @@ mod tests {
 		for (target, device) in guidance_cases {
 			let fault = reject_uri_like_target(target).expect("fault rejected");
 			let message = fault.to_string();
-			assert!(message.contains("`xd` runs in the shell tool"), "missing shell hint: {message}");
+			assert!(message.contains("`xd` runs in the bash tool"), "missing shell hint: {message}");
 			assert!(message.contains("`xd` lists devices"), "missing catalog hint: {message}");
 			assert!(
 				message.contains(&format!("`xd {device} --help` shows usage")),

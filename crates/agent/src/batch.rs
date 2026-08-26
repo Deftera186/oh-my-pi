@@ -968,6 +968,9 @@ mod interruptible {
 	use tokio::sync::watch::Receiver;
 
 	use super::*;
+	pub(super) struct InterruptTarget {
+		pub(super) sender: flume::Sender<InterruptRequest>,
+	}
 
 	impl ToolBatch {
 		/// Drives the batch with one watch-broadcast cooperative interrupt
@@ -1022,9 +1025,19 @@ mod interruptible {
 			let mut interrupt_senders = Vec::with_capacity(self.calls.len());
 			let mut calls = Vec::with_capacity(self.calls.len());
 			for (index, call) in self.calls.into_iter().enumerate() {
+				let force_after_grace = !effects_mutate_environment(call.effects());
 				let (interrupt_tx, interrupt_rx) = flume::bounded(1);
-				interrupt_senders.push(interrupt_tx);
-				calls.push(run_call(index, call, registry, caps, interrupt_rx, grace, updates.clone()));
+				interrupt_senders.push(InterruptTarget { sender: interrupt_tx });
+				calls.push(run_call(
+					index,
+					call,
+					registry,
+					caps,
+					interrupt_rx,
+					grace,
+					force_after_grace,
+					updates.clone(),
+				));
 			}
 
 			let drive = join_all(calls);
@@ -1044,25 +1057,34 @@ mod interruptible {
 
 	pub(super) async fn coordinate_interrupts(
 		source: &mut Receiver<Option<Str>>,
-		targets: &[flume::Sender<InterruptRequest>],
+		targets: &[InterruptTarget],
 		grace: Duration,
 	) {
 		let reason = wait_for_interrupt(source).await;
-		for target in targets.iter().rev() {
-			let (acknowledged, acknowledgement) = flume::bounded(1);
-			if target
-				.send_async(InterruptRequest { reason: reason.clone(), acknowledged })
-				.await
-				.is_err()
-			{
-				continue;
+		let acknowledgements = join_all(targets.iter().map(|target| {
+			let reason = reason.clone();
+			async move {
+				let (acknowledged, acknowledgement) = flume::bounded(1);
+				target
+					.sender
+					.send_async(InterruptRequest { reason, acknowledged })
+					.await
+					.ok()
+					.map(|()| acknowledgement)
 			}
-			if grace.is_zero() {
-				task::yield_now().await;
-			} else {
-				let _ = time::timeout(grace, acknowledgement.recv_async()).await;
-			}
-		}
+		}))
+		.await;
+		let waits = acknowledgements
+			.into_iter()
+			.flatten()
+			.map(|acknowledgement| async move {
+				if grace.is_zero() {
+					task::yield_now().await;
+				} else {
+					let _ = time::timeout(grace, acknowledgement.recv_async()).await;
+				}
+			});
+		join_all(waits).await;
 	}
 
 	async fn wait_for_interrupt(receiver: &mut Receiver<Option<Str>>) -> Str {
@@ -1118,6 +1140,7 @@ async fn run_call(
 	caps: &CapsBase,
 	interrupt: Receiver<InterruptRequest>,
 	grace: Duration,
+	force_after_grace: bool,
 	updates: Option<flume::Sender<BatchUpdate>>,
 ) -> (usize, BatchResult) {
 	let receipt = match call.pump.begin_authorization(
@@ -1169,12 +1192,27 @@ async fn run_call(
 	let terminal = if let Some(terminal) = terminal_during_authorization {
 		terminal
 	} else if let Some((receipt, acknowledged)) = pending_interrupt {
-		finish_interrupt_with_grace(&call, updates.as_ref(), receipt, acknowledged, grace).await
+		finish_interrupt_with_grace(
+			&call,
+			updates.as_ref(),
+			receipt,
+			acknowledged,
+			grace,
+			force_after_grace,
+		)
+		.await
 	} else {
 		tokio::select! {
 			biased;
 			request = wait_for_ordered_interrupt(&interrupt) => {
-				interrupt_pump_with_grace(&call, updates.as_ref(), request, grace).await
+				interrupt_pump_with_grace(
+					&call,
+					updates.as_ref(),
+					request,
+					grace,
+					force_after_grace,
+				)
+				.await
 			},
 			terminal = drain_pump(&call, updates.as_ref()) => terminal,
 		}
@@ -1234,12 +1272,25 @@ async fn interrupt_pump_with_grace(
 	updates: Option<&flume::Sender<BatchUpdate>>,
 	request: InterruptRequest,
 	grace: Duration,
+	force_after_grace: bool,
 ) -> PumpTerminal {
 	let Ok(receipt) = call.pump.begin_interrupt(request.reason) else {
 		drop(request.acknowledged);
-		return force_cancel_with_grace(call, updates, grace).await;
+		return if force_after_grace {
+			force_cancel_with_grace(call, updates, grace).await
+		} else {
+			drain_pump(call, updates).await
+		};
 	};
-	finish_interrupt_with_grace(call, updates, receipt, request.acknowledged, grace).await
+	finish_interrupt_with_grace(
+		call,
+		updates,
+		receipt,
+		request.acknowledged,
+		grace,
+		force_after_grace,
+	)
+	.await
 }
 
 async fn finish_interrupt_with_grace(
@@ -1248,6 +1299,7 @@ async fn finish_interrupt_with_grace(
 	receipt: CommandReceipt,
 	acknowledged: flume::Sender<()>,
 	grace: Duration,
+	force_after_grace: bool,
 ) -> PumpTerminal {
 	let cooperative = async {
 		let result = receipt.wait().await;
@@ -1255,9 +1307,16 @@ async fn finish_interrupt_with_grace(
 		result?;
 		Ok::<_, BatchError>(drain_pump(call, updates).await)
 	};
-	match time::timeout(grace, cooperative).await {
-		Ok(Ok(terminal)) => terminal,
-		Ok(Err(_)) | Err(_) => force_cancel_with_grace(call, updates, grace).await,
+	if force_after_grace {
+		match time::timeout(grace, cooperative).await {
+			Ok(Ok(terminal)) => terminal,
+			Ok(Err(_)) | Err(_) => force_cancel_with_grace(call, updates, grace).await,
+		}
+	} else {
+		match cooperative.await {
+			Ok(terminal) => terminal,
+			Err(_) => drain_pump(call, updates).await,
+		}
 	}
 }
 
@@ -1983,13 +2042,13 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn interrupt_coordinator_orders_queued_calls_before_active_call() {
+	async fn interrupt_coordinator_broadcasts_without_per_call_grace_delay() {
 		let (source_tx, mut source_rx) = watch::channel::<Option<Str>>(None);
 		let mut targets = Vec::new();
 		let mut receivers = Vec::new();
 		for _ in 0..3 {
 			let (target, receiver) = flume::bounded(1);
-			targets.push(target);
+			targets.push(interruptible::InterruptTarget { sender: target });
 			receivers.push(receiver);
 		}
 		let coordinator = tokio::spawn(async move {
@@ -2000,17 +2059,12 @@ mod tests {
 			.send(Some(sf!("stop every call")))
 			.expect("interrupt coordinator");
 
-		let third = receivers[2].recv_async().await.expect("third interrupt");
-		assert!(receivers[1].try_recv().is_err());
-		assert!(receivers[0].try_recv().is_err());
-		third.acknowledged.send(()).expect("acknowledge third");
-
-		let second = receivers[1].recv_async().await.expect("second interrupt");
-		assert!(receivers[0].try_recv().is_err());
-		second.acknowledged.send(()).expect("acknowledge second");
-
 		let first = receivers[0].recv_async().await.expect("first interrupt");
+		let second = receivers[1].recv_async().await.expect("second interrupt");
+		let third = receivers[2].recv_async().await.expect("third interrupt");
 		first.acknowledged.send(()).expect("acknowledge first");
+		second.acknowledged.send(()).expect("acknowledge second");
+		third.acknowledged.send(()).expect("acknowledge third");
 		coordinator.await.expect("coordinator task");
 	}
 

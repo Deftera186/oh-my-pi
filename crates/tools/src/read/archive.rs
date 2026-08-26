@@ -1,7 +1,7 @@
 //! Archive read behavior for selectors, text classification, and presentation.
 //!
-//! ZIP, TAR, TAR.GZ, and ASAR parsing, limits, link resolution, and member
-//! decoding live in `omp-ar`. This module translates that format-neutral API
+//! Container parsing, limits, link resolution, and member decoding live in
+//! `omp-ar`. This module translates that format-neutral API
 //! into the read tool's selector and model-facing contracts.
 
 use std::{
@@ -22,7 +22,7 @@ pub const MAX_TAR_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum decoded size of one archive member.
 pub const MAX_ARCHIVE_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 
-use std::{cmp, collections::BTreeSet, io, iter, str};
+use std::{io, str};
 
 /// Formats supported by archive reads.
 pub use omp_ar::Format as ArchiveFormat;
@@ -85,10 +85,19 @@ pub struct ArchiveListing {
 impl ArchiveListing {
 	/// Renders entries using pi's archive-listing size suffixes.
 	pub fn render(&self) -> String {
-		if self.entries.is_empty() {
-			return "(empty archive directory)".to_owned();
+		let mut rendered = if self.entries.is_empty() {
+			"(empty archive directory)".to_owned()
+		} else {
+			format_archive_entry_lines(&self.entries).join("\n")
+		};
+		if let Some(limit) = self.result_limit {
+			let next_offset = self.offset.saturating_add(self.entries.len());
+			rendered.push_str(&format!(
+				"\n\n[Archive listing limited to {} entries out of {}. Use :{}+{} for the next page.]",
+				limit.reached, self.total_entries, next_offset, limit.suggestion
+			));
 		}
-		format_archive_entry_lines(&self.entries).join("\n")
+		rendered
 	}
 }
 
@@ -268,8 +277,7 @@ pub fn archive_format_from_path(path: impl AsRef<Path>) -> Option<ArchiveFormat>
 	ArchiveFormat::from_path(path)
 }
 
-/// Sniffs ZIP records, gzip headers, checksum-valid TAR headers, or an ASAR
-/// Pickle header from in-memory bytes.
+/// Sniffs every archive family recognized by `omp-ar` from in-memory bytes.
 pub fn sniff_archive_format(bytes: &[u8]) -> Option<ArchiveFormat> {
 	ArchiveFormat::sniff(bytes)
 }
@@ -277,36 +285,13 @@ pub fn sniff_archive_format(bytes: &[u8]) -> Option<ArchiveFormat> {
 /// Split every plausible archive extension boundary, longest archive prefix
 /// first. Only an extension followed by `:` or end-of-input is a boundary.
 pub fn parse_archive_path_candidates(path: &str) -> Vec<ArchivePathCandidate> {
-	const EXTENSIONS: [&str; 8] =
-		[".tar.gz", ".tgz", ".zip", ".tar", ".asar", ".jar", ".war", ".ear"];
-	const APK: &str = ".apk";
-
-	let normalized = path.replace('\\', "/");
-	let lower = normalized.to_ascii_lowercase();
-	let mut candidates = Vec::new();
-	let mut seen = BTreeSet::new();
-	for (start, byte) in lower.bytes().enumerate() {
-		if byte != b'.' {
-			continue;
-		}
-		for extension in EXTENSIONS.iter().copied().chain(iter::once(APK)) {
-			if !lower[start..].starts_with(extension) {
-				continue;
-			}
-			let end = start + extension.len();
-			if end != lower.len() && lower.as_bytes().get(end) != Some(&b':') {
-				continue;
-			}
-			let archive_path = path[..end].to_owned();
-			let sub_path = normalized[end..].trim_start_matches(':').to_owned();
-			if seen.insert((archive_path.clone(), sub_path.clone())) {
-				candidates.push(ArchivePathCandidate { archive_path, sub_path });
-			}
-			break;
-		}
-	}
-	candidates.sort_by_key(|candidate| cmp::Reverse(candidate.archive_path.len()));
-	candidates
+	omp_ar::path_candidates(path)
+		.into_iter()
+		.map(|candidate| ArchivePathCandidate {
+			archive_path: candidate.archive_path,
+			sub_path:     candidate.member_path,
+		})
+		.collect()
 }
 
 /// Opens an archive by filesystem path using the format implied by its name.
@@ -547,7 +532,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
 		} else {
 			limit
 		};
-		let reached = available.len() >= limit;
+		let reached = available.len() > limit;
 		let entries = available[..available.len().min(limit)].to_vec();
 		Ok(ArchiveListing {
 			path: normalize_lookup_path(path).ok_or(ArchiveError::UnsafePath)?,
@@ -680,5 +665,34 @@ fn format_bytes(bytes: u64) -> String {
 		format!("{:.1}MB", bytes as f64 / MB)
 	} else {
 		format!("{:.1}GB", bytes as f64 / GB)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn archive_listing_projects_the_next_page_when_capped() {
+		let listing = ArchiveListing {
+			path:          String::new(),
+			entries:       vec![ArchiveDirectoryEntry {
+				name: "first.txt".to_owned(),
+				node: ArchiveNode {
+					path:         "first.txt".to_owned(),
+					is_directory: false,
+					size:         1,
+					mtime_ms:     None,
+				},
+			}],
+			total_entries: 3,
+			offset:        1,
+			result_limit:  Some(ArchiveListLimit { reached: 1, suggestion: 2 }),
+		};
+		assert_eq!(
+			listing.render(),
+			"first.txt (1B)\n\n[Archive listing limited to 1 entries out of 3. Use :2+2 for the next \
+			 page.]"
+		);
 	}
 }

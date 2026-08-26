@@ -37,6 +37,7 @@ omp-oauth = { workspace = true }
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-py = { workspace = true }
 omp-secrets = { workspace = true }
+omp-sandbox = { workspace = true }
 omp-settings = { workspace = true }
 omp-shell-engine = { workspace = true }
 omp-storage = { workspace = true }
@@ -64,6 +65,7 @@ tonic = { workspace = true }
 url = { workspace = true }
 wreq = { workspace = true }
 zeroize = { workspace = true }
+zstd = { workspace = true }
 
 tracing = { workspace = true }
 

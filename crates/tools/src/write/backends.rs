@@ -520,6 +520,19 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn write_selector_routing_uses_the_shared_archive_registry() {
+		for (authored, archive, member) in [
+			("bundle.tar.zst:src/lib.rs", "bundle.tar.zst", "src/lib.rs"),
+			("package.deb:control", "package.deb", "control"),
+			("payload.7z:docs/readme.txt", "payload.7z", "docs/readme.txt"),
+		] {
+			let target = archive_targets(authored).unwrap().remove(0);
+			assert_eq!(target.archive_path, archive);
+			assert_eq!(target.member_path, member);
+		}
+	}
+
+	#[test]
 	fn zip_rewrite_preserves_other_members_and_rejects_invalid_sources() {
 		let mut source = Cursor::new(Vec::new());
 		create_zip_member(&mut source, "keep.txt", b"keep").unwrap();

@@ -530,7 +530,7 @@ impl ReadSourceAdapter {
 			SourceKind::File
 		};
 		let canonical_path = utf8_path(&canonical)?;
-		let display_path = display_path(self.workspace.root(), &canonical)?;
+		let display_path = display_path(self.workspace.root(), &candidate)?;
 		Ok(SourceStat {
 			canonical_path,
 			display_path,
@@ -652,13 +652,17 @@ impl ReadLease for ReadDocumentLease {
 	}
 }
 
-async fn open_filesystem_lease(canonical_path: Str) -> Result<ReadDocumentLease, Fault> {
-	let bytes = tokio::fs::read(canonical_path.as_str())
+async fn open_filesystem_lease(io_path: Str, source_path: Str) -> Result<ReadDocumentLease, Fault> {
+	let bytes = tokio::fs::read(io_path.as_str())
 		.await
 		.map(Bytes::from)
-		.map_err(|error| source_io("read", &canonical_path, error))?;
+		.map_err(|error| source_io("read", &io_path, error))?;
 	let revision = Str::from(format!("fs:{}", Hash32::sum(&bytes).to_hex()));
-	Ok(ReadDocumentLease { backing: ReadLeaseBacking::File(bytes), revision, canonical_path })
+	Ok(ReadDocumentLease {
+		backing: ReadLeaseBacking::File(bytes),
+		revision,
+		canonical_path: source_path,
+	})
 }
 
 impl ReadSources for ReadSourceAdapter {
@@ -712,7 +716,9 @@ impl ReadSources for ReadSourceAdapter {
 	}
 
 	async fn open(&self, path: Str) -> Result<Self::Lease, Fault> {
-		let acp_path = utf8_path(&resolve_authored_path(self.workspace.root(), &path))?;
+		let authored_path = resolve_authored_path(self.workspace.root(), &path);
+		let authored_display = display_path(self.workspace.root(), &authored_path)?;
+		let acp_path = utf8_path(&authored_path)?;
 		if let Some(result) = self.documents.read_acp_text(acp_path.clone()).await {
 			match result {
 				Ok(text) => {
@@ -721,7 +727,7 @@ impl ReadSources for ReadSourceAdapter {
 					return Ok(ReadDocumentLease {
 						backing: ReadLeaseBacking::File(bytes),
 						revision,
-						canonical_path: acp_path,
+						canonical_path: authored_display.clone(),
 					});
 				},
 				Err(error) => {
@@ -732,7 +738,7 @@ impl ReadSources for ReadSourceAdapter {
 		let stat = self.stat_path(&path).await?;
 		let canonical = Path::new(stat.canonical_path.as_str());
 		let Ok(relative) = canonical.strip_prefix(self.workspace.root()) else {
-			return open_filesystem_lease(stat.canonical_path).await;
+			return open_filesystem_lease(stat.canonical_path, stat.display_path).await;
 		};
 		let relative = utf8_path(relative)?;
 		let resolved = resolve_read_document(&self.documents, &relative).map_err(Fault::source)?;
@@ -740,12 +746,12 @@ impl ReadSources for ReadSourceAdapter {
 		let lease = DocumentHost::open(&self.documents, resolved.uri, None, &cancel)
 			.await
 			.map_err(|error| Fault::source(error.to_string()))?;
-		let (revision, canonical_path) =
+		let (revision, _canonical_path) =
 			read_document_metadata(lease.head()).map_err(Fault::source)?;
 		Ok(ReadDocumentLease {
 			backing: ReadLeaseBacking::Document { host: self.documents.clone(), lease },
 			revision,
-			canonical_path,
+			canonical_path: stat.display_path,
 		})
 	}
 
@@ -842,6 +848,13 @@ impl ReadSources for ReadSourceAdapter {
 		if record.bytes.len() > SNAPSHOT_MAX_BYTES {
 			return Ok(None);
 		}
+		let snapshot_path = if record.path.contains("://") {
+			record.path
+		} else {
+			let authored = resolve_authored_path(self.workspace.root(), &record.path);
+			let canonical = fs::canonicalize(&authored).unwrap_or(authored);
+			Str::from(canonical.to_string_lossy().into_owned())
+		};
 		let revision = RevisionToken::new(record.revision.as_bytes());
 		let seen = record
 			.seen
@@ -852,7 +865,7 @@ impl ReadSources for ReadSourceAdapter {
 			.documents
 			.snapshot_store()
 			.lock()
-			.record(record.path, revision, record.bytes, seen)
+			.record(snapshot_path, revision, record.bytes, seen)
 			.ok())
 	}
 }
@@ -975,9 +988,12 @@ mod external_path_tests {
 		let path = sandbox.path().join("plain.txt");
 		fs::write(&path, b"before").expect("write file");
 		let canonical = fs::canonicalize(&path).expect("canonical file");
-		let lease = open_filesystem_lease(utf8_path(&canonical).expect("UTF-8 path"))
-			.await
-			.expect("open external lease");
+		let lease = open_filesystem_lease(
+			utf8_path(&canonical).expect("UTF-8 path"),
+			utf8_path(&path).expect("source path"),
+		)
+		.await
+		.expect("open external lease");
 		fs::write(&path, b"after").expect("replace file");
 		assert_eq!(lease.read_all().await.expect("read pinned bytes"), Bytes::from_static(b"before"));
 	}
@@ -991,12 +1007,35 @@ mod external_path_tests {
 		fs::write(&path, b"outside").expect("write file");
 		let authored = resolve_authored_path(&root, "../outside.txt");
 		let canonical = fs::canonicalize(authored).expect("canonical file");
-		let lease = open_filesystem_lease(utf8_path(&canonical).expect("UTF-8 path"))
-			.await
-			.expect("open parent-relative lease");
+		let lease = open_filesystem_lease(
+			utf8_path(&canonical).expect("UTF-8 path"),
+			utf8_path(&path).expect("source path"),
+		)
+		.await
+		.expect("open parent-relative lease");
 		assert_eq!(
 			lease.read_all().await.expect("read pinned bytes"),
 			Bytes::from_static(b"outside")
 		);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn symlink_lease_keeps_authored_alias_as_its_snapshot_key() {
+		let workspace = tempfile::tempdir().expect("workspace");
+		let target = workspace.path().join("target.txt");
+		let alias = workspace.path().join("authored.txt");
+		fs::write(&target, b"contents").expect("write target");
+		std::os::unix::fs::symlink(&target, &alias).expect("create alias");
+		let canonical = fs::canonicalize(&alias).expect("canonical target");
+		let source = display_path(workspace.path(), &alias).expect("display alias");
+		let lease =
+			open_filesystem_lease(utf8_path(&canonical).expect("canonical path"), source.clone())
+				.await
+				.expect("open lease");
+
+		assert_eq!(source.as_str(), "authored.txt");
+		assert_eq!(lease.canonical_path(), &source);
+		assert_eq!(lease.read_all().await.expect("read alias"), Bytes::from_static(b"contents"));
 	}
 }

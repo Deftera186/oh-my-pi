@@ -2,17 +2,18 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	fmt, sync,
+	fmt,
 };
 
-use omp_core::{SecretString, Str};
-use omp_inference::{auth, id::PrincipalId};
+use omp_catalog::ProviderId;
+use omp_core::{ExposeSecret as _, Secret, SecretString, Str};
+use omp_inference::{
+	auth::{self, AuthControlHandle, CredentialControlWrite},
+	id::PrincipalId,
+};
 use url::Url;
 
-use super::{
-	auth_authority::{AuthAffinity, CombinedAuthAuthority},
-	config::{McpServerConfig, ResolvedServer, TransportKind},
-};
+use super::config::{McpServerConfig, ResolvedServer, TransportKind};
 
 const EXA_HOST_SUFFIX: &str = "mcp.exa.ai";
 const EXA_KEY_QUERY: &str = "exaApiKey";
@@ -39,7 +40,8 @@ impl Default for NativeCoverage {
 /// Generic MCP mount retained after native coverage analysis.
 #[derive(Clone, Debug)]
 pub struct FilteredMount {
-	/// Source declaration, with extracted literal credentials removed.
+	/// Source declaration retained intact until any native-only replacement is
+	/// known to be usable.
 	pub server:           ResolvedServer,
 	/// Advertised leaves which the generic MCP device must suppress.
 	pub suppressed_tools: BTreeSet<Str>,
@@ -64,17 +66,21 @@ impl fmt::Debug for ExtractedExaKey {
 	}
 }
 
-/// Coverage-filter result. Fully native-covered Exa and browser servers are
-/// removed before any generic mount can expose duplicate capabilities.
+/// Coverage-filter result. Browser duplicates are removed immediately; Exa
+/// duplicates remain as fallbacks until native provider auth import succeeds.
 #[derive(Clone, Debug, Default)]
 pub struct FilterResult {
-	/// Generic mounts still needed for uncovered leaves.
-	pub mounts:   BTreeMap<Str, FilteredMount>,
-	/// Secret-typed Exa keys awaiting combined-authority import.
-	pub exa_keys: Vec<ExtractedExaKey>,
+	/// Generic mounts, including native-covered Exa fallbacks retained until
+	/// native credential import succeeds.
+	pub mounts:      BTreeMap<Str, FilteredMount>,
+	/// Secret-typed Exa keys awaiting native provider import.
+	pub exa_keys:    Vec<ExtractedExaKey>,
+	/// Exa mounts which may be removed only after native auth is usable.
+	pub covered_exa: BTreeSet<Str>,
 }
 
-/// Detects native-covered Exa/browser mounts and records leaf suppression.
+/// Detects native-covered Exa/browser mounts and records conditional leaf
+/// suppression.
 pub fn filter_native_coverage(
 	servers: &BTreeMap<Str, ResolvedServer>,
 	coverage: &NativeCoverage,
@@ -107,34 +113,40 @@ pub fn filter_native_coverage(
 				.as_ref()
 				.is_none_or(|tools| tools.iter().all(|tool| suppressed_tools.contains(tool)))
 		{
-			continue;
+			result.covered_exa.insert(name.clone());
 		}
-		let mut retained = server.clone();
-		retained.config = sync::Arc::new(sanitized);
 		result
 			.mounts
-			.insert(name.clone(), FilteredMount { server: retained, suppressed_tools });
+			.insert(name.clone(), FilteredMount { server: server.clone(), suppressed_tools });
 	}
 	result
 }
 
-/// Imports extracted Exa keys through the one combined credential authority.
-/// Returns opaque affinities for native search composition.
+/// Imports the first deterministic Exa key through the canonical native
+/// provider authority. Existing native Exa accounts take precedence.
 pub fn import_exa_keys(
-	authority: &CombinedAuthAuthority,
-	profile: &str,
+	authority: &AuthControlHandle,
 	principal: PrincipalId,
 	keys: Vec<ExtractedExaKey>,
-	now_ms: u64,
-) -> Result<Vec<AuthAffinity>, auth::StoreError> {
-	let mut affinities = Vec::with_capacity(keys.len());
-	for extracted in keys {
-		let affinity =
-			CombinedAuthAuthority::mcp_affinity(profile, extracted.server.as_str(), principal.clone());
-		authority.persist_mcp_api_key(&affinity, extracted.key, now_ms, None)?;
-		affinities.push(affinity);
+) -> Result<bool, auth::StoreError> {
+	let provider = ProviderId::from("exa");
+	let accounts = authority.accounts(Some(&provider));
+	if !accounts.is_empty() {
+		return Ok(accounts.iter().any(|account| account.enabled));
 	}
-	Ok(affinities)
+	let Some(extracted) = keys.into_iter().next() else {
+		return Ok(false);
+	};
+	let secret = Secret::new(extracted.key.expose_secret().as_bytes().to_vec());
+	authority.store(CredentialControlWrite {
+		provider,
+		principal,
+		identity: Some(Str::new_static("default")),
+		kind: Str::new_static("bearer"),
+		secret,
+		expires_at_ms: None,
+	})?;
+	Ok(true)
 }
 
 fn is_exa_server(name: &str, config: &McpServerConfig) -> bool {
@@ -271,8 +283,6 @@ fn requested_exa_tools(config: &McpServerConfig) -> Option<BTreeSet<Str>> {
 mod tests {
 	use std::{path::PathBuf, sync::Arc};
 
-	use omp_core::ExposeSecret as _;
-
 	use super::*;
 	use crate::mcp::config::{ConfigSourceKind, McpServerConfig};
 
@@ -316,38 +326,26 @@ mod tests {
 				.contains("web_search_exa")
 		);
 		assert_eq!(filtered.exa_keys[0].key.expose_secret(), "top-secret");
-		assert!(
-			!filtered.mounts["exa"]
-				.server
-				.config
-				.url
-				.as_ref()
-				.expect("url")
-				.contains("top-secret")
-		);
+		assert!(!filtered.covered_exa.contains("exa"));
 		assert!(!format!("{:?}", filtered.exa_keys).contains("top-secret"));
 	}
 
 	#[test]
-	fn drops_exactly_native_only_restricted_mount() {
+	fn marks_exactly_native_only_restricted_mount_for_conditional_removal() {
 		let servers = BTreeMap::from([(
 			Str::from("exa"),
 			remote("https://mcp.exa.ai/mcp?tools=web_search_exa"),
 		)]);
-		assert!(
-			filter_native_coverage(&servers, &NativeCoverage::default())
-				.mounts
-				.is_empty()
-		);
+		let filtered = filter_native_coverage(&servers, &NativeCoverage::default());
+		assert!(filtered.mounts.contains_key("exa"));
+		assert!(filtered.covered_exa.contains("exa"));
 	}
 
 	#[test]
-	fn drops_unrestricted_exa_mounts() {
+	fn marks_unrestricted_exa_mounts_for_conditional_removal() {
 		let servers = BTreeMap::from([(Str::from("exa"), remote("https://mcp.exa.ai/mcp"))]);
-		assert!(
-			filter_native_coverage(&servers, &NativeCoverage::default())
-				.mounts
-				.is_empty()
-		);
+		let filtered = filter_native_coverage(&servers, &NativeCoverage::default());
+		assert!(filtered.mounts.contains_key("exa"));
+		assert!(filtered.covered_exa.contains("exa"));
 	}
 }

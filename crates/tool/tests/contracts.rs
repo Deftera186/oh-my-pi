@@ -2060,7 +2060,9 @@ fn renderers_are_exact_revision_cached_and_fall_back_without_name_lookup() {
 		.fold(&exact, &mut state, Bytes::from_static(br#"{"count":3}"#))
 		.unwrap();
 	assert_eq!(
-		renderers.view(&exact, &state, Some(br#"{"kind":"ok"}"#)).unwrap(),
+		renderers
+			.view(&exact, &state, Some(br#"{"kind":"ok"}"#))
+			.unwrap(),
 		"count=5;settled=true",
 	);
 	assert_eq!(state.raw_update_count(), 0);

@@ -43,6 +43,62 @@ pub enum UnexpectedStopMode {
 	/// Add a small-model classifier for text-only terminal turns.
 	Smart,
 }
+/// Delivery cardinality for queued steering messages.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	serde::Serialize,
+	serde::Deserialize,
+	strum::Display,
+	strum::EnumString,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
+pub enum SteeringMode {
+	/// Deliver one queued steering message at each injection boundary.
+	#[default]
+	OneAtATime,
+	/// Deliver every queued steering message at the same injection boundary.
+	All,
+}
+
+impl SteeringMode {
+	/// Maximum steering messages admitted by one mailbox drain.
+	pub const fn delivery_limit(self) -> usize {
+		match self {
+			Self::OneAtATime => 1,
+			Self::All => usize::MAX,
+		}
+	}
+}
+
+/// Context-overflow promotion configured for the active model route.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContextPromotionPolicy {
+	/// Whether promotion may run before context compaction.
+	pub enabled: bool,
+	/// Eligible larger-context route selected by the catalog owner.
+	pub target:  Option<Str>,
+}
+
+/// Synchronous compaction check performed only between tool-loop requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidTurnCompactionPolicy {
+	/// Whether safe-boundary checks are enabled.
+	pub enabled:          bool,
+	/// Context occupancy that triggers compaction.
+	pub threshold_tokens: u64,
+}
+
+impl Default for MidTurnCompactionPolicy {
+	fn default() -> Self {
+		Self { enabled: true, threshold_tokens: u64::MAX }
+	}
+}
 
 /// Bounded loop-level retry policy for recoverable turn failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,28 +169,34 @@ pub enum RetryPolicyError {
 #[derive(Clone)]
 pub struct AgentSnapshot {
 	/// Per-turn arbiter options.
-	pub turn:              TurnOptions,
+	pub turn:                TurnOptions,
 	/// Names of tools enabled for this turn, in stable publication order.
-	pub enabled_tools:     Arc<[Str]>,
+	pub enabled_tools:       Arc<[Str]>,
 	/// Live revisioned tools used for advertisement, projection, and execution.
-	pub registry:          Arc<Registry>,
+	pub registry:            Arc<Registry>,
 	/// Immutable workspace and context-file input.
-	pub props:             Props,
+	pub props:               Props,
 	/// Synchronous source used to construct the canonical prompt head.
-	pub prompt_source:     Arc<dyn PromptSource>,
+	pub prompt_source:       Arc<dyn PromptSource>,
 	/// Dialect policy governing hidden continuity after interrupted reasoning.
-	pub reasoning_dialect: InterruptedReasoningDialect,
+	pub reasoning_dialect:   InterruptedReasoningDialect,
 	/// Whether immediate interrupts are demoted to turn-boundary interrupts.
-	pub defer_interrupts:  bool,
+	pub defer_interrupts:    bool,
+	/// Queued steering delivery cardinality.
+	pub steering_mode:       SteeringMode,
 	/// Absolute deadline for the active logical turn, when bounded by the host.
-	pub deadline:          Option<Instant>,
+	pub deadline:            Option<Instant>,
 	/// Bounded loop-level recovery policy.
-	pub retry:             RetryPolicy,
+	pub retry:               RetryPolicy,
 	/// Ordered context-overflow recovery ladder; empty disables automatic
 	/// recovery compaction.
-	pub compaction:        CompactionMethodOrder,
+	pub compaction:          CompactionMethodOrder,
+	/// Larger-context model promotion attempted before overflow compaction.
+	pub context_promotion:   ContextPromotionPolicy,
+	/// Safe tool-loop-boundary compaction threshold policy.
+	pub mid_turn_compaction: MidTurnCompactionPolicy,
 	/// Unexpected assistant-stop recovery policy.
-	pub unexpected_stop:   UnexpectedStopMode,
+	pub unexpected_stop:     UnexpectedStopMode,
 }
 
 impl AgentSnapshot {
@@ -149,9 +211,12 @@ impl AgentSnapshot {
 			prompt_source: Arc::new(CanonicalPromptSource),
 			reasoning_dialect: InterruptedReasoningDialect::Other,
 			defer_interrupts: false,
+			steering_mode: SteeringMode::default(),
 			deadline: None,
 			retry: RetryPolicy::default(),
 			compaction: CompactionMethodOrder::default(),
+			context_promotion: ContextPromotionPolicy::default(),
+			mid_turn_compaction: MidTurnCompactionPolicy::default(),
 			unexpected_stop: UnexpectedStopMode::Mechanical,
 		}
 	}
@@ -180,9 +245,12 @@ impl fmt::Debug for AgentSnapshot {
 			.field("prompt_source", &format_args!("<dyn PromptSource>"))
 			.field("reasoning_dialect", &self.reasoning_dialect)
 			.field("defer_interrupts", &self.defer_interrupts)
+			.field("steering_mode", &self.steering_mode)
 			.field("deadline", &self.deadline)
 			.field("retry", &self.retry)
 			.field("compaction", &self.compaction)
+			.field("context_promotion", &self.context_promotion)
+			.field("mid_turn_compaction", &self.mid_turn_compaction)
 			.field("unexpected_stop", &self.unexpected_stop)
 			.finish()
 	}
@@ -253,6 +321,14 @@ impl Default for AgentState {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn runtime_policy_defaults_match_pi() {
+		let snapshot = AgentSnapshot::default();
+		assert_eq!(snapshot.steering_mode, SteeringMode::OneAtATime);
+		assert!(!snapshot.context_promotion.enabled);
+		assert!(snapshot.mid_turn_compaction.enabled);
+	}
 
 	#[test]
 	fn update_publishes_a_new_immutable_snapshot() {

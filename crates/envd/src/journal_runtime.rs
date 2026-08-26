@@ -257,19 +257,15 @@ impl ControlAuthorityFactory for PersistenceControlFactory {
 					"authenticated extension provenance is absent",
 				)
 			})?;
-		let binding = self.actor.agent.lock().clone().ok_or_else(|| {
-			ControlCompositionError::unavailable("persistence", "active Agent owner is not bound")
-		})?;
-		let context = LiveContextControlOwner::new(
-			Arc::clone(&identity),
-			self.actor.session_id.clone(),
-			binding.host.ok_or_else(|| {
-				ControlCompositionError::unavailable(
-					"context",
-					"active Agent context owner is not bound",
-				)
-			})?,
-		);
+		let context = self
+			.actor
+			.agent
+			.lock()
+			.clone()
+			.and_then(|binding| binding.host)
+			.map(|host| {
+				LiveContextControlOwner::new(Arc::clone(&identity), self.actor.session_id.clone(), host)
+			});
 		Ok(Arc::new(PersistenceControlOwner {
 			actor: self.actor.clone(),
 			identity: Arc::clone(&identity),
@@ -288,7 +284,7 @@ struct PersistenceControlOwner {
 	actor:            ExternalJournalActor,
 	identity:         Arc<ControlConnectionIdentity>,
 	journal_identity: JournalConnectionIdentity,
-	context:          LiveContextControlOwner,
+	context:          Option<LiveContextControlOwner>,
 }
 
 impl PersistenceControlOwner {
@@ -386,7 +382,17 @@ impl ControlAuthority for PersistenceControlOwner {
 		arguments: &Map<String, Value>,
 	) -> Result<(), ControlProtocolError> {
 		if operation.starts_with("omp.context.") {
-			return self.context.authorize(context, operation, arguments);
+			return self
+				.context
+				.as_ref()
+				.ok_or_else(|| {
+					ControlProtocolError::new(
+						"ControlOwnerUnavailable",
+						"active Agent context owner is not bound",
+					)
+					.retryable(true)
+				})?
+				.authorize(context, operation, arguments);
 		}
 		self.validate(context)
 	}
@@ -398,7 +404,18 @@ impl ControlAuthority for PersistenceControlOwner {
 		arguments: Map<String, Value>,
 	) -> Result<Value, ControlProtocolError> {
 		if operation.as_str().starts_with("omp.context.") {
-			return self.context.request(context, operation, arguments).await;
+			return self
+				.context
+				.as_ref()
+				.ok_or_else(|| {
+					ControlProtocolError::new(
+						"ControlOwnerUnavailable",
+						"active Agent context owner is not bound",
+					)
+					.retryable(true)
+				})?
+				.request(context, operation, arguments)
+				.await;
 		}
 		self.validate(&context)?;
 		if operation.as_str().starts_with("omp.agents.schedule")

@@ -784,7 +784,7 @@ mod tests {
 			command:           executable,
 			args:              vec![
 				Str::from("--exact"),
-				Str::from("envd::mcp::stdio::tests::stdio_fixture_child"),
+				Str::from("mcp::stdio::tests::stdio_fixture_child"),
 				Str::from("--nocapture"),
 			],
 			env:               BTreeMap::from([(
@@ -814,7 +814,7 @@ mod tests {
 			command:           executable,
 			args:              vec![
 				Str::from("--exact"),
-				Str::from("envd::mcp::stdio::tests::stdio_fixture_child"),
+				Str::from("mcp::stdio::tests::stdio_fixture_child"),
 				Str::from("--nocapture"),
 			],
 			env:               BTreeMap::from([(

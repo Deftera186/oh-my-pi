@@ -675,6 +675,11 @@ if "__omp_prelude_loaded__" not in globals():
                             sibling.cancel()
                         raise
             return results
+        except BaseException:
+            failed = True
+            for sibling in futures:
+                sibling.cancel()
+            raise
         finally:
             pool.shutdown(wait=not failed, cancel_futures=failed)
 

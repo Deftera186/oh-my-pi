@@ -198,14 +198,14 @@ fn generated_schema_definition_and_revision_are_exact() {
 		tool.spec().description.as_str(),
 		"Creates or overwrites file at specified path.\n\n<conditions>\n- Creating new files \
 		 explicitly required by task\n- Replacing entire file contents when editing would be more \
-		 complex\n- Supports `.tar`, `.tar.gz`, `.tgz`, `.zip`, and ZIP-based \
-		 `.jar`/`.war`/`.ear`/`.apk` archive entries via `archive.ext:path/inside/archive`\n- \
-		 Supports SQLite row operations via `db.sqlite:table` (insert), `db.sqlite:table:key` \
-		 (update with JSON content, delete with empty content)\n- Supports registered \
-		 merge-conflict splices via `conflict://<id>` and \
-		 `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit tool \
-		 for modifying existing files\n- You NEVER create documentation files (*.md, README) unless \
-		 explicitly requested\n- You NEVER use emojis unless requested\n</critical>"
+		 complex\n- Supports `.zip` (and ZIP-based `.jar`/`.war`/`.ear`/`.apk`), `.tar`, \
+		 `.tar.gz`/`.tgz`, and `.tar.zst` archive entries via `archive.ext:path/inside/archive`; \
+		 other archive formats (including `.asar`) are read-only\n- Supports SQLite row operations \
+		 via `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON content, delete \
+		 with empty content)\n- Supports registered merge-conflict splices via `conflict://<id>` \
+		 and `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit \
+		 tool for modifying existing files\n- You NEVER create documentation files (*.md, README) \
+		 unless explicitly requested\n- You NEVER use emojis unless requested\n</critical>"
 	);
 }
 
@@ -230,9 +230,10 @@ fn create_records_exact_request_payload_and_hashline_output() {
 	assert!(!payload.stripped_wrapper);
 	assert!(!payload.made_executable);
 	assert_eq!(requests.lock().as_slice(), [PlainWriteRequest {
-		path:          "out.txt".into(),
-		content:       "hello\n".into(),
-		format_policy: omp_tools::edit::FormatPolicy::BestEffort,
+		path:            "out.txt".into(),
+		content:         "hello\n".into(),
+		format_policy:   omp_tools::edit::FormatPolicy::BestEffort,
+		guard_generated: true,
 	}]);
 }
 
@@ -286,9 +287,10 @@ fn copied_hashline_display_is_stripped_before_commit_with_exact_notice() {
 			.stripped_wrapper
 	);
 	assert_eq!(requests.lock().as_slice(), [PlainWriteRequest {
-		path:          "out.txt".into(),
-		content:       "first\nsecond\n".into(),
-		format_policy: omp_tools::edit::FormatPolicy::BestEffort,
+		path:            "out.txt".into(),
+		content:         "first\nsecond\n".into(),
+		format_policy:   omp_tools::edit::FormatPolicy::BestEffort,
+		guard_generated: true,
 	}]);
 }
 
@@ -439,7 +441,7 @@ fn retired_device_write_targets_are_rejected_with_xd_builtin_guidance() {
 			);
 		}
 		assert!(
-			text.contains("`xd` runs in the shell tool"),
+			text.contains("`xd` runs in the bash tool"),
 			"missing shell builtin guidance in '{text}' for '{target}'"
 		);
 		assert!(

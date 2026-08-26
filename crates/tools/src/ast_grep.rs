@@ -160,7 +160,7 @@ impl Tool for AstGrep {
 				let patterns = match omp_ast::ops::compile_search_patterns(&params.pat, language) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
 				let source = match fs::read_to_string(&file.absolute_path) { Ok(v) => v, Err(e) => { advisories.push(Advisory { path: file.relative_path, message: Str::new(e.to_string()) }); continue; } };
 				for found in omp_ast::ops::collect_matches(&source, language, &patterns) {
-					matches.push(Match { path: file.relative_path.clone(), line: found.line, column: found.column, end_line: found.end_line, end_column: found.end_column, text: found.text, bindings: Str::new("") });
+					matches.push(Match { path: file.relative_path.clone(), line: found.line, column: found.column, end_line: found.end_line, end_column: found.end_column, text: found.text, bindings: render_bindings(&found.bindings) });
 				}
 			}
 			matches.sort_unstable_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)).then(a.column.cmp(&b.column)));
@@ -182,6 +182,9 @@ impl Tool for AstGrep {
 					use std::fmt::Write as _;
 					let _ =
 						writeln!(out, "{}:{}:{}\n{}", found.path, found.line, found.column, found.text);
+					if !found.bindings.is_empty() {
+						let _ = writeln!(out, "  meta: {}", found.bindings);
+					}
 				}
 				for advisory in &payload.advisories {
 					use std::fmt::Write as _;
@@ -197,11 +200,35 @@ impl Tool for AstGrep {
 		vec![Part::Text { text }]
 	}
 }
+fn render_bindings(bindings: &[omp_ast::ops::AstBinding]) -> Str {
+	Str::new(
+		bindings
+			.iter()
+			.map(|binding| format!("{}={}", binding.name, binding.value))
+			.collect::<Vec<_>>()
+			.join(", "),
+	)
+}
 fn done(result: Result<Payload, Fault>) -> Ev<Update, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done {
 		useless: result.as_ref().is_ok_and(|p| p.matches.is_empty()),
 		result,
 	})
+}
+#[cfg(test)]
+mod tests {
+	use omp_ast::ops::AstBinding;
+
+	use super::*;
+
+	#[test]
+	fn renders_metavariable_bindings_in_stable_order() {
+		let bindings = [AstBinding { name: sf!("$NAME"), value: sf!("answer") }, AstBinding {
+			name:  sf!("$VALUE"),
+			value: sf!("42"),
+		}];
+		assert_eq!(render_bindings(&bindings), "$NAME=answer, $VALUE=42");
+	}
 }
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {
 	match error {

@@ -69,18 +69,20 @@ struct Inner {
 }
 
 struct LeaseRecord {
-	path:          PathBuf,
-	expires_at_ms: u64,
-	write_back:    Option<PathBuf>,
+	path:                PathBuf,
+	expires_at_ms:       u64,
+	write_back:          Option<PathBuf>,
+	write_back_complete: bool,
 }
 
 impl ResourceMaterializer {
 	pub(crate) fn open(
 		workspace_root: &Path,
 		state_dir: &Path,
+		local_root: &Path,
 	) -> Result<Self, MaterializationError> {
 		let workspace_root = fs::canonicalize(workspace_root)?;
-		let local_root = state_dir.join("local");
+		let local_root = local_root.to_path_buf();
 		let lease_root = state_dir.join("materializations");
 		private_directory(&local_root)?;
 		private_directory(&lease_root)?;
@@ -188,6 +190,7 @@ impl Inner {
 			path: lease_path,
 			expires_at_ms,
 			write_back: mutable_local.then_some(source),
+			write_back_complete: false,
 		});
 		Ok(MaterializationLease {
 			lease_id,
@@ -199,28 +202,27 @@ impl Inner {
 	}
 
 	fn release(&self, lease_id: &[u8]) -> Result<(), MaterializationError> {
-		let record = self.leases.lock().remove(lease_id);
-		if let Some(record) = record {
-			finalize_record(&record)?;
+		let mut leases = self.leases.lock();
+		if let Some(record) = leases.get_mut(lease_id) {
+			finalize_record(record)?;
+			leases.remove(lease_id);
 		}
 		Ok(())
 	}
 
 	fn reap_expired(&self) -> Result<(), MaterializationError> {
 		let now = now_ms();
-		let expired = {
-			let mut leases = self.leases.lock();
-			let ids = leases
-				.iter()
-				.filter(|(_, lease)| lease.expires_at_ms <= now)
-				.map(|(id, _)| id.clone())
-				.collect::<Vec<_>>();
-			ids.into_iter()
-				.filter_map(|id| leases.remove(&id))
-				.collect::<Vec<_>>()
-		};
-		for lease in expired {
-			finalize_record(&lease)?;
+		let mut leases = self.leases.lock();
+		let expired = leases
+			.iter()
+			.filter(|(_, lease)| lease.expires_at_ms <= now)
+			.map(|(id, _)| id.clone())
+			.collect::<Vec<_>>();
+		for id in expired {
+			if let Some(record) = leases.get_mut(&id) {
+				finalize_record(record)?;
+				leases.remove(&id);
+			}
 		}
 		Ok(())
 	}
@@ -286,27 +288,21 @@ impl Inner {
 impl Drop for Inner {
 	fn drop(&mut self) {
 		let leases = self.leases.get_mut();
-		for (_, lease) in leases.drain() {
-			let _ = finalize_record(&lease);
+		for (_, mut lease) in leases.drain() {
+			let _ = finalize_record(&mut lease);
 		}
 	}
 }
 
 fn cleanup_expired(weak: Weak<Inner>, lease_id: Bytes, expires_at_ms: u64) {
 	let Some(inner) = weak.upgrade() else { return };
-	let record = {
-		let mut leases = inner.leases.lock();
-		if leases
-			.get(&lease_id)
-			.is_some_and(|lease| lease.expires_at_ms == expires_at_ms)
-		{
-			leases.remove(&lease_id)
-		} else {
-			None
-		}
-	};
-	if let Some(record) = record {
-		let _ = finalize_record(&record);
+	let mut leases = inner.leases.lock();
+	if let Some(record) = leases
+		.get_mut(&lease_id)
+		.filter(|lease| lease.expires_at_ms == expires_at_ms)
+		&& finalize_record(record).is_ok()
+	{
+		leases.remove(&lease_id);
 	}
 }
 
@@ -393,17 +389,66 @@ fn copy_entry(
 	Ok(())
 }
 
-fn write_back_local(source: &Path, target: &Path) -> Result<(), MaterializationError> {
+fn write_back_local(
+	source: &Path,
+	target: &Path,
+	lease_path: &Path,
+) -> Result<(), MaterializationError> {
+	let parent = target.parent().ok_or(MaterializationError::InvalidUri)?;
+	private_directory(parent)?;
+	let target_name = target
+		.file_name()
+		.ok_or(MaterializationError::InvalidUri)?
+		.to_string_lossy();
+	let lease_name = lease_path
+		.file_name()
+		.ok_or(MaterializationError::InvalidUri)?
+		.to_string_lossy();
+	let staged = parent.join(format!(".{target_name}.omp-writeback-{lease_name}"));
+	let backup = parent.join(format!(".{target_name}.omp-backup-{lease_name}"));
+	remove_entry(&staged)?;
 	let mut size = 0;
 	let mut hasher = Hash32::hasher();
-	copy_entry(source, target, source, DEFAULT_MAX_BYTES, &mut size, &mut hasher)
+	copy_entry(source, &staged, source, DEFAULT_MAX_BYTES, &mut size, &mut hasher)?;
+
+	let target_exists = fs::symlink_metadata(target).is_ok();
+	if target_exists {
+		remove_entry(&backup)?;
+		fs::rename(target, &backup)?;
+	}
+	if let Err(error) = fs::rename(&staged, target) {
+		if target_exists {
+			let _ = fs::rename(&backup, target);
+		}
+		let _ = remove_entry(&staged);
+		return Err(error.into());
+	}
+	remove_entry(&backup)?;
+	Ok(())
 }
 
-fn finalize_record(record: &LeaseRecord) -> Result<(), MaterializationError> {
-	if let Some(target) = &record.write_back {
-		write_back_local(&record.path.join("resource"), target)?;
+fn finalize_record(record: &mut LeaseRecord) -> Result<(), MaterializationError> {
+	if !record.write_back_complete {
+		if let Some(target) = &record.write_back {
+			write_back_local(&record.path.join("resource"), target, &record.path)?;
+		}
+		record.write_back_complete = true;
 	}
 	remove_lease_path(&record.path)
+}
+
+fn remove_entry(path: &Path) -> Result<(), MaterializationError> {
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(error.into()),
+	};
+	if metadata.is_dir() && !metadata.file_type().is_symlink() {
+		fs::remove_dir_all(path)?;
+	} else {
+		fs::remove_file(path)?;
+	}
+	Ok(())
 }
 
 fn private_file(path: &Path) -> io::Result<()> {
@@ -452,7 +497,9 @@ mod tests {
 		let state = tempfile::tempdir().unwrap();
 		let source = workspace.path().join("input.txt");
 		fs::write(&source, b"materialized").unwrap();
-		let materializer = ResourceMaterializer::open(workspace.path(), state.path()).unwrap();
+		let materializer =
+			ResourceMaterializer::open(workspace.path(), state.path(), &state.path().join("local"))
+				.unwrap();
 		let lease = materializer
 			.materialize(MaterializeRequest {
 				resource_uri: Url::from_file_path(&source).unwrap().to_string(),
@@ -482,7 +529,9 @@ mod tests {
 	async fn mutable_local_parent_is_authorized_then_written_back_on_release() {
 		let workspace = tempfile::tempdir().unwrap();
 		let state = tempfile::tempdir().unwrap();
-		let materializer = ResourceMaterializer::open(workspace.path(), state.path()).unwrap();
+		let materializer =
+			ResourceMaterializer::open(workspace.path(), state.path(), &state.path().join("local"))
+				.unwrap();
 		let lease = materializer
 			.materialize(MaterializeRequest {
 				resource_uri: String::from("local://nested/result.txt"),
@@ -505,11 +554,51 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn mutable_local_directory_writeback_replaces_the_exact_tree() {
+		let workspace = tempfile::tempdir().unwrap();
+		let state = tempfile::tempdir().unwrap();
+		let local_root = state.path().join("sessions/test/local");
+		fs::create_dir_all(local_root.join("tree/kind")).unwrap();
+		fs::write(local_root.join("tree/deleted.txt"), b"remove me").unwrap();
+		fs::write(local_root.join("tree/kind/old.txt"), b"directory").unwrap();
+		let materializer =
+			ResourceMaterializer::open(workspace.path(), state.path(), &local_root).unwrap();
+		let lease = materializer
+			.materialize(MaterializeRequest {
+				resource_uri: String::from("local://tree"),
+				max_bytes: 1024,
+				ttl_ms: 60_000,
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let materialized = Url::parse(&lease.environment_uri)
+			.unwrap()
+			.to_file_path()
+			.unwrap();
+		fs::remove_file(materialized.join("deleted.txt")).unwrap();
+		fs::remove_dir_all(materialized.join("kind")).unwrap();
+		fs::write(materialized.join("kind"), b"file now").unwrap();
+		fs::write(materialized.join("renamed.txt"), b"new").unwrap();
+
+		materializer
+			.release(ReleaseMaterialization { lease_id: lease.lease_id, ..Default::default() })
+			.await
+			.unwrap();
+
+		assert!(!local_root.join("tree/deleted.txt").exists());
+		assert_eq!(fs::read(local_root.join("tree/kind")).unwrap(), b"file now");
+		assert_eq!(fs::read(local_root.join("tree/renamed.txt")).unwrap(), b"new");
+	}
+
+	#[tokio::test]
 	async fn containment_rejects_workspace_escape_and_cleans_failed_lease() {
 		let workspace = tempfile::tempdir().unwrap();
 		let state = tempfile::tempdir().unwrap();
 		let outside = tempfile::NamedTempFile::new().unwrap();
-		let materializer = ResourceMaterializer::open(workspace.path(), state.path()).unwrap();
+		let materializer =
+			ResourceMaterializer::open(workspace.path(), state.path(), &state.path().join("local"))
+				.unwrap();
 		let error = materializer
 			.materialize(MaterializeRequest {
 				resource_uri: Url::from_file_path(outside.path()).unwrap().to_string(),

@@ -174,6 +174,19 @@ pub fn project_journal(
 	tool_registry: &ToolRegistry,
 	caps: &CapsBase,
 ) -> Result<thread_pb::Thread, ProjectionError> {
+	let items = project_journal_items(log, live)?;
+	project_thread_history(&thread_pb::Thread { items }, tool_registry, caps)
+}
+
+/// Lowers the canonical live journal chain to persisted thread items.
+///
+/// This is the single event-semantic projection used both by provider history
+/// and by child materialization. Tool revision lifting remains a final
+/// provider-capability-specific step in [`project_journal`].
+pub(crate) fn project_journal_items(
+	log: &Log,
+	live: &LiveSet,
+) -> Result<Vec<thread_pb::Item>, ProjectionError> {
 	let mut items = Vec::new();
 	let mut positions = SparseMap::new();
 	let mut amended = SparseSet::new();
@@ -296,7 +309,7 @@ pub fn project_journal(
 			_ => {},
 		}
 	}
-	project_thread_history(&thread_pb::Thread { items }, tool_registry, caps)
+	Ok(items)
 }
 
 /// The effective item-affecting portion of an append-only amendment chain.
@@ -358,10 +371,10 @@ pub fn project_thread_history(
 		};
 		let call_id = call.id.clone();
 		let name = call.name.clone();
-		let Some((_, live_rev)) = tool_registry.live_identity(&name) else {
+		let Some(live_identity) = tool_registry.resolved_identity(&name) else {
 			continue;
 		};
-		if live_rev == &rev {
+		if live_identity.rev == rev {
 			continue;
 		}
 		let raw_args = call.args_json.clone();

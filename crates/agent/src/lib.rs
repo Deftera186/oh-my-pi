@@ -99,7 +99,8 @@ pub use compact::{
 	plan_lossless_with_warm_suffix, resolve_verdicts, speculation_lead_tokens,
 };
 pub use context::{
-	Anchor, ContextProjection, ContextSnapshot, ContextSnapshotError, ContextView, InheritPosition,
+	Anchor, ContextPatchSet, ContextProjection, ContextProjectionError, ContextProjectionHandler,
+	ContextSnapshot, ContextSnapshotError, ContextView, InheritPosition,
 	InterruptedReasoningDialect, MessageKind, MessageRef, PatchOp, PatchOutcome, PatchRejected,
 	RefFlags, apply_patches, demote_interrupted_reasoning, external_thinking_for_model,
 	inject_first_turn_metadata, project_context,
@@ -141,7 +142,7 @@ pub use lifecycle::{
 };
 pub use r#loop::{
 	AbortHandle, Agent, AgentError, AgentHostControl, AgentRunSummary, RewindTarget, RunActivity,
-	RunSettlement, UnexpectedStopClassifier,
+	RunSettlement, TurnDifficultyClassifier, UnexpectedStopClassifier,
 };
 pub use mailbox::{
 	DEFERRED_DIAGNOSTIC_DOCUMENT_PROP, DEFERRED_DIAGNOSTIC_GENERATION_PROP,
@@ -200,7 +201,10 @@ pub use schedule::{
 	Firing, FiringOutcome, MissedRunPolicy, Schedule, ScheduleBudget, ScheduleDelivery,
 	ScheduleError, ScheduleJournal, ScheduleScope, Scheduler, Trigger, UpgradePolicy, firing_key,
 };
-pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError, UnexpectedStopMode};
+pub use state::{
+	AgentSnapshot, AgentState, ContextPromotionPolicy, MidTurnCompactionPolicy, RetryPolicy,
+	RetryPolicyError, SteeringMode, UnexpectedStopMode,
+};
 pub use streaming_edit_guard::{StreamingEditAbort, StreamingEditDialect, StreamingEditGuard};
 pub use subagent::{
 	MAX_DISPOSITION_PREVIEW_BYTES, MAX_PROGRESS_ACTIVITY_BYTES, MAX_TERMINAL_SUMMARY_BYTES,

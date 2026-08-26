@@ -6,7 +6,6 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_proto::thread::v1::Item;
 use omp_scribe::{Value, map};
 use omp_storage::transcript::{self, Kind, ModelChange};
 use thiserror::Error;
@@ -30,8 +29,6 @@ pub struct RevivedSession {
 	pub journal:        Journal,
 	/// Reconstructed loop snapshot, including workspace and tool manifest.
 	pub snapshot:       AgentSnapshot,
-	/// Canonical live context after reset, rewind, and compaction projection.
-	pub live_items:     Vec<Item>,
 	/// Most recent journaled temporary model selection.
 	pub model_override: Option<ModelChange>,
 	/// Whether inference must discard provider-native session affinity before
@@ -100,18 +97,106 @@ pub fn revive_existing(
 		snapshot.enabled_tools = start
 			.enabled_tools
 			.iter()
-			.filter(|name| mounted.live_identity(name.as_str()).is_some())
+			.filter(|name| mounted.resolved_identity(name.as_str()).is_some())
 			.cloned()
 			.collect::<Vec<Str>>()
 			.into();
 	}
-	let live_items = journal.items_at(&journal.live_item_events()?)?;
 	Ok(RevivedSession {
 		journal,
 		snapshot,
-		live_items,
 		model_override,
 		provider_reset,
 		original_root: log.header().cwd.clone(),
 	})
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::Hash32;
+	use omp_proto::thread::v1::{self as thread_pb, item, part};
+	use omp_storage::{
+		blob::BlobRef,
+		transcript::{Header, SessionId, SnapcompactArchive},
+	};
+	use omp_tool::{CapsBase, ModelClass, Registry};
+	use tempfile::tempdir;
+
+	use super::*;
+	use crate::{Compact, project_journal};
+
+	fn message(text: &str) -> thread_pb::Item {
+		thread_pb::Item {
+			kind: Some(item::Kind::Message(thread_pb::Message {
+				role:  thread_pb::Role::User as i32,
+				parts: vec![thread_pb::Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+			})),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn cold_revival_retains_canonical_compaction_summary_and_frames() {
+		let scratch = tempdir().expect("temporary directory");
+		let path = scratch.path().join("session.jsonl");
+		let header = Header {
+			v:       4,
+			id:      SessionId(Str::new_static("revival-compact")),
+			created: 1,
+			cwd:     scratch.path().to_owned(),
+		};
+		let mut journal = Journal::create(&path, &header).expect("create journal");
+		journal
+			.append_optimistic(2, message("discarded"), None)
+			.expect("append discarded prefix");
+		let kept = journal
+			.append_optimistic(3, message("kept"), None)
+			.expect("append kept suffix");
+		let frame = BlobRef { hash: Hash32::new([7; 32]), size: 17 };
+		journal
+			.compact(4, Compact {
+				summary:       Str::new_static("durable summary"),
+				short:         None,
+				first_kept:    kept,
+				tokens_before: 100,
+				tokens_after:  Some(20),
+				method:        Some(Str::new_static("snapcompact")),
+				warning:       None,
+				snapcompact:   Some(SnapcompactArchive {
+					source:          BlobRef { hash: Hash32::new([3; 32]), size: 31 },
+					frames:          vec![frame],
+					source_tokens:   100,
+					image_tokens:    10,
+					png_bytes:       17,
+					truncated_chars: 0,
+					shape:           Str::new_static("test"),
+				}),
+				superseded:    Vec::new(),
+			})
+			.expect("compact journal");
+		drop(journal);
+
+		let revived = revive(&path, AgentSnapshot::default()).expect("revive compacted journal");
+		let log = revived.journal.load().expect("load revived journal");
+		let thread = project_journal(&log, log.as_ref(), &Registry::new(), &CapsBase {
+			maximum_parts:      8,
+			maximum_text_bytes: 4096,
+			media:              true,
+			model_class:        ModelClass::Standard,
+		})
+		.expect("project revived journal");
+		assert_eq!(thread.items.len(), 2);
+		let Some(item::Kind::Message(summary)) = &thread.items[0].kind else {
+			panic!("compaction projects as a summary message");
+		};
+		assert!(matches!(
+			summary.parts.as_slice(),
+			[
+				thread_pb::Part { kind: Some(part::Kind::Text(text)) },
+				thread_pb::Part { kind: Some(part::Kind::Blob(blob)) },
+			] if text.contains("durable summary")
+				&& blob.hash.as_ref() == frame.hash.as_bytes()
+				&& blob.size == frame.size
+		));
+		assert_eq!(thread.items[1], message("kept"));
+	}
 }

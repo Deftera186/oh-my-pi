@@ -27,6 +27,10 @@ use omp_proto::document::v1::{
 	self as pb, commit_transaction_response, document_mutation, document_target,
 	read_document_response, read_selection, text_mutation,
 };
+use omp_storage::{
+	gc::{ArtifactCatalog, ArtifactLifetime},
+	transcript::SessionId,
+};
 use omp_tool::BlobRef;
 use omp_tools::{
 	edit::{
@@ -36,7 +40,7 @@ use omp_tools::{
 		StalePolicy,
 	},
 	read::{
-		Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES, archive,
+		Fault as ReadFault, ReadBlobs, SNAPSHOT_MAX_BYTES, StoredArtifact, archive,
 		conflicts::{splice_registered, splice_registered_bulk},
 		mutation::{MutationCapability, ResourceMutationReceipt, ResourceMutationRequest},
 		notebook, selector,
@@ -214,13 +218,35 @@ impl EditSnapshotStore for BlobHost {
 	}
 }
 
-impl ReadBlobs for BlobHost {
+/// Session-bound blob and artifact adoption authority for read-family spills.
+#[derive(Clone)]
+pub(crate) struct SessionReadBlobs {
+	blobs:   BlobHost,
+	catalog: Arc<Mutex<ArtifactCatalog>>,
+	session: SessionId,
+}
+
+impl SessionReadBlobs {
+	/// Opens the artifact catalog for one stable active session.
+	pub(crate) fn open(blobs: BlobHost, session_id: &str) -> Result<Self, Str> {
+		let catalog =
+			ArtifactCatalog::open(blobs.store()).map_err(|error| Str::from(error.to_string()))?;
+		Ok(Self {
+			blobs,
+			catalog: Arc::new(Mutex::new(catalog)),
+			session: SessionId(Str::new(session_id)),
+		})
+	}
+}
+
+impl ReadBlobs for SessionReadBlobs {
 	fn store(
 		&self,
 		bytes: Bytes,
 		media_type: Str,
 	) -> impl Future<Output = Result<BlobRef, ReadFault>> + Send + '_ {
 		let result = self
+			.blobs
 			.put(&bytes)
 			.map_err(|error| ReadFault::Blob { message: Str::from(error.to_string()) })
 			.map(|id| BlobRef {
@@ -228,6 +254,33 @@ impl ReadBlobs for BlobHost {
 				media_type,
 				byte_len: id.size,
 			});
+		ready(result)
+	}
+
+	fn store_artifact(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, ReadFault>> + Send + '_ {
+		let result = (|| {
+			let id = self
+				.blobs
+				.put(&bytes)
+				.map_err(|error| ReadFault::Blob { message: Str::from(error.to_string()) })?;
+			let record = self
+				.catalog
+				.lock()
+				.adopt(&self.session, id.hash, Some(id.size), ArtifactLifetime::Session)
+				.map_err(|error| ReadFault::Blob { message: Str::from(error.to_string()) })?;
+			Ok(StoredArtifact {
+				blob: BlobRef {
+					hash: Str::from(hex::encode_n(&id.hash).as_str()),
+					media_type,
+					byte_len: id.size,
+				},
+				uri:  Str::from(format!("artifact://{}", record.ordinal)),
+			})
+		})();
 		ready(result)
 	}
 }
@@ -304,7 +357,9 @@ impl EditDocuments for DocumentHost {
 		let raw_base_bytes = read_whole(self, &lease)
 			.await
 			.map_err(|error| edit_invalid(error.to_string()))?;
-		if auto_generated_file(Path::new(canonical_path.as_str()), &raw_base_bytes) {
+		if request.guard_generated
+			&& auto_generated_file(Path::new(canonical_path.as_str()), &raw_base_bytes)
+		{
 			return Err(edit_invalid(format!(
 				"Refusing to edit auto-generated file {}; change its generator input instead",
 				request.path
@@ -1612,7 +1667,7 @@ impl WriteDocuments for DocumentHost {
 		};
 		if existed {
 			let prefix = read_file_prefix(&resolved.path, 16 * 1024).map_err(write_rejected)?;
-			if auto_generated_file(&resolved.path, &prefix) {
+			if request.guard_generated && auto_generated_file(&resolved.path, &prefix) {
 				return Err(write_rejected(format!(
 					"Refusing to overwrite auto-generated file {}; change its generator input instead",
 					request.path
@@ -2982,6 +3037,38 @@ fn write_archive_member_blocking(
 				.map_err(|error| special_fault(error.to_string()))?;
 			Ok(())
 		},
+		(archive::ArchiveFormat::TarZst, true) => {
+			let input =
+				std_fs::File::open(&final_path).map_err(|error| special_fault(error.to_string()))?;
+			let mut decoder = zstd::stream::read::Decoder::new(input)
+				.map_err(|error| special_fault(error.to_string()))?;
+			let limit = archive::MAX_TAR_ARCHIVE_BYTES;
+			let mut decoded = Vec::new();
+			let mut bounded = io::Read::take(&mut decoder, limit.saturating_add(1));
+			io::Read::read_to_end(&mut bounded, &mut decoded)
+				.map_err(|error| special_fault(error.to_string()))?;
+			if decoded.len() as u64 > limit {
+				return Err(special_fault(
+					omp_ar::Error::ArchiveTooLarge { actual: decoded.len() as u64, limit }.to_string(),
+				));
+			}
+			let mut encoder = zstd::stream::write::Encoder::new(output, 0)
+				.map_err(|error| special_fault(error.to_string()))?;
+			rewrite_tar_member(io::Cursor::new(decoded), &mut encoder, &target.member_path, &content)?;
+			encoder
+				.finish()
+				.map_err(|error| special_fault(error.to_string()))?;
+			Ok(())
+		},
+		(archive::ArchiveFormat::TarZst, false) => {
+			let mut encoder = zstd::stream::write::Encoder::new(output, 0)
+				.map_err(|error| special_fault(error.to_string()))?;
+			create_tar_member(&mut encoder, &target.member_path, &content)?;
+			encoder
+				.finish()
+				.map_err(|error| special_fault(error.to_string()))?;
+			Ok(())
+		},
 		(other, _) => {
 			Err(special_fault(format!("{} archives are read-only", <&'static str>::from(other))))
 		},
@@ -3024,7 +3111,10 @@ fn archive_member_exists(
 	format: archive::ArchiveFormat,
 	member: &str,
 ) -> Result<bool, backends::Fault> {
-	if !matches!(format, omp_ar::Format::Zip | omp_ar::Format::Tar | omp_ar::Format::TarGz) {
+	if !matches!(
+		format,
+		omp_ar::Format::Zip | omp_ar::Format::Tar | omp_ar::Format::TarGz | omp_ar::Format::TarZst
+	) {
 		return Err(special_fault(format!(
 			"{} archives are read-only",
 			<&'static str>::from(format)

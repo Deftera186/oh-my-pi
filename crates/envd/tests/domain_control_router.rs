@@ -170,7 +170,13 @@ async fn routes_requests_callbacks_and_effects_to_domain_owners() {
 		(ControlEffect::Registry(json!({})), "registry:registry"),
 		(ControlEffect::Ui(json!({})), "ui:ui"),
 		(ControlEffect::Instrument(json!({})), "telemetry:instrument"),
-		(ControlEffect::Intent(json!({})), "provider:intent"),
+		(
+			ControlEffect::Intent(json!({
+				"operation": "omp.intents.clear",
+				"arguments": {"key": "fixture"}
+			})),
+			"provider:intent",
+		),
 		(ControlEffect::Log(json!({})), "effects:log"),
 	]
 	.into_iter()

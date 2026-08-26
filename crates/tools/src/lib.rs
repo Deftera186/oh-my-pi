@@ -30,7 +30,7 @@ const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 	BuiltinToolIdentity { name: "write", hidden: false },
 	BuiltinToolIdentity { name: "grep", hidden: false },
 	BuiltinToolIdentity { name: "glob", hidden: false },
-	BuiltinToolIdentity { name: "shell", hidden: false },
+	BuiltinToolIdentity { name: "bash", hidden: false },
 	BuiltinToolIdentity { name: "eval", hidden: false },
 	BuiltinToolIdentity { name: "todo", hidden: false },
 	BuiltinToolIdentity { name: "ask", hidden: false },

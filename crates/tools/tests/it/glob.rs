@@ -10,7 +10,7 @@ use omp_tool::{
 };
 use omp_tools::{
 	glob, grep,
-	read::{Fault as ReadFault, ReadBlobs},
+	read::{Fault as ReadFault, ReadBlobs, StoredArtifact},
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -62,6 +62,22 @@ impl ReadBlobs for RecordingBlobs {
 			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 			stored.lock().push(bytes);
 			Ok(BlobRef { hash: sf!("glob-full"), media_type, byte_len })
+		}
+	}
+
+	fn store_artifact(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, ReadFault>> + Send + '_ {
+		let stored = Arc::clone(&self.stored);
+		async move {
+			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+			stored.lock().push(bytes);
+			Ok(StoredArtifact {
+				blob: BlobRef { hash: sf!("glob-full"), media_type, byte_len },
+				uri:  sf!("artifact://1"),
+			})
 		}
 	}
 }
@@ -213,7 +229,7 @@ fn limit_one_keeps_only_the_newest_match_and_records_truncation_truth() {
 	let workspace = fake(walk(vec![matched("old.rs", 1), matched("new.rs", 2)]));
 	let seen = Arc::clone(&workspace.seen);
 	let invocation = invoke(workspace, r#"{"path":"*.rs","limit":1}"#);
-	assert_eq!(invocation.text, "new.rs");
+	assert_eq!(invocation.text, "new.rs\n\n1 results limit reached. Use limit=2 for more.");
 	assert!(!invocation.useless);
 	let payload = invocation.result.expect("glob succeeds");
 	assert_eq!(payload.matches, vec![matched("new.rs", 2)]);
@@ -359,8 +375,9 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 	assert_eq!(payload.output_total_lines, 201);
 	assert!(payload.output_shown_lines < payload.output_total_lines);
 	assert_eq!(payload.output_blob.as_ref().map(|blob| blob.hash.as_str()), Some("glob-full"));
+	assert_eq!(payload.output_artifact_uri.as_deref(), Some("artifact://1"));
 	let expected_footer = format!(
-		"[truncated: {} of {} lines shown; full output in blob glob-full]",
+		"[truncated: {} of {} lines shown; read artifact://1 for full output]",
 		payload.output_shown_lines, payload.output_total_lines
 	);
 	assert!(invocation.text.ends_with(expected_footer.as_str()));

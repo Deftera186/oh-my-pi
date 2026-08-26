@@ -1,6 +1,5 @@
 use std::{
 	collections::BTreeMap,
-	env,
 	ffi::CString,
 	fmt::{self, Display},
 	path::PathBuf,
@@ -941,7 +940,22 @@ impl SessionBridgeHost {
 		if let Some(binding) = parents.get(owner) {
 			return Ok((Str::new(owner), binding.generation, Arc::clone(&binding.parent)));
 		}
-		Err(BridgeHostError::message("eval bridge parent session is not bound for this owner"))
+		let Ok((session, agent)) = serde_json::from_str::<(Str, Str)>(owner) else {
+			return Err(BridgeHostError::message(
+				"eval bridge parent session is not bound for this owner",
+			));
+		};
+		if session.is_empty() || agent.is_empty() {
+			return Err(BridgeHostError::message(
+				"eval bridge parent session is not bound for this owner",
+			));
+		}
+		let Some(binding) = parents.get(&session) else {
+			return Err(BridgeHostError::message(
+				"eval bridge parent session is not bound for this owner",
+			));
+		};
+		Ok((session, binding.generation, Arc::clone(&binding.parent)))
 	}
 
 	pub(super) fn freeze_runtime(
@@ -949,23 +963,7 @@ impl SessionBridgeHost {
 		owner: &str,
 		session: &Bytes,
 	) -> Result<RuntimeSnapshot, BridgeHostError> {
-		// No bound parent session (bare in-process embedder): cells still run,
-		// scoped to the daemon's working directory, but no runtime lease exists
-		// so parent-backed helpers (completion/agent/budget) stay unavailable.
-		let Ok((binding_owner, generation, parent)) = self.parent_for(owner) else {
-			let cwd =
-				env::current_dir().map_err(|error| BridgeHostError::message(error.to_string()))?;
-			return Ok(RuntimeSnapshot {
-				cwd:         Some(cwd),
-				managed_env: [
-					(sf!("OMP_EVAL_LOCAL_ROOTS"), None),
-					(sf!("OMP_ARTIFACTS_DIR"), None),
-					(sf!("OMP_SESSION_FILE"), None),
-				]
-				.into_iter()
-				.collect(),
-			});
-		};
+		let (binding_owner, generation, parent) = self.parent_for(owner)?;
 		let config = parent.eval_session_config()?;
 		self
 			.runtime_snapshots
@@ -1810,6 +1808,51 @@ mod tests {
 		host.release_runtime("owner-a", &first);
 		assert_eq!(host.runtime_snapshots.lock().len(), 2);
 	}
+	#[test]
+	fn runtime_snapshot_rejects_an_unbound_transport_owner() {
+		let host = SessionBridgeHost::new();
+		let error = host
+			.freeze_runtime("env-connection-1", &Bytes::from_static(b"eval-a"))
+			.expect_err("transport identity must not receive daemon runtime authority");
+		assert!(matches!(
+			error,
+			BridgeHostError::Message(message)
+				if message == "eval bridge parent session is not bound for this owner"
+		));
+	}
+	#[tokio::test]
+	async fn composite_principals_share_parent_authority_but_isolate_runtime_keys() {
+		let parent = Arc::new(RecordingParent { calls: AtomicUsize::new(0) });
+		let host = SessionBridgeHost::new();
+		host
+			.bind_registry(Arc::new(Registry::new()))
+			.expect("bind registry");
+		let _binding = host
+			.bind_sdk_parent(sf!("session"), parent)
+			.expect("bind parent session");
+		let parent_owner = r#"["session","session"]"#;
+		let child_owner = r#"["session","child"]"#;
+		let parent_eval = Bytes::from_static(b"parent-eval");
+		let child_eval = Bytes::from_static(b"child-eval");
+		host
+			.freeze_runtime(parent_owner, &parent_eval)
+			.expect("freeze parent runtime");
+		host
+			.freeze_runtime(child_owner, &child_eval)
+			.expect("freeze child runtime");
+		let snapshots = host.runtime_snapshots.lock();
+		assert!(snapshots.contains_key(&(Str::new(parent_owner), parent_eval)));
+		assert!(snapshots.contains_key(&(Str::new(child_owner), child_eval.clone())));
+		assert_eq!(snapshots.len(), 2);
+		drop(snapshots);
+		assert_eq!(
+			host
+				.call_for(child_owner, &child_eval, BUDGET, json!({"op":"spent"}), &NoopBridgeProgress,)
+				.await
+				.expect("composite owner routes to bound parent"),
+			json!({"operation":"budget","args":{"op":"spent"}})
+		);
+	}
 
 	#[tokio::test]
 	async fn dropping_parent_binding_revokes_frozen_runtime_routes() {
@@ -1842,11 +1885,10 @@ mod tests {
 		let _binding = host
 			.bind_sdk_parent(sf!("owner"), parent.clone())
 			.expect("bind parent");
-		let capabilities = host.capabilities().expect("bound capabilities");
-		let registration = dispatcher()
-			.register(sf!("owner"), sf!("cell"), capabilities, host, TimeoutHandle::new(None))
-			.expect("register owner");
-		let client = registration.client();
+		let session = Bytes::from_static(b"eval");
+		host
+			.freeze_runtime("owner", &session)
+			.expect("freeze owner runtime");
 		for (name, operation) in [
 			(COMPLETION, "completion"),
 			(AGENT, "agent"),
@@ -1854,8 +1896,14 @@ mod tests {
 			(BUDGET, "budget"),
 		] {
 			assert_eq!(
-				client
-					.call_with_progress(name, json!({ "marker": operation }), &NoopBridgeProgress)
+				host
+					.call_for(
+						"owner",
+						&session,
+						name,
+						json!({ "marker": operation }),
+						&NoopBridgeProgress,
+					)
 					.await
 					.expect("parent call"),
 				json!({ "operation": operation, "args": { "marker": operation } })

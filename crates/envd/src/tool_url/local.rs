@@ -19,6 +19,25 @@ use url::Url;
 
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 const SNIFF_BYTES: usize = 8 * 1024;
+/// Returns the confined scratch root for one stable session identity.
+///
+/// Ordinary ULID/session identifiers remain human-readable. Identities with
+/// path syntax are mapped to a deterministic digest so they cannot escape the
+/// project sessions directory.
+pub(crate) fn session_local_root(sessions_dir: &Path, session_id: &str) -> PathBuf {
+	let component = if !session_id.is_empty()
+		&& session_id
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+	{
+		session_id.to_owned()
+	} else {
+		omp_core::Hash32::sum(session_id.as_bytes())
+			.to_hex()
+			.to_string()
+	};
+	sessions_dir.join(component).join("local")
+}
 
 /// Copies session-local artifacts across a session handoff.
 ///
@@ -32,8 +51,8 @@ pub(crate) fn migrate_session_artifacts(
 	if source_session == destination_session {
 		return Ok(());
 	}
-	let source = sessions_dir.join(source_session).join("local");
-	let destination = sessions_dir.join(destination_session).join("local");
+	let source = session_local_root(sessions_dir, source_session);
+	let destination = session_local_root(sessions_dir, destination_session);
 	match fs::symlink_metadata(&source) {
 		Ok(metadata) if metadata.file_type().is_dir() => {},
 		Ok(_) => return Ok(()),
@@ -364,4 +383,18 @@ fn binary_fault(resource: &str) -> Fault {
 
 fn io_fault(source: io::Error) -> Fault {
 	Fault::Source { message: Str::new(format!("local:// I/O failed: {source}")) }
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn session_roots_are_stable_isolated_and_confined() {
+		let sessions = Path::new("/state/sessions");
+		assert_eq!(session_local_root(sessions, "01TEST"), sessions.join("01TEST").join("local"));
+		assert_ne!(session_local_root(sessions, "first"), session_local_root(sessions, "second"));
+		let hostile = session_local_root(sessions, "../escape");
+		assert!(hostile.starts_with(sessions));
+		assert_eq!(hostile.parent().and_then(Path::parent), Some(sessions));
+	}
 }

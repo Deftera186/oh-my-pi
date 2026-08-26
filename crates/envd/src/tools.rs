@@ -16,6 +16,7 @@ use std::{
 use omp_agent::control;
 use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
 use omp_core::{Duration, ExposeSecret as _, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
+use omp_env::EnvClient;
 use omp_inference::{
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageUnit, UsageWindow, UsageWindowKind,
@@ -89,6 +90,7 @@ use super::{
 	search_backend::SearchBridgeHost,
 	ssh::{HostStore, SshService},
 	tool_debug::DocumentDebugControl,
+	tool_document::SessionReadBlobs,
 	tool_lsp::DocumentLspControl,
 	tool_read_sources::ReadSourceAdapter,
 	tool_search::WorkspaceSearchAdapter,
@@ -116,31 +118,33 @@ tokio::task_local! {
 pub struct RegistryBridges {
 	/// Constructs the command-backed credential executor after the environment
 	/// client is available.
-	pub command_credentials: Option<Arc<dyn CommandCredentialExecutorFactory>>,
+	pub command_credentials:    Option<Arc<dyn CommandCredentialExecutorFactory>>,
 	/// Extra device tools registered verbatim by the composition layer.
-	pub dynamic_tools:       Vec<DynamicTool>,
+	pub dynamic_tools:          Vec<DynamicTool>,
+	/// Host tool factories registered before and bound after client creation.
+	pub dynamic_tool_factories: Vec<Arc<dyn DynamicToolFactory>>,
 	/// Internal-URL resolvers installed into the read resolver table.
-	pub url_resolvers:       Vec<Arc<dyn ContentResolver>>,
+	pub url_resolvers:          Vec<Arc<dyn ContentResolver>>,
 	/// Regime/goal authority backing the `goal` tool.
-	pub goal_control:        Option<Arc<dyn GoalAuthority>>,
+	pub goal_control:           Option<Arc<dyn GoalAuthority>>,
 	/// Auxiliary inference used by workspace search and media tools.
-	pub search:              Option<Arc<dyn SearchInference>>,
+	pub search:                 Option<Arc<dyn SearchInference>>,
 	/// Active model identity captured by edit regression observation.
-	pub edit_model:          Option<Str>,
+	pub edit_model:             Option<Str>,
 	/// Typed small-model completion bridge for validated edit auto-repair.
-	pub edit_repair:         Option<omp_tools::edit::observer::EditRepairClient>,
+	pub edit_repair:            Option<omp_tools::edit::observer::EditRepairClient>,
 	/// Host-resource broker used by composition-owned internal resource URLs.
-	pub host_resources:      Option<Arc<dyn HostResources>>,
+	pub host_resources:         Option<Arc<dyn HostResources>>,
 	/// Background telemetry delivery started once credentials exist.
-	pub telemetry_upload:    Option<Arc<dyn TelemetryUpload>>,
+	pub telemetry_upload:       Option<Arc<dyn TelemetryUpload>>,
 	/// Fallback presenter for interactive `ask` invocations.
 	///
 	/// The daemon defaults to [`omp_tools::ask::HeadlessPresenter`]; an
 	/// interactive composition supplies its own terminal presenter, and a live
 	/// session may rebind one later through `bind_ask_presenter`.
-	pub ask_presenter:       Option<Arc<dyn omp_tools::ask::AskPresenter>>,
+	pub ask_presenter:          Option<Arc<dyn omp_tools::ask::AskPresenter>>,
 	/// Plain data: active project content and native roots.
-	pub content:             ActiveContentInputs,
+	pub content:                ActiveContentInputs,
 }
 
 /// Builds the command credential executor from the live Environment client.
@@ -151,6 +155,14 @@ pub trait CommandCredentialExecutorFactory: Send + Sync + 'static {
 		client: omp_env::EnvClient,
 		cwd: &Path,
 	) -> Arc<dyn omp_inference::auth::command::CommandCredentialExecutor>;
+}
+/// Registers host-owned tools before registry freeze, then binds their live
+/// Environment client after transport composition.
+pub trait DynamicToolFactory: Send + Sync + 'static {
+	/// Registers every declaration-backed tool using factory-retained slots.
+	fn register(&self, registry: &mut Registry) -> Result<(), omp_tool::RegistryError>;
+	/// Binds the live Environment process/data authority exactly once.
+	fn bind(&self, client: EnvClient, root: &Path);
 }
 
 /// One composition-owned device tool and its admission facts.
@@ -1752,6 +1764,7 @@ pub(crate) fn production_registry<
 	documents: &DocumentHost,
 	blobs: &BlobHost,
 	exec: &ExecHost,
+	daemon_process_client: Option<EnvClient>,
 	state_dir: &Path,
 	session_id: &str,
 	github_cache: Arc<GithubCache>,
@@ -1790,6 +1803,7 @@ pub(crate) fn production_registry<
 	let RegistryBridges {
 		command_credentials: _,
 		dynamic_tools,
+		dynamic_tool_factories,
 		url_resolvers,
 		goal_control,
 		search,
@@ -1807,7 +1821,7 @@ pub(crate) fn production_registry<
 	registry.protect_core_claims([
 		"read",
 		"write",
-		"shell",
+		"bash",
 		"edit",
 		"glob",
 		"eval",
@@ -1823,7 +1837,7 @@ pub(crate) fn production_registry<
 	for name in [
 		"read",
 		"edit",
-		"shell",
+		"bash",
 		"grep",
 		"glob",
 		"write",
@@ -1858,6 +1872,9 @@ pub(crate) fn production_registry<
 	}
 	for dynamic in dynamic_tools {
 		dynamic.register(&mut registry)?;
+	}
+	for factory in dynamic_tool_factories {
+		factory.register(&mut registry)?;
 	}
 	let search_bridge = Arc::new(SearchBridgeHost::new(search));
 	let browser_daemon = BrowserDaemon::start(blobs.clone());
@@ -1961,12 +1978,15 @@ pub(crate) fn production_registry<
 		workspace.clone(),
 		document_cache::project_document_cache(state_dir),
 	);
+	let read_blobs = SessionReadBlobs::open(blobs.clone(), session_id).map_err(EnvdError::State)?;
 	let conflicts = Arc::new(ConflictRegistry::default());
+	let local_root =
+		crate::tool_url::local::session_local_root(&state_dir.join("sessions"), session_id);
 	let resolvers = production_url_resolvers(
 		Arc::clone(&conflicts),
 		blobs.store().clone(),
 		session_id,
-		state_dir.join("local"),
+		local_root,
 		workspace.root().to_path_buf(),
 		github_cache,
 		Arc::clone(&github_credentials),
@@ -1990,7 +2010,7 @@ pub(crate) fn production_registry<
 	.revision;
 	let read = omp_tools::read::tool_with_policy(
 		read_sources.clone(),
-		blobs.clone(),
+		read_blobs.clone(),
 		Arc::clone(&resolvers),
 		Arc::clone(&conflicts),
 		omp_tools::read::ReadPolicy {
@@ -2036,26 +2056,31 @@ pub(crate) fn production_registry<
 		blobs.clone(),
 		tool_settings.format_policy,
 		edit_observer.clone(),
+		tool_settings.edit_guard_generated,
 	));
 	let mut replace_edit = Some(omp_tools::edit::replace_tool_with_observer(
 		documents.clone(),
 		tool_settings.format_policy,
 		edit_observer.clone(),
+		tool_settings.edit_guard_generated,
 	));
 	let mut patch_edit = Some(omp_tools::edit::patch_tool_with_observer(
 		documents.clone(),
 		tool_settings.format_policy,
 		edit_observer.clone(),
+		tool_settings.edit_guard_generated,
 	));
 	let mut apply_patch_edit = Some(omp_tools::edit::apply_patch_tool_with_observer(
 		documents.clone(),
 		tool_settings.format_policy,
 		edit_observer.clone(),
+		tool_settings.edit_guard_generated,
 	));
 	let mut sloppy_edit = Some(omp_tools::edit::sloppy_tool_with_observer(
 		documents.clone(),
 		tool_settings.format_policy,
 		edit_observer,
+		tool_settings.edit_guard_generated,
 	));
 	if tool_settings.enabled("edit") {
 		let mut edits = [
@@ -2122,6 +2147,7 @@ pub(crate) fn production_registry<
 		documents.clone(),
 		conflicts,
 		tool_settings.format_policy,
+		tool_settings.edit_guard_generated,
 	);
 	if tool_settings.enabled("write") {
 		registry.register(write, Presentation::Slot, core_claims())?;
@@ -2154,11 +2180,11 @@ pub(crate) fn production_registry<
 		read_sources.clone(),
 		Arc::clone(&resolvers),
 	);
-	let grep = omp_tools::grep::tool(search.clone(), blobs.clone());
+	let grep = omp_tools::grep::tool(search.clone(), read_blobs.clone());
 	if tool_settings.enabled("grep") {
 		registry.register(grep, Presentation::Slot, core_claims())?;
 	}
-	let glob = omp_tools::glob::tool(search, blobs.clone());
+	let glob = omp_tools::glob::tool(search, read_blobs);
 	if tool_settings.enabled("glob") {
 		registry.register(glob, Presentation::Slot, core_claims())?;
 	}
@@ -2187,7 +2213,15 @@ pub(crate) fn production_registry<
 	let eval_host = Arc::new(SessionBridgeHost::new());
 	let mut eval_control = EvalSessionControl::default();
 	if tool_settings.enabled("eval") {
-		match preflight_python_eval(Arc::clone(&eval_host), interrupt_grace, blobs.clone()) {
+		match preflight_python_eval(
+			Arc::clone(&eval_host),
+			interrupt_grace,
+			blobs.clone(),
+			tool_settings
+				.eval_interpreters
+				.get("py")
+				.map(|path| PathBuf::from(path.as_str())),
+		) {
 			Ok(eval_exec) => {
 				let mut task_snapshot = TaskDescriptionSnapshot {
 					helpers: &helper_docs,
@@ -2254,11 +2288,11 @@ pub(crate) fn production_registry<
 			previews.clone(),
 		)));
 	}
-	if tool_settings.enabled("shell") && shell_settings.enabled {
+	if tool_settings.enabled("bash") && shell_settings.enabled {
 		let sibling_tools = registry
 			.live_identities()
 			.filter_map(|(name, _)| {
-				(name != "shell" && registry.presentation(name).ok() == Some(Presentation::Slot))
+				(name != "bash" && registry.presentation(name).ok() == Some(Presentation::Slot))
 					.then(|| name.clone())
 			})
 			.collect::<Arc<[_]>>();
@@ -2284,14 +2318,25 @@ pub(crate) fn production_registry<
 			minimizer_enabled: shell_settings.minimizer.enabled,
 		};
 		let shell = omp_tools::shell::shell_with_snapshot_and_timeout_bounds(
-			ShellExecHost::new(
-				exec.clone(),
-				root_uri.clone(),
-				Arc::clone(&resolvers),
-				shell_settings.clone(),
-				acp_exec,
-				acp_settings.routing != AcpRouting::Never,
-			),
+			if let Some(client) = daemon_process_client {
+				ShellExecHost::new_remote(
+					client,
+					root_uri.clone(),
+					Arc::clone(&resolvers),
+					shell_settings.clone(),
+					acp_exec,
+					acp_settings.routing != AcpRouting::Never,
+				)
+			} else {
+				ShellExecHost::new(
+					exec.clone(),
+					root_uri.clone(),
+					Arc::clone(&resolvers),
+					shell_settings.clone(),
+					acp_exec,
+					acp_settings.routing != AcpRouting::Never,
+				)
+			},
 			shell_timeout_bounds(tool_settings),
 			&snapshot,
 		)
@@ -2502,9 +2547,10 @@ fn preflight_python_eval(
 	host: Arc<SessionBridgeHost>,
 	interrupt_grace: Duration,
 	blobs: BlobHost,
+	configured_interpreter: Option<PathBuf>,
 ) -> Result<ProcessEvalExec, EnvdError> {
 	python_engine()?;
-	ProcessEvalExec::production(host, interrupt_grace, blobs)
+	ProcessEvalExec::production(host, interrupt_grace, blobs, configured_interpreter)
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))
 }
 

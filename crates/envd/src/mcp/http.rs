@@ -11,7 +11,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
-use futures::StreamExt as _;
+use futures::{Stream, StreamExt as _};
 use http::{
 	HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
 	header::{ACCEPT, CONTENT_TYPE},
@@ -49,15 +49,109 @@ pub struct HttpRequest {
 	pub body:    Bytes,
 }
 
-/// Bounded HTTP response used by MCP transports.
-#[derive(Clone, Debug)]
+/// Incremental bounded HTTP response used by MCP transports.
 pub struct HttpResponse {
 	/// HTTP status.
 	pub status:  StatusCode,
 	/// Response headers.
 	pub headers: HeaderMap,
-	/// Complete bounded body.
-	pub body:    Bytes,
+	/// Incremental response body.
+	pub body:    HttpBody,
+}
+
+impl std::fmt::Debug for HttpResponse {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("HttpResponse")
+			.field("status", &self.status)
+			.field("headers", &self.headers)
+			.field("body", &"HttpBody(..)")
+			.finish()
+	}
+}
+
+/// Owned streaming HTTP body with bounded incremental framing.
+pub struct HttpBody {
+	stream: Pin<Box<dyn Stream<Item = Result<Bytes, HttpExchangeError>> + Send>>,
+	buffer: BytesMut,
+	eof:    bool,
+}
+
+impl HttpBody {
+	/// Creates an incremental body for injected exchanges.
+	pub(crate) fn from_stream(
+		stream: impl Stream<Item = Result<Bytes, HttpExchangeError>> + Send + 'static,
+	) -> Self {
+		Self { stream: Box::pin(stream), buffer: BytesMut::new(), eof: false }
+	}
+
+	/// Creates a finite body for injected exchanges and tests.
+	#[cfg(test)]
+	pub(crate) fn from_bytes(bytes: impl Into<Bytes>) -> Self {
+		let bytes = bytes.into();
+		Self::from_stream(futures::stream::once(async move { Ok(bytes) }))
+	}
+
+	async fn read_chunk(
+		&mut self,
+		cancellation: &CancellationToken,
+	) -> Result<bool, TransportFailure> {
+		if self.eof {
+			return Ok(false);
+		}
+		let next = tokio::select! {
+			() = cancellation.cancelled() => return Err(TransportFailure::Cancelled),
+			next = self.stream.next() => next,
+		};
+		match next {
+			Some(Ok(chunk)) => {
+				if self.buffer.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+					return Err(TransportFailure::FrameTooLarge);
+				}
+				self.buffer.extend_from_slice(&chunk);
+				Ok(true)
+			},
+			Some(Err(HttpExchangeError::Http(source))) => Err(TransportFailure::Http(source)),
+			Some(Err(HttpExchangeError::ResponseTooLarge)) => Err(TransportFailure::FrameTooLarge),
+			None => {
+				self.eof = true;
+				Ok(false)
+			},
+		}
+	}
+
+	/// Buffers one finite JSON response under the frame bound.
+	pub(crate) async fn read_to_end(
+		&mut self,
+		cancellation: &CancellationToken,
+	) -> Result<Bytes, TransportFailure> {
+		while self.read_chunk(cancellation).await? {}
+		Ok(self.buffer.split().freeze())
+	}
+
+	/// Reads exactly one complete SSE event while retaining later chunks.
+	pub(crate) async fn next_sse_event(
+		&mut self,
+		cancellation: &CancellationToken,
+	) -> Result<Option<SseEvent>, TransportFailure> {
+		loop {
+			if let Some(end) = sse_frame_end(&self.buffer) {
+				let frame = self.buffer.split_to(end).freeze();
+				if let Some(event) = parse_sse_events(&frame)?.into_iter().next() {
+					return Ok(Some(event));
+				}
+				continue;
+			}
+			if self.eof {
+				if self.buffer.is_empty() {
+					return Ok(None);
+				}
+				let frame = self.buffer.split().freeze();
+				return Ok(parse_sse_events(&frame)?.into_iter().next());
+			}
+			self.read_chunk(cancellation).await?;
+		}
+	}
 }
 
 /// Boxed future at the cold HTTP exchange boundary.
@@ -110,22 +204,10 @@ impl HttpExchange for WreqExchange {
 			}
 			let status = response.status();
 			let headers = response.headers().clone();
-			let mut body = BytesMut::with_capacity(
-				response
-					.content_length()
-					.and_then(|value| usize::try_from(value).ok())
-					.unwrap_or_default()
-					.min(MAX_RESPONSE_BYTES),
-			);
-			let mut stream = response.bytes_stream();
-			while let Some(chunk) = stream.next().await {
-				let chunk = chunk.map_err(HttpExchangeError::Http)?;
-				if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-					return Err(HttpExchangeError::ResponseTooLarge);
-				}
-				body.extend_from_slice(&chunk);
-			}
-			Ok(HttpResponse { status, headers, body: body.freeze() })
+			let stream = response
+				.bytes_stream()
+				.map(|chunk| chunk.map_err(HttpExchangeError::Http));
+			Ok(HttpResponse { status, headers, body: HttpBody::from_stream(stream) })
 		})
 	}
 }
@@ -147,6 +229,11 @@ pub trait RefreshableHeaders: Send + Sync {
 	fn current(&self) -> HeaderMap;
 	/// Refreshes once after a 401/403 challenge.
 	fn refresh(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+	/// Whether the retained grant is definitively unusable and interactive
+	/// authorization may replace it.
+	fn should_reauthorize(&self) -> bool {
+		false
+	}
 }
 
 /// Streamable HTTP transport configuration.
@@ -185,6 +272,7 @@ pub struct StreamableHttpTransport {
 	session_id:       Mutex<Option<Str>>,
 	protocol_version: Mutex<Option<Str>>,
 	resume:           Mutex<ResumeState>,
+	sse_body:         tokio::sync::Mutex<Option<HttpBody>>,
 	incoming_tx:      flume::Sender<IncomingMessage>,
 	incoming_rx:      Receiver<IncomingMessage>,
 	closed:           atomic::AtomicBool,
@@ -206,6 +294,7 @@ impl StreamableHttpTransport {
 			session_id: Mutex::new(None),
 			protocol_version: Mutex::new(None),
 			resume: Mutex::new(ResumeState::default()),
+			sse_body: tokio::sync::Mutex::new(None),
 			incoming_tx,
 			incoming_rx,
 			closed: atomic::AtomicBool::new(false),
@@ -321,7 +410,7 @@ impl StreamableHttpTransport {
 			serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
 				.map(Bytes::from)
 				.map_err(|source| TransportError::pre_dispatch(TransportFailure::Json(source)))?;
-		let response = self
+		let mut response = self
 			.exchange_with_refresh(
 				Method::POST,
 				body,
@@ -342,7 +431,12 @@ impl StreamableHttpTransport {
 				.response_from_sse(response.body, &id, &cancellation)
 				.await?
 		} else {
-			correlated_json(&response.body, &id)?
+			let body = response
+				.body
+				.read_to_end(&cancellation)
+				.await
+				.map_err(|cause| TransportError::effects_unknown(cause))?;
+			correlated_json(&body, &id)?
 		};
 		Ok(TransportResponse { id, result, dispatch: DispatchState::Responded })
 	}
@@ -358,13 +452,19 @@ impl StreamableHttpTransport {
 
 	async fn response_from_sse(
 		&self,
-		mut body: Bytes,
+		mut body: HttpBody,
 		expected: &RequestId,
 		cancellation: &CancellationToken,
 	) -> Result<Value, TransportError> {
 		loop {
-			if let Some(result) = self.consume_sse(&body, Some(expected))? {
-				return Ok(result);
+			while let Some(event) = body
+				.next_sse_event(cancellation)
+				.await
+				.map_err(|cause| TransportError::effects_unknown(cause))?
+			{
+				if let Some(result) = self.consume_sse_event(event, Some(expected))? {
+					return Ok(result);
+				}
 			}
 			let resume = self.resume.lock().clone();
 			let Some(last_event_id) = resume.last_event_id else {
@@ -389,54 +489,50 @@ impl StreamableHttpTransport {
 		}
 	}
 
-	fn consume_sse(
+	fn consume_sse_event(
 		&self,
-		body: &[u8],
+		event: SseEvent,
 		expected: Option<&RequestId>,
 	) -> Result<Option<Value>, TransportError> {
-		let events =
-			parse_sse_events(body).map_err(|cause| TransportError::effects_unknown(cause))?;
+		{
+			let mut resume = self.resume.lock();
+			if let Some(id) = event.id {
+				resume.last_event_id = if id.is_empty() { None } else { Some(id) };
+			}
+			if let Some(retry) = event.retry {
+				resume.retry = retry;
+			}
+		}
+		if event.data.is_empty() {
+			return Ok(None);
+		}
+		let value: Value = serde_json::from_str(&event.data)
+			.map_err(|source| TransportError::effects_unknown(TransportFailure::Json(source)))?;
 		let mut response = None;
-		for event in events {
+		for message in value
+			.as_array()
+			.map_or_else(|| vec![value.clone()], Clone::clone)
+		{
+			if expected.is_some_and(|id| {
+				message
+					.get("id")
+					.and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+					.as_ref() == Some(id)
+			}) && (message.get("result").is_some() || message.get("error").is_some())
 			{
-				let mut resume = self.resume.lock();
-				if let Some(id) = event.id {
-					resume.last_event_id = if id.is_empty() { None } else { Some(id) };
-				}
-				if let Some(retry) = event.retry {
-					resume.retry = retry;
-				}
-			}
-			if event.data.is_empty() {
-				continue;
-			}
-			let value: Value = serde_json::from_str(&event.data)
-				.map_err(|source| TransportError::effects_unknown(TransportFailure::Json(source)))?;
-			for message in value
-				.as_array()
-				.map_or_else(|| vec![value.clone()], Clone::clone)
-			{
-				if expected.is_some_and(|id| {
-					message
-						.get("id")
-						.and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
-						.as_ref() == Some(id)
-				}) && (message.get("result").is_some() || message.get("error").is_some())
+				if let Some(code) = message
+					.get("error")
+					.and_then(|error| error.get("code"))
+					.and_then(Value::as_i64)
 				{
-					if let Some(code) = message
-						.get("error")
-						.and_then(|error| error.get("code"))
-						.and_then(Value::as_i64)
-					{
-						return Err(TransportError {
-							dispatch: DispatchState::Responded,
-							cause:    TransportFailure::JsonRpc { code },
-						});
-					}
-					response = Some(message.get("result").cloned().unwrap_or(Value::Null));
-				} else {
-					dispatch_incoming(&self.incoming_tx, &message);
+					return Err(TransportError {
+						dispatch: DispatchState::Responded,
+						cause:    TransportFailure::JsonRpc { code },
+					});
 				}
+				response = Some(message.get("result").cloned().unwrap_or(Value::Null));
+			} else {
+				dispatch_incoming(&self.incoming_tx, &message);
 			}
 		}
 		Ok(response)
@@ -450,30 +546,56 @@ impl StreamableHttpTransport {
 			if let Ok(message) = self.incoming_rx.try_recv() {
 				return Ok(message);
 			}
-			let resume = self.resume.lock().clone();
-			if resume.last_event_id.is_some() {
-				tokio::select! { () = cancellation.cancelled() => return Err(TransportError::pre_dispatch(TransportFailure::Cancelled)), () = tokio::time::sleep(resume.retry) => {} }
+			let mut body = self.sse_body.lock().await;
+			if body.is_none() {
+				let resume = self.resume.lock().clone();
+				if resume.last_event_id.is_some() {
+					tokio::select! {
+						() = cancellation.cancelled() => {
+							return Err(TransportError::pre_dispatch(TransportFailure::Cancelled));
+						},
+						() = tokio::time::sleep(resume.retry) => {},
+					}
+				}
+				let mut headers = self.generated_headers("text/event-stream");
+				if let Some(id) = resume.last_event_id {
+					headers.insert(
+						HeaderName::from_static("last-event-id"),
+						HeaderValue::from_str(&id)
+							.map_err(|_| TransportError::pre_dispatch(TransportFailure::SseProtocol))?,
+					);
+				}
+				let response = self
+					.exchange_with_refresh(Method::GET, Bytes::new(), headers, &cancellation, false)
+					.await?;
+				if response.status == StatusCode::METHOD_NOT_ALLOWED {
+					return Err(TransportError::pre_dispatch(TransportFailure::NotConnected));
+				}
+				if !response.status.is_success() || !is_sse(&response.headers) {
+					return Err(TransportError::pre_dispatch(TransportFailure::HttpStatus {
+						status: response.status.as_u16(),
+					}));
+				}
+				*body = Some(response.body);
 			}
-			let mut headers = self.generated_headers("text/event-stream");
-			if let Some(id) = resume.last_event_id {
-				headers.insert(
-					HeaderName::from_static("last-event-id"),
-					HeaderValue::from_str(&id)
-						.map_err(|_| TransportError::pre_dispatch(TransportFailure::SseProtocol))?,
-				);
+			let event = body
+				.as_mut()
+				.expect("SSE body installed")
+				.next_sse_event(&cancellation)
+				.await
+				.map_err(|cause| TransportError::pre_dispatch(cause))?;
+			match event {
+				Some(event) => {
+					self.consume_sse_event(event, None)?;
+					drop(body);
+					if let Ok(message) = self.incoming_rx.try_recv() {
+						return Ok(message);
+					}
+				},
+				None => {
+					*body = None;
+				},
 			}
-			let response = self
-				.exchange_with_refresh(Method::GET, Bytes::new(), headers, &cancellation, false)
-				.await?;
-			if response.status == StatusCode::METHOD_NOT_ALLOWED {
-				return Err(TransportError::pre_dispatch(TransportFailure::NotConnected));
-			}
-			if !response.status.is_success() || !is_sse(&response.headers) {
-				return Err(TransportError::pre_dispatch(TransportFailure::HttpStatus {
-					status: response.status.as_u16(),
-				}));
-			}
-			self.consume_sse(&response.body, None)?;
 		}
 	}
 }
@@ -489,7 +611,15 @@ impl McpTransport for StreamableHttpTransport {
 		params: Value,
 		cancellation: CancellationToken,
 	) -> TransportFuture<'a, Result<TransportResponse, TransportError>> {
-		Box::pin(self.request_inner(method, params, cancellation))
+		Box::pin(async move {
+			let operation = self.request_inner(method, params, cancellation);
+			match self.config.timeout {
+				Some(timeout) => tokio::time::timeout(timeout, operation)
+					.await
+					.map_err(|_| TransportError::effects_unknown(TransportFailure::TimedOut))?,
+				None => operation.await,
+			}
+		})
 	}
 
 	fn notify<'a>(
@@ -512,9 +642,6 @@ impl McpTransport for StreamableHttpTransport {
 				)
 				.await?;
 			if response.status.is_success() || response.status == StatusCode::ACCEPTED {
-				if is_sse(&response.headers) {
-					self.consume_sse(&response.body, None)?;
-				}
 				Ok(DispatchState::Dispatched)
 			} else {
 				Err(TransportError {
@@ -640,6 +767,22 @@ fn dispatch_incoming(sender: &flume::Sender<IncomingMessage>, message: &Value) {
 	let _ = sender.try_send(incoming);
 }
 
+fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
+	let lf = buffer
+		.windows(2)
+		.position(|window| window == b"\n\n")
+		.map(|position| position + 2);
+	let crlf = buffer
+		.windows(4)
+		.position(|window| window == b"\r\n\r\n")
+		.map(|position| position + 4);
+	match (lf, crlf) {
+		(Some(left), Some(right)) => Some(left.min(right)),
+		(Some(end), None) | (None, Some(end)) => Some(end),
+		(None, None) => None,
+	}
+}
+
 #[derive(Debug)]
 pub(crate) struct SseEvent {
 	pub event: Option<Str>,
@@ -735,7 +878,57 @@ mod tests {
 			headers
 				.insert(HeaderName::from_static("mcp-session-id"), HeaderValue::from_static(session));
 		}
-		HttpResponse { status, headers, body: body.into() }
+		HttpResponse { status, headers, body: HttpBody::from_bytes(body) }
+	}
+
+	#[tokio::test]
+	async fn long_lived_get_dispatches_first_sse_notification_before_eof() {
+		struct OpenGet;
+		impl HttpExchange for OpenGet {
+			fn execute(&self, _: HttpRequest) -> HttpFuture<'_> {
+				Box::pin(async {
+					let stream = futures::stream::once(async {
+						Ok(Bytes::from_static(
+							b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}\n\n",
+						))
+					})
+					.chain(futures::stream::pending::<Result<Bytes, HttpExchangeError>>());
+					Ok(HttpResponse {
+						status:  StatusCode::OK,
+						headers: HeaderMap::from_iter([(
+							CONTENT_TYPE,
+							HeaderValue::from_static("text/event-stream"),
+						)]),
+						body:    HttpBody::from_stream(stream),
+					})
+				})
+			}
+		}
+		let transport = StreamableHttpTransport::new(
+			StreamableHttpConfig {
+				url:               Url::parse("https://example.test/mcp").expect("url"),
+				headers:           HeaderMap::new(),
+				origin_locked:     true,
+				timeout:           Some(Duration::from_secs(1)),
+				request_id_format: RequestIdFormat::Number,
+				auth:              None,
+			},
+			Arc::new(OpenGet),
+		)
+		.expect("transport");
+
+		let message = tokio::time::timeout(
+			Duration::from_millis(100),
+			transport.next_message(CancellationToken::new()),
+		)
+		.await
+		.expect("notification before EOF")
+		.expect("message");
+		assert!(matches!(
+			message,
+			IncomingMessage::Notification { method, .. }
+				if method == "notifications/tools/list_changed"
+		));
 	}
 
 	#[tokio::test]

@@ -17,7 +17,7 @@ use omp_tool::{
 };
 use omp_tools::read::{
 	self, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord, SourceKind,
-	SourceStat, markit,
+	SourceStat, StoredArtifact, markit,
 	web::types::{HttpClient, HttpRequest, HttpResponse, WebError},
 };
 use parking_lot::Mutex;
@@ -140,6 +140,14 @@ impl ReadBlobs for NoBlobs {
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
 		ready(Err(Fault::source("small document fixtures must not spill to blobs")))
 	}
+
+	fn store_artifact(
+		&self,
+		_bytes: Bytes,
+		_media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, Fault>> + Send + '_ {
+		ready(Err(Fault::source("small document fixtures must not spill to artifacts")))
+	}
 }
 
 #[derive(Clone, Default)]
@@ -155,6 +163,18 @@ impl ReadBlobs for RecordingBlobs {
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
 		self.stored.lock().push((bytes.clone(), media_type.clone()));
 		ready(Ok(BlobRef { hash: sf!("document-blob"), media_type, byte_len: bytes.len() as u64 }))
+	}
+
+	fn store_artifact(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, Fault>> + Send + '_ {
+		self.stored.lock().push((bytes.clone(), media_type.clone()));
+		ready(Ok(StoredArtifact {
+			blob: BlobRef { hash: sf!("document-blob"), media_type, byte_len: bytes.len() as u64 },
+			uri:  sf!("artifact://1"),
+		}))
 	}
 }
 
@@ -315,7 +335,7 @@ async fn converted_document_truncation_spills_the_complete_numbered_markdown() {
 		read_document_tool_text_with_blobs("large.docx", "large.docx", bytes, blobs.clone()).await;
 	assert!(
 		output
-			.ends_with(&format!(" of {total_lines} lines shown; full output in blob document-blob]")),
+			.ends_with(&format!(" of {total_lines} lines shown; read artifact://1 for full output]")),
 		"{output}"
 	);
 	let visible = output

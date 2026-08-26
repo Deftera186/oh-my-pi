@@ -298,7 +298,7 @@ async fn domains_delegate_to_native_owners_with_generation_and_audit_fences() {
 		)
 		.await
 		.expect("native parser owns policy.parse");
-	assert_eq!(parsed["rev"], "bashir@3");
+	assert_eq!(parsed["rev"], "omp.policy.v1");
 	let capabilities = policy
 		.request(context.clone(), sf!("omp.policy.capabilities"), serde_json::Map::new())
 		.await

@@ -1,13 +1,6 @@
 //! Pi-compatible reads of local and special resources.
 
-use std::{
-	borrow::Cow,
-	collections::HashMap,
-	future::Future,
-	path::Path,
-	str,
-	sync::Arc,
-};
+use std::{borrow::Cow, collections::HashMap, future::Future, path::Path, str, sync::Arc};
 
 use async_stream::stream;
 use bytes::Bytes;
@@ -71,7 +64,7 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.
 - Directory → deterministic alphabetical depth-limited entries; directories end in / and listings are edit-locked.
 - SQLite (`.sqlite`, `.sqlite3`, `.db`, `.db3`): `file.db` (tables), `file.db:table` (schema+rows), `file.db:table:key` (by PK), `?limit=`/`?where=`/`?q=SELECT`.
-- Archives (`.tar`, `.tar.gz`, `.tgz`, `.zip`, `.asar`, plus ZIP-based `.jar`/`.war`/`.ear`/`.apk`): `archive.ext:path/inside/archive` reads a member.
+- Archives (`.zip` family incl. `.jar`/`.apk`/`.whl`, `.tar` incl. `.tar.{gz,bz2,xz,zst}`, `.rar`, `.7z`, `.iso`, `.cab`, `.deb`/`.rpm`/`.cpio`/`.ar`, `.lzh`/`.arj`, `.asar`; single-stream `.gz`/`.bz2`/`.xz`/`.zst`): `archive.ext:path/inside/archive` reads a member.
 - Documents → extracted text. Notebooks → editable cells. Images → decoded inline. SVGs read as text unless `:img` is specified. `:raw` bypasses converters.
 - URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
 - Internal resources enforce owner byte/entry ceilings; path-only resolution returns metadata without content. Binary/oversized resources return selector or materialized-path guidance rather than inline bytes.
@@ -269,6 +262,21 @@ pub trait ReadBlobs: Send + Sync + 'static {
 		bytes: Bytes,
 		media_type: Str,
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_;
+	/// Stores bytes and adopts them into the active session artifact catalog.
+	fn store_artifact(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, Fault>> + Send + '_;
+}
+/// Blob storage plus the resolver-valid session artifact address adopted for
+/// it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StoredArtifact {
+	/// Content-addressed bytes backing the artifact.
+	pub blob: BlobRef,
+	/// Resolver-valid `artifact://` address in the active session.
+	pub uri:  Str,
 }
 
 /// One deterministic read result part.
@@ -293,7 +301,10 @@ pub enum PayloadPart {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
 	/// Ordered text and blob parts.
-	pub parts: Vec<PayloadPart>,
+	pub parts:     Vec<PayloadPart>,
+	/// Complete text spills referenced by truncation footers.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub artifacts: Vec<StoredArtifact>,
 }
 
 /// Typed read failure with an exact model-facing message.
@@ -845,19 +856,6 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						svg_gzip_path(Path::new(uri.resource)).ok_or_else(svg_image_selector_fault)?;
 					return self.read_svg_image(bytes.into_bytes(), gzip).await;
 				}
-				if uri.scheme == resolver::Scheme::Artifact
-					&& uri.selector.is_raw()
-					&& bytes.len() > SNAPSHOT_MAX_BYTES
-				{
-					return Err(Fault::Invalid {
-						message: sf!(
-							"artifact://{} is too large for a raw inline read ({} bytes); materialize it \
-							 by path or select a bounded range",
-							uri.resource,
-							bytes.len()
-						),
-					});
-				}
 				if uri.scheme == resolver::Scheme::Local
 					&& let Some(loaded) = image::process_image_with_policy(
 						bytes.clone().into_bytes(),
@@ -1015,7 +1013,9 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		let suffix_from = recovered_from;
 
 		if stat.kind == SourceKind::Symlink {
+			let authored_display_path = stat.display_path.clone();
 			stat = self.sources.stat(stat.canonical_path.clone()).await?;
+			stat.display_path = authored_display_path;
 		}
 		if stat.kind == SourceKind::Directory {
 			if matches!(parsed, selector::ParsedSelector::Image) {
@@ -1089,7 +1089,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				.extension()
 				.is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
 		{
-			let lease = self.sources.open(stat.canonical_path.clone()).await?;
+			let lease = self.sources.open(stat.display_path.clone()).await?;
 			let source_bytes = lease.read_all().await?;
 			let rendered = notebook::render(&source_bytes, &stat.display_path)
 				.map_err(|error| Fault::Source { message: Str::new(error.message()) })?;
@@ -1136,7 +1136,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			}
 		}
 
-		let lease = self.sources.open(stat.canonical_path.clone()).await?;
+		let lease = self.sources.open(stat.display_path.clone()).await?;
 		let bytes = lease.read_all().await?;
 		// Sniff the leading bytes before deriving any text view: a binary file
 		// (font, object, archive, packed blob) is refused for one read and no
@@ -1507,31 +1507,36 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 
 	async fn finalize_text_parts(&self, parts: Vec<PayloadPart>) -> Result<Payload, Fault> {
 		let mut finalized = Vec::with_capacity(parts.len());
+		let mut artifacts = Vec::new();
 		for part in parts {
 			match part {
 				PayloadPart::Text { text } => {
-					finalized.push(PayloadPart::Text { text: self.truncate_text(text).await? });
+					let (text, artifact) = self.truncate_text(text).await?;
+					finalized.push(PayloadPart::Text { text });
+					artifacts.extend(artifact);
 				},
 				PayloadPart::Blob { blob, alt } => {
-					finalized.push(PayloadPart::Blob { blob, alt: self.truncate_text(alt).await? });
+					let (alt, artifact) = self.truncate_text(alt).await?;
+					finalized.push(PayloadPart::Blob { blob, alt });
+					artifacts.extend(artifact);
 				},
 			}
 		}
-		Ok(Payload { parts: finalized })
+		Ok(Payload { parts: finalized, artifacts })
 	}
 
-	async fn truncate_text(&self, text: Str) -> Result<Str, Fault> {
+	async fn truncate_text(&self, text: Str) -> Result<(Str, Option<StoredArtifact>), Fault> {
 		let truncated = truncate_head(&text, TruncationOptions::default());
 		if !truncated.truncated {
-			return Ok(text);
+			return Ok((text, None));
 		}
-		let blob = self
+		let artifact = self
 			.blobs
-			.store(Bytes::copy_from_slice(text.as_bytes()), sf!("text/plain; charset=utf-8"))
+			.store_artifact(Bytes::copy_from_slice(text.as_bytes()), sf!("text/plain; charset=utf-8"))
 			.await?;
 		let mut visible = truncated.content.to_owned();
-		append_blob_truncation_notice(&mut visible, &truncated, &blob.hash);
-		Ok(Str::new(visible))
+		append_blob_truncation_notice(&mut visible, &truncated, &artifact.uri);
+		Ok((Str::new(visible), Some(artifact)))
 	}
 }
 fn format_read_projection<'a>(

@@ -23,6 +23,7 @@ omp-ast = { workspace = true }
 # D2 world boundary: client API only. CI rejects docserver, shell-engine, and walker.
 omp-env = { workspace = true }
 omp-inference = { workspace = true }
+omp-memory = { workspace = true }
 omp-slopjson = { workspace = true }
 omp-secrets = { workspace = true }
 omp-snapcompact = { workspace = true }
@@ -51,6 +52,7 @@ tower = { workspace = true }
 insta = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true

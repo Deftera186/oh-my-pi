@@ -4,16 +4,13 @@ use std::{
 	fmt,
 	future::Future,
 	pin::Pin,
-	sync::Arc,
+	sync::{Arc, atomic},
 	time::{SystemTime, UNIX_EPOCH},
 };
 
 use http::HeaderMap;
-use omp_core::{SecretString, Str};
-use omp_inference::{
-	auth::{self, CredentialLease, HeaderPlacement},
-	id::PrincipalId,
-};
+use omp_core::{ExposeSecret as _, SecretString, Str};
+use omp_inference::id::PrincipalId;
 use omp_oauth::{
 	AuthChallenge, AuthorizationRequest, CallbackBindError, CallbackError, ClientConfiguration,
 	ClientRegistrationError, CompleteAuthorizationError, LoopbackCallback, MetadataError,
@@ -26,19 +23,23 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use zeroize::Zeroizing;
 
 use super::{
-	auth_authority::{AuthAffinity, CombinedAuthAuthority},
+	auth_authority::{
+		AuthAffinity, CombinedAuthAuthority, McpOAuthStoreError, StoredMcpOAuthCredential,
+	},
 	config::{McpServerConfig, OauthConfig},
 	http::RefreshableHeaders,
 };
 
-/// Live Streamable-HTTP header adapter backed by sealed credential leases.
+/// Live Streamable-HTTP header adapter backed by one encrypted renewable
+/// credential record.
 pub struct AuthorityHeaders {
-	flow:    Arc<McpOAuth>,
-	state:   Mutex<OAuthCredentialState>,
-	lease:   RwLock<CredentialLease>,
-	headers: RwLock<HeaderMap>,
+	flow:               Arc<McpOAuth>,
+	state:              Mutex<OAuthCredentialState>,
+	headers:            RwLock<HeaderMap>,
+	reauthorize_needed: atomic::AtomicBool,
 }
 
 impl AuthorityHeaders {
@@ -48,16 +49,12 @@ impl AuthorityHeaders {
 		flow: Arc<McpOAuth>,
 		state: OAuthCredentialState,
 	) -> Result<Arc<Self>, OAuthFlowError> {
-		let lease = flow
-			.authority
-			.mcp_lease(&state.affinity, SystemTime::now())
-			.await?;
-		let headers = bearer_headers(&lease)?;
+		let headers = bearer_headers(&state.access_token)?;
 		Ok(Arc::new(Self {
 			flow,
 			state: Mutex::new(state),
-			lease: RwLock::new(lease),
 			headers: RwLock::new(headers),
+			reauthorize_needed: atomic::AtomicBool::new(false),
 		}))
 	}
 }
@@ -71,32 +68,43 @@ impl RefreshableHeaders for AuthorityHeaders {
 		Box::pin(async move {
 			let mut state = self.state.lock().await;
 			if let Err(error) = self.flow.refresh(&mut state).await {
-				if error.class() == OAuthFailureClass::Definitive {
+				if error.class() == OAuthFailureClass::Definitive
+					|| matches!(error, OAuthFlowError::NotRefreshable)
+				{
+					let _ = self.flow.authority.delete_mcp(&state.affinity);
 					state.refresh_token.take();
+					self
+						.reauthorize_needed
+						.store(true, atomic::Ordering::Release);
 				}
 				return false;
 			}
-			let Ok(lease) = self
-				.flow
-				.authority
-				.mcp_lease(&state.affinity, SystemTime::now())
-				.await
-			else {
+			let Ok(headers) = bearer_headers(&state.access_token) else {
 				return false;
 			};
-			let Ok(headers) = bearer_headers(&lease) else {
-				return false;
-			};
-			*self.lease.write() = lease;
 			*self.headers.write() = headers;
+			self
+				.reauthorize_needed
+				.store(false, atomic::Ordering::Release);
 			true
 		})
 	}
+
+	fn should_reauthorize(&self) -> bool {
+		self.reauthorize_needed.load(atomic::Ordering::Acquire)
+	}
 }
 
-fn bearer_headers(lease: &CredentialLease) -> Result<HeaderMap, OAuthFlowError> {
+fn bearer_headers(token: &SecretString) -> Result<HeaderMap, OAuthFlowError> {
+	let mut material =
+		Zeroizing::new(String::with_capacity("Bearer ".len() + token.expose_secret().len()));
+	material.push_str("Bearer ");
+	material.push_str(token.expose_secret());
+	let mut value =
+		http::HeaderValue::from_str(&material).map_err(|_| OAuthFlowError::InvalidBearerToken)?;
+	value.set_sensitive(true);
 	let mut headers = HeaderMap::new();
-	lease.apply_header(&HeaderPlacement::bearer(), &mut headers)?;
+	headers.insert(http::header::AUTHORIZATION, value);
 	Ok(headers)
 }
 
@@ -133,8 +141,12 @@ impl BrowserLauncher for SystemBrowserLauncher {
 /// Retained OAuth protocol state. Secret fields remain authority-owned and are
 /// never serialized into MCP definitions, UI, or journal events.
 pub struct OAuthCredentialState {
-	/// Opaque affinity used for access-token leases.
+	/// Opaque affinity used for encrypted persistence.
 	pub affinity:       AuthAffinity,
+	/// Current access token.
+	pub access_token:   SecretString,
+	/// Absolute access-token expiration.
+	pub expires_at_ms:  Option<u64>,
 	/// Token endpoint.
 	pub token_endpoint: Str,
 	/// Client identity.
@@ -154,6 +166,8 @@ impl fmt::Debug for OAuthCredentialState {
 		formatter
 			.debug_struct("OAuthCredentialState")
 			.field("affinity", &self.affinity)
+			.field("access_token", &"[REDACTED]")
+			.field("expires_at_ms", &self.expires_at_ms)
 			.field("token_endpoint", &self.token_endpoint)
 			.field("client_id", &self.client_id)
 			.field("client_secret", &self.client_secret.as_ref().map(|_| "[REDACTED]"))
@@ -208,28 +222,32 @@ impl McpOAuth {
 		server: &str,
 		config: &McpServerConfig,
 	) -> Result<Arc<dyn RefreshableHeaders>, OAuthFlowError> {
-		let auth = config
+		let _auth = config
 			.auth
 			.as_ref()
 			.ok_or(OAuthFlowError::MissingAuthorizationServer)?;
+		let affinity =
+			CombinedAuthAuthority::mcp_affinity(profile, server, PrincipalId::from(profile));
+		let persisted = self
+			.authority
+			.load_mcp_oauth(&affinity)?
+			.ok_or(OAuthFlowError::CredentialUnavailable)?;
 		let state = OAuthCredentialState {
-			affinity:       CombinedAuthAuthority::mcp_affinity(
-				profile,
-				server,
-				PrincipalId::from(profile),
-			),
-			token_endpoint: auth.token_url.clone().unwrap_or_default(),
-			client_id:      auth.client_id.clone().unwrap_or_default(),
-			client_secret:  None,
-			resource:       auth.resource.clone(),
-			refresh_token:  None,
-			generation:     0,
+			affinity,
+			access_token: persisted.access_token,
+			expires_at_ms: persisted.expires_at_ms,
+			token_endpoint: persisted.token_endpoint,
+			client_id: persisted.client_id,
+			client_secret: persisted.client_secret,
+			resource: persisted.resource,
+			refresh_token: persisted.refresh_token,
+			generation: persisted.generation,
 		};
 		Ok(AuthorityHeaders::new(Arc::clone(self), state).await?)
 	}
 
 	/// Runs discovery, explicit-client/DCR selection, browser authorization,
-	/// callback validation, token exchange, and encrypted access-token rotation.
+	/// callback validation, token exchange, and atomic encrypted grant rotation.
 	pub async fn authorize(
 		&self,
 		attempt: OAuthAttempt<'_>,
@@ -374,6 +392,7 @@ impl McpOAuth {
 			resource.map(Str::from),
 			grant,
 			None,
+			None,
 		)
 	}
 
@@ -386,6 +405,7 @@ impl McpOAuth {
 			.as_ref()
 			.cloned()
 			.ok_or(OAuthFlowError::NotRefreshable)?;
+		let previous_refresh = refresh.clone();
 		let grant = refresh_token(
 			self.http.as_ref(),
 			&TokenRequest {
@@ -404,6 +424,7 @@ impl McpOAuth {
 			state.client_secret.clone(),
 			state.resource.clone(),
 			grant,
+			Some(previous_refresh),
 			Some(state.generation),
 		)?;
 		*state = replacement;
@@ -418,10 +439,12 @@ impl McpOAuth {
 		client_secret: Option<SecretString>,
 		resource: Option<Str>,
 		grant: TokenGrant,
+		previous_refresh_token: Option<SecretString>,
 		expected_generation: Option<u64>,
 	) -> Result<OAuthCredentialState, OAuthFlowError> {
 		let expires_in = grant.expires_in();
 		let (access, refresh_token, token_type, _) = grant.into_parts();
+		let refresh_token = refresh_token.or(previous_refresh_token);
 		if !token_type.eq_ignore_ascii_case("bearer") {
 			return Err(OAuthFlowError::UnsupportedTokenType);
 		}
@@ -431,22 +454,33 @@ impl McpOAuth {
 			.as_millis() as u64;
 		let expires_at_ms =
 			expires_in.map(|duration| now_ms.saturating_add(duration.as_millis() as u64));
-		let generation = self.authority.persist_mcp_bearer(
-			&affinity,
-			access,
-			expires_at_ms,
-			now_ms,
-			expected_generation,
-		)?;
-		Ok(OAuthCredentialState {
+		let mut state = OAuthCredentialState {
 			affinity,
+			access_token: access,
+			expires_at_ms,
 			token_endpoint,
 			client_id,
 			client_secret,
 			resource,
 			refresh_token,
-			generation,
-		})
+			generation: 0,
+		};
+		state.generation = self.authority.persist_mcp_oauth(
+			&state.affinity,
+			&StoredMcpOAuthCredential {
+				access_token:   state.access_token.clone(),
+				refresh_token:  state.refresh_token.clone(),
+				token_endpoint: state.token_endpoint.clone(),
+				client_id:      state.client_id.clone(),
+				client_secret:  state.client_secret.clone(),
+				resource:       state.resource.clone(),
+				expires_at_ms:  state.expires_at_ms,
+				generation:     0,
+			},
+			now_ms,
+			expected_generation,
+		)?;
+		Ok(state)
 	}
 }
 
@@ -497,6 +531,12 @@ pub enum OAuthFlowError {
 	/// Token endpoint returned a non-bearer token.
 	#[error("MCP OAuth token type is unsupported")]
 	UnsupportedTokenType,
+	/// Persisted grant did not contain a usable access token.
+	#[error("MCP OAuth bearer token is invalid")]
+	InvalidBearerToken,
+	/// No persisted renewable grant exists for this mount.
+	#[error("MCP OAuth credential is unavailable")]
+	CredentialUnavailable,
 	/// Metadata discovery failed.
 	#[error(transparent)]
 	Metadata(#[from] MetadataError),
@@ -524,15 +564,9 @@ pub enum OAuthFlowError {
 	/// Browser could not open.
 	#[error(transparent)]
 	Browser(#[from] BrowserError),
-	/// Encrypted store update failed.
+	/// Complete encrypted OAuth record persistence failed.
 	#[error(transparent)]
-	Store(#[from] auth::StoreError),
-	/// Encrypted-store credential acquisition failed.
-	#[error(transparent)]
-	Credential(#[from] omp_inference::auth::CredentialError),
-	/// Sealed lease could not materialize a bearer header.
-	#[error(transparent)]
-	CredentialApply(#[from] omp_inference::auth::CredentialApplyError),
+	Store(#[from] McpOAuthStoreError),
 }
 fn preferred_authorization_scopes(
 	protected: &[Str],
@@ -561,7 +595,10 @@ impl OAuthFlowError {
 			Self::UnsupportedChallenge
 			| Self::InvalidCallbackConfig
 			| Self::MissingAuthorizationServer
+			| Self::NotRefreshable
 			| Self::UnsupportedTokenType
+			| Self::InvalidBearerToken
+			| Self::CredentialUnavailable
 			| Self::Registration(ClientRegistrationError::Rejected { .. })
 			| Self::Registration(ClientRegistrationError::Malformed)
 			| Self::Registration(ClientRegistrationError::RegistrationUnavailable)
@@ -574,17 +611,14 @@ impl OAuthFlowError {
 			| Self::Token(TokenError::Rejected { .. })
 			| Self::Token(TokenError::Provider { .. })
 			| Self::Token(TokenError::Malformed) => OAuthFailureClass::Definitive,
-			Self::NotRefreshable
-			| Self::Metadata(_)
+			Self::Metadata(_)
 			| Self::Registration(_)
 			| Self::Entropy(_)
 			| Self::Callback(_)
 			| Self::Complete(_)
 			| Self::Token(_)
 			| Self::Browser(_)
-			| Self::Store(_)
-			| Self::Credential(_)
-			| Self::CredentialApply(_) => OAuthFailureClass::Transient,
+			| Self::Store(_) => OAuthFailureClass::Transient,
 		}
 	}
 }

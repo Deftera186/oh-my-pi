@@ -134,6 +134,8 @@ pub struct Payload {
 	pub projected_text:       Str,
 	/// Durable complete output when `projected_text` was pre-truncated.
 	pub output_blob:          Option<BlobRef>,
+	/// Resolver-valid address of `output_blob`.
+	pub output_artifact_uri:  Option<Str>,
 	/// Complete lines retained in `projected_text` before its footer.
 	pub output_shown_lines:   u64,
 	/// Complete line count in the pre-truncation output.
@@ -458,6 +460,7 @@ fn payload(mut result: WalkResult, limit: u64, timeout_ms: u64) -> Payload {
 		timeout_ms,
 		projected_text: Str::new(""),
 		output_blob: None,
+		output_artifact_uri: None,
 		output_shown_lines: 0,
 		output_total_lines: 0,
 	}
@@ -475,6 +478,7 @@ async fn prepare_payload<B: ReadBlobs>(
 		.map_err(|fault| Fault::Blob { message: fault.message().clone() })?;
 	payload.projected_text = output.content;
 	payload.output_blob = output.blob;
+	payload.output_artifact_uri = output.artifact_uri;
 	payload.output_shown_lines = output.shown_lines;
 	payload.output_total_lines = output.total_lines;
 	Ok(payload)
@@ -498,9 +502,12 @@ fn render_payload(payload: &Payload) -> String {
 		)
 	});
 	let timeout_note = payload.timed_out.then(|| timeout_notice(payload));
+	let result_limit_note = payload.result_limit_reached.map(|limit| {
+		format!("{limit} results limit reached. Use limit={} for more.", limit.saturating_mul(2))
+	});
 
 	if paths.is_empty() {
-		let mut parts = Vec::with_capacity(3);
+		let mut parts = Vec::with_capacity(4);
 		if !payload.timed_out {
 			parts.push(String::from("No files found matching pattern"));
 		}
@@ -510,15 +517,21 @@ fn render_payload(payload: &Payload) -> String {
 		if let Some(note) = missing_note {
 			parts.push(note);
 		}
+		if let Some(note) = result_limit_note {
+			parts.push(note);
+		}
 		return parts.join("\n");
 	}
 
 	let mut output = format_grouped_paths(&paths);
-	let mut notes = Vec::with_capacity(2);
+	let mut notes = Vec::with_capacity(3);
 	if let Some(note) = timeout_note {
 		notes.push(note);
 	}
 	if let Some(note) = missing_note {
+		notes.push(note);
+	}
+	if let Some(note) = result_limit_note {
 		notes.push(note);
 	}
 	if !notes.is_empty() {
@@ -674,7 +687,15 @@ mod tests {
 		assert!(ranked.truncated);
 		assert_eq!(
 			render_payload(&ranked),
-			["# docs/generated/", "# src/", "new.rs", "mid.rs"].join("\n")
+			[
+				"# docs/generated/",
+				"# src/",
+				"new.rs",
+				"mid.rs",
+				"",
+				"3 results limit reached. Use limit=6 for more.",
+			]
+			.join("\n")
 		);
 	}
 

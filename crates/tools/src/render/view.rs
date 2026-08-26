@@ -401,6 +401,20 @@ impl El {
 		if self.tag == Tag::Icon
 			&& let Some((_, Val::Str(name))) = self.props.iter().find(|(prop, _)| *prop == Prop::Name)
 		{
+			// A bare name uses the inline shorthand; any styling prop needs the
+			// full element form because `<ico:…/>` carries no attributes.
+			if self.props.len() > 1 {
+				output.push_str("icon");
+				for (prop, value) in &self.props {
+					if *prop != Prop::Name {
+						write_prop(output, *prop, value);
+					}
+				}
+				output.push('>');
+				escape_text(output, name);
+				output.push_str("</icon>");
+				return;
+			}
 			output.push_str("ico:");
 			output.push_str(name.as_str());
 			output.push_str("/>");
@@ -570,6 +584,8 @@ mod tests {
 	fn icon_shorthand_and_attr_escaping_round_trip() {
 		let icon = El::icon("lsp");
 		assert_eq!(icon.to_tml().as_str(), "<ico:lsp/>");
+		let colored = El::icon("error").prop(Prop::Color, Tone::Err);
+		assert_eq!(colored.to_tml().as_str(), "<icon color=err>error</icon>");
 		let fact = El::new(Tag::Fact)
 			.prop(Prop::Label, sf!("a\"b<c"))
 			.text("v");

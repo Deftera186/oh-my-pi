@@ -38,7 +38,10 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1 as thread_pb,
 };
-use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_settings::{
+	manager::{SettingsManager, SettingsPaths},
+	snapshot::SettingsSnapshot,
+};
 use omp_storage::{
 	blob, github_cache::GithubCache, index::SessionIndex, state::StateStore,
 	telemetry_index::TelemetryIndex,
@@ -91,7 +94,9 @@ use super::{
 		AcpDocumentBackend, DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost,
 		DocumentLease, LspEvents, LspRegistryEvent,
 	},
-	eval::{BridgeHostError, PreludeInvoker, SessionBridgeHost},
+	eval::{
+		BridgeHostError, ParentBindingLease, ParentSessionHost, PreludeInvoker, SessionBridgeHost,
+	},
 	exec::{ExecError, ExecEvent, ExecHost, ExecRun, ProcessEvent},
 	exec_settings::{AcpSettings, ShellSettings},
 	exthost::{ExtensionManifest, control::CompositeControlAuthority, lifecycle::EscapeCapability},
@@ -105,6 +110,7 @@ use super::{
 		McpService, McpServiceError, ServiceSubscription, SubscriptionEvent,
 		control::McpControl,
 		manager::{McpManager, ProductionConnector},
+		settings::McpSettings,
 	},
 	memory,
 	memory::{ReflectionBridgeHost, RegisteredMemoryRuntime},
@@ -177,7 +183,6 @@ const MAX_RESOURCE_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESOURCE_LIST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESOURCE_ENTRIES: usize = 4_096;
 const MAX_RESOURCE_COMPLETIONS: usize = 100;
-static NEXT_CONNECTION_OWNER: AtomicU64 = AtomicU64::new(1);
 static NEXT_AGENT_CONTROL_BINDING: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Default)]
@@ -514,6 +519,14 @@ impl WorkerDeviceInvoker {
 	}
 }
 
+fn internal_worker_authorization() -> (Bytes, u64) {
+	let token = Bytes::from(Ulid::generate().to_string());
+	let authorized_at_ms = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX));
+	(token, authorized_at_ms)
+}
+
 impl DeviceInvoker for WorkerDeviceInvoker {
 	async fn invoke(&self, request: DeviceInvokeRequest) -> omp_tool::ErasedStream<'static> {
 		let hosts = Arc::clone(&self.hosts);
@@ -537,9 +550,12 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 					return;
 				},
 			};
+			let (effect_token, authorized_at_ms) = internal_worker_authorization();
 			let committed = omp_proto::env::v1::ArgsCommitted {
 				invocation_id: request.invocation_id.to_string(),
 				raw: request.args_json,
+				effect_token,
+				authorized_at_ms,
 				..omp_proto::env::v1::ArgsCommitted::default()
 			};
 			if let Err(error) = invocation.args_committed(committed) {
@@ -610,10 +626,13 @@ impl PreludeInvoker for PreludeBridgeInvoker {
 		let raw = serde_json::to_vec(&args).map_err(|error| {
 			BridgeHostError::message(sf!("failed to encode prelude helper arguments: {error}"))
 		})?;
+		let (effect_token, authorized_at_ms) = internal_worker_authorization();
 		invocation
 			.args_committed(pb::ArgsCommitted {
 				invocation_id: invocation_id.to_string(),
 				raw: Bytes::from(raw),
+				effect_token,
+				authorized_at_ms,
 				..pb::ArgsCommitted::default()
 			})
 			.map_err(|error| {
@@ -930,8 +949,13 @@ impl LateBoundControlAuthority {
 
 #[async_trait::async_trait]
 impl ControlAuthority for LateBoundControlAuthority {
-	fn handles(&self, _operation: &str) -> bool {
-		true
+	fn handles(&self, operation: &str) -> bool {
+		if let Some((_, owner)) = self.bound.lock().as_ref() {
+			return owner.handles(operation);
+		}
+		self
+			.owner()
+			.is_ok_and(|(_, owner)| owner.handles(operation))
 	}
 
 	fn authorize(
@@ -1808,6 +1832,12 @@ fn execution_settings(
 	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
+	execution_settings_from_snapshot(&snapshot)
+}
+
+fn execution_settings_from_snapshot(
+	snapshot: &SettingsSnapshot,
+) -> Result<(HostSettings, ShellSettings, AcpSettings), EnvdError> {
 	let mut host = snapshot
 		.project::<HostSettings>()
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
@@ -1825,6 +1855,26 @@ fn execution_settings(
 		.get()
 		.clone();
 	Ok((host, shell, acp))
+}
+fn mcp_settings(
+	data_dir: &Path,
+	project_root: &Path,
+	snapshot: Option<&SettingsSnapshot>,
+) -> Result<McpSettings, EnvdError> {
+	let owned;
+	let snapshot = if let Some(snapshot) = snapshot {
+		snapshot
+	} else {
+		owned = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+			.snapshot();
+		&owned
+	};
+	Ok(snapshot
+		.project::<McpSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.clone())
 }
 
 async fn start_memory_runtime(
@@ -2208,11 +2258,13 @@ impl EnvServer {
 			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
 				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
 		);
+		let local_root =
+			crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id);
 		let mcp_manager = McpManager::new(
 			Arc::clone(&mcp),
 			Arc::new(ProductionConnector::new(workspace.root().to_path_buf())),
 			Arc::from([hello.root_uri.clone()]),
-			state_dir.join("local"),
+			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
@@ -2245,9 +2297,17 @@ impl EnvServer {
 			}));
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
-		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
+		let materializations = ResourceMaterializer::open(
+			workspace.root(),
+			state_dir,
+			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
+		)?;
 		let (host_settings, shell_settings, acp_settings) =
 			execution_settings(state_dir, workspace.root())?;
+		let mcp_settings = mcp_settings(state_dir, workspace.root(), None)?;
+		mcp.start_native_configs(mcp_settings.enable_project_config)
+			.await
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let workspace_ops = WorkspaceOperations::open(
 			workspace.clone(),
 			documents.clone(),
@@ -2276,6 +2336,7 @@ impl EnvServer {
 			&documents,
 			&blobs,
 			&exec,
+			None,
 			state_dir,
 			session_id.as_str(),
 			Arc::clone(&github_cache),
@@ -2356,9 +2417,11 @@ impl EnvServer {
 		state_dir: &Path,
 		docserver_socket: &Path,
 		registry: Registry,
+		daemon_process_client: Option<EnvClient>,
 		mut ext_host_config: ExtHostConfig,
 		doc_connections: Option<watch::Sender<usize>>,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
+		settings_snapshot: Option<&SettingsSnapshot>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -2368,8 +2431,13 @@ impl EnvServer {
 		mcp.bind_config_paths(state_dir, workspace.root());
 		let lsp_settings = load_lsp_settings(state_dir, &root)
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		let (documents, document_authority) =
-			connect_or_start_docserver(&root, docserver_socket, doc_connections.clone()).await?;
+		let (documents, document_authority) = connect_or_start_docserver(
+			&root,
+			docserver_socket,
+			doc_connections.clone(),
+			doc_connections.is_some(),
+		)
+		.await?;
 		let hello = documents.hello().clone();
 		let interrupt_grace = ext_host_config.interrupt_grace;
 		let session_id = ext_host_config.session_id.clone();
@@ -2394,11 +2462,13 @@ impl EnvServer {
 			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
 				.map_err(|error| EnvdError::State(Str::from(error.to_string())))?,
 		);
+		let local_root =
+			crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id);
 		let mcp_manager = McpManager::new(
 			Arc::clone(&mcp),
 			Arc::new(ProductionConnector::new(workspace.root().to_path_buf())),
 			Arc::from([hello.root_uri.clone()]),
-			state_dir.join("local"),
+			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
 		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
@@ -2431,12 +2501,24 @@ impl EnvServer {
 			}));
 		let sites = SiteMaterializer::open(state_dir.join("ext"), blobs.store().clone())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
-		let materializations = ResourceMaterializer::open(workspace.root(), state_dir)?;
+		let materializations = ResourceMaterializer::open(
+			workspace.root(),
+			state_dir,
+			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
+		)?;
 		let (mut host_settings, shell_settings, acp_settings) =
-			execution_settings(state_dir, workspace.root())?;
+			if let Some(snapshot) = settings_snapshot {
+				execution_settings_from_snapshot(snapshot)?
+			} else {
+				execution_settings(state_dir, workspace.root())?
+			};
 		host_settings.tools = host_settings
 			.tools
 			.with_approval_mode_override(approval_mode);
+		let mcp_settings = mcp_settings(state_dir, workspace.root(), settings_snapshot)?;
+		mcp.start_native_configs(mcp_settings.enable_project_config)
+			.await
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let workspace_ops = WorkspaceOperations::open(
 			workspace.clone(),
 			documents.clone(),
@@ -2465,6 +2547,7 @@ impl EnvServer {
 			&documents,
 			&blobs,
 			&exec,
+			daemon_process_client,
 			state_dir,
 			session_id.as_str(),
 			Arc::clone(&github_cache),
@@ -2657,6 +2740,11 @@ impl EnvServer {
 		&self.mcp_manager
 	}
 
+	/// Returns the session-owned native MCP configuration authority.
+	pub(crate) const fn mcp(&self) -> &Arc<McpService> {
+		&self.mcp
+	}
+
 	/// Constructs one generation-fenced MCP CONTROL resolver for a host
 	/// connection.
 	pub(crate) fn mcp_control(
@@ -2675,6 +2763,15 @@ impl EnvServer {
 	/// Returns the project document authority shared by standalone commands.
 	pub(crate) const fn documents(&self) -> &DocumentHost {
 		&self.documents
+	}
+
+	/// Gracefully stops every nonpersistent process owned by this environment.
+	///
+	/// Durable detached generations remain owned by the process store and are
+	/// intentionally spared by the executor's managed-shutdown policy.
+	pub(crate) async fn shutdown_managed(&self, grace: Duration) {
+		let _ = self.exec.shutdown_managed(grace).await;
+		self.ext_hosts.shutdown().await;
 	}
 
 	/// Returns the session's sole Off/Mnemopi runtime.
@@ -2706,6 +2803,15 @@ impl EnvServer {
 		Arc::clone(&self.eval_bridge)
 	}
 
+	/// Binds one durable session principal to its live eval parent authority.
+	pub fn bind_eval_sdk_parent(
+		&self,
+		owner: Str,
+		parent: Arc<dyn ParentSessionHost>,
+	) -> Result<ParentBindingLease, BridgeHostError> {
+		self.eval_bridge.bind_sdk_parent(owner, parent)
+	}
+
 	/// Returns the late-bound memory reflection bridge.
 	pub(crate) fn reflection_bridge(&self) -> Arc<ReflectionBridgeHost> {
 		Arc::clone(&self.reflection_bridge)
@@ -2729,6 +2835,11 @@ impl EnvServer {
 	/// Journal.
 	pub(crate) fn sessions_index(&self) -> Arc<SessionIndex> {
 		Arc::clone(&self.sessions_index)
+	}
+
+	/// Returns the session generation fencing CONTROL connections.
+	pub(crate) fn session_generation(&self) -> u64 {
+		self.ext_hosts.session_generation()
 	}
 
 	/// Atomically installs the chat-parent owner of `omp.agents.*`.
@@ -3019,13 +3130,17 @@ impl EnvServer {
 					}
 				},
 				completed = connections.join_next(), if !connections.is_empty() => {
-					if let Some(gauge) = &connection_gauge {
-						gauge.send_replace(connections.len());
-					}
 					match completed {
 						Some(Ok(Ok(()))) | None => {},
-						Some(Ok(Err(error))) => return Err(error),
-						Some(Err(error)) => return Err(error.into()),
+						Some(Ok(Err(error))) => {
+							tracing::warn!(%error, "environment connection terminated with an error");
+						},
+						Some(Err(error)) => {
+							tracing::error!(%error, "environment connection task failed");
+						},
+					}
+					if let Some(gauge) = &connection_gauge {
+						gauge.send_replace(connections.len());
 					}
 					if listener.is_none() && connections.is_empty() {
 						break;
@@ -3331,7 +3446,7 @@ impl EnvServer {
 					.try_into()
 					.unwrap_or(u64::MAX);
 				let grace = Duration::from_millis(request.grace_ms);
-				let summary = self.exec.shutdown_managed(grace);
+				let summary = self.exec.shutdown_managed(grace).await;
 				let acknowledgement = ShutdownAcknowledgement {
 					accepted_at_ms,
 					stopped: summary.stopped,
@@ -6018,6 +6133,18 @@ impl EnvServer {
 			.await;
 			return;
 		}
+		let principal =
+			scope.filter(|scope| !scope.session_id.is_empty() && !scope.agent_id.is_empty());
+		if scope.is_some_and(|scope| scope.session_id.is_empty() != scope.agent_id.is_empty()) {
+			send_error(
+				responses,
+				request_id,
+				pb::ProtocolErrorCode::InvalidArgument,
+				"session_id and agent_id must both be present or both be absent",
+			)
+			.await;
+			return;
+		}
 		if let Some(open_request) = connection.invocation_ids.get(&invocation_id).copied() {
 			// A terminal invocation only awaits its `Finished` sweep; its id is
 			// free for a replacement open (the client observed the terminal
@@ -6077,7 +6204,24 @@ impl EnvServer {
 		let execution = InvocationExecutionPolicy::from_request(&request);
 		let cancel = CancellationToken::new();
 		if route == ToolRoute::Native {
-			let (feed, params) = IncomingParams::owned_channel(connection.owner.clone());
+			let owner = if let Some(principal) = principal {
+				Str::from(
+					serde_json::to_string(&(&principal.session_id, &principal.agent_id))
+						.expect("invocation principal tuple is always serializable"),
+				)
+			} else if request.name == "eval" {
+				send_error(
+					responses,
+					request_id,
+					pb::ProtocolErrorCode::PermissionDenied,
+					"eval requires authenticated session_id and agent_id principals",
+				)
+				.await;
+				return;
+			} else {
+				connection.owner.clone()
+			};
+			let (feed, params) = IncomingParams::owned_channel(owner);
 			let lifecycle = Arc::new(NativeLifecycle::default());
 			let name = Str::from(request.name);
 			let admission = AdmissionGate::new(invocation_id.clone(), name.clone(), deadline);
@@ -6640,17 +6784,14 @@ impl ConnectionState {
 		authority: Arc<AuthorityTable>,
 		policy: &ConnectionPolicy,
 	) -> Self {
+		let connection_owner = authority.connection_owner();
 		let owner = policy.host.as_ref().map_or_else(
-			|| {
-				let number = NEXT_CONNECTION_OWNER.fetch_add(1, Ordering::Relaxed);
-				Str::from(format!("env-connection-{number}"))
-			},
+			|| sf!("env-connection-{connection_owner}"),
 			|host| {
 				let [layer, tier, extension] = host.fields();
-				Str::from(format!("extension:{layer}:{tier}:{extension}"))
+				sf!("extension:{layer}:{tier}:{extension}")
 			},
 		);
-		let connection_owner = authority.connection_owner();
 		let quotas = QuotaAccount::new(Arc::clone(&authority), policy.host.clone());
 		Self {
 			owner,
@@ -9345,9 +9486,9 @@ pub async fn run_with_registry(
 		socket
 	} else {
 		let socket = omp_env::project_state::document_socket(&state_dir);
-		ensure_document_socket_free(&socket).await?;
 		socket
 	};
+	ensure_document_socket_free(&docserver_socket).await?;
 	let (principal_authority, session_id, session_generation) = authenticated_runtime_identity()?;
 	let mut ext_host_config = ExtHostConfig::current(
 		principal_authority.principal().clone(),
@@ -9392,8 +9533,10 @@ pub async fn run_with_registry(
 			&state_dir,
 			&docserver_socket,
 			registry,
+			None,
 			ext_host_config,
 			Some(doc_connections),
+			None,
 			None,
 			bridges,
 		)
@@ -9444,29 +9587,38 @@ pub async fn run_with_registry(
 		}
 	};
 	tokio::pin!(idle);
-	tokio::select! {
-		() = process_shutdown.cancelled() => {
-			listener_shutdown.cancel();
-			serve_task.await??;
-		},
-		() = &mut idle => {
-			listener_shutdown.cancel();
-			serve_task.await??;
-		},
-		result = &mut serve_task => {
+	let serve_result = async {
+		tokio::select! {
+			() = process_shutdown.cancelled() => {
+				listener_shutdown.cancel();
+				serve_task.await??;
+			},
+			() = &mut idle => {
+				listener_shutdown.cancel();
+				serve_task.await??;
+			},
+			result = &mut serve_task => {
+				result??;
+				tokio::select! {
+					() = process_shutdown.cancelled() => {},
+					() = &mut idle => {},
+				}
+			},
+		}
+		listener_shutdown.cancel();
+		while let Some(result) = extension_tasks.join_next().await {
 			result??;
-			tokio::select! {
-				() = process_shutdown.cancelled() => {},
-				() = &mut idle => {},
-			}
-		},
+		}
+		Ok::<(), EnvdError>(())
 	}
+	.await;
 	listener_shutdown.cancel();
-	while let Some(result) = extension_tasks.join_next().await {
-		result??;
-	}
+	let interrupt_grace = interrupt_grace
+		.to_std()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	server.shutdown_managed(interrupt_grace).await;
 	signal_task.abort();
-	Ok(())
+	serve_result
 }
 
 #[cfg(unix)]
@@ -9521,9 +9673,14 @@ async fn connect_or_start_docserver(
 	root: &Path,
 	socket: &Path,
 	connections: Option<watch::Sender<usize>>,
+	require_ownership: bool,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
 	if let Ok(stream) = UnixStream::connect(socket).await {
+		if require_ownership {
+			return Err(EnvdError::DocumentAuthorityHeld);
+		}
 		let documents = DocumentHost::connect(stream).await?;
+		validate_document_root(root, documents.hello().root_uri.as_str())?;
 		if omp_env::build_id::is_stale(
 			omp_env::build_id::current(),
 			documents.hello().server_build.as_str(),
@@ -9567,6 +9724,7 @@ async fn connect_or_start_docserver(
 		}
 		if let Ok(stream) = UnixStream::connect(socket).await {
 			let documents = DocumentHost::connect(stream).await?;
+			validate_document_root(root, documents.hello().root_uri.as_str())?;
 			return Ok((documents, Some(authority)));
 		}
 		if Instant::now() >= deadline {
@@ -9583,9 +9741,14 @@ async fn connect_or_start_docserver(
 	root: &Path,
 	socket: &Path,
 	connections: Option<watch::Sender<usize>>,
+	require_ownership: bool,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
 	if let Ok(stream) = omp_docserver::windows::connect_owner_pipe(socket) {
+		if require_ownership {
+			return Err(EnvdError::DocumentAuthorityHeld);
+		}
 		let documents = DocumentHost::connect(stream).await?;
+		validate_document_root(root, documents.hello().root_uri.as_str())?;
 		return Ok((documents, None));
 	}
 	let listener = OwnerPipeListener::bind(socket)?;
@@ -9609,7 +9772,21 @@ async fn connect_or_start_docserver(
 	let authority = DocumentAuthority { shutdown, task: Some(task) };
 	let stream = omp_docserver::windows::connect_owner_pipe(socket)?;
 	let documents = DocumentHost::connect(stream).await?;
+	validate_document_root(root, documents.hello().root_uri.as_str())?;
 	Ok((documents, Some(authority)))
+}
+
+fn validate_document_root(root: &Path, authority_root_uri: &str) -> Result<(), EnvdError> {
+	let authority_root = Url::parse(authority_root_uri)
+		.ok()
+		.and_then(|uri| uri.to_file_path().ok())
+		.and_then(|path| fs::canonicalize(path).ok());
+	let expected_root = fs::canonicalize(root)?;
+	if authority_root.as_deref() == Some(expected_root.as_path()) {
+		Ok(())
+	} else {
+		Err(EnvdError::Document(sf!("document authority root does not match environment root")))
+	}
 }
 
 /// Refuses standalone-daemon startup while another process serves the project
@@ -9756,7 +9933,12 @@ mod tests {
 			blobs.clone(),
 			SiteMaterializer::open(state.path().join("ext"), blobs.store().clone())
 				.expect("site materializer"),
-			ResourceMaterializer::open(workspace.root(), state.path()).expect("resource materializer"),
+			ResourceMaterializer::open(
+				workspace.root(),
+				state.path(),
+				&state.path().join("sessions/test/local"),
+			)
+			.expect("resource materializer"),
 			Arc::new(Registry::new()),
 			PresenterSlot::new(Arc::new(omp_tools::ask::HeadlessPresenter)),
 			workspace_ops,
@@ -10344,6 +10526,23 @@ mod tests {
 		.await
 		.expect("stale socket file did not become free");
 	}
+
+	#[test]
+	fn document_authority_must_match_the_canonical_environment_root() {
+		let environment = tempfile::tempdir().expect("environment root");
+		let foreign = tempfile::tempdir().expect("foreign root");
+		let matching = Url::from_directory_path(environment.path())
+			.expect("environment file URI")
+			.to_string();
+		let mismatched = Url::from_directory_path(foreign.path())
+			.expect("foreign file URI")
+			.to_string();
+
+		assert!(validate_document_root(environment.path(), &matching).is_ok());
+		assert!(validate_document_root(environment.path(), &mismatched).is_err());
+		assert!(validate_document_root(environment.path(), "memory://foreign").is_err());
+	}
+
 	#[tokio::test]
 	async fn idle_wait_requires_one_continuous_quiet_window() {
 		let window = Duration::from_millis(30);
@@ -10409,7 +10608,11 @@ mod tests {
 		.await
 		.expect("stale document authority did not become ready");
 
-		let (documents, authority) = connect_or_start_docserver(root.path(), &socket, None)
+		assert!(matches!(
+			connect_or_start_docserver(root.path(), &socket, None, true).await,
+			Err(EnvdError::DocumentAuthorityHeld)
+		));
+		let (documents, authority) = connect_or_start_docserver(root.path(), &socket, None, false)
 			.await
 			.expect("join stale document authority");
 		assert_eq!(documents.hello().server_build.as_str(), "stale-build");
@@ -10457,9 +10660,9 @@ mod tests {
 			..Effects::empty()
 		};
 		let yolo =
-			InvocationExecutionPolicy { tool: sf!("shell"), plan: true, plan_yolo: true };
+			InvocationExecutionPolicy { tool: sf!("bash"), plan: true, plan_yolo: true };
 		let plan =
-			InvocationExecutionPolicy { tool: sf!("shell"), plan: true, plan_yolo: false };
+			InvocationExecutionPolicy { tool: sf!("bash"), plan: true, plan_yolo: false };
 		assert!(yolo.denial(&effects, br#"{"command":"touch x"}"#).is_none());
 		assert!(plan.denial(&effects, br#"{"command":"touch x"}"#).is_some());
 	}

@@ -18,11 +18,11 @@ use omp_core::{
 	sparse_set::SparseSet,
 };
 use omp_tool::ArtifactLifetime;
-use smallvec::SmallVec;
 use strum::{EnumString, FromRepr, IntoStaticStr, VariantArray};
 
 use super::{
 	Fault,
+	format::{self, LineSpan, ResolvedRangeText, TextFormatOptions},
 	selector::{LineRange, ParsedSelector, SelectorError},
 };
 
@@ -938,6 +938,32 @@ impl LineOffsets {
 		Self { starts: starts.into_boxed_slice(), len: bytes.len() }
 	}
 
+	fn line_count(&self, raw: bool) -> usize {
+		if raw || self.len == 0 || self.starts.last().copied() != Some(self.len) {
+			self.starts.len()
+		} else {
+			self.starts.len().saturating_sub(1)
+		}
+	}
+
+	fn byte_range_mode(&self, range: LineRange, raw: bool) -> Result<Range<usize>, SelectorError> {
+		let total_lines = self.line_count(raw);
+		let start_line = usize::try_from(range.start_line).unwrap_or(usize::MAX);
+		if start_line == 0 || start_line > total_lines {
+			return Err(SelectorError::from_message(format!(
+				"Line {} is out of bounds; resource has {total_lines} lines.",
+				range.start_line
+			)));
+		}
+		let end_line = range
+			.end_line
+			.map_or(total_lines, |end| usize::try_from(end).unwrap_or(usize::MAX))
+			.min(total_lines);
+		let start = self.starts[start_line - 1];
+		let end = self.starts.get(end_line).copied().unwrap_or(self.len);
+		Ok(start..end)
+	}
+
 	fn byte_range(&self, range: LineRange) -> Result<Range<usize>, SelectorError> {
 		let start_line = usize::try_from(range.start_line).unwrap_or(usize::MAX);
 		if start_line == 0 || start_line > self.starts.len() {
@@ -968,6 +994,16 @@ impl LineOffsetCache {
 	/// Returns cached offsets for `key`, if the resource has been scanned.
 	fn get(&self, key: &str) -> Option<Arc<LineOffsets>> {
 		self.0.get(key).map(|entry| Arc::clone(&entry))
+	}
+
+	/// Installs offsets produced by a bounded streaming scan.
+	fn insert(&self, key: &str, offsets: LineOffsets) -> Arc<LineOffsets> {
+		let offsets = Arc::new(offsets);
+		self
+			.0
+			.entry(Str::new(key))
+			.or_insert_with(|| offsets.clone())
+			.clone()
 	}
 
 	/// Scans and caches an immutable resource once.
@@ -1036,56 +1072,156 @@ impl<C: ArtifactCatalog, B: BlobAuthority> ArtifactResolver<C, B> {
 		self.blobs.read_range(&record.digest, 0..size).await
 	}
 
-	async fn selected_bytes(
-		&self,
-		record: &ArtifactRecord,
-		size: u64,
-		ranges: &[LineRange],
-	) -> Result<CowBytes<'static>, Fault> {
-		let Some(offsets) = self.lines.get(&record.digest) else {
-			let bytes = self.all_bytes(record, size).await?;
-			str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
-				message: sf!("Artifact selectors require UTF-8 text"),
-			})?;
-			let offsets = self.lines.index(&record.digest, &bytes);
-			if ranges.len() == 1 {
-				let range = offsets.byte_range(ranges[0]).map_err(selector_fault)?;
-				return Ok(bytes.slice(range));
-			}
-			let mut joined = Vec::new();
-			for range in ranges {
-				let range = offsets.byte_range(*range).map_err(selector_fault)?;
-				joined.extend_from_slice(&bytes.slice(range));
-			}
-			return Ok(CowBytes::from(joined));
-		};
-
-		if ranges.len() == 1 {
-			let range = offsets.byte_range(ranges[0]).map_err(selector_fault)?;
-			return self
-				.blobs
-				.read_range(&record.digest, usize_range_to_u64(range)?)
-				.await;
+	async fn offsets(&self, record: &ArtifactRecord, size: u64) -> Result<Arc<LineOffsets>, Fault> {
+		if let Some(offsets) = self.lines.get(&record.digest) {
+			return Ok(offsets);
 		}
-
-		let mut pieces: SmallVec<CowBytes<'static>, 2> = SmallVec::new();
-		let mut total = 0usize;
-		for range in ranges {
+		let len = usize::try_from(size)
+			.map_err(|_| Fault::Invalid { message: sf!("Artifact exceeds host address limits") })?;
+		let mut starts = vec![0usize];
+		let mut utf8_tail = Vec::new();
+		let mut position = 0usize;
+		while position < len {
+			let chunk_len = if position == 0 {
+				1
+			} else {
+				(64 * 1024).min(len - position)
+			};
+			let end = position.saturating_add(chunk_len);
 			let bytes = self
 				.blobs
 				.read_range(
 					&record.digest,
-					usize_range_to_u64(offsets.byte_range(*range).map_err(selector_fault)?)?,
+					u64::try_from(position).unwrap_or(u64::MAX)..u64::try_from(end).unwrap_or(u64::MAX),
 				)
 				.await?;
-			total = total.saturating_add(bytes.len());
-			pieces.push(bytes);
+			if bytes.len() != chunk_len {
+				return Err(Fault::Source {
+					message: sf!("Artifact blob authority returned a short range read"),
+				});
+			}
+			for (index, byte) in bytes.iter().copied().enumerate() {
+				if byte == b'\n' {
+					starts.push(position + index + 1);
+				}
+			}
+			utf8_tail.extend_from_slice(&bytes);
+			match str::from_utf8(&utf8_tail) {
+				Ok(_) => utf8_tail.clear(),
+				Err(error) if error.error_len().is_some() => {
+					return Err(Fault::Invalid {
+						message: sf!("Artifact selectors require UTF-8 text"),
+					});
+				},
+				Err(error) => {
+					utf8_tail = utf8_tail.split_off(error.valid_up_to());
+				},
+			}
+			position = end;
 		}
-		let mut joined = Vec::with_capacity(total);
-		for piece in pieces {
-			joined.extend_from_slice(&piece);
+		if str::from_utf8(&utf8_tail).is_err() {
+			return Err(Fault::Invalid { message: sf!("Artifact selectors require UTF-8 text") });
 		}
-		Ok(CowBytes::from(joined))
+		Ok(self
+			.lines
+			.insert(&record.digest, LineOffsets { starts: starts.into_boxed_slice(), len }))
+	}
+
+	async fn selected_bytes(
+		&self,
+		resource: &str,
+		record: &ArtifactRecord,
+		size: u64,
+		ranges: &[LineRange],
+		raw: bool,
+	) -> Result<CowBytes<'static>, Fault> {
+		let offsets = self.offsets(record, size).await?;
+		let total_lines = offsets.line_count(raw);
+		let mut spans = Vec::with_capacity(ranges.len());
+		for range in ranges {
+			let start = usize::try_from(range.start_line).unwrap_or(usize::MAX);
+			if start == 0 || start > total_lines {
+				continue;
+			}
+			let requested_end = range
+				.end_line
+				.map_or(total_lines, |end| usize::try_from(end).unwrap_or(usize::MAX))
+				.min(total_lines);
+			let (start_line, end_line) = if ranges.len() == 1 && !raw {
+				(
+					start.saturating_sub(1).max(1),
+					if range.end_line.is_some() {
+						requested_end.saturating_add(3).min(total_lines)
+					} else {
+						requested_end
+					},
+				)
+			} else {
+				(start, requested_end)
+			};
+			spans.push(LineSpan { start_line, end_line });
+		}
+
+		let selected_bytes = spans.iter().try_fold(0usize, |total, span| {
+			let range = offsets
+				.byte_range_mode(
+					LineRange {
+						start_line: u64::try_from(span.start_line).unwrap_or(u64::MAX),
+						end_line:   Some(u64::try_from(span.end_line).unwrap_or(u64::MAX)),
+					},
+					raw,
+				)
+				.map_err(selector_fault)?;
+			total
+				.checked_add(range.len())
+				.ok_or_else(|| Fault::Invalid { message: sf!("Artifact range byte length overflow") })
+		})?;
+		if selected_bytes > 8 * 1024 * 1024 {
+			return Err(Fault::Invalid {
+				message: sf!(
+					"Selected artifact ranges total {selected_bytes} bytes; narrow the selection below \
+					 the 8 MiB inline safety bound"
+				),
+			});
+		}
+
+		let mut loaded = Vec::with_capacity(spans.len());
+		for span in &spans {
+			let range = offsets
+				.byte_range_mode(
+					LineRange {
+						start_line: u64::try_from(span.start_line).unwrap_or(u64::MAX),
+						end_line:   Some(u64::try_from(span.end_line).unwrap_or(u64::MAX)),
+					},
+					raw,
+				)
+				.map_err(selector_fault)?;
+			let bytes = self
+				.blobs
+				.read_range(&record.digest, usize_range_to_u64(range)?)
+				.await?;
+			str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
+				message: sf!("Artifact selectors require UTF-8 text"),
+			})?;
+			loaded.push(bytes);
+		}
+		let resolved = spans
+			.iter()
+			.zip(&loaded)
+			.map(|(span, bytes)| ResolvedRangeText {
+				span: *span,
+				text: str::from_utf8(bytes).expect("validated above"),
+			})
+			.collect::<Vec<_>>();
+		let label = format!("artifact://{resource}");
+		let rendered = format::format_resolved_ranges(
+			&resolved,
+			ranges,
+			raw,
+			total_lines,
+			TextFormatOptions::new(&label),
+		);
+		Ok(CowBytes::from(rendered.into_bytes()))
 	}
 }
 
@@ -1098,7 +1234,19 @@ impl<C: ArtifactCatalog, B: BlobAuthority> Resolve for ArtifactResolver<C, B> {
 		let record = self.record(resource).await?;
 		let size = self.blobs.stat(&record.digest).await?.byte_len;
 		match selector {
-			ParsedSelector::Lines { ranges, .. } => self.selected_bytes(&record, size, ranges).await,
+			ParsedSelector::Lines { ranges, raw } => {
+				self
+					.selected_bytes(resource, &record, size, ranges, *raw)
+					.await
+			},
+			ParsedSelector::None | ParsedSelector::Raw if size > 8 * 1024 * 1024 => {
+				Err(Fault::Invalid {
+					message: sf!(
+						"artifact://{resource} is too large for a raw inline read ({size} bytes); \
+						 select a bounded line range"
+					),
+				})
+			},
 			ParsedSelector::None | ParsedSelector::Raw | ParsedSelector::Conflicts => {
 				self.all_bytes(&record, size).await
 			},

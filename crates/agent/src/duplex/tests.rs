@@ -400,6 +400,7 @@ async fn zero_deadline_fails_without_environment_dispatch() {
 #[tokio::test]
 async fn dropping_manager_interrupts_active_tasks_before_sender_destruction() {
 	let (mut manager, requests, responses) = manager();
+	let (relayed_tx, relayed_rx) = flume::bounded(1);
 	let server = thread::spawn(move || {
 		let mut opened = false;
 		let mut relayed = false;
@@ -407,7 +408,10 @@ async fn dropping_manager_interrupts_active_tasks_before_sender_destruction() {
 			let frame = recv(&requests);
 			match frame.body {
 				Some(client_frame::Body::InvokeTool(_)) => opened = true,
-				Some(client_frame::Body::ArgText(_)) => relayed = true,
+				Some(client_frame::Body::ArgText(_)) => {
+					relayed = true;
+					relayed_tx.send(()).expect("manager still awaiting relay");
+				},
 				Some(client_frame::Body::Cancel(_)) => break,
 				Some(client_frame::Body::ArgsCommitted(_)) => {
 					panic!("shutdown observed before execution must not commit effects")
@@ -420,7 +424,10 @@ async fn dropping_manager_interrupts_active_tasks_before_sender_destruction() {
 		drop(responses);
 	});
 	manager.start(invoke("invoke-drop", "call-drop", 4));
-	task::yield_now().await;
+	relayed_rx
+		.recv_async()
+		.await
+		.expect("invocation relayed before manager drop");
 	drop(manager);
 	task::spawn_blocking(move || server.join())
 		.await

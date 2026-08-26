@@ -17,6 +17,7 @@ use omp_tool::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// GitHub operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
@@ -46,10 +47,39 @@ pub enum Operation {
 	/// Watch Actions runs and jobs.
 	RunWatch,
 }
+/// Pull request selector accepted as either one value or a batch.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(untagged)]
+pub enum PrSelector {
+	/// One pull request number, URL, or branch name.
+	One(Str),
+	/// Multiple pull request numbers, URLs, or branch names.
+	Many(Vec<Str>),
+}
+
+impl PrSelector {
+	/// Returns the selectors as a borrowed slice.
+	pub fn as_slice(&self) -> &[Str] {
+		match self {
+			Self::One(value) => std::slice::from_ref(value),
+			Self::Many(values) => values,
+		}
+	}
+}
+
+/// Date field supported by GitHub issue, pull-request, and repository search.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateField {
+	/// Resource creation time.
+	Created,
+	/// Resource update time; repository search maps this to push time.
+	Updated,
+}
 
 /// Flat GitHub operation arguments.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Params {
 	/// Operation selector.
 	pub op:               Operation,
@@ -60,7 +90,7 @@ pub struct Params {
 	/// Branch, ref, or watched commit.
 	pub branch:           Option<Str>,
 	/// Pull request number, URL, or branch; arrays batch checkout.
-	pub pr:               Option<Vec<Str>>,
+	pub pr:               Option<PrSelector>,
 	/// Search query.
 	pub query:            Option<Str>,
 	/// Lower date bound.
@@ -68,7 +98,7 @@ pub struct Params {
 	/// Upper date bound.
 	pub until:            Option<Str>,
 	/// Search date field.
-	pub date_field:       Option<Str>,
+	pub date_field:       Option<DateField>,
 	/// Maximum returned rows.
 	pub limit:            Option<u32>,
 	/// Pull request title.
@@ -84,6 +114,9 @@ pub struct Params {
 	/// Open a draft pull request.
 	#[serde(default)]
 	pub draft:            bool,
+	/// Reset an existing local pull-request branch to the remote head.
+	#[serde(default)]
+	pub force:            bool,
 	/// Force-with-lease a PR push.
 	#[serde(default)]
 	pub force_with_lease: bool,
@@ -132,7 +165,11 @@ pub enum Update {}
 #[async_trait]
 pub trait GithubHost: Send + Sync + 'static {
 	/// Execute one API/worktree operation.
-	async fn execute(&self, params: Params) -> Result<Payload, Fault>;
+	async fn execute(
+		&self,
+		params: Params,
+		cancellation: CancellationToken,
+	) -> Result<Payload, Fault>;
 }
 
 /// GitHub tool.
@@ -191,7 +228,22 @@ impl Tool for Github {
 		stream! {
 			let params = match incoming.whole::<Params>().await { Ok(params) => params, Err(error) => { yield param_event(error); return; } };
 			if let Err(error) = incoming.interruptable().committed().await { yield commit_event(error); return; }
-			yield Ev::Done(ToolTerminal::Done { result: self.host.execute(params).await, useless: false });
+			let cancellation = CancellationToken::new();
+			let execution = self.host.execute(params, cancellation.clone());
+			tokio::pin!(execution);
+			tokio::select! {
+				result = &mut execution => {
+					yield Ev::Done(ToolTerminal::Done { result, useless: false });
+				},
+				interrupt = incoming.next_interrupt() => {
+					cancellation.cancel();
+					if let Ok(interrupt) = interrupt {
+						yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+					} else {
+						yield Ev::Aborted(Abort::InputDropped);
+					}
+				},
+			}
 		}
 	}
 
@@ -232,5 +284,45 @@ fn protocol_issue(message: Str) -> ArgIssue {
 		kind:     ArgIssueKind::Protocol,
 		example:  None,
 		found:    Some(message),
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::{DateField, Params, PrSelector};
+
+	#[test]
+	fn pr_selector_accepts_scalar_and_list_forms() {
+		let scalar: Params =
+			serde_json::from_value(serde_json::json!({ "op": "pr_checkout", "pr": "feature/foo" }))
+				.expect("scalar selector");
+		assert!(
+			matches!(scalar.pr, Some(PrSelector::One(value)) if value == "feature/foo"),
+			"scalar branch selector must survive schema decoding",
+		);
+
+		let list: Params = serde_json::from_value(
+			serde_json::json!({ "op": "pr_checkout", "pr": ["17", "feature/foo"] }),
+		)
+		.expect("selector list");
+		assert!(
+			matches!(list.pr, Some(PrSelector::Many(values)) if values.len() == 2),
+			"selector arrays must remain batch inputs",
+		);
+	}
+
+	#[test]
+	fn date_field_is_a_closed_enum() {
+		let updated: Params = serde_json::from_value(
+			serde_json::json!({ "op": "search_repos", "dateField": "updated" }),
+		)
+		.expect("updated date field");
+		assert_eq!(updated.date_field, Some(DateField::Updated));
+		assert!(
+			serde_json::from_value::<Params>(
+				serde_json::json!({ "op": "search_repos", "dateField": "pushed" }),
+			)
+			.is_err(),
+			"undeclared date fields must fail before dispatch",
+		);
 	}
 }

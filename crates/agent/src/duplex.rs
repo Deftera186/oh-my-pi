@@ -9,7 +9,7 @@ use omp_proto::{
 	inference::v1::{ExecStatus, Invoke, InvokeComplete, exec_status},
 	thread::v1::item,
 };
-use omp_tool::{CapsBase, Registry, RegistryError, ToolIdentity};
+use omp_tool::{CapsBase, Registry, RegistryError};
 use tokio::{sync::watch, task};
 
 use crate::{
@@ -229,10 +229,9 @@ mod invocation {
 				"dispatch name differs from canonical tool call",
 			));
 		}
-		let Some((name, rev)) = registry.live_identity(&invoke.name) else {
+		let Some(identity) = registry.resolved_identity(&invoke.name) else {
 			return Ok(failed_completion(invocation_id, "invocation names an unknown tool"));
 		};
-		let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
 		let raw_args = call.args_json.clone();
 		let fragment = match str::from_utf8(&call.args_json) {
 			Ok(fragment) => fragment.to_str(),
@@ -247,6 +246,7 @@ mod invocation {
 		// before crossing the effect-authorization boundary.
 		task::yield_now().await;
 		if interrupt.borrow().is_some() {
+			speculative.abandon().await;
 			return Ok(failed_completion(invocation_id, "invocation interrupted before execution"));
 		}
 		let committed = speculative.commit(raw_args);

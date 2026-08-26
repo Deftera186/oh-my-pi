@@ -636,18 +636,22 @@ impl LspControl for DocumentLspControl {
 				.await
 				.map_err(|_| Fault::Server)?;
 			let line = params.line.unwrap_or(1);
-			let character = if let Some(symbol) = &params.symbol {
-				let target =
-					navigation::parse_symbol_target(symbol).map_err(|_| Fault::InvalidArguments)?;
+			let symbol_target = params
+				.symbol
+				.as_ref()
+				.map(|symbol| navigation::parse_symbol_target(symbol))
+				.transpose()
+				.map_err(|_| Fault::InvalidArguments)?;
+			let source_line = if symbol_target.is_some() {
 				let text = str::from_utf8(&content).map_err(|_| Fault::InvalidArguments)?;
-				let source_line = text
-					.lines()
-					.nth(line.saturating_sub(1) as usize)
-					.ok_or(Fault::InvalidArguments)?;
-				navigation::resolve_symbol_column(source_line, &target)
-					.ok_or(Fault::InvalidArguments)?
+				Some(
+					text
+						.lines()
+						.nth(line.saturating_sub(1) as usize)
+						.ok_or(Fault::InvalidArguments)?,
+				)
 			} else {
-				0
+				None
 			};
 			let method = if params.action == Action::Request {
 				params.method.as_deref().ok_or(Fault::InvalidArguments)?
@@ -656,27 +660,39 @@ impl LspControl for DocumentLspControl {
 			} else {
 				actions::method(params.action).ok_or(Fault::InvalidArguments)?
 			};
-			let mut request_params = actions::auto_parameters(
-				params.params.clone(),
-				Some(uri.as_str()),
-				params.line,
-				Some(character),
-			);
-			if params.action == Action::References {
-				request_params["context"] = json!({ "includeDeclaration": true });
-			}
-			if params.action == Action::Rename {
-				request_params["newName"] = json!(params.new_name);
-			}
-			if params.action == Action::Symbols {
-				request_params = json!({ "textDocument": { "uri": uri.as_str() } });
-			}
-			if params.action == Action::CodeActions {
-				request_params["range"] = json!({ "start": { "line": line - 1, "character": character }, "end": { "line": line - 1, "character": character } });
-				request_params["context"] = json!({ "diagnostics": [], "triggerKind": 1 });
-			}
 			let mut results = Vec::new();
 			for binding in &selected {
+				let encoding = binding
+					.sync_policy
+					.as_ref()
+					.map(|policy| PositionEncoding::from_lsp_name(Some(&policy.position_encoding)))
+					.unwrap_or_default();
+				let character = match (source_line, symbol_target.as_ref()) {
+					(Some(source_line), Some(target)) => {
+						navigation::resolve_symbol_column(source_line, target, encoding)
+							.ok_or(Fault::InvalidArguments)?
+					},
+					_ => 0,
+				};
+				let mut request_params = actions::auto_parameters(
+					params.params.clone(),
+					Some(uri.as_str()),
+					params.line,
+					Some(character),
+				);
+				if params.action == Action::References {
+					request_params["context"] = json!({ "includeDeclaration": true });
+				}
+				if params.action == Action::Rename {
+					request_params["newName"] = json!(params.new_name);
+				}
+				if params.action == Action::Symbols {
+					request_params = json!({ "textDocument": { "uri": uri.as_str() } });
+				}
+				if params.action == Action::CodeActions {
+					request_params["range"] = json!({ "start": { "line": line - 1, "character": character }, "end": { "line": line - 1, "character": character } });
+					request_params["context"] = json!({ "diagnostics": [], "triggerKind": 1 });
+				}
 				let response = self
 					.documents
 					.lsp_request(

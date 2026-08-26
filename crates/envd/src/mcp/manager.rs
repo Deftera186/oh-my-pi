@@ -17,7 +17,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, header::WWW_AUTHENTICATE};
 use omp_core::Str;
 use omp_inference::{
 	auth::{
-		StoreError,
+		AuthControlHandle, StoreError,
 		command::{CommandCredentialExecutor, CommandCredentialResolver},
 	},
 	id::PrincipalId,
@@ -56,8 +56,8 @@ use super::{
 	auth_authority::CombinedAuthAuthority,
 	client::{ClientError, InitializedServer, McpClient},
 	config::{
-		AuthConfig, AuthKind, ConfigSourceKind, EnvironmentPolicy, HeaderPolicy, McpServerConfig,
-		RequestIdFormat as ConfigRequestIdFormat, ResolvedServer, TransportKind, validate_server,
+		AuthConfig, AuthKind, EnvironmentPolicy, HeaderPolicy, McpServerConfig,
+		RequestIdFormat as ConfigRequestIdFormat, ResolvedConfig, TransportKind, validate_server,
 	},
 	config_values::{
 		ConfigValueError, ResolvedConfigValue, ResolvedTransportValues, resolve_transport_values,
@@ -72,9 +72,10 @@ use super::{
 	oauth::{AuthorityHeaders, McpOAuth, OAuthAttempt, OAuthFlowError},
 	prompts::{PromptContent, PromptDefinition, PromptError, PromptsClient},
 	resources::{
-		ResourceDefinition, ResourceError, ResourceTemplate, ResourcesClient, best_template,
+		ResourceDefinition, ResourceError, ResourceTemplate, ResourcesClient, template_match_score,
 	},
 	stdio::{StdioConfig, StdioTransport},
+	timeout::{McpDeadlineError, McpTimeout},
 	transport::{McpTransport, TransportError, TransportFailure},
 };
 
@@ -258,6 +259,7 @@ enum ControlTransport {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ControlAuthDeclaration {
+	#[serde(rename = "oauth")]
 	OAuth {
 		#[serde(default)]
 		scopes: Vec<Str>,
@@ -594,11 +596,7 @@ impl McpConnector for ProductionConnector {
 				ConfigRequestIdFormat::Number => RequestIdFormat::Number,
 				ConfigRequestIdFormat::String => RequestIdFormat::String,
 			};
-			let timeout = spec
-				.config
-				.timeout
-				.filter(|milliseconds| *milliseconds != 0)
-				.map(Duration::from_millis);
+			let timeout = McpTimeout::resolve(None, spec.config.timeout).duration();
 			let transport: Arc<dyn McpTransport> = match spec.config.resolved_transport() {
 				TransportKind::Stdio => {
 					let command = spec
@@ -781,6 +779,7 @@ pub struct McpManager {
 	environment:   BTreeMap<Str, Str>,
 	commands:      RwLock<Option<Arc<CommandCredentialResolver>>>,
 	authority:     RwLock<Option<Arc<CombinedAuthAuthority>>>,
+	native_auth:   RwLock<Option<AuthControlHandle>>,
 	oauth:         RwLock<Option<Arc<McpOAuth>>>,
 	state:         Mutex<ManagerState>,
 	subscriptions: Mutex<SubscriptionState>,
@@ -811,6 +810,7 @@ impl McpManager {
 				.collect(),
 			commands: RwLock::new(None),
 			authority: RwLock::new(None),
+			native_auth: RwLock::new(None),
 			oauth: RwLock::new(None),
 			state: Mutex::new(ManagerState { mounts: BTreeMap::new() }),
 			subscriptions: Mutex::new(SubscriptionState {
@@ -838,9 +838,14 @@ impl McpManager {
 			Some(Arc::new(CommandCredentialResolver::new(executor, Duration::from_secs(1))));
 	}
 
-	/// Binds the shared encrypted authority used to import native Exa keys.
+	/// Binds the MCP OAuth encrypted credential authority.
 	pub fn bind_auth_authority(&self, authority: Arc<CombinedAuthAuthority>) {
 		*self.authority.write() = Some(authority);
+	}
+
+	/// Binds the canonical native provider authority used for Exa imports.
+	pub fn bind_native_auth(&self, authority: AuthControlHandle) {
+		*self.native_auth.write() = Some(authority);
 	}
 
 	/// Binds the OAuth flow used to attach live token headers and react to
@@ -913,56 +918,42 @@ impl McpManager {
 		StartupSnapshot { status: self.service.status(None), completed }
 	}
 
-	/// Atomically refreshes live mounts from the Environment configuration
-	/// authority after a successful mutation.
-	pub async fn replace_config_entries(self: &Arc<Self>, entries: Vec<pb::McpConfigEntry>) {
-		let mut declarations = BTreeMap::new();
-		for entry in entries {
-			if declarations.contains_key(entry.name.as_str()) {
-				continue;
-			}
-			let Ok(config) = serde_json::from_slice::<McpServerConfig>(&entry.server_json) else {
-				tracing::warn!(
-					server = %entry.name,
-					"MCP config refresh skipped an invalid declaration"
-				);
-				continue;
-			};
-			if !config.enabled {
-				continue;
-			}
-			let name = Str::from(entry.name.as_str());
-			let filtered = filter_native_coverage(
-				&BTreeMap::from([(name.clone(), ResolvedServer {
-					name:        name.clone(),
-					config:      Arc::new(config),
-					source:      PathBuf::new(),
-					source_kind: ConfigSourceKind::Root,
-					writable:    true,
-				})]),
-				&NativeCoverage::default(),
-			);
-			if !filtered.exa_keys.is_empty()
-				&& let Some(authority) = self.authority.read().clone()
-				&& import_exa_keys(
-					&authority,
-					"default",
-					PrincipalId::from("default"),
-					filtered.exa_keys.clone(),
-					now_ms(),
-				)
-				.is_err()
+	/// Atomically refreshes live mounts from the precedence-resolved native
+	/// configuration authority.
+	pub async fn replace_resolved_config(
+		self: &Arc<Self>,
+		resolved: ResolvedConfig,
+	) -> StartupSnapshot {
+		let mut filtered = filter_native_coverage(&resolved.servers, &NativeCoverage::default());
+		let native_exa_ready = if filtered.covered_exa.is_empty() {
+			false
+		} else if let Some(authority) = self.native_auth.read().clone() {
+			match import_exa_keys(&authority, PrincipalId::from("default"), filtered.exa_keys.clone())
 			{
-				tracing::warn!(server = %entry.name, "MCP Exa key import failed");
+				Ok(ready) => ready,
+				Err(error) => {
+					tracing::warn!(%error, "native Exa credential import failed; retaining MCP fallback");
+					false
+				},
 			}
-			let Some(filtered) = filtered.mounts.get(&name) else {
-				continue;
-			};
-			let config = Arc::clone(&filtered.server.config);
+		} else {
+			false
+		};
+		if native_exa_ready {
+			for name in &filtered.covered_exa {
+				filtered.mounts.remove(name);
+			}
+		}
+		let mut declarations = BTreeMap::new();
+		for (name, mut filtered_mount) in filtered.mounts {
+			if filtered.covered_exa.contains(&name) && !native_exa_ready {
+				filtered_mount.suppressed_tools.clear();
+			}
+			let config = Arc::clone(&filtered_mount.server.config);
 			let values = match self.resolve_values(&config, &self.shutdown).await {
 				Ok(values) => values,
 				Err(error) => {
-					tracing::warn!(server = %entry.name, %error, "MCP config refresh skipped unresolved values");
+					tracing::warn!(server = %name, %error, "MCP config refresh skipped unresolved values");
 					continue;
 				},
 			};
@@ -976,10 +967,10 @@ impl McpManager {
 						.as_ref()
 						.is_some_and(|auth| auth.kind == AuthKind::Oauth)
 				{
-					let oauth = self.oauth.read().clone();
+					let oauth = { self.oauth.read().clone() };
 					match oauth {
 						Some(oauth) => oauth
-							.authority_headers("default", entry.name.as_str(), &config)
+							.authority_headers("default", name.as_str(), &config)
 							.await
 							.ok(),
 						None => None,
@@ -987,20 +978,20 @@ impl McpManager {
 				} else {
 					None
 				};
-			declarations.insert(Str::from(entry.name.as_str()), MountSpec {
-				name: Str::from(entry.name),
+			declarations.insert(name.clone(), MountSpec {
+				name,
 				config,
 				config_json,
 				values,
 				auth_headers,
-				suppressed_tools: filtered.suppressed_tools.clone(),
+				suppressed_tools: filtered_mount.suppressed_tools,
 				projection: McpDeviceProjection::all(),
 				auth: ControlMountAuth::None,
 				restart: McpRestartPolicy::OnFailure,
 				owner: None,
 			});
 		}
-		let _ = self.start(declarations.into_values().collect()).await;
+		self.start(declarations.into_values().collect()).await
 	}
 
 	/// Enables or disables exact resource subscriptions across every live
@@ -1436,23 +1427,66 @@ impl McpManager {
 			.cloned()
 	}
 
-	/// Accepts advertised concrete resources and the most-specific matching
-	/// RFC 6570 template before an `mcp://` read reaches the remote server.
-	pub(crate) fn routes_resource(&self, name: &str, uri: &str) -> bool {
+	/// Lists live concrete resource URIs for `mcp://` completion.
+	pub(crate) fn resource_uris(&self) -> Vec<Str> {
 		let state = self.state.lock();
-		let Some(connection) = state
+		let mut uris = state
 			.mounts
-			.get(name)
-			.and_then(|mount| mount.connection.as_ref())
-		else {
-			return false;
-		};
-		connection
-			.resources
-			.read()
-			.iter()
-			.any(|resource| resource.uri == uri)
-			|| best_template(&connection.templates.read(), uri).is_some()
+			.values()
+			.filter_map(|mount| mount.connection.as_ref())
+			.flat_map(|connection| {
+				connection
+					.resources
+					.read()
+					.iter()
+					.map(|resource| resource.uri.clone())
+					.collect::<Vec<_>>()
+			})
+			.collect::<Vec<_>>();
+		uris.sort_unstable();
+		uris.dedup();
+		uris
+	}
+
+	/// Resolves an opaque advertised resource URI to its owning live server.
+	/// Concrete resources precede templates; template ties are stable by
+	/// template text and then server name.
+	pub(crate) fn resolve_resource_server(&self, uri: &str) -> Option<Str> {
+		let state = self.state.lock();
+		for (name, mount) in &state.mounts {
+			if mount.connection.as_ref().is_some_and(|connection| {
+				connection
+					.resources
+					.read()
+					.iter()
+					.any(|resource| resource.uri == uri)
+			}) {
+				return Some(name.clone());
+			}
+		}
+		let mut best: Option<(usize, Str, Str)> = None;
+		for (name, mount) in &state.mounts {
+			let Some(connection) = mount.connection.as_ref() else {
+				continue;
+			};
+			for template in connection.templates.read().iter() {
+				let Some(score) = template_match_score(template.uri_template.as_str(), uri) else {
+					continue;
+				};
+				let replace = best
+					.as_ref()
+					.is_none_or(|(best_score, best_template, best_name)| {
+						score > *best_score
+							|| (score == *best_score
+								&& (template.uri_template < *best_template
+									|| (template.uri_template == *best_template && name < best_name)))
+					});
+				if replace {
+					best = Some((score, template.uri_template.clone(), name.clone()));
+				}
+			}
+		}
+		best.map(|(_, _, name)| name)
 	}
 
 	pub(crate) async fn connection(
@@ -1657,7 +1691,13 @@ impl McpManager {
 			let Some(mount) = state.mounts.get(name) else {
 				return false;
 			};
-			if mount.generation != generation || mount.spec.auth_headers.is_some() {
+			if mount.generation != generation
+				|| mount
+					.spec
+					.auth_headers
+					.as_ref()
+					.is_some_and(|headers| !headers.should_reauthorize())
+			{
 				return false;
 			}
 			let Some(server_url) = mount.spec.config.url.clone() else {
@@ -1712,6 +1752,30 @@ impl McpManager {
 		name: &str,
 		generation: u64,
 	) -> Result<Arc<LiveConnection>, ManagerError> {
+		let timeout_ms = {
+			let state = self.state.lock();
+			let mount = state.mounts.get(name).ok_or(ManagerError::ServerNotFound)?;
+			if mount.generation != generation {
+				return Err(ManagerError::StaleGeneration);
+			}
+			mount.spec.config.timeout
+		};
+		let cancellation = self.shutdown.child_token();
+		match McpTimeout::resolve(None, timeout_ms)
+			.run(&cancellation, self.connect_once_with_no_outer_deadline(name, generation))
+			.await
+		{
+			Ok(result) => result,
+			Err(McpDeadlineError::Cancelled) => Err(ManagerError::Cancelled),
+			Err(McpDeadlineError::TimedOut) => Err(ManagerError::TimedOut),
+		}
+	}
+
+	async fn connect_once_with_no_outer_deadline(
+		self: &Arc<Self>,
+		name: &str,
+		generation: u64,
+	) -> Result<Arc<LiveConnection>, ManagerError> {
 		let spec = {
 			let state = self.state.lock();
 			let mount = state.mounts.get(name).ok_or(ManagerError::ServerNotFound)?;
@@ -1724,7 +1788,12 @@ impl McpManager {
 			.connector
 			.connect(&spec, Arc::clone(&self.workspace), self.shutdown.child_token())
 			.await?;
-		let tools = list_tools(connected.client.transport(), self.shutdown.child_token()).await?;
+		let supports_tools = connected.initialized.capabilities.get("tools").is_some();
+		let tools = if supports_tools {
+			list_tools(connected.client.transport(), self.shutdown.child_token()).await?
+		} else {
+			Vec::new()
+		};
 		let supports_resources = connected
 			.initialized
 			.capabilities
@@ -2141,6 +2210,11 @@ impl McpManager {
 			}
 			self.publish_status(name, generation, pb::McpLifecycleState::Starting, "reconnecting");
 			let mut result = self.connect_once(name, generation).await;
+			let mut reauthorized = false;
+			if is_unauthorized(&result) && self.authorize_initial(name, generation).await {
+				reauthorized = true;
+				result = self.connect_once(name, generation).await;
+			}
 			for delay in RECONNECT_DELAYS {
 				if result.is_ok() {
 					break;
@@ -2154,6 +2228,13 @@ impl McpManager {
 					() = tokio::time::sleep(delay) => {},
 				}
 				result = self.connect_once(name, generation).await;
+				if !reauthorized
+					&& is_unauthorized(&result)
+					&& self.authorize_initial(name, generation).await
+				{
+					reauthorized = true;
+					result = self.connect_once(name, generation).await;
+				}
 			}
 			{
 				let mut state = self.state.lock();
@@ -2544,13 +2625,13 @@ fn manager_service_error(error: ManagerError) -> McpServiceError {
 }
 
 fn is_unauthorized(result: &Result<Arc<LiveConnection>, ManagerError>) -> bool {
-	matches!(
-		result,
-		Err(ManagerError::Client(ClientError::Transport(TransportError {
-			cause: TransportFailure::HttpStatus { status: 401 },
-			..
-		})))
-	)
+	match result {
+		Err(ManagerError::Client(ClientError::Transport(error)))
+		| Err(ManagerError::Transport(error)) => {
+			matches!(error.cause, TransportFailure::HttpStatus { status: 401 | 403 })
+		},
+		_ => false,
+	}
 }
 
 /// Lifecycle, transport, or definition publication failure.
@@ -2589,6 +2670,9 @@ pub enum ManagerError {
 	/// Caller cancelled the operation.
 	#[error("MCP manager operation was cancelled")]
 	Cancelled,
+	/// Effective connection deadline elapsed.
+	#[error("MCP server connection timed out")]
+	TimedOut,
 	/// A CONTROL caller attempted to cross an extension-generation ownership
 	/// boundary.
 	#[error("MCP mount is owned by another extension generation")]
@@ -2614,4 +2698,145 @@ pub enum ManagerError {
 	/// Revisioned leaf publication failed.
 	#[error(transparent)]
 	Service(#[from] McpServiceError),
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::mcp::{
+		config_values::ResolvedTransportValues,
+		json_rpc::RequestId,
+		transport::{
+			DispatchState, IncomingMessage, ServerResponseError, TransportFuture, TransportResponse,
+		},
+	};
+
+	struct CatalogTransport {
+		methods: Mutex<Vec<Str>>,
+	}
+
+	impl McpTransport for CatalogTransport {
+		fn request<'a>(
+			&'a self,
+			method: &'a str,
+			_params: Value,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<TransportResponse, TransportError>> {
+			self.methods.lock().push(Str::from(method));
+			let result = match method {
+				"resources/list" => json!({ "resources": [] }),
+				"resources/templates/list" => json!({ "resourceTemplates": [] }),
+				"prompts/list" => json!({ "prompts": [] }),
+				_ => panic!("unexpected method {method}"),
+			};
+			Box::pin(async move {
+				Ok(TransportResponse {
+					id: RequestId::Number(1),
+					result,
+					dispatch: DispatchState::Responded,
+				})
+			})
+		}
+
+		fn notify<'a>(
+			&'a self,
+			_method: &'a str,
+			_params: Value,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+			Box::pin(async { Ok(DispatchState::Dispatched) })
+		}
+
+		fn next_message<'a>(
+			&'a self,
+			cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<IncomingMessage, TransportError>> {
+			Box::pin(async move {
+				cancellation.cancelled().await;
+				Err(TransportError::pre_dispatch(TransportFailure::Cancelled))
+			})
+		}
+
+		fn respond<'a>(
+			&'a self,
+			_id: RequestId,
+			_result: Result<Value, ServerResponseError>,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+			Box::pin(async { Ok(DispatchState::Dispatched) })
+		}
+
+		fn close(&self) -> TransportFuture<'_, Result<(), TransportError>> {
+			Box::pin(async { Ok(()) })
+		}
+	}
+
+	struct CatalogConnector {
+		transport: Arc<CatalogTransport>,
+	}
+
+	impl McpConnector for CatalogConnector {
+		fn connect<'a>(
+			&'a self,
+			_spec: &'a MountSpec,
+			roots: Arc<[Str]>,
+			_cancel: CancellationToken,
+		) -> Pin<Box<dyn Future<Output = Result<ConnectedClient, ManagerError>> + Send + 'a>> {
+			let transport: Arc<dyn McpTransport> = self.transport.clone();
+			Box::pin(async move {
+				Ok(ConnectedClient {
+					client:      Arc::new(McpClient::new(transport, roots)),
+					initialized: InitializedServer {
+						protocol_version: Str::from("2025-11-25"),
+						name:             Str::from("resource-only"),
+						version:          None,
+						title:            None,
+						description:      None,
+						capabilities:     json!({ "resources": {}, "prompts": {} }),
+						instructions:     None,
+					},
+				})
+			})
+		}
+	}
+
+	#[tokio::test]
+	async fn resource_and_prompt_only_server_never_receives_tools_list() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
+		let transport = Arc::new(CatalogTransport { methods: Mutex::new(Vec::new()) });
+		let manager = McpManager::new(
+			Arc::clone(&service),
+			Arc::new(CatalogConnector { transport: transport.clone() }),
+			Arc::from([]),
+			scratch.path().to_path_buf(),
+		);
+		service.bind_manager(&manager);
+		let config = Arc::new(
+			serde_json::from_value::<McpServerConfig>(json!({
+				"type": "http",
+				"url": "https://example.test/mcp"
+			}))
+			.expect("config"),
+		);
+		let config_json = Bytes::from(serde_json::to_vec(config.as_ref()).expect("config JSON"));
+		manager
+			.start(vec![MountSpec {
+				name: Str::from("resource-only"),
+				config,
+				config_json,
+				values: ResolvedTransportValues::default(),
+				auth_headers: None,
+				suppressed_tools: BTreeSet::new(),
+				projection: McpDeviceProjection::all(),
+				auth: ControlMountAuth::None,
+				restart: McpRestartPolicy::Never,
+				owner: None,
+			}])
+			.await;
+		assert_eq!(transport.methods.lock().clone(), vec![
+			Str::from("resources/list"),
+			Str::from("resources/templates/list"),
+			Str::from("prompts/list"),
+		]);
+	}
 }

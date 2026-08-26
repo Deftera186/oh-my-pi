@@ -88,7 +88,10 @@ use nix::unistd::User;
 use omp_agent::control::ControlSender;
 use omp_core::{Hash32, Str, Ulid, sf};
 use omp_env::EnvClient;
+use omp_ext::config::ContributedCliValue;
+use omp_inference::auth::AuthControlHandle;
 use omp_proto::env::v1::{ClientHello, RegisterPresence, ReleasePresence, ServerHello};
+use omp_settings::snapshot::SettingsSnapshot;
 use omp_storage::index::SessionIndex;
 use omp_tool::Registry;
 use omp_tools::eval::EvalSessionControl;
@@ -105,8 +108,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 pub use tools::{
 	ActiveContentInputs, CommandCredentialExecutorFactory, ContentResolver, DynamicTool,
-	GoalAuthority, HostResourceResult, HostResources, RegistryBridges, SearchInference,
-	TelemetryUpload,
+	DynamicToolFactory, GoalAuthority, HostResourceResult, HostResources, RegistryBridges,
+	SearchInference, TelemetryUpload,
 };
 #[cfg(windows)]
 use windows::OwnerPipeListener;
@@ -355,13 +358,18 @@ impl Drop for ProjectLifecycle {
 fn bind_command_credentials(
 	server: &EnvServer,
 	factory: Option<Arc<dyn CommandCredentialExecutorFactory>>,
+	dynamic_tools: &[Arc<dyn DynamicToolFactory>],
 	client: EnvClient,
+	dynamic_client: EnvClient,
 	root: &Path,
 ) {
 	if let Some(factory) = factory {
 		server
 			.mcp_manager()
-			.bind_command_executor(factory.make(client, root));
+			.bind_command_executor(factory.make(client.clone(), root));
+	}
+	for factory in dynamic_tools {
+		factory.bind(dynamic_client.clone(), root);
 	}
 }
 
@@ -378,6 +386,7 @@ impl ProjectEnvironment {
 		py_eval: bool,
 		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
@@ -413,6 +422,7 @@ impl ProjectEnvironment {
 										py_eval,
 										approval_mode,
 										trusted_extensions,
+										contributed_values,
 										interrupt_grace,
 										bridges,
 									)
@@ -427,7 +437,25 @@ impl ProjectEnvironment {
 							"stale-build environment daemon kept its socket; using an in-process environment"
 						);
 					},
-					Ok(_) => bridge.abort(),
+					Ok(_) => {
+						let owner_bridge = tokio::spawn(async move {
+							let _ = bridge.await;
+						});
+						return Self::connect_peer(
+							root,
+							state_dir,
+							docserver_socket,
+							py_eval,
+							approval_mode,
+							trusted_extensions,
+							contributed_values,
+							interrupt_grace,
+							owner_probe,
+							owner_bridge,
+							bridges,
+						)
+						.await;
+					},
 					Err(EnvdError::Client(omp_env::ClientError::Protocol(error))) => {
 						// Owners from before the current schema revision reject
 						// the hello outright; their endpoint drains with its
@@ -442,13 +470,15 @@ impl ProjectEnvironment {
 					},
 					Err(error) => return Err(error),
 				}
-				Self::connect_peer(
+				Self::start(
 					root,
 					state_dir,
+					socket,
 					docserver_socket,
 					py_eval,
 					approval_mode,
 					trusted_extensions,
+					contributed_values,
 					interrupt_grace,
 					bridges,
 				)
@@ -464,13 +494,15 @@ impl ProjectEnvironment {
 				// authorities outlive this process, then join it as a peer.
 				match spawn_project_daemon(root, state_dir, socket, docserver_socket).await {
 					Ok(()) => {
-						Self::connect_peer(
+						Self::connect_owner_peer(
 							root,
 							state_dir,
+							socket,
 							docserver_socket,
 							py_eval,
 							approval_mode,
 							trusted_extensions,
+							contributed_values,
 							interrupt_grace,
 							bridges,
 						)
@@ -490,6 +522,7 @@ impl ProjectEnvironment {
 							py_eval,
 							approval_mode,
 							trusted_extensions,
+							contributed_values,
 							interrupt_grace,
 							bridges,
 						)
@@ -513,6 +546,7 @@ impl ProjectEnvironment {
 		py_eval: bool,
 		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
@@ -540,6 +574,7 @@ impl ProjectEnvironment {
 										py_eval,
 										approval_mode,
 										trusted_extensions,
+										contributed_values,
 										interrupt_grace,
 										bridges,
 									)
@@ -550,7 +585,25 @@ impl ProjectEnvironment {
 							}
 						}
 					},
-					Ok(_) => bridge.abort(),
+					Ok(_) => {
+						let owner_bridge = tokio::spawn(async move {
+							let _ = bridge.await;
+						});
+						return Self::connect_peer(
+							root,
+							state_dir,
+							docserver_socket,
+							py_eval,
+							approval_mode,
+							trusted_extensions,
+							contributed_values,
+							interrupt_grace,
+							owner_probe,
+							owner_bridge,
+							bridges,
+						)
+						.await;
+					},
 					Err(omp_env::ClientError::Protocol(error)) => {
 						bridge.abort();
 						tracing::warn!(
@@ -562,13 +615,15 @@ impl ProjectEnvironment {
 					},
 					Err(error) => return Err(EnvdError::Client(error)),
 				}
-				Self::connect_peer(
+				Self::start(
 					root,
 					state_dir,
+					socket,
 					docserver_socket,
 					py_eval,
 					approval_mode,
 					trusted_extensions,
+					contributed_values,
 					interrupt_grace,
 					bridges,
 				)
@@ -582,13 +637,15 @@ impl ProjectEnvironment {
 			{
 				match spawn_project_daemon(root, state_dir, socket, docserver_socket).await {
 					Ok(()) => {
-						Self::connect_peer(
+						Self::connect_owner_peer(
 							root,
 							state_dir,
+							socket,
 							docserver_socket,
 							py_eval,
 							approval_mode,
 							trusted_extensions,
+							contributed_values,
 							interrupt_grace,
 							bridges,
 						)
@@ -608,6 +665,7 @@ impl ProjectEnvironment {
 							py_eval,
 							approval_mode,
 							trusted_extensions,
+							contributed_values,
 							interrupt_grace,
 							bridges,
 						)
@@ -617,6 +675,154 @@ impl ProjectEnvironment {
 			},
 			Err(error) => Err(error.into()),
 		}
+	}
+
+	/// Starts an isolated in-process environment from one exact layered settings
+	/// snapshot.
+	///
+	/// This path never joins or reuses an existing environment owner, so every
+	/// tool and security owner is composed from `settings` for `root`.
+	pub async fn start_with_settings_snapshot(
+		root: &Path,
+		state_dir: &Path,
+		docserver_socket: &Path,
+		py_eval: bool,
+		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
+		settings: Arc<SettingsSnapshot>,
+		bridges: RegistryBridges,
+	) -> Result<Self, EnvdError> {
+		let interrupt_grace = settings
+			.project::<host_settings::HostSettings>()
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+			.get()
+			.runtime
+			.interrupt_grace;
+		let command_credentials = bridges.command_credentials.clone();
+		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			contributed_values,
+			interrupt_grace,
+		)?;
+		let server = EnvServer::open_project(
+			root,
+			state_dir,
+			docserver_socket,
+			Registry::new(),
+			None,
+			worker_config,
+			None,
+			None,
+			Some(settings.as_ref()),
+			bridges,
+		)
+		.await?;
+		let server = Arc::new(server);
+		let registry = server.registry();
+		let eval_bridge = server.eval_bridge();
+		let reflection_bridge = server.reflection_bridge();
+		let eval_control = server.eval_control();
+		let search_bridge = server.search_bridge();
+		let github_credentials = server.github_credentials();
+		let (client, transport) = EnvClient::in_process(64);
+		bind_command_credentials(
+			&server,
+			command_credentials,
+			&dynamic_tool_factories,
+			client.clone(),
+			client.clone(),
+			root,
+		);
+		let in_process_server = Arc::clone(&server);
+		let in_process =
+			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
+		let shutdown = CancellationToken::new();
+		let mut tasks = vec![in_process];
+		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
+		hello(&client).await?;
+		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
+		Ok(Self {
+			client,
+			registry,
+			eval_bridge,
+			reflection_bridge,
+			eval_control,
+			search_bridge,
+			github_credentials,
+			lifecycle,
+		})
+	}
+
+	/// Joins the project as a peer of an already-running owner environment.
+	#[cfg(unix)]
+	async fn connect_owner_peer(
+		root: &Path,
+		state_dir: &Path,
+		socket: &Path,
+		docserver_socket: &Path,
+		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
+		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
+		interrupt_grace: omp_core::Duration,
+		bridges: RegistryBridges,
+	) -> Result<Self, EnvdError> {
+		let (owner, bridge) = EnvServer::connect_owner_uds(socket).await?;
+		hello(&owner).await?;
+		let bridge = tokio::spawn(async move {
+			let _ = bridge.await;
+		});
+		Self::connect_peer(
+			root,
+			state_dir,
+			docserver_socket,
+			py_eval,
+			approval_mode,
+			trusted_extensions,
+			contributed_values,
+			interrupt_grace,
+			owner,
+			bridge,
+			bridges,
+		)
+		.await
+	}
+
+	#[cfg(windows)]
+	async fn connect_owner_peer(
+		root: &Path,
+		state_dir: &Path,
+		socket: &Path,
+		docserver_socket: &Path,
+		py_eval: bool,
+		approval_mode: Option<ApprovalMode>,
+		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
+		interrupt_grace: omp_core::Duration,
+		bridges: RegistryBridges,
+	) -> Result<Self, EnvdError> {
+		let (owner, bridge) = crate::windows::connect_owner_pipe(socket)?;
+		hello(&owner).await?;
+		let bridge = tokio::spawn(async move {
+			let _ = bridge.await;
+		});
+		Self::connect_peer(
+			root,
+			state_dir,
+			docserver_socket,
+			py_eval,
+			approval_mode,
+			trusted_extensions,
+			contributed_values,
+			interrupt_grace,
+			owner,
+			bridge,
+			bridges,
+		)
+		.await
 	}
 
 	/// Joins the project as a peer of an already-running owner environment.
@@ -631,20 +837,32 @@ impl ProjectEnvironment {
 		py_eval: bool,
 		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
 		interrupt_grace: omp_core::Duration,
+		owner_client: EnvClient,
+		owner_bridge: JoinHandle<()>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let command_credentials = bridges.command_credentials.clone();
-		let (worker_config, data_bindings) =
-			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
+		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			contributed_values,
+			interrupt_grace,
+		)?;
+		let dynamic_tool_client = owner_client.clone();
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
 			docserver_socket,
 			Registry::new(),
+			Some(owner_client),
 			worker_config,
 			None,
 			approval_mode,
+			None,
 			bridges,
 		)
 		.await?;
@@ -656,12 +874,19 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
-		bind_command_credentials(&server, command_credentials, client.clone(), root);
+		bind_command_credentials(
+			&server,
+			command_credentials,
+			&dynamic_tool_factories,
+			client.clone(),
+			dynamic_tool_client,
+			root,
+		);
 		let in_process_server = Arc::clone(&server);
 		let in_process =
 			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
 		let shutdown = CancellationToken::new();
-		let mut tasks = vec![in_process];
+		let mut tasks = vec![in_process, owner_bridge];
 		spawn_extension_data_servers(&server, data_bindings, &shutdown, &mut tasks);
 		hello(&client).await?;
 		let lifecycle = ProjectLifecycle { shutdown: Some(shutdown), tasks, server };
@@ -686,20 +911,29 @@ impl ProjectEnvironment {
 		py_eval: bool,
 		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let command_credentials = bridges.command_credentials.clone();
-		let (worker_config, data_bindings) =
-			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
+		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			contributed_values,
+			interrupt_grace,
+		)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
 			docserver_socket,
 			Registry::new(),
+			None,
 			worker_config,
 			None,
 			approval_mode,
+			None,
 			bridges,
 		)
 		.await?;
@@ -711,7 +945,14 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
-		bind_command_credentials(&server, command_credentials, client.clone(), root);
+		bind_command_credentials(
+			&server,
+			command_credentials,
+			&dynamic_tool_factories,
+			client.clone(),
+			client.clone(),
+			root,
+		);
 		let in_process_server = Arc::clone(&server);
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
@@ -756,21 +997,30 @@ impl ProjectEnvironment {
 		py_eval: bool,
 		approval_mode: Option<ApprovalMode>,
 		trusted_extensions: &[ExtHostSpec],
+		contributed_values: &[ContributedCliValue],
 		interrupt_grace: omp_core::Duration,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let owner_listener = OwnerPipeListener::bind(socket)?;
 		let command_credentials = bridges.command_credentials.clone();
-		let (worker_config, data_bindings) =
-			worker_config(state_dir, py_eval, trusted_extensions, interrupt_grace)?;
+		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
+		let (worker_config, data_bindings) = worker_config(
+			state_dir,
+			py_eval,
+			trusted_extensions,
+			contributed_values,
+			interrupt_grace,
+		)?;
 		let server = EnvServer::open_project(
 			root,
 			state_dir,
 			docserver_socket,
 			Registry::new(),
+			None,
 			worker_config,
 			None,
 			approval_mode,
+			None,
 			bridges,
 		)
 		.await?;
@@ -782,7 +1032,14 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
-		bind_command_credentials(&server, command_credentials, client.clone(), root);
+		bind_command_credentials(
+			&server,
+			command_credentials,
+			&dynamic_tool_factories,
+			client.clone(),
+			client.clone(),
+			root,
+		);
 		let in_process_server = Arc::clone(&server);
 		let in_process = tokio::spawn(async move {
 			in_process_server.serve_in_process(transport).await;
@@ -820,8 +1077,9 @@ impl ProjectEnvironment {
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let command_credentials = bridges.command_credentials.clone();
+		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
 		let (worker_config, data_bindings) =
-			worker_config(state_dir, true, &[], omp_tool::DEFAULT_INTERRUPT_GRACE)?;
+			worker_config(state_dir, true, &[], &[], omp_tool::DEFAULT_INTERRUPT_GRACE)?;
 		let server = Arc::new(
 			EnvServer::open_local(root, state_dir, Registry::new(), worker_config, bridges).await?,
 		);
@@ -832,7 +1090,14 @@ impl ProjectEnvironment {
 		let search_bridge = server.search_bridge();
 		let github_credentials = server.github_credentials();
 		let (client, transport) = EnvClient::in_process(64);
-		bind_command_credentials(&server, command_credentials, client.clone(), root);
+		bind_command_credentials(
+			&server,
+			command_credentials,
+			&dynamic_tool_factories,
+			client.clone(),
+			client.clone(),
+			root,
+		);
 		let in_process_server = Arc::clone(&server);
 		let in_process =
 			tokio::spawn(async move { in_process_server.serve_in_process(transport).await });
@@ -860,17 +1125,31 @@ impl ProjectEnvironment {
 
 	/// Binds the application's shared credential authority and MCP OAuth flow
 	/// after production inference has opened the canonical credential store.
-	pub fn bind_mcp_oauth(
+	pub async fn bind_mcp_oauth(
 		&self,
 		authority: Arc<mcp::auth_authority::CombinedAuthAuthority>,
 		oauth: Arc<mcp::oauth::McpOAuth>,
-	) {
+		native_auth: AuthControlHandle,
+	) -> Result<(), EnvdError> {
 		self
 			.lifecycle
 			.server
 			.mcp_manager()
 			.bind_auth_authority(authority);
 		self.lifecycle.server.mcp_manager().bind_oauth(oauth);
+		self
+			.lifecycle
+			.server
+			.mcp_manager()
+			.bind_native_auth(native_auth);
+		self
+			.lifecycle
+			.server
+			.mcp()
+			.reload_native_configs()
+			.await
+			.map(|_| ())
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))
 	}
 
 	/// Returns the immutable production tool registry.
@@ -953,6 +1232,11 @@ impl ProjectEnvironment {
 	/// Returns the Environment-owned authoritative sessions index.
 	pub fn sessions_index(&self) -> Arc<SessionIndex> {
 		self.lifecycle.server.sessions_index()
+	}
+
+	/// Returns the authenticated session generation fencing CONTROL clients.
+	pub fn session_generation(&self) -> u64 {
+		self.lifecycle.server.session_generation()
 	}
 
 	/// Binds the same production CONTROL router used by spawned extension
@@ -1098,6 +1382,7 @@ fn worker_config(
 	state_dir: &Path,
 	py_eval: bool,
 	trusted_extensions: &[ExtHostSpec],
+	contributed_values: &[ContributedCliValue],
 	interrupt_grace: omp_core::Duration,
 ) -> Result<(ExtHostConfig, Vec<ExtensionDataBinding>), EnvdError> {
 	let (authority, session_id, session_generation) = authenticated_runtime_identity()?;
@@ -1107,6 +1392,9 @@ fn worker_config(
 		session_generation,
 	)?;
 	config.interrupt_grace = interrupt_grace;
+	config
+		.contributed_values
+		.extend_from_slice(contributed_values);
 	let mut bindings = Vec::new();
 	if py_eval {
 		let key = HostKey::new("workspace", "trusted", PY_EVAL_MODULE);

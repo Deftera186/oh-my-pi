@@ -26,8 +26,8 @@ use super::{
 	header_policy,
 	header_policy::{HeaderPolicyError, RedirectPolicy, redirect_location},
 	http::{
-		HttpExchange, HttpExchangeError, HttpRequest, HttpResponse, RefreshableHeaders,
-		parse_sse_events,
+		HttpBody, HttpExchange, HttpExchangeError, HttpRequest, HttpResponse, RefreshableHeaders,
+		SseEvent,
 	},
 	json_rpc::{RequestId, RequestIdAllocator, RequestIdFormat},
 	transport::{
@@ -66,6 +66,7 @@ pub struct LegacySseTransport {
 	endpoint:    Mutex<Option<Url>>,
 	ids:         Mutex<RequestIdAllocator>,
 	pending:     Mutex<HashMap<RequestId, oneshot::Sender<PendingResult>>>,
+	discovery:   tokio::sync::Mutex<Option<HttpBody>>,
 	incoming_tx: flume::Sender<IncomingMessage>,
 	incoming_rx: Receiver<IncomingMessage>,
 	closed:      AtomicBool,
@@ -87,6 +88,7 @@ impl LegacySseTransport {
 			endpoint: Mutex::new(None),
 			ids: Mutex::new(RequestIdAllocator::default()),
 			pending: Mutex::new(HashMap::new()),
+			discovery: tokio::sync::Mutex::new(None),
 			incoming_tx,
 			incoming_rx,
 			closed: AtomicBool::new(false),
@@ -97,7 +99,7 @@ impl LegacySseTransport {
 			.as_ref()
 			.map_or_else(HeaderMap::new, |auth| auth.current());
 		generated.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-		let response = transport
+		let mut response = transport
 			.exchange(
 				transport.config.url.clone(),
 				Method::GET,
@@ -107,14 +109,50 @@ impl LegacySseTransport {
 				false,
 			)
 			.await?;
+		if matches!(response.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+			&& let Some(auth) = &transport.config.auth
+			&& auth.refresh().await
+		{
+			generated = auth.current();
+			generated.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+			response = transport
+				.exchange(
+					transport.config.url.clone(),
+					Method::GET,
+					Bytes::new(),
+					generated,
+					&cancellation,
+					false,
+				)
+				.await?;
+		}
 		if !response.status.is_success() {
 			return Err(TransportError::pre_dispatch(TransportFailure::HttpStatus {
 				status: response.status.as_u16(),
 			}));
 		}
-		transport.consume_discovery(&response.body)?;
-		if transport.endpoint.lock().is_none() {
+		if !response
+			.headers
+			.get(CONTENT_TYPE)
+			.and_then(|value| value.to_str().ok())
+			.is_some_and(|value| value.contains("text/event-stream"))
+		{
 			return Err(TransportError::pre_dispatch(TransportFailure::SseProtocol));
+		}
+		let mut body = response.body;
+		loop {
+			let event = body
+				.next_sse_event(&cancellation)
+				.await
+				.map_err(TransportError::pre_dispatch)?;
+			let Some(event) = event else {
+				return Err(TransportError::pre_dispatch(TransportFailure::SseProtocol));
+			};
+			transport.consume_discovery_event(event)?;
+			if transport.endpoint.lock().is_some() {
+				*transport.discovery.lock().await = Some(body);
+				break;
+			}
 		}
 		Ok(transport)
 	}
@@ -204,67 +242,85 @@ impl LegacySseTransport {
 		Ok(response)
 	}
 
-	fn consume_discovery(&self, body: &[u8]) -> Result<(), TransportError> {
-		for event in parse_sse_events(body).map_err(|cause| TransportError::pre_dispatch(cause))? {
-			if event
-				.event
-				.as_ref()
-				.is_some_and(|name| name.as_str() == "endpoint")
-			{
-				let endpoint = self.config.url.join(event.data.trim()).map_err(|source| {
-					TransportError::pre_dispatch(TransportFailure::HeaderPolicy(HeaderPolicyError::Url(
-						source,
-					)))
-				})?;
-				if origin(&endpoint) != origin(&self.config.url) {
-					return Err(TransportError::pre_dispatch(TransportFailure::SseProtocol));
-				}
-				*self.endpoint.lock() = Some(endpoint);
-			} else if !event.data.is_empty() && event.data != "[DONE]" {
-				self.consume_message_data(&event.data)?;
+	fn consume_discovery_event(&self, event: SseEvent) -> Result<(), TransportError> {
+		if event
+			.event
+			.as_ref()
+			.is_some_and(|name| name.as_str() == "endpoint")
+		{
+			let endpoint = self.config.url.join(event.data.trim()).map_err(|source| {
+				TransportError::pre_dispatch(TransportFailure::HeaderPolicy(HeaderPolicyError::Url(
+					source,
+				)))
+			})?;
+			if origin(&endpoint) != origin(&self.config.url) {
+				return Err(TransportError::pre_dispatch(TransportFailure::SseProtocol));
 			}
+			*self.endpoint.lock() = Some(endpoint);
+		} else if !event.data.is_empty() && event.data != "[DONE]" {
+			self.consume_message_data(&event.data, None)?;
 		}
 		Ok(())
 	}
 
-	fn consume_message_data(&self, data: &str) -> Result<(), TransportError> {
+	fn consume_message_data(
+		&self,
+		data: &str,
+		expected: Option<&RequestId>,
+	) -> Result<bool, TransportError> {
 		let payload: Value = serde_json::from_str(data)
 			.map_err(|source| TransportError::effects_unknown(TransportFailure::Json(source)))?;
+		let mut matched = false;
 		for message in payload
 			.as_array()
 			.map_or_else(|| vec![payload.clone()], Clone::clone)
 		{
-			self.dispatch(&message);
+			matched |= self.dispatch(&message, expected);
 		}
-		Ok(())
+		Ok(matched)
 	}
 
-	fn consume_post_body(&self, response: &HttpResponse) -> Result<(), TransportError> {
-		if response.body.is_empty() {
-			return Ok(());
-		}
+	async fn consume_post_body(
+		&self,
+		mut response: HttpResponse,
+		expected: Option<&RequestId>,
+		cancellation: &CancellationToken,
+	) -> Result<(), TransportError> {
 		if response
 			.headers
 			.get(CONTENT_TYPE)
 			.and_then(|value| value.to_str().ok())
 			.is_some_and(|value| value.contains("text/event-stream"))
 		{
-			for event in parse_sse_events(&response.body)
-				.map_err(|cause| TransportError::effects_unknown(cause))?
+			while let Some(event) = response
+				.body
+				.next_sse_event(cancellation)
+				.await
+				.map_err(TransportError::effects_unknown)?
 			{
-				if !event.data.is_empty() {
-					self.consume_message_data(&event.data)?;
+				if !event.data.is_empty() && self.consume_message_data(&event.data, expected)? {
+					break;
+				}
+				if expected.is_none() {
+					break;
 				}
 			}
 		} else {
-			let value: Value = serde_json::from_slice(&response.body)
-				.map_err(|source| TransportError::effects_unknown(TransportFailure::Json(source)))?;
-			self.dispatch(&value);
+			let body = response
+				.body
+				.read_to_end(cancellation)
+				.await
+				.map_err(TransportError::effects_unknown)?;
+			if !body.is_empty() {
+				let value: Value = serde_json::from_slice(&body)
+					.map_err(|source| TransportError::effects_unknown(TransportFailure::Json(source)))?;
+				self.dispatch(&value, expected);
+			}
 		}
 		Ok(())
 	}
 
-	fn dispatch(&self, message: &Value) {
+	fn dispatch(&self, message: &Value, expected: Option<&RequestId>) -> bool {
 		if let Some(id) = message
 			.get("id")
 			.and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
@@ -279,11 +335,12 @@ impl LegacySseTransport {
 					|| PendingResult::Value(message.get("result").cloned().unwrap_or(Value::Null)),
 					PendingResult::RpcError,
 				);
+			let matched = expected == Some(&id);
 			let _ = pending.send(result);
-			return;
+			return matched;
 		}
 		let Some(method) = message.get("method").and_then(Value::as_str) else {
-			return;
+			return false;
 		};
 		let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
 		let incoming = match message
@@ -294,6 +351,7 @@ impl LegacySseTransport {
 			None => IncomingMessage::Notification { method: Str::from(method), params },
 		};
 		let _ = self.incoming_tx.try_send(incoming);
+		false
 	}
 
 	async fn request_inner(
@@ -330,7 +388,9 @@ impl LegacySseTransport {
 				cause:    TransportFailure::HttpStatus { status: response.status.as_u16() },
 			});
 		}
-		self.consume_post_body(&response)?;
+		self
+			.consume_post_body(response, Some(&id), &cancellation)
+			.await?;
 		let receive = async { receiver.await.unwrap_or(PendingResult::Closed) };
 		let pending = if let Some(timeout) = self.config.timeout {
 			tokio::select! { () = cancellation.cancelled() => { self.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::Cancelled)); }, value = tokio::time::timeout(timeout, receive) => match value { Ok(value) => value, Err(_) => { self.pending.lock().remove(&id); return Err(TransportError::effects_unknown(TransportFailure::TimedOut)); } } }
@@ -357,7 +417,15 @@ impl McpTransport for LegacySseTransport {
 		params: Value,
 		cancellation: CancellationToken,
 	) -> TransportFuture<'a, Result<TransportResponse, TransportError>> {
-		Box::pin(self.request_inner(method, params, cancellation))
+		Box::pin(async move {
+			let operation = self.request_inner(method, params, cancellation);
+			match self.config.timeout {
+				Some(timeout) => tokio::time::timeout(timeout, operation)
+					.await
+					.map_err(|_| TransportError::effects_unknown(TransportFailure::TimedOut))?,
+				None => operation.await,
+			}
+		})
 	}
 
 	fn notify<'a>(
@@ -372,7 +440,9 @@ impl McpTransport for LegacySseTransport {
 				.map_err(|source| TransportError::pre_dispatch(TransportFailure::Json(source)))?;
 			let response = self.post(body, &cancellation).await?;
 			if response.status.is_success() || response.status == StatusCode::ACCEPTED {
-				self.consume_post_body(&response)?;
+				self
+					.consume_post_body(response, None, &cancellation)
+					.await?;
 				Ok(DispatchState::Dispatched)
 			} else {
 				Err(TransportError {
@@ -388,7 +458,29 @@ impl McpTransport for LegacySseTransport {
 		cancellation: CancellationToken,
 	) -> TransportFuture<'a, Result<IncomingMessage, TransportError>> {
 		Box::pin(async move {
-			tokio::select! { () = cancellation.cancelled() => Err(TransportError::pre_dispatch(TransportFailure::Cancelled)), value = self.incoming_rx.recv_async() => value.map_err(|_| TransportError::pre_dispatch(TransportFailure::Closed)) }
+			loop {
+				if let Ok(message) = self.incoming_rx.try_recv() {
+					return Ok(message);
+				}
+				let mut discovery = self.discovery.lock().await;
+				let Some(body) = discovery.as_mut() else {
+					return Err(TransportError::pre_dispatch(TransportFailure::Closed));
+				};
+				let event = body
+					.next_sse_event(&cancellation)
+					.await
+					.map_err(TransportError::pre_dispatch)?;
+				match event {
+					Some(event) => {
+						self.consume_discovery_event(event)?;
+						drop(discovery);
+					},
+					None => {
+						*discovery = None;
+						return Err(TransportError::pre_dispatch(TransportFailure::Closed));
+					},
+				}
+			}
 		})
 	}
 
@@ -428,6 +520,7 @@ impl McpTransport for LegacySseTransport {
 		Box::pin(async move {
 			self.closed.store(true, Ordering::Release);
 			*self.endpoint.lock() = None;
+			*self.discovery.lock().await = None;
 			for (_, sender) in self.pending.lock().drain() {
 				let _ = sender.send(PendingResult::Closed);
 			}
@@ -452,6 +545,8 @@ fn dispatch_error(dispatched: bool, cause: TransportFailure) -> TransportError {
 mod tests {
 	use std::sync::atomic::AtomicUsize;
 
+	use futures::StreamExt as _;
+
 	use super::*;
 	use crate::mcp::http::HttpFuture;
 
@@ -469,7 +564,9 @@ mod tests {
 							CONTENT_TYPE,
 							HeaderValue::from_static("text/event-stream"),
 						)]),
-						body:    Bytes::from_static(b"event: endpoint\ndata: /messages\n\n"),
+						body:    HttpBody::from_bytes(Bytes::from_static(
+							b"event: endpoint\ndata: /messages\n\n",
+						)),
 					});
 				}
 				let request: Value = serde_json::from_slice(&request.body).expect("request");
@@ -484,10 +581,53 @@ mod tests {
 						CONTENT_TYPE,
 						HeaderValue::from_static("text/event-stream"),
 					)]),
-					body:    Bytes::from(body),
+					body:    HttpBody::from_bytes(Bytes::from(body)),
 				})
 			})
 		}
+	}
+
+	#[tokio::test]
+	async fn connect_resolves_on_endpoint_before_long_lived_stream_eof() {
+		struct OpenDiscovery;
+		impl HttpExchange for OpenDiscovery {
+			fn execute(&self, _: HttpRequest) -> HttpFuture<'_> {
+				Box::pin(async {
+					let stream = futures::stream::once(async {
+						Ok(Bytes::from_static(b"event: endpoint\ndata: /messages\n\n"))
+					})
+					.chain(futures::stream::pending::<Result<Bytes, HttpExchangeError>>());
+					Ok(HttpResponse {
+						status:  StatusCode::OK,
+						headers: HeaderMap::from_iter([(
+							CONTENT_TYPE,
+							HeaderValue::from_static("text/event-stream"),
+						)]),
+						body:    HttpBody::from_stream(stream),
+					})
+				})
+			}
+		}
+
+		let connected = tokio::time::timeout(
+			Duration::from_millis(100),
+			LegacySseTransport::connect(
+				LegacySseConfig {
+					url:               Url::parse("https://legacy.test/events").expect("url"),
+					headers:           HeaderMap::new(),
+					origin_locked:     true,
+					timeout:           Some(Duration::from_secs(1)),
+					request_id_format: RequestIdFormat::Number,
+					auth:              None,
+				},
+				Arc::new(OpenDiscovery),
+				CancellationToken::new(),
+			),
+		)
+		.await
+		.expect("connect must not wait for EOF")
+		.expect("connect");
+		assert_eq!(connected.endpoint.lock().as_ref().map(Url::path), Some("/messages"));
 	}
 
 	#[tokio::test]
@@ -525,9 +665,9 @@ mod tests {
 					Ok(HttpResponse {
 						status:  StatusCode::OK,
 						headers: HeaderMap::new(),
-						body:    Bytes::from_static(
+						body:    HttpBody::from_bytes(Bytes::from_static(
 							b"event: endpoint\ndata: https://evil.test/messages\n\n",
-						),
+						)),
 					})
 				})
 			}

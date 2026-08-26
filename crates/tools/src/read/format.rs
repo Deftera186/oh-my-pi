@@ -39,6 +39,15 @@ pub struct LineSpan {
 	/// Last source line in the span.
 	pub end_line:   usize,
 }
+
+/// One already-bounded source span loaded by a streaming resolver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedRangeText<'a> {
+	/// Original source-line coordinates for `text`.
+	pub span: LineSpan,
+	/// Exact UTF-8 bytes for the span, including an optional terminal newline.
+	pub text: &'a str,
+}
 /// Exact source-line provenance for one rendered output line.
 pub type SourceLines = SmallVec<usize, 2>;
 /// Exact source-line provenance for each rendered output line.
@@ -238,6 +247,79 @@ pub fn format_read_anchor(path: &Path, workspace: &Path, home: Option<&Path>) ->
 /// Format one hashline read header from its already-resolvable anchor and tag.
 pub fn format_read_hashline_header(anchor: &str, tag: &str) -> Str {
 	format_hashline_header(anchor, tag)
+}
+
+/// Formats resolver-loaded line spans without rebasing their source numbers.
+///
+/// This is the bounded counterpart to [`format_text`]: immutable resolvers can
+/// index a large source and fetch only the requested byte windows while still
+/// receiving the shared numbered/raw range projection.
+pub fn format_resolved_ranges(
+	pieces: &[ResolvedRangeText<'_>],
+	requested: &[SelectorLineRange],
+	raw: bool,
+	total_lines: usize,
+	options: TextFormatOptions<'_>,
+) -> String {
+	let mut output = String::new();
+	for (piece_index, piece) in pieces.iter().enumerate() {
+		if piece_index > 0 {
+			output.push_str(if raw { "\n\n…\n\n" } else { "\n…\n" });
+		}
+		let expected = piece
+			.span
+			.end_line
+			.saturating_sub(piece.span.start_line)
+			.saturating_add(1);
+		let mut lines = piece.text.split('\n').take(expected);
+		for offset in 0..expected {
+			let line = lines.next().unwrap_or("");
+			if offset > 0 {
+				output.push('\n');
+			}
+			if raw {
+				output.push_str(line);
+			} else {
+				output.push_str(
+					format_numbered_line(piece.span.start_line.saturating_add(offset), line).as_ref(),
+				);
+			}
+		}
+	}
+
+	for range in requested {
+		let start = usize::try_from(range.start_line).unwrap_or(usize::MAX);
+		if start <= total_lines {
+			continue;
+		}
+		if !output.is_empty() {
+			output.push('\n');
+		}
+		let bound = range
+			.end_line
+			.map_or_else(|| range.start_line.to_string(), |end| format!("{}-{end}", range.start_line));
+		let _ = write!(
+			output,
+			"[Range {bound} is beyond end of {} ({total_lines} lines total); skipped]",
+			options.entity_label,
+		);
+	}
+
+	if !raw
+		&& requested.len() == 1
+		&& requested[0].end_line.is_some()
+		&& let Some(last) = pieces.last()
+		&& last.span.end_line < total_lines
+	{
+		let remaining = total_lines - last.span.end_line;
+		let next_offset = last.span.end_line + 1;
+		let _ = write!(
+			output,
+			"\n\n[{remaining} more lines in {}. Use :{next_offset} to continue]",
+			options.entity_label,
+		);
+	}
+	output
 }
 
 /// Render text selected by a parsed path selector.

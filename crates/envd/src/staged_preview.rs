@@ -133,7 +133,7 @@ impl Regime for StagedPreviewRegime {
 				ctx.replace_state((ctx.committed_steps() + 1).to_string());
 			},
 			PreviewAction::RequireTool => {
-				ctx.require_tool("shell");
+				ctx.require_tool("bash");
 				ctx.replace_state((ctx.committed_steps() + 1).to_string());
 			},
 			PreviewAction::Complete => next.complete(),

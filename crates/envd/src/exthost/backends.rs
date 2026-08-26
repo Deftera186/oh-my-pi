@@ -12,6 +12,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use omp_core::{Hash32, Str, Ulid};
+use omp_sandbox::Backend;
 use omp_tool::{ArgPath, IncomingCursor, IncomingParams, PullMode, PulledKind};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -44,22 +45,30 @@ use crate::{
 	worker_pool::{WorkerControlOwner, WorkerProcessAuthority, WorkerSupervisor},
 };
 
-/// Returns the sandbox facilities envd can truthfully advertise before a
-/// native process launcher publishes an installed sandbox receipt.
-///
-/// Kernel installation is currently deferred, so this fails closed instead of
-/// claiming facilities from the operating-system name alone.
+/// Returns only sandbox facilities proven by the native backend smoke check.
 pub fn detected_sandbox_capabilities() -> SandboxCapabilities {
-	SandboxCapabilities {
-		backends:         Vec::new(),
-		landlock_abi:     None,
-		filesystem:       false,
-		network:          false,
-		domain_filtering: false,
-		resource_limits:  false,
-		degraded:         vec![Str::new_static(
-			"native sandbox enforcement is not installed by this envd process",
-		)],
+	match Backend::detect() {
+		Ok(backend) => SandboxCapabilities {
+			backends:         vec![Str::new_static(match backend {
+				Backend::Seatbelt => "seatbelt",
+				Backend::Bubblewrap => "bubblewrap",
+			})],
+			landlock_abi:     None,
+			filesystem:       true,
+			network:          true,
+			domain_filtering: false,
+			resource_limits:  false,
+			degraded:         Vec::new(),
+		},
+		Err(error) => SandboxCapabilities {
+			backends:         Vec::new(),
+			landlock_abi:     None,
+			filesystem:       false,
+			network:          false,
+			domain_filtering: false,
+			resource_limits:  false,
+			degraded:         vec![Str::from(error.to_string())],
+		},
 	}
 }
 

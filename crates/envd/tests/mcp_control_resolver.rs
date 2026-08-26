@@ -58,7 +58,7 @@ impl McpConnector for Connector {
 					version:          None,
 					title:            None,
 					description:      None,
-					capabilities:     json!({}),
+					capabilities:     json!({"tools": {}}),
 					instructions:     Some(Str::new_static("server docs")),
 				},
 			})

@@ -170,6 +170,7 @@ pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<()
 			worker_config,
 			Some(doc_connections),
 			None,
+			None,
 			bridges,
 		)
 		.await?,
@@ -218,6 +219,7 @@ pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<()
 	while let Some(result) = extension_tasks.join_next().await {
 		result??;
 	}
+	server.shutdown_managed(interrupt_grace).await;
 	signal_task.abort();
 	Ok(())
 }

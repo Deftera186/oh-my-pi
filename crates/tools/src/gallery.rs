@@ -53,7 +53,7 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 	let web_search = identity("web_search", "");
 	let fetch = identity("fetch", "");
 	let glob = identity("glob", "");
-	let shell = identity("shell", "");
+	let shell = identity("bash", "");
 	let hub = identity("hub", "");
 	let write = identity("write", "");
 	let read = identity("read", "");

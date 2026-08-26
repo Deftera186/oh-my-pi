@@ -1,9 +1,9 @@
-//! Explicit `mcp://server/resource-uri` reads.
+//! Opaque advertised MCP resource URI reads.
 
 use std::sync::Arc;
 
 use omp_core::{CowBytes, Str};
-use omp_proto::env::v1::{McpResourceRequest, McpServerRef};
+use omp_proto::env::v1::McpResourceRequest;
 use omp_tools::read::{
 	Fault,
 	resolver::{Resolve, ResourceCompletion, fuzzy_score},
@@ -23,16 +23,13 @@ impl McpUrlResolver {
 		Self { service }
 	}
 
-	fn parse<'a>(&self, resource: &'a str) -> Result<(&'a str, &'a str), Fault> {
-		let (server, uri) = resource.split_once('/').ok_or_else(|| Fault::Invalid {
-			message: Str::new_static("mcp:// reads require mcp://server/resource-uri."),
-		})?;
-		if server.is_empty() || uri.is_empty() {
+	fn parse<'a>(&self, resource: &'a str) -> Result<&'a str, Fault> {
+		if resource.is_empty() {
 			return Err(Fault::Invalid {
-				message: Str::new_static("mcp:// reads require a nonempty server and resource URI."),
+				message: Str::new_static("mcp:// reads require a nonempty advertised resource URI."),
 			});
 		}
-		Ok((server, uri))
+		Ok(resource)
 	}
 }
 
@@ -42,28 +39,18 @@ impl Resolve for McpUrlResolver {
 		resource: &'a str,
 		_selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
-		let (server, uri) = self.parse(resource)?;
-		if !self.service.routes_resource(server, uri) {
-			return Err(Fault::Source {
-				message: Str::new_static("MCP resource is not advertised by this server."),
-			});
-		}
-		let status = self.service.status(Some(server));
-		let current = status
-			.servers
-			.first()
-			.and_then(|status| status.server.as_ref())
+		let uri = self.parse(resource)?;
+		let server = self
+			.service
+			.resolve_resource_server(uri)
 			.ok_or_else(|| Fault::Source {
-				message: Str::new(format!("MCP server '{server}' is not mounted.")),
+				message: Str::new(format!("MCP resource '{uri}' is not advertised.")),
 			})?;
 		let result = self
 			.service
 			.resource(
 				McpResourceRequest {
-					server:        Some(McpServerRef {
-						name:             server.to_owned(),
-						definition_epoch: current.definition_epoch,
-					}),
+					server:        Some(server),
 					uri:           uri.to_owned(),
 					max_bytes:     8 * 1024 * 1024,
 					wire_revision: 1,
@@ -87,15 +74,14 @@ impl Resolve for McpUrlResolver {
 	) -> Result<Vec<ResourceCompletion>, Fault> {
 		let mut matches = self
 			.service
-			.status(None)
-			.servers
+			.resource_uris()
 			.into_iter()
-			.filter_map(|status| {
-				let server = status.server?;
-				let score = fuzzy_score(query, &server.name)?;
+			.filter_map(|uri| {
+				let value = Str::new(format!("mcp://{uri}"));
+				let score = fuzzy_score(query, &value)?;
 				Some(ResourceCompletion {
-					value: Str::new(format!("mcp://{}/", server.name)),
-					description: Str::new_static("mounted MCP server"),
+					value,
+					description: Str::new_static("advertised MCP resource"),
 					score,
 				})
 			})

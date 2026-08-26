@@ -13,7 +13,7 @@ use bytes::Bytes;
 use flume::Receiver;
 use omp_core::{ArtifactDigest, Hash32, InvocationPhase, Principal, Provenance, Str, phase, sf};
 use omp_proto::{
-	inference::{v1, v1::Outcome},
+	inference::v1::Outcome,
 	thread::v1::{Item, Role, item, part},
 };
 pub use omp_storage::transcript::{TurnInputRecord, TurnOptionsRecord, TurnReceipt, TurnStart};
@@ -1155,28 +1155,27 @@ impl Journal {
 		ts: u64,
 		kind: ChildKind,
 	) -> Result<Self, JournalError> {
-		let mut events = Vec::new();
-		let at = match kind {
-			ChildKind::Branch { checkpoint } => {
-				let log = self.load()?;
-				if log.get(checkpoint).is_none() {
-					return Err(JournalError::InvalidEventIndex { index: checkpoint });
-				}
-				Some(checkpoint)
-			},
-			ChildKind::Fork => None,
-		};
-		events.push(Event { ts, kind: Kind::ForkedFrom { session: self.session_id.clone(), at } });
-		if kind == ChildKind::Fork {
-			for item in self.items_at(&self.live_item_events()?)? {
-				events.push(Event {
-					ts,
-					kind: Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None }),
-				});
+		let (at, seed) = {
+			let log = self.load()?;
+			match kind {
+				ChildKind::Branch { checkpoint } => {
+					let mut live = transcript::LiveSet::new();
+					if !log.live_through_into(checkpoint, &mut live) {
+						return Err(JournalError::InvalidEventIndex { index: checkpoint });
+					}
+					(Some(checkpoint), project::project_journal_items(&log, &live)?)
+				},
+				ChildKind::Fork => (None, project::project_journal_items(&log, log.as_ref())?),
 			}
-		}
+		};
 		let mut child = Self::create(path, header)?;
-		child.append_events(&events)?;
+		if let Some((index, _)) = &self.session_index {
+			child.attach_session_index(Arc::clone(index), header.id.clone());
+		}
+		child.append_forked_from(ts, &self.session_id, at)?;
+		for item in seed {
+			child.append_optimistic(ts, item, None)?;
+		}
 		Ok(child)
 	}
 
@@ -1211,29 +1210,35 @@ impl Journal {
 		drop(log);
 		compact.first_kept = 0;
 		compact.method = Some(sf!("handoff"));
-		let events = [
-			Event {
-				ts,
-				kind: Kind::ForkedFrom { session: self.session_id.clone(), at: Some(checkpoint) },
-			},
-			Event {
-				ts,
-				kind: Kind::Compact {
-					summary:       compact.summary,
-					short:         compact.short,
-					first_kept:    compact.first_kept,
-					tokens_before: compact.tokens_before,
-					tokens_after:  compact.tokens_after,
-					method:        compact.method,
-					warning:       compact.warning,
-					superseded:    compact.superseded,
-					snapcompact:   compact.snapcompact,
-				},
-			},
-		];
 		let mut child = Self::create(path, header)?;
-		child.append_events(&events)?;
+		if let Some((index, _)) = &self.session_index {
+			child.attach_session_index(Arc::clone(index), header.id.clone());
+		}
+		child.append_forked_from(ts, &self.session_id, Some(checkpoint))?;
+		child.compact(ts, compact)?;
 		Ok(child)
+	}
+
+	fn append_forked_from(
+		&mut self,
+		ts: u64,
+		parent: &transcript::SessionId,
+		at: Option<u64>,
+	) -> Result<u64, JournalError> {
+		let event = Event { ts, kind: Kind::ForkedFrom { session: parent.clone(), at } };
+		let appended = self.append_indexed_event(
+			ts,
+			"forked_from",
+			EventProjection::Fork { parent, at },
+			&event,
+		)?;
+		if let Some(source) = appended.index_error {
+			return Err(JournalError::SessionIndexAfterJournal {
+				event_index: appended.index,
+				source,
+			});
+		}
+		Ok(appended.index)
 	}
 
 	/// Attaches the authoritative write-time sessions index for this journal.
@@ -2361,7 +2366,7 @@ impl Journal {
 		let mut recorded = Vec::with_capacity(indexes.len());
 		for (index, expected) in indexes.iter().zip(events) {
 			let Some(transcript::Entry::Ok(actual)) = log.get(*index) else {
-				break;
+				return Err(JournalError::IdempotencyConflict(stamp.idempotency_key.clone()));
 			};
 			if actual.kind != expected.kind {
 				return Err(JournalError::IdempotencyConflict(stamp.idempotency_key.clone()));
@@ -3694,74 +3699,104 @@ fn payload_indexes(audit_index: u64, count: usize) -> Vec<u64> {
 }
 
 fn recover_tool_batches(log: &Log, writer: &mut Writer) -> Result<Vec<(Str, u64)>, JournalError> {
-	let mut results = BTreeMap::<Str, Option<Str>>::new();
+	struct ReceiptRecovery<'a> {
+		ts:            u64,
+		receipt:       &'a TurnReceipt,
+		settled:       BTreeSet<usize>,
+		recovery_turn: Option<Str>,
+	}
+
 	let mut authorized = BTreeMap::<Str, BTreeSet<Str>>::new();
-	let mut receipts = Vec::new();
+	let mut receipts = Vec::<ReceiptRecovery<'_>>::new();
 	for index in 0..u64::try_from(log.len()).expect("transcript length fits in u64") {
 		let Some(transcript::Entry::Ok(event)) = log.get(index) else {
 			continue;
 		};
-		if let Some(item) = event_item(&event.kind)
-			&& let Some(item::Kind::ToolResult(result)) = item.kind.as_ref()
-		{
-			let recovery_turn = match &event.kind {
-				Kind::TurnInput(input) => Some(input.turn_id.clone()),
-				_ => None,
-			};
-			results
-				.entry(Str::new(result.call_id.as_str()))
-				.or_insert(recovery_turn);
-		}
 		match &event.kind {
 			Kind::ToolBatchAuthorized(batch) => {
 				authorized.insert(batch.turn_id.clone(), batch.call_ids.iter().cloned().collect());
 			},
 			Kind::TurnReceipt(receipt)
-				if receipt.outcome.stop == v1::StopReason::StopToolUse as i32 =>
+				if receipt
+					.outcome
+					.output
+					.iter()
+					.any(|item| matches!(item.kind, Some(item::Kind::ToolCall(_)))) =>
 			{
-				receipts.push((event.ts, receipt));
+				receipts.push(ReceiptRecovery {
+					ts: event.ts,
+					receipt,
+					settled: BTreeSet::new(),
+					recovery_turn: None,
+				});
 			},
-			_ => {},
+			kind => {
+				let Some(item) = event_item(kind) else {
+					continue;
+				};
+				let Some(item::Kind::ToolResult(result)) = item.kind.as_ref() else {
+					continue;
+				};
+				let recovery_turn = match kind {
+					Kind::TurnInput(input) => Some(input.turn_id.clone()),
+					_ => None,
+				};
+				for state in receipts.iter_mut().rev() {
+					let occurrence = state
+						.receipt
+						.outcome
+						.output
+						.iter()
+						.enumerate()
+						.find(|(position, item)| {
+							!state.settled.contains(position)
+								&& matches!(
+									item.kind.as_ref(),
+									Some(item::Kind::ToolCall(call))
+										if call.id == result.call_id
+								)
+						})
+						.map(|(position, _)| position);
+					if let Some(position) = occurrence {
+						state.settled.insert(position);
+						if state.recovery_turn.is_none() {
+							state.recovery_turn = recovery_turn;
+						}
+						break;
+					}
+				}
+			},
 		}
 	}
 
 	let mut recovered = Vec::new();
-	for (ts, receipt) in receipts {
-		let calls: Vec<_> = receipt
-			.outcome
-			.output
-			.iter()
-			.filter_map(|item| match item.kind.as_ref() {
-				Some(item::Kind::ToolCall(call)) => Some((item, call)),
-				_ => None,
-			})
-			.collect();
-		let mut recovery_turn = calls
-			.iter()
-			.find_map(|(_, call)| results.get(call.id.as_str()).and_then(Clone::clone));
-		let authorized_calls = authorized.get(receipt.turn_id.as_str());
-		for (item, call) in calls {
-			let call_id = Str::new(call.id.as_str());
-			if results.contains_key(&call_id) {
+	for mut state in receipts {
+		let authorized_calls = authorized.get(state.receipt.turn_id.as_str());
+		for (position, item) in state.receipt.outcome.output.iter().enumerate() {
+			let Some(item::Kind::ToolCall(call)) = item.kind.as_ref() else {
+				continue;
+			};
+			if state.settled.contains(&position) {
 				continue;
 			}
+			let call_id = Str::new(call.id.as_str());
 			let abort = if authorized_calls.is_some_and(|calls| calls.contains(&call_id)) {
 				Abort::EffectsUnknown { reason: sf!("agent restarted after invocation authorization") }
 			} else {
 				Abort::Skipped { reason: sf!("agent restarted before invocation authorization") }
 			};
-			let result = project::recovery_tool_result_item(ts, item, abort)?;
-			let recovery_turn =
-				recovery_turn.get_or_insert_with(|| Str::new(omp_core::Ulid::generate().to_string()));
+			let result = project::recovery_tool_result_item(state.ts, item, abort)?;
+			let recovery_turn = state
+				.recovery_turn
+				.get_or_insert_with(|| Str::new(omp_core::Ulid::generate().to_string()));
 			let index = writer.append(&Event {
-				ts,
+				ts:   state.ts,
 				kind: Kind::TurnInput(TurnInputItem {
 					turn_id:     recovery_turn.clone(),
 					item:        result,
-					prompt_hash: Some(receipt.prompt_hash),
+					prompt_hash: Some(state.receipt.prompt_hash),
 				}),
 			})?;
-			results.insert(call_id, Some(recovery_turn.clone()));
 			recovered.push((recovery_turn.clone(), index));
 		}
 	}
@@ -4077,11 +4112,11 @@ mod tests {
 		let branch = parent
 			.create_child(&branch_path, &branch_header, 6, ChildKind::Branch { checkpoint: 0 })
 			.expect("create branch");
-		assert!(
+		assert_eq!(
 			branch
-				.live_item_events()
-				.expect("branch live items")
-				.is_empty()
+				.items_at(&branch.live_item_events().expect("branch events"))
+				.expect("branch items"),
+			vec![message("before")]
 		);
 
 		let fork_path = path("lifecycle-fork");
@@ -4102,6 +4137,93 @@ mod tests {
 		assert!(matches!(log.get(1), Some(Entry::Ok(event)) if event.kind == Kind::ProviderReset));
 		assert!(matches!(log.get(2), Some(Entry::Ok(event)) if event.kind == Kind::Reset));
 		for path in [parent_path, branch_path, fork_path] {
+			fs::remove_file(path).expect("remove journal");
+		}
+	}
+
+	#[test]
+	fn branch_materializes_checkpoint_context_after_rewind_reset_and_compact() {
+		let parent_path = path("branch-checkpoint-parent");
+		let mut parent = Journal::create(&parent_path, &header()).expect("create parent");
+		let first = parent
+			.append_optimistic(2, message("first"), None)
+			.expect("append first");
+		parent
+			.append_optimistic(3, message("discarded by rewind"), None)
+			.expect("append discarded item");
+		parent.truncate_to(4, Some(first)).expect("rewind to first");
+		let after_rewind = parent
+			.append_optimistic(5, message("after rewind"), None)
+			.expect("append after rewind");
+
+		let rewind_branch_path = path("branch-checkpoint-rewind");
+		let mut rewind_header = header();
+		rewind_header.id = SessionId(sf!("branch-rewind"));
+		let rewind_branch = parent
+			.create_child(&rewind_branch_path, &rewind_header, 6, ChildKind::Branch {
+				checkpoint: after_rewind,
+			})
+			.expect("branch after rewind");
+		assert_eq!(
+			rewind_branch
+				.items_at(
+					&rewind_branch
+						.live_item_events()
+						.expect("rewind branch events")
+				)
+				.expect("rewind branch items"),
+			vec![message("first"), message("after rewind")]
+		);
+
+		parent.reset(7).expect("reset context");
+		let kept = parent
+			.append_optimistic(8, message("kept after reset"), None)
+			.expect("append compact suffix");
+		parent
+			.compact(9, Compact {
+				summary:       sf!("summary after reset"),
+				short:         None,
+				first_kept:    kept,
+				tokens_before: 50,
+				tokens_after:  Some(10),
+				method:        Some(sf!("remote")),
+				warning:       None,
+				snapcompact:   None,
+				superseded:    Vec::new(),
+			})
+			.expect("compact reset context");
+		let checkpoint = parent
+			.append_optimistic(10, message("after compact"), None)
+			.expect("append after compact");
+
+		let compact_branch_path = path("branch-checkpoint-compact");
+		let mut compact_header = header();
+		compact_header.id = SessionId(sf!("branch-compact"));
+		let compact_branch = parent
+			.create_child(&compact_branch_path, &compact_header, 11, ChildKind::Branch { checkpoint })
+			.expect("branch after compact");
+		let compact_items = compact_branch
+			.items_at(
+				&compact_branch
+					.live_item_events()
+					.expect("compact branch events"),
+			)
+			.expect("compact branch items");
+		assert_eq!(compact_items.len(), 3);
+		assert!(matches!(
+			&compact_items[0].kind,
+			Some(thread_item::Kind::Message(message))
+				if matches!(
+					message.parts.as_slice(),
+					[thread_pb::Part { kind: Some(thread_part::Kind::Text(text)) }]
+						if text.contains("summary after reset")
+				)
+		));
+		assert_eq!(compact_items[1], message("kept after reset"));
+		assert_eq!(compact_items[2], message("after compact"));
+
+		drop((parent, rewind_branch, compact_branch));
+		for path in [parent_path, rewind_branch_path, compact_branch_path] {
 			fs::remove_file(path).expect("remove journal");
 		}
 	}
@@ -4368,6 +4490,103 @@ mod tests {
 				.len(),
 			2
 		);
+		fs::remove_file(path).expect("remove journal");
+	}
+	#[test]
+	fn crash_recovery_scopes_reused_call_ids_to_their_receipt_occurrence() {
+		let path = path("reused-call-id");
+		let hash = PromptHash::from([7; 32]);
+		let start = |turn_id: &'static str| TurnStart {
+			turn_id:            Str::new_static(turn_id),
+			item_events:        Vec::new(),
+			prompt_hash:        hash.digest(),
+			prompt_head_events: Vec::new(),
+			toolset_hash:       Hash32::new([0; 32]),
+			enabled_tools:      Vec::new(),
+			sequence_targets:   Vec::new(),
+			input:              TurnInputRecord::Full { thread: thread_pb::Thread::default() },
+			options:            TurnOptionsRecord {
+				context_id: None,
+				params:     pb::ChatParams::default(),
+				executor:   None,
+				props:      None,
+			},
+		};
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		journal
+			.append(&Event { ts: 2, kind: Kind::TurnStart(start("first")) })
+			.expect("append first start");
+		let first_receipt = TurnReceipt {
+			turn_id:            sf!("first"),
+			prompt_hash:        hash.digest(),
+			prompt_head_events: Vec::new(),
+			item_events:        Vec::new(),
+			outcome:            tool_outcome(),
+		};
+		journal
+			.append(&Event { ts: 3, kind: Kind::TurnReceipt(first_receipt.clone()) })
+			.expect("append first receipt");
+		let first_result =
+			recovery_tool_result_item(4, &first_receipt.outcome.output[0], Abort::Interrupted {
+				reason: sf!("first occurrence settled"),
+			})
+			.expect("build first result");
+		journal
+			.append(&Event {
+				ts:   4,
+				kind: Kind::TurnInput(TurnInputItem {
+					turn_id:     sf!("first-follow-up"),
+					item:        first_result,
+					prompt_hash: Some(hash.digest()),
+				}),
+			})
+			.expect("append first result");
+		let mut second_receipt = first_receipt;
+		second_receipt.turn_id = sf!("second");
+		second_receipt.outcome.stop = pb::StopReason::StopMaxTokens as i32;
+		journal
+			.append(&Event { ts: 5, kind: Kind::TurnStart(start("second")) })
+			.expect("append second start");
+		journal
+			.append(&Event { ts: 6, kind: Kind::TurnReceipt(second_receipt) })
+			.expect("append second receipt");
+		journal
+			.append(&Event {
+				ts:   7,
+				kind: Kind::ToolBatchAuthorized(ToolBatchAuthorized {
+					turn_id:  sf!("second"),
+					call_ids: vec![sf!("call-1")],
+				}),
+			})
+			.expect("authorize second occurrence");
+		drop(journal);
+
+		let reopened = Journal::open(&path).expect("recover second occurrence");
+		let log = reopened.load().expect("load recovery");
+		let results = (0..u64::try_from(log.len()).expect("journal length"))
+			.filter_map(|index| {
+				let Entry::Ok(event) = log.get(index)? else {
+					return None;
+				};
+				let item = event_item(&event.kind)?;
+				let item::Kind::ToolResult(result) = item.kind.as_ref()? else {
+					return None;
+				};
+				Some(result)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(results.len(), 2);
+		let text = results[1]
+			.parts
+			.iter()
+			.find_map(|part| match part.kind.as_ref() {
+				Some(thread_part::Kind::Text(text)) => Some(text.as_str()),
+				_ => None,
+			})
+			.expect("recovery result text");
+		assert!(text.contains("effects unknown"));
+		drop(log);
+		drop(reopened);
 		fs::remove_file(path).expect("remove journal");
 	}
 

@@ -16,6 +16,7 @@ use omp_tool::{
 };
 use omp_tools::read::{
 	self, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord, SourceStat,
+	StoredArtifact,
 	web::{
 		self,
 		scrapers::{self, Scraper},
@@ -142,6 +143,17 @@ impl ReadBlobs for NoBlobs {
 		media_type: Str,
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
 		ready(Ok(BlobRef { hash: sf!("unused-web-blob"), media_type, byte_len: bytes.len() as u64 }))
+	}
+
+	fn store_artifact(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, Fault>> + Send + '_ {
+		ready(Ok(StoredArtifact {
+			blob: BlobRef { hash: sf!("unused-web-blob"), media_type, byte_len: bytes.len() as u64 },
+			uri:  sf!("artifact://1"),
+		}))
 	}
 }
 

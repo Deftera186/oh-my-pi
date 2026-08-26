@@ -1871,13 +1871,20 @@ mod wait_runtime {
 
 	impl WaitSet {
 		/// Parks until every ticket resolves, a deadline elapses, or abort
-		/// changes.
+		/// changes. All tickets expired at the observed deadline are atomically
+		/// retired before returning [`WaitError::Deadline`].
 		pub async fn wait_empty(&self, mut abort: Receiver<u64>) -> Result<(), WaitError> {
 			loop {
+				let now = now_ms();
 				let deadline = {
-					let tickets = self.inner.tickets.lock();
+					let mut tickets = self.inner.tickets.lock();
 					if tickets.is_empty() {
 						return Ok(());
+					}
+					let expired = tickets.values().any(|ticket| ticket.deadline_ms <= now);
+					if expired {
+						tickets.retain(|_, ticket| ticket.deadline_ms > now);
+						return Err(WaitError::Deadline);
 					}
 					tickets
 						.values()
@@ -1885,15 +1892,11 @@ mod wait_runtime {
 						.min()
 						.expect("nonempty")
 				};
-				let now = now_ms();
-				if now >= deadline {
-					return Err(WaitError::Deadline);
-				}
 				let sleep = time::sleep(Duration::from_millis(deadline - now));
 				tokio::pin!(sleep);
 				tokio::select! {
 					() = self.inner.notify.notified() => {},
-					_ = &mut sleep => return Err(WaitError::Deadline),
+					_ = &mut sleep => {},
 					changed = abort.changed() => {
 						if changed.is_ok() { return Err(WaitError::Aborted); }
 					},
@@ -2023,6 +2026,30 @@ mod builtin_tests {
 			assert!(matches!(apply(&mut regime, Point::Settle).control, Some(RegimeControl::Retry)));
 		}
 		assert!(matches!(apply(&mut regime, Point::Settle).control, Some(RegimeControl::Complete)));
+	}
+	#[tokio::test]
+	async fn expired_wait_is_retired_before_the_next_turn() {
+		let waits = WaitSet::default();
+		waits
+			.insert(WaitTicket {
+				id:          Str::new_static("expired"),
+				deadline_ms: now_ms(),
+				reason:      Str::new_static("first turn"),
+			})
+			.expect("insert expired ticket");
+		let (_abort_tx, abort_rx) = tokio::sync::watch::channel(0);
+		assert_eq!(waits.wait_empty(abort_rx.clone()).await, Err(WaitError::Deadline));
+		assert!(!waits.resolve("expired"));
+
+		waits
+			.insert(WaitTicket {
+				id:          Str::new_static("fresh"),
+				deadline_ms: now_ms().saturating_add(1_000),
+				reason:      Str::new_static("next turn"),
+			})
+			.expect("insert fresh ticket");
+		assert!(waits.resolve("fresh"));
+		assert_eq!(waits.wait_empty(abort_rx).await, Ok(()));
 	}
 	#[derive(Clone, Copy)]
 	enum TestBehavior {

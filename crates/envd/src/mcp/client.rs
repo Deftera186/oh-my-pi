@@ -59,9 +59,7 @@ impl McpClient {
 				json!({
 					"protocolVersion": PREFERRED_PROTOCOL_VERSION,
 					"capabilities": {
-						"roots": { "listChanged": false },
-						"sampling": {},
-						"elicitation": {}
+						"roots": { "listChanged": false }
 					},
 					"clientInfo": { "name": "omp", "version": env!("CARGO_PKG_VERSION") }
 				}),
@@ -172,4 +170,88 @@ pub enum ClientError {
 	/// Server selected a revision outside the explicit compatibility set.
 	#[error("MCP server selected unsupported protocol revision {0}")]
 	UnsupportedProtocol(Str),
+}
+#[cfg(test)]
+mod tests {
+	use parking_lot::Mutex;
+
+	use super::*;
+	use crate::mcp::{
+		json_rpc::RequestId,
+		transport::{
+			DispatchState, IncomingMessage, McpTransport, ServerResponseError, TransportFuture,
+			TransportResponse,
+		},
+	};
+
+	struct RecordingTransport {
+		initialize: Mutex<Option<Value>>,
+	}
+
+	impl McpTransport for RecordingTransport {
+		fn request<'a>(
+			&'a self,
+			method: &'a str,
+			params: Value,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<TransportResponse, TransportError>> {
+			assert_eq!(method, "initialize");
+			*self.initialize.lock() = Some(params);
+			Box::pin(async {
+				Ok(TransportResponse {
+					id:       RequestId::Number(1),
+					result:   json!({
+						"protocolVersion": PREFERRED_PROTOCOL_VERSION,
+						"capabilities": {},
+						"serverInfo": { "name": "fixture" }
+					}),
+					dispatch: DispatchState::Responded,
+				})
+			})
+		}
+
+		fn notify<'a>(
+			&'a self,
+			_method: &'a str,
+			_params: Value,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+			Box::pin(async { Ok(DispatchState::Dispatched) })
+		}
+
+		fn next_message<'a>(
+			&'a self,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<IncomingMessage, TransportError>> {
+			Box::pin(async { Ok(IncomingMessage::Closed) })
+		}
+
+		fn respond<'a>(
+			&'a self,
+			_id: RequestId,
+			_result: Result<Value, ServerResponseError>,
+			_cancellation: CancellationToken,
+		) -> TransportFuture<'a, Result<DispatchState, TransportError>> {
+			Box::pin(async { Ok(DispatchState::Dispatched) })
+		}
+
+		fn close(&self) -> TransportFuture<'_, Result<(), TransportError>> {
+			Box::pin(async { Ok(()) })
+		}
+	}
+
+	#[tokio::test]
+	async fn initialize_advertises_only_implemented_roots_capability() {
+		let transport = Arc::new(RecordingTransport { initialize: Mutex::new(None) });
+		let client = McpClient::new(transport.clone(), Arc::from([]));
+		client
+			.initialize(CancellationToken::new())
+			.await
+			.expect("initialize");
+		let request = transport.initialize.lock();
+		let capabilities = &request.as_ref().expect("request")["capabilities"];
+		assert!(capabilities.get("roots").is_some());
+		assert!(capabilities.get("sampling").is_none());
+		assert!(capabilities.get("elicitation").is_none());
+	}
 }

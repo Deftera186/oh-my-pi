@@ -70,13 +70,15 @@ impl TruncationResult<'_> {
 
 /// Complete pre-projection text after applying the shared output bounds.
 ///
-/// When content was omitted, `blob` names the durable copy of the original
-/// text and the line counts retain the exact footer truth.
+/// When content was omitted, `blob` retains the content reference and
+/// `artifact_uri` is the resolver-valid recovery address named by the footer.
 pub struct SpilledText {
-	pub content:     Str,
-	pub blob:        Option<BlobRef>,
-	pub shown_lines: u64,
-	pub total_lines: u64,
+	pub content:      Str,
+	pub blob:         Option<BlobRef>,
+	/// Resolver-valid address of the complete output.
+	pub artifact_uri: Option<Str>,
+	pub shown_lines:  u64,
+	pub total_lines:  u64,
 }
 
 /// Applies the standard text bounds and durably stores the complete text before
@@ -92,6 +94,7 @@ pub async fn spill_truncated_text<B: ReadBlobs>(
 		return Ok(SpilledText {
 			content: Str::new(full_text),
 			blob: None,
+			artifact_uri: None,
 			shown_lines,
 			total_lines,
 		});
@@ -99,10 +102,18 @@ pub async fn spill_truncated_text<B: ReadBlobs>(
 
 	let content = truncation.content.to_owned();
 	let bytes = Bytes::from(full_text);
-	let blob = blobs.store(bytes, sf!("text/plain; charset=utf-8")).await?;
+	let artifact = blobs
+		.store_artifact(bytes, sf!("text/plain; charset=utf-8"))
+		.await?;
 	let mut content = content;
-	append_blob_truncation_notice_counts(&mut content, shown_lines, total_lines, &blob.hash);
-	Ok(SpilledText { content: Str::new(content), blob: Some(blob), shown_lines, total_lines })
+	append_blob_truncation_notice_counts(&mut content, shown_lines, total_lines, &artifact.uri);
+	Ok(SpilledText {
+		content: Str::new(content),
+		blob: Some(artifact.blob),
+		artifact_uri: Some(artifact.uri),
+		shown_lines,
+		total_lines,
+	})
 }
 
 /// A borrowed result from [`truncate_head_bytes`].
@@ -245,11 +256,12 @@ pub fn append_head_truncation_notice(
 	);
 }
 
-/// Appends the exact footer used after spilling the complete output to a blob.
+/// Appends the exact footer used after spilling the complete output to a
+/// session artifact.
 pub fn append_blob_truncation_notice(
 	output: &mut String,
 	truncation: &TruncationResult<'_>,
-	blob_id: &str,
+	artifact_uri: &str,
 ) {
 	if !truncation.truncated {
 		return;
@@ -258,7 +270,7 @@ pub fn append_blob_truncation_notice(
 		output,
 		u64::try_from(truncation.shown_lines()).unwrap_or(u64::MAX),
 		u64::try_from(truncation.total_lines).unwrap_or(u64::MAX),
-		blob_id,
+		artifact_uri,
 	);
 }
 
@@ -266,10 +278,11 @@ fn append_blob_truncation_notice_counts(
 	output: &mut String,
 	shown_lines: u64,
 	total_lines: u64,
-	blob_id: &str,
+	artifact_uri: &str,
 ) {
 	let _ = write!(
 		output,
-		"\n\n[truncated: {shown_lines} of {total_lines} lines shown; full output in blob {blob_id}]"
+		"\n\n[truncated: {shown_lines} of {total_lines} lines shown; read {artifact_uri} for full \
+		 output]"
 	);
 }

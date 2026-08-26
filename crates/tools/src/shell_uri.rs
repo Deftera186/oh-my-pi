@@ -8,11 +8,13 @@ use omp_core::Str;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Occurrence {
 	/// Byte range in the original value.
-	pub range: ops::Range<usize>,
+	pub range:              ops::Range<usize>,
 	/// Exact registered URI spelling.
-	pub uri:   Str,
+	pub uri:                Str,
 	/// Quoting context at the start of the URI.
-	pub quote: QuoteContext,
+	pub quote:              QuoteContext,
+	/// Whether the URI is the complete contents of one quoted shell token.
+	pub whole_quoted_token: bool,
 }
 
 /// Shell context surrounding an internal URI.
@@ -30,8 +32,9 @@ pub enum QuoteContext {
 
 /// Returns path-backed internal URIs in command order.
 ///
-/// Single-quoted occurrences are retained for diagnostics but callers must not
-/// materialize them because shell single quotes suppress substitution.
+/// Single-quoted occurrences are materializable only when
+/// [`Occurrence::whole_quoted_token`] is true. Embedded single-quoted prose
+/// remains literal shell text.
 pub fn scan(input: &str) -> Vec<Occurrence> {
 	let bytes = input.as_bytes();
 	let mut found = Vec::new();
@@ -84,14 +87,16 @@ pub fn scan(input: &str) -> Vec<Occurrence> {
 		};
 		let end = uri_end(input, cursor + prefix.len(), quote);
 		if end > cursor + prefix.len() {
+			let occurrence_quote = if substitution_depth != 0 && quote == QuoteContext::Unquoted {
+				QuoteContext::Substitution
+			} else {
+				quote
+			};
 			found.push(Occurrence {
-				range: cursor..end,
-				uri:   Str::new(&input[cursor..end]),
-				quote: if substitution_depth != 0 && quote == QuoteContext::Unquoted {
-					QuoteContext::Substitution
-				} else {
-					quote
-				},
+				range:              cursor..end,
+				uri:                Str::new(&input[cursor..end]),
+				quote:              occurrence_quote,
+				whole_quoted_token: is_whole_quoted_token(input, cursor, end, occurrence_quote),
 			});
 		}
 		cursor = end.max(cursor + prefix.len());
@@ -100,7 +105,9 @@ pub fn scan(input: &str) -> Vec<Occurrence> {
 }
 
 /// Replaces materialized URIs using shell-safe spelling for their quote
-/// context. Missing mappings and single-quoted occurrences are left unchanged.
+/// context. An exactly single-quoted URI token is preprocessing syntax: its
+/// authored quotes are replaced by one shell-safe quoted materialized path.
+/// Embedded single-quoted URI prose remains unchanged.
 pub fn replace(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 	let occurrences = scan(input);
 	let mut output = String::with_capacity(input.len());
@@ -109,18 +116,33 @@ pub fn replace(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 		let Some(path) = paths.get(&occurrence.uri) else {
 			continue;
 		};
-		if occurrence.quote == QuoteContext::Single {
+		if occurrence.quote == QuoteContext::Single && !occurrence.whole_quoted_token {
 			continue;
 		}
-		output.push_str(&input[copied..occurrence.range.start]);
-		match occurrence.quote {
-			QuoteContext::Double => push_double_escaped(&mut output, path),
-			QuoteContext::Unquoted | QuoteContext::Substitution => {
-				push_single_quoted(&mut output, path)
-			},
-			QuoteContext::Single => unreachable!("single quotes are skipped"),
+		let replace_whole_quoted = occurrence.whole_quoted_token
+			&& matches!(occurrence.quote, QuoteContext::Single | QuoteContext::Double);
+		let replacement_start = if replace_whole_quoted {
+			occurrence.range.start - 1
+		} else {
+			occurrence.range.start
+		};
+		let replacement_end = if replace_whole_quoted {
+			occurrence.range.end + 1
+		} else {
+			occurrence.range.end
+		};
+		output.push_str(&input[copied..replacement_start]);
+		if replace_whole_quoted {
+			push_single_quoted(&mut output, path);
+		} else {
+			match occurrence.quote {
+				QuoteContext::Double => push_double_escaped(&mut output, path),
+				QuoteContext::Single | QuoteContext::Unquoted | QuoteContext::Substitution => {
+					push_single_quoted(&mut output, path)
+				},
+			}
 		}
-		copied = occurrence.range.end;
+		copied = replacement_end;
 	}
 	if copied == 0 {
 		return Str::new(input);
@@ -152,8 +174,46 @@ pub fn replace_plain(input: &str, paths: &BTreeMap<Str, Str>) -> Str {
 	Str::new(output)
 }
 
-const PATH_SCHEMES: [&str; 7] =
-	["artifact://", "memory://", "agent://", "local://", "skill://", "rule://", "plan://"];
+const PATH_SCHEMES: [&str; 8] = [
+	"artifact://",
+	"attachment://",
+	"memory://",
+	"agent://",
+	"local://",
+	"skill://",
+	"rule://",
+	"plan://",
+];
+
+fn is_whole_quoted_token(input: &str, start: usize, end: usize, quote: QuoteContext) -> bool {
+	let delimiter = match quote {
+		QuoteContext::Single => b'\'',
+		QuoteContext::Double => b'"',
+		QuoteContext::Unquoted | QuoteContext::Substitution => return false,
+	};
+	let bytes = input.as_bytes();
+	let Some(opening) = start.checked_sub(1) else {
+		return false;
+	};
+	if bytes.get(opening) != Some(&delimiter) || bytes.get(end) != Some(&delimiter) {
+		return false;
+	}
+	let before = opening
+		.checked_sub(1)
+		.and_then(|index| bytes.get(index))
+		.copied();
+	is_token_boundary(before) && is_token_boundary(bytes.get(end + 1).copied())
+}
+
+const fn is_token_boundary(byte: Option<u8>) -> bool {
+	match byte {
+		None => true,
+		Some(byte) => {
+			byte.is_ascii_whitespace()
+				|| matches!(byte, b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')')
+		},
+	}
+}
 
 fn uri_end(input: &str, start: usize, quote: QuoteContext) -> usize {
 	let bytes = input.as_bytes();
@@ -216,12 +276,25 @@ mod tests {
 		assert_eq!(found[0].uri, "artifact://a:raw");
 		assert_eq!(found[1].uri, "local://x y");
 		assert_eq!(found[2].quote, QuoteContext::Single);
+		assert!(found[2].whole_quoted_token);
 	}
 
 	#[test]
 	fn replacement_quotes_environment_paths_and_preserves_literals() {
 		let paths = BTreeMap::from([(Str::new("local://x"), Str::new("/tmp/a b"))]);
-		assert_eq!(replace("cat local://x 'local://x'", &paths), "cat '/tmp/a b' 'local://x'");
+		assert_eq!(replace("cat local://x 'local://x'", &paths), "cat '/tmp/a b' '/tmp/a b'");
+	}
+	#[test]
+	fn quoted_whole_tokens_materialize_but_embedded_prose_stays_literal() {
+		let paths = BTreeMap::from([
+			(Str::new("artifact://7"), Str::new("/tmp/artifact 7")),
+			(Str::new("attachment://1"), Str::new("/tmp/image's.png")),
+		]);
+		assert_eq!(
+			replace("wc 'artifact://7' \"artifact://7\"; cp attachment://1 out", &paths),
+			r#"wc '/tmp/artifact 7' '/tmp/artifact 7'; cp '/tmp/image'\''s.png' out"#,
+		);
+		assert_eq!(replace("echo 'see artifact://7 later'", &paths), "echo 'see artifact://7 later'",);
 	}
 
 	#[test]

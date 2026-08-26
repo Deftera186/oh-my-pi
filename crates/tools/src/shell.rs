@@ -46,31 +46,25 @@ pub fn command_segments(
 	omp_shell_engine::parser::flat_shell_segments(command)
 }
 
-/// Complete arguments for `shell@1`.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+/// Complete arguments for `bash@1`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[schemars(description = "")]
 #[serde(deny_unknown_fields)]
-#[schemars(extend(
-	"anyOf" = [
-		{ "properties": { "async": { "const": false } } },
-		{ "required": ["name"] }
-	]
-))]
 pub struct Params {
 	/// Shell script to execute.
 	#[schemars(length(min = 1), description = "Shell script to execute.")]
 	pub command:      Str,
-	/// Host-enforced execution timeout in milliseconds; zero disables the
-	/// deadline without changing the foreground auto-background threshold.
+	/// Host-enforced execution timeout in seconds; zero disables the deadline
+	/// without changing the foreground auto-background threshold.
 	#[schemars(
 		default,
 		skip_serializing_if = "Option::is_none",
-		with = "u64",
-		range(min = 0),
-		description = "Host-enforced execution timeout in milliseconds; zero disables the deadline; \
+		with = "serde_json::Number",
+		range(min = 0.0),
+		description = "Host-enforced execution timeout in seconds; zero disables the deadline; \
 		               nonzero values do not extend the foreground auto-background threshold."
 	)]
-	pub timeout_ms:   Option<u64>,
+	pub timeout:      Option<f64>,
 	/// Environment additions scoped to this command.
 	#[serde(default)]
 	#[schemars(
@@ -91,19 +85,10 @@ pub struct Params {
 	#[serde(default)]
 	#[schemars(description = "Allocate a pseudo-terminal for this command.")]
 	pub pty:          bool,
-	/// Run as a named asynchronous job.
+	/// Run as an asynchronously managed job.
 	#[serde(default, rename = "async")]
-	#[schemars(description = "Run as a named asynchronous job.")]
+	#[schemars(description = "Run as an asynchronously managed job.")]
 	pub asynchronous: bool,
-	/// Required stable job name when async is true.
-	#[schemars(
-		default,
-		skip_serializing_if = "Option::is_none",
-		with = "String",
-		length(min = 1),
-		description = "Required stable job name when async is true."
-	)]
-	pub name:         Option<Str>,
 }
 /// Ordered output channel from a shell command.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,8 +228,11 @@ pub enum Fault {
 		/// Rejected key.
 		key: Str,
 	},
-	/// Asynchronous execution did not provide its required stable name.
-	AsyncNameRequired,
+	/// A dispatched command reached a definite unsuccessful terminal status.
+	CommandFailed {
+		/// Complete output and process status retained for rendering and policy.
+		payload: Box<Payload>,
+	},
 }
 
 /// Module-owned handle for one persistent environment session.
@@ -339,10 +327,10 @@ pub trait ShellExec: Clone + Send + Sync + 'static {
 	) -> impl Future<Output = Result<Session, Fault>> + Send + '_;
 
 	/// Closes an isolated or quarantined session.
-	fn close_session(
-		&self,
-		session: &Session,
-	) -> impl Future<Output = Result<(), Fault>> + Send + '_;
+	fn close_session<'a>(
+		&'a self,
+		session: &'a Session,
+	) -> impl Future<Output = Result<(), Fault>> + Send + 'a;
 
 	/// Starts a foreground script in the existing session.
 	fn run<'a>(
@@ -375,7 +363,7 @@ impl Default for TimeoutBounds {
 	}
 }
 
-/// Immutable live-composition facts projected into the `shell@1` prompt.
+/// Immutable live-composition facts projected into the `bash@1` prompt.
 #[derive(Clone, Debug)]
 pub struct ShellPromptSnapshot {
 	/// Active sibling tools which can replace common shell intents.
@@ -403,10 +391,10 @@ pub struct ShellPromptSnapshot {
 impl ShellPromptSnapshot {
 	fn description(&self) -> Str {
 		let mut description = String::from(
-			"Execute a shell script in a persistent session, or start a named asynchronous job. \
-			 Eligible long-running calls may auto-background at the configured foreground threshold \
-			 and deliver later. `timeout_ms: 0` disables the command deadline; otherwise \
-			 `timeout_ms` sets it without extending foreground waiting.",
+			"Execute a shell script in a persistent session, or allocate an asynchronous managed \
+			 job. Eligible long-running calls may auto-background at the configured foreground \
+			 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
+			 `timeout` is measured in seconds and does not extend foreground waiting.",
 		);
 		let _ = write!(
 			description,
@@ -463,7 +451,7 @@ impl ShellPromptSnapshot {
 	}
 }
 
-/// Generic `shell@1` implementation retaining one lazy persistent session.
+/// Generic `bash@1` implementation retaining one lazy persistent session.
 pub struct ShellTool<E: ShellExec> {
 	exec: E,
 	session: Mutex<Option<Session>>,
@@ -478,7 +466,7 @@ pub struct ShellTool<E: ShellExec> {
 	spec: ToolSpec,
 }
 
-/// Constructs the native `shell@1` executor over an environment resource.
+/// Constructs the native `bash@1` executor over an environment resource.
 pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 	ShellTool {
 		exec,
@@ -492,13 +480,13 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		interceptor_rules: Arc::default(),
 		sibling_tools: Arc::default(),
 		spec: ToolSpec {
-			name:            sf!("shell"),
+			name:            sf!("bash"),
 			rev:             Rev { family: Str::default(), n: 1 },
 			description:     sf!(
-				"Execute a shell script in a persistent session, or start a named asynchronous job. \
-				 Eligible long-running calls may auto-background at the configured foreground \
-				 threshold and deliver later. `timeout_ms: 0` disables the command deadline; \
-				 otherwise `timeout_ms` sets it without extending foreground waiting.",
+				"Execute a shell script in a persistent session, or allocate an asynchronous managed \
+				 job. Eligible long-running calls may auto-background at the configured foreground \
+				 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
+				 `timeout` is measured in seconds and does not extend foreground waiting.",
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
@@ -524,7 +512,7 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		},
 	}
 }
-/// Constructs `shell@1` from immutable live registry, capability, and settings
+/// Constructs `bash@1` from immutable live registry, capability, and settings
 /// facts.
 pub fn shell_with_snapshot_and_timeout_bounds<E: ShellExec>(
 	exec: E,
@@ -590,21 +578,19 @@ impl<E: ShellExec> ShellTool<E> {
 		}
 	}
 
-	fn timeout(&self, requested: Option<u64>) -> (Option<u64>, Vec<AdjustmentReceipt>) {
-		let Some(requested) = requested else {
+	fn timeout(&self, requested: Option<f64>) -> (Option<u64>, Vec<AdjustmentReceipt>) {
+		let Some(requested_seconds) = requested else {
 			return (Some(self.timeout_bounds.default_ms), Vec::new());
 		};
-		if requested == 0 {
+		if requested_seconds == 0.0 {
 			return (None, Vec::new());
 		}
+		let requested_ms = (requested_seconds * 1_000.0).ceil() as u64;
 		let floor = self.timeout_bounds.floor_ms;
 		let ceiling = self.timeout_bounds.ceiling_ms.max(floor);
-		let effective = requested.clamp(floor, ceiling);
-		let adjustments = (effective != requested)
-			.then_some(AdjustmentReceipt::TimeoutClamped {
-				requested_ms: requested,
-				effective_ms: effective,
-			})
+		let effective = requested_ms.clamp(floor, ceiling);
+		let adjustments = (effective != requested_ms)
+			.then_some(AdjustmentReceipt::TimeoutClamped { requested_ms, effective_ms: effective })
 			.into_iter()
 			.collect();
 		(Some(effective), adjustments)
@@ -669,20 +655,22 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				return;
 			}
 
-			let (command, extracted_cwd) = extract_leading_cd(&args.command);
+			let (command, extracted_cwd) = if args.cwd.is_none() {
+				extract_leading_cd(&args.command)
+			} else {
+				(args.command.clone(), None)
+			};
+			let cwd = args.cwd.or(extracted_cwd);
 			let terminal = args.pty;
 			let options = SessionOptions {
-				cwd: args.cwd.or(extracted_cwd),
+				cwd: cwd,
 				env: args.env,
 				pty: terminal,
 			};
-			let (timeout_ms, adjustments) = self.timeout(args.timeout_ms);
+			let (timeout_ms, adjustments) = self.timeout(args.timeout);
 
 			if args.asynchronous {
-				let Some(name) = args.name else {
-					yield Ev::Done(ToolTerminal::Done { result: Err(Fault::AsyncNameRequired), useless: false });
-					return;
-				};
+				let name = next_background_name("bash", &self.next_background_name);
 				let work = self.exec.detach(DetachRequest {
 					name,
 					command,
@@ -777,7 +765,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 					match pending {
 						PendingRun::Background => {
 							let name =
-								next_background_name("shell", &self.next_background_name);
+								next_background_name("bash", &self.next_background_name);
 							if let Ok(job) = run.detach(name).await {
 											 self.finish_session(&session, persistent, true).await;
 											 yield Ev::Done(detached_terminal(
@@ -805,7 +793,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							};
 							if interrupt.class == Interrupt::STEERING {
 								let name =
-									next_background_name("shell", &self.next_background_name);
+									next_background_name("bash", &self.next_background_name);
 								if let Ok(job) = run.detach(name).await {
 									let reason = sf!("steering interrupt: {}", interrupt.reason);
 									self.finish_session(&session, persistent, true).await;
@@ -867,15 +855,35 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							|| matches!(status.outcome, ExecOutcome::Timeout | ExecOutcome::Cancelled)
 							|| status.effects_unknown;
 						self.finish_session(&session, persistent, quarantine).await;
+						if status.outcome == ExecOutcome::Cancelled {
+							yield Ev::Aborted(if status.effects_unknown {
+								Abort::EffectsUnknown {
+									reason: sf!("bash command was cancelled; effect state is unknown"),
+								}
+							} else {
+								Abort::Interrupted { reason: sf!("bash command was cancelled") }
+							});
+							return;
+						}
+						let successful = status.outcome == ExecOutcome::Exited
+							&& status.exit_code == Some(0)
+							&& status.signal.is_none()
+							&& !status.aborted
+							&& !status.effects_unknown;
+						let payload = Payload {
+							session_id,
+							exec_id,
+							command,
+							transcript,
+							adjustments,
+							status,
+						};
 						yield Ev::Done(ToolTerminal::Done {
-							result: Ok(Payload {
-								session_id,
-								exec_id,
-								command,
-								transcript,
-								adjustments,
-								status,
-							}),
+							result: if successful {
+								Ok(payload)
+							} else {
+								Err(Fault::CommandFailed { payload: Box::new(payload) })
+							},
 							useless: false,
 						});
 						return;
@@ -924,6 +932,15 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							break;
 						}
 					}
+					push_transcript_head_tail(&mut projection, &payload.transcript);
+				}
+			},
+			Err(Fault::CommandFailed { payload }) => {
+				let status = format!(
+					"bash command failed: status={:?}, exit={:?}, signal={:?}\n",
+					payload.status.outcome, payload.status.exit_code, payload.status.signal
+				);
+				if projection.push(&status) {
 					push_transcript_head_tail(&mut projection, &payload.transcript);
 				}
 			},
@@ -994,7 +1011,10 @@ fn fault_reason(fault: &Fault) -> String {
 		Fault::Resource { operation, message } => format!("shell {operation} failed: {message}"),
 		Fault::PtyDenied => String::from("shell PTY allocation denied by invocation scope"),
 		Fault::InvalidEnvironmentKey { key } => format!("invalid shell environment key {key:?}"),
-		Fault::AsyncNameRequired => String::from("shell async execution requires a non-empty name"),
+		Fault::CommandFailed { payload } => format!(
+			"bash command failed: status={:?}, exit={:?}, signal={:?}",
+			payload.status.outcome, payload.status.exit_code, payload.status.signal
+		),
 	}
 }
 
@@ -1023,6 +1043,9 @@ fn extract_leading_cd(command: &Str) -> (Str, Option<Str>) {
 		cursor = after_path;
 	}
 	cursor = skip_space(bytes, cursor);
+	if cwd.contains(['$', '`', '(']) {
+		return (command.clone(), None);
+	}
 	if bytes.get(cursor..cursor.saturating_add(2)) != Some(b"&&") {
 		return (command.clone(), None);
 	}
@@ -1155,7 +1178,7 @@ fn commit_event<U, P>(error: CommitError) -> Ev<U, P, Fault> {
 fn protocol_issue(reason: Str) -> ArgIssue {
 	ArgIssue {
 		path:     Vec::new(),
-		expected: sf!("one complete shell@1 argument object"),
+		expected: sf!("one complete bash@1 argument object"),
 		kind:     ArgIssueKind::Protocol,
 		example:  Some(sf!(r#"{{"command":"printf hello"}}"#)),
 		found:    Some(reason),
@@ -1199,6 +1222,23 @@ mod tests {
 	}
 
 	#[test]
+	fn leading_cd_extraction_preserves_shell_expansions() {
+		for command in
+			[r#"cd "$HOME" && pwd"#, "cd `pwd` && printf done", r#"cd "$(pwd)" && printf done"#]
+		{
+			assert_eq!(extract_leading_cd(&Str::new(command)), (Str::new(command), None));
+		}
+	}
+
+	#[test]
+	fn leading_cd_extraction_accepts_only_static_targets() {
+		assert_eq!(
+			extract_leading_cd(&sf!(r#"cd "/tmp/a b" && pwd"#)),
+			(sf!("pwd"), Some(sf!("/tmp/a b")))
+		);
+	}
+
+	#[test]
 	fn shell_description_mentions_xd_only_when_devices_are_installed() {
 		let enabled = prompt_snapshot(true).description();
 		assert!(
@@ -1212,7 +1252,7 @@ mod tests {
 		assert!(!disabled.contains("`dyn`"));
 	}
 	#[test]
-	fn params_schema_stays_strict_and_couples_async_to_name() {
+	fn params_schema_stays_strict_and_allocates_async_jobs_internally() {
 		use omp_inference::recovery::tools::{
 			ToolAssemblyLimits, schema_within_strict_subset, validate_schema,
 		};
@@ -1230,8 +1270,8 @@ mod tests {
 		let valid = [
 			serde_json::json!({"command": "echo hi"}),
 			serde_json::json!({"command": "echo hi", "async": false}),
-			serde_json::json!({"command": "sleep 5", "async": true, "name": "napper"}),
-			serde_json::json!({"command": "make", "timeout_ms": 0}),
+			serde_json::json!({"command": "sleep 5", "async": true}),
+			serde_json::json!({"command": "make", "timeout": 0}),
 		];
 		for arguments in valid {
 			assert!(
@@ -1242,12 +1282,12 @@ mod tests {
 		assert!(
 			validate_schema(
 				&schema,
-				&serde_json::json!({"command": "sleep 5", "async": true}),
+				&serde_json::json!({"command": "sleep 5", "async": true, "name": "caller-owned"}),
 				true,
 				limits,
 			)
 			.is_err(),
-			"async without a job name must stay invalid"
+			"caller-authored process names belong to hub start, not bash async"
 		);
 	}
 }

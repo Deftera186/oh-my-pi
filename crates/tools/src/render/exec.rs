@@ -62,12 +62,13 @@ impl RenderFold for ShellRenderer {
 		if let Some(command) = args.get("command").and_then(omp_slopjson::Value::as_str) {
 			state.shell_command = Some(Str::new(command));
 		}
-		if let Some(timeout_ms) = args.get("timeout_ms").and_then(omp_slopjson::Value::as_u64) {
+		if let Some(timeout_seconds) = args.get("timeout").and_then(omp_slopjson::Value::as_f64) {
 			state.shell_timeout_known = true;
-			state.shell_timeout_ms = (timeout_ms != 0).then_some(timeout_ms);
+			state.shell_timeout_ms =
+				(timeout_seconds != 0.0).then_some((timeout_seconds * 1_000.0).ceil() as u64);
 		} else if complete {
 			state.shell_timeout_known = true;
-			state.shell_timeout_ms = Some(30_000);
+			state.shell_timeout_ms = Some(300_000);
 		}
 		state.cached = Some(render_shell_live(state).into());
 	}
@@ -85,11 +86,18 @@ impl RenderFold for ShellRenderer {
 				result: Ok(payload),
 				..
 			})) => Some(render_shell_payload(payload, state).into()),
+			Some(ShellRenderOutcome::Call(CallOutcome::Faulted(ShellFault::CommandFailed {
+				payload,
+			})))
+			| Some(ShellRenderOutcome::Terminal(omp_tool::ToolTerminal::Done {
+				result: Err(ShellFault::CommandFailed { payload }),
+				..
+			})) => Some(render_shell_payload(payload, state).into()),
 			Some(ShellRenderOutcome::Call(CallOutcome::Faulted(fault)))
 			| Some(ShellRenderOutcome::Terminal(omp_tool::ToolTerminal::Done {
 				result: Err(fault),
 				..
-			})) => Some(render_fault("shell", &shell_fault(fault)).into()),
+			})) => Some(render_fault("bash", &shell_fault(fault)).into()),
 			Some(ShellRenderOutcome::Terminal(omp_tool::ToolTerminal::Detached(job))) => {
 				Some(render_shell_detached(job).into())
 			},
@@ -162,57 +170,53 @@ fn append_bounded_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 fn render_shell_live(state: &StreamState) -> El {
 	let tail = String::from_utf8_lossy(&state.tail);
 	view! {
-		<box border="round" pad="0 1" bc=accent>
-			<col gap=0>
-				<row gap=1>
-					<text bold fg=accent>{"$"}</text>
-					if let Some(command) = &state.shell_command {
-						<text bold max-chars=16384 truncate-from="end">{command}</text>
-					} else {
-						<text fg=muted>{"…"}</text>
-					}
-					<spinner color=accent label="running"/>
-					<spacer/>
-					if state.last_sequence.is_some() {
-						<bytes value={state.bytes}/>
-					} else {
-						<text fg=muted>{"starting"}</text>
-					}
-				</row>
-				if !state.tail.is_empty() {
-					<hr label="Output"/>
-					<pre max-rows=12 overflow="output">{tail.as_ref()}</pre>
+		<col gap=0>
+			<row gap=1>
+				<text bold fg=accent>{"$"}</text>
+				if let Some(command) = &state.shell_command {
+					<text bold max-chars=16384 truncate-from="end">{command}</text>
+				} else {
+					<text fg=muted>{"…"}</text>
 				}
-			</col>
-		</box>
+				<spinner color=accent label="running"/>
+				<spacer/>
+				if state.last_sequence.is_some() {
+					<bytes value={state.bytes}/>
+				} else {
+					<text fg=muted>{"starting"}</text>
+				}
+			</row>
+			if !state.tail.is_empty() {
+				<hr label="Output"/>
+				<pre max-rows=12 overflow="output">{tail.as_ref()}</pre>
+			}
+		</col>
 	}
 }
 
 fn render_eval_live(state: &StreamState) -> El {
 	let tail = String::from_utf8_lossy(&state.tail);
 	view! {
-		<box border="round" pad="0 1" bc=accent>
-			<col gap=0>
-				<row gap=1>
-					if let Some(language) = state.eval_language {
-						<text bold fg=info>{debug_label(language)}</text>
-					}
-					if let Some(title) = &state.eval_title {
-						<text bold max-chars=256 truncate-from="end">{title}</text>
-					}
-					<spinner color=accent label="running"/>
-					<spacer/>
-					<bytes value={state.bytes}/>
-				</row>
-				if let Some(code) = &state.eval_code {
-					<pre fg=accent max-rows=12 overflow="code">{code}</pre>
+		<col gap=0>
+			<row gap=1>
+				if let Some(language) = state.eval_language {
+					<text bold fg=info>{debug_label(language)}</text>
 				}
-				if !state.tail.is_empty() {
-					<hr label="Output"/>
-					<pre max-rows=12 overflow="output">{tail.as_ref()}</pre>
+				if let Some(title) = &state.eval_title {
+					<text bold max-chars=256 truncate-from="end">{title}</text>
 				}
-			</col>
-		</box>
+				<spinner color=accent label="running"/>
+				<spacer/>
+				<bytes value={state.bytes}/>
+			</row>
+			if let Some(code) = &state.eval_code {
+				<pre fg=accent max-rows=12 overflow="code">{code}</pre>
+			}
+			if !state.tail.is_empty() {
+				<hr label="Output"/>
+				<pre max-rows=12 overflow="output">{tail.as_ref()}</pre>
+			}
+		</col>
 	}
 }
 
@@ -229,23 +233,24 @@ fn shell_fault(fault: &ShellFault) -> String {
 		ShellFault::InvalidEnvironmentKey { key } => {
 			format!("invalid shell environment key {key:?}")
 		},
-		ShellFault::AsyncNameRequired => String::from("async shell execution requires a name"),
+		ShellFault::CommandFailed { payload } => format!(
+			"command failed: status={:?}, exit={:?}, signal={:?}",
+			payload.status.outcome, payload.status.exit_code, payload.status.signal
+		),
 	}
 }
 
 fn render_shell_detached(job: &omp_tool::JobRef) -> El {
 	view! {
-		<box border="round" pad="0 1" bc=info>
-			<col gap=0>
-				<row sep=" · ">
-					<text bold fg=info>{"$ detached"}</text>
-					<state status="running"/>
-				</row>
-				<fact label="job">{&job.id}</fact>
-				<fact label="command">{&job.metadata.label}</fact>
-				<callout kind="info">{"Completion will be delivered by the job board."}</callout>
-			</col>
-		</box>
+		<col gap=0>
+			<row sep=" · ">
+				<text bold fg=info>{"$ detached"}</text>
+				<state status="running"/>
+			</row>
+			<fact label="job">{&job.id}</fact>
+			<fact label="command">{&job.metadata.label}</fact>
+			<callout kind="info">{"Completion will be delivered by the job board."}</callout>
+		</col>
 	}
 }
 
@@ -269,54 +274,52 @@ fn render_shell_payload(payload: &ShellPayload, state: &StreamState) -> El {
 	let status = shell_state_status(payload);
 	let status_tone = shell_status_tone(payload);
 	view! {
-		<box border="round" pad="0 1">
-			<col gap=0>
-				<pre fg=accent max-rows=12 overflow="command">{"$ "}{&payload.command}</pre>
-				<hr label="Output"/>
-				if transcript.is_empty() {
-					<text fg=muted>{"(no output)"}</text>
-				} else {
-					<pre max-rows=20 overflow="output">{transcript.as_ref()}</pre>
-				}
-				if payload.status.spilled_output.is_some() {
-					<fact label="output">{"full output stored as blob"}</fact>
-				}
-				if payload.status.effects_unknown {
-					<callout kind="warn">{"Final effect state is unknown."}</callout>
-				}
-				if let Some(cwd) = &payload.status.final_cwd_uri {
-					<fact label="cwd">{cwd}</fact>
-				}
-				<row sep=" · ">
-					<fact label="Wall">
-						<time ms={payload.status.wall_clock_ms} kind="duration"/>
-					</fact>
-					<fact label="Timeout">
-						if let Some(effective_ms) = effective_timeout_ms {
-							<time ms={effective_ms} kind="duration"/>
-						} else if state.shell_timeout_known {
-							if let Some(timeout_ms) = state.shell_timeout_ms {
-								<time ms={timeout_ms} kind="duration"/>
-							} else {
-								{"disabled"}
-							}
+		<col gap=0>
+			<pre fg=accent max-rows=12 overflow="command">{"$ "}{&payload.command}</pre>
+			<hr label="Output"/>
+			if transcript.is_empty() {
+				<text fg=muted>{"(no output)"}</text>
+			} else {
+				<pre max-rows=20 overflow="output">{transcript.as_ref()}</pre>
+			}
+			if payload.status.spilled_output.is_some() {
+				<fact label="output">{"full output stored as blob"}</fact>
+			}
+			if payload.status.effects_unknown {
+				<callout kind="warn">{"Final effect state is unknown."}</callout>
+			}
+			if let Some(cwd) = &payload.status.final_cwd_uri {
+				<fact label="cwd">{cwd}</fact>
+			}
+			<row sep=" · ">
+				<fact label="Wall">
+					<time ms={payload.status.wall_clock_ms} kind="duration"/>
+				</fact>
+				<fact label="Timeout">
+					if let Some(effective_ms) = effective_timeout_ms {
+						<time ms={effective_ms} kind="duration"/>
+					} else if state.shell_timeout_known {
+						if let Some(timeout_ms) = state.shell_timeout_ms {
+							<time ms={timeout_ms} kind="duration"/>
 						} else {
-							{"unknown"}
+							{"disabled"}
 						}
-					</fact>
-					<fact label="Status">
-						<state status={status}/>
-						<text fg={status_tone}>{debug_label(payload.status.outcome)}</text>
-					</fact>
-					if let Some(code) = payload.status.exit_code {
-						<fact label="Exit"><text fg={status_tone}>{code.to_string()}</text></fact>
+					} else {
+						{"unknown"}
 					}
-					if let Some(signal) = &payload.status.signal {
-						<fact label="Signal">{signal}</fact>
-					}
-				</row>
-			</col>
-		</box>
+				</fact>
+				<fact label="Status">
+					<state status={status}/>
+					<text fg={status_tone}>{debug_label(payload.status.outcome)}</text>
+				</fact>
+				if let Some(code) = payload.status.exit_code {
+					<fact label="Exit"><text fg={status_tone}>{code.to_string()}</text></fact>
+				}
+				if let Some(signal) = &payload.status.signal {
+					<fact label="Signal">{signal}</fact>
+				}
+			</row>
+		</col>
 	}
 }
 
@@ -392,78 +395,76 @@ fn render_eval_payload(payload: &EvalPayload) -> El {
 	let status = eval_state_status(payload.status.outcome);
 	let status_tone = eval_status_tone(payload.status.outcome);
 	view! {
-		<box border="round" pad="0 1">
-			<col gap=0>
-				<row gap=1>
-					<text bold fg=info>{debug_label(payload.language)}</text>
-					if let Some(title) = &payload.title {
-						<text bold max-chars=256 truncate-from="end">{title}</text>
+		<col gap=0>
+			<row gap=1>
+				<text bold fg=info>{debug_label(payload.language)}</text>
+				if let Some(title) = &payload.title {
+					<text bold max-chars=256 truncate-from="end">{title}</text>
+				}
+				<fact label="Status">
+					<state status={status}/>
+					<text fg={status_tone}>{debug_label(payload.status.outcome)}</text>
+				</fact>
+				<spacer/>
+				<time ms={payload.status.duration_ms} kind="duration"/>
+			</row>
+			<pre fg=accent max-rows=12 overflow="code">{&payload.code}</pre>
+			<hr label="Output"/>
+			if let Some(exception) = &payload.status.exception {
+				<pre fg=err max-rows=20 overflow="traceback">
+					for (index, line) in exception.traceback.iter().enumerate() {
+						if index > 0 { {"\n"} }
+						{line}
 					}
-					<fact label="Status">
-						<state status={status}/>
-						<text fg={status_tone}>{debug_label(payload.status.outcome)}</text>
-					</fact>
-					<spacer/>
-					<time ms={payload.status.duration_ms} kind="duration"/>
-				</row>
-				<pre fg=accent max-rows=12 overflow="code">{&payload.code}</pre>
-				<hr label="Output"/>
-				if let Some(exception) = &payload.status.exception {
-					<pre fg=err max-rows=20 overflow="traceback">
-						for (index, line) in exception.traceback.iter().enumerate() {
-							if index > 0 { {"\n"} }
-							{line}
-						}
-						if !exception.traceback.is_empty() { {"\n"} }
-						{&exception.name}
-						if !exception.message.is_empty() {
-							{": "}{&exception.message}
+					if !exception.traceback.is_empty() { {"\n"} }
+					{&exception.name}
+					if !exception.message.is_empty() {
+						{": "}{&exception.message}
+					}
+				</pre>
+			} else if payload.frames.is_empty()
+				&& payload.result.is_none()
+				&& payload.display_outputs.is_empty()
+			{
+				<text fg=muted>{"(no output)"}</text>
+			} else {
+				if !payload.frames.is_empty() {
+					<pre max-rows=20 overflow="output">
+						for frame in &payload.frames {
+							{String::from_utf8_lossy(frame.data.as_ref()).into_owned()}
 						}
 					</pre>
-				} else if payload.frames.is_empty()
-					&& payload.result.is_none()
-					&& payload.display_outputs.is_empty()
-				{
-					<text fg=muted>{"(no output)"}</text>
-				} else {
-					if !payload.frames.is_empty() {
-						<pre max-rows=20 overflow="output">
-							for frame in &payload.frames {
-								{String::from_utf8_lossy(frame.data.as_ref()).into_owned()}
-							}
-						</pre>
-					}
-					if let Some(result) = &payload.result {
-						<pre fg=info max-rows=20 overflow="result">{&result.text}</pre>
-					}
-					for display in &payload.display_outputs {
-						match display {
-							DisplayOutput::Json { data } | DisplayOutput::Status { event: data } => {
-								<json max-depth=3 max-rows=12 max-chars=80>{data.to_string()}</json>
-							},
-							DisplayOutput::Markdown { text } => {
-								<md>{text}</md>
-							},
-							DisplayOutput::Image { description, .. } => {
-								<text fg=muted>{description}</text>
-							},
-							DisplayOutput::ImageData { data, mime_type } => {
-								<row sep=" · ">
-									<text fg=muted>{mime_type}</text>
-									<bytes value={u64::try_from(data.len()).unwrap_or(u64::MAX)}/>
-								</row>
-							},
-						}
+				}
+				if let Some(result) = &payload.result {
+					<pre fg=info max-rows=20 overflow="result">{&result.text}</pre>
+				}
+				for display in &payload.display_outputs {
+					match display {
+						DisplayOutput::Json { data } | DisplayOutput::Status { event: data } => {
+							<json max-depth=3 max-rows=12 max-chars=80>{data.to_string()}</json>
+						},
+						DisplayOutput::Markdown { text } => {
+							<md>{text}</md>
+						},
+						DisplayOutput::Image { description, .. } => {
+							<text fg=muted>{description}</text>
+						},
+						DisplayOutput::ImageData { data, mime_type } => {
+							<row sep=" · ">
+								<text fg=muted>{mime_type}</text>
+								<bytes value={u64::try_from(data.len()).unwrap_or(u64::MAX)}/>
+							</row>
+						},
 					}
 				}
-				if payload.truncated {
-					<callout kind="warn">{"Output was truncated."}</callout>
-				}
-				if payload.spilled_output.is_some() {
-					<fact label="output">{"full output stored as blob"}</fact>
-				}
-			</col>
-		</box>
+			}
+			if payload.truncated {
+				<callout kind="warn">{"Output was truncated."}</callout>
+			}
+			if payload.spilled_output.is_some() {
+				<fact label="output">{"full output stored as blob"}</fact>
+			}
+		</col>
 	}
 }
 
@@ -477,12 +478,12 @@ pub(crate) fn gallery_fixtures(
 			identity: shell,
 			title: "git status --short && git log --oneline -5",
 			streaming_args: r#"{"command":"git status --short && git log --on"#,
-			args: r#"{"command":"git status --short && git log --oneline -5","cwd":"packages/coding-agent","timeout_ms":30000}"#,
+			args: r#"{"command":"git status --short && git log --oneline -5","cwd":"packages/coding-agent","timeout":30}"#,
 			progress_update: Some(
 				br#"{"channel":"stdout","data":[32,77,32,115,114,99,47,99,108,105,47,103,97,108,108,101,114,121,45,99,108,105,46,116,115,10],"sequence":1,"exec_id":[1],"started":true,"terminal":false}"#,
 			),
 			success_outcome: br#"{"kind":"ok","value":{"session_id":[1],"exec_id":[1],"command":"git status --short && git log --oneline -5","transcript":[{"channel":"stdout","data":[32,77,32,115,114,99,47,99,108,105,47,103,97,108,108,101,114,121,45,99,108,105,46,116,115,10,32,77,32,115,114,99,47,116,111,111,108,115,47,98,97,115,104,46,116,115,10,63,63,32,115,114,99,47,99,108,105,47,103,97,108,108,101,114,121,45,102,105,120,116,117,114,101,115,47,115,104,101,108,108,46,116,115,10,97,49,98,50,99,51,100,32,87,105,114,101,32,103,97,108,108,101,114,121,32,99,111,109,109,97,110,100,32,105,110,116,111,32,67,76,73,32,100,105,115,112,97,116,99,104,10,57,102,56,101,55,100,54,32,65,100,100,32,84,111,111,108,69,120,101,99,117,116,105,111,110,67,111,109,112,111,110,101,110,116,32,108,105,102,101,99,121,99,108,101,32,115,116,97,116,101,115,10,52,99,53,98,54,97,55,32,69,120,116,114,97,99,116,32,99,114,101,97,116,101,83,104,101,108,108,82,101,110,100,101,114,101,114,32,102,114,111,109,32,98,97,115,104,84,111,111,108,82,101,110,100,101,114,101,114,10,50,100,51,101,52,102,53,32,83,116,114,105,112,32,76,76,77,45,102,97,99,105,110,103,32,110,111,116,105,99,101,115,32,98,101,102,111,114,101,32,84,85,73,32,114,101,110,100,101,114,10,55,97,56,98,57,99,48,32,67,97,112,32,112,114,101,118,105,101,119,32,108,105,110,101,115,32,105,110,32,112,101,110,100,105,110,103,32,99,111,109,109,97,110,100,32,98,108,111,99,107,10],"sequence":1}],"adjustments":[],"status":{"outcome":"exited","exit_code":0,"signal":null,"wall_clock_ms":184,"spilled_output":null,"aborted":false,"effects_unknown":false,"final_cwd_uri":"file:///work/pi/packages/coding-agent","final_cwd_revision":7}}}"#,
-			error_outcome: br#"{"kind":"ok","value":{"session_id":[1],"exec_id":[2],"command":"npx tsc --noEmit","transcript":[{"channel":"stderr","data":[115,114,99,47,116,111,111,108,115,47,98,97,115,104,46,116,115,58,49,49,52,50,58,51,52,32,45,32,101,114,114,111,114,32,84,83,50,51,51,57,58,32,80,114,111,112,101,114,116,121,32,39,114,101,113,117,101,115,116,101,100,84,105,109,101,111,117,116,83,101,99,111,110,100,115,39,32,100,111,101,115,32,110,111,116,32,101,120,105,115,116,32,111,110,32,116,121,112,101,32,39,66,97,115,104,84,111,111,108,68,101,116,97,105,108,115,39,46,10,10,49,49,52,50,32,32,32,99,111,110,115,116,32,114,101,113,117,101,115,116,101,100,84,105,109,101,111,117,116,83,101,99,111,110,100,115,32,61,32,100,101,116,97,105,108,115,63,46,114,101,113,117,101,115,116,101,100,84,105,109,101,111,117,116,83,101,99,111,110,100,115,59,10,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,10,10,70,111,117,110,100,32,49,32,101,114,114,111,114,32,105,110,32,115,114,99,47,116,111,111,108,115,47,98,97,115,104,46,116,115,58,49,49,52,50,10],"sequence":1}],"adjustments":[],"status":{"outcome":"exited","exit_code":2,"signal":null,"wall_clock_ms":5120,"spilled_output":null,"aborted":false,"effects_unknown":false,"final_cwd_uri":"file:///work/pi/packages/coding-agent","final_cwd_revision":7}}}"#,
+			error_outcome: br#"{"kind":"faulted","value":{"kind":"command_failed","payload":{"session_id":[1],"exec_id":[2],"command":"npx tsc --noEmit","transcript":[{"channel":"stderr","data":[115,114,99,47,116,111,111,108,115,47,98,97,115,104,46,116,115,58,49,49,52,50,58,51,52,32,45,32,101,114,114,111,114,32,84,83,50,51,51,57,58,32,80,114,111,112,101,114,116,121,32,39,114,101,113,117,101,115,116,101,100,84,105,109,101,111,117,116,83,101,99,111,110,100,115,39,32,100,111,101,115,32,110,111,116,32,101,120,105,115,116,32,111,110,32,116,121,112,101,32,39,66,97,115,104,84,111,111,108,68,101,116,97,105,108,115,39,46,10,10,49,49,52,50,32,32,32,99,111,110,115,116,32,114,101,113,117,101,115,116,101,100,84,105,109,101,111,117,116,83,101,99,111,110,100,115,32,61,32,100,101,116,97,105,108,115,63,46,114,101,113,117,101,115,116,101,100,84,105,109,101,111,117,116,83,101,99,111,110,100,115,59,10,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,32,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,126,10,10,70,111,117,110,100,32,49,32,101,114,114,111,114,32,105,110,32,115,114,99,47,116,111,111,108,115,47,98,97,115,104,46,116,115,58,49,49,52,50,10],"sequence":1}],"adjustments":[],"status":{"outcome":"exited","exit_code":2,"signal":null,"wall_clock_ms":5120,"spilled_output":null,"aborted":false,"effects_unknown":false,"final_cwd_uri":"file:///work/pi/packages/coding-agent","final_cwd_revision":7}}}}"#,
 		},
 		RendererGalleryFixture {
 			identity: eval,
@@ -520,7 +521,7 @@ mod tests {
 		let job = omp_tool::JobRef {
 			id:       Str::new("job&1"),
 			owner:    omp_tool::JobOwner::NamedProcess {
-				name:       Str::new("shell"),
+				name:       Str::new("bash-bg-1"),
 				generation: 1,
 			},
 			metadata: std::sync::Arc::new(omp_tool::JobMetadata::running(
@@ -543,7 +544,7 @@ mod tests {
 
 	#[test]
 	fn fixtures_decode_and_render_pi_grade_shell_and_eval_states() {
-		let fixtures = gallery_fixtures(identity("shell"), identity("eval"));
+		let fixtures = gallery_fixtures(identity("bash"), identity("eval"));
 		let shell = &fixtures[0];
 		let shell_update: ShellUpdate =
 			serde_json::from_slice(shell.progress_update.expect("shell progress")).unwrap();

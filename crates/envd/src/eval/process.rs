@@ -1,7 +1,7 @@
 //! Supervised child-process transport for persistent Python eval sessions.
 
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	env,
 	ffi::{OsStr, OsString},
 	fs, future,
@@ -37,10 +37,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-	process::{Child, ChildStdin, ChildStdout, Command},
+	net::TcpListener,
+	process::{Child, Command},
 	runtime,
 	sync::Mutex as AsyncMutex,
-	task, time,
+	task::{self, JoinSet},
+	time,
 };
 use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
@@ -48,6 +50,7 @@ use windows_sys::Win32::System::Console;
 
 use super::{
 	super::blobs::BlobHost,
+	PYTHON_PRELUDE,
 	bridge::{
 		BridgeCapabilities, BridgeHostError, BridgeNamespaceInstaller, BridgeProgressSink,
 		ChildBridgeTransport, PreludeStubWire, SessionBridgeHost,
@@ -68,9 +71,11 @@ const MAX_MANAGED_ENV_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGED_ENV_BYTES: usize = 2 * 1024 * 1024;
 const MANAGED_ENV_KEYS: [&str; 3] =
 	["OMP_ARTIFACTS_DIR", "OMP_EVAL_LOCAL_ROOTS", "OMP_SESSION_FILE"];
+const EMBEDDED_INTERPRETER: &str = "embedded:cpython-3.14t";
+const EXTERNAL_RUNNER_SOURCE: &str = include_str!("external_runner.py");
 
-/// Production [`EvalExec`] that owns one killable same-binary child per
-/// session.
+/// Production [`EvalExec`] that owns one killable persistent interpreter child
+/// per session.
 #[derive(Clone)]
 pub struct ProcessEvalExec {
 	inner: Arc<ProcessEvalInner>,
@@ -112,18 +117,32 @@ pub struct ProcessEvalRun {
 }
 
 impl ProcessEvalExec {
-	/// Resolves the real `omp` executable and constructs the production
-	/// Python executor.
+	/// Constructs the production Python executor.
+	///
+	/// `OMP_PYTHON_INTERPRETER` overrides `configured_interpreter`; when neither
+	/// is set, interpreter discovery is deferred until the authoritative
+	/// runtime working directory is available.
 	pub fn production(
 		host: Arc<SessionBridgeHost>,
 		interrupt_grace: OmpDuration,
 		blobs: BlobHost,
+		configured_interpreter: Option<PathBuf>,
 	) -> Result<Self, io::Error> {
 		let executable = resolve_omp_executable()?;
-		let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-		let explicit = env::var_os("OMP_PYTHON_INTERPRETER");
-		let interpreter = discover_external_python(&cwd, explicit.as_deref())
-			.unwrap_or_else(|| PathBuf::from("embedded:cpython-3.14t"));
+		let requested = env::var_os("OMP_PYTHON_INTERPRETER")
+			.or_else(|| configured_interpreter.map(PathBuf::into_os_string));
+		let interpreter = match requested {
+			Some(requested) => resolve_configured_python(&requested).ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::NotFound,
+					format!(
+						"configured Python interpreter is not executable: {}",
+						requested.to_string_lossy()
+					),
+				)
+			})?,
+			None => PathBuf::from(EMBEDDED_INTERPRETER),
+		};
 		Ok(Self::new_inner(executable, interpreter, host, interrupt_grace, Some(blobs)))
 	}
 
@@ -291,6 +310,16 @@ impl ProcessEvalExec {
 		let cancelled = CancellationToken::new();
 		let task_cancelled = cancelled.clone();
 		let executable = self.inner.executable.clone();
+		let interpreter = if owned.key.interpreter == Path::new(EMBEDDED_INTERPRETER) {
+			request
+				.runtime
+				.cwd
+				.as_deref()
+				.and_then(|cwd| discover_external_python(cwd, None))
+				.unwrap_or_else(|| owned.key.interpreter.clone())
+		} else {
+			owned.key.interpreter.clone()
+		};
 		let host = Arc::clone(&self.inner.host);
 		let blobs = self.inner.blobs.clone();
 		let interrupt_grace = self.inner.interrupt_grace;
@@ -315,6 +344,7 @@ impl ProcessEvalExec {
 				if child_slot.is_none() {
 					match EvalChild::spawn(
 						&executable,
+						&interpreter,
 						&owned.key.session,
 						request
 							.runtime
@@ -423,13 +453,34 @@ impl EvalRun for ProcessEvalRun {
 	}
 }
 
-struct ProgressChannel(flume::Sender<Value>);
+enum BridgeTaskEvent {
+	Progress { request_id: u64, event: Value },
+	Response { request_id: u64, value: Option<Value>, error: Option<Str> },
+}
+
+enum ParentLoopEvent {
+	Frame(Result<Option<ChildFrame>, ProcessError>),
+	Bridge(Option<BridgeTaskEvent>),
+	BridgeTaskJoined,
+	Cancel,
+	InterruptGraceExpired,
+	Timeout,
+}
+
+struct ProgressChannel {
+	request_id: u64,
+	events:     flume::Sender<BridgeTaskEvent>,
+}
+async fn cancel_bridge_tasks(tasks: &mut JoinSet<()>) {
+	tasks.abort_all();
+	while tasks.join_next().await.is_some() {}
+}
 
 impl BridgeProgressSink for ProgressChannel {
 	fn progress(&self, event: Value) -> Result<(), BridgeHostError> {
 		self
-			.0
-			.send(event)
+			.events
+			.send(BridgeTaskEvent::Progress { request_id: self.request_id, event })
 			.map_err(|_| BridgeHostError::message("eval bridge progress receiver was dropped"))
 	}
 }
@@ -501,10 +552,13 @@ impl OutputSpill {
 	}
 }
 
+type ProtocolInput = Box<dyn AsyncRead + Unpin + Send>;
+type ProtocolOutput = Box<dyn AsyncWrite + Unpin + Send>;
+
 struct EvalChild {
 	child:           Child,
-	stdin:           ChildStdin,
-	stdout:          BufReader<ChildStdout>,
+	stdin:           ProtocolOutput,
+	stdout:          BufReader<ProtocolInput>,
 	token:           Str,
 	next_run:        AtomicU64,
 	process_group:   Option<u32>,
@@ -532,6 +586,7 @@ const fn should_retry_dead_kernel_cancellation(
 impl EvalChild {
 	async fn spawn(
 		executable: &Path,
+		interpreter: &Path,
 		session_id: &Bytes,
 		cwd: &Path,
 		host: Arc<SessionBridgeHost>,
@@ -542,9 +597,26 @@ impl EvalChild {
 		let prelude = host.prelude_stubs();
 		let token = Str::from(Ulid::generate().to_string());
 		let parent_pid = process::id();
-		let mut command = Command::new(executable);
+		let (mut command, external_protocol, external_runner) =
+			if interpreter == Path::new(EMBEDDED_INTERPRETER) {
+				let mut command = Command::new(executable);
+				command.arg(EVAL_CHILD_ARG);
+				(command, None, None)
+			} else {
+				let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+				let address = listener.local_addr()?;
+				let secret = Str::from(Ulid::generate().to_string());
+				let runner = stage_external_runner()?;
+				let mut command = Command::new(interpreter);
+				command
+					.arg("-u")
+					.arg(&runner)
+					.arg("--omp-connect")
+					.arg(address.to_string())
+					.arg(secret.as_str());
+				(command, Some((listener, address, secret)), Some(runner))
+			};
 		command
-			.arg(EVAL_CHILD_ARG)
 			.current_dir(cwd)
 			.env_clear()
 			.envs(sanitized_spawn_env())
@@ -552,10 +624,13 @@ impl EvalChild {
 			.env("PYTHONIOENCODING", "utf-8")
 			.env("MPLBACKEND", "Agg")
 			.env("OMP_EVAL_SESSION", String::from_utf8_lossy(session_id.as_ref()).as_ref())
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
 			.stderr(Stdio::inherit())
 			.kill_on_drop(true);
+		if external_protocol.is_some() {
+			command.stdin(Stdio::null()).stdout(Stdio::null());
+		} else {
+			command.stdin(Stdio::piped()).stdout(Stdio::piped());
+		}
 		#[cfg(unix)]
 		{
 			use std::os::unix::process::CommandExt;
@@ -568,18 +643,38 @@ impl EvalChild {
 		}
 		let mut child = command.spawn()?;
 		let process_group = child.id();
-		let stdin = child
-			.stdin
-			.take()
-			.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdin unavailable")))?;
-		let stdout = child
-			.stdout
-			.take()
-			.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdout unavailable")))?;
+		let (stdin, stdout) = if let Some((listener, _, secret)) = external_protocol {
+			let (stream, _) = time::timeout(Duration::from_secs(30), listener.accept())
+				.await
+				.map_err(|_| {
+					ProcessError::Protocol(sf!("external Python protocol connect timed out"))
+				})??;
+			let (reader, writer) = stream.into_split();
+			let mut reader = BufReader::new(Box::new(reader) as ProtocolInput);
+			match read_frame::<_, ExternalHello>(&mut reader).await? {
+				Some(ExternalHello { secret: actual }) if actual == secret => {},
+				_ => {
+					return Err(ProcessError::Protocol(sf!(
+						"external Python protocol authentication failed"
+					)));
+				},
+			}
+			(Box::new(writer) as ProtocolOutput, reader)
+		} else {
+			let stdin = child
+				.stdin
+				.take()
+				.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdin unavailable")))?;
+			let stdout = child
+				.stdout
+				.take()
+				.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdout unavailable")))?;
+			(Box::new(stdin) as ProtocolOutput, BufReader::new(Box::new(stdout) as ProtocolInput))
+		};
 		let mut process = Self {
 			child,
 			stdin,
-			stdout: BufReader::new(stdout),
+			stdout,
 			token: token.clone(),
 			next_run: AtomicU64::new(1),
 			process_group,
@@ -591,12 +686,17 @@ impl EvalChild {
 			parent_pid,
 			capabilities,
 			prelude,
+			python_prelude: Str::from(PYTHON_PRELUDE),
 			interrupt_grace: Str::from(interrupt_grace.to_string()),
 		})
 		.await?;
 		// Cold start covers exec plus embedded-interpreter boot; tolerate load
 		// spikes that the per-frame runtime deadlines must not.
-		match time::timeout(Duration::from_secs(30), read_frame(&mut process.stdout)).await {
+		let ready = time::timeout(Duration::from_secs(30), read_frame(&mut process.stdout)).await;
+		if let Some(runner) = external_runner {
+			let _ = fs::remove_file(runner);
+		}
+		match ready {
 			Ok(Ok(Some(ChildFrame::Ready))) => Ok(process),
 			Ok(Ok(Some(ChildFrame::Fatal { message }))) => Err(ProcessError::Protocol(message)),
 			Ok(Ok(Some(_))) => {
@@ -653,26 +753,107 @@ impl EvalChild {
 		let mut exception = None;
 		let mut spill = OutputSpill::new(blobs.clone());
 		let mut wire_sequence = 0_u64;
+		let (bridge_events_tx, bridge_events_rx) = flume::unbounded();
+		let mut bridge_tasks = JoinSet::new();
+		let mut pending_bridge = BTreeSet::new();
+		let mut caller_cancelled = false;
+		let mut interrupt_deadline = None;
 		loop {
-			let frame = tokio::select! {
-				() = cancelled.cancelled() => {
-					needs_reset.store(true, Ordering::Release);
+			let event = tokio::select! {
+				() = cancelled.cancelled(), if !caller_cancelled => ParentLoopEvent::Cancel,
+				() = async {
+					match interrupt_deadline {
+						Some(deadline) => time::sleep_until(deadline).await,
+						None => future::pending().await,
+					}
+				} => ParentLoopEvent::InterruptGraceExpired,
+				() = timeout.expired(), if !caller_cancelled => ParentLoopEvent::Timeout,
+				event = bridge_events_rx.recv_async(), if !pending_bridge.is_empty() => {
+					ParentLoopEvent::Bridge(event.ok())
+				},
+				_ = bridge_tasks.join_next(), if !bridge_tasks.is_empty() => {
+					ParentLoopEvent::BridgeTaskJoined
+				},
+				frame = read_frame(&mut self.stdout) => ParentLoopEvent::Frame(frame),
+			};
+			let frame = match event {
+				ParentLoopEvent::Cancel => {
+					caller_cancelled = true;
 					timeout.dispose();
+					let _ = write_frame(&mut self.stdin, &ParentFrame::Cancel { run_id }).await;
+					bridge_tasks.abort_all();
 					self.interrupt();
-					time::sleep(self.interrupt_grace).await;
-					let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
-						elapsed_ms(started),
-					))));
+					task::yield_now().await;
+					for request_id in &pending_bridge {
+						let _ = write_frame(&mut self.stdin, &ParentFrame::BridgeResponse {
+							request_id: *request_id,
+							value:      None,
+							error:      Some(sf!("eval cell cancelled")),
+						})
+						.await;
+					}
+					pending_bridge.clear();
+					interrupt_deadline = Some(time::Instant::now() + self.interrupt_grace);
+					continue;
+				},
+				ParentLoopEvent::InterruptGraceExpired => {
+					needs_reset.store(true, Ordering::Release);
+					cancel_bridge_tasks(&mut bridge_tasks).await;
+					let _ =
+						events.send(Ok(RunEvent::Completed(cancelled_completion(elapsed_ms(started)))));
 					return RunCellDisposition::Drop;
 				},
-				() = timeout.expired() => {
+				ParentLoopEvent::Timeout => {
 					needs_reset.store(true, Ordering::Release);
 					self.interrupt();
+					cancel_bridge_tasks(&mut bridge_tasks).await;
 					time::sleep(self.interrupt_grace).await;
-					let _ = events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
+					let _ =
+						events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
 					return RunCellDisposition::Drop;
 				},
-				frame = read_frame(&mut self.stdout) => frame,
+				ParentLoopEvent::Bridge(Some(BridgeTaskEvent::Progress { request_id, event })) => {
+					if serde_json::to_vec(&event)
+						.is_ok_and(|encoded| encoded.len() <= MAX_BRIDGE_PROGRESS_BYTES)
+						&& write_frame(&mut self.stdin, &ParentFrame::BridgeProgress {
+							run_id,
+							request_id,
+							event,
+						})
+						.await
+						.is_err()
+					{
+						needs_reset.store(true, Ordering::Release);
+						cancel_bridge_tasks(&mut bridge_tasks).await;
+						return RunCellDisposition::Drop;
+					}
+					continue;
+				},
+				ParentLoopEvent::Bridge(Some(BridgeTaskEvent::Response {
+					request_id,
+					value,
+					error,
+				})) => {
+					pending_bridge.remove(&request_id);
+					if write_frame(&mut self.stdin, &ParentFrame::BridgeResponse {
+						request_id,
+						value,
+						error,
+					})
+					.await
+					.is_err()
+					{
+						needs_reset.store(true, Ordering::Release);
+						cancel_bridge_tasks(&mut bridge_tasks).await;
+						let _ = events.send(Err(Fault::SessionLost {
+							message: sf!("Python eval child exited during a host bridge response",),
+						}));
+						return RunCellDisposition::Drop;
+					}
+					continue;
+				},
+				ParentLoopEvent::Bridge(None) | ParentLoopEvent::BridgeTaskJoined => continue,
+				ParentLoopEvent::Frame(frame) => frame,
 			};
 			let frame = match frame {
 				Ok(Some(frame)) => frame,
@@ -740,6 +921,7 @@ impl EvalChild {
 					total_bytes,
 				} if actual == run_id => {
 					timeout.dispose();
+					cancel_bridge_tasks(&mut bridge_tasks).await;
 					status.exception = exception;
 					let spill_total_lines = spill.total_lines;
 					let spill_total_bytes = spill.total_bytes;
@@ -782,90 +964,49 @@ impl EvalChild {
 				ChildFrame::BridgeCall { run_id: actual, request_id, token, name, args }
 					if actual == run_id && token == self.token =>
 				{
-					match host.capabilities() {
-						Ok(value) if value.allows(name.as_str()) => {},
-						Ok(_) => {
-							if write_frame(&mut self.stdin, &ParentFrame::BridgeResponse {
-								request_id,
-								value: None,
-								error: Some(Str::from(format!("bridge capability denied: {name}"))),
-							})
-							.await
-							.is_err()
-							{
-								needs_reset.store(true, Ordering::Release);
-								return RunCellDisposition::Drop;
-							}
-							continue;
-						},
-						Err(error) => {
-							if write_frame(&mut self.stdin, &ParentFrame::BridgeResponse {
-								request_id,
-								value: None,
-								error: Some(Str::from(error.to_string())),
-							})
-							.await
-							.is_err()
-							{
-								needs_reset.store(true, Ordering::Release);
-								return RunCellDisposition::Drop;
-							}
-							continue;
-						},
-					}
-					let (progress_tx, progress_rx) = flume::unbounded();
-					let progress = ProgressChannel(progress_tx);
-					let call =
-						timeout.host_wait(host.call_for(owner, session, name.as_str(), args, &progress));
-					tokio::pin!(call);
-					let response = loop {
-						tokio::select! {
-							biased;
-							() = cancelled.cancelled() => {
-								needs_reset.store(true, Ordering::Release);
-								timeout.dispose();
-								self.interrupt();
-								let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
-									elapsed_ms(started),
-								))));
-								return RunCellDisposition::Drop;
-							},
-							event = progress_rx.recv_async() => {
-								let Ok(event) = event else {
-									continue;
-								};
-								if serde_json::to_vec(&event).is_ok_and(|encoded| {
-									encoded.len() <= MAX_BRIDGE_PROGRESS_BYTES
-								}) && write_frame(&mut self.stdin, &ParentFrame::BridgeProgress {
-									run_id,
-									request_id,
-									event,
-								}).await.is_err() {
-									needs_reset.store(true, Ordering::Release);
-									return RunCellDisposition::Drop;
-								}
-							},
-							result = &mut call => break result,
+					let capability_error = match host.capabilities() {
+						Ok(value) if value.allows(name.as_str()) => None,
+						Ok(_) => Some(Str::from(format!("bridge capability denied: {name}"))),
+						Err(error) => Some(Str::from(error.to_string())),
+					};
+					if let Some(error) = capability_error {
+						if write_frame(&mut self.stdin, &ParentFrame::BridgeResponse {
+							request_id,
+							value: None,
+							error: Some(error),
+						})
+						.await
+						.is_err()
+						{
+							needs_reset.store(true, Ordering::Release);
+							cancel_bridge_tasks(&mut bridge_tasks).await;
+							return RunCellDisposition::Drop;
 						}
-					};
-					let (value, error) = match response {
-						Ok(value) => (Some(value), None),
-						Err(error) => (None, Some(Str::from(error.to_string()))),
-					};
-					if write_frame(&mut self.stdin, &ParentFrame::BridgeResponse {
-						request_id,
-						value,
-						error,
-					})
-					.await
-					.is_err()
-					{
-						needs_reset.store(true, Ordering::Release);
-						let _ = events.send(Err(Fault::SessionLost {
-							message: sf!("Python eval child exited during a host bridge response",),
-						}));
-						return RunCellDisposition::Drop;
+						continue;
 					}
+					pending_bridge.insert(request_id);
+					let task_host = Arc::clone(&host);
+					let task_timeout = timeout.clone();
+					let task_owner = Str::new(owner);
+					let task_session = session.clone();
+					let task_events = bridge_events_tx.clone();
+					bridge_tasks.spawn(async move {
+						let progress = ProgressChannel { request_id, events: task_events.clone() };
+						let response = task_timeout
+							.host_wait(task_host.call_for(
+								task_owner.as_str(),
+								&task_session,
+								name.as_str(),
+								args,
+								&progress,
+							))
+							.await;
+						let (value, error) = match response {
+							Ok(value) => (Some(value), None),
+							Err(error) => (None, Some(Str::from(error.to_string()))),
+						};
+						let _ = task_events.send(BridgeTaskEvent::Response { request_id, value, error });
+					});
 				},
 				ChildFrame::Fatal { message } => {
 					needs_reset.store(true, Ordering::Release);
@@ -950,6 +1091,11 @@ impl Drop for EvalChild {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct ExternalHello {
+	secret: Str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ParentFrame {
 	Init {
@@ -958,6 +1104,7 @@ enum ParentFrame {
 		parent_pid:      u32,
 		capabilities:    Vec<Str>,
 		prelude:         Vec<PreludeStubWire>,
+		python_prelude:  Str,
 		interrupt_grace: Str,
 	},
 	Run {
@@ -967,6 +1114,9 @@ enum ParentFrame {
 		timeout_ns: Option<u64>,
 		reset:      bool,
 		runtime:    RuntimeSnapshot,
+	},
+	Cancel {
+		run_id: u64,
 	},
 	BridgeProgress {
 		run_id:     u64,
@@ -1035,12 +1185,13 @@ enum ChildBridgeEvent {
 }
 
 struct ChildBridgeHost {
-	token:        Str,
-	capabilities: BridgeCapabilities,
-	outgoing:     flume::Sender<ChildFrame>,
-	pending:      Mutex<BTreeMap<u64, flume::Sender<ChildBridgeEvent>>>,
-	next_request: AtomicU64,
-	active_run:   AtomicU64,
+	token:         Str,
+	capabilities:  BridgeCapabilities,
+	outgoing:      flume::Sender<ChildFrame>,
+	pending:       Mutex<BTreeMap<u64, flume::Sender<ChildBridgeEvent>>>,
+	next_request:  AtomicU64,
+	active_run:    AtomicU64,
+	cancelled_run: AtomicU64,
 }
 
 impl ChildBridgeHost {
@@ -1075,6 +1226,9 @@ impl ChildBridgeTransport for ChildBridgeHost {
 		}
 		let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
 		let run_id = self.active_run.load(Ordering::Acquire);
+		if run_id != 0 && self.cancelled_run.load(Ordering::Acquire) == run_id {
+			return Err(BridgeHostError::message("eval cell cancelled"));
+		}
 		let (sender, receiver) = flume::unbounded();
 		self.pending.lock().insert(request_id, sender);
 		if self
@@ -1105,8 +1259,6 @@ impl ChildBridgeTransport for ChildBridgeHost {
 	}
 }
 
-type ProtocolInput = Box<dyn AsyncRead + Unpin + Send>;
-type ProtocolOutput = Box<dyn AsyncWrite + Unpin + Send>;
 #[cfg(unix)]
 type ProtocolCapture = Option<(fs::File, fs::File)>;
 #[cfg(not(unix))]
@@ -1390,6 +1542,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 				parent_pid,
 				capabilities,
 				prelude,
+				python_prelude: _,
 				interrupt_grace,
 			}) => (token, parent_pid, capabilities, prelude, interrupt_grace.parse::<OmpDuration>()?),
 			Some(_) => {
@@ -1407,6 +1560,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 		pending: Mutex::new(BTreeMap::new()),
 		next_request: AtomicU64::new(1),
 		active_run: AtomicU64::new(0),
+		cancelled_run: AtomicU64::new(0),
 	});
 	let capture_barrier = Arc::new(start_fd_capture(capture, &child_host)?);
 	let writer = tokio::spawn(async move {
@@ -1442,6 +1596,7 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 					continue;
 				}
 				child_host.active_run.store(run_id, Ordering::Release);
+				child_host.cancelled_run.store(0, Ordering::Release);
 				let runtime = validate_runtime_snapshot(runtime)?;
 				let mut run = match eval
 					.run(&session, RunRequest {
@@ -1531,6 +1686,14 @@ pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 						}
 					}
 				});
+			},
+			Some(ParentFrame::Cancel { run_id })
+				if run_id == child_host.active_run.load(Ordering::Acquire) =>
+			{
+				child_host.cancelled_run.store(run_id, Ordering::Release);
+			},
+			Some(ParentFrame::Cancel { .. }) => {
+				return Err(ProcessError::Protocol(sf!("stale eval cell cancellation frame")));
 			},
 			Some(ParentFrame::BridgeProgress { run_id, request_id, event })
 				if run_id == child_host.active_run.load(Ordering::Acquire) =>
@@ -1635,6 +1798,18 @@ fn sanitized_spawn_env() -> Vec<(OsString, OsString)> {
 		.filter(|(name, _)| spawn_env_allowed(name))
 		.collect()
 }
+fn stage_external_runner() -> io::Result<PathBuf> {
+	let path = env::temp_dir().join(format!("omp-eval-runner-{}.py", Ulid::generate()));
+	let mut file = fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&path)?;
+	if let Err(error) = file.write_all(EXTERNAL_RUNNER_SOURCE.as_bytes()) {
+		let _ = fs::remove_file(&path);
+		return Err(error);
+	}
+	Ok(path)
+}
 
 fn spawn_env_allowed(name: &OsStr) -> bool {
 	let upper = name.to_string_lossy().to_ascii_uppercase();
@@ -1663,11 +1838,25 @@ fn spawn_env_allowed(name: &OsStr) -> bool {
 			|| upper.starts_with("OMP_PY_"))
 }
 
-/// Discovers the Python interpreter identity for a supervised kernel.
+fn resolve_configured_python(command: &OsStr) -> Option<PathBuf> {
+	let candidate = expand_home(PathBuf::from(command));
+	if candidate.is_file() {
+		return Some(candidate);
+	}
+	if candidate.components().count() != 1 {
+		return None;
+	}
+	env::var_os("PATH").and_then(|path| {
+		env::split_paths(&path)
+			.map(|directory| directory.join(command))
+			.find(|candidate| candidate.is_file())
+	})
+}
+
+/// Discovers an external Python executable for a runtime working directory.
 ///
-/// Selection follows the explicit override, active virtual environment,
-/// project virtual environments, Conda, uv, pyenv, then `PATH`. Production
-/// falls back to the embedded `CPython` identity when this returns `None`.
+/// Explicit configuration wins, followed by active environments, project
+/// virtual environments, pyenv, and finally `PATH`.
 pub fn discover_external_python(cwd: &Path, explicit: Option<&OsStr>) -> Option<PathBuf> {
 	let executable = if cfg!(windows) {
 		"python.exe"
@@ -1676,7 +1865,9 @@ pub fn discover_external_python(cwd: &Path, explicit: Option<&OsStr>) -> Option<
 	};
 	let mut candidates = Vec::new();
 	if let Some(explicit) = explicit {
-		candidates.push(expand_home(PathBuf::from(explicit)));
+		if let Some(candidate) = resolve_configured_python(explicit) {
+			return Some(candidate);
+		}
 	}
 	for name in ["VIRTUAL_ENV", "CONDA_PREFIX", "UV_PROJECT_ENVIRONMENT"] {
 		if let Some(root) = env::var_os(name) {
@@ -1935,6 +2126,205 @@ mod tests {
 		assert!(!spawn_env_allowed(OsStr::new("AWS_SECRET_ACCESS_KEY")));
 		assert!(!spawn_env_allowed(OsStr::new("OMP_EVAL_TOKEN")));
 		assert!(!spawn_env_allowed(OsStr::new("RANDOM_AMBIENT_VALUE")));
+	}
+	#[test]
+	fn project_virtualenv_interpreter_wins_over_path_fallback() {
+		let scratch = tempfile::tempdir().expect("interpreter scratch");
+		let interpreter = interpreter_below(
+			&scratch.path().join(".venv"),
+			if cfg!(windows) {
+				"python.exe"
+			} else {
+				"python"
+			},
+		);
+		fs::create_dir_all(interpreter.parent().expect("interpreter parent"))
+			.expect("create virtualenv layout");
+		fs::write(&interpreter, b"python").expect("create interpreter marker");
+		assert_eq!(discover_external_python(scratch.path(), None), Some(interpreter));
+	}
+
+	#[tokio::test]
+	async fn selected_interpreter_executes_the_external_protocol_runner() {
+		use omp_tool::Registry;
+
+		let cwd = env::current_dir().expect("current directory");
+		let interpreter = discover_external_python(&cwd, None).expect("test host provides Python");
+		let host = Arc::new(SessionBridgeHost::new());
+		host
+			.bind_registry(Arc::new(Registry::new()))
+			.expect("bind empty bridge registry");
+		let session = Bytes::from_static(b"external-runner");
+		let mut child = EvalChild::spawn(
+			Path::new("unused-for-external-python"),
+			&interpreter,
+			&session,
+			&cwd,
+			Arc::clone(&host),
+			"1s".parse().expect("interrupt grace"),
+		)
+		.await
+		.expect("launch selected interpreter");
+		let (events, received) = flume::unbounded();
+		let reset = AtomicBool::new(false);
+		let disposition = child
+			.run_cell(
+				Bytes::from_static(b"external-runner:cell-1"),
+				RunRequest {
+					code:    sf!("import sys\nsys.executable"),
+					timeout: None,
+					reset:   false,
+					runtime: runtime_snapshot(cwd),
+				},
+				CancellationToken::new(),
+				&events,
+				"owner",
+				&session,
+				host,
+				&reset,
+				None,
+				true,
+			)
+			.await;
+		assert!(matches!(disposition, RunCellDisposition::Keep));
+		let completion = received
+			.try_iter()
+			.find_map(|event| match event.expect("successful run event") {
+				RunEvent::Completed(completion) => Some(completion),
+				_ => None,
+			})
+			.expect("terminal completion");
+		let actual = completion
+			.result
+			.and_then(|value| value.json)
+			.and_then(|value| value.as_str().map(PathBuf::from))
+			.expect("sys.executable result");
+		assert_eq!(
+			actual
+				.canonicalize()
+				.expect("canonical executed interpreter"),
+			interpreter
+				.canonicalize()
+				.expect("canonical selected interpreter"),
+		);
+		child.terminate().await;
+	}
+	struct OverlapParent {
+		cwd:       PathBuf,
+		barrier:   tokio::sync::Barrier,
+		in_flight: AtomicU64,
+		maximum:   AtomicU64,
+	}
+
+	#[async_trait]
+	impl crate::eval::bridge::ParentSessionHost for OverlapParent {
+		fn eval_session_config(
+			&self,
+		) -> Result<crate::eval::bridge::EvalSessionConfig, BridgeHostError> {
+			Ok(crate::eval::bridge::EvalSessionConfig {
+				cwd:              self.cwd.clone(),
+				local_roots_json: None,
+				artifacts_dir:    None,
+				session_file:     None,
+			})
+		}
+
+		async fn completion(
+			&self,
+			_args: Value,
+			_progress: &dyn BridgeProgressSink,
+		) -> Result<Value, BridgeHostError> {
+			Err(BridgeHostError::message("completion is not used by this test"))
+		}
+
+		async fn agent(
+			&self,
+			_args: Value,
+			_progress: &dyn BridgeProgressSink,
+		) -> Result<Value, BridgeHostError> {
+			let active = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+			self.maximum.fetch_max(active, Ordering::AcqRel);
+			self.barrier.wait().await;
+			self.in_flight.fetch_sub(1, Ordering::AcqRel);
+			Ok(serde_json::json!({"text":"done"}))
+		}
+
+		async fn concurrency(&self, _args: Value) -> Result<Value, BridgeHostError> {
+			Ok(serde_json::json!({"limit":2}))
+		}
+
+		async fn budget(&self, _args: Value) -> Result<Value, BridgeHostError> {
+			Err(BridgeHostError::message("budget is not used by this test"))
+		}
+	}
+
+	#[tokio::test]
+	async fn process_bridge_dispatches_calls_concurrently_and_serializes_responses() {
+		use omp_tool::Registry;
+
+		let cwd = env::current_dir().expect("current directory");
+		let interpreter = discover_external_python(&cwd, None).expect("test host provides Python");
+		let host = Arc::new(SessionBridgeHost::new());
+		host
+			.bind_registry(Arc::new(Registry::new()))
+			.expect("bind empty bridge registry");
+		let parent = Arc::new(OverlapParent {
+			cwd:       cwd.clone(),
+			barrier:   tokio::sync::Barrier::new(2),
+			in_flight: AtomicU64::new(0),
+			maximum:   AtomicU64::new(0),
+		});
+		let _binding = host
+			.bind_sdk_parent(sf!("session"), parent.clone())
+			.expect("bind parent");
+		let owner = r#"["session","agent"]"#;
+		let session = Bytes::from_static(b"parallel-external-runner");
+		host
+			.freeze_runtime(owner, &session)
+			.expect("freeze runtime");
+		let mut child = EvalChild::spawn(
+			Path::new("unused-for-external-python"),
+			&interpreter,
+			&session,
+			&cwd,
+			Arc::clone(&host),
+			"1s".parse().expect("interrupt grace"),
+		)
+		.await
+		.expect("launch selected interpreter");
+		let (events, received) = flume::unbounded();
+		let reset = AtomicBool::new(false);
+		let disposition = child
+			.run_cell(
+				Bytes::from_static(b"parallel-external-runner:cell-1"),
+				RunRequest {
+					code:    sf!("parallel([lambda: agent('first'), lambda: agent('second')])"),
+					timeout: Some(Duration::from_secs(3)),
+					reset:   false,
+					runtime: runtime_snapshot(cwd),
+				},
+				CancellationToken::new(),
+				&events,
+				owner,
+				&session,
+				host,
+				&reset,
+				None,
+				true,
+			)
+			.await;
+		assert!(matches!(disposition, RunCellDisposition::Keep));
+		assert_eq!(parent.maximum.load(Ordering::Acquire), 2);
+		assert!(received.try_iter().any(|event| {
+			matches!(
+				event,
+				Ok(RunEvent::Completed(RunCompletion {
+					status: CellStatus { outcome: CellOutcome::Complete, .. },
+					..
+				}))
+			)
+		}));
+		child.terminate().await;
 	}
 
 	fn runtime_snapshot(cwd: PathBuf) -> RuntimeSnapshot {

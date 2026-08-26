@@ -36,18 +36,20 @@ use omp_proto::{
 	toolhost::{
 		v1,
 		v1::{
-			ActivateExtension, ActivateReason as WireActivateReason, AdmitExtensions,
-			AdmittedExtension, ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CancelTool,
-			ExtensionActivated, ExtensionDecl, FreezeDeclarations, HostFrame, InvokeTool,
-			JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping, Pong, PreludeParam,
-			PreludeParamKind, PrincipalRef, ProtocolError, ProtocolErrorCode, PullReply, PullRequest,
-			QuotaDrop, QuotaStatus, RegimeApply, RegimeControl, RegimeControlKind, RegimeDraft,
-			RegimeEffect, RegimeEffectKind, RegimeHostEnvelope, RegimeStart, RegimeStop,
-			RegimeWorkerEnvelope, RegisterTools, ResourceUpdate, RestartReason as WireRestartReason,
+			ActivateExtension, ActivateReason as WireActivateReason,
+			ActivationCliValue as WireActivationCliValue, AdmitExtensions, AdmittedExtension,
+			ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CancelTool, ExtensionActivated,
+			ExtensionDecl, FreezeDeclarations, HostFrame, InvokeTool, JournalHostEnvelope,
+			LifecycleHostEnvelope, OutcomeKind, Ping, Pong, PreludeParam, PreludeParamKind,
+			PrincipalRef, ProtocolError, ProtocolErrorCode, PullReply, PullRequest, QuotaDrop,
+			QuotaStatus, RegimeApply, RegimeControl, RegimeControlKind, RegimeDraft, RegimeEffect,
+			RegimeEffectKind, RegimeHostEnvelope, RegimeStart, RegimeStop, RegimeWorkerEnvelope,
+			RegisterTools, ResourceUpdate, RestartReason as WireRestartReason,
 			ServiceDispatch as WireServiceDispatch, ServiceReply, ServiceResult, ToolAborted,
 			ToolArgs, ToolComplete, ToolDecl, ToolUpdate, WorkerFrame, WorkerHello,
-			argument_host_envelope, argument_worker_envelope, host_frame, lifecycle_host_envelope,
-			lifecycle_worker_envelope, regime_host_envelope, regime_worker_envelope, worker_frame,
+			activation_cli_value, argument_host_envelope, argument_worker_envelope, host_frame,
+			lifecycle_host_envelope, lifecycle_worker_envelope, regime_host_envelope,
+			regime_worker_envelope, worker_frame,
 		},
 	},
 };
@@ -70,6 +72,7 @@ use tokio::{
 	time,
 	time::{Instant, MissedTickBehavior},
 };
+use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console;
 
@@ -83,8 +86,9 @@ use crate::{
 		ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta, ServiceResponse, SpawnSpec,
 		SpawnedHost, ToolDeclarationKey,
 		control::{
-			ControlAuthoritySnapshot, ControlConnectionIdentity, ControlDispatch, ControlEffect,
-			ControlHandle, ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
+			ActivationCliValue, ContributedValueDelivery, ControlAuthoritySnapshot,
+			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlHandle,
+			ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
 			ExternalJournalRequest, JournalConnectionIdentity, JournalControl, JournalDispatch,
 			journal_rows,
 		},
@@ -176,19 +180,23 @@ impl HostKey {
 #[derive(Clone, Debug)]
 pub struct ExtHostSpec {
 	/// Stable extension identity.
-	pub key:         HostKey,
+	pub key:               HostKey,
 	/// Authoritative deployment manifest; never inferred from child frames.
-	pub manifest:    ExtensionManifest,
+	pub manifest:          ExtensionManifest,
 	/// Explicit opt-in fate-sharing pool. Absence isolates this extension.
-	pub pool:        Option<Str>,
+	pub pool:              Option<Str>,
 	/// Manifest-derived DATA capabilities for this extension.
-	pub data_grants: Grants,
+	pub data_grants:       Grants,
 	/// Optional site-packages directory passed through as `OMP_PY_SITE`.
-	pub python_site: Option<PathBuf>,
+	pub python_site:       Option<PathBuf>,
 	/// Exact entry file preloaded under the manifest module name.
-	pub entry_path:  Option<PathBuf>,
+	pub entry_path:        Option<PathBuf>,
 	/// Scoped DATA socket passed only to this extension host.
-	pub data_socket: Option<PathBuf>,
+	pub data_socket:       Option<PathBuf>,
+	/// Explicit trusted host executable, or the environment executable.
+	pub host_executable:   Option<PathBuf>,
+	/// Authenticated static CLI declarations owned by this extension.
+	pub cli_contributions: omp_ext::config::CliContributionSet,
 }
 
 impl ExtHostSpec {
@@ -203,6 +211,8 @@ impl ExtHostSpec {
 			python_site: None,
 			entry_path: None,
 			data_socket: None,
+			host_executable: None,
+			cli_contributions: omp_ext::config::CliContributionSet::default(),
 		}
 	}
 }
@@ -445,6 +455,8 @@ pub struct ExtHostConfig {
 	workspace_root:         Option<PathBuf>,
 	/// Active extensions. An empty set starts no Python process.
 	pub extensions:         Vec<ExtHostSpec>,
+	/// Typed launch values validated against the active extension manifests.
+	pub contributed_values: Vec<omp_ext::config::ContributedCliValue>,
 	/// Expected workspace protobuf schema revision.
 	pub schema_rev:         u32,
 	/// Expected embedded Python ABI revision.
@@ -499,6 +511,7 @@ impl ExtHostConfig {
 			session_started_at: SystemTime::now(),
 			workspace_root: None,
 			extensions: Vec::new(),
+			contributed_values: Vec::new(),
 			schema_rev: omp_proto::SCHEMA_REV,
 			python_rev: sf!(PYTHON_REV),
 			max_frame_bytes: NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES)
@@ -1228,6 +1241,7 @@ fn missing_external_control_domains(
 	missing
 }
 
+#[derive(Clone)]
 struct PendingControlActivation {
 	control:            ControlHandle,
 	identity:           Arc<ControlConnectionIdentity>,
@@ -1414,7 +1428,6 @@ pub struct ExtHostSupervisor {
 	domain_control:       Arc<DomainControlSlot>,
 	service_router:       Arc<ServiceRouter>,
 	agents_control:       Arc<AgentsControlSlot>,
-	_control_hosts:       Vec<RunningHost>,
 	control_activations:  Vec<PendingControlActivation>,
 }
 impl ExtHostSupervisor {
@@ -1437,16 +1450,31 @@ impl ExtHostSupervisor {
 			was_bound:          AtomicBool::new(false),
 			binding:            Mutex::new(None),
 		});
-		let mut control_hosts = Vec::new();
 		let mut control_activations = Vec::new();
 		let mut control_routes = BTreeMap::new();
 		let mut control_actors = Vec::new();
+		let frozen_registry = Arc::new(Mutex::new(BTreeMap::new()));
 		for extension in &config.extensions {
 			let (Some(python_site), Some(env_socket)) =
 				(&extension.python_site, &extension.data_socket)
 			else {
 				continue;
 			};
+			let static_declarations = extension.manifest.static_declarations();
+			let control_declared =
+				static_declarations.ordered.iter().any(|declaration| {
+					!matches!(declaration.kind.as_str(), "soft" | "hard" | "prelude")
+				}) || !static_declarations.capability_grants.is_empty()
+					|| extension.manifest.declarations.hooks().next().is_some()
+					|| extension.manifest.services.provides().next().is_some()
+					|| extension.manifest.services.requires().next().is_some()
+					|| extension
+						.manifest
+						.declarations
+						.permits(EscapeCapability::DirectFilesystem);
+			if !control_declared {
+				continue;
+			}
 			let Some(trigger) = extension
 				.manifest
 				.activation_triggers
@@ -1518,7 +1546,7 @@ impl ExtHostSupervisor {
 						.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 				}
 			}
-			control_activations.push(PendingControlActivation {
+			let activation = PendingControlActivation {
 				control: running.control(),
 				identity: Arc::clone(&identity),
 				manifest: extension.manifest.clone(),
@@ -1528,22 +1556,32 @@ impl ExtHostSupervisor {
 				session_started_at: config.session_started_at,
 				session_generation: config.session_generation,
 				principal: config.principal.clone(),
-			});
+			};
+			control_activations.push(activation.clone());
 			let (commands, mailbox) = flume::unbounded();
 			let host_generation = Arc::new(AtomicU64::new(1));
+			let shutdown = CancellationToken::new();
 			let actor = tokio::spawn(run_control_supervisor(
-				running.control(),
+				running,
 				extension.key.clone(),
 				config.session_id.clone(),
 				config.session_generation,
 				mailbox,
+				Arc::clone(&host_generation),
+				shutdown.clone(),
+				activation,
+				Arc::clone(&frozen_registry),
 			));
 			control_routes.insert(
 				extension.key.clone(),
 				(commands.clone(), Arc::clone(&host_generation), config.session_generation),
 			);
-			control_actors.push(HostActor { commands, actor, reloadable: false });
-			control_hosts.push(running);
+			control_actors.push(HostActor {
+				commands,
+				actor: Mutex::new(Some(actor)),
+				shutdown,
+				reloadable: false,
+			});
 		}
 		let mut service_broker = ServiceBroker::new(config.session_generation);
 		for extension in &config.extensions {
@@ -1676,6 +1714,7 @@ impl ExtHostSupervisor {
 			let host_generation = Arc::new(AtomicU64::new(1));
 			let expected_registrations: Arc<[ToolDecl]> = process.registrations.clone().into();
 			let (commands, mailbox) = flume::unbounded();
+			let shutdown = CancellationToken::new();
 			for owner in process_config.manifests.keys() {
 				service_router
 					.broker
@@ -1707,9 +1746,15 @@ impl ExtHostSupervisor {
 				host_generation.clone(),
 				1,
 				Arc::clone(&service_router),
+				shutdown.clone(),
 			));
 			senders.insert(process_id, (commands.clone(), host_generation, session_generation));
-			actors.push(HostActor { commands, actor, reloadable: true });
+			actors.push(HostActor {
+				commands,
+				actor: Mutex::new(Some(actor)),
+				shutdown,
+				reloadable: true,
+			});
 		}
 		actors.extend(control_actors);
 		let routes = routes
@@ -1741,11 +1786,10 @@ impl ExtHostSupervisor {
 			children_active,
 			control_authorities,
 			registry_control,
-			frozen_registry: Arc::new(Mutex::new(BTreeMap::new())),
+			frozen_registry,
 			domain_control,
 			service_router,
 			agents_control,
-			_control_hosts: control_hosts,
 			control_activations,
 		})
 	}
@@ -1767,31 +1811,21 @@ impl ExtHostSupervisor {
 					missing.join(", ")
 				)));
 			}
-			let mut lifecycle = activation
-				.manifest
-				.lifecycle(activation.session_started_at, activation.session_generation);
-			let mut host = FrozenControlLifecycleHost::new(
+			activate_control_generation(
+				activation,
 				activation.control.clone(),
-				activation.key.extension().clone(),
-				activation.session_id.clone(),
 				1,
-				Arc::clone(&activation.identity),
-				activation.manifest.clone(),
+				ActivationCause::FirstReach,
 				Arc::clone(&self.frozen_registry),
-			);
-			lifecycle
-				.activate_declared(
-					&mut host,
-					&activation.manifest.declarations,
-					GenerationFence { host: 1, session: activation.session_generation },
-					activation.trigger,
-					ActivationCause::FirstReach,
-					&activation.principal,
-				)
-				.await
-				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+			)
+			.await?;
 		}
 		Ok(())
+	}
+
+	/// Returns the active session generation fencing every CONTROL connection.
+	pub fn session_generation(&self) -> u64 {
+		self.agents_control.session_generation
 	}
 
 	/// Atomically installs one chat parent's agents-domain authority.
@@ -2105,12 +2139,16 @@ impl ExtHostSupervisor {
 	}
 
 	/// Stops every active host and waits for its process group to exit.
-	pub async fn shutdown(self) {
+	pub async fn shutdown(&self) {
 		for host in &self.actors {
+			host.shutdown.cancel();
 			let _ = host.commands.send(SupervisorCommand::Shutdown);
 		}
-		for host in self.actors {
-			let _ = host.actor.await;
+		for host in &self.actors {
+			let actor = host.actor.lock().take();
+			if let Some(actor) = actor {
+				let _ = actor.await;
+			}
 		}
 	}
 }
@@ -2191,7 +2229,8 @@ struct HostRoute {
 
 struct HostActor {
 	commands:   flume::Sender<SupervisorCommand>,
-	actor:      JoinHandle<()>,
+	actor:      Mutex<Option<JoinHandle<()>>>,
+	shutdown:   CancellationToken,
 	reloadable: bool,
 }
 
@@ -2404,6 +2443,7 @@ struct ProcessConfig {
 	exact_entry:          Option<(Str, PathBuf)>,
 	modules:              Vec<Str>,
 	manifests:            BTreeMap<HostKey, ExtensionManifest>,
+	cli_values:           BTreeMap<HostKey, Vec<ActivationCliValue>>,
 	data_socket:          Option<PathBuf>,
 	schema_rev:           u32,
 	python_rev:           Str,
@@ -2446,6 +2486,21 @@ impl ProcessConfig {
 				"extensions in an explicit pool must use the same Python site",
 			)));
 		}
+		let executable = extensions
+			.first()
+			.and_then(|extension| extension.host_executable.clone())
+			.unwrap_or_else(|| root.executable.clone());
+		if extensions.iter().any(|extension| {
+			extension
+				.host_executable
+				.as_ref()
+				.unwrap_or(&root.executable)
+				!= &executable
+		}) {
+			return Err(WorkerError::Protocol(sf!(
+				"extensions in an explicit pool must use the same host executable",
+			)));
+		}
 		let data_socket = extensions
 			.first()
 			.and_then(|extension| extension.data_socket.clone());
@@ -2474,8 +2529,19 @@ impl ProcessConfig {
 		let exact_entry = exact_entries.into_iter().next();
 		let mut modules_seen = HashSet::new();
 		let mut manifests = BTreeMap::new();
+		let mut cli_values = BTreeMap::new();
 		let mut modules = Vec::new();
 		for extension in extensions {
+			let mut delivery = ContributedValueDelivery::new(
+				extension.key.extension().clone(),
+				1,
+				&extension.cli_contributions,
+				&root.contributed_values,
+			)
+			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+			let values = delivery
+				.deliver(extension.key.extension(), 1)
+				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 			let key = extension.key;
 			for module in iter::once(extension.manifest.entry.clone())
 				.chain(extension.manifest.declaration_modules.iter().cloned())
@@ -2487,16 +2553,18 @@ impl ProcessConfig {
 				}
 				modules.push(module);
 			}
+			cli_values.insert(key.clone(), values);
 			manifests.insert(key, extension.manifest);
 		}
 		Ok(Self {
 			process_id,
-			executable: root.executable.clone(),
+			executable,
 			workspace_root: root.workspace_root.clone(),
 			python_site,
 			exact_entry,
 			modules,
 			manifests,
+			cli_values,
 			data_socket,
 			schema_rev: root.schema_rev,
 			python_rev: root.python_rev.clone(),
@@ -4123,6 +4191,17 @@ impl WorkerProcess {
 			.manifests
 			.values()
 			.flat_map(|manifest| manifest.static_declarations().ordered.iter())
+			.map(|declaration| {
+				serde_json::json!({
+					"id": declaration.id.as_str(),
+					"kind": declaration.kind.as_str(),
+					"module": declaration.module.as_str(),
+					"key": declaration.key.as_str(),
+					"trigger": declaration.trigger.as_str(),
+					"api": declaration.api,
+					"failure": declaration.failure.as_str(),
+				})
+			})
 			.collect::<Vec<_>>();
 		let extension = (config.manifests.len() == 1).then(|| {
 			config
@@ -4461,6 +4540,26 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 				.as_millis()
 				.try_into()
 				.map_err(|_| sf!("session start does not fit the lifecycle wire"))?;
+			let cli_values = self
+				.config
+				.cli_values
+				.iter()
+				.find(|(owner, _)| owner.extension() == &self.extension_id)
+				.into_iter()
+				.flat_map(|(_, values)| values)
+				.map(|value| WireActivationCliValue {
+					sink:  value.sink.to_string(),
+					value: Some(match &value.value {
+						omp_ext::config::ContributedValue::Boolean(value) => {
+							activation_cli_value::Value::Boolean(*value)
+						},
+						omp_ext::config::ContributedValue::String(value) => {
+							activation_cli_value::Value::String(value.to_string())
+						},
+					}),
+					props: None,
+				})
+				.collect();
 			self
 				.process
 				.write(
@@ -4482,6 +4581,7 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 										.restart_reason
 										.map(wire_restart_reason)
 										.map(Into::into),
+									cli_values,
 									props: None,
 								},
 							)),
@@ -4629,19 +4729,103 @@ const fn wire_restart_reason(reason: RestartReason) -> WireRestartReason {
 	}
 }
 
-async fn run_control_supervisor(
+async fn activate_control_generation(
+	activation: &PendingControlActivation,
 	control: ControlHandle,
+	host_generation: u64,
+	cause: ActivationCause,
+	frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
+) -> Result<(), WorkerError> {
+	let mut identity = (*activation.identity).clone();
+	identity.host_generation = host_generation;
+	let mut lifecycle = activation
+		.manifest
+		.lifecycle(activation.session_started_at, activation.session_generation);
+	let mut host = FrozenControlLifecycleHost::new(
+		control,
+		activation.key.extension().clone(),
+		activation.session_id.clone(),
+		host_generation,
+		Arc::new(identity),
+		activation.manifest.clone(),
+		frozen_registry,
+	);
+	lifecycle
+		.activate_declared(
+			&mut host,
+			&activation.manifest.declarations,
+			GenerationFence { host: host_generation, session: activation.session_generation },
+			activation.trigger,
+			cause,
+			&activation.principal,
+		)
+		.await
+		.map(|_| ())
+		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))
+}
+
+async fn run_control_supervisor(
+	mut running: RunningHost,
 	owner: HostKey,
 	session_id: Str,
 	session_generation: u64,
 	mailbox: Receiver<SupervisorCommand>,
+	host_generation: Arc<AtomicU64>,
+	shutdown: CancellationToken,
+	activation: PendingControlActivation,
+	frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
 ) {
 	use std::time::Instant;
 
 	let mut pending = BTreeMap::<u64, PendingInvocation>::new();
-
 	let in_flight = Arc::new(Mutex::new(BTreeMap::<u64, Str>::new()));
-	while let Ok(command) = mailbox.recv_async().await {
+	let cancelled = Arc::new(Mutex::new(BTreeSet::<u64>::new()));
+	let mut health = time::interval(Duration::from_millis(50));
+	health.set_missed_tick_behavior(MissedTickBehavior::Delay);
+	loop {
+		let command = tokio::select! {
+			() = shutdown.cancelled() => break,
+			command = mailbox.recv_async() => match command {
+				Ok(command) => Some(command),
+				Err(_) => break,
+			},
+			_ = health.tick() => None,
+		};
+		let Some(command) = command else {
+			if !running.is_disabled() && running.has_exited().unwrap_or(true) {
+				loop {
+					let restarted = tokio::select! {
+						() = shutdown.cancelled() => break,
+						result = running.restart() => result,
+					};
+					match restarted {
+						Ok(()) => {
+							if activate_control_generation(
+								&activation,
+								running.control(),
+								running.generation(),
+								ActivationCause::Restart(RestartReason::Crash),
+								Arc::clone(&frozen_registry),
+							)
+							.await
+							.is_err()
+							{
+								continue;
+							}
+							host_generation.store(running.generation(), Ordering::Release);
+							break;
+						},
+						Err(_) => {
+							tokio::select! {
+								() = shutdown.cancelled() => break,
+								() = time::sleep(Duration::from_millis(100)) => {},
+							}
+						},
+					}
+				}
+			}
+			continue;
+		};
 		match command {
 			SupervisorCommand::Open { id, owner: request_owner, call, streams_args, events }
 				if request_owner == owner =>
@@ -4716,35 +4900,47 @@ async fn run_control_supervisor(
 				in_flight
 					.lock()
 					.insert(id, invocation.call.invocation_id.clone());
-				let control = control.clone();
+				let control = running.control();
 				let task_in_flight = Arc::clone(&in_flight);
+				let task_cancelled = Arc::clone(&cancelled);
 				tokio::spawn(async move {
-					match control.dispatch(dispatch).await {
-						Ok(result) => {
-							let text =
-								serde_json::to_string(&result).unwrap_or_else(|_| String::from("null"));
-							let _ = invocation
-								.events
-								.send(WorkerEvent::Complete(WorkerCompletion {
-									call_id:      invocation.call.invocation_id,
-									kind:         WorkerOutcomeKind::Ok,
-									parts:        vec![Part {
-										kind: Some(omp_proto::thread::v1::part::Kind::Text(text)),
-									}],
-									details_json: None,
-									details_blob: None,
-									args_issue:   None,
-									useless:      false,
+					let result = control.dispatch(dispatch).await;
+					let was_cancelled = task_cancelled.lock().remove(&id);
+					if was_cancelled {
+						let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
+							call_id:         invocation.call.invocation_id,
+							kind:            WorkerAbortKind::Cancelled,
+							reason:          sf!("extension invocation cancelled"),
+							effects_unknown: true,
+						}));
+					} else {
+						match result {
+							Ok(result) => {
+								let text =
+									serde_json::to_string(&result).unwrap_or_else(|_| String::from("null"));
+								let _ = invocation
+									.events
+									.send(WorkerEvent::Complete(WorkerCompletion {
+										call_id:      invocation.call.invocation_id,
+										kind:         WorkerOutcomeKind::Ok,
+										parts:        vec![Part {
+											kind: Some(omp_proto::thread::v1::part::Kind::Text(text)),
+										}],
+										details_json: None,
+										details_blob: None,
+										args_issue:   None,
+										useless:      false,
+									}));
+							},
+							Err(error) => {
+								let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
+									call_id:         invocation.call.invocation_id,
+									kind:            WorkerAbortKind::Crashed,
+									reason:          Str::from(error.to_string()),
+									effects_unknown: true,
 								}));
-						},
-						Err(error) => {
-							let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
-								call_id:         invocation.call.invocation_id,
-								kind:            WorkerAbortKind::Crashed,
-								reason:          Str::from(error.to_string()),
-								effects_unknown: true,
-							}));
-						},
+							},
+						}
 					}
 					task_in_flight.lock().remove(&id);
 				});
@@ -4757,11 +4953,13 @@ async fn run_control_supervisor(
 						reason:          sf!("extension invocation cancelled before dispatch"),
 						effects_unknown: false,
 					}));
-				} else if let Some(invocation) = in_flight.lock().remove(&id) {
-					let control = control.clone();
-					tokio::spawn(async move {
-						let _ = control.cancel(invocation.as_str()).await;
-					});
+				} else {
+					let invocation = { in_flight.lock().get(&id).cloned() };
+					if let Some(invocation) = invocation {
+						cancelled.lock().insert(id);
+						let _ = running.cancel_dispatch(invocation.as_str()).await;
+						host_generation.store(running.generation(), Ordering::Release);
+					}
 				}
 			},
 			SupervisorCommand::Interrupt { id, frame } => {
@@ -4787,6 +4985,16 @@ async fn run_control_supervisor(
 			},
 		}
 	}
+	for invocation in pending.into_values() {
+		let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
+			call_id:         invocation.call.invocation_id,
+			kind:            WorkerAbortKind::Cancelled,
+			reason:          sf!("CONTROL supervisor shut down"),
+			effects_unknown: false,
+		}));
+	}
+	cancelled.lock().extend(in_flight.lock().keys().copied());
+	running.shutdown().await;
 	let _ = session_generation;
 }
 
@@ -4798,6 +5006,7 @@ async fn run_supervisor(
 	host_generation: Arc<AtomicU64>,
 	mut generation: u64,
 	service_router: Arc<ServiceRouter>,
+	shutdown: CancellationToken,
 ) {
 	let mut pending = VecDeque::new();
 	let mut ping_nonce = 1_u64;
@@ -4825,9 +5034,25 @@ async fn run_supervisor(
 						backoff = initial_backoff(&config);
 					}
 					process.terminate(config.interrupt_grace).await;
-					process =
-						respawn(&config, &expected_registrations, &mut generation, &mut backoff, reason)
-							.await;
+					let Some(replacement) = respawn(
+						&config,
+						&expected_registrations,
+						&mut generation,
+						&mut backoff,
+						reason,
+						&shutdown,
+						&mailbox,
+					)
+					.await
+					else {
+						abort_queued_invocations(
+							&mut pending,
+							&mailbox,
+							"extension host shutdown while awaiting respawn",
+						);
+						return;
+					};
+					process = replacement;
 					host_generation.store(generation, Ordering::Release);
 					let mut broker = service_router.broker.lock();
 					for owner in config.manifests.keys() {
@@ -4850,6 +5075,15 @@ async fn run_supervisor(
 		}
 
 		tokio::select! {
+			() = shutdown.cancelled() => {
+				process.terminate(config.interrupt_grace).await;
+				abort_queued_invocations(
+					&mut pending,
+					&mailbox,
+					"extension host supervisor shut down",
+				);
+				return;
+			},
 			command = mailbox.recv_async() => match command {
 				Ok(SupervisorCommand::Open { id, owner, call, streams_args, events }) => {
 					pending.push_back(PendingInvocation {
@@ -4903,14 +5137,26 @@ async fn run_supervisor(
 				},
 				Ok(SupervisorCommand::Reload { reply }) => {
 					process.terminate(config.interrupt_grace).await;
-					process = respawn(
+					let Some(replacement) = respawn(
 						&config,
 						&expected_registrations,
 						&mut generation,
 						&mut backoff,
 						RestartReason::HotReload,
+						&shutdown,
+						&mailbox,
 					)
-					.await;
+					.await
+					else {
+						let _ = reply.send(Err(WorkerError::Unavailable));
+						abort_queued_invocations(
+							&mut pending,
+							&mailbox,
+							"extension host shutdown while awaiting reload",
+						);
+						return;
+					};
+					process = replacement;
 					host_generation.store(generation, Ordering::Release);
 					let mut broker = service_router.broker.lock();
 					for owner in config.manifests.keys() {
@@ -4952,14 +5198,25 @@ async fn run_supervisor(
 						backoff = initial_backoff(&config);
 					}
 					process.terminate(config.interrupt_grace).await;
-					process = respawn(
+					let Some(replacement) = respawn(
 						&config,
 						&expected_registrations,
 						&mut generation,
 						&mut backoff,
 						RestartReason::HealthTimeout,
+						&shutdown,
+						&mailbox,
 					)
-					.await;
+					.await
+					else {
+						abort_queued_invocations(
+							&mut pending,
+							&mailbox,
+							"extension host shutdown while awaiting health restart",
+						);
+						return;
+					};
+					process = replacement;
 					host_generation.store(generation, Ordering::Release);
 					healthy_since = Instant::now();
 				}
@@ -5824,20 +6081,72 @@ async fn respawn(
 	generation: &mut u64,
 	backoff: &mut Duration,
 	reason: RestartReason,
-) -> WorkerProcess {
+	shutdown: &CancellationToken,
+	mailbox: &Receiver<SupervisorCommand>,
+) -> Option<WorkerProcess> {
 	let max_delay = config.max_backoff.max(Duration::from_millis(1));
 	loop {
-		time::sleep(*backoff).await;
+		if shutdown.is_cancelled() || mailbox.is_disconnected() {
+			return None;
+		}
+		tokio::select! {
+			() = shutdown.cancelled() => return None,
+			() = time::sleep(*backoff) => {},
+		}
+		if mailbox.is_disconnected() {
+			return None;
+		}
 		*generation = generation.wrapping_add(1).max(1);
-		match WorkerProcess::spawn(config, *generation, ActivationCause::Restart(reason)).await {
+		let spawned = tokio::select! {
+			() = shutdown.cancelled() => return None,
+			result = WorkerProcess::spawn(
+				config,
+				*generation,
+				ActivationCause::Restart(reason),
+			) => result,
+		};
+		match spawned {
 			Ok(process) if process.registrations.as_slice() == expected => {
 				*backoff = backoff.saturating_mul(2).min(max_delay);
-				return process;
+				return Some(process);
 			},
 			Ok(mut process) => process.terminate(config.interrupt_grace).await,
 			Err(_) => {},
 		}
 		*backoff = backoff.saturating_mul(2).min(max_delay);
+	}
+}
+
+fn abort_queued_invocations(
+	pending: &mut VecDeque<PendingInvocation>,
+	mailbox: &Receiver<SupervisorCommand>,
+	reason: &str,
+) {
+	while let Ok(command) = mailbox.try_recv() {
+		match command {
+			SupervisorCommand::Open { id, owner, call, streams_args, events } => {
+				pending.push_back(PendingInvocation {
+					id,
+					owner,
+					call,
+					streams_args,
+					arguments: VecDeque::new(),
+					committed: None,
+					interrupt: None,
+					events,
+				});
+			},
+			SupervisorCommand::ServiceDispatch { reply, .. } => {
+				let _ = reply.send(Err(WorkerError::Unavailable));
+			},
+			SupervisorCommand::Reload { reply } => {
+				let _ = reply.send(Err(WorkerError::Unavailable));
+			},
+			command => stage_pending(pending, command),
+		}
+	}
+	for invocation in pending.drain(..) {
+		send_abort(&invocation, WorkerAbortKind::Crashed, reason);
 	}
 }
 impl TryFrom<ToolComplete> for WorkerCompletion {
@@ -6922,6 +7231,19 @@ fn activate_python_extension(
 			payload.set_item("restart_reason", activate.restart_reason)?;
 			payload.set_item("session_started_at_ms", activate.session_started_at_ms)?;
 			payload.set_item("generation", activate.generation)?;
+			let cli_values = PyDict::new(py);
+			for value in &activate.cli_values {
+				match value.value.as_ref() {
+					Some(activation_cli_value::Value::Boolean(inner)) => {
+						cli_values.set_item(value.sink.as_str(), *inner)?;
+					},
+					Some(activation_cli_value::Value::String(inner)) => {
+						cli_values.set_item(value.sink.as_str(), inner.as_str())?;
+					},
+					None => {},
+				}
+			}
+			payload.set_item("cli_values", cli_values)?;
 			let context = PyDict::new(py);
 			if let Some(principal) = &activate.principal {
 				let identity = PyDict::new(py);

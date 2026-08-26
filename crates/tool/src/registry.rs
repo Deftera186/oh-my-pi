@@ -24,9 +24,10 @@ use omp_inference::{
 use omp_proto::inference::{v1, v1::InvokeInput};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use smallvec::SmallVec;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
@@ -94,6 +95,62 @@ pub enum ToolRoute {
 		/// Named worker target at that site.
 		name: Str,
 	},
+}
+/// Model-visible tool declaration supplied by an attached RPC host.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostToolSpec {
+	/// Direct model-visible tool name.
+	pub name:        Str,
+	/// Model-facing purpose and usage guidance.
+	pub description: Str,
+	/// JSON Schema for the tool argument object.
+	pub parameters:  Value,
+}
+
+/// One correlated invocation delivered to an attached RPC host.
+#[derive(Clone, Debug)]
+pub struct HostToolInvocation {
+	/// Stable invocation correlation identifier.
+	pub invocation_id: Str,
+	/// Provider-authored tool-call identifier.
+	pub tool_call_id:  Str,
+	/// Direct model-visible tool name.
+	pub name:          Str,
+	/// Fully committed argument object.
+	pub arguments:     Map<String, Value>,
+}
+
+/// Terminal value returned by an attached RPC host tool.
+#[derive(Clone, Debug)]
+pub struct HostToolResult {
+	/// JSON result supplied by the host.
+	pub result:   Value,
+	/// Whether the host classified the result as an error.
+	pub is_error: bool,
+}
+
+/// Non-terminal update publisher for one host tool invocation.
+#[derive(Clone)]
+pub struct HostToolUpdateSink {
+	sender: flume::Sender<Value>,
+}
+
+impl HostToolUpdateSink {
+	/// Publishes one partial result while the invocation remains live.
+	pub fn send(&self, value: Value) -> Result<(), Value> {
+		self.sender.send(value).map_err(|error| error.into_inner())
+	}
+}
+
+/// Asynchronous bridge from registry dispatch to an attached RPC host.
+pub trait HostToolExecutor: Send + Sync + 'static {
+	/// Emits a correlated request and resolves its terminal result.
+	fn execute(
+		&self,
+		invocation: HostToolInvocation,
+		updates: HostToolUpdateSink,
+		cancellation: CancellationToken,
+	) -> Pin<Box<dyn Future<Output = Result<HostToolResult, Str>> + Send + 'static>>;
 }
 
 /// Declared priority for resolving competing claims on one tool name.
@@ -1033,6 +1090,34 @@ pub enum RegistryError {
 	/// Tool name is not registered.
 	#[error("unknown tool: {0}")]
 	UnknownTool(Str),
+	/// Host roster revision did not advance monotonically.
+	#[error("stale host tool roster for {claimant}: current {current}, received {received}")]
+	StaleHostRoster {
+		/// Attached host claimant.
+		claimant: Str,
+		/// Installed roster revision.
+		current:  u64,
+		/// Rejected roster revision.
+		received: u64,
+	},
+	/// Dynamic host tool name conflicts with a native or another host roster.
+	#[error("host tool name {name} from {claimant} conflicts with {owner}")]
+	HostToolConflict {
+		/// Contested direct model-visible name.
+		name:     Str,
+		/// Rejected claimant.
+		claimant: Str,
+		/// Existing owner.
+		owner:    Str,
+	},
+	/// Host declaration is not executable as a direct argument-object tool.
+	#[error("invalid host tool {name}: {message}")]
+	InvalidHostToolSpec {
+		/// Rejected model-visible name.
+		name:    Str,
+		/// Exact validation failure.
+		message: Str,
+	},
 	/// Two distinct claimants declared the same precedence for one name.
 	#[error("tool precedence tie for {name}: {first} and {second}")]
 	PrecedenceTie {
@@ -1120,6 +1205,122 @@ trait ErasedTool: Send + Sync {
 	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall>;
 }
 static NATIVE_TOOL_ROUTE: ToolRoute = ToolRoute::Native;
+
+struct HostTool {
+	spec:     ToolSpec,
+	schema:   OpaqueJson,
+	cache:    Arc<ProjectionCache>,
+	cache_id: u32,
+}
+
+impl HostTool {
+	fn project_fresh(
+		&self,
+		verdict: &[u8],
+		recorded_useless: bool,
+	) -> Result<ProjectedVerdict, RegistryError> {
+		let verdict: CallOutcome<Value, Value> = serde_json::from_slice(verdict)
+			.map_err(|_| RegistryError::VerdictShape(self.spec.name.clone()))?;
+		let (value, is_error, useless) = match verdict {
+			CallOutcome::Ok(value) => (value, false, recorded_useless),
+			CallOutcome::Faulted(value) => (value, true, recorded_useless),
+			CallOutcome::ArgsRejected(issue) => {
+				return Ok(ProjectedVerdict {
+					parts:    vec![Part::Text { text: render_arg_issue(&issue) }].into(),
+					is_error: true,
+					useless:  false,
+				});
+			},
+			CallOutcome::Aborted { abort, .. } => {
+				return Ok(ProjectedVerdict {
+					parts:    vec![Part::Text { text: render_abort(&abort) }].into(),
+					is_error: true,
+					useless:  false,
+				});
+			},
+		};
+		let text = serde_json::to_string(&value).map_err(RegistryError::Serialize)?;
+		Ok(ProjectedVerdict {
+			parts: vec![Part::Text { text: Str::new(text) }].into(),
+			is_error,
+			useless,
+		})
+	}
+}
+
+impl ErasedTool for HostTool {
+	fn spec(&self) -> &ToolSpec {
+		&self.spec
+	}
+
+	fn prompt_examples(&self) -> &[ToolPromptExample] {
+		&[]
+	}
+
+	fn prompt_docs(&self) -> Option<&str> {
+		None
+	}
+
+	fn route(&self) -> &ToolRoute {
+		&NATIVE_TOOL_ROUTE
+	}
+
+	fn schema(&self) -> &OpaqueJson {
+		&self.schema
+	}
+
+	fn call<'a>(&'a self, _params: IncomingParams<'a>) -> ErasedStream<'a> {
+		let error = external_error(&self.spec, "uncorrelated host invoke");
+		Box::pin(futures::stream::once(async move { Err(error) }))
+	}
+
+	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>> {
+		self.cache.get(self.cache_id, key)
+	}
+
+	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict) {
+		self.cache.insert(self.cache_id, key, projected);
+	}
+
+	fn warm(&self, requests: &[ProjectionRequest<'_>]) -> ProjectionWarm {
+		let identity = self.spec.identity();
+		let result = requests
+			.iter()
+			.filter(|request| request.key.identity == identity)
+			.filter(|request| self.cache.get(self.cache_id, &request.key).is_none())
+			.try_for_each(|request| {
+				let value = self.project_fresh(request.verdict, request.recorded_useless)?;
+				self.cache.insert(self.cache_id, &request.key, value);
+				Ok(())
+			});
+		ProjectionWarm::ready(result)
+	}
+
+	fn invoke_input(
+		&self,
+		_invocation_id: &str,
+		_json: &[u8],
+	) -> Result<Option<InvokeInput>, RegistryError> {
+		Ok(None)
+	}
+
+	fn lift(&self, _from: &Rev, _call: RecordedCall<'_>) -> Option<LiftedCall> {
+		None
+	}
+}
+
+struct HostToolRoster {
+	revision: u64,
+	executor: Arc<dyn HostToolExecutor>,
+	entries:  BTreeMap<Str, RegistryEntry>,
+}
+
+#[derive(Default)]
+struct HostToolState {
+	rosters: BTreeMap<Str, HostToolRoster>,
+	live:    BTreeMap<Str, Str>,
+	history: BTreeMap<ToolIdentity, Arc<dyn ErasedTool>>,
+}
 
 struct Worker {
 	spec:     ToolSpec,
@@ -1382,12 +1583,147 @@ pub struct Registry {
 	unmounted:        RwLock<BTreeMap<Str, Option<Str>>>,
 	arg_specs:        ArgSpecRegistry,
 	projection_cache: Arc<ProjectionCache>,
+	host_tools:       RwLock<HostToolState>,
 }
 
 impl Registry {
 	/// Creates an empty registry.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Atomically replaces one attached host's complete model-visible tool
+	/// roster.
+	pub fn replace_host_tools(
+		&self,
+		claimant: Str,
+		roster_revision: u64,
+		specs: Vec<HostToolSpec>,
+		executor: Arc<dyn HostToolExecutor>,
+	) -> Result<(), RegistryError> {
+		let mut state = self.host_tools.write();
+		if let Some(current) = state.rosters.get(&claimant).map(|roster| roster.revision)
+			&& roster_revision <= current
+		{
+			return Err(RegistryError::StaleHostRoster {
+				claimant,
+				current,
+				received: roster_revision,
+			});
+		}
+		let mut names = BTreeSet::new();
+		for spec in &specs {
+			if spec.name.trim().is_empty() || !spec.parameters.is_object() {
+				return Err(RegistryError::InvalidHostToolSpec {
+					name:    spec.name.clone(),
+					message: sf!("name must be non-empty and parameters must be a JSON Schema object"),
+				});
+			}
+			let owner = if !names.insert(spec.name.clone()) {
+				Some(claimant.clone())
+			} else if self.live.contains_key(&spec.name) {
+				Some(sf!("native registry"))
+			} else {
+				state
+					.live
+					.get(&spec.name)
+					.filter(|owner| *owner != &claimant)
+					.cloned()
+			};
+			if let Some(owner) = owner {
+				return Err(RegistryError::HostToolConflict {
+					name: spec.name.clone(),
+					claimant: claimant.clone(),
+					owner,
+				});
+			}
+		}
+		let base_cache_id = self.next_projection_cache_id()?;
+		let family = sf!("host/{claimant}/{roster_revision}");
+		let mut entries = BTreeMap::new();
+		for (index, declared) in specs.into_iter().enumerate() {
+			let schema = serde_json::to_vec(&declared.parameters)?;
+			let rev = Rev { family: family.clone(), n: 1 };
+			let value = serde_json::from_slice(&schema).map_err(|source| {
+				RegistryError::InvalidSchema { name: declared.name.clone(), rev: rev.clone(), source }
+			})?;
+			let mut projection_hasher = Hash32::hasher();
+			projection_hasher.update(&schema);
+			projection_hasher.update(declared.description.as_bytes());
+			let projection_code = projection_hasher.finalize().into();
+			let tool_spec = ToolSpec {
+				name: declared.name.clone(),
+				rev,
+				description: declared.description,
+				schema: Bytes::from(schema.clone()),
+				constraint: Constraint::Schema {
+					priority:       100,
+					on_unsupported: crate::Fallback::Unspecified,
+				},
+				effects: Effects::default(),
+				projection_code,
+			};
+			let cache_id = base_cache_id.saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+			entries.insert(declared.name.clone(), RegistryEntry {
+				tool:         Arc::new(HostTool {
+					spec: tool_spec,
+					schema: OpaqueJson::new(value),
+					cache: Arc::clone(&self.projection_cache),
+					cache_id,
+				}),
+				presentation: Presentation::Slot,
+				claims:       Claims {
+					precedence: Precedence::INTEGRATION,
+					claimant:   claimant.clone(),
+					replaces:   None,
+				},
+			});
+		}
+		if let Some(old) = state.rosters.remove(&claimant) {
+			for (name, entry) in old.entries {
+				state.live.remove(&name);
+				state
+					.history
+					.insert(entry.tool.spec().identity(), entry.tool);
+			}
+		}
+		for name in entries.keys() {
+			state.live.insert(name.clone(), claimant.clone());
+		}
+		state.rosters.insert(claimant, HostToolRoster {
+			revision: roster_revision,
+			executor,
+			entries,
+		});
+		Ok(())
+	}
+
+	/// Returns one attached host's installed roster revision.
+	pub fn host_tool_revision(&self, claimant: &str) -> Option<u64> {
+		self
+			.host_tools
+			.read()
+			.rosters
+			.get(claimant)
+			.map(|roster| roster.revision)
+	}
+
+	/// Returns all live host-tool declarations in deterministic name order.
+	pub fn host_tool_specs(&self) -> Vec<HostToolSpec> {
+		let state = self.host_tools.read();
+		state
+			.live
+			.iter()
+			.filter_map(|(name, claimant)| {
+				let entry = state.rosters.get(claimant)?.entries.get(name)?;
+				let spec = entry.tool.spec();
+				Some(HostToolSpec {
+					name:        spec.name.clone(),
+					description: spec.description.clone(),
+					parameters:  serde_json::from_slice(&spec.schema).ok()?,
+				})
+			})
+			.collect()
 	}
 
 	/// Reserves essential built-in names for harness-owned core claims.
@@ -1421,9 +1757,21 @@ impl Registry {
 			if seen.contains(name) || !self.inclusion_allowed(name, requested.is_some(), policy) {
 				return;
 			}
+			let host_visible = {
+				let state = self.host_tools.read();
+				state
+					.live
+					.get(name)
+					.and_then(|claimant| state.rosters.get(claimant))
+					.and_then(|roster| roster.entries.get(name))
+					.is_some_and(|entry| {
+						matches!(entry.presentation, Presentation::Slot | Presentation::Hidden)
+					})
+			};
 			if self.live_entry(name).is_ok_and(|entry| {
 				matches!(entry.presentation, Presentation::Slot | Presentation::Hidden)
-			}) {
+			}) || host_visible
+			{
 				let name = Str::new(name);
 				seen.insert(name.clone());
 				names.push(name);
@@ -1470,6 +1818,16 @@ impl Registry {
 			},
 			None => {
 				for name in self.live.keys() {
+					push(name, &mut names, &mut seen);
+				}
+				let host_names = self
+					.host_tools
+					.read()
+					.live
+					.keys()
+					.cloned()
+					.collect::<Vec<_>>();
+				for name in &host_names {
 					push(name, &mut names, &mut seen);
 				}
 			},
@@ -1648,6 +2006,18 @@ impl Registry {
 		Some((stored_name, claim_revision(claim, claimant)?))
 	}
 
+	/// Returns an owned live identity from either native or replaceable host
+	/// tools.
+	pub fn resolved_identity(&self, name: &str) -> Option<ToolIdentity> {
+		if let Some((name, rev)) = self.live_identity(name) {
+			return Some(ToolIdentity { name: name.clone(), rev: rev.clone() });
+		}
+		let state = self.host_tools.read();
+		let claimant = state.live.get(name)?;
+		let entry = state.rosters.get(claimant)?.entries.get(name)?;
+		Some(entry.tool.spec().identity())
+	}
+
 	/// Borrows callable prompt declarations from the exact winning registry.
 	///
 	/// `selected = None` projects all visible slots. A selected set matches
@@ -1672,6 +2042,25 @@ impl Registry {
 		Ok(&self.live_spec(name)?.effects)
 	}
 
+	/// Returns an owned effect envelope from either native or replaceable host
+	/// tools.
+	pub fn effects_owned(&self, name: &str) -> Result<Effects, RegistryError> {
+		if let Ok(effects) = self.effects(name) {
+			return Ok(effects.clone());
+		}
+		let state = self.host_tools.read();
+		let claimant = state
+			.live
+			.get(name)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		let entry = state
+			.rosters
+			.get(claimant)
+			.and_then(|roster| roster.entries.get(name))
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		Ok(entry.tool.spec().effects.clone())
+	}
+
 	/// Iterates winning identities in deterministic name order.
 	pub fn live_identities(
 		&self,
@@ -1686,12 +2075,38 @@ impl Registry {
 
 	/// Returns the execution route of a winning or claimant-qualified entry.
 	pub fn route(&self, name: &str) -> Result<ToolRoute, RegistryError> {
-		Ok(self.live_entry(name)?.tool.route().clone())
+		if let Ok(entry) = self.live_entry(name) {
+			return Ok(entry.tool.route().clone());
+		}
+		let state = self.host_tools.read();
+		let claimant = state
+			.live
+			.get(name)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		let entry = state
+			.rosters
+			.get(claimant)
+			.and_then(|roster| roster.entries.get(name))
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		Ok(entry.tool.route().clone())
 	}
 
 	/// Returns the presentation of a winning or claimant-qualified entry.
 	pub fn presentation(&self, name: &str) -> Result<Presentation, RegistryError> {
-		Ok(self.live_entry(name)?.presentation)
+		if let Ok(entry) = self.live_entry(name) {
+			return Ok(entry.presentation);
+		}
+		let state = self.host_tools.read();
+		let claimant = state
+			.live
+			.get(name)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		state
+			.rosters
+			.get(claimant)
+			.and_then(|roster| roster.entries.get(name))
+			.map(|entry| entry.presentation)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))
 	}
 
 	/// Resolves a typed device path without admitting it to the model slot
@@ -1797,6 +2212,16 @@ impl Registry {
 				hash_identity(&mut hasher, name, &claim.rev);
 			}
 		}
+		let host_tools = self.host_tools.read();
+		for (name, claimant) in &host_tools.live {
+			if let Some(entry) = host_tools
+				.rosters
+				.get(claimant)
+				.and_then(|roster| roster.entries.get(name))
+			{
+				hash_identity(&mut hasher, name, &entry.tool.spec().rev);
+			}
+		}
 		hasher.finalize()
 	}
 
@@ -1847,6 +2272,17 @@ impl Registry {
 				hash_field(&mut hasher, &entry.tool.spec().projection_code);
 			}
 		}
+		let host_tools = self.host_tools.read();
+		for (name, claimant) in &host_tools.live {
+			if let Some(entry) = host_tools
+				.rosters
+				.get(claimant)
+				.and_then(|roster| roster.entries.get(name))
+			{
+				hash_identity(&mut hasher, name, &entry.tool.spec().rev);
+				hash_field(&mut hasher, &entry.tool.spec().projection_code);
+			}
+		}
 		hasher.finalize()
 	}
 
@@ -1856,12 +2292,46 @@ impl Registry {
 		name: &str,
 		mut params: IncomingParams<'a>,
 	) -> Result<ErasedStream<'a>, RegistryError> {
-		let entry = self.live_entry(name)?;
-		if matches!(entry.tool.route(), ToolRoute::Worker { .. }) {
-			return Err(external_error(entry.tool.spec(), "invoke"));
+		if let Ok(entry) = self.live_entry(name) {
+			if matches!(entry.tool.route(), ToolRoute::Worker { .. }) {
+				return Err(external_error(entry.tool.spec(), "invoke"));
+			}
+			params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
+			return Ok(entry.tool.call(params));
 		}
-		params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
-		Ok(entry.tool.call(params))
+		let correlation = Str::from(omp_core::Ulid::generate().to_string());
+		self.invoke_host(name, correlation.clone(), correlation, params)
+	}
+
+	/// Dispatches one host tool with caller-supplied transport correlation.
+	pub fn invoke_host<'a>(
+		&'a self,
+		name: &str,
+		invocation_id: Str,
+		tool_call_id: Str,
+		params: IncomingParams<'a>,
+	) -> Result<ErasedStream<'a>, RegistryError> {
+		let (executor, tool_name) = {
+			let state = self.host_tools.read();
+			let claimant = state
+				.live
+				.get(name)
+				.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+			let roster = state
+				.rosters
+				.get(claimant)
+				.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+			let entry = roster
+				.entries
+				.get(name)
+				.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+			(Arc::clone(&roster.executor), entry.tool.spec().name.clone())
+		};
+		Ok(host_tool_stream(
+			executor,
+			HostToolInvocation { invocation_id, tool_call_id, name: tool_name, arguments: Map::new() },
+			params,
+		))
 	}
 
 	/// Dispatches one resolved native device while preserving the normal slot
@@ -1929,6 +2399,12 @@ impl Registry {
 				(include(entry) && matches!(entry.tool.route(), ToolRoute::Native)).then_some(entry)
 			})
 			.collect::<Vec<_>>();
+		let host_tools = self.host_tools.read();
+		entries.extend(host_tools.live.iter().filter_map(|(name, claimant)| {
+			let roster = host_tools.rosters.get(claimant)?;
+			let entry = roster.entries.get(name)?;
+			(include(entry) && matches!(entry.tool.route(), ToolRoute::Native)).then_some(entry)
+		}));
 		entries.sort_by(|left, right| {
 			advertisement_priority(right)
 				.cmp(&advertisement_priority(left))
@@ -1988,7 +2464,7 @@ impl Registry {
 		recorded_useless: bool,
 		caps: &PromptCaps,
 	) -> Result<ProjectionRequest<'a>, RegistryError> {
-		self.projection_entry(identity)?;
+		self.projection_tool(identity)?;
 		Ok(ProjectionRequest {
 			key: ProjectionKey::new(identity, verdict, caps, self.projection_hash()),
 			caps: *caps,
@@ -2002,10 +2478,7 @@ impl Registry {
 		&self,
 		key: &ProjectionKey,
 	) -> Result<Option<Arc<ProjectedVerdict>>, RegistryError> {
-		Ok(self
-			.projection_entry(&key.identity)?
-			.tool
-			.project_cached(key))
+		Ok(self.projection_tool(&key.identity)?.project_cached(key))
 	}
 
 	/// Stores a projection returned by a worker batch in the matching cache
@@ -2016,8 +2489,7 @@ impl Registry {
 		projected: ProjectedVerdict,
 	) -> Result<(), RegistryError> {
 		self
-			.projection_entry(&key.identity)?
-			.tool
+			.projection_tool(&key.identity)?
 			.cache_projected(key, projected);
 		Ok(())
 	}
@@ -2031,8 +2503,8 @@ impl Registry {
 			{
 				continue;
 			}
-			let entry = self.projection_entry(&request.key.identity)?;
-			entry.tool.warm(requests).await?;
+			let entry = self.projection_tool(&request.key.identity)?;
+			entry.warm(requests).await?;
 		}
 		Ok(())
 	}
@@ -2051,13 +2523,12 @@ impl Registry {
 		caps: &PromptCaps,
 	) -> Result<Arc<ProjectedVerdict>, RegistryError> {
 		let request = self.projection_request(identity, verdict, recorded_useless, caps)?;
-		let entry = self.projection_entry(identity)?;
-		if let Some(projected) = entry.tool.project_cached(&request.key) {
+		let entry = self.projection_tool(identity)?;
+		if let Some(projected) = entry.project_cached(&request.key) {
 			return Ok(projected);
 		}
-		entry.tool.warm(slice::from_ref(&request)).into_ready()?;
+		entry.warm(slice::from_ref(&request)).into_ready()?;
 		entry
-			.tool
 			.project_cached(&request.key)
 			.ok_or_else(|| RegistryError::ProjectionCacheMiss(identity.clone()))
 	}
@@ -2069,8 +2540,8 @@ impl Registry {
 		invocation_id: &str,
 		json: &[u8],
 	) -> Result<Option<InvokeInput>, RegistryError> {
-		let entry = self.projection_entry(identity)?;
-		entry.tool.invoke_input(invocation_id, json)
+		let entry = self.projection_tool(identity)?;
+		entry.invoke_input(invocation_id, json)
 	}
 
 	/// Composes registered adjacent lift steps toward the live revision.
@@ -2127,12 +2598,32 @@ impl Registry {
 		})
 	}
 
-	fn projection_entry(&self, identity: &ToolIdentity) -> Result<&RegistryEntry, RegistryError> {
-		self
+	fn projection_tool(
+		&self,
+		identity: &ToolIdentity,
+	) -> Result<Arc<dyn ErasedTool>, RegistryError> {
+		if let Some(entry) = self
 			.versions
 			.get(&identity.name)
 			.and_then(|versions| versions.get(&identity.rev))
-			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))
+		{
+			return Ok(Arc::clone(&entry.tool));
+		}
+		let state = self.host_tools.read();
+		if let Some(tool) = state.history.get(identity) {
+			return Ok(Arc::clone(tool));
+		}
+		let claimant = state
+			.live
+			.get(&identity.name)
+			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))?;
+		let entry = state
+			.rosters
+			.get(claimant)
+			.and_then(|roster| roster.entries.get(&identity.name))
+			.filter(|entry| entry.tool.spec().rev == identity.rev)
+			.ok_or_else(|| RegistryError::UnknownTool(identity.name.clone()))?;
+		Ok(Arc::clone(&entry.tool))
 	}
 
 	fn live_entry(&self, path: &str) -> Result<&RegistryEntry, RegistryError> {
@@ -2356,6 +2847,110 @@ fn render_abort(abort: &Abort) -> Str {
 			sf!("aborted: executor ended without a terminal outcome")
 		},
 	}
+}
+
+fn host_tool_stream<'a>(
+	executor: Arc<dyn HostToolExecutor>,
+	mut invocation: HostToolInvocation,
+	mut params: IncomingParams<'a>,
+) -> ErasedStream<'a> {
+	Box::pin(stream! {
+		invocation.arguments = match params.whole::<Map<String, Value>>().await {
+			Ok(arguments) => arguments,
+			Err(crate::ParamError::Args(issue)) => {
+				let verdict = CallOutcome::<Value, Value>::ArgsRejected(*issue);
+				yield serde_json::to_vec(&verdict)
+					.map(|json| ErasedEv::Done(ErasedOutcome::Done {
+						verdict: Bytes::from(json),
+						useless: false,
+					}))
+					.map_err(RegistryError::Serialize);
+				return;
+			},
+			Err(crate::ParamError::Interrupted(interrupt)) => {
+				let verdict = CallOutcome::<Value, Value>::aborted(
+					Abort::Interrupted { reason: interrupt.reason },
+				);
+				yield serde_json::to_vec(&verdict)
+					.map(|json| ErasedEv::Done(ErasedOutcome::Done {
+						verdict: Bytes::from(json),
+						useless: false,
+					}))
+					.map_err(RegistryError::Serialize);
+				return;
+			},
+			Err(crate::ParamError::Protocol(message)) => {
+				let verdict = CallOutcome::<Value, Value>::ArgsRejected(ArgIssue {
+					path: Vec::new(),
+					expected: sf!("one committed host-tool argument object"),
+					kind: ArgIssueKind::Protocol,
+					example: None,
+					found: Some(message),
+				});
+				yield serde_json::to_vec(&verdict)
+					.map(|json| ErasedEv::Done(ErasedOutcome::Done {
+						verdict: Bytes::from(json),
+						useless: false,
+					}))
+					.map_err(RegistryError::Serialize);
+				return;
+			},
+		};
+		let cancellation = CancellationToken::new();
+		let (updates_tx, updates_rx) = flume::unbounded();
+		let execution = executor.execute(
+			invocation,
+			HostToolUpdateSink { sender: updates_tx },
+			cancellation.clone(),
+		);
+		tokio::pin!(execution);
+		let mut updates_open = true;
+		loop {
+			tokio::select! {
+				result = &mut execution => {
+					let (value, is_error) = match result {
+						Ok(result) => (result.result, result.is_error),
+						Err(message) => (Value::String(message.to_string()), true),
+					};
+					let verdict = if is_error {
+						CallOutcome::<Value, Value>::Faulted(value)
+					} else {
+						CallOutcome::<Value, Value>::Ok(value)
+					};
+					yield serde_json::to_vec(&verdict)
+						.map(|json| ErasedEv::Done(ErasedOutcome::Done {
+							verdict: Bytes::from(json),
+							useless: false,
+						}))
+						.map_err(RegistryError::Serialize);
+					return;
+				},
+				interrupt = params.next_interrupt() => {
+					cancellation.cancel();
+					let abort = match interrupt {
+						Ok(interrupt) => Abort::Interrupted { reason: interrupt.reason },
+						Err(_) => Abort::InputDropped,
+					};
+					let verdict = CallOutcome::<Value, Value>::aborted(abort);
+					yield serde_json::to_vec(&verdict)
+						.map(|json| ErasedEv::Done(ErasedOutcome::Done {
+							verdict: Bytes::from(json),
+							useless: false,
+						}))
+						.map_err(RegistryError::Serialize);
+					return;
+				},
+				update = updates_rx.recv_async(), if updates_open => {
+					match update {
+						Ok(update) => yield serde_json::to_vec(&update)
+							.map(|json| ErasedEv::Update(Bytes::from(json)))
+							.map_err(RegistryError::Serialize),
+						Err(_) => updates_open = false,
+					}
+				},
+			}
+		}
+	})
 }
 
 fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, RegistryError> {
@@ -2689,5 +3284,65 @@ mod tests {
 		assert_eq!(lifted.identity, identity(2));
 		assert_eq!(lifted.raw_args, original.raw_args);
 		assert_eq!(lifted.verdict, original.verdict);
+	}
+	struct HostExecutor;
+
+	impl HostToolExecutor for HostExecutor {
+		fn execute(
+			&self,
+			_invocation: HostToolInvocation,
+			_updates: HostToolUpdateSink,
+			_cancellation: CancellationToken,
+		) -> Pin<Box<dyn Future<Output = Result<HostToolResult, Str>> + Send + 'static>> {
+			Box::pin(futures::future::ready(Ok(HostToolResult {
+				result:   serde_json::json!({"ok": true}),
+				is_error: false,
+			})))
+		}
+	}
+
+	#[test]
+	fn host_roster_replacement_is_atomic_revisioned_and_preserves_native_tools() {
+		let mut registry = Registry::new();
+		registry
+			.register(tool(1), Presentation::Slot, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/native"),
+				replaces:   None,
+			})
+			.expect("native tool registers");
+		let executor: Arc<dyn HostToolExecutor> = Arc::new(HostExecutor);
+		registry
+			.replace_host_tools(
+				sf!("rpc/client"),
+				1,
+				vec![HostToolSpec {
+					name:        sf!("alpha"),
+					description: sf!("alpha host tool"),
+					parameters:  serde_json::json!({"type": "object"}),
+				}],
+				Arc::clone(&executor),
+			)
+			.expect("first host roster installs");
+		assert!(registry.resolved_identity("lift").is_some());
+		assert!(registry.resolved_identity("alpha").is_some());
+		registry
+			.replace_host_tools(
+				sf!("rpc/client"),
+				2,
+				vec![HostToolSpec {
+					name:        sf!("beta"),
+					description: sf!("beta host tool"),
+					parameters:  serde_json::json!({"type": "object"}),
+				}],
+				executor,
+			)
+			.expect("replacement host roster installs");
+		assert!(registry.resolved_identity("alpha").is_none());
+		assert!(registry.resolved_identity("beta").is_some());
+		assert!(matches!(
+			registry.replace_host_tools(sf!("rpc/client"), 2, Vec::new(), Arc::new(HostExecutor),),
+			Err(RegistryError::StaleHostRoster { .. })
+		));
 	}
 }

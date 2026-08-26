@@ -194,7 +194,7 @@ pub fn live_renderers(tools: &Registry) -> Result<RenderRegistry, RenderRegistry
 		web_search: identity("web_search"),
 		fetch:      identity("fetch"),
 		glob:       identity("glob"),
-		shell:      identity("shell"),
+		shell:      identity("bash"),
 		hub:        identity("hub"),
 		write:      identity("write"),
 		read:       identity("read"),
@@ -296,7 +296,7 @@ pub(crate) mod test_support {
 			web_search: Some(identity("web_search", 48)),
 			fetch:      Some(identity("fetch", 49)),
 			glob:       Some(identity("glob", 43)),
-			shell:      Some(identity("shell", 44)),
+			shell:      Some(identity("bash", 44)),
 			hub:        Some(identity("hub", 45)),
 			write:      Some(identity("write", 45)),
 			read:       Some(identity("read", 46)),
@@ -399,15 +399,11 @@ mod tests {
 	fn live_renderers_follow_live_tool_specs() {
 		let mut tools = Registry::new();
 		tools
-			.register(
-				crate::think::tool(),
-				Presentation::Slot,
-				Claims {
-					precedence: Precedence::CORE,
-					claimant:   "omp/test".into(),
-					replaces:   None,
-				},
-			)
+			.register(crate::think::tool(), Presentation::Slot, Claims {
+				precedence: Precedence::CORE,
+				claimant:   "omp/test".into(),
+				replaces:   None,
+			})
 			.expect("register think");
 
 		let identity = tools.live_spec("think").expect("think is live").identity();

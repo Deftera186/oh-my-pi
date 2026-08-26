@@ -51,7 +51,8 @@ pub struct Question {
 	/// Allow more than one choice.
 	#[serde(default)]
 	pub multi:       bool,
-	/// Zero-based default choice used only by headless hosts.
+	/// Zero-based recommended choice used as the initial interactive selection
+	/// and as the required headless fallback.
 	#[schemars(default, skip_serializing_if = "Option::is_none")]
 	pub recommended: Option<usize>,
 }
@@ -72,11 +73,17 @@ pub struct OptionItem {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Answer {
 	/// The corresponding question identifier.
-	pub id:        Str,
+	pub id:           Str,
 	/// Choice labels in selection order.
-	pub selected:  Vec<Str>,
+	pub selected:     Vec<Str>,
+	/// Free text entered through the host-provided Other choice.
+	#[serde(rename = "customInput", default, skip_serializing_if = "Option::is_none")]
+	pub custom_input: Option<Str>,
+	/// Optional user note attached to this answer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note:         Option<Str>,
 	/// Whether the headless fallback generated this answer.
-	pub timed_out: bool,
+	pub timed_out:    bool,
 }
 /// Structured ask result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -365,9 +372,11 @@ fn headless_answer(question: &Question) -> Result<Answer, Fault> {
 		.get(index)
 		.ok_or_else(|| invalid("`recommended` must index an option"))?;
 	Ok(Answer {
-		id:        question.id.clone(),
-		selected:  vec![option.label.clone()],
-		timed_out: true,
+		id:           question.id.clone(),
+		selected:     vec![option.label.clone()],
+		custom_input: None,
+		note:         None,
+		timed_out:    true,
 	})
 }
 fn invalid(message: &str) -> Fault {
@@ -436,6 +445,20 @@ mod tests {
 		assert!(answer.timed_out);
 	}
 	#[test]
+	fn answer_serializes_custom_input_with_ui_contract_name() {
+		let answer = Answer {
+			id:           sf!("database"),
+			selected:     Vec::new(),
+			custom_input: Some(sf!("DuckDB")),
+			note:         Some(sf!("embedded analytics")),
+			timed_out:    false,
+		};
+		let value = serde_json::to_value(answer).expect("answer serializes");
+		assert_eq!(value["customInput"], "DuckDB");
+		assert_eq!(value["note"], "embedded analytics");
+		assert!(value.get("custom_input").is_none());
+	}
+	#[test]
 	fn rejects_reserved_labels_and_missing_headless_default() {
 		let mut reserved = question(Some(0));
 		reserved.options[0].label = sf!("Next →");
@@ -454,9 +477,11 @@ mod tests {
 				time::sleep(Duration::from_millis(10)).await;
 				Ok(Presentation {
 					answers:  vec![Answer {
-						id:        questions[0].id.clone(),
-						selected:  vec![questions[0].options[0].label.clone()],
-						timed_out: false,
+						id:           questions[0].id.clone(),
+						selected:     vec![questions[0].options[0].label.clone()],
+						custom_input: None,
+						note:         None,
+						timed_out:    false,
 					}],
 					headless: false,
 				})

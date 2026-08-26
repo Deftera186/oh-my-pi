@@ -970,7 +970,10 @@ pub fn render_tool_inventory_prop(facts: &PromptFacts) -> Result<Str, PromptErro
 	Ok(Str::from(out))
 }
 
-/// Stable BLAKE3 digest of the canonical prompt items.
+/// Stable BLAKE3 digest of canonical prompt semantics.
+///
+/// Plain sources hash their exact item serialization. Banded sources
+/// domain-separate that item digest together with all ordered band hashes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct PromptHash(Hash32);
@@ -1400,11 +1403,8 @@ impl SlotAssembler {
 		let (items, bands) = self
 			.banded_render(workspace)?
 			.expect("slot assembler is banded");
-		let mut hasher = Hash32::hasher();
-		for band in bands {
-			hasher.update(band.as_bytes());
-		}
-		Ok((RenderedPrompt { items: items.into(), hash: PromptHash(hasher.finalize()) }, bands))
+		let hash = hash_items(&items)?;
+		Ok((RenderedPrompt { items: items.into(), hash }, bands))
 	}
 
 	fn assemble(&self, workspace: &Props) -> Result<AssembledSlots, PromptError> {
@@ -1460,10 +1460,16 @@ impl SlotAssembler {
 				},
 			}
 		}
+		let bands = slot_bytes.each_ref().map(|slots| {
+			hash_framed(
+				slots
+					.iter()
+					.enumerate()
+					.filter(|(_, content)| !content.is_empty())
+					.map(|(slot, content)| (slot as u64, content.as_bytes())),
+			)
+		});
 		let band_bytes = slot_bytes.map(|slots| slots.concat());
-		let bands = band_bytes
-			.each_ref()
-			.map(|bytes| hash_band(bytes.as_bytes()));
 		let items = band_bytes
 			.into_iter()
 			.filter(|bytes| !bytes.is_empty())
@@ -1499,6 +1505,32 @@ struct AssembledSlots {
 fn hash_band(bytes: &[u8]) -> BandHash {
 	BandHash(Hash32::sum(bytes).into_bytes())
 }
+fn hash_framed<'a>(contributions: impl IntoIterator<Item = (u64, &'a [u8])>) -> BandHash {
+	let mut hasher = Hash32::hasher();
+	for (tag, bytes) in contributions {
+		hasher.update(&tag.to_le_bytes());
+		hasher.update(&(bytes.len() as u64).to_le_bytes());
+		hasher.update(bytes);
+	}
+	BandHash(hasher.finalize().into_bytes())
+}
+
+fn hash_items(items: &[Item]) -> Result<PromptHash, PromptError> {
+	let mut hasher = Hash32::hasher();
+	serde_json::to_writer(&mut hasher, items)?;
+	Ok(PromptHash(hasher.finalize()))
+}
+fn hash_banded_items(items: &[Item], bands: &[BandHash; 4]) -> Result<PromptHash, PromptError> {
+	let item_hash = hash_items(items)?;
+	let mut hasher = Hash32::hasher();
+	hasher.update(b"omp-agent/prompt/banded/v1");
+	hasher.update(item_hash.as_bytes());
+	for (index, band) in bands.iter().enumerate() {
+		hasher.update(&(index as u64).to_le_bytes());
+		hasher.update(band.as_bytes());
+	}
+	Ok(PromptHash(hasher.finalize()))
+}
 const fn default_slot_class(slot: SlotId) -> SlotClass {
 	match slot {
 		SlotId::Conventions => SlotClass::Frozen,
@@ -1516,12 +1548,12 @@ const fn default_slot_class(slot: SlotId) -> SlotClass {
 		SlotId::Recall | SlotId::Status => SlotClass::Volatile,
 	}
 }
-/// A checked canonical prompt head and its content hash.
+/// A checked canonical prompt head and its semantic hash.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderedPrompt {
 	/// Ordered canonical system items.
 	pub items: Arc<[Item]>,
-	/// BLAKE3 digest of the canonical serialized items.
+	/// BLAKE3 digest of the canonical item and stability-band semantics.
 	pub hash:  PromptHash,
 }
 
@@ -1755,20 +1787,27 @@ impl CanonicalPromptSource {
 			items.push(system_text((*content).to_owned()));
 		}
 
-		let mut stable = system;
-		stable.push_str(&project);
-		stable.push_str(&active);
-		stable.push_str(&safety);
-		let mut epochal = String::new();
-		for content in memory[..2].iter().flatten() {
-			epochal.push_str(content);
-		}
-		let volatile = memory[2].unwrap_or_default();
+		let stable = [
+			Some((0, system.as_bytes())),
+			computer.then_some((1, safety.as_bytes())),
+			Some((2, project.as_bytes())),
+			(!active.is_empty()).then_some((3, active.as_bytes())),
+		]
+		.into_iter()
+		.flatten();
+		let epochal = memory[..2]
+			.iter()
+			.enumerate()
+			.filter_map(|(index, content)| content.map(|content| (index as u64, content.as_bytes())));
+		let volatile = memory[2]
+			.map(|content| [(0, content.as_bytes())].into_iter())
+			.into_iter()
+			.flatten();
 		let bands = [
-			hash_band(frozen.as_bytes()),
-			hash_band(stable.as_bytes()),
-			hash_band(epochal.as_bytes()),
-			hash_band(volatile.as_bytes()),
+			hash_framed([(0, frozen.as_bytes())]),
+			hash_framed(stable),
+			hash_framed(epochal),
+			hash_framed(volatile),
 		];
 		Ok((items, bands))
 	}
@@ -1904,19 +1943,17 @@ pub enum PromptError {
 /// Renders, validates, volatility-checks, and hashes one prompt head.
 ///
 /// Plain sources are invoked twice against identical immutable input. Banded
-/// sources perform the same check at their contribution boundary before their
-/// four semantic hashes are folded into the wire-compatible prompt hash.
+/// sources perform the same check at their contribution boundary. Plain hashes
+/// cover the canonical item serialization; banded hashes additionally cover
+/// the ordered semantic band digests under a separate hash domain.
 pub fn render_prompt(
 	source: &dyn PromptSource,
 	workspace: &Props,
 ) -> Result<RenderedPrompt, PromptError> {
 	if let Some((items, bands)) = source.banded_render(workspace)? {
 		validate_items(&items)?;
-		let mut hasher = Hash32::hasher();
-		for band in bands {
-			hasher.update(band.as_bytes());
-		}
-		return Ok(RenderedPrompt { items: items.into(), hash: PromptHash(hasher.finalize()) });
+		let hash = hash_banded_items(&items, &bands)?;
+		return Ok(RenderedPrompt { items: items.into(), hash });
 	}
 	let first = source.render(workspace)?;
 	validate_items(&first)?;
@@ -1927,9 +1964,7 @@ pub fn render_prompt(
 	}
 	drop(second);
 
-	let mut hasher = Hash32::hasher();
-	serde_json::to_writer(&mut hasher, &first)?;
-	let hash = PromptHash(hasher.finalize());
+	let hash = hash_items(&first)?;
 	Ok(RenderedPrompt { items: first.into(), hash })
 }
 
@@ -1993,6 +2028,62 @@ mod tests {
 		let first = CanonicalPromptSource.banded_render(&props).unwrap();
 		let second = CanonicalPromptSource.banded_render(&props).unwrap();
 		assert_eq!(first, second);
+	}
+	struct BoundaryPrompt(&'static [&'static str]);
+
+	impl PromptSource for BoundaryPrompt {
+		fn render(&self, _workspace: &Props) -> Result<Vec<Item>, PromptError> {
+			Ok(self
+				.0
+				.iter()
+				.map(|content| system_text((*content).to_owned()))
+				.collect())
+		}
+	}
+
+	#[test]
+	fn prompt_hash_tracks_exact_item_order_and_boundaries() {
+		let props = Props::new();
+		let split_left = render_prompt(&BoundaryPrompt(&["ab", "c"]), &props).unwrap();
+		let split_right = render_prompt(&BoundaryPrompt(&["a", "bc"]), &props).unwrap();
+		let reordered = render_prompt(&BoundaryPrompt(&["c", "ab"]), &props).unwrap();
+		assert_ne!(split_left.hash, split_right.hash);
+		assert_ne!(split_left.hash, reordered.hash);
+	}
+
+	struct SemanticBandPrompt {
+		band:  usize,
+		value: u8,
+	}
+
+	impl PromptSource for SemanticBandPrompt {
+		fn render(&self, _workspace: &Props) -> Result<Vec<Item>, PromptError> {
+			Ok(vec![system_text("identical wire item".to_owned())])
+		}
+
+		fn banded_render(
+			&self,
+			workspace: &Props,
+		) -> Result<Option<(Vec<Item>, [BandHash; 4])>, PromptError> {
+			let mut bands = [BandHash([0; 32]); 4];
+			bands[self.band] = BandHash([self.value; 32]);
+			Ok(Some((self.render(workspace)?, bands)))
+		}
+	}
+
+	#[test]
+	fn banded_prompt_hash_tracks_semantic_band_generation_without_changing_items() {
+		let props = Props::new();
+		let first =
+			render_prompt(&SemanticBandPrompt { band: 1, value: 7 }, &props).expect("first prompt");
+		let changed =
+			render_prompt(&SemanticBandPrompt { band: 1, value: 8 }, &props).expect("changed band");
+		let reordered =
+			render_prompt(&SemanticBandPrompt { band: 2, value: 7 }, &props).expect("moved band");
+		assert_eq!(first.items, changed.items);
+		assert_eq!(first.items, reordered.items);
+		assert_ne!(first.hash, changed.hash);
+		assert_ne!(first.hash, reordered.hash);
 	}
 
 	#[test]

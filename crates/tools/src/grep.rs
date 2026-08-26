@@ -86,6 +86,8 @@ pub enum SearchRootKind {
 	Archive,
 	/// An HTTP(S) target awaiting URL materialization.
 	Url,
+	/// A resolver-backed internal URI awaiting bounded materialization.
+	Internal,
 }
 
 /// One selector-peeled search target.
@@ -261,6 +263,8 @@ pub struct Payload {
 	pub projected_text:          Str,
 	/// Durable complete output when `projected_text` was pre-truncated.
 	pub output_blob:             Option<BlobRef>,
+	/// Resolver-valid address of `output_blob`.
+	pub output_artifact_uri:     Option<Str>,
 	/// Complete lines retained in `projected_text` before its footer.
 	pub output_shown_lines:      u64,
 	/// Complete line count in the pre-truncation output.
@@ -549,19 +553,16 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 			),
 		})?;
 		match parsed {
-			ParsedSelector::Lines { ranges: selected, raw: false } => ranges = selected,
-			ParsedSelector::Lines { raw: true, .. }
-			| ParsedSelector::Raw
-			| ParsedSelector::Conflicts
-			| ParsedSelector::Image => {
+			ParsedSelector::Lines { ranges: selected, .. } => ranges = selected,
+			ParsedSelector::Raw | ParsedSelector::Conflicts | ParsedSelector::None => {},
+			ParsedSelector::Image => {
 				return Err(Fault::InvalidSelector {
 					message: sf!(
-						"path entry \"{original}\" — only line-range selectors like \":50-100\" are \
-						 supported (no \":raw\"/\":conflicts\")"
+						"path entry \"{original}\" — the display-only \":img\" selector is not valid \
+						 for search"
 					),
 				});
 			},
-			ParsedSelector::None => {},
 		}
 	}
 	let clean = split.path;
@@ -574,14 +575,8 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 		message: sf!("path entry \"{original}\" has an invalid URL — {error}"),
 	})? {
 		Some(uri) if uri.scheme == Scheme::Http => SearchRootKind::Url,
-		Some(uri) => {
-			return Err(Fault::UnsupportedTarget {
-				message: sf!(
-					"{}:// targets are not supported yet",
-					uri.raw_scheme.to_ascii_lowercase()
-				),
-			});
-		},
+		Some(uri) if uri.scheme == Scheme::File => SearchRootKind::Filesystem,
+		Some(_) => SearchRootKind::Internal,
 		None if looks_like_archive_member(clean) => SearchRootKind::Archive,
 		None => SearchRootKind::Filesystem,
 	};
@@ -595,10 +590,9 @@ fn has_glob_chars(path: &str) -> bool {
 }
 
 fn looks_like_archive_member(path: &str) -> bool {
-	let lower = path.to_ascii_lowercase();
-	[".zip:", ".jar:", ".war:", ".ear:", ".apk:", ".tar:", ".tar.gz:", ".tgz:"]
-		.iter()
-		.any(|marker| lower.contains(marker))
+	crate::read::archive::parse_archive_path_candidates(path)
+		.into_iter()
+		.any(|candidate| !candidate.sub_path.is_empty())
 }
 
 fn fetch_budgets(roots: &[SearchRoot]) -> (u32, u32, u32) {
@@ -739,6 +733,7 @@ fn make_payload(result: SearchResult, roots: &[SearchRoot], requested_skip: u64)
 		notes,
 		projected_text: Str::new(""),
 		output_blob: None,
+		output_artifact_uri: None,
 		output_shown_lines: 0,
 		output_total_lines: 0,
 	}
@@ -786,6 +781,7 @@ async fn prepare_payload<W: WorkspaceSearch, B: ReadBlobs>(
 	workspace.record_snapshots(records)?;
 	payload.projected_text = output.content;
 	payload.output_blob = output.blob;
+	payload.output_artifact_uri = output.artifact_uri;
 	payload.output_shown_lines = output.shown_lines;
 	payload.output_total_lines = output.total_lines;
 	Ok(payload)
@@ -1076,6 +1072,29 @@ mod tests {
 			LineRange { start_line: 5, end_line: Some(8) },
 			LineRange { start_line: 12, end_line: Some(13) },
 		]);
+	}
+
+	#[test]
+	fn internal_roots_keep_ranges_and_ignore_display_only_modes() {
+		let roots = parse_roots(Some(
+			"artifact://7:raw:2-4; skill://prompt:conflicts; bundle.7z:docs/readme.txt",
+		))
+		.unwrap();
+		assert_eq!(roots[0].kind, SearchRootKind::Internal);
+		assert_eq!(roots[0].path, "artifact://7");
+		assert_eq!(roots[0].ranges.as_ref(), [LineRange { start_line: 2, end_line: Some(4) }]);
+		assert_eq!(roots[1].kind, SearchRootKind::Internal);
+		assert_eq!(roots[1].path, "skill://prompt");
+		assert!(roots[1].ranges.is_empty());
+		assert_eq!(roots[2].kind, SearchRootKind::Archive);
+	}
+
+	#[test]
+	fn selector_shaped_literal_spelling_is_retained_for_workspace_precedence() {
+		let root = parse_root(sf!("test:1-2")).unwrap();
+		assert_eq!(root.original, "test:1-2");
+		assert_eq!(root.path, "test");
+		assert_eq!(root.ranges.as_ref(), [LineRange { start_line: 1, end_line: Some(2) }]);
 	}
 
 	#[test]

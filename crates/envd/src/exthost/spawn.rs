@@ -9,10 +9,14 @@ use std::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
 	},
+	time::Duration,
 };
 
 use flume::Receiver;
+#[cfg(unix)]
+use nix::{sys::signal, unistd::Pid};
 use omp_core::Str;
+use omp_sandbox::{SandboxError, SandboxPolicy};
 use pyo3::{
 	prelude::*,
 	types::{PyList, PyModule},
@@ -22,7 +26,7 @@ use tokio::{
 	io::{AsyncRead, AsyncReadExt},
 	net::UnixStream,
 	process::{Child, Command},
-	task,
+	task, time,
 };
 
 use super::{
@@ -181,6 +185,47 @@ impl RunningHost {
 		&self.logs
 	}
 
+	/// Returns the generation authenticated by this live CONTROL child.
+	pub const fn generation(&self) -> u64 {
+		self.restart_spec.host_generation
+	}
+
+	/// Reports a child or CONTROL-pump exit without consuming its owner.
+	pub fn has_exited(&mut self) -> Result<bool, RunningHostError> {
+		Ok(self.pump.is_finished() || self.child.try_wait().map_err(SpawnError::Spawn)?.is_some())
+	}
+
+	/// Returns whether repeated forced cancellation disabled this host.
+	pub fn is_disabled(&self) -> bool {
+		self.cancellation.disabled(&self.key)
+	}
+
+	/// Reaps the current process group and starts its next authenticated
+	/// generation.
+	pub async fn restart(&mut self) -> Result<(), RunningHostError> {
+		self.terminate().await;
+		let mut spec = self.restart_spec.clone();
+		spec.host_generation = spec
+			.host_generation
+			.checked_add(1)
+			.ok_or(RunningHostError::GenerationExhausted)?;
+		let mut identity = self.identity.clone();
+		identity.host_generation = spec.host_generation;
+		let cancellation = mem::take(&mut self.cancellation);
+		let spawned = spawn(spec).await?;
+		let mut replacement = spawned
+			.start_control(identity, Arc::clone(&self.authority), &self.snapshot)
+			.await?;
+		replacement.cancellation = cancellation;
+		*self = replacement;
+		Ok(())
+	}
+
+	/// Terminates and reaps this owned child process group.
+	pub async fn shutdown(mut self) {
+		self.terminate().await;
+	}
+
 	/// Runs all three cancellation stages, killing only this process group when
 	/// Python remains live after both courtesy graces.
 	pub async fn cancel_dispatch(
@@ -201,29 +246,35 @@ impl RunningHost {
 			self
 				.cancellation
 				.kill_after_grace(self.key.clone(), &mut self.child, last_frame)?;
-		if matches!(outcome, CancellationOutcome::Killed(_)) {
-			self.pump.abort();
-			let mut spec = self.restart_spec.clone();
-			spec.host_generation = spec
-				.host_generation
-				.checked_add(1)
-				.ok_or(RunningHostError::GenerationExhausted)?;
-			let mut identity = self.identity.clone();
-			identity.host_generation = spec.host_generation;
-			let cancellation = mem::take(&mut self.cancellation);
-			let spawned = spawn(spec).await?;
-			let mut replacement = spawned
-				.start_control(identity, Arc::clone(&self.authority), &self.snapshot)
-				.await?;
-			replacement.cancellation = cancellation;
-			*self = replacement;
+		match outcome {
+			CancellationOutcome::Killed(_) => self.restart().await?,
+			CancellationOutcome::Disabled(_) => self.terminate().await,
+			CancellationOutcome::DispatchCancel | CancellationOutcome::InterruptThread => {},
 		}
 		Ok(outcome)
 	}
 
+	async fn terminate(&mut self) {
+		self.pump.abort();
+		if let Some(pid) = self.child.id() {
+			#[cfg(unix)]
+			{
+				let group = Pid::from_raw(pid.cast_signed());
+				let _ = signal::killpg(group, signal::Signal::SIGTERM);
+				time::sleep(Duration::from_millis(150)).await;
+				let _ = signal::killpg(group, signal::Signal::SIGKILL);
+			}
+			#[cfg(windows)]
+			{
+				let _ = self.child.start_kill();
+			}
+		}
+		let _ = self.child.wait().await;
+	}
+
 	/// Waits for the sole CONTROL pump to finish.
-	pub async fn wait_control(self) -> Result<(), RunningHostError> {
-		match self.pump.await {
+	pub async fn wait_control(mut self) -> Result<(), RunningHostError> {
+		let result = match (&mut self.pump).await {
 			Ok(result) => result.map_err(Into::into),
 			Err(error) => Err(
 				ControlRuntimeError::Protocol(ControlProtocolError::new(
@@ -232,7 +283,9 @@ impl RunningHost {
 				))
 				.into(),
 			),
-		}
+		};
+		self.terminate().await;
+		result
 	}
 }
 
@@ -251,6 +304,12 @@ pub enum SpawnError {
 	/// The embedded Python extension-host runtime failed to boot.
 	#[error("extension host Python runtime failed: {0}")]
 	Python(String),
+	/// Native sandbox installation failed for a sandboxed host.
+	#[error(transparent)]
+	Sandbox(#[from] SandboxError),
+	/// The host trust tier does not have an explicit launch policy.
+	#[error("unsupported extension host trust tier: {0}")]
+	UnsupportedTier(Str),
 	/// The child process could not be spawned.
 	#[error("extension host spawn failed: {0}")]
 	Spawn(io::Error),
@@ -299,7 +358,24 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	let restart_spec = spec.clone();
 	let (parent, child_control) = UnixStream::pair()?;
 	let fd = fd::AsRawFd::as_raw_fd(&child_control);
-	let mut command = Command::new(&spec.executable);
+	let sandbox_launch = match spec.key.tier().as_str() {
+		"sandboxed" => {
+			let mut policy = SandboxPolicy::new();
+			policy.allow_read(&spec.executable)?;
+			policy.allow_read(&spec.python_site)?;
+			policy.allow_write(&spec.env_socket)?;
+			Some(policy.prepare(&spec.executable)?)
+		},
+		"trusted" => None,
+		tier => return Err(SpawnError::UnsupportedTier(Str::from(tier))),
+	};
+	let mut command = if let Some(launch) = &sandbox_launch {
+		let mut command = Command::new(launch.program());
+		command.args(launch.args());
+		command
+	} else {
+		Command::new(&spec.executable)
+	};
 	command
 		.arg(EXT_HOST_ARG)
 		.env(CONTROL_FD_ENV, "3")
@@ -443,4 +519,25 @@ fn install_package_snapshot(engine: &omp_py::Engine) -> Result<(), SpawnError> {
 			Ok(())
 		})
 		.map_err(|error| SpawnError::Python(error.to_string()))
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn unknown_trust_tier_never_falls_back_to_raw_spawn() {
+		let result = spawn(SpawnSpec {
+			key:                 HostKey::new("workspace", "unknown", "fixture"),
+			executable:          PathBuf::from("/definitely/not/an/executable"),
+			python_site:         PathBuf::from("/definitely/not/a/site"),
+			env_socket:          PathBuf::from("/definitely/not/a/socket"),
+			host_generation:     1,
+			session_generation:  1,
+			package_snapshot:    None,
+			manifest_snapshot:   Str::new_static("{}"),
+			declaration_modules: Box::new([]),
+		})
+		.await;
+		assert!(matches!(result, Err(SpawnError::UnsupportedTier(tier)) if tier == "unknown"));
+	}
 }

@@ -32,7 +32,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, Weak,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
 
@@ -176,13 +176,14 @@ pub struct McpLeafDefinition {
 
 /// One environment's MCP service and monotone definition authority.
 pub struct McpService {
-	state:            RwLock<State>,
-	config_paths:     RwLock<Option<McpConfigPaths>>,
-	manager:          RwLock<Option<Weak<manager::McpManager>>>,
-	leaves:           LeafReplacementRegistry<McpLeaf>,
-	cache:            Arc<McpDefinitionCache>,
-	definition_epoch: AtomicU64,
-	next_subscriber:  AtomicU64,
+	state:                 RwLock<State>,
+	config_paths:          RwLock<Option<McpConfigPaths>>,
+	manager:               RwLock<Option<Weak<manager::McpManager>>>,
+	enable_project_config: AtomicBool,
+	leaves:                LeafReplacementRegistry<McpLeaf>,
+	cache:                 Arc<McpDefinitionCache>,
+	definition_epoch:      AtomicU64,
+	next_subscriber:       AtomicU64,
 }
 
 impl McpService {
@@ -190,17 +191,18 @@ impl McpService {
 	/// storage-authority definition cache.
 	pub fn open(cache_path: impl AsRef<Path>) -> Result<Arc<Self>, McpCacheError> {
 		Ok(Arc::new(Self {
-			state:            RwLock::new(State {
+			state:                 RwLock::new(State {
 				servers:     BTreeMap::new(),
 				history:     VecDeque::with_capacity(NOTIFICATION_HISTORY),
 				subscribers: BTreeMap::new(),
 			}),
-			config_paths:     RwLock::new(None),
-			manager:          RwLock::new(None),
-			leaves:           LeafReplacementRegistry::new(),
-			cache:            Arc::new(McpDefinitionCache::open(cache_path)?),
-			definition_epoch: AtomicU64::new(0),
-			next_subscriber:  AtomicU64::new(1),
+			config_paths:          RwLock::new(None),
+			manager:               RwLock::new(None),
+			enable_project_config: AtomicBool::new(true),
+			leaves:                LeafReplacementRegistry::new(),
+			cache:                 Arc::new(McpDefinitionCache::open(cache_path)?),
+			definition_epoch:      AtomicU64::new(0),
+			next_subscriber:       AtomicU64::new(1),
 		}))
 	}
 
@@ -219,15 +221,65 @@ impl McpService {
 		*self.manager.write() = Some(Arc::downgrade(manager));
 	}
 
-	/// Checks whether an advertised concrete resource or URI template routes the
-	/// requested `mcp://` path before proxying a remote read.
-	pub(crate) fn routes_resource(&self, server: &str, uri: &str) -> bool {
+	/// Loads, precedence-resolves, and mounts every persisted native source.
+	/// This must be called once after transport credential authorities are
+	/// bound; subsequent config mutations reuse the retained discovery policy.
+	pub async fn start_native_configs(
+		&self,
+		enable_project_config: bool,
+	) -> Result<manager::StartupSnapshot, McpServiceError> {
+		self
+			.enable_project_config
+			.store(enable_project_config, Ordering::Release);
+		self.reload_native_configs().await
+	}
+
+	/// Reloads persisted native sources using the retained settings policy.
+	/// Late-bound credential authorities call this after composition so OAuth
+	/// headers and native Exa imports participate in the mounted specs.
+	pub async fn reload_native_configs(&self) -> Result<manager::StartupSnapshot, McpServiceError> {
+		let paths = self
+			.config_paths
+			.read()
+			.clone()
+			.ok_or(McpServiceError::InvalidRequest)?;
+		let enable_project_config = self.enable_project_config.load(Ordering::Acquire);
+		let resolved =
+			task::spawn_blocking(move || load_resolved_config(paths, enable_project_config))
+				.await
+				.map_err(|_| McpServiceError::InvalidRequest)??;
+		let manager = self
+			.manager
+			.read()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.ok_or(McpServiceError::InvalidRequest)?;
+		Ok(manager.replace_resolved_config(resolved).await)
+	}
+
+	/// Lists live concrete advertised URIs for `mcp://` completion.
+	pub(crate) fn resource_uris(&self) -> Vec<Str> {
 		self
 			.manager
 			.read()
 			.as_ref()
 			.and_then(Weak::upgrade)
-			.is_some_and(|manager| manager.routes_resource(server, uri))
+			.map_or_else(Vec::new, |manager| manager.resource_uris())
+	}
+
+	/// Resolves a PI-compatible opaque `mcp://<advertised-uri>` payload to the
+	/// deterministic current server which advertised it.
+	pub(crate) fn resolve_resource_server(&self, uri: &str) -> Option<pb::McpServerRef> {
+		let name = self
+			.manager
+			.read()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.and_then(|manager| manager.resolve_resource_server(uri))?;
+		Some(pb::McpServerRef {
+			name:             name.to_string(),
+			definition_epoch: self.definition_epoch(),
+		})
 	}
 
 	/// Builds one extension-scoped MCP CONTROL projection over the live manager.
@@ -257,7 +309,6 @@ impl McpService {
 			.ok_or(McpServiceError::InvalidRequest)?;
 		let action = pb::McpConfigAction::try_from(request.action)
 			.map_err(|_| McpServiceError::InvalidRequest)?;
-		let refresh_paths = paths.clone();
 		let result = task::spawn_blocking(move || config_request(paths, request))
 			.await
 			.map_err(|_| McpServiceError::InvalidRequest)??;
@@ -269,19 +320,9 @@ impl McpService {
 				| pb::McpConfigAction::Remove
 				| pb::McpConfigAction::Enable
 				| pb::McpConfigAction::Disable
-		) && let Some(manager) = manager
+		) && manager.is_some()
 		{
-			let snapshot = task::spawn_blocking(move || {
-				config_request(refresh_paths, pb::McpConfigRequest {
-					action: pb::McpConfigAction::List as i32,
-					scope: pb::McpConfigScope::Unspecified as i32,
-					wire_revision: omp_proto::SCHEMA_REV,
-					..pb::McpConfigRequest::default()
-				})
-			})
-			.await
-			.map_err(|_| McpServiceError::InvalidRequest)??;
-			manager.replace_config_entries(snapshot.entries).await;
+			self.reload_native_configs().await?;
 		}
 		Ok(result)
 	}
@@ -613,6 +654,28 @@ struct McpConfigPaths {
 	root:    PathBuf,
 }
 
+fn load_resolved_config(
+	paths: McpConfigPaths,
+	enable_project_config: bool,
+) -> Result<config::ResolvedConfig, McpServiceError> {
+	use config::{ConfigSource, ConfigSourceKind};
+
+	let sources = [
+		(ConfigSourceKind::User, paths.user),
+		(ConfigSourceKind::Project, paths.project),
+		(ConfigSourceKind::Root, paths.root),
+	]
+	.into_iter()
+	.map(|(kind, path)| {
+		let file = config_store::McpConfigStore::new(path.clone())
+			.read()
+			.map_err(|_| McpServiceError::InvalidRequest)?;
+		Ok(ConfigSource { path, kind, file })
+	})
+	.collect::<Result<Vec<_>, McpServiceError>>()?;
+	Ok(config::resolve_sources(&sources, enable_project_config))
+}
+
 fn config_request(
 	paths: McpConfigPaths,
 	request: pb::McpConfigRequest,
@@ -765,9 +828,65 @@ fn broadcast(state: &mut State, event: SubscriptionEvent) {
 
 #[cfg(test)]
 mod config_tests {
-	use std::fs;
+	use std::{fs, future::Future, pin::Pin};
 
 	use super::*;
+	use crate::mcp::manager::{ConnectedClient, ManagerError, McpConnector, McpManager, MountSpec};
+
+	struct RejectConnector;
+
+	impl McpConnector for RejectConnector {
+		fn connect<'a>(
+			&'a self,
+			_spec: &'a MountSpec,
+			_roots: Arc<[Str]>,
+			_cancel: CancellationToken,
+		) -> Pin<Box<dyn Future<Output = Result<ConnectedClient, ManagerError>> + Send + 'a>> {
+			Box::pin(async { Err(ManagerError::InvalidConfig) })
+		}
+	}
+
+	#[tokio::test]
+	async fn startup_loads_persisted_sources_and_honors_project_policy() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let data = scratch.path().join("data");
+		let project = scratch.path().join("project");
+		fs::create_dir_all(project.join(".omp")).expect("project config directory");
+		fs::create_dir_all(&data).expect("data directory");
+		fs::write(
+			data.join("mcp.json"),
+			br#"{"mcpServers":{"user-server":{"type":"stdio","command":"user"}}}"#,
+		)
+		.expect("user config");
+		fs::write(
+			project.join(".mcp.json"),
+			br#"{"mcpServers":{"root-server":{"type":"stdio","command":"root"}}}"#,
+		)
+		.expect("root config");
+		let service = McpService::open(scratch.path().join("cache.sqlite3")).expect("service");
+		service.bind_config_paths(&data, &project);
+		let manager = McpManager::new(
+			Arc::clone(&service),
+			Arc::new(RejectConnector),
+			Arc::from([]),
+			project.clone(),
+		);
+		service.bind_manager(&manager);
+
+		let snapshot = service
+			.start_native_configs(false)
+			.await
+			.expect("startup config");
+		assert_eq!(snapshot.status.servers.len(), 1);
+		assert_eq!(
+			snapshot.status.servers[0]
+				.server
+				.as_ref()
+				.expect("server")
+				.name,
+			"user-server"
+		);
+	}
 
 	#[tokio::test]
 	async fn native_config_rpc_mutates_and_lists_one_environment_store() {

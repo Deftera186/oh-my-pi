@@ -43,6 +43,15 @@ impl McpTimeout {
 		}
 	}
 
+	/// Returns the effective transport duration, or `None` when explicitly
+	/// disabled.
+	pub const fn duration(self) -> Option<Duration> {
+		match self {
+			Self::Disabled => None,
+			Self::After(duration) => Some(duration),
+		}
+	}
+
 	/// Runs one cancellation-safe operation under caller cancellation and the
 	/// resolved deadline. Dropping the future cancels the underlying operation.
 	pub async fn run<T>(

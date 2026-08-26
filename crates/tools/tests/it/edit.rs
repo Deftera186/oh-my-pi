@@ -12,35 +12,55 @@ use omp_tool::{CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool,
 use omp_tools::edit::{
 	self, CommitResult, CommittedSection, Conflict, EditAction, EditCommitError, EditDocuments,
 	EditPrepared, EditProposal, Fault, FormatPolicy, NoopResult, PrepareRequest, RejectionReason,
-	tool,
+	apply_patch_tool, tool,
 };
 use parking_lot::Mutex;
 
 #[derive(Default)]
 struct State {
-	prepared:   Vec<PrepareRequest>,
-	noop_guard: NoopLoopGuard,
-	commits:    Vec<EditProposal>,
+	prepared:       Vec<PrepareRequest>,
+	noop_guard:     NoopLoopGuard,
+	commits:        Vec<EditProposal>,
+	commit_batches: Vec<usize>,
 }
 
 #[derive(Clone)]
 struct Fake {
-	files: Arc<HashMap<Str, Bytes>>,
-	state: Arc<Mutex<State>>,
-	fault: Option<Fault>,
+	files:    Arc<HashMap<Str, Bytes>>,
+	authored: Arc<HashMap<Str, Bytes>>,
+	state:    Arc<Mutex<State>>,
+	fault:    Option<Fault>,
 }
 
 impl Fake {
 	fn with_files(files: &[(&str, &'static [u8])]) -> Self {
 		Self {
-			files: Arc::new(
+			files:    Arc::new(
 				files
 					.iter()
 					.map(|(path, bytes)| (Str::new(*path), Bytes::from_static(bytes)))
 					.collect(),
 			),
-			state: Arc::default(),
-			fault: None,
+			authored: Arc::default(),
+			state:    Arc::default(),
+			fault:    None,
+		}
+	}
+
+	fn with_stale(path: &str, authored: &'static [u8], live: &'static [u8]) -> Self {
+		Self {
+			files:    Arc::new(
+				[(Str::new(path), Bytes::from_static(live))]
+					.into_iter()
+					.collect(),
+			),
+			authored: Arc::new(
+				[(Str::new(path), Bytes::from_static(authored))]
+					.into_iter()
+					.collect(),
+			),
+			state:    Arc::default(),
+			fault:    None,
 		}
 	}
 }
@@ -87,11 +107,16 @@ impl EditDocuments for Fake {
 				conflicts: Vec::new(),
 			}));
 		};
+		let authored = self
+			.authored
+			.get(&request.path)
+			.cloned()
+			.unwrap_or_else(|| content.clone());
 		future::ready(Ok(Lease {
-			path:     request.path,
+			path: request.path,
 			revision: "r1".into(),
-			base:     content.clone(),
-			authored: content,
+			base: content,
+			authored,
 		}))
 	}
 
@@ -135,7 +160,9 @@ impl EditDocuments for Fake {
 				diagnostics_complete: true,
 			})
 			.collect();
-		self.state.lock().commits.extend(proposals);
+		let mut state = self.state.lock();
+		state.commit_batches.push(proposals.len());
+		state.commits.extend(proposals);
 		future::ready(Ok(CommitResult { sections }))
 	}
 }
@@ -433,6 +460,65 @@ async fn malformed_and_headerless_input_never_commit_and_preserve_parser_diagnos
 		assert_eq!(rendered, expected);
 	}
 	assert!(fake.state.lock().commits.is_empty());
+}
+
+#[tokio::test]
+async fn apply_patch_commits_every_file_in_one_document_transaction() {
+	let fake = Fake::with_files(&[("a.txt", b"one\n"), ("b.txt", b"two\n")]);
+	let edit = apply_patch_tool(fake.clone(), FormatPolicy::BestEffort);
+	let input = "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n*** Update File: \
+	             b.txt\n@@\n-two\n+TWO\n*** End Patch\n";
+	let raw = serde_json::json!({ "input": input }).to_string();
+	let (feed, incoming) = IncomingParams::channel();
+	feed.arg_text(raw.clone().into()).unwrap();
+	feed.args_committed(raw.into()).unwrap();
+	let events = edit.call(incoming).collect::<Vec<_>>().await;
+	assert!(matches!(events.last(), Some(Ev::Done(ToolTerminal::Done { result: Ok(_), .. }))));
+	let state = fake.state.lock();
+	assert_eq!(state.commit_batches, [2]);
+	assert_eq!(state.commits.len(), 2);
+}
+
+#[tokio::test]
+async fn stale_recovery_rejects_a_changed_authored_duplicate_line() {
+	let authored = b"same\nsame\nsame\nsame\n";
+	let live = b"same\nsame\nchanged\nsame\n";
+	let fake = Fake::with_stale("a.txt", authored, live);
+	let edit = tool(fake.clone(), FormatPolicy::BestEffort);
+	let input = format!("[a.txt#{}]\nCUT 3.=3", compute_snapshot_tag(authored));
+	let raw = serde_json::json!({ "input": input }).to_string();
+	let (feed, incoming) = IncomingParams::channel();
+	feed.arg_text(raw.clone().into()).unwrap();
+	feed.args_committed(raw.into()).unwrap();
+	let events = edit.call(incoming).collect::<Vec<_>>().await;
+	assert!(matches!(
+		events.last(),
+		Some(Ev::Done(ToolTerminal::Done {
+			result: Err(Fault { reason: RejectionReason::StaleUnrecoverable { .. }, .. }),
+			..
+		}))
+	));
+	assert!(fake.state.lock().commits.is_empty());
+}
+
+#[tokio::test]
+async fn stale_head_insert_applies_to_live_bytes_and_warns_about_drift() {
+	let authored = b"old first\nbody\n";
+	let live = b"new first\nbody\n";
+	let fake = Fake::with_stale("a.txt", authored, live);
+	let input = format!("[a.txt#{}]\nPUT <1:\n+prefix", compute_snapshot_tag(authored));
+	let (payload, _) = invoke(fake.clone(), &input).await;
+	assert!(
+		payload.sections[0]
+			.warnings
+			.iter()
+			.any(|warning| warning.as_str() == omp_hashline::HEADTAIL_DRIFT_WARNING)
+	);
+	let state = fake.state.lock();
+	assert!(matches!(
+		&state.commits[0].action,
+		EditAction::Write { content } if content.as_ref() == b"prefix\nnew first\nbody\n"
+	));
 }
 
 #[tokio::test]

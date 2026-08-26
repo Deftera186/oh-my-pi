@@ -46,6 +46,7 @@ use parking_lot::Mutex;
 use prost::Message as _;
 use regex::bytes::Regex;
 use tokio::{net::TcpStream, runtime, task, time};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
@@ -188,7 +189,7 @@ pub enum ProcessEvent {
 #[must_use]
 pub struct ExecRun {
 	id:      Bytes,
-	events:  Receiver<ExecEvent>,
+	events:  Arc<Receiver<ExecEvent>>,
 	control: Arc<RunControl>,
 }
 
@@ -278,20 +279,24 @@ struct UserShell {
 }
 
 struct NamedProcess {
-	host:       Weak<HostInner>,
-	name:       Str,
-	generation: u64,
-	control:    Arc<RunControl>,
-	stream:     Mutex<ProcessStreamState>,
-	log:        Mutex<ProcessLog>,
-	spec:       ProcessSpec,
-	ready:      Arc<[ReadyProbe]>,
-	identity:   ProcessIdentity,
-	started_at: Instant,
-	detached:   bool,
-	persist:    bool,
-	stopping:   AtomicBool,
-	restarts:   Mutex<RestartSupervisor>,
+	host:            Weak<HostInner>,
+	name:            Str,
+	generation:      u64,
+	control:         Arc<RunControl>,
+	stream:          Mutex<ProcessStreamState>,
+	log:             Mutex<ProcessLog>,
+	spec:            ProcessSpec,
+	ready:           Arc<[ReadyProbe]>,
+	identity:        ProcessIdentity,
+	started_at:      Instant,
+	detached:        bool,
+	persist:         bool,
+	stopping:        AtomicBool,
+	timed_out:       AtomicBool,
+	timeout:         Option<Duration>,
+	deadline_cancel: CancellationToken,
+	private_session: Mutex<Option<Bytes>>,
+	restarts:        Mutex<RestartSupervisor>,
 }
 
 /// Result of applying graceful shutdown to managed process trees.
@@ -396,6 +401,7 @@ struct RunControl {
 	spawns:    Arc<SpawnBook>,
 	finished:  AtomicBool,
 	retained:  Mutex<Option<Weak<NamedProcess>>>,
+	events:    Weak<Receiver<ExecEvent>>,
 }
 
 struct CancelRequest {
@@ -722,7 +728,7 @@ impl ExecHost {
 			.source
 			.ok_or_else(|| ExecError::Shell(sf!("missing script")))?;
 		let github_targets = admission::bash_ir(
-			"shell",
+			"bash",
 			&serde_json::json!({ "command": source.text.as_str() }),
 			Path::new("/"),
 			Path::new("/"),
@@ -741,6 +747,7 @@ impl ExecHost {
 			.map_or(source.clone(), |shell| user_shell_command(shell, &source));
 		let exec = self.new_id();
 		let (events_tx, events) = flume::unbounded();
+		let events = Arc::new(events);
 		let (cancel_tx, cancel_rx) = flume::bounded(1);
 		let control = Arc::new(RunControl {
 			cancel_tx,
@@ -748,6 +755,7 @@ impl ExecHost {
 			spawns: Arc::new(SpawnBook { groups: Mutex::new(Vec::new()) }),
 			finished: AtomicBool::new(false),
 			retained: Mutex::new(None),
+			events: Arc::downgrade(&events),
 		});
 		let command = SessionCommand {
 			host: Arc::downgrade(&self.inner),
@@ -819,19 +827,43 @@ impl ExecHost {
 
 	/// Starts a persistent named process and waits for every readiness probe.
 	pub async fn start_process(&self, request: StartProcess) -> Result<ProcessStarted, ExecError> {
+		let timeout = request
+			.spec
+			.as_ref()
+			.and_then(|spec| spec.timeout_ms)
+			.filter(|timeout| *timeout != 0)
+			.map(Duration::from_millis);
+		self.start_process_with_timeout(request, timeout).await
+	}
+
+	async fn start_process_with_timeout(
+		&self,
+		request: StartProcess,
+		timeout: Option<Duration>,
+	) -> Result<ProcessStarted, ExecError> {
 		let name = Str::from(request.name);
-		let _reservation = self.reserve_process(name.clone())?;
+		let (_reservation, generation) = self.reserve_process(name.clone())?;
 		let ready = request.ready;
 		let spec = request
 			.spec
 			.ok_or_else(|| ExecError::Shell(sf!("missing process spec")))?;
+		let timeout = timeout.or_else(|| {
+			spec
+				.timeout_ms
+				.filter(|timeout| *timeout != 0)
+				.map(Duration::from_millis)
+		});
 		if spec.detached && spec.pty.is_some() {
 			return Err(ExecError::DetachedPty);
 		}
 		if spec.detached {
-			self.launch_detached(name, spec, ready, 1, None).await
+			self
+				.launch_detached(name, spec, ready, generation, None, timeout)
+				.await
 		} else {
-			self.launch_attached(name, spec, ready, 1, None).await
+			self
+				.launch_attached(name, spec, ready, generation, None, timeout)
+				.await
 		}
 	}
 
@@ -842,10 +874,24 @@ impl ExecHost {
 		ready: Vec<ReadyProbe>,
 		generation: u64,
 		recovered: Option<&ProcessRecord>,
+		timeout: Option<Duration>,
 	) -> Result<ProcessStarted, ExecError> {
-		let (prior_end, prior_rotations) =
-			recovered.map_or((0, 0), |record| (record.log_end_offset, record.log_rotations));
+		let (prior_end, prior_rotations) = recovered.map_or_else(
+			|| {
+				self
+					.inner
+					.processes
+					.lock()
+					.get(&name)
+					.map_or((0, 0), |process| {
+						let log = process.log.lock();
+						(log.end_offset(), log.rotations())
+					})
+			},
+			|record| (record.log_end_offset, record.log_rotations),
+		);
 		let log = ProcessLog::create(self.process_dir(&name), prior_end, prior_rotations)?;
+		let identity = ProcessIdentity::current()?;
 		let opened = self
 			.open_session(OpenSessionRequest {
 				cwd_uri:       spec.cwd_uri.clone(),
@@ -856,16 +902,24 @@ impl ExecHost {
 				props:         Default::default(),
 			})
 			.await?;
-		let (started, run) = self
+		let private_session = opened.session;
+		let executed = self
 			.exec(
 				ExecRequest {
-					session: opened.session,
+					session: private_session.clone(),
 					source:  spec.source.clone(),
 					props:   Default::default(),
 				},
-				None,
+				timeout,
 			)
-			.await?;
+			.await;
+		let (started, run) = match executed {
+			Ok(executed) => executed,
+			Err(error) => {
+				let _ = self.close_session(&private_session);
+				return Err(error);
+			},
+		};
 		let supervisor = recovered.map_or_else(
 			|| RestartSupervisor::from_spec(spec.restart.as_ref()),
 			|record| RestartSupervisor::recovered(record, spec.restart.as_ref()),
@@ -894,11 +948,15 @@ impl ExecHost {
 			log: Mutex::new(log),
 			spec: spec.clone(),
 			ready: ready.clone().into(),
-			identity: ProcessIdentity::current()?,
+			identity,
 			started_at: Instant::now(),
 			detached: false,
 			persist: spec.persist,
 			stopping: AtomicBool::new(false),
+			timed_out: AtomicBool::new(false),
+			timeout,
+			deadline_cancel: CancellationToken::new(),
+			private_session: Mutex::new(Some(private_session)),
 			restarts: Mutex::new(supervisor),
 		});
 		self
@@ -906,14 +964,19 @@ impl ExecHost {
 			.processes
 			.lock()
 			.insert(name.clone(), process.clone());
-		self.persist_process(
+		if let Err(error) = self.persist_process(
 			&process,
 			if ready.is_empty() {
 				ProcessPhase::Running
 			} else {
 				ProcessPhase::WaitingReady
 			},
-		)?;
+		) {
+			self.inner.processes.lock().remove(&name);
+			process.control.cancel(CANCEL_GRACE);
+			close_private_session(&process);
+			return Err(error);
+		}
 		tokio::spawn(forward_named_process(process.clone(), run, started.exec));
 		if let Err(error) = try_join_all(
 			ready
@@ -925,6 +988,7 @@ impl ExecHost {
 		{
 			process.stopping.store(true, Ordering::Release);
 			process.control.cancel(CANCEL_GRACE);
+			close_private_session(&process);
 			self.persist_process(&process, ProcessPhase::Failed)?;
 			return Err(error);
 		}
@@ -961,10 +1025,23 @@ impl ExecHost {
 		ready: Vec<ReadyProbe>,
 		generation: u64,
 		recovered: Option<&ProcessRecord>,
+		timeout: Option<Duration>,
 	) -> Result<ProcessStarted, ExecError> {
 		spec.persist = true;
-		let (prior_end, prior_rotations) =
-			recovered.map_or((0, 0), |record| (record.log_end_offset, record.log_rotations));
+		let (prior_end, prior_rotations) = recovered.map_or_else(
+			|| {
+				self
+					.inner
+					.processes
+					.lock()
+					.get(&name)
+					.map_or((0, 0), |process| {
+						let log = process.log.lock();
+						(log.end_offset(), log.rotations())
+					})
+			},
+			|record| (record.log_end_offset, record.log_rotations),
+		);
 		let log = ProcessLog::create(self.process_dir(&name), prior_end, prior_rotations)?;
 		let output = log.child_output()?;
 		let stderr = output.try_clone()?;
@@ -1020,6 +1097,7 @@ impl ExecHost {
 			spawns: Arc::new(SpawnBook { groups: Mutex::new(vec![pid as i32]) }),
 			finished: AtomicBool::new(false),
 			retained: Mutex::new(None),
+			events: Weak::new(),
 		});
 		let mut supervisor = RestartSupervisor::from_spec(spec.restart.as_ref());
 		if let Some(record) = recovered {
@@ -1055,22 +1133,31 @@ impl ExecHost {
 			detached: true,
 			persist: true,
 			stopping: AtomicBool::new(false),
+			timed_out: AtomicBool::new(false),
+			timeout,
+			deadline_cancel: CancellationToken::new(),
+			private_session: Mutex::new(None),
 			restarts: Mutex::new(supervisor),
 		});
-		self.persist_process(
+		if let Err(error) = self.persist_process(
 			&process,
 			if ready.is_empty() {
 				ProcessPhase::Running
 			} else {
 				ProcessPhase::WaitingReady
 			},
-		)?;
+		) {
+			let _ = process.control.spawns.signal(ProcessSignal::Kill);
+			let _ = child.wait();
+			return Err(error);
+		}
 		self
 			.inner
 			.processes
 			.lock()
 			.insert(name.clone(), process.clone());
 		spawn_detached_monitor(process.clone(), Some(child), cancel_rx);
+		spawn_process_deadline(process.clone());
 
 		if let Err(error) = try_join_all(
 			ready
@@ -1221,6 +1308,7 @@ impl ExecHost {
 				spawns: Arc::new(SpawnBook { groups: Mutex::new(vec![record.identity.pid as i32]) }),
 				finished: AtomicBool::new(false),
 				retained: Mutex::new(None),
+				events: Weak::new(),
 			});
 			let state = match record.phase {
 				ProcessPhase::WaitingReady | ProcessPhase::Starting => ProcessState::Starting,
@@ -1261,6 +1349,13 @@ impl ExecHost {
 				detached: true,
 				persist: true,
 				stopping: AtomicBool::new(false),
+				timed_out: AtomicBool::new(false),
+				timeout: spec
+					.timeout_ms
+					.filter(|timeout| *timeout != 0)
+					.map(Duration::from_millis),
+				deadline_cancel: CancellationToken::new(),
+				private_session: Mutex::new(None),
 				restarts: Mutex::new(RestartSupervisor::recovered(&record, spec.restart.as_ref())),
 			});
 			self
@@ -1269,6 +1364,7 @@ impl ExecHost {
 				.lock()
 				.insert(record.name.clone(), process.clone());
 			spawn_detached_monitor(process.clone(), None, cancel_rx);
+			spawn_process_deadline(process.clone());
 			if state == ProcessState::Starting {
 				tokio::spawn(resume_recovered_readiness(process));
 			}
@@ -1318,13 +1414,25 @@ impl ExecHost {
 	/// this succeeds no longer requests process-tree cancellation.
 	pub fn detach_exec(&self, exec: &[u8], name: &str) -> Result<ProcessStarted, ExecError> {
 		let name = Str::from(name);
-		let _reservation = self.reserve_process(name.clone())?;
+		let (_reservation, generation) = self.reserve_process(name.clone())?;
 		let control = self.run(exec)?;
+		let events = control.events.upgrade().ok_or(ExecError::RunNotFound)?;
 		let mut retained = control.retained.lock();
-		if control.finished.load(Ordering::Acquire) {
+		if control.finished.load(Ordering::Acquire)
+			|| retained.as_ref().and_then(Weak::upgrade).is_some()
+		{
 			return Err(ExecError::RunNotFound);
 		}
-		let generation = 1;
+		let (prior_end, prior_rotations) =
+			self
+				.inner
+				.processes
+				.lock()
+				.get(&name)
+				.map_or((0, 0), |process| {
+					let log = process.log.lock();
+					(log.end_offset(), log.rotations())
+				});
 		let process = Arc::new(NamedProcess {
 			host: Arc::downgrade(&self.inner),
 			name: name.clone(),
@@ -1341,7 +1449,7 @@ impl ExecHost {
 				history:     Vec::new(),
 				subscribers: Vec::new(),
 			}),
-			log: Mutex::new(ProcessLog::create(self.process_dir(&name), 0, 0)?),
+			log: Mutex::new(ProcessLog::create(self.process_dir(&name), prior_end, prior_rotations)?),
 			spec: ProcessSpec::default(),
 			ready: Arc::from([]),
 			identity: ProcessIdentity::current()?,
@@ -1349,11 +1457,28 @@ impl ExecHost {
 			detached: false,
 			persist: false,
 			stopping: AtomicBool::new(false),
+			timed_out: AtomicBool::new(false),
+			timeout: None,
+			deadline_cancel: CancellationToken::new(),
+			private_session: Mutex::new(None),
 			restarts: Mutex::new(RestartSupervisor::from_spec(None)),
 		});
-		self.inner.processes.lock().insert(name, process.clone());
-		self.persist_process(&process, ProcessPhase::Running)?;
+		self
+			.inner
+			.processes
+			.lock()
+			.insert(name.clone(), process.clone());
+		if let Err(error) = self.persist_process(&process, ProcessPhase::Running) {
+			self.inner.processes.lock().remove(&name);
+			return Err(error);
+		}
 		*retained = Some(Arc::downgrade(&process));
+		drop(retained);
+		tokio::spawn(forward_named_process(
+			process.clone(),
+			ExecRun { id: Bytes::copy_from_slice(exec), events, control },
+			Bytes::copy_from_slice(exec),
+		));
 		Ok(ProcessStarted {
 			name: process.name.to_string(),
 			generation,
@@ -1391,15 +1516,32 @@ impl ExecHost {
 		let ready = process.ready.to_vec();
 		let generation = process.generation.saturating_add(1);
 		let detached = process.detached;
+		let timeout = process.timeout;
 		process.control.cancel(CANCEL_GRACE);
 		wait_process_finished(&process).await?;
+		process.deadline_cancel.cancel();
+		close_private_session(&process);
 		if detached {
 			self
-				.launch_detached(process.name.clone(), spec, ready, generation, record.as_ref())
+				.launch_detached(
+					process.name.clone(),
+					spec,
+					ready,
+					generation,
+					record.as_ref(),
+					timeout,
+				)
 				.await
 		} else {
 			self
-				.launch_attached(process.name.clone(), spec, ready, generation, record.as_ref())
+				.launch_attached(
+					process.name.clone(),
+					spec,
+					ready,
+					generation,
+					record.as_ref(),
+					timeout,
+				)
 				.await
 		}
 	}
@@ -1544,10 +1686,12 @@ impl ExecHost {
 	}
 
 	/// Gracefully stops every managed process except a verified detached,
-	/// persistent generation that can be safely re-adopted.
-	pub fn shutdown_managed(&self, grace: Duration) -> ShutdownSummary {
+	/// persistent generation that can be safely re-adopted, then waits for
+	/// every stopped group leader to be reaped.
+	pub async fn shutdown_managed(&self, grace: Duration) -> ShutdownSummary {
 		let processes: Vec<_> = self.inner.processes.lock().values().cloned().collect();
 		let mut summary = ShutdownSummary { stopped: 0, spared: 0 };
+		let mut stopped = Vec::new();
 		for process in processes {
 			let verified = process
 				.stream
@@ -1561,7 +1705,16 @@ impl ExecHost {
 			} else {
 				process.control.cancel(grace);
 				summary.stopped = summary.stopped.saturating_add(1);
+				stopped.push(process);
 			}
+		}
+		let deadline = Instant::now() + grace + Duration::from_secs(2);
+		while stopped
+			.iter()
+			.any(|process| !process.control.finished.load(Ordering::Acquire))
+			&& Instant::now() < deadline
+		{
+			time::sleep(Duration::from_millis(10)).await;
 		}
 		summary
 	}
@@ -1595,7 +1748,7 @@ impl ExecHost {
 			.ok_or(ExecError::RunNotFound)
 	}
 
-	fn reserve_process(&self, name: Str) -> Result<ProcessReservation, ExecError> {
+	fn reserve_process(&self, name: Str) -> Result<(ProcessReservation, u64), ExecError> {
 		if name.is_empty()
 			|| name.len() > 48
 			|| !name
@@ -1608,11 +1761,16 @@ impl ExecHost {
 		if !self.inner.starting.lock().insert(name.clone()) {
 			return Err(ExecError::ProcessExists(name));
 		}
-		if self.inner.processes.lock().contains_key(&name) {
-			self.inner.starting.lock().remove(&name);
-			return Err(ExecError::ProcessExists(name));
-		}
-		Ok(ProcessReservation { host: Arc::downgrade(&self.inner), name })
+		let generation = if let Some(process) = self.inner.processes.lock().get(&name).cloned() {
+			if !process_state_is_terminal(process.stream.lock().info.state) {
+				self.inner.starting.lock().remove(&name);
+				return Err(ExecError::ProcessExists(name));
+			}
+			process.generation.saturating_add(1)
+		} else {
+			1
+		};
+		Ok((ProcessReservation { host: Arc::downgrade(&self.inner), name }, generation))
 	}
 
 	fn reserve_process_generation(
@@ -1822,7 +1980,6 @@ fn finish_session_command(
 	elapsed: Duration,
 	working_dir: &Path,
 ) {
-	let retained = command.control.retained.lock();
 	command.control.finished.store(true, Ordering::Release);
 	let (final_cwd_uri, final_cwd_revision) = command.host.upgrade().map_or_else(
 		|| (String::new(), 0),
@@ -1865,10 +2022,7 @@ fn finish_session_command(
 		final_cwd_revision,
 		props: Default::default(),
 	});
-	let _ = command.events.send(event.clone());
-	if let Some(process) = retained.as_ref().and_then(Weak::upgrade) {
-		route_named_event(&process, event);
-	}
+	let _ = command.events.send(event);
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1923,8 +2077,7 @@ fn setup_io(
 	events: flume::Sender<ExecEvent>,
 ) -> Result<(ExecutionParameters, Vec<task::JoinHandle<()>>), ExecError> {
 	let mut params = ExecutionParameters::default();
-	let sequencer =
-		Arc::new(Mutex::new(OutputSequencer { next: 1, events, control: control.clone() }));
+	let sequencer = Arc::new(Mutex::new(OutputSequencer { next: 1, events }));
 	if let Some(pty) = pty {
 		let winsize = nix::pty::Winsize {
 			ws_row:    clamp_u16(pty.rows),
@@ -1978,9 +2131,8 @@ fn setup_io(
 }
 
 struct OutputSequencer {
-	next:    u64,
-	events:  flume::Sender<ExecEvent>,
-	control: Arc<RunControl>,
+	next:   u64,
+	events: flume::Sender<ExecEvent>,
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -2006,14 +2158,7 @@ fn spawn_reader<R: Read + Send + 'static>(
 			};
 			sequencer.next += 1;
 			let event = ExecEvent::Output(frame);
-			let _ = sequencer.events.send(event.clone());
-			let process = {
-				let retained = sequencer.control.retained.lock();
-				retained.as_ref().and_then(Weak::upgrade)
-			};
-			if let Some(process) = process {
-				route_named_event(&process, event);
-			}
+			let _ = sequencer.events.send(event);
 		}
 	})
 }
@@ -2053,6 +2198,33 @@ async fn resume_recovered_readiness(process: Arc<NamedProcess>) {
 	}
 }
 
+fn close_private_session(process: &NamedProcess) {
+	let Some(session) = process.private_session.lock().take() else {
+		return;
+	};
+	if let Some(host) = process.host.upgrade() {
+		host.sessions.lock().remove(&session);
+	}
+}
+
+fn spawn_process_deadline(process: Arc<NamedProcess>) {
+	let Some(timeout) = process.timeout.filter(|timeout| !timeout.is_zero()) else {
+		return;
+	};
+	let cancelled = process.deadline_cancel.clone();
+	tokio::spawn(async move {
+		tokio::select! {
+			() = time::sleep(timeout) => {
+				if !process.control.finished.load(Ordering::Acquire) {
+					process.timed_out.store(true, Ordering::Release);
+					process.control.cancel(CANCEL_GRACE);
+				}
+			},
+			() = cancelled.cancelled() => {},
+		}
+	});
+}
+
 fn spawn_detached_monitor(
 	process: Arc<NamedProcess>,
 	mut child: Option<process::Child>,
@@ -2066,9 +2238,7 @@ fn spawn_detached_monitor(
 				cancelled = true;
 				let _ = process.control.spawns.signal(ProcessSignal::Terminate);
 				thread::sleep(cancel.grace);
-				if process.identity.verify().unwrap_or(false) {
-					let _ = process.control.spawns.signal(ProcessSignal::Kill);
-				}
+				let _ = process.control.spawns.signal(ProcessSignal::Kill);
 			}
 			let status = if let Some(child) = child.as_mut() {
 				child.try_wait().ok().flatten().map(|status| status.code())
@@ -2092,12 +2262,20 @@ fn spawn_detached_monitor(
 		};
 		process.control.finished.store(true, Ordering::Release);
 		runtime.spawn(async move {
-			settle_named_process(process, exit_code, cancelled);
+			let timed_out = process.timed_out.load(Ordering::Acquire);
+			settle_named_process(process, exit_code, cancelled && !timed_out, timed_out);
 		});
 	});
 }
 
-fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, cancelled: bool) {
+fn settle_named_process(
+	process: Arc<NamedProcess>,
+	exit_code: Option<i32>,
+	cancelled: bool,
+	timed_out: bool,
+) {
+	process.deadline_cancel.cancel();
+	close_private_session(&process);
 	let Some(inner) = process.host.upgrade() else {
 		return;
 	};
@@ -2111,7 +2289,7 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 	if !current || process_state_is_terminal(process.stream.lock().info.state) {
 		return;
 	}
-	let failed = exit_code.is_none_or(|code| code != 0) && !cancelled;
+	let failed = timed_out || exit_code.is_none_or(|code| code != 0) && !cancelled;
 	let uptime = process.started_at.elapsed();
 	let restart_delay = if process.stopping.load(Ordering::Acquire) || cancelled {
 		None
@@ -2123,14 +2301,18 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 		let mut stream = process.stream.lock();
 		stream.info.restart_count = supervisor.restart_count;
 		stream.info.consecutive_failures = supervisor.consecutive_failures;
-		stream.info.status = Some(if cancelled {
+		stream.info.status = Some(if timed_out {
+			RunTerminal::Timeout.status(uptime)
+		} else if cancelled {
 			RunTerminal::Cancelled.status(uptime)
 		} else {
 			exit_code
 				.map_or(RunTerminal::Failed, RunTerminal::Exited)
 				.status(uptime)
 		});
-		stream.info.state = if cancelled {
+		stream.info.state = if timed_out {
+			ProcessState::Failed as i32
+		} else if cancelled {
 			ProcessState::Stopped as i32
 		} else if failed {
 			ProcessState::Failed as i32
@@ -2142,7 +2324,9 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 		let info = stream.info.clone();
 		stream.broadcast(ProcessEvent::State(info));
 	}
-	let phase = if cancelled {
+	let phase = if timed_out {
+		ProcessPhase::Failed
+	} else if cancelled {
 		ProcessPhase::Stopped
 	} else if failed {
 		ProcessPhase::Failed
@@ -2159,6 +2343,7 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 	let name = process.name.clone();
 	let generation = process.generation.saturating_add(1);
 	let detached = process.detached;
+	let timeout = process.timeout;
 	tokio::spawn(async move {
 		time::sleep(delay).await;
 		if process.stopping.load(Ordering::Acquire) {
@@ -2173,11 +2358,11 @@ fn settle_named_process(process: Arc<NamedProcess>, exit_code: Option<i32>, canc
 		}
 		if detached {
 			let _ = host
-				.launch_detached(name, spec, ready, generation, record.as_ref())
+				.launch_detached(name, spec, ready, generation, record.as_ref(), timeout)
 				.await;
 		} else {
 			let _ = host
-				.launch_attached(name, spec, ready, generation, record.as_ref())
+				.launch_attached(name, spec, ready, generation, record.as_ref(), timeout)
 				.await;
 		}
 	});
@@ -2536,7 +2721,9 @@ async fn forward_named_process(process: Arc<NamedProcess>, run: ExecRun, _exec: 
 				let exit_code = status.and_then(|status| status.exit_code);
 				let cancelled =
 					status.is_some_and(|status| status.outcome == ExecOutcome::Cancelled as i32);
-				settle_named_process(process, exit_code, cancelled);
+				let timed_out =
+					status.is_some_and(|status| status.outcome == ExecOutcome::Timeout as i32);
+				settle_named_process(process, exit_code, cancelled, timed_out);
 				break;
 			},
 			event => route_named_event(&process, event),
@@ -2892,6 +3079,144 @@ mod tests {
 			}),
 			Err(ExecError::StaleFinalCwdRevision),
 		));
+	}
+
+	async fn wait_for_terminal(host: &ExecHost, name: &str, generation: u64) -> ProcessInfo {
+		time::timeout(Duration::from_secs(5), async {
+			loop {
+				let info = host
+					.get_process(&GetProcess {
+						name: name.to_owned(),
+						generation,
+						wire_revision: omp_proto::SCHEMA_REV,
+						props: Default::default(),
+					})
+					.unwrap();
+				if process_state_is_terminal(info.state) {
+					return info;
+				}
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("named process should settle")
+	}
+
+	fn process_request(name: &str, root: &Path, source: &str) -> StartProcess {
+		StartProcess {
+			name: name.to_owned(),
+			spec: Some(ProcessSpec {
+				source: Some(v1::Script { text: source.to_owned(), ..Default::default() }),
+				cwd_uri: Url::from_directory_path(root).unwrap().to_string(),
+				restart: Some(v1::RestartSpec {
+					policy: RestartPolicy::Never as i32,
+					..Default::default()
+				}),
+				..Default::default()
+			}),
+			..Default::default()
+		}
+	}
+
+	#[tokio::test]
+	async fn terminal_name_reuse_advances_generation_and_closes_private_sessions() {
+		let root = tempfile::tempdir().unwrap();
+		let host = ExecHost::new();
+		let first = host
+			.start_process(process_request("reuse-lifecycle", root.path(), "printf first"))
+			.await
+			.unwrap();
+		wait_for_terminal(&host, &first.name, first.generation).await;
+		assert!(host.inner.sessions.lock().is_empty());
+
+		let second = host
+			.start_process(process_request("reuse-lifecycle", root.path(), "printf second"))
+			.await
+			.unwrap();
+		assert_eq!(second.generation, first.generation + 1);
+		wait_for_terminal(&host, &second.name, second.generation).await;
+		assert!(host.inner.sessions.lock().is_empty());
+	}
+
+	#[tokio::test]
+	async fn named_process_timeout_settles_failed_and_releases_its_deadline_and_session() {
+		let root = tempfile::tempdir().unwrap();
+		let host = ExecHost::new();
+		let started = host
+			.start_process_with_timeout(
+				process_request("deadline-lifecycle", root.path(), "sleep 30"),
+				Some(Duration::from_millis(25)),
+			)
+			.await
+			.unwrap();
+		let info = wait_for_terminal(&host, &started.name, started.generation).await;
+		assert_eq!(info.state, ProcessState::Failed as i32);
+		assert_eq!(
+			info.status.as_ref().map(|status| status.outcome),
+			Some(ExecOutcome::Timeout as i32),
+		);
+		let process = host
+			.inner
+			.processes
+			.lock()
+			.get(started.name.as_str())
+			.cloned()
+			.unwrap();
+		assert!(process.deadline_cancel.is_cancelled());
+		assert!(process.private_session.lock().is_none());
+		assert!(host.inner.sessions.lock().is_empty());
+	}
+
+	#[tokio::test]
+	async fn foreground_detach_transfers_remaining_output_to_named_log() {
+		let root = tempfile::tempdir().unwrap();
+		let host = ExecHost::new();
+		let opened = host
+			.open_session(OpenSessionRequest {
+				cwd_uri: Url::from_directory_path(root.path()).unwrap().to_string(),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let (started, run) = host
+			.exec(
+				ExecRequest {
+					session: opened.session.clone(),
+					source: Some(v1::Script {
+						text: String::from("printf before; sleep 0.1; printf after"),
+						..Default::default()
+					}),
+					..Default::default()
+				},
+				None,
+			)
+			.await
+			.unwrap();
+		loop {
+			match run.next_event().await {
+				Some(ExecEvent::Output(output)) if output.data.as_ref() == b"before" => break,
+				Some(_) => {},
+				None => panic!("foreground event stream closed before detachment"),
+			}
+		}
+		let detached = host.detach_exec(&started.exec, "detach-output").unwrap();
+		drop(run);
+		wait_for_terminal(&host, &detached.name, detached.generation).await;
+		let attachment = host
+			.attach_output(&AttachOutput {
+				name: detached.name,
+				generation: detached.generation,
+				max_bytes: 1024,
+				..Default::default()
+			})
+			.unwrap();
+		let output = attachment
+			.backlog
+			.iter()
+			.flat_map(|frame| frame.data.iter().copied())
+			.collect::<Vec<_>>();
+		assert_eq!(output, b"after");
+		host.close_session(&opened.session).unwrap();
 	}
 
 	#[test]

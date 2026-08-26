@@ -51,13 +51,29 @@ pub(crate) async fn invoke(
 	};
 	let timeout = McpTimeout::resolve(None, timeout_ms);
 	let idempotent = is_idempotent(&definition);
-	let mut connection = match manager.connection(&server, &cancel).await {
-		Ok(connection) => connection,
-		Err(ManagerError::Cancelled) => return Err(McpServiceError::Cancelled),
-		Err(_) => manager
-			.reconnect_for_invoke(&server)
-			.await
-			.map_err(manager_error)?,
+	let acquisition = async {
+		match manager.connection(&server, &cancel).await {
+			Ok(connection) => Ok(connection),
+			Err(ManagerError::Cancelled) => Err(ManagerError::Cancelled),
+			Err(_) => manager.reconnect_for_invoke(&server).await,
+		}
+	};
+	let mut connection = match timeout.run(&cancel, acquisition).await {
+		Ok(Ok(connection)) => connection,
+		Ok(Err(ManagerError::Cancelled)) | Err(McpDeadlineError::Cancelled) => {
+			return Err(McpServiceError::Cancelled);
+		},
+		Ok(Err(error)) => return Err(manager_error(error)),
+		Err(McpDeadlineError::TimedOut) => {
+			return Ok(error_result(
+				request,
+				DispatchState::PreDispatch,
+				"MCP connection timed out",
+				0,
+				false,
+				false,
+			));
+		},
 	};
 	let mut retry_count = 0_u32;
 	let mut auth_retried = false;

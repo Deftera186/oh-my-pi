@@ -12,7 +12,7 @@ pub use bridge::{
 };
 pub use bridge::{
 	BridgeHostError, BridgeProgressSink, EvalSessionConfig, NoopBridgeProgress, PRELUDE_PREFIX,
-	ParentSessionHost, SessionBridgeHost,
+	ParentBindingLease, ParentSessionHost, SessionBridgeHost,
 };
 pub(crate) use bridge::{
 	PRELUDE_PYTHON_KEYWORDS, PRELUDE_RESERVED_NAMES, PreludeHelper, PreludeInvoker,

@@ -23,7 +23,7 @@ use omp_tools::{
 	read::{
 		ReadSources as _, archive,
 		resolver::{ResolverTable, Scheme},
-		selector::parse_uri,
+		selector::{ParsedSelector, parse_uri},
 		web,
 	},
 };
@@ -72,14 +72,22 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 	) -> impl Future<Output = Result<SearchResult, grep::Fault>> + Send + '_ {
 		let host = self.host.clone();
 		let read_sources = self.read_sources.clone();
+		let resolvers = sync::Arc::clone(&self.resolvers);
 		async move {
 			let cancel = CancellationToken::new();
 			let cancel_on_drop = CancelOnDrop(cancel.clone());
 			let deadline = Instant::now()
 				.checked_add(Duration::from_millis(u64::from(request.timeout_ms)))
 				.unwrap_or_else(Instant::now);
-			let external =
-				materialize_external_roots(&host, &read_sources, &request, deadline, &cancel).await?;
+			let external = materialize_external_roots(
+				&host,
+				&read_sources,
+				&resolvers,
+				&request,
+				deadline,
+				&cancel,
+			)
+			.await?;
 			let operation = task::spawn_blocking(move || {
 				search_blocking(&host, request, external, deadline, &cancel)
 			});
@@ -269,6 +277,7 @@ struct ExternalMaterialization {
 async fn materialize_external_roots(
 	host: &WorkspaceHost,
 	sources: &ReadSourceAdapter,
+	resolvers: &ResolverTable<UrlResolver>,
 	request: &grep::SearchRequest,
 	deadline: Instant,
 	cancel: &CancellationToken,
@@ -276,6 +285,11 @@ async fn materialize_external_roots(
 	let mut materialized = ExternalMaterialization::default();
 	for (root_index, root) in request.roots.iter().enumerate() {
 		check_grep_cancel(cancel)?;
+		if root.original != root.path
+			&& resolve_literal_grep_target(host, root.original.as_str())?.is_some()
+		{
+			continue;
+		}
 		let remaining =
 			Duration::from_millis(u64::from(remaining_millis(deadline).ok_or(grep::Fault::TimedOut)?));
 		match root.kind {
@@ -301,6 +315,13 @@ async fn materialize_external_roots(
 				let target = time::timeout(remaining, materialize_url_root(sources, root, root_index))
 					.await
 					.map_err(|_| grep::Fault::TimedOut)??;
+				materialized.by_root.insert(root_index, vec![target]);
+			},
+			SearchRootKind::Internal => {
+				let target =
+					time::timeout(remaining, materialize_internal_root(resolvers, root, root_index))
+						.await
+						.map_err(|_| grep::Fault::TimedOut)??;
 				materialized.by_root.insert(root_index, vec![target]);
 			},
 		}
@@ -427,6 +448,29 @@ async fn materialize_url_root<C: web::types::HttpClient + Sync>(
 	})
 }
 
+async fn materialize_internal_root(
+	resolvers: &ResolverTable<UrlResolver>,
+	root: &SearchRoot,
+	root_index: usize,
+) -> Result<MemorySearchTarget, grep::Fault> {
+	let parsed = parse_uri(root.path.as_str())
+		.map_err(grep_workspace_message)?
+		.ok_or_else(|| grep_workspace_message(format!("invalid internal URI: {}", root.path)))?;
+	let content = resolvers
+		.read_query(parsed.scheme, &parsed.resource, parsed.query, &ParsedSelector::None)
+		.await
+		.ok_or_else(|| {
+			grep_workspace_message(format!("unsupported internal URI scheme: {}", parsed.raw_scheme))
+		})?
+		.map_err(|error| grep_workspace_message(error.message()))?;
+	Ok(MemorySearchTarget {
+		root_index: u64::try_from(root_index).unwrap_or(u64::MAX),
+		source_key: root.path.clone(),
+		path:       root.path.clone(),
+		content:    content.into_bytes(),
+	})
+}
+
 #[derive(Debug)]
 struct PendingSnapshot {
 	path: PathBuf,
@@ -443,8 +487,17 @@ fn search_blocking(
 	let mut targets = Vec::new();
 	let mut missing_paths = Vec::new();
 	for (root_index, root) in request.roots.iter().enumerate() {
+		let literal_original = if root.original == root.path {
+			None
+		} else {
+			resolve_literal_grep_target(host, root.original.as_str())?
+		};
+		if let Some(GrepTarget::Filesystem { path, glob, is_file, .. }) = literal_original {
+			targets.push(GrepTarget::Filesystem { root_index: u64::MAX, path, glob, is_file });
+			continue;
+		}
 		match root.kind {
-			SearchRootKind::Archive | SearchRootKind::Url => {
+			SearchRootKind::Archive | SearchRootKind::Url | SearchRootKind::Internal => {
 				targets.extend(
 					external
 						.by_root
@@ -454,29 +507,17 @@ fn search_blocking(
 						.map(GrepTarget::Memory),
 				);
 			},
-			SearchRootKind::Filesystem => {
-				let literal_original = if root.original == root.path {
-					None
-				} else {
-					resolve_literal_grep_target(host, root.original.as_str())?
-				};
-				let literal_won = literal_original.is_some();
-				match literal_original.or(resolve_grep_target(host, root.path.as_str())?) {
-					Some(GrepTarget::Filesystem { path, glob, is_file, .. }) => {
-						targets.push(GrepTarget::Filesystem {
-							root_index: if literal_won {
-								u64::MAX
-							} else {
-								u64::try_from(root_index).unwrap_or(u64::MAX)
-							},
-							path,
-							glob,
-							is_file,
-						});
-					},
-					Some(GrepTarget::Memory(_)) => unreachable!("filesystem resolver returned memory"),
-					None => missing_paths.push(root.original.clone()),
-				}
+			SearchRootKind::Filesystem => match resolve_grep_target(host, root.path.as_str())? {
+				Some(GrepTarget::Filesystem { path, glob, is_file, .. }) => {
+					targets.push(GrepTarget::Filesystem {
+						root_index: u64::try_from(root_index).unwrap_or(u64::MAX),
+						path,
+						glob,
+						is_file,
+					});
+				},
+				Some(GrepTarget::Memory(_)) => unreachable!("filesystem resolver returned memory"),
+				None => missing_paths.push(root.original.clone()),
 			},
 		}
 	}
@@ -1373,6 +1414,23 @@ mod tests {
 
 		assert_eq!(result.matches.len(), 1);
 		assert_eq!(result.matches[0].path, Str::from(source.to_string_lossy().replace('\\', "/")),);
+	}
+
+	#[tokio::test]
+	async fn literal_selector_shaped_filename_wins_before_internal_materialization() {
+		let directory = tempfile::tempdir().expect("temp directory");
+		fs::write(directory.path().join("test:1-2"), "needle\n").expect("write literal source");
+		let adapter = connected_search_adapter(directory.path()).await;
+		let mut request = search_request("test", SearchRootKind::Internal, 5_000);
+		request.roots[0].original = sf!("test:1-2");
+
+		let result =
+			time::timeout(Duration::from_secs(2), WorkspaceSearch::search(&adapter, request))
+				.await
+				.expect("literal search stayed bounded")
+				.expect("literal search succeeded");
+		assert_eq!(result.matches.len(), 1);
+		assert_eq!(result.matches[0].path.as_str(), "test:1-2");
 	}
 
 	#[tokio::test]

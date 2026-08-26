@@ -451,6 +451,20 @@ impl Mailbox {
 	/// before eligibility is evaluated, so an immediate-point drain retains
 	/// them.
 	pub fn drain(&mut self, point: DrainPoint, defer_interrupts: bool) -> Vec<Interrupt> {
+		self.drain_steering(point, defer_interrupts, usize::MAX)
+	}
+
+	/// Drains eligible interrupts while admitting at most `steering_limit`
+	/// queued user/peer steering messages.
+	///
+	/// Non-steering continuations and durable settlements are never throttled by
+	/// presentation queue mode.
+	pub fn drain_steering(
+		&mut self,
+		point: DrainPoint,
+		defer_interrupts: bool,
+		steering_limit: usize,
+	) -> Vec<Interrupt> {
 		self.service_commands();
 		self.pump(defer_interrupts);
 		if defer_interrupts {
@@ -458,13 +472,19 @@ impl Mailbox {
 		}
 
 		let mut drained = Vec::new();
+		let mut steering = 0usize;
 		for class in 0..=point.highest_class() {
 			let queued = self.backlog.len();
 			for _ in 0..queued {
 				let Some(interrupt) = self.backlog.pop_front() else {
 					break;
 				};
-				if interrupt.class.index() == class {
+				if interrupt.class.index() == class
+					&& (!is_steering(&interrupt) || steering < steering_limit)
+				{
+					if is_steering(&interrupt) {
+						steering = steering.saturating_add(1);
+					}
 					drained.push(interrupt);
 				} else {
 					self.backlog.push_back(interrupt);
@@ -580,6 +600,19 @@ impl Mailbox {
 		}
 	}
 }
+fn is_steering(interrupt: &Interrupt) -> bool {
+	let user_message = matches!(
+		interrupt.item.kind.as_ref(),
+		Some(item::Kind::Message(message)) if message.role == thread::Role::User as i32
+	);
+	user_message
+		&& matches!(
+			&interrupt.source,
+			InterruptSource::Producer(_)
+				| InterruptSource::Peer { .. }
+				| InterruptSource::Remote { .. }
+		)
+}
 
 #[cfg(test)]
 mod tests {
@@ -597,6 +630,32 @@ mod tests {
 			})),
 			props:         None,
 		}
+	}
+
+	#[test]
+	fn one_at_a_time_throttles_only_steering_messages() {
+		let mut mailbox = Mailbox::new();
+		let sender = mailbox.sender();
+		for source in [
+			InterruptSource::Producer(sf!("first")),
+			InterruptSource::Continuation { owner: sf!("system") },
+			InterruptSource::Producer(sf!("second")),
+		] {
+			sender
+				.try_enqueue(Interrupt { class: InterruptClass::Immediate, item: item(), source })
+				.expect("enqueue interrupt");
+		}
+		let first = mailbox.drain_steering(DrainPoint::Immediate, false, 1);
+		assert_eq!(first.len(), 2, "continuations are not throttled");
+		assert!(first.iter().any(|interrupt| {
+			matches!(&interrupt.source, InterruptSource::Producer(name) if name.as_str() == "first")
+		}));
+		let second = mailbox.drain_steering(DrainPoint::Immediate, false, 1);
+		assert_eq!(second.len(), 1);
+		assert!(matches!(
+			&second[0].source,
+			InterruptSource::Producer(name) if name.as_str() == "second"
+		));
 	}
 
 	#[test]

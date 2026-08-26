@@ -8,7 +8,6 @@ use std::{
 	future::{Future, ready},
 	ops::Range,
 	path::{Path, PathBuf},
-	slice,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -27,7 +26,7 @@ use omp_tool::{
 };
 use omp_tools::read::{
 	self, DirectoryEntry, DirectorySource, Fault, ReadBlobs, ReadLease, ReadSources, SnapshotRecord,
-	SourceKind, SourceStat,
+	SourceKind, SourceStat, StoredArtifact,
 	resolver::{
 		ArtifactCatalog, ArtifactRecord, ArtifactResolver, BlobAuthority, BlobStat, LineOffsetCache,
 		Resolve, ResolverTable, Scheme, SchemeEntry,
@@ -101,7 +100,7 @@ impl ReadSources for Sources {
 			.files
 			.get(path.as_str())
 			.map(|source| Lease {
-				canonical_path: source.stat.canonical_path.clone(),
+				canonical_path: path.clone(),
 				revision:       source.revision.clone(),
 				bytes:          source.bytes.clone(),
 			})
@@ -165,6 +164,18 @@ impl ReadBlobs for Blobs {
 	) -> impl Future<Output = Result<BlobRef, Fault>> + Send + '_ {
 		self.stored.lock().push((bytes.clone(), media_type.clone()));
 		ready(Ok(BlobRef { hash: sf!("blob-hash"), media_type, byte_len: bytes.len() as u64 }))
+	}
+
+	fn store_artifact(
+		&self,
+		bytes: Bytes,
+		media_type: Str,
+	) -> impl Future<Output = Result<StoredArtifact, Fault>> + Send + '_ {
+		self.stored.lock().push((bytes.clone(), media_type.clone()));
+		ready(Ok(StoredArtifact {
+			blob: BlobRef { hash: sf!("blob-hash"), media_type, byte_len: bytes.len() as u64 },
+			uri:  sf!("artifact://1"),
+		}))
 	}
 }
 
@@ -248,6 +259,26 @@ impl BlobAuthority for BlobAuthorityFixture {
 	}
 }
 
+#[derive(Clone)]
+struct MetadataOnlyAuthority {
+	reads: Arc<AtomicU64>,
+}
+
+impl BlobAuthority for MetadataOnlyAuthority {
+	async fn stat(&self, _digest: &str) -> Result<BlobStat, Fault> {
+		Ok(BlobStat { byte_len: 9 * 1024 * 1024 })
+	}
+
+	async fn read_range(
+		&self,
+		_digest: &str,
+		_range: Range<u64>,
+	) -> Result<CowBytes<'static>, Fault> {
+		self.reads.fetch_add(1, Ordering::Relaxed);
+		Ok(CowBytes::from_static(b"unexpected"))
+	}
+}
+
 impl Sources {
 	fn file(&self, path: &str, bytes: impl Into<Bytes>) {
 		self.file_as(path, path, path, bytes);
@@ -267,7 +298,8 @@ impl Sources {
 			revision: sf!("revision-7"),
 		};
 		self.files.insert(authored.to_owned(), source.clone());
-		self.files.insert(canonical.to_owned(), source);
+		self.files.insert(canonical.to_owned(), source.clone());
+		self.files.insert(display.to_owned(), source);
 	}
 
 	fn directory(&self, path: &str, entries: Vec<DirectoryEntry>) {
@@ -292,9 +324,30 @@ impl Sources {
 			.0
 			.clone();
 		self.files.insert(authored.to_owned(), FileSource {
-			stat:     SourceStat { kind: SourceKind::Symlink, ..target_stat },
+			stat:     SourceStat {
+				display_path: Str::new(authored),
+				kind: SourceKind::Symlink,
+				..target_stat
+			},
 			bytes:    Bytes::new(),
 			revision: sf!("symlink"),
+		});
+	}
+
+	fn file_symlink(&self, authored: &str, target: &str) {
+		let target_source = self
+			.files
+			.get(target)
+			.unwrap_or_else(|| panic!("file symlink target '{target}' exists"))
+			.clone();
+		self.files.insert(authored.to_owned(), FileSource {
+			stat:     SourceStat {
+				display_path: Str::new(authored),
+				kind: SourceKind::Symlink,
+				..target_source.stat
+			},
+			bytes:    target_source.bytes,
+			revision: target_source.revision,
 		});
 	}
 
@@ -340,6 +393,18 @@ async fn text(sources: Sources, raw: &str) -> String {
 	};
 	text.to_string()
 }
+async fn payload(sources: Sources, blobs: Blobs, raw: &str) -> read::Payload {
+	let tool = read::tool(sources, blobs);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::new(raw))
+		.expect("read invocation remains live");
+	let events = tool.call(params).collect::<Vec<_>>().await;
+	let [Ev::Done(ToolTerminal::Done { result: Ok(payload), .. })] = events.as_slice() else {
+		panic!("expected one successful read event: {events:?}");
+	};
+	payload.clone()
+}
 
 async fn assert_truncated_text_spill(sources: Sources, raw: &str, expected: &str) {
 	let blobs = Blobs::default();
@@ -360,7 +425,8 @@ async fn assert_truncated_text_spill(sources: Sources, raw: &str, expected: &str
 	assert_eq!(
 		format!("[truncated: {footer}"),
 		format!(
-			"[truncated: {shown_lines} of {total_lines} lines shown; full output in blob blob-hash]"
+			"[truncated: {shown_lines} of {total_lines} lines shown; read artifact://1 for full \
+			 output]"
 		)
 	);
 	assert_eq!(
@@ -584,6 +650,22 @@ async fn directory_symlink_is_reclassified_before_special_dispatch() {
 }
 
 #[tokio::test]
+async fn file_symlink_keeps_the_authored_alias_in_headers_and_snapshot_keys() {
+	let sources = Sources::default();
+	sources.file("target.txt", "alpha\nbeta\n");
+	sources.file_symlink("alias.txt", "target.txt");
+	assert_eq!(
+		text(sources.clone(), r#"{"path":"alias.txt:1-1"}"#).await,
+		"[alias.txt#A1B2]\n1:alpha\n2:beta"
+	);
+	let snapshots = sources.snapshots.lock();
+	let [snapshot] = snapshots.as_slice() else {
+		panic!("one snapshot must be recorded")
+	};
+	assert_eq!(snapshot.path, "alias.txt");
+}
+
+#[tokio::test]
 async fn line_range_adds_context_header_and_records_the_exposed_snapshot() {
 	let sources = Sources::default();
 	sources.file("file.txt", numbered_lines(12));
@@ -664,6 +746,17 @@ async fn binary_content_is_refused_before_decoding_and_raw_stays_the_escape_hatc
 	// `:raw` decodes losses: invalid bytes surface as U+FFFD replacements.
 	assert_eq!(text(sources, r#"{"path":"garbage.txt:raw"}"#).await, "ok\u{fffd}\u{fffd}not text");
 }
+#[tokio::test]
+async fn truncated_payload_retains_resolver_valid_artifact_reference() {
+	let sources = Sources::default();
+	sources.file("large.txt", numbered_lines(4000));
+	let payload = payload(sources, Blobs::default(), r#"{"path":"large.txt"}"#).await;
+	let [artifact] = payload.artifacts.as_slice() else {
+		panic!("one complete text spill must be retained: {:?}", payload.artifacts);
+	};
+	assert_eq!(artifact.uri, "artifact://1");
+	assert_eq!(artifact.blob.hash, "blob-hash");
+}
 
 #[tokio::test]
 async fn invalid_bytes_past_the_sniff_window_still_refuse_non_raw_reads() {
@@ -714,7 +807,9 @@ async fn standard_text_truncation_spills_the_complete_numbered_projection() {
 	let visible = full.lines().take(3000).collect::<Vec<_>>().join("\n");
 	assert_eq!(
 		text.as_str(),
-		format!("{visible}\n\n[truncated: 3000 of 4001 lines shown; full output in blob blob-hash]")
+		format!(
+			"{visible}\n\n[truncated: 3000 of 4001 lines shown; read artifact://1 for full output]"
+		)
 	);
 
 	let stored = blobs.stored.lock();
@@ -1498,15 +1593,23 @@ async fn artifact_resolver_stats_authority_caches_offsets_and_gates_digest_form_
 
 	let selected = read::selector::parse_selector(Some("2-3")).unwrap();
 	let first = resolver.read("7", &selected).await.unwrap();
-	assert_eq!(&*first, b"two\nthree\n");
-	assert_eq!(first.as_ptr(), bytes.as_ptr().wrapping_add(4));
+	assert_eq!(&*first, b"1:one\n2:two\n3:three");
 	assert_eq!(stats.load(Ordering::Relaxed), 1);
-	assert_eq!(ranges.lock().as_slice(), slice::from_ref(&(0..bytes.len() as u64)));
+	assert_eq!(
+		ranges.lock().as_slice(),
+		&[0..1, 1..bytes.len() as u64, 0..bytes.len() as u64],
+		"the first artifact range indexes through bounded reads before loading its selected window"
+	);
 
-	let first_line = read::selector::parse_selector(Some("1-1")).unwrap();
-	assert_eq!(&*resolver.read("7", &first_line).await.unwrap(), b"one\n");
+	let first_line = read::selector::parse_selector(Some("raw:1-1")).unwrap();
+	assert_eq!(&*resolver.read("7", &first_line).await.unwrap(), b"one");
 	assert_eq!(stats.load(Ordering::Relaxed), 2);
-	assert_eq!(ranges.lock().as_slice(), &[0..bytes.len() as u64, 0..4]);
+	assert_eq!(ranges.lock().as_slice(), &[
+		0..1,
+		1..bytes.len() as u64,
+		0..bytes.len() as u64,
+		0..4
+	]);
 
 	let error = resolver
 		.read(digest.as_str(), &ParsedSelector::None)
@@ -1529,6 +1632,46 @@ async fn artifact_resolver_stats_authority_caches_offsets_and_gates_digest_form_
 		bytes.as_ref()
 	);
 	assert_eq!(stats.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn artifact_raw_size_guard_uses_metadata_before_loading_blob_bytes() {
+	let reads = Arc::new(AtomicU64::new(0));
+	let resolver = ArtifactResolver::new(
+		ArtifactCatalogFixture {
+			record: ArtifactRecord {
+				digest:   Str::new("c".repeat(64)),
+				lifetime: ArtifactLifetime::Session,
+			},
+		},
+		MetadataOnlyAuthority { reads: reads.clone() },
+	);
+	let error = resolver.read("7", &ParsedSelector::Raw).await.unwrap_err();
+	assert!(matches!(error, Fault::Invalid { .. }));
+	assert_eq!(reads.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn artifact_ranges_format_disjoint_spans_and_do_not_address_terminal_newlines() {
+	let digest = Str::new("b".repeat(64));
+	let bytes = CowBytes::from_static(b"one\ntwo\nthree\nfour\n");
+	let ranges = Arc::new(Mutex::new(Vec::new()));
+	let resolver = ArtifactResolver::new(
+		ArtifactCatalogFixture {
+			record: ArtifactRecord { digest, lifetime: ArtifactLifetime::Session },
+		},
+		BlobAuthorityFixture { bytes, stats: Arc::new(AtomicU64::new(0)), ranges },
+	);
+
+	let numbered = read::selector::parse_selector(Some("1-1,3-3")).unwrap();
+	assert_eq!(&*resolver.read("7", &numbered).await.unwrap(), b"1:one\n\xe2\x80\xa6\n3:three");
+	let raw = read::selector::parse_selector(Some("raw:2-2,4-4")).unwrap();
+	assert_eq!(&*resolver.read("7", &raw).await.unwrap(), b"two\n\n\xe2\x80\xa6\n\nfour");
+	let phantom = read::selector::parse_selector(Some("5-5")).unwrap();
+	assert_eq!(
+		String::from_utf8_lossy(&resolver.read("7", &phantom).await.unwrap()),
+		"[Range 5-5 is beyond end of artifact://7 (4 lines total); skipped]"
+	);
 }
 
 #[tokio::test]

@@ -225,6 +225,69 @@ pub struct ContextView {
 	pub refs: SmallVec<MessageRef, 64>,
 }
 
+/// Fail-open error returned by a session context projection handler.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{message}")]
+pub struct ContextProjectionError {
+	message: Str,
+}
+
+impl ContextProjectionError {
+	/// Creates a handler error with a stable diagnostic message.
+	pub fn new(message: impl Into<Str>) -> Self {
+		Self { message: message.into() }
+	}
+
+	/// Returns the handler-supplied diagnostic.
+	pub const fn message(&self) -> &Str {
+		&self.message
+	}
+}
+
+/// One revision-bound patch decision returned by a projection handler.
+#[derive(Clone, Debug)]
+pub struct ContextPatchSet {
+	base_snapshot_rev:   u64,
+	derived_ir_revision: u32,
+	patches:             Box<[PatchOp]>,
+}
+
+impl ContextPatchSet {
+	/// Creates a patch decision for one exact durable context revision.
+	pub fn new(
+		base_snapshot_rev: u64,
+		derived_ir_revision: u32,
+		patches: impl Into<Box<[PatchOp]>>,
+	) -> Self {
+		Self { base_snapshot_rev, derived_ir_revision, patches: patches.into() }
+	}
+
+	/// Returns the durable context revision this decision observed.
+	pub const fn base_snapshot_rev(&self) -> u64 {
+		self.base_snapshot_rev
+	}
+
+	/// Returns the non-zero handler IR revision used for this decision.
+	pub const fn derived_ir_revision(&self) -> u32 {
+		self.derived_ir_revision
+	}
+
+	/// Returns the ordered context operations.
+	pub fn patches(&self) -> &[PatchOp] {
+		&self.patches
+	}
+}
+
+/// Synchronous session-local policy for model-facing context projection.
+pub trait ContextProjectionHandler: Send + Sync + 'static {
+	/// Produces bounded patch operations for the supplied immutable view.
+	fn project(
+		&self,
+		base_snapshot_rev: u64,
+		view: &ContextView,
+	) -> Result<ContextPatchSet, ContextProjectionError>;
+}
+
 /// A bounded patch operation returned by a projection handler.
 #[derive(Clone, Debug)]
 pub enum PatchOp {

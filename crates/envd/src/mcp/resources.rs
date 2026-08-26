@@ -11,26 +11,7 @@ use super::transport::{McpTransport, TransportError, TransportFailure};
 
 const MAX_PAGES: usize = 1_024;
 
-/// Selects the most-specific RFC 6570 template whose literal segments occur in
-/// order in `uri`. More literal bytes win; ties are lexical and deterministic.
-pub fn best_template<'a>(
-	templates: &'a [ResourceTemplate],
-	uri: &str,
-) -> Option<&'a ResourceTemplate> {
-	templates
-		.iter()
-		.filter_map(|template| {
-			template_match_score(template.uri_template.as_str(), uri).map(|score| (score, template))
-		})
-		.max_by(|(left_score, left), (right_score, right)| {
-			left_score
-				.cmp(right_score)
-				.then_with(|| right.uri_template.cmp(&left.uri_template))
-		})
-		.map(|(_, template)| template)
-}
-
-fn template_match_score(template: &str, uri: &str) -> Option<usize> {
+pub(crate) fn template_match_score(template: &str, uri: &str) -> Option<usize> {
 	let mut remainder = uri;
 	let mut literal_bytes = 0usize;
 	let mut cursor = 0usize;

@@ -399,7 +399,7 @@ mod tests {
 	fn typed_projection_and_registration_share_one_domain() {
 		let expected = ToolSettings {
 			approval_mode: ApprovalMode::Write,
-			approval: BTreeMap::from([(sf!("shell"), ApprovalPolicy::Deny)]),
+			approval: BTreeMap::from([(sf!("bash"), ApprovalPolicy::Deny)]),
 			..ToolSettings::default()
 		};
 		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated settings");
@@ -417,14 +417,14 @@ mod tests {
 	#[test]
 	fn override_is_applied_to_declared_effect_tier() {
 		let settings = ToolSettings {
-			approval: BTreeMap::from([(sf!("shell"), ApprovalPolicy::Deny)]),
+			approval: BTreeMap::from([(sf!("bash"), ApprovalPolicy::Deny)]),
 			..ToolSettings::default()
 		};
 		let effects = Effects {
 			exec: Some(ExecEffects { commands: [sf!("*")].into(), network: true }),
 			..Effects::empty()
 		};
-		let decision = settings.approval_for("call-1", "shell", &effects);
+		let decision = settings.approval_for("call-1", "bash", &effects);
 		assert_eq!(decision.tier, ApprovalTier::Exec);
 		assert_eq!(decision.policy, ApprovalPolicy::Deny);
 		assert_eq!(decision.source, ApprovalSource::User);
@@ -443,15 +443,11 @@ mod tests {
 			.clone()
 			.with_approval_mode_override(Some(ApprovalMode::Yolo));
 		assert_eq!(
-			overridden
-				.approval_for("override", "shell", &effects)
-				.policy,
+			overridden.approval_for("override", "bash", &effects).policy,
 			ApprovalPolicy::Allow
 		);
 		assert_eq!(
-			persisted
-				.approval_for("persisted", "shell", &effects)
-				.policy,
+			persisted.approval_for("persisted", "bash", &effects).policy,
 			ApprovalPolicy::Prompt
 		);
 

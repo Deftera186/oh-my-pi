@@ -2,7 +2,9 @@
 
 use std::{
 	collections::BTreeMap,
-	fs, io,
+	fs,
+	future::Future,
+	io,
 	net::SocketAddr,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -355,17 +357,27 @@ impl SshService {
 		self.capabilities.read().get(alias).copied()
 	}
 
-	async fn connect(&self, alias: &str) -> Result<client::Handle<ClientHandler>, SshError> {
+	async fn with_deadline<T>(
+		&self,
+		alias: &str,
+		operation: impl Future<Output = Result<T, SshError>>,
+	) -> Result<T, SshError> {
 		let host = self.hosts.get(alias)?;
 		let timeout = Duration::from_secs(host.timeout_secs.clamp(1, MAX_TIMEOUT_SECS));
+		let deadline = time::Instant::now() + timeout;
+		time::timeout_at(deadline, operation)
+			.await
+			.map_err(|_| SshError::Timeout)?
+	}
+
+	async fn connect(&self, alias: &str) -> Result<client::Handle<ClientHandler>, SshError> {
+		let host = self.hosts.get(alias)?;
 		let connect = client::connect(
 			Arc::new(client::Config::default()),
 			(host.address.as_str(), host.port),
 			ClientHandler { expected: host.host_key.clone() },
 		);
-		let mut session = time::timeout(timeout, connect)
-			.await
-			.map_err(|_| SshError::Timeout)??;
+		let mut session = connect.await?;
 		let authenticated = match &host.auth {
 			AuthPolicy::Key { path } => {
 				check_key_permissions(path)?;
@@ -405,11 +417,15 @@ impl SshService {
 	/// Initializes SFTP, then marks both SFTP and exec available without running
 	/// a probe command.
 	pub async fn probe(&self, alias: &str) -> Result<HostCapabilities, SshError> {
-		let _ = self.sftp(alias).await?;
-		let mut caps = self.cached_capabilities(alias).unwrap_or_default();
-		caps.exec = true;
-		self.capabilities.write().insert(Str::new(alias), caps);
-		Ok(caps)
+		self
+			.with_deadline(alias, async {
+				let _ = self.sftp(alias).await?;
+				let mut caps = self.cached_capabilities(alias).unwrap_or_default();
+				caps.exec = true;
+				self.capabilities.write().insert(Str::new(alias), caps);
+				Ok(caps)
+			})
+			.await
 	}
 
 	/// Reads a non-directory SFTP path without shell escaping or path rewriting.
@@ -423,25 +439,30 @@ impl SshService {
 		path: &str,
 		max_bytes: usize,
 	) -> Result<CowBytes<'static>, SshError> {
-		let limit = max_bytes.min(DEFAULT_READ_LIMIT);
-		let sftp = self.sftp(alias).await?;
-		let metadata = sftp.metadata(path).await?;
-		if metadata.file_type().is_dir() {
-			return Err(SshError::IsDirectory);
-		}
-		if metadata.size.unwrap_or(0) > limit as u64 {
-			return Err(SshError::Limit { limit });
-		}
-		let file = sftp.open(path).await?;
-		let mut bytes = Vec::with_capacity(metadata.size.unwrap_or(0).min(limit as u64) as usize);
-		file
-			.take((limit + 1) as u64)
-			.read_to_end(&mut bytes)
-			.await?;
-		if bytes.len() > limit {
-			return Err(SshError::Limit { limit });
-		}
-		Ok(CowBytes::from(bytes))
+		self
+			.with_deadline(alias, async {
+				let limit = max_bytes.min(DEFAULT_READ_LIMIT);
+				let sftp = self.sftp(alias).await?;
+				let metadata = sftp.metadata(path).await?;
+				if metadata.file_type().is_dir() {
+					return Err(SshError::IsDirectory);
+				}
+				if metadata.size.unwrap_or(0) > limit as u64 {
+					return Err(SshError::Limit { limit });
+				}
+				let file = sftp.open(path).await?;
+				let mut bytes =
+					Vec::with_capacity(metadata.size.unwrap_or(0).min(limit as u64) as usize);
+				file
+					.take((limit + 1) as u64)
+					.read_to_end(&mut bytes)
+					.await?;
+				if bytes.len() > limit {
+					return Err(SshError::Limit { limit });
+				}
+				Ok(CowBytes::from(bytes))
+			})
+			.await
 	}
 
 	/// Creates or truncates an SFTP path and writes at most 8 MiB of bytes to
@@ -453,14 +474,18 @@ impl SshService {
 		if bytes.len() > DEFAULT_WRITE_LIMIT {
 			return Err(SshError::Limit { limit: DEFAULT_WRITE_LIMIT });
 		}
-		let sftp = self.sftp(alias).await?;
-		let mut file = sftp
-			.open_with_flags(path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE)
-			.await?;
-		file.write_all(bytes).await?;
-		file.sync_all().await?;
-		file.shutdown().await?;
-		Ok(())
+		self
+			.with_deadline(alias, async {
+				let sftp = self.sftp(alias).await?;
+				let mut file = sftp
+					.open_with_flags(path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE)
+					.await?;
+				file.write_all(bytes).await?;
+				file.sync_all().await?;
+				file.shutdown().await?;
+				Ok(())
+			})
+			.await
 	}
 
 	/// Projects SFTP attributes for `path` into directory status and byte
@@ -469,11 +494,15 @@ impl SshService {
 	/// The UTF-8 path is passed directly to SFTP; an omitted server length is
 	/// reported as zero.
 	pub async fn stat(&self, alias: &str, path: &str) -> Result<RemoteMetadata, SshError> {
-		let metadata = self.sftp(alias).await?.metadata(path).await?;
-		Ok(RemoteMetadata {
-			directory: metadata.file_type().is_dir(),
-			size:      metadata.size.unwrap_or(0),
-		})
+		self
+			.with_deadline(alias, async {
+				let metadata = self.sftp(alias).await?.metadata(path).await?;
+				Ok(RemoteMetadata {
+					directory: metadata.file_type().is_dir(),
+					size:      metadata.size.unwrap_or(0),
+				})
+			})
+			.await
 	}
 
 	/// Lists an SFTP directory in entry-name order, without rewriting its UTF-8
@@ -487,27 +516,31 @@ impl SshService {
 		path: &str,
 		max_entries: usize,
 	) -> Result<(Vec<RemoteEntry>, bool), SshError> {
-		let limit = max_entries.min(DEFAULT_LIST_LIMIT);
-		let mut entries = self
-			.sftp(alias)
-			.await?
-			.read_dir(path)
-			.await?
-			.collect::<Vec<_>>();
-		entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-		let truncated = entries.len() > limit;
-		entries.truncate(limit);
-		Ok((
-			entries
-				.into_iter()
-				.map(|entry| RemoteEntry {
-					name:      Str::new(entry.file_name()),
-					directory: entry.metadata().file_type().is_dir(),
-					size:      entry.metadata().size.unwrap_or(0),
-				})
-				.collect(),
-			truncated,
-		))
+		self
+			.with_deadline(alias, async {
+				let limit = max_entries.min(DEFAULT_LIST_LIMIT);
+				let mut entries = self
+					.sftp(alias)
+					.await?
+					.read_dir(path)
+					.await?
+					.collect::<Vec<_>>();
+				entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+				let truncated = entries.len() > limit;
+				entries.truncate(limit);
+				Ok((
+					entries
+						.into_iter()
+						.map(|entry| RemoteEntry {
+							name:      Str::new(entry.file_name()),
+							directory: entry.metadata().file_type().is_dir(),
+							size:      entry.metadata().size.unwrap_or(0),
+						})
+						.collect(),
+					truncated,
+				))
+			})
+			.await
 	}
 
 	/// Opens a bounded bidirectional channel to one remote command.
@@ -519,12 +552,16 @@ impl SshService {
 		if command.as_bytes().contains(&0) {
 			return Err(SshError::InvalidCommand);
 		}
-		let session = self.connect(alias).await?;
-		let channel = session.channel_open_session().await?;
-		channel.exec(true, command.as_bytes()).await?;
-		let (interactive, inputs, events) = interactive_channel_pair();
-		tokio::spawn(run_interactive_channel(channel, inputs, events));
-		Ok(interactive)
+		self
+			.with_deadline(alias, async {
+				let session = self.connect(alias).await?;
+				let channel = session.channel_open_session().await?;
+				channel.exec(true, command.as_bytes()).await?;
+				let (interactive, inputs, events) = interactive_channel_pair();
+				tokio::spawn(run_interactive_channel(channel, inputs, events));
+				Ok(interactive)
+			})
+			.await
 	}
 
 	/// Binds a loopback listener and forwards accepted TCP connections through
@@ -539,20 +576,24 @@ impl SshService {
 		if remote_host.is_empty() || remote_port == 0 {
 			return Err(SshError::InvalidForwardTarget);
 		}
-		let session = Arc::new(self.connect(alias).await?);
-		let listener = TcpListener::bind(("127.0.0.1", local_port)).await?;
-		let local_addr = listener.local_addr()?;
-		let shutdown = CancellationToken::new();
-		let (error_tx, errors) = flume::bounded(FORWARD_ERROR_CAPACITY);
-		let task = tokio::spawn(run_local_forward(
-			listener,
-			session,
-			Str::new(remote_host),
-			remote_port,
-			shutdown.clone(),
-			error_tx,
-		));
-		Ok(LocalForward { local_addr, errors, shutdown, task: Some(task) })
+		self
+			.with_deadline(alias, async {
+				let session = Arc::new(self.connect(alias).await?);
+				let listener = TcpListener::bind(("127.0.0.1", local_port)).await?;
+				let local_addr = listener.local_addr()?;
+				let shutdown = CancellationToken::new();
+				let (error_tx, errors) = flume::bounded(FORWARD_ERROR_CAPACITY);
+				let task = tokio::spawn(run_local_forward(
+					listener,
+					session,
+					Str::new(remote_host),
+					remote_port,
+					shutdown.clone(),
+					error_tx,
+				));
+				Ok(LocalForward { local_addr, errors, shutdown, task: Some(task) })
+			})
+			.await
 	}
 
 	/// Executes a non-interactive remote command and collects its raw channel
@@ -569,34 +610,38 @@ impl SshService {
 		if command.as_bytes().contains(&0) {
 			return Err(SshError::InvalidCommand);
 		}
-		let limit = max_bytes.min(DEFAULT_EXEC_LIMIT);
-		let session = self.connect(alias).await?;
-		let mut channel = session.channel_open_session().await?;
-		channel.exec(true, command.as_bytes()).await?;
-		let mut stdout = Vec::new();
-		let mut stderr = Vec::new();
-		let mut status = None;
-		while let Some(message) = channel.wait().await {
-			match message {
-				russh::ChannelMsg::Data { data } => append_bounded(&mut stdout, &data, limit)?,
-				russh::ChannelMsg::ExtendedData { data, .. } => {
-					append_bounded(&mut stderr, &data, limit)?
-				},
-				russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
-				_ => {},
-			}
-		}
 		self
-			.capabilities
-			.write()
-			.entry(Str::new(alias))
-			.or_default()
-			.exec = true;
-		Ok(ExecOutput {
-			stdout:      CowBytes::from(stdout),
-			stderr:      CowBytes::from(stderr),
-			exit_status: status,
-		})
+			.with_deadline(alias, async {
+				let limit = max_bytes.min(DEFAULT_EXEC_LIMIT);
+				let session = self.connect(alias).await?;
+				let mut channel = session.channel_open_session().await?;
+				channel.exec(true, command.as_bytes()).await?;
+				let mut stdout = Vec::new();
+				let mut stderr = Vec::new();
+				let mut status = None;
+				while let Some(message) = channel.wait().await {
+					match message {
+						russh::ChannelMsg::Data { data } => append_bounded(&mut stdout, &data, limit)?,
+						russh::ChannelMsg::ExtendedData { data, .. } => {
+							append_bounded(&mut stderr, &data, limit)?
+						},
+						russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+						_ => {},
+					}
+				}
+				self
+					.capabilities
+					.write()
+					.entry(Str::new(alias))
+					.or_default()
+					.exec = true;
+				Ok(ExecOutput {
+					stdout:      CowBytes::from(stdout),
+					stderr:      CowBytes::from(stderr),
+					exit_status: status,
+				})
+			})
+			.await
 	}
 }
 
@@ -851,8 +896,8 @@ pub enum SshError {
 		/// Configured host whose authentication attempts were rejected.
 		alias: Str,
 	},
-	/// Establishing the SSH transport exceeded the host timeout, clamped to
-	/// 1–120 seconds.
+	/// A complete SSH operation exceeded the host timeout, clamped to 1–120
+	/// seconds.
 	#[error("SSH operation timed out")]
 	Timeout,
 	/// A bounded file-read request targeted a directory.
@@ -908,6 +953,8 @@ pub enum SshError {
 }
 #[cfg(test)]
 mod tests {
+	use omp_core::sf;
+
 	use super::*;
 
 	#[tokio::test]
@@ -936,6 +983,32 @@ mod tests {
 			channel.write(&oversized).await,
 			Err(SshError::Limit { limit: INTERACTIVE_MESSAGE_LIMIT })
 		));
+	}
+
+	#[tokio::test]
+	async fn operation_deadline_is_single_and_absolute() {
+		let store = HostStore::default();
+		store
+			.hosts
+			.write()
+			.insert(Str::new("deadline"), HostConfig {
+				address:      sf!("localhost"),
+				port:         22,
+				user:         sf!("test"),
+				host_key:     sf!("SHA256:test"),
+				auth:         AuthPolicy::Agent,
+				timeout_secs: 1,
+			});
+		let service = SshService::new(store);
+		let started = time::Instant::now();
+		let result = service
+			.with_deadline("deadline", async {
+				time::sleep(Duration::from_secs(5)).await;
+				Ok::<_, SshError>(())
+			})
+			.await;
+		assert!(matches!(result, Err(SshError::Timeout)));
+		assert!(started.elapsed() < Duration::from_secs(3));
 	}
 
 	#[tokio::test]

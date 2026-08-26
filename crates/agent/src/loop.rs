@@ -13,6 +13,10 @@ use futures::StreamExt;
 use omp_core::{Hash32, IntoStr, InvocationPhase, Point, Str, sf};
 use omp_env::EnvClient;
 use omp_inference::{TurnId, layer::secrets::SecretStreamRestorer, recovery::repetition};
+use omp_memory::{
+	retain::{OwnedRetentionMessage, RetentionRole},
+	session::SessionMemory,
+};
 use omp_proto::{
 	inference::v1::{
 		self as pb, ContextRef, Outcome, ThreadDelta, part_start, tool_choice, turn_error,
@@ -35,7 +39,7 @@ use omp_telemetry::firehose::{
 	ProviderError, ToolCall as FirehoseToolCall, TurnEnd as FirehoseTurnEnd,
 	TurnStart as FirehoseTurnStart,
 };
-use omp_tool::{CapsBase, Registry as ToolRegistry, ToolIdentity};
+use omp_tool::{Abort, CapsBase, Registry as ToolRegistry};
 use parking_lot::Mutex;
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
@@ -60,7 +64,7 @@ use crate::{
 	batch::{
 		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
 	},
-	context::{ContextProjection, project_context},
+	context::{ContextProjection, ContextProjectionHandler, apply_patches, project_context},
 	continuation::{
 		AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
 		LoopSignal, RedemptionAuthority, RedemptionEvidence, SettledFold, SettledParticipant,
@@ -73,11 +77,15 @@ use crate::{
 	events::{AgentEvent, AgentPhase, EventBus},
 	hooks::HookGate,
 	jobs::JobBoard,
-	journal::{AbortDisposition, TurnInputRecord, TurnOptionsRecord, TurnStart},
+	journal::{
+		AbortDisposition, ReplicationSubscription, TurnInputRecord, TurnOptionsRecord, TurnStart,
+	},
 	mailbox::DrainPoint,
 	project::project_journal,
 	prompt::{PromptError, PromptHash},
-	state::{AgentState, UnexpectedStopMode},
+	state::{
+		AgentState, ContextPromotionPolicy, MidTurnCompactionPolicy, SteeringMode, UnexpectedStopMode,
+	},
 	turn::Error as TurnError,
 };
 
@@ -369,6 +377,63 @@ pub trait UnexpectedStopClassifier: Send + Sync + 'static {
 		text: &'a str,
 	) -> Pin<Box<dyn Future<Output = Result<bool, Str>> + Send + 'a>>;
 }
+/// Session-scoped difficulty classification for a newly submitted user turn.
+pub trait TurnDifficultyClassifier: Send + Sync + 'static {
+	/// Classifies concatenated text from the newly submitted user items.
+	fn classify<'a>(
+		&'a self,
+		user_text: &'a str,
+	) -> Pin<Box<dyn Future<Output = pb::Effort> + Send + 'a>>;
+}
+
+fn enabled_tools_resolve(registry: &ToolRegistry, names: &[Str]) -> bool {
+	names
+		.iter()
+		.all(|name| registry.resolved_identity(name.as_str()).is_some())
+}
+
+fn submitted_user_text(items: &[Item]) -> Option<String> {
+	let mut text = String::new();
+	for item in items {
+		let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
+			continue;
+		};
+		if message.role != thread::Role::User as i32 {
+			continue;
+		}
+		for part in &message.parts {
+			let Some(part::Kind::Text(value)) = part.kind.as_ref() else {
+				continue;
+			};
+			if !text.is_empty() {
+				text.push('\n');
+			}
+			text.push_str(value);
+		}
+	}
+	(!text.is_empty()).then_some(text)
+}
+
+fn materialize_context_projection(
+	projection: ContextProjection,
+	base_snapshot_rev: u64,
+	handler: Option<&dyn ContextProjectionHandler>,
+) -> Thread {
+	let (thread, view) = match projection {
+		ContextProjection::Unchanged(thread) => return thread,
+		ContextProjection::View { thread, view } => (thread, view),
+	};
+	let Some(handler) = handler else {
+		return thread;
+	};
+	let Ok(patches) = handler.project(base_snapshot_rev, &view) else {
+		return thread;
+	};
+	if patches.base_snapshot_rev() != base_snapshot_rev || patches.derived_ir_revision() == 0 {
+		return thread;
+	}
+	apply_patches(thread, &view, patches.patches()).thread
+}
 
 #[must_use]
 struct RunActivityGuard(Arc<dyn RunActivity>);
@@ -496,12 +561,15 @@ pub struct Agent<C: TurnClient> {
 	firehose: Arc<Firehose>,
 	run_activity: Option<Arc<dyn RunActivity>>,
 	prompt_memory_source: Option<Arc<dyn PromptMemorySnapshotSource>>,
+	session_memory: Option<SessionMemory>,
 	secret_obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
 	compaction: CompactionCoordinator,
 	blob_store: Option<BlobStore>,
 	artifact_catalog: Option<Arc<Mutex<ArtifactCatalog>>>,
 	autolearn: Option<AutolearnController>,
 	unexpected_stop_classifier: Option<Arc<dyn UnexpectedStopClassifier>>,
+	difficulty_classifier: Option<Arc<dyn TurnDifficultyClassifier>>,
+	context_projection_handler: Option<Arc<dyn ContextProjectionHandler>>,
 	unexpected_stop_retries: u8,
 	streaming_edit_guard: Option<Arc<StreamingEditGuard>>,
 	advisor_tool_loop: Option<AdvisorToolLoopGuard>,
@@ -605,12 +673,15 @@ impl<C: TurnClient + Clone> Agent<C> {
 			last_toolset_hash,
 			run_activity: None,
 			prompt_memory_source: None,
+			session_memory: None,
 			secret_obfuscator: None,
 			compaction: CompactionCoordinator::default(),
 			blob_store: None,
 			artifact_catalog: None,
 			autolearn: None,
 			unexpected_stop_classifier: None,
+			difficulty_classifier: None,
+			context_projection_handler: None,
 			unexpected_stop_retries: 0,
 			streaming_edit_guard: None,
 			advisor_tool_loop: None,
@@ -620,6 +691,25 @@ impl<C: TurnClient + Clone> Agent<C> {
 	/// Returns the authoritative configuration handle.
 	pub const fn state(&self) -> &AgentState {
 		&self.state
+	}
+
+	/// Selects one-at-a-time or all-at-once queued steering delivery.
+	pub fn set_steering_mode(&self, mode: SteeringMode) {
+		self.state.update(|snapshot| snapshot.steering_mode = mode);
+	}
+
+	/// Configures larger-context promotion attempted before overflow compaction.
+	pub fn set_context_promotion(&self, policy: ContextPromotionPolicy) {
+		self
+			.state
+			.update(|snapshot| snapshot.context_promotion = policy);
+	}
+
+	/// Configures synchronous compaction checks at safe tool-loop boundaries.
+	pub fn set_mid_turn_compaction(&self, policy: MidTurnCompactionPolicy) {
+		self
+			.state
+			.update(|snapshot| snapshot.mid_turn_compaction = policy);
 	}
 
 	/// Returns the named decision arbiter and durable regime owner.
@@ -674,6 +764,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 	/// Returns the ordered event feed handle.
 	pub const fn events(&self) -> &EventBus {
 		&self.events
+	}
+
+	/// Subscribes to a race-free collaboration catch-up and live journal feed.
+	pub fn subscribe_collaboration(&mut self) -> Result<ReplicationSubscription, JournalError> {
+		self.journal.subscribe_replication()
 	}
 
 	/// Returns a producer for asynchronous steering and settlement items.
@@ -802,6 +897,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 	/// Installs the smart unexpected-stop classifier.
 	pub fn set_unexpected_stop_classifier(&mut self, classifier: Arc<dyn UnexpectedStopClassifier>) {
 		self.unexpected_stop_classifier = Some(classifier);
+	}
+
+	/// Installs the classifier sampled once for each newly submitted user turn.
+	pub fn set_difficulty_classifier(&mut self, classifier: Arc<dyn TurnDifficultyClassifier>) {
+		self.difficulty_classifier = Some(classifier);
+	}
+
+	/// Installs the session-local model-context projection handler.
+	pub fn set_context_projection_handler(&mut self, handler: Arc<dyn ContextProjectionHandler>) {
+		self.context_projection_handler = Some(handler);
 	}
 
 	/// Configures early validation for streamed edit arguments.
@@ -1167,6 +1272,26 @@ impl<C: TurnClient + Clone> Agent<C> {
 		Ok(ManualCompactionOutcome { method: mode, event, tokens_before, tokens_after, frame_count })
 	}
 
+	fn promote_context_if_enabled(&mut self) -> bool {
+		let snapshot = self.state.snapshot();
+		let policy = &snapshot.context_promotion;
+		let Some(target) = policy.enabled.then_some(policy.target.as_ref()).flatten() else {
+			return false;
+		};
+		if snapshot.turn.params.model == target.as_str() {
+			return false;
+		}
+		let target = target.clone();
+		self.state.update(|snapshot| {
+			snapshot.turn.params.model = target.to_string();
+			snapshot.turn.provider_reset = true;
+		});
+		self.clear_provider_context();
+		self.prompt_hash = None;
+		self.prompt_head_events.clear();
+		true
+	}
+
 	async fn recover_context_overflow(&mut self, order: &CompactionMethodOrder) -> bool {
 		let mode = order.as_slice().iter().find_map(|tier| match tier {
 			CompactionTier::Local => Some(ManualCompactionMode::Soft),
@@ -1418,9 +1543,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.resolve_point(Point::Idle, Some(root_turn_id.as_str()), None, None, false)?;
 			self.execute_scheduled_rewinds()?;
 			let snapshot = self.state.snapshot();
-			let queued = self
-				.mailbox
-				.drain(DrainPoint::Idle, snapshot.defer_interrupts);
+			let queued = self.mailbox.drain_steering(
+				DrainPoint::Idle,
+				snapshot.defer_interrupts,
+				snapshot.steering_mode.delivery_limit(),
+			);
 			let mut pending_indexes = self.journal.recoverable_input_events().to_vec();
 			pending_indexes.extend_from_slice(self.journal.recoverable_settlement_events());
 			pending_indexes.sort_unstable();
@@ -1507,9 +1634,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.drain_control();
 					self.execute_scheduled_rewinds()?;
 					let snapshot = self.state.snapshot();
-					let drained = self
-						.mailbox
-						.drain(DrainPoint::Idle, snapshot.defer_interrupts);
+					let drained = self.mailbox.drain_steering(
+						DrainPoint::Idle,
+						snapshot.defer_interrupts,
+						snapshot.steering_mode.delivery_limit(),
+					);
 					let has_producer = drained
 						.iter()
 						.any(|interrupt| continues_loop(&interrupt.source));
@@ -1622,6 +1751,14 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.clear_provider_context();
+					if self.promote_context_if_enabled() {
+						let next_turn_id = follow_up_id(&turn_id, committed_turns);
+						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
+							PromptAssetId::AutoContinue,
+						)])?;
+						turn_id = next_turn_id;
+						continue;
+					}
 					let order = self.state.snapshot().compaction.clone();
 					if self.recover_context_overflow(&order).await {
 						let next_turn_id = follow_up_id(&turn_id, committed_turns);
@@ -1700,6 +1837,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 			self.events.publish(AgentEvent::Snapshot(snapshot.clone()));
 			self.publish_live_history()?;
+			self.retain_session_memory();
 			let turn_end =
 				self.resolve_point(Point::TurnEnd, Some(turn_id.as_str()), None, None, false)?;
 			for item in turn_end.regime.injects {
@@ -1710,13 +1848,37 @@ impl<C: TurnClient + Clone> Agent<C> {
 				});
 			}
 			self.drain_control();
-			let mut immediate = self
+			let (mut immediate, mut boundary): (Vec<_>, Vec<_>) = self
 				.mailbox
-				.drain(DrainPoint::Immediate, snapshot.defer_interrupts);
-			let mut boundary = self
-				.mailbox
-				.drain(DrainPoint::TurnBoundary, snapshot.defer_interrupts);
-			if stop == pb::StopReason::StopToolUse {
+				.drain_steering(
+					DrainPoint::TurnBoundary,
+					snapshot.defer_interrupts,
+					snapshot.steering_mode.delivery_limit(),
+				)
+				.into_iter()
+				.partition(|interrupt| interrupt.class == InterruptClass::Immediate);
+			let tool_call_count = outcome
+				.output
+				.iter()
+				.filter(|item| matches!(item.kind, Some(item::Kind::ToolCall(_))))
+				.count();
+			if stop == pb::StopReason::StopMaxTokens && tool_call_count != 0 {
+				let next = truncated_tool_results(&outcome.output)?;
+				immediate.append(&mut boundary);
+				let next_turn_id = follow_up_id(&turn_id, committed_turns);
+				pending_indexes = self.append_pending(&next_turn_id, next)?;
+				pending_indexes.extend(self.stage_interrupts(&next_turn_id, immediate)?);
+				self.retain_session_memory();
+				last_outcome = Some(outcome);
+				turn_id = next_turn_id;
+				continue;
+			}
+			let runnable_tool_calls = tool_call_count != 0
+				&& matches!(stop, pb::StopReason::StopToolUse | pb::StopReason::StopEndTurn);
+			if runnable_tool_calls {
+				let had_immediate = !immediate.is_empty();
+				immediate.append(&mut boundary);
+				boundary = mem::take(&mut immediate);
 				if let Err(error) = self
 					.reconcile_speculation(
 						&outcome.output,
@@ -1744,6 +1906,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 					},
 				};
 				let mut calls = calls;
+				if calls.len() != tool_call_count {
+					return Err(AgentError::Protocol("tool-call commitment count mismatch"));
+				}
 				for call in &mut calls {
 					call.set_cumulative_usage(self.cumulative_usage.clone());
 				}
@@ -1805,6 +1970,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				let mut aborted = *self.abort_rx.borrow() != abort_generation;
 				if aborted {
 					interrupt_tx.send_replace(Some(sf!("user interrupt")));
+				} else if had_immediate {
+					let reason = boundary
+						.first()
+						.map_or_else(|| sf!("steering"), |interrupt| interrupt_reason(&interrupt.source));
+					interrupt_tx.send_replace(Some(reason));
 				}
 				let regime_cancel = batch_fold.regime.control == ResolutionKind::Cancel;
 				if regime_cancel {
@@ -1864,7 +2034,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 							received = self.mailbox.wait() => {
 								if received.is_err() { continue; }
 								self.drain_control();
-								for interrupt in self.mailbox.drain(DrainPoint::Immediate, snapshot.defer_interrupts) {
+								for interrupt in self.mailbox.drain_steering(
+									DrainPoint::Immediate,
+									snapshot.defer_interrupts,
+									snapshot.steering_mode.delivery_limit(),
+								) {
 									interrupt_tx.send_replace(Some(interrupt_reason(&interrupt.source)));
 									boundary.push(interrupt);
 								}
@@ -1961,6 +2135,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 				}
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.append_pending(&next_turn_id, next)?;
+				self.retain_session_memory();
+				if mid_turn_compaction_due(snapshot.mid_turn_compaction, outcome.usage.as_ref())
+					&& self.recover_context_overflow(&snapshot.compaction).await
+				{
+					self.clear_provider_context();
+				}
 				let has_producer = boundary
 					.iter()
 					.any(|interrupt| continues_loop(&interrupt.source));
@@ -2013,9 +2193,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 					source: InterruptSource::Continuation { owner: sf!("regime") },
 				});
 			}
-			let mut idle = self
-				.mailbox
-				.drain(DrainPoint::Idle, snapshot.defer_interrupts);
+			let mut idle = self.mailbox.drain_steering(
+				DrainPoint::Idle,
+				snapshot.defer_interrupts,
+				snapshot.steering_mode.delivery_limit(),
+			);
 			boundary.append(&mut idle);
 			if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
@@ -2037,9 +2219,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.observe(None, false, self.arbiter.empty_output_retry_spent());
 			if let Some(interrupt) = self.settled_continuation(&turn_id).await? {
 				let _ = self.mailbox.sender().try_enqueue(interrupt);
-				boundary = self
-					.mailbox
-					.drain(DrainPoint::Idle, snapshot.defer_interrupts);
+				boundary = self.mailbox.drain_steering(
+					DrainPoint::Idle,
+					snapshot.defer_interrupts,
+					snapshot.steering_mode.delivery_limit(),
+				);
 				if !boundary.is_empty() {
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					pending_indexes = self.stage_interrupts(&next_turn_id, boundary)?;
@@ -2332,6 +2516,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 		self.prompt_memory_source = Some(source);
 	}
 
+	/// Installs the sole top-level long-term-memory lifecycle owner.
+	pub fn set_session_memory(&mut self, memory: SessionMemory) {
+		self.session_memory = Some(memory);
+	}
+
 	/// Installs Pi-compatible substantive-turn detection and synthetic capture.
 	pub fn set_autolearn(&mut self, settings: AutolearnSettings) {
 		self.autolearn = settings.enabled.then(|| AutolearnController::new(settings));
@@ -2351,8 +2540,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.pending_turn()
 			.filter(|start| start.turn_id.as_str() == turn_id.as_str())
 			.cloned();
-		let capture_turn =
-			durable.is_none() && self.journal.items_at(&pending)?.iter().any(is_capture_item);
+		let submitted_items = if durable.is_none() {
+			self.journal.items_at(&pending)?
+		} else {
+			Vec::new()
+		};
+		let capture_turn = submitted_items.iter().any(is_capture_item);
 		if durable.is_none()
 			&& let Some(source) = &self.prompt_memory_source
 		{
@@ -2375,14 +2568,22 @@ impl<C: TurnClient + Clone> Agent<C> {
 				snapshot.props.set(prompt_keys::MEMORY, values);
 			});
 		}
+		let classified_effort = if capture_turn {
+			None
+		} else {
+			match (
+				self.difficulty_classifier.as_ref().map(Arc::clone),
+				submitted_user_text(&submitted_items),
+			) {
+				(Some(classifier), Some(text)) => Some(classifier.classify(&text).await),
+				_ => None,
+			}
+		};
 		let snapshot = self.state.snapshot();
 		if let Some(start) = durable.as_ref() {
 			let current = snapshot.registry.slot_hash();
 			if current != start.toolset_hash
-				|| start
-					.enabled_tools
-					.iter()
-					.any(|name| snapshot.registry.live_identity(name.as_str()).is_none())
+				|| !enabled_tools_resolve(snapshot.registry.as_ref(), &start.enabled_tools)
 			{
 				return Err(AgentError::ToolsetMismatch { durable: start.toolset_hash, current });
 			}
@@ -2493,6 +2694,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 				stream_watchdog: snapshot.turn.stream_watchdog,
 			},
 		);
+		if let Some(effort) = classified_effort {
+			frozen_options.params.thinking =
+				Some(pb::Reasoning { effort: effort as i32, ..pb::Reasoning::default() });
+		}
 		let lifted_reseed = if changed_toolset {
 			self.transition(AgentPhase::Projecting);
 			let journal = self.journal.load()?;
@@ -2509,32 +2714,34 @@ impl<C: TurnClient + Clone> Agent<C> {
 			{
 				return Err(AgentError::Deadline);
 			}
+			let context_base_revision = self.journal.context_position().revision;
 			let input = if let Some(input) = resume_input.as_ref() {
 				input.clone()
 			} else if full {
 				let journal = self.journal.load()?;
 				let projected =
 					project_journal(&journal, journal.as_ref(), snapshot.registry.as_ref(), &self.caps)?;
-				let context_handlers = self.hook_bus.union_mask()
-					& hook_event_mask(v1::HookEventId::HookEventThreadProjection)
-					!= 0;
-				match project_context(projected, &all_live, context_handlers) {
-					ContextProjection::Unchanged(mut thread)
-					| ContextProjection::View { mut thread, .. } => {
-						if let Ok(date) = omp_core::display_time::local_calendar_date(SystemTime::now()) {
-							let cwd = snapshot
-								.props
-								.get(prompt_keys::CWD)
-								.and_then(omp_scribe::Value::as_str)
-								.unwrap_or_default();
-							let _ = inject_first_turn_metadata(&mut thread, &date, cwd);
-						}
-						if mem::take(&mut self.pending_reasoning_demotion) {
-							let _ = demote_interrupted_reasoning(&mut thread, snapshot.reasoning_dialect);
-						}
-						TurnInput::Full(thread)
-					},
+				let context_handlers = self.context_projection_handler.is_some()
+					|| self.hook_bus.union_mask()
+						& hook_event_mask(v1::HookEventId::HookEventThreadProjection)
+						!= 0;
+				let mut thread = materialize_context_projection(
+					project_context(projected, &all_live, context_handlers),
+					context_base_revision,
+					self.context_projection_handler.as_deref(),
+				);
+				if let Ok(date) = omp_core::display_time::local_calendar_date(SystemTime::now()) {
+					let cwd = snapshot
+						.props
+						.get(prompt_keys::CWD)
+						.and_then(omp_scribe::Value::as_str)
+						.unwrap_or_default();
+					let _ = inject_first_turn_metadata(&mut thread, &date, cwd);
 				}
+				if mem::take(&mut self.pending_reasoning_demotion) {
+					let _ = demote_interrupted_reasoning(&mut thread, snapshot.reasoning_dialect);
+				}
+				TurnInput::Full(thread)
 			} else {
 				let held = context
 					.clone()
@@ -2543,9 +2750,44 @@ impl<C: TurnClient + Clone> Agent<C> {
 					Some(thread) => thread.items.clone(),
 					None => self.journal.items_at(&append_events)?,
 				};
+				let append = if self.context_projection_handler.is_some() {
+					materialize_context_projection(
+						project_context(Thread { items: append }, &append_events, true),
+						context_base_revision,
+						self.context_projection_handler.as_deref(),
+					)
+					.items
+				} else {
+					append
+				};
 				TurnInput::Delta(held, ThreadDelta { truncate_to, append })
 			};
 			let mut provider_input = input.clone();
+			if resume_input.is_some() && self.context_projection_handler.is_some() {
+				match &mut provider_input {
+					TurnInput::Full(thread) => {
+						let projected = project_context(mem::take(thread), &all_live, true);
+						*thread = materialize_context_projection(
+							projected,
+							context_base_revision,
+							self.context_projection_handler.as_deref(),
+						);
+					},
+					TurnInput::Delta(_, delta) => {
+						let projected = project_context(
+							Thread { items: mem::take(&mut delta.append) },
+							&append_events,
+							true,
+						);
+						delta.append = materialize_context_projection(
+							projected,
+							context_base_revision,
+							self.context_projection_handler.as_deref(),
+						)
+						.items;
+					},
+				}
+			}
 			let checkpoint_active = self.checkpoint_state.lock().active.is_some();
 			self
 				.arbiter
@@ -2664,13 +2906,42 @@ impl<C: TurnClient + Clone> Agent<C> {
 				}
 			};
 			self.drain_invocation_facts()?;
-			let session_result = selected?;
-			if session_result.is_err() {
+			let session_result = match selected {
+				Ok(result) => result,
+				Err(error) => {
+					self.publish_attempt_terminal(
+						&turn_id,
+						turn_error::Kind::Upstream,
+						error.to_string(),
+					);
+					return Err(error);
+				},
+			};
+			if let Err(error) = &session_result {
+				if let Some(terminal) = error.turn_error() {
+					self.events.publish(AgentEvent::Turn {
+						turn_id: turn_id.clone(),
+						event:   Box::new(pb::TurnEvent {
+							event: Some(turn_event::Event::Error(terminal.clone())),
+						}),
+					});
+				} else {
+					self.publish_attempt_terminal(
+						&turn_id,
+						turn_error::Kind::Upstream,
+						error.to_string(),
+					);
+				}
 				self.tool_choices.reject(RejectReason::Error);
 			}
 			match session_result {
 				Ok(DriveSessionResult::Complete(mut outcome, speculative)) => {
-					restore_provider_output(&mut outcome.output, self.secret_obfuscator.as_ref())?;
+					let truncated = outcome.stop() == pb::StopReason::StopMaxTokens;
+					restore_provider_output(
+						&mut outcome.output,
+						self.secret_obfuscator.as_ref(),
+						truncated,
+					)?;
 					validate_outcome(&outcome)?;
 					if stateful && outcome.revision.is_none() {
 						return Err(AgentError::Protocol("stateful outcome missing revision"));
@@ -2699,7 +2970,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 							.state
 							.update(|snapshot| snapshot.turn.provider_reset = false);
 					}
-					self.record_committed_invocations(&outcome, &speculative, &receipt)?;
+					if !truncated {
+						self.record_committed_invocations(&outcome, &speculative, &receipt)?;
+					}
 					self.patch_input_sequences(
 						&sequence_targets,
 						u64::from(checkpoint_active),
@@ -2768,6 +3041,33 @@ impl<C: TurnClient + Clone> Agent<C> {
 				Err(error) => return Err(error.into()),
 			}
 		}
+	}
+
+	fn retain_session_memory(&self) {
+		let Some(memory) = self.session_memory.as_ref() else {
+			return;
+		};
+		match settled_retention_messages(&self.journal) {
+			Ok(messages) => {
+				if let Err(error) = memory.retain_settled(&messages) {
+					tracing::warn!(%error, "session memory retention failed");
+				}
+			},
+			Err(error) => tracing::warn!(%error, "session memory projection failed"),
+		}
+	}
+
+	fn publish_attempt_terminal(&self, turn_id: &TurnId, kind: turn_error::Kind, detail: String) {
+		self.events.publish(AgentEvent::Turn {
+			turn_id: turn_id.clone(),
+			event:   Box::new(pb::TurnEvent {
+				event: Some(turn_event::Event::Error(pb::TurnError {
+					kind: kind as i32,
+					detail,
+					..pb::TurnError::default()
+				})),
+			}),
+		});
 	}
 
 	fn record_ttsr_injection(
@@ -3036,6 +3336,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 				Some(turn_event::Event::Outcome(outcome)) => {
 					return Ok(DriveSessionResult::Complete(outcome, speculative));
 				},
+				Some(turn_event::Event::Error(error)) => {
+					return Err(TurnError::Terminal(Box::new(error)));
+				},
 				Some(turn_event::Event::PartStart(part)) => {
 					let source = match part.kind() {
 						part_start::Kind::Text => Some(TtsrSource::Text),
@@ -3062,18 +3365,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 					{
 						return Err(TurnError::Protocol("stream named disabled tool"));
 					}
-					let Some((name, rev)) = registry.live_identity(&part.tool_name) else {
+					let Some(identity) = registry.resolved_identity(&part.tool_name) else {
 						return Err(TurnError::Protocol("stream named unknown tool"));
 					};
 					let maximum_effects = registry
-						.effects(&part.tool_name)
-						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?
-						.clone();
+						.effects_owned(&part.tool_name)
+						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?;
 					let call_id = part.tool_call_id.as_str().to_str();
-					if name.as_str() == "edit"
+					if identity.name.as_str() == "edit"
 						&& let Some(guard) = streaming_edit_guard.as_ref()
 					{
-						guard.start(call_id.clone(), &rev);
+						guard.start(call_id.clone(), &identity.rev);
 					}
 					let admission = self
 						.arbiter
@@ -3110,7 +3412,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						&self.env,
 						&self.events,
 						call_id.clone(),
-						ToolIdentity { name: name.clone(), rev: rev.clone() },
+						identity,
 						runtime_duration(TOOL_DEADLINE),
 						invocation_props,
 					)
@@ -3219,19 +3521,18 @@ impl<C: TurnClient + Clone> Agent<C> {
 			if !enabled_tools.iter().any(|name| name.as_str() == call.name) {
 				return Err(AgentError::Protocol("outcome names disabled tool"));
 			}
-			let Some((name, rev)) = registry.live_identity(&call.name) else {
+			let Some(identity) = registry.resolved_identity(&call.name) else {
 				return Err(AgentError::Protocol("outcome names unknown tool"));
 			};
 			let maximum_effects = registry
-				.effects(&call.name)
-				.map_err(|_| AgentError::Protocol("committed tool effects missing"))?
-				.clone();
+				.effects_owned(&call.name)
+				.map_err(|_| AgentError::Protocol("committed tool effects missing"))?;
 			let invocation_props = self.invocation_mode_props(&maximum_effects)?;
 			let mut opened = SpeculativeCall::open_with_props(
 				&self.env,
 				&self.events,
 				call.id.as_str().to_str(),
-				ToolIdentity { name: name.clone(), rev: rev.clone() },
+				identity,
 				runtime_duration(TOOL_DEADLINE),
 				invocation_props,
 			)
@@ -4040,6 +4341,7 @@ fn obfuscate_provider_input(
 fn restore_provider_output(
 	items: &mut [Item],
 	secret_obfuscator: Option<&Arc<Mutex<SecretObfuscator>>>,
+	allow_incomplete_tool_args: bool,
 ) -> Result<(), AgentError> {
 	let Some(secret_obfuscator) = secret_obfuscator else {
 		return Ok(());
@@ -4061,8 +4363,13 @@ fn restore_provider_output(
 				}
 			},
 			Some(item::Kind::ToolCall(call)) => {
-				let mut value: serde_json::Value = serde_json::from_slice(&call.args_json)
-					.map_err(|_| AgentError::Protocol("tool arguments are not one JSON document"))?;
+				let mut value: serde_json::Value = match serde_json::from_slice(&call.args_json) {
+					Ok(value) => value,
+					Err(_) if allow_incomplete_tool_args => continue,
+					Err(_) => {
+						return Err(AgentError::Protocol("tool arguments are not one JSON document"));
+					},
+				};
 				deobfuscate_json(&mut value, &obfuscator);
 				call.args_json = bytes::Bytes::from(
 					serde_json::to_vec(&value)
@@ -4209,19 +4516,20 @@ fn committed_calls(
 }
 
 fn validate_outcome(outcome: &Outcome) -> Result<(), AgentError> {
-	let tool_calls = outcome
+	let mut tool_calls = BTreeSet::new();
+	for call in outcome
 		.output
 		.iter()
-		.filter(|item| matches!(item.kind, Some(item::Kind::ToolCall(_))))
-		.count();
-	match outcome.stop() {
-		pb::StopReason::StopToolUse if tool_calls == 0 => {
-			return Err(AgentError::Protocol("tool-use outcome has no tool calls"));
-		},
-		pb::StopReason::StopEndTurn if tool_calls != 0 => {
-			return Err(AgentError::Protocol("end-turn outcome contains unresolved tool calls"));
-		},
-		_ => {},
+		.filter_map(|item| match item.kind.as_ref() {
+			Some(item::Kind::ToolCall(call)) => Some(call),
+			_ => None,
+		}) {
+		if !tool_calls.insert(call.id.as_str()) {
+			return Err(AgentError::Protocol("outcome contains duplicate tool-call IDs"));
+		}
+	}
+	if outcome.stop() == pb::StopReason::StopToolUse && tool_calls.is_empty() {
+		return Err(AgentError::Protocol("tool-use outcome has no tool calls"));
 	}
 	if let Some(revision) = outcome.revision.as_ref() {
 		let count = u64::try_from(outcome.output.len())
@@ -4238,6 +4546,89 @@ fn validate_outcome(outcome: &Outcome) -> Result<(), AgentError> {
 		}
 	}
 	Ok(())
+}
+
+fn mid_turn_compaction_due(policy: MidTurnCompactionPolicy, usage: Option<&pb::Usage>) -> bool {
+	let occupancy = usage
+		.map(|usage| {
+			usage
+				.context_tokens
+				.or(usage.total_tokens)
+				.unwrap_or(usage.input_tokens)
+		})
+		.unwrap_or_default();
+	policy.enabled && occupancy >= policy.threshold_tokens
+}
+
+fn truncated_tool_results(output: &[Item]) -> Result<Vec<Item>, AgentError> {
+	output
+		.iter()
+		.filter(|item| matches!(item.kind, Some(item::Kind::ToolCall(_))))
+		.map(|call| {
+			crate::project::recovery_tool_result_item(now_ms(), call, Abort::Skipped {
+				reason: sf!(
+					"tool call was truncated by the output-token limit; retry with smaller, chunked \
+					 arguments",
+				),
+			})
+			.map_err(AgentError::from)
+		})
+		.collect()
+}
+impl<C: TurnClient> Drop for Agent<C> {
+	fn drop(&mut self) {
+		let Some(memory) = self.session_memory.as_ref() else {
+			return;
+		};
+		match settled_retention_messages(&self.journal) {
+			Ok(messages) => {
+				if let Err(error) = memory.shutdown_flush(messages) {
+					tracing::warn!(%error, "session memory shutdown flush failed");
+				}
+			},
+			Err(error) => tracing::warn!(%error, "session memory shutdown projection failed"),
+		}
+	}
+}
+
+fn settled_retention_messages(
+	journal: &Journal,
+) -> Result<Vec<OwnedRetentionMessage>, JournalError> {
+	let indexes = journal.live_item_events()?;
+	let items = journal.items_at(&indexes)?;
+	let mut messages = Vec::new();
+	for (index, item) in indexes.into_iter().zip(items) {
+		let (role, parts) = match item.kind.as_ref() {
+			Some(item::Kind::Message(message)) => {
+				let role =
+					match thread::Role::try_from(message.role).unwrap_or(thread::Role::Unspecified) {
+						thread::Role::User => RetentionRole::User,
+						thread::Role::Assistant => RetentionRole::Assistant,
+						thread::Role::System => RetentionRole::System,
+						thread::Role::Unspecified => continue,
+					};
+				(role, message.parts.as_slice())
+			},
+			Some(item::Kind::ToolResult(result)) => (RetentionRole::Tool, result.parts.as_slice()),
+			_ => continue,
+		};
+		let content = parts
+			.iter()
+			.filter_map(|part| match part.kind.as_ref() {
+				Some(part::Kind::Text(text)) => Some(text.as_str()),
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		if !content.trim().is_empty() {
+			messages.push(OwnedRetentionMessage {
+				stable_id: Str::new(index.to_string()),
+				role,
+				content: Str::new(content),
+			});
+		}
+	}
+	Ok(messages)
 }
 fn telemetry_envelope() -> Envelope {
 	Envelope { occurred_at_ms: now_ms(), ..Envelope::default() }
@@ -4546,14 +4937,132 @@ mod tests {
 	use omp_secrets::rule::{SecretKind, SecretMode, SecretRule};
 	use omp_storage::transcript::{Entry, Header, Kind, SessionId};
 	use omp_tool::{
-		Claims, Constraint, Effects, ModelClass, Precedence, Presentation, Rev, ToolSpec,
+		Claims, Constraint, Effects, HostToolExecutor, HostToolInvocation, HostToolResult,
+		HostToolSpec, HostToolUpdateSink, ModelClass, Precedence, Presentation, Rev, ToolIdentity,
+		ToolSpec,
 	};
 	use parking_lot::Mutex;
 
 	use super::*;
-	use crate::InvokeFrame;
+	use crate::{ContextPatchSet, InheritPosition, InvokeFrame, PatchOp};
 
 	type Script = Vec<Result<pb::TurnEvent, TurnError>>;
+
+	struct DynamicHostExecutor;
+
+	impl HostToolExecutor for DynamicHostExecutor {
+		fn execute(
+			&self,
+			_invocation: HostToolInvocation,
+			_updates: HostToolUpdateSink,
+			_cancellation: tokio_util::sync::CancellationToken,
+		) -> Pin<Box<dyn Future<Output = Result<HostToolResult, Str>> + Send + 'static>> {
+			Box::pin(async { Ok(HostToolResult { result: serde_json::Value::Null, is_error: false }) })
+		}
+	}
+
+	#[test]
+	fn dynamic_host_tool_name_passes_agent_validation() {
+		let registry = ToolRegistry::new();
+		registry
+			.replace_host_tools(
+				Str::new_static("rpc-test"),
+				1,
+				vec![HostToolSpec {
+					name:        Str::new_static("rpc_dynamic"),
+					description: Str::new_static("dynamic test tool"),
+					parameters:  serde_json::json!({ "type": "object" }),
+				}],
+				Arc::new(DynamicHostExecutor),
+			)
+			.expect("install dynamic host tool");
+		assert!(enabled_tools_resolve(&registry, &[Str::new_static("rpc_dynamic")]));
+		assert!(registry.effects_owned("rpc_dynamic").is_ok());
+	}
+
+	struct ReplacingContextHandler {
+		base_offset: u64,
+		derived:     u32,
+	}
+
+	impl ContextProjectionHandler for ReplacingContextHandler {
+		fn project(
+			&self,
+			base_snapshot_rev: u64,
+			view: &crate::ContextView,
+		) -> Result<ContextPatchSet, crate::ContextProjectionError> {
+			let target = view
+				.refs
+				.first()
+				.expect("projection has one item")
+				.id
+				.clone();
+			Ok(ContextPatchSet::new(
+				base_snapshot_rev.saturating_add(self.base_offset),
+				self.derived,
+				vec![PatchOp::Replace {
+					ids:  smallvec::smallvec![target],
+					text: Str::new_static("projected"),
+					role: thread::Role::User,
+					at:   InheritPosition::First,
+				}],
+			))
+		}
+	}
+
+	fn message_text(item: &Item) -> Option<&str> {
+		let item::Kind::Message(message) = item.kind.as_ref()? else {
+			return None;
+		};
+		message.parts.iter().find_map(|part| {
+			let part::Kind::Text(text) = part.kind.as_ref()? else {
+				return None;
+			};
+			Some(text.as_str())
+		})
+	}
+
+	#[test]
+	fn context_handler_applies_to_full_and_delta_projections() {
+		let handler = ReplacingContextHandler { base_offset: 0, derived: 1 };
+		let full = project_context(
+			Thread {
+				items: vec![
+					message(thread::Role::User, "full input"),
+					message(thread::Role::Assistant, "retained"),
+				],
+			},
+			&[10, 11],
+			true,
+		);
+		let full = materialize_context_projection(full, 4, Some(&handler));
+		assert_eq!(full.items.len(), 2);
+		assert_eq!(message_text(&full.items[0]), Some("projected"));
+		assert_eq!(message_text(&full.items[1]), Some("retained"));
+
+		let delta = project_context(
+			Thread { items: vec![message(thread::Role::User, "delta input")] },
+			&[12],
+			true,
+		);
+		let delta = materialize_context_projection(delta, 5, Some(&handler));
+		assert_eq!(delta.items.len(), 1);
+		assert_eq!(message_text(&delta.items[0]), Some("projected"));
+
+		for invalid in
+			[ReplacingContextHandler { base_offset: 1, derived: 1 }, ReplacingContextHandler {
+				base_offset: 0,
+				derived:     0,
+			}] {
+			let projection = project_context(
+				Thread { items: vec![message(thread::Role::User, "unchanged")] },
+				&[13],
+				true,
+			);
+			let unchanged = materialize_context_projection(projection, 6, Some(&invalid));
+			assert_eq!(message_text(&unchanged.items[0]), Some("unchanged"));
+		}
+	}
 	type OpenedTurn = (TurnId, TurnInput, TurnOptions);
 	type OpenedTurns = Vec<OpenedTurn>;
 	#[test]
@@ -4575,6 +5084,71 @@ mod tests {
 				_ => None,
 			});
 		assert!(text.is_some_and(|text| text.contains("no first response event")));
+	}
+
+	#[tokio::test]
+	async fn observable_rpc_retry_terminates_attempt_before_replay() {
+		let (journal, path) = test_journal("observable-retry");
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let failed_attempt = vec![
+			Ok(pb::TurnEvent {
+				event: Some(turn_event::Event::PartStart(pb::PartStart {
+					index:        0,
+					kind:         part_start::Kind::Text as i32,
+					tool_call_id: String::new(),
+					tool_name:    String::new(),
+				})),
+			}),
+			Ok(pb::TurnEvent {
+				event: Some(turn_event::Event::PartDelta(pb::PartDelta {
+					index: 0,
+					chunk: Bytes::from_static(b"partial"),
+				})),
+			}),
+			Err(TurnError::Rpc(tonic::Status::unavailable("stream lost"))),
+		];
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				failed_attempt,
+				outcome_script(end_outcome("recovered")),
+			]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let events = agent.events().subscribe_lossless();
+		let summary = agent
+			.submit([message(thread::Role::User, "retry")], TurnId::new("retry-turn"))
+			.await
+			.expect("retry succeeds");
+		assert_eq!(summary.committed_turns, 1);
+		assert_eq!(opened.lock().len(), 2);
+		let observed = (0..events.len())
+			.filter_map(|_| events.try_recv().ok())
+			.filter_map(|event| match event.as_ref() {
+				AgentEvent::Turn { turn_id, event } if turn_id.as_str() == "retry-turn" => {
+					Some(event.event.as_ref().map(|event| match event {
+						turn_event::Event::Error(_) => "error",
+						turn_event::Event::Outcome(_) => "outcome",
+						_ => "part",
+					}))
+				},
+				_ => None,
+			})
+			.flatten()
+			.collect::<Vec<_>>();
+		let error = observed
+			.iter()
+			.position(|kind| *kind == "error")
+			.expect("attempt terminal");
+		let outcome = observed
+			.iter()
+			.position(|kind| *kind == "outcome")
+			.expect("replayed outcome");
+		assert!(error < outcome);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
 	}
 
 	#[derive(Clone)]
@@ -5019,6 +5593,7 @@ mod tests {
 		let (env, _transport) = EnvClient::in_process(1);
 		let mut agent =
 			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let events = agent.events().subscribe_lossless();
 		let abort = agent.abort_handle();
 		let aborting = async {
 			wait_for_opened(&opened, 1).await;
@@ -5033,6 +5608,14 @@ mod tests {
 		assert!(summary.outcome.is_none());
 		assert_eq!(summary.committed_turns, 0);
 		assert!(agent.journal().pending_turn().is_none());
+		assert!((0..events.len()).any(|_| {
+			matches!(
+				events.try_recv().ok().as_deref(),
+				Some(AgentEvent::Turn { turn_id, event })
+					if turn_id.as_str() == "abort-turn"
+						&& matches!(event.event.as_ref(), Some(turn_event::Event::Error(_)))
+			)
+		}));
 		let log = agent.journal().load().expect("load aborted journal");
 		assert!((0..u64::try_from(log.len()).expect("log length fits")).any(|index| {
 			matches!(
@@ -5201,6 +5784,65 @@ mod tests {
 			agent.journal().pending_input_submission().is_some(),
 			"interrupted tool results remain staged"
 		);
+		drop(agent);
+		env_task.abort();
+		fs::remove_file(path).expect("remove journal");
+	}
+	#[tokio::test]
+	async fn immediate_steering_during_tool_generation_is_retained_for_follow_up() {
+		let (journal, path) = test_journal("tool-steering");
+		let identity = ToolIdentity { name: sf!("pending"), rev: Rev { family: sf!("test"), n: 1 } };
+		let mut registry = ToolRegistry::new();
+		registry
+			.register_worker(worker(identity.name.as_str()), Presentation::Device, worker_claims())
+			.expect("register pending tool");
+		let state = AgentState::new(AgentSnapshot {
+			enabled_tools: Arc::from([identity.name.clone()]),
+			registry: Arc::new(registry),
+			..AgentSnapshot::default()
+		});
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				pending_tool_script(&identity),
+				outcome_script(end_outcome("steered answer")),
+			]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, transport) = EnvClient::in_process(1);
+		let (requests, responses) = transport.into_parts();
+		let env_task = tokio::spawn(async move {
+			let _responses = responses;
+			while requests.recv_async().await.is_ok() {}
+		});
+		let mut agent = Agent::new(client, env, state, journal, test_caps());
+		let events = agent.events().subscribe_lossless();
+		let mailbox = agent.mailbox();
+		let steering = async {
+			loop {
+				let event = events.recv().await.expect("agent event");
+				if matches!(event.as_ref(), AgentEvent::ToolArgs { .. }) {
+					mailbox
+						.try_enqueue(Interrupt {
+							class:  InterruptClass::Immediate,
+							item:   message(thread::Role::User, "preserved steering"),
+							source: InterruptSource::Producer(sf!("user")),
+						})
+						.expect("enqueue steering");
+					break;
+				}
+			}
+		};
+		let (summary, ()) = tokio::join!(
+			agent.submit([message(thread::Role::User, "start tool")], TurnId::new("tool-steer")),
+			steering,
+		);
+		let summary = summary.expect("steered tool turn succeeds");
+		assert_eq!(summary.committed_turns, 2);
+		let opened = opened.lock();
+		assert_eq!(opened.len(), 2);
+		assert!(input_contains_text(&opened[1].1, "preserved steering"));
+		drop(opened);
 		drop(agent);
 		env_task.abort();
 		fs::remove_file(path).expect("remove journal");
@@ -5546,6 +6188,85 @@ mod tests {
 	}
 
 	#[test]
+	fn context_promotion_runs_once_before_compaction() {
+		let (journal, path) = test_journal("context-promotion");
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut snapshot = AgentSnapshot::default();
+		snapshot.turn.params.model = "provider/small".to_owned();
+		snapshot.context_promotion =
+			ContextPromotionPolicy { enabled: true, target: Some(sf!("provider/large")) };
+		let mut agent = Agent::new(client, env, AgentState::new(snapshot), journal, test_caps());
+		assert!(agent.promote_context_if_enabled());
+		let promoted = agent.state().snapshot();
+		assert_eq!(promoted.turn.params.model, "provider/large");
+		assert!(promoted.turn.provider_reset);
+		assert!(!agent.promote_context_if_enabled(), "target promotion is one-shot");
+		drop(agent);
+		if path.exists() {
+			fs::remove_file(path).expect("remove journal");
+		}
+	}
+
+	#[test]
+	fn mid_turn_compaction_is_enabled_and_threshold_gated() {
+		let usage =
+			pb::Usage { context_tokens: Some(80_000), input_tokens: 70_000, ..pb::Usage::default() };
+		assert!(mid_turn_compaction_due(
+			MidTurnCompactionPolicy { enabled: true, threshold_tokens: 80_000 },
+			Some(&usage),
+		));
+		assert!(!mid_turn_compaction_due(
+			MidTurnCompactionPolicy { enabled: false, threshold_tokens: 1 },
+			Some(&usage),
+		));
+		assert!(!mid_turn_compaction_due(
+			MidTurnCompactionPolicy { enabled: true, threshold_tokens: 80_001 },
+			Some(&usage),
+		));
+	}
+
+	#[test]
+	fn complete_end_turn_calls_are_valid_and_truncated_calls_receive_pairing_results() {
+		let call = Item {
+			kind: Some(item::Kind::ToolCall(thread::ToolCall {
+				id: "call-1".to_owned(),
+				name: "write".to_owned(),
+				args_json: Bytes::from_static(br#"{"path":"large","content":"partial"#),
+				..thread::ToolCall::default()
+			})),
+			props: Some(pb::ValueMap {
+				fields: BTreeMap::from([(omp_tool::TOOL_REV_PROP.to_owned(), pb::Value {
+					kind: Some(value::Kind::String("1".to_owned())),
+				})]),
+			}),
+			..Item::default()
+		};
+		let end = Outcome {
+			output: vec![call.clone()],
+			stop: pb::StopReason::StopEndTurn as i32,
+			..Outcome::default()
+		};
+		validate_outcome(&end).expect("complete end-turn calls are runnable");
+		let results = truncated_tool_results(&[call]).expect("pair truncated call");
+		let Some(item::Kind::ToolResult(result)) = results[0].kind.as_ref() else {
+			panic!("truncated call must receive a tool result");
+		};
+		assert_eq!(result.call_id, "call-1");
+		assert!(result.is_error);
+		assert!(result.parts.iter().any(|part| {
+			matches!(
+				part.kind.as_ref(),
+				Some(part::Kind::Text(text))
+					if text.contains("output-token limit") && text.contains("chunked")
+			)
+		}));
+	}
+
+	#[test]
 	fn run_summary_classifies_terminal_outcomes_and_projects_assistant() {
 		let success = AgentRunSummary::settled(end_outcome("done"), 1, false);
 		assert_eq!(success.settlement, RunSettlement::Success);
@@ -5632,12 +6353,27 @@ mod tests {
 			.live_item_events()
 			.expect("live item events");
 		let display = agent.journal().items_at(&live).expect("display projection");
-		assert_eq!(display.len(), 2, "user input plus durable terminal error");
+		assert!(display.iter().any(|item| {
+			matches!(
+				item.kind.as_ref(),
+				Some(item::Kind::Message(message))
+					if message.parts.iter().any(|part| {
+						matches!(
+							part.kind.as_ref(),
+							Some(part::Kind::Text(text)) if text == "oversized request"
+						)
+					})
+			)
+		}));
 		let log = agent.journal().load().expect("journal log");
 		let provider =
 			project_journal(&log, log.as_ref(), state.snapshot().registry.as_ref(), &test_caps())
 				.expect("provider projection");
-		assert_eq!(provider.items.len(), 1, "terminal error-only frame stays display-only");
+		assert_eq!(
+			display.len(),
+			provider.items.len() + 1,
+			"exactly one durable terminal error-only frame stays display-only"
+		);
 		fs::remove_file(path).expect("remove journal");
 	}
 

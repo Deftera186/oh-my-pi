@@ -128,7 +128,7 @@ async fn configured_composition_routes_every_owned_namespace() {
 		factory("auxiliary", &calls),
 		factory("effects", &calls),
 	);
-	let factory = Arc::new(HostControlAuthorityFactory::new(
+	let host_factory = Arc::new(HostControlAuthorityFactory::new(
 		envd,
 		ExternalControlAuthorities::new(factory("agents", &calls), factory("mcp", &calls)),
 	));
@@ -138,10 +138,11 @@ async fn configured_composition_routes_every_owned_namespace() {
 		sf!("test-session"),
 		11,
 	);
-	config.bind_control_authorities(factory);
+	config.bind_control_authorities(host_factory);
 	let supervisor = ExtHostSupervisor::spawn(config)
 		.await
 		.expect("empty configured host");
+	let _agents = supervisor.bind_agents_control_authority(factory("agents", &calls));
 	let identity = identity();
 	let authority = supervisor
 		.control_authority(Arc::clone(&identity))

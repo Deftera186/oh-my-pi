@@ -226,9 +226,7 @@ fn render_hub_args(args: &HubArgsState) -> Option<El> {
 			}
 		},
 	};
-	Some(view! {
-		<box border=round pad="0 1" bc=info>{content}</box>
-	})
+	Some(content)
 }
 
 #[cfg(test)]
@@ -296,47 +294,45 @@ fn render_hub_roster(
 		.unwrap_or_else(|| peer_status_count(peers, "parked"));
 	let now_ms = now_ms();
 	view! {
-		<box border=round pad="0 1" bc=info>
-			<col gap=0 max-rows=12 overflow="peers">
-				<row sep=" · ">
-					<text bold fg=info>{"IRC peers"}</text>
-					<text fg=accent>{sf!("{running} running")}</text>
-					<text fg=muted>{sf!("{idle} idle")}</text>
-					<text fg=muted>{sf!("{parked} parked")}</text>
-				</row>
-				for peer in peers {
-					if let Some(peer) = peer.as_object() {
-						<row sep=" · ">
-							{state_view(json_string(peer, &["status", "lifecycle"]).unwrap_or("unknown"))}
-							<text bold>{json_string(peer, &["id", "name", "callerName"]).unwrap_or("unknown")}</text>
-							if let Some(name) = json_string(peer, &["name", "displayName"])
-								.filter(|name| *name != json_string(peer, &["id", "name", "callerName"]).unwrap_or("unknown"))
-							{
-								<text fg=muted>{name}</text>
-							}
-							<text fg=muted>{json_string(peer, &["kind"]).unwrap_or("agent")}</text>
-							if let Some(parent) = json_string(peer, &["parent", "parentId"]) {
-								<text fg=muted>{"of "}{parent}</text>
-							}
-							if let Some(activity) = json_string(peer, &["activity"]) {
-								<text fg=secondary>{activity}</text>
-							}
-							if let Some(unread) = json_u64(peer, &["unread", "unreadCount"]).filter(|unread| *unread > 0) {
-								<text fg=warn>{sf!("[{unread} unread]")}</text>
-							}
-							if let Some(age_ms) = object_age_ms(
-								peer,
-								now_ms,
-								&["lastActivityMs", "updatedAtMs"],
-								&["ageMs", "activityMs"],
-							) {
-								{relative_time_view(age_ms)}
-							}
-						</row>
-					}
+		<col gap=0 max-rows=12 overflow="peers">
+			<row sep=" · ">
+				<text bold fg=info>{"IRC peers"}</text>
+				<text fg=accent>{sf!("{running} running")}</text>
+				<text fg=muted>{sf!("{idle} idle")}</text>
+				<text fg=muted>{sf!("{parked} parked")}</text>
+			</row>
+			for peer in peers {
+				if let Some(peer) = peer.as_object() {
+					<row sep=" · ">
+						{state_view(json_string(peer, &["status", "lifecycle"]).unwrap_or("unknown"))}
+						<text bold>{json_string(peer, &["id", "name", "callerName"]).unwrap_or("unknown")}</text>
+						if let Some(name) = json_string(peer, &["name", "displayName"])
+							.filter(|name| *name != json_string(peer, &["id", "name", "callerName"]).unwrap_or("unknown"))
+						{
+							<text fg=muted>{name}</text>
+						}
+						<text fg=muted>{json_string(peer, &["kind"]).unwrap_or("agent")}</text>
+						if let Some(parent) = json_string(peer, &["parent", "parentId"]) {
+							<text fg=muted>{"of "}{parent}</text>
+						}
+						if let Some(activity) = json_string(peer, &["activity"]) {
+							<text fg=secondary>{activity}</text>
+						}
+						if let Some(unread) = json_u64(peer, &["unread", "unreadCount"]).filter(|unread| *unread > 0) {
+							<text fg=warn>{sf!("[{unread} unread]")}</text>
+						}
+						if let Some(age_ms) = object_age_ms(
+							peer,
+							now_ms,
+							&["lastActivityMs", "updatedAtMs"],
+							&["ageMs", "activityMs"],
+						) {
+							{relative_time_view(age_ms)}
+						}
+					</row>
 				}
-			</col>
-		</box>
+			}
+		</col>
 	}
 }
 
@@ -364,76 +360,72 @@ fn render_hub_jobs(jobs: &[serde_json::Value], waiting_ms: Option<u64>) -> El {
 		sf!("{} jobs", jobs.len())
 	};
 	view! {
-		<box border=round pad="0 1" bc=info>
-			<col gap=0 max-rows=12 overflow="jobs">
-				<row sep=" · ">
-					<text bold fg=info>{title}</text>
-					<text fg=ok>{sf!("{done} done")}</text>
-					<text fg=err>{sf!("{failed} failed")}</text>
-					if running > 0 {
-						<text fg=accent>{sf!("{running} running")}</text>
-					}
-					if let Some(waiting_ms) = waiting_ms {
-						<spinner>{"waiting"}</spinner>
-						<time kind="duration" ms={waiting_ms}/>
-					}
-				</row>
-				for job in jobs {
-					if let Some(job) = job.as_object() {
-						<row sep=" · ">
-							{state_view(json_string(job, &["status", "state", "lifecycle"]).unwrap_or("unknown"))}
-							<text fg=secondary>{json_string(job, &["kind", "type"]).unwrap_or("job")}</text>
-							<text bold>{json_string(job, &["label", "name"]).unwrap_or_else(|| json_string(job, &["id", "job", "name"]).unwrap_or("unknown"))}</text>
-							if json_string(job, &["label", "name"]).unwrap_or_else(|| json_string(job, &["id", "job", "name"]).unwrap_or("unknown"))
-								!= json_string(job, &["id", "job", "name"]).unwrap_or("unknown")
-							{
-								<text fg=muted>{json_string(job, &["id", "job", "name"]).unwrap_or("unknown")}</text>
-							}
-							if let Some(duration) = json_u64(job, &["durationMs", "elapsedMs"]) {
-								<time kind="duration" ms={duration}/>
-							}
-						</row>
-						if let Some((preview, error)) = json_string(job, &["error", "errorText"])
-							.map(|preview| (preview, true))
-							.or_else(|| json_string(job, &["result", "resultText"]).map(|preview| (preview, false)))
+		<col gap=0 max-rows=12 overflow="jobs">
+			<row sep=" · ">
+				<text bold fg=info>{title}</text>
+				<text fg=ok>{sf!("{done} done")}</text>
+				<text fg=err>{sf!("{failed} failed")}</text>
+				if running > 0 {
+					<text fg=accent>{sf!("{running} running")}</text>
+				}
+				if let Some(waiting_ms) = waiting_ms {
+					<spinner>{"waiting"}</spinner>
+					<time kind="duration" ms={waiting_ms}/>
+				}
+			</row>
+			for job in jobs {
+				if let Some(job) = job.as_object() {
+					<row sep=" · ">
+						{state_view(json_string(job, &["status", "state", "lifecycle"]).unwrap_or("unknown"))}
+						<text fg=secondary>{json_string(job, &["kind", "type"]).unwrap_or("job")}</text>
+						<text bold>{json_string(job, &["label", "name"]).unwrap_or_else(|| json_string(job, &["id", "job", "name"]).unwrap_or("unknown"))}</text>
+						if json_string(job, &["label", "name"]).unwrap_or_else(|| json_string(job, &["id", "job", "name"]).unwrap_or("unknown"))
+							!= json_string(job, &["id", "job", "name"]).unwrap_or("unknown")
 						{
-							{quote_view(preview, error)}
+							<text fg=muted>{json_string(job, &["id", "job", "name"]).unwrap_or("unknown")}</text>
 						}
+						if let Some(duration) = json_u64(job, &["durationMs", "elapsedMs"]) {
+							<time kind="duration" ms={duration}/>
+						}
+					</row>
+					if let Some((preview, error)) = json_string(job, &["error", "errorText"])
+						.map(|preview| (preview, true))
+						.or_else(|| json_string(job, &["result", "resultText"]).map(|preview| (preview, false)))
+					{
+						{quote_view(preview, error)}
 					}
 				}
-			</col>
-		</box>
+			}
+		</col>
 	}
 }
 
 fn render_hub_processes(processes: &[serde_json::Value]) -> El {
 	view! {
-		<box border=round pad="0 1" bc=secondary>
-			<col gap=0 max-rows=12 overflow="processes">
-				<row sep=" · ">
-					<text bold fg=secondary>{"Launch processes"}</text>
-					<text fg=muted>{sf!("{} supervised", processes.len())}</text>
-				</row>
-				for process in processes {
-					if let Some(process) = process.as_object() {
-						<row sep=" · ">
-							{state_view(json_string(process, &["status", "state"]).unwrap_or("unknown"))}
-							<text bold>{json_string(process, &["name"]).unwrap_or("unknown")}</text>
-							if let Some(pid) = json_u64(process, &["pid"]) {
-								<text fg=muted>{sf!("pid {pid}")}</text>
-							}
-							if let Some(uptime) = json_u64(process, &["uptimeMs", "elapsedMs"]) {
-								<text fg=muted>{"up"}</text>
-								<time kind="duration" ms={uptime}/>
-							}
-							if let Some(restarts) = json_u64(process, &["restartCount"]).filter(|count| *count > 0) {
-								<text fg=muted>{sf!("{restarts} restarts")}</text>
-							}
-						</row>
-					}
+		<col gap=0 max-rows=12 overflow="processes">
+			<row sep=" · ">
+				<text bold fg=secondary>{"Launch processes"}</text>
+				<text fg=muted>{sf!("{} supervised", processes.len())}</text>
+			</row>
+			for process in processes {
+				if let Some(process) = process.as_object() {
+					<row sep=" · ">
+						{state_view(json_string(process, &["status", "state"]).unwrap_or("unknown"))}
+						<text bold>{json_string(process, &["name"]).unwrap_or("unknown")}</text>
+						if let Some(pid) = json_u64(process, &["pid"]) {
+							<text fg=muted>{sf!("pid {pid}")}</text>
+						}
+						if let Some(uptime) = json_u64(process, &["uptimeMs", "elapsedMs"]) {
+							<text fg=muted>{"up"}</text>
+							<time kind="duration" ms={uptime}/>
+						}
+						if let Some(restarts) = json_u64(process, &["restartCount"]).filter(|count| *count > 0) {
+							<text fg=muted>{sf!("{restarts} restarts")}</text>
+						}
+					</row>
 				}
-			</col>
-		</box>
+			}
+		</col>
 	}
 }
 
@@ -468,66 +460,62 @@ fn render_hub_start(
 		json_string(object, &["state", "status"]).unwrap_or("starting")
 	};
 	view! {
-		<box border=round pad="0 1" bc=secondary>
-			<col gap=0>
-				<row sep=" · ">
-					<text bold fg=secondary>{"Launch start:"}</text>
-					<text bold>{name}</text>
-					if let Some(command) = command {
-						{command}
-					}
-					{state_view(state)}
-					if let Some(pid) = json_u64(object, &["pid"]) {
-						<text fg=muted>{sf!("pid {pid}")}</text>
-					}
-					if let Some(uptime) = json_u64(object, &["uptimeMs", "elapsedMs"]) {
-						<text fg=muted>{"up"}</text>
-						<time kind="duration" ms={uptime}/>
-					} else if let Some(generation) = json_u64(object, &["generation"]) {
-						<text fg=muted>{sf!("generation {generation}")}</text>
-					}
-				</row>
-				if let Some(matched) = json_string(object, &["readyMatch", "matchedLog", "matched"]) {
-					<text fg=muted>{"log matched: "}{matched}</text>
+		<col gap=0>
+			<row sep=" · ">
+				<text bold fg=secondary>{"Launch start:"}</text>
+				<text bold>{name}</text>
+				if let Some(command) = command {
+					{command}
 				}
-			</col>
-		</box>
+				{state_view(state)}
+				if let Some(pid) = json_u64(object, &["pid"]) {
+					<text fg=muted>{sf!("pid {pid}")}</text>
+				}
+				if let Some(uptime) = json_u64(object, &["uptimeMs", "elapsedMs"]) {
+					<text fg=muted>{"up"}</text>
+					<time kind="duration" ms={uptime}/>
+				} else if let Some(generation) = json_u64(object, &["generation"]) {
+					<text fg=muted>{sf!("generation {generation}")}</text>
+				}
+			</row>
+			if let Some(matched) = json_string(object, &["readyMatch", "matchedLog", "matched"]) {
+				<text fg=muted>{"log matched: "}{matched}</text>
+			}
+		</col>
 	}
 }
 
 fn render_hub_logs(object: &serde_json::Map<String, serde_json::Value>) -> El {
 	view! {
-		<box border=round pad="0 1" bc=secondary>
-			<col gap=0>
-				<row sep=" · ">
-					<text bold fg=secondary>{"Launch logs:"}</text>
-					if let Some(name) = json_string(object, &["name"]) {
-						<text bold>{name}</text>
-					}
-					if let Some(state) = json_string(object, &["state", "status"]) {
-						{state_view(state)}
-					}
-					if let Some(cursor) = json_u64(object, &["cursor"]) {
-						<text fg=muted>{sf!("cursor {cursor}")}</text>
-					}
-					if object.get("timedOut").and_then(serde_json::Value::as_bool) == Some(true) {
-						<callout kind="warn">{"Log follow timed out."}</callout>
-					}
-				</row>
-				<box border=round bc=border pad="0 1">
-					<pre max-rows=80 overflow="log lines">
-						if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_array) {
-							for (index, line) in lines.iter().enumerate() {
-								if index > 0 { {"\n"} }
-								{line.as_str().unwrap_or_default()}
-							}
-						} else if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_str) {
-							{lines}
+		<col gap=0>
+			<row sep=" · ">
+				<text bold fg=secondary>{"Launch logs:"}</text>
+				if let Some(name) = json_string(object, &["name"]) {
+					<text bold>{name}</text>
+				}
+				if let Some(state) = json_string(object, &["state", "status"]) {
+					{state_view(state)}
+				}
+				if let Some(cursor) = json_u64(object, &["cursor"]) {
+					<text fg=muted>{sf!("cursor {cursor}")}</text>
+				}
+				if object.get("timedOut").and_then(serde_json::Value::as_bool) == Some(true) {
+					<callout kind="warn">{"Log follow timed out."}</callout>
+				}
+			</row>
+			<box border=round bc=border pad="0 1">
+				<pre max-rows=80 overflow="log lines">
+					if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_array) {
+						for (index, line) in lines.iter().enumerate() {
+							if index > 0 { {"\n"} }
+							{line.as_str().unwrap_or_default()}
 						}
-					</pre>
-				</box>
-			</col>
-		</box>
+					} else if let Some(lines) = object.get("lines").and_then(serde_json::Value::as_str) {
+						{lines}
+					}
+				</pre>
+			</box>
+		</col>
 	}
 }
 
@@ -565,66 +553,64 @@ fn render_hub_send(
 	let reply = object.get("reply");
 	let now_ms = now_ms();
 	view! {
-		<box border=round pad="0 1" bc=info>
-			<col gap=0 max-rows=12 overflow="deliveries">
-				<row sep=" · ">
-					<text bold fg=info>{"IRC → "}{to}</text>
-					if deliveries.len() == 1 {
-						{state_view(
-							deliveries[0]
-								.as_object()
-								.and_then(|delivery| json_string(delivery, &["outcome", "status"]))
-								.unwrap_or("delivered")
-						)}
-					} else {
-						if delivered > 0 {
-							<text fg=ok>{sf!("{delivered} delivered")}</text>
-						}
-						if revived > 0 {
-							<text fg=ok>{sf!("{revived} revived")}</text>
-						}
-						if failed > 0 {
-							<text fg=err>{sf!("{failed} failed")}</text>
-						}
+		<col gap=0 max-rows=12 overflow="deliveries">
+			<row sep=" · ">
+				<text bold fg=info>{"IRC → "}{to}</text>
+				if deliveries.len() == 1 {
+					{state_view(
+						deliveries[0]
+							.as_object()
+							.and_then(|delivery| json_string(delivery, &["outcome", "status"]))
+							.unwrap_or("delivered")
+					)}
+				} else {
+					if delivered > 0 {
+						<text fg=ok>{sf!("{delivered} delivered")}</text>
 					}
-				</row>
-				if let Some(sent) = json_string(object, &["sent", "outgoing", "body"])
-					.or_else(|| args_state.and_then(|args| args.message.as_deref()))
-				{
-					{quote_view(sent, false)}
-				}
-				for delivery in deliveries {
-					if let Some(delivery) = delivery.as_object() {
-						<row sep=" · ">
-							{state_view(json_string(delivery, &["outcome", "status"]).unwrap_or("delivered"))}
-							<text bold>{json_string(delivery, &["to", "recipient"]).unwrap_or("unknown")}</text>
-							if let Some(error) = json_string(delivery, &["error", "reason"]) {
-								<callout kind="error">{error}</callout>
-							}
-						</row>
+					if revived > 0 {
+						<text fg=ok>{sf!("{revived} revived")}</text>
+					}
+					if failed > 0 {
+						<text fg=err>{sf!("{failed} failed")}</text>
 					}
 				}
-				if let Some(reply) = reply.and_then(serde_json::Value::as_object) {
+			</row>
+			if let Some(sent) = json_string(object, &["sent", "outgoing", "body"])
+				.or_else(|| args_state.and_then(|args| args.message.as_deref()))
+			{
+				{quote_view(sent, false)}
+			}
+			for delivery in deliveries {
+				if let Some(delivery) = delivery.as_object() {
 					<row sep=" · ">
-						<text fg=info>
-							{"IRC ← "}
-							{json_string(reply, &["from", "sender"]).unwrap_or(to)}
-						</text>
-						if let Some(age_ms) = object_age_ms(reply, now_ms, &["sentMs", "timestampMs"], &["ageMs"]) {
-							{relative_time_view(age_ms)}
-						}
-						if reply.contains_key("replyTo") {
-							<text fg=muted>{"reply"}</text>
+						{state_view(json_string(delivery, &["outcome", "status"]).unwrap_or("delivered"))}
+						<text bold>{json_string(delivery, &["to", "recipient"]).unwrap_or("unknown")}</text>
+						if let Some(error) = json_string(delivery, &["error", "reason"]) {
+							<callout kind="error">{error}</callout>
 						}
 					</row>
-					if let Some(body) = json_string(reply, &["message", "text", "body"]) {
-						{quote_view(body, false)}
-					}
-				} else if reply.is_some_and(serde_json::Value::is_null) {
-					<callout kind="warn">{"No reply yet; check inbox or wait again."}</callout>
 				}
-			</col>
-		</box>
+			}
+			if let Some(reply) = reply.and_then(serde_json::Value::as_object) {
+				<row sep=" · ">
+					<text fg=info>
+						{"IRC ← "}
+						{json_string(reply, &["from", "sender"]).unwrap_or(to)}
+					</text>
+					if let Some(age_ms) = object_age_ms(reply, now_ms, &["sentMs", "timestampMs"], &["ageMs"]) {
+						{relative_time_view(age_ms)}
+					}
+					if reply.contains_key("replyTo") {
+						<text fg=muted>{"reply"}</text>
+					}
+				</row>
+				if let Some(body) = json_string(reply, &["message", "text", "body"]) {
+					{quote_view(body, false)}
+				}
+			} else if reply.is_some_and(serde_json::Value::is_null) {
+				<callout kind="warn">{"No reply yet; check inbox or wait again."}</callout>
+			}
+		</col>
 	}
 }
 
@@ -649,32 +635,30 @@ fn render_hub_inbox(object: &serde_json::Map<String, serde_json::Value>) -> El {
 	};
 	let now_ms = now_ms();
 	view! {
-		<box border=round pad="0 1" bc=info>
-			<col gap=0 max-rows=12 overflow="messages">
-				<row sep=" · ">
-					<text bold fg=info>{"IRC inbox"}</text>
-					<text fg=muted>{count}</text>
-				</row>
-				for message in messages {
-					if let Some(message) = message.as_object() {
-						<row sep=" · ">
-							<text bold fg=info>{json_string(message, &["from", "sender"]).unwrap_or("unknown")}</text>
-							if let Some(age_ms) = object_age_ms(message, now_ms, &["sentMs", "timestampMs"], &["ageMs"]) {
-								{relative_time_view(age_ms)}
-							}
-							if message.get("replyTo").is_some_and(|reply_to| !reply_to.is_null()) {
-								<text fg=muted>{"reply"}</text>
-							}
-						</row>
-						if let Some(body) = json_string(message, &["message", "text", "body"]) {
-							{quote_view(body, false)}
+		<col gap=0 max-rows=12 overflow="messages">
+			<row sep=" · ">
+				<text bold fg=info>{"IRC inbox"}</text>
+				<text fg=muted>{count}</text>
+			</row>
+			for message in messages {
+				if let Some(message) = message.as_object() {
+					<row sep=" · ">
+						<text bold fg=info>{json_string(message, &["from", "sender"]).unwrap_or("unknown")}</text>
+						if let Some(age_ms) = object_age_ms(message, now_ms, &["sentMs", "timestampMs"], &["ageMs"]) {
+							{relative_time_view(age_ms)}
 						}
-					} else {
-						{quote_view(message.as_str().unwrap_or_default(), false)}
+						if message.get("replyTo").is_some_and(|reply_to| !reply_to.is_null()) {
+							<text fg=muted>{"reply"}</text>
+						}
+					</row>
+					if let Some(body) = json_string(message, &["message", "text", "body"]) {
+						{quote_view(body, false)}
 					}
+				} else {
+					{quote_view(message.as_str().unwrap_or_default(), false)}
 				}
-			</col>
-		</box>
+			}
+		</col>
 	}
 }
 
@@ -690,32 +674,30 @@ fn render_hub_wait(
 		.unwrap_or("any peer");
 	let now_ms = now_ms();
 	view! {
-		<box border=round pad="0 1" bc=info>
-			<col gap=0>
-				<row sep=" · ">
-					<text bold fg=info>{"IRC ← "}{from}</text>
-					if let Some(age_ms) = message.and_then(|message| {
-						object_age_ms(message, now_ms, &["sentMs", "timestampMs"], &["ageMs"])
-					}) {
-						{relative_time_view(age_ms)}
-					}
-				</row>
-				if message.is_none() {
-					<callout kind="warn">{"Timed out."}</callout>
-					if let Some(waited) = json_u64(object, &["waitingMs", "waitedMs"]) {
-						<row sep=" · ">
-							<text fg=muted>{"waited"}</text>
-							<time kind="duration" ms={waited}/>
-						</row>
-					}
+		<col gap=0>
+			<row sep=" · ">
+				<text bold fg=info>{"IRC ← "}{from}</text>
+				if let Some(age_ms) = message.and_then(|message| {
+					object_age_ms(message, now_ms, &["sentMs", "timestampMs"], &["ageMs"])
+				}) {
+					{relative_time_view(age_ms)}
 				}
-				if let Some(message) = message
-					&& let Some(body) = json_string(message, &["message", "text", "body"])
-				{
-					{quote_view(body, false)}
+			</row>
+			if message.is_none() {
+				<callout kind="warn">{"Timed out."}</callout>
+				if let Some(waited) = json_u64(object, &["waitingMs", "waitedMs"]) {
+					<row sep=" · ">
+						<text fg=muted>{"waited"}</text>
+						<time kind="duration" ms={waited}/>
+					</row>
 				}
-			</col>
-		</box>
+			}
+			if let Some(message) = message
+				&& let Some(body) = json_string(message, &["message", "text", "body"])
+			{
+				{quote_view(body, false)}
+			}
+		</col>
 	}
 }
 
@@ -753,11 +735,7 @@ fn render_hub_process_or_job(object: &serde_json::Map<String, serde_json::Value>
 				.text(json_compact(value)),
 		);
 	}
-	El::new(Tag::Box)
-		.prop(Prop::Border, "round")
-		.prop(Prop::Pad, "0 1")
-		.prop(Prop::Bc, super::view::Tone::Secondary)
-		.child(content)
+	content
 }
 
 fn quote_view(body: &str, error: bool) -> El {

@@ -501,7 +501,7 @@ fn merge_patch(target: &mut Value, patch: Value) {
 }
 
 pub(crate) fn bash_ir(tool_name: &str, args: &Value, cwd: &Path, root: &Path) -> Option<BashIr> {
-	if tool_name != "shell" {
+	if tool_name != "bash" {
 		return None;
 	}
 	let command = args.get("command")?.as_str()?;
@@ -560,7 +560,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn deadline_synthesizes_a_structured_denial() {
-		let gate = AdmissionGate::new(sf!("call"), sf!("shell"), Duration::ZERO);
+		let gate = AdmissionGate::new(sf!("call"), sf!("bash"), Duration::ZERO);
 		let AdmissionDecision::Denied(denied) =
 			gate.decide(Path::new("/work"), Path::new("/work")).await
 		else {
@@ -575,7 +575,7 @@ mod tests {
 		let (raw, bash) = apply_admission_patch(
 			&requested,
 			br#"{"command":"echo effective"}"#,
-			"shell",
+			"bash",
 			Path::new("/work"),
 			Path::new("/work"),
 		)
@@ -643,23 +643,23 @@ mod tests {
 		};
 		let decision = resolve_approval(
 			"shell-7",
-			"shell",
+			"bash",
 			&effects,
 			ApprovalMode::Yolo,
 			Some(ApprovalPolicy::Deny),
 		);
 		assert_eq!(decision.policy, ApprovalPolicy::Deny);
 		assert_eq!(decision.source, ApprovalSource::User);
-		assert_eq!(decision.policy_key.as_deref(), Some("shell"));
+		assert_eq!(decision.policy_key.as_deref(), Some("bash"));
 		assert_eq!(
 			serde_json::to_value(&decision).expect("durable approval receipt serializes"),
 			serde_json::json!({
 				"invocation_id": "shell-7",
-				"tool_name": "shell",
+				"tool_name": "bash",
 				"tier": "exec",
 				"policy": "deny",
 				"source": "user",
-				"policy_key": "shell"
+				"policy_key": "bash"
 			})
 		);
 	}
@@ -667,7 +667,7 @@ mod tests {
 	#[test]
 	fn derives_only_static_mutating_github_targets() {
 		let bash = bash_ir(
-			"shell",
+			"bash",
 			&serde_json::json!({
 				"command": "gh issue edit 42 --repo Owner/Repo && gh pr view 7"
 			}),
