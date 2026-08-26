@@ -164,7 +164,7 @@ pub enum TransportFailure {
 	Io(#[source] io::Error),
 	/// HTTP client failed.
 	#[error("MCP HTTP transport failed")]
-	Http(#[source] wreq::Error),
+	Http(#[source] reqwest::Error),
 	/// HTTP response status is not successful.
 	#[error("MCP HTTP endpoint returned status {status}")]
 	HttpStatus {

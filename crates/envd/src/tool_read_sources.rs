@@ -7,7 +7,7 @@ use std::{
 	io,
 	path::{Component, Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, LazyLock,
 		atomic::{AtomicU64, Ordering},
 	},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -45,11 +45,18 @@ use super::{
 const MAX_REDIRECTS: usize = 20;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+static READ_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+	omp_http::client_builder()
+		.redirect(redirect::Policy::limited(MAX_REDIRECTS))
+		.referer(false)
+		.build()
+		.expect("build read HTTP client")
+});
 
 use omp_storage::atomic;
+use reqwest::redirect;
 use thiserror::Error;
 use tokio::task;
-use wreq::redirect;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 static MEDIA_COMMIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -133,17 +140,12 @@ fn rewrite_document_media_links(destination: &Path, conversion: &mut Conversion)
 
 #[derive(Clone)]
 struct SystemHttpClient {
-	inner: wreq::Client,
+	inner: reqwest::Client,
 }
 
 impl SystemHttpClient {
 	fn new() -> Self {
-		let inner = wreq::Client::builder()
-			.redirect(redirect::Policy::limited(MAX_REDIRECTS))
-			.referer(false)
-			.build()
-			.expect("build read HTTP client");
-		Self { inner }
+		Self { inner: READ_CLIENT.clone() }
 	}
 
 	async fn request(&self, request: HttpRequest) -> Result<HttpResponse, WebError> {
@@ -189,7 +191,7 @@ impl SystemHttpClient {
 					continue;
 				}
 
-				let final_url = Str::from(response.uri().to_string());
+				let final_url = Str::from(response.url().to_string());
 				let status = response.status().as_u16();
 				let headers = response.headers().clone();
 				let body = match read_bounded(response, max_bytes).await {
@@ -266,7 +268,7 @@ fn request_headers(user_agent: &'static str, caller: &HeaderMap) -> HeaderMap {
 	headers
 }
 
-async fn read_bounded(response: wreq::Response, max_bytes: usize) -> Result<Bytes, WebError> {
+async fn read_bounded(response: reqwest::Response, max_bytes: usize) -> Result<Bytes, WebError> {
 	let content_length = response.content_length();
 	if content_length.is_some_and(|length| length > u64::try_from(max_bytes).unwrap_or(u64::MAX)) {
 		return Err(WebError::ResponseTooLarge { max_bytes });

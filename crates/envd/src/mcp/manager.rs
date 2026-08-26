@@ -65,7 +65,7 @@ use super::{
 	control::{ControlMountResolver, McpControlError},
 	device::{DeviceError, McpDeviceDefinitions, McpDeviceProjection},
 	filter::{NativeCoverage, filter_native_coverage, import_exa_keys},
-	http::{RefreshableHeaders, StreamableHttpConfig, StreamableHttpTransport, WreqExchange},
+	http::{RefreshableHeaders, ReqwestExchange, StreamableHttpConfig, StreamableHttpTransport},
 	invoke,
 	json_rpc::RequestIdFormat,
 	legacy_sse::{LegacySseConfig, LegacySseTransport},
@@ -573,14 +573,14 @@ pub trait McpAuthChallengeHandler: Send + Sync {
 /// Production connector for stdio, Streamable HTTP, and legacy HTTP+SSE.
 pub struct ProductionConnector {
 	workspace_root: PathBuf,
-	http:           Arc<WreqExchange>,
+	http:           Arc<ReqwestExchange>,
 }
 
 impl ProductionConnector {
 	/// Creates a connector whose relative stdio paths belong to this
 	/// Environment.
 	pub fn new(workspace_root: PathBuf) -> Self {
-		Self { workspace_root, http: Arc::new(WreqExchange::new()) }
+		Self { workspace_root, http: Arc::new(ReqwestExchange::new()) }
 	}
 }
 

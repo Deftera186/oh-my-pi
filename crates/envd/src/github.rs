@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
-use wreq::redirect;
 
 use super::{github_url, github_url::GithubCredentialBridge};
 
@@ -34,7 +33,7 @@ pub(crate) struct GithubService {
 	root:        PathBuf,
 	worktrees:   PathBuf,
 	credentials: Arc<GithubCredentialBridge>,
-	client:      wreq::Client,
+	client:      reqwest::Client,
 }
 
 impl GithubService {
@@ -47,10 +46,7 @@ impl GithubService {
 			root,
 			worktrees: state_dir.join("github-worktrees"),
 			credentials,
-			client: wreq::Client::builder()
-				.redirect(redirect::Policy::none())
-				.build()
-				.expect("GitHub client"),
+			client: omp_http::no_redirect_client(),
 		})
 	}
 
@@ -1238,7 +1234,7 @@ fn fault(code: &'static str, message: &'static str) -> Fault {
 fn cancelled_fault() -> Fault {
 	fault("github_cancelled", "GitHub operation was cancelled")
 }
-fn http_fault(error: wreq::Error) -> Fault {
+fn http_fault(error: reqwest::Error) -> Fault {
 	Fault { code: sf!("github_transport_failed"), message: Str::new(error.to_string()) }
 }
 fn io_fault(error: io::Error) -> Fault {

@@ -32,6 +32,7 @@ omp-ext = { workspace = true }
 omp-grep = { workspace = true }
 omp-hashline = { workspace = true }
 omp-inference = { workspace = true }
+omp-http = { workspace = true }
 omp-memory = { workspace = true }
 omp-oauth = { workspace = true }
 omp-proto = { workspace = true, features = ["tonic"] }
@@ -63,7 +64,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
 url = { workspace = true }
-wreq = { workspace = true }
+reqwest.workspace = true
 zeroize = { workspace = true }
 zstd = { workspace = true }
 

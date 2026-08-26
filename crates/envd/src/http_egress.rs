@@ -15,7 +15,6 @@ use strum::Display;
 use thiserror::Error;
 use tokio::time;
 use url::Url;
-use wreq::redirect;
 
 use super::worker_pool::MAX_TUNNEL_BUFFER_BYTES;
 
@@ -25,15 +24,12 @@ const MAX_REDIRECTS: u32 = 10;
 
 #[derive(Clone)]
 pub struct HttpEgressHost {
-	client: wreq::Client,
+	client: reqwest::Client,
 }
 
 impl HttpEgressHost {
 	pub(crate) fn new() -> Self {
-		let client = wreq::Client::builder()
-			.redirect(redirect::Policy::none())
-			.build()
-			.expect("build Environment HTTP egress client");
+		let client = omp_http::no_redirect_client();
 		Self { client }
 	}
 
@@ -133,14 +129,14 @@ pub enum HttpEgressError {
 		variable: ProxyVariable,
 		/// Original transport failure.
 		#[source]
-		source:   wreq::Error,
+		source:   reqwest::Error,
 	},
 	#[error("HTTP egress transport failed: {0}")]
 	Transport(String),
 }
 
 impl HttpEgressError {
-	fn transport(error: wreq::Error) -> Self {
+	fn transport(error: reqwest::Error) -> Self {
 		let diagnostic = error.to_string();
 		let proxy_failure = {
 			let diagnostic = diagnostic.to_ascii_lowercase();
@@ -282,7 +278,7 @@ fn response_headers(headers: &HeaderMap) -> Vec<pb::HttpHeader> {
 		.collect()
 }
 
-async fn read_bounded(response: wreq::Response) -> Result<Bytes, HttpEgressError> {
+async fn read_bounded(response: reqwest::Response) -> Result<Bytes, HttpEgressError> {
 	if response
 		.content_length()
 		.is_some_and(|length| length > MAX_TUNNEL_BUFFER_BYTES as u64)

@@ -21,7 +21,6 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use wreq::redirect;
 
 use super::{
 	header_policy,
@@ -166,26 +165,21 @@ pub trait HttpExchange: Send + Sync {
 
 /// System HTTP exchange used by production MCP transports.
 #[derive(Clone)]
-pub struct WreqExchange {
-	client: wreq::Client,
+pub struct ReqwestExchange {
+	client: reqwest::Client,
 }
-impl WreqExchange {
+impl ReqwestExchange {
 	/// Creates a redirect-disabled bounded exchange.
 	pub fn new() -> Self {
-		Self {
-			client: wreq::Client::builder()
-				.redirect(redirect::Policy::none())
-				.build()
-				.expect("build MCP HTTP client"),
-		}
+		Self { client: omp_http::no_redirect_client() }
 	}
 }
-impl Default for WreqExchange {
+impl Default for ReqwestExchange {
 	fn default() -> Self {
 		Self::new()
 	}
 }
-impl HttpExchange for WreqExchange {
+impl HttpExchange for ReqwestExchange {
 	fn execute(&self, request: HttpRequest) -> HttpFuture<'_> {
 		Box::pin(async move {
 			let response = self
@@ -217,7 +211,7 @@ impl HttpExchange for WreqExchange {
 pub enum HttpExchangeError {
 	/// System HTTP client failed.
 	#[error("MCP HTTP exchange failed")]
-	Http(#[source] wreq::Error),
+	Http(#[source] reqwest::Error),
 	/// Response exceeded the bounded MCP frame limit.
 	#[error("MCP HTTP response exceeded its size limit")]
 	ResponseTooLarge,

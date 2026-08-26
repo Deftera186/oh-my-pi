@@ -26,7 +26,6 @@ use omp_storage::github_cache::{
 };
 use omp_tools::read::{Fault, resolver::Resolve, selector::ParsedSelector};
 use serde_json::Value;
-use wreq::redirect;
 
 use super::tool_url;
 
@@ -107,7 +106,7 @@ pub(super) struct GithubResolver {
 	root:        PathBuf,
 	cache:       Arc<GithubCache>,
 	credentials: Arc<GithubCredentialBridge>,
-	client:      wreq::Client,
+	client:      reqwest::Client,
 }
 
 impl GithubResolver {
@@ -117,16 +116,7 @@ impl GithubResolver {
 		cache: Arc<GithubCache>,
 		credentials: Arc<GithubCredentialBridge>,
 	) -> Self {
-		Self {
-			scheme,
-			root,
-			cache,
-			credentials,
-			client: wreq::Client::builder()
-				.redirect(redirect::Policy::none())
-				.build()
-				.expect("GitHub client"),
-		}
+		Self { scheme, root, cache, credentials, client: omp_http::no_redirect_client() }
 	}
 
 	async fn resolve(&self, resource: &str, query: Option<&str>) -> Result<Vec<u8>, Fault> {
