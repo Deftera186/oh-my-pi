@@ -9,9 +9,9 @@ mod domains;
 pub use domains::{
 	AppearanceSettings, CompletionSettings, CredentialKeySourceSetting, DisplaySettings,
 	ErrorNotificationSettings, HyperlinkMode, InteractionSettings, LifecycleSettings,
-	MarketplaceUpdateMode, NotifyToggle, ResizeScrollbackMode, RootDisplaySettings, ShareSettings,
-	ShareStore, ShimmerMode, SteeringMode, TitleSettings, TtsrContextMode, TtsrInterruptMode,
-	TtsrSettings, TuiSettings, UnexpectedStopMode,
+	MarketplaceUpdateMode, NotifyToggle, RecapSettings, ResizeScrollbackMode, RootDisplaySettings,
+	ShareSettings, ShareStore, ShimmerMode, SteeringMode, TitleSettings, TtsrContextMode,
+	TtsrInterruptMode, TtsrSettings, TuiSettings, UnexpectedStopMode,
 };
 pub use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
 impl PromptSettings {
@@ -868,6 +868,9 @@ pub struct Settings {
 	/// Session title generation policy.
 	#[serde(default)]
 	pub title:             TitleSettings,
+	/// Idle recap generation policy.
+	#[serde(default)]
+	pub recap:             RecapSettings,
 	/// Client-scope extension overlay.
 	#[serde(default)]
 	pub extensions:        ExtensionOverlay,

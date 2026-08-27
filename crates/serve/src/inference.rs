@@ -2005,6 +2005,13 @@ fn thread_messages(thread: &thread_pb::Thread) -> Result<Vec<Message>, Status> {
 	items_messages(&thread.items)
 }
 
+/// Projects thread items into canonical messages, exactly one per item.
+///
+/// The 1:1 mapping is load-bearing: context revisions (`Revision.head`,
+/// `truncate_to`, `provider_heads`) count items, and the context store indexes
+/// its retained message list by those heads. Wire-shape concerns (merging one
+/// assistant turn's parallel tool calls into a single provider message) belong
+/// to the codecs, never to this projection.
 fn items_messages(items: &[thread_pb::Item]) -> Result<Vec<Message>, Status> {
 	items
 		.iter()
@@ -3681,6 +3688,72 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[test]
+	fn items_project_to_exactly_one_message_each() {
+		// Context revisions (`Revision.head`, `truncate_to`, `provider_heads`)
+		// count items and index the retained message list by that head, so the
+		// projection must stay 1:1. Assistant-run merging for strict OpenAI
+		// validators happens in the codecs instead.
+		let items = vec![
+			thread_pb::Item {
+				seq:           0,
+				created_at_ms: 0,
+				props:         None,
+				kind:          Some(item::Kind::Message(thread_pb::Message {
+					role:  thread_pb::Role::Assistant as i32,
+					parts: vec![thread_pb::Part {
+						kind: Some(part::Kind::Text("writing two files".to_owned())),
+					}],
+				})),
+			},
+			tool_call_item("call_a"),
+			tool_call_item("call_b"),
+			tool_result_item("call_a"),
+			tool_result_item("call_b"),
+		];
+		let messages = items_messages(&items).expect("items project");
+		assert_eq!(messages.len(), items.len());
+		let roles = messages
+			.iter()
+			.map(|message| message.role)
+			.collect::<Vec<_>>();
+		assert_eq!(roles, [
+			Role::Assistant,
+			Role::Assistant,
+			Role::Assistant,
+			Role::Tool,
+			Role::Tool
+		]);
+	}
+
+	fn tool_call_item(id: &str) -> thread_pb::Item {
+		thread_pb::Item {
+			seq:           0,
+			created_at_ms: 0,
+			props:         None,
+			kind:          Some(item::Kind::ToolCall(thread_pb::ToolCall {
+				id: id.to_owned(),
+				name: "write".to_owned(),
+				args_json: br#"{"path":"a"}"#.to_vec().into(),
+				..Default::default()
+			})),
+		}
+	}
+
+	fn tool_result_item(id: &str) -> thread_pb::Item {
+		thread_pb::Item {
+			seq:           0,
+			created_at_ms: 0,
+			props:         None,
+			kind:          Some(item::Kind::ToolResult(thread_pb::ToolResult {
+				call_id: id.to_owned(),
+				name: "write".to_owned(),
+				parts: vec![thread_pb::Part { kind: Some(part::Kind::Text("ok".to_owned())) }],
+				..Default::default()
+			})),
+		}
+	}
 
 	struct GrammarFixture {
 		spec: ToolSpec,

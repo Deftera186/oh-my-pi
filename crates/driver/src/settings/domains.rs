@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, HashSet};
 pub use omp_agent::UnexpectedStopMode;
 use omp_core::Str;
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain,
+	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
+	SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -862,6 +863,52 @@ impl SettingsDomain for TitleSettings {
 	)];
 }
 
+/// Idle recap generation policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RecapSettings {
+	/// Generate an ephemeral recap after the session becomes idle.
+	pub enabled:      bool,
+	/// Seconds to wait while idle before requesting the recap.
+	pub idle_seconds: u64,
+}
+
+impl Default for RecapSettings {
+	fn default() -> Self {
+		Self { enabled: true, idle_seconds: 240 }
+	}
+}
+
+impl SettingsDomain for RecapSettings {
+	const DOMAIN: &'static str = "recap";
+	const FIELDS: &'static [FieldDescriptor] = &[
+		field(
+			"recap.enabled",
+			"Idle Recap",
+			"Generate a brief LLM recap of where things stand after the terminal has been idle",
+			SettingKind::Boolean,
+			10,
+		),
+		FieldDescriptor {
+			path:        "recap.idleSeconds",
+			label:       "Idle Recap Delay",
+			description: "Seconds to wait while idle before showing the recap",
+			kind:        SettingKind::Integer,
+			scopes:      PERSISTED,
+			order:       20,
+			options:     Some(OptionProvider::Static(&[
+				SettingOption { value: "60", label: "1 minute", description: None },
+				SettingOption { value: "120", label: "2 minutes", description: None },
+				SettingOption { value: "240", label: "4 minutes", description: None },
+				SettingOption { value: "300", label: "5 minutes", description: None },
+				SettingOption { value: "600", label: "10 minutes", description: None },
+			])),
+			condition:   None,
+			secret:      false,
+		},
+	];
+}
+
 /// Marketplace catalog refresh and update policy.
 #[derive(
 	Clone,
@@ -1140,4 +1187,5 @@ omp_settings::inventory::submit! { DomainRegistration::of::<InteractionSettings>
 omp_settings::inventory::submit! { DomainRegistration::of::<TtsrSettings>() }
 omp_settings::inventory::submit! { DomainRegistration::of::<ShareSettings>() }
 omp_settings::inventory::submit! { DomainRegistration::of::<TitleSettings>() }
+omp_settings::inventory::submit! { DomainRegistration::of::<RecapSettings>() }
 omp_settings::inventory::submit! { DomainRegistration::of::<LifecycleSettings>() }

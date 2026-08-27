@@ -1833,12 +1833,16 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 }
 
 fn bridge_message(role: Role, text: &str) -> Item {
+	bridge_owned_message(role, text.to_owned())
+}
+
+fn bridge_owned_message(role: Role, text: String) -> Item {
 	Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(Message {
 			role:  i32::from(role),
-			parts: vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())) }],
+			parts: vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text)) }],
 		})),
 		props:         None,
 	}
@@ -3885,6 +3889,36 @@ fn append_production_child_init(
 	Ok(())
 }
 
+const SIDE_CHANNEL_NO_TOOLS: &str = concat!(
+	"<system-reminder>\n",
+	"Ephemeral side-channel turn; reuses current conversation context.\n",
+	"Tool catalog attached only to keep prompt cache warm; tools NOT available this turn.\n",
+	"Do NOT emit tool calls; reply plain text only. Tool calls discarded without execution.\n",
+	"</system-reminder>",
+);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AuxiliaryCompletionOptions {
+	greedy: bool,
+}
+
+impl AuxiliaryCompletionOptions {
+	const TITLE: Self = Self { greedy: true };
+
+	fn apply(self, params: &mut inference_pb::ChatParams) {
+		if !self.greedy {
+			return;
+		}
+		let sampling = params.sampling.get_or_insert_default();
+		sampling.temperature = Some(0.0);
+		sampling.max_output_tokens = Some(1_024);
+		params.thinking = Some(inference_pb::Reasoning {
+			effort: Effort::Off as i32,
+			..inference_pb::Reasoning::default()
+		});
+	}
+}
+
 fn bridge_outcome_text(outcome: &inference_pb::Outcome) -> String {
 	let mut text = String::new();
 	for item in &outcome.output {
@@ -3950,12 +3984,30 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		system_prompt: &str,
 		input: &str,
 	) -> Result<Option<Str>, Str> {
+		self
+			.complete_auxiliary_model_with_options(
+				model,
+				system_prompt,
+				input,
+				AuxiliaryCompletionOptions::default(),
+			)
+			.await
+	}
+
+	async fn complete_auxiliary_model_with_options(
+		&self,
+		model: &str,
+		system_prompt: &str,
+		input: &str,
+		auxiliary: AuxiliaryCompletionOptions,
+	) -> Result<Option<Str>, Str> {
 		let context = self.context.lock().clone();
 		let mut params = context.state.snapshot().turn.params.clone();
 		params.tools.clear();
 		params.tool_choice = None;
 		params.response_format = None;
 		params.model = model.to_owned();
+		auxiliary.apply(&mut params);
 		let options = TurnOptions {
 			context_id: None,
 			params,
@@ -3970,6 +4022,53 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			.client
 			.turn(
 				TurnId::new(format!("auxiliary-{}", omp_core::Ulid::generate())),
+				TurnInput::Full(Thread { items }),
+				&options,
+			)
+			.await
+			.map_err(|error| Str::from(error.to_string()))?;
+		let mut events = turn.events();
+		while let Some(event) = events.next().await {
+			let event = event.map_err(|error| Str::from(error.to_string()))?;
+			match event.event {
+				Some(turn_event::Event::Outcome(outcome)) => {
+					return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
+				},
+				Some(turn_event::Event::Error(error)) => return Err(Str::from(error.detail)),
+				_ => {},
+			}
+		}
+		Ok(None)
+	}
+
+	/// Runs one non-persisted side-channel turn over a projected live thread.
+	pub async fn run_ephemeral_turn(
+		&self,
+		thread: omp_proto::thread::v1::Thread,
+		prompt_text: &str,
+	) -> Result<Option<Str>, Str> {
+		let context = self.context.lock().clone();
+		let mut params = context.state.snapshot().turn.params.clone();
+		params.tool_choice = None;
+		params.response_format = None;
+		let options = TurnOptions {
+			context_id: None,
+			params,
+			executor: None,
+			props: None,
+			provider_reset: false,
+			stream_watchdog: omp_agent::StreamWatchdog::default(),
+		};
+		let mut items = thread.items;
+		let mut prompt = String::with_capacity(SIDE_CHANNEL_NO_TOOLS.len() + 2 + prompt_text.len());
+		prompt.push_str(SIDE_CHANNEL_NO_TOOLS);
+		prompt.push_str("\n\n");
+		prompt.push_str(prompt_text);
+		items.push(bridge_owned_message(Role::User, prompt));
+		let mut turn = self
+			.client
+			.turn(
+				TurnId::new(format!("side-{}", omp_core::Ulid::generate())),
 				TurnInput::Full(Thread { items }),
 				&options,
 			)
@@ -4069,7 +4168,16 @@ impl<C: TurnClient + Clone + Send + 'static> OnlineTitleCompletion for ChatParen
 		input: &'a str,
 	) -> Pin<Box<dyn Future<Output = Result<Option<Str>, Str>> + Send + 'a>> {
 		let role = roles.first().copied().unwrap_or("tiny");
-		Box::pin(self.complete_auxiliary_text(role, system_prompt, input))
+		Box::pin(async move {
+			self
+				.complete_auxiliary_model_with_options(
+					&format!("@{role}"),
+					system_prompt,
+					input,
+					AuxiliaryCompletionOptions::TITLE,
+				)
+				.await
+		})
 	}
 }
 
@@ -6500,6 +6608,30 @@ mod tests {
 	use omp_storage::transcript::{Event, ItemRecord, TitleSource, Writer};
 
 	use super::*;
+
+	#[test]
+	fn title_auxiliary_options_pin_greedy_non_reasoning_sampling() {
+		let mut params = inference_pb::ChatParams {
+			sampling: Some(inference_pb::Sampling {
+				top_p: Some(0.8),
+				..inference_pb::Sampling::default()
+			}),
+			thinking: Some(inference_pb::Reasoning {
+				effort: Effort::High as i32,
+				..inference_pb::Reasoning::default()
+			}),
+			..inference_pb::ChatParams::default()
+		};
+		AuxiliaryCompletionOptions::TITLE.apply(&mut params);
+		let sampling = params.sampling.as_ref().expect("sampling");
+		assert_eq!(sampling.temperature, Some(0.0));
+		assert_eq!(sampling.max_output_tokens, Some(1_024));
+		assert_eq!(sampling.top_p, Some(0.8));
+		assert_eq!(
+			params.thinking.as_ref().map(|thinking| thinking.effort),
+			Some(Effort::Off as i32)
+		);
+	}
 
 	#[test]
 	fn auto_thinking_installs_a_clamped_provisional_effort() {

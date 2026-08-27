@@ -1,6 +1,7 @@
 //! Typed `OpenAI` Chat Completions request and incremental response codec.
 
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, btree_map::Entry},
 	str,
 	time::Duration,
@@ -914,8 +915,9 @@ fn lower_messages(
 	profile: &OpenAiChatProfile,
 	messages: &[Message],
 ) -> Result<Vec<WireMessage>, Error> {
+	let messages = merge_assistant_runs(messages);
 	let mut lowered = Vec::new();
-	for message in messages {
+	for message in messages.iter() {
 		let role = match message.role {
 			Role::System => profile.system_role,
 			Role::Developer if profile.system_role == WireRole::Developer => WireRole::Developer,
@@ -1141,6 +1143,41 @@ fn proof_detail(value: &[u8], id: Option<Str>) -> WireReasoningReplay {
 	let data =
 		str::from_utf8(value).map_or_else(|_| base64::encode(value).into_string(), str::to_owned);
 	WireReasoningReplay::Encrypted { kind: ReasoningEncryptedTag::Encrypted, id, data }
+}
+
+/// Merges runs of consecutive assistant messages into one canonical message.
+///
+/// The durable thread stores one item per message, so one assistant turn with
+/// parallel tool calls arrives as a text message followed by single-call
+/// assistant messages. Strict OpenAI-compatible validators (kimi-code,
+/// vLLM-style gateways) reject an assistant `tool_calls` message that is not
+/// immediately followed by its tool responses, so each run must collapse into
+/// one wire message before lowering.
+fn merge_assistant_runs(messages: &[Message]) -> Cow<'_, [Message]> {
+	if !messages
+		.windows(2)
+		.any(|pair| pair[0].role == Role::Assistant && pair[1].role == Role::Assistant)
+	{
+		return Cow::Borrowed(messages);
+	}
+	let mut merged: Vec<Message> = Vec::with_capacity(messages.len());
+	for message in messages {
+		match merged.last_mut() {
+			Some(previous) if previous.role == Role::Assistant && message.role == Role::Assistant => {
+				previous.content = previous
+					.content
+					.iter()
+					.chain(message.content.iter())
+					.cloned()
+					.collect();
+				if previous.name.is_none() {
+					previous.name.clone_from(&message.name);
+				}
+			},
+			_ => merged.push(message.clone()),
+		}
+	}
+	Cow::Owned(merged)
 }
 
 fn project_call_id(profile: ToolIdWireProfile, value: &str) -> Str {
@@ -3493,6 +3530,61 @@ mod tests {
 				.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 		);
 		assert_eq!(wire["messages"][2]["tool_call_id"].as_str(), Some(id));
+	}
+
+	#[test]
+	fn assistant_run_with_parallel_calls_collapses_into_one_wire_message() {
+		// The durable thread stores one item per message, so one assistant
+		// turn arrives as [text, call, call]. kimi-code K3 400s ("tool_call_ids
+		// did not have response messages: write:1") when the calls stay in
+		// consecutive assistant messages ahead of their tool responses.
+		let call_message = |id: &str| Message {
+			role:    Role::Assistant,
+			content: Arc::from([ContentPart::ToolCall {
+				call:      crate::id::ToolCallId::new(id),
+				name:      "write".into(),
+				arguments: OpaqueJson::new(serde_json::json!({"path": "a"})),
+				proof:     None,
+			}]),
+			name:    None,
+		};
+		let result_message = |id: &str| Message {
+			role:    Role::Tool,
+			content: Arc::from([ContentPart::ToolResult {
+				call:     crate::id::ToolCallId::new(id),
+				name:     Some("write".into()),
+				content:  Arc::from([ToolResultContent::Text("ok".into())]),
+				is_error: false,
+			}]),
+			name:    None,
+		};
+		let replay = request(Arc::from([
+			Message {
+				role:    Role::Assistant,
+				content: Arc::from([ContentPart::Text {
+					text:  "writing two files".into(),
+					proof: None,
+				}]),
+				name:    None,
+			},
+			call_message("call_a"),
+			call_message("call_b"),
+			result_message("call_a"),
+			result_message("call_b"),
+		]));
+		let body = OpenAiChatCodec::default()
+			.encode_chat("gateway-model", &replay)
+			.expect("replay encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		let messages = wire["messages"].as_array().expect("wire messages");
+		assert_eq!(messages.len(), 3, "one assistant turn plus two tool responses: {wire}");
+		assert_eq!(messages[0]["role"], "assistant");
+		assert_eq!(messages[0]["content"], "writing two files");
+		assert_eq!(messages[0]["tool_calls"][0]["id"], "call_a");
+		assert_eq!(messages[0]["tool_calls"][1]["id"], "call_b");
+		assert_eq!(messages[1]["role"], "tool");
+		assert_eq!(messages[1]["tool_call_id"], "call_a");
+		assert_eq!(messages[2]["tool_call_id"], "call_b");
 	}
 
 	fn thinking_request(effort: ReasoningEffort) -> ChatRequest {
