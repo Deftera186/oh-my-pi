@@ -122,7 +122,7 @@ use super::{
 	presence::{PresenceError, PresenceLease, PresenceRegistry},
 	process_store::{ProcessStore, ShutdownAcknowledgement},
 	resource_materializer::{MaterializationError, ResourceMaterializer},
-	schedules::ScheduleDeliveryBackend,
+	schedules::{DurableScheduleError, ScheduleDeliveryBackend},
 	search_backend::SearchBridgeHost,
 	site::{SiteError, SiteMaterializer, record_modules},
 	staged_preview,
@@ -309,6 +309,9 @@ pub enum EnvdError {
 	/// The Python tool worker could not be started or supervised.
 	#[error(transparent)]
 	Worker(#[from] WorkerError),
+	/// The durable schedule authority failed or was generation-fenced.
+	#[error(transparent)]
+	Schedule(#[from] DurableScheduleError),
 	/// A native or worker tool declaration could not be registered.
 	#[error(transparent)]
 	Registry(#[from] RegistryError),

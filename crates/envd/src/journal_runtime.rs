@@ -112,8 +112,7 @@ impl ExternalJournalActor {
 		let sessions_dir = state_dir.join("sessions");
 		let artifact_meta = ArtifactMetadataStore::open(blobs.store())
 			.map_err(|error| EnvdError::Blob(Str::from(error.to_string())))?;
-		let schedules = open_durable_scheduler_unbound(&state_dir.join("agent-schedules.sqlite"))
-			.map_err(|error| EnvdError::Worker(WorkerError::Protocol(Str::from(error.to_string()))))?;
+		let schedules = open_durable_scheduler_unbound(&state_dir.join("agent-schedules.sqlite"))?;
 		let (sender, receiver) = flume::unbounded::<ExternalJournalCall>();
 		let agent = Arc::new(Mutex::new(None));
 		let actor_agent = Arc::clone(&agent);
@@ -206,11 +205,7 @@ impl ExternalJournalActor {
 		&self,
 		backend: Arc<dyn ScheduleDeliveryBackend>,
 	) -> Result<(), EnvdError> {
-		self
-			.schedules
-			.bind_delivery(backend)
-			.await
-			.map_err(|error| EnvdError::Worker(WorkerError::Protocol(Str::from(error.to_string()))))
+		Ok(self.schedules.bind_delivery(backend).await?)
 	}
 
 	pub(crate) fn unbind_agent(&self, id: u64) {
