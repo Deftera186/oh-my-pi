@@ -3021,6 +3021,7 @@ impl Chat {
 			| BackendEvent::OpenModelPicker { .. }
 			| BackendEvent::ModelsUpdated { .. }
 			| BackendEvent::Sessions(_)
+			| BackendEvent::WelcomeLspServers(_)
 			| BackendEvent::LoginProviders(_)
 			| BackendEvent::LogoutChoices { .. }
 			| BackendEvent::RewindTargets(_)

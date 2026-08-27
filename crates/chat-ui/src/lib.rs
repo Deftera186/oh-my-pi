@@ -144,6 +144,16 @@ pub struct SessionRow {
 	/// Whether the session is pinned above ordinary recency ordering.
 	pub pinned: bool,
 }
+/// One language server shown on the welcome card.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WelcomeLspServer {
+	/// Declared server name.
+	pub name:        Str,
+	/// Lowercase lifecycle label, optionally followed by file types.
+	pub stage_label: Str,
+	/// Whether the lifecycle ended in failure.
+	pub failed:      bool,
+}
 /// One live node projected from the core-owned `AgentTree` roster.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentRow {
@@ -989,6 +999,8 @@ pub enum BackendEvent {
 	},
 	/// Replace resumable sessions.
 	Sessions(Vec<SessionRow>),
+	/// Replace language server facts shown while the welcome card is open.
+	WelcomeLspServers(Vec<WelcomeLspServer>),
 	/// Replace provider-login choices; each row's `id` is the provider key.
 	LoginProviders(Vec<SessionRow>),
 	/// Open one stage of provider logout selection.

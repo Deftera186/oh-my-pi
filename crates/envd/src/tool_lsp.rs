@@ -349,6 +349,58 @@ impl DocumentLspControl {
 	}
 }
 
+fn lsp_roster_payload(action: Action, roster: pb::LspStatusResponse, workspace: &str) -> Payload {
+	let servers = roster
+		.servers
+		.iter()
+		.map(|server| Str::from(server.name.as_str()))
+		.collect();
+	let entries = roster
+		.servers
+		.iter()
+		.map(|server| {
+			let stage = lsp_stage_name(server.stage);
+			json!({
+				"name": server.name,
+				"stage": stage,
+				"fileTypes": server.file_types,
+				"detail": server.detail,
+				"source": server.source,
+			})
+		})
+		.collect::<Vec<_>>();
+	let lines = roster
+		.servers
+		.iter()
+		.map(|server| {
+			let stage = lsp_stage_name(server.stage);
+			let mut line = format!("{}: {stage} ({})", server.name, server.file_types.join(", "));
+			if stage == "failed" && !server.detail.is_empty() {
+				line.push_str(": ");
+				line.push_str(&server.detail);
+			}
+			line
+		})
+		.collect::<Vec<_>>();
+	let output = if lines.is_empty() {
+		Str::new_static("No native language servers discovered")
+	} else {
+		Str::from(lines.join("\n"))
+	};
+	Payload { action, servers, output, data: json!({ "workspace": workspace, "servers": entries }) }
+}
+
+fn lsp_stage_name(stage: i32) -> &'static str {
+	match pb::LspServerStage::try_from(stage) {
+		Ok(pb::LspServerStage::Available) => "available",
+		Ok(pb::LspServerStage::Starting) => "starting",
+		Ok(pb::LspServerStage::Indexing) => "indexing",
+		Ok(pb::LspServerStage::Ready) => "ready",
+		Ok(pb::LspServerStage::Failed) => "failed",
+		Ok(pb::LspServerStage::Unspecified) | Err(_) => "unspecified",
+	}
+}
+
 impl LspControl for DocumentLspControl {
 	fn execute(
 		&self,
@@ -363,16 +415,20 @@ impl LspControl for DocumentLspControl {
 				if params.action == Action::Diagnostics {
 					return self.workspace_diagnostics(&cancel).await;
 				}
-				if params.action == Action::Status {
-					return Ok(Payload {
-						action:  params.action,
-						servers: Vec::new(),
-						output:  Str::from(
-							"Native project document daemon is connected; provide a file for binding \
-							 status",
-						),
-						data:    json!({ "daemon": "connected", "workspace": self.documents.hello().root_uri }),
-					});
+				if matches!(params.action, Action::Status | Action::Reload) {
+					let roster = self
+						.documents
+						.lsp_status(
+							pb::LspStatusRequest { reload: params.action == Action::Reload },
+							&cancel,
+						)
+						.await
+						.map_err(|_| Fault::Server)?;
+					return Ok(lsp_roster_payload(
+						params.action,
+						roster,
+						self.documents.hello().root_uri.as_str(),
+					));
 				}
 				return Err(Fault::InvalidArguments);
 			}

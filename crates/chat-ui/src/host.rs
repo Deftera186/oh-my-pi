@@ -368,7 +368,10 @@ async fn run_welcome(
 					},
 			backend = events.recv_async() => match backend {
 						Ok(BackendEvent::Sessions(rows)) => welcome.set_sessions(rows),
-										Ok(BackendEvent::ModelDownloadProgress(progress)) => {
+						Ok(BackendEvent::WelcomeLspServers(servers)) => {
+							welcome.set_lsp_servers(servers);
+						},
+						Ok(BackendEvent::ModelDownloadProgress(progress)) => {
 							welcome.set_download_progress(progress, started.elapsed());
 						},
 		Ok(BackendEvent::OpenModelPicker { rows, current }
@@ -2576,6 +2579,7 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 			update_models(host, rows, current);
 		},
 		BackendEvent::Sessions(rows) => open_sessions(host, rows, ctx),
+		BackendEvent::WelcomeLspServers(_) => {},
 		BackendEvent::LoginProviders(rows) => open_login_providers(host, rows, ctx),
 		BackendEvent::LogoutChoices { title, rows } => open_logout_choices(host, title, rows, ctx),
 		BackendEvent::RewindTargets(rows) => open_rewind(host, rows, ctx),

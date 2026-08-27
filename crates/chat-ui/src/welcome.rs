@@ -34,7 +34,7 @@ use omp_tui::{
 	shader::{Eclipse, Surface},
 };
 
-use crate::{ModelDownloadProgress, SessionRow};
+use crate::{ModelDownloadProgress, SessionRow, WelcomeLspServer};
 
 /// Wide card: logo on the left, recent sessions on the right.
 const CARD_COLS: u16 = 98;
@@ -208,6 +208,7 @@ pub struct Welcome {
 	palette:        AperturePalette,
 	sessions:       Vec<SessionRow>,
 	selected:       usize,
+	lsp_servers:    Vec<WelcomeLspServer>,
 	camera:         (f32, f32),
 	camera_target:  (f32, f32),
 	last_elapsed:   f32,
@@ -242,6 +243,7 @@ impl Welcome {
 			),
 			sessions:       sessions.into_iter().take(3).collect(),
 			selected:       0,
+			lsp_servers:    Vec::new(),
 			camera:         (0.0, 0.0),
 			camera_target:  (0.0, 0.0),
 			last_elapsed:   0.0,
@@ -272,6 +274,12 @@ impl Welcome {
 		sessions.truncate(3);
 		self.sessions = sessions;
 		self.selected = self.selected.min(self.sessions.len());
+	}
+
+	/// Replaces the compact language-server facts shown on the wide card.
+	pub fn set_lsp_servers(&mut self, mut servers: Vec<WelcomeLspServer>) {
+		servers.truncate(3);
+		self.lsp_servers = servers;
 	}
 
 	/// Routes navigation and commit keys through the session index.
@@ -493,6 +501,7 @@ impl Welcome {
 			let live = sf!(" {} LIVE ", self.charset.icon(Icon::Enabled));
 			frame.put(left + cols - 11, top, &live, on_card(theme, theme.secondary));
 			draw_sessions(frame, left, top, self.charset, theme, &self.sessions, self.selected);
+			draw_lsp_servers(frame, left, top, self.charset, theme, &self.lsp_servers);
 		}
 
 		draw_instrument_hud(frame, logo_left, top, theme);
@@ -564,6 +573,43 @@ fn draw_sessions(
 		}
 	}
 	frame.put(panel_x, top + 12, "INDEXED / LOCAL", on_card(theme, theme.border));
+}
+
+fn draw_lsp_servers(
+	frame: &mut Frame,
+	left: u16,
+	top: u16,
+	charset: Charset,
+	theme: Theme,
+	servers: &[WelcomeLspServer],
+) {
+	if servers.is_empty() {
+		return;
+	}
+
+	let mut x = left + 40;
+	let right = left + CARD_COLS - 2;
+	frame.fill(Rect::new(x, top + 12, right - x, 1), on_card(theme, theme.fg));
+	frame.put(x, top + 12, "LSP", on_card(theme, theme.border).bold());
+	x += 4;
+	for server in servers.iter().take(3) {
+		let (glyph, color) = if server.failed {
+			(charset.icon(Icon::Error), theme.err)
+		} else if server.stage_label.starts_with("ready") {
+			(charset.check(), theme.ok)
+		} else if server.stage_label.starts_with("available") {
+			(charset.radio(false), theme.muted)
+		} else {
+			(charset.icon(Icon::Warning), theme.warn)
+		};
+		let row = sf!("{glyph} {} {}", server.name, server.stage_label);
+		let width = row.chars().count() as u16;
+		if x.saturating_add(width) > right {
+			break;
+		}
+		frame.put(x, top + 12, row.as_str(), on_card(theme, color));
+		x += width + 2;
+	}
 }
 
 fn draw_full_hints(frame: &mut Frame, left: u16, y: u16, theme: Theme) {
@@ -1039,7 +1085,7 @@ mod tests {
 		RING_GLASS_OPACITY, RING_INNER_RADIUS, RING_OUTER_RADIUS, RING_RIM_WIDTH, Rect, Size, TAU,
 		Theme, UiContext, Welcome, perimeter_angle, ring_basis, shortest_angle_delta,
 	};
-	use crate::SessionRow;
+	use crate::{SessionRow, WelcomeLspServer};
 
 	fn context() -> UiContext {
 		UiContext { charset: Charset::NerdFont, ..UiContext::default() }
@@ -1115,6 +1161,28 @@ mod tests {
 			(0..frame.size().height).any(|row| frame_row_text(frame, row).contains(pin)),
 			"pinned resume row renders the themed pin icon"
 		);
+	}
+
+	#[test]
+	fn full_card_renders_compact_lsp_facts_with_themed_statuses() {
+		let mut welcome = Welcome::new(&context(), sessions());
+		welcome.set_lsp_servers(vec![
+			WelcomeLspServer {
+				name:        Str::new_static("rust"),
+				stage_label: Str::new_static("ready (rs)"),
+				failed:      false,
+			},
+			WelcomeLspServer {
+				name:        Str::new_static("ts"),
+				stage_label: Str::new_static("failed (ts)"),
+				failed:      true,
+			},
+		]);
+		let frame = welcome.render(Size::new(100, 21), Duration::from_millis(2_000));
+		let row = frame_row_text(frame, 14);
+		assert!(row.contains("LSP"));
+		assert!(row.contains("rust ready (rs)"));
+		assert!(row.contains("ts failed (ts)"));
 	}
 
 	#[test]
