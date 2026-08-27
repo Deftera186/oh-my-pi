@@ -2,7 +2,7 @@ use std::{
 	future,
 	num::NonZeroUsize,
 	sync::{
-		Arc,
+		Arc, Mutex as StdMutex,
 		atomic::{AtomicUsize, Ordering},
 	},
 };
@@ -11,7 +11,12 @@ use bytes::Bytes;
 use futures::{FutureExt as _, StreamExt as _, stream};
 use omp_catalog::{OperationKind, ProviderId, RouteId};
 use omp_core::{Str, sf};
-use tokio::{net::TcpListener, sync::oneshot, time};
+use tokio::{
+	io::{AsyncReadExt as _, AsyncWriteExt as _},
+	net::TcpListener,
+	sync::oneshot,
+	time,
+};
 use tokio_tungstenite::tungstenite;
 use tower::{Service as _, ServiceExt as _};
 
@@ -26,16 +31,36 @@ use crate::{
 	},
 	call::{NegotiationPolicy, RealtimeModality, RealtimeRequest, Setting},
 	codec::{
-		Cancellation, Decoder, EncodedRequest, ProviderMetadataEvent, ProviderStateEvent,
-		RawCompletion, RawEvent, RealtimeEvents, RealtimeWireCodec, RealtimeWireFrames,
-		RequestMethod, SizeBounds, TransportAttempt, TransportRequest,
-		openai_realtime::OpenAiRealtimeWireCodec,
+		Cancellation, Decoder, EncodedRequest, ProviderMetadataEvent, ProviderResponseHooks,
+		ProviderResponseObservation, ProviderResponseObserver, ProviderStateEvent, RawCompletion,
+		RawEvent, RealtimeEvents, RealtimeWireCodec, RealtimeWireFrames, RequestMethod, SizeBounds,
+		TransportAttempt, TransportRequest, openai_realtime::OpenAiRealtimeWireCodec,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason},
 	id::RequestId,
 	receipt::{AttemptOutcome, ExecutionReceipt, ReasonId, Usage},
 };
+
+#[derive(Default)]
+struct ResponseObserver {
+	subscribed: bool,
+	observed:   StdMutex<Vec<ProviderResponseObservation>>,
+}
+
+impl ProviderResponseObserver for ResponseObserver {
+	fn subscribed(&self) -> bool {
+		self.subscribed
+	}
+
+	fn observe(&self, observation: ProviderResponseObservation) {
+		self
+			.observed
+			.lock()
+			.expect("observer lock")
+			.push(observation);
+	}
+}
 
 struct CapturedSseDecoder;
 
@@ -176,9 +201,12 @@ fn request(
 		decoder: Some(Box::new(decoder)),
 		realtime: None,
 		cancel,
+		response_hooks: Default::default(),
 		attempt: TransportAttempt {
 			request_id:    RequestId::new("request"),
 			provider:      ProviderId::new("provider"),
+			model:         Some(omp_catalog::ModelKey::new("model")),
+			api:           sf!("test"),
 			route:         RouteId::new("route"),
 			account:       None,
 			principal:     None,
@@ -188,6 +216,110 @@ fn request(
 			capture_limit: 10,
 		},
 	}
+}
+
+#[tokio::test]
+async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+	let listener = TcpListener::bind("127.0.0.1:0")
+		.await
+		.expect("bind response fixture");
+	let address = listener.local_addr().expect("response fixture address");
+	let server = tokio::spawn(async move {
+		for response in [
+			"HTTP/1.1 503 Service Unavailable\r\nX-RateLimit-Remaining: 4\r\nSet-Cookie: \
+			 secret=one\r\nX-Request-Id: req-1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+			"HTTP/1.1 200 OK\r\nAnthropic-RateLimit-Requests-Remaining: 3\r\nSet-Cookie: \
+			 secret=two\r\nX-Request-Id: req-2\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+			"HTTP/1.1 200 OK\r\nX-RateLimit-Remaining: 2\r\nSet-Cookie: \
+			 secret=three\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+		] {
+			let (mut socket, _) = listener.accept().await.expect("accept response fixture");
+			let mut request = [0_u8; 4096];
+			let _ = socket.read(&mut request).await.expect("read request");
+			socket
+				.write_all(response.as_bytes())
+				.await
+				.expect("write response");
+		}
+	});
+	let observer =
+		Arc::new(ResponseObserver { subscribed: true, observed: StdMutex::new(Vec::new()) });
+	let mut service = HttpTransport::new();
+	for attempt in 0..2 {
+		let mut call = request(
+			BodySource::Bytes(Bytes::from_static(b"request")),
+			EmitDecoder,
+			Cancellation::default(),
+		);
+		call.encoded.uri = sf!("http://{address}/stream");
+		call.attempt.index = attempt;
+		call.response_hooks = ProviderResponseHooks::new(observer.clone());
+		let result = service
+			.ready()
+			.await
+			.expect("transport ready")
+			.call(call)
+			.await;
+		if attempt == 0 {
+			assert!(result.is_err(), "first attempt must be retryable failure");
+		} else {
+			assert!(result.is_ok(), "second attempt must succeed");
+		}
+	}
+	let unsubscribed = Arc::new(ResponseObserver::default());
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/stream");
+	call.response_hooks = ProviderResponseHooks::new(unsubscribed.clone());
+	assert!(
+		service
+			.ready()
+			.await
+			.expect("transport ready")
+			.call(call)
+			.await
+			.is_ok()
+	);
+	server.await.expect("response fixture");
+
+	let observed = observer.observed.lock().expect("observer lock");
+	assert_eq!(observed.len(), 2);
+	assert_eq!((observed[0].status, observed[1].status), (503, 200));
+	assert_eq!(observed[0].request_id.as_deref(), Some("req-1"));
+	assert_eq!(observed[1].request_id.as_deref(), Some("req-2"));
+	for response in observed.iter() {
+		assert!(
+			response
+				.headers
+				.iter()
+				.all(|(name, _)| name.as_str() == name.as_str().to_ascii_lowercase())
+		);
+		assert!(
+			!response
+				.headers
+				.iter()
+				.any(|(name, _)| name.as_str() == "set-cookie")
+		);
+	}
+	assert!(
+		observed[0]
+			.headers
+			.iter()
+			.any(|(name, value)| name.as_str() == "x-ratelimit-remaining" && value.as_str() == "4")
+	);
+	assert!(observed[1].headers.iter().any(|(name, value)| {
+		name.as_str() == "anthropic-ratelimit-requests-remaining" && value.as_str() == "3"
+	}));
+	assert!(
+		unsubscribed
+			.observed
+			.lock()
+			.expect("observer lock")
+			.is_empty()
+	);
 }
 
 fn attempt(

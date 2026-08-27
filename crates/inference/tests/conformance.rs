@@ -650,7 +650,7 @@ fn native_wire_surface_is_a_closed_method_path_allowlist() {
 
 fn cassette_request(body: BodySource, format: NativeResponseFormat) -> TransportRequest {
 	TransportRequest {
-		encoded:     EncodedRequest::new(
+		encoded:        EncodedRequest::new(
 			OperationKind::Native,
 			RequestMethod::Post,
 			sf!("https://offline.invalid/v1/responses"),
@@ -659,13 +659,16 @@ fn cassette_request(body: BodySource, format: NativeResponseFormat) -> Transport
 			FramingProtocol::Raw,
 			SizeBounds { request_body: 1024, frame: 1024 * 1024, response: 1024 * 1024 },
 		),
-		credentials: None,
-		decoder:     Some(Box::new(NativeFacadeDecoder::new(format))),
-		realtime:    None,
-		cancel:      Cancellation::default(),
-		attempt:     TransportAttempt {
+		credentials:    None,
+		decoder:        Some(Box::new(NativeFacadeDecoder::new(format))),
+		realtime:       None,
+		cancel:         Cancellation::default(),
+		response_hooks: Default::default(),
+		attempt:        TransportAttempt {
 			request_id:    RequestId::from("cassette-request"),
 			provider:      ProviderId::from("offline-provider"),
+			model:         None,
+			api:           sf!("native"),
 			route:         RouteId::from("offline-route"),
 			account:       Some(AccountId::from("fixture-account-alpha")),
 			principal:     None,
@@ -1192,11 +1195,12 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 	let router =
 		Router::new(registry.clone(), Duration::from_secs(30)).with_runtime_evidence(runtime);
 	let meta = CallMeta {
-		id:       RequestId::from("planned-request"),
-		target:   Target::Model(model.key.clone()),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from("planned-request"),
+		target:         Target::Model(model.key.clone()),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let request = chat_request(Vec::new());
 	let mut client = Client::new(registry.service(), router.clone(), meta.clone());
@@ -1228,11 +1232,12 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 		accuracy: CountAccuracy::Exact,
 	};
 	let unsupported_meta = CallMeta {
-		id:       RequestId::from("unsupported-plan"),
-		target:   Target::Model(unsupported_model.key.clone()),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from("unsupported-plan"),
+		target:         Target::Model(unsupported_model.key.clone()),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let unsupported_error = Client::new(registry.service(), router.clone(), unsupported_meta)
 		.plan(&unsupported_request)
@@ -1241,11 +1246,12 @@ async fn client_plans_without_service_effects_executes_the_exact_route_and_rejec
 	assert_eq!(unsupported_error.kind, ErrorKind::CapabilityMismatch);
 
 	let unknown_meta = CallMeta {
-		id:       RequestId::from("unknown-plan"),
-		target:   Target::Model(ModelKey::from("model-that-does-not-exist")),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from("unknown-plan"),
+		target:         Target::Model(ModelKey::from("model-that-does-not-exist")),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let unknown_error = Client::new(registry.service(), router.clone(), unknown_meta)
 		.plan(&request)

@@ -882,6 +882,7 @@ mod tests {
 			deadline: None,
 			budget: ExecutionBudget::default(),
 			session: None,
+			response_hooks: Default::default(),
 			attribution: InferenceAttribution::core(),
 			execution: None,
 			staging: None,

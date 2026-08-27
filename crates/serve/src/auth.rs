@@ -294,11 +294,12 @@ impl AuthRpc {
 			self.registry.service(),
 			Router::new(self.registry.clone(), Duration::from_secs(30)),
 			CallMeta {
-				id:       RequestId::from(format!("auth-rpc-{sequence}")),
-				target:   Target::ProviderService(provider),
-				deadline: None,
-				budget:   ExecutionBudget::default(),
-				session:  None,
+				id:             RequestId::from(format!("auth-rpc-{sequence}")),
+				target:         Target::ProviderService(provider),
+				deadline:       None,
+				budget:         ExecutionBudget::default(),
+				session:        None,
+				response_hooks: Default::default(),
 			},
 		)
 	}

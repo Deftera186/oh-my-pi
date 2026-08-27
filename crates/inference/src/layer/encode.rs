@@ -364,7 +364,7 @@ mod tests {
 	}
 	fn transport() -> TransportRequest {
 		TransportRequest {
-			encoded:     EncodedRequest {
+			encoded:        EncodedRequest {
 				operation:   omp_catalog::OperationKind::Chat,
 				method:      RequestMethod::Post,
 				uri:         "https://example.invalid".into(),
@@ -374,13 +374,16 @@ mod tests {
 				bounds:      SizeBounds { request_body: 1, frame: 1, response: 1 },
 				sealed_body: None,
 			},
-			credentials: None,
-			decoder:     Some(Box::new(EmptyDecoder)),
-			realtime:    None,
-			cancel:      Cancellation::default(),
-			attempt:     TransportAttempt {
+			credentials:    None,
+			decoder:        Some(Box::new(EmptyDecoder)),
+			realtime:       None,
+			cancel:         Cancellation::default(),
+			response_hooks: Default::default(),
+			attempt:        TransportAttempt {
 				request_id:    RequestId::from("request"),
 				provider:      omp_catalog::ProviderId::from("provider"),
+				model:         Some(omp_catalog::ModelKey::from("model")),
+				api:           omp_core::Str::new_static("test"),
 				route:         omp_catalog::RouteId::from("route"),
 				account:       None,
 				principal:     None,

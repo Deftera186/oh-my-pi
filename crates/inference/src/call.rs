@@ -218,40 +218,44 @@ impl InferenceAttribution {
 #[derive(Clone, Debug)]
 pub struct CallMeta {
 	/// Logical request identity.
-	pub id:       RequestId,
+	pub id:             RequestId,
 	/// Catalog target and routing constraint.
-	pub target:   Target,
+	pub target:         Target,
 	/// Absolute wall-clock deadline.
-	pub deadline: Option<Instant>,
+	pub deadline:       Option<Instant>,
 	/// Cross-attempt resource limits.
-	pub budget:   ExecutionBudget,
+	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
-	pub session:  Option<SessionRequest>,
+	pub session:        Option<SessionRequest>,
+	/// Bitmap-gated provider response hook sink.
+	pub response_hooks: crate::codec::ProviderResponseHooks,
 }
 
 /// Clone-cheap envelope accepted by every provider service.
 #[derive(Clone, Debug)]
 pub struct Call {
 	/// Logical request identity.
-	pub id:          RequestId,
+	pub id:             RequestId,
 	/// Catalog target and routing constraint.
-	pub target:      Target,
+	pub target:         Target,
 	/// Absolute wall-clock deadline.
-	pub deadline:    Option<Instant>,
+	pub deadline:       Option<Instant>,
 	/// Cross-attempt resource limits.
-	pub budget:      ExecutionBudget,
+	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
-	pub session:     Option<SessionRequest>,
+	pub session:        Option<SessionRequest>,
+	/// Bitmap-gated provider response hook sink.
+	pub response_hooks: crate::codec::ProviderResponseHooks,
 	/// Principal and extension charged for this request.
-	pub attribution: InferenceAttribution,
+	pub attribution:    InferenceAttribution,
 	/// Immutable selected execution plan; absent only before side-effect-free
 	/// planning.
-	pub execution:   Option<Arc<ExecutionPlan>>,
+	pub execution:      Option<Arc<ExecutionPlan>>,
 	/// Shared operation-specific request payload.
-	pub operation:   OperationCall,
+	pub operation:      OperationCall,
 	/// Explicit secure-staging policy and cancellation signal, when authorized
 	/// by the caller.
-	pub staging:     Option<StagingRequest>,
+	pub staging:        Option<StagingRequest>,
 }
 
 /// Caller-owned policy and cancellation input for secure request-body staging.
@@ -272,6 +276,7 @@ impl Call {
 			deadline: meta.deadline,
 			budget: meta.budget,
 			session: meta.session,
+			response_hooks: meta.response_hooks,
 			attribution: InferenceAttribution::core(),
 			operation,
 			execution: None,

@@ -1064,15 +1064,18 @@ mod tests {
 			wire_target: None,
 		};
 		let call = Call {
-			id:          RequestId::from("auth-bypass"),
-			target:      Target::ProviderService(provider.id),
-			deadline:    None,
-			budget:      budget.clone(),
-			session:     None,
-			attribution: CallInferenceAttribution::core(),
-			execution:   Some(Arc::new(plan)),
-			operation:   OperationCall::Auth(Arc::new(AuthRequest::ListAccounts { provider: None })),
-			staging:     None,
+			id:             RequestId::from("auth-bypass"),
+			target:         Target::ProviderService(provider.id),
+			deadline:       None,
+			budget:         budget.clone(),
+			session:        None,
+			response_hooks: Default::default(),
+			attribution:    CallInferenceAttribution::core(),
+			execution:      Some(Arc::new(plan)),
+			operation:      OperationCall::Auth(Arc::new(AuthRequest::ListAccounts {
+				provider: None,
+			})),
+			staging:        None,
 		};
 		let answer = dispatch_preplanned(registry, LayerCall {
 			payload: call,

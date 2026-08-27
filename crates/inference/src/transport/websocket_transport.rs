@@ -36,7 +36,7 @@ use crate::{
 	transport::{
 		Frame, FramingProtocol, WebSocketMessage,
 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
-		http::{record_failure, request_id, sanitize_headers},
+		http::{emit_provider_response, record_failure, request_id, sanitize_headers},
 	},
 };
 
@@ -283,8 +283,9 @@ async fn execute(
 		},
 	};
 	let status = response.status().as_u16();
-	let headers = sanitize_headers(response.headers());
 	let provider_request_id = request_id(response.headers());
+	emit_provider_response(&request, status, response.headers(), provider_request_id.clone());
+	let headers = sanitize_headers(response.headers());
 	let capture = Arc::new(Mutex::new(LiveCapture {
 		attempt: request.attempt.index,
 		status,

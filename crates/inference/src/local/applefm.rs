@@ -1666,6 +1666,8 @@ mod tests {
 		TransportAttempt {
 			request_id:    RequestId::new("apple-test"),
 			provider:      ProviderId::new("apple-intelligence"),
+			model:         Some(omp_catalog::ModelKey::new("apple-intelligence")),
+			api:           sf!("applefm"),
 			route:         RouteId::new("apple-intelligence/primary"),
 			account:       None,
 			principal:     None,

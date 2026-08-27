@@ -246,12 +246,13 @@ impl Service<TransportRequest> for ProtocolTransport {
 			{
 				let creation = workflow_creation_request(&request.encoded.uri, start_body)?;
 				let creation_request = TransportRequest {
-					encoded:     creation,
-					credentials: request.credentials.clone(),
-					decoder:     Some(Box::new(WorkflowCreationDecoder::new())),
-					realtime:    None,
-					cancel:      request.cancel.clone(),
-					attempt:     request.attempt.clone(),
+					encoded:        creation,
+					credentials:    request.credentials.clone(),
+					decoder:        Some(Box::new(WorkflowCreationDecoder::new())),
+					realtime:       None,
+					cancel:         request.cancel.clone(),
+					response_hooks: request.response_hooks.clone(),
+					attempt:        request.attempt.clone(),
 				};
 				let mut response = http.ready().await?.call(creation_request).await?;
 				let mut workflow_id = None;
@@ -1412,9 +1413,12 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			decoder,
 			realtime,
 			cancel,
+			response_hooks: call.response_hooks.clone(),
 			attempt: TransportAttempt {
 				request_id: call.id.clone(),
 				provider: plan.provider.clone(),
+				model: plan.model.clone(),
+				api: Str::new(plan.codec.as_str()),
 				route: plan.route.clone(),
 				account: account.as_ref().and_then(|routing| routing.account.clone()),
 				principal: Some(call.attribution.principal.clone()),
@@ -2080,6 +2084,7 @@ mod tests {
 			deadline: None,
 			budget,
 			session: None,
+			response_hooks: Default::default(),
 			attribution: InferenceAttribution::core(),
 			execution: Some(Arc::new(plan)),
 			staging: None,

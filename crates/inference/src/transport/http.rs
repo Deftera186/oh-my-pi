@@ -44,8 +44,8 @@ use crate::{
 	},
 	catalog::OperationKind,
 	codec::{
-		Cancellation, DecoderState, HandshakeMeta, HandshakenResponse, RawEvent, RawEventStream,
-		RequestHeader, RequestMethod, TransportAttempt, TransportRequest,
+		Cancellation, DecoderState, HandshakeMeta, HandshakenResponse, ProviderResponseObservation,
+		RawEvent, RawEventStream, RequestHeader, RequestMethod, TransportAttempt, TransportRequest,
 	},
 	error::{
 		Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction, classify_provider_rejection,
@@ -750,8 +750,9 @@ async fn execute(
 	};
 	let (parts, incoming) = response.into_parts();
 	let status = parts.status.as_u16();
-	let headers = sanitize_headers(&parts.headers);
 	let provider_request_id = request_id(&parts.headers);
+	emit_provider_response(&transport, status, &parts.headers, provider_request_id.clone());
+	let headers = sanitize_headers(&parts.headers);
 	let concurrency_admission = concurrency_admission_rejection(&parts.headers);
 	let capture = Arc::new(Mutex::new(HttpCapture {
 		attempt: transport.attempt.index,
@@ -952,6 +953,41 @@ pub(crate) fn sanitize_headers(headers: &HeaderMap) -> Box<[RequestHeader]> {
 		.take(MAX_CAPTURED_HEADERS)
 		.collect::<Vec<_>>()
 		.into_boxed_slice()
+}
+
+pub(crate) fn emit_provider_response(
+	transport: &TransportRequest,
+	status: u16,
+	headers: &HeaderMap,
+	request_id: Option<Str>,
+) {
+	if !transport.response_hooks.subscribed() {
+		return;
+	}
+	let Some(model) = transport.attempt.model.clone() else {
+		return;
+	};
+	let headers = headers
+		.iter()
+		.filter(|(name, _)| *name != header::SET_COOKIE)
+		.filter_map(|(name, value)| {
+			value
+				.to_str()
+				.ok()
+				.map(|value| (Str::new(name.as_str()), Str::new(value)))
+		})
+		.collect::<Vec<_>>()
+		.into_boxed_slice();
+	transport
+		.response_hooks
+		.observe(ProviderResponseObservation {
+			provider: transport.attempt.provider.clone(),
+			model,
+			api: transport.attempt.api.clone(),
+			status,
+			headers,
+			request_id,
+		});
 }
 
 /// `true` for a response carrying `LiteLLM`'s concurrency-admission marker

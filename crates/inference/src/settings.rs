@@ -623,11 +623,12 @@ mod tests {
 	fn planning_projects_retry_budget_onto_the_real_call_once() {
 		let mut call = Call::new(
 			crate::call::CallMeta {
-				id:       crate::id::RequestId::from("settings-budget"),
-				target:   crate::call::Target::ProviderService(ProviderId::from("provider")),
-				deadline: None,
-				budget:   ExecutionBudget::default(),
-				session:  None,
+				id:             crate::id::RequestId::from("settings-budget"),
+				target:         crate::call::Target::ProviderService(ProviderId::from("provider")),
+				deadline:       None,
+				budget:         ExecutionBudget::default(),
+				session:        None,
+				response_hooks: Default::default(),
 			},
 			OperationCall::Auth(sync::Arc::new(crate::call::AuthRequest::ListAccounts {
 				provider: None,

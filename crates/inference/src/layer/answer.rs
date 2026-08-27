@@ -732,6 +732,7 @@ mod tests {
 					provider_reset:        false,
 					forked:                true,
 				}),
+				response_hooks: Default::default(),
 			},
 			OperationCall::Chat(Arc::new(ChatRequest {
 				messages:          Arc::from([]),

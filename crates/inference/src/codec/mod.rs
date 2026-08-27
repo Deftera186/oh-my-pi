@@ -15,9 +15,9 @@ use bytes::Bytes;
 use futures::{Stream, task::AtomicWaker};
 use omp_catalog::{
 	AuthSpecId, CodecId, CodecProfile, CodexTransportPreference, DiscoveredModel, EndpointSpec,
-	HeaderProfileId, OperationKind, PolicyModel, ProviderId, RedirectTrust, RouteDef, RouteId,
-	RouteRestrictions, ThinkingPolicy, ThinkingSelection, TransportKind, TrustDomain, WireTarget,
-	policy::WirePolicy,
+	HeaderProfileId, ModelKey, OperationKind, PolicyModel, ProviderId, RedirectTrust, RouteDef,
+	RouteId, RouteRestrictions, ThinkingPolicy, ThinkingSelection, TransportKind, TrustDomain,
+	WireTarget, policy::WirePolicy,
 };
 use omp_core::{IntoStr, Str, sf};
 use smallvec::SmallVec;
@@ -962,6 +962,10 @@ pub struct TransportAttempt {
 	pub request_id:    RequestId,
 	/// Provider selected for this attempt.
 	pub provider:      ProviderId,
+	/// Normalized model selected for this attempt.
+	pub model:         Option<ModelKey>,
+	/// Catalog API/codec family selected for this attempt.
+	pub api:           Str,
 	/// Route selected for this attempt.
 	pub route:         RouteId,
 	/// Account selected without credential material.
@@ -979,22 +983,85 @@ pub struct TransportAttempt {
 	pub capture_limit: u64,
 }
 
+/// Sanitized provider response facts offered before stream decoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderResponseObservation {
+	/// Catalog provider identity.
+	pub provider:   ProviderId,
+	/// Normalized model identity.
+	pub model:      ModelKey,
+	/// Catalog API/codec family.
+	pub api:        Str,
+	/// HTTP status code.
+	pub status:     u16,
+	/// Lowercase response headers with cookies removed.
+	pub headers:    Box<[(Str, Str)]>,
+	/// Provider-reported request identity, when present.
+	pub request_id: Option<Str>,
+}
+
+/// Session hook sink for provider response observations.
+pub trait ProviderResponseObserver: Send + Sync + 'static {
+	/// Returns the subscription bitmap bit without constructing a payload.
+	fn subscribed(&self) -> bool;
+	/// Offers one already-sanitized response payload.
+	fn observe(&self, observation: ProviderResponseObservation);
+}
+
+/// Clone-cheap optional provider response hook sink.
+#[derive(Clone, Default)]
+pub struct ProviderResponseHooks(Option<Arc<dyn ProviderResponseObserver>>);
+
+impl ProviderResponseHooks {
+	/// Wraps one session hook sink.
+	pub fn new(observer: Arc<dyn ProviderResponseObserver>) -> Self {
+		Self(Some(observer))
+	}
+
+	/// Returns the subscription bitmap bit.
+	#[inline]
+	pub fn subscribed(&self) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.subscribed())
+	}
+
+	/// Offers an encoded observation to the subscribed sink.
+	pub fn observe(&self, observation: ProviderResponseObservation) {
+		if let Some(observer) = &self.0 {
+			observer.observe(observation);
+		}
+	}
+}
+
+impl fmt::Debug for ProviderResponseHooks {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_tuple("ProviderResponseHooks")
+			.field(&self.0.is_some())
+			.finish()
+	}
+}
+
 /// Fully encoded transport call with a fresh decoder and cancellation handle.
 pub struct TransportRequest {
 	/// Secret-free encoded request, never mutated by credential application.
-	pub encoded:     EncodedRequest,
+	pub encoded:        EncodedRequest,
 	/// Credentials applied at the innermost boundary and ignored by logs and
 	/// cassettes.
-	pub credentials: Option<AppliedCredentials>,
+	pub credentials:    Option<AppliedCredentials>,
 	/// Fresh ordinary provider decoder, present exactly when `realtime` is
 	/// absent.
-	pub decoder:     Option<DecoderState>,
+	pub decoder:        Option<DecoderState>,
 	/// Provider realtime wire codec, present exactly when `decoder` is absent.
-	pub realtime:    Option<RealtimeWireCodecState>,
+	pub realtime:       Option<RealtimeWireCodecState>,
 	/// Cooperative cancellation handle.
-	pub cancel:      Cancellation,
+	pub cancel:         Cancellation,
+	/// Bitmap-gated provider response hook sink.
+	pub response_hooks: ProviderResponseHooks,
 	/// Attempt identity and capture policy.
-	pub attempt:     TransportAttempt,
+	pub attempt:        TransportAttempt,
 }
 
 /// Sanitized response handshake metadata.

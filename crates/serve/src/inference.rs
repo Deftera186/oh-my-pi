@@ -19,7 +19,7 @@ use omp_catalog::{
 };
 use omp_core::{Str, encoding::hex, sf};
 use omp_inference::{
-	Client, Registry, RetryAction,
+	Client, ProviderResponseHooks, Registry, RetryAction,
 	answer::{
 		Artifact, ArtifactBody, AudioChunk, ChatControl, ChatControlError, ChatStream,
 		GenerationEvent, ImageArtifact, NativeResponse, NativeResponseBody,
@@ -152,6 +152,7 @@ pub struct InferenceRpc {
 	session_provider:      Option<ProviderId>,
 	prompt_cache_affinity: Option<Str>,
 	provider_authority:    Option<Arc<dyn ProviderGatewayAuthority>>,
+	response_hooks:        ProviderResponseHooks,
 }
 
 #[derive(Clone, Default)]
@@ -254,7 +255,14 @@ impl InferenceRpc {
 			session_provider: None,
 			prompt_cache_affinity: None,
 			provider_authority: None,
+			response_hooks: ProviderResponseHooks::default(),
 		}
+	}
+
+	/// Installs the session-owned provider response observation sink.
+	pub fn with_provider_response_hooks(mut self, response_hooks: ProviderResponseHooks) -> Self {
+		self.response_hooks = response_hooks;
+		self
 	}
 
 	/// Installs the application's live provider owner on the gateway surface.
@@ -393,6 +401,7 @@ impl InferenceRpc {
 				deadline,
 				budget: ExecutionBudget::default(),
 				session: None,
+				response_hooks: self.response_hooks.clone(),
 			},
 		)
 	}
@@ -412,6 +421,7 @@ impl InferenceRpc {
 				deadline: None,
 				budget: ExecutionBudget::default(),
 				session,
+				response_hooks: self.response_hooks.clone(),
 			},
 		)
 	}

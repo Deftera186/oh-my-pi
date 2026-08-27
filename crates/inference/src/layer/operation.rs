@@ -528,14 +528,15 @@ mod tests {
 		};
 		let mut call = Call::new(
 			CallMeta {
-				id:       IdRequestId::from("request"),
-				target:   Target::Route {
+				id:             IdRequestId::from("request"),
+				target:         Target::Route {
 					route: plan.route.clone(),
 					model: omp_catalog::ModelKey::from("model"),
 				},
-				deadline: None,
-				budget:   ExecutionBudget::default(),
-				session:  None,
+				deadline:       None,
+				budget:         ExecutionBudget::default(),
+				session:        None,
+				response_hooks: Default::default(),
 			},
 			OperationCall::CountTokens(Arc::new(CountTokensRequest {
 				messages: Arc::new([]),

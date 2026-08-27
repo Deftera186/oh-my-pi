@@ -471,11 +471,12 @@ mod tests {
 		let phase = Arc::new(AtomicUsize::new(0));
 		let service = ReadinessService { phase: phase.clone() };
 		let call_meta = CallMeta {
-			id:       RequestId::from("request"),
-			target:   Target::Model(ModelKey::from("model")),
-			deadline: Some(Instant::now()),
-			budget:   ExecutionBudget::default(),
-			session:  None,
+			id:             RequestId::from("request"),
+			target:         Target::Model(ModelKey::from("model")),
+			deadline:       Some(Instant::now()),
+			budget:         ExecutionBudget::default(),
+			session:        None,
+			response_hooks: Default::default(),
 		};
 		let mut client = Client::new(service, RejectingPlanner, call_meta.clone());
 		let request = CountTokensRequest {
@@ -496,11 +497,12 @@ mod tests {
 		let phase = Arc::new(AtomicUsize::new(0));
 		let service = ReadinessService { phase: phase.clone() };
 		let call_meta = CallMeta {
-			id:       RequestId::from("request"),
-			target:   Target::Model(ModelKey::from("model")),
-			deadline: None,
-			budget:   ExecutionBudget::default(),
-			session:  None,
+			id:             RequestId::from("request"),
+			target:         Target::Model(ModelKey::from("model")),
+			deadline:       None,
+			budget:         ExecutionBudget::default(),
+			session:        None,
+			response_hooks: Default::default(),
 		};
 		let client = Client::new(service, RejectingPlanner, call_meta);
 		let request = CountTokensRequest {

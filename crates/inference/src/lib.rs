@@ -41,6 +41,7 @@ pub mod transport;
 pub use answer::*;
 pub use call::*;
 pub use client::*;
+pub use codec::{ProviderResponseHooks, ProviderResponseObservation, ProviderResponseObserver};
 pub use difficulty::*;
 pub use error::*;
 pub use event::*;

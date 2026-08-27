@@ -335,14 +335,15 @@ mod tests {
 	fn call() -> Call {
 		Call::new(
 			CallMeta {
-				id:       RequestId::from("request"),
-				target:   Target::Route {
+				id:             RequestId::from("request"),
+				target:         Target::Route {
 					route: omp_catalog::RouteId::from("route"),
 					model: omp_catalog::ModelKey::from("model"),
 				},
-				deadline: None,
-				budget:   ExecutionBudget::default(),
-				session:  None,
+				deadline:       None,
+				budget:         ExecutionBudget::default(),
+				session:        None,
+				response_hooks: Default::default(),
 			},
 			OperationCall::CountTokens(Arc::new(CountTokensRequest {
 				messages: Arc::new([]),

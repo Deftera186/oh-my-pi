@@ -128,14 +128,15 @@ where
 		let first = plan.as_ref().ok().and_then(|(plan, template)| {
 			plan.pages.first().map(|page| {
 				self.inner.call(OperationRequest {
-					id:          template.id.clone(),
-					target:      template.target.clone(),
-					deadline:    template.deadline,
-					budget:      template.budget.clone(),
-					session:     template.session.clone(),
-					attribution: template.attribution.clone(),
-					execution:   template.execution.clone(),
-					payload:     Arc::clone(page),
+					id:             template.id.clone(),
+					target:         template.target.clone(),
+					deadline:       template.deadline,
+					budget:         template.budget.clone(),
+					session:        template.session.clone(),
+					response_hooks: template.response_hooks.clone(),
+					attribution:    template.attribution.clone(),
+					execution:      template.execution.clone(),
+					payload:        Arc::clone(page),
 				})
 			})
 		});
@@ -157,14 +158,15 @@ where
 			for page in plan.pages.iter().skip(1) {
 				poll_fn(|context| later_backend.poll_ready(context)).await?;
 				let request = OperationRequest {
-					id:          template.id.clone(),
-					target:      template.target.clone(),
-					deadline:    template.deadline,
-					budget:      template.budget.clone(),
-					session:     template.session.clone(),
-					attribution: template.attribution.clone(),
-					execution:   template.execution.clone(),
-					payload:     Arc::clone(page),
+					id:             template.id.clone(),
+					target:         template.target.clone(),
+					deadline:       template.deadline,
+					budget:         template.budget.clone(),
+					session:        template.session.clone(),
+					response_hooks: template.response_hooks.clone(),
+					attribution:    template.attribution.clone(),
+					execution:      template.execution.clone(),
+					payload:        Arc::clone(page),
 				};
 				let mut later = match later_backend.call(request).await {
 					Ok(later) => later,
