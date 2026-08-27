@@ -420,14 +420,9 @@ impl ChatHost {
 		viewport: Size,
 		models: Vec<ModelRow>,
 		current_model: usize,
-		sidebar_open: bool,
 	) -> Self {
 		let status = chat.status();
-		let sidebar = if sidebar_open {
-			Sidebar::new(&status, ctx)
-		} else {
-			Sidebar::new_hidden(&status, ctx)
-		};
+		let sidebar = Sidebar::new_hidden(&status, ctx);
 		chat.set_right_inset(sidebar.reserved(viewport));
 		Self {
 			chat,
@@ -1089,7 +1084,7 @@ impl RetainedChat {
 		chat.set_composer_text(initial_draft.as_str());
 		let viewport = Size::new(0, 0);
 		Self {
-			host: ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false),
+			host: ChatHost::new(chat, &ctx, viewport, Vec::new(), 0),
 			ctx,
 			events,
 			intents,
@@ -1923,7 +1918,7 @@ async fn run_chat(
 	intents: &Sender<Intent>,
 	options: HostOptions,
 ) -> io::Result<HostOutcome> {
-	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model, true);
+	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model);
 	let ask_binding = ask::bind();
 	paint_host(renderer, &mut host, viewport, Retirement::Disabled)?;
 
@@ -3261,7 +3256,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		let request = UiRequest {
 			owner_invocation: 7,
 			kind:             Some(ui_request::Kind::Dialog(Dialog {
@@ -3304,7 +3299,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		let request = UiRequest {
 			owner_invocation: 8,
 			kind:             Some(ui_request::Kind::ShowOverlay(ShowOverlay {
@@ -3386,7 +3381,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, _received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		let (first, first_result) = ask::test_request(ask_question("first"));
 		let (second, second_result) = ask::test_request(ask_question("second"));
 
@@ -3422,7 +3417,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, _received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		host.chat.set_composer_text("Actually use SQLite");
 		let (request, _result) = ask::test_request(ask_question("guarded"));
 
@@ -3441,7 +3436,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		let now = Instant::now();
 		host.chat.set_composer_text("draft");
 
@@ -3454,7 +3449,7 @@ mod tests {
 		);
 		assert!(matches!(received.try_recv(), Ok(Intent::Quit)));
 
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		host.chat.set_composer_text("snapshot me");
 		assert_eq!(host.apply_chat_key(ChatKey::Exit, now, &intents, &ctx), Some(HostExit::Quit));
 		assert_eq!(super::host_outcome(&host, HostExit::Quit).draft, "snapshot me");
@@ -3490,7 +3485,7 @@ mod tests {
 	fn approval_waits_behind_an_unrelated_modal_without_destroying_it() {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		host.overlay = Some(Overlay::History(HistoryInspector::open(Frame::new(viewport))));
 
 		let _ = apply_backend(&mut host, BackendEvent::ApprovalPending(approval_ticket("a")), &ctx);
@@ -3505,7 +3500,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		let _ = apply_backend(&mut host, BackendEvent::ApprovalPending(approval_ticket("a")), &ctx);
 		let _ = apply_backend(&mut host, BackendEvent::ApprovalPending(approval_ticket("b")), &ctx);
 
@@ -3539,7 +3534,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let viewport = Size::new(80, 24);
 		let (intents, _received) = flume::unbounded();
-		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
 		let _ = apply_backend(&mut host, BackendEvent::ApprovalPending(approval_ticket("a")), &ctx);
 
 		let _ = apply_overlay_event(
@@ -3678,7 +3673,7 @@ mod tests {
 		for index in 0..6 {
 			chat.push_notice(format!("finalized {index}"));
 		}
-		ChatHost::new(chat, ctx, viewport, Vec::new(), 0, false)
+		ChatHost::new(chat, ctx, viewport, Vec::new(), 0)
 	}
 
 	#[test]
@@ -3687,7 +3682,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut chat = Chat::new(&ctx);
 		chat.push_notice("resumed transcript row");
-		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0);
 		let mut renderer = Renderer::new(Vec::new());
 
 		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
@@ -3759,7 +3754,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut chat = Chat::new(&ctx);
 		chat.push_notice("fits in the viewport");
-		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0);
 		let mut renderer = Renderer::new(Vec::new());
 		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
 
@@ -3779,7 +3774,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut chat = Chat::new(&ctx);
 		chat.push_notice("committed row");
-		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false);
+		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0);
 		let mut renderer = Renderer::new(Vec::new());
 		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
 		paint_host(&mut renderer, &mut host, viewport, Retirement::Flush).unwrap();
