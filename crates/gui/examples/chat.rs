@@ -430,7 +430,8 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				});
 				let _ = events.send(BackendEvent::Status(mock_status(&models[current].name, true)));
 				let id = Str::from(format!("assistant-{turn}"));
-				let _ = events.send(BackendEvent::AssistantBegin { id: id.clone() });
+				let _ =
+					events.send(BackendEvent::AssistantBegin { id: id.clone(), thinking: false });
 				for text in ["Inspecting the scene… ", "preserving stable rows… ", "done."] {
 					if generation.load(Ordering::SeqCst) != turn {
 						break;
