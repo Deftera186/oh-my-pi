@@ -624,12 +624,12 @@ async fn run_chat_login(
 					})?
 					.map_err(|error| chat_login_failure(&provider, &error))?;
 				match event {
-					AuthEvent::OpenUrl(url) => {
+					AuthEvent::OpenUrl { url, launch } => {
 						// Launch the browser directly (best-effort); the forwarded
 						// event keeps the clickable/copyable URL as fallback.
 						omp_core::open::open_path(&url);
 						events
-							.send(ChatAuthEvent::Url(url))
+							.send(ChatAuthEvent::Url { url, launch })
 							.map_err(|_| sf!("chat authentication view closed"))?;
 					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => {

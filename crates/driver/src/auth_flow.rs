@@ -35,7 +35,12 @@ pub enum AuthPromptKind {
 #[derive(Debug, Eq, PartialEq)]
 pub enum ChatAuthEvent {
 	/// Public browser authorization URL.
-	Url(Str),
+	Url {
+		/// Full provider authorization URL.
+		url:    Str,
+		/// Short loopback launch URL when a callback server is available.
+		launch: Option<Str>,
+	},
 	/// Short-lived device code and public verification URL.
 	DeviceCode {
 		/// Short-lived device code.
