@@ -914,6 +914,21 @@ bytes into an active regular-file destination is not a filesystem copy at all 鈥
 content commit that preserves the destination's document identity, and the Environment performs it
 as one.
 
+There is deliberately no pi-style permission-denied write/delete fallback hook. Running Python
+after `DOC_WRITE` or `FS_WRITE` rejects an operation would let an extension claim durable success
+outside the sole writer, bypassing revision/CAS checks, canonical-path and symlink containment,
+transaction atomicity, capability enforcement, and audit state. Permission, read-only-filesystem,
+and unsupported-operation failures therefore remain typed `Denied`, `Io`, or `Unsupported`;
+no Python callback can convert one into success. The ambient-syscall boundary is the deployment's
+[sandbox enforcement](06-policy.md#ompsandboxenforcement), not a post-denial callback.
+
+A deployment that needs privileged storage must implement an Environment backend **below**
+`DocumentAuthority`, selected and consented as deployment policy. That backend must preserve the
+same revision/CAS, canonical-path containment, symlink, transaction, and durable-success
+semantics. Its conformance proof must cover CAS conflicts, symlink escape, delete-versus-directory,
+transaction atomicity, and reporting success only after durable commit. Putting that transport
+above the dispatch gate, in an extension hook, is not a supported migration.
+
 `remove` on a missing path is an error, not an idempotent success. This is intentional: "delete if
 present" is a decision, and the caller makes it.
 
@@ -980,6 +995,19 @@ they are the Environment's data structures, not a process you hope stays alive.
 
 One-shot: opens a session, runs one command to completion, closes the session, returns the
 terminal status with output collected. The convenience path for the overwhelmingly common case.
+`env` is a command-local `Mapping[str, str | None]`: strings add or replace exported variables and
+`None` unsets them. The delta overlays the session environment only while this run executes; it
+does not alter the workspace snapshot or any later command.
+
+Pi's `ToolDefinition.shellEnv(ctx)` splits at the ownership boundary rather than becoming a new
+device declaration field. To modify a user-issued shell command, declare a fail-closed
+`user_bash/TRANSFORM` hook and return
+`omp.Modify(env_overrides={**event.env_overrides, "TOKEN_FILE": token_file})`; ordered REPLACE
+composition means the next TRANSFORM receives that updated mapping. Use `None` as a value to unset
+a variable for the command. A device that executes its own subprocess does **not** trigger
+`user_bash`: it owns that effect and must pass the delta explicitly with
+`await omp.env.sh.run(script, env=delta)`. `xd` dispatch is likewise not shell execution. In both
+paths the delta is ephemeral and affects one run only.
 
 - **Raises** `TimedOut`, `Cancelled`, `Denied`, `EffectsNotAuthorized`, `Invalid`
 - **Channel** DATA 路 **Latency** `stream` 路 **Capability** `EXEC` 路 **Effect** yes 路 **Fail** closed
@@ -2181,10 +2209,12 @@ synchronization* (100-108), *Atomic text edit and workspace edit application eng
   the parent precondition) or these stay tool-only. **Open question; leaning virtual drivers**,
   because the alternative means an extension cannot read a notebook cell through a lease, and
   *Jupyter Notebook Virtual Text Translation* (`tools-file.md:190-195`) has exactly the same shape.
-- *Permission-Denied Fallback Seam* (`tools-file.md:131-137`). A `sudo` escalation path needs a
-  structured request/response over the DATA socket *and* a CONTROL-side approval, because the
-  approving party is the user, not the Environment. Deliberately absent from `omp.env` above; it
-  is a policy surface. See `docs/py/06-policy.md`.
+- *Permission-Denied Fallback Seam* (`tools-file.md:131-137`). **Rejected.** A callback after
+  `DOC_WRITE`/`FS_WRITE` denial would bypass the docserver's sole-writer, revision, capability,
+  containment, transaction, and durable-success invariants. Privileged storage belongs below
+  `DocumentAuthority` as a deployment-selected Environment backend, with the conformance contract
+  stated under [Raw filesystem](#raw-filesystem--ompenvfs); sandbox enforcement remains
+  [`omp.SandboxEnforcement`](06-policy.md#ompsandboxenforcement).
 - **DAP, entirely** (`lsp-dap.md:192-240`: adapter registry, client protocol engine, session
   manager and state machine, debug agent actions). Nothing in `env/v1` or `document/v1` carries
   DAP. A debug adapter is a long-lived child speaking a framed protocol with request/response and

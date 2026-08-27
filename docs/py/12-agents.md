@@ -630,7 +630,7 @@ exactly the reason a subagent does: it spends the user's tokens.
 `usage: Usage`, `model: str`, `fell_back: bool`,
 `fault: omp.Fault | None` (why the fallback fired, when it did).
 
-#### `async omp.agents.completion(prompt: str | Sequence[omp.TextPart | omp.BlobPart], *, role="smol", system=None, choices=None, schema=None, default=..., scope="turn", max_output_tokens=None, deadline=omp.Duration("10s"), labels={}) -> Completion`
+#### `async omp.agents.completion(prompt: str | Sequence[omp.TextPart | omp.BlobPart], *, role="smol", system=None, choices=None, schema=None, default=..., scope="turn", context="none", max_output_tokens=None, deadline=omp.Duration("10s"), labels={}) -> Completion`
 
 - **Channel** CONTROL. **Latency class** per-call, network-bound. **Failure**
   depends entirely on `default`, below.
@@ -638,6 +638,17 @@ exactly the reason a subagent does: it spends the user's tokens.
   journal item. Use it for classification, extraction, and titling — the
   `ctx.model.call` / `ctx.model.stream` shape from
   `.plan/feature-map/discovery.md:190`.
+- **`context="thread"` trades statelessness for the live conversation.** The
+  call becomes one non-persisted side-channel turn over the caller's projected
+  thread — the same mechanism behind the interactive `/btw` command and the
+  idle recap: the session model answers with the full conversation in context
+  (tool catalog attached only to keep the prompt cache warm; tool calls are
+  discarded), and the emission still never becomes a thread item. Because the
+  session model and its live params answer, `role`, `system`, `choices`,
+  `schema`, and `max_output_tokens` are stateless-only and rejected; the
+  prompt must be plain text. `default`, `scope`, `deadline`, and `labels`
+  keep their meaning, and usage is debited against the session task budget
+  like any other completion.
 - `prompt` is either plain text or an ordered sequence containing only
   `omp.TextPart` and `omp.BlobPart` values. The typed sequence is the media path
   for one-shot vision requests; blobs remain typed and are never encoded into
@@ -2004,7 +2015,7 @@ More than the assignment implies, which changes the shape of the work from
   propagation this document specifies all depend on a caller identity travelling
   with the request, which today it does not.
 - **No constrained one-shot.** `ChatParentHost::completion` sends a plain turn
-  and reads `bridge_outcome_text`; there is no ordered-choice ladder, no
+  and reads `outcome_text`; there is no ordered-choice ladder, no
   earliest-match resolution, no budget check, and no fallback path. The
   `SchemaConstraint { priority }` / `GrammarConstraint` pair in `toolhost.proto`
   is the right substrate for `schema=`, but the arbitration that spends the
