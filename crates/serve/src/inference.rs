@@ -174,8 +174,30 @@ struct ResolvedTurn {
 
 #[derive(Default)]
 struct TurnProjection {
-	assistant_text: String,
-	output:         Vec<thread_pb::Item>,
+	message_parts: Vec<MessagePart>,
+	output:        Vec<thread_pb::Item>,
+}
+
+impl TurnProjection {
+	/// Appends streamed prose to the assistant message, opening a new part
+	/// when the block index or kind changes.
+	fn append_part(&mut self, index: u32, thinking: bool, text: &str) {
+		match self.message_parts.last_mut() {
+			Some(part) if part.index == index && part.thinking == thinking => {
+				part.text.push_str(text);
+			},
+			_ => self
+				.message_parts
+				.push(MessagePart { index, thinking, text: text.to_owned() }),
+		}
+	}
+}
+
+/// One streamed text or thinking block of the assistant message.
+struct MessagePart {
+	index:    u32,
+	thinking: bool,
+	text:     String,
 }
 
 #[derive(Clone)]
@@ -2312,15 +2334,29 @@ fn build_turn_outcome(
 	committed_len: usize,
 ) -> pb::Outcome {
 	let mut output = projection.output.clone();
-	if !projection.assistant_text.is_empty() {
+	let parts = projection
+		.message_parts
+		.iter()
+		.filter(|part| !part.text.is_empty())
+		.map(|part| thread_pb::Part {
+			kind: Some(if part.thinking {
+				part::Kind::Thinking(thread_pb::Thinking {
+					text:      part.text.clone(),
+					signature: Bytes::new(),
+					redacted:  false,
+				})
+			} else {
+				part::Kind::Text(part.text.clone())
+			}),
+		})
+		.collect::<Vec<_>>();
+	if !parts.is_empty() {
 		output.insert(0, thread_pb::Item {
 			seq:           0,
 			created_at_ms: 0,
 			kind:          Some(item::Kind::Message(thread_pb::Message {
-				role:  thread_pb::Role::Assistant as i32,
-				parts: vec![thread_pb::Part {
-					kind: Some(part::Kind::Text(projection.assistant_text.clone())),
-				}],
+				role: thread_pb::Role::Assistant as i32,
+				parts,
 			})),
 			props:         None,
 		});
@@ -2685,6 +2721,10 @@ fn turn_events(
 		};
 		let mut pending = BTreeMap::<String, PendingInvocation>::new();
 		let mut incoming_open = true;
+		// Index of the currently streaming text/thinking part. Providers close
+		// these blocks implicitly (next block start or stream completion), so
+		// the projection owes consumers an explicit `PartEnd`.
+		let mut open_part: Option<u32> = None;
 		loop {
 			let event = loop {
 				let next_timeout = pending
@@ -2761,6 +2801,17 @@ fn turn_events(
 							))?
 						},
 					};
+					if open_part.is_some_and(|open| open != index)
+						&& let Some(open) = open_part.take()
+					{
+						yield pb::TurnEvent {
+							event: Some(turn_event::Event::PartEnd(pb::PartEnd {
+								index:     open,
+								signature: Bytes::new(),
+							})),
+						};
+					}
+					open_part = Some(index);
 					yield pb::TurnEvent {
 						event: Some(turn_event::Event::PartStart(pb::PartStart {
 							index,
@@ -2771,7 +2822,7 @@ fn turn_events(
 					};
 				},
 				ChatEvent::TextDelta { index, text } => {
-					projection.lock().assistant_text.push_str(text.as_str());
+					projection.lock().append_part(index, false, text.as_str());
 					yield pb::TurnEvent {
 						event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 							index,
@@ -2780,6 +2831,7 @@ fn turn_events(
 					};
 				},
 				ChatEvent::ThinkingDelta { index, text } => {
+					projection.lock().append_part(index, true, text.as_str());
 					yield pb::TurnEvent {
 						event: Some(turn_event::Event::PartDelta(pb::PartDelta {
 							index,
@@ -2788,6 +2840,14 @@ fn turn_events(
 					};
 				},
 				ChatEvent::ToolCallStarted { index, id, name } => {
+					if let Some(open) = open_part.take() {
+						yield pb::TurnEvent {
+							event: Some(turn_event::Event::PartEnd(pb::PartEnd {
+								index:     open,
+								signature: Bytes::new(),
+							})),
+						};
+					}
 					yield pb::TurnEvent {
 						event: Some(turn_event::Event::PartStart(pb::PartStart {
 							index,
@@ -2898,6 +2958,14 @@ fn turn_events(
 						Err(Status::failed_precondition(
 							"provider completed with live invocations outstanding",
 						))?;
+					}
+					if let Some(open) = open_part.take() {
+						yield pb::TurnEvent {
+							event: Some(turn_event::Event::PartEnd(pb::PartEnd {
+								index:     open,
+								signature: Bytes::new(),
+							})),
+						};
 					}
 					let outcome = build_turn_outcome(
 						&projection.lock(),
