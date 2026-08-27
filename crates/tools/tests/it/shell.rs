@@ -366,18 +366,12 @@ fn one_session_is_reused_with_its_cwd_and_environment_state() {
 fn command_environment_is_routed_to_the_run_not_the_session() {
 	let exec = FakeExec::default();
 	let registry = registry(exec.clone(), 1024);
-	let _ = call(
-		&registry,
-		r#"{"command":"show-env","env":{"ADD":"value","REMOVE":null}}"#,
-	);
+	let _ = call(&registry, r#"{"command":"show-env","env":{"ADD":"value","REMOVE":null}}"#);
 	let state = exec.state.lock();
 	assert!(state.session_options[0].env.is_empty());
 	assert_eq!(
 		state.runs[0].1.environment,
-		BTreeMap::from([
-			(sf!("ADD"), Some(sf!("value"))),
-			(sf!("REMOVE"), None),
-		]),
+		BTreeMap::from([(sf!("ADD"), Some(sf!("value"))), (sf!("REMOVE"), None),]),
 	);
 }
 

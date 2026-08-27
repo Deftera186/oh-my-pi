@@ -129,6 +129,17 @@ pub enum Status {
 	Blocked,
 }
 
+/// Read-only reference to one actionable todo item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActionableTodoRef {
+	/// Stable phase label.
+	pub phase:  Str,
+	/// User-visible task text.
+	pub text:   Str,
+	/// Actionable lifecycle state (`pending` or `in_progress`).
+	pub status: Status,
+}
+
 /// Successful todo state after an operation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
@@ -205,6 +216,27 @@ pub fn tool() -> Todo {
 			)
 			.into(),
 		},
+	}
+}
+
+impl Todo {
+	/// Returns pending and in-progress items in stable phase/item order.
+	pub fn actionable_snapshot(&self) -> Vec<ActionableTodoRef> {
+		let phases = self.phases.lock();
+		phases
+			.iter()
+			.flat_map(|phase| {
+				phase.items.iter().filter_map(|item| {
+					matches!(item.status, Status::Pending | Status::InProgress).then(|| {
+						ActionableTodoRef {
+							phase:  phase.phase.clone(),
+							text:   item.text.clone(),
+							status: item.status,
+						}
+					})
+				})
+			})
+			.collect()
 	}
 }
 
@@ -840,6 +872,42 @@ mod tests {
 		assert_eq!(phases[0].items[0].status, Status::Completed);
 		assert_eq!(phases[0].items[1].status, Status::InProgress);
 		assert_eq!(phases[0].items[2].status, Status::Blocked);
+	}
+
+	#[test]
+	fn actionable_snapshot_is_ordered_and_excludes_non_actionable_items() {
+		let todo = tool();
+		*todo.phases.lock() = vec![
+			Phase {
+				phase: sf!("Build"),
+				items: vec![
+					Item { text: sf!("active"), status: Status::InProgress, reason: None },
+					Item { text: sf!("blocked"), status: Status::Blocked, reason: Some(sf!("wait")) },
+					Item { text: sf!("pending"), status: Status::Pending, reason: None },
+				],
+			},
+			Phase {
+				phase: sf!("Ship"),
+				items: vec![
+					Item { text: sf!("done"), status: Status::Completed, reason: None },
+					Item { text: sf!("next"), status: Status::Pending, reason: None },
+					Item { text: sf!("dropped"), status: Status::Abandoned, reason: None },
+				],
+			},
+		];
+		assert_eq!(todo.actionable_snapshot(), vec![
+			ActionableTodoRef {
+				phase:  sf!("Build"),
+				text:   sf!("active"),
+				status: Status::InProgress,
+			},
+			ActionableTodoRef {
+				phase:  sf!("Build"),
+				text:   sf!("pending"),
+				status: Status::Pending,
+			},
+			ActionableTodoRef { phase: sf!("Ship"), text: sf!("next"), status: Status::Pending },
+		]);
 	}
 
 	#[test]
