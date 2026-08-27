@@ -806,7 +806,8 @@ fn declared_capabilities(row: &DiscoveredModel) -> ModelCapabilities {
 	capabilities
 }
 
-const fn unknown_chat_capabilities() -> ChatCapabilities {
+/// Returns a chat-capability record containing no positive evidence.
+pub const fn unknown_chat_capabilities() -> ChatCapabilities {
 	ChatCapabilities {
 		roles:             Availability::Unknown,
 		mid_session_roles: Availability::Unknown,
