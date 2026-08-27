@@ -29,7 +29,9 @@ pub use control::{
 pub use dispatch::{
 	CallbackConcurrency, DispatchError, DispatchPending, DispatchRequest, DispatchRouter,
 	EventDeadline, REGIME_SUBMISSION_TIMEOUT, RegimeDispatch, RegimeDispatchError,
-	decode_regime_draft,
+	UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry, UiDispatchError, UiRoster,
+	UiRosterConflict, UiShortcutRosterEntry, decode_regime_draft, decode_ui_dispatch_result,
+	shortcut_dispatch_succeeded,
 };
 pub use lifecycle::{
 	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,
@@ -37,7 +39,8 @@ pub use lifecycle::{
 	ExtensionManifest, GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost,
 	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegimeDeclarationTable,
 	RegimeManifestError, RegistryAvailabilitySink, RestartReason, ToolDeclarationKey,
-	validate_regime_manifests,
+	UiRegistrationError, VerifiedUiRoster, validate_regime_manifests,
+	verify_ui_registration,
 };
 pub use params::{
 	DIRECT_FILESYSTEM_CAPABILITY, DirectFilesystemAuthorityError, DirectFilesystemControlOwner,

@@ -8,6 +8,7 @@ use omp_envd::{
 	exthost::{
 		control::{ControlConnectionIdentity, ControlDispatch, ControlProtocolError},
 		dispatch::{CallbackDispatcher, decode_regime_draft},
+		VerifiedUiRoster,
 	},
 	worker::{ExtensionRegimeResolver, SealedRegistryEvidence},
 };
@@ -49,6 +50,11 @@ fn encoded_json(value: &[u8]) -> serde_json::Value {
 }
 
 fn evidence(identity: Arc<ControlConnectionIdentity>) -> Arc<SealedRegistryEvidence> {
+	let ui = VerifiedUiRoster {
+		generation: identity.host_generation,
+		extension: identity.extension.clone(),
+		..Default::default()
+	};
 	Arc::new(SealedRegistryEvidence {
 		identity,
 		session: Some(sf!("session-1")),
@@ -63,6 +69,7 @@ fn evidence(identity: Arc<ControlConnectionIdentity>) -> Arc<SealedRegistryEvide
 		),
 		tools: Arc::from([]),
 		hooks: Arc::from([]),
+		ui,
 		providers: Arc::from([]),
 		regimes: Arc::from([serde_json::json!({
 			"id": "retry",

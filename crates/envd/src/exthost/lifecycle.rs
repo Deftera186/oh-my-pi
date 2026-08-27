@@ -1,7 +1,7 @@
 //! Extension declaration, verification, and activation lifecycle.
 
 use std::{
-	collections::BTreeSet,
+	collections::{BTreeMap, BTreeSet},
 	future::Future,
 	sync::{
 		Arc,
@@ -14,11 +14,11 @@ use flume::Receiver;
 use omp_agent::{HookPhase, MailboxSender, device_availability_interrupt};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{InvocationPhase, Provenance, Str};
-use omp_ext::config::StaticDeclarations;
+use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use omp_proto::{
 	thread::v1::{Item, Message, Part, Role, item, part},
 	toolhost::v1::{RegimeDeclare, RegimeLifetime, RegimeManifest, SetAvailability},
-	ui::v1::{UiEffect, UiRequest},
+	ui::v1::{CommandDecl, RegisterUi, ShortcutDecl, UiEffect, UiRequest},
 };
 use omp_tool::{AvailabilityDelta, Registry};
 use thiserror::Error;
@@ -442,6 +442,64 @@ impl DeclarationDrift {
 			&& self.unexpected_escapes.is_empty()
 	}
 }
+/// Manifest-verified UI declarations owned by one exact extension generation.
+#[derive(Clone, Debug, Default)]
+pub struct VerifiedUiRoster {
+	/// Exact worker generation that registered the callbacks.
+	pub generation: u64,
+	/// Publisher-scoped extension identity.
+	pub extension:  Str,
+	/// Verified slash-command declarations.
+	pub commands:   Box<[CommandDecl]>,
+	/// Verified shortcut declarations.
+	pub shortcuts:  Box<[ShortcutDecl]>,
+}
+
+/// Exact reason a worker UI declaration table was rejected before FREEZE.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum UiRegistrationError {
+	/// Registration arrived after the generation crossed FREEZE.
+	#[error("UI registration arrived after declarations were frozen")]
+	RegistrationClosed,
+	/// The registration named another admitted extension.
+	#[error("UI registration named extension {actual}, expected {expected}")]
+	ForeignExtension {
+		/// Manifest extension identity.
+		expected: Str,
+		/// Worker-supplied extension identity.
+		actual:   Str,
+	},
+	/// Two commands claimed one canonical name or alias.
+	#[error("duplicate UI command spelling {spelling}")]
+	DuplicateCommand {
+		/// Colliding canonical name or alias.
+		spelling: Str,
+	},
+	/// Two shortcuts claimed one normalized chord.
+	#[error("duplicate UI shortcut chord {chord}")]
+	DuplicateShortcut {
+		/// Colliding normalized chord.
+		chord: Str,
+	},
+	/// A manifest declaration was absent from the runtime table.
+	#[error("UI manifest declaration {declaration} was not registered")]
+	Missing {
+		/// Stable manifest declaration id.
+		declaration: Str,
+	},
+	/// The runtime table contained a declaration absent from the manifest.
+	#[error("UI runtime declaration {declaration} was not admitted")]
+	Unexpected {
+		/// Stable runtime declaration id.
+		declaration: Str,
+	},
+	/// Runtime metadata differed from the signed manifest row.
+	#[error("UI declaration {declaration} metadata differs from the manifest")]
+	Metadata {
+		/// Stable declaration id.
+		declaration: Str,
+	},
+}
 
 /// The four manifest activation classes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -722,6 +780,9 @@ pub enum LifecycleError {
 	/// The frozen runtime registry differed from the manifest.
 	#[error("frozen declarations differ from the manifest")]
 	Drift(DeclarationDrift),
+	/// The typed UI registry differed from the signed manifest rows.
+	#[error(transparent)]
+	UiRegistration(#[from] UiRegistrationError),
 	/// A regime declaration violated the mode-slot contract.
 	#[error(transparent)]
 	RegimeManifest(#[from] RegimeManifestError),
@@ -943,9 +1004,11 @@ impl ExtensionManifest {
 		session_generation: u64,
 	) -> LifecycleMachine {
 		LifecycleMachine::new(
+			self.provenance.extension_id(),
 			self.entry.clone(),
 			self.declaration_modules.iter().cloned(),
 			self.declarations.clone(),
+			Arc::clone(&self.static_declarations),
 			self.activation_triggers.clone(),
 			session_started_at,
 			session_generation,
@@ -955,8 +1018,11 @@ impl ExtensionManifest {
 
 /// Deterministic lifecycle state for one admitted extension.
 pub struct LifecycleMachine {
+	extension:           Str,
 	modules:             Box<[Str]>,
 	expected:            DeclarationSet,
+	expected_ui:         Arc<StaticDeclarations>,
+	verified_ui:         Option<VerifiedUiRoster>,
 	regimes:             RegimeDeclarationTable,
 	activation_triggers: BTreeSet<ActivationTrigger>,
 	phase:               LifecyclePhase,
@@ -970,9 +1036,11 @@ impl LifecycleMachine {
 	/// Builds a machine and resolves the canonical import order: entry first,
 	/// followed by distinct declaration modules in manifest order.
 	fn new(
+		extension: impl Into<Str>,
 		entry: impl Into<Str>,
 		declaration_modules: impl IntoIterator<Item = Str>,
 		expected: DeclarationSet,
+		expected_ui: Arc<StaticDeclarations>,
 		activation_triggers: BTreeSet<ActivationTrigger>,
 		session_started_at: SystemTime,
 		session_generation: u64,
@@ -988,8 +1056,11 @@ impl LifecycleMachine {
 			}
 		}
 		Self {
+			extension: extension.into(),
 			modules: modules.into_boxed_slice(),
 			expected,
+			expected_ui,
+			verified_ui: None,
 			regimes: RegimeDeclarationTable::default(),
 			activation_triggers,
 			phase: LifecyclePhase::Declared,
@@ -1003,6 +1074,69 @@ impl LifecycleMachine {
 	/// Returns the machine's current child lifecycle phase.
 	pub const fn phase(&self) -> LifecyclePhase {
 		self.phase
+	}
+
+	/// Exact-validates the typed UI registry before FREEZE and retains its
+	/// generation-owned roster for publication.
+	pub fn register_ui(
+		&mut self,
+		registration: RegisterUi,
+		fence: GenerationFence,
+	) -> Result<&VerifiedUiRoster, LifecycleError> {
+		if matches!(
+			self.phase,
+			LifecyclePhase::Frozen
+				| LifecyclePhase::Verified
+				| LifecyclePhase::Active
+				| LifecyclePhase::Degraded
+		) {
+			self.phase = LifecyclePhase::Degraded;
+			return Err(UiRegistrationError::RegistrationClosed.into());
+		}
+		if self.verified_ui.is_some() {
+			self.phase = LifecyclePhase::Degraded;
+			return Err(UiRegistrationError::RegistrationClosed.into());
+		}
+		if fence.session != self.session_generation
+			|| fence.host < self.host_generation
+			|| registration.generation != fence.host
+		{
+			self.phase = LifecyclePhase::Degraded;
+			return Err(LifecycleError::StaleGeneration {
+				expected_session: self.session_generation,
+				current_host:     self.host_generation,
+				actual_session:   fence.session,
+				actual_host:      registration.generation,
+			});
+		}
+		if registration.extension_id != self.extension.as_str() {
+			self.phase = LifecyclePhase::Degraded;
+			return Err(
+				UiRegistrationError::ForeignExtension {
+					expected: self.extension.clone(),
+					actual:   Str::from(registration.extension_id),
+				}
+				.into(),
+			);
+		}
+		let roster = match verify_ui_registration(&self.expected_ui, registration) {
+			Ok(roster) => roster,
+			Err(error) => {
+				self.phase = LifecyclePhase::Degraded;
+				return Err(error.into());
+			},
+		};
+		self.host_generation = fence.host;
+		self.verified_ui = Some(roster);
+		Ok(self
+			.verified_ui
+			.as_ref()
+			.expect("verified UI roster was stored"))
+	}
+
+	/// Returns the manifest-verified UI roster, when registration completed.
+	pub fn verified_ui(&self) -> Option<&VerifiedUiRoster> {
+		self.verified_ui.as_ref()
 	}
 
 	/// Accepts and validates the worker regime table before FREEZE.
@@ -1073,6 +1207,17 @@ impl LifecycleMachine {
 
 		self.host_generation = fence.host;
 		self.phase = LifecyclePhase::Declared;
+		if self.verified_ui.is_none()
+			&& let Some(row) = self
+				.expected_ui
+				.ui
+				.commands
+				.first()
+				.or_else(|| self.expected_ui.ui.shortcuts.first())
+		{
+			self.phase = LifecyclePhase::Degraded;
+			return Err(UiRegistrationError::Missing { declaration: row.id.clone() }.into());
+		}
 		let drift = DeclarationDrift::between(&self.expected, declared);
 		if !drift.is_empty() {
 			self.phase = LifecyclePhase::Degraded;
@@ -1106,6 +1251,167 @@ impl LifecycleMachine {
 		Ok(ActivationDisposition::Activated(event))
 	}
 }
+
+/// Exact-validates one typed UI registration against authenticated manifest rows.
+pub fn verify_ui_registration(
+	expected: &StaticDeclarations,
+	registration: RegisterUi,
+) -> Result<VerifiedUiRoster, UiRegistrationError> {
+	let generation = registration.generation;
+	let extension = Str::from(registration.extension_id.as_str());
+	validate_ui_commands(&expected.ui.commands, &registration.commands)?;
+	validate_ui_shortcuts(&expected.ui.shortcuts, &registration.shortcuts)?;
+	Ok(VerifiedUiRoster {
+		generation,
+		extension,
+		commands: registration.commands.into_boxed_slice(),
+		shortcuts: registration.shortcuts.into_boxed_slice(),
+	})
+}
+
+fn validate_ui_commands(
+	expected: &[StaticDeclaration],
+	actual: &[CommandDecl],
+) -> Result<(), UiRegistrationError> {
+	let expected = expected
+		.iter()
+		.map(|row| (row.id.as_str(), row))
+		.collect::<BTreeMap<_, _>>();
+	let mut ids = BTreeSet::new();
+	let mut spellings = BTreeSet::new();
+	for command in actual {
+		if !ids.insert(command.declaration_id.as_str()) {
+			return Err(UiRegistrationError::Unexpected {
+				declaration: Str::from(command.declaration_id.as_str()),
+			});
+		}
+		for spelling in
+			std::iter::once(command.name.as_str()).chain(command.aliases.iter().map(String::as_str))
+		{
+			if spelling.is_empty() || !spellings.insert(spelling) {
+				return Err(UiRegistrationError::DuplicateCommand { spelling: Str::from(spelling) });
+			}
+		}
+		let Some(row) = expected.get(command.declaration_id.as_str()) else {
+			return Err(UiRegistrationError::Unexpected {
+				declaration: Str::from(command.declaration_id.as_str()),
+			});
+		};
+		if !command_matches_manifest(command, row) {
+			return Err(UiRegistrationError::Metadata { declaration: row.id.clone() });
+		}
+	}
+	for id in expected.keys() {
+		if !ids.contains(id) {
+			return Err(UiRegistrationError::Missing { declaration: Str::from(*id) });
+		}
+	}
+	Ok(())
+}
+
+fn validate_ui_shortcuts(
+	expected: &[StaticDeclaration],
+	actual: &[ShortcutDecl],
+) -> Result<(), UiRegistrationError> {
+	let expected = expected
+		.iter()
+		.map(|row| (row.id.as_str(), row))
+		.collect::<BTreeMap<_, _>>();
+	let mut ids = BTreeSet::new();
+	let mut chords = BTreeSet::new();
+	for shortcut in actual {
+		if !ids.insert(shortcut.declaration_id.as_str()) {
+			return Err(UiRegistrationError::Unexpected {
+				declaration: Str::from(shortcut.declaration_id.as_str()),
+			});
+		}
+		if shortcut.chord.is_empty() || !chords.insert(shortcut.chord.as_str()) {
+			return Err(UiRegistrationError::DuplicateShortcut {
+				chord: Str::from(shortcut.chord.as_str()),
+			});
+		}
+		let Some(row) = expected.get(shortcut.declaration_id.as_str()) else {
+			return Err(UiRegistrationError::Unexpected {
+				declaration: Str::from(shortcut.declaration_id.as_str()),
+			});
+		};
+		if !shortcut_matches_manifest(shortcut, row) {
+			return Err(UiRegistrationError::Metadata { declaration: row.id.clone() });
+		}
+	}
+	for id in expected.keys() {
+		if !ids.contains(id) {
+			return Err(UiRegistrationError::Missing { declaration: Str::from(*id) });
+		}
+	}
+	Ok(())
+}
+
+fn command_matches_manifest(command: &CommandDecl, row: &StaticDeclaration) -> bool {
+	let args = row
+		.properties
+		.get("args")
+		.and_then(serde_json::Value::as_array)
+		.map_or(&[][..], Vec::as_slice);
+	command.name == row.key.as_str()
+		&& command.description == manifest_string(row, "description").unwrap_or_default()
+		&& command.hint.as_deref() == manifest_string(row, "hint")
+		&& command
+			.aliases
+			.iter()
+			.map(String::as_str)
+			.eq(manifest_strings(row, "aliases"))
+		&& command.args.len() == args.len()
+		&& command.args.iter().zip(args).all(|(actual, expected)| {
+			actual.name == json_string(expected, "name").unwrap_or_default()
+				&& actual.description == json_string(expected, "description").unwrap_or_default()
+				&& actual.usage.as_deref() == json_string(expected, "usage")
+		}) && command.callback == manifest_string(row, "callback").unwrap_or_default()
+		&& command.arg_completion_callback.as_deref() == manifest_string(row, "arg_completions")
+		&& command.module == row.module.as_str()
+		&& command.activation_trigger == row.trigger.as_str()
+}
+
+fn shortcut_matches_manifest(shortcut: &ShortcutDecl, row: &StaticDeclaration) -> bool {
+	shortcut.chord == row.key.as_str()
+		&& shortcut.action_id
+			== manifest_string(row, "action_id")
+				.or_else(|| manifest_string(row, "action"))
+				.unwrap_or_default()
+		&& shortcut.description == manifest_string(row, "description").unwrap_or_default()
+		&& shortcut
+			.when
+			.iter()
+			.map(String::as_str)
+			.eq(manifest_strings(row, "when"))
+		&& shortcut.callback == manifest_string(row, "callback").unwrap_or_default()
+		&& shortcut.module == row.module.as_str()
+		&& shortcut.activation_trigger == row.trigger.as_str()
+}
+
+fn manifest_string<'a>(row: &'a StaticDeclaration, key: &str) -> Option<&'a str> {
+	row.properties.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn manifest_strings<'a>(
+	row: &'a StaticDeclaration,
+	key: &str,
+) -> impl Iterator<Item = &'a str> + Clone {
+	row.properties
+		.get(key)
+		.and_then(serde_json::Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(serde_json::Value::as_str)
+}
+
+fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+	value
+		.as_object()
+		.and_then(|object| object.get(key))
+		.and_then(serde_json::Value::as_str)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1127,6 +1433,98 @@ mod tests {
 		}
 	}
 
+	fn command_row(id: &str, key: &str) -> StaticDeclaration {
+		StaticDeclaration {
+			id: sf!("{id}"),
+			kind: sf!("command"),
+			module: sf!("extension.commands"),
+			trigger: sf!("lazy"),
+			key: sf!("{key}"),
+			properties: BTreeMap::from([
+				(sf!("aliases"), serde_json::json!(["alias"])),
+				(sf!("description"), serde_json::json!("Runs command")),
+				(sf!("callback"), serde_json::json!("extension.commands.run")),
+			]),
+			..Default::default()
+		}
+	}
+
+	fn command_decl(id: &str, name: &str) -> CommandDecl {
+		CommandDecl {
+			name: name.to_owned(),
+			description: "Runs command".to_owned(),
+			aliases: vec!["alias".to_owned()],
+			declaration_id: id.to_owned(),
+			callback: "extension.commands.run".to_owned(),
+			module: "extension.commands".to_owned(),
+			activation_trigger: "lazy".to_owned(),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn register_ui_exact_validates_manifest_metadata_and_duplicates() {
+		let mut expected = StaticDeclarations::default();
+		expected.ui.commands = vec![command_row("command", "run")].into_boxed_slice();
+		let exact = RegisterUi {
+			commands: vec![command_decl("command", "run")],
+			generation: 4,
+			extension_id: "extension".to_owned(),
+			..Default::default()
+		};
+		let roster = verify_ui_registration(&expected, exact).expect("exact UI table");
+		assert_eq!(roster.commands[0].name, "run");
+
+		let duplicate = RegisterUi {
+			commands: vec![command_decl("command", "run"), command_decl("other", "alias")],
+			generation: 4,
+			extension_id: "extension".to_owned(),
+			..Default::default()
+		};
+		assert!(matches!(
+			verify_ui_registration(&expected, duplicate),
+			Err(UiRegistrationError::DuplicateCommand { .. })
+		));
+
+		let mut drifted = command_decl("command", "run");
+		drifted.aliases = vec!["undeclared".to_owned()];
+		assert!(matches!(
+			verify_ui_registration(&expected, RegisterUi {
+				commands: vec![drifted],
+				generation: 4,
+				extension_id: "extension".to_owned(),
+				..Default::default()
+			}),
+			Err(UiRegistrationError::Metadata { .. })
+		));
+	}
+
+	#[test]
+	fn stale_ui_registration_degrades_generation() {
+		let mut lifecycle = LifecycleMachine::new(
+			"extension",
+			"entry",
+			[],
+			DeclarationSet::default(),
+			Arc::new(StaticDeclarations::default()),
+			BTreeSet::new(),
+			SystemTime::UNIX_EPOCH,
+			2,
+		);
+		let error = lifecycle
+			.register_ui(
+				RegisterUi {
+					generation: 3,
+					extension_id: "extension".to_owned(),
+					..Default::default()
+				},
+				GenerationFence { host: 4, session: 2 },
+			)
+			.expect_err("registration generation must match transport generation");
+		assert!(matches!(error, LifecycleError::StaleGeneration { .. }));
+		assert_eq!(lifecycle.phase(), LifecyclePhase::Degraded);
+	}
+
 	#[test]
 	fn core_regime_specs_cannot_declare_stealth_modes() {
 		let stealth = core_regime(
@@ -1144,8 +1542,10 @@ mod tests {
 		);
 		let mut lifecycle = LifecycleMachine::new(
 			"core",
+			"entry",
 			[],
 			DeclarationSet::default(),
+			Arc::new(StaticDeclarations::default()),
 			BTreeSet::new(),
 			SystemTime::UNIX_EPOCH,
 			1,

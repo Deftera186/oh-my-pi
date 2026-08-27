@@ -464,6 +464,14 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	),
 	symbol!(
 		"docs/py/11-env.md",
+		"omp.env.lsp.status",
+		"(reload=False) -> list[LspServerStatus]",
+		CallbackAbi::None,
+		ENV_EPHEMERAL,
+		"await omp.env.lsp.status()"
+	),
+	symbol!(
+		"docs/py/11-env.md",
 		"omp.env.lsp.request",
 		"(server, method, params, *, doc=None, on_stale=None, timeout=None) -> Any",
 		CallbackAbi::None,

@@ -300,6 +300,7 @@ fn registry_evidence_error(error: SealedRegistryEvidenceError) -> ControlProtoco
 		| SealedRegistryEvidenceError::Duplicate
 		| SealedRegistryEvidenceError::SourceModule => "RegistryDrift",
 		SealedRegistryEvidenceError::Nested => "InvalidPhase",
+		SealedRegistryEvidenceError::Ui(_) => "RegistryDrift",
 		SealedRegistryEvidenceError::Malformed(_) => "RegistryMalformed",
 	};
 	ControlProtocolError::new(code, Str::from(error.to_string()))

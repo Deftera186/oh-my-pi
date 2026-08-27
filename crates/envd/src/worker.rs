@@ -52,6 +52,7 @@ use omp_proto::{
 			regime_worker_envelope, worker_frame,
 		},
 	},
+	ui::v1::{CommandArgDecl, CommandDecl, RegisterUi, ShortcutDecl},
 };
 use omp_tools::read::resolver::SchemeSnapshot;
 use parking_lot::Mutex;
@@ -59,7 +60,7 @@ use pyo3::{
 	exceptions::{PyImportError, PyKeyError, PyTypeError, PyValueError},
 	intern,
 	prelude::*,
-	types::{PyDict, PyIterator, PyList, PyModule, PyString},
+	types::{PyBytes, PyDict, PyIterator, PyList, PyModule, PyString},
 	wrap_pyfunction,
 };
 use serde::Deserialize;
@@ -81,10 +82,11 @@ use crate::{
 	exthost::{
 		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
 		CallbackConcurrency, ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-		ControlQuotaLedger, DeclarationSet, EventDeadline, ExtensionManifest, GenerationFence,
-		HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError, ServiceBroker,
-		ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta, ServiceResponse, SpawnSpec,
-		SpawnedHost, ToolDeclarationKey,
+		ControlQuotaLedger, DeclarationSet, ENV_SOCKET_ENV, EventDeadline, ExtensionManifest,
+		GenerationFence, HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError,
+		ServiceBroker, ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta,
+		ServiceResponse, SpawnSpec, SpawnedHost, ToolDeclarationKey, VerifiedUiRoster,
+		verify_ui_registration,
 		control::{
 			ActivationCliValue, ContributedValueDelivery, ControlAuthoritySnapshot,
 			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlHandle,
@@ -1247,6 +1249,7 @@ struct PendingControlActivation {
 	identity:           Arc<ControlConnectionIdentity>,
 	manifest:           ExtensionManifest,
 	key:                HostKey,
+	data_enabled:       bool,
 	trigger:            ActivationTrigger,
 	session_id:         Str,
 	session_started_at: SystemTime,
@@ -1551,6 +1554,7 @@ impl ExtHostSupervisor {
 				identity: Arc::clone(&identity),
 				manifest: extension.manifest.clone(),
 				key: extension.key.clone(),
+				data_enabled: extension.data_socket.is_some(),
 				trigger,
 				session_id: config.session_id.clone(),
 				session_started_at: config.session_started_at,
@@ -2419,10 +2423,14 @@ struct ProcessKey {
 
 impl ProcessKey {
 	fn from_spec(spec: &ExtHostSpec) -> Self {
-		let unit = spec
-			.pool
-			.clone()
-			.map_or_else(|| FateUnit::Extension(spec.key.extension().clone()), FateUnit::Pool);
+		let unit = if spec.data_socket.is_some() {
+			FateUnit::Extension(spec.key.extension().clone())
+		} else {
+			spec
+				.pool
+				.clone()
+				.map_or_else(|| FateUnit::Extension(spec.key.extension().clone()), FateUnit::Pool)
+		};
 		Self { layer: spec.key.layer().clone(), tier: spec.key.tier().clone(), unit }
 	}
 
@@ -2634,7 +2642,53 @@ struct WorkerProcess {
 	read_scratch:          BytesMut,
 	write_scratch:         BytesMut,
 	registrations:         Vec<ToolDecl>,
+	ui_registrations:      BTreeMap<HostKey, RegisterUi>,
 	service_registrations: BTreeMap<HostKey, Box<[ServiceProviderDeclaration]>>,
+}
+#[derive(Deserialize)]
+struct RegisteredCallback {
+	#[serde(rename = "$omp.callable")]
+	callable: String,
+}
+
+#[derive(Deserialize)]
+struct RegisteredCommandArg {
+	name:        String,
+	#[serde(default)]
+	description: String,
+	#[serde(default)]
+	usage:       Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RegisteredCommand {
+	name:            String,
+	#[serde(default)]
+	aliases:         Vec<String>,
+	#[serde(default)]
+	description:     String,
+	#[serde(default)]
+	args:            Vec<RegisteredCommandArg>,
+	#[serde(default)]
+	hint:            Option<String>,
+	#[serde(default)]
+	arg_completions: Option<RegisteredCallback>,
+	handler:         RegisteredCallback,
+	#[serde(default)]
+	trigger:         String,
+}
+
+#[derive(Deserialize)]
+struct RegisteredShortcut {
+	chord:       String,
+	action_id:   String,
+	#[serde(default)]
+	description: String,
+	#[serde(default)]
+	when:        Option<Vec<String>>,
+	handler:     RegisteredCallback,
+	#[serde(default)]
+	trigger:     String,
 }
 
 #[derive(Deserialize)]
@@ -2696,6 +2750,10 @@ struct RegisteredRegistrySnapshot {
 	hooks:     Vec<RegisteredHook>,
 	#[serde(default)]
 	services:  Vec<RegisteredService>,
+	#[serde(default)]
+	commands:  Vec<RegisteredCommand>,
+	#[serde(default)]
+	shortcuts: Vec<RegisteredShortcut>,
 	#[serde(default)]
 	providers: Vec<serde_json::Value>,
 	#[serde(default)]
@@ -2763,6 +2821,8 @@ pub struct SealedRegistryEvidence {
 	pub tools:      Arc<[SealedToolRegistration]>,
 	/// Verified runtime hook declaration keys.
 	pub hooks:      Arc<[SealedHookRegistration]>,
+	/// Manifest-verified command and shortcut declarations.
+	pub ui:         VerifiedUiRoster,
 	/// Full frozen runtime provider declaration documents.
 	pub providers:  Arc<[serde_json::Value]>,
 	/// Full frozen runtime regime declaration documents.
@@ -3734,6 +3794,9 @@ pub enum SealedRegistryEvidenceError {
 	/// Frozen runtime declarations differ from the authenticated manifest.
 	#[error("registry publication differs from authenticated manifest")]
 	ManifestDrift,
+	/// Typed UI declarations differ from the authenticated manifest.
+	#[error(transparent)]
+	Ui(#[from] crate::exthost::UiRegistrationError),
 	/// One declaration was duplicated.
 	#[error("registry publication contains a duplicate declaration")]
 	Duplicate,
@@ -3853,11 +3916,16 @@ fn seal_frozen_control_evidence(
 		));
 	}
 	Ok(SealedRegistryEvidence {
-		identity,
+		identity: Arc::clone(&identity),
 		session: Some(session),
 		provenance: manifest.provenance.clone(),
 		tools: Arc::from([]),
 		hooks: Arc::from([]),
+		ui: VerifiedUiRoster {
+			generation: identity.host_generation,
+			extension: identity.extension.clone(),
+			..Default::default()
+		},
 		providers: provider_documents.into(),
 		regimes: regime_documents.into(),
 	})
@@ -3958,6 +4026,12 @@ pub fn seal_registry_evidence(
 	{
 		return Err(SealedRegistryEvidenceError::SourceModule);
 	}
+	let ui = seal_registered_ui(
+		manifest,
+		identity,
+		snapshot.commands,
+		snapshot.shortcuts,
+	)?;
 	Ok(SealedRegistryEvidence {
 		identity:   Arc::clone(identity),
 		session:    None,
@@ -3981,9 +4055,109 @@ pub fn seal_registry_evidence(
 				.map(seal_hook_registration)
 				.collect::<Result<Vec<_>, _>>()?,
 		),
+		ui,
 		providers:  snapshot.providers.into(),
 		regimes:    snapshot.regimes.into(),
 	})
+}
+fn seal_registered_ui(
+	manifest: &ExtensionManifest,
+	identity: &ControlConnectionIdentity,
+	commands: Vec<RegisteredCommand>,
+	shortcuts: Vec<RegisteredShortcut>,
+) -> Result<VerifiedUiRoster, SealedRegistryEvidenceError> {
+	let mut register = RegisterUi {
+		generation: identity.host_generation,
+		extension_id: identity.extension.to_string(),
+		..Default::default()
+	};
+	for command in commands {
+		let module = manifest_module_for_callback(manifest, command.handler.callable.as_str())?;
+		let row = manifest
+			.static_declarations()
+			.ui
+			.commands
+			.iter()
+			.find(|row| row.key.as_str() == command.name);
+		register.commands.push(CommandDecl {
+			name: command.name.clone(),
+			description: command.description,
+			hint: command.hint,
+			aliases: command.aliases,
+			args: command
+				.args
+				.into_iter()
+				.map(|arg| CommandArgDecl {
+					name: arg.name,
+					description: arg.description,
+					usage: arg.usage,
+				})
+				.collect(),
+			declaration_id: row.map_or_else(|| command.name, |row| row.id.to_string()),
+			callback: command.handler.callable,
+			module: module.to_owned(),
+			activation_trigger: if command.trigger.is_empty() {
+				row.map_or_else(|| "lazy".to_owned(), |row| row.trigger.to_string())
+			} else {
+				command.trigger
+			},
+			arg_completion_callback: command
+				.arg_completions
+				.map(|callback| callback.callable),
+			props: None,
+		});
+	}
+	register.shortcuts = seal_registered_shortcuts(manifest, shortcuts)?;
+	verify_ui_registration(manifest.static_declarations(), register).map_err(Into::into)
+}
+fn seal_registered_shortcuts(
+	manifest: &ExtensionManifest,
+	shortcuts: Vec<RegisteredShortcut>,
+) -> Result<Vec<ShortcutDecl>, SealedRegistryEvidenceError> {
+	shortcuts
+		.into_iter()
+		.map(|shortcut| {
+			let module =
+				manifest_module_for_callback(manifest, shortcut.handler.callable.as_str())?;
+			let row = manifest
+				.static_declarations()
+				.ui
+				.shortcuts
+				.iter()
+				.find(|row| row.key.as_str() == shortcut.chord);
+			Ok(ShortcutDecl {
+				chord: shortcut.chord.clone(),
+				action_id: shortcut.action_id,
+				description: shortcut.description,
+				when: shortcut.when.unwrap_or_default(),
+				declaration_id: row.map_or_else(|| shortcut.chord, |row| row.id.to_string()),
+				callback: shortcut.handler.callable,
+				module: module.to_owned(),
+				activation_trigger: if shortcut.trigger.is_empty() {
+					row.map_or_else(|| "lazy".to_owned(), |row| row.trigger.to_string())
+				} else {
+					shortcut.trigger
+				},
+				props: None,
+			})
+		})
+		.collect()
+}
+
+fn manifest_module_for_callback<'a>(
+	manifest: &'a ExtensionManifest,
+	callback: &str,
+) -> Result<&'a str, SealedRegistryEvidenceError> {
+	std::iter::once(&manifest.entry)
+		.chain(manifest.declaration_modules.iter())
+		.find(|module| {
+			callback == module.as_str()
+				|| callback
+					.strip_prefix(module.as_str())
+					.is_some_and(|suffix| suffix.starts_with('.'))
+		})
+		.map(Str::as_str)
+		.ok_or(SealedRegistryEvidenceError::SourceModule)
 }
 
 fn seal_hook_registration(
@@ -4233,9 +4407,9 @@ impl WorkerProcess {
 		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 		command.env("OMP_EXT_MANIFEST_SNAPSHOT", manifest_snapshot);
 		if let Some(socket) = &config.data_socket {
-			command.env("OMP_EXT_ENV_SOCKET", socket);
+			command.env(ENV_SOCKET_ENV, socket);
 		} else {
-			command.env_remove("OMP_EXT_ENV_SOCKET");
+			command.env_remove(ENV_SOCKET_ENV);
 		}
 		if let Some(snapshot) = &config.scheme_snapshot {
 			let entries = snapshot
@@ -4299,6 +4473,7 @@ impl WorkerProcess {
 			read_scratch: BytesMut::with_capacity(8 * 1024),
 			write_scratch: BytesMut::with_capacity(8 * 1024),
 			registrations: Vec::new(),
+			ui_registrations: BTreeMap::new(),
 			service_registrations: BTreeMap::new(),
 		};
 		if let Err(error) = process.handshake(config, generation, cause).await {
@@ -4405,6 +4580,7 @@ impl WorkerProcess {
 		}
 		validate_registrations(&tools)?;
 		validate_manifest_registrations(config, &tools)?;
+		self.ui_registrations = parse_ui_registrations(config, props.as_ref(), generation)?;
 		self.service_registrations = parse_service_registrations(config, props.as_ref())?;
 		self.registrations = tools;
 		self.activate_manifests(config, generation, cause).await?;
@@ -4421,6 +4597,17 @@ impl WorkerProcess {
 		for (owner, manifest) in &config.manifests {
 			let declared = actual_declarations(config, &self.registrations, owner)?;
 			let mut machine = manifest.lifecycle(config.session_started_at, config.session_generation);
+			let register_ui = self
+				.ui_registrations
+				.get(owner)
+				.cloned()
+				.expect("every admitted extension has a UI registration");
+			machine
+				.register_ui(register_ui, GenerationFence {
+					host:    generation,
+					session: config.session_generation,
+				})
+				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 			let mut host = WorkerLifecycleAdapter {
 				process: self,
 				config,
@@ -4880,24 +5067,35 @@ async fn run_control_supervisor(
 					serde_json::Value::String(invocation.call.name.to_string()),
 				);
 				arguments.insert(String::from("args"), serde_json::Value::Object(args));
+				let data = (activation.data_enabled && frame.effects.is_some()).then(|| {
+					serde_json::json!({
+						"invocation": invocation.call.invocation_id.as_str(),
+						"effect_token": {
+							"$bytes": omp_core::base64::encode(frame.effect_token.as_ref()),
+						},
+						"host_generation": host_generation.load(Ordering::Acquire),
+						"session_generation": session_generation,
+						"pty_denied": false,
+					})
+				});
 				let authority = ControlInvocationAuthority {
-					invocation:        invocation.call.invocation_id.clone(),
-					phase:             InvocationPhase::EffectsAuthorized,
-					session:           session_id.clone(),
-					turn:              None,
-					event:             None,
-					call:              Some(invocation.call.invocation_id.clone()),
-					device:            Some(invocation.call.name.clone()),
-					effects:           Box::new([]),
-					place_kind:        sf!("extension"),
-					lifecycle:         LifecyclePhase::Active,
-					roots:             Box::new([]),
-					remote:            false,
-					has_ui:            false,
-					headless:          true,
-					settings:          serde_json::Map::new(),
-					secret_settings:   Box::new([]),
-					data:              None,
+					invocation: invocation.call.invocation_id.clone(),
+					phase: InvocationPhase::EffectsAuthorized,
+					session: session_id.clone(),
+					turn: None,
+					event: None,
+					call: Some(invocation.call.invocation_id.clone()),
+					device: Some(invocation.call.name.clone()),
+					effects: Box::new([]),
+					place_kind: sf!("extension"),
+					lifecycle: LifecyclePhase::Active,
+					roots: Box::new([]),
+					remote: false,
+					has_ui: false,
+					headless: true,
+					settings: serde_json::Map::new(),
+					secret_settings: Box::new([]),
+					data,
 					direct_filesystem: None,
 				};
 				let dispatch = ControlDispatch {
@@ -6324,6 +6522,140 @@ fn parse_service_registrations(
 		.map(|(owner, services)| (owner, services.into_boxed_slice()))
 		.collect())
 }
+fn parse_ui_registrations(
+	config: &ProcessConfig,
+	props: Option<&ValueMap>,
+	generation: u64,
+) -> Result<BTreeMap<HostKey, RegisterUi>, WorkerError> {
+	let encoded = props
+		.and_then(|props| props.fields.get("omp/registry-snapshot-json"))
+		.and_then(|value| match value.kind.as_ref() {
+			Some(value::Kind::String(encoded)) => Some(encoded.as_str()),
+			_ => None,
+		})
+		.ok_or_else(|| {
+			WorkerError::Protocol(sf!("RegisterTools omitted sealed registry metadata"))
+		})?;
+	let snapshot: RegisteredRegistrySnapshot = serde_json::from_str(encoded)
+		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+	let mut registrations = config
+		.manifests
+		.keys()
+		.cloned()
+		.map(|owner| {
+			(owner.clone(), RegisterUi {
+				generation,
+				extension_id: owner.extension().to_string(),
+				..Default::default()
+			})
+		})
+		.collect::<BTreeMap<_, _>>();
+	for command in snapshot.commands {
+		let (owner, module) = ui_callback_owner(config, command.handler.callable.as_str())?;
+		let module = module.to_owned();
+		let manifest = config
+			.manifests
+			.get(owner)
+			.expect("UI callback owner is admitted");
+		let row = manifest
+			.static_declarations()
+			.ui
+			.commands
+			.iter()
+			.find(|row| row.key.as_str() == command.name);
+		registrations
+			.get_mut(owner)
+			.expect("UI callback owner has a registration")
+			.commands
+			.push(CommandDecl {
+				name:                    command.name.clone(),
+				description:             command.description,
+				hint:                    command.hint,
+				aliases:                 command.aliases,
+				args:                    command
+					.args
+					.into_iter()
+					.map(|arg| CommandArgDecl {
+						name:        arg.name,
+						description: arg.description,
+						usage:       arg.usage,
+					})
+					.collect(),
+				declaration_id:          row
+					.map_or_else(|| command.name.clone(), |row| row.id.to_string()),
+				callback:                command.handler.callable,
+				module:                  module,
+				activation_trigger:      if command.trigger.is_empty() {
+					row.map_or_else(|| "lazy".to_owned(), |row| row.trigger.to_string())
+				} else {
+					command.trigger
+				},
+				arg_completion_callback: command.arg_completions.map(|callback| callback.callable),
+				props:                   None,
+			});
+	}
+	for shortcut in snapshot.shortcuts {
+		let (owner, module) = ui_callback_owner(config, shortcut.handler.callable.as_str())?;
+		let module = module.to_owned();
+		let manifest = config
+			.manifests
+			.get(owner)
+			.expect("UI callback owner is admitted");
+		let row = manifest
+			.static_declarations()
+			.ui
+			.shortcuts
+			.iter()
+			.find(|row| row.key.as_str() == shortcut.chord);
+		registrations
+			.get_mut(owner)
+			.expect("UI callback owner has a registration")
+			.shortcuts
+			.push(ShortcutDecl {
+				chord:              shortcut.chord.clone(),
+				action_id:          shortcut.action_id,
+				description:        shortcut.description,
+				when:               shortcut.when.unwrap_or_default(),
+				declaration_id:     row.map_or_else(|| shortcut.chord, |row| row.id.to_string()),
+				callback:           shortcut.handler.callable,
+				module:             module,
+				activation_trigger: if shortcut.trigger.is_empty() {
+					row.map_or_else(|| "lazy".to_owned(), |row| row.trigger.to_string())
+				} else {
+					shortcut.trigger
+				},
+				props:              None,
+			});
+	}
+	Ok(registrations)
+}
+
+fn ui_callback_owner<'a>(
+	config: &'a ProcessConfig,
+	callback: &'a str,
+) -> Result<(&'a HostKey, &'a str), WorkerError> {
+	let owners = config
+		.manifests
+		.iter()
+		.filter_map(|(owner, manifest)| {
+			std::iter::once(&manifest.entry)
+				.chain(manifest.declaration_modules.iter())
+				.find(|module| {
+					callback == module.as_str()
+						|| callback
+							.strip_prefix(module.as_str())
+							.is_some_and(|suffix| suffix.starts_with('.'))
+				})
+				.map(|module| (owner, module.as_str()))
+		})
+		.collect::<Vec<_>>();
+	let [owner] = owners.as_slice() else {
+		return Err(WorkerError::Protocol(sf!(
+			"UI callback module is not owned by exactly one admitted extension",
+		)));
+	};
+	Ok(*owner)
+}
 
 fn manifest_registration_diff(
 	owner: &HostKey,
@@ -6975,10 +7307,12 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					&tools,
 					frame.request_id,
 					invoke,
+					&commit,
 					&session_id,
 					&principal_id,
 					&principal_display,
 					host_generation,
+					session_generation,
 					&mut writer,
 					limit,
 					&mut write_scratch,
@@ -7380,6 +7714,22 @@ fn load_tools(
 				} else {
 					PythonToolKind::Contextual { place: row.getattr("place")?.extract()? }
 				};
+				let effects = row.getattr("effects")?;
+				let effects = if effects.is_none() {
+					None
+				} else {
+					let mapping = PyModule::import(py, "dataclasses")?
+						.call_method1("asdict", (&effects,))?;
+					let encoded: String = json
+						.call_method1("dumps", (mapping,))?
+						.extract()?;
+					let effects: omp_tool::Effects = serde_json::from_str(&encoded).map_err(|error| {
+						PyValueError::new_err(format!(
+							"Python tool {name} effects are invalid: {error}",
+						))
+					})?;
+					Some(omp_proto::policy::v1::EffectEnvelope::from(&effects))
+				};
 				tools.push(PythonTool {
 					decl: ToolDecl {
 						definition: Some(ToolDef {
@@ -7394,6 +7744,7 @@ fn load_tools(
 						constraint: None,
 						extension_id: row.getattr("source_module")?.extract()?,
 						streams_args: row.getattr("streams_args")?.extract()?,
+						effects,
 						props: None,
 						..Default::default()
 					},
@@ -7524,10 +7875,12 @@ fn serve_invocation<W: Write>(
 	tools: &[PythonTool],
 	request_id: u64,
 	invoke: InvokeTool,
+	commit: &ArgsCommitted,
 	session_id: &str,
 	principal_id: &str,
 	principal_display: &str,
 	host_generation: u64,
+	session_generation: u64,
 	writer: &mut W,
 	limit: NonZeroUsize,
 	scratch: &mut BytesMut,
@@ -7550,112 +7903,124 @@ fn serve_invocation<W: Write>(
 		);
 	};
 	let call_id = invoke.call_id.clone();
-	let result = engine.attach(|py| -> Result<PythonCompletion, WorkerError> {
-		let json = PyModule::import(py, "json")?;
-		let args = str::from_utf8(invoke.args_json.as_ref())
-			.map_err(|_| WorkerError::Python(sf!("committed args are not UTF-8")))?;
-		let params = json.getattr("loads")?.call1((args,))?;
-		let mut value = match &tool.kind {
-			PythonToolKind::Legacy | PythonToolKind::Prelude => {
-				tool.handler.bind(py).call1((params,))?
-			},
-			PythonToolKind::Contextual { place } => {
-				let omp = PyModule::import(py, "omp")?;
-				let kwargs = PyDict::new(py);
-				kwargs.set_item("extension", tool.decl.extension_id.as_str())?;
-				kwargs.set_item("session", session_id)?;
-				kwargs.set_item("invocation", invoke.call_id.as_str())?;
-				kwargs.set_item(
-					"principal",
-					omp_py::bind_principal(
-						py,
-						Principal::new(Str::from(principal_id), Str::from(principal_display)),
-					)?,
-				)?;
-				kwargs.set_item("generation", host_generation)?;
-				kwargs.set_item("call", invoke.call_id.as_str())?;
-				kwargs.set_item("device", invoke.name.as_str())?;
-				kwargs.set_item(
-					"place",
-					omp.getattr("Place")?
-						.call_method1("parse", (place.as_str(),))?,
-				)?;
-				let context = omp.getattr("Context")?.call((), Some(&kwargs))?;
-				tool.handler.bind(py).call1((params, context))?
-			},
-		};
-		let inspect = PyModule::import(py, "inspect")?;
-		if inspect
-			.getattr("isawaitable")?
-			.call1((&value,))?
-			.is_truthy()?
-		{
-			value = PyModule::import(py, "asyncio")?
+	let result =
+		engine.attach(|py| -> Result<PythonCompletion, WorkerError> {
+			let json = PyModule::import(py, "json")?;
+			let args = str::from_utf8(invoke.args_json.as_ref())
+				.map_err(|_| WorkerError::Python(sf!("committed args are not UTF-8")))?;
+			let params = json.getattr("loads")?.call1((args,))?;
+			let authority = PyDict::new(py);
+			if env::var_os(ENV_SOCKET_ENV).is_some() && commit.effects.is_some() {
+				let data = PyDict::new(py);
+				data.set_item("invocation", commit.invocation_id.as_str())?;
+				data.set_item("effect_token", PyBytes::new(py, commit.effect_token.as_ref()))?;
+				data.set_item("host_generation", host_generation)?;
+				data.set_item("session_generation", session_generation)?;
+				data.set_item("pty_denied", false)?;
+				authority.set_item("data", data)?;
+			}
+			let environment = PyModule::import(py, "omp.env")?;
+			let invoke_with_environment = environment.getattr("_invoke_with_environment")?;
+			let coroutine =
+				match &tool.kind {
+					PythonToolKind::Legacy | PythonToolKind::Prelude => invoke_with_environment
+						.call1((&authority, tool.handler.bind(py), &params, py.None(), false))?,
+					PythonToolKind::Contextual { place } => {
+						let omp = PyModule::import(py, "omp")?;
+						let kwargs = PyDict::new(py);
+						kwargs.set_item("extension", tool.decl.extension_id.as_str())?;
+						kwargs.set_item("session", session_id)?;
+						kwargs.set_item("invocation", invoke.call_id.as_str())?;
+						kwargs.set_item(
+							"principal",
+							omp_py::bind_principal(
+								py,
+								Principal::new(Str::from(principal_id), Str::from(principal_display)),
+							)?,
+						)?;
+						kwargs.set_item("generation", host_generation)?;
+						kwargs.set_item("call", invoke.call_id.as_str())?;
+						kwargs.set_item("device", invoke.name.as_str())?;
+						kwargs.set_item(
+							"place",
+							omp.getattr("Place")?
+								.call_method1("parse", (place.as_str(),))?,
+						)?;
+						let context = omp.getattr("Context")?.call((), Some(&kwargs))?;
+						invoke_with_environment.call1((
+							&authority,
+							tool.handler.bind(py),
+							&params,
+							context,
+							true,
+						))?
+					},
+				};
+			let value = PyModule::import(py, "asyncio")?
 				.getattr("run")?
-				.call1((value,))?;
-		}
-		if matches!(&tool.kind, PythonToolKind::Prelude) {
+				.call1((coroutine,))?;
+			if matches!(&tool.kind, PythonToolKind::Prelude) {
+				let details_json = Bytes::from(
+					json
+						.call_method1(intern!(py, "dumps"), (&value,))?
+						.extract::<String>()?,
+				);
+				return Ok(PythonCompletion {
+					parts: Vec::new(),
+					details_json,
+					kind: OutcomeKind::Ok,
+					args_issue: None,
+				});
+			}
+			if let Ok(dict) = value.cast::<PyDict>() {
+				if let Some(updates) = dict.get_item("updates")? {
+					for update in PyIterator::from_object(&updates)? {
+						write_update(writer, request_id, &call_id, &json, &update?, limit, scratch)?;
+					}
+				}
+				return completion_from_dict(dict, &json);
+			}
+			if let Ok(iterator) = PyIterator::from_object(&value)
+				&& iterator.as_any().is(&value)
+			{
+				for item in iterator {
+					let item = item?;
+					if let Ok(dict) = item.cast::<PyDict>()
+						&& let Some(complete) = dict.get_item("complete")?
+					{
+						let complete = complete.cast::<PyDict>().map_err(|_| {
+							PyTypeError::new_err("generator complete value must be a dictionary")
+						})?;
+						return completion_from_dict(complete, &json);
+					}
+					let update = if let Ok(dict) = item.cast::<PyDict>() {
+						dict.get_item("update")?.unwrap_or_else(|| item.clone())
+					} else {
+						item
+					};
+					write_update(writer, request_id, &call_id, &json, &update, limit, scratch)?;
+				}
+				return Ok(PythonCompletion {
+					parts:        Vec::new(),
+					details_json: Bytes::from_static(b"null"),
+					kind:         OutcomeKind::Ok,
+					args_issue:   None,
+				});
+			}
 			let details_json = Bytes::from(
 				json
-					.call_method1(intern!(py, "dumps"), (&value,))?
+					.getattr("dumps")?
+					.call1((&value,))?
 					.extract::<String>()?,
 			);
-			return Ok(PythonCompletion {
-				parts: Vec::new(),
+			let text = value.str()?.to_string_lossy().into_owned();
+			Ok(PythonCompletion {
+				parts: vec![text_part(text)],
 				details_json,
 				kind: OutcomeKind::Ok,
 				args_issue: None,
-			});
-		}
-		if let Ok(dict) = value.cast::<PyDict>() {
-			if let Some(updates) = dict.get_item("updates")? {
-				for update in PyIterator::from_object(&updates)? {
-					write_update(writer, request_id, &call_id, &json, &update?, limit, scratch)?;
-				}
-			}
-			return completion_from_dict(dict, &json);
-		}
-		if let Ok(iterator) = PyIterator::from_object(&value)
-			&& iterator.as_any().is(&value)
-		{
-			for item in iterator {
-				let item = item?;
-				if let Ok(dict) = item.cast::<PyDict>()
-					&& let Some(complete) = dict.get_item("complete")?
-				{
-					let complete = complete.cast::<PyDict>().map_err(|_| {
-						PyTypeError::new_err("generator complete value must be a dictionary")
-					})?;
-					return completion_from_dict(complete, &json);
-				}
-				let update = if let Ok(dict) = item.cast::<PyDict>() {
-					dict.get_item("update")?.unwrap_or_else(|| item.clone())
-				} else {
-					item
-				};
-				write_update(writer, request_id, &call_id, &json, &update, limit, scratch)?;
-			}
-			return Ok(PythonCompletion {
-				parts:        Vec::new(),
-				details_json: Bytes::from_static(b"null"),
-				kind:         OutcomeKind::Ok,
-				args_issue:   None,
-			});
-		}
-		let details_json = Bytes::from(
-			json
-				.getattr("dumps")?
-				.call1((&value,))?
-				.extract::<String>()?,
-		);
-		let text = value.str()?.to_string_lossy().into_owned();
-		Ok(PythonCompletion {
-			parts: vec![text_part(text)],
-			details_json,
-			kind: OutcomeKind::Ok,
-			args_issue: None,
-		})
-	});
+			})
+		});
 	let completion = match result {
 		Ok(completion) => completion,
 		Err(error) => PythonCompletion {
@@ -8108,6 +8473,10 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 		let limit = NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES).expect("nonzero frame limit");
 		let mut encoded = Vec::new();
 		let mut write_scratch = BytesMut::new();
+		let commit = ArgsCommitted {
+			invocation_id: "prelude-call".to_owned(),
+			..ArgsCommitted::default()
+		};
 		serve_invocation(
 			&engine,
 			&helpers,
@@ -8122,10 +8491,12 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 				rev:         "prelude.1".to_owned(),
 				props:       None,
 			},
+			&commit,
 			"session",
 			"principal",
 			"Principal",
 			7,
+			3,
 			&mut encoded,
 			limit,
 			&mut write_scratch,

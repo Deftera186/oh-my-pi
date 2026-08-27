@@ -21,16 +21,16 @@ use omp_inference::{Adjustment, ToolGrammarSyntax};
 use omp_proto::policy::v1;
 use omp_tool::{
 	Abort, AbortKind, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry,
-	ArgSpecRegistryError, ArtifactLifetime, BlobRef, CallOutcome, CallOutcomeDetails,
-	CallOutcomeDetailsError, CallOutcomeSpill, CapsBase, Claims, Coerce, CommitError, Constraint,
-	ConstraintDisposition, DesktopEffects, DocEffects, Effects, ErasedEv, ErasedOutcome, Ev,
-	ExecEffects, ExpectedArtifact, Fallback, GoalToolState, GrammarSyntax, InclusionPolicy,
-	IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, JobKind, JobMetadata, JobOwner,
-	JobRef, JobStatus, LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion,
-	LiftedCall, LoweringCaps, MemoryToolState, ModelClass, ParamError, Part, PolicyDenied,
-	Precedence, Presentation, ProjectedCall, PromptCaps, PullMode, PulledKind, RecordedCall,
-	RecordedCallOwned, Registry, RegistryError, RegistryLeaf, RepairKind, Rev, Tool, ToolIdentity,
-	ToolSpec, ToolTerminal, Usd, call_outcome_details,
+	ArgSpecRegistryError, ArtifactLifetime, AvailabilityDelta, BlobRef, CallOutcome,
+	CallOutcomeDetails, CallOutcomeDetailsError, CallOutcomeSpill, CapsBase, Claims, Coerce,
+	CommitError, Constraint, ConstraintDisposition, DesktopEffects, DocEffects, Effects, ErasedEv,
+	ErasedOutcome, Ev, ExecEffects, ExpectedArtifact, Fallback, GoalToolState, GrammarSyntax,
+	InclusionPolicy, IncomingParams, InferenceEffects, Interrupt, InterruptWaitError, JobKind,
+	JobMetadata, JobOwner, JobRef, JobStatus, LeafOwner, LeafReplacementError,
+	LeafReplacementRegistry, LeafVersion, LiftedCall, LoweringCaps, MemoryToolState, ModelClass,
+	ParamError, Part, PolicyDenied, Precedence, Presentation, ProjectedCall, PromptCaps, PullMode,
+	PulledKind, RecordedCall, RecordedCallOwned, Registry, RegistryError, RegistryLeaf, RepairKind,
+	Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal, Usd, call_outcome_details,
 	render::{RenderFold, RenderRegistry, RenderRegistryError, ViewState},
 };
 use serde::{Deserialize, Serialize, ser};
@@ -302,6 +302,24 @@ fn worker_spec(name: &str, projection_code: [u8; 32]) -> ToolSpec {
 		projection_code,
 	}
 }
+fn assert_worker_declarations_are_not_advertised(registry: &Registry, names: &[Str]) {
+	let caps = LoweringCaps {
+		strict_schema:  false,
+		grammar:        GrammarBits::empty(),
+		maximum_tools:  None,
+		maximum_strict: None,
+	};
+	assert!(registry.advertise(caps).unwrap().is_empty());
+	assert!(registry.advertise_selected(caps, names).unwrap().is_empty());
+	assert!(registry.prompt_projection(None).entries().next().is_none());
+	assert!(
+		registry
+			.prompt_projection(Some(names))
+			.entries()
+			.next()
+			.is_none()
+	);
+}
 
 #[test]
 fn duplicate_registration_never_replaces_the_erased_implementation() {
@@ -400,6 +418,70 @@ fn hashes_are_registration_order_independent() {
 	assert_eq!(first.device_hash(), second.device_hash());
 	assert_eq!(first.projection_hash(), second.projection_hash());
 }
+#[test]
+fn slot_and_device_hashes_track_distinct_projection_domains() {
+	let calls = Arc::new(AtomicUsize::new(0));
+	let mut registry = Registry::new();
+	let empty_slots = registry.slot_hash();
+	let empty_devices = registry.device_hash();
+	registry
+		.register_worker(
+			worker_spec("worker_device", [7; 32]),
+			Presentation::Device,
+			claims("publisher/device", Precedence::DEFAULT),
+		)
+		.unwrap();
+
+	let mounted_devices = registry.device_hash();
+	assert_eq!(registry.slot_hash(), empty_slots);
+	assert_ne!(mounted_devices, empty_devices);
+	assert_eq!(registry.devices().count(), 1);
+
+	let unmounted = registry.apply_availability(&[AvailabilityDelta {
+		name:    sf!("worker_device"),
+		mounted: false,
+		reason:  None,
+	}]);
+	assert_eq!(unmounted.len(), 1);
+	let unmounted_devices = registry.device_hash();
+	assert_eq!(registry.slot_hash(), empty_slots);
+	assert_ne!(unmounted_devices, mounted_devices);
+	assert_eq!(unmounted_devices, empty_devices);
+
+	registry
+		.register(
+			fake_tool(1, "native", Arc::clone(&calls)).named("native_slot"),
+			Presentation::Slot,
+			claims("omp/core", Precedence::CORE),
+		)
+		.unwrap();
+	let native_slots = registry.slot_hash();
+	assert_ne!(native_slots, empty_slots);
+	assert_eq!(registry.device_hash(), unmounted_devices);
+
+	let mut reversed = Registry::new();
+	reversed
+		.register(
+			fake_tool(1, "native", calls).named("native_slot"),
+			Presentation::Slot,
+			claims("omp/core", Precedence::CORE),
+		)
+		.unwrap();
+	reversed
+		.register_worker(
+			worker_spec("worker_device", [7; 32]),
+			Presentation::Device,
+			claims("publisher/device", Precedence::DEFAULT),
+		)
+		.unwrap();
+	reversed.apply_availability(&[AvailabilityDelta {
+		name:    sf!("worker_device"),
+		mounted: false,
+		reason:  None,
+	}]);
+	assert_eq!(reversed.slot_hash(), native_slots);
+	assert_eq!(reversed.device_hash(), unmounted_devices);
+}
 
 #[test]
 fn worker_device_is_catalogued_without_consuming_a_model_slot() {
@@ -413,20 +495,28 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 			claims("publisher/catalogue", Precedence::DEFAULT),
 		)
 		.unwrap();
+	registry
+		.register_worker(
+			worker_spec("catalogued_slot", [4; 32]),
+			Presentation::Slot,
+			claims("publisher/catalogue", Precedence::DEFAULT),
+		)
+		.unwrap();
+	registry
+		.register_worker(
+			worker_spec("catalogued_hidden", [5; 32]),
+			Presentation::Hidden,
+			claims("publisher/catalogue", Precedence::DEFAULT),
+		)
+		.unwrap();
 
 	assert_eq!(registry.slot_hash(), empty_slots);
 	assert_ne!(registry.device_hash(), empty_devices);
-	assert!(
-		registry
-			.advertise(LoweringCaps {
-				strict_schema:  false,
-				grammar:        GrammarBits::empty(),
-				maximum_tools:  None,
-				maximum_strict: None,
-			})
-			.unwrap()
-			.is_empty()
-	);
+	assert_worker_declarations_are_not_advertised(&registry, &[
+		sf!("catalogued"),
+		sf!("catalogued_slot"),
+		sf!("catalogued_hidden"),
+	]);
 	assert!(matches!(
 		registry.route("catalogued").unwrap(),
 		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
@@ -467,16 +557,26 @@ fn worker_slots_are_catalogued_without_consuming_model_slots() {
 			claims("publisher/hard", Precedence::INTEGRATION),
 		)
 		.unwrap();
-
-	let advertised = registry
-		.advertise(LoweringCaps {
-			strict_schema:  false,
-			grammar:        GrammarBits::empty(),
-			maximum_tools:  None,
-			maximum_strict: None,
-		})
+	registry
+		.register_worker(
+			worker_spec("worker_device", [6; 32]),
+			Presentation::Device,
+			claims("publisher/hard", Precedence::INTEGRATION),
+		)
 		.unwrap();
-	assert!(advertised.is_empty());
+	registry
+		.register_worker(
+			worker_spec("worker_hidden", [7; 32]),
+			Presentation::Hidden,
+			claims("publisher/hard", Precedence::INTEGRATION),
+		)
+		.unwrap();
+
+	assert_worker_declarations_are_not_advertised(&registry, &[
+		sf!("worker_slot"),
+		sf!("worker_device"),
+		sf!("worker_hidden"),
+	]);
 	assert!(matches!(
 		registry.route("worker_slot").unwrap(),
 		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
@@ -488,6 +588,9 @@ fn worker_slots_are_catalogued_without_consuming_model_slots() {
 	let device = devices.next().expect("native soft tool is catalogued");
 	assert_eq!(device.name, "native_device");
 	assert_eq!(device.route, &omp_tool::ToolRoute::Native);
+	let device = devices.next().expect("worker device is catalogued");
+	assert_eq!(device.name, "worker_device");
+	assert!(matches!(device.route, omp_tool::ToolRoute::Worker { .. }));
 	assert!(devices.next().is_none());
 }
 

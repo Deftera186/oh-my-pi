@@ -263,6 +263,11 @@ message OverlayEvent {
   string kind = 2;
   optional string value = 3;
 }
+message ShortcutInvoked {
+  string action_id = 1;
+  string chord = 2;
+  string phase = 3;
+}
 
 message UiDispatch {
   oneof kind {
@@ -272,7 +277,10 @@ message UiDispatch {
     RenderRequest render = 4;
     OverlayEvent overlay = 5;
     FrameActionFired frame_action = 6;
+    ShortcutInvoked shortcut = 7;
   }
+  uint64 generation = 8;
+  string declaration_id = 9;
   omp.inference.v1.ValueMap props = 15;
 }
 
@@ -285,26 +293,55 @@ message RenderedView {
   Tml content = 1;
   bytes state = 2;
 }
+message CommandDispatchResult {
+  oneof outcome {
+    Tml consumed = 1;
+    string prompt = 2;
+  }
+  optional bool submit = 3;
+}
+message ShortcutDispatchResult {}
 message UiDispatchResult {
   oneof result {
     Values values = 1;
     RenderedView rendered = 2;
     UiError error = 3;
+    CommandDispatchResult command = 5;
+    ShortcutDispatchResult shortcut = 6;
   }
   repeated CompletionCandidate candidates = 4;
+  uint64 generation = 7;
+  string declaration_id = 8;
   omp.inference.v1.ValueMap props = 15;
 }
 
+message CommandArgDecl {
+  string name = 1;
+  string description = 2;
+  optional string usage = 3;
+}
 message CommandDecl {
   string name = 1;
-  string summary = 2;
-  string usage = 3;
-  sint32 precedence = 4;
+  string description = 2;
+  optional string hint = 3;
+  repeated string aliases = 4;
+  repeated CommandArgDecl args = 5;
+  string declaration_id = 6;
+  string callback = 7;
+  string module = 8;
+  string activation_trigger = 9;
+  optional string arg_completion_callback = 10;
   omp.inference.v1.ValueMap props = 15;
 }
 message ShortcutDecl {
   string chord = 1;
-  string action = 2;
+  string action_id = 2;
+  string description = 3;
+  repeated string when = 4;
+  string declaration_id = 5;
+  string callback = 6;
+  string module = 7;
+  string activation_trigger = 8;
   omp.inference.v1.ValueMap props = 15;
 }
 message TriggerDecl {
@@ -324,5 +361,7 @@ message RegisterUi {
   repeated ShortcutDecl shortcuts = 2;
   repeated TriggerDecl triggers = 3;
   repeated RendererDecl renderers = 4;
+  uint64 generation = 5;
+  string extension_id = 6;
   omp.inference.v1.ValueMap props = 15;
 }

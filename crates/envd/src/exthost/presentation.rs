@@ -62,11 +62,10 @@ pub enum UiControlRequest {
 		/// App-issued identifier of the compositor-owned overlay to release.
 		id: Str,
 	},
-	/// Install manifest-checked dynamic commands.
+	/// Publish or invalidate a manifest-verified static UI roster.
 	DynamicMount {
-		/// Serialized command declarations supplied by the extension for
-		/// app-owned installation.
-		commands: Vec<Value>,
+		/// Exact verified host generation whose roster should be installed.
+		generation: u64,
 	},
 }
 
@@ -479,11 +478,8 @@ fn decode_ui_request(
 		"omp.ui.overlay_close" => {
 			UiControlRequest::OverlayClose { id: required_string(arguments, "id")? }
 		},
-		"omp.ui.dynamic_mount" => UiControlRequest::DynamicMount {
-			commands: arguments
-				.remove("commands")
-				.and_then(|value| value.as_array().cloned())
-				.ok_or_else(|| protocol("invalid_ui_request", "commands must be an array"))?,
+		"omp.ui.dynamic_mount" => {
+			UiControlRequest::DynamicMount { generation: required_u64(arguments, "generation")? }
 		},
 		_ => return Err(protocol("unknown_operation", "unknown UI operation")),
 	};

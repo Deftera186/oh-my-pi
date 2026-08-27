@@ -128,18 +128,14 @@ message SlotDecl {
   sint32 priority = 3;
   omp.inference.v1.ValueMap props = 15;
 }
-message CommandDecl {
-  string name = 1;
-  string summary = 2;
-  string usage = 3;
-  omp.inference.v1.ValueMap props = 15;
-}
 message RegisterTools {
+  reserved 5;
+  reserved "commands";
+
   repeated ToolDecl tools = 1;
   uint64 generation = 2;
   repeated ExtensionDecl extensions = 3;
   repeated SlotDecl slots = 4;
-  repeated CommandDecl commands = 5;
   omp.inference.v1.ValueMap props = 15;
 }
 

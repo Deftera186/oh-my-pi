@@ -13,15 +13,19 @@ use std::{
 use flume::Receiver;
 use omp_agent::JournalCustomEntry;
 use omp_core::{CowBytes, InvocationPhase, LifecyclePhase, SparseMap, Str, sf};
-use omp_proto::toolhost::{
-	v1,
-	v1::{
-		Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
-		LifecycleEventContext, RegimeApply, RegimeDraft, RegimeHostEnvelope, RegimeWorkerEnvelope,
-		RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1, WorkerFrame,
-		hook_host_envelope, lifecycle_worker_envelope, regime_host_envelope, regime_worker_envelope,
-		ui_worker_envelope, worker_frame,
+use omp_proto::{
+	toolhost::{
+		v1,
+		v1::{
+			Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
+			LifecycleEventContext, RegimeApply, RegimeDraft, RegimeHostEnvelope, RegimeWorkerEnvelope,
+			RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1, UiHostEnvelope,
+			UiWorkerEnvelope, WorkerFrame, hook_host_envelope, lifecycle_worker_envelope,
+			regime_host_envelope, regime_worker_envelope, ui_host_envelope, ui_worker_envelope,
+			worker_frame,
+		},
 	},
+	ui::v1::{CommandDecl, ShortcutDecl, UiDispatch, UiDispatchResult, ui_dispatch_result},
 };
 use parking_lot::{Mutex, RwLock};
 use prost::Message;
@@ -32,7 +36,10 @@ use super::{
 		ControlConnectionIdentity, ControlDispatch, ControlInvocationAuthority, ControlProtocolError,
 		ControlRequestContext,
 	},
-	lifecycle::{AvailabilityBatch, AvailabilitySink, HeadlessLifecycleSink, HeadlessSinkError},
+	lifecycle::{
+		AvailabilityBatch, AvailabilitySink, HeadlessLifecycleSink, HeadlessSinkError,
+		VerifiedUiRoster,
+	},
 };
 use crate::worker::HostKey;
 
@@ -113,6 +120,118 @@ impl CallbackDispatcher for CallbackDispatcherSlot {
 			.retryable(true)
 		})?;
 		dispatcher.dispatch(target, dispatch).await
+	}
+}
+/// Exact generation and callback identity owning one UI roster row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiCallbackOwner {
+	/// Authenticated worker process identity.
+	pub host:           HostKey,
+	/// Exact child generation.
+	pub generation:     u64,
+	/// Stable signed declaration id.
+	pub declaration_id: Str,
+	/// Qualified callback name inside the worker.
+	pub callback:       Str,
+}
+
+/// One manifest-verified slash-command roster entry.
+#[derive(Clone, Debug)]
+pub struct UiCommandRosterEntry {
+	/// Generation-fenced callback owner.
+	pub owner:       UiCallbackOwner,
+	/// Static command metadata available without starting Python.
+	pub declaration: CommandDecl,
+}
+
+/// One manifest-verified shortcut roster entry.
+#[derive(Clone, Debug)]
+pub struct UiShortcutRosterEntry {
+	/// Generation-fenced callback owner.
+	pub owner:       UiCallbackOwner,
+	/// Static shortcut metadata available without starting Python.
+	pub declaration: ShortcutDecl,
+}
+
+/// Atomic manifest-verified command and shortcut ownership table.
+#[derive(Clone, Debug, Default)]
+pub struct UiRoster {
+	commands:  BTreeMap<Str, UiCommandRosterEntry>,
+	shortcuts: BTreeMap<Str, UiShortcutRosterEntry>,
+}
+
+/// A roster publication attempted to shadow another admitted owner.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("UI roster key {key} is already owned by another extension")]
+pub struct UiRosterConflict {
+	/// Canonical command spelling, alias, or normalized chord.
+	pub key: Str,
+}
+
+impl UiRoster {
+	/// Atomically replaces every row owned by `host` with one verified
+	/// generation.
+	pub fn install(
+		&mut self,
+		host: HostKey,
+		roster: &VerifiedUiRoster,
+	) -> Result<(), UiRosterConflict> {
+		let mut commands = self.commands.clone();
+		let mut shortcuts = self.shortcuts.clone();
+		commands.retain(|_, entry| entry.owner.host != host);
+		shortcuts.retain(|_, entry| entry.owner.host != host);
+		for declaration in &roster.commands {
+			let entry = UiCommandRosterEntry {
+				owner:       UiCallbackOwner {
+					host:           host.clone(),
+					generation:     roster.generation,
+					declaration_id: Str::from(declaration.declaration_id.as_str()),
+					callback:       Str::from(declaration.callback.as_str()),
+				},
+				declaration: declaration.clone(),
+			};
+			for spelling in std::iter::once(declaration.name.as_str())
+				.chain(declaration.aliases.iter().map(String::as_str))
+			{
+				if commands.contains_key(spelling) {
+					return Err(UiRosterConflict { key: Str::from(spelling) });
+				}
+				commands.insert(Str::from(spelling), entry.clone());
+			}
+		}
+		for declaration in &roster.shortcuts {
+			if shortcuts.contains_key(declaration.chord.as_str()) {
+				return Err(UiRosterConflict { key: Str::from(declaration.chord.as_str()) });
+			}
+			shortcuts.insert(Str::from(declaration.chord.as_str()), UiShortcutRosterEntry {
+				owner:       UiCallbackOwner {
+					host:           host.clone(),
+					generation:     roster.generation,
+					declaration_id: Str::from(declaration.declaration_id.as_str()),
+					callback:       Str::from(declaration.callback.as_str()),
+				},
+				declaration: declaration.clone(),
+			});
+		}
+		self.commands = commands;
+		self.shortcuts = shortcuts;
+		Ok(())
+	}
+
+	/// Removes every callback owned by one exact process during teardown.
+	pub fn remove(&mut self, host: &HostKey) {
+		self.commands.retain(|_, entry| &entry.owner.host != host);
+		self.shortcuts.retain(|_, entry| &entry.owner.host != host);
+	}
+
+	/// Resolves a canonical command name or alias without allocating.
+	pub fn command(&self, spelling: &str) -> Option<&UiCommandRosterEntry> {
+		self.commands.get(spelling)
+	}
+
+	/// Resolves a normalized shortcut chord without allocating.
+	pub fn shortcut(&self, chord: &str) -> Option<&UiShortcutRosterEntry> {
+		self.shortcuts.get(chord)
 	}
 }
 
@@ -437,6 +556,102 @@ pub struct DispatchRequest {
 
 /// Submission-latency deadline shared by extension regime callbacks.
 pub const REGIME_SUBMISSION_TIMEOUT: Duration = time::Duration::from_secs(30);
+
+/// One typed command or shortcut callback routed to an exact roster owner.
+#[derive(Clone, Debug)]
+pub struct UiCallbackDispatch {
+	/// Generation-fenced roster owner.
+	pub owner:    UiCallbackOwner,
+	/// Typed UI payload; arbitrary extension JSON is not accepted.
+	pub dispatch: UiDispatch,
+}
+
+impl UiCallbackDispatch {
+	/// Encodes the typed UI frame with serialized actor composition.
+	pub fn request(
+		mut self,
+		id: u64,
+		timeout: Duration,
+	) -> Result<DispatchRequest, UiDispatchError> {
+		if id == 0 {
+			return Err(UiDispatchError::ZeroId);
+		}
+		if self.dispatch.generation != self.owner.generation
+			|| self.dispatch.declaration_id != self.owner.declaration_id.as_str()
+		{
+			return Err(UiDispatchError::StaleGeneration {
+				expected: self.owner.generation,
+				actual:   self.dispatch.generation,
+			});
+		}
+		self.dispatch.props = None;
+		let envelope = UiHostEnvelope {
+			body:  Some(ui_host_envelope::Body::Dispatch(self.dispatch)),
+			props: None,
+		};
+		Ok(DispatchRequest {
+			id,
+			policy: CallbackConcurrency::Serialized,
+			deadline: EventDeadline { at: Instant::now() + timeout },
+			payload: CowBytes::from(envelope.encode_to_vec()),
+		})
+	}
+}
+
+/// Invalid typed UI callback envelope, identity, or result.
+#[derive(Debug, Error)]
+pub enum UiDispatchError {
+	/// Zero cannot identify a correlated callback.
+	#[error("UI dispatch correlation id must be nonzero")]
+	ZeroId,
+	/// The typed frame did not name the exact roster generation.
+	#[error("stale UI callback generation: expected {expected}, got {actual}")]
+	StaleGeneration {
+		/// Roster generation.
+		expected: u64,
+		/// Frame generation.
+		actual:   u64,
+	},
+	/// The typed frame did not name the exact signed declaration.
+	#[error("UI callback returned another declaration")]
+	StaleDeclaration,
+	/// The worker payload was malformed protobuf.
+	#[error("worker returned a malformed UI dispatch result")]
+	Decode(#[source] prost::DecodeError),
+	/// The worker payload was not a typed UI dispatch result.
+	#[error("worker returned no UI dispatch result")]
+	MissingResult,
+}
+
+/// Decodes and generation-fences one command or shortcut callback result.
+pub fn decode_ui_dispatch_result(
+	payload: &[u8],
+	owner: &UiCallbackOwner,
+) -> Result<UiDispatchResult, UiDispatchError> {
+	let envelope = UiWorkerEnvelope::decode(payload).map_err(UiDispatchError::Decode)?;
+	let Some(ui_worker_envelope::Body::DispatchResult(result)) = envelope.body else {
+		return Err(UiDispatchError::MissingResult);
+	};
+	if result.generation != owner.generation {
+		return Err(UiDispatchError::StaleGeneration {
+			expected: owner.generation,
+			actual:   result.generation,
+		});
+	}
+	if result.declaration_id != owner.declaration_id.as_str() {
+		return Err(UiDispatchError::StaleDeclaration);
+	}
+	Ok(result)
+}
+
+/// Applies shortcut fail-open semantics: failed actions are dropped after the
+/// chord has already been consumed by the local matcher.
+pub fn shortcut_dispatch_succeeded(payload: &[u8], owner: &UiCallbackOwner) -> bool {
+	decode_ui_dispatch_result(payload, owner)
+		.ok()
+		.and_then(|result| result.result)
+		.is_some_and(|result| matches!(result, ui_dispatch_result::Result::Shortcut(_)))
+}
 
 /// One revisioned regime callback routed through the ordinary actor.
 #[derive(Clone, Debug)]
@@ -777,9 +992,97 @@ impl ExtensionActor {
 }
 #[cfg(test)]
 mod tests {
-	use omp_proto::toolhost::v1::{RegimePoint, RegimeWorkerEnvelope, regime_worker_envelope};
+	use omp_proto::{
+		toolhost::v1::{RegimePoint, RegimeWorkerEnvelope, regime_worker_envelope},
+		ui::v1::{
+			CommandDispatchResult, CommandInvoked, ShortcutDispatchResult, UiError,
+			command_dispatch_result, ui_dispatch,
+		},
+	};
 
 	use super::*;
+	fn ui_owner() -> UiCallbackOwner {
+		UiCallbackOwner {
+			host:           HostKey::new("project", "trusted", "extension"),
+			generation:     7,
+			declaration_id: sf!("command"),
+			callback:       sf!("extension.command"),
+		}
+	}
+
+	fn ui_result(result: ui_dispatch_result::Result) -> Vec<u8> {
+		UiWorkerEnvelope {
+			body:  Some(ui_worker_envelope::Body::DispatchResult(UiDispatchResult {
+				result: Some(result),
+				generation: 7,
+				declaration_id: "command".to_owned(),
+				..Default::default()
+			})),
+			props: None,
+		}
+		.encode_to_vec()
+	}
+
+	#[test]
+	fn command_dispatch_is_typed_and_generation_fenced() {
+		let owner = ui_owner();
+		let request = UiCallbackDispatch {
+			owner:    owner.clone(),
+			dispatch: UiDispatch {
+				kind:           Some(ui_dispatch::Kind::Command(CommandInvoked {
+					name: "alias".to_owned(),
+					argv: vec!["one".to_owned(), "two".to_owned()],
+					raw:  "one two".to_owned(),
+					mode: "interactive".to_owned(),
+				})),
+				generation:     7,
+				declaration_id: "command".to_owned(),
+				props:          None,
+			},
+		}
+		.request(9, Duration::from_secs(1))
+		.expect("typed command dispatch");
+		assert_eq!(request.policy, CallbackConcurrency::Serialized);
+		let envelope = UiHostEnvelope::decode(request.payload.as_ref()).expect("UI host envelope");
+		let Some(ui_host_envelope::Body::Dispatch(dispatch)) = envelope.body else {
+			panic!("UI dispatch body");
+		};
+		let Some(ui_dispatch::Kind::Command(command)) = dispatch.kind else {
+			panic!("command body");
+		};
+		assert_eq!(command.argv, ["one", "two"]);
+
+		let prompt = ui_result(ui_dispatch_result::Result::Command(CommandDispatchResult {
+			outcome: Some(command_dispatch_result::Outcome::Prompt("Review $1".to_owned())),
+			submit:  Some(true),
+		}));
+		assert!(matches!(
+			decode_ui_dispatch_result(&prompt, &owner)
+				.expect("command result")
+				.result,
+			Some(ui_dispatch_result::Result::Command(_))
+		));
+		let mut stale = owner.clone();
+		stale.generation = 8;
+		assert!(matches!(
+			decode_ui_dispatch_result(&prompt, &stale),
+			Err(UiDispatchError::StaleGeneration { .. })
+		));
+	}
+
+	#[test]
+	fn shortcut_errors_fail_open_after_local_consumption() {
+		let owner = ui_owner();
+		let failed = ui_result(ui_dispatch_result::Result::Error(UiError {
+			code: "CallbackFailed".to_owned(),
+			message: "handler raised".to_owned(),
+			..Default::default()
+		}));
+		assert!(!shortcut_dispatch_succeeded(&failed, &owner));
+		let succeeded = ui_result(ui_dispatch_result::Result::Shortcut(ShortcutDispatchResult {}));
+		assert!(shortcut_dispatch_succeeded(&succeeded, &owner));
+		assert!(!shortcut_dispatch_succeeded(&[0xff], &owner));
+	}
 
 	#[test]
 	fn regime_callbacks_use_submission_latency_and_serialized_reentrancy() {

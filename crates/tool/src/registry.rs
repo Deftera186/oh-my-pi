@@ -96,6 +96,12 @@ pub enum ToolRoute {
 		name: Str,
 	},
 }
+const fn is_model_callable(route: &ToolRoute) -> bool {
+	match route {
+		ToolRoute::Native => true,
+		ToolRoute::Worker { .. } => false,
+	}
+}
 /// Model-visible tool declaration supplied by an attached RPC host.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HostToolSpec {
@@ -795,7 +801,7 @@ impl ToolPromptProjection<'_> {
 				},
 				None => entry.presentation == Presentation::Slot,
 			};
-			(included && matches!(entry.tool.route(), ToolRoute::Native)).then(|| ToolPromptEntry {
+			(included && is_model_callable(entry.tool.route())).then(|| ToolPromptEntry {
 				name,
 				revision: &claim.rev,
 				description: &entry.tool.spec().description,
@@ -2222,7 +2228,7 @@ impl Registry {
 			else {
 				continue;
 			};
-			if entry.presentation == Presentation::Slot {
+			if entry.presentation == Presentation::Slot && is_model_callable(entry.tool.route()) {
 				hash_identity(&mut hasher, name, &claim.rev);
 			}
 		}
@@ -2232,6 +2238,7 @@ impl Registry {
 				.rosters
 				.get(claimant)
 				.and_then(|roster| roster.entries.get(name))
+				.filter(|entry| is_model_callable(entry.tool.route()))
 			{
 				hash_identity(&mut hasher, name, &entry.tool.spec().rev);
 			}
@@ -2410,14 +2417,14 @@ impl Registry {
 			.iter()
 			.filter_map(|(name, claim)| {
 				let entry = self.versions.get(name)?.get(&claim.rev)?;
-				(include(entry) && matches!(entry.tool.route(), ToolRoute::Native)).then_some(entry)
+				(include(entry) && is_model_callable(entry.tool.route())).then_some(entry)
 			})
 			.collect::<Vec<_>>();
 		let host_tools = self.host_tools.read();
 		entries.extend(host_tools.live.iter().filter_map(|(name, claimant)| {
 			let roster = host_tools.rosters.get(claimant)?;
 			let entry = roster.entries.get(name)?;
-			(include(entry) && matches!(entry.tool.route(), ToolRoute::Native)).then_some(entry)
+			(include(entry) && is_model_callable(entry.tool.route())).then_some(entry)
 		}));
 		entries.sort_by(|left, right| {
 			advertisement_priority(right)
