@@ -435,31 +435,60 @@ impl ExtensionDataBinding {
 		session_id: &str,
 		session_generation: u64,
 	) -> Self {
-		let mut hasher = Hash32::hasher();
-		hasher.update(b"omp/extension-data-binding/v1");
-		hasher.update((session_id.len() as u64).to_le_bytes());
-		hasher.update(session_id.as_bytes());
-		hasher.update(session_generation.to_le_bytes());
-		for field in key.fields() {
-			hasher.update((field.len() as u64).to_le_bytes());
-			hasher.update(field.as_bytes());
-		}
-		let digest = hasher.finalize().to_hex();
-		let grants = Grants::supported([
-			"env.doc.read",
-			"env.doc.write",
-			"env.fs.read",
-			"env.fs.write",
-			"env.exec",
-			"env.process",
-			"env.blob",
-			"env.search",
-			"env.lsp",
-			"env.net",
-			"env.workspace.snapshot",
-			"env.worktree",
-		]);
-		Self { key, path: state_dir.join("ext-env").join(format!("{digest}.sock")), grants }
+		Self::scoped(
+			state_dir,
+			key,
+			session_id,
+			session_generation,
+			Grants::supported([
+				"env.doc.read",
+				"env.doc.write",
+				"env.fs.read",
+				"env.fs.write",
+				"env.exec",
+				"env.process",
+				"env.blob",
+				"env.search",
+				"env.lsp",
+				"env.net",
+				"env.workspace.snapshot",
+				"env.worktree",
+			]),
+		)
+	}
+
+	/// Derives one private endpoint carrying only the manifest-derived grants
+	/// admitted for `key`.
+	pub(crate) fn scoped(
+		state_dir: &Path,
+		key: HostKey,
+		session_id: &str,
+		session_generation: u64,
+		grants: Grants,
+	) -> Self {
+		#[cfg(unix)]
+		let path = omp_env::project_state::extension_socket(
+			state_dir,
+			key.layer().as_str(),
+			key.tier().as_str(),
+			key.extension().as_str(),
+			session_id,
+			session_generation,
+		);
+		#[cfg(not(unix))]
+		let path = {
+			let mut hasher = Hash32::hasher();
+			hasher.update(b"omp/extension-data-binding/v1");
+			hasher.update((session_id.len() as u64).to_le_bytes());
+			hasher.update(session_id.as_bytes());
+			hasher.update(session_generation.to_le_bytes());
+			for field in key.fields() {
+				hasher.update((field.len() as u64).to_le_bytes());
+				hasher.update(field.as_bytes());
+			}
+			PathBuf::from(format!("extension-data-{}", hasher.finalize().to_hex()))
+		};
+		Self { key, path, grants }
 	}
 
 	/// Returns the socket path passed only to this binding's child.
@@ -2449,6 +2478,11 @@ impl EnvServer {
 			docserver_socket,
 			doc_connections.clone(),
 			require_document_ownership,
+			omp_docserver::NativeLspOptions {
+				enabled: lsp_settings.enabled,
+				lazy:    lsp_settings.lazy,
+			},
+			omp_core::dirs::data_dir(None).ok(),
 		)
 		.await?;
 		let hello = documents.hello().clone();
@@ -3046,9 +3080,20 @@ impl EnvServer {
 			.authority
 			.register_host(binding.key.clone(), binding.grants.clone());
 		let policy = binding.policy();
-		self
+		let result = self
 			.serve_uds_with_policy(&binding.path, shutdown, Some(policy), None)
-			.await
+			.await;
+		if let Err(error) = &result {
+			tracing::error!(
+				path = %binding.path.display(),
+				layer = %binding.key.layer(),
+				tier = %binding.key.tier(),
+				extension = %binding.key.extension(),
+				%error,
+				"extension DATA socket failed",
+			);
+		}
+		result
 	}
 
 	#[cfg(unix)]
@@ -3102,6 +3147,7 @@ impl EnvServer {
 		tokio::fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).await?;
 		tokio::fs::rename(&staging, path).await?;
 		let socket_metadata = fs::symlink_metadata(path)?;
+		let _socket_path_guard = UnixSocketPathGuard::new(path.to_path_buf(), &socket_metadata);
 		let retire = CancellationToken::new();
 		let mut listener = Some(listener);
 		let mut connections = JoinSet::new();
@@ -5743,8 +5789,10 @@ impl EnvServer {
 			return;
 		};
 		if !self.lsp_settings.enabled
-			&& matches!(&operation, Op::GetLspBindings(_) | Op::LspRequest(_) | Op::LspNotification(_))
-		{
+			&& matches!(
+				&operation,
+				Op::GetLspBindings(_) | Op::LspStatus(_) | Op::LspRequest(_) | Op::LspNotification(_)
+			) {
 			send_error(
 				responses,
 				request_id,
@@ -5772,6 +5820,7 @@ impl EnvServer {
 			Op::CreateHardLink(_) => ("omp.env.fs.create_hard_link", "env.fs.write"),
 			Op::SetPermissions(_) => ("omp.env.fs.set_permissions", "env.fs.write"),
 			Op::GetLspBindings(_) => ("omp.env.lsp.get_bindings", "env.lsp"),
+			Op::LspStatus(_) => ("omp.env.lsp.status", "env.lsp"),
 			Op::LspRequest(request) => {
 				("omp.env.lsp.request", lsp_tier_capability(lsp_request_tier(&request.method)))
 			},
@@ -6065,6 +6114,11 @@ impl EnvServer {
 					Err(error) => Err(error),
 				}
 			},
+			Op::LspStatus(request) => self
+				.documents
+				.lsp_status(request, &cancel)
+				.await
+				.map(document_result::Result::LspStatus),
 			Op::LspRequest(request) => self
 				.documents
 				.lsp_request(request, &cancel)
@@ -8942,6 +8996,7 @@ async fn send_exec_error(
 
 fn worker_operation_allowed(operation: &str) -> bool {
 	operation.starts_with("omp.env.docs.")
+		|| operation.starts_with("omp.env.fs.")
 		|| operation.starts_with("omp.env.find.")
 		|| operation.starts_with("omp.env.http.")
 		|| matches!(
@@ -9118,6 +9173,10 @@ async fn authorize_data_operation(
 		return false;
 	}
 	if scope.is_none() {
+		if connection.host.is_some() {
+			send_policy_error(responses, request_id, PolicyError::EffectsNotAuthorized).await;
+			return false;
+		}
 		return true;
 	}
 	if !spec
@@ -9692,6 +9751,8 @@ async fn connect_or_start_docserver(
 	socket: &Path,
 	connections: Option<watch::Sender<usize>>,
 	require_ownership: bool,
+	lsp: omp_docserver::NativeLspOptions,
+	user_config_root: Option<PathBuf>,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
 	if require_ownership {
 		if UnixStream::connect(socket).await.is_ok() {
@@ -9739,6 +9800,8 @@ async fn connect_or_start_docserver(
 			daemon::Transport::Socket(task_socket),
 			omp_docserver::daemon::ServeOptions {
 				lsp_config_paths: Vec::new(),
+				lsp,
+				user_config_root,
 				shutdown: Some(task_shutdown),
 				server_build: Str::from(omp_env::build_id::current()),
 				connections,
@@ -9775,6 +9838,8 @@ async fn connect_or_start_docserver(
 	socket: &Path,
 	connections: Option<watch::Sender<usize>>,
 	require_ownership: bool,
+	lsp: omp_docserver::NativeLspOptions,
+	user_config_root: Option<PathBuf>,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
 	if let Ok(stream) = omp_docserver::windows::connect_owner_pipe(socket) {
 		if require_ownership {
@@ -9790,6 +9855,20 @@ async fn connect_or_start_docserver(
 		.with_server_build(omp_env::build_id::current());
 	let environment = omp_docserver::Environment::new(config)
 		.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?;
+	if lsp.enabled {
+		match omp_docserver::NativeLspSupervisor::discover(&environment, user_config_root.as_deref())
+		{
+			Ok(supervisor) => {
+				environment.install_lsp_supervisor(supervisor.clone());
+				if !lsp.lazy {
+					supervisor.warm_all();
+				}
+			},
+			Err(error) => {
+				tracing::warn!(%error, "native LSP discovery failed; continuing without servers");
+			},
+		}
+	}
 	let shutdown = CancellationToken::new();
 	let task_shutdown = shutdown.clone();
 	let task = tokio::spawn(async move {
@@ -9837,15 +9916,50 @@ async fn ensure_document_socket_free(socket: &Path) -> Result<(), EnvdError> {
 }
 
 #[cfg(unix)]
+struct UnixSocketPathGuard {
+	path: PathBuf,
+	dev:  u64,
+	ino:  u64,
+}
+
+#[cfg(unix)]
+impl UnixSocketPathGuard {
+	fn new(path: PathBuf, metadata: &fs::Metadata) -> Self {
+		use std::os::unix::fs::MetadataExt as _;
+
+		Self { path, dev: metadata.dev(), ino: metadata.ino() }
+	}
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketPathGuard {
+	fn drop(&mut self) {
+		use std::os::unix::fs::MetadataExt as _;
+
+		if let Ok(metadata) = fs::symlink_metadata(&self.path)
+			&& metadata.dev() == self.dev
+			&& metadata.ino() == self.ino
+		{
+			let _ = fs::remove_file(&self.path);
+		}
+	}
+}
+
+#[cfg(unix)]
 fn ensure_directory(path: &Path) -> io::Result<()> {
 	use std::os::unix::fs::PermissionsExt as _;
 
+	// A pre-existing parent (e.g. `/tmp`) is not ours to re-mode; chmod only
+	// directories this call created.
+	if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+		return Ok(());
+	}
 	fs::create_dir_all(path)?;
 	fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 #[cfg(all(test, unix))]
 mod tests {
-	use std::fs;
+	use std::{fs, os::unix::fs::PermissionsExt as _};
 
 	use flume::Receiver;
 	use omp_core::Principal;
@@ -9871,6 +9985,35 @@ mod tests {
 	async fn test_connection(
 		capabilities: &[&str],
 		with_dap: bool,
+	) -> (
+		flume::Sender<pb::ClientFrame>,
+		Receiver<pb::ServerFrame>,
+		tempfile::TempDir,
+		tempfile::TempDir,
+	) {
+		let host = HostKey::new("workspace", "sandboxed", "envd-test");
+		test_connection_scoped(capabilities, with_dap, host.clone(), host, true).await
+	}
+
+	async fn test_external_connection(
+		capabilities: &[&str],
+		with_dap: bool,
+	) -> (
+		flume::Sender<pb::ClientFrame>,
+		Receiver<pb::ServerFrame>,
+		tempfile::TempDir,
+		tempfile::TempDir,
+	) {
+		let host = HostKey::new("workspace", "sandboxed", "envd-test");
+		test_connection_scoped(capabilities, with_dap, host.clone(), host, false).await
+	}
+
+	async fn test_connection_scoped(
+		capabilities: &[&str],
+		with_dap: bool,
+		policy_host: HostKey,
+		authority_host: HostKey,
+		extension_policy: bool,
 	) -> (
 		flume::Sender<pb::ClientFrame>,
 		Receiver<pb::ServerFrame>,
@@ -9991,14 +10134,17 @@ mod tests {
 			Arc::new(AuthorityTable::default()),
 			state.path(),
 		));
-		let host = HostKey::new("workspace", "sandboxed", "envd-test");
 		let grants = Grants::supported(capabilities.iter().copied());
-		server.authority.register_host(host.clone(), grants.clone());
-		server.authority.open(host.clone(), sf!("test-invocation"));
+		server
+			.authority
+			.register_host(authority_host.clone(), grants.clone());
+		server
+			.authority
+			.open(authority_host.clone(), sf!("test-invocation"));
 		server
 			.authority
 			.authorize(
-				&host,
+				&authority_host,
 				"test-invocation",
 				Bytes::from_static(b"test-effect-token"),
 				grants.clone(),
@@ -10007,7 +10153,11 @@ mod tests {
 				1,
 			)
 			.expect("authorize test invocation");
-		let policy = ConnectionPolicy::extension(host, grants.iter());
+		let policy = if extension_policy {
+			ConnectionPolicy::extension(policy_host, grants.iter())
+		} else {
+			ConnectionPolicy::external(None)
+		};
 		let (requests, request_rx) = flume::bounded(16);
 		let (responses, response_rx) = flume::bounded(16);
 		tokio::spawn(async move {
@@ -10184,6 +10334,264 @@ mod tests {
 		}
 	}
 
+	fn stat_data_frame(request_id: u64, root: &Path) -> pb::ClientFrame {
+		data_frame(
+			request_id,
+			data_request::Body::Document(pb::DocumentOp {
+				op:    Some(document_op::Op::Stat(document_pb::StatPathRequest {
+					uri:             Url::from_file_path(root)
+						.expect("workspace URI")
+						.to_string(),
+					follow_symlinks: document_pb::FollowSymlinks::Yes as i32,
+				})),
+				props: Default::default(),
+			}),
+		)
+	}
+
+	#[tokio::test]
+	async fn extension_socket_is_owner_only_and_removed_on_shutdown() {
+		let root = tempfile::tempdir().expect("workspace");
+		let state = tempfile::tempdir().expect("state");
+		let server = Arc::new(
+			EnvServer::open_local(
+				root.path(),
+				state.path(),
+				Registry::new(),
+				ExtHostConfig::new(
+					PathBuf::from("unused"),
+					Principal::new(sf!("test-principal"), sf!("Test Principal")),
+					sf!("test-session"),
+					1,
+				),
+				RegistryBridges::default(),
+			)
+			.await
+			.expect("local environment"),
+		);
+		let binding = ExtensionDataBinding::scoped(
+			state.path(),
+			HostKey::new("workspace", "trusted", "socket-mode"),
+			"test-session",
+			1,
+			Grants::supported(["env.fs.read"]),
+		);
+		let socket = binding.path().to_path_buf();
+		let shutdown = CancellationToken::new();
+		let task = tokio::spawn(Arc::clone(&server).serve_extension_uds(binding, shutdown.clone()));
+		if time::timeout(Duration::from_secs(2), async {
+			while !socket.exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.is_err()
+		{
+			let serve = time::timeout(Duration::from_secs(1), task).await;
+			panic!("extension socket was not published; serve result: {serve:?}");
+		}
+		let mode = fs::metadata(&socket)
+			.expect("extension socket metadata")
+			.permissions()
+			.mode();
+		assert_eq!(mode & 0o777, 0o600);
+		let _accepted = UnixStream::connect(&socket)
+			.await
+			.expect("connect extension socket before teardown");
+		task.abort();
+		assert!(
+			task
+				.await
+				.expect_err("aborted extension socket task unexpectedly completed")
+				.is_cancelled()
+		);
+		assert!(!socket.exists(), "extension socket survived task teardown");
+	}
+
+	#[tokio::test]
+	async fn extension_policy_rejects_other_host_authority() {
+		let policy_host = HostKey::new("workspace", "trusted", "extension-a");
+		let authority_host = HostKey::new("workspace", "trusted", "extension-b");
+		let (requests, responses, root, _state) =
+			test_connection_scoped(&["env.fs.read"], false, policy_host, authority_host, true).await;
+		requests
+			.send_async(stat_data_frame(1, root.path()))
+			.await
+			.expect("send cross-host stat");
+		assert!(matches!(
+			responses.recv_async().await.expect("cross-host denial").body,
+			Some(server_frame::Body::Error(pb::ProtocolError { code, .. }))
+				if code == pb::ProtocolErrorCode::Uncommitted as i32
+		));
+	}
+
+	#[tokio::test]
+	async fn extension_policy_denies_ungranted_operation_before_dispatch() {
+		let (requests, responses, root, _state) = test_connection(&[], false).await;
+		requests
+			.send_async(stat_data_frame(1, root.path()))
+			.await
+			.expect("send ungranted stat");
+		assert!(matches!(
+			responses.recv_async().await.expect("grant denial").body,
+			Some(server_frame::Body::Error(pb::ProtocolError { code, .. }))
+				if code == pb::ProtocolErrorCode::PermissionDenied as i32
+		));
+	}
+
+	#[tokio::test]
+	async fn extension_policy_rejects_unscoped_data() {
+		let (requests, responses, root, _state) = test_connection(&["env.fs.read"], false).await;
+		let body = data_request::Body::Document(pb::DocumentOp {
+			op:    Some(document_op::Op::Stat(document_pb::StatPathRequest {
+				uri:             Url::from_file_path(root.path())
+					.expect("workspace URI")
+					.to_string(),
+				follow_symlinks: document_pb::FollowSymlinks::Yes as i32,
+			})),
+			props: Default::default(),
+		});
+		requests
+			.send_async(unscoped_data_frame(1, body))
+			.await
+			.expect("send unscoped extension stat");
+		assert!(matches!(
+			responses.recv_async().await.expect("unscoped denial").body,
+			Some(server_frame::Body::Error(pb::ProtocolError { code, .. }))
+				if code == pb::ProtocolErrorCode::Uncommitted as i32
+		));
+	}
+
+	#[tokio::test]
+	async fn extension_policy_rejects_stale_host_generation() {
+		let (requests, responses, root, _state) = test_connection(&["env.fs.read"], false).await;
+		let mut frame = stat_data_frame(1, root.path());
+		frame.scope.as_mut().expect("DATA scope").host_generation = 2;
+		requests
+			.send_async(frame)
+			.await
+			.expect("send stale-generation stat");
+		assert!(matches!(
+			responses.recv_async().await.expect("stale-generation denial").body,
+			Some(server_frame::Body::Error(pb::ProtocolError { code, .. }))
+				if code == pb::ProtocolErrorCode::PreconditionFailed as i32
+		));
+	}
+
+	#[tokio::test]
+	async fn concurrent_extensions_cannot_reuse_each_others_endpoint() {
+		let root = tempfile::tempdir().expect("workspace");
+		let state = tempfile::tempdir().expect("state");
+		let server = Arc::new(
+			EnvServer::open_local(
+				root.path(),
+				state.path(),
+				Registry::new(),
+				ExtHostConfig::new(
+					PathBuf::from("unused"),
+					Principal::new(sf!("test-principal"), sf!("Test Principal")),
+					sf!("test-session"),
+					1,
+				),
+				RegistryBridges::default(),
+			)
+			.await
+			.expect("local environment"),
+		);
+		let host_a = HostKey::new("workspace", "trusted", "extension-a");
+		let host_b = HostKey::new("workspace", "trusted", "extension-b");
+		let grants = Grants::supported(["env.fs.read"]);
+		let binding_a = ExtensionDataBinding::scoped(
+			state.path(),
+			host_a.clone(),
+			"test-session",
+			1,
+			grants.clone(),
+		);
+		let binding_b = ExtensionDataBinding::scoped(
+			state.path(),
+			host_b.clone(),
+			"test-session",
+			1,
+			grants.clone(),
+		);
+		let socket_a = binding_a.path().to_path_buf();
+		let socket_b = binding_b.path().to_path_buf();
+		assert_ne!(socket_a, socket_b);
+		let shutdown = CancellationToken::new();
+		let task_a =
+			tokio::spawn(Arc::clone(&server).serve_extension_uds(binding_a, shutdown.clone()));
+		let task_b =
+			tokio::spawn(Arc::clone(&server).serve_extension_uds(binding_b, shutdown.clone()));
+		time::timeout(Duration::from_secs(2), async {
+			while !socket_a.exists() || !socket_b.exists() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("extension sockets were not published");
+		for (host, invocation, token) in [
+			(&host_a, "invocation-a", Bytes::from_static(b"effect-a")),
+			(&host_b, "invocation-b", Bytes::from_static(b"effect-b")),
+		] {
+			server.authority.open(host.clone(), Str::new(invocation));
+			server
+				.authority
+				.authorize(host, invocation, token, grants.clone(), 100, 1, 1)
+				.expect("authorize extension invocation");
+		}
+		let hello = pb::ClientHello {
+			client: "envd-extension-test".to_owned(),
+			schema_rev: omp_proto::SCHEMA_REV,
+			capabilities: vec!["env.fs.read".to_owned()],
+			..Default::default()
+		};
+		let crossed = omp_env::ExtensionEnvClient::connect_uds(
+			&socket_a,
+			&hello,
+			omp_env::DataScope::new(sf!("invocation-b"), Bytes::from_static(b"effect-b"), 1, 1),
+		)
+		.await
+		.expect("connect B authority to A endpoint");
+		let probe = root.path().join("endpoint-probe.txt");
+		fs::write(&probe, b"endpoint isolation").expect("write endpoint probe");
+		let request = pb::DataRequest {
+			body:  Some(data_request::Body::Document(pb::DocumentOp {
+				op:    Some(document_op::Op::Stat(document_pb::StatPathRequest {
+					uri:             Url::from_file_path(&probe)
+						.expect("workspace probe URI")
+						.to_string(),
+					follow_symlinks: document_pb::FollowSymlinks::Yes as i32,
+				})),
+				props: Default::default(),
+			})),
+			props: Default::default(),
+		};
+		crossed
+			.request(request.clone())
+			.await
+			.expect_err("extension B reused extension A endpoint");
+		let own = omp_env::ExtensionEnvClient::connect_uds(
+			&socket_b,
+			&hello,
+			omp_env::DataScope::new(sf!("invocation-b"), Bytes::from_static(b"effect-b"), 1, 1),
+		)
+		.await
+		.expect("connect B authority to B endpoint");
+		own.request(request)
+			.await
+			.expect("extension B uses its own endpoint");
+		shutdown.cancel();
+		task_a
+			.await
+			.expect("extension A socket task")
+			.expect("extension A socket shutdown");
+		task_b
+			.await
+			.expect("extension B socket task")
+			.expect("extension B socket shutdown");
+	}
+
 	/// App-authority DATA frame: no invocation scope, so admission rides the
 	/// connection grants rather than the worker effect envelope.
 	fn unscoped_data_frame(request_id: u64, body: data_request::Body) -> pb::ClientFrame {
@@ -10201,7 +10609,7 @@ mod tests {
 	#[tokio::test]
 	async fn dap_read_action_streams_output_before_revision_fenced_response() {
 		let (requests, responses, _root, _state) =
-			test_connection(&["env.dap.read", "env.dap.execute"], true).await;
+			test_external_connection(&["env.dap.read", "env.dap.execute"], true).await;
 		requests
 			.send_async(unscoped_data_frame(
 				1,
@@ -10608,6 +11016,62 @@ mod tests {
 		reset.await.expect("reset idle wait task");
 	}
 
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn spawned_document_authority_reports_discovered_lsp_roster() {
+		use std::os::unix::fs::PermissionsExt as _;
+		let root = tempfile::tempdir().expect("document workspace");
+		let project = root.path().canonicalize().expect("canonical root");
+		let server = project.join("fake-lsp.sh");
+		std::fs::write(&server, "#!/bin/sh\nexit 0\n").expect("fake server");
+		std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o700))
+			.expect("chmod fake server");
+		std::fs::write(project.join("foo.marker"), b"").expect("marker");
+		std::fs::write(
+			project.join(".lsp.json"),
+			serde_json::to_vec(&serde_json::json!({
+				"servers": {
+					"fake": {
+						"command": server,
+						"args": [],
+						"fileTypes": [".foo"],
+						"rootMarkers": ["foo.marker"],
+					}
+				}
+			}))
+			.expect("encode config"),
+		)
+		.expect("write config");
+		let state = tempfile::tempdir().expect("document socket directory");
+		let socket = state.path().join("document.sock");
+		let (documents, authority) = connect_or_start_docserver(
+			&project,
+			&socket,
+			None,
+			true,
+			omp_docserver::NativeLspOptions { enabled: true, lazy: true },
+			None,
+		)
+		.await
+		.expect("spawn document authority");
+		let response = documents
+			.lsp_status(
+				document_pb::LspStatusRequest { reload: false },
+				&CancellationToken::new(),
+			)
+			.await
+			.expect("lsp status");
+		let fake = response
+			.servers
+			.iter()
+			.find(|server| server.name == "fake")
+			.expect("discovered declaration in roster");
+		assert_eq!(fake.stage, document_pb::LspServerStage::Available as i32);
+		assert_eq!(fake.file_types, vec![".foo".to_owned()]);
+		drop(documents);
+		drop(authority);
+	}
+
 	#[tokio::test]
 	async fn stale_document_authority_is_joined_without_replacement() {
 		let root = tempfile::tempdir().expect("document workspace");
@@ -10623,6 +11087,8 @@ mod tests {
 				daemon::Transport::Socket(serve_socket),
 				omp_docserver::daemon::ServeOptions {
 					lsp_config_paths: Vec::new(),
+					lsp:              omp_docserver::NativeLspOptions { enabled: false, lazy: true },
+					user_config_root: None,
 					shutdown:         Some(serve_shutdown),
 					server_build:     sf!("stale-build"),
 					connections:      None,
@@ -10644,12 +11110,27 @@ mod tests {
 		.expect("stale document authority did not become ready");
 
 		assert!(matches!(
-			connect_or_start_docserver(root.path(), &socket, None, true).await,
+			connect_or_start_docserver(
+				root.path(),
+				&socket,
+				None,
+				true,
+				omp_docserver::NativeLspOptions { enabled: false, lazy: true },
+				None,
+			)
+			.await,
 			Err(EnvdError::DocumentAuthorityHeld)
 		));
-		let (documents, authority) = connect_or_start_docserver(root.path(), &socket, None, false)
-			.await
-			.expect("join stale document authority");
+		let (documents, authority) = connect_or_start_docserver(
+			root.path(),
+			&socket,
+			None,
+			false,
+			omp_docserver::NativeLspOptions { enabled: false, lazy: true },
+			None,
+		)
+		.await
+		.expect("join stale document authority");
 		assert_eq!(documents.hello().server_build.as_str(), "stale-build");
 		assert!(authority.is_none(), "joined authority was incorrectly claimed");
 

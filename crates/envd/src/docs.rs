@@ -1032,6 +1032,21 @@ impl DocumentHost {
 		Ok(response)
 	}
 
+	/// Returns the native language-server roster and lifecycle stages.
+	pub async fn lsp_status(
+		&self,
+		request: pb::LspStatusRequest,
+		cancel: &CancellationToken,
+	) -> Result<pb::LspStatusResponse, DocumentError> {
+		let body = self
+			.request(client_frame::Body::LspStatus(request), cancel)
+			.await?;
+		let server_frame::Body::LspStatus(response) = body else {
+			return Err(unexpected("LspStatusResponse"));
+		};
+		Ok(response)
+	}
+
 	/// Forwards an arbitrary non-lifecycle LSP request through the authority.
 	pub async fn lsp_request(
 		&self,

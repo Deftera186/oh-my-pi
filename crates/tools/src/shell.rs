@@ -65,13 +65,13 @@ pub struct Params {
 		               nonzero values do not extend the foreground auto-background threshold."
 	)]
 	pub timeout:      Option<f64>,
-	/// Environment additions scoped to this command.
+	/// Environment delta scoped to this command; null values unset variables.
 	#[serde(default)]
 	#[schemars(
-		with = "BTreeMap<String, String>",
-		description = "Environment additions scoped to this command."
+		with = "BTreeMap<String, Option<String>>",
+		description = "Environment additions and null-valued removals scoped to this command."
 	)]
-	pub env:          BTreeMap<Str, Str>,
+	pub env:          BTreeMap<Str, Option<Str>>,
 	/// Command working directory, relative to the workspace when not absolute.
 	#[schemars(
 		default,
@@ -247,8 +247,8 @@ pub struct Session {
 pub struct SessionOptions {
 	/// Requested working directory.
 	pub cwd: Option<Str>,
-	/// Scoped environment additions.
-	pub env: BTreeMap<Str, Str>,
+	/// Scoped environment delta; absent values unset variables.
+	pub env: BTreeMap<Str, Option<Str>>,
 	/// Whether a pseudo-terminal is requested.
 	pub pty: bool,
 }
@@ -263,9 +263,11 @@ impl SessionOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
 	/// Exact script text.
-	pub command:    Str,
+	pub command:     Str,
+	/// Environment delta applied only while this command runs.
+	pub environment: BTreeMap<Str, Option<Str>>,
 	/// Optional server-enforced timeout in milliseconds.
-	pub timeout_ms: Option<u64>,
+	pub timeout_ms:  Option<u64>,
 }
 
 /// Request to create one persistent named process.
@@ -662,15 +664,16 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 			};
 			let cwd = args.cwd.or(extracted_cwd);
 			let terminal = args.pty;
-			let options = SessionOptions {
-				cwd: cwd,
-				env: args.env,
-				pty: terminal,
-			};
+			let environment = args.env;
 			let (timeout_ms, adjustments) = self.timeout(args.timeout);
 
 			if args.asynchronous {
 				let name = next_background_name("bash", &self.next_background_name);
+				let options = SessionOptions {
+					cwd,
+					env: environment,
+					pty: terminal,
+				};
 				let work = self.exec.detach(DetachRequest {
 					name,
 					command,
@@ -698,6 +701,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				return;
 			}
 
+			let options = SessionOptions { cwd, env: BTreeMap::new(), pty: terminal };
 			let persistent = options.is_default()
 				&& self
 					.persistent_run_active
@@ -721,6 +725,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 			let session_id = session.id.clone();
 			let mut run = match self.exec.run(&session, RunRequest {
 				command: command.clone(),
+				environment,
 				timeout_ms,
 			}).await {
 				Ok(run) => run,

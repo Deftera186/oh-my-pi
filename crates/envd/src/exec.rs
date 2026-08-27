@@ -1,7 +1,7 @@
 //! Environment-daemon process and persistent shell-session host.
 
 use std::{
-	collections::{BTreeSet, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	env, fs, future,
 	io::{self, Read, Write as _},
 	net,
@@ -34,12 +34,15 @@ use omp_proto::{
 			RestartPolicy, RestartProcess, StartProcess, ready_probe,
 		},
 	},
+	inference::v1::{Value as WireValue, ValueMap as WireValueMap, value as wire_value},
 	toolhost::v1::{HostFrame, Ping, WorkerFrame, host_frame, worker_frame},
 };
 use omp_shell_engine::{
-	ExecutionParameters, Shell, ShellVariable, SourceInfo, SpawnObserver,
+	ExecutionParameters, Shell, ShellValue, ShellVariable, SourceInfo, SpawnObserver,
+	env::EnvironmentScope,
 	openfiles::{OpenFile, OpenFiles},
 	processes::{ProcessSignal, signal_process_group},
+	variables::ShellValueUnsetType,
 };
 use omp_storage::github_cache::GithubCache;
 use parking_lot::Mutex;
@@ -66,6 +69,7 @@ const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const RESTART_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 const RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
 const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
+const RUN_ENVIRONMENT_PROP: &str = "omp/run-environment";
 
 /// Content identity of the process environment inherited by new shell sessions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -105,6 +109,9 @@ pub enum ExecError {
 	/// The control operation was outside the declared vocabulary.
 	#[error("exec control kind is invalid")]
 	InvalidControl,
+	/// A command-local environment delta used an invalid wire value.
+	#[error("command-local environment delta is invalid")]
+	InvalidRunEnvironment,
 	/// The requested named process does not exist.
 	#[error("named process {0:?} was not found")]
 	ProcessNotFound(Str),
@@ -425,6 +432,7 @@ struct SessionCommand {
 	host:           Weak<HostInner>,
 	exec:           Bytes,
 	source:         Str,
+	environment:    Option<EnvironmentDelta>,
 	timeout:        Option<Duration>,
 	pty:            Option<PtySpec>,
 	control:        Arc<RunControl>,
@@ -714,7 +722,7 @@ impl ExecHost {
 	/// Starts a script in a session. A session serializes its scripts.
 	pub async fn exec(
 		&self,
-		request: ExecRequest,
+		mut request: ExecRequest,
 		timeout: Option<Duration>,
 	) -> Result<(ExecStarted, ExecRun), ExecError> {
 		let session = self
@@ -726,7 +734,9 @@ impl ExecHost {
 			.ok_or(ExecError::SessionNotFound)?;
 		let source = request
 			.source
+			.take()
 			.ok_or_else(|| ExecError::Shell(sf!("missing script")))?;
+		let environment = take_run_environment(&mut request)?;
 		let github_targets = admission::bash_ir(
 			"bash",
 			&serde_json::json!({ "command": source.text.as_str() }),
@@ -761,6 +771,7 @@ impl ExecHost {
 			host: Arc::downgrade(&self.inner),
 			exec: exec.clone(),
 			source,
+			environment,
 			timeout,
 			pty: session.pty,
 			control: control.clone(),
@@ -1932,6 +1943,20 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		);
 		return false;
 	};
+	let environment_scoped = command.environment.is_some();
+	if let Some(environment) = command.environment.as_ref() {
+		shell.env_mut().push_scope(EnvironmentScope::Command);
+		if apply_run_environment_delta(shell, environment).is_err() {
+			let _ = shell.env_mut().pop_scope(EnvironmentScope::Command);
+			finish_session_command(
+				&command,
+				RunTerminal::Failed,
+				started_at.elapsed(),
+				shell.working_dir(),
+			);
+			return false;
+		}
+	}
 	let _ = command
 		.events
 		.send(ExecEvent::Started { exec_id: command.exec.clone() });
@@ -1970,6 +1995,16 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		let _ = reader.await;
 	}
 	let cancelled = result == RunTerminal::Cancelled;
+	let result = if environment_scoped
+		&& shell
+			.env_mut()
+			.pop_scope(EnvironmentScope::Command)
+			.is_err()
+	{
+		RunTerminal::Failed
+	} else {
+		result
+	};
 	finish_session_command(&command, result, started_at.elapsed(), shell.working_dir());
 	cancelled
 }
@@ -2794,6 +2829,76 @@ impl ProcessStreamState {
 	}
 }
 
+pub(crate) fn set_run_environment(request: &mut ExecRequest, delta: EnvironmentDelta) {
+	if delta.set.is_empty() && delta.unset.is_empty() {
+		return;
+	}
+	let mut fields = delta
+		.set
+		.into_iter()
+		.map(|(name, value)| (name, WireValue { kind: Some(wire_value::Kind::String(value)) }))
+		.collect::<BTreeMap<_, _>>();
+	fields.extend(
+		delta
+			.unset
+			.into_iter()
+			.map(|name| (name, WireValue { kind: Some(wire_value::Kind::Null(true)) })),
+	);
+	request
+		.props
+		.get_or_insert_default()
+		.fields
+		.insert(String::from(RUN_ENVIRONMENT_PROP), WireValue {
+			kind: Some(wire_value::Kind::Map(WireValueMap { fields })),
+		});
+}
+
+fn take_run_environment(request: &mut ExecRequest) -> Result<Option<EnvironmentDelta>, ExecError> {
+	let Some(value) = request
+		.props
+		.as_mut()
+		.and_then(|props| props.fields.remove(RUN_ENVIRONMENT_PROP))
+	else {
+		return Ok(None);
+	};
+	let Some(wire_value::Kind::Map(values)) = value.kind else {
+		return Err(ExecError::InvalidRunEnvironment);
+	};
+	let mut set = BTreeMap::new();
+	let mut unset = Vec::new();
+	for (name, value) in values.fields {
+		match value.kind {
+			Some(wire_value::Kind::String(value)) => {
+				set.insert(name, value);
+			},
+			Some(wire_value::Kind::Null(_)) => unset.push(name),
+			_ => return Err(ExecError::InvalidRunEnvironment),
+		}
+	}
+	Ok(Some(EnvironmentDelta { set, unset, props: None }))
+}
+
+fn apply_run_environment_delta(
+	shell: &mut Shell,
+	delta: &EnvironmentDelta,
+) -> Result<(), omp_shell_engine::Error> {
+	for name in &delta.unset {
+		let mut variable = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
+		variable.export();
+		shell
+			.env_mut()
+			.add(name.clone(), variable, EnvironmentScope::Command)?;
+	}
+	for (name, value) in &delta.set {
+		let mut variable = ShellVariable::new(value.clone());
+		variable.export();
+		shell
+			.env_mut()
+			.add(name.clone(), variable, EnvironmentScope::Command)?;
+	}
+	Ok(())
+}
+
 fn apply_env_delta(
 	shell: &mut Shell,
 	delta: Option<&EnvironmentDelta>,
@@ -2986,6 +3091,24 @@ fn errno_io(error: Errno) -> ExecError {
 mod tests {
 	use super::*;
 
+	async fn run_output(host: &ExecHost, request: ExecRequest) -> Vec<u8> {
+		let (_, run) = host.exec(request, None).await.expect("exec starts");
+		let mut output = Vec::new();
+		loop {
+			match run.next_event().await {
+				Some(ExecEvent::Output(frame)) => output.extend_from_slice(&frame.data),
+				Some(ExecEvent::Exit(event)) => {
+					let status = event.status.expect("exit status");
+					assert_eq!(status.outcome, ExecOutcome::Exited as i32);
+					assert_eq!(status.exit_code, Some(0));
+					return output;
+				},
+				Some(ExecEvent::Started { .. }) => {},
+				None => panic!("exec event stream closed before exit"),
+			}
+		}
+	}
+
 	struct InterruptedReader {
 		interrupts: usize,
 		bytes:      &'static [u8],
@@ -3002,6 +3125,47 @@ mod tests {
 			self.bytes = &self.bytes[length..];
 			Ok(length)
 		}
+	}
+
+	#[tokio::test]
+	async fn command_environment_add_and_unset_do_not_leak_to_the_next_run() {
+		let host = ExecHost::new();
+		let opened = host
+			.open_session(OpenSessionRequest {
+				env_delta: Some(EnvironmentDelta {
+					set: BTreeMap::from([(String::from("OMP_RUN_UNSET"), String::from("baseline"))]),
+					..EnvironmentDelta::default()
+				}),
+				..OpenSessionRequest::default()
+			})
+			.await
+			.expect("session opens");
+
+		let mut first = ExecRequest {
+			session: opened.session.clone(),
+			source: Some(v1::Script {
+				text: String::from("printf '%s|%s' \"$OMP_RUN_ADD\" \"${OMP_RUN_UNSET-unset}\""),
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		set_run_environment(&mut first, EnvironmentDelta {
+			set:   BTreeMap::from([(String::from("OMP_RUN_ADD"), String::from("command"))]),
+			unset: vec![String::from("OMP_RUN_UNSET")],
+			props: None,
+		});
+		assert_eq!(run_output(&host, first).await, b"command|unset");
+
+		let second = ExecRequest {
+			session: opened.session.clone(),
+			source: Some(v1::Script {
+				text: String::from("printf '%s|%s' \"${OMP_RUN_ADD-unset}\" \"$OMP_RUN_UNSET\""),
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		assert_eq!(run_output(&host, second).await, b"unset|baseline");
+		host.close_session(&opened.session).expect("session closes");
 	}
 
 	#[tokio::test]

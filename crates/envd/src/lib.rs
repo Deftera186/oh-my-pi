@@ -1428,7 +1428,19 @@ fn worker_config(
 		config.extensions.push(extension);
 		bindings.push(binding);
 	}
-	config.extensions.extend_from_slice(trusted_extensions);
+	for trusted in trusted_extensions {
+		let mut extension = trusted.clone();
+		let binding = ExtensionDataBinding::scoped(
+			state_dir,
+			extension.key.clone(),
+			session_id.as_str(),
+			session_generation,
+			extension.data_grants.clone(),
+		);
+		extension.data_socket = Some(extension_data_endpoint(&binding));
+		config.extensions.push(extension);
+		bindings.push(binding);
+	}
 	Ok((config, bindings))
 }
 

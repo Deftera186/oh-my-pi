@@ -1,6 +1,13 @@
 //! Behavioral contracts for the persistent native `bash@1` executor.
 
-use std::{collections::VecDeque, convert, future, io::Cursor, sync::Arc, thread, time::Duration};
+use std::{
+	collections::{BTreeMap, VecDeque},
+	convert, future,
+	io::Cursor,
+	sync::Arc,
+	thread,
+	time::Duration,
+};
 
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, executor::block_on, pin_mut};
@@ -305,6 +312,13 @@ fn constructed_tool_spec_preserves_the_bash_schema_contract() {
 		}))
 		.is_err()
 	);
+	let params = serde_json::from_value::<shell::Params>(serde_json::json!({
+		"command": "echo env",
+		"env": {"ADD": "value", "REMOVE": null}
+	}))
+	.expect("environment delta accepts set and unset values");
+	assert_eq!(params.env.get("ADD"), Some(&Some(sf!("value"))));
+	assert_eq!(params.env.get("REMOVE"), Some(&None));
 }
 
 #[test]
@@ -347,6 +361,26 @@ fn one_session_is_reused_with_its_cwd_and_environment_state() {
 			.all(|run| run.0 == Bytes::from_static(b"session-1"))
 	);
 }
+
+#[test]
+fn command_environment_is_routed_to_the_run_not_the_session() {
+	let exec = FakeExec::default();
+	let registry = registry(exec.clone(), 1024);
+	let _ = call(
+		&registry,
+		r#"{"command":"show-env","env":{"ADD":"value","REMOVE":null}}"#,
+	);
+	let state = exec.state.lock();
+	assert!(state.session_options[0].env.is_empty());
+	assert_eq!(
+		state.runs[0].1.environment,
+		BTreeMap::from([
+			(sf!("ADD"), Some(sf!("value"))),
+			(sf!("REMOVE"), None),
+		]),
+	);
+}
+
 #[test]
 fn explicit_cwd_and_shell_expansions_preserve_leading_cd_commands() {
 	let explicit = FakeExec::default();

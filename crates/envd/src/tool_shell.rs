@@ -112,9 +112,9 @@ enum ShellBackend {
 }
 #[derive(Clone)]
 struct AcpSessionOptions {
-	cwd:            Option<Str>,
-	env:            BTreeMap<Str, Str>,
-	command_prefix: Str,
+	cwd:   Option<Str>,
+	env:   BTreeMap<Str, Str>,
+	unset: Vec<String>,
 }
 
 impl ShellExecHost {
@@ -310,11 +310,15 @@ impl ShellExecHost {
 
 	async fn expand_environment(
 		&self,
-		environment: BTreeMap<Str, Str>,
-	) -> Result<BTreeMap<Str, Str>, Fault> {
+		environment: BTreeMap<Str, Option<Str>>,
+	) -> Result<BTreeMap<Str, Option<Str>>, Fault> {
 		let mut expanded = BTreeMap::new();
 		for (name, value) in environment {
-			expanded.insert(name, self.expand_internal_uris(value.as_str(), false).await?);
+			let value = match value {
+				Some(value) => Some(self.expand_internal_uris(value.as_str(), false).await?),
+				None => None,
+			};
+			expanded.insert(name, value);
 		}
 		Ok(expanded)
 	}
@@ -390,7 +394,7 @@ impl ShellExecHost {
 	async fn environment(
 		&self,
 		cwd_uri: &str,
-		user: BTreeMap<Str, Str>,
+		user: BTreeMap<Str, Option<Str>>,
 		pty: bool,
 	) -> EnvironmentDelta {
 		use super::direnv::load;
@@ -413,7 +417,7 @@ impl ShellExecHost {
 }
 
 fn hardened_environment(
-	user: BTreeMap<Str, Str>,
+	user: BTreeMap<Str, Option<Str>>,
 	pty: bool,
 	direnv: Option<DirenvDelta>,
 ) -> EnvironmentDelta {
@@ -478,18 +482,38 @@ fn hardened_environment(
 	}) {
 		set.remove("CI");
 	}
-	let explicit = user.keys().cloned().collect::<BTreeSet<_>>();
-	set.extend(
-		user
-			.into_iter()
-			.map(|(key, value)| (key.to_string(), value.to_string())),
-	);
-	let unset = direnv
+	let mut unset = direnv
 		.into_iter()
 		.flat_map(|delta| delta.unset)
-		.filter(|key| !explicit.contains(key) && !set.contains_key(key.as_str()))
 		.map(|key| key.to_string())
-		.collect();
+		.collect::<BTreeSet<_>>();
+	for (key, value) in user {
+		let key = key.to_string();
+		match value {
+			Some(value) => {
+				unset.remove(&key);
+				set.insert(key, value.to_string());
+			},
+			None => {
+				set.remove(&key);
+				unset.insert(key);
+			},
+		}
+	}
+	EnvironmentDelta { set, unset: unset.into_iter().collect(), props: None }
+}
+
+fn command_environment(environment: BTreeMap<Str, Option<Str>>) -> EnvironmentDelta {
+	let mut set = BTreeMap::new();
+	let mut unset = Vec::new();
+	for (name, value) in environment {
+		match value {
+			Some(value) => {
+				set.insert(name.to_string(), value.to_string());
+			},
+			None => unset.push(name.to_string()),
+		}
+	}
 	EnvironmentDelta { set, unset, props: None }
 }
 
@@ -685,12 +709,12 @@ impl ShellExec for ShellExecHost {
 				.iter()
 				.map(|(name, value)| (Str::from(name.as_str()), Str::from(value.as_str())))
 				.collect();
-			let command_prefix = self.acp_command_prefix(&environment.unset).await;
+			let unset = environment.unset;
 			let id = Bytes::from(format!("acp:{}", omp_core::Ulid::generate()));
 			self
 				.acp_sessions
 				.lock()
-				.insert(id.clone(), AcpSessionOptions { cwd, env, command_prefix });
+				.insert(id.clone(), AcpSessionOptions { cwd, env, unset });
 			return Ok(Session { id });
 		}
 		let request = OpenSessionRequest {
@@ -748,31 +772,44 @@ impl ShellExec for ShellExecHost {
 		let command = self
 			.expand_internal_uris(request.command.as_str(), true)
 			.await?;
+		let environment = command_environment(self.expand_environment(request.environment).await?);
 		let acp_options = self.acp_sessions.lock().get(&session.id).cloned();
 		if let Some(options) = acp_options {
 			let backend = self.acp.backend().ok_or_else(|| Fault::Resource {
 				operation: sf!("run"),
 				message:   sf!("ACP terminal backend disconnected"),
 			})?;
+			let mut env = options.env;
+			env.extend(
+				environment
+					.set
+					.iter()
+					.map(|(name, value)| (Str::from(name.as_str()), Str::from(value.as_str()))),
+			);
+			let mut unset = options.unset;
+			unset.retain(|name| !environment.set.contains_key(name));
+			unset.extend(environment.unset.iter().cloned());
+			let command_prefix = self.acp_command_prefix(&unset).await;
 			return backend
 				.run(AcpExecRequest {
-					command:    if options.command_prefix.is_empty() {
+					command: if command_prefix.is_empty() {
 						command
 					} else {
-						sf!("{}{}", options.command_prefix, command)
+						sf!("{}{}", command_prefix, command)
 					},
-					cwd:        options.cwd,
-					env:        options.env,
+					cwd: options.cwd,
+					env,
 					timeout_ms: request.timeout_ms,
 				})
 				.await
 				.map(|run| SelectedShellRun { kind: SelectedShellRunKind::Acp(run) });
 		}
-		let exec_request = ExecRequest {
+		let mut exec_request = ExecRequest {
 			session: session.id.clone(),
 			source: Some(Script { text: command.to_string(), ..Default::default() }),
 			..Default::default()
 		};
+		super::exec::set_run_environment(&mut exec_request, environment);
 		match &self.backend {
 			ShellBackend::Local(host) => {
 				let (_, run) = host
@@ -974,8 +1011,9 @@ mod tests {
 			.expect("denied scope permits non-PTY session");
 		let mut run = host
 			.run(&plain_session, RunRequest {
-				command:    sf!("printf scope-ok"),
-				timeout_ms: Some(5_000),
+				command:     sf!("printf scope-ok"),
+				environment: BTreeMap::new(),
+				timeout_ms:  Some(5_000),
 			})
 			.await
 			.expect("plain execution starts");

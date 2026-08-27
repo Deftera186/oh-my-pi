@@ -1125,6 +1125,25 @@ impl EnvClient {
 		self.worktree_request(worktree_op::Op::Merge(request)).await
 	}
 
+	/// Returns the native language-server roster, optionally rediscovering its
+	/// configuration.
+	pub async fn lsp_status(
+		&self,
+		reload: bool,
+	) -> Result<omp_proto::document::v1::LspStatusResponse, ClientError> {
+		let response = self
+			.data_request_owned(document_request(document_op::Op::LspStatus(
+				document::LspStatusRequest { reload },
+			)))
+			.await?;
+		document_result(response, "LspStatusResponse", |result| {
+			let document_result::Result::LspStatus(status) = result else {
+				return None;
+			};
+			Some(status)
+		})
+	}
+
 	async fn data_request_owned(&self, request: DataRequest) -> Result<DataResponse, ClientError> {
 		match self
 			.one_shot(client_frame::Body::Data(request), None)
