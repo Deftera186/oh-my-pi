@@ -783,9 +783,10 @@ async fn await_account(
 
 fn login_step(event: AuthEvent) -> Result<begin_login_response::Step, Status> {
 	match event {
-		AuthEvent::OpenUrl(url) => {
+		AuthEvent::OpenUrl { url, launch } => {
 			Ok(begin_login_response::Step::Browse(begin_login_response::Browse {
-				url: url.as_str().to_owned(),
+				url:        url.as_str().to_owned(),
+				launch_url: launch.map(|url| url.as_str().to_owned()),
 			}))
 		},
 		AuthEvent::ShowDeviceCode { code, verification_url } => {
