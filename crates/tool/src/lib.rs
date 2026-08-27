@@ -624,6 +624,12 @@ pub enum Constraint {
 		on_unsupported: Fallback,
 	},
 	/// Freeform input constrained by a grammar.
+	///
+	/// The tool is offered as raw grammar-constrained text on grammar-capable
+	/// transports and as its ordinary JSON schema everywhere else; recovery
+	/// canonicalizes freeform text into the schema's `input` string property.
+	/// Registration therefore rejects grammar declarations whose schema lacks
+	/// one ([`RegistryError::GrammarInputProperty`]).
 	Grammar {
 		/// Grammar language.
 		syntax:         GrammarSyntax,

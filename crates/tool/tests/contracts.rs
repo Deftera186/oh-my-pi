@@ -1021,7 +1021,7 @@ fn advertisement_contains_only_the_live_schema_and_preserves_supported_grammar()
 			FakeTool::new(
 				2,
 				"live",
-				br#"{"type":"object","properties":{"live":{"const":true}},"required":["live"]}"#,
+				br#"{"type":"object","properties":{"live":{"const":true},"input":{"type":"string"}},"required":["live"]}"#,
 				Constraint::Grammar {
 					syntax:         GrammarSyntax::Regex,
 					definition:     sf!(r"live=(true|false)"),
@@ -1130,7 +1130,7 @@ fn live_identity_and_advertisement_are_the_same_exact_revision() {
 fn unsupported_grammar_degrades_to_live_lenient_schema_with_a_receipt() {
 	let live_schema = json!({
 		"type": "object",
-		"properties": {"live": {"const": true}},
+		"properties": {"live": {"const": true}, "input": {"type": "string"}},
 		"required": ["live"]
 	});
 	let mut registry = Registry::new();
@@ -1152,7 +1152,7 @@ fn unsupported_grammar_degrades_to_live_lenient_schema_with_a_receipt() {
 			FakeTool::new(
 				2,
 				"live",
-				br#"{"type":"object","properties":{"live":{"const":true}},"required":["live"]}"#,
+				br#"{"type":"object","properties":{"live":{"const":true},"input":{"type":"string"}},"required":["live"]}"#,
 				Constraint::Grammar {
 					syntax:         GrammarSyntax::Ebnf,
 					definition:     sf!("root = 'live';"),

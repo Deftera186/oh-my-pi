@@ -6,7 +6,9 @@ use bytes::Bytes;
 use omp_core::{Str, sf};
 use serde_json::{Map, Value};
 
-use super::{Decoder, DecoderState, ProviderControlInput, RawEvent, UnvalidatedToolCall};
+use super::{
+	Decoder, DecoderState, ProviderControlInput, RawEvent, ToolInputKind, UnvalidatedToolCall,
+};
 use crate::{
 	call::{
 		ContentPart, Message, OpaqueJson, OperationCall, Role, ToolDefinition, ToolResultContent,
@@ -407,6 +409,14 @@ impl GlyphDecoder {
 }
 
 fn decode_unvalidated_call(call: &mut UnvalidatedToolCall) {
+	// Freeform inputs are opaque text; JSON sniffing could reserialize and
+	// silently reformat grammar-constrained payloads that happen to parse.
+	if call.input_kind == ToolInputKind::Freeform {
+		if let Ok(text) = str::from_utf8(&call.arguments) {
+			call.arguments = Bytes::copy_from_slice(decode_text(text).as_bytes());
+		}
+		return;
+	}
 	if let Ok(mut value) = serde_json::from_slice::<Value>(&call.arguments) {
 		decode_value(&mut value);
 		if let Ok(arguments) = serde_json::to_vec(&value) {

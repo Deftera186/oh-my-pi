@@ -20,8 +20,8 @@ use crate::{
 	answer::{Artifact, ArtifactBody, GenerationEvent, GenerationSummary, ImageArtifact},
 	body::BodySource,
 	call::{
-		Background, ChatRequest, Dimensions, ImageFormat, ImageQuality, ImageRequest, MediaInput,
-		OpaqueJson, OperationCall, Setting, ToolInputConstraint,
+		Background, ChatRequest, Dimensions, FREEFORM_INPUT_PROPERTY, ImageFormat, ImageQuality,
+		ImageRequest, MediaInput, OpaqueJson, OperationCall, Setting, ToolInputConstraint,
 	},
 	catalog::{
 		OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
@@ -2563,6 +2563,17 @@ impl OpenAiResponsesCodec {
 								.unwrap_or_else(|| Str::new(call.as_str()));
 							let serialized = serde_json::to_string(arguments.as_value())
 								.map_err(|_| ResponsesEncodeError::MissingCallIdentity)?;
+							// Custom wire items carry raw freeform text; recovery
+							// canonicalized it under the `input` property. History
+							// recorded without that property replays the serialized
+							// object verbatim.
+							let custom_input = custom.then(|| {
+								arguments
+									.as_value()
+									.get(FREEFORM_INPUT_PROPERTY)
+									.and_then(serde_json::Value::as_str)
+									.map_or_else(|| Str::new(serialized.as_str()), Str::new)
+							});
 							input.push(ResponsesInputItem {
 								kind: Some(if custom {
 									ResponsesInputItemKind::CustomToolCall
@@ -2574,8 +2585,8 @@ impl OpenAiResponsesCodec {
 								content: ResponsesInputContent::default(),
 								name: Some(name.clone()),
 								call_id: Some(call_id),
-								arguments: (!custom).then(|| serialized.clone().into()),
-								input: custom.then(|| serialized.into()),
+								arguments: (!custom).then(|| serialized.into()),
+								input: custom_input,
 								output: None,
 								summary: Vec::new(),
 								encrypted_content: None,
@@ -4968,6 +4979,55 @@ mod tests {
 			serde_json::to_string(&encoded.request.input).expect("input serializes"),
 			r#"[{"role":"assistant","content":[{"type":"input_text","text":"calling read on two files"}]},{"type":"function_call","name":"read","call_id":"call_a","arguments":"{\"path\":\"a\"}"},{"type":"function_call","name":"read","call_id":"call_b","arguments":"{\"path\":\"b\"}"},{"type":"function_call_output","call_id":"call_a","output":"out a"},{"type":"function_call_output","call_id":"call_b","output":"out b"}]"#,
 		);
+	}
+	#[test]
+	fn custom_tool_replay_extracts_the_canonical_freeform_input() {
+		let text = "*** Begin Patch\n*** End Patch";
+		let policy = policy::WirePolicy::baseline();
+		let encoded = encode_with_policy(&policy, |route, target| {
+			let proof = |call_id: &str| ProviderProof {
+				provider: route.provider.clone(),
+				codec:    target.codec.clone(),
+				value:    encode_provider_proof(&ResponsesProviderProof {
+					call_id: Some(Str::new(call_id)),
+					custom_tool: true,
+					..ResponsesProviderProof::default()
+				})
+				.expect("proof encodes"),
+			};
+			history_request(vec![Message {
+				role:    Role::Assistant,
+				content: Arc::from([
+					ContentPart::ToolCall {
+						call:      ToolCallId::new("call_edit"),
+						name:      sf!("edit"),
+						arguments: OpaqueJson::new(serde_json::json!({ "input": text })),
+						proof:     Some(proof("call_edit")),
+					},
+					ContentPart::ToolCall {
+						call:      ToolCallId::new("call_legacy"),
+						name:      sf!("edit"),
+						arguments: OpaqueJson::new(serde_json::json!({"legacy": true})),
+						proof:     Some(proof("call_legacy")),
+					},
+				]),
+				name:    None,
+			}])
+		});
+		let custom = encoded
+			.request
+			.input
+			.iter()
+			.filter(|item| matches!(item.kind, Some(ResponsesInputItemKind::CustomToolCall)))
+			.collect::<Vec<_>>();
+		let [canonical, legacy] = custom.as_slice() else {
+			panic!("both replayed calls stay custom: {:?}", encoded.request.input);
+		};
+		// Canonical `{"input": text}` arguments replay as the raw freeform text.
+		assert_eq!(canonical.input.as_deref(), Some(text));
+		assert!(canonical.arguments.is_none());
+		// History recorded without the property replays the serialized object.
+		assert_eq!(legacy.input.as_deref(), Some(r#"{"legacy":true}"#));
 	}
 
 	#[test]

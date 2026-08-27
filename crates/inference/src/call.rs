@@ -562,6 +562,18 @@ pub struct ToolGrammar {
 	/// Complete grammar definition.
 	pub definition: Str,
 }
+/// Canonical argument property carrying a freeform tool input.
+///
+/// A freeform-capable tool (any [`ToolInputConstraint::Grammar`] declaration,
+/// plus schema tools a transport deliberately lowers to a custom/freeform
+/// wire shape) is called through one of two wire forms depending on transport
+/// capability: raw grammar-constrained text, or a JSON object conforming to
+/// the tool's schema. Recovery canonicalizes the freeform form into
+/// `{"input": <text>}` so every downstream consumer (journal, history
+/// re-encoding, argument decoding) sees exactly one shape. Freeform-capable
+/// tools therefore declare a string `input` property; transports re-encoding
+/// history into a freeform wire item extract this property back out.
+pub const FREEFORM_INPUT_PROPERTY: &str = "input";
 
 /// Complete syntax declaration for one callable tool's input.
 #[derive(Clone, Debug)]
@@ -574,6 +586,12 @@ pub enum ToolInputConstraint {
 		strict:     bool,
 	},
 	/// Freeform text constrained by the exact grammar declaration.
+	///
+	/// Grammar-capable transports send the grammar and receive freeform text;
+	/// all other transports encode the non-strict `fallback` schema and
+	/// receive ordinary JSON arguments. Both wire forms are valid for one
+	/// declaration — recovery validates whichever form the provider produced
+	/// and canonicalizes freeform text under [`FREEFORM_INPUT_PROPERTY`].
 	Grammar {
 		/// Exact grammar declaration for grammar-capable transports.
 		grammar:  ToolGrammar,

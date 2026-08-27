@@ -3736,7 +3736,7 @@ mod tests {
 						name:            sf!("edit"),
 						rev:             Rev { family: sf!("hl"), n: 1 },
 						description:     sf!("Sparse edit"),
-						schema:          Bytes::from_static(br#"{"type":"object"}"#),
+						schema:          Bytes::from_static(br#"{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}"#),
 						constraint:      Constraint::Grammar {
 							syntax:         GrammarSyntax::Lark,
 							definition:     Str::new_static(LIVE_EDIT_GRAMMAR),
@@ -3765,7 +3765,10 @@ mod tests {
 		};
 		assert_eq!(grammar.syntax, ToolGrammarSyntax::Lark);
 		assert_eq!(grammar.definition, LIVE_EDIT_GRAMMAR);
-		assert_eq!(fallback.as_value(), &serde_json::json!({"type": "object"}));
+		assert_eq!(
+			fallback.as_value(),
+			&serde_json::json!({"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]})
+		);
 	}
 
 	#[test]

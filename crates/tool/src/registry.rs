@@ -17,8 +17,8 @@ use futures::{Stream, StreamExt, pin_mut};
 use omp_catalog::GrammarBits;
 use omp_core::{Hash32, SparseMap, Str, hash32::Hasher, sf};
 use omp_inference::{
-	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
-	ToolInputConstraint,
+	Adjustment, FREEFORM_INPUT_PROPERTY, FeatureId, OpaqueJson, ReasonId, ToolDefinition,
+	ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
 	recovery::tools::{ToolAssemblyLimits, schema_within_strict_subset},
 };
 use omp_proto::inference::{v1, v1::InvokeInput};
@@ -1159,6 +1159,18 @@ pub enum RegistryError {
 		/// Parser failure.
 		source: serde_json::Error,
 	},
+	/// A grammar-constrained declaration cannot receive canonicalized freeform
+	/// input.
+	#[error(
+		"grammar tool {name}@{rev} must declare a string `input` property: freeform calls \
+		 canonicalize into it"
+	)]
+	GrammarInputProperty {
+		/// Tool name.
+		name: Str,
+		/// Tool revision.
+		rev:  Rev,
+	},
 	/// Typed event or verdict serialization failed.
 	#[error("tool value serialization failed: {0}")]
 	Serialize(#[from] serde_json::Error),
@@ -1905,6 +1917,7 @@ impl Registry {
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
 			RegistryError::InvalidSchema { name: name.clone(), rev: rev.clone(), source }
 		})?;
+		validate_grammar_schema(spec, &value)?;
 		let cache_id = self.next_projection_cache_id()?;
 		let entry = RegistryEntry {
 			tool: Arc::new(Registered {
@@ -1946,6 +1959,7 @@ impl Registry {
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
 			RegistryError::InvalidSchema { name: name.clone(), rev: rev.clone(), source }
 		})?;
+		validate_grammar_schema(&spec, &value)?;
 		let cache_id = self.next_projection_cache_id()?;
 		let entry = RegistryEntry {
 			tool: Arc::new(Worker {
@@ -2951,6 +2965,31 @@ fn host_tool_stream<'a>(
 			}
 		}
 	})
+}
+
+/// Enforces the freeform canonicalization contract on grammar declarations.
+///
+/// Recovery canonicalizes a freeform wire call into the schema's
+/// [`FREEFORM_INPUT_PROPERTY`] string property; a grammar tool whose schema
+/// cannot hold it could never execute on a grammar-capable transport.
+fn validate_grammar_schema(spec: &ToolSpec, schema: &Value) -> Result<(), RegistryError> {
+	if !matches!(spec.constraint, Constraint::Grammar { .. }) {
+		return Ok(());
+	}
+	let accepts_input = schema
+		.get("properties")
+		.and_then(|properties| properties.get(FREEFORM_INPUT_PROPERTY))
+		.is_some_and(|property| match property.get("type") {
+			None => true,
+			Some(Value::String(kind)) => kind == "string",
+			Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "string"),
+			Some(_) => false,
+		});
+	if accepts_input {
+		Ok(())
+	} else {
+		Err(RegistryError::GrammarInputProperty { name: spec.name.clone(), rev: spec.rev.clone() })
+	}
 }
 
 fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, RegistryError> {

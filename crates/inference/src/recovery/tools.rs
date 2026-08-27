@@ -16,7 +16,8 @@ use super::{
 	json::{JsonRepairLimits, parse_repaired_value},
 };
 use crate::{
-	call::{OpaqueJson, ToolDefinition, ToolInputConstraint},
+	call::{FREEFORM_INPUT_PROPERTY, OpaqueJson, ToolDefinition, ToolInputConstraint},
+	codec::ToolInputKind,
 	event::ToolCall,
 	id::ToolCallId,
 	receipt::{ReasonId, RecoveryKind, RecoveryRecord},
@@ -116,6 +117,8 @@ pub enum ToolFragment {
 		id:           Option<ToolCallId>,
 		/// Complete name or an empty prefix.
 		name:         Bytes,
+		/// Observed wire syntax of the call's argument bytes.
+		input_kind:   ToolInputKind,
 	},
 	/// Appends bytes to the call name and marks the final name fragment.
 	NameDelta {
@@ -180,6 +183,7 @@ struct PartialCall {
 	id:              ToolCallId,
 	name:            BytesMut,
 	arguments:       BytesMut,
+	input_kind:      ToolInputKind,
 	started_emitted: bool,
 }
 
@@ -226,7 +230,9 @@ impl<'a> ToolAssembler<'a> {
 				.map_or(0, |call| call.name.len().saturating_add(call.arguments.len()) as u64),
 		};
 		let events = match fragment {
-			ToolFragment::Start { source_index, id, name } => self.start(source_index, id, name),
+			ToolFragment::Start { source_index, id, name, input_kind } => {
+				self.start(source_index, id, name, input_kind)
+			},
 			ToolFragment::NameDelta { source_index, bytes, complete } => {
 				self.name_delta(source_index, bytes, complete)
 			},
@@ -274,6 +280,7 @@ impl<'a> ToolAssembler<'a> {
 		source_index: u32,
 		id: Option<ToolCallId>,
 		name: Bytes,
+		input_kind: ToolInputKind,
 	) -> Vec<ToolAssemblyEvent> {
 		if self.open.contains_key(&source_index) {
 			return vec![ToolAssemblyEvent::Rejected {
@@ -319,9 +326,10 @@ impl<'a> ToolAssembler<'a> {
 			.filter(|value| !value.is_empty())
 			.map(Str::new);
 		self.open.insert(source_index, PartialCall {
-			id:              id.clone(),
-			name:            BytesMut::from(name.as_ref()),
-			arguments:       BytesMut::new(),
+			id: id.clone(),
+			name: BytesMut::from(name.as_ref()),
+			arguments: BytesMut::new(),
+			input_kind,
 			started_emitted: complete_name.is_some(),
 		});
 		self.accepted_calls = self.accepted_calls.saturating_add(1);
@@ -403,8 +411,17 @@ impl<'a> ToolAssembler<'a> {
 		else {
 			return ToolAssemblyEvent::Rejected { source_index, reason: ToolRejection::InvalidName };
 		};
-		let arguments = match &definition.input {
-			ToolInputConstraint::JsonSchema { parameters, strict } => {
+		let arguments = match call.input_kind {
+			ToolInputKind::Json => {
+				// A grammar declaration lowered by a schema-only transport
+				// arrives as ordinary JSON conforming to its fallback schema.
+				let (parameters, strict) = match &definition.input {
+					ToolInputConstraint::JsonSchema { parameters, strict } => (parameters, *strict),
+					ToolInputConstraint::Grammar { fallback, .. } => {
+						self.record("tool.grammar-fallback-arguments", call.arguments.len() as u64, 1);
+						(fallback, false)
+					},
+				};
 				let arguments: Value = match parse_repaired_value(&call.arguments, JsonRepairLimits {
 					max_bytes:        self.limits.max_argument_bytes,
 					max_depth:        self.limits.max_schema_depth,
@@ -434,7 +451,7 @@ impl<'a> ToolAssembler<'a> {
 				let arguments = match repair_schema_arguments(
 					parameters.as_value(),
 					&arguments,
-					*strict,
+					strict,
 					self.limits,
 				) {
 					Ok((arguments, repairs)) => {
@@ -449,7 +466,7 @@ impl<'a> ToolAssembler<'a> {
 					},
 					Err(reason) => {
 						match normalize_flattened_arguments(&arguments).filter(|rebuilt| {
-							validate_schema(parameters.as_value(), rebuilt, *strict, self.limits).is_ok()
+							validate_schema(parameters.as_value(), rebuilt, strict, self.limits).is_ok()
 						}) {
 							Some(rebuilt) => {
 								self.record(
@@ -471,7 +488,7 @@ impl<'a> ToolAssembler<'a> {
 				self.record("tool.complete-schema-valid", call.arguments.len() as u64, 1);
 				arguments
 			},
-			ToolInputConstraint::Grammar { .. } => {
+			ToolInputKind::Freeform => {
 				let Ok(arguments) = str::from_utf8(&call.arguments) else {
 					return ToolAssemblyEvent::Rejected {
 						source_index,
@@ -481,8 +498,22 @@ impl<'a> ToolAssembler<'a> {
 						},
 					};
 				};
+				// Canonicalize freeform text into the schema's `input` property
+				// so journaled calls, history re-encoding, and argument decoding
+				// all see the one object shape regardless of wire form.
+				let wrapped = Value::Object(serde_json::Map::from_iter([(
+					FREEFORM_INPUT_PROPERTY.to_owned(),
+					Value::String(arguments.to_owned()),
+				)]));
+				let (schema, _) = definition.input.wire_schema();
+				if let Err(reason) = validate_schema(schema.as_value(), &wrapped, false, self.limits) {
+					return ToolAssemblyEvent::Rejected {
+						source_index,
+						reason: ToolRejection::SchemaViolation(reason),
+					};
+				}
 				self.record("tool.complete-freeform-valid", call.arguments.len() as u64, 1);
-				Value::String(arguments.to_owned())
+				wrapped
 			},
 		};
 		ToolAssemblyEvent::Ready {
@@ -1515,6 +1546,112 @@ mod tests {
 			},
 		}
 	}
+	fn grammar_definition(fallback: Value) -> ToolDefinition {
+		ToolDefinition {
+			name:        sf!("edit"),
+			description: None,
+			input:       ToolInputConstraint::Grammar {
+				grammar:  crate::call::ToolGrammar {
+					syntax:     crate::call::ToolGrammarSyntax::Lark,
+					definition: sf!("start: LF"),
+				},
+				fallback: OpaqueJson::new(fallback),
+			},
+		}
+	}
+
+	fn edit_fallback_schema() -> Value {
+		json!({
+			"type": "object",
+			"properties": {"input": {"type": "string"}},
+			"required": ["input"],
+			"additionalProperties": false,
+		})
+	}
+
+	fn complete_call(
+		assembler: &mut ToolAssembler<'_>,
+		input_kind: ToolInputKind,
+		arguments: &'static [u8],
+	) -> Vec<ToolAssemblyEvent> {
+		assembler.push(ToolFragment::Start {
+			input_kind,
+			source_index: 0,
+			id: Some(ToolCallId::new("call-edit")),
+			name: Bytes::from_static(b"edit"),
+		});
+		assembler.push(ToolFragment::ArgumentsDelta {
+			source_index: 0,
+			bytes:        Bytes::from_static(arguments),
+		});
+		assembler.push(ToolFragment::End { source_index: 0 })
+	}
+
+	#[test]
+	fn freeform_input_canonicalizes_into_the_input_property() {
+		let definitions = [grammar_definition(edit_fallback_schema())];
+		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		let text = "[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement";
+		let output = complete_call(&mut assembler, ToolInputKind::Freeform, text.as_bytes());
+		let [ToolAssemblyEvent::Ready { call, .. }] = output.as_slice() else {
+			panic!("freeform call must authorize: {output:?}");
+		};
+		assert_eq!(call.arguments.as_value(), &json!({"input": text}));
+		assert!(
+			assembler
+				.take_evidence()
+				.iter()
+				.any(|record| record.rule.0 == "tool.complete-freeform-valid")
+		);
+	}
+
+	#[test]
+	fn grammar_tool_accepts_schema_lowered_json_arguments() {
+		let definitions = [grammar_definition(edit_fallback_schema())];
+		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		let output = complete_call(&mut assembler, ToolInputKind::Json, br#"{"input":"PUT 1.=1:"}"#);
+		let [.., ToolAssemblyEvent::Ready { call, .. }] = output.as_slice() else {
+			panic!("fallback JSON call must authorize: {output:?}");
+		};
+		assert_eq!(call.arguments.as_value(), &json!({"input": "PUT 1.=1:"}));
+		assert!(
+			assembler
+				.take_evidence()
+				.iter()
+				.any(|record| record.rule.0 == "tool.grammar-fallback-arguments")
+		);
+	}
+
+	#[test]
+	fn grammar_fallback_json_still_enforces_the_fallback_schema() {
+		let definitions = [grammar_definition(edit_fallback_schema())];
+		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		// A missing required `input` is beyond schema-directed repair.
+		let output = complete_call(&mut assembler, ToolInputKind::Json, br"{}");
+		assert!(
+			matches!(output.as_slice(), [.., ToolAssemblyEvent::Rejected {
+				reason: ToolRejection::SchemaViolation(_),
+				..
+			}]),
+			"non-conforming fallback arguments must reject: {output:?}"
+		);
+	}
+
+	#[test]
+	fn freeform_call_without_an_input_property_is_rejected() {
+		let definitions = [grammar_definition(
+			json!({"type": "object", "properties": {}, "additionalProperties": false}),
+		)];
+		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		let output = complete_call(&mut assembler, ToolInputKind::Freeform, b"raw text");
+		assert!(
+			matches!(output.as_slice(), [.., ToolAssemblyEvent::Rejected {
+				reason: ToolRejection::SchemaViolation(_),
+				..
+			}]),
+			"schema without an input property cannot receive freeform calls: {output:?}"
+		);
+	}
 	#[test]
 	fn strict_subset_accepts_annotations_and_combinators() {
 		let schema = json!({
@@ -1573,6 +1710,7 @@ mod tests {
 		let definitions = Arc::from([definition()]);
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 2,
 			id:           None,
 			name:         Bytes::from_static(b"search"),
@@ -1588,6 +1726,7 @@ mod tests {
 				.any(|event| matches!(event, ToolAssemblyEvent::Ready { .. }))
 		);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 3,
 			id:           None,
 			name:         Bytes::from_static(b"wrong"),
@@ -1609,6 +1748,7 @@ mod tests {
 		let definitions = [definition()];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 0,
 			id:           Some(ToolCallId::new("call-1")),
 			name:         Bytes::new(),
@@ -1641,6 +1781,7 @@ mod tests {
 		let definitions = [definition()];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 4,
 			id:           Some(ToolCallId::new("call-slop")),
 			name:         Bytes::from_static(b"search"),
@@ -1671,6 +1812,7 @@ mod tests {
 		{
 			let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 			assembler.push(ToolFragment::Start {
+				input_kind: ToolInputKind::Json,
 				source_index,
 				id: None,
 				name: Bytes::from_static(b"search"),
@@ -1694,6 +1836,7 @@ mod tests {
 		let limits = ToolAssemblyLimits { max_total_calls: 1, ..ToolAssemblyLimits::default() };
 		let mut assembler = ToolAssembler::new(&definitions, limits, 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 0,
 			id:           None,
 			name:         Bytes::from_static(b"search"),
@@ -1711,6 +1854,7 @@ mod tests {
 		assert!(matches!(
 			assembler
 				.push(ToolFragment::Start {
+					input_kind:   ToolInputKind::Json,
 					source_index: 1,
 					id:           None,
 					name:         Bytes::from_static(b"search"),
@@ -1775,6 +1919,7 @@ mod tests {
 		let definitions = [nested];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 9,
 			id:           None,
 			name:         Bytes::from_static(b"search"),
@@ -1808,6 +1953,7 @@ mod tests {
 		let definitions = [definition()];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 10,
 			id:           None,
 			name:         Bytes::from_static(b"search"),
@@ -1910,6 +2056,7 @@ mod tests {
 		let definitions = [definition];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
 			source_index: 0,
 			id:           None,
 			name:         Bytes::copy_from_slice(definitions[0].name.as_bytes()),

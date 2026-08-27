@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
 	call::ToolDefinition,
+	codec::ToolInputKind,
 	event::{BlockKind, ChatEvent},
 	id::ToolCallId,
 	receipt::{ReasonId, RecoveryKind, RecoveryRecord},
@@ -225,8 +226,12 @@ impl<'a> RecoveryProjector<'a> {
 		let name = envelope
 			.name
 			.map_or_else(Bytes::new, |name| Bytes::copy_from_slice(name.as_bytes()));
-		let mut output =
-			self.project_tool(ToolChannel::Text, ToolFragment::Start { source_index, id: None, name });
+		let mut output = self.project_tool(ToolChannel::Text, ToolFragment::Start {
+			source_index,
+			id: None,
+			name,
+			input_kind: ToolInputKind::Json,
+		});
 		append_batch(
 			&mut output,
 			self.project_tool(ToolChannel::Text, ToolFragment::ArgumentsDelta {
@@ -523,6 +528,7 @@ mod tests {
 		projector.push(ProjectionInput::Tool {
 			channel:  ToolChannel::Native,
 			fragment: ToolFragment::Start {
+				input_kind:   ToolInputKind::Json,
 				source_index: 5,
 				id:           Some(ToolCallId::new("n1")),
 				name:         Bytes::from_static(b"echo"),
@@ -531,6 +537,7 @@ mod tests {
 		let ignored = projector.push(ProjectionInput::Tool {
 			channel:  ToolChannel::Text,
 			fragment: ToolFragment::Start {
+				input_kind:   ToolInputKind::Json,
 				source_index: 1,
 				id:           None,
 				name:         Bytes::from_static(b"echo"),

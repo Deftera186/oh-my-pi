@@ -6317,6 +6317,9 @@ pub fn agent_snapshot(
 			omp_agent::external_thinking_for_model(&model.capabilities, external_thinking_override)
 		});
 	let lowering_caps = LoweringCaps {
+		// Advertise the richest constraint form; sessions span routes with
+		// differing capability, so codecs lower grammar tools to their
+		// fallback schema per transport and recovery accepts both wire forms.
 		strict_schema:  true,
 		grammar:        GrammarBits::ALL,
 		maximum_tools:  None,

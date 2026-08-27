@@ -15,14 +15,8 @@ use tower::{Layer, Service};
 use crate::{
 	answer::{AnswerBody, ModelDiscoveryPage},
 	body::AttemptBodyEvidence,
-	call::{
-		Call, DiscoveryRequest, OperationCall, Setting, StructuredOutput, ToolDefinition,
-		ToolInputConstraint,
-	},
-	codec::{
-		HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, ToolInputKind,
-		UnvalidatedToolCall,
-	},
+	call::{Call, DiscoveryRequest, OperationCall, Setting, StructuredOutput, ToolDefinition},
+	codec::{HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, UnvalidatedToolCall},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{ChatEvent, Completion, FinishReason},
 	layer::{ExecutionContext, LayerCall},
@@ -665,18 +659,11 @@ fn recover_tool(
 	definitions: &[ToolDefinition],
 	context: &ExecutionContext,
 ) -> Result<ChatEvent, Error> {
-	let Some(definition) = definitions
+	if !definitions
 		.iter()
-		.find(|definition| definition.name == call.name)
-	else {
+		.any(|definition| definition.name == call.name)
+	{
 		return Err(recovery_error("tool.not-declared", context));
-	};
-	let declared_kind = match &definition.input {
-		ToolInputConstraint::JsonSchema { .. } => ToolInputKind::Json,
-		ToolInputConstraint::Grammar { .. } => ToolInputKind::Freeform,
-	};
-	if call.input_kind != declared_kind {
-		return Err(recovery_error("tool.input-kind-mismatch", context));
 	}
 	let mut assembler = ToolAssembler::new(
 		definitions,
@@ -689,6 +676,7 @@ fn recover_tool(
 			source_index: index,
 			id:           Some(call.id),
 			name:         bytes::Bytes::copy_from_slice(call.name.as_bytes()),
+			input_kind:   call.input_kind,
 		},
 		ToolFragment::ArgumentsDelta { source_index: index, bytes: call.arguments },
 		ToolFragment::End { source_index: index },
@@ -734,6 +722,58 @@ mod tests {
 
 	struct TestProjector {
 		fail: bool,
+	}
+	fn edit_grammar_definition() -> ToolDefinition {
+		ToolDefinition {
+			name:        sf!("edit"),
+			description: None,
+			input:       crate::call::ToolInputConstraint::Grammar {
+				grammar:  crate::call::ToolGrammar {
+					syntax:     crate::call::ToolGrammarSyntax::Lark,
+					definition: sf!("start: LF"),
+				},
+				fallback: crate::call::OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"properties": {"input": {"type": "string"}},
+					"required": ["input"],
+				})),
+			},
+		}
+	}
+
+	#[test]
+	fn grammar_tool_recovers_the_schema_lowered_json_wire_form() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let call = UnvalidatedToolCall {
+			id:         crate::id::ToolCallId::new("call-edit"),
+			name:       sf!("edit"),
+			input_kind: crate::codec::ToolInputKind::Json,
+			arguments:  bytes::Bytes::from_static(br#"{"input":"PUT 1.=1:"}"#),
+		};
+		let event = recover_tool(3, call, &[edit_grammar_definition()], &context)
+			.expect("fallback JSON wire form must recover");
+		let ChatEvent::ToolCallReady { index: 3, call } = event else {
+			panic!("expected a ready call: {event:?}");
+		};
+		assert_eq!(call.arguments.as_value(), &serde_json::json!({"input": "PUT 1.=1:"}));
+	}
+
+	#[test]
+	fn grammar_tool_recovers_the_freeform_wire_form_into_the_canonical_object() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let text = "[src/a.rs#1A2B]\nPUT 1.=1:\n+replacement";
+		let call = UnvalidatedToolCall {
+			id:         crate::id::ToolCallId::new("call-edit"),
+			name:       sf!("edit"),
+			input_kind: crate::codec::ToolInputKind::Freeform,
+			arguments:  bytes::Bytes::copy_from_slice(text.as_bytes()),
+		};
+		let event = recover_tool(0, call, &[edit_grammar_definition()], &context)
+			.expect("freeform wire form must recover");
+		let ChatEvent::ToolCallReady { call, .. } = event else {
+			panic!("expected a ready call: {event:?}");
+		};
+		assert_eq!(call.arguments.as_value(), &serde_json::json!({"input": text}));
 	}
 	#[test]
 	fn dropped_preferred_structured_output_disables_repair() {

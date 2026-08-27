@@ -77,12 +77,18 @@ pub struct InvocationSendError;
 /// cosmetic difference must not reject the invocation: the commitment is
 /// accepted when both sides parse to the same JSON document, or when only
 /// the commitment parses (a repaired stream, where the commitment is
-/// authoritative). Two documents with different values remain a protocol
-/// violation.
+/// authoritative). A freeform grammar call streams raw text that recovery
+/// canonicalizes into `{"input": <text>}`; the commitment is accepted when
+/// its `input` property is exactly the streamed text, even if that text
+/// happens to parse as JSON. Two documents with different values remain a
+/// protocol violation.
 fn commit_supersedes_stream(streamed: &str, committed: &str) -> bool {
 	let Ok(committed) = serde_json::from_str::<serde_json::Value>(committed) else {
 		return false;
 	};
+	if committed.get("input").and_then(serde_json::Value::as_str) == Some(streamed) {
+		return true;
+	}
 	match serde_json::from_str::<serde_json::Value>(streamed) {
 		Ok(streamed) => streamed == committed,
 		Err(_) => true,
@@ -1323,6 +1329,22 @@ mod tests {
 			.expect("commit remains connected");
 		let raw = block_on(params.committed()).expect("repaired commitment is authoritative");
 		assert_eq!(raw.as_str(), r#"{"path":"crates"}"#);
+	}
+
+	#[test]
+	fn canonicalized_freeform_commitment_supersedes_json_shaped_text() {
+		// A grammar-constrained tool streams raw text; recovery commits the
+		// canonical `{"input": <text>}` object. Even text that parses as JSON
+		// must not be mistaken for a divergent document.
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.arg_text(sf!("[1,2,3]"))
+			.expect("fragment remains connected");
+		feed
+			.args_committed(sf!(r#"{{"input":"[1,2,3]"}}"#))
+			.expect("commit remains connected");
+		let raw = block_on(params.committed()).expect("canonicalized freeform commit is accepted");
+		assert_eq!(raw.as_str(), r#"{"input":"[1,2,3]"}"#);
 	}
 
 	#[test]
