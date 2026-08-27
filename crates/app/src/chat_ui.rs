@@ -26,7 +26,7 @@ use omp_agent::{
 };
 use omp_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId,
-	provider::AuthSpecKind,
+	provider::{AuthSpecKind, CredentialSourceSpec},
 	settings::{ModelRoleStorage, ModelSettings},
 	snapshot::Catalog,
 };
@@ -37,8 +37,9 @@ use omp_chat_ui::{
 	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, VisibleResourceFacts,
 	completion::{CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion},
 	host::{HostOptions, InputAction, InputBinding},
+	login_panel::LoginEvent,
 };
-use omp_core::{EnvPath, Hash32, SecretString, Str, encoding::hex, sf};
+use omp_core::{EnvPath, FastHashSet, Hash32, SecretString, Str, encoding::hex, sf};
 pub use omp_driver::auth_flow::{
 	AuthPromptKind, CREDENTIAL_STORAGE_LOCKED_MESSAGE, ChatAuth, ChatAuthCommand, ChatAuthEvent,
 	prompt_masks_input,
@@ -978,6 +979,7 @@ fn inspect_image_enabled(state: &BridgeState) -> bool {
 
 struct BridgeState {
 	catalog: Arc<Catalog>,
+	auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	model: String,
 	model_settings: ModelSettings,
 	pending_session_delete: Option<std::time::Instant>,
@@ -1020,6 +1022,7 @@ struct BridgeState {
 	tools: HashMap<Str, ToolDisplay>,
 	rewind_targets: Vec<RewindTarget>,
 	pending_auth_kind: Option<AuthPromptKind>,
+	pending_auth_provider: Option<Str>,
 	live_activity: ActivityWaveform,
 	token_rate: Option<TokenRateMeter>,
 	tokens_per_second: Option<u64>,
@@ -2104,6 +2107,7 @@ where
 		.resolve_path_scopes(&workspace_root, &settings_home);
 	let mut state = BridgeState {
 		catalog,
+		auth_control: auth_control.clone(),
 		model,
 		model_settings,
 		pending_session_delete: None,
@@ -2150,6 +2154,7 @@ where
 		tokens_per_second: None,
 		thinking,
 		pending_auth_kind: None,
+		pending_auth_provider: None,
 		replaying_turn: false,
 		vision_override: None,
 		settings: omp_driver::settings::current(&data_dir).into_diagnostic()?,
@@ -2921,13 +2926,13 @@ pub async fn run_guest(
 						send_backend(&backend_tx, BackendEvent::Status(status));
 					}
 				},
-				event = guest_events.recv() => {
-					let Ok(event) = event else { break };
-					match event {
-						omp_driver::collab::session::GuestPresentationEvent::Resync => {
-							send_backend(&backend_tx, BackendEvent::AuthPromptClose);
-						},
-						omp_driver::collab::session::GuestPresentationEvent::Stream(stream) => {
+									event = guest_events.recv() => {
+						let Ok(event) = event else { break };
+						match event {
+							omp_driver::collab::session::GuestPresentationEvent::Resync => {
+								send_backend(&backend_tx, BackendEvent::LoginPanelClose);
+							},
+							omp_driver::collab::session::GuestPresentationEvent::Stream(stream) => {
 							if let Some(notice) = stream.notice {
 								let event = if notice.level
 									== omp_proto::collab::v1::notice::Level::Error as i32
@@ -3527,7 +3532,7 @@ fn append_hotkeys(mut help: String) -> String {
 		"\n**Hotkeys**\n\n| Context | Key | Action |\n|---|---|---|\n| Composer | `Enter` | Steer \
 		 active turn or submit |\n| Composer | `Alt+Enter` | Queue follow-up |\n| Composer | `Esc` \
 		 | Interrupt active work |\n| Composer | `Esc Esc` | Open rewind history |\n| Composer | \
-		 `Ctrl+O` | Expand exact tool card |\n| Composer | `Ctrl+T` | Expand latest thinking timer \
+		 `Ctrl+O` | Expand exact tool card |\n| Composer | `Ctrl+T` | Toggle thinking visibility \
 		 |\n| Composer | `Alt+P` | Switch model for this session |\n| Composer | `Ctrl+R` | Search \
 		 prompt history |\n| Composer | `Alt+Up` / `Shift+Up` | Restore newest queued item |\n| \
 		 Modal | `Enter` | Commit highlighted action |\n| Modal | `Esc` | Cancel modal; never \
@@ -4623,7 +4628,7 @@ const fn status_thinking_level(effort: Effort) -> Option<StatusThinkingLevel> {
 	}
 }
 
-fn set_interactive_thinking(agent_state: &AgentState, state: &mut BridgeState, cycle: bool) {
+fn cycle_interactive_thinking(agent_state: &AgentState, state: &mut BridgeState) {
 	use omp_proto::inference::v1::Reasoning;
 
 	const LEVELS: [Effort; 7] = [
@@ -4643,17 +4648,11 @@ fn set_interactive_thinking(agent_state: &AgentState, state: &mut BridgeState, c
 		.as_ref()
 		.and_then(|reasoning| Effort::try_from(reasoning.effort).ok())
 		.unwrap_or(Effort::Off);
-	let next = if cycle {
-		let at = LEVELS
-			.iter()
-			.position(|effort| *effort == current)
-			.unwrap_or(0);
-		LEVELS[(at + 1) % LEVELS.len()]
-	} else if current == Effort::Off {
-		Effort::Medium
-	} else {
-		Effort::Off
-	};
+	let at = LEVELS
+		.iter()
+		.position(|effort| *effort == current)
+		.unwrap_or(0);
+	let next = LEVELS[(at + 1) % LEVELS.len()];
 	agent_state.update(|snapshot| {
 		snapshot.turn.params.thinking =
 			Some(Reasoning { effort: next as i32, ..Reasoning::default() });
@@ -6943,7 +6942,11 @@ where
 			}
 		},
 		Intent::CycleModel { backward } => {
-			let rows = cycle_model_rows(state.catalog.as_ref(), &state.model_settings);
+			let rows = cycle_model_rows(
+				state.catalog.as_ref(),
+				&state.model_settings,
+				state.auth_control.as_ref(),
+			);
 			if !rows.is_empty() {
 				let current = rows
 					.iter()
@@ -6966,12 +6969,8 @@ where
 				.await;
 			}
 		},
-		Intent::ToggleThinking => {
-			set_interactive_thinking(agent_state, state, false);
-			send_status(backend, state, bus, dropped);
-		},
 		Intent::CycleThinking => {
-			set_interactive_thinking(agent_state, state, true);
+			cycle_interactive_thinking(agent_state, state);
 			send_status(backend, state, bus, dropped);
 		},
 		Intent::CloseExtensionInspector => {
@@ -7732,7 +7731,7 @@ fn handle_login(
 	backend: &flume::Sender<BackendEvent>,
 	auth: Option<&ChatAuth>,
 	requested: Option<Str>,
-	state: &BridgeState,
+	state: &mut BridgeState,
 ) {
 	let Some(auth) = auth else {
 		send_backend(backend, BackendEvent::Error(sf!(GATEWAY_LOGIN_MESSAGE)));
@@ -7741,10 +7740,14 @@ fn handle_login(
 	if let Some(requested) = requested {
 		match resolve_login_provider(state.catalog.as_ref(), &requested) {
 			Ok(provider) => match auth.start(provider.clone()) {
-				Ok(()) => send_backend(
-					backend,
-					BackendEvent::Notice(sf!("Starting authentication for `{provider}`…")),
-				),
+				Ok(()) => {
+					state.pending_auth_provider = Some(provider.clone());
+					send_login_panel(
+						backend,
+						state,
+						LoginEvent::Notice(sf!("Starting authentication…")),
+					);
+				},
 				Err(error) => send_backend(backend, BackendEvent::Error(Str::from(error))),
 			},
 			Err(error) => send_backend(backend, BackendEvent::Error(error)),
@@ -7841,39 +7844,56 @@ async fn load_theme_preview(state: &mut BridgeState, args: &str) -> miette::Resu
 		.ok_or_else(|| miette::miette!("theme revision was not published"))
 }
 
+/// Forwards one login-panel update tagged with the provider under
+/// authentication.
+fn send_login_panel(backend: &flume::Sender<BackendEvent>, state: &BridgeState, event: LoginEvent) {
+	let provider = state
+		.pending_auth_provider
+		.clone()
+		.unwrap_or_else(|| sf!("provider"));
+	send_backend(backend, BackendEvent::LoginPanel { provider, event });
+}
+
 fn handle_auth_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	event: ChatAuthEvent,
 ) {
 	match event {
-		ChatAuthEvent::Url(url) => {
-			send_backend(backend, BackendEvent::Notice(sf!("[open to authorize]({url})")));
+		ChatAuthEvent::Url { url, launch } => {
+			send_login_panel(backend, state, LoginEvent::Url { url, launch });
 		},
 		ChatAuthEvent::DeviceCode { code, url } => {
-			send_backend(backend, BackendEvent::Notice(sf!("Enter code `{code}` at [{url}]({url})")));
+			send_login_panel(backend, state, LoginEvent::DeviceCode { code, url });
 		},
 		ChatAuthEvent::Prompt { message, kind } => {
 			state.pending_auth_kind = Some(kind);
-			send_backend(backend, BackendEvent::AuthPrompt {
+			send_login_panel(backend, state, LoginEvent::Prompt {
 				message,
 				masked: prompt_masks_input(kind),
 			});
 		},
-		ChatAuthEvent::Notice(message) => send_backend(backend, BackendEvent::Notice(message)),
+		ChatAuthEvent::Notice(message) => {
+			send_login_panel(backend, state, LoginEvent::Notice(message));
+		},
 		ChatAuthEvent::Complete(message) => {
 			state.pending_auth_kind = None;
-			send_backend(backend, BackendEvent::AuthPromptClose);
+			state.pending_auth_provider = None;
+			send_backend(backend, BackendEvent::LoginPanelClose);
 			send_backend(backend, BackendEvent::Notice(message));
+			// A fresh credential can make new providers selectable.
+			send_models_updated(backend, state);
 		},
 		ChatAuthEvent::CredentialStorageLocked => {
 			state.pending_auth_kind = None;
-			send_backend(backend, BackendEvent::AuthPromptClose);
+			state.pending_auth_provider = None;
+			send_backend(backend, BackendEvent::LoginPanelClose);
 			send_backend(backend, BackendEvent::Error(sf!(CREDENTIAL_STORAGE_LOCKED_MESSAGE)));
 		},
 		ChatAuthEvent::Failed(message) => {
 			state.pending_auth_kind = None;
-			send_backend(backend, BackendEvent::AuthPromptClose);
+			state.pending_auth_provider = None;
+			send_backend(backend, BackendEvent::LoginPanelClose);
 			send_backend(backend, BackendEvent::Error(message));
 		},
 	}
@@ -8113,6 +8133,11 @@ fn handle_agent_event(
 			Some(Event::Attempt(attempt)) => {
 				state.attempt = attempt.number;
 				if attempt.number > 1 {
+					// The retry re-streams the failed attempt's content from the
+					// start; settling the partial would duplicate it.
+					for (_, id) in state.active_parts.drain() {
+						send_backend(backend, BackendEvent::AssistantAbandoned { id });
+					}
 					send_backend(
 						backend,
 						BackendEvent::TranscriptFrame(TranscriptFrame {
@@ -8125,18 +8150,17 @@ fn handle_agent_event(
 			},
 			Some(Event::PartStart(start)) => match part_start::Kind::try_from(start.kind) {
 				Ok(part_start::Kind::Text | part_start::Kind::Thinking) => {
+					drain_open_assistant_parts(backend, state);
 					state.part_serial = state.part_serial.saturating_add(1);
 					let id = Str::from(format!("assistant-{}", state.part_serial));
-					send_backend(backend, BackendEvent::AssistantBegin { id: id.clone() });
-					if start.kind == part_start::Kind::Thinking as i32 {
-						send_backend(backend, BackendEvent::AssistantDelta {
-							id:   id.clone(),
-							text: sf!("*Thinking:* "),
-						});
-					}
+					send_backend(backend, BackendEvent::AssistantBegin {
+						id:       id.clone(),
+						thinking: start.kind == part_start::Kind::Thinking as i32,
+					});
 					state.active_parts.insert(start.index, id);
 				},
 				Ok(part_start::Kind::ToolCall) => {
+					drain_open_assistant_parts(backend, state);
 					let id = Str::from(start.tool_call_id.as_str());
 					let identity = renderers
 						.resolve_name(&start.tool_name)
@@ -8525,6 +8549,7 @@ fn ensure_tool_started(
 
 fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, serial: &mut u64) {
 	let mut text_parts = Vec::new();
+	let mut thinking_parts = Vec::new();
 	let mut chips = Vec::new();
 	for part in &message.parts {
 		match &part.kind {
@@ -8540,6 +8565,9 @@ fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, seri
 				}
 			},
 			Some(part::Kind::Blob(blob)) => chips.push(blob_label(blob)),
+			Some(part::Kind::Thinking(thinking)) if !thinking.text.trim().is_empty() => {
+				thinking_parts.push(thinking.text.clone());
+			},
 			_ => {},
 		}
 	}
@@ -8553,17 +8581,35 @@ fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, seri
 				send_backend(backend, BackendEvent::Notice(Str::from(text)));
 			}
 		},
-		_ if !text.is_empty() => {
-			*serial = serial.saturating_add(1);
-			let id = Str::from(format!("history-assistant-{serial}"));
-			send_backend(backend, BackendEvent::AssistantBegin { id: id.clone() });
-			send_backend(backend, BackendEvent::AssistantDelta {
-				id:   id.clone(),
-				text: Str::from(text),
-			});
-			send_backend(backend, BackendEvent::AssistantEnd { id });
+		_ => {
+			for thinking in thinking_parts {
+				send_backend(backend, BackendEvent::ThinkingReplayed { text: thinking.into() });
+			}
+			if !text.is_empty() {
+				*serial = serial.saturating_add(1);
+				let id = Str::from(format!("history-assistant-{serial}"));
+				send_backend(backend, BackendEvent::AssistantBegin {
+					id:       id.clone(),
+					thinking: false,
+				});
+				send_backend(backend, BackendEvent::AssistantDelta {
+					id:   id.clone(),
+					text: Str::from(text),
+				});
+				send_backend(backend, BackendEvent::AssistantEnd { id });
+			}
 		},
-		_ => {},
+	}
+}
+
+/// Ends every still-open streamed text/thinking part.
+///
+/// Providers close prose blocks implicitly; ending them on the next part
+/// start (or turn outcome) keeps their streamed content settled in the
+/// transcript instead of abandoning it.
+fn drain_open_assistant_parts(backend: &flume::Sender<BackendEvent>, state: &mut BridgeState) {
+	for (_, id) in state.active_parts.drain() {
+		send_backend(backend, BackendEvent::AssistantEnd { id });
 	}
 }
 
@@ -8922,7 +8968,11 @@ fn proto_to_json(value: &v1::Value) -> Option<serde_json::Value> {
 	}
 }
 
-fn model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> {
+fn model_rows(
+	catalog: &Catalog,
+	settings: &ModelSettings,
+	auth: Option<&omp_inference::auth::AuthControlHandle>,
+) -> Vec<ModelRow> {
 	let roles = settings
 		.roles
 		.keys()
@@ -8931,48 +8981,67 @@ fn model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> {
 			resolve_model_selector(catalog, settings, role.as_str()).map(|model| (role, model))
 		})
 		.collect::<Vec<_>>();
-	catalog
-		.models()
-		.iter()
-		.filter(|model| model_selector_allowed(catalog, settings, model.key.as_str()))
-		.map(|model| {
-			let role = roles
-				.iter()
-				.filter(|(_, resolved)| resolved.key.as_str() == model.key.as_str())
-				.min_by_key(|(role, _)| settings.cycle_rank(role))
-				.map(|(role, _)| *role);
-			let tag = role.and_then(|role| settings.role_tag(role));
-			let (provider_id, provider) = model
-				.routes
-				.first()
-				.and_then(|route| catalog.route(route))
-				.map(|route| {
-					let name = catalog
-						.provider(&route.provider)
-						.map_or_else(|| route.provider.to_string(), |provider| provider.name.to_string());
-					(Str::from(route.provider.as_str()), Str::from(name))
+	let credentialed = auth.map(|auth| credentialed_providers(catalog, auth));
+	let rows = |credentialed: Option<&FastHashSet<ProviderId>>| {
+		catalog
+			.models()
+			.iter()
+			.filter(|model| model_selector_allowed(catalog, settings, model.key.as_str()))
+			.filter(|model| {
+				credentialed.is_none_or(|credentialed| {
+					model.routes.iter().any(|route| {
+						catalog
+							.route(route)
+							.is_some_and(|route| credentialed.contains(&route.provider))
+					})
 				})
-				.unwrap_or_default();
-			let price = |unit| {
-				model
-					.pricing
-					.components
+			})
+			.map(|model| {
+				let role = roles
 					.iter()
-					.find(|price| price.unit == unit)
-					.map(|price| price.nanos_usd as f64 / 1_000_000_000.0)
-			};
-			ModelRow {
-				key: Str::from(model.key.to_string()),
-				name: tag.map_or_else(|| model.display_name.clone(), |tag| tag.name.clone()),
-				color: tag.and_then(|tag| tag.color.clone()),
-				provider_id,
-				provider,
-				context: model.limits.context_window,
-				input_mtok: price(PriceUnit::MtokInput),
-				output_mtok: price(PriceUnit::MtokOutput),
-			}
-		})
-		.collect()
+					.filter(|(_, resolved)| resolved.key.as_str() == model.key.as_str())
+					.min_by_key(|(role, _)| settings.cycle_rank(role))
+					.map(|(role, _)| *role);
+				let tag = role.and_then(|role| settings.role_tag(role));
+				let (provider_id, provider) = model
+					.routes
+					.first()
+					.and_then(|route| catalog.route(route))
+					.map(|route| {
+						let name = catalog.provider(&route.provider).map_or_else(
+							|| route.provider.to_string(),
+							|provider| provider.name.to_string(),
+						);
+						(Str::from(route.provider.as_str()), Str::from(name))
+					})
+					.unwrap_or_default();
+				let price = |unit| {
+					model
+						.pricing
+						.components
+						.iter()
+						.find(|price| price.unit == unit)
+						.map(|price| price.nanos_usd as f64 / 1_000_000_000.0)
+				};
+				ModelRow {
+					key: Str::from(model.key.to_string()),
+					name: tag.map_or_else(|| model.display_name.clone(), |tag| tag.name.clone()),
+					color: tag.and_then(|tag| tag.color.clone()),
+					provider_id,
+					provider,
+					context: model.limits.context_window,
+					input_mtok: price(PriceUnit::MtokInput),
+					output_mtok: price(PriceUnit::MtokOutput),
+				}
+			})
+			.collect::<Vec<_>>()
+	};
+	match rows(credentialed.as_ref()) {
+		// Every model filtered out means nothing is authenticated yet; an empty
+		// picker would hide the login paths, so fail open to the full catalog.
+		filtered if filtered.is_empty() => rows(None),
+		filtered => filtered,
+	}
 }
 
 fn current_model_index(rows: &[ModelRow], current: &str) -> usize {
@@ -8981,8 +9050,70 @@ fn current_model_index(rows: &[ModelRow], current: &str) -> usize {
 		.position(|model| model.key.as_str() == current)
 		.unwrap_or_default()
 }
-fn cycle_model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> {
-	let all = model_rows(catalog, settings);
+/// Providers whose declared credential sources are currently satisfiable
+/// without a new login: auth-free specs, populated credential environment
+/// variables, or an enabled stored account.
+fn credentialed_providers(
+	catalog: &Catalog,
+	auth: &omp_inference::auth::AuthControlHandle,
+) -> FastHashSet<ProviderId> {
+	let accounts = auth.accounts(None);
+	catalog
+		.providers()
+		.iter()
+		.filter(|provider| provider_credentials_present(catalog, provider, &accounts))
+		.map(|provider| provider.id.clone())
+		.collect()
+}
+
+fn provider_credentials_present(
+	catalog: &Catalog,
+	provider: &ProviderDef,
+	accounts: &[omp_inference::account::AccountRecord],
+) -> bool {
+	let has_account = accounts
+		.iter()
+		.any(|account| account.enabled && account.provider == provider.id);
+	provider
+		.auth
+		.iter()
+		.filter_map(|auth_id| catalog.auth_spec(auth_id))
+		.any(|spec| {
+			if matches!(spec.kind, AuthSpecKind::None | AuthSpecKind::OptionalBearer) {
+				return true;
+			}
+			// A spec declaring no checkable source stays visible.
+			spec.credential_sources.is_empty()
+				|| spec.credential_sources.iter().any(|source| match source {
+					CredentialSourceSpec::Stored
+					| CredentialSourceSpec::Oauth { .. }
+					| CredentialSourceSpec::Session => has_account,
+					CredentialSourceSpec::Environment { ordered_names } => {
+						env_credential_present(ordered_names)
+					},
+					CredentialSourceSpec::BasicEnvironment { username_names, password_names } => {
+						env_credential_present(username_names) && env_credential_present(password_names)
+					},
+					// File-, metadata-, and ambient-chain credentials cannot be
+					// verified without I/O; keep the provider visible.
+					CredentialSourceSpec::ApplicationDefault { .. } | CredentialSourceSpec::AwsChain => {
+						true
+					},
+				})
+		})
+}
+
+fn env_credential_present(names: &[Str]) -> bool {
+	names
+		.iter()
+		.any(|name| env::var_os(name.as_str()).is_some_and(|value| !value.is_empty()))
+}
+fn cycle_model_rows(
+	catalog: &Catalog,
+	settings: &ModelSettings,
+	auth: Option<&omp_inference::auth::AuthControlHandle>,
+) -> Vec<ModelRow> {
+	let all = model_rows(catalog, settings, auth);
 	let mut ordered = Vec::new();
 	for role in settings.cycle_order.iter() {
 		if settings.role_tag(role).is_some_and(|tag| tag.hidden) {
@@ -9011,13 +9142,15 @@ fn cycle_model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow
 }
 
 fn send_open_models(backend: &flume::Sender<BackendEvent>, state: &BridgeState) {
-	let rows = model_rows(state.catalog.as_ref(), &state.model_settings);
+	let rows =
+		model_rows(state.catalog.as_ref(), &state.model_settings, state.auth_control.as_ref());
 	let current = current_model_index(&rows, &state.model);
 	send_backend(backend, BackendEvent::OpenModelPicker { rows, current });
 }
 
 fn send_models_updated(backend: &flume::Sender<BackendEvent>, state: &BridgeState) {
-	let rows = model_rows(state.catalog.as_ref(), &state.model_settings);
+	let rows =
+		model_rows(state.catalog.as_ref(), &state.model_settings, state.auth_control.as_ref());
 	let current = current_model_index(&rows, &state.model);
 	send_backend(backend, BackendEvent::ModelsUpdated { rows, current });
 }
@@ -9785,20 +9918,65 @@ mod tests {
 			});
 		settings.cycle_order = Arc::from([sf!("second"), sf!("first")]);
 
-		let rows = model_rows(catalog, &settings);
+		let rows = model_rows(catalog, &settings, None);
 		let tagged = rows
 			.iter()
 			.find(|row| row.key.as_str() == second)
 			.expect("visible tagged model");
 		assert_eq!(tagged.name, "Review model");
 		assert_eq!(tagged.color.as_deref(), Some("cyan"));
-		let cycle = cycle_model_rows(catalog, &settings);
+		let cycle = cycle_model_rows(catalog, &settings, None);
 		assert_eq!(cycle.first().map(|row| row.key.as_str()), Some(second.as_str()));
 		assert!(cycle.iter().all(|row| row.key.as_str() != first));
 		assert_eq!(
 			resolve_model_selector(catalog, &settings, "first").map(|model| model.key.as_str()),
 			Some(first.as_str()),
 		);
+	}
+
+	#[test]
+	fn account_bound_providers_require_an_enabled_account() {
+		let catalog = Catalog::embedded();
+		// A provider whose every credential path is account-backed (stored,
+		// OAuth, or session) is invisible without an account; environment-backed
+		// providers are excluded so ambient developer keys cannot flip the test.
+		let provider = catalog
+			.providers()
+			.iter()
+			.find(|provider| {
+				let mut specs = provider
+					.auth
+					.iter()
+					.filter_map(|auth_id| catalog.auth_spec(auth_id))
+					.peekable();
+				specs.peek().is_some()
+					&& specs.all(|spec| {
+						!matches!(spec.kind, AuthSpecKind::None | AuthSpecKind::OptionalBearer)
+							&& !spec.credential_sources.is_empty()
+							&& spec.credential_sources.iter().all(|source| {
+								matches!(
+									source,
+									CredentialSourceSpec::Stored
+										| CredentialSourceSpec::Oauth { .. }
+										| CredentialSourceSpec::Session
+								)
+							})
+					})
+			})
+			.expect("embedded catalog has an account-only provider");
+		assert!(!provider_credentials_present(catalog, provider, &[]));
+		let account = omp_inference::account::AccountRecord {
+			account:               omp_inference::AccountId::from(format!("{}:test", provider.id)),
+			principal:             omp_inference::PrincipalId::from("test"),
+			provider:              provider.id.clone(),
+			routes:                Default::default(),
+			enabled:               true,
+			credential_generation: 1,
+			routing:               Default::default(),
+		};
+		assert!(provider_credentials_present(catalog, provider, std::slice::from_ref(&account)));
+		let disabled = omp_inference::account::AccountRecord { enabled: false, ..account };
+		assert!(!provider_credentials_present(catalog, provider, &[disabled]));
 	}
 
 	struct StubSession;
@@ -9998,6 +10176,7 @@ mod tests {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			catalog: Arc::new(Catalog::embedded().clone()),
+			auth_control: None,
 			model: "test/model".to_owned(),
 			model_settings: ModelSettings::default(),
 			pending_session_delete: None,
@@ -10040,6 +10219,7 @@ mod tests {
 			tools: HashMap::new(),
 			rewind_targets: Vec::new(),
 			pending_auth_kind: None,
+			pending_auth_provider: None,
 			live_activity: ActivityWaveform::new(),
 			token_rate: None,
 			tokens_per_second: None,
