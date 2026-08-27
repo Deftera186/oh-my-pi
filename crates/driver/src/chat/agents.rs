@@ -57,7 +57,42 @@ pub fn discover(root: &Path, security_enabled: bool) -> Arc<BTreeMap<Str, AgentD
 	let home = env::var_os("HOME").map(PathBuf::from);
 	let extensions = extension_roots(root, home.as_deref());
 	let declarations = manifest::agent_declarations(root, home.as_deref(), &extensions);
-	let discovery = manifest::discover_agents(&declarations);
+	compose_catalog(manifest::discover_agents(&declarations), security_enabled)
+}
+
+/// One admitted extension's already feature-filtered static declaration rows.
+pub struct ExtensionAgentSource<'a> {
+	/// Stable admitted extension identity.
+	pub id:           &'a Str,
+	/// Canonical lock-materialized package root.
+	pub package_root: &'a Path,
+	/// Selected signed declaration projection.
+	pub declarations: &'a [omp_ext::config::StaticDeclaration],
+}
+
+/// Composes agents from selected signed manifest rows without importing an
+/// extension module.
+pub fn discover_with_extension_rows(
+	root: &Path,
+	security_enabled: bool,
+	sources: &[ExtensionAgentSource<'_>],
+) -> Result<Arc<BTreeMap<Str, AgentDefinition>>, manifest::AgentManifestError> {
+	let home = env::var_os("HOME").map(PathBuf::from);
+	let mut declarations = manifest::agent_declarations(root, home.as_deref(), &[]);
+	for source in sources {
+		declarations.extend(manifest::manifest_agent_declarations(
+			source.id,
+			source.package_root,
+			source.declarations,
+		)?);
+	}
+	Ok(compose_catalog(manifest::discover_agents(&declarations), security_enabled))
+}
+
+fn compose_catalog(
+	discovery: manifest::AgentDiscovery,
+	security_enabled: bool,
+) -> Arc<BTreeMap<Str, AgentDefinition>> {
 	for warning in &discovery.warnings {
 		tracing::warn!(path = %warning.path.display(), error = %warning.kind, "skipping malformed agent definition");
 	}

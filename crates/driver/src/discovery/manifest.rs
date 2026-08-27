@@ -533,32 +533,59 @@ pub struct PythonWorkerDeclaration {
 	/// Optional named manifest entry point.
 	pub entry:  Option<Str>,
 }
+/// Immutable install-grant identity attached by native package discovery.
+///
+/// These facts come from the local install record and lock, never from the
+/// extension's own `extension.json`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionGrantFacts {
+	/// Stable extension identity from the lock.
+	pub id:                Str,
+	/// TOFU-pinned publisher identity from the lock.
+	pub publisher:         Str,
+	/// Layer in which the installed selection is resolved.
+	pub layer:             omp_ext::Layer,
+	/// Workspace identity for workspace-layer grants.
+	pub workspace:         Option<omp_ext::WorkspaceUri>,
+	/// Digest of the selected effective capability set.
+	pub capability_digest: Str,
+	/// Requested containment tier.
+	pub tier:              omp_ext::TrustTier,
+	/// Requested code-shipping level.
+	pub ship:              Str,
+}
 
 /// Static native OMP extension manifest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionPayload {
 	/// Stable extension name.
-	pub name:        Str,
+	pub name:              Str,
 	/// Canonical package root.
-	pub root:        PathBuf,
+	pub root:              PathBuf,
 	/// Human-readable description.
-	pub description: Option<Str>,
+	pub description:       Option<Str>,
 	/// Supervised worker declaration, not imported by discovery.
-	pub worker:      Option<PythonWorkerDeclaration>,
+	pub worker:            Option<PythonWorkerDeclaration>,
 	/// Static CLI flag contributions discovered before final argument parsing.
 	#[serde(default)]
-	pub cli:         Vec<omp_ext::config::CliContribution>,
+	pub cli:               Vec<omp_ext::config::CliContribution>,
+	/// Fully expanded concrete feature selection from the install snapshot.
+	#[serde(default)]
+	pub selected_features: Box<[Str]>,
+	/// Core-authenticated grant identity for an installed package.
+	#[serde(default)]
+	pub grant:             Option<Arc<ExtensionGrantFacts>>,
 	/// Forward-compatible signed properties projected into typed CONTROL
 	/// declarations.
 	#[serde(default)]
-	pub manifest:    BTreeMap<Str, serde_json::Value>,
+	pub manifest:          BTreeMap<Str, serde_json::Value>,
 }
 
 impl ExtensionPayload {
 	/// Projects the signed, data-only manifest properties into typed CONTROL
 	/// declaration tables without importing the declared worker.
 	pub fn static_declarations(&self) -> Result<StaticDeclarations, serde_json::Error> {
-		StaticDeclarations::from_properties(&self.manifest)
+		StaticDeclarations::from_properties_selected(&self.manifest, &self.selected_features)
 	}
 }
 
@@ -866,13 +893,26 @@ impl CapabilityRecord {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityDeclaration {
 	/// Stable declaration identity within its manifest.
-	pub id:       Str,
+	pub id:                   Str,
 	/// Content type exposed by this root.
-	pub kind:     CapabilityKind,
+	pub kind:                 CapabilityKind,
 	/// Filesystem root or static manifest payload location.
-	pub root:     PathBuf,
+	pub root:                 PathBuf,
 	/// Larger values override lower-priority sources for the same item key.
-	pub priority: i32,
+	pub priority:             i32,
+	/// Optional extension identity and manifest path retained for attribution.
+	#[serde(default)]
+	pub extension_provenance: Option<ExtensionContentProvenance>,
+}
+/// Provenance retained for one extension-packaged static content row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionContentProvenance {
+	/// Owning admitted extension identity.
+	pub extension_id:  Str,
+	/// Canonical admitted package root.
+	pub package_root:  PathBuf,
+	/// Distribution-relative signed path or glob.
+	pub declared_path: Str,
 }
 
 /// One malformed or unreadable manifest-discovered agent definition.
@@ -911,7 +951,7 @@ pub fn discover_agents(declarations: &[CapabilityDeclaration]) -> AgentDiscovery
 	let ordered = priority_ordered(declarations.to_vec());
 	let warnings = cell::RefCell::new(Vec::new());
 	let definitions = dispatch_first(&ordered, CapabilityKind::Agents, |declaration| {
-		agent_files(&declaration.root)
+		agent_files(declaration)
 			.into_iter()
 			.filter_map(|path| {
 				let key = path
@@ -964,28 +1004,100 @@ pub fn agent_declarations(
 	extension_roots: &[PathBuf],
 ) -> Vec<CapabilityDeclaration> {
 	let mut declarations = vec![CapabilityDeclaration {
-		id:       sf!("project-agents"),
-		kind:     CapabilityKind::Agents,
-		root:     project_root.join(".omp/agents"),
-		priority: PROJECT_AGENT_PRIORITY,
+		id:                   sf!("project-agents"),
+		kind:                 CapabilityKind::Agents,
+		root:                 project_root.join(".omp/agents"),
+		priority:             PROJECT_AGENT_PRIORITY,
+		extension_provenance: None,
 	}];
 	if let Some(home) = user_home {
 		declarations.push(CapabilityDeclaration {
-			id:       sf!("user-agents"),
-			kind:     CapabilityKind::Agents,
-			root:     home.join(".omp/agents"),
-			priority: USER_AGENT_PRIORITY,
+			id:                   sf!("user-agents"),
+			kind:                 CapabilityKind::Agents,
+			root:                 home.join(".omp/agents"),
+			priority:             USER_AGENT_PRIORITY,
+			extension_provenance: None,
 		});
 	}
 	declarations.extend(extension_roots.iter().enumerate().map(|(index, root)| {
 		CapabilityDeclaration {
-			id:       sf!("extension-agents-{}", index),
-			kind:     CapabilityKind::Agents,
-			root:     root.join("agents"),
-			priority: EXTENSION_AGENT_PRIORITY,
+			id:                   sf!("extension-agents-{}", index),
+			kind:                 CapabilityKind::Agents,
+			root:                 root.join("agents"),
+			priority:             EXTENSION_AGENT_PRIORITY,
+			extension_provenance: Some(ExtensionContentProvenance {
+				extension_id:  Str::new(
+					root
+						.file_name()
+						.and_then(ffi::OsStr::to_str)
+						.unwrap_or("extension"),
+				),
+				package_root:  root.clone(),
+				declared_path: sf!("agents/*.md"),
+			}),
 		}
 	}));
 	declarations
+}
+
+/// Lowers selected signed `agents` rows into native discovery declarations.
+pub fn manifest_agent_declarations(
+	extension_id: &Str,
+	package_root: &Path,
+	rows: &[omp_ext::config::StaticDeclaration],
+) -> Result<Vec<CapabilityDeclaration>, AgentManifestError> {
+	let mut declarations = Vec::new();
+	for (index, row) in rows.iter().filter(|row| row.kind == "agents").enumerate() {
+		let path = row.path.as_deref().ok_or(AgentManifestError::MissingPath)?;
+		let relative = Path::new(path);
+		if path.contains('\\')
+			|| relative.is_absolute()
+			|| relative.components().any(|component| {
+				matches!(
+					component,
+					std::path::Component::ParentDir
+						| std::path::Component::RootDir
+						| std::path::Component::Prefix(_)
+				)
+			}) {
+			return Err(AgentManifestError::EscapingPath { path: Str::new(path) });
+		}
+		let prefix = path
+			.find(|character| matches!(character, '*' | '?'))
+			.map_or(path, |wildcard| &path[..wildcard]);
+		let prefix = Path::new(prefix);
+		let root = if prefix.extension().is_some() {
+			prefix.parent().unwrap_or_else(|| Path::new(""))
+		} else {
+			prefix
+		};
+		declarations.push(CapabilityDeclaration {
+			id:                   sf!("{extension_id}:agents:{index}"),
+			kind:                 CapabilityKind::Agents,
+			root:                 package_root.join(root),
+			priority:             EXTENSION_AGENT_PRIORITY,
+			extension_provenance: Some(ExtensionContentProvenance {
+				extension_id:  extension_id.clone(),
+				package_root:  package_root.to_owned(),
+				declared_path: Str::new(path),
+			}),
+		});
+	}
+	Ok(declarations)
+}
+
+/// Rejected extension-packaged agent declaration.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentManifestError {
+	/// The static content row omitted its path.
+	#[error("agent manifest row has no path")]
+	MissingPath,
+	/// The static content row escaped its owning package.
+	#[error("agent manifest path {path} escapes its package")]
+	EscapingPath {
+		/// Rejected path.
+		path: Str,
+	},
 }
 
 /// Canonical key for one immutable agent discovery generation.
@@ -1063,16 +1175,49 @@ pub fn enabled_agents<'a>(
 		})
 }
 
-fn agent_files(root: &Path) -> Vec<PathBuf> {
+fn agent_files(declaration: &CapabilityDeclaration) -> Vec<PathBuf> {
+	let root = &declaration.root;
 	if root.is_file() {
-		return vec![root.to_path_buf()];
+		return vec![root.clone()];
 	}
 	let mut paths = scan_capability_dir(root)
 		.into_iter()
 		.filter(|path| path.extension().and_then(ffi::OsStr::to_str) == Some("md"))
+		.filter(|path| {
+			declaration
+				.extension_provenance
+				.as_ref()
+				.is_none_or(|provenance| {
+					path
+						.strip_prefix(&provenance.package_root)
+						.ok()
+						.and_then(Path::to_str)
+						.is_some_and(|relative| glob_matches(&provenance.declared_path, relative))
+				})
+		})
 		.collect::<Vec<_>>();
 	paths.sort();
 	paths
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+	let pattern = pattern.as_bytes();
+	let value = value.as_bytes();
+	let mut table = vec![vec![false; value.len() + 1]; pattern.len() + 1];
+	table[0][0] = true;
+	for index in 0..pattern.len() {
+		if pattern[index] == b'*' {
+			table[index + 1][0] = table[index][0];
+		}
+		for offset in 0..value.len() {
+			table[index + 1][offset + 1] = match pattern[index] {
+				b'*' => table[index][offset + 1] || table[index + 1][offset],
+				b'?' => table[index][offset],
+				byte => table[index][offset] && byte == value[offset],
+			};
+		}
+	}
+	table[pattern.len()][value.len()]
 }
 
 /// Sorts declarations so dispatch is deterministic without registration order.
@@ -1120,22 +1265,67 @@ mod tests {
 	fn static_priority_and_first_wins_dispatch() {
 		let declarations = priority_ordered(vec![
 			CapabilityDeclaration {
-				id:       "low".into(),
-				kind:     CapabilityKind::Skills,
-				root:     PathBuf::new(),
-				priority: 1,
+				id:                   "low".into(),
+				kind:                 CapabilityKind::Skills,
+				root:                 PathBuf::new(),
+				priority:             1,
+				extension_provenance: None,
 			},
 			CapabilityDeclaration {
-				id:       "high".into(),
-				kind:     CapabilityKind::Skills,
-				root:     PathBuf::new(),
-				priority: 2,
+				id:                   "high".into(),
+				kind:                 CapabilityKind::Skills,
+				root:                 PathBuf::new(),
+				priority:             2,
+				extension_provenance: None,
 			},
 		]);
 		let entries = dispatch_first(&declarations, CapabilityKind::Skills, |declaration| {
 			vec![("same".into(), declaration.id.clone())]
 		});
 		assert_eq!(entries, vec![("same".into(), sf!("high"))]);
+	}
+
+	#[test]
+	fn extension_agent_rows_retain_provenance_and_native_precedence() {
+		let tree = tempfile::tempdir().unwrap();
+		let project = tree.path().join("project");
+		let user = tree.path().join("user");
+		let extension = tree.path().join("extension");
+		let bundled = tree.path().join("bundled");
+		let project_agents = project.join(".omp/agents");
+		let user_agents = user.join(".omp/agents");
+		let extension_agents = extension.join("agents");
+		for (root, description) in [
+			(&project_agents, "project"),
+			(&user_agents, "user"),
+			(&extension_agents, "extension"),
+			(&bundled, "bundled"),
+		] {
+			fs::create_dir_all(root).unwrap();
+			fs::write(
+				root.join("reviewer.md"),
+				format!("---\nname: reviewer\ndescription: {description}\n---\n"),
+			)
+			.unwrap();
+		}
+		let mut declarations =
+			agent_declarations(&project, Some(&user), std::slice::from_ref(&extension));
+		declarations.push(CapabilityDeclaration {
+			id:                   sf!("bundled-agents"),
+			kind:                 CapabilityKind::Agents,
+			root:                 bundled,
+			priority:             BUNDLED_AGENT_PRIORITY,
+			extension_provenance: None,
+		});
+		let discovery = discover_agents(&declarations);
+		assert_eq!(discovery.definitions[0].1.description, "project");
+		let extension_declaration = declarations
+			.iter()
+			.find(|declaration| declaration.priority == EXTENSION_AGENT_PRIORITY)
+			.unwrap();
+		let provenance = extension_declaration.extension_provenance.as_ref().unwrap();
+		assert_eq!(provenance.extension_id, "extension");
+		assert_eq!(provenance.declared_path, "agents/*.md");
 	}
 
 	#[test]

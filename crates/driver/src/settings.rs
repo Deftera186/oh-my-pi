@@ -955,6 +955,40 @@ pub fn current_for_project_with_overlays(
 	Ok(settings)
 }
 
+/// Reads the exact project's extension overlay without walking ancestor
+/// configuration roots.
+pub fn workspace_extension_overlay(
+	project: &Path,
+) -> Result<Option<ExtensionOverlay>, omp_ext::ExtensionError> {
+	let path = project.join(".omp/config.toml");
+	if !path.is_file() {
+		return Ok(None);
+	}
+	let source = std::fs::read_to_string(&path).map_err(|source| {
+		omp_ext::ExtensionError::new(
+			omp_ext::ExtensionCode::EManifestParse,
+			format!("could not read {}: {source}", path.display()),
+		)
+	})?;
+	let value = toml::from_str::<toml::Value>(&source).map_err(|source| {
+		omp_ext::ExtensionError::new(
+			omp_ext::ExtensionCode::EManifestParse,
+			format!("could not parse {}: {source}", path.display()),
+		)
+	})?;
+	value
+		.get("extensions")
+		.cloned()
+		.map(toml::Value::try_into)
+		.transpose()
+		.map_err(|source| {
+			omp_ext::ExtensionError::new(
+				omp_ext::ExtensionCode::EManifestParse,
+				format!("invalid extension overlay in {}: {source}", path.display()),
+			)
+		})
+}
+
 impl Settings {
 	/// Returns the resolved runtime durations.
 	pub const fn runtime_durations(&self) -> RuntimeDurations {

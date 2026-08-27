@@ -123,9 +123,19 @@ impl ProductionCompressHost {
 		let state_dir = omp_env::project_state::directory(&data_dir, &root)
 			.map_err(|_| ProductionError::Session)?;
 		chat::ensure_state_directory(&state_dir).map_err(|_| ProductionError::Session)?;
+		let app_settings = settings_snapshot
+			.project::<crate::settings::Settings>()
+			.map_err(|_| ProductionError::Session)?;
+		let extension_scopes = app_settings
+			.get()
+			.extension_scopes(
+				crate::settings::workspace_extension_overlay(&root)
+					.map_err(|_| ProductionError::Session)?,
+			)
+			.map_err(|_| ProductionError::Session)?;
 		let prompt_settings = discovery::PromptDiscoverySettings {
-			model:   model_settings.clone(),
-			skills:  settings_snapshot
+			model: model_settings.clone(),
+			skills: settings_snapshot
 				.project::<discovery::skills::SkillDiscoverySettings>()
 				.map_err(|_| ProductionError::Session)?
 				.get()
@@ -135,12 +145,18 @@ impl ProductionCompressHost {
 				.map_err(|_| ProductionError::Session)?
 				.get()
 				.clone(),
-			rules:   settings_snapshot
+			rules: settings_snapshot
 				.project::<crate::rulebook::RulebookSettings>()
 				.map_err(|_| ProductionError::Session)?
 				.get()
 				.clone(),
-			native:  discovery::native::NativeDiscoveryOptions::default(),
+			native: discovery::native::NativeDiscoveryOptions::default(),
+			grants: Some(discovery::ExtensionGrantSettings {
+				path:    data_dir.join("ext/grants.toml"),
+				session: Arc::from([]),
+			}),
+			extension_scopes,
+			extension_overrides: Arc::from([]),
 		};
 		let active = discovery::active_prompt_snapshots(&root, &[], &home, &prompt_settings).content;
 		let bridges = builtin_with_content(

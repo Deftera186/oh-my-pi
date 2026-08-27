@@ -127,6 +127,7 @@ pub fn discover(
 				kind: *kind,
 				root: declaration_path,
 				priority,
+				extension_provenance: None,
 			});
 		}
 		for filename in ["mcp.json", ".mcp.json"] {
@@ -141,6 +142,7 @@ pub fn discover(
 					kind: CapabilityKind::Mcps,
 					root: declaration_path,
 					priority,
+					extension_provenance: None,
 				});
 			}
 		}
@@ -209,15 +211,16 @@ mod tests {
 		let package = tree.path().join("package");
 		fs::create_dir_all(package.join("skills")).unwrap();
 		let installed = InstalledRecord {
-			version:    1,
+			version:    2,
 			extensions: vec![omp_ext::lock::InstalledExtension {
-				id:      Str::from("installed"),
-				source:  toml::Value::Table(toml::Table::from_iter([(
+				id:       Str::from("installed"),
+				features: Vec::new(),
+				source:   toml::Value::Table(toml::Table::from_iter([(
 					"link".to_owned(),
 					toml::Value::String(package.to_string_lossy().into_owned()),
 				)])),
-				tier:    TrustTier::Sandboxed,
-				enabled: true,
+				tier:     TrustTier::Sandboxed,
+				enabled:  true,
 			}],
 		};
 		let explicit = [ExtensionRoot {

@@ -630,6 +630,7 @@ impl ProductionProviderApplicationOwner {
 			deadline: None,
 			budget: omp_inference::ExecutionBudget::default(),
 			session: None,
+			response_hooks: Default::default(),
 		};
 		let call = omp_inference::Call::new(meta, operation).with_attribution(
 			omp_inference::InferenceAttribution {

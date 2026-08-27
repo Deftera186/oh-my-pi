@@ -20,6 +20,7 @@ globset = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
 im = { workspace = true }
+jiff = { workspace = true }
 miette = { workspace = true }
 nix = { workspace = true }
 omp-agent = { workspace = true }

@@ -94,6 +94,7 @@ fn factories(generation: &'static str) -> ExternalDomainControlFactories {
 		direct_filesystem: Some(factory("omp.direct_filesystem.request", generation)),
 		credentials:       Some(factory("omp.creds.list", generation)),
 		prompts:           Some(factory("omp.prompts.invalidate", generation)),
+		sessions:          Some(factory("omp.sessions.create", generation)),
 		ui:                Some(factory("omp.ui.presentation", generation)),
 		telemetry:         Some(factory("omp.telemetry.query", generation)),
 		jobs:              Some(factory("omp.jobs.register", generation)),

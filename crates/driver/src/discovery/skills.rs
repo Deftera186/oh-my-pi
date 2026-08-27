@@ -21,6 +21,29 @@ use super::{
 	},
 };
 
+/// Provenance for a skill discovery root.
+#[derive(Clone, Debug)]
+pub enum SkillSourceKind {
+	/// Native, user, foreign-adapter, or managed content.
+	Native,
+	/// Signed static content owned by one admitted extension package.
+	Extension {
+		/// Stable extension identity.
+		extension_id:  Str,
+		/// Canonical package containment root.
+		package_root:  PathBuf,
+		/// Signed distribution-relative path or glob.
+		declared_path: Str,
+	},
+	/// Session-bound paths returned by an extension discovery hook.
+	ExtensionDiscovery {
+		/// Stable extension identity.
+		extension_id: Str,
+		/// Exact canonical path admitted from the hook result.
+		path:         PathBuf,
+	},
+}
+
 /// One skill source scanned in caller-defined precedence order.
 #[derive(Clone, Debug)]
 pub struct SkillSource {
@@ -38,6 +61,8 @@ pub struct SkillSource {
 	pub contain_root:        Option<PathBuf>,
 	/// Read-only foreign/package content marker.
 	pub read_only:           bool,
+	/// Native or extension-package provenance.
+	pub kind:                SkillSourceKind,
 }
 
 /// Settings projection applied before skill names claim precedence.
@@ -267,6 +292,7 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 				require_description: true,
 				contain_root: None,
 				read_only: false,
+				kind: SkillSourceKind::Native,
 			}),
 	);
 	for source in &configured_sources {
@@ -297,6 +323,15 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 					},
 				};
 			if !realpaths.insert(canonical.clone()) {
+				continue;
+			}
+			if !matches!(&source.kind, SkillSourceKind::Native)
+				&& fs::metadata(&canonical).is_ok_and(|metadata| metadata.len() > 64_000)
+			{
+				output.warnings.push(SkillWarning {
+					path:    canonical,
+					message: Str::from("extension skill exceeds the 64,000-byte UTF-8 limit"),
+				});
 				continue;
 			}
 			let (header, content) = match parse_skill(&canonical) {
@@ -398,6 +433,11 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 			}
 			let mut provenance = SourceProvenance::native(source.id.clone(), canonical, source.scope);
 			provenance.read_only = source.read_only;
+			if let SkillSourceKind::Extension { extension_id, .. }
+			| SkillSourceKind::ExtensionDiscovery { extension_id, .. } = &source.kind
+			{
+				provenance.installed_package_id = Some(extension_id.clone());
+			}
 			output.declarations.push(DiscoveredCapability::keyed(
 				key,
 				CapabilityPayload::Skills(payload),
@@ -425,6 +465,99 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 	output
 }
 
+/// Lowers signed static `skills` rows to contained, read-only discovery roots.
+pub fn extension_sources(
+	extension_id: &Str,
+	package_root: &Path,
+	rows: &[omp_ext::config::StaticDeclaration],
+) -> Vec<SkillSource> {
+	rows
+		.iter()
+		.filter(|row| row.kind == "skills")
+		.filter_map(|row| {
+			let declared_path = row.path.as_deref()?;
+			let relative = Path::new(declared_path);
+			if declared_path.contains('\\')
+				|| relative.is_absolute()
+				|| relative.components().any(|component| {
+					matches!(
+						component,
+						std::path::Component::ParentDir
+							| std::path::Component::RootDir
+							| std::path::Component::Prefix(_)
+					)
+				}) {
+				return None;
+			}
+			let wildcard = declared_path
+				.find(|character| matches!(character, '*' | '?'))
+				.unwrap_or(declared_path.len());
+			let prefix = Path::new(&declared_path[..wildcard]);
+			let exact_file = wildcard == declared_path.len()
+				&& prefix.file_name().is_some_and(|name| name == "SKILL.md");
+			let root = if exact_file || prefix.extension().is_some() {
+				prefix.parent().unwrap_or_else(|| Path::new(""))
+			} else {
+				prefix
+			};
+			let contain_root = row
+				.metadata
+				.get("contain_root")
+				.and_then(serde_json::Value::as_str)
+				.map(Path::new)
+				.filter(|path| {
+					!path.is_absolute()
+						&& !path.components().any(|component| {
+							matches!(
+								component,
+								std::path::Component::ParentDir
+									| std::path::Component::RootDir
+									| std::path::Component::Prefix(_)
+							)
+						})
+				})
+				.map_or_else(|| package_root.to_path_buf(), |path| package_root.join(path));
+			Some(SkillSource {
+				id:                  extension_id.clone(),
+				root:                package_root.join(root),
+				scope:               SourceScope::Package,
+				include_root:        exact_file,
+				require_description: true,
+				contain_root:        Some(contain_root),
+				read_only:           true,
+				kind:                SkillSourceKind::Extension {
+					extension_id:  extension_id.clone(),
+					package_root:  package_root.to_path_buf(),
+					declared_path: Str::new(declared_path),
+				},
+			})
+		})
+		.collect()
+}
+
+/// Converts already-admitted hook paths into driver discovery sources.
+pub fn contributed_sources(
+	extension_id: &Str,
+	paths: impl IntoIterator<Item = (PathBuf, PathBuf)>,
+) -> Vec<SkillSource> {
+	paths
+		.into_iter()
+		.filter_map(|(path, contain_root)| {
+			let root = path.parent()?.to_path_buf();
+			Some(SkillSource {
+				id: extension_id.clone(),
+				root,
+				scope: SourceScope::Package,
+				include_root: true,
+				require_description: true,
+				contain_root: Some(contain_root),
+				read_only: true,
+				kind: SkillSourceKind::ExtensionDiscovery { extension_id: extension_id.clone(), path },
+			})
+		})
+		.collect()
+}
+
 fn skill_files(source: &SkillSource, warnings: &mut Vec<SkillWarning>) -> Vec<PathBuf> {
 	let mut files = Vec::new();
 	if source.include_root && source.root.join("SKILL.md").is_file() {
@@ -450,6 +583,18 @@ fn skill_files(source: &SkillSource, warnings: &mut Vec<SkillWarning>) -> Vec<Pa
 			message: Str::from("failed to read skills directory"),
 		}),
 		Err(_) => {},
+	}
+	if let SkillSourceKind::Extension { package_root, declared_path, .. } = &source.kind {
+		files.retain(|path| {
+			path
+				.strip_prefix(package_root)
+				.ok()
+				.and_then(Path::to_str)
+				.is_some_and(|relative| glob_matches(declared_path, relative))
+		});
+	}
+	if let SkillSourceKind::ExtensionDiscovery { path, .. } = &source.kind {
+		files.retain(|candidate| candidate == path);
 	}
 	files.sort();
 	files
@@ -563,6 +708,7 @@ mod tests {
 				require_description: true,
 				contain_root:        None,
 				read_only:           false,
+				kind:                SkillSourceKind::Native,
 			},
 			SkillSource {
 				id:                  Str::from("low"),
@@ -572,6 +718,7 @@ mod tests {
 				require_description: true,
 				contain_root:        None,
 				read_only:           false,
+				kind:                SkillSourceKind::Native,
 			},
 		];
 		let result = discover(&sources, &SkillDiscoverySettings::default());
@@ -580,6 +727,43 @@ mod tests {
 			panic!()
 		};
 		assert_eq!(skill.content, "low");
+	}
+
+	#[test]
+	fn extension_contributors_use_existing_first_source_precedence() {
+		let tree = tempfile::tempdir().expect("tree");
+		let first_root = tree.path().join("first");
+		let second_root = tree.path().join("second");
+		let first = first_root.join("review/SKILL.md");
+		let second = second_root.join("review/SKILL.md");
+		fs::create_dir_all(first.parent().expect("first parent")).expect("first directory");
+		fs::create_dir_all(second.parent().expect("second parent")).expect("second directory");
+		fs::write(&first, "---\ndescription: first\n---\nfirst").expect("first skill");
+		fs::write(&second, "---\ndescription: second\n---\nsecond").expect("second skill");
+		let sources = [
+			contributed_sources(&Str::from("publisher.first"), [(first.clone(), first_root)]),
+			contributed_sources(&Str::from("publisher.second"), [(second, second_root)]),
+		]
+		.concat();
+		let result = discover(&sources, &SkillDiscoverySettings::default());
+		assert_eq!(result.declarations.len(), 1);
+		let CapabilityPayload::Skills(skill) = &result.declarations[0].payload else {
+			panic!("skill payload")
+		};
+		assert_eq!(skill.content, "first");
+		assert_eq!(
+			result.declarations[0]
+				.source
+				.installed_package_id
+				.as_deref(),
+			Some("publisher.first")
+		);
+		let frozen = crate::skills::SkillSnapshot::from_declarations(&result.declarations);
+		fs::write(&first, "---\ndescription: first\n---\nupdated").expect("updated skill");
+		assert_eq!(frozen.resolve_body("review"), Some("first"));
+		let reloaded = discover(&sources, &SkillDiscoverySettings::default());
+		let reloaded = crate::skills::SkillSnapshot::from_declarations(&reloaded.declarations);
+		assert_eq!(reloaded.resolve_body("review"), Some("updated"));
 	}
 
 	#[test]

@@ -38,6 +38,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 im = { workspace = true }
 inventory = { workspace = true }
+jiff = { workspace = true }
 omp-agent = { workspace = true }
 omp-ar = { workspace = true }
 omp-collab = { workspace = true }

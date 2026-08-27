@@ -455,15 +455,17 @@ pub async fn production_rpc_registry_with_settings(
 #[derive(Default)]
 pub struct InferenceSessionOverrides {
 	/// Provider pinned by an invocation API-key lease.
-	pub provider:              Option<omp_catalog::ProviderId>,
+	pub provider:                Option<omp_catalog::ProviderId>,
 	/// Generic API key held only by the session's credential broker overlay.
-	pub api_key:               Option<SecretString>,
+	pub api_key:                 Option<SecretString>,
 	/// Opaque prompt-cache identity lowered by compatible codecs.
-	pub prompt_cache_affinity: Option<Str>,
+	pub prompt_cache_affinity:   Option<Str>,
 	/// Shared extension-host usage registry allocated before inference assembly.
-	pub usage_fetchers:        Option<UsageFetcherRegistry>,
+	pub usage_fetchers:          Option<UsageFetcherRegistry>,
+	/// Session-owned provider response hook sink.
+	pub provider_response_hooks: Option<omp_inference::ProviderResponseHooks>,
 	/// Exact layered settings snapshot frozen by the session composer.
-	pub settings:              Option<Arc<SettingsSnapshot>>,
+	pub settings:                Option<Arc<SettingsSnapshot>>,
 }
 
 /// Session-owned production inference authorities assembled from one credential
@@ -521,6 +523,7 @@ pub async fn production_inference_for_session(
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
 	let usage_fetchers = overrides.usage_fetchers.unwrap_or_default();
+	let provider_response_hooks = overrides.provider_response_hooks.unwrap_or_default();
 	let invocation_key = match (provider.as_ref(), overrides.api_key) {
 		(Some(provider), Some(secret)) => Some((provider.clone(), secret)),
 		(None, None) => None,
@@ -549,6 +552,7 @@ pub async fn production_inference_for_session(
 		.clone();
 	let rpc = InferenceRpc::new(registry.clone(), sessions, tool_registry)
 		.with_session_overrides(provider, overrides.prompt_cache_affinity)
+		.with_provider_response_hooks(provider_response_hooks)
 		.with_search_settings(search_settings);
 	let auth_control = auth_manager.control_handle();
 	let mcp_oauth = Arc::new(omp_envd::mcp::oauth::McpOAuth::new(

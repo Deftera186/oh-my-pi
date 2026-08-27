@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
 	manifest::SourceScope,
-	skills::{SkillDiscovery, SkillDiscoverySettings, SkillSource, discover},
+	skills::{SkillDiscovery, SkillDiscoverySettings, SkillSource, SkillSourceKind, discover},
 };
 
 /// Returns the isolated managed-skills directory beneath the active agent root.
@@ -36,6 +36,7 @@ pub fn discover_dead_last(agent_root: &Path, settings: &SkillDiscoverySettings) 
 			require_description: true,
 			contain_root:        Some(managed_root),
 			read_only:           false,
+			kind:                SkillSourceKind::Native,
 		}],
 		settings,
 	)

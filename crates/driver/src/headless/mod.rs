@@ -339,9 +339,16 @@ impl HeadlessSession {
 			.map_err(composition)?
 			.get()
 			.resolve_path_scopes(&root, &home);
+		let mut native_discovery = policy.native_discovery.clone();
+		native_discovery.workspace_identity = Some(discovery::workspace_identity(&root));
+		let extension_scopes = settings
+			.extension_scopes(
+				crate::settings::workspace_extension_overlay(&root).map_err(composition)?,
+			)
+			.map_err(composition)?;
 		let prompt_discovery_settings = discovery::PromptDiscoverySettings {
-			model:   model_settings.clone(),
-			skills:  settings_snapshot
+			model: model_settings.clone(),
+			skills: settings_snapshot
 				.project::<discovery::skills::SkillDiscoverySettings>()
 				.map_err(composition)?
 				.get()
@@ -351,12 +358,18 @@ impl HeadlessSession {
 				.map_err(composition)?
 				.get()
 				.clone(),
-			rules:   settings_snapshot
+			rules: settings_snapshot
 				.project::<crate::rulebook::RulebookSettings>()
 				.map_err(composition)?
 				.get()
 				.clone(),
-			native:  policy.native_discovery.clone(),
+			native: native_discovery,
+			grants: Some(discovery::ExtensionGrantSettings {
+				path:    data_dir.join("ext/grants.toml"),
+				session: Arc::from([]),
+			}),
+			extension_scopes,
+			extension_overrides: Arc::from([]),
 		};
 		let prompt_discovery = discovery::active_prompt_snapshots(
 			&root,
@@ -586,11 +599,12 @@ impl HeadlessSession {
 			Arc::clone(&registry),
 			Some(&root),
 			InferenceSessionOverrides {
-				provider:              options.credential_provider,
-				api_key:               options.api_key,
-				prompt_cache_affinity: options.prompt_cache_affinity,
-				usage_fetchers:        Some(environment.usage_fetchers()),
-				settings:              Some(Arc::clone(&settings_snapshot)),
+				provider:                options.credential_provider,
+				api_key:                 options.api_key,
+				prompt_cache_affinity:   options.prompt_cache_affinity,
+				usage_fetchers:          Some(environment.usage_fetchers()),
+				provider_response_hooks: Some(environment.provider_response_hooks()),
+				settings:                Some(Arc::clone(&settings_snapshot)),
 			},
 		)
 		.await

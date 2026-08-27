@@ -43,6 +43,13 @@ use omp_envd::{
 	},
 	worker::{ExtHostSpec, HostKey},
 };
+use omp_ext::{
+	config::{
+		CliSettingOverride, DeploymentManifest, ScopedOverlay, fold_extension,
+		resolve_extension_settings,
+	},
+	trust::{Grant, GrantsFile, grant_covers},
+};
 
 use self::{
 	foreign::ForeignContentSettings,
@@ -62,15 +69,42 @@ use crate::{
 #[derive(Clone, Debug, Default)]
 pub struct PromptDiscoverySettings {
 	/// Model/provider admission and path-scoped provider exclusions.
-	pub model:   omp_catalog::settings::ModelSettings,
+	pub model:               omp_catalog::settings::ModelSettings,
 	/// Skill source, name, and custom-directory policy.
-	pub skills:  SkillDiscoverySettings,
+	pub skills:              SkillDiscoverySettings,
 	/// Read-only foreign content family policy.
-	pub foreign: ForeignContentSettings,
+	pub foreign:             ForeignContentSettings,
 	/// Built-in and blocked-rule policy.
-	pub rules:   RulebookSettings,
+	pub rules:               RulebookSettings,
 	/// Invocation-local native root and installed-record admission policy.
-	pub native:  NativeDiscoveryOptions,
+	pub native:              NativeDiscoveryOptions,
+	/// Durable and session-only operator grants used for installed extension
+	/// admission. `None` preserves embedding callers that own admission.
+	pub grants:              Option<ExtensionGrantSettings>,
+	/// Ordered user then project extension configuration overlays.
+	pub extension_scopes:    Vec<ScopedOverlay>,
+	/// Inert command-line values validated only after the manifest is known.
+	pub extension_overrides: Arc<[CliSettingOverride]>,
+}
+
+/// Grant sources consulted while admitting installed extension workers.
+#[derive(Clone, Debug)]
+pub struct ExtensionGrantSettings {
+	/// Canonical client-side durable grant file.
+	pub path:    PathBuf,
+	/// Session-only grants accepted by the interactive core dialog.
+	pub session: Arc<[Grant]>,
+}
+
+/// One installed extension omitted pending a Core-owned operator decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionGrantRequest {
+	/// Exact grant record to persist or retain for this session.
+	pub grant:                  Grant,
+	/// Canonical capabilities requested by the active manifest.
+	pub requested_capabilities: Arc<[Str]>,
+	/// Capabilities covered by the currently matching durable grant.
+	pub granted_capabilities:   Arc<[Str]>,
 }
 /// One command contributed by native content discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,19 +149,21 @@ fn embedded_workflow_commands() -> [CommandContribution; 1] {
 #[derive(Clone, Debug)]
 pub struct ActiveContentSnapshots {
 	/// Active skills.
-	pub skills:        Arc<SkillSnapshot>,
+	pub skills:           Arc<SkillSnapshot>,
 	/// Active declarative rules.
-	pub rules:         Arc<RuleSnapshot>,
+	pub rules:            Arc<RuleSnapshot>,
 	/// Active native Markdown slash commands in discovery precedence order.
-	pub commands:      Arc<[CommandContribution]>,
+	pub commands:         Arc<[CommandContribution]>,
 	/// Bounded non-fatal diagnostics emitted while loading static content.
-	pub warnings:      Arc<[Str]>,
+	pub warnings:         Arc<[Str]>,
 	/// Frozen declarations from the same startup discovery pass.
-	pub declarations:  Arc<[DiscoveredCapability]>,
+	pub declarations:     Arc<[DiscoveredCapability]>,
 	/// Authenticated native extension workers admitted from those declarations.
-	pub extensions:    Arc<[ExtHostSpec]>,
+	pub extensions:       Arc<[ExtHostSpec]>,
+	/// Installed extension identities awaiting interactive operator consent.
+	pub extension_grants: Arc<[ExtensionGrantRequest]>,
 	/// Environment-bound process custom tools admitted from those declarations.
-	pub process_tools: Arc<custom_tools::ProcessToolFactory>,
+	pub process_tools:    Arc<custom_tools::ProcessToolFactory>,
 }
 
 /// Static prompt inputs frozen together for interactive and headless session
@@ -150,7 +186,7 @@ pub fn active_prompt_snapshots(
 ) -> ActivePromptSnapshots {
 	let disabled_providers = settings.model.resolved_disabled_providers(root, home);
 	let content =
-		active_content_snapshots_with_home(root, home, disabled_providers.as_ref(), settings);
+		active_content_snapshots_with_home(root, home, disabled_providers.as_ref(), settings, &[]);
 	let roots = iter::once(root)
 		.chain(additional_roots.iter().map(PathBuf::as_path))
 		.map(|path| context::GrantedContextRoot {
@@ -184,7 +220,43 @@ fn context_repository_boundary(start: &Path, home: &Path) -> PathBuf {
 /// winners used by a session composition.
 pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
-	active_content_snapshots_with_home(root, &home, &[], &PromptDiscoverySettings::default())
+	active_content_snapshots_with_home(root, &home, &[], &PromptDiscoverySettings::default(), &[])
+}
+
+/// Freezes admitted `resources_discover` skill paths into a new session
+/// snapshot.
+pub fn active_content_snapshots_with_skill_contributions(
+	root: &Path,
+	extension_id: &Str,
+	contributions: &[omp_envd::exthost::dispatch::SkillPathContribution],
+) -> ActiveContentSnapshots {
+	let home = env::var_os("HOME").map_or_else(|| root.to_path_buf(), PathBuf::from);
+	let sources = skills::contributed_sources(
+		extension_id,
+		contributions
+			.iter()
+			.map(|contribution| (contribution.path.clone(), contribution.contain_root.clone())),
+	);
+	active_content_snapshots_with_home(
+		root,
+		&home,
+		&[],
+		&PromptDiscoverySettings::default(),
+		&sources,
+	)
+}
+
+/// Derives the canonical local workspace grant identity used by extension
+/// admission and extension management commands.
+pub fn workspace_identity(root: &Path) -> omp_ext::WorkspaceUri {
+	let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+	let uri = url::Url::from_directory_path(&canonical)
+		.map(|url| url.to_string())
+		.unwrap_or_else(|()| format!("file://{}", canonical.display()));
+	omp_ext::WorkspaceUri {
+		digest: omp_core::sf!("sha256:{}", Hash32::sum(uri.as_bytes()).to_hex()),
+		uri:    Str::from(uri),
+	}
 }
 
 fn active_content_snapshots_with_home(
@@ -192,11 +264,48 @@ fn active_content_snapshots_with_home(
 	home: &Path,
 	disabled_providers: &[Str],
 	settings: &PromptDiscoverySettings,
+	contributed_skill_sources: &[skills::SkillSource],
 ) -> ActiveContentSnapshots {
 	let mut discovered = native::discover_capabilities(root, home, 64, &NativeDiscoveryOptions {
 		skill_settings: settings.skills.clone(),
 		..settings.native.clone()
 	});
+	let extension_skill_sources = discovered
+		.declarations
+		.iter()
+		.filter_map(|declaration| {
+			let CapabilityPayload::Extensions(extension) = &declaration.payload else {
+				return None;
+			};
+			let static_declarations = extension.static_declarations().ok()?;
+			Some(skills::extension_sources(
+				&extension.name,
+				&extension.root,
+				&static_declarations.ordered,
+			))
+		})
+		.flatten()
+		.collect::<Vec<_>>();
+	let extension_skills = skills::discover(&extension_skill_sources, &settings.skills);
+	discovered
+		.declarations
+		.extend(extension_skills.declarations);
+	discovered.warnings.extend(
+		extension_skills
+			.warnings
+			.into_iter()
+			.map(|warning| warning.message),
+	);
+	let contributed_skills = skills::discover(contributed_skill_sources, &settings.skills);
+	discovered
+		.declarations
+		.extend(contributed_skills.declarations);
+	discovered.warnings.extend(
+		contributed_skills
+			.warnings
+			.into_iter()
+			.map(|warning| warning.message),
+	);
 	let foreign = foreign::discover(root, &settings.foreign, &settings.skills);
 	discovered.declarations.extend(foreign.skills);
 	discovered.declarations.extend(foreign.rules);
@@ -218,7 +327,12 @@ fn active_content_snapshots_with_home(
 				.any(|disabled| disabled == provider)
 		})
 	});
-	let (extensions, extension_warnings) = admit_extension_specs(&discovered.declarations);
+	let (extensions, extension_grants, extension_warnings) = admit_extension_specs(
+		&discovered.declarations,
+		settings.grants.as_ref(),
+		&settings.extension_scopes,
+		&settings.extension_overrides,
+	);
 	discovered.warnings.extend(extension_warnings);
 	let admitted_extensions = extensions
 		.iter()
@@ -274,21 +388,41 @@ fn active_content_snapshots_with_home(
 		commands.extend(embedded_workflow_commands());
 	}
 	ActiveContentSnapshots {
-		skills:        Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
-		rules:         Arc::new(RuleSnapshot::from_declarations(
+		skills:           Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
+		rules:            Arc::new(RuleSnapshot::from_declarations(
 			&discovered.declarations,
 			&settings.rules,
 		)),
-		commands:      commands.into(),
-		warnings:      discovered.warnings.into(),
-		declarations:  discovered.declarations.into(),
-		extensions:    extensions.into(),
-		process_tools: Arc::new(process_tools),
+		commands:         commands.into(),
+		warnings:         discovered.warnings.into(),
+		declarations:     discovered.declarations.into(),
+		extensions:       extensions.into(),
+		extension_grants: extension_grants.into(),
+		process_tools:    Arc::new(process_tools),
 	}
 }
-fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostSpec>, Vec<Str>) {
+fn admit_extension_specs(
+	declarations: &[DiscoveredCapability],
+	grant_settings: Option<&ExtensionGrantSettings>,
+	extension_scopes: &[ScopedOverlay],
+	extension_overrides: &[CliSettingOverride],
+) -> (Vec<ExtHostSpec>, Vec<ExtensionGrantRequest>, Vec<Str>) {
+	let durable_grants = grant_settings
+		.map(|settings| GrantsFile::read(&settings.path))
+		.transpose();
+	let durable_grants = match durable_grants {
+		Ok(grants) => grants,
+		Err(error) => {
+			return (Vec::new(), Vec::new(), vec![Str::from(format!(
+				"installed extensions were not admitted: {error}"
+			))]);
+		},
+	};
+	let session_grants = grant_settings
+		.map(|settings| GrantsFile { version: 1, grants: settings.session.as_ref().to_vec() });
 	let mut seen = std::collections::BTreeSet::new();
 	let mut specs = Vec::new();
+	let mut grant_requests = Vec::new();
 	let mut warnings = Vec::new();
 	for declaration in declarations {
 		let CapabilityPayload::Extensions(extension) = &declaration.payload else {
@@ -310,6 +444,108 @@ fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostS
 				continue;
 			},
 		};
+		let mut admitted_tier = extension.grant.as_ref().map(|facts| facts.tier);
+		let requested_capabilities = static_declarations
+			.capability_grants
+			.values()
+			.flat_map(|value| {
+				value
+					.as_array()
+					.into_iter()
+					.flatten()
+					.filter_map(serde_json::Value::as_str)
+					.map(Str::new)
+			})
+			.collect::<std::collections::BTreeSet<_>>();
+		if let Some(_settings) = grant_settings {
+			let Some(facts) = extension.grant.as_ref() else {
+				warnings.push(Str::from(format!(
+					"extension {} was not admitted: installed package has no locked grant identity",
+					extension.name
+				)));
+				continue;
+			};
+			let trusted_link = facts.ship == "link"
+				&& (durable_grants.as_ref().is_some_and(|durable| {
+					grant_covers(
+						durable,
+						&facts.id,
+						&facts.publisher,
+						facts.layer,
+						facts.workspace.as_ref(),
+						&facts.capability_digest,
+						omp_ext::TrustTier::Trusted,
+						&facts.ship,
+					)
+				}) || session_grants.as_ref().is_some_and(|session| {
+					grant_covers(
+						session,
+						&facts.id,
+						&facts.publisher,
+						facts.layer,
+						facts.workspace.as_ref(),
+						&facts.capability_digest,
+						omp_ext::TrustTier::Trusted,
+						&facts.ship,
+					)
+				}));
+			if trusted_link {
+				admitted_tier = Some(omp_ext::TrustTier::Trusted);
+			}
+			let covered = trusted_link
+				|| durable_grants.as_ref().is_some_and(|durable| {
+					grant_covers(
+						durable,
+						&facts.id,
+						&facts.publisher,
+						facts.layer,
+						facts.workspace.as_ref(),
+						&facts.capability_digest,
+						facts.tier,
+						&facts.ship,
+					)
+				}) || session_grants.as_ref().is_some_and(|session| {
+				grant_covers(
+					session,
+					&facts.id,
+					&facts.publisher,
+					facts.layer,
+					facts.workspace.as_ref(),
+					&facts.capability_digest,
+					facts.tier,
+					&facts.ship,
+				)
+			});
+			let unsigned_sandboxed_link = facts.ship == "link"
+				&& facts.tier == omp_ext::TrustTier::Sandboxed
+				&& requested_capabilities.is_empty();
+			if !covered && !unsigned_sandboxed_link {
+				grant_requests.push(ExtensionGrantRequest {
+					grant:                  Grant {
+						id:                facts.id.clone(),
+						publisher:         facts.publisher.clone(),
+						layer:             facts.layer,
+						workspace:         facts.workspace.clone(),
+						capability_digest: facts.capability_digest.clone(),
+						tier:              facts.tier,
+						ship:              facts.ship.clone(),
+						granted_at:        Str::new_static(""),
+						granted_by:        Str::new_static("interactive"),
+					},
+					requested_capabilities: requested_capabilities
+						.iter()
+						.cloned()
+						.collect::<Vec<_>>()
+						.into(),
+					granted_capabilities:   Arc::from([]),
+				});
+				warnings.push(Str::from(format!(
+					"extension {} was not admitted: no exact operator grant covers its capabilities",
+					extension.name
+				)));
+				continue;
+			}
+		}
 		let tools = static_declarations
 			.tools
 			.iter()
@@ -356,19 +592,7 @@ fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostS
 			})
 			.collect::<Vec<_>>();
 		let declarations = DeclarationSet::new(tools, hooks);
-		let requested_grants = static_declarations
-			.capability_grants
-			.values()
-			.flat_map(|value| {
-				value
-					.as_array()
-					.into_iter()
-					.flatten()
-					.filter_map(serde_json::Value::as_str)
-					.map(Str::new)
-			})
-			.collect::<Vec<_>>();
-		let data_grants = omp_envd::policy::Grants::supported(requested_grants);
+		let data_grants = omp_envd::policy::Grants::supported(requested_capabilities.iter().cloned());
 		let declaration_modules = static_declarations
 			.ordered
 			.iter()
@@ -377,30 +601,75 @@ fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostS
 			.collect::<Vec<_>>();
 		let manifest_bytes = std::fs::read(&declaration.source.path).unwrap_or_default();
 		let digest = ArtifactDigest::new(Hash32::sum(&manifest_bytes).into_bytes());
-		let layer = match declaration.source.scope {
-			SourceScope::Project => Str::new_static("project"),
-			SourceScope::User => Str::new_static("user"),
-			SourceScope::Package => Str::new_static("package"),
-			SourceScope::Native => Str::new_static("native"),
-			SourceScope::BuiltIn => Str::new_static("builtin"),
-		};
-		let publisher = declaration
-			.source
-			.installed_package_id
-			.clone()
+		let layer = extension.grant.as_ref().map_or_else(
+			|| match declaration.source.scope {
+				SourceScope::Project => Str::new_static("project"),
+				SourceScope::User => Str::new_static("user"),
+				SourceScope::Package => Str::new_static("package"),
+				SourceScope::Native => Str::new_static("native"),
+				SourceScope::BuiltIn => Str::new_static("builtin"),
+			},
+			|facts| Str::from(facts.layer.to_string()),
+		);
+		let publisher = extension
+			.grant
+			.as_ref()
+			.map(|facts| facts.publisher.clone())
+			.or_else(|| declaration.source.installed_package_id.clone())
 			.unwrap_or_else(|| Str::new_static("local"));
 		let version = extension
 			.manifest
 			.get("version")
 			.and_then(serde_json::Value::as_str)
 			.map_or_else(|| Str::new_static("0"), Str::new);
+		let tier = admitted_tier
+			.map_or_else(|| Str::new_static("native"), |tier| Str::from(tier.to_string()));
+		let settings_schema = extension
+			.manifest
+			.get("settings")
+			.cloned()
+			.map(serde_json::from_value)
+			.transpose();
+		let settings_schema = match settings_schema {
+			Ok(Some(settings)) => settings,
+			Ok(None) => Default::default(),
+			Err(error) => {
+				warnings.push(Str::from(format!(
+					"extension {} was not admitted: invalid settings schema: {error}",
+					extension.name
+				)));
+				continue;
+			},
+		};
+		let deployment_manifest = DeploymentManifest {
+			id: extension.name.clone(),
+			entry: worker.module.clone(),
+			settings: settings_schema,
+			..DeploymentManifest::default()
+		};
+		let configured = fold_extension(extension_scopes, &extension.name);
+		let resolved_settings = match resolve_extension_settings(
+			&deployment_manifest,
+			&configured.settings,
+			extension_overrides,
+		) {
+			Ok(settings) => settings,
+			Err(error) => {
+				warnings
+					.push(Str::from(format!("extension {} was not admitted: {error}", extension.name)));
+				continue;
+			},
+		};
 		let provenance = Provenance::new(
 			publisher,
-			extension.name.clone(),
+			extension
+				.grant
+				.as_ref()
+				.map_or_else(|| extension.name.clone(), |facts| facts.id.clone()),
 			version,
 			digest,
 			layer.clone(),
-			Str::new_static("native"),
+			tier.clone(),
 			declaration
 				.source
 				.revision
@@ -417,16 +686,30 @@ fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostS
 			[],
 			[],
 		);
-		let key = HostKey::new(layer, "native", extension.name.clone());
+		let key = HostKey::new(layer, tier, extension.name.clone());
 		let mut spec = ExtHostSpec::new(key, manifest);
 		spec.data_grants = data_grants;
-		spec.python_site = Some(extension.root.clone());
-		let entry = extension
-			.root
-			.join(worker.module.as_str().replace('.', "/"))
-			.with_extension("py");
-		if entry.is_file() {
-			spec.entry_path = Some(entry);
+		spec.settings = resolved_settings;
+		let python_site = if extension.root.join("src").is_dir() {
+			extension.root.join("src")
+		} else {
+			extension.root.clone()
+		};
+		spec.python_site = Some(python_site.clone());
+		if extension
+			.grant
+			.as_ref()
+			.is_some_and(|facts| facts.ship == "link")
+		{
+			spec.watch_root = Some(extension.root.clone());
+		}
+		let module_path = python_site.join(worker.module.as_str().replace('.', "/"));
+		let module_file = module_path.with_extension("py");
+		let package_file = module_path.join("__init__.py");
+		if module_file.is_file() {
+			spec.entry_path = Some(module_file);
+		} else if package_file.is_file() {
+			spec.entry_path = Some(package_file);
 		}
 		match omp_ext::config::CliContributionSet::build(extension.cli.clone(), []) {
 			Ok(cli) => spec.cli_contributions = cli,
@@ -438,7 +721,15 @@ fn admit_extension_specs(declarations: &[DiscoveredCapability]) -> (Vec<ExtHostS
 		}
 		specs.push(spec);
 	}
-	(specs, warnings)
+	for value in extension_overrides {
+		if !seen.contains(&value.extension) {
+			warnings.push(Str::from(format!(
+				"extension {} was not admitted: setting override targets an unknown extension",
+				value.extension
+			)));
+		}
+	}
+	(specs, grant_requests, warnings)
 }
 
 fn discovery_provider_id(source_id: &str) -> Option<&str> {
@@ -572,6 +863,9 @@ pub const fn route_scope(route: RouteId) -> RouteId {
 mod tests {
 	use std::fs;
 
+	use omp_core::sf;
+	use omp_tools::read::{resolver::Resolve as _, selector::ParsedSelector};
+
 	use super::*;
 
 	#[test]
@@ -598,6 +892,123 @@ mod tests {
 		);
 	}
 
+	#[tokio::test]
+	async fn static_extension_skill_is_frozen_until_the_next_snapshot() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let repo = home.join("repo");
+		let skill = repo.join(".omp/demo/.omp-generated/skills/review/SKILL.md");
+		fs::create_dir_all(skill.parent().expect("skill parent")).expect("skill directory");
+		fs::write(&skill, "---\nname: review\ndescription: 'Review a change.'\n---\n\nfirst\n")
+			.expect("skill");
+		fs::write(
+			repo.join(".omp/extension.json"),
+			r#"{
+				"name":"demo",
+				"declarations":[{
+					"kind":"skills",
+					"path":"demo/.omp-generated/skills/review/SKILL.md",
+					"metadata":{"name":"review","description":"Review a change."}
+				}]
+			}"#,
+		)
+		.expect("manifest");
+
+		let first = active_content_snapshots_with_home(
+			&repo,
+			&home,
+			&[],
+			&PromptDiscoverySettings::default(),
+			&[],
+		);
+		assert_eq!(first.skills.get("review").expect("static skill").body, "first");
+		assert_eq!(first.skills.get("review").expect("static skill").source, "demo");
+		let resolver = crate::skills::SkillResolver::new(Arc::clone(&first.skills));
+		let resolved = resolver
+			.read("review", &ParsedSelector::None)
+			.await
+			.expect("skill://review");
+		assert_eq!(resolved.as_ref(), b"first");
+
+		fs::write(&skill, "---\nname: review\ndescription: 'Review a change.'\n---\n\nsecond\n")
+			.expect("updated skill");
+		assert_eq!(first.skills.get("review").expect("frozen skill").body, "first");
+
+		let reloaded = active_content_snapshots_with_home(
+			&repo,
+			&home,
+			&[],
+			&PromptDiscoverySettings::default(),
+			&[],
+		);
+		assert_eq!(reloaded.skills.get("review").expect("reloaded skill").body, "second");
+	}
+
+	#[test]
+	fn linked_omp_manifest_is_admitted_without_import_and_marks_watch_root() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let repo = home.join("repo");
+		let linked = tree.path().join("demo");
+		fs::create_dir_all(linked.join("src/demo")).expect("linked package");
+		fs::create_dir_all(&repo).expect("repository");
+		fs::write(
+			linked.join("omp.toml"),
+			r#"
+id = "demo"
+entry = "demo"
+
+[[declarations]]
+id = "hello"
+kind = "soft"
+module = "demo"
+key = "hello"
+api = 1
+family = "demo"
+rev = 1
+"#,
+		)
+		.expect("deployment manifest");
+		fs::write(linked.join("src/demo/__init__.py"), "raise AssertionError('must not import')\n")
+			.expect("extension source");
+		let installed_path = tree.path().join("installed.toml");
+		omp_ext::lock::InstalledRecord {
+			version:    2,
+			extensions: vec![omp_ext::lock::InstalledExtension {
+				id:       sf!("demo"),
+				features: Vec::new(),
+				source:   toml::Value::Table(toml::Table::from_iter([(
+					"link".to_owned(),
+					toml::Value::String(linked.display().to_string()),
+				)])),
+				tier:     omp_ext::TrustTier::Sandboxed,
+				enabled:  true,
+			}],
+		}
+		.write(&installed_path)
+		.expect("installed link");
+		let settings = PromptDiscoverySettings {
+			native: native::NativeDiscoveryOptions {
+				client_installed: Some(installed_path),
+				..native::NativeDiscoveryOptions::default()
+			},
+			grants: Some(ExtensionGrantSettings {
+				path:    tree.path().join("grants.toml"),
+				session: Arc::from([]),
+			}),
+			..PromptDiscoverySettings::default()
+		};
+		let snapshot = active_prompt_snapshots(&repo, &[], &home, &settings);
+		assert_eq!(snapshot.content.extensions.len(), 1);
+		let spec = &snapshot.content.extensions[0];
+		assert_eq!(spec.key.extension(), "demo");
+		assert_eq!(spec.key.tier(), "sandboxed");
+		let linked = linked.canonicalize().expect("canonical linked root");
+		assert_eq!(spec.watch_root.as_deref(), Some(linked.as_path()));
+		let entry = linked.join("src/demo/__init__.py");
+		assert_eq!(spec.entry_path.as_deref(), Some(entry.as_path()));
+	}
+
 	#[test]
 	fn native_extension_workers_and_process_tools_are_admitted_from_one_snapshot() {
 		let tree = tempfile::tempdir().expect("tree");
@@ -616,5 +1027,137 @@ mod tests {
 		assert_eq!(snapshot.content.extensions.len(), 1);
 		assert_eq!(snapshot.content.extensions[0].key.extension().as_str(), "demo");
 		assert!(!snapshot.content.process_tools.is_empty());
+	}
+
+	fn installed_extension(root: &Path, capabilities: &[&str]) -> DiscoveredCapability {
+		let manifest = [(sf!("capabilities"), serde_json::json!({"data": capabilities}))]
+			.into_iter()
+			.collect();
+		DiscoveredCapability::keyed(
+			"acme.reviewer",
+			CapabilityPayload::Extensions(manifest::ExtensionPayload {
+				name: sf!("acme.reviewer"),
+				root: root.to_path_buf(),
+				description: None,
+				worker: Some(manifest::PythonWorkerDeclaration { module: sf!("worker"), entry: None }),
+				cli: Vec::new(),
+				selected_features: Box::new([]),
+				grant: Some(Arc::new(manifest::ExtensionGrantFacts {
+					id:                sf!("acme.reviewer"),
+					publisher:         sf!("ed25519:publisher"),
+					layer:             omp_ext::Layer::Client,
+					workspace:         None,
+					capability_digest: sf!("b3:capabilities"),
+					tier:              omp_ext::TrustTier::Sandboxed,
+					ship:              sf!("installed"),
+				})),
+				manifest,
+			}),
+			manifest::SourceProvenance::native(
+				"installed",
+				root.join("extension.json"),
+				SourceScope::Package,
+			),
+		)
+	}
+
+	fn grant_settings(path: &Path, session: Vec<Grant>) -> ExtensionGrantSettings {
+		ExtensionGrantSettings { path: path.to_path_buf(), session: session.into() }
+	}
+
+	#[test]
+	fn cli_override_is_validated_at_admit_and_frozen_into_host_settings() {
+		let tree = tempfile::tempdir().expect("tree");
+		let mut declaration = installed_extension(tree.path(), &[]);
+		let CapabilityPayload::Extensions(extension) = &mut declaration.payload else {
+			panic!("extension payload");
+		};
+		extension.manifest.insert(
+			sf!("settings"),
+			serde_json::json!({
+				"verbose": {"type": "boolean", "default": false}
+			}),
+		);
+		let overrides =
+			[CliSettingOverride::parse("acme.reviewer.verbose=true").expect("generic override")];
+		let (specs, requests, warnings) =
+			admit_extension_specs(&[declaration.clone()], None, &[], &overrides);
+		assert!(requests.is_empty());
+		assert!(warnings.is_empty());
+		assert_eq!(specs.len(), 1);
+		assert_eq!(specs[0].settings["verbose"], serde_json::json!(true));
+
+		let invalid =
+			[CliSettingOverride::parse("acme.reviewer.unknown=true").expect("generic override")];
+		let (specs, _, warnings) = admit_extension_specs(&[declaration], None, &[], &invalid);
+		assert!(specs.is_empty());
+		assert!(
+			warnings
+				.iter()
+				.any(|warning| { warning.contains("acme.reviewer") && warning.contains("unknown") })
+		);
+	}
+
+	#[test]
+	fn non_interactive_ungranted_extension_is_omitted_with_the_existing_diagnostic() {
+		let tree = tempfile::tempdir().expect("tree");
+		let declarations = [installed_extension(tree.path(), &["env.fs.read"])];
+		let settings = grant_settings(&tree.path().join("grants.toml"), Vec::new());
+		let (specs, requests, warnings) =
+			admit_extension_specs(&declarations, Some(&settings), &[], &[]);
+		assert!(specs.is_empty());
+		assert_eq!(requests.len(), 1);
+		assert!(
+			warnings
+				.iter()
+				.any(|warning| warning.contains("was not admitted"))
+		);
+		assert_eq!(requests[0].requested_capabilities.as_ref(), [sf!("env.fs.read")]);
+	}
+
+	#[test]
+	fn allow_once_is_scoped_to_one_session_and_deny_stays_degraded() {
+		let tree = tempfile::tempdir().expect("tree");
+		let declarations = [installed_extension(tree.path(), &["env.fs.read"])];
+		let empty = grant_settings(&tree.path().join("grants.toml"), Vec::new());
+		let (_, requests, _) = admit_extension_specs(&declarations, Some(&empty), &[], &[]);
+		let once = Grant {
+			granted_at: sf!("now"),
+			granted_by: sf!("interactive-once"),
+			..requests[0].grant.clone()
+		};
+		let session = grant_settings(&tree.path().join("grants.toml"), vec![once]);
+		let (admitted, pending, _) = admit_extension_specs(&declarations, Some(&session), &[], &[]);
+		assert_eq!(admitted.len(), 1);
+		assert!(pending.is_empty());
+		let (next_session, denied, warnings) =
+			admit_extension_specs(&declarations, Some(&empty), &[], &[]);
+		assert!(next_session.is_empty());
+		assert_eq!(denied.len(), 1);
+		assert!(
+			warnings
+				.iter()
+				.any(|warning| warning.contains("no exact operator grant"))
+		);
+	}
+
+	#[test]
+	fn allow_persist_prevents_a_subsequent_admission_prompt() {
+		let tree = tempfile::tempdir().expect("tree");
+		let path = tree.path().join("grants.toml");
+		let declarations = [installed_extension(tree.path(), &["env.fs.read", "env.exec"])];
+		let settings = grant_settings(&path, Vec::new());
+		let (_, requests, _) = admit_extension_specs(&declarations, Some(&settings), &[], &[]);
+		let grant = Grant {
+			granted_at: sf!("now"),
+			granted_by: sf!("interactive"),
+			..requests[0].grant.clone()
+		};
+		GrantsFile::persist(&path, grant).expect("persist grant");
+		let (admitted, pending, warnings) =
+			admit_extension_specs(&declarations, Some(&settings), &[], &[]);
+		assert_eq!(admitted.len(), 1);
+		assert!(pending.is_empty());
+		assert!(warnings.is_empty());
 	}
 }

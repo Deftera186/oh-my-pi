@@ -342,21 +342,25 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 					.map(|candidate| candidate.capabilities.clone())
 					.unwrap_or_else(omp_catalog::unknown_capabilities);
 				let mut updated = inherited;
-				if let Some(chat) = updated.chat.as_mut() {
-					if let Some(supports) = model.supports_tools {
-						chat.tools = if supports {
-							Availability::Native(omp_catalog::ToolCapabilities {
-								features:      omp_catalog::ToolFeatureBits::empty(),
-								maximum_tools: None,
-							})
-						} else {
-							Availability::Unsupported
-						};
-					}
-					if let Some(input) = &model.input {
-						chat.input_modalities =
-							Availability::Native(parse_modalities(input, provider, key)?);
-					}
+				updated
+					.operations
+					.insert_kind(omp_catalog::OperationKind::Chat);
+				let chat = updated
+					.chat
+					.get_or_insert_with(omp_catalog::unknown_chat_capabilities);
+				if let Some(supports) = model.supports_tools {
+					chat.tools = if supports {
+						Availability::Native(omp_catalog::ToolCapabilities {
+							features:      omp_catalog::ToolFeatureBits::empty(),
+							maximum_tools: None,
+						})
+					} else {
+						Availability::Unsupported
+					};
+				}
+				if let Some(input) = &model.input {
+					chat.input_modalities =
+						Availability::Native(parse_modalities(input, provider, key)?);
 				}
 				capabilities = Some(updated);
 			}
@@ -495,6 +499,19 @@ fn configured_provider_template<'a>(
 		.expect("embedded catalog has a route template");
 	(provider, route)
 }
+/// Chat-capable capability record with otherwise unknown evidence.
+///
+/// Configured `models.toml` entries are chat models by contract; without the
+/// declared chat operation the router rejects every turn with
+/// `catalog-operation-unsupported`.
+fn configured_chat_capabilities() -> omp_catalog::ModelCapabilities {
+	let mut capabilities = omp_catalog::unknown_capabilities();
+	capabilities
+		.operations
+		.insert_kind(omp_catalog::OperationKind::Chat);
+	capabilities.chat = Some(omp_catalog::unknown_chat_capabilities());
+	capabilities
+}
 
 fn configured_model_record(
 	catalog: &omp_catalog::Catalog,
@@ -526,7 +543,7 @@ fn configured_model_record(
 		display_name: model.name.clone().unwrap_or_else(|| Str::new(key)),
 		wire_ids: Box::new([(route.clone(), WireModelId::from(key))]),
 		routes: Box::new([route]),
-		capabilities: omp_catalog::unknown_capabilities(),
+		capabilities: configured_chat_capabilities(),
 		limits: ModelLimits::default(),
 		thinking: None,
 		thinking_routing: ThinkingRouting::default(),

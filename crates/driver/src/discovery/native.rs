@@ -5,19 +5,21 @@ use std::{
 	env, fs,
 	io::Read,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use omp_core::Str;
-use omp_ext::lock::InstalledRecord;
+use omp_ext::lock::{InstalledRecord, LockFile};
 use omp_walker::WalkRequest;
 use serde::Deserialize;
 
 use super::{
 	containment::contained_existing,
 	manifest::{
-		CapabilityPayload, ContextPayload, DiscoveredCapability, ExtensionPayload, HookPayload,
-		HookPhase, InstructionPayload, PromptPayload, PythonWorkerDeclaration, SettingsPayload,
-		SourceProvenance, SourceScope, SystemPromptPayload, ToolHandlerDeclaration, ToolPayload,
+		CapabilityPayload, ContextPayload, DiscoveredCapability, ExtensionGrantFacts,
+		ExtensionPayload, HookPayload, HookPhase, InstructionPayload, PromptPayload,
+		PythonWorkerDeclaration, SettingsPayload, SourceProvenance, SourceScope, SystemPromptPayload,
+		ToolHandlerDeclaration, ToolPayload,
 	},
 	mcp_ssh::{parse_mcp_file, parse_ssh_file},
 	packages::{self, ExtensionRootMode},
@@ -199,24 +201,27 @@ pub enum NativeRootMode {
 #[derive(Clone, Debug)]
 pub struct NativeDiscoveryOptions {
 	/// Ordered explicit `.omp`/agent roots.
-	pub explicit_roots:    Vec<PathBuf>,
+	pub explicit_roots:     Vec<PathBuf>,
 	/// Explicit-root merge behavior.
-	pub root_mode:         NativeRootMode,
+	pub root_mode:          NativeRootMode,
 	/// Skill source, name, and custom-directory policy for every native root.
-	pub skill_settings:    SkillDiscoverySettings,
+	pub skill_settings:     SkillDiscoverySettings,
 	/// Whether implicit project roots and standalone project files participate.
-	pub include_workspace: bool,
+	pub include_workspace:  bool,
 	/// Authoritative selected-profile installed extension record.
-	pub client_installed:  Option<PathBuf>,
+	pub client_installed:   Option<PathBuf>,
+	/// Canonical workspace identity used only for workspace-layer grant keys.
+	pub workspace_identity: Option<omp_ext::WorkspaceUri>,
 }
 impl Default for NativeDiscoveryOptions {
 	fn default() -> Self {
 		Self {
-			explicit_roots:    Vec::new(),
-			root_mode:         NativeRootMode::Merge,
-			skill_settings:    SkillDiscoverySettings::default(),
-			include_workspace: true,
-			client_installed:  None,
+			explicit_roots:     Vec::new(),
+			root_mode:          NativeRootMode::Merge,
+			skill_settings:     SkillDiscoverySettings::default(),
+			include_workspace:  true,
+			client_installed:   None,
+			workspace_identity: None,
 		}
 	}
 }
@@ -285,7 +290,7 @@ pub fn discover_capabilities(
 		install_records.push(installed.clone());
 	}
 	for (root, scope) in roots {
-		load_root(&root, scope, &root_skill_settings, &mut output);
+		load_root(&root, scope, &root_skill_settings, None, &mut output);
 	}
 	let mut extension_roots = BTreeSet::new();
 	for installed_path in install_records {
@@ -299,11 +304,74 @@ pub fn discover_capabilities(
 				continue;
 			},
 		};
+		let layer = if options.client_installed.as_ref() == Some(&installed_path) {
+			omp_ext::Layer::Client
+		} else {
+			omp_ext::Layer::Workspace
+		};
+		let lock = LockFile::read(&installed_path.with_file_name("omp.lock"), layer).ok();
 		let packages = packages::discover(&installed, &[], ExtensionRootMode::Merge);
 		output.warnings.extend(packages.warnings);
 		for extension in packages.roots {
 			if extension_roots.insert(extension.path.clone()) {
-				load_root(&extension.path, SourceScope::Package, &root_skill_settings, &mut output);
+				let grant = lock
+					.as_ref()
+					.and_then(|lock| {
+						lock
+							.extensions
+							.iter()
+							.find(|locked| locked.id == extension.id)
+					})
+					.map(|locked| {
+						Arc::new(ExtensionGrantFacts {
+							id: locked.id.clone(),
+							publisher: locked.publisher.clone(),
+							layer,
+							workspace: (layer == omp_ext::Layer::Workspace)
+								.then(|| options.workspace_identity.clone())
+								.flatten(),
+							capability_digest: locked.capability_digest.clone(),
+							tier: locked.tier,
+							ship: locked.ship.clone(),
+						})
+					})
+					.or_else(|| {
+						installed
+							.extensions
+							.iter()
+							.find(|installed| {
+								installed.id == extension.id
+									&& installed
+										.source
+										.as_table()
+										.is_some_and(|source| source.contains_key("link"))
+							})
+							.map(|_| {
+								let publisher = Str::from(format!(
+									"unsigned:link:{}",
+									omp_core::Hash32::sum(extension.path.to_string_lossy().as_bytes())
+										.to_hex()
+								));
+								Arc::new(ExtensionGrantFacts {
+									id: extension.id.clone(),
+									publisher,
+									layer,
+									workspace: (layer == omp_ext::Layer::Workspace)
+										.then(|| options.workspace_identity.clone())
+										.flatten(),
+									capability_digest: Str::new_static("unsigned-link"),
+									tier: omp_ext::TrustTier::Sandboxed,
+									ship: Str::new_static("link"),
+								})
+							})
+					});
+				load_root(
+					&extension.path,
+					SourceScope::Package,
+					&root_skill_settings,
+					grant,
+					&mut output,
+				);
 			}
 		}
 	}
@@ -395,6 +463,7 @@ fn load_root(
 	root: &Path,
 	scope: SourceScope,
 	skill_settings: &SkillDiscoverySettings,
+	grant: Option<Arc<ExtensionGrantFacts>>,
 	output: &mut NativeDiscovery,
 ) {
 	let source_id = match scope {
@@ -411,6 +480,7 @@ fn load_root(
 			require_description: true,
 			contain_root: None,
 			read_only: false,
+			kind: skills::SkillSourceKind::Native,
 		}],
 		skill_settings,
 	);
@@ -451,7 +521,7 @@ fn load_root(
 	load_hooks(root, source_id.clone(), scope, output);
 	load_tools(root, source_id.clone(), scope, output);
 	load_settings(root, source_id.clone(), scope, output);
-	load_extension(root, source_id.clone(), scope, output);
+	load_extension(root, source_id.clone(), scope, grant, output);
 
 	for filename in ["mcp.json", ".mcp.json"] {
 		let path = root.join(filename);
@@ -776,21 +846,54 @@ fn load_settings(root: &Path, source_id: Str, scope: SourceScope, output: &mut N
 
 #[derive(Default, Deserialize)]
 struct ExtensionManifest {
-	name:        Option<String>,
-	description: Option<String>,
-	worker:      Option<PythonWorkerDeclaration>,
+	name:              Option<String>,
+	description:       Option<String>,
+	worker:            Option<PythonWorkerDeclaration>,
 	#[serde(default)]
-	cli:         Vec<omp_ext::config::CliContribution>,
+	cli:               Vec<omp_ext::config::CliContribution>,
+	#[serde(default)]
+	selected_features: Box<[Str]>,
 	#[serde(flatten)]
-	extra:       BTreeMap<Str, serde_json::Value>,
+	extra:             BTreeMap<Str, serde_json::Value>,
 }
 
-fn load_extension(root: &Path, source_id: Str, scope: SourceScope, output: &mut NativeDiscovery) {
-	let path = root.join("extension.json");
-	let Some(manifest) = fs::read_to_string(&path)
+fn load_extension(
+	root: &Path,
+	source_id: Str,
+	scope: SourceScope,
+	grant: Option<Arc<ExtensionGrantFacts>>,
+	output: &mut NativeDiscovery,
+) {
+	let legacy_path = root.join("extension.json");
+	let deployment_path = root.join("omp.toml");
+	let (path, manifest) = if let Some(manifest) = fs::read_to_string(&legacy_path)
 		.ok()
 		.and_then(|source| serde_json::from_str::<ExtensionManifest>(&source).ok())
-	else {
+	{
+		(legacy_path, manifest)
+	} else if let Some(manifest) = fs::read_to_string(&deployment_path)
+		.ok()
+		.and_then(|source| omp_ext::config::DeploymentManifest::parse(&source).ok())
+		.filter(|manifest| manifest.validate().is_ok())
+	{
+		let mut extra = BTreeMap::new();
+		extra.insert(
+			Str::new_static("declarations"),
+			serde_json::to_value(&manifest.declarations).unwrap_or_default(),
+		);
+		extra.insert(
+			Str::new_static("settings"),
+			serde_json::to_value(&manifest.settings).unwrap_or_default(),
+		);
+		(deployment_path, ExtensionManifest {
+			name: Some(manifest.id.to_string()),
+			description: None,
+			worker: Some(PythonWorkerDeclaration { module: manifest.entry.clone(), entry: None }),
+			cli: Vec::new(),
+			selected_features: Box::new([]),
+			extra,
+		})
+	} else {
 		return;
 	};
 	let name = manifest.name.as_deref().unwrap_or_else(|| {
@@ -800,12 +903,14 @@ fn load_extension(root: &Path, source_id: Str, scope: SourceScope, output: &mut 
 			.unwrap_or("extension")
 	});
 	let payload = ExtensionPayload {
-		name:        Str::from(name),
-		root:        root.to_path_buf(),
+		name: Str::from(name),
+		root: root.to_path_buf(),
 		description: manifest.description.map(Str::from),
-		worker:      manifest.worker,
-		cli:         manifest.cli,
-		manifest:    manifest.extra,
+		worker: manifest.worker,
+		cli: manifest.cli,
+		selected_features: manifest.selected_features,
+		grant,
+		manifest: manifest.extra,
 	};
 	output.declarations.push(DiscoveredCapability::keyed(
 		name,
@@ -874,7 +979,7 @@ mod tests {
 		.expect("command");
 		fs::write(root.join("commands/broken.md"), "---\ndescription: broken").expect("broken");
 		let mut output = NativeDiscovery::default();
-		load_root(&root, SourceScope::Project, &SkillDiscoverySettings::default(), &mut output);
+		load_root(&root, SourceScope::Project, &SkillDiscoverySettings::default(), None, &mut output);
 		assert!(output.declarations.iter().any(|declaration| {
 			matches!(
 				&declaration.payload,

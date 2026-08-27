@@ -16,6 +16,7 @@ pub mod collab;
 pub mod compress;
 pub mod discovery;
 pub mod export;
+pub mod ext_updates;
 pub mod goal;
 pub mod headless;
 pub mod hub;

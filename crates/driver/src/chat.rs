@@ -20,14 +20,17 @@ use flume::Receiver;
 use futures::StreamExt as _;
 use omp_agent::{
 	Agent, AgentKind, AgentNode, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget,
-	ChildKind, CompletionError, CompletionRequest, Journal, MAX_YIELD_SCHEMA_RETRIES, PromptFacts,
-	RegistryStatus, SubagentDisposition, SubagentLifecycle, SubagentProgressSnapshot,
-	SubagentRunState, SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId, TurnInput,
-	TurnOptions, TurnSession as _, UnexpectedStopClassifier, WorkspaceRootInput,
-	WorkspaceRootsInput, YieldPayloadValidator, project_journal, resolve_completion,
-	scheduler::BudgetReservation,
+	ChildKind, CompletionError, CompletionRequest, EntryKindDecl, Journal, JournalAuthor,
+	JournalGenerations, JournalRequestStamp, MAX_YIELD_SCHEMA_RETRIES, PromptFacts, RegistryStatus,
+	SubagentDisposition, SubagentLifecycle, SubagentProgressSnapshot, SubagentRunState,
+	SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId, TurnInput, TurnOptions,
+	TurnSession as _, UnexpectedStopClassifier, WorkspaceRootInput, WorkspaceRootsInput,
+	YieldPayloadValidator, project_journal, resolve_completion, scheduler::BudgetReservation,
 };
-use omp_catalog::{AuthSpecKind, GrammarBits, model::ProvenanceKind, snapshot};
+use omp_catalog::{
+	AuthSpecKind, GrammarBits, ThinkingEffort, model::ProvenanceKind, settings::ModelSettings,
+	snapshot,
+};
 use omp_core::{ExposeSecret as _, Str, sf};
 use omp_envd::{
 	eval::{
@@ -35,8 +38,9 @@ use omp_envd::{
 		spawn::{SpawnRequestV1, SpawnSchemaMode},
 	},
 	exthost::control::{
-		self, ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-		ControlConnectionIdentity, ControlEffect, ControlProtocolError, FixedControlAuthorityFactory,
+		self, CanonicalSessionCreate, ControlAuthority, ControlAuthorityFactory,
+		ControlCompositionError, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
+		FixedControlAuthorityFactory,
 	},
 };
 use omp_inference::{
@@ -64,9 +68,15 @@ use omp_storage::{
 	atomic,
 	blob::{self, BlobStore},
 	gc,
-	index::{self, IndexedWriteError, NewSession, SessionIndex, SessionKind},
+	index::{
+		self, CreateSessionWrite, EventProjection, IndexedEvent, IndexedWriteError, JournalPosition,
+		NewSession, SessionIndex, SessionInfo, SessionKind,
+	},
 	transcript,
-	transcript::{Header, Kind, SessionId},
+	transcript::{
+		Header, Kind, ModelChange as JournalModelChange, ModelId as JournalModelId,
+		ModelRef as JournalModelRef, ProviderId as JournalProviderId, SessionId, TitleSource,
+	},
 };
 use omp_telemetry::firehose::Firehose;
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
@@ -588,11 +598,12 @@ async fn run_chat_login(
 	let provider = omp_catalog::ProviderId::from(provider);
 	let planner = Router::new(registry.clone(), Duration::from_secs(30));
 	let meta = CallMeta {
-		id:       RequestId::from(format!("chat-auth-{}", omp_core::Ulid::generate())),
-		target:   Target::ProviderService(provider.clone()),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from(format!("chat-auth-{}", omp_core::Ulid::generate())),
+		target:         Target::ProviderService(provider.clone()),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let mut client = Client::new(registry.service(), planner, meta);
 	let answer = client
@@ -1001,12 +1012,10 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 				journal,
 				CHAT_CAPS_BASE,
 			);
-			controls
-				.lock()
-				.insert(node.id.clone(), AgentLoopControls {
-					host:    child.host_control(),
-					control: child.control(),
-				});
+			controls.lock().insert(node.id.clone(), AgentLoopControls {
+				host:    child.host_control(),
+				control: child.control(),
+			});
 			child.set_ttsr_registry(ttsr);
 			let control_binding = if let Some(environment) = &isolated_environment {
 				let binding = environment
@@ -1928,6 +1937,259 @@ fn deterministic_task_summary(prompt: &str) -> Str {
 	Str::from(summary)
 }
 
+/// Connection identity that created one not-yet-live interactive session.
+#[derive(Clone, Debug)]
+struct SessionInjectionOwner {
+	extension:          Str,
+	principal:          omp_core::Principal,
+	host_generation:    u64,
+	session_generation: u64,
+}
+
+/// Active interactive-session control shared by model mutation, session
+/// creation, and post-switch injection handlers.
+pub struct InteractiveSessionControl {
+	root:         PathBuf,
+	sessions_dir: PathBuf,
+	index:        Arc<SessionIndex>,
+	catalog:      Arc<snapshot::Catalog>,
+	settings:     ModelSettings,
+	state:        AgentState,
+	control:      omp_agent::ControlSender,
+	owners:       Mutex<BTreeMap<Str, SessionInjectionOwner>>,
+}
+
+impl InteractiveSessionControl {
+	/// Creates one interactive control owner over the model state and
+	/// authoritative project session index.
+	pub fn new(
+		root: PathBuf,
+		sessions_dir: PathBuf,
+		index: Arc<SessionIndex>,
+		catalog: Arc<snapshot::Catalog>,
+		settings: ModelSettings,
+		state: AgentState,
+		control: omp_agent::ControlSender,
+	) -> Self {
+		Self {
+			root,
+			sessions_dir,
+			index,
+			catalog,
+			settings,
+			state,
+			control,
+			owners: Mutex::new(BTreeMap::new()),
+		}
+	}
+
+	async fn set_model(
+		&self,
+		arguments: &serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let selector = arguments
+			.get("model")
+			.and_then(Value::as_str)
+			.ok_or_else(|| ControlProtocolError::new("ModelSwitchDenied", "model must be a string"))?;
+		let thinking = arguments.get("thinking").and_then(Value::as_str);
+		let mutation = set_active_session_model(
+			self.catalog.as_ref(),
+			&self.settings,
+			&self.state,
+			&self.control,
+			selector,
+			thinking,
+		)
+		.await
+		.map_err(|error| {
+			ControlProtocolError::new("ModelSwitchDenied", error.to_string())
+				.with_details(json!({"model": selector}))
+		})?;
+		Ok(json!({
+			"provider": mutation.model.provider.0,
+			"api": mutation.model.api,
+			"model": mutation.model.model.0,
+		}))
+	}
+
+	/// Admits a newly created session for continuation requests from exactly the
+	/// authenticated extension connection that created it.
+	pub fn admit(&self, session: Str, identity: &ControlConnectionIdentity) {
+		self.owners.lock().insert(session, SessionInjectionOwner {
+			extension:          identity.extension.clone(),
+			principal:          identity.principal.clone(),
+			host_generation:    identity.host_generation,
+			session_generation: identity.session_generation,
+		});
+	}
+
+	fn owned(
+		&self,
+		session: &str,
+		identity: &ControlConnectionIdentity,
+	) -> Result<SessionId, ControlProtocolError> {
+		let owner = self.owners.lock().get(session).cloned().ok_or_else(|| {
+			ControlProtocolError::new(
+				"SessionInjectionDenied",
+				"target session is unknown or was not created by this client",
+			)
+			.with_details(json!({"session": session, "reason": "unknown_or_foreign"}))
+		})?;
+		if owner.extension != identity.extension
+			|| owner.principal != identity.principal
+			|| owner.host_generation != identity.host_generation
+			|| owner.session_generation != identity.session_generation
+		{
+			return Err(
+				ControlProtocolError::new(
+					"SessionInjectionDenied",
+					"target session is owned by another client",
+				)
+				.with_details(json!({"session": session, "reason": "foreign"})),
+			);
+		}
+		let session_id = SessionId(Str::new(session));
+		let info = self
+			.index
+			.get(&session_id)
+			.map_err(|error| {
+				ControlProtocolError::new("SessionInjectionDenied", error.to_string())
+					.with_details(json!({"session": session, "reason": "index"}))
+			})?
+			.ok_or_else(|| {
+				ControlProtocolError::new("SessionInjectionDenied", "target session does not exist")
+					.with_details(json!({"session": session, "reason": "unknown"}))
+			})?;
+		if info.project.as_str() != self.root.to_string_lossy().as_ref() {
+			return Err(
+				ControlProtocolError::new(
+					"SessionInjectionDenied",
+					"target session is outside this client project",
+				)
+				.with_details(json!({"session": session, "reason": "foreign"})),
+			);
+		}
+		Ok(session_id)
+	}
+
+	fn enqueue(
+		&self,
+		context: &control::ControlRequestContext,
+		arguments: &serde_json::Map<String, Value>,
+		session: &str,
+	) -> Result<(), ControlProtocolError> {
+		let invocation = context.invocation.as_ref().ok_or_else(|| {
+			ControlProtocolError::new(
+				"PhaseConflict",
+				"targeted injection requires a session invocation",
+			)
+		})?;
+		let session_id = self.owned(session, &context.connection)?;
+		let message = omp_agent::PeerMessage {
+			id:            Str::from(omp_core::Ulid::generate().to_string()),
+			from:          invocation.session.clone(),
+			to:            session_id.0.clone(),
+			text:          Str::from(
+				arguments
+					.get("prompt")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+			),
+			mode:          match arguments
+				.get("mode")
+				.and_then(Value::as_str)
+				.unwrap_or("next_turn")
+			{
+				"aside" => omp_agent::DeliveryMode::Aside,
+				"steer" => omp_agent::DeliveryMode::Steer,
+				"next_turn" => omp_agent::DeliveryMode::NextTurn,
+				mode => {
+					return Err(ControlProtocolError::new(
+						"InvalidDeliveryMode",
+						format!("unknown delivery mode `{mode}`"),
+					));
+				},
+			},
+			reply_to:      None,
+			sent_ms:       now_ms(),
+			session_id:    invocation.session.clone(),
+			expects_reply: false,
+		};
+		let item = omp_agent::peer_item(&message);
+		let journal_item = item.clone();
+		let turn_id = omp_core::Ulid::generate().to_string();
+		let timestamp = message.sent_ms;
+		let path = self
+			.sessions_dir
+			.join(format!("{}.jsonl", session_id.0.as_str()));
+		let event = IndexedEvent {
+			session:    &session_id,
+			ts_ms:      timestamp,
+			kind:       "turn_input",
+			projection: EventProjection::ThreadItem {
+				item:    &item,
+				prompt:  Some(message.text.as_str()),
+				context: None,
+			},
+		};
+		self
+			.index
+			.append(&event, || {
+				let mut journal = Journal::open(&path)?;
+				let event_index = journal.append_turn_input(timestamp, &turn_id, journal_item, None)?;
+				let byte_watermark = journal.byte_watermark()?;
+				Ok::<_, omp_agent::JournalError>(((), JournalPosition { event_index, byte_watermark }))
+			})
+			.map_err(|error| {
+				ControlProtocolError::new(
+					"SessionInjectionDenied",
+					format!("could not queue target session input: {error}"),
+				)
+				.with_details(json!({"session": session, "reason": "queue"}))
+			})
+	}
+}
+
+fn authorize_active_model_mutation(
+	context: &control::ControlRequestContext,
+) -> Result<(), ControlProtocolError> {
+	let invocation = context.invocation.as_ref().ok_or_else(|| {
+		ControlProtocolError::new(
+			"effects_not_authorized",
+			"operation requires an active effects-authorized invocation",
+		)
+	})?;
+	if !invocation
+		.phase
+		.allows_operation(omp_core::InvocationPhase::EffectsAuthorized)
+	{
+		return Err(
+			ControlProtocolError::new(
+				"effects_not_authorized",
+				"invocation has not reached EFFECTS_AUTHORIZED",
+			)
+			.with_details(json!({"phase": <&'static str>::from(invocation.phase)})),
+		);
+	}
+	let interactive_command = invocation.has_ui
+		&& !invocation.headless
+		&& invocation.turn.is_none()
+		&& invocation.event.is_none()
+		&& invocation.call.is_none()
+		&& invocation.device.is_none();
+	if interactive_command || invocation.device.is_some() {
+		Ok(())
+	} else {
+		Err(
+			ControlProtocolError::new(
+				"ModelSwitchDenied",
+				"model switching is restricted to commands and device bodies",
+			)
+			.with_details(json!({"reason": "invalid_origin"})),
+		)
+	}
+}
+
 /// Host-owned `omp.agents.*` CONTROL authority for one durable chat session.
 ///
 /// Every declared agents operation delegates to the session's live tree,
@@ -1935,6 +2197,7 @@ fn deterministic_task_summary(prompt: &str) -> Str {
 pub struct AgentsControlAuthority<C: TurnClient + Clone + Send + 'static> {
 	expected_session_id: Str,
 	parent:              Arc<ChatParentHost<C>>,
+	session_control:     Option<Arc<InteractiveSessionControl>>,
 }
 struct ChatScheduleDelivery<C: TurnClient + Clone + Send + 'static> {
 	parent: Arc<ChatParentHost<C>>,
@@ -1945,13 +2208,35 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 	/// generation.
 	pub fn new(parent: Arc<ChatParentHost<C>>) -> Self {
 		let expected_session_id = parent.session_id();
-		Self { expected_session_id, parent }
+		Self { expected_session_id, parent, session_control: None }
+	}
+
+	/// Pins an authority to the current model state and connection-owned
+	/// post-switch continuation queue.
+	pub fn with_session_control(
+		parent: Arc<ChatParentHost<C>>,
+		session_control: Arc<InteractiveSessionControl>,
+	) -> Self {
+		let expected_session_id = parent.session_id();
+		Self { expected_session_id, parent, session_control: Some(session_control) }
 	}
 
 	/// Returns the app/driver agents-domain factory required by envd CONTROL
 	/// composition.
 	pub fn factory(parent: Arc<ChatParentHost<C>>) -> Arc<dyn ControlAuthorityFactory> {
 		Arc::new(FixedControlAuthorityFactory::new(Arc::new(Self::new(parent))))
+	}
+
+	/// Returns an agents factory sharing active model state and the
+	/// connection-owned post-switch queue with session creation.
+	pub fn factory_with_session_control(
+		parent: Arc<ChatParentHost<C>>,
+		session_control: Arc<InteractiveSessionControl>,
+	) -> Arc<dyn ControlAuthorityFactory> {
+		Arc::new(FixedControlAuthorityFactory::new(Arc::new(Self::with_session_control(
+			parent,
+			session_control,
+		))))
 	}
 
 	fn ensure_current(&self) -> Result<(), ControlProtocolError> {
@@ -2785,15 +3070,13 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 						"fault": Value::Null,
 					}))
 				},
-				None => {
-					ParentSessionHost::completion(
-						self.parent.as_ref(),
-						Value::Object(bridge),
-						&omp_envd::eval::NoopBridgeProgress,
-					)
-					.await
-					.map_err(|error| Str::from(error.to_string()))
-				},
+				None => ParentSessionHost::completion(
+					self.parent.as_ref(),
+					Value::Object(bridge),
+					&omp_envd::eval::NoopBridgeProgress,
+				)
+				.await
+				.map_err(|error| Str::from(error.to_string())),
 			}
 		};
 		match time::timeout(Duration::from_millis(deadline_ms), request).await {
@@ -2816,8 +3099,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"fell_back": true,
 				"fault": {"reason": "provider", "detail": error.to_string()},
 			})),
-			Ok(Err(error)) => Err(
-				ControlProtocolError::new("CompletionFailed", error.clone()).with_details(json!({
+			Ok(Err(error)) => {
+				Err(ControlProtocolError::new("CompletionFailed", error.clone()).with_details(json!({
 					"reason": error.as_str(),
 					"raw": null,
 					"usage": {
@@ -2830,8 +3113,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 						"cost_usd": 0.0,
 						"wall_ms": 0,
 					},
-				})),
-			),
+				})))
+			},
 			Err(_) if arguments.contains_key("default") => Ok(json!({
 				"text": "",
 				"choice": arguments.get("default"),
@@ -3161,6 +3444,7 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 				| "omp.agents.wait_for"
 				| "omp.agents.peers"
 				| "omp.agents.inject"
+				| "omp.agents.set_model"
 				| "omp.agents.rewind_targets"
 				| "omp.agents.rewind"
 				| "omp.agents.snapshot"
@@ -3206,6 +3490,7 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 				Self::require_capability(context, "subagents")?;
 				Self::require_effects_authorized(context)
 			},
+			"omp.agents.set_model" => authorize_active_model_mutation(context),
 			"omp.agents.broadcast"
 				if arguments.get("scope").and_then(Value::as_str) == Some("project") =>
 			{
@@ -3237,6 +3522,15 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 		self.ensure_current()?;
 		match operation.as_str() {
 			"omp.agents.completion" => self.completion(&context, arguments).await,
+			"omp.agents.set_model" => {
+				let controls = self.session_control.as_ref().ok_or_else(|| {
+					ControlProtocolError::new(
+						"ModelSwitchDenied",
+						"interactive model authority is unavailable",
+					)
+				})?;
+				controls.set_model(&arguments).await
+			},
 			"omp.agents.continuations"
 			| "omp.agents.set_continuation_policy"
 			| "omp.agents.loop_signal"
@@ -3752,6 +4046,18 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 						"agent injection requires a session invocation",
 					)
 				})?;
+				if let Some(target) = arguments.get("session").and_then(Value::as_str)
+					&& target != invocation.session.as_str()
+				{
+					let controls = self.session_control.as_ref().ok_or_else(|| {
+						ControlProtocolError::new(
+							"SessionInjectionDenied",
+							"target-session injection authority is unavailable",
+						)
+					})?;
+					controls.enqueue(&context, &arguments, target)?;
+					return Ok(Value::String("buffered".to_owned()));
+				}
 				let mut routed = arguments.clone();
 				if let Some(prompt) = routed.remove("prompt") {
 					routed.insert("text".to_owned(), prompt);
@@ -5471,11 +5777,15 @@ impl ProviderControlBackend for ChatProviderControlBackend {
 		}
 		let planner = Router::new(registry.clone(), Duration::from_secs(30));
 		let meta = CallMeta {
-			id:       RequestId::from(format!("provider-control-{}", omp_core::Ulid::generate())),
-			target:   Target::ProviderService(provider_id.clone()),
-			deadline: None,
-			budget:   ExecutionBudget::default(),
-			session:  None,
+			id:             RequestId::from(format!(
+				"provider-control-{}",
+				omp_core::Ulid::generate()
+			)),
+			target:         Target::ProviderService(provider_id.clone()),
+			deadline:       None,
+			budget:         ExecutionBudget::default(),
+			session:        None,
+			response_hooks: Default::default(),
 		};
 		let mut client = Client::new(registry.service(), planner, meta);
 		match client
@@ -6333,6 +6643,169 @@ pub fn resume_choices(
 	choices.sort_by_key(|(unpinned, modified, _)| (*unpinned, *modified));
 	Ok(choices.into_iter().map(|(_, _, choice)| choice).collect())
 }
+/// Atomic seeded-session creation failure.
+#[derive(Debug, Error)]
+pub enum SeededSessionError {
+	/// A requested parent is absent or belongs to another project.
+	#[error("requested session parent is not accessible")]
+	InaccessibleParent,
+	/// Staging the new journal failed before durability.
+	#[error("seeded session journal failed before publication")]
+	Journal(#[from] omp_agent::JournalError),
+	/// A staged journal file could not be published.
+	#[error("seeded session file publication failed")]
+	Io(#[from] io::Error),
+	/// The sessions index rejected the request before journal publication.
+	#[error("sessions index rejected seeded session creation")]
+	Index(#[source] index::Error),
+	/// Journal durability succeeded but its acknowledgement is ambiguous.
+	#[error("seeded session durability acknowledgement is indeterminate")]
+	Indeterminate {
+		/// Fused logical operation identity which must not be retried.
+		idempotency_key: Str,
+		/// Journal id which may already be durable.
+		session_id:      SessionId,
+		/// Rebuildable index failure after journal publication.
+		#[source]
+		source:          index::Error,
+	},
+	/// A committed session row was unexpectedly unavailable.
+	#[error("committed seeded session is missing from the sessions index")]
+	MissingIndexRow,
+}
+
+/// Creates, declaratively seeds, and indexes one interactive journal.
+pub fn create_seeded_session(
+	root: &Path,
+	sessions_dir: &Path,
+	session_index: Arc<SessionIndex>,
+	extension: &str,
+	declarations: Vec<EntryKindDecl>,
+	author: JournalAuthor,
+	mut request: CanonicalSessionCreate,
+) -> Result<SessionInfo, SeededSessionError> {
+	let parent = request
+		.parent
+		.as_ref()
+		.map(|parent| SessionId(parent.clone()));
+	if let Some(parent) = &parent {
+		let Some(info) = session_index
+			.get(parent)
+			.map_err(SeededSessionError::Index)?
+		else {
+			return Err(SeededSessionError::InaccessibleParent);
+		};
+		if info.project != root.to_string_lossy().as_ref() {
+			return Err(SeededSessionError::InaccessibleParent);
+		}
+	}
+	let id = Str::from(omp_core::Ulid::generate().to_string());
+	let session_id = SessionId(id.clone());
+	let staged_path = sessions_dir.join(format!(".creating-{}.jsonl", id.as_str()));
+	let final_path = sessions_dir.join(format!("{}.jsonl", id.as_str()));
+	let created_ms = now_ms();
+	let staged = (|| {
+		let mut journal = Journal::create(&staged_path, &Header {
+			v:       4,
+			id:      session_id.clone(),
+			created: created_ms,
+			cwd:     root.to_owned(),
+		})?;
+		journal.set_generations(JournalGenerations {
+			host:    request.host_generation,
+			session: request.session_generation,
+		});
+		journal.declare_entry_kinds(extension, declarations)?;
+		if let Some(parent) = &parent {
+			journal.append_forked_from(created_ms, parent, None)?;
+		}
+		if let Some(title) = request.title.clone() {
+			journal.append_title(created_ms, title, TitleSource::User)?;
+		}
+		let entry_kinds = request
+			.entries
+			.iter()
+			.map(|entry| entry.kind.clone())
+			.collect::<BTreeSet<_>>()
+			.into_iter()
+			.collect::<Vec<_>>();
+		if !request.entries.is_empty() {
+			let stamp = JournalRequestStamp {
+				request_id:         request.idempotency_key.clone(),
+				idempotency_key:    request.idempotency_key.clone(),
+				host_generation:    request.host_generation,
+				session_generation: request.session_generation,
+			};
+			journal.append_custom_atomic(
+				created_ms,
+				std::mem::take(&mut request.entries),
+				&stamp,
+				&author,
+			)?;
+		}
+		if let Some(mut prompt) = request.initial_prompt.take() {
+			prompt.created_at_ms = created_ms;
+			journal.append_optimistic(created_ms, prompt, None)?;
+		}
+		let entry_count = u64::try_from(journal.load()?.len()).unwrap_or(u64::MAX);
+		let watermark = journal.byte_watermark()?;
+		Ok::<_, omp_agent::JournalError>((journal, entry_count, watermark, entry_kinds))
+	})();
+	let (journal, entry_count, watermark, entry_kinds) = match staged {
+		Ok(staged) => staged,
+		Err(error) => {
+			let _ = fs::remove_file(&staged_path);
+			return Err(error.into());
+		},
+	};
+	let root_text = root.to_string_lossy();
+	let new_session = NewSession {
+		id: &session_id,
+		cwd: root_text.as_ref(),
+		project: root_text.as_ref(),
+		created_ms,
+		kind: SessionKind::Interactive,
+		parent: parent.as_ref(),
+		remote: false,
+	};
+	let published = session_index.create_seeded_session(
+		&new_session,
+		request.idempotency_key.as_str(),
+		request.title.as_deref(),
+		entry_count,
+		&entry_kinds,
+		|| {
+			fs::rename(&staged_path, &final_path)?;
+			Ok::<_, io::Error>((journal, watermark))
+		},
+	);
+	let committed = match published {
+		Ok(CreateSessionWrite::Created(_)) => session_id,
+		Ok(CreateSessionWrite::Existing(existing)) => {
+			let _ = fs::remove_file(&staged_path);
+			existing
+		},
+		Err(IndexedWriteError::Journal(source)) => {
+			let _ = fs::remove_file(&staged_path);
+			return Err(source.into());
+		},
+		Err(IndexedWriteError::IndexBeforeJournal(source)) => {
+			let _ = fs::remove_file(&staged_path);
+			return Err(SeededSessionError::Index(source));
+		},
+		Err(IndexedWriteError::IndexAfterJournal { source, .. }) => {
+			return Err(SeededSessionError::Indeterminate {
+				idempotency_key: request.idempotency_key,
+				source,
+				session_id,
+			});
+		},
+	};
+	session_index
+		.get(&committed)
+		.map_err(SeededSessionError::Index)?
+		.ok_or(SeededSessionError::MissingIndexRow)
+}
 
 /// Streamed session-journal probe results consumed by the resume picker.
 struct SessionMetadata {
@@ -6668,6 +7141,126 @@ pub fn apply_launch_tool_selection(
 	})
 }
 
+/// A successfully applied interactive session model mutation.
+#[derive(Clone, Debug)]
+pub struct ActiveModelMutation {
+	/// Canonical catalog key selected for subsequent turns.
+	pub key:            Str,
+	/// Provider/API/model identity returned to extension callers.
+	pub model:          JournalModelRef,
+	/// Selected model context-window limit.
+	pub context_window: Option<u64>,
+	/// Explicit reasoning effort applied with the model, when requested.
+	pub thinking:       Option<Effort>,
+}
+
+/// Failure produced by the same session model-switch seam used by interactive
+/// model commands and extension CONTROL.
+#[derive(Debug, Error)]
+pub enum ActiveModelMutationError {
+	/// The selector did not resolve to an enabled catalog model.
+	#[error("Unknown or disabled model: {0}")]
+	Unknown(Str),
+	/// The resolved model is outside the effective role/model scope.
+	#[error("Model is disabled by the effective model scope: {0}")]
+	Disabled(Str),
+	/// The model has no selectable provider route.
+	#[error("Model {0} has no selectable provider route.")]
+	NoRoute(Str),
+	/// The optional reasoning level is not a portable catalog effort.
+	#[error("unknown thinking level `{0}`")]
+	InvalidThinking(Str),
+	/// The session journal owner refused the durable model override.
+	#[error("Could not save the session model override: {0}")]
+	Journal(Str),
+}
+
+/// Applies one non-durable model/thinking selection to the active interactive
+/// session.
+///
+/// The journal model-change entry commits before the live composition snapshot
+/// changes, so the next turn and crash recovery observe the same selection.
+pub async fn set_active_session_model(
+	catalog: &snapshot::Catalog,
+	settings: &ModelSettings,
+	state: &AgentState,
+	control: &omp_agent::ControlSender,
+	selector: &str,
+	thinking: Option<&str>,
+) -> Result<ActiveModelMutation, ActiveModelMutationError> {
+	let role_selector = settings
+		.role_selector(selector)
+		.map(|_| format!("@{selector}"));
+	let selected = discovery::roles::resolve_role_selector(
+		catalog,
+		settings,
+		role_selector.as_deref().unwrap_or(selector),
+	)
+	.map_err(|_| ActiveModelMutationError::Unknown(Str::new(selector)))?;
+	let spec = catalog
+		.model(&selected.model)
+		.ok_or_else(|| ActiveModelMutationError::Unknown(Str::new(selector)))?;
+	if !discovery::roles::model_selector_allowed(catalog, settings, spec.key.as_str()) {
+		return Err(ActiveModelMutationError::Disabled(Str::new(selector)));
+	}
+	let route = spec
+		.routes
+		.first()
+		.and_then(|route| catalog.route(route))
+		.ok_or_else(|| ActiveModelMutationError::NoRoute(Str::new(selector)))?;
+	let effort = thinking
+		.map(|value| {
+			value
+				.parse::<ThinkingEffort>()
+				.map(catalog_thinking_effort)
+				.map_err(|_| ActiveModelMutationError::InvalidThinking(Str::new(value)))
+		})
+		.transpose()?;
+	let model = JournalModelRef {
+		provider: JournalProviderId(Str::new(route.provider.as_str())),
+		api:      Str::new(route.codec.as_str()),
+		model:    JournalModelId(Str::new(spec.key.as_str())),
+	};
+	control
+		.model_override(now_ms(), JournalModelChange {
+			role:     sf!("temporary"),
+			model:    model.clone(),
+			fallback: false,
+		})
+		.await
+		.map_err(|error| ActiveModelMutationError::Journal(Str::from(error.to_string())))?;
+	let key = Str::new(spec.key.as_str());
+	state.update(|snapshot| {
+		snapshot.turn.params.model = key.to_string();
+		if let Some(effort) = effort {
+			snapshot.turn.params.thinking = Some(inference_pb::Reasoning {
+				effort: effort as i32,
+				..inference_pb::Reasoning::default()
+			});
+		}
+		snapshot.reasoning_dialect =
+			interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
+	});
+	Ok(ActiveModelMutation {
+		key,
+		model,
+		context_window: spec.limits.context_window,
+		thinking: effort,
+	})
+}
+
+const fn catalog_thinking_effort(effort: ThinkingEffort) -> Effort {
+	match effort {
+		ThinkingEffort::Off => Effort::Off,
+		ThinkingEffort::Minimal => Effort::Minimal,
+		ThinkingEffort::Low => Effort::Low,
+		ThinkingEffort::Medium => Effort::Medium,
+		ThinkingEffort::High => Effort::High,
+		ThinkingEffort::XHigh => Effort::Xhigh,
+		ThinkingEffort::Max => Effort::Max,
+	}
+}
+
 /// Resolves one CLI reasoning selection against automatic-thinking policy.
 pub fn thinking_effort(level: ThinkingLevel, auto: AutoThinkingSettings) -> Effort {
 	match level {
@@ -6720,12 +7313,210 @@ mod tests {
 	};
 
 	use futures::Stream;
-	use omp_agent::{InvokeFrame, TurnSession};
+	use omp_agent::{InvokeFrame, PendingCustomEntry, TurnSession};
 	use omp_env::EnvClient;
 	use omp_proto::thread::v1::{Item, Message, Part};
 	use omp_storage::transcript::{Event, ItemRecord, TitleSource, Writer};
 
 	use super::*;
+
+	#[test]
+	fn seeded_session_is_atomic_idempotent_and_does_not_start_a_turn() {
+		use omp_core::{ArtifactDigest, Principal, Provenance};
+
+		let scratch = tempfile::tempdir().expect("scratch");
+		let root = scratch.path().join("project");
+		let sessions = scratch.path().join("sessions");
+		fs::create_dir_all(&root).expect("project");
+		fs::create_dir_all(&sessions).expect("sessions");
+		let index =
+			Arc::new(SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("index"));
+		let parent_id = sf!("parent");
+		create_indexed_journal(
+			&sessions.join("parent.jsonl"),
+			&root,
+			&parent_id,
+			Arc::clone(&index),
+			SessionKind::Interactive,
+			None,
+		)
+		.expect("parent");
+		let declaration =
+			EntryKindDecl::parse("dev.test.seed", "seed.1", true, false, None).expect("declaration");
+		let author = JournalAuthor {
+			principal:  Principal::new(sf!("user"), sf!("User")),
+			provenance: Provenance::new(
+				sf!("publisher"),
+				sf!("dev.test"),
+				sf!("1.0.0"),
+				ArtifactDigest::new([7; 32]),
+				sf!("workspace"),
+				sf!("trusted"),
+				1,
+			),
+		};
+		let request = || CanonicalSessionCreate {
+			title:              Some(sf!("Seeded")),
+			parent:             Some(parent_id.clone()),
+			entries:            vec![PendingCustomEntry {
+				kind:    sf!("dev.test.seed"),
+				rev:     sf!("seed.1"),
+				data:    Some(serde_json::from_str::<Box<RawValue>>(r#"{"value":1}"#).unwrap()),
+				context: None,
+				display: None,
+			}],
+			initial_prompt:     Some(Item {
+				seq:           0,
+				created_at_ms: 0,
+				kind:          Some(item::Kind::Message(Message {
+					role:  Role::User as i32,
+					parts: vec![Part { kind: Some(part::Kind::Text("Continue".to_owned())) }],
+				})),
+				props:         None,
+			}),
+			idempotency_key:    sf!("seed-request"),
+			host_generation:    1,
+			session_generation: 1,
+		};
+		let first = create_seeded_session(
+			&root,
+			&sessions,
+			Arc::clone(&index),
+			"dev.test",
+			vec![declaration.clone()],
+			author.clone(),
+			request(),
+		)
+		.expect("create");
+		let second = create_seeded_session(
+			&root,
+			&sessions,
+			Arc::clone(&index),
+			"dev.test",
+			vec![declaration],
+			author,
+			request(),
+		)
+		.expect("idempotent retry");
+		assert_eq!(first.id, second.id);
+		assert_eq!(first.parent.as_ref().map(|id| id.0.as_str()), Some("parent"));
+		assert_eq!(first.title.as_deref(), Some("Seeded"));
+		assert_eq!(first.turns, 0);
+		assert!(first.entries >= 4);
+		assert_eq!(index.lineage(&first.id).expect("lineage").len(), 2);
+		let journal =
+			Journal::open(&sessions.join(format!("{}.jsonl", first.id.0))).expect("journal");
+		let log = journal.load().expect("load");
+		assert!(!(0..u64::try_from(log.len()).unwrap()).any(|index| {
+			matches!(
+				log.get(index),
+				Some(transcript::Entry::Ok(event)) if matches!(event.kind, Kind::TurnStart(_))
+			)
+		}));
+	}
+
+	#[test]
+	fn targeted_injection_queues_owned_session_and_refuses_missing_target() {
+		use omp_core::{ArtifactDigest, InvocationPhase, LifecyclePhase, Principal};
+
+		let scratch = tempfile::tempdir().expect("scratch");
+		let root = scratch.path().join("project");
+		let sessions = scratch.path().join("sessions");
+		fs::create_dir_all(&root).expect("project");
+		fs::create_dir_all(&sessions).expect("sessions");
+		let index =
+			Arc::new(SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("index"));
+		let target = sf!("target-session");
+		let mut target_journal = create_indexed_journal(
+			&sessions.join("target-session.jsonl"),
+			&root,
+			&target,
+			Arc::clone(&index),
+			SessionKind::Interactive,
+			None,
+		)
+		.expect("target");
+		target_journal.reset(1).expect("materialize target");
+		drop(target_journal);
+		assert!(sessions.join("target-session.jsonl").is_file());
+		let (control, _mailbox) = omp_agent::control_channel();
+		let registry = InteractiveSessionControl::new(
+			root,
+			sessions.clone(),
+			Arc::clone(&index),
+			Arc::new(snapshot::Catalog::try_embedded().expect("catalog").clone()),
+			ModelSettings::default(),
+			AgentState::new(AgentSnapshot::default()),
+			control,
+		);
+		let identity = Arc::new(ControlConnectionIdentity {
+			extension:          sf!("dev.test"),
+			principal:          Principal::new(sf!("user"), sf!("User")),
+			artifact_digest:    Str::from(ArtifactDigest::new([1; 32]).to_string()),
+			layer:              sf!("workspace"),
+			tier:               sf!("trusted"),
+			trust:              sf!("trusted"),
+			host_generation:    4,
+			session_generation: 7,
+			capabilities:       Arc::new(BTreeSet::new()),
+		});
+		registry.admit(target.clone(), identity.as_ref());
+		registry.admit(sf!("missing-session"), identity.as_ref());
+		let context = control::ControlRequestContext {
+			connection: Arc::clone(&identity),
+			request_id: 1,
+			invocation: Some(control::ControlInvocationAuthority {
+				invocation:        sf!("command"),
+				phase:             InvocationPhase::EffectsAuthorized,
+				session:           sf!("source-session"),
+				turn:              None,
+				event:             None,
+				call:              None,
+				device:            None,
+				effects:           Box::new([]),
+				place_kind:        sf!("host"),
+				lifecycle:         LifecyclePhase::Active,
+				roots:             Box::new([]),
+				remote:            false,
+				has_ui:            true,
+				headless:          false,
+				settings:          serde_json::Map::new(),
+				secret_settings:   Box::new([]),
+				data:              None,
+				direct_filesystem: None,
+			}),
+		};
+		assert!(authorize_active_model_mutation(&context).is_ok());
+		let mut hook_context = context.clone();
+		hook_context.invocation.as_mut().expect("invocation").event = Some(sf!("turn_start"));
+		assert_eq!(
+			authorize_active_model_mutation(&hook_context)
+				.expect_err("hooks cannot mutate the active model")
+				.code
+				.as_str(),
+			"ModelSwitchDenied",
+		);
+
+		let arguments = serde_json::Map::from_iter([
+			("prompt".to_owned(), Value::String("Start the follow-up".to_owned())),
+			("mode".to_owned(), Value::String("next_turn".to_owned())),
+		]);
+
+		registry
+			.enqueue(&context, &arguments, target.as_str())
+			.expect("enqueue target");
+		let journal = Journal::open(&sessions.join("target-session.jsonl")).expect("reopen target");
+		let (_, pending) = journal
+			.pending_input_submission()
+			.expect("pending target input");
+		assert_eq!(pending.len(), 1);
+
+		let refused = registry
+			.enqueue(&context, &arguments, "missing-session")
+			.expect_err("missing session");
+		assert_eq!(refused.code.as_str(), "SessionInjectionDenied");
+		assert_eq!(refused.details["reason"], "unknown");
+	}
 
 	#[test]
 	fn title_auxiliary_options_pin_greedy_non_reasoning_sampling() {
@@ -6762,60 +7553,76 @@ mod tests {
 		assert_eq!(thinking_effort(ThinkingLevel::XHigh, auto), Effort::Xhigh,);
 	}
 
-	#[test]
-	fn model_selector_resolution_covers_keys_aliases_routes_and_unknowns() {
+	#[tokio::test]
+	async fn active_model_switch_updates_next_turn_through_the_builtin_seam() {
+		let scratch = tempfile::tempdir().expect("scratch");
+		let path = scratch.path().join("model-switch.jsonl");
+		let journal = Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(sf!("model-switch")),
+			created: 1,
+			cwd:     scratch.path().to_path_buf(),
+		})
+		.expect("journal");
+		let (control, mailbox) = omp_agent::control_channel();
+		let owner = tokio::spawn(async move {
+			let mut journal = journal;
+			mailbox.handle_next(&mut journal).await
+		});
 		let catalog = snapshot::Catalog::try_embedded().expect("embedded catalog");
-		let model = catalog.models().first().expect("catalog model");
-		assert_eq!(
-			resolve_model_selector(catalog, model.key.as_str())
-				.expect("exact key resolves")
-				.as_str(),
+		let settings = ModelSettings::default();
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| {
+				discovery::roles::model_selector_allowed(catalog, &settings, model.key.as_str())
+					&& model
+						.routes
+						.first()
+						.and_then(|route| catalog.route(route))
+						.is_some()
+			})
+			.expect("selectable embedded model");
+		let state = AgentState::new(AgentSnapshot::default());
+
+		let switched = set_active_session_model(
+			catalog,
+			&settings,
+			&state,
+			&control,
 			model.key.as_str(),
-		);
+			Some("high"),
+		)
+		.await
+		.expect("switch model");
+		assert_eq!(switched.key.as_str(), model.key.as_str());
+		assert_eq!(state.snapshot().turn.params.model, model.key.as_str());
 		assert_eq!(
-			resolve_model_selector(catalog, "@smol")
-				.expect("role selector passes through")
-				.as_str(),
-			"@smol",
+			state
+				.snapshot()
+				.turn
+				.params
+				.thinking
+				.as_ref()
+				.map(|thinking| thinking.effort),
+			Some(Effort::High as i32),
 		);
+		assert!(matches!(
+			owner.await.expect("owner"),
+			omp_agent::ControlMailboxEvent::JournalHandled
+		));
 
-		let (unique_route, unique_model) = catalog
-			.routes()
-			.iter()
-			.find_map(|route| {
-				let models = catalog
-					.models()
-					.iter()
-					.filter(|model| model.routes.contains(&route.id))
-					.collect::<Vec<_>>();
-				(models.len() == 1).then(|| (route, models[0]))
-			})
-			.expect("catalog has a uniquely served route");
-		let unique = resolve_model_selector(catalog, unique_route.id.as_str()).unwrap_err();
-		let ChatError::ModelSelectorIsRoute { hint, .. } = &unique else {
-			panic!("expected route error, got {unique}");
-		};
-		assert_eq!(hint.as_str(), format!("; use `--model {}`", unique_model.key));
-
-		let shared_route = catalog
-			.routes()
-			.iter()
-			.find(|route| {
-				catalog
-					.models()
-					.iter()
-					.filter(|model| model.routes.contains(&route.id))
-					.count() > 1
-			})
-			.expect("catalog has a shared route");
-		let shared = resolve_model_selector(catalog, shared_route.id.as_str()).unwrap_err();
-		let ChatError::ModelSelectorIsRoute { hint, .. } = &shared else {
-			panic!("expected route error, got {shared}");
-		};
-		assert!(hint.starts_with("; provider `"), "shared route hint lists candidates: {hint}");
-
-		let unknown = resolve_model_selector(catalog, "__unknown__/__missing__").unwrap_err();
-		assert!(matches!(unknown, ChatError::UnknownModel { .. }));
+		let unknown = set_active_session_model(
+			catalog,
+			&settings,
+			&state,
+			&control,
+			"dev.omp/missing-model",
+			None,
+		)
+		.await
+		.expect_err("unknown model");
+		assert!(matches!(unknown, ActiveModelMutationError::Unknown(_)));
 	}
 
 	/// Port of pi PR #8833: a provider-qualified selector must resolve within

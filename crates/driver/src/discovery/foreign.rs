@@ -195,6 +195,7 @@ pub fn discover(
 				require_description: true,
 				contain_root:        Some(repository_root.to_path_buf()),
 				read_only:           true,
+				kind:                skills::SkillSourceKind::Native,
 			})
 			.collect::<Vec<_>>();
 		let discovered_skills = skills::discover(&skill_sources, &source_skill_settings);
