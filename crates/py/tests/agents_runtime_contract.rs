@@ -161,6 +161,29 @@ async def contract():
         "blob": {"hash": "11" * 32, "size": 7},
         "alt": "image",
     }
+    aside = await omp.agents.completion("what changed?", context="thread")
+    assert aside.text == "allow"
+    op, args = backend.calls[-1]
+    assert op == "omp.agents.completion" and args["context"] == "thread"
+    assert not {"role", "system", "choices", "schema", "max_output_tokens"} & args.keys()
+    for bad in (
+        lambda: omp.agents.completion("x", context="thread", choices=("a",)),
+        lambda: omp.agents.completion("x", context="thread", system="s"),
+        lambda: omp.agents.completion("x", context="thread", role="slow"),
+        lambda: omp.agents.completion("x", context="off"),
+    ):
+        try:
+            await bad()
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError("illegal thread-context completion must raise")
+    try:
+        await omp.agents.completion((omp.Part.text("t"),), context="thread")
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("thread-context prompt must be plain text")
 
     spec = omp.agents.SubagentSpec(
         task="inspect", name="Scout", max_depth=0,

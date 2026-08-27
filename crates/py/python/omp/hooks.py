@@ -202,11 +202,34 @@ class Modify:
     target: CallTarget | None = None
     args: Mapping[str, Any] | None = None
     patch: Mapping[str, Any] | None = None
+    env_overrides: Mapping[str, str | None] | None = None
     reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.args is not None and self.patch is not None:
-            raise HookContractError("Modify args and patch are mutually exclusive")
+        if self.args is not None and (
+            self.patch is not None or self.env_overrides is not None
+        ):
+            raise HookContractError(
+                "Modify args and patch fields are mutually exclusive"
+            )
+        if (
+            self.env_overrides is not None
+            and self.patch is not None
+            and "env_overrides" in self.patch
+        ):
+            raise HookContractError(
+                "Modify env_overrides cannot also appear in patch"
+            )
+        if self.env_overrides is not None and (
+            any(not isinstance(key, str) for key in self.env_overrides)
+            or any(
+                value is not None and not isinstance(value, str)
+                for value in self.env_overrides.values()
+            )
+        ):
+            raise HookContractError(
+                "Modify env_overrides must map strings to strings or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +702,10 @@ def _decision_to_wire(decision: HookDecision) -> dict[str, object]:
                     unset.append(key)
                 else:
                     patch[key] = _wire_value(value)
+        if decision.env_overrides is not None:
+            if patch is None:
+                patch = {}
+            patch["env_overrides"] = _wire_value(decision.env_overrides)
         return {
             "kind": "modify",
             "target": (
@@ -772,10 +799,23 @@ def _decision_from_wire(value: object) -> HookDecision:
             if patch is None:
                 patch = {}
             patch.update((key, UNSET) for key in unset)
+        env_overrides = None
+        if patch is not None and "env_overrides" in patch:
+            env_overrides = patch.pop("env_overrides")
+            if not isinstance(env_overrides, Mapping):
+                raise HookContractError(
+                    "Modify env_overrides response must be a mapping"
+                )
+        decoded_patch = (
+            None
+            if env_overrides is not None and not patch
+            else patch
+        )
         return Modify(
             target=_target_from_wire(target) if target is not None else None,
             args=dict(args) if args is not None else None,
-            patch=patch,
+            patch=decoded_patch,
+            env_overrides=env_overrides,
             reason=reason,
         )
     if kind == "defer":

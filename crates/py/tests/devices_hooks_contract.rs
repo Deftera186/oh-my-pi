@@ -16,10 +16,11 @@ import omp
 from omp import hooks as hook_module
 from omp._registry import registry
 from omp.devices import _dispatch_device
+from omp.events import spec as event_spec
 
 registry.configure_manifest(
     tools=(("dynamic", "integration", 1),),
-    hooks=(("tool_call", "review"),),
+    hooks=(("tool_call", "review"), ("user_bash", "transform")),
     extension="acme/devices-hooks",
 )
 
@@ -39,7 +40,29 @@ async def review(event, ctx):
     assert ctx.extension == "acme/devices-hooks"
     return hook_module.Deny("blocked by subscribed review", code="ACME_POLICY")
 
+
+@omp.hook(
+    "user_bash",
+    phase=omp.HookPhase.TRANSFORM,
+    name="acme.shell-env-second",
+    order=20,
+)
+def shell_env_second(event, ctx):
+    assert isinstance(event, omp.UserBashEvent)
+    assert event.env_overrides == {
+        "BASELINE": "base",
+        "TOKEN_FILE": "/run/token",
+        "REMOVE_ME": None,
+    }
+    return hook_module.Defer()
+
+
 registry.freeze()
+
+user_bash_spec = event_spec("user_bash")
+assert user_bash_spec.payload is omp.UserBashEvent
+assert user_bash_spec.on_failure is omp.OnFailure.DENY
+assert user_bash_spec.fields["env_overrides"] is omp.Composition.REPLACE
 
 
 round_trip_decisions = (
@@ -69,6 +92,9 @@ round_trip_decisions = (
             "filesystem", "read_file", {"path": "/workspace/input"}
         ),
         patch={},
+    ),
+    hook_module.Modify(
+        env_overrides={"TOKEN_FILE": "/run/token", "REMOVE_ME": None}
     ),
     hook_module.Modify(),
     hook_module.Defer("no opinion"),
@@ -357,6 +383,49 @@ async def exercise():
         "reason": "blocked by subscribed review",
         "fatal": False,
         "code": "ACME_POLICY",
+    }
+
+    user_bash = {
+        "command": "printf env",
+        "cwd": "/workspace",
+        "exclude_from_context": True,
+        "bash": None,
+        "env_overrides": {"BASELINE": "base"},
+    }
+    first = hook_module._decision_to_wire(
+        hook_module.Modify(
+            env_overrides={
+                **user_bash["env_overrides"],
+                "TOKEN_FILE": "/run/token",
+                "REMOVE_ME": None,
+            }
+        )
+    )
+    assert first == {
+        "kind": "modify",
+        "target": None,
+        "args": None,
+        "patch": {
+            "env_overrides": {
+                "BASELINE": "base",
+                "TOKEN_FILE": "/run/token",
+                "REMOVE_ME": None,
+            }
+        },
+        "unset": [],
+        "reason": None,
+    }
+    user_bash["env_overrides"] = first["patch"]["env_overrides"]
+    second = await hook_module._dispatch_hook_callback(
+        "user_bash",
+        "transform",
+        "acme.shell-env-second",
+        user_bash,
+        context,
+    )
+    assert second == {
+        "kind": "defer",
+        "note": None,
     }
 
     composed = await omp.hooks.dispatch_hook("tool_call", payload)

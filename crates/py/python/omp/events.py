@@ -685,7 +685,7 @@ class UserBashEvent:
     cwd: EnvPath
     exclude_from_context: bool
     bash: BashIR | None
-    env_overrides: Mapping[str, str]
+    env_overrides: Mapping[str, str | None]
 
 
 @dataclass(frozen=True, slots=True)

@@ -294,11 +294,39 @@ async def completion(
     schema: Mapping[str, object] | None = None,
     default: object = _DEFAULT,
     scope: Literal["turn", "session"] = "turn",
+    context: Literal["none", "thread"] = "none",
     max_output_tokens: int | None = None,
     deadline: Duration = Duration("10s"),
     labels: Mapping[str, str] | None = None,
 ) -> Completion:
-    """Request a budgeted stateless completion from text or typed media parts."""
+    """Request a budgeted stateless completion from text or typed media parts.
+
+    ``context="thread"`` instead runs one non-persisted side-channel turn over
+    the caller's live conversation thread on the session model: the reply sees
+    the full context but never becomes a thread item. Thread-context calls
+    accept only a plain-text prompt; ``role``, ``system``, ``choices``,
+    ``schema``, and ``max_output_tokens`` are stateless-only.
+    """
+    if context not in ("none", "thread"):
+        raise ValueError('completion context must be "none" or "thread"')
+    if context == "thread":
+        if not isinstance(prompt, str):
+            raise TypeError("thread-context completion prompt must be plain text")
+        if (
+            system is not None
+            or choices is not None
+            or schema is not None
+            or max_output_tokens is not None
+        ):
+            raise ValueError(
+                "thread-context completions accept only prompt, default, scope,"
+                " deadline, and labels"
+            )
+        if role != "smol":
+            raise ValueError(
+                "thread-context completions run on the session model;"
+                " role is not selectable"
+            )
     if not isinstance(prompt, str):
         if not isinstance(prompt, Sequence) or any(
             not isinstance(part, (TextPart, BlobPart)) for part in prompt
@@ -318,15 +346,20 @@ async def completion(
         raise ValueError("completion choices and schema are mutually exclusive")
     arguments: dict[str, object] = {
         "prompt": prompt_wire,
-        "role": role,
-        "system": system,
-        "choices": _wire(choices),
-        "schema": _wire(schema),
         "scope": scope,
-        "max_output_tokens": max_output_tokens,
         "deadline_ms": _duration_ms(deadline),
         "labels": _wire(labels or {}),
     }
+    if context == "thread":
+        arguments["context"] = "thread"
+    else:
+        arguments.update(
+            role=role,
+            system=system,
+            choices=_wire(choices),
+            schema=_wire(schema),
+            max_output_tokens=max_output_tokens,
+        )
     if default is not _DEFAULT:
         arguments["default"] = _wire(default)
     row = _mapping(await _request("omp.agents.completion", **arguments), "completion")

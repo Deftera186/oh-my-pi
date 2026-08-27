@@ -310,6 +310,7 @@ class WorkerToolDefinition:
     source_module: str
     kind: str
     place: object
+    effects: object | None
     legacy: bool = False
 
 
@@ -728,6 +729,7 @@ class DeclarationRegistry:
             source_module=source_module,
             kind="legacy",
             place="host",
+            effects=None,
             legacy=True,
         )
         self.register_tool(name, family, rev, handler)
@@ -765,6 +767,7 @@ class DeclarationRegistry:
                     source_module=source_module,
                     kind=kind,
                     place=str(definition.place),
+                    effects=definition.effects,
                 )
             )
         return tuple(projected)
