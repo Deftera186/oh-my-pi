@@ -3,8 +3,9 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use miette::miette;
-use omp_agent::{AgentEvent, TtsrRegistry, TtsrRule, TtsrSettings};
+use omp_agent::{AgentEvent, ControlSender, TtsrRegistry, TtsrRule, TtsrSettings, TurnClient};
 use omp_core::{Str, sf};
+use omp_driver::chat::ChatParentHost;
 use omp_envd::eval::{NoopBridgeProgress, ParentSessionHost};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -63,11 +64,29 @@ struct RuleHeader<'a> {
 	scope:       &'a [String],
 }
 
-pub(crate) async fn ask_btw(parent: &dyn ParentSessionHost, question: &str) -> miette::Result<Str> {
+pub(crate) async fn ask_btw<C>(
+	parent: &ChatParentHost<C>,
+	control: &ControlSender,
+	question: &str,
+) -> miette::Result<Str>
+where
+	C: TurnClient + Clone + Send + 'static,
+{
+	let prompt = format!(
+		"<btw>\nEphemeral side question for the current session:\n{}\n</btw>",
+		question.trim()
+	);
+	if let Ok(thread) = control.project_thread().await {
+		match parent.run_ephemeral_turn(thread, &prompt).await {
+			Ok(Some(response)) => return Ok(response),
+			Ok(None) => {},
+			Err(error) => tracing::debug!(%error, "contextual BTW request failed"),
+		}
+	}
 	let response = parent
 		.completion(
 			json!({
-				"prompt": format!("<btw>\nEphemeral side question for the current session:\n{}\n</btw>", question.trim()),
+				"prompt": prompt,
 				"system": BTW_SYSTEM,
 				"model": "default",
 			}),

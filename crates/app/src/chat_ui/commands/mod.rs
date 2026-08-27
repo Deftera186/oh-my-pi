@@ -24,7 +24,7 @@ pub mod registry;
 pub mod result;
 mod review;
 mod security;
-mod session;
+pub(crate) mod session;
 mod share;
 pub(crate) mod ssh;
 pub(crate) mod utility;

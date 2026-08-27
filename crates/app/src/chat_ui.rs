@@ -10,7 +10,10 @@ use std::{
 	iter, mem,
 	path::{Path, PathBuf},
 	str,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -989,6 +992,9 @@ struct BridgeState {
 	session_path: PathBuf,
 	sessions_dir: PathBuf,
 	title: SessionTitleState,
+	title_generation_in_flight: Arc<AtomicBool>,
+	title_user_set: Arc<AtomicBool>,
+	title_commit_lock: Arc<tokio::sync::Mutex<()>>,
 	title_replan_refresh_pending: bool,
 	local_root: PathBuf,
 	regimes: RegimeHandle,
@@ -1014,6 +1020,7 @@ struct BridgeState {
 	jobs: HashSet<Str>,
 	attempt: u32,
 	turn_started: Option<Instant>,
+	has_history: bool,
 	submit_pending: bool,
 	pending_prompt: Option<PendingPrompt>,
 	part_serial: u64,
@@ -2105,6 +2112,9 @@ where
 		.into_diagnostic()?
 		.get()
 		.resolve_path_scopes(&workspace_root, &settings_home);
+	let title_user_set =
+		Arc::new(AtomicBool::new(session.title.source == Some(transcript::TitleSource::User)));
+	let has_history = !session.initial_items.is_empty() || startup_pending;
 	let mut state = BridgeState {
 		catalog,
 		auth_control: auth_control.clone(),
@@ -2117,6 +2127,9 @@ where
 		session_path: local_session_path.clone(),
 		sessions_dir,
 		title: session.title,
+		title_generation_in_flight: Arc::new(AtomicBool::new(false)),
+		title_user_set,
+		title_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
 		title_replan_refresh_pending: false,
 		local_root,
 		regimes: modes.as_ref().clone(),
@@ -2142,6 +2155,7 @@ where
 		jobs: HashSet::new(),
 		attempt: 0,
 		turn_started: startup_pending.then(Instant::now),
+		has_history,
 		submit_pending: startup_pending,
 		pending_prompt: None,
 		part_serial: 0,
@@ -2181,6 +2195,7 @@ where
 			BackendEvent::ThemePreview(omp_tui::Theme::for_appearance(state.appearance)),
 		);
 	}
+	send_recap_policy(&backend_tx, &state.settings);
 	let chat_seed = ChatSceneSeed {
 		typed_commands: chat_commands,
 		command_usage,
@@ -3476,7 +3491,10 @@ fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 	}
 }
 
-struct LiveCommandHost<'a, R> {
+struct LiveCommandHost<'a, C, R>
+where
+	C: TurnClient + Clone + Send + 'static,
+{
 	mcp_inspector:    &'a omp_envd::McpInspectorHandle,
 	backend:          &'a flume::Sender<BackendEvent>,
 	commands_tx:      &'a flume::Sender<UiCmd>,
@@ -3486,7 +3504,7 @@ struct LiveCommandHost<'a, R> {
 	modes:            &'a RegimeHandle,
 	auth:             Option<&'a ChatAuth>,
 	auth_control:     Option<&'a omp_inference::auth::AuthControlHandle>,
-	parent:           Arc<dyn omp_envd::eval::ParentSessionHost>,
+	parent:           Arc<ChatParentHost<C>>,
 	mailbox:          &'a omp_agent::MailboxSender,
 	extension_reload: &'a omp_envd::ExtensionReloadHandle,
 	data_dir:         &'a Path,
@@ -3542,7 +3560,10 @@ fn append_hotkeys(mut help: String) -> String {
 	help
 }
 
-impl<R> LiveCommandHost<'_, R> {
+impl<C, R> LiveCommandHost<'_, C, R>
+where
+	C: TurnClient + Clone + Send + 'static,
+{
 	fn unavailable(&self, message: &'static str) -> CommandFuture<'static> {
 		send_backend(self.backend, BackendEvent::Error(sf!(message)));
 		silent_command()
@@ -3572,8 +3593,9 @@ impl<R> LiveCommandHost<'_, R> {
 	}
 }
 
-impl<R> ShellCommandHost for LiveCommandHost<'_, R>
+impl<C, R> ShellCommandHost for LiveCommandHost<'_, C, R>
 where
+	C: TurnClient + Clone + Send + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn help(&mut self) -> CommandFuture<'_> {
@@ -3645,8 +3667,9 @@ fn pin_target(selector: &str, choices: &[ResumeChoice]) -> Result<Str, Str> {
 	Ok(first.id.clone())
 }
 
-impl<R> SessionCommandHost for LiveCommandHost<'_, R>
+impl<C, R> SessionCommandHost for LiveCommandHost<'_, C, R>
 where
+	C: TurnClient + Clone + Send + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn clear(&mut self) -> CommandFuture<'_> {
@@ -3658,6 +3681,7 @@ where
 				.into_diagnostic()?;
 			self.state.context_tokens = 0;
 			self.state.context_snapshot = None;
+			self.state.has_history = false;
 			send_backend(self.backend, BackendEvent::HistoryCleared);
 			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
@@ -3753,17 +3777,26 @@ where
 	}
 
 	fn rename(&mut self, title: Str) -> CommandFuture<'_> {
-		Box::pin(async move {
-			if chat_active(self.state.submit_pending, self.bus.phase()) {
-				return Ok(CommandResult::Consumed(ConsumedResult::status(
+		if chat_active(self.state.submit_pending, self.bus.phase()) {
+			return Box::pin(async {
+				Ok(CommandResult::Consumed(ConsumedResult::status(
 					"Wait for the active turn to finish before renaming.",
-				)));
-			}
-			self
+				)))
+			});
+		}
+		let user_set = Arc::clone(&self.state.title_user_set);
+		let was_user_set = user_set.swap(true, Ordering::AcqRel);
+		let commit_lock = Arc::clone(&self.state.title_commit_lock);
+		Box::pin(async move {
+			let _commit = commit_lock.lock().await;
+			if let Err(error) = self
 				.control
 				.set_title(omp_agent::broker_now_ms(), title.clone())
 				.await
-				.into_diagnostic()?;
+			{
+				user_set.store(was_user_set, Ordering::Release);
+				return Err(error).into_diagnostic();
+			}
 			Ok(CommandResult::Consumed(ConsumedResult::status(sf!("Session renamed to `{title}`."))))
 		})
 	}
@@ -3784,6 +3817,7 @@ where
 			match reply_rx.recv_async().await {
 				Ok(Ok((items, text))) => {
 					self.state.tools.clear();
+					self.state.has_history = true;
 					send_backend(self.backend, BackendEvent::HistoryCleared);
 					replay_items(
 						self.backend,
@@ -4003,13 +4037,9 @@ where
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_> {
 		match request {
 			SessionRequest::Info => {
-				let status = sf!(
-					"Model: `{}` · context: {} tokens · queued: {}",
-					self.state.model,
-					self.state.context_tokens,
-					self.state.queued,
-				);
-				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
+				let report =
+					commands::session::render_info(&session_info_facts(self.state, self.session_index));
+				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(report))) })
 			},
 			SessionRequest::Delete { force } => {
 				if chat_active(self.state.submit_pending, self.bus.phase()) {
@@ -4245,8 +4275,9 @@ where
 	}
 }
 
-impl<R> ModelCommandHost for LiveCommandHost<'_, R>
+impl<C, R> ModelCommandHost for LiveCommandHost<'_, C, R>
 where
+	C: TurnClient + Clone + Send + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
@@ -4293,8 +4324,9 @@ where
 	}
 }
 
-impl<R> ConfigCommandHost for LiveCommandHost<'_, R>
+impl<C, R> ConfigCommandHost for LiveCommandHost<'_, C, R>
 where
+	C: TurnClient + Clone + Send + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn settings(&mut self) -> CommandFuture<'_> {
@@ -5024,8 +5056,9 @@ fn advisor_status(status: &AdvisorEngineStatus) -> Str {
 	rendered.into()
 }
 
-impl<R> FlowCommandHost for LiveCommandHost<'_, R>
+impl<C, R> FlowCommandHost for LiveCommandHost<'_, C, R>
 where
+	C: TurnClient + Clone + Send + 'static,
 	R: FnMut() -> miette::Result<Vec<ResumeChoice>> + Send,
 {
 	fn context(&mut self) -> CommandFuture<'_> {
@@ -5385,19 +5418,17 @@ where
 
 	fn btw(&mut self, prompt: Str) -> CommandFuture<'_> {
 		let parent = Arc::clone(&self.parent);
+		let control = self.control.clone();
 		Box::pin(async move {
-			let answer = commands::asides::ask_btw(parent.as_ref(), prompt.as_str()).await?;
+			let answer = commands::asides::ask_btw(parent.as_ref(), &control, prompt.as_str()).await?;
 			Ok(CommandResult::Consumed(ConsumedResult::status(sf!("**BTW**\n\n{}", answer))))
 		})
 	}
 
 	fn tan(&mut self, prompt: Str) -> CommandFuture<'_> {
-		let job_id = commands::asides::spawn_tan(
-			Arc::clone(&self.parent),
-			self.backend.clone(),
-			self.bus.clone(),
-			prompt,
-		);
+		let parent: Arc<dyn omp_envd::eval::ParentSessionHost> = self.parent.clone();
+		let job_id =
+			commands::asides::spawn_tan(parent, self.backend.clone(), self.bus.clone(), prompt);
 		Box::pin(async move {
 			Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
 				"Dispatched background tan `{job_id}`."
@@ -5406,7 +5437,7 @@ where
 	}
 
 	fn omfg(&mut self, instruction: Str) -> CommandFuture<'_> {
-		let parent = Arc::clone(&self.parent);
+		let parent: Arc<dyn omp_envd::eval::ParentSessionHost> = self.parent.clone();
 		let workspace_root = PathBuf::from(self.state.workspace_root.as_str());
 		Box::pin(async move {
 			let path =
@@ -6214,35 +6245,96 @@ where
 	}
 }
 
-async fn maybe_generate_session_title<C>(
-	parent: &ChatParentHost<C>,
+fn maybe_spawn_session_title<C>(
+	parent: &Arc<ChatParentHost<C>>,
 	control: &omp_agent::ControlSender,
-	backend: &flume::Sender<BackendEvent>,
-	state: &mut BridgeState,
+	state: &BridgeState,
 	input: &str,
 	replanned: bool,
 ) where
 	C: TurnClient + Clone + Send + 'static,
 {
-	let mut title = state.title.clone();
-	if !title
-		.generate_online(parent, input, omp_driver::session_title::TITLE_SYSTEM_PROMPT, replanned)
-		.await
+	if env::var_os("OMP_NO_TITLE").is_some()
+		|| state.title_user_set.load(Ordering::Acquire)
+		|| !state.title.should_generate(input, replanned)
+		|| state
+			.title_generation_in_flight
+			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+			.is_err()
 	{
 		return;
 	}
-	let Some(generated) = title.title.clone() else {
-		return;
-	};
-	match control.set_generated_title(now_ms(), generated).await {
-		Ok(_) => {
-			if let Some(title_value) = title.title.as_ref() {
-				send_backend(backend, BackendEvent::SessionTitle(title_value.clone()));
+
+	let parent = Arc::clone(parent);
+	let control = control.clone();
+	let input = Str::new(input);
+	let cwd = state.local_root.clone();
+	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
+	let in_flight = Arc::clone(&state.title_generation_in_flight);
+	let user_set = Arc::clone(&state.title_user_set);
+	let commit_lock = Arc::clone(&state.title_commit_lock);
+	drop(tokio::spawn(async move {
+		let resolved = tokio::task::spawn_blocking(move || {
+			omp_driver::prompt_input::resolve_title_system_prompt(&cwd, &home)
+		})
+		.await;
+		let resolved = match resolved {
+			Ok(Ok(prompt)) => prompt,
+			Ok(Err(error)) => {
+				tracing::debug!(%error, "title system prompt could not be resolved");
+				in_flight.store(false, Ordering::Release);
+				return;
+			},
+			Err(error) => {
+				tracing::debug!(%error, "title system prompt resolution task failed");
+				in_flight.store(false, Ordering::Release);
+				return;
+			},
+		};
+		let embedded = prompt_asset(PromptAssetId::TitleSystem).content;
+		let system_prompt = omp_driver::session_title::title_system_prompt(
+			(resolved.as_str() != embedded).then_some(resolved.as_str()),
+		);
+		if let Some(title) =
+			generate_online_title(parent.as_ref(), input.as_str(), system_prompt.as_str()).await
+		{
+			let _commit = commit_lock.lock().await;
+			if !user_set.load(Ordering::Acquire)
+				&& let Err(error) = control.set_generated_title(now_ms(), title).await
+			{
+				tracing::debug!(%error, "generated session title could not be committed");
 			}
-			state.title = title;
-		},
-		Err(error) => tracing::warn!(%error, "generated session title could not be committed"),
+		}
+		in_flight.store(false, Ordering::Release);
+	}));
+}
+fn send_recap_policy(backend: &flume::Sender<BackendEvent>, settings: &Settings) {
+	send_backend(backend, BackendEvent::RecapPolicy {
+		enabled:      settings.recap.enabled,
+		idle_seconds: u32::try_from(settings.recap.idle_seconds).unwrap_or(u32::MAX),
+	});
+}
+
+fn recap_preview(text: &str) -> Option<Str> {
+	let mut words = text.split_whitespace();
+	let first = words.next()?;
+	let mut one_line = String::with_capacity(text.len().min(280));
+	one_line.push_str(first);
+	for word in words {
+		one_line.push(' ');
+		one_line.push_str(word);
 	}
+	let mut chars = 0;
+	let mut end = 0;
+	for grapheme in xutf::graphemes_str(&one_line) {
+		let grapheme_chars = grapheme.chars().count();
+		if chars + grapheme_chars > 280 {
+			break;
+		}
+		chars += grapheme_chars;
+		end += grapheme.len();
+	}
+	Some(Str::new(&one_line[..end]))
 }
 
 async fn handle_intent<C, R>(
@@ -6291,6 +6383,40 @@ where
 					event.overlay_id
 				)),
 			);
+		},
+		Intent::IdleRecap => {
+			if state.settings.recap.enabled
+				&& !chat_active(state.submit_pending, bus.phase())
+				&& state.has_history
+			{
+				let goal = modes
+					.goal()
+					.filter(|goal| goal.status == GoalStatus::Active)
+					.map(|goal| goal.objective)
+					.or_else(|| state.title.title.clone());
+				let prompt = omp_driver::session_title::recap_user_prompt(goal.as_deref(), None);
+				let parent = Arc::clone(parent);
+				let control = control.clone();
+				let backend = backend.clone();
+				drop(tokio::spawn(async move {
+					let thread = match control.project_thread().await {
+						Ok(thread) => thread,
+						Err(error) => {
+							tracing::debug!(%error, "idle recap thread projection failed");
+							return;
+						},
+					};
+					match parent.run_ephemeral_turn(thread, prompt.as_str()).await {
+						Ok(Some(text)) => {
+							if let Some(preview) = recap_preview(text.as_str()) {
+								send_backend(&backend, BackendEvent::Recap(preview));
+							}
+						},
+						Ok(None) => {},
+						Err(error) => tracing::debug!(%error, "idle recap request failed"),
+					}
+				}));
+			}
 		},
 		Intent::Submit { text, attachments, mode } => {
 			if let Some(handle) = state.collab.clone()
@@ -6692,26 +6818,15 @@ where
 						args.as_str(),
 						SkillInvocationKind::User,
 					);
-					if !chat_active(state.submit_pending, bus.phase()) {
-						let replanned = mem::take(&mut state.title_replan_refresh_pending)
-							&& state.settings.title.refresh_on_replan;
-						let title_input =
-							omp_driver::session_title::skill_title_input(name.as_str(), args.as_str());
-						maybe_generate_session_title(
-							parent,
-							control,
-							backend,
-							state,
-							title_input.as_str(),
-							replanned,
-						)
-						.await;
-					}
+					let active = chat_active(state.submit_pending, bus.phase());
+					let title_replanned = (!active).then(|| {
+						mem::take(&mut state.title_replan_refresh_pending)
+							&& state.settings.title.refresh_on_replan
+					});
 					let mut item = input::user_message(rendered.as_str());
 					let chips = lower_attachments(&mut item, attachments.clone(), |message| {
 						send_backend(backend, BackendEvent::Error(message));
 					});
-					let active = chat_active(state.submit_pending, bus.phase());
 					let delivered = if active {
 						apply_turn_budget(agent_state, budget.as_ref());
 						let delivered = mailbox
@@ -6733,10 +6848,14 @@ where
 							.is_ok()
 					};
 					if delivered {
+						state.has_history = true;
 						send_backend(backend, BackendEvent::UserReplayed {
 							text: Str::new(text.as_str()),
 							chips,
 						});
+						if let Some(replanned) = title_replanned {
+							maybe_spawn_session_title(parent, control, state, text.as_str(), replanned);
+						}
 						if active {
 							state.queued = state.queued.saturating_add(1);
 							state.queued_prompts.push_back(omp_chat_ui::QueuedPrompt {
@@ -6772,19 +6891,10 @@ where
 						);
 					} else {
 						let active = chat_active(state.submit_pending, bus.phase());
-						if !active {
-							let replanned = mem::take(&mut state.title_replan_refresh_pending)
-								&& state.settings.title.refresh_on_replan;
-							maybe_generate_session_title(
-								parent,
-								control,
-								backend,
-								state,
-								prompt_text.as_str(),
-								replanned,
-							)
-							.await;
-						}
+						let title_replanned = (!active).then(|| {
+							mem::take(&mut state.title_replan_refresh_pending)
+								&& state.settings.title.refresh_on_replan
+						});
 						let pending_prompt = (!active).then(|| PendingPrompt {
 							text:        prompt_text.clone(),
 							attachments: attachments.clone(),
@@ -6818,7 +6928,11 @@ where
 								.is_ok()
 						};
 						if delivered {
+							state.has_history = true;
 							send_backend(backend, BackendEvent::UserReplayed { text: prompt_text, chips });
+							if let Some(replanned) = title_replanned {
+								maybe_spawn_session_title(parent, control, state, text.as_str(), replanned);
+							}
 							if active {
 								state.queued = state.queued.saturating_add(1);
 								if let Some(prompt) = queued_prompt {
@@ -6935,6 +7049,7 @@ where
 					.is_ok() && let Ok(Ok((items, text))) = reply_rx.recv_async().await
 				{
 					state.tools.clear();
+					state.has_history = true;
 					send_backend(backend, BackendEvent::HistoryCleared);
 					replay_items(backend, &items, &mut state.tools, &mut state.part_serial, renderers);
 					send_backend(backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
@@ -7113,6 +7228,7 @@ where
 					BackendEvent::SmoothStreamingChanged(state.settings.display.smooth_streaming),
 				);
 			}
+			send_recap_policy(backend, &state.settings);
 			if commit {
 				for change in &changes {
 					let raw = match &change.value {
@@ -7337,6 +7453,7 @@ where
 					match reply_rx.recv_async().await {
 						Ok(Ok(items)) => {
 							state.tools.clear();
+							state.has_history = !items.is_empty();
 							let user_index = state
 								.rewind_targets
 								.iter()
@@ -8416,6 +8533,9 @@ fn handle_agent_event(
 		},
 		AgentEvent::TitleChanged { title, source } => {
 			state.title = SessionTitleState { title: Some(title.clone()), source: Some(*source) };
+			if *source == transcript::TitleSource::User {
+				state.title_user_set.store(true, Ordering::Release);
+			}
 			send_backend(backend, BackendEvent::SessionTitle(title.clone()));
 		},
 		AgentEvent::RunStateChanged { to, .. } => {
@@ -9322,6 +9442,96 @@ fn model_provider(catalog: &Catalog, selector: &str) -> Option<Str> {
 	let route = catalog.route(model.routes.first()?)?;
 	Some(Str::from(route.provider.as_str()))
 }
+/// Resolves a human-readable authentication summary for one provider:
+/// stored accounts first, then populated credential environment variables,
+/// then ambient credential chains.
+fn provider_auth_summary(
+	catalog: &Catalog,
+	provider: &ProviderDef,
+	auth: Option<&omp_inference::auth::AuthControlHandle>,
+) -> Str {
+	let accounts = auth.map_or_else(Vec::new, |control| control.accounts(Some(&provider.id)));
+	if !accounts.is_empty() {
+		let enabled = accounts.iter().filter(|account| account.enabled).count();
+		let mode = if provider_uses_oauth(catalog, provider) {
+			"oauth"
+		} else {
+			"api key"
+		};
+		return if enabled == accounts.len() {
+			sf!("{mode} ({} account{})", accounts.len(), if accounts.len() == 1 { "" } else { "s" })
+		} else {
+			sf!("{mode} ({enabled} of {} accounts enabled)", accounts.len())
+		};
+	}
+	for spec in provider.auth.iter().filter_map(|id| catalog.auth_spec(id)) {
+		for source in &spec.credential_sources {
+			match source {
+				CredentialSourceSpec::Environment { ordered_names } => {
+					if let Some(name) = ordered_names
+						.iter()
+						.find(|name| env::var_os(name.as_str()).is_some_and(|value| !value.is_empty()))
+					{
+						return sf!("env `{name}`");
+					}
+				},
+				CredentialSourceSpec::ApplicationDefault { .. } | CredentialSourceSpec::AwsChain => {
+					return Str::new_static("ambient credential chain");
+				},
+				_ => {},
+			}
+		}
+		if spec.kind == AuthSpecKind::None {
+			return Str::new_static("none required");
+		}
+	}
+	Str::new_static("not authenticated")
+}
+
+/// Collects `/session info` facts from bridge state, the catalog, and the
+/// durable session index.
+fn session_info_facts(state: &BridgeState, index: &SessionIndex) -> commands::session::SessionInfo {
+	let catalog = state.catalog.as_ref();
+	let provider = resolve_model(catalog, &state.model).and_then(|spec| {
+		let route = catalog.route(spec.routes.first()?)?;
+		let provider = catalog.provider(&route.provider)?;
+		Some(commands::session::ProviderInfo {
+			name:         provider.name.clone(),
+			model:        Str::new(spec.key.as_str()),
+			display_name: spec.display_name.clone(),
+			api:          Str::new(route.codec.as_str()),
+			endpoint:     route.endpoint.base_url.clone(),
+			auth:         provider_auth_summary(catalog, provider, state.auth_control.as_ref()),
+		})
+	});
+	let stats = index
+		.session_statistics(&SessionId(state.session_id.clone()), true)
+		.ok();
+	let mut mcp = state
+		.extension_live_mcp
+		.values()
+		.map(|snapshot| commands::session::McpServerInfo {
+			name:   snapshot.server.clone(),
+			health: <&'static str>::from(snapshot.health),
+			tools:  snapshot.tools.len(),
+		})
+		.collect::<Vec<_>>();
+	mcp.sort_by(|left, right| left.name.cmp(&right.name));
+	commands::session::SessionInfo {
+		file: state
+			.session_path
+			.is_file()
+			.then(|| Str::new(state.session_path.to_string_lossy().as_ref())),
+		id: state.session_id.clone(),
+		title: state.title.title.clone(),
+		provider,
+		stats,
+		context_tokens: state.context_tokens,
+		context_window: state.context_window,
+		queued: state.queued,
+		mcp,
+	}
+}
 
 fn model_uses_subscription(catalog: &Catalog, selector: &str) -> bool {
 	resolve_model(catalog, selector)
@@ -10183,6 +10393,9 @@ mod tests {
 			git: None,
 			advisor: None,
 			title: SessionTitleState::default(),
+			title_generation_in_flight: Arc::new(AtomicBool::new(false)),
+			title_user_set: Arc::new(AtomicBool::new(false)),
+			title_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
 			session_path: scratch.join("test-session.jsonl"),
 			sessions_dir: scratch.to_path_buf(),
 			title_replan_refresh_pending: false,
@@ -10211,6 +10424,7 @@ mod tests {
 			jobs: HashSet::new(),
 			attempt: 0,
 			turn_started: None,
+			has_history: false,
 			submit_pending: false,
 			pending_prompt: None,
 			part_serial: 0,
