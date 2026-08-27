@@ -144,7 +144,7 @@ impl fmt::Write for GaugeLabel {
 
 /// Cell plan for the embedded context gauge bridging the status groups.
 ///
-/// Ports pi's `statusLine.contextLine = "embedded"` top-border gauge: a
+/// The `statusLine.contextLine = "embedded"` top-border gauge uses a
 /// proportional fill with the usage percent and context window absorbed as
 /// in-line labels, plus ticks where background speculation starts and where
 /// auto-compaction fires. An unknown window plans a solid used line (no

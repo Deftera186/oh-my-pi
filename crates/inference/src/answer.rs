@@ -1118,7 +1118,7 @@ pub enum UsageStatus {
 
 /// Account-scoped usage or quota window.
 ///
-/// The shape covers Pi's stable bucket IDs and display labels, fixed-point
+/// The shape covers stable bucket IDs and display labels, fixed-point
 /// percent/count/token/USD amounts, model or shared scopes, rolling durations,
 /// reset verbs and timestamps, per-window advisories, and provenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1153,7 +1153,7 @@ pub struct UsageWindow {
 
 /// Account-scoped usage, quota, and balance answer.
 ///
-/// This is the lossless Pi usage contract: windows carry fractional or
+/// This is the lossless usage contract: windows carry fractional or
 /// absolute percent/request/token/USD values (including independent minor-unit
 /// exponents), stable IDs and labels, model/shared scopes, and reset times;
 /// reports add plan and account/source metadata, advisory notes, and saved

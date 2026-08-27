@@ -145,8 +145,8 @@ impl SelectState {
 		scored.into_iter().map(|(_, index)| index).collect()
 	}
 
-	/// Whether typing edits the query directly (pi-style browsers): a
-	/// filterable single select needs no `/` search mode, while multi
+	/// Whether typing edits the query directly: a filterable single select needs
+	/// no `/` search mode, while multi
 	/// selects keep Space for toggling.
 	const fn types_to_filter(&self) -> bool {
 		self.filter && !self.multi
@@ -870,8 +870,8 @@ impl Component for Select {
 		if self.state.filter {
 			let always_on = self.state.types_to_filter();
 			if y < pc.clip && always_on {
-				// pi-style query line: search glyph, live query, and the
-				// real terminal cursor at the insertion point.
+				// Query line: search glyph, live query, and the real terminal cursor at
+				// the insertion point.
 				let mut x = pc.frame.put(
 					rect.x,
 					y,
@@ -1048,7 +1048,7 @@ impl Component for Select {
 	}
 
 	/// Positions the cursor when focus enters: a single select rests on
-	/// its chosen option (pi preselects the active model), otherwise the
+	/// its chosen option (the active model), otherwise the
 	/// entry edge.
 	fn enter(&mut self, forward: bool) {
 		let visible = self.state.visible();
@@ -1163,7 +1163,7 @@ fn option_value(state: &SelectState, index: usize) -> serde_json::Value {
 }
 
 /// Case-insensitive subsequence match, scoring contiguous runs and early
-/// matches higher — pi's `fuzzyRank` shape. `None` when `needle` is not a
+/// matches higher. `None` when `needle` is not a
 /// subsequence of `hay`.
 fn fuzzy_score(hay: &str, needle: &str) -> Option<i32> {
 	let hay: SmallVec<char, 64> = hay.chars().flat_map(char::to_lowercase).collect();

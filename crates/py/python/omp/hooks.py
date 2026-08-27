@@ -298,6 +298,7 @@ class When:
     server: frozenset[str] | None = None
     rev: frozenset[str] | None = None
     path_globs: tuple[str, ...] = ()
+    method_globs: tuple[str, ...] = ()
     origin: frozenset["CallOrigin"] | None = None
     reason: frozenset[str] | None = None
     provider: frozenset[str] | None = None
@@ -313,6 +314,8 @@ class When:
                 object.__setattr__(self, field, frozenset(value))
         if not isinstance(self.path_globs, tuple):
             object.__setattr__(self, "path_globs", tuple(self.path_globs))
+        if not isinstance(self.method_globs, tuple):
+            object.__setattr__(self, "method_globs", tuple(self.method_globs))
 
 
 _EVENT_NAMES = (
@@ -330,8 +333,9 @@ _EVENT_NAMES = (
     "capability_budget", "model_changed", "credential_disabled", "compaction",
     "compaction_done", "context_reset", "thread_projection", "subagent_spawn", "worker_state",
     "job_registered", "job_settled", "extension_activate", "extension_load",
-    "extension_unload", "host_reconnect", "ttsr_triggered", "todo_reminder",
+    "extension_unload", "host_reconnect", "ttsr_triggered",
     "retry_start", "retry_end", "fallback_applied", "fallback_succeeded",
+    "mcp_notification", "provider_response", "session_renamed",
 )
 
 
@@ -360,8 +364,9 @@ _OBSERVATION_EVENTS = frozenset(
         "capability_budget", "model_changed", "credential_disabled",
         "compaction_done", "context_reset", "worker_state", "job_registered", "job_settled",
         "extension_activate", "extension_load", "extension_unload", "host_reconnect",
-        "ttsr_triggered", "todo_reminder", "retry_start", "retry_end",
-        "fallback_applied", "fallback_succeeded",
+        "ttsr_triggered", "retry_start", "retry_end",
+        "fallback_applied", "fallback_succeeded", "mcp_notification",
+        "provider_response", "session_renamed",
     }
 )
 _DOMAIN_EVENTS = frozenset(
@@ -465,6 +470,23 @@ def hook(
         raise HookContractError(f"stream event {event!r} requires coalesce")
     if event not in _STREAM_EVENTS and coalesce is not None:
         raise HookContractError(f"non-stream event {event!r} does not accept coalesce")
+    if event == "mcp_notification":
+        if when is None or not (
+            (when.server is not None and len(when.server) > 0)
+            or when.method_globs
+        ):
+            raise HookContractError(
+                "mcp_notification requires a non-empty When.server or When.method_globs"
+            )
+        if (
+            when.server is not None
+            and any(not isinstance(value, str) or not value for value in when.server)
+        ) or any(
+            not isinstance(value, str) or not value for value in when.method_globs
+        ):
+            raise HookContractError(
+                "mcp_notification filters must contain non-empty strings"
+            )
     if coalesce is not None:
         if not isinstance(coalesce, Duration):
             raise TypeError("coalesce must be omp.Duration or None")
@@ -475,7 +497,8 @@ def hook(
             raise HookContractError("provider and When.provider are mutually exclusive")
         when = When(provider=frozenset({provider})) if when is None else When(
             target=when.target, name=when.name, server=when.server, rev=when.rev,
-            path_globs=when.path_globs, origin=when.origin, reason=when.reason,
+            path_globs=when.path_globs, method_globs=when.method_globs,
+            origin=when.origin, reason=when.reason,
             provider=frozenset({provider}), once=when.once, after_gap=when.after_gap,
         )
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
@@ -486,6 +509,16 @@ def hook(
     def decorate(handler: _HookFn) -> _HookFn:
         if not callable(handler):
             raise TypeError("@omp.hook may decorate only a callable")
+        if event in _OBSERVATION_EVENTS:
+            annotation = inspect.signature(handler).return_annotation
+            if annotation not in (
+                inspect.Signature.empty,
+                None,
+                type(None),
+                "None",
+                "NoneType",
+            ):
+                raise HookContractError("observation hooks may only annotate a None return")
         stable_name = name or f"{handler.__module__}.{handler.__qualname__}"
         if not stable_name:
             raise ValueError("hook name must be non-empty")

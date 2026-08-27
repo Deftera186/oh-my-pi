@@ -35,7 +35,7 @@ pub async fn run(args: SayArgs) -> miette::Result<()> {
 	let root = data_dir.join("models");
 	fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
-	let artifacts = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
+	let artifacts = SpeechArtifactManifests::curated().into_diagnostic()?;
 	let cancel = LocalCancellation::new();
 	let manifest = artifacts.kokoro_manifest();
 	let total = manifest.total_bytes().into_diagnostic()?;

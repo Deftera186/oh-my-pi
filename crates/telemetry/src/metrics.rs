@@ -43,7 +43,7 @@ pub struct ChatUsageMetric {
 	pub cost_usd:       Option<f64>,
 }
 
-/// The nine instruments emitted by pi's coding-agent telemetry exporter.
+/// The nine instruments emitted by the coding-agent telemetry exporter.
 #[derive(Clone, Debug)]
 pub struct MetricRecorder {
 	token_usage:        Histogram<u64>,
@@ -162,7 +162,7 @@ impl MetricRecorder {
 		Ok(())
 	}
 
-	/// Records one completed run using pi's common run-level attribute set and
+	/// Records one completed run using the common run-level attribute set and
 	/// the configured run deadline when bounded.
 	///
 	/// # Errors

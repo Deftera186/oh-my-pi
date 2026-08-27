@@ -61,8 +61,8 @@ pub(super) async fn render<C: HttpClient + Sync>(
 ) -> Result<Option<RenderResult>, WebError> {
 	match render_inner(client, url).await {
 		Ok(result) => Ok(result),
-		// pi's handler is deliberately opportunistic: any API or conversion
-		// failure declines the scrape.
+		// The handler is deliberately opportunistic: any API or conversion failure
+		// declines the scrape.
 		Err(_) => Ok(None),
 	}
 }
@@ -310,8 +310,8 @@ mod tests {
 			("https://mathoverflow.net/questions/567", "567", "mathoverflow"),
 			("https://stackapps.com/questions/678", "678", "stackapps"),
 			("https://unix.stackexchange.com/questions/789", "789", "unix"),
-			// pi's pathname regex is intentionally unanchored and stops after
-			// the digit run rather than requiring the whole segment to be numeric.
+			// The pathname regex is intentionally unanchored and stops after the digit
+			// run rather than requiring the whole segment to be numeric.
 			("https://unix.stackexchange.com/x/questions/890suffix", "890", "unix"),
 		] {
 			let parsed = Url::parse(url).unwrap();

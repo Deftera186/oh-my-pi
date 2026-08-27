@@ -83,7 +83,7 @@ pub struct ArchiveListing {
 }
 
 impl ArchiveListing {
-	/// Renders entries using pi's archive-listing size suffixes.
+	/// Renders entries using archive-listing size suffixes.
 	pub fn render(&self) -> String {
 		let mut rendered = if self.entries.is_empty() {
 			"(empty archive directory)".to_owned()
@@ -545,7 +545,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
 	}
 }
 
-/// Formats archive directory entries using pi's exact size suffix rules.
+/// Formats archive directory entries using exact size suffix rules.
 pub fn format_archive_entry_lines(entries: &[ArchiveDirectoryEntry]) -> Vec<String> {
 	entries
 		.iter()

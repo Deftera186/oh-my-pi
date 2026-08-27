@@ -390,6 +390,7 @@ impl CommandRoster {
 		Self { commands: winners.into(), spellings: Arc::new(spellings) }
 	}
 
+	/// Resolves one extension-backed command without executing its handler.
 	/// Slash completion entries derived from the winning roster.
 	pub fn completions(&self) -> Vec<omp_tui::Command> {
 		self.completions_for(CommandRole::Owner)
@@ -497,6 +498,7 @@ impl CommandRoster {
 		output
 	}
 
+	/// Dispatches one already parsed and admitted extension command.
 	/// Parses and dispatches recognized input; unknown input remains a prompt.
 	pub fn dispatch<'a>(
 		&'a self,

@@ -644,7 +644,7 @@ async fn run_chat_login(
 							.map_err(|_| sf!("chat authentication view closed"))?;
 					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => {
-						// pi opens the verification URL for device flows too; the
+						// Device flows also open the verification URL; the
 						// code stays visible in the forwarded event.
 						omp_core::open::open_path(&verification_url);
 						events
@@ -1235,6 +1235,13 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		self.supervisor.bind_parent_jobs(jobs);
 	}
 
+	/// Binds the live extension-backed admission gate for driver-owned events.
+	/// Gates one user submission before it reaches the journal or mailbox.
+	/// Gates one direct user shell command and returns its effective fields.
+	/// Gates one direct user evaluation and returns its effective code.
+	/// Gates one parsed extension command and returns its effective name and argv.
+	/// Observes one committed model selection change.
+	/// Binds the durable approval route used by spawn admission.
 	/// Replaces the live parent state after a session switch.
 	pub fn update(&self, state: AgentState, session_id: Str) {
 		let mut context = self.context.lock();
@@ -6621,8 +6628,8 @@ pub fn resume_choices(
 		}
 		// A journal holding only its header carries nothing to resume: sessions
 		// are created eagerly on disk, so a launch-then-quit leaves an empty
-		// shell that would resume to a blank conversation. Never advertise it
-		// (pi issue #8860: only advertise resume for actually-persisted work).
+		// shell that would resume to a blank conversation. Only advertise resume
+		// for actually-persisted work.
 		if !metadata.has_entries {
 			continue;
 		}
@@ -7625,10 +7632,10 @@ mod tests {
 		assert!(matches!(unknown, ActiveModelMutationError::Unknown(_)));
 	}
 
-	/// Port of pi PR #8833: a provider-qualified selector must resolve within
-	/// its named provider or fail closed — it must never shadow onto an
-	/// aggregator's verbatim flat id (e.g. `anthropic/claude-fable-5` re-binding
-	/// to `openrouter/anthropic/claude-fable-5`), which would silently bill the
+	/// A provider-qualified selector must resolve within its named provider or
+	/// fail closed — it must never shadow onto an aggregator's verbatim flat id
+	/// (e.g. `anthropic/claude-fable-5` re-binding to
+	/// `openrouter/anthropic/claude-fable-5`), which would silently bill the
 	/// aggregator instead of failing a misconfigured provider.
 	#[test]
 	fn provider_qualified_selectors_never_shadow_onto_aggregator_flat_ids() {
@@ -7970,10 +7977,10 @@ mod tests {
 		assert!(metadata.has_entries, "real entries behind torn records still count");
 	}
 
-	/// Port of pi issue #8860: never advertise resuming a session that has no
-	/// persisted conversation. Journals are created eagerly with a lone header
-	/// line, so a launch-then-quit leaves an empty shell on disk; the resume
-	/// picker must skip it until an actual journal entry lands.
+	/// Never advertise resuming a session that has no persisted conversation.
+	/// Journals are created eagerly with a lone header line, so a
+	/// launch-then-quit leaves an empty shell on disk; the resume picker must
+	/// skip it until an actual journal entry lands.
 	#[test]
 	fn resume_choices_skip_header_only_sessions() {
 		let scratch = tempfile::tempdir().expect("scratch directory");

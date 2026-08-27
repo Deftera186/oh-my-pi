@@ -549,7 +549,7 @@ fn load_overlays(paths: &[PathBuf]) -> Result<Vec<toml::Table>, SettingsManagerE
 		.map(|path| read_document(path).map_err(Into::into))
 		.collect()
 }
-/// Loads the first canonical Pi YAML sibling below a writable TOML layer.
+/// Loads the first canonical YAML sibling below a writable TOML layer.
 ///
 /// `config.yml` is canonical and shadows `config.yaml` when both exist. The
 /// writable TOML layer is merged afterward, so native edits always win while
@@ -825,7 +825,7 @@ mod tests {
 	}
 
 	#[test]
-	fn pi_root_prompt_keys_migrate_per_layer_before_native_precedence() {
+	fn legacy_root_prompt_keys_migrate_per_layer_before_native_precedence() {
 		let tree = tempfile::tempdir().expect("tree");
 		let data = tree.path().join("data");
 		let project = tree.path().join("project");

@@ -1,4 +1,4 @@
-//! Pi-equivalent `glob@1` schema, traversal, and model-facing output contracts.
+//! `glob@1` schema, traversal, and model-facing output contracts.
 
 use std::{future, str, sync::Arc};
 
@@ -146,7 +146,7 @@ fn invoke(workspace: FakeWorkspace, raw: &str) -> Invocation {
 }
 
 #[test]
-fn pi_schema_and_defaults_are_exact() {
+fn schema_and_defaults_are_exact() {
 	let workspace = fake(walk(Vec::new()));
 	let seen = Arc::clone(&workspace.seen);
 	let tool = glob::tool(workspace.clone(), RecordingBlobs::default());

@@ -73,7 +73,7 @@ impl NoopLoopGuard {
 	}
 
 	/// Records a no-op while keeping canonical identity separate from the
-	/// authored path shown in pi-compatible diagnostics.
+	/// authored path shown in diagnostics.
 	///
 	/// Exact payload bytes are retained so a hash collision can never escalate a
 	/// different edit. A different payload on the same path starts again at one.

@@ -119,7 +119,7 @@ impl ImmuneTurnAccount {
 		self.remaining
 	}
 
-	/// Chooses the pi-parity route without mutating accounting.
+	/// Chooses the delivery route without mutating accounting.
 	pub fn evaluate(&self, severity: AdviceSeverity, context: DeliveryContext) -> AdviceDelivery {
 		if severity == AdviceSeverity::Nit {
 			return AdviceDelivery::Aside;

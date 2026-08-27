@@ -71,7 +71,7 @@ pub struct OperationRequest<T> {
 	pub budget:         ExecutionBudget,
 	/// Optional conversation state.
 	pub session:        Option<SessionRequest>,
-	/// Bitmap-gated provider response hook sink.
+	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: crate::codec::ProviderResponseHooks,
 	/// Principal and extension charged for this request.
 	pub attribution:    InferenceAttribution,

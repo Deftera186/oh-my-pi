@@ -2009,7 +2009,7 @@ mod tests {
 		assert_eq!(pairer.register_ready(&second), ToolRegistration::LimitExceeded);
 	}
 
-	/// Mirrors the shape of the `ask` tool that motivated pi issue #8886.
+	/// Returns the `ask` tool definition used by the recovery path.
 	fn ask_definition() -> ToolDefinition {
 		ToolDefinition {
 			name:        sf!("ask"),

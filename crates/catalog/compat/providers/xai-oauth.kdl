@@ -3,10 +3,8 @@
 provider "xai-oauth" {
 	class "xai" {
 		family "grok" {
-			// pi 651f20957b/01db5b04ee flip these to encrypted-reasoning
-			// replay (filter #false, include #true), but the frozen source
-			// rows' legacy compat pins both values, so that flip rides the
-			// next snapshot import. The summary rejection and root-union
+			// The frozen source rows' legacy compat pins both values, so that flip
+			// rides the next snapshot import. The summary rejection and root-union
 			// flattening are new axes the legacy compat is silent on.
 			filter-reasoning-history #true
 			flatten-root-unions #true

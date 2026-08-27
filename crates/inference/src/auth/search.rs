@@ -18,7 +18,7 @@ pub enum SearchCredentialMode {
 	Anonymous,
 }
 
-/// Pi-compatible Perplexity credential ladder.
+/// Perplexity credential ladder.
 pub const PERPLEXITY_LADDER: [SearchCredentialMode; 6] = [
 	SearchCredentialMode::Cookie,
 	SearchCredentialMode::Oauth,

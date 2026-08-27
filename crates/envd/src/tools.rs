@@ -1274,6 +1274,7 @@ impl HookControlFactory {
 		*self.mcp_journal.write() = Some((telemetry, session));
 	}
 
+	/// Returns the per-session admission gate backed by this live composer.
 	/// Returns the shared runtime provider usage registry.
 	pub fn usage_fetchers(&self) -> UsageFetcherRegistry {
 		self.usage_fetchers.clone()

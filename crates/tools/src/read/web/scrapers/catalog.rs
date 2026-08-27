@@ -1,7 +1,7 @@
 //! Long-tail public-site extractor catalog.
 //!
-//! The table follows pi's registry order. Matching is deliberately separate
-//! from rendering so a recognized URL may decline and fall through to the
+//! The table follows registry order. Matching is deliberately separate from
+//! rendering so a recognized URL may decline and fall through to the
 //! generic bounded fetch pipeline.
 
 use std::{fmt::Write as _, str};

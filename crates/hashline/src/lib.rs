@@ -22,7 +22,7 @@ pub mod grammars;
 pub mod input;
 /// Repeated no-op escalation.
 pub mod loop_guard;
-/// Pi-compatible stale snapshot mismatch diagnostics.
+/// Stale snapshot mismatch diagnostics.
 pub mod mismatch;
 /// BOM and line-ending normalization.
 pub mod normalize;

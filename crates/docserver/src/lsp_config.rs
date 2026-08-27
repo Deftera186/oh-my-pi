@@ -252,7 +252,7 @@ impl ResolvedLspServer {
 	}
 }
 
-/// Loads the bundled catalog copied from pi.
+/// Loads the bundled language-server catalog.
 pub fn bundled_lsp_defaults() -> Result<LspConfigSource, LspConfigError> {
 	let bytes: Arc<[u8]> = include_bytes!("../data/lsp-defaults.json")
 		.as_slice()

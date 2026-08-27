@@ -1,6 +1,4 @@
 //! In-process `fd` builtin backed by `omp_walker` and `regex`.
-//!
-//! Relocated from pi-shell's native implementation.
 
 use std::{
 	collections::HashMap,

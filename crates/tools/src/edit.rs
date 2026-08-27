@@ -565,7 +565,7 @@ impl Fault {
 /// Session loop-guard result for one byte-identical edit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NoopResult {
-	/// Exact pi-compatible soft or hard diagnostic.
+	/// Exact soft or hard diagnostic.
 	pub diagnostic: Str,
 	/// Whether this attempt reached the mandatory hard-failure threshold.
 	pub escalate:   bool,

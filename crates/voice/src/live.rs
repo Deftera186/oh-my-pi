@@ -2,7 +2,7 @@
 //!
 //! The TypeScript host owns authenticated signaling and the sideband protocol;
 //! this module owns the realtime WebRTC peer, Opus media, and speaker
-//! playback. The N-API class in pi-natives is a thin adapter over
+//! playback. The N-API class is a thin adapter over
 //! [`LivePeerCore`].
 
 use std::{

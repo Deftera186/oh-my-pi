@@ -122,7 +122,7 @@ pub mod manage_skill;
 pub mod memory;
 /// Typed Mnemopi mutation tool.
 pub mod memory_edit;
-/// Pi-compatible reads across local and special sources.
+/// Reads across local and special sources.
 pub mod read;
 /// Review finding parsing and priority normalization.
 pub mod review;
@@ -138,7 +138,7 @@ pub mod think;
 pub mod todo;
 /// Canonical provider-routed web search.
 pub mod web_search;
-/// Pi-compatible whole-file writes.
+/// Whole-file writes.
 pub mod write;
 /// Structured subagent result submission.
 pub mod yield_tool;

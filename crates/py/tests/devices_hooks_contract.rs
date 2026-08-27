@@ -20,7 +20,13 @@ from omp.events import spec as event_spec
 
 registry.configure_manifest(
     tools=(("dynamic", "integration", 1),),
-    hooks=(("tool_call", "review"), ("user_bash", "transform")),
+    hooks=(
+        ("tool_call", "review"),
+        ("user_bash", "transform"),
+        ("mcp_notification", "observe"),
+        ("provider_response", "observe"),
+        ("session_renamed", "observe"),
+    ),
     extension="acme/devices-hooks",
 )
 
@@ -57,10 +63,112 @@ def shell_env_second(event, ctx):
     return hook_module.Defer()
 
 
-registry.freeze()
+for kwargs in (
+    {},
+    {"phase": omp.HookPhase.REVIEW, "when": omp.When(server={"github"})},
+    {"coalesce": omp.Duration("16ms"), "when": omp.When(server={"github"})},
+    {"when": omp.When(server=frozenset(), method_globs=())},
+):
+    try:
+        omp.hook("mcp_notification", **kwargs)
+    except hook_module.HookContractError:
+        pass
+    else:
+        raise AssertionError(f"invalid mcp_notification registration passed: {kwargs!r}")
 
+
+@omp.hook(
+    "mcp_notification",
+    when=omp.When(
+        server=frozenset({"github"}),
+        method_globs=("notifications/*", "acme/*"),
+    ),
+    name="acme.mcp-observer",
+)
+async def observe_mcp(event, ctx):
+    assert isinstance(event, omp.McpNotificationEvent)
+    return None
+
+
+for event_name in ("provider_response", "session_renamed"):
+    try:
+        omp.hook(event_name, phase=omp.HookPhase.REVIEW)
+    except hook_module.HookContractError:
+        pass
+    else:
+        raise AssertionError(f"{event_name} accepted a non-OBSERVE phase")
+
+    try:
+        @omp.hook(event_name)
+        def invalid_observer(event, ctx) -> str:
+            return "invalid"
+    except hook_module.HookContractError:
+        pass
+    else:
+        raise AssertionError(f"{event_name} accepted a non-None return annotation")
+
+
+@omp.hook("provider_response", name="acme.provider-response")
+async def observe_provider_response(event, ctx) -> None:
+    assert isinstance(event, omp.ProviderResponseEvent)
+
+
+@omp.hook("session_renamed", name="acme.session-renamed")
+async def observe_session_renamed(event, ctx) -> None:
+    assert isinstance(event, omp.SessionRenamedEvent)
+
+
+for kwargs in (
+    {"phase": omp.HookPhase.OBSERVE},
+    {"order": 1},
+    {"coalesce": omp.Duration("16ms")},
+):
+    try:
+        omp.hook("agent_settled", **kwargs)
+    except hook_module.HookContractError:
+        pass
+    else:
+        raise AssertionError(f"invalid agent_settled registration passed: {kwargs!r}")
+
+
+registry.freeze()
 user_bash_spec = event_spec("user_bash")
 assert user_bash_spec.payload is omp.UserBashEvent
+mcp_spec = event_spec("mcp_notification")
+assert (mcp_spec.id, mcp_spec.rev) == (64, 1)
+assert mcp_spec.payload is omp.McpNotificationEvent
+assert mcp_spec.phase is omp.HookPhase.OBSERVE
+assert mcp_spec.latency is omp.LatencyClass.ASYNC
+assert mcp_spec.on_failure is omp.OnFailure.DEFER
+assert mcp_spec.returns is None
+assert mcp_spec.default_decision is None
+assert mcp_spec.reentrant
+assert not mcp_spec.fields
+provider_response_spec = event_spec("provider_response")
+assert (provider_response_spec.id, provider_response_spec.rev) == (65, 1)
+assert provider_response_spec.payload is omp.ProviderResponseEvent
+assert provider_response_spec.phase is omp.HookPhase.OBSERVE
+assert provider_response_spec.latency is omp.LatencyClass.ASYNC
+assert provider_response_spec.on_failure is omp.OnFailure.DEFER
+assert provider_response_spec.returns is None
+session_renamed_spec = event_spec("session_renamed")
+assert (session_renamed_spec.id, session_renamed_spec.rev) == (66, 1)
+assert session_renamed_spec.payload is omp.SessionRenamedEvent
+assert session_renamed_spec.phase is omp.HookPhase.OBSERVE
+assert session_renamed_spec.latency is omp.LatencyClass.ASYNC
+assert session_renamed_spec.on_failure is omp.OnFailure.DEFER
+assert session_renamed_spec.returns is None
+settled_spec = event_spec("agent_settled")
+assert (settled_spec.id, settled_spec.rev) == (14, 2)
+assert settled_spec.phase == "domain"
+assert settled_spec.latency is omp.LatencyClass.SUBMISSION
+assert settled_spec.on_failure is omp.OnFailure.DEFER
+try:
+    event_spec("todo_reminder")
+except omp.UnknownEvent:
+    pass
+else:
+    raise AssertionError("todo_reminder tombstone appeared in the public catalog")
 assert user_bash_spec.on_failure is omp.OnFailure.DENY
 assert user_bash_spec.fields["env_overrides"] is omp.Composition.REPLACE
 

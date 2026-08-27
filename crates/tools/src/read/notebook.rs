@@ -1,4 +1,4 @@
-//! Jupyter notebook conversion into pi's editable virtual text.
+//! Jupyter notebook conversion into editable virtual text.
 
 use std::{
 	borrow::Cow,
@@ -62,7 +62,7 @@ pub struct RenderedNotebook {
 	pub cells: Vec<NotebookCellMapping>,
 }
 
-/// A malformed notebook error with pi-compatible model-facing text.
+/// A malformed notebook error with model-facing text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NotebookError(Str);
 

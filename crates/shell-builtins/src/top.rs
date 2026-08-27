@@ -1,4 +1,4 @@
-//! `top` builtin, moved from `pi-shell`.
+//! `top` builtin.
 
 use std::{
 	collections::{HashMap, HashSet},

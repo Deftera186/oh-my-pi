@@ -26,6 +26,9 @@ use crate::{
 
 /// Pure construction-time codec binding for a planned request.
 pub trait AttemptEncoder<R, L>: Clone + Send + 'static {
+	/// Runs the session-scoped request gate against a bounded typed draft.
+	///
+	/// The default is allocation-free for route stacks without a provider hook.
 	/// Encodes with a fresh body source and decoder; it must not acquire
 	/// credentials or perform I/O.
 	fn encode(
@@ -65,7 +68,7 @@ impl<E> EncodeLayer<E, NoHookHandle> {
 	}
 }
 impl<E> EncodeLayer<E, NoHookHandle> {
-	/// Attaches the concrete hook dispatcher for this route stack.
+	/// Attaches the concrete hook dispatcher to this route stack.
 	pub fn with_hook<T: HookHandle>(self, hook: T) -> EncodeLayer<E, T> {
 		EncodeLayer {
 			encoder:     self.encoder,
@@ -125,8 +128,8 @@ where
 		let inner = Arc::clone(&self.inner);
 		async move {
 			context.checkpoint(ErrorPhase::Encoding)?;
-			// This escape hatch is explicitly fail-open: a failed hook leaves the
-			// canonical request untouched and cannot prevent a provider attempt.
+			// This legacy route-scoped escape hatch is fail-open. The
+			// session-scoped gate below preserves explicit Deny.
 			if let Some(hook) = hook {
 				let _ = hook.before_request(&context).await;
 			}

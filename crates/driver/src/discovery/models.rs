@@ -16,8 +16,7 @@ use omp_catalog::{
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use toml::{de, ser};
-/// Native model configuration. The field names deliberately mirror the pi
-/// `models.yml` contract while TOML is OMP's native serialization.
+/// Native model configuration. TOML is OMP's native serialization.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ModelsConfig {
 	/// Provider definitions keyed by stable provider id.
@@ -512,6 +511,16 @@ fn configured_chat_capabilities() -> omp_catalog::ModelCapabilities {
 	capabilities.chat = Some(omp_catalog::unknown_chat_capabilities());
 	capabilities
 }
+/// Synthesizes the interned authentication spec named by a configured
+/// provider's `auth` mode.
+///
+/// `none` fits keyless or header-authenticated endpoints; `api_key`,
+/// `bearer`, and `optional_bearer` read `OMP_<PROVIDER>_API_KEY` (falling
+/// back to stored credentials); `basic` reads `OMP_<PROVIDER>_USERNAME` and
+/// `OMP_<PROVIDER>_PASSWORD`.
+///
+/// Modes accept snake_case, kebab-case, and legacy camelCase spellings
+/// (`apiKey`, `optional-bearer`, `API_KEY` are all `api_key`-class inputs).
 
 fn configured_model_record(
 	catalog: &omp_catalog::Catalog,
@@ -649,6 +658,8 @@ pub enum ModelsConfigError {
 		/// Stable field name.
 		field:    &'static str,
 	},
+	/// A configured provider `auth` mode names no supported specification kind.
+		/// Provider containing the invalid auth mode.
 	/// Reading the configured source failed.
 	#[error(transparent)]
 	Io(#[from] io::Error),

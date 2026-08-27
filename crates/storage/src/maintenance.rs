@@ -160,10 +160,10 @@ impl SessionIndex {
 	/// Receipt, outcome, and model rows use `(session_id, event_index)` as their
 	/// logical key; entry kinds use `(session_id, kind)`. FTS rows follow the
 	/// same event-index winner rule as their base event. On collision, the row
-	/// already owned by the retained session wins, matching pi's
-	/// `UPDATE OR IGNORE` maintenance semantics. Archived members are processed
-	/// in caller order, so the first member wins collisions not already owned by
-	/// the retained session.
+	/// already owned by the retained session wins, matching `UPDATE OR IGNORE`
+	/// maintenance semantics. Archived members are processed in caller order, so
+	/// the first member wins collisions not already owned by the retained
+	/// session.
 	pub fn rekey_archived_lineage(
 		&self,
 		retained: &SessionId,

@@ -296,14 +296,14 @@ pub struct SpeechArtifactManifests {
 }
 
 impl SpeechArtifactManifests {
-	/// Builds the revision-pinned pi-parity speech artifact portfolio.
+	/// Builds the revision-pinned speech artifact portfolio.
 	///
 	/// Whisper and Parakeet use Candle-compatible safetensors checkpoints, while
 	/// Kokoro uses the safetensors conversion
 	/// consumed by `omp-voice-kokoro`. Kokoro's single manifest deliberately
 	/// includes every curated voice so switching voices never performs network
 	/// I/O after the model becomes ready.
-	pub fn pi_parity() -> Result<Self, SpeechCatalogError> {
+	pub fn curated() -> Result<Self, SpeechCatalogError> {
 		const WHISPER_BASE_REVISION: &str = "e37978b90ca9030d5170a5c07aadb050351a65bb";
 		const WHISPER_SMALL_REVISION: &str = "973afd24965f72e36ca33b3055d56a652f456b4d";
 		const WHISPER_TURBO_REVISION: &str = "41f01f3fe87f28c78e2fbf8b568835947dd65ed9";
@@ -927,8 +927,8 @@ mod tests {
 		assert!(matches!(result, Err(SpeechCatalogError::DuplicateSttPreset { .. })));
 	}
 	#[test]
-	fn pi_parity_manifests_bind_every_runtime_file() {
-		let artifacts = SpeechArtifactManifests::pi_parity().expect("curated manifests");
+	fn curated_manifests_bind_every_runtime_file() {
+		let artifacts = SpeechArtifactManifests::curated().expect("curated manifests");
 		assert_eq!(artifacts.stt_manifest(SttPreset::Fast).shards.len(), 3);
 		assert_eq!(artifacts.stt_manifest(SttPreset::Balanced).shards.len(), 3);
 		assert_eq!(artifacts.stt_manifest(SttPreset::Turbo).shards.len(), 3);

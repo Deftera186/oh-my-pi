@@ -5038,8 +5038,8 @@ fn sort_by<'a>(unsorted: &mut Vec<Line<'a>>, settings: &GlobalSettings, line_dat
 	let cmp = |a: &Line<'a>, b: &Line<'a>| compare_by(a, b, settings, line_data, line_data);
 	// WASI does not support threads, so use non-parallel sort to avoid
 	// rayon's thread pool which triggers an unreachable trap. Windows can also
-	// force sequential sort when pi-natives could not safely configure Rayon's
-	// process-global worker pool under commit pressure.
+	// force sequential sort when the global pool cannot be safely configured
+	// under commit pressure.
 	if settings.stable || settings.unique {
 		#[cfg(not(target_os = "wasi"))]
 		if rayon_global_pool_available() {

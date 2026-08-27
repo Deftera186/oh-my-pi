@@ -6,7 +6,7 @@ use bytes::Bytes;
 use image::{GenericImageView as _, ImageFormat, ImageReader, imageops::FilterType};
 use thiserror::Error;
 
-/// Pi-compatible maximum attachment dimension.
+/// Maximum attachment dimension.
 pub const MAX_IMAGE_DIMENSION: u32 = 2_000;
 /// Hard decoded-pixel admission bound.
 pub const MAX_DECODED_PIXELS: u64 = 100_000_000;

@@ -824,6 +824,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 	pub fn set_provider_error_gate(&mut self, gate: Arc<HookGate>) {
 		self.provider_error_gate = Some(gate);
 	}
+	/// Installs the catalog hook gate used by agent, message, and tool seams.
 
 	/// Returns the active regime prompt setting.
 	pub fn prompt_slot(&self) -> Option<&str> {
@@ -2588,7 +2589,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		self.session_memory = Some(memory);
 	}
 
-	/// Installs Pi-compatible substantive-turn detection and synthetic capture.
+	/// Installs substantive-turn detection and synthetic capture.
 	pub fn set_autolearn(&mut self, settings: AutolearnSettings) {
 		self.autolearn = settings.enabled.then(|| AutolearnController::new(settings));
 	}

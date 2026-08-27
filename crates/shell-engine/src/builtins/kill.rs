@@ -1,4 +1,4 @@
-//! The `kill` builtin, moved from `pi-shell`.
+//! The `kill` builtin.
 
 use std::{io::Write, result};
 

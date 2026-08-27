@@ -29,7 +29,7 @@ pub enum PromptInputError {
 /// Resolves a value as inline text or a readable file.
 ///
 /// Values containing a newline are always inline. Missing and overlong paths
-/// are treated as literal text, matching pi's command-boundary behavior.
+/// are treated as literal text at the command boundary.
 pub fn resolve_prompt_input(input: Option<&str>) -> Result<Option<Str>, PromptInputError> {
 	let Some(input) = input else {
 		return Ok(None);

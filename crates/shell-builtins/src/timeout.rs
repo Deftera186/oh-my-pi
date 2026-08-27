@@ -1,4 +1,4 @@
-//! `timeout` builtin, moved from `pi-shell`.
+//! `timeout` builtin.
 
 use std::{future, io::Write, result, sync::Arc, time::Duration};
 
@@ -216,7 +216,7 @@ impl builtins::Command for TimeoutCommand {
 		// shell mutably, so `context.stderr()` is unavailable once it exists.
 		let mut stderr = context.stderr();
 		let outer_cancel = context.cancel_token();
-		let source_info = SourceInfo::from("pi-natives:timeout");
+		let source_info = SourceInfo::from("omp-builtins:timeout");
 		let run_future = context
 			.shell
 			.run_string(command_line, &source_info, &params);

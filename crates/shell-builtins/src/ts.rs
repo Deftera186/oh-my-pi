@@ -60,7 +60,7 @@ impl Utility for Ts {
 /// The `ts` argument model.
 fn command() -> Command {
 	Command::new(Ts::NAME)
-		.version("ts (pi-shell) 17.2.11")
+		.version("ts 17.2.11")
 		.about("Timestamp each line of standard input.")
 		.override_usage(format_usage("ts [-r] [-i | -s] [-m] [FORMAT]"))
 		.disable_help_flag(true)

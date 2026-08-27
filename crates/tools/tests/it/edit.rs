@@ -1,4 +1,4 @@
-//! Exact pi-facing contracts for hashline edit execution and projection.
+//! Exact model-facing contracts for hashline edit execution and projection.
 
 use std::{collections::HashMap, future, sync::Arc};
 

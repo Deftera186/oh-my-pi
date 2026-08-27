@@ -52,8 +52,8 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 	let mut counts = BTreeMap::<String, u32>::new();
 	let mut receipts = Vec::with_capacity(args.count as usize);
 	for sample in 0..args.count {
-		// pi samples a fresh randomized session id for every attempt. Feed the
-		// same distribution into the canonical pool by making the hashed
+		// Sample a fresh randomized session id for every attempt. Feed the same
+		// distribution into the canonical pool by making the hashed
 		// session bucket the preferred preceding account.
 		let session_id = cli::turn_id();
 		let bucket = fast_hash64(session_id.as_bytes()) as usize % accounts.len();

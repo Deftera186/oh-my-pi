@@ -243,6 +243,17 @@ pub trait HookEvent {
 	/// Applies an accepted transform under the event's fixed composition table.
 	fn apply(&mut self, patch: &HookPatch) -> Result<(), GateError>;
 }
+/// Result of one JSON-encoded catalog gate.
+	/// No extension subscribed, so no payload was constructed.
+	/// The composed effective payload.
+	/// A hook denied the event.
+		/// Stable denial reason.
+		/// Whether the denial is fatal to the caller submission.
+	/// An approval requirement was returned at a gate that does not own tickets.
+		// The delegated CONTROL bridge uses the same target/newline/payload
+		// envelope as gateable events.
+/// Emits one JSON observation while preserving the bitmap-only negative path.
+/// Runs one JSON admission gate while preserving the bitmap-only negative path.
 
 impl HookEvent for GateEvent {
 	type Return = ();
@@ -284,6 +295,7 @@ pub enum GateDecision {
 	Allow,
 	/// A terminal refusal and stable reason.
 	Deny(Str),
+	/// A terminal refusal retaining its canonical structured evidence.
 	/// A legal TRANSFORM patch.
 	Modify(HookPatch),
 	/// No opinion.
@@ -356,6 +368,7 @@ pub enum GateOutcome {
 		event:  GateEvent,
 		/// Stable refusal reason.
 		reason: Str,
+		/// Canonical structured denial when supplied by the live composer.
 		/// Ordered transform overwrite audit trail before refusal.
 		trail:  Vec<TransformTrail>,
 	},
@@ -424,6 +437,12 @@ impl HookGate {
 		)
 	}
 
+	/// Creates a gate whose subscribed decisions are composed by the receiver.
+	///
+	/// Unlike [`Self::channel`], this mode emits one dispatch for the complete
+	/// event. The receiver owns phase ordering, failure policy, and callback
+	/// composition and answers with one final decision.
+	/// Publishes the complete event subscription bitmap for a delegated gate.
 	/// Replaces one host's subscriptions and publishes their event bits.
 	pub fn subscribe(
 		&self,

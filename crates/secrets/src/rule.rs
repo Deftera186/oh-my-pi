@@ -113,7 +113,7 @@ impl SecretRule {
 
 	/// Requires matches to sit on credential-alphabet boundaries.
 	///
-	/// Emulates pi's `(?<![0-9A-Za-z_*-])…(?![0-9A-Za-z_*-])` lookarounds,
+	/// Enforces `(?<![0-9A-Za-z_*-])(?![0-9A-Za-z_*-])` lookaround semantics,
 	/// which the guaranteed linear-time engine cannot express; the obfuscator
 	/// rejects matches adjacent to credential-alphabet characters instead.
 	pub const fn with_boundary_guard(mut self) -> Self {

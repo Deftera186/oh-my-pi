@@ -1,4 +1,4 @@
-//! Pi-compatible reads of local and special resources.
+//! Reads of local and special resources.
 
 use std::{borrow::Cow, collections::HashMap, future::Future, path::Path, str, sync::Arc};
 
@@ -501,7 +501,7 @@ impl Drop for InterruptSqliteOnDrop {
 	}
 }
 
-/// Constructs the Pi-compatible `read@1` tool without internal URL resolvers.
+/// Constructs the `read@1` tool without internal URL resolvers.
 pub fn tool<S: ReadSources, B: ReadBlobs>(
 	sources: S,
 	blobs: B,

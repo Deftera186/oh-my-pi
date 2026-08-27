@@ -22,7 +22,7 @@ pub struct RegexMatchContext<'a> {
 	pub end:   usize,
 }
 
-/// Generates pi's deterministic, byte-length-preserving `ZZ` replacement.
+/// Generates a deterministic, byte-length-preserving `ZZ` replacement.
 pub fn generate_deterministic_replacement(secret: &str) -> String {
 	let length = secret.encode_utf16().count();
 	if length == 0 {
@@ -150,7 +150,7 @@ pub fn regex_rematches_in_context(
 		.any(|(_, end)| end > context.start)
 }
 
-/// Performs pi's bounded fixed-point search for a same-length non-matching
+/// Performs a bounded fixed-point search for a same-length non-matching
 /// marker.
 pub fn find_non_matching_replacement(
 	value: &str,

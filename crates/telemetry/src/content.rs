@@ -51,7 +51,7 @@ pub struct ResponseContent<'a> {
 
 /// Build request-side content attributes for `mode`.
 ///
-/// `None` emits nothing. `Summary` emits only `pi.gen_ai.request.messages`.
+/// `None` emits nothing. `Summary` emits only `omp.gen_ai.request.messages`.
 /// `Full` additionally emits standard system-instruction and input-message
 /// attributes, while retaining the summary attribute.
 pub fn request_attributes(mode: CaptureMode, request: RequestContent<'_>) -> Vec<KeyValue> {
@@ -131,7 +131,7 @@ pub fn response_attributes(mode: CaptureMode, response: ResponseContent<'_>) -> 
 /// Serialize tool-call arguments for an enabled capture mode.
 ///
 /// Summary mode applies the bounded serializer; full mode serializes the value
-/// without summarization, matching `pi`'s `safeJson` path.
+/// without summarization, preserving the enabled capture mode.
 pub fn tool_arguments_attribute(mode: CaptureMode, arguments: &Value) -> Option<KeyValue> {
 	serialize_tool_value(mode, gen_ai::TOOL_CALL_ARGUMENTS, arguments)
 }

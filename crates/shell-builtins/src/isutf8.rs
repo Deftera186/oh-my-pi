@@ -136,7 +136,7 @@ fn report_verdict(
 
 fn command() -> Command {
 	Command::new(Isutf8::NAME)
-		.version("isutf8 (pi-shell) 17.2.11")
+		.version("isutf8 17.2.11")
 		.about("Check whether files are valid UTF-8.")
 		.override_usage(format_usage("isutf8 [-q|--quiet] [-l|--list] [-i|--invert] [FILE]..."))
 		.disable_help_flag(true)

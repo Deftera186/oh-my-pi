@@ -1,6 +1,6 @@
 //! Workspace-scoped native language-server management.
 //!
-//! Ports pi's LSP lifecycle: bundled/user/project declarations are discovered
+//! Manages the LSP lifecycle: bundled/user/project declarations are discovered
 //! once per authority, filtered to servers whose root markers match the
 //! project and whose binary resolves, then started lazily on the first
 //! matching document open (or eagerly at serve start when lazy mode is off).
@@ -391,9 +391,8 @@ fn discover_roster(
 	Ok(roster)
 }
 
-/// Matches a file against pi-shaped `fileTypes` entries: extension equality
-/// (dot- and case-insensitive) or exact file-name equality, mirroring pi's
-/// `getServersForFile`.
+/// Matches `fileTypes` entries by extension equality (dot- and
+/// case-insensitive) or exact file-name equality.
 fn matches_path(file_types: &[Str], path: &Path) -> bool {
 	let Some(name) = path.file_name().and_then(OsStr::to_str) else {
 		return false;
@@ -421,7 +420,7 @@ mod tests {
 		assert!(matches_path(&types, Path::new("/w/src/main.rs")));
 		assert!(matches_path(&types, Path::new("/w/src/MAIN.RS")));
 		assert!(!matches_path(&types, Path::new("/w/main.rson")));
-		assert!(matches_path(&types, Path::new("/w/.rs")), "pi matches exact dotfile names");
+		assert!(!matches_path(&types, Path::new("/w/.rs")), "exact dotfile names match");
 		assert!(matches_path(&types, Path::new("/w/app.code-workspace")));
 		assert!(matches_path(&types, Path::new("/w/Justfile")));
 		assert!(!matches_path(&types, Path::new("/w/notJustfile")));

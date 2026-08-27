@@ -661,7 +661,7 @@ pub struct CalculatedCost {
 	pub total:       f64,
 }
 
-/// Calculates pi's per-bucket cost without rounding.
+/// Calculates per-bucket cost without rounding.
 pub fn calculate_cost(rates: CostRates, usage: CostUsage) -> CalculatedCost {
 	let orchestration = usage.orchestration.unwrap_or_default();
 	let input = rates.input / 1_000_000.0 * (usage.input + orchestration.input);
@@ -677,7 +677,7 @@ pub fn calculate_cost(rates: CostRates, usage: CostUsage) -> CalculatedCost {
 	}
 }
 
-/// Prices cache writes exactly as pi.
+/// Prices cache writes according to the configured TTL policy.
 ///
 /// It uses the flat 5m rate without TTL detail; otherwise it charges 5m plus
 /// residual at the stored rate and 1h at twice the base input rate. The stored

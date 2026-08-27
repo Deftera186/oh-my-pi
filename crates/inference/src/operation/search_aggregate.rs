@@ -7,9 +7,9 @@ use url::Url;
 
 use super::search::SearchDocument;
 
-/// Pi-compatible soft deadline: enough time for fast engines.
+/// Soft deadline: enough time for fast engines.
 pub const SOFT_DEADLINE: Duration = Duration::from_secs(5);
-/// Pi-compatible hard deadline for bounded partial success.
+/// Hard deadline for bounded partial success.
 pub const HARD_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One engine's completed contribution.

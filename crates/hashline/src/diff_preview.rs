@@ -21,7 +21,7 @@ const ELISION: &str = "…";
 /// Maximum physical terminal rows shown by a compact, collapsed edit diff.
 pub const COLLAPSED_DIFF_ROWS: u16 = 40;
 
-/// Canonical pi-style numbered diff over exact base and current UTF-8 bytes.
+/// Canonical numbered diff over exact base and current UTF-8 bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NumberedDiff {
 	/// Stable ` N|context`, `-N|old`, and `+N|new` rows.
@@ -34,16 +34,16 @@ pub struct NumberedDiff {
 
 /// Produces a stable line diff with one-based original/current coordinates.
 ///
-/// As in pi's `generateDiffString`, unchanged regions retain two rows adjacent
-/// to a change and omit their untouched middle. The visible line-number jump
-/// conveys that omission without an invented footer or marker.
+/// Unchanged regions retain two rows adjacent to a change and omit their
+/// untouched middle. The visible line-number jump conveys that omission without
+/// an invented footer or marker.
 ///
 /// Context and deletion row numbers address `base`; insertion row numbers
 /// address `current`. UTF-8 BOM and line-ending conventions are normalized
 /// before comparison, while row text remains otherwise exact.
 ///
 /// When `path` is present, matching syntactic boundary rows outside the
-/// ordinary window are inserted via tree-sitter, with pi's lexical bracket
+/// ordinary window are inserted via tree-sitter, with a lexical bracket
 /// fallback for unknown or temporarily invalid sources.
 pub fn numbered_diff(
 	base: &[u8],

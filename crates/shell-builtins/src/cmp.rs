@@ -1,6 +1,4 @@
 //! `cmp` builtin: compare two files byte by byte.
-//!
-//! Ported from the `pi-shell` in-process implementation.
 
 use std::{
 	ffi::{OsStr, OsString},
@@ -105,7 +103,7 @@ impl Utility for Cmp {
 
 fn command() -> Command {
 	Command::new(Cmp::NAME)
-		.version("cmp (pi-shell) 17.2.11")
+		.version("cmp 17.2.11")
 		.about("Compare two files byte by byte.")
 		.override_usage(format_usage("cmp [OPTION]... FILE1 [FILE2 [SKIP1 [SKIP2]]]"))
 		.disable_help_flag(true)

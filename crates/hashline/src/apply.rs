@@ -274,12 +274,12 @@ fn repair_replacement_indentation(
 				continue;
 			}
 			let si = indent(source);
-			let pi = indent(payload);
-			if !si.ends_with(pi) {
+			let payload_indent = indent(payload);
+			if !si.ends_with(payload_indent) {
 				consistent = false;
 				break;
 			}
-			let candidate = &si[..si.len() - pi.len()];
+			let candidate = &si[..si.len() - payload_indent.len()];
 			match &shift {
 				None => shift = Some(candidate.to_owned()),
 				Some(old) if old == candidate => {},

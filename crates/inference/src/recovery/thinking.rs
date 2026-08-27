@@ -514,7 +514,7 @@ fn fence_close_end(buffer: &[u8], ticks: usize, final_chunk: bool) -> Option<usi
 /// fences out of the *text* stream; they never run over parts a provider
 /// already flags as thinking. Gemini thought summaries occasionally emit a
 /// bare ```` ```thinking ```` / ```` ``````thinking ```` opener line as a
-/// between-summary delimiter (pi #8719), which otherwise reaches display and
+/// between-summary delimiter, which otherwise reaches display and
 /// persisted transcripts verbatim as fence spam.
 ///
 /// Only a *standalone* opener line — nothing but ≤3 lead spaces, a run of ≥3

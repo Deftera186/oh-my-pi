@@ -1261,6 +1261,8 @@ fn command_json(command: &v1::BashCommand) -> Value {
 }
 
 fn bash_ir_json(script: &str, cwd: &Path, root: &Path) -> Value {
+/// Parses one direct user shell submission into the canonical BashIR JSON
+/// consumed by policy and hook admission.
 	let ir = admission::bash_ir("bash", &json!({"command": script}), cwd, root)
 		.expect("shell analysis always returns BashIr");
 	let parse_error = ir

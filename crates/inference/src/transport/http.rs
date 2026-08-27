@@ -93,7 +93,7 @@ const PUBLIC_NUMERIC_HEADERS: [&str; 13] = [
 /// field (the codec classifies the body form). The admission failure never
 /// reached a model, so honoring the proxy's `Retry-After`-scale hint on the
 /// same route duplicates the backoff and model fallback the router already
-/// owns, stalling one turn for minutes (pi #8854).
+/// owns, stalling one turn for minutes.
 const CONCURRENCY_ADMISSION_HEADER: &str = "rate_limit_type";
 const CONCURRENCY_ADMISSION_LIMITER: &[u8] = b"max_parallel_requests";
 
@@ -1980,7 +1980,7 @@ mod tests {
 		assert!(sanitize_headers(&headers).is_empty());
 	}
 
-	/// A header-marked `LiteLLM` concurrency-admission 429 (`pi` #8854) must
+	/// A header-marked `LiteLLM` concurrency-admission 429 must
 	/// surface for immediate route reselection instead of sleeping through the
 	/// transport's same-route retry lane; unmarked rate limits and every other
 	/// classification keep their action.

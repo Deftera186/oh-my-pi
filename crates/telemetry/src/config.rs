@@ -1,29 +1,9 @@
-//! Fail-open configuration and host hooks for agent telemetry.
+//! Fail-open telemetry configuration and host hooks.
 //!
-//! This is the Rust mapping of pi's `AgentTelemetryConfig`:
-//! `tracer` → [`TelemetryConfig::tracer`], `tracerName` →
-//! [`TelemetryConfig::tracer_name`], `captureMessageContent` →
-//! [`TelemetryConfig::capture_message_content`], `attributes` →
-//! [`TelemetryConfig::attributes`], `resolveAttributes` →
-//! [`TelemetryConfig::resolve_attributes`], `agent` →
-//! [`TelemetryConfig::agent`], `conversationId` →
-//! [`TelemetryConfig::conversation_id`], `costEstimator` →
-//! [`TelemetryConfig::cost_estimator`], `onCostDelta` →
-//! [`TelemetryConfig::on_cost_delta`], `onChatUsage` →
-//! [`TelemetryConfig::on_chat_usage`], `normalizeProvider` →
-//! [`TelemetryConfig::normalize_provider`], `normalizeAgentName` →
-//! [`TelemetryConfig::normalize_agent_name`], `contentSerializer` →
-//! [`TelemetryConfig::content_serializer`], `onSpanStart` →
-//! [`TelemetryConfig::on_span_start`], `onSpanEnd` →
-//! [`TelemetryConfig::on_span_end`], `onRunEnd` →
-//! [`TelemetryConfig::on_run_end`], and `onTelemetryWarning` →
-//! [`TelemetryConfig::on_telemetry_warning`].
-//!
-//! Pi's `TelemetryAttributeContext` maps to [`TelemetryAttributeContext`], and
-//! its `TelemetryHookContext` maps to [`TelemetryHookContext`]. All user code
-//! is invoked through fail-open methods on [`TelemetryConfig`]: both returned
-//! errors and panics become [`TelemetryWarning`] values. A failing warning hook
-//! is deliberately swallowed, matching pi's last-resort behavior.
+//! [`TelemetryConfig`] owns tracer, attribute, usage, and callback settings.
+//! User code runs through fail-open methods: returned errors and panics become
+//! [`TelemetryWarning`] values, while failures in the warning hook are
+//! swallowed.
 
 use std::{
 	any::Any,
@@ -260,7 +240,7 @@ pub struct TelemetryWarning {
 	pub error:   Option<Str>,
 }
 
-/// Optional overrides for pi's five bounded content serializers.
+/// Optional overrides for five bounded content serializers.
 #[derive(Clone, Default)]
 pub struct TelemetryContentSerializer {
 	/// Override request-message summary serialization.
@@ -384,7 +364,7 @@ impl TelemetryConfig {
 			.unwrap_or_else(|| Arc::new(opentelemetry::global::tracer(self.tracer_name.to_string())))
 	}
 
-	/// Resolves static and dynamic attributes in pi's merge order.
+	/// Resolves static and dynamic attributes in declaration order.
 	pub fn attributes_for_span(
 		&self,
 		context: &TelemetryAttributeContext<'_>,
@@ -440,7 +420,7 @@ impl TelemetryConfig {
 		}
 	}
 
-	/// Normalizes an agent name, preserving pi's built-in identity behavior.
+	/// Normalizes an agent name, preserving the built-in identity behavior.
 	pub fn normalized_agent_name(&self, name: Option<&str>) -> Option<Str> {
 		let Some(normalizer) = &self.normalize_agent_name else {
 			return name.filter(|value| !value.is_empty()).map(Str::new);

@@ -39,7 +39,7 @@ const OPENAI_RESPONSES_CODEC: &str = "openai-responses";
 /// Sibling-catalog responses-route hints for gateway-first discovered ids.
 ///
 /// The `OpenCode` gateways ship models before any census bundles them
-/// (`muse-spark-1.2[-contributor]`, served only at `/responses`, pi #8957).
+/// (`muse-spark-1.2[-contributor]`, served only at `/responses`).
 /// When an unbundled discovered id — or its billing-variant base (`-free`,
 /// `-contributor`) — is bundled on this provider or a declared sibling gateway
 /// with an `openai-responses` route, the listing materializes on this
@@ -150,9 +150,9 @@ impl CatalogDiscoveryProjector {
 			|| hints.is_some())
 		.then(|| {
 			// The taxonomy declares provider-scoped routing-variant suffixes
-			// (`gpt-5.6-luna-wm`, pi PR #8929), canonical-parameter recovery
-			// (pi PR #8991), or a responses-route hint group (pi #8957). The
-			// route allowlist above is scoped to the discovery route, but the
+			// (`gpt-5.6-luna-wm`), canonical-parameter recovery, or a responses-route
+			// hint group. The route allowlist above is scoped to the discovery route,
+			// but the
 			// bundled SKUs may live on per-model routes, so collect every
 			// bundled wire identity owned by this provider for the
 			// plain-counterpart and seeded-row lookups.
@@ -178,9 +178,8 @@ impl CatalogDiscoveryProjector {
 			.recovers_canonical_params(route.provider.as_str())
 			.then(|| {
 				// Canonical open-weight rows normally carry namespaced ids
-				// (`deepseek-ai/…`, pi PR #8991). Exact gateway-first response
-				// pins may also recover a reviewed bare canonical card (Muse
-				// Spark, pi bb80c8bc45). The first entry in frozen catalog
+				// (`deepseek-ai/`). Exact gateway-first response pins may also recover a
+				// reviewed bare canonical card (Muse Spark). The first entry in frozen catalog
 				// order wins deterministically.
 				let owners: BTreeMap<_, _> = catalog
 					.routes()
@@ -224,7 +223,7 @@ impl CatalogDiscoveryProjector {
 }
 
 /// Builds the responses-route hint set for a provider with exact route pins or
-/// a declared sibling group (pi #8957): authored gateway-first ids plus every
+/// a declared sibling group: authored gateway-first ids plus every
 /// bundled wire id on this provider or a sibling gateway riding an
 /// openai-responses route, and this provider's deterministic materialization
 /// target.
@@ -395,10 +394,10 @@ fn project_mixed_page(
 				&& hints.hinted(&row.wire_model)
 			{
 				// Gateway-first id bundled with an openai-responses route on
-				// this provider or a sibling gateway (pi #8957): materialize
-				// the listing on this provider's responses route instead of
-				// the discovery route. Canonical intrinsic parameters may be
-				// recovered separately; pricing and wire policy never transfer.
+				// this provider or a sibling gateway: materialize the listing on this
+				// provider's responses route instead of the discovery route. Canonical
+				// intrinsic parameters may be recovered separately; pricing and wire
+				// policy never transfer.
 				model.wire_ids = Box::new([(hints.target.clone(), row.wire_model.clone())]);
 				model.routes = Box::new([hints.target.clone()]);
 			}
@@ -444,7 +443,7 @@ fn canonical_reference<'catalog>(
 }
 
 /// Recovers intrinsic base-model parameters for a discovered open-weight row
-/// from its bundled canonical reference (pi PR #8991).
+/// from its bundled canonical reference.
 ///
 /// Only intrinsic facts transfer — display name, context window, output
 /// limit, the interned thinking policy, and unknown chat modality/reasoning
@@ -1116,8 +1115,8 @@ mod tests {
 
 	#[test]
 	fn gmi_bare_row_recovers_canonical_params_but_never_pricing() {
-		// pi PR #8991: GMI's /v1/models returns bare {id} rows for open-weight
-		// models it resells under canonical ids; intrinsic parameters come
+		// GMI's /v1/models returns bare {id} rows for open-weight models it resells
+		// under canonical ids; intrinsic parameters come
 		// from the bundled canonical reference index, the tariff never does.
 		let (provider, route, normalizer, canonical) = gmi_fixture();
 		let request = DiscoveryRequest {
@@ -1235,8 +1234,8 @@ mod tests {
 
 	#[test]
 	fn gmi_cloud_route_wires_canonical_recovery_from_the_embedded_catalog() {
-		// pi PR #8991 end-to-end: the bundled taxonomy declares gmi-cloud's
-		// canonical-parameter recovery, so the route projector recovers
+		// The bundled taxonomy declares gmi-cloud's canonical-parameter recovery,
+		// so the route projector recovers
 		// intrinsic params for a bare discovered open-weight row from another
 		// provider's bundled card (never its tariff), while the provider's own
 		// bundled seed keeps its full card — including GMI's published prices —
@@ -1297,8 +1296,8 @@ mod tests {
 
 	#[test]
 	fn hinted_gateway_first_ids_materialize_on_the_responses_route() {
-		// pi #8957: the OpenCode gateways ship models before any census
-		// bundles them. An unbundled id whose sibling-bundled spec — or
+		// The OpenCode gateways ship models before any census bundles them. An
+		// unbundled id whose sibling-bundled spec — or
 		// billing-variant base — rides openai-responses must rebind to the
 		// provider's responses route; everything else keeps the discovery
 		// route.
@@ -1415,8 +1414,8 @@ mod tests {
 
 	#[test]
 	fn opencode_zen_gateway_first_ids_ride_the_hinted_responses_route() {
-		// pi #8957 end-to-end: the bundled taxonomy declares the OpenCode
-		// gateway group, and opencode-zen's discovery route is its anthropic
+		// The bundled taxonomy declares the OpenCode gateway group, and opencode-zen's
+		// discovery route is its anthropic
 		// primary — exactly where an unhinted gateway-first responses model
 		// would break every turn.
 		use crate::catalog::snapshot::Catalog;

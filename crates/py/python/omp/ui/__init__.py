@@ -606,6 +606,7 @@ class _RendererRegistration:
 
 _handles: dict[str, "SlotHandle"] = {}
 _message_renderers: dict[str, Callable[[MessageView, RenderCtx], Tml | None]] = {}
+_markdown_transformers: dict[str, Callable[[str], str]] = {}
 _completion_handlers: dict[str, Callable[..., object]] = {}
 _completion_triggers: dict[str, Trigger] = {}
 _shortcut_handlers: dict[str, Callable[..., object]] = {}
@@ -779,6 +780,14 @@ def blur_slot() -> None: """Synchronously return focus to the composer."""; _emi
 def set_status(key: str, content: Tml | None, *, order: int = 100, side: Slot = Slot.STATUS_RIGHT) -> None: """Synchronously update a status contribution."""; _emit("set_status", key=key, content=content, order=order, side=side)
 def notify(message: str | Tml, *, level: Level | str = Level.INFO, title: str | None = None, desktop: bool = False, sound: Sound | None = None, urgency: Urgency | None = None) -> None: """Synchronously queue a fail-open notice effect."""; _emit("notify", message=message, level=Level(level), title=title, desktop=desktop, sound=sound, urgency=urgency)
 def set_working_message(content: Tml | None) -> None: """Synchronously replace the working-message banner."""; _emit("set_working_message", content=content)
+def set_working_indicator(frames: tuple[str, ...], interval_ms: int | None = None) -> None:
+    """Synchronously replace the core-timed working indicator for this turn."""
+    resolved = tuple(frames)
+    if not resolved or len(resolved) > 8 or any(not isinstance(frame, str) for frame in resolved):
+        raise ValueError("working indicator requires between one and eight string frames")
+    if interval_ms is not None and (not isinstance(interval_ms, int) or interval_ms <= 0):
+        raise ValueError("working indicator interval_ms must be a positive integer or None")
+    _emit("set_working_indicator", frames=resolved, interval_ms=interval_ms)
 def set_title(title: str | None) -> None: """Synchronously update the terminal title."""; _emit("set_title", title=title)
 def bell() -> None: """Synchronously queue one attention bell."""; _emit("bell")
 def set_progress(state: Progress) -> None: """Synchronously set terminal taskbar progress."""; _emit("set_progress", state=state)
@@ -904,6 +913,13 @@ async def _request(kind: str, **body: object) -> object:
         return None
 
 
+async def _strict_request(kind: str, **body: object) -> object:
+    """Issue a mutation request while preserving typed host refusals."""
+    from .. import _control_request
+
+    return await _control_request("omp.ui." + kind, **_wire(body))
+
+
 def _unavailable() -> DialogOutcome:
     return DialogOutcome(cancelled=True, reason=DialogCancel.UNAVAILABLE)
 
@@ -933,6 +949,36 @@ async def editor_text() -> str:
     """Return composer text, or an empty value when unavailable."""
     result = await _request("editor_text")
     return result if isinstance(result, str) else ""
+
+
+async def themes() -> tuple[str, ...]:
+    """Return installed theme names from the attached interactive host."""
+    result = await _request("themes")
+    return tuple(str(name) for name in result) if isinstance(result, (list, tuple)) else ()
+
+
+async def set_appearance(theme: str, *, persist: bool = False) -> None:
+    """Switch the live theme from an interactive command invocation."""
+    if not isinstance(theme, str) or not theme:
+        raise ValueError("theme must be a non-empty string")
+    await _strict_request("set_appearance", theme=theme, persist=bool(persist))
+
+
+async def tools_expanded() -> bool:
+    """Return whether transcript tool cards are expanded."""
+    return bool(await _request("tools_expanded"))
+
+
+async def set_tools_expanded(expanded: bool) -> None:
+    """Set transcript tool-card disclosure from an interactive command invocation."""
+    await _strict_request("set_tools_expanded", expanded=bool(expanded))
+
+
+async def set_hidden_thinking_label(label: str | None) -> None:
+    """Set the label shown in place of hidden reasoning blocks."""
+    if label is not None and not isinstance(label, str):
+        raise TypeError("hidden thinking label must be a string or None")
+    await _strict_request("set_hidden_thinking_label", label=label)
 
 
 async def _dialog(kind: str, **body: object) -> DialogOutcome:
@@ -998,6 +1044,35 @@ def message_renderer(
         return function
     return decorate
 
+
+def markdown_transformer(
+    name: str,
+) -> Callable[[Callable[[str], str]], Callable[[str], str]]:
+    """Register one synchronous transcript-markdown preprocessing fold."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("markdown transformer name must be a non-empty string")
+    def decorate(function: Callable[[str], str]) -> Callable[[str], str]:
+        if not callable(function) or _inspect.iscoroutinefunction(function):
+            raise TypeError("markdown transformers must be synchronous callables")
+        _declarations.register_ui("markdown_transformer", name, function)
+        _markdown_transformers[name] = function
+        return function
+    return decorate
+
+
+def _dispatch_markdown_transformer(name: str, markdown: str) -> str:
+    """Run one deadline-owned markdown fold, failing open to its input."""
+    function = _markdown_transformers.get(name)
+    if function is None:
+        return markdown
+    try:
+        value = function(markdown)
+        if not isinstance(value, str):
+            raise TypeError("markdown transformer must return str")
+        return value
+    except Exception:
+        _fold_failures.add((name, "markdown"))
+        return markdown
 
 
 def renderer(
@@ -1311,6 +1386,16 @@ async def _dispatch_command(
     if not isinstance(invocation, Invocation):
         raise TypeError("command dispatch requires Invocation")
     function = _command_handlers.get(invocation.name)
+    if function is None:
+        canonical = next(
+            (
+                definition.name
+                for definition in _declarations.command_definitions()
+                if invocation.name in definition.aliases
+            ),
+            None,
+        )
+        function = _command_handlers.get(canonical) if canonical is not None else None
     if function is None:
         raise CommandDenied(f"unknown command {invocation.name!r}")
     result = function(invocation, ctx)

@@ -205,6 +205,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		*self.parent_jobs.write() = Some(jobs);
 	}
 
+	/// Binds the observation gate used by driver-owned job lifecycle seams.
 	/// Returns the parent board used for self-delivering durable child turns.
 	pub fn parent_jobs(&self) -> Option<Arc<JobBoard>> {
 		self.parent_jobs.read().clone()

@@ -1,5 +1,5 @@
-//! Pi-compatible editing core: the flat-text [`EditBuffer`] (grapheme-safe
-//! word wrapping and navigation, undo, kill-ring yank/yank-pop, atomic
+//! Editing core: the flat-text [`EditBuffer`] (grapheme-safe word wrapping
+//! and navigation, undo, kill-ring yank/yank-pop, atomic
 //! references, character jumps, sticky page motion) and the
 //! [`Editor`] built on top of it (pluggable completion, inline ghost
 //! hints, emoji expansion, prompt history).
@@ -88,7 +88,7 @@ struct Segment {
 	last:  bool,
 }
 
-/// Shared Pi-style flat text editing model used by the widget and chat editors.
+/// Shared flat text editing model used by the widget and chat editors.
 #[derive(Clone, Debug)]
 pub struct EditBuffer {
 	text:          String,
@@ -1499,7 +1499,7 @@ impl Suggestion {
 
 	/// Marks this row as a complete command: Enter both applies the
 	/// completion and submits the input when only whitespace precedes the
-	/// command token (pi's submitted-slash-command rule).
+	/// command token (submitted-slash-command rule).
 	pub const fn with_submit(mut self) -> Self {
 		self.submits = true;
 		self
@@ -1571,9 +1571,9 @@ pub enum TabAction {
 /// Pluggable completion engine registered with [`Editor::set_completion`].
 ///
 /// The editor consults it after every edit, so an implementation chooses
-/// its own trigger convention (`/`, `@`, `#`, or none at all) by
-/// inspecting the text before the cursor. [`SlashCommands`] is the
-/// built-in pi-style implementation.
+/// its own trigger convention (`/`, `@`, `#`, or none at all) by inspecting
+/// the text before the cursor. [`SlashCommands`] is the built-in
+/// implementation.
 pub trait EditorCompletion {
 	/// Dropdown suggestions for the current text and byte cursor, or
 	/// `None` to close the dropdown.
@@ -1587,9 +1587,9 @@ pub trait EditorCompletion {
 	}
 
 	/// Tab pressed. `selected` is the highlighted row while this engine's
-	/// dropdown is open. Defaults to pi's behavior: accept the open row,
-	/// otherwise pass Tab through to the embedding app. The built-in
-	/// emoji dropdown always accepts without consulting the engine.
+	/// dropdown is open. Accepts the open row, otherwise passes Tab through to
+	/// the embedding app. The built-in emoji dropdown always accepts without
+	/// consulting the engine.
 	fn tab(&mut self, text: &str, cursor: usize, selected: Option<&Suggestion>) -> TabAction {
 		let _ = (text, cursor);
 		if selected.is_some() {
@@ -1676,7 +1676,7 @@ pub enum EditOutcome {
 	Ignored,
 }
 
-/// Editable multiline input with Pi-compatible completion and editing.
+/// Editable multiline input with completion and editing.
 ///
 /// Wraps an [`EditBuffer`] with a pluggable [`EditorCompletion`] dropdown,
 /// inline ghost hints, built-in emoji expansion, and prompt history —
@@ -2170,9 +2170,9 @@ impl Editor {
 		EditOutcome::Changed
 	}
 
-	/// pi's Enter rule while the dropdown is open: a command row accepted
-	/// with nothing before its token completes the command and submits in
-	/// one keypress; every other row is accepted in place.
+	/// When the dropdown is open, a command row with nothing before its token
+	/// completes the command and submits in one keypress; every other row is
+	/// accepted in place.
 	fn enter_picker(&mut self) -> EditOutcome {
 		if self.picker_enter_submits() {
 			self.accept_for_submit();
@@ -2361,7 +2361,7 @@ impl Command {
 
 	/// Argument candidates offered once the command name is complete:
 	/// `(name, description, usage)`, with `""` usage meaning none. Usage
-	/// text ghosts after the argument pi-style (`<path>`, `<a> <b>`).
+	/// text ghosts after the argument (`<path>`, `<a> <b>`).
 	pub fn with_args(mut self, args: &[(&str, &str, &str)]) -> Self {
 		self.args = args
 			.iter()
@@ -2374,7 +2374,7 @@ impl Command {
 		self
 	}
 
-	/// Usage hint shown as dim ghost text after the cursor, pi-style
+	/// Usage hint shown as dim ghost text after the cursor
 	/// (e.g. `<name> [--scope project|user]`).
 	pub fn with_hint(mut self, hint: &str) -> Self {
 		self.hint = Some(Str::new(hint));
@@ -2397,11 +2397,10 @@ impl Command {
 	}
 }
 
-/// Pi-compatible slash-command completion over a fixed [`Command`] palette.
+/// Slash-command completion over a fixed [`Command`] palette.
 ///
 /// `/` at a line start opens ranked name completion, the first argument
-/// completes against candidates, and usage text ghosts after the cursor
-/// (pi `buildSubcommandInlineHint`).
+/// completes against candidates, and usage text ghosts after the cursor.
 pub struct SlashCommands {
 	commands: Box<[Command]>,
 	usage:    Option<Arc<dyn Fn(&str) -> u64 + Send + Sync>>,
@@ -2684,9 +2683,9 @@ impl EditorCompletion for SlashCommands {
 		}
 	}
 
-	/// Pi-style usage ghosting: bare `/name ` shows the command's own
-	/// usage; a partial argument shows its remaining characters plus
-	/// usage; a chosen argument ghosts the usage words not yet typed.
+	/// Usage ghosting: bare `/name ` shows the command's own usage; a partial
+	/// argument shows its remaining characters plus usage; a chosen argument
+	/// ghosts the usage words not yet typed.
 	fn hint(&mut self, text: &str, cursor: usize) -> Option<Str> {
 		let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
 		let line = &text[line_start..cursor];

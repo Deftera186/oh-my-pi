@@ -1059,8 +1059,8 @@ fn disabled(raw: &str) -> bool {
 /// terminal cannot track pane scroll state for cursor-positioned
 /// placements. A forced kitty protocol opts unknown terminals in there
 /// (matching `timg -pk`); `OMP_KITTY_PLACEHOLDERS=1` opts in anywhere and
-/// `OMP_NO_KITTY_PLACEHOLDERS=1` is a hard opt-out. Mirrors pi's
-/// `detectKittyUnicodePlaceholdersSupport`.
+/// `OMP_NO_KITTY_PLACEHOLDERS=1` is a hard opt-out. Detection follows the
+/// terminal capability probe.
 fn kitty_placeholders(
 	vars: &impl Fn(&str) -> Option<String>,
 	id: TerminalId,

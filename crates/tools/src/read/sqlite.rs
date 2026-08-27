@@ -229,7 +229,7 @@ pub fn is_sqlite_target(display_path: &str, prefix: &[u8]) -> bool {
 	looks_like_sqlite(prefix) && !parse_path_candidates(display_path).is_empty()
 }
 
-/// Opens an existing database for query-only reads and installs pi's
+/// Opens an existing database for query-only reads and installs a
 /// three-second busy timeout.
 ///
 /// A cleanly closed WAL database can retain WAL format bytes in its header

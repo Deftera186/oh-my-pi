@@ -34,8 +34,8 @@ const SLOPPY_DESCRIPTION: &str = include_str!("../sloppy_prompt.txt");
 
 /// Freeform arguments shared by patch-envelope and sloppy revisions.
 ///
-/// Unknown provider-attached keys are deliberately ignored for pi parity;
-/// only `input` is canonicalized into the recorded tool call.
+/// Unknown provider-attached keys are deliberately ignored; only `input` is
+/// canonicalized into the recorded tool call.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct FreeformEditParams {
 	/// Complete dialect input.

@@ -404,8 +404,8 @@ pub fn model_operation_overrides(provider: &str, model: &str) -> OperationBits {
 /// Splits a Cursor effort-suffixed OpenAI sibling id into its base id and
 /// catalog-declared effort tier.
 ///
-/// The family gate intentionally mirrors pi's `parseOpenAIModel`: `gpt-` must
-/// be followed immediately by an ASCII version digit. Matching remains
+/// The family gate requires a `gpt-` prefix followed immediately by an ASCII
+/// version digit. Matching remains
 /// case-sensitive to preserve Cursor wire-id behavior.
 pub fn cursor_openai_effort_suffix<'model>(
 	model: &'model str,

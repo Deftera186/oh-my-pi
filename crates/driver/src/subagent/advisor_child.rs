@@ -113,6 +113,8 @@ pub enum AdvisorChildError {
 		#[source]
 		source: ChatError,
 	},
+	/// A policy extension denied advisor admission before composition.
+		/// Canonical structured policy denial.
 	/// Advisor tree admission failed.
 	#[error("failed to admit advisor {id}")]
 	Admission {

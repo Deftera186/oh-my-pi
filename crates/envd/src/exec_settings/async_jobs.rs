@@ -56,7 +56,7 @@ pub enum PollWaitDuration {
 	#[serde(rename = "5m")]
 	#[strum(to_string = "5m")]
 	Minutes5,
-	/// Apply the PI-compatible adaptive wait ladder.
+	/// Apply the adaptive wait ladder.
 	#[default]
 	#[serde(rename = "smart")]
 	#[strum(to_string = "smart")]
@@ -127,7 +127,7 @@ impl SettingsDomain for AsyncJobSettings {
 		FieldDescriptor {
 			path:        "async.poll_wait_duration",
 			label:       "Maximum Poll Time",
-			description: "Maximum implicit wait, or the adaptive PI-compatible wait ladder.",
+			description: "Maximum implicit wait, or the adaptive wait ladder.",
 			kind:        SettingKind::Enum(POLL_WAIT_VALUES),
 			scopes:      PERSISTED,
 			order:       40,

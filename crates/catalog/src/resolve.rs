@@ -325,6 +325,7 @@ pub struct RouteOverlay {
 pub struct CatalogOverlay {
 	/// Evidence source assigned to every field changed by this layer.
 	pub(crate) source:    ProvenanceSource,
+	/// Interned authentication-specification additions or replacements.
 	/// Complete provider additions or higher-precedence replacements.
 	#[serde(default)]
 	pub(crate) providers: Box<[ProviderDef]>,

@@ -52,9 +52,9 @@ pub struct ResolvedTransportValues {
 /// Resolves the dynamic portions of one MCP declaration.
 ///
 /// Literal environment and origin-locked header policies bypass both exact
-/// environment lookup and command execution. Other values follow pi parity:
-/// `!command` uses the shared secret resolver; otherwise an exact environment
-/// variable name wins, falling back to the literal text.
+/// environment lookup and command execution. Other values use the shared secret
+/// resolver for `!command`; otherwise an exact environment variable name wins,
+/// falling back to the literal text.
 pub async fn resolve_transport_values(
 	config: &McpServerConfig,
 	environment: &BTreeMap<Str, Str>,

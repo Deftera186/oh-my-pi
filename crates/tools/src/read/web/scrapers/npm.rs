@@ -151,7 +151,7 @@ fn parse(url: &Url) -> Option<Target> {
 	}
 	let mut package = percent_decode_component(first_raw)?;
 
-	// pi's scoped-package fallback operates on the still-encoded pathname, so
+	// The scoped-package fallback operates on the still-encoded pathname, so
 	// a literal leading `@` is significant here.
 	if package.starts_with('@')
 		&& remainder.starts_with('@')

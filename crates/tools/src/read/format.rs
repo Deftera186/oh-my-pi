@@ -124,7 +124,7 @@ pub struct FormattedText {
 }
 
 impl FormattedText {
-	/// Prepend pi's suffix-match resolution notice to this result.
+	/// Prepends the suffix-match resolution notice to this result.
 	pub fn prepend_suffix_resolution_notice(&mut self, from: &str, to: &str) {
 		let resolution = Some(SuffixResolution { from, to });
 		self.text = prepend_suffix_resolution_notice(&self.text, resolution);
@@ -720,7 +720,7 @@ pub fn format_merged_brace_line(
 	MergedBraceLine { model: format!("{start_line}-{end_line}:{display}"), display }
 }
 
-/// Prefix a formatted result with pi's exact suffix-match notice.
+/// Prefixes a formatted result with the exact suffix-match notice.
 pub fn prepend_suffix_resolution_notice(
 	text: &str,
 	resolution: Option<SuffixResolution<'_>>,
@@ -986,7 +986,7 @@ fn lexical_bracket_context(full_lines: &[&str], visible: &BTreeSet<usize>) -> BT
 	context
 }
 
-/// Format a byte count exactly like pi's shared `formatBytes` helper.
+/// Formats a byte count using the shared byte-size format.
 pub(crate) fn format_bytes(bytes: u64) -> String {
 	if bytes < 1024 {
 		format!("{bytes}B")

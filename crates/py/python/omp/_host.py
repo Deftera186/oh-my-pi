@@ -159,6 +159,10 @@ class Host:
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
+        # The parent creates CONTROL as a tokio socketpair whose ends are
+        # O_NONBLOCK; this synchronous codec requires a blocking descriptor,
+        # and EAGAIN from a nonblocking read must never read as disconnect.
+        os.set_blocking(fd, True)
         self._lock = Lock()
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 1
@@ -860,6 +864,7 @@ def _builtin_dispatch(operation: str) -> DispatchHandler | None:
         "omp.ui.command": ("omp.ui", "_dispatch_command"),
         "omp.ui.renderer": ("omp.ui", "_dispatch_renderer"),
         "omp.ui.message_renderer": ("omp.ui", "_dispatch_message_renderer"),
+        "omp.ui.markdown_transformer": ("omp.ui", "_dispatch_markdown_transformer"),
         "omp.ui.activation": ("omp.ui", "_dispatch_activation"),
         "omp.ui.terminal_input": ("omp.ui", "_feed_terminal_input"),
         "omp.telemetry.dispatch": ("omp.telemetry", "_dispatch_subscription"),

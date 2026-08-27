@@ -1755,8 +1755,8 @@ mod config {
 			};
 			let width = parse_width(options.get_one::<String>(options::WIDTH), host, &runtime)?;
 
-			// pi-uutils: non-tty context, so SHOW_CONTROL_CHARS and the default both
-			// enable control chars; only --hide-control-chars disables them.
+			// In a non-tty context, SHOW_CONTROL_CHARS and the default both enable
+			// control chars; only --hide-control-chars disables them.
 			let mut show_control = !options.get_flag(options::HIDE_CONTROL_CHARS);
 
 			let (mut quoting_style, mut locale_quoting) =

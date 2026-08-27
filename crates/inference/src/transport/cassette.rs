@@ -119,7 +119,7 @@ pub enum CassetteReplayBuildError {
 
 /// Immutable deterministic replay script built from [`CaptureSnapshot`].
 ///
-/// Capture exchanges are matched in capture order, like pi's first-completed
+/// Capture exchanges are matched in capture order using the first-completed
 /// `/v1/messages` exchange queue. Request payloads and credentials are not
 /// fingerprinted because the always-on capture intentionally never retains
 /// them. Each transport returned by [`Self::transport`] starts at exchange

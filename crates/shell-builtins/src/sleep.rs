@@ -1,4 +1,4 @@
-//! The `sleep` builtin, moved from `pi-shell`.
+//! The `sleep` builtin.
 
 use std::{future::Future, io::Write, result, time::Duration};
 

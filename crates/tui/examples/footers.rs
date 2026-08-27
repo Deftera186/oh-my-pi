@@ -9,7 +9,7 @@
 //! What's still open is where the *session title* lives: the named task
 //! ("Immutable Commit Placement…"), which is not the same thing as the
 //! current working narration. Each study places that title somewhere
-//! else, pi's border-fused layout included as the reference point.
+//! else, the border-fused layout included as the reference point.
 //!
 //! Every study animates live — spinner, session timer, and the narration
 //! shimmer all run — so spacing can be judged in motion.
@@ -157,11 +157,11 @@ struct Study {
 
 const STUDIES: [Study; 6] = [
 	Study {
-		title: "pi parity",
+		title: "border-fused",
 		note:  "border carries the band left and the title right; the intent rides its own spinner \
 		        row",
 		rows:  4,
-		draw:  study_pi_parity,
+		draw:  study_primary,
 	},
 	Study {
 		title: "gap title",
@@ -231,7 +231,7 @@ fn compose(scene: &Scene) -> Frame {
 /// 1: the pi layout verbatim — a bordered composer whose top border
 /// carries the session band on the left and the title on the right, with
 /// the spinner narrating intent on its own row above the box.
-fn study_pi_parity(frame: &mut Frame, y: u16, scene: &Scene) {
+fn study_primary(frame: &mut Frame, y: u16, scene: &Scene) {
 	draw_working_spin(frame, 1, y, scene);
 	let (tl, tr, bl, br, horizontal, vertical) = border_glyphs(scene.charset);
 	let right = scene.right_edge();

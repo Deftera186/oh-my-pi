@@ -306,7 +306,7 @@ pub async fn read_resource<C: HttpClient + Sync>(
 	Ok(text_result(final_url, content_type, "raw", text.to_string()))
 }
 
-/// Converts HTML with pi's aggressive native-reader options.
+/// Converts HTML with aggressive native-reader options.
 pub fn html_to_markdown(html: &str) -> Result<Str, WebError> {
 	let options = ConversionOptions {
 		skip_images: false,

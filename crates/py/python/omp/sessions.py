@@ -8,10 +8,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from _omp import Duration, EnvPath, OmpError
+from _omp import Duration, EnvPath, OmpError, SessionSetup
 
 from ._errors import NotWiredError
 from .journal import EntryId, JournalEntry
+from ._verdicts import BlobPart, TextPart
 
 
 class SessionError(OmpError):
@@ -28,6 +29,32 @@ class SessionAccessDenied(SessionError):
 
 class SessionNotFound(OmpError):
     """The requested session does not exist or is not visible to the caller."""
+
+class SessionTransitionDenied(SessionError):
+    """Core refused a session transition before creating any durable state."""
+
+    def __init__(
+        self, reason: str, *, details: Mapping[str, object] | None = None
+    ) -> None:
+        self.reason = reason
+        self.details = {} if details is None else dict(details)
+        super().__init__(reason)
+
+
+class SessionTransitionIndeterminate(SessionError):
+    """Core cannot prove whether a create transaction became durable."""
+
+    def __init__(
+        self,
+        idempotency_key: str | None,
+        reason: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        self.idempotency_key = idempotency_key
+        self.reason = reason
+        self.details = {} if details is None else dict(details)
+        super().__init__(reason)
 
 
 class SessionStatus(StrEnum):
@@ -504,6 +531,64 @@ async def resume(session_id: str) -> SessionInfo:
         await _request("omp.sessions.resume", session_id=session_id)
     )
 
+def _wire_initial_prompt(value: str | tuple[object, ...] | None) -> object:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [{"kind": "text", "text": value}]
+    if not value:
+        raise ValueError("SessionSetup.initial_prompt tuple must not be empty")
+    parts: list[dict[str, object]] = []
+    for part in value:
+        if isinstance(part, TextPart):
+            parts.append({"kind": "text", "text": part.text})
+        elif isinstance(part, BlobPart):
+            from .agents import _wire
+
+            parts.append({"kind": "blob", "blob": _wire(part.blob), "alt": part.alt})
+        else:
+            raise TypeError(
+                "SessionSetup.initial_prompt accepts only omp.Part.text() and omp.Part.blob() values"
+            )
+    return parts
+
+
+def _wire_setup(setup: SessionSetup) -> dict[str, object]:
+    if not isinstance(setup, SessionSetup):
+        raise TypeError("setup must be an omp.SessionSetup")
+    from .journal import _entry_wire
+
+    return {
+        "schema": "omp.sessions.setup.v1",
+        "title": setup.title,
+        "parent": setup.parent,
+        "entries": [_entry_wire(entry) for entry in setup.entries],
+        "initial_prompt": _wire_initial_prompt(setup.initial_prompt),
+    }
+
+
+async def create(setup: SessionSetup = SessionSetup()) -> SessionInfo:
+    """Atomically create, seed, and switch to a top-level interactive session."""
+
+    try:
+        return _decode_session(
+            await _request("omp.sessions.create", setup=_wire_setup(setup))
+        )
+    except Exception as error:
+        code = getattr(error, "code", None)
+        details = getattr(error, "details", None)
+        detail = details if isinstance(details, Mapping) else {}
+        if code == "SessionTransitionDenied":
+            raise SessionTransitionDenied(str(error), details=detail) from error
+        if code == "SessionTransitionIndeterminate":
+            key = detail.get("idempotency_key")
+            raise SessionTransitionIndeterminate(
+                None if key is None else str(key),
+                str(error),
+                details=detail,
+            ) from error
+        raise
+
 
 async def rename(session_id: str, title: str) -> SessionInfo:
     """Assign a user title and journal the durable rename receipt."""
@@ -584,7 +669,8 @@ async def journal(
 __all__ = (
     "Bucket", "Cost", "GroupBy", "SessionAccessDenied", "SessionError",
     "SessionFilter", "SessionInfo", "SessionKind", "SessionLink", "SessionNotFound",
-    "SessionStatus", "TitleSource", "Usage",
-    "UsageAccuracy", "UsageBucket", "UsageQuery", "UsageReport", "current", "delete",
+    "SessionSetup", "SessionStatus", "SessionTransitionDenied",
+    "SessionTransitionIndeterminate", "TitleSource", "Usage",
+    "UsageAccuracy", "UsageBucket", "UsageQuery", "UsageReport", "create", "current", "delete",
     "get", "journal", "lineage", "list", "rename", "resume", "usage",
 )

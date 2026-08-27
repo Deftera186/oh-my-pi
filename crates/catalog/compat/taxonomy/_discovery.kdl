@@ -5,14 +5,14 @@ discovery {
 	// models it resells under canonical namespaced ids, so discovery
 	// recovers intrinsic base-model parameters (display name, context
 	// window, output limit, thinking policy) from the bundled canonical
-	// reference index (pi PR #8991). OpenCode Go additionally recovers
-	// intrinsic parameters for its exact gateway-first Responses pins, whose
-	// bare ids otherwise carry no capability metadata (pi bb80c8bc45).
+	// reference index. OpenCode Go additionally recovers intrinsic parameters
+	// for its exact gateway-first Responses pins, whose bare ids otherwise carry
+	// no capability metadata.
 	// Pricing, wire policy, and routes are never borrowed across providers.
 	recover-canonical-params "gmi-cloud" "opencode-go" "yolo-auto"
 	// The OpenCode gateways share one operator and ship models before any
 	// census bundles them (muse-spark-1.2[-contributor] was served only at
-	// /responses while unbundled, pi #8957). An unbundled discovered id —
+	// /responses while unbundled). An unbundled discovered id —
 	// or its billing-variant base — that is bundled on either gateway with
 	// an openai-responses route materializes on the discovering gateway's
 	// responses route instead of the discovery route. Only the responses

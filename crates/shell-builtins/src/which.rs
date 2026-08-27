@@ -1,6 +1,4 @@
 //! `which` builtin: locate executables in the shell's `PATH`.
-//!
-//! Ported from pi-shell's in-process `which` implementation.
 
 use std::io::Write;
 

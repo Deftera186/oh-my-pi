@@ -1,4 +1,4 @@
-//! Pi-compatible workspace path matching with mtime-ranked grouped output.
+//! Workspace path matching with mtime-ranked grouped output.
 
 use std::{
 	collections::HashSet,

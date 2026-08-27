@@ -5054,7 +5054,7 @@ fn print_version(host: &mut Host) {
 	let _ = writeln!(host.stdout, "find (Rust) 0.8.0");
 }
 
-/// pi-uutils: BSD `find -E` compatibility (macOS muscle memory).
+/// BSD `find -E` compatibility (macOS muscle memory).
 ///
 /// BSD `-E` selects POSIX extended regular expressions before the path list;
 /// GNU find rejects it, but supports the equivalent `-regextype

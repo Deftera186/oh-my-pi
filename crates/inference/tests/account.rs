@@ -210,7 +210,7 @@ fn quota_headroom_ranks_accounts_and_exhaustion_expires_at_provider_reset() {
 
 #[test]
 fn model_policy_cooldown_blocks_one_route_and_rotates_to_an_entitled_sibling() {
-	// A ChatGPT account denied one Codex model (pi #8756) must stop competing
+	// A ChatGPT account denied one Codex model must stop competing
 	// for that model while its other entitlements — and its siblings — keep
 	// working; the block expires on its own.
 	let pool = AccountPool::new();

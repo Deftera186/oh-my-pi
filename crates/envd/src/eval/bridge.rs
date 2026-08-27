@@ -384,6 +384,7 @@ pub enum BridgeHostError {
 	/// Model-facing failure message produced by the host-side operation.
 	#[error("{0}")]
 	Message(Str),
+	/// Canonical policy denial produced before a child session exists.
 }
 
 impl BridgeHostError {

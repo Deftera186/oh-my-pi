@@ -447,7 +447,7 @@ fn billed_tokens(family: BillingFamily, frame_size: u32) -> u64 {
 	}
 }
 
-/// Selects Pi's eval-winning geometry for a model and carrying API.
+/// Selects eval-winning geometry for a model and carrying API.
 pub fn resolve_shape(target: ShapeTarget<'_>) -> Shape {
 	let family = billing_family(target.api);
 	let id = target.model_id.unwrap_or_default().to_ascii_lowercase();

@@ -243,7 +243,7 @@ impl DapAdapterRegistry {
 		self.state.read().by_name.values().cloned().collect()
 	}
 
-	/// Resolves pi-compatible js-debug installation locations, preferring the
+	/// Resolves js-debug installation locations, preferring the
 	/// explicit environment path, then Mason, then `~/.local/opt/js-debug`.
 	/// The discovered script replaces the synthetic built-in command.
 	pub fn discover_js_debug(
@@ -382,7 +382,7 @@ fn resolve_path_command(command: &str) -> Option<PathBuf> {
 	})
 }
 
-/// Locates the js-debug server script in pi-compatible priority order.
+/// Locates the js-debug server script in priority order.
 pub fn discover_js_debug_server(
 	project_root: &Path,
 	home: &Path,

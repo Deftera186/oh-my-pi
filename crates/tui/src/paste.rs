@@ -597,8 +597,8 @@ pub enum Clipboard {
 /// Reads smart clipboard content, preferring image data, then file paths, then
 /// text.
 ///
-/// One exception, ported from pi (#8769): macOS Finder `Cmd+C` on an image
-/// file advertises BOTH a `public.file-url` representation and a generated
+/// macOS Finder `Cmd+C` on an image file advertises BOTH a `public.file-url`
+/// representation and a generated
 /// 1024x1024 file-icon bitmap, and `arboard::get_image()` succeeds with the
 /// icon — so a file URL resolving to a supported image file wins over the
 /// co-advertised bitmap. Pure bitmap pasteboards (screenshots, browser
@@ -765,7 +765,7 @@ fn read_clipboard_image() -> Option<PastedImage> {
 		// arboard rejects the CF_DIBV5 payloads Qt-based screenshot tools
 		// (PixPin, Snipaste, ...) put up; PowerShell's
 		// `[Clipboard]::GetImage()` reads them fine, so it backs the native
-		// path instead of a hand-rolled DIB decoder (pi-natives #3426).
+		// path instead of a hand-rolled DIB decoder.
 		return native_read_image().or_else(read_powershell_image);
 	}
 	if cfg!(target_os = "macos") {

@@ -25,7 +25,7 @@ pub(super) fn matches(url: &Url) -> bool {
 	matches!(url.host_str(), Some("twitter.com" | "www.twitter.com" | "x.com" | "www.x.com"))
 }
 
-/// Tries the public Nitter mirrors in order, returning pi's stable blocked
+/// Tries the public Nitter mirrors in order, returning the stable blocked
 /// response when every anonymous mirror is unavailable.
 pub(super) async fn render<C: HttpClient + Sync>(
 	client: &C,

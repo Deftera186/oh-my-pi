@@ -1,4 +1,4 @@
-//! Exact pi-compatible stale hash rejection diagnostics.
+//! Exact stale hash rejection diagnostics.
 
 use std::{
 	error,
@@ -52,7 +52,7 @@ pub struct MismatchError {
 }
 
 impl MismatchError {
-	/// Builds the exact model-facing pi rejection message.
+	/// Builds the exact model-facing rejection message.
 	pub fn new(details: MismatchDetails) -> Self {
 		let message = format_mismatch(&details);
 		Self { details, message: message.into() }

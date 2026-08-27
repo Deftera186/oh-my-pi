@@ -1,4 +1,4 @@
-//! Pi-compatible sparse-edit parsing and pure, atomic text transformation.
+//! Sparse-edit parsing and pure, atomic text transformation.
 
 use std::{collections::VecDeque, mem};
 

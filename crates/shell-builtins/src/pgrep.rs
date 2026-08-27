@@ -1,4 +1,4 @@
-//! The `pgrep` process-matching command, moved from `pi-shell`.
+//! The `pgrep` process-matching command.
 
 use clap::Parser;
 use omp_shell_engine::builtins;

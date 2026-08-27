@@ -137,8 +137,8 @@ impl Default for GenerationOptions {
 }
 
 impl GenerationOptions {
-	/// Pi-parity bounded title generation: no thinking, `<title>` prefill,
-	/// withheld closing marker, and a hard twenty-token completion cap.
+	/// Bounded title generation: no thinking, `<title>` prefill, withheld
+	/// closing marker, and a hard twenty-token completion cap.
 	pub fn title() -> Self {
 		Self {
 			max_tokens:       20,

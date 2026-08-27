@@ -819,6 +819,7 @@ impl HeadlessSession {
 		result
 	}
 
+	/// Gates one parsed headless extension command before handler dispatch.
 	/// Forces one exact registered tool for the next submitted turn only.
 	pub fn force_tool_once(&self, name: Str) -> Result<(), HeadlessError> {
 		if !self.state.snapshot().enabled_tools.contains(&name) {

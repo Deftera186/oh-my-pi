@@ -19,6 +19,23 @@ import json
 import omp
 import omp._registry as registry_module
 
+omp.packages._install_snapshot(
+    [{
+        "name": "registry-contract",
+        "version": "1.0.0",
+        "extension_id": "registry-contract",
+        "root": "/registry-contract",
+        "files": (),
+    }],
+    own="registry-contract",
+)
+skill_metadata = {
+    "name": "review",
+    "description": "Review a change.",
+    "hidden": False,
+    "disable_model_invocation": False,
+    "autoload": False,
+}
 registry_module.configure_manifest(
     extension="registry-contract",
     tools=(
@@ -26,7 +43,91 @@ registry_module.configure_manifest(
         ("contract_tool", "registry-contract", 3),
     ),
     services=(("acme.contract", 2),),
+    declarations=(
+        {
+            "kind": "skills",
+            "path": "extension/.omp-generated/skills/review/SKILL.md",
+            "metadata": skill_metadata,
+        },
+        {
+            "id": "contract-device",
+            "kind": "soft",
+            "module": "__main__",
+            "key": "contract_device@wire.7",
+            "trigger": "lazy",
+            "api": 1,
+            "failure": "fault",
+        },
+        {
+            "id": "contract-tool",
+            "kind": "hard",
+            "module": "__main__",
+            "key": "contract_tool@registry-contract.3",
+            "trigger": "lazy",
+            "api": 1,
+            "failure": "fault",
+        },
+        {
+            "id": "contract-service",
+            "kind": "service",
+            "module": "__main__",
+            "key": "acme.contract",
+            "trigger": "lazy",
+            "api": 1,
+            "failure": "fault",
+        },
+    ),
 )
+skill_evaluations = 0
+lowering_evaluations = 0
+
+
+def deterministic_skill():
+    global lowering_evaluations
+    lowering_evaluations += 1
+    return "Review\n\nInspect the change."
+
+
+lowering_args = {
+    "name": "review",
+    "description": "Review a change.",
+    "hidden": False,
+    "disable_model_invocation": False,
+    "autoload": False,
+    "contain_root": None,
+}
+first_lowering = registry_module._lower_skill_declaration(
+    deterministic_skill, **lowering_args
+)
+second_lowering = registry_module._lower_skill_declaration(
+    deterministic_skill, **lowering_args
+)
+assert first_lowering == second_lowering
+assert lowering_evaluations == 2
+try:
+    registry_module._lower_skill_declaration(
+        lambda: "x" * 64_000,
+        name="oversized",
+        description="Oversized.",
+        hidden=False,
+        disable_model_invocation=False,
+        autoload=False,
+        contain_root=None,
+    )
+except ValueError:
+    pass
+else:
+    raise AssertionError("oversized generated skill was accepted")
+
+
+@omp.skill("review", description="Review a change.")
+def review_skill():
+    global skill_evaluations
+    skill_evaluations += 1
+    return "Review\n\nInspect the change."
+
+
+assert skill_evaluations == 1
 
 
 @omp.device(
@@ -59,6 +160,21 @@ class ContractService:
 marker = object()
 snapshot = registry_module.freeze_declarations()
 tools, metadata_json = registry_module.project_worker_registry()
+assert skill_evaluations == 1
+assert len(snapshot.skills) == 1
+assert snapshot.skills[0].declaration.path == (
+    "extension/.omp-generated/skills/review/SKILL.md"
+)
+assert snapshot.skills[0].content == (
+    b"---\nname: review\ndescription: 'Review a change.'\n---\n\n"
+    b"Review\n\nInspect the change.\n"
+)
+try:
+    omp.skill("late", description="late")(lambda: "late")
+except omp.DeclarationSealed:
+    pass
+else:
+    raise AssertionError("late @omp.skill declaration was accepted")
 assert snapshot.tools == frozenset({
     ("contract_device", "wire", 7),
     ("contract_tool", "registry-contract", 3),
@@ -88,6 +204,10 @@ assert asyncio.run(tool_row.handler({"count": 4}, marker)) == {
 }
 
 metadata = json.loads(metadata_json)
+assert metadata["skills"] == [{
+    "metadata": skill_metadata,
+    "path": "extension/.omp-generated/skills/review/SKILL.md",
+}]
 assert metadata["tools"][0]["rev"] == 7
 assert metadata["services"] == [{
     "methods": [{

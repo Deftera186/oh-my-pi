@@ -2731,11 +2731,9 @@ mod tests {
 		}
 	}
 
-	// Seen-line guard contracts ported from pi's `Patcher seen-line
-	// provenance` and `read → edit seen-line guard` suites (final state after
-	// the #8461 retry-token revert): rejections resend the full patch, full
-	// inline reveals unblock a straight same-tag retry, and truncated reveals
-	// keep the merge gate closed.
+	// Seen-line guard contracts: rejections resend the full patch, full inline
+	// reveals unblock a straight same-tag retry, and truncated reveals keep the
+	// merge gate closed.
 	const GUARD_PATH: &str = "notes.txt";
 	const GUARD_CONTENT: &str = "l1\nl2\nl3\nl4\nl5\n";
 

@@ -407,7 +407,7 @@ impl OpenAiChatCodec {
 		// The gateway disables thinking whenever a tool-choice selector is
 		// present. `auto` is the provider default and can be omitted without
 		// changing tool semantics, so reasoning survives; forced and named
-		// selectors remain authoritative (pi 7cb504cdb3).
+		// selectors remain authoritative.
 		if self.profile.disable_reasoning_on_tool_choice
 			&& matches!(&request.reasoning, Setting::Require(_) | Setting::Prefer(_))
 			&& matches!(&tool_choice, Some(WireToolChoice::Mode(ToolChoiceMode::Auto)))
@@ -2355,7 +2355,7 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 	// not an upstream RPM/TPM throttle: the request never reached a model, and
 	// sleeping on the same route (honoring the proxy's ~60s hint) duplicates
 	// the backoff and model fallback the router already owns, stalling one
-	// turn for minutes (pi #8854). Genuine quota 429s carry no marker.
+	// turn for minutes. Genuine quota 429s carry no marker.
 	let concurrency_admission = error
 		.rate_limit_type
 		.as_ref()
@@ -2761,7 +2761,7 @@ mod tests {
 		}
 	}
 
-	/// Exclusive-required MCP shape from pi issue #2652 / the xAI 400 class.
+	/// Exclusive-required MCP shape for the xAI 400 class.
 	fn coverage_tool() -> ToolDefinition {
 		json_tool(
 			"mcp__codebase_memory_check_index_coverage",
@@ -3066,10 +3066,9 @@ mod tests {
 	#[test]
 	fn typed_error_envelopes_preserve_classification_evidence() {
 		// The OpenRouter fixture is a gateway 502 for an upstream model failure
-		// (metadata.raw carries the upstream detail). pi auto-retries bare
-		// gateway upstream failures as transient (PR #8370's 429/500/502/503/529
-		// set), so the 502 classifies as a retryable capacity failure rather
-		// than a terminal provider-contract mismatch.
+		// (metadata.raw carries the upstream detail). Gateway upstream failures
+		// are transient (429/500/502/503/529), so the 502 classifies as a retryable
+		// capacity failure rather than a terminal provider-contract mismatch.
 		for (fixture, kind, code) in [
 			(
 				include_bytes!("../../../../fixtures/llm-oracle/openai/chat/error.azure.json")
@@ -3231,7 +3230,7 @@ mod tests {
 		// before dispatching upstream, marking the immediate 429 with
 		// `rate_limit_type: max_parallel_requests`. The admission failure must
 		// skip the transport's same-route sleep so the router's fallback walk
-		// owns retry/fallback immediately (pi #8854).
+		// owns retry/fallback immediately.
 		let classify = |code: Option<&str>, rate_limit_type: Option<&str>| {
 			classify_error(
 				WireError {
@@ -3705,8 +3704,8 @@ mod tests {
 
 	#[test]
 	fn template_effort_rides_top_level_and_kwargs() {
-		// pi bf490ae024: without routing the selected effort onto the Qwen 3.8+
-		// template's `reasoning_effort` kwarg, `enable_thinking` alone leaves
+		// Without routing the selected effort onto the Qwen 3.8+ template's
+		// `reasoning_effort` kwarg, `enable_thinking` alone leaves
 		// the model reasoning at its xhigh default. Twin emission: top-level
 		// for newer llama.cpp builds, kwargs for older builds.
 		let mut profile =

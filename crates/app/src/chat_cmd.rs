@@ -116,6 +116,15 @@ use crate::{
 	wizard,
 };
 
+/// Runs the session-switch admission chain without constructing a payload
+/// when no extension subscribes.
+/// Runs session-branch admission and returns the composed `summarize` value.
+/// Runs the fail-closed rewind admission chain before the journal is changed.
+/// Emits the bounded session-shutdown observation.
+/// Emits one post-commit session-switched observation.
+/// Emits one post-commit session-branched observation.
+/// Emits one post-commit session-rewound observation.
+/// Emits one post-commit session-reset observation.
 fn absolute_invocation_deadline(now: Instant, max_time: Option<Duration>) -> Option<Instant> {
 	max_time.and_then(|duration| now.checked_add(duration))
 }

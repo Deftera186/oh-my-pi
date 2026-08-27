@@ -3318,9 +3318,9 @@ fn trusted_extension_path(value: &str) -> Result<omp_envd::site::TrustedModule, 
 ///
 /// A bare trusted module has no static OMP declaration metadata. The CLI trust
 /// act authenticates its exact startup module and bytes; named tools,
-/// inter-extension services, and CONTROL quota classes stay empty because pi
-/// supplies no deployment-owned metadata for those sets. Python registration
-/// is never promoted into an authenticated manifest.
+/// inter-extension services, and CONTROL quota classes stay empty because the
+/// trusted module supplies no deployment-owned metadata for those sets. Python
+/// registration is never promoted into an authenticated manifest.
 pub fn trusted_extension(module: TrustedModule) -> ExtHostSpec {
 	let encoded = hex::encode_n(module.artifact_digest.as_bytes());
 	let extension_id = Str::from(format!("trusted.{}.{}", module.module, &encoded[..16],));

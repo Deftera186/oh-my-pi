@@ -99,7 +99,7 @@ fn sanitize_json(value: serde_json::Value) -> Option<serde_json::Value> {
 	}
 }
 
-/// Infers pi's conventional unit suffix from a metric key.
+/// Infers the conventional unit suffix from a metric key.
 pub fn infer_metric_unit(name: &str) -> &'static str {
 	if name.ends_with("µs") || name.ends_with("_µs") {
 		"µs"
@@ -223,7 +223,7 @@ pub fn scope_deviations(
 	deviations.into_iter().collect()
 }
 
-/// Makes a bounded, dated branch candidate matching pi's namespace.
+/// Makes a bounded, dated branch candidate in the repository namespace.
 pub fn branch_candidate(goal: Option<&str>, date: &str, suffix: Option<u32>) -> Str {
 	let mut slug = String::new();
 	for character in goal.unwrap_or("experiment").chars() {

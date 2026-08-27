@@ -1,4 +1,4 @@
-//! `pidwait` process-waiting builtin, moved from `pi-shell`.
+//! `pidwait` process-waiting builtin.
 
 use clap::Parser;
 use omp_shell_engine::builtins;

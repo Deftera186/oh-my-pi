@@ -1,4 +1,4 @@
-//! The `ps` process-status builtin, moved from `pi-shell`.
+//! The `ps` process-status builtin.
 
 #[cfg(unix)]
 use std::collections::HashSet;

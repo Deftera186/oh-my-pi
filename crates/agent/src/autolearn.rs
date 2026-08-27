@@ -12,7 +12,7 @@ use crate::{Interrupt, InterruptClass, InterruptSource, PromptNamedInput};
 
 /// Durable item property marking the private synthetic capture turn.
 pub const CAPTURE_PROP: &str = "omp/autolearn-capture";
-/// Pi-compatible substantive-turn threshold.
+/// Minimum substantive-turn threshold.
 pub const DEFAULT_MIN_TOOL_CALLS: usize = 5;
 
 const GUIDANCE: &str = "## Auto-Learn (experimental)\n\n`manage_skill`: build reusable \

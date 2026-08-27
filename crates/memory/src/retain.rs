@@ -89,7 +89,7 @@ impl<'a> Retainer<'a> {
 		}
 	}
 
-	/// Retains only when the Pi-default user-turn interval has elapsed.
+	/// Retains only when the configured user-turn interval has elapsed.
 	pub fn retain_periodic(&self, messages: &[RetentionMessage<'_>]) -> Result<RetentionOutcome> {
 		self.retain(messages, false)
 	}

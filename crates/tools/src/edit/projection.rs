@@ -1,4 +1,4 @@
-//! Pure pi-compatible model-facing edit response projection.
+//! Pure model-facing edit response projection.
 
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
@@ -309,7 +309,7 @@ pub enum SectionOp {
 	Update,
 }
 
-/// Borrowed facts needed to render one section exactly as pi does.
+/// Borrowed facts needed to render one section.
 #[derive(Clone, Copy, Debug)]
 pub struct SectionView<'a> {
 	/// Durable section outcome.
@@ -368,7 +368,7 @@ pub fn render_section(view: SectionView<'_>) -> Str {
 	output.freeze()
 }
 
-/// Joins independently rendered section responses with pi's single blank row.
+/// Joins independently rendered section responses with a single blank row.
 pub fn render_sections(sections: &[Str]) -> Str {
 	let capacity =
 		sections.iter().map(Str::len).sum::<usize>() + sections.len().saturating_sub(1) * 2;

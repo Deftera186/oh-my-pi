@@ -120,7 +120,7 @@ fn render_read_live(state: &ReadState) -> El {
 /// presentation.
 ///
 /// Filesystem paths, web URLs, and unrecognized schemes (including `xd://`
-/// devices) collapse — mirroring pi's read grouping — while recognized
+/// devices) collapse into compact groups — while recognized
 /// internal URLs (`skill://`, `agent://`, `pr://`, …) keep the full card so
 /// their resolved content stays visible.
 fn grouped_read_target(path: &str) -> bool {

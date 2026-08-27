@@ -244,7 +244,7 @@ impl Display for ImageFault {
 
 impl error::Error for ImageFault {}
 
-/// Returns whether a path has one of pi's supported image extensions.
+/// Returns whether a path has one of the supported image extensions.
 ///
 /// Byte sniffing remains authoritative: an image may be recognized without one
 /// of these extensions, and a file with one of these extensions may not decode
@@ -308,8 +308,7 @@ pub fn rasterize_svg(source: &[u8], gzip: bool) -> Result<Bytes, SvgRasterFault>
 /// Classifies PNG, JPEG, GIF, and WebP bytes.
 ///
 /// Extracts dimensions available in their headers. This intentionally
-/// recognizes truncated images after a valid magic signature, matching pi's
-/// classification behavior.
+/// recognizes truncated images after a valid magic signature.
 pub fn sniff_metadata(header: &[u8]) -> Option<ImageMetadata> {
 	parse_png(header)
 		.or_else(|| parse_jpeg(header))
@@ -469,8 +468,9 @@ pub fn process_image_for_stb(input: Bytes) -> Result<Option<ProcessedImage>, Ima
 /// return `None` when their bytes are not one of the four supported image
 /// encodings. Inputs within the dimension bounds and at most one quarter of the
 /// output budget are retained verbatim. Other inputs are resized/recompressed
-/// using pi's dimension, quality, and scale ladders. GIF/WebP animation is
-/// retained on the verbatim path; re-encoding produces the decoded first frame.
+/// using the configured dimension, quality, and scale ladders. GIF/WebP
+/// animation is retained on the verbatim path; re-encoding produces the decoded
+/// first frame.
 pub fn process_image(input: Bytes) -> Result<Option<ProcessedImage>, ImageFault> {
 	if input.len() > MAX_IMAGE_INPUT_BYTES {
 		return Err(ImageFault::TooLarge {

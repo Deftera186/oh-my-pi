@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, Literal
 from _omp import ActivateReason, ArtifactUrl, BlobRef, Duration, EnvPath
 
 
@@ -24,6 +24,7 @@ from .hooks import (
     Channel,
     Composition,
     HookDecision,
+    HookPhase,
     LatencyClass,
     OnFailure,
     TargetKind,
@@ -467,6 +468,15 @@ class TurnEndEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class TodoRef:
+    """Read-only reference to one actionable built-in todo item."""
+
+    phase: str
+    text: str
+    status: Literal["pending", "in_progress"]
+
+
+@dataclass(frozen=True, slots=True)
 class AgentSettledEvent:
     """Describe the single goal-loop seam for a caller submission."""
 
@@ -476,7 +486,7 @@ class AgentSettledEvent:
     last_stop: StopReason | None
     pending_jobs: tuple[str, ...]
     continuations_used: int
-
+    incomplete_todos: tuple[TodoRef, ...] = ()
 
 @dataclass(frozen=True, slots=True)
 class AgentEndEvent:
@@ -832,16 +842,6 @@ class TtsrTriggeredEvent:
     interrupted: bool
 
 
-@dataclass(frozen=True, slots=True)
-class TodoReminderEvent:
-    """Observe one authoritative unresolved-todo reminder."""
-
-    session_id: str
-    turn_id: str
-    sequence: int
-    pending: int
-    reminder: str
-
 
 @dataclass(frozen=True, slots=True)
 class RetryLifecycleEvent:
@@ -868,8 +868,36 @@ class FallbackLifecycleEvent:
     target_model: str
     reason: str
 
+@dataclass(frozen=True, slots=True)
+class McpNotificationEvent:
+    """Observe one post-handling MCP server notification."""
 
-_EVENT_NAMES = (
+    server: str
+    method: str
+    params: Any | None
+    sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderResponseEvent:
+    """Observe one provider HTTP response before stream decoding."""
+
+    provider: str
+    model: ModelRef
+    status: int
+    headers: Mapping[str, str]
+    request_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRenamedEvent:
+    """Observe one committed live-session name change."""
+
+    session: str
+    name: str | None
+
+
+_EVENT_NAMES_BY_ID = (
     "session_start", "session_shutdown", "session_switch", "session_switched",
     "session_branch", "session_branched", "session_rewind", "session_rewound",
     "session_reset", "before_agent_start", "agent_start", "turn_start", "turn_end",
@@ -883,13 +911,19 @@ _EVENT_NAMES = (
     "capability_budget", "model_changed", "credential_disabled", "compaction",
     "compaction_done", "thread_projection", "subagent_spawn", "worker_state",
     "job_registered", "job_settled", "extension_activate", "extension_load",
-    "extension_unload", "host_reconnect", "ttsr_triggered", "todo_reminder",
+    "extension_unload", "host_reconnect", "ttsr_triggered", None,
     "retry_start", "retry_end", "fallback_applied", "fallback_succeeded",
+    "mcp_notification", "provider_response", "session_renamed",
 )
+_EVENT_NAMES = tuple(name for name in _EVENT_NAMES_BY_ID if name is not None)
 EVENT_IDS: Final[Mapping[str, int]] = MappingProxyType(
-    {name: event_id for event_id, name in enumerate(_EVENT_NAMES, start=1)}
+    {
+        name: event_id
+        for event_id, name in enumerate(_EVENT_NAMES_BY_ID, start=1)
+        if name is not None
+    }
 )
-"""Stable dense event identifiers used by the subscription bitmap."""
+"""Stable event identifiers used by the subscription bitmap; id 59 is tombstoned."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -902,6 +936,7 @@ class EventSpec:
     payload: type
     returns: object | None
     channel: Channel
+    phase: HookPhase | str | None
     latency: LatencyClass
     on_failure: OnFailure
     default_decision: type | None
@@ -991,11 +1026,13 @@ _EVENT_METADATA = {
     "extension_unload": (ExtensionUnloadEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, False, _DOMAIN, None, {}),
     "host_reconnect": (HostReconnectEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
     "ttsr_triggered": (TtsrTriggeredEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
-    "todo_reminder": (TodoReminderEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
     "retry_start": (RetryLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
     "retry_end": (RetryLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
     "fallback_applied": (FallbackLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
     "fallback_succeeded": (FallbackLifecycleEvent, _OBSERVE, LatencyClass.TURN, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "mcp_notification": (McpNotificationEvent, _OBSERVE, LatencyClass.ASYNC, OnFailure.DEFER, True, _DOMAIN, None, {}),
+    "provider_response": (ProviderResponseEvent, _OBSERVE, LatencyClass.ASYNC, OnFailure.DEFER, False, _DOMAIN, None, {}),
+    "session_renamed": (SessionRenamedEvent, _OBSERVE, LatencyClass.ASYNC, OnFailure.DEFER, False, _DOMAIN, None, {}),
 }
 
 
@@ -1005,10 +1042,16 @@ def _make_spec(name: str) -> EventSpec:
     return EventSpec(
         name=name,
         id=EVENT_IDS[name],
-        rev=1,
+        rev=2 if name == "agent_settled" else 1,
         payload=payload,
         returns=returns,
         channel=Channel.CONTROL,
+        phase=(
+            "domain"
+            if name in {"agent_settled", "compaction", "models_discover", "provider_refresh",
+                        "provider_error", "provider_usage", "thread_projection"}
+            else HookPhase.OBSERVE if returns is None else None
+        ),
         latency=latency,
         on_failure=failure,
         default_decision=default,

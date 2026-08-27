@@ -102,7 +102,7 @@ pub enum Preset {
 	LspBinding,
 }
 
-/// Builds a pi-compatible bounded command for one workspace/file.
+/// Builds a bounded command for one workspace/file.
 pub fn request(preset: Preset, workspace: &Path, target: Option<&Path>) -> CheckerRequest {
 	let target = target.map(|path| Str::from(path.to_string_lossy().as_ref()));
 	let (program, mut args): (&str, Vec<Str>) = match preset {

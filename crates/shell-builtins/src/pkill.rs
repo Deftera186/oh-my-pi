@@ -1,4 +1,4 @@
-//! `pkill` process-signalling builtin moved from `pi-shell`.
+//! `pkill` process-signalling builtin.
 
 use clap::Parser;
 use omp_shell_engine::builtins;

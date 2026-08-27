@@ -1862,7 +1862,7 @@ impl Runtime {
 		let root = self.state.lock().data_dir.join("models");
 		fs::create_dir_all(&root).into_diagnostic()?;
 		let store = ArtifactStore::open(&root).into_diagnostic()?;
-		let manifests = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
+		let manifests = SpeechArtifactManifests::curated().into_diagnostic()?;
 		let snapshot = SpeechCatalog
 			.snapshot(&store, &manifests, &LocalCancellation::new())
 			.into_diagnostic()?;

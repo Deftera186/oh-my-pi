@@ -1,4 +1,4 @@
-//! Model-facing behavioral contracts for pi-compatible `grep@1`.
+//! Model-facing behavioral contracts for `grep@1`.
 
 use std::{future, future::Future, str, sync::Arc};
 

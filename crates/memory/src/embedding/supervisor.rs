@@ -33,7 +33,7 @@ pub struct SupervisorConfig {
 }
 
 impl SupervisorConfig {
-	/// Creates Pi-compatible request deadlines for an executable.
+	/// Creates request deadlines for an executable.
 	pub fn new(executable: impl Into<PathBuf>) -> Self {
 		Self {
 			executable:      executable.into(),

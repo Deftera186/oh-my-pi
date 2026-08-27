@@ -1,8 +1,8 @@
 //! In-place provider-login overlay.
 //!
 //! One updating surface for the whole authentication dance — browser
-//! authorization, device codes, progress notices, and manual input — mirroring
-//! pi's login dialog instead of appending a transcript line per step. The
+//! authorization, device codes, progress notices, and manual input without
+//! appending a transcript line per step. The
 //! transcript receives only the final outcome, sent by the app bridge after
 //! the panel closes.
 

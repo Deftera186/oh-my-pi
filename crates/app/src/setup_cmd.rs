@@ -71,7 +71,7 @@ async fn speech(
 	let root = data_dir.join("models");
 	fs::create_dir_all(&root).into_diagnostic()?;
 	let store = ArtifactStore::open(&root).into_diagnostic()?;
-	let manifests = SpeechArtifactManifests::pi_parity().into_diagnostic()?;
+	let manifests = SpeechArtifactManifests::curated().into_diagnostic()?;
 	let cancel = LocalCancellation::new();
 	let snapshot = SpeechCatalog
 		.snapshot(&store, &manifests, &cancel)

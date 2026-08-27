@@ -1,5 +1,4 @@
-//! Pi-equivalent `write@1` schema, guards, transactions, and exact output
-//! contracts.
+//! `write@1` schema, guards, transactions, and exact output contracts.
 
 use std::{future, future::Future, sync::Arc, time::Duration};
 

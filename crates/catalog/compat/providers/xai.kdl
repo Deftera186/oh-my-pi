@@ -3,8 +3,8 @@
 provider "xai" {
 	class "xai" {
 		family "grok" {
-			// pi PR #7454 cluster: paid xAI routes through /v1/responses like
-			// SuperGrok. Encrypted reasoning is requested and replayed across
+			// Paid xAI routes through /v1/responses like SuperGrok. Encrypted
+			// reasoning is requested and replayed across
 			// turns, api.x.ai rejects `reasoning.summary`, `minimal` clamps to
 			// `low`, and root-union tool schemas are flattened for the xAI
 			// function-calling validator.

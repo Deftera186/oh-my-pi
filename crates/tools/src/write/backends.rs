@@ -28,7 +28,7 @@ use crate::read::{
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("{message}")]
 pub struct Fault {
-	/// Exact pi-compatible error text.
+	/// Exact model-facing error text.
 	pub message: Str,
 }
 
@@ -79,7 +79,7 @@ pub fn archive_targets(path: &str) -> Result<Vec<ArchiveTarget>, Fault> {
 		.collect()
 }
 
-/// Normalizes a member write target using pi's traversal and directory guards.
+/// Normalizes a member write target using traversal and directory guards.
 pub fn normalize_archive_member(raw: &str) -> Result<String, Fault> {
 	let normalized = raw.replace('\\', "/");
 	if normalized.is_empty() {

@@ -62,7 +62,7 @@ pub const fn generations(report: &BankDiagnostic) -> IndexGeneration {
 ///
 /// Windows may retain transient locks after the last handle closes. Permission,
 /// would-block, and directory-not-empty failures are retried for the
-/// Pi-compatible one-second window.
+/// one-second window.
 pub fn remove_database_files(path: &Path) -> Result<()> {
 	for suffix in ["", "-wal", "-shm"] {
 		let target = if suffix.is_empty() {

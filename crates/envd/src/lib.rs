@@ -1289,6 +1289,7 @@ impl ProjectEnvironment {
 		self.lifecycle.server.provider_response_hooks()
 	}
 
+	/// Returns the live per-session admission hook gate.
 	/// Returns the sealed deployment manifest only when every authenticated
 	/// connection and generation fact exactly matches the live activation.
 	pub fn extension_control_manifest(

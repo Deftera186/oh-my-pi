@@ -1,9 +1,8 @@
 //! `sponge` builtin: soak up all of standard input before writing it to a file
 //! or standard output.
 //!
-//! Ported from pi-shell's in-process implementation of the moreutils tool. The
-//! delayed open makes `command < file | sponge file` safe: the destination is
-//! not opened or truncated until its former contents have reached EOF.
+//! The delayed open makes `command < file | sponge file` safe: the destination
+//! is not opened or truncated until its former contents have reached EOF.
 
 use std::{
 	ffi::{OsStr, OsString},
@@ -76,7 +75,7 @@ impl Utility for Sponge {
 
 fn command() -> Command {
 	Command::new("sponge")
-		.version("sponge (pi-shell) 17.2.11")
+		.version("sponge 17.2.11")
 		.about("Soak up all standard input, then write it to a file.")
 		.override_usage(format_usage("sponge [-a] [FILE]"))
 		.disable_help_flag(true)

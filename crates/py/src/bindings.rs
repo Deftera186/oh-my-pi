@@ -67,6 +67,59 @@ create_exception!(
 	"A request carries a retired host or session generation."
 );
 create_exception!(_omp, TemplateError, OmpError, "A scribe template failed to compile or render.");
+/// Immutable declarative inputs for one atomic interactive-session transition.
+#[pyclass(name = "SessionSetup", frozen, module = "_omp")]
+pub(crate) struct PySessionSetup {
+	title:          Option<Str>,
+	parent:         Option<Str>,
+	entries:        Py<PyTuple>,
+	initial_prompt: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PySessionSetup {
+	#[new]
+	#[pyo3(signature = (title = None, parent = None, entries = None, initial_prompt = None))]
+	fn new(
+		py: Python<'_>,
+		title: Option<&str>,
+		parent: Option<&str>,
+		entries: Option<&Bound<'_, PyTuple>>,
+		initial_prompt: Option<Py<PyAny>>,
+	) -> Self {
+		let entries = entries
+			.map(|values| values.clone().unbind())
+			.unwrap_or_else(|| PyTuple::empty(py).unbind());
+		Self { title: title.map(Str::from), parent: parent.map(Str::from), entries, initial_prompt }
+	}
+
+	/// Optional user-assigned title.
+	#[getter]
+	fn title(&self) -> Option<&str> {
+		self.title.as_deref()
+	}
+
+	/// Optional accessible lineage parent.
+	#[getter]
+	fn parent(&self) -> Option<&str> {
+		self.parent.as_deref()
+	}
+
+	/// Extension-owned values declared with `@omp.entry_kind`.
+	#[getter]
+	fn entries(&self, py: Python<'_>) -> Py<PyTuple> {
+		self.entries.clone_ref(py)
+	}
+
+	/// Optional visible user prompt which is persisted without submission.
+	#[getter]
+	fn initial_prompt(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+		self
+			.initial_prompt
+			.as_ref()
+			.map(|value| value.clone_ref(py))
+	}
+}
 
 #[derive(Debug, Default)]
 struct ResourceState {
@@ -111,7 +164,10 @@ static ASYNC_RUNTIME: LazyLock<runtime::Runtime> = LazyLock::new(|| {
 		.build()
 		.expect("omp Python DATA runtime must initialize")
 });
-static PY_TRANSACTION_ID: atomic::AtomicU64 = atomic::AtomicU64::new(1);
+/// Document transactions require exactly 16 id bytes; ulids are unique and fit.
+fn fresh_transaction_id() -> Vec<u8> {
+	omp_core::Ulid::generate().to_bytes().to_vec()
+}
 
 /// Replaces the live URL resolver snapshot used by `omp.urls.schemes()`.
 pub fn set_scheme_snapshot<I, M, D>(device_hash: [u8; 32], entries: I)
@@ -1975,12 +2031,7 @@ impl PyEnvironmentBackend {
 			.filter(|value| !value.is_none())
 			.map(|value| value.extract::<Vec<u8>>())
 			.transpose()?
-			.unwrap_or_else(|| {
-				PY_TRANSACTION_ID
-					.fetch_add(1, atomic::Ordering::Relaxed)
-					.to_be_bytes()
-					.to_vec()
-			});
+			.unwrap_or_else(|| fresh_transaction_id());
 		let mut mutations = Vec::new();
 		let operations = arguments
 			.get_item("operations")?
@@ -2240,11 +2291,7 @@ impl PyEnvironmentBackend {
 						.ok_or_else(|| PyTypeError::new_err("path is required"))?
 						.extract::<PyEnvPath>()?;
 					let request = document_pb::CommitTransactionRequest {
-						transaction_id: PY_TRANSACTION_ID
-							.fetch_add(1, atomic::Ordering::Relaxed)
-							.to_be_bytes()
-							.to_vec()
-							.into(),
+						transaction_id: fresh_transaction_id().into(),
 						operations:     vec![document_pb::DocumentMutation {
 							document:  Some(document_pb::DocumentTarget {
 								target: Some(document_target::Target::Uri(path_uri(path.0.as_str())?)),
@@ -2533,11 +2580,7 @@ impl PyEnvironmentBackend {
 					})
 				};
 				let request = document_pb::CommitTransactionRequest {
-					transaction_id: PY_TRANSACTION_ID
-						.fetch_add(1, atomic::Ordering::Relaxed)
-						.to_be_bytes()
-						.to_vec()
-						.into(),
+					transaction_id: fresh_transaction_id().into(),
 					operations:     vec![document_pb::DocumentMutation {
 						document:  Some(document_pb::DocumentTarget {
 							target: Some(document_target::Target::LeaseId(lease_id.into())),
@@ -4197,8 +4240,8 @@ mod _omp {
 		PyControlHandle, PyCostClass, PyDurability, PyDuration, PyEnvPath, PyEnvironmentBackend,
 		PyEnvironmentStream, PyHistoryUrl, PyInvocationPhase, PyLifecyclePhase, PyOperationSpec,
 		PyPrincipal, PyQuotaStatus, PyResourceReceipt, PyRestartReason, PyScribeTemplate, PySecret,
-		PySecretUse, PyStateScope, PyWorkspaceUri, StaleGeneration, TemplateError, operation_spec,
-		resources,
+		PySecretUse, PySessionSetup, PyStateScope, PyWorkspaceUri, StaleGeneration, TemplateError,
+		operation_spec, resources,
 	};
 	#[pymodule_export]
 	use crate::env_types::{

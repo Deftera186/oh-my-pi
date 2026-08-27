@@ -296,8 +296,8 @@ pub struct SourceModelRecord {
 	/// Typed compatibility properties.
 	#[serde(default)]
 	pub compat: Option<SourceWirePolicy>,
-	/// Verbatim sparse compatibility properties retained by pi alongside the
-	/// resolved compatibility record.
+	/// Verbatim sparse compatibility properties retained alongside the resolved
+	/// compatibility record.
 	#[serde(default)]
 	pub compat_config: Option<SourceWirePolicy>,
 	/// Whether the model requires reversible private-use glyph tokenization.
@@ -5133,6 +5133,9 @@ fn compile_discovery(source: &SourceDiscovery) -> Result<DiscoverySpec, CompileE
 	})
 }
 
+/// Resolves a source `api` selector (including serde aliases) to its
+/// canonical codec and transport, e.g. `openai-completions` →
+/// (`openai-chat`, HTTP).
 fn translate_transport(source: SourceTransport) -> (CodecId, TransportKind) {
 	let (codec, transport) = match source {
 		SourceTransport::AnthropicMessages => ("anthropic", TransportKind::Http),
@@ -5422,7 +5425,7 @@ mod tests {
 	fn coreweave_discovery_is_authoritative() {
 		// CoreWeave Serverless Inference (W&B Inference) is a reseller with a
 		// rotating model menu: runtime /v1/models discovery must replace stale
-		// bundled rows instead of merging over them (pi 309d5712af, PR #8923).
+		// bundled rows instead of merging over them.
 		let providers = include_str!("../../../fixtures/llm-oracle/catalog/providers.toml");
 		let models = zstd::stream::encode_all(&br"{}"[..], 1).expect("fixture compression");
 		let source = parse_oracle(providers, &models).expect("fixture providers parse");

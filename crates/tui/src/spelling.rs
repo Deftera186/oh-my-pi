@@ -281,7 +281,7 @@ impl SpellingAssist {
 						&& completion.range == range
 					{
 						// A ghost appearing changes rendered output; a null
-						// suffix leaves the current paint correct (pi parity).
+						// suffix leaves the current paint correct.
 						changed |= suffix.is_some();
 						completion.suffix = suffix;
 						completion.resolved = true;
@@ -405,7 +405,7 @@ fn worker(rx: Receiver<Request>, tx: Sender<Response>, pending: Arc<Mutex<Pendin
 					),
 				},
 				Request::Correct { generation, ref text, ref range } => {
-					// An echo of the typed word is not a correction (pi parity).
+					// An echo of the typed word is not a correction.
 					let correction = platform::correction(text, range.clone())
 						.filter(|correction| correction.as_str() != &text[range.clone()]);
 					Response::Correct {

@@ -23,7 +23,7 @@ const SNOWFLAKE_MAX_SEQUENCE: u32 = 0x3f_ffff;
 pub enum RequestId {
 	/// Ecosystem-compatible per-transport integer.
 	Number(u64),
-	/// Pi-compatible sixteen-character snowflake.
+	/// Sixteen-character collision-resistant snowflake.
 	String(Str),
 }
 
@@ -34,7 +34,7 @@ pub enum RequestIdFormat {
 	/// Monotone integer starting at one.
 	#[default]
 	Number,
-	/// Collision-resistant pi snowflake hex string.
+	/// Collision-resistant snowflake hex string.
 	String,
 }
 
@@ -96,7 +96,7 @@ pub enum RequestIdError {
 	/// Numeric request ids exhausted.
 	#[error("MCP request identifier space is exhausted")]
 	Exhausted,
-	/// Wall clock cannot produce a pi snowflake.
+	/// Wall clock cannot produce a snowflake.
 	#[error("system clock cannot produce an MCP snowflake identifier")]
 	InvalidClock,
 }
@@ -177,7 +177,7 @@ pub enum JsonRpcCallError {
 	MalformedEnvelope,
 }
 
-/// Performs one stateless JSON-RPC POST with pi's hard sixty-second ceiling.
+/// Performs one stateless JSON-RPC POST with a hard sixty-second ceiling.
 pub async fn call_mcp<P: Serialize, T: DeserializeOwned>(
 	http: &dyn OAuthHttpClient,
 	url: &str,

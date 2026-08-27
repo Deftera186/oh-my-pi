@@ -4,7 +4,7 @@ use omp_catalog::CodecId;
 use omp_core::Str;
 use url::Url;
 
-/// Explicit custom endpoint mode. No pi-native transport exists.
+/// Explicit custom endpoint mode with no provider-specific behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustomEndpointMode {
 	/// Route directly to the configured compatibility endpoint.
@@ -30,14 +30,13 @@ impl CustomEndpoint {
 		Ok(Self { base_url: Str::new(base_url.trim_end_matches('/')), mode })
 	}
 
-	/// Builds the concrete operation URL without provider-brand or pi-native
-	/// path inference.
+	/// Builds the concrete operation URL without provider-brand path inference.
 	pub fn operation_url(
 		&self,
 		codec: &CodecId<str>,
 		operation_path: &str,
 	) -> Result<Str, CustomEndpointError> {
-		if !operation_path.starts_with('/') || operation_path.starts_with("/v1/pi/") {
+		if !operation_path.starts_with('/') || operation_path.starts_with("/v1/provider-native/") {
 			return Err(CustomEndpointError::InvalidPath);
 		}
 		let mut url = String::with_capacity(
@@ -69,7 +68,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn gateway_uses_omp_namespace_and_rejects_pi_native_paths() {
+	fn gateway_uses_omp_namespace_and_rejects_provider_native_paths() {
 		let endpoint =
 			CustomEndpoint::new("https://gateway.example/v1", CustomEndpointMode::OmpGateway)
 				.expect("endpoint");
@@ -81,7 +80,7 @@ mod tests {
 		);
 		assert!(
 			endpoint
-				.operation_url(CodecId::from_ref("openai"), "/v1/pi/stream")
+				.operation_url(CodecId::from_ref("openai"), "/v1/provider-native/stream")
 				.is_err()
 		);
 	}

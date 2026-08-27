@@ -1,6 +1,5 @@
-//! Contract suite ported from `pi-utils` json-parse tests, plus Rust-specific
-//! coverage (surrogate escapes, integer fidelity, serialization, depth
-//! limits).
+//! Contract suite for JSON parsing, plus Rust-specific coverage (surrogate
+//! escapes, integer fidelity, serialization, and depth limits).
 
 use std::borrow::Cow;
 
@@ -73,8 +72,8 @@ fn classify_complete_prefix_and_invalid_buffers() {
 
 #[test]
 fn classify_detects_a_corrupting_delta_against_a_valid_prefix() {
-	// pi's openai-shared stream guard drops a delta exactly when appending
-	// it turns an extendable buffer invalid; legal continuations must keep
+	// The stream guard drops a delta exactly when appending it turns an
+	// extendable buffer invalid; legal continuations must keep
 	// classifying as a prefix.
 	let partial = r#"{"command":"echo "#;
 	assert_eq!(classify_json_prefix(partial), JsonPrefixState::Prefix);
@@ -254,9 +253,9 @@ fn streaming_recovers_null_values() {
 
 #[test]
 fn streaming_surfaces_partial_string_that_looks_like_structure() {
-	// pi regression: the todo renderer received mid-stream shapes like
-	// `{ ops: "[{" }` — a string value containing structure characters must
-	// surface as a string, while a real open array yields empty structure.
+	// A mid-stream todo payload can contain a string such as `{ ops: "[{" }`;
+	// structure characters inside a string must surface as a string, while a real
+	// open array yields empty structure.
 	assert_eq!(parse_streaming(r#"{"ops": "[{"#), json!({ "ops": "[{" }));
 	assert_eq!(parse_streaming(r#"{"ops": [{"#), json!({ "ops": [{}] }));
 	assert_eq!(parse_streaming("[nul"), json!([]));

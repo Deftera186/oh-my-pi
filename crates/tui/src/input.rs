@@ -71,11 +71,11 @@ pub enum Key {
 	/// implement the readline set (`a e k u w b f d`); others ignore.
 	Ctrl(char),
 	/// Alt-chord with a letter, normalized to lowercase, for chords without
-	/// a canonical cross-terminal meaning (e.g. pi binds `alt+y` yank-pop).
-	/// Encoding variants of one physical intent normalize to their
-	/// semantic keys instead and never reach this variant.
+	/// a canonical cross-terminal meaning (for example, `alt+y` yank-pop).
+	/// Encoding variants of one physical intent normalize to their semantic
+	/// keys instead and never reach this variant.
 	Alt(char),
-	/// Ctrl+Alt chord, normalized to lowercase. Used by pi's backward
+	/// Ctrl+Alt chord, normalized to lowercase. Used by the backward
 	/// character-jump binding and available to embedders for other chords.
 	CtrlAlt(char),
 	/// Alt+Enter: follow-up to an active turn, or standard submission if idle.
@@ -283,7 +283,7 @@ struct StringDiscard {
 }
 
 impl InputDecoder {
-	/// Creates an empty decoder using pi-compatible timeout and size limits.
+	/// Creates an empty decoder using bounded timeout and size limits.
 	pub fn new() -> Self {
 		Self {
 			keymap:                Keymap::default(),
@@ -347,7 +347,7 @@ impl InputDecoder {
 	/// A private CSI (`ESC [ ?` / `ESC [ >`) is a terminal->host report,
 	/// never a keystroke, so reassembly stays armed for the whole session:
 	/// a Device-Attributes reply split by a slow SSH/PTY link must not leak
-	/// its tail into the composer as literal text (pi #8542).
+	/// its tail into the composer as literal text.
 	fn reassemble_private_csi<'a>(
 		&mut self,
 		bytes: &'a [u8],
@@ -1088,8 +1088,8 @@ fn decode_control(byte: u8) -> Option<Chord> {
 		// A bare LF is the iTerm2-style Shift+Enter mapping (Claude Code's
 		// /terminal-setup and similar bindings); raw-mode Enter always
 		// arrives as CR, so LF decodes as the Shift+Enter chord and the
-		// keymap's `(Enter, shift)` row owns the newline semantics, matching
-		// pi's composer and /tree selector (#8821).
+		// keymap's `(Enter, shift)` row owns the newline semantics for the
+		// composer and /tree selector.
 		b'\n' => Chord::new(Key::Enter, Mods { shift: true, ..Mods::default() }),
 		0x7f | 0x08 => Chord::plain(Key::Backspace),
 		0x01..=0x1a => {
@@ -1531,8 +1531,8 @@ pub struct Keymap {
 	bindings: Vec<(Chord, Option<Key>)>,
 }
 
-/// Default chord table. Mirrors pi's defaults: word motion/delete spellings
-/// (including macOS `super+alt+…`), the readline rubouts, Shift/Ctrl-Enter
+/// Default chord table: word motion/delete spellings (including macOS
+/// `super+alt+…`), the readline rubouts, Shift/Ctrl-Enter
 /// newline spellings plus Alt follow-up, and smart/raw clipboard paste.
 ///
 /// Modifier bits are `1 = Shift`, `2 = Alt`, `4 = Ctrl`, and `8 = Super`.
@@ -2374,8 +2374,8 @@ mod tests {
 
 	#[test]
 	fn bare_lf_decodes_as_shift_enter_while_cr_stays_enter() {
-		// pi #8821: the composer and /tree selector accept three Shift+Enter
-		// encodings — kitty CSI-u (covered by the keymap rows), the legacy
+		// The composer and /tree selector accept three Shift+Enter encodings —
+		// kitty CSI-u (covered by the keymap rows), the legacy
 		// `CSI 13;2~` form, and a bare LF from the iTerm2 mapping. Raw-mode
 		// Enter always arrives as CR.
 		let start = Instant::now();
@@ -2391,8 +2391,8 @@ mod tests {
 
 	#[test]
 	fn submit_remap_on_ctrl_enter_wins_over_newline_default() {
-		// pi #8906: a chord the user explicitly binds to submit must win over
-		// the hardcoded Ctrl+Enter -> newline default. omp's newline spellings
+		// A chord the user explicitly binds to submit must win over the hardcoded
+		// Ctrl+Enter -> newline default. OMP's newline spellings
 		// are table-owned rows, so rebinding the exact chord replaces the
 		// default `(Enter, ctrl) -> ShiftEnter` row — including under kitty
 		// caps/num lock bits, which the decoder drops before lookup. Bare LF

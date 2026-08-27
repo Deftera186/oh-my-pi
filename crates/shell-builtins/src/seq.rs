@@ -936,8 +936,8 @@ mod numberparse {
 mod error {
 	//! Errors returned by seq.
 
-	// pi-uutils: `translate!` message lookups are literalized with the en-US
-	// strings from upstream's locales/en-US.ftl.
+	// Message lookups are literalized with the en-US strings from the bundled
+	// locale data.
 
 	use thiserror::Error;
 

@@ -318,7 +318,7 @@ pub struct ModelPromptInput {
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum Personality {
-	/// Pi-compatible terse, action-oriented guidance.
+	/// Terse, action-oriented guidance.
 	#[default]
 	Default,
 	/// Warm collaborative guidance.
@@ -355,7 +355,7 @@ pub enum EagerTaskPolicy {
 	Off,
 	/// Prefer delegation for substantial independent work.
 	Preferred,
-	/// Require delegation except for the small pi-compatible exceptions.
+	/// Require delegation except for small interactive operations.
 	Always,
 }
 

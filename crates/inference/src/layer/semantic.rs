@@ -260,7 +260,7 @@ fn exhausted_action(
 		&& error.kind == ErrorKind::EmptyCompletion
 	{
 		// Eventless silence may fail over while the route remains uncommitted,
-		// mirroring pi #8493's `!started` gate. Thought-only completions are
+		// using the `!started` gate. Thought-only completions are
 		// terminal `EmptyOutput` errors and therefore never reach this branch;
 		// `registry::fallback_is_safe` still requires replay permission before
 		// advancing to a sibling route.
@@ -435,7 +435,7 @@ mod tests {
 		// the loop guard's SemanticRetry re-runs the SAME route, and exhaustion
 		// must never promote to ReselectRoute. Walking preplanned fallbacks
 		// would swap a healthy turn to another model based on chain contents,
-		// not model health (pi #8760).
+		// not model health.
 		let (error, calls) = exhaust(ErrorKind::RepeatedReasoning).await;
 
 		assert_eq!(calls, 2, "loop-guard retries stay on the same route: {error:?}");

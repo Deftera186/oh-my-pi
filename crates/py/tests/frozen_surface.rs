@@ -577,6 +577,12 @@ class FrozenControlHost:
             return self._session_row(arguments["session_id"])
         if operation == "omp.sessions.lineage":
             return [{"id": arguments["session_id"], "parent": None, "at": 1}]
+        if operation == "omp.sessions.create":
+            setup = arguments["setup"]
+            assert setup["schema"] == "omp.sessions.setup.v1"
+            assert setup["entries"][0]["kind"] == "acme.surface-entry"
+            assert setup["initial_prompt"] == [{"kind": "text", "text": "Continue"}]
+            return self._session_row("created-session", setup["title"])
         if operation in {"omp.sessions.resume", "omp.sessions.rename"}:
             return self._session_row(
                 arguments["session_id"], arguments.get("title", "Surface")
@@ -1686,6 +1692,20 @@ assert session_info.id == "surface-session" and session_info.usage.reasoning == 
 lineage = asyncio.run(omp.sessions.lineage("surface-session"))
 assert lineage == (omp.SessionLink("surface-session", None, 1),)
 assert asyncio.run(omp.sessions.resume("surface-session")).id == "surface-session"
+setup = omp.sessions.SessionSetup(
+    title="Created", parent="surface-session",
+    entries=(SurfaceEntry(7),), initial_prompt="Continue",
+)
+assert setup is not omp.sessions.SessionSetup()
+expect_raises(AttributeError, lambda: setattr(setup, "title", "Changed"))
+created_session = asyncio.run(omp.sessions.create(setup))
+assert created_session.id == "created-session" and created_session.title == "Created"
+expect_raises(
+    omp.UnknownEntryKind,
+    lambda: asyncio.run(
+        omp.sessions.create(omp.sessions.SessionSetup(entries=(object(),)))
+    ),
+)
 renamed = asyncio.run(omp.sessions.rename("surface-session", "New title"))
 assert renamed.title == "New title"
 asyncio.run(

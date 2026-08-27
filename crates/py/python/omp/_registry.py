@@ -14,7 +14,7 @@ import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import MISSING, dataclass, fields, is_dataclass, replace
 from enum import Enum, StrEnum
-from types import UnionType
+from types import MappingProxyType, UnionType
 from typing import (
     Annotated,
     Any,
@@ -74,6 +74,7 @@ _EXECUTABLE_KINDS = frozenset(
         "shortcut",
         "completion",
         "message_renderer",
+        "markdown_transformer",
         "verdict_renderer",
         "telemetry",
         "service",
@@ -376,6 +377,45 @@ class ApproverDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillDecl:
+    """One deterministic extension-authored generated skill resource."""
+
+    name: str
+    description: str
+    hidden: bool
+    disable_model_invocation: bool
+    autoload: bool
+    contain_root: str | None
+    path: str
+    content: bytes
+
+    @property
+    def metadata(self) -> Mapping[str, object]:
+        """Return the exact signed metadata projected into the content row."""
+
+        values: dict[str, object] = {
+            "name": self.name,
+            "description": self.description,
+            "hidden": self.hidden,
+            "disable_model_invocation": self.disable_model_invocation,
+            "autoload": self.autoload,
+        }
+        if self.contain_root is not None:
+            values["contain_root"] = self.contain_root
+        return MappingProxyType(values)
+
+    @property
+    def declaration(self) -> _packages.ContentDeclaration:
+        """Lower this generated resource to the uniform manifest row."""
+
+        return _packages.ContentDeclaration(
+            kind=_packages.ContentKind.SKILLS,
+            path=self.path,
+            metadata=self.metadata,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class HookDefinition:
     """One import-time hook subscription and its activation trigger."""
 
@@ -400,6 +440,7 @@ class DeclarationSnapshot:
     """Immutable view of the complete decorator registry."""
 
     entry_kinds: tuple[EntryKindDefinition, ...]
+    skills: tuple[SkillDecl, ...]
     tools: frozenset[_ToolKey]
     capabilities: frozenset[str]
     hooks: frozenset[_HookKey]
@@ -421,6 +462,7 @@ class DeclarationSnapshot:
     service_definitions: tuple[ServiceDefinition, ...] = ()
     completions: tuple[UIDefinition, ...] = ()
     message_renderers: tuple[UIDefinition, ...] = ()
+    markdown_transformers: tuple[UIDefinition, ...] = ()
     verdict_renderers: tuple[UIDefinition, ...] = ()
     regimes: tuple[object, ...] = ()
 
@@ -434,6 +476,7 @@ class DeclarationRegistry:
         "_commands",
         "_completions",
         "_message_renderers",
+        "_markdown_transformers",
         "_verdict_renderers",
         "_shortcuts",
         "_device_claims",
@@ -463,6 +506,8 @@ class DeclarationRegistry:
         "_sealed",
         "_service_instances",
         "_services",
+        "_skills",
+        "_manifest_content",
         "_tools",
         "_workers",
         "_verified",
@@ -476,6 +521,7 @@ class DeclarationRegistry:
         self._commands: dict[str, CommandDefinition] = {}
         self._completions: dict[object, UIDefinition] = {}
         self._message_renderers: dict[object, UIDefinition] = {}
+        self._markdown_transformers: dict[object, UIDefinition] = {}
         self._verdict_renderers: dict[object, UIDefinition] = {}
         self._shortcuts: dict[str, ShortcutDefinition] = {}
         self._tools: dict[_ToolKey, object] = {}
@@ -504,6 +550,8 @@ class DeclarationRegistry:
         self._manifest_hooks: frozenset[_HookKey] = frozenset()
         self._manifest_capabilities: frozenset[str] = frozenset()
         self._manifest_services: frozenset[_ServiceKey] = frozenset()
+        self._manifest_content: tuple[_packages.ContentDeclaration, ...] = ()
+        self._skills: dict[str, SkillDecl] = {}
         self._manifest_executables: dict[
             tuple[str, str], _ExecutableDeclaration
         ] = {}
@@ -591,15 +639,18 @@ class DeclarationRegistry:
             or self._commands
             or self._completions
             or self._message_renderers
+            or self._markdown_transformers
             or self._verdict_renderers
             or self._shortcuts
             or self._approvers
             or self._preludes
+            or self._skills
         ):
             raise RuntimeError("manifest must be configured before declaration import")
         if declarations is not None:
+            self._manifest_content = tuple(content_declarations)
             _packages._configure_own_declarations(
-                extension, tuple(content_declarations)
+                extension, self._manifest_content
             )
         manifest_tools = {_tool_key(*item) for item in tools}
         manifest_hooks = {_hook_key(*item) for item in hooks}
@@ -1157,6 +1208,10 @@ class DeclarationRegistry:
                 self._message_renderers,
                 _ActivationTrigger.LAZY,
             ),
+            "markdown_transformer": (
+                self._markdown_transformers,
+                _ActivationTrigger.LAZY,
+            ),
             "verdict_renderer": (
                 self._verdict_renderers,
                 _ActivationTrigger.LAZY,
@@ -1167,7 +1222,7 @@ class DeclarationRegistry:
         except (KeyError, TypeError) as error:
             raise ValueError(
                 "UI declaration kind must be completion, message_renderer, "
-                "or verdict_renderer"
+                "markdown_transformer, or verdict_renderer"
             ) from error
         try:
             hash(name)
@@ -1239,6 +1294,19 @@ class DeclarationRegistry:
         self._insert(self._services, key, definition, "service")
         return implementation
 
+    def register_skill(self, declaration: SkillDecl) -> SkillDecl:
+        """Record one already-lowered generated skill before FREEZE."""
+
+        self._ensure_open(declaration.name)
+        self._check_declaration_limit()
+        self._insert(self._skills, declaration.name, declaration, "skill")
+        return declaration
+
+    def skill_declarations(self) -> tuple[SkillDecl, ...]:
+        """Return generated skill resources in deterministic name order."""
+
+        return tuple(self._skills[name] for name in sorted(self._skills))
+
     def freeze(self) -> DeclarationSnapshot:
         """Seals the Core-verified registry and returns its immutable sets."""
 
@@ -1285,6 +1353,27 @@ class DeclarationRegistry:
             undeclared_declarations = decorated_declarations.difference(
                 manifest_declarations
             )
+        if self._configured:
+            manifest_skills = tuple(
+                declaration
+                for declaration in self._manifest_content
+                if declaration.kind is _packages.ContentKind.SKILLS
+                and ".omp-generated/skills/" in declaration.path
+            )
+            decorated_skills = tuple(
+                declaration.declaration for declaration in self.skill_declarations()
+            )
+            if manifest_skills != decorated_skills:
+                missing_declarations = missing_declarations.union(
+                    ("skills", declaration.path)
+                    for declaration in manifest_skills
+                    if declaration not in decorated_skills
+                )
+                undeclared_declarations = undeclared_declarations.union(
+                    ("skills", declaration.path)
+                    for declaration in decorated_skills
+                    if declaration not in manifest_skills
+                )
         if (
             missing_tools
             or undeclared_tools
@@ -1362,6 +1451,7 @@ class DeclarationRegistry:
         for kind, values in (
             ("completion", self._completions),
             ("message_renderer", self._message_renderers),
+            ("message_renderer", self._markdown_transformers),
             ("verdict_renderer", self._verdict_renderers),
         ):
             declarations.update(
@@ -1374,6 +1464,7 @@ class DeclarationRegistry:
 
         return DeclarationSnapshot(
             entry_kinds=self.entry_kind_definitions(),
+            skills=self.skill_declarations(),
             tools=frozenset(self._tools),
             capabilities=self._manifest_capabilities,
             hooks=frozenset(self._hooks),
@@ -1411,6 +1502,10 @@ class DeclarationRegistry:
             message_renderers=tuple(
                 self._message_renderers[key]
                 for key in sorted(self._message_renderers, key=repr)
+            ),
+            markdown_transformers=tuple(
+                self._markdown_transformers[key]
+                for key in sorted(self._markdown_transformers, key=repr)
             ),
             verdict_renderers=tuple(
                 self._verdict_renderers[key]
@@ -1467,6 +1562,7 @@ class DeclarationRegistry:
             + len(self._workers)
             + len(self._exports)
             + len(self._preludes)
+            + len(self._skills)
         )
         if count >= MAX_DECLARATIONS:
             raise DeclarationLimit(count + 1, MAX_DECLARATIONS)
@@ -1724,6 +1820,13 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
             }
             for declaration in snapshot.hook_definitions
         ],
+        "skills": [
+            {
+                "path": declaration.path,
+                "metadata": dict(declaration.metadata),
+            }
+            for declaration in snapshot.skills
+        ],
         "services": [
             {
                 "name": definition.name,
@@ -1749,6 +1852,9 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
         "completions": [_worker_wire_value(value) for value in snapshot.completions],
         "message_renderers": [
             _worker_wire_value(value) for value in snapshot.message_renderers
+        ],
+        "markdown_transformers": [
+            _worker_wire_value(value) for value in snapshot.markdown_transformers
         ],
         "verdict_renderers": [
             _worker_wire_value(value) for value in snapshot.verdict_renderers
@@ -1800,6 +1906,125 @@ def _worker_wire_value(value: object) -> object:
     return str(value)
 
 
+
+
+def skill(
+    name: str,
+    *,
+    description: str,
+    hidden: bool = False,
+    disable_model_invocation: bool = False,
+    autoload: bool = False,
+    contain_root: str | None = None,
+) -> Callable[[Callable[[], str]], Callable[[], str]]:
+    """Declare and deterministically lower one generated ``SKILL.md`` resource."""
+
+    if (
+        not isinstance(name, str)
+        or not 1 <= len(name) <= 64
+        or not name[0].isalnum()
+        or name != name.lower()
+        or any(
+            not character.isascii()
+            or not (character.isalnum() or character == "-")
+            for character in name
+        )
+    ):
+        raise ValueError(
+            "skill name must be 1-64 lowercase ASCII letters, digits, or hyphens "
+            "and start with a letter or digit"
+        )
+    if not isinstance(description, str):
+        raise TypeError("skill description must be str")
+    description = " ".join(description.split())
+    if not description:
+        raise ValueError("skill description must not be empty")
+    for field_name, value in (
+        ("hidden", hidden),
+        ("disable_model_invocation", disable_model_invocation),
+        ("autoload", autoload),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"skill {field_name} must be bool")
+    if contain_root is not None:
+        if not isinstance(contain_root, str):
+            raise TypeError("skill contain_root must be str or None")
+        parts = contain_root.replace("\\", "/").split("/")
+        if (
+            not contain_root
+            or contain_root.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("skill contain_root must be a contained relative POSIX path")
+        contain_root = "/".join(parts)
+
+    def decorate(function: Callable[[], str]) -> Callable[[], str]:
+        registry._ensure_open(name)
+        declaration = _lower_skill_declaration(
+            function,
+            name=name,
+            description=description,
+            hidden=hidden,
+            disable_model_invocation=disable_model_invocation,
+            autoload=autoload,
+            contain_root=contain_root,
+        )
+        registry.register_skill(declaration)
+        return function
+
+    return decorate
+
+
+def _lower_skill_declaration(
+    function: Callable[[], str],
+    *,
+    name: str,
+    description: str,
+    hidden: bool,
+    disable_model_invocation: bool,
+    autoload: bool,
+    contain_root: str | None,
+) -> SkillDecl:
+    """Evaluate one skill body exactly once and produce deterministic bytes."""
+
+    if not callable(function):
+        raise TypeError("@omp.skill may decorate only a callable")
+    signature = inspect.signature(function)
+    if signature.parameters:
+        raise TypeError("@omp.skill callable must take no arguments")
+    module_root = function.__module__.split(".", 1)[0]
+    if not module_root or module_root == "__main__":
+        module_root = "extension"
+    body = function()
+    if not isinstance(body, str):
+        raise TypeError("@omp.skill callable must return str")
+    body = body.strip()
+    escaped_description = description.replace("'", "''")
+    lines = [
+        "---",
+        f"name: {name}",
+        f"description: '{escaped_description}'",
+    ]
+    if hidden:
+        lines.append("hidden: true")
+    if disable_model_invocation:
+        lines.append("disableModelInvocation: true")
+    if autoload:
+        lines.append("alwaysApply: true")
+    lines.extend(("---", "", body, ""))
+    content = "\n".join(lines).encode()
+    if len(content) > 64_000:
+        raise ValueError("generated skill exceeds the 64,000-byte UTF-8 limit")
+    return SkillDecl(
+        name=name,
+        description=description,
+        hidden=hidden,
+        disable_model_invocation=disable_model_invocation,
+        autoload=autoload,
+        contain_root=contain_root,
+        path=f"{module_root}/.omp-generated/skills/{name}/SKILL.md",
+        content=content,
+    )
 
 
 def service(name: str, *, rev: int) -> Callable[[_T], _T]:
@@ -1873,7 +2098,15 @@ def _executable_declaration(
             f"declarations[{index}].{field}",
             "required executable declaration field is missing",
         )
-    unknown = fields.difference(required)
+    optional = {
+        "command": frozenset(
+            {"aliases", "description", "args", "hint", "callback", "arg_completions"}
+        ),
+        "shortcut": frozenset(
+            {"action_id", "action", "description", "when", "callback"}
+        ),
+    }.get(value.get("kind"), frozenset())
+    unknown = fields.difference(required | optional | {"grants"})
     if unknown:
         field = sorted(str(item) for item in unknown)[0]
         raise ManifestError(
@@ -2466,6 +2699,7 @@ __all__ = (
     "ChildDeviceDefinition",
     "DeviceDefinition",
     "DeclarationSnapshot",
+    "SkillDecl",
     "PreludeDefinition",
     "PreludeParamSpec",
     "MAX_DECLARATIONS",
@@ -2488,4 +2722,5 @@ __all__ = (
     "resources",
     "service",
     "services",
+    "skill",
 )

@@ -43,9 +43,8 @@ pub const DIRECT_PATH: &str = "/v1/messages";
 /// OAuth beta required by Anthropic's Claude Code inference endpoint.
 ///
 /// Kept here because catalog header profiles are route-wide and cannot vary by
-/// the resolved credential kind. Values mirror pi's
-/// `packages/ai/src/providers/claude-code-fingerprint.ts` and Anthropic request
-/// construction.
+/// the resolved credential kind. These values are required by Anthropic's
+/// Claude Code inference endpoint.
 const CLAUDE_CODE_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// User-Agent emitted by Cowork's Claude desktop inference entrypoint.
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.220 (external, claude-desktop)";
@@ -634,9 +633,9 @@ struct CountTokensBody {
 
 /// JSON Schema keys Anthropic's Messages validator accepts on every node.
 ///
-/// Mirrors pi's `normalizeAnthropicToolSchema` (itself the Anthropic SDK
-/// `_transform.py` whitelist plus live Messages API guardrails): anything
-/// outside the kept sets draws an HTTP 400 `invalid_request_error` (e.g.
+/// Anthropic's Messages validator accepts only the following schema keys on
+/// every node. Anything outside the kept sets draws an HTTP 400
+/// `invalid_request_error` (e.g.
 /// `For 'integer' type, property 'minimum' is not supported`) and is demoted
 /// into the node's `description` so the constraint stays model-visible.
 const SCHEMA_UNIVERSAL_KEEP: &[&str] = &[
@@ -672,8 +671,8 @@ const SCHEMA_COMBINATORS: &[&str] = &["anyOf", "allOf", "oneOf"];
 /// Tools eligible for Anthropic strict tool use, by wire name.
 ///
 /// Strict grammars carry provider-side compile cost, so only high-traffic
-/// argument-heavy tools opt in; mirrors pi's `bash`/`python`/`edit`/`find`
-/// allowlist under omp tool names.
+/// argument-heavy tools opt in; the allowlist uses the corresponding OMP tool
+/// names.
 const STRICT_TOOL_ALLOWLIST: &[&str] = &["bash", "shell", "python", "eval", "edit", "find", "glob"];
 /// Maximum tools promoted to strict per request.
 const MAX_STRICT_TOOLS: usize = 20;
@@ -3568,7 +3567,7 @@ mod tests {
 	fn immutable_anthropic_thinking_bad_request_is_terminal_without_fallback() {
 		// Anthropic rejects a mutated latest assistant message containing signed
 		// or redacted thinking with a deterministic 400. That failure must never
-		// enter same-route retries or route fallback (pi #8558).
+		// enter same-route retries or route fallback.
 		let error = classify_http_error(
 			400,
 			br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.3.content.0.type: Expected `thinking` or `redacted_thinking`, but found `text`. The latest assistant message cannot be modified when thinking is enabled."}}"#,

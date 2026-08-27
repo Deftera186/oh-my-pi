@@ -38,7 +38,7 @@ pub enum WorkspaceTreeError {
 	WalkFailed,
 }
 
-/// Pi-compatible bounded tree builder over the native walker.
+/// Bounded tree builder over the native walker.
 #[derive(Clone, Debug)]
 pub struct WorkspaceTreeBuilder {
 	root:          PathBuf,

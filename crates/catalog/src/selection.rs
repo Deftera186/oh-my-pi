@@ -131,10 +131,7 @@ fn valid_role_id(id: &str) -> bool {
 }
 
 fn role_reference(selector: &str) -> Result<Option<(&str, Option<&str>)>, SelectionError> {
-	let Some(reference) = selector
-		.strip_prefix('@')
-		.or_else(|| selector.strip_prefix("pi/"))
-	else {
+	let Some(reference) = selector.strip_prefix('@') else {
 		return Ok(None);
 	};
 	if reference.contains('/') {
@@ -410,7 +407,7 @@ fn split_upstream(input: &str) -> Result<(&str, Option<Str>), SelectionError> {
 	}
 }
 
-/// Matches a selector by pi's ordered cascade: exact provider/id, bare id,
+/// Matches a selector by the ordered cascade: exact provider/id, bare id,
 /// alias, provider-scoped fuzzy match, then substring.
 ///
 /// Ambiguity is ranked by MRU, route priority, and canonical identity, never
@@ -1200,7 +1197,7 @@ mod tests {
 		let roles = [
 			ModelRole::assignment("slow", target.model.as_str(), None).expect("slow"),
 			ModelRole::assignment("task", "@slow", Some("high")).expect("task"),
-			ModelRole::assignment("advisor", "pi/slow", None).expect("advisor"),
+			ModelRole::assignment("advisor", "@slow", None).expect("advisor"),
 		];
 		assert_eq!(roles[1].selectors.as_ref(), [Str::new_static("@slow:high")]);
 		for (selector, thinking) in [("@task", Some("high")), ("@advisor", None)] {

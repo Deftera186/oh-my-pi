@@ -96,6 +96,25 @@ pub struct ExtensionGrantSettings {
 	pub session: Arc<[Grant]>,
 }
 
+/// Stable resource families exposed at one discovery boundary.
+	/// One bounded skill document.
+	/// One reusable prompt template.
+	/// One terminal theme.
+	/// One declarative rule document.
+	/// One static subagent definition.
+/// Reason one resource snapshot was assembled or refreshed.
+	/// Initial session discovery.
+	/// Explicit resource reload.
+	/// Workspace files changed.
+	/// An installed or linked extension changed.
+/// One file-backed resource visible to extension discovery hooks.
+	/// Canonical Environment path.
+	/// Typed resource family.
+	/// Stable discovery source identity.
+/// Fail-closed refusal or malformed effective payload from resource discovery.
+	/// A discovery handler denied the refresh.
+	/// A discovery handler returned a payload that did not match the event.
+	/// A contributed skill path failed containment or bounded-file admission.
 /// One installed extension omitted pending a Core-owned operator decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionGrantRequest {
@@ -246,6 +265,12 @@ pub fn active_content_snapshots_with_skill_contributions(
 	)
 }
 
+/// Runs the fail-closed resource discovery gate over one complete static pass.
+///
+/// The immutable snapshot is returned unchanged when ordinal 35 is not
+/// subscribed, without constructing the resource inventory or a CONTROL frame.
+/// Emits one observe notification when a committed discovery refresh changed
+/// the representable resource set.
 /// Derives the canonical local workspace grant identity used by extension
 /// admission and extension management commands.
 pub fn workspace_identity(root: &Path) -> omp_ext::WorkspaceUri {

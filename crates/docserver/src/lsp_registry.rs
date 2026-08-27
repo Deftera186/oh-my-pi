@@ -147,7 +147,7 @@ impl LspSelector {
 		}
 	}
 
-	/// Compiles pi-compatible extension and exact-filename routes.
+	/// Compiles extension and exact-filename routes.
 	pub fn for_file_types(file_types: &[Str]) -> Result<Self, LspRegistryError> {
 		let patterns = file_types
 			.iter()

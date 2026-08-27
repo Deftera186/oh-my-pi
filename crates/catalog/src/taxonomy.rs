@@ -172,7 +172,7 @@ struct SuffixDef {
 /// One provider-scoped effort-lane suffix rule.
 ///
 /// A provider may serve one logical model as parallel per-effort sibling
-/// lanes (`cursor-grok-4.6-low-fast`, pi PR #8988): the trailing lane token
+/// lanes (`cursor-grok-4.6-low-fast`): the trailing lane token
 /// is transparent to effort collapse, so the effort-suffix vocabulary is
 /// applied immediately before the lane suffix and the collapsed logical
 /// identifier keeps the lane suffix — one logical model per service-tier
@@ -343,8 +343,8 @@ impl Taxonomy {
 	}
 
 	/// Returns the full responses-route hint group containing `provider` —
-	/// sibling gateways (opencode-go/opencode-zen, pi #8957) whose bundled
-	/// catalogs hint that a gateway-first discovered id rides the
+	/// sibling gateways (opencode-go/opencode-zen) whose bundled catalogs hint
+	/// that a gateway-first discovered id rides the
 	/// openai-responses route. `None` when `provider` is in no declared group.
 	pub fn responses_hint_group(&self, provider: &str) -> Option<&[Str]> {
 		self
@@ -433,7 +433,7 @@ impl Taxonomy {
 	}
 
 	/// Whether `provider`'s discovery recovers intrinsic model parameters from
-	/// the bundled canonical reference index (pi PR #8991).
+	/// the bundled canonical reference index.
 	pub fn recovers_canonical_params(&self, provider: &str) -> bool {
 		self
 			.discovery
@@ -1571,8 +1571,8 @@ mod tests {
 
 	#[test]
 	fn bundled_collapse_declares_the_codex_worker_routing_variant() {
-		// pi PR #8929: Codex discovery advertises worker-mode `-wm` routing
-		// variants of its plain SKUs.
+		// Codex discovery advertises worker-mode `-wm` routing variants of its plain
+		// SKUs.
 		let taxonomy = taxonomy();
 		for provider in ["openai-codex", "openai-codex-device"] {
 			assert_eq!(
@@ -1720,7 +1720,6 @@ mod tests {
 		assert!(taxonomy.recovers_canonical_params("gmi-cloud"));
 		assert!(taxonomy.recovers_canonical_params("GMI-CLOUD"));
 		assert!(!taxonomy.recovers_canonical_params("siliconflow"));
-		// pi PR #8991: the bundled inventory declares GMI Cloud's recovery.
 		assert!(super::taxonomy().recovers_canonical_params("gmi-cloud"));
 		assert!(super::taxonomy().recovers_canonical_params("opencode-go"));
 		assert!(!super::taxonomy().recovers_canonical_params("openrouter"));
@@ -1812,8 +1811,8 @@ mod tests {
 		);
 		assert_eq!(taxonomy.billing_variant_plain("-free"), None, "an empty base never matches");
 		assert_eq!(taxonomy.billing_variant_plain("kimi-k3"), None);
-		// pi #8957: the bundled inventory declares the OpenCode gateway group
-		// and the billing-variant suffixes runtime discovery hints with.
+		// The bundled inventory declares the OpenCode gateway group and the
+		// billing-variant suffixes runtime discovery hints with.
 		let bundled = bundled_taxonomy();
 		assert!(
 			bundled

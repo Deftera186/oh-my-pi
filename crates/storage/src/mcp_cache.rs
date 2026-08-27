@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-/// Pi-parity definition lifetime: thirty days.
+/// Definition lifetime: thirty days.
 pub const MCP_DEFINITION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = "
@@ -171,8 +171,8 @@ impl McpDefinitionCache {
 	}
 }
 
-/// Computes the SHA-256 of pi-compatible stable JSON: object keys are sorted
-/// recursively while array order remains significant.
+/// Computes the SHA-256 of stable JSON: object keys are sorted recursively
+/// while array order remains significant.
 pub fn config_digest(config_json: &[u8]) -> Result<[u8; 32], McpCacheError> {
 	let value: Value = serde_json::from_slice(config_json)?;
 	let canonical = canonical_json(&value)?;

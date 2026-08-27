@@ -155,7 +155,7 @@ pub enum ShareStoreKind {
 	Extension,
 }
 
-/// Recorded pi-parity fallback from an unusable selected store.
+/// Recorded fallback from an unusable selected store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShareFallback {
 	/// Failed selected store.
@@ -382,8 +382,7 @@ pub fn seal(projection: &ShareProjection) -> Result<SealedShare, ShareError> {
 	})
 }
 
-/// Uploads to the selected store. Gist failure follows pi by explicitly falling
-/// back to HTTP.
+/// Uploads to the selected store. Gist failure explicitly falls back to HTTP.
 pub async fn upload(
 	store: &impl ShareStore,
 	selected: ShareStoreKind,

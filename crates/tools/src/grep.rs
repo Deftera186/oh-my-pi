@@ -1,4 +1,4 @@
-//! Regex workspace search with pi-compatible grouping and pagination.
+//! Regex workspace search with grouped output and pagination.
 
 use std::{
 	collections::{HashMap, HashSet},

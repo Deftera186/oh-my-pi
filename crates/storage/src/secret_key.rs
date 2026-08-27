@@ -17,7 +17,7 @@ pub const PLACEHOLDER_KEY_FILE: &str = "secret-placeholder.key";
 const WINNER_READ_ATTEMPTS: usize = 50;
 const WINNER_READ_DELAY: Duration = Duration::from_millis(10);
 
-/// Resolves pi's native state path for the persistent placeholder key.
+/// Resolves the native state path for the persistent placeholder key.
 pub fn native_path() -> Result<PathBuf, SecretKeyError> {
 	if let Some(state) = env::var_os("XDG_STATE_HOME") {
 		return Ok(PathBuf::from(state).join("omp").join(PLACEHOLDER_KEY_FILE));

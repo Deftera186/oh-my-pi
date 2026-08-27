@@ -2895,7 +2895,7 @@ impl OpenAiResponsesCodec {
 		// Some DeepSeek reasoning gateways silently disable thinking whenever a
 		// selector is present. `auto` is the provider default and can be omitted
 		// without changing tool semantics; forced and named selectors remain
-		// authoritative (pi 7cb504cdb3).
+		// authoritative.
 		let tool_choice = match tool_choice {
 			Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto))
 				if context.policy.tool.disable_reasoning_on_choice == Some(true)

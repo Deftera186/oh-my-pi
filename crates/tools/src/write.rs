@@ -1,4 +1,4 @@
-//! Pi-compatible whole-file writes over the session document host.
+//! Whole-file writes over the session document host.
 
 use std::{
 	collections::BTreeMap,
@@ -87,7 +87,7 @@ pub enum WriteDisposition {
 	Overwrote,
 }
 
-/// Mutation family used to project pi's exact special-write response text.
+/// Mutation family used to project exact special-write response text.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WriteOperation {
@@ -240,8 +240,8 @@ pub struct Payload {
 	pub canonical_recovery: Option<Str>,
 	/// Exact UTF-8 byte length persisted.
 	pub byte_len:           u64,
-	/// Pi-compatible JavaScript string length (UTF-16 code units) reported in
-	/// the model-facing success line.
+	/// JavaScript string length (UTF-16 code units) reported in the model-facing
+	/// success line.
 	pub reported_len:       u64,
 	/// Whether the transaction created or replaced the target.
 	pub disposition:        WriteDisposition,

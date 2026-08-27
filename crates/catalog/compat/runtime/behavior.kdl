@@ -24,8 +24,8 @@ behavior {
 	}
 
 	// Cursor advertises OpenAI reasoning effort as sibling model ids. The
-	// family marker intentionally mirrors pi parseOpenAIModel: `gpt-` must be
-	// followed immediately by an ASCII version digit.
+	// family marker uses a `gpt-` prefix followed immediately by an ASCII
+	// version digit.
 	cursor-effort family-marker="gpt-" {
 		tier "minimal" "low" "medium" "high" "xhigh" "max"
 	}

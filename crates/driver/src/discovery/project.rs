@@ -15,7 +15,7 @@ use url::Url;
 
 use super::active_repo::resolve_active_repo_context;
 
-/// Pi-compatible maximum number of `AGENTS.md` sources retained from a tree.
+/// Maximum number of `AGENTS.md` sources retained from a tree.
 pub const AGENTS_MD_LIMIT: usize = 200;
 /// Prompt tree depth below each workspace root.
 pub const WORKSPACE_TREE_DEPTH: usize = 3;
@@ -346,7 +346,7 @@ fn path_uri(path: &Path) -> Str {
 }
 
 /// Deduplicates `AGENTS.md` paths across per-root trees while retaining root
-/// order and the global pi-compatible cap.
+/// order and the global source cap.
 pub fn merged_agents_files(trees: &[WorkspaceTree]) -> Arc<[PathBuf]> {
 	let mut seen = BTreeSet::new();
 	let mut output = Vec::new();

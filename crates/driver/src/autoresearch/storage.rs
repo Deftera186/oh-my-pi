@@ -158,8 +158,7 @@ pub struct StoragePaths {
 }
 
 impl StoragePaths {
-	/// Resolves the pi-compatible per-project layout and
-	/// `OMP_AUTORESEARCH_DB_DIR` override.
+	/// Resolves the per-project layout and `OMP_AUTORESEARCH_DB_DIR` override.
 	pub fn resolve(repository_root: &Path) -> Result<Self, StorageError> {
 		let encoded = encode_project_key(repository_root.as_os_str());
 		if let Some(root) = env::var_os("OMP_AUTORESEARCH_DB_DIR").filter(|value| !value.is_empty()) {

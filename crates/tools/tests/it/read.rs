@@ -1,4 +1,4 @@
-//! Model-facing behavioral contracts for pi-compatible `read@1`.
+//! Model-facing behavioral contracts for `read@1`.
 
 use std::{
 	collections::VecDeque,

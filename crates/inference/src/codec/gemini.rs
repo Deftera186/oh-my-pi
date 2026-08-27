@@ -845,7 +845,6 @@ impl GeminiCodec {
 					// `wire_effort` already collapses `minimal` onto `low`
 					// when a collapsed family aliases both onto the same
 					// `-low` SKU — Cloud Code Assist rejects `MINIMAL` there
-					// (pi f7df5d4970).
 					let level = selection
 						.native_effort
 						.clone()
@@ -1874,7 +1873,7 @@ pub struct GeminiDecoder {
 	observed_finish: bool,
 	response_id:     Option<Str>,
 	/// Heals leaked ```` ```thinking ```` opener lines that Gemini thought
-	/// summaries emit as between-summary delimiters (pi #8719).
+	/// summaries emit as between-summary delimiters.
 	thinking_fence:  ThinkingFenceStripper,
 }
 
@@ -2037,7 +2036,7 @@ impl GeminiDecoder {
 				self.transition_part(Some(ContiguousPartKind::Thinking), events);
 				// Structured thought parts bypass the visible-channel leaked
 				// reasoning healers, so a leaked ```thinking delimiter would
-				// reach display and persistence verbatim (pi #8719).
+				// reach display and persistence verbatim.
 				let cleaned = self.thinking_fence.push(&text);
 				if !cleaned.is_empty() || part.thought_signature.is_some() {
 					let index = *self
@@ -3777,8 +3776,8 @@ mod tests {
 
 	#[test]
 	fn cca_minimal_aliased_onto_the_low_sku_sends_low_level() {
-		// pi f7df5d4970: Cloud Code Assist Gemini 3.6/3.7 Flash alias user
-		// `minimal` onto the same `-low` wire SKU as `low`; that SKU rejects
+		// Cloud Code Assist Gemini 3.6/3.7 Flash aliases `minimal` onto the same
+		// `-low` wire SKU as `low`; that SKU rejects
 		// `thinkingLevel: MINIMAL` with HTTP 400, so the wire must spell LOW.
 		let policy = ThinkingPolicy::new(ThinkingMode::GoogleLevel, [
 			ThinkingEffort::Minimal,
@@ -4029,8 +4028,8 @@ mod tests {
 
 	#[test]
 	fn leaked_thinking_fence_openers_are_stripped_from_thought_parts() {
-		// pi #8719: Gemini thought summaries occasionally emit a bare
-		// ```thinking opener line as a between-summary delimiter; structured
+		// Gemini thought summaries occasionally emit a bare ```thinking opener
+		// line as a between-summary delimiter; structured
 		// thought parts bypass the visible-channel healers, so the decoder
 		// strips it while preserving legitimate fenced code.
 		let mut decoder = GeminiDecoder::default();

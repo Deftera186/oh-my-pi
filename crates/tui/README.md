@@ -517,7 +517,7 @@ let tree = dom! {
 # let _ = tree;
 ```
 
-Cell options build pi-style browsers — aligned stat columns that survive narrow widths:
+Cell options build aligned browsers — stat columns survive narrow widths:
 
 ```rust
 # use omp_tui::dom;

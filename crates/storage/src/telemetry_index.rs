@@ -136,8 +136,8 @@ pub struct IssueDeleteSelector {
 }
 
 impl IssueDeleteSelector {
-	/// Enforces PI-compatible exact-one selector semantics before any database
-	/// is opened or mutated.
+	/// Enforces exact-one selector semantics before any database is opened or
+	/// mutated.
 	///
 	/// # Errors
 	/// Returns a typed selector error unless exactly one selector is present.

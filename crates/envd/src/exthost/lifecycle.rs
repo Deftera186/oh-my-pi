@@ -619,6 +619,19 @@ pub struct ActivationEvent {
 	pub trigger:            ActivationTrigger,
 }
 
+/// Emits `extension_load` after activation, without constructing its payload
+/// when no extension observes the event.
+/// Emits `extension_unload` before teardown, without constructing its payload
+/// when no extension observes the event.
+///
+/// Supervisor seams pass zero until callback dispatch owns a per-extension
+/// pending-hook count; tool invocation counts are not a valid substitute.
+/// Emits `host_reconnect` after replacement activation, carrying the newly
+/// authenticated host generation.
+///
+/// Callers pass zero for `missed_events` until CONTROL owns a per-host outage
+/// counter; the existing global observer-queue drop count is not a truthful
+/// proxy for events missed by one replacement host.
 /// Result of requesting activation for a generation.
 #[derive(Clone, Debug)]
 pub enum ActivationDisposition {

@@ -789,7 +789,10 @@ from .sessions import (
     SessionKind,
     SessionLink,
     SessionNotFound,
+    SessionSetup,
     SessionStatus,
+    SessionTransitionDenied,
+    SessionTransitionIndeterminate,
     TitleSource,
     Usage,
     UsageAccuracy,
@@ -800,6 +803,7 @@ from .sessions import (
 from .telemetry import ModelRequest, PromptFingerprint, TelemetryError
 renderer = ui.renderer
 message_renderer = ui.message_renderer
+markdown_transformer = ui.markdown_transformer
 command = ui.command
 shortcut = ui.shortcut
 DuplicateRenderer = ui.DuplicateRenderer
@@ -833,6 +837,7 @@ from ._registry import (
     entry_kind,
     service,
     services,
+    skill,
     registry as _declarations,
 )
 from .placement import (
@@ -1804,6 +1809,7 @@ __all__ += (
     "restart_reason",
     "service",
     "services",
+    "skill",
     "tier_of",
 )
 __all__ += (

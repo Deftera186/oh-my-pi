@@ -48,7 +48,7 @@ pub mod gen_ai {
 	/// Requested random seed on `chat` spans.
 	pub const REQUEST_SEED: &str = "gen_ai.request.seed";
 	/// Requested response-choice count; reserved for `chat` spans but not set by
-	/// pi's built-in emitter.
+	/// the built-in emitter.
 	pub const REQUEST_CHOICE_COUNT: &str = "gen_ai.request.choice.count";
 	/// Whether response streaming was requested on `chat` spans.
 	pub const REQUEST_STREAM: &str = "gen_ai.request.stream";
@@ -88,8 +88,8 @@ pub mod gen_ai {
 	/// Captured tool-call result on `execute_tool` spans when content capture is
 	/// enabled.
 	pub const TOOL_CALL_RESULT: &str = "gen_ai.tool.call.result";
-	/// Serialized tool definitions; reserved for `chat` spans but not set by
-	/// pi's built-in emitter.
+	/// Serialized tool definitions; reserved for `chat` spans but not set by the
+	/// built-in emitter.
 	pub const TOOL_DEFINITIONS: &str = "gen_ai.tool.definitions";
 
 	/// Full captured input-message payload on `chat` spans when full content
@@ -112,7 +112,7 @@ pub mod openai {
 	/// Requested `OpenAI` service tier on eligible `chat` spans.
 	pub const REQUEST_SERVICE_TIER: &str = "openai.request.service_tier";
 	/// Returned `OpenAI` service tier; reserved for `chat` spans but not set by
-	/// pi's built-in emitter.
+	/// the built-in emitter.
 	pub const RESPONSE_SERVICE_TIER: &str = "openai.response.service_tier";
 }
 

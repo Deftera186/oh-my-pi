@@ -16,7 +16,7 @@ use crate::cli::{WorktreeArgs, WorktreeCommand};
 
 /// Current isolation-owner marker written by workspace operations.
 const ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner";
-/// pi-compatible isolation-owner marker recognized during cleanup.
+/// Legacy isolation-owner marker recognized during cleanup.
 const LEGACY_ISOLATION_OWNER_FILE: &str = ".omp-isolation-owner.json";
 
 /// Owner metadata parsed from an isolation marker file.

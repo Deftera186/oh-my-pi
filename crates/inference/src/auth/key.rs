@@ -215,7 +215,7 @@ impl KeySource for UnavailableKeySource {
 
 /// A persistent encryption key stored in an owner-readable file.
 ///
-/// This is the boring local-development equivalent of pi's owner-only SQLite
+/// This is the boring local-development equivalent of owner-only SQLite
 /// credential storage: it avoids binding credential access to a particular
 /// executable identity, so rebuilding an ad-hoc-signed macOS binary does not
 /// trigger Keychain authorization. The adjacent key means encryption does not

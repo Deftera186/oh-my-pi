@@ -29,7 +29,7 @@ pub struct JsonTheme {
 }
 
 impl JsonTheme {
-	/// Parses either omp's compact semantic palette or pi's richer `colors`
+	/// Parses either omp's compact semantic palette or the richer `colors`
 	/// palette. Rich component slots lower onto omp's semantic tokens once at
 	/// load time; code-fence borders that miss the contrast floor are blended
 	/// toward the theme's muted or foreground tier.

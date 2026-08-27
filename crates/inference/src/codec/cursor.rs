@@ -417,7 +417,7 @@ fn encode_run_request_for_wire_mode(
 
 /// Projects ordered system/developer prompts as global `requestContext.rules`
 /// so Cursor's AgentService retains always-apply rules when it reconstructs
-/// prompts server-side (pi #8997).
+/// prompts server-side.
 fn cursor_request_context(root_prompts: &[CursorRootPrompt]) -> wire::RequestContext {
 	wire::RequestContext {
 		rules: root_prompts

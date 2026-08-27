@@ -43,8 +43,8 @@ struct Case {
 }
 
 /// Census wire overlay beyond the archived oracle slice: the class×host
-/// `thinking_format` compositions from pi-openai-chat:012–015. Applies only
-/// where the oracle is silent on the axis.
+/// `thinking_format` compositions from the archived OpenAI chat cases. Applies
+/// only where the oracle is silent on the axis.
 fn census_thinking_format(provider: &str, class: &str) -> Option<&'static str> {
 	match provider {
 		"openrouter" => Some("openrouter"),
@@ -252,8 +252,8 @@ fn every_ready_census_case_executes_against_real_machinery() {
 
 #[test]
 fn glm_53_uniform_ladder_resolves_on_every_host() {
-	// pi e49ee4b4e2: GLM-5.3 replaces GLM-5.2's host-specific dialects with a
-	// uniform wire-exact low/high/max ladder, mandatory thinking, and a max
+	// GLM-5.3 replaces GLM-5.2's host-specific dialects with a uniform
+	// wire-exact low/high/max ladder, mandatory thinking, and a max
 	// default effort. The rule must beat census host-dialect residues such as
 	// baseten's `zai-org/GLM-5*` glob.
 	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
@@ -318,8 +318,8 @@ fn glm_53_uniform_ladder_resolves_on_every_host() {
 
 #[test]
 fn copilot_grok_46_residue_grants_the_responses_xhigh_ladder() {
-	// pi PR #8981: Copilot serves grok-4.6 / grok-4.6-1m only via /responses,
-	// whose policy carries the native xhigh tier. Dormant until a catalog
+	// Copilot serves grok-4.6 / grok-4.6-1m only via /responses, whose policy
+	// carries the native xhigh tier. Dormant until a catalog
 	// snapshot ships the ids; discovery classification already resolves them.
 	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
 	for model in ["grok-4.6", "grok-4.6-1m"] {
@@ -410,7 +410,7 @@ fn deepseek_image_venice_off_and_opencode_effort_policies_resolve() {
 
 #[test]
 fn qwen_38_local_hosts_route_effort_onto_the_chat_template() {
-	// pi bf490ae024: Qwen 3.8+ chat templates steer thinking depth via the
+	// Qwen 3.8+ chat templates steer thinking depth via the
 	// `reasoning_effort` kwarg (low/medium/xhigh) and cannot disable thinking;
 	// vLLM rides the chat-template-kwargs dialect because it ignores top-level
 	// `enable_thinking`.

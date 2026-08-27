@@ -22,7 +22,7 @@ pub struct UnexpectedStopEvidence {
 	pub tool_call:       bool,
 }
 
-/// Returns whether pi's secondary unexpected-stop classifier should run.
+/// Returns whether the secondary unexpected-stop classifier should run.
 pub const fn is_unexpected_stop_candidate(evidence: UnexpectedStopEvidence) -> bool {
 	evidence.end_turn && !evidence.tool_call && (evidence.visible_text || evidence.signed_thinking)
 }

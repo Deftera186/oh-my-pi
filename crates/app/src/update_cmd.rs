@@ -661,7 +661,7 @@ fn prune_stale(directory: &Path) -> miette::Result<()> {
 		let name = entry.file_name();
 		if is_update_artifact_name(&name.to_string_lossy()) {
 			// A mapped Windows backup may still belong to a running older
-			// updater. Deletion remains best-effort just like pi.
+			// updater. Deletion remains best-effort.
 			let _ = fs::remove_file(entry.path());
 		}
 	}

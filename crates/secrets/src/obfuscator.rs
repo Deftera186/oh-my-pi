@@ -304,7 +304,7 @@ fn replace_literal_outside(
 }
 /// Returns whether `start..end` is not flanked by credential-alphabet bytes.
 ///
-/// Enforces [`SecretRule::boundary_guard`]: pi's lookaround boundary over
+/// Enforces [`SecretRule::boundary_guard`]: the lookaround boundary over
 /// `[0-9A-Za-z_*-]`, checked here because the linear-time engine cannot.
 fn on_credential_boundary(source: &str, start: usize, end: usize) -> bool {
 	let alphabet = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'*' | b'-');

@@ -203,7 +203,7 @@ impl SettingsDomain for TuiSettings {
 	];
 }
 
-/// Root-level terminal display switches retained at their Pi-compatible paths.
+/// Root-level terminal display switches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct RootDisplaySettings {

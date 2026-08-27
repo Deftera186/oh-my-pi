@@ -4,8 +4,6 @@
 //! select — print them, signal them, or wait for them — so selection, argument
 //! parsing, and help rendering all live here, and each command is a thin front
 //! end over [`run`].
-//!
-//! Ported from `pi-shell`, which previously defined all three inline.
 
 #![allow(dead_code, reason = "shared matching paths are selected by separate process builtins")]
 

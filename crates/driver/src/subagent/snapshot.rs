@@ -138,7 +138,7 @@ pub fn child_snapshot(parent: &AgentSnapshot, options: ChildSnapshotOptions<'_>)
 		.retain(|tool| tool_allowed(tool.name.as_str(), &options));
 	// Every child finalizes through the hidden `yield` tool, which the
 	// top-level agent never advertises; widening the cloned set here is the
-	// one non-attenuating grant (pi: `requireYieldTool` on all task children).
+	// one non-attenuating grant for all task children.
 	if !enabled.iter().any(|name| name == "yield")
 		&& let Some(tool) = lowered_yield(&child.registry)
 	{

@@ -70,7 +70,7 @@ pub struct LiveTransportOptions {
 }
 
 impl LiveTransportOptions {
-	/// Creates options with the pi-parity data-channel timeout.
+	/// Creates options with the data-channel timeout.
 	pub fn new(
 		session_id: Str,
 		instructions: Str,

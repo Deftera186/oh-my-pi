@@ -260,7 +260,7 @@ impl KokoroAdapter {
 	/// `on_chunk` is synchronous backpressure. Returning `false` stops
 	/// synthesis with a cancellation result; already-delivered audio remains
 	/// valid. A stale voice id resolves to `af_heart` before any local tensor
-	/// access, matching pi's persisted-setting fallback.
+	/// access, matching the persisted-setting fallback.
 	pub fn synthesize_streaming(
 		&self,
 		text: &str,

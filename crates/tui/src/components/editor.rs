@@ -731,7 +731,7 @@ fn word_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
 	(start < end).then_some(start..end)
 }
 
-/// pi's prose word-boundary class: whitespace or clause punctuation.
+/// Prose word-boundary class: whitespace or clause punctuation.
 const fn is_word_boundary(character: char) -> bool {
 	character.is_whitespace()
 		|| matches!(character, '.' | ',' | ';' | ':' | '!' | '?' | '"' | ']' | ')' | '}')
@@ -777,10 +777,9 @@ fn completion_prefix_range(
 	is_prose_word(text, mask, &range).then_some(range)
 }
 
-/// Whether `range` is user prose eligible for spelling assistance, mirroring
-/// pi's `isProseWord`: unmasked, no codeish characters or digits in the
-/// whitespace-delimited token, no camelCase, and not on a slash-command or
-/// arrow-prefixed line.
+/// Whether `range` is user prose eligible for spelling assistance: unmasked,
+/// with no codeish characters or digits in the whitespace-delimited token, no
+/// camelCase, and not on a slash-command or arrow-prefixed line.
 fn is_prose_word(text: &str, mask: &[Range<usize>], range: &Range<usize>) -> bool {
 	if range.start >= range.end || range.end > text.len() {
 		return false;
@@ -1387,7 +1386,7 @@ impl Component for EditInput {
 	}
 
 	fn paste_raw(&mut self, _ec: &mut EventCtx<'_>, text: &str) -> Flow {
-		// Verbatim insertion (pi's raw-paste binding): the text stays inline
+		// Verbatim insertion: the text stays inline
 		// and editable — no attachment staging, no large-paste chip, no
 		// auto-spacing. Sanitization still applies inside `insert_text`.
 		if matches!(self.editor.insert_text(text), EditOutcome::Changed) {

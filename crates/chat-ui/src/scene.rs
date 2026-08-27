@@ -63,7 +63,7 @@ const LIVE_ASSISTANT_ID: &str = "live-assistant";
 const LIVE_VOICE_ROWS: u16 = 4;
 const LIVE_VOICE_FRAME: Duration = Duration::from_millis(50);
 /// Memory bound on live (uncommitted) blocks: reaching it forces retirement
-/// offers even while the screen still has room. Matches pi's transcript cap.
+/// offers even while the screen still has room. Uses the transcript cap.
 const MAX_LIVE_BLOCKS: u64 = 256;
 
 /// Provider phase displayed while realtime voice owns the composer.

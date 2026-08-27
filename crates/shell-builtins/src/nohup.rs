@@ -1,4 +1,4 @@
-//! The `nohup` command, moved from `pi-shell`.
+//! The `nohup` command.
 //!
 //! This builtin detaches a backgrounded operand into a new session so a server
 //! survives the embedded shell's kill-on-drop teardown. A system `nohup` does
@@ -97,7 +97,7 @@ impl builtins::Command for NohupCommand {
 
 			let mut params = context.params.clone();
 			params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
-			let source_info = SourceInfo::from("pi-natives:nohup");
+			let source_info = SourceInfo::from("omp-builtins:nohup");
 			context
 				.shell
 				.run_string(command_line, &source_info, &params)

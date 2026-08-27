@@ -267,7 +267,7 @@ impl McpService {
 			.map_or_else(Vec::new, |manager| manager.resource_uris())
 	}
 
-	/// Resolves a PI-compatible opaque `mcp://<advertised-uri>` payload to the
+	/// Resolves an opaque `mcp://<advertised-uri>` payload to the
 	/// deterministic current server which advertised it.
 	pub(crate) fn resolve_resource_server(&self, uri: &str) -> Option<pb::McpServerRef> {
 		let name = self

@@ -7006,10 +7006,10 @@ where
 				state,
 			};
 			// A failed slash command (bad arguments, handler error) renders
-			// in-chat like pi; it never tears down the interactive shell.
 			let dispatch = match roster
 				.dispatch(&text, CommandSurface::Tui, &mut command_host)
 				.await
+			// in-chat; it never tears down the interactive shell.
 			{
 				Ok(dispatch) => dispatch,
 				Err(error) => {
@@ -10321,10 +10321,10 @@ fn send_status(
 }
 
 /// Auto-compaction boundary percents for the embedded context gauge, absent
-/// when compaction is disabled or the window is unknown. Mirrors pi's
-/// `computeCompactionBoundaries`: the threshold marks where auto-compaction
-/// fires; speculation marks where the background summarizer starts, absent
-/// when async compaction is off or no ladder method speculates.
+/// when compaction is disabled or the window is unknown. The threshold marks
+/// where auto-compaction fires; speculation marks where the background
+/// summarizer starts, absent when async compaction is off or no ladder method
+/// speculates.
 fn compaction_boundaries(
 	settings: &settings::CompactionSettings,
 	context_window: Option<u64>,

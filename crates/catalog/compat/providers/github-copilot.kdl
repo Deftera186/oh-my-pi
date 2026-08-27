@@ -59,7 +59,7 @@ provider "github-copilot" {
 	// Dormant until a catalog snapshot ships grok-4.6: Copilot serves
 	// grok-4.6 / grok-4.6-1m only via /responses, whose policy adds the
 	// native xhigh tier and drops the chat-completions compat block
-	// (pi PR #8981). Discovered rows ride the openai-responses primary route.
+	// Discovered rows ride the openai-responses primary route.
 	models "grok-4.6" "grok-4.6-1m" {
 		thinking-efforts "minimal" "low" "medium" "high" "xhigh"
 	}

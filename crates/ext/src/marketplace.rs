@@ -304,7 +304,7 @@ fn append_contained(target: &mut PathBuf, path: &Path) -> Result<(), ExtensionEr
 	Ok(())
 }
 
-/// Returns whether a marketplace or plugin name follows the pi/Claude contract.
+/// Returns whether a marketplace or plugin name follows the naming contract.
 pub fn valid_name(name: &str) -> bool {
 	name.len() <= 64
 		&& name

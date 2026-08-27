@@ -167,8 +167,8 @@ async fn render_item<C: HttpClient + Sync>(client: &C, item: &HnItem) -> String 
 			continue;
 		};
 
-		// This intentionally mirrors pi's depth-one recursive call: a parent
-		// comment's text is emitted again immediately before its replies.
+		// A parent comment's text is emitted again immediately before its replies
+		// to preserve depth-one recursive output.
 		append_item_text(&mut output, &comment, "");
 		let children = fetch_items(client, kids, CHILD_COMMENT_LIMIT).await;
 		for child in children {

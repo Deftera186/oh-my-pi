@@ -2889,6 +2889,7 @@ impl EnvServer {
 		self.provider_response_hooks.clone()
 	}
 
+	/// Returns the live per-session admission hook gate.
 	/// Returns the sealed deployment manifest for an exact live CONTROL
 	/// connection generation.
 	pub fn extension_control_manifest(

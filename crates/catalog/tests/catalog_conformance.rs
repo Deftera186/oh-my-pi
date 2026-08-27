@@ -124,7 +124,7 @@ const REVIEWED_THINKING_DEFAULTS: &[&str] = &["xai-oauth/grok-4.5"];
 
 /// Effort-routed wire id for an inferred Cursor family. A `-fast`
 /// service-tier lane wedges the effort before the lane token
-/// (`cursor-grok-4.5-low-fast`, pi PR #8988); plain families append it.
+/// (`cursor-grok-4.5-low-fast`); plain families append it.
 fn cursor_effort_wire(base: &str, effort: ThinkingEffort) -> String {
 	match base.strip_suffix("-fast") {
 		Some(stem) => format!("{stem}-{}-fast", effort.into_str()),
@@ -1315,8 +1315,8 @@ fn cursor_effort_suffixes_compile_to_routable_thinking_profiles() {
 
 #[test]
 fn cursor_grok_fast_lane_collapses_into_one_logical_model_with_aliases() {
-	// pi PR #8988: Cursor's `-fast` service-tier siblings collapse into one
-	// logical model per lane; each collapsed wire id survives as an alias and
+	// Cursor's `-fast` service-tier siblings collapse into one logical model per
+	// lane; each collapsed wire id survives as an alias and
 	// never as its own catalog listing.
 	let compiled = compile_frozen_oracle();
 	let key = "cursor/cursor-grok-4.5-fast";

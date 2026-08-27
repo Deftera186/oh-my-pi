@@ -1766,7 +1766,7 @@ pub fn latex_block(expr: &str, base: Style, sink: &mut dyn RichSink) -> bool {
 	true
 }
 
-/// Trims a row and collapses whitespace exactly like pi's global
+/// Trims a row and collapses whitespace using the global
 /// `[ \t]*\n[ \t]*` → `" "` replacement: each newline (with its surrounding
 /// spaces/tabs) becomes one space, so `a\n\nb` keeps two spaces.
 fn collapse_interior_whitespace(row: &str) -> borrow::Cow<'_, str> {
@@ -1812,7 +1812,7 @@ mod tests {
 	}
 	#[test]
 	fn interior_newline_runs_collapse_one_space_per_newline() {
-		// pi's global `[ \t]*\n[ \t]*` → " " replaces each newline match
+		// `[ \t]*\n[ \t]*` → " " replaces each newline match
 		// independently, so a blank line inside a group keeps two spaces
 		assert_eq!(plain("\\text{a\n\nb}"), ["a  b"]);
 		assert_eq!(plain("\\text{a \n b}"), ["a b"]);

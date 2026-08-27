@@ -79,6 +79,7 @@ impl ExtensionHarness {
 		self.server.registry()
 	}
 
+	/// Returns the live extension-backed hook admission gate.
 	/// Stops the connection task and drops the server-owned child process tree.
 	pub async fn shutdown(mut self) {
 		if let Some(task) = self.task.take() {

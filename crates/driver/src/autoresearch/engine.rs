@@ -23,7 +23,7 @@ use super::{
 
 /// Fixed harness entrypoint.
 pub const HARNESS: &str = "./autoresearch.sh";
-/// Pi's default per-run timeout.
+/// Default per-run timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
 const REGIME_ID: &str = "autoresearch";

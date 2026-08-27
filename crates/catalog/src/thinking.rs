@@ -435,7 +435,7 @@ impl ThinkingRouting {
 		let native_effort = self.effort_map.get(&effort).cloned();
 		// A collapsed family may alias `minimal` onto the sibling `low` wire
 		// identity (Cloud Code Assist Gemini 3.6/3.7 Flash route both onto the
-		// `-low` SKU, which rejects wire `MINIMAL`; pi f7df5d4970). The wire
+		// `-low` SKU, which rejects wire `MINIMAL`. The wire
 		// effort names the canonical effort that owns the routed identity so
 		// codecs spell the level that SKU actually accepts.
 		let wire_effort = if effort == ThinkingEffort::Minimal
@@ -668,7 +668,7 @@ mod tests {
 	#[test]
 	fn minimal_aliased_onto_the_low_wire_model_spells_low() {
 		// Cloud Code Assist Gemini 3.6/3.7 Flash route both minimal and low
-		// onto the `-low` SKU, which rejects wire `MINIMAL` (pi f7df5d4970).
+		// onto the `-low` SKU, which rejects wire `MINIMAL`.
 		let policy = ThinkingPolicy::new(ThinkingMode::GoogleLevel, [
 			ThinkingEffort::Minimal,
 			ThinkingEffort::Low,

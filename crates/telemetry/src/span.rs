@@ -261,9 +261,8 @@ pub fn start_execute_tool(
 
 /// Finish an `invoke_agent` span, stamping the run snapshot before error state.
 ///
-/// Pi intentionally reports aggregate chat/tool latency in milliseconds, as
-/// encoded by the `_ms` extension keys, rather than semantic-convention
-/// seconds.
+/// Aggregate chat/tool latency is reported in milliseconds, as encoded by the
+/// `_ms` extension keys, rather than semantic-convention seconds.
 pub fn finish_invoke_agent(
 	span: &mut Span,
 	step_count: u64,
@@ -372,9 +371,9 @@ pub fn record_handoff(
 /// Run `f` while `span` is the active OpenTelemetry parent.
 ///
 /// Tool-internal spans therefore nest below `execute_tool`, and a subagent's
-/// `invoke_agent` span nests below the parent tool span, matching pi's
-/// `runInActiveSpan`. The closure is synchronous because OpenTelemetry context
-/// guards are thread-local; async callers should activate around each poll.
+/// `invoke_agent` span nests below the parent tool span. The closure is
+/// synchronous because OpenTelemetry context guards are thread-local; async
+/// callers should activate around each poll.
 pub fn in_active_span<T>(span: &Span, f: impl FnOnce() -> T) -> T {
 	let context = Context::current().with_remote_span_context(span.span_context().clone());
 	let _guard = context.attach();

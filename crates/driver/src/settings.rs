@@ -838,10 +838,10 @@ pub struct Settings {
 	/// Terminal display and rendering behavior.
 	#[serde(default)]
 	pub display:           DisplaySettings,
-	/// Pi-compatible TUI rendering and input settings.
+	/// TUI rendering and input settings.
 	#[serde(default)]
 	pub tui:               TuiSettings,
-	/// Root-level Pi-compatible display switches.
+	/// Root-level display switches.
 	#[serde(flatten)]
 	pub root_display:      RootDisplaySettings,
 	/// Theme, status-line, and icon choices.

@@ -405,9 +405,9 @@ mod tests {
 
 	#[test]
 	fn collapses_cursor_grok_effort_lanes_per_service_tier() {
-		// pi PR #8988: each Cursor Grok service-tier lane is one logical
-		// model; the `-fast` lane routes efforts onto the `-<effort>-fast`
-		// wire siblings while the standard lane keeps the plain collapse.
+		// Each Cursor Grok service-tier lane is one logical model; the `-fast`
+		// lane routes efforts onto the `-<effort>-fast` wire siblings while the
+		// standard lane keeps the plain collapse.
 		let cursor = |model: &str| {
 			classify(ClassificationInput {
 				phase: ClassificationPhase::CatalogCompiler,

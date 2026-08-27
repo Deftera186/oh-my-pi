@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
-/// Pi-compatible negative startup cache lifetime.
+/// Negative startup cache lifetime.
 pub const CRASH_BACKOFF: Duration = Duration::from_secs(3 * 60);
 
 /// Complete identity of one shareable initialized client.

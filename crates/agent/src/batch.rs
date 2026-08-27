@@ -917,6 +917,8 @@ impl BatchResult {
 	pub const fn outcome(&self) -> Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>> {
 		self.outcome.as_ref()
 	}
+	/// Returns the resolved tool identity for hook projection.
+	/// Returns the exact committed arguments for hook projection.
 
 	/// Takes detached job ownership for registration with the job board.
 	pub fn into_job(self) -> Option<JobRef> {

@@ -2105,7 +2105,7 @@ mod tests {
 						.any(|rows| rows[0].is_empty() && rows[1].is_empty()),
 					"{left_name} then {right_name}",
 				);
-				// blank-separated sibling lists merge tight (pi parity), and a
+				// blank-separated sibling lists merge tight, and a
 				// paragraph flows straight into a following list
 				let merges = (left_name == "paragraph" || left_name == "list") && right_name == "list";
 				if !merges {

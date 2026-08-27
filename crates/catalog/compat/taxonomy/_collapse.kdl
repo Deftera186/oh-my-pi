@@ -9,8 +9,8 @@ collapse {
 	effort-suffix "-low" tier="low"
 	effort-suffix "-max" tier="max" except-bare-prefix="qwen"
 	// Codex backend discovery advertises worker-mode routing variants under a
-	// `-wm` suffix (`gpt-5.6-luna-wm`, pi PR #8929): the same model behind a
-	// different route, with base-model metadata owned by the plain bundled SKU.
+	// `-wm` suffix (`gpt-5.6-luna-wm`): the same model behind a different route,
+	// with base-model metadata owned by the plain bundled SKU.
 	routing-variant-suffix "-wm" "openai-codex" "openai-codex-device"
 	// Cursor discovery serves pure effort-suffixed siblings as one logical
 	// model. The reviewed GPT-5.6 seeds enable the generic grouping rule for

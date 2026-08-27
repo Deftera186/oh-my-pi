@@ -65,7 +65,7 @@ pub struct PtyOutputQueue {
 }
 
 impl PtyOutputQueue {
-	/// Appends one live chunk while retaining the newest PI-parity window.
+	/// Appends one live chunk while retaining the newest live window.
 	pub fn push(&mut self, chunk: Bytes) {
 		self.chunks.push_back(chunk);
 		if self.chunks.len() <= MAX_LIVE_WRITE_QUEUE_CHUNKS {
@@ -113,7 +113,7 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-	/// Creates a blank terminal with PI-parity scrollback capacity.
+	/// Creates a blank terminal with bounded scrollback capacity.
 	pub fn new(rows: u16, columns: u16) -> Self {
 		let rows = rows.max(1);
 		let columns = columns.max(1);

@@ -25,7 +25,7 @@ mod youtube;
 
 /// A supported site-specific renderer.
 ///
-/// `ALL` preserves the relative first-match precedence from pi's scraper
+/// `ALL` preserves the relative first-match precedence from the scraper
 /// registry. Dispatch is a concrete match so a request never allocates a trait
 /// object or boxed future.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -36,7 +36,7 @@ pub enum Scraper {
 	GitHub,
 	/// GitLab repositories and content.
 	GitLab,
-	/// Pi's ordered long-tail public API catalog.
+	/// Ordered long-tail public API catalog.
 	LongTail,
 	/// `YouTube` videos and channels.
 	YouTube,

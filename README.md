@@ -104,8 +104,8 @@ names are `omp-` prefixed; directory names are not.
 | Path                  | What it is                                            |
 | --------------------- | ----------------------------------------------------- |
 | `PLAN.md`             | Authoritative plan: decisions, ledger, eight parts    |
-| `.plan/feature-map/`  | pi-parity feature map and milestone roadmap           |
-| `.plan/quirks/`       | Catalog/inference porting notes                       |
+| `.plan/feature-map/`  | Feature map and milestone roadmap                    |
+| `.plan/quirks/`       | Catalog and inference notes                          |
 | `fixtures/llm-oracle` | Recorded inference fixtures                           |
 | `npm/pi-coding-agent` | npm package shim (`scripts/gen-npm-packages.py`)      |
 | `vendor/python`       | Gitignored embedded-Python build inputs (see below)   |

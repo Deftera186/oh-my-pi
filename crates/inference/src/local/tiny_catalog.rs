@@ -10,10 +10,9 @@ use super::artifact::{
 
 /// Persisted sentinel selecting the deterministic online role chain.
 pub const ONLINE_TINY_MODEL: &str = "online";
-/// Pi-parity default local title model when an explicit local download is
-/// requested.
+/// Default local title model when an explicit local download is requested.
 pub const DEFAULT_TITLE_LOCAL_MODEL: &str = "lfm2-700m";
-/// Pi-parity default local model for memory and classifier work.
+/// Default local model for memory and classifier work.
 pub const DEFAULT_MEMORY_LOCAL_MODEL: &str = "lfm2-1.2b";
 /// Stable settings key for title-model selection.
 pub const TINY_MODEL_SETTING: &str = "providers.tinyModel";
@@ -37,7 +36,7 @@ pub enum TinyWorkload {
 pub struct TinyBlockedEvidence {
 	/// Runtime to which the block applies.
 	pub runtime:     &'static str,
-	/// Actionable reason recorded by pi.
+	/// Actionable reason for the block.
 	pub reason:      &'static str,
 	/// Whether the block also applies to OMP's native GGUF runtime.
 	pub blocks_gguf: bool,
@@ -98,7 +97,7 @@ impl TinyModelSpec {
 	}
 }
 
-/// Pi-parity title registry, translated from ONNX q4 to native GGUF Q4_K_M.
+/// Title registry for native GGUF Q4_K_M artifacts.
 pub const TITLE_MODELS: [TinyModelSpec; 5] = [
 	TinyModelSpec {
 		id: "lfm2-350m",
@@ -163,7 +162,7 @@ pub const TITLE_MODELS: [TinyModelSpec; 5] = [
 	TinyModelSpec {
 		id: "lfm2-700m",
 		label: "LFM2 700M",
-		description: "Pi's highest-quality recommended local title model.",
+		description: "Highest-quality recommended local title model.",
 		family: "lfm2",
 		reasoning: false,
 		context_tokens: 4_096,
@@ -177,12 +176,12 @@ pub const TITLE_MODELS: [TinyModelSpec; 5] = [
 	},
 ];
 
-/// Pi-parity Mnemopi registry, also used by the local difficulty classifier.
+/// Mnemopi registry, also used by the local difficulty classifier.
 pub const MEMORY_MODELS: [TinyModelSpec; 5] = [
 	TinyModelSpec {
 		id: "qwen3-1.7b",
 		label: "Qwen3 1.7B",
-		description: "High-capacity memory model; native GGUF avoids pi's blocked ONNX cache path.",
+		description: "High-capacity memory model; native GGUF avoids the blocked ONNX cache path.",
 		family: "qwen3",
 		reasoning: true,
 		context_tokens: 8_192,
@@ -194,7 +193,7 @@ pub const MEMORY_MODELS: [TinyModelSpec; 5] = [
 		},
 		blocked_evidence: Some(TinyBlockedEvidence {
 			runtime: "onnxruntime-node",
-			reason: "Qwen3 RotaryEmbedding cache updates are unsupported by pi's ONNX runtime",
+			reason: "Qwen3 RotaryEmbedding cache updates are unsupported by the ONNX runtime",
 			blocks_gguf: false,
 		}),
 	},
@@ -246,7 +245,7 @@ pub const MEMORY_MODELS: [TinyModelSpec; 5] = [
 	TinyModelSpec {
 		id: "lfm2-1.2b",
 		label: "LFM2 1.2B",
-		description: "Pi's fastest-loading all-round memory and classifier model.",
+		description: "Fastest-loading all-round memory and classifier model.",
 		family: "lfm2",
 		reasoning: false,
 		context_tokens: 8_192,

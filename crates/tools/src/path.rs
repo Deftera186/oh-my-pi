@@ -443,7 +443,7 @@ mod tests {
 		);
 	}
 	#[test]
-	fn normalizes_pi_parity_path_table() {
+	fn normalizes_path_table() {
 		let home = Path::new("/Users/test");
 		let cases = [
 			("\u{201c}~/My\u{00a0}File.txt\u{201d}", "/Users/test/My File.txt", HostPaths::Posix),

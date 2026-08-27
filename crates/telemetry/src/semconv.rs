@@ -1,8 +1,8 @@
-//! Stable value vocabularies and span-name formatting for pi telemetry.
+//! Stable value vocabularies and span-name formatting for agent telemetry.
 //!
-//! Values in this module are wire contracts shared with the TypeScript pi
-//! implementation. They intentionally preserve pi's exact spelling rather
-//! than tracking whichever semantic-convention crate version is installed.
+//! Values in this module are wire contracts. They intentionally preserve exact
+//! spelling rather than tracking whichever semantic-convention crate version is
+//! installed.
 
 use std::str::FromStr;
 
@@ -199,7 +199,7 @@ vocab! {
 	}
 }
 impl Operation {
-	/// Formats the span name exactly as pi does.
+	/// Formats the span name exactly as specified by the wire contract.
 	///
 	/// `primary` is the agent name for `invoke_agent`, model identifier for
 	/// `chat`, tool name for `execute_tool`, and source agent name for
@@ -304,9 +304,9 @@ impl CaptureMode {
 }
 
 vocab! {
-	/// Stop-reason vocabulary received from pi providers.
+	/// Stop-reason vocabulary received from providers.
 	#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-	pub enum StopReason("stop reason", "Returns the byte-exact pi stop-reason value.") {
+	pub enum StopReason("stop reason", "Returns the byte-exact stop-reason value.") {
 		/// The model stopped normally.
 		Stop => "stop",
 		/// The model reached a length limit.
@@ -320,7 +320,7 @@ vocab! {
 	}
 }
 impl StopReason {
-	/// Maps this pi stop reason to the finish reason emitted on chat spans.
+	/// Maps this stop reason to the finish reason emitted on chat spans.
 	pub const fn finish_reason(self) -> FinishReason {
 		match self {
 			Self::Stop => FinishReason::Stop,
@@ -346,9 +346,9 @@ vocab! {
 	}
 }
 
-/// Maps a raw pi stop reason to the span's normalized finish-reason value.
+/// Maps a raw stop reason to the span's normalized finish-reason value.
 ///
-/// Unknown values return `None`, matching pi's switch default.
+/// Unknown values return `None`.
 pub fn map_stop_reason(reason: &str) -> Option<&'static str> {
 	reason
 		.parse::<StopReason>()
@@ -383,7 +383,7 @@ vocab! {
 	}
 }
 impl ErrorType {
-	/// Returns pi's fixed error classification for a non-success tool status.
+	/// Returns the fixed error classification for a non-success tool status.
 	///
 	/// Successful tools have no `error.type`. A thrown error may replace the
 	/// `ToolError` value with its free-form JavaScript error class name.
@@ -399,10 +399,9 @@ impl ErrorType {
 	}
 }
 
-/// Normalizes a pi provider identifier for `gen_ai.provider.name`.
+/// Normalizes a provider identifier for `gen_ai.provider.name`.
 ///
-/// The match table is transcribed exactly from pi. Unknown and empty provider
-/// identifiers pass through unchanged.
+/// Unknown and empty provider identifiers pass through unchanged.
 pub fn normalize_provider(raw: &str) -> &str {
 	match raw {
 		"amazon-bedrock" => "aws.bedrock",

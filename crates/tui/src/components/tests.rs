@@ -572,7 +572,7 @@ fn editor_word_motion_crosses_line_boundaries() {
 	ui.handle_key(Key::Enter);
 	ui.handle_key(Key::Char('c'));
 	ui.handle_key(Key::Home);
-	// Pi crosses one logical-line boundary per word-motion command.
+	// Word-motion commands cross one logical-line boundary at a time.
 	ui.handle_key(Key::WordLeft);
 	ui.handle_key(Key::Char('X'));
 	assert_eq!(ui.values()["e"], json!("alpha betaX\nc"));

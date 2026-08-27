@@ -227,7 +227,7 @@ pub struct CallMeta {
 	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
 	pub session:        Option<SessionRequest>,
-	/// Bitmap-gated provider response hook sink.
+	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: crate::codec::ProviderResponseHooks,
 }
 
@@ -244,7 +244,7 @@ pub struct Call {
 	pub budget:         ExecutionBudget,
 	/// Optional append-only conversation context.
 	pub session:        Option<SessionRequest>,
-	/// Bitmap-gated provider response hook sink.
+	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: crate::codec::ProviderResponseHooks,
 	/// Principal and extension charged for this request.
 	pub attribution:    InferenceAttribution,

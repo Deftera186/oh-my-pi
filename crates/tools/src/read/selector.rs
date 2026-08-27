@@ -742,7 +742,7 @@ impl SuffixMatchCache {
 	}
 }
 
-/// Prefix rendered output with pi's exact suffix-resolution notice.
+/// Prefixes rendered output with the exact suffix-resolution notice.
 pub fn prepend_suffix_resolution_notice(text: &str, from: &str, resolved: &SuffixMatch) -> String {
 	let notice = format!(
 		"[Path '{from}' not found; resolved to '{}' via suffix match]",

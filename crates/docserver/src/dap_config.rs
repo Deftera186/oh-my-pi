@@ -257,7 +257,7 @@ fn append_existing(
 }
 
 /// Merges native adapter declarations per field. Object-valued launch/attach
-/// defaults are themselves shallow-field merged as in pi.
+/// defaults are themselves shallow-field merged.
 pub fn load_dap_config(
 	builtins: impl IntoIterator<Item = DapAdapterSpec>,
 	sources: &[DapConfigSource],

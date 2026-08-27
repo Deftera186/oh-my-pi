@@ -1000,12 +1000,35 @@ pub struct ProviderResponseObservation {
 	pub request_id: Option<Str>,
 }
 
+/// Bounded provider request facts exposed before canonical wire encoding.
+	/// Catalog provider identity.
+	/// Concrete route selected for this attempt.
+	/// Normalized model identity, when the operation has one.
+	/// Closed operation vocabulary.
+	/// Top-level scalar settings; message content is never included.
+	/// Public headers known before codec lowering.
+	/// Negotiated intents in their canonical CONTROL representation.
+	/// Number of canonical chat messages without their content.
+	/// Prompt-size estimate when one is already available.
+/// Accepted `before_request` transform after ordered host composition.
+	/// Shallow top-level request-body overlay.
+	/// Public header replacements; `None` removes a header.
+	/// Optional narrowing of the draft's capability intents.
+	/// Optional tighter transport timeout.
+/// Explicit `before_request` denial returned by a subscribed extension.
+	/// User-safe denial reason.
+	/// Stable extension-provided classifier, when present.
 /// Session hook sink for provider response observations.
 pub trait ProviderResponseObserver: Send + Sync + 'static {
 	/// Returns the subscription bitmap bit without constructing a payload.
 	fn subscribed(&self) -> bool;
 	/// Offers one already-sanitized response payload.
 	fn observe(&self, observation: ProviderResponseObservation);
+	/// Returns whether `before_request` has any subscribed handler.
+	/// Composes one bounded pre-encoding request gate.
+	///
+	/// Callback failures are fail-open and return the default mutation. Only
+	/// an explicit hook denial returns [`BeforeRequestDenied`].
 }
 
 /// Clone-cheap optional provider response hook sink.
@@ -1033,6 +1056,8 @@ impl ProviderResponseHooks {
 			observer.observe(observation);
 		}
 	}
+	/// Returns the `before_request` subscription bitmap bit.
+	/// Composes one bounded request gate through the installed session sink.
 }
 
 impl fmt::Debug for ProviderResponseHooks {
@@ -1058,7 +1083,7 @@ pub struct TransportRequest {
 	pub realtime:       Option<RealtimeWireCodecState>,
 	/// Cooperative cancellation handle.
 	pub cancel:         Cancellation,
-	/// Bitmap-gated provider response hook sink.
+	/// Bitmap-gated provider request/response hook sink.
 	pub response_hooks: ProviderResponseHooks,
 	/// Attempt identity and capture policy.
 	pub attempt:        TransportAttempt,

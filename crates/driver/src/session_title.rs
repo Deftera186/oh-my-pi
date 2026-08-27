@@ -11,8 +11,8 @@ use omp_inference::local::{
 };
 use omp_storage::transcript::TitleSource;
 
-/// Pi-parity online role chain. Role resolution performs one completion using
-/// the first available assignment; it never issues one request per role.
+/// Online role chain. Role resolution performs one completion using the first
+/// available assignment; it never issues one request per role.
 pub const ONLINE_TITLE_ROLE_CHAIN: [&str; 3] = ["tiny", "commit", "smol"];
 
 const MAX_TINY_MESSAGE_CHARS: usize = 2_000;

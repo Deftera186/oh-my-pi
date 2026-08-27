@@ -234,7 +234,7 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
 	}
 }
 
-/// Appends pi's read continuation notice when `truncation` omitted content.
+/// Appends the read continuation notice when `truncation` omitted content.
 pub fn append_head_truncation_notice(
 	output: &mut String,
 	truncation: &TruncationResult<'_>,

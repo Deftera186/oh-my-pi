@@ -1,6 +1,7 @@
 //! `grep` builtin implemented on top of the ripgrep libraries.
 //!
-//! Matching uses `grep-regex`/`grep-searcher`; recursive walks use `pi-walker`.
+//! Matching uses `grep-regex`/`grep-searcher`; recursive walks use
+//! `omp-walker`.
 
 use std::{
 	borrow::Cow,
@@ -38,7 +39,7 @@ pub(crate) fn pcre2_jit_enabled(host: &Host) -> bool {
 #[derive(Parser, Debug)]
 #[command(
 	name = "grep",
-	version = concat!("grep (pi-uu-grep) ", env!("CARGO_PKG_VERSION")),
+	version = concat!("grep ", env!("CARGO_PKG_VERSION")),
 	about = "Search for PATTERN in each FILE or standard input.",
 	disable_help_flag = true,
 	disable_version_flag = true,
@@ -1799,6 +1800,6 @@ mod tests {
 		let (code, out, err) = run(&["--version"], "");
 		assert_eq!(code, 0);
 		assert!(err.is_empty());
-		assert!(out.contains("grep") && out.contains("pi-uu-grep"));
+		assert!(out.contains("grep"));
 	}
 }

@@ -181,8 +181,8 @@ pub enum CredentialKeyMode {
 impl CredentialKeyMode {
 	/// Selects the key source from an explicit environment override followed by
 	/// the typed settings value. Malformed values fail closed; the `auto`
-	/// default uses an owner-only local key file (pi's filesystem security
-	/// boundary) for interactive processes and fails closed for unattended
+	/// default uses an owner-only local key file as the filesystem security
+	/// boundary for interactive processes and fails closed for unattended
 	/// ones.
 	pub fn from_configuration(configured: CredentialKeySourceSetting) -> Self {
 		let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();

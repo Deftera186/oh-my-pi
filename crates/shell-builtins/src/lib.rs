@@ -4,11 +4,9 @@
 	clippy::perf,
 	clippy::pedantic,
 	clippy::nursery,
-	reason = "ported from pi-builtins; kept close to upstream"
+	reason = "shared builtin implementations use deliberate lint exceptions"
 )]
 //! In-process utility and process builtins for omp-shell.
-//!
-//! Ported from pi-builtins.
 
 mod cksum;
 mod factory;

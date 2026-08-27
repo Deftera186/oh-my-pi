@@ -25,6 +25,7 @@ from . import limits as _limits
 from . import Fault
 from ._verdicts import BlobPart, TextPart
 from .policy import PolicyDenied, RuleRef
+from .provider import ModelRef
 
 
 DEFAULT_MAX_DEPTH = 2
@@ -41,6 +42,14 @@ depth: int = 0
 
 class AgentsError(OmpError):
     """Base error for agent operations."""
+
+
+class ModelSwitchDenied(AgentsError):
+    """Raised when the active interactive model cannot be changed."""
+
+
+class SessionInjectionDenied(AgentsError):
+    """Raised when a targeted session injection is unknown or foreign."""
 
 
 class SpawnDenied(AgentsError):
@@ -1141,20 +1150,39 @@ async def peers(
     return [_agent_ref(row) for row in response]
 
 
+async def set_model(model: str, *, thinking: str | None = None) -> ModelRef:
+    """Switch the active interactive session model for subsequent turns."""
+    if not isinstance(model, str) or not model:
+        raise TypeError("model must be a non-empty string")
+    if thinking is not None and not isinstance(thinking, str):
+        raise TypeError("thinking must be a string or None")
+    response = _mapping(
+        await _request("omp.agents.set_model", model=model, thinking=thinking),
+        "model reference",
+    )
+    return ModelRef(
+        provider=str(response["provider"]),
+        api=str(response["api"]),
+        model=str(response["model"]),
+    )
+
+
 async def inject(
     prompt: str,
     *,
     mode: DeliveryMode = DeliveryMode.NEXT_TURN,
     visible: bool = False,
     role: Literal["user", "system"] = "system",
+    session: str | None = None,
 ) -> Receipt:
-    """Inject an out-of-band item into this agent's mailbox."""
+    """Inject an out-of-band item into the current or newly created session."""
     response = await _request(
         "omp.agents.inject",
         prompt=prompt,
         mode=mode.value,
         visible=visible,
         role=role,
+        session=session,
     )
     return _receipt(response)
 
@@ -1840,6 +1868,7 @@ __all__ = (
     "LoopSignal",
     "MAILBOX_CAPACITY",
     "MAX_BACKFILL",
+    "ModelSwitchDenied",
     "MIN_SCHEDULE_INTERVAL",
     "MergeMode",
     "Message",
@@ -1862,6 +1891,7 @@ __all__ = (
     "Settle",
     "Snapshot",
     "SnapshotUnsupported",
+    "SessionInjectionDenied",
     "Spawn",
     "SpawnDenied",
     "SpawnLimits",
@@ -1882,6 +1912,7 @@ __all__ = (
     "inbox",
     "inject",
     "limits",
+    "set_model",
     "list",
     "loop_signal",
     "peers",

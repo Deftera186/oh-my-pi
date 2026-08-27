@@ -189,6 +189,7 @@ impl CatalogOverlayBuilder {
 		self
 	}
 
+	/// Adds one interned authentication-specification addition.
 	/// Adds one model addition or field-granular patch.
 	pub fn with_model(mut self, overlay: ModelOverlay) -> Self {
 		self.models.push(overlay);
