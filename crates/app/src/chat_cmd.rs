@@ -4,8 +4,10 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	env, fs, iter,
 	path::PathBuf,
-	sync,
-	sync::Arc,
+	sync::{
+		self, Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -15,13 +17,14 @@ use nix::sys::signal;
 #[cfg(unix)]
 use nix::unistd::Pid;
 use omp_agent::{
-	Agent, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient, RpcTurnClient, TurnClient,
+	Agent, AgentHostControl, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient,
+	JournalAuthor, RpcTurnClient, TurnClient,
 	advisor::{AdviceDelivery, AdvisorAdviceQueue, DeliveryContext},
 };
 use omp_catalog::snapshot;
 use omp_chat_ui::host;
 use omp_collab::guest::GuestRelayPump;
-use omp_core::{Str, sf};
+use omp_core::{ArtifactDigest, Provenance, Str, sf};
 use omp_driver::{
 	advisor::{
 		engine::{AdviceOutcome, AdvisorEngine, AdvisorEngineOptions, AdvisorPromptJob},
@@ -33,12 +36,13 @@ use omp_driver::{
 	chat::{
 		AdvisorChildSpec, AgentRegimeControlBackend, AgentsControlAuthority, CHAT_CAPS_BASE,
 		ChatAuthWorker, ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend,
-		ChatScope, EphemeralSessions, LaunchToolSelection, RegimeControlAuthorityFactory, Session,
-		SessionOpen, agent_snapshot, apply_launch_tool_selection, canonical_project,
-		ensure_state_directory, interrupted_reasoning_dialect, model_context_window,
-		model_selector_is_selectable, model_usable_context_window, now_ms, open_session,
-		resolve_model_provider, resolve_model_selector, resume_choices, session_blueprint,
-		strict_session_id, thinking_effort,
+		ChatScope, EphemeralSessions, InteractiveSessionControl, LaunchToolSelection,
+		RegimeControlAuthorityFactory, Session, SessionOpen, agent_snapshot,
+		apply_launch_tool_selection, canonical_project, ensure_state_directory,
+		interrupted_reasoning_dialect, model_context_window, model_selector_is_selectable,
+		model_usable_context_window, now_ms, open_session, resolve_model_provider,
+		resolve_model_selector, resume_choices, session_blueprint, strict_session_id,
+		thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
 	discovery::{context, roles, runtime},
@@ -67,7 +71,8 @@ use omp_envd::exthost::{
 	JobsControlAuthority, TelemetryControlAuthority, UiControlAuthority,
 	backends::EnvdHostOwnerBackends,
 	control::{
-		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlProtocolError,
+		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlEffect,
+		ControlProtocolError, ControlRequestContext, canonical_session_create,
 	},
 	dispatch::CallbackDispatcher,
 };
@@ -100,7 +105,9 @@ use tonic::transport;
 use crate::{
 	chat_ui::{
 		self, ChatUiSession,
-		presentation::{ControlPresentationCallbackDispatcher, PresentationBridge},
+		presentation::{
+			ControlPresentationCallbackDispatcher, PresentationBridge, PublishedUiRoster,
+		},
 		presentation_authority::{PresentationAuthority, PresentationIdentity},
 	},
 	cli::ChatArgs,
@@ -131,6 +138,8 @@ pub struct SessionControlFactories {
 	pub credentials:       Arc<dyn ControlAuthorityFactory>,
 	/// Typed prompt-head invalidation.
 	pub prompts:           Arc<dyn ControlAuthorityFactory>,
+	/// Atomic interactive session create/seed/switch ownership.
+	pub sessions:          Arc<dyn ControlAuthorityFactory>,
 	/// Interactive presentation composition.
 	pub ui:                Arc<dyn ControlAuthorityFactory>,
 	/// Durable telemetry query and export.
@@ -160,6 +169,7 @@ impl SessionControlFactories {
 				direct_filesystem: Some(self.direct_filesystem),
 				credentials:       Some(self.credentials),
 				prompts:           Some(self.prompts),
+				sessions:          Some(self.sessions),
 				ui:                Some(self.ui),
 				telemetry:         Some(self.telemetry),
 				jobs:              Some(self.jobs),
@@ -169,6 +179,306 @@ impl SessionControlFactories {
 			},
 		)
 	}
+}
+
+fn session_control_factory(
+	root: PathBuf,
+	sessions_dir: PathBuf,
+	index: Arc<SessionIndex>,
+	agent: AgentHostControl,
+	bridge: Arc<PresentationBridge>,
+	session_control: Arc<InteractiveSessionControl>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	let transitioning = Arc::new(AtomicBool::new(false));
+	Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
+		Ok(Arc::new(SessionCreateAuthority {
+			identity,
+			root: root.clone(),
+			sessions_dir: sessions_dir.clone(),
+			index: Arc::clone(&index),
+			agent: agent.clone(),
+			bridge: Arc::clone(&bridge),
+			transitioning: Arc::clone(&transitioning),
+			session_control: Arc::clone(&session_control),
+		}) as Arc<dyn ControlAuthority>)
+	})
+}
+
+struct SessionCreateAuthority {
+	identity:        Arc<ControlConnectionIdentity>,
+	root:            PathBuf,
+	sessions_dir:    PathBuf,
+	index:           Arc<SessionIndex>,
+	agent:           AgentHostControl,
+	bridge:          Arc<PresentationBridge>,
+	transitioning:   Arc<AtomicBool>,
+	session_control: Arc<InteractiveSessionControl>,
+}
+
+#[async_trait::async_trait]
+impl ControlAuthority for SessionCreateAuthority {
+	fn handles(&self, operation: &str) -> bool {
+		operation == "omp.sessions.create"
+	}
+
+	fn authorize(
+		&self,
+		context: &ControlRequestContext,
+		_operation: &str,
+		arguments: &serde_json::Map<String, serde_json::Value>,
+	) -> Result<(), ControlProtocolError> {
+		if self.identity.extension != context.connection.extension
+			|| self.identity.host_generation != context.connection.host_generation
+			|| self.identity.session_generation != context.connection.session_generation
+		{
+			return Err(ControlProtocolError::new(
+				"StaleGeneration",
+				"session creation authority belongs to a replaced connection",
+			));
+		}
+		if self.transitioning.load(Ordering::Acquire) {
+			return Err(ControlProtocolError::new(
+				"SessionTransitionDenied",
+				"interactive UI is already transitioning sessions",
+			));
+		}
+		let _ = arguments;
+		Ok(())
+	}
+
+	async fn request(
+		&self,
+		context: ControlRequestContext,
+		_operation: Str,
+		arguments: serde_json::Map<String, serde_json::Value>,
+	) -> Result<serde_json::Value, ControlProtocolError> {
+		let request = canonical_session_create(&context, &arguments)?;
+		if self
+			.transitioning
+			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+			.is_err()
+		{
+			return Err(ControlProtocolError::new(
+				"SessionTransitionDenied",
+				"interactive UI is already transitioning sessions",
+			));
+		}
+		let idempotency_key = request.idempotency_key.clone();
+		let mut declaration_arguments = serde_json::Map::new();
+		declaration_arguments.insert(
+			String::from("extension"),
+			serde_json::Value::String(self.identity.extension.to_string()),
+		);
+		let rows = self
+			.agent
+			.request("omp.journal.entry_kinds", declaration_arguments)
+			.await
+			.map_err(|_| {
+				ControlProtocolError::new(
+					"SessionTransitionDenied",
+					"live entry-kind registry is unavailable",
+				)
+			})?;
+		let declarations = session_entry_declarations(rows)?;
+		for entry in &request.entries {
+			if !declarations.iter().any(|declaration| {
+				declaration.name == entry.kind
+					&& declaration.rev.to_string().as_str() == entry.rev.as_str()
+			}) {
+				return Err(ControlProtocolError::new(
+					"SessionTransitionDenied",
+					"session seed is not owned by a live @omp.entry_kind declaration",
+				));
+			}
+		}
+		let digest = self
+			.identity
+			.artifact_digest
+			.parse::<ArtifactDigest>()
+			.map_err(|_| {
+				ControlProtocolError::new(
+					"SessionTransitionDenied",
+					"authenticated artifact digest is invalid",
+				)
+			})?;
+		let author = JournalAuthor {
+			principal:  self.identity.principal.clone(),
+			provenance: Provenance::new(
+				self.identity.extension.clone(),
+				self.identity.extension.clone(),
+				Str::new_static("runtime"),
+				digest,
+				self.identity.layer.clone(),
+				self.identity.tier.clone(),
+				self.identity.host_generation,
+			),
+		};
+		let root = self.root.clone();
+		let sessions_dir = self.sessions_dir.clone();
+		let index = Arc::clone(&self.index);
+		let extension = self.identity.extension.clone();
+		let result = tokio::task::spawn_blocking(move || {
+			omp_driver::chat::create_seeded_session(
+				&root,
+				&sessions_dir,
+				index,
+				extension.as_str(),
+				declarations,
+				author,
+				request,
+			)
+		})
+		.await
+		.map_err(|_| {
+			ControlProtocolError::new(
+				"SessionTransitionIndeterminate",
+				"session creation owner stopped after dispatch",
+			)
+			.with_details(serde_json::json!({"idempotency_key": idempotency_key}))
+		})?
+		.map_err(|error| session_create_error(error, &idempotency_key))?;
+		self
+			.session_control
+			.admit(result.id.0.clone(), self.identity.as_ref());
+		self
+			.bridge
+			.transition(result.id.0.clone())
+			.await
+			.map_err(|_| {
+				ControlProtocolError::new(
+					"SessionTransitionIndeterminate",
+					"session is durable but the interactive switch acknowledgement was lost",
+				)
+				.with_details(serde_json::json!({"idempotency_key": idempotency_key}))
+			})?;
+		Ok(session_info_value(&result))
+	}
+
+	async fn effect(
+		&self,
+		_context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"InvalidEffect",
+			"session creation authority accepts requests only",
+		))
+	}
+}
+
+fn session_entry_declarations(
+	value: serde_json::Value,
+) -> Result<Vec<omp_agent::EntryKindDecl>, ControlProtocolError> {
+	let rows = value.as_array().ok_or_else(|| {
+		ControlProtocolError::new("SessionTransitionDenied", "entry-kind registry is malformed")
+	})?;
+	rows
+		.iter()
+		.map(|row| {
+			let row = row.as_object().ok_or_else(|| {
+				ControlProtocolError::new(
+					"SessionTransitionDenied",
+					"entry-kind declaration is malformed",
+				)
+			})?;
+			omp_agent::EntryKindDecl::parse(
+				Str::new(
+					row.get("name")
+						.and_then(serde_json::Value::as_str)
+						.unwrap_or_default(),
+				),
+				row.get("rev")
+					.and_then(serde_json::Value::as_str)
+					.unwrap_or_default(),
+				row.get("display")
+					.and_then(serde_json::Value::as_bool)
+					.unwrap_or(false),
+				row.get("projects")
+					.and_then(serde_json::Value::as_bool)
+					.unwrap_or(false),
+				None,
+			)
+			.map_err(|_| {
+				ControlProtocolError::new(
+					"SessionTransitionDenied",
+					"entry-kind declaration revision is invalid",
+				)
+			})
+		})
+		.collect()
+}
+
+fn session_create_error(
+	error: omp_driver::chat::SeededSessionError,
+	idempotency_key: &Str,
+) -> ControlProtocolError {
+	match error {
+		omp_driver::chat::SeededSessionError::Indeterminate { session_id, .. } => {
+			ControlProtocolError::new(
+				"SessionTransitionIndeterminate",
+				"session durability acknowledgement is indeterminate",
+			)
+			.with_details(serde_json::json!({
+				"idempotency_key": idempotency_key,
+				"session_id": session_id.0,
+			}))
+		},
+		omp_driver::chat::SeededSessionError::InaccessibleParent => ControlProtocolError::new(
+			"SessionTransitionDenied",
+			"requested session parent is not accessible",
+		),
+		omp_driver::chat::SeededSessionError::Journal(_)
+		| omp_driver::chat::SeededSessionError::Io(_)
+		| omp_driver::chat::SeededSessionError::Index(_)
+		| omp_driver::chat::SeededSessionError::MissingIndexRow => ControlProtocolError::new(
+			"SessionTransitionDenied",
+			"session creation failed before an acknowledged transition",
+		),
+	}
+}
+
+fn session_info_value(info: &index::SessionInfo) -> serde_json::Value {
+	serde_json::json!({
+		"id": info.id.0.as_str(),
+		"title": info.title,
+		"title_source": info.title_source.map_or_else(|| "system".to_owned(), |source| source.to_string()),
+		"cwd": info.cwd,
+		"project": info.project,
+		"created_ms": info.created_ms,
+		"updated_ms": info.updated_ms,
+		"status": info.status.to_string(),
+		"kind": info.kind.to_string(),
+		"parent": info.parent.as_ref().map(|parent| parent.0.as_str()),
+		"entries": info.entries,
+		"turns": info.turns,
+		"usage": {
+			"input": info.usage.input_tokens,
+			"output": info.usage.output_tokens,
+			"cache_read": info.usage.cache_read_tokens,
+			"cache_write": info.usage.cache_write_tokens,
+			"reasoning": info.usage.reasoning_tokens.unwrap_or(0),
+			"premium_requests": info.usage.premium_requests.unwrap_or(0),
+			"context": info.usage.context_tokens,
+			"total": info.usage.total_tokens.unwrap_or_else(|| info.usage.input_tokens
+				.saturating_add(info.usage.output_tokens)
+				.saturating_add(info.usage.cache_read_tokens)
+				.saturating_add(info.usage.cache_write_tokens)),
+			"accuracy": match inference_pb::usage::Accuracy::try_from(info.usage.accuracy) {
+				Ok(inference_pb::usage::Accuracy::Estimated) => "estimated",
+				Ok(inference_pb::usage::Accuracy::Mixed) => "mixed",
+				_ => "exact",
+			},
+			"detail": {},
+		},
+		"cost": {
+			"nanos_usd": info.cost.nanos_usd,
+			"estimated": info.cost.estimated,
+			"input_nanos_usd": info.cost.input_nanos_usd,
+			"output_nanos_usd": info.cost.output_nanos_usd,
+		},
+		"models": info.models,
+		"remote": info.remote,
+	})
 }
 
 fn presentation_control_factory(
@@ -332,6 +642,9 @@ enum ChatError {
 	/// Session index mutation failed.
 	#[error(transparent)]
 	SessionIndex(#[from] index::Error),
+	/// Extension UI roster publication conflicted with a live generation.
+	#[error(transparent)]
+	UiRoster(#[from] omp_envd::exthost::UiRosterConflict),
 	/// Interactive terminal or GUI host failed.
 	#[error("interactive chat shell failed: {0}")]
 	Ui(miette::Report),
@@ -569,12 +882,19 @@ pub(crate) async fn run(
 		.get()
 		.clone();
 	settings.mnemopi = settings.mnemopi.normalize();
-	let marketplace_mode: &'static str = settings.lifecycle.marketplace_auto_update.into();
-	for notice in
-		crate::ext_cli::service::refresh_stale_and_update(&data_dir, &root, marketplace_mode).await?
-	{
-		eprintln!("Marketplace: {notice}");
-	}
+	let workspace_update_overlay: Option<omp_ext::config::UpdateOverlay> =
+		fs::read_to_string(root.join(".omp/config.toml"))
+			.ok()
+			.and_then(|source| toml::from_str::<toml::Value>(&source).ok())
+			.and_then(|value| value.get("extensions")?.get("updates").cloned())
+			.map(toml::Value::try_into)
+			.transpose()
+			.map_err(|error| miette::miette!("invalid workspace extension update policy: {error}"))?;
+	let extension_update_policy = omp_ext::config::effective_updates(
+		settings.extensions.updates.as_ref(),
+		workspace_update_overlay.as_ref(),
+	)
+	.map_err(|error| miette::miette!(error))?;
 	let security_enabled = settings.security.enabled;
 	let resize_scrollback = match settings.tui.resize_scrollback {
 		omp_driver::settings::ResizeScrollbackMode::Append => host::ResizeScrollback::Append,
@@ -594,20 +914,26 @@ pub(crate) async fn run(
 		.clone();
 	let extensions_disabled =
 		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
-	let prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
-		model:   model_settings.clone(),
-		skills:  skill_settings.clone(),
+	let extension_scopes = settings
+		.extension_scopes(
+			omp_driver::settings::workspace_extension_overlay(&root)
+				.map_err(|error| miette::miette!("{error}"))?,
+		)
+		.map_err(|error| miette::miette!("{error}"))?;
+	let mut prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
+		model: model_settings.clone(),
+		skills: skill_settings.clone(),
 		foreign: settings_snapshot
 			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
 			.map_err(|error| miette::miette!(error))?
 			.get()
 			.clone(),
-		rules:   settings_snapshot
+		rules: settings_snapshot
 			.project::<omp_driver::rulebook::RulebookSettings>()
 			.map_err(|error| miette::miette!(error))?
 			.get()
 			.clone(),
-		native:  omp_driver::discovery::native::NativeDiscoveryOptions {
+		native: omp_driver::discovery::native::NativeDiscoveryOptions {
 			explicit_roots: if extensions_disabled {
 				Vec::new()
 			} else {
@@ -625,16 +951,44 @@ pub(crate) async fn run(
 			skill_settings,
 			include_workspace: !args.extension_launch.no_workspace && !extensions_disabled,
 			client_installed: Some(data_dir.join("ext/installed.toml")),
+			workspace_identity: Some(omp_driver::discovery::workspace_identity(&root)),
 		},
+		grants: Some(omp_driver::discovery::ExtensionGrantSettings {
+			path:    data_dir.join("ext/grants.toml"),
+			session: Arc::from([]),
+		}),
+		extension_scopes,
+		extension_overrides: args.extension_launch.settings.clone().into(),
 	};
-	let prompt_discovery = omp_driver::discovery::active_prompt_snapshots(
+	let mut prompt_discovery = omp_driver::discovery::active_prompt_snapshots(
 		&root,
 		&args.add_dir,
 		&home,
 		&prompt_discovery_settings,
 	);
 	let mut extension_keys = BTreeSet::new();
-	let admitted_extensions = prompt_discovery
+	let mut extension_approval_tickets = Vec::new();
+	if !prompt_discovery.content.extension_grants.is_empty() {
+		let grant_path = data_dir.join("ext/grants.toml");
+		let outcome = crate::extension_trust::prompt(
+			prompt_discovery.content.extension_grants.as_ref(),
+			&grant_path,
+		)
+		.await?;
+		prompt_discovery_settings
+			.grants
+			.as_mut()
+			.expect("interactive discovery installs a grant authority")
+			.session = outcome.session_grants.into();
+		extension_approval_tickets = outcome.tickets;
+		prompt_discovery = omp_driver::discovery::active_prompt_snapshots(
+			&root,
+			&args.add_dir,
+			&home,
+			&prompt_discovery_settings,
+		);
+	}
+	let mut admitted_extensions = prompt_discovery
 		.content
 		.extensions
 		.iter()
@@ -646,6 +1000,35 @@ pub(crate) async fn run(
 			Ok(extension.clone())
 		})
 		.collect::<miette::Result<Vec<_>>>()?;
+	let mut startup_revoked = BTreeSet::new();
+	if let (Ok(key), Ok(revocations)) = (
+		fs::read_to_string(data_dir.join("ext/index.key")),
+		omp_ext::trust::RevocationsFile::read(&data_dir.join("ext/revocations.json")),
+	) && revocations.verify(key.trim()).is_ok()
+	{
+		for (path, layer) in [
+			(data_dir.join("ext/omp.lock"), omp_ext::Layer::Client),
+			(root.join(".omp/omp.lock"), omp_ext::Layer::Workspace),
+		] {
+			let Ok(lock) = omp_ext::lock::LockFile::read(&path, layer) else {
+				continue;
+			};
+			for extension in lock.extensions {
+				if revocations
+					.revocation_for(&extension.id, &extension.version)
+					.is_ok_and(|revocation| revocation.is_some())
+				{
+					startup_revoked.insert(extension.id);
+				}
+			}
+		}
+	}
+	if !startup_revoked.is_empty() {
+		admitted_extensions.retain(|extension| !startup_revoked.contains(extension.key.extension()));
+		for id in startup_revoked {
+			eprintln!("SECURITY: revoked extension {id} was not admitted");
+		}
+	}
 	let roles = roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
@@ -905,6 +1288,18 @@ pub(crate) async fn run(
 		(!args.no_session).then(|| Arc::clone(&session_index)),
 	)
 	.map_err(|e| miette::miette!(e))?;
+	for ticket in extension_approval_tickets.drain(..) {
+		session
+			.journal
+			.record_approval_ticket(ticket.created_at_ms, ticket.filed_record())
+			.map_err(|error| miette::miette!(error))?;
+		if let Some(decision) = ticket.decision_record() {
+			session
+				.journal
+				.record_approval_decision(crate::chat_ui::now_ms(), decision)
+				.map_err(|error| miette::miette!(error))?;
+		}
+	}
 	if matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_)) {
 		let pending_turn = session.journal.pending_turn().is_some();
 		let pending_jobs = session.journal.pending_jobs().count();
@@ -996,6 +1391,80 @@ pub(crate) async fn run(
 	)
 	.map_err(|error| miette::miette!(error))?;
 	let env = environment.client().with_invocation_grant(invocation_grant);
+	let update_coordinator =
+		omp_driver::ext_updates::UpdateCoordinator::new(data_dir.join("ext/update-checks"));
+	let update_now_ms = omp_driver::ext_updates::update_now_ms();
+	let (update_notifications_tx, update_notifications_rx) = flume::unbounded();
+	let client_paths = omp_driver::ext_updates::ClientUpdatePaths::for_data_dir(&data_dir);
+	let client_policy = extension_update_policy;
+	let _ = omp_driver::ext_updates::schedule_due_update(
+		&update_coordinator,
+		omp_driver::ext_updates::UpdateScope::Client,
+		client_policy,
+		update_now_ms,
+		update_notifications_tx.clone(),
+		move || async move {
+			omp_driver::ext_updates::check_client_updates(&client_paths, client_policy, update_now_ms)
+				.await
+		},
+	);
+	let workspace_env = env.clone();
+	let workspace_policy = extension_update_policy;
+	let _ = omp_driver::ext_updates::schedule_due_update(
+		&update_coordinator,
+		omp_driver::ext_updates::UpdateScope::Workspace,
+		workspace_policy,
+		update_now_ms,
+		update_notifications_tx.clone(),
+		move || async move {
+			omp_driver::ext_updates::check_workspace_updates(
+				&workspace_env,
+				workspace_policy,
+				update_now_ms,
+			)
+			.await
+		},
+	);
+	drop(update_notifications_tx);
+	let update_quarantine = environment.extension_reload_handle();
+	drop(tokio::spawn(async move {
+		while let Ok(notification) = update_notifications_rx.recv_async().await {
+			if let Some(failure) = notification.failure {
+				eprintln!(
+					"Extension update {:?} check failed: {:?}{}",
+					notification.scope,
+					failure.kind,
+					failure
+						.code
+						.map_or_else(String::new, |code| format!(" ({code})"))
+				);
+				continue;
+			}
+			let Some(report) = notification.report else {
+				continue;
+			};
+			if !report.quarantined.is_empty() {
+				update_quarantine.quarantine(&report.quarantined).await;
+			}
+			for id in &report.quarantined {
+				eprintln!(
+					"SECURITY: extension {id} in the startup generation was revoked and quarantined"
+				);
+			}
+			for item in report.items {
+				match item.refusal {
+					Some(refusal) => eprintln!(
+						"Extension update {} {} -> {} is notify-only: {refusal}",
+						item.diff.id, item.diff.from_version, item.diff.to_version
+					),
+					None => eprintln!(
+						"Extension update {} {} -> {} verified",
+						item.diff.id, item.diff.from_version, item.diff.to_version
+					),
+				}
+			}
+		}
+	}));
 	let configured_autolearn = settings_manager
 		.snapshot()
 		.project::<omp_driver::settings::Settings>()
@@ -1152,11 +1621,12 @@ pub(crate) async fn run(
 			Arc::clone(&registry),
 			Some(&root),
 			omp_driver::registry::InferenceSessionOverrides {
-				provider:              credential_provider,
-				api_key:               args.api_key.clone(),
-				prompt_cache_affinity: args.prompt_cache_key.clone(),
-				usage_fetchers:        Some(environment.usage_fetchers()),
-				settings:              Some(Arc::clone(&settings_snapshot)),
+				provider:                credential_provider,
+				api_key:                 args.api_key.clone(),
+				prompt_cache_affinity:   args.prompt_cache_key.clone(),
+				usage_fetchers:          Some(environment.usage_fetchers()),
+				provider_response_hooks: Some(environment.provider_response_hooks()),
+				settings:                Some(Arc::clone(&settings_snapshot)),
 			},
 		)
 		.await
@@ -1796,6 +2266,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	let auth = auth_registry.map(ChatAuthWorker::start);
 	let presentation_bridge = Arc::new(PresentationBridge::new(64));
 	let extension_callbacks = environment.extension_callback_dispatcher();
+	let extension_ui = Arc::new(PublishedUiRoster::default());
+	extension_ui
+		.replace(environment.extension_registry_evidences(), Arc::clone(&extension_callbacks))?;
 	let drafts = DraftStore::new(&data_dir)?;
 	let breadcrumbs = TerminalBreadcrumbs::new(&data_dir)?;
 	let terminal_id = omp_tui::ttyid::terminal_id();
@@ -1938,6 +2411,23 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			Arc::clone(&presentation_bridge),
 			Arc::clone(&extension_callbacks),
 		);
+		let session_control = Arc::new(InteractiveSessionControl::new(
+			scope.root.to_path_buf(),
+			scope.sessions_dir.to_path_buf(),
+			Arc::clone(&scope.session_index),
+			Arc::clone(&catalog_owner),
+			prompt_discovery_settings.model.clone(),
+			state.clone(),
+			agent.control(),
+		));
+		let session_factory = session_control_factory(
+			scope.root.to_path_buf(),
+			scope.sessions_dir.to_path_buf(),
+			Arc::clone(&scope.session_index),
+			agent.host_control(),
+			Arc::clone(&presentation_bridge),
+			Arc::clone(&session_control),
+		);
 		let telemetry_query =
 			Arc::new(TelemetryIndexQuery::new(Arc::clone(&telemetry_index), id.clone()));
 		let telemetry_factory = telemetry_control_factory(telemetry_query);
@@ -2066,13 +2556,20 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				direct_filesystem: host_backends.direct_filesystem_factory,
 				credentials:       credential_factory,
 				prompts:           prompt_factory,
+				sessions:          session_factory,
 				ui:                presentation_factory,
 				telemetry:         telemetry_factory,
 				jobs:              job_factory,
 				provider:          provider_factory,
 				regimes:           regime_factory,
 			}
-			.bind(environment, AgentsControlAuthority::factory(Arc::clone(&parent))),
+			.bind(
+				environment,
+				AgentsControlAuthority::factory_with_session_control(
+					Arc::clone(&parent),
+					session_control,
+				),
+			),
 		);
 		let _control_binding = environment.bind_agent_control(agent.control())?;
 		environment.bind_device_availability(agent.mailbox());
@@ -2240,6 +2737,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			matches!(start, ChatStart::SessionIndex),
 			initial_draft,
 			submission,
+			Arc::clone(&extension_ui),
+			Arc::clone(&extension_callbacks),
 			presentation,
 			Some(presentation_bridge.attach()),
 		)

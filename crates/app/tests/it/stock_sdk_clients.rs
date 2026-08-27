@@ -32,6 +32,7 @@ fn metadata(target: Target, id: &'static str) -> CallMeta {
 		deadline: None,
 		budget: ExecutionBudget::default(),
 		session: None,
+		response_hooks: Default::default(),
 	}
 }
 

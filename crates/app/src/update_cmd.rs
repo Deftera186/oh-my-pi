@@ -825,13 +825,18 @@ mod tests {
 
 		let windows = "x86_64-pc-windows-msvc";
 		let release = IndexRelease {
-			version:           Str::new_static("18.0.0"),
-			manifest_digest:   Str::new_static("b3:manifest"),
-			capability_digest: Str::new_static("b3:capabilities"),
-			attested:          true,
-			yanked:            false,
-			shadows:           Vec::new(),
-			artifacts:         vec![
+			version:                    Str::new_static("18.0.0"),
+			manifest_digest:            Str::new_static("b3:manifest"),
+			manifest_capability_digest: Str::new_static("b3:capabilities"),
+			capability_digest:          Str::new_static("b3:capabilities"),
+			requires:                   Vec::new(),
+			capabilities:               Vec::new(),
+			features:                   std::collections::BTreeMap::new(),
+			declarations:               Vec::new(),
+			attested:                   true,
+			yanked:                     false,
+			shadows:                    Vec::new(),
+			artifacts:                  vec![
 				artifact("aarch64-apple-darwin", "omp-darwin"),
 				artifact(windows, "omp.exe"),
 			],

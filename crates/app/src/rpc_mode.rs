@@ -127,20 +127,30 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 		.clone();
 	let disabled_extensions =
 		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
+	let app_settings = settings_snapshot
+		.project::<omp_driver::settings::Settings>()
+		.into_diagnostic()?;
+	let extension_scopes = app_settings
+		.get()
+		.extension_scopes(
+			omp_driver::settings::workspace_extension_overlay(&project)
+				.map_err(|error| miette!("{error}"))?,
+		)
+		.map_err(|error| miette!("{error}"))?;
 	let prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
-		model:   model_settings.clone(),
-		skills:  skill_settings.clone(),
+		model: model_settings.clone(),
+		skills: skill_settings.clone(),
 		foreign: settings_snapshot
 			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
 			.into_diagnostic()?
 			.get()
 			.clone(),
-		rules:   settings_snapshot
+		rules: settings_snapshot
 			.project::<omp_driver::rulebook::RulebookSettings>()
 			.into_diagnostic()?
 			.get()
 			.clone(),
-		native:  omp_driver::discovery::native::NativeDiscoveryOptions {
+		native: omp_driver::discovery::native::NativeDiscoveryOptions {
 			explicit_roots: if disabled_extensions {
 				Vec::new()
 			} else {
@@ -158,9 +168,18 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 			skill_settings,
 			include_workspace: !args.extension_launch.no_workspace && !disabled_extensions,
 			client_installed: Some(data.join("ext/installed.toml")),
+			workspace_identity: Some(omp_driver::discovery::workspace_identity(&project)),
 		},
+		grants: Some(omp_driver::discovery::ExtensionGrantSettings {
+			path:    data.join("ext/grants.toml"),
+			session: Arc::from([]),
+		}),
+		extension_scopes,
+		extension_overrides: args.extension_launch.settings.clone().into(),
 	};
-	let catalog = omp_catalog::snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let catalog_owner =
+		omp_driver::registry::production_catalog(&data).map_err(|error| miette!(error))?;
+	let catalog = catalog_owner.as_ref();
 	let roles = omp_driver::discovery::roles::resolve_launch_roles(
 		catalog,
 		&model_settings,

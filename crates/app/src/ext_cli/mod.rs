@@ -14,7 +14,7 @@ use omp_core::{Hash32, Str, base64, encoding::hex, sf};
 use omp_env::{BundleFile, pack_bundle, unpack_bundle};
 use omp_ext::{
 	Layer as BackendLayer,
-	config::{ExtensionEnvironment, SourceSpec},
+	config::{DeploymentManifest, ExtensionEnvironment, FeatureSelection, SourceSpec},
 	doctor::{CredentialHealth, DoctorRequest, DoctorSeverity, RuntimeHealth, diagnose},
 	index::SignedIndex,
 	lock::{
@@ -26,7 +26,10 @@ use omp_ext::{
 		Grant, GrantsFile, KeysFile, RevocationFreshness, RevocationsFile, grant_covers,
 		verify_artifact_signature,
 	},
-	upgrade::{Generation, PinsFile, apply_uninstall, gc_generations, plan_uninstall, set_enabled},
+	upgrade::{
+		Generation, PinsFile, apply_uninstall, concrete_features, gc_generations, plan_uninstall,
+		set_enabled,
+	},
 };
 use omp_proto::env::v1::{MaterializeSite, SiteFile};
 use omp_settings::manager::{SettingsManager, SettingsPaths};
@@ -157,6 +160,8 @@ pub enum ExtCommand {
 	Info(ExtInfoArgs),
 	/// Resolve, verify, consent to, and install extension specifications.
 	Install(ExtInstallArgs),
+	/// Scaffold a minimal manifest-first Python extension.
+	New(ExtNewArgs),
 	/// Remove extension installation records.
 	Uninstall(ExtUninstallArgs),
 	/// Register a local extension directory.
@@ -319,14 +324,18 @@ pub struct ExtUninstallArgs {
 	pub dry_run:    bool,
 }
 
+/// Options for `omp ext new`.
+#[derive(Clone, Debug, Args)]
+pub struct ExtNewArgs {
+	/// Stable extension identity and destination directory.
+	pub id: Str,
+}
+
 /// Options for `omp ext link`.
 #[derive(Clone, Debug, Args)]
 pub struct ExtLinkArgs {
 	/// Local extension directory.
 	pub path:       PathBuf,
-	/// Requested containment tier.
-	#[arg(long, value_enum, default_value_t = Tier::Sandboxed)]
-	pub tier:       Tier,
 	/// Override the manifest identity.
 	#[arg(long, value_name = "ID")]
 	pub name:       Option<Str>,
@@ -609,6 +618,7 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 		ExtCommand::List(args) => list(&state, args),
 		ExtCommand::Info(args) => info(&state, args),
 		ExtCommand::Install(args) => install(&scoped_state, args, uv).await,
+		ExtCommand::New(args) => new_extension(&project, args),
 		ExtCommand::Uninstall(args) => uninstall(&scoped_state, args),
 		ExtCommand::Link(args) => link(&scoped_state, args),
 		ExtCommand::Unlink { id } => unlink(&scoped_state, &id),
@@ -692,6 +702,16 @@ fn info(state: &StatePaths, args: ExtInfoArgs) -> miette::Result<()> {
 			"disabled"
 		}
 	);
+	if let Some(manifest) = read_installed_manifest(installed)? {
+		let projection = manifest
+			.project(&installed.features)
+			.map_err(|error| miette!("{error}"))?;
+		for row in projection.declarations {
+			if matches!(row.kind.as_str(), "agents" | "lsp-servers" | "dap-adapters") {
+				println!("{} {}", row.kind, row.path.as_deref().unwrap_or_default());
+			}
+		}
+	}
 	Ok(())
 }
 async fn install(
@@ -703,9 +723,15 @@ async fn install(
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
 	for spec in &args.specs {
-		let source = SourceSpec::parse(spec).map_err(|error| miette!("{error}"))?;
+		let (source, bracket_selection) =
+			SourceSpec::parse_install(spec).map_err(|error| miette!("{error}"))?;
+		let selection = requested_features(&args, bracket_selection)?;
 		let existing_id = match &source {
-			SourceSpec::Index { distribution, .. } => distribution.rsplit_once('@').map(|(id, _)| id),
+			SourceSpec::Index { distribution, .. } => Some(
+				distribution
+					.rsplit_once('@')
+					.map_or(distribution.as_str(), |(id, _)| id),
+			),
 			SourceSpec::Path(path) => path.file_name().and_then(|name| name.to_str()),
 			_ => None,
 		};
@@ -726,15 +752,25 @@ async fn install(
 					.ok_or_else(|| miette!("extension path has no valid identity"))?;
 				let mut source = map::Map::new();
 				source.insert("path".to_owned(), toml::Value::String(path.display().to_string()));
+				let manifest = read_development_manifest(&path)?;
+				let previous = installed
+					.extensions
+					.iter()
+					.find(|entry| entry.id == id)
+					.map(|entry| entry.features.as_slice());
+				let features = concrete_features(&selection, &manifest.features, previous)
+					.map_err(|error| miette!("{error}"))?;
 				upsert_installed(&mut installed, InstalledExtension {
-					id:      Str::new(id),
-					source:  toml::Value::Table(source),
-					tier:    tier(args.tier),
+					id: Str::new(id),
+					features,
+					source: toml::Value::Table(source),
+					tier: tier(args.tier),
 					enabled: true,
 				});
 			},
 			source => {
-				install_index_source(state, &args, &mut installed, source, uv.as_deref()).await?
+				install_index_source(state, &args, &mut installed, source, selection, uv.as_deref())
+					.await?
 			},
 		}
 	}
@@ -772,6 +808,86 @@ fn uninstall(state: &StatePaths, args: ExtUninstallArgs) -> miette::Result<()> {
 	Ok(())
 }
 
+fn package_name(id: &str) -> miette::Result<String> {
+	if id.is_empty()
+		|| id.len() > 128
+		|| !id.bytes().all(|byte| {
+			byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+		}) {
+		return Err(miette!(
+			"extension id must contain 1-128 lowercase letters, digits, dots, hyphens, or underscores"
+		));
+	}
+	let mut package = id
+		.chars()
+		.map(|character| {
+			if character.is_ascii_alphanumeric() {
+				character
+			} else {
+				'_'
+			}
+		})
+		.collect::<String>();
+	if package.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+		package.insert(0, '_');
+	}
+	Ok(package)
+}
+
+fn new_extension(project: &Path, args: ExtNewArgs) -> miette::Result<()> {
+	let package = package_name(&args.id)?;
+	let root = project.join(args.id.as_str());
+	if root.exists() {
+		return Err(miette!("extension destination {} already exists", root.display()));
+	}
+	let manifest = format!(
+		r#"id = "{id}"
+version = "0.1.0"
+omp_api = 1
+entry = "{package}"
+
+[[declarations]]
+id = "hello"
+kind = "soft"
+module = "{package}"
+key = "hello"
+api = 1
+family = "{package}"
+rev = 1
+
+[[declarations]]
+id = "activated"
+kind = "hook"
+module = "{package}"
+key = "extension_activate"
+api = 1
+event = "extension_activate"
+phase = "observe"
+"#,
+		id = args.id,
+	);
+	let parsed = DeploymentManifest::parse(&manifest).map_err(|error| miette!("{error}"))?;
+	parsed.validate().map_err(|error| miette!("{error}"))?;
+	let source = r#"import omp
+
+
+@omp.tool
+async def hello(name: str = "world") -> str:
+    """Return a greeting from the linked extension."""
+    return f"Hello, {name}!"
+
+
+@omp.hook("extension_activate")
+async def activated(event, ctx: omp.Context) -> None:
+    """Observe activation without changing core behavior."""
+"#;
+	fs::create_dir_all(root.join("src").join(&package)).into_diagnostic()?;
+	fs::write(root.join("omp.toml"), manifest).into_diagnostic()?;
+	fs::write(root.join("src").join(&package).join("__init__.py"), source).into_diagnostic()?;
+	println!("created {}; link it with `omp ext link {}`", root.display(), root.display());
+	Ok(())
+}
+
 fn link(state: &StatePaths, args: ExtLinkArgs) -> miette::Result<()> {
 	let path = args.path.canonicalize().into_diagnostic()?;
 	let id = args.name.unwrap_or_else(|| {
@@ -786,10 +902,25 @@ fn link(state: &StatePaths, args: ExtLinkArgs) -> miette::Result<()> {
 	source.insert("link".to_owned(), toml::Value::String(path.display().to_string()));
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+	let selection = match args.features.as_deref() {
+		None => FeatureSelection::Absent,
+		Some(features) if features.trim().is_empty() => FeatureSelection::None,
+		Some("*") => FeatureSelection::All,
+		Some(features) => FeatureSelection::Named(csv(features)),
+	};
+	let manifest = read_development_manifest(&path)?;
+	let previous = installed
+		.extensions
+		.iter()
+		.find(|entry| entry.id == id)
+		.map(|entry| entry.features.as_slice());
+	let features = concrete_features(&selection, &manifest.features, previous)
+		.map_err(|error| miette!("{error}"))?;
 	upsert_installed(&mut installed, InstalledExtension {
-		id:      id.clone(),
-		source:  toml::Value::Table(source),
-		tier:    tier(args.tier),
+		id: id.clone(),
+		features,
+		source: toml::Value::Table(source),
+		tier: omp_ext::TrustTier::Sandboxed,
 		enabled: true,
 	});
 	installed.write(&state.client_installed).into_diagnostic()?;
@@ -1154,8 +1285,26 @@ async fn upgrade(
 		if previous.is_some_and(|previous| previous.version == release.version) {
 			continue;
 		}
+		let concrete = installed
+			.extensions
+			.iter()
+			.find(|entry| entry.id == id)
+			.map(|entry| entry.features.as_slice())
+			.unwrap_or_default();
+		let manifest = release.deployment_manifest();
+		let projection = manifest
+			.project(concrete)
+			.map_err(|error| miette!("{error}"))?;
+		let next_capability_digest = if release.features.is_empty()
+			&& release.capabilities.is_empty()
+			&& release.declarations.is_empty()
+		{
+			release.capability_digest.clone()
+		} else {
+			projection.capability_digest
+		};
 		if let Some(previous) = previous
-			&& previous.capability_digest != release.capability_digest
+			&& previous.capability_digest != next_capability_digest
 			&& !args.allow_capability_widening
 		{
 			return Err(miette!(
@@ -1340,8 +1489,22 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 						extension.version
 					)
 				})?;
+			let manifest = release.deployment_manifest();
+			let projection = manifest
+				.project(&extension.features)
+				.map_err(|error| miette!("{error}"))?;
+			let effective_capability_digest = if release.features.is_empty()
+				&& release.capabilities.is_empty()
+				&& release.declarations.is_empty()
+			{
+				release.capability_digest.clone()
+			} else {
+				projection.capability_digest.clone()
+			};
 			if indexed.publisher_key != extension.publisher
-				|| release.capability_digest != extension.capability_digest
+				|| release.signature_capability_digest() != &extension.manifest_capability_digest
+				|| effective_capability_digest != extension.capability_digest
+				|| projection.declaration_digest != extension.declaration_digest
 			{
 				return Err(miette!(
 					"signed index authority differs from the lock for {}",
@@ -1359,7 +1522,7 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 				extension.publisher.as_str(),
 				extension.wheel.blake3.as_str(),
 				extension.wheel.sha256.as_str(),
-				extension.capability_digest.as_str(),
+				extension.manifest_capability_digest.as_str(),
 				extension.signature.as_str(),
 			)
 			.map_err(|error| miette!("{error}"))?;
@@ -1845,9 +2008,84 @@ fn pack_airgap_bundle(targets: Vec<Str>, files: Vec<BundleFile>) -> miette::Resu
 
 fn validate_specs(specs: &[Str]) -> miette::Result<()> {
 	for spec in specs {
-		SourceSpec::parse(spec).map_err(|error| miette!("{error}"))?;
+		SourceSpec::parse_install(spec).map_err(|error| miette!("{error}"))?;
 	}
 	Ok(())
+}
+
+fn requested_features(
+	args: &ExtInstallArgs,
+	bracket: FeatureSelection,
+) -> miette::Result<FeatureSelection> {
+	let Some(value) = args.features.as_deref() else {
+		return Ok(bracket);
+	};
+	if !matches!(bracket, FeatureSelection::Absent) {
+		return Err(miette!("feature brackets and --features cannot be combined"));
+	}
+	let value = value.trim();
+	if value.is_empty() {
+		Ok(FeatureSelection::None)
+	} else if value == "*" {
+		Ok(FeatureSelection::All)
+	} else {
+		let mut names = csv(value);
+		names.sort();
+		names.dedup();
+		Ok(FeatureSelection::Named(names))
+	}
+}
+
+fn read_development_manifest(root: &Path) -> miette::Result<DeploymentManifest> {
+	let path = root.join("omp.toml");
+	if !path.is_file() {
+		return Ok(DeploymentManifest::default());
+	}
+	let text = fs::read_to_string(path).into_diagnostic()?;
+	let manifest = DeploymentManifest::parse(&text).map_err(|error| miette!("{error}"))?;
+	manifest.validate().map_err(|error| miette!("{error}"))?;
+	Ok(manifest)
+}
+
+fn read_installed_manifest(
+	installed: &InstalledExtension,
+) -> miette::Result<Option<DeploymentManifest>> {
+	let Some(source) = installed.source.as_table() else {
+		return Ok(None);
+	};
+	let Some(root) = source
+		.get("root")
+		.or_else(|| source.get("path"))
+		.or_else(|| source.get("link"))
+		.and_then(toml::Value::as_str)
+		.map(PathBuf::from)
+	else {
+		return Ok(None);
+	};
+	let direct = root.join("omp.toml");
+	let path = if direct.is_file() {
+		Some(direct)
+	} else {
+		fs::read_dir(&root)
+			.into_iter()
+			.flatten()
+			.filter_map(Result::ok)
+			.map(|entry| entry.path())
+			.find(|path| {
+				path
+					.file_name()
+					.and_then(|name| name.to_str())
+					.is_some_and(|name| name.ends_with(".dist-info"))
+					&& path.join("omp.toml").is_file()
+			})
+			.map(|path| path.join("omp.toml"))
+	};
+	let Some(path) = path else {
+		return Ok(None);
+	};
+	let text = fs::read_to_string(path).into_diagnostic()?;
+	let manifest = DeploymentManifest::parse(&text).map_err(|error| miette!("{error}"))?;
+	Ok(Some(manifest))
 }
 
 async fn install_index_source(
@@ -1855,6 +2093,7 @@ async fn install_index_source(
 	args: &ExtInstallArgs,
 	installed: &mut InstalledRecord,
 	source: SourceSpec,
+	selection: FeatureSelection,
 	uv: Option<&Path>,
 ) -> miette::Result<()> {
 	let SourceSpec::Index { index, distribution } = source else {
@@ -1863,27 +2102,57 @@ async fn install_index_source(
 			 PyPI, Git, and URL closure inspection"
 		));
 	};
-	let (id, version) = distribution.rsplit_once('@').ok_or_else(|| {
-		miette!("signed index installs require index:<catalog>/<id>@<exact-version>")
-	})?;
+	let (id, requested_version) = distribution
+		.rsplit_once('@')
+		.map_or((distribution.as_str(), None), |(id, version)| (id, Some(version)));
 	let index_key = fs::read_to_string(&state.index_key).into_diagnostic()?;
 	let catalog = SignedIndex::read(&state.index_snapshot, index_key.trim())
 		.map_err(|error| miette!("{error}"))?;
-	let (extension, release) = catalog
-		.release(id, version)
-		.ok_or_else(|| miette!("{id}@{version} is absent or yanked in the signed index"))?;
+	let extension = catalog
+		.extensions
+		.iter()
+		.find(|extension| extension.id == id)
+		.ok_or_else(|| miette!("{id} is absent in the signed index"))?;
+	let release = if let Some(version) = requested_version {
+		extension
+			.releases
+			.iter()
+			.find(|release| release.version == version && !release.yanked)
+	} else {
+		catalog.latest_release(extension, false)
+	}
+	.ok_or_else(|| miette!("{id} has no eligible release in the signed index"))?;
+	let manifest = release.deployment_manifest();
+	let previous = installed
+		.extensions
+		.iter()
+		.find(|entry| entry.id == extension.id)
+		.map(|entry| entry.features.as_slice());
+	let features = concrete_features(&selection, &manifest.features, previous)
+		.map_err(|error| miette!("{error}"))?;
+	let projection = manifest
+		.project(&features)
+		.map_err(|error| miette!("{error}"))?;
+	let legacy_manifest = release.features.is_empty()
+		&& release.capabilities.is_empty()
+		&& release.declarations.is_empty();
+	let effective_capability_digest = if legacy_manifest {
+		release.capability_digest.clone()
+	} else {
+		projection.capability_digest.clone()
+	};
 	ensure_not_revoked(state, &extension.id, &release.version)?;
 	let target = args.target.first().map_or("any", Str::as_str);
 	let artifact = release
 		.artifacts
 		.iter()
 		.find(|artifact| artifact.target == target || artifact.target == "any")
-		.ok_or_else(|| miette!("{id}@{version} has no wheel for {target}"))?;
+		.ok_or_else(|| miette!("{} has no wheel for {target}", release.version))?;
 	verify_artifact_signature(
 		extension.publisher_key.as_str(),
 		artifact.blake3.as_str(),
 		artifact.sha256.as_str(),
-		release.capability_digest.as_str(),
+		release.signature_capability_digest().as_str(),
 		artifact.signature.as_str(),
 	)
 	.map_err(|error| miette!("{error}"))?;
@@ -1909,9 +2178,9 @@ async fn install_index_source(
 	let requested_digest = if let Some(capabilities) = args.capabilities.as_deref() {
 		omp_ext::trust::capability_digest(csv(capabilities), [])
 	} else {
-		release.capability_digest.clone()
+		effective_capability_digest.clone()
 	};
-	if requested_digest != release.capability_digest {
+	if requested_digest != effective_capability_digest {
 		return Err(miette!(
 			"requested capabilities do not exactly match the signed manifest capability digest"
 		));
@@ -1930,7 +2199,7 @@ async fn install_index_source(
 			publisher:         extension.publisher_key.clone(),
 			layer:             state.layer,
 			workspace:         workspace.cloned(),
-			capability_digest: release.capability_digest.clone(),
+			capability_digest: effective_capability_digest.clone(),
 			tier:              tier(args.tier),
 			ship:              ship.clone(),
 			granted_at:        Str::new(jiff::Timestamp::now().to_string()),
@@ -1943,7 +2212,7 @@ async fn install_index_source(
 		&extension.publisher_key,
 		state.layer,
 		workspace,
-		&release.capability_digest,
+		&effective_capability_digest,
 		tier(args.tier),
 		&ship,
 	) {
@@ -1967,22 +2236,24 @@ async fn install_index_source(
 	lock.targets = vec![artifact.target.clone()];
 	lock.extensions.retain(|locked| locked.id != extension.id);
 	lock.extensions.push(LockedExtension {
-		id:                extension.id.clone(),
-		version:           release.version.clone(),
-		tier:              tier(args.tier),
-		pool:              args.pool.clone(),
-		features:          args.features.as_deref().map(csv).unwrap_or_default(),
-		source:            index_source(
+		id: extension.id.clone(),
+		version: release.version.clone(),
+		tier: tier(args.tier),
+		pool: args.pool.clone(),
+		features: features.clone(),
+		source: index_source(
 			lock.indexes.first().map_or("", String::as_str),
 			&extension.distribution,
 		),
-		manifest_digest:   release.manifest_digest.clone(),
-		capability_digest: release.capability_digest.clone(),
-		publisher:         extension.publisher_key.clone(),
-		signature:         artifact.signature.clone(),
-		ship:              Str::new_static("installed"),
-		requires:          Vec::new(),
-		wheel:             Wheel {
+		manifest_digest: release.manifest_digest.clone(),
+		capability_digest: effective_capability_digest,
+		declaration_digest: projection.declaration_digest,
+		manifest_capability_digest: release.signature_capability_digest().clone(),
+		publisher: extension.publisher_key.clone(),
+		signature: artifact.signature.clone(),
+		ship: Str::new_static("installed"),
+		requires: projection.requires,
+		wheel: Wheel {
 			file:   artifact.file.clone(),
 			tag:    artifact.tag.clone(),
 			size:   artifact.size,
@@ -2013,6 +2284,7 @@ async fn install_index_source(
 		.insert("root".to_owned(), toml::Value::String(site_root.display().to_string()));
 	upsert_installed(installed, InstalledExtension {
 		id: extension.id.clone(),
+		features,
 		source,
 		tier: tier(args.tier),
 		enabled: true,
@@ -2255,7 +2527,7 @@ fn read_lock_or_empty(path: &Path, layer: BackendLayer) -> miette::Result<LockFi
 		return LockFile::read(path, layer).map_err(|error| miette!("{error}"));
 	}
 	Ok(LockFile {
-		version: 1,
+		version: omp_ext::lock::LOCK_VERSION,
 		generated_by: "omp ext".to_owned(),
 		generated_at: String::new(),
 		layer,
@@ -2308,6 +2580,45 @@ fn write_toml(path: &Path, value: &impl serde::Serialize) -> miette::Result<()> 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn scaffold_manifest_admits_and_link_uses_sandboxed_source_config() {
+		let tree = tempfile::tempdir().expect("extension workspace");
+		new_extension(tree.path(), ExtNewArgs { id: Str::new_static("demo") }).expect("scaffold");
+		let root = tree.path().join("demo");
+		let manifest = read_development_manifest(&root).expect("admitted scaffold manifest");
+		assert_eq!(manifest.id, "demo");
+		assert_eq!(manifest.entry, "demo");
+		assert_eq!(manifest.declarations.len(), 2);
+
+		let data = tree.path().join("data");
+		let state = StatePaths::new(&data, tree.path()).scoped(Scope::User);
+		link(&state, ExtLinkArgs {
+			path:       root.clone(),
+			name:       None,
+			features:   None,
+			no_resolve: false,
+		})
+		.expect("linked scaffold");
+		let installed =
+			InstalledRecord::read(&state.client_installed).expect("linked install record");
+		assert_eq!(installed.extensions.len(), 1);
+		assert_eq!(installed.extensions[0].id, "demo");
+		assert_eq!(installed.extensions[0].tier, omp_ext::TrustTier::Sandboxed);
+		assert_eq!(
+			installed.extensions[0]
+				.source
+				.get("link")
+				.and_then(toml::Value::as_str),
+			Some(
+				root
+					.canonicalize()
+					.expect("canonical root")
+					.to_string_lossy()
+					.as_ref()
+			)
+		);
+	}
 
 	#[test]
 	fn verified_wheel_bytes_and_site_files_are_content_addressed() {

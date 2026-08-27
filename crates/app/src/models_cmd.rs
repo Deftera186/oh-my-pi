@@ -73,11 +73,12 @@ async fn refresh() -> miette::Result<()> {
 		for route in provider_routes {
 			let planner = router::Router::new(registry.clone(), Duration::from_secs(30));
 			let meta = CallMeta {
-				id:       RequestId::from(format!("omp-model-refresh-{}", provider.as_str())),
-				target:   Target::ProviderService(provider.clone()),
-				deadline: None,
-				budget:   ExecutionBudget::default(),
-				session:  None,
+				id:             RequestId::from(format!("omp-model-refresh-{}", provider.as_str())),
+				target:         Target::ProviderService(provider.clone()),
+				deadline:       None,
+				budget:         ExecutionBudget::default(),
+				session:        None,
+				response_hooks: Default::default(),
 			};
 			let mut cursor = None;
 			loop {

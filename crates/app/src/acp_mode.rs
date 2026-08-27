@@ -20,7 +20,7 @@ use omp_agent::{
 	ApprovalSource, ApprovalSpec, EventProvenance, EventSubscription, EventVisibility, PlanState,
 	RunSettlement,
 };
-use omp_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort, snapshot};
+use omp_catalog::{ModelKey, ThinkingEffort, clamp_thinking_effort};
 use omp_core::{CowBytes, Hash32, Str, ToolPath, sf};
 use omp_driver::{
 	headless::{
@@ -116,20 +116,30 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 		.clone();
 	let disabled_extensions =
 		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
+	let app_settings = settings_snapshot
+		.project::<omp_driver::settings::Settings>()
+		.into_diagnostic()?;
+	let extension_scopes = app_settings
+		.get()
+		.extension_scopes(
+			omp_driver::settings::workspace_extension_overlay(&root)
+				.map_err(|error| miette!("{error}"))?,
+		)
+		.map_err(|error| miette!("{error}"))?;
 	let prompt_discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
-		model:   model_settings.clone(),
-		skills:  skill_settings.clone(),
+		model: model_settings.clone(),
+		skills: skill_settings.clone(),
 		foreign: settings_snapshot
 			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
 			.into_diagnostic()?
 			.get()
 			.clone(),
-		rules:   settings_snapshot
+		rules: settings_snapshot
 			.project::<omp_driver::rulebook::RulebookSettings>()
 			.into_diagnostic()?
 			.get()
 			.clone(),
-		native:  omp_driver::discovery::native::NativeDiscoveryOptions {
+		native: omp_driver::discovery::native::NativeDiscoveryOptions {
 			explicit_roots: if disabled_extensions {
 				Vec::new()
 			} else {
@@ -147,7 +157,14 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 			skill_settings,
 			include_workspace: !args.extension_launch.no_workspace && !disabled_extensions,
 			client_installed: Some(data_dir.join("ext/installed.toml")),
+			workspace_identity: Some(omp_driver::discovery::workspace_identity(&root)),
 		},
+		grants: Some(omp_driver::discovery::ExtensionGrantSettings {
+			path:    data_dir.join("ext/grants.toml"),
+			session: Arc::from([]),
+		}),
+		extension_scopes,
+		extension_overrides: args.extension_launch.settings.clone().into(),
 	};
 	let content = omp_driver::discovery::active_prompt_snapshots(
 		&root,
@@ -156,7 +173,9 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 		&prompt_discovery_settings,
 	)
 	.content;
-	let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let catalog_owner =
+		omp_driver::registry::production_catalog(&data_dir).map_err(|error| miette!(error))?;
+	let catalog = catalog_owner.as_ref();
 	let roles = omp_driver::discovery::roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
@@ -1346,7 +1365,9 @@ impl Runtime {
 			.into_diagnostic()?
 			.get()
 			.resolve_path_scopes(&root, &home);
-		let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
+		let catalog_owner =
+			omp_driver::registry::production_catalog(&data_dir).map_err(|error| miette!(error))?;
+		let catalog = catalog_owner.as_ref();
 		let resolved = omp_driver::discovery::roles::resolve_launch_roles(
 			catalog,
 			&model_settings,
@@ -3266,6 +3287,27 @@ fn available_commands(
 			})
 		})
 		.collect::<Vec<_>>();
+	commands.extend(content.extensions.iter().flat_map(|extension| {
+		extension
+			.manifest
+			.static_declarations()
+			.ui
+			.commands
+			.iter()
+			.map(|command| {
+				json!({
+					"name":command.key,
+					"description":command
+						.properties
+						.get("description")
+						.and_then(Value::as_str)
+						.unwrap_or_default(),
+					"input":command.properties.get("hint"),
+					"source":format!("extension:{}",extension.key.extension()),
+					"generation":generation,
+				})
+			})
+	}));
 	commands.extend(content.commands.iter().map(|command| {
 		json!({
 			"name":command.name,
@@ -3316,7 +3358,9 @@ fn clamp_thinking_level(model: &str, requested: &str) -> miette::Result<&'static
 	let requested = requested
 		.parse::<ThinkingEffort>()
 		.map_err(|_| miette!("unknown thinking level `{requested}`"))?;
-	let catalog = snapshot::Catalog::try_embedded().into_diagnostic()?;
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
+	let catalog =
+		omp_driver::registry::production_catalog(&data_dir).map_err(|error| miette!(error))?;
 	let model = catalog
 		.model(ModelKey::from_ref(model))
 		.ok_or_else(|| miette!("unknown model `{model}`"))?;

@@ -31,6 +31,7 @@ pub mod dry_balance_cmd;
 pub mod editor;
 pub mod endpoint;
 pub mod ext_cli;
+pub mod extension_trust;
 pub mod gallery_cmd;
 pub mod gateway_rpc;
 pub mod gc_cmd;

@@ -323,6 +323,10 @@ pub struct SelectorList(
 	pub Vec<Str>,
 );
 
+fn extension_setting_override(value: &str) -> Result<omp_ext::config::CliSettingOverride, String> {
+	omp_ext::config::CliSettingOverride::parse(value).map_err(|error| error.to_string())
+}
+
 impl FromStr for SelectorList {
 	type Err = String;
 
@@ -346,8 +350,18 @@ impl FromStr for SelectorList {
 )]
 pub struct OmpCli {
 	/// Enable an extension specification for this invocation.
-	#[arg(long = "extension", short = 'e', visible_aliases = ["ext", "hook"], global = true, value_name = "SPEC", conflicts_with = "no_ext")]
+	#[arg(
+		long = "extension",
+		short = 'e',
+		visible_alias = "hook",
+		global = true,
+		value_name = "SPEC",
+		conflicts_with = "no_ext"
+	)]
 	pub ext:               Vec<Str>,
+	/// Override one manifest-declared extension setting for this invocation.
+	#[arg(long = "ext", global = true, value_name = "ID.KEY=VALUE", value_parser = extension_setting_override)]
+	pub ext_overrides:     Vec<omp_ext::config::CliSettingOverride>,
 	/// Load only this local extension path for this invocation.
 	#[arg(
 		long = "plugin-dir",
@@ -1725,6 +1739,8 @@ pub struct LaunchExtensions {
 	pub trusted:      Vec<ExtHostSpec>,
 	/// Declaration-owned typed CLI values delivered once at activation.
 	pub contributed:  Vec<ContributedCliValue>,
+	/// Inert manifest setting overrides validated during extension admission.
+	pub settings:     Vec<omp_ext::config::CliSettingOverride>,
 }
 
 /// Interactive project-chat options.
@@ -2633,7 +2649,6 @@ async fn install_shorthand(args: InstallArgs) -> miette::Result<()> {
 			}
 			let command = ExtCommand::Link(ExtLinkArgs {
 				path:       local_install_path(target.as_str()),
-				tier:       ExtTier::Sandboxed,
 				name:       None,
 				features:   None,
 				no_resolve: false,
@@ -2691,6 +2706,7 @@ fn lower_launch_extensions(cli: &OmpCli) -> miette::Result<LaunchExtensions> {
 			.map(trusted_extension)
 			.collect(),
 		contributed: cli.contributed.clone(),
+		settings: cli.ext_overrides.clone(),
 	})
 }
 
@@ -2826,7 +2842,8 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			|| !cli.trusted_extension.is_empty()
 			|| cli.no_ext
 			|| cli.no_workspace_ext
-			|| !cli.contributed.is_empty())
+			|| !cli.contributed.is_empty()
+			|| !cli.ext_overrides.is_empty())
 	{
 		return Err(
 			CliUsageError::new(
@@ -2871,7 +2888,6 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Print(mut args) => {
 			args.launch.extension_launch = launch_extensions;
-			refresh_marketplace(&args.launch).await?;
 			print_mode::run(args).await
 		},
 		Command::Render(args) => {
@@ -2879,12 +2895,10 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		},
 		Command::Rpc(mut args) => {
 			args.launch.extension_launch = launch_extensions;
-			refresh_marketplace(&args.launch).await?;
 			rpc_mode::run(args, false).await
 		},
 		Command::RpcUi(mut args) => {
 			args.launch.extension_launch = launch_extensions;
-			refresh_marketplace(&args.launch).await?;
 			rpc_mode::run(args, true).await
 		},
 		Command::Acp(mut args) => {
@@ -2892,7 +2906,6 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 				run_interactive_chat(args.launch, launch_extensions, ChatPresentation::Terminal).await
 			} else {
 				args.launch.extension_launch = launch_extensions;
-				refresh_marketplace(&args.launch).await?;
 				acp_mode::run(args).await
 			}
 		},
@@ -3336,22 +3349,6 @@ pub fn trusted_extension(module: TrustedModule) -> ExtHostSpec {
 	extension
 }
 
-async fn refresh_marketplace(args: &ChatArgs) -> miette::Result<()> {
-	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
-	let project = fs::canonicalize(&args.project).into_diagnostic()?;
-	let settings = omp_driver::settings::current_for_project_with_overlays(
-		&data_dir,
-		Some(&project),
-		&args.config,
-	)
-	.into_diagnostic()?;
-	let mode: &'static str = settings.lifecycle.marketplace_auto_update.into();
-	for diagnostic in ext_cli::service::refresh_stale_and_update(&data_dir, &project, mode).await? {
-		eprintln!("{diagnostic}");
-	}
-	Ok(())
-}
-
 fn is_home_dir() -> miette::Result<bool> {
 	let Some(home) = env::var_os("HOME") else {
 		return Ok(false);
@@ -3398,11 +3395,12 @@ async fn infer(args: InferArgs) -> miette::Result<()> {
 		.into_diagnostic()?;
 	let planner = router::Router::new(registry.clone(), time::Duration::from_secs(30));
 	let meta = CallMeta {
-		id:       RequestId::from(turn_id()),
-		target:   Target::Model(ModelKey::from(args.model)),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from(turn_id()),
+		target:         Target::Model(ModelKey::from(args.model)),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let mut client = Client::new(registry.service(), planner, meta);
 	let mut events = client
@@ -3909,10 +3907,24 @@ mod tests {
 	}
 
 	#[test]
+	fn generic_ext_setting_parse_is_inert_until_admission() {
+		let cli = parse(&["omp", "--ext", "demo.verbose=true"]);
+		assert!(cli.trusted_extension.is_empty());
+		let launch = lower_launch_extensions(&cli).expect("inert launch lowering");
+		assert!(launch.native_roots.is_empty());
+		assert!(launch.trusted.is_empty(), "argv parsing must not compose an extension host");
+		assert_eq!(launch.settings.len(), 1);
+		assert_eq!(launch.settings[0].extension, "demo");
+		assert_eq!(launch.settings[0].key, "verbose");
+		assert_eq!(launch.settings[0].value, "true");
+	}
+
+	#[test]
 	fn parses_ext_group_flags_and_subcommands() {
 		let cli = parse(&[
 			"omp",
-			"--ext=publisher/example",
+			"--extension=publisher/example",
+			"--ext=demo.verbose=true",
 			"--ext-only",
 			"local-ext",
 			"--no-workspace-ext",
@@ -3928,6 +3940,11 @@ mod tests {
 			"literal-spec",
 		]);
 		assert_eq!(cli.ext, vec![sf!("publisher/example")]);
+		assert_eq!(cli.ext_overrides, vec![omp_ext::config::CliSettingOverride {
+			extension: sf!("demo"),
+			key:       sf!("verbose"),
+			value:     sf!("true"),
+		}]);
 		assert_eq!(cli.ext_only, vec![PathBuf::from("local-ext")]);
 		assert!(cli.no_workspace_ext);
 		let Some(Command::Ext(args)) = cli.command else {

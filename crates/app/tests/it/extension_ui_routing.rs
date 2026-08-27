@@ -1,145 +1,246 @@
-use std::sync::{
-	Arc, Mutex,
-	atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+#![cfg(unix)]
 
-use omp_app::{
-	chat_ui::commands::{
-		CommandProvenance, CommandResult, CommandSourceKind, CommandSurface, ConsumedResult,
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
+
+use omp_app::chat_ui::{
+	commands::{
+		CommandImplementation, CommandProvenance, CommandResult, CommandSourceKind, CommandSurface,
 		ExtensionCommandHandler, ExtensionCommandInvocation,
 	},
-	keybindings::{ExtensionShortcutRoster, KeyPlatform, config::ResolvedKeybindings},
+	presentation::{ControlPresentationCallbackDispatcher, PublishedUiRoster},
 };
-use omp_core::{Str, sf};
-use omp_envd::exthost::{HostKey, UiRoster, VerifiedUiRoster};
-use omp_proto::ui::v1::{CommandDecl, ShortcutDecl};
+use omp_core::{ArtifactDigest, Provenance, Str, sf};
+use omp_envd::{
+	ProjectEnvironment, RegistryBridges,
+	exthost::{
+		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest,
+		lifecycle::HeadlessLifecycleKind,
+	},
+	worker::{ExtHostSpec, HostKey},
+};
+use omp_ext::config::{StaticDeclaration, StaticDeclarations, UiDeclarations};
+use serde_json::json;
 
-fn command(id: &str, name: &str, callback: &str) -> CommandDecl {
-	CommandDecl {
-		name: name.to_owned(),
-		description: format!("Run {name}"),
-		declaration_id: id.to_owned(),
-		callback: callback.to_owned(),
-		module: "fixture.commands".to_owned(),
-		activation_trigger: "lazy".to_owned(),
-		..Default::default()
+const MODULE: &str = "extension_ui_fixture";
+
+fn provenance(key: &HostKey) -> Provenance {
+	Provenance::new(
+		sf!("fixture"),
+		key.extension().clone(),
+		sf!("1.0.0"),
+		ArtifactDigest::new([7; 32]),
+		key.layer().clone(),
+		key.tier().clone(),
+		1,
+	)
+}
+
+fn command_row() -> StaticDeclaration {
+	StaticDeclaration {
+		id: sf!("fixture.command"),
+		kind: sf!("command"),
+		module: sf!(MODULE),
+		trigger: sf!("lazy"),
+		key: sf!("inspect"),
+		api: 1,
+		failure: sf!("fault"),
+		properties: BTreeMap::from([
+			(sf!("aliases"), json!(["i"])),
+			(sf!("description"), json!("Inspect typed arguments")),
+			(sf!("hint"), json!("[arguments]")),
+			(sf!("callback"), json!(format!("{MODULE}.inspect"))),
+		]),
+		..StaticDeclaration::default()
 	}
 }
 
-fn shortcut(id: &str, chord: &str, action_id: &str) -> ShortcutDecl {
-	ShortcutDecl {
-		chord: chord.to_owned(),
-		action_id: action_id.to_owned(),
-		declaration_id: id.to_owned(),
-		callback: format!("fixture.commands.{action_id}"),
-		module: "fixture.commands".to_owned(),
-		activation_trigger: "lazy".to_owned(),
-		..Default::default()
+fn shortcut_row() -> StaticDeclaration {
+	StaticDeclaration {
+		id: sf!("fixture.shortcut"),
+		kind: sf!("shortcut"),
+		module: sf!(MODULE),
+		trigger: sf!("lazy"),
+		key: sf!("ctrl+alt+k"),
+		api: 1,
+		failure: sf!("fail-open"),
+		properties: BTreeMap::from([
+			(sf!("action_id"), json!("fixture.inspect")),
+			(sf!("description"), json!("Inspect shortcut")),
+			(sf!("when"), json!([])),
+			(sf!("callback"), json!(format!("{MODULE}.inspect_shortcut"))),
+		]),
+		..StaticDeclaration::default()
+	}
+}
+
+fn fixture_extension(site: PathBuf, module_path: PathBuf) -> ExtHostSpec {
+	let key = HostKey::new("workspace", "trusted", MODULE);
+	let command = command_row();
+	let shortcut = shortcut_row();
+	let declarations = StaticDeclarations {
+		ordered: vec![command.clone(), shortcut.clone()].into_boxed_slice(),
+		ui: UiDeclarations {
+			commands: vec![command].into_boxed_slice(),
+			shortcuts: vec![shortcut].into_boxed_slice(),
+			..UiDeclarations::default()
+		},
+		..StaticDeclarations::default()
+	};
+	let manifest = ExtensionManifest::new_with_static(
+		provenance(&key),
+		sf!(MODULE),
+		[],
+		DeclarationSet::default(),
+		ServiceManifest::default(),
+		declarations,
+		[],
+		[ActivationTrigger::FirstReach],
+	);
+	let mut extension = ExtHostSpec::new(key, manifest);
+	extension.python_site = Some(site);
+	extension.entry_path = Some(module_path);
+	extension.host_executable = Some(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
+	extension
+}
+
+fn command_handler(
+	roster: &PublishedUiRoster,
+	session: &Str,
+) -> (Arc<dyn ExtensionCommandHandler>, CommandProvenance) {
+	let generation = roster
+		.command_generations(session)
+		.into_iter()
+		.next()
+		.expect("fixture command generation");
+	let declaration = generation
+		.declarations
+		.first()
+		.expect("fixture command declaration");
+	let CommandImplementation::Extension(handler) = &declaration.implementation else {
+		panic!("fixture command was not installed as an extension callback");
+	};
+	(Arc::clone(handler), generation.provenance)
+}
+
+fn invocation() -> ExtensionCommandInvocation {
+	ExtensionCommandInvocation {
+		name:    sf!("i"),
+		argv:    Arc::from([sf!("one"), sf!("two words")]),
+		raw:     sf!("one \"two words\""),
+		surface: CommandSurface::Tui,
 	}
 }
 
 #[tokio::test]
-async fn fixture_command_shortcut_reload_retires_old_generation() {
-	let host = HostKey::new("project", "native", "fixture");
-	let first = VerifiedUiRoster {
-		generation: 11,
-		extension:  sf!("fixture"),
-		commands:   vec![command("review", "review", "fixture.commands.review")].into_boxed_slice(),
-		shortcuts:  vec![shortcut("history", "ctrl+alt+h", "history")].into_boxed_slice(),
-	};
-	let mut host_roster = UiRoster::default();
-	host_roster
-		.install(host.clone(), &first)
-		.expect("first roster");
-	assert_eq!(host_roster.command("review").unwrap().owner.generation, 11);
+async fn spawned_python_command_shortcut_reload_retires_old_generation() {
+	let scratch = tempfile::tempdir().expect("UI routing fixture scratch");
+	let root = scratch.path().join("workspace");
+	let state = scratch.path().join("state");
+	let site = scratch.path().join("site");
+	fs::create_dir_all(&root).expect("fixture workspace");
+	fs::create_dir_all(&state).expect("fixture state");
+	fs::create_dir_all(&site).expect("fixture site");
+	let source = r#"from __future__ import annotations
+import os
+from omp.ui import Prompt, command, shortcut
 
-	let shortcuts = ExtensionShortcutRoster::install(
-		&first.shortcuts,
-		11,
-		&ResolvedKeybindings::default(),
-		KeyPlatform::Unix,
+@command("inspect", aliases=("i",), description="Inspect typed arguments", hint="[arguments]")
+def inspect(invocation, ctx):
+    return Prompt(
+        os.environ["OMP_EXT_HOST_GENERATION"]
+        + ":" + invocation.name
+        + ":" + "|".join(invocation.argv)
+        + ":" + invocation.raw
+    )
+
+@shortcut("ctrl+alt+k", action_id="fixture.inspect", description="Inspect shortcut")
+def inspect_shortcut(action, ctx):
+    return None
+"#;
+	let module_path = site.join(format!("{MODULE}.py"));
+	fs::write(&module_path, source).expect("write Python UI fixture");
+	let extension = fixture_extension(site, module_path);
+	let environment = ProjectEnvironment::connect_or_start(
+		&root,
+		&state,
+		&state.join("env.sock"),
+		&state.join("docs.sock"),
+		false,
+		None,
+		&[extension],
+		&[],
+		omp_tool::DEFAULT_INTERRUPT_GRACE,
+		RegistryBridges::default(),
 	)
-	.expect("fixture shortcut");
-	assert_eq!(
-		shortcuts
-			.match_chord("alt+ctrl+h", "open")
-			.expect("normalized chord")
-			.expect("local shortcut")
-			.generation,
-		11
-	);
+	.await
+	.expect("start spawned Python UI extension");
+	let callbacks = environment.extension_callback_dispatcher();
+	let roster = PublishedUiRoster::default();
+	let invalidations = roster.subscribe();
+	let evidence = environment.extension_registry_evidences();
+	assert_eq!(evidence.len(), 1, "fixture registry was not sealed");
+	let session = evidence[0]
+		.session
+		.clone()
+		.expect("fixture session identity");
+	roster
+		.replace(evidence, Arc::clone(&callbacks))
+		.expect("install first UI roster");
+	assert!(matches!(
+		invalidations.recv().expect("initial command invalidation"),
+		HeadlessLifecycleKind::CommandRosterInvalidated
+	));
 
-	let activated = Arc::new(AtomicBool::new(false));
-	let activation_count = Arc::new(AtomicUsize::new(0));
-	let received = Arc::new(Mutex::new(None));
-	let activated_for_handler = activated.clone();
-	let activation_count_for_handler = activation_count.clone();
-	let received_for_handler = received.clone();
-	let handler: Arc<dyn ExtensionCommandHandler> =
-		Arc::new(move |invocation: ExtensionCommandInvocation, _provenance: CommandProvenance| {
-			if activated_for_handler
-				.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-				.is_ok()
-			{
-				activation_count_for_handler.fetch_add(1, Ordering::Relaxed);
-			}
-			*received_for_handler.lock().expect("argument capture") = Some(invocation);
-			async { Ok(CommandResult::Consumed(ConsumedResult::silent())) }
-		});
-	let provenance = CommandProvenance {
-		source:     sf!("fixture"),
-		label:      sf!("Fixture"),
-		kind:       CommandSourceKind::Extension,
-		generation: 11,
-	};
-	handler
-		.call(
-			ExtensionCommandInvocation {
-				name:    sf!("review"),
-				argv:    Arc::from([sf!("one"), sf!("two")]),
-				raw:     sf!("one two"),
-				surface: CommandSurface::Tui,
-			},
-			provenance,
-		)
+	let (old_handler, provenance) = command_handler(&roster, &session);
+	let result = old_handler
+		.call(invocation(), provenance)
 		.await
-		.expect("fixture command");
-	assert_eq!(activation_count.load(Ordering::Relaxed), 1);
-	let invocation = received.lock().expect("argument capture").clone().unwrap();
-	assert_eq!(invocation.argv.as_ref(), [Str::new("one"), Str::new("two")]);
-	assert_eq!(invocation.raw, "one two");
-
-	let replacement = VerifiedUiRoster {
-		generation: 12,
-		extension:  sf!("fixture"),
-		commands:   vec![command("inspect", "inspect", "fixture.commands.inspect")]
-			.into_boxed_slice(),
-		shortcuts:  vec![shortcut("refresh", "f5", "refresh")].into_boxed_slice(),
+		.expect("dispatch spawned Python command");
+	let CommandResult::Prompt(result) = result else {
+		panic!("spawned command returned no prompt");
 	};
-	host_roster
-		.install(host, &replacement)
-		.expect("replacement roster");
-	assert!(host_roster.command("review").is_none());
-	assert_eq!(host_roster.command("inspect").unwrap().owner.generation, 12);
-	let shortcuts = ExtensionShortcutRoster::install(
-		&replacement.shortcuts,
-		12,
-		&ResolvedKeybindings::default(),
-		KeyPlatform::Unix,
-	)
-	.expect("replacement shortcuts");
+	assert_eq!(result.text, "1:i:one|two words:one \"two words\"");
+	let (shortcut, identity, dispatcher) = roster
+		.shortcut("ctrl+alt+k")
+		.expect("fixture shortcut route");
 	assert!(
-		shortcuts
-			.match_chord("ctrl+alt+h", "open")
-			.unwrap()
-			.is_none()
+		ControlPresentationCallbackDispatcher::new(identity, dispatcher)
+			.dispatch_shortcut(&shortcut, session.clone(), sf!("ctrl+alt+k"), sf!("idle"))
+			.await,
+		"spawned Python shortcut failed open",
 	);
-	assert_eq!(
-		shortcuts
-			.match_chord("f5", "open")
-			.unwrap()
-			.unwrap()
-			.generation,
-		12
+
+	let reload = environment.extension_reload_handle();
+	reload
+		.reload()
+		.await
+		.expect("reload spawned Python fixture");
+	roster
+		.replace(reload.registry_evidences(), Arc::clone(&callbacks))
+		.expect("atomically replace UI roster");
+	assert!(matches!(
+		invalidations.recv().expect("reload command invalidation"),
+		HeadlessLifecycleKind::CommandRosterInvalidated
+	));
+	assert!(
+		old_handler
+			.call(invocation(), CommandProvenance {
+				source:     sf!("old"),
+				label:      sf!("old"),
+				kind:       CommandSourceKind::Extension,
+				generation: 1,
+			})
+			.await
+			.is_err(),
+		"old callback generation remained reachable after reload",
 	);
+	let (new_handler, provenance) = command_handler(&roster, &session);
+	let result = new_handler
+		.call(invocation(), provenance)
+		.await
+		.expect("dispatch replacement Python command");
+	let CommandResult::Prompt(result) = result else {
+		panic!("replacement command returned no prompt");
+	};
+	assert_eq!(result.text, "2:i:one|two words:one \"two words\"");
 }

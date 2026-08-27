@@ -96,6 +96,7 @@ fn factories(generation: &'static str) -> SessionControlFactories {
 		direct_filesystem: factory("omp.direct_filesystem.request", generation),
 		credentials:       factory("omp.creds.list", generation),
 		prompts:           factory("omp.prompts.invalidate", generation),
+		sessions:          factory("omp.sessions.create", generation),
 		ui:                factory("omp.ui.presentation", generation),
 		telemetry:         factory("omp.telemetry.query", generation),
 		jobs:              factory("omp.jobs.register", generation),

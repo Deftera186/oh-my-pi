@@ -14,7 +14,6 @@ use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{
 	AgentEvent, AgentRunSummary, EventSubscription, InProcTurnClient, PlanState, RunSettlement,
 };
-use omp_catalog::snapshot;
 use omp_core::{Hash32, Str};
 use omp_driver::{
 	discovery::roles,
@@ -94,7 +93,9 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 		.into_diagnostic()?
 		.get()
 		.resolve_path_scopes(&cwd, &home);
-	let catalog = snapshot::Catalog::try_embedded().map_err(|error| miette!(error))?;
+	let catalog_owner =
+		omp_driver::registry::production_catalog(&data_dir).map_err(|error| miette!(error))?;
+	let catalog = catalog_owner.as_ref();
 	let roles = roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
@@ -207,7 +208,7 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 			lsp_enabled:        !args.no_lsp,
 			auto_thinking:      None,
 			native_discovery:   omp_driver::discovery::native::NativeDiscoveryOptions {
-				explicit_roots:    if matches!(
+				explicit_roots:     if matches!(
 					args.extension_launch.mode,
 					crate::cli::InvocationExtensionMode::Disabled
 				) {
@@ -215,7 +216,7 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 				} else {
 					args.extension_launch.native_roots.clone()
 				},
-				root_mode:         match args.extension_launch.mode {
+				root_mode:          match args.extension_launch.mode {
 					crate::cli::InvocationExtensionMode::Merge => {
 						omp_driver::discovery::native::NativeRootMode::Merge
 					},
@@ -224,17 +225,18 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 						omp_driver::discovery::native::NativeRootMode::ExplicitOnly
 					},
 				},
-				skill_settings:    settings_snapshot
+				skill_settings:     settings_snapshot
 					.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
 					.into_diagnostic()?
 					.get()
 					.clone(),
-				include_workspace: !args.extension_launch.no_workspace
+				include_workspace:  !args.extension_launch.no_workspace
 					&& !matches!(
 						args.extension_launch.mode,
 						crate::cli::InvocationExtensionMode::Disabled
 					),
-				client_installed:  Some(data_dir.join("ext/installed.toml")),
+				client_installed:   Some(data_dir.join("ext/installed.toml")),
+				workspace_identity: None,
 			},
 			extension_specs:    Arc::from(args.extension_launch.trusted.clone()),
 			contributed_values: Arc::from(args.extension_launch.contributed.clone()),

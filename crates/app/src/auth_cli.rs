@@ -61,11 +61,12 @@ pub async fn run(database: PathBuf, command: AuthCommand) -> miette::Result<()> 
 		},
 	};
 	let meta = CallMeta {
-		id:       RequestId::from("omp-auth-cli"),
-		target:   Target::ProviderService(provider),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from("omp-auth-cli"),
+		target:         Target::ProviderService(provider),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let planner = router::Router::new(registry.clone(), time::Duration::from_secs(30));
 	let mut client = Client::new(registry.service(), planner, meta);

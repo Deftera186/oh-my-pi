@@ -5,6 +5,7 @@ pub mod config;
 use std::collections::BTreeMap;
 
 use omp_core::Str;
+use omp_envd::exthost::{UiCallbackOwner, UiShortcutRosterEntry};
 use omp_proto::ui::v1::ShortcutDecl;
 
 /// Static extension shortcut metadata matched locally before CONTROL dispatch.
@@ -20,6 +21,8 @@ pub struct ExtensionShortcutBinding {
 	pub generation:     u64,
 	/// Optional phase filter.
 	pub when:           Box<[Str]>,
+	/// Exact callback owner when installed from a sealed production roster.
+	pub owner:          Option<UiCallbackOwner>,
 }
 
 /// Immutable extension shortcut table. Core bindings are never shadowed.
@@ -77,12 +80,39 @@ impl ExtensionShortcutRoster {
 				declaration_id: Str::from(declaration.declaration_id.as_str()),
 				generation,
 				when: declaration.when.iter().map(Str::from).collect(),
+				owner: None,
 			};
 			if bindings.insert(chord.clone(), binding).is_some() {
 				return Err(ExtensionShortcutError::Duplicate { chord });
 			}
 		}
 		Ok(Self { bindings })
+	}
+
+	/// Builds one atomic exact-generation roster from app-published entries.
+	pub fn install_verified(
+		entries: &[UiShortcutRosterEntry],
+		core: &config::ResolvedKeybindings,
+		platform: KeyPlatform,
+	) -> Result<Self, ExtensionShortcutError> {
+		let declarations = entries
+			.iter()
+			.map(|entry| entry.declaration.clone())
+			.collect::<Vec<_>>();
+		let generation = entries.first().map_or(0, |entry| entry.owner.generation);
+		let mut roster = Self::install(&declarations, generation, core, platform)?;
+		for entry in entries {
+			let chord = config::normalize_chord(entry.declaration.chord.as_str())?;
+			if let Some(binding) = roster.bindings.get_mut(chord.as_str()) {
+				binding.owner = Some(entry.owner.clone());
+			}
+		}
+		Ok(roster)
+	}
+
+	/// Matches one keystroke locally and applies its static phase filter.
+	pub fn bindings(&self) -> impl Iterator<Item = &ExtensionShortcutBinding> {
+		self.bindings.values()
 	}
 
 	/// Matches one keystroke locally and applies its static phase filter.

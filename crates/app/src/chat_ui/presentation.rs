@@ -11,27 +11,46 @@ use std::{
 	future::Future,
 	mem,
 	pin::Pin,
-	sync::{Arc, Weak},
-	time::{self, Instant},
+	sync::{
+		Arc, Weak,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{self, Duration, Instant},
 };
 
 use async_trait::async_trait;
 use flume::Receiver;
 use omp_core::{Str, sf};
-use omp_envd::exthost::{
-	CallbackConcurrency,
-	control::{ControlConnectionIdentity, ControlDispatch, ControlInvocationAuthority},
-	dispatch::CallbackDispatcher,
+use omp_envd::{
+	exthost::{
+		CallbackConcurrency, UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry, UiRoster,
+		UiRosterConflict, UiShortcutRosterEntry, VerifiedMarkdownTransformer,
+		control::{ControlConnectionIdentity, ControlDispatch, ControlInvocationAuthority},
+		dispatch::CallbackDispatcher,
+		lifecycle::HeadlessLifecycleKind,
+	},
+	worker::{HostKey, SealedRegistryEvidence},
+};
+use omp_proto::ui::v1::{
+	CommandDispatchResult, CommandInvoked, ShortcutInvoked, UiDispatch, UiDispatchResult,
+	command_dispatch_result, ui_dispatch, ui_dispatch_result,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use super::presentation_authority::{
-	COMPLETION_CALLBACK_DEADLINE, PresentationAuthorityError, PresentationCallback,
-	PresentationCallbackDispatcher, PresentationCallbackKind, PresentationClient,
-	PresentationEffect, PresentationIdentity, PresentationRequest, PresentationResponse,
-	RENDER_CALLBACK_DEADLINE,
+use super::{
+	commands::{
+		CommandDeclaration, CommandGeneration, CommandProvenance, CommandResult, CommandSourceKind,
+		CommandSurface, ConsumedResult, ExtensionCommandHandler, ExtensionCommandInvocation,
+		PromptResult,
+	},
+	presentation_authority::{
+		COMPLETION_CALLBACK_DEADLINE, PresentationAuthorityError, PresentationCallback,
+		PresentationCallbackDispatcher, PresentationCallbackKind, PresentationClient,
+		PresentationEffect, PresentationIdentity, PresentationRequest, PresentationResponse,
+		RENDER_CALLBACK_DEADLINE,
+	},
 };
 
 /// One data-only operation delivered to the attached presentation surface.
@@ -46,6 +65,8 @@ pub enum PresentationOperation {
 	},
 	/// Resolve a correlated UI request.
 	Request(PresentationRequest),
+	/// Switch the attached interactive owner to an already-durable session.
+	SessionTransition(Str),
 }
 
 /// A generation-fenced operation received by the real UI actor.
@@ -150,6 +171,19 @@ impl PresentationBridge {
 			.map_err(|_| PresentationAuthorityError::Unavailable)?;
 		guard.disarm();
 		result
+	}
+
+	/// Requests one post-durability switch from the attached interactive owner.
+	pub async fn transition(&self, session: Str) -> Result<(), PresentationAuthorityError> {
+		match self
+			.dispatch(PresentationOperation::SessionTransition(session))
+			.await?
+		{
+			PresentationResponse::Ack => Ok(()),
+			_ => Err(PresentationAuthorityError::Owner(Str::new_static(
+				"presentation surface returned a non-ack session transition",
+			))),
+		}
 	}
 }
 
@@ -431,6 +465,288 @@ impl PresentationCallbackDispatcher for PresentationCallbackRegistry {
 		handler.call(callback.arguments).await
 	}
 }
+struct PublishedUiState {
+	roster:            UiRoster,
+	routes:            BTreeMap<HostKey, PublishedUiRoute>,
+	markdown:          BTreeMap<HostKey, Box<[VerifiedMarkdownTransformer]>>,
+	markdown_revision: u64,
+	markdown_cache:    BTreeMap<(u64, Str, u64), Str>,
+	subscribers:       Vec<flume::Sender<HeadlessLifecycleKind>>,
+}
+
+struct PublishedUiRoute {
+	identity:   Arc<ControlConnectionIdentity>,
+	dispatcher: Arc<dyn CallbackDispatcher>,
+}
+
+/// App-owned, atomically replaced projection of manifest-verified extension
+/// command and shortcut declarations.
+pub struct PublishedUiRoster {
+	state: Mutex<PublishedUiState>,
+}
+
+impl Default for PublishedUiRoster {
+	fn default() -> Self {
+		Self {
+			state: Mutex::new(PublishedUiState {
+				roster:            UiRoster::default(),
+				routes:            BTreeMap::new(),
+				markdown:          BTreeMap::new(),
+				markdown_revision: 0,
+				markdown_cache:    BTreeMap::new(),
+				subscribers:       Vec::new(),
+			}),
+		}
+	}
+}
+
+impl PublishedUiRoster {
+	/// Returns whether any live verified generation declares a markdown
+	/// transformer.
+	pub fn has_markdown_transformers(&self) -> bool {
+		self
+			.state
+			.lock()
+			.markdown
+			.values()
+			.any(|declarations| !declarations.is_empty())
+	}
+
+	/// Atomically replaces the entire app-owned roster after startup or reload.
+	pub fn replace(
+		&self,
+		evidence: impl IntoIterator<Item = Arc<SealedRegistryEvidence>>,
+		dispatcher: Arc<dyn CallbackDispatcher>,
+	) -> Result<(), UiRosterConflict> {
+		let mut roster = UiRoster::default();
+		let mut routes = BTreeMap::new();
+		let mut markdown = BTreeMap::new();
+		for evidence in evidence {
+			let host = HostKey::new(
+				evidence.identity.layer.clone(),
+				evidence.identity.tier.clone(),
+				evidence.identity.extension.clone(),
+			);
+			roster.install(host.clone(), &evidence.ui)?;
+			markdown.insert(host.clone(), evidence.ui.markdown_transformers.clone());
+			routes.insert(host, PublishedUiRoute {
+				identity:   Arc::clone(&evidence.identity),
+				dispatcher: Arc::clone(&dispatcher),
+			});
+		}
+		let mut state = self.state.lock();
+		state.roster = roster;
+		state.routes = routes;
+		state.markdown = markdown;
+		state.markdown_revision = state.markdown_revision.wrapping_add(1);
+		state.markdown_cache.clear();
+		publish_command_invalidation(&mut state);
+		Ok(())
+	}
+
+	/// Installs one exact sealed generation and invalidates every attached
+	/// command surface after the atomic replacement succeeds.
+	pub fn install(
+		&self,
+		host: HostKey,
+		evidence: &SealedRegistryEvidence,
+		dispatcher: Arc<dyn CallbackDispatcher>,
+	) -> Result<(), UiRosterConflict> {
+		let mut state = self.state.lock();
+		state.roster.install(host.clone(), &evidence.ui)?;
+		state
+			.markdown
+			.insert(host.clone(), evidence.ui.markdown_transformers.clone());
+		state
+			.routes
+			.insert(host, PublishedUiRoute { identity: Arc::clone(&evidence.identity), dispatcher });
+		state.markdown_revision = state.markdown_revision.wrapping_add(1);
+		state.markdown_cache.clear();
+		publish_command_invalidation(&mut state);
+		Ok(())
+	}
+
+	/// Removes every callback owned by one host during reload or teardown and
+	/// invalidates attached command surfaces.
+	pub fn remove(&self, host: &HostKey) {
+		let mut state = self.state.lock();
+		state.roster.remove(host);
+		state.routes.remove(host);
+		state.markdown.remove(host);
+		state.markdown_revision = state.markdown_revision.wrapping_add(1);
+		state.markdown_cache.clear();
+		publish_command_invalidation(&mut state);
+	}
+
+	/// Subscribes to roster replacement using the shared lifecycle vocabulary.
+	pub fn subscribe(&self) -> Receiver<HeadlessLifecycleKind> {
+		let (sender, receiver) = flume::unbounded();
+		self.state.lock().subscribers.push(sender);
+		receiver
+	}
+
+	/// Projects the current exact-generation slash declarations into the live
+	/// structural command registry.
+	pub fn command_generations(&self, session: &Str) -> Vec<CommandGeneration> {
+		let state = self.state.lock();
+		let mut declarations = BTreeMap::<HostKey, Vec<CommandDeclaration>>::new();
+		for entry in state.roster.commands() {
+			let Some(route) = state.routes.get(&entry.owner.host) else {
+				continue;
+			};
+			let provenance = CommandProvenance {
+				source:     sf!(
+					"extension:{}:{}",
+					entry.owner.host.extension(),
+					entry.owner.generation
+				),
+				label:      Str::from(entry.owner.host.extension().as_str()),
+				kind:       CommandSourceKind::Extension,
+				generation: entry.owner.generation,
+			};
+			let callback = ControlPresentationCallbackDispatcher::new(
+				Arc::clone(&route.identity),
+				Arc::clone(&route.dispatcher),
+			);
+			declarations
+				.entry(entry.owner.host.clone())
+				.or_default()
+				.push(CommandDeclaration::verified_extension(
+					&entry.declaration,
+					provenance,
+					callback.command_handler(entry.clone(), session.clone()),
+				));
+		}
+		declarations
+			.into_iter()
+			.map(|(host, declarations)| CommandGeneration {
+				provenance:   CommandProvenance {
+					source:     sf!("extension:{}", host.extension()),
+					label:      Str::from(host.extension().as_str()),
+					kind:       CommandSourceKind::Extension,
+					generation: declarations
+						.first()
+						.map_or(0, |declaration| declaration.provenance.generation),
+				},
+				declarations: declarations.into(),
+			})
+			.collect()
+	}
+
+	/// Folds one settled markdown revision through every verified transformer.
+	///
+	/// Results are cached by roster generation, item identity, and item
+	/// revision, so retained rendering never re-enters Python.
+	pub async fn transform_markdown(
+		&self,
+		item: Str,
+		item_revision: u64,
+		markdown: Str,
+		session: Str,
+	) -> Str {
+		let (roster_revision, transforms) = {
+			let state = self.state.lock();
+			let key = (state.markdown_revision, item.clone(), item_revision);
+			if let Some(cached) = state.markdown_cache.get(&key) {
+				return cached.clone();
+			}
+			let transforms = state
+				.markdown
+				.iter()
+				.flat_map(|(host, declarations)| {
+					let route = state.routes.get(host);
+					declarations.iter().filter_map(move |declaration| {
+						route.map(|route| {
+							(
+								declaration.clone(),
+								Arc::clone(&route.identity),
+								Arc::clone(&route.dispatcher),
+							)
+						})
+					})
+				})
+				.collect::<Vec<_>>();
+			(state.markdown_revision, transforms)
+		};
+		let original = markdown.clone();
+		let mut transformed = markdown;
+		for (declaration, identity, dispatcher) in transforms {
+			let authority = ui_invocation_authority(
+				sf!("markdown:{}:{item_revision}", declaration.declaration_id),
+				omp_core::InvocationPhase::Settled,
+				session.clone(),
+			);
+			let dispatch = ControlDispatch {
+				operation: sf!("omp.ui.markdown_transformer"),
+				arguments: serde_json::Map::from_iter([
+					("name".to_owned(), Value::String(declaration.name.to_string())),
+					("markdown".to_owned(), Value::String(transformed.to_string())),
+				]),
+				authority,
+				policy: CallbackConcurrency::Serialized,
+				deadline: omp_envd::exthost::EventDeadline {
+					at: Instant::now() + RENDER_CALLBACK_DEADLINE,
+				},
+			};
+			match dispatcher.dispatch(identity, dispatch).await {
+				Ok(Value::String(value)) => transformed = Str::new(value),
+				Ok(_) => {
+					tracing::warn!(
+						declaration = %declaration.declaration_id,
+						item = %item,
+						item_revision,
+						"markdown transformer returned a non-string; original markdown retained"
+					);
+					transformed = original.clone();
+					break;
+				},
+				Err(error) => {
+					tracing::warn!(
+						declaration = %declaration.declaration_id,
+						item = %item,
+						item_revision,
+						%error,
+						"markdown transformer failed; original markdown retained"
+					);
+					transformed = original.clone();
+					break;
+				},
+			}
+		}
+		let mut state = self.state.lock();
+		if state.markdown_revision == roster_revision {
+			state
+				.markdown_cache
+				.insert((roster_revision, item, item_revision), transformed.clone());
+		}
+		transformed
+	}
+
+	/// Resolves one normalized shortcut to its exact callback route.
+	pub fn shortcuts(&self) -> Vec<UiShortcutRosterEntry> {
+		self.state.lock().roster.shortcuts().cloned().collect()
+	}
+
+	/// Resolves one normalized shortcut to its exact callback route.
+	pub fn shortcut(
+		&self,
+		chord: &str,
+	) -> Option<(UiShortcutRosterEntry, Arc<ControlConnectionIdentity>, Arc<dyn CallbackDispatcher>)>
+	{
+		let state = self.state.lock();
+		let entry = state.roster.shortcut(chord)?.clone();
+		let route = state.routes.get(&entry.owner.host)?;
+		Some((entry, Arc::clone(&route.identity), Arc::clone(&route.dispatcher)))
+	}
+}
+
+fn publish_command_invalidation(state: &mut PublishedUiState) {
+	state.subscribers.retain(|subscriber| {
+		subscriber
+			.send(HeadlessLifecycleKind::CommandRosterInvalidated)
+			.is_ok()
+	});
+}
 
 /// CONTROL-backed dispatcher which forwards callbacks to the exact live
 /// extension worker.
@@ -447,6 +763,166 @@ impl ControlPresentationCallbackDispatcher {
 		dispatcher: Arc<dyn CallbackDispatcher>,
 	) -> Self {
 		Self { target, dispatcher }
+	}
+
+	/// Builds a slash-command handler bound to one manifest-verified roster
+	/// entry and the exact live worker generation.
+	pub fn command_handler(
+		&self,
+		entry: UiCommandRosterEntry,
+		session: Str,
+	) -> Arc<dyn ExtensionCommandHandler> {
+		Arc::new(ControlExtensionCommandHandler {
+			target: Arc::clone(&self.target),
+			dispatcher: Arc::clone(&self.dispatcher),
+			owner: entry.owner,
+			session,
+			next_id: AtomicU64::new(1),
+		})
+	}
+
+	/// Dispatches one locally matched shortcut. Callback failures are dropped
+	/// after the chord has already been consumed.
+	pub async fn dispatch_shortcut(
+		&self,
+		entry: &UiShortcutRosterEntry,
+		session: Str,
+		chord: Str,
+		phase: Str,
+	) -> bool {
+		let authority = ui_invocation_authority(
+			sf!("ui-shortcut:{}:{}", entry.owner.declaration_id, entry.owner.generation),
+			omp_core::InvocationPhase::Open,
+			session,
+		);
+		let dispatch = UiCallbackDispatch {
+			owner:    entry.owner.clone(),
+			dispatch: UiDispatch {
+				kind:           Some(ui_dispatch::Kind::Shortcut(ShortcutInvoked {
+					action_id: entry.declaration.action_id.clone(),
+					chord:     chord.to_string(),
+					phase:     phase.to_string(),
+				})),
+				generation:     entry.owner.generation,
+				declaration_id: entry.owner.declaration_id.to_string(),
+				props:          None,
+			},
+		};
+		self
+			.dispatcher
+			.dispatch_ui(Arc::clone(&self.target), authority, dispatch, Duration::from_secs(30))
+			.await
+			.ok()
+			.and_then(|result| result.result)
+			.is_some_and(|result| matches!(result, ui_dispatch_result::Result::Shortcut(_)))
+	}
+}
+struct ControlExtensionCommandHandler {
+	target:     Arc<ControlConnectionIdentity>,
+	dispatcher: Arc<dyn CallbackDispatcher>,
+	owner:      UiCallbackOwner,
+	session:    Str,
+	next_id:    AtomicU64,
+}
+
+impl ExtensionCommandHandler for ControlExtensionCommandHandler {
+	fn call(
+		&self,
+		invocation: ExtensionCommandInvocation,
+		provenance: CommandProvenance,
+	) -> super::commands::ExtensionCommandFuture {
+		let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+		let target = Arc::clone(&self.target);
+		let dispatcher = Arc::clone(&self.dispatcher);
+		let owner = self.owner.clone();
+		let session = self.session.clone();
+		Box::pin(async move {
+			let authority = ui_invocation_authority(
+				sf!("ui-command:{}:{id}", owner.declaration_id),
+				omp_core::InvocationPhase::EffectsAuthorized,
+				session,
+			);
+			let dispatch = UiCallbackDispatch {
+				dispatch: UiDispatch {
+					kind:           Some(ui_dispatch::Kind::Command(CommandInvoked {
+						name: invocation.name.to_string(),
+						argv: invocation.argv.iter().map(ToString::to_string).collect(),
+						raw:  invocation.raw.to_string(),
+						mode: command_surface_name(invocation.surface).to_owned(),
+					})),
+					generation:     owner.generation,
+					declaration_id: owner.declaration_id.to_string(),
+					props:          None,
+				},
+				owner,
+			};
+			let result = dispatcher
+				.dispatch_ui(target, authority, dispatch, Duration::from_secs(30))
+				.await
+				.map_err(|error| miette::miette!("{error}"))?;
+			command_result(result, provenance)
+		})
+	}
+}
+fn command_result(
+	result: UiDispatchResult,
+	provenance: CommandProvenance,
+) -> miette::Result<CommandResult> {
+	match result.result {
+		Some(ui_dispatch_result::Result::Command(CommandDispatchResult {
+			outcome: Some(command_dispatch_result::Outcome::Prompt(text)),
+			..
+		})) => Ok(CommandResult::Prompt(PromptResult { text: Str::new(text), provenance })),
+		Some(ui_dispatch_result::Result::Command(CommandDispatchResult {
+			outcome: Some(command_dispatch_result::Outcome::Consumed(tml)),
+			..
+		})) => Ok(CommandResult::Consumed(ConsumedResult {
+			status:        (!tml.source.is_empty())
+				.then(|| Str::from(String::from_utf8_lossy(&tml.source).as_ref())),
+			agent_invoked: false,
+		})),
+		Some(ui_dispatch_result::Result::Command(_)) => {
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		},
+		Some(ui_dispatch_result::Result::Error(error)) => {
+			Err(miette::miette!("extension command failed: {}", error.message))
+		},
+		_ => Err(miette::miette!("extension command returned an incompatible UI result")),
+	}
+}
+
+fn ui_invocation_authority(
+	invocation: Str,
+	phase: omp_core::InvocationPhase,
+	session: Str,
+) -> ControlInvocationAuthority {
+	ControlInvocationAuthority {
+		invocation,
+		phase,
+		session,
+		turn: None,
+		event: None,
+		call: None,
+		device: None,
+		effects: Box::new([]),
+		place_kind: sf!("host"),
+		lifecycle: omp_core::LifecyclePhase::Active,
+		roots: Box::new([]),
+		remote: false,
+		has_ui: true,
+		headless: false,
+		settings: serde_json::Map::new(),
+		secret_settings: Box::new([]),
+		data: None,
+		direct_filesystem: None,
+	}
+}
+
+const fn command_surface_name(surface: CommandSurface) -> &'static str {
+	match surface {
+		CommandSurface::Tui => "interactive",
+		CommandSurface::Acp => "acp",
+		CommandSurface::Text => "text",
 	}
 }
 
@@ -465,6 +941,13 @@ impl PresentationCallbackDispatcher for ControlPresentationCallbackDispatcher {
 			|| self.target.session_generation != identity.session_generation
 		{
 			return Err(PresentationAuthorityError::Identity);
+		}
+		if callback.kind == PresentationCallbackKind::Action
+			&& matches!(callback.operation.as_str(), "omp.ui.command" | "omp.ui.shortcut")
+		{
+			return Err(PresentationAuthorityError::Owner(Str::new_static(
+				"commands and shortcuts require the typed UI callback route",
+			)));
 		}
 		let arguments = match callback.arguments {
 			Value::Object(arguments) => arguments,
@@ -563,6 +1046,103 @@ mod tests {
 			data:              None,
 			direct_filesystem: None,
 		}
+	}
+
+	struct MarkdownDispatcher {
+		calls: Arc<AtomicUsize>,
+		fail:  bool,
+	}
+
+	#[async_trait]
+	impl CallbackDispatcher for MarkdownDispatcher {
+		async fn dispatch(
+			&self,
+			_target: Arc<ControlConnectionIdentity>,
+			dispatch: ControlDispatch,
+		) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+			self.calls.fetch_add(1, Ordering::Relaxed);
+			if self.fail {
+				return Err(omp_envd::exthost::control::ControlProtocolError::new(
+					"TransformerFailed",
+					"transformer raised",
+				));
+			}
+			let markdown = dispatch
+				.arguments
+				.get("markdown")
+				.and_then(Value::as_str)
+				.unwrap_or_default();
+			Ok(Value::String(format!("{markdown}!")))
+		}
+	}
+
+	fn control_identity() -> Arc<ControlConnectionIdentity> {
+		Arc::new(ControlConnectionIdentity {
+			extension:          sf!("ui"),
+			principal:          omp_envd::exthost::Principal::new(sf!("principal"), sf!("Principal")),
+			artifact_digest:    sf!("digest"),
+			layer:              sf!("workspace"),
+			tier:               sf!("trusted"),
+			trust:              sf!("trusted"),
+			host_generation:    1,
+			session_generation: 1,
+			capabilities:       Arc::new(BTreeSet::new()),
+		})
+	}
+
+	fn markdown_roster(dispatcher: Arc<dyn CallbackDispatcher>) -> PublishedUiRoster {
+		let roster = PublishedUiRoster::default();
+		let host = HostKey::new(sf!("workspace"), sf!("trusted"), sf!("ui"));
+		let mut state = roster.state.lock();
+		state.markdown_revision = 1;
+		state.markdown.insert(
+			host.clone(),
+			vec![VerifiedMarkdownTransformer {
+				declaration_id: sf!("markdown"),
+				name:           sf!("math"),
+				callback:       sf!("fixture:transform"),
+				module:         sf!("fixture"),
+			}]
+			.into_boxed_slice(),
+		);
+		state
+			.routes
+			.insert(host, PublishedUiRoute { identity: control_identity(), dispatcher });
+		drop(state);
+		roster
+	}
+
+	#[tokio::test]
+	async fn markdown_transformer_caches_each_revision_and_fails_open() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let roster =
+			markdown_roster(Arc::new(MarkdownDispatcher { calls: calls.clone(), fail: false }));
+		for _ in 0..2 {
+			assert_eq!(
+				roster
+					.transform_markdown(sf!("item"), 1, sf!("math"), sf!("session"))
+					.await
+					.as_str(),
+				"math!"
+			);
+		}
+		assert_eq!(calls.load(Ordering::Relaxed), 1);
+		let _ = roster
+			.transform_markdown(sf!("item"), 2, sf!("math"), sf!("session"))
+			.await;
+		assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+		let failing = markdown_roster(Arc::new(MarkdownDispatcher {
+			calls: Arc::new(AtomicUsize::new(0)),
+			fail:  true,
+		}));
+		assert_eq!(
+			failing
+				.transform_markdown(sf!("item"), 1, sf!("original"), sf!("session"))
+				.await
+				.as_str(),
+			"original"
+		);
 	}
 
 	#[tokio::test]

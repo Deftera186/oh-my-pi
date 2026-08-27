@@ -328,11 +328,12 @@ async fn sample(
 ) -> miette::Result<Sample> {
 	let planner = router::Router::new(registry.clone(), Duration::from_secs(30));
 	let meta = CallMeta {
-		id:       RequestId::from(format!("omp-bench-{run}")),
-		target:   Target::Model(model),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from(format!("omp-bench-{run}")),
+		target:         Target::Model(model),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let mut request = cli::chat_request(challenge.prompt);
 	request.max_output_tokens = Some(challenge.max_tokens);

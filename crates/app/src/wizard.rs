@@ -582,11 +582,12 @@ async fn has_active_account(registry: &InferenceRegistry) -> miette::Result<bool
 		.ok_or_else(|| miette!("embedded catalog has no providers"))?;
 	let planner = Router::new(registry.clone(), Duration::from_secs(30));
 	let meta = CallMeta {
-		id:       RequestId::from(format!("wizard-auth-{}", omp_core::Ulid::generate())),
-		target:   Target::ProviderService(provider),
-		deadline: None,
-		budget:   ExecutionBudget::default(),
-		session:  None,
+		id:             RequestId::from(format!("wizard-auth-{}", omp_core::Ulid::generate())),
+		target:         Target::ProviderService(provider),
+		deadline:       None,
+		budget:         ExecutionBudget::default(),
+		session:        None,
+		response_hooks: Default::default(),
 	};
 	let mut client = Client::new(registry.service(), planner, meta);
 	let answer = client
