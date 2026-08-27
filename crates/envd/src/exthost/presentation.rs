@@ -28,6 +28,28 @@ pub enum UiControlRequest {
 	},
 	/// Current composer text.
 	EditorText,
+	/// Installed theme names.
+	Themes,
+	/// Switch the session's live theme, optionally through normal settings
+	/// persistence.
+	SetAppearance {
+		/// Installed theme name.
+		theme:   Str,
+		/// Whether to persist through the settings owner.
+		persist: bool,
+	},
+	/// Current transcript tool-card disclosure state.
+	ToolsExpanded,
+	/// Set every transcript tool card's disclosure state.
+	SetToolsExpanded {
+		/// Desired expansion state.
+		expanded: bool,
+	},
+	/// Set the placeholder shown for hidden reasoning.
+	SetHiddenThinkingLabel {
+		/// Replacement label, or `None` to clear it.
+		label: Option<Str>,
+	},
 	/// Total dialog request.
 	Dialog {
 		/// Dialog operation name decoded from the extension's CONTROL request.
@@ -118,6 +140,11 @@ impl ControlAuthority for UiControlAuthority {
 			"omp.ui.presentation"
 				| "omp.ui.icons"
 				| "omp.ui.editor_text"
+				| "omp.ui.themes"
+				| "omp.ui.set_appearance"
+				| "omp.ui.tools_expanded"
+				| "omp.ui.set_tools_expanded"
+				| "omp.ui.set_hidden_thinking_label"
 				| "omp.ui.confirm"
 				| "omp.ui.select"
 				| "omp.ui.multi_select"
@@ -141,6 +168,12 @@ impl ControlAuthority for UiControlAuthority {
 		_arguments: &Map<String, Value>,
 	) -> Result<(), ControlProtocolError> {
 		authorize_identity(&self.identity, context)?;
+		if matches!(
+			operation,
+			"omp.ui.set_appearance" | "omp.ui.set_tools_expanded" | "omp.ui.set_hidden_thinking_label"
+		) {
+			authorize_interactive_command(context)?;
+		}
 		let (minimum, capability) = match operation {
 			"omp.ui.confirm"
 			| "omp.ui.select"
@@ -183,6 +216,7 @@ impl ControlAuthority for UiControlAuthority {
 		let ControlEffect::Ui(effect) = effect else {
 			return Err(protocol("wrong_domain", "UI authority received a non-UI effect"));
 		};
+		validate_working_indicator(&effect)?;
 		let kind = effect
 			.get("kind")
 			.and_then(Value::as_str)
@@ -455,6 +489,18 @@ fn decode_ui_request(
 			prefix: optional_string(arguments, "prefix")?.unwrap_or_default(),
 		},
 		"omp.ui.editor_text" => UiControlRequest::EditorText,
+		"omp.ui.themes" => UiControlRequest::Themes,
+		"omp.ui.set_appearance" => UiControlRequest::SetAppearance {
+			theme:   required_string(arguments, "theme")?,
+			persist: required_bool(arguments, "persist")?,
+		},
+		"omp.ui.tools_expanded" => UiControlRequest::ToolsExpanded,
+		"omp.ui.set_tools_expanded" => {
+			UiControlRequest::SetToolsExpanded { expanded: required_bool(arguments, "expanded")? }
+		},
+		"omp.ui.set_hidden_thinking_label" => {
+			UiControlRequest::SetHiddenThinkingLabel { label: nullable_string(arguments, "label")? }
+		},
 		"omp.ui.confirm"
 		| "omp.ui.select"
 		| "omp.ui.multi_select"
@@ -586,6 +632,32 @@ fn authorize_invocation(
 	Ok(())
 }
 
+fn authorize_interactive_command(
+	context: &ControlRequestContext,
+) -> Result<(), ControlProtocolError> {
+	let Some(invocation) = context.invocation.as_ref() else {
+		return Err(protocol(
+			"UiMutationDenied",
+			"UI appearance and disclosure mutations require an interactive command",
+		));
+	};
+	if invocation.phase != InvocationPhase::EffectsAuthorized
+		|| !invocation.has_ui
+		|| invocation.headless
+		|| invocation.turn.is_some()
+		|| invocation.event.is_some()
+		|| invocation.call.is_some()
+		|| invocation.device.is_some()
+	{
+		return Err(protocol(
+			"UiMutationDenied",
+			"UI appearance and disclosure mutations are restricted to user-initiated interactive \
+			 commands",
+		));
+	}
+	Ok(())
+}
+
 fn require_capability(
 	context: &ControlRequestContext,
 	capability: &str,
@@ -622,6 +694,23 @@ fn optional_string(
 	}
 }
 
+fn nullable_string(
+	arguments: &mut Map<String, Value>,
+	name: &'static str,
+) -> Result<Option<Str>, ControlProtocolError> {
+	optional_string(arguments, name)
+}
+
+fn required_bool(
+	arguments: &mut Map<String, Value>,
+	name: &'static str,
+) -> Result<bool, ControlProtocolError> {
+	arguments
+		.remove(name)
+		.and_then(|value| value.as_bool())
+		.ok_or_else(|| protocol("invalid_request", format!("{name} must be a boolean")))
+}
+
 fn required_u64(
 	arguments: &mut Map<String, Value>,
 	name: &'static str,
@@ -642,6 +731,46 @@ fn required_object(
 		.ok_or_else(|| protocol("invalid_request", format!("{name} must be an object")))
 }
 
+fn validate_working_indicator(effect: &Value) -> Result<(), ControlProtocolError> {
+	if effect.get("kind").and_then(Value::as_str) != Some("set_working_indicator") {
+		return Ok(());
+	}
+	let body = effect
+		.get("body")
+		.and_then(Value::as_object)
+		.ok_or_else(|| protocol("InvalidWorkingIndicator", "working indicator body is missing"))?;
+	let frames = body
+		.get("frames")
+		.and_then(Value::as_array)
+		.ok_or_else(|| protocol("InvalidWorkingIndicator", "frames must be an array"))?;
+	if frames.is_empty() || frames.len() > 8 {
+		return Err(protocol(
+			"InvalidWorkingIndicator",
+			"working indicator requires between one and eight frames",
+		));
+	}
+	for frame in frames {
+		let frame = frame.as_str().ok_or_else(|| {
+			protocol("InvalidWorkingIndicator", "every working indicator frame must be a string")
+		})?;
+		if xutf::width_str(frame) > 8 {
+			return Err(protocol(
+				"InvalidWorkingIndicator",
+				"working indicator frames must be at most eight display columns",
+			));
+		}
+	}
+	if let Some(interval) = body.get("interval_ms").filter(|value| !value.is_null())
+		&& interval.as_u64().is_none_or(|value| value == 0)
+	{
+		return Err(protocol(
+			"InvalidWorkingIndicator",
+			"working indicator interval_ms must be a positive integer",
+		));
+	}
+	Ok(())
+}
+
 fn telemetry_error(error: TelemetryAuthorityError) -> ControlProtocolError {
 	let code = match &error {
 		TelemetryAuthorityError::Identity => "StaleGeneration",
@@ -656,6 +785,30 @@ fn telemetry_error(error: TelemetryAuthorityError) -> ControlProtocolError {
 
 fn protocol(code: impl Into<Str>, message: impl Into<Str>) -> ControlProtocolError {
 	ControlProtocolError::new(code, message).with_details(json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn indicator(frames: Value, interval_ms: Value) -> Value {
+		json!({
+			"kind": "set_working_indicator",
+			"body": {"frames": frames, "interval_ms": interval_ms},
+		})
+	}
+
+	#[test]
+	fn working_indicator_validates_count_width_and_interval() {
+		assert!(validate_working_indicator(&indicator(json!(["◐", "◓"]), json!(80))).is_ok());
+		for invalid in [
+			indicator(json!([]), json!(80)),
+			indicator(json!(["123456789"]), json!(80)),
+			indicator(json!(["a"]), json!(0)),
+		] {
+			assert!(validate_working_indicator(&invalid).is_err());
+		}
+	}
 }
 
 #[allow(dead_code)]

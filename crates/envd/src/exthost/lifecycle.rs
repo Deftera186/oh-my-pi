@@ -446,13 +446,28 @@ impl DeclarationDrift {
 #[derive(Clone, Debug, Default)]
 pub struct VerifiedUiRoster {
 	/// Exact worker generation that registered the callbacks.
-	pub generation: u64,
+	pub generation:            u64,
 	/// Publisher-scoped extension identity.
-	pub extension:  Str,
+	pub extension:             Str,
 	/// Verified slash-command declarations.
-	pub commands:   Box<[CommandDecl]>,
+	pub commands:              Box<[CommandDecl]>,
 	/// Verified shortcut declarations.
-	pub shortcuts:  Box<[ShortcutDecl]>,
+	pub shortcuts:             Box<[ShortcutDecl]>,
+	/// Verified transcript markdown transformer declarations.
+	pub markdown_transformers: Box<[VerifiedMarkdownTransformer]>,
+}
+
+/// One manifest-verified transcript markdown transformer callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedMarkdownTransformer {
+	/// Stable signed declaration id.
+	pub declaration_id: Str,
+	/// Transformer route name.
+	pub name:           Str,
+	/// Python callable address admitted by the signed manifest.
+	pub callback:       Str,
+	/// Package-contained declaration module.
+	pub module:         Str,
 }
 
 /// Exact reason a worker UI declaration table was rejected before FREEZE.
@@ -1252,7 +1267,8 @@ impl LifecycleMachine {
 	}
 }
 
-/// Exact-validates one typed UI registration against authenticated manifest rows.
+/// Exact-validates one typed UI registration against authenticated manifest
+/// rows.
 pub fn verify_ui_registration(
 	expected: &StaticDeclarations,
 	registration: RegisterUi,
@@ -1266,6 +1282,7 @@ pub fn verify_ui_registration(
 		extension,
 		commands: registration.commands.into_boxed_slice(),
 		shortcuts: registration.shortcuts.into_boxed_slice(),
+		markdown_transformers: Box::new([]),
 	})
 }
 

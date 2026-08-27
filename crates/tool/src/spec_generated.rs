@@ -278,6 +278,22 @@ pub static RUNTIME_SYMBOLS: &[RuntimeSymbolSpec] = &[
 	),
 	symbol!(
 		"docs/py/09-journal.md",
+		"omp.sessions.SessionSetup",
+		"(title=None, parent=None, entries=(), initial_prompt=None)",
+		CallbackAbi::None,
+		OPEN_LOCAL,
+		"omp.SessionSetup(title=\"Handoff\", initial_prompt=\"Continue here\")"
+	),
+	symbol!(
+		"docs/py/09-journal.md",
+		"omp.sessions.create",
+		"(setup=SessionSetup()) -> SessionInfo",
+		CallbackAbi::None,
+		CORE_DURABLE,
+		"await omp.sessions.create(omp.SessionSetup(title=\"Handoff\"))"
+	),
+	symbol!(
+		"docs/py/09-journal.md",
 		"omp.sessions.list",
 		"(filter=None, *, cursor=None, limit=50) -> SessionPage",
 		CallbackAbi::None,

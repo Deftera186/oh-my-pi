@@ -11,8 +11,9 @@ use smallvec::SmallVec;
 
 use crate::{ApprovalSpec, HookDecision, HookPhase};
 
-/// The number of atomic words needed by the stable 1–57 hook catalog.
-const MASK_WORDS: usize = 1;
+/// The number of atomic words needed by the stable hook catalog through ordinal
+/// 127.
+const MASK_WORDS: usize = 2;
 /// A transform phase may make exactly one ordered pass.
 pub const MODIFY_ROUNDS: u8 = 1;
 /// No event may have more than this many observe-only handlers.
@@ -445,18 +446,22 @@ impl HookGate {
 		let mut registered = self.subscriptions.lock();
 		registered.retain(|value| value.host.as_str() != host);
 		registered.extend(subscriptions);
-		let mut mask = 0_u64;
+		let mut mask = [0_u64; MASK_WORDS];
 		for subscription in registered.iter() {
-			mask |= event_bit(subscription.event);
+			let (word, bit) = event_position(subscription.event);
+			mask[word] |= bit;
 		}
-		self.mask[0].store(mask, Ordering::Release);
+		for (word, value) in self.mask.iter().zip(mask) {
+			word.store(value, Ordering::Release);
+		}
 		Ok(())
 	}
 
 	/// Returns whether an event has any subscribed or fail-closed stub bit.
 	#[inline]
 	pub fn subscribed(&self, event: HookEventId) -> bool {
-		self.mask[0].load(Ordering::Relaxed) & event_bit(event) != 0
+		let (word, bit) = event_position(event);
+		self.mask[word].load(Ordering::Relaxed) & bit != 0
 	}
 
 	/// Emits an observation without waiting; a full queue is accounted and
@@ -682,8 +687,9 @@ impl HookGate {
 	}
 }
 
-const fn event_bit(event: HookEventId) -> u64 {
-	1_u64 << event as u32
+const fn event_position(event: HookEventId) -> (usize, u64) {
+	let ordinal = event as usize;
+	(ordinal / 64, 1_u64 << (ordinal % 64))
 }
 
 #[cfg(test)]
@@ -726,10 +732,13 @@ mod tests {
 	fn mask_fast_path_stays_empty_until_subscription() {
 		let (gate, _) = HookGate::channel();
 		assert!(!gate.subscribed(HookEventId::HookEventToolCall));
-		gate
-			.subscribe("test", [subscription(HookPhase::Observe, 1)])
-			.unwrap();
+		assert!(!gate.subscribed(HookEventId::HookEventMcpNotification));
+		let tool = subscription(HookPhase::Observe, 1);
+		let mut mcp = subscription(HookPhase::Observe, 2);
+		mcp.event = HookEventId::HookEventMcpNotification;
+		gate.subscribe("test", [tool, mcp]).unwrap();
 		assert!(gate.subscribed(HookEventId::HookEventToolCall));
+		assert!(gate.subscribed(HookEventId::HookEventMcpNotification));
 	}
 
 	#[tokio::test]

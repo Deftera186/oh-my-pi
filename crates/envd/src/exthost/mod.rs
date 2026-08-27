@@ -39,7 +39,7 @@ pub use lifecycle::{
 	ExtensionManifest, GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost,
 	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegimeDeclarationTable,
 	RegimeManifestError, RegistryAvailabilitySink, RestartReason, ToolDeclarationKey,
-	UiRegistrationError, VerifiedUiRoster, validate_regime_manifests,
+	UiRegistrationError, VerifiedMarkdownTransformer, VerifiedUiRoster, validate_regime_manifests,
 	verify_ui_registration,
 };
 pub use params::{

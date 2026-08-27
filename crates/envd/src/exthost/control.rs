@@ -259,7 +259,9 @@ use omp_agent::{
 	JournalRequestStamp, PendingCustomEntry,
 	control::{ControlError as AgentControlError, ControlSender},
 };
-use omp_core::{Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str};
+use omp_core::{
+	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex,
+};
 use omp_ext::config::{ContributedCliValue, ContributedValue};
 use omp_proto::{
 	bounds::{
@@ -267,15 +269,16 @@ use omp_proto::{
 		PULL_PATH_MAX_SEGMENTS,
 	},
 	env::v1::{ArgText, ArgsCommitted, Interrupt},
-	thread::v1::{Part, part},
+	thread::v1::{Blob, Item, Message, Part, Role, item, part},
 	toolhost::{
 		v1,
 		v1::{
 			AdoptArtifact, AppendEntriesAtomic, AppendEntry, ArtifactRow, DeclareEntryKinds,
 			DeclareSecretRules, EntryAppended, JournalHostEnvelope, JournalRow, JournalWorkerEnvelope,
 			ListArtifacts, ListSessions, PinArtifact, PullReply, PullRequest, QueryJournal,
-			QueryUsage, SecretRuleDeclaration, SessionRow, StatArtifact, StateCas, StateGet,
-			StateScope, StateWatch, UsageReport, journal_host_envelope, journal_worker_envelope,
+			QueryUsage, SecretRuleDeclaration, SessionRow, SessionTransitionDenied,
+			SessionTransitionRefusalCode, StatArtifact, StateCas, StateGet, StateScope, StateWatch,
+			UsageReport, journal_host_envelope, journal_worker_envelope,
 		},
 	},
 };
@@ -1225,6 +1228,17 @@ impl JournalControl {
 					request,
 				}))
 			},
+			journal_worker_envelope::Body::CreateSession(_) => {
+				Ok(JournalDispatch::Reply(journal_row_reply(
+					journal_host_envelope::Body::SessionTransitionDenied(SessionTransitionDenied {
+						code:    SessionTransitionRefusalCode::InvalidOrigin as i32,
+						message: String::from(
+							"session creation requires an interactive command CONTROL authority",
+						),
+						details: None,
+					}),
+				)))
+			},
 		}
 	}
 
@@ -1609,6 +1623,261 @@ impl ControlProtocolError {
 		Self::new("StaleGeneration", format!("stale {field}: expected {expected}, got {actual}"))
 			.with_details(json!({"field": field, "expected": expected, "actual": actual}))
 	}
+}
+/// Maximum number of extension-authored entries seeded into one new session.
+pub const MAX_SESSION_SETUP_ENTRIES: usize = 64;
+/// Maximum aggregate canonical entry bytes admitted into one new session.
+pub const MAX_SESSION_SETUP_BYTES: usize = 1024 * 1024;
+/// Maximum visible prompt parts admitted into one new session.
+pub const MAX_SESSION_PROMPT_PARTS: usize = 32;
+/// Maximum aggregate visible prompt text admitted into one new session.
+pub const MAX_SESSION_PROMPT_BYTES: usize = 256 * 1024;
+
+/// Canonical, generation-fenced create/seed/switch request admitted from
+/// Python.
+#[derive(Debug)]
+pub struct CanonicalSessionCreate {
+	/// Optional user title.
+	pub title:              Option<Str>,
+	/// Optional accessible lineage parent.
+	pub parent:             Option<Str>,
+	/// Canonical declared custom entries in requested order.
+	pub entries:            Vec<PendingCustomEntry>,
+	/// Optional visible user item; it is not a turn input.
+	pub initial_prompt:     Option<Item>,
+	/// Stable logical identity shared by retries inside one command invocation.
+	pub idempotency_key:    Str,
+	/// Authenticated extension-host generation.
+	pub host_generation:    u64,
+	/// Authenticated session generation.
+	pub session_generation: u64,
+}
+
+/// Canonically validates a declarative session setup before allocation.
+pub fn canonical_session_create(
+	context: &ControlRequestContext,
+	arguments: &serde_json::Map<String, Value>,
+) -> Result<CanonicalSessionCreate, ControlProtocolError> {
+	let invocation = context.invocation.as_ref().ok_or_else(|| {
+		session_transition_denied(
+			"invalid_origin",
+			"session creation requires an interactive command",
+		)
+	})?;
+	if invocation.phase != InvocationPhase::EffectsAuthorized {
+		return Err(session_transition_denied(
+			"effects_not_authorized",
+			"session creation requires EFFECTS_AUTHORIZED",
+		));
+	}
+	if !invocation.has_ui
+		|| invocation.headless
+		|| invocation.turn.is_some()
+		|| invocation.event.is_some()
+		|| invocation.call.is_some()
+		|| invocation.device.is_some()
+	{
+		return Err(session_transition_denied(
+			"invalid_origin",
+			"session creation is restricted to user-initiated interactive commands",
+		));
+	}
+	let setup = arguments
+		.get("setup")
+		.and_then(Value::as_object)
+		.ok_or_else(|| session_transition_denied("invalid_setup", "setup must be an object"))?;
+	if setup.get("schema").and_then(Value::as_str) != Some("omp.sessions.setup.v1") {
+		return Err(session_transition_denied(
+			"invalid_setup",
+			"setup schema must be omp.sessions.setup.v1",
+		));
+	}
+	let title = bounded_setup_string(setup, "title", 512)?;
+	let parent = bounded_setup_string(setup, "parent", 128)?;
+	let wire_entries = setup
+		.get("entries")
+		.and_then(Value::as_array)
+		.ok_or_else(|| {
+			session_transition_denied("invalid_setup", "setup.entries must be an array")
+		})?;
+	if wire_entries.len() > MAX_SESSION_SETUP_ENTRIES {
+		return Err(session_transition_denied(
+			"quota_exceeded",
+			"session setup entry count exceeds the limit",
+		));
+	}
+	let mut total_bytes = 0_usize;
+	let mut entries = Vec::with_capacity(wire_entries.len());
+	for wire in wire_entries {
+		let entry = wire.as_object().ok_or_else(|| {
+			session_transition_denied("invalid_setup", "every setup entry must be an object")
+		})?;
+		if entry.get("schema").and_then(Value::as_str) != Some("omp.journal.entry.v1") {
+			return Err(session_transition_denied(
+				"invalid_setup",
+				"every setup entry must use omp.journal.entry.v1",
+			));
+		}
+		let data = entry.get("data").and_then(Value::as_str).ok_or_else(|| {
+			session_transition_denied("invalid_setup", "setup entry data must be canonical JSON")
+		})?;
+		total_bytes = total_bytes.saturating_add(data.len());
+		if total_bytes > MAX_SESSION_SETUP_BYTES {
+			return Err(session_transition_denied(
+				"quota_exceeded",
+				"session setup entry bytes exceed the limit",
+			));
+		}
+		let parsed: Value = serde_json::from_str(data)
+			.map_err(|_| session_transition_denied("invalid_setup", "setup entry data is not JSON"))?;
+		if serde_json::to_string(&parsed).ok().as_deref() != Some(data) {
+			return Err(session_transition_denied(
+				"invalid_setup",
+				"setup entry data is not canonical JSON",
+			));
+		}
+		let data = serde_json::from_str::<Box<RawValue>>(data).map_err(|_| {
+			session_transition_denied("invalid_setup", "setup entry data is not canonical JSON")
+		})?;
+		let kind = required_setup_string(entry, "kind")?;
+		let rev = required_setup_string(entry, "rev")?;
+		entries.push(PendingCustomEntry {
+			kind,
+			rev,
+			data: Some(data),
+			context: None,
+			display: entry.get("display").and_then(Value::as_bool),
+		});
+	}
+	let initial_prompt = setup
+		.get("initial_prompt")
+		.filter(|value| !value.is_null())
+		.map(canonical_session_prompt)
+		.transpose()?;
+	let setup_json = serde_json::to_vec(setup)
+		.map_err(|_| session_transition_denied("invalid_setup", "setup cannot be encoded"))?;
+	let setup_digest = Hash32::sum(&setup_json);
+	let idempotency_key = Str::from(format!(
+		"session-create:{}:{}:{}:{}:{}",
+		context.connection.extension,
+		context.connection.host_generation,
+		context.connection.session_generation,
+		invocation.invocation,
+		setup_digest.to_hex()
+	));
+	Ok(CanonicalSessionCreate {
+		title,
+		parent,
+		entries,
+		initial_prompt,
+		idempotency_key,
+		host_generation: context.connection.host_generation,
+		session_generation: context.connection.session_generation,
+	})
+}
+fn bounded_setup_string(
+	object: &serde_json::Map<String, Value>,
+	field: &'static str,
+	limit: usize,
+) -> Result<Option<Str>, ControlProtocolError> {
+	match object.get(field) {
+		None | Some(Value::Null) => Ok(None),
+		Some(Value::String(value)) if !value.trim().is_empty() && value.len() <= limit => {
+			Ok(Some(Str::new(value)))
+		},
+		Some(Value::String(_)) => Err(session_transition_denied(
+			"invalid_setup",
+			format!("setup.{field} must be non-empty and at most {limit} bytes"),
+		)),
+		Some(_) => Err(session_transition_denied(
+			"invalid_setup",
+			format!("setup.{field} must be a string or null"),
+		)),
+	}
+}
+
+fn required_setup_string(
+	object: &serde_json::Map<String, Value>,
+	field: &'static str,
+) -> Result<Str, ControlProtocolError> {
+	object
+		.get(field)
+		.and_then(Value::as_str)
+		.filter(|value| !value.is_empty())
+		.map(Str::new)
+		.ok_or_else(|| {
+			session_transition_denied("invalid_setup", format!("setup entry {field} is required"))
+		})
+}
+
+fn canonical_session_prompt(value: &Value) -> Result<Item, ControlProtocolError> {
+	let values = value.as_array().ok_or_else(|| {
+		session_transition_denied("invalid_setup", "initial_prompt must be an array of parts")
+	})?;
+	if values.is_empty() || values.len() > MAX_SESSION_PROMPT_PARTS {
+		return Err(session_transition_denied(
+			"quota_exceeded",
+			"initial_prompt part count is outside the allowed range",
+		));
+	}
+	let mut bytes = 0_usize;
+	let mut parts = Vec::with_capacity(values.len());
+	for value in values {
+		let part = value.as_object().ok_or_else(|| {
+			session_transition_denied("invalid_setup", "initial_prompt parts must be objects")
+		})?;
+		let kind = match part.get("kind").and_then(Value::as_str) {
+			Some("text") => {
+				let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+					session_transition_denied("invalid_setup", "text prompt part is missing text")
+				})?;
+				bytes = bytes.saturating_add(text.len());
+				part::Kind::Text(text.to_owned())
+			},
+			Some("blob") => {
+				let blob = part.get("blob").and_then(Value::as_object).ok_or_else(|| {
+					session_transition_denied("invalid_setup", "blob prompt part is missing blob")
+				})?;
+				let encoded = blob.get("hash").and_then(Value::as_str).ok_or_else(|| {
+					session_transition_denied("invalid_setup", "blob prompt part is missing hash")
+				})?;
+				let hash = <[u8; 32]>::try_from(hex::decode(encoded.as_bytes())).map_err(|_| {
+					session_transition_denied("invalid_setup", "blob prompt hash is invalid")
+				})?;
+				let size = blob.get("size").and_then(Value::as_u64).ok_or_else(|| {
+					session_transition_denied("invalid_setup", "blob prompt part is missing size")
+				})?;
+				part::Kind::Blob(Blob { hash: hash.to_vec().into(), size, ..Default::default() })
+			},
+			_ => {
+				return Err(session_transition_denied(
+					"invalid_setup",
+					"initial_prompt accepts only visible text and blob parts",
+				));
+			},
+		};
+		if bytes > MAX_SESSION_PROMPT_BYTES {
+			return Err(session_transition_denied(
+				"quota_exceeded",
+				"initial_prompt bytes exceed the limit",
+			));
+		}
+		parts.push(Part { kind: Some(kind) });
+	}
+	Ok(Item {
+		seq:           0,
+		created_at_ms: 0,
+		kind:          Some(item::Kind::Message(Message { role: Role::User as i32, parts })),
+		props:         None,
+	})
+}
+
+fn session_transition_denied(
+	reason: &'static str,
+	message: impl Into<Str>,
+) -> ControlProtocolError {
+	ControlProtocolError::new("SessionTransitionDenied", message)
+		.with_details(json!({"reason": reason}))
 }
 
 /// One authoritative fire-and-forget child observation.

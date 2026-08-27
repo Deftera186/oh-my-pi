@@ -1089,6 +1089,7 @@ Types owned elsewhere and referenced here: `Role`, `StopReason`, `omp.MessageRef
 | `session_rewind` | `SessionRewindEvent` | `HookDecision` | any | SESSION | **DENY** | yes | `Allow` |
 | `session_rewound` | `SessionRewoundEvent` | — | OBSERVE | SESSION | DEFER | yes | — |
 | `session_reset` | `SessionResetEvent` | — | OBSERVE | SESSION | DEFER | yes | — |
+| `session_renamed` | `SessionRenamedEvent` | — | OBSERVE | ASYNC | DEFER | no | — |
 
 `session_rewind` is fail-closed because a rewind with `restore_workspace=True` destroys working
 files; a host that cannot answer must not be read as consent.
@@ -1118,6 +1119,11 @@ class SessionShutdownEvent:
 	session_id: str
 	reason: ShutdownReason
 	budget: Duration
+
+@dataclass(frozen=True, slots=True)
+class SessionRenamedEvent:
+	session: str
+	name: str | None
 
 @dataclass(frozen=True, slots=True)
 class SessionSwitchEvent:
@@ -1212,7 +1218,7 @@ async def flush_index(event: omp.SessionShutdownEvent, ctx: omp.Context) -> None
 | `agent_start` | `AgentStartEvent` | — | OBSERVE | SUBMISSION | DEFER | yes | — |
 | `turn_start` | `TurnStartEvent` | `HookDecision` | any | TURN | DEFER | yes | `Allow` |
 | `turn_end` | `TurnEndEvent` | — | OBSERVE | TURN | DEFER | yes | — |
-| `agent_settled` | `AgentSettledEvent` | `Continue \| Settle` | domain | SUBMISSION | DEFER | yes | `Settle` |
+| `agent_settled` | `AgentSettledEvent` rev 2 | `Continue \| Settle` | domain | SUBMISSION | DEFER | yes | `Settle` |
 | `agent_end` | `AgentEndEvent` | — | OBSERVE | SUBMISSION | DEFER | yes | — |
 | `interrupt` | `InterruptEvent` | — | OBSERVE | TURN | DEFER | no | — |
 | `deadline` | `DeadlineEvent` | — | OBSERVE | TURN | DEFER | no | — |
@@ -1268,6 +1274,12 @@ class TurnEndEvent:
 	items: tuple[ItemRef, ...]
 
 @dataclass(frozen=True, slots=True)
+class TodoRef:
+	phase: str
+	text: str
+	status: Literal["pending", "in_progress"]
+
+@dataclass(frozen=True, slots=True)
 class AgentSettledEvent:
 	submission_id: str
 	reason: SettleReason
@@ -1275,6 +1287,7 @@ class AgentSettledEvent:
 	last_stop: StopReason | None
 	pending_jobs: tuple[str, ...]
 	continuations_used: int
+	incomplete_todos: tuple[TodoRef, ...] = ()
 
 @dataclass(frozen=True, slots=True)
 class AgentEndEvent:
@@ -1368,6 +1381,27 @@ and project-model-pin — required that selection across three review rounds; th
 to model, route, and deadline was ruled wrong.**
 
 `agent_settled` has no mutable payload fields; its outcome is the domain return.
+At `DrainPoint::Idle`, Core snapshots the built-in `todo@1` state into
+`incomplete_todos` in stable phase/item order. Only `pending` and `in_progress` items are
+actionable; completed, abandoned, and blocked items are omitted. The snapshot is read-only.
+An extension can use the existing bounded continuation protocol rather than inject a hidden
+reminder:
+
+```python
+@omp.hook("agent_settled")
+async def continue_unfinished(
+	event: omp.AgentSettledEvent,
+	ctx: omp.Context,
+) -> omp.agents.Continue | omp.agents.Settle:
+	if not event.incomplete_todos:
+		return omp.agents.Settle()
+	body = "\n".join(
+		f"- {todo.phase}: {todo.text}" for todo in event.incomplete_todos
+	)
+	return omp.agents.Continue(
+		prompt=f"Continue or resolve these unfinished tasks:\n{body}"
+	)
+```
 
 ---
 
@@ -1632,7 +1666,7 @@ class UserBashEvent:
 	cwd: EnvPath
 	exclude_from_context: bool
 	bash: BashIR | None
-	env_overrides: Mapping[str, str]
+	env_overrides: Mapping[str, str | None]
 
 @dataclass(frozen=True, slots=True)
 class UserEvalEvent:
@@ -1660,6 +1694,9 @@ class EvalLanguage(enum.StrEnum):
 is shown to the *user*, never to the model. This is the honest form of pi's
 `InputEventResult.handled`, which conflated "I rewrote this" with "I swallowed this"
 (`runner.ts:1580`).
+
+Pi `ToolDefinition.shellEnv(ctx)` migrates to a fail-closed `user_bash/TRANSFORM` returning `omp.Modify(env_overrides={...})`; values are `str | None`, `None` unsets, and later TRANSFORM handlers observe the earlier ordered REPLACE result.
+A device that executes for itself does not trigger `user_bash`; pass the same one-run delta explicitly as `await omp.env.sh.run(script, env=delta)`.
 
 `user_bash` and `user_eval` are fail-closed because they are the seam sandbox extensions attach to —
 `pi-sandbox` intercepts `user_bash` to inject proxy environment variables and a sandbox profile. If
@@ -1714,6 +1751,14 @@ path is additive and safe. `keep` is `INTERSECT`: `None` means "no opinion", and
 a set narrows the result. Every resource location is a typed `EnvPath`, so a remote-workspace
 extension contributes resources from the remote filesystem ([`14-deploy.md`](14-deploy.md)).
 
+For skills, a TRANSFORM handler appends
+`ResourceRef(uri=EnvPath("…/SKILL.md"), kind=ResourceKind.SKILL,
+origin="publisher.extension")`. The host accepts only a regular, at-most-64,000-byte `SKILL.md`
+whose canonical path remains under a root granted to that invocation. It then reads the file into
+the first session snapshot; changing the file does not mutate that snapshot, and reload or a new
+session reruns discovery. Static `@omp.skill` content does not use this hook and does not activate a
+Python child; [`08-context.md`](08-context.md) owns decorator, precedence, and snapshot semantics.
+
 Fail-closed, on the exact reasoning the surveys produced: omitting a resource is safe, adding one is
 not, so a host failure must not be read as "keep everything". pi's `emitResourcesDiscover` is
 fail-open and purely additive (`runner.ts:1522-1563`), which means a read-only-audit extension there
@@ -1723,8 +1768,8 @@ cannot hide a skill that grants write access.
 
 #### G. Provider events
 
-Payloads for the seven provider-scoped events are catalog-typed and defined in
-[`13-inference.md`](13-inference.md); this document owns only their catalog properties. All seven
+Payloads for the provider-scoped decision events are catalog-typed and defined in
+[`13-inference.md`](13-inference.md); this document owns only their catalog properties. All provider events
 accept `provider=` scoping (§3.1).
 
 | Event | Payload | Ret | Ph | Lat | Fail | Re | Def |
@@ -1736,6 +1781,7 @@ accept `provider=` scoping (§3.1).
 | `models_discover` | `13-inference.md` | `Sequence[omp.ModelSpec] \| omp.DiscoveryPage` | domain | SESSION | DEFER | yes | — |
 | `provider_error` | `13-inference.md` | `omp.Failover` | domain | TURN | **DENY** | yes | — |
 | `provider_usage` | `13-inference.md` | `omp.UsageReport \| None` | domain | TURN | DEFER | no | — |
+| `provider_response` | `ProviderResponseEvent` | — | OBSERVE | ASYNC | DEFER | no | — |
 | `capability_budget` | `CapabilityBudgetEvent` | — | OBSERVE | TURN | DEFER | no | — |
 | `model_changed` | `ModelChangedEvent` | — | OBSERVE | TURN | DEFER | yes | — |
 | `credential_disabled` | `CredentialDisabledEvent` | — | OBSERVE | SESSION | DEFER | yes | — |
@@ -1748,6 +1794,14 @@ class CapabilityBudgetEvent:
 	granted: tuple[CapabilityIntent, ...]
 	degraded: tuple[CapabilityIntent, ...]
 	refused: tuple[CapabilityIntent, ...]
+
+@dataclass(frozen=True, slots=True)
+class ProviderResponseEvent:
+	provider: str
+	model: ModelRef
+	status: int
+	headers: Mapping[str, str]
+	request_id: str | None
 
 @dataclass(frozen=True, slots=True)
 class ModelChangedEvent:
@@ -1942,6 +1996,46 @@ restarts the host, delivers `extension_activate(reason=RESTART)` to each extensi
 `host_reconnect` carrying how many events were missed — so an extension resyncs from `omp.journal`
 ([`09-journal.md`](09-journal.md)) instead of assuming its in-memory state is still coherent.
 `extension_load` / `extension_unload` are host-local dispatches and never cross CONTROL.
+
+---
+
+#### J. MCP notifications
+
+| Event | Payload | Ret | Ph | Lat | Fail | Re | Def |
+|---|---|---|---|---|---|---|---|
+| `mcp_notification` | `McpNotificationEvent` | — | OBSERVE | ASYNC | DEFER | yes | — |
+
+```python
+@dataclass(frozen=True, slots=True)
+class McpNotificationEvent:
+	server: str
+	method: str
+	params: Any | None
+	sequence: int
+
+@omp.hook(
+	"mcp_notification",
+	when=omp.When(
+		server=frozenset({"github"}),
+		method_globs=("notifications/*", "acme/*"),
+	),
+)
+async def observe(
+	event: omp.McpNotificationEvent,
+	ctx: omp.Context,
+) -> None:
+	...
+```
+
+This revision-1 observation is declaration-filtered before Python starts or `params` is decoded.
+`params` is a validated JSON value (or `None`), never a request or response/result frame.
+`When.server` matches raw `McpMount.server` names exactly and `When.method_globs` contains anchored
+JSON-RPC method globs. At least one must be non-empty; `method_globs=("**",)` explicitly opts into
+all methods. The event accepts only OBSERVE, never `coalesce=`, has no return/default/composition,
+and carries no ambient authority to call its source server. Per-session delivery retains at most
+100 matching notifications, dropping the oldest with a journaled count; `sequence` is monotonic
+per server so a subscriber can observe the gap. Delivery preserves arrival order within each
+server while independent servers may dispatch concurrently.
 
 ### 3.12 The decision procedure
 

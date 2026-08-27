@@ -9,15 +9,17 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use futures::StreamExt;
 use omp_core::{Hash32, IntoStr, InvocationPhase, Point, Str, sf};
-use omp_env::EnvClient;
+use omp_env::{EnvClient, InvocationEvent};
 use omp_inference::{TurnId, layer::secrets::SecretStreamRestorer, recovery::repetition};
 use omp_memory::{
 	retain::{OwnedRetentionMessage, RetentionRole},
 	session::SessionMemory,
 };
 use omp_proto::{
+	env::v1::InvokeTool,
 	inference::v1::{
 		self as pb, ContextRef, Outcome, ThreadDelta, part_start, tool_choice, turn_error,
 		turn_event, value,
@@ -39,7 +41,7 @@ use omp_telemetry::firehose::{
 	ProviderError, ToolCall as FirehoseToolCall, TurnEnd as FirehoseTurnEnd,
 	TurnStart as FirehoseTurnStart,
 };
-use omp_tool::{Abort, CapsBase, Registry as ToolRegistry};
+use omp_tool::{Abort, CallOutcome, CapsBase, Registry as ToolRegistry};
 use parking_lot::Mutex;
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
@@ -65,7 +67,7 @@ use crate::{
 	continuation::{
 		AgentSettledEvent, Continuation, ContinuationLedger, ContinuationPolicy, ContinuationSource,
 		LoopSignal, RedemptionAuthority, RedemptionEvidence, SettledFold, SettledParticipant,
-		continues_loop, from_hook,
+		TodoRef, continues_loop, from_hook,
 	},
 	control::{
 		ControlError, ControlMailbox, ControlMailboxEvent, ControlSender, RegimeControl,
@@ -94,6 +96,22 @@ const TOOL_DEADLINE: omp_core::Duration =
 const CONTROL_DRAIN_LIMIT: usize = 32;
 const MEMORY_RECALL_QUERY_MAX_CHARS: usize = 32 * 1024;
 const UNEXPECTED_STOP_RETRY_CAP: u8 = 3;
+#[derive(serde::Deserialize)]
+struct TodoSnapshotPayload {
+	phases: Vec<TodoSnapshotPhase>,
+}
+
+#[derive(serde::Deserialize)]
+struct TodoSnapshotPhase {
+	phase: Str,
+	items: Vec<TodoSnapshotItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct TodoSnapshotItem {
+	text:   Str,
+	status: Str,
+}
 
 /// Typed settlement of one complete caller submission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -2362,6 +2380,63 @@ impl<C: TurnClient + Clone> Agent<C> {
 		}
 	}
 
+	async fn incomplete_todo_snapshot(&self) -> Box<[TodoRef]> {
+		let invocation_id = sf!("agent-settled-todos-{}", omp_core::Ulid::generate());
+		let Ok(mut invocation) = self
+			.env
+			.invoke(InvokeTool {
+				invocation_id: invocation_id.to_string(),
+				name: "todo".to_owned(),
+				rev: "1".to_owned(),
+				..Default::default()
+			})
+			.await
+		else {
+			return Box::new([]);
+		};
+		if !matches!(invocation.next_event().await, Ok(Some(InvocationEvent::Accepted(_)))) {
+			return Box::new([]);
+		}
+		if invocation
+			.commit_args(
+				Bytes::from_static(br#"{"op":"view"}"#),
+				Bytes::from_static(b"agent-settled"),
+				now_ms(),
+				None,
+			)
+			.await
+			.is_err()
+		{
+			return Box::new([]);
+		}
+		loop {
+			match invocation.next_event().await {
+				Ok(Some(InvocationEvent::Verdict(verdict))) if !verdict.is_error => {
+					let Ok(CallOutcome::Ok(snapshot)) =
+						serde_json::from_slice::<CallOutcome<TodoSnapshotPayload, Value>>(&verdict.json)
+					else {
+						return Box::new([]);
+					};
+					return snapshot
+						.phases
+						.into_iter()
+						.flat_map(|phase| {
+							phase.items.into_iter().filter_map(move |item| {
+								matches!(item.status.as_str(), "pending" | "in_progress").then(|| TodoRef {
+									phase:  phase.phase.clone(),
+									text:   item.text,
+									status: item.status,
+								})
+							})
+						})
+						.collect();
+				},
+				Ok(Some(InvocationEvent::Update(_))) => {},
+				_ => return Box::new([]),
+			}
+		}
+	}
+
 	/// Runs the settled-boundary domain hook and converts an accepted decision
 	/// into a normal mailbox interrupt so `defer_interrupts` remains
 	/// authoritative.
@@ -2374,11 +2449,14 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let (candidate, policy) =
 			source_candidate(self.continuation_source.as_deref(), &self.loop_signal, now);
 		builtins.consider(SettledParticipant::ContinuationSource, candidate, policy);
-		if builtins.winner().is_none()
-			&& let Some(gate) = self.settled_gate.clone()
+		if let Some(gate) = self.settled_gate.clone()
+			&& gate.subscribed(v1::HookEventId::HookEventAgentSettled)
 		{
-			let event =
-				AgentSettledEvent { agent_id: sf!("agent"), turn_id: Str::new(turn_id.as_str()) };
+			let event = AgentSettledEvent {
+				agent_id:         sf!("agent"),
+				turn_id:          Str::new(turn_id.as_str()),
+				incomplete_todos: self.incomplete_todo_snapshot().await,
+			};
 			let outcome = gate.gate_domain(&event).await;
 			let winner = if outcome.winner == AgentSettled::Continue {
 				let facts =
@@ -2396,15 +2474,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.session_stop_regime = SessionStopRegime::default();
 				AgentSettled::Settle
 			};
-			builtins.consider(
-				SettledParticipant::AgentSettled,
-				from_hook(
-					winner,
-					sf!("agent_settled"),
-					recovery_prompt_item(PromptAssetId::AutoContinue),
-				),
-				ContinuationPolicy::default(),
-			);
+			if winner == AgentSettled::Settle {
+				builtins.veto();
+			} else {
+				builtins.consider(
+					SettledParticipant::AgentSettled,
+					from_hook(
+						winner,
+						sf!("agent_settled"),
+						recovery_prompt_item(PromptAssetId::AutoContinue),
+					),
+					ContinuationPolicy::default(),
+				);
+			}
 		}
 		let (mut candidate, mut policy) = builtins.into_parts();
 		let settle_fold = self.arbiter.resolve_and_record(
@@ -3584,6 +3666,22 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	fn handle_host_control(&mut self, command: AgentHostCommand) {
 		let result = match command.operation.as_str() {
+			"omp.sessions.rename" => (|| {
+				let title = command
+					.arguments
+					.get("title")
+					.and_then(Value::as_str)
+					.ok_or_else(|| sf!("session title is required"))?;
+				self
+					.journal
+					.append_title(
+						now_ms(),
+						Str::new(title.trim()),
+						omp_storage::transcript::TitleSource::User,
+					)
+					.map_err(|error| sf!("durable session rename failed: {error}"))?;
+				Ok(Value::Null)
+			})(),
 			"omp.jobs.register" => (|| {
 				let value = command
 					.arguments
@@ -3619,6 +3717,30 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.ok_or_else(|| sf!("context usage projection is missing"))
 			}),
 			"omp.context.epoch" => Ok(Value::from(self.journal.context_position().epoch)),
+			"omp.journal.entry_kinds" => {
+				let extension = command
+					.arguments
+					.get("extension")
+					.and_then(Value::as_str)
+					.ok_or_else(|| sf!("extension entry-kind owner is required"));
+				extension.map(|extension| {
+					Value::Array(
+						self
+							.journal
+							.entry_kind_declarations(extension)
+							.into_iter()
+							.map(|declaration| {
+								serde_json::json!({
+									"name": declaration.name,
+									"rev": declaration.rev.to_string(),
+									"display": declaration.display,
+									"projects": declaration.projects,
+								})
+							})
+							.collect(),
+					)
+				})
+			},
 			"omp.context.message.parts" => self.context_control_item(&command.arguments).map(|item| {
 				let parts = match item.kind.as_ref() {
 					Some(item::Kind::Message(message)) => message.parts.as_slice(),

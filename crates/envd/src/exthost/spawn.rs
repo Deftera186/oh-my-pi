@@ -212,6 +212,17 @@ impl RunningHost {
 	/// Reaps the current process group and starts its next authenticated
 	/// generation.
 	pub async fn restart(&mut self) -> Result<(), RunningHostError> {
+		self
+			.restart_with_authority(Arc::clone(&self.authority))
+			.await
+	}
+
+	/// Reaps the current process group and starts its next generation with a
+	/// freshly identity-bound CONTROL authority.
+	pub async fn restart_with_authority(
+		&mut self,
+		authority: Arc<dyn ControlAuthority>,
+	) -> Result<(), RunningHostError> {
 		self.terminate().await;
 		let mut spec = self.restart_spec.clone();
 		spec.host_generation = spec
@@ -223,7 +234,7 @@ impl RunningHost {
 		let cancellation = mem::take(&mut self.cancellation);
 		let spawned = spawn(spec).await?;
 		let mut replacement = spawned
-			.start_control(identity, Arc::clone(&self.authority), &self.snapshot)
+			.start_control(identity, authority, &self.snapshot)
 			.await?;
 		replacement.cancellation = cancellation;
 		*self = replacement;
@@ -439,6 +450,15 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 				let flags = nix::libc::fcntl(3, nix::libc::F_GETFD);
 				if flags == -1
 					|| nix::libc::fcntl(3, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) == -1
+				{
+					return Err(io::Error::last_os_error());
+				}
+				// The socketpair end was registered with tokio in the parent and
+				// carries O_NONBLOCK on its file description; the child's codec
+				// reads synchronously and must see a blocking descriptor.
+				let status = nix::libc::fcntl(3, nix::libc::F_GETFL);
+				if status == -1
+					|| nix::libc::fcntl(3, nix::libc::F_SETFL, status & !nix::libc::O_NONBLOCK) == -1
 				{
 					return Err(io::Error::last_os_error());
 				}

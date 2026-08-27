@@ -182,6 +182,13 @@ impl SettledFold {
 		}
 	}
 
+	/// Applies an explicit settled-hook veto to every earlier continuation.
+	pub fn veto(&mut self) {
+		self.candidate = Continuation::Settle;
+		self.policy = ContinuationPolicy::default();
+		self.winner = None;
+	}
+
 	/// Returns the winning participant, if a lane vetoed settlement.
 	pub const fn winner(&self) -> Option<SettledParticipant> {
 		self.winner
@@ -270,25 +277,43 @@ pub enum Continuation {
 	},
 }
 
+/// Read-only actionable todo reference carried by the settled hook.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct TodoRef {
+	/// Stable phase label.
+	pub phase:  Str,
+	/// User-visible task text.
+	pub text:   Str,
+	/// Actionable status (`pending` or `in_progress`).
+	pub status: Str,
+}
+
 /// Hook payload emitted at the settled boundary.
 #[derive(Clone, Debug)]
 pub struct AgentSettledEvent {
 	/// Stable agent identity.
-	pub agent_id: Str,
+	pub agent_id:         Str,
 	/// The terminal turn id that reached the boundary.
-	pub turn_id:  Str,
+	pub turn_id:          Str,
+	/// Ordered actionable built-in todo snapshot.
+	pub incomplete_todos: Box<[TodoRef]>,
 }
 
 impl HookEvent for AgentSettledEvent {
 	type Return = AgentSettled;
 
 	const ID: HookEventId = HookEventId::HookEventAgentSettled;
-	const REV: u32 = 1;
+	const REV: u32 = 2;
 
 	fn encode_into(&self, out: &mut BytesMut) {
-		out.extend_from_slice(self.agent_id.as_bytes());
-		out.extend_from_slice(b"\n");
-		out.extend_from_slice(self.turn_id.as_bytes());
+		let payload = serde_json::json!({
+			"agent_id": self.agent_id,
+			"turn_id": self.turn_id,
+			"incomplete_todos": self.incomplete_todos,
+		});
+		if let Ok(encoded) = serde_json::to_vec(&payload) {
+			out.extend_from_slice(&encoded);
+		}
 	}
 
 	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
@@ -355,6 +380,26 @@ mod tests {
 		assert_eq!(ledger.decide_with_policy(candidate(), 120, policy), Continuation::Refused {
 			cap: 2,
 		});
+	}
+
+	#[test]
+	fn settled_revision_two_encodes_ordered_actionable_todos() {
+		let event = AgentSettledEvent {
+			agent_id:         sf!("agent"),
+			turn_id:          sf!("turn"),
+			incomplete_todos: vec![
+				TodoRef { phase: sf!("Build"), text: sf!("compile"), status: sf!("in_progress") },
+				TodoRef { phase: sf!("Ship"), text: sf!("publish"), status: sf!("pending") },
+			]
+			.into_boxed_slice(),
+		};
+		assert_eq!(<AgentSettledEvent as HookEvent>::REV, 2);
+		let mut encoded = BytesMut::new();
+		event.encode_into(&mut encoded);
+		let payload: serde_json::Value = serde_json::from_slice(&encoded).expect("settled JSON");
+		assert_eq!(payload["incomplete_todos"][0]["phase"], "Build");
+		assert_eq!(payload["incomplete_todos"][0]["status"], "in_progress");
+		assert_eq!(payload["incomplete_todos"][1]["text"], "publish");
 	}
 
 	#[test]

@@ -2,6 +2,8 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	fs, io,
+	path::{Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -19,10 +21,9 @@ use omp_proto::{
 		v1::{
 			Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
 			LifecycleEventContext, RegimeApply, RegimeDraft, RegimeHostEnvelope, RegimeWorkerEnvelope,
-			RetryLifecycleEventV1, TodoReminderEventV1, TtsrTriggeredEventV1, UiHostEnvelope,
-			UiWorkerEnvelope, WorkerFrame, hook_host_envelope, lifecycle_worker_envelope,
-			regime_host_envelope, regime_worker_envelope, ui_host_envelope, ui_worker_envelope,
-			worker_frame,
+			RetryLifecycleEventV1, TtsrTriggeredEventV1, UiHostEnvelope, UiWorkerEnvelope,
+			WorkerFrame, hook_host_envelope, lifecycle_worker_envelope, regime_host_envelope,
+			regime_worker_envelope, ui_host_envelope, ui_worker_envelope, worker_frame,
 		},
 	},
 	ui::v1::{CommandDecl, ShortcutDecl, UiDispatch, UiDispatchResult, ui_dispatch_result},
@@ -30,6 +31,107 @@ use omp_proto::{
 use parking_lot::{Mutex, RwLock};
 use prost::Message;
 use thiserror::Error;
+
+/// Maximum bytes accepted from a runtime-discovered skill document.
+pub const MAX_DISCOVERED_SKILL_BYTES: u64 = 64_000;
+
+/// A contained `ResourceKind.SKILL` contribution admitted before driver
+/// discovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillPathContribution {
+	/// Canonical contributed `SKILL.md`.
+	pub path:         PathBuf,
+	/// Canonical authority root which contains the contribution.
+	pub contain_root: PathBuf,
+}
+
+/// A runtime resource contribution escaped or failed validation.
+#[derive(Debug, Error)]
+pub enum SkillPathAdmissionError {
+	/// The hook result did not use the typed object/array contract.
+	#[error("resources_discover returned a malformed skill contribution")]
+	Malformed,
+	/// A contributed skill path was outside every granted Environment root.
+	#[error("resources_discover skill path escapes every granted root")]
+	Escapes,
+	/// A contributed resource could not be resolved.
+	#[error("resources_discover skill path could not be resolved")]
+	Io(#[source] io::Error),
+	/// A contributed resource was not one bounded `SKILL.md` file.
+	#[error("resources_discover skill contribution is not a bounded SKILL.md file")]
+	InvalidFile,
+}
+
+/// Admits the composed `resources_discover` `add` field without following a
+/// contribution beyond the invocation's granted roots.
+///
+/// Non-skill resource kinds are left to their owning discovery domains.
+pub fn admit_skill_path_contributions(
+	composed: &serde_json::Value,
+	allowed_roots: &[PathBuf],
+) -> Result<Vec<SkillPathContribution>, SkillPathAdmissionError> {
+	let object = composed
+		.as_object()
+		.ok_or(SkillPathAdmissionError::Malformed)?;
+	let patch = object
+		.get("patch")
+		.and_then(serde_json::Value::as_object)
+		.unwrap_or(object);
+	let additions = match patch.get("add") {
+		Some(additions) => additions
+			.as_array()
+			.ok_or(SkillPathAdmissionError::Malformed)?,
+		None => return Ok(Vec::new()),
+	};
+	let roots = allowed_roots
+		.iter()
+		.map(fs::canonicalize)
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(SkillPathAdmissionError::Io)?;
+	let mut admitted = Vec::new();
+	for addition in additions {
+		let addition = addition
+			.as_object()
+			.ok_or(SkillPathAdmissionError::Malformed)?;
+		let kind = addition
+			.get("kind")
+			.and_then(serde_json::Value::as_str)
+			.ok_or(SkillPathAdmissionError::Malformed)?;
+		if kind != "skill" {
+			continue;
+		}
+		addition
+			.get("origin")
+			.and_then(serde_json::Value::as_str)
+			.filter(|origin| !origin.is_empty())
+			.ok_or(SkillPathAdmissionError::Malformed)?;
+		let uri = addition
+			.get("uri")
+			.and_then(serde_json::Value::as_str)
+			.ok_or(SkillPathAdmissionError::Malformed)?;
+		let path = fs::canonicalize(Path::new(uri)).map_err(SkillPathAdmissionError::Io)?;
+		let contain_root = roots
+			.iter()
+			.find(|root| path.starts_with(root))
+			.cloned()
+			.ok_or(SkillPathAdmissionError::Escapes)?;
+		let metadata = fs::metadata(&path).map_err(SkillPathAdmissionError::Io)?;
+		if !metadata.is_file()
+			|| metadata.len() > MAX_DISCOVERED_SKILL_BYTES
+			|| path.file_name().is_none_or(|name| name != "SKILL.md")
+		{
+			return Err(SkillPathAdmissionError::InvalidFile);
+		}
+		if !admitted
+			.iter()
+			.any(|row: &SkillPathContribution| row.path == path)
+		{
+			admitted.push(SkillPathContribution { path, contain_root });
+		}
+	}
+	admitted.sort_by(|left, right| left.path.cmp(&right.path));
+	Ok(admitted)
+}
 
 use super::{
 	control::{
@@ -78,6 +180,20 @@ pub trait CallbackDispatcher: Send + Sync + 'static {
 		target: Arc<ControlConnectionIdentity>,
 		dispatch: ControlDispatch,
 	) -> Result<serde_json::Value, ControlProtocolError>;
+	/// Calls one manifest-verified command or shortcut through the typed UI
+	/// envelope route.
+	async fn dispatch_ui(
+		&self,
+		_target: Arc<ControlConnectionIdentity>,
+		_authority: ControlInvocationAuthority,
+		_dispatch: UiCallbackDispatch,
+		_timeout: Duration,
+	) -> Result<UiDispatchResult, ControlProtocolError> {
+		Err(ControlProtocolError::new(
+			"CallbackUnavailable",
+			"typed UI callback dispatch is not installed",
+		))
+	}
 }
 
 /// Late-bound callback dispatcher used to break supervisor construction from
@@ -120,6 +236,25 @@ impl CallbackDispatcher for CallbackDispatcherSlot {
 			.retryable(true)
 		})?;
 		dispatcher.dispatch(target, dispatch).await
+	}
+
+	async fn dispatch_ui(
+		&self,
+		target: Arc<ControlConnectionIdentity>,
+		authority: ControlInvocationAuthority,
+		dispatch: UiCallbackDispatch,
+		timeout: Duration,
+	) -> Result<UiDispatchResult, ControlProtocolError> {
+		let dispatcher = self.dispatcher.read().clone().ok_or_else(|| {
+			ControlProtocolError::new(
+				"CallbackUnavailable",
+				"extension callback supervisor is not active",
+			)
+			.retryable(true)
+		})?;
+		dispatcher
+			.dispatch_ui(target, authority, dispatch, timeout)
+			.await
 	}
 }
 /// Exact generation and callback identity owning one UI roster row.
@@ -232,6 +367,20 @@ impl UiRoster {
 	/// Resolves a normalized shortcut chord without allocating.
 	pub fn shortcut(&self, chord: &str) -> Option<&UiShortcutRosterEntry> {
 		self.shortcuts.get(chord)
+	}
+
+	/// Iterates canonical command rows without repeating aliases.
+	pub fn commands(&self) -> impl Iterator<Item = &UiCommandRosterEntry> {
+		self
+			.commands
+			.iter()
+			.filter(|(spelling, entry)| spelling.as_str() == entry.declaration.name.as_str())
+			.map(|(_, entry)| entry)
+	}
+
+	/// Iterates every normalized shortcut row.
+	pub fn shortcuts(&self) -> impl Iterator<Item = &UiShortcutRosterEntry> {
+		self.shortcuts.values()
 	}
 }
 
@@ -361,7 +510,6 @@ impl LifecycleEvent {
 		if !matches!(
 			self.id,
 			HookEventId::HookEventTtsrTriggered
-				| HookEventId::HookEventTodoReminder
 				| HookEventId::HookEventRetryStart
 				| HookEventId::HookEventRetryEnd
 				| HookEventId::HookEventFallbackApplied
@@ -455,21 +603,6 @@ pub fn ttsr_event_from_journal(
 		revision: 1,
 		payload:  CowBytes::from(event.encode_to_vec()),
 	}))
-}
-
-/// Emits the revision-1 todo reminder contract from the authoritative todo
-/// projection.
-pub fn todo_reminder_event(
-	context: LifecycleEventContext,
-	pending: u32,
-	reminder: Str,
-) -> Result<LifecycleEvent, LifecycleEventError> {
-	let event = TodoReminderEventV1 {
-		context: Some(context),
-		pending,
-		reminder: bounded_event_text(reminder, MAX_EVENT_TEXT_BYTES),
-	};
-	lifecycle_event(HookEventId::HookEventTodoReminder, event)
 }
 
 /// Emits one revision-1 inference retry transition.
@@ -1021,6 +1154,59 @@ mod tests {
 			props: None,
 		}
 		.encode_to_vec()
+	}
+
+	#[test]
+	fn skill_path_contributions_require_containment_and_bounds() {
+		let tree = tempfile::tempdir().expect("tree");
+		let root = tree.path().join("allowed");
+		let outside = tree.path().join("outside");
+		fs::create_dir_all(root.join("review")).expect("skill directory");
+		fs::create_dir_all(&outside).expect("outside");
+		let skill = root.join("review/SKILL.md");
+		fs::write(&skill, "---\ndescription: review\n---\nbody").expect("skill");
+		let result = admit_skill_path_contributions(
+			&serde_json::json!({
+				"kind": "modify",
+				"patch": {
+					"add": [{
+						"uri": skill.to_string_lossy(),
+						"kind": "skill",
+						"origin": "publisher.extension"
+					}]
+				}
+			}),
+			std::slice::from_ref(&root),
+		)
+		.expect("contained skill");
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].path, fs::canonicalize(&skill).expect("canonical skill"));
+
+		let escaped = outside.join("SKILL.md");
+		fs::write(&escaped, "outside").expect("outside skill");
+		assert!(matches!(
+			admit_skill_path_contributions(
+				&serde_json::json!({"add": [{
+					"uri": escaped.to_string_lossy(),
+					"kind": "skill",
+					"origin": "publisher.extension"
+				}]}),
+				std::slice::from_ref(&root),
+			),
+			Err(SkillPathAdmissionError::Escapes)
+		));
+		fs::write(&skill, vec![b'x'; 64_001]).expect("oversized skill");
+		assert!(matches!(
+			admit_skill_path_contributions(
+				&serde_json::json!({"add": [{
+					"uri": skill.to_string_lossy(),
+					"kind": "skill",
+					"origin": "publisher.extension"
+				}]}),
+				std::slice::from_ref(&root),
+			),
+			Err(SkillPathAdmissionError::InvalidFile)
+		));
 	}
 
 	#[test]

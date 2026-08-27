@@ -1359,6 +1359,12 @@ def confirm_privileged(event: omp.ToolCallEvent, ctx: omp.Context) -> omp.HookDe
     ))
 ```
 
+Extension admission reuses this reserved ticket presentation for missing or stale install
+grants ([`14-deploy.md`](14-deploy.md) §3.9.5), but not the Python hook API: Core constructs
+that ticket from authenticated lock and grant facts before extension code starts. Its local
+dialog offers allow once, allow and remember, and deny; an extension cannot supply the
+specification, renderer, or decision.
+
 Four properties are consequences of Core ownership, not conventions:
 
 - **The ticket survives extension restarts.** It is Core state, journaled at filing. The

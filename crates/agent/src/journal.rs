@@ -1219,7 +1219,9 @@ impl Journal {
 		Ok(child)
 	}
 
-	fn append_forked_from(
+	/// Appends durable top-level lineage before a staged journal becomes
+	/// visible.
+	pub fn append_forked_from(
 		&mut self,
 		ts: u64,
 		parent: &transcript::SessionId,
@@ -1533,6 +1535,22 @@ impl Journal {
 	/// Borrows the live entry-kind registry for scoped query validation.
 	pub const fn entry_kinds(&self) -> &EntryKindRegistry {
 		&self.entry_kinds
+	}
+
+	/// Clones the live declarations owned by one authenticated extension.
+	pub fn entry_kind_declarations(&self, extension: &str) -> Vec<EntryKindDecl> {
+		self
+			.entry_kinds
+			.iter()
+			.filter(|(_, record)| record.extension == extension)
+			.map(|(name, record)| EntryKindDecl {
+				name:     Str::new(name),
+				rev:      record.rev.clone(),
+				display:  record.display,
+				projects: record.projects,
+				lift:     record.lift,
+			})
+			.collect()
 	}
 
 	/// Returns the journaled phase of one invocation, when any transition has

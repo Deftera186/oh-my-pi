@@ -803,6 +803,48 @@ activated before the session's first prompt render via
 `extension_activate(reason=FIRST_REACH)` (`RESTART` / `HOT_RELOAD` after a host restart or
 reload). A slot that could activate lazily would be a slot the first prompt renders without.
 
+#### Extension-authored skills
+
+`@omp.skill(name, *, description, hidden=False, disable_model_invocation=False,
+autoload=False, contain_root=None)` decorates a synchronous zero-argument callable returning
+`str`. Declaration lowering calls the body exactly once, normalizes the metadata, and produces
+one deterministic generated `SKILL.md`; it is never retained as a per-session callback. Names
+are 1–64 lowercase ASCII letters, digits, or hyphens, begin with a letter or digit, and the
+complete generated UTF-8 file is bounded to 64,000 bytes. `contain_root`, when present, is a
+distribution-relative POSIX path and bounds nested reads below `skill://<name>/…`.
+
+```python
+import omp
+
+@omp.skill("review", description="Review a change", autoload=False)
+def review() -> str:
+	return "# Review\n\nInspect correctness, tests, and maintainability."
+```
+
+The generated file is lowered to the static `kind = "skills"` content row specified by
+[`14-deploy.md`](14-deploy.md) §3.1.5. A skills-only extension is therefore discoverable and
+resolvable through `skill://review` from authenticated manifest bytes without starting Python.
+If that extension later starts for another declared surface, FREEZE compares the decorated
+skill path and metadata with the admitted row; a mismatch rejects the registry publication.
+FREEZE also seals this decorator: a later `@omp.skill` raises `omp.DeclarationSealed`, and
+resource discovery never reopens the declaration registry.
+
+Runtime-selected files use
+`@omp.hook("resources_discover", phase=omp.HookPhase.TRANSFORM)` instead. A transform may append
+`omp.ResourceRef(kind=omp.ResourceKind.SKILL, ...)`; Core admits only a recorded `SKILL.md`
+contained by the invocation's Environment roots, reads it once, and merges it through the same
+skill discovery path. `add` composes by `APPEND`, while `keep` composes by `INTERSECT`.
+
+The merge is first-winner by the existing source order, after source enablement and skill-name
+filters: project and user-authored native skills precede extension static and hook-contributed
+skills; extension contributors are ordered by their admitted source order; foreign adapters
+follow; managed skills are dead last. A disabled or malformed higher-priority candidate does not
+claim its name, while an admitted winner does. The session then freezes the winning bytes,
+description, flags, source, base directory, and containment root in one immutable
+`SkillSnapshot`. Editing a contributed file cannot change that session's prompt inventory or
+`skill://` body. Explicit reload or a new session reruns `resources_discover`, discovery, and
+collision resolution and creates a new snapshot.
+
 #### `omp.SlotClass`
 
 | Member | Contract | Cache consequence |

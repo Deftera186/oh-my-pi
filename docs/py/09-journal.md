@@ -683,7 +683,57 @@ The fork/handoff chain reaching a session, oldest first. Backed by
 inference from filenames — which is what pi's advisor/subagent classifier had to
 do, keying off `__advisor.jsonl` basenames and path layout.
 
-#### Session mutation
+#### `omp.sessions.SessionSetup` and `async omp.sessions.create(setup=SessionSetup())`
+
+`SessionSetup` is a frozen declarative value:
+
+```python
+setup = omp.sessions.SessionSetup(
+    title="Review follow-up",
+    parent=omp.sessions.current().id,
+    entries=(ReviewState(findings=3),),
+    initial_prompt="Continue from the recorded findings.",
+)
+created = await omp.sessions.create(setup)
+```
+
+`entries` accepts only instances of classes declared by the calling extension's
+`@omp.entry_kind`. `initial_prompt` is text or a tuple of visible
+`omp.Part.text()` / `omp.Part.blob()` values and becomes exactly one visible
+user journal item. It never submits a turn, enqueues work, starts a model
+request, or encodes hidden context.
+
+Creation is one atomic create/seed/switch transaction. Before allocating
+anything, Core validates parent access, declaration ownership, quotas,
+invocation phase, and UI state. It stages the header, durable lineage, optional
+user title, typed entries, and optional prompt in that order. Journal
+publication plus the write-time index/idempotency receipt is the durability
+point; only then does the existing interactive owner switch the UI once.
+`list`, `get`, `lineage`, `journal`, and `resume` immediately observe the
+complete result.
+
+Only an idle, user-initiated interactive `@omp.command` invocation at
+`EFFECTS_AUTHORIZED` is admitted. Hooks, tools, shortcuts, headless/RPC
+commands, subagents, and a transitioning UI raise
+`omp.SessionTransitionDenied` without creating anything. Pre-durability failure
+rolls back and leaves the old session current. If durability or switch
+acknowledgement is ambiguous, Core fuses the generation- and invocation-bound
+idempotency identity and raises `omp.SessionTransitionIndeterminate`; retry
+cannot create a duplicate.
+
+No session manager or mutable journal handle crosses CONTROL. A command may
+immediately queue the first turn with
+`await omp.agents.inject(prompt, session=created.id)` after `create` returns;
+the target is accepted only for the authenticated client that created it.
+See the create → switch → inject recipe in `docs/py/12-agents.md`. Later
+automation can use a durable schedule after the user reaches the new session.
+
+| Symbol | Kind / trigger | `OperationSpec` |
+|---|---|---|
+| `omp.sessions.SessionSetup` | Declare / static; no manifest row | `minimum_phase=OPEN`, `durability=EPHEMERAL`, `cost=NONE`, `authority=CORE` |
+| `omp.sessions.create` | Request / static; no manifest row | `minimum_phase=EFFECTS_AUTHORIZED`, `durability=DURABLE`, `cost=NONE`, `authority=CORE` |
+
+#### Historical session mutation
 
 Historical-session management uses named CONTROL requests; the extension never
 opens, rewrites, renames, or removes journal files itself.

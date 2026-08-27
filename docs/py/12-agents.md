@@ -19,6 +19,12 @@ registry: an extension that calls a model spends the user's money. Spawning a
 subagent and classifying a bash command are the same authority at different
 scales, so they answer to the same budget, the same role indirection, and the
 same attribution.
+Creating a new top-level interactive session is deliberately not an agent
+operation. `omp.sessions.create` records a visible, non-submitted handoff and
+switches the user's existing UI; it starts no inference. Use it only from an
+interactive command. Use the APIs in this chapter for subagents, later
+injection, scheduling, or any operation intended to make model work happen
+(see `docs/py/09-journal.md`).
 
 "Forks no process, opens no socket" is the entire point. In pi, `ExtensionAPI`
 had *no* subagent primitive at all — not one member of the interface in
@@ -840,18 +846,60 @@ CONTROL, per-turn, fail-open. Reading `stalled` and returning `Settle()` is the
 whole of "repeat detection", which `@narumitw/pi-goal` shipped as its own
 heuristic over message text.
 
-#### `async omp.agents.inject(prompt: str, *, mode: DeliveryMode = DeliveryMode.NEXT_TURN, visible: bool = False, role: Literal["user", "system"] = "system") -> Receipt`
+#### `async omp.agents.set_model(model: str, *, thinking: str | None = None) -> omp.ModelRef`
+
+CONTROL, per-call, fail-closed. Switches the active interactive session's model
+for subsequent turns through the same durable session-override path as the
+built-in model command. The optional portable thinking level is applied
+atomically to the next-turn composition. The call requires
+`EFFECTS_AUTHORIZED` and is admitted only from an interactive command or a
+device body; precheck/transform hooks must patch `turn_start` instead. Unknown,
+disabled, or unroutable models raise the host's typed model-switch error.
+`omp.Context.current().model` and `.thinking` expose the callback's immutable
+current values.
+
+#### `async omp.agents.inject(prompt: str, *, mode: DeliveryMode = DeliveryMode.NEXT_TURN, visible: bool = False, role: Literal["user", "system"] = "system", session: str | None = None) -> Receipt`
 
 - CONTROL, per-call, fail-closed.
 - Out-of-band injection for producers that are **not** at a settled boundary: a
   schedule firing, an inter-session message, a background child settling. It
   posts an item into this agent's mailbox and, if the loop is idle, wakes it.
+  `session=None` targets the current session. A non-current `session` must have
+  been created by this authenticated client; unknown and foreign IDs are
+  refused. An inactive newly created target is durably buffered and reclaimed
+  by its normal mailbox/startup delivery path.
 - It is *not* the way to build a goal loop. A goal loop that injects from a
   timer rather than deciding at the boundary races the model mid-turn, which is
   precisely the bug that made pi goal extensions inject continuations during
   tool batches.
 - Counts against the continuation ledger when it wakes an idle loop, and does
   not when it merely queues behind an in-flight turn.
+
+A command can seed, switch, and queue the first model turn without pretending
+that the visible setup prompt itself is submitted:
+
+```python
+@omp.command("handoff")
+async def handoff(_: omp.CommandContext) -> None:
+    created = await omp.sessions.create(
+        omp.sessions.SessionSetup(
+            title="Focused follow-up",
+            parent=omp.sessions.current().id,
+            initial_prompt="The extension prepared this follow-up.",
+        )
+    )
+    await omp.agents.inject(
+        "Continue the focused follow-up now.",
+        session=created.id,
+        mode=omp.agents.DeliveryMode.NEXT_TURN,
+        visible=True,
+        role="user",
+    )
+```
+
+`create` publishes and requests the UI switch first; the targeted injection is
+then durably queued under the same authenticated client ownership. This is the
+OMP equivalent of pi's `newSession`/`withSession` continuation handoff.
 
 ### Scheduling
 

@@ -110,7 +110,10 @@ pub use continuation::{
 	LoopSignal, RedemptionAuthority, RedemptionEvidence, RedemptionFuture, SettledFold,
 	SettledParticipant, continues_loop, from_hook,
 };
-pub use control::{ControlError, ControlSender, RewindAck};
+pub use control::{
+	ControlError, ControlMailbox, ControlMailboxEvent, ControlSender, RewindAck,
+	channel as control_channel,
+};
 pub use events::{
 	AgentEvent, AgentPhase, AgentRunState, CollabEvent, CollabEventSubscription,
 	CollabEventVisibility, EventBus, EventProvenance, EventSubscription, EventVisibility,

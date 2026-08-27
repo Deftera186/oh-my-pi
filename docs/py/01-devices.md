@@ -1361,6 +1361,10 @@ network egress. Both are world access, and CONTROL carries no world access —
 that is the topology, not a preference. Putting MCP children host-side would
 mean the extension host owns process trees and sockets, which is the property
 the two-socket split exists to prevent.
+For `mcp_notification`, Envd first completes all built-in MCP cache, list, resource, and prompt
+handling, then offers the notification to Core-owned hook dispatch. Server-to-client requests and
+responses never enter that event; unknown custom notifications do. The payload's `server` is the
+raw `McpMount.server` name, never a device-name prefix.
 
 Concretely, env-side buys four things Python-side cannot have:
 

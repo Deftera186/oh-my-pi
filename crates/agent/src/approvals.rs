@@ -181,6 +181,7 @@ fn approval_source_from_name(source: &str) -> Option<ApprovalSource> {
 /// `ApprovalDecided` journal entries.
 pub struct ApprovalBook {
 	next_id:       AtomicU64,
+	ticket_prefix: Str,
 	tickets:       Mutex<BTreeMap<Str, ApprovalTicket>>,
 	by_invocation: Mutex<BTreeMap<Str, Str>>,
 }
@@ -344,6 +345,20 @@ impl ApprovalBook {
 	pub const fn new() -> Self {
 		Self {
 			next_id:       AtomicU64::new(1),
+			ticket_prefix: Str::new_static("approval"),
+			tickets:       Mutex::new(BTreeMap::new()),
+			by_invocation: Mutex::new(BTreeMap::new()),
+		}
+	}
+
+	/// Creates an empty Core ticket index with a disjoint durable id namespace.
+	///
+	/// This is reserved for Core-owned approval families that share a session
+	/// journal with ordinary invocation tickets.
+	pub fn with_prefix(prefix: impl Into<Str>) -> Self {
+		Self {
+			next_id:       AtomicU64::new(1),
+			ticket_prefix: prefix.into(),
 			tickets:       Mutex::new(BTreeMap::new()),
 			by_invocation: Mutex::new(BTreeMap::new()),
 		}
@@ -368,7 +383,8 @@ impl ApprovalBook {
 			}
 			return ticket.clone();
 		}
-		let ticket_id = sf!("approval-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+		let ticket_id =
+			sf!("{}-{}", self.ticket_prefix, self.next_id.fetch_add(1, Ordering::Relaxed));
 		let ticket = ApprovalTicket {
 			ticket_id: ticket_id.clone(),
 			invocation_id: invocation_id.clone(),
@@ -463,7 +479,8 @@ impl ApprovalBook {
 		if let Some(sequence) = ticket
 			.ticket_id
 			.as_str()
-			.strip_prefix("approval-")
+			.strip_prefix(self.ticket_prefix.as_str())
+			.and_then(|value| value.strip_prefix('-'))
 			.and_then(|value| value.parse::<u64>().ok())
 		{
 			self
@@ -544,6 +561,17 @@ mod tests {
 			evidence:      Vec::new(),
 		}
 	}
+	#[test]
+	fn scoped_ticket_prefixes_do_not_collide_with_invocation_tickets() {
+		let ordinary = ApprovalBook::new().file(None, vec![spec()], 1);
+		let extension = ApprovalBook::with_prefix("extension-approval").file(None, vec![spec()], 1);
+		assert_eq!(ordinary.ticket_id.as_str(), "approval-1");
+		assert_eq!(extension.ticket_id.as_str(), "extension-approval-1");
+		let restored = ApprovalBook::with_prefix("extension-approval");
+		restored.restore_filed(extension.filed_record());
+		assert_eq!(restored.file(None, vec![spec()], 2).ticket_id.as_str(), "extension-approval-2");
+	}
+
 	#[test]
 	fn tickets_merge_answer_idempotently_and_withdraw() {
 		let book = ApprovalBook::new();

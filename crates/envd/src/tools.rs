@@ -1,14 +1,14 @@
 //! Production built-in tool registry assembly.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, VecDeque},
 	env,
 	env::consts,
 	future::Future,
 	path::{Path, PathBuf},
 	sync::{
 		Arc, LazyLock,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time,
 };
@@ -18,6 +18,7 @@ use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
 use omp_core::{Duration, ExposeSecret as _, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
 use omp_env::EnvClient;
 use omp_inference::{
+	ProviderResponseObservation, ProviderResponseObserver,
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageUnit, UsageWindow, UsageWindowKind,
 	},
@@ -39,7 +40,10 @@ use omp_settings::{
 	BrowserSettings,
 	manager::{SettingsManager, SettingsPaths},
 };
-use omp_storage::{github_cache::GithubCache, telemetry_index::TelemetryIndex};
+use omp_storage::{
+	github_cache::GithubCache, index::SessionRenameObserver, telemetry_index::TelemetryIndex,
+	transcript::SessionId,
+};
 use omp_tool::{
 	AvailabilityDelta, Claims, Constraint, GrammarSyntax, LeafOwner, LeafReplacementError,
 	LeafReplacementRegistry, LeafVersion, Precedence, Presentation, Registry, RegistryLeaf, Rev,
@@ -87,7 +91,10 @@ use super::{
 	},
 	github::GithubService,
 	managed_skills::ManagedSkills,
-	mcp::McpService,
+	mcp::{
+		McpService,
+		manager::{McpHookNotification, McpNotificationSink},
+	},
 	media_devices,
 	memory::ReflectionBridgeHost,
 	search_backend::SearchBridgeHost,
@@ -295,8 +302,8 @@ impl RegistryControlFactory {
 fn registry_evidence_error(error: SealedRegistryEvidenceError) -> ControlProtocolError {
 	let code = match error {
 		SealedRegistryEvidenceError::Identity => "RegistryUnauthorized",
-		SealedRegistryEvidenceError::ManifestDrift
-		| SealedRegistryEvidenceError::ExecutableDrift
+		SealedRegistryEvidenceError::ManifestDrift => "DeclarationDrift",
+		SealedRegistryEvidenceError::ExecutableDrift
 		| SealedRegistryEvidenceError::Duplicate
 		| SealedRegistryEvidenceError::SourceModule => "RegistryDrift",
 		SealedRegistryEvidenceError::Nested => "InvalidPhase",
@@ -1004,12 +1011,17 @@ pub struct HookSubscription {
 	pub concurrency:  CallbackConcurrency,
 	/// Provider ids admitted by this callback, when provider-scoped.
 	pub providers:    Option<Box<[Str]>>,
+	/// Exact raw MCP mount names admitted by this callback.
+	pub servers:      Option<Box<[Str]>>,
+	/// Anchored MCP JSON-RPC method globs admitted by this callback.
+	pub method_globs: Box<[Str]>,
 	/// Event policy frozen with the Python registry declaration.
 	pub event_policy: HookEventPolicy,
 }
 #[derive(Clone)]
 struct ExtensionUsageFetcher {
 	provider:    ProviderId,
+	settings:    JsonMap<String, JsonValue>,
 	identity:    Arc<ControlConnectionIdentity>,
 	session:     Str,
 	dispatcher:  Arc<dyn CallbackDispatcher>,
@@ -1073,7 +1085,7 @@ impl ConsoleUsageFetcher for ExtensionUsageFetcher {
 						remote:            false,
 						has_ui:            false,
 						headless:          true,
-						settings:          JsonMap::new(),
+						settings:          self.settings.clone(),
 						secret_settings:   Box::new([]),
 						data:              None,
 						direct_filesystem: None,
@@ -1187,13 +1199,44 @@ fn usage_registration_id(subscription: &HookSubscription) -> Str {
 }
 
 #[derive(Clone)]
+struct McpQueuedDelivery {
+	notification:  McpHookNotification,
+	subscriptions: Vec<HookSubscription>,
+}
+
+struct McpDeliveryQueue {
+	pending:         VecDeque<McpQueuedDelivery>,
+	running_servers: BTreeSet<Str>,
+	dropped:         u64,
+}
+
+impl McpDeliveryQueue {
+	fn push(&mut self, delivery: McpQueuedDelivery) -> bool {
+		let dropped = self.pending.len() == MCP_HOOK_QUEUE_CAPACITY;
+		if dropped {
+			self.pending.pop_front();
+			self.dropped = self.dropped.saturating_add(1);
+		}
+		self.pending.push_back(delivery);
+		dropped
+	}
+}
+
+/// Per-session MCP notification queue capacity.
+pub const MCP_HOOK_QUEUE_CAPACITY: usize = 100;
+
+#[derive(Clone)]
 pub struct HookControlFactory {
-	registries:     Arc<RegistryControlFactory>,
-	dispatcher:     Arc<dyn CallbackDispatcher>,
-	callbacks:      Arc<NestedCallbackDispatcher>,
-	policies:       Arc<RwLock<BTreeMap<Str, HookEventPolicy>>>,
-	subscriptions:  Arc<RwLock<BTreeMap<ControlConnectionKey, Vec<HookSubscription>>>>,
-	usage_fetchers: UsageFetcherRegistry,
+	registries:                   Arc<RegistryControlFactory>,
+	dispatcher:                   Arc<dyn CallbackDispatcher>,
+	callbacks:                    Arc<NestedCallbackDispatcher>,
+	policies:                     Arc<RwLock<BTreeMap<Str, HookEventPolicy>>>,
+	subscriptions:                Arc<RwLock<BTreeMap<ControlConnectionKey, Vec<HookSubscription>>>>,
+	usage_fetchers:               UsageFetcherRegistry,
+	mcp_queues:                   Arc<Mutex<BTreeMap<u64, McpDeliveryQueue>>>,
+	mcp_journal:                  Arc<RwLock<Option<(Arc<TelemetryIndex>, Str)>>>,
+	provider_response_subscribed: Arc<AtomicBool>,
+	settings:                     Arc<BTreeMap<(Str, Str, Str), JsonMap<String, JsonValue>>>,
 }
 
 impl HookControlFactory {
@@ -1202,6 +1245,7 @@ impl HookControlFactory {
 		registries: Arc<RegistryControlFactory>,
 		dispatcher: Arc<dyn CallbackDispatcher>,
 		policies: BTreeMap<Str, HookEventPolicy>,
+		settings: BTreeMap<(Str, Str, Str), JsonMap<String, JsonValue>>,
 	) -> Arc<Self> {
 		Arc::new(Self {
 			registries,
@@ -1210,7 +1254,24 @@ impl HookControlFactory {
 			policies: Arc::new(RwLock::new(policies)),
 			subscriptions: Arc::new(RwLock::new(BTreeMap::new())),
 			usage_fetchers: UsageFetcherRegistry::default(),
+			mcp_queues: Arc::new(Mutex::new(BTreeMap::new())),
+			mcp_journal: Arc::new(RwLock::new(None)),
+			provider_response_subscribed: Arc::new(AtomicBool::new(false)),
+			settings: Arc::new(settings),
 		})
+	}
+
+	fn settings_for(&self, identity: &ControlConnectionIdentity) -> JsonMap<String, JsonValue> {
+		self
+			.settings
+			.get(&(identity.layer.clone(), identity.tier.clone(), identity.extension.clone()))
+			.cloned()
+			.unwrap_or_default()
+	}
+
+	/// Binds durable accounting for drop-oldest MCP queue overflow.
+	pub fn bind_mcp_drop_journal(&self, telemetry: Arc<TelemetryIndex>, session: Str) {
+		*self.mcp_journal.write() = Some((telemetry, session));
 	}
 
 	/// Returns the shared runtime provider usage registry.
@@ -1296,6 +1357,7 @@ impl HookControlFactory {
 					usage_registration_id(row),
 					Arc::new(ExtensionUsageFetcher {
 						provider:    ProviderId::from(provider.clone()),
+						settings:    self.settings_for(&row.identity),
 						identity:    Arc::clone(&row.identity),
 						session:     session.clone(),
 						dispatcher:  Arc::clone(&self.dispatcher),
@@ -1307,7 +1369,153 @@ impl HookControlFactory {
 				);
 			}
 		}
+		self.provider_response_subscribed.store(
+			subscriptions
+				.values()
+				.flatten()
+				.any(|row| row.event == "provider_response" && row.phase == "observe"),
+			Ordering::Release,
+		);
 		Ok(())
+	}
+
+	fn enqueue_mcp(&self, session_generation: u64, delivery: McpQueuedDelivery) {
+		{
+			let mut queues = self.mcp_queues.lock();
+			let queue = queues
+				.entry(session_generation)
+				.or_insert_with(|| McpDeliveryQueue {
+					pending:         VecDeque::with_capacity(MCP_HOOK_QUEUE_CAPACITY),
+					running_servers: BTreeSet::new(),
+					dropped:         0,
+				});
+			if queue.push(delivery) {
+				let dropped = queue.dropped;
+				tracing::warn!(
+					session_generation,
+					dropped,
+					"journal: dropped oldest MCP hook notification"
+				);
+				if let Some((telemetry, session)) = self.mcp_journal.read().clone() {
+					let encoded = json!({
+						"session_generation": session_generation,
+						"dropped": dropped,
+					})
+					.to_string();
+					tokio::task::spawn_blocking(move || {
+						let occurred_at_ms = time::SystemTime::now()
+							.duration_since(time::UNIX_EPOCH)
+							.map_or(0, |elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX));
+						let _ = telemetry.append(
+							session.as_str(),
+							"mcp_notification_dropped",
+							occurred_at_ms,
+							encoded.as_bytes(),
+						);
+					});
+				}
+			}
+		}
+		self.schedule_mcp(session_generation);
+	}
+
+	fn schedule_mcp(&self, session_generation: u64) {
+		loop {
+			let delivery = {
+				let mut queues = self.mcp_queues.lock();
+				let Some(queue) = queues.get_mut(&session_generation) else {
+					return;
+				};
+				let Some(index) = queue.pending.iter().position(|delivery| {
+					!queue
+						.running_servers
+						.contains(&delivery.notification.server)
+				}) else {
+					return;
+				};
+				let delivery = queue
+					.pending
+					.remove(index)
+					.expect("selected delivery exists");
+				queue
+					.running_servers
+					.insert(delivery.notification.server.clone());
+				delivery
+			};
+			let owner = self.clone();
+			tokio::spawn(async move {
+				let server = delivery.notification.server.clone();
+				owner
+					.clone()
+					.deliver_mcp(session_generation, delivery)
+					.await;
+				{
+					let mut queues = owner.mcp_queues.lock();
+					if let Some(queue) = queues.get_mut(&session_generation) {
+						queue.running_servers.remove(&server);
+					}
+				}
+				owner.schedule_mcp(session_generation);
+			});
+		}
+	}
+
+	async fn deliver_mcp(self, session_generation: u64, delivery: McpQueuedDelivery) {
+		for subscription in delivery.subscriptions {
+			let notification = &delivery.notification;
+			let mut arguments = JsonMap::new();
+			arguments
+				.insert(String::from("event"), JsonValue::String(String::from("mcp_notification")));
+			arguments.insert(String::from("phase"), JsonValue::String(String::from("observe")));
+			arguments.insert(String::from("name"), JsonValue::String(subscription.name.to_string()));
+			arguments.insert(
+				String::from("payload"),
+				json!({
+					"server": notification.server,
+					"method": notification.method,
+					"params": notification.params,
+					"sequence": notification.sequence,
+				}),
+			);
+			let _ = self
+				.dispatcher
+				.dispatch(Arc::clone(&subscription.identity), ControlDispatch {
+					operation: sf!("omp.hooks.dispatch"),
+					arguments,
+					authority: ControlInvocationAuthority {
+						invocation:        sf!(
+							"mcp-notification:{}:{}",
+							notification.server,
+							notification.sequence
+						),
+						phase:             InvocationPhase::Open,
+						session:           sf!("session-{session_generation}"),
+						turn:              None,
+						event:             Some(sf!("mcp_notification")),
+						call:              None,
+						device:            None,
+						effects:           Box::new([]),
+						place_kind:        sf!("host"),
+						lifecycle:         LifecyclePhase::Active,
+						roots:             Box::new([]),
+						remote:            false,
+						has_ui:            false,
+						headless:          true,
+						settings:          self.settings_for(&subscription.identity),
+						secret_settings:   Box::new([]),
+						data:              None,
+						direct_filesystem: None,
+					},
+					policy: subscription.concurrency,
+					deadline: EventDeadline {
+						at: time::Instant::now()
+							+ subscription
+								.timeout
+								.unwrap_or(subscription.event_policy.timeout),
+					},
+				})
+				.await;
+		}
 	}
 
 	async fn compose(
@@ -1397,6 +1605,266 @@ impl HookControlFactory {
 		}
 		Ok(modification.map_or_else(|| policy.default.clone(), JsonValue::Object))
 	}
+}
+
+impl McpNotificationSink for HookControlFactory {
+	fn interested(&self, server: &str, method: &str) -> bool {
+		self
+			.subscriptions
+			.read()
+			.values()
+			.flat_map(|rows| rows.iter())
+			.any(|row| {
+				row.event == "mcp_notification"
+					&& row.phase == "observe"
+					&& mcp_subscription_matches(row, server, method)
+			})
+	}
+
+	fn offer(&self, notification: McpHookNotification) {
+		let rows = self
+			.subscriptions
+			.read()
+			.values()
+			.flat_map(|rows| rows.iter())
+			.filter(|row| {
+				row.event == "mcp_notification"
+					&& row.phase == "observe"
+					&& mcp_subscription_matches(
+						row,
+						notification.server.as_str(),
+						notification.method.as_str(),
+					)
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		if rows.is_empty() {
+			return;
+		}
+		let mut by_session = BTreeMap::<u64, Vec<HookSubscription>>::new();
+		for row in rows {
+			by_session
+				.entry(row.identity.session_generation)
+				.or_default()
+				.push(row);
+		}
+		for (session_generation, subscriptions) in by_session {
+			self.enqueue_mcp(session_generation, McpQueuedDelivery {
+				notification: notification.clone(),
+				subscriptions,
+			});
+		}
+	}
+}
+
+impl ProviderResponseObserver for HookControlFactory {
+	fn subscribed(&self) -> bool {
+		self.provider_response_subscribed.load(Ordering::Relaxed)
+	}
+
+	fn observe(&self, observation: ProviderResponseObservation) {
+		let subscriptions = self
+			.subscriptions
+			.read()
+			.values()
+			.flatten()
+			.filter(|row| {
+				row.event == "provider_response"
+					&& row.phase == "observe"
+					&& row.providers.as_ref().is_none_or(|providers| {
+						providers
+							.iter()
+							.any(|provider| provider == observation.provider.as_str())
+					})
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		if subscriptions.is_empty() {
+			return;
+		}
+		let owner = self.clone();
+		tokio::spawn(async move {
+			for subscription in subscriptions {
+				let headers = observation
+					.headers
+					.iter()
+					.map(|(name, value)| (name.to_string(), JsonValue::String(value.to_string())))
+					.collect::<JsonMap<_, _>>();
+				let mut arguments = JsonMap::new();
+				arguments
+					.insert(String::from("event"), JsonValue::String(String::from("provider_response")));
+				arguments.insert(String::from("phase"), JsonValue::String(String::from("observe")));
+				arguments
+					.insert(String::from("name"), JsonValue::String(subscription.name.to_string()));
+				arguments.insert(
+					String::from("payload"),
+					json!({
+						"provider": observation.provider,
+						"model": {
+							"provider": observation.provider,
+							"api": observation.api,
+							"model": observation.model,
+						},
+						"status": observation.status,
+						"headers": headers,
+						"request_id": observation.request_id,
+					}),
+				);
+				let _ = owner
+					.dispatcher
+					.dispatch(Arc::clone(&subscription.identity), ControlDispatch {
+						operation: sf!("omp.hooks.dispatch"),
+						arguments,
+						authority: ControlInvocationAuthority {
+							invocation:        sf!(
+								"provider-response:{}:{}",
+								observation.provider,
+								observation.status
+							),
+							phase:             InvocationPhase::Open,
+							session:           sf!("session-{}", subscription.identity.session_generation),
+							turn:              None,
+							event:             Some(sf!("provider_response")),
+							call:              None,
+							device:            None,
+							effects:           Box::new([]),
+							place_kind:        sf!("host"),
+							lifecycle:         LifecyclePhase::Active,
+							roots:             Box::new([]),
+							remote:            false,
+							has_ui:            false,
+							headless:          true,
+							settings:          owner.settings_for(&subscription.identity),
+							secret_settings:   Box::new([]),
+							data:              None,
+							direct_filesystem: None,
+						},
+						policy: subscription.concurrency,
+						deadline: EventDeadline {
+							at: time::Instant::now()
+								+ subscription
+									.timeout
+									.unwrap_or(subscription.event_policy.timeout),
+						},
+					})
+					.await;
+			}
+		});
+	}
+}
+
+impl SessionRenameObserver for HookControlFactory {
+	fn renamed(&self, session: &SessionId, name: Option<&str>) {
+		let subscriptions = self
+			.subscriptions
+			.read()
+			.values()
+			.flatten()
+			.filter(|row| row.event == "session_renamed" && row.phase == "observe")
+			.cloned()
+			.collect::<Vec<_>>();
+		if subscriptions.is_empty() {
+			return;
+		}
+		let owner = self.clone();
+		let session = session.0.clone();
+		let name = name.map(Str::new);
+		tokio::spawn(async move {
+			for subscription in subscriptions {
+				let mut arguments = JsonMap::new();
+				arguments
+					.insert(String::from("event"), JsonValue::String(String::from("session_renamed")));
+				arguments.insert(String::from("phase"), JsonValue::String(String::from("observe")));
+				arguments
+					.insert(String::from("name"), JsonValue::String(subscription.name.to_string()));
+				arguments.insert(String::from("payload"), json!({"session": session, "name": name}));
+				let _ = owner
+					.dispatcher
+					.dispatch(Arc::clone(&subscription.identity), ControlDispatch {
+						operation: sf!("omp.hooks.dispatch"),
+						arguments,
+						authority: ControlInvocationAuthority {
+							invocation:        sf!("session-renamed:{session}"),
+							phase:             InvocationPhase::Open,
+							session:           session.clone(),
+							turn:              None,
+							event:             Some(sf!("session_renamed")),
+							call:              None,
+							device:            None,
+							effects:           Box::new([]),
+							place_kind:        sf!("host"),
+							lifecycle:         LifecyclePhase::Active,
+							roots:             Box::new([]),
+							remote:            false,
+							has_ui:            false,
+							headless:          true,
+							settings:          owner.settings_for(&subscription.identity),
+							secret_settings:   Box::new([]),
+							data:              None,
+							direct_filesystem: None,
+						},
+						policy: subscription.concurrency,
+						deadline: EventDeadline {
+							at: time::Instant::now()
+								+ subscription
+									.timeout
+									.unwrap_or(subscription.event_policy.timeout),
+						},
+					})
+					.await;
+			}
+		});
+	}
+}
+
+fn mcp_subscription_matches(subscription: &HookSubscription, server: &str, method: &str) -> bool {
+	mcp_filter_matches(subscription.servers.as_deref(), &subscription.method_globs, server, method)
+}
+
+fn mcp_filter_matches(
+	servers: Option<&[Str]>,
+	method_globs: &[Str],
+	server: &str,
+	method: &str,
+) -> bool {
+	let server_matches =
+		servers.is_none_or(|servers| servers.iter().any(|candidate| candidate == server));
+	let method_matches = method_globs.is_empty()
+		|| method_globs
+			.iter()
+			.any(|pattern| anchored_glob_matches(pattern, method));
+	server_matches && method_matches
+}
+
+fn anchored_glob_matches(pattern: &str, value: &str) -> bool {
+	let pattern = pattern.as_bytes();
+	let value = value.as_bytes();
+	let mut pattern_index = 0;
+	let mut value_index = 0;
+	let mut star = None;
+	let mut retry_value = 0;
+	while value_index < value.len() {
+		if pattern_index < pattern.len()
+			&& (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+		{
+			pattern_index += 1;
+			value_index += 1;
+		} else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+			star = Some(pattern_index);
+			pattern_index += 1;
+			retry_value = value_index;
+		} else if let Some(star_index) = star {
+			pattern_index = star_index + 1;
+			retry_value += 1;
+			value_index = retry_value;
+		} else {
+			return false;
+		}
+	}
+	while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+		pattern_index += 1;
+	}
+	pattern_index == pattern.len()
 }
 
 fn hook_callback_failure(
@@ -2926,6 +3394,63 @@ mod tests {
 			.is_none()
 		);
 	}
+	#[test]
+	fn mcp_filter_is_anchored_and_queue_drops_oldest() {
+		let servers = [sf!("github")];
+		let methods = [sf!("notifications/*"), sf!("acme/*")];
+		assert!(mcp_filter_matches(
+			Some(&servers),
+			&methods,
+			"github",
+			"notifications/tools/list_changed",
+		));
+		assert!(mcp_filter_matches(Some(&servers), &methods, "github", "acme/custom"));
+		assert!(!mcp_filter_matches(
+			Some(&servers),
+			&methods,
+			"linear",
+			"notifications/tools/list_changed",
+		));
+		assert!(!mcp_filter_matches(Some(&servers), &methods, "github", "other/update",));
+		assert!(anchored_glob_matches("notifications/*", "notifications/tools/list_changed"));
+		assert!(anchored_glob_matches("acme/??", "acme/ok"));
+		assert!(!anchored_glob_matches("notifications/*", "prefix/notifications/update"));
+		assert!(!anchored_glob_matches("acme/??", "acme/long"));
+
+		let mut queue = McpDeliveryQueue {
+			pending:         VecDeque::new(),
+			running_servers: BTreeSet::new(),
+			dropped:         0,
+		};
+		for sequence in 1..=102 {
+			queue.push(McpQueuedDelivery {
+				notification:  McpHookNotification {
+					server: sf!("github"),
+					method: sf!("notifications/update"),
+					params: JsonValue::Null,
+					sequence,
+				},
+				subscriptions: Vec::new(),
+			});
+		}
+		assert_eq!(queue.pending.len(), MCP_HOOK_QUEUE_CAPACITY);
+		assert_eq!(queue.dropped, 2);
+		assert_eq!(
+			queue
+				.pending
+				.front()
+				.map(|delivery| delivery.notification.sequence),
+			Some(3)
+		);
+		assert_eq!(
+			queue
+				.pending
+				.back()
+				.map(|delivery| delivery.notification.sequence),
+			Some(102)
+		);
+	}
+
 	#[test]
 	fn extension_usage_projection_is_typed_and_rejects_malformed_reports() {
 		let observed = time::UNIX_EPOCH + time::Duration::from_secs(10);
