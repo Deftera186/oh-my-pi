@@ -30,6 +30,7 @@ use crate::{
 	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 	autoqa::{AutoQaConsent, ConsentRequest, Decision},
+	login_panel::{LoginPanel, LoginPanelEvent},
 	modes::{GuidedGoalEvent, GuidedGoalInterview},
 	plan_review::{PlanReviewEvent, PlanReviewOverlay, PlanReviewSection},
 	selection_overlay::{SelectionEvent, SelectionOverlay},
@@ -968,7 +969,7 @@ pub enum InputAction {
 	Exit,
 	/// Cycle reasoning effort.
 	CycleThinking,
-	/// Toggle reasoning.
+	/// Toggle thinking-block visibility.
 	ToggleThinking,
 	/// Cycle the model roster forward.
 	CycleModelForward,
@@ -1179,11 +1180,6 @@ impl RetainedChat {
 			send(&self.intents, Intent::CycleThinking);
 			return RetainedChatEffect::Consumed;
 		}
-		if key == Key::Ctrl('t') {
-			let _ = self.host.chat.handle_key(key);
-			send(&self.intents, Intent::ToggleThinking);
-			return RetainedChatEffect::Consumed;
-		}
 		if key == Key::Alt('r') {
 			send(&self.intents, Intent::Retry);
 			return RetainedChatEffect::Consumed;
@@ -1308,7 +1304,9 @@ impl RetainedChat {
 				}
 			},
 			InputAction::CycleThinking => send(&self.intents, Intent::CycleThinking),
-			InputAction::ToggleThinking => send(&self.intents, Intent::ToggleThinking),
+			InputAction::ToggleThinking => {
+				let _ = self.host.chat.handle_key(Key::Ctrl('t'));
+			},
 			InputAction::CycleModelForward => self.host.cycle_model(false, &self.intents),
 			InputAction::CycleModelBackward => self.host.cycle_model(true, &self.intents),
 			InputAction::SelectModel => self.host.open_models(&self.ctx),
@@ -1457,18 +1455,20 @@ enum Overlay {
 	RawStream(RawStreamViewer),
 	AgentPrompt { prompt: PromptOverlay, agent_id: Str, revive: bool },
 	Providers(ProviderPicker),
-	Prompt(PromptOverlay),
 	Approval(ApprovalOverlay),
 	ApprovalAmend { prompt: PromptOverlay, ticket: ApprovalTicketView },
 	Ask { dialog: AskDialog, request: AskRequest },
 	ExtensionDialog { correlation: Str, dialog: ExtensionDialog },
 	ExtensionOverlay { overlay: ExtensionOverlay },
 	AutoQaConsent { dialog: AskDialog, consent: AutoQaConsent },
+	Login { panel: LoginPanel },
 }
 
 enum OverlayEvent {
 	Consumed,
 	Git(GitIntent),
+	LoginCancel,
+	LoginSubmit(Str),
 	GoalComplete { objective: Str, token_budget: Option<u64> },
 	PlanReviewComplete(Str),
 	PlanSavePathRequest(Str),
@@ -1547,7 +1547,6 @@ impl Overlay {
 				}
 			},
 			Self::Providers(picker) => picker_event(picker.handle_key(key)),
-			Self::Prompt(prompt) => prompt_event(prompt.handle_key(key)),
 			Self::Approval(approval) => {
 				approval_event(approval.ticket_id().clone(), approval.handle_key(key))
 			},
@@ -1562,6 +1561,7 @@ impl Overlay {
 			},
 			Self::ExtensionOverlay { overlay } => extension_modal_event(None, overlay.handle_key(key)),
 			Self::AutoQaConsent { dialog, .. } => autoqa_event(dialog.handle_key(key)),
+			Self::Login { panel } => login_event(panel.handle_key(key)),
 		}
 	}
 
@@ -1607,7 +1607,6 @@ impl Overlay {
 				}
 			},
 			Self::Providers(picker) => picker_event(picker.handle_paste(text)),
-			Self::Prompt(prompt) => prompt_event(prompt.handle_paste(text)),
 			Self::Approval(approval) => {
 				approval_event(approval.ticket_id().clone(), approval.handle_paste(text))
 			},
@@ -1624,6 +1623,7 @@ impl Overlay {
 				extension_modal_event(None, overlay.handle_paste(text))
 			},
 			Self::AutoQaConsent { dialog, .. } => autoqa_event(dialog.handle_paste(text)),
+			Self::Login { panel } => login_event(panel.handle_paste(text)),
 		}
 	}
 
@@ -1667,7 +1667,6 @@ impl Overlay {
 			Self::RawStream(viewer) => raw_stream_event(viewer.handle_mouse(kind)),
 			Self::AgentPrompt { .. } => OverlayEvent::Consumed,
 			Self::Providers(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
-			Self::Prompt(prompt) => prompt_event(prompt.handle_mouse(col, row, kind, viewport)),
 			Self::Approval(approval) => approval_event(
 				approval.ticket_id().clone(),
 				approval.handle_mouse(col, row, kind, viewport),
@@ -1690,6 +1689,7 @@ impl Overlay {
 			Self::AutoQaConsent { dialog, .. } => {
 				autoqa_event(dialog.handle_mouse(col, row, kind, viewport))
 			},
+			Self::Login { panel } => login_event(panel.handle_mouse(col, row, kind, viewport)),
 		}
 	}
 
@@ -1712,13 +1712,13 @@ impl Overlay {
 			Self::RawStream(viewer) => viewer.layer(viewport),
 			Self::AgentPrompt { prompt, .. } => prompt.layer(viewport),
 			Self::Providers(picker) => picker.layer(viewport),
-			Self::Prompt(prompt) => prompt.layer(viewport),
 			Self::Approval(approval) => approval.layer(viewport),
 			Self::ApprovalAmend { prompt, .. } => prompt.layer(viewport),
 			Self::Ask { dialog, .. } => dialog.layer(viewport),
 			Self::ExtensionDialog { dialog, .. } => dialog.layer(viewport),
 			Self::ExtensionOverlay { overlay } => overlay.layer(viewport),
 			Self::AutoQaConsent { dialog, .. } => dialog.layer(viewport),
+			Self::Login { panel } => panel.layer(viewport),
 		}
 	}
 }
@@ -1873,6 +1873,14 @@ fn autoqa_event(event: AskDialogEvent) -> OverlayEvent {
 				Decision::LocalOnly
 			})
 		},
+	}
+}
+
+fn login_event(event: LoginPanelEvent) -> OverlayEvent {
+	match event {
+		LoginPanelEvent::Consumed => OverlayEvent::Consumed,
+		LoginPanelEvent::Cancel => OverlayEvent::LoginCancel,
+		LoginPanelEvent::Submit(value) => OverlayEvent::LoginSubmit(value),
 	}
 }
 
@@ -2038,11 +2046,6 @@ async fn run_chat(
 										&& action_enabled(InputAction::CycleThinking)
 									{
 										send(intents, Intent::CycleThinking);
-									} else if key == Key::Ctrl('t')
-										&& action_enabled(InputAction::ToggleThinking)
-									{
-										let _ = host.chat.handle_key(key);
-										send(intents, Intent::ToggleThinking);
 									} else if key == Key::Alt('r')
 										&& action_enabled(InputAction::Retry)
 									{
@@ -2127,6 +2130,8 @@ async fn run_chat(
 											&& !action_enabled(InputAction::Exit))
 										|| (key == Key::Ctrl('o')
 											&& !action_enabled(InputAction::ToggleToolTree))
+										|| (key == Key::Ctrl('t')
+											&& !action_enabled(InputAction::ToggleThinking))
 										|| (key == Key::FollowUp
 											&& !action_enabled(InputAction::FollowUp))
 									{
@@ -2555,14 +2560,19 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 		BackendEvent::OpenAgentTree => open_agents(host, ctx),
 		BackendEvent::Pause => open_pause(host, ctx),
 		BackendEvent::NewSessionRequested => {},
-		BackendEvent::AuthPrompt { message, masked } => {
-			host.overlay = Some(Overlay::Prompt(PromptOverlay::open(message, masked, ctx)));
+		BackendEvent::LoginPanel { provider, event } => match &mut host.overlay {
+			Some(Overlay::Login { panel }) => panel.update(event),
+			_ => {
+				let mut panel = LoginPanel::open(provider, ctx);
+				panel.update(event);
+				host.overlay = Some(Overlay::Login { panel });
+			},
 		},
-		BackendEvent::AuthPromptClose => {
-			if matches!(host.overlay, Some(Overlay::Prompt(_))) {
+		BackendEvent::LoginPanelClose => {
+			if matches!(host.overlay, Some(Overlay::Login { .. })) {
 				host.overlay = None;
 			}
-			let _ = host.chat.apply_backend_event(BackendEvent::AuthPromptClose);
+			let _ = host.chat.apply_backend_event(BackendEvent::LoginPanelClose);
 		},
 		event => {
 			let _ = host.chat.apply_backend_event(event);
@@ -2843,11 +2853,11 @@ fn apply_overlay_event(
 				host.overlay = None;
 			},
 		},
-		OverlayEvent::Prompt(value) => {
+		OverlayEvent::Prompt(value) | OverlayEvent::LoginSubmit(value) => {
 			send(intents, Intent::AuthAnswer { value: value.to_string() });
 			host.overlay = None;
 		},
-		OverlayEvent::PromptCancel => {
+		OverlayEvent::PromptCancel | OverlayEvent::LoginCancel => {
 			send(intents, Intent::AuthCancel);
 			host.overlay = None;
 		},

@@ -563,26 +563,41 @@ impl<'a> Span<'a> {
 	}
 }
 struct RichText {
-	text:  String,
-	width: u16,
-	view:  Option<Ui>,
+	text:     String,
+	width:    u16,
+	/// Reasoning prose renders dim and italic, matching the live stream.
+	thinking: bool,
+	view:     Option<Ui>,
 }
 
 impl RichText {
 	fn new(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
-		let text = text.into();
-		let view = Self::view(&text, width, ctx);
-		Self { text, width, view }
+		Self::styled(text, width, false, ctx)
 	}
 
-	fn view(text: &str, width: u16, ctx: &UiContext) -> Option<Ui> {
-		Some(Ui::from_root(Markdown::new().text(Str::new(text)), width.max(1), ctx.clone()))
+	/// Builds a reasoning body rendered dim and italic.
+	fn thinking(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
+		Self::styled(text, width, true, ctx)
+	}
+
+	fn styled(text: impl Into<String>, width: u16, thinking: bool, ctx: &UiContext) -> Self {
+		let text = text.into();
+		let view = Self::view(&text, width, thinking, ctx);
+		Self { text, width, thinking, view }
+	}
+
+	fn view(text: &str, width: u16, thinking: bool, ctx: &UiContext) -> Option<Ui> {
+		let mut markdown = Markdown::new();
+		if thinking {
+			markdown = markdown.with(Prop::Dim, true).with(Prop::Italic, true);
+		}
+		Some(Ui::from_root(markdown.text(Str::new(text)), width.max(1), ctx.clone()))
 	}
 
 	fn resize(&mut self, width: u16, ctx: &UiContext) {
 		if self.width != width {
 			self.width = width;
-			self.view = Self::view(&self.text, width, ctx);
+			self.view = Self::view(&self.text, width, self.thinking, ctx);
 		}
 	}
 
@@ -848,18 +863,26 @@ struct LiveAssistant {
 	revealed:    usize,
 	last_reveal: Duration,
 	view:        Ui,
-	started:     Duration,
 	thinking:    bool,
 	allocation:  u16,
 }
 
 impl LiveAssistant {
-	fn new(ordinal: BlockOrdinal, id: Str, width: u16, ctx: &UiContext, started: Duration) -> Self {
-		let markdown = Markdown::new()
+	fn new(
+		ordinal: BlockOrdinal,
+		id: Str,
+		width: u16,
+		ctx: &UiContext,
+		started: Duration,
+		thinking: bool,
+	) -> Self {
+		let mut markdown = Markdown::new()
 			.with(Prop::Id, LIVE_ASSISTANT_ID)
-			.with(Prop::Partial, true)
-			.text("");
-		let view = Ui::from_root(markdown, width.max(1), ctx.clone());
+			.with(Prop::Partial, true);
+		if thinking {
+			markdown = markdown.with(Prop::Dim, true).with(Prop::Italic, true);
+		}
+		let view = Ui::from_root(markdown.text(""), width.max(1), ctx.clone());
 		Self {
 			ordinal,
 			id,
@@ -867,8 +890,7 @@ impl LiveAssistant {
 			revealed: 0,
 			last_reveal: started,
 			view,
-			started,
-			thinking: false,
+			thinking,
 			allocation: 0,
 		}
 	}
@@ -877,7 +899,6 @@ impl LiveAssistant {
 		let caught_up = self.revealed == self.text.len();
 		let was_empty = self.text.is_empty();
 		self.text.push_str(delta);
-		self.thinking |= self.text.as_str().starts_with("*Thinking:* ");
 		if !smooth {
 			return self.flush();
 		}
@@ -1052,10 +1073,7 @@ struct RetainedEntry {
 }
 
 struct ThinkingEntry {
-	body:     RichText,
-	elapsed:  Str,
-	expanded: bool,
-	visible:  bool,
+	body: RichText,
 }
 
 enum Entry {
@@ -1945,7 +1963,7 @@ impl Chat {
 			return ChatKey::Consumed;
 		}
 		if key == Key::Ctrl('t') {
-			self.toggle_latest_thinking();
+			self.toggle_thinking();
 			return ChatKey::Consumed;
 		}
 		if key == Key::Enter && self.composer_empty() && self.is_working() {
@@ -2157,28 +2175,39 @@ impl Chat {
 		}));
 	}
 
-	/// Begins a live assistant message.
+	/// Begins a live assistant prose message.
 	pub fn begin_assistant(&mut self, id: impl Into<Str>) {
+		self.begin_stream(id.into(), false);
+	}
+
+	/// Begins a live assistant reasoning stream, rendered dim and italic.
+	pub fn begin_thinking(&mut self, id: impl Into<Str>) {
+		self.begin_stream(id.into(), true);
+	}
+
+	fn begin_stream(&mut self, id: Str, thinking: bool) {
 		self.finalize_abandoned_streams();
 		let ordinal = self.blocks.create();
 		self.live_assistant = Some(LiveAssistant::new(
 			ordinal,
-			id.into(),
+			id,
 			Self::message_width(self.layout_width),
 			&self.ctx,
 			self.started_at.elapsed(),
+			thinking,
 		));
 		self.bump_live();
 	}
 
-	/// Finalizes and drops streams which did not receive their terminal event.
+	/// Settles streams which did not receive their terminal event.
 	///
-	/// The abandoned producer has no durable transcript item, so cleanup only
-	/// settles its allocation block; it never invents replacement transcript
-	/// content.
+	/// Text and thinking parts end implicitly when the next part starts, so an
+	/// assistant stream still live here settles exactly what it streamed;
+	/// dropping it would erase transcript content. Abandoned tools settle as
+	/// aborted cards.
 	fn finalize_abandoned_streams(&mut self) {
 		if let Some(assistant) = self.live_assistant.take() {
-			self.blocks.finalize(assistant.ordinal);
+			self.settle_assistant(assistant);
 		}
 		for tool in self.live_tools.drain(..) {
 			let label = fmts_mut!(
@@ -2224,61 +2253,65 @@ impl Chat {
 			.as_ref()
 			.is_some_and(|message| message.id.as_str() == id)
 		{
-			if let Some(message) = self.live_assistant.as_mut() {
-				let _ = message.flush();
-			}
 			let message = self
 				.live_assistant
 				.take()
 				.expect("matching live assistant exists");
-			let body = message
-				.text
-				.as_str()
-				.strip_prefix("*Thinking:* ")
-				.unwrap_or(message.text.as_str());
-			if message.thinking {
-				if !self.hide_thinking
-					&& let Some(body) = sanitize_thinking_text(body, true)
-				{
-					let elapsed =
-						elapsed_label(self.started_at.elapsed().saturating_sub(message.started));
-					let body = RichText::new(body, Self::message_width(self.layout_width), &self.ctx);
-					self.entries.insert(
-						message.ordinal,
-						Entry::Thinking(ThinkingEntry { body, elapsed, expanded: false, visible: true }),
-					);
-				}
-			} else {
-				let body = AssistantEntry::new(
-					body.to_owned(),
-					Self::message_width(self.layout_width),
-					&self.ctx,
-				);
-				self.entries.insert(message.ordinal, Entry::Assistant(body));
+			self.settle_assistant(message);
+		}
+	}
+
+	/// Converts one finished live assistant stream into its immutable
+	/// transcript entry and retires its allocation block.
+	fn settle_assistant(&mut self, mut message: LiveAssistant) {
+		let _ = message.flush();
+		if message.thinking {
+			if let Some(body) = sanitize_thinking_text(message.text.as_str(), true) {
+				let body = RichText::thinking(body, Self::message_width(self.layout_width), &self.ctx);
+				self
+					.entries
+					.insert(message.ordinal, Entry::Thinking(ThinkingEntry { body }));
 			}
+		} else {
+			let body = AssistantEntry::new(
+				message.text.as_str().to_owned(),
+				Self::message_width(self.layout_width),
+				&self.ctx,
+			);
+			self.entries.insert(message.ordinal, Entry::Assistant(body));
+		}
+		self.blocks.finalize(message.ordinal);
+		self.bump_live();
+	}
+
+	/// Discards a matching live assistant message without settling an entry.
+	///
+	/// Used when a retry attempt is about to re-stream the same content from
+	/// the start; settling the partial would duplicate the transcript.
+	pub fn abandon_assistant(&mut self, id: &str) {
+		if let Some(message) = self
+			.live_assistant
+			.take_if(|message| message.id.as_str() == id)
+		{
 			self.blocks.finalize(message.ordinal);
 			self.bump_live();
 		}
 	}
 
-	/// Begins a live tool card.
-	/// Toggles the latest finalized pending thinking block without mutating
-	/// transcript truth.
-	pub fn toggle_latest_thinking(&mut self) {
-		if self.hide_thinking {
+	/// Inserts one replayed reasoning block as a settled thinking entry.
+	pub fn push_thinking_replay(&mut self, text: &str) {
+		let Some(body) = sanitize_thinking_text(text, true) else {
 			return;
-		}
-		if let Some(thinking) = self
-			.entries
-			.range_mut(BlockOrdinal(self.blocks.frontier())..)
-			.rev()
-			.find_map(|(_, entry)| match entry {
-				Entry::Thinking(thinking) if thinking.visible => Some(thinking),
-				_ => None,
-			}) {
-			thinking.expanded = !thinking.expanded;
-			self.bump_live();
-		}
+		};
+		let body = RichText::thinking(body, Self::message_width(self.layout_width), &self.ctx);
+		self.enqueue_final(Entry::Thinking(ThinkingEntry { body }));
+	}
+
+	/// Toggles thinking-block visibility scene-wide without mutating
+	/// transcript truth: every unretired block and all future ones follow.
+	pub fn toggle_thinking(&mut self) {
+		self.hide_thinking = !self.hide_thinking;
+		self.bump_live();
 	}
 
 	/// Begins a live tool card.
@@ -2847,15 +2880,27 @@ impl Chat {
 					self.push_user(text.as_str(), chips);
 				}
 			},
+			BackendEvent::ThinkingReplayed { text } => {
+				if !self.suppress_history_replay {
+					self.push_thinking_replay(text.as_str());
+				}
+			},
 			BackendEvent::PromptDropped { text, attachments } => {
 				self.restore_dropped_prompt(text, attachments);
 			},
 			BackendEvent::QueuedPromptsRestored(prompts) => self.restore_queued_prompts(prompts),
-			BackendEvent::AssistantBegin { id } => self.begin_assistant(id),
+			BackendEvent::AssistantBegin { id, thinking } => {
+				if thinking {
+					self.begin_thinking(id);
+				} else {
+					self.begin_assistant(id);
+				}
+			},
 			BackendEvent::AssistantDelta { id, text } => {
 				self.append_assistant(id.as_str(), text.as_str());
 			},
 			BackendEvent::AssistantEnd { id } => self.end_assistant(id.as_str()),
+			BackendEvent::AssistantAbandoned { id } => self.abandon_assistant(id.as_str()),
 			BackendEvent::ToolStarted { id, name, rev, title } => {
 				self.tool_started(id, name, rev, title);
 			},
@@ -2943,8 +2988,8 @@ impl Chat {
 			| BackendEvent::LoginProviders(_)
 			| BackendEvent::LogoutChoices { .. }
 			| BackendEvent::RewindTargets(_)
-			| BackendEvent::AuthPrompt { .. }
-			| BackendEvent::AuthPromptClose
+			| BackendEvent::LoginPanel { .. }
+			| BackendEvent::LoginPanelClose
 			| BackendEvent::ApplySettings { .. }
 			| BackendEvent::Select { .. }
 			| BackendEvent::SettingsSchema(_)
@@ -3855,7 +3900,11 @@ impl Chat {
 	}
 
 	/// Draws one settled snapshot into the live viewport, keeping its latest
-	/// rows when the allocation is smaller than its natural height.
+	/// content rows when the allocation is smaller than its natural height.
+	///
+	/// Every entry renders one trailing spacer row; clipping drops that spacer
+	/// first so a one-row allocation still shows content (the latest reasoning
+	/// or prose row) instead of a blank line.
 	fn draw_settled_clipped(
 		&mut self,
 		ordinal: BlockOrdinal,
@@ -3879,9 +3928,13 @@ impl Chat {
 			.clip_scratch
 			.fill(Rect::new(0, 0, width, natural), base_style(self.ctx.theme));
 		Self::draw_entry(&mut self.clip_scratch, entry, 0, width, &self.ctx);
-		self
-			.frame
-			.blit(&self.clip_scratch, natural - height, height, 0, y);
+		self.frame.blit(
+			&self.clip_scratch,
+			natural.saturating_sub(height.saturating_add(1)),
+			height,
+			0,
+			y,
+		);
 	}
 
 	fn refresh_live_tool_card(tool: &mut LiveTool, width: u16, ctx: &UiContext) {
@@ -3960,12 +4013,10 @@ impl Chat {
 				}
 			},
 			Entry::Thinking(thinking) => {
-				if !thinking.visible {
+				if thinking.body.text.trim().is_empty() {
 					0
-				} else if thinking.expanded {
-					thinking.body.height().saturating_add(2)
 				} else {
-					2
+					thinking.body.height().saturating_add(1)
 				}
 			},
 			Entry::Peer { title, detail } => flowed_height(title, width.saturating_sub(4))
@@ -3999,13 +4050,6 @@ impl Chat {
 					assistant.body.height().saturating_add(1)
 				}
 			},
-			Entry::Thinking(thinking) => {
-				if thinking.expanded {
-					thinking.body.height().saturating_add(2)
-				} else {
-					2
-				}
-			},
 			_ => Self::entry_height(entry, width),
 		}
 	}
@@ -4023,26 +4067,6 @@ impl Chat {
 					0
 				} else {
 					draw_rich(frame, y, &assistant.body, 0, width, ctx.theme).saturating_add(1)
-				}
-			},
-			Entry::Thinking(thinking) => {
-				let marker = fmts_mut!("thinking · {} · ctrl+t", thinking.elapsed).freeze();
-				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
-					&marker,
-					ink(ctx.theme.muted).italic(),
-				)]);
-				if thinking.expanded {
-					draw_rich(
-						frame,
-						y.saturating_add(1),
-						&thinking.body,
-						1,
-						width.saturating_sub(1),
-						ctx.theme,
-					)
-					.saturating_add(2)
-				} else {
-					2
 				}
 			},
 			_ => Self::draw_entry(frame, entry, y, width, ctx),
@@ -4066,26 +4090,10 @@ impl Chat {
 				}
 			},
 			Entry::Thinking(thinking) => {
-				if !thinking.visible {
-					return 0;
-				}
-				let marker = fmts_mut!("thinking · {} · ctrl+t", thinking.elapsed).freeze();
-				draw_line(frame, 1, y, width.saturating_sub(2), &[Span::new(
-					&marker,
-					ink(ctx.theme.muted).italic(),
-				)]);
-				if thinking.expanded {
-					draw_rich(
-						frame,
-						y.saturating_add(1),
-						&thinking.body,
-						1,
-						width.saturating_sub(1),
-						ctx.theme,
-					)
-					.saturating_add(2)
+				if thinking.body.text.trim().is_empty() {
+					0
 				} else {
-					2
+					draw_rich(frame, y, &thinking.body, 0, width, ctx.theme).saturating_add(1)
 				}
 			},
 			Entry::Peer { title, detail } => {
@@ -4882,23 +4890,89 @@ mod tests {
 	}
 
 	#[test]
-	fn next_assistant_begin_finalizes_orphan_without_transcript_content() {
+	fn next_assistant_begin_settles_orphan_stream_content() {
 		let mut chat = Chat::new(&ctx());
 		chat.begin_assistant("orphan");
 		chat.append_assistant("orphan", "partial transport output");
 		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::Queued));
 
-		chat.begin_assistant("retry");
+		chat.begin_assistant("next");
 
 		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::FinalizedPending),);
-		assert!(!chat.entries.contains_key(&BlockOrdinal(0)));
+		assert!(matches!(
+			chat.entries.get(&BlockOrdinal(0)),
+			Some(Entry::Assistant(assistant)) if assistant.body.text.contains("partial transport output")
+		));
 		assert_eq!(
 			chat
 				.live_assistant
 				.as_ref()
 				.map(|message| message.id.as_str()),
-			Some("retry")
+			Some("next")
 		);
+	}
+
+	#[test]
+	fn next_assistant_begin_settles_streamed_thinking_as_entry() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_thinking("reasoning");
+		chat.append_assistant("reasoning", "weighing the options carefully.");
+
+		chat.begin_assistant("prose");
+
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::FinalizedPending));
+		assert!(matches!(
+			chat.entries.get(&BlockOrdinal(0)),
+			Some(Entry::Thinking(thinking)) if thinking.body.text.contains("weighing the options")
+		));
+	}
+
+	#[test]
+	fn retry_abandon_drops_partial_stream_without_entry() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_assistant("attempt-one");
+		chat.append_assistant("attempt-one", "partial answer the retry re-streams");
+
+		chat.abandon_assistant("attempt-one");
+
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::FinalizedPending));
+		assert!(!chat.entries.contains_key(&BlockOrdinal(0)));
+		assert!(chat.live_assistant.is_none());
+	}
+
+	#[test]
+	fn replayed_thinking_persists_with_visible_body() {
+		let mut chat = Chat::new(&ctx());
+		let passthrough = chat.apply_backend_event(BackendEvent::ThinkingReplayed {
+			text: sf!("Restored reasoning from durable history."),
+		});
+		assert!(passthrough.is_none());
+		assert!(matches!(
+			chat.entries.get(&BlockOrdinal(0)),
+			Some(Entry::Thinking(thinking)) if thinking.body.text.contains("Restored reasoning")
+		));
+
+		let viewport = Size::new(60, 12);
+		settle(&mut chat, viewport);
+		let text = frame_text(chat.render_at(viewport, Duration::from_millis(500)).frame);
+		assert!(text.contains("Restored reasoning from durable history"), "{text}");
+	}
+
+	#[test]
+	fn one_row_clip_of_thinking_shows_a_dim_italic_reasoning_row() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_thinking("reasoning");
+		chat.append_assistant("reasoning", "short reasoning line.");
+		chat.end_assistant("reasoning");
+		let viewport = Size::new(60, 12);
+		settle(&mut chat, viewport);
+
+		chat.draw_settled_clipped(BlockOrdinal(0), 0, 1, 2, viewport.width);
+
+		let row = omp_tui::test_support::frame_row_text(&chat.frame, 0);
+		assert!(row.contains("short reasoning line"), "{row}");
+		let style = omp_tui::test_support::frame_cell_style(&chat.frame, 0, 0).spec();
+		assert!(style.dim && style.italic, "reasoning rows must render dim + italic");
 	}
 
 	#[test]
@@ -5310,7 +5384,6 @@ mod tests {
 		);
 		let text = frame_text(chat.render_at(tight, Duration::from_millis(900)).frame);
 		assert!(text.contains("Implemented answer"), "{text}");
-		assert!(!text.contains("thinking ·"), "{text}");
 	}
 
 	#[test]
@@ -5434,8 +5507,8 @@ mod tests {
 	#[test]
 	fn finalized_thinking_retires_only_after_finalization() {
 		let mut chat = Chat::new(&ctx());
-		chat.begin_assistant("thinking");
-		chat.append_assistant("thinking", "*Thinking:* private reasoning");
+		chat.begin_thinking("thinking");
+		chat.append_assistant("thinking", "private reasoning");
 		assert!(chat.retirement_batch(Size::new(40, 0)).is_none());
 		chat.end_assistant("thinking");
 
@@ -5443,8 +5516,7 @@ mod tests {
 			.flush_retirement_batch(Size::new(40, 0))
 			.expect("final thinking snapshot retires");
 		let text = frame_text(&batch.frame);
-		assert!(text.contains("thinking ·"), "{text}");
-		assert!(!text.contains("private reasoning"), "{text}");
+		assert!(text.contains("private reasoning"), "{text}");
 	}
 
 	#[test]
@@ -5464,13 +5536,41 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		let viewport = Size::new(40, 10);
 		chat.set_hide_thinking(true);
-		chat.begin_assistant("a");
-		chat.append_assistant("a", "*Thinking:* private reasoning");
+		chat.begin_thinking("a");
+		chat.append_assistant("a", "private reasoning");
 
 		assert!(!frame_text(chat.render(viewport).frame).contains("private reasoning"));
 		chat.end_assistant("a");
 		assert!(!frame_text(chat.render(viewport).frame).contains("private reasoning"));
-		assert!(chat.entries.is_empty());
+		// The entry is retained so Ctrl+T can reveal it later.
+		assert!(matches!(chat.entries.get(&BlockOrdinal(0)), Some(Entry::Thinking(_))));
+	}
+
+	#[test]
+	fn ctrl_t_toggles_thinking_visibility_for_all_blocks_including_future_ones() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(40, 14);
+		chat.begin_thinking("first");
+		chat.append_assistant("first", "first deliberation");
+		chat.end_assistant("first");
+		settle(&mut chat, viewport);
+		assert!(frame_text(chat.render(viewport).frame).contains("first deliberation"));
+
+		assert_eq!(chat.handle_key(Key::Ctrl('t')), ChatKey::Consumed);
+		assert!(!frame_text(chat.render(viewport).frame).contains("first deliberation"));
+
+		// Future blocks stay hidden while the toggle is off.
+		chat.begin_thinking("second");
+		chat.append_assistant("second", "second deliberation");
+		chat.end_assistant("second");
+		let text = frame_text(chat.render(viewport).frame);
+		assert!(!text.contains("second deliberation"), "{text}");
+
+		// Toggling back reveals every unretired block.
+		chat.toggle_thinking();
+		let text = frame_text(chat.render(viewport).frame);
+		assert!(text.contains("first deliberation"), "{text}");
+		assert!(text.contains("second deliberation"), "{text}");
 	}
 
 	#[test]

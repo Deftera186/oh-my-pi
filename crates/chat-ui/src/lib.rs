@@ -22,6 +22,7 @@ pub mod gradient;
 pub mod host;
 pub mod inspector;
 pub mod log_viewer;
+pub mod login_panel;
 pub mod modes;
 mod overlays;
 pub mod palette;
@@ -597,8 +598,6 @@ pub enum Intent {
 		/// `true` cycles to the previous roster entry.
 		backward: bool,
 	},
-	/// Toggle reasoning between off and the last/default enabled level.
-	ToggleThinking,
 	/// Cycle to the next supported reasoning effort.
 	CycleThinking,
 	/// Request an enablement change from the extension configuration owner.
@@ -724,6 +723,12 @@ pub enum BackendEvent {
 		/// Display labels for replayed attachments.
 		chips: Vec<Str>,
 	},
+	/// Replay one assistant reasoning block from durable history as a
+	/// settled dim-italic thinking entry.
+	ThinkingReplayed {
+		/// Reasoning text.
+		text: Str,
+	},
 	/// Return a user prompt that was dropped before the first turn committed.
 	PromptDropped {
 		/// Prompt text exactly as submitted.
@@ -736,7 +741,9 @@ pub enum BackendEvent {
 	/// Begin a streamed assistant message.
 	AssistantBegin {
 		/// Stable message identifier.
-		id: Str,
+		id:       Str,
+		/// Whether the stream carries provider reasoning rather than prose.
+		thinking: bool,
 	},
 	/// Append text to a streamed assistant message.
 	AssistantDelta {
@@ -747,6 +754,12 @@ pub enum BackendEvent {
 	},
 	/// Finish a streamed assistant message.
 	AssistantEnd {
+		/// Stable message identifier.
+		id: Str,
+	},
+	/// Discard a streamed assistant message whose content a retry attempt is
+	/// about to re-stream from the start.
+	AssistantAbandoned {
 		/// Stable message identifier.
 		id: Str,
 	},
@@ -977,15 +990,15 @@ pub enum BackendEvent {
 	},
 	/// Replace rewind choices.
 	RewindTargets(Vec<RewindTargetRow>),
-	/// Open a backend authentication prompt.
-	AuthPrompt {
-		/// Prompt title or message.
-		message: Str,
-		/// Whether input must be masked.
-		masked:  bool,
+	/// Open or update the interactive login panel.
+	LoginPanel {
+		/// Provider being authenticated; identifies the panel on open.
+		provider: Str,
+		/// Update applied to the panel.
+		event:    login_panel::LoginEvent,
 	},
-	/// Close the active authentication prompt.
-	AuthPromptClose,
+	/// Close the active login panel.
+	LoginPanelClose,
 	/// Begin a rewind replay, identifying the selected user-message boundary.
 	HistoryRewind {
 		/// Chronological user-message index on the current branch.
