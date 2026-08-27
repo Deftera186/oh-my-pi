@@ -7,11 +7,43 @@ use omp_core::Str;
 use serde::{Deserialize, Serialize};
 
 use super::{
-	ExtensionCode, ExtensionError, resolver::compare_versions, trust::verify_signed_payload,
+	ExtensionCode, ExtensionError,
+	config::{FeatureManifest, StaticDeclaration},
+	resolver::compare_versions,
+	trust::{KeyRotation, verify_signed_payload},
 };
 
 /// Current signed-index format.
 pub const INDEX_VERSION: u32 = 1;
+/// Ordered configured signed-index sources.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexConfig {
+	/// First-index precedence entries.
+	#[serde(default, rename = "index")]
+	pub entries: Vec<IndexConfigEntry>,
+}
+
+/// One named signed-index URL.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexConfigEntry {
+	/// Stable local index name.
+	pub name: Str,
+	/// HTTPS URL of the signed index snapshot.
+	pub url:  String,
+}
+
+impl IndexConfig {
+	/// Reads an absent config as an empty index list.
+	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
+		if !path.exists() {
+			return Ok(Self::default());
+		}
+		let text = fs::read_to_string(path)
+			.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))?;
+		toml::from_str(&text)
+			.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))
+	}
+}
 
 /// One explicit claim that an extension may shadow a bundled capability.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,7 +71,8 @@ pub struct IndexArtifact {
 	pub blake3:    Str,
 	/// SHA-256 digest prefixed by `sha256:`.
 	pub sha256:    Str,
-	/// Publisher signature over both hashes and the capability digest.
+	/// Publisher signature over both hashes and the complete manifest
+	/// capability graph digest.
 	pub signature: Str,
 }
 
@@ -47,22 +80,62 @@ pub struct IndexArtifact {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexRelease {
 	/// Exact PEP 440 release version.
-	pub version:           Str,
+	pub version:                    Str,
 	/// Canonical manifest BLAKE3 digest.
-	pub manifest_digest:   Str,
+	pub manifest_digest:            Str,
+	/// Complete signed capability-graph digest.
+	#[serde(default)]
+	pub manifest_capability_digest: Str,
 	/// Digest of declared capabilities and hard-tool claims.
-	pub capability_digest: Str,
+	pub capability_digest:          Str,
+	/// Base dependency requirements.
+	#[serde(default)]
+	pub requires:                   Vec<Str>,
+	/// Base capability grants.
+	#[serde(default)]
+	pub capabilities:               Vec<Str>,
+	/// Named optional features.
+	#[serde(default)]
+	pub features:                   std::collections::BTreeMap<Str, FeatureManifest>,
+	/// Complete signed declaration inventory.
+	#[serde(default)]
+	pub declarations:               Vec<StaticDeclaration>,
 	/// Whether index review/attestation completed.
 	#[serde(default)]
-	pub attested:          bool,
+	pub attested:                   bool,
 	/// Whether the release is yanked from new resolutions.
 	#[serde(default)]
-	pub yanked:            bool,
+	pub yanked:                     bool,
 	/// Explicit bundled-name shadow claims.
 	#[serde(default)]
-	pub shadows:           Vec<ShadowClaim>,
+	pub shadows:                    Vec<ShadowClaim>,
 	/// Target artifacts.
-	pub artifacts:         Vec<IndexArtifact>,
+	pub artifacts:                  Vec<IndexArtifact>,
+}
+
+impl IndexRelease {
+	/// Digest covered by the publisher artifact signature.
+	pub fn signature_capability_digest(&self) -> &Str {
+		if self.manifest_capability_digest.is_empty() {
+			&self.capability_digest
+		} else {
+			&self.manifest_capability_digest
+		}
+	}
+
+	/// Reconstructs the signed manifest surface needed for feature projection.
+	pub fn deployment_manifest(&self) -> crate::config::DeploymentManifest {
+		crate::config::DeploymentManifest {
+			id:           Str::new_static(""),
+			entry:        Str::new_static(""),
+			settings:     Default::default(),
+			requires:     self.requires.clone(),
+			capabilities: self.capabilities.clone(),
+			features:     self.features.clone(),
+			binaries:     Vec::new(),
+			declarations: self.declarations.clone(),
+		}
+	}
 }
 
 /// One publisher-scoped extension identity.
@@ -77,6 +150,9 @@ pub struct IndexExtension {
 	pub description:   Str,
 	/// Base64 Ed25519 publisher key.
 	pub publisher_key: Str,
+	/// Optional key continuity proof signed by the previously pinned key.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub key_rotation:  Option<KeyRotation>,
 	/// Available immutable releases.
 	pub releases:      Vec<IndexRelease>,
 }
@@ -160,6 +236,14 @@ impl SignedIndex {
 					"index extension has an empty identity or publisher key",
 				));
 			}
+			if extension.key_rotation.as_ref().is_some_and(|rotation| {
+				rotation.id != extension.id || rotation.new_key != extension.publisher_key
+			}) {
+				return Err(ExtensionError::new(
+					ExtensionCode::EKeyChanged,
+					"index key rotation does not match its extension identity",
+				));
+			}
 			if previous.is_some_and(|previous| previous >= &extension.id) || !ids.insert(&extension.id)
 			{
 				return Err(ExtensionError::new(
@@ -182,6 +266,20 @@ impl SignedIndex {
 						ExtensionCode::ETargetMissing,
 						"index release has no target artifacts",
 					));
+				}
+				if !release.features.is_empty()
+					|| !release.capabilities.is_empty()
+					|| !release.declarations.is_empty()
+				{
+					let manifest = release.deployment_manifest();
+					manifest.validate()?;
+					let digest = crate::config::manifest_capability_digest(&manifest)?;
+					if release.manifest_capability_digest != digest {
+						return Err(ExtensionError::new(
+							ExtensionCode::EIntegrity,
+							"index release capability graph digest is not canonical",
+						));
+					}
 				}
 				let mut targets = BTreeSet::new();
 				for artifact in &release.artifacts {
@@ -303,13 +401,18 @@ mod tests {
 
 	fn release(version: &'static str) -> IndexRelease {
 		IndexRelease {
-			version:           Str::new_static(version),
-			manifest_digest:   Str::new_static("b3:manifest"),
-			capability_digest: Str::new_static("b3:capabilities"),
-			attested:          true,
-			yanked:            false,
-			shadows:           Vec::new(),
-			artifacts:         Vec::new(),
+			version:                    Str::new_static(version),
+			manifest_digest:            Str::new_static("b3:manifest"),
+			manifest_capability_digest: Str::new_static("b3:capabilities"),
+			capability_digest:          Str::new_static("b3:capabilities"),
+			requires:                   Vec::new(),
+			capabilities:               Vec::new(),
+			features:                   std::collections::BTreeMap::new(),
+			declarations:               Vec::new(),
+			attested:                   true,
+			yanked:                     false,
+			shadows:                    Vec::new(),
+			artifacts:                  Vec::new(),
 		}
 	}
 
@@ -328,6 +431,7 @@ mod tests {
 			distribution:  Str::new_static("sample"),
 			description:   Str::new_static(""),
 			publisher_key: Str::new_static("key"),
+			key_rotation:  None,
 			releases:      vec![release("2.0rc1"), release("1.9"), release("2.0")],
 		};
 		assert_eq!(index.latest_release(&extension, false).unwrap().version, "2.0");

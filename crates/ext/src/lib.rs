@@ -52,13 +52,28 @@ pub enum TrustTier {
 ///
 /// Every extension subsystem emits one of these values; callers should use
 /// [`ExtensionCode::as_ref`] rather than inventing string codes.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Hash, IntoStaticStr, PartialEq)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	PartialEq,
+	Serialize,
+)]
+#[serde(rename_all = "SCREAMING-KEBAB-CASE")]
 #[strum(serialize_all = "SCREAMING-KEBAB-CASE", ascii_case_insensitive)]
 pub enum ExtensionCode {
 	/// A named source had no extension manifest.
 	ENoManifest,
 	/// An extension manifest could not be parsed.
 	EManifestParse,
+	/// A requested or declared feature is unknown or malformed.
+	EFeature,
 	/// A capability lies outside the closed vocabulary.
 	ECapUnknown,
 	/// An executable capability was open-ended.
@@ -121,6 +136,8 @@ pub enum ExtensionCode {
 	EGrantUnknown,
 	/// Extension settings attempted to carry a secret.
 	ESettingSecret,
+	/// Startup update policy attempted scope escalation or was malformed.
+	EUpdatePolicy,
 	/// A trusted extension failed to load.
 	ETrustedLoad,
 	/// A host binary does not export the `CPython` C API.

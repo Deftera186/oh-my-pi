@@ -13,6 +13,7 @@ use omp_core::Str;
 use pep440_rs::{Version, VersionSpecifiers};
 
 use super::{ExtensionCode, ExtensionError};
+use crate::config::FeatureManifest;
 
 /// The `CPython` ABI tags allowed by R3.
 pub const ACCEPTED_ABIS: [&str; 3] = ["cp314t", "abi3t", "none"];
@@ -283,6 +284,26 @@ pub type EnabledExtension = ResolveRequirement;
 pub struct ResolvePlan {
 	/// Exactly one `uv` request per materializing target.
 	pub requests: Vec<UvRequest>,
+}
+
+/// Returns base requirements plus requirements owned by selected features.
+///
+/// Unknown features fail before a resolver process is constructed.
+pub fn selected_requirements(
+	base: &[Str],
+	features: &std::collections::BTreeMap<Str, FeatureManifest>,
+	selected: &[Str],
+) -> Result<Vec<Str>, ExtensionError> {
+	let mut requirements = base.to_vec();
+	for name in selected {
+		let feature = features.get(name).ok_or_else(|| {
+			ExtensionError::new(ExtensionCode::EFeature, format!("unknown feature {name}"))
+		})?;
+		requirements.extend(feature.requires.iter().cloned());
+	}
+	requirements.sort();
+	requirements.dedup();
+	Ok(requirements)
 }
 
 impl ResolvePlan {

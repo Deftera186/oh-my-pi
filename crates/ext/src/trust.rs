@@ -6,6 +6,7 @@ use jiff::Timestamp;
 use omp_core::{Hash32, Str, base64, encoding::hex, sf};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::{
 	ExtensionCode, ExtensionError, Layer, TrustTier, WorkspaceUri, lock::atomic_toml,
@@ -45,6 +46,18 @@ pub struct GrantsFile {
 	/// Durable grants.
 	#[serde(rename = "grant", default)]
 	pub grants:  Vec<Grant>,
+}
+
+/// Failure while committing an operator grant through the canonical grant
+/// file writer.
+#[derive(Debug, Error)]
+pub enum GrantPersistenceError {
+	/// Existing grant state could not be decoded.
+	#[error("existing extension grants could not be read")]
+	Read(#[source] ExtensionError),
+	/// The atomically replaced grant file could not be written.
+	#[error("extension grants could not be persisted")]
+	Write(#[source] io::Error),
 }
 
 /// Returns whether an existing operator grant exactly admits an extension.
@@ -149,6 +162,24 @@ impl GrantsFile {
 	pub fn write(&self, path: &Path) -> io::Result<()> {
 		atomic_toml(path, self)
 	}
+
+	/// Replaces the prior decision for one extension and atomically persists the
+	/// operator's new durable grant.
+	///
+	/// This is the sole read-modify-write entry point for interactive consent;
+	/// callers cannot accidentally update an in-memory copy without committing
+	/// it through the trust domain's atomic writer.
+	pub fn persist(path: &Path, grant: Grant) -> Result<Self, GrantPersistenceError> {
+		let mut grants = Self::read(path).map_err(GrantPersistenceError::Read)?;
+		grants.grants.retain(|existing| {
+			existing.id != grant.id
+				|| existing.layer != grant.layer
+				|| existing.workspace != grant.workspace
+		});
+		grants.grants.push(grant);
+		grants.write(path).map_err(GrantPersistenceError::Write)?;
+		Ok(grants)
+	}
 }
 
 /// A TOFU-pinned publisher key.
@@ -227,16 +258,31 @@ impl KeysFile {
 				"publisher key changed without a signed rotation",
 			));
 		};
-		verify_signature(
-			pin.key.as_str(),
-			format!("{}\n{}", rotation.id, rotation.new_key).as_bytes(),
-			rotation.signature.as_str(),
-		)?;
+		verify_publisher_rotation(pin.key.as_str(), id, key.as_str(), rotation)?;
 		pin.key.clone_from(key);
 		Ok(Some(ExtensionCode::WKeyRotated))
 	}
 }
 
+/// Verifies publisher-key continuity against the exact previously pinned key.
+pub fn verify_publisher_rotation(
+	current_key: &str,
+	id: &Str,
+	new_key: &str,
+	rotation: &KeyRotation,
+) -> Result<(), ExtensionError> {
+	if rotation.id != *id || rotation.new_key != new_key {
+		return Err(ExtensionError::new(
+			ExtensionCode::EKeyChanged,
+			"publisher key changed without a matching signed rotation",
+		));
+	}
+	verify_signature(
+		current_key,
+		format!("{}\n{}", rotation.id, rotation.new_key).as_bytes(),
+		rotation.signature.as_str(),
+	)
+}
 /// A revoked extension version predicate. Version matching is deliberately
 /// delegated to the resolver; materialization compares exact lock versions.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -507,6 +553,26 @@ mod tests {
 			&sf!("pickle"),
 		));
 	}
+	#[test]
+	fn interactive_persist_round_trips_through_the_canonical_writer() {
+		let directory = tempfile::tempdir().expect("grant directory");
+		let path = directory.path().join("grants.toml");
+		let grant = Grant {
+			id:                sf!("acme.reviewer"),
+			publisher:         sf!("ed25519:publisher"),
+			layer:             Layer::Client,
+			workspace:         None,
+			capability_digest: sf!("b3:capabilities"),
+			tier:              TrustTier::Sandboxed,
+			ship:              sf!("installed"),
+			granted_at:        sf!("2026-08-27T00:00:00Z"),
+			granted_by:        sf!("interactive"),
+		};
+		let persisted = GrantsFile::persist(&path, grant.clone()).expect("persist grant");
+		assert_eq!(persisted.grants, [grant.clone()]);
+		assert_eq!(GrantsFile::read(&path).expect("read grant").grants, [grant]);
+	}
+
 	#[test]
 	fn revocations_apply_pep_440_predicates_to_exact_locked_versions() {
 		let list = RevocationsFile {

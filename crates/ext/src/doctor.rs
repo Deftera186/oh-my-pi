@@ -85,12 +85,9 @@ pub enum CredentialHealth {
 /// with no lock; it never selects versions or mutates publisher trust.
 pub fn diagnose(request: &DoctorRequest<'_>, health: &impl RuntimeHealth) -> Vec<DoctorFinding> {
 	let mut findings = Vec::new();
-	let lock = match LockFile::read(request.lock_path, request.layer) {
-		Ok(lock) => Some(lock),
-		Err(error) => {
-			findings.push(finding(Some(error.code), DoctorSeverity::Error, None, error.detail, false));
-			None
-		},
+	let (lock, lock_error) = match LockFile::read(request.lock_path, request.layer) {
+		Ok(lock) => (Some(lock), None),
+		Err(error) => (None, Some(error)),
 	};
 	let mut installed = match InstalledRecord::read(request.installed_path) {
 		Ok(installed) => installed,
@@ -99,6 +96,15 @@ pub fn diagnose(request: &DoctorRequest<'_>, health: &impl RuntimeHealth) -> Vec
 			InstalledRecord::default()
 		},
 	};
+	if let Some(error) = lock_error
+		&& installed.extensions.iter().any(|entry| {
+			!entry
+				.source
+				.as_table()
+				.is_some_and(|source| source.contains_key("link") || source.contains_key("path"))
+		}) {
+		findings.push(finding(Some(error.code), DoctorSeverity::Error, None, error.detail, false));
+	}
 	let keys = match KeysFile::read(request.keys_path) {
 		Ok(keys) => Some(keys),
 		Err(error) => {
@@ -122,10 +128,22 @@ pub fn diagnose(request: &DoctorRequest<'_>, health: &impl RuntimeHealth) -> Vec
 			.as_ref()
 			.and_then(|lock| lock.extensions.iter().find(|locked| locked.id == entry.id))
 		else {
+			if let Some(source) = entry.source.as_table()
+				&& let Some(path) = source.get("link").and_then(toml::Value::as_str)
+			{
+				findings.push(finding(
+					None,
+					DoctorSeverity::Ok,
+					Some(entry.id.clone()),
+					Str::from(format!("linked source {path}; unsigned (signature verification exempt)")),
+					false,
+				));
+				continue;
+			}
 			if entry
 				.source
 				.as_table()
-				.is_some_and(|source| source.contains_key("link") || source.contains_key("path"))
+				.is_some_and(|source| source.contains_key("path"))
 			{
 				continue;
 			}
@@ -237,7 +255,7 @@ fn verify_artifact(path: &Path, locked: &LockedExtension) -> Result<(), Str> {
 		locked.publisher.as_str(),
 		locked.wheel.blake3.as_str(),
 		locked.wheel.sha256.as_str(),
-		locked.capability_digest.as_str(),
+		locked.manifest_capability_digest.as_str(),
 		locked.signature.as_str(),
 	)
 	.map_err(|error| error.detail)
@@ -276,4 +294,66 @@ pub fn active_paths(request: &DoctorRequest<'_>) -> Vec<PathBuf> {
 		request.installed_path.to_path_buf(),
 		request.site_root.to_path_buf(),
 	]
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{TrustTier, lock::InstalledExtension};
+
+	struct Healthy;
+	impl RuntimeHealth for Healthy {
+		fn environment_ready(&self) -> bool {
+			true
+		}
+
+		fn credential_health(&self, _extension_id: &str) -> CredentialHealth {
+			CredentialHealth::NotRequired
+		}
+	}
+
+	#[test]
+	fn linked_extension_is_reported_as_unsigned_and_signature_exempt() {
+		let tree = tempfile::tempdir().expect("doctor tree");
+		let link = tree.path().join("demo");
+		fs::create_dir(&link).expect("link root");
+		let installed_path = tree.path().join("installed.toml");
+		InstalledRecord {
+			version:    2,
+			extensions: vec![InstalledExtension {
+				id:       Str::new_static("demo"),
+				features: Vec::new(),
+				source:   toml::Value::Table(toml::Table::from_iter([(
+					"link".to_owned(),
+					toml::Value::String(link.display().to_string()),
+				)])),
+				tier:     TrustTier::Sandboxed,
+				enabled:  true,
+			}],
+		}
+		.write(&installed_path)
+		.expect("installed record");
+		let request = DoctorRequest {
+			layer:            Layer::Client,
+			lock_path:        &tree.path().join("omp.lock"),
+			installed_path:   &installed_path,
+			keys_path:        &tree.path().join("keys.toml"),
+			revocations_path: None,
+			site_root:        &tree.path().join("sites"),
+			artifact_cache:   &tree.path().join("artifacts"),
+			fix:              false,
+		};
+		let findings = diagnose(&request, &Healthy);
+		assert!(
+			!findings
+				.iter()
+				.any(|finding| finding.severity == DoctorSeverity::Error)
+		);
+		assert!(findings.iter().any(|finding| {
+			finding.extension_id.as_deref() == Some("demo")
+				&& finding.severity == DoctorSeverity::Ok
+				&& finding.detail.contains("linked source")
+				&& finding.detail.contains("unsigned")
+		}));
+	}
 }

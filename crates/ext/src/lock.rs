@@ -13,7 +13,7 @@ use toml::map;
 use super::{ExtensionCode, ExtensionError, Layer, TrustTier};
 
 /// Current `omp.lock` format version.
-pub const LOCK_VERSION: u32 = 1;
+pub const LOCK_VERSION: u32 = 2;
 
 /// A hash-addressed wheel accepted by a target.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -34,32 +34,37 @@ pub struct Wheel {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LockedExtension {
 	/// Stable extension id.
-	pub id:                Str,
+	pub id: Str,
 	/// Exact PEP 440 version.
-	pub version:           Str,
+	pub version: Str,
 	/// Requested isolation tier.
-	pub tier:              TrustTier,
+	pub tier: TrustTier,
 	/// Optional explicit sharing group.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub pool:              Option<Str>,
+	pub pool: Option<Str>,
 	/// Features enabled while resolving.
-	pub features:          Vec<Str>,
+	pub features: Vec<Str>,
 	/// Reproducible source description, never a link source.
-	pub source:            toml::Value,
+	pub source: toml::Value,
 	/// Canonical manifest BLAKE3 digest.
-	pub manifest_digest:   Str,
+	pub manifest_digest: Str,
+	/// Canonical digest of the selected declaration projection.
+	pub declaration_digest: Str,
 	/// Capability digest used for consent.
 	pub capability_digest: Str,
+	/// Canonical digest of the complete signed capability graph.
+	pub manifest_capability_digest: Str,
 	/// TOFU publisher key.
-	pub publisher:         Str,
-	/// Publisher signature over both artifact hashes and capability digest.
-	pub signature:         Str,
+	pub publisher: Str,
+	/// Publisher signature over both artifact hashes and the complete manifest
+	/// capability graph digest.
+	pub signature: Str,
 	/// Code shipping level.
-	pub ship:              Str,
+	pub ship: Str,
 	/// Exact direct requirements.
-	pub requires:          Vec<Str>,
+	pub requires: Vec<Str>,
 	/// Extension's primary wheel.
-	pub wheel:             Wheel,
+	pub wheel: Wheel,
 }
 
 /// A package closure node with one wheel per supported target.
@@ -158,6 +163,17 @@ impl LockFile {
 				return Err(ExtensionError::new(
 					ExtensionCode::ELockDup,
 					format!("duplicate extension id {}", extension.id),
+				));
+			}
+			validate_canonical_features(&extension.features)?;
+			if extension.manifest_digest.is_empty()
+				|| extension.declaration_digest.is_empty()
+				|| extension.capability_digest.is_empty()
+				|| extension.manifest_capability_digest.is_empty()
+			{
+				return Err(ExtensionError::new(
+					ExtensionCode::ELockDrift,
+					format!("{} has an incomplete digest set", extension.id),
 				));
 			}
 			if extension
@@ -268,20 +284,23 @@ pub struct InstalledRecord {
 }
 
 const fn installed_version() -> u32 {
-	1
+	2
 }
 
 /// One local extension selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InstalledExtension {
 	/// Stable extension id.
-	pub id:      Str,
+	pub id:       Str,
+	/// Fully expanded, sorted concrete feature selection.
+	#[serde(default)]
+	pub features: Vec<Str>,
 	/// Local source, including permitted `{ link = ... }` overlays.
-	pub source:  toml::Value,
+	pub source:   toml::Value,
 	/// Requested tier.
-	pub tier:    TrustTier,
+	pub tier:     TrustTier,
 	/// Whether this local selection is enabled.
-	pub enabled: bool,
+	pub enabled:  bool,
 }
 
 /// The materialized per-host site tree carried into the Python package
@@ -482,8 +501,19 @@ impl InstalledRecord {
 		}
 		let text = fs::read_to_string(path)
 			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
-		toml::from_str(&text)
-			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))
+		let mut record: Self = toml::from_str(&text)
+			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
+		if record.version > installed_version() {
+			return Err(ExtensionError::new(
+				ExtensionCode::ELockVersion,
+				"install record format is newer than this binary",
+			));
+		}
+		for extension in &record.extensions {
+			validate_canonical_features(&extension.features)?;
+		}
+		record.version = installed_version();
+		Ok(record)
 	}
 
 	/// Atomically writes `installed.toml`.
@@ -507,6 +537,25 @@ pub(crate) fn atomic_toml<T: Serialize>(path: &Path, value: &T) -> io::Result<()
 	fs::write(&temporary, data)?;
 	fs::rename(temporary, path)
 }
+fn validate_canonical_features(features: &[Str]) -> Result<(), ExtensionError> {
+	let mut previous: Option<&Str> = None;
+	for feature in features {
+		if feature.is_empty() || feature.as_str().trim() != feature.as_str() {
+			return Err(ExtensionError::new(
+				ExtensionCode::EFeature,
+				"feature names must be non-empty and trimmed",
+			));
+		}
+		if previous.is_some_and(|previous| previous >= feature) {
+			return Err(ExtensionError::new(
+				ExtensionCode::EFeature,
+				"concrete features must be unique and lexically sorted",
+			));
+		}
+		previous = Some(feature);
+	}
+	Ok(())
+}
 
 /// Builds the source table used by reproducible lock entries.
 pub fn index_source(index: &str, distribution: &Str) -> toml::Value {
@@ -524,7 +573,7 @@ mod tests {
 
 	fn lock() -> LockFile {
 		LockFile {
-			version:         1,
+			version:         LOCK_VERSION,
 			generated_by:    "omp test".to_owned(),
 			generated_at:    "2026-08-20T00:00:00Z".to_owned(),
 			layer:           Layer::Workspace,
