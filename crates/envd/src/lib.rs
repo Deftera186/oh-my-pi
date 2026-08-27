@@ -304,6 +304,22 @@ impl ExtensionReloadHandle {
 	pub async fn reload(&self) -> Result<Vec<u64>, worker::WorkerError> {
 		self.server.reload_extensions().await
 	}
+
+	/// Respawns only the child which owns `extension`.
+	pub async fn reload_extension(&self, extension: &str) -> Result<u64, worker::WorkerError> {
+		self.server.reload_extension(extension).await
+	}
+
+	/// Quarantines host groups containing any newly revoked extension while
+	/// keeping their static unavailable routes registered.
+	pub async fn quarantine(&self, extensions: &[Str]) {
+		self.server.quarantine_extensions(extensions).await;
+	}
+
+	/// Returns every registry sealed by the current post-reload generations.
+	pub fn registry_evidences(&self) -> Vec<Arc<worker::SealedRegistryEvidence>> {
+		self.server.extension_registry_evidences()
+	}
 }
 
 /// Cloneable authority for retained MCP inspection and authentication commands.
@@ -1268,6 +1284,11 @@ impl ProjectEnvironment {
 		self.lifecycle.server.usage_fetchers()
 	}
 
+	/// Returns the session-owned provider response hook sink.
+	pub fn provider_response_hooks(&self) -> omp_inference::ProviderResponseHooks {
+		self.lifecycle.server.provider_response_hooks()
+	}
+
 	/// Returns the sealed deployment manifest only when every authenticated
 	/// connection and generation fact exactly matches the live activation.
 	pub fn extension_control_manifest(
@@ -1284,6 +1305,11 @@ impl ProjectEnvironment {
 		identity: &ControlConnectionIdentity,
 	) -> Option<Arc<worker::SealedRegistryEvidence>> {
 		self.lifecycle.server.extension_registry_evidence(identity)
+	}
+
+	/// Returns every currently sealed exact-generation extension registry.
+	pub fn extension_registry_evidences(&self) -> Vec<Arc<worker::SealedRegistryEvidence>> {
+		self.lifecycle.server.extension_registry_evidences()
 	}
 
 	/// Returns the live resolver over exact-generation regime declarations

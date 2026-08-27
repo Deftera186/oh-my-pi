@@ -6,9 +6,9 @@ use std::{collections::BTreeSet, sync::Arc};
 use omp_core::{ArtifactDigest, Point, Principal, Provenance, sf};
 use omp_envd::{
 	exthost::{
+		VerifiedUiRoster,
 		control::{ControlConnectionIdentity, ControlDispatch, ControlProtocolError},
 		dispatch::{CallbackDispatcher, decode_regime_draft},
-		VerifiedUiRoster,
 	},
 	worker::{ExtensionRegimeResolver, SealedRegistryEvidence},
 };
