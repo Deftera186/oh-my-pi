@@ -80,8 +80,12 @@ pub enum PromptAssetId {
 	GeminiToolCallReminder,
 	/// Title prompt.
 	TitleSystem,
+	/// Required tagged-output instruction for title generation.
+	TitleMarkerInstruction,
 	/// Plan filename topic prompt.
 	PlanFilename,
+	/// Dynamic user prompt for an idle session recap.
+	RecapUser,
 	/// Scout definition.
 	AgentScout,
 	/// Reviewer definition.
@@ -151,7 +155,7 @@ macro_rules! asset {
 	};
 }
 
-const ASSETS: [PromptAsset; 33] = [
+const ASSETS: [PromptAsset; 35] = [
 	asset!(PersonalityDefault, Personality, Runtime, Stable, "../prompts/personality/default.md"),
 	asset!(PersonalityFriendly, Personality, Runtime, Stable, "../prompts/personality/friendly.md"),
 	asset!(
@@ -194,7 +198,15 @@ const ASSETS: [PromptAsset; 33] = [
 		"../prompts/recovery/gemini-tool-call-reminder.md"
 	),
 	asset!(TitleSystem, Title, Guidance, Stable, "../prompts/title/system.md"),
+	asset!(
+		TitleMarkerInstruction,
+		Title,
+		Guidance,
+		Stable,
+		"../prompts/title/marker-instruction.md"
+	),
 	asset!(PlanFilename, Title, Guidance, Stable, "../prompts/system/plan-filename.md"),
+	asset!(RecapUser, Steering, Status, Volatile, "../prompts/recap/user.md"),
 	asset!(AgentScout, Agent, Role, Frozen, "../prompts/roles/scout.md"),
 	asset!(AgentReviewer, Agent, Role, Frozen, "../prompts/roles/reviewer.md"),
 	asset!(AgentSecurityReviewer, Agent, Role, Frozen, "../prompts/roles/security-reviewer.md"),
@@ -239,7 +251,7 @@ pub fn prompt_template(id: PromptAssetId) -> &'static Template {
 }
 
 fn asset_name(id: PromptAssetId) -> &'static str {
-	const NAMES: [&str; 33] = [
+	const NAMES: [&str; 35] = [
 		"personality/default",
 		"personality/friendly",
 		"personality/pragmatic",
@@ -252,7 +264,9 @@ fn asset_name(id: PromptAssetId) -> &'static str {
 		"recovery/thinking-loop-redirect",
 		"recovery/gemini-tool-call-reminder",
 		"title/system",
+		"title/marker-instruction",
 		"system/plan-filename",
+		"recap/user",
 		"roles/scout",
 		"roles/reviewer",
 		"roles/security-reviewer",
@@ -343,7 +357,13 @@ mod tests {
 		for asset in prompt_assets().filter(|asset| asset.id != PromptAssetId::ModeCompress) {
 			let template = prompt_template(asset.id);
 			for key in template.referenced_keys() {
-				assert!(keys.contains(key), "{} references unregistered key {key}", template.name());
+				let per_use_recap_key =
+					asset.id == PromptAssetId::RecapUser && matches!(key, "goal" | "task");
+				assert!(
+					keys.contains(key) || per_use_recap_key,
+					"{} references unregistered key {key}",
+					template.name()
+				);
 			}
 		}
 	}
