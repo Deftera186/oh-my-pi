@@ -10,6 +10,7 @@ mod envd_policy;
 mod envd_windows;
 #[cfg(unix)]
 mod envd_workspace;
+mod extension_ui_routing;
 mod headless_runtime;
 mod process_smoke;
 mod session_index;

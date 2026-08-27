@@ -1,6 +1,6 @@
 //! Structural durable-session and workspace routes.
 
-use omp_core::Str;
+use omp_core::{Str, sf};
 use omp_storage::index::SessionStatistics;
 
 use super::{BranchRequest, SessionRequest, WorkspaceRequest, command};
@@ -74,6 +74,18 @@ pub struct McpServerInfo {
 	pub tools:  usize,
 }
 
+/// One language server row for the report.
+pub struct LspServerInfo {
+	/// Declared server name.
+	pub name:       Str,
+	/// Lowercase lifecycle stage label.
+	pub stage:      Str,
+	/// Accepted extensions or exact filenames.
+	pub file_types: Vec<Str>,
+	/// Failure detail, when the server could not start.
+	pub detail:     Option<Str>,
+}
+
 /// Facts assembled by the live host for `/session info`.
 pub struct SessionInfo {
 	/// Durable session file path, absent until first save.
@@ -82,6 +94,8 @@ pub struct SessionInfo {
 	pub id:             Str,
 	/// Current session title, when one is set.
 	pub title:          Option<Str>,
+	/// Raw active model identifier, rendered when catalog resolution fails.
+	pub model:          Str,
 	/// Catalog-resolved provider facts, absent for unknown models.
 	pub provider:       Option<ProviderInfo>,
 	/// Durable message/token/cost aggregates, absent when the index query
@@ -95,6 +109,8 @@ pub struct SessionInfo {
 	pub queued:         usize,
 	/// Live MCP servers in stable name order.
 	pub mcp:            Vec<McpServerInfo>,
+	/// Discovered language servers in stable name order.
+	pub lsp:            Vec<LspServerInfo>,
 }
 
 /// Renders the `/session info` markdown report from collected facts.
@@ -127,7 +143,9 @@ pub fn render_info(info: &SessionInfo) -> Str {
 			let _ = writeln!(out, "Endpoint: {}", provider.endpoint);
 			let _ = writeln!(out, "Auth: {}", provider.auth);
 		},
-		None => out.push_str("No catalog entry for the current model.\n"),
+		None => {
+			let _ = writeln!(out, "Model: `{}` (no catalog entry)", info.model);
+		},
 	}
 
 	if let Some(stats) = &info.stats {
@@ -210,6 +228,27 @@ pub fn render_info(info: &SessionInfo) -> Str {
 		}
 	}
 
+	if !info.lsp.is_empty() {
+		out.push_str("\n**LSP servers**\n");
+		for server in &info.lsp {
+			let file_types = server
+				.file_types
+				.iter()
+				.map(Str::as_str)
+				.collect::<Vec<_>>()
+				.join(", ");
+			let stage = if server.stage.as_str() == "failed" {
+				server
+					.detail
+					.as_ref()
+					.map_or_else(|| server.stage.clone(), |detail| sf!("failed: {detail}"))
+			} else {
+				server.stage.clone()
+			};
+			let _ = writeln!(out, "{}: {stage} ({file_types})", server.name);
+		}
+	}
+
 	Str::from(out)
 }
 #[cfg(test)]
@@ -221,6 +260,7 @@ mod tests {
 	fn full_info() -> SessionInfo {
 		SessionInfo {
 			file:           Some(Str::new_static("/tmp/sessions/abc.jsonl")),
+			model:          Str::new_static("claude-sonnet-4-5"),
 			id:             Str::new_static("abc123"),
 			title:          Some(Str::new_static("Port the parser")),
 			provider:       Some(ProviderInfo {
@@ -263,6 +303,7 @@ mod tests {
 				health: "connected",
 				tools:  12,
 			}],
+			lsp:            Vec::new(),
 		}
 	}
 
@@ -290,6 +331,7 @@ mod tests {
 	fn minimal_report_degrades_without_saved_file_stats_or_mcp() {
 		let info = SessionInfo {
 			file:           None,
+			model:          Str::new_static("mystery-model"),
 			id:             Str::new_static("fresh"),
 			title:          None,
 			provider:       None,
@@ -298,16 +340,48 @@ mod tests {
 			context_window: None,
 			queued:         0,
 			mcp:            Vec::new(),
+			lsp:            Vec::new(),
 		};
 		let rendered = render_info(&info);
 		let text = rendered.as_str();
 		assert!(text.contains("File: in-memory (not saved yet)"));
-		assert!(text.contains("No catalog entry for the current model."));
+		assert!(text.contains("Model: `mystery-model` (no catalog entry)"));
 		assert!(!text.contains("Title:"));
 		assert!(!text.contains("**Messages**"));
 		assert!(!text.contains("**Tokens**"));
 		assert!(!text.contains("**Cost**"));
 		assert!(!text.contains("**MCP servers**"));
+		assert!(!text.contains("**LSP servers**"));
 		assert!(text.contains("0 tokens · 0 queued"));
+	}
+
+	#[test]
+	fn lsp_report_renders_stages_file_types_and_failure_detail() {
+		let mut info = full_info();
+		info.lsp = vec![
+			LspServerInfo {
+				name:       Str::new_static("rust-analyzer"),
+				stage:      Str::new_static("ready"),
+				file_types: vec![Str::new_static("rs")],
+				detail:     None,
+			},
+			LspServerInfo {
+				name:       Str::new_static("typescript-language-server"),
+				stage:      Str::new_static("failed"),
+				file_types: vec![Str::new_static("ts"), Str::new_static("tsx")],
+				detail:     Some(Str::new_static("binary not found")),
+			},
+		];
+
+		let rendered = render_info(&info);
+		assert!(rendered.contains("**LSP servers**"));
+		assert!(rendered.contains("rust-analyzer: ready (rs)"));
+		assert!(rendered.contains("typescript-language-server: failed: binary not found (ts, tsx)"));
+	}
+
+	#[test]
+	fn lsp_report_is_omitted_when_roster_is_empty() {
+		let rendered = render_info(&full_info());
+		assert!(!rendered.contains("**LSP servers**"));
 	}
 }

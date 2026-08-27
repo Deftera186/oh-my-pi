@@ -524,7 +524,10 @@ const fn callback_class(kind: PresentationCallbackKind) -> u8 {
 }
 #[cfg(test)]
 mod tests {
-	use std::collections::BTreeSet;
+	use std::{
+		collections::BTreeSet,
+		sync::atomic::{AtomicUsize, Ordering},
+	};
 
 	use super::*;
 
@@ -537,6 +540,29 @@ mod tests {
 			session_generation: 1,
 			capabilities:       Arc::new(BTreeSet::new()),
 		})
+	}
+
+	fn invocation() -> ControlInvocationAuthority {
+		ControlInvocationAuthority {
+			invocation:        sf!("command:1"),
+			phase:             omp_core::InvocationPhase::EffectsAuthorized,
+			session:           sf!("session"),
+			turn:              None,
+			event:             None,
+			call:              None,
+			device:            None,
+			effects:           Box::new([]),
+			place_kind:        sf!("host"),
+			lifecycle:         omp_core::LifecyclePhase::Active,
+			roots:             Box::new([]),
+			remote:            false,
+			has_ui:            true,
+			headless:          false,
+			settings:          serde_json::Map::new(),
+			secret_settings:   Box::new([]),
+			data:              None,
+			direct_filesystem: None,
+		}
 	}
 
 	#[tokio::test]
@@ -570,5 +596,62 @@ mod tests {
 		endpoint.recv().await.unwrap();
 		drop(endpoint);
 		assert_eq!(request.await.unwrap(), Err(PresentationAuthorityError::Unavailable));
+	}
+	#[tokio::test]
+	async fn action_callbacks_deliver_exact_arguments_and_refuse_stale_generations() {
+		let identity = identity();
+		let registry = PresentationCallbackRegistry::new(identity.clone());
+		let calls = Arc::new(AtomicUsize::new(0));
+		let received = Arc::new(Mutex::new(None));
+		let calls_for_handler = calls.clone();
+		let received_for_handler = received.clone();
+		let registration = registry.register_action(
+			"extension.command",
+			Arc::new(move |arguments: Value| {
+				calls_for_handler.fetch_add(1, Ordering::Relaxed);
+				*received_for_handler.lock() = Some(arguments.clone());
+				async move { Ok(arguments) }
+			}),
+		);
+		let arguments = serde_json::json!({
+			"name": "alias",
+			"argv": ["one", "two"],
+			"raw": "one two",
+		});
+		let result = registry
+			.dispatch(identity.clone(), invocation(), PresentationCallback {
+				kind:      PresentationCallbackKind::Action,
+				operation: sf!("extension.command"),
+				arguments: arguments.clone(),
+			})
+			.await
+			.expect("exact callback");
+		assert_eq!(result, arguments);
+		assert_eq!(received.lock().as_ref(), Some(&arguments));
+		assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+		let mut stale = (*identity).clone();
+		stale.host_generation += 1;
+		assert_eq!(
+			registry
+				.dispatch(Arc::new(stale), invocation(), PresentationCallback {
+					kind:      PresentationCallbackKind::Action,
+					operation: sf!("extension.command"),
+					arguments: Value::Null,
+				},)
+				.await,
+			Err(PresentationAuthorityError::Identity)
+		);
+		drop(registration);
+		assert!(matches!(
+			registry
+				.dispatch(identity, invocation(), PresentationCallback {
+					kind:      PresentationCallbackKind::Action,
+					operation: sf!("extension.command"),
+					arguments: Value::Null,
+				},)
+				.await,
+			Err(PresentationAuthorityError::Owner(_))
+		));
 	}
 }

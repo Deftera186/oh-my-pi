@@ -215,7 +215,7 @@ pub mod presentation_authority {
 		OverlayWait { id: Str },
 		OverlayEvents { id: Str },
 		OverlayClose { id: Str },
-		DynamicMount { commands: Vec<Value> },
+		DynamicMount { generation: u64 },
 	}
 
 	/// Typed response from a real presentation surface.
@@ -228,7 +228,6 @@ pub mod presentation_authority {
 		OverlayOpened { id: Str },
 		OverlayValues(serde_json::Map<String, Value>),
 		OverlayEvents(Vec<Value>),
-		DynamicMount(Vec<Str>),
 		Ack,
 	}
 
@@ -421,6 +420,11 @@ pub mod presentation_authority {
 		) -> Result<PresentationResponse, PresentationAuthorityError> {
 			let (minimum, capability) = request_policy(&request);
 			self.authorize(context, minimum, capability)?;
+			if let PresentationRequest::DynamicMount { generation } = &request
+				&& *generation != self.identity.host_generation
+			{
+				return Err(PresentationAuthorityError::Identity);
+			}
 			{
 				let mut state = self.state.lock();
 				if let Some((completed_request, response)) = state.completed.get(&context.request_id) {
@@ -558,8 +562,8 @@ pub mod presentation_authority {
 				exthost::UiControlRequest::OverlayClose { id } => {
 					PresentationRequest::OverlayClose { id }
 				},
-				exthost::UiControlRequest::DynamicMount { commands } => {
-					PresentationRequest::DynamicMount { commands }
+				exthost::UiControlRequest::DynamicMount { generation } => {
+					PresentationRequest::DynamicMount { generation }
 				},
 			};
 			let call = PresentationCallContext {
@@ -594,12 +598,6 @@ pub mod presentation_authority {
 				},
 				PresentationResponse::OverlayValues(values) => Value::Object(values),
 				PresentationResponse::OverlayEvents(events) => Value::Array(events),
-				PresentationResponse::DynamicMount(commands) => Value::Array(
-					commands
-						.into_iter()
-						.map(|command| Value::String(command.to_string()))
-						.collect(),
-				),
 				PresentationResponse::Ack => Value::Null,
 			};
 			Ok(if value.is_null() {
@@ -1003,6 +1001,7 @@ struct BridgeState {
 	collab_live: Option<omp_driver::collab::session::HostLiveHandle>,
 	collab_state: Option<omp_proto::collab::v1::SessionStateUpdate>,
 	environment: omp_env::EnvClient,
+	lsp_servers: Vec<omp_proto::document::v1::LspServerStatus>,
 	memory: Option<Arc<omp_driver::memory::ChatMemory>>,
 	workspace_root: Str,
 	appearance: omp_tui::Appearance,
@@ -1050,6 +1049,59 @@ struct BridgeState {
 	presentation_requests: HashMap<Str, (u64, presentation_authority::PresentationRequest)>,
 	raw_stream: Option<flume::Receiver<omp_inference::transport::CapturedFrame>>,
 }
+
+async fn refresh_lsp_roster(state: &mut BridgeState) {
+	if let Ok(response) = state.environment.lsp_status(false).await {
+		state.lsp_servers = response.servers;
+	}
+}
+
+fn lsp_stage_label(stage: i32) -> &'static str {
+	use omp_proto::document::v1::LspServerStage;
+
+	match LspServerStage::try_from(stage).unwrap_or(LspServerStage::Unspecified) {
+		LspServerStage::Available => "available",
+		LspServerStage::Starting => "starting",
+		LspServerStage::Indexing => "indexing",
+		LspServerStage::Ready => "ready",
+		LspServerStage::Failed => "failed",
+		LspServerStage::Unspecified => "unknown",
+	}
+}
+
+fn lsp_roster_active(servers: &[omp_proto::document::v1::LspServerStatus]) -> bool {
+	use omp_proto::document::v1::LspServerStage;
+
+	servers.iter().any(|server| {
+		matches!(
+			LspServerStage::try_from(server.stage),
+			Ok(LspServerStage::Starting | LspServerStage::Indexing)
+		)
+	})
+}
+
+fn welcome_lsp_servers(
+	servers: &[omp_proto::document::v1::LspServerStatus],
+) -> Vec<omp_chat_ui::WelcomeLspServer> {
+	servers
+		.iter()
+		.take(3)
+		.map(|server| {
+			let stage = lsp_stage_label(server.stage);
+			let stage_label = if server.file_types.is_empty() {
+				Str::new_static(stage)
+			} else {
+				sf!("{stage} ({})", server.file_types.join(", "))
+			};
+			omp_chat_ui::WelcomeLspServer {
+				name: Str::new(&server.name),
+				stage_label,
+				failed: stage == "failed",
+			}
+		})
+		.collect()
+}
+
 struct GitWorkbenchBackend {
 	session: GitSession,
 	cancel:  CancellationToken,
@@ -1523,19 +1575,7 @@ fn handle_presentation_dispatch(
 					.unwrap_or_default();
 				Ok(PresentationResponse::Icons(icons))
 			},
-			PresentationRequest::DynamicMount { commands } => {
-				let names = commands
-					.into_iter()
-					.filter_map(|command| {
-						command
-							.as_object()
-							.and_then(|command| command.get("name"))
-							.and_then(Value::as_str)
-							.map(Str::new)
-					})
-					.collect();
-				Ok(PresentationResponse::DynamicMount(names))
-			},
+			PresentationRequest::DynamicMount { .. } => Ok(PresentationResponse::Ack),
 			other => Err(PresentationAuthorityError::Owner(sf!(
 				"presentation request `{other:?}` requires a renderer surface not installed in chat",
 			))),
@@ -2138,6 +2178,7 @@ where
 		collab_live,
 		collab_state,
 		environment,
+		lsp_servers: Vec::new(),
 		memory: omp_driver::memory::chat_memory(&session_id),
 		workspace_root: Str::from(workspace_root.to_string_lossy().as_ref()),
 		appearance: ctx.appearance,
@@ -2185,6 +2226,7 @@ where
 		presentation_requests: HashMap::new(),
 		raw_stream: None,
 	};
+	let _ = tokio::time::timeout(Duration::from_millis(300), refresh_lsp_roster(&mut state)).await;
 	if let Err(error) = apply_configured_theme(&backend_tx, &data_dir, &mut state) {
 		send_backend(
 			&backend_tx,
@@ -2215,6 +2257,10 @@ where
 
 	send_models_updated(&backend_tx, &state);
 	if welcome {
+		send_backend(
+			&backend_tx,
+			BackendEvent::WelcomeLspServers(welcome_lsp_servers(&state.lsp_servers)),
+		);
 		match list_sessions() {
 			Ok(choices) => send_backend(&backend_tx, BackendEvent::Sessions(session_rows(choices))),
 			Err(error) => {
@@ -2250,10 +2296,29 @@ where
 	let bridge_data_dir = data_dir.clone();
 	let mcp_inspector = environment_host.mcp_inspector();
 	let extension_reload = environment_host.extension_reload_handle();
+	let mut lsp_refresh_deadline =
+		lsp_roster_active(&state.lsp_servers).then(|| Instant::now() + Duration::from_secs(60));
+	let mut lsp_refresh_tick = tokio::time::interval(Duration::from_secs(2));
+	lsp_refresh_tick.tick().await;
 	let bridge = async move {
 		let mut presentation_endpoint = presentation_endpoint;
 		loop {
 			tokio::select! {
+							_ = lsp_refresh_tick.tick(), if lsp_refresh_deadline.is_some() => {
+								let deadline = lsp_refresh_deadline.expect("guarded by select condition");
+								if Instant::now() >= deadline {
+									lsp_refresh_deadline = None;
+									continue;
+								}
+								refresh_lsp_roster(&mut state).await;
+								send_backend(
+									&backend_tx,
+									BackendEvent::WelcomeLspServers(welcome_lsp_servers(&state.lsp_servers)),
+								);
+								if !lsp_roster_active(&state.lsp_servers) {
+									lsp_refresh_deadline = None;
+								}
+							},
 							frame = next_raw_stream_frame(&mut state.raw_stream) => {
 								let summary = omp_inference::transport::global_provider_capture()
 									.snapshot(Some(state.session_id.as_str()))
@@ -4037,9 +4102,17 @@ where
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_> {
 		match request {
 			SessionRequest::Info => {
-				let report =
-					commands::session::render_info(&session_info_facts(self.state, self.session_index));
-				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(report))) })
+				let environment = self.state.environment.clone();
+				let state = &mut *self.state;
+				let session_index = self.session_index;
+				Box::pin(async move {
+					if let Ok(response) = environment.lsp_status(false).await {
+						state.lsp_servers = response.servers;
+					}
+					let report =
+						commands::session::render_info(&session_info_facts(state, session_index));
+					Ok(CommandResult::Consumed(ConsumedResult::status(report)))
+				})
 			},
 			SessionRequest::Delete { force } => {
 				if chat_active(self.state.submit_pending, self.bus.phase()) {
@@ -6407,8 +6480,10 @@ where
 						},
 					};
 					match parent.run_ephemeral_turn(thread, prompt.as_str()).await {
-						Ok(Some(text)) => {
-							if let Some(preview) = recap_preview(text.as_str()) {
+						Ok(Some(outcome)) => {
+							if let Some(preview) =
+								recap_preview(omp_driver::chat::outcome_text(&outcome).as_str())
+							{
 								send_backend(&backend, BackendEvent::Recap(preview));
 							}
 						},
@@ -9517,6 +9592,17 @@ fn session_info_facts(state: &BridgeState, index: &SessionIndex) -> commands::se
 		})
 		.collect::<Vec<_>>();
 	mcp.sort_by(|left, right| left.name.cmp(&right.name));
+	let mut lsp = state
+		.lsp_servers
+		.iter()
+		.map(|server| commands::session::LspServerInfo {
+			name:       Str::new(&server.name),
+			stage:      Str::new_static(lsp_stage_label(server.stage)),
+			file_types: server.file_types.iter().map(Str::new).collect(),
+			detail:     (!server.detail.is_empty()).then(|| Str::new(&server.detail)),
+		})
+		.collect::<Vec<_>>();
+	lsp.sort_by(|left, right| left.name.cmp(&right.name));
 	commands::session::SessionInfo {
 		file: state
 			.session_path
@@ -9524,12 +9610,14 @@ fn session_info_facts(state: &BridgeState, index: &SessionIndex) -> commands::se
 			.then(|| Str::new(state.session_path.to_string_lossy().as_ref())),
 		id: state.session_id.clone(),
 		title: state.title.title.clone(),
+		model: Str::new(state.model.as_str()),
 		provider,
 		stats,
 		context_tokens: state.context_tokens,
 		context_window: state.context_window,
 		queued: state.queued,
 		mcp,
+		lsp,
 	}
 }
 
@@ -10400,6 +10488,7 @@ mod tests {
 			sessions_dir: scratch.to_path_buf(),
 			title_replan_refresh_pending: false,
 			environment,
+			lsp_servers: Vec::new(),
 			local_root: env::temp_dir(),
 			session_id: sf!("test-session"),
 			regimes: RegimeHandle::new(),

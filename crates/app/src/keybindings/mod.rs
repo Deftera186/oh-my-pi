@@ -2,7 +2,101 @@
 
 pub mod config;
 
+use std::collections::BTreeMap;
+
 use omp_core::Str;
+use omp_proto::ui::v1::ShortcutDecl;
+
+/// Static extension shortcut metadata matched locally before CONTROL dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionShortcutBinding {
+	/// Normalized key chord.
+	pub chord:          Str,
+	/// Declared action identity.
+	pub action_id:      Str,
+	/// Stable manifest declaration id.
+	pub declaration_id: Str,
+	/// Exact owning worker generation.
+	pub generation:     u64,
+	/// Optional phase filter.
+	pub when:           Box<[Str]>,
+}
+
+/// Immutable extension shortcut table. Core bindings are never shadowed.
+#[derive(Clone, Debug, Default)]
+pub struct ExtensionShortcutRoster {
+	bindings: BTreeMap<Str, ExtensionShortcutBinding>,
+}
+
+/// Static shortcut installation failure.
+#[derive(Debug, thiserror::Error)]
+pub enum ExtensionShortcutError {
+	/// The chord was invalid.
+	#[error(transparent)]
+	InvalidChord(#[from] config::KeybindingsConfigError),
+	/// A core action already owns this chord.
+	#[error("extension shortcut {chord} conflicts with core action {action}")]
+	CoreConflict {
+		/// Normalized conflicting chord.
+		chord:  Str,
+		/// Incumbent core action.
+		action: Str,
+	},
+	/// Two extension declarations in one atomic generation claimed a chord.
+	#[error("duplicate extension shortcut {chord}")]
+	Duplicate {
+		/// Normalized duplicate chord.
+		chord: Str,
+	},
+}
+
+impl ExtensionShortcutRoster {
+	/// Builds one atomic generation after rejecting every core conflict.
+	pub fn install(
+		declarations: &[ShortcutDecl],
+		generation: u64,
+		core: &config::ResolvedKeybindings,
+		platform: KeyPlatform,
+	) -> Result<Self, ExtensionShortcutError> {
+		let core_chords = config::action_ids()
+			.flat_map(|action| {
+				core
+					.chords_for(action, platform)
+					.map(move |chord| (chord, action))
+			})
+			.collect::<BTreeMap<_, _>>();
+		let mut bindings = BTreeMap::new();
+		for declaration in declarations {
+			let chord = config::normalize_chord(declaration.chord.as_str())?;
+			if let Some(action) = core_chords.get(chord.as_str()) {
+				return Err(ExtensionShortcutError::CoreConflict { chord, action: Str::new(*action) });
+			}
+			let binding = ExtensionShortcutBinding {
+				chord: chord.clone(),
+				action_id: Str::from(declaration.action_id.as_str()),
+				declaration_id: Str::from(declaration.declaration_id.as_str()),
+				generation,
+				when: declaration.when.iter().map(Str::from).collect(),
+			};
+			if bindings.insert(chord.clone(), binding).is_some() {
+				return Err(ExtensionShortcutError::Duplicate { chord });
+			}
+		}
+		Ok(Self { bindings })
+	}
+
+	/// Matches one keystroke locally and applies its static phase filter.
+	pub fn match_chord(
+		&self,
+		chord: &str,
+		phase: &str,
+	) -> Result<Option<&ExtensionShortcutBinding>, config::KeybindingsConfigError> {
+		let chord = config::normalize_chord(chord)?;
+		Ok(self.bindings.get(chord.as_str()).filter(|binding| {
+			binding.when.is_empty() || binding.when.iter().any(|allowed| allowed.as_str() == phase)
+		}))
+	}
+}
 
 /// Host platform used for fallback chords and user-facing modifier labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +231,60 @@ mod tests {
 		assert_eq!(
 			format_chord_label("super+alt+p", KeyPlatform::Unix).expect("label"),
 			"Alt+Super+p"
+		);
+	}
+	#[test]
+	fn extension_shortcuts_match_locally_and_core_always_wins() {
+		let core = config::ResolvedKeybindings::default();
+		let reserved = ShortcutDecl {
+			chord: "ctrl+c".to_owned(),
+			action_id: "steal_interrupt".to_owned(),
+			declaration_id: "reserved".to_owned(),
+			..Default::default()
+		};
+		assert!(matches!(
+			ExtensionShortcutRoster::install(&[reserved], 1, &core, KeyPlatform::Unix),
+			Err(ExtensionShortcutError::CoreConflict { .. })
+		));
+
+		let first = ShortcutDecl {
+			chord: "CTRL+ALT+H".to_owned(),
+			action_id: "history".to_owned(),
+			declaration_id: "history".to_owned(),
+			when: vec!["open".to_owned()],
+			..Default::default()
+		};
+		let roster = ExtensionShortcutRoster::install(&[first], 4, &core, KeyPlatform::Unix)
+			.expect("extension shortcut");
+		let matched = roster
+			.match_chord("alt+ctrl+h", "open")
+			.expect("normalized chord")
+			.expect("local match");
+		assert_eq!(matched.action_id, "history");
+		assert_eq!(matched.generation, 4);
+		assert!(
+			roster
+				.match_chord("ctrl+alt+h", "settled")
+				.unwrap()
+				.is_none()
+		);
+
+		let replacement = ShortcutDecl {
+			chord: "f5".to_owned(),
+			action_id: "refresh".to_owned(),
+			declaration_id: "refresh".to_owned(),
+			..Default::default()
+		};
+		let roster = ExtensionShortcutRoster::install(&[replacement], 5, &core, KeyPlatform::Unix)
+			.expect("replacement generation");
+		assert!(roster.match_chord("ctrl+alt+h", "open").unwrap().is_none());
+		assert_eq!(
+			roster
+				.match_chord("f5", "open")
+				.unwrap()
+				.unwrap()
+				.generation,
+			5
 		);
 	}
 }

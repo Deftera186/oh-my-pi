@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 use miette::miette;
 use omp_agent::{AgentEvent, ControlSender, TtsrRegistry, TtsrRule, TtsrSettings, TurnClient};
 use omp_core::{Str, sf};
-use omp_driver::chat::ChatParentHost;
+use omp_driver::chat::{ChatParentHost, outcome_text};
 use omp_envd::eval::{NoopBridgeProgress, ParentSessionHost};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -78,7 +78,7 @@ where
 	);
 	if let Ok(thread) = control.project_thread().await {
 		match parent.run_ephemeral_turn(thread, &prompt).await {
-			Ok(Some(response)) => return Ok(response),
+			Ok(Some(outcome)) => return Ok(Str::from(outcome_text(&outcome))),
 			Ok(None) => {},
 			Err(error) => tracing::debug!(%error, "contextual BTW request failed"),
 		}

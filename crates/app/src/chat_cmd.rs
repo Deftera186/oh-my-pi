@@ -1846,7 +1846,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			tracing::warn!(%error, "TTSR rule condition was rejected");
 		}
 		let mut agent = Agent::new(client.clone(), agent_env, state.clone(), journal, CHAT_CAPS_BASE);
-		parent.bind_host_control(id.clone(), agent.host_control());
+		parent.bind_agent_controls(id.clone(), agent.host_control(), agent.control());
 		agent.set_unexpected_stop_classifier(parent.clone());
 		if auto_thinking_selected {
 			agent.set_difficulty_classifier(parent.clone());

@@ -37,7 +37,8 @@ use omp_core::{Str, sf};
 pub use registry::{
 	AdvertisedCommand, ArgumentHint, CommandCapability, CommandDeclaration, CommandGeneration,
 	CommandImplementation, CommandProvenance, CommandRole, CommandRoster, CommandSourceKind,
-	CommandSurface, ShadowPolicy, ShadowRule,
+	CommandSurface, ExtensionCommandFuture, ExtensionCommandHandler, ExtensionCommandInvocation,
+	ShadowPolicy, ShadowRule,
 };
 pub use result::{CommandResult, ConsumedResult, DispatchResult, PromptResult};
 

@@ -2224,6 +2224,7 @@ mod tests {
 					ControlMailboxEvent::Regime(command) => {
 						command.reject_unavailable();
 					},
+					ControlMailboxEvent::ProjectThread { .. } => {},
 				}
 			}
 		});

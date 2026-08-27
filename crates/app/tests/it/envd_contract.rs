@@ -16,7 +16,7 @@ use omp_env::{
 	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
 };
 use omp_envd::{
-	EnvServer, RegistryBridges,
+	EnvServer, ProjectEnvironment, RegistryBridges,
 	eval::{
 		BridgeHostError, BridgeProgressSink, EvalSessionConfig, ParentBindingLease, ParentSessionHost,
 	},
@@ -24,6 +24,7 @@ use omp_envd::{
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 	},
+	policy::Grants,
 	worker::{ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, PY_EVAL_MODULE},
 	workspace::{WorkspaceError, WorkspaceHost, WorkspaceSearchOptions},
 };
@@ -340,6 +341,40 @@ import omp
 @omp.prelude
 def helper_echo(value):
     return {"value": value}
+"#;
+
+const ENV_DATA_EXTENSION: &str = r#"
+import omp
+import omp.env as env
+
+try:
+    env.info()
+except env.EnvUnavailable:
+    DECLARATION_DATA_DENIED = True
+else:
+    DECLARATION_DATA_DENIED = False
+
+@omp.tool(
+    "env_data_probe",
+    effects=omp.Effects(
+        documents=omp.DocEffects(read=True, write_globs=("**",)),
+    ),
+)
+async def env_data_probe(path: str):
+    target = env.EnvPath(path)
+    metadata = await env.fs.stat(target)
+    document = await env.docs.open(target)
+    try:
+        await document.write("updated through extension DATA")
+    finally:
+        await document.close()
+    return {
+        "parts": [],
+        "details": {
+            "declaration_data_denied": DECLARATION_DATA_DENIED,
+            "kind": metadata.kind.value,
+        },
+    }
 "#;
 
 const WORKER_CANCEL_EXTENSION: &str = r#"
@@ -2374,6 +2409,121 @@ async fn native_deadline_interrupts_then_structurally_reports_effects_unknown() 
 	assert!(started.exists(), "native deadline fired before committed execution began");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn python_extension_data_reads_and_writes_live_workspace_only_during_invocation() {
+	let scratch = tempfile::tempdir().expect("extension DATA scratch");
+	let root = scratch.path().join("workspace");
+	let state = scratch.path().join("state");
+	let site = scratch.path().join("site");
+	fs::create_dir_all(&root).expect("workspace directory");
+	fs::create_dir_all(&state).expect("state directory");
+	fs::create_dir_all(&site).expect("extension site directory");
+	let module = "envd_data_extension";
+	let module_path = site.join(format!("{module}.py"));
+	fs::write(&module_path, ENV_DATA_EXTENSION).expect("write DATA extension");
+	let target = root.join("observed.txt");
+	fs::write(&target, b"workspace state before invocation").expect("write workspace fixture");
+
+	let key = HostKey::new("workspace", "trusted", module);
+	let manifest =
+		test_manifest(&key, module, [ToolDeclarationKey::new("env_data_probe", module, 1)]);
+	let mut extension = ExtHostSpec::new(key, manifest);
+	extension.python_site = Some(site);
+	extension.entry_path = Some(module_path);
+	extension.host_executable = Some(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
+	extension.data_grants =
+		Grants::supported(["env.doc.read", "env.doc.write", "env.fs.read", "env.fs.write"]);
+	let environment = ProjectEnvironment::connect_or_start(
+		&root,
+		&state,
+		&state.join("env.sock"),
+		&state.join("docs.sock"),
+		false,
+		None,
+		&[extension],
+		&[],
+		omp_tool::DEFAULT_INTERRUPT_GRACE,
+		RegistryBridges::default(),
+	)
+	.await
+	.expect("start extension DATA environment");
+	environment.client().set_admitter(AllowAdmission);
+
+	let mut invocation = environment
+		.client()
+		.invoke(v1::InvokeTool {
+			invocation_id: "extension-data-contract".into(),
+			name: "env_data_probe".into(),
+			rev: format!("{module}.1"),
+			..Default::default()
+		})
+		.await
+		.expect("open extension DATA invocation");
+	assert!(matches!(
+		invocation
+			.next_event()
+			.await
+			.expect("extension DATA accepted"),
+		Some(InvocationEvent::Accepted(_))
+	));
+	let effects = Effects {
+		documents: Some(DocEffects {
+			read:        true,
+			write_globs: [sf!("**")].into_iter().collect(),
+		}),
+		..Effects::default()
+	};
+	invocation
+		.commit_args(
+			Bytes::from(
+				serde_json::to_vec(&json!({
+					"path": Url::from_file_path(&target)
+						.expect("workspace file URI")
+						.to_string(),
+				}))
+				.expect("serialize extension DATA arguments"),
+			),
+			Bytes::from_static(b"extension-data-effect-token"),
+			1000,
+			Some(omp_proto::policy::v1::EffectEnvelope::from(&effects)),
+		)
+		.await
+		.expect("authorize extension DATA invocation");
+	let terminal = time::timeout(Duration::from_secs(10), async {
+		loop {
+			match invocation
+				.next_event()
+				.await
+				.expect("extension DATA event")
+				.expect("extension DATA stream closed")
+			{
+				InvocationEvent::Verdict(verdict) => break verdict,
+				InvocationEvent::Update(_) => {},
+				InvocationEvent::Accepted(_) => panic!("extension DATA invocation accepted twice"),
+				InvocationEvent::Admission(_) => {
+					panic!("unexpected extension DATA admission event")
+				},
+			}
+		}
+	})
+	.await
+	.expect("extension DATA invocation timed out");
+	let verdict: CallOutcome<Value, Value> =
+		serde_json::from_slice(&terminal.json).expect("decode extension DATA verdict");
+	assert_eq!(
+		verdict,
+		CallOutcome::Ok(json!({
+			"declaration_data_denied": true,
+			"kind": "regular_file",
+		}))
+	);
+	assert_eq!(
+		fs::read_to_string(&target).expect("read workspace result"),
+		"updated through extension DATA"
+	);
+}
+
 #[tokio::test]
 async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_request() {
 	let site = tempfile::tempdir().expect("worker extension scratch");
@@ -3209,4 +3359,60 @@ async fn in_process_retire_is_rejected_as_unsupported() {
 	};
 	assert_eq!(error.code, omp_proto::env::v1::ProtocolErrorCode::Unsupported as i32);
 	assert_eq!(error.message, "retire is not available on this transport");
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_client_lsp_status_reports_discovered_workspace_roster() {
+	use std::os::unix::fs::PermissionsExt as _;
+	let scratch = TempDir::new().expect("scratch");
+	let root = scratch.path().join("workspace");
+	let state = scratch.path().join("state");
+	fs::create_dir_all(&root).expect("workspace directory");
+	fs::create_dir_all(&state).expect("state directory");
+	let server = root.join("fake-lsp.sh");
+	fs::write(&server, "#!/bin/sh\nexit 0\n").expect("fake server");
+	fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).expect("chmod fake server");
+	fs::write(root.join("foo.marker"), b"").expect("marker");
+	fs::write(
+		root.join(".lsp.json"),
+		serde_json::to_vec(&json!({
+			"servers": {
+				"fake": {
+					"command": server,
+					"args": [],
+					"fileTypes": [".foo"],
+					"rootMarkers": ["foo.marker"],
+				}
+			}
+		}))
+		.expect("encode config"),
+	)
+	.expect("write config");
+
+	let environment = ProjectEnvironment::connect_or_start(
+		&root,
+		&state,
+		&state.join("env.sock"),
+		&state.join("docs.sock"),
+		false,
+		None,
+		&[],
+		&[],
+		omp_tool::DEFAULT_INTERRUPT_GRACE,
+		RegistryBridges::default(),
+	)
+	.await
+	.expect("start project environment");
+
+	let response = environment
+		.client()
+		.lsp_status(false)
+		.await
+		.expect("owner client lsp status");
+	let fake = response
+		.servers
+		.iter()
+		.find(|server| server.name == "fake")
+		.expect("discovered declaration in owner roster");
+	assert_eq!(fake.stage, omp_proto::document::v1::LspServerStage::Available as i32);
 }

@@ -1132,4 +1132,14 @@ mod tests {
 		);
 		assert!(StaticDeclarations::from_properties(&properties).is_err());
 	}
+	#[test]
+	fn manifest_admission_rejects_composer_shape_declaration_kind() {
+		let mut properties = BTreeMap::new();
+		properties.insert(
+			sf!("declarations"),
+			serde_json::json!([{"id": "acme.dock", "kind": "composer-shape"}]),
+		);
+
+		assert!(StaticDeclarations::from_properties(&properties).is_err());
+	}
 }

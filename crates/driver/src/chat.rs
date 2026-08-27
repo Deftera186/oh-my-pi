@@ -839,10 +839,16 @@ pub struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
 	advisor_children: Mutex<AdvisorChildren>,
 	revival: Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
 	inboxes: Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
-	controls: Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	controls: Arc<Mutex<BTreeMap<Str, AgentLoopControls>>>,
 	discovery_model_settings: Mutex<Option<discovery::PromptDiscoverySettings>>,
 	auto_thinking: Mutex<AutoThinkingSettings>,
 	difficulty_classifier: omp_inference::DifficultyClassifier,
+}
+/// Live request handles into one agent loop, bound per owning session.
+#[derive(Clone)]
+struct AgentLoopControls {
+	host:    omp_agent::AgentHostControl,
+	control: omp_agent::ControlSender,
 }
 
 struct EvalRunCancelGuard<C: TurnClient + Clone + Send + 'static> {
@@ -892,7 +898,7 @@ struct ProductionChildReviver<C: TurnClient + Clone + Send + 'static> {
 	session_index:            Arc<SessionIndex>,
 	parent_session:           SessionId,
 	inboxes:                  Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
-	controls:                 Arc<Mutex<BTreeMap<Str, omp_agent::AgentHostControl>>>,
+	controls:                 Arc<Mutex<BTreeMap<Str, AgentLoopControls>>>,
 	discovery_model_settings: Option<discovery::PromptDiscoverySettings>,
 }
 #[derive(serde::Deserialize)]
@@ -997,7 +1003,10 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 			);
 			controls
 				.lock()
-				.insert(node.id.clone(), child.host_control());
+				.insert(node.id.clone(), AgentLoopControls {
+					host:    child.host_control(),
+					control: child.control(),
+				});
 			child.set_ttsr_registry(ttsr);
 			let control_binding = if let Some(environment) = &isolated_environment {
 				let binding = environment
@@ -1156,12 +1165,32 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	}
 
 	/// Binds the live main or child loop lifecycle owner.
-	pub fn bind_host_control(&self, owner: Str, control: omp_agent::AgentHostControl) {
-		self.controls.lock().insert(owner, control);
+	pub fn bind_agent_controls(
+		&self,
+		owner: Str,
+		host: omp_agent::AgentHostControl,
+		control: omp_agent::ControlSender,
+	) {
+		self
+			.controls
+			.lock()
+			.insert(owner, AgentLoopControls { host, control });
 	}
 
 	fn host_control(&self, owner: &str) -> Option<omp_agent::AgentHostControl> {
-		self.controls.lock().get(owner).cloned()
+		self
+			.controls
+			.lock()
+			.get(owner)
+			.map(|controls| controls.host.clone())
+	}
+
+	fn control_sender(&self, owner: &str) -> Option<omp_agent::ControlSender> {
+		self
+			.controls
+			.lock()
+			.get(owner)
+			.map(|controls| controls.control.clone())
 	}
 
 	/// Applies a reloaded task projection to admission and later child
@@ -1760,7 +1789,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			let text = summary
 				.outcome
 				.as_ref()
-				.map_or_else(|| "(interrupted)".to_owned(), bridge_outcome_text);
+				.map_or_else(|| "(interrupted)".to_owned(), outcome_text);
 			return Ok((text, None, None));
 		};
 		let mut validator = YieldPayloadValidator::new(Some(schema), strict);
@@ -1769,7 +1798,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			let text = summary
 				.outcome
 				.as_ref()
-				.map_or_else(|| "(interrupted)".to_owned(), bridge_outcome_text);
+				.map_or_else(|| "(interrupted)".to_owned(), outcome_text);
 			match summary.yield_payload(&mut validator) {
 				Ok(Some(payload)) => {
 					if let Some(error) = payload.error {
@@ -2649,11 +2678,61 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		Ok(handle)
 	}
 
+	/// Validates thread-context completion arguments and resolves the caller's
+	/// live control handle.
+	fn ephemeral_completion_input(
+		&self,
+		context: &control::ControlRequestContext,
+		arguments: &serde_json::Map<String, Value>,
+	) -> Result<(omp_agent::ControlSender, Str), ControlProtocolError> {
+		if let Some(unsupported) = ["role", "system", "choices", "schema", "max_output_tokens"]
+			.into_iter()
+			.find(|key| arguments.get(*key).is_some_and(|value| !value.is_null()))
+		{
+			return Err(
+				ControlProtocolError::new(
+					"CompletionFailed",
+					"thread-context completions run on the session model and accept only a text prompt",
+				)
+				.with_details(json!({"unsupported": unsupported})),
+			);
+		}
+		let prompt = arguments
+			.get("prompt")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"CompletionFailed",
+					"thread-context completion prompt must be plain text",
+				)
+			})?;
+		let caller = Self::caller(context)?;
+		let control = self.parent.control_sender(caller.as_str()).ok_or_else(|| {
+			ControlProtocolError::new("AgentsError", "calling agent loop is no longer live")
+		})?;
+		Ok((control, Str::from(prompt)))
+	}
+
 	async fn completion(
 		&self,
+		context: &control::ControlRequestContext,
 		arguments: serde_json::Map<String, Value>,
 	) -> Result<Value, ControlProtocolError> {
+		let ephemeral = match arguments.get("context").and_then(Value::as_str) {
+			None | Some("none") => None,
+			Some("thread") => Some(self.ephemeral_completion_input(context, &arguments)?),
+			Some(other) => {
+				return Err(
+					ControlProtocolError::new(
+						"CompletionFailed",
+						"completion context must be \"none\" or \"thread\"",
+					)
+					.with_details(json!({"context": other})),
+				);
+			},
+		};
 		let mut bridge = arguments.clone();
+		bridge.remove("context");
 		if bridge.get("schema").is_some_and(Value::is_null) {
 			bridge.remove("schema");
 		}
@@ -2683,11 +2762,40 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 			);
 		}
 		let started = Instant::now();
-		let request = ParentSessionHost::completion(
-			self.parent.as_ref(),
-			Value::Object(bridge),
-			&omp_envd::eval::NoopBridgeProgress,
-		);
+		let request = async {
+			match &ephemeral {
+				Some((control, prompt)) => {
+					let thread = control
+						.project_thread()
+						.await
+						.map_err(|error| Str::from(error.to_string()))?;
+					let outcome = self
+						.parent
+						.run_ephemeral_turn(thread, prompt.as_str())
+						.await?
+						.ok_or_else(|| sf!("ephemeral turn ended without an outcome"))?;
+					self.parent.debit_task_budget(&outcome);
+					Ok(json!({
+						"text": outcome_text(&outcome),
+						"choice": Value::Null,
+						"data": Value::Null,
+						"usage": completion_usage(&outcome, started.elapsed()),
+						"model": outcome.model,
+						"fell_back": false,
+						"fault": Value::Null,
+					}))
+				},
+				None => {
+					ParentSessionHost::completion(
+						self.parent.as_ref(),
+						Value::Object(bridge),
+						&omp_envd::eval::NoopBridgeProgress,
+					)
+					.await
+					.map_err(|error| Str::from(error.to_string()))
+				},
+			}
+		};
 		match time::timeout(Duration::from_millis(deadline_ms), request).await {
 			Ok(Ok(value)) => Ok(value),
 			Ok(Err(error)) if arguments.contains_key("default") => Ok(json!({
@@ -2709,8 +2817,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"fault": {"reason": "provider", "detail": error.to_string()},
 			})),
 			Ok(Err(error)) => Err(
-				ControlProtocolError::new("CompletionFailed", error.to_string()).with_details(json!({
-					"reason": error.to_string(),
+				ControlProtocolError::new("CompletionFailed", error.clone()).with_details(json!({
+					"reason": error.as_str(),
 					"raw": null,
 					"usage": {
 						"input_tokens": 0,
@@ -3128,7 +3236,7 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 	) -> Result<Value, ControlProtocolError> {
 		self.ensure_current()?;
 		match operation.as_str() {
-			"omp.agents.completion" => self.completion(arguments).await,
+			"omp.agents.completion" => self.completion(&context, arguments).await,
 			"omp.agents.continuations"
 			| "omp.agents.set_continuation_policy"
 			| "omp.agents.loop_signal"
@@ -3919,7 +4027,8 @@ impl AuxiliaryCompletionOptions {
 	}
 }
 
-fn bridge_outcome_text(outcome: &inference_pb::Outcome) -> String {
+/// Concatenates the assistant text parts of a turn outcome.
+pub fn outcome_text(outcome: &inference_pb::Outcome) -> String {
 	let mut text = String::new();
 	for item in &outcome.output {
 		if let Some(item::Kind::Message(message)) = &item.kind {
@@ -4032,7 +4141,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			let event = event.map_err(|error| Str::from(error.to_string()))?;
 			match event.event {
 				Some(turn_event::Event::Outcome(outcome)) => {
-					return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
+					return Ok(Some(Str::from(outcome_text(&outcome))));
 				},
 				Some(turn_event::Event::Error(error)) => return Err(Str::from(error.detail)),
 				_ => {},
@@ -4041,12 +4150,36 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		Ok(None)
 	}
 
+	/// Debits an auxiliary turn's token spend from the session task budget.
+	fn debit_task_budget(&self, outcome: &inference_pb::Outcome) {
+		let spent = outcome.usage.as_ref().map_or(0, |usage| {
+			usage
+				.output_tokens
+				.saturating_add(usage.reasoning_tokens.unwrap_or_default())
+		});
+		self.context.lock().state.update(|snapshot| {
+			if let Some(remaining) = snapshot
+				.turn
+				.params
+				.task_budget
+				.as_mut()
+				.and_then(|budget| budget.remaining_tokens.as_mut())
+			{
+				*remaining = remaining.saturating_sub(spent);
+			}
+		});
+	}
+
 	/// Runs one non-persisted side-channel turn over a projected live thread.
+	///
+	/// Returns the turn outcome so callers can read the emitted text
+	/// ([`outcome_text`]), usage, and model; `None` when the turn ends without
+	/// an outcome.
 	pub async fn run_ephemeral_turn(
 		&self,
 		thread: omp_proto::thread::v1::Thread,
 		prompt_text: &str,
-	) -> Result<Option<Str>, Str> {
+	) -> Result<Option<inference_pb::Outcome>, Str> {
 		let context = self.context.lock().clone();
 		let mut params = context.state.snapshot().turn.params.clone();
 		params.tool_choice = None;
@@ -4079,7 +4212,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			let event = event.map_err(|error| Str::from(error.to_string()))?;
 			match event.event {
 				Some(turn_event::Event::Outcome(outcome)) => {
-					return Ok(Some(Str::from(bridge_outcome_text(&outcome))));
+					return Ok(Some(outcome));
 				},
 				Some(turn_event::Event::Error(error)) => return Err(Str::from(error.detail)),
 				_ => {},
@@ -4396,23 +4529,8 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			let event = event.map_err(|error| BridgeHostError::message(error.to_string()))?;
 			match event.event {
 				Some(turn_event::Event::Outcome(outcome)) => {
-					let spent = outcome.usage.as_ref().map_or(0, |usage| {
-						usage
-							.output_tokens
-							.saturating_add(usage.reasoning_tokens.unwrap_or_default())
-					});
-					self.context.lock().state.update(|snapshot| {
-						if let Some(remaining) = snapshot
-							.turn
-							.params
-							.task_budget
-							.as_mut()
-							.and_then(|budget| budget.remaining_tokens.as_mut())
-						{
-							*remaining = remaining.saturating_sub(spent);
-						}
-					});
-					let text = Str::from(bridge_outcome_text(&outcome));
+					self.debit_task_budget(&outcome);
+					let text = Str::from(outcome_text(&outcome));
 					let data = args
 						.get("schema")
 						.and_then(|_| serde_json::from_str::<Value>(text.as_str()).ok());
@@ -4857,7 +4975,7 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			journal,
 			CHAT_CAPS_BASE,
 		);
-		self.bind_host_control(id.clone(), child.host_control());
+		self.bind_agent_controls(id.clone(), child.host_control(), child.control());
 		child.set_ttsr_registry(child_ttsr);
 		let control_binding = if let Some(environment) = &isolated_environment {
 			let binding = environment
@@ -7237,7 +7355,7 @@ mod tests {
 		let inputs = inputs.lock();
 		assert_eq!(inputs.len(), 3);
 		assert!(matches!(&inputs[0], TurnInput::Full(thread)
-			if bridge_outcome_text(&inference_pb::Outcome {
+			if outcome_text(&inference_pb::Outcome {
 				output: thread.items.clone(),
 				..inference_pb::Outcome::default()
 			}) == "complete this"

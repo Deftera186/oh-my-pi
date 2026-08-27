@@ -108,6 +108,49 @@ pub enum CommandImplementation {
 	Handler(CommandHandler),
 	/// Prompt template. `$ARGUMENTS` is replaced exactly once.
 	Prompt(Str),
+	/// Lazy extension callback owned by one exact verified generation.
+	Extension(Arc<dyn ExtensionCommandHandler>),
+}
+/// Typed slash invocation delivered to an extension callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionCommandInvocation {
+	/// Spelling entered by the user, including aliases.
+	pub name:    Str,
+	/// Tokenized arguments with quote grouping already applied.
+	pub argv:    Arc<[Str]>,
+	/// Untokenized text after the command name.
+	pub raw:     Str,
+	/// Presentation mode in which the command was reached.
+	pub surface: CommandSurface,
+}
+
+/// Future returned by an exact-generation extension command callback.
+pub type ExtensionCommandFuture =
+	Pin<Box<dyn Future<Output = miette::Result<CommandResult>> + Send + 'static>>;
+
+/// Lazy activation and dispatch seam for one verified extension command.
+pub trait ExtensionCommandHandler: Send + Sync + 'static {
+	/// Activates only the owning extension and dispatches to its exact
+	/// generation.
+	fn call(
+		&self,
+		invocation: ExtensionCommandInvocation,
+		provenance: CommandProvenance,
+	) -> ExtensionCommandFuture;
+}
+
+impl<F, Fut> ExtensionCommandHandler for F
+where
+	F: Fn(ExtensionCommandInvocation, CommandProvenance) -> Fut + Send + Sync + 'static,
+	Fut: Future<Output = miette::Result<CommandResult>> + Send + 'static,
+{
+	fn call(
+		&self,
+		invocation: ExtensionCommandInvocation,
+		provenance: CommandProvenance,
+	) -> ExtensionCommandFuture {
+		Box::pin(self(invocation, provenance))
+	}
 }
 
 impl fmt::Debug for CommandImplementation {
@@ -115,6 +158,7 @@ impl fmt::Debug for CommandImplementation {
 		match self {
 			Self::Handler(_) => formatter.write_str("Handler(..)"),
 			Self::Prompt(template) => formatter.debug_tuple("Prompt").field(template).finish(),
+			Self::Extension(_) => formatter.write_str("Extension(..)"),
 		}
 	}
 }
@@ -149,6 +193,44 @@ pub struct CommandDeclaration {
 	pub provenance:      CommandProvenance,
 	/// Executable implementation.
 	pub implementation:  CommandImplementation,
+}
+impl CommandDeclaration {
+	/// Builds an executable command exclusively from a manifest-verified typed
+	/// UI declaration and its exact-generation callback.
+	pub fn verified_extension(
+		declaration: &omp_proto::ui::v1::CommandDecl,
+		provenance: CommandProvenance,
+		handler: Arc<dyn ExtensionCommandHandler>,
+	) -> Self {
+		Self {
+			order: 0,
+			name: Str::from(declaration.name.as_str()),
+			icon: omp_tui::Icon::ExtensionCommand,
+			aliases: declaration
+				.aliases
+				.iter()
+				.map(Str::from)
+				.collect::<Vec<_>>()
+				.into(),
+			description: Str::from(declaration.description.as_str()),
+			argument_hint: declaration.hint.as_deref().map(Str::from),
+			hints: declaration
+				.args
+				.iter()
+				.map(|arg| ArgumentHint {
+					value:       Str::from(arg.name.as_str()),
+					description: Str::from(arg.description.as_str()),
+				})
+				.collect::<Vec<_>>()
+				.into(),
+			capabilities: Arc::from([]),
+			surfaces: Arc::from([CommandSurface::Tui, CommandSurface::Acp, CommandSurface::Text]),
+			guest_visible: false,
+			acp_description: None,
+			provenance,
+			implementation: CommandImplementation::Extension(handler),
+		}
+	}
 }
 
 /// One compiled declaration factory submitted by [`inventory`].
@@ -476,6 +558,20 @@ impl CommandRoster {
 						provenance: declaration.provenance.clone(),
 					})
 				},
+				CommandImplementation::Extension(handler) => {
+					let argv = tokenize_args(args).map_err(|error| miette::miette!("{error}"))?;
+					handler
+						.call(
+							ExtensionCommandInvocation {
+								name: Str::new(candidate),
+								argv: argv.into(),
+								raw: Str::new(args),
+								surface,
+							},
+							declaration.provenance.clone(),
+						)
+						.await?
+				},
 			};
 			Ok(DispatchResult::Handled(result))
 		})
@@ -553,5 +649,53 @@ mod tests {
 			assert_eq!(omp_tui::Charset::Unicode.icon(icon), glyphs[1]);
 			assert_eq!(omp_tui::Charset::NerdFont.icon(icon), glyphs[2]);
 		}
+	}
+	#[test]
+	fn verified_extension_metadata_is_static_and_cannot_shadow_core() {
+		let provenance = CommandProvenance {
+			source:     sf!("extension:fixture"),
+			label:      sf!("Fixture"),
+			kind:       CommandSourceKind::Extension,
+			generation: 7,
+		};
+		let handler: Arc<dyn ExtensionCommandHandler> =
+			Arc::new(|_, _| async { Ok(CommandResult::Consumed(Default::default())) });
+		let declaration = |name: &str, alias: &str| {
+			CommandDeclaration::verified_extension(
+				&omp_proto::ui::v1::CommandDecl {
+					name: name.to_owned(),
+					description: "Fixture command".to_owned(),
+					aliases: vec![alias.to_owned()],
+					declaration_id: name.to_owned(),
+					..Default::default()
+				},
+				provenance.clone(),
+				handler.clone(),
+			)
+		};
+		let declarations =
+			Arc::from([declaration("model", "steal-model"), declaration("fixture", "fx")]);
+		let roster = CommandRoster::with_contributions(
+			[CommandGeneration { provenance, declarations }],
+			&ShadowPolicy::default(),
+		);
+		let completions = roster.completions();
+		assert_eq!(
+			completions
+				.iter()
+				.find(|command| command.name() == "model")
+				.unwrap()
+				.icon(),
+			Some(omp_tui::Icon::Model)
+		);
+		assert_eq!(
+			completions
+				.iter()
+				.find(|command| command.name() == "fixture")
+				.unwrap()
+				.description(),
+			"Fixture command"
+		);
+		assert_eq!(roster.command_usage_name("/fx one"), Some(sf!("fixture")));
 	}
 }
