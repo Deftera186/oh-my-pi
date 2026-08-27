@@ -157,6 +157,10 @@ struct ScriptedGateway {
 impl ScriptedGateway {
 	async fn start(scratch: &Path, socket: &Path, shell_release: &Path) -> Self {
 		let scripts = scripts(shell_release);
+		Self::start_with_scripts(scratch, socket, scripts).await
+	}
+
+	async fn start_with_scripts(scratch: &Path, socket: &Path, scripts: Vec<FakeScript>) -> Self {
 		let mut senders = Vec::with_capacity(scripts.len());
 		let mut receivers = VecDeque::with_capacity(scripts.len());
 		for _ in 0..scripts.len() {
@@ -381,6 +385,17 @@ fn text_script(text: &'static str) -> FakeScript {
 		Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text }),
 		Ok(ChatEvent::TextDelta { index: 0, text: Str::from(text) }),
 		Ok(completed(FinishReason::Stop, 1)),
+	])
+}
+/// A provider stream whose thinking block is closed implicitly by the
+/// following text block, mirroring reasoning-capable providers.
+fn thinking_text_script(thinking: &'static str, answer: &'static str) -> FakeScript {
+	FakeScript::chat(vec![
+		Ok(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Thinking }),
+		Ok(ChatEvent::ThinkingDelta { index: 0, text: Str::from(thinking) }),
+		Ok(ChatEvent::BlockStarted { index: 1, kind: BlockKind::Text }),
+		Ok(ChatEvent::TextDelta { index: 1, text: Str::from(answer) }),
+		Ok(completed(FinishReason::Stop, 2)),
 	])
 }
 
@@ -767,6 +782,42 @@ fn visible(bytes: &[u8]) -> String {
 	out
 }
 
+/// Seeds one resumable interactive session journal and its index row.
+fn seed_session(state_dir: &Path, project: &Path, id: &str) {
+	let sessions = state_dir.join("sessions");
+	fs::create_dir_all(&sessions).expect("create chat session directory");
+	let session_id = SessionId(Str::from(id));
+	let session_index =
+		SessionIndex::open(sessions.join("sessions.sqlite3")).expect("open session index");
+	let project_text = project.to_string_lossy();
+	let journal = sessions.join(format!("{id}.jsonl"));
+	session_index
+		.create_session(
+			&NewSession {
+				id:         &session_id,
+				cwd:        project_text.as_ref(),
+				project:    project_text.as_ref(),
+				created_ms: 1,
+				kind:       SessionKind::Interactive,
+				parent:     None,
+				remote:     false,
+			},
+			|| {
+				let mut header = serde_json::to_vec(&Header {
+					v:       4,
+					id:      session_id.clone(),
+					created: 1,
+					cwd:     project.to_path_buf(),
+				})
+				.map_err(io::Error::other)?;
+				header.push(b'\n');
+				fs::write(&journal, header)?;
+				Ok::<_, io::Error>(((), 0))
+			},
+		)
+		.expect("create resumable TUI session");
+}
+
 fn assert_restored(raw: &[u8], before: &Termios, after: &Termios, diagnostics: &str) {
 	let alt_enter = raw.windows(8).rposition(|window| window == b"\x1b[?1049h");
 	let alt_exit = raw.windows(8).rposition(|window| window == b"\x1b[?1049l");
@@ -863,42 +914,8 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		"--gateway".to_owned(),
 		gateway_socket.display().to_string(),
 	];
-	let sessions = state_dir.join("sessions");
-	fs::create_dir_all(&sessions).expect("create chat session directory");
 	let initial_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned();
-	let session_id = SessionId(Str::from(initial_session_id.as_str()));
-	let session_index =
-		SessionIndex::open(sessions.join("sessions.sqlite3")).expect("open session index");
-	let project_text = project.to_string_lossy();
-	let initial_journal = state_dir
-		.join("sessions")
-		.join(format!("{initial_session_id}.jsonl"));
-	session_index
-		.create_session(
-			&NewSession {
-				id:         &session_id,
-				cwd:        project_text.as_ref(),
-				project:    project_text.as_ref(),
-				created_ms: 1,
-				kind:       SessionKind::Interactive,
-				parent:     None,
-				remote:     false,
-			},
-			|| {
-				let mut header = serde_json::to_vec(&Header {
-					v:       4,
-					id:      session_id.clone(),
-					created: 1,
-					cwd:     project.clone(),
-				})
-				.map_err(io::Error::other)?;
-				header.push(b'\n');
-				fs::write(&initial_journal, header)?;
-				Ok::<_, io::Error>(((), 0))
-			},
-		)
-		.expect("create resumable TUI session");
-	drop(session_index);
+	seed_session(&state_dir, &project, &initial_session_id);
 
 	let mut args = base_args.clone();
 	args.extend(["--resume".to_owned(), initial_session_id.clone()]);
@@ -1214,4 +1231,136 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		"resumed omp chat did not exit cleanly\n{resumed_diagnostics}"
 	);
 	assert_restored(&resumed_bytes, &resumed_before, &resumed_after, &resumed_diagnostics);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_tui_persists_thinking_blocks_across_turns_and_resume() {
+	use std::os::unix::fs::PermissionsExt;
+	omp_e2e::support::install_omp_binary_env().expect("install Cargo-built omp binary");
+	let scratch = tempfile::tempdir().expect("scratch root");
+	fs::set_permissions(scratch.path(), <fs::Permissions>::from_mode(0o700))
+		.expect("secure scratch root");
+	let project = scratch.path().join("project");
+	fs::create_dir(&project).expect("project directory");
+	let project = fs::canonicalize(&project).expect("canonical project root");
+	let metadata_dir = project.join(".omp");
+	fs::create_dir(&metadata_dir).expect("project metadata directory");
+	fs::set_permissions(&metadata_dir, <fs::Permissions>::from_mode(0o755))
+		.expect("use standard project metadata permissions");
+	let data_dir = project.parent().expect("project parent").join("home/data");
+	let state_dir =
+		omp_env::project_state::directory(&data_dir, &project).expect("project state directory");
+	fs::create_dir_all(&state_dir).expect("create project state directory");
+	let gateway_socket = scratch.path().join("gateway.sock");
+	let debug_socket = scratch.path().join("tui-debug.sock");
+	let gateway = ScriptedGateway::start_with_scripts(scratch.path(), &gateway_socket, vec![
+		thinking_text_script(
+			"Weighing the first request.\nThe deterministic option is safest.",
+			"First answer settled.",
+		),
+		thinking_text_script("Second deliberation paragraph.", "Second answer settled."),
+	])
+	.await;
+	gateway.release(0);
+	gateway.release(1);
+
+	let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned();
+	seed_session(&state_dir, &project, &session_id);
+	let binary = omp_e2e::support::omp_binary().expect("locate omp binary");
+	let base_args = vec![
+		"chat".to_owned(),
+		"--model".to_owned(),
+		gateway.model.clone(),
+		"--project".to_owned(),
+		project.display().to_string(),
+		"--gateway".to_owned(),
+		gateway_socket.display().to_string(),
+	];
+	let mut args = base_args.clone();
+	args.extend(["--resume".to_owned(), session_id.clone()]);
+	let mut process = PtyChild::spawn(&binary, &args, &project, &debug_socket);
+	let raw_capture = process.raw.clone();
+	let mut debug =
+		DebugClient::connect(&debug_socket, Instant::now() + READY_TIMEOUT, &mut process);
+	let ready = wait_snapshot(&mut debug, &raw_capture, "chat shell ready", |snapshot| {
+		snapshot.text.contains("session") && snapshot.text.contains("idle")
+	});
+	assert_surface(&ready, "ready");
+
+	debug.keys("'first prompt' enter");
+	let first = wait_snapshot(&mut debug, &raw_capture, "first turn keeps thinking", |snapshot| {
+		snapshot.frame.contains("First answer settled.")
+			&& snapshot.frame.contains("Weighing the first request")
+	});
+	assert_surface(&first, "first turn");
+
+	// Ctrl+T is a scene-wide visibility toggle: it hides every unretired
+	// thinking block and applies to future ones until toggled back.
+	debug.keys("ctrl+t");
+	let hidden = wait_snapshot(&mut debug, &raw_capture, "ctrl+t hides thinking", |snapshot| {
+		snapshot.frame.contains("First answer settled.")
+			&& !snapshot.frame.contains("Weighing the first request")
+	});
+	assert_surface(&hidden, "hidden thinking");
+	debug.keys("ctrl+t");
+	wait_snapshot(&mut debug, &raw_capture, "ctrl+t restores thinking", |snapshot| {
+		snapshot.frame.contains("Weighing the first request")
+	});
+
+	debug.keys("'second prompt' enter");
+	let second = wait_snapshot(&mut debug, &raw_capture, "second turn keeps history", |snapshot| {
+		snapshot.frame.contains("Second answer settled.")
+			&& snapshot.frame.contains("Second deliberation paragraph.")
+	});
+	assert_surface(&second, "second turn");
+	assert!(
+		second.frame.contains("First answer settled."),
+		"prior transcript vanished during the second turn: {}",
+		second.frame
+	);
+
+	debug.keys("'/quit' enter");
+	drop(debug);
+	let (status, raw, stdout, stderr, _) = process.wait(READY_TIMEOUT);
+	assert!(
+		status.success(),
+		"omp chat did not exit cleanly\nstatus={status}\nstdout={stdout}\nstderr={stderr}\nraw={}",
+		visible(&raw)
+	);
+
+	// Durable thinking parts replay with their bodies visible.
+	let resume_socket = scratch.path().join("resume-tui-debug.sock");
+	let mut args = base_args.clone();
+	args.extend(["--resume".to_owned(), session_id.clone()]);
+	let mut resumed = PtyChild::spawn(&binary, &args, &project, &resume_socket);
+	let resumed_raw = resumed.raw.clone();
+	let mut resume_debug =
+		DebugClient::connect(&resume_socket, Instant::now() + READY_TIMEOUT, &mut resumed);
+	let rehydrated = wait_snapshot(
+		&mut resume_debug,
+		&resumed_raw,
+		"resumed transcript keeps thinking bodies",
+		|snapshot| {
+			let all = snapshot.combined();
+			all.contains("First answer settled.")
+				&& all.contains("Second answer settled.")
+				&& all.contains("Weighing the first request")
+		},
+	);
+	assert!(
+		rehydrated
+			.combined()
+			.contains("Second deliberation paragraph."),
+		"replayed thinking dropped a body: {}",
+		rehydrated.combined()
+	);
+	resume_debug.keys("'/quit' enter enter");
+	drop(resume_debug);
+	let (resumed_status, resumed_bytes, resumed_stdout, resumed_stderr, _) =
+		resumed.wait(READY_TIMEOUT);
+	assert!(
+		resumed_status.success(),
+		"resumed omp chat did not exit \
+		 cleanly\nstatus={resumed_status}\nstdout={resumed_stdout}\nstderr={resumed_stderr}\nraw={}",
+		visible(&resumed_bytes)
+	);
 }
