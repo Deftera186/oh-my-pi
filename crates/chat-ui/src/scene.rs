@@ -3731,16 +3731,19 @@ impl Chat {
 			return None;
 		}
 
-		// Pressure retires the shortest sufficient finalized prefix. Flush
-		// takes every currently eligible head.
+		// Pressure retires the longest finalized prefix whose remainder still
+		// fills the viewport, so committing rows never blanks the screen: a
+		// block taller than the live area stays visible (tail-clipped) until
+		// newer content can replace it. Only the block-count memory bound
+		// overrides that floor. Flush takes every currently eligible head.
 		let mut end = eligible.start;
 		let mut freed = 0_u32;
 		for height in &prefix {
 			let taken = end - eligible.start;
-			if policy == RetirementPolicy::Pressure
-				&& total.saturating_sub(freed) <= u32::from(h_live)
-				&& live_count.saturating_sub(taken) < MAX_LIVE_BLOCKS
-			{
+			let count_pressured = live_count.saturating_sub(taken) >= MAX_LIVE_BLOCKS;
+			let remainder_fills_viewport =
+				total.saturating_sub(freed).saturating_sub(*height) >= u32::from(h_live);
+			if policy == RetirementPolicy::Pressure && !count_pressured && !remainder_fills_viewport {
 				break;
 			}
 			freed = freed.saturating_add(*height);
@@ -4663,6 +4666,28 @@ mod tests {
 	}
 
 	#[test]
+	fn settling_a_message_taller_than_the_viewport_keeps_the_tail_visible() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(40, 12);
+		let long = (0..200)
+			.map(|row| format!("row-{row:03}"))
+			.collect::<Vec<_>>()
+			.join("\n\n");
+		chat.begin_assistant("long");
+		chat.append_assistant("long", &long);
+		settle(&mut chat, viewport);
+		chat.end_assistant("long");
+		settle(&mut chat, viewport);
+
+		while let Some(batch) = chat.retirement_batch(viewport) {
+			let projected = frame_text(chat.render_after_retirement(viewport, &batch).frame);
+			chat.mark_retired(&batch);
+			assert!(projected.contains("row-"), "retirement blanked the viewport: {projected:?}");
+		}
+		let rendered = frame_text(chat.render(viewport).frame);
+		assert!(rendered.contains("row-199"), "settled tail no longer visible: {rendered:?}");
+	}
+	#[test]
 	fn render_is_exactly_viewport_sized() {
 		let mut chat = Chat::new(&ctx());
 		for viewport in [Size::new(0, 0), Size::new(1, 1), Size::new(80, 24)] {
@@ -5251,8 +5276,13 @@ mod tests {
 		let text = frame_text(rendered.frame);
 		assert!(text.contains("hello there"), "{text:?}");
 		assert!(text.contains("finalized notice"), "{text:?}");
-		// Shrinking below the live tail forces the shortest prefix out.
+		// Shrinking below the live tail retires the head, but only while the
+		// remainder still fills the live area — a gap above the composer is
+		// worse than keeping a clipped block on screen.
 		let tight = Size::new(40, 7);
+		for index in 0..8 {
+			chat.push_notice(format!("tail {index}"));
+		}
 		let batch = chat.retirement_batch(tight).expect("pressure retires");
 		assert_eq!(batch.range.start, 0);
 		chat.mark_retired(&batch);
@@ -5263,7 +5293,7 @@ mod tests {
 	fn retirement_projects_the_post_commit_viewport_before_acknowledgement() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_notice("head\nhead\nhead\nhead");
-		chat.push_notice("newly visible");
+		chat.push_notice("newly visible\nnewly visible\nnewly visible\nnewly visible");
 		let viewport = Size::new(40, 7);
 		let batch = chat
 			.retirement_batch(viewport)
