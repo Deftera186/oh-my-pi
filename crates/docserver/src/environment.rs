@@ -4,7 +4,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	fmt,
 	path::PathBuf,
-	sync::Arc,
+	sync::{Arc, OnceLock, Weak},
 };
 
 use omp_core::{Str, sf};
@@ -14,7 +14,8 @@ use url::Url;
 
 use crate::{
 	DapAdapterRegistry, DapSessionRegistry, DocumentId, DocumentStore, EditAdapterRegistry, Error,
-	LeaseId, PathService, Result, ServerConfig, lsp_registry::LspRegistry, summary::SummaryService,
+	LeaseId, PathService, Result, ServerConfig, lsp_registry::LspRegistry,
+	lsp_supervisor::NativeLspSupervisor, summary::SummaryService,
 	transaction::TransactionCoordinator,
 };
 
@@ -267,6 +268,7 @@ pub struct Environment {
 struct EnvironmentInner {
 	store:            DocumentStore,
 	lsp:              LspRegistry,
+	lsp_supervisor:   OnceLock<NativeLspSupervisor>,
 	dap_adapters:     DapAdapterRegistry,
 	dap_sessions:     DapSessionRegistry,
 	transactions:     TransactionCoordinator<LspRegistry>,
@@ -305,6 +307,7 @@ impl Environment {
 			inner: Arc::new(EnvironmentInner {
 				store,
 				lsp,
+				lsp_supervisor: OnceLock::new(),
 				dap_adapters: DapAdapterRegistry::with_builtins(),
 				dap_sessions: DapSessionRegistry::default(),
 				transactions,
@@ -339,6 +342,21 @@ impl Environment {
 	/// Returns the project-scoped LSP binding registry.
 	pub fn lsp(&self) -> &LspRegistry {
 		&self.inner.lsp
+	}
+
+	/// Installs the native language-server supervisor exactly once.
+	pub fn install_lsp_supervisor(&self, supervisor: NativeLspSupervisor) {
+		let _ = self.inner.lsp_supervisor.set(supervisor);
+	}
+
+	/// Returns the native language-server supervisor when one is installed.
+	pub fn lsp_supervisor(&self) -> Option<&NativeLspSupervisor> {
+		self.inner.lsp_supervisor.get()
+	}
+
+	/// Returns a non-owning handle that never keeps the authority alive.
+	pub(crate) fn downgrade(&self) -> WeakEnvironment {
+		WeakEnvironment { inner: Arc::downgrade(&self.inner) }
 	}
 
 	/// Returns the project-scoped DAP adapter registry.
@@ -389,10 +407,24 @@ impl Environment {
 
 	/// Terminates debug sessions before stopping every active document actor.
 	pub async fn shutdown(&self) {
+		if let Some(supervisor) = self.inner.lsp_supervisor.get() {
+			supervisor.shutdown().await;
+		}
 		for session in self.inner.dap_sessions.list() {
 			let _ = session.terminate().await;
 		}
 		self.inner.store.shutdown().await;
+	}
+}
+/// Non-owning [`Environment`] handle used by background supervision tasks.
+pub(crate) struct WeakEnvironment {
+	inner: Weak<EnvironmentInner>,
+}
+
+impl WeakEnvironment {
+	/// Upgrades to the live authority when it still exists.
+	pub(crate) fn upgrade(&self) -> Option<Environment> {
+		self.inner.upgrade().map(|inner| Environment { inner })
 	}
 }
 

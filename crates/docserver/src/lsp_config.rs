@@ -23,7 +23,8 @@ const CONFIG_NAMES: [&str; 6] =
 	["lsp.json", ".lsp.json", "lsp.yaml", ".lsp.yaml", "lsp.yml", ".lsp.yml"];
 
 /// Origin class of one native LSP declaration.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum LspConfigSourceKind {
 	/// Bundled OMP catalog.

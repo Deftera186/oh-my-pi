@@ -41,6 +41,7 @@ use crate::{
 		DocumentEventStreamError, LspBindingEventKind, LspBindingId, LspLeaseBinding,
 		LspRegistryError, LspRegistryEvent, StaleResponsePolicy,
 	},
+	lsp_supervisor::LspServerState,
 	path_ops::PathMutationResult,
 	position::{Position, PositionEncoding},
 	summary::{
@@ -474,6 +475,7 @@ async fn dispatch(
 		Request::GetLspBindings(request) => get_lsp_bindings(session, request, cancellation)
 			.await
 			.map(Response::LspBindings),
+		Request::LspStatus(request) => Ok(Response::LspStatus(lsp_status(session, request.reload))),
 		Request::LspRequest(request) => lsp_request(session, request, cancellation)
 			.await
 			.map(Response::LspResponse),
@@ -1079,6 +1081,9 @@ async fn open_document(
 		.store()
 		.resolve_entry_path(&uri)
 		.map_err(Failure::from_core)?;
+	if let Some(supervisor) = session.environment().lsp_supervisor() {
+		supervisor.notify_open(&path);
+	}
 	let language = if request.language_id.is_empty() {
 		None
 	} else {
@@ -1529,6 +1534,9 @@ async fn get_lsp_bindings(
 ) -> DispatchResult<proto::GetLspBindingsResponse> {
 	let target = parse_target(required(request.document, "LSP binding document target")?)?;
 	let lease_id = connection_lease_for_target(session, &target, &cancellation).await?;
+	if let Some(supervisor) = session.environment().lsp_supervisor() {
+		supervisor.wait_idle(&cancellation).await;
+	}
 	let bindings = tokio::select! {
 		biased;
 		() = cancellation.cancelled() => {
@@ -1539,6 +1547,38 @@ async fn get_lsp_bindings(
 		},
 	};
 	Ok(proto::GetLspBindingsResponse { bindings: bindings.iter().map(binding_to_proto).collect() })
+}
+fn lsp_status(session: &EnvironmentSession, reload: bool) -> proto::LspStatusResponse {
+	let servers = session
+		.environment()
+		.lsp_supervisor()
+		.map(|supervisor| {
+			if reload && let Err(error) = supervisor.reload() {
+				tracing::warn!(%error, "LSP roster reload failed; answering with prior roster");
+			}
+			supervisor
+				.status()
+				.into_iter()
+				.map(|server| proto::LspServerStatus {
+					name:       server.name.to_string(),
+					stage:      match server.state {
+						LspServerState::Available => proto::LspServerStage::Available,
+						LspServerState::Starting => proto::LspServerStage::Starting,
+						LspServerState::Indexing => proto::LspServerStage::Indexing,
+						LspServerState::Ready => proto::LspServerStage::Ready,
+						LspServerState::Failed => proto::LspServerStage::Failed,
+					} as i32,
+					file_types: server.file_types.iter().map(ToString::to_string).collect(),
+					detail:     server
+						.detail
+						.map(|detail| detail.to_string())
+						.unwrap_or_default(),
+					source:     server.source.to_owned(),
+				})
+				.collect()
+		})
+		.unwrap_or_default();
+	proto::LspStatusResponse { servers }
 }
 
 async fn lsp_request(

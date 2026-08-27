@@ -38,6 +38,8 @@ impl DocServerTask {
 		let task = tokio::spawn(async move {
 			daemon::serve(project, Transport::Socket(task_socket), ServeOptions {
 				lsp_config_paths: lsp_configs,
+				lsp:              omp_docserver::NativeLspOptions { enabled: false, lazy: true },
+				user_config_root: None,
 				shutdown:         None,
 				server_build:     Default::default(),
 				connections:      None,

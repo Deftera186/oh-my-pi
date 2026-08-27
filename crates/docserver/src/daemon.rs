@@ -42,7 +42,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	Environment, LspProcess, LspProcessError, ServerConfig,
 	connection::{ConnectionConfig, ConnectionError, serve_io_until},
+	dap_adapter::builtin_adapters,
+	dap_config::{discover_native_dap_sources, load_dap_config},
 	error, load_lsp_process_configs,
+	lsp_supervisor::{NativeLspOptions, NativeLspSupervisor},
 };
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -65,6 +68,10 @@ pub enum Transport {
 pub struct ServeOptions {
 	/// Language-server process configuration files loaded before serving.
 	pub lsp_config_paths: Vec<PathBuf>,
+	/// Native language-server discovery and startup policy.
+	pub lsp:              NativeLspOptions,
+	/// User configuration root probed for `lsp.json` and `dap.json` overrides.
+	pub user_config_root: Option<PathBuf>,
 	/// External shutdown; `None` installs signal handling.
 	pub shutdown:         Option<CancellationToken>,
 	/// Executable-generation identity advertised in `ServerHello`.
@@ -235,6 +242,20 @@ async fn run_with_shutdown(root: PathBuf, transport: Transport, options: ServeOp
 	let config = ServerConfig::new(root)?.with_server_build(options.server_build);
 	let authority_lock = config.try_lock_authority()?;
 	let environment = Environment::new(config)?;
+	if options.lsp.enabled {
+		match NativeLspSupervisor::discover(&environment, options.user_config_root.as_deref()) {
+			Ok(supervisor) => {
+				environment.install_lsp_supervisor(supervisor.clone());
+				if !options.lsp.lazy {
+					supervisor.warm_all();
+				}
+			},
+			Err(error) => {
+				tracing::warn!(%error, "native LSP discovery failed; continuing without servers");
+			},
+		}
+	}
+	install_dap_overrides(&environment, options.user_config_root.as_deref());
 	let mut processes = Vec::with_capacity(process_configs.len());
 	for process_config in process_configs {
 		match LspProcess::start(process_config, &environment, CancellationToken::new()).await {
@@ -269,6 +290,42 @@ async fn run_with_shutdown(root: PathBuf, transport: Transport, options: ServeOp
 	}
 	serve_result?;
 	process_result
+}
+
+/// Overlays discovered user/project DAP adapter declarations onto the
+/// builtin registry; discovery failures never block the authority.
+fn install_dap_overrides(environment: &Environment, user_config_root: Option<&Path>) {
+	let root = match environment.root_uri().to_file_path() {
+		Ok(root) => root,
+		Err(()) => return,
+	};
+	let sources = match discover_native_dap_sources(user_config_root, &root) {
+		Ok(sources) => sources,
+		Err(error) => {
+			tracing::warn!(%error, "native DAP discovery failed; continuing with builtins");
+			return;
+		},
+	};
+	if sources.is_empty() {
+		return;
+	}
+	let adapters = match load_dap_config(builtin_adapters(), &sources) {
+		Ok(adapters) => adapters,
+		Err(error) => {
+			tracing::warn!(%error, "native DAP configuration failed; continuing with builtins");
+			return;
+		},
+	};
+	for resolved in adapters.values() {
+		match resolved.to_spec() {
+			Ok(spec) => {
+				if environment.dap_adapters().replace(spec.clone()).is_err() {
+					let _ = environment.dap_adapters().install(spec);
+				}
+			},
+			Err(error) => tracing::warn!(%error, "skipping invalid DAP adapter declaration"),
+		}
+	}
 }
 
 async fn stop_lsp_processes(processes: &mut Vec<LspProcess>) -> Result {
@@ -717,6 +774,8 @@ mod tests {
 		let task = tokio::spawn(async move {
 			serve(task_project, Transport::Socket(task_socket), ServeOptions {
 				lsp_config_paths: Vec::new(),
+				lsp:              NativeLspOptions { enabled: false, ..NativeLspOptions::default() },
+				user_config_root: None,
 				shutdown:         Some(task_shutdown),
 				server_build:     Str::default(),
 				connections:      None,
@@ -753,6 +812,8 @@ mod tests {
 		let (connection_tx, mut connection_rx) = watch::channel(usize::MAX);
 		let task = tokio::spawn(serve(project, Transport::Socket(socket.clone()), ServeOptions {
 			lsp_config_paths: Vec::new(),
+			lsp:              NativeLspOptions { enabled: false, ..NativeLspOptions::default() },
+			user_config_root: None,
 			shutdown:         Some(shutdown.clone()),
 			server_build:     sf!("test-build"),
 			connections:      Some(connection_tx),
@@ -808,6 +869,8 @@ mod tests {
 		let (connection_tx, mut connection_rx) = watch::channel(usize::MAX);
 		let task = tokio::spawn(serve(project, Transport::Socket(socket.clone()), ServeOptions {
 			lsp_config_paths: Vec::new(),
+			lsp:              NativeLspOptions { enabled: false, ..NativeLspOptions::default() },
+			user_config_root: None,
 			shutdown:         Some(shutdown.clone()),
 			server_build:     Str::default(),
 			connections:      Some(connection_tx),

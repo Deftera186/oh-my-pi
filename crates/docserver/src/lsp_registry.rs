@@ -887,7 +887,7 @@ impl LspRegistry {
 		Ok(())
 	}
 
-	fn publish_startup(&self, name: Str, stage: LspStartupStage) {
+	pub(crate) fn publish_startup(&self, name: Str, stage: LspStartupStage) {
 		let _ = self
 			.inner
 			.events

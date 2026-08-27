@@ -45,6 +45,8 @@ pub mod lsp_pool;
 /// Bounded child-process JSON-RPC transport and production LSP binding startup.
 pub mod lsp_process;
 pub mod lsp_registry;
+/// Workspace-scoped native language-server discovery, startup, and status.
+pub mod lsp_supervisor;
 /// Actor-aware Environment path operations.
 pub mod path_ops;
 /// Checked LSP position encoding and text-edit conversion.
@@ -89,6 +91,9 @@ pub use lsp_apply_edit::ApplyWorkspaceEditError;
 pub use lsp_process::{
 	InboundDispatch, LspPostResponse, LspProcess, LspProcessConfig, LspProcessError,
 	LspProcessSelectorConfig, LspTransportSettings, load_lsp_process_configs,
+};
+pub use lsp_supervisor::{
+	LspServerState, LspServerStatusView, NativeLspOptions, NativeLspSupervisor,
 };
 pub use path_ops::{PathMutationResult, PathService};
 pub use rebase::{
