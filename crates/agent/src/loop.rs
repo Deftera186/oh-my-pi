@@ -2670,6 +2670,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 		} else {
 			None
 		};
+		// Captured once per logical turn so retry attempts (including the
+		// held-context replacement below) rebuild the demoted thread instead of
+		// resending raw interrupted reasoning.
+		let demote_reasoning = mem::take(&mut self.pending_reasoning_demotion);
 
 		loop {
 			let latest = self.state.snapshot();
@@ -2703,10 +2707,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.unwrap_or_default();
 					let _ = inject_first_turn_metadata(&mut thread, &date, cwd);
 				}
-				if mem::take(&mut self.pending_reasoning_demotion) {
+				if demote_reasoning {
 					let _ = demote_interrupted_reasoning(&mut thread, snapshot.reasoning_dialect);
 				}
-				TurnInput::Full(thread)
+				match context.clone() {
+					// The server still holds this context (reseed after an
+					// interrupt or cancel): the protocol forbids seeding a live
+					// context, so replace its entire history in place.
+					Some(held) => TurnInput::Delta(held, ThreadDelta {
+						truncate_to: Some(0),
+						append:      thread.items,
+					}),
+					None => TurnInput::Full(thread),
+				}
 			} else {
 				let held = context
 					.clone()
@@ -2964,10 +2977,22 @@ impl<C: TurnClient + Clone> Agent<C> {
 					let actual = error
 						.actual
 						.ok_or(AgentError::Protocol("conflict missing actual revision"))?;
-					let held = context
-						.as_mut()
-						.ok_or(AgentError::Protocol("conflict on full turn"))?;
-					held.expected = Some(actual);
+					match context.as_mut() {
+						Some(held) => held.expected = Some(actual),
+						// A stateful seed conflicted with a context the server
+						// still holds: adopt its authoritative revision and retry
+						// as a full replacement delta.
+						None => {
+							let context_id = frozen_options
+								.context_id
+								.as_ref()
+								.ok_or(AgentError::Protocol("conflict on stateless turn"))?;
+							context = Some(ContextRef {
+								context_id: context_id.to_string(),
+								expected:   Some(actual),
+							});
+						},
+					}
 					resume_input = None;
 				},
 				Err(TurnError::NeedFull(error)) => {
@@ -2975,6 +3000,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						return Err(TurnError::NeedFull(error).into());
 					}
 					full = true;
+					context = None;
 					resume_input = None;
 				},
 				Err(TurnError::Terminal(error))
@@ -5088,6 +5114,96 @@ mod tests {
 			.position(|kind| *kind == "outcome")
 			.expect("replayed outcome");
 		assert!(error < outcome);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn full_seed_conflict_replaces_held_context_with_truncating_delta() {
+		#[derive(Clone)]
+		struct SeedConflictClient {
+			opened: Arc<Mutex<OpenedTurns>>,
+		}
+
+		impl TurnClient for SeedConflictClient {
+			type Session<'client> = ScriptedSession;
+
+			fn turn<'client>(
+				&'client self,
+				turn_id: TurnId,
+				input: TurnInput,
+				options: &'client TurnOptions,
+			) -> impl Future<Output = Result<Self::Session<'client>, TurnError>> + Send + 'client {
+				let mut opened = self.opened.lock();
+				opened.push((turn_id, input, options.clone()));
+				let events: Script = match &opened.last().expect("just pushed").1 {
+					TurnInput::Full(_) => vec![Err(TurnError::Conflict(Box::new(pb::TurnError {
+						kind: turn_error::Kind::Conflict as i32,
+						detail: "seed context is already held".to_owned(),
+						actual: Some(thread::Revision { head: 7, token: Bytes::from_static(b"held") }),
+						..pb::TurnError::default()
+					})))],
+					TurnInput::Delta(context, delta) => {
+						let base = delta
+							.truncate_to
+							.unwrap_or_else(|| context.expected.as_ref().expect("expected revision").head);
+						let head = base + u64::try_from(delta.append.len()).expect("append length") + 1;
+						let mut outcome = end_outcome("recovered");
+						for (offset, item) in outcome.output.iter_mut().enumerate() {
+							item.seq = head + u64::try_from(offset).expect("offset");
+						}
+						outcome.revision =
+							Some(thread::Revision { head, token: Bytes::from_static(b"next") });
+						outcome_script(outcome)
+					},
+				};
+				future::ready(Ok(ScriptedSession { events: events.into() }))
+			}
+		}
+
+		let (journal, path) = test_journal("seed-conflict");
+		let mut snapshot = AgentSnapshot::default();
+		snapshot.turn.context_id = Some(sf!("ctx"));
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = SeedConflictClient { opened: Arc::clone(&opened) };
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent = Agent::new(client, env, AgentState::new(snapshot), journal, test_caps());
+		let summary = agent
+			.submit(
+				[message(thread::Role::User, "resume after interrupt")],
+				TurnId::new("conflict-turn"),
+			)
+			.await
+			.expect("held-context conflict recovers");
+		assert_eq!(summary.committed_turns, 1);
+		{
+			let opened = opened.lock();
+			assert_eq!(opened.len(), 2, "one conflicted seed, one replacement delta");
+			let TurnInput::Full(seed) = &opened[0].1 else {
+				panic!("first attempt must seed the full thread");
+			};
+			let TurnInput::Delta(context, delta) = &opened[1].1 else {
+				panic!("recovery must replace the held context with a delta");
+			};
+			assert_eq!(context.context_id, "ctx");
+			assert_eq!(context.expected.as_ref().map(|revision| revision.head), Some(7));
+			assert_eq!(delta.truncate_to, Some(0));
+			assert_eq!(delta.append, seed.items, "replacement resends the entire thread");
+		}
+		let next = agent
+			.submit([message(thread::Role::User, "next")], TurnId::new("next-turn"))
+			.await
+			.expect("follow-up turn");
+		assert_eq!(next.committed_turns, 1);
+		{
+			let opened = opened.lock();
+			assert_eq!(opened.len(), 3);
+			let TurnInput::Delta(context, delta) = &opened[2].1 else {
+				panic!("recovered context must resume append deltas");
+			};
+			assert_eq!(context.context_id, "ctx");
+			assert!(delta.truncate_to.is_none(), "follow-up appends without truncation");
+		}
 		drop(agent);
 		fs::remove_file(path).expect("remove journal");
 	}
