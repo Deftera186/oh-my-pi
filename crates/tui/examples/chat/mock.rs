@@ -155,7 +155,8 @@ async fn stream_turn(
 	let _ = events.send(BackendEvent::Status(facts));
 	let assistant = Str::from(format!("assistant-{turn}"));
 	let tool = Str::from(format!("tool-{turn}"));
-	let _ = events.send(BackendEvent::AssistantBegin { id: assistant.clone() });
+	let _ =
+		events.send(BackendEvent::AssistantBegin { id: assistant.clone(), thinking: false });
 	for delta in [
 		"I’ll inspect the rendering seam, ",
 		"preserve stable scrollback rows, ",
