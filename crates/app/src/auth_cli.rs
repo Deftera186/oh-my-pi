@@ -78,7 +78,14 @@ async fn print_auth(answer: AuthAnswer, database: &Path) -> miette::Result<()> {
 			let session_id = session.id.clone();
 			while let Ok(event) = session.events.recv_async().await {
 				match event.into_diagnostic()? {
-					AuthEvent::OpenUrl(url) => println!("\nOpen this URL in your browser:\n{url}\n"),
+					AuthEvent::OpenUrl { url, launch } => {
+						println!("\nOpen this URL in your browser:\n{url}");
+						if let Some(launch) = launch {
+							println!("or open {launch}\n");
+						} else {
+							println!();
+						}
+					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => println!(
 						"complete device authorization at {verification_url} using code {}",
 						code.expose_secret()

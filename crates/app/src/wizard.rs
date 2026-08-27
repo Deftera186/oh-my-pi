@@ -56,7 +56,7 @@ enum Step {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AuthLocation {
-	Url(Str),
+	Url { url: Str, launch: Option<Str> },
 	DeviceCode { code: Str, url: Str },
 }
 
@@ -242,24 +242,25 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				},
 				Some(_) => {},
 			},
-			event = auth.next_event() => match event {
-				Some(ChatAuthEvent::Url(url))
-					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
-				{
-					auth_location = Some(AuthLocation::Url(url));
-					if let Step::Prompt(kind) = step {
-						if let Some(message) = auth_prompt_message.clone() {
-							let _ = app.ui_mut().close_top_overlay();
-							show_auth_prompt(app.ui_mut(), message, kind, auth_location.as_ref());
+							event = auth.next_event() => match event {
+					Some(ChatAuthEvent::Url { url, launch })
+						if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
+					{
+						auth_location = Some(AuthLocation::Url { url, launch });
+						if let Step::Prompt(kind) = step {
+							if let Some(message) = auth_prompt_message.clone() {
+								let _ = app.ui_mut().close_top_overlay();
+								show_auth_prompt(app.ui_mut(), message, kind, auth_location.as_ref());
+							}
+						} else if let Some(AuthLocation::Url { url, launch }) = auth_location.as_ref() {
+							let display_url = launch.as_ref().unwrap_or(url);
+							set_status(
+								app.ui_mut(),
+								sf!("[Open to authorize]({display_url}) · Esc to cancel"),
+							);
 						}
-					} else if let Some(AuthLocation::Url(url)) = auth_location.as_ref() {
-						set_status(
-							app.ui_mut(),
-							sf!("[Open to authorize]({url}) · Esc to cancel"),
-						);
-					}
-				},
-				Some(ChatAuthEvent::DeviceCode { code, url })
+					},
+					Some(ChatAuthEvent::DeviceCode { code, url })
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
 					auth_location = Some(AuthLocation::DeviceCode { code, url });
@@ -488,8 +489,12 @@ fn show_auth_prompt(
 		.child(TextLeaf::new().text(message));
 	if let Some(location) = location {
 		let (authorization, instruction) = match location {
-			AuthLocation::Url(url) => {
-				(sf!("[{url}]({url})"), "Authorize in your browser, then paste the redirect URL below.")
+			AuthLocation::Url { url, launch } => {
+				let display_url = launch.as_ref().unwrap_or(url);
+				(
+					sf!("[{display_url}]({display_url})"),
+					"Authorize in your browser, then paste the redirect URL below.",
+				)
 			},
 			AuthLocation::DeviceCode { code, url } => (
 				sf!("Enter code `{code}` at [{url}]({url})"),

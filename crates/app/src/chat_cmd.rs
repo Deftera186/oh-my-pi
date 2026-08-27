@@ -1759,9 +1759,21 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	parent.set_auto_thinking_settings(auto_thinking);
 	let edit_repair_service = edit_repair_requests
 		.map(|requests| omp_driver::chat::spawn_edit_repair_service(parent.clone(), requests));
-	environment
+	if let Err(error) = environment
 		.bind_schedule_delivery(parent.schedule_delivery_backend())
-		.await?;
+		.await
+	{
+		// A newer environment composition (another omp session on this project)
+		// replaced the durable scheduler owner between open and bind. Delivery
+		// is owned there; this session continues without it.
+		let omp_envd::EnvdError::Schedule(
+			omp_envd::schedules::DurableScheduleError::StaleGeneration { .. },
+		) = error
+		else {
+			return Err(error.into());
+		};
+		tracing::warn!(%error, "schedule delivery is owned by a newer environment");
+	}
 	let mut _external_control_binding: Option<omp_envd::exthost::ExternalControlAuthorityBinding> =
 		None;
 	parent.start_idle_parking();

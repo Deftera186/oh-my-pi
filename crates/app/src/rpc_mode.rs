@@ -2494,9 +2494,10 @@ impl Runtime {
 					},
 				};
 				match event {
-					AuthEvent::OpenUrl(url) => {
+					AuthEvent::OpenUrl { url, launch } => {
 						let _ = runtime.notify_auth_event(&session_id, RpcAuthEvent::OpenUrl {
-							url: url.to_string(),
+							url:    url.to_string(),
+							launch: launch.map(|url| url.to_string()),
 						});
 					},
 					AuthEvent::ShowDeviceCode { code, verification_url } => {
