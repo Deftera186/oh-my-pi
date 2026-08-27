@@ -2526,6 +2526,8 @@ fn checkpoint_fault(error: control::ControlError) -> omp_tools::checkpoint::Chec
 		),
 		control::ControlError::Closed
 		| control::ControlError::Journal(_)
+		| control::ControlError::Projection(_)
+		| control::ControlError::ProjectionUnavailable
 		| control::ControlError::RegimeStart(_)
 		| control::ControlError::RegimeStop(_)
 		| control::ControlError::RegimeArbiter(_)

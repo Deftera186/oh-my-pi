@@ -68,7 +68,8 @@ use crate::{
 		continues_loop, from_hook,
 	},
 	control::{
-		ControlMailbox, ControlMailboxEvent, ControlSender, RegimeControl, ScheduledRewind, channel,
+		ControlError, ControlMailbox, ControlMailboxEvent, ControlSender, RegimeControl,
+		ScheduledRewind, channel,
 	},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
@@ -255,9 +256,9 @@ use tokio::{
 pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, CompletedCheckpoint};
 use crate::{
 	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings,
-	CaptureDecision, CommittedCall, ControlError, Interrupt, InterruptClass, InterruptSource,
-	ProviderErrorEvent, Regime, RegimeSpec, Resource, RevivalReport, ScopedSetting, SettingSlot,
-	StartOptions, StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
+	CaptureDecision, CommittedCall, Interrupt, InterruptClass, InterruptSource, ProviderErrorEvent,
+	Regime, RegimeSpec, Resource, RevivalReport, ScopedSetting, SettingSlot, StartOptions,
+	StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
 	arbiter::ResolvedEvent,
 	attachments, batch, capture_interrupt, demote_interrupted_reasoning, effects_mutate_environment,
 	execute_snapcompact, hook_event_mask, inject_first_turn_metadata, is_capture_item,
@@ -1308,6 +1309,22 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.is_ok()
 	}
 
+	// Answers a read-only side projection without mutating provider or journal
+	// state.
+	fn answer_project_thread(&self, reply: flume::Sender<Result<Thread, ControlError>>) {
+		let result: Result<Thread, ControlError> = (|| {
+			let view = self.journal.load()?;
+			let all_live = self.journal.live_item_events()?;
+			let snapshot = self.state.snapshot();
+			let projected =
+				project_journal(&view, view.as_ref(), snapshot.registry.as_ref(), &self.caps)?;
+			Ok(match project_context(projected, &all_live, false) {
+				ContextProjection::Unchanged(thread) | ContextProjection::View { thread, .. } => thread,
+			})
+		})();
+		let _ = reply.send(result);
+	}
+
 	/// Rewinds the durable session to a live prefix and returns the fresh
 	/// projection.
 	pub fn rewind(&mut self, to: Option<u64>) -> Result<Vec<Item>, AgentError> {
@@ -2001,6 +2018,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 								match event {
 									ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 									ControlMailboxEvent::JournalHandled => {},
+									ControlMailboxEvent::ProjectThread { reply } => {
+										self.answer_project_thread(reply);
+									},
 									ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
 									ControlMailboxEvent::Regime(regime) => Self::handle_regime_control(
 										&mut self.arbiter,
@@ -3091,6 +3111,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 					match event {
 						ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 						ControlMailboxEvent::JournalHandled => {},
+						ControlMailboxEvent::ProjectThread { reply } => {
+							self.answer_project_thread(reply);
+						},
 						ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
 						ControlMailboxEvent::Regime(regime) => Self::handle_regime_control(
 							&mut self.arbiter,
@@ -3152,6 +3175,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 							ControlMailboxEvent::JournalHandled => {
 								continue;
 							},
+							ControlMailboxEvent::ProjectThread { reply } => {
+								self.answer_project_thread(reply);
+								continue;
+							},
 							ControlMailboxEvent::Rewind(rewind) => {
 								self.pending_rewinds.push_back(rewind);
 								continue;
@@ -3200,6 +3227,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 							match event {
 								ControlMailboxEvent::Closed => std::future::pending().await,
 								ControlMailboxEvent::JournalHandled => {
+									continue;
+								},
+								ControlMailboxEvent::ProjectThread { reply } => {
+									self.answer_project_thread(reply);
 									continue;
 								},
 								ControlMailboxEvent::Rewind(rewind) => {
@@ -3535,12 +3566,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.handle_host_control(command);
 		}
 		let mut regimes = Vec::new();
+		let mut projections = Vec::new();
 		self.control_mailbox.drain_ready(
 			&mut self.journal,
 			CONTROL_DRAIN_LIMIT,
 			&mut self.pending_rewinds,
 			&mut regimes,
+			&mut projections,
 		);
+		for projection in projections {
+			self.answer_project_thread(projection);
+		}
 		for regime in regimes {
 			Self::handle_regime_control(&mut self.arbiter, &mut self.journal, regime);
 		}

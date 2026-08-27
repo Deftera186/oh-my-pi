@@ -27,7 +27,7 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
-	AgentHostControl, ArbiterError, core_regime,
+	AgentHostControl, ArbiterError, ProjectionError, core_regime,
 	journal::{
 		Journal, JournalCustomEntry, JournalError, JournalQuery, JournalReply, JournalRequest,
 		SessionStateValue, SessionStateWatchEvent, WorkspaceRoots,
@@ -65,6 +65,12 @@ pub enum ControlError {
 	/// The journal rejected the authenticated operation.
 	#[error(transparent)]
 	Journal(#[from] JournalError),
+	/// The journal thread could not be projected.
+	#[error(transparent)]
+	Projection(#[from] ProjectionError),
+	/// The current agent boundary cannot safely project a thread snapshot.
+	#[error("thread projection is unavailable at the current agent boundary")]
+	ProjectionUnavailable,
 	/// A second checkpoint was requested before the active one settled.
 	#[error("checkpoint already active")]
 	CheckpointAlreadyActive,
@@ -135,7 +141,7 @@ pub struct ScheduledRewind {
 /// Result of receiving one typed CONTROL command.
 ///
 /// Journal-owner harnesses outside the agent loop drive
-/// [`ControlMailbox::handle_next`] and match on this; loop-scoped rewinds must
+/// [`ControlMailbox::handle_next`] and match on this; surfaced operations must
 /// be executed (or refused) by whoever owns full agent state.
 pub enum ControlMailboxEvent {
 	/// Every sender has closed.
@@ -146,6 +152,12 @@ pub enum ControlMailboxEvent {
 	Rewind(ScheduledRewind),
 	/// A regime command requires mutable access to the agent arbiter.
 	Regime(RegimeControl),
+	/// A read-only live thread projection is requested from the full agent
+	/// owner.
+	ProjectThread {
+		/// Correlated result.
+		reply: flume::Sender<Result<omp_proto::thread::v1::Thread, ControlError>>,
+	},
 }
 /// One authenticated regime lifecycle operation surfaced to the mutable agent
 /// owner.
@@ -342,6 +354,24 @@ impl ControlSender {
 			.await
 			.map_err(|_| ControlError::Closed)?
 			.map_err(ControlError::from)
+	}
+
+	/// Projects the current live journal as a model-facing thread without
+	/// changing conversation state.
+	///
+	/// # Errors
+	/// Returns a closed-owner, unavailable-boundary, journal, or projection
+	/// failure.
+	pub async fn project_thread(&self) -> Result<omp_proto::thread::v1::Thread, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::ProjectThread { reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
 	}
 
 	/// Appends a session-only effective model override through the journal
@@ -811,13 +841,15 @@ impl ControlMailbox {
 	/// point.
 	///
 	/// Journal commands retain their existing latency. Loop-scoped commands are
-	/// appended to `surfaced` in receive order for later boundary execution.
+	/// appended to their typed output queues in receive order for later boundary
+	/// execution.
 	pub(crate) fn drain_ready(
 		&self,
 		journal: &mut Journal,
 		limit: usize,
 		surfaced: &mut VecDeque<ScheduledRewind>,
 		regimes: &mut Vec<RegimeControl>,
+		projections: &mut Vec<flume::Sender<Result<omp_proto::thread::v1::Thread, ControlError>>>,
 	) -> usize {
 		let mut handled = 0;
 		while handled < limit {
@@ -827,6 +859,7 @@ impl ControlMailbox {
 			match handle_command(journal, command, &self.checkpoint_state) {
 				ControlMailboxEvent::Rewind(rewind) => surfaced.push_back(rewind),
 				ControlMailboxEvent::Regime(regime) => regimes.push(regime),
+				ControlMailboxEvent::ProjectThread { reply } => projections.push(reply),
 				ControlMailboxEvent::Closed | ControlMailboxEvent::JournalHandled => {},
 			}
 			handled += 1;
@@ -837,6 +870,9 @@ impl ControlMailbox {
 
 pub(crate) enum ControlCommand {
 	Regime(RegimeControl),
+	ProjectThread {
+		reply: flume::Sender<Result<omp_proto::thread::v1::Thread, ControlError>>,
+	},
 	Reset {
 		ts:    u64,
 		reply: flume::Sender<JournalReplyResult<u64>>,
@@ -933,6 +969,9 @@ fn handle_command(
 ) -> ControlMailboxEvent {
 	match command {
 		ControlCommand::Regime(command) => return ControlMailboxEvent::Regime(command),
+		ControlCommand::ProjectThread { reply } => {
+			return ControlMailboxEvent::ProjectThread { reply };
+		},
 		ControlCommand::Reset { ts, reply } => {
 			let _ = reply.send(journal.reset(ts));
 		},
@@ -1072,6 +1111,31 @@ mod tests {
 	use omp_storage::transcript::{Header, SessionId};
 
 	use super::*;
+
+	#[tokio::test]
+	async fn project_thread_command_is_surfaced_to_the_full_agent_owner() {
+		let temp = tempfile::tempdir().unwrap();
+		let path = temp.path().join("projection-session.jsonl");
+		let mut journal = Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(Str::new_static("projection-control-test")),
+			created: 1,
+			cwd:     temp.path().to_path_buf(),
+		})
+		.unwrap();
+		let (sender, mailbox) = channel();
+
+		let requester = sender.project_thread();
+		let owner = async {
+			let ControlMailboxEvent::ProjectThread { reply } = mailbox.handle_next(&mut journal).await
+			else {
+				panic!("project-thread command was not surfaced");
+			};
+			let _ = reply.send(Ok(omp_proto::thread::v1::Thread::default()));
+		};
+		let (thread, ()) = tokio::join!(requester, owner);
+		assert!(thread.unwrap().items.is_empty());
+	}
 
 	#[tokio::test]
 	async fn workspace_root_commands_run_on_the_journal_owner_and_persist() {
