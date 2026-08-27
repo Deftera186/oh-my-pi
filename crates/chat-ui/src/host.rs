@@ -1927,6 +1927,8 @@ async fn run_chat(
 	let mut pending_replay: Option<ResizeScrollback> = None;
 	let mut paste_read: Option<PasteRead> = None;
 	let mut next_frame = chat_deadline(&host.chat);
+	let mut recap_policy: Option<(bool, u32)> = None;
+	let mut recap_at: Option<Instant> = None;
 	let mut requested_exit = HostExit::Quit;
 	let input_actions = options.input_actions.clone();
 	let HostOptions {
@@ -2133,9 +2135,12 @@ async fn run_chat(
 										// An explicit binding replaces its legacy fallback.
 									} else {
 										host.last_esc = None;
+										recap_at = None;
 										let result = host.chat.handle_key(key);
 										if let Some(text) = host.chat.take_copied() { terminal.copy_to_clipboard(&text)?; }
+										let mut submitted = false;
 										while let Some((text, attachments, mode)) = host.chat.take_submission() {
+											submitted = true;
 																				if text.trim() == "/images" {
 												host.overlay = Some(Overlay::Images(ImageOverlay::open(
 													&host.chat.composer_attachments(),
@@ -2157,6 +2162,9 @@ async fn run_chat(
 										{
 											requested_exit = exit;
 											break;
+										}
+										if !submitted {
+											recap_at = idle_recap_deadline(recap_policy, &host.chat);
 										}
 									}
 									next_frame = Some(Instant::now());
@@ -2180,6 +2188,7 @@ async fn run_chat(
 										}
 									} else if !host.sidebar.focused() {
 										host.chat.handle_paste(&text);
+										recap_at = idle_recap_deadline(recap_policy, &host.chat);
 									}
 									next_frame = Some(Instant::now());
 								},
@@ -2202,6 +2211,7 @@ async fn run_chat(
 										}
 									} else if !host.sidebar.handle_mouse(report.col, report.row, report.kind, viewport) {
 										host.chat.handle_mouse(&report);
+										recap_at = idle_recap_deadline(recap_policy, &host.chat);
 									}
 									next_frame = Some(Instant::now());
 								},
@@ -2230,7 +2240,21 @@ async fn run_chat(
 							break;
 						},
 						Ok(event) => {
+							let was_working = host.chat.is_working();
+							let arm_recap = matches!(
+								&event,
+								BackendEvent::Status(facts) if was_working && !facts.working
+							);
 							match &event {
+								BackendEvent::RecapPolicy { enabled, idle_seconds } => {
+									recap_policy = Some((*enabled, *idle_seconds));
+									if !*enabled {
+										recap_at = None;
+									}
+								},
+								BackendEvent::Status(facts) if facts.working => {
+									recap_at = None;
+								},
 								BackendEvent::ApprovalPending(_) if title_enabled => {
 									terminal.set_title("Approval required · omp")?;
 								},
@@ -2283,6 +2307,9 @@ async fn run_chat(
 							if let Some(intent) = apply_terminal_backend(&mut host, event, ctx) {
 								send(intents, Intent::Git(intent));
 							}
+							if arm_recap {
+								recap_at = idle_recap_deadline(recap_policy, &host.chat);
+							}
 							send_pty_resize(&mut host, viewport, intents);
 							drain_ui_intents(&mut host, intents);
 							if !had_overlay && host.overlay.is_some() {
@@ -2305,10 +2332,20 @@ async fn run_chat(
 								ClipboardRead::Text => host.chat.handle_paste_raw(&text),
 								ClipboardRead::Smart => host.chat.handle_paste(&text),
 							}
+							recap_at = idle_recap_deadline(recap_policy, &host.chat);
 							next_frame = Some(Instant::now());
 						}
 					},
 					() = deadline(paste_deadline) => paste_read = None,
+					() = deadline(recap_at) => {
+						recap_at = None;
+						if matches!(recap_policy, Some((true, _)))
+							&& !host.chat.is_working()
+							&& host.chat.composer_empty()
+						{
+							send(intents, Intent::IdleRecap);
+						}
+					},
 					() = deadline(next_frame) => {
 						observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
 						host.chat.set_right_inset(host.sidebar.reserved(viewport));
@@ -3191,6 +3228,17 @@ fn close_overlay(
 
 fn chat_deadline(chat: &Chat) -> Option<Instant> {
 	chat.next_wake().map(|delay| Instant::now() + delay)
+}
+
+fn idle_recap_deadline(policy: Option<(bool, u32)>, chat: &Chat) -> Option<Instant> {
+	let Some((true, idle_seconds)) = policy else {
+		return None;
+	};
+	if chat.is_working() || !chat.composer_empty() {
+		return None;
+	}
+	let seconds = idle_seconds.clamp(1, 3600);
+	Some(Instant::now() + Duration::from_secs(u64::from(seconds)))
 }
 
 async fn deadline(at: Option<Instant>) {

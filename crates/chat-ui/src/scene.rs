@@ -1762,6 +1762,7 @@ pub struct Chat {
 	todo_expanded:           bool,
 	retained_frames:         RetainedFrames,
 	pinned_error:            Option<Str>,
+	idle_recap:              Option<Str>,
 	download_activity:       Option<DownloadActivity>,
 	celebration_until:       Option<Duration>,
 	attribution:             Option<Attribution>,
@@ -1829,6 +1830,7 @@ impl Chat {
 			todo_expanded: false,
 			retained_frames: RetainedFrames::new(),
 			pinned_error: None,
+			idle_recap: None,
 			download_activity: None,
 			celebration_until: None,
 			slots: Slots::new(ctx.clone()),
@@ -1943,6 +1945,7 @@ impl Chat {
 
 	/// Routes a key through the composer.
 	pub fn handle_key(&mut self, key: Key) -> ChatKey {
+		self.clear_idle_recap();
 		if key == Key::Ctrl('l') {
 			return ChatKey::ToggleLive;
 		}
@@ -2039,12 +2042,14 @@ impl Chat {
 
 	/// Routes sanitized bracketed-paste text through the composer.
 	pub fn handle_paste(&mut self, text: &str) {
+		self.clear_idle_recap();
 		let _ = self.editor_ui.handle_paste(text);
 		self.refresh_composer();
 	}
 
 	/// Routes clipboard text verbatim, bypassing attachment staging.
 	pub fn handle_paste_raw(&mut self, text: &str) {
+		self.clear_idle_recap();
 		let _ = self.editor_ui.handle_paste_raw(text);
 		self.refresh_composer();
 	}
@@ -2066,6 +2071,7 @@ impl Chat {
 		let rows = self.composer_rows();
 		let y = self.frame.size().height.saturating_sub(rows);
 		if report.row >= y && report.row < y.saturating_add(rows) {
+			self.clear_idle_recap();
 			let _ = self
 				.editor_ui
 				.handle_mouse(report.col, report.row - y, report.kind);
@@ -2103,6 +2109,7 @@ impl Chat {
 
 	/// Clears composer text and staged attachments.
 	pub fn clear_composer(&mut self) {
+		self.clear_idle_recap();
 		self.editor_ui.set_text(INPUT_ID, "");
 		let _ = self.attachments.take();
 		self.refresh_composer();
@@ -2110,6 +2117,7 @@ impl Chat {
 
 	/// Replaces composer text, preserving staged attachments.
 	pub fn set_composer_text(&mut self, text: &str) {
+		self.clear_idle_recap();
 		self.editor_ui.set_text(INPUT_ID, text);
 		self.refresh_composer();
 	}
@@ -2680,6 +2688,9 @@ impl Chat {
 	/// Replaces the complete status snapshot.
 	pub fn set_status(&mut self, facts: StatusFacts) {
 		let now = self.started_at.elapsed();
+		if facts.working {
+			self.idle_recap = None;
+		}
 		self.set_reduced_motion(facts.reduced_motion);
 		let quota_reset = {
 			let previous = &self.work.borrow().facts;
@@ -2711,6 +2722,25 @@ impl Chat {
 			.editor_ui
 			.update_component::<EditorPane>(INPUT_ID, |_| true);
 		self.bump_live();
+	}
+
+	fn set_idle_recap(&mut self, text: Str) {
+		let prefix = if self.ctx.charset == Charset::Ascii {
+			"recap: "
+		} else {
+			"※ recap: "
+		};
+		let mut label = StrMut::with_capacity(prefix.len().saturating_add(text.len()));
+		label.push_str(prefix);
+		label.push_str(text.as_str());
+		self.idle_recap = Some(label.freeze());
+		self.bump_live();
+	}
+
+	fn clear_idle_recap(&mut self) {
+		if self.idle_recap.take().is_some() {
+			self.bump_live();
+		}
 	}
 
 	/// Replaces the session title shown in the air row.
@@ -2926,6 +2956,12 @@ impl Chat {
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
+			BackendEvent::Recap(text) => {
+				if !self.is_working() && self.composer_empty() {
+					self.set_idle_recap(text);
+				}
+			},
+			BackendEvent::RecapPolicy { .. } => {},
 			BackendEvent::ThemePreview(theme) => self.preview_theme(theme),
 			BackendEvent::ComposerReplaced(text) => self.set_composer_text(text.as_str()),
 			BackendEvent::ApplyUiEffect(effect) => {
@@ -3572,6 +3608,11 @@ impl Chat {
 		}
 		if self.is_working() {
 			self.draw_working_owned(working_y, elapsed);
+		} else if let Some(recap) = self.idle_recap.as_deref() {
+			draw_line(&mut self.frame, 1, working_y, content_width.saturating_sub(2), &[Span::new(
+				recap,
+				ink(self.ctx.theme.muted).dim().italic(),
+			)]);
 		}
 		self.draw_session_title_owned(title_y);
 		if self
@@ -4810,6 +4851,43 @@ mod tests {
 		let submitted = frame_text(chat.render(viewport).frame);
 		assert!(submitted.contains("Fable 5"), "{submitted}");
 		assert!(submitted.contains('╰'), "{submitted}");
+	}
+
+	#[test]
+	fn idle_recap_paints_transient_air_row_and_clears_on_activity() {
+		let mut chat = Chat::new(&UiContext { charset: Charset::Unicode, ..UiContext::default() });
+		let viewport = Size::new(60, 10);
+		let _ = chat.apply_backend_event(BackendEvent::Recap(sf!("Continue with the focused test.")));
+
+		let rendered = chat.render(viewport).frame;
+		let text = frame_text(rendered);
+		assert!(text.contains("※ recap: Continue with the focused test."), "{text}");
+		let row = text
+			.lines()
+			.position(|line| line.contains("※ recap:"))
+			.expect("recap air row");
+		let row = u16::try_from(row).expect("viewport row fits u16");
+		let style = omp_tui::test_support::frame_cell_style(rendered, 1, row).spec();
+		assert!(style.dim && style.italic, "recap must render dim + italic");
+
+		assert_eq!(chat.handle_key(Key::Char('x')), ChatKey::Consumed);
+		let typed = frame_text(chat.render(viewport).frame);
+		assert!(!typed.contains("recap:"), "{typed}");
+
+		chat.clear_composer();
+		let _ = chat.apply_backend_event(BackendEvent::Recap(sf!("One newer recap.")));
+		let _ = chat.apply_backend_event(BackendEvent::Status(StatusFacts {
+			working: true,
+			..StatusFacts::default()
+		}));
+		let working = frame_text(chat.render(viewport).frame);
+		assert!(!working.contains("recap:"), "{working}");
+		let ascii = UiContext { charset: Charset::Ascii, ..UiContext::default() };
+		let mut chat = Chat::new(&ascii);
+		let _ = chat.apply_backend_event(BackendEvent::Recap(sf!("ASCII-safe.")));
+		let ascii_text = frame_text(chat.render(viewport).frame);
+		assert!(ascii_text.contains("recap: ASCII-safe."), "{ascii_text}");
+		assert!(!ascii_text.contains('※'), "{ascii_text}");
 	}
 
 	#[test]

@@ -499,6 +499,8 @@ pub enum Intent {
 	},
 	/// Abort the active turn.
 	Abort,
+	/// Request one transient recap after the idle deadline expires.
+	IdleRecap,
 	/// Create a goal from the retained guided interview.
 	SetGoal {
 		/// Interview objective.
@@ -901,6 +903,15 @@ pub enum BackendEvent {
 	RetainedFrame(v1::RetainedFrameEnvelope),
 	/// Replace status facts.
 	Status(StatusFacts),
+	/// Paint one ephemeral idle recap without adding it to transcript history.
+	Recap(Str),
+	/// Replace the idle recap scheduling policy.
+	RecapPolicy {
+		/// Whether idle recaps are enabled.
+		enabled:      bool,
+		/// Idle delay in seconds before requesting a recap.
+		idle_seconds: u32,
+	},
 	/// Preview a parsed theme without committing settings.
 	ThemePreview(omp_tui::Theme),
 	/// Replace the composer only after a host-owned external editor succeeds.
