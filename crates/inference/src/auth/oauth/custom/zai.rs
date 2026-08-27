@@ -75,8 +75,13 @@ impl ZaiApiKeyHandler {
 				.append_pair("state", &state);
 		}
 		let callback_server = start_callback_server(redirect_uri, &state).await;
+		let authorization_url = Str::new(authorize_url.as_str());
+		if let Some(server) = &callback_server {
+			server.arm(authorization_url.clone());
+		}
+		let launch = callback_server.as_ref().map(|server| server.launch_url());
 		driver
-			.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
+			.emit(AuthEvent::OpenUrl { url: authorization_url, launch })
 			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
@@ -743,8 +748,8 @@ mod tests {
 			tokens.identity_response.expose_secret(),
 			r#"{"zai":{"access_token":"oauth-secret"},"user":{"email":"person@example.com","id":42}}"#,
 		);
-		assert!(matches!(&events[..], [AuthEvent::OpenUrl(_), AuthEvent::Prompt(_)]));
-		let AuthEvent::OpenUrl(url) = &events[0] else {
+		assert!(matches!(&events[..], [AuthEvent::OpenUrl { .. }, AuthEvent::Prompt(_)]));
+		let AuthEvent::OpenUrl { url, .. } = &events[0] else {
 			unreachable!()
 		};
 		assert_eq!(

@@ -97,8 +97,13 @@ impl DevinCliTokenHandler {
 		}
 		let callback_server = start_callback_server(redirect_uri, &state).await;
 
+		let authorization_url = Str::new(url.as_str());
+		if let Some(server) = &callback_server {
+			server.arm(authorization_url.clone());
+		}
+		let launch = callback_server.as_ref().map(|server| server.launch_url());
 		driver
-			.emit(AuthEvent::OpenUrl(Str::new(url.as_str())))
+			.emit(AuthEvent::OpenUrl { url: authorization_url, launch })
 			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
@@ -358,7 +363,7 @@ mod tests {
 	}
 
 	async fn answer_callback(session: &AnswerAuthSession) -> (String, String) {
-		let AuthEvent::OpenUrl(url) = session
+		let AuthEvent::OpenUrl { url, .. } = session
 			.events
 			.recv_async()
 			.await
@@ -549,7 +554,7 @@ mod tests {
 		let spec = spec();
 		let (session, driver, _) = default_login_channels(LoginSessionId::from("devin-redaction"));
 		let pending = handler.begin(&spec, &driver).await.expect("pending flow");
-		let AuthEvent::OpenUrl(url) = session
+		let AuthEvent::OpenUrl { url, .. } = session
 			.events
 			.recv_async()
 			.await

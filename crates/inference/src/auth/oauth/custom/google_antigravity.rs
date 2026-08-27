@@ -539,7 +539,7 @@ mod tests {
 
 		let exchange = dispatcher.exchange(&spec, &driver);
 		let interaction = async {
-			let AuthEvent::OpenUrl(url) = session
+			let AuthEvent::OpenUrl { url, .. } = session
 				.events
 				.recv_async()
 				.await

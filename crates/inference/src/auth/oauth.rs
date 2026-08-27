@@ -289,8 +289,15 @@ where
 			},
 			PkceCompletion::PasteCode => None,
 		};
+		let authorization_url = Str::new(url.as_str());
+		if let Some(server) = &callback_server {
+			server.arm(authorization_url.clone());
+		}
+		let launch = callback_server
+			.as_ref()
+			.map(callback::CallbackServer::launch_url);
 		driver
-			.emit(AuthEvent::OpenUrl(Str::new(url.as_str())))
+			.emit(AuthEvent::OpenUrl { url: authorization_url, launch })
 			.await?;
 		let (id, message, input) = match spec.completion {
 			PkceCompletion::CallbackUrl if callback_server.is_some() => (
@@ -406,7 +413,9 @@ where
 			.await?;
 		if let Some(complete) = parsed.verification_uri_complete {
 			parse_http_url(&complete)?;
-			driver.emit(AuthEvent::OpenUrl(complete.into())).await?;
+			driver
+				.emit(AuthEvent::OpenUrl { url: complete.into(), launch: None })
+				.await?;
 		}
 		let interval =
 			Duration::from_secs(parsed.interval.unwrap_or(spec.default_interval.as_secs()));
@@ -492,7 +501,7 @@ where
 	) -> Result<(), OAuthError> {
 		parse_http_url(&spec.authorization_url)?;
 		driver
-			.emit(AuthEvent::OpenUrl(spec.authorization_url.clone()))
+			.emit(AuthEvent::OpenUrl { url: spec.authorization_url.clone(), launch: None })
 			.await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
@@ -1772,7 +1781,7 @@ mod tests {
 	}
 
 	async fn pkce_timeline(session: &AnswerAuthSession) -> (Url, AuthPrompt) {
-		let AuthEvent::OpenUrl(url) = session
+		let AuthEvent::OpenUrl { url, .. } = session
 			.events
 			.recv_async()
 			.await
@@ -1857,7 +1866,7 @@ mod tests {
 			.await
 			.expect("event")
 			.expect("ok");
-		let AuthEvent::OpenUrl(url) = first else {
+		let AuthEvent::OpenUrl { url, .. } = first else {
 			panic!("open URL")
 		};
 		let state = Url::parse(&url)

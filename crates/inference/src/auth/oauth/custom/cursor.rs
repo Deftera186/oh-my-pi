@@ -190,7 +190,7 @@ impl OAuthCustomHandler for CursorHandler {
 		async move {
 			let pending = self.authorization(spec)?;
 			driver
-				.emit(AuthEvent::OpenUrl(pending.authorize_url.clone()))
+				.emit(AuthEvent::OpenUrl { url: pending.authorize_url.clone(), launch: None })
 				.await?;
 			self.poll(spec, pending, driver).await
 		}
@@ -507,7 +507,7 @@ mod tests {
 			.await
 			.expect("Cursor login");
 
-		let AuthEvent::OpenUrl(authorize_url) = session
+		let AuthEvent::OpenUrl { url: authorize_url, launch: None } = session
 			.events
 			.recv_async()
 			.await

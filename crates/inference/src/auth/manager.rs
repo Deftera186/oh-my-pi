@@ -2016,7 +2016,7 @@ mod tests {
 					);
 					break account;
 				},
-				AuthEvent::OpenUrl(_) | AuthEvent::Waiting => {},
+				AuthEvent::OpenUrl { .. } | AuthEvent::Waiting => {},
 				AuthEvent::Prompt(_) => panic!("Kimi device flow must not request private input"),
 			}
 		};
@@ -2124,7 +2124,10 @@ mod tests {
 				.expect("OpenCode login event channel")
 				.expect("successful OpenCode login event");
 			match event {
-				AuthEvent::OpenUrl(url) => assert_eq!(url, "https://opencode.ai/auth"),
+				AuthEvent::OpenUrl { url, launch } => {
+					assert_eq!(url, "https://opencode.ai/auth");
+					assert_eq!(launch, None);
+				},
 				AuthEvent::Prompt(prompt) => {
 					assert_eq!(prompt.message, "Paste your Opencode Go API key");
 					saw_prompt = true;

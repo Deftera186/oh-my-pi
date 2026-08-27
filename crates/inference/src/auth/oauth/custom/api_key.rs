@@ -28,7 +28,7 @@ impl OAuthCustomHandler for ApiKeyPasteHandler {
 	) -> BoxFuture<'a, Result<OAuthTokenSet, OAuthError>> {
 		async move {
 			driver
-				.emit(AuthEvent::OpenUrl(spec.authorize_url.clone()))
+				.emit(AuthEvent::OpenUrl { url: spec.authorize_url.clone(), launch: None })
 				.await?;
 			// Name the selected provider when the login flow supplies one:
 			// several providers mint keys from a single shared console (OpenCode
@@ -183,7 +183,7 @@ mod tests {
 		assert_eq!(principal.as_str(), "catalog-account");
 
 		assert!(
-			matches!(session.events.recv().expect("URL").expect("event"), AuthEvent::OpenUrl(url) if url == "https://auth.example/keys")
+			matches!(session.events.recv().expect("URL").expect("event"), AuthEvent::OpenUrl { url, launch: None } if url == "https://auth.example/keys")
 		);
 		assert!(matches!(
 			session.events.recv().expect("prompt").expect("event"),

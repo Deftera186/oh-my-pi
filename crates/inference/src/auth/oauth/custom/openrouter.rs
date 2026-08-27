@@ -64,8 +64,13 @@ impl OAuthCustomHandler for OpenRouterApiKeyHandler {
 			let (verifier, challenge) = generate_pkce(&*self.entropy)?;
 			let authorize_url = authorization_url(spec, redirect_uri, challenge.as_str())?;
 			let callback_server = start_callback_server(redirect_uri, "").await;
+			let authorization_url = Str::new(authorize_url.as_str());
+			if let Some(server) = &callback_server {
+				server.arm(authorization_url.clone());
+			}
+			let launch = callback_server.as_ref().map(|server| server.launch_url());
 			driver
-				.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
+				.emit(AuthEvent::OpenUrl { url: authorization_url, launch })
 				.await?;
 			driver
 				.emit(AuthEvent::Prompt(AuthPrompt {

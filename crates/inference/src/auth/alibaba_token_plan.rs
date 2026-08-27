@@ -362,7 +362,7 @@ async fn run_login_inner(
 		_ => (sf!(ALIBABA_TOKEN_PLAN_BASE_URL), INTERNATIONAL_AUTH_URL),
 	};
 	driver
-		.emit(AuthEvent::OpenUrl(Str::new(auth_url)))
+		.emit(AuthEvent::OpenUrl { url: Str::new(auth_url), launch: None })
 		.await
 		.map_err(|_| AlibabaTokenPlanLoginError::InvalidResponse)?;
 	emit_prompt(driver, "api-key", API_KEY_PROMPT, AuthPromptKind::ApiKey).await?;
@@ -744,7 +744,7 @@ mod tests {
 			assert_eq!(prompt.input, AuthPromptKind::PlainText);
 			respond(&session, AuthInput::PlainText(Str::new(custom_url))).await;
 		}
-		let AuthEvent::OpenUrl(open_url) = next_event(&session).await else {
+		let AuthEvent::OpenUrl { url: open_url, launch: None } = next_event(&session).await else {
 			panic!("authorization URL");
 		};
 		let AuthEvent::Prompt(prompt) = next_event(&session).await else {
@@ -836,7 +836,7 @@ mod tests {
 		});
 		assert!(matches!(next_event(&session).await, AuthEvent::Prompt(_)));
 		respond(&session, AuthInput::PlainText(sf!("2"))).await;
-		assert!(matches!(next_event(&session).await, AuthEvent::OpenUrl(_)));
+		assert!(matches!(next_event(&session).await, AuthEvent::OpenUrl { launch: None, .. }));
 		assert!(matches!(next_event(&session).await, AuthEvent::Prompt(_)));
 		respond(&session, AuthInput::ApiKey(SecretString::from("sk-sp-test".to_owned()))).await;
 		assert!(matches!(next_event(&session).await, AuthEvent::Prompt(_)));

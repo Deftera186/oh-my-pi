@@ -5,7 +5,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::{ExposeSecret as _, SecretString};
+use omp_core::{ExposeSecret as _, SecretString, Str};
 use serde::Serialize;
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -30,12 +30,14 @@ mod callback_server {
 	use tokio::sync::watch;
 	use url::{Host, Url};
 
-	use super::{CallbackBindError, CallbackListeners, CallbackOutcome, OAuthError, serve};
+	use super::{CallbackBindError, CallbackListeners, CallbackOutcome, OAuthError, Str, serve};
 
 	/// A successfully bound loopback callback listener.
 	pub(in crate::auth::oauth) struct CallbackServer {
-		result:   Receiver<CallbackOutcome>,
-		shutdown: watch::Sender<()>,
+		result:            Receiver<CallbackOutcome>,
+		shutdown:          watch::Sender<()>,
+		authorization_url: watch::Sender<Option<Str>>,
+		launch_url:        Str,
 	}
 
 	impl CallbackServer {
@@ -47,7 +49,7 @@ mod callback_server {
 			redirect_uri: &str,
 			expected_state: &str,
 		) -> Result<Option<Self>, CallbackBindError> {
-			let url = Url::parse(redirect_uri).map_err(|_| CallbackBindError::InvalidRedirect)?;
+			let mut url = Url::parse(redirect_uri).map_err(|_| CallbackBindError::InvalidRedirect)?;
 			if url.scheme() != "http" {
 				return Ok(None);
 			}
@@ -67,11 +69,19 @@ mod callback_server {
 				},
 				_ => return Ok(None),
 			};
+			let bound_port = listeners.port()?;
+			url.set_port(Some(bound_port))
+				.map_err(|()| CallbackBindError::InvalidRedirect)?;
 			let callback_path = url.path().to_owned();
 			let callback_origin = url.origin().ascii_serialization();
+			url.set_path("/launch");
+			url.set_query(None);
+			url.set_fragment(None);
+			let launch_url = Str::new(url.as_str());
 			let expected_state = expected_state.to_owned();
 			let (sender, result) = flume::bounded(1);
 			let (shutdown, shutdown_receiver) = watch::channel(());
+			let (authorization_url, authorization_url_receiver) = watch::channel(None);
 			tokio::spawn(async move {
 				serve(
 					listeners,
@@ -80,10 +90,19 @@ mod callback_server {
 					&expected_state,
 					&sender,
 					shutdown_receiver,
+					authorization_url_receiver,
 				)
 				.await;
 			});
-			Ok(Some(Self { result, shutdown }))
+			Ok(Some(Self { result, shutdown, authorization_url, launch_url }))
+		}
+
+		pub(in crate::auth::oauth) fn arm(&self, authorization_url: Str) {
+			self.authorization_url.send_replace(Some(authorization_url));
+		}
+
+		pub(in crate::auth::oauth) fn launch_url(&self) -> Str {
+			self.launch_url.clone()
 		}
 
 		pub(super) async fn receive(&self) -> Result<CallbackOutcome, OAuthError> {
@@ -142,13 +161,18 @@ impl CallbackListeners {
 
 	async fn localhost(port: u16) -> Result<Self, CallbackBindError> {
 		let primary = TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)).await?;
-		let companion_address = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port);
+		let companion_address =
+			SocketAddr::new(Ipv6Addr::LOCALHOST.into(), primary.local_addr()?.port());
 		let companion = match TcpListener::bind(companion_address).await {
 			Ok(listener) => Some(listener),
 			Err(error) if error.kind() == io::ErrorKind::AddrInUse => return Err(error.into()),
 			Err(_) => None,
 		};
 		Ok(Self { primary, companion })
+	}
+
+	fn port(&self) -> io::Result<u16> {
+		self.primary.local_addr().map(|address| address.port())
 	}
 
 	async fn accept(&self, shutdown: &mut Receiver<()>) -> Option<io::Result<TcpStream>> {
@@ -176,6 +200,7 @@ async fn serve(
 	expected_state: &str,
 	result: &flume::Sender<CallbackOutcome>,
 	mut shutdown: Receiver<()>,
+	authorization_url: Receiver<Option<Str>>,
 ) {
 	while let Some(accepted) = listeners.accept(&mut shutdown).await {
 		let Ok(mut stream) = accepted else {
@@ -188,6 +213,15 @@ async fn serve(
 		let path = request_target
 			.split_once('?')
 			.map_or(request_target.as_str(), |(path, _)| path);
+		if path == "/launch" {
+			let authorization_url = authorization_url.borrow().clone();
+			if let Some(authorization_url) = authorization_url {
+				let _ = write_redirect(&mut stream, &authorization_url).await;
+			} else {
+				let _ = write_plain(&mut stream, 503, "Authorization URL is not ready").await;
+			}
+			continue;
+		}
 		if path != callback_path {
 			let _ = write_plain(&mut stream, 404, "Not Found").await;
 			continue;
@@ -337,6 +371,20 @@ async fn write_html(stream: &mut TcpStream, status: u16, body: &str) -> io::Resu
 	write_response(stream, status, "text/html; charset=utf-8", body).await
 }
 
+async fn write_redirect(stream: &mut TcpStream, location: &str) -> io::Result<()> {
+	use std::fmt::Write as _;
+
+	let mut header = String::with_capacity(128 + location.len());
+	write!(
+		header,
+		"HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: \
+		 close\r\nCache-Control: no-store\r\n\r\n"
+	)
+	.expect("writing to a String cannot fail");
+	stream.write_all(header.as_bytes()).await?;
+	stream.shutdown().await
+}
+
 async fn write_response(
 	stream: &mut TcpStream,
 	status: u16,
@@ -349,6 +397,7 @@ async fn write_response(
 		200 => "OK",
 		400 => "Bad Request",
 		404 => "Not Found",
+		503 => "Service Unavailable",
 		_ => "Internal Server Error",
 	};
 	let mut header = String::with_capacity(128);
@@ -386,5 +435,97 @@ pub(super) async fn receive_callback(
 		},
 		input = driver.receive() => input.map_err(Into::into),
 		() = &mut timeout => Err(OAuthError::Cancelled),
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::{ExposeSecret as _, Str};
+	use tokio::{
+		io::{AsyncReadExt as _, AsyncWriteExt as _},
+		net::TcpStream,
+	};
+	use url::Url;
+
+	use super::{CallbackOutcome, CallbackServer};
+
+	async fn callback_server() -> CallbackServer {
+		CallbackServer::bind("http://localhost:0/callback", "expected-state")
+			.await
+			.expect("valid callback address")
+			.expect("loopback callback server")
+	}
+
+	async fn get(url: &str) -> String {
+		let url = Url::parse(url).expect("valid request URL");
+		let host = url.host_str().expect("request host");
+		let port = url.port_or_known_default().expect("request port");
+		let mut stream = TcpStream::connect((host, port))
+			.await
+			.expect("connect to callback server");
+		let target = match url.query() {
+			Some(query) => format!("{}?{query}", url.path()),
+			None => url.path().to_owned(),
+		};
+		let request =
+			format!("GET {target} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+		stream
+			.write_all(request.as_bytes())
+			.await
+			.expect("write request");
+		let mut response = Vec::new();
+		stream
+			.read_to_end(&mut response)
+			.await
+			.expect("read response");
+		String::from_utf8(response).expect("UTF-8 response")
+	}
+
+	#[tokio::test]
+	async fn launch_before_arming_is_unavailable() {
+		let server = callback_server().await;
+
+		let response = get(&server.launch_url()).await;
+
+		assert_eq!(response.lines().next(), Some("HTTP/1.1 503 Service Unavailable"));
+		assert!(!response.lines().any(|line| line.starts_with("Location:")));
+	}
+
+	#[tokio::test]
+	async fn launch_redirects_to_the_armed_authorization_url() {
+		let server = callback_server().await;
+		let authorization_url =
+			Str::new("https://auth.example/authorize?client_id=public&challenge=pkce");
+		server.arm(authorization_url.clone());
+
+		let response = get(&server.launch_url()).await;
+
+		assert_eq!(response.lines().next(), Some("HTTP/1.1 302 Found"));
+		assert_eq!(
+			response.lines().find(|line| line.starts_with("Location:")),
+			Some("Location: https://auth.example/authorize?client_id=public&challenge=pkce")
+		);
+		assert!(
+			response
+				.lines()
+				.any(|line| line == "Cache-Control: no-store")
+		);
+	}
+
+	#[tokio::test]
+	async fn launch_does_not_consume_the_pending_callback() {
+		let server = callback_server().await;
+		server.arm(Str::new("https://auth.example/authorize"));
+		assert_eq!(get(&server.launch_url()).await.lines().next(), Some("HTTP/1.1 302 Found"));
+		let mut callback_url = Url::parse(&server.launch_url()).expect("valid launch URL");
+		callback_url.set_path("/callback");
+		callback_url.set_query(Some("code=accepted&state=expected-state"));
+
+		assert_eq!(get(callback_url.as_str()).await.lines().next(), Some("HTTP/1.1 200 OK"));
+		let CallbackOutcome::Callback(callback) =
+			server.receive().await.expect("callback remains pending")
+		else {
+			panic!("expected successful callback");
+		};
+		assert!(callback.expose_secret().contains("code=accepted"));
 	}
 }

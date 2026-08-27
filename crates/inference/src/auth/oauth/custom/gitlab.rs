@@ -13,8 +13,8 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::super::{
-	FormValue, OAuthHttpResponse as SuperOAuthHttpResponse, callback_code, form_request,
-	parse_http_url, provider_error, receive_callback_input, start_callback_server,
+	FormValue, OAuthHttpResponse as SuperOAuthHttpResponse, callback::CallbackServer, callback_code,
+	form_request, parse_http_url, provider_error, receive_callback_input, start_callback_server,
 };
 use crate::{
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
@@ -51,9 +51,10 @@ impl fmt::Debug for GitlabExternalRedirectHandler {
 }
 
 struct ExternalRedirectPending {
-	verifier:     SecretString,
-	state:        Str,
-	redirect_uri: Str,
+	verifier:        SecretString,
+	state:           Str,
+	redirect_uri:    Str,
+	callback_server: Option<CallbackServer>,
 }
 
 impl fmt::Debug for ExternalRedirectPending {
@@ -116,9 +117,13 @@ impl GitlabExternalRedirectHandler {
 			}
 		}
 
-		driver
-			.emit(AuthEvent::OpenUrl(Str::new(authorization_url.as_str())))
-			.await?;
+		let callback_server = start_callback_server(redirect_uri, &state).await;
+		let url = Str::new(authorization_url.as_str());
+		if let Some(server) = &callback_server {
+			server.arm(url.clone());
+		}
+		let launch = callback_server.as_ref().map(|server| server.launch_url());
+		driver.emit(AuthEvent::OpenUrl { url, launch }).await?;
 		driver
 			.emit(AuthEvent::Prompt(AuthPrompt {
 				id:      sf!("oauth-callback-url"),
@@ -127,7 +132,12 @@ impl GitlabExternalRedirectHandler {
 			}))
 			.await?;
 
-		Ok(ExternalRedirectPending { verifier, state, redirect_uri: Str::new(redirect_uri) })
+		Ok(ExternalRedirectPending {
+			verifier,
+			state,
+			redirect_uri: Str::new(redirect_uri),
+			callback_server,
+		})
 	}
 
 	async fn run(
@@ -136,7 +146,7 @@ impl GitlabExternalRedirectHandler {
 		driver: &LoginDriver,
 	) -> Result<OAuthTokenSet, OAuthError> {
 		let pending = self.begin(spec, driver).await?;
-		let callback_server = start_callback_server(&pending.redirect_uri, &pending.state).await;
+		let callback_server = pending.callback_server;
 		let input = receive_callback_input(driver, callback_server).await?;
 		let (AuthInput::CallbackUrl(callback) | AuthInput::AuthorizationCode(callback)) = input
 		else {
@@ -412,7 +422,7 @@ mod tests {
 	}
 
 	async fn authorization_timeline(session: &AuthSession) -> (Url, String) {
-		let AuthEvent::OpenUrl(url) = session
+		let AuthEvent::OpenUrl { url, .. } = session
 			.events
 			.recv_async()
 			.await

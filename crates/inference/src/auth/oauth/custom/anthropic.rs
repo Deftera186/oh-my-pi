@@ -123,8 +123,13 @@ async fn exchange(
 			.append_pair("state", &state);
 	}
 	let callback_server = start_callback_server(redirect_uri, &state).await;
+	let authorization_url = Str::new(authorize_url.as_str());
+	if let Some(server) = &callback_server {
+		server.arm(authorization_url.clone());
+	}
+	let launch = callback_server.as_ref().map(|server| server.launch_url());
 	driver
-		.emit(AuthEvent::OpenUrl(Str::new(authorize_url.as_str())))
+		.emit(AuthEvent::OpenUrl { url: authorization_url, launch })
 		.await?;
 	driver
 		.emit(AuthEvent::Prompt(AuthPrompt {
@@ -483,7 +488,8 @@ mod tests {
 		let spec = spec();
 		let exchange = handler.exchange(&spec, &driver);
 		let respond = async {
-			let AuthEvent::OpenUrl(url) = session.events.recv_async().await.unwrap().unwrap() else {
+			let AuthEvent::OpenUrl { url, .. } = session.events.recv_async().await.unwrap().unwrap()
+			else {
 				panic!("expected authorization URL")
 			};
 			let url = Url::parse(&url).unwrap();
@@ -586,7 +592,8 @@ mod tests {
 			let spec = spec();
 			let run = exchange(&http, &spec, &driver);
 			let respond = async {
-				let AuthEvent::OpenUrl(url) = session.events.recv_async().await.unwrap().unwrap()
+				let AuthEvent::OpenUrl { url, .. } =
+					session.events.recv_async().await.unwrap().unwrap()
 				else {
 					panic!("authorization URL")
 				};

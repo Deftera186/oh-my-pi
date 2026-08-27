@@ -1242,7 +1242,12 @@ pub enum AuthPromptKind {
 /// `Debug`.
 pub enum AuthEvent {
 	/// Open a browser at the public authorization URL.
-	OpenUrl(Str),
+	OpenUrl {
+		/// Full provider authorization URL.
+		url:    Str,
+		/// Short loopback launch URL when a callback server is available.
+		launch: Option<Str>,
+	},
 	/// Display a short-lived secret device code and public verification URL.
 	ShowDeviceCode {
 		/// Secret short-lived device code.
