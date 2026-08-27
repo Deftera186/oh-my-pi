@@ -4,7 +4,7 @@ use std::{
 	collections::BTreeMap,
 	io, slice,
 	sync::{
-		Arc, Barrier,
+		Arc, Barrier, Mutex,
 		atomic::{AtomicBool, Ordering},
 	},
 	thread,
@@ -18,8 +18,8 @@ use omp_proto::{
 use omp_storage::{
 	index::{
 		self, EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError, JournalPosition,
-		NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind, UsageBucketWidth,
-		UsageDimension, UsageQuery,
+		NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind, SessionRenameObserver,
+		UsageBucketWidth, UsageDimension, UsageQuery,
 	},
 	maintenance::MaintenanceMode,
 	transcript::{SessionId, TitleSource},
@@ -70,6 +70,60 @@ fn create_after_journal(index: &SessionIndex, id: &SessionId, after_journal: imp
 			},
 		)
 		.expect("write header and session index row");
+}
+
+#[derive(Default)]
+struct RenameObserver(Mutex<Vec<(Str, Option<Str>)>>);
+
+impl SessionRenameObserver for RenameObserver {
+	fn renamed(&self, session: &SessionId, name: Option<&str>) {
+		self
+			.0
+			.lock()
+			.expect("rename observer lock")
+			.push((session.0.clone(), name.map(Str::new)));
+	}
+}
+
+#[test]
+fn committed_ui_and_extension_renames_emit_once_while_create_and_resume_stay_silent() {
+	let directory = tempdir().expect("temporary index");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("index");
+	let observer = Arc::new(RenameObserver::default());
+	index.bind_rename_observer(observer.clone());
+	let session = session_id("live");
+	create(&index, &session);
+	assert!(observer.0.lock().expect("rename observer lock").is_empty());
+	let _resumed = index
+		.get(&session)
+		.expect("resume lookup")
+		.expect("live session");
+	assert!(observer.0.lock().expect("rename observer lock").is_empty());
+
+	for (event_index, title) in [(0, "  UI title  "), (1, "Extension title"), (2, "   ")] {
+		index
+			.append(
+				&IndexedEvent {
+					session:    &session,
+					ts_ms:      2_000 + event_index,
+					kind:       "title",
+					projection: EventProjection::Title { title, source: TitleSource::User },
+				},
+				|| {
+					Ok::<_, io::Error>(((), JournalPosition {
+						event_index,
+						byte_watermark: 128 + event_index,
+					}))
+				},
+			)
+			.expect("commit rename");
+	}
+	let observed = observer.0.lock().expect("rename observer lock");
+	assert_eq!(observed.as_slice(), [
+		(session.0.clone(), Some(sf!("UI title"))),
+		(session.0.clone(), Some(sf!("Extension title"))),
+		(session.0.clone(), None),
+	]);
 }
 
 fn outcome(input: u64, output: u64) -> pb::Outcome {

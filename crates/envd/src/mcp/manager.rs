@@ -739,6 +739,27 @@ pub struct McpInspectorSnapshot {
 	pub prompts:          Arc<[PromptDefinition]>,
 }
 
+/// Post-handling MCP notification offered to Core-owned hook dispatch.
+#[derive(Clone, Debug)]
+pub struct McpHookNotification {
+	/// Raw mounted server name.
+	pub server:   Str,
+	/// Complete JSON-RPC notification method.
+	pub method:   Str,
+	/// Validated opaque JSON parameters.
+	pub params:   Value,
+	/// Monotonic sequence local to the mounted server.
+	pub sequence: u64,
+}
+
+/// Non-blocking sink for post-handling MCP hook observations.
+pub trait McpNotificationSink: Send + Sync {
+	/// Returns whether any mirrored static filter admits the raw notification.
+	fn interested(&self, server: &str, method: &str) -> bool;
+	/// Offers one notification after built-in refresh handling has completed.
+	fn offer(&self, notification: McpHookNotification);
+}
+
 pub(crate) struct LiveConnection {
 	pub(crate) client:      Arc<McpClient>,
 	pub(crate) initialized: InitializedServer,
@@ -749,15 +770,16 @@ pub(crate) struct LiveConnection {
 }
 
 struct MountState {
-	spec:               MountSpec,
-	generation:         u64,
-	definition_version: u64,
-	connection:         Option<Arc<LiveConnection>>,
-	connecting:         bool,
-	reconnecting:       bool,
-	terminal_failure:   bool,
-	reconnects:         VecDeque<Instant>,
-	tools:              Arc<[Value]>,
+	spec:                  MountSpec,
+	generation:            u64,
+	definition_version:    u64,
+	notification_sequence: u64,
+	connection:            Option<Arc<LiveConnection>>,
+	connecting:            bool,
+	reconnecting:          bool,
+	terminal_failure:      bool,
+	reconnects:            VecDeque<Instant>,
+	tools:                 Arc<[Value]>,
 }
 
 struct ManagerState {
@@ -784,11 +806,11 @@ pub struct McpManager {
 	state:         Mutex<ManagerState>,
 	subscriptions: Mutex<SubscriptionState>,
 	auth:          RwLock<Option<Arc<dyn McpAuthChallengeHandler>>>,
+	notifications: RwLock<Option<Arc<dyn McpNotificationSink>>>,
 	control_gate:  ControlGate,
 	changed:       Notify,
 	shutdown:      CancellationToken,
 	generation:    atomic::AtomicU64,
-	sequence:      atomic::AtomicU64,
 }
 
 impl McpManager {
@@ -819,12 +841,17 @@ impl McpManager {
 				active:  BTreeMap::new(),
 			}),
 			auth: RwLock::new(None),
+			notifications: RwLock::new(None),
 			control_gate: ControlGate::new(),
 			changed: Notify::new(),
 			shutdown: CancellationToken::new(),
 			generation: atomic::AtomicU64::new(1),
-			sequence: atomic::AtomicU64::new(1),
 		})
+	}
+
+	/// Binds Core-owned filtered hook delivery for server notifications.
+	pub fn bind_notification_sink(&self, sink: Arc<dyn McpNotificationSink>) {
+		*self.notifications.write() = Some(sink);
 	}
 
 	/// Binds the combined credential authority's reactive challenge hook.
@@ -1600,6 +1627,7 @@ impl McpManager {
 			spec,
 			generation,
 			definition_version: 0,
+			notification_sequence: 0,
 			connection: None,
 			connecting: true,
 			reconnecting: false,
@@ -1988,7 +2016,27 @@ impl McpManager {
 		if let Some(refresh) = refresh {
 			let _ = self.refresh_definitions(name, generation, refresh).await;
 		}
-		let sequence = self.sequence.fetch_add(1, atomic::Ordering::Relaxed);
+		let sequence = {
+			let mut state = self.state.lock();
+			let Some(mount) = state.mounts.get_mut(name) else {
+				return;
+			};
+			if mount.generation != generation {
+				return;
+			}
+			mount.notification_sequence = mount.notification_sequence.saturating_add(1);
+			mount.notification_sequence
+		};
+		if let Some(sink) = self.notifications.read().clone()
+			&& sink.interested(name, method)
+		{
+			sink.offer(McpHookNotification {
+				server: Str::from(name),
+				method: Str::from(method),
+				params: params.clone(),
+				sequence,
+			});
+		}
 		let params_json = serde_json::to_vec(&params).unwrap_or_else(|_| b"null".to_vec());
 		let _ = self.service.notify(pb::McpNotification {
 			server: Some(pb::McpServerRef {

@@ -527,16 +527,19 @@ enum HookEventId {
   HOOK_EVENT_EXTENSION_UNLOAD = 56;
   HOOK_EVENT_HOST_RECONNECT = 57;
   HOOK_EVENT_TTSR_TRIGGERED = 58;
-  HOOK_EVENT_TODO_REMINDER = 59;
+  reserved 59; // Permanent tombstone: provisional todo_reminder was never public.
   HOOK_EVENT_RETRY_START = 60;
   HOOK_EVENT_RETRY_END = 61;
   HOOK_EVENT_FALLBACK_APPLIED = 62;
   HOOK_EVENT_FALLBACK_SUCCEEDED = 63;
+  HOOK_EVENT_MCP_NOTIFICATION = 64;
+  HOOK_EVENT_PROVIDER_RESPONSE = 65;
+  HOOK_EVENT_SESSION_RENAMED = 66;
 }
 
 // Revision 1 payloads for authoritative observational lifecycle events.
 // Producers truncate strings before dispatch: ids <= 128 bytes, rule/model/reason
-// fields <= 512 bytes, and reminder/matched fields <= 4096 bytes.
+// fields <= 512 bytes, and matched fields <= 4096 bytes.
 message LifecycleEventContext {
   string session_id = 1;
   string turn_id = 2;
@@ -548,12 +551,6 @@ message TtsrTriggeredEventV1 {
   string rule = 2;
   string matched = 3;
   bool interrupted = 4;
-}
-
-message TodoReminderEventV1 {
-  LifecycleEventContext context = 1;
-  uint32 pending = 2;
-  string reminder = 3;
 }
 
 message RetryLifecycleEventV1 {
@@ -571,11 +568,31 @@ message FallbackLifecycleEventV1 {
   string target_model = 3;
   string reason = 4;
 }
+message McpNotificationEventV1 {
+  string server = 1;
+  string method = 2;
+  bytes params_json = 3;
+  uint64 sequence = 4;
+}
+message ProviderResponseEventV1 {
+  string provider = 1;
+  string model = 2;
+  string api = 3;
+  uint32 status = 4;
+  map<string, string> headers = 5;
+  optional string request_id = 6;
+}
+message SessionRenamedEventV1 {
+  string session = 1;
+  optional string name = 2;
+}
 message When {
   repeated string names = 1;
   repeated string providers = 2;
   repeated string targets = 3;
   repeated string roles = 4;
+  repeated string servers = 5;
+  repeated string method_globs = 6;
   omp.inference.v1.ValueMap props = 15;
 }
 message SubscriptionSpec {
@@ -1168,6 +1185,46 @@ message QueryUsage {
   bool include_tree = 2;
   omp.inference.v1.ValueMap props = 15;
 }
+
+// One canonically encoded extension-owned journal seed.
+message SessionSeedEntry {
+  string kind = 1;
+  string rev = 2;
+  bytes data_json = 3;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// One visible user-message part admitted for a new interactive session.
+message SessionPromptPart {
+  oneof kind {
+    string text = 1;
+    omp.thread.v1.Blob blob = 2;
+  }
+}
+
+// Presence-bearing initial prompt. An empty parts list is invalid.
+message SessionPrompt {
+  repeated SessionPromptPart parts = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Declarative, immutable inputs to one create/seed/switch transaction.
+message SessionSetup {
+  optional string title = 1;
+  optional string parent = 2;
+  repeated SessionSeedEntry entries = 3;
+  optional SessionPrompt initial_prompt = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// One generation-fenced and replay-safe create/seed/switch request.
+message CreateSession {
+  SessionSetup setup = 1;
+  string idempotency_key = 2;
+  uint64 host_generation = 3;
+  uint64 session_generation = 4;
+  omp.inference.v1.ValueMap props = 15;
+}
 message AdoptArtifact {
   string source_url = 1;
   string lifetime = 2;
@@ -1277,6 +1334,54 @@ message StateChanged {
   bytes value_json = 2;
   omp.inference.v1.ValueMap props = 15;
 }
+
+// Immutable index projection returned after the new journal is durable.
+message CreatedSession {
+  string session = 1;
+  optional string title = 2;
+  string cwd_uri = 3;
+  string project = 4;
+  uint64 created_at_ms = 5;
+  uint64 updated_at_ms = 6;
+  optional string parent = 7;
+  uint64 entries = 8;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+// Successful terminal result of one create/seed/switch transaction.
+message CreateSessionResult {
+  CreatedSession session = 1;
+  repeated uint64 seed_indexes = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+
+enum SessionTransitionRefusalCode {
+  SESSION_TRANSITION_REFUSAL_CODE_UNSPECIFIED = 0;
+  SESSION_TRANSITION_REFUSAL_CODE_INVALID_SETUP = 1;
+  SESSION_TRANSITION_REFUSAL_CODE_INACCESSIBLE_PARENT = 2;
+  SESSION_TRANSITION_REFUSAL_CODE_INVALID_ORIGIN = 3;
+  SESSION_TRANSITION_REFUSAL_CODE_UI_BUSY = 4;
+  SESSION_TRANSITION_REFUSAL_CODE_EFFECTS_NOT_AUTHORIZED = 5;
+  SESSION_TRANSITION_REFUSAL_CODE_QUOTA_EXCEEDED = 6;
+  SESSION_TRANSITION_REFUSAL_CODE_STALE_GENERATION = 7;
+}
+
+// Typed pre-durability refusal. No session or index row was created.
+message SessionTransitionDenied {
+  SessionTransitionRefusalCode code = 1;
+  string message = 2;
+  omp.inference.v1.ValueMap details = 15;
+}
+
+// The durability acknowledgement was lost or could not be classified.
+//
+// The idempotency key is permanently fused: callers must not retry the
+// transition because Core cannot prove whether the new journal committed.
+message SessionTransitionIndeterminate {
+  string idempotency_key = 1;
+  string message = 2;
+  omp.inference.v1.ValueMap details = 15;
+}
 message JournalWorkerEnvelope {
   oneof body {
     DeclareEntryKinds declare_entry_kinds = 1;
@@ -1292,6 +1397,7 @@ message JournalWorkerEnvelope {
     StateGet state_get = 11;
     StateCas state_cas = 12;
     StateWatch state_watch = 13;
+    CreateSession create_session = 14;
   }
   omp.inference.v1.ValueMap props = 15;
 }
@@ -1304,6 +1410,9 @@ message JournalHostEnvelope {
     ArtifactRow artifact_row = 5;
     StateValue state_value = 6;
     StateChanged state_changed = 7;
+    CreateSessionResult create_session_result = 8;
+    SessionTransitionDenied session_transition_denied = 9;
+    SessionTransitionIndeterminate session_transition_indeterminate = 10;
   }
   omp.inference.v1.ValueMap props = 15;
 }

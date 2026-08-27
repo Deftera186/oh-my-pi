@@ -363,7 +363,7 @@ impl ControlAuthority for PersistenceControlOwner {
 			|| operation.starts_with("omp.journal.")
 			|| operation.starts_with("omp.state.")
 			|| operation == "omp.state_dir"
-			|| operation.starts_with("omp.sessions.")
+			|| (operation.starts_with("omp.sessions.") && operation != "omp.sessions.create")
 			|| operation.starts_with("omp.artifacts.")
 			|| operation.starts_with("omp.agents.schedule")
 			|| operation == "omp.agents.schedules"
@@ -441,6 +441,7 @@ impl ControlAuthority for PersistenceControlOwner {
 			| "omp.sessions.get"
 			| "omp.sessions.lineage"
 			| "omp.sessions.usage" => self.sessions_request(operation.as_str(), &arguments),
+			"omp.sessions.rename" => self.rename_session(&arguments).await,
 			"omp.artifacts.adopt"
 			| "omp.artifacts.stat"
 			| "omp.artifacts.list"
@@ -448,12 +449,10 @@ impl ControlAuthority for PersistenceControlOwner {
 				self.artifact_request(context.request_id, operation.as_str(), &arguments)
 			},
 			"omp.state_dir" => Ok(Value::String(self.actor.state_dir.to_string_lossy().into_owned())),
-			"omp.sessions.resume" | "omp.sessions.rename" | "omp.sessions.delete" => {
-				Err(ControlProtocolError::new(
-					"ControlOwnerUnavailable",
-					format!("{operation} requires a historical journal lifecycle owner"),
-				))
-			},
+			"omp.sessions.resume" | "omp.sessions.delete" => Err(ControlProtocolError::new(
+				"ControlOwnerUnavailable",
+				format!("{operation} requires a historical journal lifecycle owner"),
+			)),
 			_ => Err(ControlProtocolError::new(
 				"unhandled_operation",
 				format!("unhandled persistence operation: {operation}"),
@@ -474,6 +473,38 @@ impl ControlAuthority for PersistenceControlOwner {
 	}
 }
 impl PersistenceControlOwner {
+	async fn rename_session(
+		&self,
+		arguments: &Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let session_id = required_string(arguments, "session_id")?;
+		if session_id != self.actor.session_id.as_str() {
+			return Err(ControlProtocolError::new(
+				"ControlOwnerUnavailable",
+				"only the live session may be renamed",
+			));
+		}
+		let title = required_string(arguments, "title")?.trim();
+		let host = self
+			.actor
+			.agent
+			.lock()
+			.as_ref()
+			.and_then(|binding| binding.host.clone())
+			.ok_or_else(|| {
+				ControlProtocolError::new("ControlOwnerUnavailable", "Agent owner is not bound")
+			})?;
+		let mut request = Map::new();
+		request.insert(String::from("title"), Value::String(title.to_owned()));
+		host
+			.request("omp.sessions.rename", request)
+			.await
+			.map_err(protocol_error)?;
+		let mut get = Map::new();
+		get.insert(String::from("session_id"), Value::String(session_id.to_owned()));
+		self.sessions_request("omp.sessions.get", &get)
+	}
+
 	async fn journal_mutation(
 		&self,
 		request_id: u64,

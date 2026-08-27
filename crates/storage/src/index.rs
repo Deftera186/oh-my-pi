@@ -11,6 +11,7 @@ use std::{
 	fmt::{self, Display},
 	path::Path,
 	str::FromStr,
+	sync::Arc,
 	time::Duration,
 };
 
@@ -20,7 +21,7 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1::{self as thread_pb, item},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{
 	Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 	params_from_iter, types, types::Value,
@@ -66,6 +67,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_recent ON sessions(project, updated_ms DESC, id);
 CREATE INDEX IF NOT EXISTS sessions_parent ON sessions(parent);
+CREATE TABLE IF NOT EXISTS session_create_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS session_entry_kinds (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -305,6 +310,14 @@ pub enum IndexedWriteError<T, E> {
 		/// Index failure that prevented publication.
 		source:   Error,
 	},
+}
+/// Idempotent outcome of one atomic seeded-session publication.
+#[derive(Debug)]
+pub enum CreateSessionWrite<T> {
+	/// This request published the supplied staged journal.
+	Created(T),
+	/// The same logical request already published this session.
+	Existing(SessionId),
 }
 
 impl<T, E: Display> Display for IndexedWriteError<T, E> {
@@ -666,6 +679,12 @@ pub struct SessionIndex {
 	pub(crate) connection: Mutex<Connection>,
 	authority:             IndexAuthority,
 	writable:              bool,
+	rename_observer:       RwLock<Option<Arc<dyn SessionRenameObserver>>>,
+}
+/// Non-blocking observer for committed live-session rename projections.
+pub trait SessionRenameObserver: Send + Sync + 'static {
+	/// Offers one normalized committed session name; `None` means cleared.
+	fn renamed(&self, session: &SessionId, name: Option<&str>);
 }
 
 impl SessionIndex {
@@ -680,9 +699,10 @@ impl SessionIndex {
 		migrate_schema(&connection)?;
 		check_schema(&connection)?;
 		Ok(Self {
-			connection: Mutex::new(connection),
-			authority:  IndexAuthority::Authoritative,
-			writable:   true,
+			connection:      Mutex::new(connection),
+			authority:       IndexAuthority::Authoritative,
+			writable:        true,
+			rename_observer: RwLock::new(None),
 		})
 	}
 
@@ -712,9 +732,10 @@ impl SessionIndex {
 		check_schema(&connection)?;
 		connection.pragma_update(None, "query_only", true)?;
 		Ok(Self {
-			connection: Mutex::new(connection),
-			authority:  IndexAuthority::Authoritative,
-			writable:   false,
+			connection:      Mutex::new(connection),
+			authority:       IndexAuthority::Authoritative,
+			writable:        false,
+			rename_observer: RwLock::new(None),
 		})
 	}
 
@@ -726,15 +747,21 @@ impl SessionIndex {
 		)?;
 		check_schema(&connection)?;
 		Ok(Self {
-			connection: Mutex::new(connection),
-			authority:  IndexAuthority::OfflineCache { cached_at_ms },
-			writable:   false,
+			connection:      Mutex::new(connection),
+			authority:       IndexAuthority::OfflineCache { cached_at_ms },
+			writable:        false,
+			rename_observer: RwLock::new(None),
 		})
 	}
 
 	/// Returns whether this handle is authoritative or an offline cache.
 	pub const fn authority(&self) -> IndexAuthority {
 		self.authority
+	}
+
+	/// Installs the environment-owned committed rename observer.
+	pub fn bind_rename_observer(&self, observer: Arc<dyn SessionRenameObserver>) {
+		*self.rename_observer.write() = Some(observer);
 	}
 
 	/// Runs the journal header write first, then publishes the session row in an
@@ -783,6 +810,78 @@ impl SessionIndex {
 		Ok(written)
 	}
 
+	/// Publishes a fully staged journal and its seed projection exactly once.
+	pub fn create_seeded_session<T, E>(
+		&self,
+		session: &NewSession<'_>,
+		idempotency_key: &str,
+		title: Option<&str>,
+		entry_count: u64,
+		entry_kinds: &[Str],
+		write_journal: impl FnOnce() -> Result<(T, u64), E>,
+	) -> Result<CreateSessionWrite<T>, IndexedWriteError<T, E>> {
+		if let Err(error) = self.require_writer() {
+			return Err(IndexedWriteError::IndexBeforeJournal(error));
+		}
+		let mut connection = self.connection.lock();
+		let existing = connection
+			.query_row(
+				"SELECT session_id FROM session_create_receipts WHERE idempotency_key=?1",
+				[idempotency_key],
+				|row| row.get::<_, String>(0),
+			)
+			.optional()
+			.map_err(Error::from)
+			.map_err(IndexedWriteError::IndexBeforeJournal)?;
+		if let Some(existing) = existing {
+			return Ok(CreateSessionWrite::Existing(SessionId(Str::from(existing))));
+		}
+		let (written, journal_watermark) = write_journal().map_err(IndexedWriteError::Journal)?;
+		let result = (|| {
+			let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+			transaction.execute(
+				"INSERT INTO sessions(
+				 id, title, title_source, cwd, project, created_ms, updated_ms, status, kind,
+				 parent, entries, remote, journal_watermark, last_event_index
+				 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+				params![
+					session.id.0.as_str(),
+					title,
+					title.map(|_| <&'static str>::from(TitleSource::User)),
+					session.cwd,
+					session.project,
+					sql_u64(session.created_ms, "created_ms")?,
+					<&'static str>::from(SessionStatus::Unknown),
+					<&'static str>::from(session.kind),
+					session.parent.map(|parent| parent.0.as_str()),
+					sql_u64(entry_count, "entries")?,
+					session.remote,
+					sql_u64(journal_watermark, "journal_watermark")?,
+					entry_count
+						.checked_sub(1)
+						.map(|index| sql_u64(index, "last_event_index"))
+						.transpose()?,
+				],
+			)?;
+			for kind in entry_kinds {
+				transaction.execute(
+					"INSERT OR IGNORE INTO session_entry_kinds(session_id, kind) VALUES (?1, ?2)",
+					params![session.id.0.as_str(), kind.as_str()],
+				)?;
+			}
+			transaction.execute(
+				"INSERT INTO session_create_receipts(idempotency_key, session_id) VALUES (?1, ?2)",
+				params![idempotency_key, session.id.0.as_str()],
+			)?;
+			transaction.commit()?;
+			Ok(())
+		})();
+		if let Err(source) = result {
+			return Err(IndexedWriteError::IndexAfterJournal { written, position: None, source });
+		}
+		Ok(CreateSessionWrite::Created(written))
+	}
+
 	/// Runs one journal append first, then updates its index projection in an
 	/// immediate transaction serialized with every other process writer.
 	pub fn append<T, E>(
@@ -808,6 +907,11 @@ impl SessionIndex {
 				position: Some(position),
 				source,
 			});
+		}
+		if let EventProjection::Title { title, .. } = event.projection
+			&& let Some(observer) = self.rename_observer.read().as_ref()
+		{
+			observer.renamed(event.session, normalize_session_name(title));
 		}
 		Ok(written)
 	}
@@ -1359,6 +1463,11 @@ fn index_event(
 	index_event_inner(transaction, event, position, false)
 }
 
+fn normalize_session_name(value: &str) -> Option<&str> {
+	let value = value.trim();
+	(!value.is_empty()).then_some(value)
+}
+
 fn index_event_repair(
 	transaction: &Transaction<'_>,
 	event: &IndexedEvent<'_>,
@@ -1407,9 +1516,10 @@ fn index_event_inner(
 	match event.projection {
 		EventProjection::Plain => {},
 		EventProjection::Title { title, source } => {
+			let title = normalize_session_name(title);
 			transaction.execute(
 				"UPDATE sessions SET title = ?2, title_source = ?3 WHERE id = ?1",
-				params![event.session.0.as_str(), title, <&'static str>::from(source)],
+				params![event.session.0.as_str(), title, title.map(|_| <&'static str>::from(source))],
 			)?;
 		},
 		EventProjection::Prompt { text } => {

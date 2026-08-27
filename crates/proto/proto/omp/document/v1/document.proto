@@ -942,6 +942,7 @@ message LspBindingEvent {
   // stopped or restarted and every binding for it must be refreshed.
   DocumentRef document = 3;
 }
+
 // Workspace language-server roster query. Returns every discovered native
 // declaration matching the project root with its current lifecycle stage.
 message LspStatusRequest {

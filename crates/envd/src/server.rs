@@ -37,6 +37,7 @@ use omp_proto::{
 	policy::v1 as policy_pb,
 	prost::Message as _,
 	thread::v1 as thread_pb,
+	ui::v1::UiDispatchResult,
 };
 use omp_settings::{
 	BrowserSettings,
@@ -162,7 +163,7 @@ use crate::{
 			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlProtocolError,
 			ControlRequestContext,
 		},
-		dispatch::{CallbackDispatcher, CallbackDispatcherSlot},
+		dispatch::{CallbackDispatcher, CallbackDispatcherSlot, UiCallbackDispatch},
 	},
 	tools::{
 		DeviceCatalogObserver, DeviceControlFactory, DeviceInvocationAdmission,
@@ -805,6 +806,23 @@ impl CallbackDispatcher for WeakExtensionCallbackDispatcher {
 		})?;
 		CallbackDispatcher::dispatch(supervisor.as_ref(), target, dispatch).await
 	}
+
+	async fn dispatch_ui(
+		&self,
+		target: Arc<ControlConnectionIdentity>,
+		authority: crate::exthost::control::ControlInvocationAuthority,
+		dispatch: UiCallbackDispatch,
+		timeout: Duration,
+	) -> Result<UiDispatchResult, ControlProtocolError> {
+		let supervisor = self.supervisor.upgrade().ok_or_else(|| {
+			ControlProtocolError::new(
+				"CallbackUnavailable",
+				"extension callback supervisor is no longer active",
+			)
+		})?;
+		CallbackDispatcher::dispatch_ui(supervisor.as_ref(), target, authority, dispatch, timeout)
+			.await
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -815,6 +833,7 @@ enum DeclaredExternalDomain {
 	DirectFilesystem,
 	Credentials,
 	Prompts,
+	Sessions,
 	Ui,
 	Telemetry,
 	Jobs,
@@ -846,6 +865,7 @@ impl DeclaredExternalDomain {
 				!declarations.credentials.is_empty() || !declarations.secrets.is_empty()
 			},
 			Self::Prompts => !declarations.prompt_slots.is_empty(),
+			Self::Sessions => !declarations.ui.commands.is_empty(),
 			Self::Ui => {
 				!declarations.ui.commands.is_empty()
 					|| !declarations.ui.shortcuts.is_empty()
@@ -874,6 +894,7 @@ impl DeclaredExternalDomain {
 			Self::DirectFilesystem => "direct-filesystem",
 			Self::Credentials => "credentials",
 			Self::Prompts => "prompts",
+			Self::Sessions => "sessions",
 			Self::Ui => "ui",
 			Self::Telemetry => "telemetry",
 			Self::Jobs => "jobs",
@@ -894,6 +915,7 @@ impl DeclaredExternalDomain {
 			Self::DirectFilesystem => factories.direct_filesystem.clone(),
 			Self::Credentials => factories.credentials.clone(),
 			Self::Prompts => factories.prompts.clone(),
+			Self::Sessions => factories.sessions.clone(),
 			Self::Ui => factories.ui.clone(),
 			Self::Telemetry => factories.telemetry.clone(),
 			Self::Jobs => factories.jobs.clone(),
@@ -1730,8 +1752,26 @@ fn production_control_authorities(
 		Arc::new(ProductionDeviceCatalogObserver),
 		Arc::new(ProductionDeviceInvocationAdmission),
 	);
-	let hooks =
-		HookControlFactory::new(Arc::clone(&registry_owner), callbacks.clone(), BTreeMap::new());
+	let extension_settings = extensions
+		.iter()
+		.map(|extension| {
+			(
+				(
+					extension.key.layer().clone(),
+					extension.key.tier().clone(),
+					extension.key.extension().clone(),
+				),
+				extension.settings.clone(),
+			)
+		})
+		.collect();
+	let hooks = HookControlFactory::new(
+		Arc::clone(&registry_owner),
+		callbacks.clone(),
+		BTreeMap::new(),
+		extension_settings,
+	);
+	hooks.bind_mcp_drop_journal(Arc::clone(telemetry), session_id.clone());
 	let hooks_factory: Arc<dyn ControlAuthorityFactory> = hooks.clone();
 	let registry_factory: Arc<dyn ControlAuthorityFactory> = registry_owner.clone();
 	let envd: Arc<dyn ControlAuthorityFactory> = Arc::new(ProductionEnvdControlFactory {
@@ -1775,6 +1815,7 @@ fn production_control_authorities(
 	let direct_filesystem = gated(DeclaredExternalDomain::DirectFilesystem);
 	let credentials = gated(DeclaredExternalDomain::Credentials);
 	let prompts = gated(DeclaredExternalDomain::Prompts);
+	let sessions = gated(DeclaredExternalDomain::Sessions);
 	let ui = gated(DeclaredExternalDomain::Ui);
 	let telemetry_owner = gated(DeclaredExternalDomain::Telemetry);
 	let jobs = gated(DeclaredExternalDomain::Jobs);
@@ -1784,11 +1825,14 @@ fn production_control_authorities(
 	let auxiliary: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
 		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem].into_boxed_slice(),
 	});
+	let session_owner: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
+		owners: vec![Arc::clone(&persistent), sessions].into_boxed_slice(),
+	});
 	let persistence = PersistenceControlAuthorities::new(
 		Arc::clone(&persistent),
 		Arc::clone(&persistent),
 		Arc::clone(&persistent),
-		Arc::clone(&persistent),
+		session_owner,
 		persistent,
 		credentials,
 	);
@@ -1819,43 +1863,45 @@ fn production_control_authorities(
 
 /// Owner-local `env/v1` dispatch state serving one project environment.
 pub struct EnvServer {
-	identity:            ServerIdentity,
-	documents:           DocumentHost,
-	_document_authority: Option<DocumentAuthority>,
-	exec:                ExecHost,
-	acp_exec:            AcpExecSlot,
-	approvals:           ApprovalAuthoritySlot,
-	http_egress:         HttpEgressHost,
-	workspace:           WorkspaceHost,
-	mcp:                 Arc<McpService>,
-	mcp_manager:         Arc<McpManager>,
-	host_info:           HostInfoHost,
-	workspace_roots:     WorkspaceRootHost,
-	lsp_settings:        LspSettings,
-	resources:           Arc<ResolverTable<UrlResolver>>,
-	_memory_runtime:     RegisteredMemoryRuntime,
-	blobs:               BlobHost,
-	sites:               SiteMaterializer,
-	materializations:    ResourceMaterializer,
-	registry:            Arc<Registry>,
-	ask_presenter:       PresenterSlot,
-	workspace_ops:       WorkspaceOperations,
-	ext_hosts:           Arc<ExtHostSupervisor>,
-	eval_bridge:         Arc<SessionBridgeHost>,
-	reflection_bridge:   Arc<ReflectionBridgeHost>,
-	eval_control:        EvalSessionControl,
-	search_bridge:       Arc<SearchBridgeHost>,
-	github_credentials:  Arc<GithubCredentialBridge>,
-	usage_fetchers:      omp_inference::operation::usage::UsageFetcherRegistry,
-	checkpoint_control:  AgentCheckpointControl,
-	previews:            StagedProposalRegistry,
-	sessions_index:      Arc<SessionIndex>,
-	journal_external:    ExternalJournalActor,
-	workers:             Arc<WorkerSupervisor>,
-	authority:           Arc<AuthorityTable>,
-	repository_revision: AtomicU64,
-	process_store:       ProcessStore,
-	presence:            PresenceRegistry,
+	identity:                ServerIdentity,
+	documents:               DocumentHost,
+	_document_authority:     Option<DocumentAuthority>,
+	exec:                    ExecHost,
+	acp_exec:                AcpExecSlot,
+	approvals:               ApprovalAuthoritySlot,
+	http_egress:             HttpEgressHost,
+	workspace:               WorkspaceHost,
+	mcp:                     Arc<McpService>,
+	mcp_manager:             Arc<McpManager>,
+	host_info:               HostInfoHost,
+	workspace_roots:         WorkspaceRootHost,
+	lsp_settings:            LspSettings,
+	resources:               Arc<ResolverTable<UrlResolver>>,
+	_memory_runtime:         RegisteredMemoryRuntime,
+	blobs:                   BlobHost,
+	sites:                   SiteMaterializer,
+	materializations:        ResourceMaterializer,
+	registry:                Arc<Registry>,
+	ask_presenter:           PresenterSlot,
+	workspace_ops:           WorkspaceOperations,
+	ext_hosts:               Arc<ExtHostSupervisor>,
+	eval_bridge:             Arc<SessionBridgeHost>,
+	reflection_bridge:       Arc<ReflectionBridgeHost>,
+	eval_control:            EvalSessionControl,
+	search_bridge:           Arc<SearchBridgeHost>,
+	github_credentials:      Arc<GithubCredentialBridge>,
+	usage_fetchers:          omp_inference::operation::usage::UsageFetcherRegistry,
+	provider_response_hooks: omp_inference::ProviderResponseHooks,
+	checkpoint_control:      AgentCheckpointControl,
+	previews:                StagedProposalRegistry,
+	sessions_index:          Arc<SessionIndex>,
+	journal_external:        ExternalJournalActor,
+	workers:                 Arc<WorkerSupervisor>,
+	authority:               Arc<AuthorityTable>,
+	repository_revision:     AtomicU64,
+	process_store:           ProcessStore,
+	presence:                PresenceRegistry,
+	state_dir:               PathBuf,
 }
 
 fn execution_settings(
@@ -2163,6 +2209,55 @@ fn worker_info(route: &WorkerRoute) -> pb::WorkerInfo {
 		..pb::WorkerInfo::default()
 	}
 }
+fn workspace_update_failure(
+	checked_at_ms: u64,
+	code: impl Into<String>,
+	message: impl Into<String>,
+) -> pb::WorkspaceUpdateReport {
+	pb::WorkspaceUpdateReport {
+		checked: true,
+		failure: Some(pb::ExtensionUpdateFailure { code: code.into(), message: message.into() }),
+		checked_at_ms,
+		..pb::WorkspaceUpdateReport::default()
+	}
+}
+async fn fetch_extension_metadata(url: &str) -> Result<Vec<u8>, ()> {
+	const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+	let response = reqwest::get(url).await.map_err(|_| ())?;
+	if !response.status().is_success() {
+		return Err(());
+	}
+	let bytes = response.bytes().await.map_err(|_| ())?;
+	if bytes.len() > MAX_METADATA_BYTES {
+		return Err(());
+	}
+	Ok(bytes.to_vec())
+}
+
+fn write_extension_metadata(path: &Path, bytes: &[u8]) -> io::Result<()> {
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)?;
+	}
+	let temporary = path.with_extension("tmp");
+	fs::write(&temporary, bytes)?;
+	fs::rename(temporary, path)
+}
+
+fn update_refusal_wire(refusal: omp_ext::upgrade::UpdateRefusal) -> pb::ExtensionUpdateRefusal {
+	use omp_ext::upgrade::UpdateRefusal;
+	match refusal {
+		UpdateRefusal::FeatureRemoved => pb::ExtensionUpdateRefusal::FeatureRemoved,
+		UpdateRefusal::CapabilityChanged => pb::ExtensionUpdateRefusal::CapabilityChanged,
+		UpdateRefusal::Pinned => pb::ExtensionUpdateRefusal::Pinned,
+		UpdateRefusal::StaleRevocations => pb::ExtensionUpdateRefusal::StaleRevocations,
+		UpdateRefusal::BadSignature => pb::ExtensionUpdateRefusal::BadSignature,
+		UpdateRefusal::AttestationMissing => pb::ExtensionUpdateRefusal::Attestation,
+		UpdateRefusal::PublisherChanged => pb::ExtensionUpdateRefusal::PublisherChanged,
+		UpdateRefusal::Yanked => pb::ExtensionUpdateRefusal::Yanked,
+		UpdateRefusal::Revoked => pb::ExtensionUpdateRefusal::Revoked,
+		UpdateRefusal::Integrity => pb::ExtensionUpdateRefusal::Integrity,
+	}
+}
 
 impl EnvServer {
 	fn new(
@@ -2190,6 +2285,7 @@ impl EnvServer {
 		search_bridge: Arc<SearchBridgeHost>,
 		github_credentials: Arc<GithubCredentialBridge>,
 		usage_fetchers: omp_inference::operation::usage::UsageFetcherRegistry,
+		provider_response_hooks: omp_inference::ProviderResponseHooks,
 		checkpoint_control: AgentCheckpointControl,
 		previews: StagedProposalRegistry,
 		sessions_index: Arc<SessionIndex>,
@@ -2230,6 +2326,7 @@ impl EnvServer {
 			search_bridge,
 			github_credentials,
 			usage_fetchers,
+			provider_response_hooks,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2242,6 +2339,7 @@ impl EnvServer {
 			repository_revision: AtomicU64::new(0),
 			process_store: ProcessStore::new(state_dir.join("processes").join("meta.json")),
 			presence,
+			state_dir: state_dir.to_path_buf(),
 		}
 	}
 
@@ -2326,6 +2424,8 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 		);
+		sessions_index.bind_rename_observer(control_bindings.hooks.clone());
+		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
 		ext_host_config.bind_hook_control(Arc::clone(&control_bindings.hooks));
@@ -2412,6 +2512,8 @@ impl EnvServer {
 			server_build:   Str::from(omp_env::build_id::current()),
 		};
 		let usage_fetchers = control_bindings.hooks.usage_fetchers();
+		let provider_response_hooks =
+			omp_inference::ProviderResponseHooks::new(control_bindings.hooks.clone());
 		Ok(Self::new(
 			identity,
 			documents,
@@ -2437,6 +2539,7 @@ impl EnvServer {
 			search_bridge,
 			github_credentials,
 			usage_fetchers,
+			provider_response_hooks,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2537,6 +2640,8 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 		);
+		sessions_index.bind_rename_observer(control_bindings.hooks.clone());
+		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
 		ext_host_config.bind_hook_control(Arc::clone(&control_bindings.hooks));
@@ -2630,6 +2735,8 @@ impl EnvServer {
 			server_build:   Str::from(omp_env::build_id::current()),
 		};
 		let usage_fetchers = control_bindings.hooks.usage_fetchers();
+		let provider_response_hooks =
+			omp_inference::ProviderResponseHooks::new(control_bindings.hooks.clone());
 		Ok(Self::new(
 			identity,
 			documents,
@@ -2655,6 +2762,7 @@ impl EnvServer {
 			search_bridge,
 			github_credentials,
 			usage_fetchers,
+			provider_response_hooks,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2760,9 +2868,25 @@ impl EnvServer {
 		self.ext_hosts.reload().await
 	}
 
+	/// Respawns only the child owning one linked extension.
+	pub async fn reload_extension(&self, extension: &str) -> Result<u64, WorkerError> {
+		self.ext_hosts.reload_extension(extension).await
+	}
+
+	/// Stops host groups containing newly revoked extensions while retaining
+	/// their static unavailable routes.
+	pub async fn quarantine_extensions(&self, extensions: &[Str]) {
+		self.ext_hosts.quarantine(extensions).await;
+	}
+
 	/// Returns the shared extension and built-in provider usage registry.
 	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
 		self.usage_fetchers.clone()
+	}
+
+	/// Returns the session-owned provider response hook sink.
+	pub fn provider_response_hooks(&self) -> omp_inference::ProviderResponseHooks {
+		self.provider_response_hooks.clone()
 	}
 
 	/// Returns the sealed deployment manifest for an exact live CONTROL
@@ -2781,6 +2905,11 @@ impl EnvServer {
 		identity: &ControlConnectionIdentity,
 	) -> Option<Arc<SealedRegistryEvidence>> {
 		self.ext_hosts.sealed_registry_evidence(identity)
+	}
+
+	/// Returns every currently sealed exact-generation extension registry.
+	pub fn extension_registry_evidences(&self) -> Vec<Arc<SealedRegistryEvidence>> {
+		self.ext_hosts.sealed_registry_evidences()
 	}
 
 	/// Returns the session-owned MCP manager for late bridge injection.
@@ -3360,6 +3489,279 @@ impl EnvServer {
 			.map(|()| grants)
 	}
 
+	async fn check_workspace_updates(
+		&self,
+		request: pb::WorkspaceUpdateCheck,
+	) -> pb::WorkspaceUpdateReport {
+		use omp_ext::{
+			Layer,
+			config::UpdateMode,
+			index::{IndexConfig, SignedIndex},
+			lock::{InstalledRecord, LockFile},
+			trust::RevocationsFile,
+			upgrade::{
+				Generation, PinsFile, resolve_candidate_generation, verify_candidate_generation,
+			},
+		};
+
+		let checked_at_ms = request.now_ms;
+		let mode = request.mode.parse::<UpdateMode>();
+		if mode == Ok(UpdateMode::Off) {
+			return pb::WorkspaceUpdateReport {
+				checked: false,
+				checked_at_ms,
+				..pb::WorkspaceUpdateReport::default()
+			};
+		}
+		if mode.is_err() {
+			return workspace_update_failure(
+				checked_at_ms,
+				"update-policy",
+				"workspace update mode is invalid",
+			);
+		}
+		let workspace = self.workspace.root().join(".omp");
+		let lock_path = workspace.join("omp.lock");
+		if !lock_path.exists() {
+			return pb::WorkspaceUpdateReport {
+				checked: true,
+				checked_at_ms,
+				..pb::WorkspaceUpdateReport::default()
+			};
+		}
+		let Some(data_dir) = omp_core::dirs::data_dir(None).ok() else {
+			return workspace_update_failure(
+				checked_at_ms,
+				"storage",
+				"client data directory is unavailable",
+			);
+		};
+		let key = match fs::read_to_string(data_dir.join("ext/index.key")) {
+			Ok(key) => key,
+			Err(_) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					"index-key",
+					"signed index key is unavailable",
+				);
+			},
+		};
+		let mut index_path = data_dir.join("ext/index.json");
+		let mut revocations_path = data_dir.join("ext/revocations.json");
+		if let Ok(config) = IndexConfig::read(&data_dir.join("ext/indexes.toml"))
+			&& let Some(source) = config.entries.first()
+		{
+			let metadata_root = self.state_dir.join("ext/update-metadata");
+			index_path = metadata_root.join("index.json");
+			revocations_path = metadata_root.join("revocations.json");
+			let Some((prefix, _)) = source.url.rsplit_once('/') else {
+				return workspace_update_failure(
+					checked_at_ms,
+					"index-url",
+					"signed index URL has no metadata directory",
+				);
+			};
+			let revocation_bytes =
+				match fetch_extension_metadata(&format!("{prefix}/revocations.json")).await {
+					Ok(bytes) => bytes,
+					Err(()) => {
+						return workspace_update_failure(
+							checked_at_ms,
+							"network",
+							"revocation metadata refresh failed",
+						);
+					},
+				};
+			let refreshed_revocations: RevocationsFile =
+				match serde_json::from_slice(&revocation_bytes) {
+					Ok(value) => value,
+					Err(_) => {
+						return workspace_update_failure(
+							checked_at_ms,
+							"revocations",
+							"revocation metadata is malformed",
+						);
+					},
+				};
+			if let Err(error) = refreshed_revocations.verify(key.trim()) {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			}
+			if write_extension_metadata(&revocations_path, &revocation_bytes).is_err() {
+				return workspace_update_failure(
+					checked_at_ms,
+					"storage",
+					"revocation metadata could not be persisted",
+				);
+			}
+			let index_bytes = match fetch_extension_metadata(&source.url).await {
+				Ok(bytes) => bytes,
+				Err(()) => {
+					return workspace_update_failure(
+						checked_at_ms,
+						"network",
+						"signed index refresh failed",
+					);
+				},
+			};
+			let refreshed_index: SignedIndex = match serde_json::from_slice(&index_bytes) {
+				Ok(value) => value,
+				Err(_) => {
+					return workspace_update_failure(
+						checked_at_ms,
+						"index",
+						"signed index metadata is malformed",
+					);
+				},
+			};
+			if let Err(error) = refreshed_index.verify(key.trim()) {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			}
+			if write_extension_metadata(&index_path, &index_bytes).is_err() {
+				return workspace_update_failure(
+					checked_at_ms,
+					"storage",
+					"signed index could not be persisted",
+				);
+			}
+		}
+		let index = match SignedIndex::read(&index_path, key.trim()) {
+			Ok(index) => index,
+			Err(error) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			},
+		};
+		let revocations = match RevocationsFile::read(&revocations_path).and_then(|value| {
+			value.verify(key.trim())?;
+			Ok(value)
+		}) {
+			Ok(revocations) => revocations,
+			Err(error) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			},
+		};
+		let current = match LockFile::read(&lock_path, Layer::Workspace).and_then(|lock| {
+			Ok(Generation {
+				lock,
+				installed: InstalledRecord::read(&workspace.join("installed.toml"))?,
+			})
+		}) {
+			Ok(current) => current,
+			Err(error) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			},
+		};
+		let target = current
+			.lock
+			.targets
+			.first()
+			.map_or("any", omp_core::Str::as_str);
+		let candidate = match resolve_candidate_generation(&current, &index, target) {
+			Ok(candidate) => candidate,
+			Err(error) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			},
+		};
+		let pins = match PinsFile::read(&data_dir.join("ext/pins.toml")) {
+			Ok(pins) => pins,
+			Err(error) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			},
+		};
+		let now = jiff::Timestamp::now().to_string();
+		let freshness = revocations.freshness(&now, false);
+		let report = match verify_candidate_generation(
+			&current,
+			&candidate,
+			&index,
+			&pins,
+			&revocations,
+			freshness,
+			target,
+		) {
+			Ok(report) => report,
+			Err(error) => {
+				return workspace_update_failure(
+					checked_at_ms,
+					error.code.to_string(),
+					error.detail.as_str(),
+				);
+			},
+		};
+		if !report.quarantined.is_empty() {
+			let quarantine_root = self.state_dir.join("ext");
+			let _ = fs::create_dir_all(&quarantine_root);
+			let _ = fs::write(
+				quarantine_root.join("quarantine.json"),
+				serde_json::to_vec_pretty(&report).unwrap_or_default(),
+			);
+			self.ext_hosts.quarantine(&report.quarantined).await;
+		}
+		pb::WorkspaceUpdateReport {
+			checked: true,
+			items: report
+				.items
+				.into_iter()
+				.map(|item| {
+					let refusal = item.refusal.map(update_refusal_wire);
+					pb::ExtensionUpdateItem {
+						id:           item.diff.id.to_string(),
+						from_version: item.diff.from_version.to_string(),
+						to_version:   item.diff.to_version.to_string(),
+						features:     item.diff.features.into_iter().map(String::from).collect(),
+						diff:         Some(pb::ExtensionUpdateDiff {
+							declaration_digest_from: item.diff.from_declaration_digest.to_string(),
+							declaration_digest_to:   item.diff.to_declaration_digest.to_string(),
+							capability_digest_from:  item.diff.from_capability_digest.to_string(),
+							capability_digest_to:    item.diff.to_capability_digest.to_string(),
+							manifest_digest_from:    item.diff.from_manifest_capability_digest.to_string(),
+							manifest_digest_to:      item.diff.to_manifest_capability_digest.to_string(),
+						}),
+						refusal:      refusal.map(|value| value as i32),
+					}
+				})
+				.collect(),
+			quarantined: report
+				.quarantined
+				.into_iter()
+				.map(|id| pb::ExtensionUpdateQuarantine {
+					id:      id.to_string(),
+					refusal: pb::ExtensionUpdateRefusal::Revoked as i32,
+					detail:  "startup generation is newly revoked".to_owned(),
+				})
+				.collect(),
+			failure: None,
+			checked_at_ms,
+		}
+	}
+
 	async fn dispatch(
 		&self,
 		frame: pb::ClientFrame,
@@ -3531,6 +3933,15 @@ impl EnvServer {
 					)
 					.await;
 				}
+			},
+			client_frame::Body::WorkspaceUpdateCheck(request) => {
+				let report = self.check_workspace_updates(request).await;
+				send_body(
+					responses,
+					frame.request_id,
+					server_frame::Body::WorkspaceUpdateReport(report),
+				)
+				.await;
 			},
 			client_frame::Body::RegisterPresence(request) => {
 				if policy.host.is_some() {
@@ -10127,6 +10538,7 @@ mod tests {
 			Arc::new(SearchBridgeHost::new(None)),
 			Arc::new(GithubCredentialBridge::new()),
 			omp_inference::operation::usage::UsageFetcherRegistry::default(),
+			omp_inference::ProviderResponseHooks::default(),
 			AgentCheckpointControl::default(),
 			StagedProposalRegistry::new(),
 			sessions_index,
@@ -11055,10 +11467,7 @@ mod tests {
 		.await
 		.expect("spawn document authority");
 		let response = documents
-			.lsp_status(
-				document_pb::LspStatusRequest { reload: false },
-				&CancellationToken::new(),
-			)
+			.lsp_status(document_pb::LspStatusRequest { reload: false }, &CancellationToken::new())
 			.await
 			.expect("lsp status");
 		let fake = response
