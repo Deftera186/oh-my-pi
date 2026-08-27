@@ -892,7 +892,7 @@ impl Component for EditInput {
 					typo_runs.push((
 						from - start,
 						to - start,
-						Style::new().underline().underline_color(pc.ctx.theme.err),
+						Style::new().undercurl().underline_color(pc.ctx.theme.err),
 					));
 					typo_cursor = to;
 				}

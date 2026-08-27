@@ -77,7 +77,7 @@ pub use editcore::{
 };
 pub use frame::{
 	Cell, CellContent, Color, Decor, DecorFill, DecorKind, Frame, Gradient, LinkId, Rect, Size,
-	Style, StyleSpec, with_link_url,
+	Style, StyleSpec, Underline, with_link_url,
 };
 pub use graphics::{
 	NotifyProtocol, ProbeParser, ProbeResults, TerminalCaps, TerminalId, TerminalPlatform, detect,

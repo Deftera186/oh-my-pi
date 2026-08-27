@@ -74,6 +74,8 @@ macro_rules! for_each_prop {
 			Italic("italic") => italic: bool;
 			/// Enables underlined text.
 			Underline("underline") => underline: bool;
+			/// Draws a curly underline (typo-squiggle shape).
+			Undercurl("undercurl") => undercurl: bool;
 			/// Swaps foreground and background colors.
 			Reverse("reverse") => reverse: bool;
 			/// Enables struck-through text.

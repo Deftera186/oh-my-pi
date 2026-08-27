@@ -643,6 +643,9 @@ impl Props {
 		if self.underline == Some(true) {
 			style = style.underline();
 		}
+		if self.undercurl == Some(true) {
+			style = style.undercurl();
+		}
 		if self.reverse == Some(true) {
 			style = style.reverse();
 		}
@@ -1157,7 +1160,7 @@ mod tests {
 			assert_eq!(name.parse(), Ok(prop));
 			count += 1;
 		}
-		assert_eq!(count, 99);
+		assert_eq!(count, 100);
 	}
 
 	#[test]

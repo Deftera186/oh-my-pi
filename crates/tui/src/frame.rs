@@ -404,6 +404,18 @@ fn intern_link(url: &str) -> Option<LinkId> {
 	Some(links.intern(url))
 }
 
+/// Underline shape carried by a [`Style`] (SGR `4` / `4:x`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Underline {
+	/// No underline.
+	#[default]
+	None,
+	/// Single straight underline (SGR `4`).
+	Straight,
+	/// Curly underline (SGR `4:3`), used for typo squiggles.
+	Curly,
+}
+
 /// Canonical visual attributes for one or more cells.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Style {
@@ -412,7 +424,7 @@ pub struct Style {
 	pub(super) bold:            bool,
 	pub(super) dim:             bool,
 	pub(super) italic:          bool,
-	pub(super) underline:       bool,
+	pub(super) underline:       Underline,
 	/// Underline color (SGR 58); also carries the Kitty placeholder
 	/// placement-ID reference on typed image cells.
 	pub(super) underline_color: Color,
@@ -430,7 +442,7 @@ impl Style {
 			bold:            false,
 			dim:             false,
 			italic:          false,
-			underline:       false,
+			underline:       Underline::None,
 			underline_color: Color::Default,
 			reverse:         false,
 			strikethrough:   false,
@@ -470,7 +482,13 @@ impl Style {
 
 	/// Enables underlining.
 	pub const fn underline(mut self) -> Self {
-		self.underline = true;
+		self.underline = Underline::Straight;
+		self
+	}
+
+	/// Enables a curly underline (SGR `4:3`), the typo-squiggle shape.
+	pub const fn undercurl(mut self) -> Self {
+		self.underline = Underline::Curly;
 		self
 	}
 
@@ -518,7 +536,9 @@ impl Style {
 		self.bold |= parent.bold;
 		self.dim |= parent.dim;
 		self.italic |= parent.italic;
-		self.underline |= parent.underline;
+		if matches!(self.underline, Underline::None) {
+			self.underline = parent.underline;
+		}
 		if matches!(self.underline_color, Color::Default) {
 			self.underline_color = parent.underline_color;
 		}
@@ -575,7 +595,7 @@ pub struct StyleSpec {
 	/// Italics.
 	pub italic:          bool,
 	/// Underlining.
-	pub underline:       bool,
+	pub underline:       Underline,
 	/// Underline color (SGR 58); [`Color::Default`] follows the foreground.
 	pub underline_color: Color,
 	/// Reverse video.

@@ -15,7 +15,7 @@ use crate::{
 	Graphics, TerminalCaps, debug,
 	debug::ScreenSnapshot,
 	escape::esc,
-	frame::{Cell, CellContent, Color, Frame, LinkId, Size, Style, with_link_url},
+	frame::{Cell, CellContent, Color, Frame, LinkId, Size, Style, Underline, with_link_url},
 	imagereg,
 	iterm2::{Iterm2Image, Iterm2Viewport, iterm2_output},
 	kitty::{
@@ -2372,8 +2372,10 @@ pub fn push_style_parameters(output: &mut String, style: Style, first: &mut bool
 	if style.italic {
 		push_parameter(output, first, "3");
 	}
-	if style.underline {
-		push_parameter(output, first, "4");
+	match style.underline {
+		Underline::None => {},
+		Underline::Straight => push_parameter(output, first, "4"),
+		Underline::Curly => push_parameter(output, first, "4:3"),
 	}
 	match style.underline_color {
 		Color::Default => {},
