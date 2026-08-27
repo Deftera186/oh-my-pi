@@ -92,6 +92,31 @@ impl DapConfigSource {
 			yaml,
 		}
 	}
+
+	/// Creates and validates a manifest contribution whose commands must name
+	/// lock-materialized binaries or explicitly granted environment executables.
+	pub fn manifest_checked(
+		identity: impl AsRef<str>,
+		bytes: impl Into<Arc<[u8]>>,
+		yaml: bool,
+		allowed_commands: impl IntoIterator<Item = Str>,
+	) -> Result<Self, DapConfigError> {
+		let source = Self::manifest(identity, bytes, yaml);
+		let allowed = allowed_commands
+			.into_iter()
+			.collect::<std::collections::BTreeSet<_>>();
+		let resolved = load_dap_config([], std::slice::from_ref(&source))?;
+		for adapter in resolved.values() {
+			let command = &adapter.command.value;
+			if command.contains('/') || command.contains('\\') || !allowed.contains(command) {
+				return Err(DapConfigError::UndeclaredManifestCommand {
+					adapter: adapter.name.clone(),
+					command: command.clone(),
+				});
+			}
+		}
+		Ok(source)
+	}
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -190,7 +215,19 @@ pub fn discover_native_dap_sources(
 	user_root: Option<&Path>,
 	project_root: &Path,
 ) -> Result<Vec<DapConfigSource>, DapConfigError> {
+	discover_native_dap_sources_with_manifests(user_root, project_root, Vec::new())
+}
+
+/// Enumerates extension-manifest, user, and project sources in increasing
+/// precedence; built-ins are merged before this returned list.
+pub fn discover_native_dap_sources_with_manifests(
+	user_root: Option<&Path>,
+	project_root: &Path,
+	mut manifests: Vec<DapConfigSource>,
+) -> Result<Vec<DapConfigSource>, DapConfigError> {
 	let mut sources = Vec::new();
+	manifests.sort_by(|left, right| left.provenance.source.cmp(&right.provenance.source));
+	sources.extend(manifests);
 	if let Some(user_root) = user_root {
 		append_existing(&mut sources, user_root, DapConfigSourceKind::User)?;
 		append_existing(&mut sources, &user_root.join("agent"), DapConfigSourceKind::User)?;
@@ -416,6 +453,14 @@ pub enum DapConfigError {
 	/// Wrong adapters shape.
 	#[error("DAP adapters field must be an object")]
 	AdaptersObject,
+	/// A manifest command was neither materialized nor explicitly granted.
+	#[error("manifest DAP adapter {adapter} references undeclared command {command}")]
+	UndeclaredManifestCommand {
+		/// Adapter declaration name.
+		adapter: Str,
+		/// Rejected command.
+		command: Str,
+	},
 	/// Invalid adapter declaration.
 	#[error("invalid DAP adapter {adapter}: {source}")]
 	InvalidAdapter {
@@ -498,5 +543,18 @@ mod tests {
 
 		assert!(adapter.skip_attach_request());
 		assert_eq!(adapter.merged_arguments(true, &Map::new())["skipAttachRequest"], true);
+	}
+
+	#[test]
+	fn manifest_commands_require_declared_executables() {
+		let bytes = br#"{"adapters":{"acme":{"command":"acme-dap"}}}"#;
+		assert!(DapConfigSource::manifest_checked("acme:dap", bytes.as_slice(), false, []).is_err());
+		let source =
+			DapConfigSource::manifest_checked("acme:dap", bytes.as_slice(), false, [Str::new_static(
+				"acme-dap",
+			)])
+			.unwrap();
+		let adapters = load_dap_config(empty::<DapAdapterSpec>(), &[source]).unwrap();
+		assert_eq!(adapters["acme"].command.provenance.kind, DapConfigSourceKind::Manifest);
 	}
 }

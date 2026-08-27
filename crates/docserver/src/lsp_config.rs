@@ -98,6 +98,31 @@ impl LspConfigSource {
 			yaml,
 		}
 	}
+
+	/// Creates and validates a manifest contribution whose commands must name
+	/// lock-materialized binaries or explicitly granted environment executables.
+	pub fn manifest_checked(
+		identity: impl AsRef<str>,
+		bytes: impl Into<Arc<[u8]>>,
+		yaml: bool,
+		allowed_commands: impl IntoIterator<Item = Str>,
+	) -> Result<Self, LspConfigError> {
+		let source = Self::manifest(identity, bytes, yaml);
+		let allowed = allowed_commands
+			.into_iter()
+			.collect::<std::collections::BTreeSet<_>>();
+		let resolved = load_lsp_config(std::slice::from_ref(&source))?;
+		for server in resolved.servers.values() {
+			let command = &server.command.value;
+			if command.contains('/') || command.contains('\\') || !allowed.contains(command) {
+				return Err(LspConfigError::UndeclaredManifestCommand {
+					server:  server.name.clone(),
+					command: command.clone(),
+				});
+			}
+		}
+		Ok(source)
+	}
 }
 
 /// Partially specified server declaration used during field-wise merging.
@@ -248,7 +273,19 @@ pub fn discover_native_lsp_sources(
 	user_root: Option<&Path>,
 	project_root: &Path,
 ) -> Result<Vec<LspConfigSource>, LspConfigError> {
+	discover_native_lsp_sources_with_manifests(user_root, project_root, Vec::new())
+}
+
+/// Enumerates built-in, extension-manifest, user, and project sources in
+/// increasing precedence.
+pub fn discover_native_lsp_sources_with_manifests(
+	user_root: Option<&Path>,
+	project_root: &Path,
+	mut manifests: Vec<LspConfigSource>,
+) -> Result<Vec<LspConfigSource>, LspConfigError> {
 	let mut sources = vec![bundled_lsp_defaults()?];
+	manifests.sort_by(|left, right| left.provenance.source.cmp(&right.provenance.source));
+	sources.extend(manifests);
 	if let Some(user_root) = user_root {
 		append_existing(&mut sources, user_root, LspConfigSourceKind::User)?;
 		append_existing(&mut sources, &user_root.join("agent"), LspConfigSourceKind::User)?;
@@ -544,6 +581,14 @@ pub enum LspConfigError {
 	/// `servers` must be an object.
 	#[error("LSP configuration servers field must be an object")]
 	ServersObject,
+	/// A manifest command was neither materialized nor explicitly granted.
+	#[error("manifest LSP server {server} references undeclared command {command}")]
+	UndeclaredManifestCommand {
+		/// Server declaration name.
+		server:  Str,
+		/// Rejected command.
+		command: Str,
+	},
 	/// A top-level setting had the wrong type.
 	#[error("invalid LSP configuration document: {source}")]
 	InvalidDocument {
@@ -616,5 +661,18 @@ mod tests {
 		assert_eq!(rust.warmup_timeout_ms.value, 321);
 		assert_eq!(rust.command.provenance.kind, LspConfigSourceKind::Builtin);
 		assert_eq!(rust.disabled.provenance.kind, LspConfigSourceKind::Project);
+	}
+
+	#[test]
+	fn manifest_commands_require_declared_executables() {
+		let bytes = br#"{"servers":{"acme":{"command":"acme-lsp","fileTypes":["rs"],"rootMarkers":["Cargo.toml"]}}}"#;
+		assert!(LspConfigSource::manifest_checked("acme:lsp", bytes.as_slice(), false, []).is_err());
+		let source =
+			LspConfigSource::manifest_checked("acme:lsp", bytes.as_slice(), false, [Str::new_static(
+				"acme-lsp",
+			)])
+			.unwrap();
+		let config = load_lsp_config(&[source]).unwrap();
+		assert_eq!(config.servers["acme"].command.provenance.kind, LspConfigSourceKind::Manifest);
 	}
 }

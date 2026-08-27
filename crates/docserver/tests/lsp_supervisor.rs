@@ -82,13 +82,15 @@ fn stage_of(supervisor: &NativeLspSupervisor, name: &str) -> LspServerState {
 #[tokio::test]
 async fn lazy_open_starts_matching_server_and_publishes_startup_stages() {
 	let scratch = TempDir::new().expect("scratch");
-	let project = scratch.path().canonicalize().expect("canonical project root");
+	let project = scratch
+		.path()
+		.canonicalize()
+		.expect("canonical project root");
 	fixture(&project);
 
 	let environment =
 		Environment::new(ServerConfig::new(project.clone()).expect("config")).expect("environment");
-	let supervisor =
-		NativeLspSupervisor::discover(&environment, None).expect("discover supervisor");
+	let supervisor = NativeLspSupervisor::discover(&environment, None).expect("discover supervisor");
 	environment.install_lsp_supervisor(supervisor.clone());
 	let mut events = environment.lsp().subscribe_events();
 
@@ -127,7 +129,10 @@ async fn lazy_open_starts_matching_server_and_publishes_startup_stages() {
 #[tokio::test]
 async fn failed_start_records_detail_and_keeps_roster_entry() {
 	let scratch = TempDir::new().expect("scratch");
-	let project = scratch.path().canonicalize().expect("canonical project root");
+	let project = scratch
+		.path()
+		.canonicalize()
+		.expect("canonical project root");
 	// Executable exists (passes discovery) but exits immediately without
 	// answering initialize, so startup fails.
 	let server = project.join("broken-lsp.py");
@@ -153,8 +158,7 @@ async fn failed_start_records_detail_and_keeps_roster_entry() {
 
 	let environment =
 		Environment::new(ServerConfig::new(project.clone()).expect("config")).expect("environment");
-	let supervisor =
-		NativeLspSupervisor::discover(&environment, None).expect("discover supervisor");
+	let supervisor = NativeLspSupervisor::discover(&environment, None).expect("discover supervisor");
 	environment.install_lsp_supervisor(supervisor.clone());
 
 	supervisor.notify_open(&project.join("main.foo"));
