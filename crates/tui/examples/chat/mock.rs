@@ -37,6 +37,7 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 
 	while let Ok(intent) = intents.recv_async().await {
 		match intent {
+			Intent::ExtensionShortcut(_) => {},
 			Intent::Submit { text, attachments, mode: _ } => {
 				if text == "/settings" {
 					let _ = events.send(BackendEvent::SettingsSchema(setting_rows(composer_style)));

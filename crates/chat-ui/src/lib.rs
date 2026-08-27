@@ -376,6 +376,16 @@ pub struct StatusFacts {
 	/// Separator used between visible status segments.
 	pub separator:              StatusSeparator,
 }
+
+/// Core-timed working indicator supplied by one extension command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkingIndicator {
+	/// Ordered animation frames, already display-width validated by the host.
+	pub frames:      Box<[Str]>,
+	/// Frame interval in milliseconds.
+	pub interval_ms: u64,
+}
+
 /// Reasoning effort represented by the model-status glyph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThinkingLevel {
@@ -509,6 +519,8 @@ pub enum Intent {
 	},
 	/// Abort the active turn.
 	Abort,
+	/// Invoke one app-owned extension shortcut already matched by the host.
+	ExtensionShortcut(Str),
 	/// Request one transient recap after the idle deadline expires.
 	IdleRecap,
 	/// Create a goal from the retained guided interview.
@@ -764,6 +776,13 @@ pub enum BackendEvent {
 		/// Delta text.
 		text: Str,
 	},
+	/// Atomically replace a streamed assistant message before settlement.
+	AssistantReplace {
+		/// Stable message identifier.
+		id:   Str,
+		/// Complete transformed markdown.
+		text: Str,
+	},
 	/// Finish a streamed assistant message.
 	AssistantEnd {
 		/// Stable message identifier.
@@ -905,6 +924,8 @@ pub enum BackendEvent {
 	Pause,
 	/// Request a host-level fresh session transition.
 	NewSessionRequested,
+	/// Request a host-level switch to an already-durable session.
+	SessionResumeRequested(Str),
 	/// Append an informational notice.
 	Notice(Str),
 	/// Append an error notice.
@@ -913,6 +934,12 @@ pub enum BackendEvent {
 	RetainedFrame(v1::RetainedFrameEnvelope),
 	/// Replace status facts.
 	Status(StatusFacts),
+	/// Replace the active turn's core-timed working indicator.
+	WorkingIndicator(WorkingIndicator),
+	/// Set every live and settled tool card's disclosure state.
+	ToolsExpanded(bool),
+	/// Replace the label used for hidden reasoning blocks.
+	HiddenThinkingLabel(Option<Str>),
 	/// Paint one ephemeral idle recap without adding it to transcript history.
 	Recap(Str),
 	/// Replace the idle recap scheduling policy.

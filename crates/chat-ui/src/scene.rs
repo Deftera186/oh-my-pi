@@ -30,7 +30,7 @@ use smallvec::SmallVec;
 use crate::{
 	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
 	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel, TodoHud,
-	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind,
+	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, WorkingIndicator,
 	blocks::{BlockOrdinal, Blocks},
 	completion::{CompletionChain, ReloadableSlashCommands},
 	frame::{FrameError, FrameMutation, RetainedFrames, render_frame_tml},
@@ -908,6 +908,12 @@ impl LiveAssistant {
 		false
 	}
 
+	fn replace(&mut self, text: &str) {
+		self.text = StrMut::new(text);
+		self.revealed = self.text.len();
+		let _ = self.view.set_text(LIVE_ASSISTANT_ID, text);
+	}
+
 	fn advance(&mut self, now: Duration, smooth: bool) -> bool {
 		if !smooth {
 			return self.flush();
@@ -1287,6 +1293,7 @@ struct WorkState {
 	labels:        StatusLabels,
 	elapsed_label: Option<(u64, Str)>,
 	active_brand:  StrMut,
+	indicator:     Option<WorkingIndicator>,
 	fade:          Tween<Color>,
 }
 
@@ -1308,7 +1315,14 @@ impl WorkState {
 			self.elapsed_label = Some((key, elapsed_label(elapsed)));
 		}
 		self.active_brand.truncate(0);
-		self.active_brand.push_str(charset.spinner().at(now));
+		if let Some(indicator) = &self.indicator {
+			let interval = Duration::from_millis(indicator.interval_ms.max(1));
+			let index = usize::try_from(now.as_millis() / interval.as_millis()).unwrap_or(0)
+				% indicator.frames.len();
+			self.active_brand.push_str(&indicator.frames[index]);
+		} else {
+			self.active_brand.push_str(charset.spinner().at(now));
+		}
 		self.active_brand.push(' ');
 		if let Some((_, label)) = &self.elapsed_label {
 			self.active_brand.push_str(label);
@@ -1687,8 +1701,26 @@ impl Component for ChatStatus {
 			.settles_at()
 			.min(pc.now.saturating_add(FADE_FRAME));
 		let animation_deadline = match (work.facts.working, work.fade.is_settled(pc.now)) {
-			(true, true) => Some(pc.ctx.charset.spinner().next_change(pc.now)),
-			(true, false) => Some(pc.ctx.charset.spinner().next_change(pc.now).min(fade_frame)),
+			(true, true) => Some(work.indicator.as_ref().map_or_else(
+				|| pc.ctx.charset.spinner().next_change(pc.now),
+				|indicator| {
+					pc.now
+						.saturating_add(Duration::from_millis(indicator.interval_ms.max(1)))
+				},
+			)),
+			(true, false) => Some(
+				work
+					.indicator
+					.as_ref()
+					.map_or_else(
+						|| pc.ctx.charset.spinner().next_change(pc.now),
+						|indicator| {
+							pc.now
+								.saturating_add(Duration::from_millis(indicator.interval_ms.max(1)))
+						},
+					)
+					.min(fade_frame),
+			),
 			(false, false) => Some(fade_frame),
 			(false, true) => None,
 		};
@@ -1773,6 +1805,8 @@ pub struct Chat {
 	smooth_streaming:        bool,
 	suppress_history_replay: bool,
 	hide_thinking:           bool,
+	hidden_thinking_label:   Option<Str>,
+	tools_expanded:          bool,
 }
 
 impl Chat {
@@ -1785,6 +1819,7 @@ impl Chat {
 			labels,
 			elapsed_label: None,
 			active_brand: StrMut::new(""),
+			indicator: None,
 			fade: Tween::settled(ctx.theme.muted),
 		}));
 		let style = ComposerStyle::default();
@@ -1842,6 +1877,8 @@ impl Chat {
 			smooth_streaming: true,
 			suppress_history_replay: false,
 			hide_thinking: false,
+			hidden_thinking_label: None,
+			tools_expanded: true,
 		}
 	}
 
@@ -1849,6 +1886,41 @@ impl Chat {
 	/// underlying transcript.
 	pub fn set_hide_thinking(&mut self, hide_thinking: bool) {
 		self.hide_thinking = hide_thinking;
+		self.bump_live();
+	}
+
+	/// Replaces the placeholder label associated with hidden reasoning.
+	pub fn set_hidden_thinking_label(&mut self, label: Option<Str>) {
+		self.hidden_thinking_label = label.clone();
+		if self.hide_thinking
+			&& let Some(label) = label
+		{
+			let width = Self::message_width(self.layout_width);
+			for entry in self.entries.values_mut() {
+				if let Entry::Thinking(thinking) = entry {
+					thinking.body = RichText::thinking(label.to_string(), width, &self.ctx);
+				}
+			}
+		}
+		self.bump_live();
+	}
+
+	/// Returns the global transcript tool-card disclosure state.
+	pub const fn tools_expanded(&self) -> bool {
+		self.tools_expanded
+	}
+
+	/// Applies one disclosure state to every current and future tool card.
+	pub fn set_tools_expanded(&mut self, expanded: bool) {
+		self.tools_expanded = expanded;
+		for tool in &mut self.live_tools {
+			tool.expanded = expanded;
+		}
+		for entry in self.entries.values_mut() {
+			if let Entry::Tool(tool) = entry {
+				tool.expanded = expanded;
+			}
+		}
 		self.bump_live();
 	}
 
@@ -2253,6 +2325,16 @@ impl Chat {
 		}
 	}
 
+	/// Replaces a matching streamed assistant body before settlement.
+	pub fn replace_assistant(&mut self, id: &str, text: &str) {
+		if let Some(message) = &mut self.live_assistant
+			&& message.id.as_str() == id
+		{
+			message.replace(text);
+			self.bump_live();
+		}
+	}
+
 	/// Finalizes a matching live assistant message with an immutable semantic
 	/// snapshot.
 	pub fn end_assistant(&mut self, id: &str) {
@@ -2275,6 +2357,14 @@ impl Chat {
 		let _ = message.flush();
 		if message.thinking {
 			if let Some(body) = sanitize_thinking_text(message.text.as_str(), true) {
+				let body = if self.hide_thinking {
+					self
+						.hidden_thinking_label
+						.as_ref()
+						.map_or(body, ToString::to_string)
+				} else {
+					body
+				};
 				let body = RichText::thinking(body, Self::message_width(self.layout_width), &self.ctx);
 				self
 					.entries
@@ -2362,7 +2452,7 @@ impl Chat {
 			name,
 			rev,
 			title,
-			expanded: true,
+			expanded: self.tools_expanded,
 			view: ToolView::plain(
 				Default::default(),
 				Self::tool_view_width(self.layout_width),
@@ -2701,6 +2791,9 @@ impl Chat {
 		}
 		let labels = StatusLabels::new(&facts, self.ctx.charset);
 		let mut work = self.work.borrow_mut();
+		if !facts.working {
+			work.indicator = None;
+		}
 		if work.facts.working != facts.working {
 			work.fade.retarget(
 				now,
@@ -2721,6 +2814,16 @@ impl Chat {
 		self
 			.editor_ui
 			.update_component::<EditorPane>(INPUT_ID, |_| true);
+		self.bump_live();
+	}
+
+	/// Replaces the active turn's core-timed working indicator.
+	pub fn set_working_indicator(&mut self, indicator: WorkingIndicator) {
+		let now = self.started_at.elapsed();
+		let mut work = self.work.borrow_mut();
+		work.indicator = Some(indicator);
+		work.update_active_brand(now, self.ctx.charset);
+		drop(work);
 		self.bump_live();
 	}
 
@@ -2929,6 +3032,9 @@ impl Chat {
 			BackendEvent::AssistantDelta { id, text } => {
 				self.append_assistant(id.as_str(), text.as_str());
 			},
+			BackendEvent::AssistantReplace { id, text } => {
+				self.replace_assistant(id.as_str(), text.as_str());
+			},
 			BackendEvent::AssistantEnd { id } => self.end_assistant(id.as_str()),
 			BackendEvent::AssistantAbandoned { id } => self.abandon_assistant(id.as_str()),
 			BackendEvent::ToolStarted { id, name, rev, title } => {
@@ -2956,6 +3062,9 @@ impl Chat {
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
+			BackendEvent::WorkingIndicator(indicator) => self.set_working_indicator(indicator),
+			BackendEvent::ToolsExpanded(expanded) => self.set_tools_expanded(expanded),
+			BackendEvent::HiddenThinkingLabel(label) => self.set_hidden_thinking_label(label),
 			BackendEvent::Recap(text) => {
 				if !self.is_working() && self.composer_empty() {
 					self.set_idle_recap(text);
@@ -3039,7 +3148,8 @@ impl Chat {
 			| BackendEvent::RawStreamClosed
 			| BackendEvent::CopyToClipboard(_)
 			| BackendEvent::Pause
-			| BackendEvent::NewSessionRequested) => return Some(event),
+			| BackendEvent::NewSessionRequested
+			| BackendEvent::SessionResumeRequested(_)) => return Some(event),
 		}
 		None
 	}
@@ -3263,7 +3373,10 @@ impl Chat {
 		// history under capacity pressure.
 		let mut settled = SmallVec::<(BlockOrdinal, u16), 8>::new();
 		for (ordinal, entry) in self.entries.range_mut(BlockOrdinal(frontier)..) {
-			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
+			if self.hide_thinking
+				&& self.hidden_thinking_label.is_none()
+				&& matches!(entry, Entry::Thinking(_))
+			{
 				continue;
 			}
 			Self::resize_entry(entry, content_width, &self.ctx);
@@ -3733,7 +3846,13 @@ impl Chat {
 		let mut total = 0_u32;
 		for ordinal in self.blocks.frontier()..live_end {
 			let height = match self.entries.get_mut(&BlockOrdinal(ordinal)) {
-				Some(entry) if self.hide_thinking && matches!(entry, Entry::Thinking(_)) => 0,
+				Some(entry)
+					if self.hide_thinking
+						&& self.hidden_thinking_label.is_none()
+						&& matches!(entry, Entry::Thinking(_)) =>
+				{
+					0
+				},
 				Some(entry) => {
 					Self::resize_entry(entry, content_width, &self.ctx);
 					u32::from(Self::entry_height(entry, content_width))
@@ -3807,7 +3926,10 @@ impl Chat {
 			let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal)) else {
 				continue;
 			};
-			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
+			if self.hide_thinking
+				&& self.hidden_thinking_label.is_none()
+				&& matches!(entry, Entry::Thinking(_))
+			{
 				continue;
 			}
 			Self::resize_entry(entry, width, &self.ctx);
@@ -3839,7 +3961,9 @@ impl Chat {
 		let mut frame_height = 0_u32;
 		for ordinal in range {
 			let entry_height = if let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal))
-				&& !(self.hide_thinking && matches!(entry, Entry::Thinking(_)))
+				&& !(self.hide_thinking
+					&& self.hidden_thinking_label.is_none()
+					&& matches!(entry, Entry::Thinking(_)))
 			{
 				Self::resize_entry(entry, width, &self.ctx);
 				u32::from(Self::entry_height(entry, width))
@@ -3861,7 +3985,10 @@ impl Chat {
 			let Some(entry) = self.entries.get(&BlockOrdinal(ordinal)) else {
 				continue;
 			};
-			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
+			if self.hide_thinking
+				&& self.hidden_thinking_label.is_none()
+				&& matches!(entry, Entry::Thinking(_))
+			{
 				continue;
 			}
 			y = y.saturating_add(Self::draw_entry(&mut frame, entry, y, width, &self.ctx));
@@ -4914,6 +5041,23 @@ mod tests {
 		for hidden in ["queued 4", "jobs 5", "retry 2", "dropped 7", "$2", "$3"] {
 			assert!(!text.contains(hidden), "minimal status leaked {hidden}: {text}");
 		}
+	}
+
+	#[test]
+	fn working_indicator_is_core_timed_and_cleared_at_turn_end() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_status(StatusFacts { working: true, ..StatusFacts::default() });
+		chat.set_working_indicator(WorkingIndicator {
+			frames:      vec![sf!("a"), sf!("b")].into_boxed_slice(),
+			interval_ms: 10,
+		});
+		chat
+			.work
+			.borrow_mut()
+			.update_active_brand(Duration::from_millis(15), chat.ctx.charset);
+		assert!(chat.work.borrow().active_brand.as_str().starts_with('b'));
+		chat.set_status(StatusFacts { working: false, ..StatusFacts::default() });
+		assert!(chat.work.borrow().indicator.is_none());
 	}
 
 	#[test]

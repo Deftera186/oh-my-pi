@@ -938,7 +938,7 @@ pub struct RetainedChatFrame<'a> {
 }
 
 /// One resolved configured chord and its semantic chat action.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputBinding {
 	/// Key emitted by the terminal's canonical default chord resolver.
 	pub key:    Key,
@@ -957,7 +957,7 @@ impl InputBinding {
 }
 
 /// Semantic application input accepted by the retained chat host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputAction {
 	/// Abort active work.
 	Interrupt,
@@ -993,10 +993,12 @@ pub enum InputAction {
 	ToggleLiveVoice,
 	/// Open Agent Hub.
 	AgentHub,
+	/// Dispatch one app-owned extension shortcut after local chord matching.
+	ExtensionShortcut(Str),
 }
 
 impl InputAction {
-	const fn host_key(self) -> Key {
+	fn host_key(self) -> Key {
 		match self {
 			Self::Interrupt => Key::JumpPrevious,
 			Self::Clear => Key::Ctrl('c'),
@@ -1015,6 +1017,7 @@ impl InputAction {
 			Self::ToggleVoice => Key::CtrlAlt('s'),
 			Self::ToggleLiveVoice => Key::CtrlAlt('l'),
 			Self::AgentHub => Key::Alt('a'),
+			Self::ExtensionShortcut(_) => Key::Function(0),
 		}
 	}
 
@@ -1321,6 +1324,9 @@ impl RetainedChat {
 			InputAction::ToggleVoice => send(&self.intents, Intent::ToggleStt),
 			InputAction::ToggleLiveVoice => send(&self.intents, Intent::ToggleLive),
 			InputAction::AgentHub => open_agents(&mut self.host, &self.ctx),
+			InputAction::ExtensionShortcut(chord) => {
+				send(&self.intents, Intent::ExtensionShortcut(chord))
+			},
 		}
 		RetainedChatEffect::Consumed
 	}
@@ -1392,6 +1398,10 @@ impl RetainedChat {
 			match self.events.try_recv() {
 				Ok(BackendEvent::NewSessionRequested) if self.exit_on_session_change => {
 					self.pending_exit = Some(HostExit::NewSession);
+					changed = true;
+				},
+				Ok(BackendEvent::SessionResumeRequested(session)) if self.exit_on_session_change => {
+					self.pending_exit = Some(HostExit::Resume(session));
 					changed = true;
 				},
 				Ok(BackendEvent::CopyToClipboard(text)) => {
@@ -1967,15 +1977,21 @@ async fn run_chat(
 											input_actions
 												.iter()
 												.find(|binding| binding.key == key)
-												.map(|binding| binding.action)
+												.map(|binding| binding.action.clone())
 										})
 										.flatten();
-									let key = mapped_action.map_or(key, InputAction::host_key);
+									if let Some(InputAction::ExtensionShortcut(chord)) =
+										mapped_action.as_ref()
+									{
+										send(intents, Intent::ExtensionShortcut(chord.clone()));
+										continue;
+									}
+									let key = mapped_action.clone().map_or(key, InputAction::host_key);
 									let action_enabled = |action| {
-										mapped_action == Some(action)
+										mapped_action.as_ref() == Some(&action)
 											|| !input_actions
 												.iter()
-												.any(|binding| binding.action == action)
+												.any(|binding| &binding.action == &action)
 									};
 									if host.overlay.is_some() {
 										let overlay = host.overlay.as_mut().expect("overlay present");
@@ -2240,6 +2256,10 @@ async fn run_chat(
 					backend = events.recv_async() => match backend {
 						Ok(BackendEvent::NewSessionRequested) if exit_on_session_change => {
 							requested_exit = HostExit::NewSession;
+							break;
+						},
+						Ok(BackendEvent::SessionResumeRequested(session)) if exit_on_session_change => {
+							requested_exit = HostExit::Resume(session);
 							break;
 						},
 						Ok(event) => {
@@ -2596,6 +2616,7 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 		BackendEvent::OpenAgentTree => open_agents(host, ctx),
 		BackendEvent::Pause => open_pause(host, ctx),
 		BackendEvent::NewSessionRequested => {},
+		BackendEvent::SessionResumeRequested(_) => {},
 		BackendEvent::LoginPanel { provider, event } => match &mut host.overlay {
 			Some(Overlay::Login { panel }) => panel.update(event),
 			_ => {

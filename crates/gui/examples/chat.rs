@@ -418,6 +418,7 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 	let _ = events.send(BackendEvent::ModelsUpdated { rows: models.clone(), current });
 	while let Ok(intent) = intents.recv() {
 		match intent {
+			Intent::ExtensionShortcut(_) => {},
 			Intent::Submit { text, attachments, mode: _ } => {
 				let turn = generation.fetch_add(1, Ordering::SeqCst) + 1;
 				let _ = events.send(BackendEvent::UserReplayed {
