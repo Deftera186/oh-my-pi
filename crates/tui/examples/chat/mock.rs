@@ -11,7 +11,7 @@ use std::{
 use flume::{Receiver, Sender};
 use omp_chat_ui::{
 	BackendEvent, CompactionBoundaries, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow,
-	SettingRow, StatusFacts, ThinkingLevel, ToolTerminal, ToolViewContent,
+	SettingRow, StatusFacts, ThinkingLevel, ToolTerminal, ToolViewContent, login_panel::LoginEvent,
 };
 use omp_core::{Str, sf};
 use omp_tui::components::ComposerStyle;
@@ -90,17 +90,20 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				let _ = events.send(BackendEvent::LoginProviders(providers()));
 			},
 			Intent::Login(Some(provider)) => {
-				let _ = events.send(BackendEvent::AuthPrompt {
-					message: Str::from(format!("Enter credential for {provider}")),
-					masked:  true,
+				let _ = events.send(BackendEvent::LoginPanel {
+					provider: provider.clone(),
+					event:    LoginEvent::Prompt {
+						message: Str::from(format!("Enter credential for {provider}")),
+						masked:  true,
+					},
 				});
 			},
 			Intent::AuthAnswer { value: _ } => {
-				let _ = events.send(BackendEvent::AuthPromptClose);
+				let _ = events.send(BackendEvent::LoginPanelClose);
 				let _ = events.send(BackendEvent::Notice(sf!("Credential accepted by mock backend.")));
 			},
 			Intent::AuthCancel => {
-				let _ = events.send(BackendEvent::AuthPromptClose);
+				let _ = events.send(BackendEvent::LoginPanelClose);
 			},
 			Intent::Resume(None) => {
 				let _ = events.send(BackendEvent::Sessions(sessions()));

@@ -7,7 +7,7 @@ use omp_tui::{
 	Dim, Icon, Key, Layer, Mouse, OverlayAnchor, OverlayOptions, Size, Ui, UiContext, UiEvent, dom,
 };
 use serde_json::Value;
-use strum::{Display, EnumString};
+use strum::{Display, EnumString, IntoStaticStr};
 use xutf::IntoAnsiStripped as _;
 
 use crate::{OverlayPanel, panel_divider};
@@ -122,7 +122,7 @@ pub struct McpCatalogEntry {
 }
 
 /// Live MCP lifecycle state.
-#[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq)]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum McpHealth {
 	/// Transport or initialization is in progress.
