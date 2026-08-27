@@ -30,7 +30,7 @@ use crate::{
 	paste::{dropped_paths, is_image_path},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
-	spelling::{SpellingAssist, SpellingFeatures},
+	spelling::{SpellingAssist, SpellingFeatures, TypoRange},
 	syntax::{SyntaxRun, highlight_xml, xml_comment_state},
 };
 /// Built-in composer chrome selected by the `composer.shape` setting.
@@ -283,6 +283,9 @@ pub struct EditInput {
 	spelling:          SpellingAssist,
 	spelling_features: SpellingFeatures,
 	spelling_mask:     SmallVec<Range<usize>, 8>,
+	/// Cursor position an in-flight autocorrect request was made at; the
+	/// correction only applies while the cursor still sits there.
+	correction_guard:  Option<usize>,
 }
 
 impl EditInput {
@@ -301,6 +304,7 @@ impl EditInput {
 			spelling:          SpellingAssist::new(),
 			spelling_features: SpellingFeatures::default(),
 			spelling_mask:     SmallVec::new(),
+			correction_guard:  None,
 		}
 	}
 
@@ -336,7 +340,8 @@ impl EditInput {
 	}
 
 	fn refresh_spelling(&mut self) {
-		if !self.spelling_features.typo_detection {
+		let features = self.spelling_features;
+		if !features.typo_detection && !features.autocomplete && !features.autocorrect {
 			self.spelling.clear();
 			return;
 		}
@@ -349,7 +354,55 @@ impl EditInput {
 				.map(|(start, end)| start..end),
 		);
 		self.spelling_mask.extend(code_ranges(self.editor.text()));
-		self.spelling.check(self.editor.text(), &self.spelling_mask);
+		if features.typo_detection {
+			self.spelling.check(self.editor.text(), &self.spelling_mask);
+		}
+	}
+
+	/// Applies an asynchronous platform correction while the buffer still
+	/// matches the requesting state (pi `tryAutocorrect` application).
+	fn apply_autocorrect(&mut self, range: &Range<usize>, replacement: &str) {
+		let Some(guard) = self.correction_guard.take() else {
+			return;
+		};
+		if !self.spelling_features.autocorrect || guard != self.editor.buffer().cursor() {
+			return;
+		}
+		// Re-insert the boundary character so the cursor lands after it.
+		let Some(boundary) = self.editor.text().get(range.end..guard) else {
+			return;
+		};
+		let insert = sf!("{replacement}{boundary}");
+		self.editor.apply_edit(range.start..guard, &insert);
+		self.refresh_keyword_spans();
+	}
+
+	/// After a boundary character lands, asks the platform for a confident
+	/// correction of the word preceding it (pi `tryAutocorrect` trigger).
+	fn request_autocorrect(&mut self, key: Key) {
+		self.correction_guard = None;
+		if !self.spelling_features.autocorrect {
+			return;
+		}
+		let boundary = match key {
+			Key::Space => ' ',
+			Key::Char(character) if is_word_boundary(character) => character,
+			_ => return,
+		};
+		let text = self.editor.text();
+		let cursor = self.editor.buffer().cursor();
+		// Emoji/emoticon expansion may have rewritten the just-typed character.
+		if !text[..cursor].ends_with(boundary) {
+			return;
+		}
+		let Some(range) = word_suffix_range(text, cursor - boundary.len_utf8()) else {
+			return;
+		};
+		if !is_prose_word(text, &self.spelling_mask, &range) {
+			return;
+		}
+		self.correction_guard = Some(cursor);
+		self.spelling.request_correction(text, range);
 	}
 
 	/// Applies native spelling feature gates.
@@ -678,6 +731,97 @@ fn word_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
 	(start < end).then_some(start..end)
 }
 
+/// pi's prose word-boundary class: whitespace or clause punctuation.
+const fn is_word_boundary(character: char) -> bool {
+	character.is_whitespace()
+		|| matches!(character, '.' | ',' | ';' | ':' | '!' | '?' | '"' | ']' | ')' | '}')
+}
+
+/// Byte range of the `[letter']+` word ending exactly at `end`.
+fn word_suffix_range(text: &str, end: usize) -> Option<Range<usize>> {
+	if end > text.len() || !text.is_char_boundary(end) {
+		return None;
+	}
+	let start = text[..end]
+		.char_indices()
+		.rev()
+		.find_map(|(at, character)| {
+			(!character.is_alphabetic() && character != '\'').then_some(at + character.len_utf8())
+		})
+		.unwrap_or(0);
+	(start < end).then_some(start..end)
+}
+
+/// Partial prose word ending at the cursor that platform autocomplete may
+/// extend (pi `getWordCompletion` gating): at least two characters, no word
+/// character immediately after the cursor, and prose by [`is_prose_word`].
+fn completion_prefix_range(
+	text: &str,
+	cursor: usize,
+	mask: &[Range<usize>],
+) -> Option<Range<usize>> {
+	if cursor > text.len() || !text.is_char_boundary(cursor) {
+		return None;
+	}
+	if text[cursor..]
+		.chars()
+		.next()
+		.is_some_and(|character| character.is_alphabetic() || character == '\'')
+	{
+		return None;
+	}
+	let range = word_suffix_range(text, cursor)?;
+	if text[range.clone()].chars().take(2).count() < 2 {
+		return None;
+	}
+	is_prose_word(text, mask, &range).then_some(range)
+}
+
+/// Whether `range` is user prose eligible for spelling assistance, mirroring
+/// pi's `isProseWord`: unmasked, no codeish characters or digits in the
+/// whitespace-delimited token, no camelCase, and not on a slash-command or
+/// arrow-prefixed line.
+fn is_prose_word(text: &str, mask: &[Range<usize>], range: &Range<usize>) -> bool {
+	if range.start >= range.end || range.end > text.len() {
+		return false;
+	}
+	if mask
+		.iter()
+		.any(|masked| masked.start < range.end && range.start < masked.end)
+	{
+		return false;
+	}
+	let token_start = text[..range.start]
+		.char_indices()
+		.rev()
+		.find_map(|(at, character)| {
+			character
+				.is_whitespace()
+				.then_some(at + character.len_utf8())
+		})
+		.unwrap_or(0);
+	let token_end = text[range.end..]
+		.char_indices()
+		.find_map(|(at, character)| character.is_whitespace().then_some(range.end + at))
+		.unwrap_or(text.len());
+	let mut previous_lowercase = false;
+	for character in text[token_start..token_end].chars() {
+		if matches!(character, '\\' | '/' | '@' | '_' | '=' | ':' | '{' | '}' | '[' | ']' | '<' | '>')
+			|| character.is_ascii_digit()
+			|| (previous_lowercase && character.is_uppercase())
+		{
+			return false;
+		}
+		previous_lowercase = character.is_lowercase();
+	}
+	let line_start = text[..range.start].rfind('\n').map_or(0, |at| at + 1);
+	let line_end = text[range.end..]
+		.find('\n')
+		.map_or(text.len(), |at| range.end + at);
+	let line = &text[line_start..line_end];
+	!line.trim_start().starts_with('/') && !line.starts_with("->") && !line.starts_with("=>")
+}
+
 impl Default for EditInput {
 	fn default() -> Self {
 		Self::new()
@@ -725,15 +869,28 @@ impl Component for EditInput {
 		if let Some((range, items)) = self.spelling.take_guesses() {
 			let _ = self.editor.show_replacements(range, items);
 		}
-		if spelling_changed {
-			pc.wake(self.slot, pc.now);
-		} else if self.spelling.awaiting() {
-			pc.wake(self.slot, pc.now.saturating_add(time::Duration::from_millis(16)));
+		if let Some((range, replacement)) = self.spelling.take_correction() {
+			self.apply_autocorrect(&range, &replacement);
 		}
 		pc.hits
 			.push(Hit { rect, slot: self.slot, tag: HitTag::Press });
 		let focused = pc.focus == Some(self.slot);
 		let text = self.editor.text();
+		let mut ghost = None;
+		if focused
+			&& self.spelling_features.autocomplete
+			&& let Some(range) =
+				completion_prefix_range(text, self.editor.buffer().cursor(), &self.spelling_mask)
+		{
+			self.spelling.request_completion(text, range.clone());
+			ghost = self.spelling.completion(text, &range);
+		}
+		let hint = self.editor.inline_hint().or(ghost);
+		if spelling_changed {
+			pc.wake(self.slot, pc.now);
+		} else if self.spelling.awaiting() {
+			pc.wake(self.slot, pc.now.saturating_add(time::Duration::from_millis(16)));
+		}
 		let atoms = self.editor.atom_ranges();
 		let layout = self.style.layout(pc.ctx.charset);
 		let input_width = self.text_width(rect.width, pc.ctx.charset);
@@ -884,8 +1041,13 @@ impl Component for EditInput {
 			}
 			let mut runs = overlay_chip_runs(&runs, &chips, content.text.len());
 			let mut typo_runs: SmallVec<(usize, usize, Style), 8> = SmallVec::new();
+			let typos: &[TypoRange] = if self.spelling_features.typo_detection {
+				self.spelling.typo_ranges()
+			} else {
+				&[]
+			};
 			let mut typo_cursor = 0;
-			for typo in self.spelling.typo_ranges() {
+			for typo in typos {
 				let from = typo.start.max(start);
 				let to = typo.end.min(scanned);
 				if from < to && from >= typo_cursor {
@@ -953,6 +1115,27 @@ impl Component for EditInput {
 				cursor,
 				cursor_style,
 			);
+			// Dim ghost text after an end-of-row cursor: the completion
+			// engine's usage hint or the platform word completion.
+			if let Some(hint) = &hint
+				&& cursor == Some(content.text.len())
+			{
+				let hint_x = x.saturating_add(cell_width(content.text)).saturating_add(1);
+				let hint_width = rect
+					.x
+					.saturating_add(layout.side_chrome)
+					.saturating_add(layout.gutter_width)
+					.saturating_add(input_width)
+					.saturating_sub(hint_x);
+				if hint_width > 0 {
+					let mut style = Style::new().fg(pc.ctx.theme.muted).dim();
+					if matches!(self.style, ComposerStyle::Field | ComposerStyle::Rail) {
+						style = style.bg(pc.ctx.theme.panel);
+					}
+					pc.frame
+						.put(hint_x, y, truncate_to_width(hint, hint_width).text, style);
+				}
+			}
 			if row == 0
 				&& text.is_empty()
 				&& let Some(placeholder) = self.props.str_of(Prop::Placeholder)
@@ -1006,6 +1189,31 @@ impl Component for EditInput {
 			self.spelling.request_guesses(self.editor.text(), range);
 			return Flow::Consumed;
 		}
+		if key == Key::Tab
+			&& self.spelling_features.autocomplete
+			&& self.editor.picker().is_none()
+			&& let Some(range) = completion_prefix_range(
+				self.editor.text(),
+				self.editor.buffer().cursor(),
+				&self.spelling_mask,
+			) && let Some(suffix) = self.spelling.completion(self.editor.text(), &range)
+		{
+			// pi: Tab materializes the ghost word completion, appending a
+			// space unless a boundary character already follows the cursor.
+			let cursor = self.editor.buffer().cursor();
+			let needs_space = self.editor.text()[cursor..]
+				.chars()
+				.next()
+				.is_none_or(|character| !is_word_boundary(character));
+			let insert = if needs_space {
+				sf!("{suffix} ")
+			} else {
+				suffix
+			};
+			self.editor.apply_edit(cursor..cursor, &insert);
+			self.refresh_keyword_spans();
+			return Flow::Consumed;
+		}
 		if key == Key::Enter && self.props.flag(Prop::Submit) {
 			// pi: Enter on a command row with nothing before its token
 			// applies the completion and submits it in one keypress.
@@ -1040,6 +1248,7 @@ impl Component for EditInput {
 		match self.editor.handle(key) {
 			EditOutcome::Changed => {
 				self.refresh_keyword_spans();
+				self.request_autocorrect(key);
 				if self.reconcile(ec.ctx) {
 					// The pane's attachment band changed height outside this
 					// leaf's own box.
@@ -2321,6 +2530,89 @@ mod tests {
 			.comp()
 			.downcast_ref::<EditorPane>()
 			.expect("UI root is an editor pane")
+	}
+	fn edit_input(ui: &Ui) -> &EditInput {
+		ui.root()
+			.comp()
+			.downcast_ref::<EditInput>()
+			.expect("UI root is an editor input")
+	}
+
+	fn assist_features(autocomplete: bool, autocorrect: bool) -> SpellingFeatures {
+		SpellingFeatures { typo_detection: false, autocomplete, autocorrect }
+	}
+
+	#[test]
+	fn completion_prefix_gating_mirrors_pi_prose_rules() {
+		// Eligible: cursor at the end of a two-plus character prose word.
+		assert_eq!(completion_prefix_range("say recei", 9, &[]), Some(4..9));
+		// A word character after the cursor means mid-word: ineligible.
+		assert_eq!(completion_prefix_range("say recei", 6, &[]), None);
+		// Single-character prefixes never complete.
+		assert_eq!(completion_prefix_range("say a", 5, &[]), None);
+		// Codeish tokens, camelCase, and digits are not prose.
+		assert_eq!(completion_prefix_range("src/recei", 9, &[]), None);
+		assert_eq!(completion_prefix_range("getFoo", 6, &[]), None);
+		assert_eq!(completion_prefix_range("x2recei", 7, &[]), None);
+		// Slash-command and arrow-prefixed lines are ineligible.
+		assert_eq!(completion_prefix_range("/model recei", 12, &[]), None);
+		assert_eq!(completion_prefix_range("-> recei", 8, &[]), None);
+		// Masked spans (code ranges, atomic chips) are ineligible.
+		assert_eq!(completion_prefix_range("say recei", 9, &[4..9]), None);
+	}
+
+	#[test]
+	fn tab_accepts_word_completion_with_trailing_space() {
+		let mut input = EditInput::new().with(Prop::Value, "recei");
+		input.set_spelling_features(assist_features(true, false));
+		input.spelling.seed_completion("recei", 0..5, "ved");
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Tab);
+		assert_eq!(edit_input(&ui).buffer().text(), "received ");
+	}
+
+	#[test]
+	fn tab_word_completion_skips_space_before_boundary() {
+		let mut input = EditInput::new().with(Prop::Value, "recei.");
+		input.set_spelling_features(assist_features(true, false));
+		input.spelling.seed_completion("recei.", 0..5, "ved");
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Left);
+		ui.handle_key(Key::Tab);
+		assert_eq!(edit_input(&ui).buffer().text(), "received.");
+	}
+
+	#[test]
+	fn ghost_word_completion_paints_dim_after_cursor() {
+		let mut input = EditInput::new().with(Prop::Value, "recei");
+		input.set_spelling_features(assist_features(true, false));
+		input.spelling.seed_completion("recei", 0..5, "ved");
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		let mut renderer = Renderer::new(Vec::new());
+		ui.present(&mut renderer, 10).unwrap();
+		let row = frame_row_text(ui.frame(), 0);
+		assert!(row.contains("recei ved"), "{row:?}");
+	}
+
+	#[test]
+	fn autocorrect_applies_only_while_cursor_is_stable() {
+		let corrected = |guard: Option<usize>| {
+			let mut input = EditInput::new().with(Prop::Value, "teh ");
+			input.set_spelling_features(assist_features(false, true));
+			input.correction_guard = guard;
+			input.spelling.seed_correction(0..3, "the");
+			let mut ui = Ui::from_root(input, 40, UiContext::default());
+			let mut renderer = Renderer::new(Vec::new());
+			ui.present(&mut renderer, 10).unwrap();
+			edit_input(&ui).buffer().text().to_owned()
+		};
+		// The cursor sits at byte 4 (after the boundary space) when stable.
+		assert_eq!(corrected(Some(4)), "the ");
+		// A moved cursor or missing request leaves the text alone.
+		assert_eq!(corrected(Some(2)), "teh ");
+		assert_eq!(corrected(None), "teh ");
 	}
 
 	#[test]

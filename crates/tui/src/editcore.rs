@@ -2017,6 +2017,16 @@ impl Editor {
 		EditOutcome::Changed
 	}
 
+	/// Applies a programmatic replacement (word completion, platform
+	/// autocorrect) as one undo unit, leaving the cursor after `insert`,
+	/// and re-queries completion state.
+	pub fn apply_edit(&mut self, range: Range<usize>, insert: &str) {
+		self.history_index = None;
+		self.history_query = None;
+		self.buffer.replace_range(range, insert);
+		self.refresh();
+	}
+
 	/// Inserts sanitized text at the cursor (pastes, programmatic prefill).
 	pub fn insert_text(&mut self, text: &str) -> EditOutcome {
 		self.history_index = None;
