@@ -860,6 +860,23 @@ impl EnvClient {
 		}
 	}
 
+	/// Runs one due-checked workspace extension update inspection.
+	///
+	/// The environment never rewrites the committed workspace lock; `auto`
+	/// therefore has notify semantics on this authority.
+	pub async fn check_workspace_updates(
+		&self,
+		request: env_wire::WorkspaceUpdateCheck,
+	) -> Result<env_wire::WorkspaceUpdateReport, ClientError> {
+		match self
+			.one_shot(client_frame::Body::WorkspaceUpdateCheck(request), None)
+			.await?
+		{
+			server_frame::Body::WorkspaceUpdateReport(report) => Ok(report),
+			_ => Err(ClientError::UnexpectedResponse { expected: "WorkspaceUpdateReport" }),
+		}
+	}
+
 	/// Registers this connection as one live project client.
 	///
 	/// The daemon durably publishes the lease and removes it if this connection
