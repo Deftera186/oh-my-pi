@@ -14,7 +14,7 @@
 > [`04-placement.md`](04-placement.md). `omp.BlobRef` and typed paths → [`11-env.md`](11-env.md).
 > `omp.env` request surface and env-side policy → [`11-env.md`](11-env.md).
 > Hook events and the failure table → [`05-hooks.md`](05-hooks.md).
-> The `xd` shell builtin, `@omp.tool`, and `omp.ToolPath` addressing → [`01-devices.md`](01-devices.md).
+> The `dyn` shell builtin, `@omp.tool`, and `omp.ToolPath` addressing → [`01-devices.md`](01-devices.md).
 > Consent presentation primitive → [`07-ui.md`](07-ui.md) §4.9.
 
 ---
@@ -258,7 +258,7 @@ both are packaging facts, so they belong here rather than in a performance note:
 *active* extension never boots an interpreter. Lazy spawn requires that every declared
 surface — devices, hooks, and the rest of §3.1.5's declaration table — be known from the
 **static manifest**, not from importing the extension. The table is authoritative for
-serving the device catalog behind `xd`, for the hook
+serving the device catalog behind `dyn`, for the hook
 subscription mask, and for every activation
 trigger; handshake `RegisterTools` verifies rather than defines. If registration were the
 source of truth, every installed extension would have to boot at session start and the
@@ -605,10 +605,10 @@ Three properties fall out, and downstream consumers may rely on them:
   is evidence the artifact was tampered with or built from different code than it claims.
   `omp ext verify` treats that divergence as an integrity failure (exit 4), not a warning.
 - The table is **exactly enough to avoid booting a child to answer "what exists"**: the
-  `xd` catalog listing, the hook
+  `dyn` catalog listing, the hook
   subscription mask, every activation trigger in §3.1.5, and
   the spawn decision all read from the manifest. Full schemas, docs, and examples come from
-  import, fetched by `xd <path> --help`, which may spawn
+  import, fetched by `dyn <path> --help`, which may spawn
   the child lazily — a deliberate
   model action and an acceptable place to pay for a boot. This is what makes per-extension
   host children affordable (§2.2).
@@ -645,7 +645,7 @@ check any backend's output.
 > `[[devices]]` had already dissolved into a `kind`, the ruling lands as a split of that
 > kind: `soft` and `hard` are two of **thirteen executable** kinds, and they state **intent, not
 > surface** — `@omp.tool` declares either, `@omp.device` lowers with implicit `soft`
-> intent, and the surface an intent gets (a catalog entry behind the `xd` shell builtin, or a
+> intent, and the surface an intent gets (a catalog entry behind the `dyn` shell builtin, or a
 > model-facing tool slot) is decided by the user's dynamic tool policy (`tools.policy`,
 > [`01-devices.md`](01-devices.md), which owns the decorators and the mode table).
 > Rev 2.1-internal correction: an earlier draft of this revision spelled the vocabulary
@@ -760,7 +760,7 @@ doc, which also defines the exact trigger event; this table owns which class app
 
 | `kind` | Static key | Class | Boots on | Owner |
 |---|---|---|---|---|
-| `soft` | `name@family.rev` (from `@omp.tool`, or `@omp.device` with implicit `soft` intent) | lazy | first `xd <path> --help` detail fetch or first `xd <path> [args…]` dispatch, or a direct slot call under `tools.policy = tool_only` ([`01-devices.md`](01-devices.md) owns the mode table) | [`01-devices.md`](01-devices.md) |
+| `soft` | `name@family.rev` (from `@omp.tool`, or `@omp.device` with implicit `soft` intent) | lazy | first `dyn <path> --help` detail fetch or first `dyn <path> [args…]` dispatch, or a direct slot call under `tools.policy = tool_only` ([`01-devices.md`](01-devices.md) owns the mode table) | [`01-devices.md`](01-devices.md) |
 | `hard` | `name@family.rev` + a named slot claim | lazy — the advertised schema is served from the manifest, so occupying a slot never boots the child | first dispatch or first detail fetch, as for `soft`; under the default `tools.policy = auto` the slot exists only under a `tools.hard` grant (§3.9.2) | [`01-devices.md`](01-devices.md) |
 | `hook` | `event/phase` | lazy; **eager-prompt when `failure = "fail-closed"`** | first delivery of a subscribed event; mandatory gates boot before the first prompt so admission never pays a boot inside its deadline | [`05-hooks.md`](05-hooks.md) |
 | `worker` | worker name | lazy | first `place="worker:<name>"` dispatch | [`04-placement.md`](04-placement.md) |
@@ -2991,9 +2991,9 @@ exists to prevent. The fix is clean because route-awareness already exists elsew
 The target behavior, fixed by the Rev 2.1 rulings, is stricter than a route filter alone
 and is parameterized by the user's dynamic tool policy (`tools.policy`,
 [`01-devices.md`](01-devices.md)): under the default `auto`, `advertise` lowers **core
-tools + granted hard tools; devices ride the `xd` builtin inside `shell`** — `kind="hard"` declarations admitted under a
+tools + granted hard tools; devices ride the `dyn` builtin inside `shell`** — `kind="hard"` declarations admitted under a
 `tools.hard` grant (§3.9.2) — and nothing else; `device_only` drops the hard set;
-`tool_only` drops the `xd` builtin and lowers every declaration as a slot, a prompt-cache and TTFT
+`tool_only` drops the `dyn` builtin and lowers every declaration as a slot, a prompt-cache and TTFT
 cost the user explicitly bought.
 
 #### 6.0.2 `live_hash` is not the availability identity
@@ -3019,7 +3019,7 @@ this namespace touches the slot digest.
 
 Extensions register with the **host**, never with the **model**. `RegisterTools`/`ToolDecl`
 (`toolhost.proto:52-64`) exist and are host-facing — the host must know a device's name,
-schema, rev, and constraints to serve the device catalog and help behind `xd` at all.
+schema, rev, and constraints to serve the device catalog and help behind `dyn` at all.
 Registration adds no schema slot to the model's request; the paths that do are a granted
 hard tool (§3.9.2) and the user's own `tools.policy = tool_only` setting
 ([`01-devices.md`](01-devices.md)) — a grant and a setting, never a registration. (Which,
@@ -3505,10 +3505,10 @@ missing and the other two are decoration.
   same mmap-and-point path the stdlib gets. That is a real win and a real complexity cost;
   it should be measured, not assumed.
 - **Resident host count** is the multiplier, and it is now the design's main cost. One child
-  per *active* extension, lazily spawned, so `omp ext list` and `xd` catalog listings
+  per *active* extension, lazily spawned, so `omp ext list` and `dyn` catalog listings
   cost zero interpreters (§3.1.5's manifest-generated declaration
-  table is what makes that possible). A child boots on first `xd <path> [args…]` dispatch
-  or first `xd <path> --help` detail fetch. What
+  table is what makes that possible). A child boots on first `dyn <path> [args…]` dispatch
+  or first `dyn <path> --help` detail fetch. What
   is shared across children of the same executable: the frozen stdlib blob, because it is
   `include_bytes!` static data in the binary and the OS page cache serves those read-only
   pages once. What is per-child: the unmarshalled subset actually imported, the interpreter
@@ -3768,6 +3768,6 @@ review round; reversals recorded here and at the point of change:
   dispatch path, not the per-invocation decision procedure" — and §2.3 item 2 and §6.3
   now cite it as decision text.
 
-**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+**Revision 2.2** — the `dyn` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `dyn` builtin of the embedded shell, inside the core `shell` tool: `dyn` lists the catalog (`dyn --q <text>` searches), `dyn <device> --help` returns docs plus schema-derived CLI usage, and `dyn <device> [args…]` (or `dyn <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `dyn resolve "<reason>"` / `dyn reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `dyn` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
 
-In this file, live deployment activation, catalog, and policy-mode prose now uses `xd`; under `tool_only`, the `xd` builtin is absent and declarations are lowered as model-facing slots.
+In this file, live deployment activation, catalog, and policy-mode prose now uses `dyn`; under `tool_only`, the `dyn` builtin is absent and declarations are lowered as model-facing slots.

@@ -867,7 +867,7 @@ Slots are listed in assembly order. "Writable" marks the slots extensions may ta
 | `conventions` | `FROZEN` | no | RFC 2119 legend, XML-tag authority rule. First bytes of every request omp ever sends. |
 | `role` | `FROZEN` | no | Agent identity and personality preset. |
 | `runtime` | `FROZEN` | **yes** | Harness capability announcements and the internal-URL catalog. An extension contributing a URL scheme documents it here. |
-| `tools` | `STABLE` | no | Core tool inventory and the device catalog exposed through the `xd` shell builtin. Devices reach this by registering (`docs/py/01-devices.md`), never by writing text. |
+| `tools` | `STABLE` | no | Core tool inventory and the device catalog exposed through the `dyn` shell builtin. Devices reach this by registering (`docs/py/01-devices.md`), never by writing text. |
 | `policy` | `STABLE` | **yes** | Tool-use policy and specialized-tool enforcement. A policy extension states its rules here so the model knows before it is denied (`docs/py/06-policy.md`). |
 | `workflow` | `FROZEN` | **yes** | The engineering-workflow lifecycle. |
 | `skills` | `STABLE` | **yes** | Skill inventory: `name: description` lines pointing at `skill://<name>`. |
@@ -1177,8 +1177,8 @@ that refusal is what lets sessions live on a remote machine or in a database.
 carry attributed usage, a real cancellation scope, and the epoch discipline above.
 
 **How the model reaches memory.** A device (`docs/py/01-devices.md`), not a registered tool.
-`xd recall --help` fetches the docs and schema-derived CLI usage when the model wants it;
-`xd recall [args…]` runs the query through the embedded shell. A memory backend that would have
+`dyn recall --help` fetches the docs and schema-derived CLI usage when the model wants it;
+`dyn recall [args…]` runs the query through the embedded shell. A memory backend that would have
 registered `recall`, `retain`, `reflect`, `memory_edit`, and `learn` — five schemas taxing every
 token of every turn under Lesson #6 — registers five devices and, under the default dynamic tool
 policy
@@ -1583,8 +1583,8 @@ def memory_policy(ctx: omp.PromptContext) -> str | None:
     # sits above every EPOCHAL and VOLATILE byte in the prompt and is never
     # invalidated by anything below it.
     return (
-        "Durable project memory is available through the `xd` shell builtin. Run "
-        "`xd recall --help` or `xd session_search --help` for usage before asking the "
+        "Durable project memory is available through the `dyn` shell builtin. Run "
+        "`dyn recall --help` or `dyn session_search --help` for usage before asking the "
         "user to repeat a decision. Memories are background knowledge; current "
         "instructions win."
     )
@@ -1782,7 +1782,7 @@ which is the sanctioned place to prototype a fifth patch op before it earns a fi
 slot; SlotClass class; sint32 priority; }` sent at `request_id` 0 during registration. This is
 also the precedent for the phrasing that matters — extensions register with the **host**, never
 with the model. `RegisterTools` exists because the host must know a device's name, schema, and
-rev to list it in `xd` and render `xd <name> --help`; `RegisterSlots` exists because the
+rev to list it in `dyn` and render `dyn <name> --help`; `RegisterSlots` exists because the
 assembler must know which bands to pull. Neither grows the model's tool array by one entry.
 
 `MessageRef` needs no new payload types, because it is a projection of fields
@@ -2027,7 +2027,7 @@ Satisfied by this design:
   `ContextResetEvent`.
 - `prompts.md:2-85` — the entire pi system-prompt builder maps onto the slot catalog:
   `<system-conventions>` → `conventions`, personality → `role`, internal-URL catalog →
-  `runtime`, tool inventory plus the device catalog and `xd` guidance → `tools`, `<skills>` →
+  `runtime`, tool inventory plus the device catalog and `dyn` guidance → `tools`, `<skills>` →
   `skills`, `<domain-rules>`/`<generic-rules>` → `rules`,
   `<workstation>`/`<repo-rules>`/`<dir-context>`/
   `<workspace-tree>` → `workspace`, delivery contract → `delivery`.
@@ -2052,7 +2052,7 @@ Conflicts we are choosing to accept:
 - `memory.md:9` auto-registers backend-specific tools (`retain`, `recall`, `reflect`,
   `memory_edit`, `learn`) into the model's tool set. Lesson #6 forbids that. They are devices.
   The observable consequence is that a model must fetch `recall`'s docs through
-  `xd recall --help` before its first recall; in exchange, every turn of every session gets its
+  `dyn recall --help` before its first recall; in exchange, every turn of every session gets its
   schema tokens and sampler grammar back.
 - `memory.md:117` and `memories/index.ts` resolve model **roles** (`default`, `smol`) but also
   allow a `providers.memoryModel` override to a concrete model. `omp.agents.completion` takes a
@@ -2324,6 +2324,6 @@ Changes this file made in the post-review revision, and the review points that d
   opt-in fate-sharing, durable approval tickets — instead of flagging it. Rev 2's flags
   are kept in prose as historical records.
 
-**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+**Revision 2.2** — the `dyn` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `dyn` builtin of the embedded shell, inside the core `shell` tool: `dyn` lists the catalog (`dyn --q <text>` searches), `dyn <device> --help` returns docs plus schema-derived CLI usage, and `dyn <device> [args…]` (or `dyn <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `dyn resolve "<reason>"` / `dyn reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `dyn` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
 
-In this file, the live prompt-slot and memory examples now present devices through the `xd` shell builtin, use `xd <device> --help` for discovery, and invoke memory without adding schemas to the model's tool array.
+In this file, the live prompt-slot and memory examples now present devices through the `dyn` shell builtin, use `dyn <device> --help` for discovery, and invoke memory without adding schemas to the model's tool array.

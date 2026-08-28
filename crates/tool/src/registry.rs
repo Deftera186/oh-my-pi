@@ -2243,7 +2243,7 @@ impl Registry {
 	/// Resolves a typed device path without admitting it to the model slot
 	/// catalog.
 	///
-	/// The optional sub-tool component remains owned by the `xd` router; the
+	/// The optional sub-tool component remains owned by the `dyn` router; the
 	/// registry resolves the root claim and its live semantic revision.
 	pub fn resolve_device(&self, path: &DevicePath) -> Result<DeviceTarget<'_>, DeviceIssue> {
 		if self.unmounted.read().contains_key(path.root()) {

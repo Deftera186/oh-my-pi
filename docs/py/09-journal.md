@@ -1251,10 +1251,10 @@ extensions instead returned `/tmp` paths and hoped.
 The sanctioned way to add capability is a device. This is worth being exact
 about, because it is the one place where minting an address and registering a
 schema are easy to confuse: `@omp.device` places a typed `omp.ToolPath`
-(`docs/py/01-devices.md`) in the device catalog behind the `xd` shell builtin,
+(`docs/py/01-devices.md`) in the device catalog behind the `dyn` shell builtin,
 with docs and a JSON schema the model fetches on demand with
-`xd <name> --help` and discovers with `xd` or `xd --q <text>`. It adds **zero**
-registered tool slots to any request; invocation runs `xd <name> [args…]` inside
+`dyn <name> --help` and discovers with `dyn` or `dyn --q <text>`. It adds **zero**
+registered tool slots to any request; invocation runs `dyn <name> [args…]` inside
 the core `shell` tool, where the schema-derived CLI maps arguments into one nested
 JSON document. No URL scheme is ever writable by declaring a device. Availability
 changes arrive as one
@@ -1960,7 +1960,7 @@ in shipped code.** `Registry::register_worker` inserts worker declarations into
 `advertise` (`:483-492`) lowers every `self.live` entry with no route filter
 despite a comment describing "one selected route." So a Python worker declaration
 occupies a slot in the model's advertised tool array today — exactly the failure
-the `xd` device transport exists to prevent, and exactly what the device paragraph
+the `dyn` device transport exists to prevent, and exactly what the device paragraph
 under `omp.Scheme` describes as costing "zero registered tool slots." That design is the target. The
 fix is clean because route-awareness already exists elsewhere: `invoke` checks
 route and refuses `ToolRoute::Worker` (`:476-478`), and `live_identities`
@@ -2572,6 +2572,6 @@ Changes this file made in response to the external review, by review point:
   durable approval tickets (`PLAN.md` §D5) — where Rev 2 flagged it as a
   recommendation. The Rev 2 flags are kept in prose as historical records.
 
-**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+**Revision 2.2** — the `dyn` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `dyn` builtin of the embedded shell, inside the core `shell` tool: `dyn` lists the catalog (`dyn --q <text>` searches), `dyn <device> --help` returns docs plus schema-derived CLI usage, and `dyn <device> [args…]` (or `dyn <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `dyn resolve "<reason>"` / `dyn reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `dyn` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
 
-- **Journal and scheme prose.** The live minting-versus-registering account now uses `xd` catalog, help, and invocation commands, identifies `shell` as the transport's core-tool target, and keeps devices out of the model's registered tool slots.
+- **Journal and scheme prose.** The live minting-versus-registering account now uses `dyn` catalog, help, and invocation commands, identifies `shell` as the transport's core-tool target, and keeps devices out of the model's registered tool slots.

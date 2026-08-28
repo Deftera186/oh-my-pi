@@ -1006,7 +1006,7 @@ device declaration field. To modify a user-issued shell command, declare a fail-
 composition means the next TRANSFORM receives that updated mapping. Use `None` as a value to unset
 a variable for the command. A device that executes its own subprocess does **not** trigger
 `user_bash`: it owns that effect and must pass the delta explicitly with
-`await omp.env.sh.run(script, env=delta)`. `xd` dispatch is likewise not shell execution. In both
+`await omp.env.sh.run(script, env=delta)`. `dyn` dispatch is likewise not shell execution. In both
 paths the delta is ephemeral and affects one run only.
 
 - **Raises** `TimedOut`, `Cancelled`, `Denied`, `EffectsNotAuthorized`, `Invalid`
@@ -1630,7 +1630,7 @@ async def edit_pro(args: EditProArgs, ctx: omp.Context):
 | `writeAtomic` temp-and-rename | The daemon's, not yours, and it is the only writer. |
 | 150 ms preview debounce + `previewGeneration` | `dry_run` against a pinned revision is cheap, deterministic, and cannot race the executor, because they are the same function against the same lease. |
 | `tool_result` hook re-reading after `write` | `EditResult` already tells you the committed revision, whether a rebase fired, whether formatting changed the text, and exactly which ranges moved. |
-| Disabling the built-in `edit` | Unnecessary by design: an extension's editor is a device dispatched through the `xd` builtin inside the core `shell` tool (`xd <device> [args…]`; soft/hard intent, surface decided by the dynamic tool policy — `docs/py/01-devices.md`), so by default it occupies no schema slot and competes with nothing. Note this is the target, not today's behaviour — see [Known defects](#known-defects-in-code-this-namespace-depends-on). |
+| Disabling the built-in `edit` | Unnecessary by design: an extension's editor is a device dispatched through the `dyn` builtin inside the core `shell` tool (`dyn <device> [args…]`; soft/hard intent, surface decided by the dynamic tool policy — `docs/py/01-devices.md`), so by default it occupies no schema slot and competes with nothing. Note this is the target, not today's behaviour — see [Known defects](#known-defects-in-code-this-namespace-depends-on). |
 
 The interesting part is what the port *gains*: `result.rebased` is now a queryable fact. "Show me
 every `edit_pro@hl.*` call where the fuzzy rebase fired and the model retried anyway" is a query,
@@ -2386,6 +2386,6 @@ Changes this file made for Rev 2, and the review point that drove each:
   durable approval tickets (`PLAN.md` §D5). Both Rev 2 flags are kept in prose as
   historical records.
 
-**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+**Revision 2.2** — the `dyn` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `dyn` builtin of the embedded shell, inside the core `shell` tool: `dyn` lists the catalog (`dyn --q <text>` searches), `dyn <device> --help` returns docs plus schema-derived CLI usage, and `dyn <device> [args…]` (or `dyn <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `dyn resolve "<reason>"` / `dyn reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `dyn` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
 
-- **Environment editor prose.** The live pi-mechanism table now routes extension editors through `xd` inside `shell` while preserving the dynamic-policy and zero-device-schema-slot claims.
+- **Environment editor prose.** The live pi-mechanism table now routes extension editors through `dyn` inside `shell` while preserving the dynamic-policy and zero-device-schema-slot claims.

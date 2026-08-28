@@ -253,7 +253,7 @@ These words have distinct roles; none is a Python verdict constructor:
 
 - A device **resolves successfully** by returning a `Payload`, directly or through `Done`.
 - A device **rejects an expected domain request** by returning a typed `Fault`. Do not raise the fault value.
-- A device that stages an environment proposal returns the proposal's typed payload. The model-facing `xd resolve "reason"` and `xd reject "reason"` commands act on the newest pending staged proposal; they are not calls your Python body makes.
+- A device that stages an environment proposal returns the proposal's typed payload. The model-facing `dyn resolve "reason"` and `dyn reject "reason"` commands act on the newest pending staged proposal; they are not calls your Python body makes.
 - `report_issue` is a reserved host device for recording an observed mismatch between a device's documentation and structured result. It is invoked separately with the session, device, revision, and a structured verdict; do not disguise an ordinary device fault as an issue report.
 
 `resolve`, `reject`, `propose`, and `report_issue` are reserved declaration names. Choose an extension-owned device name instead.

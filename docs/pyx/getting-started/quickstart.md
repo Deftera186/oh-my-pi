@@ -102,14 +102,14 @@ A fresh session discovers the manifest. The Python child remains lazy until the 
 
 ## 4. Invoke the tool
 
-Use the device catalog through the `xd` shell builtin:
+Use the device catalog through the `dyn` shell builtin:
 
 ```console
-$ xd word_count --text "one two three"
+$ dyn word_count --text "one two three"
 {"words": 3}
 ```
 
-If the catalog qualifies names by extension family in your session, use the path shown by `xd` when you list the catalog. The result is the value returned by `word_count`; omp performs schema decoding before the function runs.
+If the catalog qualifies names by extension family in your session, use the path shown by `dyn` when you list the catalog. The result is the value returned by `word_count`; omp performs schema decoding before the function runs.
 
 Complete a turn and inspect the extension logs to observe the `"turn completed"` record from the hook. Its fields include the zero-based turn index and number of calls.
 

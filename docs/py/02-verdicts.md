@@ -530,7 +530,7 @@ def prompt(self, view, caps):
                 out.push(f"\nFull list: {payload.full.url} (slice it like a file)\n")
             return out.finish()
         case omp.Faulted(fault):
-            hint = ' Retry with `xd lsp/restart`.' if fault.restartable else ""
+            hint = ' Retry with `dyn lsp/restart`.' if fault.restartable else ""
             return [omp.Part.text(f"language server unavailable ({fault.kind}): {fault.detail}.{hint}")]
 ```
 
@@ -1696,7 +1696,7 @@ add there.
 
 **Where the pure functions live matters.** `RegisterTools` (`toolhost.proto:61-64`) is
 host-facing registration — the host must know a device's name, schema, `rev`, and constraint
-to answer the device catalog and `xd <name> --help` request at all. That is registration with the *host*, never with the
+to answer the device catalog and `dyn <name> --help` request at all. That is registration with the *host*, never with the
 *model*; see `docs/py/01-devices.md`. Since the host already holds `ToolDecl.rev` (tag 2) and
 `InvokeTool.rev` (tag 5) echoes it back, `(name, rev)` keying for projection, lift, and the
 renderer fold needs no new identity plumbing at all.
@@ -2290,6 +2290,6 @@ type collided with `docs/py/05-hooks.md`'s decision type of the same name; renam
   Pattern 4 and open question 8 now cite the amended text as ratified where Rev 2 could
   only flag a recommended amendment; the historical flags are kept as records.
 
-**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+**Revision 2.2** — the `dyn` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `dyn` builtin of the embedded shell, inside the core `shell` tool: `dyn` lists the catalog (`dyn --q <text>` searches), `dyn <device> --help` returns docs plus schema-derived CLI usage, and `dyn <device> [args…]` (or `dyn <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `dyn resolve "<reason>"` / `dyn reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `dyn` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
 
-In this file, the restartable `Faulted` hint now says `xd lsp/restart`, and host-registration prose names the device catalog and `xd <name> --help`; the prior Revision 2.1 account remains unchanged.
+In this file, the restartable `Faulted` hint now says `dyn lsp/restart`, and host-registration prose names the device catalog and `dyn <name> --help`; the prior Revision 2.1 account remains unchanged.

@@ -193,7 +193,7 @@ CONTROL round-trip is tens of microseconds; the latency classes below describe
 how often a call is *appropriate*, not how fast it is.
 
 Symbols owned elsewhere are referenced, never redefined: `@omp.device`,
-`@omp.tool`, the `xd` shell builtin, `omp.ToolPath`, the dynamic tool policy, and
+`@omp.tool`, the `dyn` shell builtin, `omp.ToolPath`, the dynamic tool policy, and
 the `omp.Effects` envelope in `docs/py/01-devices.md`;
 `omp.Payload` / `omp.Fault` / `omp.PromptCaps`, `omp.CallOutcome`, and
 `@omp.renderer` in `docs/py/02-verdicts.md`; the invocation state machine
@@ -220,13 +220,13 @@ publisher-qualified identity in `docs/py/14-deploy.md`.
 Two facts from sibling namespaces are load-bearing here and are not restated
 anywhere below. First, an extension registers with the **host**, never with the
 **model**. The host must know a device's name, schema, and rev to answer the
-device catalog behind `xd` and `xd <name> --help` at all — that is what `RegisterTools` is for — but the
+device catalog behind `dyn` and `dyn <name> --help` at all — that is what `RegisterTools` is for — but the
 model's tool array never grows, and a change in what the model can reach arrives
 as one system-notification item rather than a re-registration. Every "spawn a
 subagent" capability in the Patterns section is therefore a device, and
 `omp.agents` itself is a namespace an extension *calls*, not something it
 declares: a session using it has a byte-identical registration set to one that
-does not. Second, an `xd` device dispatch fires exactly one `tool_call` with
+does not. Second, an `dyn` device dispatch fires exactly one `tool_call` with
 the RESOLVED `target=DeviceCall(...)` carrying decoded arguments — so a policy extension gating
 `subagent_spawn` sees the decoded spec, not an envelope to re-parse, and the user is
 never prompted twice for one delegation.
@@ -309,7 +309,7 @@ would make revival unfaithful.
 | `model` | `str \| None` | `None` | Model pattern or role alias (`"@smol"`, `"anthropic/claude-*"`). `None` inherits the parent's resolved model. What happens when the pattern resolves to no usable credential is `on_model_unavailable`'s decision, never an automatic downgrade. |
 | `on_model_unavailable` | `Literal["fail", "parent"]` | `"fail"` | Explicit fallback policy. `"fail"` refuses the spawn with `SpawnDenied`; `"parent"` runs on the parent's resolved model and sets `SubagentResult.model_fallback`. Revision 1 fell back silently and flagged it afterwards; the review is right that a model chosen for cost, privacy, or capability reasons must not be substitutable behind the caller's back, so the default refuses (`docs/py/13-inference.md` owns the inference-side fallback rules). |
 | `thinking` | `ThinkingLevel \| None` | `None` | Reasoning request. `None` takes the agent definition's level. |
-| `allowed_devices` | `frozenset[str] \| None` | `None` | Allowlist of device names (see `docs/py/01-devices.md`) the child may reach through the `xd` shell builtin inside the core `shell` tool. `None` inherits the parent's set. The empty frozenset yields a child with core tools only. |
+| `allowed_devices` | `frozenset[str] \| None` | `None` | Allowlist of device names (see `docs/py/01-devices.md`) the child may reach through the `dyn` shell builtin inside the core `shell` tool. `None` inherits the parent's set. The empty frozenset yields a child with core tools only. |
 | `disallowed_devices` | `frozenset[str]` | `frozenset()` | Subtracted after `allowed_devices` resolves. Use this to make a child a leaf for one capability without enumerating the rest. |
 | `isolation` | `Isolation` | `Isolation.CLEAN` | Context inheritance, above. |
 | `max_depth` | `int` | `1` | How deep a subtree the child may build beneath itself. `0` makes the child a hard leaf. Clamped by the Core against remaining session depth; a value above the remaining budget is silently reduced and reported in `SubagentHandle.effective_max_depth`. |
@@ -1444,8 +1444,8 @@ API never exposed.
 
 The omp version puts **nothing** in the model's tool array under the default
 dynamic tool policy (`docs/py/01-devices.md`). One device,
-registered with the host, discovered with `xd --q agent`, documented on
-demand with `xd agent --help`, and dispatched with `xd agent [args…]`.
+registered with the host, discovered with `dyn --q agent`, documented on
+demand with `dyn agent --help`, and dispatched with `dyn agent [args…]`.
 
 ```python
 import omp
@@ -2139,7 +2139,7 @@ Three things about the existing file shape this namespace's work:
 
 - **`RegisterTools` is host-facing, and `omp.agents` adds nothing to it.**
   Extensions register with the *host* — the host must know a device's name,
-  schema, rev, and constraints to answer the device catalog behind `xd` at all — and never
+  schema, rev, and constraints to answer the device catalog behind `dyn` at all — and never
   with the model. `omp.agents` is a namespace an extension *calls*, not a
   device it declares, so a session using it has a byte-identical `ToolDecl` set
   to one that does not.
@@ -2665,11 +2665,11 @@ worktree capability.
 - `task.md:3-21` makes `task` a registered tool with a dynamically generated
   schema. **Lesson #6 voids that.** `task` either is a core harness tool — one
   schema, in every request, because delegation is skeletal — or it is a device
-  dispatched through the `xd` shell builtin inside `shell` (soft/hard intent, surface decided by
+  dispatched through the `dyn` shell builtin inside `shell` (soft/hard intent, surface decided by
   the dynamic tool policy — `docs/py/01-devices.md`). It is never a
   plugin-registered schema slot. The dynamic-description
   machinery (agent roster, IRC status, isolation status) becomes device
-  documentation fetched on demand by `xd agent --help`, which costs zero TTFT
+  documentation fetched on demand by `dyn agent --help`, which costs zero TTFT
   when unused.
 - `task.md:90,195` (`subprocess-tool-registry.ts`) and everything else built
   around subprocess subagents. **Deleted, not ported.** Children are in-tree
@@ -2990,6 +2990,6 @@ Changes this file made for Revision 2, and the review point that drove each:
   durable approval tickets (`PLAN.md` §D5). Rev 2's flags and Revision 1's "not
   mine to make" quote are kept as historical records.
 
-**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+**Revision 2.2** — the `dyn` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `dyn` builtin of the embedded shell, inside the core `shell` tool: `dyn` lists the catalog (`dyn --q <text>` searches), `dyn <device> --help` returns docs plus schema-derived CLI usage, and `dyn <device> [args…]` (or `dyn <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `dyn resolve "<reason>"` / `dyn reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `dyn` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
 
-In this file, the live sibling facts, `allowed_devices` semantics, and agent-device pattern now use `xd` discovery, help, and dispatch through `shell`.
+In this file, the live sibling facts, `allowed_devices` semantics, and agent-device pattern now use `dyn` discovery, help, and dispatch through `shell`.
