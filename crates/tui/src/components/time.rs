@@ -2,6 +2,9 @@
 
 use std::{fmt::Write as _, time::Duration};
 
+use omp_core::{Str, fmts_mut};
+use strum::IntoStaticStr;
+
 use crate::{
 	component::{Component, PaintCtx, Slot, next_slot},
 	context::UiContext,
@@ -13,6 +16,8 @@ const SECOND_MS: u64 = 1_000;
 const MINUTE_MS: u64 = 60 * SECOND_MS;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
+const MONTH_MS: u64 = 30 * DAY_MS;
+const YEAR_MS: u64 = 365 * DAY_MS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -20,13 +25,22 @@ enum Mode {
 	Relative,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
 enum RelativeUnit {
+	#[strum(serialize = "")]
 	Now,
+	#[strum(serialize = "s")]
 	Second,
+	#[strum(serialize = "m")]
 	Minute,
+	#[strum(serialize = "h")]
 	Hour,
+	#[strum(serialize = "d")]
 	Day,
+	#[strum(serialize = "mo")]
+	Month,
+	#[strum(serialize = "y")]
+	Year,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,19 +123,7 @@ impl Time {
 			self.text.clear();
 			match key {
 				FormatKey::Duration(ms) => write_duration(&mut self.text, ms),
-				FormatKey::Relative(RelativeUnit::Now, _) => self.text.push_str("now"),
-				FormatKey::Relative(RelativeUnit::Second, value) => {
-					write!(self.text, "{value}s ago").expect("writing to String cannot fail");
-				},
-				FormatKey::Relative(RelativeUnit::Minute, value) => {
-					write!(self.text, "{value}m ago").expect("writing to String cannot fail");
-				},
-				FormatKey::Relative(RelativeUnit::Hour, value) => {
-					write!(self.text, "{value}h ago").expect("writing to String cannot fail");
-				},
-				FormatKey::Relative(RelativeUnit::Day, value) => {
-					write!(self.text, "{value}d ago").expect("writing to String cannot fail");
-				},
+				FormatKey::Relative(unit, value) => write_relative(&mut self.text, unit, value),
 			}
 			self.key = Some(key);
 		}
@@ -182,8 +184,31 @@ fn relative_parts(age: u64) -> (RelativeUnit, u64, u64) {
 		(RelativeUnit::Minute, age / MINUTE_MS, MINUTE_MS)
 	} else if age < DAY_MS {
 		(RelativeUnit::Hour, age / HOUR_MS, HOUR_MS)
-	} else {
+	} else if age < MONTH_MS {
 		(RelativeUnit::Day, age / DAY_MS, DAY_MS)
+	} else if age < YEAR_MS {
+		(RelativeUnit::Month, age / MONTH_MS, MONTH_MS)
+	} else {
+		(RelativeUnit::Year, age / YEAR_MS, YEAR_MS)
+	}
+}
+/// Formats an elapsed age in milliseconds as the compact relative label the
+/// `<time kind=relative>` tag paints ("now", "5s ago", "3mo ago") for plain
+/// string contexts that cannot host a live component.
+pub fn relative_age(age_ms: u64) -> Str {
+	let (unit, value, _) = relative_parts(age_ms);
+	match unit {
+		RelativeUnit::Now => Str::new_static("now"),
+		unit => fmts_mut!("{value}{} ago", <&str>::from(unit)).freeze(),
+	}
+}
+
+fn write_relative(out: &mut String, unit: RelativeUnit, value: u64) {
+	match unit {
+		RelativeUnit::Now => out.push_str("now"),
+		unit => {
+			write!(out, "{value}{} ago", <&str>::from(unit)).expect("writing to String cannot fail")
+		},
 	}
 }
 
@@ -254,6 +279,11 @@ mod tests {
 			(3_600_000, "1h ago", 3_600_000),
 			(86_399_999, "23h ago", 1),
 			(86_400_000, "1d ago", 86_400_000),
+			(2_591_999_999, "29d ago", 1),
+			(2_592_000_000, "1mo ago", 2_592_000_000),
+			(5_183_999_999, "1mo ago", 1),
+			(31_536_000_000, "1y ago", 31_536_000_000),
+			(63_071_999_999, "1y ago", 1),
 		];
 		for (age, expected, delta) in cases {
 			let mut time = relative(age);
@@ -278,10 +308,18 @@ mod tests {
 		for age in [u64::MAX - 1, u64::MAX] {
 			let mut saturated = relative(age);
 			let (text, wakes) = paint_at(&mut saturated, 10);
-			assert_eq!(text, format!("{}d ago", age / DAY_MS));
+			assert_eq!(text, format!("{}y ago", age / YEAR_MS));
 			assert!(wakes.is_empty());
 			assert_eq!(paint_at(&mut saturated, u64::MAX).0, text);
 		}
+	}
+
+	#[test]
+	fn relative_age_matches_painted_labels() {
+		assert_eq!(relative_age(0), "now");
+		assert_eq!(relative_age(59_000), "59s ago");
+		assert_eq!(relative_age(2_592_000_000), "1mo ago");
+		assert_eq!(relative_age(94_608_000_000), "3y ago");
 	}
 
 	#[test]

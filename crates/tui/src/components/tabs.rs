@@ -102,8 +102,7 @@ impl Tabs {
 	}
 
 	/// The chip's rendered icon glyph, or `""` when it has none.
-	fn icon_glyph(&self, ctx: &UiContext, index: usize) -> &'static str
-	{
+	fn icon_glyph(&self, ctx: &UiContext, index: usize) -> &'static str {
 		let name = &self.state.icons[index];
 		if name.is_empty() {
 			""
@@ -305,7 +304,11 @@ impl Component for Tabs {
 					focused || hovered,
 				);
 			} else {
-				let mut style = Style::new().fg(if hovered { ctx.theme.fg } else { ctx.theme.muted });
+				let mut style = Style::new().fg(if hovered {
+					ctx.theme.fg
+				} else {
+					ctx.theme.muted
+				});
 				if hovered {
 					style = style.underline();
 				}
@@ -319,8 +322,7 @@ impl Component for Tabs {
 				if chip.full || icon.is_empty() {
 					text_x = pc.frame.put(text_x, y, title, style);
 				}
-				pc.frame
-					.put(text_x, y, " ", Style::new().fg(ctx.theme.fg));
+				pc.frame.put(text_x, y, " ", Style::new().fg(ctx.theme.fg));
 			}
 			pc.hits.push(Hit {
 				rect: Rect::new(x, y, chip.end.saturating_sub(chip.start), 1),

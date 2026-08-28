@@ -1594,7 +1594,9 @@ fn finish_element(
 			*tabs.props_mut() = props;
 			for part in parts {
 				match part {
-					Parsed::Tab { title, icon, children, .. } => tabs = tabs.pane_icon(icon, title, children),
+					Parsed::Tab { title, icon, children, .. } => {
+						tabs = tabs.pane_icon(icon, title, children)
+					},
 					other => return Err(parent_error(other.name(), "tabs", at)),
 				}
 			}

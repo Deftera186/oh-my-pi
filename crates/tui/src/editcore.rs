@@ -1444,7 +1444,7 @@ pub struct Suggestion {
 
 impl Suggestion {
 	/// Builds a row: on acceptance `insert` replaces the completion's
-	/// prefix range verbatim; `label` is shown in the dropdown.
+	/// replacement range verbatim; `label` is shown in the dropdown.
 	pub fn new(insert: impl IntoStr, label: impl IntoStr) -> Self {
 		Self {
 			value:       insert.into_str(),
@@ -1542,11 +1542,11 @@ pub type SuggestionList = SmallVec<Suggestion, 8>;
 /// Ranked dropdown suggestions returned by [`EditorCompletion::suggest`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Suggestions {
-	/// Byte offset where the completed prefix starts; acceptance replaces
-	/// `prefix_start..cursor` with the chosen suggestion's insert text.
-	pub prefix_start: usize,
+	/// UTF-8 byte range replaced by the selected row. It must contain the
+	/// cursor; invalid or stale ranges close the dropdown.
+	pub range: ops::Range<usize>,
 	/// Rows in display order; empty closes the dropdown.
-	pub items:        SuggestionList,
+	pub items: SuggestionList,
 }
 
 /// Buffer edit returned by [`EditorCompletion::tab`]: replaces `range`
@@ -1616,11 +1616,11 @@ pub enum PickerRow<'a> {
 
 /// Active completion dropdown state.
 pub struct Picker {
-	prefix_start: usize,
-	suggestions:  SuggestionList,
-	selected:     usize,
+	range:       ops::Range<usize>,
+	suggestions: SuggestionList,
+	selected:    usize,
 	/// Produced by the registered engine (vs the built-in emoji dropdown).
-	provided:     bool,
+	provided:    bool,
 }
 
 impl Picker {
@@ -2081,10 +2081,7 @@ impl Editor {
 		items: impl IntoIterator<Item = Str>,
 	) -> bool {
 		if range.start >= range.end
-			|| range.end > self.buffer.text().len()
-			|| range.end != self.buffer.cursor()
-			|| !self.buffer.text().is_char_boundary(range.start)
-			|| !self.buffer.text().is_char_boundary(range.end)
+			|| !completion_range_is_valid(self.buffer.text(), self.buffer.cursor(), &range)
 		{
 			return false;
 		}
@@ -2096,8 +2093,7 @@ impl Editor {
 		if suggestions.is_empty() {
 			return false;
 		}
-		self.picker =
-			Some(Picker { prefix_start: range.start, suggestions, selected: 0, provided: false });
+		self.picker = Some(Picker { range, suggestions, selected: 0, provided: false });
 		true
 	}
 
@@ -2155,7 +2151,7 @@ impl Editor {
 		// Accepting an already-typed value is a no-op; re-querying would
 		// reopen the identical dropdown and trap Enter forever. Close the
 		// dropdown and let the next keypress act on the finished text.
-		if self.buffer.text()[picker.prefix_start..self.buffer.cursor()] == *suggestion.value {
+		if self.buffer.text()[picker.range.clone()] == *suggestion.value {
 			let cursor = self.buffer.cursor();
 			self.hint = self
 				.completion
@@ -2163,9 +2159,7 @@ impl Editor {
 				.and_then(|completion| completion.hint(self.buffer.text(), cursor));
 			return EditOutcome::Changed;
 		}
-		self
-			.buffer
-			.replace_range(picker.prefix_start..self.buffer.cursor(), &suggestion.value);
+		self.buffer.replace_range(picker.range, &suggestion.value);
 		self.refresh();
 		EditOutcome::Changed
 	}
@@ -2187,7 +2181,7 @@ impl Editor {
 	pub fn picker_enter_submits(&self) -> bool {
 		self.picker.as_ref().is_some_and(|picker| {
 			picker.suggestions[picker.selected].submits
-				&& self.buffer.text()[..picker.prefix_start].trim().is_empty()
+				&& self.buffer.text()[..picker.range.start].trim().is_empty()
 		})
 	}
 
@@ -2200,9 +2194,7 @@ impl Editor {
 			return;
 		};
 		let suggestion = &picker.suggestions[picker.selected];
-		self
-			.buffer
-			.replace_range(picker.prefix_start..self.buffer.cursor(), &suggestion.value);
+		self.buffer.replace_range(picker.range, &suggestion.value);
 		self.hint = None;
 	}
 
@@ -2213,15 +2205,17 @@ impl Editor {
 		let text = self.buffer.text();
 		let mut picker = self.completion.as_mut().and_then(|completion| {
 			let suggestions = completion.suggest(text, cursor)?;
-			(!suggestions.items.is_empty()).then_some(Picker {
-				prefix_start: suggestions.prefix_start,
-				suggestions:  suggestions.items,
-				selected:     0,
-				provided:     true,
+			(completion_range_is_valid(text, cursor, &suggestions.range)
+				&& !suggestions.items.is_empty())
+			.then_some(Picker {
+				range:       suggestions.range,
+				suggestions: suggestions.items,
+				selected:    0,
+				provided:    true,
 			})
 		});
 		if picker.is_none() && self.options.emoji {
-			picker = emoji_picker(&text[..cursor]);
+			picker = emoji_picker(text, cursor);
 		}
 		self.hint = self
 			.completion
@@ -2289,6 +2283,20 @@ impl Editor {
 			break;
 		}
 	}
+}
+
+fn completion_range_is_valid(text: &str, cursor: usize, range: &Range<usize>) -> bool {
+	range.start <= cursor
+		&& cursor <= range.end
+		&& range.end <= text.len()
+		&& text.is_char_boundary(range.start)
+		&& text.is_char_boundary(range.end)
+}
+
+fn completion_token_end(text: &str, cursor: usize) -> usize {
+	text[cursor..]
+		.find(char::is_whitespace)
+		.map_or(text.len(), |offset| cursor + offset)
 }
 
 /// One slash-command palette entry completed by [`SlashCommands`].
@@ -2425,7 +2433,12 @@ impl SlashCommands {
 			.find(|command| command.name == name || command.aliases.iter().any(|a| a == name))
 	}
 
-	fn name_suggestions(&self, line_start: usize, line: &str) -> Option<Suggestions> {
+	fn name_suggestions(
+		&self,
+		line_start: usize,
+		line: &str,
+		range_end: usize,
+	) -> Option<Suggestions> {
 		const SKILL_NAMESPACE: &str = "skill:";
 		let trimmed = line.trim_start_matches([' ', '\t']);
 		let body = trimmed.strip_prefix('/')?;
@@ -2503,7 +2516,7 @@ impl SlashCommands {
 			.into_iter()
 			.map(|(_, _, suggestion)| suggestion)
 			.collect::<SuggestionList>();
-		(!items.is_empty()).then_some(Suggestions { prefix_start, items })
+		(!items.is_empty()).then_some(Suggestions { range: prefix_start..range_end, items })
 	}
 
 	fn argument_suggestions(
@@ -2511,6 +2524,7 @@ impl SlashCommands {
 		cursor: usize,
 		body: &str,
 		delimiter: usize,
+		range_end: usize,
 	) -> Option<Suggestions> {
 		let (name, rest) = body.split_at(delimiter);
 		let partial = rest.trim_start_matches([' ', '\t', ':']);
@@ -2572,7 +2586,7 @@ impl SlashCommands {
 			.into_iter()
 			.map(|(_, suggestion)| suggestion)
 			.collect::<SuggestionList>();
-		(!items.is_empty()).then_some(Suggestions { prefix_start, items })
+		(!items.is_empty()).then_some(Suggestions { range: prefix_start..range_end, items })
 	}
 }
 
@@ -2674,12 +2688,13 @@ impl EditorCompletion for SlashCommands {
 		let line_start = before.rfind('\n').map_or(0, |index| index + 1);
 		let line = &before[line_start..];
 		let body = line.trim_start_matches([' ', '\t']).strip_prefix('/')?;
+		let range_end = completion_token_end(text, cursor);
 		if body.starts_with("skill:") && !body.contains(char::is_whitespace) {
-			return self.name_suggestions(line_start, line);
+			return self.name_suggestions(line_start, line, range_end);
 		}
 		match body.find(|ch: char| ch.is_whitespace() || ch == ':') {
-			Some(delimiter) => self.argument_suggestions(cursor, body, delimiter),
-			None => self.name_suggestions(line_start, line),
+			Some(delimiter) => self.argument_suggestions(cursor, body, delimiter, range_end),
+			None => self.name_suggestions(line_start, line, range_end),
 		}
 	}
 
@@ -2730,8 +2745,8 @@ impl EditorCompletion for SlashCommands {
 	}
 }
 
-fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
-	let (prefix_start, query) = emoji_trigger(text_before_cursor)?;
+fn emoji_picker(text: &str, cursor: usize) -> Option<Picker> {
+	let (prefix_start, query) = emoji_trigger(&text[..cursor])?;
 	let mut suggestions = SuggestionList::new();
 	let wanted = format!(":{query}");
 	for &(pattern, emoji) in EMOTICONS {
@@ -2773,8 +2788,24 @@ fn emoji_picker(text_before_cursor: &str) -> Option<Picker> {
 	if suggestions.is_empty() {
 		None
 	} else {
-		Some(Picker { prefix_start, suggestions, selected: 0, provided: false })
+		Some(Picker {
+			range: prefix_start..emoji_token_end(text, cursor),
+			suggestions,
+			selected: 0,
+			provided: false,
+		})
 	}
+}
+
+fn emoji_token_end(text: &str, mut cursor: usize) -> usize {
+	while text
+		.as_bytes()
+		.get(cursor)
+		.is_some_and(|byte| is_name_byte(*byte))
+	{
+		cursor += 1;
+	}
+	cursor
 }
 
 fn emoji_trigger(text: &str) -> Option<(usize, String)> {
@@ -2993,6 +3024,27 @@ mod tests {
 		assert_eq!(editor.handle_key(key(Key::Down)), EditOutcome::Changed);
 		assert_eq!(editor.handle_key(key(Key::Tab)), EditOutcome::Changed);
 		assert_eq!(editor.text(), "/settings ");
+	}
+
+	#[test]
+	fn replacement_picker_replaces_the_word_under_the_cursor() {
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.replace_external("teh", true);
+		assert_eq!(editor.handle_key(Key::Right), EditOutcome::Changed);
+		assert!(editor.show_replacements(0..3, [Str::new("the")]));
+		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
+		assert_eq!(editor.text(), "the");
+	}
+
+	#[test]
+	fn completion_replaces_text_after_the_cursor() {
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(AtNames));
+		type_text(&mut editor, "@alicex");
+		assert_eq!(editor.handle_key(Key::Left), EditOutcome::Changed);
+		assert!(editor.picker().is_some(), "exact prefix reopens the picker");
+		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
+		assert_eq!(editor.text(), "@alice ");
 	}
 	#[test]
 	fn command_frequency_breaks_equal_text_score_ties() {
@@ -3656,7 +3708,8 @@ mod tests {
 				.filter(|name| !query.is_empty() && name.starts_with(query))
 				.map(|name| Suggestion::new(sf!("@{name} "), *name))
 				.collect::<SuggestionList>();
-			(!items.is_empty()).then_some(Suggestions { prefix_start: at, items })
+			(!items.is_empty())
+				.then_some(Suggestions { range: at..completion_token_end(text, cursor), items })
 		}
 
 		fn hint(&mut self, text: &str, cursor: usize) -> Option<Str> {

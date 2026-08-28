@@ -188,7 +188,7 @@ pub use status::{
 pub use table::{Table, TableCell, TableRow};
 pub use tabs::Tabs;
 pub use text::{Pre, TextLeaf};
-pub use time::Time;
+pub use time::{Time, relative_age};
 pub use todo::{TaskStatus, Todo, TodoTask, collapse_hud_line};
 pub use tool_card::{ToolCard, ToolState};
 pub use tree::{Tree, TreeAnnotation, TreeNode};

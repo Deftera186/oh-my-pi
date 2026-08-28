@@ -81,10 +81,7 @@ impl SettingsOverlay {
 		let (mut event, claimed) = self.ui.handle_key_claimed(key);
 		// Global type-to-search: a printable key nothing claimed jumps to
 		// the search field and lands there, wherever focus was parked.
-		if !claimed
-			&& matches!(key, Key::Char(_))
-			&& self.ui.focus_id("settings-search")
-		{
+		if !claimed && matches!(key, Key::Char(_)) && self.ui.focus_id("settings-search") {
 			event = self.ui.handle_key_claimed(key).0;
 		}
 		match &event {

@@ -343,7 +343,7 @@ impl DeferredCompletion {
 			.map(|cached| locally_rank(&cached.items, query.query.as_str(), query.rule.max_results))
 	}
 
-	fn show(&mut self, query: &CompletionQuery, items: SuggestionList) {
+	fn show(&mut self, query: &CompletionQuery, text: &str, cursor: usize, items: SuggestionList) {
 		let hint = items.first().and_then(|item| {
 			item
 				.value()
@@ -351,7 +351,8 @@ impl DeferredCompletion {
 				.filter(|hint| !hint.is_empty())
 		});
 		self.ghost.store(hint.map(|hint| Arc::new(Str::new(hint))));
-		self.shown = Some(Suggestions { prefix_start: query.prefix_start, items });
+		self.shown =
+			Some(Suggestions { range: query.prefix_start..completion_token_end(text, cursor), items });
 	}
 }
 
@@ -363,7 +364,7 @@ impl EditorCompletion for DeferredCompletion {
 			return None;
 		};
 		if let Some(items) = self.cached(&query) {
-			self.show(&query, items);
+			self.show(&query, text, cursor, items);
 		} else if self.requested.as_ref() != Some(&query) {
 			self.shown = None;
 			if self.request.try_send(query.clone()).is_ok() {
@@ -376,6 +377,12 @@ impl EditorCompletion for DeferredCompletion {
 	fn hint(&mut self, _text: &str, _cursor: usize) -> Option<Str> {
 		self.ghost.load_full().as_deref().cloned()
 	}
+}
+
+fn completion_token_end(text: &str, cursor: usize) -> usize {
+	text[cursor..]
+		.find(char::is_whitespace)
+		.map_or(text.len(), |offset| cursor + offset)
 }
 
 fn locally_rank(items: &SuggestionList, query: &str, limit: usize) -> SuggestionList {
@@ -445,10 +452,10 @@ mod tests {
 	struct MentionCompletion;
 
 	impl EditorCompletion for MentionCompletion {
-		fn suggest(&mut self, text: &str, _cursor: usize) -> Option<Suggestions> {
+		fn suggest(&mut self, text: &str, cursor: usize) -> Option<Suggestions> {
 			text.starts_with('@').then(|| Suggestions {
-				prefix_start: 0,
-				items:        [Suggestion::new("@project", "@project")]
+				range: 0..completion_token_end(text, cursor),
+				items: [Suggestion::new("@project", "@project")]
 					.into_iter()
 					.collect(),
 			})
@@ -508,6 +515,21 @@ mod tests {
 			.into_iter()
 			.collect()
 		}
+	}
+
+	#[test]
+	fn deferred_completion_replaces_the_current_token() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let rule = CompletionRule::native("@", CompletionTrigger::Mention);
+		let mut completion = DeferredCompletion::new([rule], Arc::new(CountingCompletion { calls }));
+		let query = completion.query("@alixce", 3).expect("mention query");
+		completion.show(
+			&query,
+			"@alixce",
+			3,
+			[Suggestion::new("@alice", "alice")].into_iter().collect(),
+		);
+		assert_eq!(completion.shown.expect("visible completion").range, 0..7);
 	}
 
 	#[test]
