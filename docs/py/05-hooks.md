@@ -254,16 +254,11 @@ Every event carries three fixed properties, queryable at runtime:
   disk ([`14-deploy.md`](14-deploy.md)). Path-bearing event fields are therefore env-scoped URIs,
   never assumed-local paths.
 
-  **What exists today is one socket, and it carries no world access.** CONTROL exists in embryo as
-  `omp.toolhost.v1` stdio framing; the DATA edge is specified and partly wire-complete in
-  `omp.env.v1` but is not reachable from Python. `crates/app/src/envd/server.rs:177-181` holds
-  `_documents: DocumentHost`, `_document_authority: Option<DocumentAuthority>` and
-  `_workspace: WorkspaceHost` as underscore-prefixed fields — constructed, never dispatched — so
-  documents, fs, LSP and search have no reachable frame for a Python client even though exec, named
-  processes and blobs are wire-complete. Everything below that says "a hook uses `omp.env`" is the
-  target model; the additive path to it is in [`11-env.md`](11-env.md) and named in this document's
-  closing section. Until then, every hook in this catalog is CONTROL-only, which is sufficient for
-  every decision but not for the `omp.env` calls the worked examples show.
+  Both channels are live. CONTROL is the dedicated inherited, multiplexed `omp.toolhost.v1`
+  descriptor and carries hook dispatch and decisions, effects, host-initiated requests, and the
+  subscription mask without world access. Invocation-scoped DATA is reachable from Python through
+  `ExtensionEnvClient`; envd authenticates its invocation id, effect token, host generation, and
+  session generation before routing documents, workspace operations, processes, and blobs.
 - **Latency class.** How often the event can fire, hence what a handler may afford. CONTROL
   round-trip on a local socket is tens of microseconds; `SESSION`, `SUBMISSION`, `TURN`, `CALL` and
   `INPUT` hooks may do real work, `STREAM` hooks must be coalesced and cheap, `ASYNC` hooks are off
@@ -1113,12 +1108,14 @@ class SessionStartEvent:
 	trust: TrustTier
 	head_event: int
 	prompt_rev: str
+	previous_session: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class SessionShutdownEvent:
 	session_id: str
 	reason: ShutdownReason
 	budget: Duration
+	target_session: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class SessionRenamedEvent:
@@ -1627,15 +1624,15 @@ thread item naming the delta and leaves the request's tool array byte-identical,
 prefix cache survives
 ([`01-devices.md`](01-devices.md)) and `pi-cache-optimizer` has no counterpart here.
 
-That property does not hold in the shipped code yet, for two verified reasons.
-`Registry::advertise` (`crates/tool/src/registry.rs:483-492`) lowers every live entry with no route
-filter, so worker-routed declarations are in the advertised array (§2.5). And
-`Registry::live_hash` (`registry.rs:458-467`) is a single blake3 digest over *all* live identities,
-so using it as the prompt-cache identity would report a change whenever a device is enabled or
-disabled — falsifying availability-as-notification precisely when devices exist. The correction is
-the `slot_hash` / `device_hash` split specified in [`01-devices.md`](01-devices.md): the former over
-advertised core tools only, the latter over device availability, with `TurnStartEvent.toolset_hash`
-carrying the former.
+That property is enforced by the registry. `Registry::advertise` delegates to
+`advertise_matching`, which requires slot presentation and
+`is_model_callable(entry.tool.route())`; worker-routed devices never enter the model's advertised
+array (`crates/tool/src/registry.rs::advertise`, `::advertise_matching`,
+`::is_model_callable`). Cache identity is split as specified in
+[`01-devices.md`](01-devices.md): `Registry::slot_hash` covers policy-resolved model-visible slots,
+while `Registry::device_hash` covers device-catalog availability
+(`crates/tool/src/registry.rs::slot_hash`, `::device_hash`), with
+`TurnStartEvent.toolset_hash` carrying the former.
 
 Mutable fields: `tool_call.{target, args, cwd, deadline}` (REPLACE each),
 `tool_result.annotate` (APPEND), `tool_result.spill` (REPLACE), `device_list.devices` (INTERSECT).
@@ -1809,6 +1806,8 @@ class ModelChangedEvent:
 	to_model: ModelRef
 	role: str
 	reason: ModelChangeReason
+	previous_thinking: Effort | None = None
+	thinking: Effort | None = None
 
 @dataclass(frozen=True, slots=True)
 class CredentialDisabledEvent:
@@ -1816,6 +1815,10 @@ class CredentialDisabledEvent:
 	account: str | None
 	cause: str
 ```
+`model_changed` fires immediately when either the selected model or its effective thinking effort
+changes. A thinking-only change repeats the same model in `from_model` and `to_model` and reports
+the transition through `previous_thinking` and `thinking`; extensions need not wait for the next
+`turn_start` to observe it.
 
 ```python
 class ModelChangeReason(enum.StrEnum):
@@ -2496,44 +2499,22 @@ the protobuf files themselves.
   pattern to copy, including the async interrupt path (`PyThreadState_SetAsyncExc` with
   `PyExc_KeyboardInterrupt`).
 
-### What does not exist yet, and known defects
+### Implementation status and bounded gaps
 
-Four verified gaps and two verified defects bound what this document can honestly claim. Each is
-stated here rather than worked around, and none is fixed as part of this documentation work.
+The joined Python host has both live edges: multiplexed CONTROL carries hook dispatch and
+decisions, UI effects, host-initiated requests, and the subscription mask; invocation-scoped DATA
+routes through the extension's generation-fenced `ExtensionEnvClient`. The registry applies
+`is_model_callable` during advertisement and exposes separate `slot_hash` and `device_hash`
+identities. `ToolComplete.kind` carries the four `OutcomeKind` branches at tag 16, and envd's
+`SpillDiverter` implements `VerdictSpill`.
 
-**Gap 1 — there is no DATA edge from Python.** The two-socket topology is the target, not the
-present. `crates/app/src/envd/server.rs:177-181` holds `_documents: DocumentHost`,
-`_document_authority: Option<DocumentAuthority>` and `_workspace: WorkspaceHost` as
-underscore-prefixed, constructed-never-dispatched fields, so documents, fs, LSP and search have no
-reachable frame for a Python client, while exec, named processes and blobs are wire-complete in
-`env.proto`. Consequence for this document: every hook in §3.11 works CONTROL-only, but the
-`omp.env` calls in the worked examples do not. The additive path is
-[`11-env.md`](11-env.md)'s — pass the env UDS path in one `OMP_*` variable beside `OMP_PY_SITE`, and
-let `EnvServer::serve_io` accept the connection, since it already takes any
-`AsyncRead + AsyncWrite` and differentiates per connection via `ConnectionPolicy`.
-
-**Gap 2 — devices currently occupy model tool slots.** `Registry::advertise`
-(`crates/tool/src/registry.rs:483-492`) lowers all of `self.live` with no route filter, despite its
-own doc comment at L482 saying "for one selected route", and `register_worker` (`registry.rs:413-426`)
-puts worker declarations into `self.live` at L424. `Registry::invoke` (`registry.rs:476-478`) does
-check the route and refuses `ToolRoute::Worker`, and `live_identities` (`registry.rs:437-443`)
-documents that callers must inspect `route` first — so route-awareness exists and `advertise` simply
-does not use it. Until it does, Lesson #6 is violated in shipped code and §3.11's `device_list`
-notes describe the target. Related: `live_hash` (`registry.rs:458-467`) is one digest over all live
-identities, so it cannot serve as prompt-cache identity once devices exist; `TurnStartEvent`'s
-`toolset_hash` needs the `slot_hash` / `device_hash` split from [`01-devices.md`](01-devices.md).
-
-**Gap 3 — `ToolComplete.is_error` cannot express the four outcome branches.** It is a single `bool`
-(`toolhost.proto:95`), so a Python-hosted device cannot distinguish `Verdict::Fault` from
-`Verdict::Args` or `Verdict::Aborted` across the toolhost boundary, and `ToolResultEvent.outcome`
-will report `FAULTED` where `ARGS_REJECTED` or `ABORTED` is true. Fix shape: an additive
-`OutcomeKind kind = 16` whose absence keeps meaning `is_error`.
-
-**Gap 4 — `Tool::lift` and `VerdictSpill` are contracts without implementations.**
-`Tool::lift` defaults to `None` (`crates/tool/src/lib.rs:214`), so no device migrates history today
-even though `Registry::project` implements the walk; `VerdictSpill` (`lib.rs:436-442`) is a trait
-with no wired env implementation. `ToolResultEvent.artifact` is therefore always `None` in practice,
-and `tool_result`'s `spill` override has nothing to override yet.
+The emission ledger is
+[`.plan/ext-gaps/emit-coverage.md`](../../.plan/ext-gaps/emit-coverage.md). Every non-tombstoned
+ordinal is wired except `provider_login`, `provider_refresh`, `provider_sign`, `models_discover`,
+`capability_budget`, and `worker_state`; those six await the owning provider-callback or worker
+lifecycle authority rather than a fabricated emit. Partial payload facts at otherwise real emit
+sites are recorded in
+[`.plan/ext-gaps/emit-remainder.md`](../../.plan/ext-gaps/emit-remainder.md).
 
 **Defect 1 — `omp_remote.py` framing.** Two distinct exposures, and the first is the serious one.
 (a) *Authentication is opt-in and defaults to off.* `serve(sock, authkey=None)`

@@ -858,6 +858,51 @@ disabled, or unroutable models raise the host's typed model-switch error.
 `omp.Context.current().model` and `.thinking` expose the callback's immutable
 current values.
 
+#### `async omp.agents.abort() -> None`
+
+CONTROL, per-call, fail-closed. Requests the same out-of-band interruption as
+the interactive interrupt action. The acknowledgement means Core accepted the
+request; the active model stream or tool batch settles through its normal
+interrupted path. Requires `EFFECTS_AUTHORIZED`.
+
+#### `async omp.agents.shutdown(reason: str = "") -> None`
+
+CONTROL, per-session, fail-closed. Requests a graceful interactive-session
+shutdown through the user-quit path. Active work is interrupted, the loop is
+allowed to settle, and the bounded `session_shutdown` hooks run before the host
+exits. `reason` is an optional operator diagnostic; the lifecycle event remains
+the typed `ShutdownReason.USER_EXIT`. Requires `EFFECTS_AUTHORIZED`.
+
+#### `async omp.agents.reload_extensions() -> None`
+
+CONTROL, per-session, fail-closed. Triggers the existing supervised
+extension-host hot-reload. The request acknowledges scheduling; each reloadable
+host drains its active callback before its generation is replaced. Requires
+`EFFECTS_AUTHORIZED`.
+
+#### `async omp.agents.is_idle() -> bool`
+
+CONTROL, per-call, read-only. Returns whether the main agent loop is currently
+waiting for work.
+
+#### `async omp.agents.wait_for_idle() -> None`
+
+CONTROL, per-call, read-only. Returns immediately when the main agent is idle,
+otherwise waits for its next transition to idle.
+
+#### `async omp.agents.pending_messages() -> int`
+
+CONTROL, per-call, read-only. Returns the number of interrupts retained for a
+future main-agent mailbox drain, including queued producer, peer, schedule, and
+continuation messages.
+
+Abort and shutdown have durable `OperationSpec` metadata; reload is an
+ephemeral Core effect. All three require a minimum phase of
+`EFFECTS_AUTHORIZED`. The three introspection requests are
+ephemeral and legal from `OPEN` until settlement. They are async because
+extension actors cross the CONTROL boundary; pi's corresponding synchronous
+booleans depended on sharing the agent process.
+
 #### `async omp.agents.inject(prompt: str, *, mode: DeliveryMode = DeliveryMode.NEXT_TURN, visible: bool = False, role: Literal["user", "system"] = "system", session: str | None = None) -> Receipt`
 
 - CONTROL, per-call, fail-closed.

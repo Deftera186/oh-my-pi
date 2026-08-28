@@ -393,6 +393,9 @@ fn discover_roster(
 
 /// Matches `fileTypes` entries by extension equality (dot- and
 /// case-insensitive) or exact file-name equality.
+///
+/// Entries with a leading dot are extension specs only: a dotfile literally
+/// named like the spec (`.rs`) never matches by name.
 fn matches_path(file_types: &[Str], path: &Path) -> bool {
 	let Some(name) = path.file_name().and_then(OsStr::to_str) else {
 		return false;
@@ -405,7 +408,8 @@ fn matches_path(file_types: &[Str], path: &Path) -> bool {
 	file_types.iter().any(|file_type| {
 		let normalized = file_type.as_str().to_ascii_lowercase();
 		let dotless = normalized.strip_prefix('.').unwrap_or(&normalized);
-		extension.as_deref() == Some(dotless) || dotless == file_name || normalized == file_name
+		extension.as_deref() == Some(dotless)
+			|| (!normalized.starts_with('.') && dotless == file_name)
 	})
 }
 

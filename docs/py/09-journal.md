@@ -442,6 +442,14 @@ read. Backed by `Kind::Label` (`event.rs:326-332`).
 
 **Channel** CONTROL. **Latency class** per-event. **Failure** fail-closed.
 
+#### `async omp.journal.label_of(target) -> str | None`
+
+Returns the latest live label assignment for an addressable entry. A durable
+clear written by `label(target, None)` resolves to `None`; callers never need
+to scan `Label` events or guess whether a later rewind abandoned an assignment.
+
+**Channel** CONTROL. **Latency class** per-command. **Failure** fail-closed.
+
 #### `omp.journal.decode(raw) -> Any`
 
 Parses the verbatim `data` bytes of an entry into plain Python values. Only
@@ -682,6 +690,20 @@ The fork/handoff chain reaching a session, oldest first. Backed by
 `Kind::ForkedFrom` (`event.rs:277-283`), so it is durable lineage rather than
 inference from filenames — which is what pi's advisor/subagent classifier had to
 do, keying off `__advisor.jsonl` basenames and path layout.
+
+#### `async omp.sessions.tree(session_id=None) -> tuple[omp.SessionNode, ...]`
+
+Materializes the physical journal as immutable root nodes in durable order.
+Each `SessionNode` has `id`, `parent`, `kind`, `ts`, `data`, resolved `label`,
+and nested `children`. Rewinds form sibling branches. Broken parent references
+are returned as additional roots rather than dropping durable records.
+
+#### `async omp.sessions.branch(from_id=None) -> tuple[omp.SessionNode, ...]`
+
+Returns one root-first path. `from_id` accepts an `EntryId` (including another
+visible session) or a non-negative physical index in the current session.
+Omitting it selects the current live leaf. An unknown entry returns an empty
+path.
 
 #### `omp.sessions.SessionSetup` and `async omp.sessions.create(setup=SessionSetup())`
 

@@ -2156,6 +2156,21 @@ merge behavior. Exit 0 if already in the requested state.
 Any mutation re-resolves (R11) and may therefore fail with exit 3 or require consent
 (a feature's capabilities change the digest). Forward-ports pi's `plugin features`
 (`/work/pi/packages/coding-agent/src/cli/plugin-cli.ts:25-39`).
+**`omp ext config`** opens the native alternate-buffer resource selector. `--layer
+workspace` starts in workspace mode; other layer selections start in client mode. Tab switches
+between the exact user `config.toml` and project `.omp/config.toml` layers without writing.
+Space or a pointer click changes the focused extension or package resource; Enter/Apply commits
+the staged `[extensions]` table atomically, while Escape, Cancel, Ctrl-C, or terminal closure
+writes nothing.
+
+Client extension rows toggle `enabled` / `disabled`. Workspace rows cycle an explicit delta
+against the client result: `inherit` → the opposite of the inherited state → the other explicit
+state → `inherit`. Skill, prompt, theme, and executable-entry rows use the same visible state
+machine and persist exact `+path` / `-path` entries under
+`[extensions.resources.\"<extension-id>\"]`. A workspace filter created only for such an override
+has `autoload = false`, so it changes the named resource without replacing the package default;
+returning every family row to `inherit` removes that empty delta. Existing plain include globs and
+`!` exclusion globs are preserved.
 
 #### 3.13.8 `omp ext lock` / `resolve` / `sync` / `upgrade` / `pin`
 

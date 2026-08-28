@@ -244,6 +244,14 @@ class SearchPayload(omp.Payload):
     def useless(self) -> bool:
         return not self.hits
 ```
+##### `Payload.terminate` / `Fault.terminate`
+
+Every payload and fault constructor accepts the keyword-only `terminate: bool = False`.
+When `True`, the terminal frame opts this result into ending the tool loop without an
+automatic model follow-up. A batch ends only when every finalized result opts in; a mixed
+batch always stages the normal follow-up. The hint is execution control, not durable verdict
+truth: `omp.dumps` omits it and `omp.loads` restores the default `False`. The finalized tool
+results and the decision to stop are still journaled.
 
 #### `omp.Fault`
 
@@ -668,7 +676,7 @@ class Part:
 
 ### Rendering: the update fold
 
-#### `@omp.renderer(name, *, family=None, rev=None, reduce=None)`
+#### `@omp.renderer(name, *, family=None, rev=None, reduce=None, decorates=False)`
 
 ```python
 def renderer(
@@ -677,6 +685,7 @@ def renderer(
     family: str | None = None,
     rev: int | None = None,
     reduce: Callable[[object, object], object] | None = None,
+    decorates: bool = False,
 ) -> Callable[[RenderFn], RenderFn]:
     ...
 ```
@@ -699,6 +708,8 @@ Arguments:
   update stream incrementally. When supplied, `view.state` is the accumulator and
   `view.updates` is empty; the fold becomes O(1) per frame instead of O(updates). Supply it
   for any device that can emit more than a few dozen updates.
+- `decorates` — when true, the returned TML augments the winning native or extension base
+  renderer instead of replacing it. The host appends the augmentation; `None` declines it.
 
 Registration is keyed strictly by `(name, rev)`. A second registration for the same key
 raises `omp.DuplicateRenderer` at import time — renderers do not race for ownership the way
