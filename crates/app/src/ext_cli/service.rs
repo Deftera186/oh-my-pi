@@ -325,12 +325,40 @@ impl ExtensionTransactions {
 	}
 
 	pub(crate) fn uninstall(&self, spec: &str) -> miette::Result<Str> {
-		let (id, marketplace) = package_spec(spec)?;
-		let plugin_id = format!("{id}@{marketplace}");
 		let registry_path = self.state.plugin_registry(self.scope);
 		let mut installed = read_installed_plugins(&registry_path)?;
+		let plugin_id = if installed.plugins.contains_key(spec) {
+			spec.to_owned()
+		} else {
+			let candidates = installed
+				.plugins
+				.keys()
+				.filter(|installed_id| {
+					installed_id
+						.rsplit_once('@')
+						.is_some_and(|(name, _)| name == spec)
+				})
+				.cloned()
+				.collect::<Vec<_>>();
+			match candidates.as_slice() {
+				[candidate] => candidate.clone(),
+				[] => {
+					return Err(miette!(
+						"nothing to remove: plugin {spec} is not installed in this scope"
+					));
+				},
+				_ => {
+					return Err(miette!(
+						"plugin {spec} is installed from {} marketplaces; qualify it as one of: {}",
+						candidates.len(),
+						candidates.join(", ")
+					));
+				},
+			}
+		};
+		let (id, _) = package_spec(&plugin_id)?;
 		if installed.plugins.remove(&plugin_id).is_none() {
-			return Err(miette!("plugin {plugin_id} is not installed in this scope"));
+			return Err(miette!("nothing to remove: plugin {spec} is not installed in this scope"));
 		}
 		unlink_plugin(&self.state.plugin_root(self.scope), id)?;
 		write_json(&registry_path, &installed)?;
@@ -1046,6 +1074,94 @@ mod tests {
 		let project_record = read_installed_plugins(&state.plugin_registry(Scope::Project)).unwrap();
 		assert!(!user.plugins["sample@index"][0].enabled);
 		assert!(project_record.plugins["sample@index"][0].enabled);
+	}
+
+	#[test]
+	fn uninstall_resolves_a_unique_bare_plugin_name() {
+		let temp = tempfile::tempdir().unwrap();
+		let data_dir = temp.path().join("data");
+		let project = temp.path().join("project");
+		fs::create_dir_all(&project).unwrap();
+		let state = StatePaths::new(&data_dir, &project);
+		let mut installed = InstalledPluginsRegistry::default();
+		installed
+			.plugins
+			.insert("sample@index".to_owned(), vec![plugin_entry("user", true)]);
+		write_json(&state.plugin_registry(Scope::User), &installed).unwrap();
+
+		let removed = ExtensionTransactions::new(&data_dir, &project, Scope::User)
+			.uninstall("sample")
+			.unwrap();
+
+		assert_eq!(removed, "sample@index");
+		let installed = read_installed_plugins(&state.plugin_registry(Scope::User)).unwrap();
+		assert!(installed.plugins.is_empty());
+	}
+
+	#[test]
+	fn uninstall_rejects_an_ambiguous_bare_plugin_name_with_candidates() {
+		let temp = tempfile::tempdir().unwrap();
+		let data_dir = temp.path().join("data");
+		let project = temp.path().join("project");
+		fs::create_dir_all(&project).unwrap();
+		let state = StatePaths::new(&data_dir, &project);
+		let mut installed = InstalledPluginsRegistry::default();
+		for id in ["sample@first", "sample@second"] {
+			installed
+				.plugins
+				.insert(id.to_owned(), vec![plugin_entry("user", true)]);
+		}
+		write_json(&state.plugin_registry(Scope::User), &installed).unwrap();
+
+		let error = ExtensionTransactions::new(&data_dir, &project, Scope::User)
+			.uninstall("sample")
+			.unwrap_err()
+			.to_string();
+
+		assert!(error.contains("sample@first, sample@second"), "{error}");
+		let installed = read_installed_plugins(&state.plugin_registry(Scope::User)).unwrap();
+		assert_eq!(installed.plugins.len(), 2);
+	}
+
+	#[test]
+	fn uninstall_reports_when_no_plugin_matches() {
+		let temp = tempfile::tempdir().unwrap();
+		let data_dir = temp.path().join("data");
+		let project = temp.path().join("project");
+		fs::create_dir_all(&project).unwrap();
+
+		let error = ExtensionTransactions::new(&data_dir, &project, Scope::User)
+			.uninstall("missing")
+			.unwrap_err()
+			.to_string();
+
+		assert!(error.contains("nothing to remove"), "{error}");
+		assert!(error.contains("missing"), "{error}");
+	}
+
+	#[test]
+	fn uninstall_keeps_qualified_package_resolution_unchanged() {
+		let temp = tempfile::tempdir().unwrap();
+		let data_dir = temp.path().join("data");
+		let project = temp.path().join("project");
+		fs::create_dir_all(&project).unwrap();
+		let state = StatePaths::new(&data_dir, &project);
+		let mut installed = InstalledPluginsRegistry::default();
+		for id in ["sample@first", "sample@second"] {
+			installed
+				.plugins
+				.insert(id.to_owned(), vec![plugin_entry("user", true)]);
+		}
+		write_json(&state.plugin_registry(Scope::User), &installed).unwrap();
+
+		let removed = ExtensionTransactions::new(&data_dir, &project, Scope::User)
+			.uninstall("sample@second")
+			.unwrap();
+
+		assert_eq!(removed, "sample@second");
+		let installed = read_installed_plugins(&state.plugin_registry(Scope::User)).unwrap();
+		assert!(installed.plugins.contains_key("sample@first"));
+		assert!(!installed.plugins.contains_key("sample@second"));
 	}
 
 	#[test]

@@ -12,14 +12,14 @@ description = "Disk-free hashline patch parsing and application over immutable b
 workspace = true
 
 [dependencies]
-bytes = { workspace = true }
-omp-ast = { workspace = true }
-im = { workspace = true }
-omp-core = { workspace = true }
-parking_lot = { workspace = true }
-similar = { workspace = true }
-smallvec = { workspace = true }
-strum = { workspace = true }
-thiserror = { workspace = true }
-xutf = { workspace = true }
-xxhash-rust = { workspace = true }
+bytes.workspace = true
+omp-ast.workspace = true
+im.workspace = true
+omp-core.workspace = true
+parking_lot.workspace = true
+similar.workspace = true
+smallvec.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+xutf.workspace = true
+xxhash-rust.workspace = true

@@ -231,7 +231,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity:       grep,
-			title:          "grep useState in packages/tui/src",
 			streaming_args: r#"{"pattern":"useSta"#,
 			args:           r#"{"pattern":"useState","path":"packages/tui/src","case":true}"#,
 			progress_update: None,
@@ -240,7 +239,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity:       glob,
-			title:          "glob test files in packages",
 			streaming_args: r#"{"path":"packages/**/*.{test,sp"#,
 			args:           r#"{"path":"packages/**/*.{test,spec}.ts","limit":200}"#,
 			progress_update: None,

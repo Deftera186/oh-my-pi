@@ -119,6 +119,9 @@ pub struct Params {
 	#[serde(rename = "replyTo")]
 	pub reply_to:             Option<Str>,
 	/// Block for the recipient's threaded reply.
+	///
+	/// A terminal recipient turn without a matching reply settles promptly with
+	/// a stopped-without-replying note.
 	#[serde(rename = "await", default)]
 	pub await_reply:          bool,
 	/// Only accept a peer message from this sender.
@@ -175,6 +178,10 @@ pub struct Params {
 	#[serde(rename = "renderTerminalRows", default)]
 	pub render_terminal_rows: bool,
 	/// Process lifecycle target (`ready` or `exit`).
+	///
+	/// Each wait is fenced to the named process generation observed when the
+	/// call starts; a restart settles the wait instead of following the
+	/// replacement.
 	#[serde(rename = "for")]
 	pub wait_for:             Option<Str>,
 	/// Output regex taking precedence over lifecycle target.

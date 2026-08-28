@@ -49,7 +49,7 @@ use omp_proto::{
 	},
 };
 use omp_settings::{
-	BrowserSettings,
+	BrowserSettings, SettingsCatalog,
 	manager::{SettingsManager, SettingsPaths},
 };
 use omp_storage::{
@@ -3329,9 +3329,11 @@ pub(super) fn pty_denied() -> bool {
 fn configured_model_edit_revision(
 	data_dir: &Path,
 	project_root: &Path,
+	catalog: SettingsCatalog,
 ) -> Result<Option<Rev>, EnvdError> {
-	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let manager =
+		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
 	let settings = snapshot
 		.project::<HostSettings>()
@@ -3355,9 +3357,11 @@ fn configured_model_edit_revision(
 fn configured_model_identity(
 	data_dir: &Path,
 	project_root: &Path,
+	catalog: SettingsCatalog,
 ) -> Result<Option<Str>, EnvdError> {
-	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let manager =
+		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
 	let settings = snapshot
 		.project::<HostSettings>()
@@ -3391,7 +3395,6 @@ fn prepare_registry(registry: &mut Registry) -> Result<(), EnvdError> {
 		"eval",
 		"todo",
 		"ask",
-		"fetch",
 		"web_search",
 		"think",
 		"goal",
@@ -3506,7 +3509,14 @@ fn register_session_base(
 		)?;
 	}
 	if tool_settings.enabled("think") {
-		register_instrumented(registry, omp_tools::think::tool(), Presentation::Slot, core_claims())?;
+		// External-thinking sessions select `think` explicitly via
+		// `advertise_selected`; ordinary models must never see it (pi parity).
+		register_instrumented(
+			registry,
+			omp_tools::think::tool(),
+			Presentation::Hidden,
+			core_claims(),
+		)?;
 	}
 	if let Some(goal_control) = goal_control {
 		register_instrumented(
@@ -3629,6 +3639,7 @@ pub(crate) struct EnvironmentDeclarationInputs {
 pub(crate) fn build_environment_declaration_inputs(
 	state_dir: &Path,
 	project_root: &Path,
+	settings_catalog: SettingsCatalog,
 	workers: &ExtHostSupervisor,
 	tool_settings: &ToolSettings,
 	shell_settings: &ShellSettings,
@@ -3640,7 +3651,8 @@ pub(crate) fn build_environment_declaration_inputs(
 ) -> Result<EnvironmentDeclarationInputs, EnvdError> {
 	let environment_edit_dialect = env::var("OMP_EDIT_DIALECT").ok();
 	let force_hashline = env::var_os("OMP_STRICT_EDIT_MODE").is_some();
-	let model_edit_revision = configured_model_edit_revision(state_dir, project_root)?;
+	let model_edit_revision =
+		configured_model_edit_revision(state_dir, project_root, settings_catalog)?;
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
 		model_rule: model_edit_revision.as_ref(),
@@ -3755,9 +3767,6 @@ fn environment_declarations(
 	}
 	if tool_settings.enabled("read") {
 		push(omp_tools::read::spec(inputs.read_policy), Presentation::Slot, core_claims());
-	}
-	if tool_settings.enabled("fetch") && tool_settings.fetch_enabled {
-		push(omp_tools::fetch::spec(), Presentation::Slot, core_claims());
 	}
 	if tool_settings.enabled("edit") {
 		let mut edits = [
@@ -3942,6 +3951,7 @@ pub(crate) fn production_registry<
 	blobs: &BlobHost,
 	exec: &ExecHost,
 	state_dir: &Path,
+	settings_catalog: SettingsCatalog,
 	session_id: &str,
 	github_cache: Arc<GithubCache>,
 	mcp: &Arc<McpService>,
@@ -4115,7 +4125,8 @@ pub(crate) fn production_registry<
 	);
 	let environment_edit_dialect = env::var("OMP_EDIT_DIALECT").ok();
 	let force_hashline = env::var_os("OMP_STRICT_EDIT_MODE").is_some();
-	let model_edit_revision = configured_model_edit_revision(state_dir, workspace.root())?;
+	let model_edit_revision =
+		configured_model_edit_revision(state_dir, workspace.root(), settings_catalog)?;
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
 		model_rule: model_edit_revision.as_ref(),
@@ -4140,11 +4151,6 @@ pub(crate) fn production_registry<
 	if tool_settings.enabled("read") {
 		environment_registry(&mut registry, read, Presentation::Slot, core_claims())?;
 	}
-	let fetch = omp_tools::fetch::tool(read_sources.clone());
-	if tool_settings.enabled("fetch") && tool_settings.fetch_enabled {
-		environment_registry(&mut registry, fetch, Presentation::Slot, core_claims())?;
-	}
-
 	let edit_repair = tool_settings.edit_auto_repair.then(|| {
 		edit_repair
 			.unwrap_or_else(|| {
@@ -4162,7 +4168,7 @@ pub(crate) fn production_registry<
 				}
 			}),
 			model: edit_model
-				.or(configured_model_identity(state_dir, workspace.root())?)
+				.or(configured_model_identity(state_dir, workspace.root(), settings_catalog)?)
 				.unwrap_or_else(|| sf!("unknown")),
 			..omp_tools::edit::observer::EditBlackboxConfig::default()
 		},
@@ -4998,25 +5004,25 @@ mod tests {
 			core_claims(),
 		)
 		.expect("environment tool");
-		let remote = omp_tools::fetch::spec();
+		let remote = omp_tools::write::spec();
 		let expected_description = remote.description.clone();
 		registry
 			.declare_remote(remote, Presentation::Slot, core_claims(), ExecutionMode::Parallel)
 			.expect("remote environment declaration");
 
-		assert_eq!(registry.locus("fetch").expect("fetch locus"), ToolLocus::Environment);
+		assert_eq!(registry.locus("write").expect("write locus"), ToolLocus::Environment);
 		assert_eq!(registry.locus("ast_grep").expect("ast_grep locus"), ToolLocus::Environment);
 		assert_eq!(registry.locus("todo").expect("todo locus"), ToolLocus::Session);
-		assert_eq!(registry.presentation("fetch").expect("fetch presentation"), Presentation::Slot);
+		assert_eq!(registry.presentation("write").expect("write presentation"), Presentation::Slot);
 		assert_eq!(
 			&registry
-				.live_spec("fetch")
+				.live_spec("write")
 				.expect("remote spec")
 				.description,
 			&expected_description
 		);
 		let names = environment_tool_names(&registry);
-		assert!(names.contains("fetch"));
+		assert!(names.contains("write"));
 		assert!(names.contains("ast_grep"));
 		assert!(!names.contains("todo"));
 	}

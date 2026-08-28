@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use omp_agent::AgentTree;
 use omp_core::Str;
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain, ValidationError,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
+	ValidationError,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -440,13 +440,6 @@ const fn field(
 	}
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<TaskSettings>()
-}
-omp_settings::inventory::submit! {
-	omp_settings::LayerNormalizer::new(normalize_persisted_agent_overrides)
-}
-
 /// Typed IRC wait and visibility settings owned by subagent supervision.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -492,10 +485,6 @@ impl SettingsDomain for IrcSettings {
 	];
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<IrcSettings>()
-}
-
 /// Atomically replaceable settings projection read once by each new spawn.
 #[derive(Clone)]
 pub struct LiveTaskSettings {
@@ -525,9 +514,12 @@ impl LiveTaskSettings {
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
+
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
 
 	#[test]
 	fn defaults_match_pi_task_contract() {
@@ -543,25 +535,16 @@ mod tests {
 	}
 
 	#[test]
-	fn typed_projection_registration_and_validation_are_linked() {
+	fn typed_projection_and_validation_are_linked() {
 		let expected = TaskSettings { max_concurrency: 0, ..TaskSettings::default() };
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated task settings");
+		let snapshot =
+			SettingsSnapshot::isolated(expected.clone(), CATALOG).expect("isolated task settings");
 		assert_eq!(
 			snapshot
 				.project::<TaskSettings>()
 				.expect("task projection")
 				.get(),
 			&expected
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == TaskSettings::DOMAIN)
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == IrcSettings::DOMAIN)
 		);
 		assert!(
 			TaskSettings { max_recursion_depth: -2, ..TaskSettings::default() }
@@ -581,9 +564,7 @@ mod tests {
 				)])),
 			)])),
 		)]);
-		for normalizer in omp_settings::inventory::iter::<omp_settings::LayerNormalizer> {
-			normalizer.apply(&mut document);
-		}
+		CATALOG.normalize(&mut document);
 		assert_eq!(document["task"]["agentPrewalk"]["scout"].as_str(), Some("on"));
 	}
 

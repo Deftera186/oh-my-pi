@@ -10,7 +10,9 @@ use rusqlite::{Connection, OptionalExtension as _, params, types};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
-const SCHEMA_VERSION: i64 = 2;
+// Version 3 invalidates rows written before discovered partial pricing and
+// provider-local transport isolation became part of the serialized overlay.
+const SCHEMA_VERSION: i64 = 3;
 
 /// Secret-free identity of one provider discovery cache namespace.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -138,6 +140,17 @@ impl DiscoveryStore {
 			 CREATE INDEX discovered_models_fresh
 			   ON discovered_models(provider, cache_scope, expires_at_ms, generation);",
 		)?;
+		let stored_version = connection
+			.query_row("SELECT value FROM discovery_meta WHERE key='schema_version'", [], |row| {
+				row.get::<_, i64>(0)
+			})
+			.optional()?;
+		if stored_version != Some(SCHEMA_VERSION) {
+			connection.execute_batch(
+				"DELETE FROM discovered_models;
+				 DELETE FROM provider_lifecycle;",
+			)?;
+		}
 		connection.execute(
 			"INSERT INTO discovery_meta(key, value) VALUES('schema_version', ?1)
 			 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -308,7 +321,9 @@ pub enum DiscoveryStoreError {
 mod tests {
 	use std::str;
 
-	use omp_catalog::{ModelAvailability, ModelLimits, OperationBits, RouteId, WireModelId};
+	use omp_catalog::{
+		ModelAvailability, ModelLimits, OperationBits, Price, PriceUnit, RouteId, WireModelId,
+	};
 
 	use super::*;
 
@@ -328,6 +343,7 @@ mod tests {
 				maximum_output_tokens: None,
 				maximum_batch:         None,
 			}),
+			declared_pricing:      Box::new([]),
 			extended_context_mode: None,
 			availability:          Some(ModelAvailability::Available),
 			source:                Str::new_static("fixture"),
@@ -345,20 +361,27 @@ mod tests {
 		let key = DiscoveryCacheKey::provider(provider.clone());
 		{
 			let store = DiscoveryStore::open(&path).expect("open");
+			let mut priced = row(&provider);
+			priced.declared_pricing =
+				vec![Price { unit: PriceUnit::MtokCacheRead, nanos_usd: 550_000_000 }, Price {
+					unit:      PriceUnit::MtokCacheWrite,
+					nanos_usd: 6_875_000_000,
+				}]
+				.into_boxed_slice();
 			store
-				.publish(&key, &[row(&provider)], 100, Duration::from_secs(1))
+				.publish(&key, &[priced], 100, Duration::from_secs(1))
 				.expect("publish");
 		}
 		let reopened = DiscoveryStore::open(&path).expect("reopen");
-		assert_eq!(
-			reopened
-				.load_fresh(&key, 500)
-				.expect("load")
-				.unwrap()
-				.rows
-				.len(),
-			1
-		);
+		let cached = reopened
+			.load_fresh(&key, 500)
+			.expect("load")
+			.expect("fresh cache");
+		assert_eq!(cached.rows.len(), 1);
+		assert_eq!(cached.rows[0].declared_pricing.as_ref(), [
+			Price { unit: PriceUnit::MtokCacheRead, nanos_usd: 550_000_000 },
+			Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: 6_875_000_000 },
+		]);
 		assert!(reopened.load_fresh(&key, 1_101).expect("expired").is_none());
 		assert_eq!(
 			reopened
@@ -370,14 +393,19 @@ mod tests {
 		);
 	}
 	#[test]
-	fn legacy_provider_wide_rows_migrate_into_the_restorable_scope() {
+	fn pre_pricing_schema_rows_are_invalidated() {
 		let directory = tempfile::tempdir().expect("directory");
 		let path = directory.path().join("models.db");
 		let provider = ProviderId::from("opencode-zen");
 		let legacy = Connection::open(&path).expect("legacy database");
 		legacy
 			.execute_batch(
-				"CREATE TABLE discovered_models (
+				"CREATE TABLE discovery_meta (
+				   key TEXT PRIMARY KEY,
+				   value INTEGER NOT NULL
+				 );
+				 INSERT INTO discovery_meta(key, value) VALUES('schema_version', 2);
+				 CREATE TABLE discovered_models (
 				   provider TEXT NOT NULL,
 				   generation INTEGER NOT NULL,
 				   ordinal INTEGER NOT NULL,
@@ -398,11 +426,12 @@ mod tests {
 		drop(legacy);
 
 		let store = DiscoveryStore::open(&path).expect("migrate");
-		let cached = store
-			.load_fresh(&DiscoveryCacheKey::provider(provider), 100)
-			.expect("load migrated row")
-			.expect("legacy row remains available");
-		assert_eq!(cached.rows.len(), 1);
+		assert!(
+			store
+				.load_fresh(&DiscoveryCacheKey::provider(provider), 100)
+				.expect("load invalidated namespace")
+				.is_none()
+		);
 	}
 
 	#[test]

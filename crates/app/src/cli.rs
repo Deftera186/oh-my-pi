@@ -39,7 +39,7 @@ fn parse_cli_secret(value: &str) -> Result<SecretString, convert::Infallible> {
 
 use std::{convert, env, fs, time};
 
-use omp_catalog::{ModelKey, compile::compile_oracle};
+use omp_catalog::{ModelKey, SelectionError, compile::compile_oracle, role_assignment_selector};
 use omp_driver::bridges::{AgentGoalControl, InferenceBridge};
 use omp_envd::{
 	exthost::{ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest},
@@ -155,6 +155,20 @@ impl FromStr for ThinkingLevel {
 			_ => Err(format!("ambiguous thinking level `{value}`")),
 		}
 	}
+}
+
+/// Formats the invocation-local default role recorded for `--model`.
+///
+/// An explicit `--thinking` replaces a model suffix; without it, the suffix is
+/// retained so cycling away from and back to the default role restores the
+/// launch effort.
+pub(crate) fn default_model_role_override(
+	model: Option<&str>,
+	thinking: Option<ThinkingLevel>,
+) -> Result<Option<Str>, SelectionError> {
+	model
+		.map(|selector| role_assignment_selector(selector, thinking.map(<&'static str>::from)))
+		.transpose()
 }
 
 /// Validated provider service tier.
@@ -589,7 +603,11 @@ pub struct InstallArgs {
 /// Durable quota-history options.
 #[derive(Clone, Debug, Args)]
 pub struct UsageArgs {
-	/// Override the profile data directory containing `credentials.db`.
+	/// Optional usage report to render.
+	#[arg(value_enum)]
+	pub action:     Option<UsageAction>,
+	/// Override the profile data directory containing credentials and usage
+	/// state.
 	#[arg(long, value_name = "PATH")]
 	pub data_dir:   Option<PathBuf>,
 	/// Restrict snapshots to one provider.
@@ -604,6 +622,19 @@ pub struct UsageArgs {
 	/// Emit machine-readable JSON.
 	#[arg(long)]
 	pub json:       bool,
+	/// Reporting window in days for client usage.
+	#[arg(long, default_value_t = 7)]
+	pub days:       u32,
+	/// Gateway endpoint for fleet-wide client usage.
+	#[arg(long, value_name = "LOCAL_ENDPOINT")]
+	pub gateway:    Option<LocalEndpoint>,
+}
+
+/// Optional durable-usage report selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UsageAction {
+	/// Per-installation and per-application gateway token burn.
+	Clients,
 }
 
 /// Benchmark workload selection.
@@ -1067,7 +1098,7 @@ pub enum Command {
 	/// Install or serve the local Chrome CDP relay.
 	#[command(name = "browser-relay")]
 	BrowserRelay(BrowserRelayArgs),
-	/// Generate changelog updates and one coherent commit.
+	/// Generate one conventional commit from staged changes.
 	Commit(CommitCliArgs),
 	/// Start the inference gateway on a platform-native local endpoint.
 	Serve(ServeArgs),
@@ -1267,27 +1298,18 @@ pub enum BrowserRelayAction {
 	Install,
 }
 
-/// Agentic commit workflow options.
+/// Conventional commit workflow options.
 #[derive(Clone, Debug, Args)]
 pub struct CommitCliArgs {
 	/// Push the committed branch after success.
 	#[arg(long)]
-	pub push:         bool,
+	pub push:    bool,
 	/// Preview the proposed commit without mutation.
 	#[arg(long)]
-	pub dry_run:      bool,
-	/// Skip changelog updates.
-	#[arg(long)]
-	pub no_changelog: bool,
-	/// Use the conservative legacy commit policy.
-	#[arg(long)]
-	pub legacy:       bool,
-	/// Additional commit-classification context.
-	#[arg(long, short = 'c')]
-	pub context:      Option<String>,
-	/// Commit-agent model override.
+	pub dry_run: bool,
+	/// Commit generation model override.
 	#[arg(long, short = 'm')]
-	pub model:        Option<Str>,
+	pub model:   Option<Str>,
 }
 
 /// Environment process supervisor options.
@@ -3018,7 +3040,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 				None,
 				omp_agent::advisor::AdvisorAdviceQueue::default(),
 			);
-			omp_envd::run(args.into_config(), bridges).await
+			omp_envd::run(args.into_config(), crate::SETTINGS_CATALOG, bridges).await
 		},
 		Command::Chat(args) => {
 			run_interactive_chat(
@@ -3752,6 +3774,34 @@ mod tests {
 
 	fn parse(arguments: &[&str]) -> OmpCli {
 		OmpCli::try_parse_from(arguments).expect("valid command")
+	}
+
+	#[test]
+	fn model_role_override_preserves_and_prioritizes_effort() {
+		assert_eq!(
+			default_model_role_override(Some("anthropic/claude:low"), None)
+				.expect("valid selector")
+				.as_deref(),
+			Some("anthropic/claude:low")
+		);
+		assert_eq!(
+			default_model_role_override(Some("anthropic/claude:low"), Some(ThinkingLevel::High),)
+				.expect("valid selector")
+				.as_deref(),
+			Some("anthropic/claude:high")
+		);
+		assert_eq!(
+			default_model_role_override(Some("anthropic/claude"), Some(ThinkingLevel::High))
+				.expect("valid selector")
+				.as_deref(),
+			Some("anthropic/claude:high")
+		);
+		assert_eq!(
+			default_model_role_override(Some("anthropic/claude"), None)
+				.expect("valid selector")
+				.as_deref(),
+			Some("anthropic/claude")
+		);
 	}
 
 	#[test]

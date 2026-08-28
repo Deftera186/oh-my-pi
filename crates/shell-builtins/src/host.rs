@@ -39,8 +39,6 @@ use std::{
 use std::{ffi::OsStr, os::fd};
 
 use im::HashMap;
-#[cfg(test)]
-use omp_shell_engine::WriteDenied;
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, PathPolicy, ProcessScope, ShellExtensions,
 	SpawnObserver, SpawnWrapper,
@@ -48,6 +46,8 @@ use omp_shell_engine::{
 	openfiles::{self, OpenFile, OpenFiles},
 	sys::fs,
 };
+#[cfg(test)]
+use omp_shell_engine::{OpenRequest, PathAccess, PathDenied};
 use parking_lot::Mutex;
 
 /// A command-line utility implemented as a shell builtin.
@@ -1131,9 +1131,9 @@ mod testing {
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AtomicBool, Error, HashMap, Host, OpenFile, Ordering, OsString, PathBuf, PathPolicy,
-		Read, SpawnWrapper, Stdin, StreamWriter, Utility, Write, WriteDenied, io, openfiles,
-		run_caught,
+		Arc, AtomicBool, Error, HashMap, Host, OpenFile, OpenRequest, Ordering, OsString, PathAccess,
+		PathBuf, PathDenied, PathPolicy, Read, SpawnWrapper, Stdin, StreamWriter, Utility, Write, io,
+		openfiles, run_caught,
 	};
 
 	/// Test policy admitting writes only beneath one root.
@@ -1149,12 +1149,40 @@ mod testing {
 	}
 
 	impl PathPolicy for ScopedPathPolicy {
-		fn check_write(&self, path: &std::path::Path) -> Result<(), WriteDenied> {
+		fn check_read(&self, path: &std::path::Path) -> Result<(), PathDenied> {
 			if path.starts_with(&self.root) {
 				Ok(())
 			} else {
-				Err(WriteDenied { path: path.to_path_buf() })
+				Err(PathDenied { path: path.to_path_buf(), access: PathAccess::Read })
 			}
+		}
+
+		fn check_write(&self, path: &std::path::Path) -> Result<(), PathDenied> {
+			if path.starts_with(&self.root) {
+				Ok(())
+			} else {
+				Err(PathDenied { path: path.to_path_buf(), access: PathAccess::Write })
+			}
+		}
+
+		fn open(
+			&self,
+			path: &std::path::Path,
+			request: OpenRequest,
+		) -> Result<std::fs::File, PathDenied> {
+			let access = request.access;
+			if !path.starts_with(&self.root) {
+				return Err(PathDenied { path: path.to_path_buf(), access });
+			}
+			std::fs::File::options()
+				.read(matches!(access, PathAccess::Read | PathAccess::ReadWrite))
+				.write(!matches!(access, PathAccess::Read))
+				.create(!matches!(access, PathAccess::Read))
+				.truncate(matches!(access, PathAccess::Truncate))
+				.append(matches!(access, PathAccess::Append))
+				.create_new(matches!(access, PathAccess::CreateNew))
+				.open(path)
+				.map_err(|_| PathDenied { path: path.to_path_buf(), access })
 		}
 	}
 	struct TestSpawnWrapper {

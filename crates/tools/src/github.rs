@@ -83,7 +83,7 @@ pub enum DateField {
 pub struct Params {
 	/// Operation selector.
 	pub op:               Operation,
-	/// `owner/repo`; omitted operations resolve the current checkout.
+	/// `[host/]owner/repo`; omitted operations resolve the current checkout.
 	pub repo:             Option<Str>,
 	/// Repository-relative file path.
 	pub path:             Option<Str>,
@@ -187,7 +187,8 @@ pub fn tool(host: Arc<dyn GithubHost>) -> Github {
 			rev:             Rev { family: Str::default(), n: 1 },
 			description:     sf!(
 				"Uses GitHub's direct API for repository, file, search, pull-request worktree, push, \
-				 and Actions operations. No gh process or commit automation is used."
+				 and Actions operations. Repository identities are [host/]owner/repo; name the host \
+				 for GitHub Enterprise. No gh process or commit automation is used."
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {

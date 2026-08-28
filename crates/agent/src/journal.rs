@@ -54,6 +54,7 @@ use crate::{
 	project,
 	prompt::PromptHash,
 	regime::RegimeRecord,
+	strip_system_wrapper,
 	ttsr::StreamSource,
 };
 type ActivePrompt = (Hash32, Vec<u64>);
@@ -1148,6 +1149,11 @@ impl Journal {
 	}
 
 	/// Atomically creates a branch or fork child with ruled lineage semantics.
+	///
+	/// The child is staged without a sessions index: every production caller
+	/// runs inside [`SessionIndex::create_session`], which holds the index
+	/// connection lock, so an indexed append here would self-deadlock. Callers
+	/// attach the index after the session row is published.
 	pub fn create_child(
 		&self,
 		path: &Path,
@@ -1169,9 +1175,6 @@ impl Journal {
 			}
 		};
 		let mut child = Self::create(path, header)?;
-		if let Some((index, _)) = &self.session_index {
-			child.attach_session_index(Arc::clone(index), header.id.clone());
-		}
 		child.append_forked_from(ts, &self.session_id, at)?;
 		for item in seed {
 			child.append_optimistic(ts, item, None)?;
@@ -1195,6 +1198,9 @@ impl Journal {
 	/// `checkpoint` and `compaction_epoch` are validated by the coordinator
 	/// before this journal-owner operation. The checkpoint is checked again
 	/// here so a stale parent event can never be recorded as current lineage.
+	///
+	/// Like [`Self::create_child`], the child is staged without a sessions
+	/// index; callers attach it after publishing the session row.
 	pub fn create_handoff_child(
 		&self,
 		path: &Path,
@@ -1211,9 +1217,6 @@ impl Journal {
 		compact.first_kept = 0;
 		compact.method = Some(sf!("handoff"));
 		let mut child = Self::create(path, header)?;
-		if let Some((index, _)) = &self.session_index {
-			child.attach_session_index(Arc::clone(index), header.id.clone());
-		}
 		child.append_forked_from(ts, &self.session_id, Some(checkpoint))?;
 		child.compact(ts, compact)?;
 		Ok(child)
@@ -4098,7 +4101,11 @@ fn user_prompt_text(item: &Item) -> Option<String> {
 		}
 		prompt.push_str(value);
 	}
-	(!prompt.is_empty()).then_some(prompt)
+	if prompt.is_empty() {
+		return None;
+	}
+	let stripped = strip_system_wrapper(&prompt).map(str::to_owned);
+	Some(stripped.unwrap_or(prompt))
 }
 
 const fn event_item(kind: &Kind) -> Option<&Item> {
@@ -4151,16 +4158,26 @@ mod tests {
 	}
 
 	fn message(text: &str) -> Item {
+		message_parts(&[text])
+	}
+
+	fn message_parts(parts: &[&str]) -> Item {
 		Item {
 			kind: Some(thread_item::Kind::Message(thread_pb::Message {
-				role:  Role::User as i32,
-				parts: vec![thread_pb::Part { kind: Some(thread_part::Kind::Text(text.to_owned())) }],
+				role: Role::User as i32,
+				parts: parts
+					.iter()
+					.map(|text| thread_pb::Part {
+						kind: Some(thread_part::Kind::Text((*text).to_owned())),
+					})
+					.collect(),
+				..Default::default()
 			})),
 			..Default::default()
 		}
 	}
 	#[test]
-	fn materialized_header_indexes_first_turn_input() {
+	fn materialized_header_indexes_unwrapped_first_turn_input() {
 		let journal_path = path("materialized-header");
 		let index_path = journal_path.with_extension("sqlite3");
 		let header = header();
@@ -4185,9 +4202,87 @@ mod tests {
 			})
 			.unwrap_or_else(|_| panic!("create indexed session"));
 		let mut journal = Journal::open(&journal_path).expect("open materialized journal");
-		journal.attach_session_index(index, session_id);
-		let result = journal.append_turn_input(2, "turn", message("input"), None);
+		journal.attach_session_index(Arc::clone(&index), session_id);
+		let result = journal.append_turn_input(
+			2,
+			"turn",
+			message_parts(&[
+				"<system-reminder>",
+				"2 todo items still open. Keep working.",
+				"</system-reminder>",
+			]),
+			None,
+		);
 		assert!(result.is_ok(), "{result:?}");
+		let hits = index
+			.search_prompts("todo items", 10)
+			.expect("search readable body");
+		assert_eq!(hits.len(), 1);
+		assert_eq!(hits[0].prompt.as_str(), "2 todo items still open. Keep working.");
+		assert!(
+			index
+				.search_prompts("system-reminder", 10)
+				.expect("search hidden wrapper")
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn create_child_completes_inside_an_indexed_create_session() {
+		let parent_path = path("indexed-branch-parent");
+		let index_path = parent_path.with_extension("sqlite3");
+		let header = header();
+		let session_id = header.id.clone();
+		let index = Arc::new(SessionIndex::open(&index_path).expect("session index"));
+		let cwd = header.cwd.to_string_lossy();
+		let mut parent = Journal::create(&parent_path, &header).expect("create parent");
+		parent
+			.append_optimistic(2, message("hi"), None)
+			.expect("append seed");
+		let parent_watermark = parent.byte_watermark().expect("parent watermark");
+		let parent_request = omp_storage::index::NewSession {
+			id:         &session_id,
+			cwd:        cwd.as_ref(),
+			project:    cwd.as_ref(),
+			created_ms: header.created,
+			kind:       omp_storage::index::SessionKind::Interactive,
+			parent:     None,
+			remote:     false,
+		};
+		index
+			.create_session(&parent_request, || Ok::<_, JournalError>(((), parent_watermark)))
+			.unwrap_or_else(|_| panic!("publish parent row"));
+		parent.attach_session_index(Arc::clone(&index), session_id.clone());
+
+		let child_path = path("indexed-branch-child");
+		let mut child_header = header.clone();
+		child_header.id = SessionId(sf!("indexed-branch-child"));
+		let child_id = child_header.id.clone();
+		let child_request = omp_storage::index::NewSession {
+			id:         &child_id,
+			cwd:        cwd.as_ref(),
+			project:    cwd.as_ref(),
+			created_ms: header.created,
+			kind:       omp_storage::index::SessionKind::Interactive,
+			parent:     Some(&session_id),
+			remote:     false,
+		};
+		// Regression: staging the child while `create_session` holds the index
+		// connection lock must not re-enter the index and self-deadlock.
+		let mut child = index
+			.create_session(&child_request, || {
+				let child = parent
+					.create_child(&child_path, &child_header, 3, ChildKind::Branch { checkpoint: 0 })?;
+				let watermark = child.byte_watermark()?;
+				Ok::<_, JournalError>((child, watermark))
+			})
+			.unwrap_or_else(|_| panic!("create indexed child"));
+		child.attach_session_index(index, child_id);
+		assert!(
+			child
+				.append_optimistic(4, message("follow-up"), None)
+				.is_ok()
+		);
 	}
 
 	#[test]
@@ -4367,10 +4462,11 @@ mod tests {
 				seq:           3,
 				created_at_ms: 9,
 				kind:          Some(thread_item::Kind::Message(thread_pb::Message {
-					role:  Role::Assistant as i32,
+					role: Role::Assistant as i32,
 					parts: vec![thread_pb::Part {
 						kind: Some(thread_part::Kind::Text("answer".to_owned())),
 					}],
+					..Default::default()
 				})),
 				props:         None,
 			}],

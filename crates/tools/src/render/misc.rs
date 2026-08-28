@@ -619,7 +619,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity: github,
-			title: "search_prs is:open review-requested:@me in oh-my-pi/pi",
 			streaming_args: r#"{"op":"search_prs","query":"is:open review-requested:@me sort:up"#,
 			args: r#"{"op":"search_prs","query":"is:open review-requested:@me sort:updated","repo":"oh-my-pi/pi","limit":10}"#,
 			progress_update: None,
@@ -628,7 +627,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: browser,
-			title: "run observe() in bun.sh docs",
 			streaming_args: r#"{"action":"run","name":"docs","url":"https://bun.sh/docs","code":"const obs = await tab.observe();\nconst heading = obs.elements.find(e => e.role === 'head"#,
 			args: r#"{"action":"run","name":"docs","url":"https://bun.sh/docs","code":"const obs = await tab.observe();\nconst heading = obs.elements.find(e => e.role === 'heading');\ndisplay({ url: obs.url, title: obs.title, headings: obs.elements.filter(e => e.role === 'heading').length });\nreturn heading?.name ?? 'no heading found';"}"#,
 			progress_update: None,
@@ -637,7 +635,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: computer,
-			title: "capture the primary display at 1440×900",
 			streaming_args: r#"{"action":"capture","read_only":true,"max_width":1440,"max_height":9"#,
 			args: r#"{"action":"capture","read_only":true,"max_width":1440,"max_height":900}"#,
 			progress_update: None,

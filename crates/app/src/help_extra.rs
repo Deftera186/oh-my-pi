@@ -25,7 +25,6 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 	"computer",
 	"edit",
 	"eval",
-	"fetch",
 	"glob",
 	"goal",
 	"grep",

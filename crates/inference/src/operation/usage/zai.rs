@@ -78,7 +78,7 @@ impl ConsoleUsageFetcher for ZaiUsageFetcher {
 			if !(200..300).contains(&response.status) {
 				return Err(UsageFetchError::Unavailable);
 			}
-			let windows = parse(response.body.expose_secret(), now)?;
+			let (windows, plan) = parse(response.body.expose_secret(), now)?;
 
 			let start = now
 				.checked_sub(Duration::from_days(7))
@@ -93,7 +93,7 @@ impl ConsoleUsageFetcher for ZaiUsageFetcher {
 
 			Ok(ConsoleUsageObservation {
 				account_meta,
-				plan: None,
+				plan,
 				source_label: Some(sf!("zai-monitor")),
 				notes: Box::default(),
 				reset_credits: None,
@@ -163,11 +163,16 @@ fn encode_time(time: SystemTime) -> String {
 	value.replace('T', "%2B").replace(':', "%3A")
 }
 
-fn parse(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageFetchError> {
+fn parse(body: &str, now: SystemTime) -> Result<(Vec<UsageWindow>, Option<Str>), UsageFetchError> {
 	let payload: Value = serde_json::from_str(body).map_err(|_| UsageFetchError::Unavailable)?;
 	if payload.get("success").and_then(Value::as_bool) != Some(true) {
 		return Err(UsageFetchError::Unavailable);
 	}
+	let plan = payload
+		.pointer("/data/level")
+		.and_then(Value::as_str)
+		.filter(|level| !level.trim().is_empty())
+		.map(Str::new);
 	let rows = payload
 		.pointer("/data/limits")
 		.and_then(Value::as_array)
@@ -202,6 +207,13 @@ fn parse(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageFetchErro
 				UsageUnit::Requests,
 				"requests",
 			),
+			"CREDIT_LIMIT" => (
+				format!("zai:credits:{window_id}"),
+				format!("ZAI {window_label} Credit Quota"),
+				"shared".to_owned(),
+				UsageUnit::Credits,
+				"credits",
+			),
 			_ => continue,
 		};
 		let consumed = row.get("currentValue").and_then(quantity);
@@ -211,6 +223,15 @@ fn parse(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageFetchErro
 			.get("percentage")
 			.and_then(Value::as_f64)
 			.filter(|value| value.is_finite() && *value >= 0.0);
+		let percentage = if unit == UsageUnit::Credits {
+			consumed
+				.zip(limit)
+				.and_then(|(consumed, limit)| quantity_ratio(consumed, limit))
+				.map(|fraction| fraction * 100.0)
+				.or(percentage)
+		} else {
+			percentage
+		};
 		let status = percentage.map_or(UsageStatus::Unknown, |percentage| {
 			if percentage >= 100.0 {
 				UsageStatus::Exhausted
@@ -239,8 +260,18 @@ fn parse(body: &str, now: SystemTime) -> Result<Vec<UsageWindow>, UsageFetchErro
 	if windows.is_empty() {
 		Err(UsageFetchError::Unavailable)
 	} else {
-		Ok(windows)
+		Ok((windows, plan))
 	}
+}
+
+fn quantity_ratio(consumed: UsageQuantity, limit: UsageQuantity) -> Option<f64> {
+	if limit.units == 0 {
+		return None;
+	}
+	let consumed_scale = 10_f64.powi(i32::from(consumed.decimal_exponent));
+	let limit_scale = 10_f64.powi(i32::from(limit.decimal_exponent));
+	let ratio = (consumed.units as f64 / consumed_scale) / (limit.units as f64 / limit_scale);
+	ratio.is_finite().then_some(ratio)
 }
 
 fn window_descriptor(row: &Map<String, Value>) -> (String, String, Option<Duration>) {
@@ -324,6 +355,7 @@ mod tests {
 
 	use super::ZaiUsageFetcher;
 	use crate::{
+		answer::{UsageStatus, UsageUnit},
 		auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError},
 		operation::usage::ConsoleUsageFetcher as _,
 	};
@@ -368,6 +400,8 @@ mod tests {
 	}
 
 	const BODY: &str = r#"{"success":true,"data":{"limits":[{"type":"TIME_LIMIT","usage":100,"currentValue":0,"percentage":0,"remaining":100,"nextResetTime":1784547608994,"unit":5,"number":1,"usageDetails":[{"modelCode":"search-prime"},{"modelCode":"web-reader"},{"modelCode":"zread"}]},{"type":"TOKENS_LIMIT","percentage":82,"nextResetTime":1782656863894,"unit":3,"number":5},{"type":"TOKENS_LIMIT","percentage":38,"nextResetTime":1783165208993,"unit":6,"number":7}]}}"#;
+	const CREDIT_ONLY_BODY: &str = r#"{"success":true,"data":{"level":"pro","limits":[{"type":"CREDIT_LIMIT","usage":12000,"currentValue":11400,"remaining":600,"percentage":11,"nextResetTime":1787804173065,"unit":3,"number":5},{"type":"CREDIT_LIMIT","usage":60000,"currentValue":2254,"remaining":57746,"percentage":3,"nextResetTime":1788223121997,"unit":6,"number":1}]}}"#;
+	const MIXED_BODY: &str = r#"{"success":true,"data":{"level":"max","limits":[{"type":"TOKENS_LIMIT","percentage":82,"nextResetTime":1787804173065,"unit":3,"number":5},{"type":"CREDIT_LIMIT","usage":12000,"currentValue":1438,"remaining":10562,"percentage":11,"nextResetTime":1787804173065,"unit":3,"number":5},{"type":"TIME_LIMIT","usage":100,"currentValue":4,"remaining":96,"percentage":4,"nextResetTime":1788223121997,"unit":6,"number":1}]}}"#;
 
 	#[tokio::test]
 	async fn auth_headers_two_requests_identity_and_window_projection() {
@@ -432,6 +466,63 @@ mod tests {
 			http.requests.lock()[0]
 				.0
 				.starts_with("https://proxy.example/api/monitor/")
+		);
+	}
+
+	#[tokio::test]
+	async fn credit_only_response_surfaces_windows_and_plan() {
+		let http = Arc::new(Http::new([(200, CREDIT_ONLY_BODY), (200, "{}")]));
+		let fetcher = ZaiUsageFetcher::new(http);
+		let credential = SecretString::from("api-key".to_owned());
+		let report = fetcher
+			.fetch(Some(&credential), UNIX_EPOCH + Duration::from_secs(1_784_000_000), None)
+			.await
+			.expect("credit-only usage report");
+
+		assert_eq!(report.plan.as_deref(), Some("pro"));
+		assert_eq!(
+			report
+				.windows
+				.iter()
+				.map(|window| window.id.as_str())
+				.collect::<Vec<_>>(),
+			["zai:credits:5h", "zai:credits:1w"]
+		);
+		assert!(
+			report
+				.windows
+				.iter()
+				.all(|window| window.amount.unit == UsageUnit::Credits)
+		);
+		assert_eq!(report.windows[0].amount.consumed.expect("consumed").units, 11_400);
+		assert_eq!(report.windows[0].amount.limit.expect("limit").units, 12_000);
+		assert_eq!(report.windows[0].amount.remaining.expect("remaining").units, 600);
+		assert_eq!(report.windows[0].status, Some(UsageStatus::Warning));
+		assert_eq!(report.windows[1].label.as_deref(), Some("ZAI Weekly Credit Quota"));
+	}
+
+	#[tokio::test]
+	async fn mixed_response_preserves_each_meter() {
+		let http = Arc::new(Http::new([(200, MIXED_BODY), (200, "{}")]));
+		let fetcher = ZaiUsageFetcher::new(http);
+		let credential = SecretString::from("api-key".to_owned());
+		let report = fetcher
+			.fetch(Some(&credential), UNIX_EPOCH + Duration::from_secs(1_784_000_000), None)
+			.await
+			.expect("mixed usage report");
+
+		assert_eq!(report.plan.as_deref(), Some("max"));
+		assert_eq!(
+			report
+				.windows
+				.iter()
+				.map(|window| (window.id.as_str(), window.amount.unit))
+				.collect::<Vec<_>>(),
+			[
+				("zai:tokens:5h", UsageUnit::Tokens),
+				("zai:credits:5h", UsageUnit::Credits),
+				("zai:requests:1w", UsageUnit::Requests),
+			]
 		);
 	}
 }

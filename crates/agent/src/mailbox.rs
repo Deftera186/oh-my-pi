@@ -198,8 +198,14 @@ pub fn deferred_diagnostics_interrupt(
 		seq:           0,
 		created_at_ms: 0,
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
+			role:            thread::Role::System as i32,
+			parts:           vec![thread::Part {
+				kind: Some(thread::part::Kind::Text(text.to_string())),
+			}],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         Some(props),
 	};
@@ -374,6 +380,14 @@ impl MailboxSender {
 	/// Returns whether the receiving mailbox has closed.
 	pub fn is_disconnected(&self) -> bool {
 		self.tx.is_disconnected()
+	}
+
+	/// Returns whether an interrupt is waiting in the producer channel.
+	///
+	/// The supervisor uses this only while atomically settling a completed turn;
+	/// the consumer has already drained its private backlog at that boundary.
+	pub fn has_pending(&self) -> bool {
+		!self.tx.is_empty()
 	}
 
 	/// Removes every producer-authored interrupt that has not reached a drain
@@ -635,8 +649,9 @@ mod tests {
 			seq:           0,
 			created_at_ms: 0,
 			kind:          Some(item::Kind::Message(Message {
-				role:  Role::User as i32,
+				role: Role::User as i32,
 				parts: vec![Part { kind: Some(part::Kind::Text("continue".to_owned())) }],
+				..Default::default()
 			})),
 			props:         None,
 		}

@@ -7,6 +7,7 @@ use std::{
 
 use omp_catalog::{
 	OperationKind,
+	capability::{Availability, ModalityBits},
 	classify::{ClassificationInput, ClassificationPhase, EffortTier, classify},
 	compile::{CompiledCatalog, compile_oracle},
 	policy::{MaxTokensField, ReasoningDisableMode, ThinkingFormat, WirePolicy},
@@ -1403,6 +1404,80 @@ fn vercel_muse_contributor_caps_output_below_context() {
 		.expect("Vercel Muse contributor row");
 	assert_eq!(model.limits.context_window, Some(1_048_576));
 	assert_eq!(model.limits.maximum_output_tokens, Some(131_072));
+}
+
+#[test]
+fn zai_glm_53_flash_has_native_image_input_and_list_pricing() {
+	let compiled = compile_frozen_oracle();
+	let model = compiled
+		.models
+		.iter()
+		.find(|model| model.key.as_str() == "zai/glm-5.3-flash")
+		.expect("Z.AI GLM-5.3-Flash row");
+	assert_eq!(model.limits.context_window, Some(1_000_000));
+	assert_eq!(model.limits.maximum_output_tokens, Some(131_072));
+	assert!(matches!(
+		model.capabilities.chat.as_ref().map(|chat| &chat.input_modalities),
+		Some(Availability::Native(modalities)) if modalities.contains(ModalityBits::IMAGE)
+	));
+	assert_eq!(
+		model
+			.pricing
+			.components
+			.iter()
+			.map(|price| (price.unit, price.nanos_usd))
+			.collect::<Vec<_>>(),
+		[
+			(PriceUnit::MtokInput, 150_000_000),
+			(PriceUnit::MtokOutput, 500_000_000),
+			(PriceUnit::MtokCacheRead, 30_000_000),
+			(PriceUnit::MtokCacheWrite, 0),
+		]
+	);
+	let thinking = model
+		.thinking
+		.as_ref()
+		.and_then(|id| {
+			compiled
+				.thinking_policies
+				.iter()
+				.find(|policy| policy.content_id() == *id)
+		})
+		.expect("GLM-5.3-Flash thinking policy");
+	assert_eq!(thinking.mode, ThinkingMode::AnthropicBudgetEffort);
+	assert_eq!(thinking.efforts.as_slice(), [
+		ThinkingEffort::Low,
+		ThinkingEffort::High,
+		ThinkingEffort::Max
+	]);
+	assert_eq!(thinking.default_level, Some(ThinkingEffort::Max));
+	assert_eq!(thinking.requires_effort, Some(true));
+}
+
+#[test]
+fn gemini_37_tiered_alias_uses_the_canonical_low_route() {
+	let compiled = compile_frozen_oracle();
+	assert!(
+		!compiled
+			.models
+			.iter()
+			.any(|model| model.key.as_str() == "google-antigravity/gemini-3.7-flash-tiered")
+	);
+	let model = compiled
+		.models
+		.iter()
+		.find(|model| model.key.as_str() == "google-antigravity/gemini-3.7-flash")
+		.expect("canonical Gemini 3.7 Flash row");
+	for effort in [ThinkingEffort::Minimal, ThinkingEffort::Low] {
+		assert_eq!(
+			model
+				.thinking_routing
+				.effort_routing
+				.get(&effort)
+				.map(|wire| wire.as_str()),
+			Some("gemini-3.7-flash-low")
+		);
+	}
 }
 
 #[test]

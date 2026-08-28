@@ -181,9 +181,12 @@ async fn every_external_domain_uses_one_atomic_session_lease() {
 		approval_mode:      None,
 		trusted_extensions: vec![extension()],
 		contributed_values: Vec::new(),
-		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
-			.expect("settings manager")
-			.snapshot(),
+		settings:           SettingsManager::open(
+			SettingsPaths::discover(&state, Some(&root)),
+			omp_driver::SETTINGS_CATALOG,
+		)
+		.expect("settings manager")
+		.snapshot(),
 		bridges:            RegistryBridges::default(),
 		spawn_idle_timeout: Some(2),
 	})

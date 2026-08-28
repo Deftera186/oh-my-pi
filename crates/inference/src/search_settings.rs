@@ -1,9 +1,7 @@
 //! Typed web-search routing and provider settings.
 
 use omp_core::Str;
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -184,23 +182,27 @@ impl SettingsDomain for WebSearchSettings {
 	}
 }
 
-omp_settings::inventory::submit! { DomainRegistration::of::<WebSearchSettings>() }
-
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
+
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
 
 	#[test]
 	fn projection_is_registered_and_rejects_invalid_timeout() {
 		let expected = WebSearchSettings { timeout_seconds: 42, ..Default::default() };
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("snapshot");
+		let snapshot = SettingsSnapshot::isolated(expected.clone(), CATALOG).expect("snapshot");
 		assert_eq!(snapshot.project::<WebSearchSettings>().unwrap().get(), &expected);
-		assert!(
-			registered_domains()
+		assert_eq!(
+			crate::SETTINGS_CONTRIBUTION
+				.domains
 				.iter()
-				.any(|domain| domain.name == WebSearchSettings::DOMAIN)
+				.map(|domain| domain.descriptor().name)
+				.collect::<Vec<_>>(),
+			["retry", "sampling", "provider_runtime", "web_search"],
 		);
 		assert!(
 			WebSearchSettings { timeout_seconds: 301, ..Default::default() }

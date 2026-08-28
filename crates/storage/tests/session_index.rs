@@ -17,9 +17,9 @@ use omp_proto::{
 };
 use omp_storage::{
 	index::{
-		self, EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError, JournalPosition,
-		NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind, SessionRenameObserver,
-		UsageBucketWidth, UsageDimension, UsageQuery,
+		self, ClientUsageRecord, EventProjection, IndexAuthority, IndexedEvent, IndexedWriteError,
+		JournalPosition, NewSession, RepairRecord, SessionFilter, SessionIndex, SessionKind,
+		SessionRenameObserver, UsageBucketWidth, UsageDimension, UsageQuery,
 	},
 	maintenance::MaintenanceMode,
 	transcript::{SessionId, TitleSource},
@@ -298,12 +298,126 @@ fn opening_v4_index_migrates_prompt_history_without_fabricating_timestamps() {
 			row.get::<_, i64>(0)
 		})
 		.expect("read migrated schema version");
-	assert_eq!(schema_version, 5);
+	assert_eq!(schema_version, 6);
 	assert_eq!(
 		index
 			.prompt_history("", 10)
 			.expect("migrated prompt history"),
 		vec![index::PromptHistoryEntry { prompt: Str::from("preserved prompt"), ts_ms: None }]
+	);
+}
+
+#[test]
+fn client_usage_aggregates_per_app_provider_and_model() {
+	let directory = tempdir().expect("temporary index");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("index");
+	for (recorded_ms, app, input_tokens) in
+		[(1_000, "omp", 10), (2_000, "omp", 20), (3_000, "robomp", 40)]
+	{
+		index
+			.record_client_usage(&ClientUsageRecord {
+				recorded_ms,
+				install_id: "install-a",
+				hostname: Some("host-a"),
+				app,
+				provider: "anthropic",
+				model: "claude",
+				requests: 1,
+				input_tokens,
+				output_tokens: 2,
+				cache_read_tokens: 3,
+				cache_write_tokens: 4,
+				cost_nanos_usd: 5,
+			})
+			.expect("record client usage");
+	}
+
+	let clients = index.client_usage(0).expect("client usage breakdown");
+	assert_eq!(clients.len(), 1);
+	assert_eq!(clients[0].install_id, "install-a");
+	assert_eq!(clients[0].hostname.as_deref(), Some("host-a"));
+	assert_eq!(clients[0].providers.len(), 2);
+	let omp = clients[0]
+		.providers
+		.iter()
+		.find(|usage| usage.app.as_deref() == Some("omp"))
+		.expect("omp aggregate");
+	assert_eq!(omp.requests, 2);
+	assert_eq!(omp.input_tokens, 30);
+	let robomp = clients[0]
+		.providers
+		.iter()
+		.find(|usage| usage.app.as_deref() == Some("robomp"))
+		.expect("robomp aggregate");
+	assert_eq!(robomp.requests, 1);
+	assert_eq!(robomp.input_tokens, 40);
+}
+
+#[test]
+fn opening_v5_usage_table_adds_app_without_losing_legacy_rows() {
+	let directory = tempdir().expect("temporary index");
+	let path = directory.path().join("sessions.sqlite3");
+	let connection = Connection::open(&path).expect("open v5 database");
+	connection
+		.execute_batch(
+			"CREATE TABLE index_meta (
+			    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			    schema_version INTEGER NOT NULL
+			 );
+			 INSERT INTO index_meta(singleton, schema_version) VALUES (1, 5);
+			 CREATE TABLE client_usage (
+			    id INTEGER PRIMARY KEY AUTOINCREMENT,
+			    recorded_ms INTEGER NOT NULL,
+			    install_id TEXT NOT NULL,
+			    hostname TEXT,
+			    provider TEXT NOT NULL,
+			    model TEXT NOT NULL,
+			    requests INTEGER NOT NULL,
+			    input_tokens INTEGER NOT NULL,
+			    output_tokens INTEGER NOT NULL,
+			    cache_read_tokens INTEGER NOT NULL,
+			    cache_write_tokens INTEGER NOT NULL,
+			    cost_nanos_usd INTEGER NOT NULL
+			 );
+			 INSERT INTO client_usage(
+			    recorded_ms, install_id, hostname, provider, model, requests,
+			    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_nanos_usd
+			 ) VALUES (1000, 'legacy-install', 'legacy-host', 'anthropic', 'claude', 2,
+			           11, 12, 13, 14, 15);",
+		)
+		.expect("create v5 usage schema");
+	drop(connection);
+
+	let index = SessionIndex::open(&path).expect("migrate v5 index");
+	index
+		.record_client_usage(&ClientUsageRecord {
+			recorded_ms:        2_000,
+			install_id:         "legacy-install",
+			hostname:           Some("legacy-host"),
+			app:                "robomp",
+			provider:           "anthropic",
+			model:              "claude",
+			requests:           1,
+			input_tokens:       20,
+			output_tokens:      0,
+			cache_read_tokens:  0,
+			cache_write_tokens: 0,
+			cost_nanos_usd:     1,
+		})
+		.expect("record labeled usage after migration");
+	let clients = index.client_usage(0).expect("migrated breakdown");
+	assert_eq!(clients[0].providers.len(), 2);
+	assert!(
+		clients[0]
+			.providers
+			.iter()
+			.any(|usage| usage.app.is_none() && usage.requests == 2)
+	);
+	assert!(
+		clients[0]
+			.providers
+			.iter()
+			.any(|usage| usage.app.as_deref() == Some("robomp") && usage.requests == 1)
 	);
 }
 
@@ -650,6 +764,31 @@ fn title_and_contains_kind_are_updated_only_after_journal_success() {
 }
 
 #[test]
+fn rename_session_sets_the_user_title_without_touching_missing_sessions() {
+	let directory = tempdir().expect("temporary directory");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
+	let id = session_id("rename");
+	create(&index, &id);
+
+	assert!(
+		index
+			.rename_session(&id, " Renamed ")
+			.expect("rename session")
+	);
+	assert!(
+		!index
+			.rename_session(&session_id("missing"), "Missing")
+			.expect("rename missing session")
+	);
+
+	let page = index
+		.list(&SessionFilter::default())
+		.expect("list renamed session");
+	assert_eq!(page.sessions[0].title.as_deref(), Some("Renamed"));
+	assert_eq!(page.sessions[0].title_source, Some(TitleSource::User));
+}
+
+#[test]
 fn stale_position_is_reported_after_journal_without_advancing_index_watermarks() {
 	let directory = tempdir().expect("temporary directory");
 	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("open index");
@@ -845,8 +984,9 @@ fn relocate_session_moves_complete_projection_and_updates_workspace_identity() {
 	});
 	let item = thread_pb::Item {
 		kind: Some(item::Kind::Message(thread_pb::Message {
-			role:  thread_pb::Role::User as i32,
+			role: thread_pb::Role::User as i32,
 			parts: Vec::new(),
+			..Default::default()
 		})),
 		..thread_pb::Item::default()
 	};
@@ -913,8 +1053,9 @@ fn delete_session_removes_the_projection_and_every_derived_row_atomically() {
 	});
 	let item = thread_pb::Item {
 		kind: Some(item::Kind::Message(thread_pb::Message {
-			role:  thread_pb::Role::User as i32,
+			role: thread_pb::Role::User as i32,
 			parts: Vec::new(),
+			..Default::default()
 		})),
 		..thread_pb::Item::default()
 	};
@@ -966,8 +1107,9 @@ fn lineage_rekey_moves_all_projections_retains_collision_winners_and_rolls_back_
 	let archived_unique_receipt = outcome(30, 31);
 	let retained_item = thread_pb::Item {
 		kind: Some(item::Kind::Message(thread_pb::Message {
-			role:  thread_pb::Role::User as i32,
+			role: thread_pb::Role::User as i32,
 			parts: Vec::new(),
+			..Default::default()
 		})),
 		..thread_pb::Item::default()
 	};

@@ -30,6 +30,25 @@ pub enum RelocateError {
 		#[source]
 		source:           io::Error,
 	},
+	/// The pre-move journal snapshot could not be read.
+	#[error("failed to snapshot session journal before relocation: {path}")]
+	Snapshot {
+		/// Existing journal path.
+		path:   PathBuf,
+		/// Underlying filesystem failure.
+		#[source]
+		source: io::Error,
+	},
+	/// The captured journal boundary and header could not be restored after a
+	/// failed move.
+	#[error("failed to restore session journal after relocation rollback: {path}")]
+	Restore {
+		/// Original journal path.
+		path:   PathBuf,
+		/// Underlying filesystem failure.
+		#[source]
+		source: io::Error,
+	},
 }
 
 /// Failure to persist or resolve owner-local session breadcrumbs.
@@ -163,33 +182,186 @@ pub fn resolve_session_selector(
 	Err(SessionResolveError::Ambiguous { selector: Str::from(selector), matches: ambiguous })
 }
 
-/// Relocates exact journal bytes without rewriting historical workspace state.
+/// A journal rename paired with its pre-move header and append boundary.
 ///
-/// A fileless untouched session remains fileless and reports `Ok(false)`.
-/// Existing journals are renamed on the same filesystem; their v4 header and
-/// every historical workspace event remain byte-identical.
-///
-/// # Errors
-///
-/// Fails when the destination exists or the rename cannot be performed.
-pub fn relocate_journal(source: &Path, destination: &Path) -> Result<bool, RelocateError> {
-	if !source.exists() {
-		return Ok(false);
-	}
-	if destination.exists() {
-		return Err(RelocateError::DestinationExists(destination.to_owned()));
-	}
-	if let Some(parent) = destination.parent() {
-		fs::create_dir_all(parent).map_err(|source_error| RelocateError::Io {
+/// Call [`Self::rollback`] if any operation after the rename fails. Rollback
+/// renames the journal back, truncates appended workspace mutations, and
+/// restores the captured header.
+pub struct JournalRelocation {
+	source:      PathBuf,
+	destination: PathBuf,
+	snapshot:    Option<JournalSnapshot>,
+	moved:       bool,
+}
+
+struct JournalSnapshot {
+	len:    u64,
+	header: Box<[u8]>,
+}
+
+impl JournalRelocation {
+	/// Captures the journal and relocates it without rewriting its contents.
+	///
+	/// A fileless untouched session remains fileless and returns a transaction
+	/// whose [`Self::moved`] value is false.
+	///
+	/// # Errors
+	///
+	/// Fails when the source cannot be snapshotted, the destination exists, or
+	/// the rename cannot be performed.
+	pub fn begin(source: &Path, destination: &Path) -> Result<Self, RelocateError> {
+		use std::io::BufRead as _;
+
+		let snapshot = match fs::File::open(source) {
+			Ok(file) => {
+				let len = file
+					.metadata()
+					.map_err(|error| RelocateError::Snapshot { path: source.to_owned(), source: error })?
+					.len();
+				let mut reader = io::BufReader::new(file);
+				let mut header = Vec::new();
+				reader
+					.read_until(b'\n', &mut header)
+					.map_err(|error| RelocateError::Snapshot { path: source.to_owned(), source: error })?;
+				Some(JournalSnapshot { len, header: header.into_boxed_slice() })
+			},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+			Err(source_error) => {
+				return Err(RelocateError::Snapshot {
+					path:   source.to_owned(),
+					source: source_error,
+				});
+			},
+		};
+		if snapshot.is_none() {
+			return Ok(Self {
+				source: source.to_owned(),
+				destination: destination.to_owned(),
+				snapshot,
+				moved: false,
+			});
+		}
+		match fs::metadata(destination) {
+			Ok(_) => return Err(RelocateError::DestinationExists(destination.to_owned())),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(source_error) => {
+				return Err(RelocateError::Io {
+					source_path:      source.to_owned(),
+					destination_path: destination.to_owned(),
+					source:           source_error,
+				});
+			},
+		}
+		if let Some(parent) = destination.parent() {
+			fs::create_dir_all(parent).map_err(|source_error| RelocateError::Io {
+				source_path:      source.to_owned(),
+				destination_path: destination.to_owned(),
+				source:           source_error,
+			})?;
+		}
+		fs::rename(source, destination).map_err(|source_error| RelocateError::Io {
 			source_path:      source.to_owned(),
 			destination_path: destination.to_owned(),
 			source:           source_error,
 		})?;
+		Ok(Self {
+			source: source.to_owned(),
+			destination: destination.to_owned(),
+			snapshot,
+			moved: true,
+		})
 	}
-	fs::rename(source, destination).map_err(|source_error| RelocateError::Io {
-		source_path:      source.to_owned(),
-		destination_path: destination.to_owned(),
-		source:           source_error,
-	})?;
-	Ok(true)
+
+	/// Returns whether an existing journal was renamed.
+	pub const fn moved(&self) -> bool {
+		self.moved
+	}
+
+	/// Renames the journal back and restores its pre-move header and length.
+	///
+	/// # Errors
+	///
+	/// Fails without overwriting a recreated source path, or when the rename or
+	/// snapshot restoration fails.
+	pub fn rollback(self) -> Result<(), RelocateError> {
+		if !self.moved {
+			return Ok(());
+		}
+		if self.source.exists() {
+			return Err(RelocateError::DestinationExists(self.source));
+		}
+		fs::rename(&self.destination, &self.source).map_err(|source_error| RelocateError::Io {
+			source_path:      self.destination.clone(),
+			destination_path: self.source.clone(),
+			source:           source_error,
+		})?;
+		let snapshot = self
+			.snapshot
+			.expect("a moved journal has a captured snapshot");
+		restore_journal_snapshot(&self.source, &snapshot)
+			.map_err(|source| RelocateError::Restore { path: self.source, source })
+	}
+}
+
+fn restore_journal_snapshot(path: &Path, snapshot: &JournalSnapshot) -> io::Result<()> {
+	use std::io::{Seek as _, Write as _};
+
+	let mut file = fs::OpenOptions::new().write(true).open(path)?;
+	file.set_len(snapshot.len)?;
+	file.seek(io::SeekFrom::Start(0))?;
+	file.write_all(&snapshot.header)?;
+	file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn failed_relocation_restores_pre_move_journal_snapshot() {
+		let directory = tempfile::tempdir().unwrap();
+		let source = directory.path().join("source.jsonl");
+		let destination = directory.path().join("destination").join("session.jsonl");
+		let original = concat!(
+			"{\"v\":4,\"id\":\"01J00000000000000000000000\",\"cwd\":\"/source\"}\n",
+			"{\"ts\":1,\"k\":\"workspace_move\",\"root\":\"/source\"}\n",
+		)
+		.as_bytes();
+		fs::write(&source, original).unwrap();
+
+		let relocation = JournalRelocation::begin(&source, &destination).unwrap();
+		assert!(relocation.moved());
+		use std::io::Write as _;
+		fs::OpenOptions::new()
+			.append(true)
+			.open(&destination)
+			.unwrap()
+			.write_all(b"{\"ts\":2,\"k\":\"workspace_move\",\"root\":\"/target\"}\n")
+			.unwrap();
+
+		relocation.rollback().unwrap();
+		assert_eq!(fs::read(&source).unwrap(), original);
+		assert!(!destination.exists());
+	}
+	#[test]
+	fn same_path_move_rollback_truncates_appended_workspace_metadata() {
+		use std::io::Write as _;
+
+		let directory = tempfile::tempdir().unwrap();
+		let source = directory.path().join("session.jsonl");
+		let original = b"{\"v\":4,\"id\":\"01J00000000000000000000000\",\"cwd\":\"/source\"}\n";
+		fs::write(&source, original).unwrap();
+
+		let relocation = JournalRelocation::begin(&source, &source).unwrap();
+		assert!(!relocation.moved());
+		fs::OpenOptions::new()
+			.append(true)
+			.open(&source)
+			.unwrap()
+			.write_all(b"{\"ts\":2,\"k\":\"workspace_move\",\"root\":\"/target\"}\n")
+			.unwrap();
+
+		relocation.rollback().unwrap();
+		assert_eq!(fs::read(&source).unwrap(), original);
+	}
 }

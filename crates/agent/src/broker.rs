@@ -1,7 +1,7 @@
 //! Process-global agent registry and project-scoped IRC routing.
 
 use std::{
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{HashMap, VecDeque},
 	ffi, fs, io,
 	io::{BufRead as _, Read as _},
 	path::{Path, PathBuf},
@@ -35,6 +35,7 @@ const QUERY_MAX_BYTES: usize = 4 * 1_024 * 1_024;
 const QUERY_MAX_CHARS: usize = 4_096;
 const QUERY_MAX_DEPTH: usize = 64;
 const QUERY_MAX_DURATION: Duration = Duration::from_millis(100);
+const MAX_PERSISTED_ROSTER_LATCHES: usize = 32;
 
 /// Delivery boundary requested by a peer message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
@@ -60,6 +61,16 @@ pub enum Receipt {
 	Revived,
 	/// No live or revivable target accepted the message.
 	Failed,
+}
+
+/// Result of atomically settling one recipient turn against newly queued IRC
+/// work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnEndDisposition {
+	/// No IRC work was queued at settlement; the turn is terminal.
+	Terminal,
+	/// IRC arrived after the loop's final drain and requires a continuation.
+	ContinuationPending,
 }
 
 /// Process-global lifecycle state retained after a live loop is detached.
@@ -248,10 +259,16 @@ struct RegistryEntry {
 	live_history: Option<Arc<[u8]>>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PersistedRosterLatch {
+	owned: HashMap<Str, PathBuf>,
+}
+
 struct RegistryInner {
 	records:        Mutex<HashMap<Str, RegistryEntry>>,
 	diagnostics:    Mutex<VecDeque<DiscoveryDiagnostic>>,
-	restored_roots: Mutex<HashSet<PathBuf>>,
+	restored_roots: Mutex<HashMap<PathBuf, PersistedRosterLatch>>,
+	roster_scan:    Mutex<()>,
 	generation:     watch::Sender<u64>,
 }
 
@@ -282,7 +299,8 @@ impl AgentRegistry {
 			inner: Arc::new(RegistryInner {
 				records: Mutex::new(HashMap::new()),
 				diagnostics: Mutex::new(VecDeque::with_capacity(DISCOVERY_DIAGNOSTIC_CAPACITY)),
-				restored_roots: Mutex::new(HashSet::new()),
+				restored_roots: Mutex::new(HashMap::new()),
+				roster_scan: Mutex::new(()),
 				generation,
 			}),
 		}
@@ -431,6 +449,28 @@ impl AgentRegistry {
 		CollabRegistrySnapshot { generation, agents }
 	}
 
+	/// Lists only agents whose retained parent chain belongs to `root`.
+	///
+	/// This prevents parked records discovered for another root session from
+	/// leaking into a caller's roster while preserving live descendants at any
+	/// nesting depth.
+	pub fn roster_for_root(&self, root: &str, include_advisors: bool) -> Vec<AgentRecord> {
+		let records = self.inner.records.lock();
+		let mut roster = records
+			.values()
+			.filter(|entry| include_advisors || entry.record.kind != AgentKind::Advisor)
+			.filter(|entry| record_belongs_to_root(&records, &entry.record, root))
+			.map(|entry| entry.record.clone())
+			.collect::<Vec<_>>();
+		roster.sort_by(|left, right| {
+			left
+				.last_activity_ms
+				.cmp(&right.last_activity_ms)
+				.then_with(|| left.id.cmp(&right.id))
+		});
+		roster
+	}
+
 	/// CAS-updates one lifecycle state.
 	pub fn set_status(
 		&self,
@@ -530,33 +570,23 @@ impl AgentRegistry {
 
 	/// Imports bounded valid transcript prefixes as parked records.
 	///
-	/// Malformed and incomplete journals remain untouched and are exposed
-	/// through [`Self::discovery_diagnostics`].
+	/// This unscoped entry point is retained for explicit administrative
+	/// discovery. Model-facing callers should use
+	/// [`Self::restore_transcripts_once`], which filters records to one root
+	/// session.
 	pub fn discover_transcripts(&self, directory: &Path) -> Result<usize, RegistryError> {
-		let mut imported = 0;
-		for entry in fs::read_dir(directory)? {
-			let path = entry?.path();
-			if path.extension().and_then(ffi::OsStr::to_str) != Some("jsonl") {
-				continue;
-			}
-			match cold_record(&path)? {
-				ColdScan::Record(record) => {
-					let expected = self.revision(record.id.as_str());
-					if self.compare_and_register(record, expected).is_ok() {
-						imported += 1;
-					}
-				},
-				ColdScan::Skipped(kind) => self.record_discovery_diagnostic(path, kind),
-			}
-		}
-		Ok(imported)
+		let records = self.scan_transcripts(directory)?;
+		Ok(self.import_transcripts(records).0)
 	}
 
 	/// Restores parked transcripts at most once for one canonical root session
 	/// file.
 	///
 	/// Root lookup and transcript discovery failures are warned and remain
-	/// retryable instead of failing the caller's roster request.
+	/// retryable instead of failing the caller's roster request. Distinct roots
+	/// serialize scan bodies because shared child ids mutate one process-global
+	/// registry. Settled latches are reused only while every id still points at
+	/// the transcript restored by that scan.
 	pub fn restore_transcripts_once(&self, root_file: &Path, directory: &Path) -> usize {
 		let root = match fs::canonicalize(root_file) {
 			Ok(root) => root,
@@ -569,13 +599,43 @@ impl AgentRegistry {
 				return 0;
 			},
 		};
-		if !self.inner.restored_roots.lock().insert(root.clone()) {
+		if self.restored_root_is_valid(&root) {
 			return 0;
 		}
-		match self.discover_transcripts(directory) {
-			Ok(imported) => imported,
+
+		let _scan = self.inner.roster_scan.lock();
+		if self.restored_root_is_valid(&root) {
+			return 0;
+		}
+		self.inner.restored_roots.lock().remove(&root);
+
+		let root_id = match root_session_id(&root) {
+			Ok(root_id) => root_id,
 			Err(error) => {
-				self.inner.restored_roots.lock().remove(&root);
+				tracing::warn!(
+					root = %root.display(),
+					%error,
+					"failed to read persisted agent roster root"
+				);
+				return 0;
+			},
+		};
+		let restored = self.scan_transcripts(directory).map(|records| {
+			let records = records_for_scanned_root(records, root_id.as_str());
+			self.import_transcripts(records)
+		});
+		match restored {
+			Ok((imported, owned)) => {
+				let mut latches = self.inner.restored_roots.lock();
+				if latches.len() >= MAX_PERSISTED_ROSTER_LATCHES
+					&& let Some(expired) = latches.keys().next().cloned()
+				{
+					latches.remove(&expired);
+				}
+				latches.insert(root, PersistedRosterLatch { owned });
+				imported
+			},
+			Err(error) => {
 				tracing::warn!(
 					root = %root.display(),
 					path = %directory.display(),
@@ -587,6 +647,65 @@ impl AgentRegistry {
 		}
 	}
 
+	fn restored_root_is_valid(&self, root: &Path) -> bool {
+		let latches = self.inner.restored_roots.lock();
+		let Some(latch) = latches.get(root) else {
+			return false;
+		};
+		let records = self.inner.records.lock();
+		latch.owned.iter().all(|(id, transcript)| {
+			find_record(&records, id.as_str()).is_some_and(|(_, entry)| {
+				entry.record.transcript.as_deref() == Some(transcript.as_path())
+			})
+		})
+	}
+
+	fn scan_transcripts(&self, directory: &Path) -> Result<Vec<AgentRecord>, RegistryError> {
+		let mut records = Vec::new();
+		for entry in fs::read_dir(directory)? {
+			let path = entry?.path();
+			if path.extension().and_then(ffi::OsStr::to_str) != Some("jsonl") {
+				continue;
+			}
+			match cold_record(&path)? {
+				ColdScan::Record(record) => records.push(record),
+				ColdScan::Skipped(kind) => self.record_discovery_diagnostic(path, kind),
+			}
+		}
+		Ok(records)
+	}
+
+	fn import_transcripts(&self, records: Vec<AgentRecord>) -> (usize, HashMap<Str, PathBuf>) {
+		let mut imported = 0;
+		let mut owned = HashMap::new();
+		for record in records {
+			let id = record.id.clone();
+			let transcript = record.transcript.clone();
+			let existing = self.record(id.as_str());
+			let replaceable = existing.as_ref().is_none_or(|(current, _)| {
+				current.status == RegistryStatus::Parked && current.transcript.is_some()
+			});
+			if replaceable {
+				let expected = existing.map(|(_, revision)| revision);
+				if self.compare_and_register(record, expected).is_ok() {
+					imported += 1;
+				}
+			}
+			if let Some(transcript) = transcript
+				&& self.registry_transcript_matches(id.as_str(), &transcript)
+			{
+				owned.insert(id, transcript);
+			}
+		}
+		(imported, owned)
+	}
+
+	fn registry_transcript_matches(&self, id: &str, transcript: &Path) -> bool {
+		self
+			.record(id)
+			.is_some_and(|(record, _)| record.transcript.as_deref() == Some(transcript))
+	}
+
 	/// Returns retained bounded-prefix diagnostics, oldest first.
 	pub fn discovery_diagnostics(&self) -> Vec<DiscoveryDiagnostic> {
 		self.inner.diagnostics.lock().iter().cloned().collect()
@@ -596,6 +715,32 @@ impl AgentRegistry {
 	/// bytes. Child names become dot-separated artifact stems.
 	pub fn resolve_agent(&self, resource: &str) -> Result<Vec<u8>, RegistryError> {
 		Ok(fs::read(self.agent_path(resource)?)?)
+	}
+
+	/// Resolves an agent artifact with the caller root taking precedence over
+	/// the process-global registry.
+	pub fn resolve_agent_from(
+		&self,
+		resource: &str,
+		preferred_directory: &Path,
+	) -> Result<Vec<u8>, RegistryError> {
+		Ok(fs::read(self.agent_path_from(resource, preferred_directory)?)?)
+	}
+
+	/// Resolves and queries an agent artifact with the caller root taking
+	/// precedence over the process-global registry.
+	pub fn resolve_agent_query_from(
+		&self,
+		resource: &str,
+		query: &str,
+		preferred_directory: &Path,
+	) -> Result<Vec<u8>, RegistryError> {
+		let path = self.agent_path_from(resource, preferred_directory)?;
+		if fs::metadata(&path)?.len() > QUERY_MAX_BYTES as u64 {
+			return Err(RegistryError::QueryLimit);
+		}
+		let bytes = fs::read(path)?;
+		bounded_json_query(&bytes, query)
 	}
 
 	/// Resolves an output and applies one bounded jq-compatible expression.
@@ -610,6 +755,31 @@ impl AgentRegistry {
 		}
 		let bytes = fs::read(path)?;
 		bounded_json_query(&bytes, query)
+	}
+
+	/// Resolves an agent artifact path with the caller root taking precedence
+	/// over the process-global registry.
+	pub fn agent_path_from(
+		&self,
+		resource: &str,
+		preferred_directory: &Path,
+	) -> Result<PathBuf, RegistryError> {
+		let resource = resource.trim_start_matches('/');
+		let (id, child) = resource.split_once('/').unwrap_or((resource, ""));
+		let suffix = if child.is_empty() {
+			String::new()
+		} else {
+			format!(".{}", child.replace('/', "."))
+		};
+		if valid_artifact_component(id)
+			&& (suffix.is_empty() || valid_artifact_component(&suffix[1..]))
+		{
+			let preferred = preferred_directory.join(format!("{id}{suffix}.md"));
+			if preferred.is_file() {
+				return Ok(preferred);
+			}
+		}
+		self.agent_path(resource)
 	}
 
 	fn agent_path(&self, resource: &str) -> Result<PathBuf, RegistryError> {
@@ -652,6 +822,45 @@ impl AgentRegistry {
 		true
 	}
 
+	/// Resolves history with the caller's transcript directory taking
+	/// precedence over a colliding process-global registry entry.
+	pub fn resolve_history_from(
+		&self,
+		resource: &str,
+		preferred_directory: &Path,
+	) -> Result<Vec<u8>, RegistryError> {
+		let id = resource.trim_matches('/');
+		if id.is_empty() {
+			return Ok(self.history_index().into_bytes());
+		}
+		if id.starts_with("__advisor") {
+			return Err(RegistryError::ResourceNotFound(Str::new(id)));
+		}
+		if valid_artifact_component(id)
+			&& let Ok(entries) = fs::read_dir(preferred_directory)
+		{
+			for entry in entries {
+				let entry = entry?;
+				let path = entry.path();
+				if path.extension().and_then(ffi::OsStr::to_str) == Some("jsonl")
+					&& path
+						.file_stem()
+						.and_then(ffi::OsStr::to_str)
+						.is_some_and(|stem| stem.eq_ignore_ascii_case(id))
+				{
+					return Ok(fs::read(path)?);
+				}
+			}
+		}
+		if self
+			.record(id)
+			.is_some_and(|(record, _)| record.kind == AgentKind::Advisor)
+		{
+			return Err(RegistryError::ResourceNotFound(Str::new(id)));
+		}
+		self.resolve_history(resource)
+	}
+
 	/// Resolves `history://` to a roster index and `history://<id>` to immutable
 	/// transcript bytes.
 	pub fn resolve_history(&self, resource: &str) -> Result<Vec<u8>, RegistryError> {
@@ -681,6 +890,34 @@ impl AgentRegistry {
 		output.push_str("|---|---|---|---|---|---|---|---|---:|\n");
 		let now = now_ms();
 		for record in self.roster(false) {
+			let age = now.saturating_sub(record.last_activity_ms) / 1_000;
+			output.push_str(&format!(
+				"| {} | {} | {} | {} | {}/{} | {} | {} → {} | {} | {}s |\n",
+				record.id,
+				record.name,
+				record.kind,
+				record.status,
+				record.parent.as_deref().unwrap_or("-"),
+				record.depth,
+				record.definition.as_deref().unwrap_or("-"),
+				record.model.as_deref().unwrap_or("-"),
+				record.serving_model.as_deref().unwrap_or("-"),
+				record.task.as_deref().unwrap_or("-"),
+				age,
+			));
+		}
+		output
+	}
+
+	/// Renders the `history://` index scoped to one caller root session.
+	pub fn history_index_for_root(&self, root: &str) -> String {
+		let mut output = String::from(
+			"| id | name | kind | status | parent/depth | definition | model → serving | task | last \
+			 active |\n",
+		);
+		output.push_str("|---|---|---|---|---|---|---|---|---:|\n");
+		let now = now_ms();
+		for record in self.roster_for_root(root, false) {
 			let age = now.saturating_sub(record.last_activity_ms) / 1_000;
 			output.push_str(&format!(
 				"| {} | {} | {} | {} | {}/{} | {} | {} → {} | {} | {}s |\n",
@@ -922,6 +1159,7 @@ struct RegisteredNode {
 	revival:         Option<flume::Sender<RevivalRequest>>,
 	revival_pending: bool,
 	idle:            bool,
+	terminal_turn:   u64,
 }
 
 struct DeliveryCache {
@@ -1039,6 +1277,7 @@ impl Broker {
 				revival:         None,
 				revival_pending: false,
 				idle:            true,
+				terminal_turn:   0,
 			});
 		self.bump_generation();
 		Ok(BrokerInbox {
@@ -1070,6 +1309,7 @@ impl Broker {
 			revival:         Some(revival),
 			revival_pending: false,
 			idle:            true,
+			terminal_turn:   0,
 		});
 		self.bump_generation();
 		Ok(())
@@ -1157,6 +1397,60 @@ impl Broker {
 				RegistryStatus::Running
 			},
 		)?;
+		Ok(())
+	}
+
+	/// Atomically completes one fully unwound turn unless IRC work arrived after
+	/// the loop's final drain.
+	///
+	/// A pending interrupt keeps the node running and requires the supervisor to
+	/// issue an empty-input continuation. Only a truly quiescent boundary bumps
+	/// the terminal-turn generation observed by awaited sends.
+	pub fn finish_turn(&self, id: &str) -> Result<TurnEndDisposition, RegistryError> {
+		let mut nodes = self.inner.nodes.lock();
+		let (_, node) =
+			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
+		if node
+			.mailbox
+			.as_ref()
+			.is_some_and(MailboxSender::has_pending)
+		{
+			node.idle = false;
+			drop(nodes);
+			self
+				.inner
+				.registry
+				.set_status(id, None, RegistryStatus::Running)?;
+			return Ok(TurnEndDisposition::ContinuationPending);
+		}
+		node.idle = true;
+		node.terminal_turn = node.terminal_turn.wrapping_add(1);
+		drop(nodes);
+		self
+			.inner
+			.registry
+			.set_status(id, None, RegistryStatus::Idle)?;
+		self.bump_generation();
+		Ok(TurnEndDisposition::Terminal)
+	}
+
+	/// Marks a failed turn terminal even when queued work cannot be continued.
+	///
+	/// Failure callers use this only after an attempted IRC wake continuation
+	/// also failed, ensuring awaited senders are not stranded behind work the
+	/// recipient can no longer execute.
+	pub fn finish_failed_turn(&self, id: &str) -> Result<(), RegistryError> {
+		let mut nodes = self.inner.nodes.lock();
+		let (_, node) =
+			find_node_mut(&mut nodes, id).ok_or_else(|| RegistryError::NotFound(Str::new(id)))?;
+		node.idle = true;
+		node.terminal_turn = node.terminal_turn.wrapping_add(1);
+		drop(nodes);
+		self
+			.inner
+			.registry
+			.set_status(id, None, RegistryStatus::Idle)?;
+		self.bump_generation();
 		Ok(())
 	}
 
@@ -1340,6 +1634,12 @@ impl Broker {
 			.collect()
 	}
 
+	/// Returns the terminal-turn generation for one currently routed peer.
+	pub fn terminal_turn(&self, id: &str) -> Option<u64> {
+		let nodes = self.inner.nodes.lock();
+		find_node(&nodes, id).map(|(_, node)| node.terminal_turn)
+	}
+
 	fn bump_generation(&self) {
 		self
 			.inner
@@ -1367,6 +1667,12 @@ pub enum WaitError {
 	/// The requested deadline elapsed.
 	#[error("IRC wait timed out")]
 	Timeout,
+	/// An awaited-send recipient completed a terminal turn without replying.
+	#[error("awaited peer {peer} stopped without replying")]
+	AwaitTargetStopped {
+		/// Stable recipient identity.
+		peer: Str,
+	},
 	/// The awaited peer died or no other live peers remain.
 	#[error("IRC wait aborted because the peer is no longer live")]
 	PeerDead,
@@ -1406,6 +1712,37 @@ impl BrokerInbox {
 		reply_to: Option<&str>,
 		timeout: Option<Duration>,
 	) -> Result<Option<PeerMessage>, WaitError> {
+		self
+			.wait_for_timeout_inner(sender, reply_to, None, timeout)
+			.await
+	}
+
+	/// Waits for one threaded reply and settles when the recipient advances past
+	/// the terminal-turn generation observed before delivery.
+	pub async fn wait_for_reply_timeout(
+		&mut self,
+		sender: &str,
+		reply_to: &str,
+		observed_terminal_turn: u64,
+		timeout: Option<Duration>,
+	) -> Result<Option<PeerMessage>, WaitError> {
+		self
+			.wait_for_timeout_inner(
+				Some(sender),
+				Some(reply_to),
+				Some(observed_terminal_turn),
+				timeout,
+			)
+			.await
+	}
+
+	async fn wait_for_timeout_inner(
+		&mut self,
+		sender: Option<&str>,
+		reply_to: Option<&str>,
+		observed_terminal_turn: Option<u64>,
+		timeout: Option<Duration>,
+	) -> Result<Option<PeerMessage>, WaitError> {
 		use tokio::time::{self, Instant};
 		if let Some(message) = self.state.matching(sender, reply_to) {
 			return Ok(Some(message));
@@ -1418,6 +1755,14 @@ impl BrokerInbox {
 				return Ok(Some(message));
 			}
 			let broker = self.broker.upgrade().ok_or(WaitError::BrokerGone)?;
+			if observed_terminal_turn.is_some_and(|observed| {
+				find_node(&broker.nodes.lock(), sender.unwrap_or_default())
+					.is_some_and(|(_, node)| node.terminal_turn != observed)
+			}) {
+				return Err(WaitError::AwaitTargetStopped {
+					peer: Str::new(sender.unwrap_or_default()),
+				});
+			}
 			if !peer_is_live(&broker, self.owner.as_str(), sender) {
 				return Err(WaitError::PeerDead);
 			}
@@ -1473,6 +1818,28 @@ fn find_record<'a>(
 		candidate.as_str().eq_ignore_ascii_case(id)
 			|| entry.record.name.as_str().eq_ignore_ascii_case(id)
 	})
+}
+fn record_belongs_to_root(
+	records: &HashMap<Str, RegistryEntry>,
+	record: &AgentRecord,
+	root: &str,
+) -> bool {
+	if record.id.as_str().eq_ignore_ascii_case(root) {
+		return true;
+	}
+	let mut parent = record.parent.as_deref();
+	let mut remaining = records.len();
+	while let Some(id) = parent {
+		if id.eq_ignore_ascii_case(root) {
+			return true;
+		}
+		if remaining == 0 {
+			return false;
+		}
+		remaining -= 1;
+		parent = find_record(records, id).and_then(|(_, entry)| entry.record.parent.as_deref());
+	}
+	false
 }
 
 fn find_node<'a>(
@@ -1537,8 +1904,12 @@ pub fn peer_item(message: &PeerMessage) -> Item {
 		seq:           0,
 		created_at_ms: message.sent_ms,
 		kind:          Some(item::Kind::Message(ThreadMessage {
-			role:  Role::User as i32,
-			parts: vec![Part { kind: Some(part::Kind::Text(text)) }],
+			role:            Role::User as i32,
+			parts:           vec![Part { kind: Some(part::Kind::Text(text)) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}
@@ -1572,6 +1943,44 @@ fn sanitize_activity(activity: &str) -> Str {
 enum ColdScan {
 	Record(AgentRecord),
 	Skipped(DiscoveryDiagnosticKind),
+}
+fn root_session_id(path: &Path) -> Result<Str, RegistryError> {
+	path
+		.file_stem()
+		.and_then(ffi::OsStr::to_str)
+		.filter(|id| !id.is_empty())
+		.map(Str::new)
+		.ok_or_else(|| {
+			RegistryError::Io(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"persisted roster root has no UTF-8 session id",
+			))
+		})
+}
+
+fn records_for_scanned_root(records: Vec<AgentRecord>, root: &str) -> Vec<AgentRecord> {
+	let parents = records
+		.iter()
+		.map(|record| (record.id.clone(), record.parent.clone()))
+		.collect::<HashMap<_, _>>();
+	records
+		.into_iter()
+		.filter(|record| {
+			let mut parent = record.parent.as_deref();
+			let mut remaining = parents.len();
+			while let Some(id) = parent {
+				if id.eq_ignore_ascii_case(root) {
+					return true;
+				}
+				if remaining == 0 {
+					return false;
+				}
+				remaining -= 1;
+				parent = parents.get(id).and_then(Option::as_deref);
+			}
+			false
+		})
+		.collect()
 }
 
 fn cold_record(path: &Path) -> Result<ColdScan, RegistryError> {
@@ -1887,7 +2296,7 @@ mod tests {
 	use omp_core::sf;
 
 	use super::*;
-	use crate::{AgentTree, Budget, Mailbox};
+	use crate::{AgentTree, Budget, DrainPoint, Mailbox};
 
 	fn node(tree: &AgentTree, id: &str, name: &str) -> Arc<AgentNode> {
 		tree
@@ -1914,6 +2323,45 @@ mod tests {
 			session_id:    "session".into(),
 			expects_reply: false,
 		}
+	}
+	#[test]
+	fn caller_root_wins_agent_and_history_id_collisions() {
+		let registry = AgentRegistry::new();
+		let tree = AgentTree::standard(2);
+		let worker = node(&tree, "Worker", "Worker");
+		registry
+			.register_node(&worker, RegistryStatus::Parked, None)
+			.expect("register global worker");
+		let root = tempfile::tempdir().expect("caller root");
+		let preferred_artifacts = root.path().join("caller");
+		fs::create_dir_all(&preferred_artifacts).expect("preferred artifacts");
+		let preferred_history = root.path().join("sessions");
+		fs::create_dir_all(&preferred_history).expect("preferred histories");
+		let global_output = root.path().join("global.md");
+		let global_history = root.path().join("global.jsonl");
+		fs::write(&global_output, b"GLOBAL OUTPUT").expect("global output");
+		fs::write(&global_history, b"GLOBAL HISTORY").expect("global history");
+		fs::write(preferred_artifacts.join("Worker.md"), b"CALLER OUTPUT").expect("caller output");
+		fs::write(preferred_history.join("Worker.jsonl"), b"CALLER HISTORY").expect("caller history");
+		registry
+			.set_history("Worker", Some(global_history), None, None, AgentHistory {
+				output_path: Some(global_output),
+				..AgentHistory::default()
+			})
+			.expect("global history");
+
+		assert_eq!(
+			registry
+				.resolve_agent_from("Worker", &preferred_artifacts)
+				.expect("preferred output"),
+			b"CALLER OUTPUT"
+		);
+		assert_eq!(
+			registry
+				.resolve_history_from("Worker", &preferred_history)
+				.expect("preferred transcript"),
+			b"CALLER HISTORY"
+		);
 	}
 
 	#[test]
@@ -2056,6 +2504,90 @@ mod tests {
 			Err(WaitError::PeerDead)
 		);
 	}
+	#[tokio::test]
+	async fn awaited_reply_settles_when_recipient_turn_ends_without_reply() {
+		let registry = AgentRegistry::new();
+		let broker = Broker::with_registry("project".into(), registry);
+		let tree = AgentTree::standard(2);
+		let owner = node(&tree, "owner", "Owner");
+		let peer = node(&tree, "peer", "Peer");
+		let owner_mailbox = Mailbox::new();
+		let mut peer_mailbox = Mailbox::new();
+		let mut inbox = broker
+			.register(&owner, owner_mailbox.sender())
+			.expect("owner");
+		broker.register(&peer, peer_mailbox.sender()).expect("peer");
+		let observed = broker.terminal_turn("peer").expect("terminal generation");
+		let mut outbound = message("owner", "peer", 7);
+		outbound.expects_reply = true;
+		let reply_to = outbound.id.clone();
+		broker.route(outbound).expect("route awaited message");
+		assert_eq!(
+			peer_mailbox.drain(DrainPoint::Idle, false).len(),
+			1,
+			"recipient consumed the awaited message"
+		);
+		assert_eq!(
+			broker.finish_turn("peer").expect("settle peer turn"),
+			TurnEndDisposition::Terminal
+		);
+
+		let result = tokio::time::timeout(
+			Duration::from_millis(100),
+			inbox.wait_for_reply_timeout(
+				"peer",
+				reply_to.as_str(),
+				observed,
+				Some(Duration::from_secs(30)),
+			),
+		)
+		.await
+		.expect("terminal monitor settles promptly");
+		assert_eq!(result, Err(WaitError::AwaitTargetStopped { peer: "peer".into() }));
+	}
+
+	#[tokio::test]
+	async fn queued_irc_continuation_does_not_emit_terminal_turn_end() {
+		let registry = AgentRegistry::new();
+		let broker = Broker::with_registry("project".into(), registry);
+		let tree = AgentTree::standard(2);
+		let owner = node(&tree, "owner", "Owner");
+		let peer = node(&tree, "peer", "Peer");
+		let owner_mailbox = Mailbox::new();
+		let peer_mailbox = Mailbox::new();
+		let mut inbox = broker
+			.register(&owner, owner_mailbox.sender())
+			.expect("owner");
+		broker.register(&peer, peer_mailbox.sender()).expect("peer");
+		let observed = broker.terminal_turn("peer").expect("terminal generation");
+		let outbound = message("owner", "peer", 8);
+		let reply_to = outbound.id.clone();
+		broker.route(outbound).expect("queue tail IRC");
+		assert_eq!(
+			broker.finish_turn("peer").expect("settle peer turn"),
+			TurnEndDisposition::ContinuationPending
+		);
+		broker
+			.set_idle("peer", true)
+			.expect("mid-turn continuation idle flip");
+		assert_eq!(broker.terminal_turn("peer"), Some(observed));
+
+		assert!(
+			tokio::time::timeout(
+				Duration::from_millis(20),
+				inbox.wait_for_reply_timeout(
+					"peer",
+					reply_to.as_str(),
+					observed,
+					Some(Duration::from_secs(30)),
+				),
+			)
+			.await
+			.is_err(),
+			"non-terminal continuation must keep the reply waiter armed"
+		);
+	}
+
 	#[test]
 	fn persisted_roster_restore_latches_per_root_file() {
 		let scratch = tempfile::tempdir().expect("temporary directory");
@@ -2071,5 +2603,77 @@ mod tests {
 		assert_eq!(registry.restore_transcripts_once(&first, &transcripts), 0);
 		assert_eq!(registry.restore_transcripts_once(&second, &transcripts), 0);
 		assert_eq!(registry.inner.restored_roots.lock().len(), 2);
+	}
+
+	#[test]
+	fn persisted_roster_latch_refreshes_after_owned_reference_is_superseded() {
+		let scratch = tempfile::tempdir().expect("temporary directory");
+		let transcripts = scratch.path().join("eval-agents");
+		fs::create_dir(&transcripts).expect("transcript directory");
+		let root_file = scratch.path().join("root.jsonl");
+		fs::write(&root_file, b"").expect("root transcript");
+		let first_transcript = transcripts.join("first.jsonl");
+		let replacement_transcript = transcripts.join("replacement.jsonl");
+		let registry = AgentRegistry::new();
+		let record = |transcript: PathBuf| AgentRecord {
+			id:               "shared".into(),
+			name:             "Shared".into(),
+			kind:             AgentKind::Subagent,
+			parent:           Some("root".into()),
+			session:          "shared".into(),
+			depth:            1,
+			status:           RegistryStatus::Parked,
+			activity:         Str::default(),
+			last_activity_ms: 0,
+			transcript:       Some(transcript),
+			definition:       None,
+			model:            None,
+			serving_model:    None,
+			task:             None,
+			history:          AgentHistory::default(),
+		};
+		let revision = registry
+			.compare_and_register(record(first_transcript.clone()), None)
+			.expect("first parked ref");
+		let root = fs::canonicalize(&root_file).expect("canonical root");
+		registry
+			.inner
+			.restored_roots
+			.lock()
+			.insert(root.clone(), PersistedRosterLatch {
+				owned: HashMap::from([("shared".into(), first_transcript)]),
+			});
+		registry
+			.compare_and_register(record(replacement_transcript), Some(revision))
+			.expect("supersede parked ref");
+
+		assert_eq!(registry.restore_transcripts_once(&root_file, &transcripts), 0);
+		assert!(
+			registry
+				.inner
+				.restored_roots
+				.lock()
+				.get(&root)
+				.expect("refreshed latch")
+				.owned
+				.is_empty(),
+			"stale owned identity was discarded by the refresh"
+		);
+	}
+
+	#[test]
+	fn persisted_roster_scan_failure_does_not_poison_retry() {
+		let scratch = tempfile::tempdir().expect("temporary directory");
+		let root_file = scratch.path().join("root.jsonl");
+		let transcripts = scratch.path().join("eval-agents");
+		fs::write(&root_file, b"").expect("root transcript");
+		let root = fs::canonicalize(&root_file).expect("canonical root");
+		let registry = AgentRegistry::new();
+
+		assert_eq!(registry.restore_transcripts_once(&root_file, &transcripts), 0);
+		assert!(!registry.inner.restored_roots.lock().contains_key(&root));
+		fs::create_dir(&transcripts).expect("transcript directory");
+		assert_eq!(registry.restore_transcripts_once(&root_file, &transcripts), 0);
+		assert!(registry.inner.restored_roots.lock().contains_key(&root));
 	}
 }

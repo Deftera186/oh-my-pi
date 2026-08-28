@@ -35,6 +35,7 @@ pub mod process_log;
 pub mod process_store;
 pub mod recovery;
 mod resource_materializer;
+mod sandbox_proxy;
 pub mod schedules;
 pub mod search_backend;
 mod server;
@@ -102,7 +103,9 @@ use omp_proto::{
 	},
 	inference::v1::{Value, ValueMap, value},
 };
-use omp_settings::snapshot::SettingsSnapshot;
+use omp_settings::{
+	DomainRegistration, SettingsCatalog, SettingsContribution, snapshot::SettingsSnapshot,
+};
 use omp_storage::index::SessionIndex;
 use omp_tool::Registry;
 use omp_tools::{
@@ -135,6 +138,41 @@ use self::{
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
 use crate::eval::{BridgeHostError, ParentSessionHost};
+
+/// Settings domains owned by the environment daemon.
+pub const SETTINGS_CONTRIBUTION: SettingsContribution = SettingsContribution {
+	domains:     &[
+		DomainRegistration::of::<lsp_settings::LspSettings>(),
+		DomainRegistration::of::<tool_settings::ToolSettings>(),
+		DomainRegistration::of::<exec_settings::AcpSettings>(),
+		DomainRegistration::of::<exec_settings::AsyncJobSettings>(),
+		DomainRegistration::of::<exec_settings::SandboxSettings>(),
+		DomainRegistration::of::<exec_settings::ShellSettings>(),
+		DomainRegistration::of::<mcp::settings::McpSettings>(),
+	],
+	normalizers: &[],
+};
+
+#[cfg(test)]
+const TEST_SETTINGS_CATALOG: SettingsCatalog =
+	SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &SETTINGS_CONTRIBUTION]);
+
+#[cfg(test)]
+mod settings_tests {
+	use super::*;
+
+	#[test]
+	fn contribution_lists_every_envd_domain() {
+		assert_eq!(
+			SETTINGS_CONTRIBUTION
+				.domains
+				.iter()
+				.map(|domain| domain.descriptor().name)
+				.collect::<Vec<_>>(),
+			["lsp", "tools", "acp", "async", "sandbox", "shell", "mcp"]
+		);
+	}
+}
 
 /// Owned configuration for one project environment daemon.
 #[derive(Clone, Debug)]
@@ -284,20 +322,38 @@ pub fn migrate_session_artifacts(
 
 /// Starts the project environment daemon and serves until process shutdown.
 #[cfg(unix)]
-pub async fn run(config: EnvdConfig, bridges: RegistryBridges) -> miette::Result<()> {
-	server::run(config, bridges).await.into_diagnostic()
+pub async fn run(
+	config: EnvdConfig,
+	catalog: SettingsCatalog,
+	bridges: RegistryBridges,
+) -> miette::Result<()> {
+	server::run(config, catalog, bridges)
+		.await
+		.into_diagnostic()
 }
 
 /// Starts the Windows named-pipe project environment daemon.
 #[cfg(windows)]
-pub async fn run(config: EnvdConfig, bridges: RegistryBridges) -> miette::Result<()> {
-	windows::run(config, bridges).await.into_diagnostic()
+pub async fn run(
+	config: EnvdConfig,
+	catalog: SettingsCatalog,
+	bridges: RegistryBridges,
+) -> miette::Result<()> {
+	windows::run(config, catalog, bridges)
+		.await
+		.into_diagnostic()
 }
 
 /// Reports that no owner-local environment transport exists on this target.
 #[cfg(not(any(unix, windows)))]
-pub async fn run(config: EnvdConfig, bridges: RegistryBridges) -> miette::Result<()> {
-	server::run(config, bridges).await.into_diagnostic()
+pub async fn run(
+	config: EnvdConfig,
+	catalog: SettingsCatalog,
+	bridges: RegistryBridges,
+) -> miette::Result<()> {
+	server::run(config, catalog, bridges)
+		.await
+		.into_diagnostic()
 }
 
 /// Options for attaching a session composition to its detached project daemon.
@@ -586,6 +642,7 @@ impl ProjectEnvironment {
 			None,
 			false,
 			None,
+			settings.catalog(),
 			Some(settings.as_ref()),
 			bridges,
 		)
@@ -779,6 +836,7 @@ impl ProjectEnvironment {
 	pub async fn isolated(
 		root: &Path,
 		state_dir: &Path,
+		catalog: SettingsCatalog,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let command_credentials = bridges.command_credentials.clone();
@@ -786,7 +844,8 @@ impl ProjectEnvironment {
 		let (worker_config, data_bindings) =
 			worker_config(state_dir, true, &[], &[], omp_tool::DEFAULT_INTERRUPT_GRACE)?;
 		let server = Arc::new(
-			EnvServer::open_local(root, state_dir, Registry::new(), worker_config, bridges).await?,
+			EnvServer::open_local(root, state_dir, Registry::new(), worker_config, catalog, bridges)
+				.await?,
 		);
 		let registry = server.registry();
 		let eval_bridge = server.eval_bridge();

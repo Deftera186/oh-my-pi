@@ -19,23 +19,25 @@ pub(super) const DESCRIPTION_PANE_ID: &str = "git-commit-description-pane";
 pub(super) const AMEND_ID: &str = "git-amend";
 pub(super) const COMMIT_ID: &str = "git-commit";
 pub(super) const VIEW_STYLE_ID: &str = "git-sidebar-view";
+pub(super) const AI_STAGE_ID: &str = "git-ai-stage";
+pub(super) const AI_STAGE_BUTTON_ID: &str = "git-ai-stage-submit";
 
 /// Visual partition within one staged, unstaged, or commit file section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SidebarGroup {
 	/// Modified, deleted, renamed, and conflicted tracked paths.
 	Changes,
-	/// Added and untracked paths rendered without redundant status badges.
+	/// Unstaged additions rendered separately without redundant status badges.
 	Additions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SidebarTarget {
 	ViewStyle,
-	StageAll,
-	UnstageAll,
+	Section { area: GitArea },
 	Directory { area: GitArea, path: Str, depth: usize, group: SidebarGroup },
 	File { area: GitArea, path: Str, depth: usize },
+	AiStage,
 	Amend,
 	Summary,
 	Description,
@@ -64,10 +66,12 @@ impl SidebarTarget {
 	pub(super) fn key(&self) -> Str {
 		match self {
 			Self::ViewStyle => Str::new_static("sidebar-view"),
-			Self::StageAll => Str::new_static("unstaged-section"),
-			Self::UnstageAll => Str::new_static("staged-section"),
+			Self::Section { area: GitArea::Unstaged } => Str::new_static("unstaged-section"),
+			Self::Section { area: GitArea::Staged } => Str::new_static("staged-section"),
+			Self::Section { area: GitArea::Commit } => Str::new_static("commit-section"),
 			Self::Directory { area, path, group, .. } => sf!("dir:{area:?}:{group:?}:{path}"),
 			Self::File { area, path, .. } => sf!("file:{area:?}:{path}"),
+			Self::AiStage => Str::new_static("ai-stage"),
 			Self::Amend => Str::new_static("amend"),
 			Self::Summary => Str::new_static("summary"),
 			Self::Description => Str::new_static("description"),
@@ -76,7 +80,7 @@ impl SidebarTarget {
 	}
 
 	pub(super) const fn is_tree_node(&self) -> bool {
-		matches!(self, Self::StageAll | Self::UnstageAll | Self::Directory { .. } | Self::File { .. })
+		matches!(self, Self::Section { .. } | Self::Directory { .. } | Self::File { .. })
 	}
 
 	pub(super) const fn is_file_or_directory(&self) -> bool {
@@ -101,6 +105,7 @@ impl GitWorkbench {
 		width: u16,
 		summary: &str,
 		description: &str,
+		ai_instruction: &str,
 		selected_key: Option<&str>,
 		scroll_top: usize,
 	) -> Col {
@@ -123,7 +128,7 @@ impl GitWorkbench {
 		} else {
 			let description_rows = u16::try_from(description.lines().count().clamp(1, 5)).unwrap_or(5);
 			content_rows
-				.saturating_sub(7_u16.saturating_add(description_rows))
+				.saturating_sub(8_u16.saturating_add(description_rows))
 				.max(1)
 		};
 		tree = tree.with(Prop::H, tree_rows);
@@ -146,7 +151,7 @@ impl GitWorkbench {
 		let branch = self.snapshot.branch.as_deref().unwrap_or("HEAD");
 		let view = if self.tree { "tree" } else { "path" };
 		let amend = self.amend;
-		let disabled = !self.commit_enabled_with(summary);
+		let disabled = !self.commit_enabled_with(summary, description);
 		let commit_label = self.commit_button_label();
 		let commit_text =
 			sf!("{} {commit_label}", self.ctx.charset.icon_named("commit-node").unwrap_or(""));
@@ -158,6 +163,7 @@ impl GitWorkbench {
 				.with(Prop::Placeholder, "Description")
 				.with(Prop::MaxRows, 5_u16),
 		);
+		let wand = self.ctx.charset.icon_named("magic-wand").unwrap_or("");
 		dom! {
 			<col w={width}>
 				<row h=1 gap=1>
@@ -172,6 +178,10 @@ impl GitWorkbench {
 				</row>
 				<hr fg=border/>
 				{tree}
+				<row h=1 gap=1>
+					<input id={AI_STAGE_ID} value={ai_instruction} grow rail placeholder="What should we stage?"/>
+					<button id={AI_STAGE_BUTTON_ID} variant=tint color=accent active>{wand}</button>
+				</row>
 				<hr fg=border/>
 				<checkbox id={AMEND_ID} checked={amend} label="Amend previous commit"/>
 				<input id={SUMMARY_ID} value={summary} limit=72 rail placeholder="Commit summary"/>
@@ -194,13 +204,13 @@ pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) 
 				.cloned()
 				.map(|file| (GitArea::Commit, file))
 				.collect::<Vec<_>>();
-			append_partitioned_files(&mut rows, files, tree, ctx);
+			append_files(&mut rows, &files, tree, ctx, SidebarGroup::Changes);
 		}
 		rows.push(action_row(SidebarTarget::ViewStyle, Str::default()));
 		return rows;
 	}
 	rows.push(action_row(
-		SidebarTarget::StageAll,
+		SidebarTarget::Section { area: GitArea::Unstaged },
 		sf!("Unstaged Files ({})", snapshot.unstaged.len()),
 	));
 	let unstaged = snapshot
@@ -210,16 +220,19 @@ pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) 
 		.map(|file| (GitArea::Unstaged, file))
 		.collect::<Vec<_>>();
 	append_partitioned_files(&mut rows, unstaged, tree, ctx);
-	rows
-		.push(action_row(SidebarTarget::UnstageAll, sf!("Staged Files ({})", snapshot.staged.len())));
+	rows.push(action_row(
+		SidebarTarget::Section { area: GitArea::Staged },
+		sf!("Staged Files ({})", snapshot.staged.len()),
+	));
 	let staged = snapshot
 		.staged
 		.iter()
 		.cloned()
 		.map(|file| (GitArea::Staged, file))
 		.collect::<Vec<_>>();
-	append_partitioned_files(&mut rows, staged, tree, ctx);
+	append_files(&mut rows, &staged, tree, ctx, SidebarGroup::Changes);
 	rows.push(action_row(SidebarTarget::ViewStyle, Str::default()));
+	rows.push(action_row(SidebarTarget::AiStage, Str::default()));
 	rows.push(action_row(SidebarTarget::Amend, Str::default()));
 	rows.push(action_row(SidebarTarget::Summary, Str::default()));
 	rows.push(action_row(SidebarTarget::Description, Str::default()));
@@ -353,7 +366,7 @@ fn file_sidebar_row(
 	let (directory, basename) = split_path(file.path.as_str());
 	SidebarRow {
 		target: SidebarTarget::File { area, path: file.path.clone(), depth },
-		status: (!is_addition(file)).then(|| status.to_str()),
+		status: (area != GitArea::Unstaged || !is_addition(file)).then(|| status.to_str()),
 		status_color,
 		directory: if tree {
 			Str::default()
@@ -374,13 +387,13 @@ fn sidebar_tree(rows: &[SidebarRow], collapsed: &BTreeSet<Str>) -> Tree {
 	let mut index = 0;
 	while index < rows.len() {
 		match rows[index].target {
-			SidebarTarget::StageAll | SidebarTarget::UnstageAll => {
+			SidebarTarget::Section { area: GitArea::Unstaged | GitArea::Staged } => {
 				let section = &rows[index];
 				index += 1;
 				let children = tree_level(rows, &mut index, 0, collapsed);
 				let mut node = row_node(section, collapsed).with(
 					Prop::Action,
-					if matches!(section.target, SidebarTarget::StageAll) {
+					if matches!(section.target, SidebarTarget::Section { area: GitArea::Unstaged }) {
 						"Stage All"
 					} else {
 						"Unstage All"
@@ -435,7 +448,7 @@ fn row_node(row: &SidebarRow, collapsed: &BTreeSet<Str>) -> TreeNode {
 	let key = row.target.key();
 	let mut node = TreeNode::new().key(key.clone()).label(row.basename.clone());
 	match row.target {
-		SidebarTarget::StageAll | SidebarTarget::UnstageAll => {
+		SidebarTarget::Section { .. } => {
 			node = node
 				.with(Prop::Open, !collapsed.contains(&key))
 				.with(Prop::Bold, true)

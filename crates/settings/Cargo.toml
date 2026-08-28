@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 flume.workspace = true
 globset.workspace = true
-inventory.workspace = true
 omp-slopjson.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true
@@ -29,5 +28,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

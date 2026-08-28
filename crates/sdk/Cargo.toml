@@ -10,28 +10,28 @@ description = "Stable native embedding facade for OMP sessions, callbacks, disco
 readme = "README.md"
 
 [dependencies]
-bytes = { workspace = true }
-flume = { workspace = true }
-futures = { workspace = true }
-omp-docserver = { workspace = true }
-omp-agent = { workspace = true }
-omp-env = { workspace = true }
-omp-core = { workspace = true }
-omp-catalog = { workspace = true }
-omp-inference = { workspace = true }
-omp-proto = { workspace = true }
-omp-secrets = { workspace = true }
-omp-observability = { workspace = true }
-omp-tool = { workspace = true }
-omp-tools = { workspace = true }
-omp-walker = { workspace = true }
-parking_lot = { workspace = true }
-serde_json = { workspace = true }
-strum = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-url = { workspace = true }
+bytes.workspace = true
+flume.workspace = true
+futures.workspace = true
+omp-docserver.workspace = true
+omp-agent.workspace = true
+omp-env.workspace = true
+omp-core.workspace = true
+omp-catalog.workspace = true
+omp-inference.workspace = true
+omp-proto.workspace = true
+omp-secrets.workspace = true
+omp-observability.workspace = true
+omp-tool.workspace = true
+omp-tools.workspace = true
+omp-walker.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

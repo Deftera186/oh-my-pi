@@ -1802,8 +1802,12 @@ fn regime_message(text: impl Into<String>) -> Item {
 	Item {
 		created_at_ms: now_ms(),
 		kind: Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
+			role:            thread::Role::User as i32,
+			parts:           vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		..Item::default()
 	}

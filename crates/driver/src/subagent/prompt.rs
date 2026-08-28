@@ -2,7 +2,7 @@
 
 use std::{path::Path, sync::LazyLock};
 
-use omp_agent::{AgentDefinition, AgentNode};
+use omp_agent::{AgentDefinition, AgentRecord};
 use omp_core::Str;
 use omp_scribe::{
 	Engine, Error as ScribeError, HelperError, Props, Template, Value as ScribeValue, map,
@@ -103,6 +103,10 @@ pub struct SubagentPromptInput<'a> {
 	pub roster_generation: u64,
 	/// Peers visible to this child.
 	pub peers:             &'a [PromptPeer<'a>],
+	/// Current-root parked peers omitted from the initial prompt.
+	pub parked_count:      usize,
+	/// Live peers dropped by the bounded initial roster.
+	pub omitted_count:     usize,
 	/// Model-family behavioral capabilities.
 	pub capabilities:      ModelFamilyCapabilities,
 	/// Whether plan mode attenuated this child.
@@ -158,6 +162,8 @@ pub fn props(input: &SubagentPromptInput<'_>, parent: &Props) -> Props {
 			})
 			.collect::<Vec<_>>(),
 	);
+	patch.set("parked_count", input.parked_count as i64);
+	patch.set("omitted_count", input.omitted_count as i64);
 	patch.set("caps", map! {
 		"codex_style" => input.capabilities.codex_style,
 		"parallel_tool_calls" => input.capabilities.parallel_tool_calls,
@@ -180,23 +186,25 @@ pub fn compose(input: SubagentPromptInput<'_>, parent: &Props) -> Str {
 		.expect("typed subagent props satisfy the embedded template")
 }
 
-/// Projects one live roster node without transferring scheduling authority.
-pub fn peer_from_node(node: &AgentNode) -> (Str, Str, Str, Str) {
+/// Projects one live roster record without transferring scheduling authority.
+pub fn peer_from_record(record: &AgentRecord) -> (Str, Str, Str, Str) {
 	(
-		node.name.clone(),
-		node
+		record.name.clone(),
+		record
 			.definition
 			.clone()
-			.unwrap_or_else(|| Str::new_static("main")),
-		Str::from(node.status().to_string()),
-		node.activity(),
+			.unwrap_or_else(|| Str::from(record.kind.to_string())),
+		Str::from(record.status.to_string()),
+		record.activity.clone(),
 	)
 }
 #[cfg(test)]
 mod tests {
 	use std::collections::HashSet;
 
-	use super::system_template;
+	use omp_scribe::{Props, map};
+
+	use super::{engine, system_template};
 
 	#[test]
 	fn subagent_template_parses_and_uses_registered_keys() {
@@ -207,5 +215,39 @@ mod tests {
 		for key in system_template().referenced_keys() {
 			assert!(keys.contains(key), "subagent template references unregistered key {key}");
 		}
+	}
+
+	#[test]
+	fn subagent_roster_reports_omitted_live_and_parked_counts() {
+		let mut props = Props::new();
+		props.set("irc_enabled", true);
+		props.set("self_name", "Worker");
+		props.set("self_role", "task");
+		props.set("roster_generation", 7_i64);
+		props.set("peers", vec![map! {
+			"name" => "Main",
+			"role" => "main",
+			"status" => "running",
+			"activity" => "working",
+		}]);
+		props.set("omitted_count", 3_i64);
+		props.set("parked_count", 27_i64);
+		props.set("caps", map! {
+			"codex_style" => false,
+			"parallel_tool_calls" => false,
+			"structured_yield" => false,
+		});
+		let rendered = system_template()
+			.render_str(engine(), &props)
+			.expect("roster prompt renders");
+		assert!(rendered.contains("3 more live peer(s) omitted."));
+		assert!(rendered.contains("27 parked peer(s) omitted."));
+		assert!(!rendered.contains("- (no live agents)"));
+		props.set("peers", Vec::<omp_scribe::Value>::new());
+		props.set("omitted_count", 0_i64);
+		let empty = system_template()
+			.render_str(engine(), &props)
+			.expect("empty live roster renders");
+		assert!(empty.contains("- (no live agents)"));
 	}
 }

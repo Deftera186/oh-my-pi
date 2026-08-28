@@ -403,7 +403,15 @@ async fn rpc_host(
 	let channel = omp_rpc::uds::connect(&socket)
 		.await
 		.expect("connect real RPC gateway");
-	(daemon, RpcTurnClient::new(channel), model.key.as_str().to_owned(), responses_rx)
+	(
+		daemon,
+		RpcTurnClient::new(
+			channel,
+			omp_inference::auth::UsageAttribution::new("crash-resume", "omp-e2e", None::<&str>),
+		),
+		model.key.as_str().to_owned(),
+		responses_rx,
+	)
 }
 
 async fn next_rpc(session: &mut RpcTurnSession) -> pb::TurnEvent {
@@ -681,7 +689,6 @@ fn binary_gateway_tools() -> Arc<Registry> {
 		"debug",
 		"edit",
 		"eval",
-		"fetch",
 		"glob",
 		"grep",
 		"hub",

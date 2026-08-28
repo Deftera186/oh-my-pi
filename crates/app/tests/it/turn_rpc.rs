@@ -247,6 +247,7 @@ fn user_thread() -> thread_pb::Thread {
 				parts: vec![thread_pb::Part {
 					kind: Some(thread_pb::part::Kind::Text("Inspect the workspace".to_owned())),
 				}],
+				..Default::default()
 			})),
 			props:         None,
 		}],
@@ -304,7 +305,10 @@ async fn rpc_turn_client_proves_stateful_replay_duplex_and_recovery_over_owner_u
 	let channel = omp_rpc::uds::connect(&socket)
 		.await
 		.expect("connect owner UDS");
-	let client = RpcTurnClient::new(channel);
+	let client = RpcTurnClient::new(
+		channel,
+		omp_inference::auth::UsageAttribution::new("turn-rpc-test", "omp-test", None::<&str>),
+	);
 	let thread = user_thread();
 	let options = TurnOptions {
 		context_id:      Some(sf!("context-1")),

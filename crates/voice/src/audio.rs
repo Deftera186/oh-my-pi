@@ -15,7 +15,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::{
 	AudioDirection, VoiceError, VoiceResult,
-	device::{CaptureDevice, DeviceConfig, PlaybackDevice},
+	device::{CaptureDevice, DeviceConfig, PlaybackDevice, playback_drain_periods},
 };
 
 #[cfg(target_os = "linux")]
@@ -26,7 +26,7 @@ const PLAYBACK_PERIOD_MS: u32 = 20;
 const CAPTURE_PERIOD_MS: u32 = 50;
 #[cfg(not(target_os = "linux"))]
 const CAPTURE_PERIOD_MS: u32 = 20;
-const PLAYBACK_DRAIN_CALLBACKS: usize = 4;
+const PLAYBACK_DRAIN_MARGIN_CALLBACKS: usize = 1;
 
 mod level {
 	use tokio::sync::watch::Receiver;
@@ -211,6 +211,8 @@ impl PlaybackStream {
 		let mut cursor = 0;
 		let mut empty_callbacks = 0;
 		let config = DeviceConfig { sample_rate, period_ms: PLAYBACK_PERIOD_MS };
+		let drain_callbacks =
+			(playback_drain_periods(config) as usize) + PLAYBACK_DRAIN_MARGIN_CALLBACKS;
 		let guard = FillGuard { state: Arc::clone(&state), level: level_tx.clone() };
 		let device = PlaybackDevice::start(
 			config,
@@ -223,6 +225,7 @@ impl PlaybackStream {
 					output,
 					&callback_state,
 					&mut empty_callbacks,
+					drain_callbacks,
 				);
 				level_tx.send_replace(rms_level(output));
 			}),
@@ -453,6 +456,7 @@ fn fill_playback(
 	output: &mut [f32],
 	state: &PlaybackState,
 	empty_callbacks: &mut usize,
+	drain_callbacks: usize,
 ) {
 	output.fill(0.0);
 	if state.stopped.load(Ordering::Acquire) {
@@ -475,14 +479,14 @@ fn fill_playback(
 					} else {
 						*empty_callbacks += 1;
 					}
-					if *empty_callbacks >= PLAYBACK_DRAIN_CALLBACKS {
+					if *empty_callbacks >= drain_callbacks {
 						state.mark_drained();
 					}
 					break;
 				},
 				Err(TryRecvError::Disconnected) => {
 					*empty_callbacks += 1;
-					if *empty_callbacks >= PLAYBACK_DRAIN_CALLBACKS {
+					if *empty_callbacks >= drain_callbacks {
 						state.mark_drained();
 					}
 					break;
@@ -509,6 +513,8 @@ fn fill_playback(
 mod tests {
 	use super::*;
 
+	const LOCAL_DRAIN_CALLBACKS: usize = 3 + PLAYBACK_DRAIN_MARGIN_CALLBACKS;
+
 	fn render(
 		rx: &Receiver<Vec<f32>>,
 		state: &PlaybackState,
@@ -517,7 +523,7 @@ mod tests {
 		empty: &mut usize,
 		output: &mut [f32],
 	) {
-		fill_playback(rx, current, cursor, output, state, empty);
+		fill_playback(rx, current, cursor, output, state, empty, LOCAL_DRAIN_CALLBACKS);
 	}
 
 	#[test]
@@ -550,8 +556,46 @@ mod tests {
 		let mut cursor = 0;
 		let mut empty = 0;
 		let mut output = [0.0; 2];
-		for _ in 0..=PLAYBACK_DRAIN_CALLBACKS {
+		for _ in 0..=LOCAL_DRAIN_CALLBACKS {
 			render(&rx, &state, &mut current, &mut cursor, &mut empty, &mut output);
+		}
+		assert!(state.is_drained());
+	}
+
+	#[test]
+	fn widened_backlog_is_not_drained_within_local_margin() {
+		let state = PlaybackState::new();
+		let (tx, rx) = flume::unbounded::<Vec<f32>>();
+		drop(tx);
+		let mut current = Vec::new();
+		let mut cursor = 0;
+		let mut empty = 0;
+		let mut output = [0.0; 2];
+		let widened_drain_callbacks = LOCAL_DRAIN_CALLBACKS * 4;
+
+		for _ in 0..LOCAL_DRAIN_CALLBACKS {
+			fill_playback(
+				&rx,
+				&mut current,
+				&mut cursor,
+				&mut output,
+				&state,
+				&mut empty,
+				widened_drain_callbacks,
+			);
+		}
+		assert!(!state.is_drained());
+
+		while empty < widened_drain_callbacks {
+			fill_playback(
+				&rx,
+				&mut current,
+				&mut cursor,
+				&mut output,
+				&state,
+				&mut empty,
+				widened_drain_callbacks,
+			);
 		}
 		assert!(state.is_drained());
 	}

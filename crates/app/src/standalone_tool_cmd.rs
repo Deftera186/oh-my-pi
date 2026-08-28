@@ -90,8 +90,11 @@ pub(crate) async fn session_at(
 		.canonicalize()
 		.into_diagnostic()?;
 	let home = env::var_os("HOME").map_or_else(|| project.clone(), std::path::PathBuf::from);
-	let settings_manager = SettingsManager::open(SettingsPaths::discover(&data_dir, Some(&project)))
-		.into_diagnostic()?;
+	let settings_manager = SettingsManager::open(
+		SettingsPaths::discover(&data_dir, Some(&project)),
+		crate::SETTINGS_CATALOG,
+	)
+	.into_diagnostic()?;
 	let settings_snapshot = settings_manager.snapshot();
 	let model_settings = settings_snapshot
 		.project::<omp_catalog::settings::ModelSettings>()

@@ -12,11 +12,11 @@ description = "Tolerant JSON parsing for malformed, partial, and streaming docum
 workspace = true
 
 [dependencies]
-omp-core = { workspace = true }
-parking_lot = { workspace = true }
-serde = { workspace = true }
-smallvec = { workspace = true }
-thiserror = { workspace = true }
+omp-core.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-futures = { workspace = true }
+futures.workspace = true

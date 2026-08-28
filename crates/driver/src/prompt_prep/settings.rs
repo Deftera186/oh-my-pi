@@ -5,8 +5,7 @@ use std::{env, path::Path};
 use omp_agent::{Personality, PromptSettingsInput};
 use omp_core::Str;
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -283,18 +282,17 @@ impl SettingsDomain for PromptSettings {
 	];
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<PromptSettings>()
-}
-
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
 
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
+
 	#[test]
-	fn defaults_match_pi_prompt_behavior_and_registration_is_linked() {
+	fn defaults_match_pi_prompt_behavior() {
 		let defaults = PromptSettings::default();
 		assert_eq!(defaults.personality, Personality::Default);
 		assert!(defaults.include_model_in_prompt);
@@ -306,16 +304,12 @@ mod tests {
 		assert!(defaults.append_prompt.is_none());
 		assert!(!defaults.null_prompt);
 
-		let snapshot = SettingsSnapshot::isolated(defaults.clone()).expect("isolated snapshot");
+		let snapshot =
+			SettingsSnapshot::isolated(defaults.clone(), CATALOG).expect("isolated snapshot");
 		let projection = snapshot
 			.project::<PromptSettings>()
 			.expect("prompt projection");
 		assert_eq!(projection.get(), &defaults);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == PromptSettings::DOMAIN)
-		);
 	}
 
 	#[test]

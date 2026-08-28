@@ -8,7 +8,7 @@ use omp_env::windows::{
 	OwnerPipeListener, connect_owner_pipe, read_client_frame, read_server_frame, write_client_frame,
 	write_server_frame,
 };
-use omp_envd::{EnvServer, worker::ExtHostConfig};
+use omp_envd::{EnvServer, RegistryBridges, worker::ExtHostConfig};
 use omp_proto::env::v1::{
 	ClientFrame, ClientHello, ServerFrame, ServerHello, client_frame, server_frame,
 };
@@ -107,6 +107,8 @@ async fn unknown_frame_receives_the_same_protocol_error_as_stream_dispatch() {
 			Registry::new(),
 			ExtHostConfig::current(Principal::new(sf!("test"), sf!("Test")), sf!("test-session"), 1)
 				.expect("host config"),
+			omp_app::SETTINGS_CATALOG,
+			RegistryBridges::default(),
 		)
 		.await
 		.expect("environment server"),

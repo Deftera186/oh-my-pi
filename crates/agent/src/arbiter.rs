@@ -665,8 +665,12 @@ pub(crate) mod context {
 		Item {
 			created_at_ms: now_ms(),
 			kind: Some(item::Kind::Message(thread::Message {
-				role:  role as i32,
-				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+				role:            role as i32,
+				parts:           vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+				synthetic:       None,
+				user_initiated:  None,
+				completed_at_ms: None,
+				usage:           None,
 			})),
 			..Default::default()
 		}
@@ -846,8 +850,12 @@ pub(crate) mod settle {
 			seq:           0,
 			created_at_ms: now_ms(),
 			kind:          Some(item::Kind::Message(thread::Message {
-				role:  thread::Role::User as i32,
-				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+				role:            thread::Role::User as i32,
+				parts:           vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+				synthetic:       None,
+				user_initiated:  None,
+				completed_at_ms: None,
+				usage:           None,
 			})),
 			props:         None,
 		}
@@ -1174,8 +1182,12 @@ pub(crate) mod stream {
 			seq:           0,
 			created_at_ms: now_ms(),
 			kind:          Some(item::Kind::Message(thread::Message {
-				role:  thread::Role::User as i32,
-				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+				role:            thread::Role::User as i32,
+				parts:           vec![thread::Part { kind: Some(thread::part::Kind::Text(text)) }],
+				synthetic:       None,
+				user_initiated:  None,
+				completed_at_ms: None,
+				usage:           None,
 			})),
 			props:         None,
 		}
@@ -1197,14 +1209,18 @@ pub(crate) mod stream {
 			seq:           0,
 			created_at_ms: now_ms(),
 			kind:          Some(item::Kind::Message(thread::Message {
-				role:  thread::Role::User as i32,
-				parts: vec![thread::Part {
+				role:            thread::Role::User as i32,
+				parts:           vec![thread::Part {
 					kind: Some(thread::part::Kind::Text(format!(
 						"<system-injection>\nThe prior model attempt was retried because {reason}. \
 						 Continue from the retained context without repeating completed \
 						 work.\n</system-injection>"
 					))),
 				}],
+				synthetic:       None,
+				user_initiated:  None,
+				completed_at_ms: None,
+				usage:           None,
 			})),
 			props:         None,
 		}

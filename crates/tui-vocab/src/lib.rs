@@ -251,6 +251,7 @@ macro_rules! for_each_component {
 			todo => Todo;
 			form => Form;
 			progress => Progress;
+			qr => Qr;
 			time => Time;
 			img => Img;
 			logo => Logo;

@@ -176,6 +176,14 @@ pub enum AgentEvent {
 	},
 	/// Display-only peer message; never appended to the model journal.
 	PeerRelay(Arc<PeerRelayObservation>),
+	/// One canonical input item was durably staged for the next model turn.
+	///
+	/// Presentation consumers use message metadata to update turn-time anchors
+	/// at actual delivery rather than when a queued prompt was submitted.
+	InputStaged {
+		/// Exact staged item, including its original local creation time.
+		item: Item,
+	},
 	/// An inference event, preserved without lossy adaptation.
 	Turn {
 		/// Logical turn that emitted the event.

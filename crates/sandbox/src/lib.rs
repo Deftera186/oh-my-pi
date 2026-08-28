@@ -29,4 +29,6 @@ pub use runner::{
 	CommandWrapper, OutputMode, PreparedSandbox, RunOptions, RunOutput, Runner, SandboxExit,
 	SandboxInput, backend_status, backend_statuses,
 };
-pub use spec::{DegradationPolicy, NetworkMode, ResourceLimits, SandboxSpec, WriteMode};
+pub use spec::{
+	DegradationPolicy, NetworkMode, RUNTIME_READ_ROOTS, ResourceLimits, SandboxSpec, WriteMode,
+};

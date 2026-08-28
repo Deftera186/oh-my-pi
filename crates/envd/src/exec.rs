@@ -41,7 +41,8 @@ use omp_proto::{
 	toolhost::v1::{HostFrame, Ping, WorkerFrame, host_frame, worker_frame},
 };
 use omp_shell_engine::{
-	ExecutionParameters, ProcessScope, Shell, ShellValue, ShellVariable, SourceInfo, SpawnObserver,
+	ExecutionParameters, PathAccess, ProcessScope, Shell, ShellValue, ShellVariable, SourceInfo,
+	SpawnObserver, SpawnWrapper,
 	env::EnvironmentScope,
 	openfiles::{OpenFile, OpenFiles},
 	processes::{ProcessSignal, signal_process_group},
@@ -58,8 +59,8 @@ use url::Url;
 use super::{
 	admission,
 	admission::GithubMutationTarget,
-	exec_sandbox::ExecSandbox,
-	exec_settings::{ExecSandboxMode, SandboxSettings},
+	exec_sandbox::{ApprovedPathScope, ExecSandbox, SandboxDenialFact},
+	exec_settings::{ExecSandboxMode, SandboxNetworkMode, SandboxSettings},
 	process_identity::{IdentityError, ProcessIdentity},
 	process_log,
 	process_log::{LogChunk, ProcessLog},
@@ -77,7 +78,9 @@ const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
 const RUN_ENVIRONMENT_PROP: &str = "omp/run-environment";
 const SANDBOX_DENIED_PATH_PROP: &str = "omp/sandbox-denied-path";
 const SANDBOX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
-const WRITE_DENIED_DIAGNOSTIC: &[u8] = b"sandbox denied write to ";
+const PATH_DENIED_DIAGNOSTIC: &[u8] = b"sandbox denied ";
+const SANDBOX_PROXY_ENV: [&str; 6] =
+	["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
 
 /// Content identity of the process environment inherited by new shell sessions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -196,28 +199,6 @@ pub enum ExecEvent {
 	Exit(ExitEvent),
 }
 
-pub(crate) fn sandbox_denied_event_path(event: &ExecEvent) -> Option<Str> {
-	let ExecEvent::Exit(event) = event else {
-		return None;
-	};
-	let status = event.status.as_ref()?;
-	if status.outcome != ExecOutcome::Denied as i32 {
-		return None;
-	}
-	let path = status
-		.props
-		.as_ref()?
-		.fields
-		.get(SANDBOX_DENIED_PATH_PROP)?
-		.kind
-		.as_ref()
-		.and_then(|kind| match kind {
-			wire_value::Kind::String(path) => Some(path.as_str()),
-			_ => None,
-		})?;
-	Some(Str::from(path))
-}
-
 /// One event emitted by an attached named process.
 #[derive(Clone, Debug)]
 pub enum ProcessEvent {
@@ -309,8 +290,6 @@ struct HostInner {
 struct SandboxConfig {
 	settings:       SandboxSettings,
 	workspace_root: PathBuf,
-	supervised:     Option<Arc<ExecSandbox>>,
-	detached:       Option<Arc<ExecSandbox>>,
 }
 
 struct ProcessPersistence {
@@ -321,12 +300,13 @@ struct ProcessPersistence {
 
 #[derive(Clone)]
 struct SessionHandle {
-	tx:             flume::Sender<SessionCommand>,
-	pty:            Option<PtySpec>,
-	command_prefix: Str,
-	user_shell:     Option<UserShell>,
-	sandbox:        Option<Arc<ExecSandbox>>,
-	process_scope:  Arc<SpawnBook>,
+	tx:                flume::Sender<SessionCommand>,
+	pty:               Option<PtySpec>,
+	command_prefix:    Str,
+	user_shell:        Option<UserShell>,
+	sandbox:           Option<Arc<ExecSandbox>>,
+	process_scope:     Arc<SpawnBook>,
+	sandbox_announced: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 struct UserShell {
@@ -480,19 +460,23 @@ struct SpawnBook {
 	session: Option<Arc<SpawnBook>>,
 }
 
+#[derive(Clone)]
 struct SessionCommand {
-	host:           Weak<HostInner>,
-	exec:           Bytes,
-	source:         Str,
-	environment:    Option<EnvironmentDelta>,
-	timeout:        Option<Duration>,
-	pty:            Option<PtySpec>,
-	control:        Arc<RunControl>,
-	cancel_rx:      Receiver<CancelRequest>,
-	events:         flume::Sender<ExecEvent>,
+	host: Weak<HostInner>,
+	exec: Bytes,
+	source: Str,
+	environment: Option<EnvironmentDelta>,
+	timeout: Option<Duration>,
+	pty: Option<PtySpec>,
+	control: Arc<RunControl>,
+	cancel_rx: Receiver<CancelRequest>,
+	events: flume::Sender<ExecEvent>,
 	github_targets: Vec<GithubMutationTarget>,
-	sandbox:        Option<Arc<ExecSandbox>>,
-	bypass_sandbox: bool,
+	sandbox: Option<Arc<ExecSandbox>>,
+	sandbox_announced: Arc<AtomicBool>,
+	sequence: Arc<AtomicU64>,
+	rerun: bool,
+	sandbox_environment_update: bool,
 }
 
 impl Default for ExecHost {
@@ -528,12 +512,16 @@ impl ExecHost {
 	/// processes.
 	pub(crate) fn configure_sandbox(&self, settings: &SandboxSettings, workspace_root: &Path) {
 		let config = (settings.mode != ExecSandboxMode::Off
+			|| settings.network_mode != SandboxNetworkMode::Disabled
+			|| !settings.allow_unix_sockets.is_empty()
+			|| settings.read_mode != crate::exec_settings::ReadMode::Host
+			|| !settings.readable_roots.is_empty()
+			|| !settings.read_deny.is_empty()
+			|| !settings.read_deny_globs.is_empty()
 			|| !settings.environment_policy_is_default())
 		.then(|| SandboxConfig {
 			settings:       settings.clone(),
 			workspace_root: workspace_root.to_path_buf(),
-			supervised:     None,
-			detached:       None,
 		});
 		*self.inner.sandbox.lock() = config;
 	}
@@ -547,48 +535,45 @@ impl ExecHost {
 	}
 
 	fn compiled_sandbox(&self, supervised: bool) -> Result<Option<Arc<ExecSandbox>>, ExecError> {
-		let mut config = self.inner.sandbox.lock();
-		let Some(config) = config.as_mut() else {
-			return Ok(None);
+		let (settings, workspace_root) = {
+			let config = self.inner.sandbox.lock();
+			let Some(config) = config.as_ref() else {
+				return Ok(None);
+			};
+			(config.settings.clone(), config.workspace_root.clone())
 		};
-		if let Some(sandbox) = if supervised {
-			config.supervised.as_ref()
-		} else {
-			config.detached.as_ref()
-		} {
-			return Ok(Some(Arc::clone(sandbox)));
-		}
-		let sandbox = ExecSandbox::compile(&config.settings, &config.workspace_root, supervised)
-			.map_err(|source| ExecError::Sandbox { mode: config.settings.mode.into(), source })?;
-		if supervised {
-			config.supervised = sandbox.clone();
-		} else {
-			config.detached = sandbox.clone();
-		}
-		Ok(sandbox)
+		ExecSandbox::compile(&settings, &workspace_root, supervised)
+			.map_err(|source| ExecError::Sandbox { mode: settings.mode.into(), source })
 	}
 
-	/// Binds the interactive approval route used for one-shot sandbox bypasses.
+	/// Binds the interactive approval route used for one-shot sandbox
+	/// amendments.
 	pub(crate) fn bind_sandbox_approval_route(&self, route: Option<ApprovalRoute>) {
 		*self.inner.sandbox_approval_route.lock() = route;
 	}
 
-	/// Requests approval to rerun one exact command without its sandbox hooks.
-	pub(crate) async fn approve_sandbox_bypass(&self, command: &str, denied_path: &str) -> bool {
+	async fn approve_sandbox_amendment(
+		&self,
+		command: &str,
+		fact: &SandboxDenialFact,
+		scope: &str,
+	) -> bool {
 		let Some(route) = self.inner.sandbox_approval_route.lock().clone() else {
 			return false;
 		};
+		let fact_label = sandbox_fact_label(fact);
+		let scope = Str::from(scope);
 		let ticket = route
 			.request(
 				None,
 				vec![ApprovalSpec {
-					title:         sf!("Rerun command without sandbox"),
+					title:         sf!("Approve scoped sandbox amendment"),
 					body:          sf!(
-						"The sandbox denied access to {denied_path}. Approve one unsandboxed rerun of \
-						 this exact command?\n\n{command}"
+						"The sandbox denied {fact_label}. Approve {scope} for this exact command one \
+						 time?\n\n{command}"
 					),
-					subject:       Str::from(denied_path),
-					kind:          sf!("sandbox_bypass"),
+					subject:       scope.clone(),
+					kind:          sf!("sandbox_amendment"),
 					scopes:        vec![sf!("once")],
 					default:       Some(false),
 					route:         sf!("local"),
@@ -597,7 +582,7 @@ impl ExecHost {
 					unreachable:   sf!("fail_closed"),
 					require_human: true,
 					pattern:       Some(Str::from(command)),
-					evidence:      vec![sf!("sandbox denial")],
+					evidence:      vec![fact_label, scope.clone()],
 				}],
 				unix_time_ms(),
 			)
@@ -610,7 +595,7 @@ impl ExecHost {
 			&& ticket
 				.reasons
 				.iter()
-				.any(|reason| reason.kind == "sandbox_bypass" && reason.subject == denied_path)
+				.any(|reason| reason.kind == "sandbox_amendment" && reason.subject == scope)
 	}
 
 	/// Enables durable named-process metadata and recovers verified detached
@@ -691,6 +676,19 @@ impl ExecHost {
 		let cwd = cwd_from_uri(&request.cwd_uri)?.map_or_else(env::current_dir, Ok)?;
 		let sandbox = self.active_sandbox()?;
 		let variables = Arc::clone(&self.inner.environment.lock().variables);
+		let variables = sandbox.as_ref().map_or_else(
+			|| {
+				variables
+					.iter()
+					.map(|(name, value)| (OsString::from(name.as_str()), OsString::from(value.as_str())))
+					.collect()
+			},
+			|sandbox| {
+				sandbox.resolve_env(variables.iter().map(|(name, value)| {
+					(OsString::from(name.as_str()), OsString::from(value.as_str()))
+				}))
+			},
+		);
 		let mut builder = Shell::builder()
 			.profile(omp_shell_engine::ProfileLoadBehavior::Skip)
 			.rc(omp_shell_engine::RcLoadBehavior::Skip)
@@ -700,10 +698,14 @@ impl ExecHost {
 		if let Some(host) = self.inner.devices.lock().clone() {
 			builder = builder.builtin("dyn", crate::devices_host::registration(host));
 		}
-		for (name, value) in variables.iter() {
-			let mut variable = ShellVariable::new(value.to_string());
+		for (name, value) in &variables {
+			let Some(name) = name.to_str() else { continue };
+			let Some(value) = value.to_str() else {
+				continue;
+			};
+			let mut variable = ShellVariable::new(value);
 			variable.export();
-			builder = builder.var(name.to_string(), variable);
+			builder = builder.var(name, variable);
 		}
 		let mut shell = builder.build().await.map_err(shell_error)?;
 		if let Some(pty) = request.pty.as_ref()
@@ -719,6 +721,10 @@ impl ExecHost {
 			apply_env_delta(&mut shell, profile.env_delta.as_ref()).map_err(shell_error)?;
 		}
 		apply_env_delta(&mut shell, request.env_delta.as_ref()).map_err(shell_error)?;
+		if let Some(sandbox) = sandbox.as_ref() {
+			apply_sandbox_environment(&mut shell, sandbox.as_ref(), EnvironmentScope::Global)
+				.map_err(shell_error)?;
+		}
 
 		let command_prefix =
 			profile.map_or_else(Str::default, |profile| Str::from(profile.command_prefix.trim()));
@@ -760,6 +766,7 @@ impl ExecHost {
 				user_shell,
 				sandbox,
 				process_scope,
+				sandbox_announced: Arc::new(AtomicBool::new(false)),
 			});
 
 		Ok(OpenSessionResponse {
@@ -878,23 +885,13 @@ impl ExecHost {
 		request: ExecRequest,
 		timeout: Option<Duration>,
 	) -> Result<(ExecStarted, ExecRun), ExecError> {
-		self.exec_controlled(request, timeout, false).await
-	}
-
-	/// Starts one script while bypassing sandbox hooks for only this command.
-	pub(crate) async fn exec_without_sandbox(
-		&self,
-		request: ExecRequest,
-		timeout: Option<Duration>,
-	) -> Result<(ExecStarted, ExecRun), ExecError> {
-		self.exec_controlled(request, timeout, true).await
+		self.exec_controlled(request, timeout).await
 	}
 
 	async fn exec_controlled(
 		&self,
 		mut request: ExecRequest,
 		timeout: Option<Duration>,
-		bypass_sandbox: bool,
 	) -> Result<(ExecStarted, ExecRun), ExecError> {
 		let session = self
 			.inner
@@ -954,7 +951,10 @@ impl ExecHost {
 			events: events_tx,
 			github_targets,
 			sandbox: session.sandbox,
-			bypass_sandbox,
+			sandbox_announced: session.sandbox_announced,
+			sequence: Arc::new(AtomicU64::new(1)),
+			rerun: false,
+			sandbox_environment_update: false,
 		};
 		session
 			.tx
@@ -2161,16 +2161,13 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		Err(flume::TryRecvError::Empty) => {},
 	}
 	let cancel_rx = command.cancel_rx.clone();
-	let sandbox_active = !command.bypass_sandbox
-		&& command
-			.sandbox
-			.as_ref()
-			.is_some_and(|sandbox| sandbox.kernel_active());
+	let sandbox_active = command.sandbox.is_some();
 	let setup = setup_io(
 		command.pty.as_ref(),
 		command.control.clone(),
 		command.exec.clone(),
 		command.events.clone(),
+		command.sequence.clone(),
 		sandbox_active,
 	);
 	let Ok((mut params, readers, sequencer)) = setup else {
@@ -2182,10 +2179,38 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		);
 		return false;
 	};
-	let environment_scoped = command.environment.is_some();
-	if let Some(environment) = command.environment.as_ref() {
+	if let Some(sandbox) = command.sandbox.as_ref()
+		&& !command.sandbox_announced.swap(true, Ordering::AcqRel)
+	{
+		sequencer
+			.lock()
+			.sandbox_note(&command.exec, sandbox.session_note());
+	}
+	let attempt = command.sandbox.as_ref().map(ExecSandbox::begin_attempt);
+	let environment_scoped =
+		command.environment.is_some() || command.sandbox_environment_update || attempt.is_some();
+	if environment_scoped {
 		shell.env_mut().push_scope(EnvironmentScope::Command);
-		if apply_run_environment_delta(shell, environment).is_err() {
+		if command
+			.environment
+			.as_ref()
+			.is_some_and(|environment| apply_run_environment_delta(shell, environment).is_err())
+			|| command.sandbox.as_ref().is_some_and(|_| {
+				(if command.environment.is_some() {
+					apply_sandbox_environment(
+						shell,
+						attempt.as_deref().expect("sandbox attempt exists"),
+						EnvironmentScope::Command,
+					)
+				} else {
+					apply_amended_proxy_environment(
+						shell,
+						attempt.as_deref().expect("sandbox attempt exists"),
+						EnvironmentScope::Command,
+					)
+				})
+				.is_err()
+			}) {
 			let _ = shell.env_mut().pop_scope(EnvironmentScope::Command);
 			finish_session_command(
 				&command,
@@ -2203,13 +2228,9 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 	params.set_spawn_observer(command.control.spawns.clone());
 	params.set_process_scope(command.control.spawns.clone());
 	params.set_protect_host_process(true);
-	if !command.bypass_sandbox
-		&& let Some(sandbox) = command.sandbox.as_ref()
-	{
-		if sandbox.kernel_active() {
-			params.set_path_policy(sandbox.clone());
-		}
-		params.set_spawn_wrapper(sandbox.clone());
+	if let Some(attempt) = attempt.as_ref() {
+		params.set_path_policy(attempt.clone());
+		params.set_spawn_wrapper(attempt.clone());
 	}
 	let source_info = SourceInfo::from("env/v1 exec");
 	let result = {
@@ -2253,6 +2274,7 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 	for reader in readers {
 		let _ = reader.await;
 	}
+	let broker_denial = attempt.as_ref().and_then(|attempt| attempt.take_denial());
 	let cancelled = result == RunTerminal::Cancelled;
 	let result = if environment_scoped
 		&& shell
@@ -2268,21 +2290,60 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		let sequencer = sequencer.lock();
 		classify_sandbox_denial(
 			sandbox_active,
+			broker_denial,
 			&result,
 			shell_error.as_ref(),
 			sequencer.sandbox_diagnostic.as_deref().unwrap_or_default(),
 		)
 	};
-	let result = denial.map_or(result, |denial| RunTerminal::Denied {
-		exit_code: denial.exit_code,
-		path:      denial.path,
-	});
-	if matches!(&result, RunTerminal::Denied { .. })
-		&& let Some(sandbox) = command.sandbox.as_ref()
-	{
-		sequencer
-			.lock()
-			.sandbox_note(&command.exec, sandbox.failure_note());
+	if let Some(denial) = denial {
+		if !command.rerun
+			&& let Some(sandbox) = command.sandbox.as_deref()
+			&& let Some(amendment) = approved_amendment(sandbox, &denial.fact)
+			&& let Some(host) = command.host.upgrade()
+		{
+			let scope = amendment.scope_label();
+			let host = ExecHost { inner: host };
+			let approval = host.approve_sandbox_amendment(&command.source, &denial.fact, &scope);
+			tokio::pin!(approval);
+			let approved = tokio::select! {
+				approved = &mut approval => approved,
+				_ = command.cancel_rx.recv_async() => {
+					finish_session_command(
+						&command,
+						RunTerminal::Cancelled,
+						started_at.elapsed(),
+						shell.working_dir(),
+					);
+					return true;
+				},
+			};
+			if approved {
+				let network_amendment = matches!(&amendment, ApprovedSandboxAmendment::Network(_));
+				let amended = match &amendment {
+					ApprovedSandboxAmendment::Path(scope) => sandbox.amended_scope(scope),
+					ApprovedSandboxAmendment::Network(fact) => sandbox.amended_network(fact),
+				};
+				if let Ok(Some(sandbox)) = amended {
+					sequencer.lock().sandbox_note(
+						&command.exec,
+						&sf!("[sandbox] rerun with approved scope: {scope}"),
+					);
+					let mut rerun = command.clone();
+					rerun.sandbox = Some(sandbox);
+					rerun.rerun = true;
+					rerun.sandbox_environment_update = network_amendment;
+					return Box::pin(run_session_command(shell, rerun)).await;
+				}
+			}
+		}
+		finish_session_command(
+			&command,
+			RunTerminal::Denied { exit_code: denial.exit_code, fact: denial.fact },
+			started_at.elapsed(),
+			shell.working_dir(),
+		);
+		return cancelled;
 	}
 	finish_session_command(&command, result, started_at.elapsed(), shell.working_dir());
 	cancelled
@@ -2345,15 +2406,15 @@ enum RunTerminal {
 	Failed,
 	Timeout,
 	Cancelled,
-	Denied { exit_code: Option<i32>, path: Str },
+	Denied { exit_code: Option<i32>, fact: SandboxDenialFact },
 }
 
 impl RunTerminal {
 	fn status(self, elapsed: Duration) -> ExecStatusMsg {
 		let props = match &self {
-			Self::Denied { path, .. } => Some(WireValueMap {
+			Self::Denied { fact, .. } => Some(WireValueMap {
 				fields: BTreeMap::from([(SANDBOX_DENIED_PATH_PROP.to_owned(), WireValue {
-					kind: Some(wire_value::Kind::String(path.to_string())),
+					kind: Some(wire_value::Kind::String(sandbox_fact_label(fact).to_string())),
 				})]),
 			}),
 			_ => None,
@@ -2380,11 +2441,52 @@ impl RunTerminal {
 
 struct SandboxDenial {
 	exit_code: Option<i32>,
-	path:      Str,
+	fact:      SandboxDenialFact,
+}
+fn sandbox_fact_label(fact: &SandboxDenialFact) -> Str {
+	match fact {
+		SandboxDenialFact::ReadPath(path) => sf!("read {}", path.display()),
+		SandboxDenialFact::WritePath(path) => sf!("write {}", path.display()),
+		SandboxDenialFact::Network { host, port } => sf!("network {host}:{port}"),
+		SandboxDenialFact::Unknown => sf!("unknown sandbox denial"),
+	}
+}
+
+enum ApprovedSandboxAmendment {
+	Path(ApprovedPathScope),
+	Network(SandboxDenialFact),
+}
+
+impl ApprovedSandboxAmendment {
+	fn scope_label(&self) -> Str {
+		match self {
+			Self::Path(scope) => scope.label(),
+			Self::Network(fact) => sandbox_fact_label(fact),
+		}
+	}
+}
+
+fn approved_amendment(
+	sandbox: &ExecSandbox,
+	fact: &SandboxDenialFact,
+) -> Option<ApprovedSandboxAmendment> {
+	match fact {
+		SandboxDenialFact::ReadPath(_) | SandboxDenialFact::WritePath(_) => sandbox
+			.freeze_amendment(fact)
+			.map(ApprovedSandboxAmendment::Path),
+		SandboxDenialFact::Network { host, port } => {
+			Some(ApprovedSandboxAmendment::Network(SandboxDenialFact::Network {
+				host: host.clone(),
+				port: *port,
+			}))
+		},
+		SandboxDenialFact::Unknown => None,
+	}
 }
 
 fn classify_sandbox_denial(
 	sandbox_active: bool,
+	broker_denial: Option<SandboxDenialFact>,
 	result: &RunTerminal,
 	error: Option<&omp_shell_engine::Error>,
 	stderr: &[u8],
@@ -2392,65 +2494,75 @@ fn classify_sandbox_denial(
 	if !sandbox_active {
 		return None;
 	}
-	if let Some(omp_shell_engine::ErrorKind::WriteDenied(denied)) =
+	if let Some(omp_shell_engine::ErrorKind::PathDenied(denied)) =
 		error.map(omp_shell_engine::Error::kind)
 	{
 		return Some(SandboxDenial {
 			exit_code: None,
-			path:      Str::from(denied.path.to_string_lossy().as_ref()),
+			fact:      match denied.access {
+				PathAccess::Read => SandboxDenialFact::ReadPath(denied.path.clone()),
+				_ => SandboxDenialFact::WritePath(denied.path.clone()),
+			},
 		});
 	}
-	let command_failed = match result {
-		RunTerminal::Failed => true,
-		RunTerminal::Exited(code) => *code != 0,
-		_ => false,
-	};
-	if command_failed && let Some(path) = shell_write_denied_path(stderr) {
+	let command_failed = matches!(result, RunTerminal::Failed)
+		|| matches!(result, RunTerminal::Exited(code) if *code != 0);
+	if command_failed && let Some(fact) = broker_denial {
 		return Some(SandboxDenial {
 			exit_code: match result {
 				RunTerminal::Exited(code) => Some(*code),
 				_ => None,
 			},
-			path,
+			fact,
 		});
 	}
 	let RunTerminal::Exited(exit_code) = result else {
 		return None;
 	};
-	if *exit_code == 0 {
-		return None;
-	}
-	let marker = sandbox_denial_marker(stderr)?;
-	Some(SandboxDenial {
+	(*exit_code != 0 && sandbox_denial_marker(stderr).is_some()).then_some(SandboxDenial {
 		exit_code: Some(*exit_code),
-		path:      sandbox_denied_path(stderr, marker),
+		fact:      SandboxDenialFact::Unknown,
 	})
 }
 
-fn shell_write_denied_path(stderr: &[u8]) -> Option<Str> {
+fn shell_path_denied_path(stderr: &[u8]) -> Option<Str> {
 	let marker = stderr
-		.windows(WRITE_DENIED_DIAGNOSTIC.len())
-		.position(|window| window == WRITE_DENIED_DIAGNOSTIC)?;
-	let path_start = marker + WRITE_DENIED_DIAGNOSTIC.len();
+		.windows(PATH_DENIED_DIAGNOSTIC.len())
+		.position(|window| window == PATH_DENIED_DIAGNOSTIC)?;
+	let path_start = marker + PATH_DENIED_DIAGNOSTIC.len();
 	let path_end = stderr[path_start..]
 		.iter()
 		.position(|byte| *byte == b'\n' || *byte == b'\r')
 		.map_or(stderr.len(), |position| path_start + position);
 	let path = String::from_utf8_lossy(&stderr[path_start..path_end]);
 	let path = path.trim();
+	let path = path.rsplit_once(" to ").map_or(path, |(_, path)| path);
 	(!path.is_empty()).then(|| Str::from(path))
 }
-
 fn sandbox_denial_marker(stderr: &[u8]) -> Option<usize> {
-	stderr
-		.windows(b"Operation not permitted".len())
-		.position(|window| window == b"Operation not permitted")
-		.or_else(|| {
+	const PHRASES: &[&[u8]] = &[
+		b"sandbox denied",
+		b"x-omp-policy-blocked:",
+		b"operation not permitted",
+		b"permission denied",
+		b"read-only file system",
+	];
+	const ERRNOS: &[&[u8]] = &[b"eperm", b"eacces", b"erofs"];
+	for phrase in PHRASES {
+		if let Some(position) = stderr
+			.windows(phrase.len())
+			.position(|window| window.eq_ignore_ascii_case(phrase))
+		{
+			return Some(position);
+		}
+	}
+	for errno in ERRNOS {
+		if let Some(position) =
 			stderr
-				.windows(b"EPERM".len())
+				.windows(errno.len())
 				.enumerate()
 				.find_map(|(position, window)| {
-					if window != b"EPERM" {
+					if !window.eq_ignore_ascii_case(errno) {
 						return None;
 					}
 					let before = position
@@ -2458,33 +2570,14 @@ fn sandbox_denial_marker(stderr: &[u8]) -> Option<usize> {
 						.and_then(|index| stderr.get(index))
 						.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
 					let after = stderr
-						.get(position + b"EPERM".len())
+						.get(position + errno.len())
 						.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
 					(before && after).then_some(position)
-				})
-		})
-}
-
-fn sandbox_denied_path(stderr: &[u8], marker: usize) -> Str {
-	let line_start = stderr[..marker]
-		.iter()
-		.rposition(|byte| *byte == b'\n' || *byte == b'\r')
-		.map_or(0, |position| position + 1);
-	let line_end = stderr[marker..]
-		.iter()
-		.position(|byte| *byte == b'\n' || *byte == b'\r')
-		.map_or(stderr.len(), |position| marker + position);
-	let line = String::from_utf8_lossy(&stderr[line_start..line_end]);
-	let prefix = String::from_utf8_lossy(&stderr[line_start..marker]);
-	let prefix = prefix.trim().trim_end_matches(':').trim();
-	let candidate = prefix
-		.rsplit_once(':')
-		.map_or(prefix, |(_, path)| path.trim());
-	if candidate.starts_with('/') || candidate.starts_with("./") || candidate.starts_with("../") {
-		Str::from(candidate)
-	} else {
-		Str::from(line.trim())
+				}) {
+			return Some(position);
+		}
 	}
+	None
 }
 
 fn write_input(control: &RunControl, data: Option<&[u8]>) -> Result<(), ExecError> {
@@ -2508,12 +2601,14 @@ fn setup_io(
 	control: Arc<RunControl>,
 	exec: Bytes,
 	events: flume::Sender<ExecEvent>,
+	sequence: Arc<AtomicU64>,
 	capture_sandbox_diagnostic: bool,
 ) -> Result<(ExecutionParameters, Vec<task::JoinHandle<()>>, Arc<Mutex<OutputSequencer>>), ExecError>
 {
 	let mut params = ExecutionParameters::default();
 	let sequencer = Arc::new(Mutex::new(OutputSequencer {
-		next: 1,
+		next: sequence.load(Ordering::Acquire),
+		sequence,
 		events,
 		at_line_start: true,
 		sandbox_diagnostic: capture_sandbox_diagnostic.then(Vec::new),
@@ -2577,6 +2672,7 @@ fn setup_io(
 
 struct OutputSequencer {
 	next:               u64,
+	sequence:           Arc<AtomicU64>,
 	events:             flume::Sender<ExecEvent>,
 	at_line_start:      bool,
 	sandbox_diagnostic: Option<Vec<u8>>,
@@ -2586,13 +2682,12 @@ impl OutputSequencer {
 		let Some(diagnostic) = self.sandbox_diagnostic.as_mut() else {
 			return;
 		};
-		if shell_write_denied_path(diagnostic).is_some()
-			|| sandbox_denial_marker(diagnostic).is_some()
+		if shell_path_denied_path(diagnostic).is_some() || sandbox_denial_marker(diagnostic).is_some()
 		{
 			return;
 		}
 		diagnostic.extend_from_slice(data);
-		if shell_write_denied_path(diagnostic).is_none()
+		if shell_path_denied_path(diagnostic).is_none()
 			&& sandbox_denial_marker(diagnostic).is_none()
 			&& diagnostic.len() > SANDBOX_DIAGNOSTIC_BYTES
 		{
@@ -2616,6 +2711,7 @@ impl OutputSequencer {
 			..OutputFrame::default()
 		}));
 		self.next += 1;
+		self.sequence.store(self.next, Ordering::Release);
 	}
 }
 
@@ -2645,6 +2741,7 @@ fn spawn_reader<R: Read + Send + 'static>(
 				props:    Default::default(),
 			};
 			sequencer.next += 1;
+			sequencer.sequence.store(sequencer.next, Ordering::Release);
 			let event = ExecEvent::Output(frame);
 			let _ = sequencer.events.send(event);
 		}
@@ -3343,6 +3440,88 @@ fn take_run_environment(request: &mut ExecRequest) -> Result<Option<EnvironmentD
 	Ok(Some(EnvironmentDelta { set, unset, props: None }))
 }
 
+fn apply_sandbox_environment(
+	shell: &mut Shell,
+	sandbox: &impl SpawnWrapper,
+	scope: EnvironmentScope,
+) -> Result<(), omp_shell_engine::Error> {
+	let inherited = shell
+		.env()
+		.iter_exported()
+		.map(|(name, variable)| {
+			(OsString::from(name), OsString::from(variable.value().to_cow_str(shell).as_ref()))
+		})
+		.collect::<Vec<_>>();
+	let mut resolved = inherited.clone();
+	sandbox.resolve_env(&mut resolved);
+	let mut effective = resolved.into_iter().collect::<HashMap<_, _>>();
+	for (name, value) in inherited {
+		let replacement = effective.remove(&name);
+		let Some(name) = name.to_str() else { continue };
+		match replacement {
+			Some(replacement) if replacement == value => {},
+			Some(replacement) => {
+				let Some(value) = replacement.to_str() else {
+					continue;
+				};
+				let mut variable = ShellVariable::new(value);
+				variable.export();
+				shell.env_mut().add(name, variable, scope)?;
+			},
+			None => {
+				let mut unset = ShellVariable::new(ShellValue::Unset(ShellValueUnsetType::Untyped));
+				unset.export();
+				shell.env_mut().add(name, unset, scope)?;
+			},
+		}
+	}
+	for (name, value) in effective {
+		let Some(name) = name.to_str() else { continue };
+		let Some(value) = value.to_str() else {
+			continue;
+		};
+		let mut variable = ShellVariable::new(value);
+		variable.export();
+		shell.env_mut().add(name, variable, scope)?;
+	}
+	Ok(())
+}
+
+fn apply_amended_proxy_environment(
+	shell: &mut Shell,
+	sandbox: &impl SpawnWrapper,
+	scope: EnvironmentScope,
+) -> Result<(), omp_shell_engine::Error> {
+	let inherited = shell
+		.env()
+		.iter_exported()
+		.map(|(name, variable)| {
+			(OsString::from(name), OsString::from(variable.value().to_cow_str(shell).as_ref()))
+		})
+		.collect::<Vec<_>>();
+	let mut resolved = inherited.clone();
+	sandbox.resolve_env(&mut resolved);
+	for (name, value) in resolved {
+		let Some(name_text) = name.to_str() else {
+			continue;
+		};
+		if !SANDBOX_PROXY_ENV.contains(&name_text)
+			|| inherited
+				.iter()
+				.any(|(current_name, current_value)| current_name == &name && current_value == &value)
+		{
+			continue;
+		}
+		let Some(value) = value.to_str() else {
+			continue;
+		};
+		let mut variable = ShellVariable::new(value);
+		variable.export();
+		shell.env_mut().add(name_text, variable, scope)?;
+	}
+	Ok(())
+}
+
 fn apply_run_environment_delta(
 	shell: &mut Shell,
 	delta: &EnvironmentDelta,
@@ -3585,49 +3764,92 @@ mod tests {
 	#[test]
 	fn sandbox_denial_classification_is_typed_and_conservative() {
 		let denied_path = PathBuf::from("/private/blocked");
-		let write_error: omp_shell_engine::Error =
-			omp_shell_engine::WriteDenied { path: denied_path.clone() }.into();
-		let denial = classify_sandbox_denial(true, &RunTerminal::Failed, Some(&write_error), b"")
-			.expect("typed write denial");
-		assert_eq!(denial.path, Str::from(denied_path.to_string_lossy().as_ref()));
+		let write_error: omp_shell_engine::Error = omp_shell_engine::PathDenied {
+			path:   denied_path.clone(),
+			access: omp_shell_engine::PathAccess::Write,
+		}
+		.into();
+		let denial =
+			classify_sandbox_denial(true, None, &RunTerminal::Failed, Some(&write_error), b"")
+				.expect("typed write denial");
+		assert_eq!(denial.fact, SandboxDenialFact::WritePath(denied_path));
 		assert_eq!(denial.exit_code, None);
 
 		let denial = classify_sandbox_denial(
 			true,
+			None,
 			&RunTerminal::Exited(2),
 			None,
 			b"env/v1 exec: sandbox denied write to /private/handled\n",
 		)
 		.expect("shell-handled typed write denial");
-		assert_eq!(denial.path, "/private/handled");
+		assert_eq!(denial.fact, SandboxDenialFact::Unknown);
 		assert_eq!(denial.exit_code, Some(2));
 
 		let denial = classify_sandbox_denial(
 			true,
+			None,
 			&RunTerminal::Exited(1),
 			None,
 			b"touch: /private/blocked: Operation not permitted\n",
 		)
 		.expect("EPERM-shaped stderr");
-		assert_eq!(denial.path, "/private/blocked");
-		assert_eq!(denial.exit_code, Some(1));
+		assert_eq!(denial.fact, SandboxDenialFact::Unknown);
+
+		let denial = classify_sandbox_denial(
+			true,
+			None,
+			&RunTerminal::Exited(1),
+			None,
+			b"X-Omp-Policy-Blocked: api.example.test:8443\r\n",
+		)
+		.expect("scoped proxy denial");
+		assert_eq!(denial.fact, SandboxDenialFact::Unknown);
+
+		let denial = classify_sandbox_denial(
+			true,
+			Some(SandboxDenialFact::Network { host: sf!("api.example.test"), port: 8443 }),
+			&RunTerminal::Exited(1),
+			None,
+			b"",
+		)
+		.expect("attempt-scoped broker denial");
+		assert_eq!(denial.fact, SandboxDenialFact::Network {
+			host: sf!("api.example.test"),
+			port: 8443,
+		});
 
 		assert!(
 			classify_sandbox_denial(
 				false,
+				None,
 				&RunTerminal::Exited(1),
 				None,
 				b"touch: /private/blocked: Operation not permitted",
 			)
 			.is_none()
 		);
-		assert!(classify_sandbox_denial(true, &RunTerminal::Exited(0), None, b"EPERM",).is_none());
 		assert!(
-			classify_sandbox_denial(true, &RunTerminal::Exited(1), None, b"permission denied",)
-				.is_none()
+			classify_sandbox_denial(true, None, &RunTerminal::Exited(0), None, b"EPERM",).is_none()
 		);
 		assert!(
-			classify_sandbox_denial(true, &RunTerminal::Exited(1), None, b"NOT_EPERMISSION",)
+			classify_sandbox_denial(true, None, &RunTerminal::Exited(1), None, b"permission denied",)
+				.is_some()
+		);
+		for diagnostic in [
+			b"EACCES".as_slice(),
+			b"Permission denied".as_slice(),
+			b"EROFS".as_slice(),
+			b"Read-only file system".as_slice(),
+		] {
+			assert!(
+				classify_sandbox_denial(true, None, &RunTerminal::Exited(1), None, diagnostic)
+					.is_some(),
+				"missing denial classification for {diagnostic:?}"
+			);
+		}
+		assert!(
+			classify_sandbox_denial(true, None, &RunTerminal::Exited(1), None, b"NOT_EPERMISSION",)
 				.is_none()
 		);
 	}
@@ -3658,8 +3880,11 @@ mod tests {
 		assert_eq!(cancelled.signal, "");
 		assert!(cancelled.aborted);
 
-		let denied = RunTerminal::Denied { exit_code: Some(1), path: sf!("/private/blocked") }
-			.status(Duration::from_millis(5));
+		let denied = RunTerminal::Denied {
+			exit_code: Some(1),
+			fact:      SandboxDenialFact::WritePath(PathBuf::from("/private/blocked")),
+		}
+		.status(Duration::from_millis(5));
 		assert_eq!(denied.outcome, ExecOutcome::Denied as i32);
 		assert_eq!(denied.exit_code, Some(1));
 		assert_eq!(
@@ -3668,7 +3893,7 @@ mod tests {
 				.as_ref()
 				.and_then(|props| props.fields.get(SANDBOX_DENIED_PATH_PROP))
 				.and_then(|value| value.kind.as_ref()),
-			Some(&wire_value::Kind::String(String::from("/private/blocked")))
+			Some(&wire_value::Kind::String(String::from("write /private/blocked")))
 		);
 	}
 
@@ -3757,12 +3982,6 @@ mod tests {
 			.expect("sandboxed session opens");
 		let session = &opened.session;
 
-		// Software lane: an in-process redirection persists inside the workspace.
-		assert_eq!(
-			run_exit_code(&host, script_request(session, "echo ok > allowed.txt")).await,
-			Some(0)
-		);
-		assert_eq!(fs::read(workspace.join("allowed.txt")).unwrap(), b"ok\n");
 		// Software lane: the same redirection into the carve-out is denied.
 		let (outcome, exit, output) =
 			run_failure(&host, script_request(session, "echo no > .git/blocked.txt")).await;
@@ -3771,33 +3990,19 @@ mod tests {
 		let output = String::from_utf8_lossy(&output);
 		assert!(output.contains("sandbox denied write"));
 		assert!(output.contains(".git/blocked.txt"));
-		assert!(output.contains("sandbox: mode=workspace-write"));
-		assert!(output.contains("network=off"));
-		assert_eq!(
-			output
-				.matches("Seatbelt write scopes are path based")
-				.count(),
-			1
-		);
+		assert_eq!(output.matches("sandbox: backend=").count(), 1);
 		assert!(!workspace.join(".git/blocked.txt").exists());
 
-		let (_, bypass) = host
-			.exec_without_sandbox(script_request(session, "echo approved > .git/approved.txt"), None)
-			.await
-			.expect("one-shot bypass starts");
-		loop {
-			match bypass.next_event().await {
-				Some(ExecEvent::Output(_) | ExecEvent::Started { .. }) => {},
-				Some(ExecEvent::Exit(event)) => {
-					let status = event.status.expect("bypass status");
-					assert_eq!(status.outcome, ExecOutcome::Exited as i32);
-					assert_eq!(status.exit_code, Some(0));
-					break;
-				},
-				None => panic!("bypass event stream closed before exit"),
-			}
-		}
-		assert_eq!(fs::read(workspace.join(".git/approved.txt")).unwrap(), b"approved\n");
+		// The one-time session note must not change ordinary command behavior.
+		assert_eq!(
+			run_exit_code(&host, script_request(session, "echo ok > allowed.txt")).await,
+			Some(0)
+		);
+		assert_eq!(fs::read(workspace.join("allowed.txt")).unwrap(), b"ok\n");
+		assert_eq!(
+			run_exit_code(&host, script_request(session, "[ -z \"${MY_TOKEN+x}\" ]")).await,
+			Some(0)
+		);
 
 		// The next ordinary command is sandboxed again.
 		let (outcome, ..) =
@@ -3830,10 +4035,10 @@ mod tests {
 		);
 		assert!(!workspace.join(".git/external.txt").exists());
 
-		// Secret-shaped names stay visible in-shell but never reach children.
+		// Environment policy applies before shell expansion and child launch.
 		assert_eq!(
 			run_output(&host, script_request(session, "printf '%s' \"$MY_TOKEN\"")).await,
-			b"secret"
+			b""
 		);
 		assert_ne!(
 			run_exit_code(&host, script_request(session, "/usr/bin/printenv MY_TOKEN")).await,
@@ -3899,6 +4104,112 @@ mod tests {
 		};
 		assert_eq!(run_output(&host, second).await, b"unset|baseline");
 		host.close_session(&opened.session).expect("session closes");
+	}
+
+	#[tokio::test]
+	async fn sandboxed_session_preserves_ordinary_environment_mutations() {
+		let root = tempfile::tempdir().expect("workspace");
+		let host = ExecHost::new();
+		host.configure_sandbox(
+			&crate::exec_settings::SandboxSettings {
+				env_set: BTreeMap::from([(
+					Str::new_static("OMP_SANDBOX_POLICY"),
+					Str::new_static("1"),
+				)]),
+				..Default::default()
+			},
+			root.path(),
+		);
+		let opened = host
+			.open_session(OpenSessionRequest {
+				cwd_uri: Url::from_directory_path(root.path())
+					.expect("workspace URI")
+					.to_string(),
+				env_delta: Some(EnvironmentDelta {
+					set: BTreeMap::from([(String::from("OMP_SANDBOX_POLICY"), String::from("user"))]),
+					..EnvironmentDelta::default()
+				}),
+				..OpenSessionRequest::default()
+			})
+			.await
+			.expect("sandboxed session");
+		let first =
+			run_output(&host, script_request(&opened.session, "printf '%s' \"$OMP_SANDBOX_POLICY\""))
+				.await;
+		assert!(first.ends_with(b"1"));
+		assert_eq!(
+			run_output(&host, script_request(&opened.session, "export PATH=/persistent")).await,
+			b"",
+		);
+		assert_eq!(
+			run_output(&host, script_request(&opened.session, "printf '%s' \"$PATH\"")).await,
+			b"/persistent",
+		);
+		host.close_session(&opened.session).expect("session closes");
+	}
+
+	#[tokio::test]
+	async fn concurrent_sessions_own_distinct_sandbox_denial_slots() {
+		use omp_shell_engine::PathPolicy as _;
+
+		let root = tempfile::tempdir().expect("workspace");
+		let host = ExecHost::new();
+		host.configure_sandbox(
+			&crate::exec_settings::SandboxSettings {
+				env_set: BTreeMap::from([(
+					Str::new_static("OMP_SANDBOX_POLICY"),
+					Str::new_static("1"),
+				)]),
+				write_deny: vec![Str::from(root.path().to_string_lossy().as_ref())],
+				..Default::default()
+			},
+			root.path(),
+		);
+		let request = || OpenSessionRequest {
+			cwd_uri: Url::from_directory_path(root.path())
+				.expect("workspace URI")
+				.to_string(),
+			..OpenSessionRequest::default()
+		};
+		let (first, second) =
+			tokio::join!(host.open_session(request()), host.open_session(request()));
+		let first = first.expect("first session");
+		let second = second.expect("second session");
+		let (first_sandbox, second_sandbox) = {
+			let sessions = host.inner.sessions.lock();
+			(
+				sessions[&first.session]
+					.sandbox
+					.clone()
+					.expect("first sandbox"),
+				sessions[&second.session]
+					.sandbox
+					.clone()
+					.expect("second sandbox"),
+			)
+		};
+		assert!(!Arc::ptr_eq(&first_sandbox, &second_sandbox));
+		let first_attempt = first_sandbox.begin_attempt();
+		let second_attempt = second_sandbox.begin_attempt();
+		let first_path = root.path().join("first-denied");
+		let second_path = root.path().join("second-denied");
+		assert!(first_attempt.check_write(&first_path).is_err());
+		assert!(second_attempt.check_write(&second_path).is_err());
+		let canonical = fs::canonicalize(root.path()).expect("canonical root");
+		assert_eq!(
+			first_attempt.take_denial(),
+			Some(SandboxDenialFact::WritePath(canonical.join("first-denied"))),
+		);
+		assert_eq!(
+			second_attempt.take_denial(),
+			Some(SandboxDenialFact::WritePath(canonical.join("second-denied"))),
+		);
+		host
+			.close_session(&first.session)
+			.expect("first session closes");
+		host
+			.close_session(&second.session)
+			.expect("second session closes");
 	}
 
 	#[tokio::test]

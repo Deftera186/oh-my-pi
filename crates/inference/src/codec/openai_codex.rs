@@ -851,6 +851,7 @@ impl Decoder for CodexModelsDecoder {
 					maximum_output_tokens: Some(context_window.min(128_000)),
 					maximum_batch:         None,
 				}),
+				declared_pricing: Box::new([]),
 				extended_context_mode: None,
 				availability: Some(ModelAvailability::Available),
 				source: Str::new(CODEX_DISCOVERY_SOURCE),

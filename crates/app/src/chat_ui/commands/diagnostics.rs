@@ -1,6 +1,12 @@
 //! Project cleansing and local diagnostic command routes.
 
-use std::{fmt::Write as _, future::Future, path::Path, pin::Pin, sync::Arc};
+use std::{
+	fmt::Write as _,
+	future::Future,
+	path::{Path, PathBuf},
+	pin::Pin,
+	sync::Arc,
+};
 
 use miette::IntoDiagnostic as _;
 use omp_core::{Str, sf};
@@ -98,6 +104,30 @@ async fn run_cleanse_local(
 	})
 }
 
+pub(crate) fn session_artifacts(
+	data_dir: &Path,
+	workspace_root: &str,
+	session_id: &str,
+	journal: &Path,
+) -> miette::Result<PathBuf> {
+	let project_dir = omp_env::project_state::directory(data_dir, Path::new(workspace_root))
+		.map_err(|error| miette::miette!("could not resolve session paths: {error}"))?;
+	Ok(journal
+		.parent()
+		.unwrap_or(project_dir.as_path())
+		.join(session_id))
+}
+
+pub(crate) fn debug_logs_dir(data_dir: &Path) -> PathBuf {
+	omp_observability::logging::log_dir().map_or_else(|| data_dir.join("logs"), Path::to_path_buf)
+}
+
+pub(crate) fn render_system_facts(facts: &crate::debug::SystemFacts) -> miette::Result<Str> {
+	let json = serde_json::to_string_pretty(facts)
+		.map_err(|error| miette::miette!("could not render system facts: {error}"))?;
+	Ok(sf!("## System information\n\n```json\n{json}\n```"))
+}
+
 pub(crate) fn render_debug(
 	inspector: Option<&str>,
 	data_dir: &Path,
@@ -107,11 +137,8 @@ pub(crate) fn render_debug(
 ) -> miette::Result<Str> {
 	let project_dir = omp_env::project_state::directory(data_dir, Path::new(workspace_root))
 		.map_err(|error| miette::miette!("could not resolve session paths: {error}"))?;
-	let artifacts = journal
-		.parent()
-		.unwrap_or(project_dir.as_path())
-		.join(session_id);
-	let logs = data_dir.join("logs");
+	let artifacts = session_artifacts(data_dir, workspace_root, session_id, journal)?;
+	let logs = debug_logs_dir(data_dir);
 	match inspector.map(str::trim).filter(|value| !value.is_empty()) {
 		None => Ok(sf!(
 			"## Debug tools\n\n| Command | Purpose |\n|---|---|\n| `/debug raw-stream` | View this \
@@ -140,12 +167,7 @@ pub(crate) fn render_debug(
 			project_dir.display(),
 			logs.display(),
 		)),
-		Some("system") => {
-			let facts = crate::debug::collect_system_facts();
-			let json = serde_json::to_string_pretty(&facts)
-				.map_err(|error| miette::miette!("could not render system facts: {error}"))?;
-			Ok(sf!("## System information\n\n```json\n{json}\n```"))
-		},
+		Some("system") => render_system_facts(&crate::debug::collect_system_facts()),
 		Some(other) => Err(miette::miette!(
 			"unknown debug inspector `{other}`; expected raw-stream, logs, paths, or system"
 		)),
@@ -213,8 +235,8 @@ mod tests {
 
 	#[test]
 	fn diagnostic_commands_are_registered_at_stable_orders() {
-		let mut declarations = inventory::iter::<super::super::registry::BuiltinRegistration>
-			.into_iter()
+		let mut declarations = super::super::registry::BUILTINS
+			.iter()
 			.map(|registration| (registration.declaration)())
 			.filter(|declaration| {
 				matches!(declaration.name.as_str(), "cleanse" | "debug" | "extended-context")

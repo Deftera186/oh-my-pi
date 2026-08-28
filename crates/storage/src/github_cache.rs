@@ -25,7 +25,7 @@ pub enum GithubResourceKind {
 pub struct GithubCacheKey {
 	/// Resource family.
 	pub kind:   GithubResourceKind,
-	/// Lowercase `owner/repo` identity.
+	/// Lowercase `[host/]owner/repo` identity; github.com remains unqualified.
 	pub repo:   Str,
 	/// Item number; `None` identifies a list.
 	pub number: Option<u64>,
@@ -79,8 +79,8 @@ pub struct GithubCacheEntry {
 /// Cache open, validation, or transaction failure.
 #[derive(Debug, thiserror::Error)]
 pub enum GithubCacheError {
-	/// Repository must be an `owner/repo` pair of safe GitHub components.
-	#[error("GitHub repository must be a safe owner/repo pair")]
+	/// Repository must be a safe `[host/]owner/repo` identity.
+	#[error("GitHub repository must be a safe [host/]owner/repo identity")]
 	InvalidRepo,
 	/// Item numbers are positive.
 	#[error("GitHub item number must be positive")]
@@ -228,20 +228,43 @@ impl fmt::Debug for GithubCache {
 }
 
 fn normalize_repo(repo: &str) -> Result<Str, GithubCacheError> {
-	let repo = repo.trim().trim_end_matches(".git");
-	let mut parts = repo.split('/');
-	let owner = parts.next().unwrap_or_default();
-	let name = parts.next().unwrap_or_default();
-	if parts.next().is_some() || !valid_component(owner) || !valid_component(name) {
+	let mut parts = repo.trim().trim_end_matches(".git").split('/');
+	let first = parts.next().unwrap_or_default();
+	let second = parts.next().unwrap_or_default();
+	let third = parts.next();
+	if parts.next().is_some() {
 		return Err(GithubCacheError::InvalidRepo);
 	}
-	Ok(Str::new(format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase())))
+	let (host, owner, name) = match third {
+		Some(name) => (Some(first), second, name),
+		None => (None, first, second),
+	};
+	if host.is_some_and(|host| !valid_host(host))
+		|| !valid_component(owner)
+		|| !valid_component(name)
+	{
+		return Err(GithubCacheError::InvalidRepo);
+	}
+	let slug = format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase());
+	match host {
+		Some(host) if !host.eq_ignore_ascii_case("github.com") => {
+			Ok(Str::new(format!("{}/{slug}", host.to_ascii_lowercase())))
+		},
+		_ => Ok(Str::new(slug)),
+	}
 }
 
 fn valid_component(component: &str) -> bool {
 	!component.is_empty()
 		&& component.len() <= 100
 		&& component
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+fn valid_host(host: &str) -> bool {
+	!host.is_empty()
+		&& host.len() <= 255
+		&& host
 			.bytes()
 			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
@@ -297,6 +320,31 @@ mod tests {
 		);
 		assert_eq!(cache.invalidate_repo("owner/repo").expect("invalidate"), 1);
 		assert!(cache.get(&key, 70_001).expect("read").is_none());
+	}
+
+	#[test]
+	fn cache_keys_namespace_enterprise_hosts_without_changing_github_dot_com() {
+		let default =
+			GithubCacheKey::new(GithubResourceKind::PullRequest, "Owner/Repo", Some(7), "detail")
+				.expect("default key");
+		let explicit_default = GithubCacheKey::new(
+			GithubResourceKind::PullRequest,
+			"github.com/OWNER/REPO",
+			Some(7),
+			"detail",
+		)
+		.expect("explicit default key");
+		let enterprise = GithubCacheKey::new(
+			GithubResourceKind::PullRequest,
+			"GHE.Example.com/Owner/Repo",
+			Some(7),
+			"detail",
+		)
+		.expect("enterprise key");
+		assert_eq!(default.repo, "owner/repo");
+		assert_eq!(explicit_default.repo, default.repo);
+		assert_eq!(enterprise.repo, "ghe.example.com/owner/repo");
+		assert_ne!(enterprise.repo, default.repo);
 	}
 
 	#[test]

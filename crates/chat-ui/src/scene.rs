@@ -12,9 +12,9 @@ use std::{
 
 use omp_core::{IntoStr, Str, StrMut, fmts_mut, sf};
 use omp_tui::{
-	Border, Cached, Charset, Color, Command, Component, Decor, DecorKind, Frame, HistoryReplay,
-	Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, PropValue, Props, Rect, Size, Slot,
-	SpellingFeatures, Style, Theme, Ui, UiContext, UiEvent,
+	Border, Cached, CellContent, Charset, Color, Command, Component, Decor, DecorKind, Frame,
+	HistoryReplay, Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, PropValue, Props, Rect,
+	Size, Slot, SpellingFeatures, Style, Theme, Ui, UiContext, UiEvent,
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
 		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
@@ -28,9 +28,10 @@ use omp_tui::{
 use smallvec::SmallVec;
 
 use crate::{
-	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
-	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel, TodoHud,
-	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, WorkingIndicator,
+	ActivityWaveform, AgentRow, AssistantUsage, BackendEvent, CompactionSpeculationStatus,
+	ModelDownloadProgress, QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode,
+	ThinkingLevel, TodoHud, ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind,
+	TurnAnchor, WorkingIndicator,
 	blocks::{BlockOrdinal, Blocks},
 	completion::{CompletionChain, ReloadableSlashCommands},
 	frame::{FrameError, FrameMutation, RetainedFrames, render_frame_tml},
@@ -274,7 +275,7 @@ impl RetirementBatch {
 	pub(crate) fn replay_plan(&self) -> Option<(HistoryReplay, &[Frame])> {
 		match (self.kind, self.replay_frames.as_deref()) {
 			(RetirementKind::Replay(mode), Some(frames)) => Some((mode, frames)),
-			(RetirementKind::Commit, None) => None,
+			(RetirementKind::Commit | RetirementKind::Band, None) => None,
 			_ => unreachable!("replay kind and segmented frame plan must agree"),
 		}
 	}
@@ -284,6 +285,8 @@ impl RetirementBatch {
 enum RetirementKind {
 	Commit,
 	Replay(HistoryReplay),
+	/// Resident band rows scrolled into native history ahead of newer content.
+	Band,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,6 +641,25 @@ struct AssistantEntry {
 	body: RichText,
 }
 
+struct UsageEntry {
+	label:          Str,
+	elapsed_ms:     Option<u64>,
+	visible:        bool,
+	show_turn_time: bool,
+}
+
+impl UsageEntry {
+	fn display_label(&self) -> Str {
+		if self.show_turn_time
+			&& let Some(elapsed_ms) = self.elapsed_ms
+		{
+			sf!("{} · Δ{}", self.label, format_turn_elapsed(elapsed_ms))
+		} else {
+			self.label.clone()
+		}
+	}
+}
+
 impl AssistantEntry {
 	fn new(text: String, width: u16, ctx: &UiContext) -> Self {
 		Self { body: RichText::new(text, width, ctx) }
@@ -786,6 +808,9 @@ struct ToolEntry {
 	expanded: bool,
 	view:     ToolView,
 	images:   Vec<ToolImageEntry>,
+}
+fn tool_label(icon: &str, name: &str) -> Str {
+	fmts_mut!("{icon} {name}").freeze()
 }
 
 struct CompactionEntry {
@@ -1055,8 +1080,6 @@ struct LiveTool {
 	ordinal:           BlockOrdinal,
 	id:                Str,
 	name:              Str,
-	rev:               Str,
-	title:             Str,
 	expanded:          bool,
 	view:              ToolView,
 	images:            Vec<ToolImageEntry>,
@@ -1064,43 +1087,6 @@ struct LiveTool {
 	target_height:     u16,
 	target_changed_at: Duration,
 	body_folded:       bool,
-}
-/// Normalized live tool model consumed by the active-stack renderer.
-#[derive(Clone, Debug)]
-pub struct ToolPresentation {
-	/// Stable tool call identity.
-	pub id:        Str,
-	/// Human-readable tool name.
-	pub name:      Str,
-	/// Stable operation description.
-	pub intent:    Str,
-	/// Latest one-line semantic progress.
-	pub activity:  Str,
-	/// Optional compact status badge.
-	pub badge:     Option<Str>,
-	/// Current bounded live body.
-	pub live_body: Str,
-}
-
-impl LiveTool {
-	fn presentation(&self) -> ToolPresentation {
-		let activity = self
-			.view
-			.source
-			.lines()
-			.rev()
-			.find(|line| !line.trim().is_empty())
-			.unwrap_or(self.title.as_str())
-			.into();
-		ToolPresentation {
-			id: self.id.clone(),
-			name: self.name.clone(),
-			intent: self.title.clone(),
-			activity,
-			badge: Some(self.rev.clone()),
-			live_body: self.view.source.clone(),
-		}
-	}
 }
 
 struct RetainedEntry {
@@ -1116,6 +1102,7 @@ enum Entry {
 	User(UserEntry),
 	Welcome(WelcomeEntry),
 	Assistant(AssistantEntry),
+	Usage(UsageEntry),
 	Thinking(ThinkingEntry),
 	Peer { title: Str, detail: Option<Str> },
 	Tool(ToolEntry),
@@ -1136,6 +1123,7 @@ fn restyle_entry(entry: &mut Entry, ctx: &UiContext) {
 				let _ = view.set_context(ctx.clone());
 			}
 		},
+		Entry::Usage(_) => {},
 		Entry::Thinking(thinking) => {
 			if let Some(view) = thinking.body.view.as_mut() {
 				let _ = view.set_context(ctx.clone());
@@ -1170,25 +1158,22 @@ fn activity_waveform_label(waveform: &ActivityWaveform, charset: Charset) -> Str
 }
 
 struct StatusLabels {
-	model:        Str,
-	session:      Option<Str>,
-	turn_context: Option<Str>,
-	turn_cost:    Option<Str>,
-	turn_state:   Str,
-	activity:     Option<Str>,
-	git:          Option<Str>,
-	context:      Option<(Str, bool)>,
-	velocity:     Option<Str>,
-	folder:       Option<Str>,
-	resources:    SmallVec<Str, 5>,
-	hooks:        Option<Str>,
-	tasks:        Option<Str>,
-	collab:       Option<Str>,
-	account:      Option<Str>,
-	queued:       Option<Str>,
-	jobs:         Option<Str>,
-	attempt:      Option<Str>,
-	dropped:      Option<Str>,
+	model:     Str,
+	activity:  Option<Str>,
+	git:       Option<Str>,
+	context:   Option<(Str, bool)>,
+	velocity:  Option<Str>,
+	folder:    Option<Str>,
+	resources: SmallVec<Str, 5>,
+	hooks:     Option<Str>,
+	tasks:     Option<Str>,
+	collab:    Option<Str>,
+	account:   Option<Str>,
+	quota:     Option<(Str, u8)>,
+	queued:    Option<Str>,
+	jobs:      Option<Str>,
+	attempt:   Option<Str>,
+	dropped:   Option<Str>,
 }
 
 impl StatusLabels {
@@ -1227,24 +1212,6 @@ impl StatusLabels {
 		});
 		let mut labels = Self {
 			model: model.freeze(),
-			session: facts.session_id.as_ref().map(|session_id| {
-				let suffix = session_id
-					.get(session_id.len().saturating_sub(6)..)
-					.unwrap_or(session_id.as_str());
-				fmts_mut!("session {suffix}").freeze()
-			}),
-			turn_context: (facts.context_tokens > 0).then(|| sf!("context  {}", facts.context_tokens)),
-			turn_cost: (facts.cost_nanos > 0).then(|| {
-				let total_cents = facts.cost_nanos.saturating_add(5_000_000) / 10_000_000;
-				let dollars = total_cents / 100;
-				let cents = total_cents % 100;
-				sf!("cost     ${dollars}.{cents:02}")
-			}),
-			turn_state: if facts.working {
-				sf!("state    working")
-			} else {
-				sf!("state    idle")
-			},
 			activity,
 			git,
 			context,
@@ -1279,6 +1246,10 @@ impl StatusLabels {
 				.account_override
 				.as_ref()
 				.map(|account| fmts_mut!("acct {account}").freeze()),
+			quota: facts
+				.quota
+				.and_then(|quota| quota.daily)
+				.map(|window| (crate::status_line::daily_quota_label(window), window.percent)),
 			queued: (facts.queued > 0).then(|| fmts_mut!("queued {}", facts.queued).freeze()),
 			jobs: (facts.jobs > 0).then(|| fmts_mut!("jobs {}", facts.jobs).freeze()),
 			attempt: (facts.attempt > 0).then(|| fmts_mut!("retry {}", facts.attempt).freeze()),
@@ -1312,6 +1283,9 @@ impl StatusLabels {
 			*label = separated(label, separator, charset);
 		}
 		if let Some((text, _)) = &mut self.context {
+			*text = separated(text, separator, charset);
+		}
+		if let Some((text, _)) = &mut self.quota {
 			*text = separated(text, separator, charset);
 		}
 	}
@@ -1404,6 +1378,39 @@ struct ChatStatus {
 	style:      ComposerStyle,
 }
 
+fn context_gauge_min_width(facts: &StatusFacts) -> u16 {
+	let Some(window) = facts.context_window.filter(|window| *window > 0) else {
+		return 1;
+	};
+	let (label, _) = context_usage_label(facts.context_tokens, Some(window));
+	let Some((percent, window)) = label.split_once('/') else {
+		return 1;
+	};
+	visible_width(percent)
+		.saturating_add(visible_width(window))
+		.saturating_add(4)
+}
+
+fn fit_status_group_widths(budget: u16, left: u16, right: u16) -> (u16, u16) {
+	if left == 0 {
+		return (0, right.min(budget));
+	}
+	if right == 0 {
+		return (left.min(budget), 0);
+	}
+	if budget < 2 {
+		return (budget.min(left), 0);
+	}
+	let mut fitted_left = left.min(budget.div_ceil(2)).max(1);
+	let mut fitted_right = right.min(budget.saturating_sub(fitted_left)).max(1);
+	let mut spare = budget.saturating_sub(fitted_left.saturating_add(fitted_right));
+	let left_extra = left.saturating_sub(fitted_left).min(spare);
+	fitted_left = fitted_left.saturating_add(left_extra);
+	spare = spare.saturating_sub(left_extra);
+	fitted_right = fitted_right.saturating_add(right.saturating_sub(fitted_right).min(spare));
+	(fitted_left, fitted_right)
+}
+
 impl ChatStatus {
 	fn new(
 		work: Rc<RefCell<WorkState>>,
@@ -1414,7 +1421,7 @@ impl ChatStatus {
 		let mut props = Props::new();
 		props.set(Prop::Id, STATUS_ID);
 		props.set(Prop::NoSelect, true);
-		let idle_brand = fmts_mut!("{} omp idle", charset.icon(Icon::Omp)).freeze();
+		let idle_brand = fmts_mut!("{} omp", charset.icon(Icon::Omp)).freeze();
 		Self { props, slot: next_slot(), work, idle_brand, charset, theme, style }
 	}
 
@@ -1448,27 +1455,10 @@ impl ChatStatus {
 		let work = self.work.borrow();
 		let facts = &work.facts;
 		let minimal = facts.layout == StatusLayout::Minimal;
-		let compact = facts.layout == StatusLayout::Compact;
 		let model = work.labels.model.clone();
-		let session = work.labels.session.clone();
-		let turn_context = if compact {
-			work.labels.turn_context.clone()
-		} else {
-			None
-		};
-		let turn_cost = if compact {
-			work.labels.turn_cost.clone()
-		} else {
-			None
-		};
-		let turn_state = compact.then(|| work.labels.turn_state.clone());
 		let folder = work.labels.folder.clone();
 		let git = work.labels.git.clone();
-		let spend = if compact {
-			Str::default()
-		} else {
-			spend_label(facts.cost_nanos, facts.model_subscription, self.charset)
-		};
+		let spend = spend_label(facts.cost_nanos, facts.model_subscription, self.charset);
 		let advisor_spend =
 			advisor_spend_label(facts.advisor_cost_nanos, facts.advisor_subscription, self.charset);
 		drop(work);
@@ -1478,13 +1468,6 @@ impl ChatStatus {
 			.segment(Segment::new().label(model).with(Prop::Fg, self.theme.ok));
 		if minimal {
 			return status;
-		}
-		if let Some(session) = session {
-			status = status.segment(
-				Segment::new()
-					.label(session.clone())
-					.with(Prop::Fg, self.theme.secondary),
-			);
 		}
 		if let Some(folder) = folder {
 			status = status.segment(
@@ -1500,27 +1483,6 @@ impl ChatStatus {
 			status = status.segment(
 				Segment::new()
 					.label(spend)
-					.with(Prop::Fg, self.theme.secondary),
-			);
-		}
-		if let Some(context) = turn_context {
-			status = status.segment(
-				Segment::new()
-					.label(context)
-					.with(Prop::Fg, self.theme.secondary),
-			);
-		}
-		if let Some(cost) = turn_cost {
-			status = status.segment(
-				Segment::new()
-					.label(cost)
-					.with(Prop::Fg, self.theme.secondary),
-			);
-		}
-		if let Some(turn_state) = turn_state {
-			status = status.segment(
-				Segment::new()
-					.label(turn_state)
 					.with(Prop::Fg, self.theme.secondary),
 			);
 		}
@@ -1616,6 +1578,16 @@ impl ChatStatus {
 			);
 		}
 		if facts.layout != StatusLayout::Minimal {
+			if let Some((quota, percent)) = &work.labels.quota {
+				let color = if *percent >= 80 {
+					self.theme.err
+				} else if *percent >= 50 {
+					self.theme.warn
+				} else {
+					self.theme.muted
+				};
+				status = status.segment(Segment::new().label(quota.clone()).with(Prop::Fg, color));
+			}
 			if let Some(queued) = &work.labels.queued {
 				status = status.segment(
 					Segment::new()
@@ -1668,6 +1640,7 @@ impl ChatStatus {
 			|| facts.tasks > 0
 			|| facts.collab_peers > 0
 			|| facts.account_override.is_some()
+			|| facts.quota.and_then(|quota| quota.daily).is_some()
 			|| facts.context_tokens > 0
 			|| !work.title.is_empty()
 	}
@@ -1689,9 +1662,29 @@ impl ChatStatus {
 	fn paint_full(&self, pc: &mut PaintCtx<'_>, rect: Rect, gauge: ContextGaugeMode) {
 		let mut left = self.left_group(pc.now);
 		let mut right = self.right_group(gauge, pc.now);
-		let (_, left_width) = left.measure(pc.ctx);
-		let (_, right_width) = right.measure(pc.ctx);
-		if let Some(layout) = boundary_layout(rect.x, rect.width, left_width, right_width, 2) {
+		let (_, natural_left) = left.measure(pc.ctx);
+		let (_, natural_right) = right.measure(pc.ctx);
+		let (left_width, right_width, minimum_boundary) = if matches!(gauge, ContextGaugeMode::Bar) {
+			let facts = &self.work.borrow().facts;
+			let desired = context_gauge_min_width(facts);
+			let surviving_group = u16::from(natural_left > 0 || natural_right > 0);
+			let minimum = if desired.saturating_add(surviving_group) <= rect.width {
+				desired
+			} else {
+				1
+			};
+			let (left, right) = fit_status_group_widths(
+				rect.width.saturating_sub(minimum),
+				natural_left,
+				natural_right,
+			);
+			(left, right, minimum)
+		} else {
+			(natural_left, natural_right, 2)
+		};
+		if let Some(layout) =
+			boundary_layout(rect.x, rect.width, left_width, right_width, minimum_boundary)
+		{
 			left.paint(pc, Rect::new(layout.left_x, rect.y, left_width, 1));
 			if matches!(gauge, ContextGaugeMode::Bar) {
 				let facts = &self.work.borrow().facts;
@@ -1888,6 +1881,14 @@ pub struct Chat {
 	work:                    Rc<RefCell<WorkState>>,
 	blocks:                  Blocks,
 	replay:                  Option<Replay>,
+	/// Committed transcript tail resident in the viewport's leading rows.
+	///
+	/// A settled-resize replay leaves these rows on screen instead of
+	/// scrolling all of them into native history, keeping the viewport
+	/// contiguous with the transcript. They repaint every frame and retire
+	/// ahead of any newer commit; a width change drops them and the next
+	/// settled replay re-derives the split from `entries`.
+	band:                    Option<Frame>,
 	/// Finalized semantic snapshots by ordinal. Snapshots at or past the
 	/// commit frontier are settled (viewport-resident); earlier ones are
 	/// retained so one buffered display replay can re-render them at a new
@@ -1922,8 +1923,13 @@ pub struct Chat {
 	live_voice_action:       Option<LiveVoiceAction>,
 	reduced_motion:          bool,
 	smooth_streaming:        bool,
+	show_token_usage:        bool,
+	show_turn_time:          bool,
+	turn_started_at_ms:      Option<u64>,
+	last_completed_at_ms:    Option<u64>,
 	suppress_history_replay: bool,
 	hide_thinking:           bool,
+	hide_tools:              bool,
 	/// Dequeue chord rendered in pending queued-row hints.
 	dequeue_hint:            Str,
 	hidden_thinking_label:   Option<Str>,
@@ -1977,6 +1983,7 @@ impl Chat {
 			work,
 			blocks: Blocks::new(),
 			replay: None,
+			band: None,
 			entries: BTreeMap::new(),
 			last_viewport: Size::new(0, 0),
 			last_editor_height: 0,
@@ -2007,8 +2014,13 @@ impl Chat {
 			live_voice_action: None,
 			reduced_motion: false,
 			smooth_streaming: true,
+			show_token_usage: false,
+			show_turn_time: false,
+			turn_started_at_ms: None,
+			last_completed_at_ms: None,
 			suppress_history_replay: false,
 			hide_thinking: false,
+			hide_tools: false,
 			hidden_thinking_label: None,
 			tools_expanded: true,
 			dequeue_hint: Str::new_static(DEQUEUE_HINT_DEFAULT),
@@ -2019,6 +2031,86 @@ impl Chat {
 	/// underlying transcript.
 	pub fn set_hide_thinking(&mut self, hide_thinking: bool) {
 		self.hide_thinking = hide_thinking;
+		self.bump_live();
+	}
+
+	/// Applies one non-visible prompt/run boundary to the elapsed-time anchor.
+	pub fn apply_turn_anchor(&mut self, anchor: TurnAnchor) {
+		match anchor {
+			TurnAnchor::AgentStart => {
+				if self
+					.turn_started_at_ms
+					.zip(self.last_completed_at_ms)
+					.is_some_and(|(started, completed)| started < completed)
+				{
+					self.turn_started_at_ms = None;
+				}
+			},
+			TurnAnchor::User { submitted_at_ms } => {
+				if submitted_at_ms > 0 {
+					self.turn_started_at_ms = Some(submitted_at_ms);
+				}
+			},
+			TurnAnchor::Developer { submitted_at_ms, synthetic, user_initiated } => {
+				if synthetic {
+					self.turn_started_at_ms = if user_initiated && submitted_at_ms > 0 {
+						Some(submitted_at_ms)
+					} else {
+						None
+					};
+				}
+			},
+		}
+	}
+
+	/// Appends one final usage row and derives elapsed time from local clocks.
+	pub fn push_assistant_usage(&mut self, row: AssistantUsage) {
+		let elapsed_ms = self
+			.turn_started_at_ms
+			.and_then(|started| row.completed_at_ms.checked_sub(started))
+			.filter(|elapsed| *elapsed > 0);
+		self.last_completed_at_ms = Some(row.completed_at_ms);
+		self.enqueue_final(Entry::Usage(UsageEntry {
+			label: format_usage_label(&row.usage),
+			elapsed_ms,
+			visible: self.show_token_usage,
+			show_turn_time: self.show_turn_time,
+		}));
+		self.bump_live();
+	}
+
+	/// Shows or hides transcript usage rows and rebuilds committed scrollback.
+	pub fn set_show_token_usage(&mut self, show: bool) {
+		if self.show_token_usage == show {
+			return;
+		}
+		self.show_token_usage = show;
+		for entry in self.entries.values_mut() {
+			if let Entry::Usage(usage) = entry {
+				usage.visible = show;
+			}
+		}
+		self.rebuild_usage_display();
+	}
+
+	/// Shows or hides prompt-to-yield deltas and rebuilds committed scrollback.
+	pub fn set_show_turn_time(&mut self, show: bool) {
+		if self.show_turn_time == show {
+			return;
+		}
+		self.show_turn_time = show;
+		for entry in self.entries.values_mut() {
+			if let Entry::Usage(usage) = entry {
+				usage.show_turn_time = show;
+			}
+		}
+		self.rebuild_usage_display();
+	}
+
+	fn rebuild_usage_display(&mut self) {
+		if self.blocks.frontier() > 0 {
+			self.begin_history_replay(HistoryReplay::Rebuild);
+		}
 		self.bump_live();
 	}
 
@@ -2167,11 +2259,33 @@ impl Chat {
 			return ChatKey::Consumed;
 		}
 		if key == Key::Ctrl('o') {
-			self.toggle_latest_tool();
+			let _ = self.toggle_latest_tool();
 			return ChatKey::Consumed;
 		}
 		if key == Key::Ctrl('t') {
 			self.toggle_thinking();
+			return ChatKey::Consumed;
+		}
+		if key == Key::ToggleToolVisibility {
+			self.toggle_tool_visibility();
+			return ChatKey::Consumed;
+		}
+		if key == Key::CopyPrompt {
+			self.copied = self.entries.values().rev().find_map(|entry| match entry {
+				Entry::User(user) => Some(Str::new(user.body.text.as_str())),
+				_ => None,
+			});
+			return ChatKey::Consumed;
+		}
+		if key == Key::CopyLine {
+			let mut line = None;
+			self
+				.editor_ui
+				.update_component::<EditorPane>(INPUT_ID, |pane| {
+					line = Some(Str::new(pane.current_line()));
+					false
+				});
+			self.copied = line.filter(|line| !line.is_empty());
 			return ChatKey::Consumed;
 		}
 		if key == Key::Enter && self.composer_empty() && self.is_working() {
@@ -2268,7 +2382,7 @@ impl Chat {
 				.find(|(_, top, height)| report.row == *top && *height > 0)
 				.map(|(ordinal, ..)| *ordinal);
 			if let Some(ordinal) = hit
-				&& self.toggle_tool_ordinal(ordinal)
+				&& self.toggle_tool_ordinal(ordinal).is_some()
 			{
 				return;
 			}
@@ -2504,14 +2618,7 @@ impl Chat {
 			self.settle_assistant(assistant);
 		}
 		for tool in self.live_tools.drain(..) {
-			let label = fmts_mut!(
-				"{} {}@{} · {}",
-				self.ctx.charset.icon(Icon::Cancellable),
-				tool.name,
-				tool.rev,
-				tool.title
-			)
-			.freeze();
+			let label = tool_label(self.ctx.charset.icon(Icon::Cancellable), &tool.name);
 			self.entries.insert(
 				tool.ordinal,
 				Entry::Tool(ToolEntry {
@@ -2626,14 +2733,15 @@ impl Chat {
 		self.bump_live();
 	}
 
+	/// Toggles tool-card visibility scene-wide without mutating transcript
+	/// truth.
+	pub fn toggle_tool_visibility(&mut self) {
+		self.hide_tools = !self.hide_tools;
+		self.bump_live();
+	}
+
 	/// Begins a live tool card.
-	pub fn tool_started(
-		&mut self,
-		id: impl Into<Str>,
-		name: impl Into<Str>,
-		rev: impl Into<Str>,
-		title: impl Into<Str>,
-	) {
+	pub fn tool_started(&mut self, id: impl Into<Str>, name: impl Into<Str>) {
 		if self
 			.live_assistant
 			.as_mut()
@@ -2643,8 +2751,6 @@ impl Chat {
 		}
 		let id = id.into();
 		let name = name.into();
-		let rev = rev.into();
-		let title = hud_line(title.into(), self.ctx.charset);
 		let ordinal = self.blocks.create();
 		let duration = if self.reduced_motion { "0ms" } else { "180ms" };
 		let card = ToolCard::new()
@@ -2653,9 +2759,6 @@ impl Chat {
 			.with(Prop::Anim, duration)
 			.with(Prop::Ease, "out")
 			.name(name.clone())
-			.intent(title.clone())
-			.activity(title.clone())
-			.badge(rev.clone())
 			.folded(false)
 			.child(TextLeaf::new().text(""));
 		let mut card_ui = Ui::from_root(card, self.layout_width.max(1), self.ctx.clone());
@@ -2664,8 +2767,6 @@ impl Chat {
 			ordinal,
 			id,
 			name,
-			rev,
-			title,
 			expanded: self.tools_expanded,
 			view: ToolView::plain(
 				Default::default(),
@@ -2750,7 +2851,7 @@ impl Chat {
 				ToolTerminal::Aborted => self.ctx.charset.icon(Icon::Cancellable),
 				ToolTerminal::Skipped => self.ctx.charset.icon(Icon::Cancellable),
 			};
-			let label = fmts_mut!("{icon} {}@{} · {}", tool.name, tool.rev, tool.title).freeze();
+			let label = tool_label(icon, &tool.name);
 			let entry = ToolEntry {
 				label,
 				terminal,
@@ -2765,7 +2866,9 @@ impl Chat {
 	}
 
 	/// Toggles the most recent active tool card.
-	pub fn toggle_latest_tool(&mut self) {
+	///
+	/// Returns its new expansion state, or [`None`] when no tool card exists.
+	pub fn toggle_latest_tool(&mut self) -> Option<bool> {
 		let live = self.live_tools.last().map(|tool| tool.ordinal);
 		let settled = self
 			.entries
@@ -2773,11 +2876,12 @@ impl Chat {
 			.rev()
 			.find_map(|(ordinal, entry)| matches!(entry, Entry::Tool(_)).then_some(*ordinal));
 		if let Some(ordinal) = live.into_iter().chain(settled).max() {
-			let _ = self.toggle_tool_ordinal(ordinal);
+			return self.toggle_tool_ordinal(ordinal);
 		}
+		None
 	}
 
-	fn toggle_tool_ordinal(&mut self, ordinal: BlockOrdinal) -> bool {
+	fn toggle_tool_ordinal(&mut self, ordinal: BlockOrdinal) -> Option<bool> {
 		if let Some(tool) = self
 			.live_tools
 			.iter_mut()
@@ -2790,15 +2894,17 @@ impl Chat {
 					.card_ui
 					.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| card.set_folded(false));
 			}
+			let expanded = tool.expanded;
 			self.bump_live();
-			return true;
+			return Some(expanded);
 		}
 		if let Some(Entry::Tool(tool)) = self.entries.get_mut(&ordinal) {
 			tool.expanded = !tool.expanded;
+			let expanded = tool.expanded;
 			self.bump_live();
-			return true;
+			return Some(expanded);
 		}
-		false
+		None
 	}
 
 	/// Appends an in-place compaction divider with method, token delta, and
@@ -3197,7 +3303,7 @@ impl Chat {
 			self.blocks.finalize(assistant.ordinal);
 		}
 		for tool in self.live_tools.drain(..) {
-			let label = sf!("{}@{} · {reason}", tool.name, tool.rev);
+			let label = sf!("{} · {reason}", tool.name);
 			self
 				.entries
 				.insert(tool.ordinal, Entry::Notice { text: label, error: true });
@@ -3219,6 +3325,8 @@ impl Chat {
 		}
 		self.retained_frames = RetainedFrames::new();
 		self.pinned_error = None;
+		self.turn_started_at_ms = None;
+		self.last_completed_at_ms = None;
 		self.enqueue_final(Entry::Notice { text: "history cleared".into(), error: false });
 		self.bump_live();
 	}
@@ -3227,12 +3335,17 @@ impl Chat {
 	/// overlays.
 	pub fn apply_backend_event(&mut self, event: BackendEvent) -> Option<BackendEvent> {
 		match event {
+			BackendEvent::TurnAnchor(anchor) => self.apply_turn_anchor(anchor),
+			BackendEvent::AssistantUsage(row) => self.push_assistant_usage(row),
+			BackendEvent::ShowTokenUsageChanged(show) => self.set_show_token_usage(show),
+			BackendEvent::ShowTurnTimeChanged(show) => self.set_show_turn_time(show),
 			BackendEvent::UserReplayed { text, chips, queued } => {
 				if !self.suppress_history_replay {
+					let text = omp_agent::strip_system_wrapper(text.as_str()).unwrap_or(text.as_str());
 					if queued {
-						self.push_user_queued(text.as_str(), chips);
+						self.push_user_queued(text, chips);
 					} else {
-						self.push_user(text.as_str(), chips);
+						self.push_user(text, chips);
 					}
 				}
 			},
@@ -3262,9 +3375,7 @@ impl Chat {
 			},
 			BackendEvent::AssistantEnd { id } => self.end_assistant(id.as_str()),
 			BackendEvent::AssistantAbandoned { id } => self.abandon_assistant(id.as_str()),
-			BackendEvent::ToolStarted { id, name, rev, title } => {
-				self.tool_started(id, name, rev, title);
-			},
+			BackendEvent::ToolStarted { id, name } => self.tool_started(id, name),
 			BackendEvent::ToolOutput { id, chunk } => self.tool_output(id.as_str(), chunk.as_str()),
 			BackendEvent::ToolView { id, view } => self.tool_view(id.as_str(), view),
 			BackendEvent::ToolImage { id, source } => self.tool_image(id.as_str(), source),
@@ -3373,6 +3484,10 @@ impl Chat {
 			| BackendEvent::OpenAgentTree
 			| BackendEvent::UiRequest { .. }
 			| BackendEvent::OpenRawStream { .. }
+			| BackendEvent::OpenDebugTools(_)
+			| BackendEvent::OpenProtocolProbe
+			| BackendEvent::OpenLogs { .. }
+			| BackendEvent::OlderLogs { .. }
 			| BackendEvent::RawStreamFrame { .. }
 			| BackendEvent::RawStreamSnapshot { .. }
 			| BackendEvent::RawStreamClosed
@@ -3398,7 +3513,7 @@ impl Chat {
 	) -> ViewportFrame<'_> {
 		let frontier = match batch.kind {
 			RetirementKind::Commit => batch.range.end,
-			RetirementKind::Replay(_) => self.blocks.frontier(),
+			RetirementKind::Replay(_) | RetirementKind::Band => self.blocks.frontier(),
 		};
 		self.render_at_with_frontier(
 			viewport,
@@ -3590,6 +3705,18 @@ impl Chat {
 		self
 			.frame
 			.fill(Rect::new(0, 0, viewport.width, viewport.height), base_style(self.ctx.theme));
+		// Resident committed tail from the last settled-resize replay: these
+		// rows live on screen (not yet in native history) and repaint every
+		// frame so history-neutral presents cannot erase them.
+		match self.band.as_ref() {
+			Some(band) if band.size().width == viewport.width => {
+				let rows = band.size().height;
+				self.frame.blit(band, 0, rows, 0, 0);
+			},
+			// Stale width: drop it; the pending settled replay re-derives it.
+			Some(_) => self.band = None,
+			None => {},
+		}
 		let content_width = self.content_width(viewport);
 		self.layout_width = content_width;
 		self.editor_ui.tick(elapsed);
@@ -3613,6 +3740,7 @@ impl Chat {
 			if self.hide_thinking
 				&& self.hidden_thinking_label.is_none()
 				&& matches!(entry, Entry::Thinking(_))
+				|| self.hide_tools && matches!(entry, Entry::Tool(_))
 			{
 				continue;
 			}
@@ -3634,6 +3762,9 @@ impl Chat {
 			natural.push((assistant.ordinal, assistant.height()));
 		}
 		for tool in &mut self.live_tools {
+			if self.hide_tools {
+				continue;
+			}
 			if tool.card_ui.frame().size().width != content_width {
 				tool.card_ui.resize(content_width);
 			}
@@ -4126,6 +4257,7 @@ impl Chat {
 				{
 					0
 				},
+				Some(entry) if self.hide_tools && matches!(entry, Entry::Tool(_)) => 0,
 				Some(entry) => {
 					Self::resize_entry(entry, content_width, &self.ctx);
 					u32::from(Self::entry_height(entry, content_width, self.ctx.charset))
@@ -4149,6 +4281,9 @@ impl Chat {
 			total = total.saturating_add(u32::from(assistant.allocation.max(wanted)));
 		}
 		for tool in &self.live_tools {
+			if self.hide_tools {
+				continue;
+			}
 			let wanted = if tool.expanded {
 				tool.view.height().saturating_add(2).max(1)
 			} else {
@@ -4160,37 +4295,105 @@ impl Chat {
 		let live_count = self.blocks.live_count();
 		let row_pressure = total > u32::from(h_live);
 		let pressured = row_pressure || live_count >= MAX_LIVE_BLOCKS;
-		let eligible = eligible?;
-		if policy == RetirementPolicy::Pressure && !pressured {
-			return None;
-		}
+		let width = viewport.width.max(1);
+		let band_rows = self.band_rows(width);
 
 		// Pressure retires the longest finalized prefix whose remainder still
 		// fills the viewport, so committing rows never blanks the screen: a
 		// block taller than the live area stays visible (tail-clipped) until
 		// newer content can replace it. Only the block-count memory bound
 		// overrides that floor. Flush takes every currently eligible head.
-		let mut end = eligible.start;
-		let mut freed = 0_u32;
-		for height in &prefix {
-			let taken = end - eligible.start;
-			let count_pressured = live_count.saturating_sub(taken) >= MAX_LIVE_BLOCKS;
-			let remainder_fills_viewport =
-				total.saturating_sub(freed).saturating_sub(*height) >= u32::from(h_live);
-			if policy == RetirementPolicy::Pressure && !count_pressured && !remainder_fills_viewport {
-				break;
+		let commit = eligible
+			.filter(|_| policy != RetirementPolicy::Pressure || pressured)
+			.and_then(|eligible| {
+				let mut end = eligible.start;
+				let mut freed = 0_u32;
+				for height in &prefix {
+					let taken = end - eligible.start;
+					let count_pressured = live_count.saturating_sub(taken) >= MAX_LIVE_BLOCKS;
+					let remainder_fills_viewport =
+						total.saturating_sub(freed).saturating_sub(*height) >= u32::from(h_live);
+					if policy == RetirementPolicy::Pressure
+						&& !count_pressured
+						&& !remainder_fills_viewport
+					{
+						break;
+					}
+					freed = freed.saturating_add(*height);
+					end += 1;
+				}
+				(end > eligible.start).then_some(eligible.start..end)
+			});
+		if let Some(range) = commit {
+			let mut batch = self.render_retirement_batch(range, width, RetirementKind::Commit);
+			// Resident band rows are older than every commit: they must enter
+			// native history first or scrollback order breaks.
+			if band_rows > 0 {
+				let body = mem::replace(&mut batch.frame, Frame::new(Size::new(width, 0)));
+				match self.prepend_band(body, band_rows, width) {
+					Some(frame) => batch.frame = frame,
+					// The combined height overflows a frame: retire the band
+					// alone; the commit re-offers on the next paint.
+					None => return Some(self.band_overflow_batch(band_rows, width)),
+				}
 			}
-			freed = freed.saturating_add(*height);
-			end += 1;
+			return Some(batch);
 		}
-		if end == eligible.start {
-			return None;
+		if band_rows > 0 {
+			// Live content growing into the resident band pushes its oldest
+			// rows into native history before a paint can cover them.
+			let demand = u16::try_from(total.min(u32::from(h_live))).expect("clamped to h_live");
+			let overflow = band_rows.saturating_sub(h_live.saturating_sub(demand));
+			if overflow > 0 {
+				return Some(self.band_overflow_batch(overflow, width));
+			}
 		}
-		Some(self.render_retirement_batch(
-			eligible.start..end,
-			viewport.width.max(1),
-			RetirementKind::Commit,
-		))
+		None
+	}
+
+	/// Height of the resident band when it matches the current width; a
+	/// stale-width band is dropped (the pending settled replay re-derives it).
+	fn band_rows(&mut self, width: u16) -> u16 {
+		match self.band.as_ref() {
+			Some(band) if band.size().width == width => band.size().height,
+			Some(_) => {
+				self.band = None;
+				0
+			},
+			None => 0,
+		}
+	}
+
+	/// Returns `[band ‖ commit]` as one retirement frame, or `None` when the
+	/// combined height exceeds the frame limit. Consumes the band on success.
+	fn prepend_band(&mut self, commit: Frame, band_rows: u16, width: u16) -> Option<Frame> {
+		let height = band_rows.checked_add(commit.size().height)?;
+		let band = self.band.take().expect("band rows imply a resident band");
+		let mut frame = Frame::new(Size::new(width, height));
+		frame.blit(&band, 0, band_rows, 0, 0);
+		frame.blit(&commit, 0, commit.size().height, 0, band_rows);
+		Some(frame)
+	}
+
+	/// Splits the oldest `rows` off the resident band into a standalone
+	/// retirement frame, keeping the remainder resident.
+	fn band_overflow_batch(&mut self, rows: u16, width: u16) -> RetirementBatch {
+		let band = self.band.take().expect("overflow requires a resident band");
+		let mut frame = Frame::new(Size::new(width, rows));
+		frame.blit(&band, 0, rows, 0, 0);
+		let kept = band.size().height.saturating_sub(rows);
+		if kept > 0 {
+			let mut rest = Frame::new(Size::new(width, kept));
+			rest.blit(&band, rows, kept, 0, 0);
+			self.band = Some(rest);
+		}
+		let frontier = self.blocks.frontier();
+		RetirementBatch {
+			range: frontier..frontier,
+			frame,
+			replay_frames: None,
+			kind: RetirementKind::Band,
+		}
 	}
 
 	fn render_replay_batch(&mut self, replay: Replay, width: u16) -> RetirementBatch {
@@ -4202,6 +4405,7 @@ impl Chat {
 			if self.hide_thinking
 				&& self.hidden_thinking_label.is_none()
 				&& matches!(entry, Entry::Thinking(_))
+				|| self.hide_tools && matches!(entry, Entry::Tool(_))
 			{
 				continue;
 			}
@@ -4215,12 +4419,70 @@ impl Chat {
 			Self::draw_replay_entry(&mut frame, entry, 0, width, &self.ctx);
 			frames.push(frame);
 		}
+		self.split_replay_band(&mut frames, width);
 		RetirementBatch {
 			range:         0..replay.end,
 			frame:         Frame::new(Size::new(width, 0)),
 			replay_frames: Some(frames),
 			kind:          RetirementKind::Replay(replay.mode),
 		}
+	}
+
+	/// Moves the replay's trailing rows into the resident band so the
+	/// viewport's leading blank space shows the transcript tail; only the
+	/// remainder scrolls into native history.
+	///
+	/// The scene owning the split is what keeps the tail on screen: rows the
+	/// renderer moved into blank viewport space without scene knowledge were
+	/// erased by the very next history-neutral paint.
+	fn split_replay_band(&mut self, frames: &mut Vec<Frame>, width: u16) {
+		// Rows the outgoing band covered are reusable space: the replay
+		// re-derives their content from `entries`.
+		let prior = match self.band.take() {
+			Some(band) if band.size().width == width => band.size().height,
+			_ => 0,
+		};
+		let mut available = prior;
+		if self.frame.size().width == width {
+			let height = self.frame.size().height;
+			while available < height
+				&& (0..width).all(|column| {
+					matches!(self.frame.cell(column, available).content(), CellContent::Blank)
+				}) {
+				available += 1;
+			}
+		} else {
+			available = 0;
+		}
+		let total: usize = frames
+			.iter()
+			.map(|frame| usize::from(frame.size().height))
+			.sum();
+		let moved = usize::from(available).min(total);
+		let Ok(band_height) = u16::try_from(moved) else {
+			return;
+		};
+		if band_height == 0 {
+			return;
+		}
+		let mut band = Frame::new(Size::new(width, band_height));
+		band.fill(Rect::new(0, 0, width, band_height), base_style(self.ctx.theme));
+		let mut remaining = band_height;
+		while remaining > 0 {
+			let source = frames
+				.last_mut()
+				.expect("moved rows come from replay frames");
+			let height = source.size().height;
+			let take = height.min(remaining);
+			remaining -= take;
+			band.blit(source, height - take, take, 0, remaining);
+			if take == height {
+				frames.pop();
+			} else {
+				source.resize_height(height - take, base_style(self.ctx.theme));
+			}
+		}
+		self.band = Some(band);
 	}
 
 	fn render_retirement_batch(
@@ -4237,6 +4499,7 @@ impl Chat {
 				&& !(self.hide_thinking
 					&& self.hidden_thinking_label.is_none()
 					&& matches!(entry, Entry::Thinking(_)))
+				&& !(self.hide_tools && matches!(entry, Entry::Tool(_)))
 			{
 				Self::resize_entry(entry, width, &self.ctx);
 				u32::from(Self::entry_height(entry, width, self.ctx.charset))
@@ -4261,6 +4524,7 @@ impl Chat {
 			if self.hide_thinking
 				&& self.hidden_thinking_label.is_none()
 				&& matches!(entry, Entry::Thinking(_))
+				|| self.hide_tools && matches!(entry, Entry::Tool(_))
 			{
 				continue;
 			}
@@ -4295,6 +4559,9 @@ impl Chat {
 		match batch.kind {
 			RetirementKind::Commit => self.blocks.mark_committed(batch.range.end),
 			RetirementKind::Replay(_) => self.replay = None,
+			// The band shrinks when its batch is rendered; success needs no ack
+			// and failure poisons the renderer, ending the session.
+			RetirementKind::Band => {},
 		}
 	}
 
@@ -4391,7 +4658,6 @@ impl Chat {
 	}
 
 	fn refresh_live_tool_card(tool: &mut LiveTool, width: u16, ctx: &UiContext) {
-		let presentation = tool.presentation();
 		let mut body = Vec::with_capacity(tool.images.len().saturating_add(1));
 		body.push(tool.view.body(ctx));
 		for image in &tool.images {
@@ -4407,10 +4673,6 @@ impl Chat {
 			.card_ui
 			.update_component::<ToolCard>(LIVE_TOOL_CARD_ID, |card| {
 				let mut dirty = false;
-				dirty |= card.set_name(presentation.name);
-				dirty |= card.set_intent(presentation.intent);
-				dirty |= card.set_activity(presentation.activity);
-				dirty |= card.set_badge(presentation.badge.unwrap_or_default());
 				dirty |= card.set_state(ToolState::Streaming);
 				dirty |= card.set_flush(tool.view.chrome == ViewChrome::Flush);
 				dirty |= card.replace_body(body);
@@ -4436,6 +4698,7 @@ impl Chat {
 		match entry {
 			Entry::User(user) => user.body.resize(width.max(1), ctx),
 			Entry::Assistant(assistant) => assistant.body.resize(width.max(1), ctx),
+			Entry::Usage(_) => {},
 			Entry::Thinking(thinking) => thinking.body.resize(width.max(1), ctx),
 			Entry::Peer { .. } => {},
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
@@ -4467,6 +4730,7 @@ impl Chat {
 					assistant.body.height().saturating_add(1)
 				}
 			},
+			Entry::Usage(usage) => u16::from(usage.visible).saturating_add(u16::from(usage.visible)),
 			Entry::Thinking(thinking) => {
 				if thinking.body.text.trim().is_empty() {
 					0
@@ -4552,6 +4816,19 @@ impl Chat {
 					0
 				} else {
 					draw_rich(frame, y, &assistant.body, 0, width, ctx.theme).saturating_add(1)
+				}
+			},
+			Entry::Usage(usage) => {
+				if !usage.visible {
+					0
+				} else {
+					let label = usage.display_label();
+					draw_flowed(
+						frame,
+						Rect::new(1, y, width.saturating_sub(2), frame.size().height.saturating_sub(y)),
+						&[Span::new(label.as_str(), ink(ctx.theme.muted))],
+					)
+					.saturating_add(1)
 				}
 			},
 			Entry::Thinking(thinking) => {
@@ -5386,6 +5663,24 @@ fn elapsed_label(elapsed: Duration) -> Str {
 	}
 }
 
+fn format_turn_elapsed(elapsed_ms: u64) -> Str {
+	if elapsed_ms < 1_000 {
+		sf!("{elapsed_ms}ms")
+	} else {
+		elapsed_label(Duration::from_millis(elapsed_ms))
+	}
+}
+
+fn format_usage_label(usage: &omp_proto::inference::v1::Usage) -> Str {
+	let input = usage.input_tokens.saturating_add(usage.cache_write_tokens);
+	let mut label =
+		fmts_mut!("{} in · {} out", compact_count(input), compact_count(usage.output_tokens));
+	if usage.cache_read_tokens > 0 {
+		let _ = write!(label, " · {} cached", compact_count(usage.cache_read_tokens));
+	}
+	label.freeze()
+}
+
 fn compact_count(value: u64) -> Str {
 	let mut label = StrMut::default();
 	let _ = write_compact_count(&mut label, value);
@@ -5428,7 +5723,7 @@ mod tests {
 	use std::{env, fs, process};
 
 	use super::*;
-	use crate::BlockPhase;
+	use crate::{BlockPhase, GitFacts};
 
 	fn ctx() -> UiContext {
 		UiContext::default()
@@ -5451,6 +5746,16 @@ mod tests {
 	fn settle(chat: &mut Chat, viewport: Size) {
 		for frame in 0..8 {
 			let _ = chat.render_at(viewport, Duration::from_millis(frame * 60));
+		}
+	}
+	fn assistant_usage(completed_at_ms: u64) -> AssistantUsage {
+		AssistantUsage {
+			usage: omp_proto::inference::v1::Usage {
+				input_tokens: 4_200,
+				output_tokens: 7,
+				..Default::default()
+			},
+			completed_at_ms,
 		}
 	}
 
@@ -5484,43 +5789,46 @@ mod tests {
 		}
 	}
 	#[test]
-	fn idle_status_is_visible_without_the_sidebar() {
-		let mut chat = Chat::new(&ctx());
-		let rendered = frame_text(chat.render(Size::new(100, 32)).frame);
+	fn idle_brand_becomes_the_working_indicator() {
+		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
+		let mut chat = Chat::new(&ctx);
+		let brand = fmts_mut!("{} omp", ctx.charset.icon(Icon::Omp)).freeze();
+		let idle = frame_text(chat.render(Size::new(100, 32)).frame);
 
-		assert!(rendered.contains("omp idle"), "idle state is not visible: {rendered}");
+		assert!(idle.contains(brand.as_str()), "idle brand is missing: {idle}");
+		chat.set_status(StatusFacts { working: true, ..StatusFacts::default() });
+		let working = frame_text(chat.render(Size::new(100, 32)).frame);
+		assert!(!working.contains(brand.as_str()), "idle brand remained while working: {working}");
+		assert!(working.contains("0s"), "working indicator is missing: {working}");
 	}
 	#[test]
-	fn compact_status_keeps_the_session_identity_visible() {
-		let mut chat = Chat::new(&ctx());
+	fn compact_status_matches_the_reference_segment_contract() {
+		let ctx = UiContext { charset: Charset::Unicode, ..UiContext::default() };
+		let mut chat = Chat::new(&ctx);
+		chat.set_composer_style(ComposerStyle::Box);
 		chat.set_status(StatusFacts {
 			model: "DeepSeek V4 Flash".into(),
-			session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB1".into()),
 			cwd: Some("/tmp/project".into()),
-			context_tokens: 4_096,
+			git: Some(GitFacts { branch: sf!("main"), dirty: 2, staged: 1, untracked: 3 }),
+			context_tokens: 40_000,
 			context_window: Some(1_000_000),
 			cost_nanos: 1_500_000_000,
 			layout: StatusLayout::Compact,
 			..StatusFacts::default()
 		});
-		let rendered = frame_text(chat.render(Size::new(120, 32)).frame);
+		let _ = chat.apply_backend_event(BackendEvent::SessionTitle(sf!("Fix segment bars")));
+		let rendered = frame_text(chat.render(Size::new(140, 32)).frame);
 
-		assert!(
-			rendered.contains("session 9G5FB1"),
-			"compact status omitted the session identity: {rendered}"
-		);
-		assert!(
-			rendered.contains("context  4096"),
-			"compact status omitted the turn context: {rendered}"
-		);
-		assert!(
-			rendered.contains("cost     $1.50"),
-			"compact status omitted the turn cost: {rendered}"
-		);
-		assert!(
-			rendered.contains("state    idle"),
-			"compact status omitted the turn state: {rendered}"
-		);
+		for obsolete in ["session ", "context  ", "cost     ", "state    "] {
+			assert!(!rendered.contains(obsolete), "obsolete segment `{obsolete}`: {rendered}");
+		}
+		assert!(rendered.contains("⬢ DeepSeek V4 Flash"), "model icon is missing: {rendered}");
+		assert!(rendered.contains("📁 project"), "folder icon is missing: {rendered}");
+		assert!(rendered.contains("⑂ main *2 +1 ?3"), "git icon is missing: {rendered}");
+		assert!(rendered.contains("$1.50"), "compact spend is missing: {rendered}");
+		assert!(rendered.contains("4%"), "embedded context percent is missing: {rendered}");
+		assert!(rendered.contains("1m"), "embedded context window is missing: {rendered}");
+		assert!(rendered.contains("Fix segment bars"), "session title is missing: {rendered}");
 	}
 	#[test]
 	fn clear_and_exit_bypass_editor_mutation() {
@@ -5602,6 +5910,69 @@ mod tests {
 		assert!(border.contains('┃'), "compaction threshold tick: {border}");
 		assert!(border.contains('╎'), "speculation tick: {border}");
 		assert!(!border.contains("80%/"), "numeric context segment is absorbed: {border}");
+	}
+	#[test]
+	fn context_gauge_labels_survive_long_status_groups() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_composer_style(ComposerStyle::Box);
+		chat.set_status(StatusFacts {
+			model: "An Extremely Long Model Name".into(),
+			context_tokens: 160_000,
+			context_window: Some(200_000),
+			..StatusFacts::default()
+		});
+		let _ = chat.apply_backend_event(BackendEvent::SessionTitle(sf!(
+			"An extremely long session title that must shed first"
+		)));
+
+		let text = frame_text(chat.render(Size::new(34, 8)).frame);
+		let border = text
+			.lines()
+			.find(|line| line.contains("80%"))
+			.unwrap_or_else(|| panic!("gauge percent was shed before long status groups: {text}"));
+		assert!(border.contains("200k"), "gauge window was shed before status groups: {border}");
+	}
+
+	#[test]
+	fn context_gauge_degrades_to_one_cell_only_after_labels_cannot_fit() {
+		let facts = StatusFacts {
+			context_tokens: 160_000,
+			context_window: Some(200_000),
+			..StatusFacts::default()
+		};
+		let desired = context_gauge_min_width(&facts);
+		assert_eq!(desired, 11);
+		let (left, right) = fit_status_group_widths(12, 40, 30);
+		let labelled = boundary_layout(0, 23, left, right, desired).expect("labelled gauge layout");
+		assert_eq!(labelled.boundary_width, desired);
+
+		let minimum = if desired.saturating_add(1) <= 8 {
+			desired
+		} else {
+			1
+		};
+		let (left, right) = fit_status_group_widths(8_u16.saturating_sub(minimum), 40, 30);
+		let tiny = boundary_layout(0, 8, left, right, minimum).expect("one-cell gauge layout");
+		assert_eq!(tiny.boundary_width, 1);
+		assert!(left > 0 || right > 0, "a final status segment must survive beside the gauge");
+	}
+
+	#[test]
+	fn daily_quota_is_rendered_with_reset_context() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_status(StatusFacts {
+			model: "Fable 5".into(),
+			quota: Some(crate::status_line::StatusQuota {
+				daily: Some(crate::status_line::StatusQuotaWindow {
+					percent:       83,
+					reset_minutes: Some(125),
+				}),
+			}),
+			..StatusFacts::default()
+		});
+
+		let text = frame_text(chat.render(Size::new(100, 8)).frame);
+		assert!(text.contains("1d 83% (2h 5m)"), "{text}");
 	}
 
 	#[test]
@@ -5776,7 +6147,7 @@ mod tests {
 		assert!(assistant.revealed >= family_bytes);
 		assert!(assistant.revealed < assistant.text.len());
 
-		chat.tool_started("tool", "read", "1", "ordered boundary");
+		chat.tool_started("tool", "read");
 		let assistant = chat.live_assistant.as_ref().expect("live assistant");
 		assert_eq!(assistant.revealed, assistant.text.len());
 	}
@@ -5901,7 +6272,7 @@ mod tests {
 	#[test]
 	fn next_assistant_begin_seals_orphaned_tool_card() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("orphan", "bash", "1", "unfinished command");
+		chat.tool_started("orphan", "bash");
 		chat.tool_output("orphan", "partial output");
 		settle(&mut chat, Size::new(40, 12));
 
@@ -5940,28 +6311,31 @@ mod tests {
 	}
 
 	#[test]
-	fn settled_tool_card_draws_rail_chrome() {
+	fn settled_tool_card_leaves_call_detail_to_renderer() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("card", "grep", "1", "find usages");
+		chat.tool_started("card", "bash");
 		chat.tool_finished(
 			"card",
 			ToolTerminal::Succeeded,
-			ToolViewContent::Markup("<text>3 matches</text>".into()),
+			ToolViewContent::Markup("<text>$ echo ok</text>".into()),
 		);
 		let batch = chat
 			.retirement_batch(Size::new(60, 0))
 			.expect("settled card retires");
 		let text = frame_text(&batch.frame);
-		assert!(text.contains("▾ ✓ grep@1 · find usages"), "{text}");
-		assert!(text.contains("│ 3 matches"), "{text}");
+		assert!(text.contains("▾ ✓ bash"), "{text}");
+		assert!(text.contains("│ $ echo ok"), "{text}");
+		assert!(!text.contains('@'), "{text}");
+		assert!(!text.contains("bash ·"), "{text}");
+		assert_eq!(text.matches("echo ok").count(), 1, "{text}");
 		assert!(text.contains('╰'), "{text}");
 	}
 
 	#[test]
 	fn settled_tool_preserves_and_toggles_the_live_collapse_state() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("card", "read", "1", "long result");
-		chat.toggle_latest_tool();
+		chat.tool_started("card", "read");
+		assert_eq!(chat.toggle_latest_tool(), Some(false));
 		assert!(!chat.live_tools[0].expanded);
 		chat.tool_finished(
 			"card",
@@ -5973,7 +6347,7 @@ mod tests {
 		};
 		assert!(!tool.expanded);
 
-		chat.toggle_latest_tool();
+		assert_eq!(chat.toggle_latest_tool(), Some(true));
 		let Some(Entry::Tool(tool)) = chat.entries.get(&BlockOrdinal(0)) else {
 			panic!("settled tool entry");
 		};
@@ -5983,7 +6357,7 @@ mod tests {
 	#[test]
 	fn plain_tool_fallback_never_parses_core_markup() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("plain", "unknown", "0", "fallback");
+		chat.tool_started("plain", "unknown");
 		chat.tool_finished(
 			"plain",
 			ToolTerminal::ArgsRejected,
@@ -6002,7 +6376,7 @@ mod tests {
 	#[test]
 	fn flush_tool_view_settles_without_card_chrome() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("flush", "read", "1", "read src/lib.rs");
+		chat.tool_started("flush", "read");
 		chat.tool_finished(
 			"flush",
 			ToolTerminal::Succeeded,
@@ -6024,7 +6398,7 @@ mod tests {
 	fn replay_renders_the_same_committed_rows() {
 		let mut chat = Chat::new(&ctx());
 		for id in ["a", "b"] {
-			chat.tool_started(id, "read", "1", id);
+			chat.tool_started(id, "read");
 			chat.tool_finished(id, ToolTerminal::Succeeded, ToolViewContent::Plain(Str::from(id)));
 		}
 		let viewport = Size::new(40, 0);
@@ -6079,6 +6453,129 @@ mod tests {
 		let text = frame_text(chat.render(viewport).frame);
 		assert!(!text.contains("Queued"), "{text}");
 		assert!(text.contains("queued follow-up"), "{text}");
+	}
+	#[test]
+	fn replayed_todo_nudge_strips_only_the_outer_system_wrapper() {
+		let mut chat = Chat::new(&ctx());
+		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
+			text:   sf!("<system-reminder>Finish the todo list.</system-reminder>"),
+			chips:  Vec::new(),
+			queued: false,
+		});
+
+		let text = frame_text(chat.render(Size::new(60, 12)).frame);
+		assert!(text.contains("Finish the todo list."), "{text}");
+		assert!(!text.contains("<system-reminder>"), "{text}");
+	}
+	#[test]
+	fn todo_continuation_preserves_the_user_turn_anchor() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_show_token_usage(true);
+		chat.set_show_turn_time(true);
+		chat.apply_turn_anchor(TurnAnchor::User { submitted_at_ms: 1_000 });
+		chat.apply_turn_anchor(TurnAnchor::Developer {
+			submitted_at_ms: 2_000,
+			synthetic:       false,
+			user_initiated:  false,
+		});
+		chat.push_assistant_usage(assistant_usage(61_000));
+
+		let text = frame_text(chat.render(Size::new(60, 12)).frame);
+		assert!(text.contains("Δ1m"), "{text}");
+	}
+
+	#[test]
+	fn synthetic_follow_up_clears_the_user_turn_anchor() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_show_token_usage(true);
+		chat.set_show_turn_time(true);
+		chat.apply_turn_anchor(TurnAnchor::User { submitted_at_ms: 1_000 });
+		chat.apply_turn_anchor(TurnAnchor::Developer {
+			submitted_at_ms: 2_000,
+			synthetic:       true,
+			user_initiated:  false,
+		});
+		chat.push_assistant_usage(assistant_usage(61_000));
+
+		let text = frame_text(chat.render(Size::new(60, 12)).frame);
+		assert!(text.contains("4k in"), "{text}");
+		assert!(!text.contains('Δ'), "{text}");
+	}
+	#[test]
+	fn outer_agent_start_clears_an_anchor_from_a_completed_run() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_show_token_usage(true);
+		chat.set_show_turn_time(true);
+		chat.apply_turn_anchor(TurnAnchor::User { submitted_at_ms: 1_000 });
+		chat.push_assistant_usage(assistant_usage(61_000));
+		chat.apply_turn_anchor(TurnAnchor::AgentStart);
+		chat.push_assistant_usage(assistant_usage(121_000));
+
+		let text = frame_text(chat.render(Size::new(60, 12)).frame);
+		assert_eq!(text.matches('Δ').count(), 1, "{text}");
+	}
+
+	#[test]
+	fn skill_and_user_continue_each_seed_a_turn_anchor() {
+		let mut skill = Chat::new(&ctx());
+		skill.set_show_token_usage(true);
+		skill.set_show_turn_time(true);
+		skill.apply_turn_anchor(TurnAnchor::User { submitted_at_ms: 1_000 });
+		skill.push_assistant_usage(assistant_usage(61_000));
+		let skill_text = frame_text(skill.render(Size::new(60, 12)).frame);
+		assert!(skill_text.contains("Δ1m"), "{skill_text}");
+
+		let mut continued = Chat::new(&ctx());
+		continued.set_show_token_usage(true);
+		continued.set_show_turn_time(true);
+		continued.apply_turn_anchor(TurnAnchor::Developer {
+			submitted_at_ms: 1_000,
+			synthetic:       true,
+			user_initiated:  true,
+		});
+		continued.push_assistant_usage(assistant_usage(61_000));
+		let continued_text = frame_text(continued.render(Size::new(60, 12)).frame);
+		assert!(continued_text.contains("Δ1m"), "{continued_text}");
+	}
+
+	#[test]
+	fn journal_replay_reproduces_live_elapsed_value() {
+		let drive = |chat: &mut Chat| {
+			chat.set_show_token_usage(true);
+			chat.set_show_turn_time(true);
+			chat.apply_turn_anchor(TurnAnchor::User { submitted_at_ms: 1_000 });
+			chat.push_assistant_usage(assistant_usage(61_000));
+		};
+		let mut live = Chat::new(&ctx());
+		drive(&mut live);
+		let live_text = frame_text(live.render(Size::new(60, 12)).frame);
+
+		let mut replay = Chat::new(&ctx());
+		drive(&mut replay);
+		let replay_text = frame_text(replay.render(Size::new(60, 12)).frame);
+		assert_eq!(replay_text, live_text, "live:\n{live_text}\nreplay:\n{replay_text}");
+		assert!(replay_text.contains("Δ1m"), "{replay_text}");
+	}
+
+	#[test]
+	fn turn_time_setting_hides_delta_and_rebuilds_when_toggled() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_show_token_usage(true);
+		chat.apply_turn_anchor(TurnAnchor::User { submitted_at_ms: 1_000 });
+		chat.push_assistant_usage(assistant_usage(61_000));
+		let viewport = Size::new(60, 12);
+		let before = frame_text(chat.render(viewport).frame);
+		assert!(before.contains("4k in"), "{before}");
+		assert!(!before.contains('Δ'), "{before}");
+
+		let batch = chat.retirement_batch(viewport).expect("usage row retires");
+		chat.mark_retired(&batch);
+		chat.set_show_turn_time(true);
+		let replay = chat
+			.retirement_batch(viewport)
+			.expect("setting toggle rebuilds transcript");
+		let after = batch_text(&replay);
+		assert!(after.contains("Δ1m"), "{after}");
 	}
 
 	#[test]
@@ -6139,7 +6636,7 @@ mod tests {
 		])
 		.expect("temporary PNG");
 		let source: Str = path.to_string_lossy().into_owned().into();
-		chat.tool_started("image", "render", "1", "render image");
+		chat.tool_started("image", "render");
 		chat.tool_image("image", source.clone());
 		chat.tool_finished("image", ToolTerminal::Succeeded, ToolViewContent::Plain(source.clone()));
 		let batch = chat
@@ -6153,10 +6650,10 @@ mod tests {
 	#[test]
 	fn active_tools_contract_before_next_admission() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("one", "read", "1", "first");
+		chat.tool_started("one", "read");
 		chat.tool_output("one", "a\nb\nc\nd");
 		settle(&mut chat, Size::new(40, 14));
-		chat.tool_started("two", "bash", "1", "second");
+		chat.tool_started("two", "bash");
 		let _ = chat.render_at(Size::new(40, 10), Duration::from_millis(500));
 		assert_eq!(chat.blocks.phase(BlockOrdinal(1)), Some(crate::BlockPhase::Queued));
 		for frame in 10..18 {
@@ -6170,12 +6667,12 @@ mod tests {
 		let mut chat = Chat::new(&ctx());
 		let roomy = Size::new(40, 10);
 		let pressured = Size::new(40, 6);
-		chat.tool_started("one", "read", "1", "first");
+		chat.tool_started("one", "read");
 		chat.tool_output("one", "a\nb\nc\nd");
 		let _ = chat.render_at(roomy, Duration::ZERO);
 		let _ = chat.render_at(roomy, Duration::from_millis(200));
 		let _ = chat.render_at(roomy, Duration::from_millis(400));
-		chat.tool_started("two", "bash", "1", "second");
+		chat.tool_started("two", "bash");
 		let _ = chat.render_at(pressured, Duration::from_millis(400));
 		let _ = chat.render_at(pressured, Duration::from_millis(580));
 		let composer_rows = chat.composer_rows();
@@ -6221,7 +6718,7 @@ mod tests {
 	#[test]
 	fn live_blocks_and_voice_request_frame_cadence() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("one", "read", "1", "first");
+		chat.tool_started("one", "read");
 		assert!(chat.next_wake().is_some_and(|wake| wake <= anim::FRAME));
 		chat.live_tools.clear();
 		chat.start_live_voice();
@@ -6337,6 +6834,103 @@ mod tests {
 	}
 
 	#[test]
+	fn settled_replay_adopts_the_committed_tail_and_keeps_it_across_paints() {
+		let mut chat = Chat::new(&ctx());
+		let small = Size::new(40, 0);
+		for index in 0..6 {
+			chat.push_notice(format!("hist-{index}"));
+		}
+		let batch = chat.retirement_batch(small).expect("finalized rows retire");
+		chat.mark_retired(&batch);
+		let frontier = chat.blocks.frontier();
+
+		// A taller settled viewport leaves a blank band above the composer.
+		let tall = Size::new(40, 24);
+		let before = frame_text(chat.render(tall).frame);
+		assert!(!before.contains("hist-5"), "committed rows left the viewport: {before}");
+
+		chat.begin_history_replay(HistoryReplay::Rebuild);
+		let replay = chat.retirement_batch(tall).expect("replay batch");
+		let rendered = frame_text(chat.render_after_retirement(tall, &replay).frame);
+		assert!(rendered.contains("hist-5"), "replay adopts the tail on screen: {rendered}");
+		// Adopted rows never also scroll into native history.
+		assert!(!batch_text(&replay).contains("hist-5"), "adopted rows duplicated into history");
+		chat.mark_retired(&replay);
+		assert_eq!(chat.blocks.frontier(), frontier, "adoption never rewinds the frontier");
+
+		// The regression: the very next history-neutral paints kept erasing the
+		// adopted rows, flashing the transcript for a single frame.
+		for _ in 0..3 {
+			let after = frame_text(chat.render(tall).frame);
+			assert!(after.contains("hist-5"), "post-replay paint erased the resident band: {after}");
+		}
+	}
+
+	#[test]
+	fn resident_band_retires_ahead_of_newer_commits() {
+		let mut chat = Chat::new(&ctx());
+		for index in 0..4 {
+			chat.push_notice(format!("hist-{index}"));
+		}
+		let small = Size::new(40, 0);
+		let batch = chat.retirement_batch(small).expect("finalized rows retire");
+		chat.mark_retired(&batch);
+		let tall = Size::new(40, 24);
+		let _ = chat.render(tall);
+		chat.begin_history_replay(HistoryReplay::Rebuild);
+		let replay = chat.retirement_batch(tall).expect("replay batch");
+		chat.mark_retired(&replay);
+		assert!(chat.band.is_some(), "replay leaves a resident band");
+
+		for index in 0..40 {
+			chat.push_notice(format!("new-{index}"));
+		}
+		let batch = chat
+			.retirement_batch(tall)
+			.expect("pressure commits the finalized prefix");
+		let committed = frame_text(&batch.frame);
+		let band_row = committed.find("hist-0").expect("band rows lead the commit");
+		let new_row = committed.find("new-0").expect("commit rows follow");
+		assert!(band_row < new_row, "band rows must precede newer commits: {committed}");
+		assert!(chat.band.is_none(), "a commit consumes the whole band");
+		chat.mark_retired(&batch);
+	}
+
+	#[test]
+	fn live_growth_scrolls_band_overflow_into_history_without_a_commit() {
+		let mut chat = Chat::new(&ctx());
+		for index in 0..4 {
+			chat.push_notice(format!("hist-{index}"));
+		}
+		let small = Size::new(40, 0);
+		let batch = chat.retirement_batch(small).expect("finalized rows retire");
+		chat.mark_retired(&batch);
+		let tall = Size::new(40, 20);
+		let _ = chat.render(tall);
+		chat.begin_history_replay(HistoryReplay::Rebuild);
+		let replay = chat.retirement_batch(tall).expect("replay batch");
+		chat.mark_retired(&replay);
+		assert!(chat.band.is_some(), "replay leaves a resident band");
+
+		// An active (unfinalized) stream grows into the band: its oldest rows
+		// must scroll into native history before a paint can cover them.
+		chat.set_smooth_streaming(false);
+		chat.begin_assistant("live");
+		let long = (0..40)
+			.map(|row| format!("line-{row}"))
+			.collect::<Vec<_>>()
+			.join("\n\n");
+		chat.append_assistant("live", &long);
+		let batch = chat
+			.retirement_batch(tall)
+			.expect("band overflow retires without a commit");
+		assert!(matches!(batch.kind, RetirementKind::Band));
+		assert!(batch.range.is_empty(), "band retirement never advances the frontier");
+		assert!(frame_text(&batch.frame).contains("hist-0"), "oldest band rows scroll first");
+		chat.mark_retired(&batch);
+	}
+
+	#[test]
 	fn clear_history_does_not_mutate_committed_replay_rows() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_notice("immutable committed row");
@@ -6373,7 +6967,7 @@ mod tests {
 		chat.append_assistant("active-prefix", "stale active prefix");
 		let answer = AssistantEntry::new("Implemented answer".to_owned(), 40, &chat.ctx);
 		chat.enqueue_final(Entry::Assistant(answer));
-		chat.tool_started("tool", "read", "1", "task running");
+		chat.tool_started("tool", "read");
 		settle(&mut chat, Size::new(40, 16));
 
 		let tight = Size::new(40, 7);
@@ -6389,7 +6983,7 @@ mod tests {
 	fn transcript_text_receives_surplus_before_live_tool_cards() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_notice("Answer one\nAnswer two\nAnswer three\nAnswer four");
-		chat.tool_started("tool", "bash", "1", "long activity");
+		chat.tool_started("tool", "bash");
 		chat.tool_output("tool", "one\ntwo\nthree\nfour\nfive");
 		settle(&mut chat, Size::new(40, 18));
 		let tight = (6..18)
@@ -6405,8 +6999,8 @@ mod tests {
 	#[test]
 	fn later_tool_finishing_first_blocks_retirement() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("head", "bash", "1", "head");
-		chat.tool_started("later", "read", "1", "later");
+		chat.tool_started("head", "bash");
+		chat.tool_started("later", "read");
 		settle(&mut chat, Size::new(40, 8));
 		chat.tool_finished("later", ToolTerminal::Succeeded, ToolViewContent::Plain("done".into()));
 		settle(&mut chat, Size::new(40, 8));
@@ -6416,8 +7010,8 @@ mod tests {
 	#[test]
 	fn head_finalization_releases_contiguous_ordinal_run() {
 		let mut chat = Chat::new(&ctx());
-		chat.tool_started("head", "bash", "1", "head");
-		chat.tool_started("later", "read", "1", "later");
+		chat.tool_started("head", "bash");
+		chat.tool_started("later", "read");
 		settle(&mut chat, Size::new(40, 8));
 		chat.tool_finished(
 			"later",
@@ -6442,7 +7036,7 @@ mod tests {
 	fn overflow_summary_appears_under_tiny_viewport() {
 		let mut chat = Chat::new(&ctx());
 		for id in ["a", "b", "c"] {
-			chat.tool_started(id, "read", "1", id);
+			chat.tool_started(id, "read");
 		}
 		settle(&mut chat, Size::new(30, 10));
 		let rendered = chat.render_at(Size::new(30, 5), Duration::from_millis(500));
@@ -6453,15 +7047,15 @@ mod tests {
 	fn queued_demand_does_not_displace_the_only_active_row() {
 		let mut chat = Chat::new(&ctx());
 		let viewport = Size::new(30, 5);
-		chat.tool_started("active", "read", "1", "active row");
+		chat.tool_started("active", "read");
 		let _ = chat.render_at(viewport, Duration::from_millis(100));
-		chat.tool_started("queued", "read", "1", "queued row");
+		chat.tool_started("queued", "read");
 		let rendered = chat.render_at(viewport, Duration::from_millis(200));
 		let text = frame_text(rendered.frame);
 
 		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(crate::BlockPhase::Active));
 		assert_eq!(chat.blocks.phase(BlockOrdinal(1)), Some(crate::BlockPhase::Queued));
-		assert!(text.contains("active row"), "{text}");
+		assert!(text.contains("read"), "{text}");
 		assert!(!text.contains("blocks"), "{text}");
 	}
 
@@ -6469,15 +7063,15 @@ mod tests {
 	fn queued_only_demand_admits_without_painting_a_summary() {
 		let mut chat = Chat::new(&ctx());
 		let viewport = Size::new(30, 5);
-		chat.tool_started("first", "read", "1", "first row");
-		chat.tool_started("second", "read", "1", "second row");
+		chat.tool_started("first", "first-tool");
+		chat.tool_started("second", "second-tool");
 		let first = frame_text(chat.render_at(viewport, Duration::from_millis(100)).frame);
 
 		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(crate::BlockPhase::Active));
 		assert_eq!(chat.blocks.phase(BlockOrdinal(1)), Some(crate::BlockPhase::Queued));
 		assert!(!first.contains("blocks"), "{first}");
 		let second = frame_text(chat.render_at(viewport, Duration::from_millis(200)).frame);
-		assert!(second.contains("first row"), "{second}");
+		assert!(second.contains("first-tool"), "{second}");
 		assert!(!second.contains("blocks"), "{second}");
 	}
 
@@ -6570,6 +7164,28 @@ mod tests {
 		let text = frame_text(chat.render(viewport).frame);
 		assert!(text.contains("first deliberation"), "{text}");
 		assert!(text.contains("second deliberation"), "{text}");
+	}
+	#[test]
+	fn toggle_tool_visibility_hides_tool_cards() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(40, 14);
+		chat.tool_started("read", "read");
+		chat.tool_output("read", "tool output");
+		settle(&mut chat, viewport);
+		assert!(frame_text(chat.render(viewport).frame).contains("tool output"));
+
+		assert_eq!(chat.handle_key(Key::ToggleToolVisibility), ChatKey::Consumed);
+		assert!(!frame_text(chat.render(viewport).frame).contains("tool output"));
+	}
+
+	#[test]
+	fn copy_prompt_uses_latest_user_entry() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_user("first prompt", Vec::new());
+		chat.push_user("latest prompt", Vec::new());
+
+		assert_eq!(chat.handle_key(Key::CopyPrompt), ChatKey::Consumed);
+		assert_eq!(chat.take_copied(), Some(sf!("latest prompt")));
 	}
 
 	#[test]

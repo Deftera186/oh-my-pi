@@ -111,8 +111,8 @@ mod tests {
 
 	#[test]
 	fn declaration_uses_globe_and_described_canonical_modes() {
-		let declaration = inventory::iter::<super::super::registry::BuiltinRegistration>
-			.into_iter()
+		let declaration = super::super::registry::BUILTINS
+			.iter()
 			.map(|registration| (registration.declaration)())
 			.find(|declaration| declaration.name.as_str() == "browser")
 			.expect("browser declaration");

@@ -1,8 +1,9 @@
 //! Direct default-device audio backends.
 //!
-//! Backends invoke callbacks on their own realtime threads, queue no more than
-//! three playback periods in the operating system, and guarantee that an
-//! externally initiated `stop` waits out any in-flight callback.
+//! Backends invoke callbacks on their own realtime threads, and guarantee that
+//! an externally initiated `stop` waits out any in-flight callback. Queue depth
+//! varies by backend and stream configuration; [`playback_drain_periods`]
+//! reports the bound used by playback drain accounting.
 
 #[cfg(all(feature = "native-audio", target_os = "macos"))]
 mod coreaudio;
@@ -120,6 +121,19 @@ impl PlaybackDevice {
 		)))]
 		self.inner.stop()
 	}
+}
+
+/// Returns the maximum number of callback periods queued by the playback
+/// backend for this stream configuration.
+#[cfg(all(feature = "native-audio", target_os = "linux"))]
+pub(super) fn playback_drain_periods(config: DeviceConfig) -> u32 {
+	imp::playback_drain_periods(config)
+}
+
+/// Returns the fixed playback queue depth used by non-PulseAudio backends.
+#[cfg(not(all(feature = "native-audio", target_os = "linux")))]
+pub(super) const fn playback_drain_periods(_config: DeviceConfig) -> u32 {
+	3
 }
 
 pub(super) struct CaptureDevice {

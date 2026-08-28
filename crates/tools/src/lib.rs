@@ -20,7 +20,6 @@ pub struct BuiltinToolIdentity {
 
 const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 	BuiltinToolIdentity { name: "read", hidden: false },
-	BuiltinToolIdentity { name: "fetch", hidden: false },
 	BuiltinToolIdentity { name: "web_search", hidden: false },
 	BuiltinToolIdentity { name: "recall", hidden: false },
 	BuiltinToolIdentity { name: "reflect", hidden: false },
@@ -85,6 +84,7 @@ pub mod staging;
 /// `if`, and `match` control flow (see [`render::view`]).
 pub use omp_macros::view;
 pub use render::{BuiltinRendererIdentities, live_renderers, register_builtin_renderers};
+pub use settings::SETTINGS_CONTRIBUTION;
 
 /// Revisioned project debugger tool.
 pub mod debug;
@@ -98,8 +98,6 @@ pub mod device_ctl;
 pub mod edit;
 /// Persistent Python evaluation.
 pub mod eval;
-/// Reader-mode URL fetching through the shared read conversion pipeline.
-pub mod fetch;
 /// Native renderer lifecycle fixtures for visual QA.
 pub mod gallery;
 /// Direct GitHub API and isolated pull-request operations.

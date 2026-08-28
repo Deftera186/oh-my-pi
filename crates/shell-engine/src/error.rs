@@ -139,9 +139,9 @@ pub enum ErrorKind {
 	/// The requested input or output redirection is invalid.
 	#[error("invalid redirection target")]
 	InvalidRedirection,
-	/// A sandbox write-path policy refused a filesystem mutation.
+	/// A sandbox file-operation policy refused filesystem access.
 	#[error(transparent)]
-	WriteDenied(#[from] interp::WriteDenied),
+	PathDenied(#[from] interp::PathDenied),
 
 	/// An error occurred while redirecting input or output with the given file.
 	#[error("failed to redirect to {0}: {1}")]

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::{error, openfiles};
+use crate::{PathAccess, error, openfiles};
 
 impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 	pub(super) fn load_history(&self) -> Result<Option<crate::history::History>, error::Error> {
@@ -15,7 +15,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
 		let mut options = std::fs::File::options();
 		options.read(true);
 
-		let mut history_file = self.open_file(&options, history_path, &self.default_exec_params())?;
+		let mut history_file =
+			self.open_file(&options, history_path, &self.default_exec_params(), PathAccess::Read)?;
 
 		// Check on the file's size.
 		if let openfiles::OpenFile::File(file) = &mut history_file {

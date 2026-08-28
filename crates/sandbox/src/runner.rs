@@ -68,6 +68,10 @@ impl Runner {
 
 	/// Selects the first live backend whose compiled plan enforces every
 	/// request.
+	///
+	/// Landlock is intentionally excluded from automatic selection because it
+	/// cannot enforce the namespace-based default carve-outs; use
+	/// [`Runner::for_backend`] to select it explicitly.
 	#[tracing::instrument(
 		name = "sandbox_admission",
 		level = "debug",
@@ -184,6 +188,9 @@ impl Runner {
 	}
 
 	/// Returns the live normal-child backend required for inherited descriptors.
+	///
+	/// Linux normal-child execution requires Bubblewrap and does not fall back
+	/// to Landlock.
 	pub fn native_command() -> Result<Self, SandboxError> {
 		let backend = native_command_backend()?;
 		let status = backend_status(backend);
@@ -1108,7 +1115,6 @@ fn candidates_for(os: &str) -> &'static [Backend] {
 		"linux" => &[
 			Backend::Gvisor,
 			Backend::Bubblewrap,
-			Backend::Landlock,
 			Backend::DockerRunscEphemeral,
 			Backend::DockerEphemeral,
 		],
@@ -1120,11 +1126,7 @@ fn candidates_for(os: &str) -> &'static [Backend] {
 fn fallback_backend() -> Result<Backend, SandboxError> {
 	match std::env::consts::OS {
 		"macos" => Ok(Backend::Seatbelt),
-		"linux" => Ok(if backend_status(Backend::Bubblewrap).is_available() {
-			Backend::Bubblewrap
-		} else {
-			Backend::Landlock
-		}),
+		"linux" => Ok(Backend::Bubblewrap),
 		"windows" => Ok(Backend::AppContainer),
 		_ => Err(SandboxError::UnsupportedHost { os: std::env::consts::OS }),
 	}
@@ -1133,11 +1135,7 @@ fn fallback_backend() -> Result<Backend, SandboxError> {
 fn native_command_backend() -> Result<Backend, SandboxError> {
 	match std::env::consts::OS {
 		"macos" => Ok(Backend::Seatbelt),
-		"linux" => Ok(if backend_status(Backend::Bubblewrap).is_available() {
-			Backend::Bubblewrap
-		} else {
-			Backend::Landlock
-		}),
+		"linux" => Ok(Backend::Bubblewrap),
 		_ => Err(SandboxError::UnsupportedHost { os: std::env::consts::OS }),
 	}
 }
@@ -1154,6 +1152,8 @@ fn unavailable(status: BackendStatus) -> SandboxError {
 #[cfg(test)]
 mod tests {
 	use super::candidates_for;
+	#[cfg(target_os = "linux")]
+	use super::{fallback_backend, native_command_backend};
 	use crate::Backend;
 
 	#[test]
@@ -1166,11 +1166,21 @@ mod tests {
 		assert_eq!(candidates_for("linux"), [
 			Backend::Gvisor,
 			Backend::Bubblewrap,
-			Backend::Landlock,
 			Backend::DockerRunscEphemeral,
 			Backend::DockerEphemeral,
 		],);
+		assert!(!candidates_for("linux").contains(&Backend::Landlock));
 		assert_eq!(candidates_for("windows"), [Backend::AppContainer]);
 		assert!(candidates_for("plan9").is_empty());
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn linux_native_selection_requires_bubblewrap() {
+		assert_eq!(fallback_backend().expect("Linux fallback backend"), Backend::Bubblewrap);
+		assert_eq!(
+			native_command_backend().expect("Linux native command backend"),
+			Backend::Bubblewrap
+		);
 	}
 }

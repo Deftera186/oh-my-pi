@@ -5,8 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 pub use omp_agent::UnexpectedStopMode;
 use omp_core::Str;
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -331,6 +330,8 @@ pub struct DisplaySettings {
 	pub smooth_streaming:   bool,
 	/// Show per-turn token usage.
 	pub show_token_usage:   bool,
+	/// Show prompt-to-yield elapsed time on per-turn usage rows.
+	pub show_turn_time:     bool,
 	/// Hide model-initiated tool calls and results.
 	pub hide_tool_activity: bool,
 }
@@ -341,6 +342,7 @@ impl Default for DisplaySettings {
 			shimmer:            ShimmerMode::Classic,
 			smooth_streaming:   true,
 			show_token_usage:   false,
+			show_turn_time:     false,
 			hide_tool_activity: false,
 		}
 	}
@@ -371,11 +373,18 @@ impl SettingsDomain for DisplaySettings {
 			30,
 		),
 		field(
+			"display.showTurnTime",
+			"Turn Time",
+			"Show prompt-to-yield elapsed time on assistant usage rows.",
+			SettingKind::Boolean,
+			40,
+		),
+		field(
 			"display.hideToolActivity",
 			"Hide Tool Activity",
 			"Hide model-initiated tool calls and results.",
 			SettingKind::Boolean,
-			40,
+			50,
 		),
 	];
 }
@@ -1176,16 +1185,3 @@ impl SettingsDomain for LifecycleSettings {
 		),
 	];
 }
-
-omp_settings::inventory::submit! { DomainRegistration::of::<DisplaySettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<AppearanceSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<TuiSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<RootDisplaySettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<CompletionSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<ErrorNotificationSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<InteractionSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<TtsrSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<ShareSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<TitleSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<RecapSettings>() }
-omp_settings::inventory::submit! { DomainRegistration::of::<LifecycleSettings>() }

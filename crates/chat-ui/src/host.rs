@@ -30,9 +30,12 @@ use crate::{
 	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 	autoqa::{AutoQaConsent, ConsentRequest, Decision},
+	debug_selector::DebugSelector,
+	log_viewer::{LogViewer, LogViewerEvent},
 	login_panel::{LoginPanel, LoginPanelEvent},
 	modes::{GuidedGoalEvent, GuidedGoalInterview},
 	plan_review::{PlanReviewEvent, PlanReviewOverlay, PlanReviewSection},
+	protocol_probe::{ProtocolProbe, ProtocolProbeEvent},
 	selection_overlay::{SelectionEvent, SelectionOverlay},
 	settings_overlay::{SettingsEvent, SettingsOverlay},
 };
@@ -107,6 +110,8 @@ pub struct HostOptions {
 	pub title_enabled:          bool,
 	/// How a settled terminal width change refreshes retired scrollback rows.
 	pub resize_scrollback:      ResizeScrollback,
+	/// Physical chord resolver shared with every application host.
+	pub keymap:                 Keymap,
 	/// Effective configured application bindings, consulted before legacy
 	/// fallback keys.
 	pub input_actions:          Vec<InputBinding>,
@@ -124,6 +129,7 @@ impl Default for HostOptions {
 			error_notify:           true,
 			title_enabled:          true,
 			resize_scrollback:      ResizeScrollback::Rebuild,
+			keymap:                 Keymap::default(),
 			input_actions:          Vec::new(),
 			dequeue_hint:           None,
 		}
@@ -190,6 +196,7 @@ pub async fn run(
 		error_notify:           true,
 		title_enabled:          true,
 		resize_scrollback:      ResizeScrollback::Rebuild,
+		keymap:                 Keymap::default(),
 		input_actions:          Vec::new(),
 		dequeue_hint:           None,
 	})
@@ -232,6 +239,7 @@ pub async fn run_with_draft(
 	let caps = detect();
 	let terminal_options = TerminalOptions::new(caps).cursor_style(CursorStyle::BlinkingBar);
 	let mut terminal = Terminal::enter(terminal_options)?;
+	terminal.edit_keymap(|keymap| *keymap = options.keymap.clone());
 	let mut renderer = Renderer::new(TtyOut::new()?);
 	renderer.apply_caps(&caps)?;
 	let result =
@@ -358,6 +366,17 @@ async fn run_welcome(
 											WelcomeOutcome::Proceed
 										});
 									},
+									WelcomeEvent::SessionList {
+										all_projects,
+										sort_by_title,
+										show_paths,
+									} => send(
+										intents,
+										Intent::SessionList { all_projects, sort_by_title, show_paths },
+									),
+									WelcomeEvent::SessionDelete { id, noninvasive } => {
+										send(intents, Intent::SessionDelete { id, noninvasive });
+									},
 									WelcomeEvent::Quit => {
 										send(intents, Intent::Quit);
 										return Ok(WelcomeOutcome::Exit(HostExit::Quit));
@@ -379,8 +398,8 @@ async fn run_welcome(
 						Ok(BackendEvent::ModelDownloadProgress(progress)) => {
 							welcome.set_download_progress(progress, started.elapsed());
 						},
-		Ok(BackendEvent::OpenModelPicker { rows, current }
-							| BackendEvent::ModelsUpdated { rows, current }) => {
+		Ok(BackendEvent::OpenModelPicker { rows, current, .. }
+							| BackendEvent::ModelsUpdated { rows, current, .. }) => {
 							*models = rows;
 							*current_model = current.min(models.len().saturating_sub(1));
 						},
@@ -405,6 +424,7 @@ struct ChatHost {
 	overlay:                 Option<Overlay>,
 	models:                  Vec<ModelRow>,
 	current_model:           usize,
+	task_model:              usize,
 	last_esc:                Option<Instant>,
 	last_clear:              Option<Instant>,
 	last_left:               Option<Instant>,
@@ -419,6 +439,10 @@ struct ChatHost {
 	hidden_overlays:         BTreeMap<Str, ExtensionOverlay>,
 	suppress_history_replay: bool,
 	saved_git_keymap:        Option<Keymap>,
+	session_all_projects:    bool,
+	session_sort_by_title:   bool,
+	session_show_paths:      bool,
+	session_delete_confirm:  Option<Str>,
 }
 
 impl ChatHost {
@@ -439,6 +463,7 @@ impl ChatHost {
 			overlay: None,
 			models,
 			current_model,
+			task_model: current_model,
 			last_esc: None,
 			last_clear: None,
 			last_left: None,
@@ -453,6 +478,10 @@ impl ChatHost {
 			hidden_overlays: BTreeMap::new(),
 			suppress_history_replay: false,
 			saved_git_keymap: None,
+			session_all_projects: false,
+			session_sort_by_title: false,
+			session_show_paths: false,
+			session_delete_confirm: None,
 		}
 	}
 
@@ -461,6 +490,7 @@ impl ChatHost {
 			self.overlay = Some(Overlay::Models(ModelPicker::open(
 				&self.models,
 				self.current_model.min(self.models.len() - 1),
+				self.task_model.min(self.models.len() - 1),
 				ctx,
 			)));
 		}
@@ -476,6 +506,16 @@ impl ChatHost {
 			(self.current_model + 1) % self.models.len()
 		};
 		send(intents, Intent::SwitchModel(self.models[self.current_model].key.clone()));
+	}
+
+	fn toggle_tool_tree(&mut self) {
+		if let Some(expanded) = self.chat.toggle_latest_tool() {
+			self.chat.push_notice(if expanded {
+				"Tool output expansion: enabled"
+			} else {
+				"Tool output expansion: disabled"
+			});
+		}
 	}
 
 	fn apply_chat_key(
@@ -924,6 +964,7 @@ pub struct RetainedChat {
 	events:                 Receiver<BackendEvent>,
 	intents:                Sender<Intent>,
 	exit_on_session_change: bool,
+	input_actions:          Vec<InputBinding>,
 	ask_binding:            ask::AskBinding,
 	viewport:               Size,
 	pending_exit:           Option<HostExit>,
@@ -959,12 +1000,20 @@ impl InputBinding {
 		let key = Keymap::default().resolve(chord)?;
 		Some(Self { key, action })
 	}
+
+	/// Resolves one canonical chord through the host's exact active keymap.
+	pub fn parse_with(keymap: &Keymap, chord: &str, action: InputAction) -> Option<Self> {
+		let chord = Chord::parse(chord).ok()?;
+		let key = keymap.resolve(chord)?;
+		Some(Self { key, action })
+	}
 }
 
 /// Semantic application input accepted by the retained chat host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputAction {
-	/// Abort active work.
+	/// Interrupt active work, or arm the double-press rewind gesture when
+	/// idle with an empty composer.
 	Interrupt,
 	/// Clear the current draft, or exit on a rapid second activation.
 	Clear,
@@ -974,6 +1023,12 @@ pub enum InputAction {
 	CycleThinking,
 	/// Toggle thinking-block visibility.
 	ToggleThinking,
+	/// Toggle transcript tool-card visibility.
+	ToggleToolVisibility,
+	/// Copy the latest user prompt.
+	CopyPrompt,
+	/// Copy the composer's current line.
+	CopyLine,
 	/// Cycle the model roster forward.
 	CycleModelForward,
 	/// Cycle the model roster backward.
@@ -996,6 +1051,8 @@ pub enum InputAction {
 	TogglePlan,
 	/// Open the prompt-history search selector.
 	HistorySearch,
+	/// Open the native debug-tools selector.
+	DebugMenu,
 	/// Toggle speech-to-text capture.
 	ToggleVoice,
 	/// Toggle realtime voice.
@@ -1007,13 +1064,19 @@ pub enum InputAction {
 }
 
 impl InputAction {
-	fn host_key(self) -> Key {
-		match self {
-			Self::Interrupt => Key::JumpPrevious,
+	/// Returns the semantic host key for a core action.
+	///
+	/// App-owned extension shortcuts have no chat-host key and return `None`.
+	pub const fn key(&self) -> Option<Key> {
+		Some(match self {
+			Self::Interrupt => Key::Esc,
 			Self::Clear => Key::Ctrl('c'),
 			Self::Exit => Key::Ctrl('d'),
 			Self::CycleThinking => Key::BackTab,
 			Self::ToggleThinking => Key::Ctrl('t'),
+			Self::ToggleToolVisibility => Key::ToggleToolVisibility,
+			Self::CopyPrompt => Key::CopyPrompt,
+			Self::CopyLine => Key::CopyLine,
 			Self::CycleModelForward => Key::Ctrl('p'),
 			Self::CycleModelBackward => Key::CyclePrevious,
 			Self::SelectModel => Key::Alt('p'),
@@ -1025,36 +1088,11 @@ impl InputAction {
 			Self::Dequeue => Key::RestoreQueue,
 			Self::TogglePlan => Key::PlanToggle,
 			Self::HistorySearch => Key::Ctrl('r'),
+			Self::DebugMenu => Key::DebugMenu,
 			Self::ToggleVoice => Key::CtrlAlt('s'),
 			Self::ToggleLiveVoice => Key::CtrlAlt('l'),
 			Self::AgentHub => Key::Alt('a'),
-			Self::ExtensionShortcut(_) => Key::Function(0),
-		}
-	}
-
-	/// Projects one canonical application action id into chat-owned behavior.
-	pub fn from_action_id(id: &str) -> Option<Self> {
-		Some(match id {
-			"app.interrupt" => Self::Interrupt,
-			"app.clear" => Self::Clear,
-			"app.exit" => Self::Exit,
-			"app.thinking.cycle" => Self::CycleThinking,
-			"app.thinking.toggle" => Self::ToggleThinking,
-			"app.model.cycle_forward" => Self::CycleModelForward,
-			"app.model.cycle_backward" => Self::CycleModelBackward,
-			"app.model.select" => Self::SelectModel,
-			"app.model.hub" => Self::OpenModelHub,
-			"app.tools.toggle_tree" => Self::ToggleToolTree,
-			"app.editor.external" => Self::ExternalEditor,
-			"app.message.follow_up" => Self::FollowUp,
-			"app.retry" => Self::Retry,
-			"app.message.dequeue" => Self::Dequeue,
-			"app.plan.toggle" => Self::TogglePlan,
-			"app.history.search" => Self::HistorySearch,
-			"app.voice.toggle" => Self::ToggleVoice,
-			"app.voice.live_toggle" => Self::ToggleLiveVoice,
-			"app.agent_hub" => Self::AgentHub,
-			_ => return None,
+			Self::ExtensionShortcut(_) => return None,
 		})
 	}
 }
@@ -1108,6 +1146,7 @@ impl RetainedChat {
 			events,
 			intents,
 			exit_on_session_change: options.exit_on_session_change,
+			input_actions: options.input_actions,
 			ask_binding: ask::bind(),
 			viewport,
 			pending_exit: None,
@@ -1161,7 +1200,99 @@ impl RetainedChat {
 
 	/// Routes one keyboard event through the active overlay or chat composer.
 	pub fn key(&mut self, key: Key) -> RetainedChatEffect {
+		self.key_inner(key, true)
+	}
+
+	fn key_inner(&mut self, key: Key, map_actions: bool) -> RetainedChatEffect {
+		if matches!(
+			self.host.overlay.as_ref(),
+			Some(Overlay::List { purpose: ListPurpose::Resume, .. })
+		) {
+			let selected = match self.host.overlay.as_ref() {
+				Some(Overlay::List { picker, rows, .. }) => {
+					let index = picker.selected();
+					picker.selected_key().and_then(|_| {
+						rows
+							.get(index)
+							.map(|row| (index, row.key.clone(), row.label.clone()))
+					})
+				},
+				_ => None,
+			};
+			match key {
+				Key::Tab => {
+					self.host.session_delete_confirm = None;
+					self.host.session_all_projects = !self.host.session_all_projects;
+				},
+				Key::Ctrl('s') => {
+					self.host.session_delete_confirm = None;
+					self.host.session_sort_by_title = !self.host.session_sort_by_title;
+				},
+				Key::Ctrl('p') => {
+					self.host.session_delete_confirm = None;
+					self.host.session_show_paths = !self.host.session_show_paths;
+				},
+				Key::Delete | Key::Ctrl('d') => {
+					let Some((index, id, _)) = selected else {
+						return RetainedChatEffect::Consumed;
+					};
+					if self.host.session_delete_confirm.as_ref() == Some(&id) {
+						self.host.session_delete_confirm = None;
+						send(&self.intents, Intent::SessionDelete { id, noninvasive: false });
+					} else {
+						self.host.session_delete_confirm = Some(id);
+						if let Some(Overlay::List { picker, .. }) = self.host.overlay.as_mut() {
+							picker.set_row_detail(
+								index,
+								sf!("press again to delete — <ctrl+backspace: keep artifacts>"),
+							);
+						}
+					}
+					return RetainedChatEffect::Consumed;
+				},
+				Key::Ctrl('w') => {
+					if let Some((_, id, _)) = selected {
+						self.host.session_delete_confirm = None;
+						send(&self.intents, Intent::SessionDelete { id, noninvasive: true });
+					}
+					return RetainedChatEffect::Consumed;
+				},
+				Key::Ctrl('r') => {
+					if let Some((_, id, label)) = selected {
+						self.host.session_delete_confirm = None;
+						self.host.overlay = Some(Overlay::SessionRename {
+							prompt: PromptOverlay::open_prefilled("Rename session", label, &self.ctx),
+							id,
+						});
+					}
+					return RetainedChatEffect::Consumed;
+				},
+				_ => self.host.session_delete_confirm = None,
+			}
+		}
 		if let Some(overlay) = self.host.overlay.as_mut() {
+			if matches!(overlay, Overlay::List { purpose: ListPurpose::Resume, .. }) {
+				match key {
+					Key::Tab => self.host.session_all_projects = !self.host.session_all_projects,
+					Key::Ctrl('s') => self.host.session_sort_by_title = !self.host.session_sort_by_title,
+					Key::Ctrl('p') => self.host.session_show_paths = !self.host.session_show_paths,
+					_ => {
+						let key = if key == Key::Ctrl('c') && !matches!(overlay, Overlay::RawStream(_)) {
+							Key::Esc
+						} else {
+							key
+						};
+						let event = overlay.handle_key(key);
+						return self.apply_overlay(event);
+					},
+				}
+				send(&self.intents, Intent::SessionList {
+					all_projects:  self.host.session_all_projects,
+					sort_by_title: self.host.session_sort_by_title,
+					show_paths:    self.host.session_show_paths,
+				});
+				return RetainedChatEffect::Consumed;
+			}
 			let key = if key == Key::Ctrl('c') && !matches!(overlay, Overlay::RawStream(_)) {
 				Key::Esc
 			} else {
@@ -1169,6 +1300,23 @@ impl RetainedChat {
 			};
 			let event = overlay.handle_key(key);
 			return self.apply_overlay(event);
+		}
+		if map_actions && !self.host.sidebar.focused() {
+			if let Some(action) = self
+				.input_actions
+				.iter()
+				.find(|binding| binding.key == key)
+				.map(|binding| binding.action.clone())
+			{
+				return self.action(action);
+			}
+			if self
+				.input_actions
+				.iter()
+				.any(|binding| binding.action.key() == Some(key))
+			{
+				return RetainedChatEffect::Consumed;
+			}
 		}
 		if key == Key::Ctrl('b') {
 			self.host.sidebar.toggle();
@@ -1214,8 +1362,16 @@ impl RetainedChat {
 			send(&self.intents, Intent::InspectHistory);
 			return RetainedChatEffect::Consumed;
 		}
+		if key == Key::DebugMenu {
+			send(&self.intents, Intent::DebugMenuRequest);
+			return RetainedChatEffect::Consumed;
+		}
 		if key == Key::Ctrl('r') {
 			send(&self.intents, Intent::SearchHistory);
+			return RetainedChatEffect::Consumed;
+		}
+		if key == Key::Ctrl('o') {
+			self.host.toggle_tool_tree();
 			return RetainedChatEffect::Consumed;
 		}
 		if key == Key::Ctrl('k') {
@@ -1302,7 +1458,7 @@ impl RetainedChat {
 	/// Applies one configured semantic application action.
 	pub fn action(&mut self, action: InputAction) -> RetainedChatEffect {
 		match action {
-			InputAction::Interrupt => send(&self.intents, Intent::Abort),
+			InputAction::Interrupt => return self.key_inner(Key::Esc, false),
 			InputAction::Clear => {
 				if let Some(exit) =
 					self
@@ -1325,21 +1481,27 @@ impl RetainedChat {
 			InputAction::ToggleThinking => {
 				let _ = self.host.chat.handle_key(Key::Ctrl('t'));
 			},
+			InputAction::ToggleToolVisibility => {
+				let _ = self.host.chat.handle_key(Key::ToggleToolVisibility);
+			},
+			InputAction::CopyPrompt => return self.key_inner(Key::CopyPrompt, false),
+			InputAction::CopyLine => return self.key_inner(Key::CopyLine, false),
 			InputAction::CycleModelForward => self.host.cycle_model(false, &self.intents),
 			InputAction::CycleModelBackward => self.host.cycle_model(true, &self.intents),
 			InputAction::SelectModel => self.host.open_models(&self.ctx),
 			InputAction::OpenModelHub => send(&self.intents, Intent::OpenModelHub),
 			InputAction::ToggleToolTree => {
-				let _ = self.host.chat.handle_key(Key::Ctrl('o'));
+				self.host.toggle_tool_tree();
 			},
 			InputAction::ExternalEditor => {
 				return RetainedChatEffect::ExternalEditor(Str::new(self.host.chat.composer_text()));
 			},
-			InputAction::FollowUp => return self.key(Key::FollowUp),
+			InputAction::FollowUp => return self.key_inner(Key::FollowUp, false),
 			InputAction::Retry => send(&self.intents, Intent::Retry),
 			InputAction::Dequeue => send(&self.intents, Intent::Dequeue),
 			InputAction::TogglePlan => send(&self.intents, Intent::TogglePlan),
 			InputAction::HistorySearch => send(&self.intents, Intent::SearchHistory),
+			InputAction::DebugMenu => send(&self.intents, Intent::DebugMenuRequest),
 			InputAction::ToggleVoice => send(&self.intents, Intent::ToggleStt),
 			InputAction::ToggleLiveVoice => send(&self.intents, Intent::ToggleLive),
 			InputAction::AgentHub => open_agents(&mut self.host, &self.ctx),
@@ -1481,7 +1643,11 @@ enum Overlay {
 	Images(ImageOverlay),
 	History(HistoryInspector),
 	RawStream(RawStreamViewer),
+	Debug(DebugSelector),
+	Logs(LogViewer),
+	Probe(ProtocolProbe),
 	AgentPrompt { prompt: PromptOverlay, agent_id: Str, revive: bool },
+	SessionRename { prompt: PromptOverlay, id: Str },
 	Providers(ProviderPicker),
 	Approval(ApprovalOverlay),
 	ApprovalAmend { prompt: PromptOverlay, ticket: ApprovalTicketView },
@@ -1506,6 +1672,7 @@ enum OverlayEvent {
 	PtyKill { id: Str },
 	Close,
 	Pick(usize),
+	PickTask(usize),
 	ModelHub(ModelHubIntent),
 	LoginRequest(Str),
 	Palette(PaletteAction),
@@ -1515,17 +1682,23 @@ enum OverlayEvent {
 	OpenAgentRevivePrompt(Str),
 	AgentSteerPrompt { agent_id: Str, prompt: Str },
 	AgentRevivePrompt { agent_id: Str, prompt: Str },
+	SessionRename { id: Str, title: Str },
 	AgentKill(Str),
 	ApprovalCancel,
 	ApprovalDecide { ticket_id: Str, action: ApprovalAction },
 	ApprovalAmend(Str),
 	AskCancel,
-	AskSubmit { selected: Vec<Str>, custom_input: Option<Str> },
+	AskSubmit { selected: Vec<Str>, custom_input: Option<Str>, note: Option<Str> },
 	ExtensionDialog { correlation: Str, response: omp_proto::omp::ui::v1::UiResponse },
 	ExtensionOverlayEvent(omp_proto::omp::ui::v1::OverlayEvent),
 	ExtensionOverlayClose(Str),
 	RawStreamClose,
 	RawStreamCopy(Str),
+	RefreshModels,
+	DebugAction(Str),
+	LogsOlder,
+	LogsCopy(Str),
+	Notify(Notification),
 	AutoQaConsent(Decision),
 	SettingsPreview(Vec<SettingChange>),
 	SettingsCommit(Vec<SettingChange>),
@@ -1551,7 +1724,11 @@ impl Overlay {
 			Self::Images(_) => "images",
 			Self::History(_) => "history",
 			Self::RawStream(_) => "raw_stream",
+			Self::Debug(_) => "debug",
+			Self::Logs(_) => "logs",
+			Self::Probe(_) => "probe",
 			Self::AgentPrompt { .. } => "agent_prompt",
+			Self::SessionRename { .. } => "session_rename",
 			Self::Providers(_) => "providers",
 			Self::Approval(_) => "approval",
 			Self::ApprovalAmend { .. } => "approval_amend",
@@ -1595,6 +1772,15 @@ impl Overlay {
 			Self::Images(images) => image_overlay_event(images.handle_key(key)),
 			Self::History(inspector) => history_inspector_event(inspector.handle_key(key)),
 			Self::RawStream(viewer) => raw_stream_event(viewer.handle_key(key)),
+			Self::Debug(selector) => match selector.handle_key(key) {
+				PickerEvent::Pick(index) => selector
+					.key(index)
+					.cloned()
+					.map_or(OverlayEvent::Consumed, OverlayEvent::DebugAction),
+				event => picker_event(event),
+			},
+			Self::Logs(viewer) => log_viewer_event(viewer.handle_key(key)),
+			Self::Probe(probe) => protocol_probe_event(probe.handle_key(key)),
 			Self::AgentPrompt { prompt, agent_id, revive } => {
 				match prompt_event(prompt.handle_key(key)) {
 					OverlayEvent::Prompt(value) if *revive => {
@@ -1606,6 +1792,11 @@ impl Overlay {
 					OverlayEvent::PromptCancel => OverlayEvent::Close,
 					event => event,
 				}
+			},
+			Self::SessionRename { prompt, id } => match prompt_event(prompt.handle_key(key)) {
+				OverlayEvent::Prompt(title) => OverlayEvent::SessionRename { id: id.clone(), title },
+				OverlayEvent::PromptCancel => OverlayEvent::Close,
+				event => event,
 			},
 			Self::Providers(picker) => picker_event(picker.handle_key(key)),
 			Self::Approval(approval) => {
@@ -1656,6 +1847,8 @@ impl Overlay {
 			Self::Selection(selection) => selection_event(selection.handle_paste(text)),
 			Self::AgentHub(_) | Self::Images(_) => OverlayEvent::Consumed,
 			Self::History(_) | Self::RawStream(_) => OverlayEvent::Consumed,
+			Self::Debug(selector) => picker_event(selector.handle_paste(text)),
+			Self::Logs(_) | Self::Probe(_) => OverlayEvent::Consumed,
 			Self::AgentPrompt { prompt, agent_id, revive } => {
 				match prompt_event(prompt.handle_paste(text)) {
 					OverlayEvent::Prompt(value) if *revive => {
@@ -1667,6 +1860,11 @@ impl Overlay {
 					OverlayEvent::PromptCancel => OverlayEvent::Close,
 					event => event,
 				}
+			},
+			Self::SessionRename { prompt, id } => match prompt_event(prompt.handle_paste(text)) {
+				OverlayEvent::Prompt(title) => OverlayEvent::SessionRename { id: id.clone(), title },
+				OverlayEvent::PromptCancel => OverlayEvent::Close,
+				event => event,
 			},
 			Self::Providers(picker) => picker_event(picker.handle_paste(text)),
 			Self::Approval(approval) => {
@@ -1728,7 +1926,17 @@ impl Overlay {
 			Self::Images(images) => image_overlay_event(images.handle_mouse(col, row, kind, viewport)),
 			Self::History(inspector) => history_inspector_event(inspector.handle_mouse(kind)),
 			Self::RawStream(viewer) => raw_stream_event(viewer.handle_mouse(kind)),
+			Self::Debug(selector) => match selector.handle_mouse(col, row, kind, viewport) {
+				PickerEvent::Pick(index) => selector
+					.key(index)
+					.cloned()
+					.map_or(OverlayEvent::Consumed, OverlayEvent::DebugAction),
+				event => picker_event(event),
+			},
+			Self::Logs(viewer) => log_viewer_event(viewer.handle_mouse(col, row, kind, viewport)),
+			Self::Probe(_) => OverlayEvent::Consumed,
 			Self::AgentPrompt { .. } => OverlayEvent::Consumed,
+			Self::SessionRename { .. } => OverlayEvent::Consumed,
 			Self::Providers(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::Approval(approval) => approval_event(
 				approval.ticket_id().clone(),
@@ -1774,7 +1982,11 @@ impl Overlay {
 			Self::Images(images) => images.layer(viewport),
 			Self::History(inspector) => inspector.layer(viewport),
 			Self::RawStream(viewer) => viewer.layer(viewport),
+			Self::Debug(selector) => selector.layer(viewport),
+			Self::Logs(viewer) => viewer.layer(viewport),
+			Self::Probe(probe) => probe.layer(viewport),
 			Self::AgentPrompt { prompt, .. } => prompt.layer(viewport),
+			Self::SessionRename { prompt, .. } => prompt.layer(viewport),
 			Self::Providers(picker) => picker.layer(viewport),
 			Self::Approval(approval) => approval.layer(viewport),
 			Self::ApprovalAmend { prompt, .. } => prompt.layer(viewport),
@@ -1800,6 +2012,7 @@ const fn picker_event(event: PickerEvent) -> OverlayEvent {
 		PickerEvent::Consumed => OverlayEvent::Consumed,
 		PickerEvent::Close => OverlayEvent::Close,
 		PickerEvent::Pick(index) => OverlayEvent::Pick(index),
+		PickerEvent::PickTask(index) => OverlayEvent::PickTask(index),
 	}
 }
 fn model_hub_event(event: ModelHubEvent) -> OverlayEvent {
@@ -1818,6 +2031,7 @@ fn model_hub_event(event: ModelHubEvent) -> OverlayEvent {
 		ModelHubEvent::SetCycleOrder { order } => {
 			OverlayEvent::ModelHub(ModelHubIntent::SetCycleOrder { order })
 		},
+		ModelHubEvent::RefreshModels => OverlayEvent::RefreshModels,
 		ModelHubEvent::Login(provider) => OverlayEvent::LoginRequest(provider),
 	}
 }
@@ -1841,6 +2055,7 @@ fn plan_review_event(event: PlanReviewEvent, sections: &[PlanReviewSection]) -> 
 			OverlayEvent::PlanReviewComplete(annotations.prompt(sections))
 		},
 		PlanReviewEvent::SaveAndQuit(content) => OverlayEvent::PlanSavePathRequest(content),
+		PlanReviewEvent::Copy(text) => OverlayEvent::RawStreamCopy(text),
 		PlanReviewEvent::Cancel => OverlayEvent::Close,
 	}
 }
@@ -1874,6 +2089,28 @@ fn raw_stream_event(event: RawStreamEvent) -> OverlayEvent {
 		RawStreamEvent::Consumed => OverlayEvent::Consumed,
 		RawStreamEvent::Close => OverlayEvent::RawStreamClose,
 		RawStreamEvent::Copy(text) => OverlayEvent::RawStreamCopy(Str::new(text)),
+	}
+}
+fn log_viewer_event(event: LogViewerEvent) -> OverlayEvent {
+	match event {
+		LogViewerEvent::Consumed => OverlayEvent::Consumed,
+		LogViewerEvent::Close => OverlayEvent::Close,
+		LogViewerEvent::LoadOlder => OverlayEvent::LogsOlder,
+		LogViewerEvent::Copy(text) => OverlayEvent::LogsCopy(Str::new(text)),
+	}
+}
+
+fn protocol_probe_event(event: ProtocolProbeEvent) -> OverlayEvent {
+	match event {
+		ProtocolProbeEvent::Consumed => OverlayEvent::Consumed,
+		ProtocolProbeEvent::Close => OverlayEvent::Close,
+		ProtocolProbeEvent::Notify { title, body } => OverlayEvent::Notify(
+			Notification::builder()
+				.title(title)
+				.body(body)
+				.id("omp-probe")
+				.build(),
+		),
 	}
 }
 
@@ -1940,8 +2177,8 @@ fn ask_event(event: AskDialogEvent) -> OverlayEvent {
 	match event {
 		AskDialogEvent::Consumed => OverlayEvent::Consumed,
 		AskDialogEvent::Cancel => OverlayEvent::AskCancel,
-		AskDialogEvent::Submit { selected, custom_input } => {
-			OverlayEvent::AskSubmit { selected, custom_input }
+		AskDialogEvent::Submit { selected, custom_input, note } => {
+			OverlayEvent::AskSubmit { selected, custom_input, note }
 		},
 	}
 }
@@ -2064,7 +2301,8 @@ async fn run_chat(
 										send(intents, Intent::ExtensionShortcut(chord.clone()));
 										continue;
 									}
-									let key = mapped_action.clone().map_or(key, InputAction::host_key);
+									let key =
+										mapped_action.as_ref().and_then(InputAction::key).unwrap_or(key);
 									let action_enabled = |action| {
 										mapped_action.as_ref() == Some(&action)
 											|| !input_actions
@@ -2072,6 +2310,10 @@ async fn run_chat(
 												.any(|binding| &binding.action == &action)
 									};
 									if host.overlay.is_some() {
+										if resume_picker_key(&mut host, key, ctx, intents) {
+											next_frame = Some(Instant::now());
+											continue;
+										}
 										let overlay = host.overlay.as_mut().expect("overlay present");
 										let key = if key == Key::Ctrl('c')
 											&& !matches!(overlay, Overlay::RawStream(_))
@@ -2080,7 +2322,13 @@ async fn run_chat(
 										} else {
 											key
 										};
-										let event = overlay.handle_key(key);
+										let event = match overlay.handle_key(key) {
+											OverlayEvent::Notify(notification) => {
+												terminal.notify(&notification)?;
+												OverlayEvent::Consumed
+											},
+											event => event,
+										};
 										if let Some(exit) = apply_overlay_event(
 											&mut host,
 											event,
@@ -2095,10 +2343,6 @@ async fn run_chat(
 										if host.overlay.is_none() {
 											close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 										}
-									} else if key == Key::JumpPrevious
-										&& action_enabled(InputAction::Interrupt)
-									{
-										send(intents, Intent::Abort);
 									} else if key == Key::JumpNext
 										&& action_enabled(InputAction::ExternalEditor)
 									{
@@ -2107,7 +2351,11 @@ async fn run_chat(
 									} else if key == Key::Ctrl('b') {
 										host.sidebar.toggle();
 										host.chat.set_right_inset(host.sidebar.reserved(viewport));
-																		} else if key == Key::Ctrl('z') {
+									} else if key == Key::Ctrl('o')
+										&& action_enabled(InputAction::ToggleToolTree)
+									{
+										host.toggle_tool_tree();
+									} else if key == Key::Ctrl('z') {
 										requested_exit = HostExit::Suspend;
 										break;
 									} else if key == Key::Alt('l') {
@@ -2158,6 +2406,10 @@ async fn run_chat(
 										send(intents, Intent::ToggleStt);
 									} else if key == Key::Alt('h') {
 										send(intents, Intent::InspectHistory);
+									} else if key == Key::DebugMenu
+										&& action_enabled(InputAction::DebugMenu)
+									{
+										send(intents, Intent::DebugMenuRequest);
 									} else if key == Key::Ctrl('r')
 										&& action_enabled(InputAction::HistorySearch)
 									{
@@ -2566,6 +2818,20 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 		BackendEvent::OpenRawStream { frames, summary } => {
 			host.overlay = Some(Overlay::RawStream(RawStreamViewer::open(frames, summary, ctx)));
 		},
+		BackendEvent::OpenDebugTools(rows) => {
+			host.overlay = Some(Overlay::Debug(DebugSelector::open(&rows, ctx)));
+		},
+		BackendEvent::OpenProtocolProbe => {
+			host.overlay = Some(Overlay::Probe(ProtocolProbe::open(detect(), ctx)));
+		},
+		BackendEvent::OpenLogs { entries, current_pid, has_older } => {
+			host.overlay = Some(Overlay::Logs(LogViewer::open(entries, current_pid, has_older, ctx)));
+		},
+		BackendEvent::OlderLogs { entries, has_older } => {
+			if let Some(Overlay::Logs(viewer)) = host.overlay.as_mut() {
+				viewer.prepend(entries, has_older);
+			}
+		},
 		BackendEvent::RawStreamFrame { frame, summary } => {
 			if let Some(Overlay::RawStream(viewer)) = host.overlay.as_mut() {
 				viewer.push(frame, summary);
@@ -2684,12 +2950,12 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 			host.sidebar.set_status(&facts);
 			let _ = host.chat.apply_backend_event(BackendEvent::Status(facts));
 		},
-		BackendEvent::OpenModelPicker { rows, current } => {
-			update_models(host, rows, current);
+		BackendEvent::OpenModelPicker { rows, current, task_current } => {
+			update_models(host, rows, current, task_current);
 			host.open_models(ctx);
 		},
-		BackendEvent::ModelsUpdated { rows, current } => {
-			update_models(host, rows, current);
+		BackendEvent::ModelsUpdated { rows, current, task_current } => {
+			update_models(host, rows, current, task_current);
 		},
 		BackendEvent::OpenModelHub(data) => {
 			host.overlay = Some(Overlay::ModelHub(ModelHub::open(data, ctx)));
@@ -2761,10 +3027,11 @@ fn open_autoqa_consent(host: &mut ChatHost, request: ConsentRequest, ctx: &UiCon
 	host.overlay = Some(Overlay::AutoQaConsent { dialog, consent });
 }
 
-fn update_models(host: &mut ChatHost, rows: Vec<ModelRow>, current: usize) {
+fn update_models(host: &mut ChatHost, rows: Vec<ModelRow>, current: usize, task_current: usize) {
 	host.current_model = current.min(rows.len().saturating_sub(1));
+	host.task_model = task_current.min(rows.len().saturating_sub(1));
 	if let Some(Overlay::Models(picker)) = &mut host.overlay {
-		picker.update_rows(&rows, host.current_model);
+		picker.update_rows(&rows, host.current_model, host.task_model);
 	}
 	host.models = rows;
 	if let Some(model) = host.models.get(host.current_model) {
@@ -2795,6 +3062,86 @@ fn open_sessions(host: &mut ChatHost, sessions: Vec<SessionRow>, ctx: &UiContext
 	let picker = ListPicker::open("Resume session", &rows, 0, ctx);
 	host.overlay =
 		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Resume });
+}
+fn resume_picker_key(
+	host: &mut ChatHost,
+	key: Key,
+	ctx: &UiContext,
+	intents: &Sender<Intent>,
+) -> bool {
+	if !matches!(host.overlay, Some(Overlay::List { purpose: ListPurpose::Resume, .. })) {
+		return false;
+	}
+	let selected = match host.overlay.as_ref() {
+		Some(Overlay::List { picker, rows, .. }) => {
+			let index = picker.selected();
+			picker.selected_key().and_then(|_| {
+				rows
+					.get(index)
+					.map(|row| (index, row.key.clone(), row.label.clone()))
+			})
+		},
+		_ => None,
+	};
+	match key {
+		Key::Tab => {
+			host.session_delete_confirm = None;
+			host.session_all_projects = !host.session_all_projects;
+		},
+		Key::Ctrl('s') => {
+			host.session_delete_confirm = None;
+			host.session_sort_by_title = !host.session_sort_by_title;
+		},
+		Key::Ctrl('p') => {
+			host.session_delete_confirm = None;
+			host.session_show_paths = !host.session_show_paths;
+		},
+		Key::Delete | Key::Ctrl('d') => {
+			let Some((index, id, _)) = selected else {
+				return true;
+			};
+			if host.session_delete_confirm.as_ref() == Some(&id) {
+				host.session_delete_confirm = None;
+				send(intents, Intent::SessionDelete { id, noninvasive: false });
+			} else {
+				host.session_delete_confirm = Some(id);
+				if let Some(Overlay::List { picker, .. }) = host.overlay.as_mut() {
+					picker.set_row_detail(
+						index,
+						sf!("press again to delete — <ctrl+backspace: keep artifacts>"),
+					);
+				}
+			}
+			return true;
+		},
+		Key::Ctrl('w') => {
+			if let Some((_, id, _)) = selected {
+				host.session_delete_confirm = None;
+				send(intents, Intent::SessionDelete { id, noninvasive: true });
+			}
+			return true;
+		},
+		Key::Ctrl('r') => {
+			if let Some((_, id, label)) = selected {
+				host.session_delete_confirm = None;
+				host.overlay = Some(Overlay::SessionRename {
+					prompt: PromptOverlay::open_prefilled("Rename session", label, ctx),
+					id,
+				});
+			}
+			return true;
+		},
+		_ => {
+			host.session_delete_confirm = None;
+			return false;
+		},
+	}
+	send(intents, Intent::SessionList {
+		all_projects:  host.session_all_projects,
+		sort_by_title: host.session_sort_by_title,
+		show_paths:    host.session_show_paths,
+	});
+	true
 }
 
 fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &UiContext) {
@@ -2908,6 +3255,7 @@ fn apply_overlay_event(
 		OverlayEvent::PtyInput { id, data } => send(intents, Intent::PtyInput { id, data }),
 		OverlayEvent::PtyKill { id } => send(intents, Intent::PtyKill { id }),
 		OverlayEvent::ModelHub(intent) => send(intents, Intent::ModelHub(intent)),
+		OverlayEvent::RefreshModels => send(intents, Intent::RefreshModels),
 		OverlayEvent::LoginRequest(provider) => {
 			send(intents, Intent::Login(Some(provider)));
 			host.overlay = None;
@@ -2941,6 +3289,10 @@ fn apply_overlay_event(
 		},
 		OverlayEvent::AgentRevivePrompt { agent_id, prompt } => {
 			send(intents, Intent::AgentRevive { id: agent_id, prompt });
+			host.overlay = None;
+		},
+		OverlayEvent::SessionRename { id, title } => {
+			send(intents, Intent::SessionRename { id, title });
 			host.overlay = None;
 		},
 		OverlayEvent::AgentKill(id) => {
@@ -2988,6 +3340,15 @@ fn apply_overlay_event(
 				host.overlay = None;
 			},
 			_ => {},
+		},
+		OverlayEvent::PickTask(index) => {
+			if matches!(host.overlay, Some(Overlay::Models(_))) {
+				if let Some(model) = host.models.get(index) {
+					host.task_model = index;
+					send(intents, Intent::SwitchTaskModel(model.key.clone()));
+				}
+				host.overlay = None;
+			}
 		},
 		OverlayEvent::Palette(action) => match action {
 			PaletteAction::Intent(intent) => {
@@ -3050,14 +3411,14 @@ fn apply_overlay_event(
 			},
 			overlay => host.overlay = overlay,
 		},
-		OverlayEvent::AskSubmit { selected, custom_input } => {
+		OverlayEvent::AskSubmit { selected, custom_input, note } => {
 			if let Some(Overlay::Ask { request, .. }) = host.overlay.take() {
 				let id = request.question.id.clone();
 				request.answer(omp_tools::ask::Answer {
 					id,
 					selected,
 					custom_input,
-					note: None,
+					note,
 					timed_out: false,
 				});
 			}
@@ -3099,6 +3460,13 @@ fn apply_overlay_event(
 		OverlayEvent::RawStreamCopy(text) => {
 			send(intents, Intent::CopyToClipboard(text));
 		},
+		OverlayEvent::DebugAction(key) => {
+			send(intents, Intent::DebugAction(key));
+			host.overlay = None;
+		},
+		OverlayEvent::LogsOlder => send(intents, Intent::OlderLogs),
+		OverlayEvent::LogsCopy(text) => send(intents, Intent::CopyToClipboard(text)),
+		OverlayEvent::Notify(_) => {},
 		OverlayEvent::AutoQaConsent(decision) => {
 			if let Some(Overlay::AutoQaConsent { consent, .. }) = host.overlay.take() {
 				send(intents, Intent::AutoQaConsent(consent.decide(decision)));
@@ -3156,6 +3524,12 @@ fn palette_entries() -> Vec<PaletteEntry> {
 			PaletteAction::Intent(Intent::InspectHistory),
 		)
 		.key("Alt+H"),
+		PaletteEntry::new(
+			"Debug tools",
+			"Logs, raw stream, reports, terminal probes",
+			PaletteAction::Intent(Intent::DebugMenuRequest),
+		)
+		.key("Ctrl+Shift+D"),
 		PaletteEntry::new(
 			"Search prompt history",
 			"Reuse a previously submitted prompt",
@@ -3413,13 +3787,16 @@ mod tests {
 		ui::v1::{Dialog, DialogOutcome, ShowOverlay, Tml, UiRequest, ui_request, ui_response},
 	};
 	use omp_tools::ask::{OptionItem, Question};
-	use omp_tui::{Frame, Key, Renderer, Size, UiContext, test_support::frame_row_text};
+	use omp_tui::{
+		Frame, Key, Renderer, Size, UiContext,
+		test_support::{TerminalModel, frame_row_text},
+	};
 
 	use super::{
-		ChatHost, Duration, HostExit, HostOptions, InputAction, InputBinding, Instant, Overlay,
-		OverlayEvent, PaintKind, ResizeScrollback, ResizeState, RetainedChat, RetainedChatEffect,
-		Retirement, apply_backend, apply_overlay_event, drain_ui_intents, paint_host,
-		start_pending_replay,
+		ChatHost, CommandPalette, Duration, HostExit, HostOptions, InputAction, InputBinding,
+		Instant, Overlay, OverlayEvent, PaintKind, ResizeScrollback, ResizeState, RetainedChat,
+		RetainedChatEffect, Retirement, apply_backend, apply_overlay_event, drain_ui_intents,
+		paint_host, palette_entries, start_pending_replay,
 	};
 	use crate::{
 		ApprovalAction, ApprovalTicketView, BackendEvent, Chat, ChatKey, HistoryInspector, Intent,
@@ -3959,7 +4336,11 @@ mod tests {
 		assert_eq!(host.modal_queue.len(), 1);
 		let _ = apply_overlay_event(
 			&mut host,
-			OverlayEvent::AskSubmit { selected: vec![sf!("Yes")], custom_input: None },
+			OverlayEvent::AskSubmit {
+				selected:     vec![sf!("Yes")],
+				custom_input: None,
+				note:         None,
+			},
 			&ctx,
 			viewport,
 			&intents,
@@ -4049,6 +4430,56 @@ mod tests {
 		assert_eq!(chat.key(Key::Esc), RetainedChatEffect::Consumed);
 		assert!(matches!(requests.try_recv(), Ok(Intent::LiveVoice(LiveVoiceAction::Close))));
 	}
+	#[test]
+	fn resume_overlay_delete_twice_emits_session_delete() {
+		let ctx = UiContext::default();
+		let (_events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx.clone(),
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		super::open_sessions(
+			&mut chat.host,
+			vec![crate::SessionRow {
+				id:     sf!("session-1"),
+				label:  sf!("Session"),
+				detail: Str::default(),
+				pinned: false,
+			}],
+			&ctx,
+		);
+
+		assert_eq!(chat.key(Key::Delete), RetainedChatEffect::Consumed);
+		assert!(requests.try_recv().is_err());
+		assert_eq!(chat.key(Key::Delete), RetainedChatEffect::Consumed);
+		assert!(matches!(
+			requests.try_recv(),
+			Ok(Intent::SessionDelete { id, noninvasive: false }) if id == "session-1"
+		));
+	}
+	#[test]
+	fn copy_prompt_sets_clipboard_to_latest_user_prompt() {
+		let ctx = UiContext::default();
+		let (_events, receiver) = flume::unbounded();
+		let (intents, _requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		chat.host.chat.push_user("first prompt", Vec::new());
+		chat.host.chat.push_user("last prompt", Vec::new());
+
+		assert_eq!(chat.key(Key::CopyPrompt), RetainedChatEffect::SetClipboard(sf!("last prompt")));
+	}
 
 	#[test]
 	fn ctrl_r_requests_prompt_history_before_the_composer_sees_it() {
@@ -4069,6 +4500,119 @@ mod tests {
 
 		assert_eq!(chat.key(Key::Ctrl('r')), RetainedChatEffect::Consumed);
 		assert!(matches!(requests.try_recv(), Ok(Intent::SearchHistory)));
+		assert_eq!(chat.host.chat.composer_text(), "draft survives");
+	}
+
+	#[test]
+	fn debug_menu_key_requests_native_catalog() {
+		let ctx = UiContext::default();
+		let (_events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+
+		assert_eq!(chat.key(Key::DebugMenu), RetainedChatEffect::Consumed);
+		assert!(matches!(requests.try_recv(), Ok(Intent::DebugMenuRequest)));
+	}
+
+	#[test]
+	fn debug_selector_pick_dispatches_stable_action_key() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let (intents, requests) = flume::unbounded();
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
+		let row = crate::debug_selector::DebugActionRow {
+			key:         sf!("protocol-probe"),
+			label:       sf!("Protocol probe"),
+			description: sf!("Exercise terminal capabilities"),
+		};
+
+		let _ = apply_backend(&mut host, BackendEvent::OpenDebugTools(vec![row]), &ctx);
+		let event = host
+			.overlay
+			.as_mut()
+			.expect("debug selector opens")
+			.handle_key(Key::Enter);
+		let _ = apply_overlay_event(&mut host, event, &ctx, viewport, &intents, false);
+
+		assert!(matches!(
+			requests.try_recv(),
+			Ok(Intent::DebugAction(key)) if key == "protocol-probe"
+		));
+		assert!(host.overlay.is_none());
+	}
+
+	#[test]
+	fn ctrl_o_and_tool_tree_action_report_each_expansion_state() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let (_events, receiver) = flume::unbounded();
+		let (intents, _requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		chat.resize(viewport, true);
+		chat.host.chat.tool_started("tool", "read");
+
+		assert_eq!(chat.key(Key::Ctrl('o')), RetainedChatEffect::Consumed);
+		let disabled = {
+			let frame = chat.render();
+			(0..frame.frame.size().height)
+				.map(|row| frame_row_text(frame.frame, row))
+				.collect::<Vec<_>>()
+				.join("\n")
+		};
+		assert!(disabled.contains("Tool output expansion: disabled"), "{disabled}");
+
+		assert_eq!(chat.action(InputAction::ToggleToolTree), RetainedChatEffect::Consumed);
+		let enabled = {
+			let frame = chat.render();
+			(0..frame.frame.size().height)
+				.map(|row| frame_row_text(frame.frame, row))
+				.collect::<Vec<_>>()
+				.join("\n")
+		};
+		assert!(enabled.contains("Tool output expansion: enabled"), "{enabled}");
+	}
+
+	#[test]
+	fn bound_interrupt_action_double_taps_into_a_rewind_request() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let (_events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		chat.resize(viewport, true);
+
+		// The default `app.interrupt` binding (Esc) must not swallow the
+		// gesture into an unconditional abort while the agent is idle.
+		assert_eq!(chat.action(InputAction::Interrupt), RetainedChatEffect::Consumed);
+		assert!(requests.try_recv().is_err(), "first Esc only arms the gesture");
+		assert_eq!(chat.action(InputAction::Interrupt), RetainedChatEffect::Consumed);
+		assert!(matches!(requests.try_recv(), Ok(Intent::RewindRequest)));
+
+		// A non-empty composer disarms the gesture instead of destroying the draft.
+		chat.host.chat.set_composer_text("draft survives");
+		assert_ne!(chat.action(InputAction::Interrupt), RetainedChatEffect::Quit(HostExit::Quit));
+		assert!(requests.try_recv().is_err());
 		assert_eq!(chat.host.chat.composer_text(), "draft survives");
 	}
 
@@ -4150,12 +4694,66 @@ mod tests {
 		assert!(state.settled(started_at + Duration::from_millis(220)));
 	}
 	#[test]
+	fn settled_replay_band_survives_followup_paints_on_the_terminal() {
+		fn pump(renderer: &mut Renderer<Vec<u8>>, terminal: &mut TerminalModel) {
+			let bytes = std::mem::take(renderer.writer_mut());
+			terminal.apply(std::str::from_utf8(&bytes).expect("renderer output is UTF-8"));
+		}
+		let ctx = UiContext::default();
+		let small = Size::new(60, 8);
+		let tall = Size::new(60, 24);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, small, Vec::new(), 0);
+		for index in 0..6 {
+			host.chat.push_notice(format!("hist-{index}"));
+		}
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(60, 8);
+		paint_host(&mut renderer, &mut host, small, Retirement::Disabled).unwrap();
+		while matches!(
+			paint_host(&mut renderer, &mut host, small, Retirement::Flush).unwrap(),
+			PaintKind::Retired | PaintKind::Deferred
+		) {}
+		pump(&mut renderer, &mut terminal);
+
+		// Grow the window: drag paints present at the new geometry first, then
+		// the settled width change starts a rebuild replay.
+		terminal.resize(60, 24);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, tall, Retirement::Pressure).unwrap(),
+			PaintKind::Deferred
+		);
+		let mut pending = Some(ResizeScrollback::Rebuild);
+		start_pending_replay(&mut renderer, &mut host, &mut pending).unwrap();
+		assert_eq!(pending, None);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, tall, Retirement::Pressure).unwrap(),
+			PaintKind::Presented
+		);
+		pump(&mut renderer, &mut terminal);
+		let visible = terminal.visible_rows().join("\n");
+		assert!(visible.contains("hist-5"), "replay adopts the tail on screen: {visible}");
+		assert!(
+			!terminal.history.iter().any(|row| row.contains("hist-5")),
+			"adopted rows must not duplicate into scrollback: {:?}",
+			terminal.history
+		);
+
+		// The regression: follow-up history-neutral paints erased the adopted
+		// rows one frame after the replay flashed them onto the screen.
+		for _ in 0..3 {
+			let _ = paint_host(&mut renderer, &mut host, tall, Retirement::Pressure).unwrap();
+		}
+		pump(&mut renderer, &mut terminal);
+		let visible = terminal.visible_rows().join("\n");
+		assert!(
+			visible.contains("hist-5"),
+			"follow-up paint erased the adopted transcript tail: {visible}"
+		);
+	}
+	#[test]
 	fn configured_actions_parse_and_external_editor_returns_exact_draft() {
-		let binding = InputBinding::parse(
-			"ctrl+x",
-			InputAction::from_action_id("app.editor.external").expect("known action"),
-		)
-		.expect("canonical chord");
+		let binding =
+			InputBinding::parse("ctrl+x", InputAction::ExternalEditor).expect("canonical chord");
 		assert_eq!(binding.key, Key::Ctrl('x'));
 
 		let ctx = UiContext::default();
@@ -4173,6 +4771,54 @@ mod tests {
 			chat.action(InputAction::ExternalEditor),
 			RetainedChatEffect::ExternalEditor(sf!("expanded draft"))
 		);
+	}
+	#[test]
+	fn retained_chat_applies_rebound_actions_and_consumes_their_legacy_keys() {
+		let ctx = UiContext::default();
+		let (_events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions {
+				input_actions: vec![InputBinding {
+					key:    Key::Ctrl('x'),
+					action: InputAction::HistorySearch,
+				}],
+				..HostOptions::default()
+			},
+			Default::default(),
+		);
+
+		assert_eq!(chat.key(Key::Ctrl('x')), RetainedChatEffect::Consumed);
+		assert!(matches!(requests.try_recv(), Ok(Intent::SearchHistory)));
+		assert_eq!(chat.key(Key::Ctrl('r')), RetainedChatEffect::Consumed);
+		assert!(requests.try_recv().is_err(), "the rebound legacy key must not dispatch");
+	}
+
+	#[test]
+	fn retained_overlays_bypass_application_mappings() {
+		let ctx = UiContext::default();
+		let (_events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx.clone(),
+			receiver,
+			intents,
+			HostOptions {
+				input_actions: vec![InputBinding { key: Key::Esc, action: InputAction::Exit }],
+				..HostOptions::default()
+			},
+			Default::default(),
+		);
+		chat.host.overlay = Some(Overlay::Palette(CommandPalette::open(palette_entries(), &ctx)));
+
+		assert_eq!(chat.key(Key::Esc), RetainedChatEffect::Consumed);
+		assert!(chat.host.overlay.is_none());
+		assert!(requests.try_recv().is_err(), "modal Esc must not exit the host");
 	}
 
 	#[test]
@@ -4240,8 +4886,9 @@ mod tests {
 		};
 		events
 			.send(BackendEvent::ModelsUpdated {
-				rows:    vec![row("provider/first", "First"), row("provider/second", "Second")],
-				current: 0,
+				rows:         vec![row("provider/first", "First"), row("provider/second", "Second")],
+				current:      0,
+				task_current: 0,
 			})
 			.expect("retained chat receiver remains connected");
 

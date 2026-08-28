@@ -8,9 +8,7 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use omp_walker::{FollowLinks, WalkRequest};
 use serde::{Deserialize, Serialize};
 
@@ -199,10 +197,6 @@ impl SettingsDomain for SkillDiscoverySettings {
 			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
 		}
 	}
-}
-
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<SkillDiscoverySettings>()
 }
 
 /// Non-fatal skill discovery diagnostic.

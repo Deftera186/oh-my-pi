@@ -94,6 +94,14 @@ pub enum Key {
 	JumpNext,
 	/// Ctrl+Shift+P: cycle backward through the host's model roster.
 	CyclePrevious,
+	/// Ctrl+Shift+O: toggle transcript tool-activity visibility.
+	ToggleToolVisibility,
+	/// Alt+Shift+C: copy the latest prompt to the clipboard.
+	CopyPrompt,
+	/// Alt+Shift+L: copy the current editor line to the clipboard.
+	CopyLine,
+	/// Ctrl+Shift+D: open the host's debug-tools overlay.
+	DebugMenu,
 	/// Alt+Shift+P: toggle the host's planning mode.
 	PlanToggle,
 	/// Ctrl/Alt+Left: previous word boundary.
@@ -1526,7 +1534,7 @@ fn write_key_label(target: &mut String, key: Key) {
 ///
 /// [`disable`]: Keymap::disable
 /// [`unbind`]: Keymap::unbind
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keymap {
 	bindings: Vec<(Chord, Option<Key>)>,
 }
@@ -1568,12 +1576,24 @@ const DEFAULT_BINDINGS: &[(Key, u8, Key)] = &[
 	(Key::Backspace, 2, Key::Ctrl('w')),
 	(Key::Backspace, 10, Key::Ctrl('w')),
 	(Key::Char('v'), 4, Key::Paste),
+	(Key::Char('v'), 8, Key::Paste),
+	(Key::Char('v'), 2, Key::Paste),
 	(Key::Char('v'), 5, Key::PasteRaw),
+	(Key::Char('v'), 3, Key::PasteRaw),
 	// xterm modifyOtherKeys emits the shifted codepoint, so this exact row must win
 	// before shift-folding `Ctrl+Shift+V` into the smart-paste `Ctrl+v` row.
 	(Key::Up, 2, Key::RestoreQueue),
 	(Key::Up, 3, Key::RestoreQueue),
 	(Key::Char('V'), 5, Key::PasteRaw),
+	(Key::Char('V'), 3, Key::PasteRaw),
+	(Key::Char('d'), 5, Key::DebugMenu),
+	(Key::Char('D'), 5, Key::DebugMenu),
+	(Key::Char('o'), 5, Key::ToggleToolVisibility),
+	(Key::Char('O'), 5, Key::ToggleToolVisibility),
+	(Key::Char('c'), 3, Key::CopyPrompt),
+	(Key::Char('C'), 3, Key::CopyPrompt),
+	(Key::Char('l'), 3, Key::CopyLine),
+	(Key::Char('L'), 3, Key::CopyLine),
 	(Key::Char('P'), 5, Key::CyclePrevious),
 	(Key::Char('P'), 3, Key::PlanToggle),
 	// pi tui.input.newLine: Shift/Ctrl-Enter spelling; Alt+Enter maps to FollowUp.
@@ -2035,6 +2055,8 @@ mod tests {
 			(Key::Char('y'), 2, Key::Alt('y')),
 			(Key::Char('Y'), 3, Key::Alt('y')),
 			(Key::Char(']'), 6, Key::CtrlAlt(']')),
+			(Key::Char('d'), 5, Key::DebugMenu),
+			(Key::Char('D'), 5, Key::DebugMenu),
 		];
 		let keymap = Keymap::default();
 		for &(key, bits, expected) in cases {
@@ -2046,6 +2068,30 @@ mod tests {
 	#[test]
 	fn keymap_resolves_smart_and_raw_paste_chords() {
 		let mut keymap = Keymap::default();
+		assert_eq!(
+			keymap.resolve(Chord::parse("ctrl+shift+o").expect("tool visibility chord")),
+			Some(Key::ToggleToolVisibility)
+		);
+		assert_eq!(
+			keymap.resolve(Chord::parse("alt+shift+c").expect("copy prompt chord")),
+			Some(Key::CopyPrompt)
+		);
+		assert_eq!(
+			keymap.resolve(Chord::parse("alt+shift+l").expect("copy line chord")),
+			Some(Key::CopyLine)
+		);
+		assert_eq!(
+			keymap.resolve(Chord::parse("super+v").expect("super paste chord")),
+			Some(Key::Paste)
+		);
+		assert_eq!(
+			keymap.resolve(Chord::parse("alt+shift+v").expect("raw paste chord")),
+			Some(Key::PasteRaw)
+		);
+		assert_eq!(
+			keymap.resolve(Chord::parse("ctrl+shift+d").expect("debug chord")),
+			Some(Key::DebugMenu)
+		);
 		let smart = Chord::new(Key::Char('v'), mods_from_bits(4));
 		assert_eq!(keymap.resolve(smart), Some(Key::Paste));
 		assert_eq!(

@@ -16,6 +16,8 @@ pub enum SelectionPurpose {
 	Advisor,
 	/// Select a conversation branch or history result.
 	History,
+	/// Select a user message to branch the session from.
+	Branch,
 }
 
 /// Action emitted by [`SelectionOverlay`].
@@ -86,13 +88,15 @@ impl SelectionOverlay {
 		match event {
 			PickerEvent::Consumed => SelectionEvent::Consumed,
 			PickerEvent::Close => SelectionEvent::Close,
-			PickerEvent::Pick(index) => self
-				.rows
-				.get(index)
-				.map_or(SelectionEvent::Consumed, |row| SelectionEvent::Pick {
-					purpose: self.purpose,
-					key:     row.key.clone(),
-				}),
+			PickerEvent::Pick(index) | PickerEvent::PickTask(index) => {
+				self
+					.rows
+					.get(index)
+					.map_or(SelectionEvent::Consumed, |row| SelectionEvent::Pick {
+						purpose: self.purpose,
+						key:     row.key.clone(),
+					})
+			},
 		}
 	}
 }

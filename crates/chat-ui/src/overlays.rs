@@ -184,6 +184,35 @@ impl ListPicker {
 		self.rows.get(index).map(|row| &row.key)
 	}
 
+	/// Returns the row index currently under the selection cursor.
+	pub const fn selected(&self) -> usize {
+		self.current
+	}
+
+	/// Returns the stable key of the row under the selection cursor.
+	pub fn selected_key(&self) -> Option<&Str> {
+		self.rows.get(self.current).map(|row| &row.key)
+	}
+
+	/// Replaces one row's secondary detail and repaints the list, keeping
+	/// the filter query and cursor; used for in-place confirm prompts.
+	pub fn set_row_detail(&mut self, index: usize, detail: Str) {
+		let Some(row) = self.rows.get_mut(index) else {
+			return;
+		};
+		row.detail = detail;
+		let width = self.ui.frame().size().width.max(1);
+		self.ui = build_list(
+			&self.title,
+			&self.rows,
+			self.current,
+			&self.query,
+			self.list_rows,
+			width,
+			&self.ctx,
+		);
+	}
+
 	fn route(&mut self, event: UiEvent) -> PickerEvent {
 		match event {
 			UiEvent::Cancel => PickerEvent::Close,
@@ -191,13 +220,21 @@ impl ListPicker {
 				.as_str()
 				.parse()
 				.map_or(PickerEvent::Consumed, PickerEvent::Pick),
-			UiEvent::Filtered { query, .. } => {
+			UiEvent::Filtered { query, value, .. } => {
 				self.query = query;
+				if let Some(index) = value.as_ref().and_then(|value| value.as_str().parse().ok()) {
+					self.current = index;
+				}
+				PickerEvent::Consumed
+			},
+			UiEvent::Highlighted { value, .. } => {
+				if let Ok(index) = value.as_str().parse() {
+					self.current = index;
+				}
 				PickerEvent::Consumed
 			},
 			UiEvent::None
 			| UiEvent::Submit
-			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
 			| UiEvent::TreeActivated { .. }

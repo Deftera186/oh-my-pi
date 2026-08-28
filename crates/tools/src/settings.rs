@@ -208,34 +208,41 @@ const fn integer_field(
 	FieldDescriptor { kind: SettingKind::Integer, ..field(path, label, description, order) }
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<FetchSettings>()
-}
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<ImageSettings>()
-}
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<ReadSettings>()
-}
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<LspFileSettings>()
-}
+/// Settings domains owned by the tools crate.
+pub const SETTINGS_CONTRIBUTION: omp_settings::SettingsContribution =
+	omp_settings::SettingsContribution {
+		domains:     &[
+			DomainRegistration::of::<FetchSettings>(),
+			DomainRegistration::of::<ImageSettings>(),
+			DomainRegistration::of::<ReadSettings>(),
+			DomainRegistration::of::<LspFileSettings>(),
+		],
+		normalizers: &[],
+	};
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
 
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
+
 	#[test]
 	fn projects_defaults_and_links_registration() {
-		let snapshot = SettingsSnapshot::isolated(FetchSettings::default()).expect("snapshot");
+		let snapshot =
+			SettingsSnapshot::isolated(FetchSettings::default(), CATALOG).expect("snapshot");
 		let projection = snapshot.project::<FetchSettings>().expect("projection");
 		assert!(projection.get().enabled);
-		let domains = registered_domains();
-		for domain in ["fetch", "images", "read", "lsp"] {
-			assert!(domains.iter().any(|registered| registered.name == domain));
-		}
+		assert_eq!(
+			SETTINGS_CONTRIBUTION
+				.domains
+				.iter()
+				.map(|domain| domain.descriptor().name)
+				.collect::<Vec<_>>(),
+			["fetch", "images", "read", "lsp"],
+		);
 	}
 
 	#[test]

@@ -80,6 +80,15 @@ pub(crate) fn render_tools(
 	let mut active = BTreeSet::new();
 	active.extend(enabled_tools.iter().map(Str::as_str));
 	active.extend(live_tools.iter().map(|tool| tool.name.as_str()));
+	// Hidden families (vibe, report_issue, think, …) stay out of the user
+	// list unless the model can actually call them this session.
+	let hidden = omp_tools::builtin_tool_identities()
+		.iter()
+		.filter(|identity| identity.hidden)
+		.map(|identity| identity.name)
+		.collect::<BTreeSet<_>>();
+	active
+		.retain(|name| !hidden.contains(name) || enabled_tools.iter().any(|enabled| enabled == name));
 
 	let mut all = BTreeSet::new();
 	all.extend(
@@ -90,6 +99,7 @@ pub(crate) fn render_tools(
 	);
 	all.extend(active.iter().copied());
 	all.extend(settings.enabled.keys().map(Str::as_str));
+	all.retain(|name| !hidden.contains(name) || active.contains(name));
 	all.extend(declarations.iter().filter_map(|declaration| {
 		if let omp_driver::discovery::manifest::CapabilityPayload::Tools(tool) = &declaration.payload
 		{

@@ -17,7 +17,7 @@ use self::{
 	interaction::{AskRenderer, ThinkRenderer, TodoRenderer},
 	misc::{BrowserRenderer, ComputerRenderer, GithubRenderer},
 	search::{GlobRenderer, GrepRenderer},
-	web::{FetchRenderer, WebSearchRenderer},
+	web::WebSearchRenderer,
 };
 
 /// Native goal renderer views.
@@ -64,8 +64,6 @@ pub struct BuiltinRendererIdentities {
 	pub grep:       Option<ToolIdentity>,
 	/// Identity of canonical web search, when enabled.
 	pub web_search: Option<ToolIdentity>,
-	/// Identity of the native URL fetcher, when enabled.
-	pub fetch:      Option<ToolIdentity>,
 	/// Identity of the native path matching tool, when enabled.
 	pub glob:       Option<ToolIdentity>,
 	/// Identity of the native persistent shell, when enabled.
@@ -120,9 +118,6 @@ pub fn register_builtin_renderers(
 	}
 	if let Some(identity) = identities.web_search {
 		registry.register(identity, WebSearchRenderer)?;
-	}
-	if let Some(identity) = identities.fetch {
-		registry.register(identity, FetchRenderer)?;
 	}
 	if let Some(identity) = identities.glob {
 		registry.register(identity, GlobRenderer)?;
@@ -192,7 +187,6 @@ pub fn live_renderers(tools: &Registry) -> Result<RenderRegistry, RenderRegistry
 		edit:       identity("edit"),
 		grep:       identity("grep"),
 		web_search: identity("web_search"),
-		fetch:      identity("fetch"),
 		glob:       identity("glob"),
 		shell:      identity("bash"),
 		hub:        identity("hub"),
@@ -294,7 +288,6 @@ pub(crate) mod test_support {
 			edit:       Some(identity("edit", 41)),
 			grep:       Some(identity("grep", 42)),
 			web_search: Some(identity("web_search", 48)),
-			fetch:      Some(identity("fetch", 49)),
 			glob:       Some(identity("glob", 43)),
 			shell:      Some(identity("bash", 44)),
 			hub:        Some(identity("hub", 45)),
@@ -345,7 +338,6 @@ mod tests {
 			identities.edit.as_ref().unwrap(),
 			identities.grep.as_ref().unwrap(),
 			identities.web_search.as_ref().unwrap(),
-			identities.fetch.as_ref().unwrap(),
 			identities.glob.as_ref().unwrap(),
 			identities.shell.as_ref().unwrap(),
 			identities.hub.as_ref().unwrap(),

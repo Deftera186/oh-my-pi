@@ -432,6 +432,7 @@ impl DiscoveryDecoder {
 			declared_operations: OperationBits::empty(),
 			declared_capabilities: None,
 			declared_limits: None,
+			declared_pricing: Box::new([]),
 			extended_context_mode: None,
 			availability,
 			source: self.source.clone(),

@@ -8,9 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	LayerNormalizer, ValidationError, deep_merge,
+	SettingsCatalog, ValidationError, deep_merge,
 	io::{SettingsIoError, atomic_replace},
-	registered_domains,
 };
 
 const MARKER: &str = ".settings-migration-v2";
@@ -68,8 +67,11 @@ pub enum MigrationOutcome {
 	skip_all,
 	fields(path = %data_dir.display())
 )]
-pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, MigrationError> {
-	let result = migrate_legacy_settings_inner(data_dir);
+pub fn migrate_legacy_settings(
+	data_dir: &Path,
+	catalog: SettingsCatalog,
+) -> Result<MigrationOutcome, MigrationError> {
+	let result = migrate_legacy_settings_inner(data_dir, catalog);
 	match &result {
 		Ok(MigrationOutcome::AlreadyCompleted) => {
 			tracing::debug!(
@@ -117,7 +119,10 @@ pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, Migr
 	result
 }
 
-fn migrate_legacy_settings_inner(data_dir: &Path) -> Result<MigrationOutcome, MigrationError> {
+fn migrate_legacy_settings_inner(
+	data_dir: &Path,
+	catalog: SettingsCatalog,
+) -> Result<MigrationOutcome, MigrationError> {
 	fs::create_dir_all(data_dir)
 		.map_err(|source| MigrationError::CreateDirectory { path: data_dir.to_owned(), source })?;
 	let marker = data_dir.join(MARKER);
@@ -165,7 +170,7 @@ fn migrate_legacy_settings_inner(data_dir: &Path) -> Result<MigrationOutcome, Mi
 		deep_merge(&mut imported, current);
 		current = imported;
 		normalize_legacy_layer(&mut current);
-		validate_migration_candidate(&current)?;
+		validate_migration_candidate(&current, catalog)?;
 		for source in &backups {
 			backup_file(source)?;
 		}
@@ -699,20 +704,19 @@ fn take_compat_value(
 	nested.or(flat)
 }
 
-fn normalize_legacy_layer(document: &mut toml::Table) {
+pub(crate) fn normalize_legacy_layer(document: &mut toml::Table) {
 	let mut ignored = MigrationRecord::default();
 	let _ = convert_legacy(document, &mut ignored);
 	remove_unsupported(document, &mut ignored);
 	reject_credentials(document, &mut ignored, "");
 }
 
-crate::inventory::submit! {
-	LayerNormalizer::new(normalize_legacy_layer)
-}
-
-fn validate_migration_candidate(document: &toml::Table) -> Result<(), MigrationError> {
-	for domain in registered_domains() {
-		(domain.validate)(document)?;
+fn validate_migration_candidate(
+	document: &toml::Table,
+	catalog: SettingsCatalog,
+) -> Result<(), MigrationError> {
+	for domain in catalog.descriptors() {
+		(domain.validate)(document, catalog)?;
 	}
 	Ok(())
 }
@@ -940,6 +944,8 @@ pub enum MigrationError {
 mod tests {
 	use super::*;
 
+	const CATALOG: SettingsCatalog = SettingsCatalog::new(&[&crate::SETTINGS_CONTRIBUTION]);
+
 	#[test]
 	fn migration_is_recorded_secret_free_and_idempotent() {
 		let directory = tempfile::tempdir().expect("directory");
@@ -949,7 +955,7 @@ mod tests {
 			 'never-report', hindsight: { enabled: true }, }",
 		)
 		.expect("legacy");
-		let first = migrate_legacy_settings(directory.path()).expect("migrate");
+		let first = migrate_legacy_settings(directory.path(), CATALOG).expect("migrate");
 		let MigrationOutcome::Completed(record) = first else {
 			panic!("first migration")
 		};
@@ -966,7 +972,7 @@ mod tests {
 		assert!(config.contains("default = \"demo/model\""));
 		assert!(!config.contains("apiKey"));
 		assert_eq!(
-			migrate_legacy_settings(directory.path()).expect("idempotent"),
+			migrate_legacy_settings(directory.path(), CATALOG).expect("idempotent"),
 			MigrationOutcome::AlreadyCompleted,
 		);
 	}
@@ -981,7 +987,7 @@ mod tests {
 		fs::write(directory.path().join("config.toml"), "[prompt]\nincludeModelInPrompt = true\n")
 			.expect("native");
 		let MigrationOutcome::Completed(record) =
-			migrate_legacy_settings(directory.path()).expect("migrate")
+			migrate_legacy_settings(directory.path(), CATALOG).expect("migrate")
 		else {
 			panic!("migration completed")
 		};

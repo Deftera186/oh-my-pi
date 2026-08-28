@@ -444,9 +444,12 @@ struct GuardrailConfig {
 
 #[derive(Serialize)]
 struct AdditionalModelRequestFields {
-	thinking:       ThinkingConfig,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	thinking:       Option<ThinkingConfig>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	output_config:  Option<OutputConfig>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	reasoning:      Option<ReasoningConfig>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	anthropic_beta: Vec<&'static str>,
 }
@@ -463,6 +466,11 @@ struct ThinkingConfig {
 
 #[derive(Serialize)]
 struct OutputConfig {
+	effort: Str,
+}
+
+#[derive(Serialize)]
+struct ReasoningConfig {
 	effort: Str,
 }
 
@@ -1029,8 +1037,9 @@ fn reasoning_config(
 	}
 	let fields = match mode {
 		ThinkingMode::AnthropicAdaptive => AdditionalModelRequestFields {
-			thinking:       ThinkingConfig { kind: "adaptive", budget_tokens: None, display },
+			thinking:       Some(ThinkingConfig { kind: "adaptive", budget_tokens: None, display }),
 			output_config:  Some(OutputConfig { effort: native_effort }),
+			reasoning:      None,
 			anthropic_beta: Vec::new(),
 		},
 		ThinkingMode::Budget | ThinkingMode::AnthropicBudgetEffort => {
@@ -1041,13 +1050,14 @@ fn reasoning_config(
 				)
 			})?;
 			AdditionalModelRequestFields {
-				thinking:       ThinkingConfig {
+				thinking:       Some(ThinkingConfig {
 					kind: "enabled",
 					budget_tokens: Some(budget),
 					display,
-				},
+				}),
 				output_config:  (mode == ThinkingMode::AnthropicBudgetEffort)
 					.then_some(OutputConfig { effort: native_effort }),
+				reasoning:      None,
 				anthropic_beta: if context.policy.reasoning.interleaved_thinking == Some(true) {
 					vec!["interleaved-thinking-2025-05-14"]
 				} else {
@@ -1055,7 +1065,13 @@ fn reasoning_config(
 				},
 			}
 		},
-		ThinkingMode::Effort | ThinkingMode::GoogleLevel => {
+		ThinkingMode::Effort => AdditionalModelRequestFields {
+			thinking:       None,
+			output_config:  None,
+			reasoning:      Some(ReasoningConfig { effort: native_effort }),
+			anthropic_beta: Vec::new(),
+		},
+		ThinkingMode::GoogleLevel => {
 			return Err(encoding_error(ErrorKind::CodecMismatch, "bedrock.thinking.mode_mismatch"));
 		},
 	};
@@ -1409,6 +1425,7 @@ impl FoundationModelSummary {
 			declared_operations: OperationBits::for_kind(OperationKind::Chat),
 			declared_capabilities: Some(capabilities),
 			declared_limits: None,
+			declared_pricing: Box::new([]),
 			extended_context_mode: None,
 			availability: Some(ModelAvailability::Available),
 			source: sf!("bedrock-list-foundation-models"),
@@ -2327,10 +2344,11 @@ mod tests {
 			.as_ref()
 			.and_then(|id| catalog.thinking_policy(id))
 			.cloned();
-		if setting_value(&request.reasoning).is_some()
-			&& let Some(thinking) = &mut explicit_thinking_policy
-		{
-			thinking.supports_display = Some(true);
+		if let Some(thinking) = &mut explicit_thinking_policy {
+			thinking.mode = mode;
+			if setting_value(&request.reasoning).is_some() {
+				thinking.supports_display = Some(true);
+			}
 		}
 		let thinking_policy = explicit_thinking_policy.as_ref();
 		let thinking_selection = setting_value(&request.reasoning).map(|reasoning| {
@@ -2464,6 +2482,35 @@ mod tests {
 				false,
 			),
 			"adaptive",
+		);
+	}
+
+	#[test]
+	fn encodes_effort_reasoning_without_dropping_output_cap() {
+		let mut request = base_request(vec![text_message(Role::User, "Solve carefully.")]);
+		request.max_output_tokens = Some(16);
+		request.reasoning = Setting::Require(ReasoningRequest {
+			visibility:          ReasoningVisibility::Summary,
+			effort:              Some(ReasoningEffort::High),
+			max_tokens:          None,
+			preserve_signatures: true,
+		});
+		let body: Value = serde_json::from_slice(&encode_fixture_with_thinking(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Effort,
+			false,
+		))
+		.expect("effort request is JSON");
+		assert_eq!(
+			body["additionalModelRequestFields"],
+			serde_json::json!({"reasoning":{"effort":"high"}}),
+		);
+		assert_eq!(body["inferenceConfig"]["maxTokens"], 16);
+		assert!(
+			body["additionalModelRequestFields"]
+				.get("thinking")
+				.is_none()
 		);
 	}
 

@@ -446,7 +446,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity: lsp,
-			title: "references for validateToken in src/server/auth.ts:42",
 			streaming_args: r#"{"action":"references","file":"src/server/au"#,
 			args: r#"{"action":"references","file":"src/server/auth.ts","line":42,"symbol":"validateToken"}"#,
 			progress_update: None,
@@ -455,7 +454,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: debug,
-			title: "stack_trace for dbg-1 thread 1",
 			streaming_args: r#"{"action":"stack_trace","session":"dbg-"#,
 			args: r#"{"action":"stack_trace","session":"dbg-1","thread_id":1}"#,
 			progress_update: None,

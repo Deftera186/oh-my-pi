@@ -109,13 +109,23 @@ impl Color {
 		(0.2126 * f32::from(red) + 0.7152 * f32::from(green) + 0.0722 * f32::from(blue)) / 255.0
 	}
 
-	/// Derives a readable label color by blending this fill toward black or
-	/// white.
+	/// Derives a readable label color from this fill.
+	///
+	/// RGB fills blend toward black or white. Xterm-indexed fills select the
+	/// corresponding black or white palette endpoint; the terminal-default
+	/// surface remains terminal-default because its actual color is unknown.
 	pub fn contrast_label(self) -> Self {
-		if self.luminance() > 0.5 {
-			self.mix(Self::Rgb(0, 0, 0), 0.82)
-		} else {
-			self.mix(Self::Rgb(255, 255, 255), 0.92)
+		match self {
+			Self::Default => Self::Default,
+			Self::Indexed(index) => {
+				if indexed_rgb(index).luminance() > 0.5 {
+					Self::Indexed(16)
+				} else {
+					Self::Indexed(231)
+				}
+			},
+			Self::Rgb(..) if self.luminance() > 0.5 => self.mix(Self::Rgb(0, 0, 0), 0.82),
+			Self::Rgb(..) => self.mix(Self::Rgb(255, 255, 255), 0.92),
 		}
 	}
 
@@ -178,6 +188,43 @@ impl Color {
 		}
 	}
 }
+
+const fn indexed_rgb(index: u8) -> Color {
+	const ANSI: [(u8, u8, u8); 16] = [
+		(0, 0, 0),
+		(128, 0, 0),
+		(0, 128, 0),
+		(128, 128, 0),
+		(0, 0, 128),
+		(128, 0, 128),
+		(0, 128, 128),
+		(192, 192, 192),
+		(128, 128, 128),
+		(255, 0, 0),
+		(0, 255, 0),
+		(255, 255, 0),
+		(0, 0, 255),
+		(255, 0, 255),
+		(0, 255, 255),
+		(255, 255, 255),
+	];
+	if index < 16 {
+		let (red, green, blue) = ANSI[index as usize];
+		return Color::Rgb(red, green, blue);
+	}
+	if index < 232 {
+		const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+		let cube = index - 16;
+		return Color::Rgb(
+			LEVELS[(cube / 36) as usize],
+			LEVELS[((cube % 36) / 6) as usize],
+			LEVELS[(cube % 6) as usize],
+		);
+	}
+	let gray = 8 + 10 * (index - 232);
+	Color::Rgb(gray, gray, gray)
+}
+
 const fn nearest_level(channel: u8) -> u8 {
 	let levels = [0_u8, 95, 135, 175, 215, 255];
 	let mut best = 0_u8;
@@ -1372,6 +1419,9 @@ mod tests {
 			Color::Rgb(236, 238, 239),
 			"dark fills blend 92% toward white"
 		);
+		assert_eq!(Color::Default.contrast_label(), Color::Default);
+		assert_eq!(Color::Indexed(255).contrast_label(), Color::Indexed(16));
+		assert_eq!(Color::Indexed(233).contrast_label(), Color::Indexed(231));
 	}
 
 	#[test]

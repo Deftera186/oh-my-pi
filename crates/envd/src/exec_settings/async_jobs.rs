@@ -1,8 +1,7 @@
 //! Native async-job capacity, retention, and wait settings.
 
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -138,36 +137,28 @@ impl SettingsDomain for AsyncJobSettings {
 	];
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<AsyncJobSettings>()
-}
-
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::SettingsSnapshot;
 
 	use super::*;
 
 	#[test]
-	fn async_projection_round_trips_and_is_registered() {
+	fn async_projection_round_trips() {
 		let expected = AsyncJobSettings {
 			enabled:            true,
 			max_jobs:           0,
 			retention_ms:       42_000,
 			poll_wait_duration: PollWaitDuration::Seconds30,
 		};
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated snapshot");
+		let snapshot = SettingsSnapshot::isolated(expected.clone(), crate::TEST_SETTINGS_CATALOG)
+			.expect("isolated snapshot");
 		assert_eq!(
 			snapshot
 				.project::<AsyncJobSettings>()
 				.expect("projection")
 				.get(),
 			&expected
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == AsyncJobSettings::DOMAIN)
 		);
 	}
 }

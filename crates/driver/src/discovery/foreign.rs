@@ -6,9 +6,7 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use omp_core::Str;
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain};
 use omp_walker::WalkRequest;
 
 use super::{
@@ -63,10 +61,6 @@ impl SettingsDomain for ForeignContentSettings {
 			secret:      false,
 		},
 	];
-}
-
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<ForeignContentSettings>()
 }
 
 /// Allowed read-only foreign content discovered at one repository surface.

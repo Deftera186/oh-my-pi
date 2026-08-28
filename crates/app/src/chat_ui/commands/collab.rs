@@ -79,8 +79,8 @@ pub(crate) fn join_command(
 
 pub(crate) fn render(result: CollabCommandResult) -> Str {
 	let mut lines = Vec::new();
-	if let Some(presence) = result.presence {
-		lines.push(format!(
+	let heading = if let Some(presence) = result.presence {
+		format!(
 			"**Collaboration** · {:?} · {:?} · {} participant{}{}",
 			presence.role(),
 			presence.connection(),
@@ -95,9 +95,14 @@ pub(crate) fn render(result: CollabCommandResult) -> Str {
 			} else {
 				""
 			},
-		));
+		)
 	} else {
-		lines.push("**Collaboration inactive**".to_owned());
+		"**Collaboration inactive**".to_owned()
+	};
+	if let Some(link) = result.web_link.as_ref().or(result.web_view_link.as_ref()) {
+		lines.push(format!("[Join in browser]({link})  {heading}"));
+	} else {
+		lines.push(heading);
 	}
 	for (label, link) in [
 		("Join", result.full_link),
@@ -113,5 +118,27 @@ pub(crate) fn render(result: CollabCommandResult) -> Str {
 		Str::from(lines.remove(0))
 	} else {
 		Str::from(lines.join("\n"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_collab::presence::{ConnectionState, PresenceFacts};
+
+	use super::*;
+
+	#[test]
+	fn browser_join_url_is_on_first_status_row() {
+		let browser_url = Str::new_static("https://my.omp.sh/#a-very-long-collaboration-token");
+		let rendered = render(CollabCommandResult {
+			presence:      Some(PresenceFacts::host(ConnectionState::Connected, 0)),
+			full_link:     Some(Str::new_static("native-link")),
+			view_link:     None,
+			web_link:      Some(browser_url.clone()),
+			web_view_link: None,
+		});
+		let first = rendered.lines().next().expect("status has a heading");
+		assert!(first.starts_with("[Join in browser]("), "{first}");
+		assert!(first.contains(browser_url.as_str()), "{first}");
 	}
 }

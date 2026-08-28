@@ -185,24 +185,34 @@ pub enum AskDialogEvent {
 		selected:     Vec<Str>,
 		/// User-authored answer entered through the always-present Other row.
 		custom_input: Option<Str>,
+		/// Optional note attached to the selected option or custom answer.
+		note:         Option<Str>,
 	},
 }
 
 /// Core-owned Ask dialog supporting single and multi selection.
 pub struct AskDialog {
-	ui:       Ui,
-	options:  OverlayOptions,
-	question: Question,
-	selected: Vec<Str>,
-	custom:   Option<PromptOverlay>,
-	ctx:      UiContext,
-	width:    u16,
+	ui:          Ui,
+	options:     OverlayOptions,
+	question:    Question,
+	selected:    Vec<Str>,
+	custom:      Option<PromptOverlay>,
+	note:        Option<(Str, Str)>,
+	note_editor: Option<PromptOverlay>,
+	focused:     Str,
+	ctx:         UiContext,
+	width:       u16,
 }
 
 impl AskDialog {
 	/// Opens a typed Ask question.
 	pub fn open(question: Question, ctx: &UiContext) -> Self {
 		let width = 72;
+		let focused = question
+			.recommended
+			.and_then(|index| question.options.get(index))
+			.or_else(|| question.options.first())
+			.map_or_else(|| Str::new_static(OTHER_VALUE), |option| option.label.clone());
 		let mut ui = build_dialog(&question, width, ctx);
 		ui.focus_first();
 		Self {
@@ -213,6 +223,9 @@ impl AskDialog {
 			question,
 			selected: Vec::new(),
 			custom: None,
+			note: None,
+			note_editor: None,
+			focused,
 			ctx: ctx.clone(),
 			width,
 		}
@@ -220,6 +233,29 @@ impl AskDialog {
 
 	/// Routes a key through the dialog.
 	pub fn handle_key(&mut self, key: Key) -> AskDialogEvent {
+		if let Some(note_editor) = self.note_editor.as_mut() {
+			return match note_editor.handle_key(key) {
+				PromptEvent::Consumed => AskDialogEvent::Consumed,
+				PromptEvent::Cancel => {
+					self.note_editor = None;
+					AskDialogEvent::Consumed
+				},
+				PromptEvent::Submit(value) => {
+					self.note = (!value.trim().is_empty()).then_some((self.focused.clone(), value));
+					self.note_editor = None;
+					AskDialogEvent::Consumed
+				},
+			};
+		}
+		if key == Key::Char('n') {
+			let title = if self.focused == OTHER_VALUE {
+				sf!("Note for Other")
+			} else {
+				sf!("Note for {}", self.focused)
+			};
+			self.note_editor = Some(PromptOverlay::open(title, false, &self.ctx));
+			return AskDialogEvent::Consumed;
+		}
 		if let Some(custom) = self.custom.as_mut() {
 			return match custom.handle_key(key) {
 				PromptEvent::Consumed => AskDialogEvent::Consumed,
@@ -229,7 +265,8 @@ impl AskDialog {
 				},
 				PromptEvent::Submit(value) if value.trim().is_empty() => AskDialogEvent::Consumed,
 				PromptEvent::Submit(value) => {
-					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value) }
+					let note = self.note_for_selection(&[], Some(&value));
+					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value), note }
 				},
 			};
 		}
@@ -239,10 +276,21 @@ impl AskDialog {
 
 	/// Routes pasted custom input.
 	pub fn handle_paste(&mut self, text: &str) -> AskDialogEvent {
+		if let Some(note_editor) = self.note_editor.as_mut() {
+			return match note_editor.handle_paste(text) {
+				PromptEvent::Submit(value) => {
+					self.note = (!value.trim().is_empty()).then_some((self.focused.clone(), value));
+					self.note_editor = None;
+					AskDialogEvent::Consumed
+				},
+				PromptEvent::Consumed | PromptEvent::Cancel => AskDialogEvent::Consumed,
+			};
+		}
 		if let Some(custom) = self.custom.as_mut() {
 			return match custom.handle_paste(text) {
 				PromptEvent::Submit(value) if !value.trim().is_empty() => {
-					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value) }
+					let note = self.note_for_selection(&[], Some(&value));
+					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value), note }
 				},
 				PromptEvent::Consumed | PromptEvent::Cancel | PromptEvent::Submit(_) => {
 					AskDialogEvent::Consumed
@@ -261,6 +309,20 @@ impl AskDialog {
 		kind: Mouse,
 		viewport: Size,
 	) -> AskDialogEvent {
+		if let Some(note_editor) = self.note_editor.as_mut() {
+			return match note_editor.handle_mouse(col, row, kind, viewport) {
+				PromptEvent::Consumed => AskDialogEvent::Consumed,
+				PromptEvent::Cancel => {
+					self.note_editor = None;
+					AskDialogEvent::Consumed
+				},
+				PromptEvent::Submit(value) => {
+					self.note = (!value.trim().is_empty()).then_some((self.focused.clone(), value));
+					self.note_editor = None;
+					AskDialogEvent::Consumed
+				},
+			};
+		}
 		if let Some(custom) = self.custom.as_mut() {
 			return match custom.handle_mouse(col, row, kind, viewport) {
 				PromptEvent::Consumed => AskDialogEvent::Consumed,
@@ -270,7 +332,8 @@ impl AskDialog {
 				},
 				PromptEvent::Submit(value) if value.trim().is_empty() => AskDialogEvent::Consumed,
 				PromptEvent::Submit(value) => {
-					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value) }
+					let note = self.note_for_selection(&[], Some(&value));
+					AskDialogEvent::Submit { selected: Vec::new(), custom_input: Some(value), note }
 				},
 			};
 		}
@@ -286,6 +349,9 @@ impl AskDialog {
 
 	/// Returns the centered composited layer.
 	pub fn layer(&mut self, viewport: Size) -> Layer<'_> {
+		if let Some(note_editor) = self.note_editor.as_mut() {
+			return note_editor.layer(viewport);
+		}
 		if let Some(custom) = self.custom.as_mut() {
 			return custom.layer(viewport);
 		}
@@ -297,15 +363,18 @@ impl AskDialog {
 	fn route(&mut self, event: UiEvent) -> AskDialogEvent {
 		match event {
 			UiEvent::Cancel => AskDialogEvent::Cancel,
-			UiEvent::Submit if self.question.multi => AskDialogEvent::Submit {
-				selected:     mem::take(&mut self.selected),
-				custom_input: None,
+			UiEvent::Submit if self.question.multi => {
+				let selected = mem::take(&mut self.selected);
+				let note = self.note_for_selection(&selected, None);
+				AskDialogEvent::Submit { selected, custom_input: None, note }
 			},
 			UiEvent::Changed { value, .. } if value == OTHER_VALUE => {
+				self.focused = value;
 				self.custom = Some(PromptOverlay::open("Other answer", false, &self.ctx));
 				AskDialogEvent::Consumed
 			},
 			UiEvent::Changed { value, .. } if self.question.multi => {
+				self.focused = value.clone();
 				if let Some(at) = self.selected.iter().position(|chosen| chosen == &value) {
 					self.selected.remove(at);
 				} else {
@@ -314,12 +383,16 @@ impl AskDialog {
 				AskDialogEvent::Consumed
 			},
 			UiEvent::Changed { value, .. } => {
-				AskDialogEvent::Submit { selected: vec![value], custom_input: None }
+				let note = self.note_for_selection(std::slice::from_ref(&value), None);
+				AskDialogEvent::Submit { selected: vec![value], custom_input: None, note }
+			},
+			UiEvent::Highlighted { value, .. } => {
+				self.focused = value;
+				AskDialogEvent::Consumed
 			},
 			UiEvent::None
 			| UiEvent::Submit
 			| UiEvent::Filtered { .. }
-			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
 			| UiEvent::TreeActivated { .. }
@@ -327,6 +400,13 @@ impl AskDialog {
 			| UiEvent::TreeAction { .. }
 			| UiEvent::DiffAction { .. } => AskDialogEvent::Consumed,
 		}
+	}
+
+	fn note_for_selection(&self, selected: &[Str], custom_input: Option<&Str>) -> Option<Str> {
+		let (target, note) = self.note.as_ref()?;
+		(selected.iter().any(|value| value == target)
+			|| (target.as_str() == OTHER_VALUE && custom_input.is_some()))
+		.then(|| note.clone())
 	}
 }
 
@@ -374,7 +454,7 @@ fn build_dialog(question: &Question, width: u16, ctx: &UiContext) -> Ui {
 					</option>
 				</select>
 				{panel_divider()}
-				<text dim>{if multi { "Space toggle · Enter confirm · Esc cancel" } else { "Enter choose · Esc cancel" }}</text>
+				<text dim>{if multi { "Space toggle · Enter confirm · n note · PgUp/PgDn page · Esc cancel" } else { "Enter choose · n note · PgUp/PgDn page · Esc cancel" }}</text>
 			</col>
 		}),
 		width,
@@ -432,6 +512,7 @@ mod tests {
 		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Submit {
 			selected:     vec![sf!("Python")],
 			custom_input: None,
+			note:         None,
 		});
 	}
 
@@ -448,6 +529,22 @@ mod tests {
 		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Submit {
 			selected:     Vec::new(),
 			custom_input: Some(sf!("DuckDB")),
+			note:         None,
+		});
+	}
+
+	#[test]
+	fn note_attaches_to_the_focused_option() {
+		let ctx = UiContext::default();
+		let mut dialog = AskDialog::open(question(false), &ctx);
+
+		assert_eq!(dialog.handle_key(Key::Char('n')), AskDialogEvent::Consumed);
+		assert_eq!(dialog.handle_paste("Preferred ecosystem"), AskDialogEvent::Consumed);
+		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Consumed);
+		assert_eq!(dialog.handle_key(Key::Enter), AskDialogEvent::Submit {
+			selected:     vec![sf!("Rust")],
+			custom_input: None,
+			note:         Some(sf!("Preferred ecosystem")),
 		});
 	}
 }

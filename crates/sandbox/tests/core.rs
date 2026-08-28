@@ -83,17 +83,13 @@ fn resource_limits_reject_nonfinite_and_negative_cpu_values() {
 }
 
 #[test]
-fn strict_compilation_reports_the_missing_capability_set() {
+fn strict_compilation_enforces_outbound_networking() {
 	let mut spec = scoped_spec();
 	spec.set_network(NetworkMode::Outbound);
-	let error = Runner::for_backend(Backend::Bubblewrap)
+	let plan = Runner::for_backend(Backend::Bubblewrap)
 		.compile(&spec)
-		.expect_err("Bubblewrap cannot enforce outbound-only networking");
-	assert!(matches!(
-		error,
-		SandboxError::BackendCapabilities { backend: Backend::Bubblewrap, missing }
-			if missing.contains(Capability::NetOutbound)
-	));
+		.expect("Bubblewrap enforces outbound-only networking");
+	assert!(plan.enforced().contains(Capability::NetOutbound));
 }
 
 #[test]

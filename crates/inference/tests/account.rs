@@ -54,6 +54,7 @@ fn selection_request(route: &RouteId, now: SystemTime) -> AccountSelectionReques
 		rotate: false,
 		rotation: RotationPolicy::default(),
 		now,
+		quota_scope: None,
 	}
 }
 
@@ -432,6 +433,7 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 			rotate:             false,
 			rotation:           RotationPolicy::default(),
 			now:                at(180),
+			quota_scope:        None,
 		})
 		.unwrap();
 	assert_eq!(selected_b.record.account, AccountId::new("durable-b"));
@@ -532,6 +534,7 @@ fn durable_account_state_survives_reopen_and_account_removal() {
 				rotate:             false,
 				rotation:           RotationPolicy::default(),
 				now:                at(181),
+				quota_scope:        None,
 			})
 			.is_err()
 	);

@@ -19,6 +19,10 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 
 use super::now_ms;
+const MANUAL_CONTINUE_PROMPT: &str =
+	"<system-notice>\nContinue.\n\nMUST resume most recent intent; complete unfinished work.\nIf \
+	 interrupted mid-step: resume where stopped.\nNEVER pause to summarize progress, re-confirm \
+	 plan, or ask whether to proceed; continue.\n</system-notice>";
 
 /// One declarative subcommand offered by completion and help.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -635,11 +639,13 @@ pub enum ChatCommand {
 	/// Invoke one frozen session skill with surrounding user prose as arguments.
 	Skill {
 		/// Stable skill name.
-		name:   Str,
+		name:            Str,
 		/// User prose outside the invocation token.
-		args:   Str,
+		args:            Str,
 		/// Optional per-turn budget parsed from surrounding prose.
-		budget: Option<ParsedTurnBudget>,
+		budget:          Option<ParsedTurnBudget>,
+		/// Original local submission time before command preprocessing.
+		submitted_at_ms: u64,
 	},
 	/// A recognized command whose backend is not available yet.
 	Unavailable { command: Str, reason: Str },
@@ -733,6 +739,7 @@ impl error::Error for InputError {}
 /// Parses composer text against the same aggregated roster used for completion.
 /// Unknown slash names intentionally pass through as normal prompt text.
 fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand, InputError> {
+	let submitted_at_ms = now_ms();
 	let (text, budget) = parse_budget_prefix(text)?;
 	if text.trim().is_empty() {
 		return if budget.is_some() {
@@ -742,12 +749,24 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		};
 	}
 	let submit = |text: &str| ChatCommand::Submit {
-		item:   Box::new(user_message(text)),
+		item:   Box::new(user_message_at(text, submitted_at_ms)),
 		text:   Str::from(text),
 		budget: budget.clone(),
 	};
+	if matches!(&*text, "." | "c") {
+		return Ok(ChatCommand::Submit {
+			item: Box::new(manual_continue_message_at(submitted_at_ms)),
+			text: Str::from(text),
+			budget,
+		});
+	}
 	if let Some(skill) = omp_driver::skills::parse_invocation(&text) {
-		return Ok(ChatCommand::Skill { name: skill.name, args: skill.args, budget });
+		return Ok(ChatCommand::Skill {
+			name: skill.name,
+			args: skill.args,
+			budget,
+			submitted_at_ms,
+		});
 	}
 	let Some(parsed) = parse_slash(&text) else {
 		return Ok(submit(&text));
@@ -764,7 +783,7 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 		let args = tokenize_args(parsed.args)?;
 		let expanded = expand_arguments_with_fallback(template, &args, parsed.args);
 		return Ok(ChatCommand::Submit {
-			item: Box::new(user_message(&expanded)),
+			item: Box::new(user_message_at(&expanded, submitted_at_ms)),
 			text: Str::from(expanded),
 			budget,
 		});
@@ -1087,12 +1106,33 @@ fn argument_slice(template: &str) -> Option<(usize, usize, Option<usize>)> {
 
 /// Builds the canonical user-message item used by submissions and steering.
 pub(super) fn user_message(text: impl Into<String>) -> Item {
+	user_message_at(text, now_ms())
+}
+
+/// Builds a canonical user message with a caller-captured submission time.
+pub(super) fn user_message_at(text: impl Into<String>, submitted_at_ms: u64) -> Item {
 	Item {
 		seq:           0,
-		created_at_ms: now_ms(),
+		created_at_ms: submitted_at_ms,
 		kind:          Some(item::Kind::Message(Message {
-			role:  i32::from(Role::User),
+			role: i32::from(Role::User),
 			parts: vec![Part { kind: Some(part::Kind::Text(text.into())) }],
+			..Message::default()
+		})),
+		props:         None,
+	}
+}
+
+fn manual_continue_message_at(submitted_at_ms: u64) -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: submitted_at_ms,
+		kind:          Some(item::Kind::Message(Message {
+			role: i32::from(Role::System),
+			parts: vec![Part { kind: Some(part::Kind::Text(MANUAL_CONTINUE_PROMPT.to_owned())) }],
+			synthetic: Some(true),
+			user_initiated: Some(true),
+			..Message::default()
 		})),
 		props:         None,
 	}
@@ -1153,6 +1193,30 @@ mod tests {
 			submit_text(commands.parse_input("/tmp/pic.png describe").unwrap()),
 			"/tmp/pic.png describe"
 		);
+	}
+
+	#[test]
+	fn continue_shortcuts_build_user_initiated_synthetic_developer_items() {
+		let commands = builtins();
+		for shortcut in [".", "c"] {
+			let ChatCommand::Submit { item, text, .. } =
+				commands.parse_input(shortcut).expect("continue shortcut")
+			else {
+				panic!("continue shortcut must submit");
+			};
+			let Some(item::Kind::Message(message)) = item.kind else {
+				panic!("continue shortcut message");
+			};
+			assert_eq!(text, shortcut);
+			assert!(item.created_at_ms > 0);
+			assert_eq!(message.role(), Role::System);
+			assert_eq!(message.synthetic, Some(true));
+			assert_eq!(message.user_initiated, Some(true));
+			assert!(matches!(
+				message.parts.as_slice(),
+				[Part { kind: Some(part::Kind::Text(body)) }] if body.contains("Continue.")
+			));
+		}
 	}
 
 	#[test]

@@ -24,9 +24,9 @@ command!(move_root, 90, "move", icon: FolderMove, [], "Set the primary workspace
 command!(dir, 100, "dir", icon: Folder, [], "List or mutate this session's workspace roots", [Workspace, Owner], false, typed("[add|remove <directory>|list]", [("add", "Add a workspace root"), ("remove", "Remove a workspace root"), ("list", "List effective workspace roots")], parse_dir) => |host, request| host.workspace(request));
 
 command!(handoff, 121, "handoff", icon: Handoff, [], "Summarize the session into a handoff document and compact in place", [Session, Execution], false, optional("[focus instructions]") => |host, instructions| host.handoff(instructions));
-command!(branch, 122, "branch", icon: Branch, [], "Create a new branch from a checkpoint", [Session, Execution], false, typed("[checkpoint]", [], parse_branch) => |host, request| host.branch(request));
+command!(branch, 122, "branch", icon: Branch, [], "Branch into a new session from an earlier message", [Session, Execution], false, typed("[checkpoint]", [], parse_branch) => |host, request| host.branch(request));
 command!(fork, 123, "fork", icon: Branch, [], "Create an independent fork of the live session", [Session, Execution], false, optional("[title]") => |host, title| host.fork(title));
-command!(branch_tree, 124, "tree", icon: Worktree, [], "Show session branch lineage and descendants", [Session], false, none => |host| host.branch_tree());
+command!(tree, 124, "tree", icon: Worktree, [], "Backtrack to an earlier point in this session", [Session], false, none => |host| host.tree());
 command!(quit, 900, "quit", icon: Power, ["exit", "q"], "Exit the client", [], true, none => |host| host.quit());
 fn parse_branch(args: &str) -> miette::Result<BranchRequest> {
 	let checkpoint = args.trim();

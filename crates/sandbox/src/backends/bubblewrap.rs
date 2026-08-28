@@ -12,8 +12,8 @@ use omp_core::CowBytes;
 
 use crate::{
 	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
-	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxOperation,
-	SandboxSpec, WriteMode,
+	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, RUNTIME_READ_ROOTS, SandboxError,
+	SandboxOperation, SandboxSpec, WriteMode,
 	paths::{insert_path, path_under_any, temp_roots},
 	runner::COMMAND_WRAPPER_PLACEHOLDER,
 };
@@ -29,6 +29,21 @@ pub(crate) fn compile(
 	requested: CapabilitySet,
 	mut enforced: CapabilitySet,
 ) -> Result<Plan, SandboxError> {
+	if !spec.unix_sockets.is_empty() {
+		return Err(SandboxError::EnforcementUnavailable {
+			backend:   Backend::Bubblewrap,
+			authority: "Unix-domain socket path grants",
+		});
+	}
+	if spec.network == NetworkMode::Outbound
+		&& (spec.proxy_port.is_some() != spec.proxy_socket.is_some())
+	{
+		return Err(SandboxError::EnforcementUnavailable {
+			backend:   Backend::Bubblewrap,
+			authority: "complete scoped proxy endpoint",
+		});
+	}
+	let scoped_proxy = spec.proxy_socket.is_some();
 	let mut unavailable = requested.difference(Backend::Bubblewrap.capabilities());
 	let has_future_deny = spec.read_deny.iter().any(|path| !path.exists());
 	if has_future_deny {
@@ -48,10 +63,8 @@ pub(crate) fn compile(
 	if !spec.unix_sockets.is_empty() {
 		enforced = enforced.difference(CapabilitySet::one(Capability::IpcRestrict));
 	}
-	if spec.network == NetworkMode::Outbound {
-		enforced = enforced
-			.difference(CapabilitySet::one(Capability::NetOutbound))
-			.union(CapabilitySet::one(Capability::NetEnable));
+	if spec.network == NetworkMode::Enabled {
+		enforced = enforced.difference(CapabilitySet::one(Capability::IpcRestrict));
 	}
 	if spec.degradation == DegradationPolicy::AllowCaveats {
 		if spec.write == WriteMode::Ephemeral {
@@ -59,8 +72,15 @@ pub(crate) fn compile(
 		}
 	}
 
+	let mut temporary_writable = spec.allow_temp.then(temp_roots).unwrap_or_default();
+	if spec.allow_temp {
+		insert_path(&mut temporary_writable, PathBuf::from("/tmp"));
+	}
+	reject_protected_symlinks(spec, &temporary_writable)?;
+
 	let launcher = launcher();
-	let seccomp_helper = (spec.network == NetworkMode::Disabled && spec.unix_sockets.is_empty())
+	let seccomp_helper = (spec.network == NetworkMode::Disabled
+		|| spec.network == NetworkMode::Outbound)
 		.then(|| {
 			env::current_exe().map_err(|source| SandboxError::BackendIo {
 				backend: Backend::Bubblewrap,
@@ -77,7 +97,8 @@ pub(crate) fn compile(
 	// Bubblewrap passes inherited descriptors through to the final exec; it has
 	// no `--preserve-fds` flag. Leaving them open preserves shell-injected high
 	// descriptors such as process-substitution fd 63.
-	if matches!(spec.network, NetworkMode::Enabled | NetworkMode::Outbound) {
+	if spec.network == NetworkMode::Enabled || spec.network == NetworkMode::Outbound && !scoped_proxy
+	{
 		argv.push(OsString::from("--share-net"));
 	}
 
@@ -86,6 +107,12 @@ pub(crate) fn compile(
 	} else {
 		argv.extend([OsString::from("--tmpfs"), OsString::from("/")]);
 		let mut readable = runtime_closure(program);
+		readable.extend(
+			RUNTIME_READ_ROOTS
+				.iter()
+				.map(PathBuf::from)
+				.filter(|path| path.exists()),
+		);
 		if let Some(helper) = &seccomp_helper {
 			readable.extend(runtime_closure(helper));
 		}
@@ -101,10 +128,7 @@ pub(crate) fn compile(
 
 	argv.extend([OsString::from("--proc"), OsString::from("/proc")]);
 	argv.extend([OsString::from("--dev"), OsString::from("/dev")]);
-	let mut temporary_writable = Vec::new();
 	if spec.allow_temp {
-		temporary_writable = temp_roots();
-		insert_path(&mut temporary_writable, PathBuf::from("/tmp"));
 		for root in &temporary_writable {
 			push_bind(&mut argv, "--bind", root);
 		}
@@ -116,6 +140,13 @@ pub(crate) fn compile(
 	}
 	for socket in &spec.unix_sockets {
 		push_bind(&mut argv, "--bind", socket);
+	}
+	if let Some(socket) = &spec.proxy_socket {
+		let parent = socket.parent().ok_or(SandboxError::InvalidMountPath {
+			backend: Backend::Bubblewrap,
+			path:    socket.clone(),
+		})?;
+		push_bind(&mut argv, "--ro-bind", parent);
 	}
 	for path in spec.write_deny.iter().filter(|path| {
 		path_under_any(path, &spec.writable) || path_under_any(path, &temporary_writable)
@@ -133,6 +164,11 @@ pub(crate) fn compile(
 			]);
 		}
 	}
+	// Bind overrides after read-only masks so a one-shot nested exception
+	// supersedes only its own parent carve-out.
+	for path in &spec.write_override {
+		push_bind(&mut argv, "--bind", path);
+	}
 	for path in spec.read_deny.iter().filter(|path| path.exists()) {
 		let placeholder = if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
 			DIRECTORY_MASK_PLACEHOLDER
@@ -145,6 +181,11 @@ pub(crate) fn compile(
 			path.as_os_str().to_owned(),
 		]);
 	}
+	// Bind one-shot read approvals after every deny mask while preserving the
+	// unrestricted base bind when reads are otherwise host-visible.
+	for path in &spec.read_override {
+		push_bind(&mut argv, "--ro-bind", path);
+	}
 	if seccomp_helper.is_some() {
 		push_bind(&mut argv, "--ro-bind", Path::new(super::landlock::BPF_PLACEHOLDER));
 	}
@@ -155,8 +196,15 @@ pub(crate) fn compile(
 			helper.into_os_string(),
 			OsString::from(super::landlock::HIDDEN_CHILD_ARG),
 			OsString::from(super::landlock::BPF_PLACEHOLDER),
-			OsString::from("--"),
 		]);
+		if let (Some(socket), Some(port)) = (&spec.proxy_socket, spec.proxy_port) {
+			argv.extend([
+				OsString::from("--proxy-relay"),
+				socket.as_os_str().to_owned(),
+				OsString::from(port.to_string()),
+			]);
+		}
+		argv.push(OsString::from("--"));
 	}
 	argv.push(program.as_os_str().to_owned());
 	argv.extend(spec.args.iter().cloned());
@@ -164,14 +212,29 @@ pub(crate) fn compile(
 	let mut plan = Plan::new(Backend::Bubblewrap, requested, enforced, argv, true);
 	if spec.network == NetworkMode::Disabled && spec.unix_sockets.is_empty() {
 		plan.add_caveat(Caveat::general(
-			"Bubblewrap seccomp denies all socket creation plus ptrace, process_vm access, and \
-			 io_uring",
+			"Bubblewrap seccomp denies host-reaching socket operations while allowing private Unix \
+			 socketpairs; it also denies ptrace, process_vm access, io_uring, and signals to other \
+			 processes",
 		));
 	}
-	if spec.network == NetworkMode::Outbound {
+	if spec.network == NetworkMode::Outbound && scoped_proxy {
+		plan.add_caveat(Caveat::general(
+			"Bubblewrap keeps scoped egress in a private network namespace; only the loopback relay \
+			 can reach the policy-enforcing Unix-domain broker",
+		));
+	}
+	if spec.network == NetworkMode::Enabled && spec.unix_sockets.is_empty() {
 		plan.add_caveat(Caveat::capability(
-			Capability::NetOutbound,
-			"Bubblewrap permits outbound networking, but inbound listeners are not blocked",
+			Capability::IpcRestrict,
+			"Bubblewrap shares the host network namespace, so abstract Unix sockets are not \
+			 restricted",
+		));
+	}
+	if !spec.unix_sockets.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::IpcRestrict,
+			"Bubblewrap relaxes Unix-domain socket filtering for explicit socket grants, so host \
+			 local IPC is not fully restricted",
 		));
 	}
 	if spec.degradation == DegradationPolicy::AllowCaveats {
@@ -308,4 +371,123 @@ fn push_bind(argv: &mut Vec<OsString>, option: &str, path: &Path) {
 	argv.push(OsString::from(option));
 	argv.push(path.as_os_str().to_owned());
 	argv.push(path.as_os_str().to_owned());
+}
+
+fn reject_protected_symlinks(
+	spec: &SandboxSpec,
+	temporary_writable: &[PathBuf],
+) -> Result<(), SandboxError> {
+	for path in spec.write_deny.iter().filter(|path| {
+		path_under_any(path, &spec.writable) || path_under_any(path, temporary_writable)
+	}) {
+		for writable_root in spec
+			.writable
+			.iter()
+			.chain(temporary_writable.iter())
+			.filter(|root| path.starts_with(root))
+		{
+			reject_protected_symlink(writable_root, path)?;
+		}
+	}
+	Ok(())
+}
+
+fn reject_protected_symlink(
+	writable_root: &Path,
+	protected_path: &Path,
+) -> Result<(), SandboxError> {
+	let relative = protected_path
+		.strip_prefix(writable_root)
+		.expect("write-deny path was filtered beneath writable root");
+	let mut component_path = writable_root.to_path_buf();
+	for component in relative.components() {
+		component_path.push(component);
+		match fs::symlink_metadata(&component_path) {
+			Ok(metadata) if metadata.file_type().is_symlink() => {
+				return Err(SandboxError::ProtectedWriteDenySymlink {
+					writable_root: writable_root.to_path_buf(),
+					path:          protected_path.to_path_buf(),
+					symlink:       component_path,
+				});
+			},
+			Ok(_) => {},
+			Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(source) => {
+				return Err(SandboxError::BackendPath {
+					backend: Backend::Bubblewrap,
+					operation: SandboxOperation::Compile,
+					path: component_path,
+					source,
+				});
+			},
+		}
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn outbound_proxy_uses_private_netns_and_hidden_relay() {
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec.set_network(NetworkMode::Outbound);
+		spec
+			.set_proxy_endpoint(18443, Some(Path::new("/tmp/omp-broker.sock")))
+			.expect("proxy endpoint");
+		let requested = spec.requested_capabilities();
+		let plan = compile(&spec, Path::new("/bin/true"), requested, requested).expect("relay plan");
+		let argv = plan
+			.argv()
+			.iter()
+			.map(|value| value.to_string_lossy())
+			.collect::<Vec<_>>();
+		assert!(!argv.iter().any(|value| value == "--share-net"));
+		assert!(argv.windows(4).any(|window| {
+			window[0] == "--proxy-relay"
+				&& window[1] == "/tmp/omp-broker.sock"
+				&& window[2] == "18443"
+				&& window[3] == "--"
+		}));
+	}
+
+	#[test]
+	fn partial_proxy_endpoint_is_rejected() {
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec.set_network(NetworkMode::Outbound);
+		spec.set_proxy_endpoint(18443, None).expect("proxy port");
+		let requested = spec.requested_capabilities();
+		assert!(matches!(
+			compile(&spec, Path::new("/bin/true"), requested, requested),
+			Err(SandboxError::EnforcementUnavailable {
+				authority: "complete scoped proxy endpoint",
+				..
+			})
+		));
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn external_target_carve_out_symlink_rejects_kernel_plan() {
+		use std::os::unix::fs::symlink;
+
+		let workspace = tempfile::tempdir().expect("workspace");
+		let external = tempfile::tempdir().expect("external");
+		symlink(external.path(), workspace.path().join(".git")).expect("carve-out symlink");
+
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec.set_write(WriteMode::Scoped);
+		spec
+			.allow_write(workspace.path())
+			.expect("writable workspace");
+		spec
+			.deny_write_lexical(workspace.path().join(".git"))
+			.expect("protected carve-out");
+		let requested = spec.requested_capabilities();
+		assert!(matches!(
+			compile(&spec, Path::new("/bin/true"), requested, requested),
+			Err(SandboxError::ProtectedWriteDenySymlink { .. })
+		));
+	}
 }

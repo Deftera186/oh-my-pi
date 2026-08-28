@@ -1043,6 +1043,14 @@ const IN_BAND_RESIZE_MODE: u8 = 2;
 #[cfg(any(windows, test))]
 const UTF8_CODEPAGE: u32 = 65001;
 
+/// Maximum byte count passed to one Unix terminal write.
+///
+/// Terminal.app can stop draining after one multi-hundred-KiB PTY write;
+/// bounded syscalls let the emulator consume a large history replay
+/// incrementally.
+#[cfg(unix)]
+const MAX_TTY_WRITE_CHUNK_BYTES: usize = 16 * 1024;
+
 #[cfg(any(windows, test))]
 trait ConsoleCodepage {
 	fn output_codepage(&mut self) -> u32;
@@ -1074,8 +1082,29 @@ impl ConsoleCodepage for SystemConsoleCodepage {
 	}
 }
 
+/// Writes a fully materialized terminal payload, bounding individual Unix
+/// writes so terminal emulators can drain large frames incrementally.
+#[cfg(unix)]
 pub fn terminal_write_all<W: io::Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
-	#[cfg(windows)]
+	let mut offset = 0;
+	while offset < bytes.len() {
+		let end = offset
+			.saturating_add(MAX_TTY_WRITE_CHUNK_BYTES)
+			.min(bytes.len());
+		match writer.write(&bytes[offset..end]) {
+			Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+			Ok(written) => offset += written,
+			Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+			Err(error) => return Err(error),
+		}
+	}
+	Ok(())
+}
+
+/// Writes a fully materialized terminal payload after restoring the Windows
+/// console's UTF-8 output codepage.
+#[cfg(windows)]
+pub fn terminal_write_all<W: io::Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
 	ensure_console_utf8(&mut SystemConsoleCodepage);
 	writer.write_all(bytes)
 }
@@ -2409,6 +2438,7 @@ mod tests {
 	use std::{
 		env,
 		fs::{self, File, OpenOptions},
+		io,
 		mem::MaybeUninit,
 		os::fd::AsRawFd as _,
 		process::{self, Command, Output},
@@ -2431,14 +2461,14 @@ mod tests {
 	use super::{
 		ACTIVE, ALT_SCREEN_ACTIVE, ANSI_INSERT_MODE, ANSI_NEWLINE_MODE,
 		APPEARANCE_NOTIFICATIONS_MODE, AltScreenUse, ConsoleCodepage, CursorStyle,
-		IN_BAND_RESIZE_MODE, INPUT_REPORTS_OFF, KeyboardMode, MOUSE_TRACKING_ON, OSC11_QUERY,
-		Progress, RESIZE_GENERATION, ResizeWatch, TITLE_POP, TITLE_PUSH, Terminal, UTF8_CODEPAGE,
-		XTERM_SCROLL_ON_KEY_PRESS, XTERM_SCROLL_ON_OUTPUT, ansi_mode_restore_modes,
-		ansi_mode_restore_payload, base64, compose_enter, compose_input_reports_off, compose_leave,
-		compose_progress, compose_title, emergency_restore_payload, ensure_console_utf8,
-		ensure_restore_hooks, keyboard_mode, notification_modes_off_payload,
-		owned_notification_modes, platform, progress_state, reconcile_in_band_geometry,
-		rounded_cell_pixels,
+		IN_BAND_RESIZE_MODE, INPUT_REPORTS_OFF, KeyboardMode, MAX_TTY_WRITE_CHUNK_BYTES,
+		MOUSE_TRACKING_ON, OSC11_QUERY, Progress, RESIZE_GENERATION, ResizeWatch, TITLE_POP,
+		TITLE_PUSH, Terminal, UTF8_CODEPAGE, XTERM_SCROLL_ON_KEY_PRESS, XTERM_SCROLL_ON_OUTPUT,
+		ansi_mode_restore_modes, ansi_mode_restore_payload, base64, compose_enter,
+		compose_input_reports_off, compose_leave, compose_progress, compose_title,
+		emergency_restore_payload, ensure_console_utf8, ensure_restore_hooks, keyboard_mode,
+		notification_modes_off_payload, owned_notification_modes, platform, progress_state,
+		reconcile_in_band_geometry, rounded_cell_pixels, terminal_write_all,
 	};
 	use crate::{
 		Appearance, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
@@ -2547,6 +2577,33 @@ mod tests {
 		assert_eq!(legacy.sets, [UTF8_CODEPAGE]);
 		ensure_console_utf8(&mut legacy);
 		assert_eq!(legacy.sets, [UTF8_CODEPAGE]);
+	}
+
+	#[derive(Default)]
+	struct RecordingWriter {
+		requested: Vec<usize>,
+		output:    Vec<u8>,
+	}
+
+	impl io::Write for RecordingWriter {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.requested.push(bytes.len());
+			self.output.extend_from_slice(bytes);
+			Ok(bytes.len())
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn large_terminal_payload_is_split_into_bounded_unix_writes() {
+		let payload = vec![b'x'; MAX_TTY_WRITE_CHUNK_BYTES * 2 + 7];
+		let mut writer = RecordingWriter::default();
+		terminal_write_all(&mut writer, &payload).unwrap();
+		assert_eq!(writer.requested, [MAX_TTY_WRITE_CHUNK_BYTES, MAX_TTY_WRITE_CHUNK_BYTES, 7]);
+		assert_eq!(writer.output, payload);
 	}
 
 	#[test]

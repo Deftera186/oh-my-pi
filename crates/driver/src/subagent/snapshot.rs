@@ -212,6 +212,9 @@ pub fn resolve_effort(
 }
 
 fn tool_allowed(name: &str, options: &ChildSnapshotOptions<'_>) -> bool {
+	if options.definition.tools_declared && options.definition.tools.is_empty() {
+		return name == "hub";
+	}
 	if options.plan_mode {
 		return matches!(name, "read" | "grep" | "glob" | "web_search")
 			|| (name == "ast_grep"
@@ -234,7 +237,7 @@ fn tool_allowed(name: &str, options: &ChildSnapshotOptions<'_>) -> bool {
 		return false;
 	}
 	let declared = &options.definition.tools;
-	declared.is_empty()
+	!options.definition.tools_declared
 		|| name == "hub"
 		|| declared.iter().any(|tool| tool.as_str() == name)
 		|| (declared.iter().any(|tool| tool.as_str() == "exec") && matches!(name, "bash" | "eval"))
@@ -348,6 +351,10 @@ mod tests {
 			enable_lsp:        false,
 			prewalk_gate:      false,
 		});
+		assert!(
+			Arc::ptr_eq(&child.registry, &parent.registry),
+			"children reuse the parent session's prepared extension/tool registry"
+		);
 		assert!(child.enabled_tools.iter().any(|name| name == "yield"));
 		let tool = child
 			.turn
@@ -360,5 +367,46 @@ mod tests {
 			panic!("yield rides a JSON schema declaration");
 		};
 		assert_eq!(schema.strict, Some(false), "yield must never request strict sampling");
+	}
+
+	#[test]
+	fn explicitly_empty_toolset_inherits_no_default_tools() {
+		let mut registry = Registry::new();
+		registry
+			.register(omp_tools::yield_tool::tool(), Presentation::Hidden, Claims {
+				precedence: Precedence::CORE,
+				claimant:   sf!("omp/core"),
+				replaces:   None,
+			})
+			.expect("register hidden yield");
+		let mut parent = AgentSnapshot::default();
+		parent.registry = Arc::new(registry);
+		parent.enabled_tools =
+			Arc::from([Str::new_static("read"), Str::new_static("bash"), Str::new_static("hub")]);
+		let definition = AgentDefinition::parse_markdown(
+			"quiet",
+			"---\ndescription: no default tools\ntools: []\n---\nbody",
+		)
+		.expect("definition");
+		let settings = TaskSettings::default();
+
+		let child = child_snapshot(&parent, ChildSnapshotOptions {
+			definition:        &definition,
+			settings:          &settings,
+			cwd:               Path::new("/"),
+			selected_model:    None,
+			inference_role:    None,
+			inherited_pattern: None,
+			caller_effort:     None,
+			model_ceiling:     None,
+			plan_mode:         false,
+			enable_lsp:        false,
+			prewalk_gate:      false,
+		});
+
+		assert_eq!(
+			child.enabled_tools.as_ref(),
+			&[Str::new_static("hub"), Str::new_static("yield"),]
+		);
 	}
 }

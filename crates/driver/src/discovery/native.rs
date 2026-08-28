@@ -195,13 +195,41 @@ pub fn scan_capability_dir(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Explicit native-root composition policy.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum NativeRootMode {
 	/// Explicit roots precede normally discovered project/user roots.
 	#[default]
 	Merge,
 	/// Only explicit roots participate.
 	ExplicitOnly,
+}
+
+/// Provenance of the effective configured extension-root lane.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ConfiguredRootLevel {
+	/// The effective configured roots came from user/profile settings.
+	#[default]
+	User,
+	/// The effective configured roots came from project settings.
+	Project,
+}
+
+/// Complete extension-root policy materialized for one discovery call.
+///
+/// The configured lane remains separate from explicit invocation roots so
+/// [`NativeRootMode::ExplicitOnly`] can drop it without flattening away its
+/// provenance. Callers must materialize this value for each discovery pass;
+/// storing it would make settings reloads observe a stale root snapshot.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct EffectiveExtensionRoots {
+	/// Ordered invocation-local roots, always admitted.
+	pub explicit:         Vec<PathBuf>,
+	/// Whether configured roots participate.
+	pub mode:             NativeRootMode,
+	/// Ordered settings-owned roots.
+	pub configured:       Vec<PathBuf>,
+	/// Settings authority which produced the configured lane.
+	pub configured_level: ConfiguredRootLevel,
 }
 
 /// Native static capability discovery options.
@@ -239,6 +267,47 @@ impl Default for NativeDiscoveryOptions {
 	}
 }
 
+/// Materializes the effective extension roots from current filesystem settings.
+///
+/// This function intentionally performs discovery on every call. In particular,
+/// it never retains the configured lane inside [`NativeDiscoveryOptions`], so
+/// roots created or removed after session startup are visible to reloads.
+pub fn effective_extension_roots(
+	cwd: &Path,
+	home: &Path,
+	max_depth: usize,
+	options: &NativeDiscoveryOptions,
+) -> EffectiveExtensionRoots {
+	let discovered = discover_roots(cwd, home, max_depth);
+	effective_extension_roots_from_discovered(discovered, options).0
+}
+
+fn effective_extension_roots_from_discovered(
+	discovered: NativeRoots,
+	options: &NativeDiscoveryOptions,
+) -> (EffectiveExtensionRoots, Vec<PathBuf>) {
+	let NativeRoots { user, project, agents } = discovered;
+	let configured_level = if options.include_workspace && !project.is_empty() {
+		ConfiguredRootLevel::Project
+	} else {
+		ConfiguredRootLevel::User
+	};
+	let mut configured = Vec::new();
+	if options.include_workspace {
+		configured.extend(project);
+	}
+	configured.push(user);
+	(
+		EffectiveExtensionRoots {
+			explicit: options.explicit_roots.clone(),
+			mode: options.root_mode,
+			configured,
+			configured_level,
+		},
+		agents,
+	)
+}
+
 /// Complete native static provider output.
 #[derive(Clone, Debug, Default)]
 pub struct NativeDiscovery {
@@ -268,22 +337,69 @@ pub fn discover_capabilities(
 	options: &NativeDiscoveryOptions,
 ) -> NativeDiscovery {
 	let discovered = discover_roots(cwd, home, max_depth);
-	let standalone_agents = discovered.agents.clone();
-	let mut roots = options
-		.explicit_roots
+	let (extension_roots, standalone_agents) =
+		effective_extension_roots_from_discovered(discovered, options);
+	discover_capabilities_with_materialized_roots(
+		cwd,
+		home,
+		max_depth,
+		options,
+		&extension_roots,
+		standalone_agents,
+	)
+}
+
+/// Discovers capabilities with a caller-materialized session root policy.
+///
+/// Session owners use this seam for reloads and child discovery so explicit
+/// roots, configured roots, mode, and provenance travel together.
+pub fn discover_capabilities_with_roots(
+	cwd: &Path,
+	home: &Path,
+	max_depth: usize,
+	options: &NativeDiscoveryOptions,
+	extension_roots: &EffectiveExtensionRoots,
+) -> NativeDiscovery {
+	let standalone_agents = (extension_roots.mode == NativeRootMode::Merge
+		&& options.include_workspace)
+		.then(|| discover_roots(cwd, home, max_depth).agents)
+		.unwrap_or_default();
+	discover_capabilities_with_materialized_roots(
+		cwd,
+		home,
+		max_depth,
+		options,
+		extension_roots,
+		standalone_agents,
+	)
+}
+
+fn discover_capabilities_with_materialized_roots(
+	cwd: &Path,
+	home: &Path,
+	max_depth: usize,
+	options: &NativeDiscoveryOptions,
+	extension_roots: &EffectiveExtensionRoots,
+	standalone_agents: Vec<PathBuf>,
+) -> NativeDiscovery {
+	let user_root = user_config_root(home);
+	let mut roots = extension_roots
+		.explicit
 		.iter()
 		.map(|path| (path.clone(), SourceScope::Native))
 		.collect::<Vec<_>>();
-	if options.root_mode == NativeRootMode::Merge {
-		if options.include_workspace {
-			roots.extend(
-				discovered
-					.project
-					.into_iter()
-					.map(|path| (path, SourceScope::Project)),
-			);
-		}
-		roots.push((discovered.user, SourceScope::User));
+	if extension_roots.mode == NativeRootMode::Merge {
+		roots.extend(extension_roots.configured.iter().map(|path| {
+			let scope = if path == &user_root {
+				SourceScope::User
+			} else {
+				match extension_roots.configured_level {
+					ConfiguredRootLevel::User => SourceScope::User,
+					ConfiguredRootLevel::Project => SourceScope::Project,
+				}
+			};
+			(path.clone(), scope)
+		}));
 	}
 	let mut seen = BTreeSet::new();
 	roots.retain_mut(|(path, _)| {
@@ -309,7 +425,8 @@ pub fn discover_capabilities(
 		.iter()
 		.map(|(root, _)| root.join("installed.toml"))
 		.collect::<Vec<_>>();
-	if let Some(installed) = &options.client_installed
+	if extension_roots.mode == NativeRootMode::Merge
+		&& let Some(installed) = &options.client_installed
 		&& !install_records.contains(installed)
 	{
 		install_records.push(installed.clone());
@@ -317,7 +434,7 @@ pub fn discover_capabilities(
 	for (root, scope) in roots {
 		load_root(&root, scope, &root_skill_settings, None, None, &mut output);
 	}
-	let mut extension_roots = BTreeSet::new();
+	let mut loaded_extension_roots = BTreeSet::new();
 	for installed_path in install_records {
 		let installed = match InstalledRecord::read(&installed_path) {
 			Ok(installed) => installed,
@@ -338,7 +455,7 @@ pub fn discover_capabilities(
 		let packages = packages::discover(&installed, &[], ExtensionRootMode::Merge);
 		output.warnings.extend(packages.warnings);
 		for extension in packages.roots {
-			if extension_roots.insert(extension.path.clone()) {
+			if loaded_extension_roots.insert(extension.path.clone()) {
 				let grant = lock
 					.as_ref()
 					.and_then(|lock| {
@@ -403,7 +520,7 @@ pub fn discover_capabilities(
 	}
 	for path in standalone_agents
 		.into_iter()
-		.filter(|_| options.root_mode == NativeRootMode::Merge && options.include_workspace)
+		.filter(|_| extension_roots.mode == NativeRootMode::Merge && options.include_workspace)
 	{
 		let Ok(content) = fs::read_to_string(&path) else {
 			continue;
@@ -422,7 +539,7 @@ pub fn discover_capabilities(
 			SourceProvenance::native("native-project-context", path, SourceScope::Project),
 		));
 	}
-	if options.root_mode == NativeRootMode::Merge && options.include_workspace {
+	if extension_roots.mode == NativeRootMode::Merge && options.include_workspace {
 		let mut current = cwd;
 		for _ in 0..=max_depth {
 			load_standalone(current, &mut output);
@@ -853,6 +970,12 @@ struct ToolHeader {
 	input_schema: Option<serde_json::Value>,
 }
 
+/// Package/runtime manifest filenames that may sit beside script tools but
+/// never declare one.
+pub(crate) fn is_package_manifest(filename: &str) -> bool {
+	matches!(filename, "package.json" | "tsconfig.json" | "jsconfig.json" | "deno.json")
+}
+
 fn script_tool_header(path: &Path) -> ToolHeader {
 	const HEADER_BYTES: u64 = 4096;
 	let mut source = String::new();
@@ -888,6 +1011,15 @@ fn script_tool_header(path: &Path) -> ToolHeader {
 
 fn load_tools(root: &Path, source_id: Str, scope: SourceScope, output: &mut NativeDiscovery) {
 	for path in scan_capability_dir(&root.join("tools")) {
+		// A tools directory may be a Bun/TS package for its own scripts;
+		// runtime manifests are not tool declarations.
+		if path
+			.file_name()
+			.and_then(|name| name.to_str())
+			.is_some_and(is_package_manifest)
+		{
+			continue;
+		}
 		let extension = path
 			.extension()
 			.and_then(|ext| ext.to_str())
@@ -947,12 +1079,24 @@ fn load_tools(root: &Path, source_id: Str, scope: SourceScope, output: &mut Nati
 }
 
 fn load_settings(root: &Path, source_id: Str, scope: SourceScope, output: &mut NativeDiscovery) {
-	for filename in ["settings.toml", "config.toml"] {
-		let path = root.join(filename);
-		let Some(table) = fs::read_to_string(&path)
-			.ok()
-			.and_then(|source| toml::from_str::<toml::Table>(&source).ok())
-		else {
+	let yaml = ["config.yml", "config.yaml"]
+		.into_iter()
+		.map(|filename| root.join(filename))
+		.find(|path| path.is_file());
+	let paths = yaml.into_iter().chain(
+		["settings.toml", "config.toml"]
+			.into_iter()
+			.map(|filename| root.join(filename)),
+	);
+	for path in paths {
+		let Some(source) = fs::read_to_string(&path).ok() else {
+			continue;
+		};
+		let table = match path.extension().and_then(|extension| extension.to_str()) {
+			Some("yml" | "yaml") => serde_yaml::from_str::<toml::Table>(&source).ok(),
+			_ => toml::from_str::<toml::Table>(&source).ok(),
+		};
+		let Some(table) = table else {
 			continue;
 		};
 		output.declarations.push(DiscoveredCapability::unkeyed(
@@ -1166,6 +1310,105 @@ mod tests {
 		assert_eq!(roots.project, vec![cwd.join(".omp")]);
 		assert_eq!(roots.agents, vec![root.join("a/AGENTS.md")]);
 	}
+
+	#[test]
+	fn explicit_only_drops_a_nonempty_configured_lane() {
+		let tree = tempfile::tempdir().expect("tree");
+		let explicit = tree.path().join("explicit");
+		let configured = tree.path().join("configured");
+		fs::create_dir_all(&explicit).expect("explicit root");
+		fs::create_dir_all(&configured).expect("configured root");
+		fs::write(explicit.join("settings.toml"), "marker = \"explicit\"\n").expect("explicit");
+		fs::write(configured.join("settings.toml"), "marker = \"configured\"\n").expect("configured");
+		let options = NativeDiscoveryOptions::default();
+		let roots = EffectiveExtensionRoots {
+			explicit:         vec![explicit.clone()],
+			mode:             NativeRootMode::ExplicitOnly,
+			configured:       vec![configured],
+			configured_level: ConfiguredRootLevel::Project,
+		};
+
+		let discovered =
+			discover_capabilities_with_roots(tree.path(), tree.path(), 0, &options, &roots);
+		let settings = discovered.declarations.iter().filter_map(|declaration| {
+			let CapabilityPayload::Settings(settings) = &declaration.payload else {
+				return None;
+			};
+			Some(settings.path.clone())
+		});
+
+		assert_eq!(settings.collect::<Vec<_>>(), vec![explicit.join("settings.toml")]);
+	}
+
+	#[test]
+	fn subagent_discovery_uses_the_owning_session_extension_policy() {
+		let tree = tempfile::tempdir().expect("tree");
+		let explicit = tree.path().join("explicit");
+		let configured = tree.path().join("configured");
+		fs::create_dir_all(explicit.join("agents")).expect("explicit agents");
+		fs::create_dir_all(configured.join("agents")).expect("configured agents");
+		fs::write(
+			explicit.join("agents/explicit.md"),
+			"---\ndescription: explicit child\n---\nUse the explicit extension.",
+		)
+		.expect("explicit agent");
+		fs::write(
+			configured.join("agents/configured.md"),
+			"---\ndescription: configured child\n---\nUse configured settings.",
+		)
+		.expect("configured agent");
+		let roots = EffectiveExtensionRoots {
+			explicit:         vec![explicit],
+			mode:             NativeRootMode::ExplicitOnly,
+			configured:       vec![configured],
+			configured_level: ConfiguredRootLevel::Project,
+		};
+
+		let parent_discovery = discover_capabilities_with_roots(
+			tree.path(),
+			tree.path(),
+			0,
+			&NativeDiscoveryOptions::default(),
+			&roots,
+		);
+		let child_names = parent_discovery
+			.declarations
+			.iter()
+			.filter_map(|declaration| {
+				let CapabilityPayload::Agents(agent) = &declaration.payload else {
+					return None;
+				};
+				Some(agent.name.as_str())
+			});
+
+		assert_eq!(child_names.collect::<Vec<_>>(), ["explicit"]);
+	}
+
+	#[test]
+	fn reload_materializes_configured_roots_again() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let cwd = tree.path().join("repo");
+		fs::create_dir_all(&cwd).expect("cwd");
+		let options = NativeDiscoveryOptions::default();
+		let before = discover_capabilities(&cwd, &home, 4, &options);
+		assert!(!before.declarations.iter().any(|declaration| {
+			matches!(&declaration.payload, CapabilityPayload::Settings(settings)
+				if settings.path.ends_with("config.yml"))
+		}));
+
+		fs::create_dir_all(cwd.join(".omp")).expect("configured root");
+		fs::write(cwd.join(".omp/config.yml"), "extensions:\n  enabled: [demo]\n")
+			.expect("yaml config");
+		let after = discover_capabilities(&cwd, &home, 4, &options);
+
+		assert!(after.declarations.iter().any(|declaration| {
+			matches!(&declaration.payload, CapabilityPayload::Settings(settings)
+				if settings.path == cwd.join(".omp/config.yml")
+					&& settings.data.contains_key("extensions"))
+		}));
+	}
+
 	#[test]
 	fn scan_respects_gitignore_and_is_non_recursive() {
 		let tree = tempfile::tempdir().expect("tree");

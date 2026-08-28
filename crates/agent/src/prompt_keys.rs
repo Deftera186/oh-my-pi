@@ -103,6 +103,10 @@ pub const IRC_ENABLED: &str = "irc_enabled";
 pub const ROSTER_GENERATION: &str = "roster_generation";
 /// Visible IRC peer maps.
 pub const PEERS: &str = "peers";
+/// Current-root parked peer count omitted from the initial prompt.
+pub const PARKED_COUNT: &str = "parked_count";
+/// Live peer count dropped by the initial prompt bound.
+pub const OMITTED_COUNT: &str = "omitted_count";
 /// Model-family capability map.
 pub const CAPS: &str = "caps";
 /// Read-only plan-mode flag.
@@ -294,6 +298,8 @@ pub const ALL: &[&str] = &[
 	IRC_ENABLED,
 	ROSTER_GENERATION,
 	PEERS,
+	PARKED_COUNT,
+	OMITTED_COUNT,
 	CAPS,
 	PLAN_MODE,
 	EAGER,

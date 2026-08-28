@@ -43,7 +43,7 @@ use omp_tool::{
 };
 use omp_tools::edit::{self, FormatPolicy};
 use serde::Deserialize;
-use tokio::{sync::Barrier, task, time};
+use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -500,7 +500,8 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 		.iter()
 		.filter(|record| record.kind == "format_done")
 		.count();
-	let barrier = Arc::new(Barrier::new(STORM_COUNT + 1));
+	let format_start = Gate::default();
+	let storm_start = Gate::default();
 	let reader_gate = Gate::default();
 	let first_reads = Arc::new(AtomicUsize::new(0));
 	let mut reader_tasks = Vec::new();
@@ -533,12 +534,16 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 		} else {
 			host_b.clone()
 		};
-		let barrier = Arc::clone(&barrier);
+		let start_gate = if index == 0 {
+			format_start.clone()
+		} else {
+			storm_start.clone()
+		};
 		let start = index * 8;
 		let end = start + 7;
 		let replacement = Bytes::from(format!("new-{index:03}"));
 		commits.push(tokio::spawn(async move {
-			barrier.wait().await;
+			start_gate.arrive_and_wait(TEST_TIMEOUT).await?;
 			let mut lease = lease;
 			let response = host
 				.commit(
@@ -603,9 +608,12 @@ async fn storm(scratch: &Scratch, docserver: &DocServerTask, lsp_log: &Path) -> 
 			}
 		}));
 	}
-	barrier.wait().await;
-	wait_lsp_kind(lsp_log, "", "format", format_count + 1).await?;
+	format_start.wait_arrived(TEST_TIMEOUT).await?;
+	storm_start.wait_arrived(TEST_TIMEOUT).await?;
 	reader_gate.wait_arrived(TEST_TIMEOUT).await?;
+	format_start.release();
+	wait_lsp_kind(lsp_log, "", "format", format_count + 1).await?;
+	storm_start.release();
 	reader_gate.release();
 	within("pinned readers during formatter", TEST_TIMEOUT, async {
 		while first_reads.load(Ordering::Acquire) < PINNED_READERS {

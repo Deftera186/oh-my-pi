@@ -890,6 +890,7 @@ facets = ["chat"]
 transport = "bedrock-converse"
 base_url = "https://bedrock-runtime.{region}.amazonaws.com"
 auth = { type = "aws-sig-v4" }
+oauth_auth = { type = "bearer", env = ["OMP_AWS_BEARER_TOKEN_BEDROCK"] }
 discovery = { kind = "specialized", label = "Amazon Bedrock", authoritative = false }
 facets = ["chat"]
 compat = { "multiple_system_messages" = false, "max_tokens_field" = "max_tokens", "tool_strict_mode" = "none", "reasoning_wire_format" = "anthropic", "cache_control_format" = "anthropic", "image_encoding_format" = "anthropic_source", "tool_schema_flavor" = "anthropic", "stream_protocol" = "sse_events" }

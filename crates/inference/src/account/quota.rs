@@ -21,6 +21,17 @@ impl QuotaWindowId {
 	pub fn as_str(&self) -> &str {
 		self.0.as_str()
 	}
+
+	/// Returns the structured meter scope carried by a provider window id.
+	///
+	/// Scoped provider windows use `provider:scope:window`; historical
+	/// two-segment ids have no scope and remain shared for block compatibility.
+	pub fn scope(&self) -> Option<&str> {
+		let mut parts = self.as_str().split(':');
+		let _provider = parts.next()?;
+		let scope = parts.next()?;
+		parts.next().is_some().then_some(scope)
+	}
 }
 
 #[allow(
@@ -200,8 +211,19 @@ impl QuotaState {
 	/// Computes aggregate availability; the latest active reset wins
 	/// deterministically.
 	pub fn availability(&self, now: SystemTime) -> QuotaAvailability {
+		self.availability_scoped(now, None)
+	}
+
+	/// Computes availability for one request meter.
+	///
+	/// Unscoped historical windows remain binding for every meter so blocks
+	/// restored from older snapshots retain their provider-wide meaning.
+	pub fn availability_scoped(&self, now: SystemTime, scope: Option<&str>) -> QuotaAvailability {
 		let mut reset_at = None;
-		for window in self.windows.values() {
+		for (id, window) in &self.windows {
+			if scope.is_some_and(|scope| id.scope().is_some_and(|window| window != scope)) {
+				continue;
+			}
 			match window.availability(now) {
 				QuotaAvailability::Available => {},
 				QuotaAvailability::Exhausted { reset_at: candidate } => {
@@ -223,10 +245,40 @@ impl QuotaState {
 	/// A sample observed before an elapsed reset belongs to the previous quota
 	/// window and is unknown.
 	pub fn minimum_remaining(&self, now: SystemTime) -> Option<u64> {
+		self.minimum_remaining_scoped(now, None)
+	}
+
+	/// Returns the smallest current remainder in one request meter.
+	///
+	/// A meter-specific report takes precedence over historical shared windows.
+	/// A secondary-only scoped report is incomplete and therefore returns no
+	/// ranking value instead of receiving an uncapped priority boost.
+	pub fn minimum_remaining_scoped(&self, now: SystemTime, scope: Option<&str>) -> Option<u64> {
+		let has_scoped =
+			scope.is_some_and(|scope| self.windows.keys().any(|id| id.scope() == Some(scope)));
+		if has_scoped && scope.is_some() {
+			let mut primary = false;
+			let mut secondary = false;
+			for id in self.windows.keys().filter(|id| id.scope() == scope) {
+				primary |= id.as_str().ends_with(":primary");
+				secondary |= id.as_str().ends_with(":secondary");
+			}
+			if secondary && !primary {
+				return None;
+			}
+		}
 		self
 			.windows
-			.values()
-			.filter_map(|window| {
+			.iter()
+			.filter(|(id, _)| {
+				scope.is_none()
+					|| if has_scoped {
+						id.scope() == scope
+					} else {
+						id.scope().is_none()
+					}
+			})
+			.filter_map(|(_, window)| {
 				let remaining = window.remaining?;
 				if window
 					.reset_at
@@ -243,8 +295,21 @@ impl QuotaState {
 	/// Reports whether any current known remaining/limit pair is below the
 	/// configured percentage. Unknown or reset-stale pairs do not fail closed.
 	pub fn below_remaining_percent(&self, now: SystemTime, percent: u8) -> bool {
+		self.below_remaining_percent_scoped(now, percent, None)
+	}
+
+	/// Reports whether one request meter is below the configured percentage.
+	pub fn below_remaining_percent_scoped(
+		&self,
+		now: SystemTime,
+		percent: u8,
+		scope: Option<&str>,
+	) -> bool {
 		let percent = u128::from(percent.min(100));
-		self.windows.values().any(|window| {
+		self.windows.iter().any(|(id, window)| {
+			if scope.is_some_and(|scope| id.scope().is_some_and(|window| window != scope)) {
+				return false;
+			}
 			let (Some(remaining), Some(limit)) = (window.remaining, window.limit) else {
 				return false;
 			};
@@ -283,5 +348,51 @@ mod tests {
 		assert!(quota.below_remaining_percent(now, 10));
 		assert!(!quota.below_remaining_percent(now, 9));
 		assert!(!quota.below_remaining_percent(now + std::time::Duration::from_secs(61), 10));
+	}
+	#[test]
+	fn scoped_spark_ranking_does_not_boost_a_secondary_only_report() {
+		let now = SystemTime::UNIX_EPOCH + time::Duration::from_secs(100);
+		let observation = |window: &'static str, remaining| QuotaObservation {
+			window:      QuotaWindowId::new(window),
+			consumed:    Some(100 - remaining),
+			remaining:   Some(remaining),
+			limit:       Some(100),
+			reset_at:    Some(now + time::Duration::from_secs(300)),
+			exhausted:   Some(false),
+			provenance:  QuotaProvenance::Provider,
+			observed_at: now,
+		};
+		let mut quota = QuotaState::default();
+		quota.apply(observation("openai-codex:secondary", 80));
+		quota.apply(observation("openai-codex:spark:secondary", 90));
+
+		let incomplete = quota.minimum_remaining_scoped(now, Some("spark"));
+		assert_eq!(
+			incomplete,
+			None,
+			"secondary-only Spark ranking value={incomplete:?}, windows={:?}",
+			quota
+				.windows()
+				.map(|(id, _)| id.as_str())
+				.collect::<Vec<_>>()
+		);
+		let chat = quota.minimum_remaining_scoped(now, Some("chat"));
+		assert_eq!(chat, Some(80), "legacy chat ranking value={chat:?}");
+
+		quota.apply(observation("openai-codex:spark:primary", 20));
+		let complete = quota.minimum_remaining_scoped(now, Some("spark"));
+		assert_eq!(complete, Some(20), "complete Spark ranking value={complete:?}");
+		let mut legacy = QuotaState::default();
+		legacy.record_429(
+			QuotaWindowId::new("openai-codex:primary"),
+			Some(now + time::Duration::from_secs(60)),
+			now,
+		);
+		let availability = legacy.availability_scoped(now, Some("spark"));
+		assert_eq!(
+			availability,
+			QuotaAvailability::Exhausted { reset_at: now + time::Duration::from_secs(60) },
+			"legacy shared availability={availability:?}"
+		);
 	}
 }

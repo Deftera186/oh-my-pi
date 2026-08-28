@@ -47,7 +47,33 @@ pub const DIRECT_PATH: &str = "/v1/messages";
 /// Claude Code inference endpoint.
 const CLAUDE_CODE_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// User-Agent emitted by Cowork's Claude desktop inference entrypoint.
-const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.220 (external, claude-desktop)";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.246 (external, claude-desktop)";
+/// `@anthropic-ai/sdk` version bundled by the matching Cowork release.
+const CLAUDE_CODE_SDK_VERSION: &str = "0.112.1";
+/// Ordered Cowork agent betas sent on every subscription-OAuth request.
+const CLAUDE_CODE_AGENT_BETAS: &[&str] = &[
+	"claude-code-20250219",
+	CLAUDE_CODE_OAUTH_BETA,
+	"interleaved-thinking-2025-05-14",
+	"thinking-token-count-2026-05-13",
+	"context-management-2025-06-27",
+	"prompt-caching-scope-2026-01-05",
+	"mid-conversation-system-2026-04-07",
+	"advanced-tool-use-2025-11-20",
+];
+/// Ordered Cowork utility betas for requests without tools or thinking.
+const CLAUDE_CODE_UTILITY_BETAS: &[&str] = &[
+	CLAUDE_CODE_OAUTH_BETA,
+	"interleaved-thinking-2025-05-14",
+	"thinking-token-count-2026-05-13",
+	"context-management-2025-06-27",
+	"prompt-caching-scope-2026-01-05",
+	"structured-outputs-2025-12-15",
+];
+/// OAuth beta required for native effort controls.
+const CLAUDE_CODE_EFFORT_BETA: &str = "effort-2025-11-24";
+/// Subscription fallback-credit beta emitted after optional effort.
+const CLAUDE_CODE_FALLBACK_BETA: &str = "fallback-credit-2026-06-01";
 /// Identity instruction prepended to OAuth Anthropic system blocks.
 const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
 	"You are a Claude agent, built on Anthropic's Claude Agent SDK.";
@@ -1707,6 +1733,78 @@ fn count_tokens_uri(base: &str) -> Str {
 	Str::new(uri)
 }
 
+fn extend_claude_code_headers(headers: &mut Vec<RequestHeader>, context: &EncodeContext<'_>) {
+	let arch = match std::env::consts::ARCH {
+		"x86_64" => "x64",
+		"aarch64" => "arm64",
+		"x86" => "x86",
+		"arm" => "other::arm",
+		"mips" => "other::mips",
+		"mips64" => "other::mips64",
+		"powerpc" => "other::powerpc",
+		"powerpc64" => "other::powerpc64",
+		"riscv64" => "other::riscv64",
+		"s390x" => "other::s390x",
+		"wasm32" => "other::wasm32",
+		_ => "other::unknown",
+	};
+	headers.extend([
+		RequestHeader { name: "accept".into(), value: "application/json".into() },
+		RequestHeader { name: "user-agent".into(), value: CLAUDE_CODE_USER_AGENT.into() },
+		RequestHeader { name: "x-stainless-arch".into(), value: arch.into() },
+		RequestHeader { name: "x-stainless-lang".into(), value: "js".into() },
+		RequestHeader { name: "x-stainless-os".into(), value: "Linux".into() },
+		RequestHeader {
+			name:  "x-stainless-package-version".into(),
+			value: CLAUDE_CODE_SDK_VERSION.into(),
+		},
+		RequestHeader { name: "x-stainless-retry-count".into(), value: "0".into() },
+		RequestHeader { name: "x-stainless-runtime".into(), value: "node".into() },
+		RequestHeader { name: "x-stainless-runtime-version".into(), value: "v26.3.0".into() },
+		RequestHeader { name: "x-stainless-timeout".into(), value: "600".into() },
+		RequestHeader {
+			name:  "anthropic-dangerous-direct-browser-access".into(),
+			value: "true".into(),
+		},
+		RequestHeader { name: "x-app".into(), value: "cli".into() },
+		RequestHeader {
+			name:  "x-client-request-id".into(),
+			value: context.request_id.as_str().into(),
+		},
+		RequestHeader { name: "connection".into(), value: "keep-alive".into() },
+		RequestHeader { name: "accept-encoding".into(), value: "gzip, deflate, br, zstd".into() },
+	]);
+	if let Some(session) = context.session {
+		headers.push(RequestHeader {
+			name:  "x-claude-code-session-id".into(),
+			value: session.conversation.as_str().into(),
+		});
+	}
+}
+
+fn claude_code_betas(extra: &BetaSet, agent_request: bool, thinking: bool) -> BetaSet {
+	let mut betas = BetaSet::default();
+	betas.extend(
+		if agent_request {
+			CLAUDE_CODE_AGENT_BETAS
+		} else {
+			CLAUDE_CODE_UTILITY_BETAS
+		}
+		.iter()
+		.copied(),
+	);
+	if agent_request && thinking {
+		betas.insert(Str::new_static(CLAUDE_CODE_EFFORT_BETA));
+	}
+	if agent_request {
+		betas.insert(Str::new_static(CLAUDE_CODE_FALLBACK_BETA));
+	}
+	for beta in extra.as_slice() {
+		betas.insert(beta.clone());
+	}
+	betas
+}
+
 fn encoded_count_tokens(
 	context: &EncodeContext<'_>,
 	adapter: AnthropicAdapter,
@@ -1731,11 +1829,12 @@ fn encoded_count_tokens(
 		RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
 		RequestHeader { name: sf!("anthropic-version"), value: sf!(DIRECT_VERSION) },
 	];
-	let mut merged_betas = betas.clone();
-	if claude_code_oauth {
-		merged_betas.insert(sf!(CLAUDE_CODE_OAUTH_BETA));
-		headers.push(RequestHeader { name: sf!("user-agent"), value: sf!(CLAUDE_CODE_USER_AGENT) });
-	}
+	let merged_betas = if claude_code_oauth {
+		extend_claude_code_headers(&mut headers, context);
+		claude_code_betas(betas, !request.tools.is_empty(), false)
+	} else {
+		betas.clone()
+	};
 	if !merged_betas.as_slice().is_empty() {
 		headers
 			.push(RequestHeader { name: sf!("anthropic-beta"), value: merged_betas.header_value() });
@@ -1779,17 +1878,20 @@ impl Codec for AnthropicCodec {
 			request,
 		)?;
 		let claude_code_oauth = is_claude_code_oauth(context, self.adapter);
-		let mut betas = self.betas.clone();
-		if claude_code_oauth {
+		let betas = if claude_code_oauth {
 			apply_claude_code_fingerprint(&mut body, context);
-			betas.insert(sf!(CLAUDE_CODE_OAUTH_BETA));
-		}
+			let thinking = setting_value(&request.reasoning).is_some();
+			let agent_request =
+				thinking || !request.tools.is_empty() || !request.hosted_tools.is_empty();
+			claude_code_betas(&self.betas, agent_request, thinking)
+		} else {
+			self.betas.clone()
+		};
 		let projected = project(MessagesIntent { body, fallbacks: Vec::new(), betas }, self.adapter)?;
 		let mut headers =
 			vec![RequestHeader { name: sf!("content-type"), value: sf!("application/json") }];
 		if claude_code_oauth {
-			headers
-				.push(RequestHeader { name: sf!("user-agent"), value: sf!(CLAUDE_CODE_USER_AGENT) });
+			extend_claude_code_headers(&mut headers, context);
 		}
 		if let Some(version) = projected.anthropic_version_header {
 			headers.push(RequestHeader { name: sf!("anthropic-version"), value: version });
@@ -3035,10 +3137,7 @@ mod tests {
 			policy,
 			..EncodeContext::default()
 		};
-		let mut codec = AnthropicCodec::direct().with_betas([sf!("route-beta")]);
-		if kind == CredentialKind::Bearer {
-			codec = codec.with_betas([sf!(CLAUDE_CODE_OAUTH_BETA)]);
-		}
+		let codec = AnthropicCodec::direct().with_betas([sf!("route-beta")]);
 		codec
 			.encode(&context, &OperationCall::Chat(Arc::new(canonical_chat(system))))
 			.expect("Anthropic request encodes")
@@ -3096,11 +3195,65 @@ mod tests {
 	}
 
 	#[test]
+	fn subscription_oauth_beta_fingerprint_matches_cowork_order() {
+		let betas = claude_code_betas(&BetaSet::default(), true, true);
+		assert_eq!(
+			betas.header_value(),
+			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+			 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+			 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+			 advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01",
+		);
+		let utility = claude_code_betas(&BetaSet::default(), false, false);
+		assert_eq!(
+			utility.header_value(),
+			"oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+			 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+			 structured-outputs-2025-12-15",
+		);
+	}
+
+	#[test]
 	fn oauth_lease_applies_claude_code_fingerprint_and_bearer_auth() {
 		let encoded = encoded_anthropic(CredentialKind::Bearer, &["caller system"]);
 		let request = finalize_auth(&encoded, CredentialKind::Bearer);
-		assert_eq!(request.headers()["user-agent"], CLAUDE_CODE_USER_AGENT,);
-		assert_eq!(request.headers()["anthropic-beta"], "route-beta,oauth-2025-04-20",);
+		assert_eq!(request.headers()["accept"], "application/json");
+		assert_eq!(request.headers()["user-agent"], CLAUDE_CODE_USER_AGENT);
+		assert_eq!(request.headers()["x-stainless-package-version"], CLAUDE_CODE_SDK_VERSION);
+		assert!(matches!(
+			request.headers()["x-stainless-arch"]
+				.to_str()
+				.expect("stainless architecture"),
+			"x64"
+				| "arm64"
+				| "x86" | "other::arm"
+				| "other::mips"
+				| "other::mips64"
+				| "other::powerpc"
+				| "other::powerpc64"
+				| "other::riscv64"
+				| "other::s390x"
+				| "other::wasm32"
+				| "other::unknown"
+		));
+		assert_eq!(request.headers()["x-stainless-lang"], "js");
+		assert_eq!(request.headers()["x-stainless-os"], "Linux");
+		assert_eq!(request.headers()["x-stainless-runtime"], "node");
+		assert_eq!(request.headers()["x-stainless-runtime-version"], "v26.3.0");
+		assert_eq!(request.headers()["x-stainless-timeout"], "600");
+		assert_eq!(request.headers()["x-stainless-retry-count"], "0");
+		assert_eq!(request.headers()["anthropic-dangerous-direct-browser-access"], "true");
+		assert_eq!(request.headers()["x-app"], "cli");
+		assert_eq!(request.headers()["x-client-request-id"], "anthropic-oauth-fingerprint");
+		assert_eq!(request.headers()["connection"], "keep-alive");
+		assert_eq!(request.headers()["accept-encoding"], "gzip, deflate, br, zstd");
+		assert_eq!(
+			request.headers()["anthropic-beta"],
+			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+			 thinking-token-count-2026-05-13,context-management-2025-06-27,\
+			 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
+			 advanced-tool-use-2025-11-20,fallback-credit-2026-06-01,route-beta"
+		);
 		assert_eq!(request.headers()["authorization"], "Bearer oauth-token");
 		assert!(!request.headers().contains_key("x-api-key"));
 		let body: MessagesRequest = serde_json::from_slice(request.body()).expect("request body");

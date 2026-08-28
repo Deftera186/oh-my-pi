@@ -2380,6 +2380,8 @@ mod tests {
 		let paragraph = plain("$$x^2$$", 40);
 		assert_eq!(block, paragraph);
 		assert!(block.iter().any(|line| line.contains('²')));
+		assert_eq!(plain("$$\r\nx^2\r\n$$\r\n", 40), block);
+		assert_eq!(plain("\\[\r\nx^2\r\n\\]\r\n", 40), block);
 	}
 
 	#[test]

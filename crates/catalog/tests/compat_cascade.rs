@@ -259,6 +259,7 @@ fn glm_53_uniform_ladder_resolves_on_every_host() {
 	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
 	for (provider, model) in [
 		("zai", "glm-5.3"),
+		("zai", "glm-5.3-flash"),
 		("zhipu-coding-plan", "glm-5.3"),
 		("opencode-go", "glm-5.3"),
 		("baseten", "zai-org/GLM-5.3"),
@@ -297,6 +298,13 @@ fn glm_53_uniform_ladder_resolves_on_every_host() {
 			Some(&Value::Bool(true)),
 			"{provider}/{model}: thinking cannot be disabled"
 		);
+		if provider == "zai" && model == "glm-5.3-flash" {
+			assert_eq!(
+				resolved.thinking.get("mode"),
+				Some(&Value::from("anthropic-budget-effort")),
+				"{provider}/{model}: mandatory Anthropic wire mode"
+			);
+		}
 	}
 	// The vision shape keeps its host dialect; the 5.3 rule must not match.
 	let vision = cascade

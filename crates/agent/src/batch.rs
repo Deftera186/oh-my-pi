@@ -5,7 +5,7 @@ use std::{
 	future,
 	sync::{
 		Arc, OnceLock,
-		atomic::{AtomicBool, AtomicU128, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,16 +30,21 @@ use omp_tool::{
 	JobRef, Part, PromptCaps, Registry, ToolIdentity, ToolTerminal,
 };
 use serde_json::Value;
-use tokio::{sync::Notify, task, time};
+use tokio::{
+	sync::{Notify, watch},
+	task, time,
+};
 
 use crate::{
 	events::{AgentEvent, EventBus, EventProvenance, EventVisibility},
-	hooks::{GateEvent, GateOutcome, HookGate, notify_json},
+	hooks::{GateEvent, GateOutcome, HookGate, MASK_WORDS, event_position, notify_json},
 	project::{tool_result_item, tool_result_item_canonical_parts},
 };
 
 /// Namespaced invocation property carrying the environment-enforced mode.
 pub const EXECUTION_MODE_PROP: &str = "omp/execution-mode";
+/// Namespaced marker that delegates admission to the calling agent Core.
+pub const CORE_ADMISSION_PROP: &str = "omp/core-admission";
 /// Namespaced authorization for the one plan-to-execution transition.
 pub const PLAN_YOLO_PROP: &str = "omp/plan-yolo";
 /// Namespaced explanation for an automatic prewalk transition.
@@ -71,6 +76,7 @@ pub fn invocation_mode_props(mode: Option<&str>, effects: &Effects) -> value_pb:
 		mode => mode,
 	};
 	fields.insert(EXECUTION_MODE_PROP.to_owned(), string_value(label));
+	fields.insert(CORE_ADMISSION_PROP.to_owned(), bool_value(true));
 	value_pb::ValueMap { fields }
 }
 
@@ -204,13 +210,13 @@ async fn gate_tool_call(
 			};
 		},
 	};
-	match gate
+	let outcome = gate
 		.gate(
 			HookEventId::HookEventToolCall,
 			GateEvent::new(identity.name.clone(), Bytes::from(encoded)),
 		)
-		.await
-	{
+		.await;
+	match outcome {
 		GateOutcome::Allow { event, .. } => {
 			let Some(args) = serde_json::from_slice::<Value>(&event.effective_args)
 				.ok()
@@ -385,7 +391,7 @@ pub enum InvocationHookRequest {
 /// Atomic union-mask and hook request sender shared by invocation pumps.
 #[derive(Clone, Debug)]
 pub struct InvocationHookBus {
-	union: Arc<AtomicU128>,
+	union: Arc<[AtomicU64; MASK_WORDS]>,
 	tx:    flume::Sender<InvocationHookRequest>,
 }
 
@@ -393,21 +399,27 @@ impl InvocationHookBus {
 	/// Creates a hook bus and its single CONTROL-side request receiver.
 	pub fn channel() -> (Self, Receiver<InvocationHookRequest>) {
 		let (tx, rx) = flume::unbounded();
-		(Self { union: Arc::new(AtomicU128::new(0)), tx }, rx)
+		(Self { union: Arc::new([const { AtomicU64::new(0) }; MASK_WORDS]), tx }, rx)
 	}
 
-	/// Replaces the registered union mask in one atomic publication.
+	/// Publishes the complete subscription bitmap, one release store per word.
 	pub fn replace_union_mask(&self, mask: u128) {
-		self.union.store(mask, Ordering::Release);
+		self.union[0].store(mask as u64, Ordering::Release);
+		self.union[1].store((mask >> 64) as u64, Ordering::Release);
 	}
 
 	/// Returns the currently published union mask.
+	///
+	/// Words are read independently: a read racing `replace_union_mask` may
+	/// combine the old and new halves, each individually valid.
 	pub fn union_mask(&self) -> u128 {
-		self.union.load(Ordering::Acquire)
+		u128::from(self.union[0].load(Ordering::Acquire))
+			| (u128::from(self.union[1].load(Ordering::Acquire)) << 64)
 	}
 
 	fn subscribed(&self, event: HookEventId) -> bool {
-		self.union.load(Ordering::Relaxed) & hook_event_mask(event) != 0
+		let (word, bit) = event_position(event);
+		self.union[word].load(Ordering::Relaxed) & bit != 0
 	}
 
 	fn arg_text(&self, invocation_id: &Str, fragment: &Str) {
@@ -496,28 +508,43 @@ enum AuthorizationState {
 	DeliveryIndeterminate,
 }
 
-struct AuthorizationReceipt(Receiver<Result<AuthorizationState, ClientError>>);
+struct AuthorizationReceipt {
+	reply: Receiver<Result<AuthorizationState, ClientError>>,
+	alive: watch::Receiver<()>,
+}
 
 impl AuthorizationReceipt {
 	async fn wait(&self) -> Result<AuthorizationState, BatchError> {
-		Ok(self
-			.0
-			.recv_async()
-			.await
-			.map_err(|_| InvocationPump::closed())??)
+		Ok(acked(&self.alive, &self.reply).await??)
 	}
 }
 
-struct CommandReceipt(Receiver<Result<(), ClientError>>);
+struct CommandReceipt {
+	reply: Receiver<Result<(), ClientError>>,
+	alive: watch::Receiver<()>,
+}
 
 impl CommandReceipt {
 	async fn wait(&self) -> Result<(), BatchError> {
-		self
-			.0
-			.recv_async()
-			.await
-			.map_err(|_| InvocationPump::closed())??;
+		acked(&self.alive, &self.reply).await??;
 		Ok(())
+	}
+}
+/// Waits for one pump acknowledgement without deadlocking on a dead pump.
+///
+/// A command can be queued in the instant before the pump task exits. The
+/// dropped command receiver never dequeues it, and the queue — holding the
+/// command's `ack` sender — stays alive through the pump's own command
+/// sender, so a bare `recv_async` on the acknowledgement would wait forever.
+/// Racing the pump's lifetime guard turns that stranded wait into
+/// [`InvocationPump::closed`]; the final `try_recv` keeps an acknowledgement
+/// that raced the exit.
+async fn acked<T>(alive: &watch::Receiver<()>, reply: &Receiver<T>) -> Result<T, BatchError> {
+	let mut alive = alive.clone();
+	tokio::select! {
+		biased;
+		result = reply.recv_async() => result.map_err(|_| InvocationPump::closed()),
+		_ = alive.changed() => reply.try_recv().map_err(|_| InvocationPump::closed()),
 	}
 }
 
@@ -563,6 +590,7 @@ struct InterruptRequest {
 struct InvocationPump {
 	commands:        flume::Sender<PumpCommand>,
 	outputs:         Receiver<PumpOutput>,
+	alive:           watch::Receiver<()>,
 	hooks:           Arc<OnceLock<InvocationHookBus>>,
 	hook_gate:       Arc<OnceLock<Option<Arc<HookGate>>>>,
 	maximum_effects: Arc<OnceLock<Effects>>,
@@ -576,7 +604,7 @@ impl InvocationPump {
 	async fn arg_text(&self, fragment: Str) -> Result<(), BatchError> {
 		let (ack, reply) = flume::bounded(1);
 		self.send(PumpCommand::ArgText { fragment, ack })?;
-		reply.recv_async().await.map_err(|_| Self::closed())??;
+		acked(&self.alive, &reply).await??;
 		Ok(())
 	}
 
@@ -589,19 +617,19 @@ impl InvocationPump {
 	) -> Result<AuthorizationReceipt, BatchError> {
 		let (ack, reply) = flume::bounded(1);
 		self.send(PumpCommand::Authorize { raw, effect_token, authorized_at_ms, effects, ack })?;
-		Ok(AuthorizationReceipt(reply))
+		Ok(AuthorizationReceipt { reply, alive: self.alive.clone() })
 	}
 
 	fn begin_interrupt(&self, reason: Str) -> Result<CommandReceipt, BatchError> {
 		let (ack, reply) = flume::bounded(1);
 		self.send(PumpCommand::Interrupt { reason, ack })?;
-		Ok(CommandReceipt(reply))
+		Ok(CommandReceipt { reply, alive: self.alive.clone() })
 	}
 
 	async fn cancel(&self) -> Result<(), BatchError> {
 		let (ack, reply) = flume::bounded(1);
 		self.send(PumpCommand::Cancel { ack })?;
-		reply.recv_async().await.map_err(|_| Self::closed())
+		acked(&self.alive, &reply).await
 	}
 
 	fn send(&self, command: PumpCommand) -> Result<(), BatchError> {
@@ -691,7 +719,11 @@ fn spawn_invocation_pump(
 	let task_facts = Arc::clone(&facts);
 	let cancelled = Arc::new(AtomicBool::new(false));
 	let task_cancelled = Arc::clone(&cancelled);
+	let (alive_tx, alive) = watch::channel(());
 	tokio::spawn(async move {
+		// Dropped on any exit — including panics — so stranded ack waiters
+		// racing this guard resolve instead of deadlocking on a queued command.
+		let _alive = alive_tx;
 		let mut args_text = StrMut::default();
 		loop {
 			tokio::select! {
@@ -879,6 +911,7 @@ fn spawn_invocation_pump(
 	InvocationPump {
 		commands,
 		outputs,
+		alive,
 		hooks,
 		hook_gate,
 		maximum_effects,
@@ -1463,7 +1496,7 @@ mod interruptible {
 		let durable = durable_outcome(&wire.json, &outcome);
 		let is_error = !matches!(outcome, CallOutcome::Ok(_));
 		let terminate = wire.terminate.unwrap_or(false);
-		let mut result = if let Some(parts) = harness_parts(&outcome) {
+		let mut result = if let Some(parts) = harness_parts(call.identity.name.as_str(), &outcome) {
 			lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?
 		} else {
 			let caps = PromptCaps::for_tool(caps, &call.identity.rev);
@@ -1782,7 +1815,8 @@ fn lower_detached(
 fn lower_abort(call: &CommittedCall, abort: Abort) -> Result<BatchResult, BatchError> {
 	let outcome = CallOutcome::<Value, Value>::aborted(abort);
 	let raw = Bytes::from(serde_json::to_vec(&outcome).map_err(BatchError::InvalidOutcome)?);
-	let parts = harness_parts(&outcome).expect("aborted outcome always uses the harness renderer");
+	let parts = harness_parts(call.identity.name.as_str(), &outcome)
+		.expect("aborted outcome always uses the harness renderer");
 	let mut result = lower_tool_parts(call, &raw, true, false, &parts)?;
 	result.outcome = Some(durable_outcome(&raw, &outcome));
 	Ok(result)
@@ -1862,12 +1896,10 @@ fn finish_event(call: &CommittedCall, item: Item) -> Arc<AgentEvent> {
 	})
 }
 
-fn harness_parts(outcome: &CallOutcome<Value, Value>) -> Option<Vec<Part>> {
+fn harness_parts(tool_name: &str, outcome: &CallOutcome<Value, Value>) -> Option<Vec<Part>> {
 	let text = match outcome {
 		CallOutcome::ArgsRejected(issue) => render_arg_issue(issue),
-		CallOutcome::Aborted { abort, policy: Some(policy), .. } => {
-			render_policy_denied(abort, policy)
-		},
+		CallOutcome::Aborted { policy: Some(policy), .. } => render_policy_denied(tool_name, policy),
 		CallOutcome::Aborted { abort, policy: None, .. } => render_abort(abort),
 		CallOutcome::Ok(_) | CallOutcome::Faulted(_) => return None,
 	};
@@ -1919,21 +1951,23 @@ fn render_abort(abort: &Abort) -> Str {
 	}
 }
 
-fn render_policy_denied(abort: &Abort, policy: &omp_tool::PolicyDenied) -> Str {
+fn render_policy_denied(tool_name: &str, policy: &omp_tool::PolicyDenied) -> Str {
 	use std::fmt::Write as _;
 
-	let mut text = render_abort(abort).to_string();
-	if let Some(code) = &policy.code {
-		let _ = write!(text, "\nPolicy code: {code}");
+	let policy_key = policy
+		.rules
+		.iter()
+		.find_map(|rule| rule.strip_prefix("tools.approval."));
+	if policy.code.as_deref() == Some("approval_policy_denied") {
+		let denied = policy_key.as_deref().unwrap_or(tool_name);
+		return sf!(
+			"Tool \"{denied}\" is blocked by user policy.\nTo allow: remove \
+			 \"tools.approval.{denied}: deny\" from config."
+		);
 	}
-	if !policy.rules.is_empty() {
-		text.push_str("\nPolicy rules: ");
-		for (index, rule) in policy.rules.iter().enumerate() {
-			if index != 0 {
-				text.push_str(", ");
-			}
-			text.push_str(rule);
-		}
+	let mut text = format!("Tool \"{tool_name}\" is blocked by tool policy.");
+	if !policy.reason.is_empty() {
+		let _ = write!(text, "\nReason: {}", policy.reason);
 	}
 	Str::from(text)
 }
@@ -1960,6 +1994,45 @@ mod tests {
 			media:              false,
 			model_class:        ModelClass::Standard,
 		}
+	}
+	/// A command queued in the instant before the pump task exits is never
+	/// dequeued, and its ack sender stays alive inside the disconnected queue.
+	/// The lifetime guard must resolve that wait; before it existed the agent
+	/// loop deadlocked mid-stream on the first invocation protocol error.
+	#[tokio::test]
+	async fn queued_command_acks_fail_when_the_pump_task_exits_without_draining() {
+		let (commands, command_rx) = flume::unbounded();
+		let (_output_tx, outputs) = flume::unbounded::<PumpOutput>();
+		let (alive_tx, alive) = watch::channel(());
+		let pump = InvocationPump {
+			commands,
+			outputs,
+			alive,
+			hooks: Arc::new(OnceLock::new()),
+			hook_gate: Arc::new(OnceLock::new()),
+			maximum_effects: Arc::new(OnceLock::new()),
+			maximum_ready: Arc::new(Notify::new()),
+			admission: Arc::new(OnceLock::new()),
+			effects: Arc::new(OnceLock::new()),
+			facts: Arc::new(OnceLock::new()),
+			cancelled: Arc::new(AtomicBool::new(false)),
+		};
+		let wait = pump.arg_text(sf!("fragment"));
+		tokio::pin!(wait);
+		// A zero timeout polls exactly once: the command enqueues and the
+		// wait parks on its acknowledgement.
+		assert!(
+			time::timeout(Duration::ZERO, wait.as_mut()).await.is_err(),
+			"ack wait must park while the pump is alive"
+		);
+		// The pump task exits without draining its queue; the stranded command
+		// keeps its ack sender alive through the pump's own command sender.
+		drop(command_rx);
+		drop(alive_tx);
+		let result = time::timeout(Duration::from_secs(5), wait)
+			.await
+			.expect("ack wait must resolve once the pump exits");
+		assert!(result.is_err(), "stranded command must surface a closed-pump error");
 	}
 
 	#[test]
@@ -2010,22 +2083,47 @@ mod tests {
 	}
 
 	#[test]
-	fn policy_denial_prompt_includes_code_and_rules() {
+	fn wrapper_tool_policy_denial_names_the_tool_and_source() {
 		let outcome = CallOutcome::<Value, Value>::policy_denied(
 			Abort::Skipped { reason: sf!("blocked") },
 			omp_tool::PolicyDenied {
-				reason:      sf!("blocked"),
-				code:        Some(sf!("qa_policy_deny")),
+				reason:      sf!("Blocked by bash pattern: rm -rf *"),
+				code:        Some(sf!("bash_pattern_denied")),
 				decision_id: sf!("decision"),
-				rules:       Arc::from([sf!("qa-approval-rule")]),
+				rules:       Arc::from([sf!("bash.patterns.rm-rf")]),
 			},
 		);
-		let parts = harness_parts(&outcome).expect("policy denial has harness text");
+		let parts = harness_parts("bash", &outcome).expect("policy denial has harness text");
 		let Part::Text { text } = &parts[0] else {
 			panic!("policy denial must render as text");
 		};
-		assert!(text.contains("qa_policy_deny"));
-		assert!(text.contains("qa-approval-rule"));
+		assert_eq!(
+			text,
+			"Tool \"bash\" is blocked by tool policy.\nReason: Blocked by bash pattern: rm -rf *"
+		);
+		assert!(!text.contains("tools.approval"));
+	}
+
+	#[test]
+	fn user_policy_denial_keeps_the_config_remediation() {
+		let outcome = CallOutcome::<Value, Value>::policy_denied(
+			Abort::Skipped { reason: sf!("blocked") },
+			omp_tool::PolicyDenied {
+				reason:      sf!("tool `write` is denied by approval policy"),
+				code:        Some(sf!("approval_policy_denied")),
+				decision_id: sf!("decision"),
+				rules:       Arc::from([sf!("tools.approval.write")]),
+			},
+		);
+		let parts = harness_parts("write", &outcome).expect("policy denial has harness text");
+		let Part::Text { text } = &parts[0] else {
+			panic!("policy denial must render as text");
+		};
+		assert_eq!(
+			text,
+			"Tool \"write\" is blocked by user policy.\nTo allow: remove \"tools.approval.write: \
+			 deny\" from config."
+		);
 	}
 
 	fn terminal_text(result: &BatchResult) -> &str {

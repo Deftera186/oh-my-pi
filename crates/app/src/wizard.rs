@@ -194,6 +194,7 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				{
 					let manager = omp_settings::manager::SettingsManager::open(
 						omp_settings::manager::SettingsPaths::discover(data_dir, None),
+						crate::SETTINGS_CATALOG,
 					)
 					.into_diagnostic()?;
 					manager

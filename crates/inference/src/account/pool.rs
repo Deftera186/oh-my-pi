@@ -241,6 +241,8 @@ pub struct AccountSelectionRequest {
 	pub rotation:           RotationPolicy,
 	/// Deterministic clock instant.
 	pub now:                SystemTime,
+	/// Catalog-resolved independent quota meter for this request.
+	pub quota_scope:        Option<Str>,
 }
 
 /// Failure selecting an eligible account; always carries partial decision
@@ -831,9 +833,12 @@ impl AccountPool {
 				.rate
 				.get(&record.account)
 				.map_or(RateAvailability::Available, |rate| rate.availability(request.now));
-			let quota = quota_state
-				.map_or(QuotaAvailability::Available, |quota| quota.availability(request.now));
-			let quota_remaining = quota_state.and_then(|quota| quota.minimum_remaining(request.now));
+			let quota = quota_state.map_or(QuotaAvailability::Available, |quota| {
+				quota.availability_scoped(request.now, request.quota_scope.as_deref())
+			});
+			let quota_remaining = quota_state.and_then(|quota| {
+				quota.minimum_remaining_scoped(request.now, request.quota_scope.as_deref())
+			});
 			let eligible_at =
 				candidate_eligible_at(&state, record, request, &eligibility, rate, quota);
 			let evidence = CandidateEvidence {
@@ -979,8 +984,9 @@ fn eligibility(
 	match state
 		.quota
 		.get(&record.account)
-		.map_or(QuotaAvailability::Available, |quota| quota.availability(request.now))
-	{
+		.map_or(QuotaAvailability::Available, |quota| {
+			quota.availability_scoped(request.now, request.quota_scope.as_deref())
+		}) {
 		QuotaAvailability::Available => {},
 		QuotaAvailability::Exhausted { reset_at } => {
 			return Eligibility::QuotaExhausted { reset_at: Some(reset_at) };
@@ -991,10 +997,10 @@ fn eligibility(
 	}
 	if let Some(percent) = state.quota_reserve.percent()
 		&& let Some(quota) = state.quota.get(&record.account)
-		&& quota.below_remaining_percent(request.now, percent)
+		&& quota.below_remaining_percent_scoped(request.now, percent, request.quota_scope.as_deref())
 	{
 		return Eligibility::QuotaReserved {
-			remaining: quota.minimum_remaining(request.now),
+			remaining: quota.minimum_remaining_scoped(request.now, request.quota_scope.as_deref()),
 			percent,
 		};
 	}

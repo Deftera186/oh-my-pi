@@ -28,19 +28,19 @@ use omp_agent::{
 	prompt_assets::{PromptAssetId, prompt_asset},
 };
 use omp_catalog::{
-	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId,
+	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId, RouteId,
 	provider::{AuthSpecKind, CredentialSourceSpec},
 	role_assignment_selector,
 	settings::{ModelRoleStorage, ModelSettings},
 	snapshot::Catalog,
 };
 use omp_chat_ui::{
-	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
-	HubRole, HubScope, Intent, ListRow, LiveVoiceAction, LockedProviderRow, ModelHubData,
-	ModelHubIntent, ModelRow, RawFrame, RestoredAttachment, RewindTargetRow, SessionRow,
-	StatusFacts, StatusLayout, StatusSeparator, StreamSummary, SubmitMode,
+	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, AssistantUsage, Attachment,
+	BackendEvent, Chat, HubRole, HubScope, Intent, ListRow, LiveVoiceAction, LockedProviderRow,
+	ModelHubData, ModelHubIntent, ModelRow, RawFrame, RestoredAttachment, RewindTargetRow,
+	SessionRow, StatusFacts, StatusLayout, StatusSeparator, StreamSummary, SubmitMode,
 	ThinkingLevel as StatusThinkingLevel, ToolTerminal, ToolViewContent, TranscriptFrame,
-	TranscriptFrameKind, VisibleResourceFacts,
+	TranscriptFrameKind, TurnAnchor, VisibleResourceFacts,
 	completion::{CompletionQuery, CompletionRule, CompletionSource, CompletionTrigger},
 	host::{HostOptions, InputAction, InputBinding},
 	login_panel::LoginEvent,
@@ -58,7 +58,12 @@ use omp_driver::{
 	subagent::settings::TaskSettings,
 };
 use omp_envd::exthost::lifecycle::HeadlessLifecycleKind;
-use omp_inference::{call::AuthInput, id::TurnId};
+use omp_inference::{
+	answer::{UsageQuantity, UsageReport, UsageWindow},
+	call::{AuthInput, UsageRequest, UsageScope},
+	id::TurnId,
+	operation::usage::google_antigravity::scope_antigravity_windows_for_model,
+};
 use omp_observability::firehose::{
 	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
 };
@@ -80,7 +85,7 @@ use omp_proto::{
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
 use omp_storage::{
-	index::{NewSession, SessionIndex, SessionKind},
+	index::{NewSession, SessionFilter, SessionIndex, SessionKind},
 	transcript::{self, SessionId},
 };
 use omp_tool::{
@@ -115,7 +120,7 @@ const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(feature = "gui")]
 use omp_chat_ui::host::RetainedChat;
-use omp_chat_ui::status_line::TokenRateMeter;
+use omp_chat_ui::status_line::{StatusQuota, StatusQuotaWindow, TokenRateMeter};
 use omp_collab::{
 	guest::{GuestInputDisposition, GuestInputError, GuestSessionRestore},
 	presence::CollabRole,
@@ -945,16 +950,22 @@ fn css_color(color: omp_tui::Color) -> String {
 
 /// Durable session facts required to initialize the designed chat scene.
 pub struct ChatUiSession {
-	/// Stable session identifier displayed by the status line.
-	pub session_id:     Str,
+	/// Stable identifier used by session-scoped authorities.
+	pub session_id:            Str,
 	/// Canonical path owned by the active session storage authority.
-	pub journal_path:   PathBuf,
+	pub journal_path:          PathBuf,
+	/// Session directory used by branches created from a runtime-only fallback.
+	pub future_sessions_dir:   Option<PathBuf>,
+	/// Session index paired with `future_sessions_dir`.
+	pub future_session_index:  Option<Arc<SessionIndex>>,
+	/// Runtime project root recorded by branches created from a fallback.
+	pub future_workspace_root: Option<PathBuf>,
 	/// Canonical history replayed before live events.
-	pub initial_items:  Vec<Item>,
+	pub initial_items:         Vec<Item>,
 	/// Selected model's total token window, when known by the catalog.
-	pub context_window: Option<u64>,
+	pub context_window:        Option<u64>,
 	/// Current durable title authority restored from the sessions index.
-	pub title:          SessionTitleState,
+	pub title:                 SessionTitleState,
 }
 
 enum UiCmd {
@@ -1202,11 +1213,28 @@ fn inspect_image_enabled(state: &BridgeState) -> bool {
 	}
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StatusUsageRequest {
+	provider: ProviderId,
+	route:    RouteId,
+	model:    Str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StatusUsageUpdate {
+	provider: ProviderId,
+	model:    Str,
+	quota:    StatusQuota,
+}
+
 struct BridgeState {
 	catalog: Arc<Catalog>,
+	discovery_runtime: Option<Arc<omp_driver::discovery::runtime::DiscoveryRuntime>>,
+	inference_registry: Option<omp_inference::Registry>,
 	auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	model: String,
 	model_settings: ModelSettings,
+	task_model: Option<Str>,
 	pending_session_delete: Option<std::time::Instant>,
 	git: Option<GitWorkbenchBackend>,
 	git_facts: Option<omp_chat_ui::GitFacts>,
@@ -1214,6 +1242,7 @@ struct BridgeState {
 	session_id: Str,
 	session_path: PathBuf,
 	sessions_dir: PathBuf,
+	process_started: SystemTime,
 	title: SessionTitleState,
 	title_generation_in_flight: Arc<AtomicBool>,
 	title_user_set: Arc<AtomicBool>,
@@ -1247,6 +1276,7 @@ struct BridgeState {
 	queued_prompts: VecDeque<omp_chat_ui::QueuedPrompt>,
 	audio: crate::audio_coordinator::InteractiveAudioController,
 	jobs: HashSet<Str>,
+	running_subagent_ids: HashSet<Str>,
 	attempt: u32,
 	turn_started: Option<Instant>,
 	has_history: bool,
@@ -1263,6 +1293,8 @@ struct BridgeState {
 	live_activity: ActivityWaveform,
 	token_rate: Option<TokenRateMeter>,
 	tokens_per_second: Option<u64>,
+	status_quota: Option<StatusQuota>,
+	status_usage_refresh_due: bool,
 	thinking: Option<StatusThinkingLevel>,
 	replaying_turn: bool,
 	vision_override: Option<InspectImageMode>,
@@ -1272,6 +1304,7 @@ struct BridgeState {
 	command_sources: Vec<Vec<CommandContribution>>,
 	command_usage: Arc<CommandUsage>,
 	typed_commands: commands::CommandRoster,
+	keybindings: crate::keybindings::config::ResolvedKeybindings,
 	extension_ui: Arc<presentation::PublishedUiRoster>,
 	extension_callbacks: Option<Arc<dyn omp_envd::exthost::dispatch::CallbackDispatcher>>,
 	skills: Arc<omp_driver::skills::SkillSnapshot>,
@@ -1282,6 +1315,7 @@ struct BridgeState {
 	approvals: HashMap<Str, ApprovalRequest>,
 	presentation_requests: HashMap<Str, (u64, presentation_authority::PresentationRequest)>,
 	raw_stream: Option<flume::Receiver<omp_inference::transport::CapturedFrame>>,
+	logs: Option<(crate::debug_logs::LogSource, Option<crate::debug_logs::Cursor>)>,
 }
 
 async fn refresh_lsp_roster(state: &mut BridgeState) {
@@ -2452,12 +2486,18 @@ struct ChatSceneSeed {
 	hide_thinking:    bool,
 }
 
-/// Loads effective keybindings, returning host input bindings plus the
-/// resolved dequeue chord label for pending queued-row hints.
+struct LoadedInputActions {
+	bindings:     Vec<InputBinding>,
+	keymap:       omp_tui::Keymap,
+	dequeue_hint: Option<Str>,
+	resolved:     crate::keybindings::config::ResolvedKeybindings,
+}
+
+/// Loads the one effective keybinding snapshot used by dispatch and help.
 fn load_input_actions(
 	data_dir: &Path,
 	extension_ui: &presentation::PublishedUiRoster,
-) -> miette::Result<(Vec<InputBinding>, Option<Str>)> {
+) -> miette::Result<LoadedInputActions> {
 	let imported = crate::keybindings::config::import_legacy(data_dir)
 		.map_err(|error| miette::miette!("{error}"))?;
 	let native = data_dir.join("keybindings.toml");
@@ -2498,30 +2538,41 @@ fn load_input_actions(
 		.chords_for("app.message.dequeue", platform)
 		.next()
 		.and_then(|chord| crate::keybindings::format_chord_label(chord, platform).ok());
-	let mut actions = crate::keybindings::config::APP_ACTION_IDS
-		.iter()
-		.filter_map(|action| {
-			InputAction::from_action_id(action).map(|projected| {
-				resolved
-					.chords_for(action, platform)
-					.filter_map(move |chord| InputBinding::parse(chord, projected.clone()))
-			})
-		})
-		.flatten()
-		.collect::<Vec<_>>();
+	let keymap = crate::keybindings::keymap().map_err(|error| miette::miette!("{error}"))?;
+	let mut bindings = Vec::new();
+	for hotkey in crate::keybindings::action_hotkeys() {
+		for chord in resolved.chords_for(hotkey.action_id, platform) {
+			let binding =
+				InputBinding::parse_with(&keymap, chord, hotkey.action.clone()).ok_or_else(|| {
+					miette::miette!(
+						"keybinding chord {chord} for {} cannot be decoded by the active keymap",
+						hotkey.action_id,
+					)
+				})?;
+			bindings.push(binding);
+		}
+	}
 	let shortcuts = crate::keybindings::ExtensionShortcutRoster::install_verified(
 		&extension_ui.shortcuts(),
 		&resolved,
 		platform,
 	)
 	.map_err(|error| miette::miette!("{error}"))?;
-	actions.extend(shortcuts.bindings().filter_map(|binding| {
-		InputBinding::parse(
-			binding.chord.as_str(),
-			InputAction::ExtensionShortcut(binding.chord.clone()),
+	for shortcut in shortcuts.bindings() {
+		let binding = InputBinding::parse_with(
+			&keymap,
+			shortcut.chord.as_str(),
+			InputAction::ExtensionShortcut(shortcut.chord.clone()),
 		)
-	}));
-	Ok((actions, dequeue_hint))
+		.ok_or_else(|| {
+			miette::miette!(
+				"extension keybinding chord {} cannot be decoded by the active keymap",
+				shortcut.chord,
+			)
+		})?;
+		bindings.push(binding);
+	}
+	Ok(LoadedInputActions { bindings, keymap, dequeue_hint, resolved })
 }
 
 fn current_browser_settings(manager: &SettingsManager) -> BrowserSettings {
@@ -2573,6 +2624,29 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 	chat
 }
 
+async fn settle_hub_turn<C>(agent: &mut Agent<C>, broker: &omp_agent::Broker, id: &str)
+where
+	C: TurnClient + Clone + Send + 'static,
+{
+	loop {
+		match broker.finish_turn(id) {
+			Ok(omp_agent::TurnEndDisposition::Terminal) => return,
+			Ok(omp_agent::TurnEndDisposition::ContinuationPending) => {
+				let turn_id = TurnId::new(format!("agent-irc-wake-{}", omp_core::Ulid::generate()));
+				if let Err(error) = agent.submit(Vec::new(), turn_id).await {
+					tracing::warn!(agent = %id, %error, "IRC wake continuation failed");
+					let _ = broker.finish_failed_turn(id);
+					return;
+				}
+			},
+			Err(error) => {
+				tracing::warn!(agent = %id, %error, "agent turn settlement failed");
+				return;
+			},
+		}
+	}
+}
+
 pub async fn run<C, R>(
 	mut agent: Agent<C>,
 	environment_host: &omp_envd::ProjectEnvironment,
@@ -2580,6 +2654,8 @@ pub async fn run<C, R>(
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	advisor_notices: flume::Receiver<Option<Str>>,
 	catalog: Arc<Catalog>,
+	discovery_runtime: Option<Arc<omp_driver::discovery::runtime::DiscoveryRuntime>>,
+	inference_registry: Option<omp_inference::Registry>,
 	registry: Arc<Registry>,
 	tree: Arc<AgentTree>,
 	parent: Arc<ChatParentHost<C>>,
@@ -2648,10 +2724,19 @@ where
 		.map(|replica| replica.subscribe());
 	let mut collab_presence = collab.as_ref().map(CollabCommandHandle::subscribe_presence);
 	let local_session_path = session.journal_path.clone();
-	let sessions_dir = local_session_path
-		.parent()
-		.ok_or_else(|| miette::miette!("active session path has no storage directory"))?
-		.to_path_buf();
+	let session_child_index = session
+		.future_session_index
+		.as_ref()
+		.map_or_else(|| Arc::clone(&session_index), Arc::clone);
+	let session_child_root = session.future_workspace_root.clone();
+	let sessions_dir = if let Some(directory) = session.future_sessions_dir.as_ref() {
+		directory.clone()
+	} else {
+		local_session_path
+			.parent()
+			.ok_or_else(|| miette::miette!("active session path has no storage directory"))?
+			.to_path_buf()
+	};
 	let mut session_restore = GuestSessionRestore::default();
 	let mut guest_projected = false;
 	// Turn deltas and their authoritative outcome share this stream. Dropping
@@ -2675,6 +2760,8 @@ where
 		)
 		.into_diagnostic()?;
 	let session_id = session.session_id.clone();
+	let hub_broker = parent.broker();
+	let hub_agent_id = session_id.clone();
 	let mut roster_events = tree.watch_roster();
 	let period = Duration::from_millis(100);
 	let mut roster_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -2699,11 +2786,14 @@ where
 		.collect();
 	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
 	let maintenance_registry = Arc::clone(&registry);
-	let session_delete_index = Arc::clone(&session_index);
+	let session_delete_index = Arc::clone(&session_child_index);
 	let agent_future = async move {
 		if startup_pending {
 			let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
-			let ack = match agent.submit(Vec::new(), turn_id).await {
+			let _ = hub_broker.set_idle(hub_agent_id.as_str(), false);
+			let result = agent.submit(Vec::new(), turn_id).await;
+			settle_hub_turn(&mut agent, &hub_broker, hub_agent_id.as_str()).await;
+			let ack = match result {
 				Ok(summary) => SubmitAck {
 					interrupted:     summary.interrupted,
 					committed_turns: summary.committed_turns,
@@ -2719,7 +2809,10 @@ where
 				UiCmd::Submit { item, budget } => {
 					apply_turn_budget(&submission_state, budget.as_ref());
 					let turn_id = TurnId::new(omp_core::Ulid::generate().to_string());
-					let ack = match agent.submit([*item], turn_id).await {
+					let _ = hub_broker.set_idle(hub_agent_id.as_str(), false);
+					let result = agent.submit([*item], turn_id).await;
+					settle_hub_turn(&mut agent, &hub_broker, hub_agent_id.as_str()).await;
+					let ack = match result {
 						Ok(summary) => SubmitAck {
 							interrupted:     summary.interrupted,
 							committed_turns: summary.committed_turns,
@@ -2778,6 +2871,7 @@ where
 				},
 				UiCmd::Retry { reply } => {
 					let turn_id = TurnId::new(format!("retry-{}", omp_core::Ulid::generate()));
+					let _ = hub_broker.set_idle(hub_agent_id.as_str(), false);
 					let result = agent
 						.retry_last_turn(turn_id)
 						.await
@@ -2787,6 +2881,7 @@ where
 								.map(|(items, text, _summary)| (items, text))
 								.ok_or_else(|| String::from("no user turn is available to retry"))
 						});
+					settle_hub_turn(&mut agent, &hub_broker, hub_agent_id.as_str()).await;
 					let _ = reply.send(result);
 				},
 				UiCmd::Compact { request } => {
@@ -2827,7 +2922,9 @@ where
 				UiCmd::CreateSessionChild { kind, child_id, child_path, title, reply } => {
 					let result = (|| -> Result<u64, String> {
 						let parent_id = agent.journal().session_id().clone();
-						let root = {
+						let root = if let Some(root) = session_child_root.as_ref() {
+							root.clone()
+						} else {
 							let journal = agent.journal().load().map_err(|error| error.to_string())?;
 							journal.header().cwd.clone()
 						};
@@ -2891,32 +2988,17 @@ where
 						continue;
 					}
 					drop(agent);
-					let tombstone =
-						path.with_extension(format!("jsonl.deleted-{}", omp_core::Ulid::generate()));
-					let result = (|| -> Result<(), String> {
-						fs::rename(&path, &tombstone).map_err(|error| error.to_string())?;
-						match session_delete_index.delete_session(&session_id) {
-							Ok(true) => {},
-							Ok(false) => {
-								let _ = fs::rename(&tombstone, &path);
-								return Err(String::from(
-									"session index no longer contains the live session",
-								));
-							},
-							Err(error) => {
-								let _ = fs::rename(&tombstone, &path);
-								return Err(error.to_string());
-							},
-						}
-						if let Err(error) = fs::remove_file(&tombstone) {
-							tracing::warn!(
-								path = %tombstone.display(),
-								%error,
-								"deleted session tombstone cleanup failed"
-							);
-						}
-						Ok(())
-					})();
+					let result = path
+						.parent()
+						.ok_or_else(|| String::from("live session path has no storage directory"))
+						.and_then(|sessions_dir| {
+							delete_indexed_session(
+								session_delete_index.as_ref(),
+								sessions_dir,
+								&session_id,
+								false,
+							)
+						});
 					let _ = reply.send(result);
 					break;
 				},
@@ -2980,14 +3062,27 @@ where
 		.into_diagnostic()?
 		.get()
 		.resolve_path_scopes(&workspace_root, &settings_home);
+	let task_model = settings_manager
+		.snapshot()
+		.project::<TaskSettings>()
+		.into_diagnostic()?
+		.get()
+		.agent_model_overrides
+		.get("task")
+		.cloned();
 	let title_user_set =
 		Arc::new(AtomicBool::new(session.title.source == Some(transcript::TitleSource::User)));
 	let has_history = !session.initial_items.is_empty() || startup_pending;
+	let LoadedInputActions { bindings: input_actions, keymap, dequeue_hint, resolved: keybindings } =
+		load_input_actions(&data_dir, extension_ui.as_ref())?;
 	let mut state = BridgeState {
 		catalog,
+		discovery_runtime,
+		inference_registry,
 		auth_control: auth_control.clone(),
 		model,
 		model_settings,
+		task_model,
 		pending_session_delete: None,
 		git: None,
 		git_facts: None,
@@ -2995,6 +3090,7 @@ where
 		session_id: session_id.clone(),
 		session_path: local_session_path.clone(),
 		sessions_dir,
+		process_started: SystemTime::now(),
 		title: session.title,
 		title_generation_in_flight: Arc::new(AtomicBool::new(false)),
 		title_user_set,
@@ -3028,6 +3124,7 @@ where
 		queued_prompts: VecDeque::new(),
 		audio: crate::audio_coordinator::InteractiveAudioController::new(),
 		jobs: HashSet::new(),
+		running_subagent_ids: HashSet::new(),
 		attempt: 0,
 		turn_started: startup_pending.then(Instant::now),
 		has_history,
@@ -3042,6 +3139,8 @@ where
 		live_activity: ActivityWaveform::new(),
 		token_rate: None,
 		tokens_per_second: None,
+		status_quota: None,
+		status_usage_refresh_due: false,
 		thinking,
 		pending_auth_kind: None,
 		pending_auth_provider: None,
@@ -3053,6 +3152,7 @@ where
 		command_sources,
 		command_usage: Arc::clone(&command_usage),
 		typed_commands,
+		keybindings,
 		extension_ui,
 		extension_callbacks: Some(extension_callbacks),
 		skills: Arc::clone(&skills),
@@ -3063,7 +3163,21 @@ where
 		approvals: HashMap::new(),
 		presentation_requests: HashMap::new(),
 		raw_stream: None,
+		logs: None,
 	};
+	let (status_usage_request_tx, status_usage_request_rx) = flume::bounded(1);
+	let (status_usage_update_tx, status_usage_update_rx) = flume::bounded(1);
+	let status_usage_task = tokio::spawn(run_status_usage_worker(
+		data_dir.clone(),
+		status_usage_request_rx,
+		status_usage_update_tx,
+	));
+	let mut status_usage_tick = tokio::time::interval_at(
+		tokio::time::Instant::now() + Duration::from_secs(60),
+		Duration::from_secs(60),
+	);
+	status_usage_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	queue_status_usage_refresh(&state, &status_usage_request_tx);
 	let _ = tokio::time::timeout(Duration::from_millis(300), refresh_lsp_roster(&mut state)).await;
 	let _ = tokio::time::timeout(Duration::from_millis(300), refresh_git_facts(&mut state)).await;
 	if let Err(error) = apply_configured_theme(&backend_tx, &data_dir, &mut state) {
@@ -3077,6 +3191,14 @@ where
 		);
 	}
 	send_recap_policy(&backend_tx, &state.settings);
+	send_backend(
+		&backend_tx,
+		BackendEvent::ShowTokenUsageChanged(state.settings.display.show_token_usage),
+	);
+	send_backend(
+		&backend_tx,
+		BackendEvent::ShowTurnTimeChanged(state.settings.display.show_turn_time),
+	);
 	let chat_seed = ChatSceneSeed {
 		typed_commands: chat_commands,
 		extension_ui: Arc::clone(&state.extension_ui),
@@ -3097,6 +3219,9 @@ where
 	};
 
 	send_models_updated(&backend_tx, &state);
+	if let Some(title) = state.title.title.clone() {
+		send_backend(&backend_tx, BackendEvent::SessionTitle(title));
+	}
 	if welcome {
 		send_backend(
 			&backend_tx,
@@ -3148,20 +3273,23 @@ where
 		}
 	}
 	if let Some(item) = initial_submission {
-		replay_items(
-			&backend_tx,
-			std::slice::from_ref(&item),
-			&mut state.tools,
-			&mut state.part_serial,
-			renderers.as_ref(),
-		);
+		let title_input = user_item_text(&item);
+		let mut replayed = replay_backend_events(std::slice::from_ref(&item), renderers.as_ref());
+		replayed.retain(|event| !matches!(event, BackendEvent::TurnAnchor(_)));
 		ui_tx
 			.send_async(UiCmd::Submit { item: Box::new(item), budget: None })
 			.await
 			.into_diagnostic()?;
+		for event in replayed {
+			send_backend(&backend_tx, event);
+		}
+		if let Some(input) = title_input {
+			maybe_spawn_session_title(&parent, &control, &state, input.as_str(), false);
+		}
 	}
-	send_status(&backend_tx, &state, &bus, 0);
 	let mut last_roster = project_agent_roster(&parent, &tree, &session_id);
+	state.running_subagent_ids = running_subagent_ids(&last_roster);
+	send_status(&backend_tx, &state, &bus, 0);
 	send_backend(&backend_tx, BackendEvent::AgentRoster(last_roster.clone()));
 	publish_collaboration_registry(state.collab_live.as_ref(), parent.as_ref(), session_id.as_str());
 
@@ -3169,7 +3297,6 @@ where
 	let mcp_inspector = environment_host.mcp_inspector();
 	let extension_reload = environment_host.extension_reload_handle();
 	let extension_ui_events = state.extension_ui.subscribe();
-	let input_extension_ui = Arc::clone(&state.extension_ui);
 	let mut lsp_refresh_deadline =
 		lsp_roster_active(&state.lsp_servers).then(|| Instant::now() + Duration::from_secs(60));
 	let mut lsp_refresh_tick = tokio::time::interval(Duration::from_secs(2));
@@ -3480,6 +3607,18 @@ where
 							Some(event) = next_auth_event(auth.as_ref()) => {
 								handle_auth_event(&backend_tx, &mut state, event);
 							},
+							Ok(update) = status_usage_update_rx.recv_async() => {
+								let current = status_usage_request(&state);
+								if current.as_ref().is_some_and(|request| {
+									request.provider == update.provider && request.model == update.model
+								}) {
+									state.status_quota = update.quota.daily.is_some().then_some(update.quota);
+									send_status(&backend_tx, &state, &bus, 0);
+								}
+							},
+							_ = status_usage_tick.tick() => {
+								queue_status_usage_refresh(&state, &status_usage_request_tx);
+							},
 							Some(request) = next_approval_request(&mut approval_inbox) => {
 								let ticket_id = request.ticket.ticket_id.clone();
 								send_backend(
@@ -3577,6 +3716,8 @@ where
 								}
 								if matches!(&*event, AgentEvent::RosterChanged { .. }) {
 									publish_agent_roster(&backend_tx, &parent, &tree, &session_id, &mut last_roster);
+									state.running_subagent_ids = running_subagent_ids(&last_roster);
+									send_status(&backend_tx, &state, &bus, 0);
 									publish_collaboration_registry(
 										state.collab_live.as_ref(),
 										parent.as_ref(),
@@ -3606,6 +3747,10 @@ where
 								bus.publish(AgentEvent::RosterChanged { generation });
 							},
 							_ = roster_tick.tick() => {
+								if state.status_usage_refresh_due {
+									queue_status_usage_refresh(&state, &status_usage_request_tx);
+									state.status_usage_refresh_due = false;
+								}
 								if project_agent_roster(&parent, &tree, &session_id) != last_roster {
 									bus.publish(AgentEvent::RosterChanged {
 										generation: tree.roster_generation(),
@@ -3625,7 +3770,6 @@ where
 		Ok::<(), miette::Report>(())
 	};
 
-	let (input_actions, dequeue_hint) = load_input_actions(&data_dir, input_extension_ui.as_ref())?;
 	let options = HostOptions {
 		welcome,
 		exit_on_session_change: true,
@@ -3634,6 +3778,7 @@ where
 		title_enabled,
 		resize_scrollback,
 		input_actions,
+		keymap,
 		dequeue_hint,
 	};
 	let (host_result, bridge_result): (
@@ -3659,7 +3804,10 @@ where
 				"native GUI support is not built; rerun with `--features gui`"
 			));
 			#[cfg(feature = "gui")]
+			let gui_keymap = options.keymap.clone();
+			#[cfg(feature = "gui")]
 			let (host_result, bridge_result) = gui::run(
+				gui_keymap,
 				move |ctx| {
 					let chat = chat_scene(&chat_seed, ctx);
 					RetainedChat::new(chat, ctx.clone(), backend_rx, intent_tx, options, initial_draft)
@@ -3672,6 +3820,8 @@ where
 	};
 	task_settings_watch.abort();
 	let _ = task_settings_watch.await;
+	status_usage_task.abort();
+	let _ = status_usage_task.await;
 	if tokio::time::timeout(Duration::from_secs(3), &mut agent_task)
 		.await
 		.is_err()
@@ -4019,6 +4169,7 @@ pub async fn run_guest(
 			title_enabled:          true,
 			resize_scrollback:      omp_chat_ui::host::ResizeScrollback::Rebuild,
 			input_actions:          Vec::new(),
+			keymap:                 omp_tui::Keymap::default(),
 			dequeue_hint:           None,
 		},
 		initial_draft,
@@ -4486,6 +4637,16 @@ fn compaction_notice(outcome: &omp_agent::ManualCompactionOutcome) -> Str {
 	}
 }
 
+fn open_raw_stream(backend: &flume::Sender<BackendEvent>, state: &mut BridgeState) {
+	let capture = omp_inference::transport::global_provider_capture();
+	let snapshot = capture.snapshot(Some(state.session_id.as_str()));
+	state.raw_stream = Some(capture.subscribe(Some(state.session_id.as_str())));
+	send_backend(backend, BackendEvent::OpenRawStream {
+		frames:  snapshot.frames.into_iter().map(raw_frame).collect(),
+		summary: stream_summary(snapshot.summary),
+	});
+}
+
 async fn reset_session(
 	control: &omp_agent::ControlSender,
 	gate: &omp_agent::HookGate,
@@ -4576,17 +4737,14 @@ fn toggle_live_voice(backend: &flume::Sender<BackendEvent>, state: &mut BridgeSt
 	}
 }
 
-fn append_hotkeys(mut help: String) -> String {
-	help.push_str(
-		"\n**Hotkeys**\n\n| Context | Key | Action |\n|---|---|---|\n| Composer | `Enter` | Steer \
-		 active turn or submit |\n| Composer | `Alt+Enter` | Queue follow-up |\n| Composer | `Esc` \
-		 | Interrupt active work |\n| Composer | `Esc Esc` | Open rewind history |\n| Composer | \
-		 `Ctrl+O` | Expand exact tool card |\n| Composer | `Ctrl+T` | Toggle thinking visibility \
-		 |\n| Composer | `Alt+P` | Switch model for this session |\n| Composer | `Ctrl+R` | Search \
-		 prompt history |\n| Composer | `Alt+Up` / `Shift+Up` | Restore newest queued item |\n| \
-		 Modal | `Enter` | Commit highlighted action |\n| Modal | `Esc` | Cancel modal; never \
-		 trigger composer shortcuts |\n| Modal | `Tab` / `Shift+Tab` | Move focus |\n| Approval | \
-		 `1` / `2` / `3` / `4` | Once / always / amend / reject |\n",
+fn append_hotkeys(
+	mut help: String,
+	keybindings: &crate::keybindings::config::ResolvedKeybindings,
+) -> String {
+	crate::keybindings::append_hotkey_help(
+		&mut help,
+		keybindings,
+		crate::keybindings::KeyPlatform::current(),
 	);
 	help
 }
@@ -4639,7 +4797,7 @@ where
 			true,
 			|_| true,
 		);
-		let help = append_hotkeys(help);
+		let help = append_hotkeys(help, &self.state.keybindings);
 		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(Str::from(help)))) })
 	}
 
@@ -4926,104 +5084,53 @@ where
 					"Wait for the active turn to finish before branching.",
 				)));
 			}
-			let checkpoint = if let Some(checkpoint) = request.checkpoint {
-				match checkpoint.parse::<u64>() {
-					Ok(checkpoint) => checkpoint,
-					Err(_) => {
-						return Ok(CommandResult::Consumed(ConsumedResult::status(
-							"Checkpoint must be a durable event number.",
-						)));
-					},
-				}
-			} else {
-				let (reply_tx, reply_rx) = flume::bounded(1);
-				self
-					.commands_tx
-					.send_async(UiCmd::ListRewind { reply: reply_tx })
+			if let Some(checkpoint) = request.checkpoint {
+				let Ok(checkpoint) = checkpoint.parse::<u64>() else {
+					return Ok(CommandResult::Consumed(ConsumedResult::status(
+						"Checkpoint must be a durable event number.",
+					)));
+				};
+				return Ok(CommandResult::Consumed(
+					match branch_and_switch(
+						self.commands_tx,
+						self.backend,
+						self.state,
+						self.data_dir,
+						checkpoint,
+						None,
+					)
 					.await
-					.into_diagnostic()?;
-				match reply_rx.recv_async().await {
-					Ok(Ok(targets)) => {
-						let Some(target) = targets.last() else {
-							return Ok(CommandResult::Consumed(ConsumedResult::status(
-								"No user checkpoint is available to branch from.",
-							)));
-						};
-						target.event
+					{
+						Ok(()) => ConsumedResult::silent(),
+						Err(status) => ConsumedResult::status(status),
 					},
-					Ok(Err(error)) => {
-						return Ok(CommandResult::Consumed(ConsumedResult::status(error)));
-					},
-					Err(_) => {
-						return Ok(CommandResult::Consumed(ConsumedResult::status(
-							"Agent checkpoint reply channel is closed.",
-						)));
-					},
-				}
+				));
+			}
+			let targets = match list_rewind_targets(self.commands_tx).await {
+				Ok(targets) => targets,
+				Err(status) => return Ok(CommandResult::Consumed(ConsumedResult::status(status))),
 			};
-			let summarize = match crate::chat_cmd::gate_session_branch(
-				&self.state.session_hooks,
-				checkpoint,
-				Some(checkpoint),
-				false,
-			)
-			.await
-			{
-				Ok(summarize) => summarize,
-				Err(reason) => {
-					return Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
-						"Branch denied: {reason}"
-					))));
-				},
-			};
-			if summarize {
+			if targets.is_empty() {
 				return Ok(CommandResult::Consumed(ConsumedResult::status(
-					"Branch summarization is unavailable for this session backend.",
+					"No user message is available to branch from.",
 				)));
 			}
-			let child_id = Str::from(omp_core::Ulid::generate().to_string());
-			let child_path = self
-				.state
-				.sessions_dir
-				.join(sf!("{child_id}.jsonl").as_str());
-			let (reply_tx, reply_rx) = flume::bounded(1);
-			self
-				.commands_tx
-				.send_async(UiCmd::CreateSessionChild {
-					kind: omp_agent::ChildKind::Branch { checkpoint },
-					child_id: child_id.clone(),
-					child_path,
-					title: None,
-					reply: reply_tx,
+			let rows = targets
+				.iter()
+				.rev()
+				.map(|target| ListRow {
+					key:    Str::from(target.event.to_string()),
+					label:  Str::new(target.text.lines().next().unwrap_or("")),
+					detail: sf!("branch here"),
 				})
-				.await
-				.into_diagnostic()?;
-			match reply_rx.recv_async().await {
-				Ok(Ok(new_head)) => {
-					crate::chat_cmd::notify_session_branched(
-						&self.state.session_hooks,
-						checkpoint,
-						new_head,
-						None,
-					);
-					send_backend(
-						self.backend,
-						BackendEvent::Sessions(vec![SessionRow {
-							id:     child_id.clone(),
-							label:  child_id.clone(),
-							detail: sf!("branch of {}", self.state.session_id),
-							pinned: false,
-						}]),
-					);
-					Ok(CommandResult::Consumed(ConsumedResult::silent()))
-				},
-				Ok(Err(error)) => {
-					Ok(CommandResult::Consumed(ConsumedResult::status(sf!("Branch failed: {error}"))))
-				},
-				Err(_) => Ok(CommandResult::Consumed(ConsumedResult::status(
-					"Branch failed: agent reply channel is closed.",
-				))),
-			}
+				.collect();
+			self.state.rewind_targets = targets;
+			send_backend(self.backend, BackendEvent::OpenSelection {
+				title: sf!("Branch from message"),
+				purpose: omp_chat_ui::SelectionPurpose::Branch,
+				rows,
+			});
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
 	}
 
@@ -5075,25 +5182,30 @@ where
 		})
 	}
 
-	fn branch_tree(&mut self) -> CommandFuture<'_> {
-		let result = (|| -> miette::Result<Str> {
-			let current = SessionId(self.state.session_id.clone());
-			let root_id = self
-				.session_index
-				.lineage(&current)
-				.into_diagnostic()?
-				.first()
-				.map_or_else(|| current.0.clone(), |link| link.id.0.clone());
-			let tree = SessionTree::load(
-				&self
-					.state
-					.sessions_dir
-					.join(sf!("{root_id}.jsonl").as_str()),
-			)
-			.map_err(|error| miette::miette!("{error}"))?;
-			Ok(Str::from(omp_driver::export::render_lineage(&tree, current.0.as_str())))
-		})();
-		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(result?))) })
+	fn tree(&mut self) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before rewinding.",
+				)));
+			}
+			let targets = match list_rewind_targets(self.commands_tx).await {
+				Ok(targets) => targets,
+				Err(status) => return Ok(CommandResult::Consumed(ConsumedResult::status(status))),
+			};
+			if targets.is_empty() {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"No earlier user message to rewind to.",
+				)));
+			}
+			let rows = targets
+				.iter()
+				.map(|target| RewindTargetRow { event: target.event, text: target.text.clone() })
+				.collect();
+			self.state.rewind_targets = targets;
+			send_backend(self.backend, BackendEvent::RewindTargets(rows));
+			Ok(CommandResult::Consumed(ConsumedResult::silent()))
+		})
 	}
 
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_> {
@@ -5222,6 +5334,7 @@ where
 				},
 				WorkspaceRequest::Move(raw) => {
 					let root = commands::workspace::canonical_directory(&current, raw.as_str()).await?;
+					omp_driver::workspace_roots::ensure_directory_enterable(&root).into_diagnostic()?;
 					let roots = control.workspace_roots().await.into_diagnostic()?;
 					if roots.primary() == root {
 						sf!("The future primary workspace root is already `{}`.", root.display())
@@ -5253,11 +5366,13 @@ where
 							None
 						};
 						let destination_index = destination_index.as_ref().unwrap_or(self.session_index);
-						let moved_file = destination_path != source_path;
-						if moved_file {
-							omp_driver::session_state::relocate_journal(&source_path, &destination_path)
-								.into_diagnostic()?;
-						}
+						let mut relocation = Some(
+							omp_driver::session_state::JournalRelocation::begin(
+								&source_path,
+								&destination_path,
+							)
+							.into_diagnostic()?,
+						);
 						let session_id = SessionId(self.state.session_id.clone());
 						let root_text = root.to_string_lossy();
 						match self.session_index.relocate_session(
@@ -5268,37 +5383,58 @@ where
 						) {
 							Ok(true) => {},
 							Ok(false) => {
-								if moved_file {
-									let _ = omp_driver::session_state::relocate_journal(
-										&destination_path,
-										&source_path,
-									);
+								if let Some(relocation) = relocation.take()
+									&& let Err(rollback) = relocation.rollback()
+								{
+									let reason =
+										sf!("Session move rollback failed: {rollback}. Submission disabled.");
+									self.parent.terminate_project_mismatch(reason.clone());
+									return Err(miette::miette!(reason));
 								}
 								return Err(miette::miette!("active session is absent from its index"));
 							},
 							Err(error) => {
-								if moved_file {
-									let _ = omp_driver::session_state::relocate_journal(
-										&destination_path,
-										&source_path,
+								if let Some(relocation) = relocation.take()
+									&& let Err(rollback) = relocation.rollback()
+								{
+									let reason = sf!(
+										"Session move failed ({error}); rollback failed ({rollback}). \
+										 Submission disabled."
 									);
+									self.parent.terminate_project_mismatch(reason.clone());
+									return Err(miette::miette!(reason));
 								}
 								return Err(miette::miette!(error));
 							},
 						}
 						if let Err(error) = control.move_workspace_root(now_ms(), root.clone()).await {
 							let current_text = current.to_string_lossy();
-							let _ = destination_index.relocate_session(
+							let index_rollback = destination_index.relocate_session(
 								self.session_index,
 								&session_id,
 								current_text.as_ref(),
 								current_text.as_ref(),
 							);
-							if moved_file {
-								let _ = omp_driver::session_state::relocate_journal(
-									&destination_path,
-									&source_path,
+							let journal_rollback = relocation
+								.take()
+								.map(|relocation| relocation.rollback())
+								.transpose();
+							if !matches!(index_rollback, Ok(true)) || journal_rollback.is_err() {
+								let index_detail = match index_rollback {
+									Ok(true) => sf!("restored"),
+									Ok(false) => sf!("session absent from destination index"),
+									Err(rollback) => sf!("{rollback}"),
+								};
+								let journal_detail = journal_rollback
+									.err()
+									.map_or_else(|| sf!("restored"), |rollback| sf!("{rollback}"));
+								let reason = sf!(
+									"Session workspace move failed ({error}); index rollback: \
+									 {index_detail}; journal rollback: {journal_detail}. Submission \
+									 disabled."
 								);
+								self.parent.terminate_project_mismatch(reason.clone());
+								return Err(miette::miette!(reason));
 							}
 							return Err(error).into_diagnostic();
 						}
@@ -5325,13 +5461,7 @@ where
 
 	fn debug(&mut self, inspector: Option<Str>) -> CommandFuture<'_> {
 		if inspector.as_deref() == Some("raw-stream") {
-			let capture = omp_inference::transport::global_provider_capture();
-			let snapshot = capture.snapshot(Some(self.state.session_id.as_str()));
-			self.state.raw_stream = Some(capture.subscribe(Some(self.state.session_id.as_str())));
-			send_backend(self.backend, BackendEvent::OpenRawStream {
-				frames:  snapshot.frames.into_iter().map(raw_frame).collect(),
-				summary: stream_summary(snapshot.summary),
-			});
+			open_raw_stream(self.backend, self.state);
 			return silent_command();
 		}
 		let rendered = commands::render_debug(
@@ -5622,7 +5752,8 @@ where
 fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
 	let document =
 		toml::Value::try_from(settings).unwrap_or_else(|_| toml::Value::Table(toml::Table::new()));
-	let mut rows = omp_settings::registered_domains()
+	let mut rows = crate::SETTINGS_CATALOG
+		.descriptors()
 		.into_iter()
 		.flat_map(|domain| {
 			let document = &document;
@@ -5685,7 +5816,7 @@ fn apply_setting_changes(
 	changes: &[omp_chat_ui::SettingChange],
 ) -> miette::Result<()> {
 	let mut document = toml::Value::try_from(&*settings).into_diagnostic()?;
-	let domains = omp_settings::registered_domains();
+	let domains = crate::SETTINGS_CATALOG.descriptors();
 	for change in changes {
 		let field = domains
 			.iter()
@@ -7492,6 +7623,153 @@ fn recap_preview(text: &str) -> Option<Str> {
 	Some(Str::new(&one_line[..end]))
 }
 
+/// Fetches live rewind targets from the agent task.
+async fn list_rewind_targets(commands_tx: &flume::Sender<UiCmd>) -> Result<Vec<RewindTarget>, Str> {
+	let (reply_tx, reply_rx) = flume::bounded(1);
+	if commands_tx
+		.send_async(UiCmd::ListRewind { reply: reply_tx })
+		.await
+		.is_err()
+	{
+		return Err(sf!("Agent input channel is closed."));
+	}
+	match reply_rx.recv_async().await {
+		Ok(Ok(targets)) => Ok(targets),
+		Ok(Err(error)) => Err(Str::from(error)),
+		Err(_) => Err(sf!("Agent rewind reply channel is closed.")),
+	}
+}
+
+/// Creates a lineage child at `checkpoint`, seeds its composer draft, and
+/// requests a host-level switch into the new session.
+async fn branch_and_switch(
+	commands_tx: &flume::Sender<UiCmd>,
+	backend: &flume::Sender<BackendEvent>,
+	state: &BridgeState,
+	data_dir: &Path,
+	checkpoint: u64,
+	draft: Option<Str>,
+) -> Result<(), Str> {
+	let summarize = crate::chat_cmd::gate_session_branch(
+		&state.session_hooks,
+		checkpoint,
+		Some(checkpoint),
+		false,
+	)
+	.await
+	.map_err(|reason| sf!("Branch denied: {reason}"))?;
+	if summarize {
+		return Err(sf!("Branch summarization is unavailable for this session backend."));
+	}
+	let child_id = Str::from(omp_core::Ulid::generate().to_string());
+	let child_path = state.sessions_dir.join(sf!("{child_id}.jsonl").as_str());
+	let (reply_tx, reply_rx) = flume::bounded(1);
+	if commands_tx
+		.send_async(UiCmd::CreateSessionChild {
+			kind: omp_agent::ChildKind::Branch { checkpoint },
+			child_id: child_id.clone(),
+			child_path,
+			title: None,
+			reply: reply_tx,
+		})
+		.await
+		.is_err()
+	{
+		return Err(sf!("Agent input channel is closed."));
+	}
+	match reply_rx.recv_async().await {
+		Ok(Ok(new_head)) => {
+			crate::chat_cmd::notify_session_branched(&state.session_hooks, checkpoint, new_head, None);
+			if let Some(text) = draft
+				&& !text.is_empty()
+				&& let Err(error) = crate::session_manager::DraftStore::new(data_dir)
+					.and_then(|drafts| drafts.save(&SessionId(child_id.clone()), text.as_str()))
+			{
+				tracing::warn!(%error, "branched composer draft could not be saved");
+			}
+			send_backend(backend, BackendEvent::SessionResumeRequested(child_id));
+			Ok(())
+		},
+		Ok(Err(error)) => Err(sf!("Branch failed: {error}")),
+		Err(_) => Err(sf!("Branch failed: agent reply channel is closed.")),
+	}
+}
+
+fn debug_artifact_notice(label: &str, path: &Path) -> Str {
+	if let Some(url) = crate::debug::artifact_url(path) {
+		sf!("{label}: [`{}`]({url})", path.display())
+	} else {
+		sf!("{label}: `{}`", path.display())
+	}
+}
+
+fn debug_log_entries(
+	chunk: &crate::debug_logs::LogChunk,
+) -> Vec<omp_chat_ui::log_viewer::LogEntry> {
+	chunk
+		.lines
+		.iter()
+		.enumerate()
+		.map(|(index, line)| omp_chat_ui::log_viewer::LogEntry {
+			line: Str::new(line),
+			pid: None,
+			current_process_boundary: chunk.current_process_boundary == Some(index),
+		})
+		.collect()
+}
+
+fn debug_log_files(directory: &Path) -> Vec<PathBuf> {
+	let Ok(entries) = fs::read_dir(directory) else {
+		return Vec::new();
+	};
+	let mut files = Vec::new();
+	for entry in entries.filter_map(Result::ok) {
+		let path = entry.path();
+		if path.is_file() && path.extension().is_some_and(|extension| extension == "log") {
+			files.push(path);
+		} else if path.is_dir()
+			&& let Ok(children) = fs::read_dir(path)
+		{
+			files.extend(
+				children
+					.filter_map(Result::ok)
+					.map(|child| child.path())
+					.filter(|child| {
+						child.is_file()
+							&& child
+								.extension()
+								.is_some_and(|extension| extension == "log")
+					}),
+			);
+		}
+	}
+	files
+}
+
+fn render_terminal_facts(facts: &crate::debug::TerminalFacts) -> Str {
+	let cell_pixels = facts
+		.cell_pixels
+		.map_or_else(|| "unknown".to_owned(), |(width, height)| format!("{width} × {height}"));
+	let kitty_keyboard = facts
+		.kitty_keyboard
+		.map_or_else(|| "none".to_owned(), |flags| flags.to_string());
+	sf!(
+		"## Terminal information\n\n| Field | Value |\n|---|---|\n| Terminal | `{}` |\n| Character \
+		 set | `{}` |\n| Graphics | `{}` |\n| Cell pixels | `{cell_pixels}` |\n| Hyperlinks | `{}` \
+		 |\n| Text sizing | `{}` |\n| Notifications | `{}` |\n| Multiplexer | `{}` |\n| Scrollback \
+		 | `{}` |\n| Synchronized output | `{}` |\n| Kitty keyboard flags | `{kitty_keyboard}` |",
+		facts.terminal,
+		facts.charset,
+		facts.graphics,
+		facts.hyperlinks,
+		facts.text_sizing,
+		facts.notifications,
+		facts.multiplexer,
+		facts.scrollback,
+		facts.synchronized_output,
+	)
+}
+
 async fn handle_intent<C, R>(
 	mcp_inspector: &omp_envd::McpInspectorHandle,
 	intent: Intent,
@@ -7832,14 +8110,15 @@ where
 					}
 				},
 				Ok(ChatCommand::Help) => {
+					let help = state.typed_commands.help_text(
+						CommandSurface::Tui,
+						command_role(state.collab.as_ref()),
+						true,
+						|_| true,
+					);
 					send_backend(
 						backend,
-						BackendEvent::Notice(Str::from(append_hotkeys(state.typed_commands.help_text(
-							CommandSurface::Tui,
-							command_role(state.collab.as_ref()),
-							true,
-							|_| true,
-						)))),
+						BackendEvent::Notice(Str::from(append_hotkeys(help, &state.keybindings))),
 					);
 				},
 				Ok(ChatCommand::Login(provider)) => {
@@ -8022,7 +8301,7 @@ where
 					backend,
 					BackendEvent::Error(sf!("Prewalk does not own the visible mode resource.")),
 				),
-				Ok(ChatCommand::Skill { name, args, budget }) => {
+				Ok(ChatCommand::Skill { name, args, budget, submitted_at_ms }) => {
 					let Some(skill) = state.skills.get(name.as_str()) else {
 						send_backend(backend, BackendEvent::Error(sf!("Unknown skill `{name}`.")));
 						return Ok(false);
@@ -8048,7 +8327,7 @@ where
 						mem::take(&mut state.title_replan_refresh_pending)
 							&& state.settings.title.refresh_on_replan
 					});
-					let mut item = input::user_message(rendered.as_str());
+					let mut item = input::user_message_at(rendered.as_str(), submitted_at_ms);
 					let chips = lower_attachments(&mut item, attachments.clone(), |message| {
 						send_backend(backend, BackendEvent::Error(message));
 					});
@@ -8124,19 +8403,20 @@ where
 						);
 					} else {
 						let active = chat_active(state.submit_pending, bus.phase());
-						let title_replanned = (!active).then(|| {
+						let mut item = *item;
+						let visible_user = user_item_text(&item).is_some();
+						let title_replanned = (!active && visible_user).then(|| {
 							mem::take(&mut state.title_replan_refresh_pending)
 								&& state.settings.title.refresh_on_replan
 						});
-						let pending_prompt = (!active).then(|| PendingPrompt {
+						let pending_prompt = (!active && visible_user).then(|| PendingPrompt {
 							text:        prompt_text.clone(),
 							attachments: attachments.clone(),
 						});
-						let queued_prompt = active.then(|| omp_chat_ui::QueuedPrompt {
+						let queued_prompt = (active && visible_user).then(|| omp_chat_ui::QueuedPrompt {
 							text:        prompt_text.clone(),
 							attachments: attachments.clone(),
 						});
-						let mut item = *item;
 						let chips = lower_attachments(&mut item, attachments, |message| {
 							send_backend(backend, BackendEvent::Error(message));
 						});
@@ -8173,13 +8453,21 @@ where
 						};
 						if delivered {
 							state.has_history = true;
-							send_backend(backend, BackendEvent::UserReplayed {
-								text: prompt_text,
-								chips,
-								queued: active,
-							});
 							if let Some(replanned) = title_replanned {
-								maybe_spawn_session_title(parent, control, state, text.as_str(), replanned);
+								maybe_spawn_session_title(
+									parent,
+									control,
+									state,
+									prompt_text.as_str(),
+									replanned,
+								);
+							}
+							if visible_user {
+								send_backend(backend, BackendEvent::UserReplayed {
+									text: prompt_text,
+									chips,
+									queued: active,
+								});
 							}
 							if active {
 								state.queued = state.queued.saturating_add(1);
@@ -8511,7 +8799,12 @@ where
 			},
 		},
 		Intent::Suspend | Intent::ResetDisplay | Intent::InspectHistory => {},
-		Intent::OpenModelHub => send_open_model_hub(backend, settings_manager, state),
+		Intent::OpenModelHub => {
+			send_open_model_hub(backend, settings_manager, state);
+			if state.discovery_runtime.is_some() {
+				refresh_runtime_models(backend, settings_manager, state).await;
+			}
+		},
 		Intent::ModelHub(intent) => {
 			match apply_model_hub_intent(settings_manager, state.model_settings.role_storage, intent) {
 				Ok(()) => {
@@ -8533,6 +8826,8 @@ where
 			let composer_style = state.settings.composer.shape;
 			let spelling = state.settings.spelling;
 			let smooth_streaming = state.settings.display.smooth_streaming;
+			let show_token_usage = state.settings.display.show_token_usage;
+			let show_turn_time = state.settings.display.show_turn_time;
 			let appearance = state.settings.appearance.clone();
 			apply_setting_changes(&mut state.settings, &changes)?;
 			if state.settings.appearance != appearance
@@ -8563,6 +8858,18 @@ where
 				send_backend(
 					backend,
 					BackendEvent::SmoothStreamingChanged(state.settings.display.smooth_streaming),
+				);
+			}
+			if state.settings.display.show_token_usage != show_token_usage {
+				send_backend(
+					backend,
+					BackendEvent::ShowTokenUsageChanged(state.settings.display.show_token_usage),
+				);
+			}
+			if state.settings.display.show_turn_time != show_turn_time {
+				send_backend(
+					backend,
+					BackendEvent::ShowTurnTimeChanged(state.settings.display.show_turn_time),
 				);
 			}
 			send_recap_policy(backend, &state.settings);
@@ -8597,6 +8904,44 @@ where
 		Intent::Select { purpose, key } => match purpose {
 			omp_chat_ui::SelectionPurpose::Copy => {
 				send_backend(backend, BackendEvent::CopyToClipboard(key));
+			},
+			omp_chat_ui::SelectionPurpose::Branch => {
+				if chat_active(state.submit_pending, bus.phase()) {
+					send_backend(
+						backend,
+						BackendEvent::Error(sf!("Wait for the active turn to finish before branching.",)),
+					);
+				} else {
+					let target = key.parse::<u64>().ok().and_then(|event| {
+						state
+							.rewind_targets
+							.iter()
+							.find(|target| target.event == event)
+							.cloned()
+					});
+					match target {
+						Some(target) => {
+							let checkpoint = target.keep.unwrap_or(0);
+							match branch_and_switch(
+								commands_tx,
+								backend,
+								state,
+								data_dir,
+								checkpoint,
+								Some(target.text),
+							)
+							.await
+							{
+								Ok(()) => state.rewind_targets.clear(),
+								Err(status) => send_backend(backend, BackendEvent::Error(status)),
+							}
+						},
+						None => send_backend(
+							backend,
+							BackendEvent::Error(sf!("The selected branch point is no longer available.",)),
+						),
+					}
+				}
 			},
 			omp_chat_ui::SelectionPurpose::Hook
 			| omp_chat_ui::SelectionPurpose::Advisor
@@ -8731,6 +9076,240 @@ where
 			}
 			send_backend(backend, BackendEvent::ApprovalSettled { ticket_id });
 		},
+		Intent::DebugMenuRequest => {
+			send_backend(backend, BackendEvent::OpenDebugTools(crate::debug::selector_rows()));
+		},
+		Intent::DebugAction(key) => {
+			let action = match key.as_str().parse::<crate::debug::DebugAction>() {
+				Ok(action) => action,
+				Err(_) => {
+					send_backend(backend, BackendEvent::Error(sf!("Unknown debug action `{key}`.")));
+					return Ok(false);
+				},
+			};
+			match crate::debug::target(action, omp_tui::detect()) {
+				crate::debug::DebugTarget::ArtifactFolder => match commands::session_artifacts(
+					data_dir,
+					state.workspace_root.as_str(),
+					state.session_id.as_str(),
+					&state.session_path,
+				) {
+					Ok(path) => {
+						if let Err(error) = fs::create_dir_all(&path) {
+							send_backend(
+								backend,
+								BackendEvent::Error(sf!("Could not create artifact directory: {error}")),
+							);
+						} else {
+							send_backend(
+								backend,
+								BackendEvent::Notice(debug_artifact_notice("Session artifacts", &path)),
+							);
+						}
+					},
+					Err(error) => send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not resolve artifact directory: {error}")),
+					),
+				},
+				crate::debug::DebugTarget::Report(kind) => match commands::session_artifacts(
+					data_dir,
+					state.workspace_root.as_str(),
+					state.session_id.as_str(),
+					&state.session_path,
+				) {
+					Ok(directory) => {
+						let settings = serde_json::to_value(settings_manager.snapshot().document());
+						match settings {
+							Ok(settings) => {
+								let output = directory
+									.join(format!("omp-report-{}.tar.gz", omp_core::Ulid::generate()));
+								let mut spec = crate::diagnostics::BundleSpec::new(
+									output,
+									state.session_path.clone(),
+									settings,
+								);
+								spec.logs = debug_log_files(&commands::debug_logs_dir(data_dir));
+								match tokio::task::spawn_blocking(move || {
+									crate::diagnostics::create_bundle(spec)
+								})
+								.await
+								{
+									Ok(Ok(summary)) => {
+										let degraded = match kind {
+											crate::debug::ReportKind::Session => "",
+											crate::debug::ReportKind::Performance => {
+												" Performance sampling was not active; this bundle contains \
+												 session diagnostics only."
+											},
+											crate::debug::ReportKind::Memory => {
+												" Allocator sampling was not active; this bundle contains \
+												 session diagnostics only."
+											},
+										};
+										let notice =
+											debug_artifact_notice("Diagnostic bundle", &summary.output);
+										send_backend(
+											backend,
+											BackendEvent::Notice(sf!(
+												"{notice} · {} bytes.{degraded}",
+												summary.uncompressed_bytes
+											)),
+										);
+									},
+									Ok(Err(error)) => send_backend(
+										backend,
+										BackendEvent::Error(sf!(
+											"Could not create diagnostic bundle: {error}"
+										)),
+									),
+									Err(error) => send_backend(
+										backend,
+										BackendEvent::Error(sf!("Diagnostic bundle task failed: {error}")),
+									),
+								}
+							},
+							Err(error) => send_backend(
+								backend,
+								BackendEvent::Error(sf!(
+									"Could not snapshot settings for diagnostics: {error}"
+								)),
+							),
+						}
+					},
+					Err(error) => send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not resolve artifact directory: {error}")),
+					),
+				},
+				crate::debug::DebugTarget::Logs => {
+					let directory = commands::debug_logs_dir(data_dir);
+					match crate::debug_logs::LogSource::discover(&directory, state.process_started) {
+						Ok(source) => match source.newest() {
+							Ok(Some(cursor)) => {
+								match source.read_older(cursor, crate::debug_logs::DEFAULT_CHUNK_BYTES) {
+									Ok(chunk) => {
+										let entries = debug_log_entries(&chunk);
+										let has_older = chunk.older.is_some();
+										state.logs = Some((source, chunk.older));
+										send_backend(backend, BackendEvent::OpenLogs {
+											entries,
+											current_pid: std::process::id(),
+											has_older,
+										});
+									},
+									Err(error) => send_backend(
+										backend,
+										BackendEvent::Error(sf!("Could not read debug logs: {error}")),
+									),
+								}
+							},
+							Ok(None) => {
+								state.logs = Some((source, None));
+								send_backend(backend, BackendEvent::OpenLogs {
+									entries:     Vec::new(),
+									current_pid: std::process::id(),
+									has_older:   false,
+								});
+							},
+							Err(error) => send_backend(
+								backend,
+								BackendEvent::Error(sf!("Could not inspect debug logs: {error}")),
+							),
+						},
+						Err(error) => send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not discover debug logs: {error}")),
+						),
+					}
+				},
+				crate::debug::DebugTarget::RawStream => open_raw_stream(backend, state),
+				crate::debug::DebugTarget::System(facts) => {
+					match commands::render_system_facts(&facts) {
+						Ok(rendered) => send_backend(backend, BackendEvent::Notice(rendered)),
+						Err(error) => send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not render system facts: {error}")),
+						),
+					}
+				},
+				crate::debug::DebugTarget::Terminal(facts) => {
+					send_backend(backend, BackendEvent::Notice(render_terminal_facts(&facts)));
+				},
+				crate::debug::DebugTarget::ProtocolProbe => {
+					send_backend(backend, BackendEvent::OpenProtocolProbe);
+				},
+				crate::debug::DebugTarget::TranscriptExport => {
+					match crate::render_cmd::history_frame(&state.session_path, registry, renderers) {
+						Ok(frame) => match commands::session_artifacts(
+							data_dir,
+							state.workspace_root.as_str(),
+							state.session_id.as_str(),
+							&state.session_path,
+						) {
+							Ok(directory) => {
+								let text = omp_tui::frame_text(&frame);
+								match crate::debug::export_transcript(&directory, &text) {
+									Ok(path) => send_backend(
+										backend,
+										BackendEvent::Notice(debug_artifact_notice(
+											"Transcript export",
+											&path,
+										)),
+									),
+									Err(error) => send_backend(
+										backend,
+										BackendEvent::Error(sf!("Could not export transcript: {error}")),
+									),
+								}
+							},
+							Err(error) => send_backend(
+								backend,
+								BackendEvent::Error(sf!("Could not resolve artifact directory: {error}")),
+							),
+						},
+						Err(error) => send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not render transcript: {error}")),
+						),
+					}
+				},
+				crate::debug::DebugTarget::GarbageCollect => {
+					match crate::gc_cmd::sweep_debug(data_dir, Duration::from_secs(300)) {
+						Ok(report) => send_backend(
+							backend,
+							BackendEvent::Notice(sf!(
+								"Garbage collection removed {} blob(s) and reclaimed {} bytes.",
+								report.reclaimed_count,
+								report.reclaimed_bytes
+							)),
+						),
+						Err(error) => send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not garbage collect artifacts: {error}")),
+						),
+					}
+				},
+			}
+		},
+		Intent::OlderLogs => {
+			let Some((source, older @ Some(_))) = state.logs.as_mut() else {
+				return Ok(false);
+			};
+			let cursor = (*older).expect("older cursor remains present");
+			match source.read_older(cursor, crate::debug_logs::DEFAULT_CHUNK_BYTES) {
+				Ok(chunk) => {
+					let entries = debug_log_entries(&chunk);
+					let has_older = chunk.older.is_some();
+					*older = chunk.older;
+					send_backend(backend, BackendEvent::OlderLogs { entries, has_older });
+				},
+				Err(error) => send_backend(
+					backend,
+					BackendEvent::Error(sf!("Could not read older debug logs: {error}")),
+				),
+			}
+		},
 		Intent::RewindRequest => {
 			if chat_active(state.submit_pending, bus.phase()) {
 				send_backend(
@@ -8738,37 +9317,30 @@ where
 					BackendEvent::Error(sf!("Wait for the active turn to finish before rewinding.",)),
 				);
 			} else {
-				let (reply_tx, reply_rx) = flume::bounded(1);
-				if commands_tx
-					.send_async(UiCmd::ListRewind { reply: reply_tx })
-					.await
-					.is_err()
-				{
-					send_backend(backend, BackendEvent::Error(sf!("Agent input channel is closed.")));
-				} else {
-					match reply_rx.recv_async().await {
-						Ok(Ok(targets)) => {
-							state.rewind_targets = targets;
-							send_backend(
-								backend,
-								BackendEvent::RewindTargets(
-									state
-										.rewind_targets
-										.iter()
-										.map(|target| RewindTargetRow {
-											event: target.event,
-											text:  target.text.clone(),
-										})
-										.collect(),
-								),
-							);
-						},
-						Ok(Err(error)) => send_backend(backend, BackendEvent::Error(Str::from(error))),
-						Err(_) => send_backend(
+				match list_rewind_targets(commands_tx).await {
+					Ok(targets) if targets.is_empty() => {
+						send_backend(
 							backend,
-							BackendEvent::Error(sf!("Agent rewind reply channel is closed.")),
-						),
-					}
+							BackendEvent::Notice(sf!("No earlier user message to rewind to.")),
+						);
+					},
+					Ok(targets) => {
+						state.rewind_targets = targets;
+						send_backend(
+							backend,
+							BackendEvent::RewindTargets(
+								state
+									.rewind_targets
+									.iter()
+									.map(|target| RewindTargetRow {
+										event: target.event,
+										text:  target.text.clone(),
+									})
+									.collect(),
+							),
+						);
+					},
+					Err(status) => send_backend(backend, BackendEvent::Error(status)),
 				}
 			}
 		},
@@ -8865,6 +9437,9 @@ where
 			)
 			.await;
 		},
+		Intent::SwitchTaskModel(model) => {
+			switch_task_model(backend, settings_manager, model.as_str(), state);
+		},
 		Intent::Login(provider) => {
 			if chat_active(state.submit_pending, bus.phase()) {
 				send_backend(
@@ -8915,6 +9490,90 @@ where
 				}
 			}
 		},
+		Intent::SessionList { all_projects, sort_by_title, show_paths } => {
+			match indexed_session_rows(
+				session_index,
+				&state.sessions_dir,
+				state.workspace_root.as_str(),
+				state.session_id.as_str(),
+				all_projects,
+				sort_by_title,
+				show_paths,
+			) {
+				Ok(rows) => send_backend(backend, BackendEvent::Sessions(rows)),
+				Err(error) => {
+					send_backend(backend, BackendEvent::Error(sf!("Could not list sessions: {error}")))
+				},
+			}
+		},
+		Intent::SessionDelete { id, noninvasive } => {
+			if id == state.session_id {
+				send_backend(backend, BackendEvent::Error(sf!("Cannot delete the live session.")));
+			} else {
+				let session = SessionId(id);
+				match delete_indexed_session(session_index, &state.sessions_dir, &session, noninvasive)
+				{
+					Ok(()) => match indexed_session_rows(
+						session_index,
+						&state.sessions_dir,
+						state.workspace_root.as_str(),
+						state.session_id.as_str(),
+						false,
+						false,
+						false,
+					) {
+						Ok(rows) => send_backend(backend, BackendEvent::Sessions(rows)),
+						Err(error) => send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not list sessions: {error}")),
+						),
+					},
+					Err(error) => send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not delete session: {error}")),
+					),
+				}
+			}
+		},
+		Intent::SessionRename { id, title } => {
+			if id == state.session_id {
+				if chat_active(state.submit_pending, bus.phase()) {
+					send_backend(
+						backend,
+						BackendEvent::Error(sf!("Wait for the active turn to finish before renaming.",)),
+					);
+				} else {
+					let user_set = Arc::clone(&state.title_user_set);
+					let was_user_set = user_set.swap(true, Ordering::AcqRel);
+					let _commit = state.title_commit_lock.lock().await;
+					if let Err(error) = control.set_title(omp_agent::broker_now_ms(), title).await {
+						user_set.store(was_user_set, Ordering::Release);
+						send_backend(
+							backend,
+							BackendEvent::Error(sf!("Could not rename the live session: {error}")),
+						);
+					} else {
+						refresh_indexed_session_rows(backend, session_index, state);
+					}
+				}
+			} else {
+				let session = SessionId(id);
+				match session_index.rename_session(&session, title.as_str()) {
+					Ok(true) => refresh_indexed_session_rows(backend, session_index, state),
+					Ok(false) => send_backend(
+						backend,
+						BackendEvent::Error(sf!("The selected session no longer exists.")),
+					),
+					Err(error) => send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not rename session: {error}")),
+					),
+				}
+			}
+		},
+		Intent::RefreshModels => {
+			refresh_runtime_models(backend, settings_manager, state).await;
+		},
 		Intent::Resume(None) => {
 			if chat_active(state.submit_pending, bus.phase()) {
 				send_backend(
@@ -8954,14 +9613,15 @@ where
 			}
 		},
 		Intent::Help => {
+			let help = state.typed_commands.help_text(
+				CommandSurface::Tui,
+				command_role(state.collab.as_ref()),
+				true,
+				|_| true,
+			);
 			send_backend(
 				backend,
-				BackendEvent::Notice(Str::from(append_hotkeys(state.typed_commands.help_text(
-					CommandSurface::Tui,
-					command_role(state.collab.as_ref()),
-					true,
-					|_| true,
-				)))),
+				BackendEvent::Notice(Str::from(append_hotkeys(help, &state.keybindings))),
 			);
 		},
 		Intent::Quit => {
@@ -9007,12 +9667,7 @@ async fn execute_deferred_command<C>(
 	C: TurnClient + Clone + Send + 'static,
 {
 	let name = <&'static str>::from(command.kind);
-	send_backend(backend, BackendEvent::ToolStarted {
-		id:    command.id.clone(),
-		name:  sf!(name),
-		rev:   sf!("1"),
-		title: command.source.clone(),
-	});
+	send_backend(backend, BackendEvent::ToolStarted { id: command.id.clone(), name: sf!(name) });
 	let result = match command.kind {
 		DeferredCommandKind::Shell => execute_deferred_shell(backend, state, parent, &command).await,
 		DeferredCommandKind::Eval => {
@@ -9620,6 +10275,7 @@ async fn handle_agent_event(
 				modes.begin_streaming();
 			},
 			Some(Event::Outcome(outcome)) => {
+				let replaying = state.replaying_turn;
 				if state.replaying_turn {
 					replay_items(
 						backend,
@@ -9636,6 +10292,8 @@ async fn handle_agent_event(
 				state.queued = 0;
 				state.queued_prompts.clear();
 				state.model.clone_from(&outcome.model);
+				state.status_quota = None;
+				state.status_usage_refresh_due = true;
 				state.context_window = resolve_model(state.catalog.as_ref(), &outcome.model)
 					.and_then(|spec| spec.limits.context_window);
 				if let Some(cost) = &outcome.cost {
@@ -9693,8 +10351,27 @@ async fn handle_agent_event(
 						now_ms(),
 					);
 				}
+				let assistant_usage = (!replaying)
+					.then(|| {
+						outcome.output.iter().rev().find_map(|item| {
+							let item::Kind::Message(message) = item.kind.as_ref()? else {
+								return None;
+							};
+							matches!(Role::try_from(message.role), Ok(Role::Assistant))
+								.then(|| {
+									message.completed_at_ms.zip(message.usage.clone()).map(
+										|(completed_at_ms, usage)| AssistantUsage { usage, completed_at_ms },
+									)
+								})
+								.flatten()
+						})
+					})
+					.flatten();
 				for (_, id) in state.active_parts.drain() {
 					send_backend(backend, BackendEvent::AssistantEnd { id });
+				}
+				if let Some(usage) = assistant_usage {
+					send_backend(backend, BackendEvent::AssistantUsage(usage));
 				}
 				if state.attempt > 1 {
 					send_backend(
@@ -9788,7 +10465,7 @@ async fn handle_agent_event(
 						&& let Some(tool) = state.tools.get_mut(id.as_str())
 					{
 						tool.args = omp_slopjson::parse_streaming(fragment);
-						ensure_tool_started(backend, id, tool, false);
+						ensure_tool_started(backend, id, tool);
 						if let Some(view) = fold_tool_args(renderers, tool, false) {
 							send_backend(backend, BackendEvent::ToolView { id: id.clone(), view });
 						} else if tool.started
@@ -9852,12 +10529,12 @@ async fn handle_agent_event(
 				if let Some(view) = fold_tool_args(renderers, tool, true) {
 					send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 				}
-				ensure_tool_started(backend, call_id, tool, false);
+				ensure_tool_started(backend, call_id, tool);
 			}
 		},
 		AgentEvent::ToolUpdate { call_id, json } => {
 			let projection = if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
-				ensure_tool_started(backend, call_id, tool, true);
+				ensure_tool_started(backend, call_id, tool);
 				if tool.identity.name == "bash"
 					&& let Ok(update) = serde_json::from_slice::<omp_tools::shell::Update>(json)
 					&& update.terminal
@@ -9960,13 +10637,11 @@ async fn handle_agent_event(
 			});
 			let is_report_issue = identity.name == "report_issue";
 			if let Some(tool) = tool.as_mut() {
-				ensure_tool_started(backend, call_id, tool, true);
+				ensure_tool_started(backend, call_id, tool);
 			} else {
 				send_backend(backend, BackendEvent::ToolStarted {
-					id:    call_id.clone(),
-					name:  identity.name.clone(),
-					rev:   Str::from(identity.rev.to_string()),
-					title: identity.name.clone(),
+					id:   call_id.clone(),
+					name: identity.name.clone(),
 				});
 			}
 			send_tool_result_images(backend, call_id, item);
@@ -10125,7 +10800,15 @@ async fn handle_agent_event(
 			}
 			send_backend(backend, BackendEvent::SessionTitle(title.clone()));
 		},
+		AgentEvent::InputStaged { item } => {
+			if let Some(anchor) = item_turn_anchor(item) {
+				send_backend(backend, BackendEvent::TurnAnchor(anchor));
+			}
+		},
 		AgentEvent::RunStateChanged { to, .. } => {
+			if *to == AgentRunState::Working {
+				send_backend(backend, BackendEvent::TurnAnchor(TurnAnchor::AgentStart));
+			}
 			if matches!(to, AgentRunState::Idle | AgentRunState::Attention) {
 				let _ = modes.settle_plan_transition();
 			}
@@ -10175,7 +10858,7 @@ fn replay_items(
 ) {
 	for item in items {
 		match &item.kind {
-			Some(item::Kind::Message(message)) => replay_message(backend, message, serial),
+			Some(item::Kind::Message(message)) => replay_message(backend, item, message, serial),
 			Some(item::Kind::ToolCall(call)) => {
 				let id = Str::from(call.id.as_str());
 				let args = str::from_utf8(&call.args_json).map_or_else(
@@ -10184,15 +10867,9 @@ fn replay_items(
 				);
 				let identity =
 					item_tool_identity(item, &call.name).unwrap_or_else(|| missing_identity(&call.name));
-				let title = call
-					.intent
-					.as_deref()
-					.map_or_else(|| tool_title(&identity.name, &args), Str::from);
 				send_backend(backend, BackendEvent::ToolStarted {
-					id: id.clone(),
+					id:   id.clone(),
 					name: identity.name.clone(),
-					rev: Str::from(identity.rev.to_string()),
-					title,
 				});
 				let mut tool = ToolDisplay {
 					identity,
@@ -10213,10 +10890,8 @@ fn replay_items(
 					render_tool_result_view(renderers, item, tool.as_ref());
 				if tool.is_none() {
 					send_backend(backend, BackendEvent::ToolStarted {
-						id:    id.clone(),
-						name:  identity.name.clone(),
-						rev:   Str::from(identity.rev.to_string()),
-						title: identity.name.clone(),
+						id:   id.clone(),
+						name: identity.name.clone(),
 					});
 				}
 				send_tool_result_images(backend, &id, item);
@@ -10244,39 +10919,83 @@ fn ensure_tool_started(
 	backend: &flume::Sender<BackendEvent>,
 	call_id: &Str,
 	tool: &mut ToolDisplay,
-	force: bool,
 ) {
 	if tool.started {
 		return;
 	}
-	let title = tool_title(&tool.identity.name, &tool.args);
-	if !force && title == tool.identity.name {
-		return;
-	}
 	send_backend(backend, BackendEvent::ToolStarted {
-		id: call_id.clone(),
+		id:   call_id.clone(),
 		name: tool.identity.name.clone(),
-		rev: Str::from(tool.identity.rev.to_string()),
-		title,
 	});
 	tool.started = true;
 }
 
-fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, serial: &mut u64) {
-	let mut text_parts = Vec::new();
+fn attachment_body(text: &str) -> Option<&str> {
+	text
+		.strip_prefix("<attachment>")
+		.and_then(|text| text.strip_suffix("</attachment>"))
+}
+
+fn visible_message_text(message: &Message) -> String {
+	let mut visible = String::new();
+	let mut first = true;
+	for part in &message.parts {
+		let Some(part::Kind::Text(text)) = &part.kind else {
+			continue;
+		};
+		if attachment_body(text).is_some() {
+			continue;
+		}
+		if !first {
+			visible.push('\n');
+		}
+		visible.push_str(text);
+		first = false;
+	}
+	visible
+}
+
+fn user_item_text(item: &Item) -> Option<Str> {
+	let Some(item::Kind::Message(message)) = &item.kind else {
+		return None;
+	};
+	if message.role != i32::from(Role::User) {
+		return None;
+	}
+	let text = visible_message_text(message);
+	let stripped = omp_agent::strip_system_wrapper(&text).map(Str::new);
+	let text = stripped.unwrap_or_else(|| Str::from(text));
+	(!text.trim().is_empty()).then_some(text)
+}
+fn item_turn_anchor(item: &Item) -> Option<TurnAnchor> {
+	let item::Kind::Message(message) = item.kind.as_ref()? else {
+		return None;
+	};
+	match Role::try_from(message.role).ok()? {
+		Role::User => Some(TurnAnchor::User { submitted_at_ms: item.created_at_ms }),
+		Role::System => Some(TurnAnchor::Developer {
+			submitted_at_ms: item.created_at_ms,
+			synthetic:       message.synthetic.unwrap_or(false),
+			user_initiated:  message.user_initiated.unwrap_or(false),
+		}),
+		Role::Assistant | Role::Unspecified => None,
+	}
+}
+
+fn replay_message(
+	backend: &flume::Sender<BackendEvent>,
+	item: &Item,
+	message: &Message,
+	serial: &mut u64,
+) {
 	let mut thinking_parts = Vec::new();
 	let mut chips = Vec::new();
 	for part in &message.parts {
 		match &part.kind {
 			Some(part::Kind::Text(text)) => {
-				if let Some(attachment) = text
-					.strip_prefix("<attachment>")
-					.and_then(|text| text.strip_suffix("</attachment>"))
-				{
+				if let Some(attachment) = attachment_body(text) {
 					let lines = attachment.bytes().filter(|byte| *byte == b'\n').count() + 1;
 					chips.push(sf!("paste · {lines} lines"));
-				} else {
-					text_parts.push(text.as_str());
 				}
 			},
 			Some(part::Kind::Blob(blob)) => chips.push(blob_label(blob)),
@@ -10286,16 +11005,30 @@ fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, seri
 			_ => {},
 		}
 	}
-	let text = text_parts.join("\n");
+	let text = visible_message_text(message);
 	match Role::try_from(message.role) {
 		Ok(Role::User) => {
+			send_backend(
+				backend,
+				BackendEvent::TurnAnchor(TurnAnchor::User { submitted_at_ms: item.created_at_ms }),
+			);
+			let stripped = omp_agent::strip_system_wrapper(&text).map(Str::new);
 			send_backend(backend, BackendEvent::UserReplayed {
-				text: Str::from(text),
+				text: stripped.unwrap_or_else(|| Str::from(text)),
 				chips,
 				queued: false,
 			});
 		},
-		Ok(Role::System) => {},
+		Ok(Role::System) => {
+			send_backend(
+				backend,
+				BackendEvent::TurnAnchor(TurnAnchor::Developer {
+					submitted_at_ms: item.created_at_ms,
+					synthetic:       message.synthetic.unwrap_or(false),
+					user_initiated:  message.user_initiated.unwrap_or(false),
+				}),
+			);
+		},
 		_ => {
 			for thinking in thinking_parts {
 				send_backend(backend, BackendEvent::ThinkingReplayed { text: thinking.into() });
@@ -10312,6 +11045,14 @@ fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, seri
 					text: Str::from(text),
 				});
 				send_backend(backend, BackendEvent::AssistantEnd { id });
+			}
+			if let (Some(completed_at_ms), Some(usage)) =
+				(message.completed_at_ms, message.usage.clone())
+			{
+				send_backend(
+					backend,
+					BackendEvent::AssistantUsage(AssistantUsage { usage, completed_at_ms }),
+				);
 			}
 		},
 	}
@@ -10668,47 +11409,6 @@ fn render_tool_result_view(
 	(identity, terminal, view)
 }
 
-fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
-	if name == "edit"
-		&& let Some(input) = args.get("input").and_then(|value| value.as_str())
-		&& let Some(detail) = edit_input_title(input)
-	{
-		return sf!("{name} · {detail}");
-	}
-	let detail = ["title", "path", "command", "pattern", "query"]
-		.into_iter()
-		.find_map(|key| args.get(key).and_then(|value| value.as_str()))
-		.and_then(|text| text.lines().next())
-		.or_else(|| {
-			args
-				.get("input")
-				.and_then(|value| value.as_str())
-				.and_then(|input| input.lines().next())
-				.and_then(|header| header.strip_prefix('['))
-				.and_then(|header| header.split_once('#').map(|(path, _)| path))
-		});
-	detail.map_or_else(|| name.clone(), |detail| sf!("{name} · {detail}"))
-}
-fn edit_input_title(input: &str) -> Option<Str> {
-	let mut paths = Vec::new();
-	for line in input.lines() {
-		let Some(opener) = line.trim_start().strip_prefix('§') else {
-			continue;
-		};
-		let path = opener.strip_prefix('*').unwrap_or(opener).trim();
-		if path.is_empty() || paths.contains(&path) {
-			continue;
-		}
-		paths.push(path);
-	}
-	let first = paths.first()?;
-	Some(if paths.len() == 1 {
-		Str::new(*first)
-	} else {
-		sf!("{first} (+{} more)", paths.len() - 1)
-	})
-}
-
 fn send_tool_result_images(backend: &flume::Sender<BackendEvent>, call_id: &Str, item: &Item) {
 	let Some(item::Kind::ToolResult(result)) = &item.kind else {
 		return;
@@ -10881,6 +11581,15 @@ fn current_model_index(rows: &[ModelRow], current: &str) -> usize {
 		.position(|model| model.key.as_str() == current)
 		.unwrap_or_default()
 }
+
+fn task_model_index(rows: &[ModelRow], state: &BridgeState) -> usize {
+	state
+		.task_model
+		.as_deref()
+		.map(|model| current_model_index(rows, model))
+		.unwrap_or_else(|| current_model_index(rows, &state.model))
+}
+
 /// Providers whose declared credential sources are currently satisfiable
 /// without a new login: auth-free specs, populated credential environment
 /// variables, or an enabled stored account.
@@ -10976,15 +11685,74 @@ fn send_open_models(backend: &flume::Sender<BackendEvent>, state: &BridgeState) 
 	let rows =
 		model_rows(state.catalog.as_ref(), &state.model_settings, state.auth_control.as_ref());
 	let current = current_model_index(&rows, &state.model);
-	send_backend(backend, BackendEvent::OpenModelPicker { rows, current });
+	let task_current = task_model_index(&rows, state);
+	send_backend(backend, BackendEvent::OpenModelPicker { rows, current, task_current });
 }
 
 fn send_models_updated(backend: &flume::Sender<BackendEvent>, state: &BridgeState) {
 	let rows =
 		model_rows(state.catalog.as_ref(), &state.model_settings, state.auth_control.as_ref());
 	let current = current_model_index(&rows, &state.model);
-	send_backend(backend, BackendEvent::ModelsUpdated { rows, current });
+	let task_current = task_model_index(&rows, state);
+	send_backend(backend, BackendEvent::ModelsUpdated { rows, current, task_current });
 }
+
+fn switch_task_model(
+	backend: &flume::Sender<BackendEvent>,
+	settings_manager: &SettingsManager,
+	selector: &str,
+	state: &mut BridgeState,
+) {
+	let Some(model) =
+		resolve_model_selector(state.catalog.as_ref(), &state.model_settings, selector)
+	else {
+		send_backend(backend, BackendEvent::Error(sf!("Unknown or disabled model: {selector}")));
+		return;
+	};
+	if !model_selector_allowed(state.catalog.as_ref(), &state.model_settings, model.key.as_str()) {
+		send_backend(
+			backend,
+			BackendEvent::Error(sf!("Model is disabled by the effective model scope: {selector}")),
+		);
+		return;
+	}
+	let key = Str::new(model.key.as_str());
+	let task_settings = match settings_manager.snapshot().project::<TaskSettings>() {
+		Ok(settings) => settings,
+		Err(error) => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Could not read task subagent settings: {error}")),
+			);
+			return;
+		},
+	};
+	let mut overrides = task_settings.get().agent_model_overrides.clone();
+	overrides.insert(Str::new_static("task"), key.clone());
+	let value = match toml::Value::try_from(overrides) {
+		Ok(value) => value.to_string(),
+		Err(error) => {
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Could not encode the task subagent model: {error}")),
+			);
+			return;
+		},
+	};
+	if let Err(error) =
+		settings_manager.set_sync(MutationScope::Runtime, "task.agentModelOverrides", &value)
+	{
+		send_backend(
+			backend,
+			BackendEvent::Error(sf!("Could not set the task subagent model: {error}")),
+		);
+		return;
+	}
+	state.task_model = Some(key.clone());
+	send_models_updated(backend, state);
+	send_backend(backend, BackendEvent::Notice(sf!("Task subagent model (session-only): `{key}`.")));
+}
+
 fn send_open_model_hub(
 	backend: &flume::Sender<BackendEvent>,
 	settings_manager: &SettingsManager,
@@ -11218,6 +11986,48 @@ fn refresh_model_settings(settings_manager: &SettingsManager, state: &mut Bridge
 	}
 }
 
+async fn refresh_runtime_models(
+	backend: &flume::Sender<BackendEvent>,
+	settings_manager: &SettingsManager,
+	state: &mut BridgeState,
+) {
+	let (Some(runtime), Some(registry)) =
+		(state.discovery_runtime.clone(), state.inference_registry.clone())
+	else {
+		send_backend(
+			backend,
+			BackendEvent::Notice(sf!("Model refresh is available via `omp models --refresh`.")),
+		);
+		return;
+	};
+	let cancellation = tokio_util::sync::CancellationToken::new();
+	if let Err(error) = runtime
+		.refresh_registry_discovery(&registry, Duration::from_secs(10), cancellation.clone())
+		.await
+	{
+		tracing::warn!(%error, "model hub provider discovery refresh failed");
+	}
+	if let Err(error) = runtime
+		.refresh_shared_catalog(Duration::from_secs(10), cancellation)
+		.await
+	{
+		tracing::warn!(%error, "model hub shared catalog refresh failed");
+	}
+	match runtime.catalog() {
+		Ok(catalog) => {
+			state.catalog = catalog;
+			send_backend(
+				backend,
+				BackendEvent::ModelHubUpdated(model_hub_data(settings_manager, state)),
+			);
+			send_models_updated(backend, state);
+		},
+		Err(error) => {
+			tracing::warn!(%error, "refreshed model catalog could not be composed");
+		},
+	}
+}
+
 fn provider_rows(catalog: &Catalog, current: Option<&str>) -> Vec<SessionRow> {
 	let mut providers = catalog
 		.providers()
@@ -11267,6 +12077,166 @@ fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
 			pinned: choice.pinned,
 		})
 		.collect()
+}
+
+fn indexed_session_rows(
+	session_index: &SessionIndex,
+	sessions_dir: &Path,
+	workspace_root: &str,
+	current_session: &str,
+	all_projects: bool,
+	sort_by_title: bool,
+	show_paths: bool,
+) -> miette::Result<Vec<SessionRow>> {
+	let pins = PinStore::new(sessions_dir).load().into_diagnostic()?;
+	let page = session_index
+		.list(&SessionFilter {
+			project: (!all_projects).then(|| Str::from(workspace_root)),
+			limit: 200,
+			..SessionFilter::default()
+		})
+		.into_diagnostic()?;
+	let mut rows = page
+		.sessions
+		.into_iter()
+		.map(|session| {
+			let id = session.id.0;
+			let pinned = pins.contains(id.as_str());
+			let age = indexed_relative_time(session.updated_ms);
+			let mut detail = if id.as_str() == current_session {
+				sf!("current · {age} · {id}")
+			} else {
+				sf!("{age} · {id}")
+			};
+			if show_paths {
+				detail = sf!("{detail} · {}", session.cwd);
+			}
+			(pinned, session.updated_ms, SessionRow {
+				label: session.title.unwrap_or_else(|| sf!("Untitled session")),
+				pinned,
+				id,
+				detail,
+			})
+		})
+		.collect::<Vec<_>>();
+	if sort_by_title {
+		rows.sort_by(|left, right| {
+			left
+				.2
+				.label
+				.as_str()
+				.cmp(right.2.label.as_str())
+				.then_with(|| left.2.id.as_str().cmp(right.2.id.as_str()))
+		});
+	} else {
+		rows.sort_by(|left, right| {
+			right
+				.0
+				.cmp(&left.0)
+				.then_with(|| right.1.cmp(&left.1))
+				.then_with(|| left.2.id.as_str().cmp(right.2.id.as_str()))
+		});
+	}
+	Ok(rows.into_iter().map(|(_, _, row)| row).collect())
+}
+
+fn refresh_indexed_session_rows(
+	backend: &flume::Sender<BackendEvent>,
+	session_index: &SessionIndex,
+	state: &BridgeState,
+) {
+	match indexed_session_rows(
+		session_index,
+		&state.sessions_dir,
+		state.workspace_root.as_str(),
+		state.session_id.as_str(),
+		false,
+		false,
+		false,
+	) {
+		Ok(rows) => send_backend(backend, BackendEvent::Sessions(rows)),
+		Err(error) => {
+			send_backend(backend, BackendEvent::Error(sf!("Could not list sessions: {error}")))
+		},
+	}
+}
+
+fn indexed_relative_time(updated_ms: u64) -> Str {
+	let updated = UNIX_EPOCH + Duration::from_millis(updated_ms);
+	let seconds = SystemTime::now()
+		.duration_since(updated)
+		.unwrap_or_default()
+		.as_secs();
+	match seconds {
+		0..60 => sf!("just now"),
+		60..3_600 => sf!("{}m ago", seconds / 60),
+		3_600..86_400 => sf!("{}h ago", seconds / 3_600),
+		86_400..604_800 => sf!("{}d ago", seconds / 86_400),
+		_ => sf!("{}w ago", seconds / 604_800),
+	}
+}
+
+fn delete_indexed_session(
+	session_index: &SessionIndex,
+	sessions_dir: &Path,
+	session: &SessionId,
+	noninvasive: bool,
+) -> Result<(), String> {
+	if noninvasive {
+		return match session_index.delete_session(session) {
+			Ok(true) => Ok(()),
+			Ok(false) => Err(String::from("session index no longer contains the selected session")),
+			Err(error) => Err(error.to_string()),
+		};
+	}
+
+	let journal = sessions_dir.join(format!("{}.jsonl", session.as_str()));
+	let tombstone = journal.with_extension(format!("jsonl.deleted-{}", omp_core::Ulid::generate()));
+	fs::rename(&journal, &tombstone).map_err(|error| error.to_string())?;
+	let artifacts = sessions_dir.join(session.as_str());
+	let artifact_tombstone =
+		sessions_dir.join(format!("{}.deleted-{}", session.as_str(), omp_core::Ulid::generate()));
+	if artifacts.exists()
+		&& let Err(error) = fs::rename(&artifacts, &artifact_tombstone)
+	{
+		let _ = fs::rename(&tombstone, &journal);
+		return Err(error.to_string());
+	}
+
+	match session_index.delete_session(session) {
+		Ok(true) => {},
+		Ok(false) => {
+			if artifact_tombstone.exists() {
+				let _ = fs::rename(&artifact_tombstone, &artifacts);
+			}
+			let _ = fs::rename(&tombstone, &journal);
+			return Err(String::from("session index no longer contains the selected session"));
+		},
+		Err(error) => {
+			if artifact_tombstone.exists() {
+				let _ = fs::rename(&artifact_tombstone, &artifacts);
+			}
+			let _ = fs::rename(&tombstone, &journal);
+			return Err(error.to_string());
+		},
+	}
+	if let Err(error) = fs::remove_file(&tombstone) {
+		tracing::warn!(
+			path = %tombstone.display(),
+			%error,
+			"deleted session tombstone cleanup failed"
+		);
+	}
+	if artifact_tombstone.exists()
+		&& let Err(error) = fs::remove_dir_all(&artifact_tombstone)
+	{
+		tracing::warn!(
+			path = %artifact_tombstone.display(),
+			%error,
+			"deleted session artifact tombstone cleanup failed"
+		);
+	}
+	Ok(())
 }
 
 async fn switch_model<C>(
@@ -11336,6 +12306,8 @@ async fn switch_model_with_thinking<C>(
 			"user",
 		);
 		state.model = mutation.key.to_string();
+		state.status_quota = None;
+		state.status_usage_refresh_due = true;
 		state.context_window = mutation.context_window;
 		send_models_updated(backend, state);
 		send_backend(backend, BackendEvent::Notice(sf!("Session model: `{}`.", state.model)));
@@ -11430,6 +12402,8 @@ async fn switch_model_with_thinking<C>(
 		"user",
 	);
 	state.model = key;
+	state.status_quota = None;
+	state.status_usage_refresh_due = true;
 	state.context_window = spec.limits.context_window;
 	send_models_updated(backend, state);
 	send_backend(
@@ -11782,6 +12756,114 @@ fn publish_agent_roster<C>(
 		send_backend(backend, BackendEvent::AgentRoster(current));
 	}
 }
+fn running_subagent_ids(rows: &[AgentRow]) -> HashSet<Str> {
+	rows
+		.iter()
+		.filter(|row| row.parent.is_some() && row.status == "running")
+		.map(|row| row.id.clone())
+		.collect()
+}
+fn status_usage_request(state: &BridgeState) -> Option<StatusUsageRequest> {
+	let model = resolve_model(state.catalog.as_ref(), &state.model)?;
+	let route = model.routes.first()?.clone();
+	let provider = state.catalog.route(&route)?.provider.clone();
+	let wire_model = model
+		.wire_ids
+		.iter()
+		.find_map(|(candidate, wire)| (candidate == &route).then(|| Str::new(wire.as_str())))
+		.unwrap_or_else(|| Str::new(model.key.as_str()));
+	Some(StatusUsageRequest { provider, route, model: wire_model })
+}
+
+fn queue_status_usage_refresh(state: &BridgeState, requests: &flume::Sender<StatusUsageRequest>) {
+	if let Some(request) = status_usage_request(state) {
+		let _ = requests.try_send(request);
+	}
+}
+
+async fn run_status_usage_worker(
+	data_dir: PathBuf,
+	requests: flume::Receiver<StatusUsageRequest>,
+	updates: flume::Sender<StatusUsageUpdate>,
+) {
+	let Ok(manager) = omp_driver::registry::production_usage_manager(&data_dir).await else {
+		return;
+	};
+	while let Ok(refresh) = requests.recv_async().await {
+		let usage = UsageRequest {
+			provider:    Some(refresh.provider.clone()),
+			account:     None,
+			scope:       UsageScope::All,
+			allow_stale: true,
+		};
+		let deadline = Instant::now().checked_add(Duration::from_secs(10));
+		let Ok(report) = manager
+			.execute(&refresh.provider, &refresh.route, &usage, deadline)
+			.await
+		else {
+			continue;
+		};
+		let update = StatusUsageUpdate {
+			provider: refresh.provider,
+			model:    refresh.model.clone(),
+			quota:    status_quota(&report, refresh.model.as_str(), SystemTime::now()),
+		};
+		if updates.send_async(update).await.is_err() {
+			break;
+		}
+	}
+}
+
+fn status_quota(report: &UsageReport, model: &str, now: SystemTime) -> StatusQuota {
+	let windows = scope_antigravity_windows_for_model(&report.windows, Some(model));
+	let daily = windows
+		.into_iter()
+		.filter(|window| is_daily_quota_window(window))
+		.filter_map(|window| {
+			let percent = used_percent(window)?;
+			let reset_minutes = window.resets_at.map(|reset| {
+				reset
+					.duration_since(now)
+					.unwrap_or_default()
+					.as_secs()
+					.saturating_add(30)
+					/ 60
+			});
+			Some(StatusQuotaWindow { percent, reset_minutes })
+		})
+		.max_by_key(|window| window.percent);
+	StatusQuota { daily }
+}
+
+fn is_daily_quota_window(window: &UsageWindow) -> bool {
+	if window.id.as_str().ends_with(":daily") {
+		return true;
+	}
+	let Some(duration) = window.duration else {
+		return false;
+	};
+	let day = Duration::from_days(1);
+	duration.abs_diff(day) <= Duration::from_secs(60)
+}
+
+fn used_percent(window: &UsageWindow) -> Option<u8> {
+	let amount = &window.amount;
+	let used = amount.consumed.map(quantity_value).or_else(|| {
+		amount
+			.remaining
+			.zip(amount.limit)
+			.map(|(remaining, limit)| quantity_value(limit) - quantity_value(remaining))
+	})?;
+	let limit = amount.limit.map(quantity_value).unwrap_or(100.0);
+	if !used.is_finite() || !limit.is_finite() || limit <= 0.0 {
+		return None;
+	}
+	Some((used / limit * 100.0).clamp(0.0, 100.0).round() as u8)
+}
+
+fn quantity_value(quantity: UsageQuantity) -> f64 {
+	quantity.units as f64 / 10_f64.powi(i32::from(quantity.decimal_exponent))
+}
 
 fn send_status(
 	backend: &flume::Sender<BackendEvent>,
@@ -11816,7 +12898,6 @@ fn send_status(
 		backend,
 		BackendEvent::Status(StatusFacts {
 			model: status_model_label(state.catalog.as_ref(), state.model.as_str()),
-			session_id: Some(state.session_id.clone()),
 			model_subscription: model_uses_subscription(state.catalog.as_ref(), &state.model),
 			advisor_subscription: advisor_model
 				.as_ref()
@@ -11844,7 +12925,10 @@ fn send_status(
 					queue_depth: facts.queue_depth,
 				})
 				.collect(),
-			jobs: state.jobs.len(),
+			jobs: omp_chat_ui::status_line::independent_job_count(
+				&state.jobs,
+				&state.running_subagent_ids,
+			),
 			attempt: state.attempt,
 			dropped,
 			git: state.git_facts.clone(),
@@ -11854,10 +12938,11 @@ fn send_status(
 			worktree: None,
 			thinking: state.thinking,
 			hooks: 0,
-			tasks: 0,
+			tasks: state.running_subagent_ids.len(),
 			collab_peers: 0,
 			account_override: None,
 			quota_reset: false,
+			quota: state.status_quota,
 			reduced_motion: false,
 			layout: StatusLayout::Compact,
 			separator: StatusSeparator::Dot,
@@ -12141,6 +13226,7 @@ mod tests {
 	};
 
 	use super::*;
+
 	struct LiveRendererDispatcher {
 		views: Arc<Mutex<Vec<Value>>>,
 	}
@@ -12319,6 +13405,51 @@ mod tests {
 	}
 
 	#[test]
+	fn active_antigravity_model_selects_its_daily_counter() {
+		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+		let quota_window = |id: &'static str, used: u64, reset_minutes: u64| UsageWindow {
+			id:          Str::new_static(id),
+			kind:        omp_inference::answer::UsageWindowKind::Quota,
+			dimension:   sf!("quota"),
+			label:       None,
+			scope:       None,
+			amount:      omp_inference::answer::UsageAmount {
+				unit:      omp_inference::answer::UsageUnit::Percent,
+				consumed:  Some(UsageQuantity::new(used, 0)),
+				remaining: Some(UsageQuantity::new(100 - used, 0)),
+				limit:     Some(UsageQuantity::new(100, 0)),
+			},
+			status:      None,
+			duration:    Some(Duration::from_days(1)),
+			resets_at:   Some(now + Duration::from_secs(reset_minutes * 60)),
+			reset_label: None,
+			notes:       Box::default(),
+			source:      omp_inference::receipt::UsageSource::Provider,
+			observed_at: now,
+		};
+		let report = UsageReport {
+			provider:      ProviderId::from("google-antigravity"),
+			account:       omp_inference::AccountId::from("account"),
+			principal:     None,
+			plan:          None,
+			account_meta:  Default::default(),
+			source_label:  None,
+			notes:         Box::default(),
+			reset_credits: None,
+			windows:       vec![
+				quota_window("google-antigravity:google:default:daily", 91, 11),
+				quota_window("google-antigravity:openai:default:daily", 24, 71),
+			],
+		};
+		let actual = status_quota(&report, "gpt-oss-120b", now);
+		assert_eq!(
+			actual.daily,
+			Some(StatusQuotaWindow { percent: 24, reset_minutes: Some(71) }),
+			"actual quota={actual:?}"
+		);
+	}
+
+	#[test]
 	fn roster_projection_keeps_only_the_current_canonical_session_nodes() {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let parent = stub_parent_host(scratch.path());
@@ -12349,7 +13480,7 @@ mod tests {
 		// a subagent joins the session.
 		assert!(project_agent_roster(&parent, &tree, "session-a").is_empty());
 
-		tree
+		let worker = tree
 			.register(
 				sf!("worker"),
 				sf!("Worker"),
@@ -12359,6 +13490,7 @@ mod tests {
 				Budget::default(),
 			)
 			.expect("subagent");
+		worker.set_status(AgentStatus::Running);
 		let rows = project_agent_roster(&parent, &tree, "session-a");
 		assert_eq!(rows.len(), 2);
 		let main = rows
@@ -12367,6 +13499,16 @@ mod tests {
 			.expect("canonical main");
 		assert_eq!(main.status, "running", "the session root is the canonical node");
 		assert!(rows.iter().any(|row| row.id == "worker"));
+		let running = running_subagent_ids(&rows);
+		assert_eq!(
+			running,
+			HashSet::from([sf!("worker")]),
+			"rows={:?}, running={running:?}",
+			rows
+				.iter()
+				.map(|row| (row.id.as_str(), row.status.as_str()))
+				.collect::<Vec<_>>()
+		);
 		assert!(
 			project_agent_roster(&parent, &tree, "session-b").is_empty(),
 			"other sessions stay solo"
@@ -12413,12 +13555,14 @@ mod tests {
 		let (backend, events) = flume::unbounded();
 		send_open_models(&backend, &state);
 
-		let BackendEvent::OpenModelPicker { rows, current } = events.recv().expect("model picker")
+		let BackendEvent::OpenModelPicker { rows, current, task_current } =
+			events.recv().expect("model picker")
 		else {
 			panic!("model picker event")
 		};
 		assert!(!rows.is_empty());
 		assert!(current < rows.len());
+		assert!(task_current < rows.len());
 	}
 	#[test]
 	fn status_thinking_level_keeps_only_visible_reasoning_efforts() {
@@ -12452,10 +13596,13 @@ mod tests {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			catalog: Arc::new(Catalog::embedded().clone()),
+			discovery_runtime: None,
+			inference_registry: None,
 			session_hooks: Arc::new(omp_agent::HookGate::channel().0),
 			auth_control: None,
 			model: "test/model".to_owned(),
 			model_settings: ModelSettings::default(),
+			task_model: None,
 			pending_session_delete: None,
 			git: None,
 			git_facts: None,
@@ -12466,6 +13613,7 @@ mod tests {
 			title_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
 			session_path: scratch.join("test-session.jsonl"),
 			sessions_dir: scratch.to_path_buf(),
+			process_started: SystemTime::now(),
 			title_replan_refresh_pending: false,
 			environment,
 			lsp_servers: Vec::new(),
@@ -12495,6 +13643,7 @@ mod tests {
 			queued_prompts: VecDeque::new(),
 			audio: crate::audio_coordinator::InteractiveAudioController::new(),
 			jobs: HashSet::new(),
+			running_subagent_ids: HashSet::new(),
 			attempt: 0,
 			turn_started: None,
 			has_history: false,
@@ -12511,6 +13660,8 @@ mod tests {
 			live_activity: ActivityWaveform::new(),
 			token_rate: None,
 			tokens_per_second: None,
+			status_quota: None,
+			status_usage_refresh_due: false,
 			thinking: None,
 			replaying_turn: false,
 			vision_override: None,
@@ -12520,6 +13671,7 @@ mod tests {
 			command_sources: Vec::new(),
 			command_usage,
 			typed_commands: commands::CommandRoster::builtins(),
+			keybindings: crate::keybindings::config::ResolvedKeybindings::default(),
 			extension_ui: Arc::new(presentation::PublishedUiRoster::default()),
 			extension_callbacks: None,
 			skills: Default::default(),
@@ -12530,6 +13682,7 @@ mod tests {
 			approvals: HashMap::new(),
 			presentation_requests: HashMap::new(),
 			raw_stream: None,
+			logs: None,
 		}
 	}
 
@@ -13118,20 +14271,6 @@ mod tests {
 	}
 
 	#[test]
-	fn edit_tool_title_lists_distinct_sparse_opener_paths() {
-		let args = omp_slopjson::parse_streaming(
-			"{\"input\":\"§src/one.rs\\nold\\n§\\n§*src/two.rs\\n§src/one.rs\"}",
-		);
-		assert_eq!(tool_title(&Str::new_static("edit"), &args), "edit · src/one.rs (+1 more)");
-	}
-
-	#[test]
-	fn edit_tool_title_keeps_hashline_header_fallback() {
-		let args = omp_slopjson::parse_streaming("{\"input\":\"[src/main.rs#abc]\\npatch\"}");
-		assert_eq!(tool_title(&Str::new_static("edit"), &args), "edit · src/main.rs");
-	}
-
-	#[test]
 	fn streaming_args_render_live_previews_before_any_update() {
 		let mut renderers = RenderRegistry::new();
 		renderers
@@ -13249,6 +14388,7 @@ mod tests {
 				parts: vec![omp_proto::thread::v1::Part {
 					kind: Some(part::Kind::Text("private durable prompt".to_owned())),
 				}],
+				..Default::default()
 			})),
 			..Default::default()
 		};

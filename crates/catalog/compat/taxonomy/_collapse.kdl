@@ -19,6 +19,11 @@ collapse {
 	effort-family "cursor" "gpt-5.6-luna"
 	effort-family "cursor" "gpt-5.6-sol"
 	effort-family "cursor" "gpt-5.6-terra"
+	// Cloud Code Assist advertises `-tiered` aliases beside effort-suffixed
+	// Gemini Flash siblings. Fold each alias into the canonical routed family;
+	// its minimal/off tier is served by the `-low` SKU.
+	effort-family "google-antigravity" "gemini-3.6-flash" "gemini-3.6-flash-tiered"
+	effort-family "google-antigravity" "gemini-3.7-flash" "gemini-3.7-flash-tiered"
 	// `-fast` is a parallel SKU lane. It stays in the logical identifier while
 	// the effort token immediately before it selects the wire sibling.
 	effort-lane-suffix "-fast" "cursor"

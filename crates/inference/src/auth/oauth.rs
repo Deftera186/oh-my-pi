@@ -2017,6 +2017,11 @@ mod tests {
 		let (input, response) = futures::join!(receive, browser);
 		assert!(response.starts_with("HTTP/1.1 200 OK"));
 		assert!(response.contains("Authentication Successful"));
+		assert!(response.contains("message.textContent = \"You have successfully logged in.\";"));
+		assert!(response.contains("window.close();"));
+		assert!(response.contains("closeButton.remove();"));
+		assert!(response.contains("Please close this tab manually."));
+		assert!(response.contains("}, 300);"));
 		let tokens = engine
 			.complete_pkce(&spec, pending, input.expect("browser input"))
 			.await

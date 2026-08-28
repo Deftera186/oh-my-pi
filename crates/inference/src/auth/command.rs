@@ -68,6 +68,15 @@ impl CommandCredentialResolver {
 		Self { executor, failure_ttl, cache: Mutex::new(BTreeMap::new()) }
 	}
 
+	/// Invalidates one command's successful or failed cached result.
+	///
+	/// The next [`Self::resolve`] call executes the command again. Empty command
+	/// strings are ignored.
+	pub fn invalidate(&self, command: &str) -> bool {
+		let command = command.trim();
+		!command.is_empty() && self.cache.lock().remove(command).is_some()
+	}
+
 	/// Resolves a configured command, sharing concurrent work for the same
 	/// command.
 	pub async fn resolve(
@@ -173,6 +182,23 @@ mod tests {
 		assert_eq!(right.unwrap().expose_secret(), "secret-marker");
 		assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 		assert!(!format!("{resolver:?}").contains("secret-marker"));
+	}
+
+	#[tokio::test]
+	async fn invalidation_reexecutes_a_successful_command() {
+		let executor =
+			Arc::new(CountingExecutor { calls: AtomicUsize::new(0), fail: AtomicUsize::new(0) });
+		let resolver = CommandCredentialResolver::new(executor.clone(), Duration::from_secs(1));
+		resolver
+			.resolve("credential command", CancellationToken::new())
+			.await
+			.expect("initial credential");
+		assert!(resolver.invalidate(" credential command "));
+		resolver
+			.resolve("credential command", CancellationToken::new())
+			.await
+			.expect("refreshed credential");
+		assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
 	}
 
 	#[tokio::test(start_paused = true)]

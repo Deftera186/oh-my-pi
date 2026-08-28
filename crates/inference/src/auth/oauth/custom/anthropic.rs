@@ -30,8 +30,8 @@ const PROMPT: &str = "Complete login in your browser. If the browser cannot reac
                       paste the final redirect URL or authorization code when prompted.";
 const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
 const OAUTH_BETA: &str = "oauth-2025-04-20";
-const REFRESH_USER_AGENT: &str = "anthropic-sdk-typescript/0.94.0 userOAuthProvider";
-const BOOTSTRAP_USER_AGENT: &str = "claude-code/2.1.220";
+const REFRESH_USER_AGENT: &str = "anthropic-sdk-typescript/0.112.1 userOAuthProvider";
+const BOOTSTRAP_USER_AGENT: &str = "claude-code/2.1.246";
 
 struct AnthropicPkceHandler {
 	http: Arc<dyn OAuthHttpClient>,
@@ -619,5 +619,24 @@ mod tests {
 			let (result, ()) = futures::join!(run, respond);
 			assert_eq!(result.expect_err("malformed response"), OAuthError::MalformedResponse);
 		}
+	}
+
+	#[tokio::test]
+	async fn refresh_uses_subscription_oauth_fingerprint_headers() {
+		let http = ScriptedHttp {
+			response: Mutex::new(Some(response(
+				r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+			))),
+			request:  Mutex::new(RecordedRequest::default()),
+		};
+		refresh(&http, &spec(), SecretString::from("old-refresh".to_owned()))
+			.await
+			.expect("refresh succeeds");
+
+		let request = http.request.lock();
+		let headers = request.headers.as_ref().expect("recorded headers");
+		assert_eq!(headers.get(ANTHROPIC_BETA).expect("OAuth beta"), OAUTH_BETA);
+		assert_eq!(headers.get(USER_AGENT).expect("refresh user agent"), REFRESH_USER_AGENT,);
+		assert_eq!(headers.get(CONTENT_TYPE).expect("content type"), JSON_CONTENT_TYPE);
 	}
 }

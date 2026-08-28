@@ -2,7 +2,7 @@
 //! constraints.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	error::Error,
 	fmt::{self, Display},
 	iter,
@@ -337,6 +337,100 @@ pub struct CatalogOverlay {
 	pub(crate) routes:     Box<[RouteOverlay]>,
 	/// Exact alias additions or replacements.
 	pub(crate) aliases:    Box<[ScopedAlias]>,
+}
+
+impl CatalogOverlay {
+	/// Returns the evidence source applied by this complete layer.
+	pub const fn source(&self) -> &ProvenanceSource {
+		&self.source
+	}
+
+	/// Returns the number of provider-scoped model entries in this layer.
+	pub const fn model_count(&self) -> usize {
+		self.models.len()
+	}
+
+	/// Returns the distinct model keys added by this layer, used to validate
+	/// intra-overlay cross-references (promotion and compaction targets)
+	/// during sanitization.
+	pub fn added_model_keys(&self) -> BTreeSet<ModelKey> {
+		self
+			.models
+			.iter()
+			.filter(|entry| entry.added.is_some())
+			.map(|entry| entry.selector.model.clone())
+			.collect()
+	}
+
+	/// Returns whether this layer contributes no catalog records.
+	pub const fn is_empty(&self) -> bool {
+		self.auth_specs.is_empty()
+			&& self.providers.is_empty()
+			&& self.models.is_empty()
+			&& self.routes.is_empty()
+			&& self.aliases.is_empty()
+	}
+
+	/// Combines complete independently produced slices under one publication
+	/// source while preserving their supplied precedence order.
+	pub fn combined(source: ProvenanceSource, overlays: impl IntoIterator<Item = Self>) -> Self {
+		let mut auth_specs = Vec::new();
+		let mut providers = Vec::new();
+		let mut models = Vec::new();
+		let mut routes = Vec::new();
+		let mut aliases = Vec::new();
+		for overlay in overlays {
+			auth_specs.extend(overlay.auth_specs);
+			providers.extend(overlay.providers);
+			models.extend(overlay.models);
+			routes.extend(overlay.routes);
+			aliases.extend(overlay.aliases);
+		}
+		Self {
+			source,
+			auth_specs: auth_specs.into_boxed_slice(),
+			providers: providers.into_boxed_slice(),
+			models: models.into_boxed_slice(),
+			routes: routes.into_boxed_slice(),
+			aliases: aliases.into_boxed_slice(),
+		}
+	}
+}
+
+pub(crate) fn retain_additive_models(
+	mut overlay: CatalogOverlay,
+	existing_models: &BTreeSet<ModelKey>,
+	known_providers: &BTreeSet<ProviderId>,
+	mut valid: impl FnMut(&ModelSpec) -> bool,
+) -> CatalogOverlay {
+	overlay.auth_specs = Box::new([]);
+	overlay.providers = Box::new([]);
+	overlay.routes = Box::new([]);
+	overlay.models = overlay
+		.models
+		.into_vec()
+		.into_iter()
+		.filter(|entry| {
+			entry.added.as_ref().is_some_and(&mut valid)
+				&& known_providers.contains(&entry.selector.provider)
+				&& !existing_models.contains(&entry.selector.model)
+		})
+		.collect();
+	let retained_targets = overlay
+		.models
+		.iter()
+		.map(|entry| entry.selector.model.clone())
+		.collect::<BTreeSet<_>>();
+	overlay.aliases = overlay
+		.aliases
+		.into_vec()
+		.into_iter()
+		.filter(|alias| {
+			known_providers.contains(&alias.provider)
+				&& retained_targets.contains(&alias.definition.target)
+		})
+		.collect();
+	overlay
 }
 
 /// Explicit authority for security-sensitive configured route changes.

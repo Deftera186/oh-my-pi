@@ -42,7 +42,7 @@ use omp_proto::{
 	ui::v1::UiDispatchResult,
 };
 use omp_settings::{
-	BrowserSettings,
+	BrowserSettings, SettingsCatalog,
 	manager::{SettingsManager, SettingsPaths},
 	snapshot::SettingsSnapshot,
 };
@@ -92,7 +92,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
-	admission::{AdmissionDecision, AdmissionGate, effects_narrow_or_refuse},
+	admission::{AdmissionDecision, AdmissionGate, ApprovalPolicy, effects_narrow_or_refuse},
 	blobs::{BlobError, BlobHost, BlobRead},
 	docs::{
 		AcpDocumentBackend, DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost,
@@ -202,9 +202,10 @@ fn unknown_tool_message(name: &str) -> &'static str {
 
 #[derive(Clone, Debug, Default)]
 struct InvocationExecutionPolicy {
-	tool:      Str,
-	plan:      bool,
-	plan_yolo: bool,
+	tool:           Str,
+	plan:           bool,
+	plan_yolo:      bool,
+	core_admission: bool,
 }
 
 impl InvocationExecutionPolicy {
@@ -221,7 +222,16 @@ impl InvocationExecutionPolicy {
 			.and_then(|props| props.fields.get(omp_agent::PLAN_YOLO_PROP))
 			.and_then(|value| value.kind.as_ref())
 			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
-		Self { tool: Str::from(request.name.as_str()), plan: mode == Some("plan"), plan_yolo }
+		let core_admission = props
+			.and_then(|props| props.fields.get(omp_agent::CORE_ADMISSION_PROP))
+			.and_then(|value| value.kind.as_ref())
+			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
+		Self {
+			tool: Str::from(request.name.as_str()),
+			plan: mode == Some("plan"),
+			plan_yolo,
+			core_admission,
+		}
 	}
 
 	fn denial(&self, effects: &Effects, raw: &[u8]) -> Option<Str> {
@@ -403,20 +413,19 @@ pub struct ServerIdentity {
 /// Per-connection transport and exact DATA grant bounds.
 #[derive(Clone)]
 pub(crate) struct ConnectionPolicy {
-	retire:  Option<CancellationToken>,
-	grants:  Grants,
-	host:    Option<HostKey>,
-	ambient: bool,
+	retire: Option<CancellationToken>,
+	grants: Grants,
+	host:   Option<HostKey>,
 }
 
 impl ConnectionPolicy {
 	fn in_process() -> Self {
-		Self { retire: None, grants: Grants::all(), host: None, ambient: true }
+		Self { retire: None, grants: Grants::all(), host: None }
 	}
 
 	/// Grants owner-local lifecycle traffic while retaining DATA phase checks.
 	pub(crate) fn external(retire: Option<CancellationToken>) -> Self {
-		Self { retire, grants: Grants::all(), host: None, ambient: false }
+		Self { retire, grants: Grants::all(), host: None }
 	}
 
 	/// Restricts an extension-host connection to explicitly granted, reachable
@@ -426,12 +435,7 @@ impl ConnectionPolicy {
 		I: IntoIterator<Item = S>,
 		S: AsRef<str>,
 	{
-		Self {
-			retire:  None,
-			grants:  Grants::supported(grants),
-			host:    Some(host),
-			ambient: false,
-		}
+		Self { retire: None, grants: Grants::supported(grants), host: Some(host) }
 	}
 }
 
@@ -1962,10 +1966,12 @@ pub struct EnvServer {
 fn execution_settings(
 	data_dir: &Path,
 	project_root: &Path,
+	catalog: SettingsCatalog,
 ) -> Result<(HostSettings, BrowserSettings, ShellSettings, SandboxSettings, AcpSettings), EnvdError>
 {
-	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+	let manager =
+		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
+			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
 	execution_settings_from_snapshot(&snapshot)
 }
@@ -2005,12 +2011,13 @@ fn mcp_settings(
 	data_dir: &Path,
 	project_root: &Path,
 	snapshot: Option<&SettingsSnapshot>,
+	catalog: SettingsCatalog,
 ) -> Result<McpSettings, EnvdError> {
 	let owned;
 	let snapshot = if let Some(snapshot) = snapshot {
 		snapshot
 	} else {
-		owned = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
+		owned = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 			.snapshot();
 		&owned
@@ -2189,11 +2196,6 @@ fn requires_environment_host(body: &client_frame::Body) -> bool {
 			| client_frame::Body::SendInput(_)
 			| client_frame::Body::SignalProcess(_)
 			| client_frame::Body::StopProcess(_)
-			| client_frame::Body::BlobStat(_)
-			| client_frame::Body::BlobGet(_)
-			| client_frame::Body::BlobPutChunk(_)
-			| client_frame::Body::BlobPutCommit(_)
-			| client_frame::Body::BlobDelete(_)
 	)
 }
 
@@ -2453,13 +2455,14 @@ impl EnvServer {
 		state_dir: &Path,
 		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
+		settings_catalog: SettingsCatalog,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		mcp.bind_config_paths(state_dir, workspace.root());
-		let lsp_settings = load_lsp_settings(state_dir, workspace.root())
+		let lsp_settings = load_lsp_settings(state_dir, workspace.root(), settings_catalog)
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let doc_config = omp_docserver::ServerConfig::new(root)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
@@ -2542,9 +2545,9 @@ impl EnvServer {
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
 		let (host_settings, browser_settings, shell_settings, sandbox_settings, acp_settings) =
-			execution_settings(state_dir, workspace.root())?;
+			execution_settings(state_dir, workspace.root(), settings_catalog)?;
 		exec.configure_sandbox(&sandbox_settings, workspace.root());
-		let mcp_settings = mcp_settings(state_dir, workspace.root(), None)?;
+		let mcp_settings = mcp_settings(state_dir, workspace.root(), None, settings_catalog)?;
 		mcp.start_native_configs(mcp_settings.enable_project_config)
 			.await
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
@@ -2576,6 +2579,7 @@ impl EnvServer {
 			&blobs,
 			&exec,
 			state_dir,
+			settings_catalog,
 			session_id.as_str(),
 			Arc::clone(&github_cache),
 			&mcp,
@@ -2682,6 +2686,7 @@ impl EnvServer {
 		doc_connections: Option<watch::Sender<usize>>,
 		require_document_ownership: bool,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
+		settings_catalog: SettingsCatalog,
 		settings_snapshot: Option<&SettingsSnapshot>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
@@ -2690,7 +2695,7 @@ impl EnvServer {
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		mcp.bind_config_paths(state_dir, workspace.root());
-		let lsp_settings = load_lsp_settings(state_dir, &root)
+		let lsp_settings = load_lsp_settings(state_dir, &root, settings_catalog)
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		let document_lsp = omp_docserver::NativeLspOptions {
 			enabled: lsp_settings.enabled,
@@ -2814,13 +2819,14 @@ impl EnvServer {
 			if let Some(snapshot) = settings_snapshot {
 				execution_settings_from_snapshot(snapshot)?
 			} else {
-				execution_settings(state_dir, workspace.root())?
+				execution_settings(state_dir, workspace.root(), settings_catalog)?
 			};
 		exec.configure_sandbox(&sandbox_settings, workspace.root());
 		host_settings.tools = host_settings
 			.tools
 			.with_approval_mode_override(approval_mode);
-		let mcp_settings = mcp_settings(state_dir, workspace.root(), settings_snapshot)?;
+		let mcp_settings =
+			mcp_settings(state_dir, workspace.root(), settings_snapshot, settings_catalog)?;
 		mcp.start_native_configs(mcp_settings.enable_project_config)
 			.await
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
@@ -2852,6 +2858,7 @@ impl EnvServer {
 			&blobs,
 			&exec,
 			state_dir,
+			settings_catalog,
 			session_id.as_str(),
 			Arc::clone(&github_cache),
 			&mcp,
@@ -2980,7 +2987,8 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
-		let mcp_settings = mcp_settings(state_dir, &root, Some(settings_snapshot))?;
+		let mcp_settings =
+			mcp_settings(state_dir, &root, Some(settings_snapshot), settings_snapshot.catalog())?;
 		// Native config mounting requires the bound manager: reload resolves
 		// through the live transport supervisor.
 		mcp.start_native_configs(mcp_settings.enable_project_config)
@@ -3049,6 +3057,7 @@ impl EnvServer {
 		let declarations = build_environment_declaration_inputs(
 			state_dir,
 			&root,
+			settings_snapshot.catalog(),
 			ext_hosts.as_ref(),
 			&host_settings.tools,
 			&shell_settings,
@@ -4633,9 +4642,6 @@ impl EnvServer {
 					.await;
 			},
 			client_frame::Body::ArgText(request) => {
-				let gate_tool_args = self
-					.admission_gate
-					.subscribed(omp_proto::toolhost::v1::HookEventId::HookEventToolCall);
 				let result = connection.invocation_mut(frame.request_id, &request.invocation_id);
 				let query = match result {
 					Ok(InvocationState::Native { feed, lifecycle, admission, .. })
@@ -4646,7 +4652,9 @@ impl EnvServer {
 							self.workspace.root(),
 							self.workspace.root(),
 						);
-						if !gate_tool_args && feed.arg_text(Str::from(request.fragment)).is_err() {
+						if !admission.requires_external_answer()
+							&& feed.arg_text(Str::from(request.fragment)).is_err()
+						{
 							send_error(
 								responses,
 								frame.request_id,
@@ -4671,7 +4679,7 @@ impl EnvServer {
 							self.workspace.root(),
 						);
 						if invocation.streams_args()
-							&& !gate_tool_args
+							&& !admission.requires_external_answer()
 							&& let Err(error) = invocation.arg_text(request)
 						{
 							send_error(
@@ -7216,12 +7224,12 @@ impl EnvServer {
 		if reject_duplicate_open(connection, request_id, responses).await {
 			return;
 		}
-		if !connection.ambient && request.name == "eval" {
+		if connection.host.is_some() && request.name == "eval" {
 			send_error(
 				responses,
 				request_id,
 				pb::ProtocolErrorCode::PermissionDenied,
-				"eval is available only through the session-local environment",
+				"eval is denied to extension-host connections",
 			)
 			.await;
 			return;
@@ -7315,11 +7323,15 @@ impl EnvServer {
 			.effects(&request.name)
 			.expect("a routed tool has a declared effect envelope")
 			.clone();
-		let approval_policy = connection
-			.tool_settings
-			.approval_for(invocation_id.clone(), request.name.as_str(), &maximum_effects)
-			.policy;
 		let execution = InvocationExecutionPolicy::from_request(&request);
+		let approval_policy = if execution.core_admission {
+			ApprovalPolicy::Prompt
+		} else {
+			connection
+				.tool_settings
+				.approval_for(invocation_id.clone(), request.name.as_str(), &maximum_effects)
+				.policy
+		};
 		let cancel = CancellationToken::new();
 		if route == ToolRoute::Native {
 			let owner = if let Some(principal) = principal {
@@ -7357,12 +7369,21 @@ impl EnvServer {
 			);
 			let acp = connection.acp_routes(request_id, &invocation_id, responses);
 			let acp_context = acp.context();
-			let admission = AdmissionGate::with_policy(
-				invocation_id.clone(),
-				name.clone(),
-				deadline,
-				approval_policy,
-			);
+			let admission = if execution.core_admission {
+				AdmissionGate::with_deferred_policy(
+					invocation_id.clone(),
+					name.clone(),
+					deadline,
+					approval_policy,
+				)
+			} else {
+				AdmissionGate::with_policy(
+					invocation_id.clone(),
+					name.clone(),
+					deadline,
+					approval_policy,
+				)
+			};
 			connection.requests.insert(
 				request_id,
 				RequestState::Invocation(InvocationState::Native {
@@ -7448,12 +7469,16 @@ impl EnvServer {
 					owner,
 					invocation: Some(invocation),
 					committed: false,
-					admission: AdmissionGate::with_policy(
-						invocation_id.clone(),
-						name,
-						deadline,
-						approval_policy,
-					),
+					admission: if execution.core_admission {
+						AdmissionGate::with_deferred_policy(
+							invocation_id.clone(),
+							name,
+							deadline,
+							approval_policy,
+						)
+					} else {
+						AdmissionGate::with_policy(invocation_id.clone(), name, deadline, approval_policy)
+					},
 					pending_commit: None,
 					maximum_effects,
 					execution,
@@ -8211,7 +8236,6 @@ struct ConnectionState {
 	acp_documents:    bool,
 	acp_exec:         bool,
 	host:             Option<HostKey>,
-	ambient:          bool,
 	authority:        Arc<AuthorityTable>,
 	connection_owner: u64,
 	quotas:           QuotaAccount,
@@ -8370,7 +8394,6 @@ impl ConnectionState {
 			acp_documents: false,
 			acp_exec: false,
 			host: policy.host.clone(),
-			ambient: policy.ambient,
 			authority,
 			connection_owner,
 			quotas,
@@ -11239,8 +11262,12 @@ where
 /// Assembles and runs the standalone environment daemon with the production
 /// built-in registry.
 #[cfg(unix)]
-pub async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<(), EnvdError> {
-	run_with_registry(args, Registry::new(), bridges).await
+pub async fn run(
+	args: EnvdConfig,
+	catalog: SettingsCatalog,
+	bridges: RegistryBridges,
+) -> Result<(), EnvdError> {
+	run_with_registry(args, Registry::new(), catalog, bridges).await
 }
 
 /// Assembles production dispatch plus caller-provided tool revisions.
@@ -11258,12 +11285,13 @@ pub async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<(), EnvdE
 pub async fn run_with_registry(
 	args: EnvdConfig,
 	registry: Registry,
+	catalog: SettingsCatalog,
 	bridges: RegistryBridges,
 ) -> Result<(), EnvdError> {
 	let workspace = WorkspaceHost::open(&args.root)?;
 	let root = workspace.root().to_path_buf();
 	let data_dir = omp_core::dirs::data_dir(None).map_err(io::Error::other)?;
-	let settings = load_host_settings(&data_dir, &root).map_err(io::Error::other)?;
+	let settings = load_host_settings(&data_dir, &root, catalog).map_err(io::Error::other)?;
 	let interrupt_grace = settings.runtime.interrupt_grace;
 	let state_dir = if let Some(path) = args.state_dir {
 		path
@@ -11335,6 +11363,7 @@ pub async fn run_with_registry(
 			Some(doc_connections),
 			require_document_ownership,
 			None,
+			catalog,
 			None,
 			bridges,
 		)
@@ -11680,14 +11709,16 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
 }
 #[cfg(all(test, unix))]
 mod tests {
-	use std::{fs, os::unix::fs::PermissionsExt as _};
+	use std::{fs, os::unix::fs::PermissionsExt as _, sync::Arc};
 
 	use flume::Receiver;
-	use omp_core::Principal;
+	use omp_agent::{ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalSource};
+	use omp_core::{EnvPath, Principal};
 	use omp_docserver::{
 		Environment, ServerConfig,
 		connection::{ConnectionConfig, serve_connection},
 	};
+	use omp_env::{EnvClient, ExecEvent as ClientExecEvent};
 	use omp_proto::{
 		document::v1::{document_target, read_selection},
 		env::v1::{self as env_pb, document_op, document_result},
@@ -11732,6 +11763,26 @@ mod tests {
 	fn eval_reset_is_environment_only() {
 		assert!(requires_environment_host(&client_frame::Body::EvalReset(pb::EvalResetRequest {}),));
 	}
+
+	#[test]
+	fn blob_io_is_available_on_session_hosts() {
+		assert!(!requires_environment_host(&client_frame::Body::BlobStat(
+			blob_pb::StatRequest::default(),
+		)));
+		assert!(!requires_environment_host(&client_frame::Body::BlobGet(
+			blob_pb::GetRequest::default(),
+		)));
+		assert!(!requires_environment_host(&client_frame::Body::BlobPutChunk(
+			blob_pb::Chunk::default(),
+		)));
+		assert!(!requires_environment_host(&client_frame::Body::BlobPutCommit(
+			pb::CommitBlobPut::default(),
+		)));
+		assert!(!requires_environment_host(&client_frame::Body::BlobDelete(
+			blob_pb::DeleteRequest::default(),
+		)));
+	}
+
 	#[tokio::test]
 	async fn environment_host_acknowledges_eval_reset() {
 		let (requests, responses, _root, _state) = test_connection(&[], false).await;
@@ -11751,6 +11802,31 @@ mod tests {
 				.body,
 			Some(server_frame::Body::EvalReset(pb::EvalResetResponse {}))
 		));
+	}
+	/// Owner-local connections may run eval on this host; extension-host
+	/// connections are the one class the eval guard still rejects.
+	#[tokio::test]
+	async fn host_keyed_connections_cannot_invoke_eval() {
+		let (requests, responses, _root, _state) = test_connection(&["invocation"], false).await;
+		requests
+			.send_async(pb::ClientFrame {
+				request_id: 7,
+				body: Some(client_frame::Body::InvokeTool(pb::InvokeTool {
+					invocation_id: "host-eval-denied".into(),
+					name: "eval".into(),
+					rev: "1".into(),
+					..pb::InvokeTool::default()
+				})),
+				..pb::ClientFrame::default()
+			})
+			.await
+			.expect("send eval invoke");
+		let frame = responses.recv_async().await.expect("eval denial response");
+		let Some(server_frame::Body::Error(error)) = frame.body else {
+			panic!("host-keyed eval invoke was not denied: {:?}", frame.body);
+		};
+		assert_eq!(error.code, pb::ProtocolErrorCode::PermissionDenied as i32);
+		assert_eq!(error.message, "eval is denied to extension-host connections");
 	}
 
 	#[tokio::test]
@@ -12226,6 +12302,7 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
+				crate::TEST_SETTINGS_CATALOG,
 				RegistryBridges::default(),
 			)
 			.await
@@ -12355,6 +12432,7 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
+				crate::TEST_SETTINGS_CATALOG,
 				RegistryBridges::default(),
 			)
 			.await
@@ -12975,7 +13053,10 @@ mod tests {
 		.await
 		.expect("spawn document authority");
 		let response = documents
-			.lsp_status(document_pb::LspStatusRequest { reload: false }, &CancellationToken::new())
+			.lsp_status(
+				document_pb::LspStatusRequest { reload: false, start: false },
+				&CancellationToken::new(),
+			)
 			.await
 			.expect("lsp status");
 		let fake = response
@@ -13060,6 +13141,150 @@ mod tests {
 			.expect("stale authority task")
 			.expect("stale authority shutdown");
 	}
+	#[cfg(target_os = "macos")]
+	#[tokio::test]
+	async fn remote_exec_approval_amends_only_the_owner_command() {
+		if !omp_sandbox::backend_status(omp_sandbox::Backend::Seatbelt).is_available() {
+			return;
+		}
+		let root = tempfile::tempdir().expect("workspace");
+		let state = tempfile::tempdir().expect("state");
+		fs::create_dir(root.path().join(".git")).expect("protected carve-out");
+		let server = Arc::new(
+			EnvServer::open_local(
+				root.path(),
+				state.path(),
+				Registry::new(),
+				ExtHostConfig::new(
+					PathBuf::from("unused"),
+					Principal::new(sf!("test-principal"), sf!("Test Principal")),
+					sf!("test-session"),
+					1,
+				),
+				crate::TEST_SETTINGS_CATALOG,
+				RegistryBridges::default(),
+			)
+			.await
+			.expect("owner server"),
+		);
+		server.exec.configure_sandbox(
+			&SandboxSettings {
+				mode: crate::exec_settings::ExecSandboxMode::WorkspaceWrite,
+				..SandboxSettings::default()
+			},
+			root.path(),
+		);
+		let book = Arc::new(ApprovalBook::new());
+		let (route, inbox) = ApprovalRoute::new(Arc::clone(&book), None);
+		server.bind_approval_authority(Some(book), Some(route));
+		let (client, transport) = EnvClient::in_process(64);
+		let owner = Arc::clone(&server);
+		let serving = tokio::spawn(async move { owner.serve_in_process(transport).await });
+		client
+			.hello(pb::ClientHello {
+				client: "remote-scoped-amendment".to_owned(),
+				schema_rev: omp_proto::SCHEMA_REV,
+				..pb::ClientHello::default()
+			})
+			.await
+			.expect("remote hello");
+		let approval = tokio::spawn(async move {
+			let request = inbox.recv().await.expect("owner approval");
+			let reason = request.ticket.reasons.first().expect("scoped reason");
+			assert_eq!(reason.kind, "sandbox_amendment");
+			assert!(
+				reason
+					.pattern
+					.as_deref()
+					.is_some_and(|command| { command == "echo approved > .git/approved.txt" })
+			);
+			assert!(reason.subject.ends_with(".git"));
+			request
+				.respond(ApprovalDecision {
+					approved:   true,
+					scope:      sf!("once"),
+					source:     ApprovalSource::User,
+					decided_by: Some(sf!("test approver")),
+					reason:     None,
+					audited:    false,
+				})
+				.expect("approve exact scope");
+		});
+		let opened = client
+			.open_session(
+				&EnvPath::new(
+					Url::from_directory_path(root.path())
+						.expect("workspace URI")
+						.to_string(),
+				)
+				.expect("typed workspace URI"),
+				pb::OpenSessionRequest::default(),
+			)
+			.await
+			.expect("remote session");
+		let mut approved = client
+			.exec(pb::ExecRequest {
+				session: opened.session.clone(),
+				source: Some(pb::Script {
+					text: "echo approved > .git/approved.txt".to_owned(),
+					..pb::Script::default()
+				}),
+				..pb::ExecRequest::default()
+			})
+			.await
+			.expect("normal remote request");
+		let mut starts = 0;
+		let mut note = Vec::new();
+		let status = loop {
+			match approved
+				.next_event()
+				.await
+				.expect("remote exec event")
+				.expect("remote exec stream")
+			{
+				ClientExecEvent::Started(_) => starts += 1,
+				ClientExecEvent::Output(frame) => note.extend_from_slice(&frame.data),
+				ClientExecEvent::Exit(exit) => break exit.status.expect("terminal status"),
+			}
+		};
+		approval.await.expect("owner approver");
+		assert_eq!(starts, 1);
+		assert_eq!(status.outcome, pb::ExecOutcome::Exited as i32);
+		assert_eq!(
+			fs::read(root.path().join(".git/approved.txt")).expect("approved write"),
+			b"approved\n"
+		);
+		assert!(
+			String::from_utf8_lossy(&note).contains("[sandbox] rerun with approved scope: write")
+		);
+
+		let mut restored = client
+			.exec(pb::ExecRequest {
+				session: opened.session,
+				source: Some(pb::Script {
+					text: "echo blocked > .git/blocked.txt".to_owned(),
+					..pb::Script::default()
+				}),
+				..pb::ExecRequest::default()
+			})
+			.await
+			.expect("second normal remote request");
+		let restored = loop {
+			match restored
+				.next_event()
+				.await
+				.expect("restored event")
+				.expect("restored stream")
+			{
+				ClientExecEvent::Exit(exit) => break exit.status.expect("restored status"),
+				ClientExecEvent::Started(_) | ClientExecEvent::Output(_) => {},
+			}
+		};
+		assert_eq!(restored.outcome, pb::ExecOutcome::Denied as i32);
+		assert!(!root.path().join(".git/blocked.txt").exists());
+		serving.abort();
+	}
+
 	#[test]
 	fn plan_guard_denies_workspace_mutation_and_exempts_local_artifacts() {
 		let effects = Effects {
@@ -13069,8 +13294,12 @@ mod tests {
 			}),
 			..Effects::empty()
 		};
-		let policy =
-			InvocationExecutionPolicy { tool: sf!("write"), plan: true, plan_yolo: false };
+		let policy = InvocationExecutionPolicy {
+			tool:           sf!("write"),
+			plan:           true,
+			plan_yolo:      false,
+			core_admission: false,
+		};
 		assert!(
 			policy
 				.denial(&effects, br#"{"path":"src/lib.rs","content":"x"}"#)
@@ -13094,10 +13323,18 @@ mod tests {
 			exec: Some(omp_tool::ExecEffects { commands: Arc::from([sf!("*")]), network: false }),
 			..Effects::empty()
 		};
-		let yolo =
-			InvocationExecutionPolicy { tool: sf!("bash"), plan: true, plan_yolo: true };
-		let plan =
-			InvocationExecutionPolicy { tool: sf!("bash"), plan: true, plan_yolo: false };
+		let yolo = InvocationExecutionPolicy {
+			tool:           sf!("bash"),
+			plan:           true,
+			plan_yolo:      true,
+			core_admission: false,
+		};
+		let plan = InvocationExecutionPolicy {
+			tool:           sf!("bash"),
+			plan:           true,
+			plan_yolo:      false,
+			core_admission: false,
+		};
 		assert!(yolo.denial(&effects, br#"{"command":"touch x"}"#).is_none());
 		assert!(plan.denial(&effects, br#"{"command":"touch x"}"#).is_some());
 	}

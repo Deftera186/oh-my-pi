@@ -947,6 +947,7 @@ fn cca_discovered_rows(
 				declared_operations: OperationBits::for_kind(OperationKind::Chat),
 				declared_capabilities,
 				declared_limits,
+				declared_pricing: Box::new([]),
 				extended_context_mode: None,
 				availability: Some(if record.is_internal {
 					ModelAvailability::Disabled

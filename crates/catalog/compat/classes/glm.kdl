@@ -21,14 +21,14 @@ class "glm" {
 			thinking-efforts "minimal" "low" "medium" "high"
 		}
 	}
-	// GLM-5.3+ coding SKUs (base/air/turbo, non-vision) expose a uniform
+	// GLM-5.3+ coding SKUs (base/air/turbo/flash, non-vision) expose a uniform
 	// wire-exact low/high/max reasoning-effort ladder on every host, thinking
 	// can no longer be disabled, and the default effort is max.
 	// residue: taxonomy ranks cannot separate these ids from the vision (`…v`)
-	// and flash shapes that keep host dialects; the explicit priority resolves
+	// and flashx/preview shapes that keep host dialects; the explicit priority resolves
 	// the intentional overlap with census host-dialect residues such as
 	// baseten's `zai-org/GLM-5*`.
-	models "*glm-5.3" "*glm-5.3-air" "*glm-5.3-turbo" priority=10 {
+	models "*glm-5.3" "*glm-5.3-air" "*glm-5.3-turbo" "*glm-5.3-flash" priority=10 {
 		thinking-default-level "max"
 		thinking-efforts "low" "high" "max"
 		thinking-requires-effort #true

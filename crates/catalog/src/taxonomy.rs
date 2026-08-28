@@ -217,12 +217,14 @@ struct DiscoveryVocabulary {
 /// One reviewed seed for provider-scoped dynamic effort-sibling collapse.
 ///
 /// Declaring at least one family enables the generic grouping rule for that
-/// provider. The reviewed ids retain the upstream inventory in data without
-/// baking provider or model names into compiler code.
+/// provider. Additional exact aliases fold unsuffixed provider discovery names
+/// into the canonical routed family. The reviewed ids retain the upstream
+/// inventory in data without baking provider or model names into compiler code.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EffortFamily {
 	provider: ProviderId,
 	logical:  Str,
+	aliases:  Box<[Str]>,
 }
 
 /// Parsed checked-in identity taxonomy.
@@ -487,17 +489,29 @@ impl Taxonomy {
 
 	/// Collapses a declared thinking or effort suffix from a model identifier.
 	///
+	/// An exact member alias declared by `effort-family` collapses to that
+	/// family's logical model without assigning an effort.
+	///
 	/// A provider-scoped effort lane (`effort-lane-suffix`) additionally
 	/// collapses an effort suffix wedged before the lane token: on a declared
 	/// provider, `cursor-grok-4.6-low-fast` collapses to the logical
 	/// `cursor-grok-4.6-fast` with effort `low` — one logical model per
 	/// service-tier lane.
 	pub fn collapse<'a>(
-		&self,
+		&'a self,
 		provider: &str,
 		model: &'a str,
 	) -> (Cow<'a, str>, Option<EffortTier>, bool) {
 		let lower = model.to_ascii_lowercase();
+		if let Some(family) = self.effort_families.iter().find(|family| {
+			family.provider.eq_ignore_ascii_case(provider)
+				&& family
+					.aliases
+					.iter()
+					.any(|alias| alias.as_str() == lower.as_str())
+		}) {
+			return (Cow::Borrowed(family.logical.as_str()), None, false);
+		}
 		let bare = lower.rsplit('/').next().unwrap_or(lower.as_str());
 		let winner = self
 			.collapse
@@ -1005,6 +1019,7 @@ fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>
 	};
 	let mut families = Vec::new();
 	let mut unique = BTreeSet::new();
+	let mut unique_aliases = BTreeSet::new();
 	for child in children
 		.nodes()
 		.iter()
@@ -1012,20 +1027,33 @@ fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>
 	{
 		validate_properties(file, child, "effort-family", &[])?;
 		let arguments = positional_strings(child);
-		let [provider, logical] = arguments.as_slice() else {
+		let [provider, logical, aliases @ ..] = arguments.as_slice() else {
 			return malformed(file, "effort-family");
 		};
 		let provider = provider.to_ascii_lowercase();
 		let logical = logical.to_ascii_lowercase();
+		let aliases = aliases
+			.iter()
+			.map(|alias| alias.to_ascii_lowercase())
+			.collect::<Vec<_>>();
 		if provider.is_empty()
 			|| logical.is_empty()
-			|| child.children().is_some()
+			|| unique_aliases.contains(&(provider.clone(), logical.clone()))
+			|| aliases.iter().any(|alias| {
+				alias.is_empty()
+					|| alias == &logical
+					|| unique.contains(&(provider.clone(), alias.clone()))
+					|| !unique_aliases.insert((provider.clone(), alias.clone()))
+			}) || child.children().is_some()
 			|| !unique.insert((provider.clone(), logical.clone()))
 		{
 			return malformed(file, "effort-family");
 		}
-		families
-			.push(EffortFamily { provider: ProviderId::new(provider), logical: logical.to_str() });
+		families.push(EffortFamily {
+			provider: ProviderId::new(provider),
+			logical:  logical.to_str(),
+			aliases:  aliases.into_iter().map(Str::new).collect(),
+		});
 	}
 	Ok(families)
 }
@@ -1690,6 +1718,52 @@ mod tests {
 			taxonomy.collapse("cursor", "claude-opus-5-high-fast"),
 			(Cow::Owned::<str>("claude-opus-5-fast".into()), Some(EffortTier::High), false)
 		);
+	}
+
+	#[test]
+	fn bundled_effort_families_fold_gemini_tiered_aliases() {
+		let taxonomy = taxonomy();
+		for (alias, logical) in [
+			("gemini-3.6-flash-tiered", "gemini-3.6-flash"),
+			("gemini-3.7-flash-tiered", "gemini-3.7-flash"),
+		] {
+			assert_eq!(
+				taxonomy.collapse("google-antigravity", alias),
+				(Cow::Borrowed(logical), None, false)
+			);
+		}
+		assert_eq!(
+			taxonomy
+				.collapse("GOOGLE-ANTIGRAVITY", "GEMINI-3.7-FLASH-TIERED")
+				.0,
+			"gemini-3.7-flash"
+		);
+		assert_eq!(
+			taxonomy.collapse("google", "gemini-3.7-flash-tiered").0,
+			"gemini-3.7-flash-tiered"
+		);
+	}
+
+	#[test]
+	fn malformed_effort_family_aliases_are_rejected() {
+		for source in [
+			r#"collapse {
+				effort-family "provider" "model" ""
+			}"#,
+			r#"collapse {
+				effort-family "provider" "model" "model"
+			}"#,
+			r#"collapse {
+				effort-family "provider" "first" "shared-alias"
+				effort-family "provider" "second" "shared-alias"
+			}"#,
+		] {
+			let result = Taxonomy::parse(&[("bad", source)]);
+			assert!(
+				matches!(result, Err(CascadeError::MalformedDirective { .. })),
+				"{source} -> {result:?}"
+			);
+		}
 	}
 
 	#[test]

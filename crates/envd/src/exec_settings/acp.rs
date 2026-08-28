@@ -1,8 +1,7 @@
 //! Native ACP exec-backend routing settings.
 
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,25 +69,17 @@ impl SettingsDomain for AcpSettings {
 	}];
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<AcpSettings>()
-}
-
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::SettingsSnapshot;
 
 	use super::*;
 
 	#[test]
-	fn acp_projection_round_trips_and_is_registered() {
+	fn acp_projection_round_trips() {
 		let expected = AcpSettings { routing: AcpRouting::Never };
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated snapshot");
+		let snapshot = SettingsSnapshot::isolated(expected.clone(), crate::TEST_SETTINGS_CATALOG)
+			.expect("isolated snapshot");
 		assert_eq!(snapshot.project::<AcpSettings>().expect("projection").get(), &expected);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == AcpSettings::DOMAIN)
-		);
 	}
 }

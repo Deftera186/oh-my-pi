@@ -1030,7 +1030,12 @@ fn character_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(b
 	None
 }
 
-omp_settings::inventory::submit! { DomainRegistration::of::<ModelSettings>() }
+/// Settings domains owned by the catalog crate.
+pub const SETTINGS_CONTRIBUTION: omp_settings::SettingsContribution =
+	omp_settings::SettingsContribution {
+		domains:     &[DomainRegistration::of::<ModelSettings>()],
+		normalizers: &[],
+	};
 
 /// Resolves provider family from canonical route and model identities.
 pub fn provider_family(provider: &str, model: Option<&str>) -> ProviderFamily {

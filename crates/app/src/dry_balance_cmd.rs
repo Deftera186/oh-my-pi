@@ -68,6 +68,7 @@ pub async fn run(args: DryBalanceArgs) -> miette::Result<()> {
 				rotate:             false,
 				rotation:           RotationPolicy::default(),
 				now:                SystemTime::now(),
+				quota_scope:        None,
 			})
 			.map_err(|error| miette!(error.to_string()))?;
 		*counts

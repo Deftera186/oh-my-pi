@@ -113,7 +113,8 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	let home = env::var_os("HOME").map_or_else(|| project.clone(), PathBuf::from);
 	let mut settings_paths = SettingsPaths::discover(&data, Some(&project));
 	settings_paths.overlays.extend(args.config.iter().cloned());
-	let settings_manager = Arc::new(SettingsManager::open(settings_paths).into_diagnostic()?);
+	let settings_manager =
+		Arc::new(SettingsManager::open(settings_paths, crate::SETTINGS_CATALOG).into_diagnostic()?);
 	let settings_snapshot = settings_manager.snapshot();
 	let model_settings = settings_snapshot
 		.project::<omp_catalog::settings::ModelSettings>()
@@ -2022,6 +2023,7 @@ impl Runtime {
 			| AgentEvent::JobRegistered { .. }
 			| AgentEvent::JobSettled { .. }
 			| AgentEvent::HistoryRewritten { .. }
+			| AgentEvent::InputStaged { .. }
 			| AgentEvent::Snapshot(_)
 			| AgentEvent::PeerRelay(_) => return Ok(()),
 		};
@@ -4426,14 +4428,25 @@ fn rpc_prompt_items(prompt: RpcPrompt) -> Result<Vec<Item>, CommandError> {
 	if orchestration {
 		items.push(Item {
 			kind: Some(item::Kind::Message(ThreadMessage {
-				role:  ThreadRole::System as i32,
-				parts: vec![Part { kind: Some(part::Kind::Text(ORCHESTRATE_NOTICE.to_owned())) }],
+				role:            ThreadRole::System as i32,
+				parts:           vec![Part { kind: Some(part::Kind::Text(ORCHESTRATE_NOTICE.to_owned())) }],
+				synthetic:       None,
+				user_initiated:  None,
+				completed_at_ms: None,
+				usage:           None,
 			})),
 			..Item::default()
 		});
 	}
 	items.push(Item {
-		kind: Some(item::Kind::Message(ThreadMessage { role: ThreadRole::User as i32, parts })),
+		kind: Some(item::Kind::Message(ThreadMessage {
+			role: ThreadRole::User as i32,
+			parts,
+			synthetic: None,
+			user_initiated: None,
+			completed_at_ms: None,
+			usage: None,
+		})),
 		..Item::default()
 	});
 	Ok(items)

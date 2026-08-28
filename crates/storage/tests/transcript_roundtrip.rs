@@ -264,10 +264,11 @@ fn every_kind() -> Vec<Event> {
 					seq:           0,
 					created_at_ms: 18,
 					kind:          Some(thread_pb::item::Kind::Message(thread_pb::Message {
-						role:  thread_pb::Role::User as i32,
+						role: thread_pb::Role::User as i32,
 						parts: vec![thread_pb::Part {
 							kind: Some(thread_pb::part::Kind::Text("canonical".to_owned())),
 						}],
+						..Default::default()
 					})),
 					props:         None,
 				},
@@ -313,10 +314,11 @@ fn every_kind() -> Vec<Event> {
 						seq:           7,
 						created_at_ms: 18,
 						kind:          Some(thread_pb::item::Kind::Message(thread_pb::Message {
-							role:  thread_pb::Role::Assistant as i32,
+							role: thread_pb::Role::Assistant as i32,
 							parts: vec![thread_pb::Part {
 								kind: Some(thread_pb::part::Kind::Text("done".to_owned())),
 							}],
+							..Default::default()
 						})),
 						props:         None,
 					}],
@@ -336,10 +338,11 @@ fn every_kind() -> Vec<Event> {
 					seq:           0,
 					created_at_ms: 22,
 					kind:          Some(thread_pb::item::Kind::Message(thread_pb::Message {
-						role:  thread_pb::Role::User as i32,
+						role: thread_pb::Role::User as i32,
 						parts: vec![thread_pb::Part {
 							kind: Some(thread_pb::part::Kind::Text("next".to_owned())),
 						}],
+						..Default::default()
 					})),
 					props:         None,
 				},
@@ -698,6 +701,7 @@ fn oversized_tool_search_history_round_trips_byte_for_byte() {
 							.into_bytes(),
 						),
 					],
+					..Default::default()
 				})),
 				props:         None,
 			},

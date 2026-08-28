@@ -26,6 +26,10 @@ use omp_inference::{
 		RealtimeEvent as CanonicalRealtimeEvent, RealtimeInput, SearchFailureKind, SearchResults,
 		TranscriptEvent, UsageReport, UsageStatus, UsageUnit, UsageWindowKind, VideoArtifact,
 	},
+	auth::{
+		APP_HEADER, ClientUsageIdentity, HOSTNAME_HEADER, INSTALL_ID_HEADER, UsageAttribution,
+		resolve_forwarded_attribution,
+	},
 	call::{
 		self, CallMeta, ContentPart, ContextStrategy, CountAccuracy, CountTokensRequest,
 		DetokenizeRequest, Dimensions, EmbedRequest, EmbeddingInput, ImageFormat, ImageQuality,
@@ -70,6 +74,7 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1::{self as thread_pb, blob, item, part},
 };
+use omp_storage::index::{ClientUsageRecord, SessionIndex};
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry as ToolRegistry, TOOL_REV_PROP};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, oneshot};
@@ -156,6 +161,8 @@ pub struct InferenceRpc {
 	prompt_cache_affinity: Option<Str>,
 	provider_authority:    Option<Arc<dyn ProviderGatewayAuthority>>,
 	response_hooks:        ProviderResponseHooks,
+	client_usage:          Option<Arc<SessionIndex>>,
+	gateway_attribution:   Option<UsageAttribution>,
 }
 
 #[derive(Clone, Default)]
@@ -266,7 +273,17 @@ impl InferenceRpc {
 			prompt_cache_affinity: None,
 			provider_authority: None,
 			response_hooks: ProviderResponseHooks::default(),
+			client_usage: None,
+			gateway_attribution: None,
 		}
+	}
+
+	/// Binds append-only per-client usage accounting and the gateway fallback
+	/// identity.
+	pub fn with_client_usage(mut self, store: Arc<SessionIndex>, gateway: UsageAttribution) -> Self {
+		self.client_usage = Some(store);
+		self.gateway_attribution = Some(gateway);
+		self
 	}
 
 	/// Installs the session-owned provider response observation sink.
@@ -693,6 +710,23 @@ impl pb::inference_server::Inference for InferenceRpc {
 		&self,
 		request: Request<tonic::Streaming<pb::TurnFrame>>,
 	) -> Result<Response<Self::TurnStream>, Status> {
+		let attribution = self.gateway_attribution.as_ref().map(|gateway| {
+			resolve_forwarded_attribution(
+				request
+					.metadata()
+					.get(INSTALL_ID_HEADER)
+					.and_then(|value| value.to_str().ok()),
+				request
+					.metadata()
+					.get(APP_HEADER)
+					.and_then(|value| value.to_str().ok()),
+				request
+					.metadata()
+					.get(HOSTNAME_HEADER)
+					.and_then(|value| value.to_str().ok()),
+				gateway,
+			)
+		});
 		let mut incoming = request.into_inner();
 		let first = incoming
 			.message()
@@ -797,6 +831,8 @@ impl pb::inference_server::Inference for InferenceRpc {
 			projection,
 			Arc::clone(&self.tool_registry),
 			self.test_live_responses.clone(),
+			self.client_usage.clone(),
+			attribution,
 		);
 		Ok(Response::new(Box::pin(output)))
 	}
@@ -2456,21 +2492,26 @@ fn chat_request(
 	let tools: Vec<ToolDefinition> = if params.tools.is_empty() {
 		Vec::new()
 	} else {
+		// Selected advertisement keeps caller-requested hidden slots (`think`
+		// under external thinking, subagent `yield`) that plain `advertise`
+		// would drop.
+		let selected = params
+			.tools
+			.iter()
+			.map(|tool| Str::new(tool.name.as_str()))
+			.collect::<Vec<_>>();
 		tool_registry
-			.advertise(LoweringCaps {
-				strict_schema:  true,
-				grammar:        GrammarBits::ALL,
-				maximum_tools:  None,
-				maximum_strict: None,
-			})
+			.advertise_selected(
+				LoweringCaps {
+					strict_schema:  true,
+					grammar:        GrammarBits::ALL,
+					maximum_tools:  None,
+					maximum_strict: None,
+				},
+				&selected,
+			)
 			.map_err(|error| Status::failed_precondition(error.to_string()))?
 			.into_iter()
-			.filter(|tool| {
-				params
-					.tools
-					.iter()
-					.any(|requested| requested.name == tool.identity.name.as_str())
-			})
 			.map(|tool| tool.definition)
 			.collect()
 	};
@@ -2636,6 +2677,7 @@ fn build_turn_outcome(
 			kind:          Some(item::Kind::Message(thread_pb::Message {
 				role: thread_pb::Role::Assistant as i32,
 				parts,
+				..Default::default()
 			})),
 			props:         None,
 		});
@@ -3002,6 +3044,8 @@ fn turn_events(
 	projection: Arc<Mutex<TurnProjection>>,
 	tool_registry: Arc<ToolRegistry>,
 	test_live_responses: Option<flume::Sender<WorkflowResponse>>,
+	client_usage: Option<Arc<SessionIndex>>,
+	attribution: Option<ClientUsageIdentity>,
 ) -> impl Stream<Item = Result<pb::TurnEvent, Status>> + Send + 'static {
 	let control = events.control();
 	async_stream::try_stream! {
@@ -3264,6 +3308,47 @@ fn turn_events(
 						let route = resolved.resolved_route.lock();
 						(route.provider.clone(), route.model.clone())
 					};
+					if let (Some(store), Some(attribution), Some(provider), Some(model)) =
+						(&client_usage, &attribution, &route_provider, &route_model)
+					{
+						let usage = completion.usage;
+						let tokens = usage
+							.input_tokens
+							.saturating_add(usage.output_tokens)
+							.saturating_add(usage.cache_read_tokens)
+							.saturating_add(usage.cache_write_tokens);
+						if tokens != 0 {
+							let recorded_ms = SystemTime::now()
+								.duration_since(UNIX_EPOCH)
+								.unwrap_or_default()
+								.as_millis()
+								.try_into()
+								.unwrap_or(u64::MAX);
+							let cost = proto_cost(completion.receipt.cost);
+							if store
+								.record_client_usage(&ClientUsageRecord {
+									recorded_ms,
+									install_id: attribution.install_id(),
+									hostname: attribution.hostname(),
+									app: attribution.app(),
+									provider: provider.as_str(),
+									model: model
+										.as_str()
+										.split_once('/')
+										.map_or(model.as_str(), |(_, logical)| logical),
+									requests: 1,
+									input_tokens: usage.input_tokens,
+									output_tokens: usage.output_tokens,
+									cache_read_tokens: usage.cache_read_tokens,
+									cache_write_tokens: usage.cache_write_tokens,
+									cost_nanos_usd: cost.nanos_usd,
+								})
+								.is_err()
+							{
+								tracing::warn!("client usage observation was not recorded");
+							}
+						}
+					}
 					let outcome = build_turn_outcome(
 						&projection.lock(),
 						&completion,
@@ -3600,6 +3685,7 @@ fn usage_response(report: UsageReport) -> pb::UsageResponse {
 					UsageUnit::Percent => window::Unit::Percent,
 					UsageUnit::Tokens => window::Unit::Tokens,
 					UsageUnit::Requests => window::Unit::Requests,
+					UsageUnit::Credits => window::Unit::Credits,
 					UsageUnit::Usd => window::Unit::Usd,
 					UsageUnit::Minutes => window::Unit::Minutes,
 					UsageUnit::Bytes => window::Unit::Bytes,

@@ -21,4 +21,10 @@ provider "zai" {
 		thinking-efforts "high" "max"
 		thinking-mode "anthropic-budget-effort"
 	}
+	// GLM-5.3-Flash is the first mandatory-thinking flash SKU. Its exact
+	// deployment keeps the Anthropic budget+effort wire mode instead of the
+	// older optional-thinking flash family's budget-only mode.
+	models "glm-5.3-flash" {
+		thinking-mode "anthropic-budget-effort"
+	}
 }

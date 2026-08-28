@@ -31,6 +31,7 @@ pub mod open;
 pub mod path;
 pub mod phase;
 pub mod principal;
+pub mod qr;
 pub mod secret;
 pub mod semver;
 pub mod sparse_index;
@@ -61,6 +62,7 @@ pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, Point, PointSet
 pub use principal::{
 	ArtifactDigest, ArtifactDigestError, CredentialTier, Principal, Provenance, RemotePrincipal,
 };
+pub use qr::{QrCode, QrEc, QrOverflow};
 pub use secret::{ExposeSecret, Secret, SecretBox, SecretString, ct_eq};
 pub use semver::SemVer;
 pub use sparse_map::SparseMap;

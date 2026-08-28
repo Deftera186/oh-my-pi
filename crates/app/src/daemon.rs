@@ -291,6 +291,7 @@ mod session_authority_tests {
 			kind: Some(item::Kind::Message(Message {
 				role:  Role::User.into(),
 				parts: vec![Part { kind: Some(part::Kind::Text("hello".to_owned())) }],
+				..Default::default()
 			})),
 			..Item::default()
 		};
@@ -433,6 +434,12 @@ pub enum DaemonError {
 	/// Content-addressed blob state could not be opened.
 	#[error(transparent)]
 	BlobStore(#[from] blob::Error),
+	/// Gateway client-usage state could not be opened.
+	#[error(transparent)]
+	UsageStore(#[from] omp_storage::index::Error),
+	/// Gateway usage attribution identity could not be composed.
+	#[error(transparent)]
+	UsageAttribution(#[from] omp_inference::auth::AttributionError),
 	/// Owner-local RPC listener could not bind.
 	#[error("could not bind owner-local RPC endpoint")]
 	RpcListen(#[source] omp_rpc::Error),
@@ -610,7 +617,7 @@ impl DaemonHandle {
 		config: DaemonConfig,
 		data_dir: PathBuf,
 		registry: Registry,
-		inference: InferenceRpc,
+		mut inference: InferenceRpc,
 		auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	) -> Result<Self, DaemonError> {
 		let routes = registry
@@ -623,10 +630,17 @@ impl DaemonHandle {
 		let bearer_token_file = config.bearer_token_file;
 		let (shutdown, mut rpc_shutdown) = watch::channel(false);
 		let blobs = Arc::new(BlobStore::open(&data_dir)?);
-		let auth_rpc = auth_control.map_or_else(
-			|| AuthRpc::new(registry.clone()),
-			|control| AuthRpc::with_control(registry.clone(), control),
-		);
+		let usage =
+			Arc::new(omp_storage::index::SessionIndex::open(data_dir.join("sessions.sqlite3"))?);
+		let gateway_attribution =
+			omp_inference::auth::UsageAttribution::compose(&data_dir, Some("gateway"))?;
+		inference = inference.with_client_usage(Arc::clone(&usage), gateway_attribution);
+		let auth_rpc = auth_control
+			.map_or_else(
+				|| AuthRpc::new(registry.clone()),
+				|control| AuthRpc::with_control(registry.clone(), control),
+			)
+			.with_usage_store(usage);
 		let hello = || {
 			omp_rpc::HelloService::new(env!("CARGO_PKG_VERSION"), vec![
 				sf!("auth"),

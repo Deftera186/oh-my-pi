@@ -447,6 +447,19 @@ impl Default for Theme {
 }
 
 impl Theme {
+	/// Resolves `foreground` for text painted over `background`.
+	///
+	/// Explicit foregrounds pass through. An unset foreground is replaced with
+	/// a contrast-safe color only when the background is concrete; terminal
+	/// defaults remain terminal defaults on an unpainted surface.
+	pub fn foreground_on(&self, foreground: Color, background: Color) -> Color {
+		if foreground == Color::Default && background != Color::Default {
+			background.contrast_label()
+		} else {
+			foreground
+		}
+	}
+
 	/// Quantizes every semantic token for terminals without truecolor.
 	pub const fn quantized_256(self) -> Self {
 		Self {
@@ -697,6 +710,8 @@ mod tests {
 	use std::time::Duration;
 
 	use super::{Appearance, Charset, Theme};
+	use crate::frame::Color;
+
 	#[test]
 	fn pulse_frames_degrade_by_charset() {
 		let samples = [0, 120, 240, 360, 480].map(Duration::from_millis);
@@ -719,6 +734,17 @@ mod tests {
 		assert_eq!(Appearance::from_rgb16(u16::MAX, u16::MAX, u16::MAX), Appearance::Light);
 		assert_eq!(Appearance::from_rgb16(0x7fff, 0x7fff, 0x7fff), Appearance::Dark);
 		assert_eq!(Appearance::from_rgb16(0x8000, 0x8000, 0x8000), Appearance::Light);
+	}
+
+	#[test]
+	fn unset_foreground_falls_back_only_on_painted_surfaces() {
+		let theme = Theme { fg: Color::Default, ..Theme::default() };
+		let painted = theme.foreground_on(theme.fg, Color::Rgb(0xee, 0xee, 0xee));
+		assert_ne!(painted, Color::Default);
+		assert_eq!(theme.foreground_on(theme.fg, Color::Default), Color::Default);
+
+		let explicit = Color::Rgb(1, 2, 3);
+		assert_eq!(theme.foreground_on(explicit, theme.panel), explicit);
 	}
 
 	#[test]

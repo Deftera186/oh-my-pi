@@ -250,7 +250,6 @@ pub(crate) fn gallery_fixtures(edit: ToolIdentity) -> Vec<RendererGalleryFixture
 	vec![
 		RendererGalleryFixture {
 			identity: edit,
-			title: "rename readFileSlice in packages/coding-agent/src/tools/read.ts",
 			streaming_args: r#"{"input":"[packages/coding-agent/src/tools/read.ts#7F18]\nPUT 82.=82:\n+function readTextSli"#,
 			args: r#"{"input":"[packages/coding-agent/src/tools/read.ts#7F18]\nPUT 82.=82:\n+function readTextSlice(raw: string, offset: number, limit: number): string {\nPUT 212.=212:\n+\tconst content = readTextSlice(raw, offset, limit);"}"#,
 			progress_update: Some(

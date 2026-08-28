@@ -9,6 +9,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
 	"web_search",
 	"lsp",
 	"ast_grep",
+	"dyn",
 	"task",
 	"yield",
 	"hub",
@@ -46,4 +47,28 @@ pub fn is_read_only_agent(definition: &AgentDefinition) -> bool {
 					if !allowed.is_empty()
 						&& allowed.iter().all(|name| name == &definition.name)
 			))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn definition(tools: &str) -> AgentDefinition {
+		AgentDefinition::parse_markdown(
+			"scout",
+			&format!("---\ndescription: Read only\ntools: [{tools}]\n---\nInspect."),
+		)
+		.expect("valid agent definition")
+	}
+
+	#[test]
+	fn dynamic_device_transport_preserves_read_only_classification() {
+		assert!(is_read_only_agent(&definition("read, grep, glob, dyn")));
+	}
+
+	#[test]
+	fn mutating_top_level_tools_remain_rejected() {
+		assert!(!is_read_only_agent(&definition("read, dyn, write")));
+		assert!(!is_read_only_agent(&definition("read, dyn, edit")));
+	}
 }

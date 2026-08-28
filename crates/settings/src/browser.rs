@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain};
+use crate::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 
@@ -50,14 +50,10 @@ impl SettingsDomain for BrowserSettings {
 	];
 }
 
-inventory::submit! {
-	DomainRegistration::of::<BrowserSettings>()
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{SettingsSnapshot, registered_domains};
+	use crate::{SETTINGS_CONTRIBUTION, SettingsCatalog, SettingsSnapshot};
 
 	#[test]
 	fn defaults_preserve_current_enabled_headless_surface() {
@@ -68,9 +64,11 @@ mod tests {
 
 	#[test]
 	fn snapshot_projects_browser_table() {
-		let snapshot =
-			SettingsSnapshot::isolated(BrowserSettings { enabled: false, headless: false })
-				.expect("browser settings snapshot");
+		let snapshot = SettingsSnapshot::isolated(
+			BrowserSettings { enabled: false, headless: false },
+			SettingsCatalog::new(&[&SETTINGS_CONTRIBUTION]),
+		)
+		.expect("browser settings snapshot");
 		let projected = snapshot
 			.project::<BrowserSettings>()
 			.expect("browser settings projection");
@@ -79,7 +77,8 @@ mod tests {
 
 	#[test]
 	fn schema_registers_browser_fields() {
-		let domain = registered_domains()
+		let domain = SettingsCatalog::new(&[&SETTINGS_CONTRIBUTION])
+			.descriptors()
 			.into_iter()
 			.find(|domain| domain.name == "browser")
 			.expect("browser domain");

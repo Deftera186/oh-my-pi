@@ -20,6 +20,7 @@ fn message(role: Role, text: &str) -> Item {
 		kind: Some(item::Kind::Message(Message {
 			role:  role as i32,
 			parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+			..Default::default()
 		})),
 		..Item::default()
 	}

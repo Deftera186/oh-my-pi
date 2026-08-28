@@ -9,7 +9,7 @@ use std::{
 use omp_core::NormalizePath as _;
 
 use crate::{
-	ExecutionParameters, Shell, ShellFd,
+	ExecutionParameters, OpenRequest, PathAccess, Shell, ShellFd,
 	env::{EnvironmentLookup, EnvironmentScope},
 	error,
 	extensions::ShellExtensions,
@@ -192,32 +192,41 @@ impl<SE: ShellExtensions> Shell<SE> {
 	/// * `path` - The path to the file to open; may be relative to the shell's
 	///   working directory.
 	/// * `params` - Execution parameters.
+	/// * `access` - The authority requested for this file operation.
 	pub(crate) fn open_file(
 		&self,
 		options: &OpenOptions,
 		path: impl AsRef<Path>,
 		params: &ExecutionParameters,
+		access: PathAccess,
 	) -> Result<OpenFile, io::Error> {
-		// Give platform-specific code a chance to handle special files
-		// (e.g. /dev/null on Windows, which needs to open NUL instead).
-		// This is checked before absolute_path so that paths like /dev/null
-		// are intercepted on platforms where they aren't valid native paths.
-		if let Some(result) = try_open_special_file(path.as_ref()) {
-			return result.map(OpenFile::from);
-		}
-
 		let path_to_open = self.absolute_path(path.as_ref());
 
-		// See if this is a reference to a file descriptor, in which case the actual
-		// /dev/fd* file path for this process may not match with what's in the
-		// execution parameters.
+		// `/dev/fd/N` is a shell descriptor reference, never authority to open
+		// the embedding process's descriptor table. Resolve it before either a
+		// policy or host filesystem access.
 		if let Some(parent) = path_to_open.parent()
 			&& parent == Path::new("/dev/fd")
 			&& let Some(filename) = path_to_open.file_name()
-			&& let Ok(fd_num) = filename.to_string_lossy().to_string().parse::<ShellFd>()
-			&& let Some(open_file) = params.try_fd(self, fd_num)
+			&& let Ok(fd_num) = filename.to_string_lossy().parse::<ShellFd>()
 		{
-			return open_file.try_clone();
+			return params.try_fd(self, fd_num).map_or_else(
+				|| Err(io::Error::new(io::ErrorKind::PermissionDenied, "shell descriptor not mapped")),
+				|open_file| open_file.try_clone(),
+			);
+		}
+
+		if let Some(policy) = params.path_policy() {
+			return policy
+				.open(&path_to_open, OpenRequest { access, create_mode: 0o666 & !self.virtual_umask() })
+				.map(OpenFile::from)
+				.map_err(io::Error::other);
+		}
+
+		// Give platform-specific code a chance to handle special files
+		// (e.g. /dev/null on Windows, which needs to open NUL instead).
+		if let Some(result) = try_open_special_file(path.as_ref()) {
+			return result.map(OpenFile::from);
 		}
 
 		Ok(options.open(path_to_open)?.into())

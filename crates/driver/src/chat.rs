@@ -118,7 +118,7 @@ use crate::{
 		output::persist_bounded,
 		prewalk::PrewalkGate,
 		prompt::{
-			ModelFamilyCapabilities, PromptPeer, SubagentPromptInput, compose, peer_from_node, props,
+			ModelFamilyCapabilities, PromptPeer, SubagentPromptInput, compose, peer_from_record, props,
 		},
 		settings::{LiveTaskSettings, TaskIsolationMerge, TaskIsolationMode, TaskSettings},
 		snapshot::{ChildSnapshotOptions, child_snapshot},
@@ -127,6 +127,7 @@ use crate::{
 		},
 		yield_driver,
 	},
+	workspace_roots::{DirectoryEnterabilityError, ensure_directory_enterable},
 };
 
 /// Reasoning effort selected for one composed chat session.
@@ -335,6 +336,9 @@ pub enum ChatError {
 	/// The canonical project path is not a directory.
 	#[error("project root is not a directory: {0}")]
 	ProjectNotDirectory(PathBuf),
+	/// The requested project root exists but cannot safely be entered.
+	#[error(transparent)]
+	ProjectEnterability(#[from] DirectoryEnterabilityError),
 	/// Project-local state could not be accessed.
 	#[error("could not access project state {path}")]
 	ProjectState {
@@ -498,6 +502,8 @@ pub enum SessionOpen<'a> {
 	New,
 	/// Resume an existing session.
 	Resume(&'a Str),
+	/// Resume while retaining the launch project as runtime-only cwd.
+	ResumeRuntimeOnly(&'a Str),
 	/// Resume a session whose canonical project moved.
 	ResumeMoved(&'a Str),
 	/// Fork an existing session.
@@ -539,22 +545,40 @@ impl Drop for EphemeralSessions {
 	}
 }
 
+/// Runtime project store adopted by descendants after a fallback resume.
+#[derive(Clone)]
+pub struct SessionReanchor {
+	/// Session directory under the retained runtime project.
+	pub sessions_dir:  PathBuf,
+	/// Runtime project's authoritative session index.
+	pub session_index: Arc<SessionIndex>,
+}
+
 /// Durable chat resources borrowed by one interactive host.
 pub struct ChatScope<'a> {
 	/// Embedded model catalog.
-	pub catalog:          &'a snapshot::Catalog,
+	pub catalog:           &'a snapshot::Catalog,
 	/// Canonical project root.
-	pub root:             &'a Path,
+	pub root:              &'a Path,
 	/// Session journal directory.
-	pub sessions_dir:     &'a Path,
+	pub sessions_dir:      &'a Path,
 	/// Authoritative session index.
-	pub session_index:    Arc<SessionIndex>,
+	pub session_index:     Arc<SessionIndex>,
 	/// Fully composed tool registry.
-	pub registry:         Arc<Registry>,
+	pub registry:          Arc<Registry>,
+	/// Daemon-wide live catalog refresh authority, absent for gateway-backed
+	/// sessions whose remote owner controls discovery.
+	pub discovery_runtime: Option<Arc<crate::discovery::runtime::DiscoveryRuntime>>,
+	/// Composed inference registry backing registry-routed model discovery,
+	/// absent for gateway-backed sessions.
+	pub inference_registry: Option<InferenceRegistry>,
+	/// Runtime project store used by new sessions and branches after a
+	/// runtime-only fallback resume.
+	pub fallback_reanchor: Option<SessionReanchor>,
 	/// Clone-shared session queue backing the environment's `advise@1` device.
-	pub advise_queue:     omp_agent::advisor::AdvisorAdviceQueue,
+	pub advise_queue:      omp_agent::advisor::AdvisorAdviceQueue,
 	/// Whether owner-local session state is persisted.
-	pub persist_sessions: bool,
+	pub persist_sessions:  bool,
 }
 /// Background provider-authentication worker used by interactive chat.
 pub struct ChatAuthWorker {
@@ -1071,6 +1095,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 					omp_envd::ProjectEnvironment::isolated(
 						&workspace_root,
 						&state,
+						crate::SETTINGS_CATALOG,
 						omp_envd::RegistryBridges::default(),
 					)
 					.await
@@ -1369,6 +1394,15 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		});
 	}
 
+	/// Terminates a session whose runtime project can no longer be aligned with
+	/// its durable journal.
+	///
+	/// This is fail-closed: the presentation exits before another submission or
+	/// automatic continuation can append work under the wrong repository.
+	pub fn terminate_project_mismatch(&self, reason: Str) {
+		self.request_shutdown(reason);
+	}
+
 	/// Waits for an extension-authorized graceful session shutdown request.
 	pub async fn wait_for_shutdown(&self) -> Str {
 		let mut shutdown = self.shutdown.subscribe();
@@ -1539,6 +1573,16 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		source: &'static str,
 		pasted: bool,
 	) -> Result<(), omp_tool::PolicyDenied> {
+		let submitted_at_ms = now_ms();
+		for item in items.iter_mut() {
+			let user = matches!(
+				item.kind.as_ref(),
+				Some(item::Kind::Message(message)) if message.role() == Role::User
+			);
+			if user && item.created_at_ms == 0 {
+				item.created_at_ms = submitted_at_ms;
+			}
+		}
 		let event_id = omp_proto::toolhost::v1::HookEventId::HookEventUserInput;
 		if !self.admission_gate.lock().subscribed(event_id) {
 			return Ok(());
@@ -1866,6 +1910,14 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		let mut context = self.context.lock();
 		context.state = state;
 		context.session_id = session_id;
+	}
+
+	/// Rebinds future session and child persistence after a runtime-only
+	/// fallback reanchors to the retained project.
+	pub fn reanchor_session_store(&self, sessions_dir: PathBuf, session_index: Arc<SessionIndex>) {
+		let mut context = self.context.lock();
+		context.sessions_dir = sessions_dir;
+		context.session_index = session_index;
 	}
 
 	/// Shares the append-only subagent roster with the interactive UI bridge.
@@ -2221,7 +2273,29 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 						TurnId::new(format!("agent-revival-{}", omp_core::Ulid::generate())),
 					)
 					.await;
-				let _ = broker.set_idle(child_id.as_str(), true);
+				let mut result = result;
+				loop {
+					match broker.finish_turn(child_id.as_str()) {
+						Ok(omp_agent::TurnEndDisposition::Terminal) => break,
+						Ok(omp_agent::TurnEndDisposition::ContinuationPending) => {
+							if result.is_err() {
+								let _ = broker.finish_failed_turn(child_id.as_str());
+								break;
+							}
+							result = supervisor
+								.run(
+									child_id.as_str(),
+									Vec::new(),
+									TurnId::new(format!("agent-irc-wake-{}", omp_core::Ulid::generate())),
+								)
+								.await;
+						},
+						Err(error) => {
+							tracing::warn!(agent = %child_id, %error, "revived child turn settlement failed");
+							break;
+						},
+					}
+				}
 				if let Some(terminal) = supervisor
 					.state(child_id.as_str())
 					.and_then(|state| state.terminal())
@@ -2505,8 +2579,34 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		loop {
 			tokio::select! {
 				result = &mut run => {
+					let mut result = result;
+					loop {
+						match self.broker.finish_turn(id) {
+							Ok(omp_agent::TurnEndDisposition::Terminal) => break,
+							Ok(omp_agent::TurnEndDisposition::ContinuationPending) => {
+								if result.is_err() {
+									let _ = self.broker.finish_failed_turn(id);
+									break;
+								}
+								result = self
+									.supervisor
+									.run(
+										id,
+										Vec::new(),
+										TurnId::new(format!(
+											"agent-irc-wake-{}",
+											omp_core::Ulid::generate()
+										)),
+									)
+									.await;
+							},
+							Err(error) => {
+								tracing::warn!(agent = %id, %error, "child turn settlement failed");
+								break;
+							},
+						}
+					}
 					cancellation.armed = false;
-										let _ = self.broker.set_idle(id, true);
 					if let Some(terminal) = self
 						.supervisor
 						.state(id)
@@ -2649,8 +2749,9 @@ fn bridge_owned_message(role: Role, text: String) -> Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(Message {
-			role:  i32::from(role),
+			role: i32::from(role),
 			parts: vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text)) }],
+			..Message::default()
 		})),
 		props:         None,
 	}
@@ -5703,8 +5804,9 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			seq:           0,
 			created_at_ms: now_ms(),
 			kind:          Some(item::Kind::Message(Message {
-				role:  i32::from(Role::User),
+				role: i32::from(Role::User),
 				parts: user_parts,
+				..Message::default()
 			})),
 			props:         None,
 		});
@@ -6023,6 +6125,7 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			let environment = omp_envd::ProjectEnvironment::isolated(
 				&root,
 				&child_state,
+				crate::SETTINGS_CATALOG,
 				omp_envd::RegistryBridges::default(),
 			)
 			.await
@@ -6140,11 +6243,43 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 		for error in child_ttsr_diagnostics {
 			tracing::warn!(%error, agent = %id, "subagent TTSR rule condition was rejected");
 		}
-		let peer_values = context
-			.tree
-			.roster()
-			.map(|node| peer_from_node(node))
-			.collect::<Vec<_>>();
+		let root_file = context
+			.sessions_dir
+			.join(format!("{}.jsonl", context.session_id));
+		let persisted_agents = context.sessions_dir.join("eval-agents");
+		if persisted_agents.is_dir() {
+			self
+				.broker
+				.registry()
+				.restore_transcripts_once(&root_file, &persisted_agents);
+		}
+		let mut roster = self
+			.broker
+			.registry()
+			.roster_for_root(context.session_id.as_str(), false);
+		roster.retain(|record| record.id != id);
+		let parked_count = roster
+			.iter()
+			.filter(|record| record.status == RegistryStatus::Parked)
+			.count();
+		roster
+			.retain(|record| matches!(record.status, RegistryStatus::Running | RegistryStatus::Idle));
+		roster.sort_by(|left, right| {
+			let order = |status| match status {
+				RegistryStatus::Running => 0_u8,
+				RegistryStatus::Idle => 1,
+				RegistryStatus::Parked => 2,
+			};
+			order(left.status)
+				.cmp(&order(right.status))
+				.then_with(|| right.last_activity_ms.cmp(&left.last_activity_ms))
+				.then_with(|| left.id.cmp(&right.id))
+		});
+		let omitted_count = roster
+			.len()
+			.saturating_sub(omp_tools::hub::DEFAULT_LIST_LIMIT);
+		roster.truncate(omp_tools::hub::DEFAULT_LIST_LIMIT);
+		let peer_values = roster.iter().map(peer_from_record).collect::<Vec<_>>();
 		let peers = peer_values
 			.iter()
 			.map(|(name, role, status, activity)| PromptPeer {
@@ -6160,24 +6295,26 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			model.contains("codex") || model.contains("gpt-5")
 		};
 		let prompt_input = SubagentPromptInput {
-			definition:        &definition,
-			shared_context:    None,
-			plan_path:         None,
-			plan_content:      None,
-			workspace_root:    &child_root,
-			output_schema:     request.output_schema.as_ref(),
-			self_name:         node.name.as_str(),
-			self_role:         definition.name.as_str(),
-			irc_enabled:       child_can_spawn,
-			roster_generation: context.tree.roster_generation(),
-			peers:             &peers,
-			capabilities:      ModelFamilyCapabilities {
+			definition: &definition,
+			shared_context: None,
+			plan_path: None,
+			plan_content: None,
+			workspace_root: &child_root,
+			output_schema: request.output_schema.as_ref(),
+			self_name: node.name.as_str(),
+			self_role: definition.name.as_str(),
+			irc_enabled: child_can_spawn,
+			roster_generation: self.broker.registry().generation(),
+			peers: &peers,
+			parked_count,
+			omitted_count,
+			capabilities: ModelFamilyCapabilities {
 				codex_style,
 				parallel_tool_calls: true,
 				structured_yield: request.output_schema.is_some(),
 			},
-			plan_mode:         false,
-			eager:             task_settings.eager,
+			plan_mode: false,
+			eager: task_settings.eager,
 		};
 		child_snapshot.props = props(&prompt_input, &parent_snapshot.props);
 		let system_prompt = compose(prompt_input, &parent_snapshot.props);
@@ -7344,6 +7481,7 @@ pub fn resolve_model_provider(
 
 /// Canonicalizes and validates a project directory.
 pub fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
+	ensure_directory_enterable(path)?;
 	let root = fs::canonicalize(path)
 		.map_err(|source| ChatError::Project { path: path.to_owned(), source })?;
 	if !root.is_dir() {
@@ -7373,6 +7511,7 @@ pub fn open_session(
 	let operation = match open {
 		SessionOpen::New => "new",
 		SessionOpen::Resume(_) => "resume",
+		SessionOpen::ResumeRuntimeOnly(_) => "resume_runtime_only",
 		SessionOpen::ResumeMoved(_) => "resume_moved",
 		SessionOpen::Fork(_) => "fork",
 		SessionOpen::Ephemeral => "ephemeral",
@@ -7380,19 +7519,23 @@ pub fn open_session(
 	let span = tracing::Span::current();
 	span.record("operation", operation);
 	let source = match open {
-		SessionOpen::Resume(id) | SessionOpen::ResumeMoved(id) | SessionOpen::Fork(id) => {
-			Some(strict_session_id(id)?)
-		},
+		SessionOpen::Resume(id)
+		| SessionOpen::ResumeRuntimeOnly(id)
+		| SessionOpen::ResumeMoved(id)
+		| SessionOpen::Fork(id) => Some(strict_session_id(id)?),
 		SessionOpen::New | SessionOpen::Ephemeral => None,
 	};
-	let id = if matches!(open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_)) {
+	let id = if matches!(
+		open,
+		SessionOpen::Resume(_) | SessionOpen::ResumeRuntimeOnly(_) | SessionOpen::ResumeMoved(_)
+	) {
 		source.clone().expect("resume has a validated source")
 	} else {
 		Str::from(omp_core::Ulid::generate().to_string())
 	};
 	let path = sessions_dir.join(format!("{}.jsonl", id.as_str()));
 	let journal = match open {
-		SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_) => {
+		SessionOpen::Resume(_) | SessionOpen::ResumeRuntimeOnly(_) | SessionOpen::ResumeMoved(_) => {
 			validate_session_file(&path).map_err(|source_error| {
 				if source_error.kind() == io::ErrorKind::NotFound {
 					ChatError::MissingResume(id.clone())
@@ -7408,12 +7551,14 @@ pub fn open_session(
 			let recorded_root = view.header().cwd.clone();
 			drop(view);
 			let current_root = journal.workspace_roots(&recorded_root)?;
-			if current_root.primary() != root && !matches!(open, SessionOpen::ResumeMoved(_)) {
+			if current_root.primary() != root
+				&& !matches!(open, SessionOpen::ResumeRuntimeOnly(_) | SessionOpen::ResumeMoved(_))
+			{
 				return Err(ChatError::SessionProjectMismatch { session: id });
 			}
 			let index = session_index.ok_or(ChatError::MissingSessionIndex)?;
 			journal.attach_session_index(index, SessionId(id.clone()));
-			if current_root.primary() != root {
+			if current_root.primary() != root && matches!(open, SessionOpen::ResumeMoved(_)) {
 				journal.move_workspace_root(now_ms(), root.to_owned())?;
 			}
 			journal
@@ -8568,8 +8713,9 @@ mod tests {
 				seq:           0,
 				created_at_ms: 0,
 				kind:          Some(item::Kind::Message(Message {
-					role:  Role::User as i32,
+					role: Role::User as i32,
 					parts: vec![Part { kind: Some(part::Kind::Text("Continue".to_owned())) }],
+					..Message::default()
 				})),
 				props:         None,
 			}),
@@ -8638,7 +8784,7 @@ mod tests {
 		target_journal.reset(1).expect("materialize target");
 		drop(target_journal);
 		assert!(sessions.join("target-session.jsonl").is_file());
-		let (control, _mailbox) = omp_agent::control_channel();
+		let (control, _mailbox) = omp_agent::control_channel(omp_agent::EventBus::new());
 		let registry = InteractiveSessionControl::new(
 			root,
 			sessions.clone(),
@@ -8763,7 +8909,7 @@ mod tests {
 			cwd:     scratch.path().to_path_buf(),
 		})
 		.expect("journal");
-		let (control, mailbox) = omp_agent::control_channel();
+		let (control, mailbox) = omp_agent::control_channel(omp_agent::EventBus::new());
 		let owner = tokio::spawn(async move {
 			let mut journal = journal;
 			mailbox.handle_next(&mut journal).await
@@ -9243,6 +9389,29 @@ mod tests {
 		assert!(host.client.inputs.lock().is_empty(), "denied input reached the agent client");
 	}
 	#[tokio::test]
+	async fn user_input_is_stamped_before_async_admission() {
+		let (_scratch, host) = admission_host();
+		let mut items = vec![Item {
+			kind: Some(item::Kind::Message(Message {
+				role: Role::User as i32,
+				parts: vec![Part { kind: Some(part::Kind::Text("submitted".to_owned())) }],
+				..Message::default()
+			})),
+			..Item::default()
+		}];
+
+		host
+			.admit_user_input(&mut items, "interactive", false)
+			.await
+			.expect("unsubscribed admission");
+
+		assert!(
+			items[0].created_at_ms > 0,
+			"submission timestamp must be captured at admission entry"
+		);
+	}
+
+	#[tokio::test]
 	async fn user_bash_composes_one_admission_with_effective_shell_fields() {
 		let (scratch, host) = admission_host();
 		let (gate, dispatches) = HookGate::channel();
@@ -9428,8 +9597,9 @@ mod tests {
 						seq:           0,
 						created_at_ms: 2,
 						kind:          Some(item::Kind::Message(Message {
-							role:  i32::from(Role::User),
+							role: i32::from(Role::User),
 							parts: vec![Part { kind: Some(part::Kind::Text(prompt.to_owned())) }],
+							..Message::default()
 						})),
 						props:         None,
 					},
@@ -9536,6 +9706,62 @@ mod tests {
 				.permissions()
 				.mode() & 0o777,
 			0o644
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn resume_preflight_rejects_unenterable_destination() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let scratch = tempfile::tempdir().expect("scratch directory");
+		let denied = scratch.path().join("denied");
+		fs::create_dir(&denied).expect("denied project");
+		fs::set_permissions(&denied, fs::Permissions::from_mode(0o000))
+			.expect("remove search permission");
+
+		let error = canonical_project(&denied).expect_err("denied project must fail preflight");
+		assert!(matches!(
+			error,
+			ChatError::ProjectEnterability(DirectoryEnterabilityError::Search { .. })
+		));
+
+		fs::set_permissions(&denied, fs::Permissions::from_mode(0o700))
+			.expect("restore search permission");
+	}
+
+	#[test]
+	fn runtime_only_resume_does_not_rewrite_foreign_journal() {
+		let scratch = tempfile::tempdir().expect("scratch directory");
+		let recorded_root = scratch.path().join("recorded");
+		let runtime_root = scratch.path().join("runtime");
+		let sessions_dir = scratch.path().join("foreign-sessions");
+		for path in [&recorded_root, &runtime_root, &sessions_dir] {
+			fs::create_dir(path).expect("fixture directory");
+		}
+		let id = write_session(&sessions_dir, &recorded_root, "resume me", None);
+		let path = sessions_dir.join(format!("{id}.jsonl"));
+		let before = fs::read(&path).expect("foreign journal snapshot");
+
+		let session = open_session(
+			&runtime_root,
+			&sessions_dir,
+			SessionOpen::ResumeRuntimeOnly(&id),
+			&Registry::new(),
+			Some(Arc::new(
+				SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("session index"),
+			)),
+		)
+		.expect("runtime-only resume");
+
+		assert_eq!(fs::read(&path).expect("foreign journal after resume"), before);
+		assert_eq!(
+			session
+				.journal
+				.workspace_roots(&recorded_root)
+				.expect("workspace roots")
+				.primary(),
+			recorded_root
 		);
 	}
 

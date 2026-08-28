@@ -622,7 +622,13 @@ fn encode_key(key: Key, application_cursor: bool) -> Option<Bytes> {
 		Key::Tab => b"\t",
 		Key::Space => b" ",
 		Key::Backspace => b"\x7f",
-		Key::RestoreQueue | Key::CyclePrevious | Key::PlanToggle => b"",
+		Key::RestoreQueue
+		| Key::CyclePrevious
+		| Key::PlanToggle
+		| Key::DebugMenu
+		| Key::ToggleToolVisibility
+		| Key::CopyPrompt
+		| Key::CopyLine => b"",
 		Key::JumpPrevious | Key::JumpNext => return None,
 		Key::Function(1) => b"\x1bOP",
 		Key::Function(2) => b"\x1bOQ",

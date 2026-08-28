@@ -56,6 +56,7 @@ use omp_proto::toolhost::v1::HookEventId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use self::native::{ConfiguredRootLevel, EffectiveExtensionRoots, NativeRootMode};
 use self::{
 	foreign::ForeignContentSettings,
 	manifest::{

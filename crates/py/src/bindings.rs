@@ -2225,8 +2225,10 @@ impl PyEnvironmentBackend {
 	}
 }
 
-#[pymethods]
-impl PyEnvironmentBackend {
+macro_rules! backend_methods {
+	($($table:tt)*) => {
+		emit_backend_methods! {
+			custom {
 	fn process_endpoint(&self, name: &str, generation: u64) -> Option<String> {
 		self
 			.endpoints
@@ -4005,6 +4007,10 @@ impl PyEnvironmentBackend {
 		};
 		Ok(Py::new(py, PyEnvironmentStream { stream: Mutex::new(Some(stream)) })?.into_any())
 	}
+			}
+			$($table)*
+		}
+	};
 }
 include!("env_backend.rs");
 

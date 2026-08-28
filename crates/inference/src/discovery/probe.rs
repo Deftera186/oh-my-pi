@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, future::Future, mem, pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use omp_catalog::{
-	DiscoveredModel, ModelLimits, OperationBits, OperationKind, ProviderId, RouteId, WireModelId,
+	DiscoveredModel, ModelLimits, OperationBits, OperationKind, Price, PriceUnit, ProviderId,
+	RouteId, WireModelId,
 };
 use omp_core::{Str, sf};
 use tokio_util::sync::CancellationToken;
@@ -130,6 +131,7 @@ impl DiscoveryProbe {
 			let Ok(entries) = decode_json_rows(&payload) else {
 				continue;
 			};
+			let had_prior_models = !merged.is_empty();
 			for value in &entries {
 				let Some(id) = litellm_public_id(value) else {
 					continue;
@@ -141,15 +143,15 @@ impl DiscoveryProbe {
 					merge_discovered_model(existing, next);
 					*held = held.merge(evidence);
 					existing.route = route_for_evidence(self, *held);
-				} else {
+				} else if !had_prior_models {
 					merged.insert(key, (next, evidence));
 				}
 			}
 			if !merged.is_empty()
-				&& merged
-					.values()
-					.all(|(_, evidence)| *evidence != LiteLlmRouteEvidence::Unknown)
-			{
+				&& merged.values().all(|(model, evidence)| {
+					*evidence != LiteLlmRouteEvidence::Unknown
+						&& !litellm_pricing_is_partial(&model.declared_pricing)
+				}) {
 				break;
 			}
 		}
@@ -259,6 +261,11 @@ impl DiscoveryProbe {
 		});
 		let mut operations = OperationBits::empty();
 		operations.insert_kind(OperationKind::Chat);
+		let declared_pricing = if self.endpoint.kind == DiscoveryEndpointKind::LiteLlm {
+			litellm_reported_prices(value)
+		} else {
+			Box::new([])
+		};
 		DiscoveredModel {
 			provider: self.provider.clone(),
 			route,
@@ -273,6 +280,7 @@ impl DiscoveryProbe {
 			declared_operations: operations,
 			declared_capabilities: None,
 			declared_limits: limits,
+			declared_pricing,
 			extended_context_mode: None,
 			availability: None,
 			source: sf!("{}:{}{source_path}", self.endpoint.kind, self.endpoint.base_url),
@@ -302,13 +310,21 @@ impl LiteLlmRouteEvidence {
 fn decode_json_rows(payload: &[u8]) -> Result<Vec<serde_json::Value>, ProbeError> {
 	let mut envelope: serde_json::Value =
 		serde_json::from_slice(payload).map_err(|_| ProbeError::Protocol)?;
-	if let Some(serde_json::Value::Array(rows)) = envelope.get_mut("data") {
-		return Ok(mem::take(rows));
+	take_json_rows(&mut envelope).ok_or(ProbeError::Protocol)
+}
+
+fn take_json_rows(envelope: &mut serde_json::Value) -> Option<Vec<serde_json::Value>> {
+	if let serde_json::Value::Array(rows) = envelope {
+		return Some(mem::take(rows));
 	}
-	if let Some(serde_json::Value::Array(rows)) = envelope.get_mut("models") {
-		return Ok(mem::take(rows));
+	for key in ["data", "models", "result", "items"] {
+		if let Some(candidate) = envelope.get_mut(key)
+			&& let Some(rows) = take_json_rows(candidate)
+		{
+			return Some(rows);
+		}
 	}
-	Err(ProbeError::Protocol)
+	None
 }
 
 fn litellm_public_id(value: &serde_json::Value) -> Option<&str> {
@@ -317,6 +333,7 @@ fn litellm_public_id(value: &serde_json::Value) -> Option<&str> {
 		.or_else(|| value.get("model_name"))
 		.or_else(|| value.get("id"))
 		.or_else(|| value.get("name"))
+		.or_else(|| value.get("litellm_params")?.get("model"))
 		.and_then(serde_json::Value::as_str)
 		.map(str::trim)
 		.filter(|id| !id.is_empty())
@@ -419,7 +436,60 @@ fn merge_discovered_model(existing: &mut DiscoveredModel, incoming: DiscoveredMo
 		(None, limits @ Some(_)) => existing.declared_limits = limits,
 		_ => {},
 	}
+	let mut pricing = existing.declared_pricing.to_vec();
+	for incoming in incoming.declared_pricing {
+		if let Some(existing) = pricing.iter_mut().find(|price| price.unit == incoming.unit) {
+			*existing = incoming;
+		} else {
+			pricing.push(incoming);
+		}
+	}
+	pricing.sort_unstable_by_key(|price| price.unit);
+	existing.declared_pricing = pricing.into_boxed_slice();
 	existing.source = incoming.source;
+}
+
+fn litellm_reported_prices(value: &serde_json::Value) -> Box<[Price]> {
+	[
+		("input_cost_per_token", PriceUnit::MtokInput),
+		("output_cost_per_token", PriceUnit::MtokOutput),
+		("cache_read_input_token_cost", PriceUnit::MtokCacheRead),
+		("cache_creation_input_token_cost", PriceUnit::MtokCacheWrite),
+	]
+	.into_iter()
+	.filter_map(|(key, unit)| {
+		let value = value
+			.get(key)
+			.filter(|value| !value.is_null())
+			.or_else(|| {
+				value
+					.get("model_info")?
+					.get(key)
+					.filter(|value| !value.is_null())
+			})?;
+		let per_token = value
+			.as_f64()
+			.or_else(|| value.as_str()?.trim().parse::<f64>().ok())?;
+		if !per_token.is_finite() || per_token <= 0.0 {
+			return None;
+		}
+		let nanos_usd = (per_token * 1_000_000_000_000_000.0).round();
+		(nanos_usd <= u64::MAX as f64).then_some(Price { unit, nanos_usd: nanos_usd as u64 })
+	})
+	.collect::<Vec<_>>()
+	.into_boxed_slice()
+}
+
+fn litellm_pricing_is_partial(pricing: &[Price]) -> bool {
+	!pricing.is_empty()
+		&& [
+			PriceUnit::MtokInput,
+			PriceUnit::MtokOutput,
+			PriceUnit::MtokCacheRead,
+			PriceUnit::MtokCacheWrite,
+		]
+		.into_iter()
+		.any(|unit| pricing.iter().all(|price| price.unit != unit))
 }
 
 fn nested_positive_u64(value: &serde_json::Value, object: &str, keys: &[&str]) -> Option<u64> {
@@ -593,6 +663,58 @@ mod tests {
 				.any(|url| url.as_str().ends_with("/v2/model/info")),
 			"unknown first-endpoint evidence must keep probing"
 		);
+	}
+
+	#[tokio::test]
+	async fn litellm_preserves_partial_and_late_cache_pricing() {
+		let endpoint = configured_endpoint(DiscoveryEndpointKind::LiteLlm, "http://primary:4000/v1")
+			.expect("endpoint");
+		let probe = DiscoveryProbe {
+			provider: ProviderId::from("litellm"),
+			route: RouteId::from("litellm/primary"),
+			endpoint,
+		};
+		let client = ScriptedClient {
+			responses: Arc::new(BTreeMap::from([
+				(
+					Str::new_static("http://primary:4000/model_group/info"),
+					Bytes::from_static(
+						br#"{"data":[{"model_group":"priced","providers":["openai"],"input_cost_per_token":0.0000055,"cache_read_input_token_cost":0.00000055},{"model_group":"partial","providers":["openai"],"cache_read_input_token_cost":0.00000025}]}"#,
+					),
+				),
+				(
+					Str::new_static("http://primary:4000/v2/model/info"),
+					Bytes::from_static(
+						br#"{"data":[{"model_name":"priced","model_info":{"output_cost_per_token":0.000033,"cache_creation_input_token_cost":0.000006875}}]}"#,
+					),
+				),
+			])),
+			requests: Arc::new(Mutex::new(Vec::new())),
+		};
+		let rows = probe
+			.probe(&client, CancellationToken::new())
+			.await
+			.expect("LiteLLM probe");
+		let pricing = |id: &str| {
+			rows
+				.iter()
+				.find(|row| row.wire_model.as_str() == id)
+				.unwrap_or_else(|| panic!("{id} row"))
+				.declared_pricing
+				.iter()
+				.map(|price| (price.unit, price.nanos_usd))
+				.collect::<BTreeMap<_, _>>()
+		};
+		assert_eq!(
+			pricing("priced"),
+			BTreeMap::from([
+				(PriceUnit::MtokInput, 5_500_000_000),
+				(PriceUnit::MtokOutput, 33_000_000_000),
+				(PriceUnit::MtokCacheRead, 550_000_000),
+				(PriceUnit::MtokCacheWrite, 6_875_000_000),
+			])
+		);
+		assert_eq!(pricing("partial"), BTreeMap::from([(PriceUnit::MtokCacheRead, 250_000_000)]));
 	}
 
 	#[tokio::test]

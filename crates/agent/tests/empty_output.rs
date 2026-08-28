@@ -151,10 +151,11 @@ fn user_text(text: &str) -> Item {
 		seq:           0,
 		created_at_ms: 1,
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
+			role: thread::Role::User as i32,
 			parts: vec![thread::Part {
 				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())),
 			}],
+			..Default::default()
 		})),
 		props:         None,
 	}

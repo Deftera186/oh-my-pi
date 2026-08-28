@@ -1,5 +1,7 @@
 //! Indeterminate activity indicator backing the `<spinner>` markup tag.
 
+use std::time::Duration;
+
 use omp_core::{IntoStr, Str};
 
 use crate::{
@@ -9,6 +11,9 @@ use crate::{
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
 };
+
+const RENDER_BACKPRESSURE_MULTIPLIER: u32 = 9;
+const MAX_BACKPRESSURE_FRAME_COST: Duration = Duration::from_millis(200);
 
 /// An animated one-cell spinner with an optional trailing label.
 ///
@@ -23,6 +28,15 @@ pub struct Spinner {
 }
 
 impl Spinner {
+	/// Returns the post-frame idle time used to keep pending-work animations at
+	/// or below ten percent render duty, bounded after pathological frame
+	/// stalls.
+	pub(crate) fn animation_backpressure(frame_cost: Duration) -> Duration {
+		frame_cost
+			.min(MAX_BACKPRESSURE_FRAME_COST)
+			.saturating_mul(RENDER_BACKPRESSURE_MULTIPLIER)
+	}
+
 	/// Creates a bare spinner.
 	pub fn new() -> Self {
 		Self { props: Props::new(), slot: next_slot(), label: Str::default() }
@@ -113,6 +127,18 @@ mod tests {
 		assert!(ui.tick(Duration::from_millis(80)));
 		assert_eq!(frame_row_text(ui.frame(), 0), "⠙ busy");
 		assert_eq!(ui.next_wake(), Some(Duration::from_millis(160)));
+	}
+
+	#[test]
+	fn animation_backpressure_uses_full_frame_cost_and_caps_pathological_stalls() {
+		assert_eq!(
+			Spinner::animation_backpressure(Duration::from_millis(40)),
+			Duration::from_millis(360)
+		);
+		assert_eq!(
+			Spinner::animation_backpressure(Duration::from_secs(5)),
+			Duration::from_millis(1_800)
+		);
 	}
 
 	#[test]

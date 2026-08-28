@@ -4487,7 +4487,11 @@ fn decode_context_items(
 					.get("created_at_ms")
 					.and_then(serde_json::Value::as_u64)
 					.unwrap_or(0),
-				kind:          Some(item::Kind::Message(Message { role: role.into(), parts })),
+				kind:          Some(item::Kind::Message(Message {
+					role: role.into(),
+					parts,
+					..Default::default()
+				})),
 				props:         None,
 			})
 		})

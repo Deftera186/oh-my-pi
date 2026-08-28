@@ -33,8 +33,8 @@ use std::{
 };
 
 use omp_tui::{
-	CellContent, Charset, DecorKind, Frame, Graphics, Key, Mouse, MouseButton, MouseReport, Size,
-	Style, UiContext,
+	CellContent, Charset, DecorKind, Frame, Graphics, Key, Keymap, Mouse, MouseButton, MouseReport,
+	Size, Style, UiContext,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
@@ -97,6 +97,8 @@ pub struct HostConfig {
 	/// Permit tabs, splits, and additional windows that each require a fresh
 	/// scene.
 	pub multiplex:    bool,
+	/// Chord bindings shared with terminal input and generated hotkey help.
+	pub keymap:       Keymap,
 }
 
 impl Default for HostConfig {
@@ -112,6 +114,7 @@ impl Default for HostConfig {
 			native_decor: true,
 			size:         (1120.0, 720.0),
 			multiplex:    true,
+			keymap:       Keymap::default(),
 		}
 	}
 }
@@ -442,6 +445,7 @@ struct WindowHost<S> {
 	strip_origin:      [f32; 2],
 	pointer:           [f32; 2],
 	mods:              ModifiersState,
+	keymap:            Keymap,
 	grab:              Grab,
 	/// Last cursor icon set, to skip redundant sets.
 	cursor:            CursorIcon,
@@ -1189,6 +1193,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 			strip_origin: [0.0, 0.0],
 			pointer: [0.0, 0.0],
 			mods: ModifiersState::default(),
+			keymap: self.config.keymap.clone(),
 			grab: Grab::None,
 			cursor: CursorIcon::Default,
 			last_select_press: None,
@@ -1718,7 +1723,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 					return;
 				}
 				let win = &mut self.windows[widx];
-				let Some(key) = input::map_key(&event, win.mods) else {
+				let Some(key) = input::map_key(&event, win.mods, &win.keymap) else {
 					return;
 				};
 				let focused = win.focused();

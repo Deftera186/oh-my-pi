@@ -132,7 +132,6 @@ fn render_goal_payload(payload: &GoalPayload) -> El {
 pub(crate) fn gallery_fixtures(goal: ToolIdentity) -> Vec<RendererGalleryFixture> {
 	vec![RendererGalleryFixture {
 		identity: goal,
-		title: "create auth-hardening goal with a 500K token budget",
 		streaming_args: r#"{"op":"create","objective":"Ship the auth hardening pass: per-account rate"#,
 		args: r#"{"op":"create","objective":"Ship the auth hardening pass: per-account rate limits and sliding session expiry.","token_budget":500000}"#,
 		progress_update: None,

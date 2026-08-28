@@ -14,7 +14,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_catalog::{DiscoveryNormalizer, OverlaySource, OverlayStore, UnsafeTrustScope, snapshot};
+use omp_catalog::{DiscoveryNormalizer, OverlaySource, OverlayStore, snapshot};
 use omp_core::{Hash32, SecretString, Str, sf};
 use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
@@ -78,6 +78,7 @@ use omp_settings::{
 	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
 };
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
 	auth_backend,
@@ -98,6 +99,7 @@ const ANTIGRAVITY_CL_ENV: &str = "OMP_ANTIGRAVITY_CL";
 const ANTIGRAVITY_OS_ENV: &str = "OMP_ANTIGRAVITY_OS";
 const ANTIGRAVITY_ARCH_ENV: &str = "OMP_ANTIGRAVITY_ARCH";
 const ANTIGRAVITY_VERSION_CACHE_FILE: &str = "antigravity-version";
+const SHARED_CATALOG_CACHE_FILE: &str = "catalog-discovery.json";
 const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_BASE_URL_ENV: &str = "OMP_AZURE_OPENAI_BASE_URL";
 const AZURE_RESOURCE_NAME_ENV: &str = "OMP_AZURE_OPENAI_RESOURCE_NAME";
@@ -234,7 +236,8 @@ pub fn open_credential_store(
 ) -> Result<Arc<CredentialStore>, RegistryError> {
 	let database = database.as_ref();
 	let data_dir = database.parent().unwrap_or_else(|| Path::new("."));
-	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, None))?;
+	let manager =
+		SettingsManager::open(SettingsPaths::discover(data_dir, None), crate::SETTINGS_CATALOG)?;
 	let configured = manager
 		.snapshot()
 		.project::<LifecycleSettings>()?
@@ -304,18 +307,39 @@ pub fn open_credential_store_with_key_source(
 	fields(data_dir = %data_dir.display())
 )]
 pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, RegistryError> {
-	let base = snapshot::Catalog::try_embedded()
-		.map_err(RegistryError::Catalog)?
-		.clone();
+	production_catalog_runtime(data_dir, None).map(|(catalog, _)| catalog)
+}
+
+fn production_catalog_runtime(
+	data_dir: &Path,
+	base: Option<Arc<snapshot::Catalog>>,
+) -> Result<(Arc<snapshot::Catalog>, Arc<DiscoveryRuntime>), RegistryError> {
+	let base = match base {
+		Some(base) => base,
+		None => Arc::new(
+			snapshot::Catalog::try_embedded()
+				.map_err(RegistryError::Catalog)?
+				.clone(),
+		),
+	};
 	let overlays = Arc::new(OverlayStore::default());
 	let cache_path = data_dir.join("models.db");
 	let discovery_cache = cache_path.exists();
+	let cache = Arc::new(
+		DiscoveryStore::open(&cache_path)
+			.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?,
+	);
+	let runtime = Arc::new(
+		DiscoveryRuntime::new(
+			cache,
+			Arc::clone(&overlays),
+			[],
+			Arc::clone(&base),
+			data_dir.join(SHARED_CATALOG_CACHE_FILE),
+		)
+		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?,
+	);
 	if discovery_cache {
-		let cache = Arc::new(
-			DiscoveryStore::open(&cache_path)
-				.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?,
-		);
-		let runtime = DiscoveryRuntime::new(cache, Arc::clone(&overlays), []);
 		let requests = base
 			.providers()
 			.iter()
@@ -351,8 +375,8 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 	} else {
 		false
 	};
-	let catalog = base
-		.with_overlay_stack(&overlays.load(), UnsafeTrustScope::ALL)
+	let catalog = runtime
+		.catalog()
 		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?;
 	tracing::debug!(
 		discovery_cache,
@@ -362,7 +386,7 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 		route_count = catalog.routes().len(),
 		"production catalog composed"
 	);
-	Ok(Arc::new(catalog))
+	Ok((catalog, runtime))
 }
 
 /// Builds the production inference registry over durable daemon state.
@@ -370,7 +394,9 @@ pub async fn production_registry(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
 ) -> Result<Registry, RegistryError> {
-	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, None))?.snapshot();
+	let settings =
+		SettingsManager::open(SettingsPaths::discover(data_dir, None), crate::SETTINGS_CATALOG)?
+			.snapshot();
 	production_assembly_for_session(
 		data_dir,
 		credential_store,
@@ -389,7 +415,7 @@ pub async fn production_usage_manager(
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	production_assembly(data_dir, credential_store)
 		.await
-		.map(|(_, _, _, _, _, usage, _)| usage)
+		.map(|(_, _, _, _, _, usage, ..)| usage)
 }
 
 /// Builds the production Codex saved-reset redemption authority, when the
@@ -446,7 +472,9 @@ pub async fn production_rpc_registry(
 	data_dir: &Path,
 	credential_store: Arc<CredentialStore>,
 ) -> Result<(Registry, AuthManager), RegistryError> {
-	let settings = SettingsManager::open(SettingsPaths::discover(data_dir, None))?.snapshot();
+	let settings =
+		SettingsManager::open(SettingsPaths::discover(data_dir, None), crate::SETTINGS_CATALOG)?
+			.snapshot();
 	production_rpc_registry_with_settings(data_dir, credential_store, settings, None).await
 }
 
@@ -511,6 +539,8 @@ pub struct ProductionInference {
 	pub auth_control:         AuthControlHandle,
 	/// Shared provider usage registry accepting extension-scoped overlays.
 	pub usage_fetchers:       UsageFetcherRegistry,
+	/// Daemon-scoped catalog refresh and immutable overlay authority.
+	pub discovery_runtime:    Arc<DiscoveryRuntime>,
 }
 
 /// Builds the production inference RPC authority used by the gateway and chat.
@@ -548,7 +578,11 @@ pub async fn production_inference_for_session(
 ) -> Result<ProductionInference, RegistryError> {
 	let settings = match overrides.settings.as_ref() {
 		Some(snapshot) => Arc::clone(snapshot),
-		None => SettingsManager::open(SettingsPaths::discover(data_dir, project_root))?.snapshot(),
+		None => SettingsManager::open(
+			SettingsPaths::discover(data_dir, project_root),
+			crate::SETTINGS_CATALOG,
+		)?
+		.snapshot(),
 	};
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
@@ -569,16 +603,24 @@ pub async fn production_inference_for_session(
 		},
 	};
 	let inference_settings = inference_settings(settings.as_ref(), project_root)?;
-	let (registry, sessions, authority, mcp_authority, auth_manager, usage_manager, builtins) =
-		production_assembly_with_catalog(
-			data_dir,
-			credential_store,
-			invocation_key,
-			usage_fetchers,
-			inference_settings,
-			catalog,
-		)
-		.await?;
+	let (
+		registry,
+		sessions,
+		authority,
+		mcp_authority,
+		auth_manager,
+		usage_manager,
+		builtins,
+		discovery_runtime,
+	) = production_assembly_with_catalog(
+		data_dir,
+		credential_store,
+		invocation_key,
+		usage_fetchers,
+		inference_settings,
+		catalog,
+	)
+	.await?;
 	let usage_fetchers = usage_manager.fetchers();
 	let search_settings = settings
 		.project::<omp_inference::search_settings::WebSearchSettings>()?
@@ -605,7 +647,10 @@ pub async fn production_inference_for_session(
 		auth_manager,
 		auth_control,
 		usage_fetchers,
+		discovery_runtime: Arc::clone(&discovery_runtime),
 	};
+	let _shared_catalog_refresh =
+		discovery_runtime.spawn_shared_catalog_refresh(CancellationToken::new());
 	tracing::debug!(provider_override, catalog_override, "production inference stack composed");
 	Ok(inference)
 }
@@ -651,6 +696,7 @@ async fn production_assembly(
 		AuthManager,
 		ConsoleUsageManager,
 		BuiltinConfig,
+		Arc<DiscoveryRuntime>,
 	),
 	RegistryError,
 > {
@@ -679,6 +725,7 @@ async fn production_assembly_for_session(
 		AuthManager,
 		ConsoleUsageManager,
 		BuiltinConfig,
+		Arc<DiscoveryRuntime>,
 	),
 	RegistryError,
 > {
@@ -709,14 +756,12 @@ async fn production_assembly_with_catalog(
 		AuthManager,
 		ConsoleUsageManager,
 		BuiltinConfig,
+		Arc<DiscoveryRuntime>,
 	),
 	RegistryError,
 > {
 	fs::create_dir_all(data_dir).map_err(RegistryError::PrepareState)?;
-	let catalog = match catalog {
-		Some(catalog) => catalog,
-		None => production_catalog(data_dir)?,
-	};
+	let (catalog, discovery_runtime) = production_catalog_runtime(data_dir, catalog)?;
 	#[cfg(feature = "local-applefm")]
 	let apple_routes = catalog
 		.routes()
@@ -962,6 +1007,7 @@ async fn production_assembly_with_catalog(
 		exposed_auth_manager,
 		exposed_usage_manager,
 		builtins,
+		discovery_runtime,
 	))
 }
 
@@ -1199,6 +1245,7 @@ maxTokens = 1024
 			declared_operations:   omp_catalog::OperationBits::empty(),
 			declared_capabilities: None,
 			declared_limits:       None,
+			declared_pricing:      Box::new([]),
 			extended_context_mode: None,
 			availability:          None,
 			source:                Str::new_static("driver-test"),
@@ -1236,7 +1283,8 @@ cache_retention = "long"
 "#,
 		)
 		.expect("settings document");
-		let manager = SettingsManager::isolated(document).expect("settings manager");
+		let manager =
+			SettingsManager::isolated(document, crate::SETTINGS_CATALOG).expect("settings manager");
 		let settings =
 			inference_settings(manager.snapshot().as_ref(), None).expect("inference settings");
 		assert_eq!(settings.model.default_thinking, omp_catalog::ThinkingEffort::High,);

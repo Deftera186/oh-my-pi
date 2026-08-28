@@ -5594,7 +5594,7 @@ fn format_error_message(error: &ParseSizeError, s: &str, option: &str) -> String
 #[cfg(test)]
 mod tests {
 
-	use omp_shell_engine::{PathPolicy, WriteDenied};
+	use omp_shell_engine::{OpenRequest, PathAccess, PathDenied, PathPolicy};
 
 	use super::*;
 	use crate::host::{run_util, run_util_with_policy};
@@ -5602,8 +5602,16 @@ mod tests {
 	struct DenyWrites;
 
 	impl PathPolicy for DenyWrites {
-		fn check_write(&self, path: &Path) -> Result<(), WriteDenied> {
-			Err(WriteDenied { path: path.to_path_buf() })
+		fn check_read(&self, path: &Path) -> Result<(), PathDenied> {
+			Err(PathDenied { path: path.to_path_buf(), access: PathAccess::Read })
+		}
+
+		fn check_write(&self, path: &Path) -> Result<(), PathDenied> {
+			Err(PathDenied { path: path.to_path_buf(), access: PathAccess::Write })
+		}
+
+		fn open(&self, path: &Path, request: OpenRequest) -> Result<std::fs::File, PathDenied> {
+			Err(PathDenied { path: path.to_path_buf(), access: request.access })
 		}
 	}
 

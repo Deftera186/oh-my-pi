@@ -384,15 +384,19 @@ fn encode_run_request_for_wire_mode(
 		max_mode: Some(request.max_mode),
 		..Default::default()
 	};
-	let parameters = wire_model
-		.reasoning
-		.map(|value| {
-			vec![wire::RequestedModelModelParameterbytes {
-				id:    "reasoning".to_owned(),
-				value: value.as_str().to_owned(),
-			}]
-		})
-		.unwrap_or_default();
+	let mut parameters = Vec::new();
+	if let Some(value) = wire_model.reasoning {
+		parameters.push(wire::RequestedModelModelParameterbytes {
+			id:    "reasoning".to_owned(),
+			value: value.as_str().to_owned(),
+		});
+	}
+	parameters.extend(omp_catalog::cursor_model_parameters(wire_model.model_id.as_str()).map(
+		|(id, value)| wire::RequestedModelModelParameterbytes {
+			id:    id.to_owned(),
+			value: value.to_owned(),
+		},
+	));
 	let run = wire::AgentRunRequest {
 		conversation_state: Some(state),
 		action: Some(wire::ConversationAction { action: Some(action) }),
@@ -2358,6 +2362,7 @@ impl Decoder for CursorWireDecoder {
 						declared_operations:   OperationBits::for_kind(OperationKind::Chat),
 						declared_capabilities: Some(discovered_capabilities(model.reasoning)),
 						declared_limits:       None,
+						declared_pricing:      Box::new([]),
 						extended_context_mode: Some(ExtendedContextMode::from_enabled(model.max_mode)),
 						availability:          None,
 						source:                sf!("cursor_get_usable_models"),
@@ -2675,6 +2680,20 @@ mod tests {
 		let off = encoded_run("gpt-5.6-sol-none", Box::new([]));
 		let requested = off.requested_model.expect("requested model");
 		assert_eq!(requested.model_id, "gpt-5.6-sol-none");
+		assert!(requested.parameters.is_empty());
+	}
+	#[test]
+	fn requested_model_pins_standard_composer_tier_from_catalog_data() {
+		let run = encoded_run("composer-2.5", Box::new([]));
+		let requested = run.requested_model.expect("requested model");
+		assert_eq!(requested.model_id, "composer-2.5");
+		assert_eq!(requested.parameters.len(), 1);
+		assert_eq!(requested.parameters[0].id, "fast");
+		assert_eq!(requested.parameters[0].value, "false");
+
+		let fast = encoded_run("composer-2.5-fast", Box::new([]));
+		let requested = fast.requested_model.expect("requested model");
+		assert_eq!(requested.model_id, "composer-2.5-fast");
 		assert!(requested.parameters.is_empty());
 	}
 

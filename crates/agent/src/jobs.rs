@@ -1310,6 +1310,10 @@ const fn system_item(parts: Vec<thread::Part>) -> thread::Item {
 		kind:          Some(item::Kind::Message(thread::Message {
 			role: thread::Role::System as i32,
 			parts,
+			synthetic: None,
+			user_initiated: None,
+			completed_at_ms: None,
+			usage: None,
 		})),
 		props:         None,
 	}

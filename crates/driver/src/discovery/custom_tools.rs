@@ -533,6 +533,14 @@ fn tool_files(root: &Path) -> Vec<PathBuf> {
 				.is_some_and(|extension| {
 					matches!(extension.to_ascii_lowercase().as_str(), "json" | "md" | "py" | "sh")
 				}) {
+				// Runtime manifests beside script tools are not declarations.
+				if path
+					.file_name()
+					.and_then(|name| name.to_str())
+					.is_some_and(super::native::is_package_manifest)
+				{
+					continue;
+				}
 				files.push(path);
 			}
 		}

@@ -188,18 +188,18 @@ pub(crate) async fn run_list(title: &str, rows: &[ListRow]) -> Result<Option<usi
 			TerminalEvent::Input(InputEvent::Key(key)) => match picker.handle_key(key) {
 				PickerEvent::Consumed => {},
 				PickerEvent::Close => return Ok(None),
-				PickerEvent::Pick(index) => return Ok(Some(index)),
+				PickerEvent::Pick(index) | PickerEvent::PickTask(index) => return Ok(Some(index)),
 			},
 			TerminalEvent::Input(InputEvent::Paste(text)) => match picker.handle_paste(&text) {
 				PickerEvent::Consumed => {},
 				PickerEvent::Close => return Ok(None),
-				PickerEvent::Pick(index) => return Ok(Some(index)),
+				PickerEvent::Pick(index) | PickerEvent::PickTask(index) => return Ok(Some(index)),
 			},
 			TerminalEvent::Input(InputEvent::Mouse(report)) => {
 				match picker.handle_mouse(report.col, report.row, report.kind, viewport) {
 					PickerEvent::Consumed => {},
 					PickerEvent::Close => return Ok(None),
-					PickerEvent::Pick(index) => return Ok(Some(index)),
+					PickerEvent::Pick(index) | PickerEvent::PickTask(index) => return Ok(Some(index)),
 				}
 			},
 			TerminalEvent::Input(event) => {

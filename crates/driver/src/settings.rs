@@ -909,10 +909,6 @@ impl omp_settings::SettingsDomain for Settings {
 	}
 }
 
-omp_settings::inventory::submit! {
-	omp_settings::DomainRegistration::of::<Settings>()
-}
-
 /// Loads the current typed projection for the process working directory.
 pub fn current(data_dir: &Path) -> Result<Settings, SettingsManagerError> {
 	current_with_overlays(data_dir, &[])
@@ -945,7 +941,7 @@ pub fn current_for_project_with_overlays(
 ) -> Result<Settings, SettingsManagerError> {
 	let mut paths = SettingsPaths::discover(data_dir, project);
 	paths.overlays.extend_from_slice(overlays);
-	let manager = SettingsManager::open(paths)?;
+	let manager = SettingsManager::open(paths, crate::SETTINGS_CATALOG)?;
 	let projection = manager
 		.snapshot()
 		.project::<Settings>()
@@ -1019,10 +1015,14 @@ mod tests {
 	use omp_core::DurationUnit;
 
 	use super::*;
+
+	const CATALOG: omp_settings::SettingsCatalog = crate::SETTINGS_CATALOG;
+
 	#[test]
 	fn isolated_snapshot_round_trip() {
 		let settings = Settings::default();
-		let snapshot = omp_settings::SettingsSnapshot::isolated(settings.clone()).expect("snapshot");
+		let snapshot =
+			omp_settings::SettingsSnapshot::isolated(settings.clone(), CATALOG).expect("snapshot");
 		let loaded = snapshot.project::<Settings>().expect("projection");
 		assert_eq!(
 			loaded.get().runtime_durations().interrupt_grace,
@@ -1134,6 +1134,29 @@ mod tests {
 	}
 
 	#[test]
+	fn external_reload_notifies_registered_settings_listener() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("config.toml");
+		fs::write(&path, "[runtime]\ninterrupt_grace = \"150ms\"\n").expect("initial settings");
+		let manager = SettingsManager::open(
+			SettingsPaths { global: path.clone(), project: None, overlays: Vec::new() },
+			CATALOG,
+		)
+		.expect("manager");
+		let mut listener = manager.subscribe::<Settings>();
+
+		fs::write(&path, "[runtime]\ninterrupt_grace = \"375ms\"\n").expect("external edit");
+		manager.reload().expect("reload external edit");
+
+		let changed = listener.recv().expect("settings listener");
+		let settings = changed.project::<Settings>().expect("settings projection");
+		assert_eq!(
+			settings.get().runtime_durations().interrupt_grace,
+			omp_core::Duration::new(375, DurationUnit::Milliseconds),
+		);
+	}
+
+	#[test]
 	fn configured_runtime_duration_precedes_default() {
 		let settings: Settings = toml::from_str("[runtime]\ninterrupt_grace = \"375ms\"")
 			.expect("configured duration parses");
@@ -1197,11 +1220,10 @@ mod tests {
 		let data_dir = tempfile::tempdir().expect("create temporary data directory");
 		let path = data_dir.path().join("config.toml");
 		fs::write(&path, "not valid toml").expect("write corrupt settings");
-		let manager = SettingsManager::open(SettingsPaths {
-			global:   path.clone(),
-			project:  None,
-			overlays: Vec::new(),
-		})
+		let manager = SettingsManager::open(
+			SettingsPaths { global: path.clone(), project: None, overlays: Vec::new() },
+			CATALOG,
+		)
 		.expect("manager");
 		let diagnostics = manager.diagnostics();
 		assert_eq!(diagnostics.len(), 1);
@@ -1218,7 +1240,7 @@ mod tests {
 		)
 		.expect("legacy settings");
 		let paths = SettingsPaths::discover(data_dir.path(), None);
-		let manager = SettingsManager::open(paths.clone()).expect("first startup");
+		let manager = SettingsManager::open(paths.clone(), CATALOG).expect("first startup");
 		assert_eq!(
 			manager
 				.snapshot()
@@ -1250,6 +1272,6 @@ mod tests {
 			Some("solarized"),
 		);
 		assert!(data_dir.path().join(".settings-migration-v2").is_file());
-		SettingsManager::open(paths).expect("subsequent startup");
+		SettingsManager::open(paths, CATALOG).expect("subsequent startup");
 	}
 }

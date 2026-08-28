@@ -19,7 +19,8 @@ use omp_proto::{
 	env::v1::{self as env_pb, OutputChannel},
 };
 use omp_tools::lsp::{
-	Action, Fault, LspControl, Params, Payload, actions,
+	Action, Fault, LspControl, Params, Payload, WorkspaceSymbolOutcome, actions,
+	aggregate_workspace_symbols,
 	checkers::{self, CheckerExecutor, CheckerFault, CheckerOutput, CheckerRequest, Preset},
 	diagnostics::{DiagnosticResult, render as render_diagnostics},
 	navigation, refactor, render,
@@ -30,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{
-	docs::{DocumentHost, lease_target},
+	docs::{DocumentError, DocumentHost, lease_target},
 	exec::{ExecEvent, ExecHost},
 	tool_document::{read_whole, transaction_id},
 };
@@ -140,6 +141,18 @@ fn checker_command(request: &CheckerRequest) -> String {
 		command.push_str(&shell_quote(argument.as_str()));
 	}
 	command
+}
+
+fn document_error_detail(error: DocumentError) -> Str {
+	match error {
+		DocumentError::Wire(_) => Str::new_static("document transport failed"),
+		DocumentError::Disconnected => Str::new_static("document server disconnected"),
+		DocumentError::Cancelled => Str::new_static("document request was cancelled"),
+		DocumentError::Protocol { code, message } => {
+			Str::from(format!("document server error {code}: {message}"))
+		},
+		DocumentError::MalformedResponse(message) => message,
+	}
 }
 
 fn shell_quote(value: &str) -> String {
@@ -307,6 +320,73 @@ impl DocumentLspControl {
 		}
 	}
 
+	async fn workspace_symbols(
+		&self,
+		query: &str,
+		server: Option<&str>,
+		cancel: &CancellationToken,
+	) -> Result<Payload, Fault> {
+		let roster = self
+			.documents
+			.lsp_status(pb::LspStatusRequest { reload: false, start: true }, cancel)
+			.await
+			.map_err(|_| Fault::Server)?;
+		let selected = roster
+			.servers
+			.into_iter()
+			.filter(|status| server.is_none_or(|server| status.name == server))
+			.collect::<Vec<_>>();
+		if selected.is_empty() {
+			return Err(Fault::Unavailable);
+		}
+		let params_json = Bytes::from(
+			serde_json::to_vec(&json!({ "query": query })).map_err(|_| Fault::InvalidArguments)?,
+		);
+		let mut outcomes = Vec::with_capacity(selected.len());
+		for status in selected {
+			let result = if status.server_id.is_empty() {
+				let detail = if status.detail.is_empty() {
+					Str::from(format!("server is {}", lsp_stage_name(status.stage)))
+				} else {
+					Str::from(status.detail)
+				};
+				Err(detail)
+			} else {
+				match self
+					.documents
+					.lsp_request(
+						pb::LspRequest {
+							server_id:    status.server_id,
+							method:       "workspace/symbol".into(),
+							params_json:  params_json.clone(),
+							document:     None,
+							revision:     None,
+							stale_policy: pb::LspStalePolicy::Fail as i32,
+						},
+						cancel,
+					)
+					.await
+				{
+					Ok(response) => match response.outcome {
+						Some(lsp_response::Outcome::ResultJson(bytes)) => serde_json::from_slice(&bytes)
+							.map_err(|_| Str::new_static("server returned invalid JSON")),
+						Some(lsp_response::Outcome::Error(error)) => {
+							if error.message.is_empty() {
+								Err(Str::from(format!("server returned LSP error {}", error.code)))
+							} else {
+								Err(Str::from(error.message))
+							}
+						},
+						None => Err(Str::new_static("server returned no response")),
+					},
+					Err(error) => Err(document_error_detail(error)),
+				}
+			};
+			outcomes.push(WorkspaceSymbolOutcome { server: Str::from(status.name), result });
+		}
+		aggregate_workspace_symbols(query, outcomes)
+	}
+
 	async fn workspace_diagnostics(&self, cancel: &CancellationToken) -> Result<Payload, Fault> {
 		let root = Url::parse(self.documents.hello().root_uri.as_str())
 			.map_err(|_| Fault::Unavailable)?
@@ -415,11 +495,23 @@ impl LspControl for DocumentLspControl {
 				if params.action == Action::Diagnostics {
 					return self.workspace_diagnostics(&cancel).await;
 				}
+				if params.action == Action::Symbols {
+					return self
+						.workspace_symbols(
+							params.query.as_deref().ok_or(Fault::InvalidArguments)?,
+							params.server.as_deref(),
+							&cancel,
+						)
+						.await;
+				}
 				if matches!(params.action, Action::Status | Action::Reload) {
 					let roster = self
 						.documents
 						.lsp_status(
-							pb::LspStatusRequest { reload: params.action == Action::Reload },
+							pb::LspStatusRequest {
+								reload: params.action == Action::Reload,
+								start:  false,
+							},
 							&cancel,
 						)
 						.await
@@ -709,14 +801,18 @@ impl LspControl for DocumentLspControl {
 			} else {
 				None
 			};
+			let workspace_symbols = params.action == Action::Symbols && params.query.is_some();
 			let method = if params.action == Action::Request {
 				params.method.as_deref().ok_or(Fault::InvalidArguments)?
 			} else if params.action == Action::Reload {
 				"rust-analyzer/reloadWorkspace"
+			} else if workspace_symbols {
+				"workspace/symbol"
 			} else {
 				actions::method(params.action).ok_or(Fault::InvalidArguments)?
 			};
 			let mut results = Vec::new();
+			let mut workspace_outcomes = Vec::new();
 			for binding in &selected {
 				let encoding = binding
 					.sync_policy
@@ -742,7 +838,9 @@ impl LspControl for DocumentLspControl {
 				if params.action == Action::Rename {
 					request_params["newName"] = json!(params.new_name);
 				}
-				if params.action == Action::Symbols {
+				if workspace_symbols {
+					request_params = json!({ "query": params.query.as_deref().unwrap_or_default() });
+				} else if params.action == Action::Symbols {
 					request_params = json!({ "textDocument": { "uri": uri.as_str() } });
 				}
 				if params.action == Action::CodeActions {
@@ -758,20 +856,55 @@ impl LspControl for DocumentLspControl {
 							params_json:  Bytes::from(
 								serde_json::to_vec(&request_params).map_err(|_| Fault::InvalidArguments)?,
 							),
-							document:     Some(lease_target(&lease)),
-							revision:     lease.head().revision.clone(),
+							document:     (!workspace_symbols).then(|| lease_target(&lease)),
+							revision:     if workspace_symbols {
+								None
+							} else {
+								lease.head().revision.clone()
+							},
 							stale_policy: pb::LspStalePolicy::Fail as i32,
 						},
 						&cancel,
 					)
-					.await
-					.map_err(|_| Fault::Server)?;
+					.await;
+				if workspace_symbols {
+					let result = match response {
+						Ok(response) => match response.outcome {
+							Some(lsp_response::Outcome::ResultJson(bytes)) => {
+								serde_json::from_slice(&bytes)
+									.map_err(|_| Str::new_static("server returned invalid JSON"))
+							},
+							Some(lsp_response::Outcome::Error(error)) => {
+								let message = if error.message.is_empty() {
+									Str::from(format!("server returned LSP error {}", error.code))
+								} else {
+									Str::from(error.message)
+								};
+								Err(message)
+							},
+							None => Err(Str::new_static("server returned no response")),
+						},
+						Err(error) => Err(document_error_detail(error)),
+					};
+					workspace_outcomes.push(WorkspaceSymbolOutcome {
+						server: Str::from(binding.name.as_str()),
+						result,
+					});
+					continue;
+				}
+				let response = response.map_err(|_| Fault::Server)?;
 				match response.outcome {
 					Some(lsp_response::Outcome::ResultJson(bytes)) => {
 						results.push(serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?)
 					},
 					Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
 				}
+			}
+			if workspace_symbols {
+				return aggregate_workspace_symbols(
+					params.query.as_deref().unwrap_or_default(),
+					workspace_outcomes,
+				);
 			}
 			let mut data = if results.len() == 1 {
 				results.remove(0)

@@ -29,6 +29,8 @@ behavior {
 	cursor-effort family-marker="gpt-" {
 		tier "minimal" "low" "medium" "high" "xhigh" "max"
 	}
+	// A bare composer-2.5 request defaults to the Fast lane server-side.
+	cursor-model-parameter model="composer-2.5" id="fast" value="false"
 
 	// Exact quota bucket memberships reported by Google Gemini CLI.
 	quota-tiers provider="google-gemini-cli" {
@@ -40,6 +42,29 @@ behavior {
 		// Unknown discovered quota ids retain the upstream display heuristic.
 		fallback "Flash" substring="flash"
 		fallback "Pro" substring="pro"
+	}
+	// Antigravity reports independent backend-family counters. Exact memberships
+	// cover bundled/current ids; fallbacks preserve the same counter for newly
+	// discovered family ids.
+	quota-tiers provider="google-antigravity" {
+		tier "anthropic" "claude-opus-4-6"
+		tier "google" "gemini-3-pro" "gemma-3" "tab_flash_lite_preview" \
+			"tab_jump_flash_lite_preview"
+		tier "openai" "gpt-oss-120b" "openai/gpt-oss-120b"
+		fallback "anthropic" substring="claude-"
+		fallback "google" substring="gemini-"
+		fallback "google" substring="gemma-"
+		fallback "google" substring="tab_"
+		fallback "openai" substring="gpt-"
+		fallback "openai" substring="openai/"
+	}
+	// Codex Spark consumes an independent meter. The broad chat fallback follows
+	// Spark so the specific suffix wins for discovered ids.
+	quota-tiers provider="openai-codex" {
+		tier "spark" "gpt-5.3-codex-spark"
+		tier "chat" "gpt-5.3-codex"
+		fallback "spark" substring="-spark"
+		fallback "chat" substring="gpt-"
 	}
 
 	// Provider-default wire model for model-less hosted search operations.

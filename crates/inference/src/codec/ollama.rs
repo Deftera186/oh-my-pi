@@ -860,6 +860,7 @@ impl Decoder for OllamaDecoder {
 							declared_operations:   OperationBits::empty(),
 							declared_capabilities: None,
 							declared_limits:       None,
+							declared_pricing:      Box::new([]),
 							availability:          None,
 							source:                sf!("ollama:/api/tags"),
 							observed_at_ms:        None,

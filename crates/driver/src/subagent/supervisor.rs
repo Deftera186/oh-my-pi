@@ -1379,10 +1379,14 @@ fn system_item(text: Str) -> Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::System as i32,
-			parts: vec![omp_proto::thread::v1::Part {
+			role:            thread::Role::System as i32,
+			parts:           vec![omp_proto::thread::v1::Part {
 				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_string())),
 			}],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}

@@ -273,7 +273,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity: ask,
-			title: "choose a database and v1 auth flows",
 			streaming_args: r#"{"questions":[{"id":"db","question":"Which database should the new service use?","options":[{"label":"Postgres","description":"Relational, strong consistency, JSONB support"},{"label":"SQLite","description":"Embedded, zero-ops, great for single-node"},{"label":"MongoDB","description":"Document store, flexible schema"}],"recommended":0},{"id":"features","question":"Which auth flows should sh"#,
 			args: r#"{"questions":[{"id":"db","question":"Which database should the new service use?","options":[{"label":"Postgres","description":"Relational, strong consistency, JSONB support"},{"label":"SQLite","description":"Embedded, zero-ops, great for single-node"},{"label":"MongoDB","description":"Document store, flexible schema"}],"recommended":0},{"id":"features","question":"Which auth flows should ship in v1?","options":[{"label":"Email + password"},{"label":"OAuth (Google, GitHub)"},{"label":"Magic links"},{"label":"SAML SSO","description":"Enterprise; can be deferred"}],"multi":true}]}"#,
 			progress_update: None,
@@ -282,7 +281,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: todo,
-			title: "initialize the Foundation and Auth plan",
 			streaming_args: r#"{"op":"init","list":[{"phase":"Foundation","items":[{"text":"Scaffold crate"},{"text":"Wire workspace"}]},{"phase":"Au"#,
 			args: r#"{"op":"init","list":[{"phase":"Foundation","items":[{"text":"Scaffold crate"},{"text":"Wire workspace"}]},{"phase":"Auth","items":[{"text":"Port credential store"},{"text":"Wire OAuth providers"}]}]}"#,
 			progress_update: None,
@@ -291,7 +289,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: think,
-			title: "reflect on retry-loop latency",
 			streaming_args: r#"{"thoughts":"The retry loop re-reads the config after every failure, which explains the doubled lat"#,
 			args: r#"{"thoughts":"The retry loop re-reads the config after every failure, which explains the doubled latency. Cache the parsed config outside the loop, then re-check the invalidation path."}"#,
 			progress_update: None,

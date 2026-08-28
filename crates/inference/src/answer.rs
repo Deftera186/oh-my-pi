@@ -1004,6 +1004,8 @@ pub enum UsageUnit {
 	Tokens,
 	/// Requests or operations.
 	Requests,
+	/// Provider account credits.
+	Credits,
 	/// United States dollars.
 	Usd,
 	/// Minutes.

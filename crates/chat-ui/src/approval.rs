@@ -9,6 +9,91 @@ use crate::{ApprovalAction, ApprovalTicketView, OverlayPanel, panel_divider};
 
 const DIALOG_WIDTH: u16 = 78;
 const SUBJECT_MARGIN: u16 = 10;
+#[derive(Clone, Copy)]
+enum ApprovalChoiceAction {
+	AllowOnce,
+	AllowAlways,
+	Amend,
+	Reject,
+}
+
+#[derive(Clone, Copy)]
+enum ApprovalChoiceDetail {
+	Static(&'static str),
+	AlwaysScope,
+}
+
+#[derive(Clone, Copy)]
+struct ApprovalChoice {
+	value:  &'static str,
+	label:  &'static str,
+	key:    char,
+	help:   &'static str,
+	detail: ApprovalChoiceDetail,
+	action: ApprovalChoiceAction,
+}
+
+const APPROVAL_CHOICES: [ApprovalChoice; 4] = [
+	ApprovalChoice {
+		value:  "once",
+		label:  "Allow once",
+		key:    '1',
+		help:   "Once",
+		detail: ApprovalChoiceDetail::Static("Approve only this exact invocation"),
+		action: ApprovalChoiceAction::AllowOnce,
+	},
+	ApprovalChoice {
+		value:  "always",
+		label:  "Always allow",
+		key:    '2',
+		help:   "always",
+		detail: ApprovalChoiceDetail::AlwaysScope,
+		action: ApprovalChoiceAction::AllowAlways,
+	},
+	ApprovalChoice {
+		value:  "amend",
+		label:  "Amend",
+		key:    '3',
+		help:   "amend",
+		detail: ApprovalChoiceDetail::Static("Edit the exact command or subject, then approve once"),
+		action: ApprovalChoiceAction::Amend,
+	},
+	ApprovalChoice {
+		value:  "reject",
+		label:  "Reject",
+		key:    '4',
+		help:   "reject",
+		detail: ApprovalChoiceDetail::Static("Deny this invocation"),
+		action: ApprovalChoiceAction::Reject,
+	},
+];
+/// Iterates approval shortcuts and their action labels in dispatch order.
+pub fn approval_hotkeys() -> impl ExactSizeIterator<Item = (char, &'static str)> + Clone {
+	APPROVAL_CHOICES
+		.iter()
+		.map(|choice| (choice.key, choice.help))
+}
+
+impl ApprovalChoice {
+	fn event(self) -> ApprovalEvent {
+		match self.action {
+			ApprovalChoiceAction::AllowOnce => ApprovalEvent::Decide(ApprovalAction::AllowOnce),
+			ApprovalChoiceAction::AllowAlways => ApprovalEvent::Decide(ApprovalAction::AllowAlways),
+			ApprovalChoiceAction::Amend => ApprovalEvent::Amend,
+			ApprovalChoiceAction::Reject => ApprovalEvent::Decide(ApprovalAction::Reject),
+		}
+	}
+
+	fn detail(self, ticket: &ApprovalTicketView) -> Str {
+		match self.detail {
+			ApprovalChoiceDetail::Static(detail) => Str::new(detail),
+			ApprovalChoiceDetail::AlwaysScope => ticket.always_scope.as_ref().map_or_else(
+				|| sf!("Persist the narrowest offered policy scope"),
+				|scope| sf!("Persist scope: {scope}"),
+			),
+		}
+	}
+}
 
 /// Result of routing input through an approval dialog.
 pub enum ApprovalEvent {
@@ -93,13 +178,10 @@ impl ApprovalOverlay {
 	fn route(event: UiEvent) -> ApprovalEvent {
 		match event {
 			UiEvent::Cancel => ApprovalEvent::Consumed,
-			UiEvent::Changed { value, .. } => match value.as_str() {
-				"once" => ApprovalEvent::Decide(ApprovalAction::AllowOnce),
-				"always" => ApprovalEvent::Decide(ApprovalAction::AllowAlways),
-				"reject" => ApprovalEvent::Decide(ApprovalAction::Reject),
-				"amend" => ApprovalEvent::Amend,
-				_ => ApprovalEvent::Consumed,
-			},
+			UiEvent::Changed { value, .. } => APPROVAL_CHOICES
+				.iter()
+				.find(|choice| choice.value == value.as_str())
+				.map_or(ApprovalEvent::Consumed, |choice| choice.event()),
 			UiEvent::None
 			| UiEvent::Submit
 			| UiEvent::Filtered { .. }
@@ -112,6 +194,15 @@ impl ApprovalOverlay {
 			| UiEvent::DiffAction { .. } => ApprovalEvent::Consumed,
 		}
 	}
+}
+
+fn choice_rows(ticket: &ApprovalTicketView) -> Vec<(Str, Str, Str)> {
+	APPROVAL_CHOICES
+		.iter()
+		.map(|choice| {
+			(Str::new(choice.value), sf!("{}. {}", choice.key, choice.label), choice.detail(ticket))
+		})
+		.collect()
 }
 
 fn build(ticket: &ApprovalTicketView, width: u16, ctx: &UiContext) -> Ui {
@@ -130,10 +221,7 @@ fn build(ticket: &ApprovalTicketView, width: u16, ctx: &UiContext) -> Ui {
 				.join(" · "),
 		)
 	};
-	let always_detail = ticket.always_scope.as_ref().map_or_else(
-		|| sf!("Persist the narrowest offered policy scope"),
-		|scope| sf!("Persist scope: {scope}"),
-	);
+	let choices = choice_rows(ticket);
 	Ui::from_root(
 		OverlayPanel::new(sf!("Approval · {}", ticket.title)).child(dom! {
 			<col>
@@ -142,10 +230,11 @@ fn build(ticket: &ApprovalTicketView, width: u16, ctx: &UiContext) -> Ui {
 				<text dim>{evidence}</text>
 				{panel_divider()}
 				<select id="approval" h={4u16}>
-					<option value="once" label="Allow once"><text dim>{"Approve only this exact invocation"}</text></option>
-					<option value="always" label="Always allow"><text dim>{always_detail}</text></option>
-					<option value="amend" label="Amend"><text dim>{"Edit the exact command or subject, then approve once"}</text></option>
-					<option value="reject" label="Reject"><text dim>{"Deny this invocation"}</text></option>
+					for (value, label, detail) in choices {
+						<option value={value} label={label.clone()}>
+							<text dim>{detail}</text>
+						</option>
+					}
 				</select>
 				{panel_divider()}
 				<text dim>{"Enter choose · Esc keep pending"}</text>
@@ -183,8 +272,8 @@ pub fn middle_elide(text: &str, max_chars: usize) -> Str {
 mod tests {
 	use omp_tui::{Key, Mouse, Size, UiContext};
 
-	use super::{ApprovalEvent, ApprovalOverlay};
-	use crate::ApprovalTicketView;
+	use super::{ApprovalEvent, ApprovalOverlay, choice_rows};
+	use crate::{ApprovalAction, ApprovalTicketView};
 
 	fn ticket() -> ApprovalTicketView {
 		ApprovalTicketView {
@@ -206,5 +295,42 @@ mod tests {
 			overlay.handle_mouse(0, 0, Mouse::Click, Size::new(120, 40)),
 			ApprovalEvent::Consumed
 		));
+	}
+	#[test]
+	fn numbered_shortcuts_route_to_the_documented_actions() {
+		let ctx = UiContext::default();
+
+		let mut overlay = ApprovalOverlay::open(ticket(), &ctx);
+		assert!(matches!(
+			overlay.handle_key(Key::Char('1')),
+			ApprovalEvent::Decide(ApprovalAction::AllowOnce)
+		));
+		let mut overlay = ApprovalOverlay::open(ticket(), &ctx);
+		assert!(matches!(
+			overlay.handle_key(Key::Char('2')),
+			ApprovalEvent::Decide(ApprovalAction::AllowAlways)
+		));
+		let mut overlay = ApprovalOverlay::open(ticket(), &ctx);
+		assert!(matches!(overlay.handle_key(Key::Char('3')), ApprovalEvent::Amend));
+		let mut overlay = ApprovalOverlay::open(ticket(), &ctx);
+		assert!(matches!(
+			overlay.handle_key(Key::Char('4')),
+			ApprovalEvent::Decide(ApprovalAction::Reject)
+		));
+	}
+
+	#[test]
+	fn numbered_labels_keep_choice_order_and_dynamic_always_scope() {
+		let mut ticket = ticket();
+		ticket.always_scope = Some("command prefix `cargo test`".into());
+		let rows = choice_rows(&ticket);
+		assert_eq!(
+			rows
+				.iter()
+				.map(|(_, label, _)| label.as_str())
+				.collect::<Vec<_>>(),
+			["1. Allow once", "2. Always allow", "3. Amend", "4. Reject"]
+		);
+		assert_eq!(rows[1].2, "Persist scope: command prefix `cargo test`");
 	}
 }

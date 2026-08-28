@@ -187,6 +187,22 @@ pub enum WelcomeEvent {
 	NewSession,
 	/// Resume the selected recent session.
 	Resume(Str),
+	/// Request rows with updated session-index presentation.
+	SessionList {
+		/// Include sessions from every project.
+		all_projects:  bool,
+		/// Sort sessions by title rather than recency.
+		sort_by_title: bool,
+		/// Include session paths in row details.
+		show_paths:    bool,
+	},
+	/// Delete one selected session.
+	SessionDelete {
+		/// Stable session identity.
+		id:          Str,
+		/// Preserve session artifacts while deleting its record.
+		noninvasive: bool,
+	},
 	/// Leave the terminal host.
 	Quit,
 }
@@ -208,6 +224,10 @@ pub struct Welcome {
 	palette:        AperturePalette,
 	sessions:       Vec<SessionRow>,
 	selected:       usize,
+	all_projects:   bool,
+	sort_by_title:  bool,
+	show_paths:     bool,
+	delete_confirm: Option<Str>,
 	lsp_servers:    Vec<WelcomeLspServer>,
 	camera:         (f32, f32),
 	camera_target:  (f32, f32),
@@ -243,6 +263,10 @@ impl Welcome {
 			),
 			sessions:       sessions.into_iter().take(3).collect(),
 			selected:       0,
+			all_projects:   false,
+			sort_by_title:  false,
+			show_paths:     false,
+			delete_confirm: None,
 			lsp_servers:    Vec::new(),
 			camera:         (0.0, 0.0),
 			camera_target:  (0.0, 0.0),
@@ -298,8 +322,59 @@ impl Welcome {
 				.sessions
 				.get(self.selected - 1)
 				.map_or(WelcomeEvent::Consumed, |session| WelcomeEvent::Resume(session.id.clone())),
+			Key::Tab => {
+				self.delete_confirm = None;
+				self.all_projects = !self.all_projects;
+				WelcomeEvent::SessionList {
+					all_projects:  self.all_projects,
+					sort_by_title: self.sort_by_title,
+					show_paths:    self.show_paths,
+				}
+			},
+			Key::Ctrl('s') => {
+				self.delete_confirm = None;
+				self.sort_by_title = !self.sort_by_title;
+				WelcomeEvent::SessionList {
+					all_projects:  self.all_projects,
+					sort_by_title: self.sort_by_title,
+					show_paths:    self.show_paths,
+				}
+			},
+			Key::Ctrl('p') => {
+				self.delete_confirm = None;
+				self.show_paths = !self.show_paths;
+				WelcomeEvent::SessionList {
+					all_projects:  self.all_projects,
+					sort_by_title: self.sort_by_title,
+					show_paths:    self.show_paths,
+				}
+			},
+			Key::Delete => {
+				let Some(session) = self.sessions.get_mut(self.selected.saturating_sub(1)) else {
+					return WelcomeEvent::Consumed;
+				};
+				if self.delete_confirm.as_ref() == Some(&session.id) {
+					let id = session.id.clone();
+					self.delete_confirm = None;
+					WelcomeEvent::SessionDelete { id, noninvasive: false }
+				} else {
+					self.delete_confirm = Some(session.id.clone());
+					session.detail = sf!("press again to delete — <ctrl+backspace: keep artifacts>");
+					WelcomeEvent::Consumed
+				}
+			},
+			Key::Ctrl('w') => self.sessions.get(self.selected.saturating_sub(1)).map_or(
+				WelcomeEvent::Consumed,
+				|session| WelcomeEvent::SessionDelete {
+					id:          session.id.clone(),
+					noninvasive: true,
+				},
+			),
 			Key::Esc | Key::Ctrl('c') => WelcomeEvent::Quit,
-			_ => WelcomeEvent::Consumed,
+			_ => {
+				self.delete_confirm = None;
+				WelcomeEvent::Consumed
+			},
 		}
 	}
 

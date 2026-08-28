@@ -23,9 +23,8 @@ use serde_json::{Value, json};
 use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
 
-use super::{github_url, github_url::GithubCredentialBridge};
+use super::github_url::{self, GithubCredentialBridge, GithubRepo};
 
-const API: &str = "https://api.github.com";
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
 /// Combined-credential GitHub owner.
@@ -61,6 +60,7 @@ impl GithubService {
 	)]
 	async fn request(
 		&self,
+		host: &str,
 		method: Method,
 		path: &str,
 		body: Option<&Value>,
@@ -85,7 +85,7 @@ impl GithubService {
 					message: sf!("GitHub credential projection failed"),
 				})?;
 		}
-		let url = format!("{API}{path}");
+		let url = github_url::api_url_for_host(host, path);
 		let request = match method {
 			Method::Get => self.client.get(url),
 			Method::Post => self.client.post(url),
@@ -143,18 +143,21 @@ impl GithubService {
 		Ok(ApiResponse { value, remaining, reset })
 	}
 
-	fn repo(&self, requested: Option<&str>) -> Result<Str, Fault> {
-		let repo = requested.map(Str::new).map_or_else(
+	fn repo(&self, requested: Option<&str>) -> Result<GithubRepo, Fault> {
+		requested.map_or_else(
 			|| {
 				github_url::infer_repo(&self.root).map_err(|error| Fault {
 					code:    sf!("github_repo_unresolved"),
 					message: Str::new(error.message().clone()),
 				})
 			},
-			Ok,
-		)?;
-		validate_repo(&repo)?;
-		Ok(repo)
+			|repo| {
+				GithubRepo::parse(repo).map_err(|error| Fault {
+					code:    sf!("github_invalid_repo"),
+					message: Str::new(error.message().clone()),
+				})
+			},
+		)
 	}
 }
 
@@ -168,10 +171,12 @@ impl GithubHost for GithubService {
 	) -> Result<Payload, Fault> {
 		let response = match params.op {
 			Operation::RepoView => {
+				let repo = self.repo(params.repo.as_deref())?;
 				self
 					.request(
+						repo.host(),
 						Method::Get,
-						&format!("/repos/{}", self.repo(params.repo.as_deref())?),
+						&format!("/repos/{}", repo.slug()),
 						None,
 						&cancellation,
 					)
@@ -180,11 +185,11 @@ impl GithubHost for GithubService {
 			Operation::FileRead => {
 				let repo = self.repo(params.repo.as_deref())?;
 				let path = required(params.path.as_deref(), "file_read requires `path`")?;
-				let endpoint = file_endpoint(&repo, path, params.branch.as_deref())?;
+				let endpoint = file_endpoint(repo.slug(), path, params.branch.as_deref())?;
 				let mut response = self
-					.request(Method::Get, &endpoint, None, &cancellation)
+					.request(repo.host(), Method::Get, &endpoint, None, &cancellation)
 					.await?;
-				response.value = decode_file_response(&response.value, &repo, path)?;
+				response.value = decode_file_response(&response.value, repo.identity(), path)?;
 				response
 			},
 			Operation::PrCreate => {
@@ -197,7 +202,13 @@ impl GithubHost for GithubService {
 					"draft": params.draft,
 				});
 				self
-					.request(Method::Post, &format!("/repos/{repo}/pulls"), Some(&body), &cancellation)
+					.request(
+						repo.host(),
+						Method::Post,
+						&format!("/repos/{}/pulls", repo.slug()),
+						Some(&body),
+						&cancellation,
+					)
 					.await?
 			},
 			Operation::PrCheckout => self.checkout(&params, &cancellation).await?,
@@ -232,6 +243,11 @@ impl GithubService {
 			Operation::SearchRepos => ("repositories", None),
 			_ => unreachable!(),
 		};
+		let repo = if params.op == Operation::SearchRepos && params.repo.is_none() {
+			None
+		} else {
+			Some(self.repo(params.repo.as_deref())?)
+		};
 		if params.op == Operation::SearchCode
 			&& (params.since.is_some() || params.until.is_some() || params.date_field.is_some())
 		{
@@ -245,8 +261,10 @@ impl GithubService {
 			append_query_part(&mut query, tag);
 		}
 		if params.op != Operation::SearchRepos && !has_scope(&query) {
-			let repo = self.repo(params.repo.as_deref())?;
-			append_query_part(&mut query, &format!("repo:{repo}"));
+			append_query_part(
+				&mut query,
+				&format!("repo:{}", repo.as_ref().expect("scoped search repository").slug()),
+			);
 		}
 		if let Some(qualifier) = search_date_qualifier(params, SystemTime::now())? {
 			append_query_part(&mut query, &qualifier);
@@ -258,6 +276,9 @@ impl GithubService {
 		let limit = params.limit.unwrap_or(30).clamp(1, 100);
 		self
 			.request(
+				repo
+					.as_ref()
+					.map_or(github_url::GITHUB_HOST, GithubRepo::host),
 				Method::Get,
 				&format!("/search/{kind}?q={encoded}&per_page={limit}"),
 				None,
@@ -268,7 +289,7 @@ impl GithubService {
 
 	async fn resolve_pr(
 		&self,
-		repo: &str,
+		repo: &GithubRepo,
 		selector: &str,
 		cancellation: &CancellationToken,
 	) -> Result<(u64, ApiResponse), Fault> {
@@ -282,15 +303,15 @@ impl GithubService {
 					"pull request must be a positive number, URL, or branch name",
 				));
 			}
-			let owner = repo.split_once('/').expect("validated repository").0;
+			let owner = repo.slug().split_once('/').expect("validated repository").0;
 			let head = if branch.contains(':') {
 				branch.to_owned()
 			} else {
 				format!("{owner}:{branch}")
 			};
-			let endpoint = pr_branch_endpoint(repo, &head);
+			let endpoint = pr_branch_endpoint(repo.slug(), &head);
 			let matches = self
-				.request(Method::Get, &endpoint, None, cancellation)
+				.request(repo.host(), Method::Get, &endpoint, None, cancellation)
 				.await?;
 			let rows = matches.value.as_array().ok_or_else(|| {
 				fault("github_invalid_response", "GitHub pull request lookup was not a list")
@@ -302,7 +323,13 @@ impl GithubService {
 			if numbers.is_empty() {
 				for page in 1..=100u32 {
 					let response = self
-						.request(Method::Get, &pr_list_endpoint(repo, page), None, cancellation)
+						.request(
+							repo.host(),
+							Method::Get,
+							&pr_list_endpoint(repo.slug(), page),
+							None,
+							cancellation,
+						)
 						.await?;
 					let rows = response.value.as_array().ok_or_else(|| {
 						fault("github_invalid_response", "GitHub pull request lookup was not a list")
@@ -337,7 +364,13 @@ impl GithubService {
 			number
 		};
 		let response = self
-			.request(Method::Get, &format!("/repos/{repo}/pulls/{number}"), None, cancellation)
+			.request(
+				repo.host(),
+				Method::Get,
+				&format!("/repos/{}/pulls/{number}", repo.slug()),
+				None,
+				cancellation,
+			)
 			.await?;
 		Ok((number, response))
 	}
@@ -389,7 +422,7 @@ impl GithubService {
 			}
 			fs::create_dir_all(&path).map_err(io_fault)?;
 			let metadata = CheckoutMetadata {
-				repo:      repo.to_string(),
+				repo:      repo.identity().to_owned(),
 				clone_url: clone_url.to_owned(),
 				head:      head.to_owned(),
 			};
@@ -456,9 +489,9 @@ impl GithubService {
 		let target = if let Some(run) = &params.run {
 			WatchTarget::Run(run_id(run)?)
 		} else if let Some(branch) = &params.branch {
-			let branch_endpoint = branch_endpoint(&repo, branch);
+			let branch_endpoint = branch_endpoint(repo.slug(), branch);
 			let response = self
-				.request(Method::Get, &branch_endpoint, None, cancellation)
+				.request(repo.host(), Method::Get, &branch_endpoint, None, cancellation)
 				.await?;
 			let head_sha = response
 				.value
@@ -468,7 +501,10 @@ impl GithubService {
 			WatchTarget::Commit { branch: branch.clone(), head_sha: Str::new(head_sha) }
 		} else {
 			let current_repo = self.repo(None)?;
-			if !current_repo.eq_ignore_ascii_case(&repo) {
+			if !current_repo
+				.identity()
+				.eq_ignore_ascii_case(repo.identity())
+			{
 				return Err(fault(
 					"github_repo_mismatch",
 					"current checkout does not match `repo`; pass `branch` or `run`",
@@ -489,8 +525,9 @@ impl GithubService {
 				WatchTarget::Run(id) => {
 					let mut run = self
 						.request(
+							repo.host(),
 							Method::Get,
-							&format!("/repos/{repo}/actions/runs/{id}"),
+							&format!("/repos/{}/actions/runs/{id}", repo.slug()),
 							None,
 							cancellation,
 						)
@@ -501,7 +538,13 @@ impl GithubService {
 				},
 				WatchTarget::Commit { branch, head_sha } => {
 					let mut runs = self
-						.request(Method::Get, &actions_runs_endpoint(&repo, head_sha), None, cancellation)
+						.request(
+							repo.host(),
+							Method::Get,
+							&actions_runs_endpoint(repo.slug(), head_sha),
+							None,
+							cancellation,
+						)
 						.await?;
 					self
 						.attach_run_jobs(&repo, &mut runs.value, cancellation)
@@ -540,14 +583,20 @@ impl GithubService {
 
 	async fn fetch_run_jobs(
 		&self,
-		repo: &str,
+		repo: &GithubRepo,
 		run_id: u64,
 		cancellation: &CancellationToken,
 	) -> Result<Value, Fault> {
 		let mut jobs = Vec::new();
 		for page in 1..=100u32 {
 			let response = self
-				.request(Method::Get, &run_jobs_endpoint(repo, run_id, page), None, cancellation)
+				.request(
+					repo.host(),
+					Method::Get,
+					&run_jobs_endpoint(repo.slug(), run_id, page),
+					None,
+					cancellation,
+				)
 				.await?;
 			let page_jobs = response
 				.value
@@ -567,7 +616,7 @@ impl GithubService {
 
 	async fn attach_run_jobs(
 		&self,
-		repo: &str,
+		repo: &GithubRepo,
 		value: &mut Value,
 		cancellation: &CancellationToken,
 	) -> Result<(), Fault> {
@@ -755,7 +804,7 @@ fn has_scope(query: &str) -> bool {
 			.any(|prefix| part.starts_with(prefix))
 	})
 }
-fn parse_pr_number(value: &str, repo: &str) -> Result<Option<u64>, Fault> {
+fn parse_pr_number(value: &str, repo: &GithubRepo) -> Result<Option<u64>, Fault> {
 	let value = value.trim();
 	if let Ok(number) = value.parse::<u64>() {
 		return if number > 0 {
@@ -774,19 +823,26 @@ fn parse_pr_number(value: &str, repo: &str) -> Result<Option<u64>, Fault> {
 		.path_segments()
 		.map(|parts| parts.collect::<Vec<_>>())
 		.unwrap_or_default();
-	let (url_repo, number) = match (host, parts.as_slice()) {
-		("github.com", [owner, name, "pull", number, ..]) => (format!("{owner}/{name}"), *number),
+	let (repo_host, owner, name, number) = match (host, parts.as_slice()) {
 		("api.github.com", ["repos", owner, name, "pulls", number, ..]) => {
-			(format!("{owner}/{name}"), *number)
+			("github.com", *owner, *name, *number)
+		},
+		(host, ["api", "v3", "repos", owner, name, "pulls", number, ..]) => {
+			(host, *owner, *name, *number)
+		},
+		(host, [owner, name, "pull", number, ..]) if !host.is_empty() => {
+			(host, *owner, *name, *number)
 		},
 		_ => {
 			return Err(fault(
 				"github_invalid_pr",
-				"pull request URL must be a github.com pull request URL",
+				"pull request URL must be a GitHub pull request URL",
 			));
 		},
 	};
-	if !url_repo.eq_ignore_ascii_case(repo) {
+	let url_repo = GithubRepo::new(repo_host, owner, name)
+		.map_err(|_| fault("github_invalid_pr", "pull request URL has an invalid repository"))?;
+	if !url_repo.identity().eq_ignore_ascii_case(repo.identity()) {
 		return Err(fault("github_invalid_pr", "pull request URL belongs to a different repository"));
 	}
 	number
@@ -859,23 +915,6 @@ fn conclusion_state(conclusion: Option<&str>) -> ActionsState {
 		},
 		_ => ActionsState::Pending,
 	}
-}
-fn validate_repo(repo: &str) -> Result<(), Fault> {
-	let Some((owner, name)) = repo.split_once('/') else {
-		return Err(fault("github_invalid_repo", "repository must be `owner/repo`"));
-	};
-	if owner.is_empty()
-		|| name.is_empty()
-		|| name.contains('/')
-		|| [owner, name].into_iter().any(|part| {
-			matches!(part, "." | "..")
-				|| !part
-					.bytes()
-					.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-		}) {
-		return Err(fault("github_invalid_repo", "repository must be a valid `owner/repo`"));
-	}
-	Ok(())
 }
 fn file_endpoint(repo: &str, path: &str, branch: Option<&str>) -> Result<String, Fault> {
 	if path.is_empty()
@@ -1284,6 +1323,7 @@ mod tests {
 		branch_endpoint, date_qualifier, days_from_civil, decode_file_response, file_endpoint,
 		normalize_date_bound, parse_pr_number, poll_sleep, pr_branch_endpoint, run_jobs_endpoint,
 	};
+	use crate::github_url::GithubRepo;
 
 	fn instant(year: i64, month: u32, day: u32, hour: u64) -> std::time::SystemTime {
 		let days = days_from_civil(year, month, day).expect("test date");
@@ -1346,14 +1386,26 @@ mod tests {
 	}
 
 	#[test]
-	fn pr_references_distinguish_numbers_urls_and_branches() {
-		assert_eq!(parse_pr_number("17", "owner/repo").expect("number"), Some(17));
+	fn pr_references_distinguish_numbers_urls_branches_and_hosts() {
+		let default = GithubRepo::parse("owner/repo").expect("default repo");
+		assert_eq!(parse_pr_number("17", &default).expect("number"), Some(17));
 		assert_eq!(
-			parse_pr_number("https://github.com/OWNER/REPO/pull/19/files", "owner/repo").expect("URL"),
+			parse_pr_number("https://github.com/OWNER/REPO/pull/19/files", &default).expect("URL"),
 			Some(19),
 		);
-		assert_eq!(parse_pr_number("feature/17", "owner/repo").expect("branch"), None,);
-		assert!(parse_pr_number("https://github.com/other/repo/pull/19", "owner/repo").is_err(),);
+		assert_eq!(parse_pr_number("feature/17", &default).expect("branch"), None);
+		assert!(parse_pr_number("https://github.com/other/repo/pull/19", &default).is_err(),);
+
+		let enterprise = GithubRepo::parse("ghe.example.com/owner/repo").expect("enterprise repo");
+		assert_eq!(
+			parse_pr_number("https://ghe.example.com/OWNER/REPO/pull/23", &enterprise)
+				.expect("enterprise URL"),
+			Some(23),
+		);
+		assert!(
+			parse_pr_number("https://github.com/owner/repo/pull/23", &enterprise).is_err(),
+			"a PR URL from another host must not drive the enterprise checkout",
+		);
 	}
 
 	#[test]

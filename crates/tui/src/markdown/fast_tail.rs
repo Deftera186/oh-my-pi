@@ -556,6 +556,7 @@ mod tests {
 			("ordinary prose", " continues"),
 			("unicode café", " noir"),
 			("wrapped words here", " and there"),
+			("color #c5ffd6.", " remains painted"),
 			("#", " heading"),
 			("|--", "-|"),
 			("open [", "label"),

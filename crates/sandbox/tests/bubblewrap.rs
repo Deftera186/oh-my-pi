@@ -29,10 +29,13 @@ fn broad_view_has_required_namespaces_and_runtime_mounts() {
 fn enabled_network_alone_shares_the_host_network_namespace() {
 	let mut spec = SandboxSpec::new(executable());
 	spec.set_network(NetworkMode::Enabled);
+	spec.tolerate_missing(Capability::IpcRestrict);
 	let plan = compile(spec);
 	assert!(plan.argv().iter().any(|argument| argument == "--share-net"));
 	assert!(plan.enforced().contains(Capability::NetEnable));
 	assert!(!plan.enforced().contains(Capability::NetDisable));
+	assert!(!plan.enforced().contains(Capability::IpcRestrict));
+	assert_caveat(&plan, Capability::IpcRestrict);
 	assert_enforced_subset(&plan);
 }
 #[test]
@@ -59,6 +62,7 @@ fn disabled_network_uses_hidden_seccomp_child_contract() {
 fn enabled_network_skips_hidden_seccomp_child() {
 	let mut spec = SandboxSpec::new(executable());
 	spec.set_network(NetworkMode::Enabled);
+	spec.tolerate_missing(Capability::IpcRestrict);
 	let plan = compile(spec);
 	assert!(
 		!plan
@@ -187,35 +191,54 @@ fn temporary_and_overlay_write_denies_accept_every_effective_writable_region() {
 
 #[cfg(unix)]
 #[test]
-fn write_deny_preserves_a_symlink_literal_separately_from_its_target() {
+fn write_deny_rejects_symlinked_protected_paths() {
 	use std::os::unix::fs::symlink;
 
-	let root = tempdir().expect("writable root");
-	let target_root = tempdir().expect("symlink target");
-	let target = target_root.path().join("target");
-	let link = root.path().join("link");
-	fs::create_dir(&target).expect("target directory");
-	symlink(&target, &link).expect("symlink");
-	let literal = root
+	let root_dir = tempdir().expect("writable root");
+	let root = root_dir
 		.path()
 		.canonicalize()
-		.expect("canonical root")
-		.join("link");
-	let canonical_target = target.canonicalize().expect("canonical target");
+		.expect("canonical writable root");
+	let target = root.join("target");
+	fs::create_dir(&target).expect("target directory");
 
-	let mut spec = SandboxSpec::new(executable());
-	spec
-		.set_write(WriteMode::Overlay)
-		.set_degradation(DegradationPolicy::AllowCaveats);
-	spec.allow_write(root.path()).expect("write root");
-	spec.deny_write(&link).expect("symlink write denial");
-	let plan = compile(spec);
-
-	assert!(has_mount(plan.argv(), "--ro-bind", &literal, &literal));
+	let git = root.join(".git");
+	symlink(&target, &git).expect("direct symlink");
+	let mut direct = SandboxSpec::new(executable());
+	direct.set_write(WriteMode::Scoped);
+	direct.allow_write(&root).expect("write root");
+	direct
+		.deny_write(&git)
+		.expect("direct symlink write denial");
+	let error = Runner::for_backend(Backend::Bubblewrap)
+		.compile(&direct)
+		.expect_err("direct symlinked carve-out must fail");
 	assert!(
-		!has_mount(plan.argv(), "--ro-bind", &canonical_target, &canonical_target),
-		"the target is already beneath Bubblewrap's read-only root",
+		matches!(
+			error,
+			SandboxError::ProtectedWriteDenySymlink { ref writable_root, ref path, ref symlink }
+				if writable_root == &root && path == &git && symlink == &git
+		),
+		"unexpected error: {error:?}"
 	);
+
+	let intermediate = root.join("linked");
+	symlink(&target, &intermediate).expect("intermediate symlink");
+	let protected = intermediate.join("private").join("secret");
+	let mut nested = SandboxSpec::new(executable());
+	nested.set_write(WriteMode::Scoped);
+	nested.allow_write(&root).expect("write root");
+	nested
+		.deny_write(&protected)
+		.expect("intermediate symlink write denial");
+	let error = Runner::for_backend(Backend::Bubblewrap)
+		.compile(&nested)
+		.expect_err("intermediate symlinked carve-out must fail");
+	assert!(matches!(
+		error,
+		SandboxError::ProtectedWriteDenySymlink { writable_root, path, symlink }
+			if writable_root == root && path == protected && symlink == intermediate
+	));
 }
 
 #[test]
@@ -272,20 +295,17 @@ fn future_read_denies_reject_or_drop_the_unenforceable_guarantee() {
 fn unsupported_modes_reject_or_narrow_authoritative_enforcement() {
 	let mut outbound = SandboxSpec::new(executable());
 	outbound.set_network(NetworkMode::Outbound);
-	assert_missing(&outbound, Capability::NetOutbound);
-	outbound.set_degradation(DegradationPolicy::AllowCaveats);
 	let plan = compile(outbound);
-	assert!(plan.enforced().contains(Capability::NetEnable));
+	assert!(plan.enforced().contains(Capability::NetOutbound));
+	assert!(plan.enforced().contains(Capability::IpcRestrict));
 	assert!(!plan.enforced().contains(Capability::NetDisable));
-	assert!(!plan.enforced().contains(Capability::NetOutbound));
 	assert!(plan.argv().iter().any(|argument| argument == "--share-net"));
-	assert!(plan.caveats().iter().any(|caveat| {
-		caveat.capability == Some(Capability::NetOutbound)
-			&& caveat
-				.message
-				.as_str()
-				.contains("inbound listeners are not blocked")
-	}));
+	assert!(
+		plan
+			.argv()
+			.iter()
+			.any(|argument| argument == omp_sandbox::HIDDEN_CHILD_ARG)
+	);
 	assert_enforced_subset(&plan);
 
 	let mut ephemeral = SandboxSpec::new(executable());
@@ -373,7 +393,7 @@ fn no_exec_and_resources_are_never_advertised() {
 
 #[cfg(unix)]
 #[test]
-fn explicit_unix_socket_is_bound_without_claiming_ipc_restriction() {
+fn explicit_unix_socket_fails_closed_when_exact_enforcement_is_unavailable() {
 	use std::os::unix::net::UnixListener;
 
 	let root = tempdir().expect("temporary paths");
@@ -381,13 +401,15 @@ fn explicit_unix_socket_is_bound_without_claiming_ipc_restriction() {
 	let _listener = UnixListener::bind(&socket).expect("Unix listener");
 	let mut spec = SandboxSpec::new(executable());
 	spec.allow_read(executable()).expect("scoped executable");
+	spec.set_network(NetworkMode::Outbound);
 	spec.allow_unix_socket(&socket).expect("socket grant");
-	let plan = compile(spec);
-	let socket = fs::canonicalize(socket).expect("canonical socket");
-	assert!(has_mount(plan.argv(), "--bind", &socket, &socket));
-	assert!(!plan.requested().contains(Capability::IpcRestrict));
-	assert!(!plan.enforced().contains(Capability::IpcRestrict));
-	assert_enforced_subset(&plan);
+	let error = Runner::for_backend(Backend::Bubblewrap)
+		.compile(&spec)
+		.expect_err("exact Unix-socket grant must fail closed");
+	assert!(matches!(error, SandboxError::EnforcementUnavailable {
+		backend:   Backend::Bubblewrap,
+		authority: "Unix-domain socket path grants",
+	}));
 }
 
 #[cfg(target_os = "linux")]
@@ -408,12 +430,6 @@ fn wrapper_prefix_executes_and_filters_environment_names() {
 		.expect("compile wrapper");
 	assert!(wrapper.env_allowed("PATH"));
 	assert!(!wrapper.env_allowed("API_TOKEN"));
-	assert!(
-		wrapper
-			.caveats()
-			.iter()
-			.any(|caveat| caveat.capability == Some(Capability::NetOutbound))
-	);
 	assert_eq!(wrapper.prefix_args().last().and_then(|arg| arg.to_str()), Some("--"));
 	let output = Command::new(wrapper.launcher().expect("kernel launcher"))
 		.args(wrapper.prefix_args())

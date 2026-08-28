@@ -36,7 +36,7 @@ use crate::{
 	body::BodySource,
 	call::{
 		AccountRoutingContext, Call, NativeResponseFraming, OperationCall, Setting, StructuredOutput,
-		ToolChoice,
+		Target, ToolChoice,
 	},
 	catalog::{AuthSpecId, RouteId},
 	codec::{
@@ -585,7 +585,7 @@ impl RouteComposer for ProductionRouteComposer {
 		let runtime_auth = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
 			.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
 		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
-		if matches!(route.codec.as_str(), "anthropic" | "search-perplexity") {
+		if matches!(route.codec.as_str(), "anthropic" | "bedrock-converse" | "search-perplexity") {
 			let provider = catalog
 				.provider(&route.provider)
 				.ok_or_else(|| unavailable(route, "catalog-provider-missing"))?;
@@ -596,16 +596,24 @@ impl RouteComposer for ProductionRouteComposer {
 				let Some(auth) = catalog.auth_spec(auth_id) else {
 					return Err(unavailable(route, "catalog-auth-spec-missing"));
 				};
-				if auth.kind != AuthSpecKind::Oauth
-					&& !(route.codec.as_str() == "anthropic"
-						&& matches!(auth.kind, AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer))
-				{
+				let accepted = match route.codec.as_str() {
+					"anthropic" => matches!(
+						auth.kind,
+						AuthSpecKind::Oauth | AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer
+					),
+					"bedrock-converse" => {
+						matches!(auth.kind, AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer)
+					},
+					"search-perplexity" => auth.kind == AuthSpecKind::Oauth,
+					_ => false,
+				};
+				if !accepted {
 					continue;
 				}
 				let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
 				let runtime = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
 					.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
-				if route.codec.as_str() == "search-perplexity" {
+				if matches!(route.codec.as_str(), "bedrock-converse" | "search-perplexity") {
 					auth_specs.insert(0, (auth_id.clone(), runtime));
 				} else {
 					auth_specs.push((auth_id.clone(), runtime));
@@ -1773,7 +1781,7 @@ struct RouteAccountSelector {
 impl AccountSelector<Call> for RouteAccountSelector {
 	type Account = RouteAccount;
 
-	fn select(&self, _: &Call, context: &ExecutionContext) -> Result<Self::Account, Error> {
+	fn select(&self, call: &Call, context: &ExecutionContext) -> Result<Self::Account, Error> {
 		if !self.authenticated {
 			return Ok(RouteAccount::Anonymous {
 				_account: AnonymousAccount {
@@ -1789,6 +1797,19 @@ impl AccountSelector<Call> for RouteAccountSelector {
 		};
 		let affinity = context.session_affinity();
 		let preserve_principal = affinity.is_some();
+		let quota_scope = omp_catalog::has_quota_tier_policy(self.provider.as_str()).then(|| {
+			let model = match &call.target {
+				Target::Model(model) | Target::Provider { model, .. } | Target::Route { model, .. } => {
+					Some(model.as_str())
+				},
+				Target::ProviderService(_) | Target::RouteService(_) => None,
+			};
+			Str::new(
+				model
+					.and_then(|model| omp_catalog::quota_display_tier(self.provider.as_str(), model))
+					.unwrap_or("unknown"),
+			)
+		});
 		let request = AccountSelectionRequest {
 			provider: self.provider.clone(),
 			route: self.route.clone(),
@@ -1798,6 +1819,7 @@ impl AccountSelector<Call> for RouteAccountSelector {
 			rotate,
 			rotation: RotationPolicy { allow_account_change: true, preserve_principal },
 			now: SystemTime::now(),
+			quota_scope,
 		};
 		match self.pool.select(&request) {
 			Ok(selection) => Ok(RouteAccount::Authenticated(Box::new(selection))),

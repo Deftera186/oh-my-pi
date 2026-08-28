@@ -377,12 +377,14 @@ impl AppOptions {
 		// frame one on the alternate screen; the main buffer stays untouched
 		// (and unseeded) until release.
 		let initial_hold = hold_alt || ui.has_overlay();
+		let paint_started = Instant::now();
 		let last_stats = if initial_hold {
 			let alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 			ui.repaint(&mut renderer, viewport.height, alt_enter.as_deref().unwrap_or(""))?
 		} else {
 			ui.present(&mut renderer, viewport.height)?
 		};
+		let last_frame_cost = paint_started.elapsed();
 		let now = Instant::now();
 		Ok(App {
 			ui,
@@ -405,6 +407,8 @@ impl AppOptions {
 			hold_request: hold_alt,
 			clipboard: ClipboardGate::default(),
 			last_stats,
+			last_frame_cost,
+			animation_not_before: None,
 			terminal,
 		})
 	}
@@ -527,24 +531,26 @@ pub enum AppEvent {
 
 /// Running retained-UI terminal host.
 pub struct App {
-	ui:             Ui,
-	renderer:       Renderer<TtyOut>,
-	msgs:           Receiver<Msg>,
-	tx:             flume::Sender<Msg>,
-	cancel:         CancellationToken,
-	epoch:          Instant,
-	caps:           TerminalCaps,
-	viewport:       Size,
-	quit:           SmallVec<Key, 4>,
-	hotkeys:        SmallVec<Key, 4>,
-	quit_on_cancel: bool,
-	resize_wait:    Option<Instant>,
-	resize_settle:  Option<Instant>,
-	alt_hold:       bool,
-	hold_request:   bool,
-	clipboard:      ClipboardGate,
-	last_stats:     PaintStats,
-	terminal:       Terminal,
+	ui:                   Ui,
+	renderer:             Renderer<TtyOut>,
+	msgs:                 Receiver<Msg>,
+	tx:                   flume::Sender<Msg>,
+	cancel:               CancellationToken,
+	epoch:                Instant,
+	caps:                 TerminalCaps,
+	viewport:             Size,
+	quit:                 SmallVec<Key, 4>,
+	hotkeys:              SmallVec<Key, 4>,
+	quit_on_cancel:       bool,
+	resize_wait:          Option<Instant>,
+	resize_settle:        Option<Instant>,
+	alt_hold:             bool,
+	hold_request:         bool,
+	clipboard:            ClipboardGate,
+	last_stats:           PaintStats,
+	last_frame_cost:      Duration,
+	animation_not_before: Option<Instant>,
+	terminal:             Terminal,
 }
 
 impl App {
@@ -594,6 +600,11 @@ impl App {
 		self.last_stats
 	}
 
+	/// Returns the compose-and-write cost of the most recent completed frame.
+	pub const fn last_frame_cost(&self) -> Duration {
+		self.last_frame_cost
+	}
+
 	/// Requests or releases a persistent alternate-screen hold.
 	///
 	/// Fullscreen scenes — a welcome screen, a pager — hold the alternate
@@ -619,6 +630,7 @@ impl App {
 		reason = "terminal UI components are intentionally confined to their owning thread"
 	)]
 	pub async fn next(&mut self) -> io::Result<Option<AppEvent>> {
+		let mut animation_paint = false;
 		loop {
 			if self.cancel.is_cancelled() {
 				return Ok(None);
@@ -627,7 +639,7 @@ impl App {
 			// Alternate-screen transitions and ordinary paints all render the
 			// same fixed viewport. Only the staged enter/leave prefix differs.
 			let want_hold = self.hold_request || self.ui.has_overlay();
-			if want_hold != self.alt_hold {
+			let painted = if want_hold != self.alt_hold {
 				let prefix = if want_hold {
 					self
 						.terminal
@@ -636,15 +648,26 @@ impl App {
 				} else {
 					Str::new(self.terminal.stage_alt_leave().unwrap_or(""))
 				};
-				self.last_stats = self
-					.ui
-					.repaint(&mut self.renderer, self.viewport.height, &prefix)?;
+				self.paint(Some(&prefix))?;
 				if !want_hold {
 					self.terminal.commit_alt_leave();
 				}
 				self.alt_hold = want_hold;
+				true
 			} else if self.ui.has_damage() {
-				self.last_stats = self.ui.present(&mut self.renderer, self.viewport.height)?;
+				self.paint(None)?;
+				true
+			} else {
+				false
+			};
+			if animation_paint {
+				if painted {
+					self.animation_not_before = Some(
+						Instant::now()
+							+ components::Spinner::animation_backpressure(self.last_frame_cost),
+					);
+				}
+				animation_paint = false;
 			}
 
 			// Replay input queued behind a clipboard read — oldest first, one
@@ -662,7 +685,12 @@ impl App {
 				}
 			}
 
-			let wake = self.ui.next_wake().map(|at| self.epoch + at);
+			let wake = self.ui.next_wake().map(|at| {
+				let scheduled = self.epoch + at;
+				self
+					.animation_not_before
+					.map_or(scheduled, |not_before| scheduled.max(not_before))
+			});
 			let wakeup = tokio::select! {
 				() = self.cancel.cancelled() => Wakeup::Cancelled,
 				message = self.msgs.recv_async() => Wakeup::Message(message),
@@ -730,7 +758,7 @@ impl App {
 					},
 				},
 				Wakeup::Animation => {
-					self.ui.tick(self.epoch.elapsed());
+					animation_paint = self.ui.tick(self.epoch.elapsed());
 				},
 				Wakeup::ClipboardExpired => self.clipboard.expire(),
 				Wakeup::ResizeCheck => {
@@ -876,6 +904,19 @@ impl App {
 
 	/// Routes one decoded input event into the retained tree, mapping the
 	/// outcome exactly like the inline dispatch it replaced.
+	fn paint(&mut self, prefix: Option<&str>) -> io::Result<()> {
+		let started = Instant::now();
+		let result = match prefix {
+			Some(prefix) => self
+				.ui
+				.repaint(&mut self.renderer, self.viewport.height, prefix),
+			None => self.ui.present(&mut self.renderer, self.viewport.height),
+		};
+		self.last_frame_cost = started.elapsed();
+		self.last_stats = result?;
+		Ok(())
+	}
+
 	fn dispatch_input(&mut self, event: InputEvent) -> Routed {
 		// Input lands on the real clock: transitions started by this event
 		// must not begin on a stale animation tick.
@@ -947,7 +988,7 @@ impl App {
 		self.viewport = viewport;
 		self.ui.resize(viewport.width);
 		self.ui.damage_all();
-		self.last_stats = self.ui.present(&mut self.renderer, viewport.height)?;
+		self.paint(None)?;
 		self.resize_settle = Some(now + RESIZE_SETTLE);
 		Ok(())
 	}

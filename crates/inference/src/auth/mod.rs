@@ -4,6 +4,7 @@
 pub mod adc;
 pub mod alibaba_token_plan;
 pub mod apply;
+pub mod attribution;
 pub mod broker;
 pub mod command;
 pub mod crypto;
@@ -27,7 +28,14 @@ pub use alibaba_token_plan::{
 	AlibabaTokenPlanLoginEngine, AlibabaTokenPlanLoginError, AlibabaTokenPlanShaper,
 	parse_alibaba_token_plan_credential, serialize_alibaba_token_plan_credential,
 };
-pub use apply::{CustomAuthApplyError, SecretHeader, apply_custom_auth};
+pub use apply::{
+	CommandHeaderResolveError, CommandHeaderRetry, CommandHeaderSource, CustomAuthApplyError,
+	SecretHeader, apply_custom_auth,
+};
+pub use attribution::{
+	APP_HEADER, AttributionError, ClientUsageIdentity, HOSTNAME_HEADER, INSTALL_ID_HEADER,
+	UsageAttribution, resolve_app_name, resolve_forwarded_attribution,
+};
 pub use broker::{
 	CredentialBroker, CredentialBrokerEngines, CredentialBrokerError, CredentialEnvironment,
 	SystemCredentialEnvironment,

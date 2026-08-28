@@ -14,7 +14,9 @@ use crate::{
 	overlays::{OverlayPanel, panel_divider},
 };
 
-const HINT: &str = "↑/↓ models · Enter switch · type to search · Esc close";
+const HINT: &str = "↑/↓ models · Enter switch · type to search · Alt+P task model · Esc close";
+const TASK_HINT: &str =
+	"↑/↓ models · Enter use for task subagents · type to search · Alt+P session model · Esc close";
 const FRAME_ROWS: u16 = 6;
 const CONTEXT_WIDTH: u16 = 62;
 const INPUT_PRICE_WIDTH: u16 = 76;
@@ -29,29 +31,38 @@ pub enum PickerEvent {
 	Close,
 	/// Choose the row at this index.
 	Pick(usize),
+	/// Choose the row at this index for task subagents.
+	PickTask(usize),
 }
 
 /// Retained filterable model-picker overlay.
 pub struct ModelPicker {
-	ui:        Ui,
-	rows:      Vec<ModelRow>,
-	current:   usize,
-	ctx:       UiContext,
-	options:   OverlayOptions,
-	query:     Str,
-	list_rows: u16,
+	ui:           Ui,
+	rows:         Vec<ModelRow>,
+	current:      usize,
+	task_current: usize,
+	task_mode:    bool,
+	ctx:          UiContext,
+	options:      OverlayOptions,
+	query:        Str,
+	list_rows:    u16,
 }
 
 impl ModelPicker {
 	/// Opens the picker over host-supplied rows with `current` preselected.
-	pub fn open(rows: &[ModelRow], current: usize, ctx: &UiContext) -> Self {
+	///
+	/// `task_current` is preselected after toggling into task-subagent mode.
+	pub fn open(rows: &[ModelRow], current: usize, task_current: usize, ctx: &UiContext) -> Self {
 		let rows = rows.to_vec();
 		let current = current.min(rows.len().saturating_sub(1));
-		let ui = build(&rows, current, "", 6, 100, ctx);
+		let task_current = task_current.min(rows.len().saturating_sub(1));
+		let ui = build(&rows, current, "", 6, 100, false, ctx);
 		let mut picker = Self {
 			ui,
 			rows,
 			current,
+			task_current,
+			task_mode: false,
 			ctx: ctx.clone(),
 			options: OverlayOptions::default()
 				.anchor(OverlayAnchor::Bottom)
@@ -66,6 +77,12 @@ impl ModelPicker {
 
 	/// Routes a key into the model filter and list.
 	pub fn handle_key(&mut self, key: Key) -> PickerEvent {
+		if key == Key::Alt('p') {
+			self.task_mode = !self.task_mode;
+			let width = self.ui.frame().size().width;
+			self.rebuild(width);
+			return PickerEvent::Consumed;
+		}
 		let event = self.ui.handle_key(key);
 		self.route(event)
 	}
@@ -102,10 +119,11 @@ impl ModelPicker {
 	}
 
 	/// Replaces catalog rows while preserving the active query.
-	pub fn update_rows(&mut self, rows: &[ModelRow], current: usize) {
+	pub fn update_rows(&mut self, rows: &[ModelRow], current: usize, task_current: usize) {
 		let width = self.ui.frame().size().width;
 		self.rows = rows.to_vec();
 		self.current = current.min(self.rows.len().saturating_sub(1));
+		self.task_current = task_current.min(self.rows.len().saturating_sub(1));
 		self.rebuild(width);
 	}
 
@@ -115,7 +133,13 @@ impl ModelPicker {
 			UiEvent::Changed { id, value } if id.as_str() == "models" => value
 				.as_str()
 				.parse()
-				.map_or(PickerEvent::Consumed, PickerEvent::Pick),
+				.map_or(PickerEvent::Consumed, |index| {
+					if self.task_mode {
+						PickerEvent::PickTask(index)
+					} else {
+						PickerEvent::Pick(index)
+					}
+				}),
 			UiEvent::Highlighted { id, value } if id.as_str() == "models" => {
 				self.show_detail(value.as_str().parse().ok());
 				PickerEvent::Consumed
@@ -140,8 +164,14 @@ impl ModelPicker {
 	}
 
 	fn rebuild(&mut self, width: u16) {
-		self.ui = build(&self.rows, self.current, &self.query, self.list_rows, width, &self.ctx);
-		self.show_detail((!self.rows.is_empty()).then_some(self.current));
+		let selected = if self.task_mode {
+			self.task_current
+		} else {
+			self.current
+		};
+		self.ui =
+			build(&self.rows, selected, &self.query, self.list_rows, width, self.task_mode, &self.ctx);
+		self.show_detail((!self.rows.is_empty()).then_some(selected));
 	}
 
 	fn show_detail(&mut self, model: Option<usize>) {
@@ -171,6 +201,7 @@ fn build(
 	query: &str,
 	list_rows: u16,
 	width: u16,
+	task_mode: bool,
 	ctx: &UiContext,
 ) -> Ui {
 	let show_context = width >= CONTEXT_WIDTH && rows.iter().any(|row| row.context.is_some());
@@ -210,10 +241,20 @@ fn build(
 		})
 		.collect();
 	let seed = Str::new(query);
-	let current_mark = sf!(" current");
+	let current_mark = if task_mode {
+		sf!(" task")
+	} else {
+		sf!(" current")
+	};
+	let title = if task_mode {
+		"Switch Task Model"
+	} else {
+		"Switch Model"
+	};
+	let hint = if task_mode { TASK_HINT } else { HINT };
 	let height = list_rows.saturating_add(1);
 	Ui::from_root(
-		OverlayPanel::new("Switch Model").child(dom! {
+		OverlayPanel::new(title).child(dom! {
 			<col>
 				<select id="models" filter={seed} h={height}>
 					for row in display {
@@ -236,7 +277,7 @@ fn build(
 				</select>
 				{panel_divider()}
 				<text id="model-facts" fg=muted truncate>{" "}</text>
-				<text fg=muted truncate>{HINT}</text>
+				<text fg=muted truncate>{hint}</text>
 			</col>
 		}),
 		width,
@@ -322,7 +363,7 @@ mod tests {
 	#[test]
 	fn typing_filters_models() {
 		let rows = [row("alpha", "first"), row("beta", "second")];
-		let mut picker = ModelPicker::open(&rows, 0, &UiContext::default());
+		let mut picker = ModelPicker::open(&rows, 0, 0, &UiContext::default());
 		assert_eq!(picker.handle_key(Key::Char('b')), PickerEvent::Consumed);
 		assert_eq!(picker.handle_key(Key::Enter), PickerEvent::Pick(1));
 	}
@@ -330,18 +371,27 @@ mod tests {
 	#[test]
 	fn down_then_enter_picks_the_next_model() {
 		let rows = [row("alpha", "first"), row("beta", "second")];
-		let mut picker = ModelPicker::open(&rows, 0, &UiContext::default());
+		let mut picker = ModelPicker::open(&rows, 0, 0, &UiContext::default());
 		assert_eq!(picker.handle_key(Key::Down), PickerEvent::Consumed);
 		assert_eq!(picker.handle_key(Key::Enter), PickerEvent::Pick(1));
 	}
 
 	#[test]
+	fn task_mode_is_reachable_and_picks_the_task_model() {
+		let rows = [row("alpha", "first"), row("beta", "second")];
+		let mut picker = ModelPicker::open(&rows, 0, 1, &UiContext::default());
+
+		assert_eq!(picker.handle_key(Key::Alt('p')), PickerEvent::Consumed);
+		assert_eq!(picker.handle_key(Key::Enter), PickerEvent::PickTask(1));
+	}
+
+	#[test]
 	fn catalog_refresh_rebuilds_the_model_list() {
 		let rows = [row("alpha", "first"), row("beta", "second")];
-		let mut picker = ModelPicker::open(&rows, 0, &UiContext::default());
+		let mut picker = ModelPicker::open(&rows, 0, 0, &UiContext::default());
 		let refreshed = [row("alpha", "replacement"), row("beta", "new-second")];
 
-		picker.update_rows(&refreshed, 0);
+		picker.update_rows(&refreshed, 0, 0);
 
 		assert_eq!(picker.handle_key(Key::Down), PickerEvent::Consumed);
 		assert_eq!(picker.handle_key(Key::Enter), PickerEvent::Pick(1));

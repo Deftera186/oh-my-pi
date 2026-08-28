@@ -3,9 +3,20 @@ use std::ffi::OsStr;
 use std::{ffi::OsString, path::Path};
 #[cfg(target_os = "linux")]
 use std::{
-	fs,
-	io::{self, Write},
+	fs::{self, File},
+	io::{self, Read as _, Write},
+	net::{Ipv4Addr, TcpListener, TcpStream},
+	os::{
+		fd::{AsRawFd as _, FromRawFd as _},
+		unix::net::UnixStream,
+	},
 	path::PathBuf,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
+	thread,
+	time::Duration,
 };
 
 #[cfg(target_os = "linux")]
@@ -27,7 +38,7 @@ use crate::{
 /// Embedding binaries using [`crate::CommandWrapper`] must dispatch this
 /// argument to [`run_child_entry`] before launching untrusted work. Its
 /// stable argv contract is `HIDDEN_CHILD_ARG BPF_PATH [--landlock POLICY_PATH]
-/// -- PROGRAM ARGS...`.
+/// [--proxy-relay BROKER_UDS PORT] -- PROGRAM ARGS...`.
 pub const HIDDEN_CHILD_ARG: &str = "--omp-sandbox-child";
 
 pub(crate) const BPF_PLACEHOLDER: &str = "@omp-sandbox-bpf@";
@@ -36,6 +47,8 @@ pub(crate) const POLICY_PLACEHOLDER: &str = "@omp-sandbox-landlock-policy@";
 const POLICY_MAGIC: &[u8; 8] = b"OMPLL\0\0\x01";
 #[cfg(target_os = "linux")]
 const MIN_ABI: u32 = 5;
+#[cfg(target_os = "linux")]
+const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const LANDLOCK_CAPABILITIES: CapabilitySet = CapabilitySet::one(Capability::EnvScrub)
 	.union(CapabilitySet::one(Capability::FsReadHost))
@@ -56,6 +69,12 @@ pub(crate) fn compile(
 	requested: CapabilitySet,
 	mut enforced: CapabilitySet,
 ) -> Result<Plan, SandboxError> {
+	if !spec.unix_sockets.is_empty() {
+		return Err(SandboxError::EnforcementUnavailable {
+			backend:   Backend::Landlock,
+			authority: "Unix-domain socket path grants",
+		});
+	}
 	let mut unavailable = requested.difference(LANDLOCK_CAPABILITIES);
 	if spec.network == NetworkMode::Disabled && !spec.unix_sockets.is_empty() {
 		enforced = enforced.difference(CapabilitySet::one(Capability::NetDisable));
@@ -97,7 +116,8 @@ pub(crate) fn compile(
 		 filesystem rules",
 	));
 	plan.add_caveat(Caveat::general(
-		"Landlock seccomp always denies ptrace, process_vm access, and io_uring",
+		"Landlock seccomp always denies ptrace, process_vm access, and io_uring, and kill-family \
+		 signals",
 	));
 	if spec.network == NetworkMode::Disabled && !spec.unix_sockets.is_empty() {
 		plan.add_caveat(Caveat::capability(
@@ -343,6 +363,7 @@ enum FilterMode {
 	DisabledUnix,
 	Enabled,
 	Outbound,
+	OutboundUnixRestricted,
 }
 
 #[cfg(target_os = "linux")]
@@ -352,7 +373,8 @@ impl FilterMode {
 			(NetworkMode::Disabled, true) => Self::DisabledStrict,
 			(NetworkMode::Disabled, false) => Self::DisabledUnix,
 			(NetworkMode::Enabled, _) => Self::Enabled,
-			(NetworkMode::Outbound, _) => Self::Outbound,
+			(NetworkMode::Outbound, true) => Self::OutboundUnixRestricted,
+			(NetworkMode::Outbound, false) => Self::Outbound,
 		}
 	}
 }
@@ -378,14 +400,30 @@ fn compile_filter(mode: FilterMode) -> Result<seccompiler::BpfProgram, SandboxEr
 		libc::SYS_io_uring_setup,
 		libc::SYS_io_uring_enter,
 		libc::SYS_io_uring_register,
+		libc::SYS_kill,
+		libc::SYS_tkill,
+		libc::SYS_tgkill,
+		libc::SYS_rt_sigqueueinfo,
+		libc::SYS_rt_tgsigqueueinfo,
 	] {
 		deny(&mut rules, syscall);
 	}
+	deny(&mut rules, libc::SYS_pidfd_send_signal);
 	match mode {
 		FilterMode::DisabledStrict => {
+			let unix_only = SeccompRule::new(vec![
+				SeccompCondition::new(
+					0,
+					SeccompCmpArgLen::Dword,
+					SeccompCmpOp::Ne,
+					libc::AF_UNIX as u64,
+				)
+				.map_err(seccompiler::Error::from)?,
+			])
+			.map_err(seccompiler::Error::from)?;
+			rules.insert(libc::SYS_socket, vec![unix_only.clone()]);
+			rules.insert(libc::SYS_socketpair, vec![unix_only]);
 			for syscall in [
-				libc::SYS_socket,
-				libc::SYS_socketpair,
 				libc::SYS_connect,
 				libc::SYS_accept,
 				libc::SYS_accept4,
@@ -427,12 +465,138 @@ fn compile_filter(mode: FilterMode) -> Result<seccompiler::BpfProgram, SandboxEr
 			}
 		},
 		FilterMode::Outbound => {
-			for syscall in [libc::SYS_accept, libc::SYS_accept4, libc::SYS_listen] {
+			for syscall in [libc::SYS_accept, libc::SYS_accept4, libc::SYS_bind, libc::SYS_listen] {
+				deny(&mut rules, syscall);
+			}
+		},
+		FilterMode::OutboundUnixRestricted => {
+			let unix_socket = SeccompRule::new(vec![
+				SeccompCondition::new(
+					0,
+					SeccompCmpArgLen::Dword,
+					SeccompCmpOp::Eq,
+					libc::AF_UNIX as u64,
+				)
+				.map_err(seccompiler::Error::from)?,
+			])
+			.map_err(seccompiler::Error::from)?;
+			let unix_socketpair_only = SeccompRule::new(vec![
+				SeccompCondition::new(
+					0,
+					SeccompCmpArgLen::Dword,
+					SeccompCmpOp::Ne,
+					libc::AF_UNIX as u64,
+				)
+				.map_err(seccompiler::Error::from)?,
+			])
+			.map_err(seccompiler::Error::from)?;
+			rules.insert(libc::SYS_socket, vec![unix_socket]);
+			rules.insert(libc::SYS_socketpair, vec![unix_socketpair_only]);
+			for syscall in [libc::SYS_accept, libc::SYS_accept4, libc::SYS_bind, libc::SYS_listen] {
 				deny(&mut rules, syscall);
 			}
 		},
 		FilterMode::Enabled => {},
 	}
+	let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(seccompiler::Error::from)?;
+	let filter = SeccompFilter::new(
+		rules,
+		SeccompAction::Allow,
+		SeccompAction::Errno(libc::EPERM as u32),
+		arch,
+	)
+	.map_err(seccompiler::Error::from)?;
+	filter
+		.try_into()
+		.map_err(seccompiler::Error::from)
+		.map_err(Into::into)
+}
+
+#[cfg(target_os = "linux")]
+fn compile_relay_filter() -> Result<seccompiler::BpfProgram, SandboxError> {
+	use std::collections::BTreeMap;
+
+	use seccompiler::{
+		SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+		TargetArch,
+	};
+
+	fn deny(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, syscall: i64) {
+		rules.insert(syscall, Vec::new());
+	}
+
+	let mut rules = BTreeMap::new();
+	for syscall in [
+		libc::SYS_ptrace,
+		libc::SYS_process_vm_readv,
+		libc::SYS_process_vm_writev,
+		libc::SYS_io_uring_setup,
+		libc::SYS_io_uring_enter,
+		libc::SYS_io_uring_register,
+		libc::SYS_kill,
+		libc::SYS_tkill,
+		libc::SYS_tgkill,
+		libc::SYS_rt_sigqueueinfo,
+		libc::SYS_rt_tgsigqueueinfo,
+		libc::SYS_pidfd_send_signal,
+		libc::SYS_execve,
+		libc::SYS_execveat,
+		libc::SYS_openat,
+		libc::SYS_openat2,
+		libc::SYS_unlinkat,
+		libc::SYS_renameat,
+		libc::SYS_renameat2,
+		libc::SYS_mkdirat,
+		libc::SYS_linkat,
+		libc::SYS_symlinkat,
+		libc::SYS_mknodat,
+		libc::SYS_ftruncate,
+		libc::SYS_fchmod,
+		libc::SYS_fchown,
+		libc::SYS_fchownat,
+		libc::SYS_utimensat,
+		libc::SYS_setxattr,
+		libc::SYS_lsetxattr,
+		libc::SYS_fsetxattr,
+		libc::SYS_removexattr,
+		libc::SYS_lremovexattr,
+		libc::SYS_fremovexattr,
+		libc::SYS_bind,
+		libc::SYS_listen,
+		libc::SYS_socketpair,
+	] {
+		deny(&mut rules, syscall);
+	}
+	// Legacy path syscalls exist only on the x86 Linux ABI. The modern `*at`
+	// variants above cover architectures such as aarch64 that intentionally
+	// expose no `SYS_open`/`SYS_unlink` constants.
+	#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+	for syscall in [
+		libc::SYS_open,
+		libc::SYS_creat,
+		libc::SYS_unlink,
+		libc::SYS_rename,
+		libc::SYS_mkdir,
+		libc::SYS_rmdir,
+		libc::SYS_link,
+		libc::SYS_symlink,
+		libc::SYS_mknod,
+		libc::SYS_truncate,
+		libc::SYS_chmod,
+		libc::SYS_fchmodat,
+		libc::SYS_chown,
+		libc::SYS_lchown,
+		libc::SYS_utime,
+		libc::SYS_utimes,
+	] {
+		deny(&mut rules, syscall);
+	}
+	let unix_only = SeccompRule::new(vec![
+		SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, libc::AF_UNIX as u64)
+			.map_err(seccompiler::Error::from)?,
+	])
+	.map_err(seccompiler::Error::from)?;
+	rules.insert(libc::SYS_socket, vec![unix_only]);
 	let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(seccompiler::Error::from)?;
 	let filter = SeccompFilter::new(
 		rules,
@@ -506,6 +670,23 @@ fn run_child_entry_linux() -> Result<(), SandboxError> {
 		}
 		apply_landlock(Path::new(&policy))?;
 		(Backend::Landlock, args.next())
+	} else if next == OsStr::new("--proxy-relay") {
+		let socket = args
+			.next()
+			.ok_or(SandboxError::InvalidSandboxChildArguments)?;
+		let port = args
+			.next()
+			.and_then(|value| value.to_string_lossy().parse::<u16>().ok())
+			.filter(|port| *port != 0)
+			.ok_or(SandboxError::InvalidSandboxChildArguments)?;
+		let separator = args
+			.next()
+			.ok_or(SandboxError::InvalidSandboxChildArguments)?;
+		if separator != OsStr::new("--") {
+			return Err(SandboxError::InvalidSandboxChildArguments);
+		}
+		spawn_proxy_relay(PathBuf::from(socket), port)?;
+		(Backend::Bubblewrap, args.next())
 	} else {
 		if next != OsStr::new("--") {
 			return Err(SandboxError::InvalidSandboxChildArguments);
@@ -516,6 +697,221 @@ fn run_child_entry_linux() -> Result<(), SandboxError> {
 	seccompiler::apply_filter(&program)?;
 	let source = std::process::Command::new(command).args(args).exec();
 	Err(SandboxError::BackendIo { backend, operation: SandboxOperation::Launch, source })
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_proxy_relay(socket: PathBuf, port: u16) -> Result<(), SandboxError> {
+	let (ready, mut child_ready) = relay_ready_pipe().map_err(relay_launch_error)?;
+	// SAFETY: the helper has not started any threads. The parent waits for the
+	// isolated relay to finish its setup before installing the target filter.
+	match unsafe { libc::fork() } {
+		-1 => Err(relay_launch_error(io::Error::last_os_error())),
+		0 => {
+			drop(ready);
+			let status = relay_child(&socket, port, &mut child_ready);
+			if status.is_err() {
+				let _ = child_ready.write_all(&[0]);
+			}
+			std::process::exit(i32::from(status.is_err()));
+		},
+		pid => {
+			drop(child_ready);
+			if let Err(source) = wait_for_relay_ready(ready) {
+				wait_for_relay_exit(pid);
+				return Err(relay_launch_error(source));
+			}
+			Ok(())
+		},
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn relay_launch_error(source: io::Error) -> SandboxError {
+	SandboxError::BackendIo {
+		backend: Backend::Bubblewrap,
+		operation: SandboxOperation::Launch,
+		source,
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn relay_ready_pipe() -> io::Result<(File, File)> {
+	let mut fds = [-1; 2];
+	// SAFETY: `fds` has space for both returned descriptors. CLOEXEC ensures a
+	// target exec cannot mistake an unready relay for a successful startup.
+	if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: `pipe2` returned owned descriptors exactly once.
+	Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_relay_ready(mut ready: File) -> io::Result<()> {
+	let mut descriptor = libc::pollfd {
+		fd:      ready.as_raw_fd(),
+		events:  libc::POLLIN | libc::POLLHUP,
+		revents: 0,
+	};
+	// SAFETY: `descriptor` is initialized and points to the owned readiness pipe.
+	let polled = unsafe {
+		libc::poll(
+			&mut descriptor,
+			1,
+			i32::try_from(RELAY_READY_TIMEOUT.as_millis()).expect("relay timeout fits i32"),
+		)
+	};
+	if polled == 0 {
+		return Err(io::Error::new(io::ErrorKind::TimedOut, "scoped relay readiness timed out"));
+	}
+	if polled < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	let mut byte = [0_u8; 1];
+	ready.read_exact(&mut byte)?;
+	if byte == [1] {
+		Ok(())
+	} else {
+		Err(io::Error::new(io::ErrorKind::Other, "scoped relay initialization failed"))
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_relay_exit(pid: libc::pid_t) {
+	let mut status = 0;
+	// SAFETY: `pid` is this helper's direct child and waiting only occurs after
+	// the readiness pipe reported its setup failure or closure.
+	loop {
+		if unsafe { libc::waitpid(pid, &mut status, 0) } >= 0
+			|| io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+		{
+			return;
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn relay_child(socket: &Path, port: u16, ready: &mut File) -> Result<(), SandboxError> {
+	configure_relay_process().map_err(relay_launch_error)?;
+
+	bring_loopback_up().map_err(relay_launch_error)?;
+	let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(relay_launch_error)?;
+	listener.set_nonblocking(true).map_err(relay_launch_error)?;
+	install_relay_filter()?;
+	ready.write_all(&[1]).map_err(relay_launch_error)?;
+	proxy_relay(socket, listener).map_err(relay_launch_error)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_relay_process() -> io::Result<()> {
+	// The relay is owned by the target helper. A parent-death signal closes the
+	// network bridge even if the target exits without orderly cleanup.
+	// SAFETY: PR_SET_* settings are process-local Linux kernel controls.
+	if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	if unsafe { libc::getppid() } == 1 {
+		return Err(io::Error::new(io::ErrorKind::Other, "relay parent exited during startup"));
+	}
+	// A target in the same PID namespace cannot inspect this trusted child
+	// through /proc/<pid>/mem once dumpability is disabled.
+	if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0
+		|| unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+	{
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_relay_filter() -> Result<(), SandboxError> {
+	let filter = compile_relay_filter()?;
+	seccompiler::apply_filter(&filter)?;
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn proxy_relay(socket: &Path, listener: TcpListener) -> io::Result<()> {
+	const MAX_CONNECTIONS: usize = 32;
+	const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+	let live = Arc::new(AtomicUsize::new(0));
+	loop {
+		match listener.accept() {
+			Ok((client, _)) if live.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS => {
+				live.fetch_sub(1, Ordering::AcqRel);
+			},
+			Ok((client, _)) => {
+				let socket = socket.to_path_buf();
+				let worker_live = Arc::clone(&live);
+				if thread::Builder::new()
+					.name("omp-scoped-relay".into())
+					.spawn(move || {
+						let _ = relay_connection(client, &socket, IDLE_TIMEOUT);
+						worker_live.fetch_sub(1, Ordering::AcqRel);
+					})
+					.is_err()
+				{
+					live.fetch_sub(1, Ordering::AcqRel);
+				}
+			},
+			Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+				thread::sleep(Duration::from_millis(10));
+			},
+			Err(error) => return Err(error),
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn bring_loopback_up() -> io::Result<()> {
+	// Bubblewrap creates the private namespace before invoking this helper, but
+	// Linux leaves its loopback device down until its namespace owner enables it.
+	// SAFETY: the fd and `ifreq` are initialized for the documented SIOC* ioctls.
+	let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+	if fd < 0 {
+		return Err(io::Error::last_os_error());
+	}
+	let result = (|| {
+		// SAFETY: zero initialization is valid for the C `ifreq` input buffer.
+		let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+		request.ifr_name[0] = b'l' as libc::c_char;
+		request.ifr_name[1] = b'o' as libc::c_char;
+		// SAFETY: SIOCGIFFLAGS fills the flags union member of `request`.
+		if unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut request) } != 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: the preceding ioctl initialized this union member.
+		unsafe { request.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short };
+		// SAFETY: SIOCSIFFLAGS consumes the initialized flags union member.
+		if unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &request) } != 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(())
+	})();
+	// SAFETY: `fd` is owned by this function and is no longer used.
+	unsafe { libc::close(fd) };
+	result
+}
+
+#[cfg(target_os = "linux")]
+fn relay_connection(mut client: TcpStream, socket: &Path, timeout: Duration) -> io::Result<()> {
+	client.set_read_timeout(Some(timeout))?;
+	client.set_write_timeout(Some(timeout))?;
+	let mut broker = UnixStream::connect(socket)?;
+	broker.set_read_timeout(Some(timeout))?;
+	broker.set_write_timeout(Some(timeout))?;
+	let mut client_copy = client.try_clone()?;
+	let closer = client_copy.try_clone()?;
+	let mut broker_copy = broker.try_clone()?;
+	let copied = thread::Builder::new()
+		.name("omp-scoped-relay-copy".into())
+		.spawn(move || io::copy(&mut client_copy, &mut broker_copy));
+	let down = io::copy(&mut broker, &mut client);
+	let _ = closer.shutdown(std::net::Shutdown::Both);
+	if let Ok(copied) = copied {
+		let _ = copied.join();
+	}
+	down.map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -605,7 +1001,13 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> io::Result<&'
 }
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-	use super::{FilterMode, compile_filter, read_program, write_program};
+	use std::io::Write as _;
+
+	use super::{
+		FilterMode, compile_filter, compile_relay_filter, configure_relay_process, read_program,
+		relay_ready_pipe, wait_for_relay_ready, write_program,
+	};
+	use crate::{NetworkMode, SandboxSpec};
 
 	#[test]
 	fn strict_filter_serializes_as_a_larger_deny_program() {
@@ -626,5 +1028,133 @@ mod tests {
 					&& left.jf == right.jf
 					&& left.k == right.k)
 		);
+	}
+
+	#[test]
+	fn filters_deny_host_process_signals() {
+		let enabled = compile_filter(FilterMode::Enabled).expect("baseline filter");
+		for syscall in [
+			libc::SYS_kill,
+			libc::SYS_tkill,
+			libc::SYS_tgkill,
+			libc::SYS_rt_sigqueueinfo,
+			libc::SYS_rt_tgsigqueueinfo,
+			libc::SYS_pidfd_send_signal,
+		] {
+			assert!(
+				enabled
+					.iter()
+					.any(|instruction| instruction.k == syscall as u32),
+				"filter must guard syscall {syscall}",
+			);
+		}
+	}
+
+	#[test]
+	fn relay_filter_denies_process_access_exec_and_filesystem_opens() {
+		let filter = compile_relay_filter().expect("relay filter");
+		for syscall in [
+			libc::SYS_ptrace,
+			libc::SYS_process_vm_readv,
+			libc::SYS_process_vm_writev,
+			libc::SYS_execve,
+			libc::SYS_execveat,
+			libc::SYS_openat,
+			libc::SYS_openat2,
+			libc::SYS_unlinkat,
+			libc::SYS_renameat,
+			libc::SYS_kill,
+			libc::SYS_rt_sigqueueinfo,
+			libc::SYS_rt_tgsigqueueinfo,
+		] {
+			assert!(
+				filter
+					.iter()
+					.any(|instruction| instruction.k == syscall as u32),
+				"relay filter must guard syscall {syscall}",
+			);
+		}
+		assert!(
+			filter
+				.iter()
+				.any(|instruction| instruction.k == libc::SYS_socket as u32),
+			"relay filter must only create Unix sockets",
+		);
+	}
+
+	#[test]
+	fn relay_readiness_requires_an_explicit_success_byte() {
+		let (ready, mut child_ready) = relay_ready_pipe().expect("readiness pipe");
+		child_ready.write_all(&[1]).expect("ready byte");
+		wait_for_relay_ready(ready).expect("relay ready");
+
+		let (ready, child_ready) = relay_ready_pipe().expect("failure pipe");
+		drop(child_ready);
+		assert!(wait_for_relay_ready(ready).is_err());
+	}
+
+	#[test]
+	fn relay_process_is_non_dumpable_and_cannot_gain_privileges() {
+		// SAFETY: the child performs only process-local prctls and exits through
+		// `_exit`, preserving the concurrent test process.
+		match unsafe { libc::fork() } {
+			-1 => panic!("fork relay defense child"),
+			0 => {
+				let configured = configure_relay_process().is_ok();
+				// SAFETY: these documented prctl getters take no pointer arguments.
+				let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+				let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+				// SAFETY: exit without invoking post-fork Rust cleanup.
+				unsafe { libc::_exit(i32::from(!(configured && dumpable == 0 && no_new_privs == 1))) };
+			},
+			pid => {
+				let mut status = 0;
+				// SAFETY: `pid` is this test's direct child.
+				assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+				assert_eq!(status, 0, "relay defense child failed");
+			},
+		}
+	}
+
+	#[test]
+	fn socket_filters_preserve_private_unix_socketpairs() {
+		let strict = compile_filter(FilterMode::DisabledStrict).expect("strict filter");
+		let outbound = compile_filter(FilterMode::Outbound).expect("outbound filter");
+		let outbound_no_unix =
+			compile_filter(FilterMode::OutboundUnixRestricted).expect("outbound Unix filter");
+		assert!(
+			strict
+				.iter()
+				.any(|instruction| instruction.k == libc::SYS_socket as u32),
+			"strict filter must conditionally guard socket",
+		);
+		assert!(
+			strict
+				.iter()
+				.any(|instruction| instruction.k == libc::SYS_socketpair as u32),
+			"strict filter must conditionally guard socketpair",
+		);
+		assert!(
+			outbound_no_unix
+				.iter()
+				.any(|instruction| instruction.k == libc::SYS_socket as u32),
+			"outbound no-Unix filter must guard socket",
+		);
+		assert!(
+			outbound_no_unix
+				.iter()
+				.any(|instruction| instruction.k == libc::SYS_socketpair as u32),
+			"outbound no-Unix filter must guard socketpair",
+		);
+		assert!(
+			outbound_no_unix.len() > outbound.len(),
+			"outbound no-Unix filter must include AF_UNIX socket rules",
+		);
+
+		let mut no_unix = SandboxSpec::new("/bin/true");
+		no_unix.set_network(NetworkMode::Outbound);
+		assert!(matches!(FilterMode::for_spec(&no_unix), FilterMode::OutboundUnixRestricted));
+		no_unix.unix_sockets.push("/tmp/allowed.sock".into());
+		assert!(matches!(FilterMode::for_spec(&no_unix), FilterMode::Outbound));
 	}
 }

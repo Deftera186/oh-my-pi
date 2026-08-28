@@ -8,6 +8,7 @@ use std::{
 };
 
 use omp_core::Hash32;
+use omp_settings::SettingsCatalog;
 use omp_tool::Registry;
 use tokio::{
 	signal::ctrl_c,
@@ -137,12 +138,16 @@ async fn serve_pipe(
 }
 
 /// Assembles and runs the Windows project environment daemon.
-pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<(), EnvdError> {
+pub(crate) async fn run(
+	args: EnvdConfig,
+	catalog: SettingsCatalog,
+	bridges: RegistryBridges,
+) -> Result<(), EnvdError> {
 	use super::worker_config;
 	let workspace = WorkspaceHost::open(&args.root)?;
 	let root = workspace.root().to_path_buf();
 	let data_dir = omp_core::dirs::data_dir(None).map_err(io::Error::other)?;
-	let settings = host_settings::load(&data_dir, &root).map_err(io::Error::other)?;
+	let settings = host_settings::load(&data_dir, &root, catalog).map_err(io::Error::other)?;
 	let interrupt_grace = settings.runtime.interrupt_grace;
 	let state_dir = if let Some(path) = args.state_dir {
 		path
@@ -172,6 +177,7 @@ pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<()
 			Some(doc_connections),
 			require_document_ownership,
 			None,
+			catalog,
 			None,
 			bridges,
 		)

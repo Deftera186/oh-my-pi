@@ -3,9 +3,7 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use omp_core::{Duration, Str};
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use omp_tool::Effects;
 use omp_tools::edit::FormatPolicy;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -358,10 +356,6 @@ const fn field(
 	}
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<ToolSettings>()
-}
-
 mod optional_duration {
 
 	use super::*;
@@ -389,29 +383,25 @@ mod optional_duration {
 #[cfg(test)]
 mod tests {
 	use omp_core::sf;
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::SettingsSnapshot;
 	use omp_tool::{Effects, ExecEffects};
 
 	use super::*;
 	use crate::admission::{ApprovalPolicy, ApprovalSource, ApprovalTier};
 
 	#[test]
-	fn typed_projection_and_registration_share_one_domain() {
+	fn typed_projection_round_trips() {
 		let expected = ToolSettings {
 			approval_mode: ApprovalMode::Write,
 			approval: BTreeMap::from([(sf!("bash"), ApprovalPolicy::Deny)]),
 			..ToolSettings::default()
 		};
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated settings");
+		let snapshot = SettingsSnapshot::isolated(expected.clone(), crate::TEST_SETTINGS_CATALOG)
+			.expect("isolated settings");
 		let projected = snapshot
 			.project::<ToolSettings>()
 			.expect("typed projection");
 		assert_eq!(projected.get(), &expected);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == ToolSettings::DOMAIN)
-		);
 	}
 
 	#[test]

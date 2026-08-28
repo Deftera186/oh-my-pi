@@ -375,8 +375,12 @@ fn advisor_item(advice: PendingAdvice) -> Item {
 	text.push_str(advice.note.as_str());
 	Item {
 		kind: Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(part::Kind::Text(text)) }],
+			role:            thread::Role::System as i32,
+			parts:           vec![thread::Part { kind: Some(part::Kind::Text(text)) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		..Item::default()
 	}

@@ -519,7 +519,9 @@ async fn dispatch(
 		Request::GetLspBindings(request) => get_lsp_bindings(session, request, cancellation)
 			.await
 			.map(Response::LspBindings),
-		Request::LspStatus(request) => Ok(Response::LspStatus(lsp_status(session, request.reload))),
+		Request::LspStatus(request) => Ok(Response::LspStatus(
+			lsp_status(session, request.reload, request.start, &cancellation).await,
+		)),
 		Request::LspRequest(request) => lsp_request(session, request, cancellation)
 			.await
 			.map(Response::LspResponse),
@@ -1592,36 +1594,47 @@ async fn get_lsp_bindings(
 	};
 	Ok(proto::GetLspBindingsResponse { bindings: bindings.iter().map(binding_to_proto).collect() })
 }
-fn lsp_status(session: &EnvironmentSession, reload: bool) -> proto::LspStatusResponse {
-	let servers = session
-		.environment()
-		.lsp_supervisor()
-		.map(|supervisor| {
-			if reload && let Err(error) = supervisor.reload() {
-				tracing::warn!(%error, "LSP roster reload failed; answering with prior roster");
-			}
-			supervisor
-				.status()
-				.into_iter()
-				.map(|server| proto::LspServerStatus {
-					name:       server.name.to_string(),
-					stage:      match server.state {
-						LspServerState::Available => proto::LspServerStage::Available,
-						LspServerState::Starting => proto::LspServerStage::Starting,
-						LspServerState::Indexing => proto::LspServerStage::Indexing,
-						LspServerState::Ready => proto::LspServerStage::Ready,
-						LspServerState::Failed => proto::LspServerStage::Failed,
-					} as i32,
-					file_types: server.file_types.iter().map(ToString::to_string).collect(),
-					detail:     server
-						.detail
-						.map(|detail| detail.to_string())
-						.unwrap_or_default(),
-					source:     server.source.to_owned(),
-				})
-				.collect()
+async fn lsp_status(
+	session: &EnvironmentSession,
+	reload: bool,
+	start: bool,
+	cancellation: &CancellationToken,
+) -> proto::LspStatusResponse {
+	let Some(supervisor) = session.environment().lsp_supervisor() else {
+		return proto::LspStatusResponse { servers: Vec::new() };
+	};
+	if reload && let Err(error) = supervisor.reload() {
+		tracing::warn!(%error, "LSP roster reload failed; answering with prior roster");
+	}
+	if start {
+		supervisor.warm_all();
+		supervisor.wait_idle(cancellation).await;
+	}
+	let registry = session.environment().lsp();
+	let servers = supervisor
+		.status()
+		.into_iter()
+		.map(|server| proto::LspServerStatus {
+			server_id:  registry
+				.binding_id(server.name.as_str())
+				.map(binding_id_bytes)
+				.unwrap_or_default(),
+			name:       server.name.to_string(),
+			stage:      match server.state {
+				LspServerState::Available => proto::LspServerStage::Available,
+				LspServerState::Starting => proto::LspServerStage::Starting,
+				LspServerState::Indexing => proto::LspServerStage::Indexing,
+				LspServerState::Ready => proto::LspServerStage::Ready,
+				LspServerState::Failed => proto::LspServerStage::Failed,
+			} as i32,
+			file_types: server.file_types.iter().map(ToString::to_string).collect(),
+			detail:     server
+				.detail
+				.map(|detail| detail.to_string())
+				.unwrap_or_default(),
+			source:     server.source.to_owned(),
 		})
-		.unwrap_or_default();
+		.collect();
 	proto::LspStatusResponse { servers }
 }
 

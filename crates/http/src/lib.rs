@@ -64,6 +64,14 @@ pub fn client_builder() -> ClientBuilder {
 	LazyLock::force(&TLS_PROVIDER_READY);
 	ReqwestClient::builder()
 }
+/// Installs the process-wide rustls Ring crypto provider.
+///
+/// Idempotent. Hosts call it once at process bootstrap so TLS clients built
+/// outside this crate (telemetry exporters, vendored SDKs) never construct
+/// before a provider exists.
+pub fn install_tls_provider() {
+	LazyLock::force(&TLS_PROVIDER_READY);
+}
 
 #[tracing::instrument(
 	level = "debug",

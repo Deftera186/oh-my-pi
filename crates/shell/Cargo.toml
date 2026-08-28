@@ -12,10 +12,10 @@ description = "Batteries-included shell facade combining the execution engine an
 workspace = true
 
 [dependencies]
-omp-shell-builtins = { workspace = true }
-omp-shell-engine = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+omp-shell-builtins.workspace = true
+omp-shell-engine.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile.workspace = true

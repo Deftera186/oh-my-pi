@@ -14,6 +14,7 @@ use http::{
 use omp_core::{ExposeSecret as _, SecretString, Str, parse_rfc3339, sf};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use smallvec::SmallVec;
 use tokio::time;
 use zeroize::Zeroizing;
 
@@ -41,12 +42,55 @@ const FETCH_AVAILABLE_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
 const DAY: Duration = Duration::from_days(1);
 const WEEK: Duration = Duration::from_days(7);
 
+/// Maps one Antigravity model identity to its independent backend quota
+/// counter.
+///
+/// The mapping is catalog-authored so newly discovered model families use the
+/// same counter policy as credential ranking and status presentation.
+pub fn antigravity_counter_for_model(model_id: &str) -> Option<&'static str> {
+	let direct = omp_catalog::quota_display_tier(PROVIDER, model_id);
+	if direct.is_some() || !model_id.bytes().any(|byte| byte.is_ascii_uppercase()) {
+		return direct;
+	}
+	let normalized = model_id.to_ascii_lowercase();
+	omp_catalog::quota_display_tier(PROVIDER, &normalized)
+}
+
+/// Selects quota windows for the active Antigravity model family.
+///
+/// Legacy `default` counters are used only when the mapped backend counter has
+/// no limits. An absent or unmodelled identity returns no windows, preventing a
+/// family-specific exhaustion observation from becoming a provider-wide block.
+pub fn scope_antigravity_windows_for_model<'a>(
+	windows: &'a [UsageWindow],
+	model_id: Option<&str>,
+) -> SmallVec<&'a UsageWindow, 4> {
+	let Some(counter) = model_id.and_then(antigravity_counter_for_model) else {
+		return SmallVec::new();
+	};
+	let has_counter = windows
+		.iter()
+		.any(|window| antigravity_window_counter(window.id.as_str()) == Some(counter));
+	let selected = if has_counter { counter } else { "default" };
+	windows
+		.iter()
+		.filter(|window| antigravity_window_counter(window.id.as_str()) == Some(selected))
+		.collect()
+}
+
+fn antigravity_window_counter(id: &str) -> Option<&str> {
+	id.strip_prefix("google-antigravity:")?
+		.split_once(':')
+		.map(|(counter, _)| counter)
+}
+
 /// Application-registered Google Antigravity usage fetcher.
 #[derive(Clone)]
 pub struct GoogleAntigravityUsageFetcher {
 	provider: ProviderId,
 	http:     Arc<dyn OAuthHttpClient>,
 }
+
 impl GoogleAntigravityUsageFetcher {
 	/// Constructs an Antigravity usage fetcher.
 	pub fn new(http: Arc<dyn OAuthHttpClient>) -> Self {
@@ -482,10 +526,13 @@ mod tests {
 
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::{HeaderMap, Method};
-	use omp_core::{ExposeSecret as _, SecretString};
+	use omp_core::{ExposeSecret as _, SecretString, sf};
 	use parking_lot::Mutex;
 
-	use super::fetch_google_antigravity_usage;
+	use super::{
+		antigravity_counter_for_model, fetch_google_antigravity_usage,
+		scope_antigravity_windows_for_model,
+	};
 	use crate::auth::{OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse, OAuthTransportError};
 	#[derive(Clone)]
 	struct Req {
@@ -534,6 +581,18 @@ mod tests {
 	}
 	#[tokio::test]
 	async fn merges_counters_tiers_and_windows_with_lowest_headroom() {
+		let mappings = [
+			("gpt-oss-120b", Some("openai")),
+			("openai/gpt-oss-120b", Some("openai")),
+			("tab_flash_lite_preview", Some("google")),
+			("tab_jump_flash_lite_preview", Some("google")),
+			("unmodelled", None),
+		];
+		for (model, expected) in mappings {
+			let actual = antigravity_counter_for_model(model);
+			assert_eq!(actual, expected, "model={model}, actual={actual:?}");
+		}
+
 		let http = Http::new([(
 			200,
 			r#"{"models":{"gemini-a":{"modelProvider":"MODEL_PROVIDER_GOOGLE","quotaInfo":{"remainingFraction":0.8,"resetTime":"2026-08-15T00:00:00Z","tier":"Default","windowId":"WINDOW_DAILY"}},"gemini-b":{"apiProvider":"API_PROVIDER_GOOGLE_GEMINI","quotaInfo":{"remainingFraction":0.2,"tier":"default","windowId":"WINDOW_DAILY"},"weeklyQuotaInfo":{"remainingFraction":0.7,"windowId":"WINDOW_7_DAY","tier":"DEFAULT"}},"claude":{"modelProvider":"MODEL_PROVIDER_ANTHROPIC","quotaInfo":{"resetTime":"2026-08-15T00:00:00Z","tier":"default","windowId":"WINDOW_DAILY"}}}}"#,
@@ -543,6 +602,38 @@ mod tests {
 			.await
 			.expect("report");
 		assert_eq!(report.windows.len(), 3);
+		let claude = scope_antigravity_windows_for_model(&report.windows, Some("claude-opus-4-6"));
+		let claude_ids = claude
+			.iter()
+			.map(|window| window.id.as_str())
+			.collect::<Vec<_>>();
+		assert_eq!(
+			claude_ids,
+			["google-antigravity:anthropic:default:daily"],
+			"scoped claude windows={claude_ids:?}"
+		);
+		let mut legacy = report.windows[0].clone();
+		legacy.id = sf!("google-antigravity:default:default:daily");
+		let legacy = [legacy];
+		let fallback = scope_antigravity_windows_for_model(&legacy, Some("claude-opus-4-6"));
+		assert_eq!(
+			fallback.len(),
+			1,
+			"legacy fallback windows={:?}",
+			fallback
+				.iter()
+				.map(|window| window.id.as_str())
+				.collect::<Vec<_>>()
+		);
+		let unmodelled = scope_antigravity_windows_for_model(&report.windows, Some("unknown"));
+		assert!(
+			unmodelled.is_empty(),
+			"unmodelled lookup selected={:?}",
+			unmodelled
+				.iter()
+				.map(|window| window.id.as_str())
+				.collect::<Vec<_>>()
+		);
 		assert_eq!(report.windows[0].id.as_str(), "google-antigravity:anthropic:default:daily");
 		assert_eq!(report.windows[0].status, Some(crate::answer::UsageStatus::Exhausted));
 		assert!(

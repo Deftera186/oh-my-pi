@@ -4,12 +4,13 @@ use std::{cell::RefCell, future::Future, rc::Rc, time::Duration};
 
 use omp_chat_ui::host::{HostExit, HostOutcome, RetainedChat, RetainedChatEffect};
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
-use omp_tui::{Key, MouseReport, Size, UiContext};
+use omp_tui::{Key, Keymap, MouseReport, Size, UiContext};
 
 use crate::editor::{EditorOptions, edit_draft_detached};
 
 /// Runs one production chat scene in a single native GPU window.
 pub(crate) fn run<F>(
+	keymap: Keymap,
 	build: impl FnOnce(&UiContext) -> RetainedChat,
 	bridge: F,
 ) -> (HostOutcome, miette::Result<()>)
@@ -22,7 +23,7 @@ where
 	let bridge_task = tokio::spawn(async move {
 		let _ = result_tx.send(bridge.await);
 	});
-	omp_gui::run(HostConfig { multiplex: false, ..HostConfig::default() }, {
+	omp_gui::run(HostConfig { keymap, multiplex: false, ..HostConfig::default() }, {
 		let build = Rc::clone(&build);
 		let outcome = Rc::clone(&outcome);
 		move |ctx| {

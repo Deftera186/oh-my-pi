@@ -603,7 +603,8 @@ impl HeadlessSession {
 		settings_paths
 			.overlays
 			.extend(options.settings_overlays.iter().cloned());
-		let settings_manager = SettingsManager::open(settings_paths).map_err(composition)?;
+		let settings_manager =
+			SettingsManager::open(settings_paths, crate::SETTINGS_CATALOG).map_err(composition)?;
 		if let Some(approval_mode) = options.approval_mode {
 			settings_manager
 				.set_sync(MutationScope::Runtime, "tools.approval_mode", &approval_mode.to_string())
@@ -1465,39 +1466,59 @@ impl HeadlessSession {
 		executor: Arc<dyn omp_tool::HostToolExecutor>,
 	) -> Result<(), HeadlessError> {
 		let registry = self._environment.registry();
+		let host_names = specs
+			.iter()
+			.map(|spec| spec.name.clone())
+			.collect::<Vec<_>>();
 		registry
 			.replace_host_tools(claimant, roster_revision, specs, executor)
 			.map_err(composition)?;
+		// The session's tool selection is already frozen (policy filters and
+		// hidden inclusions applied at composition); a host roster swap only
+		// re-lowers that selection plus the policy-filtered incoming names.
+		// Names dropped by the replacement are omitted by selected
+		// advertisement.
 		let advertised = if chat::model_rejects_tools(
 			self._catalog.as_ref(),
 			self.state.snapshot().turn.params.model.as_str(),
 		) {
 			Vec::new()
 		} else {
+			let mut selected = self
+				.state
+				.snapshot()
+				.enabled_tools
+				.iter()
+				.cloned()
+				.collect::<Vec<_>>();
+			for name in host_names {
+				let allowed = (self._lsp_enabled || name != "lsp")
+					&& match &self._tool_policy {
+						HeadlessToolPolicy::All => true,
+						HeadlessToolPolicy::None => false,
+						HeadlessToolPolicy::Only(allowed) => allowed.contains(&name),
+					};
+				if allowed && !selected.contains(&name) {
+					selected.push(name);
+				}
+			}
 			registry
-				.advertise(omp_tool::LoweringCaps {
-					strict_schema:  true,
-					grammar:        omp_catalog::GrammarBits::ALL,
-					maximum_tools:  None,
-					maximum_strict: None,
-				})
+				.advertise_selected(
+					omp_tool::LoweringCaps {
+						strict_schema:  true,
+						grammar:        omp_catalog::GrammarBits::ALL,
+						maximum_tools:  None,
+						maximum_strict: None,
+					},
+					&selected,
+				)
 				.map_err(composition)?
 		};
 		let mut names = Vec::new();
 		let mut tools = Vec::new();
 		for tool in advertised {
-			let name = &tool.identity.name;
-			let selected = self._lsp_enabled || name != "lsp";
-			let selected = selected
-				&& match &self._tool_policy {
-					HeadlessToolPolicy::All => true,
-					HeadlessToolPolicy::None => false,
-					HeadlessToolPolicy::Only(allowed) => allowed.contains(name),
-				};
-			if selected {
-				names.push(name.clone());
-				tools.push(chat::protocol_tool_definition(tool.definition).map_err(composition)?);
-			}
+			names.push(tool.identity.name.clone());
+			tools.push(chat::protocol_tool_definition(tool.definition).map_err(composition)?);
 		}
 		self.state.update(|snapshot| {
 			snapshot.registry = Arc::clone(&registry);

@@ -29,6 +29,8 @@ const SIDEBAR_MAX_WIDTH: u16 = 26;
 pub enum ModelHubEvent {
 	/// Input was consumed and the hub remains open.
 	Consumed,
+	/// Force-refresh provider model discovery.
+	RefreshModels,
 	/// Close the hub.
 	Close,
 	/// Persist one role assignment.
@@ -165,27 +167,32 @@ enum Strip {
 
 /// Retained fullscreen models hub overlay.
 pub struct ModelHub {
-	ui:          Ui,
-	ctx:         UiContext,
-	options:     OverlayOptions,
-	data:        ModelHubData,
-	entries:     Vec<Entry>,
-	active:      usize,
-	focus:       Focus,
-	query:       Str,
-	roles_view:  Vec<RolesRow>,
-	role_index:  usize,
-	role_start:  usize,
-	assigning:   Option<Assign>,
-	strip:       Option<Strip>,
+	ui:                Ui,
+	ctx:               UiContext,
+	options:           OverlayOptions,
+	data:              ModelHubData,
+	entries:           Vec<Entry>,
+	active:            usize,
+	focus:             Focus,
+	query:             Str,
+	roles_view:        Vec<RolesRow>,
+	role_index:        usize,
+	role_start:        usize,
+	assigning:         Option<Assign>,
+	strip:             Option<Strip>,
+	refreshing_models: bool,
 	/// Roles-view row to land on after the next data refresh.
-	pending_row: Option<(Str, Option<Str>)>,
-	body_rows:   u16,
-	width:       u16,
+	pending_row:       Option<(Str, Option<Str>)>,
+	body_rows:         u16,
+	width:             u16,
 }
 
 impl ModelHub {
 	/// Opens the hub over one backend-projected snapshot.
+	///
+	/// The backend starts one live catalog refresh for the open intent and
+	/// delivers the resulting snapshot through [`Self::update`]; the retained
+	/// overlay does not issue provider probes itself.
 	pub fn open(data: ModelHubData, ctx: &UiContext) -> Self {
 		let mut hub = Self {
 			ui: Ui::from_root(dom! { <text/> }, 1, ctx.clone()),
@@ -204,6 +211,7 @@ impl ModelHub {
 			role_start: 0,
 			assigning: None,
 			strip: None,
+			refreshing_models: false,
 			pending_row: None,
 			body_rows: 18,
 			width: 100,
@@ -225,6 +233,7 @@ impl ModelHub {
 			.get(self.active)
 			.map(|entry| entry.key(&self.data.locked));
 		self.data = data;
+		self.refreshing_models = false;
 		self.sync_derived();
 		self.active = active_key
 			.and_then(|key| {
@@ -269,6 +278,11 @@ impl ModelHub {
 
 	/// Routes one key; unhandled keys reach the embedded model browser.
 	pub fn handle_key(&mut self, key: Key) -> ModelHubEvent {
+		if key == Key::Function(5) {
+			self.refreshing_models = true;
+			self.rebuild();
+			return ModelHubEvent::RefreshModels;
+		}
 		if self.strip.is_some() {
 			return self.handle_strip_key(key);
 		}
@@ -1610,6 +1624,9 @@ fn sidebar_lines(hub: &ModelHub, width: u16, searching: bool) -> Vec<SidebarLine
 }
 
 fn status_line(hub: &ModelHub) -> Str {
+	if hub.refreshing_models {
+		return Str::new_static(" Refreshing provider models…");
+	}
 	if let Some(assign) = &hub.assigning {
 		return match assign {
 			Assign::Role(role) => sf!(" Assigning {role} — Enter assigns, Esc cancels"),
@@ -1855,48 +1872,52 @@ fn locked_lines(hub: &ModelHub, index: usize) -> Vec<(Str, Str)> {
 fn footer_hint(hub: &ModelHub) -> Str {
 	if let Some(strip) = &hub.strip {
 		return match strip {
-			Strip::RoleName { .. } => Str::new_static("Enter create + pick model · Esc cancel"),
+			Strip::RoleName { .. } => {
+				Str::new_static("Enter create + pick model · F5 refresh · Esc cancel")
+			},
 			Strip::Chips { kind: StripKind::Role | StripKind::FallbackKey, .. } => {
-				Str::new_static("←/→ choose · Enter assign/clear · Esc cancel")
+				Str::new_static("←/→ choose · Enter assign/clear · F5 refresh · Esc cancel")
 			},
 			Strip::Chips { kind: StripKind::Scope, .. } => {
-				Str::new_static("←/→ save scope · Enter choose · Esc cancel")
+				Str::new_static("←/→ save scope · Enter choose · F5 refresh · Esc cancel")
 			},
 			Strip::Chips { kind: StripKind::Thinking, .. } => {
-				Str::new_static("←/→ thinking level · Enter apply · Esc keep")
+				Str::new_static("←/→ thinking level · Enter apply · F5 refresh · Esc keep")
 			},
 		};
 	}
 	if let Some(assign) = &hub.assigning {
 		return match assign {
-			Assign::Fallback { .. } => {
-				Str::new_static("Enter pick fallback · ↑/↓ providers · type to search · Esc cancel")
-			},
-			Assign::FallbackKey => Str::new_static(
-				"Enter pick the protected model · ↑/↓ providers · type to search · Esc cancel",
+			Assign::Fallback { .. } => Str::new_static(
+				"Enter pick fallback · ↑/↓ providers · type to search · F5 refresh · Esc cancel",
 			),
-			Assign::Role(_) => {
-				Str::new_static("Enter assign · ↑/↓ providers · type to search · Esc cancel")
-			},
+			Assign::FallbackKey => Str::new_static(
+				"Enter pick the protected model · ↑/↓ providers · type to search · F5 refresh · Esc \
+				 cancel",
+			),
+			Assign::Role(_) => Str::new_static(
+				"Enter assign · ↑/↓ providers · type to search · F5 refresh · Esc cancel",
+			),
 		};
 	}
 	match hub.active_entry() {
 		Entry::Roles if hub.focus == Focus::Scope => {
-			Str::new_static("↑/↓ providers · → roles · Esc close")
+			Str::new_static("↑/↓ providers · → roles · F5 refresh · Esc close")
 		},
 		Entry::Roles => match hub.roles_view.get(hub.role_index) {
 			Some(RolesRow::Fallback { .. }) => Str::new_static(
-				"↑/↓ rows · Enter replace · f add another · x remove · [/] reorder · ← providers",
+				"↑/↓ rows · Enter replace · f add another · x remove · [/] reorder · F5 refresh · ← \
+				 providers",
 			),
-			Some(RolesRow::ChainKey(_)) => {
-				Str::new_static("↑/↓ rows · Enter/f add fallback · x clear chain · ← providers")
-			},
-			Some(RolesRow::NewFallback) => {
-				Str::new_static("↑/↓ rows · Enter new model/provider fallback chain · ← providers")
-			},
+			Some(RolesRow::ChainKey(_)) => Str::new_static(
+				"↑/↓ rows · Enter/f add fallback · x clear chain · F5 refresh · ← providers",
+			),
+			Some(RolesRow::NewFallback) => Str::new_static(
+				"↑/↓ rows · Enter new model/provider fallback chain · F5 refresh · ← providers",
+			),
 			_ => Str::new_static(
 				"↑/↓ rows · Enter pick · f fallback · x clear · t thinking · c cycle · [/] reorder · \
-				 n new",
+				 n new · F5 refresh",
 			),
 		},
 		Entry::Locked(index) => {
@@ -1906,16 +1927,16 @@ fn footer_hint(hub: &ModelHub) -> Str {
 				.get(*index)
 				.is_some_and(|provider| provider.oauth)
 			{
-				Str::new_static("Enter log in · ↑/↓ providers · Esc close")
+				Str::new_static("Enter log in · ↑/↓ providers · F5 refresh · Esc close")
 			} else {
-				Str::new_static("↑/↓ providers · Esc close")
+				Str::new_static("↑/↓ providers · F5 refresh · Esc close")
 			}
 		},
 		_ if hub.focus == Focus::Scope => Str::new_static(
-			"Enter assign roles · ↑/↓ providers · → models · type to search · Esc close",
+			"Enter assign roles · ↑/↓ providers · → models · type to search · F5 refresh · Esc close",
 		),
 		_ => Str::new_static(
-			"Enter assign roles · ↑/↓ models · ← providers · type to search · Esc close",
+			"Enter assign roles · ↑/↓ models · ← providers · type to search · F5 refresh · Esc close",
 		),
 	}
 }
@@ -2159,8 +2180,10 @@ mod tests {
 		hub.focus = Focus::List;
 		hub.handle_key(Key::Enter);
 		let _ = hub.activate_item(1);
+		assert_eq!(hub.handle_key(Key::Function(5)), ModelHubEvent::RefreshModels);
 		let rows = frame_rows(&mut hub, Size::new(110, 30));
 		let all = rows.join("\n");
+		assert!(all.contains("Refreshing provider models…"), "refresh status renders:\n{all}");
 		assert!(all.contains("[inherit]"), "selected thinking chip renders bracketed:\n{all}");
 		assert!(all.contains("high"), "supported efforts render as chips:\n{all}");
 	}

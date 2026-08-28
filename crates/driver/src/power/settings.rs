@@ -3,8 +3,7 @@
 use std::{env, path::Path};
 
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
 	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
 };
 use serde::{Deserialize, Serialize};
@@ -59,15 +58,14 @@ impl SettingsDomain for PowerSettings {
 	}];
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<PowerSettings>()
-}
-
 /// Loads the current power projection through the application settings
 /// authority.
 pub fn current(data_dir: &Path) -> Result<PowerSettings, SettingsManagerError> {
 	let project = env::current_dir().ok();
-	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, project.as_deref()))?;
+	let manager = SettingsManager::open(
+		SettingsPaths::discover(data_dir, project.as_deref()),
+		crate::SETTINGS_CATALOG,
+	)?;
 	let projection = manager
 		.snapshot()
 		.project::<PowerSettings>()
@@ -77,26 +75,25 @@ pub fn current(data_dir: &Path) -> Result<PowerSettings, SettingsManagerError> {
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
 
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
+
 	#[test]
-	fn power_projection_round_trips_and_is_registered() {
+	fn power_projection_round_trips() {
 		assert_eq!(PowerSettings::default().sleep_prevention, SleepPrevention::Idle);
 		let expected = PowerSettings { sleep_prevention: SleepPrevention::Display };
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated snapshot");
+		let snapshot =
+			SettingsSnapshot::isolated(expected.clone(), CATALOG).expect("isolated snapshot");
 		assert_eq!(
 			snapshot
 				.project::<PowerSettings>()
 				.expect("projection")
 				.get(),
 			&expected
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == PowerSettings::DOMAIN)
 		);
 	}
 }

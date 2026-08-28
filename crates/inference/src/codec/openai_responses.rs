@@ -24,8 +24,10 @@ use crate::{
 		ImageRequest, MediaInput, OpaqueJson, OperationCall, Setting, ToolInputConstraint,
 	},
 	catalog::{
-		OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
-		policy::{ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport},
+		ModalityBits, OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
+		policy::{
+			ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport, ImageEncodingFormat,
+		},
 	},
 	error::{Error, ErrorKind, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
@@ -287,12 +289,38 @@ pub struct ResponsesComputerScreenshot {
 	pub image_url: Str,
 }
 
-/// Function/custom text output or typed computer screenshot output.
+/// One typed multimodal function/custom-tool output part.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesToolOutputPart {
+	/// Text returned by the tool.
+	InputText {
+		/// Tool-result text.
+		text: Str,
+	},
+	/// Image returned by the tool.
+	InputImage {
+		/// Requested image fidelity.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		detail:    Option<ResponsesImageDetail>,
+		/// Inline data URI or replayable remote URL.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		image_url: Option<Str>,
+		/// Provider-owned image identity.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		file_id:   Option<Str>,
+	},
+}
+
+/// Function/custom output or typed computer screenshot output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponsesToolOutput {
-	/// Textual tool output.
+	/// Textual tool output. Text-only results deliberately retain this compact
+	/// wire shape.
 	Text(Str),
+	/// Ordered text and image tool output.
+	Multimodal(Vec<ResponsesToolOutputPart>),
 	/// Computer screenshot output.
 	Computer(ResponsesComputerScreenshot),
 }
@@ -764,6 +792,12 @@ pub enum ResponsesEncodeError {
 	MissingCallIdentity,
 	/// Stored media was not resolved before wire encoding.
 	UnresolvedStoredMedia,
+	/// A provider image file reference cannot be replayed without bytes or a
+	/// URL.
+	UnreplayableImageFileReference {
+		/// Provider file identity that could not be replayed.
+		file_id: Str,
+	},
 	/// A required output format is unsupported by Responses.
 	UnsupportedOutputFormat,
 	/// Route policy explicitly rejects native computer use.
@@ -2343,12 +2377,14 @@ impl OpenAiResponsesCodec {
 	) -> Result<EncodedResponses, ResponsesEncodeError> {
 		use crate::call::{
 			CacheRetention, ContentPart, HostedTool, ReasoningVisibility, Role, Setting,
-			StructuredOutput, TextVerbosity, ToolChoice, ToolResultContent,
+			StructuredOutput, TextVerbosity, ToolChoice,
 		};
 
 		let target = context
 			.target
 			.ok_or(ResponsesEncodeError::MissingWireTarget)?;
+		let supports_images = supports_tool_result_images(context);
+		let supports_detail_original = context.policy.image.supports_detail_original == Some(true);
 		let mut adjustments = Vec::new();
 		let mut input = Vec::new();
 		let mut instructions = Vec::new();
@@ -2604,22 +2640,8 @@ impl OpenAiResponsesCodec {
 						if !content.is_empty() {
 							input.push(ResponsesInputItem::message(role, mem::take(&mut content)));
 						}
-						let mut output = String::new();
-						for (position, part) in result.iter().enumerate() {
-							if position != 0 {
-								output.push('\n');
-							}
-							match part {
-								ToolResultContent::Text(text) => output.push_str(text),
-								ToolResultContent::Json(value) => output.push_str(
-									&serde_json::to_string(value.as_value())
-										.map_err(|_| ResponsesEncodeError::MissingCallIdentity)?,
-								),
-								ToolResultContent::Image(_) | ToolResultContent::Document(_) => {
-									return Err(ResponsesEncodeError::UnsupportedOutputFormat);
-								},
-							}
-						}
+						let output =
+							encode_tool_result_output(result, supports_images, supports_detail_original)?;
 						input.push(ResponsesInputItem {
 							kind: Some(ResponsesInputItemKind::FunctionCallOutput),
 							id: None,
@@ -2629,7 +2651,7 @@ impl OpenAiResponsesCodec {
 							call_id: Some(Str::new(call.as_str())),
 							arguments: None,
 							input: None,
-							output: Some(ResponsesToolOutput::Text(output.into())),
+							output: Some(output),
 							summary: Vec::new(),
 							encrypted_content: None,
 							actions: Vec::new(),
@@ -2662,7 +2684,23 @@ impl OpenAiResponsesCodec {
 				input.push(ResponsesInputItem::message(role, content));
 			}
 		}
-		input.extend(self.options.native_input.iter().cloned());
+		for item in &self.options.native_input {
+			let mut item = item.clone();
+			if matches!(
+				item.kind,
+				Some(
+					ResponsesInputItemKind::FunctionCallOutput
+						| ResponsesInputItemKind::CustomToolCallOutput
+				)
+			) {
+				normalize_replayed_tool_output(
+					&mut item.output,
+					supports_images,
+					supports_detail_original,
+				)?;
+			}
+			input.push(item);
+		}
 		hoist_interleaved_tool_batch_messages(&mut input);
 		let instructions = if instructions.is_empty() {
 			None
@@ -3157,6 +3195,169 @@ fn parse_reasoning_effort(value: &str) -> Option<ResponsesReasoningEffort> {
 		"xhigh" => Some(ResponsesReasoningEffort::Xhigh),
 		_ => None,
 	}
+}
+
+fn supports_tool_result_images(context: &EncodeContext<'_>) -> bool {
+	context.policy_model.map_or_else(
+		|| !matches!(context.policy.image.encoding, Some(ImageEncodingFormat::None)),
+		|model| {
+			model
+				.capabilities
+				.chat
+				.as_ref()
+				.and_then(|chat| chat.input_modalities.constraints())
+				.is_some_and(|modalities| modalities.contains(ModalityBits::IMAGE))
+		},
+	)
+}
+
+fn encode_tool_result_output(
+	content: &[crate::call::ToolResultContent],
+	supports_images: bool,
+	supports_detail_original: bool,
+) -> Result<ResponsesToolOutput, ResponsesEncodeError> {
+	use crate::call::ToolResultContent;
+
+	let has_images = content
+		.iter()
+		.any(|part| matches!(part, ToolResultContent::Image(_)));
+	if !has_images || !supports_images {
+		let mut output = String::new();
+		let mut omitted_image = false;
+		let mut first_text = true;
+		for part in content {
+			match part {
+				ToolResultContent::Text(text) => {
+					if !first_text {
+						output.push('\n');
+					}
+					first_text = false;
+					output.push_str(text);
+				},
+				ToolResultContent::Json(value) => {
+					if !first_text {
+						output.push('\n');
+					}
+					first_text = false;
+					output.push_str(
+						&serde_json::to_string(value.as_value())
+							.map_err(|_| ResponsesEncodeError::MissingCallIdentity)?,
+					);
+				},
+				ToolResultContent::Image(_) => omitted_image = true,
+				ToolResultContent::Document(_) => {
+					return Err(ResponsesEncodeError::UnsupportedOutputFormat);
+				},
+			}
+		}
+		if omitted_image {
+			if !output.is_empty() {
+				output.push('\n');
+			}
+			output.push_str("[image omitted: model does not support vision]");
+		}
+		return Ok(ResponsesToolOutput::Text(output.into()));
+	}
+
+	let mut output = Vec::with_capacity(content.len());
+	for part in content {
+		match part {
+			ToolResultContent::Text(text) => {
+				output.push(ResponsesToolOutputPart::InputText { text: text.clone() });
+			},
+			ToolResultContent::Json(value) => {
+				let text = serde_json::to_string(value.as_value())
+					.map_err(|_| ResponsesEncodeError::MissingCallIdentity)?;
+				output.push(ResponsesToolOutputPart::InputText { text: text.into() });
+			},
+			ToolResultContent::Image(media) => {
+				let encoded = encode_media_content(media, true)?;
+				output.push(ResponsesToolOutputPart::InputImage {
+					detail:    Some(clamp_image_detail(
+						ResponsesImageDetail::Auto,
+						supports_detail_original,
+					)),
+					image_url: encoded.image_url,
+					file_id:   encoded.file_id,
+				});
+			},
+			ToolResultContent::Document(_) => {
+				return Err(ResponsesEncodeError::UnsupportedOutputFormat);
+			},
+		}
+	}
+	Ok(ResponsesToolOutput::Multimodal(output))
+}
+
+const fn clamp_image_detail(
+	detail: ResponsesImageDetail,
+	supports_detail_original: bool,
+) -> ResponsesImageDetail {
+	if matches!(detail, ResponsesImageDetail::Original) && !supports_detail_original {
+		ResponsesImageDetail::Auto
+	} else {
+		detail
+	}
+}
+
+fn normalize_replayed_tool_output(
+	output: &mut Option<ResponsesToolOutput>,
+	supports_images: bool,
+	supports_detail_original: bool,
+) -> Result<(), ResponsesEncodeError> {
+	if output.is_none() {
+		*output = Some(ResponsesToolOutput::Text(Str::empty()));
+		return Ok(());
+	}
+	let Some(ResponsesToolOutput::Multimodal(parts)) = output else {
+		return Ok(());
+	};
+	let mut has_images = false;
+	for part in parts.iter_mut() {
+		let ResponsesToolOutputPart::InputImage { detail, image_url, file_id } = part else {
+			continue;
+		};
+		has_images = true;
+		if let Some(value) = detail {
+			*value = clamp_image_detail(*value, supports_detail_original);
+		}
+		let has_url = image_url.as_ref().is_some_and(|url| !url.trim().is_empty());
+		if !has_url {
+			if let Some(file_id) = file_id
+				.as_ref()
+				.filter(|file_id| !file_id.trim().is_empty())
+			{
+				return Err(ResponsesEncodeError::UnreplayableImageFileReference {
+					file_id: file_id.clone(),
+				});
+			}
+		}
+	}
+	if !has_images || !supports_images {
+		let mut text = String::new();
+		let mut first = true;
+		let mut omitted_image = false;
+		for part in mem::take(parts) {
+			match part {
+				ResponsesToolOutputPart::InputText { text: part } => {
+					if !first {
+						text.push('\n');
+					}
+					first = false;
+					text.push_str(&part);
+				},
+				ResponsesToolOutputPart::InputImage { .. } => omitted_image = true,
+			}
+		}
+		if omitted_image {
+			if !text.is_empty() {
+				text.push('\n');
+			}
+			text.push_str("[image omitted: model does not support vision]");
+		}
+		*output = Some(ResponsesToolOutput::Text(text.into()));
+	}
+	Ok(())
 }
 
 fn encode_media_content(
@@ -3699,6 +3900,9 @@ impl Codec for OpenAiResponsesCodec {
 				ResponsesEncodeError::UnresolvedStoredMedia => {
 					encoding_error("unresolved_responses_media")
 				},
+				ResponsesEncodeError::UnreplayableImageFileReference { .. } => {
+					encoding_error("unreplayable_responses_image_file_reference")
+				},
 				ResponsesEncodeError::UnreplayableProviderProof => {
 					encoding_error("unreplayable_responses_provider_proof")
 				},
@@ -3773,20 +3977,21 @@ mod tests {
 
 	use super::{
 		EncodedResponses, HostedImageDecoder, OpenAiResponsesCodec, OpenAiResponsesDecoder,
-		ResponsesContinuationFailure, ResponsesDecoderAdapter, ResponsesErrorEvidence,
-		ResponsesInputItem, ResponsesInputItemKind, ResponsesProjection, ResponsesProviderProof,
-		ResponsesRole, classify_continuation_error, encode_provider_proof,
-		hoist_interleaved_tool_batch_messages,
+		OpenAiResponsesOptions, ResponsesContinuationFailure, ResponsesDecoderAdapter,
+		ResponsesEncodeError, ResponsesErrorEvidence, ResponsesImageDetail, ResponsesInputItem,
+		ResponsesInputItemKind, ResponsesProjection, ResponsesProviderProof, ResponsesRole,
+		ResponsesToolOutput, ResponsesToolOutputPart, classify_continuation_error,
+		encode_provider_proof, hoist_interleaved_tool_batch_messages,
 	};
 	use crate::{
 		TurnId,
 		answer::GenerationEvent,
 		call::{
 			Background, ChatRequest, ContentPart, ContextStrategy, Dimensions, ImageFormat,
-			ImageQuality, ImageRequest, Message, NegotiationPolicy, OpaqueJson, OperationCall,
-			ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling, SessionRequest,
-			Setting, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax, ToolInputConstraint,
-			ToolResultContent,
+			ImageQuality, ImageRequest, MediaInput, Message, NegotiationPolicy, OpaqueJson,
+			OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility, Role, Sampling,
+			SessionRequest, Setting, ToolChoice, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
+			ToolInputConstraint, ToolResultContent,
 		},
 		catalog::{ProviderId, RouteId},
 		codec::{Codec as _, Decoder as _, EncodeContext, RawEvent},
@@ -3830,6 +4035,45 @@ mod tests {
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
 		}
+	}
+
+	fn empty_chat_request() -> ChatRequest {
+		let mut request = request_with_tool(ToolInputConstraint::Grammar {
+			grammar:  ToolGrammar {
+				syntax:     ToolGrammarSyntax::Lark,
+				definition: Str::new_static("start: WORD"),
+			},
+			fallback: OpaqueJson::new(serde_json::json!({"type": "object"})),
+		});
+		request.tools = Arc::from([]);
+		request
+	}
+
+	fn request_with_tool_result(content: Vec<ToolResultContent>) -> ChatRequest {
+		let mut request = empty_chat_request();
+		request.messages = Arc::from([Message {
+			role:    Role::Tool,
+			content: Arc::from([ContentPart::ToolResult {
+				call:     ToolCallId::new("call_read"),
+				name:     Some(Str::new_static("read")),
+				content:  content.into(),
+				is_error: false,
+			}]),
+			name:    None,
+		}]);
+		request
+	}
+
+	fn native_tool_output(
+		kind: ResponsesInputItemKind,
+		output: Option<ResponsesToolOutput>,
+	) -> ResponsesInputItem {
+		let mut item = ResponsesInputItem::message(ResponsesRole::User, Vec::new());
+		item.kind = Some(kind);
+		item.role = None;
+		item.call_id = Some(Str::new_static("call_read"));
+		item.output = output;
+		item
 	}
 
 	fn encode_tool(input: ToolInputConstraint) -> Vec<u8> {
@@ -4065,10 +4309,248 @@ mod tests {
 		assert_eq!(encode_cache_affinity(true), None);
 	}
 
-	fn encode_with_policy(
+	#[test]
+	fn text_only_tool_output_stays_a_flat_string() {
+		let policy = policy::WirePolicy::baseline();
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool_result(vec![ToolResultContent::Text(Str::new_static("read complete"))])
+		});
+		let output = encoded
+			.request
+			.input
+			.iter()
+			.find_map(|item| item.output.as_ref())
+			.expect("tool output");
+		assert_eq!(output, &ResponsesToolOutput::Text(Str::new_static("read complete")),);
+		let wire = serde_json::to_string(output).expect("tool output serializes");
+		assert_eq!(wire, r#""read complete""#);
+		let decoded: ResponsesToolOutput =
+			serde_json::from_str(&wire).expect("flat tool output parses");
+		assert_eq!(decoded, *output);
+	}
+
+	#[test]
+	fn replayed_text_only_null_and_empty_outputs_normalize_to_flat_strings() {
+		let policy = policy::WirePolicy::baseline();
+		let options = OpenAiResponsesOptions {
+			native_input: vec![
+				native_tool_output(
+					ResponsesInputItemKind::FunctionCallOutput,
+					Some(ResponsesToolOutput::Multimodal(vec![
+						ResponsesToolOutputPart::InputText { text: Str::new_static("first") },
+						ResponsesToolOutputPart::InputText { text: Str::new_static("second") },
+					])),
+				),
+				native_tool_output(
+					ResponsesInputItemKind::CustomToolCallOutput,
+					Some(ResponsesToolOutput::Multimodal(Vec::new())),
+				),
+				native_tool_output(ResponsesInputItemKind::FunctionCallOutput, None),
+			],
+			..OpenAiResponsesOptions::default()
+		};
+		let encoded = try_encode_with_options(&policy, options, |_, _| empty_chat_request())
+			.expect("empty and text-only outputs encode");
+		assert_eq!(
+			encoded.request.input[0].output,
+			Some(ResponsesToolOutput::Text(Str::new_static("first\nsecond"))),
+		);
+		assert_eq!(encoded.request.input[1].output, Some(ResponsesToolOutput::Text(Str::empty())),);
+		assert_eq!(encoded.request.input[2].output, Some(ResponsesToolOutput::Text(Str::empty())),);
+	}
+
+	#[test]
+	fn mixed_tool_output_encodes_ordered_text_and_image_parts() {
+		let policy = policy::WirePolicy::baseline();
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool_result(vec![
+				ToolResultContent::Text(Str::new_static("Read image file [image/png]")),
+				ToolResultContent::Image(MediaInput::Bytes {
+					media_type: Str::new_static("image/png"),
+					data:       Bytes::from_static(b"tool image"),
+				}),
+			])
+		});
+		assert_eq!(encoded.request.input.len(), 1);
+		assert_eq!(encoded.request.input[0].kind, Some(ResponsesInputItemKind::FunctionCallOutput),);
+		let output = encoded.request.input[0]
+			.output
+			.as_ref()
+			.expect("tool output");
+		assert_eq!(
+			output,
+			&ResponsesToolOutput::Multimodal(vec![
+				ResponsesToolOutputPart::InputText {
+					text: Str::new_static("Read image file [image/png]"),
+				},
+				ResponsesToolOutputPart::InputImage {
+					detail:    Some(ResponsesImageDetail::Auto),
+					image_url: Some(Str::new_static("data:image/png;base64,dG9vbCBpbWFnZQ==",)),
+					file_id:   None,
+				},
+			]),
+		);
+		let wire = serde_json::to_string(output).expect("multimodal tool output serializes");
+		let decoded: ResponsesToolOutput =
+			serde_json::from_str(&wire).expect("multimodal tool output parses");
+		assert_eq!(decoded, *output);
+	}
+
+	#[test]
+	fn text_only_model_keeps_image_tool_output_in_flat_fallback_form() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.image.encoding = Some(policy::ImageEncodingFormat::None);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool_result(vec![
+				ToolResultContent::Text(Str::new_static("read complete")),
+				ToolResultContent::Image(MediaInput::Bytes {
+					media_type: Str::new_static("image/png"),
+					data:       Bytes::from_static(b"tool image"),
+				}),
+			])
+		});
+		assert_eq!(
+			encoded.request.input[0].output,
+			Some(ResponsesToolOutput::Text(Str::new_static(
+				"read complete\n[image omitted: model does not support vision]",
+			))),
+		);
+	}
+
+	#[test]
+	fn replayed_original_image_detail_is_clamped_to_auto() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.image.supports_detail_original = Some(false);
+		let output = ResponsesToolOutput::Multimodal(vec![ResponsesToolOutputPart::InputImage {
+			detail:    Some(ResponsesImageDetail::Original),
+			image_url: Some(Str::new_static("https://example.invalid/image.png")),
+			file_id:   None,
+		}]);
+		let options = OpenAiResponsesOptions {
+			native_input: vec![native_tool_output(
+				ResponsesInputItemKind::FunctionCallOutput,
+				Some(output),
+			)],
+			..OpenAiResponsesOptions::default()
+		};
+		let encoded = try_encode_with_options(&policy, options, |_, _| empty_chat_request())
+			.expect("replayed output encodes");
+		let detail = encoded.request.input.iter().find_map(|item| {
+			let Some(ResponsesToolOutput::Multimodal(parts)) = item.output.as_ref() else {
+				return None;
+			};
+			parts.iter().find_map(|part| match part {
+				ResponsesToolOutputPart::InputImage { detail, .. } => *detail,
+				ResponsesToolOutputPart::InputText { .. } => None,
+			})
+		});
+		assert_eq!(detail, Some(ResponsesImageDetail::Auto));
+	}
+
+	#[test]
+	fn replayed_file_id_without_data_or_url_is_rejected() {
+		let policy = policy::WirePolicy::baseline();
+		let output = ResponsesToolOutput::Multimodal(vec![ResponsesToolOutputPart::InputImage {
+			detail:    Some(ResponsesImageDetail::Low),
+			image_url: None,
+			file_id:   Some(Str::new_static("file_image_123")),
+		}]);
+		let options = OpenAiResponsesOptions {
+			native_input: vec![native_tool_output(
+				ResponsesInputItemKind::FunctionCallOutput,
+				Some(output),
+			)],
+			..OpenAiResponsesOptions::default()
+		};
+		let error = try_encode_with_options(&policy, options, |_, _| empty_chat_request())
+			.expect_err("provider file identity is not replayable");
+		assert_eq!(error, ResponsesEncodeError::UnreplayableImageFileReference {
+			file_id: Str::new_static("file_image_123"),
+		},);
+	}
+
+	#[test]
+	fn inbound_function_and_custom_outputs_preserve_multimodal_parts() {
+		for (wire, expected_kind) in [
+			(
+				r#"{
+				"type": "function_call_output",
+				"call_id": "call_read",
+				"output": [
+					{"type": "input_text", "text": "rendered"},
+					{
+						"type": "input_image",
+						"detail": "high",
+						"image_url": "data:image/png;base64,AAAA"
+					},
+					{
+						"type": "input_image",
+						"detail": "low",
+						"file_id": "file_image_123"
+					}
+				]
+			}"#,
+				ResponsesInputItemKind::FunctionCallOutput,
+			),
+			(
+				r#"{
+				"type": "custom_tool_call_output",
+				"call_id": "call_read",
+				"output": [
+					{"type": "input_text", "text": "rendered"},
+					{
+						"type": "input_image",
+						"detail": "high",
+						"image_url": "data:image/png;base64,AAAA"
+					},
+					{
+						"type": "input_image",
+						"detail": "low",
+						"file_id": "file_image_123"
+					}
+				]
+			}"#,
+				ResponsesInputItemKind::CustomToolCallOutput,
+			),
+		] {
+			let item: ResponsesInputItem =
+				serde_json::from_str(wire).expect("multimodal inbound output parses");
+			assert_eq!(item.kind, Some(expected_kind));
+			assert_eq!(
+				item.output,
+				Some(ResponsesToolOutput::Multimodal(vec![
+					ResponsesToolOutputPart::InputText { text: Str::new_static("rendered") },
+					ResponsesToolOutputPart::InputImage {
+						detail:    Some(ResponsesImageDetail::High),
+						image_url: Some(Str::new_static("data:image/png;base64,AAAA")),
+						file_id:   None,
+					},
+					ResponsesToolOutputPart::InputImage {
+						detail:    Some(ResponsesImageDetail::Low),
+						image_url: None,
+						file_id:   Some(Str::new_static("file_image_123")),
+					},
+				])),
+			);
+		}
+
+		let null: ResponsesInputItem = serde_json::from_str(
+			r#"{"type":"function_call_output","call_id":"call_null","output":null}"#,
+		)
+		.expect("null output parses");
+		assert_eq!(null.output, None);
+		let empty: ResponsesInputItem = serde_json::from_str(
+			r#"{"type":"custom_tool_call_output","call_id":"call_empty","output":[]}"#,
+		)
+		.expect("empty array output parses");
+		assert_eq!(empty.output, Some(ResponsesToolOutput::Multimodal(Vec::new())),);
+	}
+
+	fn try_encode_with_options(
 		policy: &policy::WirePolicy,
+		options: OpenAiResponsesOptions,
 		build: impl FnOnce(&RouteDef, &WireTarget) -> ChatRequest,
-	) -> EncodedResponses {
+	) -> Result<EncodedResponses, ResponsesEncodeError> {
 		let catalog = Catalog::embedded();
 		let model = catalog
 			.models()
@@ -4109,8 +4591,14 @@ mod tests {
 			policy,
 			..EncodeContext::default()
 		};
-		OpenAiResponsesCodec::default()
-			.encode_chat(&context, &request)
+		OpenAiResponsesCodec::new(options).encode_chat(&context, &request)
+	}
+
+	fn encode_with_policy(
+		policy: &policy::WirePolicy,
+		build: impl FnOnce(&RouteDef, &WireTarget) -> ChatRequest,
+	) -> EncodedResponses {
+		try_encode_with_options(policy, OpenAiResponsesOptions::default(), build)
 			.expect("policy request encodes")
 	}
 

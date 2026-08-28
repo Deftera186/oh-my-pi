@@ -621,6 +621,15 @@ A determinate progress bar.
 - **Defaults:** `value=0`, `max=100`; values are clamped to the maximum.
 - **Presentation:** The theme supplies filled, empty, label, and percentage colors.
 
+#### `<qr>`
+
+A scannable QR code encoding the tag body.
+
+- **Content:** The payload text, whitespace-trimmed; URLs are the common case.
+- **Props:** Shared sizing; `kind=l|m|q|h` selects the error-correction level (default `m`); `fg`/`bg` recolor the dark/light modules; `label` names the degraded row.
+- **Presentation:** Unicode half-block cells (two module rows per terminal row) inside the spec-required four-module quiet zone, black on white by default — a scanner contract, not theming. URL-shaped payloads wrap the symbol in an OSC-8 hyperlink.
+- **Degradation:** A viewport too narrow or short for the full symbol, or a payload beyond QR capacity, renders one hyperlinked text row (`label`, defaulting to the payload) instead of a clipped, unscannable code.
+
 ### Custom elements
 
 Any unknown tag becomes a `CustomElement`.

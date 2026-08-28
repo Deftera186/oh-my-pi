@@ -1438,7 +1438,7 @@ impl EnvClient {
 	) -> Result<omp_proto::document::v1::LspStatusResponse, ClientError> {
 		let response = self
 			.data_request_owned(document_request(document_op::Op::LspStatus(
-				document::LspStatusRequest { reload },
+				document::LspStatusRequest { reload, start: false },
 			)))
 			.await?;
 		document_result(response, "LspStatusResponse", |result| {

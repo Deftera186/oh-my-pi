@@ -273,8 +273,9 @@ impl AvailabilitySink for RegistryAvailabilitySink {
 			seq:           0,
 			created_at_ms: 0,
 			kind:          Some(item::Kind::Message(Message {
-				role:  Role::System as i32,
+				role: Role::System as i32,
 				parts: vec![Part { kind: Some(part::Kind::Text(text)) }],
+				..Default::default()
 			})),
 			props:         None,
 		};

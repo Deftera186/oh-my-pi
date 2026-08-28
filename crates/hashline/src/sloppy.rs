@@ -357,6 +357,32 @@ fn build_operation(
 	if has_add {
 		pattern_raw = embed_add_lines(&pattern_raw);
 	}
+	if let Some(repaired) = recover_stray_close_divider(&pattern_raw) {
+		let authored_pattern = pattern_raw;
+		let repaired_lines = repaired.lines().map(str::to_owned).collect::<Vec<_>>();
+		let mut parsed = build_operation(
+			all,
+			&repaired_lines,
+			rewrite_lines,
+			operation,
+			source,
+			full_lines,
+			end_index,
+			path,
+		)?;
+		parsed.pattern_raw = authored_pattern;
+		parsed.has_add = has_add;
+		let note = Str::new(format!(
+			"Note: operation {operation} wrote {SELECT_CLOSE} where the {SELECT_DIVIDER} divider \
+			 belongs; {SELECT_OPEN}old{SELECT_CLOSE}new{SELECT_CLOSE} was read as \
+			 {SELECT_OPEN}old{SELECT_DIVIDER}new{SELECT_CLOSE}."
+		));
+		parsed.recovery_note = Some(match parsed.recovery_note {
+			Some(existing) => Str::new(format!("{note}\n{existing}")),
+			None => note,
+		});
+		return Ok(parsed);
+	}
 	let selections = selection_facts(&pattern_raw, operation)?;
 	let explicit = rewrite_lines.map(|lines| {
 		trim_trailing_blank_lines(lines)
@@ -470,6 +496,81 @@ fn build_operation(
 				)),
 			})
 		},
+	}
+}
+
+/// Repairs a closing marker typed where an inline selection divider belongs.
+///
+/// A line like `⟪old⟫new⟫` is unambiguous only when closes outnumber opens,
+/// both sides contain no selection markers, and replacing the first close
+/// restores balance across the operation. Proper selections followed by a
+/// stray close therefore remain errors.
+fn recover_stray_close_divider(pattern: &str) -> Option<String> {
+	if pattern.matches(SELECT_CLOSE).count() <= pattern.matches(SELECT_OPEN).count() {
+		return None;
+	}
+
+	let mut repaired = String::with_capacity(pattern.len());
+	let mut changed = false;
+	for (index, line) in pattern.split('\n').enumerate() {
+		if index > 0 {
+			repaired.push('\n');
+		}
+		if line.matches(SELECT_CLOSE).count() > line.matches(SELECT_OPEN).count()
+			&& let Some(line) = recover_stray_close_dividers_on_line(line)
+		{
+			repaired.push_str(&line);
+			changed = true;
+		} else {
+			repaired.push_str(line);
+		}
+	}
+
+	(changed && repaired.matches(SELECT_OPEN).count() == repaired.matches(SELECT_CLOSE).count())
+		.then_some(repaired)
+}
+
+fn recover_stray_close_dividers_on_line(line: &str) -> Option<String> {
+	let marker_free = |side: &str| {
+		!side.contains(SELECT_OPEN) && !side.contains(SELECT_CLOSE) && !side.contains(SELECT_DIVIDER)
+	};
+	let mut repaired = String::with_capacity(line.len());
+	let mut copied_through = 0;
+	let mut search_from = 0;
+	let mut changed = false;
+
+	while let Some(relative_open) = line[search_from..].find(SELECT_OPEN) {
+		let open = search_from + relative_open;
+		let old_start = open + SELECT_OPEN.len();
+		let Some(relative_first_close) = line[old_start..].find(SELECT_CLOSE) else {
+			break;
+		};
+		let first_close = old_start + relative_first_close;
+		let new_start = first_close + SELECT_CLOSE.len();
+		let Some(relative_second_close) = line[new_start..].find(SELECT_CLOSE) else {
+			break;
+		};
+		let second_close = new_start + relative_second_close;
+		let old = &line[old_start..first_close];
+		let new = &line[new_start..second_close];
+		if marker_free(old) && marker_free(new) {
+			repaired.push_str(&line[copied_through..first_close]);
+			repaired.push_str(SELECT_DIVIDER);
+			let second_close_end = second_close + SELECT_CLOSE.len();
+			repaired.push_str(&line[new_start..second_close_end]);
+			copied_through = second_close_end;
+			search_from = second_close_end;
+			changed = true;
+		} else {
+			search_from = open + SELECT_OPEN.len();
+		}
+	}
+
+	if changed {
+		repaired.push_str(&line[copied_through..]);
+		Some(repaired)
+	} else {
+		None
 	}
 }
 
@@ -1600,6 +1701,33 @@ mod tests {
 			apply_sloppy(source, input).expect("inline"),
 			"const timeout = 5000;\nconst retries = 5;\n"
 		);
+	}
+
+	#[test]
+	fn stray_close_in_place_of_divider_is_repaired_with_a_note() {
+		let applied = apply_sloppy_detailed(
+			"const value = oldValue;\nreport(value);\n",
+			"§\nconst value = ⟪oldValue⟫newValue⟫;\nreport(value)",
+			Some("src/example.rs"),
+		)
+		.expect("stray close divider");
+		assert_eq!(applied.content, "const value = newValue;\nreport(value);\n");
+		assert!(
+			applied
+				.notes
+				.iter()
+				.any(|note| note.contains("⟪old⟫new⟫ was read as ⟪old│new⟫"))
+		);
+	}
+
+	#[test]
+	fn proper_selection_followed_by_a_stray_close_remains_an_error() {
+		let error = apply_sloppy(
+			"const value = oldValue;\nreport(value);\n",
+			"§\nconst value = ⟪oldValue│newValue⟫;⟫\nreport(value)",
+		)
+		.expect_err("proper selection plus stray close");
+		assert!(error.to_string().contains("selection is missing ⟪"));
 	}
 
 	#[test]

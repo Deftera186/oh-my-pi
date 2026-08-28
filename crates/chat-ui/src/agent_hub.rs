@@ -161,7 +161,19 @@ impl AgentHub {
 			Key::Char('r') => {
 				return self.capability_event(|row| row.can_revive, AgentHubEvent::Revive);
 			},
-			Key::Char('k') => return self.capability_event(|row| row.can_kill, AgentHubEvent::Kill),
+			Key::Char('j') => {
+				let routed = self.ui.handle_key(Key::Down);
+				return self.route(routed);
+			},
+			Key::Char('k') => {
+				let routed = self.ui.handle_key(Key::Up);
+				return self.route(routed);
+			},
+			Key::Char('x') => return self.capability_event(|row| row.can_kill, AgentHubEvent::Kill),
+			Key::PageUp | Key::PageDown if self.view == HubView::Transcript => {
+				let _ = self.ui.handle_key(key);
+				return AgentHubEvent::Consumed;
+			},
 			_ => {},
 		}
 		let routed = self.ui.handle_key(key);
@@ -253,7 +265,11 @@ impl AgentHub {
 	fn rebuild(&mut self) {
 		self.selected = self.selected.min(self.rows.len().saturating_sub(1));
 		self.ui = build(&self.rows, self.selected, self.view, self.list_rows, self.width, &self.ctx);
-		self.ui.focus_first();
+		if self.view == HubView::Transcript {
+			let _ = self.ui.focus_id("agent-hub-inspector-scroll");
+		} else {
+			self.ui.focus_first();
+		}
 		self.refresh_inspector();
 	}
 
@@ -415,9 +431,11 @@ fn build(
 	let root = if view == HubView::Transcript {
 		OverlayPanel::new(title).child(dom! {
 			<col>
-				<text id="agent-hub-inspector" h={height} wrap>{" "}</text>
+				<scroll id="agent-hub-inspector-scroll" h={height}>
+					<text id="agent-hub-inspector" wrap>{" "}</text>
+				</scroll>
 				{panel_divider()}
-				<text fg=muted truncate>{"v back · Esc root"}</text>
+				<text fg=muted truncate>{"↑/↓ scroll · PgUp/PgDn page · v back · Esc root"}</text>
 			</col>
 		})
 	} else if width >= WIDE_INSPECTOR {
@@ -435,7 +453,7 @@ fn build(
 					<text id="agent-hub-inspector" grow wrap>{" "}</text>
 				</row>
 				{panel_divider()}
-				<text fg=muted truncate>{"t roster/tree · v transcript · Enter/s steer · r revive · k kill · Esc root"}</text>
+				<text fg=muted truncate>{"t roster/tree · v transcript · Enter/s steer · r revive · x kill · Esc root"}</text>
 			</col>
 		})
 	} else {
@@ -451,7 +469,7 @@ fn build(
 				</select>
 				{panel_divider()}
 				<text id="agent-hub-inspector" h=4 wrap>{" "}</text>
-				<text fg=muted truncate>{"t view · v transcript · Enter/s steer · r revive · k kill · Esc"}</text>
+				<text fg=muted truncate>{"t view · v transcript · Enter/s steer · r revive · x kill · Esc"}</text>
 			</col>
 		})
 	};
@@ -540,5 +558,54 @@ mod tests {
 		hub.update_rows(&rows);
 		assert_eq!(hub.selected, 0);
 		assert_eq!(hub.handle_key(Key::Enter), AgentHubEvent::Steer(Str::new_static("beta")));
+	}
+
+	#[test]
+	fn vi_navigation_selects_rows_and_x_kills() {
+		let ctx = UiContext::default();
+		let mut alpha = row("running", true, false);
+		alpha.id = Str::new_static("alpha");
+		alpha.name = Str::new_static("alpha");
+		let mut beta = row("running", true, false);
+		beta.id = Str::new_static("beta");
+		beta.name = Str::new_static("beta");
+		beta.can_kill = true;
+		let mut hub = AgentHub::open(&[alpha, beta], &ctx);
+
+		assert_eq!(hub.handle_key(Key::Char('j')), AgentHubEvent::Consumed);
+		assert_eq!(hub.selected, 1);
+		assert_eq!(hub.handle_key(Key::Char('x')), AgentHubEvent::Kill(Str::new_static("beta")));
+		assert_eq!(hub.handle_key(Key::Char('k')), AgentHubEvent::Consumed);
+		assert_eq!(hub.selected, 0);
+		assert_eq!(hub.handle_key(Key::Char('x')), AgentHubEvent::Consumed);
+	}
+
+	#[test]
+	fn transcript_page_keys_scroll_details() {
+		let ctx = UiContext::default();
+		let mut row = row("dead", false, false);
+		row.transcript = Str::new(
+			(0..32)
+				.map(|line| format!("transcript-{line}"))
+				.collect::<Vec<_>>()
+				.join("\n"),
+		);
+		let mut hub = AgentHub::open(&[row], &ctx);
+
+		assert_eq!(hub.handle_key(Key::Char('v')), AgentHubEvent::Consumed);
+		let before = frame_text(&hub);
+		assert_eq!(hub.handle_key(Key::PageDown), AgentHubEvent::Consumed);
+		let after = frame_text(&hub);
+		assert_ne!(after, before);
+		assert_eq!(hub.handle_key(Key::PageUp), AgentHubEvent::Consumed);
+		assert_eq!(frame_text(&hub), before);
+	}
+
+	fn frame_text(hub: &AgentHub) -> String {
+		let frame = hub.ui.frame();
+		(0..frame.size().height)
+			.map(|line| omp_tui::test_support::frame_row_text(frame, line))
+			.collect::<Vec<_>>()
+			.join("\n")
 	}
 }

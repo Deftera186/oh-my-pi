@@ -9,7 +9,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use diff::{DIFF_ID, VIEW_ID};
+use diff::{DIFF_ID, VIEW_ID, strip_carriage_returns};
 use omp_core::{IntoStr, Str, sf};
 use omp_tui::{
 	DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
@@ -18,8 +18,8 @@ use omp_tui::{
 	components::{Col, EditorPane, Tree},
 };
 use sidebar::{
-	AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID, SIDEBAR_ID, SUMMARY_ID, SidebarGroup,
-	SidebarRow, SidebarTarget, VIEW_STYLE_ID, sidebar_rows,
+	AI_STAGE_BUTTON_ID, AI_STAGE_ID, AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID,
+	SIDEBAR_ID, SUMMARY_ID, SidebarGroup, SidebarRow, SidebarTarget, VIEW_STYLE_ID, sidebar_rows,
 };
 use strum::EnumProperty as _;
 
@@ -162,6 +162,11 @@ pub enum GitIntent {
 	},
 	/// Stage the exact paths, or every unstaged path when absent.
 	StageFiles(Option<Vec<Str>>),
+	/// Selectively stage changes matching one natural-language instruction.
+	AiStage {
+		/// User description of the changes to stage.
+		instruction: Str,
+	},
 	/// Unstage the exact paths, or every staged path when absent.
 	UnstageFiles(Option<Vec<Str>>),
 	/// Apply an operation to inclusive one-based line ranges.
@@ -183,6 +188,11 @@ pub enum GitIntent {
 		amend:     bool,
 		/// Whether to stage all working-tree changes first.
 		stage_all: bool,
+	},
+	/// Generate a conventional commit message from the staged diff.
+	GenerateCommit {
+		/// Whether the generated message replaces the current HEAD message.
+		amend: bool,
 	},
 	/// Resolve an avatar image for an author email.
 	Avatar {
@@ -218,6 +228,13 @@ pub enum GitUpdate {
 	ActionDone {
 		/// Human-readable success message.
 		message: Str,
+	},
+	/// Populate the commit composer with an inferred conventional commit.
+	CommitGenerated {
+		/// Generated conventional-commit subject.
+		summary: Str,
+		/// Generated body text.
+		body:    Str,
 	},
 	/// Report a failed mutation.
 	ActionFailed {
@@ -291,9 +308,11 @@ pub struct GitWorkbench {
 	pub(super) view_mode: ViewMode,
 	pub(super) wrap: bool,
 	pub(super) amend: bool,
-	pub(super) status: Option<(Str, omp_tui::Color, Instant)>,
+	pub(super) status: Option<(Str, omp_tui::Color, Instant, bool)>,
 	pending_discard: Option<PendingDiscard>,
 	commit_pending: bool,
+	generation_pending: bool,
+	sidebar_follow_selection: bool,
 	pub(super) avatar: Option<(Str, bytes::Bytes)>,
 	avatar_requested: Option<Str>,
 	pending_last_hunk: bool,
@@ -327,6 +346,8 @@ impl GitWorkbench {
 			status: None,
 			pending_discard: None,
 			commit_pending: false,
+			generation_pending: false,
+			sidebar_follow_selection: true,
 			avatar: None,
 			avatar_requested: None,
 			pending_last_hunk: false,
@@ -349,7 +370,7 @@ impl GitWorkbench {
 	pub fn apply(&mut self, update: GitUpdate) -> Option<GitIntent> {
 		match update {
 			GitUpdate::Snapshot(snapshot) => self.apply_snapshot(snapshot),
-			GitUpdate::ContentsChunk { seq, old_lines, new_lines } => {
+			GitUpdate::ContentsChunk { seq, mut old_lines, mut new_lines } => {
 				if seq != self.load_seq || self.load_finished {
 					return None;
 				}
@@ -357,6 +378,8 @@ impl GitWorkbench {
 					self.streaming = true;
 					self.begin_stream();
 				}
+				sanitize_stream_lines(&mut old_lines);
+				sanitize_stream_lines(&mut new_lines);
 				self.with_pane(|pane| pane.push_stream(&old_lines, &new_lines));
 				None
 			},
@@ -378,18 +401,32 @@ impl GitWorkbench {
 					self.commit_pending = false;
 					self.sidebar_selected = self.first_file_target().unwrap_or(0);
 				}
-				self.status = Some((message, self.ctx.theme.ok, Instant::now()));
+				self.status = Some((message, self.ctx.theme.ok, Instant::now(), false));
 				self.pending_discard = None;
 				if clear_form {
-					self.rebuild_with_form("", "");
+					self.rebuild_with_form("", "", "");
 				} else {
 					self.rebuild();
 				}
 				None
 			},
+			GitUpdate::CommitGenerated { summary, body } => {
+				self.generation_pending = false;
+				let (_, _, ai_instruction) = self.form_values();
+				self.status = Some((
+					Str::new_static("Generated commit message"),
+					self.ctx.theme.ok,
+					Instant::now(),
+					false,
+				));
+				self.rebuild_with_form(summary.as_str(), body.as_str(), ai_instruction.as_str());
+				None
+			},
 			GitUpdate::ActionFailed { message } => {
 				self.commit_pending = false;
-				self.status = Some((message, self.ctx.theme.err, Instant::now()));
+				self.generation_pending = false;
+				self.status =
+					Some((single_line(message.as_str()), self.ctx.theme.err, Instant::now(), true));
 				self.pending_discard = None;
 				self.rebuild();
 				None
@@ -421,7 +458,11 @@ impl GitWorkbench {
 		}
 		if key == Key::Esc {
 			if self.focus == Focus::Sidebar && self.editing() {
-				self.select_target_kind(SidebarTarget::Commit);
+				if matches!(self.current_sidebar_target(), Some(SidebarTarget::AiStage)) {
+					self.select_target_kind(SidebarTarget::Section { area: GitArea::Unstaged });
+				} else {
+					self.select_target_kind(SidebarTarget::Commit);
+				}
 				return GitWorkbenchEvent::Consumed;
 			}
 			if self.focus == Focus::Diff && self.clear_diff_selection() {
@@ -526,7 +567,7 @@ impl GitWorkbench {
 		if self
 			.status
 			.as_ref()
-			.is_some_and(|(_, _, at)| at.elapsed() >= STATUS_TTL)
+			.is_some_and(|(_, _, at, sticky)| !sticky && at.elapsed() >= STATUS_TTL)
 		{
 			self.status = None;
 			let hint = self.focus.hint();
@@ -636,7 +677,10 @@ impl GitWorkbench {
 				self.rebuild();
 				GitWorkbenchEvent::Consumed
 			},
-			(Some(SidebarTarget::Amend), Key::Up | Key::Char('k')) => self.focus_tree(),
+			(Some(SidebarTarget::Amend), Key::Up | Key::Char('k')) => {
+				self.select_target_kind(SidebarTarget::AiStage);
+				GitWorkbenchEvent::Consumed
+			},
 			(Some(SidebarTarget::Amend), Key::Down | Key::Char('j')) => {
 				self.select_target_kind(SidebarTarget::Summary);
 				GitWorkbenchEvent::Consumed
@@ -670,6 +714,12 @@ impl GitWorkbench {
 
 	fn handle_editor_key(&mut self, key: Key) -> GitWorkbenchEvent {
 		match (self.current_sidebar_target().cloned(), key) {
+			(Some(SidebarTarget::AiStage), Key::Enter) => return self.submit_ai_stage(),
+			(Some(SidebarTarget::AiStage), Key::Up) => return self.focus_tree(),
+			(Some(SidebarTarget::AiStage), Key::Down) => {
+				self.select_target_kind(SidebarTarget::Amend);
+				return GitWorkbenchEvent::Consumed;
+			},
 			(Some(SidebarTarget::Summary), Key::Up) => {
 				self.select_target_kind(SidebarTarget::Amend);
 				return GitWorkbenchEvent::Consumed;
@@ -708,9 +758,16 @@ impl GitWorkbench {
 				self.focus_current();
 				GitWorkbenchEvent::Consumed
 			},
-			SidebarTarget::ViewStyle | SidebarTarget::StageAll | SidebarTarget::UnstageAll => {
+			SidebarTarget::Section { area: GitArea::Unstaged } => {
+				GitWorkbenchEvent::Intent(GitIntent::StageFiles(None))
+			},
+			SidebarTarget::Section { area: GitArea::Staged } => {
+				GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(None))
+			},
+			SidebarTarget::Section { area: GitArea::Commit } | SidebarTarget::ViewStyle => {
 				GitWorkbenchEvent::Consumed
 			},
+			SidebarTarget::AiStage => self.submit_ai_stage(),
 			SidebarTarget::Amend => self.toggle_amend(),
 			SidebarTarget::Summary | SidebarTarget::Description => {
 				self.focus_current();
@@ -734,6 +791,12 @@ impl GitWorkbench {
 				if (stage && area == GitArea::Unstaged) || (!stage && area == GitArea::Staged) =>
 			{
 				self.stage_directory(area, path.as_str(), group)
+			},
+			SidebarTarget::Section { area: GitArea::Unstaged } if stage => {
+				GitWorkbenchEvent::Intent(GitIntent::StageFiles(None))
+			},
+			SidebarTarget::Section { area: GitArea::Staged } if !stage => {
+				GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(None))
 			},
 			_ => GitWorkbenchEvent::Consumed,
 		}
@@ -759,7 +822,7 @@ impl GitWorkbench {
 					.is_some_and(|suffix| suffix.starts_with('/'));
 				let in_group = matches!(file.kind, GitChangeKind::Added | GitChangeKind::Untracked)
 					== (group == SidebarGroup::Additions);
-				in_directory && in_group
+				in_directory && (area != GitArea::Unstaged || in_group)
 			})
 			.map(|file| file.path.clone())
 			.collect();
@@ -779,12 +842,12 @@ impl GitWorkbench {
 
 	fn toggle_amend(&mut self) -> GitWorkbenchEvent {
 		self.amend = !self.amend;
-		let (summary, description) = self.form_values();
+		let (summary, description, ai_instruction) = self.form_values();
 		if self.amend && summary.is_empty() && description.is_empty() {
 			if let Some(head) = &self.snapshot.head {
 				let subject = head.subject.clone();
 				let body = head.body.clone();
-				self.rebuild_with_form(subject.as_str(), body.as_str());
+				self.rebuild_with_form(subject.as_str(), body.as_str(), ai_instruction.as_str());
 				return GitWorkbenchEvent::Consumed;
 			}
 		}
@@ -793,13 +856,41 @@ impl GitWorkbench {
 		GitWorkbenchEvent::Consumed
 	}
 
+	fn submit_ai_stage(&mut self) -> GitWorkbenchEvent {
+		let (summary, description, instruction) = self.form_values();
+		let instruction = instruction.as_str().trim();
+		if instruction.is_empty() || self.snapshot.unstaged.is_empty() {
+			return GitWorkbenchEvent::Consumed;
+		}
+		let instruction = instruction.to_str();
+		self.status = Some((
+			sf!("Selecting changes for: {instruction}"),
+			self.ctx.theme.accent,
+			Instant::now(),
+			false,
+		));
+		self.rebuild_with_form(summary.as_str(), description.as_str(), "");
+		GitWorkbenchEvent::Intent(GitIntent::AiStage { instruction })
+	}
+
 	fn submit_commit(&mut self) -> GitWorkbenchEvent {
-		let (summary, description) = self.form_values();
-		if !self.commit_enabled_with(summary.as_str()) {
+		let (summary, description, ai_instruction) = self.form_values();
+		if !self.commit_enabled_with(summary.as_str(), description.as_str()) {
 			return GitWorkbenchEvent::Consumed;
 		}
 		let summary = summary.as_str().trim();
 		let body = description.as_str().trim();
+		if summary.is_empty() {
+			self.generation_pending = true;
+			self.status = Some((
+				Str::new_static("Generating commit message"),
+				self.ctx.theme.accent,
+				Instant::now(),
+				false,
+			));
+			self.rebuild_with_form("", "", ai_instruction.as_str());
+			return GitWorkbenchEvent::Intent(GitIntent::GenerateCommit { amend: self.amend });
+		}
 		let message = if body.is_empty() {
 			summary.to_str()
 		} else {
@@ -849,7 +940,7 @@ impl GitWorkbench {
 				"Discard hunk? Press x (or click) again to confirm"
 			};
 			self.pending_discard = Some(identity);
-			self.status = Some((Str::new_static(label), self.ctx.theme.warn, Instant::now()));
+			self.status = Some((Str::new_static(label), self.ctx.theme.warn, Instant::now(), false));
 			let _ = self.ui.set_text("git-status", label);
 			let _ = self
 				.ui
@@ -864,6 +955,13 @@ impl GitWorkbench {
 		match event {
 			UiEvent::TreeActivated { id, key } if id.as_str() == SIDEBAR_ID => {
 				let selected = self.select_tree_key(key.as_str());
+				if matches!(self.current_sidebar_target(), Some(SidebarTarget::Section { .. })) {
+					if !self.collapsed.remove(&key) {
+						self.collapsed.insert(key);
+					}
+					self.rebuild();
+					return GitWorkbenchEvent::Consumed;
+				}
 				if matches!(self.current_sidebar_target(), Some(SidebarTarget::File { .. })) {
 					self.focus = Focus::Diff;
 					self.focus_current();
@@ -996,6 +1094,7 @@ impl GitWorkbench {
 				self.sync_toggle_props();
 				GitWorkbenchEvent::Consumed
 			},
+			AI_STAGE_BUTTON_ID => self.submit_ai_stage(),
 			COMMIT_ID => self.submit_commit(),
 			_ => GitWorkbenchEvent::Consumed,
 		}
@@ -1014,8 +1113,12 @@ impl GitWorkbench {
 			DiffWhitespaceMode::Whitespace => DiffWhitespaceMode::Formatting,
 			DiffWhitespaceMode::Formatting => DiffWhitespaceMode::Off,
 		};
-		self.status =
-			Some((Str::new_static("Whitespace mode changed"), self.ctx.theme.muted, Instant::now()));
+		self.status = Some((
+			Str::new_static("Whitespace mode changed"),
+			self.ctx.theme.muted,
+			Instant::now(),
+			false,
+		));
 		if !self.streaming {
 			self.install_document();
 		}
@@ -1058,7 +1161,11 @@ impl GitWorkbench {
 	}
 
 	fn select_sidebar(&mut self, index: usize) -> Option<GitIntent> {
-		self.sidebar_selected = index.min(self.sidebar_rows.len().saturating_sub(1));
+		let index = index.min(self.sidebar_rows.len().saturating_sub(1));
+		if self.sidebar_selected != index {
+			self.sidebar_follow_selection = true;
+		}
+		self.sidebar_selected = index;
 		if let Some(key) = self
 			.current_sidebar_target()
 			.filter(|target| target.is_tree_node())
@@ -1095,6 +1202,9 @@ impl GitWorkbench {
 		else {
 			return false;
 		};
+		if self.sidebar_selected != index {
+			self.sidebar_follow_selection = true;
+		}
 		self.sidebar_selected = index;
 		true
 	}
@@ -1143,7 +1253,7 @@ impl GitWorkbench {
 				GitWorkbenchEvent::Consumed
 			},
 			(Some(target), Key::Down) if target.is_tree_node() && !self.is_commit_view() => {
-				self.select_target_kind(SidebarTarget::Amend);
+				self.select_target_kind(SidebarTarget::AiStage);
 				GitWorkbenchEvent::Consumed
 			},
 			_ => routed,
@@ -1172,11 +1282,15 @@ impl GitWorkbench {
 	}
 
 	fn select_target_kind(&mut self, desired: SidebarTarget) {
+		let desired_key = desired.key();
 		if let Some(index) = self
 			.sidebar_rows
 			.iter()
-			.position(|row| std::mem::discriminant(&row.target) == std::mem::discriminant(&desired))
+			.position(|row| row.target.key() == desired_key)
 		{
+			if self.sidebar_selected != index {
+				self.sidebar_follow_selection = true;
+			}
 			self.sidebar_selected = index;
 		}
 		self.focus_current();
@@ -1198,7 +1312,8 @@ impl GitWorkbench {
 			Focus::Diff => DIFF_ID.to_str(),
 			Focus::Sidebar => match self.current_sidebar_target() {
 				Some(SidebarTarget::ViewStyle) => VIEW_STYLE_ID.to_str(),
-				Some(SidebarTarget::StageAll | SidebarTarget::UnstageAll) => SIDEBAR_ID.to_str(),
+				Some(SidebarTarget::Section { .. }) => SIDEBAR_ID.to_str(),
+				Some(SidebarTarget::AiStage) => AI_STAGE_ID.to_str(),
 				Some(SidebarTarget::Amend) => AMEND_ID.to_str(),
 				Some(SidebarTarget::Summary) => SUMMARY_ID.to_str(),
 				Some(SidebarTarget::Description) => DESCRIPTION_ID.to_str(),
@@ -1230,7 +1345,7 @@ impl GitWorkbench {
 		self.focus == Focus::Sidebar
 			&& matches!(
 				self.current_sidebar_target(),
-				Some(SidebarTarget::Summary | SidebarTarget::Description)
+				Some(SidebarTarget::Summary | SidebarTarget::Description | SidebarTarget::AiStage)
 			)
 	}
 
@@ -1256,7 +1371,7 @@ impl GitWorkbench {
 		if self.is_commit_view() || content_height == 0 {
 			return;
 		}
-		let (_, description) = self.form_values();
+		let (_, description, _) = self.form_values();
 		let description_rows = description.lines().count().clamp(1, 5) as u16;
 		let commit_row = content_height.saturating_sub(1);
 		let description_start = commit_row.saturating_sub(description_rows);
@@ -1270,6 +1385,8 @@ impl GitWorkbench {
 			Some(SidebarTarget::Summary)
 		} else if row == amend_row {
 			Some(SidebarTarget::Amend)
+		} else if row == amend_row.saturating_sub(2) {
+			Some(SidebarTarget::AiStage)
 		} else {
 			None
 		};
@@ -1285,7 +1402,7 @@ impl GitWorkbench {
 			.unwrap_or(false)
 	}
 
-	fn form_values(&self) -> (Str, Str) {
+	fn form_values(&self) -> (Str, Str, Str) {
 		let values = self.ui.values();
 		let summary = values
 			.get(SUMMARY_ID)
@@ -1295,18 +1412,25 @@ impl GitWorkbench {
 			.get(DESCRIPTION_ID)
 			.and_then(serde_json::Value::as_str)
 			.map_or_else(Str::default, Str::new);
-		(summary, description)
+		let ai_instruction = values
+			.get(AI_STAGE_ID)
+			.and_then(serde_json::Value::as_str)
+			.map_or_else(Str::default, Str::new);
+		(summary, description, ai_instruction)
 	}
 
-	pub(super) fn commit_enabled_with(&self, summary: &str) -> bool {
-		!summary.trim().is_empty()
+	pub(super) fn commit_enabled_with(&self, summary: &str, description: &str) -> bool {
+		!self.generation_pending
+			&& (!summary.trim().is_empty() || description.trim().is_empty())
 			&& (!self.snapshot.staged.is_empty()
 				|| !self.snapshot.unstaged.is_empty()
 				|| (self.amend && self.snapshot.head.is_some()))
 	}
 
 	pub(super) fn commit_button_label(&self) -> &'static str {
-		if self.snapshot.staged.is_empty() {
+		if self.generation_pending {
+			"Generating commit message"
+		} else if self.snapshot.staged.is_empty() {
 			"Stage all & commit"
 		} else {
 			"Commit staged changes"
@@ -1314,8 +1438,8 @@ impl GitWorkbench {
 	}
 
 	fn sync_commit_button(&mut self) {
-		let (summary, _) = self.form_values();
-		let disabled = !self.commit_enabled_with(summary.as_str());
+		let (summary, description, _) = self.form_values();
+		let disabled = !self.commit_enabled_with(summary.as_str(), description.as_str());
 		let _ = self.ui.set_prop(COMMIT_ID, Prop::Dim, disabled);
 	}
 
@@ -1453,9 +1577,11 @@ impl GitWorkbench {
 				},
 				(Some((_, path)), Some(contents)) => {
 					let options = DiffBuildOptions { whitespace, language: None };
+					let old_text = strip_carriage_returns(contents.old_text.as_str());
+					let new_text = strip_carriage_returns(contents.new_text.as_str());
 					let document = DiffDocument::build(
-						contents.old_text.as_str(),
-						contents.new_text.as_str(),
+						old_text.as_ref(),
+						new_text.as_ref(),
 						path.as_str(),
 						&options,
 					);
@@ -1476,11 +1602,11 @@ impl GitWorkbench {
 	}
 
 	fn rebuild(&mut self) {
-		let (summary, description) = self.form_values();
-		self.rebuild_with_form(summary.as_str(), description.as_str());
+		let (summary, description, ai_instruction) = self.form_values();
+		self.rebuild_with_form(summary.as_str(), description.as_str(), ai_instruction.as_str());
 	}
 
-	fn rebuild_with_form(&mut self, summary: &str, description: &str) {
+	fn rebuild_with_form(&mut self, summary: &str, description: &str, ai_instruction: &str) {
 		let previous_rows = self.sidebar_rows.clone();
 		let previous_target = self.current_sidebar_target().cloned();
 		self.rebuild_sidebar_rows();
@@ -1496,14 +1622,19 @@ impl GitWorkbench {
 				self.set_sidebar_index_for_key(survivor.as_str());
 			}
 		}
-		self.sidebar_selected = self
+		let reconciled = self
 			.sidebar_selected
 			.min(self.sidebar_rows.len().saturating_sub(1));
-		self.rebuild_retained(summary, description);
+		if reconciled != self.sidebar_selected {
+			self.sidebar_follow_selection = true;
+			self.sidebar_selected = reconciled;
+		}
+		self.rebuild_retained(summary, description, ai_instruction);
 	}
 
-	fn rebuild_retained(&mut self, summary: &str, description: &str) {
+	fn rebuild_retained(&mut self, summary: &str, description: &str, ai_instruction: &str) {
 		let old_mode = self.view_mode;
+		let follow_selection = self.sidebar_follow_selection;
 		let old_wrap = self.wrap;
 		let (tree_selected, tree_scroll_top) = self
 			.ui
@@ -1538,12 +1669,19 @@ impl GitWorkbench {
 			sidebar_width,
 			summary,
 			description,
+			ai_instruction,
 			tree_selected.as_deref(),
 			tree_scroll_top,
 		);
 		let root = self.root_component(pane, sidebar, sidebar_width, content_rows);
 		self.ui = Ui::from_root(root, self.width.max(1), self.ctx.clone());
 		self.focus_current();
+		if !follow_selection {
+			let _ = self
+				.ui
+				.with_component_mut::<Tree, _>(SIDEBAR_ID, |tree| tree.set_scroll_top(tree_scroll_top));
+		}
+		self.sidebar_follow_selection = false;
 		if fresh {
 			self.install_document();
 		}
@@ -1676,6 +1814,28 @@ pub(super) fn split_path(path: &str) -> (&str, &str) {
 		.map_or(("", path), |(directory, basename)| (&path[..directory.len() + 1], basename))
 }
 
+fn single_line(text: &str) -> Str {
+	let mut words = text.split_whitespace();
+	let Some(first) = words.next() else {
+		return Str::default();
+	};
+	let mut line = String::with_capacity(text.len());
+	line.push_str(first);
+	for word in words {
+		line.push(' ');
+		line.push_str(word);
+	}
+	line.into()
+}
+
+fn sanitize_stream_lines(lines: &mut [Str]) {
+	for line in lines {
+		if line.contains('\r') {
+			*line = Str::new(line.replace('\r', ""));
+		}
+	}
+}
+
 pub(super) fn short_sha(sha: &Str) -> Str {
 	sha.slice(..sha.len().min(8))
 }
@@ -1800,6 +1960,28 @@ mod tests {
 	}
 
 	#[test]
+	fn crlf_contents_and_stream_chunks_match_lf_documents() {
+		let mut crlf = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = crlf.initial_intent().expect("load") else {
+			panic!("load")
+		};
+		let _ = crlf.apply(GitUpdate::ContentsChunk {
+			seq,
+			old_lines: vec![Str::new_static("old\r")],
+			new_lines: vec![Str::new_static("new\r")],
+		});
+		let _ = crlf.apply(GitUpdate::Contents { seq, contents: contents("old\r\n", "new\r\n") });
+		let crlf_document = pane_document(&mut crlf);
+
+		let mut lf = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = lf.initial_intent().expect("load") else {
+			panic!("load")
+		};
+		let _ = lf.apply(GitUpdate::Contents { seq, contents: contents("old\n", "new\n") });
+		assert_eq!(crlf_document, pane_document(&mut lf));
+	}
+
+	#[test]
 	fn stale_stream_chunk_is_ignored() {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
 		let GitIntent::Load { seq, .. } = workbench.initial_intent().expect("load") else {
@@ -1862,6 +2044,26 @@ mod tests {
 		));
 		assert!(matches!(workbench.current_sidebar_target(), Some(SidebarTarget::File { .. })));
 		assert_eq!(workbench.handle_key(Key::Char('g')), GitWorkbenchEvent::Consumed);
+	}
+
+	#[test]
+	fn section_headers_fold_on_enter_and_arrows_but_space_stages() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		workbench.select_target_kind(SidebarTarget::Section { area: GitArea::Unstaged });
+		let key = workbench.current_sidebar_target().expect("section").key();
+		assert_eq!(workbench.handle_key(Key::Enter), GitWorkbenchEvent::Consumed);
+		assert!(workbench.collapsed.contains(&key));
+		assert_eq!(workbench.handle_key(Key::Right), GitWorkbenchEvent::Consumed);
+		assert!(!workbench.collapsed.contains(&key));
+		assert!(matches!(
+			workbench.handle_key(Key::Space),
+			GitWorkbenchEvent::Intent(GitIntent::StageFiles(None))
+		));
+		workbench.select_target_kind(SidebarTarget::Section { area: GitArea::Staged });
+		assert!(matches!(
+			workbench.handle_key(Key::Space),
+			GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(None))
+		));
 	}
 
 	#[test]
@@ -2050,6 +2252,13 @@ mod tests {
 			.expect("tree");
 		assert_eq!(after_slot, slot, "wheel input must not rebuild the workbench");
 		assert!(scroll_top > 0);
+		let idle_snapshot = workbench.snapshot.clone();
+		let _ = workbench.apply(GitUpdate::Snapshot(idle_snapshot));
+		let after_refresh = workbench
+			.ui
+			.with_component_mut::<Tree, _>(super::sidebar::SIDEBAR_ID, |tree| tree.scroll_top())
+			.expect("tree");
+		assert_eq!(after_refresh, scroll_top, "idle refresh must preserve wheel scroll");
 	}
 
 	#[test]
@@ -2096,6 +2305,60 @@ mod tests {
 				stage_all: false,
 			})
 		);
+	}
+
+	#[test]
+	fn empty_commit_submission_generates_and_populates_the_form() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		workbench.select_target_kind(SidebarTarget::Commit);
+		assert_eq!(
+			workbench.handle_key(Key::Enter),
+			GitWorkbenchEvent::Intent(GitIntent::GenerateCommit { amend: false })
+		);
+		assert!(workbench.generation_pending);
+		assert_eq!(workbench.commit_button_label(), "Generating commit message");
+		let _ = workbench.apply(GitUpdate::CommitGenerated {
+			summary: Str::new_static("fix(git): corrected staging"),
+			body:    Str::new_static("- Preserved selected hunks."),
+		});
+		let (summary, description, _) = workbench.form_values();
+		assert_eq!(summary.as_str(), "fix(git): corrected staging");
+		assert_eq!(description.as_str(), "- Preserved selected hunks.");
+		assert!(!workbench.generation_pending);
+	}
+
+	#[test]
+	fn ai_stage_input_emits_one_natural_language_instruction() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		workbench.select_target_kind(SidebarTarget::AiStage);
+		for character in "comment-only changes".chars() {
+			assert_eq!(
+				workbench.handle_key(if character == ' ' {
+					Key::Space
+				} else {
+					Key::Char(character)
+				}),
+				GitWorkbenchEvent::Consumed
+			);
+		}
+		assert_eq!(
+			workbench.handle_key(Key::Enter),
+			GitWorkbenchEvent::Intent(GitIntent::AiStage {
+				instruction: Str::new_static("comment-only changes"),
+			})
+		);
+		assert!(workbench.form_values().2.is_empty());
+	}
+
+	#[test]
+	fn failed_actions_keep_a_single_line_sticky_footer() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		let _ = workbench.apply(GitUpdate::ActionFailed {
+			message: Str::new_static("provider failed\nwith details"),
+		});
+		let (message, _, _, sticky) = workbench.status.as_ref().expect("status");
+		assert_eq!(message.as_str(), "provider failed with details");
+		assert!(*sticky);
 	}
 
 	#[test]
@@ -2161,7 +2424,7 @@ mod tests {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
 		workbench.select_target_kind(SidebarTarget::Amend);
 		assert_eq!(workbench.handle_key(Key::Enter), GitWorkbenchEvent::Consumed);
-		let (summary, description) = workbench.form_values();
+		let (summary, description, _) = workbench.form_values();
 		assert_eq!(summary.as_str(), "existing subject");
 		assert_eq!(description.as_str(), "existing body");
 		workbench.select_target_kind(SidebarTarget::Commit);
@@ -2170,7 +2433,7 @@ mod tests {
 			GitWorkbenchEvent::Intent(GitIntent::Commit { amend: true, .. })
 		));
 		workbench.apply(GitUpdate::ActionDone { message: Str::new_static("committed") });
-		let (summary, description) = workbench.form_values();
+		let (summary, description, _) = workbench.form_values();
 		assert!(summary.is_empty() && description.is_empty());
 		assert!(!workbench.amend);
 	}
@@ -2180,8 +2443,9 @@ mod tests {
 		let mut snapshot = dirty();
 		let mut workbench = GitWorkbench::open(snapshot.clone(), &UiContext::default());
 		assert_eq!(workbench.commit_button_label(), "Commit staged changes");
-		assert!(!workbench.commit_enabled_with("   "));
-		assert!(workbench.commit_enabled_with("subject"));
+		assert!(workbench.commit_enabled_with("   ", ""));
+		assert!(workbench.commit_enabled_with("subject", ""));
+		assert!(!workbench.commit_enabled_with("", "body only"));
 		snapshot.staged.clear();
 		let _ = workbench.apply(GitUpdate::Snapshot(snapshot));
 		assert_eq!(workbench.commit_button_label(), "Stage all & commit");
@@ -2315,6 +2579,71 @@ mod tests {
 				new:  (1, 1),
 			})
 		);
+	}
+
+	#[test]
+	fn staged_and_committed_additions_use_consolidated_lists() {
+		let mut snapshot = dirty();
+		snapshot.staged.push(GitFileRow {
+			path:      Str::new_static("tests/new.rs"),
+			orig_path: None,
+			kind:      GitChangeKind::Added,
+			area:      GitArea::Staged,
+			additions: Some(3),
+			deletions: None,
+		});
+		let workbench = GitWorkbench::open(snapshot, &UiContext::default());
+		let staged = workbench
+			.sidebar_rows
+			.iter()
+			.find(|row| {
+				matches!(&row.target, SidebarTarget::File {
+					area: GitArea::Staged,
+					path,
+					..
+				} if path.as_str() == "tests/new.rs")
+			})
+			.expect("staged addition");
+		assert_eq!(staged.status.as_deref(), Some("A"));
+		assert!(workbench.sidebar_rows.iter().all(|row| {
+			!matches!(&row.target, SidebarTarget::Directory {
+				area: GitArea::Staged,
+				group: SidebarGroup::Additions,
+				..
+			})
+		}));
+
+		let mut commit = head();
+		commit.files.push(GitFileRow {
+			path:      Str::new_static("src/new.rs"),
+			orig_path: None,
+			kind:      GitChangeKind::Added,
+			area:      GitArea::Commit,
+			additions: Some(2),
+			deletions: None,
+		});
+		let committed = GitWorkbench::open(
+			GitSnapshot {
+				branch:   None,
+				unstaged: Vec::new(),
+				staged:   Vec::new(),
+				head:     Some(commit),
+				pinned:   true,
+			},
+			&UiContext::default(),
+		);
+		let added = committed
+			.sidebar_rows
+			.iter()
+			.find(|row| {
+				matches!(&row.target, SidebarTarget::File {
+					area: GitArea::Commit,
+					path,
+					..
+				} if path.as_str() == "src/new.rs")
+			})
+			.expect("committed addition");
+		assert_eq!(added.status.as_deref(), Some("A"));
 	}
 
 	#[test]

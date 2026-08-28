@@ -335,6 +335,12 @@ fn acquire_lock(path: &Path) -> miette::Result<GcLock> {
 	Ok(GcLock(path.to_owned()))
 }
 
+pub(crate) fn sweep_debug(data_dir: &Path, min_age: Duration) -> miette::Result<gc::SweepReport> {
+	let _lock = acquire_lock(&data_dir.join("gc.lock"))?;
+	let store = BlobStore::open(data_dir).into_diagnostic()?;
+	crate::debug::garbage_collect(&store, min_age).into_diagnostic()
+}
+
 fn stale_lock(path: &Path) -> bool {
 	let Ok(text) = fs::read_to_string(path) else {
 		return false;

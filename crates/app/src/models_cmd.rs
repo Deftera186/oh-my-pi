@@ -49,6 +49,7 @@ async fn composed_catalog(
 	let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
 	let settings = omp_settings::manager::SettingsManager::open(
 		omp_settings::manager::SettingsPaths::discover(data_dir, Some(&root)),
+		crate::SETTINGS_CATALOG,
 	)
 	.into_diagnostic()?;
 	let settings_snapshot = settings.snapshot();
@@ -273,6 +274,7 @@ fn discovered(
 		declared_operations: OperationBits::empty(),
 		declared_capabilities: Some(model.capabilities.clone()),
 		declared_limits: Some(model.limits.clone()),
+		declared_pricing: Box::new([]),
 		extended_context_mode: None,
 		availability: Some(model.availability.clone()),
 		source: Str::new_static("runtime-inference-discovery"),

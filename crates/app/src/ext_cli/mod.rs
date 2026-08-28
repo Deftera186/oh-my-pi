@@ -2659,9 +2659,11 @@ async fn materialize_signed_wheel(
 		idempotency_key: format!("ext-install-{site_key}"),
 		..MaterializeSite::default()
 	};
-	let settings =
-		SettingsManager::open(SettingsPaths::discover(&state.data_dir, Some(&state.project)))
-			.into_diagnostic()?;
+	let settings = SettingsManager::open(
+		SettingsPaths::discover(&state.data_dir, Some(&state.project)),
+		crate::SETTINGS_CATALOG,
+	)
+	.into_diagnostic()?;
 	let environment = omp_envd::ProjectEnvironment::attach(
 		&state.project,
 		&state.project_state,

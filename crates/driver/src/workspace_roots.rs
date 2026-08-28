@@ -1,8 +1,10 @@
 //! Journal/Environment reconciliation for immutable workspace-root snapshots.
 
+#[cfg(unix)]
+use std::ffi::CString;
 use std::{
 	collections::BTreeMap,
-	io,
+	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -12,6 +14,94 @@ use omp_core::Str;
 use omp_proto::{SCHEMA_REV, env::v1 as pb};
 use thiserror::Error;
 use url::Url;
+
+/// Failure to prove that a project directory can be entered safely.
+#[derive(Debug, Error)]
+pub enum DirectoryEnterabilityError {
+	/// Directory metadata could not be read.
+	#[error("project directory cannot be inspected: {path}")]
+	Metadata {
+		/// Project directory being checked.
+		path:   PathBuf,
+		/// Underlying filesystem failure.
+		#[source]
+		source: io::Error,
+	},
+	/// The existing path is not a directory.
+	#[error("project path is not a directory: {path}")]
+	NotDirectory {
+		/// Rejected project path.
+		path: PathBuf,
+	},
+	/// The directory lacks search permission or cannot otherwise be entered.
+	#[error("project directory is not enterable: {path}")]
+	Search {
+		/// Rejected project directory.
+		path:   PathBuf,
+		/// Underlying filesystem failure.
+		#[source]
+		source: io::Error,
+	},
+}
+
+impl DirectoryEnterabilityError {
+	/// Returns whether the path disappeared before it could be adopted.
+	pub fn is_missing(&self) -> bool {
+		match self {
+			Self::Metadata { source, .. } | Self::Search { source, .. } => {
+				matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+			},
+			Self::NotDirectory { .. } => true,
+		}
+	}
+}
+
+/// Proves that `path` exists, is a directory, and has search permission.
+///
+/// Metadata alone is insufficient on POSIX: it can succeed for a directory
+/// whose own execute/search bit is denied.
+pub fn ensure_directory_enterable(path: &Path) -> Result<(), DirectoryEnterabilityError> {
+	let metadata = fs::metadata(path)
+		.map_err(|source| DirectoryEnterabilityError::Metadata { path: path.to_owned(), source })?;
+	if !metadata.is_dir() {
+		return Err(DirectoryEnterabilityError::NotDirectory { path: path.to_owned() });
+	}
+	ensure_search_permission(path)
+}
+
+/// Returns whether `path` can safely be adopted as a working directory.
+pub fn directory_is_enterable(path: &Path) -> bool {
+	ensure_directory_enterable(path).is_ok()
+}
+
+#[cfg(unix)]
+fn ensure_search_permission(path: &Path) -> Result<(), DirectoryEnterabilityError> {
+	use std::os::unix::ffi::OsStrExt as _;
+
+	let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+		DirectoryEnterabilityError::Search {
+			path:   path.to_owned(),
+			source: io::Error::new(io::ErrorKind::InvalidInput, "project path contains a NUL byte"),
+		}
+	})?;
+	// SAFETY: `encoded` is a live NUL-terminated path and `access` does not retain
+	// it.
+	if unsafe { libc::access(encoded.as_ptr(), libc::X_OK) } == 0 {
+		Ok(())
+	} else {
+		Err(DirectoryEnterabilityError::Search {
+			path:   path.to_owned(),
+			source: io::Error::last_os_error(),
+		})
+	}
+}
+
+#[cfg(not(unix))]
+fn ensure_search_permission(path: &Path) -> Result<(), DirectoryEnterabilityError> {
+	fs::read_dir(path)
+		.map(drop)
+		.map_err(|source| DirectoryEnterabilityError::Search { path: path.to_owned(), source })
+}
 
 /// Root-authority drift retained with a prompt snapshot instead of hidden.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +303,8 @@ fn parse_grant(root: pb::WorkspaceRoot) -> Result<Grant, WorkspaceRootError> {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(unix)]
+	use std::os::unix::fs::PermissionsExt as _;
 	use std::{fs, slice};
 
 	use omp_storage::transcript::{Header, SessionId};
@@ -224,6 +316,21 @@ mod tests {
 			canonical_uri: Url::from_file_path(path).unwrap().to_string(),
 			grant_id:      id.into(),
 		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn enterability_rejects_directory_without_search_permission() {
+		let directory = tempfile::tempdir().unwrap();
+		let denied = directory.path().join("denied");
+		fs::create_dir(&denied).unwrap();
+		fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+		assert!(!directory_is_enterable(&denied));
+		assert!(matches!(
+			ensure_directory_enterable(&denied),
+			Err(DirectoryEnterabilityError::Search { .. })
+		));
+		fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
 	}
 
 	#[tokio::test]

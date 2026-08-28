@@ -42,7 +42,7 @@ fn backend_never_claims_namespace_guarantees() {
 
 #[cfg(unix)]
 #[test]
-fn pathname_socket_allowance_drops_network_disable_claim() {
+fn pathname_socket_allowance_fails_closed_without_exact_enforcement() {
 	use std::os::unix::net::UnixListener;
 
 	let root = tempdir().expect("socket root");
@@ -51,16 +51,12 @@ fn pathname_socket_allowance_drops_network_disable_claim() {
 	let mut spec = SandboxSpec::new(executable());
 	spec.allow_unix_socket(&socket).expect("socket allowance");
 	spec.set_degradation(DegradationPolicy::AllowCaveats);
-	let plan = Runner::for_backend(Backend::Landlock)
+	let error = Runner::for_backend(Backend::Landlock)
 		.compile(&spec)
-		.expect("degraded Landlock plan");
-	assert!(!plan.enforced().contains(Capability::NetDisable));
-	assert!(plan.caveats().iter().any(|caveat| {
-		caveat.capability == Some(Capability::NetDisable)
-			&& caveat
-				.message
-				.as_str()
-				.contains("inherited Internet socket")
+		.expect_err("exact Unix-socket grant must fail closed");
+	assert!(matches!(error, omp_sandbox::SandboxError::EnforcementUnavailable {
+		backend:   Backend::Landlock,
+		authority: "Unix-domain socket path grants",
 	}));
 }
 

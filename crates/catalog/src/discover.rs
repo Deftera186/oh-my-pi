@@ -17,9 +17,10 @@ use crate::{
 	ClassificationEvidence, ClassificationInput, ClassificationPhase, ContextStrategy,
 	DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EffortTier, EvidenceConfidence,
 	ExactSelector, ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits,
-	ModelOverlay, ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Pricing,
-	ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, ScopedAlias,
-	ThinkingEffort, ThinkingPolicyId, ThinkingRouting, WireModelId, WirePolicyId, classify,
+	ModelOverlay, ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Price,
+	PriceUnit, Pricing, ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, RouteDef,
+	RouteId, ScopedAlias, ThinkingEffort, ThinkingPolicyId, ThinkingRouting, WireModelId,
+	WirePolicyId, classify,
 	classify::{strip_effort_lane, supports_dynamic_effort_siblings},
 };
 
@@ -45,6 +46,10 @@ pub struct DiscoveredModel {
 	pub declared_capabilities: Option<ModelCapabilities>,
 	/// Provider-declared limits, if present.
 	pub declared_limits:       Option<ModelLimits>,
+	/// Provider-declared partial base pricing. Missing dimensions inherit route
+	/// defaults; discovery never invents omitted prices.
+	#[serde(default)]
+	pub declared_pricing:      Box<[Price]>,
 	/// Provider-declared standard or extended context serving mode.
 	pub extended_context_mode: Option<ExtendedContextMode>,
 	/// Provider-declared availability, if present.
@@ -509,7 +514,7 @@ impl DiscoveryNormalizer {
 				thinking_routing: ThinkingRouting::default(),
 				wire_policy,
 				context: self.defaults.context,
-				pricing: self.defaults.pricing.clone(),
+				pricing: merge_declared_pricing(&self.defaults.pricing, &row.declared_pricing),
 				availability: row.availability.unwrap_or(ModelAvailability::Unspecified),
 				provenance: ModelProvenance {
 					sources:          Box::new([declared, classified]),
@@ -557,6 +562,28 @@ impl DiscoveryNormalizer {
 			}
 		}
 		Ok(grouped.into_values().collect())
+	}
+}
+
+fn merge_declared_pricing(defaults: &Pricing, declared: &[Price]) -> Pricing {
+	if declared.is_empty() {
+		return defaults.clone();
+	}
+	let mut components = defaults
+		.components
+		.iter()
+		.map(|price| (price.unit, price.nanos_usd))
+		.collect::<BTreeMap<PriceUnit, u64>>();
+	for price in declared {
+		components.insert(price.unit, price.nanos_usd);
+	}
+	Pricing {
+		components: components
+			.into_iter()
+			.map(|(unit, nanos_usd)| Price { unit, nanos_usd })
+			.collect::<Vec<_>>()
+			.into_boxed_slice(),
+		tiers:      defaults.tiers.clone(),
 	}
 }
 
@@ -961,6 +988,7 @@ mod tests {
 			declared_operations:   OperationBits::empty(),
 			declared_capabilities: None,
 			declared_limits:       None,
+			declared_pricing:      Box::new([]),
 			extended_context_mode: None,
 			availability:          None,
 			source:                sf!("provider-list"),
@@ -1112,6 +1140,55 @@ mod tests {
 		assert!(normalized.model.capabilities.chat.is_none());
 		assert_eq!(normalized.model.limits, ModelLimits::default());
 		assert_eq!(normalized.model.provenance.sources[0].confidence, EvidenceConfidence::Declared);
+	}
+
+	#[test]
+	fn partial_discovery_pricing_overrides_only_reported_dimensions() {
+		let mut configured = defaults();
+		configured.pricing = Pricing {
+			components: vec![
+				Price { unit: PriceUnit::MtokInput, nanos_usd: 1 },
+				Price { unit: PriceUnit::MtokOutput, nanos_usd: 2 },
+				Price { unit: PriceUnit::MtokCacheRead, nanos_usd: 3 },
+				Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: 4 },
+			]
+			.into_boxed_slice(),
+			tiers:      Box::new([]),
+		};
+		let mut discovered = row("partial-pricing");
+		discovered.declared_pricing =
+			vec![Price { unit: PriceUnit::MtokInput, nanos_usd: 9 }, Price {
+				unit:      PriceUnit::MtokCacheRead,
+				nanos_usd: 8,
+			}]
+			.into_boxed_slice();
+
+		let normalized = DiscoveryNormalizer::new(configured)
+			.normalize(&discovered)
+			.expect("partial pricing normalizes");
+
+		assert_eq!(normalized.model.pricing.components.as_ref(), [
+			Price { unit: PriceUnit::MtokInput, nanos_usd: 9 },
+			Price { unit: PriceUnit::MtokOutput, nanos_usd: 2 },
+			Price { unit: PriceUnit::MtokCacheRead, nanos_usd: 8 },
+			Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: 4 },
+		]);
+	}
+
+	#[test]
+	fn discovered_alias_keeps_its_provider_route_transport_defaults() {
+		let mut configured = defaults();
+		configured.wire_policy = WirePolicyId::from("private-litellm-wire");
+		let normalized = DiscoveryNormalizer::new(configured)
+			.normalize(&row("kimi-k3"))
+			.expect("colliding alias normalizes");
+		assert_eq!(normalized.model.wire_policy, WirePolicyId::from("private-litellm-wire"));
+		assert_eq!(normalized.model.routes.as_ref(), [RouteId::from("route")]);
+		assert_eq!(normalized.model.wire_ids.as_ref(), [(
+			RouteId::from("route"),
+			WireModelId::from("kimi-k3")
+		)]);
+		assert_eq!(normalized.model.thinking, None);
 	}
 
 	#[test]

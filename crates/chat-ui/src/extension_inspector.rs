@@ -442,6 +442,14 @@ impl ExtensionInspector {
 				self.rebuild();
 				return ExtensionInspectorEvent::Consumed;
 			},
+			Key::Char('j') => {
+				let event = self.ui.handle_key(Key::Down);
+				return self.route(event);
+			},
+			Key::Char('k') => {
+				let event = self.ui.handle_key(Key::Up);
+				return self.route(event);
+			},
 			Key::Enter | Key::Space => {
 				if let Some(row) = self.snapshot.rows.get(self.selected)
 					&& let Some(enabled) = row.toggled_enabled()
@@ -621,7 +629,7 @@ fn build(
 					</col>
 				</row>
 				{panel_divider()}
-				<text dim truncate>{"↑/↓ select · Space toggle · PgUp/PgDn inspect · Ctrl+O expand · Esc close"}</text>
+				<text dim truncate>{"↑/↓/j/k select · Space toggle · PgUp/PgDn inspect · Ctrl+O expand · Esc close"}</text>
 			</col>
 		})
 	} else {
@@ -638,7 +646,7 @@ fn build(
 					}
 				</select>
 				{panel_divider()}
-				<text dim truncate>{"Space toggle · PgUp/PgDn inspect · Ctrl+O expand · Esc"}</text>
+				<text dim truncate>{"↑/↓/j/k select · Space toggle · PgUp/PgDn inspect · Ctrl+O expand · Esc"}</text>
 			</col>
 		})
 	};
@@ -1354,6 +1362,23 @@ mod tests {
 		let after = frame_text(inspector.layer(Size { width: 100, height: 18 }).frame);
 		assert_ne!(before, after);
 		assert!(inspector.inspector_top > 0);
+	}
+
+	#[test]
+	fn flat_list_jk_aliases_directional_navigation() {
+		let snapshot = ExtensionSnapshot {
+			rows:       vec![
+				tool_row("first", "/repo/first.ts"),
+				tool_row("second", "/repo/second.ts"),
+			],
+			generation: 1,
+		};
+		let mut inspector = ExtensionInspector::open(snapshot, &UiContext::default());
+
+		assert_eq!(inspector.handle_key(Key::Char('j')), ExtensionInspectorEvent::Consumed);
+		assert_eq!(inspector.selected, 1);
+		assert_eq!(inspector.handle_key(Key::Char('k')), ExtensionInspectorEvent::Consumed);
+		assert_eq!(inspector.selected, 0);
 	}
 
 	#[test]

@@ -1,5 +1,6 @@
 //! Shared backend for the standalone and chat-hosted Git workbench.
 
+pub mod ai_stage;
 pub mod avatar;
 pub mod model;
 
@@ -13,11 +14,14 @@ use std::{
 
 use omp_chat_ui::git::{GitIntent, GitUpdate};
 use omp_core::{IntoStr as _, Str};
+use omp_driver::commit::{CommitError, CommitGenerator, CommitRequest};
+use omp_vcs::{git::GitRepo, types::DiffOptions};
 use parking_lot::Mutex as SyncMutex;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 
 use self::{
+	ai_stage::AiStageError,
 	avatar::AvatarLoader,
 	model::{GitModel, GitModelError},
 };
@@ -39,6 +43,38 @@ pub struct GitSession {
 	busy:        Arc<AtomicBool>,
 	cancel:      CancellationToken,
 	load_cancel: Arc<SyncMutex<CancellationToken>>,
+	generator:   Arc<OnceCell<CommitGenerator>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GeneratorError {
+	#[error("cannot resolve the OMP data directory")]
+	DataDir {
+		#[source]
+		source: omp_core::dirs::DataDirError,
+	},
+	#[error(transparent)]
+	Commit(#[from] CommitError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GenerateError {
+	#[error(transparent)]
+	Generator(#[from] GeneratorError),
+	#[error(transparent)]
+	Model(#[from] GitModelError),
+	#[error("cannot read the staged diff")]
+	Repository {
+		#[source]
+		source: omp_vcs::Error,
+	},
+	#[error("staged diff task failed")]
+	Task {
+		#[source]
+		source: tokio::task::JoinError,
+	},
+	#[error(transparent)]
+	Commit(#[from] CommitError),
 }
 
 impl GitSession {
@@ -54,6 +90,7 @@ impl GitSession {
 			avatar: AvatarLoader::new(),
 			busy: Arc::new(AtomicBool::new(false)),
 			load_cancel: Arc::new(SyncMutex::new(cancel.child_token())),
+			generator: Arc::new(OnceCell::new()),
 			cancel,
 		})
 	}
@@ -152,6 +189,13 @@ impl GitSession {
 		let Ok(_busy) = BusyGuard::enter(&self.busy) else {
 			return GitIntentResult::default();
 		};
+		match intent {
+			GitIntent::GenerateCommit { amend } => return self.generate_commit(amend).await,
+			GitIntent::AiStage { instruction } => {
+				return self.ai_stage(instruction.as_str()).await;
+			},
+			_ => {},
+		}
 		let mut model = self.model.lock().await;
 		let action = match intent {
 			GitIntent::StageFiles(paths) => model.stage(paths.as_deref(), &self.cancel).await,
@@ -169,6 +213,8 @@ impl GitSession {
 			GitIntent::Refresh
 			| GitIntent::Load { .. }
 			| GitIntent::Avatar { .. }
+			| GitIntent::GenerateCommit { .. }
+			| GitIntent::AiStage { .. }
 			| GitIntent::Close => {
 				unreachable!("non-action intent routed to action handler")
 			},
@@ -183,6 +229,124 @@ impl GitSession {
 			Err(error) => updates.push(GitUpdate::ActionFailed { message: render_error(&error) }),
 		}
 		GitIntentResult { updates, close: false }
+	}
+
+	async fn commit_generator(&self, project: &Path) -> Result<CommitGenerator, GeneratorError> {
+		let data_dir =
+			omp_core::dirs::data_dir(None).map_err(|source| GeneratorError::DataDir { source })?;
+		let generator = self
+			.generator
+			.get_or_try_init(|| CommitGenerator::production(&data_dir, project, None))
+			.await?;
+		Ok(generator.clone())
+	}
+
+	async fn generate_commit(&self, amend: bool) -> GitIntentResult {
+		match self.generate_commit_inner(amend).await {
+			Ok((commit, snapshot)) => GitIntentResult {
+				updates: vec![
+					GitUpdate::CommitGenerated { summary: commit.summary, body: commit.body },
+					GitUpdate::Snapshot(snapshot),
+				],
+				close:   false,
+			},
+			Err(error) => {
+				let mut updates = vec![GitUpdate::ActionFailed { message: error.to_string().to_str() }];
+				if let Ok(snapshot) = self.model.lock().await.force_refresh(&self.cancel).await {
+					updates.push(GitUpdate::Snapshot(snapshot));
+				}
+				GitIntentResult { updates, close: false }
+			},
+		}
+	}
+
+	async fn generate_commit_inner(
+		&self,
+		amend: bool,
+	) -> Result<(omp_driver::commit::ConventionalCommit, omp_chat_ui::git::GitSnapshot), GenerateError>
+	{
+		let (cwd, snapshot) = {
+			let mut model = self.model.lock().await;
+			let mut snapshot = model.force_refresh(&self.cancel).await?;
+			if snapshot.staged.is_empty() && !snapshot.unstaged.is_empty() {
+				let _ = model.stage(None, &self.cancel).await?;
+				snapshot = model.force_refresh(&self.cancel).await?;
+			}
+			(model.cwd().to_path_buf(), snapshot)
+		};
+		let diff_cwd = cwd.clone();
+		let has_head = snapshot.head.is_some();
+		let (staged_diff, recent_subjects) = tokio::task::spawn_blocking(move || {
+			let repo = GitRepo::require(&diff_cwd)?;
+			let diff = repo.diff_text(&DiffOptions {
+				cached: true,
+				binary: true,
+				..DiffOptions::default()
+			})?;
+			let subjects = if has_head {
+				repo.log_subjects(12)?
+			} else {
+				Vec::new()
+			};
+			Ok::<_, omp_vcs::Error>((diff, subjects))
+		})
+		.await
+		.map_err(|source| GenerateError::Task { source })?
+		.map_err(|source| GenerateError::Repository { source })?;
+		let recent_subjects = recent_subjects
+			.into_iter()
+			.map(Str::from)
+			.collect::<Vec<_>>();
+		let amend_base = if amend { snapshot.head.as_ref() } else { None }.map(|head| {
+			if head.body.is_empty() {
+				head.subject.clone()
+			} else {
+				omp_core::sf!("{}\n\n{}", head.subject, head.body)
+			}
+		});
+		let generator = self.commit_generator(&cwd).await?;
+		let commit = generator
+			.generate(CommitRequest {
+				staged_diff:     staged_diff.as_str(),
+				recent_subjects: &recent_subjects,
+				amend_base:      amend_base.as_deref(),
+			})
+			.await?;
+		Ok((commit, snapshot))
+	}
+
+	async fn ai_stage(&self, instruction: &str) -> GitIntentResult {
+		let (cwd, snapshot) = {
+			let mut model = self.model.lock().await;
+			let snapshot = match model.force_refresh(&self.cancel).await {
+				Ok(snapshot) => snapshot,
+				Err(error) => return failed(error),
+			};
+			(model.cwd().to_path_buf(), snapshot)
+		};
+		let generator = match self.commit_generator(&cwd).await {
+			Ok(generator) => generator,
+			Err(error) => {
+				return one(GitUpdate::ActionFailed { message: error.to_string().to_str() });
+			},
+		};
+		let outcome = match ai_stage::stage(&cwd, instruction, &snapshot.unstaged, &generator).await {
+			Ok(outcome) => outcome,
+			Err(error) => {
+				return one(GitUpdate::ActionFailed { message: render_ai_stage_error(&error) });
+			},
+		};
+		let refreshed = match self.model.lock().await.force_refresh(&self.cancel).await {
+			Ok(snapshot) => snapshot,
+			Err(error) => return failed(error),
+		};
+		GitIntentResult {
+			updates: vec![
+				GitUpdate::ActionDone { message: outcome.message() },
+				GitUpdate::Snapshot(refreshed),
+			],
+			close:   false,
+		}
 	}
 }
 
@@ -212,6 +376,9 @@ fn failed(error: GitModelError) -> GitIntentResult {
 }
 
 fn render_error(error: &GitModelError) -> Str {
+	error.to_string().to_str()
+}
+fn render_ai_stage_error(error: &AiStageError) -> Str {
 	error.to_string().to_str()
 }
 #[cfg(test)]

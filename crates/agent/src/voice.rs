@@ -205,8 +205,14 @@ impl LiveAgentBridge {
 			seq:           0,
 			created_at_ms: now_ms(),
 			kind:          Some(item::Kind::Message(Message {
-				role:  i32::from(Role::User),
-				parts: vec![Part { kind: Some(part::Kind::Text(request.as_str().to_owned())) }],
+				role:            i32::from(Role::User),
+				parts:           vec![Part {
+					kind: Some(part::Kind::Text(request.as_str().to_owned())),
+				}],
+				synthetic:       None,
+				user_initiated:  None,
+				completed_at_ms: None,
+				usage:           None,
 			})),
 			props:         None,
 		};
@@ -395,8 +401,9 @@ mod tests {
 		let output = text.map_or_else(Vec::new, |text| {
 			vec![Item {
 				kind: Some(item::Kind::Message(Message {
-					role:  i32::from(Role::Assistant),
+					role: i32::from(Role::Assistant),
 					parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+					..Default::default()
 				})),
 				..Item::default()
 			}]

@@ -1,12 +1,16 @@
 //! Deterministic provider/model header merging and custom OAuth application.
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::SystemTime};
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Request};
+use http::{HeaderName, HeaderValue, Request, StatusCode};
 use omp_core::{ExposeSecret as _, SecretString, Str};
+use tokio_util::sync::CancellationToken;
 
-use super::{AuthSpec, CredentialApplyError, CredentialLease};
+use super::{
+	AuthSpec, CommandCredentialError, CommandCredentialResolver, CredentialApplyError,
+	CredentialLease,
+};
 
 /// One dynamic secret header resolved by the Environment credential authority.
 #[derive(Clone, Debug)]
@@ -15,6 +19,109 @@ pub struct SecretHeader {
 	pub name:  Str,
 	/// Secret-only value.
 	pub value: SecretString,
+}
+
+/// One configured command-backed secret header.
+#[derive(Clone)]
+pub struct CommandHeaderSource {
+	/// Header name.
+	pub name:    Str,
+	/// Environment command that resolves the header value.
+	pub command: Str,
+}
+
+impl CommandHeaderSource {
+	/// Parses one `!command` header value. Literal and empty command values do
+	/// not produce a secret source.
+	pub fn from_config(name: &str, value: &str) -> Option<Self> {
+		let command = value.strip_prefix('!')?.trim();
+		(!command.is_empty()).then(|| Self { name: Str::new(name), command: Str::new(command) })
+	}
+}
+
+/// Per-request command-header resolver and one-shot 401 refresh hook.
+///
+/// A provider response may invalidate every command-backed header exactly once.
+/// The returned refreshed headers are then applied to the replay request. A
+/// second 401 returns `None`, allowing the original authentication failure to
+/// propagate instead of creating an unbounded command/retry loop.
+pub struct CommandHeaderRetry {
+	resolver:  Arc<CommandCredentialResolver>,
+	sources:   Box<[CommandHeaderSource]>,
+	refreshed: bool,
+}
+
+impl CommandHeaderRetry {
+	/// Creates a one-shot retry hook for one provider/model header set.
+	pub fn new(
+		resolver: Arc<CommandCredentialResolver>,
+		sources: impl IntoIterator<Item = CommandHeaderSource>,
+	) -> Self {
+		Self {
+			resolver,
+			sources: sources.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+			refreshed: false,
+		}
+	}
+
+	/// Resolves the current header values through the shared command cache.
+	pub async fn resolve(
+		&self,
+		cancellation: CancellationToken,
+	) -> Result<Vec<SecretHeader>, CommandHeaderResolveError> {
+		let mut headers = Vec::with_capacity(self.sources.len());
+		for source in &self.sources {
+			let value = self
+				.resolver
+				.resolve(source.command.as_str(), cancellation.clone())
+				.await
+				.map_err(|error| CommandHeaderResolveError {
+					header: source.name.clone(),
+					source: error,
+				})?;
+			headers.push(SecretHeader { name: source.name.clone(), value });
+		}
+		Ok(headers)
+	}
+
+	/// Invalidates and re-resolves command-backed headers after the first 401.
+	///
+	/// Non-401 statuses and subsequent 401 responses return `None`.
+	pub async fn retry_after_status(
+		&mut self,
+		status: StatusCode,
+		cancellation: CancellationToken,
+	) -> Result<Option<Vec<SecretHeader>>, CommandHeaderResolveError> {
+		if status != StatusCode::UNAUTHORIZED || self.refreshed {
+			return Ok(None);
+		}
+		self.refreshed = true;
+		for source in &self.sources {
+			self.resolver.invalidate(source.command.as_str());
+		}
+		self.resolve(cancellation).await.map(Some)
+	}
+}
+
+impl fmt::Debug for CommandHeaderRetry {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("CommandHeaderRetry")
+			.field("header_count", &self.sources.len())
+			.field("refreshed", &self.refreshed)
+			.finish_non_exhaustive()
+	}
+}
+
+/// Failure to resolve one command-backed header.
+#[derive(Debug, thiserror::Error)]
+#[error("command-backed header resolution failed for {header}")]
+pub struct CommandHeaderResolveError {
+	/// Non-secret header name identifying the failed source.
+	pub header: Str,
+	/// Typed command-resolution failure.
+	#[source]
+	pub source: CommandCredentialError,
 }
 
 /// Merges safe provider headers, model overrides, dynamic secret headers, then
@@ -76,7 +183,26 @@ pub enum CustomAuthApplyError {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
 	use super::*;
+
+	struct RotatingExecutor {
+		calls: AtomicUsize,
+	}
+
+	impl super::super::CommandCredentialExecutor for RotatingExecutor {
+		fn execute(&self, _: Str, _: CancellationToken) -> super::super::CommandExecutionFuture {
+			let call = self.calls.fetch_add(1, Ordering::SeqCst);
+			Box::pin(async move {
+				Ok(SecretString::from(if call == 0 {
+					"stale-header"
+				} else {
+					"fresh-header"
+				}))
+			})
+		}
+	}
 
 	#[test]
 	fn model_headers_override_provider_and_secret_values_are_sensitive() {
@@ -100,6 +226,52 @@ mod tests {
 		assert_eq!(request.headers()["x-route"], "model");
 		assert!(request.headers()["x-api-key"].is_sensitive());
 		assert!(!format!("{:?}", request.headers()).contains("secret-marker"));
+	}
+
+	#[tokio::test]
+	async fn unauthorized_refreshes_command_headers_exactly_once() {
+		let executor = Arc::new(RotatingExecutor { calls: AtomicUsize::new(0) });
+		let resolver = Arc::new(CommandCredentialResolver::new(
+			executor.clone(),
+			std::time::Duration::from_secs(1),
+		));
+		let mut retry = CommandHeaderRetry::new(resolver, [CommandHeaderSource::from_config(
+			"x-tenant-token",
+			"!resolve tenant token",
+		)
+		.expect("command source")]);
+		let initial = retry
+			.resolve(CancellationToken::new())
+			.await
+			.expect("initial headers");
+		assert_eq!(initial[0].value.expose_secret(), "stale-header");
+
+		let refreshed = retry
+			.retry_after_status(StatusCode::UNAUTHORIZED, CancellationToken::new())
+			.await
+			.expect("refresh hook")
+			.expect("first 401 refreshes");
+		assert_eq!(refreshed[0].value.expose_secret(), "fresh-header");
+		let mut request = Request::new(Bytes::new());
+		apply_custom_auth(
+			&mut request,
+			&BTreeMap::new(),
+			&BTreeMap::new(),
+			&refreshed,
+			None,
+			SystemTime::UNIX_EPOCH,
+		)
+		.expect("apply refreshed headers");
+		assert_eq!(request.headers()["x-tenant-token"], "fresh-header");
+		assert!(request.headers()["x-tenant-token"].is_sensitive());
+		assert!(
+			retry
+				.retry_after_status(StatusCode::UNAUTHORIZED, CancellationToken::new())
+				.await
+				.expect("second hook")
+				.is_none()
+		);
+		assert_eq!(executor.calls.load(Ordering::SeqCst), 2);
 	}
 
 	#[test]

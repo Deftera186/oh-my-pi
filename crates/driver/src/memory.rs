@@ -364,8 +364,12 @@ fn memory_message(role: Role, text: &str) -> Item {
 		seq:           0,
 		created_at_ms: 0,
 		kind:          Some(item::Kind::Message(Message {
-			role:  i32::from(role),
-			parts: vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())) }],
+			role:            i32::from(role),
+			parts:           vec![Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}

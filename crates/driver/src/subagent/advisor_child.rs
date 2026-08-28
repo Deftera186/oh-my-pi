@@ -380,8 +380,29 @@ pub(crate) async fn run_batch<C: TurnClient + Clone + Send + 'static>(
 		.map(|chunk| message(Role::User, chunk.as_str(), now_ms()))
 		.collect();
 	let _ = broker.set_idle(advisor_id, false);
-	let result = supervisor.run(advisor_id, items, turn_id).await;
-	let _ = broker.set_idle(advisor_id, true);
+	let mut result = supervisor.run(advisor_id, items, turn_id).await;
+	loop {
+		match broker.finish_turn(advisor_id) {
+			Ok(omp_agent::TurnEndDisposition::Terminal) => break,
+			Ok(omp_agent::TurnEndDisposition::ContinuationPending) => {
+				if result.is_err() {
+					let _ = broker.finish_failed_turn(advisor_id);
+					break;
+				}
+				result = supervisor
+					.run(
+						advisor_id,
+						Vec::new(),
+						TurnId::new(format!("advisor-irc-wake-{}", omp_core::Ulid::generate())),
+					)
+					.await;
+			},
+			Err(error) => {
+				tracing::warn!(agent = %advisor_id, %error, "advisor turn settlement failed");
+				break;
+			},
+		}
+	}
 	if let Some(terminal) = supervisor
 		.state(advisor_id)
 		.and_then(|state| state.terminal())
@@ -418,8 +439,12 @@ fn message(role: Role, text: &str, created_at_ms: u64) -> Item {
 		seq: 0,
 		created_at_ms,
 		kind: Some(item::Kind::Message(Message {
-			role:  i32::from(role),
-			parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+			role:            i32::from(role),
+			parts:           vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props: None,
 	}

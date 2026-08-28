@@ -309,6 +309,7 @@ fn window(
 		dimension: Str::new(match unit {
 			UsageUnit::Usd => "usd",
 			UsageUnit::Percent => "percent",
+			UsageUnit::Credits => "credits",
 			_ => "requests",
 		}),
 		label: Some(label),

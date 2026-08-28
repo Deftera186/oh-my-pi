@@ -457,6 +457,7 @@ mod tests {
 			kind:          Some(item::Kind::Message(thread::Message {
 				role: thread::Role::User as i32,
 				parts,
+				..Default::default()
 			})),
 			props:         None,
 		}

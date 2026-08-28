@@ -8,6 +8,7 @@ use std::{env, panic, process::ExitCode};
 use windows_sys::Win32::System::Console;
 
 fn process_bootstrap() {
+	omp_http::install_tls_provider();
 	// Safety: this runs as the first statement in `main`, before OMP starts any
 	// daemon, worker, or application thread that could concurrently read env.
 	unsafe {

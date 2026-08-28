@@ -3,7 +3,7 @@
 use omp_core::Str;
 use omp_settings::{
 	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain,
+	SettingsContribution, SettingsDomain,
 };
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -517,13 +517,15 @@ impl SettingsDomain for VoiceSettings {
 	const PREFIX: Option<&'static str> = None;
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<VoiceSettings>()
-}
+/// Settings domains and normalizers owned by the application crate.
+pub const SETTINGS_CONTRIBUTION: SettingsContribution = SettingsContribution {
+	domains:     &[DomainRegistration::of::<VoiceSettings>()],
+	normalizers: &[],
+};
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
 
@@ -597,7 +599,11 @@ mod tests {
 			stt: SttSettings { enabled: true, ..SttSettings::default() },
 			..VoiceSettings::default()
 		};
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated snapshot");
+		let snapshot = SettingsSnapshot::isolated(
+			expected.clone(),
+			SettingsCatalog::new(&[&SETTINGS_CONTRIBUTION]),
+		)
+		.expect("isolated snapshot");
 		assert_eq!(
 			snapshot
 				.project::<VoiceSettings>()
@@ -606,9 +612,11 @@ mod tests {
 			&expected
 		);
 		assert!(
-			registered_domains()
+			SETTINGS_CONTRIBUTION
+				.domains
 				.iter()
-				.any(|domain| domain.name == VoiceSettings::DOMAIN)
+				.map(|domain| domain.descriptor().name)
+				.eq([VoiceSettings::DOMAIN])
 		);
 	}
 }

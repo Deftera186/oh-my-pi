@@ -23,9 +23,10 @@ use omp_envd::{
 use omp_inference::{
 	AccountId, PrincipalId, auth,
 	auth::{
-		AuditedCredentialReveal, AuthControlHandle, CommandCredentialError,
+		APP_HEADER, AuditedCredentialReveal, AuthControlHandle, CommandCredentialError,
 		CommandCredentialExecutor, CommandExecutionFuture, CredentialControlWrite, CredentialGrants,
-		OAuthControlImport, ScopedCredentialGrant,
+		HOSTNAME_HEADER, INSTALL_ID_HEADER, OAuthControlImport, ScopedCredentialGrant,
+		UsageAttribution,
 	},
 };
 use omp_proto::{
@@ -626,16 +627,19 @@ impl CredentialSecretControlAuthority {
 pub struct GatewayCredentialSecretControlFactory {
 	channel:         Channel,
 	bearer_token:    Option<Arc<SecretString>>,
+	attribution:     UsageAttribution,
 	grants:          Arc<BTreeMap<Str, CredentialControlGrant>>,
 	base_rules:      Arc<[SecretRule]>,
 	placeholder_key: Arc<str>,
 }
 
 /// Constructs the credential authority used by gateway-mode application
-/// composition.
+/// composition. `attribution` is resolved once by the application and reused
+/// for every broker request.
 pub fn gateway_credential_control_factory(
 	channel: Channel,
 	bearer_token: Option<SecretString>,
+	attribution: UsageAttribution,
 	grants: BTreeMap<Str, CredentialControlGrant>,
 	base_rules: Arc<[SecretRule]>,
 	placeholder_key: impl Into<Arc<str>>,
@@ -643,6 +647,7 @@ pub fn gateway_credential_control_factory(
 	GatewayCredentialSecretControlFactory {
 		channel,
 		bearer_token: bearer_token.map(Arc::new),
+		attribution,
 		grants: Arc::new(grants),
 		base_rules,
 		placeholder_key: placeholder_key.into(),
@@ -652,12 +657,14 @@ pub fn gateway_credential_control_factory(
 /// session CONTROL factory.
 pub fn gateway_credential_secret_control_factory(
 	channel: Channel,
+	attribution: UsageAttribution,
 	grants: BTreeMap<Str, CredentialControlGrant>,
 	snapshot: &SecretSessionSnapshot,
 ) -> GatewayCredentialSecretControlFactory {
 	gateway_credential_control_factory(
 		channel,
 		None,
+		attribution,
 		grants,
 		Arc::from(snapshot.rules().to_vec()),
 		Arc::<str>::from(key::placeholder_key()),
@@ -687,6 +694,7 @@ impl ControlAuthorityFactory for GatewayCredentialSecretControlFactory {
 			identity,
 			client: AuthClient::new(self.channel.clone()),
 			bearer_token: self.bearer_token.clone(),
+			attribution: self.attribution.clone(),
 			grant,
 			masking,
 		}))
@@ -697,6 +705,7 @@ struct GatewayCredentialSecretControlAuthority {
 	identity:     Arc<ControlConnectionIdentity>,
 	client:       AuthClient<Channel>,
 	bearer_token: Option<Arc<SecretString>>,
+	attribution:  UsageAttribution,
 	grant:        CredentialControlGrant,
 	masking:      SecretMaskingAuthority,
 }
@@ -856,6 +865,15 @@ impl GatewayCredentialSecretControlAuthority {
 
 	fn authenticated<T>(&self, message: T) -> Result<Request<T>, ControlProtocolError> {
 		let mut request = Request::new(message);
+		let attribution = self.attribution.headers();
+		for name in [INSTALL_ID_HEADER, APP_HEADER, HOSTNAME_HEADER] {
+			if let Some(value) = attribution.get(name)
+				&& let Ok(value) = value.to_str()
+				&& let Ok(value) = MetadataValue::try_from(value)
+			{
+				request.metadata_mut().insert(name, value);
+			}
+		}
 		if let Some(token) = &self.bearer_token {
 			let encoded = Zeroizing::new(format!("Bearer {}", token.expose_secret()));
 			let mut value = MetadataValue::try_from(encoded.as_str())

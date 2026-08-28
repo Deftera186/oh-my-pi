@@ -121,7 +121,7 @@ const fn picker_event(event: PickerEvent) -> OverlayEvent {
 	match event {
 		PickerEvent::Consumed => OverlayEvent::Consumed,
 		PickerEvent::Close => OverlayEvent::Close,
-		PickerEvent::Pick(index) => OverlayEvent::Pick(index),
+		PickerEvent::Pick(index) | PickerEvent::PickTask(index) => OverlayEvent::Pick(index),
 	}
 }
 
@@ -151,7 +151,7 @@ impl ChatScene {
 	fn drain_backend(&mut self) {
 		while let Ok(event) = self.events.try_recv() {
 			match event {
-				BackendEvent::OpenModelPicker { rows, current } => {
+				BackendEvent::OpenModelPicker { rows, current, .. } => {
 					self.models = rows;
 					self.current = current.min(self.models.len().saturating_sub(1));
 					if let Phase::Chat(state) = &mut self.phase
@@ -160,11 +160,12 @@ impl ChatScene {
 						state.overlay = Some(Overlay::Models(ModelPicker::open(
 							&self.models,
 							self.current,
+							self.current,
 							&self.ctx,
 						)));
 					}
 				},
-				BackendEvent::ModelsUpdated { rows, current } => {
+				BackendEvent::ModelsUpdated { rows, current, .. } => {
 					self.models = rows;
 					self.current = current.min(self.models.len().saturating_sub(1));
 				},
@@ -214,8 +215,12 @@ impl ChatScene {
 					if quit { Effect::Quit } else { Effect::Consumed }
 				},
 				PaletteAction::OpenModelPicker => {
-					state.overlay =
-						Some(Overlay::Models(ModelPicker::open(&self.models, self.current, &self.ctx)));
+					state.overlay = Some(Overlay::Models(ModelPicker::open(
+						&self.models,
+						self.current,
+						self.current,
+						&self.ctx,
+					)));
 					Effect::Consumed
 				},
 				PaletteAction::ToggleSidebar => {
@@ -311,8 +316,12 @@ impl Scene for ChatScene {
 			return Effect::Consumed;
 		}
 		if key == Key::Ctrl('p') || key == Key::Alt('p') {
-			state.overlay =
-				Some(Overlay::Models(ModelPicker::open(&self.models, self.current, &self.ctx)));
+			state.overlay = Some(Overlay::Models(ModelPicker::open(
+				&self.models,
+				self.current,
+				self.current,
+				&self.ctx,
+			)));
 			return Effect::Consumed;
 		}
 		if let Some(scope) = ClipboardRead::for_key(key) {
@@ -415,7 +424,11 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 	let generation = Arc::new(AtomicU64::new(0));
 	let mut current = 0;
 	let _ = events.send(BackendEvent::Sessions(mock_sessions()));
-	let _ = events.send(BackendEvent::ModelsUpdated { rows: models.clone(), current });
+	let _ = events.send(BackendEvent::ModelsUpdated {
+		rows: models.clone(),
+		current,
+		task_current: current,
+	});
 	while let Ok(intent) = intents.recv() {
 		match intent {
 			Intent::ExtensionShortcut(_) => {},
@@ -444,12 +457,8 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				}
 				let tool = Str::from(format!("tool-{turn}"));
 				if generation.load(Ordering::SeqCst) == turn {
-					let _ = events.send(BackendEvent::ToolStarted {
-						id:    tool.clone(),
-						name:  sf!("shell"),
-						rev:   sf!("r0"),
-						title: sf!("Inspect chat scene"),
-					});
+					let _ =
+						events.send(BackendEvent::ToolStarted { id: tool.clone(), name: sf!("shell") });
 					let _ = events.send(BackendEvent::ToolOutput {
 						id:    tool.clone(),
 						chunk: sf!("checking damage ranges\n"),

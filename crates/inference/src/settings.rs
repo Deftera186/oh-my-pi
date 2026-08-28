@@ -599,15 +599,18 @@ fn nonnegative(value: f32) -> Option<f32> {
 	(value >= 0.0).then_some(value)
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<RetrySettings>()
-}
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<SamplingSettings>()
-}
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<ProviderRuntimeSettings>()
-}
+/// Settings domains owned by the inference crate.
+pub const SETTINGS_CONTRIBUTION: omp_settings::SettingsContribution =
+	omp_settings::SettingsContribution {
+		domains:     &[
+			DomainRegistration::of::<RetrySettings>(),
+			DomainRegistration::of::<SamplingSettings>(),
+			DomainRegistration::of::<ProviderRuntimeSettings>(),
+			DomainRegistration::of::<crate::search_settings::WebSearchSettings>(),
+		],
+		normalizers: &[],
+	};
+
 #[cfg(test)]
 mod tests {
 	use super::*;

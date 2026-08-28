@@ -10,8 +10,6 @@ use crate::BuiltinRendererIdentities;
 pub struct RendererGalleryFixture {
 	/// Exact production-compatible renderer identity.
 	pub identity:        ToolIdentity,
-	/// Human-readable card title.
-	pub title:           &'static str,
 	/// Partial argument JSON prefix folded for the streaming state, exactly as
 	/// a provider would have emitted it mid-generation. Empty skips the fold.
 	pub streaming_args:  &'static str,
@@ -51,7 +49,6 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 	let edit = identity("edit", "hl");
 	let grep = identity("grep", "");
 	let web_search = identity("web_search", "");
-	let fetch = identity("fetch", "");
 	let glob = identity("glob", "");
 	let shell = identity("bash", "");
 	let hub = identity("hub", "");
@@ -73,7 +70,6 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 		edit:       Some(edit.clone()),
 		grep:       Some(grep.clone()),
 		web_search: Some(web_search.clone()),
-		fetch:      Some(fetch.clone()),
 		glob:       Some(glob.clone()),
 		shell:      Some(shell.clone()),
 		hub:        Some(hub.clone()),
@@ -97,7 +93,7 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 		crate::render::fs::gallery_fixtures(write.clone(), read.clone()),
 		crate::render::search::gallery_fixtures(grep.clone(), glob.clone()),
 		crate::render::exec::gallery_fixtures(shell.clone(), eval.clone()),
-		crate::render::web::gallery_fixtures(web_search.clone(), fetch.clone()),
+		crate::render::web::gallery_fixtures(web_search.clone()),
 		crate::render::hub::gallery_fixtures(hub.clone()),
 		crate::render::ast::gallery_fixtures(ast_grep.clone(), ast_edit.clone()),
 		crate::render::interaction::gallery_fixtures(ask.clone(), todo.clone(), think.clone()),

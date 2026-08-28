@@ -41,8 +41,11 @@ use url::Url;
 
 use super::{
 	direnv::DirenvDelta,
-	exec::{ExecError, ExecEvent, ExecHost, ExecRun, sandbox_denied_event_path},
-	exec_settings::{DirenvMode, ExecSandboxMode, SandboxSettings, ShellProfile, ShellSettings},
+	exec::{ExecError, ExecEvent, ExecHost, ExecRun},
+	exec_settings::{
+		DirenvMode, ExecSandboxMode, ReadMode, SandboxNetworkMode, SandboxSettings, ShellProfile,
+		ShellSettings,
+	},
 	tool_url::UrlResolver,
 	tools,
 };
@@ -529,108 +532,19 @@ fn cwd_fault(message: impl Into<Str>) -> Fault {
 }
 /// Foreground shell run retaining the concrete host's process-tree guard.
 pub(crate) struct HostShellRun {
-	host:            ExecHost,
-	run:             ExecRun,
-	rerun:           Option<SandboxRerun>,
-	pending_denial:  Option<RunEvent>,
-	approval:        tokio::sync::Mutex<Option<Pin<Box<dyn Future<Output = bool> + Send>>>>,
-	sequence_offset: u64,
-	last_sequence:   u64,
-}
-
-struct SandboxRerun {
-	request: ExecRequest,
-	timeout: Option<Duration>,
+	host: ExecHost,
+	run:  ExecRun,
 }
 
 impl HostShellRun {
-	fn new(host: ExecHost, run: ExecRun, request: ExecRequest, timeout: Option<Duration>) -> Self {
-		Self {
-			host,
-			run,
-			rerun: Some(SandboxRerun { request, timeout }),
-			pending_denial: None,
-			approval: tokio::sync::Mutex::new(None),
-			sequence_offset: 0,
-			last_sequence: 0,
-		}
-	}
-
-	fn map_event(&mut self, event: ExecEvent) -> Result<RunEvent, Fault> {
-		let mut event = map_event(event)?;
-		if let RunEvent::Output(update) = &mut event {
-			update.sequence = update.sequence.saturating_add(self.sequence_offset);
-			self.last_sequence = self.last_sequence.max(update.sequence);
-		}
-		Ok(event)
+	fn new(host: ExecHost, run: ExecRun) -> Self {
+		Self { host, run }
 	}
 }
 
 impl ShellRun for HostShellRun {
 	async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
-		loop {
-			if let Some(approval) = self.approval.get_mut().as_mut() {
-				let approved = approval.await;
-				*self.approval.get_mut() = None;
-				let denial = self
-					.pending_denial
-					.take()
-					.expect("sandbox approval always retains its denied result");
-				if !approved {
-					return Ok(Some(denial));
-				}
-				let rerun = self
-					.rerun
-					.take()
-					.expect("sandbox approval always retains its rerun request");
-				let denied_exec = Bytes::copy_from_slice(self.run.id());
-				let (_, run) = match self
-					.host
-					.exec_without_sandbox(rerun.request, rerun.timeout)
-					.await
-				{
-					Ok(started) => started,
-					Err(_) => return Ok(Some(denial)),
-				};
-				self.run = run;
-				self.sequence_offset = self.last_sequence.saturating_add(1);
-				let sequence = self.sequence_offset;
-				self.last_sequence = sequence;
-				return Ok(Some(RunEvent::Output(Update {
-					channel: OutputChannel::Stderr,
-					data: CowBytes::owned(Bytes::from_static(
-						b"[sandbox] original run denied; rerun without sandbox after approval\n",
-					)),
-					sequence,
-					exec_id: denied_exec,
-					started: false,
-					terminal: false,
-				})));
-			}
-
-			let Some(event) = self.run.next_event().await else {
-				return Ok(None);
-			};
-			let denied_path = self
-				.rerun
-				.as_ref()
-				.and_then(|_| sandbox_denied_event_path(&event));
-			let event = self.map_event(event)?;
-			let Some(denied_path) = denied_path else {
-				return Ok(Some(event));
-			};
-			let command = self
-				.rerun
-				.as_ref()
-				.and_then(|rerun| rerun.request.source.as_ref())
-				.map_or_else(Str::default, |source| Str::from(source.text.as_str()));
-			let host = self.host.clone();
-			self.pending_denial = Some(event);
-			*self.approval.get_mut() =
-				Some(Box::pin(
-					async move { host.approve_sandbox_bypass(&command, &denied_path).await },
-				));
-		}
+		self.run.next_event().await.map(map_event).transpose()
 	}
 
 	fn cancel(&self) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
@@ -673,10 +587,7 @@ impl ShellRun for SelectedShellRun {
 
 	async fn cancel(&self) -> Result<(), Fault> {
 		match &self.kind {
-			SelectedShellRunKind::Host(run) => {
-				run.run.cancel();
-				Ok(())
-			},
+			SelectedShellRunKind::Host(run) => run.cancel().await,
 			SelectedShellRunKind::Acp(run) => {
 				run.cancel.cancel();
 				Ok(())
@@ -711,8 +622,7 @@ impl ShellExec for ShellExecHost {
 		let environment = self
 			.environment(&cwd_uri, self.expand_environment(options.env).await?, pty)
 			.await;
-		if self.sandbox.mode == ExecSandboxMode::Off
-			&& self.sandbox.environment_policy_is_default()
+		if sandbox_authority_is_inactive(&self.sandbox)
 			&& self.acp_routing
 			&& self.acp.backend().is_some()
 			&& !pty
@@ -776,8 +686,7 @@ impl ShellExec for ShellExecHost {
 			.await?;
 		let environment = command_environment(self.expand_environment(request.environment).await?);
 		let acp_options = self.acp_sessions.lock().get(&session.id).cloned();
-		if self.sandbox.mode == ExecSandboxMode::Off
-			&& self.sandbox.environment_policy_is_default()
+		if sandbox_authority_is_inactive(&self.sandbox)
 			&& let Some(options) = acp_options
 		{
 			let backend = self.acp.backend().ok_or_else(|| Fault::Resource {
@@ -817,16 +726,11 @@ impl ShellExec for ShellExecHost {
 		super::exec::set_run_environment(&mut exec_request, environment);
 		let (_, run) = self
 			.host
-			.exec(exec_request.clone(), request.timeout_ms.map(Duration::from_millis))
+			.exec(exec_request, request.timeout_ms.map(Duration::from_millis))
 			.await
 			.map_err(|error| resource_fault("run", error))?;
 		Ok(SelectedShellRun {
-			kind: SelectedShellRunKind::Host(HostShellRun::new(
-				self.host.clone(),
-				run,
-				exec_request,
-				request.timeout_ms.map(Duration::from_millis),
-			)),
+			kind: SelectedShellRunKind::Host(HostShellRun::new(self.host.clone(), run)),
 		})
 	}
 
@@ -935,6 +839,21 @@ pub(crate) fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 	}
 }
 
+fn sandbox_authority_is_inactive(sandbox: &SandboxSettings) -> bool {
+	sandbox.mode == ExecSandboxMode::Off
+		&& sandbox.environment_policy_is_default()
+		&& sandbox.read_mode == ReadMode::Host
+		&& sandbox.readable_roots.is_empty()
+		&& sandbox.read_deny.is_empty()
+		&& sandbox.read_deny_globs.is_empty()
+		&& sandbox.network_mode == SandboxNetworkMode::Disabled
+		&& sandbox.allow_domains.is_empty()
+		&& sandbox.deny_domains.is_empty()
+		&& sandbox.allow_ports == [80, 443]
+		&& !sandbox.allow_localhost
+		&& sandbox.allow_unix_sockets.is_empty()
+}
+
 fn wire_bool(props: &Option<omp_proto::inference::v1::ValueMap>, key: &str) -> Option<bool> {
 	match props.as_ref()?.fields.get(key)?.kind.as_ref()? {
 		value::Kind::Bool(value) => Some(*value),
@@ -954,6 +873,25 @@ fn protocol_fault(operation: &'static str, message: impl Into<Str>) -> Fault {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn acp_requires_all_sandbox_authority_to_be_inactive() {
+		assert!(sandbox_authority_is_inactive(&SandboxSettings::default()));
+		for sandbox in [
+			SandboxSettings { network_mode: SandboxNetworkMode::Open, ..SandboxSettings::default() },
+			SandboxSettings { network_mode: SandboxNetworkMode::Scoped, ..SandboxSettings::default() },
+			SandboxSettings {
+				allow_domains: vec![sf!("api.example.test")],
+				..SandboxSettings::default()
+			},
+			SandboxSettings {
+				allow_unix_sockets: vec![sf!("/tmp/service.sock")],
+				..SandboxSettings::default()
+			},
+		] {
+			assert!(!sandbox_authority_is_inactive(&sandbox));
+		}
+	}
+
 	fn test_host(root: &Path) -> ShellExecHost {
 		let root_uri = Url::from_directory_path(root)
 			.expect("workspace URI")
@@ -970,8 +908,160 @@ mod tests {
 	}
 
 	#[cfg(target_os = "macos")]
+	async fn approval_gated_sandbox_run(
+		root: &Path,
+	) -> (ShellExecHost, Session, SelectedShellRun, omp_agent::ApprovalInbox) {
+		std::fs::create_dir(root.join(".git")).expect("git carve-out");
+		let exec = ExecHost::new();
+		let book = Arc::new(omp_agent::ApprovalBook::new());
+		let (route, inbox) = omp_agent::ApprovalRoute::new(book, None);
+		exec.bind_sandbox_approval_route(Some(route));
+		let root_uri = Url::from_directory_path(root)
+			.expect("workspace URI")
+			.to_string();
+		let host = ShellExecHost::new(
+			exec,
+			Str::from(root_uri),
+			Arc::new(ResolverTable::default()),
+			ShellSettings::default(),
+			SandboxSettings { mode: ExecSandboxMode::WorkspaceWrite, ..SandboxSettings::default() },
+			AcpExecSlot::default(),
+			false,
+		);
+		let session = host
+			.open_session(SessionOptions::default())
+			.await
+			.expect("sandbox session");
+		let run = host
+			.run(&session, RunRequest {
+				command:     sf!("echo approved > .git/approved.txt"),
+				environment: BTreeMap::new(),
+				timeout_ms:  Some(5_000),
+			})
+			.await
+			.expect("sandboxed command starts");
+		(host, session, run, inbox)
+	}
+
+	#[cfg(target_os = "macos")]
+	async fn pending_sandbox_approval(
+		run: &mut SelectedShellRun,
+		inbox: &omp_agent::ApprovalInbox,
+	) -> omp_agent::ApprovalRequest {
+		loop {
+			let pending = run.next_event();
+			tokio::pin!(pending);
+			tokio::select! {
+				request = inbox.recv() => return request.expect("sandbox approval ticket"),
+				event = &mut pending => match event.expect("sandboxed command event") {
+					Some(RunEvent::Started { .. } | RunEvent::Output(_)) => {},
+					Some(RunEvent::Exit(status)) => {
+						panic!("sandboxed command exited before approval: {status:?}")
+					},
+					None => panic!("sandboxed command stream closed before approval"),
+				},
+			}
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	fn approve_sandbox_amendment(request: omp_agent::ApprovalRequest) {
+		request
+			.respond(omp_agent::ApprovalDecision {
+				approved:   true,
+				scope:      sf!("once"),
+				source:     omp_agent::ApprovalSource::User,
+				decided_by: Some(sf!("test approver")),
+				reason:     None,
+				audited:    false,
+			})
+			.expect("approve sandbox amendment");
+	}
+
+	#[cfg(target_os = "macos")]
+	async fn assert_cancelled_without_sandbox_amendment(run: &mut SelectedShellRun, root: &Path) {
+		let status = loop {
+			let event = run
+				.next_event()
+				.await
+				.expect("cancelled sandbox event")
+				.expect("cancelled terminal event");
+			match event {
+				RunEvent::Started { .. } | RunEvent::Output(_) => {},
+				RunEvent::Exit(status) => break status,
+			}
+		};
+		assert_eq!(status.outcome, ExecOutcome::Cancelled);
+		assert!(status.aborted);
+		assert!(
+			run.next_event()
+				.await
+				.expect("closed cancelled stream")
+				.is_none(),
+			"cancellation must not emit a second execution start"
+		);
+		assert!(
+			!root.join(".git/approved.txt").exists(),
+			"cancellation must not permit the approved scoped write"
+		);
+	}
+
+	#[cfg(target_os = "macos")]
 	#[tokio::test]
-	async fn approved_sandbox_denial_reruns_exactly_once_without_hooks() {
+	async fn cancelling_before_sandbox_approval_never_reruns() {
+		if !omp_sandbox::backend_status(omp_sandbox::Backend::Seatbelt).is_available() {
+			return;
+		}
+		let root = tempfile::tempdir().expect("workspace");
+		let (host, session, mut run, inbox) = approval_gated_sandbox_run(root.path()).await;
+		let request = pending_sandbox_approval(&mut run, &inbox).await;
+
+		run.cancel().await.expect("cancel sandboxed command");
+
+		assert_cancelled_without_sandbox_amendment(&mut run, root.path()).await;
+		drop(request);
+		host.close_session(&session).await.expect("close session");
+	}
+
+	#[cfg(target_os = "macos")]
+	#[tokio::test]
+	async fn cancelling_concurrent_with_sandbox_approval_never_reruns() {
+		if !omp_sandbox::backend_status(omp_sandbox::Backend::Seatbelt).is_available() {
+			return;
+		}
+		let root = tempfile::tempdir().expect("workspace");
+		let (host, session, mut run, inbox) = approval_gated_sandbox_run(root.path()).await;
+		let request = pending_sandbox_approval(&mut run, &inbox).await;
+
+		let approval = async move { approve_sandbox_amendment(request) };
+		let cancellation = run.cancel();
+		let (_, result) = tokio::join!(approval, cancellation);
+		result.expect("cancel sandboxed command");
+
+		assert_cancelled_without_sandbox_amendment(&mut run, root.path()).await;
+		host.close_session(&session).await.expect("close session");
+	}
+
+	#[cfg(target_os = "macos")]
+	#[tokio::test]
+	async fn cancelling_after_dropping_pending_sandbox_event_blocks_late_approval() {
+		if !omp_sandbox::backend_status(omp_sandbox::Backend::Seatbelt).is_available() {
+			return;
+		}
+		let root = tempfile::tempdir().expect("workspace");
+		let (host, session, mut run, inbox) = approval_gated_sandbox_run(root.path()).await;
+		let request = pending_sandbox_approval(&mut run, &inbox).await;
+
+		run.cancel().await.expect("cancel sandboxed command");
+		approve_sandbox_amendment(request);
+
+		assert_cancelled_without_sandbox_amendment(&mut run, root.path()).await;
+		host.close_session(&session).await.expect("close session");
+	}
+
+	#[cfg(target_os = "macos")]
+	#[tokio::test]
+	async fn approved_sandbox_denial_reruns_once_with_scoped_policy() {
 		if !omp_sandbox::backend_status(omp_sandbox::Backend::Seatbelt).is_available() {
 			return;
 		}
@@ -1000,14 +1090,20 @@ mod tests {
 				.reasons
 				.first()
 				.expect("sandbox approval reason");
-			assert_eq!(reason.kind, "sandbox_bypass");
+			assert_eq!(reason.kind, "sandbox_amendment");
 			assert!(
 				reason
 					.pattern
 					.as_deref()
 					.is_some_and(|command| command == "echo approved > .git/approved.txt")
 			);
-			assert!(reason.subject.ends_with(".git/approved.txt"));
+			assert!(reason.subject.ends_with(".git"));
+			assert!(
+				reason
+					.evidence
+					.iter()
+					.any(|fact| fact.ends_with(".git/approved.txt"))
+			);
 			request
 				.respond(omp_agent::ApprovalDecision {
 					approved:   true,
@@ -1017,7 +1113,7 @@ mod tests {
 					reason:     None,
 					audited:    false,
 				})
-				.expect("approve sandbox bypass");
+				.expect("approve sandbox amendment");
 		});
 
 		let session = host
@@ -1044,15 +1140,33 @@ mod tests {
 		};
 		approver.await.expect("approver task");
 		assert_eq!(starts, 2);
-		assert_eq!(status.outcome, ExecOutcome::Exited);
+		assert_eq!(
+			status.outcome,
+			ExecOutcome::Exited,
+			"output={}",
+			String::from_utf8_lossy(&output)
+		);
 		assert_eq!(status.exit_code, Some(0));
 		let output = String::from_utf8_lossy(&output);
 		assert!(output.contains("sandbox denied write"));
-		assert!(output.contains("rerun without sandbox after approval"));
-		assert_eq!(
-			std::fs::read(root.path().join(".git/approved.txt")).expect("approved write"),
-			b"approved\n"
-		);
+		assert!(output.contains("rerun with approved scope"));
+		let mut restored = host
+			.run(&session, RunRequest {
+				command:     sf!("echo blocked > .git/blocked-again.txt"),
+				environment: BTreeMap::new(),
+				timeout_ms:  Some(5_000),
+			})
+			.await
+			.expect("restored sandboxed command starts");
+		let restored = loop {
+			match restored.next_event().await.expect("restored sandbox event") {
+				Some(RunEvent::Exit(status)) => break status,
+				Some(_) => {},
+				None => panic!("restored sandbox event stream closed before exit"),
+			}
+		};
+		assert_eq!(restored.outcome, ExecOutcome::Denied);
+		assert!(!root.path().join(".git/blocked-again.txt").exists());
 		host.close_session(&session).await.expect("close session");
 	}
 

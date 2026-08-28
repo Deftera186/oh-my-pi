@@ -304,15 +304,16 @@ fn inline_option<'a>(arguments: &[&'a str], prefix: &str) -> Option<&'a str> {
 
 /// Env-owned one-shot admission state for one invocation.
 pub struct AdmissionGate {
-	invocation_id: Str,
-	tool_name:     Str,
-	deadline:      Instant,
-	fragments:     BytesMut,
-	requested:     Option<Value>,
-	query_emitted: bool,
-	policy:        ApprovalPolicy,
-	answer_tx:     Option<flume::Sender<Admission>>,
-	answer_rx:     Receiver<Admission>,
+	invocation_id:      Str,
+	tool_name:          Str,
+	deadline:           Instant,
+	fragments:          BytesMut,
+	requested:          Option<Value>,
+	query_emitted:      bool,
+	policy:             ApprovalPolicy,
+	defer_until_commit: bool,
+	answer_tx:          Option<flume::Sender<Admission>>,
+	answer_rx:          Receiver<Admission>,
 }
 
 impl AdmissionGate {
@@ -329,6 +330,26 @@ impl AdmissionGate {
 		deadline: Duration,
 		policy: ApprovalPolicy,
 	) -> Self {
+		Self::with_policy_mode(invocation_id, tool_name, deadline, policy, false)
+	}
+
+	/// Starts a caller-composed gate whose query uses only committed arguments.
+	pub(crate) fn with_deferred_policy(
+		invocation_id: Str,
+		tool_name: Str,
+		deadline: Duration,
+		policy: ApprovalPolicy,
+	) -> Self {
+		Self::with_policy_mode(invocation_id, tool_name, deadline, policy, true)
+	}
+
+	fn with_policy_mode(
+		invocation_id: Str,
+		tool_name: Str,
+		deadline: Duration,
+		policy: ApprovalPolicy,
+		defer_until_commit: bool,
+	) -> Self {
 		let (answer_tx, answer_rx) = flume::bounded(1);
 		Self {
 			invocation_id,
@@ -338,6 +359,7 @@ impl AdmissionGate {
 			requested: None,
 			query_emitted: false,
 			policy,
+			defer_until_commit,
 			answer_tx: Some(answer_tx),
 			answer_rx,
 		}
@@ -352,6 +374,9 @@ impl AdmissionGate {
 		root: &Path,
 	) -> Option<AdmitInvocation> {
 		if self.query_emitted {
+			return None;
+		}
+		if self.defer_until_commit {
 			return None;
 		}
 		self.fragments.extend_from_slice(fragment.as_bytes());
@@ -445,6 +470,11 @@ impl AdmissionGate {
 		self.query_emitted && self.answer_tx.is_none()
 	}
 
+	/// Returns whether the caller must answer before effective arguments commit.
+	pub(crate) const fn requires_external_answer(&self) -> bool {
+		matches!(self.policy, ApprovalPolicy::Prompt)
+	}
+
 	/// Returns the deadline for a query that is waiting on Core.
 	pub(crate) fn pending_deadline(&self) -> Option<Instant> {
 		(self.query_emitted && self.answer_tx.is_some()).then_some(self.deadline)
@@ -501,8 +531,8 @@ pub fn effects_narrow_or_refuse(
 ) -> Option<Effects> {
 	let requested = requested.map(Effects::try_from).transpose().ok()?;
 	match requested {
-		Some(requested) => maximum.narrow(requested),
-		None => Some(maximum.clone()),
+		Some(requested) if !requested.is_empty() => maximum.narrow(requested),
+		Some(_) | None => Some(maximum.clone()),
 	}
 }
 
@@ -835,5 +865,17 @@ mod tests {
 			..Effects::empty()
 		};
 		assert_eq!(effects_narrow_or_refuse(None, &maximum), Some(maximum));
+	}
+
+	#[test]
+	fn default_effect_envelope_retains_declared_maximum() {
+		let maximum = Effects {
+			exec: Some(ToolExecEffects { commands: [sf!("git")].into(), network: false }),
+			..Effects::empty()
+		};
+		assert_eq!(
+			effects_narrow_or_refuse(Some(&EffectEnvelope::default()), &maximum),
+			Some(maximum),
+		);
 	}
 }

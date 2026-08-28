@@ -370,7 +370,7 @@ async fn set_model_control_request_commits_before_switching_the_live_snapshot() 
 		cwd:     root.clone(),
 	})
 	.expect("journal");
-	let (control, mailbox) = control_channel();
+	let (control, mailbox) = control_channel(omp_agent::EventBus::new());
 	let owner = tokio::spawn(async move {
 		let mut journal = journal;
 		assert!(matches!(

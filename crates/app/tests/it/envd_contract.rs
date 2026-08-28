@@ -593,6 +593,7 @@ impl Harness {
 				state.path(),
 				registry,
 				worker,
+				omp_app::SETTINGS_CATALOG,
 				RegistryBridges::default(),
 			)
 			.await
@@ -872,6 +873,7 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 		state.path(),
 		registry,
 		test_config(),
+		omp_app::SETTINGS_CATALOG,
 		RegistryBridges::default(),
 	)
 	.await;
@@ -911,11 +913,9 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("debug", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
-		("fetch", "1".to_owned()),
 		("glob", "1".to_owned()),
 		("grep", "1".to_owned()),
 		("lsp", "1".to_owned()),
-		("think", "1".to_owned()),
 		("todo", "1".to_owned()),
 		("web_search", "1".to_owned()),
 		("write", "1".to_owned()),
@@ -929,13 +929,14 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 				maximum_tools:  None,
 				maximum_strict: None,
 			},
-			&[sf!("yield")],
+			&[sf!("yield"), sf!("think")],
 		)
 		.expect("advertise hidden yield selection");
 	assert_eq!(
 		hidden_yield.len(),
-		1,
-		"yield must stay selectable for child sessions while hidden from the top-level agent"
+		2,
+		"yield and think must stay selectable for child/external-thinking sessions while hidden \
+		 from the top-level agent"
 	);
 	let write_definition = advertised
 		.iter()
@@ -1863,7 +1864,7 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 }
 
 #[tokio::test]
-async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools() {
+async fn uds_clients_invoke_owner_eval_and_retain_ordinary_tools() {
 	let harness = Harness::start(Registry::new()).await;
 	fs::write(harness.root.path().join("uds-note.txt"), "uds read\n").expect("UDS read fixture");
 	let advertised = harness
@@ -1924,24 +1925,19 @@ async fn uds_clients_cannot_invoke_session_local_eval_but_retain_ordinary_tools(
 		.await
 		.expect("UDS environment hello");
 
-	let mut denied = remote
-		.invoke(InvokeTool {
-			invocation_id: "remote-eval-denied".into(),
-			name: "eval".into(),
-			rev: "1".into(),
-			..InvokeTool::default()
-		})
-		.await
-		.expect("open denied remote eval request");
-	let error = denied
-		.next_event()
-		.await
-		.expect_err("UDS eval unexpectedly produced an event");
-	let omp_env::ClientError::Protocol(error) = error else {
-		panic!("UDS eval denial was not a typed protocol error");
-	};
-	assert_eq!(error.code, omp_proto::env::v1::ProtocolErrorCode::PermissionDenied as i32);
-	assert_eq!(error.message, "eval is available only through the session-local environment");
+	let remote_eval = invoke_builtin(
+		&remote,
+		"remote-eval-allowed",
+		"eval",
+		"1",
+		json!({"language":"py","code":"5 * 7"}),
+	)
+	.await;
+	assert!(
+		!remote_eval.is_error,
+		"owner-local UDS eval was denied: {}",
+		String::from_utf8_lossy(&remote_eval.json)
+	);
 
 	let read = invoke_builtin(
 		&remote,
@@ -1971,7 +1967,7 @@ async fn opt_in_python_admits_its_soft_declaration_without_shadowing_native_eval
 			maximum_strict: None,
 		})
 		.expect("advertise worker registry");
-	assert_eq!(advertised.len(), 18);
+	assert_eq!(advertised.len(), 16);
 	assert!(matches!(registry.route("py_eval").expect("python route"), ToolRoute::Worker { .. }));
 	assert_eq!(
 		registry
@@ -2011,7 +2007,7 @@ async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
 			maximum_strict: None,
 		})
 		.expect("advertise registry with prelude helper");
-	assert_eq!(advertised.len(), 18);
+	assert_eq!(advertised.len(), 16);
 
 	let verdict = invoke_builtin(
 		harness.client(),
@@ -2482,9 +2478,12 @@ async fn python_extension_data_reads_and_writes_live_workspace_only_during_invoc
 		approval_mode:      None,
 		trusted_extensions: vec![extension],
 		contributed_values: Vec::new(),
-		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
-			.expect("settings manager")
-			.snapshot(),
+		settings:           SettingsManager::open(
+			SettingsPaths::discover(&state, Some(&root)),
+			omp_app::SETTINGS_CATALOG,
+		)
+		.expect("settings manager")
+		.snapshot(),
 		bridges:            RegistryBridges::default(),
 		spawn_idle_timeout: Some(2),
 	})
@@ -3438,9 +3437,12 @@ async fn owner_client_lsp_status_reports_discovered_workspace_roster() {
 		approval_mode:      None,
 		trusted_extensions: Vec::new(),
 		contributed_values: Vec::new(),
-		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
-			.expect("settings manager")
-			.snapshot(),
+		settings:           SettingsManager::open(
+			SettingsPaths::discover(&state, Some(&root)),
+			omp_app::SETTINGS_CATALOG,
+		)
+		.expect("settings manager")
+		.snapshot(),
 		bridges:            RegistryBridges::default(),
 		spawn_idle_timeout: Some(2),
 	})

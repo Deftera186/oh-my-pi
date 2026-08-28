@@ -1,4 +1,3 @@
-#![feature(integer_atomics)]
 //! Transport-neutral foundations for durable, interruptible OMP agent loops.
 //!
 //! The crate composes immutable configuration snapshots, deterministic system
@@ -52,6 +51,7 @@ mod state;
 mod stateful;
 pub mod streaming_edit_guard;
 mod subagent;
+mod system_wrapper;
 mod todo_restore;
 pub mod tool_choice;
 mod tree;
@@ -75,15 +75,16 @@ pub use autolearn::{
 	capture_interrupt, is_capture_item, standing_guidance,
 };
 pub use batch::{
-	BatchError, BatchResult, CommittedCall, EXECUTION_MODE_PROP, InvocationAdmission,
-	InvocationHookBus, InvocationHookRequest, PLAN_YOLO_PROP, PREWALK_REASON_PROP, SpeculativeCall,
-	ToolBatch, effects_mutate_environment, hook_event_mask, invocation_mode_props,
+	BatchError, BatchResult, CORE_ADMISSION_PROP, CommittedCall, EXECUTION_MODE_PROP,
+	InvocationAdmission, InvocationHookBus, InvocationHookRequest, PLAN_YOLO_PROP,
+	PREWALK_REASON_PROP, SpeculativeCall, ToolBatch, effects_mutate_environment, hook_event_mask,
+	invocation_mode_props,
 };
 pub use broker::{
 	AgentHistory, AgentRecord, AgentRegistry, Broker, BrokerError, BrokerInbox, CollabAgentKind,
 	CollabAgentRecord, CollabRegistrySnapshot, DeliveryMode, DeliveryReceipt, DiscoveryDiagnostic,
 	DiscoveryDiagnosticKind, ParkLease, PeerMessage, Receipt, RegistryError, RegistryStatus,
-	RevivalRequest, RoutedEvent, now_ms as broker_now_ms, peer_item,
+	RevivalRequest, RoutedEvent, TurnEndDisposition, WaitError, now_ms as broker_now_ms, peer_item,
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCancellation,
@@ -198,8 +199,9 @@ pub use regime::{
 	RegimeLifetime, RegimeRecord, RegimeSet, RegimeSpec, RegimeStateError, RegimeStatus,
 	RegimeStepResult, RegimeWhen, Resource, ResourceDecl, ResourceRegistry, RevivalReport,
 	ScopedSetting, SettingSlot, StartError, StartOptions, StartReceipt, StopError,
-	SubagentYieldRegime, WaitError, WaitSet, WaitTicket, autoresearch_regime_spec, core_regime,
-	goal_regime_spec, plan_regime_spec, prewalk_regime_spec, vibe_regime_spec,
+	SubagentYieldRegime, WaitError as RegimeWaitError, WaitSet, WaitTicket,
+	autoresearch_regime_spec, core_regime, goal_regime_spec, plan_regime_spec, prewalk_regime_spec,
+	vibe_regime_spec,
 };
 pub use revival::{RevivalError, RevivedSession, revive, revive_existing};
 pub use schedule::{
@@ -218,6 +220,7 @@ pub use subagent::{
 	SubagentLifecycle, SubagentProgressSnapshot, SubagentRunEvent, SubagentRunEventKind,
 	SubagentRunState, SubagentStateError, SubagentTerminalKind, SubagentTerminalStatus,
 };
+pub use system_wrapper::strip_system_wrapper;
 pub use todo_restore::TodoRestore;
 pub use tree::{
 	AgentAuxiliary, AgentDefinition, AgentDefinitionError, AgentKind, AgentModelPurpose, AgentNode,

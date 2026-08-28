@@ -52,6 +52,7 @@ fn factory(reveal: &[&str]) -> omp_driver::auth_backend::GatewayCredentialSecret
 	gateway_credential_control_factory(
 		Endpoint::from_static("http://127.0.0.1:9").connect_lazy(),
 		Some(SecretString::from("gateway-token-marker")),
+		omp_inference::auth::UsageAttribution::new("test-install", "test-app", Some("test-host")),
 		BTreeMap::from([(sf!("fixture.gateway"), grant)]),
 		Arc::from([]),
 		Arc::<str>::from("gateway-test-placeholder"),

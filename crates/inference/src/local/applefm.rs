@@ -1177,6 +1177,7 @@ fn apple_discovered_model(
 			maximum_output_tokens: None,
 			maximum_batch:         Some(1),
 		}),
+		declared_pricing:      Box::new([]),
 		extended_context_mode: None,
 		availability:          Some(if evidence.state == AppleFmSupportState::Available {
 			ModelAvailability::Available

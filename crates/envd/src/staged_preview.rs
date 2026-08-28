@@ -94,8 +94,9 @@ impl StagedPreviewRegime {
 		);
 		Item {
 			kind: Some(item::Kind::Message(thread::Message {
-				role:  thread::Role::User as i32,
+				role: thread::Role::User as i32,
 				parts: vec![thread::Part { kind: Some(thread::part::Kind::Text(text.to_string())) }],
+				..Default::default()
 			})),
 			..Item::default()
 		}

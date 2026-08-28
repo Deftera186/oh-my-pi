@@ -1,8 +1,6 @@
 //! Typed settings owned by the Environment MCP runtime.
 
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain};
 use serde::{Deserialize, Serialize};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
@@ -40,8 +38,6 @@ impl SettingsDomain for McpSettings {
 	}
 }
 
-omp_settings::inventory::submit! { DomainRegistration::of::<McpSettings>() }
-
 #[cfg(test)]
 mod tests {
 	use omp_settings::SettingsSnapshot;
@@ -49,19 +45,16 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn projection_defaults_enabled_and_registration_is_linked() {
-		let snapshot = SettingsSnapshot::isolated(McpSettings::default()).expect("snapshot");
+	fn projection_defaults_enabled() {
+		let snapshot =
+			SettingsSnapshot::isolated(McpSettings::default(), crate::TEST_SETTINGS_CATALOG)
+				.expect("snapshot");
 		assert!(
 			snapshot
 				.project::<McpSettings>()
 				.expect("projection")
 				.get()
 				.enable_project_config
-		);
-		assert!(
-			omp_settings::registered_domains()
-				.iter()
-				.any(|registration| registration.name == McpSettings::DOMAIN)
 		);
 	}
 }

@@ -36,7 +36,7 @@ use crate::{
 		ToolInputKind, UnvalidatedToolCall,
 	},
 	error::{
-		Error, ErrorKind, ErrorPhase, RetryAction, classify_provider_rejection,
+		Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction, classify_provider_rejection,
 		is_transient_generation_fault,
 	},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
@@ -1778,9 +1778,12 @@ impl Decoder for OpenAiChatDecoder {
 		}
 		let chunk: WireChunk =
 			serde_json::from_slice(&event.data).map_err(|_| self.decode_error(None))?;
-		if let Some(error) = chunk.error {
+		if let Some(error) = chunk
+			.error
+			.or_else(|| chunk.message.map(WireStreamError::Text))
+		{
 			self.done = true;
-			emit(RawEvent::Failure(classify_error(error, self.committed)));
+			emit(RawEvent::Failure(classify_stream_error(error, self.committed)));
 			return Ok(());
 		}
 		let final_usage = chunk.choices.is_empty();
@@ -1820,7 +1823,7 @@ impl OpenAiChatDecoder {
 		let payload = choice.delta.or(choice.message).unwrap_or_default();
 		if let Some(error) = payload.error {
 			self.done = true;
-			emit(RawEvent::Failure(classify_error(error, self.committed)));
+			emit(RawEvent::Failure(classify_stream_error(error, self.committed)));
 			return;
 		}
 		let reasoning = payload
@@ -2026,7 +2029,9 @@ struct WireChunk {
 	#[serde(default)]
 	usage:   Option<WireUsage>,
 	#[serde(default)]
-	error:   Option<WireError>,
+	error:   Option<WireStreamError>,
+	#[serde(default)]
+	message: Option<Str>,
 }
 
 #[derive(Deserialize)]
@@ -2059,7 +2064,7 @@ struct WirePayload {
 	#[serde(default)]
 	reasoning_details: Vec<WireReasoningDetail>,
 	#[serde(default)]
-	error:             Option<WireError>,
+	error:             Option<WireStreamError>,
 }
 
 #[derive(Deserialize)]
@@ -2273,11 +2278,20 @@ impl WireFinishReason {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum WireStreamError {
+	Structured(WireError),
+	Text(Str),
+}
+
+#[derive(Deserialize)]
 struct WireError {
 	#[serde(default)]
 	code:            Option<ErrorCode>,
 	#[serde(default)]
 	message:         Option<Str>,
+	#[serde(default, rename = "type")]
+	kind:            Option<Str>,
 	#[serde(default)]
 	param:           Option<Str>,
 	#[serde(default)]
@@ -2310,15 +2324,49 @@ struct ErrorMetadata {
 	raw: Option<Str>,
 }
 
+fn classify_stream_error(error: WireStreamError, committed: bool) -> Error {
+	match error {
+		WireStreamError::Structured(error) => classify_error(error, committed),
+		WireStreamError::Text(message) => Error::new(
+			ErrorKind::Protocol,
+			if committed {
+				ErrorPhase::Streaming
+			} else {
+				ErrorPhase::Handshake
+			},
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.detail(ErrorDetail::provider(message))
+		.committed(committed),
+	}
+}
+
 fn classify_error(error: WireError, committed: bool) -> Error {
 	let status = match error.code.as_ref() {
 		Some(ErrorCode::Number(value)) => u16::try_from(*value).ok(),
 		Some(ErrorCode::Text(value)) => value.as_str().parse().ok(),
-		None => None,
+		None => error.kind.as_deref().and_then(|kind| {
+			let kind = kind.trim();
+			if kind.eq_ignore_ascii_case("SERVICE_UNAVAILABLE") {
+				Some(503)
+			} else if kind.eq_ignore_ascii_case("TOO_MANY_REQUESTS") {
+				Some(429)
+			} else if kind.eq_ignore_ascii_case("REQUEST_TIMEOUT") {
+				Some(408)
+			} else {
+				None
+			}
+		}),
 	};
-	let code = error.code.as_ref().map(ErrorCode::text);
+	let code = error
+		.code
+		.as_ref()
+		.map(ErrorCode::text)
+		.or_else(|| error.kind.clone());
 	let code_text = code.as_ref().map(Str::as_str).unwrap_or_default();
 	let message = error.message.as_ref().map(Str::as_str).unwrap_or_default();
+	let provider_message = error.message.clone().filter(|message| !message.is_empty());
 	// DashScope / Bailian reports its per-minute TPM/TPS throttle (429
 	// `Throttling.AllocationQuota`, type `insufficient_quota`) with
 	// OpenAI-compatible billing wording, but links the error-code doc's
@@ -2341,14 +2389,8 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 			b"failed to parse tool call arguments as json",
 		) || contains_ascii_case_insensitive(message.as_bytes(), b"[json.exception.parse_error.101]");
 	let transient_server_error = !deterministic_parse_failure
-		&& matches!(
-			code_text,
-			"500"
-				| "502" | "503"
-				| "529" | "server_error"
-				| "internal_server_error"
-				| "overloaded_error"
-		);
+		&& (matches!(status, Some(500 | 502 | 503 | 529))
+			|| matches!(code_text, "server_error" | "internal_server_error" | "overloaded_error"));
 	// LiteLLM (and compatible proxies) shed over-concurrency requests *before*
 	// dispatching to the model backend, marking the immediate 429 with
 	// `rate_limit_type: max_parallel_requests`. That is an admission failure,
@@ -2375,7 +2417,8 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 		(kind, RetryAction::Never)
 	} else if generation_fault {
 		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: Duration::ZERO })
-	} else if matches!(code_text, "invalid_api_key" | "authentication_error" | "401") {
+	} else if status == Some(401) || matches!(code_text, "invalid_api_key" | "authentication_error")
+	{
 		(
 			ErrorKind::Authentication,
 			if committed {
@@ -2384,7 +2427,7 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 				RetryAction::RefreshCredential
 			},
 		)
-	} else if matches!(code_text, "permission_denied" | "403") {
+	} else if status == Some(403) || code_text == "permission_denied" {
 		(
 			ErrorKind::Authorization,
 			if committed {
@@ -2397,9 +2440,18 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 		// Concurrency-admission shed: surface immediately so the fallback walk
 		// owns retry instead of the transport's same-route sleep.
 		(ErrorKind::RateLimited, RetryAction::ReselectRoute)
-	} else if matches!(code_text, "rate_limit_exceeded" | "429") {
+	} else if status == Some(429) || code_text == "rate_limit_exceeded" {
 		// Transient rate throttle: short backoff on the same credential.
 		(ErrorKind::RateLimited, RetryAction::SameRoute { after: Duration::from_secs(30) })
+	} else if status == Some(408) {
+		(
+			ErrorKind::DeadlineExceeded,
+			if committed {
+				RetryAction::Never
+			} else {
+				RetryAction::SameRoute { after: Duration::ZERO }
+			},
+		)
 	} else if code_text == "insufficient_quota" && dashscope_token_limit {
 		(ErrorKind::RateLimited, RetryAction::SameRoute { after: Duration::from_secs(30) })
 	} else if code_text == "insufficient_quota" {
@@ -2413,16 +2465,16 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 		// safely pre-commit; the retry layer bounds attempts and refuses once
 		// output committed.
 		(ErrorKind::ResourceExhausted, RetryAction::SameRoute { after: Duration::from_millis(500) })
-	} else if matches!(code_text, "402" | "payment_required") {
+	} else if status == Some(402) || code_text == "payment_required" {
 		(ErrorKind::PaymentRequired, RetryAction::Never)
 	} else if template_effort_rejection {
 		(ErrorKind::InvalidRequest, RetryAction::SameRoute { after: Duration::ZERO })
-	} else if matches!(code_text, "400" | "invalid_request_error") {
+	} else if status == Some(400) || code_text == "invalid_request_error" {
 		(ErrorKind::InvalidRequest, RetryAction::Never)
 	} else {
 		(ErrorKind::ProviderContractMismatch, RetryAction::Never)
 	};
-	Error::new(
+	let classified = Error::new(
 		kind,
 		if committed {
 			ErrorPhase::Streaming
@@ -2439,7 +2491,11 @@ fn classify_error(error: WireError, committed: bool) -> Error {
 			.or_else(|| error.metadata.and_then(|metadata| metadata.raw))
 			.or(code),
 	)
-	.committed(committed)
+	.committed(committed);
+	match provider_message {
+		Some(message) => classified.detail(ErrorDetail::provider(message)),
+		None => classified,
+	}
 }
 
 /// Canonical structured code for a rejected kwargs effort spelling.
@@ -2610,7 +2666,7 @@ mod tests {
 		},
 		catalog::ReasoningEffort,
 		codec::{Decoder, RawEvent},
-		error::{Error, ErrorKind, RetryAction},
+		error::{Error, ErrorDetail, ErrorKind, RetryAction},
 		event::{ChatEvent, FinishReason},
 		transport::{Frame, SseDecoder, SseEvent},
 	};
@@ -3110,12 +3166,87 @@ mod tests {
 	}
 
 	#[test]
+	fn in_band_stream_errors_decode_nested_and_flat_envelopes() {
+		let cases = [
+			(
+				br#"{"error":{"message":"queue full","type":"SERVICE_UNAVAILABLE"}}"#.as_slice(),
+				ErrorKind::ResourceExhausted,
+				Some(503),
+				Some("queue full"),
+			),
+			(
+				br#"{"error":"rate limit exceeded"}"#.as_slice(),
+				ErrorKind::Protocol,
+				None,
+				Some("rate limit exceeded"),
+			),
+			(
+				br#"{"message":"provider temporarily unavailable"}"#.as_slice(),
+				ErrorKind::Protocol,
+				None,
+				Some("provider temporarily unavailable"),
+			),
+		];
+		for (fixture, kind, status, detail) in cases {
+			let mut decoder = OpenAiChatDecoder::default();
+			let mut events = Vec::new();
+			decoder
+				.push(
+					Frame::Sse(SseEvent { name: None, data: Bytes::copy_from_slice(fixture) }),
+					&mut |event| events.push(event),
+				)
+				.expect("in-band stream error decodes");
+			let error = events
+				.into_iter()
+				.find_map(|event| match event {
+					RawEvent::Failure(error) => Some(error),
+					_ => None,
+				})
+				.expect("typed stream failure");
+			assert_eq!(error.kind, kind);
+			assert_eq!(error.status, status);
+			assert_eq!(
+				error.detail_ref().and_then(|detail| match detail {
+					ErrorDetail::Provider { sanitized_message } => Some(sanitized_message.as_str()),
+					_ => None,
+				}),
+				detail,
+			);
+		}
+
+		let mut decoder = OpenAiChatDecoder::default();
+		let mut events = Vec::new();
+		for data in [
+			br#"{"choices":[{"index":0,"delta":{"content":"partial"}}]}"#.as_slice(),
+			br#"{"error":"stream failed"}"#.as_slice(),
+		] {
+			decoder
+				.push(
+					Frame::Sse(SseEvent { name: None, data: Bytes::copy_from_slice(data) }),
+					&mut |event| events.push(event),
+				)
+				.expect("mid-stream error decodes");
+		}
+		let failure = events
+			.into_iter()
+			.find_map(|event| match event {
+				RawEvent::Failure(error) => Some(error),
+				_ => None,
+			})
+			.expect("mid-stream typed failure");
+		assert!(failure.committed);
+		assert_eq!(failure.phase, crate::error::ErrorPhase::Streaming);
+		assert_eq!(failure.action, RetryAction::Never);
+	}
+
+	#[test]
 	fn dashscope_token_limit_requires_anchor_and_exact_billing_wording() {
 		let classify = |message: &str| {
 			classify_error(
 				WireError {
 					code:            Some(ErrorCode::Text("insufficient_quota".into())),
 					message:         Some(message.into()),
+					kind:            None,
 					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
@@ -3166,6 +3297,7 @@ mod tests {
 				WireError {
 					code:            Some(ErrorCode::Text(code.into())),
 					message:         Some(message.into()),
+					kind:            None,
 					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
@@ -3200,6 +3332,7 @@ mod tests {
 				WireError {
 					code:            Some(ErrorCode::Text(code.into())),
 					message:         Some("denied".into()),
+					kind:            None,
 					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
@@ -3236,6 +3369,7 @@ mod tests {
 				WireError {
 					code:            code.map(|value| ErrorCode::Text(value.into())),
 					message:         Some("Max parallel request limit reached".into()),
+					kind:            None,
 					param:           None,
 					metadata:        None,
 					rate_limit_type: rate_limit_type.map(Into::into),
@@ -3302,6 +3436,7 @@ mod tests {
 				WireError {
 					code:            Some(ErrorCode::Text(code.into())),
 					message:         Some(message.into()),
+					kind:            None,
 					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
@@ -3328,6 +3463,7 @@ mod tests {
 				WireError {
 					code:            Some(code),
 					message:         message.map(Into::into),
+					kind:            None,
 					param:           None,
 					metadata:        None,
 					rate_limit_type: None,
@@ -3815,6 +3951,7 @@ mod tests {
 				WireError {
 					code:            code.map(|value| ErrorCode::Text(value.into())),
 					message:         message.map(Into::into),
+					kind:            None,
 					param:           param.map(Into::into),
 					metadata:        None,
 					rate_limit_type: None,

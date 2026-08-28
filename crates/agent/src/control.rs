@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::{
 	AgentHostControl, ArbiterError, ProjectionError, core_regime,
+	events::EventBus,
 	journal::{
 		Journal, JournalCustomEntry, JournalError, JournalQuery, JournalReply, JournalRequest,
 		SessionStateValue, SessionStateWatchEvent, WorkspaceRoots,
@@ -54,6 +55,7 @@ pub struct ControlSender {
 pub struct ControlMailbox {
 	commands:         Receiver<ControlCommand>,
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
+	events:           EventBus,
 }
 
 /// Failure to deliver or execute a journal-owner CONTROL operation.
@@ -262,7 +264,9 @@ type JournalReplyResult<T> = Result<T, JournalError>;
 /// The channel is unbounded because every durable request already has a bounded
 /// protobuf frame and backpressure happens at the worker request correlation
 /// slot. The receiver must stay with the sole [`Journal`] owner.
-pub fn channel() -> (ControlSender, ControlMailbox) {
+/// Title commands publish through `events` only after that owner accepts the
+/// journal and session-index writes.
+pub fn channel(events: EventBus) -> (ControlSender, ControlMailbox) {
 	let (commands, receiver) = flume::unbounded();
 	let checkpoint_state = Arc::new(Mutex::new(CheckpointState::default()));
 	(
@@ -272,7 +276,7 @@ pub fn channel() -> (ControlSender, ControlMailbox) {
 			checkpoint_state: Arc::clone(&checkpoint_state),
 			host_control: Arc::new(Mutex::new(None)),
 		},
-		ControlMailbox { commands: receiver, checkpoint_state },
+		ControlMailbox { commands: receiver, checkpoint_state, events },
 	)
 }
 
@@ -837,7 +841,7 @@ impl ControlMailbox {
 		let Ok(command) = self.commands.recv_async().await else {
 			return ControlMailboxEvent::Closed;
 		};
-		handle_command(journal, command, &self.checkpoint_state)
+		handle_command(journal, command, &self.checkpoint_state, &self.events)
 	}
 
 	/// Drains at most `limit` commands already waiting at an agent-loop mailbox
@@ -860,7 +864,7 @@ impl ControlMailbox {
 			let Ok(command) = self.commands.try_recv() else {
 				break;
 			};
-			match handle_command(journal, command, &self.checkpoint_state) {
+			match handle_command(journal, command, &self.checkpoint_state, &self.events) {
 				ControlMailboxEvent::Rewind(rewind) => surfaced.push_back(rewind),
 				ControlMailboxEvent::Regime(regime) => regimes.push(regime),
 				ControlMailboxEvent::ProjectThread { reply } => projections.push(reply),
@@ -971,6 +975,7 @@ fn handle_command(
 	journal: &mut Journal,
 	command: ControlCommand,
 	checkpoint_state: &Mutex<CheckpointState>,
+	events: &EventBus,
 ) -> ControlMailboxEvent {
 	match command {
 		ControlCommand::Regime(command) => return ControlMailboxEvent::Regime(command),
@@ -1003,7 +1008,7 @@ fn handle_command(
 			let _ = reply.send(journal.move_workspace_root(ts, root));
 		},
 		ControlCommand::SetTitle { ts, title, source, reply } => {
-			let _ = reply.send(journal.append_title(ts, title, source));
+			let _ = reply.send(journal.append_title_and_publish(ts, title, source, events));
 		},
 		ControlCommand::Checkpoint { goal, reply } => {
 			let mut state = checkpoint_state.lock();
@@ -1118,9 +1123,10 @@ fn handle_command(
 }
 #[cfg(test)]
 mod tests {
-	use omp_storage::transcript::{Header, SessionId};
+	use omp_storage::transcript::{Header, Kind, SessionId};
 
 	use super::*;
+	use crate::events::AgentEvent;
 
 	#[tokio::test]
 	async fn project_thread_command_is_surfaced_to_the_full_agent_owner() {
@@ -1133,7 +1139,7 @@ mod tests {
 			cwd:     temp.path().to_path_buf(),
 		})
 		.unwrap();
-		let (sender, mailbox) = channel();
+		let (sender, mailbox) = channel(EventBus::new());
 
 		let requester = sender.project_thread();
 		let owner = async {
@@ -1145,6 +1151,55 @@ mod tests {
 		};
 		let (thread, ()) = tokio::join!(requester, owner);
 		assert!(thread.unwrap().items.is_empty());
+	}
+
+	#[tokio::test]
+	async fn generated_title_is_durable_and_publishes_one_assistant_event() {
+		let temp = tempfile::tempdir().unwrap();
+		let path = temp.path().join("generated-title-session.jsonl");
+		let mut journal = Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(Str::new_static("generated-title-control-test")),
+			created: 1,
+			cwd:     temp.path().to_path_buf(),
+		})
+		.unwrap();
+		let events = EventBus::new();
+		let observed = events.subscribe_lossless();
+		let (sender, mailbox) = channel(events);
+		let title = Str::new_static("Generated session title");
+
+		let requester = sender.set_generated_title(2, title.clone());
+		let owner = async {
+			assert!(matches!(
+				mailbox.handle_next(&mut journal).await,
+				ControlMailboxEvent::JournalHandled
+			));
+		};
+		let (index, ()) = tokio::join!(requester, owner);
+		let index = index.unwrap();
+		assert_eq!(index, 0);
+
+		assert_eq!(observed.len(), 1);
+		let event = observed.recv().await.unwrap();
+		assert!(matches!(
+			event.as_ref(),
+			AgentEvent::TitleChanged { title: observed_title, source: TitleSource::Assistant }
+				if observed_title == &title
+		));
+		assert!(observed.try_recv().is_err());
+
+		drop(journal);
+		let reopened = Journal::open(&path).unwrap();
+		let durable = reopened.load().unwrap();
+		let Some(omp_storage::transcript::Entry::Ok(event)) = durable.get(index) else {
+			panic!("generated title was not durably recorded");
+		};
+		assert!(matches!(
+			&event.kind,
+			Kind::Title { title: durable_title, source: TitleSource::Assistant }
+				if durable_title == &title
+		));
 	}
 
 	#[tokio::test]
@@ -1162,7 +1217,7 @@ mod tests {
 			cwd:     primary.clone(),
 		})
 		.unwrap();
-		let (sender, mailbox) = channel();
+		let (sender, mailbox) = channel(EventBus::new());
 
 		let requester = async {
 			sender.move_workspace_root(2, moved.clone()).await.unwrap();

@@ -1,9 +1,7 @@
 //! Layered settings projection owned by the discovery runtime.
 
 use omp_core::Str;
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use serde::{Deserialize, Serialize};
 
 use super::manifest::CapabilityKind;
@@ -112,18 +110,17 @@ impl SettingsDomain for DiscoverySettings {
 	}
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<DiscoverySettings>()
-}
-
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::{SettingsCatalog, SettingsSnapshot};
 
 	use super::*;
 
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
+
 	#[test]
-	fn discovery_settings_projection_and_registration_are_typed() {
+	fn discovery_settings_projection_is_typed() {
 		let configured = DiscoverySettings {
 			disabled_providers: vec!["foreign-content".into()],
 			disabled_sources:   vec!["project-rules".into()],
@@ -132,7 +129,7 @@ mod tests {
 				key:  "rust".into(),
 			}],
 		};
-		let snapshot = SettingsSnapshot::isolated(configured).expect("isolated settings");
+		let snapshot = SettingsSnapshot::isolated(configured, CATALOG).expect("isolated settings");
 		let projection = snapshot
 			.project::<DiscoverySettings>()
 			.expect("typed projection");
@@ -142,11 +139,6 @@ mod tests {
 			projection
 				.get()
 				.shadows_builtin(CapabilityKind::Skills, "rust")
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == DiscoverySettings::DOMAIN)
 		);
 	}
 

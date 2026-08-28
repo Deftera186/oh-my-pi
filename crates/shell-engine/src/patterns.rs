@@ -3,7 +3,7 @@
 use std::{collections::VecDeque, fs, mem, path::Path};
 
 use crate::{
-	error,
+	PathPolicy, error,
 	parser::pattern::{self, pattern_has_glob_metacharacters},
 	regex,
 	regex::regex_char_is_special,
@@ -160,6 +160,7 @@ impl Pattern {
 	/// * `working_dir` - The current working directory, used for relative paths.
 	/// * `path_filter` - Optionally provides a function that filters paths after
 	///   expansion.
+	/// * `path_policy` - Optional authority required before directory traversal.
 	#[expect(
 		clippy::too_many_lines,
 		reason = "glob expansion covers the full shell pattern grammar"
@@ -168,6 +169,7 @@ impl Pattern {
 		&self,
 		working_dir: &Path,
 		path_filter: Option<&PF>,
+		path_policy: Option<&dyn PathPolicy>,
 		options: &FilenameExpansionOptions,
 	) -> Result<PatternExpansionResult, error::Error>
 	where
@@ -296,6 +298,9 @@ impl Pattern {
 
 			let current_paths = mem::take(&mut paths_so_far);
 			for current_path in current_paths {
+				if let Some(policy) = path_policy {
+					policy.check_read(&current_path)?;
+				}
 				let subpattern = Self::from(&component)
 					.set_extended_globbing(self.enable_extended_globbing)
 					.set_case_insensitive(self.case_insensitive);
@@ -898,6 +903,7 @@ mod tests {
 		let result = pattern.expand::<fn(&Path) -> bool>(
 			scratch.path(),
 			None,
+			None,
 			&FilenameExpansionOptions::default(),
 		)?;
 
@@ -935,6 +941,7 @@ mod tests {
 		let pattern = Pattern::from(abs_pattern.as_str()).set_extended_globbing(false);
 		let result = pattern.expand::<fn(&Path) -> bool>(
 			Path::new("/"),
+			None,
 			None,
 			&FilenameExpansionOptions::default(),
 		)?;

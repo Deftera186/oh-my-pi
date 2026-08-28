@@ -837,13 +837,18 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
 		// On error (e.g. malformed pattern), default to NoGlob so the field
 		// passes through as a literal rather than triggering failglob.
-		let expansion = pattern
-			.expand(
-				self.shell.working_dir(),
-				Some(&patterns::Pattern::accept_all_expand_filter),
-				&options,
-			)
-			.unwrap_or_default();
+		let expansion = match pattern.expand(
+			self.shell.working_dir(),
+			Some(&patterns::Pattern::accept_all_expand_filter),
+			self.params.path_policy().map(AsRef::as_ref),
+			&options,
+		) {
+			Ok(expansion) => expansion,
+			Err(error) if matches!(error.kind(), error::ErrorKind::PathDenied(_)) => {
+				return Err(error);
+			},
+			Err(_) => patterns::PatternExpansionResult::default(),
+		};
 
 		if expansion.is_unmatched_glob() && self.shell.options().fail_expansion_on_globs_without_match
 		{

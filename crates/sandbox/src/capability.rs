@@ -340,6 +340,7 @@ const BUBBLEWRAP: CapabilitySet = set(&[
 	Capability::IpcRestrict,
 	Capability::NetDisable,
 	Capability::NetEnable,
+	Capability::NetOutbound,
 ]);
 const LANDLOCK: CapabilitySet = crate::backends::landlock::capabilities();
 const GVISOR: CapabilitySet = set(&[

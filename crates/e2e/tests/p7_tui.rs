@@ -191,7 +191,6 @@ impl ScriptedGateway {
 			"debug",
 			"edit",
 			"eval",
-			"fetch",
 			"glob",
 			"grep",
 			"hub",
@@ -936,7 +935,8 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	let preview = wait_snapshot(&mut debug, &raw_capture, "edit preview", |snapshot| {
 		let surface = snapshot.combined();
 		surface.contains("read scratch.txt · Lines 1 · Size 24B")
-			&& surface.contains("edit edit · scratch.txt")
+			&& surface.contains("edit")
+			&& !surface.contains("edit · scratch.txt")
 			&& surface.contains("scratch.txt +1 -1 1 op")
 			&& surface.contains("+ new")
 			&& surface.contains("streaming arguments")
@@ -946,7 +946,9 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	gateway.release_preview();
 	let final_edit = wait_snapshot(&mut debug, &raw_capture, "edit final", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("edit@hl.1 · edit · scratch.txt")
+		surface.contains("edit")
+			&& !surface.contains("edit@hl.1")
+			&& !surface.contains("edit · scratch.txt")
 			&& surface.contains("scratch.txt +1 -1 2 ops")
 			&& surface.contains("- 1|old")
 			&& surface.contains("+ 1|new")
@@ -957,21 +959,31 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	gateway.release(2);
 	let shell_live = wait_snapshot(&mut debug, &raw_capture, "shell live tail", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("bash bash ·") && surface.contains("10B") && surface.contains("live-tail")
+		surface.contains("bash")
+			&& !surface.contains("bash bash ·")
+			&& !surface.contains("bash@1")
+			&& surface.contains("$ printf")
+			&& surface.contains("10B")
+			&& surface.contains("live-tail")
 	});
 	assert_surface(&shell_live, "shell live");
 	assert!(
 		shell_live
 			.frame
 			.contains("read scratch.txt · Lines 1 · Size 24B")
-			&& shell_live.frame.contains("edit@hl.1 · edit · scratch.txt"),
+			&& shell_live.frame.contains("edit")
+			&& !shell_live.frame.contains("edit@hl.1")
+			&& !shell_live.frame.contains("edit · scratch.txt"),
 		"prior transcript vanished during shell stream: {}",
 		shell_live.frame
 	);
 	fs::write(&shell_release, b"release").expect("release shell fixture");
 	let shell_final = wait_snapshot(&mut debug, &raw_capture, "shell exit badge", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("bash@1 · bash ·")
+		surface.contains("bash")
+			&& !surface.contains("bash@1")
+			&& !surface.contains("bash ·")
+			&& surface.contains("$ printf")
 			&& surface.contains("live-error")
 			&& surface.contains("Exit 7")
 	});
@@ -980,7 +992,10 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	gateway.release(3);
 	let unknown = wait_snapshot(&mut debug, &raw_capture, "unknown generic card", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("think@1 · think") && surface.contains("P7 generic card proof")
+		surface.contains("think")
+			&& !surface.contains("think@1")
+			&& !surface.contains("think ·")
+			&& surface.contains("P7 generic card proof")
 	});
 	assert_surface(&unknown, "unknown");
 	gateway.release(4);
@@ -1006,7 +1021,9 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	assert_surface(&multiline, "Shift+Enter multiline input");
 	debug.keys("enter");
 	let batch_live = wait_snapshot(&mut debug, &raw_capture, "batch running", |snapshot| {
-		snapshot.combined().contains("bash bash ·")
+		snapshot.combined().contains("bash")
+			&& !snapshot.combined().contains("bash bash ·")
+			&& !snapshot.combined().contains("bash@1")
 			&& snapshot.combined().contains("18B")
 			&& gateway.captured_text(5, "interrupt\nthe batch")
 			&& batch_one_marker.is_file()
@@ -1018,7 +1035,9 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		.op("resize")
 		.unwrap_or_else(|error| panic!("resize injection failed: {error}"));
 	let resized = wait_snapshot(&mut debug, &raw_capture, "streaming resize", |snapshot| {
-		snapshot.frame.contains("bash bash ·")
+		snapshot.frame.contains("bash")
+			&& !snapshot.frame.contains("bash bash ·")
+			&& !snapshot.frame.contains("bash@1")
 			&& snapshot.frame.contains("18B")
 			&& snapshot.frame.contains("Working")
 	});
@@ -1068,7 +1087,9 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	let queue_marker = scratch.path().join("p7-queue-side-effect");
 	let queue_live =
 		wait_snapshot(&mut debug, &raw_capture, "next batch after interrupt", |snapshot| {
-			snapshot.frame.contains("bash bash ·")
+			snapshot.frame.contains("bash")
+				&& !snapshot.frame.contains("bash bash ·")
+				&& !snapshot.frame.contains("bash@1")
 				&& snapshot.frame.contains("17B")
 				&& queue_marker.is_file()
 				&& gateway.captured_text(6, "continue")

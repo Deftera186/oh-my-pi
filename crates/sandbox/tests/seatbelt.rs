@@ -106,15 +106,15 @@ fn scoped_reads_preserve_loader_devices_and_rule_precedence() {
 
 	assert_ordered(profile, &[
 		"(deny file-read* (subpath \"/\"))",
-		"(allow file-read* (subpath \"/usr/lib\") (subpath \"/System\") (subpath \
-		 \"/private/var/db/dyld\"))",
-		"(deny file-read* (subpath \"/System/Volumes/Data\"))",
+		"(allow file-read* (subpath \"/bin\") (subpath \"/usr/bin\") (subpath \"/usr/lib\") \
+		 (subpath \"/lib\") (subpath \"/System\") (subpath \"/private/var/db/dyld\"))",
 		"(allow file-read-data (literal \"/\"))",
 		"(allow file-read* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \
 		 \"/dev/random\") (literal \"/dev/urandom\"))",
 		"(allow file-read* (literal \"/dev/ptmx\") (literal \"/dev/tty\"))",
 		"(allow file-read* (subpath \"/dev/fd\"))",
 		&format!("(subpath \"{readable}\")"),
+		"(deny file-read* (subpath \"/System/Volumes/Data\"))",
 		&format!("(deny file-read* (literal \"{denied}\"))"),
 	]);
 	assert!(plan.enforced().contains(Capability::FsReadScope));

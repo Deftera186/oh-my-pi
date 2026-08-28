@@ -450,8 +450,20 @@ mod tests {
 	struct DenyWrites;
 
 	impl crate::PathPolicy for DenyWrites {
-		fn check_write(&self, path: &Path) -> Result<(), crate::WriteDenied> {
-			Err(crate::WriteDenied { path: path.to_path_buf() })
+		fn check_read(&self, path: &Path) -> Result<(), crate::PathDenied> {
+			Err(crate::PathDenied { path: path.to_path_buf(), access: crate::PathAccess::Read })
+		}
+
+		fn check_write(&self, path: &Path) -> Result<(), crate::PathDenied> {
+			Err(crate::PathDenied { path: path.to_path_buf(), access: crate::PathAccess::Write })
+		}
+
+		fn open(
+			&self,
+			path: &Path,
+			request: crate::OpenRequest,
+		) -> Result<std::fs::File, crate::PathDenied> {
+			Err(crate::PathDenied { path: path.to_path_buf(), access: request.access })
 		}
 	}
 

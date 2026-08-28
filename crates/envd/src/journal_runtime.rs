@@ -2476,7 +2476,7 @@ mod tests {
 			cwd:     state_dir.path().to_path_buf(),
 		})
 		.expect("journal");
-		let (control, mailbox) = omp_agent::control::channel();
+		let (control, mailbox) = omp_agent::control::channel(omp_agent::EventBus::new());
 		actor.bind_agent(1, control).expect("bind agent owner");
 		let owner = tokio::spawn(async move {
 			loop {
@@ -2507,7 +2507,7 @@ mod tests {
 			response.body,
 			Some(journal_host_envelope::Body::JournalRow(row)) if row.terminal
 		));
-		let (contender, _contender_mailbox) = omp_agent::control::channel();
+		let (contender, _contender_mailbox) = omp_agent::control::channel(omp_agent::EventBus::new());
 		assert!(
 			actor.bind_agent(2, contender).is_err(),
 			"a concurrent owner must not replace the live binding"
@@ -2515,12 +2515,12 @@ mod tests {
 		owner.abort();
 		actor.unbind_agent(1);
 
-		let (successor, _successor_mailbox) = omp_agent::control::channel();
+		let (successor, _successor_mailbox) = omp_agent::control::channel(omp_agent::EventBus::new());
 		actor
 			.bind_agent(2, successor)
 			.expect("bind successor after release");
 		actor.unbind_agent(1);
-		let (third, _third_mailbox) = omp_agent::control::channel();
+		let (third, _third_mailbox) = omp_agent::control::channel(omp_agent::EventBus::new());
 		assert!(
 			actor.bind_agent(3, third.clone()).is_err(),
 			"a stale release must not clear the successor"

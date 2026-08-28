@@ -1200,8 +1200,12 @@ fn user_item(text: Str, now_ms: u64) -> Item {
 		seq:           0,
 		created_at_ms: now_ms,
 		kind:          Some(item::Kind::Message(Message {
-			role:  i32::from(Role::User),
-			parts: vec![Part { kind: Some(part::Kind::Text(text.to_string())) }],
+			role:            i32::from(Role::User),
+			parts:           vec![Part { kind: Some(part::Kind::Text(text.to_string())) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}
@@ -1212,8 +1216,12 @@ fn system_item(text: String, now_ms: u64) -> Item {
 		seq:           0,
 		created_at_ms: now_ms,
 		kind:          Some(item::Kind::Message(Message {
-			role:  i32::from(Role::System),
-			parts: vec![Part { kind: Some(part::Kind::Text(text)) }],
+			role:            i32::from(Role::System),
+			parts:           vec![Part { kind: Some(part::Kind::Text(text)) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}

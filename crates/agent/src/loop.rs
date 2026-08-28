@@ -466,13 +466,16 @@ fn hook_custom_message_item(value: &Value) -> Option<Item> {
 		},
 		_ => return None,
 	};
+	let stripped = crate::strip_system_wrapper(&text).map(str::to_owned);
+	let text = stripped.unwrap_or(text);
 	if text.is_empty() {
 		return None;
 	}
 	Some(Item {
 		kind: Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
+			role: thread::Role::User as i32,
 			parts: vec![thread::Part { kind: Some(part::Kind::Text(text)) }],
+			..thread::Message::default()
 		})),
 		..Item::default()
 	})
@@ -627,6 +630,27 @@ fn authoritative_assistant(outcome: &Outcome) -> Option<Str> {
 	(!text.is_empty()).then(|| Str::from(text))
 }
 
+fn stamp_assistant_completion(outcome: &mut Outcome, completed_at_ms: u64) {
+	let last_assistant = outcome.output.iter().rposition(|item| {
+		matches!(
+			item.kind.as_ref(),
+			Some(item::Kind::Message(message)) if message.role() == thread::Role::Assistant
+		)
+	});
+	let mut usage = outcome.usage.clone();
+	for (index, item) in outcome.output.iter_mut().enumerate() {
+		let Some(item::Kind::Message(message)) = item.kind.as_mut() else {
+			continue;
+		};
+		if message.role() == thread::Role::Assistant && message.completed_at_ms.is_none() {
+			message.completed_at_ms = Some(completed_at_ms);
+		}
+		if Some(index) == last_assistant && message.usage.is_none() {
+			message.usage = usage.take();
+		}
+	}
+}
+
 use std::{future, iter, mem};
 
 use omp_inference::call::ToolChoice;
@@ -642,8 +666,8 @@ pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, Comp
 use crate::{
 	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings,
 	CaptureDecision, CommittedCall, Interrupt, InterruptClass, InterruptSource, ProviderErrorEvent,
-	Regime, RegimeSpec, Resource, RevivalReport, ScopedSetting, SettingSlot, StartOptions,
-	StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
+	Regime, RegimeSpec, RegimeWaitError, Resource, RevivalReport, ScopedSetting, SettingSlot,
+	StartOptions, StartReceipt, TurnOptions, TurnReceipt, WaitSet,
 	arbiter::ResolvedEvent,
 	attachments, batch, capture_interrupt, demote_interrupted_reasoning, dispatch_tier,
 	effects_mutate_environment, execute_snapcompact, hook_event_mask, inject_first_turn_metadata,
@@ -707,7 +731,7 @@ pub enum AgentError {
 	Batch(#[from] BatchError),
 	/// A required-deadline regime wait expired or was aborted.
 	#[error(transparent)]
-	RegimeWait(#[from] WaitError),
+	RegimeWait(#[from] RegimeWaitError),
 	/// Manual compaction was cancelled before its history rewrite committed.
 	#[error(transparent)]
 	CompactionCancelled(#[from] CompactionCancellation),
@@ -1002,7 +1026,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let (abort_tx, abort_rx) = watch::channel(0_u64);
 		let (hook_bus, hook_requests) = InvocationHookBus::channel();
 		let (invocation_fact_tx, invocation_fact_rx) = flume::unbounded();
-		let (control_tx, control_mailbox) = channel();
+		let (control_tx, control_mailbox) = channel(events.clone());
 		let (host_commands_tx, host_commands) = flume::unbounded();
 		let host_control = AgentHostControl { commands: host_commands_tx };
 		control_tx.bind_host_control(host_control.clone());
@@ -2147,7 +2171,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 				}
 			}
 			if !synthetic && !text.starts_with("<system-injection>") {
-				targets.push(RewindTarget { event, keep: previous, text: Str::new(text), parts });
+				let text = crate::strip_system_wrapper(&text)
+					.map(Str::new)
+					.unwrap_or_else(|| Str::from(text));
+				targets.push(RewindTarget { event, keep: previous, text, parts });
 			}
 			previous = Some(event);
 		}
@@ -2173,8 +2200,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 			seq:           0,
 			created_at_ms: now_ms(),
 			kind:          Some(item::Kind::Message(thread::Message {
-				role:  i32::from(thread::Role::User),
+				role: i32::from(thread::Role::User),
 				parts: vec![thread::Part { kind: Some(part::Kind::Text(text.to_string())) }],
+				..thread::Message::default()
 			})),
 			props:         None,
 		};
@@ -2408,20 +2436,28 @@ impl<C: TurnClient + Clone> Agent<C> {
 			pending_indexes.sort_unstable();
 			pending_indexes.extend(self.stage_interrupts(&root_turn_id, queued, DrainPoint::Idle)?);
 			for item in idle_fold.regime.injects {
+				let event_item = item.clone();
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
 					root_turn_id.as_str(),
 					item,
 					self.prompt_hash,
 				)?);
+				self
+					.events
+					.publish(AgentEvent::InputStaged { item: event_item });
 			}
 			for item in supplied_items {
+				let event_item = item.clone();
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
 					root_turn_id.as_str(),
 					item,
 					self.prompt_hash,
 				)?);
+				self
+					.events
+					.publish(AgentEvent::InputStaged { item: event_item });
 			}
 			(pending_indexes, root_turn_id)
 		};
@@ -3355,15 +3391,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 		items: impl IntoIterator<Item = Item>,
 	) -> Result<Vec<u64>, AgentError> {
 		let ts = now_ms();
-		items
-			.into_iter()
-			.map(|item| {
+		let mut indexes = Vec::new();
+		for item in items {
+			let event_item = item.clone();
+			let index =
 				self
 					.journal
-					.append_turn_input(ts, turn_id.as_str(), item, self.prompt_hash)
-					.map_err(Into::into)
-			})
-			.collect()
+					.append_turn_input(ts, turn_id.as_str(), item, self.prompt_hash)?;
+			self
+				.events
+				.publish(AgentEvent::InputStaged { item: event_item });
+			indexes.push(index);
+		}
+		Ok(indexes)
 	}
 
 	fn resolve_point(&mut self, point: Point, cx: PointCx<'_>) -> Result<ResolvedEvent, AgentError> {
@@ -3594,12 +3634,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 				let claimed = settlement.lease.claim();
 				debug_assert!(claimed.is_ok(), "delivery lease must remain exclusive through commit");
 			} else {
-				indexes.push(self.journal.append_turn_input(
+				let event_item = interrupt.item.clone();
+				let index = self.journal.append_turn_input(
 					ts,
 					turn_id.as_str(),
 					interrupt.item,
 					self.prompt_hash,
-				)?);
+				)?;
+				self
+					.events
+					.publish(AgentEvent::InputStaged { item: event_item });
+				indexes.push(index);
 			}
 		}
 		Ok(indexes)
@@ -4500,6 +4545,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 				}
 			};
 			let event = event.ok_or_else(|| tonic::Status::unavailable("turn stream lost"))??;
+			let mut event = event;
+			if let Some(turn_event::Event::Outcome(outcome)) = event.event.as_mut() {
+				stamp_assistant_completion(outcome, now_ms());
+			}
 			saw_stream_event = true;
 			let publish = |event: pb::TurnEvent| {
 				self
@@ -6323,13 +6372,15 @@ fn recovery_prompt_item(id: PromptAssetId) -> Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
+			role: thread::Role::System as i32,
 			parts: vec![thread::Part {
 				kind: Some(part::Kind::Text(format!(
 					"<system-injection>\n{}\n</system-injection>",
 					crate::prompt_assets::prompt_asset(id).content.trim(),
 				))),
 			}],
+			synthetic: Some(true),
+			..thread::Message::default()
 		})),
 		props:         None,
 	}
@@ -6339,8 +6390,9 @@ fn terminal_error_item(error: &pb::TurnError) -> Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::Assistant as i32,
+			role: thread::Role::Assistant as i32,
 			parts: vec![thread::Part { kind: Some(part::Kind::Text(error.detail.clone())) }],
+			..thread::Message::default()
 		})),
 		props:         Some(pb::ValueMap {
 			fields: BTreeMap::from([(
@@ -6357,8 +6409,9 @@ fn silent_abort_item(reason: &str) -> Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::Assistant as i32,
+			role: thread::Role::Assistant as i32,
 			parts: Vec::new(),
+			..thread::Message::default()
 		})),
 		props:         Some(pb::ValueMap {
 			fields: BTreeMap::from([
@@ -6380,8 +6433,9 @@ fn tool_loop_redirect_item(count: u32, digest: &str) -> Item {
 		seq:           0,
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
+			role: thread::Role::System as i32,
 			parts: vec![thread::Part { kind: Some(part::Kind::Text(content)) }],
+			..thread::Message::default()
 		})),
 		props:         None,
 	}
@@ -6503,6 +6557,79 @@ mod tests {
 			message.parts.as_slice(),
 			[thread::Part { kind: Some(part::Kind::Text(text)) }] if text == "extension context"
 		));
+	}
+	#[test]
+	fn custom_message_array_strips_one_outer_system_wrapper() {
+		let item = hook_custom_message_item(&serde_json::json!({
+			"content": [
+				{"text": "<system-reminder>"},
+				{"text": "keep going"},
+				{"text": "</system-reminder>"},
+			],
+		}))
+		.expect("custom message");
+		let item::Kind::Message(message) = item.kind.expect("message item") else {
+			panic!("expected message");
+		};
+		assert!(matches!(
+			message.parts.as_slice(),
+			[thread::Part { kind: Some(part::Kind::Text(text)) }] if text == "keep going"
+		));
+	}
+
+	#[test]
+	fn local_completion_stamp_only_fills_assistant_messages() {
+		let mut unstamped = message(thread::Role::Assistant, "done");
+		let mut stamped = message(thread::Role::Assistant, "already done");
+		let Some(item::Kind::Message(stamped_message)) = stamped.kind.as_mut() else {
+			panic!("assistant message");
+		};
+		stamped_message.completed_at_ms = Some(7);
+		let user = message(thread::Role::User, "prompt");
+		let mut outcome = Outcome {
+			output: vec![user, unstamped.clone(), stamped],
+			usage: Some(pb::Usage { input_tokens: 3, ..pb::Usage::default() }),
+			..Outcome::default()
+		};
+
+		stamp_assistant_completion(&mut outcome, 11);
+
+		let completion = |item: &Item| match item.kind.as_ref() {
+			Some(item::Kind::Message(message)) => message.completed_at_ms,
+			_ => None,
+		};
+		assert_eq!(completion(&outcome.output[0]), None);
+		assert_eq!(completion(&outcome.output[1]), Some(11));
+		assert_eq!(completion(&outcome.output[2]), Some(7));
+		fn embedded_usage(item: &Item) -> Option<&pb::Usage> {
+			match item.kind.as_ref() {
+				Some(item::Kind::Message(message)) => message.usage.as_ref(),
+				_ => None,
+			}
+		}
+		assert!(embedded_usage(&outcome.output[1]).is_none());
+		assert_eq!(embedded_usage(&outcome.output[2]).map(|usage| usage.input_tokens), Some(3));
+		let Some(item::Kind::Message(message)) = unstamped.kind.as_mut() else {
+			panic!("assistant message");
+		};
+		assert_eq!(message.completed_at_ms, None, "stamp mutates only the committed outcome");
+	}
+
+	#[test]
+	fn continuation_items_distinguish_run_boundaries() {
+		let synthetic = recovery_prompt_item(PromptAssetId::AutoContinue);
+		let reminder = tool_loop_redirect_item(3, "same call");
+		let Some(item::Kind::Message(synthetic)) = synthetic.kind else {
+			panic!("synthetic developer item");
+		};
+		let Some(item::Kind::Message(reminder)) = reminder.kind else {
+			panic!("continuation reminder");
+		};
+		assert_eq!(synthetic.role(), thread::Role::System);
+		assert_eq!(synthetic.synthetic, Some(true));
+		assert_eq!(synthetic.user_initiated, None);
+		assert_eq!(reminder.role(), thread::Role::System);
+		assert_eq!(reminder.synthetic, None);
 	}
 
 	#[test]
@@ -7079,8 +7206,9 @@ mod tests {
 	fn message(role: thread::Role, text: &str) -> Item {
 		Item {
 			kind: Some(item::Kind::Message(thread::Message {
-				role:  i32::from(role),
+				role: i32::from(role),
 				parts: vec![thread::Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+				..thread::Message::default()
 			})),
 			..Item::default()
 		}
@@ -7738,7 +7866,7 @@ mod tests {
 		let prompt_hash = PromptHash::from([7; 32]);
 		let assistant = Item {
 			kind: Some(item::Kind::Message(thread::Message {
-				role:  i32::from(thread::Role::Assistant),
+				role: i32::from(thread::Role::Assistant),
 				parts: vec![
 					thread::Part {
 						kind: Some(part::Kind::Thinking(thread::Thinking {
@@ -7756,6 +7884,7 @@ mod tests {
 					},
 					thread::Part { kind: Some(part::Kind::Text("visible answer".to_owned())) },
 				],
+				..thread::Message::default()
 			})),
 			..Item::default()
 		};
@@ -8076,7 +8205,7 @@ mod tests {
 			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
 		let item = Item {
 			kind: Some(item::Kind::Message(thread::Message {
-				role:  i32::from(thread::Role::User),
+				role: i32::from(thread::Role::User),
 				parts: vec![
 					thread::Part { kind: Some(part::Kind::Text("look at this".to_owned())) },
 					thread::Part {
@@ -8091,6 +8220,7 @@ mod tests {
 					},
 					thread::Part { kind: Some(part::Kind::Text("and this".to_owned())) },
 				],
+				..thread::Message::default()
 			})),
 			..Item::default()
 		};

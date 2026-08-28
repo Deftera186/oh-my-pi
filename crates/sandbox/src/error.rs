@@ -152,6 +152,9 @@ pub enum SpecViolation {
 	/// A Mach service allow entry is blank.
 	#[error("Mach service names must not be blank")]
 	EmptyMachService,
+	/// A scoped proxy endpoint has no usable TCP port.
+	#[error("sandbox proxy port must be nonzero")]
+	ProxyPortZero,
 }
 
 /// One failed best-effort cleanup operation.
@@ -348,11 +351,37 @@ pub enum SandboxError {
 		/// Rejected deny path.
 		path: PathBuf,
 	},
+	/// A configured read-deny glob cannot be enforced by the selected sandbox
+	/// backends.
+	#[error("sandbox read-deny glob {pattern} cannot be enforced")]
+	UnsupportedReadDenyGlob {
+		/// Rejected glob pattern.
+		pattern: Str,
+	},
+	/// A writable-root carve-out crosses a symlink that Bubblewrap cannot
+	/// protect.
+	#[error("sandbox writable root {writable_root} cannot protect {path} through symlink {symlink}")]
+	ProtectedWriteDenySymlink {
+		/// Writable root containing the protected path.
+		writable_root: PathBuf,
+		/// Logical path requested as a read-only carve-out.
+		path:          PathBuf,
+		/// Symlink component a read-only bind would follow.
+		symlink:       PathBuf,
+	},
 	/// A Unix-socket allowance did not identify a socket.
 	#[error("sandbox Unix-socket allowance {path} is not a socket")]
 	NotUnixSocket {
 		/// Rejected path.
 		path: PathBuf,
+	},
+	/// The active backend cannot enforce an exact requested authority.
+	#[error("sandbox backend {backend} cannot enforce exact {authority}")]
+	EnforcementUnavailable {
+		/// Backend which cannot represent the restriction.
+		backend:   Backend,
+		/// Exact authority which would otherwise be widened.
+		authority: &'static str,
 	},
 	/// An environment glob is syntactically invalid.
 	#[error("invalid environment pattern {pattern}")]

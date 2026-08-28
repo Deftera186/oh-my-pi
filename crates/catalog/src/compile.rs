@@ -3286,8 +3286,12 @@ fn compile_model_routes(
 			if let Some(lite) = row.use_responses_lite {
 				route.use_responses_lite = Some(lite);
 			}
-			if row.prefer_websockets == Some(true) {
-				route.codex_transport = CodexTransportPreference::WebsocketPreferred;
+			if let Some(prefer_websockets) = row.prefer_websockets {
+				route.codex_transport = if prefer_websockets {
+					CodexTransportPreference::WebsocketPreferred
+				} else {
+					CodexTransportPreference::HttpOnly
+				};
 			}
 			route.priority = row.priority;
 			let shape = serde_json::to_vec(&(
@@ -5515,6 +5519,38 @@ facets = ["chat"]
 			.find(|model| model.key.as_str() == "synthetic/model")
 			.expect("compiled model");
 		assert_eq!(model.routes.as_ref(), &[RouteId::from("synthetic/primary")]);
+	}
+
+	#[test]
+	fn model_websocket_preference_overrides_the_provider_in_both_directions() {
+		let providers = r#"
+[providers.synthetic]
+transport = "open-ai-responses"
+base_url = "https://example.test/v1"
+facets = ["chat"]
+codex_transport = "websocket-preferred"
+"#;
+		let models = br#"{"synthetic":{"http":{"input":["text"],"preferWebsockets":false},"websocket":{"input":["text"],"preferWebsockets":true}}}"#;
+		let compressed = zstd::stream::encode_all(&models[..], 1).expect("fixture compression");
+		let compiled = compile(parse_oracle(providers, &compressed).expect("typed source"))
+			.expect("catalog compilation");
+
+		for (model_key, expected) in [
+			("synthetic/http", CodexTransportPreference::HttpOnly),
+			("synthetic/websocket", CodexTransportPreference::WebsocketPreferred),
+		] {
+			let model = compiled
+				.models
+				.iter()
+				.find(|model| model.key.as_str() == model_key)
+				.expect("compiled model");
+			let route = compiled
+				.routes
+				.iter()
+				.find(|route| model.routes.first().is_some_and(|id| &route.id == id))
+				.expect("model route");
+			assert_eq!(route.codex_transport, expected);
+		}
 	}
 
 	#[test]

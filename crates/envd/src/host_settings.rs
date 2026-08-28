@@ -6,7 +6,7 @@
 //! client-side aggregate while both read the same merged tables.
 //!
 //! ```ignore
-//! let settings = host_settings::load(state_dir, workspace.root())?;
+//! let settings = host_settings::load(state_dir, workspace.root(), catalog)?;
 //! let grace = settings.runtime.interrupt_grace;
 //! ```
 
@@ -17,7 +17,10 @@ use std::{
 
 use omp_core::{Duration, DurationError};
 use omp_memory::config::{AutolearnSettings, MemorySettings, MnemopiSettings};
-use omp_settings::manager::{SettingsManager, SettingsManagerError, SettingsPaths};
+use omp_settings::{
+	SettingsCatalog,
+	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
+};
 use omp_tool::DEFAULT_INTERRUPT_GRACE;
 use serde::{
 	Deserialize, Deserializer, Serialize, Serializer,
@@ -88,8 +91,13 @@ impl omp_settings::SettingsDomain for HostSettings {
 ///
 /// Fails when the settings tables cannot be opened or do not project onto
 /// [`HostSettings`].
-pub fn load(data_dir: &Path, project_root: &Path) -> Result<HostSettings, SettingsManagerError> {
-	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))?;
+pub fn load(
+	data_dir: &Path,
+	project_root: &Path,
+	catalog: SettingsCatalog,
+) -> Result<HostSettings, SettingsManagerError> {
+	let manager =
+		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)?;
 	let mut settings = manager
 		.snapshot()
 		.project::<HostSettings>()

@@ -36,7 +36,11 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 	let mut streaming = false;
 	let (done_tx, done_rx) = flume::unbounded::<u64>();
 	let _ = events.send(BackendEvent::Sessions(sessions()));
-	let _ = events.send(BackendEvent::ModelsUpdated { rows: models.clone(), current: model });
+	let _ = events.send(BackendEvent::ModelsUpdated {
+		rows:         models.clone(),
+		current:      model,
+		task_current: model,
+	});
 	let _ = events.send(BackendEvent::Status(status(&models[model].name, false)));
 	let _ = events.send(BackendEvent::WelcomeBanner(welcome_banner(&models[model])));
 
@@ -58,8 +62,11 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 					continue;
 				}
 				if matches!(text.as_str(), "/model" | "/switch") {
-					let _ = events
-						.send(BackendEvent::OpenModelPicker { rows: models.clone(), current: model });
+					let _ = events.send(BackendEvent::OpenModelPicker {
+						rows:         models.clone(),
+						current:      model,
+						task_current: model,
+					});
 					continue;
 				}
 				let event = next_event;
@@ -225,12 +232,7 @@ async fn stream_turn(
 	if !active() {
 		return;
 	}
-	let _ = events.send(BackendEvent::ToolStarted {
-		id:    tool.clone(),
-		name:  sf!("shell"),
-		rev:   sf!("r0"),
-		title: sf!("Inspect chat scene"),
-	});
+	let _ = events.send(BackendEvent::ToolStarted { id: tool.clone(), name: sf!("shell") });
 	for chunk in ["reading scene modules\n", "checking damage ranges\n", "done\n"] {
 		if !active() {
 			return;

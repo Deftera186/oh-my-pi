@@ -1,3 +1,4 @@
+#![feature(duration_constructors)]
 #![recursion_limit = "256"]
 
 //! Production application CLI, TUI, and command dispatch.
@@ -87,6 +88,19 @@ pub mod usage_error;
 pub mod voice;
 pub mod wizard;
 pub mod worktree_cmd;
+
+pub use voice::settings::SETTINGS_CONTRIBUTION;
+
+/// Complete settings catalog for the production application composition.
+pub const SETTINGS_CATALOG: omp_settings::SettingsCatalog = omp_settings::SettingsCatalog::new(&[
+	&omp_settings::SETTINGS_CONTRIBUTION,
+	&omp_catalog::SETTINGS_CONTRIBUTION,
+	&omp_inference::SETTINGS_CONTRIBUTION,
+	&omp_envd::SETTINGS_CONTRIBUTION,
+	&omp_tools::SETTINGS_CONTRIBUTION,
+	&omp_driver::SETTINGS_CONTRIBUTION,
+	&SETTINGS_CONTRIBUTION,
+]);
 
 pub use miette::{IntoDiagnostic, Report, Result};
 use omp_driver::prompt_prep::settings::PromptOverrides;

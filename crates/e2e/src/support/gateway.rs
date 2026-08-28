@@ -161,7 +161,10 @@ impl ScriptedGateway {
 		let channel =
 			within("gateway connection", DEFAULT_TIMEOUT, omp_rpc::uds::connect(&self.socket))
 				.await??;
-		Ok(RpcTurnClient::new(channel))
+		Ok(RpcTurnClient::new(
+			channel,
+			omp_inference::auth::UsageAttribution::new("e2e-gateway", "omp-e2e", None::<&str>),
+		))
 	}
 
 	/// Appends deterministic provider interactions without replacing the real

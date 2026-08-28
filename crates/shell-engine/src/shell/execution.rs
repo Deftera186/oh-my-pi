@@ -3,8 +3,8 @@
 use std::{fs, io, io::Read, iter, path::Path};
 
 use crate::{
-	ExecutionControlFlow, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, Shell,
-	SourceInfo,
+	ExecutionControlFlow, ExecutionParameters, ExecutionResult, PathAccess, ProcessGroupPolicy,
+	Shell, SourceInfo,
 	arithmetic::Evaluatable as _,
 	callstack, error,
 	extensions::ShellExtensions,
@@ -103,7 +103,7 @@ impl<SE: ShellExtensions> Shell<SE> {
 		options.read(true);
 
 		let opened_file: OpenFile = self
-			.open_file(&options, path, params)
+			.open_file(&options, path, params, PathAccess::Read)
 			.map_err(|e| error::ErrorKind::FailedSourcingFile(path.to_owned(), e))?;
 
 		if opened_file.is_dir() {

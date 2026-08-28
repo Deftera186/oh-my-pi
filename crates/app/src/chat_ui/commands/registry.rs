@@ -233,13 +233,89 @@ impl CommandDeclaration {
 	}
 }
 
-/// One compiled declaration factory submitted by [`inventory`].
+/// One explicitly composed builtin command declaration factory.
 pub struct BuiltinRegistration {
 	/// Builds the declaration without retaining mutable global state.
 	pub declaration: fn() -> CommandDeclaration,
 }
 
-inventory::collect!(BuiltinRegistration);
+/// Complete builtin command set, assembled explicitly from command modules.
+pub(super) const BUILTINS: &[BuiltinRegistration] = &[
+	super::advisor::advisor::REGISTRATION,
+	super::browser::browser::REGISTRATION,
+	super::collab::collab::REGISTRATION,
+	super::collab::join::REGISTRATION,
+	super::collab::leave::REGISTRATION,
+	super::config::settings::REGISTRATION,
+	super::config::setup::REGISTRATION,
+	super::config::providers::REGISTRATION,
+	super::config::login::REGISTRATION,
+	super::config::logout::REGISTRATION,
+	super::context::context::REGISTRATION,
+	super::diagnostics::cleanse::REGISTRATION,
+	super::diagnostics::debug::REGISTRATION,
+	super::export::export::REGISTRATION,
+	super::export::dump::REGISTRATION,
+	super::export::copy::REGISTRATION,
+	super::extensions::extensions::REGISTRATION,
+	super::extensions::marketplace::REGISTRATION,
+	super::extensions::plugins::REGISTRATION,
+	super::extensions::reload_plugins::REGISTRATION,
+	super::flow::compact::REGISTRATION,
+	super::flow::shake::REGISTRATION,
+	super::flow::usage::REGISTRATION,
+	super::flow::stats::REGISTRATION,
+	super::flow::plan::REGISTRATION,
+	super::flow::vibe::REGISTRATION,
+	super::flow::todo::REGISTRATION,
+	super::flow::plan_review::REGISTRATION,
+	super::flow::goal::REGISTRATION,
+	super::flow::guided_goal::REGISTRATION,
+	super::flow::loop_command::REGISTRATION,
+	super::flow::queue::REGISTRATION,
+	super::flow::force::REGISTRATION,
+	super::flow::fast::REGISTRATION,
+	super::flow::prewalk::REGISTRATION,
+	super::flow::btw::REGISTRATION,
+	super::flow::tan::REGISTRATION,
+	super::flow::omfg::REGISTRATION,
+	super::flow::live::REGISTRATION,
+	super::git::git::REGISTRATION,
+	super::green::green::REGISTRATION,
+	super::mcp::mcp::REGISTRATION,
+	super::memory::memory::REGISTRATION,
+	super::model::model::REGISTRATION,
+	super::model::switch::REGISTRATION,
+	super::model::extended_context::REGISTRATION,
+	super::review::review::REGISTRATION,
+	super::security::security::REGISTRATION,
+	super::session::help::REGISTRATION,
+	super::session::new_session::REGISTRATION,
+	super::session::clear::REGISTRATION,
+	super::session::fresh::REGISTRATION,
+	super::session::drop_session::REGISTRATION,
+	super::session::rename::REGISTRATION,
+	super::session::retry::REGISTRATION,
+	super::session::resume::REGISTRATION,
+	super::session::pin::REGISTRATION,
+	super::session::session::REGISTRATION,
+	super::session::jobs::REGISTRATION,
+	super::session::agents::REGISTRATION,
+	super::session::pause::REGISTRATION,
+	super::session::move_root::REGISTRATION,
+	super::session::dir::REGISTRATION,
+	super::session::handoff::REGISTRATION,
+	super::session::branch::REGISTRATION,
+	super::session::fork::REGISTRATION,
+	super::session::tree::REGISTRATION,
+	super::session::quit::REGISTRATION,
+	super::share::share::REGISTRATION,
+	super::ssh::ssh::REGISTRATION,
+	super::utility::changelog::REGISTRATION,
+	super::utility::tools::REGISTRATION,
+	super::utility::computer::REGISTRATION,
+	super::utility::vision::REGISTRATION,
+];
 
 /// Explicit source-qualified permission to replace one builtin.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,12 +399,12 @@ fn completion_icon(declaration: &CommandDeclaration) -> omp_tui::Icon {
 }
 
 impl CommandRoster {
-	/// Builds the inventory roster with no dynamic contributions.
+	/// Builds the builtin roster with no dynamic contributions.
 	pub fn builtins() -> Self {
 		Self::with_contributions([], &ShadowPolicy::default())
 	}
 
-	/// Builds inventory declarations plus atomically published contributions.
+	/// Builds builtin declarations plus atomically published contributions.
 	pub fn with_contributions(
 		generations: impl IntoIterator<Item = CommandGeneration>,
 		policy: &ShadowPolicy,
@@ -338,15 +414,15 @@ impl CommandRoster {
 		})
 	}
 
-	/// Builds inventory declarations while omitting disabled builtins before
+	/// Builds builtin declarations while omitting disabled builtins before
 	/// help, completion, advertisement, and dispatch indexes are derived.
 	pub fn with_contributions_filtered(
 		generations: impl IntoIterator<Item = CommandGeneration>,
 		policy: &ShadowPolicy,
 		include_builtin: impl Fn(&CommandDeclaration) -> bool,
 	) -> Self {
-		let mut builtins: Vec<_> = inventory::iter::<BuiltinRegistration>
-			.into_iter()
+		let mut builtins: Vec<_> = BUILTINS
+			.iter()
 			.map(|registration| (registration.declaration)())
 			.filter(include_builtin)
 			.collect();

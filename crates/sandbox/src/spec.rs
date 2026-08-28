@@ -5,6 +5,23 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+/// Minimal host runtime roots required to execute ordinary system programs in
+/// restricted-read sandboxes.
+#[cfg(target_os = "macos")]
+pub const RUNTIME_READ_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/lib", "/System"];
+/// Minimal host runtime roots required to execute ordinary system programs in
+/// restricted-read sandboxes.
+#[cfg(target_os = "linux")]
+pub const RUNTIME_READ_ROOTS: &[&str] = &["/bin", "/usr/bin", "/usr/lib", "/lib"];
+/// Minimal host runtime roots required to execute ordinary system programs in
+/// restricted-read sandboxes.
+#[cfg(target_os = "windows")]
+pub const RUNTIME_READ_ROOTS: &[&str] = &["C:\\Windows\\System32"];
+/// Minimal host runtime roots required to execute ordinary system programs in
+/// restricted-read sandboxes.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub const RUNTIME_READ_ROOTS: &[&str] = &[];
+
 use omp_core::{Hash32, Str};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -162,24 +179,28 @@ impl ResourceLimits {
 /// Backend-independent description of one confined command.
 #[derive(Clone, Debug)]
 pub struct SandboxSpec {
-	pub(crate) program:       OsString,
-	pub(crate) args:          Vec<OsString>,
-	pub(crate) dir:           Option<PathBuf>,
-	pub(crate) environment:   EnvironmentPolicy,
-	pub(crate) network:       NetworkMode,
-	pub(crate) write:         WriteMode,
-	pub(crate) readable:      Vec<PathBuf>,
-	pub(crate) read_deny:     Vec<PathBuf>,
-	pub(crate) writable:      Vec<PathBuf>,
-	pub(crate) write_deny:    Vec<PathBuf>,
-	pub(crate) unix_sockets:  Vec<PathBuf>,
-	pub(crate) allow_temp:    bool,
-	pub(crate) supervised:    bool,
-	pub(crate) no_exec:       bool,
-	pub(crate) mach_services: Vec<Str>,
-	pub(crate) resources:     ResourceLimits,
-	pub(crate) degradation:   DegradationPolicy,
-	pub(crate) tolerated:     CapabilitySet,
+	pub(crate) program:        OsString,
+	pub(crate) args:           Vec<OsString>,
+	pub(crate) dir:            Option<PathBuf>,
+	pub(crate) environment:    EnvironmentPolicy,
+	pub(crate) network:        NetworkMode,
+	pub(crate) write:          WriteMode,
+	pub(crate) readable:       Vec<PathBuf>,
+	pub(crate) read_deny:      Vec<PathBuf>,
+	pub(crate) read_override:  Vec<PathBuf>,
+	pub(crate) writable:       Vec<PathBuf>,
+	pub(crate) write_deny:     Vec<PathBuf>,
+	pub(crate) write_override: Vec<PathBuf>,
+	pub(crate) unix_sockets:   Vec<PathBuf>,
+	pub(crate) proxy_port:     Option<u16>,
+	pub(crate) proxy_socket:   Option<PathBuf>,
+	pub(crate) allow_temp:     bool,
+	pub(crate) supervised:     bool,
+	pub(crate) no_exec:        bool,
+	pub(crate) mach_services:  Vec<Str>,
+	pub(crate) resources:      ResourceLimits,
+	pub(crate) degradation:    DegradationPolicy,
+	pub(crate) tolerated:      CapabilitySet,
 }
 
 impl SandboxSpec {
@@ -187,24 +208,28 @@ impl SandboxSpec {
 	#[must_use]
 	pub fn new(program: impl Into<OsString>) -> Self {
 		Self {
-			program:       program.into(),
-			args:          Vec::new(),
-			dir:           None,
-			environment:   EnvironmentPolicy::inherit(),
-			network:       NetworkMode::Disabled,
-			write:         WriteMode::Deny,
-			readable:      Vec::new(),
-			read_deny:     Vec::new(),
-			writable:      Vec::new(),
-			write_deny:    Vec::new(),
-			unix_sockets:  Vec::new(),
-			allow_temp:    false,
-			supervised:    true,
-			no_exec:       false,
-			mach_services: Vec::new(),
-			resources:     ResourceLimits::default(),
-			degradation:   DegradationPolicy::Reject,
-			tolerated:     CapabilitySet::empty(),
+			program:        program.into(),
+			args:           Vec::new(),
+			dir:            None,
+			environment:    EnvironmentPolicy::inherit(),
+			network:        NetworkMode::Disabled,
+			write:          WriteMode::Deny,
+			readable:       Vec::new(),
+			read_deny:      Vec::new(),
+			read_override:  Vec::new(),
+			writable:       Vec::new(),
+			write_deny:     Vec::new(),
+			write_override: Vec::new(),
+			unix_sockets:   Vec::new(),
+			proxy_port:     None,
+			proxy_socket:   None,
+			allow_temp:     false,
+			supervised:     true,
+			no_exec:        false,
+			mach_services:  Vec::new(),
+			resources:      ResourceLimits::default(),
+			degradation:    DegradationPolicy::Reject,
+			tolerated:      CapabilitySet::empty(),
 		}
 	}
 
@@ -272,6 +297,22 @@ impl SandboxSpec {
 		self
 	}
 
+	/// Routes IP connections through a trusted loopback proxy. A Unix socket,
+	/// when supplied, is the sole host-side relay endpoint exposed to a Linux
+	/// network namespace.
+	pub fn set_proxy_endpoint(
+		&mut self,
+		port: u16,
+		unix_socket: Option<&Path>,
+	) -> Result<&mut Self, SandboxError> {
+		if port == 0 {
+			return Err(SpecViolation::ProxyPortZero.into());
+		}
+		self.proxy_port = Some(port);
+		self.proxy_socket = unix_socket.map(Path::to_path_buf);
+		Ok(self)
+	}
+
 	/// Sets filesystem write semantics.
 	pub const fn set_write(&mut self, write: WriteMode) -> &mut Self {
 		self.write = write;
@@ -291,9 +332,27 @@ impl SandboxSpec {
 		Ok(self)
 	}
 
+	/// Reopens one existing nested scope after ordinary read denials.
+	pub fn allow_read_override(
+		&mut self,
+		path: impl AsRef<Path>,
+	) -> Result<&mut Self, SandboxError> {
+		insert_path(&mut self.read_override, canonicalize_existing(path.as_ref())?);
+		Ok(self)
+	}
+
 	/// Adds and canonicalizes an existing writable path.
 	pub fn allow_write(&mut self, path: impl AsRef<Path>) -> Result<&mut Self, SandboxError> {
 		insert_path(&mut self.writable, canonicalize_existing(path.as_ref())?);
+		Ok(self)
+	}
+
+	/// Reopens one existing nested scope after ordinary write denials.
+	pub fn allow_write_override(
+		&mut self,
+		path: impl AsRef<Path>,
+	) -> Result<&mut Self, SandboxError> {
+		insert_path(&mut self.write_override, canonicalize_existing(path.as_ref())?);
 		Ok(self)
 	}
 
@@ -306,6 +365,16 @@ impl SandboxSpec {
 		let path = path.as_ref();
 		insert_path(&mut self.write_deny, absolute_lexical(path)?);
 		insert_path(&mut self.write_deny, canonicalize_deny(path)?);
+		Ok(self)
+	}
+
+	/// Adds only the normalized lexical spelling of a protected write entry.
+	///
+	/// This is for an in-scope symlink entry whose target is outside the write
+	/// scope: protecting the target would incorrectly expand a scoped deny into
+	/// a deny outside its enforceable scope.
+	pub fn deny_write_lexical(&mut self, path: impl AsRef<Path>) -> Result<&mut Self, SandboxError> {
+		insert_path(&mut self.write_deny, absolute_lexical(path.as_ref())?);
 		Ok(self)
 	}
 
@@ -502,9 +571,13 @@ impl SandboxSpec {
 		hash_bytes(&mut hasher, write.as_bytes());
 		hash_paths(&mut hasher, &self.readable);
 		hash_paths(&mut hasher, &self.read_deny);
+		hash_paths(&mut hasher, &self.read_override);
 		hash_paths(&mut hasher, &self.writable);
 		hash_paths(&mut hasher, &self.write_deny);
+		hash_paths(&mut hasher, &self.write_override);
 		hash_paths(&mut hasher, &self.unix_sockets);
+		hash_u64(&mut hasher, u64::from(self.proxy_port.unwrap_or(0)));
+		hash_path(&mut hasher, self.proxy_socket.as_deref());
 		hash_bool(&mut hasher, self.allow_temp);
 		hash_bool(&mut hasher, self.supervised);
 		hash_bool(&mut hasher, self.no_exec);
@@ -562,4 +635,23 @@ fn hash_bool(hasher: &mut omp_core::hash32::Hasher, value: bool) {
 
 fn hash_u64(hasher: &mut omp_core::hash32::Hasher, value: u64) {
 	hash_bytes(hasher, &value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn proxy_endpoint_requires_nonzero_port_and_changes_stable_identity() {
+		let mut first = SandboxSpec::new("/bin/true");
+		assert!(matches!(
+			first.set_proxy_endpoint(0, None),
+			Err(SandboxError::InvalidSpec(SpecViolation::ProxyPortZero))
+		));
+		let before = first.stable_id("sandbox");
+		first
+			.set_proxy_endpoint(18443, None)
+			.expect("proxy endpoint");
+		assert_ne!(before, first.stable_id("sandbox"));
+	}
 }

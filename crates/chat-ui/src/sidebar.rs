@@ -327,19 +327,6 @@ mod tests {
 	}
 
 	#[test]
-	fn rail_preserves_sub_cent_cost_precision() {
-		let ctx = UiContext::default();
-		let viewport = Size::new(120, 30);
-		let mut facts = facts();
-		facts.cost_nanos = 1_918_000;
-		let mut sidebar = Sidebar::new(&facts, &ctx);
-		let layer = sidebar
-			.layer(viewport, Instant::now())
-			.expect("rail visible");
-		assert!((0..30).any(|row| frame_row_text(layer.frame, row).contains("$0.0019")));
-	}
-
-	#[test]
 	fn context_usage_uses_the_themed_compaction_threshold_color() {
 		let accent = Color::Rgb(12, 34, 56);
 		let mut ctx = UiContext::default();

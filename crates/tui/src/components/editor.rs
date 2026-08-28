@@ -459,6 +459,12 @@ impl EditInput {
 		self.editor.buffer()
 	}
 
+	/// Returns the composer line containing the cursor, for host copy-line
+	/// actions.
+	pub fn current_line(&self) -> &str {
+		self.editor.current_line()
+	}
+
 	/// Sets one editor property, updating its buffer for `value`.
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		let value = value.into();
@@ -964,7 +970,13 @@ impl Component for EditInput {
 		} else {
 			pc.ctx.theme.muted
 		});
-		let surface = Style::new().bg(pc.ctx.theme.panel);
+		let surface = Style::new()
+			.fg(
+				pc.ctx
+					.theme
+					.foreground_on(pc.ctx.theme.fg, pc.ctx.theme.panel),
+			)
+			.bg(pc.ctx.theme.panel);
 		let (tl, tr, bl, br, horizontal, vertical) = pc.ctx.charset.border(Border::Round);
 		let right = rect.x.saturating_add(rect.width.saturating_sub(1));
 		if layout.top_rows > 0 && rect.y < pc.clip {
@@ -1037,7 +1049,11 @@ impl Component for EditInput {
 			}
 		}
 		let cursor_style = Style::new()
-			.fg(pc.ctx.theme.contrast)
+			.fg(
+				pc.ctx
+					.theme
+					.foreground_on(pc.ctx.theme.contrast, pc.ctx.theme.accent),
+			)
 			.bg(pc.ctx.theme.accent);
 		let buffer_start = text.as_ptr() as usize;
 		let mut scanned = 0;
@@ -1121,7 +1137,14 @@ impl Component for EditInput {
 			runs = overlay_chip_runs(&runs, &decoration_runs, content.text.len());
 			if matches!(self.style, ComposerStyle::Field | ComposerStyle::Rail) {
 				for run in &mut runs {
-					run.style = run.style.bg(pc.ctx.theme.panel);
+					run.style = run
+						.style
+						.fg(
+							pc.ctx
+								.theme
+								.foreground_on(run.style.foreground_color(), pc.ctx.theme.panel),
+						)
+						.bg(pc.ctx.theme.panel);
 				}
 			}
 			let mut x = rect.x.saturating_add(layout.side_chrome);
@@ -1168,7 +1191,13 @@ impl Component for EditInput {
 				if hint_width > 0 {
 					let mut style = Style::new().fg(pc.ctx.theme.muted).dim();
 					if matches!(self.style, ComposerStyle::Field | ComposerStyle::Rail) {
-						style = style.bg(pc.ctx.theme.panel);
+						style = style
+							.fg(
+								pc.ctx
+									.theme
+									.foreground_on(style.foreground_color(), pc.ctx.theme.panel),
+							)
+							.bg(pc.ctx.theme.panel);
 					}
 					pc.frame
 						.put(hint_x, y, truncate_to_width(hint, hint_width).text, style);
@@ -1180,7 +1209,13 @@ impl Component for EditInput {
 			{
 				let mut style = Style::new().fg(pc.ctx.theme.muted).dim().italic();
 				if matches!(self.style, ComposerStyle::Field | ComposerStyle::Rail) {
-					style = style.bg(pc.ctx.theme.panel);
+					style = style
+						.fg(
+							pc.ctx
+								.theme
+								.foreground_on(style.foreground_color(), pc.ctx.theme.panel),
+						)
+						.bg(pc.ctx.theme.panel);
 				}
 				pc.frame.put(x, y, placeholder, style);
 			}
@@ -2134,6 +2169,16 @@ impl EditorPane {
 			.buffer()
 	}
 
+	/// Returns the composer line containing the cursor, for host copy-line
+	/// actions; empty when the editable leaf was replaced by a custom
+	/// component.
+	pub fn current_line(&self) -> &str {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.map_or("", EditInput::current_line)
+	}
+
 	#[cfg(test)]
 	pub(crate) fn replace_external(&mut self, text: &str, cursor_at_start: bool) {
 		self.children[0]
@@ -2757,6 +2802,36 @@ mod tests {
 			rail.frame().cell(1, 0).style().background_color(),
 			UiContext::default().theme.panel,
 		);
+	}
+	#[test]
+	fn unset_editor_foreground_falls_back_only_on_painted_fields() {
+		let mut painted = UiContext::default();
+		painted.theme.fg = Color::Default;
+		painted.theme.panel = Color::Rgb(0xee, 0xee, 0xee);
+		let painted = Ui::from_root(
+			EditorPane::new()
+				.composer_style(ComposerStyle::Field)
+				.with(Prop::Value, "hello"),
+			20,
+			painted,
+		);
+		let painted_style = painted.frame().cell(2, 0).style();
+		assert_ne!(painted_style.foreground_color(), Color::Default);
+		assert_eq!(painted_style.background_color(), Color::Rgb(0xee, 0xee, 0xee));
+
+		let mut terminal_default = UiContext::default();
+		terminal_default.theme.fg = Color::Default;
+		terminal_default.theme.panel = Color::Default;
+		let terminal_default = Ui::from_root(
+			EditorPane::new()
+				.composer_style(ComposerStyle::Field)
+				.with(Prop::Value, "hello"),
+			20,
+			terminal_default,
+		);
+		let default_style = terminal_default.frame().cell(2, 0).style();
+		assert_eq!(default_style.foreground_color(), Color::Default);
+		assert_eq!(default_style.background_color(), Color::Default);
 	}
 
 	#[test]

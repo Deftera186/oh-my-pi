@@ -1239,8 +1239,8 @@ fn icon_catalog_resolves_short_names_and_qualified_aliases() {
 
 	let omp = Icon::from_name("omp").unwrap();
 	assert_eq!(omp, Icon::from_name("icon.omp").unwrap());
-	assert_eq!(Charset::Ascii.icon(omp), "⍧");
-	assert_eq!(Charset::Unicode.icon(omp), "⍧");
+	assert_eq!(Charset::Ascii.icon(omp), "pi");
+	assert_eq!(Charset::Unicode.icon(omp), "π");
 	assert_eq!(Charset::NerdFont.icon(omp), "󰵗");
 	assert_eq!(Charset::NerdFont.icon(Icon::Csharp), "\u{e7b2}");
 	let command_types = [

@@ -259,7 +259,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity:       ast_grep,
-			title:          "find console calls in packages/tui/src",
 			streaming_args: r#"{"pat":"console.$METHOD($AR"#,
 			args:           r#"{"pat":"console.$METHOD($ARG)","path":"packages/tui/src/**/*.ts"}"#,
 			progress_update: None,
@@ -268,7 +267,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity:       ast_edit,
-			title:          "replace legacy null guards with optional chaining",
 			streaming_args: r#"{"ops":[{"pat":"$A && $A.$B","out":"$A?."#,
 			args:           r#"{"ops":[{"pat":"$A && $A.$B","out":"$A?.$B"}],"paths":["packages/tui/src/**/*.ts"]}"#,
 			progress_update: None,

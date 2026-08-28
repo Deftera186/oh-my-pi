@@ -139,7 +139,8 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 	fs::create_dir_all(&local_root).into_diagnostic()?;
 	let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&root));
 	settings_paths.overlays.extend(args.config.iter().cloned());
-	let settings_manager = SettingsManager::open(settings_paths).into_diagnostic()?;
+	let settings_manager =
+		SettingsManager::open(settings_paths, crate::SETTINGS_CATALOG).into_diagnostic()?;
 	let settings_snapshot = settings_manager.snapshot();
 	let model_settings = settings_snapshot
 		.project::<omp_catalog::settings::ModelSettings>()
@@ -1114,6 +1115,7 @@ impl AcpEventMapper {
 			| AgentEvent::RosterChanged { .. }
 			| AgentEvent::JobRegistered { .. }
 			| AgentEvent::JobSettled { .. }
+			| AgentEvent::InputStaged { .. }
 			| AgentEvent::HistoryRewritten { .. } => Vec::new(),
 		}
 	}
@@ -1187,6 +1189,48 @@ impl AcpEventMapper {
 	}
 }
 
+#[derive(Clone, Debug, miette::Diagnostic, thiserror::Error)]
+#[error("{message}")]
+struct AcpRequestError {
+	code:    i64,
+	message: &'static str,
+	data:    Value,
+}
+
+impl AcpRequestError {
+	fn session_busy() -> Self {
+		Self {
+			code:    -32003,
+			message: "session is busy",
+			data:    json!({
+				"reason": "session_busy",
+				"hint": "steer|followUp|wait",
+			}),
+		}
+	}
+
+	fn response(&self, id: Value) -> Value {
+		json!({
+			"jsonrpc": "2.0",
+			"id": id,
+			"error": {
+				"code": self.code,
+				"message": self.message,
+				"data": self.data,
+			},
+		})
+	}
+}
+
+fn active_prompt_error(
+	active: &HashMap<Str, CancellationToken>,
+	session_id: &Str,
+) -> Option<AcpRequestError> {
+	active
+		.contains_key(session_id)
+		.then(AcpRequestError::session_busy)
+}
+
 impl Runtime {
 	#[tracing::instrument(
 		name = "acp_request",
@@ -1219,7 +1263,11 @@ impl Runtime {
 				return Ok(());
 			};
 			if let Err(error) = self.start_prompt(id.clone(), params).await {
-				self.error(id, -32602, error.to_string())?;
+				if let Some(error) = error.downcast_ref::<AcpRequestError>() {
+					self.request_error(id, error)?;
+				} else {
+					self.error(id, -32602, error.to_string())?;
+				}
 			}
 			return Ok(());
 		}
@@ -1399,7 +1447,7 @@ impl Runtime {
 		let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
 		let mut paths = SettingsPaths::discover(&data_dir, Some(&root));
 		paths.overlays.extend(settings_overlays.iter().cloned());
-		let manager = SettingsManager::open(paths).into_diagnostic()?;
+		let manager = SettingsManager::open(paths, crate::SETTINGS_CATALOG).into_diagnostic()?;
 		let settings_snapshot = manager.snapshot();
 		let model_settings = settings_snapshot
 			.project::<omp_catalog::settings::ModelSettings>()
@@ -2439,8 +2487,8 @@ impl Runtime {
 		let token = CancellationToken::new();
 		let session = {
 			let mut state = self.state.lock();
-			if state.active.contains_key(&session_id) {
-				return Err(miette!("session is busy"));
+			if let Some(error) = active_prompt_error(&state.active, &session_id) {
+				return Err(miette::Report::new(error));
 			}
 			let session = state
 				.sessions
@@ -2536,8 +2584,8 @@ impl Runtime {
 		cancellation: &CancellationToken,
 	) -> miette::Result<Arc<AcpSession>> {
 		let mut state = self.state.lock();
-		if state.active.contains_key(session_id) {
-			return Err(miette!("session is busy"));
+		if let Some(error) = active_prompt_error(&state.active, session_id) {
+			return Err(miette::Report::new(error));
 		}
 		let session = state
 			.sessions
@@ -2806,6 +2854,10 @@ impl Runtime {
 			.into_diagnostic()
 	}
 
+	fn request_error(&self, id: Value, error: &AcpRequestError) -> miette::Result<()> {
+		self.output.send(error.response(id)).into_diagnostic()
+	}
+
 	fn error(&self, id: Value, code: i64, message: impl Into<String>) -> miette::Result<()> {
 		self
 			.output
@@ -2857,7 +2909,14 @@ fn prompt_items(parts: Vec<ContentPart>) -> Vec<Item> {
 		}
 	}
 	vec![Item {
-		kind: Some(item::Kind::Message(Message { role: Role::User as i32, parts: canonical })),
+		kind: Some(item::Kind::Message(Message {
+			role: Role::User as i32,
+			parts: canonical,
+			synthetic: None,
+			user_initiated: None,
+			completed_at_ms: None,
+			usage: None,
+		})),
 		..Item::default()
 	}]
 }
@@ -3689,6 +3748,28 @@ mod tests {
 	use omp_proto::inference::v1::value;
 
 	use super::*;
+
+	#[test]
+	fn busy_prompt_has_typed_session_busy_response() {
+		let session_id = Str::new_static("busy-session");
+		let active = HashMap::from([(session_id.clone(), CancellationToken::new())]);
+		let error = active_prompt_error(&active, &session_id).expect("active session is busy");
+		assert_eq!(
+			error.response(json!(7)),
+			json!({
+				"jsonrpc": "2.0",
+				"id": 7,
+				"error": {
+					"code": -32003,
+					"message": "session is busy",
+					"data": {
+						"reason": "session_busy",
+						"hint": "steer|followUp|wait",
+					},
+				},
+			})
+		);
+	}
 
 	#[test]
 	fn canonical_auth_methods_follow_client_terminal_capability() {

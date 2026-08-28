@@ -38,6 +38,7 @@ use omp_proto::omp::{
 	},
 	inference::v1::usage,
 };
+use omp_storage::index::SessionIndex;
 use parking_lot::Mutex;
 use tonic::{Request, Response, Status};
 
@@ -178,18 +179,30 @@ pub struct AuthRpc {
 	registry: Registry,
 	flows:    Arc<Mutex<BTreeMap<String, AuthFlow>>>,
 	control:  Option<AuthControlHandle>,
+	usage:    Option<Arc<SessionIndex>>,
 }
 
 impl AuthRpc {
 	/// Wraps one immutable comprehensive registry.
 	pub fn new(registry: Registry) -> Self {
-		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())), control: None }
+		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())), control: None, usage: None }
 	}
 
 	/// Binds the same live auth manager used by route execution to lifecycle
 	/// RPC.
 	pub fn with_control(registry: Registry, control: AuthControlHandle) -> Self {
-		Self { registry, flows: Arc::new(Mutex::new(BTreeMap::new())), control: Some(control) }
+		Self {
+			registry,
+			flows: Arc::new(Mutex::new(BTreeMap::new())),
+			control: Some(control),
+			usage: None,
+		}
+	}
+
+	/// Binds the gateway's append-only client usage store.
+	pub fn with_usage_store(mut self, usage: Arc<SessionIndex>) -> Self {
+		self.usage = Some(usage);
+		self
 	}
 
 	fn control(&self) -> Result<&AuthControlHandle, Status> {
@@ -979,12 +992,43 @@ impl pb::auth_server::Auth for AuthRpc {
 
 	async fn get_client_usage(
 		&self,
-		_request: Request<pb::GetClientUsageRequest>,
+		request: Request<pb::GetClientUsageRequest>,
 	) -> Result<Response<pb::GetClientUsageResponse>, Status> {
-		Err(Status::failed_precondition(
-			"per-client usage accounting is not bound to the auth service; use the session usage \
-			 report",
-		))
+		let usage = self
+			.usage
+			.as_ref()
+			.ok_or_else(|| Status::failed_precondition("per-client usage accounting is not bound"))?;
+		let clients = usage
+			.client_usage(request.into_inner().since_ms)
+			.map_err(|_| Status::internal("client usage query failed"))?
+			.into_iter()
+			.map(|client| pb::get_client_usage_response::ClientUsage {
+				install_id:    client.install_id.to_string(),
+				hostname:      client
+					.hostname
+					.map_or_else(String::new, |value| value.to_string()),
+				first_seen_ms: client.first_seen_ms,
+				last_seen_ms:  client.last_seen_ms,
+				providers:     client
+					.providers
+					.into_iter()
+					.map(|provider| pb::get_client_usage_response::client_usage::ProviderUsage {
+						app:                provider
+							.app
+							.map_or_else(String::new, |value| value.to_string()),
+						provider:           provider.provider.to_string(),
+						model:              provider.model.to_string(),
+						requests:           provider.requests,
+						input_tokens:       provider.input_tokens,
+						output_tokens:      provider.output_tokens,
+						cache_read_tokens:  provider.cache_read_tokens,
+						cache_write_tokens: provider.cache_write_tokens,
+						nanos_usd:          provider.cost_nanos_usd,
+					})
+					.collect(),
+			})
+			.collect();
+		Ok(Response::new(pb::GetClientUsageResponse { clients }))
 	}
 
 	async fn probe_credentials(
@@ -1278,6 +1322,7 @@ fn usage_report(report: UsageReport) -> pb::UsageReport {
 						UsageUnit::Percent => usage_window::Unit::Percent,
 						UsageUnit::Tokens => usage_window::Unit::Tokens,
 						UsageUnit::Requests => usage_window::Unit::Requests,
+						UsageUnit::Credits => usage_window::Unit::Credits,
 						UsageUnit::Usd => usage_window::Unit::Usd,
 						UsageUnit::Minutes => usage_window::Unit::Minutes,
 						UsageUnit::Bytes => usage_window::Unit::Bytes,

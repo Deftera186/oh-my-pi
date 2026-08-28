@@ -603,8 +603,11 @@ pub struct AgentDefinition {
 	pub name:            Str,
 	/// Human-readable description used by dynamic task schemas.
 	pub description:     Str,
-	/// Exact child tool vocabulary. An empty list inherits the caller toolset.
+	/// Exact child tool vocabulary.
 	pub tools:           Box<[Str]>,
+	/// Whether the definition explicitly declared `tools`, including `tools:
+	/// []`.
+	pub tools_declared:  bool,
 	/// Child-spawn capability and whitelist.
 	pub spawns:          SpawnPolicy,
 	/// Optional role or exact model selector.
@@ -666,6 +669,7 @@ impl AgentDefinition {
 			.as_mapping()
 			.ok_or(AgentDefinitionError::InvalidField("frontmatter"))?;
 		let description = yaml_string(fields, &["description"])?.unwrap_or_default();
+		let tools_declared = yaml_get(fields, &["tools"]).is_some();
 		let mut tools = yaml_string_list(fields, &["tools"], "tools")?;
 		if !tools.is_empty() && !tools.iter().any(|tool| tool == "yield") {
 			tools.push(Str::new_static("yield"));
@@ -705,6 +709,7 @@ impl AgentDefinition {
 			name,
 			description,
 			tools,
+			tools_declared,
 			spawns,
 			model,
 			prewalk_model,
@@ -2194,6 +2199,7 @@ mod tests {
 		)
 		.expect("definition");
 		assert_eq!(definition.tools.as_ref(), ["read", "grep", "hub", "yield"]);
+		assert!(definition.tools_declared);
 		assert!(definition.spawns.allows("SCOUT"));
 		assert!(!definition.spawns.allows("task"));
 		assert_eq!(definition.spawns.default_definition(), Some("scout"));
@@ -2201,5 +2207,22 @@ mod tests {
 		assert!(definition.blocking);
 		let overrides = BTreeMap::from([("Reviewer".into(), "@slow".into())]);
 		assert_eq!(definition.effective_model(&overrides), Some("@slow"));
+	}
+
+	#[test]
+	fn explicit_empty_tools_remains_distinct_from_absent_tools() {
+		let empty = AgentDefinition::parse_markdown(
+			"quiet",
+			"---\ndescription: no tools\ntools: []\n---\nWait.",
+		)
+		.expect("empty tools");
+		let absent =
+			AgentDefinition::parse_markdown("default", "---\ndescription: defaults\n---\nWork.")
+				.expect("absent tools");
+
+		assert!(empty.tools_declared);
+		assert!(empty.tools.is_empty());
+		assert!(!absent.tools_declared);
+		assert!(absent.tools.is_empty());
 	}
 }

@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "source_digest": "ab3c692a2a93bec98ce90e16ca9bea160c826bd98dafec1692a084bdc1818cda",
+  "source_digest": "15cea0d23eb3e0f86158fa3775c60094458c3e9a4b313b28113b07c399728f48",
   "inputs": [
     {
       "id": "catalog.models.compressed.v1",
       "path": "fixtures/llm-oracle/catalog/models.json.zst",
-      "sha256": "a26a567b9402fb468c77d1d79f00a81df309ca36d60df0afda9198fa469a6a5f",
+      "sha256": "fedc53d731511e1be277c1882cff0cdc0c8de22edcd27d4dc184a6d3591c4e14",
       "source": "oracle:catalog.models.compressed.v1"
     },
     {
@@ -71,7 +71,7 @@
     {
       "id": "catalog.providers.source.v1",
       "path": "fixtures/llm-oracle/catalog/providers.toml",
-      "sha256": "f377f0f3ad0c5b9fa5d64dbcecaf130cfc51c4adcdb9a413ce4e47b96b0807f6",
+      "sha256": "b362d8c6b1c7b8c1c103649ceba84c58ded423039287909cfcd6f3101ef3b6a6",
       "source": "oracle:catalog.providers.source.v1"
     },
     {
@@ -125,7 +125,7 @@
     {
       "id": "compat.cascade.classes.glm.v1",
       "path": "crates/catalog/compat/classes/glm.kdl",
-      "sha256": "b22fdd362b283a13488edc960124b2d092a4f88f457b43c068f5dff8bdec7f14",
+      "sha256": "09bb5362e74788466ff96bd9d13a71065be438aab80c9380fb13fd5712b49d3a",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -173,7 +173,7 @@
     {
       "id": "compat.cascade.classes.qwen.v1",
       "path": "crates/catalog/compat/classes/qwen.kdl",
-      "sha256": "cf5fd165e4ce77a82a816e5f50203da14cf8e67b09336be9a39a83a18ef3e620",
+      "sha256": "984cdc953eb04128ac9639eb00d4c257b6330f1a9ae81c39a7cd9ce09ea6cb4f",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -227,7 +227,7 @@
     {
       "id": "compat.cascade.providers.amazon-bedrock.v1",
       "path": "crates/catalog/compat/providers/amazon-bedrock.kdl",
-      "sha256": "afee52349434463958fb31cc65a508db6ecd3b5d9d81c37488a53fd48d7660f4",
+      "sha256": "86ee5bed806153079cb7816ae62b3616727b2f90fd40f3f36cf61d9f62fa481a",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -317,7 +317,7 @@
     {
       "id": "compat.cascade.providers.github-copilot.v1",
       "path": "crates/catalog/compat/providers/github-copilot.kdl",
-      "sha256": "6c3635a2c5d1f10c44c1ecb372274366cbae520819fe5b49123fda304202d30e",
+      "sha256": "62de41105d50b376f0e937510e9b671fc6ae7c0dcaef26faf29912fa95bfc110",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -437,7 +437,7 @@
     {
       "id": "compat.cascade.providers.openai-codex.v1",
       "path": "crates/catalog/compat/providers/openai-codex.kdl",
-      "sha256": "014fd7f16a0424d4efea3f99805bbd165bfe10ba4183f15af8b551af3dcea655",
+      "sha256": "d62fe4009cd30b64d79d1450fd7656ed2728e0621fbc774bec4f2e31022cb3fa",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -557,13 +557,13 @@
     {
       "id": "compat.cascade.providers.xai-oauth.v1",
       "path": "crates/catalog/compat/providers/xai-oauth.kdl",
-      "sha256": "ec40b873b8f7837e99fe4a032708480ffbf95f2bc6a8a4d62e979d40fd358d33",
+      "sha256": "422d86ea1808e69671963c8828e575069f628b96e82b4cfa77b1ee34bc2e2ae8",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
       "id": "compat.cascade.providers.xai.v1",
       "path": "crates/catalog/compat/providers/xai.kdl",
-      "sha256": "15e38266130964a985064fc28ba76162cc1038dbb180d5d3260bf3fecc5f3522",
+      "sha256": "d130e7d6fedeb33ba76444b271be88196ead693fb460ebd8ce361397176d7e04",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -605,7 +605,7 @@
     {
       "id": "compat.cascade.providers.zai.v1",
       "path": "crates/catalog/compat/providers/zai.kdl",
-      "sha256": "24e3aa90cbbc0b1deef6d9ba863f22f106c960c76d15b71d326e08f31354c240",
+      "sha256": "8dcd464784ed7c4cdd33bb91f8274ff9ce39a4658dc3fbaa716ab5d177e76e47",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -623,19 +623,19 @@
     {
       "id": "compat.cascade.runtime.behavior.v1",
       "path": "crates/catalog/compat/runtime/behavior.kdl",
-      "sha256": "021fa8d71194967b96d12bad1b2a28898428bdb672975525b66055e23201e15f",
+      "sha256": "72e1e6d8a344f59770c50d55ef2af8be96f470e6a817cdec3535317107171444",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
       "id": "compat.cascade.taxonomy._collapse.v1",
       "path": "crates/catalog/compat/taxonomy/_collapse.kdl",
-      "sha256": "d0f379d74e495acdd78360287f68a4aecc7a379d2f4d650220864c849b4a43e5",
+      "sha256": "5ab2fe40a52dbf2ba020a23161120dc14ae7dfbde9ba570970bdbcebaf91f7f8",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
       "id": "compat.cascade.taxonomy._discovery.v1",
       "path": "crates/catalog/compat/taxonomy/_discovery.kdl",
-      "sha256": "daad238b2dba3963342fa4766ae24b52b06c74e731fff02e9411d1ceb9b33cf3",
+      "sha256": "219ad4949210cd1175c28b3bed58852afc607152de32ee164ff4c9a6f7f8f2da",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {

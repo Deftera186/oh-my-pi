@@ -37,6 +37,7 @@ pub use provider::*;
 pub use resolve::*;
 pub use runtime::*;
 pub use selection::*;
+pub use settings::SETTINGS_CONTRIBUTION;
 pub use snapshot::*;
 pub use taxonomy::*;
 pub use thinking::*;

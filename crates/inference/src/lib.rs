@@ -70,4 +70,4 @@ pub use plan::{
 pub use provider::ProviderService;
 pub use receipt::*;
 pub use registry::{Registry, RegistryBuilder, RegistryHandle, RegistrySnapshot, RouteUnavailable};
-pub use settings::InferenceSettings;
+pub use settings::{InferenceSettings, SETTINGS_CONTRIBUTION};

@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use omp_agent::{
 	AgentEvent, AgentRecord, Broker, CancelOutcome, DeliveryMode, EventBus, JobBoard, JobError,
-	PeerMessage, PeerRelayObservation, RegistryStatus, TurnClient,
+	PeerMessage, PeerRelayObservation, RegistryStatus, TurnClient, WaitError,
 };
 use omp_core::{Duration, DurationUnit, Str, sf};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
@@ -349,9 +349,13 @@ impl ChatHubBackend {
 	}
 
 	fn roster_page(&self, status: Option<ListStatus>, limit: Option<u16>) -> RosterPage {
-		self.restore_persisted_roster();
+		let root = self.restore_persisted_roster();
+		let registry = self.broker.registry();
+		let records = root
+			.as_deref()
+			.map_or_else(|| registry.roster(false), |root| registry.roster_for_root(root, false));
 		let (records, counts) = select_roster(
-			self.broker.registry().roster(false),
+			records,
 			self.agent_id.as_str(),
 			status,
 			limit.map_or(DEFAULT_LIST_LIMIT, usize::from),
@@ -384,34 +388,36 @@ impl ChatHubBackend {
 		RosterPage { peers, counts }
 	}
 
-	fn restore_persisted_roster(&self) {
+	fn restore_persisted_roster(&self) -> Option<Str> {
 		let registry = self.broker.registry();
 		let mut current = self.agent_id.clone();
-		let mut root_file = None;
-		for _ in 0..64 {
+		let mut visited = BTreeSet::new();
+		let (root_id, root_file) = loop {
+			if !visited.insert(current.clone()) {
+				return None;
+			}
 			let Some((record, _)) = registry.record(current.as_str()) else {
-				break;
+				return None;
 			};
 			if record.kind == omp_agent::AgentKind::Main {
-				root_file = record.transcript;
-				break;
+				break (record.id, record.transcript);
 			}
 			let Some(parent) = record.parent else {
-				root_file = record.transcript;
-				break;
+				break (record.id, record.transcript);
 			};
 			current = parent;
-		}
+		};
 		let Some(root_file) = root_file else {
-			return;
+			return Some(root_id);
 		};
 		let Some(sessions) = root_file.parent() else {
-			return;
+			return Some(root_id);
 		};
 		let directory = sessions.join("eval-agents");
 		if directory.is_dir() {
 			registry.restore_transcripts_once(&root_file, &directory);
 		}
+		Some(root_id)
 	}
 
 	async fn process_generation(&self, name: &str) -> Result<u64, Fault> {
@@ -438,6 +444,18 @@ impl ChatHubBackend {
 		if params.await_reply && (to == "all" || to == "project:all" || to.starts_with("session:")) {
 			return Err(fault("awaited hub sends require one direct recipient"));
 		}
+		if to != "all" && to != "project:all" && !to.starts_with("session:") {
+			self.restore_persisted_roster();
+		}
+		let awaited_target = params.await_reply.then(|| {
+			let recipient = self
+				.broker
+				.registry()
+				.record(to.as_str())
+				.map_or_else(|| to.clone(), |(record, _)| record.id);
+			let terminal_turn = self.broker.terminal_turn(recipient.as_str());
+			(recipient, terminal_turn)
+		});
 		let id = Str::from(omp_core::Ulid::generate().to_string());
 		let message = PeerMessage {
 			id:            id.clone(),
@@ -466,13 +484,38 @@ impl ChatHubBackend {
 				.map(|delivery| delivery.to.clone())
 				.unwrap_or(to);
 			let timeout = wait_timeout(params.timeout_ms);
-			let reply = self
-				.inbox
-				.lock()
-				.await
-				.wait_for_timeout(Some(recipient.as_str()), Some(id.as_str()), timeout)
-				.await
-				.map_err(|error| fault(error.to_string()))?;
+			let wait = if let Some(observed) = awaited_target
+				.as_ref()
+				.filter(|(target, _)| target.eq_ignore_ascii_case(recipient.as_str()))
+				.and_then(|(_, terminal_turn)| *terminal_turn)
+			{
+				self
+					.inbox
+					.lock()
+					.await
+					.wait_for_reply_timeout(recipient.as_str(), id.as_str(), observed, timeout)
+					.await
+			} else {
+				self
+					.inbox
+					.lock()
+					.await
+					.wait_for_timeout(Some(recipient.as_str()), Some(id.as_str()), timeout)
+					.await
+			};
+			let reply = match wait {
+				Ok(reply) => reply,
+				Err(WaitError::AwaitTargetStopped { peer }) => {
+					return Self::response(json!({
+						"deliveries": deliveries_json(&deliveries),
+						"reply": null,
+						"note": format!(
+							"{peer} stopped without replying. Check inbox or history://{peer} for a later answer."
+						),
+					}));
+				},
+				Err(error) => return Err(fault(error.to_string())),
+			};
 			return Self::response(json!({
 				"deliveries": deliveries_json(&deliveries),
 				"reply": reply.map(message_json),
@@ -823,7 +866,11 @@ impl ChatHubBackend {
 				.map_err(|error| fault(error.to_string()))?
 			{
 				match event {
+					ProcessAttachmentEvent::Attached(attached) => {
+						ensure_process_generation(name, generation, attached.generation)?;
+					},
 					ProcessAttachmentEvent::Output(output) => {
+						ensure_process_generation(name, generation, output.generation)?;
 						let text = String::from_utf8_lossy(&output.data);
 						if pattern.is_none() {
 							return Ok(Some(json!({
@@ -845,6 +892,11 @@ impl ChatHubBackend {
 						}
 					},
 					ProcessAttachmentEvent::State(state) => {
+						let actual_generation = state
+							.process
+							.as_ref()
+							.map_or(generation, |process| process.generation);
+						ensure_process_generation(name, generation, actual_generation)?;
 						let target = params.wait_for.as_deref().unwrap_or("exit");
 						let process_state = v1::ProcessState::try_from(
 							state.process.as_ref().map_or(0, |process| process.state),
@@ -1275,6 +1327,15 @@ fn compile_regex(pattern: Option<&str>, label: &str) -> Result<Option<Regex>, Fa
 		})
 		.transpose()
 }
+fn ensure_process_generation(name: &str, observed: u64, actual: u64) -> Result<(), Fault> {
+	if actual == observed {
+		return Ok(());
+	}
+	Err(fault(format!(
+		"process {name:?} generation {observed} ended; the wait will not continue against \
+		 replacement generation {actual}"
+	)))
+}
 
 fn append_bounded(buffer: &mut String, text: &str, limit: usize) {
 	buffer.push_str(text);
@@ -1383,7 +1444,7 @@ mod tests {
 
 	use super::{
 		DEFAULT_LIST_LIMIT, HUB_WAIT_MATCH_BYTES, TerminalRowReplay, append_bounded, compile_regex,
-		select_roster,
+		ensure_process_generation, select_roster,
 	};
 
 	#[test]
@@ -1409,6 +1470,13 @@ mod tests {
 		let mut bounded = String::new();
 		append_bounded(&mut bounded, &"x".repeat(HUB_WAIT_MATCH_BYTES + 10), HUB_WAIT_MATCH_BYTES);
 		assert_eq!(bounded.len(), HUB_WAIT_MATCH_BYTES);
+	}
+	#[test]
+	fn process_wait_rejects_a_replacement_generation() {
+		assert!(ensure_process_generation("worker", 7, 7).is_ok());
+		let error = ensure_process_generation("worker", 7, 8).expect_err("generation bump");
+		assert!(error.message.contains("generation 7 ended"));
+		assert!(error.message.contains("replacement generation 8"));
 	}
 	#[test]
 	fn default_roster_is_live_bounded_and_reports_parked_count() {

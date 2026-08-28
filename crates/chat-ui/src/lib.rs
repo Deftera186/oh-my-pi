@@ -46,6 +46,7 @@ pub mod slots;
 use std::{sync::Arc, time::Instant};
 
 pub use agent_hub::{AgentHub, AgentHubEvent};
+pub use approval::approval_hotkeys;
 pub use blocks::{BlockOrdinal, BlockPhase, BlockTarget, Blocks, Overflow, Plan};
 pub mod image_overlay;
 pub use extension_inspector::{
@@ -63,7 +64,7 @@ pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
 pub use inspector::{HistoryInspector, HistoryInspectorEvent};
 pub use model_hub::{ModelHub, ModelHubEvent};
 use omp_core::Str;
-use omp_proto::omp::ui::v1;
+use omp_proto::{inference::v1::Usage, omp::ui::v1};
 pub use omp_tui::components::{Attachment, CompactionBoundaries, ComposerStyle};
 pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
@@ -73,7 +74,7 @@ pub use pty::{PtyEvent, PtyOutputQueue, PtyOverlay, PtyStatus, TerminalState};
 pub use raw_stream::{RawFrame, RawStreamEvent, RawStreamViewer, StreamSummary};
 pub use scene::{
 	Chat, ChatKey, LiveVoiceAction, LiveVoicePhase, LiveVoiceVisualizer, RetirementBatch,
-	ToolPresentation, ViewportFrame,
+	ViewportFrame,
 };
 pub use selection_overlay::{SelectionEvent, SelectionOverlay, SelectionPurpose};
 pub use settings_overlay::{SettingChange, SettingsEvent, SettingsOverlay};
@@ -429,8 +430,6 @@ pub struct VisibleResourceFacts {
 pub struct StatusFacts {
 	/// Model label shown in the status line.
 	pub model:                  Str,
-	/// Stable session identifier shown in non-minimal status layouts.
-	pub session_id:             Option<Str>,
 	/// Whether the primary model uses subscription billing.
 	pub model_subscription:     bool,
 	/// Advisor model label, when an advisor is configured or active.
@@ -486,6 +485,8 @@ pub struct StatusFacts {
 	pub account_override:       Option<Str>,
 	/// One-shot quota-reset edge emitted by the provider usage authority.
 	pub quota_reset:            bool,
+	/// Provider quota windows shown in the status line.
+	pub quota:                  Option<status_line::StatusQuota>,
 	/// Disable non-essential retained animation.
 	pub reduced_motion:         bool,
 	/// Responsive status shedding policy.
@@ -703,6 +704,13 @@ pub enum Intent {
 	/// The terminal host binds this to Alt+H because legacy terminal input
 	/// decodes Ctrl+H as Backspace.
 	InspectHistory,
+	/// Ask the backend for the native debug-tools catalog.
+	DebugMenuRequest,
+	/// Dispatch one stable debug action selected in the native overlay.
+	DebugAction(Str),
+	/// The log viewer reached its oldest visible entry; load the next backwards
+	/// chunk.
+	OlderLogs,
 	/// Ask the backend for prompt-history rows to open the history selector.
 	SearchHistory,
 	/// Rewind the durable transcript to an event.
@@ -712,6 +720,33 @@ pub enum Intent {
 	},
 	/// Switch the active model.
 	SwitchModel(Str),
+	/// Select the session-only model override used by task subagents.
+	SwitchTaskModel(Str),
+	/// Request session rows with the selected picker presentation.
+	SessionList {
+		/// Include sessions from every project.
+		all_projects:  bool,
+		/// Sort sessions by title rather than recency.
+		sort_by_title: bool,
+		/// Include session paths in row details.
+		show_paths:    bool,
+	},
+	/// Delete one session from the picker.
+	SessionDelete {
+		/// Stable session identity.
+		id:          Str,
+		/// Preserve session artifacts while deleting its record.
+		noninvasive: bool,
+	},
+	/// Rename one session from the picker.
+	SessionRename {
+		/// Stable session identity.
+		id:    Str,
+		/// Replacement session title.
+		title: Str,
+	},
+	/// Refresh the available model roster.
+	RefreshModels,
 	/// Ask the backend to open the fullscreen models hub.
 	OpenModelHub,
 	/// Apply one models-hub configuration mutation.
@@ -818,6 +853,38 @@ pub struct QueuedPrompt {
 	/// Attachments staged with the text.
 	pub attachments: Vec<Attachment>,
 }
+
+/// Transcript anchor transition carried separately from visible message rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnAnchor {
+	/// Start one outer agent run; clears only an anchor older than the last
+	/// completed run.
+	AgentStart,
+	/// A genuinely user-attributed prompt starts a turn at submission time.
+	User {
+		/// Original local submission time in Unix epoch milliseconds.
+		submitted_at_ms: u64,
+	},
+	/// A system/developer item either starts a synthetic run or continues the
+	/// current user turn.
+	Developer {
+		/// Original local item creation time in Unix epoch milliseconds.
+		submitted_at_ms: u64,
+		/// Whether this item initiates a fresh synthetic run.
+		synthetic:       bool,
+		/// Whether the synthetic item was deliberately issued by the operator.
+		user_initiated:  bool,
+	},
+}
+
+/// Final assistant usage and the local completion timestamp persisted with it.
+#[derive(Clone, Debug)]
+pub struct AssistantUsage {
+	/// Provider token accounting shown on the transcript row.
+	pub usage:           Usage,
+	/// Locally stamped completion time in Unix epoch milliseconds.
+	pub completed_at_ms: u64,
+}
 /// One attachment recovered from durable history for composer restore.
 #[derive(Clone, Debug)]
 pub enum RestoredAttachment {
@@ -842,6 +909,14 @@ pub struct RewindTargetRow {
 /// Inbound mutation emitted by a backend.
 #[derive(Clone)]
 pub enum BackendEvent {
+	/// Update the scene's prompt-to-yield anchor without adding a visible row.
+	TurnAnchor(TurnAnchor),
+	/// Append one assistant usage row using only local timing endpoints.
+	AssistantUsage(AssistantUsage),
+	/// Toggle transcript usage rows and rebuild already committed history.
+	ShowTokenUsageChanged(bool),
+	/// Toggle prompt-to-yield labels and rebuild already committed history.
+	ShowTurnTimeChanged(bool),
 	/// Open the fullscreen Git workbench over one repository snapshot.
 	OpenGitWorkbench(GitSnapshot),
 	/// Apply one update to the open Git workbench.
@@ -936,13 +1011,9 @@ pub enum BackendEvent {
 	/// Begin a streamed tool invocation.
 	ToolStarted {
 		/// Stable tool-call identifier.
-		id:    Str,
+		id:   Str,
 		/// Backend tool name.
-		name:  Str,
-		/// Exact argument/rendering revision.
-		rev:   Str,
-		/// Human-readable tool title.
-		title: Str,
+		name: Str,
 	},
 	/// Append output to a live tool invocation.
 	ToolOutput {
@@ -1114,6 +1185,26 @@ pub enum BackendEvent {
 		/// Initial ring/drop counters.
 		summary: StreamSummary,
 	},
+	/// Open the native debug-tools selector.
+	OpenDebugTools(Vec<crate::debug_selector::DebugActionRow>),
+	/// Open the terminal protocol probe.
+	OpenProtocolProbe,
+	/// Open the bounded process log viewer.
+	OpenLogs {
+		/// Initial log entries.
+		entries:     Vec<crate::log_viewer::LogEntry>,
+		/// Current process id used for filtering and boundary display.
+		current_pid: u32,
+		/// Whether another backwards chunk is available.
+		has_older:   bool,
+	},
+	/// Prepend an older chunk to the active log viewer.
+	OlderLogs {
+		/// Older entries, in chronological order.
+		entries:   Vec<crate::log_viewer::LogEntry>,
+		/// Whether another backwards chunk is available.
+		has_older: bool,
+	},
 	/// Append one subscribed raw provider stream frame.
 	RawStreamFrame {
 		/// Newly delivered sanitized frame.
@@ -1158,16 +1249,20 @@ pub enum BackendEvent {
 	/// Open the model picker with these rows and current selection.
 	OpenModelPicker {
 		/// Available models.
-		rows:    Vec<ModelRow>,
+		rows:         Vec<ModelRow>,
 		/// Current model index.
-		current: usize,
+		current:      usize,
+		/// Effective task-subagent model index.
+		task_current: usize,
 	},
 	/// Silently refresh cached model rows and the current selection.
 	ModelsUpdated {
 		/// Available models.
-		rows:    Vec<ModelRow>,
+		rows:         Vec<ModelRow>,
 		/// Current model index.
-		current: usize,
+		current:      usize,
+		/// Effective task-subagent model index.
+		task_current: usize,
 	},
 	/// Open the fullscreen models hub over catalog, role, and fallback state.
 	OpenModelHub(ModelHubData),

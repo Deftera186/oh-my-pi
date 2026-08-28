@@ -1041,7 +1041,15 @@ fn default_protocol(
 		TerminalId::Base | TerminalId::TrueColor | TerminalId::Vscode | TerminalId::Alacritty => None,
 		TerminalId::Orca => None,
 	};
-	known.or_else(|| fallback_protocol(vars, id, tty))
+	let protocol = known.or_else(|| fallback_protocol(vars, id, tty));
+	if value(vars, "PASEO_TERMINAL_ID").is_some() && matches!(protocol, Some(ImageProtocol::Kitty)) {
+		// Paseo advertises Kitty from its xterm.js-backed PTYs but supports
+		// neither Kitty APC graphics nor Unicode placeholders. Apply this
+		// after fallback resolution so tmux cannot restore Kitty passthrough.
+		None
+	} else {
+		protocol
+	}
 }
 
 fn enabled(raw: &str) -> bool {
@@ -1929,6 +1937,56 @@ mod tests {
 		assert_eq!(
 			detect(&[("TERM_PROGRAM", "WarpTerminal")], TerminalPlatform::MacOs).graphics,
 			Graphics::KittyDirect
+		);
+	}
+
+	#[test]
+	fn paseo_embedder_disables_direct_placeholder_and_tmux_fallback_graphics() {
+		assert_eq!(
+			detect(
+				&[("TERM_PROGRAM", "kitty"), ("PASEO_TERMINAL_ID", "term-1")],
+				TerminalPlatform::Linux,
+			)
+			.graphics,
+			Graphics::Cells
+		);
+		assert_eq!(
+			detect(
+				&[
+					("TERM_PROGRAM", "kitty"),
+					("PASEO_TERMINAL_ID", "term-1"),
+					("OMP_NO_KITTY_PLACEHOLDERS", "1"),
+				],
+				TerminalPlatform::Linux,
+			)
+			.graphics,
+			Graphics::Cells
+		);
+		assert_eq!(
+			detect(
+				&[
+					("TERM_PROGRAM", "kitty"),
+					("PASEO_TERMINAL_ID", "term-1"),
+					("TMUX", "/tmp/tmux"),
+					("TERM", "tmux-256color"),
+				],
+				TerminalPlatform::Linux,
+			)
+			.graphics,
+			Graphics::Cells
+		);
+		assert_eq!(
+			detect(
+				&[("PASEO_TERMINAL_ID", "term-1"), ("TERM", "tmux-256color")],
+				TerminalPlatform::Linux,
+			)
+			.graphics,
+			Graphics::Cells
+		);
+		assert_eq!(
+			detect(&[("TERM", "tmux-256color")], TerminalPlatform::Linux).graphics,
+			Graphics::KittyDirect,
+			"the tmux fallback remains available outside Paseo"
 		);
 	}
 

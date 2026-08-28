@@ -90,20 +90,56 @@ pub trait SpawnObserver: Send + Sync {
 	/// group id when known (always its own pid under `NewProcessGroup`).
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>);
 }
-/// Write-path admission consulted by in-process redirections and mutating
-/// builtins.
+/// File-operation admission consulted by in-process shell filesystem access.
+///
+/// Implementations receive the complete requested operation so protected
+/// executions can open files atomically after authorizing their path.
 pub trait PathPolicy: Send + Sync {
-	/// Checks whether `path` (absolute) may be created, truncated, modified, or
-	/// deleted.
-	fn check_write(&self, path: &Path) -> Result<(), WriteDenied>;
+	/// Checks whether `path` (absolute) may be read or traversed.
+	fn check_read(&self, path: &Path) -> Result<(), PathDenied>;
+
+	/// Checks whether `path` (absolute) may be mutated or removed.
+	fn check_write(&self, path: &Path) -> Result<(), PathDenied>;
+
+	/// Opens `path` for the requested operation after atomically authorizing it.
+	fn open(&self, path: &Path, request: OpenRequest) -> Result<fs::File, PathDenied>;
 }
 
-/// Typed sandbox denial naming the refused write path.
-#[derive(Debug, thiserror::Error)]
-#[error("sandbox denied write to {path}")]
-pub struct WriteDenied {
-	/// Absolute path whose mutation was refused.
-	pub path: PathBuf,
+/// Complete authority request for one atomic shell file open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenRequest {
+	/// Access operation requested by the shell.
+	pub access:      PathAccess,
+	/// POSIX creation bits for a newly created file.
+	pub create_mode: u32,
+}
+
+/// Explicit access requested for a shell-managed file open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
+#[strum(serialize_all = "kebab-case")]
+pub enum PathAccess {
+	/// Read an existing file.
+	Read,
+	/// Create a new file, failing when it already exists.
+	CreateNew,
+	/// Create or truncate a file for writing.
+	Truncate,
+	/// Create or append to a file.
+	Append,
+	/// Create or open a file for read/write access.
+	ReadWrite,
+	/// Create or open a file for writing without truncating it.
+	Write,
+}
+
+/// Typed sandbox denial naming the refused filesystem path.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("sandbox denied {access} to {path}")]
+pub struct PathDenied {
+	/// Absolute path whose access was refused.
+	pub path:   PathBuf,
+	/// Access operation refused by the policy.
+	pub access: PathAccess,
 }
 
 /// Rewrites external-command launches with a sandbox prefix and environment
@@ -161,7 +197,8 @@ pub struct ExecutionParameters {
 	pub suppress_errexit:     bool,
 	/// Optional hook reporting spawned external children for scoped teardown.
 	spawn_observer:           Option<Arc<dyn SpawnObserver>>,
-	/// Optional write-path admission policy for in-process filesystem mutations.
+	/// Optional file-operation admission policy for in-process shell filesystem
+	/// access.
 	path_policy:              Option<Arc<dyn PathPolicy>>,
 	/// Optional launcher and environment policy for external commands.
 	spawn_wrapper:            Option<Arc<dyn SpawnWrapper>>,
@@ -220,12 +257,12 @@ impl ExecutionParameters {
 		self.spawn_observer.as_ref()
 	}
 
-	/// Assigns a write-path policy for this execution.
+	/// Assigns a file-operation policy for this execution.
 	pub fn set_path_policy(&mut self, policy: Arc<dyn PathPolicy>) {
 		self.path_policy = Some(policy);
 	}
 
-	/// Returns the active write-path policy, if any.
+	/// Returns the active file-operation policy, if any.
 	pub fn path_policy(&self) -> Option<&Arc<dyn PathPolicy>> {
 		self.path_policy.as_ref()
 	}
@@ -2107,58 +2144,62 @@ pub(crate) async fn setup_redirect(
 						shell.absolute_path(Path::new(expanded_fields.remove(0).as_str()));
 
 					let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
-					if !matches!(
-						kind,
-						ast::IoFileRedirectKind::Read | ast::IoFileRedirectKind::DuplicateInput
-					) && let Some(policy) = params.path_policy()
-					{
-						policy.check_write(&expanded_file_path)?;
-					}
-					match kind {
+					let access = match kind {
 						ast::IoFileRedirectKind::Read => {
 							options.read(true);
+							PathAccess::Read
 						},
 						ast::IoFileRedirectKind::Write => {
 							if shell
 								.options()
 								.disallow_overwriting_regular_files_via_output_redirection
 							{
-								// First check to see if the path points to an existing regular
-								// file.
-								if !expanded_file_path.is_file() {
-									options.create(true);
-								} else {
+								// A protected execution cannot inspect before opening: use an
+								// atomic create-new admission instead. Unprotected shells retain
+								// the historical regular-file-only noclobber behavior.
+								if params.path_policy().is_some() || expanded_file_path.is_file() {
 									options.create_new(true);
+									options.write(true);
+									PathAccess::CreateNew
+								} else {
+									options.create(true);
+									options.write(true);
+									PathAccess::Write
 								}
-								options.write(true);
 							} else {
 								options.create(true);
 								options.write(true);
 								options.truncate(true);
+								PathAccess::Truncate
 							}
 						},
 						ast::IoFileRedirectKind::Append => {
 							options.create(true);
 							options.append(true);
+							PathAccess::Append
 						},
 						ast::IoFileRedirectKind::ReadAndWrite => {
 							options.create(true);
 							options.read(true);
 							options.write(true);
+							PathAccess::ReadWrite
 						},
 						ast::IoFileRedirectKind::Clobber => {
 							options.create(true);
 							options.write(true);
 							options.truncate(true);
+							PathAccess::Truncate
 						},
 						ast::IoFileRedirectKind::DuplicateInput => {
 							options.read(true);
+							PathAccess::Read
 						},
 						ast::IoFileRedirectKind::DuplicateOutput => {
 							options.create(true);
 							options.write(true);
+							PathAccess::Write
 						},
-					}
+					};
 
 					let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
 					#[cfg(unix)]
@@ -2167,13 +2208,8 @@ pub(crate) async fn setup_redirect(
 					}
 
 					let opened_file = shell
-						.open_file(&options, &expanded_file_path, params)
-						.map_err(|err| {
-							error::ErrorKind::RedirectionFailure(
-								expanded_file_path.to_string_lossy().to_string(),
-								err.to_string(),
-							)
-						})?;
+						.open_file(&options, &expanded_file_path, params, access)
+						.map_err(|error| redirection_error(&expanded_file_path, &error))?;
 
 					params.open_files.set_fd(fd_num, opened_file);
 				},
@@ -2328,6 +2364,20 @@ pub(crate) async fn setup_redirect(
 
 	Ok(())
 }
+fn redirection_error(path: &Path, error: &io::Error) -> error::ErrorKind {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<PathDenied>())
+		.map_or_else(
+			|| {
+				error::ErrorKind::RedirectionFailure(
+					path.to_string_lossy().to_string(),
+					error.to_string(),
+				)
+			},
+			|denied| error::ErrorKind::PathDenied(denied.clone()),
+		)
+}
 
 /// Sets up redirection of both stdout and stderr to the same file, given by
 /// `file_path`.
@@ -2345,9 +2395,6 @@ fn setup_redirect_output_and_error_to(
 	append: bool,
 ) -> Result<(), error::Error> {
 	let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
-	if let Some(policy) = params.path_policy() {
-		policy.check_write(&abs_file_path)?;
-	}
 
 	let mut file_options = fs::File::options();
 	file_options
@@ -2361,13 +2408,17 @@ fn setup_redirect_output_and_error_to(
 	}
 
 	let stdout_file = shell
-		.open_file(&file_options, &abs_file_path, params)
-		.map_err(|err| {
-			error::ErrorKind::RedirectionFailure(
-				abs_file_path.to_string_lossy().to_string(),
-				err.to_string(),
-			)
-		})?;
+		.open_file(
+			&file_options,
+			&abs_file_path,
+			params,
+			if append {
+				PathAccess::Append
+			} else {
+				PathAccess::Truncate
+			},
+		)
+		.map_err(|error| redirection_error(&abs_file_path, &error))?;
 
 	let stderr_file = stdout_file.try_clone()?;
 
@@ -2509,12 +2560,51 @@ mod sandbox_tests {
 	struct RootPolicy(PathBuf);
 
 	impl PathPolicy for RootPolicy {
-		fn check_write(&self, path: &Path) -> Result<(), WriteDenied> {
+		fn check_read(&self, path: &Path) -> Result<(), PathDenied> {
 			if path.starts_with(&self.0) {
 				Ok(())
 			} else {
-				Err(WriteDenied { path: path.to_path_buf() })
+				Err(PathDenied { path: path.to_path_buf(), access: PathAccess::Read })
 			}
+		}
+
+		fn check_write(&self, path: &Path) -> Result<(), PathDenied> {
+			if path.starts_with(&self.0) {
+				Ok(())
+			} else {
+				Err(PathDenied { path: path.to_path_buf(), access: PathAccess::Write })
+			}
+		}
+
+		fn open(&self, path: &Path, request: OpenRequest) -> Result<fs::File, PathDenied> {
+			let access = request.access;
+			if !path.starts_with(&self.0) {
+				return Err(PathDenied { path: path.to_path_buf(), access });
+			}
+			let mut options = fs::File::options();
+			match access {
+				PathAccess::Read => {
+					options.read(true);
+				},
+				PathAccess::CreateNew => {
+					options.write(true).create_new(true);
+				},
+				PathAccess::Truncate => {
+					options.write(true).create(true).truncate(true);
+				},
+				PathAccess::Append => {
+					options.append(true).create(true);
+				},
+				PathAccess::ReadWrite => {
+					options.read(true).write(true).create(true);
+				},
+				PathAccess::Write => {
+					options.write(true).create(true);
+				},
+			}
+			options
+				.open(path)
+				.map_err(|_| PathDenied { path: path.to_path_buf(), access })
 		}
 	}
 
@@ -2542,6 +2632,70 @@ mod sandbox_tests {
 		assert!(!result.is_success());
 		assert!(!denied_path.exists());
 
+		Ok(())
+	}
+	#[tokio::test]
+	async fn redirect_read_consults_path_policy_before_open() -> crate::TestResult<()> {
+		let allowed = tempfile::tempdir()?;
+		let denied = tempfile::tempdir()?;
+		let denied_path = denied.path().join("secret");
+		std::fs::write(&denied_path, "secret")?;
+		let mut shell = Shell::builder()
+			.working_dir(allowed.path().to_path_buf())
+			.build()
+			.await?;
+		let mut params = shell.default_exec_params();
+		params.set_path_policy(Arc::new(RootPolicy(allowed.path().to_path_buf())));
+
+		let program = shell.parse_string(format!("< {}", denied_path.display()))?;
+		let result = shell.run_program(program, &params).await?;
+		assert!(!result.is_success());
+		Ok(())
+	}
+	#[tokio::test]
+	async fn dev_fd_uses_only_the_execution_descriptor_map() -> crate::TestResult<()> {
+		use std::io::Read as _;
+
+		let workspace = tempfile::tempdir()?;
+		let source = workspace.path().join("mapped");
+		std::fs::write(&source, "mapped descriptor")?;
+		let shell = Shell::builder()
+			.working_dir(workspace.path().to_path_buf())
+			.build()
+			.await?;
+		let mut params = shell.default_exec_params();
+		params.set_path_policy(Arc::new(RootPolicy(workspace.path().to_path_buf())));
+		params.set_fd(9, std::fs::File::open(source)?.into());
+
+		let mut options = std::fs::File::options();
+		options.read(true);
+		let mut mapped = shell.open_file(&options, "/dev/fd/9", &params, PathAccess::Read)?;
+		let mut contents = String::new();
+		mapped.read_to_string(&mut contents)?;
+		assert_eq!(contents, "mapped descriptor");
+
+		let denied = shell
+			.open_file(&options, "/dev/fd/10", &params, PathAccess::Read)
+			.err()
+			.expect("unmapped descriptor must not open the host fd table");
+		assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+		Ok(())
+	}
+
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn read_policy_blocks_proc_self_environment() -> crate::TestResult<()> {
+		let allowed = tempfile::tempdir()?;
+		let mut shell = Shell::builder()
+			.working_dir(allowed.path().to_path_buf())
+			.build()
+			.await?;
+		let mut params = shell.default_exec_params();
+		params.set_path_policy(Arc::new(RootPolicy(allowed.path().to_path_buf())));
+
+		let program = shell.parse_string("< /proc/self/environ")?;
+		let result = shell.run_program(program, &params).await?;
+		assert!(!result.is_success());
 		Ok(())
 	}
 }

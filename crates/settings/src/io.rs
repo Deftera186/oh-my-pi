@@ -51,6 +51,55 @@ pub enum DocumentMutation {
 	},
 }
 
+impl DocumentMutation {
+	/// Returns the dotted setting path affected by this mutation.
+	pub(crate) fn path(&self) -> &str {
+		match self {
+			Self::Set { path, .. } | Self::Unset { path } => path,
+		}
+	}
+}
+
+/// File state observed when a pending settings mutation was created.
+#[derive(Eq, PartialEq)]
+enum DocumentGeneration {
+	Missing,
+	Content(Box<str>),
+	Unreadable,
+}
+
+/// A settings mutation paired with the file generation and value it was based
+/// on.
+pub struct PendingDocumentMutation {
+	mutation:   DocumentMutation,
+	generation: DocumentGeneration,
+	base_value: Option<toml::Value>,
+}
+
+/// Captures the current file generation and value for a later reconciled
+/// mutation.
+pub fn prepare_document_mutation(
+	path: &Path,
+	mutation: DocumentMutation,
+) -> PendingDocumentMutation {
+	let (generation, document) = document_state(path);
+	let base_value = document
+		.as_ref()
+		.and_then(|document| value_at(document, mutation.path()))
+		.cloned();
+	PendingDocumentMutation { mutation, generation, base_value }
+}
+
+/// Captures a mutation against the value retained by the owning settings layer.
+pub(crate) fn prepare_document_mutation_from_base(
+	path: &Path,
+	mutation: DocumentMutation,
+	base_value: Option<toml::Value>,
+) -> PendingDocumentMutation {
+	let generation = document_generation(path);
+	PendingDocumentMutation { mutation, generation, base_value }
+}
+
 /// Reads native TOML. Corruption is reported without changing the source.
 pub fn read_document(path: &Path) -> Result<toml::Table, SettingsIoError> {
 	match fs::read_to_string(path) {
@@ -76,19 +125,49 @@ pub fn mutate_document(
 	path: &Path,
 	mutations: &[DocumentMutation],
 ) -> Result<ReadDocument, SettingsIoError> {
+	let pending = mutations
+		.iter()
+		.cloned()
+		.map(|mutation| prepare_document_mutation(path, mutation))
+		.collect::<Vec<_>>();
+	mutate_prepared_document(path, &pending)
+}
+
+/// Flushes previously prepared mutations, preserving newer same-key external
+/// edits.
+pub fn mutate_prepared_document(
+	path: &Path,
+	mutations: &[PendingDocumentMutation],
+) -> Result<ReadDocument, SettingsIoError> {
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent)
 			.map_err(|source| SettingsIoError::CreateDirectory { path: parent.to_owned(), source })?;
 	}
 	let _lock = FileLock::acquire(path)?;
-	let mut read = read_or_quarantine_locked(path)?;
+	let (mut read, generation) = read_or_quarantine_locked_with_generation(path)?;
+	let mut changed = false;
 	for mutation in mutations {
-		match mutation {
+		let unchanged_value =
+			value_at(&read.document, mutation.mutation.path()) == mutation.base_value.as_ref();
+		let can_apply = mutation.generation != DocumentGeneration::Unreadable
+			&& (mutation.generation == generation || unchanged_value);
+		if !can_apply {
+			tracing::warn!(
+				path = %path.display(),
+				setting = mutation.mutation.path(),
+				"skipped stale settings change after external edit",
+			);
+			continue;
+		}
+		match &mutation.mutation {
 			DocumentMutation::Set { path, value } => set_path(&mut read.document, path, value.clone()),
 			DocumentMutation::Unset { path } => unset_path(&mut read.document, path),
 		}
+		changed = true;
 	}
-	atomic_replace(path, &toml::to_string_pretty(&read.document)?)?;
+	if changed {
+		atomic_replace(path, &toml::to_string_pretty(&read.document)?)?;
+	}
 	Ok(read)
 }
 
@@ -153,14 +232,56 @@ fn parse_table(path: &Path, source: &str) -> Result<toml::Table, SettingsIoError
 	}
 }
 
+fn document_state(path: &Path) -> (DocumentGeneration, Option<toml::Table>) {
+	match fs::read_to_string(path) {
+		Ok(source) => {
+			let document = parse_table(path, &source).ok();
+			(DocumentGeneration::Content(source.into_boxed_str()), document)
+		},
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			(DocumentGeneration::Missing, Some(toml::Table::new()))
+		},
+		Err(_) => (DocumentGeneration::Unreadable, None),
+	}
+}
+
+fn document_generation(path: &Path) -> DocumentGeneration {
+	match fs::read_to_string(path) {
+		Ok(source) => DocumentGeneration::Content(source.into_boxed_str()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => DocumentGeneration::Missing,
+		Err(_) => DocumentGeneration::Unreadable,
+	}
+}
+
+fn value_at<'a>(document: &'a toml::Table, path: &str) -> Option<&'a toml::Value> {
+	let mut segments = path.split('.');
+	let first = segments.next()?;
+	let mut value = document.get(first)?;
+	for segment in segments {
+		value = value.as_table()?.get(segment)?;
+	}
+	Some(value)
+}
+
 fn read_or_quarantine_locked(path: &Path) -> Result<ReadDocument, SettingsIoError> {
+	read_or_quarantine_locked_with_generation(path).map(|(read, _)| read)
+}
+
+fn read_or_quarantine_locked_with_generation(
+	path: &Path,
+) -> Result<(ReadDocument, DocumentGeneration), SettingsIoError> {
 	let source = match fs::read_to_string(path) {
 		Ok(source) => source,
-		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ReadDocument::default()),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			return Ok((ReadDocument::default(), DocumentGeneration::Missing));
+		},
 		Err(source) => return Err(SettingsIoError::Read { path: path.to_owned(), source }),
 	};
 	match toml::from_str(&source) {
-		Ok(document) => Ok(ReadDocument { document, quarantine: None }),
+		Ok(document) => Ok((
+			ReadDocument { document, quarantine: None },
+			DocumentGeneration::Content(source.into_boxed_str()),
+		)),
 		Err(error) => {
 			let span = error.span();
 			let (line, column) = span
@@ -172,15 +293,18 @@ fn read_or_quarantine_locked(path: &Path) -> Result<ReadDocument, SettingsIoErro
 				backup_path: backup_path.clone(),
 				source,
 			})?;
-			Ok(ReadDocument {
-				document:   toml::Table::new(),
-				quarantine: Some(QuarantineDiagnostic {
-					path: path.to_owned(),
-					backup_path,
-					line,
-					column,
-				}),
-			})
+			Ok((
+				ReadDocument {
+					document:   toml::Table::new(),
+					quarantine: Some(QuarantineDiagnostic {
+						path: path.to_owned(),
+						backup_path,
+						line,
+						column,
+					}),
+				},
+				DocumentGeneration::Content(source.into_boxed_str()),
+			))
 		},
 	}
 }
@@ -386,6 +510,41 @@ mod tests {
 		let parsed = read_document(&path).expect("read");
 		assert_eq!(parsed["external"].as_str(), Some("kept"));
 		assert_eq!(parsed["worktree"]["base"].as_str(), Some("new"));
+	}
+
+	#[test]
+	fn prepared_mutation_preserves_later_disjoint_external_edit() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("config.toml");
+		atomic_replace(&path, "local = \"old\"\n").expect("initial replace");
+		let pending = prepare_document_mutation(&path, DocumentMutation::Set {
+			path:  "local".to_owned(),
+			value: toml::Value::String("new".to_owned()),
+		});
+		atomic_replace(&path, "local = \"old\"\nexternal = \"kept\"\n").expect("external replace");
+
+		mutate_prepared_document(&path, &[pending]).expect("flush pending mutation");
+
+		let parsed = read_document(&path).expect("read");
+		assert_eq!(parsed["local"].as_str(), Some("new"));
+		assert_eq!(parsed["external"].as_str(), Some("kept"));
+	}
+
+	#[test]
+	fn later_same_key_external_edit_wins_over_prepared_mutation() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("config.toml");
+		atomic_replace(&path, "value = \"base\"\n").expect("initial replace");
+		let pending = prepare_document_mutation(&path, DocumentMutation::Set {
+			path:  "value".to_owned(),
+			value: toml::Value::String("local".to_owned()),
+		});
+		atomic_replace(&path, "value = \"external\"\n").expect("external replace");
+
+		mutate_prepared_document(&path, &[pending]).expect("flush pending mutation");
+
+		let parsed = read_document(&path).expect("read");
+		assert_eq!(parsed["value"].as_str(), Some("external"));
 	}
 
 	#[test]

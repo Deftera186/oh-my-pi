@@ -9,10 +9,10 @@ pub mod snapshot;
 pub mod subscription;
 
 pub use browser::BrowserSettings;
-pub use inventory;
 pub use schema::{
 	Condition, DomainDescriptor, DomainRegistration, DynamicOption, FieldDescriptor, OptionProvider,
-	SettingKind, SettingOption, SettingScope, SettingsDomain, ValidationError, registered_domains,
+	SettingKind, SettingOption, SettingScope, SettingsCatalog, SettingsContribution, SettingsDomain,
+	ValidationError,
 };
 pub use snapshot::{
 	DomainRevision, Revision, ScopedValues, SettingsSnapshot, SnapshotError, SnapshotMode,
@@ -26,10 +26,14 @@ pub use snapshot::{
 /// keeping precedence independent of which shape each layer happened to use.
 ///
 /// ```ignore
-/// omp_settings::inventory::submit! {
-///     omp_settings::LayerNormalizer::new(normalize_persisted_agent_overrides)
-/// }
+/// use omp_settings::{DomainRegistration, LayerNormalizer, SettingsContribution};
+///
+/// pub const SETTINGS_CONTRIBUTION: SettingsContribution = SettingsContribution {
+///     domains: &[DomainRegistration::of::<AgentSettings>()],
+///     normalizers: &[LayerNormalizer::new(normalize_persisted_agent_overrides)],
+/// };
 /// ```
+#[derive(Debug)]
 pub struct LayerNormalizer {
 	hook: fn(&mut toml::Table),
 }
@@ -46,4 +50,8 @@ impl LayerNormalizer {
 	}
 }
 
-inventory::collect!(LayerNormalizer);
+/// Settings domains and normalizers owned by this crate.
+pub const SETTINGS_CONTRIBUTION: SettingsContribution = SettingsContribution {
+	domains:     &[DomainRegistration::of::<BrowserSettings>()],
+	normalizers: &[LayerNormalizer::new(migrate::normalize_legacy_layer)],
+};

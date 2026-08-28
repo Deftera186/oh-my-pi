@@ -55,7 +55,7 @@ pub enum ClassificationMethod {
 	/// A bounded class rule supplied the result.
 	#[serde(rename = "family_rule")]
 	ClassRule,
-	/// A structural suffix rule supplied the result.
+	/// A structural suffix or exact effort-family alias supplied the result.
 	StructuralSuffix,
 	/// No rule established the fact.
 	Unknown,
@@ -162,7 +162,9 @@ fn classify_with_taxonomy(
 	let (inferred_class, inferred_family, inferred_revision) =
 		classify_ranks(taxonomy, input.phase, &logical);
 
-	let structural = collapsed_effort.is_some() || collapsed_thinking;
+	let family_alias =
+		logical.as_ref() != trimmed && collapsed_effort.is_none() && !collapsed_thinking;
+	let structural = family_alias || collapsed_effort.is_some() || collapsed_thinking;
 	let method = if structural {
 		ClassificationMethod::StructuralSuffix
 	} else if inferred_class.as_str() == "unknown" {
@@ -179,12 +181,16 @@ fn classify_with_taxonomy(
 		thinking_variant: collapsed_thinking,
 		evidence:         ClassificationEvidence {
 			method,
-			rule: if structural {
+			rule: if family_alias {
+				Str::new_static("effort-family-alias-v1")
+			} else if structural {
 				sf!("effort-suffix-v1")
 			} else {
 				sf!("family-segments-v1")
 			},
-			rationale: if structural {
+			rationale: if family_alias {
+				Str::new_static("provider row is an exact alias of one logical effort family")
+			} else if structural {
 				sf!("provider row is a structurally named effort route of one logical model",)
 			} else {
 				sf!("bounded vendor and model-family segments establish lineage")
@@ -396,11 +402,26 @@ mod tests {
 			assert_eq!(value.effort, Some(effort));
 		}
 	}
+
 	#[test]
 	fn bundled_dynamic_cursor_families_are_data_driven() {
 		assert!(supports_dynamic_effort_siblings("CURSOR"));
 		assert_eq!(strip_effort_lane("cursor", "gpt-5.6-luna-fast"), "gpt-5.6-luna");
 		assert_eq!(strip_effort_lane("other", "gpt-5.6-luna-fast"), "gpt-5.6-luna-fast");
+	}
+
+	#[test]
+	fn classifies_gemini_tiered_alias_as_the_canonical_effort_family() {
+		let classified = classify(ClassificationInput {
+			phase:          ClassificationPhase::DiscoveryNormalizer,
+			provider:       "google-antigravity",
+			model:          "gemini-3.7-flash-tiered",
+			observed_at_ms: None,
+		});
+		assert_eq!(classified.logical_model.as_str(), "gemini-3.7-flash");
+		assert_eq!(classified.effort, None);
+		assert_eq!(classified.evidence.method, ClassificationMethod::StructuralSuffix);
+		assert_eq!(classified.evidence.rule.as_str(), "effort-family-alias-v1");
 	}
 
 	#[test]

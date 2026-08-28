@@ -94,7 +94,8 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	let home = env::var_os("HOME").map_or_else(|| cwd.clone(), PathBuf::from);
 	let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&cwd));
 	settings_paths.overlays.extend(args.config.iter().cloned());
-	let settings_manager = SettingsManager::open(settings_paths).into_diagnostic()?;
+	let settings_manager =
+		SettingsManager::open(settings_paths, crate::SETTINGS_CATALOG).into_diagnostic()?;
 	let settings_snapshot = settings_manager.snapshot();
 	let settings = settings_snapshot
 		.project::<omp_driver::settings::Settings>()
@@ -667,6 +668,7 @@ async fn emit_event(
 		| AgentEvent::RosterChanged { .. }
 		| AgentEvent::JobRegistered { .. }
 		| AgentEvent::JobSettled { .. }
+		| AgentEvent::InputStaged { .. }
 		| AgentEvent::HistoryRewritten { .. } => return Ok(()),
 		AgentEvent::Failed { message, .. } => {
 			serde_json::json!({
@@ -928,7 +930,17 @@ pub(crate) fn initial_message(parts: Vec<ContentPart>, system: Option<Str>) -> V
 }
 
 fn message(role: Role, parts: Vec<Part>) -> Item {
-	Item { kind: Some(item::Kind::Message(Message { role: role as i32, parts })), ..Item::default() }
+	Item {
+		kind: Some(item::Kind::Message(Message {
+			role: role as i32,
+			parts,
+			synthetic: None,
+			user_initiated: None,
+			completed_at_ms: None,
+			usage: None,
+		})),
+		..Item::default()
+	}
 }
 
 async fn write_final_assistant(
@@ -1226,6 +1238,7 @@ mod tests {
 					..Default::default()
 				})),
 			}],
+			..Default::default()
 		};
 		assert_eq!(
 			message_json(&message, Some("stop")),

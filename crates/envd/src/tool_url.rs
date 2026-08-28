@@ -10,9 +10,15 @@ mod memory;
 pub(super) mod ssh;
 pub(super) mod vault;
 
-use std::{fmt::Display, fs, path::PathBuf, str, sync::Arc};
+use std::{
+	fmt::Display,
+	fs,
+	path::{Path, PathBuf},
+	str,
+	sync::Arc,
+};
 
-use omp_agent::{AgentKind, AgentRegistry};
+use omp_agent::AgentRegistry;
 use omp_core::{CowBytes, Str};
 use omp_storage::{blob::BlobStore, github_cache::GithubCache};
 use omp_tools::read::{
@@ -42,13 +48,31 @@ enum RegistryResource {
 }
 
 pub(super) struct RegistryResolver {
-	resource: RegistryResource,
-	lines:    LineOffsetCache,
+	resource:              RegistryResource,
+	lines:                 LineOffsetCache,
+	session_id:            Str,
+	root_file:             PathBuf,
+	preferred_artifacts:   PathBuf,
+	preferred_transcripts: PathBuf,
 }
 
 impl RegistryResolver {
-	fn new(resource: RegistryResource) -> Self {
-		Self { resource, lines: LineOffsetCache::default() }
+	fn new(resource: RegistryResource, sessions_dir: &Path, session_id: &str) -> Self {
+		Self {
+			resource,
+			lines: LineOffsetCache::default(),
+			session_id: Str::new(session_id),
+			root_file: sessions_dir.join(format!("{session_id}.jsonl")),
+			preferred_artifacts: sessions_dir.join(session_id),
+			preferred_transcripts: sessions_dir.join("eval-agents"),
+		}
+	}
+
+	fn refresh(&self) {
+		if self.preferred_transcripts.is_dir() {
+			AgentRegistry::global()
+				.restore_transcripts_once(&self.root_file, &self.preferred_transcripts);
+		}
 	}
 }
 
@@ -67,6 +91,7 @@ impl Resolve for RegistryResolver {
 		query: Option<&'a str>,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
+		self.refresh();
 		let bytes = match self.resource {
 			RegistryResource::Agent => {
 				let (base, path) = resource.split_once('/').unwrap_or((resource, ""));
@@ -78,14 +103,15 @@ impl Resolve for RegistryResolver {
 				if let Some(query) = query {
 					let expression = parse_agent_query(query)?;
 					AgentRegistry::global()
-						.resolve_agent_query(resource, &expression)
+						.resolve_agent_query_from(resource, &expression, &self.preferred_artifacts)
 						.map_err(registry_fault)?
 				} else {
-					match AgentRegistry::global().resolve_agent(resource) {
+					match AgentRegistry::global().resolve_agent_from(resource, &self.preferred_artifacts)
+					{
 						Ok(bytes) => bytes,
 						Err(_) if !path.is_empty() => {
 							let bytes = AgentRegistry::global()
-								.resolve_agent(base)
+								.resolve_agent_from(base, &self.preferred_artifacts)
 								.map_err(registry_fault)?;
 							project_json(bytes, None, Some(path))?
 						},
@@ -94,17 +120,16 @@ impl Resolve for RegistryResolver {
 				}
 			},
 			RegistryResource::History => {
-				if AgentRegistry::global()
-					.record(resource.trim_matches('/'))
-					.is_some_and(|(record, _)| record.kind == AgentKind::Advisor)
-				{
-					return Err(Fault::Source {
-						message: Str::new_static("Agent history resource was not found."),
-					});
-				}
-				let bytes = AgentRegistry::global()
-					.resolve_history(resource)
-					.map_err(registry_fault)?;
+				let registry = AgentRegistry::global();
+				let bytes = if resource.trim_matches('/').is_empty() {
+					registry
+						.history_index_for_root(self.session_id.as_str())
+						.into_bytes()
+				} else {
+					registry
+						.resolve_history_from(resource, &self.preferred_transcripts)
+						.map_err(registry_fault)?
+				};
 				render_history(resource, bytes)?
 			},
 		};
@@ -112,17 +137,13 @@ impl Resolve for RegistryResolver {
 	}
 
 	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
+		self.refresh();
 		if !matches!(self.resource, RegistryResource::Agent) || resource.contains('/') {
 			return Ok(None);
 		}
-		let (record, _) = AgentRegistry::global()
-			.record(resource.trim_matches('/'))
-			.ok_or_else(|| Fault::Source {
-				message: Str::new_static("Agent resource was not found."),
-			})?;
-		let Some(path) = record.history.output_path else {
-			return Ok(None);
-		};
+		let path = AgentRegistry::global()
+			.agent_path_from(resource, &self.preferred_artifacts)
+			.map_err(registry_fault)?;
 		let path = fs::canonicalize(path).map_err(|_| Fault::Source {
 			message: Str::new_static("Agent output path was not found."),
 		})?;
@@ -138,6 +159,7 @@ impl Resolve for RegistryResolver {
 		max_entries: usize,
 		max_bytes: usize,
 	) -> Result<ResourceList, Fault> {
+		self.refresh();
 		if !resource.trim_matches('/').is_empty() {
 			return Err(Fault::Invalid {
 				message: Str::new_static(
@@ -148,7 +170,7 @@ impl Resolve for RegistryResolver {
 		let mut entries = Vec::new();
 		let mut bytes = 0usize;
 		let mut truncated = false;
-		for record in AgentRegistry::global().roster(false) {
+		for record in AgentRegistry::global().roster_for_root(self.session_id.as_str(), false) {
 			let uri = match self.resource {
 				RegistryResource::Agent => format!("agent://{}", record.id),
 				RegistryResource::History => format!("history://{}", record.id),
@@ -174,12 +196,13 @@ impl Resolve for RegistryResolver {
 		query: &str,
 		max_results: usize,
 	) -> Result<Vec<ResourceCompletion>, Fault> {
+		self.refresh();
 		let scheme = match self.resource {
 			RegistryResource::Agent => "agent",
 			RegistryResource::History => "history",
 		};
 		let mut matches = AgentRegistry::global()
-			.roster(false)
+			.roster_for_root(self.session_id.as_str(), false)
 			.into_iter()
 			.filter_map(|record| {
 				let score =
@@ -472,7 +495,7 @@ pub(super) fn production_url_resolvers(
 			SchemeEntry::new(Scheme::Local, false, false, "session-local scratch files")
 				.with_capabilities(true, true, true),
 			UrlResolver::Local(
-				local::LocalResolver::open(sessions_dir)
+				local::LocalResolver::open(sessions_dir.clone())
 					.expect("canonical sessions directory can be created"),
 			),
 		)
@@ -486,14 +509,22 @@ pub(super) fn production_url_resolvers(
 		.register(
 			SchemeEntry::new(Scheme::Agent, true, false, "settled agent output and child artifacts")
 				.with_capabilities(true, true, true),
-			UrlResolver::Agent(RegistryResolver::new(RegistryResource::Agent)),
+			UrlResolver::Agent(RegistryResolver::new(
+				RegistryResource::Agent,
+				&sessions_dir,
+				session_id,
+			)),
 		)
 		.expect("agent URL resolver is unique");
 	builder
 		.register(
 			SchemeEntry::new(Scheme::History, true, false, "read-only agent transcript index")
 				.with_capabilities(true, false, true),
-			UrlResolver::History(RegistryResolver::new(RegistryResource::History)),
+			UrlResolver::History(RegistryResolver::new(
+				RegistryResource::History,
+				&sessions_dir,
+				session_id,
+			)),
 		)
 		.expect("history URL resolver is unique");
 	builder

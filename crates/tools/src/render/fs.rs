@@ -290,7 +290,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity: write,
-			title: "write tests/session.test.ts",
 			streaming_args: r#"{"path":"tests/session.test.ts","content":"import { descr"#,
 			args: r#"{"path":"tests/session.test.ts","content":"import { describe, expect, test } from \"bun:test\";\nimport { createSession } from \"../src/session\";\n\ndescribe(\"session\", () => {\n\ttest(\"refreshes an expired token\", async () => {\n\t\tconst session = createSession({ expiresAt: 0 });\n\t\tawait session.refresh();\n\t\texpect(session.expired).toBe(false);\n\t});\n});"}"#,
 			progress_update: None,
@@ -299,7 +298,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: read,
-			title: "read src/session.ts:437-442",
 			streaming_args: r#"{"path":"src/session.ts:437-"#,
 			args: r#"{"path":"src/session.ts:437-442"}"#,
 			progress_update: Some(br#"{"phase":"resolving source range"}"#),

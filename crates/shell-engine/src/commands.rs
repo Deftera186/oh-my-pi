@@ -656,6 +656,10 @@ pub(crate) fn execute_external_command(
 	argv0_override: Option<&str>,
 	args: &[CommandArg],
 ) -> Result<ExecutionSpawnResult, error::Error> {
+	if let Some(policy) = context.params.path_policy() {
+		policy.check_read(&context.shell.absolute_path(Path::new(executable_path)))?;
+	}
+
 	// Filter out the args; we only want strings.
 	let cmd_args = args
 		.iter()

@@ -823,7 +823,6 @@ pub(crate) fn gallery_fixtures(hub: ToolIdentity) -> Vec<RendererGalleryFixture>
 	vec![
 		RendererGalleryFixture {
 			identity: hub.clone(),
-			title: "hub list",
 			streaming_args: r#"{"op":"list","status":"ru"#,
 			args: r#"{"op":"list","limit":32}"#,
 			progress_update: Some(
@@ -834,7 +833,6 @@ pub(crate) fn gallery_fixtures(hub: ToolIdentity) -> Vec<RendererGalleryFixture>
 		},
 		RendererGalleryFixture {
 			identity: hub.clone(),
-			title: "hub jobs",
 			streaming_args: r#"{"op":"jobs","ids":["bash_a"#,
 			args: r#"{"op":"jobs"}"#,
 			progress_update: Some(
@@ -845,7 +843,6 @@ pub(crate) fn gallery_fixtures(hub: ToolIdentity) -> Vec<RendererGalleryFixture>
 		},
 		RendererGalleryFixture {
 			identity: hub.clone(),
-			title: "hub send AuthLoader",
 			streaming_args: r#"{"op":"send","to":"AuthLoader","message":"Can you verify the refresh-tok"#,
 			args: r#"{"op":"send","to":"AuthLoader","message":"Can you verify the refresh-token race?","await":true}"#,
 			progress_update: None,
@@ -854,7 +851,6 @@ pub(crate) fn gallery_fixtures(hub: ToolIdentity) -> Vec<RendererGalleryFixture>
 		},
 		RendererGalleryFixture {
 			identity: hub.clone(),
-			title: "hub inbox",
 			streaming_args: r#"{"op":"inbox","peek":fa"#,
 			args: r#"{"op":"inbox","peek":false}"#,
 			progress_update: Some(
@@ -865,7 +861,6 @@ pub(crate) fn gallery_fixtures(hub: ToolIdentity) -> Vec<RendererGalleryFixture>
 		},
 		RendererGalleryFixture {
 			identity: hub.clone(),
-			title: "hub start web",
 			streaming_args: r#"{"op":"start","name":"web","application":"bu"#,
 			args: r#"{"op":"start","name":"web","application":"bun","args":["run","dev"],"ready":{"log":"Local:.*http","port":5173}}"#,
 			progress_update: None,
@@ -874,7 +869,6 @@ pub(crate) fn gallery_fixtures(hub: ToolIdentity) -> Vec<RendererGalleryFixture>
 		},
 		RendererGalleryFixture {
 			identity: hub,
-			title: "hub logs web",
 			streaming_args: r#"{"op":"logs","name":"we"#,
 			args: r#"{"op":"logs","name":"web","follow":true,"cursor":118,"lines":100}"#,
 			progress_update: Some(

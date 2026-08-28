@@ -11,7 +11,7 @@ use pyo3::{
 use crate::bindings::PyEnvPath;
 
 macro_rules! py_record {
-	($rust:ident, $name:literal, $( $field:ident ),+ $(,)?) => {
+	($rust:ident, $name:literal, $( $field:ident ),+ $(,)? $(; $($method:tt)*)?) => {
 		#[pyclass(name = $name, frozen, module = "_omp")]
 		#[derive(Debug)]
 		pub(crate) struct $rust { $(pub(crate) $field: Py<PyAny>,)+ }
@@ -30,6 +30,7 @@ macro_rules! py_record {
 				let equal = true $(&& self.$field.bind(py).eq(other.$field.bind(py))?)+;
 				match op { CompareOp::Eq => Ok(equal), CompareOp::Ne => Ok(!equal), _ => Err(PyValueError::new_err("record values only support equality")) }
 			}
+			$($($method)*)?
 		}
 	};
 }
@@ -200,15 +201,22 @@ py_record!(
 py_record!(LspBinding, "LspBinding", server_id, name, sync, capabilities);
 py_record!(LspEvent, "LspEvent", server_id, method, params, path, revision);
 py_record!(LspBindingEvent, "LspBindingEvent", kind, binding, path);
-py_record!(Completed, "Completed", outcome, exit_code, signal, wall, output, artifact, aborted);
-py_record!(Output, "Output", channel, data, sequence);
-#[pymethods]
-impl Completed {
+py_record!(
+	Completed,
+	"Completed",
+	outcome,
+	exit_code,
+	signal,
+	wall,
+	output,
+	artifact,
+	aborted;
 	#[pyo3(signature = (_channel=None))]
 	fn text(&self, py: Python<'_>, _channel: Option<&Bound<'_, PyAny>>) -> PyResult<String> {
 		Ok(String::from_utf8_lossy(self.output.bind(py).cast::<PyBytes>()?.as_bytes()).into_owned())
 	}
-}
+);
+py_record!(Output, "Output", channel, data, sequence);
 py_record!(Exit, "Exit", status);
 py_record!(ProcessInfo, "ProcessInfo", name, generation, state, status);
 py_record!(ProcessOutput, "ProcessOutput", generation, channel, data, sequence);

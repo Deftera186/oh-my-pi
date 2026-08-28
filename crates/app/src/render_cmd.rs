@@ -340,6 +340,7 @@ mod tests {
 							kind: Some(item::Kind::Message(Message {
 								role:  i32::from(role),
 								parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+								..Default::default()
 							})),
 							props: None,
 						},

@@ -45,13 +45,13 @@ local-stt = ["local", "omp-driver/local-stt", "omp-inference/local-stt"]
 local-tts = ["local", "omp-driver/local-tts", "omp-inference/local-tts"]
 
 [dependencies]
-arc-swap = { workspace = true }
+arc-swap.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-ring = { workspace = true }
+ring.workspace = true
 flume.workspace = true
 futures.workspace = true
 smallvec.workspace = true
@@ -60,16 +60,15 @@ libc.workspace = true
 image.workspace = true
 md-5.workspace = true
 indicatif.workspace = true
-inventory.workspace = true
-miette = { workspace = true }
+miette.workspace = true
 omp-agent.workspace = true
-omp-ar = { workspace = true }
+omp-ar.workspace = true
 omp-chat-ui.workspace = true
 omp-collab.workspace = true
 omp-core.workspace = true
-omp-driver = { workspace = true, default-features = false }
-omp-env = { workspace = true }
-omp-envd = { workspace = true }
+omp-driver.workspace = true
+omp-env.workspace = true
+omp-envd.workspace = true
 omp-ext.workspace = true
 omp-gui = { workspace = true, optional = true }
 omp-grep.workspace = true
@@ -79,7 +78,7 @@ omp-catalog.workspace = true
 omp-inference.workspace = true
 omp-memory.workspace = true
 omp-serve.workspace = true
-omp-proto = { workspace = true, features = ["tonic"] }
+omp-proto.workspace = true
 omp-py.workspace = true
 omp-rpc.workspace = true
 omp-sandbox.workspace = true
@@ -91,7 +90,7 @@ omp-observability.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
 omp-vcs.workspace = true
-omp-voice = { workspace = true }
+omp-voice.workspace = true
 omp-slopjson.workspace = true
 omp-shell.workspace = true
 omp-tools.workspace = true
@@ -104,7 +103,7 @@ reqwest.workspace = true
 regex.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-sha2 = { workspace = true }
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -115,8 +114,8 @@ tracing.workspace = true
 url.workspace = true
 xutf.workspace = true
 zeroize.workspace = true
-strum = { workspace = true }
-toml = { workspace = true }
+strum.workspace = true
+toml.workspace = true
 serde.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -124,12 +123,11 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 async-stream.workspace = true
-ctor.workspace = true
-flume = { workspace = true }
-insta = { workspace = true }
+flume.workspace = true
+insta.workspace = true
 omp-docserver.workspace = true
-omp-inference = { workspace = true, features = ["test-support"] }
+omp-inference.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+tokio.workspace = true
 tonic-health.workspace = true
 tower.workspace = true

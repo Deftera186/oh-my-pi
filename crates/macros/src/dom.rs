@@ -555,7 +555,7 @@ fn attr_named<'a>(attrs: &'a [Attr], name: &str) -> Option<&'a Attr> {
 }
 
 fn is_text_tag(name: &str) -> bool {
-	matches!(name, "text" | "pre" | "md" | "latex" | "callout")
+	matches!(name, "text" | "pre" | "md" | "latex" | "callout" | "qr")
 }
 
 fn is_data_tag(name: &str) -> bool {

@@ -140,7 +140,9 @@ pub(crate) fn compile(
 		.iter()
 		.map(|service| service.as_str())
 		.collect();
-	if matches!(spec.network, NetworkMode::Enabled | NetworkMode::Outbound) {
+	if matches!(spec.network, NetworkMode::Enabled | NetworkMode::Outbound)
+		|| spec.proxy_port.is_some()
+	{
 		for service in NETWORK_MACH_SERVICES {
 			if !mach_services.contains(&service) {
 				mach_services.push(service);
@@ -171,6 +173,13 @@ pub(crate) fn compile(
 			);
 		},
 	}
+	if let Some(port) = spec.proxy_port {
+		// Scoped egress never grants general networking: the only reachable TCP
+		// peer is the session-owned loopback broker.
+		profile.push_str("(deny network*)\n(allow network-outbound (remote tcp ");
+		push_string(&mut profile, &format!("127.0.0.1:{port}"));
+		profile.push_str("))\n");
+	}
 
 	if spec.readable.is_empty() {
 		// Broad reads still exclude raw disk and kernel-memory devices. Otherwise a
@@ -181,13 +190,13 @@ pub(crate) fn compile(
 	} else {
 		profile.push_str("(deny file-read* (subpath \"/\"))\n");
 		push_paths(&mut profile, "allow", "file-read*", [
+			Path::new("/bin"),
+			Path::new("/usr/bin"),
 			Path::new("/usr/lib"),
+			Path::new("/lib"),
 			Path::new("/System"),
 			Path::new("/private/var/db/dyld"),
 		]);
-		// /System lexically includes this firmlink target. Put the denial after
-		// loader widening but before user scopes, so an explicit user grant wins.
-		profile.push_str("(deny file-read* (subpath \"/System/Volumes/Data\"))\n");
 		profile.push_str("(allow file-read-data (literal \"/\"))\n");
 		// Allowed scopes are canonicalized under /private; callers still address
 		// them through these firmlink symlinks, whose resolution needs a read.
@@ -224,10 +233,21 @@ pub(crate) fn compile(
 		if spec.write == WriteMode::Ephemeral {
 			push_paths(&mut profile, "allow", "file-read*", [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)]);
 		}
+		// /System lexically includes this firmlink target. This follows every
+		// runtime and caller grant, including a caller-provided /System scope.
+		profile.push_str("(deny file-read* (subpath \"/System/Volumes/Data\"))\n");
 	}
 	// A deny must follow every built-in and caller allow because the last
 	// matching Seatbelt rule wins.
 	push_scopes(&mut profile, "deny", "file-read*", spec.read_deny.iter().map(PathBuf::as_path));
+	// One-shot approvals follow ordinary denials without turning a host-read
+	// policy into an allowlist.
+	push_scopes(
+		&mut profile,
+		"allow",
+		"file-read*",
+		spec.read_override.iter().map(PathBuf::as_path),
+	);
 
 	profile.push_str("(deny file-write* (subpath \"/\"))\n");
 	push_literals(&mut profile, "allow", "file-write*", [Path::new("/dev/null")]);
@@ -257,6 +277,15 @@ pub(crate) fn compile(
 			push_write_scopes(&mut profile, [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)], &spec.write_deny)
 		},
 	}
+
+	// One-shot scopes are emitted after ordinary carve-out denials: Seatbelt's
+	// last matching rule wins, so this reopens only the approved nested path.
+	push_scopes(
+		&mut profile,
+		"allow",
+		"file-write*",
+		spec.write_override.iter().map(PathBuf::as_path),
+	);
 
 	if spec.no_exec {
 		profile.push_str("(deny process-exec*)\n(allow process-exec* (literal ");
@@ -544,4 +573,102 @@ fn push_string(profile: &mut String, value: &str) {
 		}
 	}
 	profile.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn data_volume_deny_follows_every_system_read_allow() {
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec
+			.allow_read(Path::new("/System"))
+			.expect("system read scope");
+		let requested = spec.requested_capabilities();
+		let plan = compile(
+			&spec,
+			Path::new("/bin/true"),
+			requested,
+			requested.intersection(Backend::Seatbelt.capabilities()),
+		)
+		.expect("seatbelt plan");
+		let profile = plan.profile().expect("seatbelt profile");
+		let system_allow = profile
+			.rfind("(subpath \"/System\")")
+			.expect("system allow");
+		let data_deny = profile
+			.rfind("(deny file-read* (subpath \"/System/Volumes/Data\"))")
+			.expect("data deny");
+		assert!(system_allow < data_deny);
+	}
+
+	#[test]
+	fn scoped_proxy_allows_only_its_exact_loopback_tcp_port() {
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec
+			.set_proxy_endpoint(18443, None)
+			.expect("proxy endpoint");
+		let requested = spec.requested_capabilities();
+		let plan = compile(
+			&spec,
+			Path::new("/bin/true"),
+			requested,
+			requested.intersection(Backend::Seatbelt.capabilities()),
+		)
+		.expect("seatbelt plan");
+		let profile = plan.profile().expect("seatbelt profile");
+		assert!(profile.contains("(deny network*)"));
+		assert!(profile.contains("(remote tcp \"127.0.0.1:18443\")"));
+	}
+
+	#[test]
+	fn read_override_follows_read_denials() {
+		let directory = tempfile::tempdir().expect("directory");
+		let path = directory.path().join("approved");
+		std::fs::write(&path, "approved").expect("approved path");
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec.deny_read(&path).expect("read deny");
+		spec.allow_read_override(&path).expect("read override");
+		let requested = spec.requested_capabilities();
+		let plan = compile(
+			&spec,
+			Path::new("/bin/true"),
+			requested,
+			requested.intersection(Backend::Seatbelt.capabilities()),
+		)
+		.expect("seatbelt plan");
+		let profile = plan.profile().expect("seatbelt profile");
+		let deny = profile.find("(deny file-read*").expect("read deny");
+		let allow = profile.rfind("(allow file-read*").expect("read override");
+		assert!(deny < allow);
+	}
+	#[cfg(unix)]
+	#[test]
+	fn lexical_write_deny_blocks_logical_entry_removal() {
+		use std::os::unix::fs::symlink;
+
+		let workspace = tempfile::tempdir().expect("workspace");
+		let external = tempfile::tempdir().expect("external");
+		let protected = workspace.path().join(".git");
+		symlink(external.path(), &protected).expect("protected symlink");
+
+		let mut spec = SandboxSpec::new("/bin/true");
+		spec.set_write(WriteMode::Scoped);
+		spec
+			.allow_write(workspace.path())
+			.expect("writable workspace");
+		spec.deny_write_lexical(&protected).expect("logical deny");
+		let requested = spec.requested_capabilities();
+		let plan = compile(
+			&spec,
+			Path::new("/bin/true"),
+			requested,
+			requested.intersection(Backend::Seatbelt.capabilities()),
+		)
+		.expect("seatbelt plan");
+		let profile = plan.profile().expect("seatbelt profile");
+		assert!(profile.contains(protected.to_string_lossy().as_ref()));
+		assert!(profile.contains("(deny file-write-unlink"));
+	}
 }

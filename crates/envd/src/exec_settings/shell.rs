@@ -2,8 +2,8 @@
 
 use omp_core::Str;
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain, ValidationError,
+	FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope, SettingsDomain,
+	ValidationError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -463,13 +463,9 @@ fn default_interceptor_rules() -> Vec<InterceptorRule> {
 	.collect()
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<ShellSettings>()
-}
-
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::SettingsSnapshot;
 
 	use super::*;
 
@@ -481,24 +477,20 @@ mod tests {
 	}
 
 	#[test]
-	fn shell_projection_round_trips_and_is_registered() {
+	fn shell_projection_round_trips() {
 		let expected = ShellSettings {
 			profile: ShellProfile::Zsh,
 			command_prefix: Some(Str::new_static("time")),
 			..ShellSettings::default()
 		};
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated snapshot");
+		let snapshot = SettingsSnapshot::isolated(expected.clone(), crate::TEST_SETTINGS_CATALOG)
+			.expect("isolated snapshot");
 		assert_eq!(
 			snapshot
 				.project::<ShellSettings>()
 				.expect("projection")
 				.get(),
 			&expected
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == ShellSettings::DOMAIN)
 		);
 	}
 

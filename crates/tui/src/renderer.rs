@@ -327,7 +327,6 @@ pub struct Renderer<W: Write> {
 	poisoned:          bool,
 	output_state:      OutputState,
 	backlog:           OutputBacklogGuard,
-	#[cfg(any(windows, target_os = "linux"))]
 	conpty_hosted:     bool,
 	images:            BTreeMap<u32, RegisteredImage>,
 	alt_screen:        bool,
@@ -342,6 +341,14 @@ pub struct Renderer<W: Write> {
 impl<W: Write> Renderer<W> {
 	/// Creates a renderer with an empty viewport cache.
 	pub fn new(writer: W) -> Self {
+		Self::with_conpty_hosted(writer, is_conpty_hosted())
+	}
+
+	/// Creates a renderer with an injectable ConPTY-hosted decision.
+	///
+	/// Tests use this seam so ambient WSL variables cannot change large-write
+	/// chunking expectations.
+	pub fn with_conpty_hosted(writer: W, conpty_hosted: bool) -> Self {
 		Self {
 			writer,
 			previous: None,
@@ -353,8 +360,7 @@ impl<W: Write> Renderer<W> {
 			poisoned: false,
 			output_state: OutputState::Connected,
 			backlog: OutputBacklogGuard::default(),
-			#[cfg(any(windows, target_os = "linux"))]
-			conpty_hosted: is_conpty_hosted(),
+			conpty_hosted,
 			images: BTreeMap::new(),
 			alt_screen: alt_screen_active(),
 			graphics: Graphics::KittyPlaceholders,
@@ -1370,7 +1376,7 @@ impl<W: Write> Renderer<W> {
 	}
 
 	fn write_output(&mut self, output: &[u8]) -> io::Result<()> {
-		#[cfg(any(windows, target_os = "linux"))]
+		#[cfg(any(windows, target_os = "linux", test))]
 		if self.conpty_hosted && output.len() > MAX_CONPTY_WRITE_CHUNK_BYTES {
 			for chunk in ConptyChunks::new(output, MAX_CONPTY_WRITE_CHUNK_BYTES) {
 				terminal_write_all(&mut self.writer, chunk)?;
@@ -1626,6 +1632,11 @@ const fn is_conpty_hosted() -> bool {
 #[cfg(target_os = "linux")]
 fn is_conpty_hosted() -> bool {
 	env::var_os("WSL_DISTRO_NAME").is_some() || env::var_os("WSL_INTEROP").is_some()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+const fn is_conpty_hosted() -> bool {
+	false
 }
 
 #[allow(clippy::too_many_arguments, reason = "rendering inputs are independent frame state")]
@@ -2467,13 +2478,15 @@ mod tests {
 
 	#[derive(Default)]
 	struct CountingWriter {
-		writes: usize,
-		bytes:  Vec<u8>,
+		writes:    usize,
+		requested: Vec<usize>,
+		bytes:     Vec<u8>,
 	}
 
 	impl Write for CountingWriter {
 		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
 			self.writes += 1;
+			self.requested.push(bytes.len());
 			self.bytes.extend_from_slice(bytes);
 			Ok(bytes.len())
 		}
@@ -2897,6 +2910,24 @@ mod tests {
 		let chunks = ConptyChunks::new(&payload, MAX_CONPTY_WRITE_CHUNK_BYTES).collect::<Vec<_>>();
 		assert_eq!(chunks.concat(), payload);
 		assert!(chunks.iter().all(|chunk| !chunk.ends_with(b"\x1b")));
+	}
+
+	#[test]
+	fn conpty_write_decision_is_injectable_on_every_test_platform() {
+		let mut payload = vec![b'x'; MAX_CONPTY_WRITE_CHUNK_BYTES + 1];
+		payload[MAX_CONPTY_WRITE_CHUNK_BYTES / 2] = b'\n';
+
+		let mut direct = Renderer::with_conpty_hosted(CountingWriter::default(), false);
+		direct.write_output(&payload).unwrap();
+		let direct = direct.into_inner();
+
+		let mut conpty = Renderer::with_conpty_hosted(CountingWriter::default(), true);
+		conpty.write_output(&payload).unwrap();
+		let conpty = conpty.into_inner();
+
+		assert_ne!(direct.requested, conpty.requested);
+		assert_eq!(direct.bytes, payload);
+		assert_eq!(conpty.bytes, payload);
 	}
 
 	#[test]

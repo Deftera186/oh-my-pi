@@ -38,11 +38,11 @@ use omp_driver::{
 		AdvisorChildSpec, AgentsControlAuthority, CHAT_CAPS_BASE, ChatAuthWorker,
 		ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend, ChatScope,
 		EphemeralSessions, InteractiveSessionControl, LaunchToolSelection, Session, SessionOpen,
-		agent_snapshot, apply_launch_tool_selection, canonical_project, ensure_state_directory,
-		extension_regime_control_factory, interrupted_reasoning_dialect, model_context_window,
-		model_selector_is_selectable, model_usable_context_window, now_ms, open_session,
-		resolve_model_provider, resolve_model_selector, resume_choices, session_blueprint,
-		strict_session_id, thinking_effort,
+		SessionReanchor, agent_snapshot, apply_launch_tool_selection, canonical_project,
+		ensure_state_directory, extension_regime_control_factory, interrupted_reasoning_dialect,
+		model_context_window, model_selector_is_selectable, model_usable_context_window, now_ms,
+		open_session, resolve_model_provider, resolve_model_selector, resume_choices,
+		session_blueprint, strict_session_id, thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
 	discovery::{context, roles, runtime},
@@ -66,6 +66,7 @@ use omp_driver::{
 		telemetry_backend::TelemetryIndexQuery,
 	},
 	task::prompt_policy,
+	workspace_roots::ensure_directory_enterable,
 };
 use omp_envd::exthost::{
 	JobsControlAuthority, TelemetryControlAuthority, UiControlAuthority,
@@ -969,6 +970,7 @@ pub(crate) async fn run(
 	let mut selected_index_path = None;
 	let mut picked_resume = None;
 	let mut resume_moved = false;
+	let mut resume_runtime_only = false;
 	if start == ChatStart::SessionIndex {
 		let Some(selection) = pick_session(&data_dir, args.session_dir.as_deref())
 			.await
@@ -981,40 +983,59 @@ pub(crate) async fn run(
 		selected_index_path = Some(selection.database_path);
 		start = ChatStart::Session;
 		let recorded_root = PathBuf::from(selection.session.project.as_str());
-		if recorded_root.is_dir() {
-			root = canonical_project(&recorded_root).map_err(|error| miette::miette!(error))?;
-		} else {
-			let choices = [
-				omp_chat_ui::ListRow {
-					key:    sf!("move"),
-					label:  sf!("Move session"),
-					detail: Str::from(launch_root.to_string_lossy().as_ref()),
-				},
-				omp_chat_ui::ListRow {
-					key:    sf!("cancel"),
-					label:  sf!("Cancel"),
-					detail: sf!("Keep the journal unchanged"),
-				},
-			];
-			if run_list("Project missing", &choices)
-				.await
-				.map_err(|error| miette::miette!(error))?
-				!= Some(0)
-			{
-				return Ok(());
-			}
-			resume_moved = true;
-			eprintln!(
-				"Session project `{}` no longer exists; moving future workspace access to `{}`.",
-				recorded_root.display(),
-				launch_root.display()
-			);
-			tracing::info!(
-				session_id = %selection.session.id.0,
-				recorded_root = %recorded_root.display(),
-				launch_root = %launch_root.display(),
-				"session workspace root moved"
-			);
+		match ensure_directory_enterable(&recorded_root) {
+			Ok(()) => {
+				root = canonical_project(&recorded_root).map_err(|error| miette::miette!(error))?;
+			},
+			Err(error) if error.is_missing() => {
+				let choices = [
+					omp_chat_ui::ListRow {
+						key:    sf!("move"),
+						label:  sf!("Move session"),
+						detail: Str::from(launch_root.to_string_lossy().as_ref()),
+					},
+					omp_chat_ui::ListRow {
+						key:    sf!("cancel"),
+						label:  sf!("Cancel"),
+						detail: sf!("Keep the journal unchanged"),
+					},
+				];
+				if run_list("Project missing", &choices)
+					.await
+					.map_err(|error| miette::miette!(error))?
+					!= Some(0)
+				{
+					return Ok(());
+				}
+				resume_moved = true;
+				eprintln!(
+					"Session project `{}` no longer exists; moving future workspace access to `{}`.",
+					recorded_root.display(),
+					launch_root.display()
+				);
+				tracing::info!(
+					session_id = %selection.session.id.0,
+					recorded_root = %recorded_root.display(),
+					launch_root = %launch_root.display(),
+					"session workspace root moved"
+				);
+			},
+			Err(error) => {
+				resume_runtime_only = true;
+				eprintln!(
+					"Session project `{}` is inaccessible ({error}); using launch project `{}` for \
+					 this run without changing the session workspace.",
+					recorded_root.display(),
+					launch_root.display()
+				);
+				tracing::warn!(
+					session_id = %selection.session.id.0,
+					recorded_root = %recorded_root.display(),
+					launch_root = %launch_root.display(),
+					%error,
+					"session resumed with runtime-only workspace fallback"
+				);
+			},
 		}
 	}
 	if args.from_claude || args.from_codex {
@@ -1101,14 +1122,25 @@ pub(crate) async fn run(
 	settings_paths.overlays.extend(args.config.iter().cloned());
 	let settings_span = tracing::debug_span!("settings_load");
 	let settings_guard = settings_span.enter();
-	let settings_manager =
-		Arc::new(SettingsManager::open(settings_paths).map_err(|error| miette::miette!(error))?);
+	let settings_manager = Arc::new(
+		SettingsManager::open(settings_paths, crate::SETTINGS_CATALOG)
+			.map_err(|error| miette::miette!(error))?,
+	);
 	let approval_mode: Option<omp_envd::tool_settings::ApprovalMode> = args
 		.effective_approval()
 		.map(omp_envd::tool_settings::ApprovalMode::from);
 	if let Some(approval_mode) = &approval_mode {
 		settings_manager
 			.set_sync(MutationScope::Runtime, "tools.approval_mode", &approval_mode.to_string())
+			.map_err(|error| miette::miette!(error))?;
+	}
+	if let Some(selector) =
+		crate::cli::default_model_role_override(args.model.as_deref(), args.thinking)
+			.map_err(|error| miette::miette!(error))?
+	{
+		let value = toml::Value::String(selector.to_string()).to_string();
+		settings_manager
+			.set_sync(MutationScope::Runtime, "model.roles.default", &value)
 			.map_err(|error| miette::miette!(error))?;
 	}
 	let settings_snapshot = settings_manager.snapshot();
@@ -1515,6 +1547,16 @@ pub(crate) async fn run(
 	} else {
 		environment.sessions_index()
 	};
+	let fallback_reanchor = if resume_runtime_only {
+		let runtime_sessions_dir = state_dir.join("sessions");
+		ensure_state_directory(&runtime_sessions_dir).map_err(|error| miette::miette!(error))?;
+		Some(SessionReanchor {
+			sessions_dir:  runtime_sessions_dir,
+			session_index: environment.sessions_index(),
+		})
+	} else {
+		None
+	};
 	let breadcrumbs = TerminalBreadcrumbs::new(&data_dir).map_err(|error| miette::miette!(error))?;
 	let terminal_id = omp_tui::ttyid::terminal_id();
 	let resume = if let Some(resume) = requested_resume {
@@ -1574,14 +1616,18 @@ pub(crate) async fn run(
 	} else if let Some(source) = resume.as_ref() {
 		if resume_moved {
 			SessionOpen::ResumeMoved(source)
+		} else if resume_runtime_only {
+			SessionOpen::ResumeRuntimeOnly(source)
 		} else {
 			SessionOpen::Resume(source)
 		}
 	} else {
 		SessionOpen::New
 	};
-	let session_resumed =
-		matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_));
+	let session_resumed = matches!(
+		session_open,
+		SessionOpen::Resume(_) | SessionOpen::ResumeRuntimeOnly(_) | SessionOpen::ResumeMoved(_)
+	);
 	let session_open_span = tracing::debug_span!("session_open");
 	let mut session = session_open_span
 		.in_scope(|| {
@@ -1606,7 +1652,10 @@ pub(crate) async fn run(
 				.map_err(|error| miette::miette!(error))?;
 		}
 	}
-	if matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_)) {
+	if matches!(
+		session_open,
+		SessionOpen::Resume(_) | SessionOpen::ResumeRuntimeOnly(_) | SessionOpen::ResumeMoved(_)
+	) {
 		let pending_turn = session.journal.pending_turn().is_some();
 		let pending_jobs = session.journal.pending_jobs().count();
 		if pending_turn || pending_jobs != 0 {
@@ -1919,8 +1968,10 @@ pub(crate) async fn run(
 		if exit_before_ui_for_timing() {
 			return Ok(());
 		}
+		let gateway_attribution =
+			omp_inference::auth::UsageAttribution::compose(&data_dir, None).into_diagnostic()?;
 		Box::pin(run_ui(
-			RpcTurnClient::new(channel.clone()),
+			RpcTurnClient::new(channel.clone(), gateway_attribution.clone()),
 			&environment,
 			env,
 			state,
@@ -1935,6 +1986,7 @@ pub(crate) async fn run(
 			goal_control.clone(),
 			None,
 			Some(channel.clone()),
+			Some(gateway_attribution),
 			Some(runtime::gateway_provider_control_factory(channel.clone())),
 			None,
 			credential_control_grants,
@@ -1964,6 +2016,9 @@ pub(crate) async fn run(
 				sessions_dir: &sessions_dir,
 				session_index: Arc::clone(&session_index),
 				registry,
+				discovery_runtime: None,
+				inference_registry: None,
+				fallback_reanchor: fallback_reanchor.clone(),
 				advise_queue: advise_queue.clone(),
 				persist_sessions: !args.no_session,
 			},
@@ -1980,6 +2035,7 @@ pub(crate) async fn run(
 			credential_authority,
 			auth_control,
 			builtins,
+			discovery_runtime,
 			..
 		} = omp_driver::registry::production_inference_for_session(
 			&data_dir,
@@ -2026,9 +2082,10 @@ pub(crate) async fn run(
 			blueprint,
 			eval_control,
 			edit_repair_requests,
-			Some(inference_registry),
+			Some(inference_registry.clone()),
 			goal_control,
 			Some(auth_control),
+			None,
 			None,
 			None,
 			Some(builtins),
@@ -2059,6 +2116,9 @@ pub(crate) async fn run(
 				sessions_dir: &sessions_dir,
 				session_index: Arc::clone(&session_index),
 				registry,
+				discovery_runtime: Some(discovery_runtime),
+				inference_registry: Some(inference_registry),
+				fallback_reanchor: fallback_reanchor.clone(),
 				advise_queue: advise_queue.clone(),
 				persist_sessions: !args.no_session,
 			},
@@ -2524,6 +2584,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	goal_control: AgentGoalControl,
 	auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	gateway_channel: Option<transport::Channel>,
+	gateway_attribution: Option<omp_inference::auth::UsageAttribution>,
 	gateway_provider_factory: Option<Arc<dyn ControlAuthorityFactory>>,
 	provider_builtins: Option<BuiltinConfig>,
 	credential_control_grants: BTreeMap<Str, omp_driver::auth_backend::CredentialControlGrant>,
@@ -2551,6 +2612,10 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	mut start: ChatStart,
 	presentation: ChatPresentation,
 ) -> Result<Str, ChatError> {
+	let mut active_sessions_dir = scope.sessions_dir.to_path_buf();
+	let mut active_session_index = Arc::clone(&scope.session_index);
+	let mut fallback_reanchor = scope.fallback_reanchor.clone();
+	let mut runtime_only_fallback = fallback_reanchor.is_some();
 	state.update(|snapshot| snapshot.deadline = invocation_deadline);
 	let memory_runtime = environment.memory_runtime();
 	let mnemopi = memory_runtime.mnemopi_settings().ok().cloned();
@@ -2594,9 +2659,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		env.clone(),
 		state.clone(),
 		session.id.clone(),
-		scope.sessions_dir.to_path_buf(),
+		active_sessions_dir.clone(),
 		scope.root.to_path_buf(),
-		Arc::clone(&scope.session_index),
+		Arc::clone(&active_session_index),
 		security_enabled,
 	));
 	parent.bind_admission_gate(environment.admission_gate());
@@ -2634,7 +2699,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			"@smol",
 		)))
 		.map_err(DriverChatError::from)?;
-	let cold_agents = scope.sessions_dir.join("eval-agents");
+	let cold_agents = active_sessions_dir.as_path().join("eval-agents");
 	if cold_agents.is_dir() {
 		omp_agent::AgentRegistry::global().discover_transcripts(&cold_agents)?;
 	}
@@ -2710,7 +2775,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		}
 		parent.update(state.clone(), session.id.clone());
 		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
-		let session_root = scope.sessions_dir.join(session.id.as_str());
+		let session_root = active_sessions_dir.as_path().join(session.id.as_str());
 		ensure_state_directory(&session_root)?;
 		ensure_state_directory(&session_root.join("local"))?;
 		let host_backends = EnvdHostOwnerBackends::production(
@@ -2837,6 +2902,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				.ok_or(ChatError::MissingAuthority("credentials"))?;
 			Arc::new(omp_driver::auth_backend::gateway_credential_secret_control_factory(
 				channel.clone(),
+				gateway_attribution
+					.clone()
+					.ok_or(ChatError::MissingAuthority("gateway attribution"))?,
 				credential_control_grants.clone(),
 				&secrets,
 			)) as Arc<dyn ControlAuthorityFactory>
@@ -2846,10 +2914,17 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			Arc::clone(&presentation_bridge),
 			Arc::clone(&extension_callbacks),
 		);
+		let creation_sessions_dir = fallback_reanchor
+			.as_ref()
+			.map_or_else(|| active_sessions_dir.clone(), |target| target.sessions_dir.clone());
+		let creation_session_index = fallback_reanchor.as_ref().map_or_else(
+			|| Arc::clone(&active_session_index),
+			|target| Arc::clone(&target.session_index),
+		);
 		let session_control = Arc::new(InteractiveSessionControl::new(
 			scope.root.to_path_buf(),
-			scope.sessions_dir.to_path_buf(),
-			Arc::clone(&scope.session_index),
+			creation_sessions_dir.clone(),
+			Arc::clone(&creation_session_index),
 			Arc::clone(&catalog_owner),
 			prompt_discovery_settings.model.clone(),
 			state.clone(),
@@ -2858,8 +2933,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		session_control.bind_admission_gate(environment.admission_gate());
 		let session_factory = session_control_factory(
 			scope.root.to_path_buf(),
-			scope.sessions_dir.to_path_buf(),
-			Arc::clone(&scope.session_index),
+			creation_sessions_dir,
+			Arc::clone(&creation_session_index),
 			agent.host_control(),
 			Arc::clone(&presentation_bridge),
 			Arc::clone(&session_control),
@@ -3031,6 +3106,13 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		let inbox = broker
 			.register(&node, agent.mailbox())
 			.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		let _ = broker.registry().set_history(
+			id.as_str(),
+			Some(active_sessions_dir.as_path().join(format!("{id}.jsonl"))),
+			None,
+			None,
+			omp_agent::AgentHistory::default(),
+		);
 		let inbox = hub_backend::share_inbox(inbox);
 		parent.bind_inbox(id.clone(), Arc::clone(&inbox));
 		parent.recover_parked_children().await;
@@ -3118,8 +3200,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		let (collab_authority, collab) =
 			CollabSessionAuthority::with_runtimes(Some(replica), Some(host));
 		let mut collab_task = session::spawn_session_owner(collab_authority);
-		let title = scope
-			.session_index
+		let title = active_session_index
 			.subagent_tree(&SessionId(id.clone()))?
 			.into_iter()
 			.next()
@@ -3127,14 +3208,32 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				title:  session.title,
 				source: session.title_source,
 			});
-		let journal_path = scope.sessions_dir.join(format!("{id}.jsonl"));
+		let journal_path = active_sessions_dir.as_path().join(format!("{id}.jsonl"));
+		let future_sessions_dir = fallback_reanchor
+			.as_ref()
+			.map(|target| target.sessions_dir.clone());
+		let future_session_index = fallback_reanchor
+			.as_ref()
+			.map(|target| Arc::clone(&target.session_index));
+		let future_workspace_root = fallback_reanchor.as_ref().map(|_| scope.root.to_path_buf());
 		let outcome = chat_ui::run(
 			agent,
 			environment,
-			ChatUiSession { session_id: id, journal_path, initial_items, context_window, title },
+			ChatUiSession {
+				session_id: id,
+				journal_path,
+				future_sessions_dir,
+				future_session_index,
+				future_workspace_root,
+				initial_items,
+				context_window,
+				title,
+			},
 			Some(advisor_engine),
 			advisor_notices,
 			Arc::clone(&catalog_owner),
+			scope.discovery_runtime.clone(),
+			scope.inference_registry.clone(),
 			Arc::clone(&scope.registry),
 			parent.tree(),
 			Arc::clone(&parent),
@@ -3149,7 +3248,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			Arc::clone(&settings_manager),
 			prompt_discovery_settings.clone(),
 			Arc::clone(&telemetry_index),
-			Arc::clone(&scope.session_index),
+			Arc::clone(&active_session_index),
 			scope.root.to_path_buf(),
 			session_root.join("local"),
 			security_enabled,
@@ -3168,7 +3267,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			Some(approval_inbox),
 			hide_thinking,
 			{
-				let sessions_dir = scope.sessions_dir.to_path_buf();
+				let sessions_dir = active_sessions_dir.as_path().to_path_buf();
 				let root = scope.root.to_path_buf();
 				let current_id = current_id.clone();
 				move || resume_choices(&sessions_dir, &root, Some(&current_id)).into_diagnostic()
@@ -3241,14 +3340,19 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			.await
 		{
 			tracing::warn!(%denied, "session switch denied by extension policy");
+			let reopen = if runtime_only_fallback {
+				SessionOpen::ResumeRuntimeOnly(&current_id)
+			} else {
+				SessionOpen::Resume(&current_id)
+			};
 			session = open_session(
 				scope.root,
-				scope.sessions_dir,
-				SessionOpen::Resume(&current_id),
+				active_sessions_dir.as_path(),
+				reopen,
 				scope.registry.as_ref(),
 				scope
 					.persist_sessions
-					.then(|| Arc::clone(&scope.session_index)),
+					.then(|| Arc::clone(&active_session_index)),
 			)?;
 			continue;
 		}
@@ -3276,14 +3380,19 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				}
 				let model = state.snapshot().turn.params.model.clone();
 				let prompt_props = state.snapshot().props.clone();
+				let reopen = if runtime_only_fallback {
+					SessionOpen::ResumeRuntimeOnly(&current_id)
+				} else {
+					SessionOpen::Resume(&current_id)
+				};
 				session = open_session(
 					scope.root,
-					scope.sessions_dir,
-					SessionOpen::Resume(&current_id),
+					active_sessions_dir.as_path(),
+					reopen,
 					scope.registry.as_ref(),
 					scope
 						.persist_sessions
-						.then(|| Arc::clone(&scope.session_index)),
+						.then(|| Arc::clone(&active_session_index)),
 				)?;
 				let additional_roots = blueprint.options().additional_roots.clone();
 				blueprint = session_blueprint(
@@ -3306,14 +3415,19 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
 				let prompt_props = state.snapshot().props.clone();
+				let reopen = if runtime_only_fallback {
+					SessionOpen::ResumeRuntimeOnly(&current_id)
+				} else {
+					SessionOpen::Resume(&current_id)
+				};
 				session = open_session(
 					scope.root,
-					scope.sessions_dir,
-					SessionOpen::Resume(&current_id),
+					active_sessions_dir.as_path(),
+					reopen,
 					scope.registry.as_ref(),
 					scope
 						.persist_sessions
-						.then(|| Arc::clone(&scope.session_index)),
+						.then(|| Arc::clone(&active_session_index)),
 				)?;
 				let additional_roots = blueprint.options().additional_roots.clone();
 				blueprint = session_blueprint(
@@ -3332,24 +3446,43 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
 				let prompt_props = state.snapshot().props.clone();
+				let source_sessions_dir = active_sessions_dir.clone();
+				let reanchor = fallback_reanchor
+					.as_ref()
+					.filter(|target| target.sessions_dir.join(format!("{id}.jsonl")).is_file())
+					.cloned();
+				if let Some(target) = reanchor {
+					active_sessions_dir = target.sessions_dir;
+					active_session_index = target.session_index;
+					fallback_reanchor = None;
+					runtime_only_fallback = false;
+				}
 				session = open_session(
 					scope.root,
-					scope.sessions_dir,
+					active_sessions_dir.as_path(),
 					SessionOpen::Resume(&id),
 					scope.registry.as_ref(),
 					scope
 						.persist_sessions
-						.then(|| Arc::clone(&scope.session_index)),
+						.then(|| Arc::clone(&active_session_index)),
 				)?;
-				omp_envd::migrate_session_artifacts(
-					scope.sessions_dir,
-					current_id.as_str(),
-					session.id.as_str(),
-				)
-				.map_err(|source| DriverChatError::ProjectState {
-					path: scope.sessions_dir.to_owned(),
-					source,
-				})?;
+				if source_sessions_dir != active_sessions_dir {
+					parent.reanchor_session_store(
+						active_sessions_dir.clone(),
+						Arc::clone(&active_session_index),
+					);
+				}
+				if source_sessions_dir == active_sessions_dir {
+					omp_envd::migrate_session_artifacts(
+						active_sessions_dir.as_path(),
+						current_id.as_str(),
+						session.id.as_str(),
+					)
+					.map_err(|source| DriverChatError::ProjectState {
+						path: active_sessions_dir.as_path().to_owned(),
+						source,
+					})?;
+				}
 				let additional_roots = blueprint.options().additional_roots.clone();
 				blueprint = session_blueprint(
 					&model,
@@ -3367,9 +3500,15 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				eval_control.request_reset();
 				let model = state.snapshot().turn.params.model.clone();
 				let prompt_props = state.snapshot().props.clone();
+				let source_sessions_dir = active_sessions_dir.clone();
+				if let Some(target) = fallback_reanchor.take() {
+					active_sessions_dir = target.sessions_dir;
+					active_session_index = target.session_index;
+					runtime_only_fallback = false;
+				}
 				session = open_session(
 					scope.root,
-					scope.sessions_dir,
+					active_sessions_dir.as_path(),
 					if scope.persist_sessions {
 						SessionOpen::New
 					} else {
@@ -3378,17 +3517,25 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 					scope.registry.as_ref(),
 					scope
 						.persist_sessions
-						.then(|| Arc::clone(&scope.session_index)),
+						.then(|| Arc::clone(&active_session_index)),
 				)?;
-				omp_envd::migrate_session_artifacts(
-					scope.sessions_dir,
-					current_id.as_str(),
-					session.id.as_str(),
-				)
-				.map_err(|source| DriverChatError::ProjectState {
-					path: scope.sessions_dir.to_owned(),
-					source,
-				})?;
+				if source_sessions_dir != active_sessions_dir {
+					parent.reanchor_session_store(
+						active_sessions_dir.clone(),
+						Arc::clone(&active_session_index),
+					);
+				}
+				if source_sessions_dir == active_sessions_dir {
+					omp_envd::migrate_session_artifacts(
+						active_sessions_dir.as_path(),
+						current_id.as_str(),
+						session.id.as_str(),
+					)
+					.map_err(|source| DriverChatError::ProjectState {
+						path: active_sessions_dir.as_path().to_owned(),
+						source,
+					})?;
+				}
 				let additional_roots = blueprint.options().additional_roots.clone();
 				blueprint = session_blueprint(
 					&model,

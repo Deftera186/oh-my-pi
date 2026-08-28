@@ -476,7 +476,6 @@ pub(crate) fn gallery_fixtures(
 	vec![
 		RendererGalleryFixture {
 			identity: shell,
-			title: "git status --short && git log --oneline -5",
 			streaming_args: r#"{"command":"git status --short && git log --on"#,
 			args: r#"{"command":"git status --short && git log --oneline -5","cwd":"packages/coding-agent","timeout":30}"#,
 			progress_update: Some(
@@ -487,7 +486,6 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: eval,
-			title: "load config",
 			streaming_args: r#"{"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.js"#,
 			args: r#"{"language":"py","title":"load config","code":"import json\nfrom pathlib import Path\n\ndata = json.loads(Path(\"package.json\").read_text())\ndeps = data.get(\"dependencies\", {})\nprint(f\"{data['name']} v{data['version']}\")\nprint(f\"{len(deps)} dependencies\")\ndisplay(sorted(deps)[:3])"}"#,
 			progress_update: Some(

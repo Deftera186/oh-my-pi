@@ -16,9 +16,7 @@ use omp_envd::exthost::control::{
 	self, ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
 	ControlRequestContext,
 };
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use omp_tools::read::{
 	Fault,
 	resolver::{
@@ -94,10 +92,6 @@ impl SettingsDomain for RulebookSettings {
 			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
 		}
 	}
-}
-
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<RulebookSettings>()
 }
 
 /// Frozen rule with source provenance.

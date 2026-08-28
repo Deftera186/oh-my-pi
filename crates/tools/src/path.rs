@@ -230,9 +230,18 @@ fn at_prefix_is_shorthand(input: &str) -> bool {
 		|| input.starts_with("~/")
 		|| input.starts_with("~\\")
 		|| is_windows_drive(input)
-		|| ["agent://", "artifact://", "skill://", "rule://", "security://", "local:", "mcp://"]
-			.iter()
-			.any(|prefix| input.starts_with(prefix))
+		|| [
+			"agent://",
+			"artifact://",
+			"history://",
+			"skill://",
+			"rule://",
+			"security://",
+			"local:",
+			"mcp://",
+		]
+		.iter()
+		.any(|prefix| input.starts_with(prefix))
 }
 
 fn strip_extended_windows_prefix(input: &str) -> String {
@@ -471,6 +480,7 @@ mod tests {
 			("\u{201c}~/My\u{00a0}File.txt\u{201d}", "/Users/test/My File.txt", HostPaths::Posix),
 			(":/tmp/a", "/tmp/a", HostPaths::Posix),
 			("@~/a", "/Users/test/a", HostPaths::Posix),
+			("@history://Worker", "history://Worker", HostPaths::Posix),
 			("file:///tmp/a%20b", "/tmp/a b", HostPaths::Posix),
 			("/tmp/escaped\\ name.txt", "/tmp/escaped name.txt", HostPaths::Posix),
 			("/mnt/c/Users/me/a", r"C:\Users\me\a", HostPaths::Windows),

@@ -1,5 +1,9 @@
 //! Pure transcript-to-thread projection and canonical tool-result lowering.
-use std::{collections::BTreeMap, str, sync::LazyLock};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	str,
+	sync::LazyLock,
+};
 
 use bytes::Bytes;
 use omp_core::{SparseMap, SparseSet, Str, encoding::hex};
@@ -165,6 +169,42 @@ fn is_silent_abort_item(item: &thread_pb::Item) -> bool {
 		.and_then(|value| value.kind.as_ref())
 		.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)))
 }
+// Provider checkpoints are opaque, so their calls cannot be enumerated here.
+// Results below a live checkpoint remain provider-owned until reset or another
+// compaction establishes a different replay boundary.
+fn retain_replayable_tool_results(
+	items: &mut Vec<thread_pb::Item>,
+	provider_owned_results: &SparseSet<usize>,
+) {
+	let dropped = {
+		let mut unmatched_calls = BTreeSet::new();
+		let mut dropped = SparseSet::new();
+		for (position, projected) in items.iter().enumerate() {
+			match projected.kind.as_ref() {
+				Some(item::Kind::ToolCall(call)) => {
+					unmatched_calls.insert(call.id.as_str());
+				},
+				Some(item::Kind::ToolResult(result))
+					if !unmatched_calls.remove(result.call_id.as_str())
+						&& !provider_owned_results.contains(position) =>
+				{
+					dropped.insert(position);
+				},
+				_ => {},
+			}
+		}
+		dropped
+	};
+	if dropped.is_empty() {
+		return;
+	}
+	let mut position = 0;
+	items.retain(|_| {
+		let keep = !dropped.contains(position);
+		position += 1;
+		keep
+	});
+}
 ///
 /// Rewinds are already resolved in `live`. Sequence amendments update only the
 /// working copy; original item events remain untouched.
@@ -183,6 +223,8 @@ pub fn project_journal(
 /// This is the single event-semantic projection used both by provider history
 /// and by child materialization. Tool revision lifting remains a final
 /// provider-capability-specific step in [`project_journal`].
+/// Tool results require a distinct preceding live call unless an opaque
+/// provider-state boundary owns the call outside the projected item stream.
 pub(crate) fn project_journal_items(
 	log: &Log,
 	live: &LiveSet,
@@ -191,6 +233,10 @@ pub(crate) fn project_journal_items(
 	let mut positions = SparseMap::new();
 	let mut amended = SparseSet::new();
 	let mut amendments = SparseMap::new();
+	let mut provider_state_owns_calls = false;
+	let mut provider_owned_results = SparseSet::new();
+	// Mark opaque provider-owned results while event identity is still available;
+	// pairing itself runs after amendments have reached their final projection.
 	for index in live.iter() {
 		let Some(Entry::Ok(event)) = log.get(index) else {
 			continue;
@@ -244,6 +290,7 @@ pub(crate) fn project_journal_items(
 				items.push(item);
 			},
 			Kind::Compact { summary, method, snapcompact, .. } => {
+				provider_state_owns_calls = method.as_deref() == Some("remote");
 				let mut parts = vec![thread_pb::Part {
 					kind: Some(omp_proto::thread::v1::part::Kind::Text(render_compaction_summary(
 						summary,
@@ -267,6 +314,7 @@ pub(crate) fn project_journal_items(
 					kind: Some(item::Kind::Message(thread_pb::Message {
 						role: thread_pb::Role::User as i32,
 						parts,
+						..thread_pb::Message::default()
 					})),
 					..Default::default()
 				});
@@ -284,7 +332,7 @@ pub(crate) fn project_journal_items(
 				items.push(thread_pb::Item {
 					created_at_ms: event.ts,
 					kind: Some(item::Kind::Message(thread_pb::Message {
-						role:  thread_pb::Role::User as i32,
+						role: thread_pb::Role::User as i32,
 						parts: vec![thread_pb::Part {
 							kind: Some(omp_proto::thread::v1::part::Kind::Text(format!(
 								"Checkpoint called and rewound. Report retained below. Need explore again \
@@ -292,6 +340,7 @@ pub(crate) fn project_journal_items(
 								report.report
 							))),
 						}],
+						..thread_pb::Message::default()
 					})),
 					..Default::default()
 				});
@@ -306,9 +355,22 @@ pub(crate) fn project_journal_items(
 					apply_amendment(&mut items[position], amendment);
 				}
 			},
+			Kind::NativeCheckpoint { .. } => {
+				provider_state_owns_calls = true;
+			},
+			Kind::ProviderReset | Kind::Reset => {
+				provider_state_owns_calls = false;
+			},
 			_ => {},
 		}
+		if provider_state_owns_calls
+			&& let Some(position) = positions.get(index).copied()
+			&& matches!(items[position].kind.as_ref(), Some(item::Kind::ToolResult(_)))
+		{
+			provider_owned_results.insert(position);
+		}
 	}
+	retain_replayable_tool_results(&mut items, &provider_owned_results);
 	Ok(items)
 }
 
@@ -658,18 +720,142 @@ mod tests {
 	};
 
 	use bytes::Bytes;
+	use omp_core::{Hash32, Str};
 	use omp_proto::{
 		inference::v1::{self as pb, value},
 		thread::v1::{self as thread_pb, blob, item},
 	};
-	use omp_storage::transcript::{
-		AmendPatch, Event, Header, ItemRecord, Kind, LiveSet, SessionId, Writer, load,
+	use omp_storage::{
+		blob::BlobRef,
+		transcript::{
+			AmendPatch, Event, Header, ItemRecord, Kind, LiveSet, ModelId, ProviderId, SessionId,
+			Writer, load,
+		},
 	};
 	use omp_tool::{CapsBase, ModelClass, TOOL_REV_PROP};
 
 	use super::{project_journal, render_compaction_summary};
 
 	static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+	fn item_event(item: thread_pb::Item) -> Kind {
+		Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None })
+	}
+
+	fn tool_call_item(call_id: &str) -> thread_pb::Item {
+		thread_pb::Item {
+			kind: Some(item::Kind::ToolCall(thread_pb::ToolCall {
+				id: call_id.to_owned(),
+				..Default::default()
+			})),
+			..Default::default()
+		}
+	}
+
+	fn tool_result_item(call_id: &str) -> thread_pb::Item {
+		thread_pb::Item {
+			kind: Some(item::Kind::ToolResult(thread_pb::ToolResult {
+				call_id: call_id.to_owned(),
+				..Default::default()
+			})),
+			..Default::default()
+		}
+	}
+	fn compact_kind(first_kept: u64, method: &str) -> Kind {
+		Kind::Compact {
+			summary: sf!("compacted"),
+			short: None,
+			first_kept,
+			tokens_before: 100,
+			tokens_after: Some(10),
+			method: Some(Str::new(method)),
+			warning: None,
+			superseded: Vec::new(),
+			snapcompact: None,
+		}
+	}
+
+	fn project_kinds(label: &str, kinds: Vec<Kind>) -> Vec<thread_pb::Item> {
+		let path = env::temp_dir().join(format!(
+			"omp-agent-project-{label}-{}-{}.jsonl",
+			std::process::id(),
+			NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+		));
+		let mut writer = Writer::create(&path, &Header {
+			v:       4,
+			id:      SessionId(sf!("project-test")),
+			created: 1,
+			cwd:     env::temp_dir(),
+		})
+		.expect("create transcript");
+		for (offset, kind) in kinds.into_iter().enumerate() {
+			writer
+				.append(&Event {
+					ts: u64::try_from(offset).expect("fixture length fits u64") + 2,
+					kind,
+				})
+				.expect("append fixture event");
+		}
+		drop(writer);
+
+		let log = load(&path).expect("load transcript");
+		let mut live = LiveSet::new();
+		log.live_into(&mut live);
+		let projected = project_journal(&log, &live, &omp_tool::Registry::new(), &CapsBase {
+			maximum_parts:      8,
+			maximum_text_bytes: 4_096,
+			media:              true,
+			model_class:        ModelClass::Standard,
+		})
+		.expect("project transcript");
+		fs::remove_file(path).expect("remove transcript");
+		projected.items
+	}
+
+	#[test]
+	fn compaction_projection_omits_result_whose_call_was_pruned() {
+		let items = project_kinds("orphan-result", vec![
+			item_event(tool_call_item("call-pruned")),
+			item_event(tool_result_item("call-pruned")),
+			compact_kind(1, "local"),
+		]);
+		assert_eq!(items.len(), 1);
+		assert!(matches!(items[0].kind.as_ref(), Some(item::Kind::Message(_))));
+	}
+
+	#[test]
+	fn projection_keeps_distinct_paired_tool_call_and_result() {
+		let items = project_kinds("paired-result", vec![
+			item_event(tool_call_item("call-kept")),
+			item_event(tool_result_item("call-kept")),
+		]);
+		assert_eq!(items.len(), 2);
+		assert!(matches!(items[0].kind.as_ref(), Some(item::Kind::ToolCall(_))));
+		assert!(matches!(items[1].kind.as_ref(), Some(item::Kind::ToolResult(_))));
+	}
+
+	#[test]
+	fn projection_keeps_result_owned_by_provider_state_boundary() {
+		let items = project_kinds("provider-owned-result", vec![
+			Kind::NativeCheckpoint {
+				provider: ProviderId(sf!("openai-codex")),
+				model:    ModelId(sf!("gpt-5.6-sol")),
+				items:    BlobRef { hash: Hash32::new([7; 32]), size: 10 },
+			},
+			item_event(tool_result_item("call-in-provider-state")),
+		]);
+		assert_eq!(items.len(), 1);
+		assert!(matches!(items[0].kind.as_ref(), Some(item::Kind::ToolResult(_))));
+	}
+	#[test]
+	fn projection_keeps_result_owned_by_remote_compaction_boundary() {
+		let items = project_kinds("remote-result", vec![
+			item_event(tool_call_item("call-remote")),
+			item_event(tool_result_item("call-remote")),
+			compact_kind(1, "remote"),
+		]);
+		assert_eq!(items.len(), 2);
+		assert!(matches!(items[1].kind.as_ref(), Some(item::Kind::ToolResult(_))));
+	}
 
 	#[test]
 	fn handoff_compaction_uses_successor_memory_framing() {
@@ -704,8 +890,9 @@ mod tests {
 		.expect("create transcript");
 		let item = thread_pb::Item {
 			kind: Some(item::Kind::Message(thread_pb::Message {
-				role:  thread_pb::Role::Assistant as i32,
+				role: thread_pb::Role::Assistant as i32,
 				parts: Vec::new(),
+				..thread_pb::Message::default()
 			})),
 			props: Some(pb::ValueMap {
 				fields: BTreeMap::from([
@@ -775,10 +962,11 @@ mod tests {
 		};
 		let item = thread_pb::Item {
 			kind: Some(item::Kind::Message(thread_pb::Message {
-				role:  thread_pb::Role::User as i32,
+				role: thread_pb::Role::User as i32,
 				parts: vec![thread_pb::Part {
 					kind: Some(omp_proto::thread::v1::part::Kind::Blob(blob)),
 				}],
+				..thread_pb::Message::default()
 			})),
 			..Default::default()
 		};
@@ -822,6 +1010,9 @@ mod tests {
 			cwd:     env::temp_dir(),
 		})
 		.expect("create transcript");
+		writer
+			.append(&Event { ts: 2, kind: item_event(tool_call_item("call-1")) })
+			.expect("append tool call");
 		let details = pb::Value { kind: Some(value::Kind::String("recorded".to_owned())) };
 		let item = thread_pb::Item {
 			kind: Some(item::Kind::ToolResult(thread_pb::ToolResult {
@@ -844,12 +1035,12 @@ mod tests {
 		};
 		let target = writer
 			.append(&Event {
-				ts:   2,
+				ts:   3,
 				kind: Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None }),
 			})
 			.expect("append tool result");
 		writer
-			.append(&Event { ts: 3, kind: Kind::Amend { target, patch: AmendPatch::DropParts } })
+			.append(&Event { ts: 4, kind: Kind::Amend { target, patch: AmendPatch::DropParts } })
 			.expect("append content drop");
 		drop(writer);
 
@@ -863,7 +1054,7 @@ mod tests {
 			model_class:        ModelClass::Standard,
 		})
 		.expect("project transcript");
-		let Some(item::Kind::ToolResult(result)) = projected.items[0].kind.as_ref() else {
+		let Some(item::Kind::ToolResult(result)) = projected.items[1].kind.as_ref() else {
 			panic!("projected item is a tool result");
 		};
 		assert!(result.parts.is_empty());
@@ -871,7 +1062,7 @@ mod tests {
 		assert!(result.is_error);
 		assert_eq!(result.useless, Some(true));
 		assert_eq!(
-			projected.items[0]
+			projected.items[1]
 				.props
 				.as_ref()
 				.and_then(|props| props.fields.get(TOOL_REV_PROP)),

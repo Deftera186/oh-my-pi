@@ -14,7 +14,7 @@ use crate::{ApprovalSpec, HookDecision, HookPhase};
 
 /// The number of atomic words needed by the stable hook catalog through ordinal
 /// 127.
-const MASK_WORDS: usize = 2;
+pub(crate) const MASK_WORDS: usize = 2;
 /// A transform phase may make exactly one ordered pass.
 pub const MODIFY_ROUNDS: u8 = 1;
 /// No event may have more than this many observe-only handlers.
@@ -900,7 +900,8 @@ impl HookGate {
 	}
 }
 
-const fn event_position(event: HookEventId) -> (usize, u64) {
+/// Maps a hook event to its `(word, bit)` slot in a split subscription mask.
+pub(crate) const fn event_position(event: HookEventId) -> (usize, u64) {
 	let ordinal = event as usize;
 	(ordinal / 64, 1_u64 << (ordinal % 64))
 }

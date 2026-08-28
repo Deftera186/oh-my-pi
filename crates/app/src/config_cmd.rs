@@ -30,8 +30,11 @@ pub fn run(data_dir: &Path, command: &ConfigCommand) -> miette::Result<()> {
 	if let ConfigCommand::Mcp { command } = command {
 		return run_mcp(data_dir, &project, command);
 	}
-	let manager =
-		SettingsManager::open(SettingsPaths::discover(data_dir, Some(&project))).into_diagnostic()?;
+	let manager = SettingsManager::open(
+		SettingsPaths::discover(data_dir, Some(&project)),
+		crate::SETTINGS_CATALOG,
+	)
+	.into_diagnostic()?;
 	match command {
 		ConfigCommand::InitXdg { .. } => unreachable!("XDG initialization returns before settings"),
 		ConfigCommand::List { json } => list(&manager, *json),
@@ -407,9 +410,11 @@ mod tests {
 	fn reflected_mutations_validate_and_persist() {
 		let state = tempfile::tempdir().expect("state");
 		let project = tempfile::tempdir().expect("project");
-		let manager =
-			SettingsManager::open(SettingsPaths::discover(state.path(), Some(project.path())))
-				.expect("manager");
+		let manager = SettingsManager::open(
+			SettingsPaths::discover(state.path(), Some(project.path())),
+			crate::SETTINGS_CATALOG,
+		)
+		.expect("manager");
 		manager
 			.set_sync(MutationScope::Global, "runtime.interrupt_grace", "250ms")
 			.expect("duration");

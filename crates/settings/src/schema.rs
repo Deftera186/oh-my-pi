@@ -222,16 +222,17 @@ pub struct DomainDescriptor {
 	/// Serializes the Rust type's `Default` value as a TOML document.
 	pub default_document: fn() -> toml::Table,
 	/// Validates a fully layered document through the Rust type.
-	pub validate:         fn(&toml::Table) -> Result<(), ValidationError>,
+	pub validate:         fn(&toml::Table, SettingsCatalog) -> Result<(), ValidationError>,
 }
 
-/// Link-time registration emitted next to the runtime-owned Rust type.
+/// Registration emitted next to the runtime-owned Rust type.
+#[derive(Debug)]
 pub struct DomainRegistration {
 	descriptor: fn() -> DomainDescriptor,
 }
 
 impl DomainRegistration {
-	/// Builds a registration for `D`; intended for `inventory::submit!`.
+	/// Builds a registration for `D`.
 	pub const fn of<D: SettingsDomain>() -> Self {
 		Self { descriptor: descriptor_of::<D> }
 	}
@@ -242,16 +243,54 @@ impl DomainRegistration {
 	}
 }
 
-inventory::collect!(DomainRegistration);
+/// One crate's settings contribution: domains plus layer normalizers,
+/// assembled into a [`SettingsCatalog`] by the composition root.
+#[derive(Debug)]
+pub struct SettingsContribution {
+	/// Domains owned by the contributing crate.
+	pub domains:     &'static [DomainRegistration],
+	/// Layer normalizers owned by the contributing crate.
+	pub normalizers: &'static [crate::LayerNormalizer],
+}
 
-/// Iterates all linked domains in deterministic name order.
-pub fn registered_domains() -> Vec<DomainDescriptor> {
-	let mut domains = inventory::iter::<DomainRegistration>
-		.into_iter()
-		.map(DomainRegistration::descriptor)
-		.collect::<Vec<_>>();
-	domains.sort_unstable_by_key(|domain| domain.name);
-	domains
+/// Explicit set of every settings contribution linked into one composition.
+///
+/// Copy (one wide pointer); stored by value inside `SettingsSnapshot`.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsCatalog {
+	contributions: &'static [&'static SettingsContribution],
+}
+
+impl SettingsCatalog {
+	/// Builds a catalog from explicit contributions; order = normalizer
+	/// application order.
+	pub const fn new(contributions: &'static [&'static SettingsContribution]) -> Self {
+		Self { contributions }
+	}
+
+	/// All domain descriptors in deterministic name order.
+	pub fn descriptors(&self) -> Vec<DomainDescriptor> {
+		let mut domains = self
+			.contributions
+			.iter()
+			.flat_map(|contribution| contribution.domains)
+			.map(DomainRegistration::descriptor)
+			.collect::<Vec<_>>();
+		domains.sort_unstable_by_key(|domain| domain.name);
+		domains
+	}
+
+	/// Applies every layer normalizer to one persisted document, in contribution
+	/// order.
+	pub fn normalize(&self, document: &mut toml::Table) {
+		for normalizer in self
+			.contributions
+			.iter()
+			.flat_map(|contribution| contribution.normalizers)
+		{
+			normalizer.apply(document);
+		}
+	}
 }
 
 fn descriptor_of<D: SettingsDomain>() -> DomainDescriptor {
@@ -277,14 +316,20 @@ fn default_document_of<D: SettingsDomain>() -> toml::Table {
 	}
 }
 
-fn validate_document_as<D: SettingsDomain>(document: &toml::Table) -> Result<(), ValidationError> {
-	let domain = projection_value::<D>(document)
+fn validate_document_as<D: SettingsDomain>(
+	document: &toml::Table,
+	catalog: SettingsCatalog,
+) -> Result<(), ValidationError> {
+	let domain = projection_value::<D>(document, catalog)
 		.try_into::<D>()
 		.map_err(|source| ValidationError::DomainDecode { domain: D::DOMAIN, source })?;
 	domain.validate()
 }
 
-pub(crate) fn projection_value<D: SettingsDomain>(document: &toml::Table) -> toml::Value {
+pub(crate) fn projection_value<D: SettingsDomain>(
+	document: &toml::Table,
+	catalog: SettingsCatalog,
+) -> toml::Value {
 	let Some(prefix) = D::PREFIX else {
 		return toml::Value::Table(document.clone());
 	};
@@ -293,7 +338,8 @@ pub(crate) fn projection_value<D: SettingsDomain>(document: &toml::Table) -> tom
 		.and_then(toml::Value::as_table)
 		.cloned()
 		.unwrap_or_default();
-	for domain in registered_domains()
+	for domain in catalog
+		.descriptors()
 		.into_iter()
 		.filter(|domain| domain.name == D::DOMAIN)
 	{

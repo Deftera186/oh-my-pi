@@ -387,11 +387,11 @@ pub fn spend_label(amount_nanos: u64, subscription: bool, charset: Charset) -> S
 	}
 	let amount = amount_nanos as f64 / 1_000_000_000.0;
 	if !subscription {
-		return Str::from(format!("${amount:.4}"));
+		return Str::from(format!("${amount:.2}"));
 	}
 	match charset {
-		Charset::NerdFont => Str::from(format!("{} {amount:.4}", charset.icon(Icon::Subscription))),
-		Charset::Unicode | Charset::Ascii => Str::from(format!("S{amount:.4}")),
+		Charset::NerdFont => Str::from(format!("{} {amount:.2}", charset.icon(Icon::Subscription))),
+		Charset::Unicode | Charset::Ascii => Str::from(format!("S{amount:.2}")),
 	}
 }
 
@@ -893,19 +893,19 @@ mod tests {
 
 	#[test]
 	fn billing_labels_degrade_by_charset() {
-		assert_eq!(spend_label(250_000_000, false, Charset::Ascii), "$0.2500");
-		assert_eq!(spend_label(250_000_000, true, Charset::Ascii), "S0.2500");
+		assert_eq!(spend_label(250_000_000, false, Charset::Ascii), "$0.25");
+		assert_eq!(spend_label(250_000_000, true, Charset::Ascii), "S0.25");
 		assert_eq!(spend_label(0, true, Charset::Unicode), "(sub)");
-		assert_eq!(spend_label(250_000_000, true, Charset::NerdFont), "\u{f067a} 0.2500",);
+		assert_eq!(spend_label(250_000_000, true, Charset::NerdFont), "\u{f067a} 0.25",);
 	}
 
 	#[test]
 	fn advisor_billing_uses_semantic_glyphs() {
-		assert_eq!(advisor_spend_label(250_000_000, false, Charset::Ascii), "$0.2500 (adv)",);
-		assert_eq!(advisor_spend_label(250_000_000, true, Charset::Unicode), "👁 S0.2500",);
+		assert_eq!(advisor_spend_label(250_000_000, false, Charset::Ascii), "$0.25 (adv)",);
+		assert_eq!(advisor_spend_label(250_000_000, true, Charset::Unicode), "👁 S0.25",);
 		assert_eq!(
 			advisor_spend_label(250_000_000, true, Charset::NerdFont),
-			"\u{ea70} \u{f067a} 0.2500",
+			"\u{ea70} \u{f067a} 0.25",
 		);
 	}
 }

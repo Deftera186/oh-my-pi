@@ -141,8 +141,9 @@ mod tests {
 	fn message(text: &str) -> thread_pb::Item {
 		thread_pb::Item {
 			kind: Some(item::Kind::Message(thread_pb::Message {
-				role:  thread_pb::Role::User as i32,
+				role: thread_pb::Role::User as i32,
 				parts: vec![thread_pb::Part { kind: Some(part::Kind::Text(text.to_owned())) }],
+				..Default::default()
 			})),
 			..Default::default()
 		}

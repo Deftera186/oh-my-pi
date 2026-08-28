@@ -32,14 +32,14 @@ use thiserror::Error;
 
 use crate::transcript::{SessionId, TitleSource};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS index_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 5);
+INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 6);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -115,6 +115,25 @@ CREATE TABLE IF NOT EXISTS receipts (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS receipts_time ON receipts(ts_ms, session_id);
 CREATE INDEX IF NOT EXISTS receipts_model ON receipts(provider, model, ts_ms);
+
+CREATE TABLE IF NOT EXISTS client_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_ms INTEGER NOT NULL,
+    install_id TEXT NOT NULL,
+    hostname TEXT,
+    app TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    cost_nanos_usd INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS client_usage_recorded ON client_usage(recorded_ms);
+CREATE INDEX IF NOT EXISTS client_usage_series
+    ON client_usage(install_id, provider, model, recorded_ms);
 
 CREATE TABLE IF NOT EXISTS item_outcomes (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -565,6 +584,74 @@ pub struct UsageBucket {
 	pub duration_ms: u64,
 	/// Number of distinct contributing sessions.
 	pub sessions:    u64,
+}
+
+/// One append-only gateway usage observation attributed to an installation and
+/// app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientUsageRecord<'a> {
+	/// Settlement timestamp in epoch milliseconds.
+	pub recorded_ms:        u64,
+	/// Stable installation identifier.
+	pub install_id:         &'a str,
+	/// Human-readable hostname, when supplied.
+	pub hostname:           Option<&'a str>,
+	/// Application label.
+	pub app:                &'a str,
+	/// Serving provider.
+	pub provider:           &'a str,
+	/// Serving model.
+	pub model:              &'a str,
+	/// Number of requests represented by this observation.
+	pub requests:           u64,
+	/// Input tokens.
+	pub input_tokens:       u64,
+	/// Output tokens.
+	pub output_tokens:      u64,
+	/// Cache-read tokens.
+	pub cache_read_tokens:  u64,
+	/// Cache-write tokens.
+	pub cache_write_tokens: u64,
+	/// Settled cost in billionths of a US dollar.
+	pub cost_nanos_usd:     u64,
+}
+
+/// One `(app, provider, model)` aggregate within a client usage summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientUsageProviderSummary {
+	/// Application label, absent for migrated unlabeled rows.
+	pub app:                Option<Str>,
+	/// Serving provider.
+	pub provider:           Str,
+	/// Serving model.
+	pub model:              Str,
+	/// Request count.
+	pub requests:           u64,
+	/// Input tokens.
+	pub input_tokens:       u64,
+	/// Output tokens.
+	pub output_tokens:      u64,
+	/// Cache-read tokens.
+	pub cache_read_tokens:  u64,
+	/// Cache-write tokens.
+	pub cache_write_tokens: u64,
+	/// Settled cost in billionths of a US dollar.
+	pub cost_nanos_usd:     u64,
+}
+
+/// Aggregated usage for one installation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientUsageSummary {
+	/// Stable installation identifier.
+	pub install_id:    Str,
+	/// Most recently reported hostname, when available.
+	pub hostname:      Option<Str>,
+	/// First contributing observation in the query window.
+	pub first_seen_ms: u64,
+	/// Most recent contributing observation in the query window.
+	pub last_seen_ms:  u64,
+	/// Per-app, provider, and model aggregates.
+	pub providers:     Vec<ClientUsageProviderSummary>,
 }
 
 /// Exact accounting stored for one receipt.
@@ -1062,6 +1149,24 @@ impl SessionIndex {
 		Ok(SessionPage { sessions, authority: self.authority })
 	}
 
+	/// Replaces one session's display title with a user-assigned title.
+	///
+	/// Returns `false` when the session projection is absent.
+	pub fn rename_session(&self, session: &SessionId, title: &str) -> Result<bool, Error> {
+		self.require_writer()?;
+		let connection = self.connection.lock();
+		let title = normalize_session_name(title);
+		let renamed = connection.execute(
+			"UPDATE sessions SET title = ?2, title_source = ?3 WHERE id = ?1",
+			params![session.as_str(), title, title.map(|_| <&'static str>::from(TitleSource::User)),],
+		)? != 0;
+		drop(connection);
+		if renamed && let Some(observer) = self.rename_observer.read().as_ref() {
+			observer.renamed(session, title);
+		}
+		Ok(renamed)
+	}
+
 	/// Returns one root and every durable lineage descendant in parent-before-
 	/// child order.
 	pub fn subagent_tree(&self, root: &SessionId) -> Result<Vec<SessionInfo>, Error> {
@@ -1163,6 +1268,117 @@ impl SessionIndex {
 		drop(statement);
 		merge_bucket_details(&connection, query, &mut buckets)?;
 		Ok(buckets)
+	}
+
+	/// Appends one gateway-side client usage observation.
+	pub fn record_client_usage(&self, record: &ClientUsageRecord<'_>) -> Result<(), Error> {
+		self.require_writer()?;
+		let connection = self.connection.lock();
+		connection.execute(
+			"INSERT INTO client_usage(
+			 recorded_ms, install_id, hostname, app, provider, model, requests,
+			 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_nanos_usd
+			 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+			params![
+				sql_u64(record.recorded_ms, "client_usage.recorded_ms")?,
+				record.install_id,
+				record.hostname,
+				record.app.trim(),
+				record.provider,
+				record.model,
+				sql_u64(record.requests, "client_usage.requests")?,
+				sql_u64(record.input_tokens, "client_usage.input_tokens")?,
+				sql_u64(record.output_tokens, "client_usage.output_tokens")?,
+				sql_u64(record.cache_read_tokens, "client_usage.cache_read_tokens")?,
+				sql_u64(record.cache_write_tokens, "client_usage.cache_write_tokens")?,
+				sql_u64(record.cost_nanos_usd, "client_usage.cost_nanos_usd")?,
+			],
+		)?;
+		Ok(())
+	}
+
+	/// Aggregates append-only gateway observations since `since_ms`.
+	pub fn client_usage(&self, since_ms: u64) -> Result<Vec<ClientUsageSummary>, Error> {
+		let connection = self.connection.lock();
+		let mut statement = connection.prepare(
+			"SELECT install_id, app, provider, model, MIN(recorded_ms), MAX(recorded_ms),
+			        SUM(requests), SUM(input_tokens), SUM(output_tokens),
+			        SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(cost_nanos_usd)
+			 FROM client_usage
+			 WHERE recorded_ms >= ?1
+			 GROUP BY install_id, app, provider, model
+			 ORDER BY install_id, app, provider, model",
+		)?;
+		let rows = statement.query_map([sql_u64(since_ms, "client_usage.since_ms")?], |row| {
+			Ok((
+				row.get::<_, String>(0)?,
+				row.get::<_, String>(1)?,
+				row.get::<_, String>(2)?,
+				row.get::<_, String>(3)?,
+				row.get::<_, u64>(4)?,
+				row.get::<_, u64>(5)?,
+				row.get::<_, u64>(6)?,
+				row.get::<_, u64>(7)?,
+				row.get::<_, u64>(8)?,
+				row.get::<_, u64>(9)?,
+				row.get::<_, u64>(10)?,
+				row.get::<_, u64>(11)?,
+			))
+		})?;
+		let mut clients = Vec::<ClientUsageSummary>::new();
+		for row in rows {
+			let (
+				install_id,
+				app,
+				provider,
+				model,
+				first_seen_ms,
+				last_seen_ms,
+				requests,
+				input_tokens,
+				output_tokens,
+				cache_read_tokens,
+				cache_write_tokens,
+				cost_nanos_usd,
+			) = row?;
+			let new_client = clients
+				.last()
+				.is_none_or(|client| client.install_id.as_str() != install_id.as_str());
+			if new_client {
+				let hostname = connection
+					.query_row(
+						"SELECT hostname FROM client_usage
+						 WHERE install_id = ?1 AND hostname IS NOT NULL AND hostname != ''
+						 ORDER BY recorded_ms DESC, id DESC LIMIT 1",
+						[install_id.as_str()],
+						|row| row.get::<_, String>(0),
+					)
+					.optional()?
+					.map(Str::from);
+				clients.push(ClientUsageSummary {
+					install_id: Str::from(install_id.as_str()),
+					hostname,
+					first_seen_ms,
+					last_seen_ms,
+					providers: Vec::new(),
+				});
+			}
+			let client = clients.last_mut().expect("client was inserted");
+			client.first_seen_ms = client.first_seen_ms.min(first_seen_ms);
+			client.last_seen_ms = client.last_seen_ms.max(last_seen_ms);
+			client.providers.push(ClientUsageProviderSummary {
+				app: (!app.is_empty()).then(|| Str::from(app)),
+				provider: Str::from(provider),
+				model: Str::from(model),
+				requests,
+				input_tokens,
+				output_tokens,
+				cache_read_tokens,
+				cache_write_tokens,
+				cost_nanos_usd,
+			});
+		}
+		Ok(clients)
 	}
 
 	/// Aggregates one session and, when requested, every lineage descendant.
@@ -1605,6 +1821,56 @@ fn migrate_schema(connection: &Connection) -> Result<(), Error> {
 			 UPDATE index_meta SET schema_version = 5 WHERE singleton = 1;",
 		)?;
 		version = 5;
+	}
+	if version == 5 {
+		let usage_table = connection.query_row(
+			"SELECT EXISTS(
+			 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'client_usage'
+			 )",
+			[],
+			|row| row.get::<_, bool>(0),
+		)?;
+		if usage_table {
+			let has_app = {
+				let mut columns = connection.prepare("PRAGMA table_info(client_usage)")?;
+				let names = columns.query_map([], |row| row.get::<_, String>(1))?;
+				let mut has_app = false;
+				for name in names {
+					has_app |= name? == "app";
+				}
+				has_app
+			};
+			if !has_app {
+				connection.execute_batch(
+					"ALTER TABLE client_usage ADD COLUMN app TEXT NOT NULL DEFAULT '';",
+				)?;
+			}
+		} else {
+			connection.execute_batch(
+				"CREATE TABLE client_usage (
+				    id INTEGER PRIMARY KEY AUTOINCREMENT,
+				    recorded_ms INTEGER NOT NULL,
+				    install_id TEXT NOT NULL,
+				    hostname TEXT,
+				    app TEXT NOT NULL DEFAULT '',
+				    provider TEXT NOT NULL,
+				    model TEXT NOT NULL,
+				    requests INTEGER NOT NULL,
+				    input_tokens INTEGER NOT NULL,
+				    output_tokens INTEGER NOT NULL,
+				    cache_read_tokens INTEGER NOT NULL,
+				    cache_write_tokens INTEGER NOT NULL,
+				    cost_nanos_usd INTEGER NOT NULL
+				 );",
+			)?;
+		}
+		connection.execute_batch(
+			"CREATE INDEX IF NOT EXISTS client_usage_recorded ON client_usage(recorded_ms);
+			 CREATE INDEX IF NOT EXISTS client_usage_series
+			 ON client_usage(install_id, provider, model, recorded_ms);
+			 UPDATE index_meta SET schema_version = 6 WHERE singleton = 1;",
+		)?;
+		version = 6;
 	}
 	if version != initial_version {
 		tracing::info!(

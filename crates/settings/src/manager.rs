@@ -12,14 +12,14 @@ use parking_lot::{Mutex, RwLock};
 
 use super::{migrate, migrate::MigrationError};
 use crate::{
-	DomainRevision, DynamicOption, FieldDescriptor, LayerNormalizer, OptionProvider, Revision,
-	SettingKind, SettingScope, SettingsDomain, SettingsSnapshot, SnapshotError, SnapshotPublisher,
-	Subscription, ValidationError, deep_merge,
+	DomainRevision, DynamicOption, FieldDescriptor, OptionProvider, Revision, SettingKind,
+	SettingScope, SettingsCatalog, SettingsDomain, SettingsSnapshot, SnapshotError,
+	SnapshotPublisher, Subscription, ValidationError, deep_merge,
 	io::{
-		DocumentMutation, QuarantineDiagnostic, ReadDocument, SettingsIoError, mutate_document,
-		read_document, read_or_quarantine,
+		DocumentMutation, QuarantineDiagnostic, ReadDocument, SettingsIoError,
+		mutate_prepared_document, prepare_document_mutation_from_base, read_document,
+		read_or_quarantine,
 	},
-	registered_domains,
 };
 
 /// Selected writable native settings layer.
@@ -91,13 +91,16 @@ impl SettingsPaths {
 
 /// Sole production writer for reflected native settings.
 pub struct SettingsManager {
-	paths:       SettingsPaths,
-	runtime:     RwLock<toml::Table>,
-	snapshot:    RwLock<Arc<SettingsSnapshot>>,
-	publisher:   SnapshotPublisher,
-	mutation:    Mutex<()>,
-	read_only:   bool,
-	diagnostics: RwLock<Vec<QuarantineDiagnostic>>,
+	paths:          SettingsPaths,
+	catalog:        SettingsCatalog,
+	global_native:  RwLock<toml::Table>,
+	project_native: RwLock<toml::Table>,
+	runtime:        RwLock<toml::Table>,
+	snapshot:       RwLock<Arc<SettingsSnapshot>>,
+	publisher:      SnapshotPublisher,
+	mutation:       Mutex<()>,
+	read_only:      bool,
+	diagnostics:    RwLock<Vec<QuarantineDiagnostic>>,
 }
 
 impl SettingsManager {
@@ -107,12 +110,15 @@ impl SettingsManager {
 		skip_all,
 		fields(path = %paths.global.display(), overlay_count = paths.overlays.len())
 	)]
-	pub fn open(paths: SettingsPaths) -> Result<Self, SettingsManagerError> {
+	pub fn open(
+		paths: SettingsPaths,
+		catalog: SettingsCatalog,
+	) -> Result<Self, SettingsManagerError> {
 		let preflight = read_or_quarantine_reported(&paths.global, "preflight")?;
 		if let Some(data_dir) = paths.global.parent() {
-			migrate::migrate_legacy_settings(data_dir)?;
+			migrate::migrate_legacy_settings(data_dir, catalog)?;
 		}
-		let manager = Self::load(paths, false)?;
+		let manager = Self::load(paths, false, catalog)?;
 		if let Some(diagnostic) = preflight.quarantine {
 			report_quarantine(&diagnostic);
 			manager.diagnostics.write().push(diagnostic);
@@ -121,31 +127,40 @@ impl SettingsManager {
 	}
 
 	/// Loads a read-only authority without migration or mutation rights.
-	pub fn open_read_only(paths: SettingsPaths) -> Result<Self, SettingsManagerError> {
-		Self::load(paths, true)
+	pub fn open_read_only(
+		paths: SettingsPaths,
+		catalog: SettingsCatalog,
+	) -> Result<Self, SettingsManagerError> {
+		Self::load(paths, true, catalog)
 	}
 
 	/// Constructs a filesystem-isolated authority from a merged document.
-	pub fn isolated(document: toml::Table) -> Result<Self, SettingsManagerError> {
-		validate_document(&document)?;
-		let snapshot = SettingsSnapshot::isolated_document(document);
+	pub fn isolated(
+		document: toml::Table,
+		catalog: SettingsCatalog,
+	) -> Result<Self, SettingsManagerError> {
+		validate_document(&document, catalog)?;
+		let snapshot = SettingsSnapshot::isolated_document(document, catalog);
 		Ok(Self {
-			paths:       SettingsPaths {
-				global:   PathBuf::new(),
-				project:  None,
-				overlays: Vec::new(),
-			},
-			runtime:     RwLock::new(toml::Table::new()),
-			snapshot:    RwLock::new(Arc::new(snapshot)),
-			publisher:   SnapshotPublisher::default(),
-			mutation:    Mutex::new(()),
-			read_only:   true,
+			catalog,
+			paths: SettingsPaths { global: PathBuf::new(), project: None, overlays: Vec::new() },
+			global_native: RwLock::new(toml::Table::new()),
+			project_native: RwLock::new(toml::Table::new()),
+			runtime: RwLock::new(toml::Table::new()),
+			snapshot: RwLock::new(Arc::new(snapshot)),
+			publisher: SnapshotPublisher::default(),
+			mutation: Mutex::new(()),
+			read_only: true,
 			diagnostics: RwLock::new(Vec::new()),
 		})
 	}
 
-	fn load(paths: SettingsPaths, read_only: bool) -> Result<Self, SettingsManagerError> {
-		validate_registry().map_err(|error| {
+	fn load(
+		paths: SettingsPaths,
+		read_only: bool,
+		catalog: SettingsCatalog,
+	) -> Result<Self, SettingsManagerError> {
+		validate_registry(catalog).map_err(|error| {
 			tracing::warn!(
 				path = %paths.global.display(),
 				error = %error,
@@ -165,7 +180,7 @@ impl SettingsManager {
 			read.document
 		};
 		let mut global = load_yaml_compatibility(&paths.global)?;
-		deep_merge(&mut global, global_toml);
+		deep_merge(&mut global, global_toml.clone());
 		let project_toml = match &paths.project {
 			Some(path) if read_only => read_document_reported(path, "project")?,
 			Some(path) => {
@@ -184,21 +199,25 @@ impl SettingsManager {
 			.map(load_yaml_compatibility)
 			.transpose()?
 			.unwrap_or_default();
-		deep_merge(&mut project, project_toml);
+		deep_merge(&mut project, project_toml.clone());
 		let overlays = load_overlays(&paths.overlays)?;
-		let document = compose_document(global, project, overlays, toml::Table::new());
-		validate_loaded_document(&document, &paths)?;
-		let revisions = registered_domains()
+		let document = compose_document(global, project, overlays, toml::Table::new(), catalog);
+		validate_loaded_document(&document, &paths, catalog)?;
+		let revisions = catalog
+			.descriptors()
 			.into_iter()
 			.map(|domain| (domain.name, DomainRevision(1)))
 			.collect();
 		let snapshot = if read_only {
-			SettingsSnapshot::read_only(document)
+			SettingsSnapshot::read_only(document, catalog)
 		} else {
-			SettingsSnapshot::persistent(Revision(1), revisions, document)
+			SettingsSnapshot::persistent(Revision(1), revisions, document, catalog)
 		};
 		Ok(Self {
 			paths,
+			catalog,
+			global_native: RwLock::new(global_toml),
+			project_native: RwLock::new(project_toml),
 			runtime: RwLock::new(toml::Table::new()),
 			snapshot: RwLock::new(Arc::new(snapshot)),
 			publisher: SnapshotPublisher::default(),
@@ -229,9 +248,26 @@ impl SettingsManager {
 		self.diagnostics.write().push(diagnostic);
 	}
 
+	fn read_native_layer(
+		&self,
+		path: &Path,
+		layer: &'static str,
+	) -> Result<toml::Table, SettingsManagerError> {
+		if self.read_only {
+			return Ok(read_document_reported(path, layer)?);
+		}
+		let read = read_or_quarantine_reported(path, layer)?;
+		if let Some(diagnostic) = read.quarantine {
+			self.record_quarantine(diagnostic);
+		}
+		Ok(read.document)
+	}
+
 	/// Finds a reflected field by exact dotted path.
 	pub fn field(&self, path: &str) -> Option<FieldDescriptor> {
-		registered_domains()
+		self
+			.catalog
+			.descriptors()
 			.into_iter()
 			.flat_map(|domain| domain.fields.iter().copied())
 			.find(|field| field.path == path)
@@ -241,7 +277,9 @@ impl SettingsManager {
 		if let Some(field) = self.field(path) {
 			return Some((field, false));
 		}
-		registered_domains()
+		self
+			.catalog
+			.descriptors()
 			.into_iter()
 			.flat_map(|domain| domain.fields.iter().copied())
 			.filter(|field| {
@@ -258,7 +296,9 @@ impl SettingsManager {
 
 	/// Iterates reflected fields in stable domain/order/path order.
 	pub fn fields(&self) -> Vec<FieldDescriptor> {
-		let mut fields = registered_domains()
+		let mut fields = self
+			.catalog
+			.descriptors()
 			.into_iter()
 			.flat_map(|domain| domain.fields.iter().copied())
 			.collect::<Vec<_>>();
@@ -280,7 +320,7 @@ impl SettingsManager {
 			.iter()
 			.map(|id| SettingsEditorPanel { id, fields: Vec::new() })
 			.collect::<Vec<_>>();
-		for domain in registered_domains() {
+		for domain in self.catalog.descriptors() {
 			let mut fields = domain.fields.to_vec();
 			fields.sort_unstable_by_key(|field| (field.order, field.path));
 			for descriptor in fields {
@@ -393,10 +433,16 @@ impl SettingsManager {
 		let _guard = self.mutation.lock();
 		let mut candidate = self.snapshot().document().clone();
 		apply_runtime(&mut candidate, &mutation);
-		validate_document(&candidate)?;
+		validate_document(&candidate, self.catalog)?;
 		match scope {
 			MutationScope::Global => {
-				let read = mutate_document(&self.paths.global, slice::from_ref(&mutation))?;
+				let base_value = value_at(&self.global_native.read(), mutation.path()).cloned();
+				let pending = prepare_document_mutation_from_base(
+					&self.paths.global,
+					mutation.clone(),
+					base_value,
+				);
+				let read = mutate_prepared_document(&self.paths.global, slice::from_ref(&pending))?;
 				if let Some(diagnostic) = read.quarantine {
 					self.record_quarantine(diagnostic);
 				}
@@ -407,40 +453,60 @@ impl SettingsManager {
 					.project
 					.as_ref()
 					.ok_or(SettingsManagerError::NoProjectScope)?;
-				let read = mutate_document(path, slice::from_ref(&mutation))?;
+				let base_value = value_at(&self.project_native.read(), mutation.path()).cloned();
+				let pending = prepare_document_mutation_from_base(path, mutation.clone(), base_value);
+				let read = mutate_prepared_document(path, slice::from_ref(&pending))?;
 				if let Some(diagnostic) = read.quarantine {
 					self.record_quarantine(diagnostic);
 				}
 			},
 			MutationScope::Runtime => apply_runtime(&mut self.runtime.write(), &mutation),
 		}
-		self.reload()
+		self.reload_locked()
 	}
 
-	fn reload(&self) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
-		let global_read = read_or_quarantine_reported(&self.paths.global, "global")?;
-		if let Some(diagnostic) = global_read.quarantine {
-			self.record_quarantine(diagnostic);
+	/// Reconciles externally edited files and notifies affected domain
+	/// listeners.
+	pub fn reload(&self) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		if self.read_only {
+			return Err(SettingsManagerError::ReadOnly);
 		}
+		let _guard = self.mutation.lock();
+		self.reload_locked()
+	}
+
+	fn reload_locked(&self) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
+		let global_toml = self.read_native_layer(&self.paths.global, "global")?;
 		let mut global = load_yaml_compatibility(&self.paths.global)?;
-		deep_merge(&mut global, global_read.document);
-		let mut project = toml::Table::new();
-		if let Some(path) = self.paths.project.as_deref() {
-			project = load_yaml_compatibility(path)?;
-			let read = read_or_quarantine_reported(path, "project")?;
-			if let Some(diagnostic) = read.quarantine {
-				self.record_quarantine(diagnostic);
-			}
-			deep_merge(&mut project, read.document);
-		}
+		deep_merge(&mut global, global_toml.clone());
+
+		let project_toml = self
+			.paths
+			.project
+			.as_deref()
+			.map(|path| self.read_native_layer(path, "project"))
+			.transpose()?
+			.unwrap_or_default();
+		let mut project = self
+			.paths
+			.project
+			.as_deref()
+			.map(load_yaml_compatibility)
+			.transpose()?
+			.unwrap_or_default();
+		deep_merge(&mut project, project_toml.clone());
+
 		let overlays = load_overlays(&self.paths.overlays)?;
-		let document = compose_document(global, project, overlays, self.runtime.read().clone());
-		validate_loaded_document(&document, &self.paths)?;
+		let document =
+			compose_document(global, project, overlays, self.runtime.read().clone(), self.catalog);
+		validate_loaded_document(&document, &self.paths, self.catalog)?;
+		*self.global_native.write() = global_toml;
+		*self.project_native.write() = project_toml;
 
 		let previous = self.snapshot();
 		let mut revisions = BTreeMap::new();
 		let mut changed_domain_count = 0_u64;
-		for domain in registered_domains() {
+		for domain in self.catalog.descriptors() {
 			let changed = domain.fields.iter().any(|field| {
 				value_at(previous.document(), field.path) != value_at(&document, field.path)
 			});
@@ -466,6 +532,7 @@ impl SettingsManager {
 			Revision(previous.revision().0 + 1),
 			revisions,
 			document,
+			self.catalog,
 		));
 		*self.snapshot.write() = Arc::clone(&snapshot);
 		self.publisher.publish(Arc::clone(&snapshot));
@@ -558,27 +625,21 @@ pub fn panel_for_field(domain: &str, path: &str) -> &'static str {
 	}
 }
 
-/// Applies every linked layer normalizer to one persisted document.
-fn normalize_layer(document: &mut toml::Table) {
-	for normalizer in inventory::iter::<LayerNormalizer> {
-		normalizer.apply(document);
-	}
-}
-
 fn compose_document(
 	mut global: toml::Table,
 	mut project: toml::Table,
 	mut overlays: Vec<toml::Table>,
 	mut runtime: toml::Table,
+	catalog: SettingsCatalog,
 ) -> toml::Table {
-	normalize_layer(&mut global);
-	normalize_layer(&mut project);
+	catalog.normalize(&mut global);
+	catalog.normalize(&mut project);
 	for overlay in &mut overlays {
-		normalize_layer(overlay);
+		catalog.normalize(overlay);
 	}
-	normalize_layer(&mut runtime);
+	catalog.normalize(&mut runtime);
 	let mut document = toml::Table::new();
-	for domain in registered_domains() {
+	for domain in catalog.descriptors() {
 		deep_merge(&mut document, (domain.default_document)());
 	}
 	deep_merge(&mut document, global);
@@ -590,9 +651,9 @@ fn compose_document(
 	document
 }
 
-fn validate_registry() -> Result<(), SettingsManagerError> {
+fn validate_registry(catalog: SettingsCatalog) -> Result<(), SettingsManagerError> {
 	let mut paths = BTreeMap::new();
-	for domain in registered_domains() {
+	for domain in catalog.descriptors() {
 		for field in domain.fields {
 			if let Some(previous) = paths.insert(field.path, *field)
 				&& (previous.kind != field.kind
@@ -606,9 +667,12 @@ fn validate_registry() -> Result<(), SettingsManagerError> {
 	Ok(())
 }
 
-fn validate_document(document: &toml::Table) -> Result<(), SettingsManagerError> {
-	for domain in registered_domains() {
-		(domain.validate)(document)?;
+fn validate_document(
+	document: &toml::Table,
+	catalog: SettingsCatalog,
+) -> Result<(), SettingsManagerError> {
+	for domain in catalog.descriptors() {
+		(domain.validate)(document, catalog)?;
 	}
 	Ok(())
 }
@@ -616,8 +680,9 @@ fn validate_document(document: &toml::Table) -> Result<(), SettingsManagerError>
 fn validate_loaded_document(
 	document: &toml::Table,
 	paths: &SettingsPaths,
+	catalog: SettingsCatalog,
 ) -> Result<(), SettingsManagerError> {
-	validate_document(document).map_err(|error| {
+	validate_document(document, catalog).map_err(|error| {
 		tracing::warn!(
 			path = %paths.global.display(),
 			overlay_count = paths.overlays.len(),
@@ -781,7 +846,7 @@ pub enum SettingsManagerError {
 	/// Project scope was requested without a project root.
 	#[error("project settings scope is unavailable")]
 	NoProjectScope,
-	/// Mutation was attempted through a read-only authority.
+	/// Mutation or reconciliation was attempted through a read-only authority.
 	#[error("settings authority is read-only")]
 	ReadOnly,
 }
@@ -794,7 +859,8 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		FieldDescriptor, LayerNormalizer, SettingKind, SettingScope, SettingsDomain, SettingsSnapshot,
+		DomainRegistration, FieldDescriptor, LayerNormalizer, SettingKind, SettingScope,
+		SettingsContribution, SettingsDomain, SettingsSnapshot,
 	};
 
 	const PROBE_SCOPES: &[SettingScope] =
@@ -821,10 +887,6 @@ mod tests {
 			secret:      false,
 		}];
 		const PREFIX: Option<&'static str> = None;
-	}
-
-	inventory::submit! {
-		crate::DomainRegistration::of::<CoreProbe>()
 	}
 
 	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -863,10 +925,6 @@ mod tests {
 		];
 	}
 
-	inventory::submit! {
-		crate::DomainRegistration::of::<ModelProbe>()
-	}
-
 	/// Table-shaped domain whose values accept booleans on disk.
 	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 	struct ToggleProbe {
@@ -877,10 +935,6 @@ mod tests {
 	impl SettingsDomain for ToggleProbe {
 		const DOMAIN: &'static str = "probe";
 		const FIELDS: &'static [FieldDescriptor] = &[];
-	}
-
-	inventory::submit! {
-		crate::DomainRegistration::of::<ToggleProbe>()
 	}
 
 	fn normalize_probe_toggles(document: &mut toml::Table) {
@@ -900,12 +954,19 @@ mod tests {
 		}
 	}
 
-	inventory::submit! {
-		LayerNormalizer::new(normalize_probe_toggles)
-	}
+	const CONTRIBUTION: SettingsContribution = SettingsContribution {
+		domains:     &[
+			DomainRegistration::of::<CoreProbe>(),
+			DomainRegistration::of::<ModelProbe>(),
+			DomainRegistration::of::<ToggleProbe>(),
+		],
+		normalizers: &[LayerNormalizer::new(normalize_probe_toggles)],
+	};
+	const CATALOG: SettingsCatalog =
+		SettingsCatalog::new(&[&crate::SETTINGS_CONTRIBUTION, &CONTRIBUTION]);
 
 	fn test_manager(global: PathBuf) -> SettingsManager {
-		SettingsManager::open(SettingsPaths { global, project: None, overlays: Vec::new() })
+		SettingsManager::open(SettingsPaths { global, project: None, overlays: Vec::new() }, CATALOG)
 			.expect("manager")
 	}
 
@@ -978,11 +1039,14 @@ mod tests {
 	#[test]
 	fn domain_subscription_wakes_on_owning_revision() {
 		let tree = tempfile::tempdir().expect("tree");
-		let manager = SettingsManager::open(SettingsPaths {
-			global:   tree.path().join("config.toml"),
-			project:  None,
-			overlays: Vec::new(),
-		})
+		let manager = SettingsManager::open(
+			SettingsPaths {
+				global:   tree.path().join("config.toml"),
+				project:  None,
+				overlays: Vec::new(),
+			},
+			CATALOG,
+		)
 		.expect("manager");
 		let mut subscription = manager.subscribe::<CoreProbe>();
 		manager
@@ -1011,11 +1075,10 @@ mod tests {
 		fs::write(&global, "probe_value = 'global'").expect("global");
 		fs::write(&project, "probe_value = 'project'").expect("project");
 		fs::write(&overlay, "probe_value = 'overlay'").expect("overlay");
-		let manager = SettingsManager::open(SettingsPaths {
-			global,
-			project: Some(project),
-			overlays: vec![overlay],
-		})
+		let manager = SettingsManager::open(
+			SettingsPaths { global, project: Some(project), overlays: vec![overlay] },
+			CATALOG,
+		)
 		.expect("manager");
 		let projected = manager
 			.snapshot()
@@ -1056,7 +1119,7 @@ mod tests {
 		fs::write(&overlay, "probe_value: overlay-yaml\n").expect("overlay yaml");
 		let mut paths = SettingsPaths::discover(&data, Some(&project));
 		paths.overlays.push(overlay);
-		let manager = SettingsManager::open(paths).expect("manager");
+		let manager = SettingsManager::open(paths, CATALOG).expect("manager");
 		assert_eq!(
 			manager
 				.snapshot()
@@ -1083,7 +1146,8 @@ mod tests {
 		.expect("global yaml");
 		fs::write(data.join("config.toml"), "[prompt]\nincludeModelInPrompt = true\n")
 			.expect("global native");
-		let global = SettingsManager::open(SettingsPaths::discover(&data, None)).expect("global");
+		let global =
+			SettingsManager::open(SettingsPaths::discover(&data, None), CATALOG).expect("global");
 		let snapshot = global.snapshot();
 		let prompt = snapshot
 			.document()
@@ -1110,8 +1174,8 @@ mod tests {
 		.expect("project yaml");
 		fs::write(project.join(".omp/config.toml"), "[prompt]\nincludeWorkspaceTree = true\n")
 			.expect("project native");
-		let layered =
-			SettingsManager::open(SettingsPaths::discover(&data, Some(&project))).expect("layered");
+		let layered = SettingsManager::open(SettingsPaths::discover(&data, Some(&project)), CATALOG)
+			.expect("layered");
 		let snapshot = layered.snapshot();
 		let prompt = snapshot
 			.document()
@@ -1137,8 +1201,8 @@ mod tests {
 		let global =
 			toml::from_str("[probe.toggles]\nleft = true\nright = true\n").expect("global layer");
 		let project = toml::from_str("[probe.toggles]\nleft = false\n").expect("project layer");
-		let document = compose_document(global, project, Vec::new(), toml::Table::new());
-		let snapshot = SettingsSnapshot::isolated_document(document);
+		let document = compose_document(global, project, Vec::new(), toml::Table::new(), CATALOG);
+		let snapshot = SettingsSnapshot::isolated_document(document, CATALOG);
 		let settings = snapshot.project::<ToggleProbe>().expect("probe projection");
 		assert_eq!(settings.get().toggles.get("left").map(String::as_str), Some("off"));
 		assert_eq!(settings.get().toggles.get("right").map(String::as_str), Some("on"));

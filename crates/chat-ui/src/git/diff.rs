@@ -1,5 +1,7 @@
 //! Git diff-pane chrome and workbench composition.
 
+use std::borrow::Cow;
+
 use omp_core::{Str, sf};
 use omp_tui::{DiffPane, DiffWhitespaceMode, Icon, components::Col, dom};
 
@@ -7,6 +9,16 @@ use super::{Focus, GitArea, GitWorkbench, split_path};
 
 pub(super) const DIFF_ID: &str = "git-diff";
 pub(super) const VIEW_ID: &str = "git-diff-view";
+
+/// Removes carriage returns before source lines reach tab expansion and
+/// terminal rendering.
+pub(super) fn strip_carriage_returns(text: &str) -> Cow<'_, str> {
+	if text.contains('\r') {
+		Cow::Owned(text.replace('\r', ""))
+	} else {
+		Cow::Borrowed(text)
+	}
+}
 
 impl GitWorkbench {
 	pub(super) fn root_component(
@@ -27,7 +39,7 @@ impl GitWorkbench {
 		let middle_color = self
 			.status
 			.as_ref()
-			.map_or(self.ctx.theme.muted, |(_, color, _)| *color);
+			.map_or(self.ctx.theme.muted, |(_, color, ..)| *color);
 		let encoding = self.contents.as_ref().map_or("UTF-8", |contents| {
 			if contents.media.as_deref() == Some("binary") {
 				"Binary"

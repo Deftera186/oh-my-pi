@@ -6,7 +6,9 @@ pub(crate) mod browser;
 pub(crate) mod collab;
 mod config;
 mod diagnostics;
-pub(crate) use diagnostics::{render_debug, run_cleanse};
+pub(crate) use diagnostics::{
+	debug_logs_dir, render_debug, render_system_facts, run_cleanse, session_artifacts,
+};
 pub mod context;
 mod export;
 #[path = "extensions/runtime.rs"]
@@ -246,9 +248,10 @@ pub trait SessionCommandHost {
 		let _ = title;
 		Box::pin(async { Err(miette::miette!("session forking is unavailable")) })
 	}
-	/// Render durable branch lineage.
-	fn branch_tree(&mut self) -> CommandFuture<'_> {
-		Box::pin(async { Err(miette::miette!("session branch navigation is unavailable")) })
+	/// Open the interactive backtrack selector over this session's user
+	/// messages.
+	fn tree(&mut self) -> CommandFuture<'_> {
+		Box::pin(async { Err(miette::miette!("session tree navigation is unavailable")) })
 	}
 	/// Open a named inspector or the inspector selector.
 	fn debug(&mut self, inspector: Option<Str>) -> CommandFuture<'_> {
@@ -691,7 +694,7 @@ macro_rules! command_common {
 	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 $hint:literal, [$(($candidate:literal, $candidate_description:literal)),* $(,)?], [$($capability:ident),* $(,)?], $guest:literal,
 		$parse:expr, |$host:ident, $args:ident| $body:expr) => {
-		mod $module {
+		pub(crate) mod $module {
 			#[allow(unused_imports, reason = "commands reference file-scope parsers and types")]
 			use super::{super::*, *};
 
@@ -719,9 +722,9 @@ macro_rules! command_common {
 					handle,
 				)
 			}
-			inventory::submit! {
-				$crate::chat_ui::commands::registry::BuiltinRegistration { declaration: build }
-			}
+			pub(crate) const REGISTRATION:
+				$crate::chat_ui::commands::registry::BuiltinRegistration =
+				$crate::chat_ui::commands::registry::BuiltinRegistration { declaration: build };
 		}
 	};
 }

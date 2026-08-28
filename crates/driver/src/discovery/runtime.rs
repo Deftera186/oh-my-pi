@@ -2,34 +2,45 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	path::PathBuf,
 	sync::Arc,
 	time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use omp_catalog::{
-	CatalogOverlayBuilder, ClassId, DiscoveredModel, DiscoveryNormalizer, DiscoveryPollGate,
-	DiscoveryPollKey, DiscoverySpec, EvidenceConfidence, ModelLimits, ModelOverlay, ModelPatch,
-	OperationBits, OperationKind, OverlaySource, OverlayStore, ProvenanceKind, ProvenanceSource,
-	ProviderId, ScopedAlias, WireModelId,
+	CatalogOverlay, CatalogOverlayBuilder, ClassId, DiscoveredModel, DiscoveryNormalizer,
+	DiscoveryPollGate, DiscoveryPollKey, DiscoverySpec, EvidenceConfidence, ModelLimits,
+	ModelOverlay, ModelPatch, ModelSpec, OperationBits, OperationKind, OverlaySource, OverlayStore,
+	ProvenanceKind, ProvenanceSource, ProviderId, ScopedAlias, UnsafeTrustScope, WireModelId,
+	snapshot,
 };
 use omp_core::{Principal, Str, sf};
 use omp_envd::exthost::control::{
 	ControlAuthorityFactory, ControlConnectionIdentity, ControlProtocolError,
 };
 use omp_inference::{
-	ModelsDiscoverHookRequest, ProviderResponseHooks,
+	Client, ModelsDiscoverHookRequest, ProviderResponseHooks, Registry,
+	call::{CallMeta, DiscoveryRequest, Target},
 	discovery::{
 		DiscoveryCacheKey, DiscoveryHttpClient, DiscoveryProbe, DiscoveryStore, DiscoveryStoreError,
-		ProbeError, ProviderDiscoveryState, ProviderLifecycle,
+		ProbeError, ProbeHttpFuture, ProbeHttpRequest, ProviderDiscoveryState, ProviderLifecycle,
 	},
+	id::RequestId,
+	receipt::ExecutionBudget,
+	router,
 };
 use omp_proto::inference::v1::{
 	self as pb, Effort, inference_client::InferenceClient, model_event, price,
 	provider_operation_request, provider_operation_response,
 };
+use parking_lot::Mutex as SyncMutex;
 use serde_json::{Map, Value};
-use tokio::sync::Mutex;
+use tokio::{
+	sync::{Mutex, watch},
+	task::JoinHandle,
+	time,
+};
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status, transport::Channel};
 
@@ -42,6 +53,12 @@ use crate::{
 		ProviderRequestKind,
 	},
 };
+
+const SHARED_CATALOG_URL: &str = "https://catalog.stencil.so/models.json.zstd";
+const SHARED_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+const SHARED_CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const SHARED_CATALOG_TRANSPORT_DEADLINE: Duration = Duration::from_secs(15);
+const SHARED_CATALOG_BACKGROUND_SUBSCRIBER_DEADLINE: Duration = Duration::from_secs(30);
 
 type RegimeConstructor =
 	dyn Fn(Option<&str>) -> Result<Box<dyn omp_agent::Regime>, ControlProtocolError> + Send + Sync;
@@ -166,13 +183,237 @@ impl RegimeControlResolver for SealedRegimeControlResolver {
 	}
 }
 
-/// One daemon-wide discovery coordinator shared by every attached session.
-pub struct DiscoveryRuntime {
-	gate:      DiscoveryPollGate,
-	cache:     Arc<DiscoveryStore>,
-	overlays:  Arc<OverlayStore>,
-	disabled:  BTreeSet<omp_catalog::ProviderId>,
-	extension: Mutex<ExtensionDiscoveryState>,
+/// Reqwest transport shared by endpoint probes and shared-catalog refreshes.
+#[derive(Clone, Debug)]
+pub struct RuntimeDiscoveryHttpClient {
+	client:             reqwest::Client,
+	shared_catalog_url: Str,
+}
+
+impl RuntimeDiscoveryHttpClient {
+	/// Creates the production transport with the well-known shared-catalog URL.
+	pub fn new() -> Self {
+		Self {
+			client:             reqwest::Client::new(),
+			shared_catalog_url: Str::new_static(SHARED_CATALOG_URL),
+		}
+	}
+
+	#[cfg(test)]
+	fn with_shared_catalog_url(url: impl Into<Str>) -> Self {
+		Self { client: reqwest::Client::new(), shared_catalog_url: url.into() }
+	}
+
+	async fn fetch_shared_catalog(
+		&self,
+		etag: Option<&str>,
+		cancellation: CancellationToken,
+	) -> Result<SharedCatalogHttpResponse, SharedCatalogFetchError> {
+		let mut request = self
+			.client
+			.get(self.shared_catalog_url.as_str())
+			.header(reqwest::header::ACCEPT, "application/zstd, application/json");
+		if let Some(etag) = etag {
+			request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+		}
+		let execute = async {
+			let response = request
+				.send()
+				.await
+				.map_err(SharedCatalogFetchError::Transport)?;
+			if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+				return Ok(SharedCatalogHttpResponse::NotModified);
+			}
+			if !response.status().is_success() {
+				return Err(SharedCatalogFetchError::Status { status: response.status().as_u16() });
+			}
+			let etag = response
+				.headers()
+				.get(reqwest::header::ETAG)
+				.and_then(|value| value.to_str().ok())
+				.map(Str::new);
+			let body = response
+				.bytes()
+				.await
+				.map_err(SharedCatalogFetchError::Transport)?;
+			Ok(SharedCatalogHttpResponse::Payload { body, etag })
+		};
+		tokio::select! {
+			_ = cancellation.cancelled() => Err(SharedCatalogFetchError::Cancelled),
+			result = time::timeout(SHARED_CATALOG_TRANSPORT_DEADLINE, execute) => {
+				result.map_err(|_| SharedCatalogFetchError::Timeout)?
+			},
+		}
+	}
+}
+
+impl Default for RuntimeDiscoveryHttpClient {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl DiscoveryHttpClient for RuntimeDiscoveryHttpClient {
+	fn request(
+		&self,
+		request: ProbeHttpRequest,
+		cancellation: CancellationToken,
+	) -> ProbeHttpFuture {
+		let client = self.client.clone();
+		Box::pin(async move {
+			let deadline = request.deadline;
+			let execute = async move {
+				let mut builder = client.request(request.method, request.url.as_str());
+				if !request.body.is_empty() {
+					builder = builder.body(request.body);
+				}
+				let response = builder.send().await.map_err(|_| ProbeError::Transport)?;
+				if !response.status().is_success() {
+					return Err(ProbeError::Protocol);
+				}
+				response.bytes().await.map_err(|_| ProbeError::Transport)
+			};
+			tokio::select! {
+				_ = cancellation.cancelled() => Err(ProbeError::Cancelled),
+				result = time::timeout(deadline, execute) => {
+					result.map_err(|_| ProbeError::Timeout)?
+				},
+			}
+		})
+	}
+}
+
+enum SharedCatalogHttpResponse {
+	NotModified,
+	Payload { body: bytes::Bytes, etag: Option<Str> },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SharedCatalogFetchError {
+	#[error("shared catalog request was cancelled")]
+	Cancelled,
+	#[error("shared catalog request timed out")]
+	Timeout,
+	#[error("shared catalog transport failed")]
+	Transport(#[source] reqwest::Error),
+	#[error("shared catalog returned HTTP status {status}")]
+	Status { status: u16 },
+}
+
+/// Shared-catalog compilation or persistence failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SharedCatalogRefreshError {
+	/// The remote payload could not be compiled into safe additive rows.
+	#[error("shared catalog payload was rejected")]
+	Catalog(#[source] snapshot::SharedCatalogError),
+	/// The credential-blind overlay cache could not be persisted.
+	#[error("shared catalog cache publication failed")]
+	Cache(#[source] snapshot::OverlayCacheError),
+	/// A blocking compiler or cache task could not be joined.
+	#[error("shared catalog worker failed")]
+	Worker(#[source] tokio::task::JoinError),
+}
+
+/// Source supplying the currently published shared-catalog slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedCatalogSource {
+	/// No remote addition is available; only bundled rows are active.
+	Bundled,
+	/// A persisted additive slice is serving an offline or failed refresh.
+	DiskCache,
+	/// The current conditional fetch or revalidation succeeded.
+	Remote,
+}
+
+/// Stable category recorded for the most recent failed revalidation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedCatalogFailureKind {
+	/// Subscriber-independent transport cancellation.
+	Cancelled,
+	/// The transport hard deadline elapsed.
+	Timeout,
+	/// The HTTP exchange failed.
+	Transport,
+	/// The server returned a non-success status.
+	Status,
+	/// The remote catalog failed compilation or additive admission.
+	Compile,
+}
+
+/// Truthful status of one shared-catalog refresh attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedCatalogRefreshOutcome {
+	/// Source contributing non-bundled model rows after this attempt.
+	pub source:                 SharedCatalogSource,
+	/// Whether the remote source failed or has not yet been revalidated.
+	pub stale:                  bool,
+	/// Number of additive shared-catalog model entries.
+	pub models:                 usize,
+	/// Last successful remote observation time.
+	pub updated_at_ms:          Option<u64>,
+	/// Most recent failed revalidation time.
+	pub revalidation_failed_ms: Option<u64>,
+	/// Stable failure category for the most recent revalidation.
+	pub revalidation_failure:   Option<SharedCatalogFailureKind>,
+}
+
+/// Summary of one on-demand inference-routed discovery pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegistryDiscoveryRefreshOutcome {
+	/// Secret-free model rows published across provider caches.
+	pub models:   usize,
+	/// Provider routes skipped because another caller owns the same gate.
+	pub skipped:  usize,
+	/// Provider routes that failed without replacing their prior slice.
+	pub failures: usize,
+}
+
+type SharedCatalogResult = Result<SharedCatalogRefreshOutcome, Arc<SharedCatalogRefreshError>>;
+
+struct SharedCatalogState {
+	inflight:      Option<watch::Receiver<Option<SharedCatalogResult>>>,
+	etag:          Option<Str>,
+	last_attempt:  Option<Instant>,
+	cache_overlay: Option<CatalogOverlay>,
+	outcome:       SharedCatalogRefreshOutcome,
+}
+
+impl SharedCatalogState {
+	fn from_cache(cache_overlay: Option<CatalogOverlay>) -> Self {
+		let contributed = cache_overlay
+			.as_ref()
+			.is_some_and(|overlay| !overlay.is_empty());
+		let updated_at_ms = cache_overlay
+			.as_ref()
+			.and_then(|overlay| overlay.source().observed_at_ms);
+		let models = cache_overlay
+			.as_ref()
+			.map_or(0, CatalogOverlay::model_count);
+		Self {
+			inflight: None,
+			etag: None,
+			last_attempt: None,
+			cache_overlay,
+			outcome: SharedCatalogRefreshOutcome {
+				source:                 if contributed {
+					SharedCatalogSource::DiskCache
+				} else {
+					SharedCatalogSource::Bundled
+				},
+				stale:                  true,
+				models:                 if contributed { models } else { 0 },
+				updated_at_ms:          if contributed { updated_at_ms } else { None },
+				revalidation_failed_ms: None,
+				revalidation_failure:   None,
+			},
+		}
+	}
+}
+
+#[derive(Default)]
+struct LiveDiscoveryState {
+	providers: BTreeMap<ProviderId, CatalogOverlay>,
+	shared:    Option<CatalogOverlay>,
 }
 
 #[derive(Default)]
@@ -181,20 +422,72 @@ struct ExtensionDiscoveryState {
 	models:      BTreeMap<ProviderId, BTreeMap<Str, Value>>,
 }
 
+/// One daemon-wide discovery coordinator shared by every attached session.
+pub struct DiscoveryRuntime {
+	gate:            DiscoveryPollGate,
+	cache:           Arc<DiscoveryStore>,
+	overlays:        Arc<OverlayStore>,
+	base:            Arc<snapshot::Catalog>,
+	overlay_cache:   PathBuf,
+	http:            Arc<RuntimeDiscoveryHttpClient>,
+	disabled:        BTreeSet<omp_catalog::ProviderId>,
+	disk_endpoint:   SyncMutex<Option<CatalogOverlay>>,
+	shared_cache:    SyncMutex<Option<CatalogOverlay>>,
+	route_refreshes: SyncMutex<BTreeSet<DiscoveryPollKey>>,
+	live:            Mutex<LiveDiscoveryState>,
+	shared:          Mutex<SharedCatalogState>,
+	extension:       Mutex<ExtensionDiscoveryState>,
+}
+
 impl DiscoveryRuntime {
-	/// Creates a coordinator with explicit disabled-provider precedence.
+	/// Creates a coordinator, loading and sanitizing its credential-blind shared
+	/// catalog cache before any network work begins.
 	pub fn new(
 		cache: Arc<DiscoveryStore>,
 		overlays: Arc<OverlayStore>,
 		disabled: impl IntoIterator<Item = ProviderId>,
-	) -> Self {
-		Self {
+		base: Arc<snapshot::Catalog>,
+		overlay_cache: PathBuf,
+	) -> Result<Self, DiscoveryRuntimeError> {
+		Self::with_http_client(
+			cache,
+			overlays,
+			disabled,
+			base,
+			overlay_cache,
+			Arc::new(RuntimeDiscoveryHttpClient::new()),
+		)
+	}
+
+	fn with_http_client(
+		cache: Arc<DiscoveryStore>,
+		overlays: Arc<OverlayStore>,
+		disabled: impl IntoIterator<Item = ProviderId>,
+		base: Arc<snapshot::Catalog>,
+		overlay_cache: PathBuf,
+		http: Arc<RuntimeDiscoveryHttpClient>,
+	) -> Result<Self, DiscoveryRuntimeError> {
+		let cached = snapshot::read_discovery_overlay_cache(&overlay_cache)?
+			.map(|overlay| base.sanitize_shared_catalog_overlay(overlay))
+			.transpose()?;
+		if let Some(overlay) = cached.as_ref() {
+			overlays.replace(OverlaySource::DiskCache, overlay.clone());
+		}
+		Ok(Self {
 			gate: DiscoveryPollGate::default(),
 			cache,
 			overlays,
+			base,
+			overlay_cache,
+			http,
 			disabled: disabled.into_iter().collect(),
+			disk_endpoint: SyncMutex::new(None),
+			shared_cache: SyncMutex::new(cached.clone()),
+			route_refreshes: SyncMutex::new(BTreeSet::new()),
+			live: Mutex::new(LiveDiscoveryState { providers: BTreeMap::new(), shared: None }),
+			shared: Mutex::new(SharedCatalogState::from_cache(cached)),
 			extension: Mutex::new(ExtensionDiscoveryState::default()),
-		}
+		})
 	}
 
 	/// Reports picker/call eligibility. Explicit disable is the only discovery
@@ -202,6 +495,395 @@ impl DiscoveryRuntime {
 	/// remains selectable.
 	pub fn provider_selectable(&self, provider: &omp_catalog::ProviderId<str>) -> bool {
 		!self.disabled.contains(provider)
+	}
+
+	/// Returns the HTTP client shared with native endpoint discovery probes.
+	pub fn http_client(&self) -> Arc<dyn DiscoveryHttpClient> {
+		self.http.clone()
+	}
+
+	/// Returns the current shared-catalog source and revalidation state without
+	/// scheduling network work.
+	pub async fn shared_catalog_status(&self) -> SharedCatalogRefreshOutcome {
+		self.shared.lock().await.outcome
+	}
+
+	/// Materializes the latest immutable overlay generation over the exact base
+	/// catalog retained by this daemon authority.
+	pub fn catalog(&self) -> Result<Arc<snapshot::Catalog>, DiscoveryRuntimeError> {
+		self
+			.base
+			.with_overlay_stack(&self.overlays.load(), UnsafeTrustScope::ALL)
+			.map(Arc::new)
+			.map_err(DiscoveryRuntimeError::Catalog)
+	}
+
+	/// Starts one detached startup refresh. The transport owns its hard
+	/// deadline, while this subscriber may stop waiting independently.
+	pub fn spawn_shared_catalog_refresh(
+		self: &Arc<Self>,
+		cancellation: CancellationToken,
+	) -> JoinHandle<Result<SharedCatalogRefreshOutcome, DiscoveryRuntimeError>> {
+		let runtime = Arc::clone(self);
+		tokio::spawn(async move {
+			runtime
+				.refresh_shared_catalog(SHARED_CATALOG_BACKGROUND_SUBSCRIBER_DEADLINE, cancellation)
+				.await
+		})
+	}
+
+	/// Conditionally refreshes the shared models.dev-style catalog.
+	///
+	/// Concurrent subscribers join one transport request. A subscriber timeout
+	/// or cancellation never aborts that shared transport; the transport's own
+	/// hard deadline remains authoritative.
+	pub async fn refresh_shared_catalog(
+		self: &Arc<Self>,
+		subscriber_deadline: Duration,
+		cancellation: CancellationToken,
+	) -> Result<SharedCatalogRefreshOutcome, DiscoveryRuntimeError> {
+		let now = Instant::now();
+		let receiver = {
+			let mut state = self.shared.lock().await;
+			if let Some(receiver) = state.inflight.as_ref() {
+				receiver.clone()
+			} else {
+				let interval = if state.outcome.stale {
+					SHARED_CATALOG_RETRY_INTERVAL
+				} else {
+					SHARED_CATALOG_REFRESH_INTERVAL
+				};
+				if state
+					.last_attempt
+					.is_some_and(|last| now.saturating_duration_since(last) < interval)
+				{
+					return Ok(state.outcome);
+				}
+				let (sender, receiver) = watch::channel(None);
+				state.last_attempt = Some(now);
+				state.inflight = Some(receiver.clone());
+				let runtime = Arc::clone(self);
+				let _task = tokio::spawn(async move {
+					let result = Arc::clone(&runtime)
+						.perform_shared_catalog_refresh(unix_time_ms())
+						.await;
+					runtime.shared.lock().await.inflight = None;
+					let _ = sender.send(Some(result));
+				});
+				receiver
+			}
+		};
+		wait_for_shared_catalog(receiver, subscriber_deadline, cancellation).await
+	}
+
+	/// Runs one inference-routed pass across the registry's discoverable routes,
+	/// deduplicating route work through the daemon gate and publishing complete
+	/// provider slices only when every route for that provider succeeds.
+	pub async fn refresh_registry_discovery(
+		&self,
+		registry: &Registry,
+		subscriber_deadline: Duration,
+		cancellation: CancellationToken,
+	) -> Result<RegistryDiscoveryRefreshOutcome, DiscoveryRuntimeError> {
+		let catalog = registry.catalog();
+		let mut providers = BTreeMap::<ProviderId, Vec<_>>::new();
+		for route in catalog
+			.routes()
+			.iter()
+			.filter(|route| route.discovery.is_some())
+		{
+			let spec_id = route.discovery.clone().expect("filtered discovery route");
+			let Some(spec) = catalog.discovery_spec(&spec_id) else {
+				continue;
+			};
+			providers.entry(route.provider.clone()).or_default().push((
+				route.id.clone(),
+				spec_id,
+				spec.clone(),
+			));
+		}
+		let now = Instant::now();
+		let now_ms = unix_time_ms();
+		let mut outcome = RegistryDiscoveryRefreshOutcome::default();
+		for (provider, routes) in providers {
+			if self.disabled.contains(&provider) {
+				outcome.skipped = outcome.skipped.saturating_add(routes.len());
+				continue;
+			}
+			let mut builder = CatalogOverlayBuilder::new(ProvenanceSource {
+				kind:           ProvenanceKind::Discovered,
+				origin:         sf!("registry-discovery:{}", provider),
+				revision:       None,
+				confidence:     EvidenceConfidence::Verified,
+				observed_at_ms: Some(now_ms),
+			});
+			let mut rows = Vec::new();
+			let mut provider_failed = false;
+			for (route, spec_id, spec) in routes {
+				let key = DiscoveryPollKey {
+					provider: provider.clone(),
+					route:    route.clone(),
+					spec:     spec_id,
+				};
+				if spec.polling_interval().is_some()
+					&& !self.gate.claim_interval(key.clone(), &spec, now)
+				{
+					outcome.skipped = outcome.skipped.saturating_add(1);
+					continue;
+				}
+				if !self.route_refreshes.lock().insert(key.clone()) {
+					outcome.skipped = outcome.skipped.saturating_add(1);
+					continue;
+				}
+				self.cache.set_lifecycle(&ProviderLifecycle {
+					provider:       provider.clone(),
+					state:          ProviderDiscoveryState::Probing,
+					error_code:     None,
+					observed_at_ms: now_ms,
+					retry_at_ms:    None,
+				})?;
+				let planner = router::Router::new(registry.clone(), subscriber_deadline);
+				let meta = CallMeta {
+					id:             RequestId::from(format!(
+						"runtime-model-refresh-{}-{}",
+						provider.as_str(),
+						route.as_str()
+					)),
+					target:         Target::ProviderService(provider.clone()),
+					deadline:       None,
+					budget:         ExecutionBudget::default(),
+					session:        None,
+					response_hooks: Default::default(),
+				};
+				let mut cursor = None;
+				let mut route_failed = false;
+				loop {
+					let mut client = Client::new(registry.service(), planner.clone(), meta.clone());
+					let request = client
+						.execute(DiscoveryRequest {
+							provider:  Some(provider.clone()),
+							route:     Some(route.clone()),
+							cursor:    cursor.clone(),
+							page_size: 500,
+							operation: None,
+						});
+					let page = tokio::select! {
+						_ = cancellation.cancelled() => None,
+						result = time::timeout(subscriber_deadline, request) => {
+							result.ok().and_then(Result::ok)
+						},
+					};
+					let Some(page) = page else {
+						route_failed = true;
+						break;
+					};
+					for model in page.models {
+						if let Some(row) = registry_discovered_model(&model, &provider, &route, now_ms) {
+							rows.push(row);
+						}
+						builder = builder.with_model(ModelOverlay {
+							selector: omp_catalog::ExactSelector::new(provider.clone(), model.key.clone()),
+							added:    Some(model),
+							patch:    ModelPatch::default(),
+						});
+					}
+					cursor = page.next_cursor;
+					if cursor.is_none() {
+						break;
+					}
+				}
+				self.route_refreshes.lock().remove(&key);
+				if route_failed {
+					self.gate.release(&key);
+					provider_failed = true;
+					outcome.failures = outcome.failures.saturating_add(1);
+					self.cache.set_lifecycle(&ProviderLifecycle {
+						provider:       provider.clone(),
+						state:          ProviderDiscoveryState::Failed,
+						error_code:     Some(Str::new_static("inference-discovery")),
+						observed_at_ms: now_ms,
+						retry_at_ms:    Some(now_ms.saturating_add(5_000)),
+					})?;
+				}
+			}
+			if provider_failed || rows.is_empty() {
+				continue;
+			}
+			self.cache.publish(
+				&DiscoveryCacheKey::provider(provider.clone()),
+				&rows,
+				now_ms,
+				Duration::from_secs(24 * 60 * 60),
+			)?;
+			self
+				.live
+				.lock()
+				.await
+				.providers
+				.insert(provider.clone(), builder.build());
+			self.cache.set_lifecycle(&ProviderLifecycle {
+				provider,
+				state: ProviderDiscoveryState::Ready,
+				error_code: None,
+				observed_at_ms: now_ms,
+				retry_at_ms: None,
+			})?;
+			outcome.models = outcome.models.saturating_add(rows.len());
+		}
+		self.publish_live_discovery(now_ms).await;
+		Ok(outcome)
+	}
+
+	async fn perform_shared_catalog_refresh(self: Arc<Self>, now_ms: u64) -> SharedCatalogResult {
+		let etag = self.shared.lock().await.etag.clone();
+		let response = match self
+			.http
+			.fetch_shared_catalog(etag.as_deref(), CancellationToken::new())
+			.await
+		{
+			Ok(response) => response,
+			Err(error) => {
+				let kind = match error {
+					SharedCatalogFetchError::Cancelled => SharedCatalogFailureKind::Cancelled,
+					SharedCatalogFetchError::Timeout => SharedCatalogFailureKind::Timeout,
+					SharedCatalogFetchError::Transport(_) => SharedCatalogFailureKind::Transport,
+					SharedCatalogFetchError::Status { .. } => SharedCatalogFailureKind::Status,
+				};
+				return Ok(self.record_shared_catalog_failure(kind, now_ms).await);
+			},
+		};
+		if matches!(&response, SharedCatalogHttpResponse::NotModified) {
+			let mut state = self.shared.lock().await;
+			state.outcome = SharedCatalogRefreshOutcome {
+				source:                 SharedCatalogSource::Remote,
+				stale:                  false,
+				models:                 state
+					.cache_overlay
+					.as_ref()
+					.map_or(0, CatalogOverlay::model_count),
+				updated_at_ms:          Some(now_ms),
+				revalidation_failed_ms: None,
+				revalidation_failure:   None,
+			};
+			return Ok(state.outcome);
+		}
+		let SharedCatalogHttpResponse::Payload { body, etag } = response else {
+			unreachable!("not-modified handled above")
+		};
+		let base = Arc::clone(&self.base);
+		let overlay = match tokio::task::spawn_blocking(move || {
+			base.additive_shared_catalog_overlay(&body, now_ms)
+		})
+		.await
+		{
+			Ok(Ok(overlay)) => overlay,
+			Ok(Err(_error)) => {
+				return Ok(self
+					.record_shared_catalog_failure(SharedCatalogFailureKind::Compile, now_ms)
+					.await);
+			},
+			Err(source) => {
+				return Err(Arc::new(SharedCatalogRefreshError::Worker(source)));
+			},
+		};
+		let cache_path = self.overlay_cache.clone();
+		let cached = overlay.clone();
+		match tokio::task::spawn_blocking(move || {
+			snapshot::write_discovery_overlay_cache(&cache_path, &cached)
+		})
+		.await
+		{
+			Ok(Ok(())) => {},
+			Ok(Err(source)) => {
+				return Err(Arc::new(SharedCatalogRefreshError::Cache(source)));
+			},
+			Err(source) => {
+				return Err(Arc::new(SharedCatalogRefreshError::Worker(source)));
+			},
+		}
+		*self.shared_cache.lock() = Some(overlay.clone());
+		self.publish_disk_cache(now_ms);
+		{
+			let mut live = self.live.lock().await;
+			live.shared = Some(overlay.clone());
+		}
+		self.publish_live_discovery(now_ms).await;
+		let mut state = self.shared.lock().await;
+		state.etag = etag;
+		state.cache_overlay = Some(overlay.clone());
+		state.outcome = SharedCatalogRefreshOutcome {
+			source:                 SharedCatalogSource::Remote,
+			stale:                  false,
+			models:                 overlay.model_count(),
+			updated_at_ms:          Some(now_ms),
+			revalidation_failed_ms: None,
+			revalidation_failure:   None,
+		};
+		Ok(state.outcome)
+	}
+
+	async fn record_shared_catalog_failure(
+		&self,
+		kind: SharedCatalogFailureKind,
+		now_ms: u64,
+	) -> SharedCatalogRefreshOutcome {
+		let mut state = self.shared.lock().await;
+		let models = state
+			.cache_overlay
+			.as_ref()
+			.map_or(0, CatalogOverlay::model_count);
+		state.outcome = SharedCatalogRefreshOutcome {
+			source: if models == 0 {
+				SharedCatalogSource::Bundled
+			} else {
+				SharedCatalogSource::DiskCache
+			},
+			stale: true,
+			models,
+			updated_at_ms: if models == 0 {
+				None
+			} else {
+				state.outcome.updated_at_ms
+			},
+			revalidation_failed_ms: Some(now_ms),
+			revalidation_failure: Some(kind),
+		};
+		state.outcome
+	}
+
+	fn publish_disk_cache(&self, now_ms: u64) {
+		let shared = self.shared_cache.lock().clone();
+		let endpoint = self.disk_endpoint.lock().clone();
+		let overlay = CatalogOverlay::combined(
+			ProvenanceSource {
+				kind:           ProvenanceKind::Discovered,
+				origin:         Str::new_static("discovery:disk-cache"),
+				revision:       None,
+				confidence:     EvidenceConfidence::Verified,
+				observed_at_ms: Some(now_ms),
+			},
+			shared.into_iter().chain(endpoint),
+		);
+		self.overlays.replace(OverlaySource::DiskCache, overlay);
+	}
+
+	async fn publish_live_discovery(&self, now_ms: u64) {
+		let state = self.live.lock().await;
+		let overlay = CatalogOverlay::combined(
+			ProvenanceSource {
+				kind:           ProvenanceKind::Discovered,
+				origin:         Str::new_static("discovery:runtime"),
+				revision:       None,
+				confidence:     EvidenceConfidence::Verified,
+				observed_at_ms: Some(now_ms),
+			},
+			state
+				.shared
+				.clone()
+				.into_iter()
+				.chain(state.providers.values().cloned()),
+		);
+		self.overlays.replace(OverlaySource::Discovery, overlay);
 	}
 
 	/// Hydrates exact provider/account cache namespaces without network access.
@@ -253,9 +935,8 @@ impl DiscoveryRuntime {
 				);
 			}
 		}
-		self
-			.overlays
-			.replace(OverlaySource::DiskCache, builder.build());
+		*self.disk_endpoint.lock() = Some(builder.build());
+		self.publish_disk_cache(now_ms);
 		Ok(hydrated)
 	}
 
@@ -432,10 +1113,77 @@ impl DiscoveryRuntime {
 		}
 		self.cache.publish(cache_key, &rows, now_ms, ttl)?;
 		self
-			.overlays
-			.replace(OverlaySource::Discovery, builder.build());
+			.live
+			.lock()
+			.await
+			.providers
+			.insert(key.provider, builder.build());
+		self.publish_live_discovery(now_ms).await;
 		Ok(RefreshOutcome::Published { models: rows.len() })
 	}
+}
+
+async fn wait_for_shared_catalog(
+	mut receiver: watch::Receiver<Option<SharedCatalogResult>>,
+	deadline: Duration,
+	cancellation: CancellationToken,
+) -> Result<SharedCatalogRefreshOutcome, DiscoveryRuntimeError> {
+	let wait = async {
+		loop {
+			if let Some(result) = receiver.borrow().clone() {
+				return result.map_err(DiscoveryRuntimeError::SharedCatalog);
+			}
+			receiver
+				.changed()
+				.await
+				.map_err(|_| DiscoveryRuntimeError::SharedCatalogCoordination)?;
+		}
+	};
+	tokio::select! {
+		_ = cancellation.cancelled() => Err(DiscoveryRuntimeError::SubscriberCancelled),
+		result = time::timeout(deadline, wait) => {
+			result.map_err(|_| DiscoveryRuntimeError::SubscriberDeadline)?
+		},
+	}
+}
+
+fn unix_time_ms() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
+}
+
+fn registry_discovered_model(
+	model: &ModelSpec,
+	provider: &ProviderId<str>,
+	route: &omp_catalog::RouteId<str>,
+	now_ms: u64,
+) -> Option<DiscoveredModel> {
+	let wire_model = model
+		.wire_ids
+		.iter()
+		.find_map(|(candidate, wire)| (candidate == route).then(|| wire.clone()))?;
+	Some(DiscoveredModel {
+		provider: provider.to_owned(),
+		route: route.to_owned(),
+		wire_model,
+		aliases: Box::new([]),
+		display_name: Some(model.display_name.clone()),
+		declared_class: Some(model.class.clone()),
+		declared_operations: OperationBits::empty(),
+		declared_capabilities: Some(model.capabilities.clone()),
+		declared_limits: Some(model.limits),
+		declared_pricing: Box::new([]),
+		extended_context_mode: None,
+		availability: Some(model.availability),
+		source: Str::new_static("runtime-inference-discovery"),
+		observed_at_ms: Some(now_ms),
+		updated_at_ms: model.provenance.updated_at_ms,
+		deprecated: Some(model.provenance.deprecated),
+	})
 }
 
 /// One exact local-only cache hydration request.
@@ -509,6 +1257,7 @@ fn discovered_hook_model(
 		declared_operations:   operations,
 		declared_capabilities: None,
 		declared_limits:       Some(limits),
+		declared_pricing:      Box::new([]),
 		extended_context_mode: None,
 		availability:          object
 			.get("availability")
@@ -569,6 +1318,28 @@ pub enum DiscoveryRuntimeError {
 	/// SQLite publication failed.
 	#[error(transparent)]
 	Store(#[from] DiscoveryStoreError),
+	/// Persisted shared-catalog overlay loading failed.
+	#[error(transparent)]
+	OverlayCache(#[from] snapshot::OverlayCacheError),
+	/// Persisted shared-catalog rows failed current additive admission.
+	#[error(transparent)]
+	SharedCatalogAdmission(#[from] snapshot::SharedCatalogError),
+	/// Current overlays could not materialize into an immutable catalog.
+	#[error("runtime catalog materialization failed")]
+	Catalog(#[source] snapshot::SnapshotError),
+	/// Shared-catalog compilation or persistence failed.
+	#[error("shared catalog refresh failed")]
+	SharedCatalog(#[source] Arc<SharedCatalogRefreshError>),
+	/// The shared refresh task ended without publishing a result.
+	#[error("shared catalog refresh coordination ended unexpectedly")]
+	SharedCatalogCoordination,
+	/// This subscriber stopped waiting without cancelling the shared transport.
+	#[error("shared catalog subscriber was cancelled")]
+	SubscriberCancelled,
+	/// This subscriber's deadline elapsed without cancelling the shared
+	/// transport.
+	#[error("shared catalog subscriber deadline elapsed")]
+	SubscriberDeadline,
 }
 
 /// Server-side bridge from the gateway protocol to the one authoritative
@@ -1419,7 +2190,7 @@ mod tests {
 		future::Future,
 		iter,
 		pin::Pin,
-		sync::atomic::{AtomicBool, Ordering},
+		sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 	};
 
 	use omp_catalog::{
@@ -1429,8 +2200,10 @@ mod tests {
 	use omp_inference::{
 		ModelsDiscoverHookPage, ProviderHookError, ProviderHookObserver, ProviderResponseObservation,
 		ProviderResponseObserver,
+		discovery::{DiscoveryEndpoint, DiscoveryEndpointKind, EndpointOrigin},
 	};
 	use serde_json::json;
+	use tokio::{io::AsyncWriteExt as _, sync::Notify};
 
 	use super::*;
 
@@ -1445,6 +2218,7 @@ mod tests {
 			declared_operations:   OperationBits::empty(),
 			declared_capabilities: None,
 			declared_limits:       None,
+			declared_pricing:      Box::new([]),
 			extended_context_mode: None,
 			availability:          Some(ModelAvailability::Available),
 			source:                Str::new_static("fixture"),
@@ -1464,8 +2238,59 @@ mod tests {
 		})
 	}
 
+	fn shared_cache_overlay(
+		base: &snapshot::Catalog,
+		observed_at_ms: u64,
+		addition: bool,
+	) -> (CatalogOverlay, omp_catalog::ModelKey) {
+		let bundled = base
+			.models()
+			.iter()
+			.find(|model| !model.routes.is_empty())
+			.expect("bundled model")
+			.clone();
+		let provider = base
+			.route(&bundled.routes[0])
+			.expect("bundled route")
+			.provider
+			.clone();
+		let mut model = bundled.clone();
+		if addition {
+			model.key =
+				omp_catalog::ModelKey::from(format!("{}/runtime-cache-fixture", provider.as_str()));
+		}
+		let key = model.key.clone();
+		let source = ProvenanceSource {
+			kind:           ProvenanceKind::Discovered,
+			origin:         Str::new_static("models.dev"),
+			revision:       None,
+			confidence:     EvidenceConfidence::Declared,
+			observed_at_ms: Some(observed_at_ms),
+		};
+		let overlay = CatalogOverlayBuilder::new(source)
+			.with_model(ModelOverlay {
+				selector: omp_catalog::ExactSelector::new(provider, model.key.clone()),
+				added:    Some(model),
+				patch:    ModelPatch::default(),
+			})
+			.build();
+		(overlay, key)
+	}
+
 	struct StubExthost {
 		fail: AtomicBool,
+	}
+
+	struct FailingDiscoveryClient;
+
+	impl DiscoveryHttpClient for FailingDiscoveryClient {
+		fn request(
+			&self,
+			_request: ProbeHttpRequest,
+			_cancellation: CancellationToken,
+		) -> ProbeHttpFuture {
+			Box::pin(async { Err(ProbeError::Transport) })
+		}
 	}
 
 	impl ProviderHookObserver for StubExthost {
@@ -1514,7 +2339,10 @@ mod tests {
 			Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
 			Arc::clone(&overlays),
 			iter::empty::<ProviderId>(),
-		);
+			Arc::new(snapshot::Catalog::embedded().clone()),
+			directory.path().join("catalog-discovery.json"),
+		)
+		.expect("runtime");
 		let exthost = Arc::new(StubExthost { fail: AtomicBool::new(false) });
 		let hooks = ProviderResponseHooks::new(exthost.clone());
 		let request = ModelsDiscoverHookRequest {
@@ -1557,10 +2385,221 @@ mod tests {
 			Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
 			Arc::new(OverlayStore::default()),
 			[disabled.clone()],
-		);
+			Arc::new(snapshot::Catalog::embedded().clone()),
+			directory.path().join("catalog-discovery.json"),
+		)
+		.expect("runtime");
 		assert!(!runtime.provider_selectable(&disabled));
 		assert!(runtime.provider_selectable(ProviderId::from_ref("offline")));
 	}
+
+	#[tokio::test]
+	async fn offline_shared_catalog_cache_is_served_and_static_only_cache_is_bundled() {
+		let directory = tempfile::tempdir().expect("directory");
+		let base = Arc::new(snapshot::Catalog::embedded().clone());
+		let cache_path = directory.path().join("catalog-discovery.json");
+		let (overlay, added_key) = shared_cache_overlay(&base, 100, true);
+		snapshot::write_discovery_overlay_cache(&cache_path, &overlay).expect("write cache");
+		let runtime = DiscoveryRuntime::new(
+			Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
+			Arc::new(OverlayStore::default()),
+			iter::empty::<ProviderId>(),
+			Arc::clone(&base),
+			cache_path.clone(),
+		)
+		.expect("runtime");
+		assert_eq!(runtime.shared_catalog_status().await, SharedCatalogRefreshOutcome {
+			source:                 SharedCatalogSource::DiskCache,
+			stale:                  true,
+			models:                 1,
+			updated_at_ms:          Some(100),
+			revalidation_failed_ms: None,
+			revalidation_failure:   None,
+		});
+		assert!(
+			runtime
+				.catalog()
+				.expect("catalog")
+				.model(&added_key)
+				.is_some()
+		);
+
+		let (static_only, _) = shared_cache_overlay(&base, 101, false);
+		snapshot::write_discovery_overlay_cache(&cache_path, &static_only)
+			.expect("write static-only cache");
+		let static_runtime = DiscoveryRuntime::new(
+			Arc::new(DiscoveryStore::open(&directory.path().join("static-models.db")).expect("store")),
+			Arc::new(OverlayStore::default()),
+			iter::empty::<ProviderId>(),
+			base,
+			cache_path,
+		)
+		.expect("static runtime");
+		let status = static_runtime.shared_catalog_status().await;
+		assert_eq!(status.source, SharedCatalogSource::Bundled);
+		assert!(status.stale);
+		assert_eq!(status.models, 0);
+		assert_eq!(status.updated_at_ms, None);
+	}
+
+	#[tokio::test]
+	async fn failed_revalidation_preserves_prior_good_shared_catalog_state() {
+		let directory = tempfile::tempdir().expect("directory");
+		let base = Arc::new(snapshot::Catalog::embedded().clone());
+		let cache_path = directory.path().join("catalog-discovery.json");
+		let (overlay, added_key) = shared_cache_overlay(&base, 100, true);
+		snapshot::write_discovery_overlay_cache(&cache_path, &overlay).expect("write cache");
+		let runtime = Arc::new(
+			DiscoveryRuntime::with_http_client(
+				Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
+				Arc::new(OverlayStore::default()),
+				iter::empty::<ProviderId>(),
+				base,
+				cache_path,
+				Arc::new(RuntimeDiscoveryHttpClient::with_shared_catalog_url(
+					"http://127.0.0.1:1/models.json.zstd",
+				)),
+			)
+			.expect("runtime"),
+		);
+		let status = runtime
+			.refresh_shared_catalog(Duration::from_secs(1), CancellationToken::new())
+			.await
+			.expect("fallback status");
+		assert_eq!(status.source, SharedCatalogSource::DiskCache);
+		assert!(status.stale);
+		assert_eq!(status.updated_at_ms, Some(100));
+		assert!(status.revalidation_failure.is_some());
+		assert!(
+			runtime
+				.catalog()
+				.expect("catalog")
+				.model(&added_key)
+				.is_some()
+		);
+	}
+
+	#[tokio::test]
+	async fn subscriber_deadlines_do_not_abort_joined_shared_catalog_transport() {
+		let directory = tempfile::tempdir().expect("directory");
+		let base = Arc::new(snapshot::Catalog::embedded().clone());
+		let cache_path = directory.path().join("catalog-discovery.json");
+		let (overlay, _) = shared_cache_overlay(&base, 100, true);
+		snapshot::write_discovery_overlay_cache(&cache_path, &overlay).expect("write cache");
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+			.await
+			.expect("listener");
+		let url =
+			format!("http://{}/models.json.zstd", listener.local_addr().expect("listener address"));
+		let accepted = Arc::new(AtomicUsize::new(0));
+		let release = Arc::new(Notify::new());
+		let server_accepted = Arc::clone(&accepted);
+		let server_release = Arc::clone(&release);
+		let server = tokio::spawn(async move {
+			let (mut stream, _) = listener.accept().await.expect("accept");
+			server_accepted.fetch_add(1, Ordering::SeqCst);
+			server_release.notified().await;
+			stream
+				.write_all(
+					b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+				)
+				.await
+				.expect("response");
+		});
+		let runtime = Arc::new(
+			DiscoveryRuntime::with_http_client(
+				Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
+				Arc::new(OverlayStore::default()),
+				iter::empty::<ProviderId>(),
+				base,
+				cache_path,
+				Arc::new(RuntimeDiscoveryHttpClient::with_shared_catalog_url(url)),
+			)
+			.expect("runtime"),
+		);
+		let short_runtime = Arc::clone(&runtime);
+		let short = tokio::spawn(async move {
+			short_runtime
+				.refresh_shared_catalog(Duration::from_millis(25), CancellationToken::new())
+				.await
+		});
+		time::sleep(Duration::from_millis(5)).await;
+		let long_runtime = Arc::clone(&runtime);
+		let long = tokio::spawn(async move {
+			long_runtime
+				.refresh_shared_catalog(Duration::from_secs(1), CancellationToken::new())
+				.await
+		});
+		assert!(matches!(
+			short.await.expect("short task"),
+			Err(DiscoveryRuntimeError::SubscriberDeadline)
+		));
+		assert_eq!(accepted.load(Ordering::SeqCst), 1);
+		release.notify_one();
+		let outcome = long.await.expect("long task").expect("long subscriber");
+		assert_eq!(outcome.source, SharedCatalogSource::Remote);
+		assert!(!outcome.stale);
+		server.await.expect("server");
+		assert_eq!(accepted.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test]
+	async fn static_catalog_fallback_survives_dynamic_refresh_failure() {
+		let directory = tempfile::tempdir().expect("directory");
+		let base = Arc::new(snapshot::Catalog::embedded().clone());
+		let static_model = base.models().first().expect("bundled model").clone();
+		let route = base
+			.route(static_model.routes.first().expect("bundled model route"))
+			.expect("bundled route")
+			.clone();
+		let mut spec = base
+			.discovery_specs()
+			.first()
+			.expect("discovery spec")
+			.clone();
+		spec.interval = Some(Duration::from_secs(5));
+		let cache =
+			Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store"));
+		let runtime = DiscoveryRuntime::new(
+			cache,
+			Arc::new(OverlayStore::default()),
+			iter::empty::<ProviderId>(),
+			Arc::clone(&base),
+			directory.path().join("catalog-discovery.json"),
+		)
+		.expect("runtime");
+		let probe = DiscoveryProbe {
+			provider: route.provider.clone(),
+			route:    route.id.clone(),
+			endpoint: DiscoveryEndpoint {
+				kind:     DiscoveryEndpointKind::OpenAi,
+				base_url: Str::new_static("http://127.0.0.1:1"),
+				origin:   EndpointOrigin::Configured,
+			},
+		};
+		let error = runtime
+			.refresh(
+				DiscoveryPollKey {
+					provider: route.provider.clone(),
+					route:    route.id.clone(),
+					spec:     spec.id.clone(),
+				},
+				&DiscoveryCacheKey::provider(route.provider),
+				&spec,
+				&probe,
+				&normalizer(),
+				&FailingDiscoveryClient,
+				Instant::now(),
+				200,
+				Duration::from_secs(60),
+				CancellationToken::new(),
+			)
+			.await
+			.expect_err("dynamic refresh fails");
+		assert!(matches!(error, DiscoveryRuntimeError::Probe(ProbeError::Transport)));
+		assert_eq!(runtime.catalog().expect("catalog").model(&static_model.key), Some(&static_model));
+	}
+
 	#[test]
 	fn credential_cache_hydration_repeats_after_affinity_changes() {
 		let directory = tempfile::tempdir().expect("directory");
@@ -1571,7 +2610,10 @@ mod tests {
 			Arc::clone(&cache),
 			Arc::clone(&overlays),
 			iter::empty::<ProviderId>(),
-		);
+			Arc::new(snapshot::Catalog::embedded().clone()),
+			directory.path().join("catalog-discovery.json"),
+		)
+		.expect("runtime");
 		let provider = ProviderId::from("opencode-go");
 		let first = DiscoveryCacheKey::credential(provider.clone(), "affinity-first");
 		let second = DiscoveryCacheKey::credential(provider.clone(), "affinity-second");

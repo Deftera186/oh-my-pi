@@ -48,12 +48,16 @@ hardening, and defense-in-depth-only observations. An empty finding list is vali
 pub(crate) fn checkpoint_active_reminder() -> Item {
 	Item {
 		kind: Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part {
+			role:            thread::Role::User as i32,
+			parts:           vec![thread::Part {
 				kind: Some(omp_proto::thread::v1::part::Kind::Text(
 					CHECKPOINT_ACTIVE_NOTICE.to_owned(),
 				)),
 			}],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		..Default::default()
 	}
@@ -2053,8 +2057,14 @@ fn system_text(text: String) -> Item {
 		seq:           0,
 		created_at_ms: 0,
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::System as i32,
-			parts: vec![thread::Part { kind: Some(omp_proto::thread::v1::part::Kind::Text(text)) }],
+			role:            thread::Role::System as i32,
+			parts:           vec![thread::Part {
+				kind: Some(omp_proto::thread::v1::part::Kind::Text(text)),
+			}],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}

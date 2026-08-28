@@ -1136,6 +1136,7 @@ impl Decoder for GitLabDiscoveryDecoder {
 				),
 				declared_capabilities: None,
 				declared_limits:       None,
+				declared_pricing:      Box::new([]),
 				extended_context_mode: None,
 				availability:          Some(omp_catalog::ModelAvailability::Available),
 				source:                sf!("gitlab.ai-chat-available-models"),

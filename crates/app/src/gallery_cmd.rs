@@ -183,12 +183,7 @@ fn fixture_chat<'a>(
 		.into_diagnostic()?;
 	let mut chat = Chat::new(context);
 	chat.set_reduced_motion(true);
-	let revision = if fixture.identity.rev.family.is_empty() {
-		fixture.identity.rev.n.to_string()
-	} else {
-		format!("{}.{}", fixture.identity.rev.family, fixture.identity.rev.n)
-	};
-	chat.tool_started("gallery", fixture.identity.name.as_str(), &revision, fixture.title);
+	chat.tool_started("gallery", fixture.identity.name.as_str());
 	match state {
 		GalleryState::Streaming | GalleryState::Progress => {
 			chat.tool_view("gallery", ToolViewContent::Markup(view))

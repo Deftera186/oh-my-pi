@@ -474,8 +474,12 @@ pub fn demote_interrupted_reasoning(
 		seq:           0,
 		created_at_ms: 0,
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  thread::Role::User as i32,
-			parts: vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
+			role:            thread::Role::User as i32,
+			parts:           vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         Some(inference::ValueMap {
 			fields: BTreeMap::from([("omp/hidden-continuity".to_owned(), inference::Value {
@@ -835,8 +839,12 @@ fn synthetic_item(text: Str, role: thread::Role) -> Item {
 		seq:           0,
 		created_at_ms: 0,
 		kind:          Some(item::Kind::Message(thread::Message {
-			role:  role as i32,
-			parts: vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
+			role:            role as i32,
+			parts:           vec![thread::Part { kind: Some(part::Kind::Text(text.into())) }],
+			synthetic:       None,
+			user_initiated:  None,
+			completed_at_ms: None,
+			usage:           None,
 		})),
 		props:         None,
 	}
@@ -907,7 +915,7 @@ mod tests {
 				seq:           1,
 				created_at_ms: 1,
 				kind:          Some(item::Kind::Message(thread::Message {
-					role:  thread::Role::Assistant as i32,
+					role: thread::Role::Assistant as i32,
 					parts: vec![
 						thread::Part {
 							kind: Some(part::Kind::Thinking(thread::Thinking {
@@ -918,6 +926,7 @@ mod tests {
 						},
 						thread::Part { kind: Some(part::Kind::Text("partial".to_owned())) },
 					],
+					..Default::default()
 				})),
 				props:         None,
 			}],
@@ -949,7 +958,7 @@ mod tests {
 		let mut thread = Thread {
 			items: vec![Item {
 				kind: Some(item::Kind::Message(thread::Message {
-					role:  i32::from(thread::Role::Assistant),
+					role: i32::from(thread::Role::Assistant),
 					parts: vec![
 						thread::Part {
 							kind: Some(part::Kind::Thinking(thread::Thinking {
@@ -960,6 +969,7 @@ mod tests {
 						},
 						thread::Part { kind: Some(part::Kind::Text("partial answer".to_owned())) },
 					],
+					..Default::default()
 				})),
 				..Item::default()
 			}],
@@ -1079,8 +1089,9 @@ mod tests {
 			seq:           8,
 			created_at_ms: 100,
 			kind:          Some(item::Kind::Message(thread::Message {
-				role:  thread::Role::Assistant as i32,
+				role: thread::Role::Assistant as i32,
 				parts: vec![thread::Part { kind: Some(part::Kind::Text("assistant text".to_owned())) }],
+				..Default::default()
 			})),
 			props:         None,
 		};

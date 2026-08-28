@@ -131,6 +131,23 @@ pub struct Payload {
 	/// Structured revisioned result used by enhanced views.
 	pub data:    Value,
 }
+/// One language-server failure retained during a workspace-symbol fanout.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceSymbolFailure {
+	/// Configured server name.
+	pub server:  Str,
+	/// Server or transport failure detail.
+	pub message: Str,
+}
+
+/// One completed language-server branch of a workspace-symbol fanout.
+#[derive(Clone, Debug)]
+pub struct WorkspaceSymbolOutcome {
+	/// Configured server name.
+	pub server: Str,
+	/// Successful JSON result or failure detail.
+	pub result: Result<Value, Str>,
+}
 
 /// LSP operations do not stream intermediate updates.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -155,12 +172,95 @@ pub enum Fault {
 	/// Server returned a protocol error.
 	#[error("language server request failed")]
 	Server,
+	/// Every server selected for a workspace-symbol search failed.
+	#[error("{message}")]
+	WorkspaceSymbols {
+		/// Stable per-server failures.
+		failures: Vec<WorkspaceSymbolFailure>,
+		/// Human-readable aggregate retaining every server name and detail.
+		message:  Str,
+	},
 	/// Transactional workspace edit was rejected or rolled back.
 	#[error("LSP workspace edit failed")]
 	WorkspaceEdit,
 	/// Caller cancelled the action.
 	#[error("LSP action was cancelled")]
 	Cancelled,
+}
+
+impl Fault {
+	/// Constructs an all-failed workspace-symbol error without discarding any
+	/// server's identifying detail.
+	pub fn workspace_symbols(failures: Vec<WorkspaceSymbolFailure>) -> Self {
+		let details = workspace_failure_lines(&failures);
+		Self::WorkspaceSymbols {
+			message: Str::from(format!(
+				"Workspace symbol search failed: all language servers failed\nServer failures:\n{}",
+				details.join("\n")
+			)),
+			failures,
+		}
+	}
+}
+
+/// Aggregates workspace-symbol fanout results while retaining partial failures.
+///
+/// An empty result is still a successful response from that server. Only a
+/// fanout in which every branch failed becomes [`Fault::WorkspaceSymbols`].
+pub fn aggregate_workspace_symbols(
+	query: &str,
+	outcomes: Vec<WorkspaceSymbolOutcome>,
+) -> Result<Payload, Fault> {
+	let mut servers = Vec::new();
+	let mut symbols = Vec::new();
+	let mut failures = Vec::new();
+	for outcome in outcomes {
+		match outcome.result {
+			Ok(Value::Array(mut result)) => {
+				servers.push(outcome.server);
+				symbols.append(&mut result);
+			},
+			Ok(Value::Null) => servers.push(outcome.server),
+			Ok(result) => {
+				servers.push(outcome.server);
+				symbols.push(result);
+			},
+			Err(message) => {
+				failures.push(WorkspaceSymbolFailure { server: outcome.server, message });
+			},
+		}
+	}
+	if servers.is_empty() {
+		return Err(Fault::workspace_symbols(failures));
+	}
+	let mut output = if symbols.is_empty() {
+		format!("No symbols matching \"{query}\"")
+	} else {
+		format!(
+			"Found {} symbol(s) matching \"{query}\":\n{}",
+			symbols.len(),
+			render::structured(&Value::Array(symbols.clone()), 200)
+		)
+	};
+	if !failures.is_empty() {
+		output.push_str("\nServer failures:\n");
+		output.push_str(&workspace_failure_lines(&failures).join("\n"));
+	}
+	Ok(Payload {
+		action: Action::Symbols,
+		servers,
+		output: Str::from(output),
+		data: Value::Array(symbols),
+	})
+}
+
+fn workspace_failure_lines(failures: &[WorkspaceSymbolFailure]) -> Vec<String> {
+	failures
+		.iter()
+		.map(|failure| {
+			format!("  {}: {}", failure.server, failure.message.as_str().replace('\t', "    "))
+		})
+		.collect()
 }
 
 /// Application-owned bridge to the project Environment's document authority.
@@ -292,6 +392,50 @@ fn valid(params: &Params) -> bool {
 		},
 		Action::RenameFile => params.file.is_some() && params.query.is_some(),
 		_ => params.file.is_some() && params.line.is_some(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn workspace_symbols_keep_results_and_server_failures() {
+		let payload = aggregate_workspace_symbols("Target", vec![
+			WorkspaceSymbolOutcome {
+				server: Str::new_static("broken"),
+				result: Err(Str::new_static("server exited with code 7")),
+			},
+			WorkspaceSymbolOutcome {
+				server: Str::new_static("healthy"),
+				result: Ok(serde_json::json!([{"name": "TargetSymbol"}])),
+			},
+		])
+		.expect("one server responded");
+		assert_eq!(payload.servers, [Str::new_static("healthy")]);
+		assert_eq!(payload.data, serde_json::json!([{"name": "TargetSymbol"}]));
+		assert!(payload.output.contains("TargetSymbol"));
+		assert!(payload.output.contains("Server failures:"));
+		assert!(payload.output.contains("broken: server exited with code 7"));
+	}
+
+	#[test]
+	fn workspace_symbols_name_every_failure_when_all_servers_fail() {
+		let error = aggregate_workspace_symbols("Target", vec![
+			WorkspaceSymbolOutcome {
+				server: Str::new_static("first"),
+				result: Err(Str::new_static("first server exited")),
+			},
+			WorkspaceSymbolOutcome {
+				server: Str::new_static("second"),
+				result: Err(Str::new_static("second server exited")),
+			},
+		])
+		.expect_err("all servers failed");
+		let message = error.to_string();
+		assert!(message.contains("all language servers failed"));
+		assert!(message.contains("first: first server exited"));
+		assert!(message.contains("second: second server exited"));
 	}
 }
 

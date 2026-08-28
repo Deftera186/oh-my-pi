@@ -86,7 +86,7 @@ use crate::{
 	components::{
 		Boxed, Button, Callout, Checkbox, Choice, Col, CustomElement, DiffKind, DiffStat, DiffView,
 		EditorPane, Fact, Field, Files, Form, Hr, Icon, Img, Input, JsonPreview, Latex, Markdown,
-		NumberLeaf, Pre, Progress, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
+		NumberLeaf, Pre, Progress, Qr, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
 		SelectOption, Spacer, Spinner, State, Status, Table, TableCell, TableRow, Tabs, TaskStatus,
 		TextLeaf, Time, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
@@ -519,10 +519,11 @@ impl Parser<'_> {
 		}
 		if matches!(
 			name,
-			"pre" | "latex" | "callout" | "diff" | "json" | "files" | "quote" | "choice"
+			"pre" | "latex" | "callout" | "diff" | "json" | "files" | "quote" | "choice" | "qr"
 		) {
 			let closer = match name {
 				"pre" => "</pre>",
+				"qr" => "</qr>",
 				"latex" => "</latex>",
 				"callout" => "</callout>",
 				"diff" => "</diff>",
@@ -1116,6 +1117,7 @@ fn is_catalog_tag(name: &str) -> bool {
 			| "fact"
 			| "quote"
 			| "choice"
+			| "qr"
 	)
 }
 
@@ -1308,6 +1310,7 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		"todo" => configured!(Todo::new()),
 		"form" => configured!(Form::new()),
 		"progress" => configured!(Progress::new()),
+		"qr" => configured!(Qr::new().text(body.clone())),
 		"img" => configured!(Img::new()),
 		"diff" => {
 			let mut diff = DiffView::new();

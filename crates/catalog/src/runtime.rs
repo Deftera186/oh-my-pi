@@ -48,6 +48,12 @@ struct CursorEffortRule {
 	family_marker: Str,
 	tiers:         Box<[Str]>,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CursorModelParameter {
+	model: Str,
+	id:    Str,
+	value: Str,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QuotaTier {
@@ -76,11 +82,12 @@ struct HostedDefault {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeBehavior {
-	openai_responses: OpenAiResponsesHeuristic,
-	model_operations: Box<[OperationRule]>,
-	cursor_effort:    CursorEffortRule,
-	quota_tiers:      Box<[QuotaRule]>,
-	hosted_defaults:  Box<[HostedDefault]>,
+	openai_responses:  OpenAiResponsesHeuristic,
+	model_operations:  Box<[OperationRule]>,
+	cursor_effort:     CursorEffortRule,
+	cursor_parameters: Box<[CursorModelParameter]>,
+	quota_tiers:       Box<[QuotaRule]>,
+	hosted_defaults:   Box<[HostedDefault]>,
 }
 
 impl RuntimeBehavior {
@@ -107,6 +114,7 @@ impl RuntimeBehavior {
 		let mut openai_responses = None;
 		let mut model_operations = Vec::new();
 		let mut cursor_effort = None;
+		let mut cursor_parameters = Vec::new();
 		let mut quota_tiers = Vec::new();
 		let mut hosted_defaults = Vec::new();
 		for node in children.nodes() {
@@ -124,6 +132,9 @@ impl RuntimeBehavior {
 					}
 					cursor_effort = Some(parse_cursor_effort(node)?);
 				},
+				"cursor-model-parameter" => {
+					cursor_parameters.push(parse_cursor_model_parameter(node)?);
+				},
 				"quota-tiers" => quota_tiers.push(parse_quota_tiers(node)?),
 				"hosted-default" => hosted_defaults.push(parse_hosted_default(node)?),
 				other => return unexpected(other, "behavior"),
@@ -131,13 +142,18 @@ impl RuntimeBehavior {
 		}
 		let openai_responses = openai_responses.ok_or_else(|| malformed_error("behavior"))?;
 		let cursor_effort = cursor_effort.ok_or_else(|| malformed_error("behavior"))?;
-		if model_operations.is_empty() || quota_tiers.is_empty() || hosted_defaults.is_empty() {
+		if model_operations.is_empty()
+			|| cursor_parameters.is_empty()
+			|| quota_tiers.is_empty()
+			|| hosted_defaults.is_empty()
+		{
 			return malformed("behavior");
 		}
 		Ok(Self {
 			openai_responses,
 			model_operations: model_operations.into_boxed_slice(),
 			cursor_effort,
+			cursor_parameters: cursor_parameters.into_boxed_slice(),
 			quota_tiers: quota_tiers.into_boxed_slice(),
 			hosted_defaults: hosted_defaults.into_boxed_slice(),
 		})
@@ -229,6 +245,17 @@ fn parse_cursor_effort(node: &KdlNode) -> Result<CursorEffortRule, CascadeError>
 		family_marker: family_marker.to_str(),
 		tiers:         tiers.into_boxed_slice(),
 	})
+}
+fn parse_cursor_model_parameter(node: &KdlNode) -> Result<CursorModelParameter, CascadeError> {
+	ensure_leaf(node, "cursor-model-parameter", &["model", "id", "value"])?;
+	let model = required_property(node, "model", "cursor-model-parameter")?;
+	let id = required_property(node, "id", "cursor-model-parameter")?;
+	let value = required_property(node, "value", "cursor-model-parameter")?;
+	if model.is_empty() || id.is_empty() || value.is_empty() || !positional_strings(node)?.is_empty()
+	{
+		return malformed("cursor-model-parameter");
+	}
+	Ok(CursorModelParameter { model: model.to_str(), id: id.to_str(), value: value.to_str() })
 }
 
 fn parse_quota_tiers(node: &KdlNode) -> Result<QuotaRule, CascadeError> {
@@ -436,12 +463,24 @@ pub fn cursor_openai_effort_suffix<'model>(
 	}
 	None
 }
+/// Returns fixed Cursor `requestedModel` parameters declared for an exact wire
+/// model.
+pub fn cursor_model_parameters<'model>(
+	model: &'model str,
+) -> impl Iterator<Item = (&'static str, &'static str)> + 'model {
+	runtime_behavior()
+		.cursor_parameters
+		.iter()
+		.filter(move |parameter| parameter.model == model)
+		.map(|parameter| (parameter.id.as_str(), parameter.value.as_str()))
+}
 
-/// Returns the catalog-declared quota display tier for a provider model id.
+/// Returns the catalog-declared quota scope or display tier for a provider
+/// model id.
 ///
-/// Exact Google Gemini CLI memberships are checked first. Its authored
-/// substring fallbacks deliberately preserve tier labels for newly discovered
-/// quota ids that are not yet present in the bundled catalog.
+/// Exact authored memberships are checked first. Provider-authored substring
+/// fallbacks deliberately preserve quota semantics for newly discovered ids
+/// that are not yet present in the bundled catalog.
 pub fn quota_display_tier(provider: &str, model: &str) -> Option<&'static str> {
 	let rule = runtime_behavior()
 		.quota_tiers
@@ -459,6 +498,13 @@ pub fn quota_display_tier(provider: &str, model: &str) -> Option<&'static str> {
 		.iter()
 		.find(|fallback| model.contains(fallback.substring.as_str()))
 		.map(|fallback| fallback.label.as_str())
+}
+/// Reports whether a provider has catalog-authored model quota scopes.
+pub fn has_quota_tier_policy(provider: &str) -> bool {
+	runtime_behavior()
+		.quota_tiers
+		.iter()
+		.any(|rule| rule.provider == provider)
 }
 
 /// Returns the provider-default wire model for a model-less hosted operation.
@@ -513,6 +559,17 @@ mod tests {
 		assert_eq!(cursor_openai_effort_suffix("gpt-5.6-sol-high"), Some(("gpt-5.6-sol", "high")));
 		assert_eq!(cursor_openai_effort_suffix("claude-fable-5-low"), None);
 		assert_eq!(cursor_openai_effort_suffix("gpt-alpha-high"), None);
+	}
+	#[test]
+	fn cursor_model_parameters_are_exact_wire_model_data() {
+		assert_eq!(cursor_model_parameters("composer-2.5").collect::<Vec<_>>(), vec![(
+			"fast", "false"
+		)]);
+		assert!(
+			cursor_model_parameters("composer-2.5-fast")
+				.next()
+				.is_none()
+		);
 	}
 
 	#[test]

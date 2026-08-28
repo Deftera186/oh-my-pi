@@ -1751,6 +1751,18 @@ impl Editor {
 		self.buffer.text()
 	}
 
+	/// Returns the visible text of the line containing the cursor, without
+	/// its trailing newline, for host copy-line actions.
+	pub fn current_line(&self) -> &str {
+		let text = self.buffer.text();
+		let cursor = self.buffer.cursor().min(text.len());
+		let start = text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+		let end = text[cursor..]
+			.find('\n')
+			.map_or(text.len(), |index| cursor + index);
+		&text[start..end]
+	}
+
 	/// Returns the open completion dropdown, if any.
 	pub const fn picker(&self) -> Option<&Picker> {
 		self.picker.as_ref()
@@ -2463,7 +2475,23 @@ impl SlashCommands {
 		}
 		let prefix_start = line_start + line.len() - trimmed.len();
 		let query = body.to_ascii_lowercase();
-		let expand_skills = query.starts_with(SKILL_NAMESPACE);
+		let in_skill_namespace = query.starts_with(SKILL_NAMESPACE);
+		let approaches_skill_namespace = SKILL_NAMESPACE.starts_with(&query);
+		let strongest_command_tier = (!approaches_skill_namespace)
+			.then(|| {
+				self
+					.commands
+					.iter()
+					.filter(|command| !command.name.starts_with(SKILL_NAMESPACE))
+					.flat_map(|command| {
+						std::iter::once(command.name.as_str())
+							.chain(command.aliases.iter().map(Str::as_str))
+					})
+					.map(|name| breakout_match_tier(&query, name))
+					.max()
+					.unwrap_or(0)
+			})
+			.unwrap_or(0);
 		let skill_count = self
 			.commands
 			.iter()
@@ -2476,11 +2504,19 @@ impl SlashCommands {
 			.and_then(|command| command.icon);
 		let mut ranked: SmallVec<(u16, u64, Suggestion), 8> = SmallVec::new();
 		for command in &self.commands {
-			if !expand_skills && command.name.starts_with(SKILL_NAMESPACE) {
+			let skill_name = command.name.strip_prefix(SKILL_NAMESPACE);
+			if let Some(ref bare_name) = skill_name
+				&& !in_skill_namespace
+				&& (approaches_skill_namespace
+					|| breakout_match_tier(&query, &bare_name) <= strongest_command_tier)
+			{
 				continue;
 			}
 			let mut selected_name = &command.name;
 			let mut score = command_score(&query, &command.name);
+			if let Some(bare_name) = skill_name {
+				score = score.max(command_score(&query, &bare_name));
+			}
 			for alias in &command.aliases {
 				let alias_score = command_score(&query, alias);
 				if alias_score > score {
@@ -2512,7 +2548,7 @@ impl SlashCommands {
 				));
 			}
 		}
-		if !expand_skills && skill_count > 0 && SKILL_NAMESPACE.starts_with(&query) {
+		if !in_skill_namespace && skill_count > 0 && approaches_skill_namespace {
 			ranked.push((command_score(&query, SKILL_NAMESPACE), 0, Suggestion {
 				value:       sf!("/skill:"),
 				display:     SuggestionDisplay::Text(sf!("skill:")),
@@ -2905,6 +2941,16 @@ fn command_score(query: &str, target: &str) -> u16 {
 	}
 }
 
+fn breakout_match_tier(query: &str, target: &str) -> u16 {
+	if query == target {
+		1_000
+	} else if target.starts_with(query) {
+		900
+	} else {
+		0
+	}
+}
+
 fn history_entry_matches(query: &str, entry: &str) -> bool {
 	if query.is_empty() {
 		return true;
@@ -3151,6 +3197,73 @@ mod tests {
 		assert_eq!(editor.text(), "/skill:");
 		assert_eq!(editor.picker().expect("skill candidates reopen").len(), 1);
 	}
+
+	#[test]
+	fn bare_skill_prefix_breaks_out_above_fuzzy_commands() {
+		let commands = vec![
+			Command::new("skill:batch", "Run batch workflows", &[]),
+			Command::new("skill:reviewer", "Review code", &[]),
+			Command::new("run-batch", "Run a saved batch job", &[]),
+		];
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/batch");
+		assert_eq!(
+			editor
+				.picker()
+				.expect("bare skill prefix opens")
+				.suggestions
+				.iter()
+				.map(|suggestion| suggestion.value().as_str())
+				.collect::<Vec<_>>(),
+			["/skill:batch ", "/run-batch "],
+		);
+	}
+
+	#[test]
+	fn bare_skill_prefix_alias_tie_keeps_command_only() {
+		let commands = vec![
+			Command::new("skill:setup-ci", "Bootstrap CI pipelines", &[]),
+			Command::new("configure", "Open settings", &["settings"]),
+		];
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/set");
+		let picker = editor.picker().expect("command prefix opens");
+		assert_eq!(picker.suggestions.len(), 1);
+		assert_eq!(picker.suggestions[0].value(), "/settings ");
+	}
+
+	#[test]
+	fn exact_bare_skill_breaks_out_above_command_prefix() {
+		let commands = vec![
+			Command::new("skill:set", "Set tracked values", &[]),
+			Command::new("settings", "Open settings", &[]),
+		];
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/set");
+		assert_eq!(
+			editor
+				.picker()
+				.expect("exact skill opens")
+				.suggestions
+				.iter()
+				.map(|suggestion| suggestion.value().as_str())
+				.collect::<Vec<_>>(),
+			["/skill:set ", "/settings "],
+		);
+	}
+
+	#[test]
+	fn fuzzy_only_bare_skill_does_not_break_out() {
+		let commands = vec![Command::new("skill:humanizer", "Remove signs of AI writing", &[])];
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(SlashCommands::new(commands)));
+		type_text(&mut editor, "/hmz");
+		assert!(editor.picker().is_none());
+	}
+
 	#[test]
 	fn command_picker_defaults_to_ten_visible_suggestions() {
 		let commands = (0..12)

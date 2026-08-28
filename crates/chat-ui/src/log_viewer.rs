@@ -104,7 +104,14 @@ impl LogViewer {
 			},
 			Key::PageUp => self.move_cursor(-(self.rows as isize), false),
 			Key::PageDown => self.move_cursor(self.rows as isize, false),
+			Key::Left => self.collapse_selected(),
+			Key::Right => {
+				self.expand_selected();
+				self.rebuild_ui();
+				return self.older_event();
+			},
 			Key::Enter | Key::Space => self.toggle_expanded(),
+			Key::Ctrl('o') => return LogViewerEvent::LoadOlder,
 			Key::Ctrl('p') => {
 				self.pid_only = !self.pid_only;
 				self.rebuild();
@@ -220,12 +227,28 @@ impl LogViewer {
 	}
 
 	fn toggle_expanded(&mut self) {
-		let Some(index) = self.visible.get(self.cursor).copied() else {
+		let Some(index) = self.selected_index() else {
 			return;
 		};
 		if !self.expanded.remove(&index) {
 			self.expanded.insert(index);
 		}
+	}
+
+	fn collapse_selected(&mut self) {
+		if let Some(index) = self.selected_index() {
+			self.expanded.remove(&index);
+		}
+	}
+
+	fn expand_selected(&mut self) {
+		if let Some(index) = self.selected_index() {
+			self.expanded.insert(index);
+		}
+	}
+
+	fn selected_index(&self) -> Option<usize> {
+		self.visible.get(self.cursor).copied()
 	}
 
 	fn selected(&self) -> impl Iterator<Item = usize> + '_ {
@@ -294,7 +317,7 @@ impl LogViewer {
 					</col>
 				</scroll>
 				{panel_divider()}
-				<text dim truncate>{"Type search · Ctrl+P PID · Shift+↑/↓ select · Enter expand · Ctrl+C copy · Esc close"}</text>
+				<text dim truncate>{"Type search · Ctrl+O older · ← collapse · → expand · Shift+↑/↓ select · Enter toggle · Ctrl+C copy · Esc close"}</text>
 			</col>
 		}), self.width, self.ctx.clone());
 	}
@@ -329,4 +352,27 @@ fn sanitize_line(line: &str) -> String {
 		}
 	}
 	output
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn entry(line: &str) -> LogEntry {
+		LogEntry { line: Str::new(line), pid: None, current_process_boundary: false }
+	}
+
+	#[test]
+	fn directional_expansion_and_older_loading_match_keyboard_contract() {
+		let mut viewer =
+			LogViewer::open(vec![entry("oldest"), entry("newest")], 0, true, &UiContext::default());
+
+		assert_eq!(viewer.handle_key(Key::Right), LogViewerEvent::LoadOlder);
+		assert!(viewer.expanded.contains(&0));
+		assert_eq!(viewer.handle_key(Key::Left), LogViewerEvent::Consumed);
+		assert!(!viewer.expanded.contains(&0));
+
+		viewer.cursor = 1;
+		assert_eq!(viewer.handle_key(Key::Ctrl('o')), LogViewerEvent::LoadOlder);
+	}
 }

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain,
+	FieldDescriptor, SettingKind, SettingScope, SettingsCatalog, SettingsDomain,
 	manager::{SettingsManager, SettingsManagerError, SettingsPaths},
 };
 use serde::{Deserialize, Serialize};
@@ -114,10 +114,6 @@ impl SettingsDomain for LspSettings {
 	];
 }
 
-omp_settings::inventory::submit! {
-	DomainRegistration::of::<LspSettings>()
-}
-
 /// Loading the immutable LSP projection from native settings failed.
 #[derive(Debug, Error)]
 pub enum LspSettingsError {
@@ -130,15 +126,21 @@ pub enum LspSettingsError {
 }
 
 /// Loads one immutable global/project/overlay LSP policy snapshot.
-pub fn load(data_dir: &Path, project_root: &Path) -> Result<LspSettings, LspSettingsError> {
-	let manager =
-		SettingsManager::open_read_only(SettingsPaths::discover(data_dir, Some(project_root)))?;
+pub fn load(
+	data_dir: &Path,
+	project_root: &Path,
+	catalog: SettingsCatalog,
+) -> Result<LspSettings, LspSettingsError> {
+	let manager = SettingsManager::open_read_only(
+		SettingsPaths::discover(data_dir, Some(project_root)),
+		catalog,
+	)?;
 	Ok(manager.snapshot().project::<LspSettings>()?.get().clone())
 }
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsSnapshot, registered_domains};
+	use omp_settings::SettingsSnapshot;
 
 	use super::*;
 
@@ -160,21 +162,17 @@ mod tests {
 	}
 
 	#[test]
-	fn isolated_projection_and_registration_are_typed() {
+	fn isolated_projection_is_typed() {
 		let expected =
 			LspSettings { enabled: false, diagnostics_on_edit: true, ..LspSettings::default() };
-		let snapshot = SettingsSnapshot::isolated(expected.clone()).expect("isolated LSP snapshot");
+		let snapshot = SettingsSnapshot::isolated(expected.clone(), crate::TEST_SETTINGS_CATALOG)
+			.expect("isolated LSP snapshot");
 		assert_eq!(
 			snapshot
 				.project::<LspSettings>()
 				.expect("LSP projection")
 				.get(),
 			&expected
-		);
-		assert!(
-			registered_domains()
-				.iter()
-				.any(|domain| domain.name == LspSettings::DOMAIN)
 		);
 	}
 
@@ -184,7 +182,7 @@ mod tests {
 			[lsp]
 			shared = true
 		};
-		let snapshot = SettingsSnapshot::read_only(document);
+		let snapshot = SettingsSnapshot::read_only(document, crate::TEST_SETTINGS_CATALOG);
 		assert!(snapshot.project::<LspSettings>().is_err());
 	}
 }

@@ -175,7 +175,13 @@ async fn dispatch(
 ) -> bool {
 	let mut intents = VecDeque::from([intent]);
 	while let Some(intent) = intents.pop_front() {
-		if matches!(intent, GitIntent::Avatar { .. } | GitIntent::Load { .. }) {
+		if matches!(
+			intent,
+			GitIntent::Avatar { .. }
+				| GitIntent::Load { .. }
+				| GitIntent::GenerateCommit { .. }
+				| GitIntent::AiStage { .. }
+		) {
 			let session = session.clone();
 			let updates = updates.clone();
 			drop(tokio::spawn(async move {

@@ -530,11 +530,16 @@ mod tests {
 		time::SystemTime,
 	};
 
+	use bytes::Bytes;
+	use http::Request;
 	use omp_core::ExposeSecret as _;
 	use parking_lot::Mutex;
 
 	use super::*;
-	use crate::id::{AccountId, PrincipalId};
+	use crate::{
+		auth::AuthSpec,
+		id::{AccountId, PrincipalId},
+	};
 
 	#[derive(Debug, Default)]
 	struct EmptyEnvironment;
@@ -661,6 +666,67 @@ mod tests {
 		assert!(
 			environment.reads.load(Ordering::Relaxed) > 0 || store.leases.load(Ordering::Relaxed) > 0
 		);
+	}
+
+	#[tokio::test]
+	async fn explicit_bedrock_key_remains_bearer_instead_of_resolving_to_sigv4() {
+		let catalog = Catalog::embedded();
+		let provider = catalog
+			.provider(omp_catalog::ProviderId::from_ref("amazon-bedrock"))
+			.expect("embedded Bedrock provider");
+		let _route = provider
+			.routes
+			.iter()
+			.filter_map(|id| catalog.route(id))
+			.find(|route| route.codec.as_str() == "bedrock-converse")
+			.expect("Bedrock Converse route");
+		let bearer = provider
+			.auth
+			.iter()
+			.find(|id| {
+				catalog
+					.auth_spec(id)
+					.is_some_and(|auth| auth.kind == AuthSpecKind::Bearer)
+			})
+			.expect("Bedrock bearer alternative");
+		let broker = CredentialBroker::from_catalog(
+			catalog,
+			Arc::new(EmptyEnvironment),
+			CredentialBrokerEngines::default(),
+		)
+		.expect("base broker")
+		.with_api_key_override(catalog, &provider.id, SecretString::from("explicit-bedrock-token"))
+		.expect("Bedrock bearer override");
+
+		let lease = broker
+			.lease(CredentialNeed {
+				spec:        bearer.clone(),
+				account:     None,
+				principal:   None,
+				valid_after: SystemTime::UNIX_EPOCH,
+			})
+			.await
+			.expect("explicit bearer lease");
+		assert_eq!(lease.kind(), CredentialKind::Bearer);
+		assert_eq!(
+			lease.scalar_secret().expect("bearer token").expose_secret(),
+			"explicit-bedrock-token",
+		);
+
+		let catalog_auth = catalog.auth_spec(bearer).expect("catalog bearer auth");
+		let runtime_auth =
+			AuthSpec::from_catalog(catalog_auth, None, None).expect("runtime bearer auth");
+		let applied = lease
+			.prepare(&runtime_auth, SystemTime::UNIX_EPOCH)
+			.expect("AWS bearer alternative prepares");
+		let mut request = Request::builder()
+			.uri("https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse-stream")
+			.body(Bytes::new())
+			.expect("request");
+		applied
+			.finalize_buffered(&mut request)
+			.expect("AWS bearer alternative applies");
+		assert_eq!(request.headers()["authorization"], "Bearer explicit-bedrock-token");
 	}
 
 	#[test]

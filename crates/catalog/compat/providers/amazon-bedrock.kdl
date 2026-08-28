@@ -11,6 +11,9 @@ provider "amazon-bedrock" {
 			thinking-efforts "low" "medium" "high" "max"
 		}
 	}
+	class "openai" {
+		thinking-mode "effort"
+	}
 	class "deepseek" {
 		requires-reasoning-content-for-all-assistant-turns #true
 		thinking-efforts "minimal" "low" "medium" "high"

@@ -1366,6 +1366,46 @@ mod tests {
 	}
 
 	#[test]
+	fn home_and_end_jump_between_filtered_options() {
+		let mut select = Select::new()
+			.with(Prop::Id, "pick")
+			.with(Prop::Filter, true)
+			.option(
+				SelectOption::new()
+					.label("one match")
+					.with(Prop::Value, "one"),
+			)
+			.option(
+				SelectOption::new()
+					.label("two match")
+					.with(Prop::Value, "two"),
+			)
+			.option(
+				SelectOption::new()
+					.label("red match")
+					.with(Prop::Value, "red"),
+			)
+			.option(
+				SelectOption::new()
+					.label("unrelated")
+					.with(Prop::Value, "unrelated"),
+			);
+		let ctx = UiContext::default();
+
+		for character in "match".chars() {
+			let _ = select.key(&mut event_ctx(&ctx), Key::Char(character));
+		}
+		assert_eq!(
+			select.key(&mut event_ctx(&ctx), Key::End),
+			Flow::Event(UiEvent::Highlighted { id: "pick".into(), value: "red".into() })
+		);
+		assert_eq!(
+			select.key(&mut event_ctx(&ctx), Key::Home),
+			Flow::Event(UiEvent::Highlighted { id: "pick".into(), value: "one".into() })
+		);
+	}
+
+	#[test]
 	fn paint_places_rows_and_registers_hits() {
 		let mut select = Select::new().option(SelectOption::new().label("Alpha"));
 		let ctx = UiContext::default();

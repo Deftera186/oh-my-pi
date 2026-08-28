@@ -748,6 +748,7 @@ impl Decoder for DiscoveryDecoder {
 					maximum_output_tokens: Some(row.max_output_tokens),
 					maximum_batch:         None,
 				}),
+				declared_pricing:      Box::new([]),
 				extended_context_mode: None,
 				availability:          Some(omp_catalog::ModelAvailability::Available),
 				source:                sf!("devin.get-cli-model-configs"),

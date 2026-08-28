@@ -7,6 +7,11 @@ use omp_envd::{
 };
 use omp_tool::Registry;
 
+const CATALOG: omp_settings::SettingsCatalog = omp_settings::SettingsCatalog::new(&[
+	&omp_settings::SETTINGS_CONTRIBUTION,
+	&omp_envd::SETTINGS_CONTRIBUTION,
+]);
+
 fn identity(principal: Principal) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
 		extension: sf!("fixture.extension"),
@@ -37,6 +42,7 @@ async fn normal_server_refuses_control_identity_without_admitted_manifest() {
 		state.path(),
 		Registry::new(),
 		config,
+		CATALOG,
 		RegistryBridges::default(),
 	)
 	.await
