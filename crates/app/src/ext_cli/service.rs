@@ -106,7 +106,7 @@ pub(crate) struct MarketplacePackage {
 }
 
 /// One installed native extension projected across user and project scopes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct InstalledExtensionView {
 	pub(crate) id:          Str,
 	pub(crate) version:     Option<Str>,
@@ -114,6 +114,9 @@ pub(crate) struct InstalledExtensionView {
 	pub(crate) scope:       Scope,
 	pub(crate) marketplace: Option<Str>,
 	pub(crate) shadowed:    bool,
+	pub(crate) tier:        omp_ext::TrustTier,
+	pub(crate) source:      toml::Value,
+	pub(crate) features:    Vec<Str>,
 }
 
 /// One committed extension upgrade.
@@ -835,6 +838,9 @@ fn plugin_views(state: &StatePaths) -> miette::Result<Vec<InstalledExtensionView
 					scope,
 					marketplace: (!marketplace.is_empty()).then(|| Str::new(marketplace)),
 					shadowed: scope == Scope::User && project_enabled.contains(id.as_str()),
+					tier: omp_ext::TrustTier::Sandboxed,
+					source: toml::Value::String(entry.install_path.display().to_string()),
+					features: Vec::new(),
 				});
 			}
 		}
@@ -897,32 +903,40 @@ pub(super) fn installed_views(state: &StatePaths) -> miette::Result<Vec<Installe
 		.map(|entry| entry.id.clone())
 		.collect::<std::collections::BTreeSet<_>>();
 	let mut entries = Vec::with_capacity(client.extensions.len() + workspace.extensions.len());
-	entries.extend(
-		client
-			.extensions
-			.into_iter()
-			.map(|entry| InstalledExtensionView {
-				version:     client_versions.get(&entry.id).cloned(),
-				marketplace: source_index(&entry.source),
-				shadowed:    project_ids.contains(&entry.id),
-				id:          entry.id,
-				enabled:     entry.enabled,
-				scope:       Scope::User,
-			}),
-	);
-	entries.extend(
-		workspace
-			.extensions
-			.into_iter()
-			.map(|entry| InstalledExtensionView {
-				version:     workspace_versions.get(&entry.id).cloned(),
-				marketplace: source_index(&entry.source),
-				shadowed:    false,
-				id:          entry.id,
-				enabled:     entry.enabled,
-				scope:       Scope::Project,
-			}),
-	);
+	entries.extend(client.extensions.into_iter().map(|entry| {
+		let version = client_versions
+			.get(&entry.id)
+			.cloned()
+			.or_else(|| source_version(&entry.source));
+		InstalledExtensionView {
+			version,
+			marketplace: source_index(&entry.source),
+			shadowed: project_ids.contains(&entry.id),
+			id: entry.id,
+			enabled: entry.enabled,
+			scope: Scope::User,
+			tier: entry.tier,
+			source: entry.source,
+			features: entry.features,
+		}
+	}));
+	entries.extend(workspace.extensions.into_iter().map(|entry| {
+		let version = workspace_versions
+			.get(&entry.id)
+			.cloned()
+			.or_else(|| source_version(&entry.source));
+		InstalledExtensionView {
+			version,
+			marketplace: source_index(&entry.source),
+			shadowed: false,
+			id: entry.id,
+			enabled: entry.enabled,
+			scope: Scope::Project,
+			tier: entry.tier,
+			source: entry.source,
+			features: entry.features,
+		}
+	}));
 	entries.sort_by(|left, right| {
 		left
 			.id
@@ -958,6 +972,18 @@ fn versions(path: &Path, layer: BackendLayer) -> miette::Result<BTreeMap<Str, St
 		.into_iter()
 		.map(|entry| (entry.id, entry.version))
 		.collect())
+}
+
+fn source_version(source: &toml::Value) -> Option<Str> {
+	let source = source.as_table()?;
+	let root = source
+		.get("root")
+		.or_else(|| source.get("path"))
+		.or_else(|| source.get("link"))?
+		.as_str()?;
+	let manifest = fs::read_to_string(Path::new(root).join("omp.toml")).ok()?;
+	let value: toml::Value = toml::from_str(&manifest).ok()?;
+	value.get("version")?.as_str().map(Str::new)
 }
 
 fn source_index(source: &toml::Value) -> Option<Str> {

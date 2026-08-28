@@ -3,7 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	env, fs, iter,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::{
 		self, Arc,
 		atomic::{AtomicBool, Ordering},
@@ -11,14 +11,15 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use bytes::{Bytes, BytesMut};
 use miette::IntoDiagnostic as _;
 #[cfg(unix)]
 use nix::sys::signal;
 #[cfg(unix)]
 use nix::unistd::Pid;
 use omp_agent::{
-	Agent, AgentHostControl, AgentKind, AgentState, AgentStatus, Budget, InProcTurnClient,
-	JournalAuthor, RpcTurnClient, TurnClient,
+	Agent, AgentHostControl, AgentKind, AgentState, AgentStatus, Budget, GateError, GateEvent,
+	GateOutcome, HookEvent, HookPatch, InProcTurnClient, JournalAuthor, RpcTurnClient, TurnClient,
 	advisor::{AdviceDelivery, AdvisorAdviceQueue, DeliveryContext},
 };
 use omp_catalog::snapshot;
@@ -80,6 +81,7 @@ use omp_inference::{Registry as InferenceRegistry, layer::stack::BuiltinConfig};
 use omp_proto::{
 	inference::v1 as inference_pb,
 	thread::v1::{item, part},
+	toolhost::v1::HookEventId,
 };
 use omp_sdk::SessionBlueprint;
 use omp_settings::manager::{MutationScope, SettingsManager, SettingsManagerError, SettingsPaths};
@@ -116,15 +118,251 @@ use crate::{
 	wizard,
 };
 
+macro_rules! session_observe_event {
+	($name:ident, $event:ident) => {
+		struct $name(serde_json::Value);
+
+		impl HookEvent for $name {
+			type Return = ();
+
+			const ID: HookEventId = HookEventId::$event;
+			const REV: u32 = 1;
+
+			fn encode_into(&self, out: &mut BytesMut) {
+				if let Ok(encoded) = serde_json::to_vec(&self.0) {
+					out.extend_from_slice(&encoded);
+				}
+			}
+
+			fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+				Ok(())
+			}
+		}
+	};
+}
+
+session_observe_event!(SessionStartHook, HookEventSessionStart);
+session_observe_event!(SessionShutdownHook, HookEventSessionShutdown);
+session_observe_event!(SessionSwitchedHook, HookEventSessionSwitched);
+session_observe_event!(SessionBranchedHook, HookEventSessionBranched);
+session_observe_event!(SessionRewoundHook, HookEventSessionRewound);
+session_observe_event!(SessionResetHook, HookEventSessionReset);
+
+async fn gate_session_payload(
+	gate: &omp_agent::HookGate,
+	event: HookEventId,
+	name: &'static str,
+	payload: serde_json::Value,
+) -> Result<serde_json::Value, Str> {
+	let requested = serde_json::to_vec(&payload)
+		.map(Bytes::from)
+		.map_err(|error| sf!("could not encode {name} hook payload: {error}"))?;
+	match gate
+		.gate(event, GateEvent::new(Str::new_static(name), requested))
+		.await
+	{
+		GateOutcome::Allow { event, .. } => serde_json::from_slice(&event.effective_args)
+			.map_err(|error| sf!("could not decode effective {name} hook payload: {error}")),
+		GateOutcome::Deny { reason, .. } => Err(reason),
+		GateOutcome::Approval { .. } => Err(sf!("{name} hook requested unsupported approval")),
+	}
+}
+
 /// Runs the session-switch admission chain without constructing a payload
 /// when no extension subscribes.
+pub(crate) async fn gate_session_switch(
+	gate: &omp_agent::HookGate,
+	reason: &'static str,
+	from_session: Option<&str>,
+	to_session: Option<&str>,
+	target_cwd: Option<&Path>,
+) -> Result<(), Str> {
+	if !gate.subscribed(HookEventId::HookEventSessionSwitch) {
+		return Ok(());
+	}
+	gate_session_payload(
+		gate,
+		HookEventId::HookEventSessionSwitch,
+		"session_switch",
+		serde_json::json!({
+			"reason": reason,
+			"from_session": from_session,
+			"to_session": to_session,
+			"target_cwd": target_cwd.map(|path| path.to_string_lossy()),
+		}),
+	)
+	.await
+	.map(|_| ())
+}
+
 /// Runs session-branch admission and returns the composed `summarize` value.
+pub(crate) async fn gate_session_branch(
+	gate: &omp_agent::HookGate,
+	at_event: u64,
+	keep_event: Option<u64>,
+	summarize: bool,
+) -> Result<bool, Str> {
+	if !gate.subscribed(HookEventId::HookEventSessionBranch) {
+		return Ok(summarize);
+	}
+	let effective = gate_session_payload(
+		gate,
+		HookEventId::HookEventSessionBranch,
+		"session_branch",
+		serde_json::json!({
+			"at_event": at_event,
+			"keep_event": keep_event,
+			"reason": "user",
+			"summarize": summarize,
+		}),
+	)
+	.await?;
+	effective
+		.get("summarize")
+		.and_then(serde_json::Value::as_bool)
+		.ok_or_else(|| sf!("session_branch hook removed summarize"))
+}
+
 /// Runs the fail-closed rewind admission chain before the journal is changed.
+pub(crate) async fn gate_session_rewind(
+	gate: &omp_agent::HookGate,
+	to_event: Option<u64>,
+	targets: &[omp_agent::RewindTarget],
+	dropped_items: usize,
+) -> Result<bool, Str> {
+	if !gate.subscribed(HookEventId::HookEventSessionRewind) {
+		return Ok(false);
+	}
+	let effective = gate_session_payload(
+		gate,
+		HookEventId::HookEventSessionRewind,
+		"session_rewind",
+		serde_json::json!({
+			"to_event": to_event,
+			"restore_workspace": false,
+			"targets": targets.iter().map(|target| serde_json::json!({
+				"event_index": target.event,
+				"keep_event": target.keep,
+				"text": target.text,
+			})).collect::<Vec<_>>(),
+			"dropped_items": dropped_items,
+		}),
+	)
+	.await?;
+	effective
+		.get("restore_workspace")
+		.and_then(serde_json::Value::as_bool)
+		.ok_or_else(|| sf!("session_rewind hook removed restore_workspace"))
+}
+
+/// Emits one real session-start transition to extensions already active in
+/// the project host.
+pub(crate) fn notify_session_start(
+	gate: &omp_agent::HookGate,
+	session_id: &str,
+	root: &Path,
+	cwd: &Path,
+	dirs: &[PathBuf],
+	resumed: bool,
+	head_event: u64,
+	previous_session: Option<&str>,
+) {
+	if gate.subscribed(SessionStartHook::ID) {
+		// No Rust authority currently projects the prompt revision, extension
+		// trust tier, or durable session origin at this seam. Required fields
+		// therefore carry their schema zero values; optional origin/agent facts
+		// remain absent rather than using a fabricated proxy.
+		gate.notify(&SessionStartHook(serde_json::json!({
+			"session_id": session_id,
+			"root": root.to_string_lossy(),
+			"cwd": cwd.to_string_lossy(),
+			"dirs": dirs.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+			"resumed": resumed,
+			"trust": "sandboxed",
+			"head_event": head_event,
+			"prompt_rev": "",
+			"previous_session": previous_session,
+		})));
+	}
+}
+
 /// Emits the bounded session-shutdown observation.
+pub(crate) fn notify_session_shutdown(
+	gate: &omp_agent::HookGate,
+	session_id: &str,
+	reason: &'static str,
+	target_session: Option<&str>,
+) {
+	if gate.subscribed(SessionShutdownHook::ID) {
+		gate.notify(&SessionShutdownHook(serde_json::json!({
+			"session_id": session_id,
+			"reason": reason,
+			"budget": "2s",
+			"target_session": target_session,
+		})));
+	}
+}
+
 /// Emits one post-commit session-switched observation.
+pub(crate) fn notify_session_switched(
+	gate: &omp_agent::HookGate,
+	reason: &'static str,
+	from_session: Option<&str>,
+	to_session: &str,
+	head_event: u64,
+) {
+	if gate.subscribed(SessionSwitchedHook::ID) {
+		gate.notify(&SessionSwitchedHook(serde_json::json!({
+			"reason": reason,
+			"from_session": from_session,
+			"to_session": to_session,
+			"head_event": head_event,
+		})));
+	}
+}
+
 /// Emits one post-commit session-branched observation.
+pub(crate) fn notify_session_branched(
+	gate: &omp_agent::HookGate,
+	at_event: u64,
+	new_head: u64,
+	summary_event: Option<u64>,
+) {
+	if gate.subscribed(SessionBranchedHook::ID) {
+		gate.notify(&SessionBranchedHook(serde_json::json!({
+			"at_event": at_event,
+			"new_head": new_head,
+			"summary_event": summary_event,
+		})));
+	}
+}
+
 /// Emits one post-commit session-rewound observation.
+pub(crate) fn notify_session_rewound(
+	gate: &omp_agent::HookGate,
+	to_event: Option<u64>,
+	new_head: u64,
+	restored_workspace: bool,
+) {
+	if gate.subscribed(SessionRewoundHook::ID) {
+		gate.notify(&SessionRewoundHook(serde_json::json!({
+			"to_event": to_event,
+			"new_head": new_head,
+			"restored_workspace": restored_workspace,
+		})));
+	}
+}
+
 /// Emits one post-commit session-reset observation.
+pub(crate) fn notify_session_reset(gate: &omp_agent::HookGate, at_event: u64, kept_events: u64) {
+	if gate.subscribed(SessionResetHook::ID) {
+		gate.notify(&SessionResetHook(serde_json::json!({
+			"at_event": at_event,
+			"kept_events": kept_events,
+		})));
+	}
+}
+
 fn absolute_invocation_deadline(now: Instant, max_time: Option<Duration>) -> Option<Instant> {
 	max_time.and_then(|duration| now.checked_add(duration))
 }
@@ -645,6 +883,9 @@ enum ChatError {
 	/// Environment authority binding failed.
 	#[error(transparent)]
 	Environment(#[from] omp_envd::EnvdError),
+	/// Durable transcript journal access failed.
+	#[error(transparent)]
+	Journal(#[from] omp_agent::JournalError),
 	/// A production session entry omitted a required CONTROL owner.
 	#[error("required production CONTROL authority `{0}` was not composed")]
 	MissingAuthority(&'static str),
@@ -891,6 +1132,10 @@ pub(crate) async fn run(
 		.get()
 		.clone();
 	settings.mnemopi = settings.mnemopi.normalize();
+	if let Some(theme) = &args.use_theme {
+		settings.appearance.theme = theme.clone();
+		settings.appearance.theme_variant = None;
+	}
 	let workspace_update_overlay: Option<omp_ext::config::UpdateOverlay> =
 		fs::read_to_string(root.join(".omp/config.toml"))
 			.ok()
@@ -916,11 +1161,17 @@ pub(crate) async fn run(
 		.map_err(|error| miette::miette!(error))?
 		.get()
 		.resolve_path_scopes(&root, &home);
-	let skill_settings = settings_snapshot
+	let mut skill_settings = settings_snapshot
 		.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
 		.map_err(|error| miette::miette!(error))?
 		.get()
 		.clone();
+	if args.no_skills {
+		skill_settings.enabled = false;
+	}
+	skill_settings
+		.custom_directories
+		.extend(args.skill.iter().cloned());
 	let extensions_disabled =
 		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
 	let extension_scopes = settings
@@ -958,6 +1209,8 @@ pub(crate) async fn run(
 				},
 			},
 			skill_settings,
+			prompt_templates: args.prompt_template.clone(),
+			themes: args.theme.clone(),
 			include_workspace: !args.extension_launch.no_workspace && !extensions_disabled,
 			client_installed: Some(data_dir.join("ext/installed.toml")),
 			workspace_identity: Some(omp_driver::discovery::workspace_identity(&root)),
@@ -975,6 +1228,24 @@ pub(crate) async fn run(
 		&home,
 		&prompt_discovery_settings,
 	);
+	if args.no_prompt_templates {
+		prompt_discovery.content.declarations = prompt_discovery
+			.content
+			.declarations
+			.iter()
+			.filter(|declaration| {
+				!matches!(
+					&declaration.payload,
+					omp_driver::discovery::manifest::CapabilityPayload::Prompts(_)
+				)
+			})
+			.cloned()
+			.collect::<Vec<_>>()
+			.into();
+	}
+	if args.no_context_files {
+		prompt_discovery.context = Default::default();
+	}
 	let mut extension_keys = BTreeSet::new();
 	let mut extension_approval_tickets = Vec::new();
 	if !prompt_discovery.content.extension_grants.is_empty() {
@@ -1209,6 +1480,29 @@ pub(crate) async fn run(
 	)
 	.await
 	.map_err(|e| miette::miette!(e))?;
+	prompt_head.bind_provider(environment.extension_prompt_provider());
+	let mut resource_roots = Vec::with_capacity(1 + args.add_dir.len() + admitted_extensions.len());
+	resource_roots.push(root.clone());
+	resource_roots.extend(args.add_dir.iter().cloned());
+	resource_roots.extend(admitted_extensions.iter().filter_map(|extension| {
+		extension.watch_root.clone().or_else(|| {
+			extension
+				.entry_path
+				.as_ref()?
+				.parent()
+				.map(Path::to_path_buf)
+		})
+	}));
+	prompt_discovery.content = omp_driver::discovery::gate_resources_discover(
+		environment.admission_gate().as_ref(),
+		omp_driver::discovery::DiscoverReason::Startup,
+		&root,
+		&resource_roots,
+		&prompt_discovery_settings,
+		prompt_discovery.content,
+	)
+	.await
+	.map_err(|error| miette::miette!(error))?;
 	let credential_control_grants =
 		omp_driver::secrets::credential_control_grants(&admitted_extensions);
 	let session_index = if let Some(database) = selected_index_path {
@@ -1289,6 +1583,8 @@ pub(crate) async fn run(
 	} else {
 		SessionOpen::New
 	};
+	let session_resumed =
+		matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_));
 	let mut session = open_session(
 		&root,
 		&sessions_dir,
@@ -1573,6 +1869,7 @@ pub(crate) async fn run(
 			autolearn,
 			args.advisor,
 			session,
+			session_resumed,
 			blueprint,
 			eval_control.clone(),
 			edit_repair_requests,
@@ -1659,6 +1956,7 @@ pub(crate) async fn run(
 			autolearn,
 			args.advisor,
 			session,
+			session_resumed,
 			blueprint,
 			eval_control,
 			edit_repair_requests,
@@ -2152,6 +2450,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	autolearn: omp_agent::AutolearnSettings,
 	advisor_enabled: bool,
 	mut session: Session,
+	mut session_resumed: bool,
 	mut blueprint: SessionBlueprint,
 	eval_control: EvalSessionControl,
 	edit_repair_requests: Option<flume::Receiver<omp_tools::edit::observer::EditRepairRequest>>,
@@ -2234,6 +2533,8 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		Arc::clone(&scope.session_index),
 		security_enabled,
 	));
+	parent.bind_admission_gate(environment.admission_gate());
+	parent.bind_extension_reload(environment.extension_reload_handle());
 	parent.set_prompt_discovery_settings(prompt_discovery_settings.clone());
 	parent.set_auto_thinking_settings(auto_thinking);
 	let edit_repair_service = edit_repair_requests
@@ -2282,17 +2583,67 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 	let breadcrumbs = TerminalBreadcrumbs::new(&data_dir)?;
 	let terminal_id = omp_tui::ttyid::terminal_id();
 	let mut reconstructed_draft: Option<Str> = None;
+	let mut emit_session_start = true;
+	let mut previous_session: Option<Str> = None;
+	state.update(|snapshot| {
+		snapshot.prompt_source = prompt_head.wrap_prompt_source(Arc::clone(&snapshot.prompt_source));
+	});
 	let final_id = loop {
+		if emit_session_start {
+			let head_event = session.journal.load()?.len().saturating_sub(1) as u64;
+			notify_session_start(
+				environment.admission_gate().as_ref(),
+				session.id.as_str(),
+				scope.root,
+				&blueprint.options().cwd,
+				&blueprint.options().additional_roots,
+				session_resumed,
+				head_event,
+				previous_session.as_deref(),
+			);
+			emit_session_start = false;
+		}
 		state.update(|snapshot| snapshot.deadline = invocation_deadline);
+		let (model, context_window) = {
+			let current = state.snapshot();
+			(
+				Str::from(current.turn.params.model.as_str()),
+				model_context_window(scope.catalog, &current.turn.params.model),
+			)
+		};
+		let provider = model
+			.split_once('/')
+			.map_or_else(|| Str::new_static(""), |(provider, _)| Str::from(provider));
+		let mut roots = Vec::with_capacity(1 + blueprint.options().additional_roots.len());
+		roots.push(Str::from(scope.root.to_string_lossy().as_ref()));
+		roots.extend(
+			blueprint
+				.options()
+				.additional_roots
+				.iter()
+				.map(|root| Str::from(root.to_string_lossy().as_ref())),
+		);
+		prompt_head
+			.activate(omp_envd::exthost::PromptPullContext {
+				session_id: session.id.clone(),
+				model,
+				provider,
+				context_window: context_window.unwrap_or(0),
+				epoch: 0,
+				cwd: Str::from(blueprint.options().cwd.to_string_lossy().as_ref()),
+				roots,
+				vcs_branch: None,
+				vcs_commit: None,
+				is_subagent: false,
+				agent_kind: None,
+			})
+			.await
+			.map_err(DriverChatError::from)?;
 		if scope.persist_sessions {
 			breadcrumbs.restamp(terminal_id.as_str(), &SessionId(session.id.clone()))?;
 		}
 		parent.update(state.clone(), session.id.clone());
 		let approval_book = Arc::new(omp_agent::ApprovalBook::new());
-		state.update(|snapshot| {
-			snapshot.prompt_source =
-				prompt_head.wrap_prompt_source(Arc::clone(&snapshot.prompt_source));
-		});
 		let session_root = scope.sessions_dir.join(session.id.as_str());
 		ensure_state_directory(&session_root)?;
 		ensure_state_directory(&session_root.join("local"))?;
@@ -2304,10 +2655,6 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			&state_dir.join("telemetry"),
 			&state_dir.join("telemetry.sqlite3"),
 		)?);
-		let context_window = {
-			let current = state.snapshot();
-			model_context_window(scope.catalog, &current.turn.params.model)
-		};
 		let Session { id, journal, initial_items } = session;
 		let current_id = id.clone();
 		let agent_env = env
@@ -2328,7 +2675,13 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			tracing::warn!(%error, "TTSR rule condition was rejected");
 		}
 		let mut agent = Agent::new(client.clone(), agent_env, state.clone(), journal, CHAT_CAPS_BASE);
-		parent.bind_agent_controls(id.clone(), agent.host_control(), agent.control());
+		parent.bind_agent_controls(
+			id.clone(),
+			agent.host_control(),
+			agent.control(),
+			agent.abort_handle(),
+			agent.events().clone(),
+		);
 		agent.set_unexpected_stop_classifier(parent.clone());
 		if auto_thinking_selected {
 			agent.set_difficulty_classifier(parent.clone());
@@ -2429,6 +2782,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			state.clone(),
 			agent.control(),
 		));
+		session_control.bind_admission_gate(environment.admission_gate());
 		let session_factory = session_control_factory(
 			scope.root.to_path_buf(),
 			scope.sessions_dir.to_path_buf(),
@@ -2652,8 +3006,11 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		};
 		let initial_draft = Str::from(saved_draft);
 		let submission = initial_submission.take();
-		let (approval_route, approval_inbox) =
-			omp_agent::ApprovalRoute::new(Arc::clone(&approval_book));
+		let (approval_route, approval_inbox) = omp_agent::ApprovalRoute::new(
+			Arc::clone(&approval_book),
+			Some(environment.admission_gate()),
+		);
+		parent.bind_spawn_approval_route(approval_route.clone());
 		environment.bind_approval_authority(Some(Arc::clone(&approval_book)), Some(approval_route));
 		let (replica_pump, replica) =
 			GuestRelayPump::new(data_dir.join("collab"), scope.root.to_path_buf(), now_ms());
@@ -2779,11 +3136,58 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			collab_task.abort();
 			let _ = collab_task.await;
 		}
-		let outcome = outcome.map_err(ChatError::Ui)?;
+		let outcome = match outcome {
+			Ok(outcome) => outcome,
+			Err(error) => {
+				notify_session_shutdown(
+					environment.admission_gate().as_ref(),
+					current_id.as_str(),
+					"fatal",
+					None,
+				);
+				return Err(ChatError::Ui(error));
+			},
+		};
 		if scope.persist_sessions {
 			drafts.save(&SessionId(current_id.clone()), outcome.draft.as_str())?;
 		}
 		start = ChatStart::Session;
+		let switch_request = match &outcome.exit {
+			host::HostExit::Resume(id) => Some(("resume", Some(id.as_str()))),
+			host::HostExit::NewSession => Some(("new", None)),
+			_ => None,
+		};
+		if let Some((reason, to_session)) = switch_request
+			&& let Err(denied) = gate_session_switch(
+				environment.admission_gate().as_ref(),
+				reason,
+				Some(current_id.as_str()),
+				to_session,
+				None,
+			)
+			.await
+		{
+			tracing::warn!(%denied, "session switch denied by extension policy");
+			session = open_session(
+				scope.root,
+				scope.sessions_dir,
+				SessionOpen::Resume(&current_id),
+				scope.registry.as_ref(),
+				scope
+					.persist_sessions
+					.then(|| Arc::clone(&scope.session_index)),
+			)?;
+			continue;
+		}
+		let switched = switch_request.map(|(reason, _)| reason);
+		if matches!(&outcome.exit, host::HostExit::Quit) {
+			notify_session_shutdown(
+				environment.admission_gate().as_ref(),
+				current_id.as_str(),
+				"user_exit",
+				None,
+			);
+		}
 		match outcome.exit {
 			host::HostExit::Quit => break current_id,
 			host::HostExit::ExternalEditor => {
@@ -2926,6 +3330,25 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				state = AgentState::new(next);
 			},
 		}
+		if let Some(reason) = switched {
+			let head_event = session.journal.load()?.len().saturating_sub(1) as u64;
+			notify_session_shutdown(
+				environment.admission_gate().as_ref(),
+				current_id.as_str(),
+				"switch",
+				Some(session.id.as_str()),
+			);
+			notify_session_switched(
+				environment.admission_gate().as_ref(),
+				reason,
+				Some(current_id.as_str()),
+				session.id.as_str(),
+				head_event,
+			);
+			session_resumed = reason == "resume";
+			previous_session = Some(current_id.clone());
+			emit_session_start = true;
+		}
 	};
 	extraction_shutdown.cancel();
 	if let Some(mut task) = extraction_task.take()
@@ -2950,7 +3373,121 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 
 #[cfg(test)]
 mod tests {
+	use omp_agent::GateDecision;
+
 	use super::*;
+
+	#[tokio::test]
+	async fn session_switch_deny_preserves_state() {
+		let (gate, dispatches) = omp_agent::HookGate::delegated_channel();
+		gate.replace_union_mask(1_u128 << HookEventId::HookEventSessionSwitch as u32);
+		let gate = Arc::new(gate);
+		let responder = Arc::clone(&gate);
+		let reply = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("switch dispatch");
+			responder
+				.answer(dispatch.dispatch_id, vec![(0, GateDecision::Deny(sf!("blocked")))])
+				.expect("answer switch");
+		});
+		let mut current = sf!("session-a");
+		if gate_session_switch(
+			gate.as_ref(),
+			"resume",
+			Some(current.as_str()),
+			Some("session-b"),
+			None,
+		)
+		.await
+		.is_ok()
+		{
+			current = sf!("session-b");
+		}
+		reply.await.expect("switch responder");
+		assert_eq!(current, "session-a");
+	}
+
+	#[tokio::test]
+	async fn session_branch_transform_composes_summarize() {
+		let (gate, dispatches) = omp_agent::HookGate::delegated_channel();
+		gate.replace_union_mask(1_u128 << HookEventId::HookEventSessionBranch as u32);
+		let gate = Arc::new(gate);
+		let responder = Arc::clone(&gate);
+		let reply = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("branch dispatch");
+			let payload = serde_json::json!({
+				"at_event": 9,
+				"keep_event": 9,
+				"reason": "user",
+				"summarize": true,
+			});
+			responder
+				.answer(dispatch.dispatch_id, vec![(
+					0,
+					GateDecision::Modify(HookPatch {
+						target: None,
+						args:   Some(Bytes::from(
+							serde_json::to_vec(&payload).expect("effective payload"),
+						)),
+					}),
+				)])
+				.expect("answer branch");
+		});
+		assert!(
+			gate_session_branch(gate.as_ref(), 9, Some(9), false)
+				.await
+				.expect("branch allowed")
+		);
+		reply.await.expect("branch responder");
+	}
+
+	#[test]
+	fn session_post_observe_fires_exactly_once() {
+		let (gate, dispatches) = omp_agent::HookGate::delegated_channel();
+		gate.replace_union_mask(1_u128 << HookEventId::HookEventSessionReset as u32);
+		notify_session_reset(&gate, 12, 0);
+		let dispatch = dispatches.try_recv().expect("one reset observation");
+		assert_eq!(dispatch.event, HookEventId::HookEventSessionReset);
+		assert!(dispatches.try_recv().is_err());
+	}
+	#[test]
+	fn session_transition_observations_include_provenance() {
+		let (gate, dispatches) = omp_agent::HookGate::delegated_channel();
+		gate.replace_union_mask(
+			(1_u128 << HookEventId::HookEventSessionStart as u32)
+				| (1_u128 << HookEventId::HookEventSessionShutdown as u32),
+		);
+		notify_session_start(
+			&gate,
+			"next",
+			Path::new("."),
+			Path::new("."),
+			&[],
+			true,
+			4,
+			Some("previous"),
+		);
+		notify_session_shutdown(&gate, "previous", "switch", Some("next"));
+		let start = dispatches.try_recv().unwrap();
+		let shutdown = dispatches.try_recv().unwrap();
+		let start: serde_json::Value = serde_json::from_slice(&start.payload).unwrap();
+		let shutdown: serde_json::Value = serde_json::from_slice(&shutdown.payload).unwrap();
+		assert_eq!(start["previous_session"], "previous");
+		assert_eq!(shutdown["target_session"], "next");
+		assert!(dispatches.try_recv().is_err());
+	}
+
+	#[tokio::test]
+	async fn unsubscribed_session_hooks_construct_no_frame() {
+		let (gate, dispatches) = omp_agent::HookGate::delegated_channel();
+		assert!(
+			!gate_session_branch(&gate, 9, Some(9), false)
+				.await
+				.expect("fast path")
+		);
+		notify_session_start(&gate, "session", Path::new("."), Path::new("."), &[], false, 0, None);
+		notify_session_reset(&gate, 12, 0);
+		assert!(dispatches.try_recv().is_err());
+	}
 
 	#[test]
 	fn max_time_is_one_absolute_deadline() {

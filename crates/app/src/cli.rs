@@ -14,7 +14,7 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
@@ -354,19 +354,19 @@ pub struct OmpCli {
 		long = "extension",
 		short = 'e',
 		visible_alias = "hook",
-		global = true,
+		hide = true,
 		value_name = "SPEC",
 		conflicts_with = "no_ext"
 	)]
 	pub ext:               Vec<Str>,
 	/// Override one manifest-declared extension setting for this invocation.
-	#[arg(long = "ext", global = true, value_name = "ID.KEY=VALUE", value_parser = extension_setting_override)]
+	#[arg(long = "ext", hide = true, value_name = "ID.KEY=VALUE", value_parser = extension_setting_override)]
 	pub ext_overrides:     Vec<omp_ext::config::CliSettingOverride>,
 	/// Load only this local extension path for this invocation.
 	#[arg(
 		long = "plugin-dir",
 		visible_alias = "ext-only",
-		global = true,
+		hide = true,
 		value_name = "PATH",
 		conflicts_with = "no_ext"
 	)]
@@ -375,7 +375,7 @@ pub struct OmpCli {
 	/// supervisor.
 	#[arg(
 		long = "trusted-extension",
-		global = true,
+		hide = true,
 		value_name = "ABSOLUTE_PATH",
 		value_parser = trusted_extension_path,
 		conflicts_with_all = ["ext", "ext_only", "no_ext"]
@@ -385,12 +385,12 @@ pub struct OmpCli {
 	#[arg(
 		long = "no-ext",
 		visible_alias = "no-extensions",
-		global = true,
+		hide = true,
 		conflicts_with_all = ["ext", "ext_only", "trusted_extension"]
 	)]
 	pub no_ext:            bool,
 	/// Suppress the workspace extension layer for this invocation.
-	#[arg(long = "no-workspace-ext", global = true)]
+	#[arg(long = "no-workspace-ext", hide = true)]
 	pub no_workspace_ext:  bool,
 	/// Export one durable session journal to a self-contained HTML file and
 	/// exit.
@@ -429,6 +429,19 @@ pub struct OmpCli {
 	/// Typed contributed values excluded from prompt positionals.
 	#[arg(skip)]
 	pub contributed:       Vec<ContributedCliValue>,
+}
+fn omp_command(hide_launch_controls: bool) -> clap::Command {
+	let command = OmpCli::command();
+	if !hide_launch_controls {
+		return command;
+	}
+	command
+		.mut_arg("ext", |arg| arg.hide(true))
+		.mut_arg("ext_overrides", |arg| arg.hide(true))
+		.mut_arg("ext_only", |arg| arg.hide(true))
+		.mut_arg("trusted_extension", |arg| arg.hide(true))
+		.mut_arg("no_ext", |arg| arg.hide(true))
+		.mut_arg("no_workspace_ext", |arg| arg.hide(true))
 }
 
 /// Production application commands.
@@ -1402,6 +1415,9 @@ pub struct ShellCliArgs {
 
 /// Provider credential projection options.
 #[derive(Clone, Debug, Args)]
+#[command(after_long_help = "Unattended credential stores require an explicit key source. Set \
+                             OMP_LLM_KEY_SOURCE=local-file for an owner-only local encrypted \
+                             store, or configure the platform keyring.")]
 pub struct TokenArgs {
 	/// Provider identifier.
 	pub provider:      Str,
@@ -1580,6 +1596,10 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--prewalk-into"
 			| "--plan-yolo-into"
 			| "--skills"
+			| "--skill"
+			| "--prompt-template"
+			| "--theme"
+			| "--use-theme"
 			| "--api-key"
 			| "--system-prompt"
 			| "--append-system-prompt"
@@ -1617,6 +1637,8 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--no-lsp"
 			| "--no-pty"
 			| "--no-skills"
+			| "--no-prompt-templates"
+			| "--no-context-files"
 			| "--no-rules"
 			| "--no-title"
 	)
@@ -1743,206 +1765,278 @@ pub struct LaunchExtensions {
 	pub settings:     Vec<omp_ext::config::CliSettingOverride>,
 }
 
+/// Extension controls accepted only by commands that launch an agent session.
+#[derive(Clone, Debug, Default, Args)]
+pub struct InvocationExtensionArgs {
+	/// Enable an extension specification for this invocation.
+	#[arg(
+		long = "extension",
+		short = 'e',
+		visible_alias = "hook",
+		value_name = "SPEC",
+		conflicts_with = "no_ext"
+	)]
+	pub ext:               Vec<Str>,
+	/// Override one manifest-declared extension setting for this invocation.
+	#[arg(long = "ext", value_name = "ID.KEY=VALUE", value_parser = extension_setting_override)]
+	pub ext_overrides:     Vec<omp_ext::config::CliSettingOverride>,
+	/// Load only this local extension path for this invocation.
+	#[arg(
+		long = "plugin-dir",
+		visible_alias = "ext-only",
+		value_name = "PATH",
+		conflicts_with = "no_ext"
+	)]
+	pub ext_only:          Vec<PathBuf>,
+	/// Load exactly these absolute Python modules through the trusted
+	/// supervisor.
+	#[arg(
+		long = "trusted-extension",
+		value_name = "ABSOLUTE_PATH",
+		value_parser = trusted_extension_path,
+		conflicts_with_all = ["ext", "ext_only", "no_ext"]
+	)]
+	pub trusted_extension: Vec<omp_envd::site::TrustedModule>,
+	/// Suppress all configured extensions for this invocation.
+	#[arg(
+		long = "no-ext",
+		visible_alias = "no-extensions",
+		conflicts_with_all = ["ext", "ext_only", "trusted_extension"]
+	)]
+	pub no_ext:            bool,
+	/// Suppress the workspace extension layer for this invocation.
+	#[arg(long = "no-workspace-ext")]
+	pub no_workspace_ext:  bool,
+}
+
 /// Interactive project-chat options.
 #[derive(Clone, Debug, Args)]
 pub struct ChatArgs {
+	/// Extension controls for this session.
+	#[command(flatten)]
+	pub extensions:          InvocationExtensionArgs,
 	/// Catalog model key, alias, or role.
 	#[arg(long)]
-	pub model:             Option<Str>,
+	pub model:               Option<Str>,
 	/// Provider preference for the selected model.
 	#[arg(long)]
-	pub provider:          Option<Str>,
+	pub provider:            Option<Str>,
 	/// Fast/low-cost model-role selector.
 	#[arg(long)]
-	pub smol:              Option<Str>,
+	pub smol:                Option<Str>,
 	/// Deep-reasoning model-role selector.
 	#[arg(long)]
-	pub slow:              Option<Str>,
+	pub slow:                Option<Str>,
 	/// Planning model-role selector.
 	#[arg(long)]
-	pub plan:              Option<Str>,
+	pub plan:                Option<Str>,
 	/// Ordered model selectors available for interactive cycling.
 	#[arg(long)]
-	pub models:            Option<SelectorList>,
+	pub models:              Option<SelectorList>,
 	/// Provider session selector, never inferred from prompt text.
 	#[arg(long = "provider-session-id")]
-	pub provider_session:  Option<Str>,
+	pub provider_session:    Option<Str>,
 	/// Project root whose environment and durable sessions are used.
 	#[arg(long, value_name = "PATH", default_value = ".")]
-	pub project:           PathBuf,
+	pub project:             PathBuf,
 	/// Existing inference gateway endpoint. Omit to run inference in process.
 	#[arg(long, value_name = "LOCAL_ENDPOINT")]
-	pub gateway:           Option<LocalEndpoint>,
+	pub gateway:             Option<LocalEndpoint>,
 	/// Existing ULID session to reopen strictly.
 	#[arg(long, short = 'r', visible_alias = "session", value_name = "ULID")]
-	pub resume:            Option<Str>,
+	pub resume:              Option<Str>,
 	/// Continue the most recent session for this terminal.
 	#[arg(
 		long = "continue",
 		short = 'c',
 		conflicts_with_all = ["resume", "fork", "no_session", "from_claude", "from_codex"]
 	)]
-	pub continue_session:  bool,
+	pub continue_session:    bool,
 	/// Fork an existing session before opening the chat.
 	#[arg(long, value_name = "SESSION", conflicts_with_all = ["resume", "continue_session", "no_session"])]
-	pub fork:              Option<Str>,
+	pub fork:                Option<Str>,
 	/// Import a Claude Code session interactively before opening the chat.
 	#[arg(long = "from-claude", conflicts_with_all = ["from_codex", "resume", "continue_session", "fork", "no_session"])]
-	pub from_claude:       bool,
+	pub from_claude:         bool,
 	/// Import a Codex CLI session interactively before opening the chat.
 	#[arg(long = "from-codex", conflicts_with_all = ["resume", "continue_session", "fork", "no_session"])]
-	pub from_codex:        bool,
+	pub from_codex:          bool,
 	/// Do not persist a durable session for this chat.
 	#[arg(long, conflicts_with_all = ["resume", "continue_session", "fork", "session_dir"])]
-	pub no_session:        bool,
+	pub no_session:          bool,
 	/// Override the native session storage directory.
 	#[arg(long, value_name = "PATH", conflicts_with = "no_session")]
-	pub session_dir:       Option<PathBuf>,
+	pub session_dir:         Option<PathBuf>,
 	/// Select provider reasoning effort with unambiguous prefix abbreviations.
 	#[arg(long, value_parser = <ThinkingLevel as FromStr>::from_str)]
-	pub thinking:          Option<ThinkingLevel>,
+	pub thinking:            Option<ThinkingLevel>,
 	/// Select the provider's service tier.
 	#[arg(long)]
-	pub service_tier:      Option<ServiceTier>,
+	pub service_tier:        Option<ServiceTier>,
 	/// Tool approval policy.
 	#[arg(long)]
-	pub approval_mode:     Option<ApprovalMode>,
+	pub approval_mode:       Option<ApprovalMode>,
 	/// Approve every tool without asking; an explicit `--approval-mode` wins.
 	#[arg(long, visible_alias = "auto-approve")]
-	pub yolo:              bool,
+	pub yolo:                bool,
 	/// Stop after this strictly positive duration.
 	#[arg(long)]
-	pub max_time:          Option<CliDuration>,
+	pub max_time:            Option<CliDuration>,
 	/// Restrict enabled tools to these normalized names.
 	#[arg(long, conflicts_with = "no_tools")]
-	pub tools:             Option<ToolNames>,
+	pub tools:               Option<ToolNames>,
 	/// Disable every built-in tool.
 	#[arg(long)]
-	pub no_tools:          bool,
+	pub no_tools:            bool,
 	/// Disable LSP tools, formatting, and diagnostics.
 	#[arg(long)]
-	pub no_lsp:            bool,
+	pub no_lsp:              bool,
 	/// Disable PTY-backed shell execution.
 	#[arg(long)]
-	pub no_pty:            bool,
+	pub no_pty:              bool,
 	/// Enter read-only planning mode at startup.
 	#[arg(long = "plan-mode")]
-	pub plan_mode:         bool,
+	pub plan_mode:           bool,
 	/// Enter plan mode with one explicitly authorized mutation transition.
 	#[arg(long = "plan-yolo", conflicts_with = "plan_mode")]
-	pub plan_yolo:         bool,
+	pub plan_yolo:           bool,
 	/// Model selector switched to once the plan-yolo plan is approved.
 	#[arg(long = "plan-yolo-into", value_name = "SELECTOR", requires = "plan_yolo")]
-	pub plan_yolo_into:    Option<Str>,
+	pub plan_yolo_into:      Option<Str>,
 	/// Enter prewalk automation.
 	#[arg(long, conflicts_with = "no_prewalk")]
-	pub prewalk:           bool,
+	pub prewalk:             bool,
 	/// Disable configured prewalk automation.
 	#[arg(long, conflicts_with = "prewalk")]
-	pub no_prewalk:        bool,
+	pub no_prewalk:          bool,
 	/// Model selector used when prewalk begins.
 	#[arg(long)]
-	pub prewalk_into:      Option<Str>,
+	pub prewalk_into:        Option<Str>,
 	/// Read-only native TOML or YAML settings overlays in precedence order.
 	#[arg(long = "config", value_name = "PATH")]
-	pub config:            Vec<PathBuf>,
+	pub config:              Vec<PathBuf>,
 	/// Additional authorized workspace roots.
 	#[arg(long = "add-dir", value_name = "PATH")]
-	pub add_dir:           Vec<PathBuf>,
+	pub add_dir:             Vec<PathBuf>,
 	/// Comma-separated skill glob filters.
 	#[arg(long)]
-	pub skills:            Option<SelectorList>,
+	pub skills:              Option<SelectorList>,
+	/// Additional skill file or directory for this invocation.
+	#[arg(long = "skill", value_name = "PATH")]
+	pub skill:               Vec<PathBuf>,
 	/// Disable skill discovery.
 	#[arg(long, conflicts_with = "skills")]
-	pub no_skills:         bool,
+	pub no_skills:           bool,
+	/// Additional prompt-template file or directory for this invocation.
+	#[arg(long = "prompt-template", value_name = "PATH")]
+	pub prompt_template:     Vec<PathBuf>,
+	/// Disable prompt-template discovery.
+	#[arg(long)]
+	pub no_prompt_templates: bool,
+	/// Additional JSON theme file or directory for this invocation.
+	#[arg(long = "theme", value_name = "PATH")]
+	pub theme:               Vec<PathBuf>,
+	/// Select a theme by registry name for this invocation.
+	#[arg(long = "use-theme", value_name = "NAME")]
+	pub use_theme:           Option<Str>,
+	/// Disable repository context-file discovery.
+	#[arg(long = "no-context-files")]
+	pub no_context_files:    bool,
 	/// Disable rule discovery.
 	#[arg(long)]
-	pub no_rules:          bool,
+	pub no_rules:            bool,
 	/// Disable generated terminal titles.
 	#[arg(long)]
-	pub no_title:          bool,
+	pub no_title:            bool,
 	/// Enable the advisor watchdog runtime for this session.
 	#[arg(long)]
-	pub advisor:           bool,
+	pub advisor:             bool,
 	/// Ephemeral provider API key; never journaled or rendered by `Debug`.
 	#[arg(long, value_parser = parse_cli_secret)]
-	pub api_key:           Option<SecretString>,
+	pub api_key:             Option<SecretString>,
 	/// Ephemeral provider prompt-cache affinity.
 	#[arg(long = "prompt-cache-key")]
-	pub prompt_cache_key:  Option<Str>,
+	pub prompt_cache_key:    Option<Str>,
 	#[arg(long)]
 	/// Enable the built-in Python expression-evaluation tool for this chat's
 	/// environment.
-	pub py_eval:           bool,
+	pub py_eval:             bool,
 	/// Hide thinking blocks in the transcript for this invocation.
 	#[arg(long = "hide-thinking")]
-	pub hide_thinking:     bool,
+	pub hide_thinking:       bool,
 	/// Force external thinking: provider reasoning off, hidden `think` tool on.
 	/// Providers have flagged the resulting request shape as abuse risk, up to
 	/// account-level enforcement.
 	#[arg(long = "external-thinking")]
-	pub external_thinking: bool,
+	pub external_thinking:   bool,
 	/// Deployment-authenticated exact modules admitted by the CLI boundary.
 	#[arg(skip)]
-	pub extension_launch:  LaunchExtensions,
+	pub extension_launch:    LaunchExtensions,
 	/// Typed prompt settings and invocation overrides.
 	#[command(flatten)]
-	pub prompt_settings:   PromptArgs,
+	pub prompt_settings:     PromptArgs,
 	/// Ordered initial message words; `@path` remains an attachment mention.
 	#[arg(num_args = 0..)]
-	pub prompt:            Vec<Str>,
+	pub prompt:              Vec<Str>,
 }
 
 impl ChatArgs {
 	/// Returns the default options for an interactive project chat.
 	pub fn default_interactive() -> Self {
 		Self {
-			model:             None,
-			provider:          None,
-			smol:              None,
-			slow:              None,
-			plan:              None,
-			models:            None,
-			provider_session:  None,
-			project:           ".".into(),
-			gateway:           None,
-			resume:            None,
-			continue_session:  false,
-			fork:              None,
-			from_claude:       false,
-			from_codex:        false,
-			no_session:        false,
-			session_dir:       None,
-			thinking:          None,
-			service_tier:      None,
-			approval_mode:     None,
-			yolo:              false,
-			max_time:          None,
-			tools:             None,
-			no_tools:          false,
-			no_lsp:            false,
-			no_pty:            false,
-			plan_mode:         false,
-			plan_yolo:         false,
-			plan_yolo_into:    None,
-			prewalk:           false,
-			no_prewalk:        false,
-			prewalk_into:      None,
-			config:            Vec::new(),
-			add_dir:           Vec::new(),
-			skills:            None,
-			no_skills:         false,
-			no_rules:          false,
-			no_title:          false,
-			advisor:           false,
-			api_key:           None,
-			prompt_cache_key:  None,
-			py_eval:           false,
-			hide_thinking:     false,
-			external_thinking: false,
-			extension_launch:  LaunchExtensions::default(),
-			prompt_settings:   PromptArgs::default(),
-			prompt:            Vec::new(),
+			extensions:          InvocationExtensionArgs::default(),
+			model:               None,
+			provider:            None,
+			smol:                None,
+			slow:                None,
+			plan:                None,
+			models:              None,
+			provider_session:    None,
+			project:             ".".into(),
+			gateway:             None,
+			resume:              None,
+			continue_session:    false,
+			fork:                None,
+			from_claude:         false,
+			from_codex:          false,
+			no_session:          false,
+			session_dir:         None,
+			thinking:            None,
+			service_tier:        None,
+			approval_mode:       None,
+			yolo:                false,
+			max_time:            None,
+			tools:               None,
+			no_tools:            false,
+			no_lsp:              false,
+			no_pty:              false,
+			plan_mode:           false,
+			plan_yolo:           false,
+			plan_yolo_into:      None,
+			prewalk:             false,
+			no_prewalk:          false,
+			prewalk_into:        None,
+			config:              Vec::new(),
+			add_dir:             Vec::new(),
+			skills:              None,
+			skill:               Vec::new(),
+			no_skills:           false,
+			prompt_template:     Vec::new(),
+			no_prompt_templates: false,
+			theme:               Vec::new(),
+			use_theme:           None,
+			no_context_files:    false,
+			no_rules:            false,
+			no_title:            false,
+			advisor:             false,
+			api_key:             None,
+			prompt_cache_key:    None,
+			py_eval:             false,
+			hide_thinking:       false,
+			external_thinking:   false,
+			extension_launch:    LaunchExtensions::default(),
+			prompt_settings:     PromptArgs::default(),
+			prompt:              Vec::new(),
 		}
 	}
 
@@ -2053,6 +2147,12 @@ pub enum AuthCommand {
 	},
 	/// List non-secret account summaries.
 	List {
+		/// Optional provider filter.
+		#[arg(long)]
+		provider: Option<Str>,
+	},
+	/// Show actionable credential status and lifecycle account selectors.
+	Status {
 		/// Optional provider filter.
 		#[arg(long)]
 		provider: Option<Str>,
@@ -2649,6 +2749,7 @@ async fn install_shorthand(args: InstallArgs) -> miette::Result<()> {
 			}
 			let command = ExtCommand::Link(ExtLinkArgs {
 				path:       local_install_path(target.as_str()),
+				tier:       ExtTier::Sandboxed,
 				name:       None,
 				features:   None,
 				no_resolve: false,
@@ -2677,20 +2778,43 @@ async fn install_shorthand(args: InstallArgs) -> miette::Result<()> {
 	ext_cli::run(extension_shorthand_args(command, args.scope, args.json)).await
 }
 
-fn lower_launch_extensions(cli: &OmpCli) -> miette::Result<LaunchExtensions> {
-	let mode = if cli.no_ext {
+fn command_extension_args(command: Option<&Command>) -> Option<&InvocationExtensionArgs> {
+	match command {
+		None => None,
+		Some(Command::Chat(args)) => Some(&args.extensions),
+		Some(Command::Print(args)) => Some(&args.launch.extensions),
+		Some(Command::Rpc(args) | Command::RpcUi(args)) => Some(&args.launch.extensions),
+		Some(Command::Acp(args)) => Some(&args.launch.extensions),
+		_ => None,
+	}
+}
+
+fn lower_launch_extensions(
+	cli: &OmpCli,
+	command_args: Option<&InvocationExtensionArgs>,
+) -> miette::Result<LaunchExtensions> {
+	let nested_ext = command_args.map_or(&[][..], |args| args.ext.as_slice());
+	let nested_ext_only = command_args.map_or(&[][..], |args| args.ext_only.as_slice());
+	let nested_trusted = command_args.map_or(&[][..], |args| args.trusted_extension.as_slice());
+	let nested_overrides = command_args.map_or(&[][..], |args| args.ext_overrides.as_slice());
+	let nested_no_ext = command_args.is_some_and(|args| args.no_ext);
+	let nested_no_workspace = command_args.is_some_and(|args| args.no_workspace_ext);
+	let no_ext = cli.no_ext || nested_no_ext;
+	let mode = if no_ext {
 		InvocationExtensionMode::Disabled
-	} else if cli.ext_only.is_empty() {
+	} else if cli.ext_only.is_empty() && nested_ext_only.is_empty() {
 		InvocationExtensionMode::Merge
 	} else {
 		InvocationExtensionMode::ExplicitOnly
 	};
-	let mut native_roots = Vec::with_capacity(cli.ext.len() + cli.ext_only.len());
+	let mut native_roots = Vec::with_capacity(
+		cli.ext.len() + nested_ext.len() + cli.ext_only.len() + nested_ext_only.len(),
+	);
 	if mode != InvocationExtensionMode::Disabled {
-		for spec in &cli.ext {
+		for spec in cli.ext.iter().chain(nested_ext) {
 			native_roots.push(invocation_extension_root(spec.as_str())?);
 		}
-		for root in &cli.ext_only {
+		for root in cli.ext_only.iter().chain(nested_ext_only) {
 			native_roots.push(canonical_extension_root(root)?);
 		}
 		native_roots.dedup();
@@ -2698,15 +2822,21 @@ fn lower_launch_extensions(cli: &OmpCli) -> miette::Result<LaunchExtensions> {
 	Ok(LaunchExtensions {
 		native_roots,
 		mode,
-		no_workspace: cli.no_workspace_ext,
+		no_workspace: cli.no_workspace_ext || nested_no_workspace,
 		trusted: cli
 			.trusted_extension
 			.iter()
+			.chain(nested_trusted)
 			.cloned()
 			.map(trusted_extension)
 			.collect(),
 		contributed: cli.contributed.clone(),
-		settings: cli.ext_overrides.clone(),
+		settings: cli
+			.ext_overrides
+			.iter()
+			.chain(nested_overrides)
+			.cloned()
+			.collect(),
 	})
 }
 
@@ -2852,7 +2982,8 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			.into(),
 		);
 	}
-	let launch_extensions = lower_launch_extensions(&cli)?;
+	let launch_extensions =
+		lower_launch_extensions(&cli, command_extension_args(cli.command.as_ref()))?;
 	let command = cli
 		.command
 		.unwrap_or_else(|| Command::Chat(ChatArgs::default_interactive()));
@@ -3033,7 +3164,10 @@ fn parse_with_terminal(
 		normalize_interactive_launch(&mut arguments);
 	}
 	normalize_bare_resume(&mut arguments);
-	let mut cli = OmpCli::try_parse_from(arguments)?;
+	let serve = first_positional(&arguments)
+		.is_some_and(|index| arguments[index].to_string_lossy() == "serve");
+	let matches = omp_command(serve).try_get_matches_from(arguments)?;
+	let mut cli = OmpCli::from_arg_matches(&matches)?;
 	if cli.license && cli.command.is_some() {
 		return Err(clap::Error::raw(
 			ErrorKind::ArgumentConflict,
@@ -3123,8 +3257,15 @@ fn normalize_hidden_command(arguments: &mut Vec<OsString>) {
 	let mut leading = leading.into_iter();
 	while let Some(argument) = leading.next() {
 		if let Some(consumes_value) = launch_option(&argument) {
-			if consumes_value {
-				leading.next();
+			let retain = is_extension_launch_option(&argument);
+			if retain {
+				kept.push(argument);
+			}
+			if consumes_value
+				&& let Some(value) = leading.next()
+				&& retain
+			{
+				kept.push(value);
 			}
 		} else {
 			kept.push(argument);
@@ -3234,8 +3375,29 @@ fn normalize_transport_mode(arguments: &mut Vec<OsString>) {
 	}
 }
 
-/// Returns whether a launch option belongs to the chat/print surface rather
-/// than the root-global set clap already parses without a command.
+fn is_extension_launch_option(argument: &OsString) -> bool {
+	let argument = argument.to_string_lossy();
+	let name = argument
+		.split_once('=')
+		.map_or(argument.as_ref(), |(name, _)| name);
+	matches!(
+		name,
+		"--ext"
+			| "--ext-only"
+			| "--extension"
+			| "-e" | "--hook"
+			| "--plugin-dir"
+			| "--trusted-extension"
+			| "--no-ext"
+			| "--no-extensions"
+			| "--no-workspace-ext"
+	)
+}
+
+/// Returns whether a launch option alone should synthesize a chat command.
+///
+/// Root-position compatibility options already default to chat without an
+/// explicit command and therefore do not participate in this predicate.
 fn chat_launch_option(argument: &OsString) -> bool {
 	if launch_option(argument).is_none() {
 		return false;
@@ -3317,13 +3479,15 @@ fn trusted_extension_path(value: &str) -> Result<omp_envd::site::TrustedModule, 
 /// activation contract admitted by the extension supervisor.
 ///
 /// A bare trusted module has no static OMP declaration metadata. The CLI trust
-/// act authenticates its exact startup module and bytes; named tools,
-/// inter-extension services, and CONTROL quota classes stay empty because the
-/// trusted module supplies no deployment-owned metadata for those sets. Python
-/// registration is never promoted into an authenticated manifest.
+/// act authenticates its exact startup module and bytes, and explicitly allows
+/// its frozen runtime registry to publish named declarations. Inter-extension
+/// services and CONTROL quota classes stay empty because the trusted module
+/// supplies no deployment-owned metadata for those sets.
 pub fn trusted_extension(module: TrustedModule) -> ExtHostSpec {
 	let encoded = hex::encode_n(module.artifact_digest.as_bytes());
-	let extension_id = Str::from(format!("trusted.{}.{}", module.module, &encoded[..16],));
+	// Dashes, not dots: the id becomes a tool-revision family, whose
+	// `name@family.rev` grammar reserves the dot.
+	let extension_id = Str::from(format!("trusted-{}-{}", module.module, &encoded[..16]));
 	let key = HostKey::new("invocation", "trusted", extension_id.clone());
 	let provenance = omp_core::Provenance::new(
 		Str::new_static("operator-cli"),
@@ -3334,7 +3498,7 @@ pub fn trusted_extension(module: TrustedModule) -> ExtHostSpec {
 		Str::new_static("trusted"),
 		1,
 	);
-	let manifest = ExtensionManifest::new(
+	let mut manifest = ExtensionManifest::new(
 		provenance,
 		module.module,
 		[],
@@ -3343,8 +3507,23 @@ pub fn trusted_extension(module: TrustedModule) -> ExtHostSpec {
 		[],
 		[ActivationTrigger::FirstReach],
 	);
+	manifest.trust_runtime_declarations();
 	let mut extension = ExtHostSpec::new(key, manifest);
-	extension.python_site = module.path.parent().map(Path::to_path_buf);
+	// A package `__init__.py` imports as its directory: the site root is the
+	// directory CONTAINING the package, not the package itself.
+	extension.python_site = if module
+		.path
+		.file_stem()
+		.is_some_and(|stem| stem == "__init__")
+	{
+		module
+			.path
+			.parent()
+			.and_then(Path::parent)
+			.map(Path::to_path_buf)
+	} else {
+		module.path.parent().map(Path::to_path_buf)
+	};
 	extension.entry_path = Some(module.path);
 	extension
 }
@@ -3882,6 +4061,7 @@ mod tests {
 		assert_eq!(extension.manifest.services.provides().len(), 0);
 		assert_eq!(extension.manifest.services.requires().len(), 0);
 		assert!(extension.manifest.resource_limits.is_empty());
+		assert!(extension.manifest.runtime_declarations_trusted());
 		assert_eq!(
 			extension.manifest.activation_triggers,
 			[omp_envd::exthost::ActivationTrigger::FirstReach]
@@ -3910,7 +4090,8 @@ mod tests {
 	fn generic_ext_setting_parse_is_inert_until_admission() {
 		let cli = parse(&["omp", "--ext", "demo.verbose=true"]);
 		assert!(cli.trusted_extension.is_empty());
-		let launch = lower_launch_extensions(&cli).expect("inert launch lowering");
+		let launch = lower_launch_extensions(&cli, command_extension_args(cli.command.as_ref()))
+			.expect("inert launch lowering");
 		assert!(launch.native_roots.is_empty());
 		assert!(launch.trusted.is_empty(), "argv parsing must not compose an extension host");
 		assert_eq!(launch.settings.len(), 1);
@@ -4051,12 +4232,36 @@ mod tests {
 			OsString::from("chat"),
 		])
 		.expect("invocation extension flags");
-		let lowered = lower_launch_extensions(&cli).expect("lowered launch policy");
+		let lowered = lower_launch_extensions(&cli, command_extension_args(cli.command.as_ref()))
+			.expect("lowered launch policy");
 		assert_eq!(lowered.mode, InvocationExtensionMode::ExplicitOnly);
 		assert!(lowered.no_workspace);
 		assert_eq!(lowered.native_roots, vec![
 			directory.path().canonicalize().expect("canonical root")
 		]);
+	}
+
+	#[test]
+	fn extension_launch_flags_are_only_advertised_on_launch_commands() {
+		let compress_help = OmpCli::try_parse_from(["omp", "compress", "--help"])
+			.expect_err("help exits through clap")
+			.to_string();
+		assert!(!compress_help.contains("--plugin-dir"));
+		assert!(!compress_help.contains("--trusted-extension"));
+		assert!(!compress_help.contains("--no-ext"));
+		let misplaced = parse_with_terminal(
+			["omp", "--plugin-dir", "/tmp/demo", "compress", "file.txt"].map(OsString::from),
+			true,
+		)
+		.expect_err("non-launch commands reject leading extension controls");
+		assert_eq!(misplaced.kind(), ErrorKind::UnknownArgument);
+
+		let chat_help = OmpCli::try_parse_from(["omp", "chat", "--help"])
+			.expect_err("help exits through clap")
+			.to_string();
+		assert!(chat_help.contains("--plugin-dir"));
+		assert!(chat_help.contains("--trusted-extension"));
+		assert!(chat_help.contains("--no-ext"));
 	}
 
 	#[test]
@@ -4066,6 +4271,35 @@ mod tests {
 		assert_eq!(error.kind(), ErrorKind::UnknownArgument);
 		assert_eq!(error.exit_code(), 2);
 		assert!(error.to_string().contains("Usage:"));
+	}
+
+	#[test]
+	fn parses_one_shot_resource_controls() {
+		let cli = parse(&[
+			"omp",
+			"chat",
+			"--no-context-files",
+			"--no-prompt-templates",
+			"--use-theme",
+			"ocean",
+			"--skill",
+			"review/SKILL.md",
+			"--skill",
+			"debug",
+			"--prompt-template",
+			"review.md",
+			"--theme",
+			"ocean.json",
+		]);
+		let Some(Command::Chat(args)) = cli.command else {
+			panic!("chat command");
+		};
+		assert!(args.no_context_files);
+		assert!(args.no_prompt_templates);
+		assert_eq!(args.use_theme.as_deref(), Some("ocean"));
+		assert_eq!(args.skill, [PathBuf::from("review/SKILL.md"), PathBuf::from("debug")]);
+		assert_eq!(args.prompt_template, [PathBuf::from("review.md")]);
+		assert_eq!(args.theme, [PathBuf::from("ocean.json")]);
 	}
 
 	#[test]
@@ -4106,6 +4340,10 @@ mod tests {
 		assert!(matches!(
 			parse(&["omp", "auth", "list", "--provider", "provider"]).command,
 			Some(Command::Auth(AuthArgs { command: AuthCommand::List { provider: Some(_) }, .. }))
+		));
+		assert!(matches!(
+			parse(&["omp", "auth", "status"]).command,
+			Some(Command::Auth(AuthArgs { command: AuthCommand::Status { provider: None }, .. }))
 		));
 		assert!(matches!(
 			parse(&["omp", "auth", "refresh", "account"]).command,
@@ -4250,8 +4488,33 @@ mod tests {
 	#[test]
 	fn hoists_global_flags_after_the_subcommand() {
 		let cli = parse(&["omp", "print", "hello", "--no-ext", "--cwd=workspace"]);
-		assert!(cli.no_ext);
+		let Some(Command::Print(args)) = &cli.command else {
+			panic!("print command: {cli:?}");
+		};
+		assert!(args.launch.extensions.no_ext);
 		assert_eq!(cli.cwd, Some(PathBuf::from("workspace")));
+	}
+	#[test]
+	fn serve_help_hides_rejected_extension_launch_controls() {
+		let serve = omp_command(true)
+			.try_get_matches_from(["omp", "serve", "--help"])
+			.expect_err("help exits before parsing")
+			.to_string();
+		for option in [
+			"--extension",
+			"--ext ",
+			"--plugin-dir",
+			"--trusted-extension",
+			"--no-ext",
+			"--no-workspace-ext",
+		] {
+			assert!(!serve.contains(option), "serve help advertised {option}");
+		}
+		let chat = omp_command(false)
+			.try_get_matches_from(["omp", "chat", "--help"])
+			.expect_err("help exits before parsing")
+			.to_string();
+		assert!(chat.contains("--no-ext"));
 	}
 
 	#[test]

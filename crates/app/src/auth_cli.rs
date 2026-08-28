@@ -49,9 +49,10 @@ pub async fn run(database: PathBuf, command: AuthCommand) -> miette::Result<()> 
 			let provider = ProviderId::from(provider);
 			(provider.clone(), AuthRequest::Login(LoginRequest { provider, method: None }))
 		},
-		AuthCommand::List { provider } => {
-			let provider = provider.map_or(default_provider, ProviderId::from);
-			(provider.clone(), AuthRequest::ListAccounts { provider: Some(provider) })
+		AuthCommand::List { provider } | AuthCommand::Status { provider } => {
+			let requested = provider.map(ProviderId::from);
+			let target = requested.clone().unwrap_or(default_provider);
+			(target, AuthRequest::ListAccounts { provider: requested })
 		},
 		AuthCommand::Refresh { account } => {
 			(default_provider.clone(), AuthRequest::Refresh { account: AccountId::from(account) })
@@ -112,7 +113,17 @@ async fn print_auth(answer: AuthAnswer, database: &Path) -> miette::Result<()> {
 		},
 		AuthAnswer::Accounts(accounts) => {
 			for account in accounts {
-				println!("{} {}", account.account, account.provider);
+				print!(
+					"selector={} provider={} state={:?}",
+					account.account, account.provider, account.state
+				);
+				if let Some(principal) = account.principal {
+					print!(" principal={principal}");
+				}
+				if let Some(label) = account.label {
+					print!(" label={label}");
+				}
+				println!();
 			}
 		},
 		AuthAnswer::Refreshed(account) => println!("{} {}", account.account, account.provider),
