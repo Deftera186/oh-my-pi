@@ -202,6 +202,15 @@ pub(crate) fn compile(
 			Path::new("/dev/random"),
 			Path::new("/dev/urandom"),
 		]);
+		push_literals(&mut profile, "allow", "file-read*", [
+			Path::new("/dev/ptmx"),
+			Path::new("/dev/tty"),
+		]);
+		push_paths(&mut profile, "allow", "file-read*", [Path::new("/dev/fd")]);
+		profile.push_str(
+			"(allow file-read* (require-all (regex #\"^/dev/ttys[0-9]+\") (extension \
+			 \"com.apple.sandbox.pty\")))\n",
+		);
 		push_scopes(
 			&mut profile,
 			"allow",
@@ -222,6 +231,14 @@ pub(crate) fn compile(
 
 	profile.push_str("(deny file-write* (subpath \"/\"))\n");
 	push_literals(&mut profile, "allow", "file-write*", [Path::new("/dev/null")]);
+	profile.push_str(
+		"(allow file-write* file-ioctl (literal \"/dev/ptmx\") (literal \"/dev/tty\") (subpath \
+		 \"/dev/fd\"))\n",
+	);
+	profile.push_str(
+		"(allow file-write* (require-all (regex #\"^/dev/ttys[0-9]+\") (extension \
+		 \"com.apple.sandbox.pty\")))\n",
+	);
 	match spec.write {
 		WriteMode::Deny => {},
 		WriteMode::Scoped | WriteMode::Overlay => {

@@ -217,10 +217,7 @@ impl Runner {
 
 	/// Compiles a reusable native launcher prefix from a program-less policy.
 	pub fn wrap_template(self, spec: &SandboxSpec) -> Result<CommandWrapper, SandboxError> {
-		if !matches!(
-			self.backend,
-			Backend::Seatbelt | Backend::Bubblewrap | Backend::Landlock
-		) {
+		if !matches!(self.backend, Backend::Seatbelt | Backend::Bubblewrap | Backend::Landlock) {
 			return Err(SandboxError::CommandWrapperUnsupported { backend: self.backend });
 		}
 		if self.backend != native_command_backend()? {
@@ -495,7 +492,7 @@ pub struct RunOutput {
 
 /// Precompiled sandbox launcher reused across many command spawns.
 ///
-/// Temporary profile and bind-mask resources remain alive until this value is
+/// Temporary profile, BPF, policy, and bind-mask resources remain alive until this value is
 /// dropped. The wrapper is `Send + Sync`; launcher and policy accessors
 /// allocate nothing.
 pub struct CommandWrapper {

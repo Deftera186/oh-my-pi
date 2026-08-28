@@ -1,4 +1,6 @@
-use std::{ffi::{OsStr, OsString}, path::Path};
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+use std::{ffi::OsString, path::Path};
 #[cfg(target_os = "linux")]
 use std::{
 	fs,
@@ -22,9 +24,10 @@ use crate::{
 
 /// Hidden same-binary child role which installs Linux confinement before exec.
 ///
-/// Embedding binaries using [`crate::CommandWrapper`] must dispatch this argument
-/// to [`run_child_entry`] before starting application threads. Its stable argv
-/// contract is `HIDDEN_CHILD_ARG BPF_PATH [--landlock POLICY_PATH] -- PROGRAM ARGS...`.
+/// Embedding binaries using [`crate::CommandWrapper`] must dispatch this
+/// argument to [`run_child_entry`] before launching untrusted work. Its
+/// stable argv contract is `HIDDEN_CHILD_ARG BPF_PATH [--landlock POLICY_PATH]
+/// -- PROGRAM ARGS...`.
 pub const HIDDEN_CHILD_ARG: &str = "--omp-sandbox-child";
 
 pub(crate) const BPF_PLACEHOLDER: &str = "@omp-sandbox-bpf@";
@@ -90,18 +93,24 @@ pub(crate) fn compile(
 		.collect();
 	let mut plan = Plan::new(Backend::Landlock, requested, enforced, argv, true);
 	plan.add_caveat(Caveat::general(
-		"Landlock does not create PID or mount namespaces; host /proc remains visible subject to filesystem rules",
+		"Landlock does not create PID or mount namespaces; host /proc remains visible subject to \
+		 filesystem rules",
+	));
+	plan.add_caveat(Caveat::general(
+		"Landlock seccomp always denies ptrace, process_vm access, and io_uring",
 	));
 	if spec.network == NetworkMode::Disabled && !spec.unix_sockets.is_empty() {
 		plan.add_caveat(Caveat::capability(
 			Capability::NetDisable,
-			"Landlock must permit connect for allowed pathname Unix sockets and cannot distinguish an inherited Internet socket",
+			"Landlock must permit connect for allowed pathname Unix sockets and cannot distinguish \
+			 an inherited Internet socket",
 		));
 	}
 	if !spec.write_deny.is_empty() {
 		plan.add_caveat(Caveat::capability(
 			Capability::FsWriteDeny,
-			"Landlock allow rules are additive and cannot subtract a write-deny path nested beneath a writable root",
+			"Landlock allow rules are additive and cannot subtract a write-deny path nested beneath \
+			 a writable root",
 		));
 	}
 	if spec.degradation == DegradationPolicy::AllowCaveats {
@@ -132,6 +141,7 @@ pub(crate) fn prepare(
 	}
 	#[cfg(target_os = "linux")]
 	{
+		let backend = prepared.backend;
 		let mode = FilterMode::for_spec(spec);
 		let program = compile_filter(mode)?;
 		let mut bpf = secure_temp_file("omp-sandbox-bpf-")?;
@@ -140,17 +150,21 @@ pub(crate) fn prepare(
 			path: bpf.path().to_path_buf(),
 			source,
 		})?;
-		replace_placeholder(&mut prepared.args, BPF_PLACEHOLDER, bpf.path())?;
+		replace_placeholder(&mut prepared.args, backend, BPF_PLACEHOLDER, bpf.path())?;
 		prepared.push_resource(PreparedResource::File(Some(bpf)));
 
-		if prepared.args.iter().any(|arg| arg == OsStr::new(POLICY_PLACEHOLDER)) {
+		if prepared
+			.args
+			.iter()
+			.any(|arg| arg == OsStr::new(POLICY_PLACEHOLDER))
+		{
 			let program = prepared
 				.args
 				.windows(2)
 				.find(|pair| pair[0] == OsStr::new("--"))
 				.map(|pair| PathBuf::from(&pair[1]))
 				.ok_or(SandboxError::MissingPlanPlaceholder {
-					backend:     Backend::Landlock,
+					backend,
 					placeholder: COMMAND_WRAPPER_PLACEHOLDER,
 				})?;
 			let mut policy = secure_temp_file("omp-sandbox-landlock-")?;
@@ -161,7 +175,7 @@ pub(crate) fn prepare(
 					source,
 				}
 			})?;
-			replace_placeholder(&mut prepared.args, POLICY_PLACEHOLDER, policy.path())?;
+			replace_placeholder(&mut prepared.args, backend, POLICY_PLACEHOLDER, policy.path())?;
 			prepared.push_resource(PreparedResource::File(Some(policy)));
 		}
 		Ok(())
@@ -171,6 +185,7 @@ pub(crate) fn prepare(
 #[cfg(target_os = "linux")]
 fn replace_placeholder(
 	args: &mut [OsString],
+	backend: Backend,
 	placeholder: &'static str,
 	replacement: &Path,
 ) -> Result<(), SandboxError> {
@@ -184,23 +199,21 @@ fn replace_placeholder(
 	if found {
 		Ok(())
 	} else {
-		Err(SandboxError::MissingPlanPlaceholder {
-			backend: Backend::Landlock,
-			placeholder,
-		})
+		Err(SandboxError::MissingPlanPlaceholder { backend, placeholder })
 	}
 }
 
 #[cfg(target_os = "linux")]
 fn secure_temp_file(prefix: &str) -> Result<NamedTempFile, SandboxError> {
-	let file = Builder::new()
-		.prefix(prefix)
-		.tempfile()
-		.map_err(|source| SandboxError::Artifact {
-			operation: SandboxOperation::Prepare,
-			path: std::env::temp_dir(),
-			source,
-		})?;
+	let file =
+		Builder::new()
+			.prefix(prefix)
+			.tempfile()
+			.map_err(|source| SandboxError::Artifact {
+				operation: SandboxOperation::Prepare,
+				path: std::env::temp_dir(),
+				source,
+			})?;
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::PermissionsExt as _;
@@ -216,11 +229,7 @@ fn secure_temp_file(prefix: &str) -> Result<NamedTempFile, SandboxError> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_policy(
-	mut writer: impl Write,
-	spec: &SandboxSpec,
-	program: &Path,
-) -> io::Result<()> {
+fn write_policy(mut writer: impl Write, spec: &SandboxSpec, program: &Path) -> io::Result<()> {
 	writer.write_all(POLICY_MAGIC)?;
 	writer.write_all(&[u8::from(spec.readable.is_empty())])?;
 	let mut readable = if spec.readable.is_empty() {
@@ -254,9 +263,8 @@ fn write_paths(writer: &mut impl Write, paths: &[PathBuf]) -> io::Result<()> {
 	writer.write_all(&count.to_le_bytes())?;
 	for path in paths {
 		let bytes = os_string_bytes(path.as_os_str());
-		let length = u32::try_from(bytes.len()).map_err(|_| {
-			io::Error::new(io::ErrorKind::InvalidInput, "Landlock path is too long")
-		})?;
+		let length = u32::try_from(bytes.len())
+			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Landlock path is too long"))?;
 		writer.write_all(&length.to_le_bytes())?;
 		writer.write_all(&bytes)?;
 	}
@@ -290,21 +298,23 @@ pub(crate) fn probe() -> BackendStatus {
 	{
 		BackendStatus::unavailable(Backend::Landlock, ProbeFailure::WrongHost {
 			backend: Backend::Landlock,
-			os: std::env::consts::OS,
+			os:      std::env::consts::OS,
 		})
 	}
 	#[cfg(target_os = "linux")]
 	{
 		match abi() {
 			Some(available) if available >= MIN_ABI => BackendStatus::available(Backend::Landlock),
-			Some(available) => BackendStatus::unavailable(
-				Backend::Landlock,
-				ProbeFailure::LandlockAbi { required: MIN_ABI, available },
-			),
+			Some(available) => {
+				BackendStatus::unavailable(Backend::Landlock, ProbeFailure::LandlockAbi {
+					required: MIN_ABI,
+					available,
+				})
+			},
 			None => BackendStatus::unavailable(Backend::Landlock, ProbeFailure::Start {
-				backend: Backend::Landlock,
+				backend:   Backend::Landlock,
 				operation: SandboxOperation::Probe,
-				source: io::Error::last_os_error(),
+				source:    io::Error::last_os_error(),
 			}),
 		}
 	}
@@ -312,7 +322,7 @@ pub(crate) fn probe() -> BackendStatus {
 
 /// Applies the hidden-child policy and replaces the helper process image.
 ///
-/// The caller must dispatch this before application threads start. The helper
+/// The caller must dispatch this before launching untrusted work. The helper
 /// reads an owned BPF artifact, optionally applies an owned Landlock manifest,
 /// and then `execve(2)`s the command following the required `--` separator.
 pub fn run_child_entry() -> Result<(), SandboxError> {
@@ -352,8 +362,8 @@ fn compile_filter(mode: FilterMode) -> Result<seccompiler::BpfProgram, SandboxEr
 	use std::collections::BTreeMap;
 
 	use seccompiler::{
-		SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-		SeccompRule, TargetArch,
+		SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+		TargetArch,
 	};
 
 	fn deny(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, syscall: i64) {
@@ -417,19 +427,13 @@ fn compile_filter(mode: FilterMode) -> Result<seccompiler::BpfProgram, SandboxEr
 			}
 		},
 		FilterMode::Outbound => {
-			for syscall in [
-				libc::SYS_accept,
-				libc::SYS_accept4,
-				libc::SYS_bind,
-				libc::SYS_listen,
-			] {
+			for syscall in [libc::SYS_accept, libc::SYS_accept4, libc::SYS_listen] {
 				deny(&mut rules, syscall);
 			}
 		},
 		FilterMode::Enabled => {},
 	}
-	let arch =
-		TargetArch::try_from(std::env::consts::ARCH).map_err(seccompiler::Error::from)?;
+	let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(seccompiler::Error::from)?;
 	let filter = SeccompFilter::new(
 		rules,
 		SeccompAction::Allow,
@@ -463,17 +467,17 @@ fn read_program(path: &Path) -> Result<seccompiler::BpfProgram, SandboxError> {
 	if bytes.is_empty() || bytes.len() % 8 != 0 {
 		return Err(SandboxError::Artifact {
 			operation: SandboxOperation::Launch,
-			path: path.to_path_buf(),
-			source: io::Error::new(io::ErrorKind::InvalidData, "invalid seccomp BPF artifact"),
+			path:      path.to_path_buf(),
+			source:    io::Error::new(io::ErrorKind::InvalidData, "invalid seccomp BPF artifact"),
 		});
 	}
 	Ok(bytes
 		.chunks_exact(8)
 		.map(|chunk| seccompiler::sock_filter {
 			code: u16::from_le_bytes([chunk[0], chunk[1]]),
-			jt: chunk[2],
-			jf: chunk[3],
-			k: u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
+			jt:   chunk[2],
+			jf:   chunk[3],
+			k:    u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
 		})
 		.collect())
 }
@@ -483,12 +487,20 @@ fn run_child_entry_linux() -> Result<(), SandboxError> {
 	use std::os::unix::process::CommandExt as _;
 
 	let mut args = std::env::args_os().skip(2);
-	let bpf_path = args.next().ok_or(SandboxError::InvalidSandboxChildArguments)?;
+	let bpf_path = args
+		.next()
+		.ok_or(SandboxError::InvalidSandboxChildArguments)?;
 	let program = read_program(Path::new(&bpf_path))?;
-	let next = args.next().ok_or(SandboxError::InvalidSandboxChildArguments)?;
+	let next = args
+		.next()
+		.ok_or(SandboxError::InvalidSandboxChildArguments)?;
 	let (backend, command) = if next == OsStr::new("--landlock") {
-		let policy = args.next().ok_or(SandboxError::InvalidSandboxChildArguments)?;
-		let separator = args.next().ok_or(SandboxError::InvalidSandboxChildArguments)?;
+		let policy = args
+			.next()
+			.ok_or(SandboxError::InvalidSandboxChildArguments)?;
+		let separator = args
+			.next()
+			.ok_or(SandboxError::InvalidSandboxChildArguments)?;
 		if separator != OsStr::new("--") {
 			return Err(SandboxError::InvalidSandboxChildArguments);
 		}
@@ -503,19 +515,14 @@ fn run_child_entry_linux() -> Result<(), SandboxError> {
 	let command = command.ok_or(SandboxError::InvalidSandboxChildArguments)?;
 	seccompiler::apply_filter(&program)?;
 	let source = std::process::Command::new(command).args(args).exec();
-	Err(SandboxError::BackendIo {
-		backend,
-		operation: SandboxOperation::Launch,
-		source,
-	})
+	Err(SandboxError::BackendIo { backend, operation: SandboxOperation::Launch, source })
 }
 
 #[cfg(target_os = "linux")]
 fn apply_landlock(path: &Path) -> Result<(), SandboxError> {
 	use landlock::{
 		ABI, Access as _, AccessFs, CompatLevel, Compatible as _, Ruleset, RulesetAttr,
-		RulesetCreatedAttr,
-		RulesetStatus,
+		RulesetCreatedAttr, RulesetStatus,
 	};
 
 	let bytes = fs::read(path).map_err(|source| SandboxError::Artifact {
@@ -595,4 +602,29 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> io::Result<&'
 	let value = &bytes[*cursor..end];
 	*cursor = end;
 	Ok(value)
+}
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use super::{FilterMode, compile_filter, read_program, write_program};
+
+	#[test]
+	fn strict_filter_serializes_as_a_larger_deny_program() {
+		let strict = compile_filter(FilterMode::DisabledStrict).expect("strict filter");
+		let enabled = compile_filter(FilterMode::Enabled).expect("baseline filter");
+		assert!(strict.len() > enabled.len());
+
+		let mut file = tempfile::NamedTempFile::new().expect("BPF artifact");
+		write_program(file.as_file_mut(), &strict).expect("serialize BPF");
+		let decoded = read_program(file.path()).expect("deserialize BPF");
+		assert_eq!(decoded.len(), strict.len());
+		assert!(
+			decoded
+				.iter()
+				.zip(strict.iter())
+				.all(|(left, right)| left.code == right.code
+					&& left.jt == right.jt
+					&& left.jf == right.jf
+					&& left.k == right.k)
+		);
+	}
 }

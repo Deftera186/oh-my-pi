@@ -51,6 +51,11 @@ fn deny_default_base_has_process_platform_ipc_and_terminal_allowances() {
 	] {
 		assert!(profile.contains(allowance), "missing base allowance: {allowance}");
 	}
+	assert_ordered(&profile, &[
+		"(deny file-write* (subpath \"/\"))",
+		"(allow file-write* file-ioctl (literal \"/dev/ptmx\") (literal \"/dev/tty\") (subpath \
+		 \"/dev/fd\"))",
+	]);
 }
 
 #[test]
@@ -107,6 +112,8 @@ fn scoped_reads_preserve_loader_devices_and_rule_precedence() {
 		"(allow file-read-data (literal \"/\"))",
 		"(allow file-read* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \
 		 \"/dev/random\") (literal \"/dev/urandom\"))",
+		"(allow file-read* (literal \"/dev/ptmx\") (literal \"/dev/tty\"))",
+		"(allow file-read* (subpath \"/dev/fd\"))",
 		&format!("(subpath \"{readable}\")"),
 		&format!("(deny file-read* (literal \"{denied}\"))"),
 	]);
@@ -226,6 +233,22 @@ fn enabled_network_keeps_host_unix_sockets_open() {
 	assert!(profile.contains("(allow network-outbound)"));
 	assert!(profile.contains("(allow network-inbound)"));
 	assert!(!profile.contains("(deny network-outbound (remote unix-socket))"));
+}
+#[test]
+fn outbound_does_not_overclaim_ipc_isolation() {
+	let program = std::env::current_exe().expect("test executable");
+	let mut spec = caveated_spec(program);
+	spec.set_network(NetworkMode::Outbound);
+	let plan = compile(&spec);
+
+	assert!(plan.requested().contains(Capability::IpcRestrict));
+	assert!(!plan.enforced().contains(Capability::IpcRestrict));
+	assert!(
+		plan
+			.caveats()
+			.iter()
+			.any(|caveat| caveat.capability == Some(Capability::IpcRestrict))
+	);
 }
 
 #[test]
@@ -504,6 +527,10 @@ mod live {
 				if libc::dup2(fd, 9) == -1 {
 					return Err(std::io::Error::last_os_error());
 				}
+				let flags = libc::fcntl(9, libc::F_GETFD);
+				if flags == -1 || libc::fcntl(9, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+					return Err(std::io::Error::last_os_error());
+				}
 				Ok(())
 			});
 		}
@@ -579,6 +606,29 @@ mod live {
 		command.command.env("OMP_SOCKET", &socket);
 		assert_success(&command.output().expect("run allowed Unix socket probe"));
 	}
+	#[test]
+	fn disabled_network_denies_an_undeclared_unix_socket() {
+		let Some(runner) = runner() else { return };
+		let root = tempdir().expect("socket root");
+		let socket = root.path().join("service.sock");
+		let _listener = UnixListener::bind(&socket).expect("Unix listener");
+		let mut command = command_for(runner, &probe_spec(), "socket-denied");
+		command.command.env("OMP_SOCKET", &socket);
+		assert_success(&command.output().expect("run disabled Unix socket probe"));
+	}
+
+	#[test]
+	fn enabled_network_keeps_unix_sockets_open() {
+		let Some(runner) = runner() else { return };
+		let root = tempdir().expect("socket root");
+		let socket = root.path().join("service.sock");
+		let _listener = UnixListener::bind(&socket).expect("Unix listener");
+		let mut spec = probe_spec();
+		spec.set_network(NetworkMode::Enabled);
+		let mut command = command_for(runner, &spec, "socket-allowed");
+		command.command.env("OMP_SOCKET", &socket);
+		assert_success(&command.output().expect("run enabled Unix socket probe"));
+	}
 
 	#[test]
 	fn outbound_network_can_reach_dns_configuration_services() {
@@ -631,7 +681,8 @@ mod live {
 		}
 
 		let mut spec = SandboxSpec::new("/usr/bin/id");
-		spec.arg("-un")
+		spec
+			.arg("-un")
 			.set_degradation(DegradationPolicy::AllowCaveats);
 		let output = command_for(runner, &spec, "mach-libinfo")
 			.output()

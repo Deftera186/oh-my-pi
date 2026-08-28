@@ -10,11 +10,10 @@ use std::{
 #[cfg(target_os = "linux")]
 use omp_core::CowBytes;
 
-use crate::SandboxOperation;
 use crate::{
 	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
-	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
-	WriteMode,
+	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxOperation,
+	SandboxSpec, WriteMode,
 	paths::{insert_path, path_under_any, temp_roots},
 	runner::COMMAND_WRAPPER_PLACEHOLDER,
 };
@@ -147,11 +146,7 @@ pub(crate) fn compile(
 		]);
 	}
 	if seccomp_helper.is_some() {
-		push_bind(
-			&mut argv,
-			"--ro-bind",
-			Path::new(super::landlock::BPF_PLACEHOLDER),
-		);
+		push_bind(&mut argv, "--ro-bind", Path::new(super::landlock::BPF_PLACEHOLDER));
 	}
 
 	argv.push(OsString::from("--"));
@@ -167,6 +162,12 @@ pub(crate) fn compile(
 	argv.extend(spec.args.iter().cloned());
 
 	let mut plan = Plan::new(Backend::Bubblewrap, requested, enforced, argv, true);
+	if spec.network == NetworkMode::Disabled && spec.unix_sockets.is_empty() {
+		plan.add_caveat(Caveat::general(
+			"Bubblewrap seccomp denies all socket creation plus ptrace, process_vm access, and \
+			 io_uring",
+		));
+	}
 	if spec.network == NetworkMode::Outbound {
 		plan.add_caveat(Caveat::capability(
 			Capability::NetOutbound,

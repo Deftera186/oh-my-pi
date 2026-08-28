@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use omp_sandbox::{
-	Backend, Capability, DegradationPolicy, NetworkMode, Runner, SandboxError, SandboxSpec, WriteMode,
+	Backend, Capability, DegradationPolicy, NetworkMode, Runner, SandboxError, SandboxSpec,
+	WriteMode,
 };
 use tempfile::tempdir;
 
@@ -25,9 +26,11 @@ fn helper_argv_contract_carries_owned_policy_artifacts() {
 	assert!(plan.enforced().contains(Capability::NetDisable));
 	assert!(plan.enforced().contains(Capability::FsWriteDeny));
 	assert!(!plan.enforced().contains(Capability::IpcRestrict));
-	assert!(plan.caveats().iter().any(|caveat| {
-		caveat.capability.is_none() && caveat.message.as_str().contains("/proc")
-	}));
+	assert!(
+		plan.caveats().iter().any(|caveat| {
+			caveat.capability.is_none() && caveat.message.as_str().contains("/proc")
+		})
+	);
 }
 
 #[test]
@@ -54,7 +57,10 @@ fn pathname_socket_allowance_drops_network_disable_claim() {
 	assert!(!plan.enforced().contains(Capability::NetDisable));
 	assert!(plan.caveats().iter().any(|caveat| {
 		caveat.capability == Some(Capability::NetDisable)
-			&& caveat.message.as_str().contains("inherited Internet socket")
+			&& caveat
+				.message
+				.as_str()
+				.contains("inherited Internet socket")
 	}));
 }
 

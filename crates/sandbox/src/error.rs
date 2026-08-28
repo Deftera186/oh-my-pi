@@ -392,7 +392,8 @@ pub enum SandboxError {
 	/// The hidden same-binary sandbox child received a malformed argv contract.
 	#[error("invalid hidden sandbox child arguments")]
 	InvalidSandboxChildArguments,
-	/// The kernel accepted the Landlock ruleset request without fully enforcing it.
+	/// The kernel accepted the Landlock ruleset request without fully enforcing
+	/// it.
 	#[cfg(target_os = "linux")]
 	#[error("the kernel did not fully enforce the Landlock ruleset")]
 	LandlockNotEnforced,

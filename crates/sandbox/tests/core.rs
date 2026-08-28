@@ -56,7 +56,11 @@ fn portable_capabilities_and_backend_names_are_stable() {
 			"seatbelt",
 		],
 	);
-	assert!(!Backend::Landlock.capabilities().contains(Capability::IpcRestrict));
+	assert!(
+		!Backend::Landlock
+			.capabilities()
+			.contains(Capability::IpcRestrict)
+	);
 	assert!(
 		!Backend::Landlock
 			.capabilities()
