@@ -69,33 +69,74 @@ impl Interrupt {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("invocation event stream is closed")]
 pub struct InvocationSendError;
-/// Whether a committed raw payload supersedes mismatched streamed fragments.
+/// Whether a committed canonical payload is the deterministic settlement of
+/// the provider's streamed fragments.
 ///
-/// The agent loop and provider codecs may canonicalize committed arguments
-/// (serde re-serialization drops whitespace and normalizes escapes), and the
-/// recovery layer may repair a sloppy stream into a valid document. A
-/// cosmetic difference must not reject the invocation: the commitment is
-/// accepted when both sides parse to the same tolerant JSON document. A
-/// structurally incomplete stream never yields to a repaired commitment:
-/// finalization must reject it before effects are authorized. A freeform
-/// grammar call streams raw text that recovery
-/// canonicalizes into `{"input": <text>}`; the commitment is accepted when
-/// its `input` property is exactly the streamed text, even if that text
-/// happens to parse as JSON. Two documents with different values remain a
-/// protocol violation.
+/// Provider codecs normalize JSON spelling, while recovery may apply bounded
+/// syntax repair and schema-directed scalar coercion before the call becomes
+/// executable and durable. Those changes must not make live execution diverge
+/// from the canonical call replayed from the journal. Structurally incomplete
+/// streams and materially different values remain protocol violations. A
+/// freeform grammar call is the one shape-changing exception: recovery wraps
+/// its exact streamed text in the canonical `input` object.
 fn commit_supersedes_stream(streamed: &str, committed: &str) -> bool {
-	let Ok(committed_doc) = serde_json::from_str::<serde_json::Value>(committed) else {
+	let Ok(committed_doc) = serde_json::from_str::<Value>(committed) else {
 		return false;
 	};
-	if committed_doc
-		.get("input")
-		.and_then(serde_json::Value::as_str)
-		== Some(streamed)
-	{
+	if committed_doc.get("input").and_then(Value::as_str) == Some(streamed) {
 		return true;
 	}
 	match (omp_slopjson::parse(streamed), omp_slopjson::parse(committed)) {
-		(Ok(streamed), Ok(committed)) => streamed == committed,
+		(Ok(streamed), Ok(committed)) => repaired_value_eq(&streamed, &committed),
+		_ => false,
+	}
+}
+
+fn repaired_value_eq(streamed: &Value, committed: &Value) -> bool {
+	if streamed == committed {
+		return true;
+	}
+	match (streamed, committed) {
+		(Value::Object(streamed), Value::Object(committed)) => {
+			streamed.len() == committed.len()
+				&& streamed.iter().all(|(key, value)| {
+					committed
+						.get(key)
+						.is_some_and(|settled| repaired_value_eq(value, settled))
+				})
+		},
+		(Value::Array(streamed), Value::Array(committed)) => {
+			streamed.len() == committed.len()
+				&& streamed
+					.iter()
+					.zip(committed)
+					.all(|(value, settled)| repaired_value_eq(value, settled))
+		},
+		(Value::String(streamed), Value::Object(_) | Value::Array(_)) => {
+			let trimmed = streamed.trim();
+			serde_json::from_str::<Value>(&trimmed)
+				.is_ok_and(|parsed| repaired_value_eq(&parsed, committed))
+		},
+		(Value::String(streamed), Value::Bool(committed)) => match streamed.trim().as_str() {
+			"true" | "yes" | "1" => *committed,
+			"false" | "no" | "0" => !*committed,
+			_ => false,
+		},
+		(Value::String(streamed), Value::Number(committed)) => {
+			let trimmed = streamed.trim();
+			trimmed
+				.parse::<i64>()
+				.is_ok_and(|parsed| committed.as_i64() == Some(parsed))
+				|| trimmed
+					.parse::<f64>()
+					.is_ok_and(|parsed| committed.as_f64() == parsed)
+		},
+		(value, Value::String(committed)) if !matches!(value, Value::String(_)) => {
+			value.to_string() == committed.as_str()
+		},
+		(value, Value::Array(committed)) if !matches!(value, Value::Array(_)) => {
+			committed.len() == 1 && repaired_value_eq(value, &committed[0])
+		},
 		_ => false,
 	}
 }
@@ -180,7 +221,7 @@ impl InvocationFeed {
 		Ok(())
 	}
 
-	/// Closes argument streaming with its exact complete raw emission.
+	/// Closes argument streaming with the authoritative canonical settlement.
 	pub fn args_committed(&self, raw: Str) -> Result<(), InvocationSendError> {
 		if self.tx.is_disconnected() {
 			return Err(InvocationSendError);
@@ -289,7 +330,7 @@ pub struct FinalizedArgs {
 }
 
 impl FinalizedArgs {
-	/// Exact provider-emitted argument bytes.
+	/// Authoritative canonical commitment supplied by the invocation host.
 	pub const fn raw(&self) -> &Str {
 		&self.raw
 	}
@@ -570,10 +611,23 @@ async fn validate_structure(
 					.object_keys(&node.source)
 					.await
 					.map_err(|error| param_error(error, arg_specs))?;
+				let parent = arg_specs.and_then(|(rev, specs)| specs.get(rev, &node.canonical));
 				let mut seen = SmallVec::<SmallVec<ArgPath, 4>, 8>::new();
 				for key in &keys {
 					let candidate = child_path(&node.canonical, ArgPath::Key(key.clone()));
 					let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
+					if spec.is_none()
+						&& parent.is_some_and(|parent| {
+							!parent.additional_properties && !parent.from_union_branch
+						}) {
+						return Err(ParamError::Args(Box::new(ArgIssue {
+							path:     candidate.into_iter().collect(),
+							expected: sf!("no additional properties"),
+							kind:     ArgIssueKind::Malformed,
+							example:  None,
+							found:    Some(sf!("additional property")),
+						})));
+					}
 					let identity = spec.map_or_else(|| candidate.clone(), |spec| spec.path.clone());
 					if seen.contains(&identity) {
 						let expected = spec
@@ -649,21 +703,9 @@ fn canonicalize(
 	match value {
 		Value::Object(object) => {
 			let mut canonical = omp_slopjson::Object::with_capacity(object.len());
-			let parent = arg_specs.and_then(|(rev, specs)| specs.get(rev, path));
 			for (key, value) in object {
 				let candidate = child_path(path, ArgPath::Key(key.clone()));
 				let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
-				if spec.is_none()
-					&& parent
-						.is_some_and(|parent| !parent.additional_properties && !parent.from_union_branch)
-				{
-					repairs.push(Repair {
-						path:   candidate,
-						kind:   RepairKind::Elision,
-						detail: sf!("unrecognized key {key} -> <absent>"),
-					});
-					continue;
-				}
 				let (canonical_path, canonical_key) = if let Some(spec) = spec {
 					let canonical_key = match spec.path.last() {
 						Some(ArgPath::Key(key)) => key.clone(),
@@ -848,7 +890,7 @@ impl<'c> IncomingParams<'c> {
 		self.finalize_with_interrupts(false).await
 	}
 
-	/// Returns the exact provider-emitted argument text after the feed closes.
+	/// Returns the authoritative canonical argument commitment.
 	pub async fn raw(&mut self) -> Result<Str, ParamError> {
 		self
 			.drive_commit_raw(false)
@@ -1335,6 +1377,55 @@ mod tests {
 		let raw = block_on(params.committed()).expect("repaired commitment is authoritative");
 		assert_eq!(raw.as_str(), r#"{"path":"crates"}"#);
 	}
+	#[test]
+	fn schema_coerced_commitment_is_the_executed_document() {
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.arg_text(sf!(r#"{{"args":{{"flag":"yes","count":"42","ratio":"3.5","label":99}}}}"#,))
+			.expect("fragment remains connected");
+		feed
+			.args_committed(sf!(r#"{{"args":{{"flag":true,"count":42,"ratio":3.5,"label":"99"}}}}"#,))
+			.expect("commit remains connected");
+		let effective =
+			block_on(params.committed()).expect("schema-directed scalar repair is authoritative");
+		assert_eq!(
+			effective.as_str(),
+			r#"{"args":{"flag":true,"count":42,"ratio":3.5,"label":"99"}}"#,
+		);
+	}
+	#[test]
+	fn closed_object_rejects_an_unknown_member_instead_of_eliding_it() {
+		let rev = Rev { family: sf!("python"), n: 1 };
+		let mut specs = ArgSpecRegistry::new();
+		for path in [smallvec![ArgPath::Key(sf!("args"))], smallvec![
+			ArgPath::Key(sf!("args")),
+			ArgPath::Key(sf!("label"))
+		]] {
+			specs
+				.register(rev.clone(), ArgSpec {
+					path,
+					aliases: SmallVec::new(),
+					coerce: SmallVec::new(),
+					from_union_branch: false,
+					expected: sf!("a declared argument"),
+					example: None,
+					additional_properties: false,
+				})
+				.expect("argument declaration registers");
+		}
+		specs.seal();
+		let (feed, mut params) = bound_params(&rev, &specs);
+		feed
+			.args_committed(sf!(r#"{{"args":{{"label":"ok","extra":1}}}}"#))
+			.expect("arguments remain connected");
+		let error = block_on(params.finalize()).expect_err("closed object rejects extra member");
+		let ParamError::Args(issue) = error else {
+			panic!("closed object failure must remain a structured argument issue");
+		};
+		assert_eq!(issue.path, [ArgPath::Key(sf!("args")), ArgPath::Key(sf!("extra"))],);
+		assert_eq!(issue.kind, ArgIssueKind::Malformed);
+		assert_eq!(issue.expected.as_str(), "no additional properties");
+	}
 
 	#[test]
 	fn truncated_stream_cannot_be_superseded_by_repaired_commitment() {
@@ -1345,9 +1436,7 @@ mod tests {
 		feed
 			.args_committed(sf!(r#"{{"command":"echo never"}}"#))
 			.expect("commit remains connected");
-		let error = block_on(params.committed()).expect_err("truncated stream must be rejected");
-		assert!(matches!(error, CommitError::Protocol(message)
-			if message.contains("committed arguments differ")));
+		assert!(matches!(block_on(params.committed()), Err(CommitError::Protocol(_)),));
 	}
 
 	#[test]
