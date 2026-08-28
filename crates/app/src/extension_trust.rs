@@ -15,9 +15,12 @@ use omp_tui::{
 	components::{Button, Col, Markdown, Shader, TextLeaf},
 	shader::Eclipse,
 };
+use strum::IntoStaticStr;
 
 const ALLOW_ONCE: &str = "extension-trust-once";
+const ALLOW_SESSION: &str = "extension-trust-session";
 const ALLOW_PERSIST: &str = "extension-trust-persist";
+const ALLOW_SUBTREE: &str = "extension-trust-subtree";
 const DENY: &str = "extension-trust-deny";
 /// Completed interactive admission decisions carried into the first session
 /// journal before the first agent turn.
@@ -51,7 +54,7 @@ pub async fn prompt(
 		.await
 		.into_diagnostic()?;
 	let book = Arc::new(ApprovalBook::with_prefix("extension-approval"));
-	let (route, inbox) = ApprovalRoute::new(book);
+	let (route, inbox) = ApprovalRoute::new(book, None);
 	let mut session = Vec::new();
 	let mut tickets = Vec::with_capacity(requests.len());
 	for request in requests {
@@ -63,8 +66,16 @@ pub async fn prompt(
 		let action = loop {
 			match app.next().await.into_diagnostic()? {
 				Some(AppEvent::Pressed(id)) if id.as_str() == ALLOW_ONCE => break GrantAction::Once,
+				Some(AppEvent::Pressed(id)) if id.as_str() == ALLOW_SESSION => {
+					break GrantAction::Session;
+				},
 				Some(AppEvent::Pressed(id)) if id.as_str() == ALLOW_PERSIST => {
 					break GrantAction::Persist;
+				},
+				Some(AppEvent::Pressed(id))
+					if id.as_str() == ALLOW_SUBTREE && request.grant.workspace.is_some() =>
+				{
+					break GrantAction::Subtree;
 				},
 				Some(AppEvent::Pressed(id)) if id.as_str() == DENY => break GrantAction::Deny,
 				Some(AppEvent::Key(Key::Esc)) | None => break GrantAction::Deny,
@@ -82,9 +93,24 @@ pub async fn prompt(
 		let _ = app.ui_mut().close_top_overlay();
 		tickets.push(ticket);
 		match action {
-			GrantAction::Once => session.push(completed_grant(&request.grant, "interactive-once")),
-			GrantAction::Persist => {
-				let grant = completed_grant(&request.grant, "interactive");
+			GrantAction::Once => session.push(completed_grant(
+				&request.grant,
+				omp_ext::trust::GrantDuration::Once,
+				omp_ext::trust::GrantScope::Exact,
+			)),
+			GrantAction::Session => session.push(completed_grant(
+				&request.grant,
+				omp_ext::trust::GrantDuration::Session,
+				omp_ext::trust::GrantScope::Exact,
+			)),
+			GrantAction::Persist | GrantAction::Subtree => {
+				let scope = if action == GrantAction::Subtree {
+					omp_ext::trust::GrantScope::Subtree
+				} else {
+					omp_ext::trust::GrantScope::Exact
+				};
+				let grant =
+					completed_grant(&request.grant, omp_ext::trust::GrantDuration::Persistent, scope);
 				GrantsFile::persist(grant_path, grant.clone()).into_diagnostic()?;
 				session.push(grant);
 			},
@@ -94,26 +120,25 @@ pub async fn prompt(
 	Ok(PromptOutcome { session_grants: session, tickets })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "snake_case")]
 enum GrantAction {
 	Once,
+	Session,
 	Persist,
+	Subtree,
 	Deny,
 }
 
 impl GrantAction {
 	fn decision(self) -> ApprovalDecision {
-		let (approved, scope, reason) = match self {
-			Self::Once => (true, sf!("once"), None),
-			Self::Persist => (true, sf!("persist"), None),
-			Self::Deny => (false, sf!("once"), Some(sf!("extension grant denied by user"))),
-		};
+		let approved = self != Self::Deny;
 		ApprovalDecision {
 			approved,
-			scope,
+			scope: Str::new_static(self.into()),
 			source: ApprovalSource::User,
 			decided_by: None,
-			reason,
+			reason: (!approved).then(|| sf!("extension grant denied by user")),
 			audited: false,
 		}
 	}
@@ -132,7 +157,7 @@ fn approval_spec(request: &ExtensionGrantRequest) -> ApprovalSpec {
 		),
 		subject:       request.grant.id.clone(),
 		kind:          sf!("extension_trust"),
-		scopes:        vec![sf!("persist")],
+		scopes:        vec![sf!("once"), sf!("session"), sf!("persist"), sf!("subtree")],
 		default:       Some(false),
 		route:         sf!("local"),
 		approver:      None,
@@ -165,10 +190,16 @@ fn joined(capabilities: &[Str], fallback: &'static str) -> String {
 		.join(", ")
 }
 
-fn completed_grant(template: &Grant, granted_by: &'static str) -> Grant {
+fn completed_grant(
+	template: &Grant,
+	duration: omp_ext::trust::GrantDuration,
+	scope: omp_ext::trust::GrantScope,
+) -> Grant {
 	Grant {
 		granted_at: Str::new(jiff::Timestamp::now().to_string()),
-		granted_by: Str::new_static(granted_by),
+		granted_by: sf!("interactive"),
+		duration,
+		scope,
 		..template.clone()
 	}
 }
@@ -178,15 +209,27 @@ fn show_dialog(ui: &mut Ui, request: &ExtensionGrantRequest, ticket: &omp_agent:
 		.reasons
 		.first()
 		.expect("extension ticket has one Core-owned reason");
-	let actions = Col::new()
+	let mut actions = Col::new()
 		.with(Prop::Gap, 1_u16)
 		.child(Button::new().with(Prop::Id, ALLOW_ONCE).child("Allow once"))
 		.child(
 			Button::new()
+				.with(Prop::Id, ALLOW_SESSION)
+				.child("Allow for this session"),
+		)
+		.child(
+			Button::new()
 				.with(Prop::Id, ALLOW_PERSIST)
 				.child("Allow and remember"),
-		)
-		.child(Button::new().with(Prop::Id, DENY).child("Deny"));
+		);
+	if request.grant.workspace.is_some() {
+		actions = actions.child(
+			Button::new()
+				.with(Prop::Id, ALLOW_SUBTREE)
+				.child("Trust this folder and everything under it"),
+		);
+	}
+	let actions = actions.child(Button::new().with(Prop::Id, DENY).child("Deny"));
 	let content = Col::new()
 		.with(Prop::Gap, 1_u16)
 		.child(Markdown::new().text(reason.body.clone()))
@@ -229,11 +272,13 @@ mod tests {
 				publisher:         sf!("ed25519:publisher"),
 				layer:             Layer::Client,
 				workspace:         None,
+				scope:             omp_ext::trust::GrantScope::Exact,
 				capability_digest: sf!("b3:capabilities"),
 				tier:              TrustTier::Sandboxed,
 				ship:              sf!("installed"),
 				granted_at:        sf!(""),
 				granted_by:        sf!("interactive"),
+				duration:          omp_ext::trust::GrantDuration::Persistent,
 			},
 			requested_capabilities: Arc::from([sf!("env.fs.read"), sf!("env.exec")]),
 			granted_capabilities:   Arc::from([sf!("env.fs.read")]),
@@ -249,7 +294,7 @@ mod tests {
 		assert!(spec.body.contains("ed25519:publisher"));
 		assert!(spec.body.contains("env.exec"));
 		assert!(spec.body.contains("Currently granted"));
-		assert_eq!(spec.scopes, [sf!("persist")]);
+		assert_eq!(spec.scopes, [sf!("once"), sf!("session"), sf!("persist"), sf!("subtree")]);
 	}
 
 	#[test]
@@ -260,6 +305,12 @@ mod tests {
 		let persist = GrantAction::Persist.decision();
 		assert!(persist.approved);
 		assert_eq!(persist.scope.as_str(), "persist");
+		let session = GrantAction::Session.decision();
+		assert!(session.approved);
+		assert_eq!(session.scope.as_str(), "session");
+		let subtree = GrantAction::Subtree.decision();
+		assert!(subtree.approved);
+		assert_eq!(subtree.scope.as_str(), "subtree");
 		let deny = GrantAction::Deny.decision();
 		assert!(!deny.approved);
 		assert_eq!(deny.source, ApprovalSource::User);

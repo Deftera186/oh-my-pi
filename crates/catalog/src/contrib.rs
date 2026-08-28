@@ -163,11 +163,12 @@ impl OverlayStore {
 /// Public construction path for one immutable [`CatalogOverlay`].
 #[derive(Clone, Debug)]
 pub struct CatalogOverlayBuilder {
-	source:    ProvenanceSource,
-	providers: Vec<ProviderDef>,
-	models:    Vec<ModelOverlay>,
-	routes:    Vec<RouteOverlay>,
-	aliases:   Vec<ScopedAlias>,
+	source:     ProvenanceSource,
+	auth_specs: Vec<AuthSpec>,
+	providers:  Vec<ProviderDef>,
+	models:     Vec<ModelOverlay>,
+	routes:     Vec<RouteOverlay>,
+	aliases:    Vec<ScopedAlias>,
 }
 
 impl CatalogOverlayBuilder {
@@ -176,6 +177,7 @@ impl CatalogOverlayBuilder {
 	pub const fn new(source: ProvenanceSource) -> Self {
 		Self {
 			source,
+			auth_specs: Vec::new(),
 			providers: Vec::new(),
 			models: Vec::new(),
 			routes: Vec::new(),
@@ -190,6 +192,11 @@ impl CatalogOverlayBuilder {
 	}
 
 	/// Adds one interned authentication-specification addition.
+	pub fn with_auth_spec(mut self, spec: AuthSpec) -> Self {
+		self.auth_specs.push(spec);
+		self
+	}
+
 	/// Adds one model addition or field-granular patch.
 	pub fn with_model(mut self, overlay: ModelOverlay) -> Self {
 		self.models.push(overlay);
@@ -217,11 +224,12 @@ impl CatalogOverlayBuilder {
 	/// Freezes the accumulated layer for publication in an [`OverlayStack`].
 	pub fn build(self) -> CatalogOverlay {
 		CatalogOverlay {
-			source:    self.source,
-			providers: self.providers.into_boxed_slice(),
-			models:    self.models.into_boxed_slice(),
-			routes:    self.routes.into_boxed_slice(),
-			aliases:   self.aliases.into_boxed_slice(),
+			source:     self.source,
+			auth_specs: self.auth_specs.into_boxed_slice(),
+			providers:  self.providers.into_boxed_slice(),
+			models:     self.models.into_boxed_slice(),
+			routes:     self.routes.into_boxed_slice(),
+			aliases:    self.aliases.into_boxed_slice(),
 		}
 	}
 }
@@ -521,17 +529,18 @@ mod tests {
 
 	fn overlay(origin: &str) -> CatalogOverlay {
 		CatalogOverlay {
-			source:    ProvenanceSource {
+			auth_specs: Box::new([]),
+			source:     ProvenanceSource {
 				kind:           ProvenanceKind::Configured,
 				origin:         origin.to_str(),
 				revision:       None,
 				confidence:     EvidenceConfidence::Declared,
 				observed_at_ms: None,
 			},
-			providers: Box::new([]),
-			models:    Box::new([]),
-			routes:    Box::new([]),
-			aliases:   Box::new([]),
+			providers:  Box::new([]),
+			models:     Box::new([]),
+			routes:     Box::new([]),
+			aliases:    Box::new([]),
 		}
 	}
 

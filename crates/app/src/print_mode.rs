@@ -1,9 +1,10 @@
 //! Single-shot, stdout-safe inference mode.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	env, fs, io,
 	io::IsTerminal as _,
+	mem,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
@@ -48,9 +49,13 @@ const MAX_TOTAL_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_AUTO_READ_TEXT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_AUTO_READ_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const DIRECTORY_MENTION_LIMIT: usize = 500;
+const PRINT_DISPOSAL_GRACE: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct JsonTurnState {
 	part_kinds:        BTreeMap<u32, part_start::Kind>,
+	part_tool_calls:   BTreeMap<u32, Str>,
+	opened_tools:      BTreeSet<Str>,
+	finished_tools:    BTreeSet<Str>,
 	assistant_started: bool,
 	settled_items:     Vec<Item>,
 }
@@ -59,6 +64,8 @@ struct JsonTurnState {
 enum PrintTurnError {
 	#[error(transparent)]
 	Session(#[from] omp_sdk::SessionHandleError),
+	#[error(transparent)]
+	Headless(#[from] omp_driver::headless::HeadlessError),
 	#[error(transparent)]
 	Stdout(#[from] io::Error),
 	#[error(transparent)]
@@ -70,9 +77,15 @@ pub async fn run(args: PrintArgs) -> miette::Result<()> {
 	let Some(max_time) = args.max_time.map(|duration| duration.0) else {
 		return run_inner(args).await;
 	};
-	tokio::time::timeout(max_time, run_inner(args))
-		.await
-		.map_err(|_| miette!("print mode exceeded --max-time"))?
+	match tokio::time::timeout(max_time, run_inner(args)).await {
+		Ok(result) => result,
+		Err(_) => {
+			let mut stdout = stdout();
+			let mut stderr = stderr();
+			let _ = stderr.write_all(b"print mode exceeded --max-time\n").await;
+			exit_print_process(&mut stdout, &mut stderr, 1).await
+		},
+	}
 }
 
 async fn run_inner(args: PrintArgs) -> miette::Result<()> {
@@ -225,11 +238,20 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 						omp_driver::discovery::native::NativeRootMode::ExplicitOnly
 					},
 				},
-				skill_settings:     settings_snapshot
-					.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
-					.into_diagnostic()?
-					.get()
-					.clone(),
+				skill_settings:     {
+					let mut skills = settings_snapshot
+						.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
+						.into_diagnostic()?
+						.get()
+						.clone();
+					if args.no_skills {
+						skills.enabled = false;
+					}
+					skills.custom_directories.extend(args.skill.iter().cloned());
+					skills
+				},
+				prompt_templates:   args.prompt_template.clone(),
+				themes:             args.theme.clone(),
 				include_workspace:  !args.extension_launch.no_workspace
 					&& !matches!(
 						args.extension_launch.mode,
@@ -244,6 +266,13 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	)
 	.await
 	.into_diagnostic()?;
+	let mut stderr = stderr();
+	for warning in session.discovery_warnings() {
+		stderr
+			.write_all(format!("Extension load warning: {}\n", sanitize(warning.as_str())).as_bytes())
+			.await
+			.into_diagnostic()?;
+	}
 	let advisor_runtime = if args.advisor {
 		let (runtime, _notices) = AppAdvisorRuntime::compose(
 			session.advisor_parent(),
@@ -262,7 +291,6 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	};
 	let fresh = session.initial_items().is_empty();
 	let startup_plan_ignored = startup_plan_ignored(&settings, fresh, args.plan_yolo);
-	let mut stderr = stderr();
 	if startup_plan_ignored {
 		stderr
 			.write_all(
@@ -355,38 +383,118 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	let summary = match summary {
 		Ok(summary) => summary,
 		Err(error) => {
-			let report = session
-				.finalize(&mut stdout, FinalizerBudget::terminal_error())
-				.await;
-			emit_finalizer_report(report, &mut stderr).await?;
-			return Err(error).into_diagnostic();
+			let error = error.to_string();
+			return finalize_print_session(
+				&mut session,
+				&mut stdout,
+				&mut stderr,
+				FinalizerBudget::terminal_error(),
+				1,
+				Some(&error),
+			)
+			.await;
 		},
 	};
 	match summary.settlement {
 		RunSettlement::Success | RunSettlement::Warning => {},
 		RunSettlement::SilentCompactionTransition => {
-			let report = session
-				.finalize(&mut stdout, FinalizerBudget::success(Duration::from_secs(30)))
-				.await;
-			emit_finalizer_report(report, &mut stderr).await?;
-			return Ok(());
+			return finalize_print_session(
+				&mut session,
+				&mut stdout,
+				&mut stderr,
+				FinalizerBudget::success(Duration::from_secs(30)),
+				0,
+				None,
+			)
+			.await;
 		},
 		RunSettlement::CallerAbort | RunSettlement::MaxTokens | RunSettlement::TerminalFault => {
-			let report = session
-				.finalize(&mut stdout, FinalizerBudget::terminal_error())
-				.await;
-			emit_finalizer_report(report, &mut stderr).await?;
-			return Err(miette!("headless turn settled as {}", <&str>::from(summary.settlement)));
+			let error = format!("headless turn settled as {}", <&str>::from(summary.settlement));
+			return finalize_print_session(
+				&mut session,
+				&mut stdout,
+				&mut stderr,
+				FinalizerBudget::terminal_error(),
+				1,
+				Some(&error),
+			)
+			.await;
 		},
 	}
 
 	if !json {
 		write_final_assistant(&summary, args.print_thoughts, &mut stdout).await?;
 	}
-	let report = session
-		.finalize(&mut stdout, FinalizerBudget::success(Duration::from_secs(30)))
+	finalize_print_session(
+		&mut session,
+		&mut stdout,
+		&mut stderr,
+		FinalizerBudget::success(Duration::from_secs(30)),
+		0,
+		None,
+	)
+	.await
+}
+
+async fn finalize_print_session(
+	session: &mut HeadlessSession,
+	stdout: &mut Stdout,
+	stderr: &mut Stderr,
+	budget: FinalizerBudget,
+	status: i32,
+	error: Option<&str>,
+) -> miette::Result<()> {
+	let report = mem::take(session.finalizer_mut())
+		.finalize(stdout, budget)
 		.await;
-	emit_finalizer_report(report, &mut stderr).await
+	let mut finalizer_error = emit_finalizer_report(report, stderr).await.err();
+
+	// Dispose is the clean path, but the durable session actor can fail to
+	// acknowledge it after a terminal turn. Bound that host-owned tail; print mode
+	// is a process boundary and all mode-owned finalizers (including stdout) have
+	// already drained when the fallback runs.
+	let disposal_budget = FinalizerBudget {
+		advisor:   Duration::ZERO,
+		mnemopi:   Duration::ZERO,
+		stdout:    PRINT_DISPOSAL_GRACE,
+		telemetry: Duration::ZERO,
+	};
+	match tokio::time::timeout(PRINT_DISPOSAL_GRACE, session.finalize(stdout, disposal_budget)).await
+	{
+		Ok(report) => {
+			if let Err(disposal_error) = emit_finalizer_report(report, stderr).await {
+				if finalizer_error.is_none() {
+					finalizer_error = Some(disposal_error);
+				}
+			}
+		},
+		Err(_) => {
+			let mut status = status;
+			if let Some(finalizer_error) = finalizer_error {
+				let _ = stderr
+					.write_all(format!("{finalizer_error}\n").as_bytes())
+					.await;
+				status = 1;
+			}
+			if let Some(error) = error {
+				let _ = stderr.write_all(format!("{error}\n").as_bytes()).await;
+			}
+			exit_print_process(stdout, stderr, status).await
+		},
+	}
+	if let Some(finalizer_error) = finalizer_error {
+		return Err(finalizer_error);
+	}
+	if let Some(error) = error {
+		return Err(miette!("{error}"));
+	}
+	Ok(())
+}
+
+async fn exit_print_process(stdout: &mut Stdout, stderr: &mut Stderr, status: i32) -> ! {
+	let _ = stdout.flush().await;
+	let _ = stderr.flush().await;
+	std::process::exit(status)
 }
 
 fn startup_plan_ignored(
@@ -411,6 +519,9 @@ async fn submit_print_turn(
 ) -> Result<AgentRunSummary, PrintTurnError> {
 	let turn_id = omp_agent::TurnId::new(turn_id());
 	json_state.part_kinds.clear();
+	json_state.part_tool_calls.clear();
+	json_state.opened_tools.clear();
+	json_state.finished_tools.clear();
 	json_state.assistant_started = false;
 	json_state.settled_items.clear();
 	let submit = session.submit(items, turn_id.clone());
@@ -475,6 +586,11 @@ async fn emit_event(
 			Some(turn_event::Event::PartStart(start)) => {
 				if let Ok(kind) = part_start::Kind::try_from(start.kind) {
 					state.part_kinds.insert(start.index, kind);
+					if kind == part_start::Kind::ToolCall && !start.tool_call_id.is_empty() {
+						state
+							.part_tool_calls
+							.insert(start.index, Str::from(start.tool_call_id.as_str()));
+					}
 				}
 				if state.assistant_started {
 					return Ok(());
@@ -489,21 +605,32 @@ async fn emit_event(
 			Some(turn_event::Event::PartDelta(delta)) => {
 				let kind = state.part_kinds.get(&delta.index).copied();
 				let text = String::from_utf8_lossy(&delta.chunk);
+				let assistant_event = match kind {
+					Some(part_start::Kind::ToolCall) => {
+						let Some(call_id) = state.part_tool_calls.get(&delta.index) else {
+							return Ok(());
+						};
+						serde_json::json!({
+							"type":"toolcall_delta",
+							"toolCallId":call_id.as_str(),
+							"delta":sanitize(&text),
+						})
+					},
+					Some(part_start::Kind::Thinking) => {
+						serde_json::json!({"type":"thinking_delta","delta":sanitize(&text)})
+					},
+					_ => {
+						serde_json::json!({"type":"text_delta","delta":sanitize(&text)})
+					},
+				};
 				serde_json::json!({
 					"type":"message_update",
-					"assistantMessageEvent": {
-						"type": match kind {
-							Some(part_start::Kind::Text) => "text_delta",
-							Some(part_start::Kind::Thinking) => "thinking_delta",
-							Some(part_start::Kind::ToolCall) => "toolcall_delta",
-							_ => "text_delta",
-						},
-						"delta":sanitize(&text),
-					}
+					"assistantMessageEvent":assistant_event,
 				})
 			},
 			Some(turn_event::Event::PartEnd(end)) => {
 				state.part_kinds.remove(&end.index);
+				state.part_tool_calls.remove(&end.index);
 				return Ok(());
 			},
 			Some(turn_event::Event::Outcome(outcome)) => {
@@ -514,22 +641,22 @@ async fn emit_event(
 		},
 		AgentEvent::ToolObserved { .. } | AgentEvent::PlanStateChanged { .. } => return Ok(()),
 		AgentEvent::ToolOpened { call_id, name, rev } => {
+			if !state.opened_tools.insert(call_id.clone()) {
+				return Ok(());
+			}
 			serde_json::json!({"type":"tool_execution_start","toolCallId":call_id.as_str(),"toolName":name.as_str(),"rev":rev.to_string()})
 		},
-		AgentEvent::ToolArgs { call_id, fragment, .. } => {
-			serde_json::json!({
-				"type":"message_update",
-				"assistantMessageEvent":{
-					"type":"toolcall_delta",
-					"toolCallId":call_id.as_str(),
-					"delta":String::from_utf8_lossy(fragment)
-				}
-			})
-		},
+		// Turn deltas are the single provider-authored argument stream and already carry the
+		// PartStart call ID. ToolArgs replays those bytes from the invocation pump.
+		AgentEvent::ToolArgs { .. } => return Ok(()),
 		AgentEvent::ToolUpdate { call_id, json } => {
 			serde_json::json!({"type":"tool_execution_update","toolCallId":call_id.as_str(),"content":String::from_utf8_lossy(json)})
 		},
-		AgentEvent::ToolFinished { call_id, .. } => {
+		AgentEvent::ToolFinished { call_id, item, .. } => {
+			if !state.finished_tools.insert(call_id.clone()) {
+				return Ok(());
+			}
+			state.settled_items.push(item.clone());
 			serde_json::json!({"type":"tool_execution_end","toolCallId":call_id.as_str()})
 		},
 		AgentEvent::PhaseChanged { .. }

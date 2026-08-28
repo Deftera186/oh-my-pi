@@ -120,11 +120,17 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 		.into_diagnostic()?
 		.get()
 		.resolve_path_scopes(&project, &home);
-	let skill_settings = settings_snapshot
+	let mut skill_settings = settings_snapshot
 		.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
 		.into_diagnostic()?
 		.get()
 		.clone();
+	if args.no_skills {
+		skill_settings.enabled = false;
+	}
+	skill_settings
+		.custom_directories
+		.extend(args.skill.iter().cloned());
 	let disabled_extensions =
 		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
 	let app_settings = settings_snapshot
@@ -166,6 +172,8 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 				},
 			},
 			skill_settings,
+			prompt_templates: args.prompt_template.clone(),
+			themes: args.theme.clone(),
 			include_workspace: !args.extension_launch.no_workspace && !disabled_extensions,
 			client_installed: Some(data.join("ext/installed.toml")),
 			workspace_identity: Some(omp_driver::discovery::workspace_identity(&project)),
@@ -1035,7 +1043,7 @@ impl Runtime {
 			},
 		};
 		if request.command == "bash" {
-			return self.start_bash(request);
+			return self.start_bash(request).await;
 		}
 		if request.command == "login" {
 			return self.handle_login(request).await;
@@ -1058,7 +1066,7 @@ impl Runtime {
 						return self.send_error(None, "bash", "invalid_request", error.to_string());
 					},
 				};
-				self.start_bash(request)
+				self.start_bash(request).await
 			},
 			Some("abort_bash") => {
 				let request = match serde_json::from_value::<RpcRequest>(value) {
@@ -1142,16 +1150,30 @@ impl Runtime {
 		}
 	}
 
-	fn start_bash(self: &Arc<Self>, request: RpcRequest) -> miette::Result<()> {
+	async fn start_bash(self: &Arc<Self>, request: RpcRequest) -> miette::Result<()> {
 		let params = match parse_params::<BashParams>(&request.params) {
 			Ok(params) => params,
 			Err(error) => {
 				return self.send_error(request.id, "bash", error.code, error.message);
 			},
 		};
+		let project = self.state.lock().project.clone();
+		let admission = {
+			let headless = self.headless.lock().await;
+			headless
+				.session
+				.admit_user_bash(&params.command, &project)
+				.await
+		};
+		let (source, cwd, env_overrides) = match admission {
+			Ok(admission) => admission,
+			Err(denial) => {
+				return self.send_error(request.id, "bash", "policy_denied", denial.reason.to_string());
+			},
+		};
 		let operation_id = new_id("bash");
 		let cancellation = CancellationToken::new();
-		let project = {
+		{
 			let mut state = self.state.lock();
 			if state.active_bash.is_some() {
 				return self.send_error(
@@ -1165,15 +1187,21 @@ impl Runtime {
 				id:           operation_id.clone(),
 				cancellation: cancellation.clone(),
 			});
-			state.project.clone()
-		};
-		let mut command = shell_command(&params.command);
+		}
+		let mut command = shell_command(source.as_str());
 		command
-			.current_dir(project)
+			.current_dir(cwd.as_str())
 			.stdin(Stdio::null())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
 			.kill_on_drop(true);
+		for (name, value) in env_overrides {
+			if let Some(value) = value {
+				command.env(name, value);
+			} else {
+				command.env_remove(name);
+			}
+		}
 		let child = match command.spawn() {
 			Ok(child) => child,
 			Err(error) => {
@@ -1450,11 +1478,38 @@ impl Runtime {
 	) -> Result<CommandIntercept, CommandError> {
 		use crate::chat_ui::commands::{CommandResult, CommandSurface, DispatchResult};
 		let roster = self.commands.lock().clone();
-		let mut host = RpcCommandHost { runtime: self.clone(), roster: roster.clone() };
-		let dispatched = roster
-			.dispatch(text, CommandSurface::Text, &mut host)
-			.await
-			.map_err(|error| CommandError::new("command_failed", error.to_string()))?;
+		let admitted_extension =
+			if let Some(mut invocation) = roster.extension_invocation(text, CommandSurface::Text) {
+				let admitted = {
+					let headless = self.headless.lock().await;
+					headless
+						.session
+						.admit_command_invoke(
+							invocation.name.as_str(),
+							invocation.argv.as_ref(),
+							invocation.raw.as_str(),
+							"rpc",
+							"rpc",
+						)
+						.await
+				};
+				let (name, argv) = match admitted {
+					Ok(admitted) => admitted,
+					Err(denial) => return Ok(CommandIntercept::Prompt(denial.reason.to_string())),
+				};
+				invocation.name = name;
+				invocation.argv = argv.into();
+				Some(invocation)
+			} else {
+				None
+			};
+		let dispatched = if let Some(invocation) = admitted_extension {
+			roster.dispatch_extension_invocation(invocation).await
+		} else {
+			let mut host = RpcCommandHost { runtime: self.clone(), roster: roster.clone() };
+			roster.dispatch(text, CommandSurface::Text, &mut host).await
+		}
+		.map_err(|error| CommandError::new("command_failed", error.to_string()))?;
 		match dispatched {
 			DispatchResult::Passthrough(_) => Ok(CommandIntercept::Passthrough),
 			DispatchResult::Handled(CommandResult::Prompt(prompt)) => {

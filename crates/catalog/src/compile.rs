@@ -5136,6 +5136,12 @@ fn compile_discovery(source: &SourceDiscovery) -> Result<DiscoverySpec, CompileE
 /// Resolves a source `api` selector (including serde aliases) to its
 /// canonical codec and transport, e.g. `openai-completions` →
 /// (`openai-chat`, HTTP).
+pub fn resolve_source_transport(name: &str) -> Option<(CodecId, TransportKind)> {
+	let source: SourceTransport =
+		serde_json::from_value(serde_json::Value::String(name.to_owned())).ok()?;
+	Some(translate_transport(source))
+}
+
 fn translate_transport(source: SourceTransport) -> (CodecId, TransportKind) {
 	let (codec, transport) = match source {
 		SourceTransport::AnthropicMessages => ("anthropic", TransportKind::Http),

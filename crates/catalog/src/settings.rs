@@ -498,6 +498,27 @@ impl ModelSettings {
 		self.provider_allowed(provider) && model_matches(patterns, provider, model)
 	}
 
+	/// Appends a persistently selected canonical model to a non-empty model
+	/// scope.
+	///
+	/// The first configured occurrence wins case-insensitively. Empty scopes
+	/// remain empty so persisting a default never creates a new restriction.
+	pub fn insert_persisted_default(&mut self, canonical: &str) -> bool {
+		if self.enabled_models.is_empty()
+			|| self.enabled_models.iter().any(|entry| match entry {
+				PathScopedStringEntry::Bare(value) => value.eq_ignore_ascii_case(canonical),
+				PathScopedStringEntry::Scoped(source) => scoped_values(source, ScopedValueKind::Models)
+					.iter()
+					.any(|value| value.eq_ignore_ascii_case(canonical)),
+			}) {
+			return false;
+		}
+		let mut enabled = self.enabled_models.iter().cloned().collect::<Vec<_>>();
+		enabled.push(PathScopedStringEntry::Bare(Str::new(canonical)));
+		self.enabled_models = enabled.into();
+		true
+	}
+
 	/// Reports whether a canonical identity is inside the resolved
 	/// working-directory scope.
 	pub fn model_allowed_at(&self, cwd: &Path, home: &Path, provider: &str, model: &str) -> bool {
@@ -871,22 +892,49 @@ fn normalize_path(path: &Path, cwd: &Path, home: &Path) -> PathBuf {
 }
 
 fn model_matches<'a>(patterns: impl Iterator<Item = &'a Str>, provider: &str, model: &str) -> bool {
-	let logical_id = model
-		.split_once('/')
-		.map_or(model, |(_, logical_id)| logical_id);
 	let mut configured = false;
 	let mut matched = false;
 	for pattern in patterns {
 		configured = true;
-		matched |= pattern.split_once('/').map_or_else(
-			|| glob_matches(pattern.as_bytes(), logical_id.as_bytes()),
-			|(provider_pattern, model_pattern)| {
-				glob_matches(provider_pattern.as_bytes(), provider.as_bytes())
-					&& glob_matches(model_pattern.as_bytes(), logical_id.as_bytes())
-			},
-		);
+		matched |= model_pattern_matches(pattern, provider, model);
 	}
 	!configured || matched
+}
+
+/// Reports whether one configured model-scope pattern matches a provider and
+/// model identity.
+///
+/// Matching is ASCII case-insensitive and supports `*`, `?`, and glob character
+/// classes. A valid trailing thinking effort is ignored for admission, except
+/// when the complete pattern exactly names a colon-bearing model id.
+pub fn model_pattern_matches(pattern: &str, provider: &str, model: &str) -> bool {
+	let logical_id = model
+		.split_once('/')
+		.map_or(model, |(_, logical_id)| logical_id);
+	if exact_pattern_matches(pattern, provider, logical_id) {
+		return true;
+	}
+	let pattern = pattern
+		.rsplit_once(':')
+		.filter(|(_, suffix)| suffix.parse::<ThinkingEffort>().is_ok())
+		.map_or(pattern, |(pattern, _)| pattern);
+	pattern.split_once('/').map_or_else(
+		|| glob_matches(pattern.as_bytes(), logical_id.as_bytes()),
+		|(provider_pattern, model_pattern)| {
+			glob_matches(provider_pattern.as_bytes(), provider.as_bytes())
+				&& glob_matches(model_pattern.as_bytes(), logical_id.as_bytes())
+		},
+	)
+}
+
+fn exact_pattern_matches(pattern: &str, provider: &str, model: &str) -> bool {
+	pattern.split_once('/').map_or_else(
+		|| pattern.eq_ignore_ascii_case(model),
+		|(pattern_provider, pattern_model)| {
+			pattern_provider.eq_ignore_ascii_case(provider)
+				&& pattern_model.eq_ignore_ascii_case(model)
+		},
+	)
 }
 
 fn scoped_entries_valid(entries: &[PathScopedStringEntry], kind: ScopedValueKind) -> bool {
@@ -913,15 +961,16 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 	let (mut pattern_index, mut value_index) = (0, 0);
 	let (mut star, mut retry_value) = (None, 0);
 	while value_index < value.len() {
-		if pattern_index < pattern.len()
-			&& (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
-		{
-			pattern_index += 1;
-			value_index += 1;
-		} else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+		if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
 			star = Some(pattern_index);
 			pattern_index += 1;
 			retry_value = value_index;
+			continue;
+		}
+		let token = glob_token_matches(pattern, pattern_index, value[value_index]);
+		if let Some((true, next_pattern)) = token {
+			pattern_index = next_pattern;
+			value_index += 1;
 		} else if let Some(star_index) = star {
 			retry_value += 1;
 			value_index = retry_value;
@@ -934,6 +983,51 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 		pattern_index += 1;
 	}
 	pattern_index == pattern.len()
+}
+
+fn glob_token_matches(pattern: &[u8], index: usize, value: u8) -> Option<(bool, usize)> {
+	let token = *pattern.get(index)?;
+	if token == b'?' {
+		return Some((true, index + 1));
+	}
+	if token != b'[' {
+		return Some((token.eq_ignore_ascii_case(&value), index + 1));
+	}
+	character_class_matches(pattern, index, value)
+		.or(Some((b'['.eq_ignore_ascii_case(&value), index + 1)))
+}
+
+fn character_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(bool, usize)> {
+	let mut index = start + 1;
+	let negated = matches!(pattern.get(index), Some(b'!' | b'^'));
+	index += usize::from(negated);
+	let mut matched = false;
+	let mut populated = false;
+	if pattern.get(index) == Some(&b']') {
+		matched = value == b']';
+		populated = true;
+		index += 1;
+	}
+	while let Some(&current) = pattern.get(index) {
+		if current == b']' && populated {
+			return Some(((matched && !negated) || (!matched && negated), index + 1));
+		}
+		populated = true;
+		if pattern.get(index + 1) == Some(&b'-')
+			&& let Some(&end) = pattern.get(index + 2)
+			&& end != b']'
+		{
+			let value = value.to_ascii_lowercase();
+			let first = current.to_ascii_lowercase();
+			let last = end.to_ascii_lowercase();
+			matched |= first.min(last) <= value && value <= first.max(last);
+			index += 3;
+		} else {
+			matched |= current.eq_ignore_ascii_case(&value);
+			index += 1;
+		}
+	}
+	None
 }
 
 omp_settings::inventory::submit! { DomainRegistration::of::<ModelSettings>() }
@@ -1018,10 +1112,28 @@ mod tests {
 		assert_eq!(settings.model_rank("openai", "gpt-4.1"), None);
 		assert_eq!(settings.model_rank("anthropic", "claude-opus-4-6"), None);
 		assert!(settings.model_allowed("openrouter", "claude-sonnet-4-6"));
+		assert!(model_pattern_matches("OPENAI/GPT-5.[4-7]:HIGH", "openai", "gpt-5.6"));
+		assert!(model_pattern_matches("openrouter/model:exacto", "OPENROUTER", "MODEL:EXACTO"));
+		assert!(!model_pattern_matches("openai/gpt-5.[!4-7]", "openai", "gpt-5.6"));
 		assert!(settings.validate().is_ok());
 		settings.cycle_order =
 			sync::Arc::from([Str::new_static("default"), Str::new_static("default")]);
 		assert!(settings.validate().is_err());
+	}
+
+	#[test]
+	fn persisted_default_extends_only_an_existing_scope() {
+		let mut settings = ModelSettings::default();
+		assert!(!settings.insert_persisted_default("openai/gpt-5.6"));
+		settings.enabled_models =
+			sync::Arc::from([PathScopedStringEntry::Bare(Str::new_static("anthropic/*"))]);
+		assert!(settings.insert_persisted_default("openai/gpt-5.6"));
+		assert!(!settings.insert_persisted_default("OPENAI/GPT-5.6"));
+		assert_eq!(settings.enabled_models.len(), 2);
+		assert!(matches!(
+			settings.enabled_models.last(),
+			Some(PathScopedStringEntry::Bare(value)) if value == "openai/gpt-5.6"
+		));
 	}
 
 	#[test]

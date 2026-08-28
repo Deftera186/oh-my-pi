@@ -13,15 +13,15 @@ use omp_core::{IntoStr, Str};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	AuthSpecId, Availability, CatalogAlias, CatalogRevision, ClassId, CodecId, ContextStrategy,
-	DiscoverySpecId, EmbeddingFormatBits, EndpointSpec, EvidenceConfidence, GrammarBits,
-	HeaderProfileId, HostedToolBits, ModalityBits, ModelAvailability, ModelCapabilities, ModelKey,
-	ModelLimits, ModelRemoteCompaction, ModelSpec, OperationKind, OverlaySource, OverlayStack,
-	PolicyModel, PremiumMultiplier, Pricing, ProvenanceKind, ProvenanceSource, ProviderDef,
-	ProviderId, ReasoningFeatureBits, RoleBits, RouteDef, RouteId, RouteRestrictions,
-	SamplingControlBits, StructuredOutputBits, TextVerbosityBits, ThinkingPolicyId, ThinkingRouting,
-	ToolFeatureBits, TransportKind, TrustDomain, WireModelId, WirePolicyId,
-	compile::CompiledCatalog,
+	AuthSpec, AuthSpecId, Availability, CatalogAlias, CatalogRevision, ClassId, CodecId,
+	ContextStrategy, DiscoverySpecId, EmbeddingFormatBits, EndpointSpec, EvidenceConfidence,
+	GrammarBits, HeaderProfileId, HostedToolBits, ModalityBits, ModelAvailability,
+	ModelCapabilities, ModelKey, ModelLimits, ModelRemoteCompaction, ModelSpec, OperationKind,
+	OverlaySource, OverlayStack, PolicyModel, PremiumMultiplier, Pricing, ProvenanceKind,
+	ProvenanceSource, ProviderDef, ProviderId, ReasoningFeatureBits, RoleBits, RouteDef, RouteId,
+	RouteRestrictions, SamplingControlBits, StructuredOutputBits, TextVerbosityBits,
+	ThinkingPolicyId, ThinkingRouting, ToolFeatureBits, TransportKind, TrustDomain, WireModelId,
+	WirePolicyId, compile::CompiledCatalog,
 };
 
 /// An exact provider and normalized-model selector.
@@ -324,17 +324,19 @@ pub struct RouteOverlay {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogOverlay {
 	/// Evidence source assigned to every field changed by this layer.
-	pub(crate) source:    ProvenanceSource,
+	pub(crate) source:     ProvenanceSource,
 	/// Interned authentication-specification additions or replacements.
+	#[serde(default)]
+	pub(crate) auth_specs: Box<[AuthSpec]>,
 	/// Complete provider additions or higher-precedence replacements.
 	#[serde(default)]
-	pub(crate) providers: Box<[ProviderDef]>,
+	pub(crate) providers:  Box<[ProviderDef]>,
 	/// Model additions and patches.
-	pub(crate) models:    Box<[ModelOverlay]>,
+	pub(crate) models:     Box<[ModelOverlay]>,
 	/// Route additions and patches.
-	pub(crate) routes:    Box<[RouteOverlay]>,
+	pub(crate) routes:     Box<[RouteOverlay]>,
 	/// Exact alias additions or replacements.
-	pub(crate) aliases:   Box<[ScopedAlias]>,
+	pub(crate) aliases:    Box<[ScopedAlias]>,
 }
 
 /// Explicit authority for security-sensitive configured route changes.
@@ -910,11 +912,22 @@ pub(crate) fn materialize_overlay_stack(
 	let mut resolver = CatalogResolver::new(base);
 	resolver.add_stack(stack, scope)?;
 	let overlays = resolver.overlays;
+	let mut auth_specs = catalog.auth_specs.into_vec();
 	let mut providers = catalog.providers.into_vec();
 	let mut routes = catalog.routes.into_vec();
 	let mut models = catalog.models.into_vec();
 	let mut aliases = catalog.aliases.into_vec();
 	for overlay in overlays {
+		for spec in overlay.auth_specs {
+			if let Some(existing) = auth_specs
+				.iter_mut()
+				.find(|existing| existing.id == spec.id)
+			{
+				*existing = spec;
+			} else {
+				auth_specs.push(spec);
+			}
+		}
 		for provider in overlay.providers {
 			if let Some(existing) = providers
 				.iter_mut()
@@ -1013,10 +1026,12 @@ pub(crate) fn materialize_overlay_stack(
 			}
 		}
 	}
+	auth_specs.sort_by(|left, right| left.id.cmp(&right.id));
 	providers.sort_by(|left, right| left.id.cmp(&right.id));
 	routes.sort_by(|left, right| left.id.cmp(&right.id));
 	models.sort_by(|left, right| left.key.cmp(&right.key));
 	aliases.sort_by(|left, right| left.alias.cmp(&right.alias));
+	catalog.auth_specs = auth_specs.into_boxed_slice();
 	catalog.providers = providers.into_boxed_slice();
 	catalog.routes = routes.into_boxed_slice();
 	catalog.models = models.into_boxed_slice();
@@ -1538,9 +1553,10 @@ mod tests {
 		});
 		resolver
 			.add_discovery(CatalogOverlay {
-				source:    source(ProvenanceKind::Discovered, "discovery"),
-				providers: Box::new([]),
-				models:    Box::new([ModelOverlay {
+				auth_specs: Box::new([]),
+				source:     source(ProvenanceKind::Discovered, "discovery"),
+				providers:  Box::new([]),
+				models:     Box::new([ModelOverlay {
 					selector: ExactSelector::new("p", "m"),
 					added:    None,
 					patch:    ModelPatch {
@@ -1550,20 +1566,21 @@ mod tests {
 						..ModelPatch::default()
 					},
 				}]),
-				routes:    Box::new([RouteOverlay {
+				routes:     Box::new([RouteOverlay {
 					route: RouteId::from("r"),
 					added: None,
 					patch: RoutePatch { priority: Some(Some(2)), ..RoutePatch::default() },
 				}]),
-				aliases:   Box::new([]),
+				aliases:    Box::new([]),
 			})
 			.expect("discovery overlay accepted");
 		resolver
 			.add_user(
 				CatalogOverlay {
-					source:    source(ProvenanceKind::Configured, "user"),
-					providers: Box::new([]),
-					models:    Box::new([ModelOverlay {
+					auth_specs: Box::new([]),
+					source:     source(ProvenanceKind::Configured, "user"),
+					providers:  Box::new([]),
+					models:     Box::new([ModelOverlay {
 						selector: ExactSelector::new("p", "m"),
 						added:    None,
 						patch:    ModelPatch {
@@ -1572,12 +1589,12 @@ mod tests {
 							..ModelPatch::default()
 						},
 					}]),
-					routes:    Box::new([RouteOverlay {
+					routes:     Box::new([RouteOverlay {
 						route: RouteId::from("r"),
 						added: None,
 						patch: RoutePatch { priority: Some(Some(3)), ..RoutePatch::default() },
 					}]),
-					aliases:   Box::new([]),
+					aliases:    Box::new([]),
 				},
 				UnsafeTrustScope::NONE,
 			)
@@ -1605,10 +1622,11 @@ mod tests {
 		let routes = [route("r", "p", 1)];
 		let models = [model("m", &["r"], true)];
 		let make = || CatalogOverlay {
-			source:    source(ProvenanceKind::Configured, "user"),
-			providers: Box::new([]),
-			models:    Box::new([]),
-			routes:    Box::new([RouteOverlay {
+			auth_specs: Box::new([]),
+			source:     source(ProvenanceKind::Configured, "user"),
+			providers:  Box::new([]),
+			models:     Box::new([]),
+			routes:     Box::new([RouteOverlay {
 				route: RouteId::from("r"),
 				added: None,
 				patch: RoutePatch {
@@ -1621,7 +1639,7 @@ mod tests {
 					..RoutePatch::default()
 				},
 			}]),
-			aliases:   Box::new([]),
+			aliases:    Box::new([]),
 		};
 		let mut denied = CatalogResolver::new(BundledCatalog {
 			providers: &providers,
@@ -1733,11 +1751,12 @@ mod tests {
 		});
 		resolver
 			.add_discovery(CatalogOverlay {
-				source:    source(ProvenanceKind::Discovered, "discovery"),
-				providers: Box::new([]),
-				models:    Box::new([]),
-				routes:    Box::new([]),
-				aliases:   Box::new([ScopedAlias {
+				auth_specs: Box::new([]),
+				source:     source(ProvenanceKind::Discovered, "discovery"),
+				providers:  Box::new([]),
+				models:     Box::new([]),
+				routes:     Box::new([]),
+				aliases:    Box::new([ScopedAlias {
 					provider:   ProviderId::from("p"),
 					definition: CatalogAlias {
 						alias:      "current".into_str(),
@@ -1751,11 +1770,12 @@ mod tests {
 		resolver
 			.add_user(
 				CatalogOverlay {
-					source:    source(ProvenanceKind::Configured, "user"),
-					providers: Box::new([]),
-					models:    Box::new([]),
-					routes:    Box::new([]),
-					aliases:   Box::new([ScopedAlias {
+					auth_specs: Box::new([]),
+					source:     source(ProvenanceKind::Configured, "user"),
+					providers:  Box::new([]),
+					models:     Box::new([]),
+					routes:     Box::new([]),
+					aliases:    Box::new([ScopedAlias {
 						provider:   ProviderId::from("p"),
 						definition: CatalogAlias {
 							alias:      "current".into_str(),
