@@ -38,9 +38,10 @@ use omp_envd::{
 use omp_inference::call::{ContentPart, MediaInput};
 use omp_proto::{
 	env::v1 as env_wire,
-	inference::v1::{self as inference_wire, Effort, Reasoning, part_start, turn_event, value},
+	inference::v1::{self as inference_wire, Effort, Reasoning, part_start, turn_event},
 	thread::v1::{self as thread, Blob, Item, Message, Part, Role, blob, item, part},
 	ui::v1::{ui_effect, ui_request},
+	value_json::value_to_json,
 };
 use omp_settings::manager::{SettingsManager, SettingsPaths};
 use omp_storage::index::{SessionFilter, SessionIndex};
@@ -223,14 +224,16 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 	let roles = omp_driver::discovery::roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
-		args.model.as_deref(),
+		None,
 		args.smol.as_deref(),
 		args.slow.as_deref(),
 		args.plan.as_deref(),
 	)
 	.map_err(|error| miette!(error))?;
-	let model = roles
-		.primary
+	let model = args
+		.model
+		.clone()
+		.or_else(|| roles.primary.map(|model| Str::from(model.as_str())))
 		.ok_or_else(|| miette!("acp mode requires a configured default model role"))?;
 	let mut models = acp_model_selectors(catalog, &model_settings);
 	models.sort_by_key(|selector| {
@@ -1073,7 +1076,7 @@ impl AcpEventMapper {
 				let details = result
 					.details
 					.as_ref()
-					.and_then(proto_to_json)
+					.and_then(value_to_json)
 					.unwrap_or(Value::Null);
 				let mut update = tool_update(
 					call_id,
@@ -1109,7 +1112,8 @@ impl AcpEventMapper {
 			| AgentEvent::PhaseChanged { .. }
 			| AgentEvent::RosterChanged { .. }
 			| AgentEvent::JobRegistered { .. }
-			| AgentEvent::JobSettled { .. } => Vec::new(),
+			| AgentEvent::JobSettled { .. }
+			| AgentEvent::HistoryRewritten { .. } => Vec::new(),
 		}
 	}
 
@@ -1400,15 +1404,15 @@ impl Runtime {
 		let resolved = omp_driver::discovery::roles::resolve_launch_roles(
 			catalog,
 			&model_settings,
-			explicit_model.as_deref(),
+			None,
 			None,
 			None,
 			None,
 		)
 		.map_err(|error| miette!(error))?;
-		let default_model = resolved
-			.primary
-			.map(|model| model.as_str().to_owned())
+		let default_model = explicit_model
+			.map(|model| model.to_string())
+			.or_else(|| resolved.primary.map(|model| model.as_str().to_owned()))
 			.unwrap_or(default_model);
 		let models = acp_model_selectors(catalog, &model_settings);
 		let mode = params
@@ -1422,13 +1426,15 @@ impl Runtime {
 			.get("modelId")
 			.and_then(Value::as_str)
 			.unwrap_or(&default_model);
-		let model = omp_driver::chat::resolve_model_selector(catalog, model)
-			.map_err(|error| miette!(error))?;
+		let model = Str::new(model);
 		let requested = params
 			.get("thinking")
 			.and_then(Value::as_str)
 			.unwrap_or(&default_thinking);
-		let thinking = clamp_thinking_level(model.as_str(), requested)?.to_owned();
+		let thinking = match omp_driver::chat::resolve_model_selector(catalog, model.as_str()) {
+			Ok(resolved) => clamp_thinking_level(resolved.as_str(), requested)?.to_owned(),
+			Err(_) => requested.to_owned(),
+		};
 		launch_policy.session = if let Some(source) = fork {
 			HeadlessSessionOpen::Fork(source)
 		} else if let Some(source) = resume {
@@ -2877,7 +2883,7 @@ fn replay_updates(items: &[Item], root: &Path) -> Vec<Value> {
 				let details = result
 					.details
 					.as_ref()
-					.and_then(proto_to_json)
+					.and_then(value_to_json)
 					.unwrap_or(Value::Null);
 				replay.push(tool_update(
 					&Str::from(result.call_id.as_str()),
@@ -3146,30 +3152,6 @@ fn plan_update(state: PlanState) -> Value {
 		],
 	};
 	json!({"sessionUpdate":"plan","entries":entries})
-}
-
-fn proto_to_json(value: &inference_wire::Value) -> Option<Value> {
-	match value.kind.as_ref()? {
-		value::Kind::Null(_) => Some(Value::Null),
-		value::Kind::Int(number) => Some((*number).into()),
-		value::Kind::Double(number) => serde_json::Number::from_f64(*number).map(Value::Number),
-		value::Kind::Bool(value) => Some(Value::Bool(*value)),
-		value::Kind::String(value) => Some(Value::String(value.clone())),
-		value::Kind::Uint(number) => Some((*number).into()),
-		value::Kind::List(list) => list
-			.values
-			.iter()
-			.map(proto_to_json)
-			.collect::<Option<Vec<_>>>()
-			.map(Value::Array),
-		value::Kind::Map(map) => {
-			let mut object = Map::new();
-			for (key, value) in &map.fields {
-				object.insert(key.clone(), proto_to_json(value)?);
-			}
-			Some(Value::Object(object))
-		},
-	}
 }
 
 fn is_internal_url(value: &str) -> bool {
@@ -3695,6 +3677,8 @@ mod tests {
 
 	use std::slice;
 
+	use omp_proto::inference::v1::value;
+
 	use super::*;
 
 	#[test]
@@ -3896,7 +3880,7 @@ mod tests {
 			}),
 			..thread::ToolResult::default()
 		};
-		let details = result.details.as_ref().and_then(proto_to_json).unwrap();
+		let details = result.details.as_ref().and_then(value_to_json).unwrap();
 		let content = tool_result_content(&result, &details, root);
 		assert_eq!(content[0]["type"], "diff");
 		assert_eq!(content[0]["path"], "/repo/src/lib.rs");

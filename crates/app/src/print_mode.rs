@@ -112,7 +112,7 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	let roles = roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
-		args.model.as_deref(),
+		None,
 		args.smol.as_deref(),
 		args.slow.as_deref(),
 		args.plan.as_deref(),
@@ -130,9 +130,10 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	for root in &args.add_dir {
 		fs::canonicalize(root).into_diagnostic()?;
 	}
-	let model = roles
-		.primary
-		.map(|model| Str::from(model.as_str()))
+	let model = args
+		.model
+		.clone()
+		.or_else(|| roles.primary.map(|model| Str::from(model.as_str())))
 		.ok_or_else(|| miette!("print mode requires a configured default model role"))?;
 	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
 		return Err(miette!("--api-key requires a model to be specified via --model or --models"));
@@ -157,12 +158,7 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	} else {
 		None
 	};
-	let credential_provider = args
-		.api_key
-		.as_ref()
-		.map(|_| omp_driver::chat::resolve_model_provider(catalog, model.as_str(), None))
-		.transpose()
-		.map_err(|error| miette!(error))?;
+	let credential_provider = None;
 	let initial = initial_parts(&args.prompt, settings.images.auto_resize).await?;
 	if initial.is_empty() {
 		return Err(
@@ -662,7 +658,8 @@ async fn emit_event(
 		AgentEvent::PhaseChanged { .. }
 		| AgentEvent::RosterChanged { .. }
 		| AgentEvent::JobRegistered { .. }
-		| AgentEvent::JobSettled { .. } => return Ok(()),
+		| AgentEvent::JobSettled { .. }
+		| AgentEvent::HistoryRewritten { .. } => return Ok(()),
 		AgentEvent::Failed { message, .. } => {
 			serde_json::json!({
 				"type":"message_update",

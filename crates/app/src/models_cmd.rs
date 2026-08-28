@@ -2,13 +2,16 @@
 
 use std::{
 	collections::BTreeMap,
-	fs,
+	env, fs,
+	path::{Path, PathBuf},
+	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_catalog::{DiscoveredModel, ModelSpec, OperationBits, ProviderId, snapshot::Catalog};
 use omp_core::Str;
+use omp_driver::bridges::{AgentGoalControl, InferenceBridge};
 use omp_inference::{
 	Client,
 	call::{CallMeta, DiscoveryRequest, Target},
@@ -18,15 +21,14 @@ use omp_inference::{
 	router,
 };
 
-use crate::cli::{ModelRole, ModelsArgs, ModelsCommand};
+use crate::cli::{InvocationExtensionMode, LaunchExtensions, ModelRole, ModelsArgs, ModelsCommand};
 
 /// Runs a model catalog operation. Refresh travels through the same inference
 /// routes and credentials used at call time, then atomically updates only the
 /// runtime discovery cache.
-pub async fn run(args: &ModelsArgs) -> miette::Result<()> {
-	let catalog =
-		omp_driver::registry::production_catalog(&omp_core::dirs::data_dir(None).into_diagnostic()?)
-			.into_diagnostic()?;
+pub async fn run(args: &ModelsArgs, extensions: &LaunchExtensions) -> miette::Result<()> {
+	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
+	let catalog = composed_catalog(&data_dir, extensions).await?;
 	match args.command.as_ref() {
 		None => print_rows(&select(catalog.as_ref(), args.filter.as_deref(), args.role), args.json),
 		Some(ModelsCommand::List { filter, json, role }) => {
@@ -37,6 +39,122 @@ pub async fn run(args: &ModelsArgs) -> miette::Result<()> {
 		},
 		Some(ModelsCommand::Refresh) => refresh().await,
 	}
+}
+
+async fn composed_catalog(
+	data_dir: &Path,
+	launch: &LaunchExtensions,
+) -> miette::Result<Arc<Catalog>> {
+	let root = fs::canonicalize(env::current_dir().into_diagnostic()?).into_diagnostic()?;
+	let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
+	let settings = omp_settings::manager::SettingsManager::open(
+		omp_settings::manager::SettingsPaths::discover(data_dir, Some(&root)),
+	)
+	.into_diagnostic()?;
+	let settings_snapshot = settings.snapshot();
+	let driver_settings = settings_snapshot
+		.project::<omp_driver::settings::Settings>()
+		.into_diagnostic()?
+		.get()
+		.clone();
+	let model_settings = settings_snapshot
+		.project::<omp_catalog::settings::ModelSettings>()
+		.into_diagnostic()?
+		.get()
+		.resolve_path_scopes(&root, &home);
+	let disabled = matches!(launch.mode, InvocationExtensionMode::Disabled);
+	let extension_scopes = driver_settings
+		.extension_scopes(
+			omp_driver::settings::workspace_extension_overlay(&root)
+				.map_err(|error| miette!("{error}"))?,
+		)
+		.map_err(|error| miette!("{error}"))?;
+	let discovery_settings = omp_driver::discovery::PromptDiscoverySettings {
+		model: model_settings,
+		skills: settings_snapshot
+			.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		foreign: settings_snapshot
+			.project::<omp_driver::discovery::foreign::ForeignContentSettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		rules: settings_snapshot
+			.project::<omp_driver::rulebook::RulebookSettings>()
+			.into_diagnostic()?
+			.get()
+			.clone(),
+		native: omp_driver::discovery::native::NativeDiscoveryOptions {
+			explicit_roots: if disabled {
+				Vec::new()
+			} else {
+				launch.native_roots.clone()
+			},
+			root_mode: match launch.mode {
+				InvocationExtensionMode::Merge => omp_driver::discovery::native::NativeRootMode::Merge,
+				InvocationExtensionMode::ExplicitOnly | InvocationExtensionMode::Disabled => {
+					omp_driver::discovery::native::NativeRootMode::ExplicitOnly
+				},
+			},
+			include_workspace: !launch.no_workspace && !disabled,
+			client_installed: Some(data_dir.join("ext/installed.toml")),
+			workspace_identity: Some(omp_driver::discovery::workspace_identity(&root)),
+			..Default::default()
+		},
+		grants: Some(omp_driver::discovery::ExtensionGrantSettings {
+			path:    data_dir.join("ext/grants.toml"),
+			session: Arc::from([]),
+		}),
+		extension_scopes,
+		extension_overrides: launch.settings.clone().into(),
+	};
+	let discovery =
+		omp_driver::discovery::active_prompt_snapshots(&root, &[], &home, &discovery_settings);
+	let extension_specs = discovery
+		.content
+		.extensions
+		.iter()
+		.chain(launch.trusted.iter())
+		.cloned()
+		.collect::<Vec<_>>();
+	let base = omp_driver::registry::production_catalog(data_dir).into_diagnostic()?;
+	if extension_specs.is_empty() {
+		return Ok(base);
+	}
+	let state_dir =
+		omp_env::project_state::directory(data_dir, &root).map_err(|error| miette!("{error}"))?;
+	omp_driver::chat::ensure_state_directory(&state_dir).map_err(|error| miette!("{error}"))?;
+	let bridges = omp_driver::bridges::builtin_with_content(
+		&root,
+		Arc::new(InferenceBridge::default()),
+		AgentGoalControl::default(),
+		None,
+		omp_agent::advisor::AdvisorAdviceQueue::default(),
+		&discovery.content,
+	);
+	let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
+		&root,
+		&state_dir,
+		&omp_env::project_state::document_socket(&state_dir),
+		false,
+		&extension_specs,
+		&launch.contributed,
+		settings_snapshot,
+		bridges,
+	)
+	.await
+	.into_diagnostic()?;
+	let evidences = environment.extension_registry_evidences();
+	let catalog = omp_driver::model_controls::compose_runtime_provider_catalog(
+		base.as_ref(),
+		evidences
+			.iter()
+			.flat_map(|evidence| evidence.providers.iter()),
+	)
+	.into_diagnostic()?;
+	Ok(Arc::new(catalog))
 }
 
 async fn refresh() -> miette::Result<()> {

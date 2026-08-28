@@ -35,15 +35,14 @@ use omp_driver::{
 	autolearn::AutolearnRegime,
 	bridges::{AgentGoalControl, InferenceBridge},
 	chat::{
-		AdvisorChildSpec, AgentRegimeControlBackend, AgentsControlAuthority, CHAT_CAPS_BASE,
-		ChatAuthWorker, ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend,
-		ChatScope, EphemeralSessions, InteractiveSessionControl, LaunchToolSelection,
-		RegimeControlAuthorityFactory, Session, SessionOpen, agent_snapshot,
-		apply_launch_tool_selection, canonical_project, ensure_state_directory,
-		interrupted_reasoning_dialect, model_context_window, model_selector_is_selectable,
-		model_usable_context_window, now_ms, open_session, resolve_model_provider,
-		resolve_model_selector, resume_choices, session_blueprint, strict_session_id,
-		thinking_effort,
+		AdvisorChildSpec, AgentsControlAuthority, CHAT_CAPS_BASE, ChatAuthWorker,
+		ChatError as DriverChatError, ChatParentHost, ChatProviderControlBackend, ChatScope,
+		EphemeralSessions, InteractiveSessionControl, LaunchToolSelection, Session, SessionOpen,
+		agent_snapshot, apply_launch_tool_selection, canonical_project, ensure_state_directory,
+		extension_regime_control_factory, interrupted_reasoning_dialect, model_context_window,
+		model_selector_is_selectable, model_usable_context_window, now_ms, open_session,
+		resolve_model_provider, resolve_model_selector, resume_choices, session_blueprint,
+		strict_session_id, thinking_effort,
 	},
 	collab::session::{self, CollabSessionAuthority},
 	discovery::{context, roles, runtime},
@@ -145,7 +144,6 @@ session_observe_event!(SessionStartHook, HookEventSessionStart);
 session_observe_event!(SessionShutdownHook, HookEventSessionShutdown);
 session_observe_event!(SessionSwitchedHook, HookEventSessionSwitched);
 session_observe_event!(SessionBranchedHook, HookEventSessionBranched);
-session_observe_event!(SessionRewoundHook, HookEventSessionRewound);
 session_observe_event!(SessionResetHook, HookEventSessionReset);
 
 async fn gate_session_payload(
@@ -333,22 +331,6 @@ pub(crate) fn notify_session_branched(
 			"at_event": at_event,
 			"new_head": new_head,
 			"summary_event": summary_event,
-		})));
-	}
-}
-
-/// Emits one post-commit session-rewound observation.
-pub(crate) fn notify_session_rewound(
-	gate: &omp_agent::HookGate,
-	to_event: Option<u64>,
-	new_head: u64,
-	restored_workspace: bool,
-) {
-	if gate.subscribed(SessionRewoundHook::ID) {
-		gate.notify(&SessionRewoundHook(serde_json::json!({
-			"to_event": to_event,
-			"new_head": new_head,
-			"restored_workspace": restored_workspace,
 		})));
 	}
 }
@@ -803,32 +785,6 @@ fn provider_control_factory(
 	let owner = Arc::new(ProductionProviderApplicationOwner::new(registry, builtins, blobs));
 	let backend = Arc::new(ChatProviderControlBackend::new(owner));
 	Arc::new(ProviderControlAuthorityFactory::new(backend))
-}
-
-struct SessionRegimeResolver(Arc<omp_envd::worker::ExtensionRegimeResolver>);
-
-impl omp_driver::chat::RegimeControlResolver for SessionRegimeResolver {
-	fn resolve(
-		&self,
-		identity: &ControlConnectionIdentity,
-		regime: &str,
-		state: Option<&str>,
-	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
-		self.0.resolve(identity, regime, state)
-	}
-
-	fn owner(&self, regime: &str) -> Option<Str> {
-		self.0.owner(regime)
-	}
-}
-
-fn regime_control_factory(
-	control: omp_agent::ControlSender,
-	resolver: Arc<omp_envd::worker::ExtensionRegimeResolver>,
-) -> Arc<dyn ControlAuthorityFactory> {
-	let backend =
-		Arc::new(AgentRegimeControlBackend::new(control, Arc::new(SessionRegimeResolver(resolver))));
-	Arc::new(RegimeControlAuthorityFactory::new(backend))
 }
 
 fn replace_model_props(mut props: omp_scribe::Props, model: &str) -> omp_scribe::Props {
@@ -1312,7 +1268,7 @@ pub(crate) async fn run(
 	let roles = roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
-		args.model.as_deref(),
+		None,
 		args.smol.as_deref(),
 		args.slow.as_deref(),
 		args.plan.as_deref(),
@@ -1363,56 +1319,23 @@ pub(crate) async fn run(
 		.map_err(|error| miette::miette!(error))?
 		.get()
 		.sleep_prevention;
-	let explicit_model = roles
-		.primary
-		.as_ref()
-		.map(|model| Str::from(model.as_str()))
-		.or_else(|| args.model.clone());
+	let explicit_model = args.model.clone().or_else(|| {
+		roles
+			.primary
+			.as_ref()
+			.map(|model| Str::from(model.as_str()))
+	});
 	let model = match explicit_model.clone() {
 		Some(model) => model,
 		None => wizard::run(&data_dir, catalog)
 			.await?
 			.ok_or_else(|| miette::miette!("no model configured — run `omp` again to finish setup"))?,
 	};
-	let model = match resolve_model_selector(catalog, model.as_str()) {
-		Ok(resolved)
-			if roles::model_selector_allowed(catalog, &model_settings, resolved.as_str()) =>
-		{
-			resolved
-		},
-		Ok(resolved) if explicit_model.is_some() => {
-			return Err(
-				miette::miette!("model `{resolved}` is disabled by effective model settings").into(),
-			);
-		},
-		Ok(_) | Err(_) if explicit_model.is_none() => {
-			let fallback = roles::fallback_model_selector(catalog, &model_settings)
-				.ok_or_else(|| miette::miette!("no model is allowed by effective settings"))?;
-			eprintln!(
-				"Saved model `{}` is unavailable; using `{}` for this session without changing the \
-				 saved preference.",
-				model, fallback
-			);
-			fallback
-		},
-		Err(error) => return Err(miette::miette!(error).into()),
-		Ok(resolved) => {
-			return Err(
-				miette::miette!("model `{resolved}` is disabled by effective model settings").into(),
-			);
-		},
-	};
 	if args.api_key.is_some() && args.model.is_none() && args.models.is_none() {
 		return Err(miette::miette!(
 			"--api-key requires a model to be specified via --model or --models"
 		));
 	}
-	let credential_provider = args
-		.api_key
-		.as_ref()
-		.map(|_| resolve_model_provider(catalog, model.as_str(), args.provider.as_deref()))
-		.transpose()
-		.map_err(|error| miette::miette!(error))?;
 	let state_dir =
 		omp_env::project_state::directory(&data_dir, &root).map_err(|e| miette::miette!(e))?;
 	ensure_state_directory(&state_dir).map_err(|e| miette::miette!(e))?;
@@ -1480,6 +1403,30 @@ pub(crate) async fn run(
 	)
 	.await
 	.map_err(|e| miette::miette!(e))?;
+	let evidences = environment.extension_registry_evidences();
+	let catalog_owner = Arc::new(
+		omp_driver::model_controls::compose_runtime_provider_catalog(
+			catalog,
+			evidences
+				.iter()
+				.flat_map(|evidence| evidence.providers.iter()),
+		)
+		.map_err(|error| miette::miette!(error))?,
+	);
+	let catalog = catalog_owner.as_ref();
+	let model =
+		resolve_model_selector(catalog, model.as_str()).map_err(|error| miette::miette!(error))?;
+	if !roles::model_selector_allowed(catalog, &model_settings, model.as_str()) {
+		return Err(
+			miette::miette!("model `{model}` is disabled by effective model settings").into(),
+		);
+	}
+	let credential_provider = args
+		.api_key
+		.as_ref()
+		.map(|_| resolve_model_provider(catalog, model.as_str(), args.provider.as_deref()))
+		.transpose()
+		.map_err(|error| miette::miette!(error))?;
 	prompt_head.bind_provider(environment.extension_prompt_provider());
 	let mut resource_roots = Vec::with_capacity(1 + args.add_dir.len() + admitted_extensions.len());
 	resource_roots.push(root.clone());
@@ -1932,6 +1879,7 @@ pub(crate) async fn run(
 				prompt_cache_affinity:   args.prompt_cache_key.clone(),
 				usage_fetchers:          Some(environment.usage_fetchers()),
 				provider_response_hooks: Some(environment.provider_response_hooks()),
+				catalog:                 Some(Arc::clone(&catalog_owner)),
 				settings:                Some(Arc::clone(&settings_snapshot)),
 			},
 		)
@@ -2675,6 +2623,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			tracing::warn!(%error, "TTSR rule condition was rejected");
 		}
 		let mut agent = Agent::new(client.clone(), agent_env, state.clone(), journal, CHAT_CAPS_BASE);
+		agent.set_hook_gate(environment.admission_gate());
 		parent.bind_agent_controls(
 			id.clone(),
 			agent.host_control(),
@@ -2682,6 +2631,9 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			agent.abort_handle(),
 			agent.events().clone(),
 		);
+		if let Err(error) = agent.restore_session_state().await {
+			tracing::warn!(%error, "journal-derived session state was not restored");
+		}
 		agent.set_unexpected_stop_classifier(parent.clone());
 		if auto_thinking_selected {
 			agent.set_difficulty_classifier(parent.clone());
@@ -2909,7 +2861,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 		});
 		agent.set_continuation_source(modes.clone());
 		let regime_factory =
-			regime_control_factory(agent.control(), environment.extension_regime_resolver());
+			extension_regime_control_factory(agent.control(), environment.extension_regime_resolver());
 		let provider_factory = provider_factory.ok_or(ChatError::MissingAuthority("provider"))?;
 		_external_control_binding = Some(
 			SessionControlFactories {

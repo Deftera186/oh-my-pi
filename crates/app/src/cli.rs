@@ -2965,6 +2965,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			| Some(Command::Rpc(_))
 			| Some(Command::RpcUi(_))
 			| Some(Command::Acp(_))
+			| Some(Command::Models(_))
 	);
 	if !launch_command
 		&& (!cli.ext.is_empty()
@@ -2977,7 +2978,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	{
 		return Err(
 			CliUsageError::new(
-				"extension launch controls are only valid for chat, print, RPC, or ACP",
+				"extension launch controls are only valid for chat, print, RPC, ACP, or models",
 			)
 			.into(),
 		);
@@ -3061,7 +3062,7 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Update(args) => update_cmd::run(args).await,
 		Command::Registry(args) => update_cmd::registry(args),
 		Command::Share(args) => share_cmd::run(args).await,
-		Command::Models(args) => models_cmd::run(&args).await,
+		Command::Models(args) => models_cmd::run(&args, &launch_extensions).await,
 		Command::Worktree(args) => {
 			worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args)
 		},

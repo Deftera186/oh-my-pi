@@ -191,14 +191,16 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	let roles = omp_driver::discovery::roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
-		args.model.as_deref(),
+		None,
 		args.smol.as_deref(),
 		args.slow.as_deref(),
 		args.plan.as_deref(),
 	)
 	.map_err(|error| miette!(error))?;
-	let model = roles
-		.primary
+	let model = args
+		.model
+		.clone()
+		.or_else(|| roles.primary.map(|model| Str::from(model.as_str())))
 		.ok_or_else(|| miette!("rpc mode requires a configured default model role"))?;
 	let store =
 		omp_driver::registry::open_credential_store(data.join("credentials.db")).into_diagnostic()?;
@@ -306,12 +308,7 @@ async fn run_inner(args: RpcArgs, ui_enabled: bool) -> miette::Result<()> {
 	} else {
 		HeadlessToolPolicy::All
 	};
-	let credential_provider = args
-		.api_key
-		.as_ref()
-		.map(|_| omp_driver::chat::resolve_model_provider(catalog, model.as_str(), None))
-		.transpose()
-		.map_err(|error| miette!(error))?;
+	let credential_provider = None;
 	let mut headless = HeadlessSession::open_with_policy(
 		data.clone(),
 		HeadlessSessionOptions {
@@ -2005,6 +2002,7 @@ impl Runtime {
 			| AgentEvent::RosterChanged { .. }
 			| AgentEvent::JobRegistered { .. }
 			| AgentEvent::JobSettled { .. }
+			| AgentEvent::HistoryRewritten { .. }
 			| AgentEvent::Snapshot(_)
 			| AgentEvent::PeerRelay(_) => return Ok(()),
 		};

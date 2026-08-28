@@ -1403,6 +1403,30 @@ struct RawRealtimeCaps {
 	transports: BTreeSet<String>,
 }
 
+/// Composes frozen extension provider documents into a catalog before model
+/// selection.
+pub fn compose_runtime_provider_catalog<'a>(
+	base: &snapshot::Catalog,
+	documents: impl IntoIterator<Item = &'a Value>,
+) -> Result<snapshot::Catalog, ProviderControlError> {
+	let mut catalog = base.clone();
+	for document in documents {
+		let provider = document
+			.get("id")
+			.and_then(Value::as_str)
+			.filter(|provider| !provider.is_empty())
+			.ok_or_else(|| invalid_declaration("provider identity is missing"))?;
+		let spec = document.get("spec").unwrap_or(document);
+		let declaration =
+			ProviderDeclarationDocument { provider: Str::from(provider), document: spec.clone() };
+		let records = lower_provider_declaration(&catalog, &declaration)?;
+		catalog = catalog
+			.with_runtime_provider(&records)
+			.map_err(|error| invalid_declaration(error.to_string()))?;
+	}
+	Ok(catalog)
+}
+
 /// Lowers one sealed Python `ProviderSpec` document into complete catalog
 /// records. The compiler accepts only routes supported by the production
 /// composer and never invents credential or trust policy.
