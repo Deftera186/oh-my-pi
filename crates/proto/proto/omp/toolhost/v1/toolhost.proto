@@ -122,6 +122,8 @@ message ToolDecl {
   // Per-tool batch scheduling constraint.
   ToolExecutionMode execution_mode = 14;
   omp.inference.v1.ValueMap props = 15;
+  // Frozen Python placement spelling: host, env, or worker:<name>.
+  string place = 16;
 }
 
 message ExtensionDecl {
