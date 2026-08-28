@@ -70,6 +70,42 @@ const DELIVERY_DRAIN_PASSES: usize = 8;
 const DELIVERY_DRAIN_BATCH: usize = 256;
 const EMBEDDED_TEXT_LIMIT: usize = 4_000;
 
+fn acp_model_selectors(
+	catalog: &omp_catalog::snapshot::Catalog,
+	settings: &omp_catalog::settings::ModelSettings,
+) -> Vec<String> {
+	catalog
+		.models()
+		.iter()
+		.filter(|model| {
+			omp_driver::discovery::roles::model_selector_allowed(catalog, settings, model.key.as_str())
+		})
+		.map(|model| model.key.as_str().to_owned())
+		.collect()
+}
+
+fn acp_model_rank(
+	catalog: &omp_catalog::snapshot::Catalog,
+	settings: &omp_catalog::settings::ModelSettings,
+	selector: &str,
+) -> usize {
+	let Some(model) = catalog.model(ModelKey::from_ref(selector)) else {
+		return usize::MAX;
+	};
+	let model_id = model
+		.key
+		.as_str()
+		.split_once('/')
+		.map_or(model.key.as_str(), |(_, model)| model);
+	model
+		.routes
+		.iter()
+		.filter_map(|route| catalog.route(route))
+		.filter_map(|route| settings.model_rank(route.provider.as_str(), model_id))
+		.min()
+		.unwrap_or(usize::MAX)
+}
+
 enum AcpPromptIntercept {
 	Prompt(Str),
 	Consumed,
@@ -109,11 +145,17 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 		.into_diagnostic()?
 		.get()
 		.resolve_path_scopes(&root, &home);
-	let skill_settings = settings_snapshot
+	let mut skill_settings = settings_snapshot
 		.project::<omp_driver::discovery::skills::SkillDiscoverySettings>()
 		.into_diagnostic()?
 		.get()
 		.clone();
+	if args.no_skills {
+		skill_settings.enabled = false;
+	}
+	skill_settings
+		.custom_directories
+		.extend(args.skill.iter().cloned());
 	let disabled_extensions =
 		matches!(args.extension_launch.mode, crate::cli::InvocationExtensionMode::Disabled);
 	let app_settings = settings_snapshot
@@ -155,6 +197,8 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 				},
 			},
 			skill_settings,
+			prompt_templates: args.prompt_template.clone(),
+			themes: args.theme.clone(),
 			include_workspace: !args.extension_launch.no_workspace && !disabled_extensions,
 			client_installed: Some(data_dir.join("ext/installed.toml")),
 			workspace_identity: Some(omp_driver::discovery::workspace_identity(&root)),
@@ -188,24 +232,9 @@ async fn run_inner(args: AcpArgs) -> miette::Result<()> {
 	let model = roles
 		.primary
 		.ok_or_else(|| miette!("acp mode requires a configured default model role"))?;
-	let mut models = catalog
-		.models()
-		.iter()
-		.filter_map(|entry| {
-			let (provider, model) = entry.key.as_str().split_once('/')?;
-			model_settings
-				.model_allowed(provider, model)
-				.then(|| entry.key.as_str().to_owned())
-		})
-		.collect::<Vec<_>>();
+	let mut models = acp_model_selectors(catalog, &model_settings);
 	models.sort_by_key(|selector| {
-		let (provider, model) = selector.split_once('/').unwrap_or(("", selector.as_str()));
-		(
-			model_settings
-				.model_rank(provider, model)
-				.unwrap_or(usize::MAX),
-			selector.clone(),
-		)
+		(acp_model_rank(catalog, &model_settings, selector), selector.clone())
 	});
 	let cycle_selectors = args.models.as_ref().map_or_else(
 		|| {
@@ -1381,16 +1410,7 @@ impl Runtime {
 			.primary
 			.map(|model| model.as_str().to_owned())
 			.unwrap_or(default_model);
-		let models = catalog
-			.models()
-			.iter()
-			.filter_map(|entry| {
-				let (provider, model) = entry.key.as_str().split_once('/')?;
-				model_settings
-					.model_allowed(provider, model)
-					.then(|| entry.key.as_str().to_owned())
-			})
-			.collect::<Vec<_>>();
+		let models = acp_model_selectors(catalog, &model_settings);
 		let mode = params
 			.get("modeId")
 			.and_then(Value::as_str)
@@ -1402,14 +1422,13 @@ impl Runtime {
 			.get("modelId")
 			.and_then(Value::as_str)
 			.unwrap_or(&default_model);
-		if !models.iter().any(|candidate| candidate == model) {
-			return Err(miette!("unknown model `{model}`"));
-		}
+		let model = omp_driver::chat::resolve_model_selector(catalog, model)
+			.map_err(|error| miette!(error))?;
 		let requested = params
 			.get("thinking")
 			.and_then(Value::as_str)
 			.unwrap_or(&default_thinking);
-		let thinking = clamp_thinking_level(model, requested)?.to_owned();
+		let thinking = clamp_thinking_level(model.as_str(), requested)?.to_owned();
 		launch_policy.session = if let Some(source) = fork {
 			HeadlessSessionOpen::Fork(source)
 		} else if let Some(source) = resume {
@@ -1423,7 +1442,7 @@ impl Runtime {
 				project: root.clone(),
 				settings_overlays,
 				additional_roots,
-				model: Str::from(model),
+				model: model.clone(),
 				initial_regime: (mode == "plan").then_some("plan"),
 				initial_prompt_slot: None,
 				plan_handoff: None,
@@ -1494,7 +1513,7 @@ impl Runtime {
 			events,
 			meta: Mutex::new(AcpSessionMeta {
 				title: None,
-				model: model.to_owned(),
+				model: model.to_string(),
 				mode: mode.to_owned(),
 				thinking,
 				replay,
@@ -2057,27 +2076,15 @@ impl Runtime {
 	}
 
 	async fn set_model(&self, params: &Map<String, Value>) -> miette::Result<Value> {
-		let model = required_text(params, "modelId")?;
+		let selector = required_text(params, "modelId")?;
 		let session_id = Str::from(required_text(params, "sessionId")?);
-		if !self
-			.state
-			.lock()
-			.models
-			.iter()
-			.any(|candidate| candidate == model)
-		{
-			return Err(miette!("unknown model `{model}`"));
-		}
 		let session = self.session(&session_id)?;
-		session
-			.asynchronous
-			.headless
-			.lock()
-			.await
-			.set_model(model)
-			.await
-			.into_diagnostic()?;
-		session.meta.lock().model = model.to_owned();
+		let model = {
+			let headless = session.asynchronous.headless.lock().await;
+			headless.set_model(selector).await.into_diagnostic()?;
+			headless.model()
+		};
+		session.meta.lock().model = model.to_string();
 		self.update(&session_id, json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"model","currentValue":model}]}))?;
 		Ok(json!({}))
 	}

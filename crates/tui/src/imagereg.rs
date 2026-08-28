@@ -85,6 +85,44 @@ pub fn bytes(id: u32) -> Option<CowBytes<'static>> {
 	registry.by_id.get(&id).cloned()
 }
 
+/// Registers renderer-local image bytes under an opaque extension resource
+/// name.
+///
+/// Existing registrations are immutable: a repeated name returns the original
+/// image so extension generations cannot replace a resource after TML parsing.
+pub fn register(source: impl Into<Str>, bytes: impl Into<CowBytes<'static>>) -> bool {
+	let source = source.into();
+	let mut registry = IMAGES.lock();
+	if registry.by_source.contains_key(&source) {
+		return registry.by_source.get(&source).is_some_and(Option::is_some);
+	}
+	let bytes = bytes.into();
+	let png = if is_png(&bytes) {
+		Some(bytes)
+	} else {
+		let image = image::load_from_memory(&bytes).ok();
+		image.and_then(|image| {
+			let mut output = Cursor::new(Vec::new());
+			image
+				.write_to(&mut output, image::ImageFormat::Png)
+				.ok()
+				.map(|()| CowBytes::from(output.into_inner()))
+		})
+	};
+	let Some(png) = png else {
+		registry.by_source.insert(source, None);
+		return false;
+	};
+	let Some(interned) = make_interned(png, registry.allocated) else {
+		registry.by_source.insert(source, None);
+		return false;
+	};
+	registry.allocated += 1;
+	registry.by_id.insert(interned.id, interned.png.clone());
+	registry.by_source.insert(source, Some(interned));
+	true
+}
+
 fn make_interned(png: CowBytes<'static>, allocated: u32) -> Option<InternedImage> {
 	let id = 0x00ff_ffff_u32.checked_sub(allocated)?;
 	let dimensions = imagefmt::dimensions(&png)?;

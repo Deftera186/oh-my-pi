@@ -38,11 +38,11 @@ use omp_chat_ui::{
 	Intent, LiveVoiceAction, ModelRow, RawFrame, RewindTargetRow, SessionRow, StatusFacts,
 	StatusLayout, StatusSeparator, StreamSummary, SubmitMode, ThinkingLevel as StatusThinkingLevel,
 	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, VisibleResourceFacts,
-	completion::{CompletionQuery, CompletionSource, CompletionTrigger, DeferredCompletion},
+	completion::{CompletionQuery, CompletionRule, CompletionSource, CompletionTrigger},
 	host::{HostOptions, InputAction, InputBinding},
 	login_panel::LoginEvent,
 };
-use omp_core::{EnvPath, FastHashSet, Hash32, SecretString, Str, encoding::hex, sf};
+use omp_core::{FastHashSet, Hash32, SecretString, Str, encoding::hex, sf};
 pub use omp_driver::auth_flow::{
 	AuthPromptKind, CREDENTIAL_STORAGE_LOCKED_MESSAGE, ChatAuth, ChatAuthCommand, ChatAuthEvent,
 	prompt_masks_input,
@@ -58,16 +58,18 @@ use omp_envd::exthost::lifecycle::HeadlessLifecycleKind;
 use omp_inference::{call::AuthInput, id::TurnId};
 use omp_proto::{
 	env::v1::{
-		CloseSessionRequest, ExecControlKind, ExecOutcome, ExecRequest, McpConfigAction,
-		McpConfigRequest, McpConfigScope, McpLifecycleState, McpResetRequest, McpServerRef,
-		McpStatusRequest, McpSubscribeRequest, OpenSessionRequest, OutputChannel, Script,
+		CloseSessionRequest, EnvironmentDelta, ExecControlKind, ExecOutcome, ExecRequest,
+		McpConfigAction, McpConfigRequest, McpConfigScope, McpLifecycleState, McpResetRequest,
+		McpServerRef, McpStatusRequest, McpSubscribeRequest, OpenSessionRequest, OutputChannel,
+		Script,
 	},
 	inference::v1::{part_start, turn_event::Event, value},
 	omp::ui::v1::{
-		Bell, CloseOverlay, ComposerText, Dialog, FocusSlot, MountSlot, OverlayValues, PatchNode,
-		PropValue, RetainedFrame, RetainedFrameEnvelope, RetainedFrameKey, ShowOverlay, SlotOptions,
-		SlotPlacement, Tml, UiEffect, UiRequest, UiResponse, UnmountSlot, prop_value,
-		retained_frame_envelope, ui_effect, ui_request, ui_response,
+		Bell, CloseOverlay, ComposerEdit, ComposerText, Dialog, FocusSlot, MountSlot, Notify,
+		OpenUrl, OverlayValues, PatchNode, PropValue, RetainedFrame, RetainedFrameEnvelope,
+		RetainedFrameKey, ShowOverlay, SlotOptions, SlotPlacement, Tml, UiEffect, UiRequest,
+		UiResponse, UnmountSlot, prop_value, retained_frame_envelope, ui_effect, ui_request,
+		ui_response,
 	},
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
@@ -84,7 +86,7 @@ use omp_tool::{
 };
 use omp_tools::todo;
 use omp_tui::{
-	Command, Icon, Suggestion, SuggestionList, UiContext,
+	Command, Icon, Notification, NotificationSound, Suggestion, SuggestionList, UiContext, Urgency,
 	components::{AttachmentContent, KeywordAccent},
 	detect,
 };
@@ -205,6 +207,7 @@ pub mod presentation_authority {
 	#[derive(Clone, Debug, PartialEq)]
 	pub enum PresentationRequest {
 		Presentation,
+		Commands,
 		Icons { prefix: Str },
 		EditorText,
 		Themes,
@@ -557,6 +560,7 @@ pub mod presentation_authority {
 		) -> Result<UiControlResult, ControlProtocolError> {
 			let request = match request {
 				exthost::UiControlRequest::Presentation => PresentationRequest::Presentation,
+				exthost::UiControlRequest::Commands => PresentationRequest::Commands,
 				exthost::UiControlRequest::Icons { prefix } => PresentationRequest::Icons { prefix },
 				exthost::UiControlRequest::EditorText => PresentationRequest::EditorText,
 				exthost::UiControlRequest::Themes => PresentationRequest::Themes,
@@ -708,6 +712,7 @@ pub mod presentation_authority {
 			| PresentationRequest::OverlayWait { .. } => {
 				(InvocationPhase::EffectsAuthorized, Some("ui.dialogs"))
 			},
+			PresentationRequest::Commands => (InvocationPhase::Open, None),
 			PresentationRequest::DynamicMount { .. } => (InvocationPhase::Open, Some("ui.commands")),
 			_ => (InvocationPhase::Open, None),
 		}
@@ -985,7 +990,7 @@ enum UiCmd {
 		child_id:   Str,
 		child_path: PathBuf,
 		title:      Option<Str>,
-		reply:      flume::Sender<Result<(), String>>,
+		reply:      flume::Sender<Result<u64, String>>,
 	},
 	DeleteCurrentSession {
 		path:  PathBuf,
@@ -1018,10 +1023,17 @@ struct PendingPrompt {
 }
 
 struct ToolDisplay {
-	identity: ToolIdentity,
-	args:     omp_slopjson::Value,
-	started:  bool,
-	fold:     ViewState,
+	identity:           ToolIdentity,
+	args:               omp_slopjson::Value,
+	started:            bool,
+	fold:               ViewState,
+	updates:            Vec<Value>,
+	opened:             Instant,
+	extension_renderer: Option<ExtensionRendererRoute>,
+}
+#[derive(Clone, Copy)]
+struct ExtensionRendererRoute {
+	native_authoritative: bool,
 }
 
 struct RegistryCompletionCache {
@@ -1138,6 +1150,7 @@ impl CompletionSource for ProjectCompletionSource {
 				.collect()
 			},
 			CompletionTrigger::Custom => self.internal_urls(query.query.as_str()),
+			CompletionTrigger::Extension => SuggestionList::new(),
 			CompletionTrigger::Slash => SuggestionList::new(),
 		}
 	}
@@ -1202,10 +1215,13 @@ struct BridgeState {
 	collab_live: Option<omp_driver::collab::session::HostLiveHandle>,
 	collab_state: Option<omp_proto::collab::v1::SessionStateUpdate>,
 	environment: omp_env::EnvClient,
+	session_hooks: Arc<omp_agent::HookGate>,
 	lsp_servers: Vec<omp_proto::document::v1::LspServerStatus>,
 	memory: Option<Arc<omp_driver::memory::ChatMemory>>,
 	workspace_root: Str,
 	appearance: omp_tui::Appearance,
+	presentation: UiContext,
+	hyperlinks: bool,
 	theme_watcher: ThemeWatcher,
 	theme_revision: u64,
 	tools_expanded: bool,
@@ -1410,6 +1426,37 @@ fn presentation_props(value: Option<&Value>) -> BTreeMap<String, PropValue> {
 		.collect()
 }
 
+fn presentation_proto_value(value: &Value) -> v1::Value {
+	let kind = match value {
+		Value::Null => value::Kind::Null(true),
+		Value::Bool(value) => value::Kind::Bool(*value),
+		Value::String(value) => value::Kind::String(value.clone()),
+		Value::Number(value) => {
+			if let Some(value) = value.as_i64() {
+				value::Kind::Int(value)
+			} else if let Some(value) = value.as_u64() {
+				value::Kind::Uint(value)
+			} else {
+				value::Kind::Double(value.as_f64().unwrap_or_default())
+			}
+		},
+		Value::Array(values) => value::Kind::List(v1::ValueList {
+			values: values.iter().map(presentation_proto_value).collect(),
+		}),
+		Value::Object(values) => value::Kind::Map(presentation_value_map(values)),
+	};
+	v1::Value { kind: Some(kind) }
+}
+
+fn presentation_value_map(values: &serde_json::Map<String, Value>) -> v1::ValueMap {
+	v1::ValueMap {
+		fields: values
+			.iter()
+			.map(|(key, value)| (key.clone(), presentation_proto_value(value)))
+			.collect(),
+	}
+}
+
 fn presentation_slot(value: &str) -> Option<SlotPlacement> {
 	Some(match value {
 		"header" => SlotPlacement::Header,
@@ -1422,7 +1469,8 @@ fn presentation_slot(value: &str) -> Option<SlotPlacement> {
 	})
 }
 
-fn presentation_ui_effect(
+/// Lowers one authenticated extension effect into the canonical UI protocol.
+pub fn lower_presentation_effect(
 	identity: &presentation_authority::PresentationIdentity,
 	effect: &presentation_authority::PresentationEffect,
 ) -> Result<UiEffect, presentation_authority::PresentationAuthorityError> {
@@ -1525,6 +1573,13 @@ fn presentation_ui_effect(
 		"blur_slot" => ui_effect::Kind::FocusSlot(FocusSlot { key: String::new() }),
 		"set_status" => {
 			let key = presentation_key(identity, string("key").unwrap_or("status"));
+			let side = string("side").unwrap_or("status_right");
+			let status_props = v1::ValueMap {
+				fields: BTreeMap::from([(
+					String::from("side"),
+					presentation_proto_value(&Value::String(side.to_owned())),
+				)]),
+			};
 			if let Some(content) = presentation_tml(body.get("content")) {
 				ui_effect::Kind::MountSlot(MountSlot {
 					key,
@@ -1539,7 +1594,7 @@ fn presentation_ui_effect(
 						visible: true,
 						width:   None,
 						height:  None,
-						props:   None,
+						props:   Some(status_props),
 					}),
 				})
 			} else {
@@ -1593,6 +1648,59 @@ fn presentation_ui_effect(
 				})
 			}
 		},
+		"set_editor_text" => {
+			let text = string("text").ok_or_else(|| {
+				PresentationAuthorityError::Owner(sf!("set_editor_text effect requires text"))
+			})?;
+			ui_effect::Kind::ComposerEdit(ComposerEdit {
+				start: 0,
+				end:   u32::MAX,
+				text:  text.to_owned(),
+			})
+		},
+		"paste_to_editor" => {
+			let content = body
+				.get("content")
+				.and_then(|value| match value {
+					Value::String(value) => Some(value.as_str()),
+					Value::Object(value) => value.get("source").and_then(Value::as_str),
+					_ => None,
+				})
+				.ok_or_else(|| {
+					PresentationAuthorityError::Owner(sf!(
+						"paste_to_editor effect requires string or TML content"
+					))
+				})?;
+			ui_effect::Kind::ComposerEdit(ComposerEdit {
+				start: u32::MAX,
+				end:   u32::MAX,
+				text:  content.to_owned(),
+			})
+		},
+		"open_url" => {
+			let url = string("url").ok_or_else(|| {
+				PresentationAuthorityError::Owner(sf!("open_url effect requires url"))
+			})?;
+			ui_effect::Kind::OpenUrl(OpenUrl { url: url.to_owned() })
+		},
+		"notify" => {
+			let message = body
+				.get("message")
+				.or_else(|| body.get("text"))
+				.and_then(|value| match value {
+					Value::String(value) => Some(value.as_str()),
+					Value::Object(value) => value.get("source").and_then(Value::as_str),
+					_ => None,
+				})
+				.ok_or_else(|| {
+					PresentationAuthorityError::Owner(sf!("notify effect requires message text"))
+				})?;
+			ui_effect::Kind::Notify(Notify {
+				message:     message.to_owned(),
+				level:       string("level").unwrap_or("info").to_owned(),
+				duration_ms: None,
+			})
+		},
 		"bell" => ui_effect::Kind::Bell(Bell {}),
 		_ => {
 			return Err(PresentationAuthorityError::Owner(sf!(
@@ -1604,7 +1712,8 @@ fn presentation_ui_effect(
 	Ok(UiEffect { kind: Some(kind), props: None })
 }
 
-fn presentation_ui_request(
+/// Lowers one extension presentation request for a renderer client.
+pub fn lower_presentation_request(
 	owner_invocation: u64,
 	request: &presentation_authority::PresentationRequest,
 ) -> Option<UiRequest> {
@@ -1634,7 +1743,13 @@ fn presentation_ui_request(
 						.map(str::to_owned)
 				})
 				.collect();
-			ui_request::Kind::Dialog(Dialog { kind: kind.to_string(), title, content, choices })
+			ui_request::Kind::Dialog(Dialog {
+				kind: kind.to_string(),
+				title,
+				content,
+				choices,
+				props: Some(presentation_value_map(fields)),
+			})
 		},
 		PresentationRequest::Overlay { fields } => ui_request::Kind::ShowOverlay(ShowOverlay {
 			kind:    fields
@@ -1645,8 +1760,11 @@ fn presentation_ui_request(
 			content: fields
 				.get("content")
 				.and_then(|value| presentation_tml(Some(value))),
-			options: None,
-			props:   None,
+			options: fields
+				.get("options")
+				.and_then(Value::as_object)
+				.map(presentation_value_map),
+			props:   Some(presentation_value_map(fields)),
 		}),
 		PresentationRequest::OverlayValues { id }
 		| PresentationRequest::OverlayWait { id }
@@ -1662,7 +1780,8 @@ fn presentation_ui_request(
 	Some(UiRequest { owner_invocation, kind: Some(kind), props: None })
 }
 
-fn presentation_response(
+/// Converts a renderer response into the fixed extension presentation shape.
+pub fn lower_presentation_response(
 	request: presentation_authority::PresentationRequest,
 	response: UiResponse,
 ) -> Result<
@@ -1680,12 +1799,23 @@ fn presentation_response(
 		| (
 			PresentationRequest::OverlayWait { .. },
 			Some(ui_response::Kind::DialogOutcome(outcome)),
-		) => Ok(PresentationResponse::Dialog(serde_json::json!({
-			"accepted": outcome.accepted,
-			"cancelled": outcome.cancelled,
-			"value": outcome.value,
-			"values": outcome.values,
-		}))),
+		) => {
+			let answers = outcome
+				.answers
+				.as_ref()
+				.and_then(proto_map_to_json)
+				.map(Value::Object);
+			let reason = outcome
+				.reason
+				.or_else(|| outcome.cancelled.then(|| String::from("dismissed")));
+			Ok(PresentationResponse::Dialog(serde_json::json!({
+				"accepted": outcome.accepted,
+				"value": outcome.value,
+				"values": (!outcome.values.is_empty()).then_some(outcome.values),
+				"answers": answers,
+				"reason": reason,
+			})))
+		},
 		(PresentationRequest::Overlay { .. }, Some(ui_response::Kind::OverlayOpened(opened))) => {
 			Ok(PresentationResponse::OverlayOpened { id: Str::new(opened.overlay_id) })
 		},
@@ -1714,6 +1844,163 @@ fn presentation_response(
 	}
 }
 
+fn presentation_text<'a>(body: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a str> {
+	body.get(name).and_then(|value| match value {
+		Value::String(value) => Some(value.as_str()),
+		Value::Object(value) => value.get("source").and_then(Value::as_str),
+		_ => None,
+	})
+}
+
+fn presentation_notification_urgency(level: &str, urgency: Option<&str>) -> Urgency {
+	let value = urgency.unwrap_or(level);
+	if value.eq_ignore_ascii_case("critical") || value.eq_ignore_ascii_case("error") {
+		Urgency::Critical
+	} else if value.eq_ignore_ascii_case("low") || value.eq_ignore_ascii_case("debug") {
+		Urgency::Low
+	} else {
+		Urgency::Normal
+	}
+}
+
+fn presentation_notification_sound(sound: Option<&str>) -> Option<NotificationSound> {
+	let sound = sound?;
+	if sound.eq_ignore_ascii_case("silent") {
+		Some(NotificationSound::Silent)
+	} else if sound.eq_ignore_ascii_case("info") {
+		Some(NotificationSound::Info)
+	} else if sound.eq_ignore_ascii_case("warning") {
+		Some(NotificationSound::Warning)
+	} else if sound.eq_ignore_ascii_case("error") {
+		Some(NotificationSound::Error)
+	} else if sound.eq_ignore_ascii_case("question") {
+		Some(NotificationSound::Question)
+	} else {
+		Some(NotificationSound::System)
+	}
+}
+
+fn presentation_progress(body: &serde_json::Map<String, Value>) -> omp_tui::Progress {
+	let state = body.get("state").and_then(Value::as_object);
+	let kind = state
+		.and_then(|state| state.get("kind"))
+		.and_then(Value::as_str)
+		.unwrap_or("clear");
+	let pct = state
+		.and_then(|state| state.get("pct"))
+		.and_then(Value::as_u64)
+		.and_then(|pct| u8::try_from(pct.min(100)).ok())
+		.unwrap_or_default();
+	if kind == "value" {
+		omp_tui::Progress::Value(pct)
+	} else if kind == "error" {
+		omp_tui::Progress::Error(pct)
+	} else if kind == "indeterminate" {
+		omp_tui::Progress::Indeterminate
+	} else if kind == "paused" {
+		omp_tui::Progress::Paused(pct)
+	} else {
+		omp_tui::Progress::Clear
+	}
+}
+
+fn presentation_image_bytes(source: &Value) -> Option<Vec<u8>> {
+	match source {
+		Value::String(path) => {
+			let path = path.strip_prefix("file://").unwrap_or(path);
+			fs::read(path).ok()
+		},
+		Value::Array(bytes) => bytes
+			.iter()
+			.map(Value::as_u64)
+			.map(|byte| byte.and_then(|byte| u8::try_from(byte).ok()))
+			.collect(),
+		Value::Object(source) => source
+			.get("path")
+			.or_else(|| source.get("value"))
+			.and_then(Value::as_str)
+			.and_then(|path| fs::read(path.strip_prefix("file://").unwrap_or(path)).ok()),
+		_ => None,
+	}
+}
+
+fn presentation_color(color: omp_tui::Color) -> String {
+	match color {
+		omp_tui::Color::Default => String::from("default"),
+		omp_tui::Color::Indexed(index) => format!("index:{index}"),
+		omp_tui::Color::Rgb(red, green, blue) => format!("#{red:02x}{green:02x}{blue:02x}"),
+	}
+}
+
+fn presentation_palette(theme: omp_tui::Theme) -> Value {
+	serde_json::json!({
+		"fg": presentation_color(theme.fg),
+		"accent": presentation_color(theme.accent),
+		"info": presentation_color(theme.info),
+		"ok": presentation_color(theme.ok),
+		"warn": presentation_color(theme.warn),
+		"err": presentation_color(theme.err),
+		"muted": presentation_color(theme.muted),
+		"border": presentation_color(theme.border),
+		"surface": presentation_color(theme.surface),
+		"hover": presentation_color(theme.hover),
+		"selection": presentation_color(theme.selection),
+		"shadow": presentation_color(theme.shadow),
+		"panel": presentation_color(theme.panel),
+		"secondary": presentation_color(theme.secondary),
+		"contrast": presentation_color(theme.contrast),
+	})
+}
+
+/// Projects the live winning command registry into the extension roster
+/// contract.
+pub fn command_roster_response(roster: &commands::CommandRoster) -> Value {
+	let commands = roster
+		.roster_entries()
+		.into_iter()
+		.map(|command| {
+			serde_json::json!({
+				"name": command.name.as_str(),
+				"aliases": command.aliases.iter().map(Str::as_str).collect::<Vec<_>>(),
+				"description": command.description.as_str(),
+				"source": command.source.as_str(),
+			})
+		})
+		.collect::<Vec<_>>();
+	serde_json::json!({ "commands": commands })
+}
+
+#[cfg(unix)]
+fn presentation_dimensions() -> (u16, u16) {
+	use std::os::fd::AsRawFd as _;
+
+	let Ok(tty) = fs::File::open("/dev/tty") else {
+		return (0, 0);
+	};
+	let mut dimensions = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+	// SAFETY: TIOCGWINSZ initializes the fixed winsize output for a valid tty fd.
+	let status = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ, dimensions.as_mut_ptr()) };
+	if status != 0 {
+		return (0, 0);
+	}
+	// SAFETY: successful TIOCGWINSZ initialized the output structure.
+	let dimensions = unsafe { dimensions.assume_init() };
+	(dimensions.ws_col, dimensions.ws_row)
+}
+
+#[cfg(not(unix))]
+fn presentation_dimensions() -> (u16, u16) {
+	let width = env::var("COLUMNS")
+		.ok()
+		.and_then(|value| value.parse().ok())
+		.unwrap_or_default();
+	let height = env::var("LINES")
+		.ok()
+		.and_then(|value| value.parse().ok())
+		.unwrap_or_default();
+	(width, height)
+}
+
 fn handle_presentation_dispatch(
 	endpoint: &presentation::PresentationEndpoint,
 	dispatch: presentation::PresentationDispatch,
@@ -1728,7 +2015,7 @@ fn handle_presentation_dispatch(
 	};
 
 	if let presentation::PresentationOperation::Request(request) = &dispatch.operation
-		&& let Some(request_wire) = presentation_ui_request(dispatch.id, request)
+		&& let Some(request_wire) = lower_presentation_request(dispatch.id, request)
 	{
 		let correlation = Str::from(dispatch.id.to_string());
 		state
@@ -1745,17 +2032,61 @@ fn handle_presentation_dispatch(
 		},
 		PresentationOperation::Effect { identity, effect } => {
 			let result = match effect.kind.as_str() {
-				"notify" => effect
-					.body
-					.get("message")
-					.or_else(|| effect.body.get("text"))
-					.and_then(Value::as_str)
-					.map(|message| send_backend(backend, BackendEvent::Notice(Str::new(message))))
-					.ok_or_else(|| {
-						PresentationAuthorityError::Owner(Str::new_static(
-							"notify effect requires message text",
-						))
-					}),
+				"notify" => (|| -> Result<(), PresentationAuthorityError> {
+					let message = presentation_text(&effect.body, "message")
+						.or_else(|| presentation_text(&effect.body, "text"))
+						.ok_or_else(|| {
+							PresentationAuthorityError::Owner(Str::new_static(
+								"notify effect requires message text",
+							))
+						})?;
+					let level = effect
+						.body
+						.get("level")
+						.and_then(Value::as_str)
+						.unwrap_or("info");
+					if level.eq_ignore_ascii_case("error") {
+						send_backend(backend, BackendEvent::Error(Str::new(message)));
+					} else if level.eq_ignore_ascii_case("warn") {
+						send_backend(backend, BackendEvent::Notice(sf!("[warning] {message}")));
+					} else if level.eq_ignore_ascii_case("debug") {
+						send_backend(backend, BackendEvent::Notice(sf!("[debug] {message}")));
+					} else {
+						send_backend(backend, BackendEvent::Notice(Str::new(message)));
+					}
+					let desktop = effect
+						.body
+						.get("desktop")
+						.and_then(Value::as_bool)
+						.unwrap_or(false);
+					let sound =
+						presentation_notification_sound(effect.body.get("sound").and_then(Value::as_str));
+					if desktop {
+						let mut notification = Notification::default();
+						notification.title = effect
+							.body
+							.get("title")
+							.and_then(Value::as_str)
+							.map(Str::new);
+						notification.body = Some(Str::new(message));
+						notification.id = Some(Str::from(presentation_key(identity.as_ref(), "notify")));
+						notification.urgency = Some(presentation_notification_urgency(
+							level,
+							effect.body.get("urgency").and_then(Value::as_str),
+						));
+						notification.sound = sound;
+						send_backend(backend, BackendEvent::TerminalNotification(notification));
+					} else if sound.is_some_and(|sound| sound != NotificationSound::Silent) {
+						send_backend(
+							backend,
+							BackendEvent::ApplyUiEffect(UiEffect {
+								kind:  Some(ui_effect::Kind::Bell(Bell {})),
+								props: None,
+							}),
+						);
+					}
+					Ok(())
+				})(),
 				"set_title" => effect
 					.body
 					.get("title")
@@ -1792,20 +2123,115 @@ fn handle_presentation_dispatch(
 					);
 					Ok(())
 				},
-				_ => presentation_ui_effect(identity.as_ref(), &effect)
+				"set_progress" => {
+					send_backend(
+						backend,
+						BackendEvent::TerminalProgress(presentation_progress(&effect.body)),
+					);
+					lower_presentation_effect(identity.as_ref(), &effect)
+						.map(|effect| send_backend(backend, BackendEvent::ApplyUiEffect(effect)))
+				},
+				"set_editor_text" => presentation_text(&effect.body, "text")
+					.map(|text| {
+						send_backend(backend, BackendEvent::ComposerReplaced(Str::new(text)));
+					})
+					.ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"set_editor_text effect requires text",
+						))
+					}),
+				"paste_to_editor" => presentation_text(&effect.body, "content")
+					.map(|content| {
+						send_backend(backend, BackendEvent::ComposerPaste(Str::new(content)));
+					})
+					.ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"paste_to_editor effect requires string or TML content",
+						))
+					}),
+				"set_clipboard" => presentation_text(&effect.body, "text")
+					.map(|text| {
+						send_backend(backend, BackendEvent::CopyToClipboard(Str::new(text)));
+					})
+					.ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"set_clipboard effect requires text",
+						))
+					}),
+				"open_url" => presentation_text(&effect.body, "url")
+					.map(omp_core::open::open_path)
+					.ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"open_url effect requires URL text",
+						))
+					}),
+				"image" => (|| -> Result<(), PresentationAuthorityError> {
+					let resource = presentation_text(&effect.body, "resource").ok_or_else(|| {
+						PresentationAuthorityError::Owner(Str::new_static(
+							"image effect requires an opaque resource name",
+						))
+					})?;
+					let bytes = effect
+						.body
+						.get("source")
+						.and_then(presentation_image_bytes)
+						.ok_or_else(|| {
+							PresentationAuthorityError::Owner(Str::new_static(
+								"image source is not readable by the chat renderer",
+							))
+						})?;
+					if omp_tui::register_image_source(Str::new(resource), bytes) {
+						Ok(())
+					} else {
+						Err(PresentationAuthorityError::Owner(Str::new_static(
+							"image source is not a supported PNG or PPM resource",
+						)))
+					}
+				})(),
+				_ => lower_presentation_effect(identity.as_ref(), &effect)
 					.map(|effect| send_backend(backend, BackendEvent::ApplyUiEffect(effect))),
 			};
 			result.map(|()| PresentationResponse::Ack)
 		},
 		PresentationOperation::Request(request) => match request {
 			PresentationRequest::Presentation => {
+				let (width, height) = presentation_dimensions();
+				let charset = if state.presentation.charset == omp_tui::Charset::Ascii {
+					"ascii"
+				} else if state.presentation.charset == omp_tui::Charset::NerdFont {
+					"nerd"
+				} else {
+					"unicode"
+				};
+				let appearance = if state.presentation.appearance == omp_tui::Appearance::Light {
+					"light"
+				} else {
+					"dark"
+				};
+				let graphics = if state.presentation.graphics == omp_tui::Graphics::Sixel {
+					"sixel"
+				} else if state.presentation.graphics == omp_tui::Graphics::KittyPlaceholders {
+					"kitty_placeholders"
+				} else if state.presentation.graphics == omp_tui::Graphics::KittyDirect {
+					"kitty_direct"
+				} else if state.presentation.graphics == omp_tui::Graphics::Iterm2 {
+					"iterm2"
+				} else {
+					"cells"
+				};
 				Ok(PresentationResponse::Presentation(serde_json::json!({
-					"kind": "chat",
-					"session": state.session_id.as_str(),
-					"model": state.model.as_str(),
-					"workspace": state.workspace_root.as_str(),
-					"interactive": true,
+					"charset": charset,
+					"appearance": appearance,
+					"width": width,
+					"height": height,
+					"graphics": graphics,
+					"hyperlinks": state.hyperlinks,
+					"has_ui": true,
+					"palette": presentation_palette(state.presentation.theme),
 				})))
+			},
+			PresentationRequest::Commands => {
+				Ok(PresentationResponse::Presentation(command_roster_response(&state.typed_commands)))
 			},
 			PresentationRequest::Icons { prefix } => {
 				let icons = omp_tui::Icon::from_name(prefix.as_str())
@@ -1951,6 +2377,8 @@ fn command_role(collab: Option<&CollabCommandHandle>) -> CommandRole {
 }
 struct ChatSceneSeed {
 	typed_commands:   commands::CommandRoster,
+	extension_ui:     Arc<presentation::PublishedUiRoster>,
+	session:          Str,
 	command_usage:    Arc<CommandUsage>,
 	browser_settings: BrowserSettings,
 	skills:           Arc<omp_driver::skills::SkillSnapshot>,
@@ -2061,11 +2489,12 @@ fn chat_scene(seed: &ChatSceneSeed, ctx: &UiContext) -> Chat {
 	}));
 	let command_usage = Arc::clone(&seed.command_usage);
 	chat.set_ranked_slash_commands(commands, move |name| command_usage.count(name));
-	chat.set_completion(Box::new(DeferredCompletion::new(
+	chat.set_completion(Box::new(seed.extension_ui.completion_adapter(
+		seed.session.clone(),
 		[
-			('@', CompletionTrigger::Mention),
-			('#', CompletionTrigger::Hash),
-			(':', CompletionTrigger::Custom),
+			CompletionRule::native("@", CompletionTrigger::Mention),
+			CompletionRule::native("#", CompletionTrigger::Hash),
+			CompletionRule::native(":", CompletionTrigger::Custom),
 		],
 		Arc::new(ProjectCompletionSource::scan(&seed.workspace_root)),
 	)));
@@ -2192,6 +2621,7 @@ where
 
 	let submission_state = agent.state().clone();
 	let regime_projection = modes.clone();
+	let session_hooks = environment_host.admission_gate();
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
 	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
@@ -2233,7 +2663,40 @@ where
 					let _ = reply.send(result);
 				},
 				UiCmd::Rewind { to, reply } => {
-					let result = agent.rewind(to).map_err(|error| error.to_string());
+					let result = match agent.rewind_targets() {
+						Ok(targets) => {
+							let dropped_items = targets
+								.iter()
+								.filter(|target| to.is_none_or(|keep| target.event > keep))
+								.count();
+							match crate::chat_cmd::gate_session_rewind(
+								session_hooks.as_ref(),
+								to,
+								&targets,
+								dropped_items,
+							)
+							.await
+							{
+								Ok(false) => (|| -> Result<Vec<Item>, omp_agent::AgentError> {
+									let items = agent.rewind(to)?;
+									let new_head = agent.journal().load()?.len().saturating_sub(1) as u64;
+									crate::chat_cmd::notify_session_rewound(
+										session_hooks.as_ref(),
+										to,
+										new_head,
+										false,
+									);
+									Ok(items)
+								})()
+								.map_err(|error| error.to_string()),
+								Ok(true) => Err(String::from(
+									"workspace restore is unavailable for this rewind backend",
+								)),
+								Err(reason) => Err(format!("rewind denied: {reason}")),
+							}
+						},
+						Err(error) => Err(error.to_string()),
+					};
 					let _ = reply.send(result);
 				},
 				UiCmd::Retry { reply } => {
@@ -2285,7 +2748,7 @@ where
 					let _ = reply.send(result);
 				},
 				UiCmd::CreateSessionChild { kind, child_id, child_path, title, reply } => {
-					let result = (|| -> Result<(), String> {
+					let result = (|| -> Result<u64, String> {
 						let parent_id = agent.journal().session_id().clone();
 						let root = {
 							let journal = agent.journal().load().map_err(|error| error.to_string())?;
@@ -2329,7 +2792,12 @@ where
 								.append_title(created_ms, title, transcript::TitleSource::User)
 								.map_err(|error| error.to_string())?;
 						}
-						Ok(())
+						let head = child
+							.load()
+							.map_err(|error| error.to_string())?
+							.len()
+							.saturating_sub(1) as u64;
+						Ok(head)
 					})();
 					let _ = reply.send(result);
 				},
@@ -2461,10 +2929,13 @@ where
 		collab_live,
 		collab_state,
 		environment,
+		session_hooks: environment_host.admission_gate(),
 		lsp_servers: Vec::new(),
 		memory: omp_driver::memory::chat_memory(&session_id),
 		workspace_root: Str::from(workspace_root.to_string_lossy().as_ref()),
 		appearance: ctx.appearance,
+		presentation: ctx.clone(),
+		hyperlinks: caps.hyperlinks,
 		theme_watcher: ThemeWatcher::new(),
 		theme_revision: 0,
 		tools_expanded: true,
@@ -2529,6 +3000,8 @@ where
 	send_recap_policy(&backend_tx, &state.settings);
 	let chat_seed = ChatSceneSeed {
 		typed_commands: chat_commands,
+		extension_ui: Arc::clone(&state.extension_ui),
+		session: state.session_id.clone(),
 		command_usage,
 		browser_settings: current_browser_settings(settings_manager.as_ref()),
 		skills,
@@ -2595,6 +3068,11 @@ where
 		let mut presentation_endpoint = presentation_endpoint;
 		loop {
 			tokio::select! {
+							_reason = parent.wait_for_shutdown() => {
+								abort.abort();
+								parent.wait_for_idle().await;
+								break;
+							},
 							Ok(HeadlessLifecycleKind::CommandRosterInvalidated) = extension_ui_events.recv_async() => {
 								let security_enabled = state
 									.typed_commands
@@ -2720,7 +3198,7 @@ where
 										state.presentation_requests.remove(correlation.as_str())
 										&& let Some(endpoint) = presentation_endpoint.as_ref()
 									{
-										let result = presentation_response(request, response.clone());
+										let result = lower_presentation_response(request, response.clone());
 										let _ = endpoint.complete(dispatch_id, result);
 									}
 									continue;
@@ -2875,6 +3353,7 @@ where
 										&backend_tx,
 										&mut state,
 										registry.as_ref(),
+										parent.as_ref(),
 										command,
 									)
 									.await;
@@ -2995,7 +3474,8 @@ where
 										renderers.as_ref(),
 										&bus,
 										0,
-									);
+									)
+									.await;
 								}
 							},
 							Ok(()) = roster_events.changed() => {
@@ -3089,6 +3569,7 @@ fn guest_ui_request(request: omp_proto::collab::v1::UiRequest) -> UiRequest {
 				.into_iter()
 				.map(|option| option.label)
 				.collect(),
+			props:   None,
 		}),
 		Some(Spec::Editor(editor)) => ui_request::Kind::Dialog(Dialog {
 			kind:    String::from("editor"),
@@ -3097,12 +3578,14 @@ fn guest_ui_request(request: omp_proto::collab::v1::UiRequest) -> UiRequest {
 				presentation_tml(Some(&Value::String(format!("<text>{prefill}</text>"))))
 			}),
 			choices: Vec::new(),
+			props:   None,
 		}),
 		None => ui_request::Kind::Dialog(Dialog {
 			kind:    String::from("confirm"),
 			title:   request.title,
 			content: None,
 			choices: Vec::new(),
+			props:   None,
 		}),
 	};
 	UiRequest {
@@ -3877,6 +4360,15 @@ fn compaction_notice(outcome: &omp_agent::ManualCompactionOutcome) -> Str {
 	}
 }
 
+async fn reset_session(
+	control: &omp_agent::ControlSender,
+	gate: &omp_agent::HookGate,
+) -> Result<u64, omp_agent::ControlError> {
+	let at_event = control.reset(omp_agent::broker_now_ms()).await?;
+	crate::chat_cmd::notify_session_reset(gate, at_event, 0);
+	Ok(at_event)
+}
+
 fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 	match outcome.mode {
 		omp_agent::ManualShakeMode::Thinking => sf!(
@@ -3988,6 +4480,7 @@ where
 					selector.as_str(),
 					self.state,
 					self.control,
+					&self.parent,
 					durable,
 				)
 				.await;
@@ -4080,9 +4573,7 @@ where
 {
 	fn clear(&mut self) -> CommandFuture<'_> {
 		Box::pin(async move {
-			self
-				.control
-				.reset(omp_agent::broker_now_ms())
+			reset_session(self.control, &self.state.session_hooks)
 				.await
 				.into_diagnostic()?;
 			self.state.context_tokens = 0;
@@ -4331,6 +4822,26 @@ where
 					},
 				}
 			};
+			let summarize = match crate::chat_cmd::gate_session_branch(
+				&self.state.session_hooks,
+				checkpoint,
+				Some(checkpoint),
+				false,
+			)
+			.await
+			{
+				Ok(summarize) => summarize,
+				Err(reason) => {
+					return Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+						"Branch denied: {reason}"
+					))));
+				},
+			};
+			if summarize {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Branch summarization is unavailable for this session backend.",
+				)));
+			}
 			let child_id = Str::from(omp_core::Ulid::generate().to_string());
 			let child_path = self
 				.state
@@ -4349,7 +4860,13 @@ where
 				.await
 				.into_diagnostic()?;
 			match reply_rx.recv_async().await {
-				Ok(Ok(())) => {
+				Ok(Ok(new_head)) => {
+					crate::chat_cmd::notify_session_branched(
+						&self.state.session_hooks,
+						checkpoint,
+						new_head,
+						None,
+					);
 					send_backend(
 						self.backend,
 						BackendEvent::Sessions(vec![SessionRow {
@@ -4397,7 +4914,7 @@ where
 				.await
 				.into_diagnostic()?;
 			match reply_rx.recv_async().await {
-				Ok(Ok(())) => {
+				Ok(Ok(_new_head)) => {
 					send_backend(
 						self.backend,
 						BackendEvent::Sessions(vec![SessionRow {
@@ -4719,6 +5236,7 @@ where
 					target.as_str(),
 					self.state,
 					self.control,
+					&self.parent,
 					false,
 				)
 				.await;
@@ -6962,7 +7480,7 @@ where
 						"Local command queued until the active turn settles.",
 					);
 				} else if let Some(command) = state.deferred.take_next() {
-					execute_deferred_command(backend, state, registry, command).await;
+					execute_deferred_command(backend, state, registry, parent.as_ref(), command).await;
 				}
 				return Ok(false);
 			}
@@ -7006,11 +7524,44 @@ where
 				state,
 			};
 			// A failed slash command (bad arguments, handler error) renders
-			let dispatch = match roster
-				.dispatch(&text, CommandSurface::Tui, &mut command_host)
-				.await
 			// in-chat; it never tears down the interactive shell.
-			{
+			let mut command_denial = None;
+			let admitted_extension =
+				if let Some(mut invocation) = roster.extension_invocation(&text, CommandSurface::Tui) {
+					match parent
+						.admit_command_invoke(
+							invocation.name.as_str(),
+							invocation.argv.as_ref(),
+							invocation.raw.as_str(),
+							"interactive",
+							"interactive",
+						)
+						.await
+					{
+						Ok((name, argv)) => {
+							invocation.name = name;
+							invocation.argv = argv.into();
+							Some(invocation)
+						},
+						Err(denial) => {
+							command_denial = Some(denial.reason);
+							None
+						},
+					}
+				} else {
+					None
+				};
+			let command_denied = command_denial.is_some();
+			let dispatched = if let Some(reason) = command_denial {
+				Ok(DispatchResult::Passthrough(reason))
+			} else if let Some(invocation) = admitted_extension {
+				roster.dispatch_extension_invocation(invocation).await
+			} else {
+				roster
+					.dispatch(&text, CommandSurface::Tui, &mut command_host)
+					.await
+			};
+			let dispatch = match dispatched {
 				Ok(dispatch) => dispatch,
 				Err(error) => {
 					send_backend(backend, BackendEvent::Error(sf!("{error}")));
@@ -7031,7 +7582,16 @@ where
 			if !text.trim().is_empty() {
 				modes.capture_loop_prompt(&text);
 			}
-			match state.commands.parse_input(&text) {
+			let parsed = if command_denied {
+				Ok(ChatCommand::Submit {
+					item:   Box::new(input::user_message(&text)),
+					text:   Str::from(text.as_str()),
+					budget: None,
+				})
+			} else {
+				state.commands.parse_input(&text)
+			};
+			match parsed {
 				Ok(ChatCommand::Nothing) => {
 					if should_abort_empty(chat_active(state.submit_pending, bus.phase()), state.queued) {
 						abort.abort();
@@ -7068,6 +7628,7 @@ where
 						selector.as_str(),
 						state,
 						control,
+						parent,
 						true,
 					)
 					.await;
@@ -7080,6 +7641,7 @@ where
 						selector.as_str(),
 						state,
 						control,
+						parent,
 						false,
 					)
 					.await;
@@ -7126,7 +7688,7 @@ where
 							)),
 						);
 					} else {
-						match control.reset(omp_agent::broker_now_ms()).await {
+						match reset_session(control, &state.session_hooks).await {
 							Ok(_) => {
 								state.context_tokens = 0;
 								send_backend(backend, BackendEvent::HistoryCleared);
@@ -7255,6 +7817,13 @@ where
 					let chips = lower_attachments(&mut item, attachments.clone(), |message| {
 						send_backend(backend, BackendEvent::Error(message));
 					});
+					if let Err(denial) = parent
+						.admit_user_input(std::slice::from_mut(&mut item), "interactive", false)
+						.await
+					{
+						send_backend(backend, BackendEvent::Error(denial.reason));
+						return Ok(false);
+					}
 					let delivered = if active {
 						apply_turn_budget(agent_state, budget.as_ref());
 						let delivered = mailbox
@@ -7335,6 +7904,17 @@ where
 						let chips = lower_attachments(&mut item, attachments, |message| {
 							send_backend(backend, BackendEvent::Error(message));
 						});
+						if let Err(denial) = parent
+							.admit_user_input(
+								std::slice::from_mut(&mut item),
+								"interactive",
+								looks_like_pasted_transcript(prompt_text.as_str()),
+							)
+							.await
+						{
+							send_backend(backend, BackendEvent::Error(denial.reason));
+							return Ok(false);
+						}
 						let delivered = if active {
 							apply_turn_budget(agent_state, budget.as_ref());
 							let delivered = mailbox
@@ -7485,6 +8065,43 @@ where
 			}
 		},
 		Intent::CycleModel { backward } => {
+			if !state.model_settings.enabled_models.is_empty() {
+				let mut unscoped = state.model_settings.clone();
+				unscoped.enabled_models = Arc::from([]);
+				let available =
+					model_rows(state.catalog.as_ref(), &unscoped, state.auth_control.as_ref())
+						.into_iter()
+						.map(|row| row.key.to_string())
+						.collect::<HashSet<_>>();
+				let mut controls = omp_driver::model_controls::ModelControls::default();
+				controls.set_scoped_from_settings(
+					state.catalog.as_ref(),
+					&state.model_settings,
+					|key| available.contains(key.as_str()),
+				);
+				let direction = if backward {
+					omp_driver::model_controls::CycleDirection::Backward
+				} else {
+					omp_driver::model_controls::CycleDirection::Forward
+				};
+				if let Some(selection) =
+					controls.cycle_scoped(ModelKey::from_ref(&state.model), direction)
+				{
+					switch_model_with_thinking(
+						backend,
+						agent_state,
+						settings_manager,
+						selection.model.as_str(),
+						state,
+						control,
+						parent,
+						selection.thinking,
+						false,
+					)
+					.await;
+				}
+				return Ok(false);
+			}
 			let rows = cycle_model_rows(
 				state.catalog.as_ref(),
 				&state.model_settings,
@@ -7507,6 +8124,7 @@ where
 					rows[next].key.as_str(),
 					state,
 					control,
+					parent,
 					false,
 				)
 				.await;
@@ -7923,6 +8541,7 @@ where
 				model.as_str(),
 				state,
 				control,
+				parent,
 				false,
 			)
 			.await;
@@ -8059,12 +8678,15 @@ fn looks_like_pasted_transcript(source: &str) -> bool {
 	})
 }
 
-async fn execute_deferred_command(
+async fn execute_deferred_command<C>(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	registry: &Registry,
+	parent: &ChatParentHost<C>,
 	command: DeferredCommand,
-) {
+) where
+	C: TurnClient + Clone + Send + 'static,
+{
 	let name = <&'static str>::from(command.kind);
 	send_backend(backend, BackendEvent::ToolStarted {
 		id:    command.id.clone(),
@@ -8073,8 +8695,10 @@ async fn execute_deferred_command(
 		title: command.source.clone(),
 	});
 	let result = match command.kind {
-		DeferredCommandKind::Shell => execute_deferred_shell(backend, state, &command).await,
-		DeferredCommandKind::Eval => execute_deferred_eval(backend, registry, &command).await,
+		DeferredCommandKind::Shell => execute_deferred_shell(backend, state, parent, &command).await,
+		DeferredCommandKind::Eval => {
+			execute_deferred_eval(backend, state, registry, parent, &command).await
+		},
 	};
 	let (ok, preview) = match result {
 		Ok(preview) => (true, preview),
@@ -8100,15 +8724,41 @@ async fn execute_deferred_command(
 	);
 }
 
-async fn execute_deferred_shell(
+async fn execute_deferred_shell<C>(
 	backend: &flume::Sender<BackendEvent>,
 	state: &BridgeState,
+	parent: &ChatParentHost<C>,
 	command: &DeferredCommand,
-) -> miette::Result<Str> {
-	let cwd = EnvPath::new(state.workspace_root.clone()).into_diagnostic()?;
+) -> miette::Result<Str>
+where
+	C: TurnClient + Clone + Send + 'static,
+{
+	let cwd = PathBuf::from(state.workspace_root.as_str());
+	let (source, cwd, env_overrides) = parent
+		.admit_user_bash(
+			command.source.as_str(),
+			&cwd,
+			matches!(command.context, DeferredContext::Excluded),
+		)
+		.await
+		.map_err(|denial| miette::miette!("{}", denial.reason))?;
+	let env_delta = EnvironmentDelta {
+		set:   env_overrides
+			.iter()
+			.filter_map(|(name, value)| value.as_ref().map(|value| (name.clone(), value.clone())))
+			.collect(),
+		unset: env_overrides
+			.iter()
+			.filter_map(|(name, value)| value.is_none().then(|| name.clone()))
+			.collect(),
+		props: None,
+	};
 	let opened = state
 		.environment
-		.open_session(&cwd, OpenSessionRequest::default())
+		.open_session(&cwd, OpenSessionRequest {
+			env_delta: Some(env_delta),
+			..OpenSessionRequest::default()
+		})
 		.await
 		.into_diagnostic()?;
 	let session = opened.session.clone();
@@ -8116,7 +8766,7 @@ async fn execute_deferred_shell(
 		.environment
 		.exec(ExecRequest {
 			session: opened.session,
-			source: Some(Script { text: command.source.to_string(), ..Script::default() }),
+			source: Some(Script { text: source.to_string(), ..Script::default() }),
 			..ExecRequest::default()
 		})
 		.await;
@@ -8169,14 +8819,27 @@ async fn execute_deferred_shell(
 	result
 }
 
-async fn execute_deferred_eval(
+async fn execute_deferred_eval<C>(
 	backend: &flume::Sender<BackendEvent>,
+	state: &BridgeState,
 	registry: &Registry,
+	parent: &ChatParentHost<C>,
 	command: &DeferredCommand,
-) -> miette::Result<Str> {
+) -> miette::Result<Str>
+where
+	C: TurnClient + Clone + Send + 'static,
+{
+	let code = parent
+		.admit_user_eval(
+			command.source.as_str(),
+			Path::new(state.workspace_root.as_str()),
+			matches!(command.context, DeferredContext::Excluded),
+		)
+		.await
+		.map_err(|denial| miette::miette!("{}", denial.reason))?;
 	let raw = serde_json::to_string(&serde_json::json!({
 		"language": "py",
-		"code": command.source.as_str(),
+		"code": code,
 		"title": "interactive",
 	}))
 	.into_diagnostic()?;
@@ -8408,6 +9071,7 @@ fn apply_configured_theme(
 			.ok_or_else(|| miette::miette!("appearance.accent is not a valid color"))?;
 	}
 	state.theme_revision = revision;
+	state.presentation.theme = theme;
 	send_backend(backend, BackendEvent::ThemePreview(theme));
 	Ok(())
 }
@@ -8619,7 +9283,7 @@ async fn handle_collaboration_operation<C>(
 	let _ = commands;
 }
 
-fn handle_agent_event(
+async fn handle_agent_event(
 	backend: &flume::Sender<BackendEvent>,
 	state: &mut BridgeState,
 	event: &AgentEvent,
@@ -8766,11 +9430,16 @@ fn handle_agent_event(
 						.resolve_name(&start.tool_name)
 						.cloned()
 						.unwrap_or_else(|| missing_identity(&start.tool_name));
+					let extension_renderer =
+						extension_renderer_route(state.extension_ui.as_ref(), renderers, &identity);
 					state.tools.insert(id.clone(), ToolDisplay {
 						identity,
 						args: omp_slopjson::Value::Object(omp_slopjson::Object::new()),
 						started: false,
 						fold: ViewState::new(),
+						updates: Vec::new(),
+						opened: Instant::now(),
+						extension_renderer,
 					});
 					state.streaming_tools.insert(start.index, (id, Vec::new()));
 				},
@@ -8837,8 +9506,11 @@ fn handle_agent_event(
 		},
 		AgentEvent::ToolOpened { call_id, name, rev } => {
 			let identity = ToolIdentity { name: name.clone(), rev: rev.clone() };
+			let extension_renderer =
+				extension_renderer_route(state.extension_ui.as_ref(), renderers, &identity);
 			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				tool.identity = identity;
+				tool.extension_renderer = extension_renderer;
 				let _ = fold_tool_args(renderers, tool, true);
 			} else {
 				state.tools.insert(call_id.clone(), ToolDisplay {
@@ -8846,6 +9518,9 @@ fn handle_agent_event(
 					args: omp_slopjson::Value::Object(omp_slopjson::Object::new()),
 					started: false,
 					fold: ViewState::new(),
+					updates: Vec::new(),
+					opened: Instant::now(),
+					extension_renderer,
 				});
 			}
 		},
@@ -8859,7 +9534,7 @@ fn handle_agent_event(
 			}
 		},
 		AgentEvent::ToolUpdate { call_id, json } => {
-			if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
+			let projection = if let Some(tool) = state.tools.get_mut(call_id.as_str()) {
 				ensure_tool_started(backend, call_id, tool, true);
 				if tool.identity.name == "bash"
 					&& let Ok(update) = serde_json::from_slice::<omp_tools::shell::Update>(json)
@@ -8886,7 +9561,37 @@ fn handle_agent_event(
 						});
 					}
 				}
-				let view = fold_tool_update(renderers, tool, json.clone());
+				if let Ok(update) = serde_json::from_slice(json) {
+					tool.updates.push(update);
+				}
+				let native = fold_tool_update(renderers, tool, json.clone());
+				let extension = tool.extension_renderer.map(|route| {
+					(
+						route,
+						tool.identity.clone(),
+						tool_renderer_view(call_id, tool, Value::Null, "EFFECTS_AUTHORIZED"),
+					)
+				});
+				Some((native, extension))
+			} else {
+				None
+			};
+			if let Some((native, extension)) = projection {
+				let view = if let Some((route, identity, extension_view)) = extension {
+					state
+						.extension_ui
+						.render_tool(
+							&identity,
+							extension_view,
+							tool_renderer_context(state),
+							native,
+							route.native_authoritative,
+							state.session_id.clone(),
+						)
+						.await
+				} else {
+					native
+				};
 				send_backend(backend, BackendEvent::ToolView { id: call_id.clone(), view });
 			}
 		},
@@ -8908,7 +9613,29 @@ fn handle_agent_event(
 				});
 			}
 			let mut tool = state.tools.remove(call_id.as_str());
-			let (identity, terminal, view) = render_tool_result_view(renderers, item, tool.as_ref());
+			let (identity, terminal, native) = render_tool_result_view(renderers, item, tool.as_ref());
+			let extension_renderer = match tool.as_ref() {
+				Some(tool) => tool.extension_renderer,
+				None => extension_renderer_route(state.extension_ui.as_ref(), renderers, &identity),
+			};
+			let extension_view = extension_renderer.map(|route| {
+				let verdict = durable_tool_outcome(item)
+					.and_then(|outcome| serde_json::from_slice(&outcome).ok())
+					.unwrap_or(Value::Null);
+				let view = match tool.as_ref() {
+					Some(tool) => tool_renderer_view(call_id, tool, verdict, "SETTLED"),
+					None => serde_json::json!({
+						"call_id": call_id.as_str(),
+						"updates": [],
+						"state": null,
+						"verdict": verdict,
+						"elapsed": "0ms",
+						"phase": "SETTLED",
+						"presentation": {},
+					}),
+				};
+				(route, view)
+			});
 			let is_report_issue = identity.name == "report_issue";
 			if let Some(tool) = tool.as_mut() {
 				ensure_tool_started(backend, call_id, tool, true);
@@ -8921,6 +9648,21 @@ fn handle_agent_event(
 				});
 			}
 			send_tool_result_images(backend, call_id, item);
+			let view = if let Some((route, extension_view)) = extension_view {
+				state
+					.extension_ui
+					.render_tool(
+						&identity,
+						extension_view,
+						tool_renderer_context(state),
+						native,
+						route.native_authoritative,
+						state.session_id.clone(),
+					)
+					.await
+			} else {
+				native
+			};
 			send_backend(backend, BackendEvent::ToolFinished { id: call_id.clone(), terminal, view });
 			if terminal == ToolTerminal::Succeeded
 				&& identity.name == "todo"
@@ -9109,7 +9851,15 @@ fn replay_items(
 					rev: Str::from(identity.rev.to_string()),
 					title,
 				});
-				let mut tool = ToolDisplay { identity, args, started: true, fold: ViewState::new() };
+				let mut tool = ToolDisplay {
+					identity,
+					args,
+					started: true,
+					fold: ViewState::new(),
+					updates: Vec::new(),
+					opened: Instant::now(),
+					extension_renderer: None,
+				};
 				let _ = fold_tool_args(renderers, &mut tool, true);
 				tools.insert(id, tool);
 			},
@@ -9412,6 +10162,71 @@ fn durable_tool_terminal(item: &Item) -> ToolTerminal {
 fn structured_bytes_fallback(bytes: &Bytes) -> Str {
 	str::from_utf8(bytes).map_or_else(|_| Str::new_static("{}"), Str::from)
 }
+fn extension_renderer_route(
+	roster: &presentation::PublishedUiRoster,
+	renderers: &RenderRegistry,
+	identity: &ToolIdentity,
+) -> Option<ExtensionRendererRoute> {
+	let native_authoritative = renderers.has_native(identity);
+	roster
+		.has_tool_renderer(identity, native_authoritative)
+		.then_some(ExtensionRendererRoute { native_authoritative })
+}
+
+fn tool_renderer_view(
+	call_id: &Str,
+	tool: &ToolDisplay,
+	verdict: Value,
+	phase: &'static str,
+) -> Value {
+	serde_json::json!({
+		"call_id": call_id.as_str(),
+		"updates": tool.updates.clone(),
+		"state": null,
+		"verdict": verdict,
+		"elapsed": format!("{}ms", tool.opened.elapsed().as_millis()),
+		"phase": phase,
+		"presentation": {},
+	})
+}
+
+fn tool_renderer_context(state: &BridgeState) -> Value {
+	let (width, _) = presentation_dimensions();
+	let charset = if state.presentation.charset == omp_tui::Charset::Ascii {
+		"ascii"
+	} else if state.presentation.charset == omp_tui::Charset::NerdFont {
+		"nerd"
+	} else {
+		"unicode"
+	};
+	let appearance = if state.presentation.appearance == omp_tui::Appearance::Light {
+		"light"
+	} else {
+		"dark"
+	};
+	let graphics = if state.presentation.graphics == omp_tui::Graphics::Sixel {
+		"sixel"
+	} else if state.presentation.graphics == omp_tui::Graphics::KittyPlaceholders {
+		"kitty_placeholders"
+	} else if state.presentation.graphics == omp_tui::Graphics::KittyDirect {
+		"kitty_direct"
+	} else if state.presentation.graphics == omp_tui::Graphics::Iterm2 {
+		"iterm2"
+	} else {
+		"cells"
+	};
+	serde_json::json!({
+		"width": width,
+		"charset": charset,
+		"appearance": appearance,
+		"graphics": graphics,
+		"hyperlinks": state.hyperlinks,
+		"focused": false,
+		"collapsed": !state.tools_expanded,
+		"place": "transcript",
+		"presentation": {},
+	})
+}
 
 /// Folds the accumulated streaming argument parse and re-renders the live
 /// view, returning markup only when an exact-revision renderer produced one.
@@ -9437,8 +10252,8 @@ fn fold_tool_update(
 	let rendered = renderers
 		.fold(&tool.identity, &mut tool.fold, update.clone())
 		.ok()
-		.and_then(|()| renderers.get(&tool.identity))
-		.and_then(|entry| entry.view(&tool.fold, None).ok().flatten());
+		.filter(|()| renderers.contains(&tool.identity))
+		.and_then(|()| renderers.view(&tool.identity, &tool.fold, None).ok());
 	rendered.map_or_else(
 		|| ToolViewContent::Plain(structured_bytes_fallback(&update)),
 		ToolViewContent::Markup,
@@ -9478,8 +10293,9 @@ fn render_tool_result_view(
 		.filter(|tool| tool.identity == identity)
 		.map_or(&empty_fold, |tool| &tool.fold);
 	let view = renderers
-		.get(&identity)
-		.and_then(|entry| entry.view(fold, outcome.as_deref()).ok().flatten())
+		.contains(&identity)
+		.then(|| renderers.view(&identity, fold, outcome.as_deref()).ok())
+		.flatten()
 		.map(ToolViewContent::Markup)
 		.unwrap_or_else(|| {
 			ToolViewContent::Plain(
@@ -9588,6 +10404,14 @@ fn proto_to_json(value: &v1::Value) -> Option<serde_json::Value> {
 			Some(serde_json::Value::Object(object))
 		},
 	}
+}
+
+fn proto_map_to_json(map: &v1::ValueMap) -> Option<serde_json::Map<String, Value>> {
+	let mut object = serde_json::Map::with_capacity(map.fields.len());
+	for (key, value) in &map.fields {
+		object.insert(key.clone(), proto_to_json(value)?);
+	}
+	Some(object)
 }
 
 fn model_rows(
@@ -9828,24 +10652,55 @@ fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
 		.collect()
 }
 
-async fn switch_model(
+async fn switch_model<C>(
 	backend: &flume::Sender<BackendEvent>,
 	state_handle: &AgentState,
 	settings_manager: &SettingsManager,
 	selector: &str,
 	state: &mut BridgeState,
 	control: &omp_agent::ControlSender,
+	parent: &Arc<ChatParentHost<C>>,
 	durable: bool,
-) {
+) where
+	C: TurnClient + Clone + Send + 'static,
+{
+	switch_model_with_thinking(
+		backend,
+		state_handle,
+		settings_manager,
+		selector,
+		state,
+		control,
+		parent,
+		None,
+		durable,
+	)
+	.await;
+}
+
+async fn switch_model_with_thinking<C>(
+	backend: &flume::Sender<BackendEvent>,
+	state_handle: &AgentState,
+	settings_manager: &SettingsManager,
+	selector: &str,
+	state: &mut BridgeState,
+	control: &omp_agent::ControlSender,
+	parent: &Arc<ChatParentHost<C>>,
+	thinking: Option<omp_catalog::ThinkingEffort>,
+	durable: bool,
+) where
+	C: TurnClient + Clone + Send + 'static,
+{
 	let catalog = state.catalog.as_ref();
 	if !durable {
+		let thinking = thinking.map(<&'static str>::from);
 		let mutation = match omp_driver::chat::set_active_session_model(
 			catalog,
 			&state.model_settings,
 			state_handle,
 			control,
 			selector,
-			None,
+			thinking,
 		)
 		.await
 		{
@@ -9855,6 +10710,14 @@ async fn switch_model(
 				return;
 			},
 		};
+		parent.notify_model_changed(
+			mutation.previous_model.as_ref(),
+			&mutation.model,
+			mutation.previous_thinking,
+			mutation.thinking,
+			"temporary",
+			"user",
+		);
 		state.model = mutation.key.to_string();
 		state.context_window = mutation.context_window;
 		send_models_updated(backend, state);
@@ -9872,10 +10735,58 @@ async fn switch_model(
 		);
 		return;
 	}
+	let previous_model = resolve_model_selector(catalog, &state.model_settings, &state.model)
+		.and_then(|spec| journal_model_ref(catalog, spec));
+	let Some(model) = journal_model_ref(catalog, spec) else {
+		send_backend(
+			backend,
+			BackendEvent::Error(sf!("Model has no selectable provider route: {selector}")),
+		);
+		return;
+	};
 	let key = spec.key.to_string();
+	let current_thinking = state_handle
+		.snapshot()
+		.turn
+		.params
+		.thinking
+		.as_ref()
+		.and_then(|reasoning| Effort::try_from(reasoning.effort).ok());
+	let previous_enabled_models = Arc::clone(&state.model_settings.enabled_models);
+	let persisted_scope_changed = state
+		.model_settings
+		.insert_persisted_default(spec.key.as_str());
 	{
 		let raw = toml::Value::String(key.clone()).to_string();
 		let scope = model_role_scope(state.model_settings.role_storage);
+		if persisted_scope_changed {
+			let enabled = match toml::Value::try_from(
+				state
+					.model_settings
+					.enabled_models
+					.iter()
+					.cloned()
+					.collect::<Vec<_>>(),
+			) {
+				Ok(enabled) => enabled.to_string(),
+				Err(error) => {
+					state.model_settings.enabled_models = previous_enabled_models;
+					send_backend(
+						backend,
+						BackendEvent::Error(sf!("Could not encode the enabled model scope: {error}")),
+					);
+					return;
+				},
+			};
+			if let Err(error) = settings_manager.set_sync(scope, "model.enabled_models", &enabled) {
+				state.model_settings.enabled_models = previous_enabled_models;
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Could not save the enabled model scope: {error}")),
+				);
+				return;
+			}
+		}
 		if let Err(error) = settings_manager.set_sync(scope, "model.roles.default", &raw) {
 			send_backend(
 				backend,
@@ -9893,6 +10804,14 @@ async fn switch_model(
 		snapshot.reasoning_dialect =
 			omp_driver::chat::interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
 	});
+	parent.notify_model_changed(
+		previous_model.as_ref(),
+		&model,
+		current_thinking,
+		current_thinking,
+		"default",
+		"user",
+	);
 	state.model = key;
 	state.context_window = spec.limits.context_window;
 	send_models_updated(backend, state);
@@ -9901,6 +10820,15 @@ async fn switch_model(
 		BackendEvent::Notice(sf!("Default and session model: `{}`.", state.model)),
 	);
 }
+fn journal_model_ref(catalog: &Catalog, spec: &ModelSpec) -> Option<transcript::ModelRef> {
+	let route = spec.routes.first().and_then(|route| catalog.route(route))?;
+	Some(transcript::ModelRef {
+		provider: transcript::ProviderId(Str::new(route.provider.as_str())),
+		api:      Str::new(route.codec.as_str()),
+		model:    transcript::ModelId(Str::new(spec.key.as_str())),
+	})
+}
+
 fn resolve_model_selector<'a>(
 	catalog: &'a Catalog,
 	settings: &ModelSettings,
@@ -10593,6 +11521,27 @@ mod tests {
 	};
 
 	use super::*;
+	struct LiveRendererDispatcher {
+		views: Arc<Mutex<Vec<Value>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl omp_envd::exthost::dispatch::CallbackDispatcher for LiveRendererDispatcher {
+		async fn dispatch(
+			&self,
+			_target: Arc<omp_envd::exthost::control::ControlConnectionIdentity>,
+			dispatch: omp_envd::exthost::control::ControlDispatch,
+		) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+			self.views.lock().push(
+				dispatch
+					.arguments
+					.get("view")
+					.cloned()
+					.expect("renderer view argument"),
+			);
+			Ok(serde_json::json!({ "source": "<text>extension live</text>" }))
+		}
+	}
 
 	#[test]
 	fn model_tags_cycle_order_and_hidden_direct_resolution_are_preserved() {
@@ -10883,6 +11832,7 @@ mod tests {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			catalog: Arc::new(Catalog::embedded().clone()),
+			session_hooks: Arc::new(omp_agent::HookGate::channel().0),
 			auth_control: None,
 			model: "test/model".to_owned(),
 			model_settings: ModelSettings::default(),
@@ -10908,6 +11858,8 @@ mod tests {
 			memory: None,
 			workspace_root: sf!("/workspace"),
 			appearance: omp_tui::Appearance::Dark,
+			presentation: UiContext::default(),
+			hyperlinks: false,
 			theme_watcher: ThemeWatcher::new(),
 			theme_revision: 0,
 			tools_expanded: true,
@@ -10969,9 +11921,123 @@ mod tests {
 		}
 		assert_eq!(events.len(), 300);
 	}
+	#[tokio::test]
+	async fn live_tool_events_dispatch_extension_renderer_tml() {
+		let scratch = tempfile::tempdir().expect("scratch directory");
+		let (tx, rx) = flume::unbounded();
+		let mut state = test_bridge_state(scratch.path());
+		let identity =
+			ToolIdentity { name: sf!("counter"), rev: Rev { family: sf!("counter"), n: 2 } };
+		let target = Arc::new(omp_envd::exthost::control::ControlConnectionIdentity {
+			extension:          sf!("renderer-fixture"),
+			principal:          omp_envd::exthost::Principal::new(
+				sf!("renderer-fixture"),
+				sf!("Renderer fixture"),
+			),
+			artifact_digest:    sf!("digest"),
+			layer:              sf!("workspace"),
+			tier:               sf!("trusted"),
+			trust:              sf!("trusted"),
+			host_generation:    1,
+			session_generation: 1,
+			capabilities:       Arc::new(std::collections::BTreeSet::new()),
+		});
+		let views = Arc::new(Mutex::new(Vec::new()));
+		state.extension_ui.install_test_renderer(
+			omp_envd::exthost::VerifiedRendererDeclaration {
+				declaration_id: sf!("counter-renderer"),
+				identity:       identity.clone(),
+				callback:       sf!("fixture.render"),
+				reduce:         None,
+				decorates:      false,
+				module:         sf!("fixture"),
+			},
+			target,
+			Arc::new(LiveRendererDispatcher { views: Arc::clone(&views) }),
+		);
+		let modes = RegimeHandle::new();
+		let renderers = RenderRegistry::new();
+		let bus = omp_agent::EventBus::new();
+		handle_agent_event(
+			&tx,
+			&mut state,
+			&AgentEvent::ToolOpened {
+				call_id: sf!("call-1"),
+				name:    identity.name.clone(),
+				rev:     identity.rev.clone(),
+			},
+			&modes,
+			&renderers,
+			&bus,
+			0,
+		)
+		.await;
+		handle_agent_event(
+			&tx,
+			&mut state,
+			&AgentEvent::ToolUpdate {
+				call_id: sf!("call-1"),
+				json:    Bytes::from_static(br#"{"count":1}"#),
+			},
+			&modes,
+			&renderers,
+			&bus,
+			0,
+		)
+		.await;
+		handle_agent_event(
+			&tx,
+			&mut state,
+			&AgentEvent::ToolFinished {
+				call_id: sf!("call-1"),
+				item:    Item {
+					kind: Some(item::Kind::ToolResult(omp_proto::thread::v1::ToolResult {
+						call_id: "call-1".to_owned(),
+						name: "counter".to_owned(),
+						details: Some(json_proto(serde_json::json!({
+							"kind": "ok",
+							"value": { "count": 1 },
+						}))),
+						..Default::default()
+					})),
+					props: Some(revision_props("counter.2")),
+					..Default::default()
+				},
+				usage:   Default::default(),
+			},
+			&modes,
+			&renderers,
+			&bus,
+			0,
+		)
+		.await;
 
-	#[test]
-	fn active_turn_text_and_error_notices_project_into_viewport_or_retirement_rows() {
+		let events = rx.drain().collect::<Vec<_>>();
+		assert!(events.iter().any(|event| matches!(
+			event,
+			BackendEvent::ToolView {
+				id,
+				view: ToolViewContent::Markup(source),
+			} if id == "call-1" && source == "<text>extension live</text>"
+		)));
+		assert!(events.iter().any(|event| matches!(
+			event,
+			BackendEvent::ToolFinished {
+				id,
+				view: ToolViewContent::Markup(source),
+				..
+			} if id == "call-1" && source == "<text>extension live</text>"
+		)));
+		let views = views.lock();
+		assert_eq!(views.len(), 2);
+		assert_eq!(views[0]["call_id"], "call-1");
+		assert_eq!(views[0]["updates"], serde_json::json!([{ "count": 1 }]));
+		assert_eq!(views[0]["verdict"], Value::Null);
+		assert_eq!(views[1]["verdict"]["kind"], "ok");
+	}
+
+	#[tokio::test]
+	async fn active_turn_text_and_error_notices_project_into_viewport_or_retirement_rows() {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state(scratch.path());
@@ -10999,7 +12065,8 @@ mod tests {
 				&renderers,
 				&bus,
 				0,
-			);
+			)
+			.await;
 		}
 		send_backend(&tx, BackendEvent::Error(sf!("Compaction failed: unauthorized")));
 
@@ -11033,8 +12100,8 @@ mod tests {
 		assert!(transcript.contains("Compaction failed: unauthorized"), "{transcript}");
 	}
 
-	#[test]
-	fn turn_failure_settles_streaming_parts_and_tool_widgets() {
+	#[tokio::test]
+	async fn turn_failure_settles_streaming_parts_and_tool_widgets() {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state(scratch.path());
@@ -11070,7 +12137,8 @@ mod tests {
 				&renderers,
 				&bus,
 				0,
-			);
+			)
+			.await;
 		}
 		assert!(state.tools.get("toolu_1").is_some_and(|tool| tool.started));
 		handle_agent_event(
@@ -11084,7 +12152,8 @@ mod tests {
 			&renderers,
 			&bus,
 			0,
-		);
+		)
+		.await;
 		assert!(state.active_parts.is_empty());
 		assert!(state.streaming_tools.is_empty());
 		assert!(state.tools.is_empty());
@@ -11413,10 +12482,13 @@ mod tests {
 			.register(test_identity("test.1"), TestRenderer("one"))
 			.expect("register renderer");
 		let mut tool = ToolDisplay {
-			identity: test_identity("test.1"),
-			args:     omp_slopjson::parse_streaming(r#"{"query":"parti"#),
-			started:  false,
-			fold:     ViewState::new(),
+			identity:           test_identity("test.1"),
+			args:               omp_slopjson::parse_streaming(r#"{"query":"parti"#),
+			started:            false,
+			fold:               ViewState::new(),
+			updates:            Vec::new(),
+			opened:             Instant::now(),
+			extension_renderer: None,
 		};
 		assert_eq!(
 			fold_tool_args(&renderers, &mut tool, false)
@@ -11432,10 +12504,13 @@ mod tests {
 			"<row>one:partial search::committed:live</row>"
 		);
 		let mut unknown = ToolDisplay {
-			identity: test_identity("test.9"),
-			args:     omp_slopjson::parse_streaming(r#"{"query":"x"}"#),
-			started:  false,
-			fold:     ViewState::new(),
+			identity:           test_identity("test.9"),
+			args:               omp_slopjson::parse_streaming(r#"{"query":"x"}"#),
+			started:            false,
+			fold:               ViewState::new(),
+			updates:            Vec::new(),
+			opened:             Instant::now(),
+			extension_renderer: None,
 		};
 		assert!(fold_tool_args(&renderers, &mut unknown, false).is_none());
 	}
@@ -11450,16 +12525,22 @@ mod tests {
 			.register(test_identity("test.2"), TestRenderer("two"))
 			.expect("register revision two");
 		let mut first = ToolDisplay {
-			identity: test_identity("test.1"),
-			args:     omp_slopjson::Value::Object(omp_slopjson::Object::new()),
-			started:  true,
-			fold:     ViewState::new(),
+			identity:           test_identity("test.1"),
+			args:               omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+			started:            true,
+			fold:               ViewState::new(),
+			updates:            Vec::new(),
+			opened:             Instant::now(),
+			extension_renderer: None,
 		};
 		let mut second = ToolDisplay {
-			identity: test_identity("test.2"),
-			args:     omp_slopjson::Value::Object(omp_slopjson::Object::new()),
-			started:  true,
-			fold:     ViewState::new(),
+			identity:           test_identity("test.2"),
+			args:               omp_slopjson::Value::Object(omp_slopjson::Object::new()),
+			started:            true,
+			fold:               ViewState::new(),
+			updates:            Vec::new(),
+			opened:             Instant::now(),
+			extension_renderer: None,
 		};
 		assert_eq!(
 			fold_tool_update(&renderers, &mut first, Bytes::from_static(br#"{"text":"a"}"#)).as_str(),

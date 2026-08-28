@@ -293,6 +293,19 @@ pub struct AdvertisedCommand {
 	pub provenance:    CommandProvenance,
 }
 
+/// One live command row returned to extension roster introspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandRosterEntry {
+	/// Canonical spelling without the leading slash.
+	pub name:        Str,
+	/// Alternate spellings without the leading slash.
+	pub aliases:     Arc<[Str]>,
+	/// One-line user-facing description.
+	pub description: Str,
+	/// Stable source identifier of the winning declaration.
+	pub source:      Str,
+}
+
 /// Immutable winning command generation.
 #[derive(Clone)]
 pub struct CommandRoster {
@@ -390,7 +403,53 @@ impl CommandRoster {
 		Self { commands: winners.into(), spellings: Arc::new(spellings) }
 	}
 
+	fn resolve_invocation<'a>(&self, text: &'a str) -> Option<(usize, &'a str, &'a str)> {
+		let body = text.strip_prefix('/')?;
+		if body.is_empty() || body.starts_with('/') {
+			return None;
+		}
+		let split = body.find(char::is_whitespace).unwrap_or(body.len());
+		let token = &body[..split];
+		let trailing = body[split..].trim();
+		let mut candidate = token;
+		let mut colon_args = "";
+		loop {
+			if let Some(index) = self.spellings.get(candidate).copied() {
+				let args = match (colon_args.is_empty(), trailing.is_empty()) {
+					(true, _) => trailing,
+					(false, true) => colon_args,
+					(false, false) => return None,
+				};
+				return Some((index, candidate, args));
+			}
+			let (prefix, suffix) = candidate.rsplit_once(':')?;
+			candidate = prefix;
+			colon_args = suffix;
+		}
+	}
+
 	/// Resolves one extension-backed command without executing its handler.
+	pub(crate) fn extension_invocation(
+		&self,
+		text: &str,
+		surface: CommandSurface,
+	) -> Option<ExtensionCommandInvocation> {
+		let (index, candidate, args) = self.resolve_invocation(text)?;
+		let declaration = &self.commands[index];
+		if !declaration.surfaces.contains(&surface)
+			|| !matches!(declaration.implementation, CommandImplementation::Extension(_))
+		{
+			return None;
+		}
+		let argv = tokenize_args(args).ok()?;
+		Some(ExtensionCommandInvocation {
+			name: Str::new(candidate),
+			argv: argv.into(),
+			raw: Str::new(args),
+			surface,
+		})
+	}
+
 	/// Slash completion entries derived from the winning roster.
 	pub fn completions(&self) -> Vec<omp_tui::Command> {
 		self.completions_for(CommandRole::Owner)
@@ -477,6 +536,20 @@ impl CommandRoster {
 			.collect()
 	}
 
+	/// Returns the unfiltered live winning roster used by interactive dispatch.
+	pub fn roster_entries(&self) -> Vec<CommandRosterEntry> {
+		self
+			.commands
+			.iter()
+			.map(|command| CommandRosterEntry {
+				name:        command.name.clone(),
+				aliases:     Arc::clone(&command.aliases),
+				description: command.description.clone(),
+				source:      command.provenance.source.clone(),
+			})
+			.collect()
+	}
+
 	/// Renders help from the same filtered declarations used by completion.
 	pub fn help_text(
 		&self,
@@ -499,6 +572,28 @@ impl CommandRoster {
 	}
 
 	/// Dispatches one already parsed and admitted extension command.
+	pub(crate) async fn dispatch_extension_invocation(
+		&self,
+		invocation: ExtensionCommandInvocation,
+	) -> miette::Result<DispatchResult> {
+		let index = self
+			.spellings
+			.get(invocation.name.as_str())
+			.copied()
+			.ok_or_else(|| miette::miette!("command transform selected an unknown command"))?;
+		let declaration = &self.commands[index];
+		if !declaration.surfaces.contains(&invocation.surface) {
+			return Err(miette::miette!("command transform selected an unavailable command"));
+		}
+		let CommandImplementation::Extension(handler) = &declaration.implementation else {
+			return Err(miette::miette!("command transform selected a non-extension command"));
+		};
+		let result = handler
+			.call(invocation, declaration.provenance.clone())
+			.await?;
+		Ok(DispatchResult::Handled(result))
+	}
+
 	/// Parses and dispatches recognized input; unknown input remains a prompt.
 	pub fn dispatch<'a>(
 		&'a self,
@@ -507,31 +602,8 @@ impl CommandRoster {
 		host: &'a mut dyn CommandHost,
 	) -> Pin<Box<dyn Future<Output = miette::Result<DispatchResult>> + Send + 'a>> {
 		Box::pin(async move {
-			let Some(body) = text.strip_prefix('/') else {
+			let Some((index, candidate, args)) = self.resolve_invocation(text) else {
 				return Ok(DispatchResult::Passthrough(Str::new(text)));
-			};
-			if body.is_empty() || body.starts_with('/') {
-				return Ok(DispatchResult::Passthrough(Str::new(text)));
-			}
-			let split = body.find(char::is_whitespace).unwrap_or(body.len());
-			let token = &body[..split];
-			let trailing = body[split..].trim();
-			let mut candidate = token;
-			let mut colon_args = "";
-			let (index, args) = loop {
-				if let Some(index) = self.spellings.get(candidate).copied() {
-					let args = match (colon_args.is_empty(), trailing.is_empty()) {
-						(true, _) => trailing,
-						(false, true) => colon_args,
-						(false, false) => return Ok(DispatchResult::Passthrough(Str::new(text))),
-					};
-					break (index, args);
-				}
-				let Some((prefix, suffix)) = candidate.rsplit_once(':') else {
-					return Ok(DispatchResult::Passthrough(Str::new(text)));
-				};
-				candidate = prefix;
-				colon_args = suffix;
 			};
 			let declaration = &self.commands[index];
 			if !declaration.surfaces.contains(&surface) {

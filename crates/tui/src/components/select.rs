@@ -98,6 +98,8 @@ struct OptionData {
 	value:       Str,
 	desc:        Option<Str>,
 	recommended: bool,
+	selected:    bool,
+	active:      bool,
 	preview:     Range<usize>,
 	/// Grid cells rendered as this option's row; empty for label options.
 	cells:       Range<usize>,
@@ -219,6 +221,8 @@ impl Select {
 				.unwrap_or_else(|| label.clone()),
 			desc: option.props.str_of(Prop::Desc).cloned(),
 			recommended: option.props.flag(Prop::Recommended),
+			selected: option.props.flag(Prop::Selected),
+			active: option.props.flag(Prop::Active),
 			custom: false,
 			label,
 			preview,
@@ -240,6 +244,11 @@ impl Select {
 				self.state.multi = self.props.flag(Prop::Multi);
 				if self.state.multi {
 					self.state.chosen = smol_bitmap::SmolBitmap::new();
+					for (index, option) in self.state.options.iter().enumerate() {
+						if option.selected {
+							self.state.chosen.set(index, true);
+						}
+					}
 				} else {
 					self.choose_recommended();
 				}
@@ -266,10 +275,17 @@ impl Select {
 			chosen.set(if index >= at { index + 1 } else { index }, true);
 		}
 		let recommended = option.recommended;
+		let selected = option.selected;
 		self.state.options.insert(at, option);
 		self.state.layouts.insert(at, OptionLayout::default());
 		self.state.chosen = chosen;
 		if recommended && !self.state.multi && self.state.chosen.iter().next().is_none() {
+			self.state.chosen.set(at, true);
+		}
+		if selected {
+			if !self.state.multi {
+				self.state.chosen = smol_bitmap::SmolBitmap::new();
+			}
 			self.state.chosen.set(at, true);
 		}
 	}
@@ -302,6 +318,8 @@ impl Select {
 					value:       Str::default(),
 					desc:        None,
 					recommended: false,
+					selected:    false,
+					active:      false,
 					preview:     end..end,
 					cells:       end..end,
 					custom:      true,
@@ -1055,6 +1073,14 @@ impl Component for Select {
 		if visible.is_empty() {
 			return;
 		}
+		if let Some(active) = self.state.options.iter().position(|option| option.active)
+			&& let Some(position) = visible
+				.iter()
+				.position(|&index| usize::from(index) == active)
+		{
+			self.state.cursor = position as u16;
+			return;
+		}
 		if !self.state.multi
 			&& let Some(chosen) = self.state.chosen.iter().next()
 			&& let Some(position) = visible
@@ -1422,6 +1448,29 @@ mod tests {
 		values.clear();
 		select.value(&mut values);
 		assert_eq!(values["checks"], serde_json::json!(["lint"]));
+	}
+	#[test]
+	fn multi_select_adopts_selected_rows_and_active_cursor() {
+		let mut select = Select::new()
+			.with(Prop::Id, "checks")
+			.with(Prop::Multi, true)
+			.option(
+				SelectOption::new()
+					.label("lint")
+					.with(Prop::Value, "lint")
+					.with(Prop::Selected, true),
+			)
+			.option(
+				SelectOption::new()
+					.label("unit")
+					.with(Prop::Value, "unit")
+					.with(Prop::Active, true),
+			);
+		select.enter(true);
+		let mut values = serde_json::Map::new();
+		select.value(&mut values);
+		assert_eq!(values["checks"], serde_json::json!(["lint"]));
+		assert_eq!(select.cursor_value().as_deref(), Some("unit"));
 	}
 
 	#[test]

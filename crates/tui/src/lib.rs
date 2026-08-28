@@ -87,6 +87,8 @@ pub use icons::Icon;
 pub use imagefmt::ImageFormat;
 /// Returns registered PNG bytes for renderer-side image upload.
 pub use imagereg::bytes as image_bytes;
+/// Registers immutable renderer-local image bytes under an opaque TML source.
+pub use imagereg::register as register_image_source;
 pub use input::{
 	Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,

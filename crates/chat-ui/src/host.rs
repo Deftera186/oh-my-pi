@@ -2324,6 +2324,12 @@ async fn run_chat(
 								BackendEvent::CopyToClipboard(text) => {
 									terminal.copy_to_clipboard(text)?;
 								},
+								BackendEvent::TerminalNotification(notification) => {
+									terminal.notify(notification)?;
+								},
+								BackendEvent::TerminalProgress(progress) => {
+									terminal.set_progress(*progress)?;
+								},
 								_ => {},
 							}
 							let had_overlay = host.overlay.is_some();
@@ -3283,9 +3289,12 @@ mod tests {
 
 	use bytes::Bytes;
 	use omp_core::{Str, sf};
-	use omp_proto::omp::ui::v1::{Dialog, ShowOverlay, Tml, UiRequest, ui_request, ui_response};
+	use omp_proto::omp::{
+		inference::v1::{Value as ProtoValue, ValueMap, value},
+		ui::v1::{Dialog, DialogOutcome, ShowOverlay, Tml, UiRequest, ui_request, ui_response},
+	};
 	use omp_tools::ask::{OptionItem, Question};
-	use omp_tui::{Frame, Key, Renderer, Size, UiContext};
+	use omp_tui::{Frame, Key, Renderer, Size, UiContext, test_support::frame_row_text};
 
 	use super::{
 		ChatHost, Duration, HostExit, HostOptions, InputAction, InputBinding, Instant, Overlay,
@@ -3337,6 +3346,7 @@ mod tests {
 				title:   "Database".to_owned(),
 				content: None,
 				choices: vec!["Postgres".to_owned(), "SQLite".to_owned()],
+				props:   None,
 			})),
 			props:            None,
 		};
@@ -3362,9 +3372,376 @@ mod tests {
 		assert!(matches!(
 			response.kind,
 			Some(ui_response::Kind::DialogOutcome(outcome))
-				if outcome.accepted && outcome.values == ["Postgres"]
+				if outcome.accepted && outcome.value.as_deref() == Some("Postgres")
 		));
 		assert!(host.overlay.is_none());
+	}
+
+	fn dialog_test_props(value: serde_json::Value) -> Option<ValueMap> {
+		let serde_json::Value::Object(fields) = value else {
+			return None;
+		};
+		Some(ValueMap {
+			fields: fields
+				.into_iter()
+				.map(|(name, value)| (name, dialog_test_value(value)))
+				.collect(),
+		})
+	}
+
+	fn dialog_test_value(value: serde_json::Value) -> ProtoValue {
+		let kind = match value {
+			serde_json::Value::Null => value::Kind::Null(true),
+			serde_json::Value::Bool(value) => value::Kind::Bool(value),
+			serde_json::Value::String(value) => value::Kind::String(value),
+			serde_json::Value::Number(value) => value.as_i64().map_or_else(
+				|| {
+					value.as_u64().map_or_else(
+						|| value::Kind::Double(value.as_f64().unwrap_or_default()),
+						value::Kind::Uint,
+					)
+				},
+				value::Kind::Int,
+			),
+			serde_json::Value::Array(values) => {
+				value::Kind::List(omp_proto::omp::inference::v1::ValueList {
+					values: values.into_iter().map(dialog_test_value).collect(),
+				})
+			},
+			serde_json::Value::Object(fields) => value::Kind::Map(ValueMap {
+				fields: fields
+					.into_iter()
+					.map(|(name, value)| (name, dialog_test_value(value)))
+					.collect(),
+			}),
+		};
+		ProtoValue { kind: Some(kind) }
+	}
+
+	fn settle_extension_dialog(
+		kind: &str,
+		props: serde_json::Value,
+		choices: Vec<String>,
+		keys: &[Key],
+	) -> DialogOutcome {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let (intents, received) = flume::unbounded();
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
+		let request = UiRequest {
+			owner_invocation: 17,
+			kind:             Some(ui_request::Kind::Dialog(Dialog {
+				kind: kind.to_owned(),
+				title: "Extension dialog".to_owned(),
+				content: None,
+				choices,
+				props: dialog_test_props(props),
+			})),
+			props:            None,
+		};
+		let _ = apply_backend(
+			&mut host,
+			BackendEvent::UiRequest { correlation: sf!("dialog-{kind}"), request },
+			&ctx,
+		);
+		let mut event = OverlayEvent::Consumed;
+		for &key in keys {
+			event = host
+				.overlay
+				.as_mut()
+				.expect("dialog remains open until settlement")
+				.handle_key(key);
+		}
+		let _ = apply_overlay_event(&mut host, event, &ctx, viewport, &intents, false);
+		let Intent::UiResponse { response, .. } = received
+			.try_recv()
+			.unwrap_or_else(|error| panic!("{kind} dialog response: {error}"))
+		else {
+			panic!("wrong intent")
+		};
+		let Some(ui_response::Kind::DialogOutcome(outcome)) = response.kind else {
+			panic!("wrong response kind")
+		};
+		assert!(host.overlay.is_none());
+		outcome
+	}
+
+	#[test]
+	fn extension_dialog_kinds_accept_through_native_controls() {
+		let confirm = settle_extension_dialog(
+			"confirm",
+			serde_json::json!({"message": "Proceed?"}),
+			Vec::new(),
+			&[Key::Enter],
+		);
+		assert!(confirm.accepted);
+		assert!(!confirm.cancelled);
+		let declined = settle_extension_dialog(
+			"confirm",
+			serde_json::json!({"message": "Proceed?"}),
+			Vec::new(),
+			&[Key::Tab, Key::Enter],
+		);
+		assert!(!declined.accepted);
+		assert!(!declined.cancelled);
+		assert!(declined.reason.is_none());
+
+		let select = settle_extension_dialog(
+			"select",
+			serde_json::json!({}),
+			vec!["alpha".to_owned(), "beta".to_owned()],
+			&[Key::Enter],
+		);
+		assert_eq!(select.value.as_deref(), Some("alpha"));
+
+		let multi = settle_extension_dialog(
+			"multi_select",
+			serde_json::json!({"checked": ["beta"]}),
+			vec!["alpha".to_owned(), "beta".to_owned()],
+			&[Key::Enter],
+		);
+		assert_eq!(multi.values, ["beta"]);
+
+		let input = settle_extension_dialog(
+			"input",
+			serde_json::json!({
+				"prefill": "valid-name",
+				"placeholder": "name",
+				"match": "[a-z-]+",
+			}),
+			Vec::new(),
+			&[Key::Tab, Key::Right, Key::Enter],
+		);
+		assert_eq!(input.value.as_deref(), Some("valid-name"));
+
+		let editor = settle_extension_dialog(
+			"editor",
+			serde_json::json!({"prefill": "let answer = 42;", "syntax": "rust"}),
+			Vec::new(),
+			&[Key::Tab, Key::Right, Key::Enter],
+		);
+		assert_eq!(editor.value.as_deref(), Some("let answer = 42;"));
+
+		let form = settle_extension_dialog(
+			"form",
+			serde_json::json!({
+				"fields": [
+					{
+						"id": "name",
+						"kind": "text",
+						"label": "Name",
+						"value": "omp",
+						"required": true,
+					},
+					{"id": "enabled", "kind": "bool", "label": "Enabled", "value": true},
+					{
+						"id": "region",
+						"kind": "enum",
+						"label": "Region",
+						"options": ["us", "eu"],
+						"value": "eu",
+					},
+					{
+						"id": "scopes",
+						"kind": "multi",
+						"label": "Scopes",
+						"options": ["repo", "issues"],
+						"value": ["repo", "issues"],
+					},
+					{
+						"id": "replicas",
+						"kind": "number",
+						"label": "Replicas",
+						"value": 3,
+						"min": 1,
+						"max": 5,
+					},
+				],
+			}),
+			Vec::new(),
+			&[Key::Tab, Key::Right, Key::Enter],
+		);
+		let fields = &form.answers.as_ref().expect("form answers").fields;
+		assert!(matches!(
+			fields.get("name").and_then(|value| value.kind.as_ref()),
+			Some(value::Kind::String(value)) if value == "omp"
+		));
+		assert!(matches!(
+			fields.get("enabled").and_then(|value| value.kind.as_ref()),
+			Some(value::Kind::Bool(true))
+		));
+		assert!(matches!(
+			fields.get("replicas").and_then(|value| value.kind.as_ref()),
+			Some(value::Kind::Int(3))
+		));
+		assert!(matches!(
+			fields.get("scopes").and_then(|value| value.kind.as_ref()),
+			Some(value::Kind::List(values)) if values.values.len() == 2
+		));
+
+		let ask = settle_extension_dialog(
+			"ask_user",
+			serde_json::json!({
+				"questions": [{
+					"id": "database",
+					"question": "Database?",
+					"options": [{"value": "postgres", "label": "Postgres"}],
+					"allow_freeform": true,
+					"allow_note": true,
+				}],
+			}),
+			Vec::new(),
+			&[
+				Key::Tab,
+				Key::Char('o'),
+				Key::Char('t'),
+				Key::Char('h'),
+				Key::Char('e'),
+				Key::Char('r'),
+				Key::Tab,
+				Key::Char('n'),
+				Key::Char('o'),
+				Key::Char('t'),
+				Key::Char('e'),
+				Key::Tab,
+				Key::Right,
+				Key::Enter,
+			],
+		);
+		let answer = ask
+			.answers
+			.as_ref()
+			.and_then(|answers| answers.fields.get("database"))
+			.and_then(|answer| answer.kind.as_ref());
+		let Some(value::Kind::Map(answer)) = answer else {
+			panic!("ask answer is an object")
+		};
+		assert!(matches!(
+			answer.fields.get("freeform").and_then(|value| value.kind.as_ref()),
+			Some(value::Kind::String(value)) if value == "other"
+		));
+		assert!(matches!(
+			answer.fields.get("note").and_then(|value| value.kind.as_ref()),
+			Some(value::Kind::String(value)) if value == "note"
+		));
+	}
+
+	#[test]
+	fn extension_confirm_renders_requested_countdown() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
+		let request = UiRequest {
+			owner_invocation: 19,
+			kind:             Some(ui_request::Kind::Dialog(Dialog {
+				kind:    "confirm".to_owned(),
+				title:   "Confirm".to_owned(),
+				content: None,
+				choices: Vec::new(),
+				props:   dialog_test_props(serde_json::json!({
+					"message": "Proceed?",
+					"options": {"timeout": "3s", "countdown": true},
+				})),
+			})),
+			props:            None,
+		};
+		let _ = apply_backend(
+			&mut host,
+			BackendEvent::UiRequest { correlation: sf!("dialog-countdown"), request },
+			&ctx,
+		);
+		let layer = host
+			.overlay
+			.as_mut()
+			.expect("confirm opens")
+			.layer(viewport);
+		let painted = (0..layer.frame.size().height)
+			.map(|row| frame_row_text(layer.frame, row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(painted.contains("Proceed?"), "{painted}");
+		assert!(painted.contains("Time remaining"), "{painted}");
+		assert!(painted.contains("3s"), "{painted}");
+	}
+
+	#[test]
+	fn extension_input_match_blocks_accept_until_valid() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let (intents, received) = flume::unbounded();
+		let mut host = ChatHost::new(Chat::new(&ctx), &ctx, viewport, Vec::new(), 0);
+		let request = UiRequest {
+			owner_invocation: 18,
+			kind:             Some(ui_request::Kind::Dialog(Dialog {
+				kind:    "input".to_owned(),
+				title:   "Name".to_owned(),
+				content: None,
+				choices: Vec::new(),
+				props:   dialog_test_props(serde_json::json!({
+					"prefill": "Bad!",
+					"match": "[a-z-]+",
+				})),
+			})),
+			props:            None,
+		};
+		let _ = apply_backend(
+			&mut host,
+			BackendEvent::UiRequest { correlation: sf!("dialog-validation"), request },
+			&ctx,
+		);
+		let dialog = host.overlay.as_mut().expect("input dialog opens");
+		assert!(matches!(dialog.handle_key(Key::Tab), OverlayEvent::Consumed));
+		assert!(matches!(dialog.handle_key(Key::Right), OverlayEvent::Consumed));
+		assert!(matches!(dialog.handle_key(Key::Enter), OverlayEvent::Consumed));
+		assert!(host.overlay.is_some());
+		assert!(received.try_recv().is_err());
+
+		let dialog = host.overlay.as_mut().expect("invalid dialog remains");
+		for key in [
+			Key::BackTab,
+			Key::Ctrl('u'),
+			Key::Char('v'),
+			Key::Char('a'),
+			Key::Char('l'),
+			Key::Char('i'),
+			Key::Char('d'),
+			Key::Tab,
+			Key::Right,
+		] {
+			assert!(matches!(dialog.handle_key(key), OverlayEvent::Consumed));
+		}
+		let event = dialog.handle_key(Key::Enter);
+		let _ = apply_overlay_event(&mut host, event, &ctx, viewport, &intents, false);
+		let Intent::UiResponse { response, .. } = received.try_recv().expect("valid input settles")
+		else {
+			panic!("wrong intent")
+		};
+		assert!(matches!(
+			response.kind,
+			Some(ui_response::Kind::DialogOutcome(outcome))
+				if outcome.accepted && outcome.value.as_deref() == Some("valid")
+		));
+	}
+
+	#[test]
+	fn every_extension_dialog_kind_dismisses_with_reason() {
+		for kind in ["confirm", "select", "multi_select", "input", "editor", "form", "ask_user"] {
+			let outcome = settle_extension_dialog(
+				kind,
+				if kind == "ask_user" {
+					serde_json::json!({
+						"questions": [{"id": "q", "question": "Question?"}],
+					})
+				} else {
+					serde_json::json!({})
+				},
+				vec!["choice".to_owned()],
+				&[Key::Esc],
+			);
+			assert!(!outcome.accepted, "{kind}");
+			assert!(outcome.cancelled, "{kind}");
+			assert_eq!(outcome.reason.as_deref(), Some("dismissed"), "{kind}");
+		}
 	}
 
 	#[test]

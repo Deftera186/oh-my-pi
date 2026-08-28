@@ -675,6 +675,15 @@ pub struct ParsedSlash<'a> {
 	pub args: &'a str,
 }
 
+/// Dynamic slash-command argument query projected from text up to the cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArgCompletionQuery {
+	/// Token currently being completed.
+	pub prefix: Str,
+	/// Fully entered arguments preceding `prefix`.
+	pub argv:   Vec<Str>,
+}
+
 /// Parses a syntactically command-shaped line. Paths containing another `/`
 /// and ordinary prompt text return `None` for model passthrough.
 pub fn parse_slash(text: &str) -> Option<ParsedSlash<'_>> {
@@ -914,6 +923,59 @@ pub fn tokenize_args(raw: &str) -> Result<Vec<Str>, InputError> {
 		args.push(Str::from(current));
 	}
 	Ok(args)
+}
+/// Splits a partial argument line into completed arguments and the token under
+/// the cursor. Unterminated quotes are accepted because completion runs before
+/// submission validation.
+pub fn completion_arg_query(raw: &str) -> ArgCompletionQuery {
+	let mut argv = Vec::new();
+	let mut current = String::new();
+	let mut quote = None;
+	let mut escaped = false;
+	let mut ended_on_whitespace = false;
+	for ch in raw.chars() {
+		if escaped {
+			current.push(ch);
+			escaped = false;
+			ended_on_whitespace = false;
+			continue;
+		}
+		if ch == '\\' {
+			escaped = true;
+			ended_on_whitespace = false;
+			continue;
+		}
+		if let Some(open) = quote {
+			if ch == open {
+				quote = None;
+			} else {
+				current.push(ch);
+			}
+			ended_on_whitespace = false;
+			continue;
+		}
+		if ch == '\'' || ch == '"' {
+			quote = Some(ch);
+			ended_on_whitespace = false;
+		} else if ch.is_whitespace() {
+			if !current.is_empty() {
+				argv.push(Str::from(mem::take(&mut current)));
+			}
+			ended_on_whitespace = true;
+		} else {
+			current.push(ch);
+			ended_on_whitespace = false;
+		}
+	}
+	if escaped {
+		current.push('\\');
+		ended_on_whitespace = false;
+	}
+	if ended_on_whitespace {
+		ArgCompletionQuery { prefix: Str::default(), argv }
+	} else {
+		ArgCompletionQuery { prefix: Str::from(current), argv }
+	}
 }
 
 /// Expands `$1`, `$2`, `$@`, `$@[start:length]`, and `$ARGUMENTS` once.
@@ -1285,6 +1347,21 @@ mod tests {
 			 five $1 fifth=$1"
 		);
 		assert_eq!(tokenize_args("'open"), Err(InputError::UnterminatedQuote));
+	}
+	#[test]
+	fn partial_argument_completion_retains_completed_argv_and_open_token() {
+		assert_eq!(completion_arg_query("one 'two words' thr"), ArgCompletionQuery {
+			prefix: sf!("thr"),
+			argv:   vec![sf!("one"), sf!("two words")],
+		});
+		assert_eq!(completion_arg_query("one "), ArgCompletionQuery {
+			prefix: Str::default(),
+			argv:   vec![sf!("one")],
+		});
+		assert_eq!(completion_arg_query("'open token"), ArgCompletionQuery {
+			prefix: sf!("open token"),
+			argv:   Vec::new(),
+		});
 	}
 	#[test]
 	fn all_argument_slices_use_pi_one_based_bounds() {

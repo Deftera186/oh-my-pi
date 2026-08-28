@@ -920,6 +920,12 @@ pub enum BackendEvent {
 	ExtensionProviderDisabled(Str),
 	/// Copy backend-produced text through the terminal host clipboard authority.
 	CopyToClipboard(Str),
+	/// Route backend-produced text through the composer's ordinary paste path.
+	ComposerPaste(Str),
+	/// Deliver one structured desktop notification through the terminal host.
+	TerminalNotification(omp_tui::Notification),
+	/// Update the terminal's OSC 9;4 taskbar progress state.
+	TerminalProgress(omp_tui::Progress),
 	/// Request the pause overlay.
 	Pause,
 	/// Request a host-level fresh session transition.

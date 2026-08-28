@@ -285,6 +285,7 @@ fn payload_view(
 			}))
 		},
 		CapabilityPayload::Settings(_)
+		| CapabilityPayload::Themes(_)
 		| CapabilityPayload::Ssh(_)
 		| CapabilityPayload::SystemPrompt(_)
 		| CapabilityPayload::Agents(_) => None,

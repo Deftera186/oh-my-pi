@@ -20,6 +20,11 @@ use std::{
 
 use async_trait::async_trait;
 use flume::Receiver;
+use futures::future::join_all;
+use omp_chat_ui::completion::{
+	CompletionQuery as ComposerCompletionQuery, CompletionRule, CompletionSource, CompletionTrigger,
+	DeferredCompletion,
+};
 use omp_core::{Str, sf};
 use omp_envd::{
 	exthost::{
@@ -32,9 +37,11 @@ use omp_envd::{
 	worker::{HostKey, SealedRegistryEvidence},
 };
 use omp_proto::ui::v1::{
-	CommandDispatchResult, CommandInvoked, ShortcutInvoked, UiDispatch, UiDispatchResult,
+	CommandDispatchResult, CommandInvoked, CompletionCandidate,
+	CompletionQuery as WireCompletionQuery, ShortcutInvoked, UiDispatch, UiDispatchResult,
 	command_dispatch_result, ui_dispatch, ui_dispatch_result,
 };
+use omp_tui::{Icon, Suggestion, SuggestionList};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -45,6 +52,7 @@ use super::{
 		CommandSurface, ConsumedResult, ExtensionCommandHandler, ExtensionCommandInvocation,
 		PromptResult,
 	},
+	input::completion_arg_query,
 	presentation_authority::{
 		COMPLETION_CALLBACK_DEADLINE, PresentationAuthorityError, PresentationCallback,
 		PresentationCallbackDispatcher, PresentationCallbackKind, PresentationClient,
@@ -52,6 +60,8 @@ use super::{
 		RENDER_CALLBACK_DEADLINE,
 	},
 };
+
+const RENDER_TML_MAX_BYTES: usize = 256 * 1024;
 
 /// One data-only operation delivered to the attached presentation surface.
 #[derive(Clone, Debug, PartialEq)]
@@ -501,6 +511,73 @@ impl Default for PublishedUiRoster {
 }
 
 impl PublishedUiRoster {
+	/// Projects manifest completion triggers and dynamic command argument
+	/// completers into the composer's static-no-Python trigger table.
+	pub fn completion_rules(&self) -> Vec<CompletionRule> {
+		let state = self.state.lock();
+		let mut rules = BTreeMap::<Str, CompletionRule>::new();
+		for entry in state.roster.completions() {
+			let declaration = &entry.declaration;
+			merge_completion_rule(&mut rules, CompletionRule {
+				prefix:         Str::from(declaration.prefix.as_str()),
+				trigger:        CompletionTrigger::Extension,
+				at_line_start:  declaration.at_line_start,
+				min_chars:      declaration.min_chars as usize,
+				debounce:       Duration::from_millis(declaration.debounce_ms),
+				max_results:    declaration.max_results as usize,
+				cache:          Duration::from_millis(declaration.cache_ms),
+				refine_locally: declaration.refine_locally,
+			});
+		}
+		for entry in state.roster.commands() {
+			if entry.declaration.arg_completion_callback.is_none() {
+				continue;
+			}
+			for spelling in std::iter::once(entry.declaration.name.as_str())
+				.chain(entry.declaration.aliases.iter().map(String::as_str))
+			{
+				merge_completion_rule(&mut rules, CompletionRule {
+					prefix:         sf!("/{spelling} "),
+					trigger:        CompletionTrigger::Extension,
+					at_line_start:  true,
+					min_chars:      0,
+					debounce:       Duration::from_millis(90),
+					max_results:    20,
+					cache:          Duration::from_secs(2),
+					refine_locally: true,
+				});
+			}
+		}
+		rules.into_values().collect()
+	}
+
+	/// Builds the non-blocking composer adapter around this live roster and a
+	/// lower-level native completion source.
+	pub fn completion_adapter(
+		self: &Arc<Self>,
+		session: Str,
+		fallback_rules: impl IntoIterator<Item = CompletionRule>,
+		fallback: Arc<dyn CompletionSource>,
+	) -> DeferredCompletion {
+		let mut rules = BTreeMap::<Str, CompletionRule>::new();
+		for rule in fallback_rules {
+			merge_completion_rule(&mut rules, rule);
+		}
+		for rule in self.completion_rules() {
+			merge_completion_rule(&mut rules, rule);
+		}
+		DeferredCompletion::new(
+			rules.into_values(),
+			Arc::new(PublishedCompletionSource {
+				roster: Arc::clone(self),
+				session,
+				runtime: tokio::runtime::Handle::current(),
+				fallback,
+				next_id: AtomicU64::new(1),
+			}),
+		)
+	}
+
 	/// Returns whether any live verified generation declares a markdown
 	/// transformer.
 	pub fn has_markdown_transformers(&self) -> bool {
@@ -510,6 +587,43 @@ impl PublishedUiRoster {
 			.markdown
 			.values()
 			.any(|declarations| !declarations.is_empty())
+	}
+
+	/// Returns whether an exact-revision extension renderer can affect this
+	/// tool view under the native renderer authority rule.
+	pub fn has_tool_renderer(
+		&self,
+		identity: &omp_tool::ToolIdentity,
+		native_authoritative: bool,
+	) -> bool {
+		let state = self.state.lock();
+		state.roster.renderers(identity).any(|entry| {
+			state.routes.contains_key(&entry.owner.host)
+				&& (!native_authoritative || entry.declaration.decorates)
+		})
+	}
+
+	#[cfg(test)]
+	pub(super) fn install_test_renderer(
+		&self,
+		declaration: omp_envd::exthost::VerifiedRendererDeclaration,
+		target: Arc<ControlConnectionIdentity>,
+		dispatcher: Arc<dyn CallbackDispatcher>,
+	) {
+		let host = HostKey::new(target.layer.clone(), target.tier.clone(), target.extension.clone());
+		let mut state = self.state.lock();
+		state
+			.roster
+			.install(host.clone(), &omp_envd::exthost::VerifiedUiRoster {
+				generation: target.host_generation,
+				extension: target.extension.clone(),
+				renderers: vec![declaration].into_boxed_slice(),
+				..Default::default()
+			})
+			.expect("install renderer fixture");
+		state
+			.routes
+			.insert(host, PublishedUiRoute { identity: target, dispatcher });
 	}
 
 	/// Atomically replaces the entire app-owned roster after startup or reload.
@@ -738,6 +852,315 @@ impl PublishedUiRoster {
 		let route = state.routes.get(&entry.owner.host)?;
 		Some((entry, Arc::clone(&route.identity), Arc::clone(&route.dispatcher)))
 	}
+
+	/// Runs exact-revision Python folds for one host-observed render transition.
+	///
+	/// `native_authoritative` keeps a native exact-revision base and admits only
+	/// extension decorations. Otherwise the extension base may replace the
+	/// supplied generic fallback. The returned TML is retained by the caller;
+	/// repaint and replay consume that retained value without re-entering
+	/// Python.
+	pub async fn render_tool(
+		&self,
+		identity: &omp_tool::ToolIdentity,
+		view: Value,
+		ctx: Value,
+		native: omp_chat_ui::ToolViewContent,
+		native_authoritative: bool,
+		session: Str,
+	) -> omp_chat_ui::ToolViewContent {
+		let routes = {
+			let state = self.state.lock();
+			state
+				.roster
+				.renderers(identity)
+				.filter_map(|entry| {
+					state.routes.get(&entry.owner.host).map(|route| {
+						(entry.clone(), Arc::clone(&route.identity), Arc::clone(&route.dispatcher))
+					})
+				})
+				.collect::<Vec<_>>()
+		};
+		let call_id = view
+			.get("call_id")
+			.and_then(Value::as_str)
+			.unwrap_or("renderer");
+		let settled = view
+			.get("verdict")
+			.is_some_and(|verdict| !verdict.is_null());
+		let mut rendered = native;
+		for (entry, target, dispatcher) in routes {
+			if native_authoritative && !entry.declaration.decorates {
+				continue;
+			}
+			let authority = ui_invocation_authority(
+				sf!("renderer:{}:{call_id}", entry.declaration.declaration_id),
+				if settled {
+					omp_core::InvocationPhase::Settled
+				} else {
+					omp_core::InvocationPhase::Open
+				},
+				session.clone(),
+			);
+			let dispatch = ControlDispatch {
+				operation: sf!("omp.ui.renderer"),
+				arguments: serde_json::Map::from_iter([
+					("name".to_owned(), Value::String(identity.name.to_string())),
+					("family".to_owned(), Value::String(identity.rev.family.to_string())),
+					("rev".to_owned(), Value::from(identity.rev.n)),
+					("view".to_owned(), view.clone()),
+					("ctx".to_owned(), ctx.clone()),
+				]),
+				authority,
+				policy: CallbackConcurrency::Serialized,
+				deadline: omp_envd::exthost::EventDeadline {
+					at: Instant::now() + RENDER_CALLBACK_DEADLINE,
+				},
+			};
+			let Ok(value) = dispatcher.dispatch(target, dispatch).await else {
+				continue;
+			};
+			let source = value
+				.as_object()
+				.and_then(|value| value.get("source"))
+				.and_then(Value::as_str)
+				.or_else(|| value.as_str());
+			let Some(source) = source else {
+				continue;
+			};
+			if source.len() > RENDER_TML_MAX_BYTES
+				|| omp_tui::Ui::from_markup(Str::new(source), 1, omp_tui::UiContext::default()).is_err()
+			{
+				continue;
+			}
+			if entry.declaration.decorates {
+				let base = match rendered {
+					omp_chat_ui::ToolViewContent::Markup(source) => source,
+					omp_chat_ui::ToolViewContent::Plain(source) => tml_text(&source),
+				};
+				let mut composed = omp_core::StrMut::with_capacity(base.len() + source.len());
+				composed.push_str(&base);
+				composed.push_str(source);
+				rendered = omp_chat_ui::ToolViewContent::Markup(composed.freeze());
+			} else {
+				rendered = omp_chat_ui::ToolViewContent::Markup(Str::new(source));
+			}
+		}
+		rendered
+	}
+}
+
+fn tml_text(value: &str) -> Str {
+	let mut escaped = omp_core::StrMut::with_capacity(value.len() + 13);
+	escaped.push_str("<text>");
+	for character in value.chars() {
+		match character {
+			'&' => escaped.push_str("&amp;"),
+			'<' => escaped.push_str("&lt;"),
+			'>' => escaped.push_str("&gt;"),
+			_ => escaped.push(character),
+		}
+	}
+	escaped.push_str("</text>");
+	escaped.freeze()
+}
+
+fn merge_completion_rule(rules: &mut BTreeMap<Str, CompletionRule>, rule: CompletionRule) {
+	if let Some(existing) = rules.get_mut(&rule.prefix) {
+		existing.at_line_start &= rule.at_line_start;
+		existing.min_chars = existing.min_chars.min(rule.min_chars);
+		existing.debounce = existing.debounce.min(rule.debounce);
+		existing.max_results = existing
+			.max_results
+			.saturating_add(rule.max_results)
+			.min(100);
+		existing.cache = existing.cache.min(rule.cache);
+		existing.refine_locally &= rule.refine_locally;
+	} else {
+		rules.insert(rule.prefix.clone(), rule);
+	}
+}
+
+struct PublishedCompletionSource {
+	roster:   Arc<PublishedUiRoster>,
+	session:  Str,
+	runtime:  tokio::runtime::Handle,
+	fallback: Arc<dyn CompletionSource>,
+	next_id:  AtomicU64,
+}
+
+struct CompletionInvocation {
+	owner:       UiCallbackOwner,
+	target:      Arc<ControlConnectionIdentity>,
+	dispatcher:  Arc<dyn CallbackDispatcher>,
+	query:       WireCompletionQuery,
+	max_results: usize,
+	stem:        Option<Str>,
+}
+
+impl CompletionSource for PublishedCompletionSource {
+	fn complete(&self, query: ComposerCompletionQuery) -> SuggestionList {
+		let id = self.next_id.fetch_add(1, Ordering::Relaxed).max(1);
+		let mut items =
+			self
+				.runtime
+				.block_on(complete_published_ui(&self.roster, &self.session, id, &query));
+		items.extend(self.fallback.complete(query));
+		items
+	}
+}
+
+async fn complete_published_ui(
+	roster: &PublishedUiRoster,
+	session: &Str,
+	id: u64,
+	query: &ComposerCompletionQuery,
+) -> SuggestionList {
+	let invocations = {
+		let state = roster.state.lock();
+		let command = query
+			.prefix
+			.strip_prefix("/")
+			.and_then(|prefix| prefix.strip_suffix(" "))
+			.and_then(|spelling| state.roster.command(spelling.as_str()))
+			.filter(|entry| entry.declaration.arg_completion_callback.is_some());
+		if let Some(entry) = command {
+			let Some(route) = state.routes.get(&entry.owner.host) else {
+				return SuggestionList::new();
+			};
+			let arguments = completion_arg_query(query.query.as_str());
+			let stem_len = query.query.len().saturating_sub(arguments.prefix.len());
+			let mut stem =
+				omp_core::StrMut::with_capacity(query.prefix.len().saturating_add(stem_len));
+			stem.push_str(&query.prefix);
+			stem.push_str(&query.query[..stem_len]);
+			let mut owner = entry.owner.clone();
+			owner.callback = Str::from(
+				entry
+					.declaration
+					.arg_completion_callback
+					.as_deref()
+					.expect("filtered command has an argument completion callback"),
+			);
+			vec![CompletionInvocation {
+				owner,
+				target: Arc::clone(&route.identity),
+				dispatcher: Arc::clone(&route.dispatcher),
+				query: WireCompletionQuery {
+					trigger: query.prefix.to_string(),
+					text:    arguments.prefix.to_string(),
+					cursor:  arguments.prefix.len().min(u32::MAX as usize) as u32,
+					argv:    arguments.argv.iter().map(ToString::to_string).collect(),
+					command: Some(entry.declaration.name.clone()),
+				},
+				max_results: query.rule.max_results,
+				stem: Some(stem.freeze()),
+			}]
+		} else {
+			state
+				.roster
+				.completions_for(query.prefix.as_str())
+				.filter_map(|entry| {
+					let route = state.routes.get(&entry.owner.host)?;
+					Some(CompletionInvocation {
+						owner:       entry.owner.clone(),
+						target:      Arc::clone(&route.identity),
+						dispatcher:  Arc::clone(&route.dispatcher),
+						query:       WireCompletionQuery {
+							trigger: query.prefix.to_string(),
+							text:    query.query.to_string(),
+							cursor:  query.query.len().min(u32::MAX as usize) as u32,
+							argv:    Vec::new(),
+							command: None,
+						},
+						max_results: entry.declaration.max_results as usize,
+						stem:        None,
+					})
+				})
+				.collect()
+		}
+	};
+	let results = join_all(
+		invocations
+			.into_iter()
+			.enumerate()
+			.map(|(offset, invocation)| {
+				let session = session.clone();
+				async move {
+					let authority = ui_invocation_authority(
+						sf!(
+							"ui-completion:{}:{}",
+							invocation.owner.declaration_id,
+							id.wrapping_add(offset as u64).max(1)
+						),
+						omp_core::InvocationPhase::Open,
+						session,
+					);
+					let dispatch = UiCallbackDispatch {
+						dispatch: UiDispatch {
+							kind:           Some(ui_dispatch::Kind::Completion(invocation.query)),
+							generation:     invocation.owner.generation,
+							declaration_id: invocation.owner.declaration_id.to_string(),
+							props:          None,
+						},
+						owner:    invocation.owner,
+					};
+					let result = invocation
+						.dispatcher
+						.dispatch_ui(invocation.target, authority, dispatch, COMPLETION_CALLBACK_DEADLINE)
+						.await;
+					(invocation.max_results, invocation.stem, result)
+				}
+			}),
+	)
+	.await;
+	let mut suggestions = SuggestionList::new();
+	for (max_results, stem, result) in results {
+		let Ok(mut result) = result else {
+			continue;
+		};
+		result
+			.candidates
+			.sort_by_key(|candidate| std::cmp::Reverse(candidate.sort));
+		for candidate in result.candidates.into_iter().take(max_results) {
+			if let Some(suggestion) = completion_suggestion(candidate, stem.as_deref()) {
+				suggestions.push(suggestion);
+			}
+		}
+	}
+	suggestions
+}
+
+fn completion_suggestion(candidate: CompletionCandidate, stem: Option<&str>) -> Option<Suggestion> {
+	if candidate.value.is_empty() {
+		return None;
+	}
+	let insert = if let Some(stem) = stem {
+		let mut value = omp_core::StrMut::with_capacity(stem.len() + candidate.value.len());
+		value.push_str(stem);
+		value.push_str(&candidate.value);
+		value.freeze()
+	} else {
+		Str::new(candidate.value.as_str())
+	};
+	let label = candidate
+		.display
+		.as_deref()
+		.unwrap_or(candidate.value.as_str());
+	let mut suggestion = Suggestion::new(insert, label);
+	if let Some(description) = candidate.description {
+		suggestion = suggestion.with_description(description);
+	}
+	if let Some(hint) = candidate.hint {
+		suggestion = suggestion.with_hint(hint);
+	}
+	if let Some(group) = candidate.group {
+		suggestion = suggestion.with_category(group);
+	}
+	if let Some(icon) = candidate.icon.and_then(|icon| Icon::from_name(&icon)) {
+		suggestion = suggestion.with_icon(icon);
+	}
+	Some(suggestion)
 }
 
 fn publish_command_invalidation(state: &mut PublishedUiState) {
@@ -1053,6 +1476,59 @@ mod tests {
 		fail:  bool,
 	}
 
+	struct CompletionDispatcher {
+		dispatches: Arc<Mutex<Vec<UiDispatch>>>,
+	}
+
+	#[async_trait]
+	impl CallbackDispatcher for CompletionDispatcher {
+		async fn dispatch(
+			&self,
+			_target: Arc<ControlConnectionIdentity>,
+			_dispatch: ControlDispatch,
+		) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+			Ok(Value::Null)
+		}
+
+		async fn dispatch_ui(
+			&self,
+			_target: Arc<ControlConnectionIdentity>,
+			_authority: ControlInvocationAuthority,
+			dispatch: UiCallbackDispatch,
+			_timeout: Duration,
+		) -> Result<UiDispatchResult, omp_envd::exthost::control::ControlProtocolError> {
+			self.dispatches.lock().push(dispatch.dispatch);
+			Ok(UiDispatchResult {
+				candidates: vec![CompletionCandidate {
+					value:       "two".to_owned(),
+					display:     Some("Two".to_owned()),
+					description: Some("second".to_owned()),
+					hint:        None,
+					group:       Some("Fixture".to_owned()),
+					icon:        None,
+					sort:        7,
+				}],
+				..Default::default()
+			})
+		}
+	}
+
+	struct RendererDispatcher {
+		source: &'static str,
+	}
+
+	#[async_trait]
+	impl CallbackDispatcher for RendererDispatcher {
+		async fn dispatch(
+			&self,
+			_target: Arc<ControlConnectionIdentity>,
+			dispatch: ControlDispatch,
+		) -> Result<Value, omp_envd::exthost::control::ControlProtocolError> {
+			assert_eq!(dispatch.operation, "omp.ui.renderer");
+			Ok(serde_json::json!({ "source": self.source }))
+		}
+	}
+
 	#[async_trait]
 	impl CallbackDispatcher for MarkdownDispatcher {
 		async fn dispatch(
@@ -1110,6 +1586,191 @@ mod tests {
 			.insert(host, PublishedUiRoute { identity: control_identity(), dispatcher });
 		drop(state);
 		roster
+	}
+
+	fn completion_roster(dispatcher: Arc<dyn CallbackDispatcher>) -> Arc<PublishedUiRoster> {
+		let roster = Arc::new(PublishedUiRoster::default());
+		let host = HostKey::new(sf!("workspace"), sf!("trusted"), sf!("ui"));
+		let verified = omp_envd::exthost::VerifiedUiRoster {
+			generation: 1,
+			extension: sf!("ui"),
+			commands: vec![omp_proto::ui::v1::CommandDecl {
+				name: "review".to_owned(),
+				description: "Review".to_owned(),
+				declaration_id: "command".to_owned(),
+				callback: "fixture.command".to_owned(),
+				module: "fixture".to_owned(),
+				activation_trigger: "before_ui_input".to_owned(),
+				arg_completion_callback: Some("fixture.complete_args".to_owned()),
+				..Default::default()
+			}]
+			.into_boxed_slice(),
+			triggers: vec![omp_proto::ui::v1::TriggerDecl {
+				prefix: "#".to_owned(),
+				kind: "completion".to_owned(),
+				min_chars: 1,
+				debounce_ms: 90,
+				max_results: 9,
+				cache_ms: 2_000,
+				refine_locally: true,
+				declaration_id: "issues".to_owned(),
+				callback: "fixture.issues".to_owned(),
+				module: "fixture".to_owned(),
+				activation_trigger: "before_ui_input".to_owned(),
+				..Default::default()
+			}]
+			.into_boxed_slice(),
+			..Default::default()
+		};
+		let mut state = roster.state.lock();
+		state
+			.roster
+			.install(host.clone(), &verified)
+			.expect("completion roster");
+		state
+			.routes
+			.insert(host, PublishedUiRoute { identity: control_identity(), dispatcher });
+		drop(state);
+		roster
+	}
+
+	#[tokio::test]
+	async fn completion_projection_and_typed_round_trip_reach_composer_rows() {
+		let dispatches = Arc::new(Mutex::new(Vec::new()));
+		let roster =
+			completion_roster(Arc::new(CompletionDispatcher { dispatches: Arc::clone(&dispatches) }));
+		let rules = roster.completion_rules();
+		assert!(
+			rules
+				.iter()
+				.any(|rule| { rule.prefix == "#" && rule.min_chars == 1 && rule.max_results == 9 })
+		);
+		assert!(rules.iter().any(|rule| rule.prefix == "/review "));
+
+		let trigger_rule = rules
+			.iter()
+			.find(|rule| rule.prefix == "#")
+			.expect("trigger rule")
+			.clone();
+		let trigger = ComposerCompletionQuery {
+			prefix_start: 0,
+			prefix:       sf!("#"),
+			trigger:      CompletionTrigger::Extension,
+			query:        sf!("12"),
+			rule:         trigger_rule,
+		};
+		let rows = complete_published_ui(&roster, &sf!("session"), 1, &trigger).await;
+		assert_eq!(rows[0].value(), "two");
+
+		let command_rule = rules
+			.iter()
+			.find(|rule| rule.prefix == "/review ")
+			.expect("command rule")
+			.clone();
+		let command = ComposerCompletionQuery {
+			prefix_start: 0,
+			prefix:       sf!("/review "),
+			trigger:      CompletionTrigger::Extension,
+			query:        sf!("one tw"),
+			rule:         command_rule,
+		};
+		let rows = complete_published_ui(&roster, &sf!("session"), 2, &command).await;
+		assert_eq!(rows[0].value(), "/review one two");
+
+		let dispatches = dispatches.lock();
+		let Some(ui_dispatch::Kind::Completion(trigger)) = dispatches[0].kind.as_ref() else {
+			panic!("completion dispatch");
+		};
+		assert_eq!(trigger.trigger, "#");
+		assert_eq!(trigger.text, "12");
+		let Some(ui_dispatch::Kind::Completion(command)) = dispatches[1].kind.as_ref() else {
+			panic!("command completion dispatch");
+		};
+		assert_eq!(command.command.as_deref(), Some("review"));
+		assert_eq!(command.argv, ["one"]);
+		assert_eq!(command.text, "tw");
+	}
+
+	fn renderer_declaration(
+		identity: omp_tool::ToolIdentity,
+		decorates: bool,
+	) -> omp_envd::exthost::VerifiedRendererDeclaration {
+		omp_envd::exthost::VerifiedRendererDeclaration {
+			declaration_id: sf!("renderer"),
+			identity,
+			callback: sf!("fixture.render"),
+			reduce: None,
+			decorates,
+			module: sf!("fixture"),
+		}
+	}
+
+	#[tokio::test]
+	async fn extension_renderer_replaces_generic_base_and_decorates_native_base() {
+		let identity = omp_tool::ToolIdentity {
+			name: sf!("counter"),
+			rev:  omp_tool::Rev { family: sf!("counter"), n: 2 },
+		};
+		let roster = PublishedUiRoster::default();
+		let base_host = HostKey::new(sf!("workspace"), sf!("trusted"), sf!("base"));
+		let decoration_host = HostKey::new(sf!("workspace"), sf!("trusted"), sf!("decoration"));
+		{
+			let mut state = roster.state.lock();
+			state
+				.roster
+				.install(base_host.clone(), &omp_envd::exthost::VerifiedUiRoster {
+					generation: 1,
+					extension: sf!("base"),
+					renderers: vec![renderer_declaration(identity.clone(), false)].into_boxed_slice(),
+					..Default::default()
+				})
+				.unwrap();
+			state
+				.roster
+				.install(decoration_host.clone(), &omp_envd::exthost::VerifiedUiRoster {
+					generation: 1,
+					extension: sf!("decoration"),
+					renderers: vec![renderer_declaration(identity.clone(), true)].into_boxed_slice(),
+					..Default::default()
+				})
+				.unwrap();
+			state.routes.insert(base_host, PublishedUiRoute {
+				identity:   control_identity(),
+				dispatcher: Arc::new(RendererDispatcher { source: "<text>base</text>" }),
+			});
+			state.routes.insert(decoration_host, PublishedUiRoute {
+				identity:   control_identity(),
+				dispatcher: Arc::new(RendererDispatcher { source: "<text>decoration</text>" }),
+			});
+		}
+		let view = serde_json::json!({ "call_id": "call-1", "updates": [], "verdict": null });
+		let ctx = serde_json::json!({});
+		assert_eq!(
+			roster
+				.render_tool(
+					&identity,
+					view.clone(),
+					ctx.clone(),
+					omp_chat_ui::ToolViewContent::Plain(sf!("<generic/>")),
+					false,
+					sf!("session"),
+				)
+				.await,
+			omp_chat_ui::ToolViewContent::Markup(sf!("<text>base</text><text>decoration</text>")),
+		);
+		assert_eq!(
+			roster
+				.render_tool(
+					&identity,
+					view,
+					ctx,
+					omp_chat_ui::ToolViewContent::Markup(sf!("<text>native</text>")),
+					true,
+					sf!("session"),
+				)
+				.await,
+			omp_chat_ui::ToolViewContent::Markup(sf!("<text>native</text><text>decoration</text>")),
+		);
 	}
 
 	#[tokio::test]

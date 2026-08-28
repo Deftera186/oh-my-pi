@@ -162,6 +162,7 @@ fn dialog_request(question: &Question) -> UiRequest {
 				.iter()
 				.map(|option| option.label.to_string())
 				.collect(),
+			props:   None,
 		})),
 		props:            None,
 	}

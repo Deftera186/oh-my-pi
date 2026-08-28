@@ -1316,6 +1316,9 @@ impl WorkState {
 		}
 		self.active_brand.truncate(0);
 		if let Some(indicator) = &self.indicator {
+			if indicator.frames.is_empty() {
+				return;
+			}
 			let interval = Duration::from_millis(indicator.interval_ms.max(1));
 			let index = usize::try_from(now.as_millis() / interval.as_millis()).unwrap_or(0)
 				% indicator.frames.len();
@@ -2216,8 +2219,8 @@ impl Chat {
 	/// Replaces the composer's completion source.
 	pub fn set_completion(&mut self, completion: Box<dyn omp_tui::EditorCompletion>) {
 		let completion = CompletionChain::new()
-			.source(Box::new(self.slash_commands.clone()))
-			.source(completion);
+			.source(completion)
+			.source(Box::new(self.slash_commands.clone()));
 		self
 			.editor_ui
 			.update_component::<EditorPane>(INPUT_ID, |pane| {
@@ -3073,9 +3076,11 @@ impl Chat {
 			BackendEvent::RecapPolicy { .. } => {},
 			BackendEvent::ThemePreview(theme) => self.preview_theme(theme),
 			BackendEvent::ComposerReplaced(text) => self.set_composer_text(text.as_str()),
+			BackendEvent::ComposerPaste(text) => self.handle_paste(text.as_str()),
 			BackendEvent::ApplyUiEffect(effect) => {
 				let _ = self.apply_ui_effect(&effect);
 			},
+			BackendEvent::TerminalNotification(_) | BackendEvent::TerminalProgress(_) => {},
 			BackendEvent::ComposerStyleChanged(style) => self.set_composer_style(style),
 			BackendEvent::SpellingFeaturesChanged(features) => self.set_spelling_features(features),
 			BackendEvent::SmoothStreamingChanged(smooth) => self.set_smooth_streaming(smooth),
@@ -5058,6 +5063,21 @@ mod tests {
 		assert!(chat.work.borrow().active_brand.as_str().starts_with('b'));
 		chat.set_status(StatusFacts { working: false, ..StatusFacts::default() });
 		assert!(chat.work.borrow().indicator.is_none());
+	}
+
+	#[test]
+	fn empty_working_indicator_hides_the_active_brand() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_status(StatusFacts { working: true, ..StatusFacts::default() });
+		chat.set_working_indicator(WorkingIndicator {
+			frames:      Vec::new().into_boxed_slice(),
+			interval_ms: 80,
+		});
+		chat
+			.work
+			.borrow_mut()
+			.update_active_brand(Duration::from_millis(15), chat.ctx.charset);
+		assert!(chat.work.borrow().active_brand.is_empty());
 	}
 
 	#[test]
