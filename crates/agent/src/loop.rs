@@ -6906,53 +6906,6 @@ mod tests {
 		drop(agent);
 		fs::remove_file(path).expect("remove journal");
 	}
-
-	#[derive(Clone)]
-	struct ScriptedClient {
-		scripts: Arc<Mutex<VecDeque<Script>>>,
-		opened:  Arc<Mutex<OpenedTurns>>,
-	}
-
-	struct ScriptedSession {
-		events: VecDeque<Result<pb::TurnEvent, TurnError>>,
-	}
-
-	impl TurnSession for ScriptedSession {
-		fn events(
-			&mut self,
-		) -> impl futures::Stream<Item = Result<pb::TurnEvent, TurnError>> + Send + Unpin + '_ {
-			stream::poll_fn(move |_| match self.events.pop_front() {
-				Some(event) => task::Poll::Ready(Some(event)),
-				None => task::Poll::Pending,
-			})
-		}
-
-		fn submit(
-			&mut self,
-			_frame: InvokeFrame,
-		) -> impl Future<Output = Result<(), TurnError>> + Send + '_ {
-			future::ready(Ok(()))
-		}
-	}
-
-	impl TurnClient for ScriptedClient {
-		type Session<'client> = ScriptedSession;
-
-		fn turn<'client>(
-			&'client self,
-			turn_id: TurnId,
-			input: TurnInput,
-			options: &'client TurnOptions,
-		) -> impl Future<Output = Result<Self::Session<'client>, TurnError>> + Send + 'client {
-			self.opened.lock().push((turn_id, input, options.clone()));
-			let events = self
-				.scripts
-				.lock()
-				.pop_front()
-				.expect("one script per turn");
-			future::ready(Ok(ScriptedSession { events: events.into() }))
-		}
-	}
 	#[tokio::test]
 	async fn stateful_turn_echoes_provider_owned_revision_without_deriving_its_head() {
 		let first_revision =
@@ -7004,6 +6957,53 @@ mod tests {
 		drop(opened);
 		drop(agent);
 		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[derive(Clone)]
+	struct ScriptedClient {
+		scripts: Arc<Mutex<VecDeque<Script>>>,
+		opened:  Arc<Mutex<OpenedTurns>>,
+	}
+
+	struct ScriptedSession {
+		events: VecDeque<Result<pb::TurnEvent, TurnError>>,
+	}
+
+	impl TurnSession for ScriptedSession {
+		fn events(
+			&mut self,
+		) -> impl futures::Stream<Item = Result<pb::TurnEvent, TurnError>> + Send + Unpin + '_ {
+			stream::poll_fn(move |_| match self.events.pop_front() {
+				Some(event) => task::Poll::Ready(Some(event)),
+				None => task::Poll::Pending,
+			})
+		}
+
+		fn submit(
+			&mut self,
+			_frame: InvokeFrame,
+		) -> impl Future<Output = Result<(), TurnError>> + Send + '_ {
+			future::ready(Ok(()))
+		}
+	}
+
+	impl TurnClient for ScriptedClient {
+		type Session<'client> = ScriptedSession;
+
+		fn turn<'client>(
+			&'client self,
+			turn_id: TurnId,
+			input: TurnInput,
+			options: &'client TurnOptions,
+		) -> impl Future<Output = Result<Self::Session<'client>, TurnError>> + Send + 'client {
+			self.opened.lock().push((turn_id, input, options.clone()));
+			let events = self
+				.scripts
+				.lock()
+				.pop_front()
+				.expect("one script per turn");
+			future::ready(Ok(ScriptedSession { events: events.into() }))
+		}
 	}
 
 	fn outcome_script(outcome: Outcome) -> Vec<Result<pb::TurnEvent, TurnError>> {
