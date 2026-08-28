@@ -1475,7 +1475,7 @@ impl AuthManager {
 					.control_handle()
 					.import_oauth(OAuthControlImport {
 						provider: request.provider.clone(),
-						principal: principal.clone(),
+						principal,
 						identity: credential.identity,
 						access_token: Some(credential.secret),
 						refresh_token,
@@ -1494,11 +1494,11 @@ impl AuthManager {
 				let (_, record) = self
 					.control_handle()
 					.store(CredentialControlWrite {
-						provider:      request.provider.clone(),
-						principal:     principal.clone(),
-						identity:      credential.identity,
-						kind:          credential.kind,
-						secret:        Secret::from(secret),
+						provider: request.provider.clone(),
+						principal,
+						identity: credential.identity,
+						kind: credential.kind,
+						secret: Secret::from(secret),
 						expires_at_ms: credential.expires_at_ms,
 					})
 					.map_err(auth_store_error)?;

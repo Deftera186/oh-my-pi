@@ -55,10 +55,20 @@ class BudgetError(OmpError, ValueError):
     """Report invalid use of a sealed projection budget or text fragment."""
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Payload:
-    """Marker base for a device's durable success value."""
+_PAYLOAD_MISSING = object()
 
+
+@dataclass(frozen=True, slots=True, kw_only=True, init=False)
+class Payload:
+    """A device's durable success value, inline or subclass-shaped."""
+
+    _inline: Mapping[str, object] | None = dataclasses.field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+        metadata={"omp_terminal_control": True},
+    )
     terminate: bool = dataclasses.field(
         default=False,
         metadata={"omp_terminal_control": True},
@@ -69,10 +79,21 @@ class Payload:
         super().__init_subclass__(**kwargs)
         _validate_verdict_schema(cls)
 
-    def __new__(cls, *_args: Any, **_kwargs: Any) -> Payload:
-        if cls is Payload:
-            raise TypeError("Payload is a marker base; instantiate a frozen dataclass subclass")
-        return super().__new__(cls)
+    def __init__(
+        self,
+        value: Mapping[str, object] | object = _PAYLOAD_MISSING,
+        /,
+        *,
+        terminate: bool = False,
+    ) -> None:
+        """Freeze one inline mapping payload."""
+
+        if value is _PAYLOAD_MISSING:
+            value = {}
+        if not isinstance(value, MappingABC):
+            raise TypeError("Payload value must be a mapping")
+        object.__setattr__(self, "_inline", MappingProxyType(dict(value)))
+        object.__setattr__(self, "terminate", terminate)
 
     def useless(self) -> bool:
         """Return whether compaction may omit this value's prompt projection."""
@@ -637,7 +658,10 @@ class _ShapeMismatch(ValueError):
 
 
 def _type_globals(cls: type[object]) -> dict[str, object]:
-    namespace = dict(vars(__import__(cls.__module__, fromlist=("*",))))
+    # Base-class annotations (Payload/Fault fields) resolve against this module's
+    # imports; the subclass module's names are overlaid on top.
+    namespace = dict(globals())
+    namespace.update(vars(__import__(cls.__module__, fromlist=("*",))))
     if any("RuleRef" in str(value) for value in cls.__dict__.get("__annotations__", {}).values()):
         from .policy import RuleRef
 
@@ -764,6 +788,8 @@ def _encode_verdict(value: object, active: set[int]) -> object:
         raise TypeError("cyclic values are not verdict-serializable")
     active.add(identity)
     try:
+        if type(value) is Payload:
+            return _encode_verdict(value._inline, active)
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return {
                 field.name: _encode_verdict(getattr(value, field.name), active)

@@ -2578,6 +2578,47 @@ def _schema_for_annotation(annotation: object) -> dict[str, object]:
 
 
 
+def _bind_tool_arguments(
+    body: object, params: Mapping[str, object], context: object
+) -> tuple[list[object], dict[str, object]]:
+    """Ergonomic parameter binding shared by worker and CONTROL dispatch.
+
+    ``ctx`` parameters receive ``context``; every other parameter binds from
+    ``params`` with defaults honored, unknown arguments rejected unless the
+    body declares ``**kwargs``.
+    """
+    signature = inspect.signature(body)
+    positional: list[object] = []
+    keywords: dict[str, object] = {}
+    consumed: set[str] = set()
+    has_var_kwargs = False
+    for parameter in signature.parameters.values():
+        if parameter.name == "ctx":
+            value = context
+        elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            has_var_kwargs = True
+            continue
+        elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            continue
+        elif parameter.name in params:
+            value = params[parameter.name]
+            consumed.add(parameter.name)
+        elif parameter.default is not inspect.Parameter.empty:
+            continue
+        else:
+            raise TypeError(f"missing required tool argument {parameter.name!r}")
+        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            positional.append(value)
+        else:
+            keywords[parameter.name] = value
+    unexpected = set(params).difference(consumed)
+    if unexpected and not has_var_kwargs:
+        raise TypeError(f"unexpected tool argument {sorted(unexpected)[0]!r}")
+    if has_var_kwargs:
+        keywords.update((name, params[name]) for name in unexpected)
+    return positional, keywords
+
+
 def _worker_handler(
     definition: DeviceDefinition, kind: object
 ) -> Callable[[Mapping[str, object], object], Awaitable[object]]:
@@ -2588,35 +2629,7 @@ def _worker_handler(
         if not isinstance(params, Mapping):
             raise TypeError("worker tool arguments must decode to an object")
         if ergonomic:
-            signature = inspect.signature(body)
-            positional: list[object] = []
-            keywords: dict[str, object] = {}
-            consumed: set[str] = set()
-            has_var_kwargs = False
-            for parameter in signature.parameters.values():
-                if parameter.name == "ctx":
-                    value = context
-                elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
-                    has_var_kwargs = True
-                    continue
-                elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
-                    continue
-                elif parameter.name in params:
-                    value = params[parameter.name]
-                    consumed.add(parameter.name)
-                elif parameter.default is not inspect.Parameter.empty:
-                    continue
-                else:
-                    raise TypeError(f"missing required tool argument {parameter.name!r}")
-                if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
-                    positional.append(value)
-                else:
-                    keywords[parameter.name] = value
-            unexpected = set(params).difference(consumed)
-            if unexpected and not has_var_kwargs:
-                raise TypeError(f"unexpected tool argument {sorted(unexpected)[0]!r}")
-            if has_var_kwargs:
-                keywords.update((name, params[name]) for name in unexpected)
+            positional, keywords = _bind_tool_arguments(body, params, context)
             result = body(*positional, **keywords)
         else:
             parameters = tuple(inspect.signature(body).parameters.values())
@@ -2638,24 +2651,32 @@ def _worker_handler(
             result = terminal
         if inspect.isawaitable(result):
             result = await result
-        from . import Fault
-        from ._verdicts import Faulted, Ok, Payload, _canonical_json
-
-        if isinstance(result, (Payload, Fault)):
-            outcome = Ok(result) if isinstance(result, Payload) else Faulted(result)
-            return {
-                "updates": streamed_updates or [],
-                "details": json.loads(_canonical_json(outcome)),
-                "is_error": isinstance(result, Fault),
-                "terminate": result.terminate,
-            }
-        if streamed_updates is not None:
-            if isinstance(result, Mapping):
-                return {"updates": streamed_updates, **result}
-            return {"updates": streamed_updates, "details": result}
-        return result
+        return _lower_worker_result(result, streamed_updates)
 
     return invoke
+
+
+def _lower_worker_result(
+    result: object, streamed_updates: list[object] | None = None
+) -> object:
+    """Lower one Python result to the shared stdio/CONTROL completion shape."""
+
+    from . import Fault
+    from ._verdicts import Faulted, Ok, Payload, _canonical_json
+
+    if isinstance(result, (Payload, Fault)):
+        outcome = Ok(result) if isinstance(result, Payload) else Faulted(result)
+        return {
+            "updates": streamed_updates or [],
+            "details": json.loads(_canonical_json(outcome)),
+            "is_error": isinstance(result, Fault),
+            "terminate": result.terminate,
+        }
+    if streamed_updates is not None:
+        if isinstance(result, Mapping):
+            return {"updates": streamed_updates, **result}
+        return {"updates": streamed_updates, "details": result}
+    return result
 
 
 def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ...]:

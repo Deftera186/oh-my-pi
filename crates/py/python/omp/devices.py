@@ -548,10 +548,25 @@ async def _dispatch_device(
                 f"host device {path!r}"
             )
         body = candidates[0]
-    result = body(**dict(args))
+    if hasattr(body, "__omp_tool_kind__"):
+        # Parity with the stdio worker path: ergonomic tools receive the
+        # ambient invocation context in their `ctx` parameter.
+        from . import Context
+        from ._registry import _bind_tool_arguments
+
+        try:
+            context = Context.current()
+        except LookupError:
+            context = None
+        positional, keywords = _bind_tool_arguments(body, dict(args), context)
+        result = body(*positional, **keywords)
+    else:
+        result = body(**dict(args))
     if inspect.isawaitable(result):
-        return await result
-    return result
+        result = await result
+    from ._registry import _lower_worker_result
+
+    return _lower_worker_result(result)
 
 
 def _declared_rows() -> tuple[DeviceInfo, ...]:
