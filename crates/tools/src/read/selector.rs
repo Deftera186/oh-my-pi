@@ -805,7 +805,7 @@ mod tests {
 		assert_eq!(http.resource, "example.com/page");
 		assert!(matches!(http.selector, ParsedSelector::Lines { .. }));
 
-		let unknown = parse_uri("xd://pending:raw").unwrap().unwrap();
+		let unknown = parse_uri("custom://pending:raw").unwrap().unwrap();
 		assert_eq!(unknown.scheme, Scheme::Unknown);
 		assert_eq!(unknown.resource, "pending:raw");
 		assert_eq!(unknown.selector, ParsedSelector::None);

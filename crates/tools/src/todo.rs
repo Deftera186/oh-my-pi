@@ -791,6 +791,50 @@ mod tests {
 	}
 
 	#[test]
+	fn init_with_journaled_snapshot_restores_state_exactly() {
+		let snapshot = vec![Phase {
+			phase: sf!("Work"),
+			items: vec![
+				Item { text: sf!("done"), status: Status::Completed, reason: None },
+				Item { text: sf!("active"), status: Status::InProgress, reason: None },
+				Item { text: sf!("stuck"), status: Status::Blocked, reason: Some(sf!("waiting")) },
+				Item { text: sf!("later"), status: Status::Pending, reason: None },
+			],
+		}];
+		let mut phases = vec![Phase {
+			phase: sf!("Stale"),
+			items: vec![Item { text: sf!("junk"), status: Status::InProgress, reason: None }],
+		}];
+		let restored = apply(&mut phases, Params {
+			op:     Op::Init,
+			list:   Some(snapshot.clone()),
+			phase:  None,
+			item:   None,
+			items:  None,
+			reason: None,
+		})
+		.expect("init restore");
+		assert_eq!(restored, snapshot);
+		assert_eq!(phases, snapshot);
+	}
+
+	#[test]
+	fn init_with_empty_list_clears_all_phases() {
+		let mut phases = init();
+		let cleared = apply(&mut phases, Params {
+			op:     Op::Init,
+			list:   Some(Vec::new()),
+			phase:  None,
+			item:   None,
+			items:  None,
+			reason: None,
+		})
+		.expect("init clear");
+		assert!(cleared.is_empty());
+		assert!(phases.is_empty());
+	}
+
+	#[test]
 	fn single_phase_init_promotes_only_the_earliest_pending_item() {
 		let mut phases = Vec::new();
 		apply(&mut phases, Params {

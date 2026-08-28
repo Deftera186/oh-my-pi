@@ -130,7 +130,10 @@ use omp_driver::{
 	skills::SkillInvocationKind,
 };
 use omp_envd::github_url::GithubCredentialBridge;
-use omp_proto::inference::{v1, v1::Effort};
+use omp_proto::{
+	inference::{v1, v1::Effort},
+	value_json::{value_map_to_json, value_to_json},
+};
 use omp_settings::{
 	BrowserSettings,
 	manager::{MutationScope, SettingsManager},
@@ -960,6 +963,10 @@ enum UiCmd {
 	},
 	ListRewind {
 		reply: flume::Sender<Result<Vec<RewindTarget>, String>>,
+	},
+	TodoEdited {
+		phases: Box<serde_json::value::RawValue>,
+		reply:  flume::Sender<Result<(), String>>,
 	},
 	Rewind {
 		to:    Option<u64>,
@@ -1803,7 +1810,7 @@ pub fn lower_presentation_response(
 			let answers = outcome
 				.answers
 				.as_ref()
-				.and_then(proto_map_to_json)
+				.and_then(value_map_to_json)
 				.map(Value::Object);
 			let reason = outcome
 				.reason
@@ -2624,6 +2631,11 @@ where
 	let session_hooks = environment_host.admission_gate();
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
+	let resumed_pending_jobs: Vec<Str> = agent
+		.journal()
+		.pending_jobs()
+		.map(|job| job.id.clone())
+		.collect();
 	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
 	let maintenance_registry = Arc::clone(&registry);
 	let session_delete_index = Arc::clone(&session_index);
@@ -2662,6 +2674,13 @@ where
 					let result = agent.rewind_targets().map_err(|error| error.to_string());
 					let _ = reply.send(result);
 				},
+				UiCmd::TodoEdited { phases, reply } => {
+					let result = agent
+						.append_todo_edit(&phases)
+						.map(|_| ())
+						.map_err(|error| error.to_string());
+					let _ = reply.send(result);
+				},
 				UiCmd::Rewind { to, reply } => {
 					let result = match agent.rewind_targets() {
 						Ok(targets) => {
@@ -2677,18 +2696,15 @@ where
 							)
 							.await
 							{
-								Ok(false) => (|| -> Result<Vec<Item>, omp_agent::AgentError> {
-									let items = agent.rewind(to)?;
-									let new_head = agent.journal().load()?.len().saturating_sub(1) as u64;
-									crate::chat_cmd::notify_session_rewound(
-										session_hooks.as_ref(),
-										to,
-										new_head,
-										false,
-									);
-									Ok(items)
-								})()
-								.map_err(|error| error.to_string()),
+								Ok(false) => match agent.rewind(to) {
+									Ok(items) => {
+										if let Err(error) = agent.reconcile_history_rewrite().await {
+											tracing::warn!(%error, "history-rewrite reconciliation failed");
+										}
+										Ok(items)
+									},
+									Err(error) => Err(error.to_string()),
+								},
 								Ok(true) => Err(String::from(
 									"workspace restore is unavailable for this rewind backend",
 								)),
@@ -3037,6 +3053,36 @@ where
 		&mut state.part_serial,
 		renderers.as_ref(),
 	);
+	if !session.initial_items.is_empty() {
+		match invoke_todo(&state.environment, &omp_tools::todo::Params {
+			op:     omp_tools::todo::Op::View,
+			list:   None,
+			phase:  None,
+			item:   None,
+			items:  None,
+			reason: None,
+		})
+		.await
+		{
+			Ok(payload) if !payload.phases.is_empty() => {
+				send_backend(&backend_tx, BackendEvent::TodoHud(todo_hud(&payload)));
+			},
+			Ok(_) => {},
+			Err(error) => {
+				tracing::warn!(%error, "resumed todo state was not projected to the HUD");
+			},
+		}
+		for id in &resumed_pending_jobs {
+			state.jobs.insert(id.clone());
+			send_retained_fact(
+				&backend_tx,
+				"async-job",
+				id.as_str(),
+				serde_json::json!({"name": id.as_str(), "status": "running"}),
+				"Background job is running.",
+			);
+		}
+	}
 	if let Some(item) = initial_submission {
 		replay_items(
 			&backend_tx,
@@ -3451,6 +3497,11 @@ where
 							Ok(event) = agent_events.recv() => {
 								if guest_projected {
 									continue;
+								}
+								if let AgentEvent::HistoryRewritten { escalate_jobs, .. } = event.as_ref() {
+									for id in escalate_jobs {
+										parent.cancel_child(id.as_str());
+									}
 								}
 								if matches!(&*event, AgentEvent::RosterChanged { .. }) {
 									publish_agent_roster(&backend_tx, &parent, &tree, &session_id, &mut last_roster);
@@ -6125,7 +6176,24 @@ where
 			let payload = if params.op == todo::Op::View {
 				view
 			} else {
-				invoke_todo(&self.state.environment, &params).await?
+				let payload = invoke_todo(&self.state.environment, &params).await?;
+				let phases = serde_json::value::to_raw_value(&payload.phases).into_diagnostic()?;
+				let (reply, response) = flume::bounded(1);
+				self
+					.commands_tx
+					.send_async(UiCmd::TodoEdited { phases, reply })
+					.await
+					.into_diagnostic()?;
+				match response.recv_async().await {
+					Ok(Ok(())) => {},
+					Ok(Err(error)) => {
+						return Err(miette::miette!("todo edit applied but was not journaled: {error}"));
+					},
+					Err(_) => {
+						return Err(miette::miette!("todo edit applied but the journal owner is gone"));
+					},
+				}
+				payload
 			};
 			send_backend(self.backend, BackendEvent::TodoHud(todo_hud(&payload)));
 			let rendered = if payload.phases.is_empty() {
@@ -9697,6 +9765,27 @@ async fn handle_agent_event(
 				"Background job settled.",
 			);
 		},
+		AgentEvent::HistoryRewritten { .. } => {
+			match invoke_todo(&state.environment, &omp_tools::todo::Params {
+				op:     omp_tools::todo::Op::View,
+				list:   None,
+				phase:  None,
+				item:   None,
+				items:  None,
+				reason: None,
+			})
+			.await
+			{
+				Ok(payload) => send_backend(backend, BackendEvent::TodoHud(todo_hud(&payload))),
+				Err(error) => send_backend(
+					backend,
+					BackendEvent::Error(sf!("Todo view failed after history rewrite: {error}")),
+				),
+			}
+			if let Some(advisor) = state.advisor.as_ref() {
+				advisor.lock().history_rewritten();
+			}
+		},
 		AgentEvent::PeerRelay(observation) => {
 			state.part_serial = state.part_serial.saturating_add(1);
 			let stable_id = sf!("irc-{}-{}-{}", observation.from, observation.to, state.part_serial);
@@ -9803,7 +9892,7 @@ fn autoqa_consent_request(item: &Item) -> Option<omp_chat_ui::autoqa::ConsentReq
 	if result.is_error || result.name != "report_issue" {
 		return None;
 	}
-	let value = proto_to_json(result.details.as_ref()?)?;
+	let value = value_to_json(result.details.as_ref()?)?;
 	let payload = value.get("value")?;
 	let issue_id = payload.get("issue_id")?.as_str()?;
 	let target = payload.get("target")?.as_str()?;
@@ -10108,7 +10197,7 @@ fn durable_tool_outcome(item: &Item) -> Option<Bytes> {
 	let Some(item::Kind::ToolResult(result)) = &item.kind else {
 		return None;
 	};
-	let details = proto_to_json(result.details.as_ref()?)?;
+	let details = value_to_json(result.details.as_ref()?)?;
 	serde_json::to_vec(&details).ok().map(Bytes::from)
 }
 
@@ -10380,38 +10469,6 @@ fn persist_tool_image(blob: &Blob) -> Option<Str> {
 		fs::write(&path, &blob.inline).ok()?;
 	}
 	Some(Str::from(path.to_string_lossy().as_ref()))
-}
-
-fn proto_to_json(value: &v1::Value) -> Option<serde_json::Value> {
-	match value.kind.as_ref()? {
-		value::Kind::Null(_) => Some(serde_json::Value::Null),
-		value::Kind::Int(number) => Some((*number).into()),
-		value::Kind::Uint(number) => Some((*number).into()),
-		value::Kind::Double(number) => serde_json::Number::from_f64(*number).map(Into::into),
-		value::Kind::Bool(boolean) => Some((*boolean).into()),
-		value::Kind::String(string) => Some(string.clone().into()),
-		value::Kind::List(list) => list
-			.values
-			.iter()
-			.map(proto_to_json)
-			.collect::<Option<Vec<_>>>()
-			.map(Into::into),
-		value::Kind::Map(map) => {
-			let mut object = serde_json::Map::with_capacity(map.fields.len());
-			for (key, value) in &map.fields {
-				object.insert(key.clone(), proto_to_json(value)?);
-			}
-			Some(serde_json::Value::Object(object))
-		},
-	}
-}
-
-fn proto_map_to_json(map: &v1::ValueMap) -> Option<serde_json::Map<String, Value>> {
-	let mut object = serde_json::Map::with_capacity(map.fields.len());
-	for (key, value) in &map.fields {
-		object.insert(key.clone(), proto_to_json(value)?);
-	}
-	Some(object)
 }
 
 fn model_rows(
