@@ -31,9 +31,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
-	CallOutcome, Constraint, DeviceIssue, DevicePath, Effects, GrammarSyntax, IncomingParams,
-	JobRef, LiftedCall, Part, Presentation, PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool,
-	ToolIdentity, ToolPromptExample, ToolSpec,
+	CallOutcome, Constraint, DeviceIssue, DevicePath, Effects, ExecutionMode, GrammarSyntax,
+	IncomingParams, JobRef, LiftedCall, Part, Presentation, PromptCaps, RecordedCall,
+	RecordedCallOwned, Rev, Tool, ToolIdentity, ToolPromptExample, ToolSpec,
 };
 
 /// Catalog capabilities needed for deterministic tool lowering.
@@ -98,8 +98,7 @@ pub enum ToolRoute {
 }
 const fn is_model_callable(route: &ToolRoute) -> bool {
 	match route {
-		ToolRoute::Native => true,
-		ToolRoute::Worker { .. } => false,
+		ToolRoute::Native | ToolRoute::Worker { .. } => true,
 	}
 }
 /// Model-visible tool declaration supplied by an attached RPC host.
@@ -294,21 +293,45 @@ pub struct Claim {
 #[derive(Clone, Copy, Debug)]
 pub struct MountedDevice<'a> {
 	/// Stable catalog name.
-	pub name:     &'a Str,
+	pub name:       &'a Str,
 	/// Current schema revision.
-	pub rev:      &'a Rev,
+	pub rev:        &'a Rev,
 	/// Publisher-qualified implementation identity.
-	pub claimant: &'a Str,
+	pub claimant:   &'a Str,
+	/// Winning claimant precedence.
+	pub precedence: Precedence,
 	/// Short catalog summary.
-	pub summary:  &'a Str,
+	pub summary:    &'a Str,
 	/// Complete JSON Schema bytes.
-	pub schema:   &'a [u8],
+	pub schema:     &'a [u8],
 	/// Maximum declared authority before per-invocation narrowing.
-	pub effects:  &'a Effects,
+	pub effects:    &'a Effects,
 	/// Long-form documentation, when supplied by the declaration surface.
-	pub docs:     Option<&'a str>,
+	pub docs:       Option<&'a str>,
 	/// Execution placement, independent of device presentation.
-	pub route:    &'a ToolRoute,
+	pub route:      &'a ToolRoute,
+	/// Authenticated extension provenance retained by the mount path, when
+	/// available.
+	pub metadata:   Option<&'a DeviceMetadata>,
+}
+
+/// Authenticated device provenance known by the registry mount path.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeviceMetadata {
+	/// Artifact publisher, when retained by the mount owner.
+	pub publisher:       Option<Str>,
+	/// Stable extension identity.
+	pub extension_id:    Option<Str>,
+	/// Artifact version, when retained by the mount owner.
+	pub version:         Option<Str>,
+	/// Verified artifact digest, when retained by the mount owner.
+	pub artifact_digest: Option<Str>,
+	/// Extension resolution layer.
+	pub layer:           Option<Str>,
+	/// Extension trust tier.
+	pub tier:            Option<Str>,
+	/// Live host generation, when retained by the mount owner.
+	pub generation:      Option<u64>,
 }
 /// Resolved device dispatch target.
 ///
@@ -1585,6 +1608,7 @@ struct RegistryEntry {
 	tool:         Arc<dyn ErasedTool>,
 	presentation: Presentation,
 	claims:       Claims,
+	execution:    ExecutionMode,
 }
 
 /// Revision-aware tool registry.
@@ -1597,17 +1621,35 @@ struct RegistryEntry {
 pub struct Registry {
 	versions:         BTreeMap<Str, BTreeMap<Rev, RegistryEntry>>,
 	live:             BTreeMap<Str, Claim>,
+	device_metadata:  BTreeMap<(Str, Str), DeviceMetadata>,
 	protected_core:   BTreeSet<Str>,
-	unmounted:        RwLock<BTreeMap<Str, Option<Str>>>,
 	arg_specs:        ArgSpecRegistry,
 	projection_cache: Arc<ProjectionCache>,
 	host_tools:       RwLock<HostToolState>,
+	/// Conservatively unmounted device roots keyed by name, with the reported
+	/// unavailability reason. Populated only by
+	/// [`Registry::apply_availability`]; cleared by fresh registry composition.
+	unmounted:        RwLock<BTreeMap<Str, Option<Str>>>,
 }
 
 impl Registry {
 	/// Creates an empty registry.
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// Retains authenticated mount provenance for one exact device claimant.
+	///
+	/// Metadata never participates in claim resolution or either registry hash.
+	pub fn bind_device_metadata(
+		&mut self,
+		name: impl Into<Str>,
+		claimant: impl Into<Str>,
+		metadata: DeviceMetadata,
+	) {
+		self
+			.device_metadata
+			.insert((name.into(), claimant.into()), metadata);
 	}
 
 	/// Atomically replaces one attached host's complete model-visible tool
@@ -1690,6 +1732,7 @@ impl Registry {
 					cache_id,
 				}),
 				presentation: Presentation::Slot,
+				execution:    ExecutionMode::Parallel,
 				claims:       Claims {
 					precedence: Precedence::INTEGRATION,
 					claimant:   claimant.clone(),
@@ -1934,6 +1977,7 @@ impl Registry {
 			}),
 			presentation,
 			claims,
+			execution: ExecutionMode::Parallel,
 		};
 		self.insert(name, rev, entry)
 	}
@@ -1947,7 +1991,34 @@ impl Registry {
 		claims: Claims,
 	) -> Result<(), RegistryError> {
 		let worker_name = spec.name.clone();
-		self.register_worker_at(spec, presentation, claims, WorkerSiteKind::Env, worker_name)
+		self.register_worker_at_with_mode(
+			spec,
+			presentation,
+			claims,
+			WorkerSiteKind::Env,
+			worker_name,
+			ExecutionMode::Parallel,
+		)
+	}
+
+	/// Registers an externally supervised declaration with a batch scheduling
+	/// constraint.
+	pub fn register_worker_with_mode(
+		&mut self,
+		spec: ToolSpec,
+		presentation: Presentation,
+		claims: Claims,
+		execution: ExecutionMode,
+	) -> Result<(), RegistryError> {
+		let worker_name = spec.name.clone();
+		self.register_worker_at_with_mode(
+			spec,
+			presentation,
+			claims,
+			WorkerSiteKind::Env,
+			worker_name,
+			execution,
+		)
 	}
 
 	/// Registers an externally supervised declaration with its resolved worker
@@ -1959,6 +2030,27 @@ impl Registry {
 		claims: Claims,
 		site: WorkerSiteKind,
 		worker_name: Str,
+	) -> Result<(), RegistryError> {
+		self.register_worker_at_with_mode(
+			spec,
+			presentation,
+			claims,
+			site,
+			worker_name,
+			ExecutionMode::Parallel,
+		)
+	}
+
+	/// Registers an externally supervised declaration at a placement with
+	/// scheduling metadata.
+	pub fn register_worker_at_with_mode(
+		&mut self,
+		spec: ToolSpec,
+		presentation: Presentation,
+		claims: Claims,
+		site: WorkerSiteKind,
+		worker_name: Str,
+		execution: ExecutionMode,
 	) -> Result<(), RegistryError> {
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
@@ -1977,6 +2069,7 @@ impl Registry {
 			}),
 			presentation,
 			claims,
+			execution,
 		};
 		self.insert(name, rev, entry)
 	}
@@ -2129,6 +2222,24 @@ impl Registry {
 			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))
 	}
 
+	/// Returns the batch scheduling constraint of the resolved live tool.
+	pub fn execution_mode(&self, name: &str) -> Result<ExecutionMode, RegistryError> {
+		if let Ok(entry) = self.live_entry(name) {
+			return Ok(entry.execution);
+		}
+		let state = self.host_tools.read();
+		let claimant = state
+			.live
+			.get(name)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		state
+			.rosters
+			.get(claimant)
+			.and_then(|roster| roster.entries.get(name))
+			.map(|entry| entry.execution)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))
+	}
+
 	/// Resolves a typed device path without admitting it to the model slot
 	/// catalog.
 	///
@@ -2207,11 +2318,15 @@ impl Registry {
 					name,
 					rev: &claim.rev,
 					claimant: &claim.claimant,
+					precedence: claim.precedence,
 					summary: &entry.tool.spec().description,
 					schema: entry.tool.spec().schema.as_ref(),
 					effects: &entry.tool.spec().effects,
 					docs: None,
 					route: entry.tool.route(),
+					metadata: self
+						.device_metadata
+						.get(&(name.clone(), claim.claimant.clone())),
 				})
 		})
 	}

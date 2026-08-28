@@ -75,23 +75,28 @@ pub struct InvocationSendError;
 /// (serde re-serialization drops whitespace and normalizes escapes), and the
 /// recovery layer may repair a sloppy stream into a valid document. A
 /// cosmetic difference must not reject the invocation: the commitment is
-/// accepted when both sides parse to the same JSON document, or when only
-/// the commitment parses (a repaired stream, where the commitment is
-/// authoritative). A freeform grammar call streams raw text that recovery
+/// accepted when both sides parse to the same tolerant JSON document. A
+/// structurally incomplete stream never yields to a repaired commitment:
+/// finalization must reject it before effects are authorized. A freeform
+/// grammar call streams raw text that recovery
 /// canonicalizes into `{"input": <text>}`; the commitment is accepted when
 /// its `input` property is exactly the streamed text, even if that text
 /// happens to parse as JSON. Two documents with different values remain a
 /// protocol violation.
 fn commit_supersedes_stream(streamed: &str, committed: &str) -> bool {
-	let Ok(committed) = serde_json::from_str::<serde_json::Value>(committed) else {
+	let Ok(committed_doc) = serde_json::from_str::<serde_json::Value>(committed) else {
 		return false;
 	};
-	if committed.get("input").and_then(serde_json::Value::as_str) == Some(streamed) {
+	if committed_doc
+		.get("input")
+		.and_then(serde_json::Value::as_str)
+		== Some(streamed)
+	{
 		return true;
 	}
-	match serde_json::from_str::<serde_json::Value>(streamed) {
-		Ok(streamed) => streamed == committed,
-		Err(_) => true,
+	match (omp_slopjson::parse(streamed), omp_slopjson::parse(committed)) {
+		(Ok(streamed), Ok(committed)) => streamed == committed,
+		_ => false,
 	}
 }
 
@@ -1322,13 +1327,27 @@ mod tests {
 	fn repaired_commitment_supersedes_a_sloppy_stream() {
 		let (feed, mut params) = IncomingParams::channel();
 		feed
-			.arg_text(sf!(r#"{{"path":"crates"#))
+			.arg_text(sf!("{{path:'crates',}}"))
 			.expect("fragment remains connected");
 		feed
 			.args_committed(sf!(r#"{{"path":"crates"}}"#))
 			.expect("commit remains connected");
 		let raw = block_on(params.committed()).expect("repaired commitment is authoritative");
 		assert_eq!(raw.as_str(), r#"{"path":"crates"}"#);
+	}
+
+	#[test]
+	fn truncated_stream_cannot_be_superseded_by_repaired_commitment() {
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.arg_text(sf!(r#"{{"command":"echo never","i":"Truncated"#))
+			.expect("fragment remains connected");
+		feed
+			.args_committed(sf!(r#"{{"command":"echo never"}}"#))
+			.expect("commit remains connected");
+		let error = block_on(params.committed()).expect_err("truncated stream must be rejected");
+		assert!(matches!(error, CommitError::Protocol(message)
+			if message.contains("committed arguments differ")));
 	}
 
 	#[test]

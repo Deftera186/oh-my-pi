@@ -34,13 +34,13 @@ pub use omp_proto::inference::v1::Fallback;
 use omp_proto::{inference::v1::InvokeInput, policy::v1};
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
-	AvailabilityDelta, Claim, Claims, ConstraintDisposition, DeviceTarget, ErasedEv, ErasedOutcome,
-	ErasedStream, GoalToolState, HostToolExecutor, HostToolInvocation, HostToolResult, HostToolSpec,
-	HostToolUpdateSink, InclusionPolicy, LeafCatalogSnapshot, LeafOwner, LeafReplacementError,
-	LeafReplacementRegistry, LeafVersion, LoweredTool, LoweringCaps, MemoryToolState, MountedDevice,
-	Precedence, ProjectedCall, ProjectedVerdict, ProjectionKey, ProjectionRequest, PublishedLeaf,
-	Registry, RegistryError, RegistryLeaf, ShadowClaim, ToolPromptEntry, ToolPromptProjection,
-	ToolRoute, WorkerSiteKind,
+	AvailabilityDelta, Claim, Claims, ConstraintDisposition, DeviceMetadata, DeviceTarget, ErasedEv,
+	ErasedOutcome, ErasedStream, GoalToolState, HostToolExecutor, HostToolInvocation,
+	HostToolResult, HostToolSpec, HostToolUpdateSink, InclusionPolicy, LeafCatalogSnapshot,
+	LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion, LoweredTool,
+	LoweringCaps, MemoryToolState, MountedDevice, Precedence, ProjectedCall, ProjectedVerdict,
+	ProjectionKey, ProjectionRequest, PublishedLeaf, Registry, RegistryError, RegistryLeaf,
+	ShadowClaim, ToolPromptEntry, ToolPromptProjection, ToolRoute, WorkerSiteKind,
 };
 use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize, de, de::DeserializeOwned};
@@ -132,6 +132,30 @@ pub enum ToolsPolicy {
 	DeviceOnly,
 	/// Advertise only tool slots.
 	ToolOnly,
+}
+
+/// Batch scheduling constraint declared by one tool revision.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ExecutionMode {
+	/// Calls may execute concurrently with sibling calls.
+	#[default]
+	Parallel,
+	/// Any batch containing this tool executes in issued order.
+	Sequential,
 }
 
 /// One argument-dialect revision within a revision family.

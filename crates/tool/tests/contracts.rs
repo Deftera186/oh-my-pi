@@ -2,6 +2,7 @@
 //! history.
 
 use std::{
+	collections::BTreeSet,
 	future::{Future, ready},
 	io::{self, Write},
 	sync,
@@ -302,23 +303,43 @@ fn worker_spec(name: &str, projection_code: [u8; 32]) -> ToolSpec {
 		projection_code,
 	}
 }
-fn assert_worker_declarations_are_not_advertised(registry: &Registry, names: &[Str]) {
+fn assert_worker_declaration_projection(
+	registry: &Registry,
+	slot: &str,
+	device: &str,
+	hidden: &str,
+) {
 	let caps = LoweringCaps {
 		strict_schema:  false,
 		grammar:        GrammarBits::empty(),
 		maximum_tools:  None,
 		maximum_strict: None,
 	};
-	assert!(registry.advertise(caps).unwrap().is_empty());
-	assert!(registry.advertise_selected(caps, names).unwrap().is_empty());
-	assert!(registry.prompt_projection(None).entries().next().is_none());
-	assert!(
-		registry
-			.prompt_projection(Some(names))
-			.entries()
-			.next()
-			.is_none()
-	);
+	let advertised = registry.advertise(caps).unwrap();
+	assert_eq!(advertised.len(), 1);
+	assert_eq!(advertised[0].identity.name, slot);
+
+	let selected = [Str::new(slot), Str::new(device), Str::new(hidden)];
+	let selected_names = registry
+		.advertise_selected(caps, &selected)
+		.unwrap()
+		.into_iter()
+		.map(|tool| tool.identity.name)
+		.collect::<BTreeSet<_>>();
+	assert_eq!(selected_names, BTreeSet::from([Str::new(slot), Str::new(hidden)]));
+
+	let projection = registry.prompt_projection(None);
+	let prompt_names = projection
+		.entries()
+		.map(|tool| tool.name.as_str())
+		.collect::<BTreeSet<_>>();
+	assert_eq!(prompt_names, BTreeSet::from([slot]));
+	let selected_projection = registry.prompt_projection(Some(&selected));
+	let selected_prompt_names = selected_projection
+		.entries()
+		.map(|tool| tool.name.as_str())
+		.collect::<BTreeSet<_>>();
+	assert_eq!(selected_prompt_names, BTreeSet::from([slot, hidden]));
 }
 
 #[test]
@@ -484,7 +505,7 @@ fn slot_and_device_hashes_track_distinct_projection_domains() {
 }
 
 #[test]
-fn worker_device_is_catalogued_without_consuming_a_model_slot() {
+fn worker_presentations_partition_device_catalog_and_model_slots() {
 	let mut registry = Registry::new();
 	let empty_slots = registry.slot_hash();
 	let empty_devices = registry.device_hash();
@@ -510,13 +531,14 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 		)
 		.unwrap();
 
-	assert_eq!(registry.slot_hash(), empty_slots);
+	assert_ne!(registry.slot_hash(), empty_slots);
 	assert_ne!(registry.device_hash(), empty_devices);
-	assert_worker_declarations_are_not_advertised(&registry, &[
-		sf!("catalogued"),
-		sf!("catalogued_slot"),
-		sf!("catalogued_hidden"),
-	]);
+	assert_worker_declaration_projection(
+		&registry,
+		"catalogued_slot",
+		"catalogued",
+		"catalogued_hidden",
+	);
 	assert!(matches!(
 		registry.route("catalogued").unwrap(),
 		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
@@ -541,7 +563,7 @@ fn worker_device_is_catalogued_without_consuming_a_model_slot() {
 }
 
 #[test]
-fn worker_slots_are_catalogued_without_consuming_model_slots() {
+fn worker_slots_are_model_callable_while_devices_stay_catalog_only() {
 	let mut registry = Registry::new();
 	registry
 		.register(
@@ -572,11 +594,7 @@ fn worker_slots_are_catalogued_without_consuming_model_slots() {
 		)
 		.unwrap();
 
-	assert_worker_declarations_are_not_advertised(&registry, &[
-		sf!("worker_slot"),
-		sf!("worker_device"),
-		sf!("worker_hidden"),
-	]);
+	assert_worker_declaration_projection(&registry, "worker_slot", "worker_device", "worker_hidden");
 	assert!(matches!(
 		registry.route("worker_slot").unwrap(),
 		omp_tool::ToolRoute::Worker { site: omp_tool::WorkerSiteKind::Env, name }
@@ -2106,6 +2124,22 @@ impl RenderFold for CountRender {
 	}
 }
 
+struct LabeledRender(&'static str);
+
+impl RenderFold for LabeledRender {
+	type Outcome = serde_json::Value;
+	type State = usize;
+	type Update = CountUpdate;
+
+	fn fold(&self, state: &mut Self::State, update: Self::Update) {
+		*state += update.count;
+	}
+
+	fn view(&self, state: &Self::State, _outcome: Option<&Self::Outcome>) -> Option<Str> {
+		Some(sf!("{}={state}", self.0))
+	}
+}
+
 #[test]
 fn policy_denied_abort_round_trips_and_missing_fields_keep_legacy_abort_kind() {
 	type Outcome = CallOutcome<serde_json::Value, serde_json::Value>;
@@ -2176,6 +2210,57 @@ fn renderers_are_exact_revision_cached_and_fall_back_without_name_lookup() {
 		.unwrap();
 	assert_eq!(renderers.view(&unknown, &fallback, None).unwrap(), r#"{"progress":7}"#,);
 	assert_eq!(fallback.raw_update_count(), 1);
+}
+
+#[test]
+fn extension_renderers_fill_exact_revisions_decorate_native_and_replay() {
+	let native = ToolIdentity { name: sf!("counter"), rev: Rev { family: sf!("counter"), n: 1 } };
+	let extension = ToolIdentity {
+		name: native.name.clone(),
+		rev:  Rev { family: native.rev.family.clone(), n: 2 },
+	};
+	let decoration_only = ToolIdentity {
+		name: native.name.clone(),
+		rev:  Rev { family: native.rev.family.clone(), n: 3 },
+	};
+	let mut renderers = RenderRegistry::new();
+	renderers
+		.register(native.clone(), LabeledRender("native"))
+		.unwrap();
+	assert!(
+		!renderers
+			.register_extension(native.clone(), LabeledRender("replacement"), false)
+			.unwrap(),
+		"an extension base must not replace a native exact-revision fold",
+	);
+	assert!(
+		renderers
+			.register_extension(native.clone(), LabeledRender(";decorated"), true)
+			.unwrap(),
+	);
+	assert!(
+		renderers
+			.register_extension(extension.clone(), LabeledRender("extension"), false)
+			.unwrap(),
+	);
+	assert!(
+		renderers
+			.register_extension(decoration_only.clone(), LabeledRender(";decoration-only"), true,)
+			.unwrap(),
+	);
+
+	let update = Bytes::from_static(br#"{"count":4}"#);
+	assert_eq!(renderers.replay(&native, [update.clone()], None).unwrap(), "native=4;decorated=4",);
+	assert_eq!(
+		renderers
+			.replay(&extension, [update.clone()], None)
+			.unwrap(),
+		"extension=4",
+	);
+	assert_eq!(
+		renderers.replay(&decoration_only, [update], None).unwrap(),
+		r#"{"count":4};decoration-only=4"#,
+	);
 }
 
 #[test]
