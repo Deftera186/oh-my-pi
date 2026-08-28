@@ -252,6 +252,17 @@ pub enum AgentEvent {
 		/// Stable detached-job identifier.
 		job_id: Str,
 	},
+	/// Durable history was rewritten (rewind or reset) and journal-derived
+	/// state was reconciled to the new live prefix.
+	HistoryRewritten {
+		/// Retained physical event; `None` when rewound to the root.
+		to:            Option<u64>,
+		/// New journal head after the rewrite marker.
+		head:          u64,
+		/// Loop-owned job ids the JobBoard could not cancel itself; the
+		/// composition layer escalates these to its session supervisor.
+		escalate_jobs: Vec<Str>,
+	},
 	/// The loop reached an error that is visible to hosts.
 	Failed {
 		/// Logical turn involved, when failure occurred within a turn.

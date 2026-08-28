@@ -47,9 +47,9 @@ use crate::{
 	events::EventBus,
 	journal_kinds::{
 		CHECKPOINT_KIND, CORE_EXTENSION, CORE_REVISION, EntryKindDecl, EntryKindError,
-		EntryKindRegistry, REGIME_FACT_KIND, REGIME_RECORD_KIND, REWIND_REPORT_KIND,
+		EntryKindRegistry, REGIME_FACT_KIND, REGIME_RECORD_KIND, REWIND_REPORT_KIND, TODO_EDIT_KIND,
 		TTSR_INJECTION_KIND, core_checkpoint_declarations, core_regime_declarations,
-		core_ttsr_declaration,
+		core_todo_declaration, core_ttsr_declaration,
 	},
 	project,
 	prompt::PromptHash,
@@ -2746,10 +2746,11 @@ impl Journal {
 			started_at: u64,
 		}
 
-		self.append_core_checkpoint_entry(
+		self.append_core_entry(
 			ts,
 			token,
 			CHECKPOINT_KIND,
+			core_checkpoint_declarations(),
 			serde_json::value::to_raw_value(&Checkpoint { token, goal, started_at })
 				.map_err(transcript::Error::from)?,
 		)
@@ -2773,10 +2774,11 @@ impl Journal {
 			rewound_at: u64,
 		}
 
-		self.append_core_checkpoint_entry(
+		self.append_core_entry(
 			rewound_at,
 			token,
 			REWIND_REPORT_KIND,
+			core_checkpoint_declarations(),
 			serde_json::value::to_raw_value(&RewindReport {
 				token,
 				goal,
@@ -2788,15 +2790,33 @@ impl Journal {
 		)
 	}
 
-	fn append_core_checkpoint_entry(
+	/// Appends the durable snapshot of a user-driven todo edit.
+	pub fn todo_edit(&mut self, ts: u64, phases: &RawValue) -> Result<u64, JournalError> {
+		#[derive(Serialize)]
+		struct TodoEdit<'a> {
+			phases: &'a RawValue,
+		}
+
+		let unique = omp_core::Ulid::generate().to_string();
+		self.append_core_entry(
+			ts,
+			&unique,
+			TODO_EDIT_KIND,
+			vec![core_todo_declaration()],
+			serde_json::value::to_raw_value(&TodoEdit { phases }).map_err(transcript::Error::from)?,
+		)
+	}
+
+	fn append_core_entry(
 		&mut self,
 		ts: u64,
-		token: &str,
+		uniquifier: &str,
 		kind: &'static str,
+		declarations: Vec<EntryKindDecl>,
 		data: Box<RawValue>,
 	) -> Result<u64, JournalError> {
-		self.declare_entry_kinds(CORE_EXTENSION, core_checkpoint_declarations())?;
-		let request_id = sf!("{kind}-{token}");
+		self.declare_entry_kinds(CORE_EXTENSION, declarations)?;
+		let request_id = sf!("{kind}-{uniquifier}");
 		let reply = self.handle_request(JournalRequest {
 			ts,
 			stamp: JournalRequestStamp {
@@ -3557,6 +3577,12 @@ impl Journal {
 	/// Iterates detached jobs still awaiting settlement without allocating.
 	pub fn pending_jobs(&self) -> impl Iterator<Item = &JobRef> {
 		self.pending_jobs.values().map(|(_, job)| job)
+	}
+
+	/// Iterates detached jobs still awaiting settlement together with their
+	/// durable registration event indexes, without allocating.
+	pub fn pending_jobs_with_events(&self) -> impl Iterator<Item = (u64, &JobRef)> {
+		self.pending_jobs.values().map(|(index, job)| (*index, job))
 	}
 
 	/// Appends a later event assigning a arbiter sequence to an item event.

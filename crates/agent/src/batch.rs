@@ -20,7 +20,7 @@ use omp_proto::{
 		v1,
 		v1::{self as value_pb, value},
 	},
-	policy::v1::EffectEnvelope,
+	policy::v1::{EffectEnvelope, PolicyDenied as WirePolicyDenied},
 	thread::v1::{Item, Part as CanonicalPart},
 	toolhost::v1::HookEventId,
 };
@@ -33,7 +33,7 @@ use tokio::{sync::Notify, task, time};
 
 use crate::{
 	events::{AgentEvent, EventBus, EventProvenance, EventVisibility},
-	hooks::{HookGate, notify_json},
+	hooks::{GateEvent, GateOutcome, HookGate, notify_json},
 	project::{tool_result_item, tool_result_item_canonical_parts},
 };
 
@@ -123,6 +123,147 @@ fn tool_target(identity: &ToolIdentity, args: &[u8]) -> Value {
 	})
 }
 
+fn hook_policy_denied(
+	query: &AdmitInvocation,
+	reason: Str,
+	policy: Option<Arc<omp_tool::PolicyDenied>>,
+) -> Admission {
+	let policy = policy
+		.map(Arc::unwrap_or_clone)
+		.unwrap_or_else(|| omp_tool::PolicyDenied {
+			reason:      reason.clone(),
+			code:        Some(sf!("hook_denied")),
+			decision_id: Str::from(omp_core::Ulid::generate().to_string()),
+			rules:       Arc::from([]),
+		});
+	Admission {
+		invocation_id: query.invocation_id.clone(),
+		allow: false,
+		denied: Some(WirePolicyDenied {
+			reason: policy.reason.to_string(),
+			code: policy
+				.code
+				.map_or_else(String::new, |code| code.to_string()),
+			decision_id: policy.decision_id.to_string(),
+			rules: policy.rules.iter().map(ToString::to_string).collect(),
+			..WirePolicyDenied::default()
+		}),
+		..Admission::default()
+	}
+}
+
+async fn gate_tool_call(
+	gate: &HookGate,
+	query: &AdmitInvocation,
+	identity: &ToolIdentity,
+	raw_args: &[u8],
+) -> InvocationAdmission {
+	if !gate.subscribed(HookEventId::HookEventToolCall) {
+		return InvocationAdmission {
+			admission: allowed_admission(query),
+			effects:   Effects::empty(),
+		};
+	}
+	let args = serde_json::from_slice::<Value>(raw_args)
+		.ok()
+		.filter(Value::is_object)
+		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+	let requested_args = args.clone();
+	let payload = serde_json::json!({
+		"call_id": query.invocation_id,
+		"invocation_id": query.invocation_id,
+		"target": tool_target(identity, raw_args),
+		"kind": target_kind(identity),
+		"args": args,
+		"raw_args": {
+			"$bytes": omp_core::base64::encode(raw_args),
+		},
+		"repaired": false,
+		"turn_id": "",
+		"session_id": "",
+		"cwd": ".",
+		"origin": "model",
+		"batch": [],
+		"deadline": Value::Null,
+		"bash": Value::Null,
+	});
+	let encoded = match serde_json::to_vec(&payload) {
+		Ok(encoded) => encoded,
+		Err(_) => {
+			return InvocationAdmission {
+				admission: hook_policy_denied(
+					query,
+					sf!("tool_call hook payload serialization failed"),
+					None,
+				),
+				effects:   Effects::empty(),
+			};
+		},
+	};
+	match gate
+		.gate(
+			HookEventId::HookEventToolCall,
+			GateEvent::new(identity.name.clone(), Bytes::from(encoded)),
+		)
+		.await
+	{
+		GateOutcome::Allow { event, .. } => {
+			let Some(args) = serde_json::from_slice::<Value>(&event.effective_args)
+				.ok()
+				.and_then(|payload| payload.get("args").cloned())
+				.filter(Value::is_object)
+			else {
+				return InvocationAdmission {
+					admission: hook_policy_denied(
+						query,
+						sf!("tool_call hook returned malformed arguments"),
+						None,
+					),
+					effects:   Effects::empty(),
+				};
+			};
+			let patch = if args == requested_args {
+				Bytes::new()
+			} else {
+				match serde_json::to_vec(&args) {
+					Ok(args) => Bytes::from(args),
+					Err(_) => {
+						return InvocationAdmission {
+							admission: hook_policy_denied(
+								query,
+								sf!("tool_call hook arguments could not be encoded"),
+								None,
+							),
+							effects:   Effects::empty(),
+						};
+					},
+				}
+			};
+			InvocationAdmission {
+				admission: Admission {
+					invocation_id: query.invocation_id.clone(),
+					allow: true,
+					args_patch: patch,
+					..Admission::default()
+				},
+				effects:   Effects::empty(),
+			}
+		},
+		GateOutcome::Deny { reason, policy, .. } => InvocationAdmission {
+			admission: hook_policy_denied(query, reason, policy),
+			effects:   Effects::empty(),
+		},
+		GateOutcome::Approval { .. } => InvocationAdmission {
+			admission: hook_policy_denied(
+				query,
+				sf!("tool_call hook requires unavailable approval"),
+				None,
+			),
+			effects:   Effects::empty(),
+		},
+	}
+}
+
 fn outcome_kind(
 	outcome: Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
 ) -> &'static str {
@@ -170,6 +311,9 @@ pub enum BatchError {
 	/// The invocation hook bus was already installed.
 	#[error("canonical tool result failed: invocation hook bus already set")]
 	HookBusAlreadySet,
+	/// The invocation catalog hook gate was already installed.
+	#[error("canonical tool result failed: invocation catalog hook gate already set")]
+	HookGateAlreadySet,
 	/// The invocation effect maximum was already installed.
 	#[error("canonical tool result failed: invocation effect maximum already set")]
 	EffectMaximumAlreadySet,
@@ -404,6 +548,7 @@ struct InvocationPump {
 	commands:        flume::Sender<PumpCommand>,
 	outputs:         Receiver<PumpOutput>,
 	hooks:           Arc<OnceLock<InvocationHookBus>>,
+	hook_gate:       Arc<OnceLock<Option<Arc<HookGate>>>>,
 	maximum_effects: Arc<OnceLock<Effects>>,
 	maximum_ready:   Arc<Notify>,
 	admission:       Arc<OnceLock<Admission>>,
@@ -411,7 +556,6 @@ struct InvocationPump {
 	facts:           Arc<OnceLock<flume::Sender<InvocationAdmissionFact>>>,
 	cancelled:       Arc<AtomicBool>,
 }
-
 impl InvocationPump {
 	async fn arg_text(&self, fragment: Str) -> Result<(), BatchError> {
 		let (ack, reply) = flume::bounded(1);
@@ -510,12 +654,15 @@ enum AuthorizationAction {
 fn spawn_invocation_pump(
 	mut invocation: Invocation,
 	call_id: Str,
+	identity: ToolIdentity,
 	events: EventBus,
 ) -> InvocationPump {
 	let (commands, command_rx) = flume::unbounded();
 	let (output_tx, outputs) = flume::unbounded();
 	let hooks: Arc<OnceLock<InvocationHookBus>> = Arc::new(OnceLock::new());
 	let task_hooks = Arc::clone(&hooks);
+	let hook_gate: Arc<OnceLock<Option<Arc<HookGate>>>> = Arc::new(OnceLock::new());
+	let task_hook_gate = Arc::clone(&hook_gate);
 	let maximum_effects: Arc<OnceLock<Effects>> = Arc::new(OnceLock::new());
 	let task_maximum_effects = Arc::clone(&maximum_effects);
 	let maximum_ready = Arc::new(Notify::new());
@@ -564,6 +711,16 @@ fn spawn_invocation_pump(
 							effects,
 							ack,
 						} => {
+							if task_hook_gate
+								.get()
+								.and_then(Option::as_deref)
+								.is_some_and(|gate| gate.subscribed(HookEventId::HookEventToolCall))
+								&& args_text.as_str().as_bytes() != raw.as_ref()
+								&& let Ok(committed) = std::str::from_utf8(&raw)
+							{
+								args_text.truncate(0);
+								args_text.push_str(committed);
+							}
 							let action = {
 								let sent = invocation.commit_args(
 									raw,
@@ -638,11 +795,19 @@ fn spawn_invocation_pump(
 							}
 							task_maximum_ready.notified().await;
 						};
-						let decision = match task_hooks.get() {
-							Some(hooks) => hooks.admit(query.clone(), maximum.clone()).await,
-							None => InvocationAdmission {
-								admission: allowed_admission(&query),
-								effects: maximum,
+						let decision = match task_hook_gate.get().and_then(Option::as_deref) {
+							Some(gate) => {
+								let mut decision =
+									gate_tool_call(gate, &query, &identity, args_text.as_str().as_bytes()).await;
+								decision.effects = if decision.admission.allow { maximum } else { Effects::empty() };
+								decision
+							},
+							None => match task_hooks.get() {
+								Some(hooks) => hooks.admit(query.clone(), maximum.clone()).await,
+								None => InvocationAdmission {
+									admission: allowed_admission(&query),
+									effects: maximum,
+								},
 							},
 						};
 						let _ = task_admission.set(decision.admission.clone());
@@ -699,6 +864,7 @@ fn spawn_invocation_pump(
 		commands,
 		outputs,
 		hooks,
+		hook_gate,
 		maximum_effects,
 		maximum_ready,
 		admission,
@@ -769,7 +935,8 @@ impl SpeculativeCall {
 			name:    identity.name.clone(),
 			rev:     identity.rev.clone(),
 		});
-		let pump = spawn_invocation_pump(invocation, call_id.clone(), events.clone());
+		let pump =
+			spawn_invocation_pump(invocation, call_id.clone(), identity.clone(), events.clone());
 		Ok(Self {
 			inner: Some(SpeculativeCallInner {
 				call_id,
@@ -806,6 +973,10 @@ impl SpeculativeCall {
 			.hooks
 			.set(hooks)
 			.map_err(|_| BatchError::HookBusAlreadySet)?;
+		pump
+			.hook_gate
+			.set(hook_gate.clone())
+			.map_err(|_| BatchError::HookGateAlreadySet)?;
 		pump
 			.maximum_effects
 			.set(maximum_effects)
@@ -1827,6 +1998,75 @@ mod tests {
 				fragment: actual_fragment,
 			}) if actual_id == invocation_id && actual_fragment == fragment
 		));
+	}
+
+	#[tokio::test]
+	async fn tool_call_gate_denies_and_transforms_before_environment_admission() {
+		let query =
+			AdmitInvocation { invocation_id: String::from("hooked"), ..AdmitInvocation::default() };
+		let tool = identity("bash");
+		let (deny_gate, deny_dispatches) = HookGate::delegated_channel();
+		deny_gate.replace_union_mask(hook_event_mask(HookEventId::HookEventToolCall));
+		let deny_driver = async {
+			let dispatch = deny_dispatches.recv_async().await.expect("deny dispatch");
+			deny_gate
+				.answer(dispatch.dispatch_id, vec![(
+					0,
+					crate::hooks::GateDecision::Deny(sf!("blocked by hook")),
+				)])
+				.expect("answer deny");
+		};
+		let (denied, ()) = tokio::join!(
+			gate_tool_call(&deny_gate, &query, &tool, br#"{"command":"original"}"#),
+			deny_driver,
+		);
+		assert!(!denied.admission.allow);
+		assert_eq!(
+			denied
+				.admission
+				.denied
+				.as_ref()
+				.map(|denial| denial.reason.as_str()),
+			Some("blocked by hook"),
+		);
+
+		let (modify_gate, modify_dispatches) = HookGate::delegated_channel();
+		modify_gate.replace_union_mask(hook_event_mask(HookEventId::HookEventToolCall));
+		let modify_driver = async {
+			let dispatch = modify_dispatches
+				.recv_async()
+				.await
+				.expect("modify dispatch");
+			let separator = dispatch
+				.payload
+				.iter()
+				.position(|byte| *byte == b'\n')
+				.expect("gate event separator");
+			let mut payload =
+				serde_json::from_slice::<Value>(&dispatch.payload[separator + 1..]).expect("payload");
+			payload["args"]["command"] = Value::String(String::from("modified"));
+			modify_gate
+				.answer(dispatch.dispatch_id, vec![(
+					0,
+					crate::hooks::GateDecision::Modify(crate::hooks::HookPatch {
+						target: None,
+						args:   Some(Bytes::from(
+							serde_json::to_vec(&payload).expect("modified payload"),
+						)),
+					}),
+				)])
+				.expect("answer modify");
+		};
+		let (modified, ()) = tokio::join!(
+			gate_tool_call(&modify_gate, &query, &tool, br#"{"command":"original"}"#),
+			modify_driver,
+		);
+		assert!(modified.admission.allow);
+		assert_eq!(
+			serde_json::from_slice::<Value>(&modified.admission.args_patch).expect("argument patch")
+				["command"],
+			"modified",
+		);
 	}
 
 	#[tokio::test]

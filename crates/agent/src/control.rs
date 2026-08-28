@@ -148,6 +148,9 @@ pub enum ControlMailboxEvent {
 	Closed,
 	/// A journal-scoped command completed on the journal owner.
 	JournalHandled,
+	/// A journal reset committed on the journal owner; the agent owner must
+	/// reconcile journal-derived environment state.
+	HistoryReset,
 	/// A loop-scoped rewind is ready for boundary execution.
 	Rewind(ScheduledRewind),
 	/// A regime command requires mutable access to the agent arbiter.
@@ -850,6 +853,7 @@ impl ControlMailbox {
 		surfaced: &mut VecDeque<ScheduledRewind>,
 		regimes: &mut Vec<RegimeControl>,
 		projections: &mut Vec<flume::Sender<Result<omp_proto::thread::v1::Thread, ControlError>>>,
+		history_reset: &mut bool,
 	) -> usize {
 		let mut handled = 0;
 		while handled < limit {
@@ -860,6 +864,7 @@ impl ControlMailbox {
 				ControlMailboxEvent::Rewind(rewind) => surfaced.push_back(rewind),
 				ControlMailboxEvent::Regime(regime) => regimes.push(regime),
 				ControlMailboxEvent::ProjectThread { reply } => projections.push(reply),
+				ControlMailboxEvent::HistoryReset => *history_reset = true,
 				ControlMailboxEvent::Closed | ControlMailboxEvent::JournalHandled => {},
 			}
 			handled += 1;
@@ -973,7 +978,12 @@ fn handle_command(
 			return ControlMailboxEvent::ProjectThread { reply };
 		},
 		ControlCommand::Reset { ts, reply } => {
-			let _ = reply.send(journal.reset(ts));
+			let result = journal.reset(ts);
+			let applied = result.is_ok();
+			let _ = reply.send(result);
+			if applied {
+				return ControlMailboxEvent::HistoryReset;
+			}
 		},
 		ControlCommand::ProviderReset { ts, reply } => {
 			let _ = reply.send(journal.provider_reset(ts));

@@ -51,6 +51,7 @@ pub mod scheduler;
 mod state;
 pub mod streaming_edit_guard;
 mod subagent;
+mod todo_restore;
 pub mod tool_choice;
 mod tree;
 pub mod ttsr;

@@ -81,7 +81,7 @@ use crate::{
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
 	hooks::{HookGate, JsonGateOutcome, gate_json, notify_json},
-	jobs::JobBoard,
+	jobs::{CancelOutcome, JobBoard, JobError},
 	journal::{
 		AbortDisposition, ReplicationSubscription, TurnInputRecord, TurnOptionsRecord, TurnStart,
 	},
@@ -91,6 +91,7 @@ use crate::{
 	state::{
 		AgentState, ContextPromotionPolicy, MidTurnCompactionPolicy, SteeringMode, UnexpectedStopMode,
 	},
+	todo_restore::latest_todo_phases,
 	turn::Error as TurnError,
 };
 
@@ -98,6 +99,10 @@ const INTERRUPT_GRACE: omp_core::Duration =
 	omp_core::Duration::new(500, omp_core::DurationUnit::Milliseconds);
 const TOOL_DEADLINE: omp_core::Duration =
 	omp_core::Duration::new(300, omp_core::DurationUnit::Seconds);
+/// Grace given to background jobs cancelled because a rewind dropped their
+/// registration.
+const REWIND_JOB_GRACE: omp_core::Duration =
+	omp_core::Duration::new(5, omp_core::DurationUnit::Seconds);
 const CONTROL_DRAIN_LIMIT: usize = 32;
 const MEMORY_RECALL_QUERY_MAX_CHARS: usize = 32 * 1024;
 const UNEXPECTED_STOP_RETRY_CAP: u8 = 3;
@@ -897,6 +902,26 @@ mod wire_tool_choice {
 	}
 }
 
+/// Which flavor of history rewrite is awaiting reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryRewriteCause {
+	/// User- or extension-initiated rewind/reset: dropped job launches are
+	/// cancelled.
+	User,
+	/// Checkpoint-regime rewind: exploration jobs survive by design.
+	Checkpoint,
+}
+
+/// A journaled history rewrite whose environment-state reconciliation is
+/// still outstanding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingHistoryRewrite {
+	/// Retained physical event; `None` when rewound to the root or reset.
+	to:    Option<u64>,
+	/// Rewrite flavor driving the background-job policy.
+	cause: HistoryRewriteCause,
+}
+
 /// Durable agent loop composed from transport-neutral Phase 1 foundations.
 pub struct Agent<C: TurnClient> {
 	client: C,
@@ -916,6 +941,7 @@ pub struct Agent<C: TurnClient> {
 	tool_choices: ToolChoiceQueue,
 	waits: WaitSet,
 	pending_rewinds: VecDeque<ScheduledRewind>,
+	pending_history_rewrite: Option<PendingHistoryRewrite>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
 	jobs_restored: bool,
@@ -1030,6 +1056,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			tool_choices: ToolChoiceQueue::new(),
 			waits: WaitSet::default(),
 			pending_rewinds: VecDeque::new(),
+			pending_history_rewrite: None,
 			mailbox,
 			jobs,
 			jobs_restored: false,
@@ -1972,7 +1999,150 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.state.snapshot().registry.as_ref(),
 			&self.caps,
 		)?;
+		drop(journal);
+		self.pending_history_rewrite =
+			Some(PendingHistoryRewrite { to, cause: HistoryRewriteCause::User });
 		Ok(projected.items)
+	}
+
+	/// Settles a pending history rewrite: restores journal-derived environment
+	/// state, applies the background-job policy, and notifies observers.
+	///
+	/// No-op when no rewrite is outstanding. Environment failures are logged
+	/// and never returned; journal failures propagate.
+	pub async fn reconcile_history_rewrite(&mut self) -> Result<(), AgentError> {
+		let Some(PendingHistoryRewrite { to, cause }) = self.pending_history_rewrite else {
+			return Ok(());
+		};
+		let phases = latest_todo_phases(&self.journal)?;
+		self.restore_todo_slot(phases).await;
+		if !self.jobs_restored {
+			for job in self.journal.pending_jobs() {
+				self.jobs.register(job.clone());
+			}
+			self.jobs_restored = true;
+		}
+		let mut cancelled: Vec<Str> = Vec::new();
+		let mut escalate: Vec<Str> = Vec::new();
+		if cause == HistoryRewriteCause::User {
+			let dropped: Vec<Str> = {
+				let log = self.journal.load()?;
+				let live = log.as_ref();
+				self
+					.journal
+					.pending_jobs_with_events()
+					.filter(|(index, _)| !live.contains(*index))
+					.map(|(_, job)| job.id.clone())
+					.collect()
+			};
+			for id in dropped {
+				match self.jobs.cancel(&id, REWIND_JOB_GRACE).await {
+					Ok(CancelOutcome::Accepted) => cancelled.push(id),
+					Ok(CancelOutcome::AlreadySettled | CancelOutcome::Missing) => {},
+					Err(JobError::AgentLoopCancellation { .. }) => {
+						escalate.push(id.clone());
+						cancelled.push(id);
+					},
+					Err(error) => {
+						tracing::warn!(job = id.as_str(), %error, "rewind job cancellation failed");
+					},
+				}
+			}
+		}
+		let running: Vec<Str> = self
+			.journal
+			.pending_jobs()
+			.map(|job| job.id.clone())
+			.filter(|id| !cancelled.contains(id))
+			.collect();
+		if !running.is_empty() {
+			self.journal.append_optimistic(
+				now_ms(),
+				rewind_background_warning(running.len()),
+				self.prompt_hash,
+			)?;
+		}
+		let head = u64::try_from(self.journal.load()?.len().saturating_sub(1))
+			.expect("event indexes fit in u64");
+		notify_json(hook_pb::HookEventId::HookEventSessionRewound, self.hook_gate.as_deref(), || {
+			serde_json::json!({
+				"to_event": to,
+				"new_head": head,
+				"restored_workspace": false,
+				"running_jobs": running,
+				"cancelled_jobs": cancelled,
+			})
+		});
+		self
+			.events
+			.publish(AgentEvent::HistoryRewritten { to, head, escalate_jobs: escalate });
+		self.pending_history_rewrite = None;
+		Ok(())
+	}
+
+	/// Seeds resumed sessions with journal-derived environment state.
+	///
+	/// Todo restore only: `session_start{resumed}` already notifies
+	/// extensions, and job watchers lazily re-register on the next submit.
+	pub async fn restore_session_state(&mut self) -> Result<(), AgentError> {
+		let phases = latest_todo_phases(&self.journal)?;
+		self.restore_todo_slot(phases).await;
+		Ok(())
+	}
+
+	/// Journals the durable snapshot of a user-driven todo edit.
+	pub fn append_todo_edit(&mut self, phases: &RawValue) -> Result<u64, AgentError> {
+		Ok(self.journal.todo_edit(now_ms(), phases)?)
+	}
+
+	/// Drives one best-effort `todo@1` init restoring the journal-derived
+	/// snapshot; an absent snapshot clears the slot.
+	async fn restore_todo_slot(&self, phases: Option<serde_json::Value>) {
+		let list = phases.unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+		let Ok(args) = serde_json::to_vec(&serde_json::json!({"op": "init", "list": list})) else {
+			return;
+		};
+		let invocation_id = sf!("todo-restore-{}", omp_core::Ulid::generate());
+		let Ok(mut invocation) = self
+			.env
+			.invoke(InvokeTool {
+				invocation_id: invocation_id.to_string(),
+				name: "todo".to_owned(),
+				rev: "1".to_owned(),
+				..Default::default()
+			})
+			.await
+		else {
+			tracing::warn!("todo restore invocation was not accepted by the environment");
+			return;
+		};
+		if !matches!(invocation.next_event().await, Ok(Some(InvocationEvent::Accepted(_)))) {
+			tracing::warn!("todo restore invocation was not accepted by the environment");
+			return;
+		}
+		if invocation
+			.commit_args(Bytes::from(args), Bytes::from_static(b"todo-restore"), now_ms(), None)
+			.await
+			.is_err()
+		{
+			tracing::warn!("todo restore argument commit failed");
+			return;
+		}
+		loop {
+			match invocation.next_event().await {
+				Ok(Some(InvocationEvent::Verdict(verdict))) => {
+					if verdict.is_error {
+						tracing::warn!("todo restore invocation returned an error verdict");
+					}
+					return;
+				},
+				Ok(Some(_)) => {},
+				_ => {
+					tracing::warn!("todo restore invocation ended without a verdict");
+					return;
+				},
+			}
+		}
 	}
 
 	/// Lists live user messages from oldest to newest for rewind selection.
@@ -2022,6 +2192,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		};
 		let text = target.text;
 		let items = self.rewind(target.keep)?;
+		self.reconcile_history_rewrite().await?;
 		let item = Item {
 			seq:           0,
 			created_at_ms: now_ms(),
@@ -2151,6 +2322,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		items: impl IntoIterator<Item = Item>,
 		root_turn_id: TurnId,
 	) -> Result<AgentRunSummary, AgentError> {
+		self.reconcile_history_rewrite().await?;
 		let mut abort_generation = *self.abort_rx.borrow_and_update();
 		if !self.jobs_restored {
 			for job in self.journal.pending_jobs() {
@@ -2204,7 +2376,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.drain_control();
 			let idle_fold =
 				self.resolve_point(Point::Idle, self.point_cx(Some(root_turn_id.as_str())))?;
-			self.execute_scheduled_rewinds()?;
+			self.execute_scheduled_rewinds().await?;
 			let snapshot = self.state.snapshot();
 			let queued = self.mailbox.drain_steering(
 				DrainPoint::Idle,
@@ -2332,7 +2504,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.pending_reasoning_demotion = true;
 					abort_generation = *self.abort_rx.borrow_and_update();
 					self.drain_control();
-					self.execute_scheduled_rewinds()?;
+					self.execute_scheduled_rewinds().await?;
 					let snapshot = self.state.snapshot();
 					let drained = self.mailbox.drain_steering(
 						DrainPoint::Idle,
@@ -2766,6 +2938,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 								match event {
 									ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 									ControlMailboxEvent::JournalHandled => {},
+									ControlMailboxEvent::HistoryReset => {
+										self.pending_history_rewrite = Some(PendingHistoryRewrite {
+											to:    None,
+											cause: HistoryRewriteCause::User,
+										});
+									},
 									ControlMailboxEvent::ProjectThread { reply } => {
 										self.answer_project_thread(reply);
 									},
@@ -2925,7 +3103,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					},
 					AdvisorToolLoopAction::Continue => {},
 				}
-				if self.execute_scheduled_rewinds()? {
+				if self.execute_scheduled_rewinds().await? {
 					self.transition(AgentPhase::Idle);
 					return Ok(run_summary(Some(outcome), committed_turns, false));
 				}
@@ -2994,7 +3172,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			boundary = immediate;
 
 			self.drain_control();
-			if self.execute_scheduled_rewinds()? {
+			if self.execute_scheduled_rewinds().await? {
 				self.transition(AgentPhase::Idle);
 				return Ok(run_summary(Some(outcome), committed_turns, false));
 			}
@@ -3024,8 +3202,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				false,
 				u8::try_from(self.journal.trailing_aborts()).unwrap_or(u8::MAX),
 			);
-			if let Some(interrupt) = self.settled_continuation(&turn_id).await? {
-				let _ = self.mailbox.sender().try_enqueue(interrupt);
+			let settled = self.settled_continuation(&turn_id).await?;
+			if !settled.is_empty() {
+				for interrupt in settled {
+					let _ = self.mailbox.sender().try_enqueue(interrupt);
+				}
 				boundary = self.mailbox.drain_steering(
 					DrainPoint::Idle,
 					snapshot.defer_interrupts,
@@ -3239,7 +3420,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 	async fn settled_continuation(
 		&mut self,
 		turn_id: &TurnId<str>,
-	) -> Result<Option<Interrupt>, AgentError> {
+	) -> Result<Vec<Interrupt>, AgentError> {
 		let now = now_ms();
 		let mut builtins = SettledFold::new();
 		let (candidate, policy) =
@@ -3291,6 +3472,20 @@ impl<C: TurnClient + Clone> Agent<C> {
 			None,
 			&mut self.journal,
 		)?;
+		// Every committed SETTLE append is delivered in declaration resolution
+		// order; effects-only drafts open a boundary turn even without retry
+		// control. Items ride the ordinary mailbox drain + stage_interrupts
+		// journaling path — never a second durable source of truth.
+		let mut interrupts = settle_fold
+			.regime
+			.injects
+			.into_iter()
+			.map(|item| Interrupt {
+				class: InterruptClass::Immediate,
+				item,
+				source: InterruptSource::Continuation { owner: sf!("regime") },
+			})
+			.collect::<Vec<_>>();
 		if settle_fold.regime.control == ResolutionKind::Retry
 			&& matches!(candidate, Continuation::Settle)
 		{
@@ -3319,17 +3514,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 		if matches!(&candidate, Continuation::Continue { owner, .. } if owner == "loop") {
 			self.continuations.reset_for_user();
 		}
-		match self
+		if let Continuation::Continue { owner, item, .. } = self
 			.continuations
 			.decide_with_policy(candidate, now, policy)
 		{
-			Continuation::Continue { owner, item, .. } => Ok(Some(Interrupt {
+			interrupts.push(Interrupt {
 				class: InterruptClass::Immediate,
 				item,
 				source: InterruptSource::Continuation { owner },
-			})),
-			Continuation::Settle | Continuation::Refused { .. } => Ok(None),
+			});
 		}
+		Ok(interrupts)
 	}
 
 	fn stage_interrupts(
@@ -4131,6 +4326,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 					match event {
 						ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 						ControlMailboxEvent::JournalHandled => {},
+						ControlMailboxEvent::HistoryReset => {
+							self.pending_history_rewrite = Some(PendingHistoryRewrite {
+								to:    None,
+								cause: HistoryRewriteCause::User,
+							});
+						},
 						ControlMailboxEvent::ProjectThread { reply } => {
 							self.answer_project_thread(reply);
 						},
@@ -4208,6 +4409,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 							ControlMailboxEvent::JournalHandled => {
 								continue;
 							},
+							ControlMailboxEvent::HistoryReset => {
+								self.pending_history_rewrite = Some(PendingHistoryRewrite {
+									to:    None,
+									cause: HistoryRewriteCause::User,
+								});
+								continue;
+							},
 							ControlMailboxEvent::ProjectThread { reply } => {
 								self.answer_project_thread(reply);
 								continue;
@@ -4260,6 +4468,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 							match event {
 								ControlMailboxEvent::Closed => std::future::pending().await,
 								ControlMailboxEvent::JournalHandled => {
+									continue;
+								},
+								ControlMailboxEvent::HistoryReset => {
+									self.pending_history_rewrite = Some(PendingHistoryRewrite {
+										to:    None,
+										cause: HistoryRewriteCause::User,
+									});
 									continue;
 								},
 								ControlMailboxEvent::ProjectThread { reply } => {
@@ -4631,13 +4846,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 		}
 		let mut regimes = Vec::new();
 		let mut projections = Vec::new();
+		let mut history_reset = false;
 		self.control_mailbox.drain_ready(
 			&mut self.journal,
 			CONTROL_DRAIN_LIMIT,
 			&mut self.pending_rewinds,
 			&mut regimes,
 			&mut projections,
+			&mut history_reset,
 		);
+		if history_reset {
+			self.pending_history_rewrite =
+				Some(PendingHistoryRewrite { to: None, cause: HistoryRewriteCause::User });
+		}
 		for projection in projections {
 			self.answer_project_thread(projection);
 		}
@@ -5113,12 +5334,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 		}
 	}
 
-	fn execute_scheduled_rewinds(&mut self) -> Result<bool, AgentError> {
+	async fn execute_scheduled_rewinds(&mut self) -> Result<bool, AgentError> {
 		let mut executed = false;
 		while let Some(ScheduledRewind { token, target, report, goal, started_at }) =
 			self.pending_rewinds.pop_front()
 		{
 			self.rewind(Some(target))?;
+			self.pending_history_rewrite = Some(PendingHistoryRewrite {
+				to:    Some(target),
+				cause: HistoryRewriteCause::Checkpoint,
+			});
 			let rewound_at = now_ms();
 			self.journal.rewind_report(
 				token.as_str(),
@@ -5127,29 +5352,25 @@ impl<C: TurnClient + Clone> Agent<C> {
 				started_at,
 				rewound_at,
 			)?;
-			if !self.jobs.is_empty() {
-				self.journal.append_optimistic(
-					now_ms(),
-					rewind_background_warning(self.jobs.len()),
-					self.prompt_hash,
-				)?;
-			}
-			let mut state = self.checkpoint_state.lock();
-			if state
-				.active
-				.as_ref()
-				.is_some_and(|active| active.opaque_token == token)
 			{
-				state.active = None;
-				state.last_completed = Some(CompletedCheckpoint {
-					opaque_token: token,
-					goal,
-					report,
-					started_at,
-					rewound_at,
-				});
+				let mut state = self.checkpoint_state.lock();
+				if state
+					.active
+					.as_ref()
+					.is_some_and(|active| active.opaque_token == token)
+				{
+					state.active = None;
+					state.last_completed = Some(CompletedCheckpoint {
+						opaque_token: token,
+						goal,
+						report,
+						started_at,
+						rewound_at,
+					});
+				}
+				state.rewind_scheduled = false;
 			}
-			state.rewind_scheduled = false;
+			self.reconcile_history_rewrite().await?;
 			executed = true;
 		}
 		Ok(executed)
