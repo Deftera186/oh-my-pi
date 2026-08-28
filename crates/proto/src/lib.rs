@@ -38,6 +38,8 @@ pub use prost;
 pub mod bounds;
 /// Serde adapters rendering protobuf byte fields as lossless text.
 pub mod bytes_text;
+/// JSON projections of `omp.inference.v1.Value` trees.
+pub mod value_json;
 
 /// Current wire-visible protobuf schema revision.
 ///
