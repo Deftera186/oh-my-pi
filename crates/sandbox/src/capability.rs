@@ -32,6 +32,10 @@ pub enum Backend {
 	#[strum(serialize = "gvisor")]
 	#[serde(rename = "gvisor")]
 	Gvisor,
+	/// Linux Landlock filesystem and seccomp confinement.
+	#[strum(serialize = "landlock")]
+	#[serde(rename = "landlock")]
+	Landlock,
 	/// Disposable Docker storage with the default runtime.
 	#[strum(serialize = "docker-ephemeral")]
 	#[serde(rename = "docker-ephemeral")]
@@ -337,6 +341,7 @@ const BUBBLEWRAP: CapabilitySet = set(&[
 	Capability::NetDisable,
 	Capability::NetEnable,
 ]);
+const LANDLOCK: CapabilitySet = crate::backends::landlock::capabilities();
 const GVISOR: CapabilitySet = set(&[
 	Capability::NetDisable,
 	Capability::NetEnable,
@@ -394,6 +399,7 @@ impl Backend {
 			Self::Seatbelt => SEATBELT,
 			Self::Bubblewrap => BUBBLEWRAP,
 			Self::Gvisor => GVISOR,
+			Self::Landlock => LANDLOCK,
 			Self::DockerEphemeral => DOCKER,
 			Self::DockerRunscEphemeral => DOCKER_RUNSC,
 			Self::AppContainer => APP_CONTAINER,
@@ -408,6 +414,7 @@ impl Backend {
 			Self::DockerEphemeral,
 			Self::DockerRunscEphemeral,
 			Self::Gvisor,
+			Self::Landlock,
 			Self::Seatbelt,
 		]
 		.into_iter()

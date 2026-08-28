@@ -10,12 +10,13 @@ use std::{
 #[cfg(target_os = "linux")]
 use omp_core::CowBytes;
 
-#[cfg(target_os = "linux")]
 use crate::SandboxOperation;
 use crate::{
 	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
 	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
-	WriteMode, paths::path_under_any, runner::COMMAND_WRAPPER_PLACEHOLDER,
+	WriteMode,
+	paths::{insert_path, path_under_any, temp_roots},
+	runner::COMMAND_WRAPPER_PLACEHOLDER,
 };
 
 pub(crate) const FILE_MASK_PLACEHOLDER: &str = "@omp-bwrap-file-mask@";
@@ -35,40 +36,49 @@ pub(crate) fn compile(
 		unavailable = unavailable.union(CapabilitySet::one(Capability::FsReadDeny));
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsReadDeny));
 	}
-	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
-	if has_future_write_deny {
-		unavailable = unavailable.union(CapabilitySet::one(Capability::FsWriteDeny));
-		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
-	}
-	if spec.degradation == DegradationPolicy::Reject && !unavailable.is_empty() {
-		return Err(SandboxError::BackendCapabilities {
-			backend: Backend::Bubblewrap,
-			missing: unavailable,
-		});
+	if spec.degradation == DegradationPolicy::Reject {
+		let fatal = unavailable.difference(spec.tolerated);
+		if !fatal.is_empty() {
+			return Err(SandboxError::BackendCapabilities {
+				backend: Backend::Bubblewrap,
+				missing: fatal,
+			});
+		}
 	}
 
 	if !spec.unix_sockets.is_empty() {
 		enforced = enforced.difference(CapabilitySet::one(Capability::IpcRestrict));
 	}
+	if spec.network == NetworkMode::Outbound {
+		enforced = enforced
+			.difference(CapabilitySet::one(Capability::NetOutbound))
+			.union(CapabilitySet::one(Capability::NetEnable));
+	}
 	if spec.degradation == DegradationPolicy::AllowCaveats {
-		if spec.network == NetworkMode::Outbound {
-			enforced = enforced.union(CapabilitySet::one(Capability::NetDisable));
-		}
 		if spec.write == WriteMode::Ephemeral {
 			enforced = enforced.union(CapabilitySet::one(Capability::FsWriteDeny));
 		}
 	}
 
 	let launcher = launcher();
-	let mut argv = vec![
-		launcher,
-		OsString::from("--die-with-parent"),
-		OsString::from("--new-session"),
-		OsString::from("--unshare-all"),
-		OsString::from("--preserve-fds"),
-		OsString::from("1"),
-	];
-	if spec.network == NetworkMode::Enabled {
+	let seccomp_helper = (spec.network == NetworkMode::Disabled && spec.unix_sockets.is_empty())
+		.then(|| {
+			env::current_exe().map_err(|source| SandboxError::BackendIo {
+				backend: Backend::Bubblewrap,
+				operation: SandboxOperation::Compile,
+				source,
+			})
+		})
+		.transpose()?;
+	let mut argv = vec![launcher];
+	if spec.supervised {
+		argv.push(OsString::from("--die-with-parent"));
+	}
+	argv.extend([OsString::from("--new-session"), OsString::from("--unshare-all")]);
+	// Bubblewrap passes inherited descriptors through to the final exec; it has
+	// no `--preserve-fds` flag. Leaving them open preserves shell-injected high
+	// descriptors such as process-substitution fd 63.
+	if matches!(spec.network, NetworkMode::Enabled | NetworkMode::Outbound) {
 		argv.push(OsString::from("--share-net"));
 	}
 
@@ -77,6 +87,9 @@ pub(crate) fn compile(
 	} else {
 		argv.extend([OsString::from("--tmpfs"), OsString::from("/")]);
 		let mut readable = runtime_closure(program);
+		if let Some(helper) = &seccomp_helper {
+			readable.extend(runtime_closure(helper));
+		}
 		readable.extend(spec.readable.iter().cloned());
 		readable.sort();
 		readable.dedup();
@@ -89,8 +102,13 @@ pub(crate) fn compile(
 
 	argv.extend([OsString::from("--proc"), OsString::from("/proc")]);
 	argv.extend([OsString::from("--dev"), OsString::from("/dev")]);
+	let mut temporary_writable = Vec::new();
 	if spec.allow_temp {
-		argv.extend([OsString::from("--tmpfs"), OsString::from("/tmp")]);
+		temporary_writable = temp_roots();
+		insert_path(&mut temporary_writable, PathBuf::from("/tmp"));
+		for root in &temporary_writable {
+			push_bind(&mut argv, "--bind", root);
+		}
 	}
 	if matches!(spec.write, WriteMode::Scoped | WriteMode::Overlay) {
 		for path in &spec.writable {
@@ -100,12 +118,21 @@ pub(crate) fn compile(
 	for socket in &spec.unix_sockets {
 		push_bind(&mut argv, "--bind", socket);
 	}
-	for path in spec
-		.write_deny
-		.iter()
-		.filter(|path| path.exists() && path_under_any(path, &spec.writable))
-	{
-		push_bind(&mut argv, "--ro-bind", path);
+	for path in spec.write_deny.iter().filter(|path| {
+		path_under_any(path, &spec.writable) || path_under_any(path, &temporary_writable)
+	}) {
+		if path.exists() {
+			push_bind(&mut argv, "--ro-bind", path);
+		} else {
+			// Bubblewrap constructs its root on a private tmpfs and creates
+			// missing bind destinations there. Binding an owned empty directory
+			// read-only therefore blocks creation without touching the host.
+			argv.extend([
+				OsString::from("--ro-bind"),
+				OsString::from(DIRECTORY_MASK_PLACEHOLDER),
+				path.as_os_str().to_owned(),
+			]);
+		}
 	}
 	for path in spec.read_deny.iter().filter(|path| path.exists()) {
 		let placeholder = if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
@@ -119,20 +146,35 @@ pub(crate) fn compile(
 			path.as_os_str().to_owned(),
 		]);
 	}
+	if seccomp_helper.is_some() {
+		push_bind(
+			&mut argv,
+			"--ro-bind",
+			Path::new(super::landlock::BPF_PLACEHOLDER),
+		);
+	}
 
 	argv.push(OsString::from("--"));
+	if let Some(helper) = seccomp_helper {
+		argv.extend([
+			helper.into_os_string(),
+			OsString::from(super::landlock::HIDDEN_CHILD_ARG),
+			OsString::from(super::landlock::BPF_PLACEHOLDER),
+			OsString::from("--"),
+		]);
+	}
 	argv.push(program.as_os_str().to_owned());
 	argv.extend(spec.args.iter().cloned());
 
 	let mut plan = Plan::new(Backend::Bubblewrap, requested, enforced, argv, true);
+	if spec.network == NetworkMode::Outbound {
+		plan.add_caveat(Caveat::capability(
+			Capability::NetOutbound,
+			"Bubblewrap permits outbound networking, but inbound listeners are not blocked",
+		));
+	}
 	if spec.degradation == DegradationPolicy::AllowCaveats {
 		add_degradation_caveats(&mut plan, spec, unavailable, has_future_deny);
-		if has_future_write_deny {
-			plan.add_caveat(Caveat::capability(
-				Capability::FsWriteDeny,
-				"Bubblewrap cannot pre-mount a read-only carve-out for a path that does not yet exist",
-			));
-		}
 	}
 	if spec.write == WriteMode::Overlay {
 		plan.set_filesystem(FilesystemVirtualizationKind::ScopedDeny);
@@ -153,7 +195,7 @@ fn launcher() -> OsString {
 		.unwrap_or_else(|| OsString::from(LAUNCHERS[0]))
 }
 
-fn runtime_closure(program: &Path) -> Vec<PathBuf> {
+pub(crate) fn runtime_closure(program: &Path) -> Vec<PathBuf> {
 	let mut paths = if program == Path::new(COMMAND_WRAPPER_PLACEHOLDER) {
 		Vec::new()
 	} else {
@@ -192,7 +234,7 @@ fn add_degradation_caveats(
 	for capability in unavailable.iter() {
 		let message = match capability {
 			Capability::NetOutbound => {
-				"Bubblewrap narrows outbound-only networking to a disabled network namespace"
+				"Bubblewrap permits outbound networking, but inbound listeners are not blocked"
 			},
 			Capability::FsWriteEphemeral if spec.write == WriteMode::Ephemeral => {
 				"Bubblewrap narrows ephemeral writes to write denial"

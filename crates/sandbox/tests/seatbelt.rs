@@ -26,6 +26,32 @@ fn compile(spec: &SandboxSpec) -> omp_sandbox::Plan {
 	);
 	plan
 }
+#[test]
+fn deny_default_base_has_process_platform_ipc_and_terminal_allowances() {
+	let program = std::env::current_exe().expect("test executable");
+	let profile = compile(&caveated_spec(program))
+		.profile()
+		.expect("Seatbelt profile")
+		.to_owned();
+
+	for allowance in [
+		"(deny default)",
+		"(allow process-exec*)",
+		"(allow process-fork)",
+		"(allow signal (target same-sandbox))",
+		"(allow process-info* (target same-sandbox))",
+		"(sysctl-name \"kern.osrelease\")",
+		"(global-name \"com.apple.system.opendirectoryd.libinfo\")",
+		"(allow ipc-posix-sem)",
+		"ipc-posix-shm-write-create",
+		"(allow pseudo-tty)",
+		"(literal \"/dev/ptmx\")",
+		"(literal \"/dev/tty\")",
+		"(subpath \"/dev/fd\")",
+	] {
+		assert!(profile.contains(allowance), "missing base allowance: {allowance}");
+	}
+}
 
 #[test]
 fn profile_orders_mach_network_and_tls_trust_rules() {
@@ -39,12 +65,19 @@ fn profile_orders_mach_network_and_tls_trust_rules() {
 	let profile = plan.profile().expect("Seatbelt profile");
 
 	assert_ordered(profile, &[
+		"(deny default)",
 		"(deny mach-lookup)",
+		"(global-name \"com.apple.system.opendirectoryd.libinfo\")",
 		"(allow mach-lookup (global-name \"com.example.explicit\"))",
 		"(allow mach-lookup (global-name \"com.apple.trustd\"))",
 		"(allow mach-lookup (global-name \"com.apple.trustd.agent\"))",
 		"(allow mach-lookup (global-name \"com.apple.SecurityServer\"))",
+		"(allow mach-lookup (global-name \"com.apple.SystemConfiguration.DNSConfiguration\"))",
+		"(allow mach-lookup (global-name \"com.apple.SystemConfiguration.configd\"))",
+		"(allow network-outbound)",
 		"(deny network-inbound)",
+		"(deny network-bind)",
+		"(deny network-outbound (remote unix-socket))",
 	]);
 	assert!(plan.enforced().contains(Capability::MachRestrict));
 	assert!(plan.enforced().contains(Capability::NetOutbound));
@@ -86,6 +119,11 @@ fn broad_reads_mask_raw_disk_and_kernel_memory_devices() {
 	let program = std::env::current_exe().expect("test executable");
 	let plan = compile(&caveated_spec(program));
 	let profile = plan.profile().expect("Seatbelt profile");
+	assert_ordered(profile, &[
+		"(deny default)",
+		"(allow file-read*)",
+		"(deny file-read* (regex #\"^/dev/r?disk\"))",
+	]);
 	assert!(profile.contains("(deny file-read* (regex #\"^/dev/r?disk\"))"));
 	assert!(profile.contains("(deny file-read* (regex #\"^/dev/(mem|kmem|kcore)$\"))"));
 	assert!(!profile.contains("com.apple.trustd"));
@@ -149,6 +187,45 @@ fn scoped_write_profile_excludes_denied_subtree() {
 	let denied = sbpl_path(&fs::canonicalize(denied).expect("canonical denied"));
 	assert!(profile.contains(&format!("(require-not (subpath \"{denied}\"))")));
 	assert!(profile.contains(&format!("(require-not (literal \"{denied}\"))")));
+	let root = sbpl_path(&fs::canonicalize(root.path()).expect("canonical writable root"));
+	assert!(profile.contains(&format!(
+		"(deny file-write-unlink (require-all (vnode-type DIRECTORY) (literal \"{root}\")))"
+	)));
+}
+#[test]
+fn outbound_unix_sockets_are_denied_before_explicit_exceptions() {
+	let root = tempdir().expect("socket root");
+	let socket = root.path().join("service.sock");
+	let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("Unix listener");
+	let program = std::env::current_exe().expect("test executable");
+	let mut spec = caveated_spec(program);
+	spec.set_network(NetworkMode::Outbound);
+	spec.allow_unix_socket(&socket).expect("socket allowance");
+	let profile = compile(&spec)
+		.profile()
+		.expect("Seatbelt profile")
+		.to_owned();
+	let socket = sbpl_path(&fs::canonicalize(socket).expect("canonical socket"));
+
+	assert_ordered(&profile, &[
+		"(allow network-outbound)",
+		"(deny network-outbound (remote unix-socket))",
+		&format!("(allow network-outbound (remote unix-socket (path-literal \"{socket}\")))"),
+	]);
+}
+#[test]
+fn enabled_network_keeps_host_unix_sockets_open() {
+	let program = std::env::current_exe().expect("test executable");
+	let mut spec = caveated_spec(program);
+	spec.set_network(NetworkMode::Enabled);
+	let profile = compile(&spec)
+		.profile()
+		.expect("Seatbelt profile")
+		.to_owned();
+
+	assert!(profile.contains("(allow network-outbound)"));
+	assert!(profile.contains("(allow network-inbound)"));
+	assert!(!profile.contains("(deny network-outbound (remote unix-socket))"));
 }
 
 #[test]
@@ -198,7 +275,7 @@ fn sbpl_path(path: &Path) -> String {
 mod live {
 	use std::{
 		fs::{self, File},
-		net::{TcpListener, TcpStream},
+		net::{TcpListener, TcpStream, ToSocketAddrs as _},
 		os::{
 			fd::AsRawFd as _,
 			unix::{
@@ -211,7 +288,9 @@ mod live {
 		process::{Command, Output},
 	};
 
-	use omp_sandbox::{Backend, DegradationPolicy, PreparedSandbox, Runner, SandboxSpec, WriteMode};
+	use omp_sandbox::{
+		Backend, DegradationPolicy, NetworkMode, PreparedSandbox, Runner, SandboxSpec, WriteMode,
+	};
 	use tempfile::tempdir;
 
 	fn runner() -> Option<Runner> {
@@ -270,7 +349,7 @@ mod live {
 		assert!(!wrapper.env_allowed("API_TOKEN"));
 		assert_eq!(wrapper.prefix_args().last().and_then(|arg| arg.to_str()), Some("--"));
 
-		let output = Command::new(wrapper.launcher())
+		let output = Command::new(wrapper.launcher().expect("kernel launcher"))
 			.args(wrapper.prefix_args())
 			.arg("/bin/echo")
 			.arg("wrapped")
@@ -442,9 +521,104 @@ mod live {
 			.env("OMP_TCP", listener.local_addr().expect("listener address").to_string());
 		assert_success(&command.output().expect("run TCP denial probe"));
 	}
+	#[test]
+	fn deny_default_runs_git_and_python_with_workspace_writes() {
+		let Some(runner) = runner() else { return };
+		let workspace = tempdir().expect("workspace");
+		for (program, args, expected) in [
+			("/usr/bin/git", &["--version"][..], "git version"),
+			("/usr/bin/python3", &["-c", "print('python-ok')"][..], "python-ok"),
+		] {
+			let mut spec = SandboxSpec::new(program);
+			spec.args(args);
+			spec.set_dir(workspace.path()).expect("workspace cwd");
+			spec.set_write(WriteMode::Scoped);
+			spec.allow_write(workspace.path()).expect("workspace write");
+			spec.set_degradation(DegradationPolicy::AllowCaveats);
+			let output = command_for(runner, &spec, "real-tool")
+				.output()
+				.unwrap_or_else(|error| panic!("run {program}: {error}"));
+			assert_success(&output);
+			assert!(
+				String::from_utf8_lossy(&output.stdout).contains(expected),
+				"unexpected {program} output: {}",
+				String::from_utf8_lossy(&output.stdout),
+			);
+		}
+	}
 
 	#[test]
-	fn libinfo_mach_allow_restores_username_lookup() {
+	fn same_sandbox_signal_rules_isolate_the_host_parent() {
+		let Some(runner) = runner() else { return };
+		let spec = probe_spec();
+		let mut command = command_for(runner, &spec, "signal-scope");
+		command
+			.command
+			.env("OMP_PARENT_PID", std::process::id().to_string());
+		assert_success(&command.output().expect("run signal-scope probe"));
+	}
+
+	#[test]
+	fn outbound_unix_socket_requires_an_explicit_allowance() {
+		let Some(runner) = runner() else { return };
+		let root = tempdir().expect("socket root");
+		let socket = root.path().join("service.sock");
+		let _listener = UnixListener::bind(&socket).expect("Unix listener");
+
+		let mut denied = probe_spec();
+		denied.set_network(NetworkMode::Outbound);
+		let mut command = command_for(runner, &denied, "socket-denied");
+		command.command.env("OMP_SOCKET", &socket);
+		assert_success(&command.output().expect("run denied Unix socket probe"));
+
+		let mut allowed = denied;
+		allowed
+			.allow_unix_socket(&socket)
+			.expect("socket allowance");
+		let mut command = command_for(runner, &allowed, "socket-allowed");
+		command.command.env("OMP_SOCKET", &socket);
+		assert_success(&command.output().expect("run allowed Unix socket probe"));
+	}
+
+	#[test]
+	fn outbound_network_can_reach_dns_configuration_services() {
+		let Some(runner) = runner() else { return };
+		if ("example.com", 443).to_socket_addrs().is_err() {
+			return;
+		}
+		let mut spec = probe_spec();
+		spec.set_network(NetworkMode::Outbound);
+		assert_success(
+			&command_for(runner, &spec, "dns-resolve")
+				.output()
+				.expect("run DNS probe"),
+		);
+	}
+
+	#[test]
+	fn write_carveout_protects_ancestor_from_rename() {
+		let Some(runner) = runner() else { return };
+		let writable = tempdir().expect("writable scope");
+		let ancestor = writable.path().join("workspace");
+		let protected = ancestor.join(".git");
+		let destination = writable.path().join("moved");
+		fs::create_dir_all(&protected).expect("protected metadata");
+		let mut spec = probe_spec();
+		spec.set_write(WriteMode::Scoped);
+		spec.allow_write(writable.path()).expect("write scope");
+		spec.deny_write(&protected).expect("write carve-out");
+		let mut command = command_for(runner, &spec, "rename-protection");
+		command
+			.command
+			.env("OMP_ALLOWED", &ancestor)
+			.env("OMP_DENIED", &destination);
+		assert_success(&command.output().expect("run rename-protection probe"));
+		assert!(ancestor.exists());
+		assert!(!destination.exists());
+	}
+
+	#[test]
+	fn base_libinfo_mach_allow_restores_username_lookup() {
 		let Some(runner) = runner() else { return };
 		let host = Command::new("/usr/bin/id")
 			.arg("-un")
@@ -456,28 +630,14 @@ mod live {
 			return;
 		}
 
-		let mut denied = SandboxSpec::new("/usr/bin/id");
-		denied
-			.arg("-un")
+		let mut spec = SandboxSpec::new("/usr/bin/id");
+		spec.arg("-un")
 			.set_degradation(DegradationPolicy::AllowCaveats);
-		let denied = command_for(runner, &denied, "mach-denied")
+		let output = command_for(runner, &spec, "mach-libinfo")
 			.output()
-			.expect("run denied Mach lookup");
-		assert_success(&denied);
-		assert_ne!(String::from_utf8_lossy(&denied.stdout).trim(), host_name);
-
-		let mut allowed = SandboxSpec::new("/usr/bin/id");
-		allowed
-			.arg("-un")
-			.set_degradation(DegradationPolicy::AllowCaveats);
-		allowed
-			.allow_mach_service("com.apple.system.opendirectoryd.libinfo")
-			.expect("libinfo Mach service");
-		let allowed = command_for(runner, &allowed, "mach-libinfo")
-			.output()
-			.expect("run allowed Mach lookup");
-		assert_success(&allowed);
-		assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), host_name);
+			.expect("run base libinfo Mach lookup");
+		assert_success(&output);
+		assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), host_name);
 	}
 
 	#[test]
@@ -521,9 +681,43 @@ mod live {
 				UnixStream::connect(required_path("OMP_SOCKET")).expect("allowed Unix socket");
 				assert_ne!(unsafe { libc::fcntl(9, libc::F_GETFD) }, -1, "fd 9 must be inherited");
 			},
+			"socket-denied" => {
+				assert!(UnixStream::connect(required_path("OMP_SOCKET")).is_err());
+			},
+			"socket-allowed" => {
+				UnixStream::connect(required_path("OMP_SOCKET")).expect("allowed Unix socket");
+			},
 			"tcp-denied" => {
 				let address = std::env::var("OMP_TCP").expect("TCP address");
 				assert!(TcpStream::connect(address).is_err());
+			},
+			"signal-scope" => {
+				let parent = std::env::var("OMP_PARENT_PID")
+					.expect("parent pid")
+					.parse::<libc::pid_t>()
+					.expect("numeric parent pid");
+				assert_eq!(unsafe { libc::kill(parent, 0) }, -1);
+				assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+
+				let mut child = Command::new("/bin/sleep")
+					.arg("30")
+					.spawn()
+					.expect("sandbox child");
+				assert_eq!(unsafe { libc::kill(child.id().cast_signed(), 0) }, 0);
+				assert_eq!(unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) }, 0);
+				child.wait().expect("reap sandbox child");
+			},
+			"dns-resolve" => {
+				assert!(
+					("example.com", 443)
+						.to_socket_addrs()
+						.expect("sandbox DNS resolution")
+						.next()
+						.is_some()
+				);
+			},
+			"rename-protection" => {
+				assert!(fs::rename(required_path("OMP_ALLOWED"), required_path("OMP_DENIED")).is_err());
 			},
 			operation => panic!("unknown probe operation {operation}"),
 		}

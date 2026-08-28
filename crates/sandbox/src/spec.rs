@@ -12,7 +12,8 @@ use strum::{Display, EnumString, IntoStaticStr};
 use crate::{
 	Capability, CapabilitySet, EnvironmentPolicy, EnvironmentSource, SandboxError, SpecViolation,
 	paths::{
-		canonicalize_deny, canonicalize_existing, insert_path, os_string_bytes, path_under_any,
+		absolute_lexical, canonicalize_deny, canonicalize_existing, insert_path, os_string_bytes,
+		path_under_any, temp_roots,
 	},
 };
 
@@ -173,6 +174,7 @@ pub struct SandboxSpec {
 	pub(crate) write_deny:    Vec<PathBuf>,
 	pub(crate) unix_sockets:  Vec<PathBuf>,
 	pub(crate) allow_temp:    bool,
+	pub(crate) supervised:    bool,
 	pub(crate) no_exec:       bool,
 	pub(crate) mach_services: Vec<Str>,
 	pub(crate) resources:     ResourceLimits,
@@ -197,6 +199,7 @@ impl SandboxSpec {
 			write_deny:    Vec::new(),
 			unix_sockets:  Vec::new(),
 			allow_temp:    false,
+			supervised:    true,
 			no_exec:       false,
 			mach_services: Vec::new(),
 			resources:     ResourceLimits::default(),
@@ -230,6 +233,23 @@ impl SandboxSpec {
 	/// Replaces the environment source without changing allow or deny patterns.
 	pub fn set_environment(&mut self, source: EnvironmentSource) -> &mut Self {
 		self.environment.set_source(source);
+		self
+	}
+
+	/// Starts children from the platform-core name set instead of the full
+	/// inherited environment.
+	pub fn set_env_core(&mut self, core: bool) -> &mut Self {
+		self.environment.set_source(if core {
+			EnvironmentSource::Core
+		} else {
+			EnvironmentSource::Inherit
+		});
+		self
+	}
+
+	/// Injects or overrides one variable after environment filtering.
+	pub fn env_set(&mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> &mut Self {
+		self.environment.set_override(key.as_ref(), value.as_ref());
 		self
 	}
 
@@ -277,10 +297,15 @@ impl SandboxSpec {
 		Ok(self)
 	}
 
-	/// Carves a canonicalized read-only subtree out of otherwise writable
-	/// scopes.
+	/// Carves a read-only subtree out of otherwise writable scopes.
+	///
+	/// Both the absolute lexical path and its canonical target are retained so
+	/// a symlink entry and the object it resolves to can be protected
+	/// independently.
 	pub fn deny_write(&mut self, path: impl AsRef<Path>) -> Result<&mut Self, SandboxError> {
-		insert_path(&mut self.write_deny, canonicalize_deny(path.as_ref())?);
+		let path = path.as_ref();
+		insert_path(&mut self.write_deny, absolute_lexical(path)?);
+		insert_path(&mut self.write_deny, canonicalize_deny(path)?);
 		Ok(self)
 	}
 
@@ -309,6 +334,12 @@ impl SandboxSpec {
 	/// Opts temporary roots into scoped or overlay writes.
 	pub const fn set_allow_temp(&mut self, allow: bool) -> &mut Self {
 		self.allow_temp = allow;
+		self
+	}
+
+	/// Detaches the sandboxed tree from supervisor lifetime when set to `false`.
+	pub const fn set_supervised(&mut self, supervised: bool) -> &mut Self {
+		self.supervised = supervised;
 		self
 	}
 
@@ -370,12 +401,15 @@ impl SandboxSpec {
 		if self.write == WriteMode::Scoped && self.writable.is_empty() && !self.allow_temp {
 			return Err(SpecViolation::EmptyWriteScope.into());
 		}
-		if self
-			.write_deny
-			.iter()
-			.any(|path| !path_under_any(path, &self.writable))
-		{
-			return Err(SpecViolation::WriteDenyOutsideScope.into());
+		if self.write != WriteMode::Overlay {
+			let temporary = self.allow_temp.then(temp_roots).unwrap_or_default();
+			if self
+				.write_deny
+				.iter()
+				.any(|path| !path_under_any(path, &self.writable) && !path_under_any(path, &temporary))
+			{
+				return Err(SpecViolation::WriteDenyOutsideScope.into());
+			}
 		}
 		if let (Some(dir), false) = (&self.dir, self.readable.is_empty())
 			&& !path_under_any(dir, &self.readable)
@@ -442,6 +476,7 @@ impl SandboxSpec {
 		hash_path(&mut hasher, self.dir.as_deref());
 		match self.environment.source() {
 			EnvironmentSource::Inherit => hash_bytes(&mut hasher, b"inherit"),
+			EnvironmentSource::Core => hash_bytes(&mut hasher, b"core"),
 			EnvironmentSource::Exact(entries) => {
 				hash_bytes(&mut hasher, b"exact");
 				hash_os_slice(&mut hasher, entries);
@@ -455,6 +490,11 @@ impl SandboxSpec {
 			hash_bytes(&mut hasher, pattern.as_bytes());
 		}
 		hash_bytes(&mut hasher, b"deny-end");
+		for (key, value) in self.environment.overrides() {
+			hash_os(&mut hasher, key);
+			hash_os(&mut hasher, value);
+		}
+		hash_bytes(&mut hasher, b"env-set-end");
 		let network: &'static str = self.network.into();
 		let write: &'static str = self.write.into();
 		let degradation: &'static str = self.degradation.into();
@@ -466,6 +506,7 @@ impl SandboxSpec {
 		hash_paths(&mut hasher, &self.write_deny);
 		hash_paths(&mut hasher, &self.unix_sockets);
 		hash_bool(&mut hasher, self.allow_temp);
+		hash_bool(&mut hasher, self.supervised);
 		hash_bool(&mut hasher, self.no_exec);
 		for service in &self.mach_services {
 			hash_bytes(&mut hasher, service.as_bytes());

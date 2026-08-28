@@ -81,9 +81,15 @@ fn compile_for(
 	let readable = &spec.readable;
 	let writable = &spec.writable;
 	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
-	if has_future_write_deny {
+	let has_unmounted_write_deny = spec
+		.write_deny
+		.iter()
+		.any(|path| !path_under_any(path, writable));
+	if has_future_write_deny || has_unmounted_write_deny {
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
-		if spec.degradation == DegradationPolicy::Reject {
+		if spec.degradation == DegradationPolicy::Reject
+			&& !spec.tolerated.contains(Capability::FsWriteDeny)
+		{
 			return Err(SandboxError::BackendCapabilities {
 				backend,
 				missing: CapabilitySet::one(Capability::FsWriteDeny),
@@ -188,8 +194,11 @@ fn compile_for(
 	if spec.write == WriteMode::Overlay && enforced.contains(Capability::FsWriteEphemeral) {
 		semantic_missing = semantic_missing.union(CapabilitySet::one(Capability::FsWriteEphemeral));
 	}
-	if spec.degradation == DegradationPolicy::Reject && !semantic_missing.is_empty() {
-		return Err(SandboxError::BackendCapabilities { backend, missing: semantic_missing });
+	if spec.degradation == DegradationPolicy::Reject {
+		let fatal = semantic_missing.difference(spec.tolerated);
+		if !fatal.is_empty() {
+			return Err(SandboxError::BackendCapabilities { backend, missing: fatal });
+		}
 	}
 	enforced = enforced.difference(semantic_missing);
 
@@ -235,6 +244,13 @@ fn compile_for(
 			plan.add_caveat(Caveat::capability(
 				Capability::FsWriteDeny,
 				"Docker cannot pre-mount a read-only carve-out for a path that does not yet exist",
+			));
+		}
+		if has_unmounted_write_deny {
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteDeny,
+				"Docker cannot carve an image or temporary path read-only without replacing it with a \
+				 host bind mount",
 			));
 		}
 	}

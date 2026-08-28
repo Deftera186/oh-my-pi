@@ -40,7 +40,7 @@ pub(crate) fn canonicalize_deny(path: &Path) -> Result<PathBuf, SandboxError> {
 	}
 }
 
-fn absolute_lexical(path: &Path) -> Result<PathBuf, SandboxError> {
+pub(crate) fn absolute_lexical(path: &Path) -> Result<PathBuf, SandboxError> {
 	let absolute = if path.is_absolute() {
 		path.to_path_buf()
 	} else {
@@ -62,7 +62,7 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf, SandboxError> {
 			Component::Normal(name) => normalized.push(name),
 		}
 	}
-	Ok(normalized)
+	Ok(normalize_firmlink(normalized))
 }
 
 #[cfg(target_os = "macos")]
@@ -185,19 +185,13 @@ fn is_executable(path: &Path) -> bool {
 
 pub(crate) fn temp_roots() -> Vec<PathBuf> {
 	let mut roots = Vec::new();
-	#[cfg(target_os = "macos")]
-	{
-		insert_path(&mut roots, PathBuf::from("/private/tmp"));
-		insert_path(&mut roots, PathBuf::from("/private/var/folders"));
-	}
-	if let Some(path) = std::env::var_os("TMPDIR") {
-		if let Ok(path) = canonicalize_existing(Path::new(&path)) {
-			insert_path(&mut roots, path);
-		}
-	}
 	if let Ok(path) = canonicalize_existing(&std::env::temp_dir()) {
 		insert_path(&mut roots, path);
 	}
+	#[cfg(target_os = "linux")]
+	insert_path(&mut roots, PathBuf::from("/tmp"));
+	#[cfg(target_os = "macos")]
+	insert_path(&mut roots, PathBuf::from("/private/tmp"));
 	roots
 }
 

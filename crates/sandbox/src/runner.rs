@@ -18,13 +18,14 @@ use tokio::{
 use crate::{
 	Backend, BackendStatus, CapabilitySet, Caveat, CleanupFailure, CleanupFailures,
 	DegradationPolicy, Plan, RunFailure, SandboxError, SandboxSpec,
-	backends::{appcontainer, bubblewrap, docker, gvisor, seatbelt},
+	backends::{appcontainer, bubblewrap, docker, gvisor, landlock, seatbelt},
 	environment::split_entry,
 	paths::resolve_program,
 };
 
 static SEATBELT_STATUS: LazyLock<BackendStatus> = LazyLock::new(seatbelt::probe);
 static BUBBLEWRAP_STATUS: LazyLock<BackendStatus> = LazyLock::new(bubblewrap::probe);
+static LANDLOCK_STATUS: LazyLock<BackendStatus> = LazyLock::new(landlock::probe);
 static GVISOR_STATUS: LazyLock<BackendStatus> = LazyLock::new(gvisor::probe);
 static DOCKER_STATUS: LazyLock<BackendStatus> =
 	LazyLock::new(|| docker::probe(Backend::DockerEphemeral));
@@ -39,6 +40,7 @@ pub fn backend_status(backend: Backend) -> BackendStatus {
 	match backend {
 		Backend::Seatbelt => SEATBELT_STATUS.clone(),
 		Backend::Bubblewrap => BUBBLEWRAP_STATUS.clone(),
+		Backend::Landlock => LANDLOCK_STATUS.clone(),
 		Backend::Gvisor => GVISOR_STATUS.clone(),
 		Backend::DockerEphemeral => DOCKER_STATUS.clone(),
 		Backend::DockerRunscEphemeral => DOCKER_RUNSC_STATUS.clone(),
@@ -69,13 +71,14 @@ impl Runner {
 	pub fn for_spec(spec: &SandboxSpec) -> Result<Self, SandboxError> {
 		spec.validate()?;
 		let requested = spec.requested_capabilities();
+		let required = requested.difference(spec.tolerated);
 		let candidates = candidates();
 		if candidates.is_empty() {
 			return Err(SandboxError::UnsupportedHost { os: std::env::consts::OS });
 		}
 
 		let mut available = Vec::new();
-		let mut smallest_missing = requested;
+		let mut smallest_missing = required;
 		for backend in candidates.iter().copied() {
 			let status = backend_status(backend);
 			if !status.is_available() {
@@ -85,7 +88,9 @@ impl Runner {
 			let runner = Self { backend };
 			match runner.compile(spec) {
 				Ok(plan) => {
-					let missing = requested.difference(plan.enforced());
+					let missing = requested
+						.difference(plan.enforced())
+						.difference(spec.tolerated);
 					if missing.is_empty() {
 						if backend == Backend::Gvisor {
 							let requirements = gvisor::check_requirements(spec)?;
@@ -100,6 +105,10 @@ impl Runner {
 					}
 				},
 				Err(SandboxError::BackendCapabilities { missing, .. }) => {
+					let missing = missing.difference(spec.tolerated);
+					if missing.is_empty() {
+						return Ok(runner);
+					}
 					if missing.len() < smallest_missing.len() {
 						smallest_missing = missing;
 					}
@@ -161,6 +170,7 @@ impl Runner {
 		let mut plan = match self.backend {
 			Backend::Seatbelt => seatbelt::compile(spec, program, requested, enforced),
 			Backend::Bubblewrap => bubblewrap::compile(spec, program, requested, enforced),
+			Backend::Landlock => landlock::compile(spec, program, requested, enforced),
 			Backend::Gvisor => gvisor::compile(spec, program, requested, enforced),
 			Backend::DockerEphemeral => docker::compile(spec, program, requested, enforced),
 			Backend::DockerRunscEphemeral => docker::compile_runsc(spec, program, requested, enforced),
@@ -207,7 +217,10 @@ impl Runner {
 
 	/// Compiles a reusable native launcher prefix from a program-less policy.
 	pub fn wrap_template(self, spec: &SandboxSpec) -> Result<CommandWrapper, SandboxError> {
-		if !matches!(self.backend, Backend::Seatbelt | Backend::Bubblewrap) {
+		if !matches!(
+			self.backend,
+			Backend::Seatbelt | Backend::Bubblewrap | Backend::Landlock
+		) {
 			return Err(SandboxError::CommandWrapperUnsupported { backend: self.backend });
 		}
 		if self.backend != native_command_backend()? {
@@ -219,6 +232,7 @@ impl Runner {
 
 		let placeholder = Path::new(COMMAND_WRAPPER_PLACEHOLDER);
 		let plan = self.compile_program(spec, placeholder)?;
+		let caveats = plan.caveats().to_vec();
 		let mut preparation_spec = spec.clone();
 		preparation_spec.environment = crate::EnvironmentPolicy::exact(Vec::new());
 		let mut prepared = self.prepare(plan, &preparation_spec)?;
@@ -233,14 +247,38 @@ impl Runner {
 				prefix_args.push(OsString::from("--"));
 			},
 			Backend::Bubblewrap => {
-				let separator = prefix_args
+				let end = if prefix_args
 					.iter()
-					.position(|arg| arg == OsStr::new("--"))
+					.any(|arg| arg == OsStr::new(landlock::HIDDEN_CHILD_ARG))
+				{
+					prefix_args
+						.iter()
+						.position(|arg| arg == OsStr::new(COMMAND_WRAPPER_PLACEHOLDER))
+						.ok_or(SandboxError::MissingPlanPlaceholder {
+							backend:     self.backend,
+							placeholder: COMMAND_WRAPPER_PLACEHOLDER,
+						})?
+				} else {
+					prefix_args
+						.iter()
+						.position(|arg| arg == OsStr::new("--"))
+						.map(|separator| separator + 1)
+						.ok_or(SandboxError::MissingPlanPlaceholder {
+							backend:     self.backend,
+							placeholder: "--",
+						})?
+				};
+				prefix_args.truncate(end);
+			},
+			Backend::Landlock => {
+				let command = prefix_args
+					.iter()
+					.position(|arg| arg == OsStr::new(COMMAND_WRAPPER_PLACEHOLDER))
 					.ok_or(SandboxError::MissingPlanPlaceholder {
 						backend:     self.backend,
-						placeholder: "--",
+						placeholder: COMMAND_WRAPPER_PLACEHOLDER,
 					})?;
-				prefix_args.truncate(separator + 1);
+				prefix_args.truncate(command);
 			},
 			Backend::Gvisor
 			| Backend::DockerEphemeral
@@ -248,9 +286,10 @@ impl Runner {
 			| Backend::AppContainer => unreachable!("native backend checked above"),
 		}
 		Ok(CommandWrapper {
-			launcher,
+			launcher: Some(launcher),
 			prefix_args,
 			environment: spec.environment.clone(),
+			caveats,
 			resources: std::mem::take(&mut prepared.resources),
 		})
 	}
@@ -296,7 +335,17 @@ impl Runner {
 				crate::runtime::macos::prepare(spec, &mut prepared)?;
 			},
 			Backend::Bubblewrap => {
+				if prepared
+					.args
+					.iter()
+					.any(|arg| arg == OsStr::new(landlock::BPF_PLACEHOLDER))
+				{
+					landlock::prepare(spec, &mut prepared)?;
+				}
 				prepared = crate::runtime::bubblewrap::prepare(prepared)?;
+			},
+			Backend::Landlock => {
+				landlock::prepare(spec, &mut prepared)?;
 			},
 			Backend::Gvisor => {
 				#[cfg(target_os = "linux")]
@@ -345,6 +394,11 @@ impl Runner {
 				Err(SandboxError::UnsupportedHost { os: std::env::consts::OS })
 			},
 			Backend::Bubblewrap => {
+				let result = run_command(&prepared, options, CommandRuntime::Plain).await;
+				let cleanup = prepared.cleanup();
+				finish_run(self.backend, result, cleanup)
+			},
+			Backend::Landlock => {
 				let result = run_command(&prepared, options, CommandRuntime::Plain).await;
 				let cleanup = prepared.cleanup();
 				finish_run(self.backend, result, cleanup)
@@ -442,19 +496,33 @@ pub struct RunOutput {
 /// Precompiled sandbox launcher reused across many command spawns.
 ///
 /// Temporary profile and bind-mask resources remain alive until this value is
-/// dropped. The wrapper is `Send + Sync` and its accessors allocate nothing.
+/// dropped. The wrapper is `Send + Sync`; launcher and policy accessors
+/// allocate nothing.
 pub struct CommandWrapper {
-	launcher:    OsString,
+	launcher:    Option<OsString>,
 	prefix_args: Vec<OsString>,
 	environment: crate::EnvironmentPolicy,
+	caveats:     Vec<Caveat>,
 	resources:   Vec<PreparedResource>,
 }
 
 impl CommandWrapper {
+	/// Creates an environment-filtering wrapper without a kernel launcher.
+	#[must_use]
+	pub fn environment_only(spec: &SandboxSpec) -> Self {
+		Self {
+			launcher:    None,
+			prefix_args: Vec::new(),
+			environment: spec.environment.clone(),
+			caveats:     Vec::new(),
+			resources:   Vec::new(),
+		}
+	}
+
 	/// Returns the launcher program, such as `sandbox-exec` or `bwrap`.
 	#[must_use]
-	pub fn launcher(&self) -> &OsStr {
-		&self.launcher
+	pub fn launcher(&self) -> Option<&OsStr> {
+		self.launcher.as_deref()
 	}
 
 	/// Returns arguments placed before the wrapped program.
@@ -467,6 +535,23 @@ impl CommandWrapper {
 	#[must_use]
 	pub fn env_allowed(&self, key: &str) -> bool {
 		self.environment.allows(key)
+	}
+
+	/// Applies the environment base, include-only filters, deny filters, and
+	/// explicit overrides in policy order.
+	pub fn resolve_env<I, K, V>(&self, environment: I) -> Vec<(OsString, OsString)>
+	where
+		I: IntoIterator<Item = (K, V)>,
+		K: Into<OsString>,
+		V: Into<OsString>,
+	{
+		self.environment.resolve_env(environment)
+	}
+
+	/// Returns caveats recorded by the backend for this compiled policy.
+	#[must_use]
+	pub fn caveats(&self) -> &[Caveat] {
+		&self.caveats
 	}
 }
 
@@ -957,6 +1042,7 @@ fn candidates_for(os: &str) -> &'static [Backend] {
 		"linux" => &[
 			Backend::Gvisor,
 			Backend::Bubblewrap,
+			Backend::Landlock,
 			Backend::DockerRunscEphemeral,
 			Backend::DockerEphemeral,
 		],
@@ -968,7 +1054,11 @@ fn candidates_for(os: &str) -> &'static [Backend] {
 fn fallback_backend() -> Result<Backend, SandboxError> {
 	match std::env::consts::OS {
 		"macos" => Ok(Backend::Seatbelt),
-		"linux" => Ok(Backend::Bubblewrap),
+		"linux" => Ok(if backend_status(Backend::Bubblewrap).is_available() {
+			Backend::Bubblewrap
+		} else {
+			Backend::Landlock
+		}),
 		"windows" => Ok(Backend::AppContainer),
 		_ => Err(SandboxError::UnsupportedHost { os: std::env::consts::OS }),
 	}
@@ -977,7 +1067,11 @@ fn fallback_backend() -> Result<Backend, SandboxError> {
 fn native_command_backend() -> Result<Backend, SandboxError> {
 	match std::env::consts::OS {
 		"macos" => Ok(Backend::Seatbelt),
-		"linux" => Ok(Backend::Bubblewrap),
+		"linux" => Ok(if backend_status(Backend::Bubblewrap).is_available() {
+			Backend::Bubblewrap
+		} else {
+			Backend::Landlock
+		}),
 		_ => Err(SandboxError::UnsupportedHost { os: std::env::consts::OS }),
 	}
 }
@@ -1006,6 +1100,7 @@ mod tests {
 		assert_eq!(candidates_for("linux"), [
 			Backend::Gvisor,
 			Backend::Bubblewrap,
+			Backend::Landlock,
 			Backend::DockerRunscEphemeral,
 			Backend::DockerEphemeral,
 		],);

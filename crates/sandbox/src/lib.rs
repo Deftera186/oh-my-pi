@@ -16,7 +16,10 @@ mod runtime;
 mod spec;
 
 pub use capability::{Backend, Capability, CapabilitySet, portable_capabilities};
-pub use environment::{EnvironmentPolicy, EnvironmentSource};
+pub use backends::landlock::{HIDDEN_CHILD_ARG, abi as landlock_abi, run_child_entry};
+pub use environment::{
+	EnvironmentPolicy, EnvironmentSource, core_environment_names, validate_env_pattern,
+};
 pub use error::{
 	BackendStatus, CleanupFailure, CleanupFailures, ProbeFailure, ResourceKind, RunFailure,
 	SandboxError, SandboxOperation, SpecViolation,

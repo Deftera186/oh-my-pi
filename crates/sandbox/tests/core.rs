@@ -3,9 +3,9 @@
 use std::{ffi::OsString, fs, path::Path};
 
 use omp_sandbox::{
-	Backend, Capability, CapabilitySet, DegradationPolicy, EnvironmentSource, NetworkMode,
-	ResourceLimits, Runner, SandboxError, SandboxSpec, SpecViolation, WriteMode,
-	portable_capabilities,
+	Backend, Capability, CapabilitySet, CommandWrapper, DegradationPolicy, EnvironmentSource,
+	NetworkMode, ResourceLimits, Runner, SandboxError, SandboxSpec, SpecViolation, WriteMode,
+	core_environment_names, portable_capabilities, validate_env_pattern,
 };
 use tempfile::tempdir;
 
@@ -52,8 +52,15 @@ fn portable_capabilities_and_backend_names_are_stable() {
 			"docker-ephemeral",
 			"docker-runsc-ephemeral",
 			"gvisor",
+			"landlock",
 			"seatbelt",
 		],
+	);
+	assert!(!Backend::Landlock.capabilities().contains(Capability::IpcRestrict));
+	assert!(
+		!Backend::Landlock
+			.capabilities()
+			.contains(Capability::KernelIsolation)
 	);
 }
 
@@ -137,6 +144,29 @@ fn deterministic_ids_include_write_deny_paths() {
 }
 
 #[test]
+fn deterministic_ids_include_supervisor_and_environment_overrides() {
+	let mut baseline = scoped_spec();
+	baseline
+		.env_set("OMP_TEST", "zero")
+		.set_degradation(DegradationPolicy::AllowCaveats);
+	let mut changed_supervisor = baseline.clone();
+	changed_supervisor.set_supervised(false);
+	let mut changed_environment = baseline.clone();
+	changed_environment.env_set("OMP_TEST", "one");
+
+	let runner = Runner::for_backend(Backend::Gvisor);
+	let baseline = runner.compile(&baseline).expect("baseline gVisor plan");
+	let changed_supervisor = runner
+		.compile(&changed_supervisor)
+		.expect("unsupervised gVisor plan");
+	let changed_environment = runner
+		.compile(&changed_environment)
+		.expect("environment gVisor plan");
+	assert_ne!(plan_id(&baseline), plan_id(&changed_supervisor));
+	assert_ne!(plan_id(&baseline), plan_id(&changed_environment));
+}
+
+#[test]
 fn explicit_empty_environment_survives_preparation() {
 	let runner = Runner::for_backend(native_backend());
 	if omp_sandbox::backend_status(runner.backend())
@@ -174,6 +204,85 @@ fn deny_patterns_win_after_allow_patterns() {
 	let plan = runner.compile(&spec).expect("native plan");
 	let prepared = runner.prepare(plan, &spec).expect("prepared native plan");
 	assert_eq!(prepared.environment(), Some([OsString::from("PUBLIC=kept")].as_slice()));
+}
+
+#[test]
+fn environment_globs_are_case_insensitive() {
+	validate_env_pattern("*KEY*").expect("valid environment pattern");
+	assert!(validate_env_pattern("[").is_err());
+
+	let mut spec = SandboxSpec::new("");
+	spec.deny_env("*KEY*").expect("deny glob");
+	let wrapper = CommandWrapper::environment_only(&spec);
+	assert!(!wrapper.env_allowed("api_key"));
+	assert!(!wrapper.env_allowed("API_KEY"));
+	assert!(wrapper.env_allowed("PATH"));
+}
+
+#[test]
+fn core_none_include_deny_and_set_resolve_in_policy_order() {
+	assert_eq!(core_environment_names(), [
+		"HOME", "PATH", "USER", "SHELL", "LOGNAME", "TERM", "TMPDIR", "LANG", "LC_*",
+	]);
+
+	let mut core = SandboxSpec::new("");
+	core.set_env_core(true);
+	let wrapper = CommandWrapper::environment_only(&core);
+	assert_eq!(
+		wrapper.resolve_env([
+			("HOME", "/home/test"),
+			("path", "/bin"),
+			("LC_ALL", "C"),
+			("SECRET", "hidden"),
+		]),
+		[
+			(OsString::from("HOME"), OsString::from("/home/test")),
+			(OsString::from("path"), OsString::from("/bin")),
+			(OsString::from("LC_ALL"), OsString::from("C")),
+		],
+	);
+
+	let mut none = SandboxSpec::new("");
+	none.set_environment(EnvironmentSource::Exact(Vec::new()));
+	assert!(
+		CommandWrapper::environment_only(&none)
+			.resolve_env([("PATH", "/bin")])
+			.is_empty()
+	);
+
+	let mut ordered = SandboxSpec::new("");
+	ordered.allow_env("*KEY*").expect("include-only glob");
+	ordered.deny_env("*SECRET*").expect("deny glob");
+	ordered.env_set("SECRET_KEY", "explicit");
+	ordered.env_set("api_key", "override");
+	let resolved = CommandWrapper::environment_only(&ordered).resolve_env([
+		("api_key", "ambient"),
+		("OTHER", "removed"),
+		("SECRET_KEY", "removed"),
+	]);
+	assert_eq!(resolved, [
+		(OsString::from("SECRET_KEY"), OsString::from("explicit")),
+		(OsString::from("api_key"), OsString::from("override")),
+	]);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn for_spec_subtracts_tolerated_capabilities_before_rejecting_backend() {
+	let native = native_backend();
+	if !omp_sandbox::backend_status(native).is_available() {
+		return;
+	}
+	let mut spec = scoped_spec();
+	#[cfg(target_os = "linux")]
+	{
+		spec.set_network(NetworkMode::Outbound);
+		spec.tolerate_missing(Capability::NetOutbound);
+	}
+	#[cfg(target_os = "macos")]
+	spec.tolerate_missing(Capability::IpcRestrict);
+
+	Runner::for_spec(&spec).expect("native backend accepts the tolerated gap");
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::SandboxOperation;
 use crate::{
 	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
 	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
-	WriteMode,
+	WriteMode, paths::path_under_any,
 };
 
 const RUNSC_ENV: &str = "OMP_SANDBOX_RUNSC";
@@ -33,7 +33,9 @@ pub(crate) fn compile(
 	let has_future_deny = spec.read_deny.iter().any(|path| !path.exists());
 	if has_future_deny {
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsReadDeny));
-		if spec.degradation == DegradationPolicy::Reject {
+		if spec.degradation == DegradationPolicy::Reject
+			&& !spec.tolerated.contains(Capability::FsReadDeny)
+		{
 			return Err(SandboxError::BackendCapabilities {
 				backend: Backend::Gvisor,
 				missing: CapabilitySet::one(Capability::FsReadDeny),
@@ -41,9 +43,15 @@ pub(crate) fn compile(
 		}
 	}
 	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
-	if has_future_write_deny {
+	let has_unmounted_write_deny = spec
+		.write_deny
+		.iter()
+		.any(|path| !path_under_any(path, &spec.writable));
+	if has_future_write_deny || has_unmounted_write_deny {
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
-		if spec.degradation == DegradationPolicy::Reject {
+		if spec.degradation == DegradationPolicy::Reject
+			&& !spec.tolerated.contains(Capability::FsWriteDeny)
+		{
 			return Err(SandboxError::BackendCapabilities {
 				backend: Backend::Gvisor,
 				missing: CapabilitySet::one(Capability::FsWriteDeny),
@@ -53,7 +61,9 @@ pub(crate) fn compile(
 	let filesystem_view = needs_filesystem_view(spec);
 	if filesystem_view && enforced.contains(Capability::IpcRestrict) {
 		enforced = enforced.difference(CapabilitySet::one(Capability::IpcRestrict));
-		if spec.degradation == DegradationPolicy::Reject {
+		if spec.degradation == DegradationPolicy::Reject
+			&& !spec.tolerated.contains(Capability::IpcRestrict)
+		{
 			return Err(SandboxError::BackendCapabilities {
 				backend: Backend::Gvisor,
 				missing: CapabilitySet::one(Capability::IpcRestrict),
@@ -114,6 +124,13 @@ pub(crate) fn compile(
 			plan.add_caveat(Caveat::capability(
 				Capability::FsWriteDeny,
 				"gVisor cannot pre-mount a read-only carve-out for a path that does not yet exist",
+			));
+		}
+		if has_unmounted_write_deny {
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteDeny,
+				"gVisor cannot carve a rootfs or temporary path read-only without replacing it with a \
+				 host bind mount",
 			));
 		}
 	}

@@ -15,8 +15,7 @@ fn broad_view_has_required_namespaces_and_runtime_mounts() {
 	assert_eq!(argv[1], "--die-with-parent");
 	assert_eq!(argv[2], "--new-session");
 	assert_eq!(argv[3], "--unshare-all");
-	assert_eq!(argv[4], "--preserve-fds");
-	assert_eq!(argv[5], "1");
+	assert!(!argv.iter().any(|argument| argument == "--preserve-fds"));
 	assert!(has_mount(argv, "--ro-bind", Path::new("/"), Path::new("/")));
 	assert!(has_pair(argv, "--proc", Path::new("/proc")));
 	assert!(has_pair(argv, "--dev", Path::new("/dev")));
@@ -35,6 +34,38 @@ fn enabled_network_alone_shares_the_host_network_namespace() {
 	assert!(plan.enforced().contains(Capability::NetEnable));
 	assert!(!plan.enforced().contains(Capability::NetDisable));
 	assert_enforced_subset(&plan);
+}
+#[test]
+fn disabled_network_uses_hidden_seccomp_child_contract() {
+	let target = executable();
+	let plan = compile(SandboxSpec::new(target));
+	let argv = plan.argv();
+	let child = argv
+		.iter()
+		.position(|argument| argument == omp_sandbox::HIDDEN_CHILD_ARG)
+		.expect("hidden sandbox child");
+	assert_eq!(argv[child + 1], "@omp-sandbox-bpf@");
+	assert_eq!(argv[child + 2], "--");
+	assert_eq!(Path::new(&argv[child + 3]), target);
+	assert!(has_mount(
+		argv,
+		"--ro-bind",
+		Path::new("@omp-sandbox-bpf@"),
+		Path::new("@omp-sandbox-bpf@"),
+	));
+}
+
+#[test]
+fn enabled_network_skips_hidden_seccomp_child() {
+	let mut spec = SandboxSpec::new(executable());
+	spec.set_network(NetworkMode::Enabled);
+	let plan = compile(spec);
+	assert!(
+		!plan
+			.argv()
+			.iter()
+			.any(|argument| argument == omp_sandbox::HIDDEN_CHILD_ARG)
+	);
 }
 
 #[test]
@@ -57,7 +88,11 @@ fn scoped_view_binds_loader_reads_and_writable_overrides() {
 	assert!(has_pair(plan.argv(), "--tmpfs", Path::new("/")));
 	assert!(has_mount(plan.argv(), "--ro-bind", &readable, &readable));
 	assert!(has_mount(plan.argv(), "--bind", &writable, &writable));
-	assert!(has_pair(plan.argv(), "--tmpfs", Path::new("/tmp")));
+	let canonical_temp =
+		fs::canonicalize(std::env::temp_dir()).expect("canonical temporary directory");
+	assert!(has_mount(plan.argv(), "--bind", &canonical_temp, &canonical_temp));
+	assert!(has_mount(plan.argv(), "--bind", Path::new("/tmp"), Path::new("/tmp")));
+	assert!(!has_pair(plan.argv(), "--tmpfs", Path::new("/tmp")));
 	let resolved_program = fs::canonicalize(executable()).expect("resolved executable");
 	assert!(has_mount(plan.argv(), "--ro-bind", &resolved_program, &resolved_program,));
 	assert!(plan.enforced().contains(Capability::FsReadScope));
@@ -82,6 +117,105 @@ fn write_denies_remount_subtrees_read_only_after_writable_bind() {
 	let denied_index = mount_index(plan.argv(), "--ro-bind", &denied);
 	assert!(writable_index < denied_index, "read-only carve-out must shadow writable bind");
 	assert!(plan.enforced().contains(Capability::FsWriteDeny));
+}
+
+#[test]
+fn future_write_denies_bind_an_owned_read_only_synthetic_target() {
+	let root = tempdir().expect("writable scope");
+	let root = fs::canonicalize(root.path()).expect("canonical root");
+	let future = root.join("not-created");
+
+	let mut spec = SandboxSpec::new(executable());
+	spec.set_write(WriteMode::Scoped);
+	spec.allow_write(&root).expect("write scope");
+	spec.deny_write(&future).expect("future write denial");
+	let plan = compile(spec);
+
+	assert_eq!(
+		mount_source(plan.argv(), "--ro-bind", &future).to_str(),
+		Some("@omp-bwrap-directory-mask@"),
+	);
+	assert!(plan.enforced().contains(Capability::FsWriteDeny));
+	assert!(
+		!plan
+			.caveats()
+			.iter()
+			.any(|caveat| caveat.capability == Some(Capability::FsWriteDeny))
+	);
+}
+
+#[test]
+fn temporary_and_overlay_write_denies_accept_every_effective_writable_region() {
+	let temporary_root = tempdir().expect("temporary write scope");
+	let temporary = fs::canonicalize(temporary_root.path())
+		.expect("canonical temporary scope")
+		.join("future-deny");
+	let mut scoped = SandboxSpec::new(executable());
+	scoped.set_write(WriteMode::Scoped).set_allow_temp(true);
+	scoped
+		.deny_write(&temporary)
+		.expect("temporary write denial");
+	let scoped = compile(scoped);
+	assert_eq!(
+		mount_source(scoped.argv(), "--ro-bind", &temporary).to_str(),
+		Some("@omp-bwrap-directory-mask@"),
+	);
+
+	let root = tempdir().expect("overlay paths");
+	let writable = root.path().join("writable");
+	let outside = root.path().join("outside");
+	fs::create_dir(&writable).expect("writable directory");
+	fs::create_dir(&outside).expect("outside directory");
+	let mut overlay = SandboxSpec::new(executable());
+	overlay
+		.set_write(WriteMode::Overlay)
+		.set_degradation(DegradationPolicy::AllowCaveats);
+	overlay.allow_write(&writable).expect("overlay write scope");
+	overlay
+		.deny_write(&outside)
+		.expect("overlay-wide write denial");
+	let overlay = compile(overlay);
+	assert!(overlay.enforced().contains(Capability::FsWriteDeny));
+	assert!(
+		!overlay
+			.argv()
+			.windows(3)
+			.any(|window| window[0] == "--ro-bind" && Path::new(&window[2]) == outside),
+		"the already-read-only Bubblewrap root needs no redundant carve-out",
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_deny_preserves_a_symlink_literal_separately_from_its_target() {
+	use std::os::unix::fs::symlink;
+
+	let root = tempdir().expect("writable root");
+	let target_root = tempdir().expect("symlink target");
+	let target = target_root.path().join("target");
+	let link = root.path().join("link");
+	fs::create_dir(&target).expect("target directory");
+	symlink(&target, &link).expect("symlink");
+	let literal = root
+		.path()
+		.canonicalize()
+		.expect("canonical root")
+		.join("link");
+	let canonical_target = target.canonicalize().expect("canonical target");
+
+	let mut spec = SandboxSpec::new(executable());
+	spec
+		.set_write(WriteMode::Overlay)
+		.set_degradation(DegradationPolicy::AllowCaveats);
+	spec.allow_write(root.path()).expect("write root");
+	spec.deny_write(&link).expect("symlink write denial");
+	let plan = compile(spec);
+
+	assert!(has_mount(plan.argv(), "--ro-bind", &literal, &literal));
+	assert!(
+		!has_mount(plan.argv(), "--ro-bind", &canonical_target, &canonical_target),
+		"the target is already beneath Bubblewrap's read-only root",
+	);
 }
 
 #[test]
@@ -141,10 +275,17 @@ fn unsupported_modes_reject_or_narrow_authoritative_enforcement() {
 	assert_missing(&outbound, Capability::NetOutbound);
 	outbound.set_degradation(DegradationPolicy::AllowCaveats);
 	let plan = compile(outbound);
-	assert!(plan.enforced().contains(Capability::NetDisable));
+	assert!(plan.enforced().contains(Capability::NetEnable));
+	assert!(!plan.enforced().contains(Capability::NetDisable));
 	assert!(!plan.enforced().contains(Capability::NetOutbound));
-	assert!(!plan.argv().iter().any(|argument| argument == "--share-net"));
-	assert_caveat(&plan, Capability::NetOutbound);
+	assert!(plan.argv().iter().any(|argument| argument == "--share-net"));
+	assert!(plan.caveats().iter().any(|caveat| {
+		caveat.capability == Some(Capability::NetOutbound)
+			&& caveat
+				.message
+				.as_str()
+				.contains("inbound listeners are not blocked")
+	}));
 	assert_enforced_subset(&plan);
 
 	let mut ephemeral = SandboxSpec::new(executable());
@@ -173,6 +314,25 @@ fn unsupported_modes_reject_or_narrow_authoritative_enforcement() {
 	assert!(has_mount(plan.argv(), "--bind", &writable, &writable));
 	assert_caveat(&plan, Capability::FsWriteEphemeral);
 	assert_enforced_subset(&plan);
+}
+
+#[test]
+fn unsupervised_plans_omit_die_with_parent() {
+	let mut spec = SandboxSpec::new(executable());
+	spec.set_supervised(false);
+	let plan = compile(spec);
+	assert!(
+		!plan
+			.argv()
+			.iter()
+			.any(|argument| argument == "--die-with-parent")
+	);
+	assert!(
+		plan
+			.argv()
+			.iter()
+			.any(|argument| argument == "--new-session")
+	);
 }
 
 #[test]
@@ -240,13 +400,22 @@ fn wrapper_prefix_executes_and_filters_environment_names() {
 	}
 	let mut spec = SandboxSpec::new("");
 	spec.deny_env("*TOKEN*").expect("deny environment glob");
+	spec
+		.set_network(NetworkMode::Outbound)
+		.set_degradation(DegradationPolicy::AllowCaveats);
 	let wrapper = Runner::for_backend(Backend::Bubblewrap)
 		.wrap_template(&spec)
 		.expect("compile wrapper");
 	assert!(wrapper.env_allowed("PATH"));
 	assert!(!wrapper.env_allowed("API_TOKEN"));
+	assert!(
+		wrapper
+			.caveats()
+			.iter()
+			.any(|caveat| caveat.capability == Some(Capability::NetOutbound))
+	);
 	assert_eq!(wrapper.prefix_args().last().and_then(|arg| arg.to_str()), Some("--"));
-	let output = Command::new(wrapper.launcher())
+	let output = Command::new(wrapper.launcher().expect("kernel launcher"))
 		.args(wrapper.prefix_args())
 		.arg("/bin/echo")
 		.arg("wrapped")
@@ -254,6 +423,37 @@ fn wrapper_prefix_executes_and_filters_environment_names() {
 		.expect("run wrapped echo");
 	assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 	assert_eq!(output.stdout, b"wrapped\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prepared_future_write_deny_uses_an_owned_directory_mask() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	if !omp_sandbox::backend_status(Backend::Bubblewrap).is_available() {
+		return;
+	}
+	let root = tempdir().expect("writable scope");
+	let future = root.path().join("not-created");
+	let mut spec = SandboxSpec::new(executable());
+	spec.set_write(WriteMode::Scoped);
+	spec.allow_write(root.path()).expect("write scope");
+	spec.deny_write(&future).expect("future write denial");
+	let runner = Runner::for_backend(Backend::Bubblewrap);
+	let plan = runner.compile(&spec).expect("Bubblewrap plan");
+	let prepared = runner.prepare(plan, &spec).expect("prepared mask");
+	let source = mount_source(prepared.args(), "--ro-bind", &future).to_path_buf();
+	assert!(source.is_dir());
+	assert_eq!(
+		fs::metadata(&source)
+			.expect("directory mask")
+			.permissions()
+			.mode()
+			& 0o777,
+		0o700,
+	);
+	drop(prepared);
+	assert!(!source.exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -308,7 +508,7 @@ fn prepared_masks_are_private_owned_and_removed_on_drop() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn live_bubblewrap_confines_reads_writes_socket_and_preserves_fd_three() {
+fn live_bubblewrap_confines_reads_writes_socket_and_preserves_fd_63() {
 	use std::{
 		io::Read as _,
 		os::{
@@ -330,6 +530,7 @@ fn live_bubblewrap_confines_reads_writes_socket_and_preserves_fd_three() {
 	let denied = root.path().join("denied");
 	let writable_directory = root.path().join("writable");
 	let writable = writable_directory.join("created");
+	let future_denied = writable_directory.join("blocked");
 	let outside = root.path().join("outside");
 	let socket = root.path().join("service.sock");
 	fs::write(&readable, "readable").expect("readable file");
@@ -339,7 +540,7 @@ fn live_bubblewrap_confines_reads_writes_socket_and_preserves_fd_three() {
 
 	let script = r#"
 import os, socket, sys
-readable, denied, writable, outside, socket_path = sys.argv[1:]
+readable, denied, writable, future_denied, outside, socket_path = sys.argv[1:]
 assert open(readable).read() == "readable"
 try:
     denied_value = open(denied).read()
@@ -348,6 +549,13 @@ except OSError:
 assert denied_value != "denied-secret"
 with open(writable, "w") as stream:
     stream.write("persisted")
+try:
+    with open(future_denied, "w") as stream:
+        stream.write("blocked")
+except OSError:
+    pass
+else:
+    raise AssertionError("future write-deny creation succeeded")
 try:
     with open(outside, "w") as stream:
         stream.write("escaped")
@@ -359,7 +567,7 @@ client = socket.socket(socket.AF_UNIX)
 client.connect(socket_path)
 client.sendall(b"socket")
 client.close()
-os.fstat(3)
+os.fstat(63)
 print("ok")
 "#;
 	let mut spec = SandboxSpec::new("python3");
@@ -369,10 +577,12 @@ print("ok")
 		.arg(&readable)
 		.arg(&denied)
 		.arg(&writable)
+		.arg(&future_denied)
 		.arg(&outside)
 		.arg(&socket);
 	spec.set_write(WriteMode::Scoped);
 	spec.allow_write(&writable_directory).expect("write scope");
+	spec.deny_write(&future_denied).expect("future write deny");
 	spec.deny_read(&denied).expect("read deny");
 	spec.allow_unix_socket(&socket).expect("socket grant");
 
@@ -394,7 +604,7 @@ print("ok")
 	// between fork and exec; the source descriptor remains owned until output().
 	unsafe {
 		command.pre_exec(move || {
-			if libc::dup2(inherited_fd, 3) == -1 {
+			if libc::dup2(inherited_fd, 63) == -1 {
 				return Err(std::io::Error::last_os_error());
 			}
 			Ok(())

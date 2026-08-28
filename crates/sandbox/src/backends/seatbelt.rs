@@ -1,6 +1,7 @@
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::{
+	collections::BTreeSet,
 	env,
 	ffi::OsString,
 	fmt::Write as _,
@@ -17,11 +18,111 @@ use crate::{
 	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
 	WriteMode, paths::temp_roots, runner::COMMAND_WRAPPER_PLACEHOLDER,
 };
-
 const LAUNCHER: &str = "/usr/bin/sandbox-exec";
 pub(crate) const EPHEMERAL_ROOT_PLACEHOLDER: &str = "<omp-sandbox-ephemeral-root>";
-const TLS_TRUST_MACH_SERVICES: [&str; 3] =
-	["com.apple.trustd", "com.apple.trustd.agent", "com.apple.SecurityServer"];
+
+const SEATBELT_BASE_POLICY: &str = r#"(version 1)
+(deny default)
+(allow process-exec*)
+(allow process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read
+	(sysctl-name "hw.activecpu")
+	(sysctl-name "hw.busfrequency_compat")
+	(sysctl-name "hw.byteorder")
+	(sysctl-name "hw.cacheconfig")
+	(sysctl-name "hw.cachelinesize_compat")
+	(sysctl-name "hw.cpufamily")
+	(sysctl-name "hw.cpufrequency_compat")
+	(sysctl-name "hw.cputype")
+	(sysctl-name "hw.l1dcachesize_compat")
+	(sysctl-name "hw.l1icachesize_compat")
+	(sysctl-name "hw.l2cachesize_compat")
+	(sysctl-name "hw.l3cachesize_compat")
+	(sysctl-name "hw.logicalcpu_max")
+	(sysctl-name "hw.machine")
+	(sysctl-name "hw.model")
+	(sysctl-name "hw.memsize")
+	(sysctl-name "hw.ncpu")
+	(sysctl-name "hw.nperflevels")
+	(sysctl-name-prefix "hw.optional.arm.")
+	(sysctl-name-prefix "hw.optional.armv8_")
+	(sysctl-name "hw.packages")
+	(sysctl-name "hw.pagesize_compat")
+	(sysctl-name "hw.pagesize")
+	(sysctl-name "hw.physicalcpu")
+	(sysctl-name "hw.physicalcpu_max")
+	(sysctl-name "hw.logicalcpu")
+	(sysctl-name "hw.cpufrequency")
+	(sysctl-name "hw.tbfrequency_compat")
+	(sysctl-name "hw.vectorunit")
+	(sysctl-name "machdep.cpu.brand_string")
+	(sysctl-name "kern.argmax")
+	(sysctl-name "kern.hostname")
+	(sysctl-name "kern.maxfilesperproc")
+	(sysctl-name "kern.maxproc")
+	(sysctl-name "kern.osproductversion")
+	(sysctl-name "kern.osrelease")
+	(sysctl-name "kern.ostype")
+	(sysctl-name "kern.osvariant_status")
+	(sysctl-name "kern.osversion")
+	(sysctl-name "kern.secure_kernel")
+	(sysctl-name "kern.sysv.semmns")
+	(sysctl-name "kern.usrstack64")
+	(sysctl-name "kern.version")
+	(sysctl-name "sysctl.proc_cputype")
+	(sysctl-name "vm.loadavg")
+	(sysctl-name-prefix "hw.perflevel")
+	(sysctl-name-prefix "kern.proc.pgrp.")
+	(sysctl-name-prefix "kern.proc.pid.")
+	(sysctl-name-prefix "net.routetable."))
+(allow sysctl-write (sysctl-name "kern.grade_cputype"))
+(allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))
+(deny mach-lookup)
+(allow mach-lookup
+	(global-name "com.apple.system.opendirectoryd.libinfo")
+	(global-name "com.apple.PowerManagement.control"))
+(allow ipc-posix-sem)
+(allow ipc-posix-shm-read-data
+	ipc-posix-shm-write-create
+	ipc-posix-shm-write-unlink
+	(ipc-posix-name-regex #"^/__KMP_REGISTERED_LIB_[0-9]+$"))
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write*
+	(require-all
+		(regex #"^/dev/ttys[0-9]+")
+		(extension "com.apple.sandbox.pty")))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+"))
+(allow file-read* file-write* file-ioctl
+	(literal "/dev/null")
+	(literal "/dev/tty"))
+(allow file-read* file-ioctl
+	(literal "/dev/zero")
+	(literal "/dev/random")
+	(literal "/dev/urandom")
+	(subpath "/dev/fd"))
+"#;
+
+const NETWORK_MACH_SERVICES: [&str; 9] = [
+	"com.apple.trustd",
+	"com.apple.trustd.agent",
+	"com.apple.SecurityServer",
+	"com.apple.bsd.dirhelper",
+	"com.apple.system.opendirectoryd.membership",
+	"com.apple.networkd",
+	"com.apple.ocspd",
+	"com.apple.SystemConfiguration.DNSConfiguration",
+	"com.apple.SystemConfiguration.configd",
+];
+
+const NETWORK_SERVICE_POLICY: &str = r#"(allow system-socket
+	(require-all
+		(socket-domain AF_SYSTEM)
+		(socket-protocol 2)))
+(allow sysctl-read (sysctl-name-regex #"^net.routetable"))
+"#;
 
 pub(crate) fn compile(
 	spec: &SandboxSpec,
@@ -33,14 +134,14 @@ pub(crate) fn compile(
 	if spec.write == WriteMode::Overlay {
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteEphemeral));
 	}
-	let mut profile = String::from("(version 1)\n(allow default)\n(deny mach-lookup)\n");
+	let mut profile = String::from(SEATBELT_BASE_POLICY);
 	let mut mach_services: Vec<&str> = spec
 		.mach_services
 		.iter()
 		.map(|service| service.as_str())
 		.collect();
 	if matches!(spec.network, NetworkMode::Enabled | NetworkMode::Outbound) {
-		for service in TLS_TRUST_MACH_SERVICES {
+		for service in NETWORK_MACH_SERVICES {
 			if !mach_services.contains(&service) {
 				mach_services.push(service);
 			}
@@ -53,13 +154,28 @@ pub(crate) fn compile(
 	}
 	match spec.network {
 		NetworkMode::Disabled => profile.push_str("(deny network*)\n"),
-		NetworkMode::Enabled => {},
-		NetworkMode::Outbound => profile.push_str("(deny network-inbound)\n"),
+		NetworkMode::Enabled => {
+			profile.push_str(NETWORK_SERVICE_POLICY);
+			profile.push_str("(allow network-outbound)\n(allow network-inbound)\n");
+		},
+		NetworkMode::Outbound => {
+			profile.push_str(NETWORK_SERVICE_POLICY);
+			profile.push_str("(allow network-outbound)\n");
+			profile.push_str("(deny network-inbound)\n(deny network-bind)\n");
+			// Seatbelt uses the last matching rule. Close UDS after the broad
+			// outbound grant, then reopen only the system resolver endpoint.
+			profile.push_str("(deny network-outbound (remote unix-socket))\n");
+			profile.push_str(
+				"(allow network-outbound (remote unix-socket (path-literal \
+				 \"/private/var/run/mDNSResponder\")))\n",
+			);
+		},
 	}
 
 	if spec.readable.is_empty() {
 		// Broad reads still exclude raw disk and kernel-memory devices. Otherwise a
 		// privileged caller could bypass the filesystem policy entirely.
+		profile.push_str("(allow file-read*)\n");
 		profile.push_str("(deny file-read* (regex #\"^/dev/r?disk\"))\n");
 		profile.push_str("(deny file-read* (regex #\"^/dev/(mem|kmem|kcore)$\"))\n");
 	} else {
@@ -130,7 +246,8 @@ pub(crate) fn compile(
 		push_path_string(&mut profile, program);
 		profile.push_str("))\n");
 	}
-	// Socket exceptions deliberately follow the blanket IP-network denial.
+	// Caller-declared socket exceptions stay last so they can reopen named
+	// endpoints without weakening the preceding blanket network/UDS denial.
 	for socket in &spec.unix_sockets {
 		profile.push_str("(allow network-outbound (remote unix-socket (path-literal ");
 		push_path_string(&mut profile, socket);
@@ -210,8 +327,8 @@ pub(crate) fn compile(
 			"Seatbelt network denial also blocks loopback IP sockets",
 		)),
 		NetworkMode::Enabled | NetworkMode::Outbound => plan.add_caveat(Caveat::general(
-			"Seatbelt re-allows Apple TLS trust Mach services so Security.framework clients can \
-			 validate certificates",
+			"Seatbelt re-allows the Apple TLS trust, DNS, and network-configuration services needed \
+			 by network clients",
 		)),
 	}
 	if spec.network == NetworkMode::Outbound {
@@ -360,6 +477,7 @@ fn push_write_scopes<'a>(
 	paths: impl IntoIterator<Item = &'a Path>,
 	denied: &[PathBuf],
 ) {
+	let mut protected_ancestors = BTreeSet::new();
 	for path in paths {
 		let filter = if path.is_dir() || !path.exists() {
 			"subpath"
@@ -377,8 +495,21 @@ fn push_write_scopes<'a>(
 			profile.push_str(")) (require-not (literal ");
 			push_path_string(profile, denied);
 			profile.push_str("))");
+			if denied.starts_with(path) {
+				for ancestor in denied.parent().into_iter().flat_map(Path::ancestors) {
+					if !ancestor.starts_with(path) {
+						break;
+					}
+					protected_ancestors.insert(ancestor.to_owned());
+				}
+			}
 		}
 		profile.push_str("))\n");
+	}
+	for ancestor in protected_ancestors {
+		profile.push_str("(deny file-write-unlink (require-all (vnode-type DIRECTORY) (literal ");
+		push_path_string(profile, &ancestor);
+		profile.push_str(")))\n");
 	}
 }
 

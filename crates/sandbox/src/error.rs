@@ -74,6 +74,14 @@ pub enum ProbeFailure {
 		/// Missing environment variable.
 		variable: &'static str,
 	},
+	/// The running Linux kernel exposes an older Landlock ABI than required.
+	#[error("landlock ABI {required} is required, but the kernel exposes ABI {available}")]
+	LandlockAbi {
+		/// Minimum ABI providing the capabilities advertised by the backend.
+		required:  u32,
+		/// ABI reported by the running kernel.
+		available: u32,
+	},
 	/// The current host cannot execute this backend.
 	#[error("{backend} is not executable on {os}")]
 	WrongHost {
@@ -135,8 +143,8 @@ pub enum SpecViolation {
 	/// Scoped write mode needs at least one writable location.
 	#[error("write mode scope requires a writable path or temporary writes")]
 	EmptyWriteScope,
-	/// A write-deny carve-out must be nested under a writable scope.
-	#[error("write-deny paths must be inside an explicitly writable scope")]
+	/// A write-deny carve-out must be nested under an effective writable scope.
+	#[error("write-deny paths must be inside an effective writable scope")]
 	WriteDenyOutsideScope,
 	/// A scoped-read working directory must itself be readable or writable.
 	#[error("the working directory is outside every readable and writable scope")]
@@ -380,6 +388,29 @@ pub enum SandboxError {
 	ExecutableNotFound {
 		/// Unresolved executable name.
 		program: OsString,
+	},
+	/// The hidden same-binary sandbox child received a malformed argv contract.
+	#[error("invalid hidden sandbox child arguments")]
+	InvalidSandboxChildArguments,
+	/// The kernel accepted the Landlock ruleset request without fully enforcing it.
+	#[cfg(target_os = "linux")]
+	#[error("the kernel did not fully enforce the Landlock ruleset")]
+	LandlockNotEnforced,
+	/// A Landlock ruleset could not be built or installed.
+	#[cfg(target_os = "linux")]
+	#[error("failed to install the Landlock ruleset")]
+	Landlock {
+		/// Landlock ruleset failure.
+		#[from]
+		source: landlock::RulesetError,
+	},
+	/// A seccomp program could not be built or installed.
+	#[cfg(target_os = "linux")]
+	#[error("failed to build or install the seccomp filter")]
+	Seccomp {
+		/// Seccomp compiler or kernel-installation failure.
+		#[from]
+		source: seccompiler::Error,
 	},
 	/// A backend mount path cannot be represented safely.
 	#[error("sandbox backend {backend} cannot mount path {path}")]
