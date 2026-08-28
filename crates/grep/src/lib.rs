@@ -667,6 +667,19 @@ impl Matcher for CompiledMatcher {
 /// Search an in-memory byte slice.
 ///
 /// The `path` option is copied into returned matches as their display path.
+#[tracing::instrument(
+	level = "debug",
+	name = "grep_search_memory",
+	skip_all,
+	fields(
+		root = %options.path,
+		pattern_bytes = options.pattern.len(),
+		multiline = options.multiline,
+		ignore_case = options.ignore_case,
+		byte_count = content.len(),
+		match_count = tracing::field::Empty
+	)
+)]
 pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepError> {
 	let deadline = Deadline::new(options.timeout_ms);
 	deadline.check()?;
@@ -691,7 +704,9 @@ pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepE
 	};
 	deadline.check()?;
 	summary.files_searched = 1;
-	Ok(collector.finish(summary))
+	let result = collector.finish(summary);
+	tracing::Span::current().record("match_count", result.total_matches);
+	Ok(result)
 }
 
 /// Stream exact matches from a file or directory in deterministic path and
@@ -700,6 +715,20 @@ pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepE
 /// Candidate discovery may run in parallel inside [`WalkRequest`], while file
 /// delivery follows its explicit [`WalkOrder::Path`] sequence. The function
 /// never collects match records or performs a terminal match sort.
+#[tracing::instrument(
+	level = "debug",
+	name = "grep_search",
+	skip_all,
+	fields(
+		root = %options.path,
+		pattern_bytes = options.pattern.len(),
+		multiline = options.multiline,
+		ignore_case = options.ignore_case,
+		candidate_count = tracing::field::Empty,
+		files_searched = tracing::field::Empty,
+		match_count = tracing::field::Empty
+	)
+)]
 pub fn grep_stream<S: GrepSink>(
 	options: &GrepOptions,
 	sink: &mut S,
@@ -715,7 +744,10 @@ pub fn grep_stream<S: GrepSink>(
 	})
 	.map_err(GrepStreamError::Grep)?;
 	if !metadata.is_file() && !metadata.is_dir() {
-		return Ok(GrepStreamSummary::default());
+		tracing::Span::current().record("candidate_count", 0);
+		let summary = GrepStreamSummary::default();
+		record_stream_summary(&summary);
+		return Ok(summary);
 	}
 
 	let mut summary = GrepStreamSummary::default();
@@ -738,6 +770,7 @@ pub fn grep_stream<S: GrepSink>(
 				})
 			})?
 	};
+	tracing::Span::current().record("candidate_count", candidates.len());
 	let mut saw_limit = false;
 	for candidate in &candidates {
 		deadline.check().map_err(GrepStreamError::Grep)?;
@@ -747,6 +780,7 @@ pub fn grep_stream<S: GrepSink>(
 			.map(|maximum| maximum.saturating_sub(summary.matches));
 		if remaining == Some(0) {
 			summary.status = GrepStreamStatus::LimitReached;
+			record_stream_summary(&summary);
 			return Ok(summary);
 		}
 		let mode_limit = if options.mode == GrepOutputMode::FilesWithMatches {
@@ -779,6 +813,7 @@ pub fn grep_stream<S: GrepSink>(
 		match file.status {
 			GrepStreamStatus::Stopped | GrepStreamStatus::Cancelled => {
 				summary.status = file.status;
+				record_stream_summary(&summary);
 				return Ok(summary);
 			},
 			GrepStreamStatus::LimitReached => saw_limit = true,
@@ -789,6 +824,7 @@ pub fn grep_stream<S: GrepSink>(
 			.is_some_and(|maximum| summary.matches >= u64::from(maximum))
 		{
 			summary.status = GrepStreamStatus::LimitReached;
+			record_stream_summary(&summary);
 			return Ok(summary);
 		}
 	}
@@ -798,7 +834,14 @@ pub fn grep_stream<S: GrepSink>(
 	} else {
 		GrepStreamStatus::Complete
 	};
+	record_stream_summary(&summary);
 	Ok(summary)
+}
+
+fn record_stream_summary(summary: &GrepStreamSummary) {
+	let span = tracing::Span::current();
+	span.record("files_searched", summary.files_searched);
+	span.record("match_count", summary.matches);
 }
 
 /// Search a file or directory synchronously and collect the streaming records.
@@ -973,7 +1016,10 @@ fn build_matcher(
 		Err(error) => error,
 	};
 	let pcre2_error = match build_pcre_matcher(sanitized.as_ref(), ignore_case, multiline) {
-		Ok(matcher) => return Ok(CompiledMatcher::Pcre2(matcher)),
+		Ok(matcher) => {
+			tracing::debug!("using PCRE2 regex fallback");
+			return Ok(CompiledMatcher::Pcre2(matcher));
+		},
 		Err(error) => error,
 	};
 
@@ -982,20 +1028,26 @@ fn build_matcher(
 		let escaped = escape_unescaped_parentheses(sanitized.as_ref());
 		if escaped.as_ref() != sanitized.as_ref() {
 			if let Ok(matcher) = build_regex_matcher(escaped.as_ref(), ignore_case, multiline) {
+				tracing::warn!("repaired invalid regex parentheses");
 				return Ok(CompiledMatcher::Rust(matcher));
 			}
 			if let Ok(matcher) = build_pcre_matcher(escaped.as_ref(), ignore_case, multiline) {
+				tracing::warn!("repaired invalid regex parentheses with PCRE2");
 				return Ok(CompiledMatcher::Pcre2(matcher));
 			}
 		}
 	}
 
-	build_regex_matcher(&regex::escape(pattern), ignore_case, multiline)
-		.map(CompiledMatcher::Rust)
-		.map_err(|_| GrepError::InvalidRegex {
+	match build_regex_matcher(&regex::escape(pattern), ignore_case, multiline) {
+		Ok(matcher) => {
+			tracing::warn!("using literal fallback for invalid regex");
+			Ok(CompiledMatcher::Rust(matcher))
+		},
+		Err(_) => Err(GrepError::InvalidRegex {
 			regex: Str::from(message),
 			pcre2: Str::from(pcre2_error.to_string()),
-		})
+		}),
+	}
 }
 
 fn sanitize_braces(pattern: &str) -> Cow<'_, str> {

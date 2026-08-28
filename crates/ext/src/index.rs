@@ -34,14 +34,31 @@ pub struct IndexConfigEntry {
 
 impl IndexConfig {
 	/// Reads an absent config as an empty index list.
+	#[tracing::instrument(
+		name = "extension_index_config_read",
+		level = "debug",
+		skip_all,
+		fields(path = %path.display())
+	)]
 	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
 		if !path.exists() {
+			tracing::debug!(cache_hit = false, "extension index config not found");
 			return Ok(Self::default());
 		}
-		let text = fs::read_to_string(path)
-			.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))?;
-		toml::from_str(&text)
+		let result = fs::read_to_string(path)
 			.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))
+			.and_then(|text| {
+				toml::from_str::<Self>(&text)
+					.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))
+			});
+		if let Ok(config) = &result {
+			tracing::debug!(
+				cache_hit = true,
+				index_count = config.entries.len(),
+				"extension index config loaded"
+			);
+		}
+		result
 	}
 }
 
@@ -185,13 +202,31 @@ struct UnsignedIndex<'a> {
 
 impl SignedIndex {
 	/// Reads and validates a signed JSON index snapshot.
+	#[tracing::instrument(
+		name = "extension_index_load",
+		level = "debug",
+		skip_all,
+		fields(path = %path.display())
+	)]
 	pub fn read(path: &Path, index_key: &str) -> Result<Self, ExtensionError> {
-		let bytes = fs::read(path)
-			.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))?;
-		let index: Self = serde_json::from_slice(&bytes)
-			.map_err(|error| ExtensionError::new(ExtensionCode::EManifestParse, error.to_string()))?;
-		index.verify(index_key)?;
-		Ok(index)
+		let result: Result<Self, ExtensionError> = (|| {
+			let bytes = fs::read(path)
+				.map_err(|error| ExtensionError::new(ExtensionCode::EIntegrity, error.to_string()))?;
+			let index: Self = serde_json::from_slice(&bytes).map_err(|error| {
+				ExtensionError::new(ExtensionCode::EManifestParse, error.to_string())
+			})?;
+			index.verify(index_key)?;
+			Ok(index)
+		})();
+		if let Ok(index) = &result {
+			tracing::debug!(
+				cache_hit = true,
+				index_name = %index.name,
+				extension_count = index.extensions.len(),
+				"extension index cache loaded"
+			);
+		}
+		result
 	}
 
 	/// Verifies version, freshness, canonical ordering, uniqueness, and the
@@ -202,6 +237,12 @@ impl SignedIndex {
 	}
 
 	/// Verifies a signed index at an authority-supplied instant.
+	#[tracing::instrument(
+		name = "extension_index_verify",
+		level = "debug",
+		skip_all,
+		fields(index_name = %self.name, extension_count = self.extensions.len())
+	)]
 	pub fn verify_at(&self, index_key: &str, now: Timestamp) -> Result<(), ExtensionError> {
 		if self.version != INDEX_VERSION {
 			return Err(ExtensionError::new(

@@ -360,6 +360,7 @@ async fn read_ndjson(runtime: Arc<Runtime>) -> miette::Result<()> {
 		let value: Value = match serde_json::from_str(&line) {
 			Ok(value) => value,
 			Err(error) => {
+				tracing::warn!(%error, "malformed ACP request");
 				runtime.error(Value::Null, -32700, error.to_string())?;
 				continue;
 			},
@@ -1456,6 +1457,7 @@ impl Runtime {
 				fork: None,
 				py_eval: false,
 				approval_mode: None,
+				spawn_idle_timeout: None,
 				pty_denied: false,
 				credential_provider: None,
 				api_key: None,

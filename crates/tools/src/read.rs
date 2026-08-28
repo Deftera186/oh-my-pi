@@ -13,9 +13,10 @@ use omp_tool::{
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{
-	path::{HostPaths, normalize_target},
+	path::{HostPaths, normalize_target, tracing_path_metadata},
 	render::{
 		TextProjection,
 		truncate::{TruncationOptions, append_blob_truncation_notice, truncate_head},
@@ -501,6 +502,43 @@ impl Drop for InterruptSqliteOnDrop {
 	}
 }
 
+/// Returns the host-free `read@1` specification for a frozen projection policy.
+pub fn spec(policy: ReadPolicy) -> ToolSpec {
+	let description = if policy.hashline_headers {
+		sf!(DESCRIPTION)
+	} else {
+		Str::new(DESCRIPTION.replace(
+			"- File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy \
+			 `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.",
+			"- File + selector → numbered lines. This registry projection is read-only or has no \
+			 compatible hashline edit revision, so snapshot headers are suppressed.",
+		))
+	};
+	ToolSpec {
+		name: sf!("read"),
+		rev: Rev { family: Default::default(), n: 1 },
+		description,
+		schema: omp_tool::schema::<Params>(),
+		constraint: Constraint::Schema {
+			priority:       10,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects: Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("read.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Constructs the `read@1` tool without internal URL resolvers.
 pub fn tool<S: ReadSources, B: ReadBlobs>(
 	sources: S,
@@ -548,16 +586,6 @@ pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 	conflicts: Arc<conflicts::ConflictRegistry>,
 	policy: ReadPolicy,
 ) -> ReadTool<S, B, R> {
-	let description = if policy.hashline_headers {
-		sf!(DESCRIPTION)
-	} else {
-		Str::new(DESCRIPTION.replace(
-			"- File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy \
-			 `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.",
-			"- File + selector → numbered lines. This registry projection is read-only or has no \
-			 compatible hashline edit revision, so snapshot headers are suppressed.",
-		))
-	};
 	ReadTool {
 		sources,
 		blobs,
@@ -565,29 +593,7 @@ pub fn tool_with_policy<S: ReadSources, B: ReadBlobs, R: resolver::Resolve>(
 		conflicts,
 		policy,
 		repeat_reads: Mutex::default(),
-		spec: ToolSpec {
-			name: sf!("read"),
-			rev: Rev { family: Default::default(), n: 1 },
-			description,
-			schema: omp_tool::schema::<Params>(),
-			constraint: Constraint::Schema {
-				priority:       10,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects: Effects {
-				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("read.rs"),
-			)
-			.into(),
-		},
+		spec: spec(policy),
 	}
 }
 
@@ -605,6 +611,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 		&'c self,
 		mut incoming: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Update, Payload, Fault>> + Send + 'c {
+		let span = tracing::debug_span!("read_execution", path = tracing::field::Empty);
 		stream! {
 			let pulled = incoming.pull(|mut document| async move {
 				let mut root = document.json().object();
@@ -626,7 +633,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 				Err(CommitError::Protocol(reason)) => { yield Ev::Args(protocol_issue(reason)); return; },
 			}
 			let path = params.path;
-			let work = self.execute(path.clone()).fuse();
+			span.record("path", tracing::field::display(tracing_path_metadata(&path)));
+			let work = self.execute(path.clone()).instrument(span.clone()).fuse();
 			let cancel = incoming.next_interrupt().fuse();
 			pin_mut!(work, cancel);
 			let result = select_biased! {

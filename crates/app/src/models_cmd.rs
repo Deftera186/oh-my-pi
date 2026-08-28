@@ -134,18 +134,18 @@ async fn composed_catalog(
 		omp_agent::advisor::AdvisorAdviceQueue::default(),
 		&discovery.content,
 	);
-	let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
-		&root,
-		&state_dir,
-		&omp_env::project_state::document_socket(&state_dir),
-		false,
-		&extension_specs,
-		&launch.contributed,
-		settings_snapshot,
-		bridges,
-	)
-	.await
-	.into_diagnostic()?;
+	let environment =
+		omp_envd::ProjectEnvironment::attach(&root, &state_dir, omp_envd::AttachOptions {
+			py_eval: false,
+			approval_mode: None,
+			trusted_extensions: extension_specs,
+			contributed_values: launch.contributed.clone(),
+			settings: settings_snapshot,
+			bridges,
+			spawn_idle_timeout: None,
+		})
+		.await
+		.into_diagnostic()?;
 	let evidences = environment.extension_registry_evidences();
 	let catalog = omp_driver::model_controls::compose_runtime_provider_catalog(
 		base.as_ref(),

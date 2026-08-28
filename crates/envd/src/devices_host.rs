@@ -155,6 +155,7 @@ impl DynHost {
 fn device_event_json(device: omp_tool::MountedDevice<'_>) -> Value {
 	let place = match device.route {
 		ToolRoute::Native => String::from("env"),
+		ToolRoute::Remote => String::from("remote"),
 		ToolRoute::Worker { name, .. } => format!("worker:{name}"),
 	};
 	let mut row = Map::from_iter([
@@ -471,6 +472,12 @@ async fn invoke_command<SE: ShellExtensions>(
 					return Ok(ExecutionResult::general_error());
 				},
 			}
+		},
+		ToolRoute::Remote => {
+			// Presentation-only declarations execute on the remote environment
+			// host; the local dyn builtin cannot dispatch them.
+			print_error(&context, "device is owned by the remote environment host")?;
+			return Ok(ExecutionResult::general_error());
 		},
 		ToolRoute::Worker { site, name: worker } => {
 			host

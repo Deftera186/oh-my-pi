@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use omp_app::chat_cmd::SessionControlFactories;
 use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_envd::{
-	ProjectEnvironment, RegistryBridges,
+	AttachOptions, ProjectEnvironment, RegistryBridges,
 	exthost::{
 		ControlAuthority, ControlAuthorityFactory, ControlCompositionError, ExtensionManifest,
 		control::{
@@ -17,6 +17,7 @@ use omp_envd::{
 	worker::{ExtHostSpec, HostKey},
 };
 use omp_ext::config::{StaticDeclaration, StaticDeclarations};
+use omp_settings::manager::{SettingsManager, SettingsPaths};
 use serde_json::Value;
 
 struct TaggedFactory {
@@ -184,18 +185,17 @@ async fn session_bundle_binds_replaces_and_revokes_atomically() {
 	let state = scratch.path().join("state");
 	fs::create_dir_all(&root).expect("project root");
 	fs::create_dir_all(&state).expect("state root");
-	let environment = ProjectEnvironment::connect_or_start(
-		&root,
-		&state,
-		&state.join("env.sock"),
-		&state.join("docs.sock"),
-		false,
-		None,
-		&[extension()],
-		&[],
-		omp_tool::DEFAULT_INTERRUPT_GRACE,
-		RegistryBridges::default(),
-	)
+	let environment = ProjectEnvironment::attach(&root, &state, AttachOptions {
+		py_eval:            false,
+		approval_mode:      None,
+		trusted_extensions: vec![extension()],
+		contributed_values: Vec::new(),
+		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
+			.expect("settings manager")
+			.snapshot(),
+		bridges:            RegistryBridges::default(),
+		spawn_idle_timeout: Some(2),
+	})
 	.await
 	.expect("embedded environment");
 

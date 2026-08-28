@@ -602,6 +602,8 @@ pub enum ChatCommand {
 	Switch(Str),
 	/// Open the catalog model picker.
 	ModelPicker,
+	/// Open the fullscreen models hub.
+	ModelHub,
 	/// Open the durable-session picker.
 	Resume,
 	/// Start a new durable session.
@@ -774,7 +776,7 @@ fn parse_input(text: &str, available: &[AvailableCommand]) -> Result<ChatCommand
 	let command = match spec.name {
 		"help" => ChatCommand::Help,
 		"login" => ChatCommand::Login((!parsed.args.is_empty()).then(|| Str::from(parsed.args))),
-		"model" if parsed.args.is_empty() => ChatCommand::ModelPicker,
+		"model" if parsed.args.is_empty() => ChatCommand::ModelHub,
 		"model" => ChatCommand::Model(Str::from(parsed.args)),
 		"switch" if !parsed.args.is_empty() => ChatCommand::Switch(Str::from(parsed.args)),
 		"switch" => ChatCommand::ModelPicker,
@@ -1139,7 +1141,7 @@ mod tests {
 		assert_eq!(commands.parse_input("/live"), Ok(ChatCommand::Live));
 		assert_eq!(parse_slash("/model: smol"), Some(ParsedSlash { name: "model", args: "smol" }));
 		assert_eq!(commands.parse_input("/model:smol"), Ok(ChatCommand::Model(sf!("smol"))));
-		assert_eq!(commands.parse_input("/model"), Ok(ChatCommand::ModelPicker));
+		assert_eq!(commands.parse_input("/model"), Ok(ChatCommand::ModelHub));
 		assert_eq!(commands.parse_input("/switch"), Ok(ChatCommand::ModelPicker));
 		assert_eq!(
 			commands.parse_input("/switch anthropic/opus"),

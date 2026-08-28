@@ -15,7 +15,6 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
-gix = { workspace = true }
 globset = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
@@ -43,9 +42,10 @@ omp-sandbox = { workspace = true }
 omp-settings = { workspace = true }
 omp-shell-engine = { workspace = true }
 omp-storage = { workspace = true }
-omp-telemetry = { workspace = true }
+omp-observability = { workspace = true }
 omp-tool = { workspace = true }
 omp-tools = { workspace = true }
+omp-vcs = { workspace = true }
 omp-voice = { workspace = true }
 omp-walker = { workspace = true }
 omp-webview = { workspace = true }

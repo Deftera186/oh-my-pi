@@ -22,9 +22,11 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{
 	glob::{Fault as GlobFault, WalkRequest, WalkResult},
+	path::tracing_path_metadata,
 	read::{
 		ReadBlobs,
 		resolver::Scheme,
@@ -348,7 +350,6 @@ impl Display for Fault {
 	}
 }
 impl error::Error for Fault {}
-
 /// Zero-box workspace traversal boundary shared by `grep@1` and `glob@1`.
 pub trait WorkspaceSearch: Send + Sync + 'static {
 	/// Execute a native regex search and return revision-pinned snapshot
@@ -384,42 +385,43 @@ pub struct Grep<W, B> {
 	spec:      ToolSpec,
 }
 
+/// Returns the host-free `grep@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("grep"),
+		rev:             Rev { family: Str::new(""), n: 1 },
+		description:     sf!(
+			"Searches files/internal URLs: Rust regex, PCRE2 fallback.\n\n<instruction>\n- `path`: \
+			 known files, directories, globs, internal URLs; roots `;`-separated.\n- Broad searches \
+			 may time out → narrow scope or use `glob` first.\n- One-file line selector: \
+			 `src/foo.ts:50-100`; never selects search root.\n- Literal `\\n` or `\\\\n` enables \
+			 cross-line patterns.\n</instruction>\n\n<critical>\n- MUST use instead of shell \
+			 `grep`/`rg`.\n</critical>",
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("grep.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Construct `grep@1` over `workspace` and the shared durable blob namespace.
 pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Grep<W, B> {
-	Grep {
-		workspace,
-		blobs,
-		spec: ToolSpec {
-			name:            sf!("grep"),
-			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     sf!(
-				"Searches files/internal URLs: Rust regex, PCRE2 fallback.\n\n<instruction>\n- \
-				 `path`: known files, directories, globs, internal URLs; roots `;`-separated.\n- \
-				 Broad searches may time out → narrow scope or use `glob` first.\n- One-file line \
-				 selector: `src/foo.ts:50-100`; never selects search root.\n- Literal `\\n` or \
-				 `\\\\n` enables cross-line patterns.\n</instruction>\n\n<critical>\n- MUST use \
-				 instead of shell `grep`/`rg`.\n</critical>",
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("grep.rs"),
-			)
-			.into(),
-		},
-	}
+	Grep { workspace, blobs, spec: spec() }
 }
 
 impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
@@ -436,6 +438,12 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+		let span = tracing::debug_span!(
+			"grep_execution",
+			pattern_len = tracing::field::Empty,
+			multiline = tracing::field::Empty,
+			path = tracing::field::Empty,
+		);
 		stream! {
 			let arguments = match params.whole::<Params>().await {
 				Ok(arguments) => arguments,
@@ -456,6 +464,17 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 				yield done(Err(Fault::EmptyPattern));
 				return;
 			}
+			span.record("pattern_len", arguments.pattern.len());
+			span.record(
+				"multiline",
+				arguments.pattern.contains('\n') || arguments.pattern.contains("\\n"),
+			);
+			span.record(
+				"path",
+				tracing::field::display(tracing_path_metadata(
+					arguments.path.as_deref().unwrap_or("."),
+				)),
+			);
 			let skip = match normalize_skip(arguments.skip) {
 				Ok(skip) => skip,
 				Err(fault) => {
@@ -474,14 +493,16 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 			let operation = async {
 				let result = self.workspace.search(request).await?;
 				prepare_payload(result, &roots, skip, &self.workspace, &self.blobs).await
-			}.fuse();
+			}.instrument(span.clone()).fuse();
 			let interruption = params.next_interrupt().fuse();
 			pin_mut!(operation, interruption);
 			select_biased! {
-				result = operation => yield done(result),
+				result = operation => {
+					yield done(result);
+				},
 				interrupt = interruption => {
 					yield interrupt_event(interrupt, "grep traversal owner disappeared");
-			},
+				},
 			}
 		}
 	}

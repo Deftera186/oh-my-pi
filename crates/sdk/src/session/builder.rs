@@ -15,8 +15,8 @@ use omp_catalog::{CandidateProvenance, Catalog, TransportKind};
 use omp_core::{Hash32, Str, sf};
 use omp_env::EnvClient;
 use omp_inference::transport::http::{HttpTransport, PreconnectLaunch};
+use omp_observability::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionStart};
 use omp_secrets::obfuscator::SecretObfuscator;
-use omp_telemetry::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionStart};
 use omp_tool::{CapsBase, Registry};
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -199,6 +199,12 @@ impl SessionBlueprint {
 
 	/// Composes the production agent loop and returns a launchable session
 	/// handle without exposing internal construction APIs.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_launch",
+		skip_all,
+		fields(session_id = %identity.id)
+	)]
 	pub fn launch_production(
 		self,
 		identity: SessionIdentity,
@@ -241,6 +247,12 @@ impl SessionBlueprint {
 	///
 	/// Callback classes crossing subsystem ownership require the same explicit
 	/// production boundary as [`Self::launch_production`].
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_launch",
+		skip_all,
+		fields(session_id = %identity.id)
+	)]
 	pub fn launch(
 		self,
 		identity: SessionIdentity,
@@ -273,6 +285,12 @@ impl SessionBlueprint {
 
 	/// Consumes the blueprint into a cold handle that revives from its journal
 	/// before accepting the first submission in this process.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_launch",
+		skip_all,
+		fields(session_id = %identity.id, initial_lifecycle = "disposed")
+	)]
 	pub fn revive(
 		self,
 		identity: SessionIdentity,
@@ -491,6 +509,12 @@ impl SessionBuilder {
 
 	/// Builds and launches a complete production session through the stable SDK
 	/// facade.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_create",
+		skip_all,
+		fields(session_id = %identity.id)
+	)]
 	pub fn create_session(
 		self,
 		catalog: &Catalog,
@@ -506,6 +530,7 @@ impl SessionBuilder {
 
 	/// Resolves roots, models, prompt bytes, and fork-cache inheritance without
 	/// touching credential material or starting processes.
+	#[tracing::instrument(level = "debug", name = "sdk_session_build", skip_all)]
 	pub fn build(
 		self,
 		catalog: &Catalog,

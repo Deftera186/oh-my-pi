@@ -21,6 +21,7 @@ use omp_proto::{
 		v1::{self as value_pb, value},
 	},
 	policy::v1::{EffectEnvelope, PolicyDenied as WirePolicyDenied},
+	prost::Message as _,
 	thread::v1::{Item, Part as CanonicalPart},
 	toolhost::v1::HookEventId,
 };
@@ -186,6 +187,9 @@ async fn gate_tool_call(
 		"batch": [],
 		"deadline": Value::Null,
 		"bash": Value::Null,
+		"__omp_bash_proto": query.bash.as_ref().map(|bash| serde_json::json!({
+			"$bytes": omp_core::base64::encode(&bash.encode_to_vec()),
+		})),
 	});
 	let encoded = match serde_json::to_vec(&payload) {
 		Ok(encoded) => encoded,
@@ -253,13 +257,25 @@ async fn gate_tool_call(
 			admission: hook_policy_denied(query, reason, policy),
 			effects:   Effects::empty(),
 		},
-		GateOutcome::Approval { .. } => InvocationAdmission {
-			admission: hook_policy_denied(
-				query,
-				sf!("tool_call hook requires unavailable approval"),
-				None,
-			),
-			effects:   Effects::empty(),
+		GateOutcome::Approval { specs, .. } => {
+			let rules = specs
+				.into_iter()
+				.flat_map(|spec| spec.evidence)
+				.collect::<Vec<_>>();
+			let reason = sf!("tool_call hook requires unavailable approval");
+			InvocationAdmission {
+				admission: hook_policy_denied(
+					query,
+					reason.clone(),
+					Some(Arc::new(omp_tool::PolicyDenied {
+						reason,
+						code: Some(sf!("hook_approval_unavailable")),
+						decision_id: Str::from(omp_core::Ulid::generate().to_string()),
+						rules: rules.into(),
+					})),
+				),
+				effects:   Effects::empty(),
+			}
 		},
 	}
 }
@@ -1849,7 +1865,10 @@ fn finish_event(call: &CommittedCall, item: Item) -> Arc<AgentEvent> {
 fn harness_parts(outcome: &CallOutcome<Value, Value>) -> Option<Vec<Part>> {
 	let text = match outcome {
 		CallOutcome::ArgsRejected(issue) => render_arg_issue(issue),
-		CallOutcome::Aborted { abort, .. } => render_abort(abort),
+		CallOutcome::Aborted { abort, policy: Some(policy), .. } => {
+			render_policy_denied(abort, policy)
+		},
+		CallOutcome::Aborted { abort, policy: None, .. } => render_abort(abort),
 		CallOutcome::Ok(_) | CallOutcome::Faulted(_) => return None,
 	};
 	Some(vec![Part::Text { text }])
@@ -1898,6 +1917,25 @@ fn render_abort(abort: &Abort) -> Str {
 			sf!("aborted: executor ended without a terminal outcome")
 		},
 	}
+}
+
+fn render_policy_denied(abort: &Abort, policy: &omp_tool::PolicyDenied) -> Str {
+	use std::fmt::Write as _;
+
+	let mut text = render_abort(abort).to_string();
+	if let Some(code) = &policy.code {
+		let _ = write!(text, "\nPolicy code: {code}");
+	}
+	if !policy.rules.is_empty() {
+		text.push_str("\nPolicy rules: ");
+		for (index, rule) in policy.rules.iter().enumerate() {
+			if index != 0 {
+				text.push_str(", ");
+			}
+			text.push_str(rule);
+		}
+	}
+	Str::from(text)
 }
 
 #[cfg(test)]
@@ -1969,6 +2007,25 @@ mod tests {
 		batch.push(Bytes::from_static(br#"{"step":2}"#));
 		assert_eq!(batch.latest, Bytes::from_static(br#"{"step":2}"#));
 		assert_eq!(batch.coalesced, 2);
+	}
+
+	#[test]
+	fn policy_denial_prompt_includes_code_and_rules() {
+		let outcome = CallOutcome::<Value, Value>::policy_denied(
+			Abort::Skipped { reason: sf!("blocked") },
+			omp_tool::PolicyDenied {
+				reason:      sf!("blocked"),
+				code:        Some(sf!("qa_policy_deny")),
+				decision_id: sf!("decision"),
+				rules:       Arc::from([sf!("qa-approval-rule")]),
+			},
+		);
+		let parts = harness_parts(&outcome).expect("policy denial has harness text");
+		let Part::Text { text } = &parts[0] else {
+			panic!("policy denial must render as text");
+		};
+		assert!(text.contains("qa_policy_deny"));
+		assert!(text.contains("qa-approval-rule"));
 	}
 
 	fn terminal_text(result: &BatchResult) -> &str {

@@ -15,8 +15,8 @@ use omp_driver::stats_api::{
 };
 use omp_env::EnvClient;
 use omp_envd::exthost::control::ControlInvocationAuthority;
+use omp_observability::authority::{DurableTelemetryQuery, TelemetryAuthorityIdentity};
 use omp_storage::telemetry_index::TelemetryIndex;
-use omp_telemetry::authority::{DurableTelemetryQuery, TelemetryAuthorityIdentity};
 use omp_tool::ArtifactLifetime;
 use serde_json::{Value, json};
 use tempfile::tempdir;

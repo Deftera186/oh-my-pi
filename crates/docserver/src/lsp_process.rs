@@ -353,6 +353,12 @@ pub struct LspProcess {
 
 impl LspProcess {
 	/// Starts, initializes, installs, and activates one process binding.
+	#[tracing::instrument(
+		name = "lsp_server_spawn",
+		level = "debug",
+		skip_all,
+		fields(server = %config.name)
+	)]
 	pub async fn start(
 		config: LspProcessConfig,
 		environment: &Environment,

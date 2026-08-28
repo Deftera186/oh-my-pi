@@ -97,6 +97,30 @@ use crate::{
 	options::PageOptions,
 	remote::{Command, RemoteView, chromium, firefox},
 };
+pub(crate) fn navigation_scheme(url: &str) -> &'static str {
+	let Some((scheme, _)) = url.split_once(':') else {
+		return "none";
+	};
+	if scheme.eq_ignore_ascii_case("http") {
+		"http"
+	} else if scheme.eq_ignore_ascii_case("https") {
+		"https"
+	} else if scheme.eq_ignore_ascii_case("file") {
+		"file"
+	} else if scheme.eq_ignore_ascii_case("about") {
+		"about"
+	} else if scheme.eq_ignore_ascii_case("data") {
+		"data"
+	} else if scheme.eq_ignore_ascii_case("blob") {
+		"blob"
+	} else if scheme.eq_ignore_ascii_case("ws") {
+		"ws"
+	} else if scheme.eq_ignore_ascii_case("wss") {
+		"wss"
+	} else {
+		"other"
+	}
+}
 
 /// A concrete engine choice for [`WebViewBuilder::new`].
 #[derive(Clone, Debug)]
@@ -277,6 +301,12 @@ impl WebViewBuilder {
 	///
 	/// [`Error::Unsupported`] on remote engines, [`Error::MainThread`] off
 	/// the main thread, [`Error::WindowHandle`] for foreign handles.
+	#[tracing::instrument(
+		name = "webview_initialize",
+		level = "debug",
+		skip_all,
+		fields(engine = %self.engine.kind(), surface = %SurfaceKind::Child)
+	)]
 	pub fn build_child(self, parent: &impl HasWindowHandle, bounds: Rect) -> Result<WebView> {
 		match self.engine {
 			#[cfg(target_os = "macos")]
@@ -285,7 +315,15 @@ impl WebViewBuilder {
 				let state = SharedState::default();
 				let handle = parent.window_handle().map_err(|_| Error::WindowHandle)?;
 				let view =
-					wk::WkView::create(&self.page, handle.as_raw(), bounds, events_tx, state.clone())?;
+					wk::WkView::create(&self.page, handle.as_raw(), bounds, events_tx, state.clone())
+						.inspect_err(|error| {
+							tracing::warn!(
+								engine = "system",
+								surface = "child",
+								error = error.kind(),
+								"webview initialization failed"
+							);
+						})?;
 				Ok(WebView {
 					inner: Inner::Wk(view),
 					events,
@@ -313,20 +351,51 @@ impl WebViewBuilder {
 	///
 	/// Launch/connect/capture-setup failures from the engine;
 	/// [`Error::MainThread`] off the main thread on the system engine.
+	#[tracing::instrument(
+		name = "webview_initialize",
+		level = "debug",
+		skip_all,
+		fields(engine = %self.engine.kind(), surface = %SurfaceKind::Frames)
+	)]
 	pub fn build_frames(self, config: FrameConfig) -> Result<WebView> {
 		let engine = self.engine.kind();
 		let (view, events, state) = match self.engine {
 			Engine::Chromium { binary } => {
-				remote::spawn(self.page, move |ctx| chromium::drive_frames(binary, config, ctx))?
+				remote::spawn(self.page, move |ctx| chromium::drive_frames(binary, config, ctx))
+					.inspect_err(|error| {
+						tracing::warn!(
+							engine = %engine,
+							surface = "frames",
+							error = error.kind(),
+							"webview initialization failed"
+						);
+					})?
 			},
 			Engine::Firefox { binary } => {
-				remote::spawn(self.page, move |ctx| firefox::drive_frames(binary, config, ctx))?
+				remote::spawn(self.page, move |ctx| firefox::drive_frames(binary, config, ctx))
+					.inspect_err(|error| {
+						tracing::warn!(
+							engine = %engine,
+							surface = "frames",
+							error = error.kind(),
+							"webview initialization failed"
+						);
+					})?
 			},
 			#[cfg(target_os = "macos")]
 			Engine::System => {
 				let (events_tx, events) = flume::unbounded();
 				let state = SharedState::default();
-				let view = WkFrames::create(&self.page, config, events_tx, state.clone())?;
+				let view = WkFrames::create(&self.page, config, events_tx, state.clone()).inspect_err(
+					|error| {
+						tracing::warn!(
+							engine = %engine,
+							surface = "frames",
+							error = error.kind(),
+							"webview initialization failed"
+						);
+					},
+				)?;
 				return Ok(WebView {
 					inner: Inner::WkFrames(view),
 					events,
@@ -351,14 +420,36 @@ impl WebViewBuilder {
 	///
 	/// [`Error::Unsupported`] on the system engine; launch/connect failures
 	/// from the remote engine.
+	#[tracing::instrument(
+		name = "webview_initialize",
+		level = "debug",
+		skip_all,
+		fields(engine = %self.engine.kind(), surface = %SurfaceKind::Window)
+	)]
 	pub fn build_window(self, config: WindowConfig) -> Result<WebView> {
 		let engine = self.engine.kind();
 		let (view, events, state) = match self.engine {
 			Engine::Chromium { binary } => {
-				remote::spawn(self.page, move |ctx| chromium::drive_window(binary, config, ctx))?
+				remote::spawn(self.page, move |ctx| chromium::drive_window(binary, config, ctx))
+					.inspect_err(|error| {
+						tracing::warn!(
+							engine = %engine,
+							surface = "window",
+							error = error.kind(),
+							"webview initialization failed"
+						);
+					})?
 			},
 			Engine::Firefox { binary } => {
-				remote::spawn(self.page, move |ctx| firefox::drive_window(binary, config, ctx))?
+				remote::spawn(self.page, move |ctx| firefox::drive_window(binary, config, ctx))
+					.inspect_err(|error| {
+						tracing::warn!(
+							engine = %engine,
+							surface = "window",
+							error = error.kind(),
+							"webview initialization failed"
+						);
+					})?
 			},
 			#[cfg(target_os = "macos")]
 			Engine::System => {
@@ -402,13 +493,29 @@ pub struct WebView {
 impl WebView {
 	/// Navigate to `url`.
 	pub fn navigate(&self, url: &str) -> Result<()> {
-		match &self.inner {
+		tracing::debug!(
+			engine = %self.engine,
+			surface = %self.surface,
+			scheme = navigation_scheme(url),
+			"webview navigation requested"
+		);
+		let result = match &self.inner {
 			#[cfg(target_os = "macos")]
 			Inner::Wk(view) => view.navigate(url),
 			#[cfg(target_os = "macos")]
 			Inner::WkFrames(view) => view.navigate(url),
 			Inner::Remote(view) => view.send(Command::Navigate(url.to_str())),
+		};
+		if let Err(error) = &result {
+			tracing::warn!(
+				engine = %self.engine,
+				surface = %self.surface,
+				scheme = navigation_scheme(url),
+				error = error.kind(),
+				"webview navigation rejected"
+			);
 		}
+		result
 	}
 
 	/// Replace the document with `html` (null origin).

@@ -94,12 +94,19 @@ impl ChatAuth {
 	}
 
 	/// Starts one provider login unless another flow is already active.
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		name = "provider_auth_start",
+		fields(provider = %provider)
+	)]
 	pub fn start(&self, provider: Str) -> Result<(), &'static str> {
 		if self
 			.active
 			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 			.is_err()
 		{
+			tracing::debug!(provider = %provider, "provider authentication start lost active-flow race");
 			return Err("authentication is already in progress");
 		}
 		if self
@@ -108,8 +115,10 @@ impl ChatAuth {
 			.is_err()
 		{
 			self.active.store(false, Ordering::Release);
+			tracing::warn!("provider authentication worker unavailable");
 			return Err("authentication worker is unavailable");
 		}
+		tracing::debug!("provider authentication admitted");
 		Ok(())
 	}
 

@@ -10,20 +10,15 @@ use omp_chat_ui::git::{
 	GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitPatchOp, GitSnapshot,
 };
 use omp_core::{Hash32, IntoStr as _, Str};
-use omp_envd::{
-	exec::ExecHost,
-	vcs::git::{
-		commands::{CommandError, GitCommands},
-		diff::{self, ChangeKind, DiffOptions, GitDiff, LineCount, NumstatEntry, StatusEntry},
-		mutation::{
-			CommitOptions, DiffLineSelection, GitMutation, GitMutationConsumer, LineRange,
-			MutationError,
-		},
-		query::GitQuery,
-		refs::{self, RefError},
-		repo::{self, Repository, RepositoryError},
-		runner::{GitRunError, GitRunOptions, GitRunner},
+use omp_envd::vcs::git::{
+	commands::{CommandError, GitCommands},
+	diff::{self, ChangeKind, DiffOptions, GitDiff, LineCount, NumstatEntry, StatusEntry},
+	mutation::{
+		CommitOptions, DiffLineSelection, GitMutation, GitMutationConsumer, LineRange, MutationError,
 	},
+	query::GitQuery,
+	refs::{self, RefError},
+	repo::{self, Repository, RepositoryError},
 };
 use tokio::io::AsyncReadExt as _;
 use tokio_util::sync::CancellationToken;
@@ -55,15 +50,6 @@ pub enum GitModelError {
 	/// A Git mutation failed.
 	#[error(transparent)]
 	Mutation(#[from] MutationError),
-	/// A raw Git invocation could not complete.
-	#[error(transparent)]
-	Run(#[from] GitRunError),
-	/// Git rejected a raw status or revision-diff invocation.
-	#[error("Git command exited with status {code}")]
-	Exit {
-		/// Process exit status.
-		code: i32,
-	},
 	/// The requested revision does not resolve to a commit.
 	#[error("Cannot resolve revision: {revision}")]
 	RevisionMissing {
@@ -94,7 +80,6 @@ pub enum GitModelError {
 pub struct GitModel {
 	cwd:               PathBuf,
 	repository:        Repository,
-	runner:            GitRunner,
 	diff:              GitDiff,
 	query:             GitQuery,
 	commands:          GitCommands,
@@ -117,8 +102,7 @@ impl GitModel {
 			.await?
 			.ok_or(GitModelError::NotRepository)?;
 		let cwd = repository.worktree_root.clone();
-		let runner = GitRunner::new(ExecHost::new());
-		let commands = GitCommands::new(runner.clone());
+		let commands = GitCommands::new();
 		let pinned_sha = match revision {
 			Some(revision) => {
 				let commit_revision = format!("{revision}^{{commit}}");
@@ -134,15 +118,10 @@ impl GitModel {
 		Ok(Self {
 			cwd,
 			repository: repository.clone(),
-			diff: GitDiff::new(runner.clone()),
-			query: GitQuery::new(runner.clone()),
+			diff: GitDiff::new(),
+			query: GitQuery::new(),
 			commands,
-			mutation: GitMutation::new(
-				runner.clone(),
-				repository,
-				GitMutationConsumer::InteractiveGit,
-			),
-			runner,
+			mutation: GitMutation::new(repository, GitMutationConsumer::InteractiveGit),
 			pinned_sha,
 			fingerprint: None,
 			stats_fingerprint: None,
@@ -181,24 +160,13 @@ impl GitModel {
 			return Ok(Some(snapshot));
 		}
 
-		let status_output = self
-			.runner
-			.run(
-				&self.cwd,
-				&["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-				GitRunOptions { read_only: true, parse_sensitive: true, ..Default::default() },
-				cancel,
-			)
-			.await?;
-		if status_output.exit_code != 0 {
-			return Err(GitModelError::Exit { code: status_output.exit_code });
-		}
-		let entries = diff::parse_status_entries(&status_output.stdout);
+		let status_output = self.diff.status_raw(&self.cwd, cancel).await?;
+		let entries = diff::parse_status_entries(&status_output);
 		let branch = self.commands.current_branch(&self.cwd, cancel).await?;
-		let head_state = refs::resolve_head(&self.repository, &self.runner, cancel).await?;
+		let head_state = refs::resolve_head(&self.repository, cancel).await?;
 		let head_sha = head_state.commit().map(str::to_owned);
 		let fingerprint =
-			fingerprint(head_sha.as_deref().unwrap_or_default().as_bytes(), &status_output.stdout);
+			fingerprint(head_sha.as_deref().unwrap_or_default().as_bytes(), &status_output);
 		if self.fingerprint == Some(fingerprint) {
 			return Ok(None);
 		}
@@ -442,9 +410,8 @@ impl GitModel {
 				Ok(StreamedSide { bytes: Bytes::new(), too_large: true })
 			},
 			Ok(bytes) => Ok(StreamedSide { bytes, too_large: false }),
-			Err(CommandError::Exit { .. }) => Ok(StreamedSide::default()),
-			Err(CommandError::Run(GitRunError::Incomplete { stdout: true, .. })) => {
-				Ok(StreamedSide { bytes: Bytes::new(), too_large: true })
+			Err(CommandError::Vcs(omp_vcs::Error::ObjectNotFound { .. })) => {
+				Ok(StreamedSide::default())
 			},
 			Err(error) => Err(error.into()),
 		}
@@ -478,7 +445,7 @@ impl GitModel {
 		let mut total = 0;
 		loop {
 			if cancel.is_cancelled() {
-				return Err(GitRunError::Cancelled.into());
+				return Err(CommandError::Vcs(omp_vcs::Error::Canceled).into());
 			}
 			let read = file
 				.read(&mut buffer)
@@ -620,21 +587,10 @@ impl GitModel {
 		let mut commit = self.load_commit_metadata(sha, cancel).await?;
 		let base = commit.parents.first().map_or(EMPTY_TREE, Str::as_str);
 		let output = self
-			.runner
-			.run(
-				&self.cwd,
-				&["diff", "--numstat", "-z", base, commit.sha.as_str()],
-				GitRunOptions { read_only: true, parse_sensitive: true, ..Default::default() },
-				cancel,
-			)
+			.diff
+			.numstat_tree(&self.cwd, base, commit.sha.as_str(), cancel)
 			.await?;
-		if output.exit_code != 0 {
-			return Err(GitModelError::Exit { code: output.exit_code });
-		}
-		commit.files = diff::parse_numstat(output.stdout)?
-			.into_iter()
-			.map(commit_row)
-			.collect();
+		commit.files = output.into_iter().map(commit_row).collect();
 		Ok(commit)
 	}
 

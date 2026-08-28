@@ -198,6 +198,7 @@ where
 					let _ = evt_tx.send(WebViewEvent::Closed);
 				},
 				Err(err) => {
+					tracing::warn!(error = err.kind(), "webview driver stopped unexpectedly");
 					let _ = evt_tx.send(WebViewEvent::Crashed(sf!("{err}")));
 				},
 			}

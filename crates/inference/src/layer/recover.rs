@@ -22,7 +22,7 @@ use crate::{
 	layer::{ExecutionContext, LayerCall},
 	plan::{ExecutionPlan, NegotiationDecision},
 	receipt::{
-		Adjustment, AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId,
+		Adjustment, AttemptOutcome, AttemptReceipt, Cost, ProviderEvidence, ReasonId, RecoveryRecord,
 		ServingModelAttribution,
 	},
 	recovery::{
@@ -511,7 +511,7 @@ fn finish_json(
 	let document =
 		document.ok_or_else(|| structured_error("structured-output.missing-document", context))?;
 	if let Some(recovery) = document.recovery {
-		context.with_receipt(|receipt| receipt.recoveries.push(recovery));
+		record_recovery(context, recovery);
 	}
 	String::from_utf8(document.bytes.to_vec())
 		.map_err(|_| structured_error("structured-output.invalid-utf8", context))
@@ -685,16 +685,40 @@ fn recover_tool(
 			match event {
 				ToolAssemblyEvent::Ready { call, .. } => ready = Some(call),
 				ToolAssemblyEvent::Rejected { .. } => {
-					context.with_receipt(|receipt| receipt.recoveries.extend(assembler.take_evidence()));
+					record_recoveries(context, assembler.take_evidence());
 					return Err(recovery_error("tool.assembly-rejected", context));
 				},
 				ToolAssemblyEvent::Started { .. } | ToolAssemblyEvent::ArgumentsDelta { .. } => {},
 			}
 		}
 	}
-	context.with_receipt(|receipt| receipt.recoveries.extend(assembler.take_evidence()));
+	record_recoveries(context, assembler.take_evidence());
 	let call = ready.ok_or_else(|| recovery_error("tool.assembly-incomplete", context))?;
 	Ok(ChatEvent::ToolCallReady { index, call })
+}
+
+fn record_recoveries(
+	context: &ExecutionContext,
+	recoveries: impl IntoIterator<Item = RecoveryRecord>,
+) {
+	for recovery in recoveries {
+		record_recovery(context, recovery);
+	}
+}
+
+fn record_recovery(context: &ExecutionContext, recovery: RecoveryRecord) {
+	if !matches!(
+		recovery.rule.0.as_str(),
+		"tool.complete-schema-valid" | "tool.complete-freeform-valid"
+	) {
+		tracing::warn!(
+			recovery_kind = recovery.kind.as_str(),
+			recovery_rule = recovery.rule.0.as_str(),
+			repair_steps = recovery.steps,
+			"provider output required bounded repair"
+		);
+	}
+	context.with_receipt(|receipt| receipt.recoveries.push(recovery));
 }
 
 fn recovery_error(reason: &'static str, context: &ExecutionContext) -> Error {

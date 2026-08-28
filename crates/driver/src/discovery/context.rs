@@ -108,6 +108,12 @@ pub enum ContextDiagnostic {
 /// ancestor-walked, `@path` expansion reuses the canonical context importer,
 /// and normalized paragraph containment favors sources closest to the workspace
 /// directory.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "context_discovery",
+	fields(root_count = roots.len(), max_depth = options.max_depth)
+)]
 pub fn discover(
 	roots: &[GrantedContextRoot],
 	options: &ContextDiscoveryOptions,
@@ -298,6 +304,27 @@ pub fn discover(
 		.into_iter()
 		.map(|index| items[index].clone())
 		.collect();
+	if !diagnostics.is_empty() {
+		let outside_grant_count = diagnostics
+			.iter()
+			.filter(|diagnostic| matches!(diagnostic, ContextDiagnostic::OutsideGrant(_)))
+			.count();
+		let unreadable_count = diagnostics
+			.iter()
+			.filter(|diagnostic| matches!(diagnostic, ContextDiagnostic::Unreadable(_)))
+			.count();
+		let truncated_count = diagnostics
+			.iter()
+			.filter(|diagnostic| matches!(diagnostic, ContextDiagnostic::Truncated(_)))
+			.count();
+		tracing::warn!(
+			diagnostic_count = diagnostics.len(),
+			outside_grant_count = outside_grant_count,
+			unreadable_count = unreadable_count,
+			truncated_count = truncated_count,
+			"context discovery completed with diagnostics"
+		);
+	}
 	ContextSnapshot { items: items.into(), diagnostics: diagnostics.into() }
 }
 

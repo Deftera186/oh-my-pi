@@ -11,11 +11,6 @@ expression: "canonical_snapshot(&PromptFacts::default())"
     GoldenItem {
         index: 1,
         band: "stable",
-        text: "§ Tool Policy\n# General\nUse tools when they improve correctness, completeness, or grounding.\n- SHOULD resolve prerequisites first; NEVER accept first plausible answer when another call reduces uncertainty; retry empty, partial, or suspiciously narrow lookup differently.\n- SHOULD parallelize independent calls.\n- NEVER open files hoping. Read only relevant sections and re-read after a tool failure or file change.\n# Tool I/O\n- Prefer relative `path`-like fields.\n\n# Specialized Tools\nMUST use a specialized tool over a shell equivalent:",
-    },
-    GoldenItem {
-        index: 2,
-        band: "stable",
-        text: "PROJECT\n\n<workstation>\n</workstation>\n\n<critical>\n- Each response MUST advance the task; completion is the only stopping condition.\n- MUST default to informed action; do not ask for confirmation when tools or repository context can answer.\n- Before yielding, MUST verify significant behavioral changes with the specific command or scenario covering the change.\n</critical>",
+        text: "§ Tool Policy\n# General\nUse tools when they improve correctness, completeness, or grounding.\n- SHOULD resolve prerequisites first; NEVER accept first plausible answer when another call reduces uncertainty; retry empty, partial, or suspiciously narrow lookup differently.\n- SHOULD parallelize independent calls.\n- NEVER open files hoping. Read only relevant sections and re-read after a tool failure or file change.\n# Tool I/O\n- Prefer relative `path`-like fields.\n\n# Specialized Tools\nMUST use a specialized tool over a shell equivalent:\nPROJECT\n\n<workstation>\n</workstation>\n\n<critical>\n- Each response MUST advance the task; completion is the only stopping condition.\n- MUST default to informed action; do not ask for confirmation when tools or repository context can answer.\n- Before yielding, MUST verify significant behavioral changes with the specific command or scenario covering the change.\n</critical>",
     },
 ]

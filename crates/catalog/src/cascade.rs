@@ -557,16 +557,19 @@ impl CompatCascade {
 	/// # Errors
 	/// Returns the first [`CascadeError`] encountered: invalid KDL, unknown or
 	/// malformed directives, duplicate axes, or misplaced nodes.
+	#[tracing::instrument(
+		name = "catalog_compat_parse",
+		level = "debug",
+		skip_all,
+		fields(source_count = sources.len())
+	)]
 	pub fn parse(sources: &[(&str, &str)]) -> Result<Self, CascadeError> {
 		let mut rules = Vec::new();
 		for &(file, text) in sources {
-			let document: KdlDocument =
-				text
-					.parse()
-					.map_err(|error: kdl::KdlError| CascadeError::Parse {
-						file:    file.to_str(),
-						message: error.to_string().to_str(),
-					})?;
+			let document: KdlDocument = text.parse().map_err(|error: kdl::KdlError| {
+				tracing::warn!(file, "catalog compatibility KDL failed to parse");
+				CascadeError::Parse { file: file.to_str(), message: error.to_string().to_str() }
+			})?;
 			for node in document.nodes() {
 				match node.name().value() {
 					"class" => parse_class(file, node, &mut rules)?,

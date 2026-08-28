@@ -63,7 +63,61 @@ pub enum MigrationOutcome {
 }
 
 /// Imports `settings.json`/JSONC and the legacy `agent.db` settings table.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(path = %data_dir.display())
+)]
 pub fn migrate_legacy_settings(data_dir: &Path) -> Result<MigrationOutcome, MigrationError> {
+	let result = migrate_legacy_settings_inner(data_dir);
+	match &result {
+		Ok(MigrationOutcome::AlreadyCompleted) => {
+			tracing::debug!(
+				path = %data_dir.display(),
+				"legacy settings migration already completed",
+			);
+		},
+		Ok(MigrationOutcome::Completed(record)) => {
+			let mut converted_count = 0_usize;
+			let mut dropped_count = 0_usize;
+			let mut credential_rejected_count = 0_usize;
+			for entry in &record.entries {
+				match entry.action {
+					MigrationAction::Converted => converted_count += 1,
+					MigrationAction::Dropped => dropped_count += 1,
+					MigrationAction::CredentialRejected => credential_rejected_count += 1,
+				}
+			}
+			if dropped_count > 0 || credential_rejected_count > 0 {
+				tracing::warn!(
+					path = %data_dir.display(),
+					dropped_count,
+					credential_rejected_count,
+					"legacy settings entries rejected during migration",
+				);
+			}
+			tracing::info!(
+				path = %data_dir.display(),
+				source_count = record.sources.len(),
+				entry_count = record.entries.len(),
+				converted_count,
+				dropped_count,
+				credential_rejected_count,
+				"legacy settings migration applied",
+			);
+		},
+		Err(error) => {
+			tracing::warn!(
+				path = %data_dir.display(),
+				error = %error,
+				"legacy settings migration failed",
+			);
+		},
+	}
+	result
+}
+
+fn migrate_legacy_settings_inner(data_dir: &Path) -> Result<MigrationOutcome, MigrationError> {
 	fs::create_dir_all(data_dir)
 		.map_err(|source| MigrationError::CreateDirectory { path: data_dir.to_owned(), source })?;
 	let marker = data_dir.join(MARKER);

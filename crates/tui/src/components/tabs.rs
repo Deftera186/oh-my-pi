@@ -91,7 +91,7 @@ impl Tabs {
 	}
 
 	/// Selects the active pane; out-of-range indices clamp to the last pane.
-	pub fn select(mut self, index: u16) -> Self {
+	pub const fn select(mut self, index: u16) -> Self {
 		self.state.idx = index;
 		self
 	}

@@ -181,40 +181,45 @@ pub struct LspTool<C> {
 	spec:    ToolSpec,
 }
 
+/// Returns the host-free `lsp@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("lsp"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(
+			"Queries and transactionally applies project language-server diagnostics, navigation, \
+			 symbols, refactors, code actions, raw requests, status, and reloads."
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("*")].into_iter().collect::<Arc<[_]>>(),
+			}),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("mod.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates discoverable `lsp@1` with an environment-configured timeout ceiling.
 pub fn tool<C: LspControl>(control: C, maximum: Duration) -> LspTool<C> {
 	LspTool {
 		control,
 		maximum: maximum.clamp(Duration::from_secs(5), Duration::from_secs(300)),
-		spec: ToolSpec {
-			name:            sf!("lsp"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(
-				"Queries and transactionally applies project language-server diagnostics, navigation, \
-				 symbols, refactors, code actions, raw requests, status, and reloads."
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("*")].into_iter().collect::<Arc<[_]>>(),
-				}),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("mod.rs"),
-			)
-			.into(),
-		},
+		spec: spec(),
 	}
 }
 

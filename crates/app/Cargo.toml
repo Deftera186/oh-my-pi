@@ -87,9 +87,10 @@ omp-sdk.workspace = true
 omp-scribe.workspace = true
 omp-settings.workspace = true
 omp-storage.workspace = true
-omp-telemetry.workspace = true
+omp-observability.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
+omp-vcs.workspace = true
 omp-voice = { workspace = true }
 omp-slopjson.workspace = true
 omp-shell.workspace = true

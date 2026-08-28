@@ -913,6 +913,8 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 		project.display().to_string(),
 		"--gateway".to_owned(),
 		gateway_socket.display().to_string(),
+		"--envd-idle-timeout".to_owned(),
+		"2".to_owned(),
 	];
 	let initial_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned();
 	seed_session(&state_dir, &project, &initial_session_id);
@@ -1274,6 +1276,8 @@ async fn chat_tui_persists_thinking_blocks_across_turns_and_resume() {
 		project.display().to_string(),
 		"--gateway".to_owned(),
 		gateway_socket.display().to_string(),
+		"--envd-idle-timeout".to_owned(),
+		"2".to_owned(),
 	];
 	let mut args = base_args.clone();
 	args.extend(["--resume".to_owned(), session_id.clone()]);

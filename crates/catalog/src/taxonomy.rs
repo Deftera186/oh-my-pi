@@ -268,6 +268,12 @@ impl Taxonomy {
 	///
 	/// # Errors
 	/// Returns [`CascadeError`] for invalid KDL, nodes, properties, or values.
+	#[tracing::instrument(
+		name = "catalog_taxonomy_parse",
+		level = "debug",
+		skip_all,
+		fields(source_count = sources.len())
+	)]
 	pub fn parse(sources: &[(&str, &str)]) -> Result<Self, CascadeError> {
 		let mut classes = Vec::new();
 		let mut collapse = Vec::new();
@@ -286,13 +292,10 @@ impl Taxonomy {
 			if !source_names.insert(file) {
 				return malformed(file, "source");
 			}
-			let document: KdlDocument =
-				text
-					.parse()
-					.map_err(|error: kdl::KdlError| CascadeError::Parse {
-						file:    file.to_str(),
-						message: error.to_string().to_str(),
-					})?;
+			let document: KdlDocument = text.parse().map_err(|error: kdl::KdlError| {
+				tracing::warn!(file, "catalog taxonomy KDL failed to parse");
+				CascadeError::Parse { file: file.to_str(), message: error.to_string().to_str() }
+			})?;
 			for node in document.nodes() {
 				match node.name().value() {
 					"class" => {

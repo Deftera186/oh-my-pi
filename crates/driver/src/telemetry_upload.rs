@@ -85,7 +85,7 @@ pub async fn manual_push(
 }
 
 async fn deliver_to(
-	client: &reqwest::Client,
+	client: &omp_http::Client,
 	endpoint: &str,
 	store: &TelemetryIndex,
 	credentials: &GithubCredentialBridge,
@@ -111,7 +111,7 @@ async fn deliver_to(
 		"session_id": pending.issue.session_id,
 		"device": pending.issue.device,
 		"revision": revision,
-		"payload": omp_telemetry::autoqa::project_payload(&pending.payload),
+		"payload": omp_observability::autoqa::project_payload(&pending.payload),
 	});
 	let mut headers = HeaderMap::new();
 	headers.insert(USER_AGENT, HeaderValue::from_static("omp-autoqa/1"));

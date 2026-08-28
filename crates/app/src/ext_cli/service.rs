@@ -2,7 +2,6 @@ use std::{
 	collections::BTreeMap,
 	fs,
 	path::{Path, PathBuf},
-	process::Stdio,
 };
 
 use futures::StreamExt as _;
@@ -18,7 +17,6 @@ use omp_ext::{
 	resolver::compare_versions,
 };
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use super::{Scope, StatePaths};
 
@@ -583,44 +581,30 @@ async fn clone_repo(
 	if let Some(parent) = destination.parent() {
 		fs::create_dir_all(parent).into_diagnostic()?;
 	}
-	let output = Command::new("git")
-		.args(["clone", "--quiet", "--no-tags", url])
-		.arg(destination)
-		.stdin(Stdio::null())
-		.output()
-		.await
-		.into_diagnostic()?;
-	if !output.status.success() {
-		return Err(miette!("git clone failed: {}", String::from_utf8_lossy(&output.stderr)));
-	}
-	if let Some(reference) = expected_sha.or(reference) {
-		let output = Command::new("git")
-			.arg("-C")
-			.arg(destination)
-			.args(["checkout", "--quiet", "--detach", reference])
-			.stdin(Stdio::null())
-			.output()
-			.await
-			.into_diagnostic()?;
-		if !output.status.success() {
-			return Err(miette!("git checkout failed: {}", String::from_utf8_lossy(&output.stderr)));
-		}
-	}
-	let output = Command::new("git")
-		.arg("-C")
-		.arg(destination)
-		.args(["rev-parse", "HEAD"])
-		.stdin(Stdio::null())
-		.output()
-		.await
-		.into_diagnostic()?;
-	if !output.status.success() {
-		return Err(miette!("git revision lookup failed"));
-	}
-	let sha = String::from_utf8(output.stdout)
-		.into_diagnostic()?
-		.trim()
-		.to_owned();
+	omp_vcs::git::clone(
+		url,
+		destination,
+		&omp_vcs::CloneOptions {
+			ref_name: reference.map(str::to_owned),
+			sha:      expected_sha.map(str::to_owned),
+			timeout:  None,
+		},
+		None,
+	)
+	.await
+	.into_diagnostic()?;
+	let destination = destination.to_owned();
+	let sha = tokio::task::spawn_blocking(move || {
+		let repo = omp_vcs::git::GitRepo::discover(&destination)
+			.into_diagnostic()?
+			.ok_or_else(|| miette!("git clone did not create a repository"))?;
+		repo
+			.head_sha()
+			.into_diagnostic()?
+			.ok_or_else(|| miette!("git revision lookup failed"))
+	})
+	.await
+	.into_diagnostic()??;
 	if expected_sha.is_some_and(|expected| {
 		!sha
 			.to_ascii_lowercase()

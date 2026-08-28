@@ -107,11 +107,12 @@ impl<SE: ShellExtensions> Shell<SE> {
 			return Err(error::ErrorKind::MaxFunctionCallDepthExceeded.into());
 		}
 
-		if tracing::enabled!(target: trace_categories::FUNCTIONS, tracing::Level::DEBUG) {
-			let depth = self.call_stack.function_call_depth();
-			let prefix = repeated_char_str(' ', depth);
-			tracing::debug!(target: trace_categories::FUNCTIONS, "Entering func [depth={depth}]: {prefix}{name}");
-		}
+		tracing::debug!(
+			target: trace_categories::FUNCTIONS,
+			depth = self.call_stack.function_call_depth(),
+			function = %name,
+			"entering shell function"
+		);
 
 		self.call_stack.push_function(name, function, args);
 		self.env.push_scope(env::EnvironmentScope::Local);
@@ -126,11 +127,12 @@ impl<SE: ShellExtensions> Shell<SE> {
 
 		if let Some(exited_call) = self.call_stack.pop() {
 			if let callstack::FrameType::Function(func_call) = exited_call.frame_type {
-				if tracing::enabled!(target: trace_categories::FUNCTIONS, tracing::Level::DEBUG) {
-					let depth = self.call_stack.function_call_depth();
-					let prefix = repeated_char_str(' ', depth);
-					tracing::debug!(target: trace_categories::FUNCTIONS, "Exiting func  [depth={depth}]: {prefix}{}", func_call.function_name);
-				}
+				tracing::debug!(
+					target: trace_categories::FUNCTIONS,
+					depth = self.call_stack.function_call_depth(),
+					function = %func_call.function_name,
+					"leaving shell function"
+				);
 			} else {
 				let err: error::Error =
 					error::ErrorKind::InternalError("mismatched call stack state".to_owned()).into();
@@ -180,8 +182,4 @@ impl<SE: ShellExtensions> Shell<SE> {
 
 		&mut self.args
 	}
-}
-
-fn repeated_char_str(c: char, count: usize) -> String {
-	(0..count).map(|_| c).collect()
 }

@@ -1542,8 +1542,9 @@ pub type SuggestionList = SmallVec<Suggestion, 8>;
 /// Ranked dropdown suggestions returned by [`EditorCompletion::suggest`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Suggestions {
-	/// UTF-8 byte range replaced by the selected row. It must contain the
-	/// cursor; invalid or stale ranges close the dropdown.
+	/// UTF-8 byte range replaced by the selected row. The editor clamps it
+	/// around the cursor and inside the text, so a drifting end shrinks the
+	/// replacement instead of closing the dropdown.
 	pub range: ops::Range<usize>,
 	/// Rows in display order; empty closes the dropdown.
 	pub items: SuggestionList,
@@ -2074,7 +2075,8 @@ impl Editor {
 		self.buffer.atom_ranges()
 	}
 
-	/// Opens a replacement picker for `range`; acceptance replaces that range.
+	/// Opens a replacement picker for `range` when it contains the cursor;
+	/// acceptance replaces that range.
 	pub fn show_replacements(
 		&mut self,
 		range: Range<usize>,
@@ -2205,10 +2207,8 @@ impl Editor {
 		let text = self.buffer.text();
 		let mut picker = self.completion.as_mut().and_then(|completion| {
 			let suggestions = completion.suggest(text, cursor)?;
-			(completion_range_is_valid(text, cursor, &suggestions.range)
-				&& !suggestions.items.is_empty())
-			.then_some(Picker {
-				range:       suggestions.range,
+			(!suggestions.items.is_empty()).then(|| Picker {
+				range:       clamp_completion_range(text, cursor, suggestions.range),
 				suggestions: suggestions.items,
 				selected:    0,
 				provided:    true,
@@ -2291,6 +2291,22 @@ fn completion_range_is_valid(text: &str, cursor: usize, range: &Range<usize>) ->
 		&& range.end <= text.len()
 		&& text.is_char_boundary(range.start)
 		&& text.is_char_boundary(range.end)
+}
+
+/// Clamps an engine-supplied replacement range around the cursor: both ends
+/// are pulled onto char boundaries inside the text, so drift in an
+/// asynchronously produced range shrinks the replacement instead of hiding
+/// the dropdown.
+fn clamp_completion_range(text: &str, cursor: usize, range: Range<usize>) -> Range<usize> {
+	let mut start = range.start.min(cursor);
+	while !text.is_char_boundary(start) {
+		start -= 1;
+	}
+	let mut end = range.end.max(cursor).min(text.len());
+	while !text.is_char_boundary(end) {
+		end += 1;
+	}
+	start..end
 }
 
 fn completion_token_end(text: &str, cursor: usize) -> usize {
@@ -3045,6 +3061,27 @@ mod tests {
 		assert!(editor.picker().is_some(), "exact prefix reopens the picker");
 		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
 		assert_eq!(editor.text(), "@alice ");
+	}
+
+	/// Engine claiming a range that no longer contains the cursor (stale
+	/// async rows): the dropdown must stay open on the clamped span.
+	#[test]
+	fn degenerate_completion_range_is_clamped_not_hidden() {
+		struct StaleRange;
+		impl EditorCompletion for StaleRange {
+			fn suggest(&mut self, text: &str, _cursor: usize) -> Option<Suggestions> {
+				(!text.is_empty()).then(|| Suggestions {
+					range: 0..0,
+					items: [Suggestion::new("value", "value")].into_iter().collect(),
+				})
+			}
+		}
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(StaleRange));
+		type_text(&mut editor, "ab");
+		assert!(editor.picker().is_some(), "degenerate range keeps the dropdown open");
+		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
+		assert!(editor.text().starts_with("value"), "{}", editor.text());
 	}
 	#[test]
 	fn command_frequency_breaks_equal_text_score_ties() {

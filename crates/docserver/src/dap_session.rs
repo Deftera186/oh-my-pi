@@ -339,6 +339,12 @@ impl DapSession {
 		.await
 	}
 
+	#[tracing::instrument(
+		name = "dap_session_start",
+		level = "debug",
+		skip_all,
+		fields(session_id = %id.as_ref(), adapter = %adapter.as_ref(), attach = attach)
+	)]
 	async fn start_owned(
 		id: impl AsRef<str>,
 		adapter: impl AsRef<str>,
@@ -433,6 +439,7 @@ impl DapSession {
 			session.transition(DapSessionState::Running)?;
 		}
 		Self::spawn_maintenance(&session);
+		tracing::info!("DAP session ready");
 		Ok(session)
 	}
 
@@ -451,16 +458,22 @@ impl DapSession {
 				if let Some(process) = &session.process
 					&& process.lock().await.try_wait().ok().flatten().is_some()
 				{
+					tracing::info!(
+						session_id = %session.id,
+						adapter = %session.adapter,
+						"DAP adapter process exited"
+					);
 					*session.state.lock() = DapSessionState::Terminated;
 					session.protocol.shutdown();
 					break;
 				}
-				if session
-					.protocol
-					.request("threads", json!({}))
-					.await
-					.is_err()
-				{
+				if let Err(error) = session.protocol.request("threads", json!({})).await {
+					tracing::warn!(
+						session_id = %session.id,
+						adapter = %session.adapter,
+						%error,
+						"DAP liveness request failed; stopping session"
+					);
 					*session.state.lock() = DapSessionState::Terminated;
 					session.protocol.shutdown();
 					break;
@@ -490,7 +503,13 @@ impl DapSession {
 					},
 					event = events.recv() => match event {
 						Ok(event) => Self::handle_inbound(&session, event).await,
-						Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+						Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+							tracing::warn!(
+								session_id = %session.id,
+								skipped,
+								"DAP event subscriber lagged"
+							);
+						},
 						Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
 					},
 				}
@@ -525,12 +544,27 @@ impl DapSession {
 					.await;
 				let (success, body, message) = match result {
 					Ok(body) => (true, body, None),
-					Err(message) => (false, Value::Null, Some(message)),
+					Err(message) => {
+						tracing::warn!(
+							session_id = %session.id,
+							command = %command,
+							"DAP reverse request rejected"
+						);
+						(false, Value::Null, Some(message))
+					},
 				};
-				let _ = session
+				if let Err(error) = session
 					.protocol
 					.respond_reverse(seq, command.as_str(), success, body, message)
-					.await;
+					.await
+				{
+					tracing::warn!(
+						session_id = %session.id,
+						command = %command,
+						%error,
+						"DAP reverse response delivery failed"
+					);
+				}
 			},
 		}
 	}
@@ -623,6 +657,12 @@ impl DapSession {
 	}
 
 	/// Executes one direct action; callers can inspect `approval_tier` first.
+	#[tracing::instrument(
+		name = "dap_request",
+		level = "debug",
+		skip_all,
+		fields(action = ?action)
+	)]
 	pub async fn execute(
 		&self,
 		action: DapAction,
@@ -637,6 +677,12 @@ impl DapSession {
 
 	/// Sends an adapter-specific request without rewriting its payload.
 	/// Continues, pauses, or steps and awaits the corresponding lifecycle event.
+	#[tracing::instrument(
+		name = "dap_request",
+		level = "debug",
+		skip_all,
+		fields(action = ?action)
+	)]
 	pub async fn control(
 		&self,
 		action: DapAction,
@@ -951,6 +997,12 @@ impl DapSession {
 	}
 
 	/// Cascades termination through children, then disconnects this adapter.
+	#[tracing::instrument(
+		name = "dap_session_stop",
+		level = "debug",
+		skip_all,
+		fields(session_id = %self.id, adapter = %self.adapter)
+	)]
 	pub async fn terminate(self: &Arc<Self>) -> Result<(), DapSessionError> {
 		let children = self
 			.children
@@ -993,6 +1045,7 @@ impl DapSession {
 				Err(error) => return Err(DapSessionError::Process(error)),
 			}
 		}
+		tracing::info!("DAP session stopped");
 		Ok(())
 	}
 

@@ -24,8 +24,8 @@ client and framing boundary; it does not contain an alternate host.
   generation-fenced DATA transport.
 - `policy`, `admission`, `http_egress`, `vault`, and `recovery` enforce access
   decisions and manage durable runtime state.
-- `run` starts the platform transport. `ProjectEnvironment` connects to or
-  starts the project host and retains the client plus host-owned lifetimes.
+- `run` starts the platform transport. `ProjectEnvironment::attach` joins the
+  build-keyed detached daemon and composes session-only tools locally.
 
 The `omp` executable recognizes the hidden eval, extension-host, and Python
 worker child arguments because those children re-enter the same binary.
@@ -34,12 +34,16 @@ Their entry functions and runtime implementations remain owned by
 
 ## Philosophy
 
-The daemon is the single owner of project environment resources. Clients
-request effects through the typed environment protocol instead of opening
-competing filesystem, process, document, worker, or extension-host
-authorities. Resource lifetimes, policy checks, cancellation, and recovery
-therefore remain attached to daemon-owned project state for both embedded and
-connected transports.
+Each project and executable generation has one detached environment daemon.
+Environment-locus tools and filesystem, process, document, browser, debugger,
+and memory effects execute there. Session-locus tools, extension workers, MCP,
+presenters, and agent controls stay in the attaching process behind the same
+partitioned `EnvClient`. An embedded full host is used only as a loud spawn
+fallback or by explicitly isolated compositions.
+
+The document socket is build-stable while environment sockets are build-keyed.
+`DocumentHost` reconnects after a server restart, and a surviving non-owner
+environment may rehost the document authority without invalidating its clones.
 
 The crate is deliberately below the headless driver and application layers.
 Capabilities that require regime state, inference composition,

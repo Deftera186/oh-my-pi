@@ -77,37 +77,39 @@ pub struct Fetch<C> {
 	spec:   ToolSpec,
 }
 
+/// Builds the host-free `fetch@1` declaration.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("fetch"),
+		rev:             Rev { family: Default::default(), n: 1 },
+		description:     sf!(
+			"Fetches a URL as reader-mode clean text or Markdown. Append `:raw` to bypass HTML and \
+			 document conversion; line selectors use the read syntax.",
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: None,
+			exec:      Some(ExecEffects { network: true, commands: Arc::default() }),
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("fetch.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates `fetch@1` over an application-owned HTTP transport.
 pub fn tool<C: web::types::HttpClient + Send + Sync + 'static>(client: C) -> Fetch<C> {
-	Fetch {
-		client,
-		spec: ToolSpec {
-			name:            sf!("fetch"),
-			rev:             Rev { family: Default::default(), n: 1 },
-			description:     sf!(
-				"Fetches a URL as reader-mode clean text or Markdown. Append `:raw` to bypass HTML \
-				 and document conversion; line selectors use the read syntax.",
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: None,
-				exec:      Some(ExecEffects { network: true, commands: Arc::default() }),
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("fetch.rs"),
-			)
-			.into(),
-		},
-	}
+	Fetch { client, spec: spec() }
 }
 
 impl<C: web::types::HttpClient + Send + Sync + 'static> Tool for Fetch<C> {

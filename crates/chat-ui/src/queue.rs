@@ -1,6 +1,7 @@
 //! Queue and steering shorthand parsing.
 
 use omp_core::Str;
+use smallvec::SmallVec;
 
 /// One message extracted from a composer submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11,29 +12,72 @@ pub struct QueueItem {
 	pub yield_after_turn: bool,
 }
 
+/// Byte-span classification for composer queue-shorthand decoration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueSpan {
+	/// The leading `->` or `=>` queue prefix.
+	Prefix,
+	/// A list marker or delimiter inside the shorthand body.
+	Marker,
+}
+
+/// Returns decoration spans into the original composer text.
+pub fn decoration_spans(text: &str) -> SmallVec<(usize, usize, QueueSpan), 8> {
+	let trimmed_start = text.trim_start();
+	let prefix_at = text.len() - trimmed_start.len();
+	let Some(body) = yield_body(trimmed_start) else {
+		return SmallVec::new();
+	};
+	let body_at = prefix_at + 2;
+	let body_trimmed = body.trim();
+	let body_trimmed_at = body_at + body.len() - body.trim_start().len();
+	let mut spans = SmallVec::from_buf([(prefix_at, body_at, QueueSpan::Prefix)]);
+
+	delimiter_spans(body_trimmed, body_trimmed_at, &mut spans);
+	if let Some(markers) = sequential_marker_spans(body_trimmed, body_trimmed_at) {
+		spans.extend(markers);
+	}
+	spans.sort_unstable_by_key(|span| span.0);
+	spans
+}
+
 /// Splits delimiter or sequential-list shorthand into queued messages.
 /// Ordinary prose always returns exactly one item.
 pub fn split(text: &str) -> Vec<QueueItem> {
 	let trimmed = text.trim();
-	if let Some(body) = trimmed
+	if let Some(body) = yield_body(trimmed) {
+		return split_plain(body.trim())
+			.into_iter()
+			.map(yield_item)
+			.collect();
+	}
+	split_plain(trimmed).into_iter().map(item).collect()
+}
+
+fn yield_body(text: &str) -> Option<&str> {
+	text
 		.strip_prefix("->")
-		.or_else(|| trimmed.strip_prefix("=>"))
+		.or_else(|| text.strip_prefix("=>"))
 		.filter(|body| body.starts_with(char::is_whitespace))
-	{
-		return vec![QueueItem { text: Str::new(body.trim()), yield_after_turn: true }];
-	}
-	let delimited = split_delimiters(trimmed);
+}
+
+fn split_plain(text: &str) -> Vec<&str> {
+	let delimited = split_delimiters(text);
 	if delimited.len() > 1 {
-		return delimited.into_iter().map(item).collect();
+		return delimited;
 	}
-	if let Some(list) = split_sequential_list(trimmed) {
-		return list.into_iter().map(item).collect();
+	if let Some(list) = split_sequential_list(text) {
+		return list;
 	}
-	vec![item(trimmed)]
+	vec![text]
 }
 
 fn item(text: &str) -> QueueItem {
 	QueueItem { text: Str::new(text.trim()), yield_after_turn: false }
+}
+
+fn yield_item(text: &str) -> QueueItem {
+	QueueItem { text: Str::new(text.trim()), yield_after_turn: true }
 }
 
 fn split_delimiters(text: &str) -> Vec<&str> {
@@ -56,6 +100,17 @@ fn split_delimiters(text: &str) -> Vec<&str> {
 		items.push(tail);
 	}
 	items
+}
+fn delimiter_spans(text: &str, base: usize, spans: &mut SmallVec<(usize, usize, QueueSpan), 8>) {
+	let mut offset = 0;
+	for line in text.split_inclusive('\n') {
+		let trimmed = line.trim();
+		if trimmed == "---" || trimmed == "///" {
+			let marker_at = offset + line.len() - line.trim_start().len();
+			spans.push((base + marker_at, base + marker_at + 3, QueueSpan::Marker));
+		}
+		offset += line.len();
+	}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,17 +167,56 @@ fn split_sequential_list(text: &str) -> Option<Vec<&str>> {
 	}
 	Some(items)
 }
+fn sequential_marker_spans(
+	text: &str,
+	base: usize,
+) -> Option<SmallVec<(usize, usize, QueueSpan), 8>> {
+	let mut spans = SmallVec::new();
+	let mut family = None;
+	let mut expected = None;
+	let mut offset = 0;
+	for line in text.split_inclusive('\n') {
+		let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+		if indent == 0
+			&& let Some((marker, marker_end)) = decoration_marker(line)
+		{
+			if let Some(wanted) = family
+				&& (wanted != marker.family() || expected != Some(marker.ordinal()))
+			{
+				return None;
+			}
+			family.get_or_insert(marker.family());
+			expected = Some(marker.ordinal().saturating_add(1));
+			spans.push((base + offset, base + offset + marker_end, QueueSpan::Marker));
+		}
+		offset += line.len();
+	}
+	(spans.len() >= 2).then_some(spans)
+}
 
 fn marker(line: &str) -> Option<(Marker, usize)> {
+	let (marker, body_at) = marker_token(line)?;
+	if !line[body_at..].starts_with(char::is_whitespace) {
+		return None;
+	}
+	Some((marker, body_at))
+}
+
+fn decoration_marker(line: &str) -> Option<(Marker, usize)> {
+	let (marker, body_at) = marker_token(line)?;
+	if !line[body_at..].is_empty() && !line[body_at..].starts_with(char::is_whitespace) {
+		return None;
+	}
+	Some((marker, body_at))
+}
+
+fn marker_token(line: &str) -> Option<(Marker, usize)> {
 	let token_end = line.find(['.', ')'])?;
 	let punctuation = line.as_bytes().get(token_end)?;
 	if !matches!(punctuation, b'.' | b')') {
 		return None;
 	}
 	let body_at = token_end + 1;
-	if !line[body_at..].starts_with(char::is_whitespace) {
-		return None;
-	}
 	let token = &line[..token_end];
 	let marker = if let Ok(number) = token.parse::<u16>() {
 		Marker::Decimal(number)
@@ -170,11 +264,29 @@ mod tests {
 	}
 
 	#[test]
-	fn delimiters_and_yield_prefix_split_without_leaking_syntax() {
+	fn delimiters_split_without_leaking_syntax() {
 		assert_eq!(texts(&split("one\n---\ntwo\n///\nthree")), ["one", "two", "three"]);
-		let yielded = split("->\nwait for the turn");
-		assert_eq!(texts(&yielded), ["wait for the turn"]);
+	}
+
+	#[test]
+	fn yield_body_single_message_stays_one_item() {
+		let yielded = split("-> single message");
+		assert_eq!(texts(&yielded), ["single message"]);
 		assert!(yielded[0].yield_after_turn);
+	}
+
+	#[test]
+	fn yield_body_sequential_lists_split() {
+		let yielded = split("->\n1. first\n2. second");
+		assert_eq!(texts(&yielded), ["first", "second"]);
+		assert!(yielded.iter().all(|item| item.yield_after_turn));
+	}
+
+	#[test]
+	fn yield_body_delimiters_split() {
+		let yielded = split("=>\nfirst\n---\nsecond\n///\nthird");
+		assert_eq!(texts(&yielded), ["first", "second", "third"]);
+		assert!(yielded.iter().all(|item| item.yield_after_turn));
 	}
 
 	#[test]
@@ -183,5 +295,35 @@ mod tests {
 		assert_eq!(texts(&split("a) first\nb. second")), ["first", "second"]);
 		assert_eq!(texts(&split("i. first\nii) second\niii. third")), ["first", "second", "third"]);
 		assert_eq!(texts(&split("1. first\n3. not sequential")), ["1. first\n3. not sequential"]);
+	}
+	#[test]
+	fn decoration_spans_track_original_prefix_offsets() {
+		assert_eq!(decoration_spans("  -> hi").as_slice(), &[(2, 4, QueueSpan::Prefix)]);
+		assert_eq!(decoration_spans("=>  x").as_slice(), &[(0, 2, QueueSpan::Prefix)]);
+	}
+
+	#[test]
+	fn decoration_spans_mark_lists_and_delimiters() {
+		assert_eq!(decoration_spans(" \t->\n1. first\n2) second").as_slice(), &[
+			(2, 4, QueueSpan::Prefix),
+			(5, 7, QueueSpan::Marker),
+			(14, 16, QueueSpan::Marker),
+		]);
+		assert_eq!(decoration_spans("->\none\n---\ntwo\n///\nthree").as_slice(), &[
+			(0, 2, QueueSpan::Prefix),
+			(7, 10, QueueSpan::Marker),
+			(15, 18, QueueSpan::Marker),
+		]);
+		assert_eq!(decoration_spans("->\n1. first\n2.").as_slice(), &[
+			(0, 2, QueueSpan::Prefix),
+			(3, 5, QueueSpan::Marker),
+			(12, 14, QueueSpan::Marker),
+		]);
+	}
+
+	#[test]
+	fn decoration_spans_ignore_plain_text_and_lists() {
+		assert!(decoration_spans("plain prose").is_empty());
+		assert!(decoration_spans("1. first\n2. second").is_empty());
 	}
 }

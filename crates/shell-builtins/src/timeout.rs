@@ -172,6 +172,11 @@ impl builtins::Command for TimeoutCommand {
 				// with a success status, real usage errors exit 125.
 				let rendered = err.to_string();
 				if err.use_stderr() {
+					tracing::warn!(
+						builtin = "timeout",
+						error_kind = ?err.kind(),
+						"builtin arguments rejected"
+					);
 					let _ = write!(context.stderr(), "{rendered}");
 					return Ok(ExecutionResult::new(EXIT_TIMEOUT_FAILURE));
 				}
@@ -180,6 +185,7 @@ impl builtins::Command for TimeoutCommand {
 			},
 		};
 		let Some(limit) = parse_duration(&args.duration) else {
+			tracing::warn!(builtin = "timeout", "builtin duration rejected");
 			let _ = writeln!(context.stderr(), "timeout: invalid time interval '{}'", args.duration);
 			return Ok(ExecutionResult::new(EXIT_TIMEOUT_FAILURE));
 		};
@@ -187,6 +193,7 @@ impl builtins::Command for TimeoutCommand {
 			Some(spec) => match parse_duration(spec) {
 				Some(duration) => Some(duration),
 				None => {
+					tracing::warn!(builtin = "timeout", "builtin kill-after duration rejected");
 					let _ = writeln!(context.stderr(), "timeout: invalid time interval '{spec}'");
 					return Ok(ExecutionResult::new(EXIT_TIMEOUT_FAILURE));
 				},
@@ -197,6 +204,7 @@ impl builtins::Command for TimeoutCommand {
 			Some(spec) => match parse_signal(spec) {
 				Some(signal) => signal,
 				None => {
+					tracing::warn!(builtin = "timeout", "builtin signal rejected");
 					let _ = writeln!(context.stderr(), "timeout: '{spec}': invalid signal");
 					return Ok(ExecutionResult::new(EXIT_TIMEOUT_FAILURE));
 				},

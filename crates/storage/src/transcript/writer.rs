@@ -310,6 +310,12 @@ impl Writer {
 	///
 	/// Every newline-terminated malformed record remains a stable tombstone.
 	/// Scanning is bounded by [`super::reader::READ_BUFFER_BYTES`].
+	#[tracing::instrument(
+		name = "journal_open_append",
+		level = "debug",
+		skip_all,
+		fields(path = %path.display())
+	)]
 	pub fn open_append(path: &Path) -> Result<Self, Error> {
 		let reader = Reader::open(path)?;
 		let next_index = reader.next_index();
@@ -333,15 +339,22 @@ impl Writer {
 				.unwrap_or(false);
 		drop(reader);
 		let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-		if !header_terminated && next_index == 0 && file.metadata()?.len() == append_offset {
+		let original_len = file.metadata()?.len();
+		if !header_terminated && next_index == 0 && original_len == append_offset {
 			file.seek(SeekFrom::End(0))?;
 			file.write_all(b"\n")?;
 			file.sync_data()?;
-		} else if file.metadata()?.len() > append_offset {
+			tracing::info!("journal header terminator repaired");
+		} else if original_len > append_offset {
 			file.set_len(append_offset)?;
 			file.sync_data()?;
+			tracing::info!(
+				removed_bytes = original_len.saturating_sub(append_offset),
+				"journal torn tail repaired"
+			);
 		}
 		file.seek(SeekFrom::End(0))?;
+		tracing::debug!(next_event_index = next_index, "journal opened for append");
 		Ok(Self {
 			file: Some(file),
 			pending: None,

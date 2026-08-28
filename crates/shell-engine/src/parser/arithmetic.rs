@@ -13,7 +13,6 @@ pub fn parse(input: &str) -> Result<ast::ArithmeticExpr, error::WordParseError> 
 
 #[omp_macros::cached(size = 64, result = true)]
 fn cacheable_parse(input: String) -> Result<ast::ArithmeticExpr, error::WordParseError> {
-	tracing::debug!(target: "arithmetic", "parsing arithmetic expression: '{input}'");
 	arithmetic::full_expression(input.as_str())
 		.map_err(|e| error::WordParseError::ArithmeticExpression(e.into()))
 }

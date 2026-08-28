@@ -85,6 +85,7 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 tower = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 voice-g2p = { workspace = true, optional = true }
 xutf = { workspace = true }

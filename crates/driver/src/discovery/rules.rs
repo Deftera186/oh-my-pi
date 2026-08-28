@@ -88,6 +88,12 @@ impl StringList {
 
 /// Loads nested Markdown rules, normalizes TTSR scope shorthand, and retains
 /// only declarative (never executable) conditions.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "rule_discovery",
+	fields(source_count = sources.len())
+)]
 pub fn discover(sources: &[RuleSource]) -> RuleDiscovery {
 	let mut result = RuleDiscovery::default();
 	let mut names = BTreeSet::new();

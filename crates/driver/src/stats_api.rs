@@ -37,11 +37,11 @@ pub mod telemetry_backend {
 	};
 
 	use omp_core::Str;
-	use omp_storage::telemetry_index::{QueryGuard, TelemetryIndex};
-	use omp_telemetry::authority::{
+	use omp_observability::authority::{
 		DurableTelemetryQuery, DurableTelemetryRow, DurableTelemetryRows, TelemetryAuthorityError,
 		TelemetryAuthorityIdentity,
 	};
+	use omp_storage::telemetry_index::{QueryGuard, TelemetryIndex};
 	use serde_json::{Value, json};
 
 	const QUERY_LIMIT_MAX: usize = 10_000;

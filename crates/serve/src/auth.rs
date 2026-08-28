@@ -131,6 +131,11 @@ impl AuthenticatedRevealContext {
 			|| request.session_generation != self.session_generation
 			|| !self.providers.contains(&provider)
 		{
+			tracing::warn!(
+				rpc.service = "auth",
+				rpc.method = "reveal_credential",
+				"credential reveal authorization denied"
+			);
 			return Err(Status::permission_denied(
 				"credential reveal identity or provider scope is not authenticated",
 			));
@@ -156,6 +161,11 @@ fn authenticated_reveal_context<T>(
 		.get::<AuthenticatedRevealContext>()
 		.cloned()
 		.ok_or_else(|| {
+			tracing::warn!(
+				rpc.service = "auth",
+				rpc.method = "reveal_credential",
+				"credential reveal missing authenticated context"
+			);
 			Status::permission_denied(
 				"credential reveal requires authenticated CONTROL identity and scope",
 			)
@@ -389,6 +399,11 @@ impl AuthRpc {
 impl pb::auth_server::Auth for AuthRpc {
 	type WatchCredentialsStream = AuthEventStream;
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "list_credentials")
+	)]
 	async fn list_credentials(
 		&self,
 		request: Request<pb::ListCredentialsRequest>,
@@ -418,6 +433,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(pb::ListCredentialsResponse { credentials, cursor: None }))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "watch_credentials")
+	)]
 	async fn watch_credentials(
 		&self,
 		_request: Request<pb::WatchCredentialsRequest>,
@@ -467,6 +487,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(Box::pin(stream)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "begin_login")
+	)]
 	async fn begin_login(
 		&self,
 		request: Request<pb::BeginLoginRequest>,
@@ -492,6 +517,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(pb::BeginLoginResponse { flow_id, step: Some(step) }))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "submit_code")
+	)]
 	async fn submit_code(
 		&self,
 		request: Request<pb::SubmitCodeRequest>,
@@ -511,6 +541,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(account_meta(await_account(flow.session().events.clone()).await?)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "wait_login")
+	)]
 	async fn wait_login(
 		&self,
 		request: Request<pb::WaitLoginRequest>,
@@ -520,6 +555,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(account_meta(await_account(flow.session().events.clone()).await?)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "put_api_key")
+	)]
 	async fn put_api_key(
 		&self,
 		request: Request<pb::PutApiKeyRequest>,
@@ -556,6 +596,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(account_meta(summary)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "refresh_credential")
+	)]
 	async fn refresh_credential(
 		&self,
 		request: Request<pb::RefreshCredentialRequest>,
@@ -582,6 +627,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "delete_credential")
+	)]
 	async fn delete_credential(
 		&self,
 		request: Request<pb::DeleteCredentialRequest>,
@@ -601,6 +651,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(pb::DeleteCredentialResponse {}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "reveal_credential")
+	)]
 	async fn reveal_credential(
 		&self,
 		request: Request<pb::RevealCredentialRequest>,
@@ -616,6 +671,11 @@ impl pb::auth_server::Auth for AuthRpc {
 			.find(|record| record.account == account)
 			.ok_or_else(|| Status::not_found("credential not found"))?;
 		if record.provider.as_str() != request.provider {
+			tracing::warn!(
+				rpc.service = "auth",
+				rpc.method = "reveal_credential",
+				"credential reveal provider authorization denied"
+			);
 			return Err(Status::permission_denied(
 				"credential does not belong to the authorized provider",
 			));
@@ -627,6 +687,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(pb::RevealCredentialResponse { secret: secret.into() }))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "get_usage")
+	)]
 	async fn get_usage(
 		&self,
 		request: Request<pb::GetUsageRequest>,
@@ -686,6 +751,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(pb::GetUsageResponse { reports }))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "put_aws_credential")
+	)]
 	async fn put_aws_credential(
 		&self,
 		request: Request<pb::PutAwsCredentialRequest>,
@@ -717,6 +787,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(self.control_meta(account)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "import_o_auth")
+	)]
 	async fn import_o_auth(
 		&self,
 		request: Request<pb::ImportOAuthRequest>,
@@ -747,6 +822,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(self.control_meta(account)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "disable_credential")
+	)]
 	async fn disable_credential(
 		&self,
 		request: Request<pb::DisableCredentialRequest>,
@@ -762,6 +842,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(metadata))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "enable_credential")
+	)]
 	async fn enable_credential(
 		&self,
 		request: Request<pb::EnableCredentialRequest>,
@@ -774,6 +859,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(self.control_meta(record)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "report_block")
+	)]
 	async fn report_block(
 		&self,
 		request: Request<pb::ReportBlockRequest>,
@@ -799,6 +889,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(self.control_meta(record)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "clear_blocks")
+	)]
 	async fn clear_blocks(
 		&self,
 		request: Request<pb::ClearBlocksRequest>,
@@ -829,6 +924,11 @@ impl pb::auth_server::Auth for AuthRpc {
 		Ok(Response::new(self.control_meta(record)?))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "auth", rpc.method = "mark_usage_stale")
+	)]
 	async fn mark_usage_stale(
 		&self,
 		request: Request<pb::MarkUsageStaleRequest>,
@@ -1045,7 +1145,14 @@ fn store_status(error: auth::StoreError) -> Status {
 		auth::StoreError::GenerationConflict | auth::StoreError::RevealAuditConflict => {
 			Status::aborted(error.to_string())
 		},
-		auth::StoreError::InvalidRevealAudit => Status::permission_denied(error.to_string()),
+		auth::StoreError::InvalidRevealAudit => {
+			tracing::warn!(
+				rpc.service = "auth",
+				rpc.method = "reveal_credential",
+				"credential reveal audit rejected"
+			);
+			Status::permission_denied(error.to_string())
+		},
 		auth::StoreError::InvalidScopedGrant => Status::invalid_argument(error.to_string()),
 		_ => Status::internal(error.to_string()),
 	}

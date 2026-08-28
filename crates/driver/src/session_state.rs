@@ -117,6 +117,15 @@ impl TerminalBreadcrumbs {
 /// # Errors
 ///
 /// Fails when no session matches or the selector is ambiguous.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(
+		session_count = sessions.len(),
+		latest = selector == "@latest",
+		selector_len = selector.len(),
+	)
+)]
 pub fn resolve_session_selector(
 	sessions: &[SessionInfo],
 	selector: &str,

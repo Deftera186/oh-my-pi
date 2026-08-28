@@ -1405,6 +1405,16 @@ struct RawRealtimeCaps {
 
 /// Composes frozen extension provider documents into a catalog before model
 /// selection.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "runtime_provider_catalog_composition",
+	fields(
+		base_provider_count = base.providers().len(),
+		base_model_count = base.models().len(),
+		base_route_count = base.routes().len()
+	)
+)]
 pub fn compose_runtime_provider_catalog<'a>(
 	base: &snapshot::Catalog,
 	documents: impl IntoIterator<Item = &'a Value>,

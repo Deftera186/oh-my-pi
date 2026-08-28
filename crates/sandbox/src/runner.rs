@@ -68,12 +68,31 @@ impl Runner {
 
 	/// Selects the first live backend whose compiled plan enforces every
 	/// request.
+	#[tracing::instrument(
+		name = "sandbox_admission",
+		level = "debug",
+		skip_all,
+		fields(
+			requested_capabilities = spec.requested_capabilities().len(),
+			tolerated_capabilities = spec.tolerated.len(),
+			network = %spec.network,
+			write = %spec.write,
+			degradation = %spec.degradation,
+		)
+	)]
 	pub fn for_spec(spec: &SandboxSpec) -> Result<Self, SandboxError> {
-		spec.validate()?;
+		if let Err(error) = spec.validate() {
+			tracing::warn!(%error, "sandbox specification rejected");
+			return Err(error);
+		}
 		let requested = spec.requested_capabilities();
 		let required = requested.difference(spec.tolerated);
 		let candidates = candidates();
 		if candidates.is_empty() {
+			tracing::warn!(
+				os = std::env::consts::OS,
+				"sandbox admission denied: no supported backend"
+			);
 			return Err(SandboxError::UnsupportedHost { os: std::env::consts::OS });
 		}
 
@@ -93,11 +112,20 @@ impl Runner {
 						.difference(spec.tolerated);
 					if missing.is_empty() {
 						if backend == Backend::Gvisor {
-							let requirements = gvisor::check_requirements(spec)?;
+							let requirements = gvisor::check_requirements(spec).map_err(|error| {
+								tracing::warn!(%error, "sandbox admission denied");
+								error
+							})?;
 							if !requirements.is_available() {
 								continue;
 							}
 						}
+						tracing::debug!(
+							backend = %backend,
+							enforced_capabilities = plan.enforced().len(),
+							caveat_count = plan.caveats().len(),
+							"sandbox backend admitted"
+						);
 						return Ok(runner);
 					}
 					if missing.len() < smallest_missing.len() {
@@ -107,28 +135,51 @@ impl Runner {
 				Err(SandboxError::BackendCapabilities { missing, .. }) => {
 					let missing = missing.difference(spec.tolerated);
 					if missing.is_empty() {
+						tracing::debug!(
+							backend = %backend,
+							"sandbox backend admitted with tolerated capability gaps"
+						);
 						return Ok(runner);
 					}
 					if missing.len() < smallest_missing.len() {
 						smallest_missing = missing;
 					}
 				},
-				Err(error) => return Err(error),
+				Err(error) => {
+					tracing::warn!(%error, "sandbox admission denied");
+					return Err(error);
+				},
 			}
 		}
 
 		if spec.degradation == DegradationPolicy::AllowCaveats {
-			let native = fallback_backend()?;
+			let native = fallback_backend().map_err(|error| {
+				tracing::warn!(%error, "sandbox admission denied");
+				error
+			})?;
 			let status = backend_status(native);
 			return if status.is_available() {
+				tracing::debug!(
+					backend = %native,
+					"sandbox fallback backend admitted"
+				);
 				Ok(Self { backend: native })
 			} else {
+				tracing::warn!(
+					backend = %native,
+					"sandbox admission denied: fallback backend unavailable"
+				);
 				Err(unavailable(status))
 			};
 		}
 		if available.is_empty() {
+			tracing::warn!("sandbox admission denied: no backend passed its live probe");
 			return Err(unavailable(backend_status(candidates[0])));
 		}
+		tracing::warn!(
+			missing_capabilities = %smallest_missing,
+			"sandbox admission denied: required capabilities unavailable"
+		);
 		Err(SandboxError::NoBackendCapabilities { missing: smallest_missing })
 	}
 
@@ -156,6 +207,17 @@ impl Runner {
 	}
 
 	/// Purely compiles a specification into an inspectable plan.
+	#[tracing::instrument(
+		name = "sandbox_profile_build",
+		level = "debug",
+		skip_all,
+		fields(
+			backend = %self.backend,
+			requested_capabilities = spec.requested_capabilities().len(),
+			network = %spec.network,
+			write = %spec.write,
+		)
+	)]
 	pub fn compile(self, spec: &SandboxSpec) -> Result<Plan, SandboxError> {
 		spec.validate()?;
 		let program = resolve_program(&spec.program)?;
@@ -212,6 +274,13 @@ impl Runner {
 				}
 			}
 		}
+		tracing::debug!(
+			backend = %self.backend,
+			enforced_capabilities = plan.enforced().len(),
+			caveat_count = plan.caveats().len(),
+			profile_generated = plan.profile().is_some(),
+			"sandbox profile built"
+		);
 		Ok(plan)
 	}
 
@@ -492,9 +561,9 @@ pub struct RunOutput {
 
 /// Precompiled sandbox launcher reused across many command spawns.
 ///
-/// Temporary profile, BPF, policy, and bind-mask resources remain alive until this value is
-/// dropped. The wrapper is `Send + Sync`; launcher and policy accessors
-/// allocate nothing.
+/// Temporary profile, BPF, policy, and bind-mask resources remain alive until
+/// this value is dropped. The wrapper is `Send + Sync`; launcher and policy
+/// accessors allocate nothing.
 pub struct CommandWrapper {
 	launcher:    Option<OsString>,
 	prefix_args: Vec<OsString>,

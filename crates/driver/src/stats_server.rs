@@ -229,7 +229,7 @@ impl Security {
 			host,
 			address,
 			auth_token,
-			hostname: omp_telemetry::redact::redact_sensitive_credentials(&hostname),
+			hostname: omp_observability::redact::redact_sensitive_credentials(&hostname),
 		}
 	}
 

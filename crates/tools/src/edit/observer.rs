@@ -1,6 +1,6 @@
 //! Syntax-regression observation and bounded automatic edit repair.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use flume::{Receiver, Sender};
@@ -136,30 +136,96 @@ pub struct EditRepairRequest {
 	pub reply:  Sender<Result<Str, EditRepairError>>,
 }
 
-/// Cloneable client for the inference-owning automatic-repair service.
-#[derive(Clone, Debug)]
+/// Type-erased cold completion future used only when a repair is requested.
+type EditRepairFuture =
+	Pin<Box<dyn Future<Output = Result<Str, EditRepairError>> + Send + 'static>>;
+type EditRepairCompletion = dyn Fn(EditRepairPrompt) -> EditRepairFuture + Send + Sync + 'static;
+type EditRepairModel = dyn Fn() -> Option<Str> + Send + Sync + 'static;
+
+#[derive(Clone)]
+enum EditRepairBackend {
+	Channel(Sender<EditRepairRequest>),
+	Completion(Arc<EditRepairCompletion>),
+}
+
+/// Cloneable client for an automatic-repair service.
+#[derive(Clone)]
 pub struct EditRepairClient {
-	tx: Sender<EditRepairRequest>,
+	backend: EditRepairBackend,
+	model:   Option<Arc<EditRepairModel>>,
+}
+
+impl std::fmt::Debug for EditRepairClient {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("EditRepairClient")
+			.field("backend", &match &self.backend {
+				EditRepairBackend::Channel(_) => "channel",
+				EditRepairBackend::Completion(_) => "completion",
+			})
+			.field("has_model_identity", &self.model.is_some())
+			.finish()
+	}
 }
 
 impl EditRepairClient {
-	/// Creates a client and its single-consumer request stream.
+	/// Creates a client and its existing single-consumer request stream.
 	pub fn channel() -> (Self, Receiver<EditRepairRequest>) {
 		let (tx, rx) = flume::unbounded();
-		(Self { tx }, rx)
+		(Self { backend: EditRepairBackend::Channel(tx), model: None }, rx)
 	}
 
-	async fn complete(&self, prompt: EditRepairPrompt) -> Result<Str, EditRepairError> {
-		let (reply, response) = flume::bounded(1);
+	/// Creates a client backed by a cold typed completion callback.
+	///
+	/// The callback is invoked only after an edit introduces a parse failure.
+	/// Its future is boxed at that erased repair boundary, not on the normal
+	/// edit path.
+	pub fn from_completion<F, Fut>(completion: F) -> Self
+	where
+		F: Fn(EditRepairPrompt) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = Result<Str, EditRepairError>> + Send + 'static,
+	{
+		Self {
+			backend: EditRepairBackend::Completion(Arc::new(move |prompt| {
+				Box::pin(completion(prompt))
+			})),
+			model:   None,
+		}
+	}
+
+	/// Adds a dynamic model identity used only for blackbox record metadata.
+	///
+	/// Returning `None` preserves the model configured on the observer.
+	pub fn with_model_identity<F>(mut self, model: F) -> Self
+	where
+		F: Fn() -> Option<Str> + Send + Sync + 'static,
+	{
+		self.model = Some(Arc::new(model));
 		self
-			.tx
-			.send_async(EditRepairRequest { prompt, reply })
-			.await
-			.map_err(|_| EditRepairError::Unavailable)?;
-		response
-			.recv_async()
-			.await
-			.map_err(|_| EditRepairError::Unavailable)?
+	}
+
+	/// Requests one typed repair completion.
+	///
+	/// Channel-backed clients forward to the existing session repair service;
+	/// callback-backed clients invoke their cold completion callback directly.
+	pub async fn complete(&self, prompt: EditRepairPrompt) -> Result<Str, EditRepairError> {
+		match &self.backend {
+			EditRepairBackend::Channel(tx) => {
+				let (reply, response) = flume::bounded(1);
+				tx.send_async(EditRepairRequest { prompt, reply })
+					.await
+					.map_err(|_| EditRepairError::Unavailable)?;
+				response
+					.recv_async()
+					.await
+					.map_err(|_| EditRepairError::Unavailable)?
+			},
+			EditRepairBackend::Completion(completion) => completion(prompt).await,
+		}
+	}
+
+	fn model_identity(&self) -> Option<Str> {
+		self.model.as_ref().and_then(|model| model())
 	}
 }
 
@@ -194,11 +260,25 @@ impl EditObserver {
 			return EditInspection { content: snapshot.after, notice: None, pending: None };
 		}
 		let pending = self.blackbox.path.as_ref().map(|_| PendingBlackbox {
-			record: bounded_record(&snapshot, mode, args, &self.blackbox),
+			record: bounded_record(
+				&snapshot,
+				mode,
+				args,
+				&self.blackbox,
+				self
+					.auto_repair
+					.as_ref()
+					.and_then(EditRepairClient::model_identity),
+			),
 		});
 		if let Some(client) = &self.auto_repair
 			&& let Some(repaired) = repair_parse_regression(&snapshot, client).await
 		{
+			tracing::warn!(
+				path = %snapshot.path,
+				attempts = repaired.attempts,
+				"automatic edit syntax repair applied",
+			);
 			return EditInspection {
 				content: repaired.content,
 				notice: Some(sf!(
@@ -210,6 +290,11 @@ impl EditObserver {
 				pending,
 			};
 		}
+		tracing::warn!(
+			path = %snapshot.path,
+			repair_enabled = self.auto_repair.is_some(),
+			"edit introduced a syntax regression",
+		);
 		EditInspection {
 			content: snapshot.after,
 			notice: Some(sf!(
@@ -292,12 +377,13 @@ fn bounded_record(
 	mode: &str,
 	args: &serde_json::Value,
 	config: &EditBlackboxConfig,
+	model: Option<Str>,
 ) -> EditBlackboxRecord {
 	EditBlackboxRecord {
 		path:   snapshot.path.clone(),
 		before: capture(&snapshot.before, config.max_source_bytes),
 		after:  capture(&snapshot.after, config.max_source_bytes),
-		model:  config.model.clone(),
+		model:  model.unwrap_or_else(|| config.model.clone()),
 		mode:   Str::new(mode),
 		args:   bounded_args(args, config.max_args_bytes),
 	}
@@ -571,6 +657,8 @@ mod tests {
 		);
 		let temp = tempdir().expect("tempdir");
 		let log = temp.path().join("blackbox.jsonl");
+		let (client, requests) = EditRepairClient::channel();
+		drop(requests);
 		let observer = EditObserver::new(
 			EditBlackboxConfig {
 				path:             Some(log.clone()),
@@ -578,7 +666,7 @@ mod tests {
 				max_source_bytes: 24,
 				max_args_bytes:   16,
 			},
-			None,
+			Some(client),
 		);
 		for mode in ["hashline", "replace", "patch", "apply_patch", "sloppy"] {
 			let inspected = observer
@@ -613,6 +701,70 @@ mod tests {
 		assert_eq!(record.mode, "replace");
 		assert!(record.before.truncated);
 		assert_eq!(record.args["truncated"], true);
+	}
+
+	#[tokio::test]
+	async fn callback_repair_uses_dynamic_model_only_for_record_metadata() {
+		let prompts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let observed = Arc::clone(&prompts);
+		let client = EditRepairClient::from_completion(move |prompt| {
+			let observed = Arc::clone(&observed);
+			async move {
+				observed.lock().push(prompt);
+				Ok(Str::new_static("export function value(): number {\n\treturn (1);\n}"))
+			}
+		})
+		.with_model_identity(|| Some(sf!("session/edit-model")));
+		let observer = EditObserver::new(
+			EditBlackboxConfig {
+				path: Some(PathBuf::from("unused.jsonl")),
+				model: sf!("registry/model"),
+				..EditBlackboxConfig::default()
+			},
+			Some(client),
+		);
+
+		let inspected = observer
+			.inspect(snapshot(INVALID), "replace", &serde_json::Value::Null)
+			.await;
+
+		assert!(source_parses(std::str::from_utf8(&inspected.content).expect("utf8"), PATH));
+		assert_eq!(inspected.pending.expect("record").record.model, "session/edit-model");
+		let prompts = prompts.lock();
+		assert_eq!(prompts.len(), 1);
+		assert_eq!(prompts[0].language, "typescript");
+		assert!(prompts[0].after.contains("return (;"));
+		assert!(prompts[0].previous_attempt.is_none());
+	}
+
+	#[tokio::test]
+	async fn public_channel_completion_preserves_typed_service_api() {
+		let (client, requests) = EditRepairClient::channel();
+		let worker = tokio::spawn(async move {
+			let request = requests.recv_async().await.expect("request");
+			assert_eq!(request.prompt.language, "rust");
+			request
+				.reply
+				.send_async(Err(EditRepairError::Completion {
+					message: sf!("provider rejected request"),
+				}))
+				.await
+				.expect("reply");
+		});
+		let result = client
+			.complete(EditRepairPrompt {
+				language:         sf!("rust"),
+				before:           Str::new_static("fn main() {}"),
+				after:            Str::new_static("fn main( {}"),
+				previous_attempt: None,
+			})
+			.await;
+
+		assert_eq!(
+			result,
+			Err(EditRepairError::Completion { message: sf!("provider rejected request") })
+		);
+		worker.await.expect("worker");
 	}
 
 	#[tokio::test]

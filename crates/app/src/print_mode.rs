@@ -204,6 +204,7 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 			fork: args.fork.clone(),
 			py_eval: args.py_eval,
 			approval_mode: args.effective_approval().map(Into::into),
+			spawn_idle_timeout: args.envd_idle_timeout,
 			pty_denied: args.no_pty,
 			credential_provider,
 			api_key: args.api_key.clone(),

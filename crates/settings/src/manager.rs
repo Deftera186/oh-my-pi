@@ -13,11 +13,11 @@ use parking_lot::{Mutex, RwLock};
 use super::{migrate, migrate::MigrationError};
 use crate::{
 	DomainRevision, DynamicOption, FieldDescriptor, LayerNormalizer, OptionProvider, Revision,
-	SettingScope, SettingsDomain, SettingsSnapshot, SnapshotError, SnapshotPublisher, Subscription,
-	ValidationError, deep_merge,
+	SettingKind, SettingScope, SettingsDomain, SettingsSnapshot, SnapshotError, SnapshotPublisher,
+	Subscription, ValidationError, deep_merge,
 	io::{
-		DocumentMutation, QuarantineDiagnostic, SettingsIoError, mutate_document, read_document,
-		read_or_quarantine,
+		DocumentMutation, QuarantineDiagnostic, ReadDocument, SettingsIoError, mutate_document,
+		read_document, read_or_quarantine,
 	},
 	registered_domains,
 };
@@ -102,8 +102,13 @@ pub struct SettingsManager {
 
 impl SettingsManager {
 	/// Loads and validates a writable production authority.
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(path = %paths.global.display(), overlay_count = paths.overlays.len())
+	)]
 	pub fn open(paths: SettingsPaths) -> Result<Self, SettingsManagerError> {
-		let preflight = read_or_quarantine(&paths.global)?;
+		let preflight = read_or_quarantine_reported(&paths.global, "preflight")?;
 		if let Some(data_dir) = paths.global.parent() {
 			migrate::migrate_legacy_settings(data_dir)?;
 		}
@@ -140,12 +145,19 @@ impl SettingsManager {
 	}
 
 	fn load(paths: SettingsPaths, read_only: bool) -> Result<Self, SettingsManagerError> {
-		validate_registry()?;
+		validate_registry().map_err(|error| {
+			tracing::warn!(
+				path = %paths.global.display(),
+				error = %error,
+				"settings registry rejected",
+			);
+			error
+		})?;
 		let mut diagnostics = Vec::new();
 		let global_toml = if read_only {
-			read_document(&paths.global)?
+			read_document_reported(&paths.global, "global")?
 		} else {
-			let read = read_or_quarantine(&paths.global)?;
+			let read = read_or_quarantine_reported(&paths.global, "global")?;
 			if let Some(diagnostic) = read.quarantine {
 				report_quarantine(&diagnostic);
 				diagnostics.push(diagnostic);
@@ -155,9 +167,9 @@ impl SettingsManager {
 		let mut global = load_yaml_compatibility(&paths.global)?;
 		deep_merge(&mut global, global_toml);
 		let project_toml = match &paths.project {
-			Some(path) if read_only => read_document(path)?,
+			Some(path) if read_only => read_document_reported(path, "project")?,
 			Some(path) => {
-				let read = read_or_quarantine(path)?;
+				let read = read_or_quarantine_reported(path, "project")?;
 				if let Some(diagnostic) = read.quarantine {
 					report_quarantine(&diagnostic);
 					diagnostics.push(diagnostic);
@@ -175,7 +187,7 @@ impl SettingsManager {
 		deep_merge(&mut project, project_toml);
 		let overlays = load_overlays(&paths.overlays)?;
 		let document = compose_document(global, project, overlays, toml::Table::new());
-		validate_document(&document)?;
+		validate_loaded_document(&document, &paths)?;
 		let revisions = registered_domains()
 			.into_iter()
 			.map(|domain| (domain.name, DomainRevision(1)))
@@ -223,6 +235,25 @@ impl SettingsManager {
 			.into_iter()
 			.flat_map(|domain| domain.fields.iter().copied())
 			.find(|field| field.path == path)
+	}
+
+	fn mutation_field(&self, path: &str) -> Option<(FieldDescriptor, bool)> {
+		if let Some(field) = self.field(path) {
+			return Some((field, false));
+		}
+		registered_domains()
+			.into_iter()
+			.flat_map(|domain| domain.fields.iter().copied())
+			.filter(|field| {
+				field.kind == SettingKind::Table
+					&& path
+						.as_bytes()
+						.get(field.path.len())
+						.is_some_and(|byte| *byte == b'.')
+					&& path.starts_with(field.path)
+			})
+			.max_by_key(|field| field.path.len())
+			.map(|field| (field, true))
 	}
 
 	/// Iterates reflected fields in stable domain/order/path order.
@@ -311,14 +342,19 @@ impl SettingsManager {
 		path: &str,
 		raw: &str,
 	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
-		let field = self
-			.field(path)
+		let (field, sub_key) = self
+			.mutation_field(path)
 			.ok_or_else(|| SettingsManagerError::UnsupportedKey { path: path.to_owned() })?;
 		if scope != MutationScope::Runtime && !field.scopes.contains(&scope.schema_scope()) {
 			return Err(SettingsManagerError::UnsupportedScope { path: field.path, scope });
 		}
-		let value = field.parse(raw)?;
-		self.apply(scope, DocumentMutation::Set { path: field.path, value })
+		let value = if sub_key {
+			parse_toml_fragment(field.path, raw)?
+		} else {
+			field.parse(raw)?
+		};
+		let mutation_path = if sub_key { path } else { field.path };
+		self.apply(scope, DocumentMutation::Set { path: mutation_path.to_owned(), value })
 	}
 
 	/// Removes one reflected value from the selected layer.
@@ -336,13 +372,14 @@ impl SettingsManager {
 		scope: MutationScope,
 		path: &str,
 	) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
-		let field = self
-			.field(path)
+		let (field, sub_key) = self
+			.mutation_field(path)
 			.ok_or_else(|| SettingsManagerError::UnsupportedKey { path: path.to_owned() })?;
 		if scope != MutationScope::Runtime && !field.scopes.contains(&scope.schema_scope()) {
 			return Err(SettingsManagerError::UnsupportedScope { path: field.path, scope });
 		}
-		self.apply(scope, DocumentMutation::Unset { path: field.path })
+		let mutation_path = if sub_key { path } else { field.path };
+		self.apply(scope, DocumentMutation::Unset { path: mutation_path.to_owned() })
 	}
 
 	fn apply(
@@ -381,7 +418,7 @@ impl SettingsManager {
 	}
 
 	fn reload(&self) -> Result<Arc<SettingsSnapshot>, SettingsManagerError> {
-		let global_read = read_or_quarantine(&self.paths.global)?;
+		let global_read = read_or_quarantine_reported(&self.paths.global, "global")?;
 		if let Some(diagnostic) = global_read.quarantine {
 			self.record_quarantine(diagnostic);
 		}
@@ -390,7 +427,7 @@ impl SettingsManager {
 		let mut project = toml::Table::new();
 		if let Some(path) = self.paths.project.as_deref() {
 			project = load_yaml_compatibility(path)?;
-			let read = read_or_quarantine(path)?;
+			let read = read_or_quarantine_reported(path, "project")?;
 			if let Some(diagnostic) = read.quarantine {
 				self.record_quarantine(diagnostic);
 			}
@@ -398,14 +435,18 @@ impl SettingsManager {
 		}
 		let overlays = load_overlays(&self.paths.overlays)?;
 		let document = compose_document(global, project, overlays, self.runtime.read().clone());
-		validate_document(&document)?;
+		validate_loaded_document(&document, &self.paths)?;
 
 		let previous = self.snapshot();
 		let mut revisions = BTreeMap::new();
+		let mut changed_domain_count = 0_u64;
 		for domain in registered_domains() {
 			let changed = domain.fields.iter().any(|field| {
 				value_at(previous.document(), field.path) != value_at(&document, field.path)
 			});
+			if changed {
+				changed_domain_count += 1;
+			}
 			let old = previous.domain_revision(domain.name);
 			let revision = if changed {
 				DomainRevision(old.0 + 1)
@@ -428,6 +469,11 @@ impl SettingsManager {
 		));
 		*self.snapshot.write() = Arc::clone(&snapshot);
 		self.publisher.publish(Arc::clone(&snapshot));
+		tracing::debug!(
+			revision = snapshot.revision().0,
+			changed_domain_count,
+			"settings snapshot committed",
+		);
 		Ok(snapshot)
 	}
 }
@@ -567,11 +613,65 @@ fn validate_document(document: &toml::Table) -> Result<(), SettingsManagerError>
 	Ok(())
 }
 
+fn validate_loaded_document(
+	document: &toml::Table,
+	paths: &SettingsPaths,
+) -> Result<(), SettingsManagerError> {
+	validate_document(document).map_err(|error| {
+		tracing::warn!(
+			path = %paths.global.display(),
+			overlay_count = paths.overlays.len(),
+			error = %error,
+			"settings document rejected",
+		);
+		error
+	})
+}
+
 fn load_overlays(paths: &[PathBuf]) -> Result<Vec<toml::Table>, SettingsManagerError> {
 	paths
 		.iter()
-		.map(|path| read_document(path).map_err(Into::into))
+		.map(|path| {
+			read_document(path).map_err(|error| {
+				tracing::warn!(
+					path = %path.display(),
+					overlay_count = paths.len(),
+					error = %error,
+					"settings overlay rejected",
+				);
+				error.into()
+			})
+		})
 		.collect()
+}
+fn read_document_reported(
+	path: &Path,
+	layer: &'static str,
+) -> Result<toml::Table, SettingsIoError> {
+	read_document(path).map_err(|error| {
+		tracing::warn!(
+			path = %path.display(),
+			layer,
+			error = %error,
+			"settings layer rejected",
+		);
+		error
+	})
+}
+
+fn read_or_quarantine_reported(
+	path: &Path,
+	layer: &'static str,
+) -> Result<ReadDocument, SettingsIoError> {
+	read_or_quarantine(path).map_err(|error| {
+		tracing::warn!(
+			path = %path.display(),
+			layer,
+			error = %error,
+			"settings layer read failed",
+		);
+		error
+	})
 }
 /// Loads the first canonical YAML sibling below a writable TOML layer.
 ///
@@ -585,10 +685,20 @@ fn load_yaml_compatibility(path: &Path) -> Result<toml::Table, SettingsManagerEr
 	for name in ["config.yml", "config.yaml"] {
 		let candidate = parent.join(name);
 		if candidate.is_file() {
-			return read_document(&candidate).map_err(Into::into);
+			return read_document_reported(&candidate, "yaml_compatibility").map_err(Into::into);
 		}
 	}
 	Ok(toml::Table::new())
+}
+
+fn parse_toml_fragment(path: &'static str, raw: &str) -> Result<toml::Value, ValidationError> {
+	let wrapped = format!("value = {raw}");
+	let document: toml::Table =
+		toml::from_str(&wrapped).map_err(|source| ValidationError::InvalidToml { path, source })?;
+	document
+		.get("value")
+		.cloned()
+		.ok_or(ValidationError::MissingParsedValue { path })
 }
 
 fn apply_runtime(document: &mut toml::Table, mutation: &DocumentMutation) {
@@ -717,6 +827,46 @@ mod tests {
 		crate::DomainRegistration::of::<CoreProbe>()
 	}
 
+	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+	struct ModelProbe {
+		#[serde(default)]
+		roles:         BTreeMap<String, String>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		tiny_selector: Option<String>,
+	}
+
+	impl SettingsDomain for ModelProbe {
+		const DOMAIN: &'static str = "model";
+		const FIELDS: &'static [FieldDescriptor] = &[
+			FieldDescriptor {
+				path:        "model.roles",
+				label:       "Model Roles",
+				description: "Named model selectors.",
+				kind:        SettingKind::Table,
+				scopes:      PROBE_SCOPES,
+				order:       0,
+				options:     None,
+				condition:   None,
+				secret:      false,
+			},
+			FieldDescriptor {
+				path:        "model.tiny_selector",
+				label:       "Tiny Model",
+				description: "Tiny model selector.",
+				kind:        SettingKind::String,
+				scopes:      PROBE_SCOPES,
+				order:       1,
+				options:     None,
+				condition:   None,
+				secret:      false,
+			},
+		];
+	}
+
+	inventory::submit! {
+		crate::DomainRegistration::of::<ModelProbe>()
+	}
+
 	/// Table-shaped domain whose values accept booleans on disk.
 	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 	struct ToggleProbe {
@@ -752,6 +902,77 @@ mod tests {
 
 	inventory::submit! {
 		LayerNormalizer::new(normalize_probe_toggles)
+	}
+
+	fn test_manager(global: PathBuf) -> SettingsManager {
+		SettingsManager::open(SettingsPaths { global, project: None, overlays: Vec::new() })
+			.expect("manager")
+	}
+
+	#[test]
+	fn table_sub_key_set_persists_and_updates_snapshot() {
+		let tree = tempfile::tempdir().expect("tree");
+		let global = tree.path().join("config.toml");
+		let manager = test_manager(global.clone());
+
+		manager
+			.set_sync(MutationScope::Global, "model.roles.default", "\"prov/model\"")
+			.expect("set role");
+
+		let persisted = read_document(&global).expect("global settings");
+		assert_eq!(
+			value_at(&persisted, "model.roles.default").and_then(toml::Value::as_str),
+			Some("prov/model"),
+		);
+		assert_eq!(
+			value_at(manager.snapshot().document(), "model.roles.default")
+				.and_then(toml::Value::as_str),
+			Some("prov/model"),
+		);
+	}
+
+	#[test]
+	fn table_sub_key_unset_preserves_siblings() {
+		let tree = tempfile::tempdir().expect("tree");
+		let global = tree.path().join("config.toml");
+		let manager = test_manager(global.clone());
+		manager
+			.set_sync(MutationScope::Global, "model.roles.default", "\"prov/default\"")
+			.expect("set default role");
+		manager
+			.set_sync(MutationScope::Global, "model.roles.smol", "\"prov/smol\"")
+			.expect("set sibling role");
+
+		manager
+			.unset_sync(MutationScope::Global, "model.roles.default")
+			.expect("unset default role");
+
+		let persisted = read_document(&global).expect("global settings");
+		assert!(value_at(&persisted, "model.roles.default").is_none());
+		assert_eq!(
+			value_at(&persisted, "model.roles.smol").and_then(toml::Value::as_str),
+			Some("prov/smol"),
+		);
+		assert!(value_at(manager.snapshot().document(), "model.roles.default").is_none());
+		assert_eq!(
+			value_at(manager.snapshot().document(), "model.roles.smol").and_then(toml::Value::as_str),
+			Some("prov/smol"),
+		);
+	}
+
+	#[test]
+	fn non_table_sub_key_is_unsupported() {
+		let tree = tempfile::tempdir().expect("tree");
+		let manager = test_manager(tree.path().join("config.toml"));
+
+		let error = manager
+			.set_sync(MutationScope::Global, "model.tiny_selector.x", "\"value\"")
+			.expect_err("non-table sub-key must fail");
+		assert!(matches!(
+			error,
+			SettingsManagerError::UnsupportedKey { path }
+				if path == "model.tiny_selector.x"
+		));
 	}
 
 	#[test]

@@ -143,39 +143,40 @@ pub struct LearnTool<A> {
 	spec:      ToolSpec,
 }
 
+/// Builds the host-free `learn@1` declaration.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("learn"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("managed-skills/**")].into_iter().collect(),
+			}),
+			..Effects::empty()
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("learn.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates `learn@1` over one active Mnemopi runtime and managed-skill
 /// authority.
 pub fn tool<A: ManagedSkillAuthority>(
 	memory: Arc<MemoryRuntime>,
 	authority: Arc<A>,
 ) -> LearnTool<A> {
-	LearnTool {
-		memory,
-		authority,
-		spec: ToolSpec {
-			name:            sf!("learn"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("managed-skills/**")].into_iter().collect(),
-				}),
-				..Effects::empty()
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("learn.rs"),
-			)
-			.into(),
-		},
-	}
+	LearnTool { memory, authority, spec: spec() }
 }
 
 impl<A: ManagedSkillAuthority> Tool for LearnTool<A> {

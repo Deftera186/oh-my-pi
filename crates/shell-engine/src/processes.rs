@@ -45,11 +45,12 @@ pub enum ProcessSignal {
 /// Process groups are the cancellation ownership boundary used by embedders.
 /// A missing group is treated as already stopped.
 #[cfg(unix)]
-pub fn signal_process_group(pgid: i32, signal: ProcessSignal) -> Result<(), io::Error> {
+pub fn signal_process_group(pgid: i32, requested_signal: ProcessSignal) -> Result<(), io::Error> {
 	if pgid <= 0 {
 		return Err(io::Error::new(io::ErrorKind::InvalidInput, "process-group id must be positive"));
 	}
-	let signal = match signal {
+	let signal_name = process_signal_name(requested_signal);
+	let signal = match requested_signal {
 		ProcessSignal::Hangup => signal::Signal::SIGHUP,
 		ProcessSignal::Interrupt => signal::Signal::SIGINT,
 		ProcessSignal::Quit => signal::Signal::SIGQUIT,
@@ -62,18 +63,71 @@ pub fn signal_process_group(pgid: i32, signal: ProcessSignal) -> Result<(), io::
 		ProcessSignal::WindowChanged => signal::Signal::SIGWINCH,
 	};
 	match signal::kill(Pid::from_raw(-pgid), signal) {
-		Ok(()) | Err(Errno::ESRCH) => Ok(()),
-		Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+		Ok(()) => {
+			match requested_signal {
+				ProcessSignal::Terminate => {
+					tracing::info!(
+						pgid,
+						signal = signal_name,
+						"shell process group termination requested"
+					);
+				},
+				ProcessSignal::Kill => {
+					tracing::warn!(
+						pgid,
+						signal = signal_name,
+						"shell process group force kill delivered"
+					);
+				},
+				_ => {
+					tracing::debug!(pgid, signal = signal_name, "shell process group signal delivered");
+				},
+			}
+			Ok(())
+		},
+		Err(Errno::ESRCH) => {
+			tracing::info!(pgid, signal = signal_name, "shell process group already exited");
+			Ok(())
+		},
+		Err(error) => {
+			tracing::warn!(
+				pgid,
+				signal = signal_name,
+				error = %error,
+				"failed to signal shell process group"
+			);
+			Err(io::Error::from_raw_os_error(error as i32))
+		},
 	}
 }
 
 /// Sends `signal` to a process when process groups are unavailable.
 #[cfg(not(unix))]
-pub fn signal_process_group(_pgid: i32, _signal: ProcessSignal) -> Result<(), io::Error> {
+pub fn signal_process_group(pgid: i32, signal: ProcessSignal) -> Result<(), io::Error> {
+	tracing::warn!(
+		pgid,
+		signal = process_signal_name(signal),
+		"process-group signalling is unsupported on this platform"
+	);
 	Err(io::Error::new(
 		io::ErrorKind::Unsupported,
 		"process-group signalling is unsupported on this platform",
 	))
+}
+
+const fn process_signal_name(signal: ProcessSignal) -> &'static str {
+	match signal {
+		ProcessSignal::Hangup => "hangup",
+		ProcessSignal::Interrupt => "interrupt",
+		ProcessSignal::Quit => "quit",
+		ProcessSignal::Terminate => "terminate",
+		ProcessSignal::Kill => "kill",
+		ProcessSignal::User1 => "user1",
+		ProcessSignal::User2 => "user2",
+		ProcessSignal::Continue => "continue",
+		ProcessSignal::Stop => "stop",
+		ProcessSignal::WindowChanged => "window_changed",
+	}
 }
 
 struct CompletionMarker {
@@ -161,11 +215,17 @@ impl ChildProcess {
 			match self.exec_future.as_mut().await {
 				Ok(output) => {
 					let marker_exit_code = completion_exit_code(&output.status);
+					self.record_exit(&output);
 					self.reaped = true;
 					self.write_completion_marker(marker_exit_code);
 				},
 				Err(error) => {
-					tracing::debug!(?error, "failed to reap detached child process");
+					tracing::warn!(
+						pid = ?self.pid,
+						pgid = ?self.pgid,
+						error = %error,
+						"failed to reap detached shell child process"
+					);
 				},
 			}
 		});
@@ -206,6 +266,7 @@ impl ChildProcess {
 				output = &mut self.exec_future => {
 					let output = output?;
 					let marker_exit_code = completion_exit_code(&output.status);
+					self.record_exit(&output);
 					self.reaped = true;
 					self.write_completion_marker(marker_exit_code);
 					break Ok(ProcessWaitResult::Completed(output))
@@ -240,11 +301,21 @@ impl ChildProcess {
 		#[cfg(unix)]
 		{
 			let Some(pid) = self.pid else { return };
+			tracing::warn!(
+				pid,
+				pgid = ?self.pgid,
+				"force killing shell child process"
+			);
 			let _ = signal::kill(Pid::from_raw(pid), signal::Signal::SIGKILL);
 		}
 
 		#[cfg(windows)]
 		{
+			tracing::warn!(
+				pid = ?self.pid,
+				pgid = ?self.pgid,
+				"force terminating shell child process"
+			);
 			let terminated = self
 				.kill_handle
 				.as_ref()
@@ -255,6 +326,16 @@ impl ChildProcess {
 				}
 			}
 		}
+	}
+
+	fn record_exit(&self, output: &process::Output) {
+		tracing::info!(
+			pid = ?self.pid,
+			pgid = ?self.pgid,
+			exit_code = ?output.status.code(),
+			success = output.status.success(),
+			"shell child process exited"
+		);
 	}
 
 	fn write_completion_marker(&mut self, exit_code: i32) {
@@ -273,6 +354,7 @@ impl ChildProcess {
 		Some(match result {
 			Ok(output) => {
 				let marker_exit_code = completion_exit_code(&output.status);
+				self.record_exit(&output);
 				self.reaped = true;
 				self.write_completion_marker(marker_exit_code);
 				Ok(output)

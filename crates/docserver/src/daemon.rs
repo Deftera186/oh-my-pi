@@ -233,6 +233,7 @@ pub type Result<T = ()> = result::Result<T, Error>;
 /// are protected by a separate instance lock and created sockets are
 /// owner-only. When no external shutdown token is supplied, `SIGINT` or
 /// `SIGTERM` starts graceful connection, LSP, and actor shutdown.
+#[tracing::instrument(level = "debug", skip_all, fields(root = %root.display()))]
 pub async fn serve(root: PathBuf, transport: Transport, options: ServeOptions) -> Result {
 	run_with_shutdown(root, transport, options).await
 }
@@ -267,6 +268,7 @@ async fn run_with_shutdown(root: PathBuf, transport: Transport, options: ServeOp
 			},
 		}
 	}
+	tracing::info!(lsp_processes = processes.len(), "document server initialized");
 	let serve_result = match (transport, options.shutdown) {
 		(Transport::Stdio, None) => serve_stdio(environment.clone()).await,
 		(Transport::Stdio, Some(shutdown)) => serve_stdio_until(environment.clone(), shutdown).await,
@@ -288,6 +290,7 @@ async fn run_with_shutdown(root: PathBuf, transport: Transport, options: ServeOp
 		mem::forget(authority_lock);
 		return Err(Error::ShutdownDeadlineExceeded);
 	}
+	tracing::info!("document server stopped");
 	serve_result?;
 	process_result
 }
@@ -448,6 +451,7 @@ async fn bind_socket(path: PathBuf) -> Result<(UnixListener, SocketCleanup)> {
 	fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 	let metadata = fs::symlink_metadata(&path)?;
 	let cleanup = SocketCleanup { path, dev: metadata.dev(), ino: metadata.ino(), _lock: lock };
+	tracing::info!(path = %cleanup.path.display(), "document server socket listening");
 	Ok((listener, cleanup))
 }
 
@@ -507,7 +511,7 @@ async fn serve_socket_until(
 				let (stream, _) = match accepted {
 					Ok(connection) => connection,
 					Err(error) => {
-						eprintln!("omp-docserver: socket accept failed: {error}");
+						tracing::warn!(%error, "socket accept failed; retrying");
 						sleep(ACCEPT_RETRY_DELAY).await;
 						continue;
 					},
@@ -515,14 +519,14 @@ async fn serve_socket_until(
 				match stream.peer_cred() {
 					Ok(credentials) if credentials.uid() == geteuid().as_raw() => {},
 					Ok(credentials) => {
-						eprintln!(
-							"omp-docserver: rejected socket peer owned by uid {}",
-							credentials.uid()
+						tracing::warn!(
+							peer_uid = credentials.uid(),
+							"rejected socket peer owned by another user"
 						);
 						continue;
 					},
 					Err(error) => {
-						eprintln!("omp-docserver: cannot authenticate socket peer: {error}");
+						tracing::warn!(%error, "cannot authenticate socket peer");
 						continue;
 					},
 				}
@@ -597,11 +601,11 @@ fn report_connection(result: result::Result<result::Result<(), ConnectionError>,
 	match result {
 		Ok(Ok(())) => {},
 		Ok(Err(error)) => {
-			eprintln!("omp-docserver: connection failed: {error}");
+			tracing::warn!(%error, "document server connection failed");
 		},
 		Err(error) if error.is_cancelled() => {},
 		Err(error) => {
-			eprintln!("omp-docserver: connection task failed: {error}");
+			tracing::error!(%error, "document server connection task crashed");
 		},
 	}
 }

@@ -126,10 +126,11 @@ impl ComposerStyle {
 		} else {
 			StatusPlacement::Standalone
 		};
-		let context_gauge = if matches!(status_placement, super::StatusPlacement::Embedded) {
-			ContextGaugeMode::Bar
-		} else {
-			ContextGaugeMode::Numeric
+		let context_gauge = match status_attachment {
+			ComposerStatusAttachment::TopBorder | ComposerStatusAttachment::Standalone => {
+				ContextGaugeMode::Bar
+			},
+			ComposerStatusAttachment::TopRuleChip => ContextGaugeMode::Numeric,
 		};
 		let status_gap = matches!(self, Self::Rule | Self::Field | Self::Rail);
 		let status_before_input = matches!(self, Self::Borderless);
@@ -213,6 +214,18 @@ const fn scrollbar_thumb(charset: Charset) -> char {
 	}
 }
 
+/// Semantic accent painted over host-declared inline spans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InlineAccent {
+	/// Muted, dimmed host annotation.
+	Dim,
+	/// Theme-accented host annotation.
+	Accent,
+}
+
+/// Pure host decoration from full editor text to accented byte spans.
+pub type InlineDecorator = Box<dyn Fn(&str) -> SmallVec<(usize, usize, InlineAccent), 4>>;
+
 /// Data-driven accent policy for editor keywords.
 #[derive(Clone, Debug, Default)]
 pub struct KeywordAccent {
@@ -280,6 +293,8 @@ pub struct EditInput {
 	last_click:        Option<((u16, u16), Instant)>,
 	keyword_accent:    KeywordAccent,
 	keyword_spans:     SmallVec<(usize, usize), 8>,
+	inline_decorator:  Option<InlineDecorator>,
+	decoration_spans:  SmallVec<(usize, usize, InlineAccent), 4>,
 	spelling:          SpellingAssist,
 	spelling_features: SpellingFeatures,
 	spelling_mask:     SmallVec<Range<usize>, 8>,
@@ -301,6 +316,8 @@ impl EditInput {
 			last_click:        None,
 			keyword_accent:    KeywordAccent::default(),
 			keyword_spans:     SmallVec::new(),
+			inline_decorator:  None,
+			decoration_spans:  SmallVec::new(),
 			spelling:          SpellingAssist::new(),
 			spelling_features: SpellingFeatures::default(),
 			spelling_mask:     SmallVec::new(),
@@ -334,8 +351,17 @@ impl EditInput {
 		self.refresh_keyword_spans();
 	}
 
+	fn set_inline_decorator(&mut self, decorator: Option<InlineDecorator>) {
+		self.inline_decorator = decorator;
+		self.refresh_keyword_spans();
+	}
+
 	fn refresh_keyword_spans(&mut self) {
 		self.keyword_spans = self.keyword_accent.matched_spans(self.editor.text());
+		self.decoration_spans = self
+			.inline_decorator
+			.as_ref()
+			.map_or_else(SmallVec::new, |decorator| decorator(self.editor.text()));
 		self.refresh_spelling();
 	}
 
@@ -1080,6 +1106,19 @@ impl Component for EditInput {
 				}
 			}
 			runs = overlay_chip_runs(&runs, &keyword_runs, content.text.len());
+			let mut decoration_runs: SmallVec<(usize, usize, Style), 8> = SmallVec::new();
+			for &(decoration_start, decoration_end, decoration) in &self.decoration_spans {
+				let from = decoration_start.max(start);
+				let to = decoration_end.min(scanned);
+				if from < to {
+					let style = match decoration {
+						InlineAccent::Dim => Style::new().fg(pc.ctx.theme.muted).dim(),
+						InlineAccent::Accent => Style::new().fg(pc.ctx.theme.accent),
+					};
+					decoration_runs.push((from - start, to - start, style));
+				}
+			}
+			runs = overlay_chip_runs(&runs, &decoration_runs, content.text.len());
 			if matches!(self.style, ComposerStyle::Field | ComposerStyle::Rail) {
 				for run in &mut runs {
 					run.style = run.style.bg(pc.ctx.theme.panel);
@@ -1843,6 +1882,14 @@ impl EditorPane {
 	pub fn set_keyword_accent(&mut self, accent: KeywordAccent) {
 		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
 			input.set_keyword_accent(accent);
+			self.children[0].invalidate();
+		}
+	}
+
+	/// Installs chat-host queue-shorthand decoration and refreshes its spans.
+	pub fn set_inline_decorator(&mut self, decorator: Option<InlineDecorator>) {
+		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
+			input.set_inline_decorator(decorator);
 			self.children[0].invalidate();
 		}
 	}
@@ -2641,11 +2688,15 @@ mod tests {
 			);
 			if style == ComposerStyle::Box {
 				assert_eq!(layout.status_placement, StatusPlacement::Embedded);
-				assert_eq!(layout.context_gauge, ContextGaugeMode::Bar);
 			} else {
 				assert_eq!(layout.status_placement, StatusPlacement::Standalone);
-				assert_eq!(layout.context_gauge, ContextGaugeMode::Numeric);
 			}
+			let expected_gauge = if layout.status_attachment == ComposerStatusAttachment::TopRuleChip {
+				ContextGaugeMode::Numeric
+			} else {
+				ContextGaugeMode::Bar
+			};
+			assert_eq!(layout.context_gauge, expected_gauge, "{style}");
 			assert_eq!(layout.status_before_input, style == ComposerStyle::Borderless);
 		}
 		assert_eq!(ComposerStyle::default(), ComposerStyle::Borderless);
@@ -2956,6 +3007,39 @@ mod tests {
 		ui.handle_key(Key::Char('a'));
 		assert!(ui.set_text("input", "hi"), "set_text still routes through the pane to the input");
 		assert_eq!(ui.values()["input"], "hi");
+	}
+
+	#[test]
+	fn inline_decorator_paints_host_spans() {
+		let ctx = UiContext::default();
+		let mut pane = EditorPane::new();
+		pane.set_inline_decorator(Some(Box::new(|text| {
+			let mut spans = SmallVec::new();
+			if text.starts_with("->") {
+				spans.push((0, 2, InlineAccent::Dim));
+			}
+			if let Some(start) = text.find("hello") {
+				spans.push((start, start + "hello".len(), InlineAccent::Accent));
+			}
+			spans
+		})));
+		let ui = Ui::from_root(pane.with(Prop::Value, "-> hello"), 20, ctx.clone());
+		let row = frame_row_text(ui.frame(), 0);
+		let arrow = row.find("->").expect("decorated arrow is painted");
+		let arrow_x = u16::try_from(xutf::width_str(&row[..arrow])).expect("narrow editor row");
+		for x in arrow_x..arrow_x + 2 {
+			let style = ui.frame().cell(x, 0).style();
+			assert_eq!(style.foreground_color(), ctx.theme.muted);
+			assert!(style.spec().dim);
+		}
+		let space = ui.frame().cell(arrow_x + 2, 0).style();
+		assert_eq!(space.foreground_color(), ctx.theme.fg);
+		assert!(!space.spec().dim);
+		for x in arrow_x + 3..arrow_x + 8 {
+			let style = ui.frame().cell(x, 0).style();
+			assert_eq!(style.foreground_color(), ctx.theme.accent);
+			assert!(!style.spec().dim);
+		}
 	}
 
 	#[test]

@@ -310,13 +310,25 @@ pub struct AdmissionGate {
 	fragments:     BytesMut,
 	requested:     Option<Value>,
 	query_emitted: bool,
+	policy:        ApprovalPolicy,
 	answer_tx:     Option<flume::Sender<Admission>>,
 	answer_rx:     Receiver<Admission>,
 }
 
 impl AdmissionGate {
 	/// Starts an OPEN invocation gate whose deadline is enforced by env.
+	#[cfg(test)]
 	pub(crate) fn new(invocation_id: Str, tool_name: Str, deadline: Duration) -> Self {
+		Self::with_policy(invocation_id, tool_name, deadline, ApprovalPolicy::Prompt)
+	}
+
+	/// Starts an OPEN invocation gate with its resolved admission policy.
+	pub(crate) fn with_policy(
+		invocation_id: Str,
+		tool_name: Str,
+		deadline: Duration,
+		policy: ApprovalPolicy,
+	) -> Self {
 		let (answer_tx, answer_rx) = flume::bounded(1);
 		Self {
 			invocation_id,
@@ -325,6 +337,7 @@ impl AdmissionGate {
 			fragments: BytesMut::new(),
 			requested: None,
 			query_emitted: false,
+			policy,
 			answer_tx: Some(answer_tx),
 			answer_rx,
 		}
@@ -346,7 +359,7 @@ impl AdmissionGate {
 		if !value.is_object() {
 			return None;
 		}
-		Some(self.finish_query(value, cwd, root))
+		self.finish_query(value, cwd, root)
 	}
 
 	/// Finalizes a call that supplied its complete arguments only with
@@ -367,14 +380,14 @@ impl AdmissionGate {
 		}
 		self.fragments.clear();
 		self.fragments.extend_from_slice(raw);
-		Ok(Some(self.finish_query(value, cwd, root)))
+		Ok(self.finish_query(value, cwd, root))
 	}
 
-	fn finish_query(&mut self, value: Value, cwd: &Path, root: &Path) -> AdmitInvocation {
+	fn finish_query(&mut self, value: Value, cwd: &Path, root: &Path) -> Option<AdmitInvocation> {
 		let bash = bash_ir(&self.tool_name, &value, cwd, root);
 		self.requested = Some(value);
 		self.query_emitted = true;
-		AdmitInvocation {
+		let query = AdmitInvocation {
 			invocation_id: self.invocation_id.to_string(),
 			bash,
 			deadline_ms: self
@@ -384,6 +397,30 @@ impl AdmissionGate {
 				.try_into()
 				.unwrap_or(u64::MAX),
 			props: Default::default(),
+		};
+		match self.policy {
+			ApprovalPolicy::Prompt => Some(query),
+			ApprovalPolicy::Allow => {
+				self
+					.answer(Admission {
+						invocation_id: self.invocation_id.to_string(),
+						allow: true,
+						..Admission::default()
+					})
+					.expect("an internally resolved admission is answered exactly once");
+				None
+			},
+			ApprovalPolicy::Deny => {
+				self
+					.answer(Admission {
+						invocation_id: self.invocation_id.to_string(),
+						allow: false,
+						denied: Some(approval_denial(&self.invocation_id, &self.tool_name)),
+						..Admission::default()
+					})
+					.expect("an internally resolved admission is answered exactly once");
+				None
+			},
 		}
 	}
 
@@ -425,9 +462,18 @@ impl AdmissionGate {
 	/// Waits for Core's answer through the env-owned deadline, synthesizing the
 	/// structured fail-closed denial when it expires or the relay closes.
 	pub(crate) async fn decide(&self, cwd: &Path, root: &Path) -> AdmissionDecision {
-		let answer = time::timeout_at(self.deadline, self.answer_rx.recv_async()).await;
-		let Ok(Ok(admission)) = answer else {
-			return AdmissionDecision::Denied(timeout_denial(&self.invocation_id));
+		let admission = match self.answer_rx.try_recv() {
+			Ok(admission) => admission,
+			Err(flume::TryRecvError::Empty) => {
+				let answer = time::timeout_at(self.deadline, self.answer_rx.recv_async()).await;
+				let Ok(Ok(admission)) = answer else {
+					return AdmissionDecision::Denied(timeout_denial(&self.invocation_id));
+				};
+				admission
+			},
+			Err(flume::TryRecvError::Disconnected) => {
+				return AdmissionDecision::Denied(timeout_denial(&self.invocation_id));
+			},
 		};
 		if !admission.allow {
 			return AdmissionDecision::Denied(
@@ -541,16 +587,30 @@ fn invalid_patch_denial(invocation_id: &str) -> PolicyDenied {
 	}
 }
 
+fn approval_denial(invocation_id: &str, tool_name: &str) -> PolicyDenied {
+	PolicyDenied {
+		reason:      format!("tool `{tool_name}` is denied by approval policy"),
+		code:        "approval_policy_denied".into(),
+		decision_id: invocation_id.to_owned(),
+		rules:       vec![format!("tools.approval.{tool_name}")],
+		props:       Default::default(),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{path::Path, sync::Arc, time::Duration};
 
 	use bytes::Bytes;
 	use omp_core::sf;
-	use omp_proto::policy::v1::{EffectEnvelope, ExecEffects};
+	use omp_proto::{
+		env::v1::Admission,
+		policy::v1::{EffectEnvelope, ExecEffects},
+	};
 	use omp_tool::{
 		DesktopEffects, DocEffects, Effects, ExecEffects as ToolExecEffects, InferenceEffects, Usd,
 	};
+	use tokio::time;
 
 	use super::{
 		AdmissionDecision, AdmissionGate, ApprovalMode, ApprovalPolicy, ApprovalSource, ApprovalTier,
@@ -567,6 +627,75 @@ mod tests {
 			panic!("elapsed admission deadline must deny");
 		};
 		assert_eq!(denied.code, "admission_timeout");
+	}
+
+	#[tokio::test]
+	async fn allow_policy_finalizes_without_emitting_a_query() {
+		let mut gate = AdmissionGate::with_policy(
+			sf!("call"),
+			sf!("bash"),
+			Duration::ZERO,
+			ApprovalPolicy::Allow,
+		);
+		assert!(
+			gate
+				.finalize(br#"{"command":"echo allowed"}"#, Path::new("/work"), Path::new("/work"))
+				.expect("valid arguments")
+				.is_none()
+		);
+		let AdmissionDecision::Allowed { raw, .. } =
+			gate.decide(Path::new("/work"), Path::new("/work")).await
+		else {
+			panic!("allow policy must admit");
+		};
+		assert_eq!(raw, Bytes::from_static(br#"{"command":"echo allowed"}"#));
+	}
+
+	#[tokio::test]
+	async fn deny_policy_finalizes_without_emitting_a_query() {
+		let mut gate =
+			AdmissionGate::with_policy(sf!("call"), sf!("bash"), Duration::ZERO, ApprovalPolicy::Deny);
+		assert!(
+			gate
+				.finalize(br#"{"command":"echo denied"}"#, Path::new("/work"), Path::new("/work"))
+				.expect("valid arguments")
+				.is_none()
+		);
+		let AdmissionDecision::Denied(denied) =
+			gate.decide(Path::new("/work"), Path::new("/work")).await
+		else {
+			panic!("deny policy must refuse");
+		};
+		assert_eq!(denied.code, "approval_policy_denied");
+		assert_eq!(denied.decision_id, "call");
+		assert_eq!(denied.rules, ["tools.approval.bash"]);
+	}
+
+	#[tokio::test]
+	async fn prompt_policy_emits_a_query_and_waits_for_an_answer() {
+		let mut gate = AdmissionGate::new(sf!("call"), sf!("bash"), Duration::from_secs(1));
+		assert!(
+			gate
+				.finalize(br#"{"command":"echo prompt"}"#, Path::new("/work"), Path::new("/work"))
+				.expect("valid arguments")
+				.is_some()
+		);
+		assert!(
+			time::timeout(
+				Duration::from_millis(10),
+				gate.decide(Path::new("/work"), Path::new("/work")),
+			)
+			.await
+			.is_err(),
+			"prompt policy must wait for the client admission answer"
+		);
+		gate
+			.answer(Admission { invocation_id: "call".into(), allow: true, ..Admission::default() })
+			.expect("prompt answer");
+		assert!(matches!(
+			gate.decide(Path::new("/work"), Path::new("/work")).await,
+			AdmissionDecision::Allowed { .. }
+		));
 	}
 
 	#[test]

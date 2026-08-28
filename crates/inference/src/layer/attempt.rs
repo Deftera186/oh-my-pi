@@ -123,6 +123,22 @@ where
 					request.context.finalize_error(&mut error);
 					return Err(error);
 				}
+				let retry_attempt = reentries.saturating_add(1);
+				match &action {
+					AttemptAction::RefreshCredential { .. } => tracing::warn!(
+						retry_attempt,
+						error_kind = ?error.kind,
+						error_phase = ?error.phase,
+						"provider authentication failed; refreshing credential before retry"
+					),
+					AttemptAction::RotateAccount { .. } => tracing::warn!(
+						retry_attempt,
+						error_kind = ?error.kind,
+						error_phase = ?error.phase,
+						"provider attempt failed; rotating account before retry"
+					),
+					AttemptAction::Initial => {},
+				}
 				reentries += 1;
 				request.context.set_attempt_action(action);
 				future::poll_fn(|cx| service.poll_ready(cx)).await?;

@@ -45,12 +45,13 @@ use super::{
 const MAX_REDIRECTS: usize = 20;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
-static READ_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+static READ_CLIENT: LazyLock<omp_http::Client> = LazyLock::new(|| {
 	omp_http::client_builder()
 		.redirect(redirect::Policy::limited(MAX_REDIRECTS))
 		.referer(false)
 		.build()
 		.expect("build read HTTP client")
+		.into()
 });
 
 use omp_storage::atomic;
@@ -140,7 +141,7 @@ fn rewrite_document_media_links(destination: &Path, conversion: &mut Conversion)
 
 #[derive(Clone)]
 struct SystemHttpClient {
-	inner: reqwest::Client,
+	inner: omp_http::Client,
 }
 
 impl SystemHttpClient {

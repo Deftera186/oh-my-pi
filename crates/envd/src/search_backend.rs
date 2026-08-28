@@ -12,6 +12,7 @@ use omp_proto::{
 use omp_tools::web_search::{BackendError, SearchBackend};
 use thiserror::Error;
 use tonic::transport;
+use tracing::Instrument as _;
 
 use crate::SearchInference;
 
@@ -57,11 +58,14 @@ impl SearchBridgeHost {
 
 	/// Routes one image generation/edit through the already-bound inference
 	/// facade and returns the final artifact blobs.
+	#[tracing::instrument(name = "media_generate_image", level = "debug", skip_all)]
 	pub(crate) async fn generate_image(
 		&self,
 		request: pb::GenerateImageRequest,
 	) -> Result<Vec<v1::Blob>, BackendError> {
-		let inference = self.inference.get().ok_or_else(unbound_media)?;
+		let Some(inference) = self.inference.get() else {
+			return Err(unbound_media());
+		};
 		match inference {
 			SearchFacade::Local(inference) => inference.generate_image(request).await,
 			SearchFacade::Remote(client) => {
@@ -76,8 +80,11 @@ impl SearchBridgeHost {
 	}
 
 	/// Routes speech synthesis and concatenates encoded chunks in wire order.
+	#[tracing::instrument(name = "media_speak", level = "debug", skip_all)]
 	pub(crate) async fn speak(&self, request: pb::SpeakRequest) -> Result<Vec<u8>, BackendError> {
-		let inference = self.inference.get().ok_or_else(unbound_media)?;
+		let Some(inference) = self.inference.get() else {
+			return Err(unbound_media());
+		};
 		match inference {
 			SearchFacade::Local(inference) => inference.speak(request).await,
 			SearchFacade::Remote(client) => {
@@ -148,16 +155,21 @@ impl SearchBackend for SearchBridgeHost {
 		&self,
 		request: pb::SearchRequest,
 	) -> impl Future<Output = Result<pb::SearchResponse, BackendError>> + Send + '_ {
+		let span = tracing::debug_span!("search_request", provider = %request.engine, limit = request.limit, transport = tracing::field::Empty);
 		async move {
-			let inference = self.inference.get().ok_or_else(|| BackendError {
-				code:    sf!("backend_unbound"),
-				message: sf!("web search is unavailable before inference startup completes"),
-			})?;
+			let Some(inference) = self.inference.get() else {
+				return Err(BackendError {
+					code:    sf!("backend_unbound"),
+					message: sf!("web search is unavailable before inference startup completes"),
+				});
+			};
 			let response = match inference {
 				SearchFacade::Local(inference) => {
+					tracing::Span::current().record("transport", "local");
 					return inference.search(request).await;
 				},
 				SearchFacade::Remote(client) => {
+					tracing::Span::current().record("transport", "remote");
 					let mut client = client.clone();
 					client.search(tonic::Request::new(request)).await
 				},
@@ -168,6 +180,7 @@ impl SearchBackend for SearchBridgeHost {
 			})?;
 			Ok(response.into_inner())
 		}
+		.instrument(span)
 	}
 }
 

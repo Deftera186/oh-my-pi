@@ -7,7 +7,7 @@ use crate::{
 	parser::pattern::{self, pattern_has_glob_metacharacters},
 	regex,
 	regex::regex_char_is_special,
-	sys, trace_categories,
+	sys,
 };
 
 /// Represents a piece of a shell pattern.
@@ -201,8 +201,6 @@ impl Pattern {
 			return Ok(PatternExpansionResult::Expanded(vec![concatenated]));
 		}
 
-		tracing::debug!(target: trace_categories::PATTERN, "expanding pattern: {self:?}");
-
 		let mut components: Vec<PatternWord> = vec![];
 		for piece in &self.pieces {
 			let mut split_result: VecDeque<_> = sys::fs::split_path_for_pattern(piece.as_str())
@@ -364,8 +362,6 @@ impl Pattern {
 			})
 			.collect();
 
-		tracing::debug!(target: trace_categories::PATTERN, "  => results: {results:?}");
-
 		Ok(PatternExpansionResult::Expanded(results))
 	}
 
@@ -430,9 +426,6 @@ impl Pattern {
 		strict_suffix_match: bool,
 	) -> Result<fancy_regex::Regex, error::Error> {
 		let regex_str = self.to_regex_str(strict_prefix_match, strict_suffix_match)?;
-
-		tracing::debug!(target: trace_categories::PATTERN, "pattern: '{self:?}' => regex: '{regex_str}'");
-
 		let re = regex::compile_regex(regex_str, self.case_insensitive, self.multiline)?;
 		Ok(re)
 	}

@@ -1,5 +1,7 @@
 //! Native goal lifecycle renderer.
 
+use std::time::Duration;
+
 use omp_core::Str;
 use omp_tool::{CallOutcome, ToolIdentity, render::RenderFold};
 
@@ -114,7 +116,7 @@ fn render_goal_payload(payload: &GoalPayload) -> El {
 				</row>
 				if goal.time_used_secs > 0 {
 					<row sep="">
-						<time ms={goal.time_used_secs.saturating_mul(1_000)} kind="duration"/>
+						<time ms={Duration::from_secs(goal.time_used_secs)} kind="duration"/>
 						<text>{" elapsed"}</text>
 					</row>
 				}

@@ -369,7 +369,7 @@ pub(super) fn production_url_resolvers(
 	conflicts: Arc<ConflictRegistry>,
 	blob_store: BlobStore,
 	session_id: &str,
-	local_root: PathBuf,
+	sessions_dir: PathBuf,
 	workspace_root: PathBuf,
 	github_cache: Arc<GithubCache>,
 	github_credentials: Arc<GithubCredentialBridge>,
@@ -472,7 +472,8 @@ pub(super) fn production_url_resolvers(
 			SchemeEntry::new(Scheme::Local, false, false, "session-local scratch files")
 				.with_capabilities(true, true, true),
 			UrlResolver::Local(
-				local::LocalResolver::open(local_root).expect("session local root can be created"),
+				local::LocalResolver::open(sessions_dir)
+					.expect("canonical sessions directory can be created"),
 			),
 		)
 		.expect("local URL resolver is unique");

@@ -154,7 +154,8 @@ pub use diff_pane::{
 pub use diffstat::DiffStat;
 pub use editor::{
 	Attachment, AttachmentContent, Attachments, ComposerLayout, ComposerStatusAttachment,
-	ComposerStyle, EditInput, EditorPane, KeywordAccent, attachment_color, chip_label,
+	ComposerStyle, EditInput, EditorPane, InlineAccent, InlineDecorator, KeywordAccent,
+	attachment_color, chip_label,
 };
 pub use fact::Fact;
 pub use files::Files;

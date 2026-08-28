@@ -21,7 +21,7 @@ omp-catalog = { workspace = true }
 omp-inference = { workspace = true }
 omp-proto = { workspace = true }
 omp-secrets = { workspace = true }
-omp-telemetry = { workspace = true }
+omp-observability = { workspace = true }
 omp-tool = { workspace = true }
 omp-tools = { workspace = true }
 omp-walker = { workspace = true }
@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 
 [lints]

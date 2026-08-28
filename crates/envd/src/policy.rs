@@ -1205,7 +1205,7 @@ fn command_json(command: &v1::BashCommand) -> Value {
 		"index": command.index,
 		"name": command.name,
 		"argv": command.argv.iter().map(|arg| json!({
-			"text": arg.text,
+			"text": literal_argument_text(arg.text.as_str()),
 			"dynamic": arg.dynamic,
 			"dynamism": arg.dynamism,
 			"quoting": if arg.quoting.is_empty() { "bare" } else { arg.quoting.as_str() },
@@ -1266,12 +1266,25 @@ fn command_json(command: &v1::BashCommand) -> Value {
 		"span": span_json(command.span.as_ref()),
 	})
 }
+fn literal_argument_text(text: &str) -> &str {
+	match text.as_bytes() {
+		[first, .., last] if first == last && matches!(first, b'\'' | b'"') => {
+			&text[1..text.len() - 1]
+		},
+		_ => text,
+	}
+}
 
 /// Parses one direct user shell submission into the canonical BashIR JSON
 /// consumed by policy and hook admission.
 pub fn user_bash_ir(script: &str, cwd: &Path, root: &Path) -> Value {
 	let ir = admission::bash_ir("bash", &json!({"command": script}), cwd, root)
 		.expect("shell analysis always returns BashIr");
+	bash_ir_json(&ir, script)
+}
+
+/// Projects one environment-produced Bash IR fact into the public hook shape.
+pub(crate) fn bash_ir_json(ir: &v1::BashIr, script: &str) -> Value {
 	let parse_error = ir
 		.parse_error
 		.as_ref()
@@ -1293,12 +1306,21 @@ pub fn user_bash_ir(script: &str, cwd: &Path, root: &Path) -> Value {
 	let mut operators = Vec::<&str>::new();
 	for (index, command) in ir.commands.iter().enumerate() {
 		if index > 0 {
-			let previous_end =
-				ir.commands[index - 1].span.as_ref().map_or(0, |span| span.end as usize);
-			let next_start = command.span.as_ref().map_or(previous_end, |span| span.start as usize);
+			let previous_end = ir.commands[index - 1]
+				.span
+				.as_ref()
+				.map_or(0, |span| span.end as usize);
+			let next_start = command
+				.span
+				.as_ref()
+				.map_or(previous_end, |span| span.start as usize);
 			let separator = script.get(previous_end..next_start).unwrap_or_default();
 			if separator.contains("&&") || separator.contains("||") {
-				operators.push(if separator.contains("&&") { "and" } else { "or" });
+				operators.push(if separator.contains("&&") {
+					"and"
+				} else {
+					"or"
+				});
 				pipeline_commands.push(Vec::new());
 			}
 		}

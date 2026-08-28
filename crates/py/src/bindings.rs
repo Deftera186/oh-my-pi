@@ -1221,9 +1221,9 @@ fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
 		),
 		ClientError::ScopedOperationDenied => environment_exception(py, "Denied", &error.to_string()),
 		ClientError::StreamLost(_) => environment_exception(py, "StreamLost", &error.to_string()),
-		ClientError::RequestIdExhausted | ClientError::UnexpectedResponse { .. } => {
-			environment_exception(py, "Io", &error.to_string())
-		},
+		ClientError::TransportBusy
+		| ClientError::RequestIdExhausted
+		| ClientError::UnexpectedResponse { .. } => environment_exception(py, "Io", &error.to_string()),
 	}
 }
 
@@ -4029,9 +4029,9 @@ fn _open_environment_scope(
 		scope = scope.deny_pty();
 	}
 	let hello = env_pb::ClientHello {
-		client:       String::from("omp-py"),
-		schema_rev:   omp_env::SCHEMA_REV,
-		capabilities: vec![
+		client:        String::from("omp-py"),
+		schema_rev:    omp_env::SCHEMA_REV,
+		capabilities:  vec![
 			"env.doc.read",
 			"env.doc.write",
 			"env.fs.read",
@@ -4048,8 +4048,9 @@ fn _open_environment_scope(
 		.into_iter()
 		.map(str::to_owned)
 		.collect(),
-		client_id:    format!("omp-py:{}:{host_generation}", std::process::id()).into(),
-		props:        Default::default(),
+		client_id:     format!("omp-py:{}:{host_generation}", std::process::id()).into(),
+		approval_mode: env_pb::ApprovalMode::Unspecified as i32,
+		props:         Default::default(),
 	};
 	let client = ASYNC_RUNTIME
 		.block_on(ExtensionEnvClient::connect_uds(socket, &hello, scope))

@@ -202,13 +202,29 @@ impl LockFile {
 	}
 
 	/// Reads and validates one `omp.lock`.
+	#[tracing::instrument(
+		name = "extension_lock_read",
+		level = "debug",
+		skip_all,
+		fields(path = %path.display(), layer = ?layer)
+	)]
 	pub fn read(path: &Path, layer: Layer) -> Result<Self, ExtensionError> {
-		let text = fs::read_to_string(path)
-			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
-		let lock: Self = toml::from_str(&text)
-			.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
-		lock.validate_for(layer)?;
-		Ok(lock)
+		let result: Result<Self, ExtensionError> = (|| {
+			let text = fs::read_to_string(path)
+				.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
+			let lock: Self = toml::from_str(&text)
+				.map_err(|error| ExtensionError::new(ExtensionCode::ELockVersion, error.to_string()))?;
+			lock.validate_for(layer)?;
+			Ok(lock)
+		})();
+		if let Ok(lock) = &result {
+			tracing::debug!(
+				extension_count = lock.extensions.len(),
+				package_count = lock.packages.len(),
+				"extension lock loaded"
+			);
+		}
+		result
 	}
 
 	/// Atomically writes a committed `omp.lock`.

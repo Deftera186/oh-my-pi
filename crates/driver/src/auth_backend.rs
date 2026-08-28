@@ -49,6 +49,7 @@ use omp_secrets::{
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, metadata::MetadataValue, transport::Channel};
+use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
 use crate::secrets::{key, session::SecretSessionSnapshot};
@@ -343,12 +344,37 @@ impl ControlAuthority for CredentialSecretControlAuthority {
 				self.metadata_value(account)
 			},
 			"omp.creds.refresh" => {
-				let account = self.selected_account(&arguments)?;
-				self
-					.control
-					.refresh(account.clone())
-					.await
-					.map_err(auth_control_error)?;
+				let provider = self.provider(&arguments)?;
+				let account = match self.selected_account(&arguments) {
+					Ok(account) => account,
+					Err(error) => {
+						tracing::debug!(
+							error = %error,
+							"credential refresh preflight rejected"
+						);
+						return Err(error);
+					},
+				};
+				let span = tracing::debug_span!(
+					"oauth_refresh",
+					authority = "local",
+					provider = %provider,
+					credential_id = credential_id(&account)
+				);
+				if let Err(error) = self.control.refresh(account.clone()).instrument(span).await {
+					tracing::warn!(
+						provider = %provider,
+						credential_id = credential_id(&account),
+						error = %error,
+						"OAuth credential refresh failed"
+					);
+					return Err(auth_control_error(error));
+				}
+				tracing::debug!(
+					provider = %provider,
+					credential_id = credential_id(&account),
+					"OAuth credential refresh completed"
+				);
 				self.metadata_value(self.account_record(&account)?)
 			},
 			"omp.creds.clear" => {
@@ -953,12 +979,42 @@ impl GatewayCredentialSecretControlAuthority {
 					.map(|response| remote_metadata_value(response.into_inner()))
 			},
 			"omp.creds.refresh" => {
-				let id = self.selected_credential_id(&provider, arguments).await?;
-				client
+				let id = match self.selected_credential_id(&provider, arguments).await {
+					Ok(id) => id,
+					Err(error) => {
+						tracing::debug!(
+							provider = %provider,
+							error = %error,
+							"credential refresh preflight rejected"
+						);
+						return Err(error);
+					},
+				};
+				let span = tracing::debug_span!(
+					"oauth_refresh",
+					authority = "gateway",
+					provider = %provider,
+					credential_id = id
+				);
+				let response = client
 					.refresh_credential(self.authenticated(RefreshCredentialRequest { id })?)
+					.instrument(span)
 					.await
-					.map_err(remote_control_error)
-					.map(|response| remote_metadata_value(response.into_inner()))
+					.map_err(|error| {
+						tracing::warn!(
+							provider = %provider,
+							credential_id = id,
+							error = %error,
+							"OAuth credential refresh failed"
+						);
+						remote_control_error(error)
+					})?;
+				tracing::debug!(
+					provider = %provider,
+					credential_id = id,
+					"OAuth credential refresh completed"
+				);
+				Ok(remote_metadata_value(response.into_inner()))
 			},
 			"omp.creds.clear" => {
 				let id = self.selected_credential_id(&provider, arguments).await?;

@@ -336,14 +336,40 @@ impl WorkerSupervisor {
 				WorkerLease::new(route.key.name.clone(), route.generation, self.terminate_tx.clone());
 			return Ok((route, lease));
 		}
-		reserve(&self.layer_live, self.layer_ceiling).ok_or(WorkerUnavailable::LayerCeiling)?;
+		if !reserve(&self.layer_live, self.layer_ceiling) {
+			tracing::warn!(
+				extension = %key.extension,
+				worker = %key.name,
+				site = %key.site,
+				layer_live = self.layer_live.load(Ordering::Acquire),
+				layer_ceiling = self.layer_ceiling,
+				"worker spawn denied by layer capacity",
+			);
+			return Err(WorkerUnavailable::LayerCeiling);
+		}
 		if !reserve(&self.spawn_live, self.spawn_ceiling) {
 			self.layer_live.fetch_sub(1, Ordering::AcqRel);
+			tracing::warn!(
+				extension = %key.extension,
+				worker = %key.name,
+				site = %key.site,
+				spawn_live = self.spawn_live.load(Ordering::Acquire),
+				spawn_ceiling = self.spawn_ceiling,
+				"worker spawn denied by concurrent capacity",
+			);
 			return Err(WorkerUnavailable::SpawnCeiling);
 		}
 		let route = WorkerRoute { key: key.clone(), generation: 1 };
 		self.workers.lock().insert(key.name.clone(), route.clone());
 		self.spawn_live.fetch_sub(1, Ordering::AcqRel);
+		tracing::debug!(
+			extension = %route.key.extension,
+			worker = %route.key.name,
+			site = %route.key.site,
+			generation = route.generation,
+			layer_live = self.layer_live.load(Ordering::Acquire),
+			"worker route opened",
+		);
 		let lease = WorkerLease::new(key.name, route.generation, self.terminate_tx.clone());
 		Ok((route, lease))
 	}
@@ -381,7 +407,11 @@ impl WorkerSupervisor {
 		{
 			self.process_changed.notify_waiters();
 		}
-		self.layer_live.fetch_sub(1, Ordering::AcqRel);
+		let layer_live = self
+			.layer_live
+			.fetch_sub(1, Ordering::AcqRel)
+			.saturating_sub(1);
+		tracing::debug!(worker = %name, generation, layer_live, "worker route closed");
 		true
 	}
 
@@ -394,6 +424,14 @@ impl WorkerSupervisor {
 			return None;
 		}
 		route.generation = route.generation.checked_add(1)?;
+		tracing::debug!(
+			extension = %route.key.extension,
+			worker = %route.key.name,
+			site = %route.key.site,
+			previous_generation = generation,
+			generation = route.generation,
+			"worker route replaced",
+		);
 		Some(route.clone())
 	}
 
@@ -465,7 +503,18 @@ impl WorkerSupervisor {
 		{
 			self.process_changed.notify_waiters();
 		}
-		self.layer_live.fetch_sub(1, Ordering::AcqRel);
+		let layer_live = self
+			.layer_live
+			.fetch_sub(1, Ordering::AcqRel)
+			.saturating_sub(1);
+		tracing::debug!(
+			extension = %extension,
+			worker = %name,
+			site = %site,
+			generation,
+			layer_live,
+			"worker route closed",
+		);
 		true
 	}
 
@@ -486,6 +535,14 @@ impl WorkerSupervisor {
 			return None;
 		}
 		route.generation = route.generation.checked_add(1)?;
+		tracing::debug!(
+			extension = %extension,
+			worker = %name,
+			site = %site,
+			previous_generation = generation,
+			generation = route.generation,
+			"worker route replaced",
+		);
 		Some(route.clone())
 	}
 

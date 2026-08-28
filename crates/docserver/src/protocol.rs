@@ -182,6 +182,11 @@ impl EnvironmentDapReverseHandler {
 
 /// Dispatches one post-handshake request body. Framing, hello, and cancellation
 /// routing remain connection-owned.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(request_id = request_id, method = %request_kind(&body))
+)]
 pub async fn dispatch_request(
 	session: EnvironmentSession,
 	request_id: u64,
@@ -197,8 +202,47 @@ pub async fn dispatch_request(
 		request_id,
 		body: Some(match result {
 			Ok(body) => body,
-			Err(error) => server_frame::Body::Error(error.into_proto()),
+			Err(error) => {
+				if error.code == proto::ProtocolErrorCode::Cancelled {
+					tracing::debug!("protocol request cancelled");
+				} else {
+					tracing::warn!(code = ?error.code, "protocol request rejected");
+				}
+				server_frame::Body::Error(error.into_proto())
+			},
 		}),
+	}
+}
+fn request_kind(body: &client_frame::Body) -> &'static str {
+	use client_frame::Body as Request;
+	match body {
+		Request::Hello(_) => "hello",
+		Request::Cancel(_) => "cancel",
+		Request::OpenDocument(_) => "open_document",
+		Request::CloseDocument(_) => "close_document",
+		Request::ReadDocument(_) => "read_document",
+		Request::SummarizeDocument(_) => "summarize_document",
+		Request::CommitTransaction(_) => "commit_transaction",
+		Request::GetLspBindings(_) => "get_lsp_bindings",
+		Request::LspStatus(_) => "lsp_status",
+		Request::LspRequest(_) => "lsp_request",
+		Request::LspNotification(_) => "lsp_notification",
+		Request::AcquireWorkspaceLease(_) => "acquire_workspace_lease",
+		Request::ReleaseWorkspaceLease(_) => "release_workspace_lease",
+		Request::CanonicalizePath(_) => "canonicalize_path",
+		Request::StatPath(_) => "stat_path",
+		Request::ListDirectory(_) => "list_directory",
+		Request::CreateDirectory(_) => "create_directory",
+		Request::RemovePath(_) => "remove_path",
+		Request::RenamePath(_) => "rename_path",
+		Request::CopyPath(_) => "copy_path",
+		Request::ReadLink(_) => "read_link",
+		Request::CreateSymlink(_) => "create_symlink",
+		Request::CreateHardLink(_) => "create_hard_link",
+		Request::SetPermissions(_) => "set_permissions",
+		Request::DapLaunch(_) => "dap_launch",
+		Request::DapAttach(_) => "dap_attach",
+		Request::DapAction(_) => "dap_action",
 	}
 }
 

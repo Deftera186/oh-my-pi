@@ -30,51 +30,74 @@ impl KModel {
 	}
 
 	/// Load model weights from a `VarBuilder` (typically backed by safetensors).
+	#[tracing::instrument(
+		level = "debug",
+		name = "model_weight_load",
+		skip_all,
+		fields(gen_ai.request.model = REGISTRATION.id)
+	)]
 	pub fn load(config: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-		let bert = CustomAlbert::load(&config.plbert, config.n_token, vb.pp("bert"))?;
+		let result = (|| {
+			let bert = CustomAlbert::load(&config.plbert, config.n_token, vb.pp("bert"))?;
 
-		let bert_encoder =
-			nn::linear(config.plbert.hidden_size, config.hidden_dim, vb.pp("bert_encoder"))?;
+			let bert_encoder =
+				nn::linear(config.plbert.hidden_size, config.hidden_dim, vb.pp("bert_encoder"))?;
 
-		let predictor = ProsodyPredictor::load(
-			config.style_dim,
-			config.hidden_dim,
-			config.n_layer,
-			config.max_dur,
-			vb.pp("predictor"),
-		)?;
+			let predictor = ProsodyPredictor::load(
+				config.style_dim,
+				config.hidden_dim,
+				config.n_layer,
+				config.max_dur,
+				vb.pp("predictor"),
+			)?;
 
-		let text_encoder = TextEncoder::load(
-			config.hidden_dim,
-			config.text_encoder_kernel_size,
-			config.n_layer,
-			config.n_token,
-			vb.pp("text_encoder"),
-		)?;
+			let text_encoder = TextEncoder::load(
+				config.hidden_dim,
+				config.text_encoder_kernel_size,
+				config.n_layer,
+				config.n_token,
+				vb.pp("text_encoder"),
+			)?;
 
-		let istft = &config.istftnet;
-		let decoder = Decoder::load(
-			config.hidden_dim,
-			config.style_dim,
-			config.n_mels,
-			&istft.resblock_kernel_sizes,
-			&istft.upsample_rates,
-			istft.upsample_initial_channel,
-			&istft.resblock_dilation_sizes,
-			&istft.upsample_kernel_sizes,
-			istft.gen_istft_n_fft,
-			istft.gen_istft_hop_size,
-			vb.pp("decoder"),
-		)?;
+			let istft = &config.istftnet;
+			let decoder = Decoder::load(
+				config.hidden_dim,
+				config.style_dim,
+				config.n_mels,
+				&istft.resblock_kernel_sizes,
+				&istft.upsample_rates,
+				istft.upsample_initial_channel,
+				&istft.resblock_dilation_sizes,
+				&istft.upsample_kernel_sizes,
+				istft.gen_istft_n_fft,
+				istft.gen_istft_hop_size,
+				vb.pp("decoder"),
+			)?;
 
-		Ok(Self {
-			bert,
-			bert_encoder,
-			predictor,
-			text_encoder,
-			decoder,
-			context_length: config.plbert.max_position_embeddings,
-		})
+			Ok(Self {
+				bert,
+				bert_encoder,
+				predictor,
+				text_encoder,
+				decoder,
+				context_length: config.plbert.max_position_embeddings,
+			})
+		})();
+
+		match result {
+			Ok(model) => {
+				tracing::info!(gen_ai.request.model = REGISTRATION.id, "voice model loaded");
+				Ok(model)
+			},
+			Err(error) => {
+				tracing::warn!(
+					gen_ai.request.model = REGISTRATION.id,
+					error = %error,
+					"voice model load failed"
+				);
+				Err(error)
+			},
+		}
 	}
 
 	/// Run inference.
@@ -101,6 +124,16 @@ impl KModel {
 	/// Deterministic mode removes the decoder's random harmonic phase and noise
 	/// sources, making output reproducible on CPU and GPU backends. `speed` must
 	/// be finite and greater than zero.
+	#[tracing::instrument(
+		level = "debug",
+		name = "voice_synthesis",
+		skip_all,
+		fields(
+			gen_ai.request.model = REGISTRATION.id,
+			input_tokens = input_ids.len(),
+			synthesis.mode = ?mode
+		)
+	)]
 	pub fn forward_with_mode(
 		&self,
 		input_ids: &[i64],

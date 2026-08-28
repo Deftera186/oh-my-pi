@@ -53,6 +53,7 @@ use omp_inference::{
 	receipt::ExecutionBudget,
 	router::Router,
 };
+use omp_observability::firehose::Firehose;
 use omp_proto::{
 	env::v1 as env_pb,
 	inference::v1::{
@@ -79,7 +80,6 @@ use omp_storage::{
 		ModelRef as JournalModelRef, ProviderId as JournalProviderId, SessionId, TitleSource,
 	},
 };
-use omp_telemetry::firehose::Firehose;
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry};
 use parking_lot::Mutex;
 use prost::Message as _;
@@ -3546,7 +3546,8 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				"allowed_devices",
 				spec
 					.get("allowed_devices")
-					.is_some_and(|value| !value.is_null()),
+					.and_then(Value::as_array)
+					.is_some_and(|values| !values.is_empty()),
 			),
 			(
 				"disallowed_devices",
@@ -4335,10 +4336,7 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 					)
 				}
 			},
-			"omp.agents.spawn" | "omp.agents.spawn_all" => {
-				Self::require_capability(context, "subagents")?;
-				Self::require_effects_authorized(context)
-			},
+			"omp.agents.spawn" | "omp.agents.spawn_all" => Self::require_effects_authorized(context),
 			"omp.agents.abort"
 			| "omp.agents.shutdown"
 			| "omp.agents.reload_extensions"
@@ -7355,6 +7353,16 @@ pub fn canonical_project(path: &Path) -> Result<PathBuf, ChatError> {
 }
 
 /// Opens, resumes, forks, or creates one chat session journal.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(
+		root = %root.display(),
+		sessions_dir = %sessions_dir.display(),
+		operation = tracing::field::Empty,
+		session_id = tracing::field::Empty,
+	)
+)]
 pub fn open_session(
 	root: &Path,
 	sessions_dir: &Path,
@@ -7362,6 +7370,15 @@ pub fn open_session(
 	registry: &Registry,
 	session_index: Option<Arc<SessionIndex>>,
 ) -> Result<Session, ChatError> {
+	let operation = match open {
+		SessionOpen::New => "new",
+		SessionOpen::Resume(_) => "resume",
+		SessionOpen::ResumeMoved(_) => "resume_moved",
+		SessionOpen::Fork(_) => "fork",
+		SessionOpen::Ephemeral => "ephemeral",
+	};
+	let span = tracing::Span::current();
+	span.record("operation", operation);
 	let source = match open {
 		SessionOpen::Resume(id) | SessionOpen::ResumeMoved(id) | SessionOpen::Fork(id) => {
 			Some(strict_session_id(id)?)
@@ -7432,6 +7449,13 @@ pub fn open_session(
 	let view = journal.load()?;
 	let initial_items = project_journal(&view, view.as_ref(), registry, &CHAT_CAPS_BASE)?.items;
 	drop(view);
+	span.record("session_id", id.as_str());
+	tracing::info!(
+		session_id = %id,
+		operation,
+		initial_item_count = initial_items.len(),
+		"session opened"
+	);
 	Ok(Session { id, journal, initial_items })
 }
 
@@ -7683,6 +7707,19 @@ pub enum SeededSessionError {
 }
 
 /// Creates, declaratively seeds, and indexes one interactive journal.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(
+		root = %root.display(),
+		sessions_dir = %sessions_dir.display(),
+		extension = extension,
+		declaration_count = declarations.len(),
+		request_entry_count = request.entries.len(),
+		has_parent = request.parent.is_some(),
+		session_id = tracing::field::Empty,
+	)
+)]
 pub fn create_seeded_session(
 	root: &Path,
 	sessions_dir: &Path,
@@ -7809,10 +7846,18 @@ pub fn create_seeded_session(
 			});
 		},
 	};
-	session_index
+	let info = session_index
 		.get(&committed)
 		.map_err(SeededSessionError::Index)?
-		.ok_or(SeededSessionError::MissingIndexRow)
+		.ok_or(SeededSessionError::MissingIndexRow)?;
+	tracing::Span::current().record("session_id", committed.0.as_str());
+	tracing::info!(
+		session_id = %committed.0,
+		extension,
+		entry_count,
+		"seeded session opened"
+	);
+	Ok(info)
 }
 
 /// Streamed session-journal probe results consumed by the resume picker.

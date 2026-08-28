@@ -23,7 +23,7 @@ const NON_ELEVATED_GID: u32 = 1000;
 /// which can't change after process start, so it's safe to memoize.
 static IS_ELEVATED: LazyLock<bool> = LazyLock::new(|| {
 	query_elevation().unwrap_or_else(|err| {
-		tracing::warn!("failed to determine process elevation: {err}");
+		tracing::warn!(error = %err, "failed to determine process elevation");
 		false
 	})
 });

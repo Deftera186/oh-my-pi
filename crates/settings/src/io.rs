@@ -40,14 +40,14 @@ pub enum DocumentMutation {
 	/// Replace one whole reflected value.
 	Set {
 		/// Dotted reflected path.
-		path:  &'static str,
+		path:  String,
 		/// Typed TOML value.
 		value: toml::Value,
 	},
 	/// Remove one whole reflected value.
 	Unset {
 		/// Dotted reflected path.
-		path: &'static str,
+		path: String,
 	},
 }
 
@@ -376,7 +376,7 @@ mod tests {
 		atomic_replace(&path, "external = \"kept\"\n[worktree]\nbase = \"old\"\n")
 			.expect("initial replace");
 		let result = mutate_document(&path, &[DocumentMutation::Set {
-			path:  "worktree.base",
+			path:  "worktree.base".to_owned(),
 			value: toml::Value::String("new".to_owned()),
 		}])
 		.expect("mutation");
@@ -393,8 +393,9 @@ mod tests {
 		let directory = tempfile::tempdir().expect("directory");
 		let path = directory.path().join("config.toml");
 		atomic_replace(&path, "[worktree]\nbase = \"old\"\n").expect("initial replace");
-		let result = mutate_document(&path, &[DocumentMutation::Unset { path: "worktree.base" }])
-			.expect("mutation");
+		let result =
+			mutate_document(&path, &[DocumentMutation::Unset { path: "worktree.base".to_owned() }])
+				.expect("mutation");
 		assert!(!result.document.contains_key("worktree"));
 	}
 }

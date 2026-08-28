@@ -25,6 +25,7 @@ use omp_tool::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::Instrument as _;
 
 use crate::{
 	auto_background::{
@@ -233,6 +234,23 @@ pub enum Fault {
 		/// Complete output and process status retained for rendering and policy.
 		payload: Box<Payload>,
 	},
+}
+
+impl Fault {
+	/// Renders the model-facing failure diagnostic at the presentation boundary.
+	pub fn message(&self) -> String {
+		match self {
+			Self::Resource { operation, message } => format!("shell {operation} failed: {message}"),
+			Self::PtyDenied => String::from("shell PTY allocation denied by invocation scope"),
+			Self::InvalidEnvironmentKey { key } => {
+				format!("invalid shell environment key {key:?}")
+			},
+			Self::CommandFailed { payload } => format!(
+				"bash command failed: status={:?}, exit={:?}, signal={:?}",
+				payload.status.outcome, payload.status.exit_code, payload.status.signal
+			),
+		}
+	}
 }
 
 /// Module-owned handle for one persistent environment session.
@@ -453,6 +471,40 @@ impl ShellPromptSnapshot {
 	}
 }
 
+/// Builds the host-free `bash@1` declaration from immutable prompt facts.
+pub fn spec(snapshot: &ShellPromptSnapshot) -> ToolSpec {
+	spec_described(snapshot.description())
+}
+
+fn spec_described(description: Str) -> ToolSpec {
+	ToolSpec {
+		name: sf!("bash"),
+		rev: Rev { family: Str::default(), n: 1 },
+		description,
+		schema: omp_tool::schema::<Params>(),
+		constraint: Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects: Effects {
+			documents: None,
+			exec:      Some(ExecEffects {
+				commands: [sf!("*")].into_iter().collect(),
+				network:  true,
+			}),
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("shell.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Generic `bash@1` implementation retaining one lazy persistent session.
 pub struct ShellTool<E: ShellExec> {
 	exec: E,
@@ -470,6 +522,18 @@ pub struct ShellTool<E: ShellExec> {
 
 /// Constructs the native `bash@1` executor over an environment resource.
 pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
+	shell_with_spec(
+		exec,
+		spec_described(sf!(
+			"Execute a shell script in a persistent session, or allocate an asynchronous managed \
+			 job. Eligible long-running calls may auto-background at the configured foreground \
+			 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
+			 `timeout` is measured in seconds and does not extend foreground waiting.",
+		)),
+	)
+}
+
+fn shell_with_spec<E: ShellExec>(exec: E, spec: ToolSpec) -> ShellTool<E> {
 	ShellTool {
 		exec,
 		session: Mutex::new(None),
@@ -481,37 +545,7 @@ pub fn shell<E: ShellExec>(exec: E) -> ShellTool<E> {
 		interceptor_enabled: false,
 		interceptor_rules: Arc::default(),
 		sibling_tools: Arc::default(),
-		spec: ToolSpec {
-			name:            sf!("bash"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(
-				"Execute a shell script in a persistent session, or allocate an asynchronous managed \
-				 job. Eligible long-running calls may auto-background at the configured foreground \
-				 threshold and deliver later. `timeout: 0` disables the command deadline; otherwise \
-				 `timeout` is measured in seconds and does not extend foreground waiting.",
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: None,
-				exec:      Some(ExecEffects {
-					commands: [sf!("*")].into_iter().collect(),
-					network:  true,
-				}),
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("shell.rs"),
-			)
-			.into(),
-		},
+		spec,
 	}
 }
 /// Constructs `bash@1` from immutable live registry, capability, and settings
@@ -521,8 +555,7 @@ pub fn shell_with_snapshot_and_timeout_bounds<E: ShellExec>(
 	timeout_bounds: TimeoutBounds,
 	snapshot: &ShellPromptSnapshot,
 ) -> ShellTool<E> {
-	let mut tool = shell(exec).with_timeout_bounds(timeout_bounds);
-	tool.spec.description = snapshot.description();
+	let mut tool = shell_with_spec(exec, spec(snapshot)).with_timeout_bounds(timeout_bounds);
 	tool.interceptor_enabled = snapshot.interceptor_enabled;
 	tool.interceptor_rules =
 		shell_intercept::compile(&snapshot.interceptor_rules, &snapshot.sibling_tools).into();
@@ -613,6 +646,12 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+		let span = tracing::debug_span!(
+			"shell_execution",
+			cwd = tracing::field::Empty,
+			asynchronous = tracing::field::Empty,
+			pty = tracing::field::Empty,
+		);
 		stream! {
 			let args = match params.whole::<Params>().await {
 				Ok(args) => args,
@@ -628,6 +667,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				)
 				.or_else(|| crate::shell_intercept::analyze(&args.command, &self.sibling_tools))
 			{
+				tracing::warn!(parent: &span, "shell command denied by tool interception");
 				yield Ev::Args(ArgIssue {
 					path: Vec::new(),
 					expected: guidance.message,
@@ -664,6 +704,9 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 			};
 			let cwd = args.cwd.or(extracted_cwd);
 			let terminal = args.pty;
+			span.record("cwd", tracing::field::display(cwd.as_deref().unwrap_or(".")));
+			span.record("asynchronous", args.asynchronous);
+			span.record("pty", terminal);
 			let environment = args.env;
 			let (timeout_ms, adjustments) = self.timeout(args.timeout);
 
@@ -679,7 +722,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 					command,
 					timeout_ms,
 					options,
-				}).fuse();
+				}).instrument(span.clone()).fuse();
 				let interrupt = params.next_interrupt().fuse();
 				pin_mut!(work, interrupt);
 				match futures::future::select(interrupt, work).await {
@@ -708,9 +751,9 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 					.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
 					.is_ok();
 			let session = if persistent {
-				self.persistent_session().await
+				self.persistent_session().instrument(span.clone()).await
 			} else {
-				self.exec.open_session(options).await
+				self.exec.open_session(options).instrument(span.clone()).await
 			};
 			let session = match session {
 				Ok(session) => session,
@@ -727,7 +770,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				command: command.clone(),
 				environment,
 				timeout_ms,
-			}).await {
+			}).instrument(span.clone()).await {
 				Ok(run) => run,
 				Err(fault) => {
 					self.finish_session(&session, persistent, true).await;
@@ -772,16 +815,16 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							let name =
 								next_background_name("bash", &self.next_background_name);
 							if let Ok(job) = run.detach(name).await {
-											 self.finish_session(&session, persistent, true).await;
-											 yield Ev::Done(detached_terminal(
+								self.finish_session(&session, persistent, true).await;
+								yield Ev::Done(detached_terminal(
 									job,
 									"automatic foreground threshold elapsed",
 									&transcript,
 								));
 								return;
 							}
-											 auto_background = false;
-											 continue;
+							auto_background = false;
+							continue;
 						},
 						PendingRun::Event(event) => event,
 						PendingRun::Interrupt(interrupt) => {
@@ -808,6 +851,10 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 							}
 							let reason = interrupt.reason;
 							if run.cancel().await.is_err() {
+								tracing::warn!(
+									parent: &span,
+									"shell cancellation failed; effect state is unknown",
+								);
 								self.finish_session(&session, persistent, true).await;
 								yield Ev::Aborted(Abort::EffectsUnknown { reason });
 								return;
@@ -894,6 +941,10 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 						return;
 					},
 					Ok(None) => {
+						tracing::warn!(
+							parent: &span,
+							"shell event stream ended before terminal status",
+						);
 						self.finish_session(&session, persistent, true).await;
 						yield Ev::Aborted(Abort::EffectsUnknown {
 							reason: cancellation_reason.unwrap_or_else(|| sf!("exec event stream ended before terminal status")),
@@ -901,8 +952,9 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 						return;
 					},
 					Err(fault) => {
+						tracing::warn!(parent: &span, "shell event stream failed");
 						self.finish_session(&session, persistent, true).await;
-						yield Ev::Aborted(Abort::EffectsUnknown { reason: Str::new(fault_reason(&fault)) });
+						yield Ev::Aborted(Abort::EffectsUnknown { reason: Str::new(fault.message()) });
 						return;
 					},
 				}
@@ -950,7 +1002,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				}
 			},
 			Err(fault) => {
-				projection.push(&fault_reason(fault));
+				projection.push(&fault.message());
 			},
 		}
 		projection.finish()
@@ -1008,18 +1060,6 @@ fn interrupt_reason(
 		Ok(interrupt) => interrupt.reason,
 		Err(InterruptWaitError::Closed) => Str::new(closed_reason),
 		Err(InterruptWaitError::Protocol(reason)) => reason,
-	}
-}
-
-fn fault_reason(fault: &Fault) -> String {
-	match fault {
-		Fault::Resource { operation, message } => format!("shell {operation} failed: {message}"),
-		Fault::PtyDenied => String::from("shell PTY allocation denied by invocation scope"),
-		Fault::InvalidEnvironmentKey { key } => format!("invalid shell environment key {key:?}"),
-		Fault::CommandFailed { payload } => format!(
-			"bash command failed: status={:?}, exit={:?}, signal={:?}",
-			payload.status.outcome, payload.status.exit_code, payload.status.signal
-		),
 	}
 }
 

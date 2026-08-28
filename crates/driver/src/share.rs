@@ -191,7 +191,7 @@ pub trait ShareStore {
 pub struct DirectShareStore {
 	http_base:   Url,
 	credentials: sync::Arc<GithubCredentialBridge>,
-	client:      reqwest::Client,
+	client:      omp_http::Client,
 }
 
 impl DirectShareStore {

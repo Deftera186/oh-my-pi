@@ -32,7 +32,7 @@ pub struct AdvisorUsageTotals {
 }
 
 impl AdvisorUsageTotals {
-	fn accumulate(&mut self, other: Self) {
+	pub(crate) fn accumulate(&mut self, other: Self) {
 		self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
 		self.cache_read_tokens = self
 			.cache_read_tokens

@@ -15,7 +15,7 @@ flume = { workspace = true }
 omp-core = { workspace = true }
 omp-ar = { workspace = true }
 omp-proto = { workspace = true }
-omp-telemetry = { workspace = true }
+omp-observability = { workspace = true }
 omp-tool = { workspace = true }
 parking_lot = { workspace = true }
 rusqlite = { workspace = true }
@@ -26,6 +26,7 @@ smallvec = { workspace = true }
 strum = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 xutf = { workspace = true }
 zeroize = { workspace = true }
 

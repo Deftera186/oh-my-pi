@@ -73,10 +73,11 @@ pub struct InvocationSendError;
 /// the provider's streamed fragments.
 ///
 /// Provider codecs normalize JSON spelling, while recovery may apply bounded
-/// syntax repair and schema-directed scalar coercion before the call becomes
-/// executable and durable. Those changes must not make live execution diverge
-/// from the canonical call replayed from the journal. Structurally incomplete
-/// streams and materially different values remain protocol violations. A
+/// syntax repair, schema-directed scalar coercion, and charitable removal of
+/// closed-schema extras before the call becomes executable and durable. Those
+/// changes must not make live execution diverge from the canonical call
+/// replayed from the journal. Structurally incomplete streams and materially
+/// different retained values remain protocol violations. A
 /// freeform grammar call is the one shape-changing exception: recovery wraps
 /// its exact streamed text in the canonical `input` object.
 fn commit_supersedes_stream(streamed: &str, committed: &str) -> bool {
@@ -98,11 +99,11 @@ fn repaired_value_eq(streamed: &Value, committed: &Value) -> bool {
 	}
 	match (streamed, committed) {
 		(Value::Object(streamed), Value::Object(committed)) => {
-			streamed.len() == committed.len()
-				&& streamed.iter().all(|(key, value)| {
-					committed
+			committed.len() <= streamed.len()
+				&& committed.iter().all(|(key, settled)| {
+					streamed
 						.get(key)
-						.is_some_and(|settled| repaired_value_eq(value, settled))
+						.is_some_and(|value| repaired_value_eq(value, settled))
 				})
 		},
 		(Value::Array(streamed), Value::Array(committed)) => {
@@ -611,23 +612,10 @@ async fn validate_structure(
 					.object_keys(&node.source)
 					.await
 					.map_err(|error| param_error(error, arg_specs))?;
-				let parent = arg_specs.and_then(|(rev, specs)| specs.get(rev, &node.canonical));
 				let mut seen = SmallVec::<SmallVec<ArgPath, 4>, 8>::new();
 				for key in &keys {
 					let candidate = child_path(&node.canonical, ArgPath::Key(key.clone()));
 					let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
-					if spec.is_none()
-						&& parent.is_some_and(|parent| {
-							!parent.additional_properties && !parent.from_union_branch
-						}) {
-						return Err(ParamError::Args(Box::new(ArgIssue {
-							path:     candidate.into_iter().collect(),
-							expected: sf!("no additional properties"),
-							kind:     ArgIssueKind::Malformed,
-							example:  None,
-							found:    Some(sf!("additional property")),
-						})));
-					}
 					let identity = spec.map_or_else(|| candidate.clone(), |spec| spec.path.clone());
 					if seen.contains(&identity) {
 						let expected = spec
@@ -703,9 +691,21 @@ fn canonicalize(
 	match value {
 		Value::Object(object) => {
 			let mut canonical = omp_slopjson::Object::with_capacity(object.len());
+			let parent = arg_specs.and_then(|(rev, specs)| specs.get(rev, path));
 			for (key, value) in object {
 				let candidate = child_path(path, ArgPath::Key(key.clone()));
 				let spec = arg_specs.and_then(|(rev, specs)| specs.get(rev, &candidate));
+				if spec.is_none()
+					&& parent
+						.is_some_and(|parent| !parent.additional_properties && !parent.from_union_branch)
+				{
+					repairs.push(Repair {
+						path:   candidate,
+						kind:   RepairKind::Elision,
+						detail: sf!("undeclared property elided"),
+					});
+					continue;
+				}
 				let (canonical_path, canonical_key) = if let Some(spec) = spec {
 					let canonical_key = match spec.path.last() {
 						Some(ArgPath::Key(key)) => key.clone(),
@@ -1381,7 +1381,9 @@ mod tests {
 	fn schema_coerced_commitment_is_the_executed_document() {
 		let (feed, mut params) = IncomingParams::channel();
 		feed
-			.arg_text(sf!(r#"{{"args":{{"flag":"yes","count":"42","ratio":"3.5","label":99}}}}"#,))
+			.arg_text(sf!(
+				r#"{{"args":{{"flag":"yes","count":"42","ratio":"3.5","label":99}},"extra":1}}"#,
+			))
 			.expect("fragment remains connected");
 		feed
 			.args_committed(sf!(r#"{{"args":{{"flag":true,"count":42,"ratio":3.5,"label":"99"}}}}"#,))
@@ -1394,7 +1396,7 @@ mod tests {
 		);
 	}
 	#[test]
-	fn closed_object_rejects_an_unknown_member_instead_of_eliding_it() {
+	fn closed_object_elides_unknown_members_with_a_repair() {
 		let rev = Rev { family: sf!("python"), n: 1 };
 		let mut specs = ArgSpecRegistry::new();
 		for path in [smallvec![ArgPath::Key(sf!("args"))], smallvec![
@@ -1418,13 +1420,14 @@ mod tests {
 		feed
 			.args_committed(sf!(r#"{{"args":{{"label":"ok","extra":1}}}}"#))
 			.expect("arguments remain connected");
-		let error = block_on(params.finalize()).expect_err("closed object rejects extra member");
-		let ParamError::Args(issue) = error else {
-			panic!("closed object failure must remain a structured argument issue");
-		};
-		assert_eq!(issue.path, [ArgPath::Key(sf!("args")), ArgPath::Key(sf!("extra"))],);
-		assert_eq!(issue.kind, ArgIssueKind::Malformed);
-		assert_eq!(issue.expected.as_str(), "no additional properties");
+		let finalized = block_on(params.finalize()).expect("closed object repairs extra member");
+		assert_eq!(finalized.effective_json(), r#"{"args":{"label":"ok"}}"#);
+		assert_eq!(finalized.repairs().len(), 1);
+		assert_eq!(finalized.repairs()[0].path, [
+			ArgPath::Key(sf!("args")),
+			ArgPath::Key(sf!("extra"))
+		],);
+		assert_eq!(finalized.repairs()[0].kind, RepairKind::Elision);
 	}
 
 	#[test]

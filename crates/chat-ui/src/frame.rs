@@ -745,6 +745,7 @@ fn row_label(value: &serde_json::Value) -> String {
 	}
 }
 
+/// Escapes markup-significant characters so `text` renders literally in TML.
 fn push_tml_text(output: &mut String, text: &str) {
 	for character in text.chars() {
 		match character {

@@ -30,8 +30,8 @@ pub use incoming::{
 	InterruptibleParams, InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
 };
 use omp_core::{Hash32, InvocationPhase, SparseMap, Str};
-pub use omp_proto::inference::v1::Fallback;
-use omp_proto::{inference::v1::InvokeInput, policy::v1};
+pub use omp_proto::inference::v1::{Fallback, InvokeInput};
+use omp_proto::policy::v1;
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
 pub use registry::{
 	AvailabilityDelta, Claim, Claims, ConstraintDisposition, DeviceMetadata, DeviceTarget, ErasedEv,
@@ -40,7 +40,7 @@ pub use registry::{
 	LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion, LoweredTool,
 	LoweringCaps, MemoryToolState, MountedDevice, Precedence, ProjectedCall, ProjectedVerdict,
 	ProjectionKey, ProjectionRequest, PublishedLeaf, Registry, RegistryError, RegistryLeaf,
-	ShadowClaim, ToolPromptEntry, ToolPromptProjection, ToolRoute, WorkerSiteKind,
+	ShadowClaim, ToolLocus, ToolPromptEntry, ToolPromptProjection, ToolRoute, WorkerSiteKind,
 };
 use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize, de, de::DeserializeOwned};

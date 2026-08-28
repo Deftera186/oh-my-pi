@@ -98,39 +98,41 @@ pub struct AstGrep {
 	spec: ToolSpec,
 }
 
+/// Returns the host-free `ast_grep@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("ast_grep"),
+		rev:             Rev { family: Default::default(), n: 1 },
+		description:     sf!(
+			"Searches multiple files structurally with ast-grep metavariables. `path` accepts \
+			 semicolon-separated files, directories, and globs. Results use stable path/source \
+			 ordering; `cursor` resumes pagination."
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("ast_grep.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Builds an `ast_grep` tool whose relative files and globs resolve under
 /// `root`.
 pub fn tool(root: PathBuf) -> AstGrep {
-	AstGrep {
-		root,
-		spec: ToolSpec {
-			name:            sf!("ast_grep"),
-			rev:             Rev { family: Default::default(), n: 1 },
-			description:     sf!(
-				"Searches multiple files structurally with ast-grep metavariables. `path` accepts \
-				 semicolon-separated files, directories, and globs. Results use stable path/source \
-				 ordering; `cursor` resumes pagination."
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("ast_grep.rs"),
-			)
-			.into(),
-		},
-	}
+	AstGrep { root, spec: spec() }
 }
 
 impl Tool for AstGrep {

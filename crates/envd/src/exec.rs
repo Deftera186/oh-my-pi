@@ -2363,7 +2363,7 @@ impl RunTerminal {
 			Self::Exited(code) => (ExecOutcome::Failed, Some(code), "", false),
 			Self::Failed => (ExecOutcome::Failed, None, "", false),
 			Self::Timeout => (ExecOutcome::Timeout, None, "SIGKILL", true),
-			Self::Cancelled => (ExecOutcome::Cancelled, None, "SIGKILL", true),
+			Self::Cancelled => (ExecOutcome::Cancelled, None, "", true),
 			Self::Denied { exit_code, .. } => (ExecOutcome::Denied, exit_code, "", false),
 		};
 		ExecStatusMsg {
@@ -3633,7 +3633,7 @@ mod tests {
 	}
 
 	#[test]
-	fn terminal_receipts_distinguish_exit_failure_timeout_and_kill() {
+	fn terminal_receipts_distinguish_exit_failure_timeout_and_cancellation() {
 		let success = RunTerminal::Exited(0).status(Duration::from_millis(1));
 		assert_eq!(success.outcome, ExecOutcome::Exited as i32);
 		assert_eq!(success.exit_code, Some(0));
@@ -3655,7 +3655,7 @@ mod tests {
 		let cancelled = RunTerminal::Cancelled.status(Duration::from_millis(4));
 		assert_eq!(cancelled.outcome, ExecOutcome::Cancelled as i32);
 		assert_eq!(cancelled.exit_code, None);
-		assert_eq!(cancelled.signal, "SIGKILL");
+		assert_eq!(cancelled.signal, "");
 		assert!(cancelled.aborted);
 
 		let denied = RunTerminal::Denied { exit_code: Some(1), path: sf!("/private/blocked") }

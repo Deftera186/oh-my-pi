@@ -322,6 +322,15 @@ impl TelemetryIndex {
 	/// # Errors
 	/// Returns file-system or SQLite errors when the durable index cannot be
 	/// opened or initialized.
+	#[tracing::instrument(
+		name = "telemetry_index_open",
+		level = "debug",
+		skip_all,
+		fields(
+			session_dir = %session_dir.display(),
+			database = %database_path.display()
+		)
+	)]
 	pub fn open(session_dir: &Path, database_path: &Path) -> Result<Self, QueryError> {
 		fs::create_dir_all(session_dir)?;
 		let side_path = session_dir.join("telemetry.bin");
@@ -359,6 +368,7 @@ impl TelemetryIndex {
 				remote_ack TEXT
 			);",
 		)?;
+		let mut migrated_columns = 0_usize;
 		for (name, declaration) in [
 			("payload_offset", "INTEGER NOT NULL DEFAULT 0"),
 			("payload_len", "INTEGER NOT NULL DEFAULT 0"),
@@ -369,11 +379,18 @@ impl TelemetryIndex {
 			("remote_ack", "TEXT"),
 		] {
 			let statement = format!("ALTER TABLE telemetry_issues ADD COLUMN {name} {declaration}");
-			if let Err(error) = database.execute(&statement, [])
-				&& !error.to_string().contains("duplicate column name")
-			{
-				return Err(QueryError::Sql(error));
+			match database.execute(&statement, []) {
+				Ok(_) => migrated_columns = migrated_columns.saturating_add(1),
+				Err(error) if error.to_string().contains("duplicate column name") => {},
+				Err(error) => return Err(QueryError::Sql(error)),
 			}
+		}
+		if migrated_columns != 0 {
+			tracing::info!(
+				database = "telemetry_index",
+				column_count = migrated_columns,
+				"storage migration completed"
+			);
 		}
 		Ok(Self {
 			database: Mutex::new(database),
@@ -454,6 +471,16 @@ impl TelemetryIndex {
 	///
 	/// # Errors
 	/// Returns invalid-predicate, SQLite, or cancellation errors.
+	#[tracing::instrument(
+		name = "telemetry_index_query",
+		level = "debug",
+		skip_all,
+		fields(
+			session_id = %session_id,
+			has_predicate = predicate.is_some(),
+			install_floor = ?install_floor.map(|floor| floor.0)
+		)
+	)]
 	pub fn query(
 		&self,
 		session_id: &str,
@@ -498,6 +525,12 @@ impl TelemetryIndex {
 			});
 		}
 		result.floored = install_floor.is_some();
+		tracing::debug!(
+			row_count = result.rows.len(),
+			floored = result.floored,
+			backfilled = result.backfilled,
+			"telemetry index query completed"
+		);
 		Ok(result)
 	}
 

@@ -1291,6 +1291,27 @@ impl LifecycleMachine {
 		}
 	}
 
+	fn quarantine(&mut self, error: LifecycleError) -> LifecycleError {
+		self.phase = LifecyclePhase::Degraded;
+		let failure_kind = match &error {
+			LifecycleError::StaleGeneration { .. } => "stale_generation",
+			LifecycleError::UndeclaredTrigger(_) => "undeclared_trigger",
+			LifecycleError::Import { .. } => "import",
+			LifecycleError::Freeze(_) => "freeze",
+			LifecycleError::Drift(_) => "declaration_drift",
+			LifecycleError::UiRegistration(_) => "ui_registration",
+			LifecycleError::RegimeManifest(_) => "regime_manifest",
+			LifecycleError::Activation(_) => "activation",
+		};
+		tracing::warn!(
+			extension_id = %self.extension,
+			host_generation = self.host_generation,
+			failure_kind,
+			"extension host generation quarantined",
+		);
+		error
+	}
+
 	/// Returns the machine's current child lifecycle phase.
 	pub const fn phase(&self) -> LifecyclePhase {
 		self.phase
@@ -1310,48 +1331,52 @@ impl LifecycleMachine {
 				| LifecyclePhase::Active
 				| LifecyclePhase::Degraded
 		) {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(UiRegistrationError::RegistrationClosed.into());
+			return Err(self.quarantine(UiRegistrationError::RegistrationClosed.into()));
 		}
 		if self.verified_ui.is_some() {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(UiRegistrationError::RegistrationClosed.into());
+			return Err(self.quarantine(UiRegistrationError::RegistrationClosed.into()));
 		}
 		if fence.session != self.session_generation
 			|| fence.host < self.host_generation
 			|| registration.generation != fence.host
 		{
-			self.phase = LifecyclePhase::Degraded;
-			return Err(LifecycleError::StaleGeneration {
+			let error = LifecycleError::StaleGeneration {
 				expected_session: self.session_generation,
 				current_host:     self.host_generation,
 				actual_session:   fence.session,
 				actual_host:      registration.generation,
-			});
+			};
+			return Err(self.quarantine(error));
 		}
 		if registration.extension_id != self.extension.as_str() {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(
-				UiRegistrationError::ForeignExtension {
-					expected: self.extension.clone(),
-					actual:   Str::from(registration.extension_id),
-				}
-				.into(),
-			);
+			let error = UiRegistrationError::ForeignExtension {
+				expected: self.extension.clone(),
+				actual:   Str::from(registration.extension_id),
+			};
+			return Err(self.quarantine(error.into()));
 		}
 		let roster = match verify_ui_registration(&self.expected_ui, registration) {
 			Ok(roster) => roster,
 			Err(error) => {
-				self.phase = LifecyclePhase::Degraded;
-				return Err(error.into());
+				return Err(self.quarantine(error.into()));
 			},
 		};
 		self.host_generation = fence.host;
 		self.verified_ui = Some(roster);
-		Ok(self
+		let roster = self
 			.verified_ui
 			.as_ref()
-			.expect("verified UI roster was stored"))
+			.expect("verified UI roster was stored");
+		tracing::info!(
+			extension_id = %self.extension,
+			host_generation = roster.generation,
+			command_count = roster.commands.len(),
+			shortcut_count = roster.shortcuts.len(),
+			completion_count = roster.triggers.len(),
+			renderer_count = roster.renderers.len(),
+			"extension UI roster admitted",
+		);
+		Ok(roster)
 	}
 
 	/// Returns the manifest-verified UI roster, when registration completed.
@@ -1366,10 +1391,7 @@ impl LifecycleMachine {
 				self.regimes = regimes;
 				Ok(())
 			},
-			Err(error) => {
-				self.phase = LifecyclePhase::Degraded;
-				Err(LifecycleError::RegimeManifest(error))
-			},
+			Err(error) => Err(self.quarantine(LifecycleError::RegimeManifest(error))),
 		}
 	}
 
@@ -1384,8 +1406,8 @@ impl LifecycleMachine {
 		module: impl Into<Str>,
 		message: impl Into<Str>,
 	) -> LifecycleError {
-		self.phase = LifecyclePhase::Degraded;
-		LifecycleError::Import { module: module.into(), message: message.into() }
+		let error = LifecycleError::Import { module: module.into(), message: message.into() };
+		self.quarantine(error)
 	}
 
 	/// Validates a completed `RegisterTools` declaration set, then runs
@@ -1395,6 +1417,16 @@ impl LifecycleMachine {
 	/// before this method is entered. Repeating an already-active generation is
 	/// idempotent. Older host or session generations are rejected before any
 	/// host callback is entered.
+	#[tracing::instrument(
+		level = "debug",
+		name = "extension_host_activation",
+		skip_all,
+		fields(
+			extension_id = %self.extension,
+			host_generation = fence.host,
+			session_generation = fence.session,
+		)
+	)]
 	pub async fn activate_declared<H: LifecycleHost>(
 		&mut self,
 		host: &mut H,
@@ -1405,12 +1437,27 @@ impl LifecycleMachine {
 		principal: &Principal,
 	) -> Result<ActivationDisposition, LifecycleError> {
 		if !self.activation_triggers.contains(&trigger) {
+			tracing::warn!(
+				extension_id = %self.extension,
+				host_generation = fence.host,
+				session_generation = fence.session,
+				trigger = ?trigger,
+				"extension host activation denied for undeclared trigger",
+			);
 			return Err(LifecycleError::UndeclaredTrigger(trigger));
 		}
 		if !trigger.requires_host() {
 			return Ok(ActivationDisposition::Inert);
 		}
 		if fence.session != self.session_generation || fence.host < self.host_generation {
+			tracing::warn!(
+				extension_id = %self.extension,
+				expected_host_generation = self.host_generation,
+				expected_session_generation = self.session_generation,
+				host_generation = fence.host,
+				session_generation = fence.session,
+				"extension host activation denied for stale generation",
+			);
 			return Err(LifecycleError::StaleGeneration {
 				expected_session: self.session_generation,
 				current_host:     self.host_generation,
@@ -1435,23 +1482,20 @@ impl LifecycleMachine {
 				.first()
 				.or_else(|| self.expected_ui.ui.shortcuts.first())
 		{
-			self.phase = LifecyclePhase::Degraded;
-			return Err(UiRegistrationError::Missing { declaration: row.id.clone() }.into());
+			let declaration = row.id.clone();
+			return Err(self.quarantine(UiRegistrationError::Missing { declaration }.into()));
 		}
 		if !self.trust_runtime {
 			let drift = DeclarationDrift::between(&self.expected, declared);
 			if !drift.is_empty() {
-				self.phase = LifecyclePhase::Degraded;
-				return Err(LifecycleError::Drift(drift));
+				return Err(self.quarantine(LifecycleError::Drift(drift)));
 			}
 		}
 		if let Err(error) = self.regimes.freeze() {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(LifecycleError::RegimeManifest(error));
+			return Err(self.quarantine(LifecycleError::RegimeManifest(error)));
 		}
 		if let Err(message) = host.freeze().await {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(LifecycleError::Freeze(message));
+			return Err(self.quarantine(LifecycleError::Freeze(message)));
 		}
 		self.phase = LifecyclePhase::Frozen;
 		self.phase = LifecyclePhase::Verified;
@@ -1465,11 +1509,16 @@ impl LifecycleMachine {
 			trigger,
 		};
 		if let Err(message) = host.activate(&event, principal).await {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(LifecycleError::Activation(message));
+			return Err(self.quarantine(LifecycleError::Activation(message)));
 		}
 		self.phase = LifecyclePhase::Active;
 		self.last_event = Some(event.clone());
+		tracing::info!(
+			extension_id = %self.extension,
+			host_generation = fence.host,
+			session_generation = fence.session,
+			"extension host generation admitted",
+		);
 		Ok(ActivationDisposition::Activated(event))
 	}
 }

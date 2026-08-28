@@ -355,6 +355,7 @@ const DEVICE_TAGS: &[&str] = &[
 	"builtin",
 	"external",
 	"native",
+	"remote",
 	"worker",
 ];
 
@@ -389,8 +390,9 @@ fn has_tag(device: &MountedDevice<'_>, tag: &str) -> bool {
 			.is_some_and(|effects| !effects.is_empty()),
 		"subagent" => device.effects.subagents != 0,
 		"builtin" => is_builtin(device),
-		"external" => !is_builtin(device),
+		"external" => matches!(device.route, ToolRoute::Remote) || !is_builtin(device),
 		"native" => matches!(device.route, ToolRoute::Native),
+		"remote" => matches!(device.route, ToolRoute::Remote),
 		"worker" => matches!(device.route, ToolRoute::Worker { .. }),
 		_ => false,
 	}

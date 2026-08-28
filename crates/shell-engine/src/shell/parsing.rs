@@ -5,16 +5,14 @@ use std::{io, io::Read};
 use crate::{
 	Shell, extensions,
 	parser::{ParseError, Parser, ParserOptions, ast::Program},
-	trace_categories,
 };
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Parses the given reader as a shell program, returning the resulting
 	/// Abstract Syntax Tree for the program.
+	#[tracing::instrument(name = "shell_parse", level = "debug", skip_all)]
 	pub fn parse<R: Read>(&self, reader: R) -> Result<Program, ParseError> {
 		let mut parser = create_parser(reader, &self.parser_options());
-
-		tracing::debug!(target: trace_categories::PARSE, "Parsing reader as program...");
 		parser.parse_program()
 	}
 
@@ -24,6 +22,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// # Arguments
 	///
 	/// * `s` - The string to parse as a program.
+	#[tracing::instrument(name = "shell_parse", level = "debug", skip_all)]
 	pub fn parse_string<S: Into<String>>(&self, s: S) -> Result<Program, ParseError> {
 		parse_string_impl(s.into(), self.parser_options())
 	}
@@ -46,8 +45,6 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 #[omp_macros::cached(size = 64, result = true)]
 fn parse_string_impl(s: String, parser_options: ParserOptions) -> Result<Program, ParseError> {
 	let mut parser = create_parser(s.as_bytes(), &parser_options);
-
-	tracing::debug!(target: trace_categories::PARSE, "Parsing string as program...");
 	parser.parse_program()
 }
 

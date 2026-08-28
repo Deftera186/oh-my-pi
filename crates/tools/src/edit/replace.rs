@@ -18,13 +18,14 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use super::{
 	AppliedOp, CommittedSection, EditAction, EditCommitError, EditDocuments, EditPrepared,
 	EditProposal, EditUpdate, Fault, FormatPolicy, NoopResult, Payload, PrepareRequest,
 	RejectionReason, ResolvedEdit, SectionOp, SectionPayload, StalePolicy, commit_event, done_fault,
 	observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox},
-	param_event, recovery_edits,
+	param_event, recovery_edits, warn_edit_rejection,
 };
 use crate::render::TextProjection;
 
@@ -74,6 +75,36 @@ pub struct ReplaceTool<D> {
 	spec:            ToolSpec,
 }
 
+/// Returns the host-free `edit@rep.1` specification.
+pub fn replace_spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("edit"),
+		rev:             Rev { family: sf!("rep"), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<ReplaceParams>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("**")].into_iter().collect(),
+			}),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("replace.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Constructs the old-text/new-text replacement dialect.
 pub fn replace_tool<D: EditDocuments>(documents: D, format_policy: FormatPolicy) -> ReplaceTool<D> {
 	replace_tool_with_observer(documents, format_policy, EditObserver::default(), true)
@@ -86,38 +117,7 @@ pub fn replace_tool_with_observer<D: EditDocuments>(
 	observer: EditObserver,
 	guard_generated: bool,
 ) -> ReplaceTool<D> {
-	ReplaceTool {
-		documents,
-		format_policy,
-		observer,
-		guard_generated,
-		spec: ToolSpec {
-			name:            sf!("edit"),
-			rev:             Rev { family: sf!("rep"), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<ReplaceParams>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect(),
-				}),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("replace.rs"),
-			)
-			.into(),
-		},
-	}
+	ReplaceTool { documents, format_policy, observer, guard_generated, spec: replace_spec() }
 }
 
 struct Work<P> {
@@ -145,6 +145,12 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
+		let span = tracing::debug_span!(
+			"edit_execution",
+			revision = "rep.1",
+			path_count = tracing::field::Empty,
+			path = tracing::field::Empty,
+		);
 		stream! {
 			let replace_params = match params.whole::<ReplaceParams>().await {
 				Ok(params) => params,
@@ -153,6 +159,10 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 			if replace_params.edits.is_empty() {
 				yield done_fault(Fault::invalid("No replacement operations found in edits."));
 				return;
+			}
+			span.record("path_count", replace_params.edits.len());
+			if let Some(operation) = replace_params.edits.first() {
+				span.record("path", tracing::field::display(&operation.path));
 			}
 			let observer_args = serde_json::to_value(&replace_params).unwrap_or_default();
 			let journal_input = if let Ok(input) = serde_json::to_vec(&replace_params) { Bytes::from(input) } else { yield done_fault(Fault::invalid("Replacement arguments could not be journaled.")); return; };
@@ -165,7 +175,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					allow_unpinned: true,
 					allow_missing: false,
 					guard_generated: self.guard_generated,
-				}).await {
+				}).instrument(span.clone()).await {
 					Ok(prepared) => prepared,
 					Err(fault) => { yield done_fault(fault); return; },
 				};
@@ -212,12 +222,40 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					},
 					Err(error) => { yield done_fault(Fault::invalid(replacement_error(error))); return; },
 				};
-				let after = if work.prepared.authored_bytes() == work.prepared.base_bytes() {
+				let authored_stale = work.prepared.authored_bytes() != work.prepared.base_bytes();
+				let after = if !authored_stale {
 					after
 				} else if recovery_edits.is_empty() {
+					tracing::warn!(
+						parent: &span,
+						path = %work.prepared.display_path(),
+						"replacement rebase had no recoverable ranges",
+					);
 					yield done_fault(Fault::stale("The source snapshot changed before this replacement could be applied; re-read the document."));
 					return;
-				} else if let Ok(recovered) = recover_exact(work.prepared.authored_bytes(), work.prepared.base_bytes(), &recovery_edits) { recovered.content().clone() } else { yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document.")); return; };
+				} else if let Ok(recovered) = recover_exact(
+					work.prepared.authored_bytes(),
+					work.prepared.base_bytes(),
+					&recovery_edits,
+				) {
+					recovered.content().clone()
+				} else {
+					tracing::warn!(
+						parent: &span,
+						path = %work.prepared.display_path(),
+						"replacement rebase overlapped a concurrent change",
+					);
+					yield done_fault(Fault::stale("The source snapshot changed and the replacement overlaps intervening edits; re-read the document."));
+					return;
+				};
+				if authored_stale {
+					tracing::warn!(
+						parent: &span,
+						path = %work.prepared.display_path(),
+						strategy = "exact_recovery",
+						"replacement rebased over a changed document",
+					);
+				}
 				let inspected = self.observer.inspect(
 					AppliedEditSnapshot {
 						path: work.prepared.path().clone(),
@@ -226,7 +264,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					},
 					"replace",
 					&observer_args,
-				).await;
+				).instrument(span.clone()).await;
 				let after = inspected.content;
 				let warnings = inspected.notice.into_iter().collect();
 				pending_blackbox.extend(inspected.pending);
@@ -266,7 +304,7 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 			let result = {
 				let clipboard = self.documents.start_clipboard_batch();
 				let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
-				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+				let commit = self.documents.commit(prepared, proposals, clipboard).instrument(span.clone()).fuse();
 				let interrupt = params.next_interrupt().fuse();
 				pin_mut!(commit, interrupt);
 				select_biased! {
@@ -281,6 +319,15 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 			let Some(result) = result else { return; };
 			match result {
 				Ok(result) if result.sections.len() == works.len() => {
+					for (work, committed) in works.iter().zip(&result.sections) {
+						if committed.rebased {
+							tracing::warn!(
+								parent: &span,
+								path = %work.prepared.display_path(),
+								"edit transaction rebased a concurrent change",
+							);
+						}
+					}
 					for work in &works { self.documents.reset_noop(work.prepared.path()); }
 					for pending in pending_blackbox {
 						self.observer.record_committed(pending).await;
@@ -288,8 +335,14 @@ impl<D: EditDocuments> Tool for ReplaceTool<D> {
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, Some(&result.sections))), useless: false });
 				},
 				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
-				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
-				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+				Err(EditCommitError::Rejected(fault)) => {
+					warn_edit_rejection(&span, &fault);
+					yield done_fault(fault);
+				},
+				Err(EditCommitError::EffectsUnknown { reason }) => {
+					tracing::warn!(parent: &span, "edit commit result is unknown");
+					yield Ev::Aborted(Abort::EffectsUnknown { reason });
+				},
 			}
 		}
 	}

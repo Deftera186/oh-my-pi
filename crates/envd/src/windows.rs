@@ -153,12 +153,13 @@ pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<()
 	let socket = args
 		.socket
 		.unwrap_or_else(|| omp_env::project_state::environment_socket(&state_dir));
+	let require_document_ownership = args.docserver_socket.is_none();
 	let docserver_socket = args
 		.docserver_socket
 		.unwrap_or_else(|| omp_env::project_state::document_socket(&state_dir));
 	let owner_listener = OwnerPipeListener::bind(&socket)?;
 	let (worker_config, extension_bindings) =
-		worker_config(&state_dir, args.py_eval, &[], interrupt_grace)?;
+		worker_config(&state_dir, args.py_eval, &[], &[], interrupt_grace)?;
 	let (env_connections, env_connection_rx) = watch::channel(0);
 	let (doc_connections, doc_connection_rx) = watch::channel(0);
 	let server = Arc::new(
@@ -169,6 +170,7 @@ pub(crate) async fn run(args: EnvdConfig, bridges: RegistryBridges) -> Result<()
 			Registry::new(),
 			worker_config,
 			Some(doc_connections),
+			require_document_ownership,
 			None,
 			None,
 			bridges,

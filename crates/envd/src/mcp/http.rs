@@ -166,7 +166,7 @@ pub trait HttpExchange: Send + Sync {
 /// System HTTP exchange used by production MCP transports.
 #[derive(Clone)]
 pub struct ReqwestExchange {
-	client: reqwest::Client,
+	client: omp_http::Client,
 }
 impl ReqwestExchange {
 	/// Creates a redirect-disabled bounded exchange.

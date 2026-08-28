@@ -762,6 +762,7 @@ fn write_output(playback_tx: &PlaybackWriter, samples: &[f32], core: &Weak<LiveP
 	match playback_tx.write(samples) {
 		Ok(()) => true,
 		Err(error) => {
+			tracing::warn!(error = %error, "live voice playback failed");
 			if let Some(core) = core.upgrade()
 				&& !core.closing.load(Ordering::Acquire)
 			{

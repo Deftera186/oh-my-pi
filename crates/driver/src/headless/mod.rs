@@ -26,6 +26,10 @@ use omp_envd::exthost::{
 	},
 };
 use omp_inference::Registry as InferenceRegistry;
+use omp_observability::firehose::{
+	Envelope as TelemetryEnvelope, Event as TelemetryEvent, Firehose, Kind as TelemetryKind,
+	SubscriptionOptions,
+};
 use omp_proto::thread::v1::Item;
 use omp_sdk::{SessionHandle, SessionIdentity, SessionRuntime};
 use omp_settings::manager::{MutationScope, SettingsManager, SettingsPaths};
@@ -37,10 +41,6 @@ use omp_storage::{
 		ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
 		ProviderId as JournalProviderId,
 	},
-};
-use omp_telemetry::firehose::{
-	Envelope as TelemetryEnvelope, Event as TelemetryEvent, Firehose, Kind as TelemetryKind,
-	SubscriptionOptions,
 };
 use parking_lot::Mutex;
 
@@ -72,7 +72,7 @@ fn prompt_control_factory(
 }
 
 fn telemetry_control_factory(
-	query: Arc<dyn omp_telemetry::authority::DurableTelemetryQuery>,
+	query: Arc<dyn omp_observability::authority::DurableTelemetryQuery>,
 ) -> Arc<dyn ControlAuthorityFactory> {
 	Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
 		Ok(Arc::new(TelemetryControlAuthority::new(identity, now_ms(), Arc::clone(&query)))
@@ -210,16 +210,25 @@ fn bind_extension_telemetry(
 		let Some(manifest) = environment.extension_control_manifest(&evidence) else {
 			continue;
 		};
-		for declaration in &manifest.static_declarations().telemetry.subscriptions {
+		for declaration in &manifest.static_declarations().ordered {
+			if !matches!(declaration.kind.as_str(), "telemetry" | "telemetry_subscription") {
+				continue;
+			}
 			let Ok(kind) = TelemetryKind::from_str(declaration.key.as_str()) else {
 				continue;
 			};
 			let Ok(subscription) = firehose.subscribe(
-				SubscriptionOptions::new([kind], omp_telemetry::firehose::QUEUE_DEFAULT)
+				SubscriptionOptions::new([kind], omp_observability::firehose::QUEUE_DEFAULT)
 					.expect("one telemetry kind and the default queue are valid"),
 			) else {
 				continue;
 			};
+			tracing::debug!(
+				extension = %evidence.extension,
+				subscription = %declaration.id,
+				kind = kind.as_str(),
+				"bound extension telemetry firehose"
+			);
 			let dispatcher = Arc::clone(&dispatcher);
 			let identity = Arc::clone(&evidence);
 			let qualified_name = sf!("{}.{}", declaration.module, declaration.id);
@@ -227,6 +236,11 @@ fn bind_extension_telemetry(
 			tasks.push(tokio::spawn(async move {
 				let mut delivered = 0_u64;
 				while let Ok(event) = subscription.recv().await {
+					tracing::debug!(
+						extension = %identity.extension,
+						kind = event.kind().as_str(),
+						"received extension telemetry event"
+					);
 					delivered = delivered.saturating_add(1);
 					let kind = event.kind();
 					let turn = match event.as_ref() {
@@ -351,6 +365,9 @@ pub struct HeadlessSessionOptions {
 	pub py_eval:               bool,
 	/// Invocation-only tool approval mode that overrides persisted settings.
 	pub approval_mode:         Option<omp_envd::tool_settings::ApprovalMode>,
+	/// Detached-daemon idle timeout in seconds, forwarded only when this session
+	/// spawns the daemon. `None` uses the daemon's default.
+	pub spawn_idle_timeout:    Option<u64>,
 	/// Whether authenticated tool invocations are forbidden from allocating
 	/// PTYs.
 	pub pty_denied:            bool,
@@ -708,18 +725,18 @@ impl HeadlessSession {
 		);
 		bridges.edit_model = Some(options.model.clone());
 		bridges.edit_repair = settings.tools.edit_auto_repair.then_some(edit_repair);
-		let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
-			&root,
-			&state_dir,
-			&omp_env::project_state::document_socket(&state_dir),
-			options.py_eval,
-			&extension_specs,
-			policy.contributed_values.as_ref(),
-			Arc::clone(&settings_snapshot),
-			bridges,
-		)
-		.await
-		.map_err(composition)?;
+		let environment =
+			omp_envd::ProjectEnvironment::attach(&root, &state_dir, omp_envd::AttachOptions {
+				py_eval: options.py_eval,
+				approval_mode: options.approval_mode,
+				trusted_extensions: extension_specs.clone(),
+				contributed_values: policy.contributed_values.iter().cloned().collect(),
+				settings: Arc::clone(&settings_snapshot),
+				bridges,
+				spawn_idle_timeout: options.spawn_idle_timeout,
+			})
+			.await
+			.map_err(composition)?;
 		let evidences = environment.extension_registry_evidences();
 		let catalog_owner = if has_runtime_providers {
 			Arc::new(

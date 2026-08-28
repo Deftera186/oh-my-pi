@@ -422,12 +422,13 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 			Intent::Submit { text, attachments, mode: _ } => {
 				let turn = generation.fetch_add(1, Ordering::SeqCst) + 1;
 				let _ = events.send(BackendEvent::UserReplayed {
-					text:  Str::from(text),
-					chips: attachments
+					text:   Str::from(text),
+					chips:  attachments
 						.iter()
 						.enumerate()
 						.map(|(i, _)| Str::from(format!("attachment {}", i + 1)))
 						.collect(),
+					queued: false,
 				});
 				let _ = events.send(BackendEvent::Status(mock_status(&models[current].name, true)));
 				let id = Str::from(format!("assistant-{turn}"));
@@ -481,8 +482,9 @@ fn run_mock(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 			},
 			Intent::Resume(_) => {
 				let _ = events.send(BackendEvent::UserReplayed {
-					text:  sf!("Continue the previous session."),
-					chips: Vec::new(),
+					text:   sf!("Continue the previous session."),
+					chips:  Vec::new(),
+					queued: false,
 				});
 			},
 			Intent::Help => {
@@ -512,6 +514,7 @@ fn mock_models() -> Vec<ModelRow> {
 		context:     Some(200_000),
 		input_mtok:  Some(3.0),
 		output_mtok: Some(15.0),
+		efforts:     Arc::from([]),
 	})
 	.collect()
 }
@@ -544,7 +547,7 @@ fn mock_status(model: &str, working: bool) -> StatusFacts {
 		jobs: usize::from(working),
 		attempt: 0,
 		dropped: 0,
-		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
+		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9, untracked: 2 }),
 		compaction_boundaries: Some(CompactionBoundaries {
 			threshold_percent:   80.0,
 			speculation_percent: Some(70.0),

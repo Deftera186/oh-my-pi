@@ -17,7 +17,7 @@ use omp_app::chat_ui::{
 };
 use omp_core::{ArtifactDigest, Provenance, Str, sf};
 use omp_envd::{
-	ProjectEnvironment, RegistryBridges,
+	AttachOptions, ProjectEnvironment, RegistryBridges,
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest,
 		lifecycle::HeadlessLifecycleKind,
@@ -29,6 +29,7 @@ use omp_proto::{
 	inference::v1::{Value as ProtoValue, ValueMap, value as proto_value},
 	omp::ui::v1::{DialogOutcome, UiResponse, ui_effect, ui_request, ui_response},
 };
+use omp_settings::manager::{SettingsManager, SettingsPaths};
 use serde_json::json;
 
 const MODULE: &str = "extension_ui_fixture";
@@ -170,18 +171,17 @@ def inspect_shortcut(action, ctx):
 	let module_path = site.join(format!("{MODULE}.py"));
 	fs::write(&module_path, source).expect("write Python UI fixture");
 	let extension = fixture_extension(site, module_path);
-	let environment = ProjectEnvironment::connect_or_start(
-		&root,
-		&state,
-		&state.join("env.sock"),
-		&state.join("docs.sock"),
-		false,
-		None,
-		&[extension],
-		&[],
-		omp_tool::DEFAULT_INTERRUPT_GRACE,
-		RegistryBridges::default(),
-	)
+	let environment = ProjectEnvironment::attach(&root, &state, AttachOptions {
+		py_eval:            false,
+		approval_mode:      None,
+		trusted_extensions: vec![extension],
+		contributed_values: Vec::new(),
+		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
+			.expect("settings manager")
+			.snapshot(),
+		bridges:            RegistryBridges::default(),
+		spawn_idle_timeout: Some(2),
+	})
 	.await
 	.expect("start spawned Python UI extension");
 	let callbacks = environment.extension_callback_dispatcher();

@@ -34,6 +34,11 @@ impl BlobRpc {
 impl blob_server::Blob for BlobRpc {
 	type GetStream = BlobStream;
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "blob", rpc.method = "stat")
+	)]
 	async fn stat(
 		&self,
 		request: Request<pb::StatRequest>,
@@ -56,6 +61,11 @@ impl blob_server::Blob for BlobRpc {
 		}
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "blob", rpc.method = "get")
+	)]
 	async fn get(
 		&self,
 		request: Request<pb::GetRequest>,
@@ -102,6 +112,11 @@ impl blob_server::Blob for BlobRpc {
 		Ok(Response::new(Box::pin(stream)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "blob", rpc.method = "put")
+	)]
 	async fn put(
 		&self,
 		request: Request<tonic::Streaming<pb::Chunk>>,
@@ -146,6 +161,11 @@ impl blob_server::Blob for BlobRpc {
 		}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "blob", rpc.method = "delete")
+	)]
 	async fn delete(
 		&self,
 		request: Request<pb::DeleteRequest>,

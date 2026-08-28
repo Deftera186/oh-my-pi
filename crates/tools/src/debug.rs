@@ -259,41 +259,46 @@ pub struct DebugTool<C> {
 	spec:    ToolSpec,
 }
 
+/// Returns the host-free `debug@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("debug"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(
+			"Launches or attaches native debug adapters; manages all breakpoint families, execution, \
+			 stack and variable inspection, disassembly, memory, output, sessions, custom requests, \
+			 and termination."
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: None,
+			exec:      Some(ExecEffects {
+				commands: [sf!("*")].into_iter().collect(),
+				network:  false,
+			}),
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("debug.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates the revisioned debug tool.
 pub fn tool<C: DebugControl>(control: C, maximum: Duration) -> DebugTool<C> {
 	DebugTool {
 		control,
 		maximum: maximum.clamp(Duration::from_secs(5), Duration::from_secs(300)),
-		spec: ToolSpec {
-			name:            sf!("debug"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(
-				"Launches or attaches native debug adapters; manages all breakpoint families, \
-				 execution, stack and variable inspection, disassembly, memory, output, sessions, \
-				 custom requests, and termination."
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: None,
-				exec:      Some(ExecEffects {
-					commands: [sf!("*")].into_iter().collect(),
-					network:  false,
-				}),
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("debug.rs"),
-			)
-			.into(),
-		},
+		spec: spec(),
 	}
 }
 

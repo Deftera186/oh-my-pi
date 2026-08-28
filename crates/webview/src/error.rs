@@ -93,3 +93,25 @@ pub enum Error {
 	#[error(transparent)]
 	Io(#[from] io::Error),
 }
+impl Error {
+	pub(crate) const fn kind(&self) -> &'static str {
+		match self {
+			Self::NoEngine(_) => "no_engine",
+			Self::Launch { .. } => "launch",
+			Self::Closed => "closed",
+			Self::Protocol(_) => "protocol",
+			Self::ScreencastFrameBase64 { .. } => "screencast_frame_base64",
+			Self::ScreenshotBase64 { .. } => "screenshot_base64",
+			Self::Jpeg(_) => "jpeg",
+			Self::Png(_) => "png",
+			Self::PngEncode(_) => "png_encode",
+			Self::MalformedMessage(_) => "malformed_message",
+			Self::WebSocket(_) => "websocket",
+			Self::Unsupported(_) => "unsupported",
+			Self::Timeout(_) => "timeout",
+			Self::MainThread => "main_thread",
+			Self::WindowHandle => "window_handle",
+			Self::Io(_) => "io",
+		}
+	}
+}

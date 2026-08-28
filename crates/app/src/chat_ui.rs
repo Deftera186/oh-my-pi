@@ -30,14 +30,17 @@ use omp_agent::{
 use omp_catalog::{
 	ModelKey, ModelSpec, PriceUnit, ProviderDef, ProviderId,
 	provider::{AuthSpecKind, CredentialSourceSpec},
+	role_assignment_selector,
 	settings::{ModelRoleStorage, ModelSettings},
 	snapshot::Catalog,
 };
 use omp_chat_ui::{
 	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
-	Intent, ListRow, LiveVoiceAction, ModelRow, RawFrame, RewindTargetRow, SessionRow, StatusFacts,
-	StatusLayout, StatusSeparator, StreamSummary, SubmitMode, ThinkingLevel as StatusThinkingLevel,
-	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, VisibleResourceFacts,
+	HubRole, HubScope, Intent, ListRow, LiveVoiceAction, LockedProviderRow, ModelHubData,
+	ModelHubIntent, ModelRow, RawFrame, RestoredAttachment, RewindTargetRow, SessionRow,
+	StatusFacts, StatusLayout, StatusSeparator, StreamSummary, SubmitMode,
+	ThinkingLevel as StatusThinkingLevel, ToolTerminal, ToolViewContent, TranscriptFrame,
+	TranscriptFrameKind, VisibleResourceFacts,
 	completion::{CompletionQuery, CompletionRule, CompletionSource, CompletionTrigger},
 	host::{HostOptions, InputAction, InputBinding},
 	login_panel::LoginEvent,
@@ -1206,6 +1209,7 @@ struct BridgeState {
 	model_settings: ModelSettings,
 	pending_session_delete: Option<std::time::Instant>,
 	git: Option<GitWorkbenchBackend>,
+	git_facts: Option<omp_chat_ui::GitFacts>,
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	session_id: Str,
 	session_path: PathBuf,
@@ -1285,6 +1289,32 @@ async fn refresh_lsp_roster(state: &mut BridgeState) {
 		state.lsp_servers = response.servers;
 	}
 }
+/// Refreshes cached repository facts from the Environment-owned snapshot.
+async fn refresh_git_facts(state: &mut BridgeState) {
+	use omp_proto::env::v1::{RepositoryAvailability, RepositorySnapshotRequest};
+	let Ok(snapshot) = state
+		.environment
+		.repository_snapshot(RepositorySnapshotRequest::default())
+		.await
+	else {
+		return;
+	};
+	if snapshot.availability != RepositoryAvailability::Available as i32 {
+		state.git_facts = None;
+		return;
+	}
+	let branch = if snapshot.branch.is_empty() {
+		Str::from(snapshot.head.get(..8).unwrap_or(snapshot.head.as_str()))
+	} else {
+		Str::from(snapshot.branch.as_str())
+	};
+	state.git_facts = Some(omp_chat_ui::GitFacts {
+		branch,
+		dirty: snapshot.unstaged,
+		staged: snapshot.staged,
+		untracked: snapshot.untracked,
+	});
+}
 
 fn lsp_stage_label(stage: i32) -> &'static str {
 	use omp_proto::document::v1::LspServerStage;
@@ -1330,6 +1360,31 @@ fn welcome_lsp_servers(
 			}
 		})
 		.collect()
+}
+/// Rotating one-line tips shown under the welcome banner.
+const WELCOME_TIPS: &[&str] = &[
+	"Tired of typing \"keep going\"? Just send a '.'",
+	"/model switches models mid-session.",
+	"! runs shell commands and $ runs Python without leaving the chat.",
+	"# opens prompt actions for the current draft.",
+	"/theme previews themes live as you scroll.",
+];
+
+/// Builds the transcript welcome banner from startup facts.
+fn welcome_banner(state: &BridgeState) -> omp_chat_ui::WelcomeBanner {
+	let rows =
+		model_rows(state.catalog.as_ref(), &state.model_settings, state.auth_control.as_ref());
+	let current = rows.get(current_model_index(&rows, &state.model));
+	let tip = WELCOME_TIPS[usize::try_from(now_ms()).unwrap_or(0) % WELCOME_TIPS.len()];
+	omp_chat_ui::WelcomeBanner {
+		version:     Str::new_static(env!("CARGO_PKG_VERSION")),
+		model:       current
+			.map(|row| row.name.clone())
+			.unwrap_or_else(|| Str::from(state.model.as_str())),
+		provider:    current.map(|row| row.provider.clone()).unwrap_or_default(),
+		lsp_servers: welcome_lsp_servers(&state.lsp_servers),
+		tip:         Some(Str::new_static(tip)),
+	}
 }
 
 struct GitWorkbenchBackend {
@@ -2397,10 +2452,12 @@ struct ChatSceneSeed {
 	hide_thinking:    bool,
 }
 
+/// Loads effective keybindings, returning host input bindings plus the
+/// resolved dequeue chord label for pending queued-row hints.
 fn load_input_actions(
 	data_dir: &Path,
 	extension_ui: &presentation::PublishedUiRoster,
-) -> miette::Result<Vec<InputBinding>> {
+) -> miette::Result<(Vec<InputBinding>, Option<Str>)> {
 	let imported = crate::keybindings::config::import_legacy(data_dir)
 		.map_err(|error| miette::miette!("{error}"))?;
 	let native = data_dir.join("keybindings.toml");
@@ -2437,6 +2494,10 @@ fn load_input_actions(
 		return Err(miette::miette!("conflicting keybindings: {conflicts}"));
 	}
 	let platform = crate::keybindings::KeyPlatform::current();
+	let dequeue_hint = resolved
+		.chords_for("app.message.dequeue", platform)
+		.next()
+		.and_then(|chord| crate::keybindings::format_chord_label(chord, platform).ok());
 	let mut actions = crate::keybindings::config::APP_ACTION_IDS
 		.iter()
 		.filter_map(|action| {
@@ -2460,7 +2521,7 @@ fn load_input_actions(
 			InputAction::ExtensionShortcut(binding.chord.clone()),
 		)
 	}));
-	Ok(actions)
+	Ok((actions, dequeue_hint))
 }
 
 fn current_browser_settings(manager: &SettingsManager) -> BrowserSettings {
@@ -2929,6 +2990,7 @@ where
 		model_settings,
 		pending_session_delete: None,
 		git: None,
+		git_facts: None,
 		advisor,
 		session_id: session_id.clone(),
 		session_path: local_session_path.clone(),
@@ -3003,6 +3065,7 @@ where
 		raw_stream: None,
 	};
 	let _ = tokio::time::timeout(Duration::from_millis(300), refresh_lsp_roster(&mut state)).await;
+	let _ = tokio::time::timeout(Duration::from_millis(300), refresh_git_facts(&mut state)).await;
 	if let Err(error) = apply_configured_theme(&backend_tx, &data_dir, &mut state) {
 		send_backend(
 			&backend_tx,
@@ -3046,6 +3109,7 @@ where
 			},
 		}
 	}
+	send_backend(&backend_tx, BackendEvent::WelcomeBanner(welcome_banner(&state)));
 	replay_items(
 		&backend_tx,
 		&session.initial_items,
@@ -3378,6 +3442,9 @@ where
 							Ok(ack) = ack_rx.recv_async() => {
 								state.submit_pending = false;
 								state.turn_started = None;
+								if state.queued > 0 {
+									send_backend(&backend_tx, BackendEvent::QueuedPromptsSettled);
+								}
 								state.queued = 0;
 								state.queued_prompts.clear();
 								if ack.interrupted && ack.committed_turns == 0
@@ -3393,6 +3460,11 @@ where
 								send_backend(&backend_tx, BackendEvent::Ack {
 									interrupted: ack.interrupted,
 								});
+								let _ = tokio::time::timeout(
+									Duration::from_millis(300),
+									refresh_git_facts(&mut state),
+								)
+								.await;
 								send_status(&backend_tx, &state, &bus, 0);
 												while let Some(command) = state.deferred.take_next() {
 									execute_deferred_command(
@@ -3553,6 +3625,7 @@ where
 		Ok::<(), miette::Report>(())
 	};
 
+	let (input_actions, dequeue_hint) = load_input_actions(&data_dir, input_extension_ui.as_ref())?;
 	let options = HostOptions {
 		welcome,
 		exit_on_session_change: true,
@@ -3560,7 +3633,8 @@ where
 		error_notify: true,
 		title_enabled,
 		resize_scrollback,
-		input_actions: load_input_actions(&data_dir, input_extension_ui.as_ref())?,
+		input_actions,
+		dequeue_hint,
 	};
 	let (host_result, bridge_result): (
 		miette::Result<omp_chat_ui::host::HostOutcome>,
@@ -3945,6 +4019,7 @@ pub async fn run_guest(
 			title_enabled:          true,
 			resize_scrollback:      omp_chat_ui::host::ResizeScrollback::Rebuild,
 			input_actions:          Vec::new(),
+			dequeue_hint:           None,
 		},
 		initial_draft,
 	);
@@ -4535,6 +4610,8 @@ where
 					durable,
 				)
 				.await;
+			} else if durable {
+				send_open_model_hub(self.backend, self.settings_manager, self.state);
 			} else {
 				send_open_models(self.backend, self.state);
 			}
@@ -4774,7 +4851,11 @@ where
 						&mut self.state.part_serial,
 						self.renderers,
 					);
-					send_backend(self.backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
+					send_backend(self.backend, BackendEvent::UserReplayed {
+						text,
+						chips: Vec::new(),
+						queued: false,
+					});
 					Ok(CommandResult::Consumed(ConsumedResult::silent()))
 				},
 				Ok(Err(error)) => Ok(CommandResult::Consumed(ConsumedResult::status(error))),
@@ -6291,7 +6372,11 @@ where
 				text:        prompt.clone(),
 				attachments: Vec::new(),
 			});
-		send_backend(self.backend, BackendEvent::UserReplayed { text: prompt, chips: Vec::new() });
+		send_backend(self.backend, BackendEvent::UserReplayed {
+			text:   prompt,
+			chips:  Vec::new(),
+			queued: true,
+		});
 		send_status(self.backend, self.state, self.bus, self.dropped);
 		Box::pin(async {
 			Ok(CommandResult::Consumed(ConsumedResult::status(
@@ -7293,6 +7378,7 @@ fn maybe_spawn_session_title<C>(
 	let in_flight = Arc::clone(&state.title_generation_in_flight);
 	let user_set = Arc::clone(&state.title_user_set);
 	let commit_lock = Arc::clone(&state.title_commit_lock);
+	let session_id = state.session_id.clone();
 	drop(tokio::spawn(async move {
 		let resolved = tokio::task::spawn_blocking(move || {
 			omp_driver::prompt_input::resolve_title_system_prompt(&cwd, &home)
@@ -7319,15 +7405,35 @@ fn maybe_spawn_session_title<C>(
 			generate_online_title(parent.as_ref(), input.as_str(), system_prompt.as_str()).await
 		{
 			let _commit = commit_lock.lock().await;
-			if !user_set.load(Ordering::Acquire)
-				&& let Err(error) = control.set_generated_title(now_ms(), title).await
-			{
-				tracing::debug!(%error, "generated session title could not be committed");
+			if user_set.load(Ordering::Acquire) {
+				tracing::debug!(
+					session_id = %session_id,
+					"generated session title discarded after user rename"
+				);
+			} else {
+				match control.set_generated_title(now_ms(), title).await {
+					Ok(event) => tracing::debug!(
+						session_id = %session_id,
+						event,
+						"generated session title committed"
+					),
+					Err(error) => tracing::debug!(
+						%error,
+						session_id = %session_id,
+						"generated session title could not be committed"
+					),
+				}
 			}
+		} else {
+			tracing::debug!(
+				session_id = %session_id,
+				"session title generation returned no title"
+			);
 		}
 		in_flight.store(false, Ordering::Release);
 	}));
 }
+
 fn send_recap_policy(backend: &flume::Sender<BackendEvent>, settings: &Settings) {
 	send_backend(backend, BackendEvent::RecapPolicy {
 		enabled:      settings.recap.enabled,
@@ -7419,6 +7525,7 @@ where
 				let parent = Arc::clone(parent);
 				let control = control.clone();
 				let backend = backend.clone();
+				let session_id = state.session_id.clone();
 				drop(tokio::spawn(async move {
 					let thread = match control.project_thread().await {
 						Ok(thread) => thread,
@@ -7724,6 +7831,7 @@ where
 					.await;
 				},
 				Ok(ChatCommand::ModelPicker) => send_open_models(backend, state),
+				Ok(ChatCommand::ModelHub) => send_open_model_hub(backend, settings_manager, state),
 				Ok(ChatCommand::Resume) => {
 					if chat_active(state.submit_pending, bus.phase()) {
 						send_backend(
@@ -7926,6 +8034,7 @@ where
 						send_backend(backend, BackendEvent::UserReplayed {
 							text: Str::new(text.as_str()),
 							chips,
+							queued: active,
 						});
 						if let Some(replanned) = title_replanned {
 							maybe_spawn_session_title(parent, control, state, text.as_str(), replanned);
@@ -8014,7 +8123,11 @@ where
 						};
 						if delivered {
 							state.has_history = true;
-							send_backend(backend, BackendEvent::UserReplayed { text: prompt_text, chips });
+							send_backend(backend, BackendEvent::UserReplayed {
+								text: prompt_text,
+								chips,
+								queued: active,
+							});
 							if let Some(replanned) = title_replanned {
 								maybe_spawn_session_title(parent, control, state, text.as_str(), replanned);
 							}
@@ -8137,7 +8250,11 @@ where
 					state.has_history = true;
 					send_backend(backend, BackendEvent::HistoryCleared);
 					replay_items(backend, &items, &mut state.tools, &mut state.part_serial, renderers);
-					send_backend(backend, BackendEvent::UserReplayed { text, chips: Vec::new() });
+					send_backend(backend, BackendEvent::UserReplayed {
+						text,
+						chips: Vec::new(),
+						queued: false,
+					});
 				}
 			}
 		},
@@ -8283,15 +8400,30 @@ where
 		},
 		Intent::LiveVoice(LiveVoiceAction::SetMuted(muted)) => {
 			match state.audio.set_live_muted(muted) {
-				Ok(()) => send_backend(
-					backend,
-					BackendEvent::Notice(sf!(if muted {
-						"Live voice muted."
-					} else {
-						"Live voice unmuted."
-					})),
-				),
-				Err(error) => send_backend(backend, BackendEvent::Error(Str::new(error))),
+				Ok(()) => {
+					tracing::debug!(
+						session_id = %state.session_id,
+						muted,
+						"live voice mute state changed"
+					);
+					send_backend(
+						backend,
+						BackendEvent::Notice(sf!(if muted {
+							"Live voice muted."
+						} else {
+							"Live voice unmuted."
+						})),
+					);
+				},
+				Err(error) => {
+					tracing::warn!(
+						error,
+						session_id = %state.session_id,
+						muted,
+						"live voice mute change denied"
+					);
+					send_backend(backend, BackendEvent::Error(Str::new(error)));
+				},
 			}
 		},
 		Intent::LiveVoice(LiveVoiceAction::Close) => {
@@ -8300,20 +8432,51 @@ where
 			send_status(backend, state, bus, dropped);
 		},
 		Intent::ToggleStt => match state.audio.toggle_stt() {
-			Ok(enabled) => send_backend(
-				backend,
-				BackendEvent::Notice(sf!(if enabled {
-					"Speech-to-text capture enabled."
-				} else {
-					"Speech-to-text capture disabled."
-				})),
-			),
-			Err(error) => send_backend(
-				backend,
-				BackendEvent::Error(sf!("Could not change speech-to-text capture: {error}")),
-			),
+			Ok(enabled) => {
+				tracing::debug!(
+					session_id = %state.session_id,
+					enabled,
+					"speech-to-text capture state changed"
+				);
+				send_backend(
+					backend,
+					BackendEvent::Notice(sf!(if enabled {
+						"Speech-to-text capture enabled."
+					} else {
+						"Speech-to-text capture disabled."
+					})),
+				);
+			},
+			Err(error) => {
+				tracing::warn!(
+					%error,
+					session_id = %state.session_id,
+					"speech-to-text capture change denied"
+				);
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Could not change speech-to-text capture: {error}")),
+				);
+			},
 		},
 		Intent::Suspend | Intent::ResetDisplay | Intent::InspectHistory => {},
+		Intent::OpenModelHub => send_open_model_hub(backend, settings_manager, state),
+		Intent::ModelHub(intent) => {
+			match apply_model_hub_intent(settings_manager, state.model_settings.role_storage, intent) {
+				Ok(()) => {
+					refresh_model_settings(settings_manager, state);
+					send_backend(
+						backend,
+						BackendEvent::ModelHubUpdated(model_hub_data(settings_manager, state)),
+					);
+					send_models_updated(backend, state);
+				},
+				Err(error) => send_backend(
+					backend,
+					BackendEvent::Error(sf!("Could not save model configuration: {error}")),
+				),
+			}
+		},
 		Intent::ApplySettings { changes, commit } => {
 			let previous_settings = state.settings.clone();
 			let composer_style = state.settings.composer.shape;
@@ -8612,6 +8775,7 @@ where
 							send_backend(backend, BackendEvent::HistoryRewind {
 								user_index,
 								text: target.text.clone(),
+								attachments: rewind_attachments(&target.parts),
 							});
 							replay_items(
 								backend,
@@ -9415,6 +9579,9 @@ async fn handle_agent_event(
 					);
 					state.replaying_turn = false;
 				}
+				if state.queued > 0 {
+					send_backend(backend, BackendEvent::QueuedPromptsSettled);
+				}
 				state.queued = 0;
 				state.queued_prompts.clear();
 				state.model.clone_from(&outcome.model);
@@ -10071,13 +10238,13 @@ fn replay_message(backend: &flume::Sender<BackendEvent>, message: &Message, seri
 	let text = text_parts.join("\n");
 	match Role::try_from(message.role) {
 		Ok(Role::User) => {
-			send_backend(backend, BackendEvent::UserReplayed { text: Str::from(text), chips });
+			send_backend(backend, BackendEvent::UserReplayed {
+				text: Str::from(text),
+				chips,
+				queued: false,
+			});
 		},
-		Ok(Role::System) => {
-			if !text.is_empty() {
-				send_backend(backend, BackendEvent::Notice(Str::from(text)));
-			}
-		},
+		Ok(Role::System) => {},
 		_ => {
 			for thinking in thinking_parts {
 				send_backend(backend, BackendEvent::ThinkingReplayed { text: thinking.into() });
@@ -10417,7 +10584,8 @@ fn render_tool_result_view(
 	let fold = tool
 		.filter(|tool| tool.identity == identity)
 		.map_or(&empty_fold, |tool| &tool.fold);
-	let view = renderers
+	let terminal = durable_tool_terminal(item);
+	let mut view = renderers
 		.contains(&identity)
 		.then(|| renderers.view(&identity, fold, outcome.as_deref()).ok())
 		.flatten()
@@ -10429,7 +10597,24 @@ fn render_tool_result_view(
 					.map_or_else(|| Str::new_static("{}"), structured_bytes_fallback),
 			)
 		});
-	(identity, durable_tool_terminal(item), view)
+	if terminal == ToolTerminal::Aborted
+		&& let (ToolViewContent::Markup(markup), Some(outcome)) = (&view, outcome.as_ref())
+	{
+		let durable = structured_bytes_fallback(outcome);
+		let mut combined = String::with_capacity(
+			markup
+				.len()
+				.saturating_add(durable.len())
+				.saturating_add(40),
+		);
+		combined.push_str("<col gap=0>");
+		combined.push_str(markup);
+		combined.push_str("<pre fg=muted>");
+		push_tml_text(&mut combined, durable.as_str());
+		combined.push_str("</pre></col>");
+		view = ToolViewContent::Markup(Str::from(combined));
+	}
+	(identity, terminal, view)
 }
 
 fn tool_title(name: &Str, args: &omp_slopjson::Value) -> Str {
@@ -10491,20 +10676,61 @@ fn send_tool_result_images(backend: &flume::Sender<BackendEvent>, call_id: &Str,
 /// file for inline terminal rendering, returning its path. Non-PNG payloads
 /// and by-reference blobs are represented by the structured renderer view.
 fn persist_tool_image(blob: &Blob) -> Option<Str> {
-	if blob.mime != "image/png" || blob.inline.is_empty() {
+	if blob.mime != "image/png" {
+		return None;
+	}
+	persist_inline_blob("omp-tool-image", "png", blob)
+}
+
+/// Writes an inline blob to a content-addressed temp file, returning its
+/// path. Empty payloads (by-reference blobs) persist nothing.
+fn persist_inline_blob(prefix: &str, extension: &str, blob: &Blob) -> Option<Str> {
+	if blob.inline.is_empty() {
 		return None;
 	}
 	let name = if blob.hash.is_empty() {
-		format!("omp-tool-image-{}.png", omp_core::Ulid::generate())
+		format!("{prefix}-{}.{extension}", omp_core::Ulid::generate())
 	} else {
 		let hex = hex::encode(&blob.hash[..blob.hash.len().min(16)]).into_string();
-		format!("omp-tool-image-{hex}.png")
+		format!("{prefix}-{hex}.{extension}")
 	};
 	let path = env::temp_dir().join(name);
 	if !path.exists() {
 		fs::write(&path, &blob.inline).ok()?;
 	}
 	Some(Str::from(path.to_string_lossy().as_ref()))
+}
+
+/// Recovers composer-restorable attachments from a rewound user message's
+/// non-prose parts: image blobs land in content-addressed temp files and
+/// `<attachment>` pastes become text clips.
+fn rewind_attachments(parts: &[Part]) -> Vec<RestoredAttachment> {
+	let mut attachments = Vec::with_capacity(parts.len());
+	for part in parts {
+		match part.kind.as_ref() {
+			Some(part::Kind::Blob(blob)) => {
+				let extension = match blob.mime.as_str() {
+					"image/png" => "png",
+					"image/jpeg" => "jpg",
+					"image/gif" => "gif",
+					"image/webp" => "webp",
+					_ => continue,
+				};
+				if let Some(source) = persist_inline_blob("omp-history-image", extension, blob) {
+					attachments.push(RestoredAttachment::Image { source });
+				}
+			},
+			Some(part::Kind::Text(text)) => {
+				let body = text
+					.strip_prefix("<attachment>")
+					.and_then(|body| body.strip_suffix("</attachment>"))
+					.unwrap_or(text);
+				attachments.push(RestoredAttachment::Text(Str::from(body)));
+			},
+			_ => {},
+		}
+	}
+	attachments
 }
 
 fn model_rows(
@@ -10571,6 +10797,21 @@ fn model_rows(
 					context: model.limits.context_window,
 					input_mtok: price(PriceUnit::MtokInput),
 					output_mtok: price(PriceUnit::MtokOutput),
+					efforts: model
+						.thinking
+						.as_ref()
+						.and_then(|policy| catalog.thinking_policy(policy))
+						.map_or_else(
+							|| Arc::from([]),
+							|policy| {
+								policy
+									.efforts
+									.iter()
+									.map(|effort| Str::new_static(<&'static str>::from(*effort)))
+									.collect::<Vec<_>>()
+									.into()
+							},
+						),
 				}
 			})
 			.collect::<Vec<_>>()
@@ -10743,6 +10984,238 @@ fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
 			pinned: choice.pinned,
 		})
 		.collect()
+}
+fn send_open_model_hub(
+	backend: &flume::Sender<BackendEvent>,
+	settings_manager: &SettingsManager,
+	state: &BridgeState,
+) {
+	send_backend(backend, BackendEvent::OpenModelHub(model_hub_data(settings_manager, state)));
+}
+
+/// Projects catalog, role, fallback, and credential state for the models hub.
+fn model_hub_data(settings_manager: &SettingsManager, state: &BridgeState) -> ModelHubData {
+	let catalog = state.catalog.as_ref();
+	let settings = &state.model_settings;
+	let rows = model_rows(catalog, settings, state.auth_control.as_ref());
+	let current = current_model_index(&rows, &state.model);
+	ModelHubData {
+		current,
+		roles: hub_roles(catalog, settings),
+		cycle_order: settings.cycle_order.iter().cloned().collect(),
+		chains: retry_chains(settings_manager).into_iter().collect(),
+		project_storage: settings.role_storage == ModelRoleStorage::Project,
+		locked: locked_provider_rows(catalog, settings, state.auth_control.as_ref(), &rows),
+		rows,
+	}
+}
+
+/// Presentation color defaults for built-in roles without configured tags.
+fn builtin_role_color(role: &str) -> Option<&'static str> {
+	Some(match role {
+		"default" => "ok",
+		"smol" => "warning",
+		"slow" | "advisor" => "accent",
+		"vision" => "error",
+		"plan" | "designer" | "task" | "commit" | "tiny" | "memory" => "muted",
+		_ => return None,
+	})
+}
+
+/// Resolves every visible role for the hub: built-ins first, then configured
+/// custom roles in name order.
+fn hub_roles(catalog: &Catalog, settings: &ModelSettings) -> Vec<HubRole> {
+	let mut ids: Vec<Str> = omp_catalog::BUILTIN_ROLE_IDS
+		.iter()
+		.map(|id| Str::new_static(id))
+		.collect();
+	let known = |ids: &[Str], id: &Str| ids.iter().any(|candidate| candidate == id);
+	let mut customs: Vec<Str> = settings
+		.cycle_order
+		.iter()
+		.chain(settings.roles.keys())
+		.chain(settings.tags.keys())
+		.filter(|id| !known(&ids, id))
+		.cloned()
+		.collect();
+	customs.sort();
+	customs.dedup();
+	ids.extend(customs);
+	ids.retain(|id| !settings.role_tag(id).is_some_and(|tag| tag.hidden));
+	ids.into_iter()
+		.map(|id| {
+			let tag = settings.role_tag(&id);
+			let resolved = resolve_role_selector(catalog, settings, &format!("@{id}")).ok();
+			HubRole {
+				name: tag
+					.map(|tag| tag.name.clone())
+					.filter(|name| !name.is_empty())
+					.unwrap_or_else(|| id.clone()),
+				color: tag
+					.and_then(|tag| tag.color.clone())
+					.or_else(|| builtin_role_color(&id).map(Str::new_static)),
+				selector: settings.role_selector(&id).cloned(),
+				resolved: resolved
+					.as_ref()
+					.map(|selected| Str::from(selected.model.as_str())),
+				thinking: resolved.and_then(|selected| selected.thinking),
+				id,
+			}
+		})
+		.collect()
+}
+
+/// Providers with admitted catalog models but no usable credentials.
+fn locked_provider_rows(
+	catalog: &Catalog,
+	settings: &ModelSettings,
+	auth: Option<&omp_inference::auth::AuthControlHandle>,
+	selectable: &[ModelRow],
+) -> Vec<LockedProviderRow> {
+	let Some(auth) = auth else {
+		return Vec::new();
+	};
+	let credentialed = credentialed_providers(catalog, auth);
+	let selectable: FastHashSet<&str> = selectable
+		.iter()
+		.map(|row| row.provider_id.as_str())
+		.collect();
+	let mut rows: Vec<LockedProviderRow> = catalog
+		.providers()
+		.iter()
+		.filter(|provider| {
+			!credentialed.contains(&provider.id) && !selectable.contains(provider.id.as_str())
+		})
+		.filter_map(|provider| {
+			let models = catalog
+				.models()
+				.iter()
+				.filter(|model| {
+					model.routes.iter().any(|route| {
+						catalog
+							.route(route)
+							.is_some_and(|route| route.provider == provider.id)
+					}) && model_selector_allowed(catalog, settings, model.key.as_str())
+				})
+				.count();
+			(models > 0).then(|| LockedProviderRow {
+				id: Str::from(provider.id.as_str()),
+				name: provider.name.clone(),
+				models,
+				oauth: provider_uses_oauth(catalog, provider),
+				env_vars: provider
+					.auth
+					.iter()
+					.filter_map(|auth_id| catalog.auth_spec(auth_id))
+					.flat_map(|spec| &spec.credential_sources)
+					.filter_map(|source| match source {
+						CredentialSourceSpec::Environment { ordered_names } => Some(ordered_names),
+						_ => None,
+					})
+					.flatten()
+					.cloned()
+					.collect(),
+			})
+		})
+		.collect();
+	rows.sort_by(|left, right| left.id.cmp(&right.id));
+	rows
+}
+
+/// The persisted retry fallback chains, empty when unreadable.
+fn retry_chains(settings_manager: &SettingsManager) -> omp_catalog::settings::FallbackChains {
+	settings_manager
+		.snapshot()
+		.project::<omp_inference::settings::RetrySettings>()
+		.map(|projection| projection.get().fallback_chains.clone())
+		.unwrap_or_default()
+}
+
+fn hub_mutation_scope(scope: Option<HubScope>, storage: ModelRoleStorage) -> MutationScope {
+	match scope {
+		Some(HubScope::Global) => MutationScope::Global,
+		Some(HubScope::Project) => MutationScope::Project,
+		None => model_role_scope(storage),
+	}
+}
+
+/// Persists one models-hub mutation through the settings authority.
+fn apply_model_hub_intent(
+	settings_manager: &SettingsManager,
+	storage: ModelRoleStorage,
+	intent: ModelHubIntent,
+) -> miette::Result<()> {
+	match intent {
+		ModelHubIntent::AssignRole { role, selector, thinking, scope } => {
+			let selector =
+				role_assignment_selector(selector.as_str(), thinking.as_deref()).into_diagnostic()?;
+			let raw = toml::Value::String(selector.to_string()).to_string();
+			settings_manager
+				.set_sync(hub_mutation_scope(scope, storage), &format!("model.roles.{role}"), &raw)
+				.into_diagnostic()?;
+		},
+		ModelHubIntent::UnassignRole { role, scope } => {
+			settings_manager
+				.unset_sync(hub_mutation_scope(scope, storage), &format!("model.roles.{role}"))
+				.into_diagnostic()?;
+		},
+		ModelHubIntent::SetFallbackChain { key, chain } => {
+			let mut chains = retry_chains(settings_manager);
+			if chain.is_empty() {
+				chains.remove(&key);
+			} else {
+				chains.insert(key, chain);
+			}
+			if chains.is_empty() {
+				settings_manager
+					.unset_sync(MutationScope::Global, "retry.fallback_chains")
+					.into_diagnostic()?;
+			} else {
+				let table = chains
+					.into_iter()
+					.map(|(key, chain)| {
+						(
+							key.to_string(),
+							toml::Value::Array(
+								chain
+									.into_iter()
+									.map(|selector| toml::Value::String(selector.to_string()))
+									.collect(),
+							),
+						)
+					})
+					.collect::<toml::Table>();
+				settings_manager
+					.set_sync(
+						MutationScope::Global,
+						"retry.fallback_chains",
+						&toml::Value::Table(table).to_string(),
+					)
+					.into_diagnostic()?;
+			}
+		},
+		ModelHubIntent::SetCycleOrder { order } => {
+			let array = toml::Value::Array(
+				order
+					.into_iter()
+					.map(|role| toml::Value::String(role.to_string()))
+					.collect(),
+			);
+			settings_manager
+				.set_sync(MutationScope::Global, "model.cycle_order", &array.to_string())
+				.into_diagnostic()?;
+		},
+	}
+	Ok(())
+}
+
+/// Re-projects [`ModelSettings`] from the live snapshot after a hub mutation.
+fn refresh_model_settings(settings_manager: &SettingsManager, state: &mut BridgeState) {
+	let workspace = PathBuf::from(state.workspace_root.as_str());
+	let home = env::var_os("HOME").map_or_else(|| workspace.clone(), PathBuf::from);
+	if let Ok(projection) = settings_manager.snapshot().project::<ModelSettings>() {
+		state.model_settings = projection.get().resolve_path_scopes(&workspace, &home);
+	}
 }
 
 async fn switch_model<C>(
@@ -11292,6 +11765,7 @@ fn send_status(
 		backend,
 		BackendEvent::Status(StatusFacts {
 			model: status_model_label(state.catalog.as_ref(), state.model.as_str()),
+			session_id: Some(state.session_id.clone()),
 			model_subscription: model_uses_subscription(state.catalog.as_ref(), &state.model),
 			advisor_subscription: advisor_model
 				.as_ref()
@@ -11322,7 +11796,7 @@ fn send_status(
 			jobs: state.jobs.len(),
 			attempt: state.attempt,
 			dropped,
-			git: None,
+			git: state.git_facts.clone(),
 			live_activity: state.audio.live_active().then_some(state.live_activity),
 			tokens_per_second: state.tokens_per_second,
 			cwd: Some(state.workspace_root.clone()),
@@ -11933,6 +12407,7 @@ mod tests {
 			model_settings: ModelSettings::default(),
 			pending_session_delete: None,
 			git: None,
+			git_facts: None,
 			advisor: None,
 			title: SessionTitleState::default(),
 			title_generation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -12169,8 +12644,9 @@ mod tests {
 		let viewport = Size::new(80, 30);
 		let _ = chat.render(viewport);
 		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
-			text:  sf!("say banana"),
-			chips: Vec::new(),
+			text:   sf!("say banana"),
+			chips:  Vec::new(),
+			queued: false,
 		});
 		for event in rx.drain() {
 			let _ = chat.apply_backend_event(event);
@@ -12193,6 +12669,40 @@ mod tests {
 		assert!(transcript.contains("say banana"), "{transcript}");
 		assert!(transcript.contains("banana"), "{transcript}");
 		assert!(transcript.contains("Compaction failed: unauthorized"), "{transcript}");
+	}
+
+	#[test]
+	fn rewind_attachments_recover_pastes_and_supported_images_only() {
+		let parts = vec![
+			Part { kind: Some(part::Kind::Text("<attachment>two\nlines</attachment>".to_owned())) },
+			Part {
+				kind: Some(part::Kind::Blob(Blob {
+					mime: "image/png".to_owned(),
+					inline: Bytes::from_static(b"png-bytes"),
+					hash: Bytes::from_static(b"stable-hash-for-test"),
+					..Blob::default()
+				})),
+			},
+			Part {
+				kind: Some(part::Kind::Blob(Blob {
+					mime: "application/pdf".to_owned(),
+					inline: Bytes::from_static(b"pdf-bytes"),
+					..Blob::default()
+				})),
+			},
+		];
+		let attachments = rewind_attachments(&parts);
+		assert_eq!(attachments.len(), 2, "unsupported blob mimes are skipped");
+		let RestoredAttachment::Text(text) = &attachments[0] else {
+			panic!("first restored attachment is the paste");
+		};
+		assert_eq!(text.as_str(), "two\nlines");
+		let RestoredAttachment::Image { source } = &attachments[1] else {
+			panic!("second restored attachment is the image");
+		};
+		assert!(source.ends_with(".png"), "{source}");
+		assert!(Path::new(source.as_str()).is_file(), "blob persisted to {source}");
+		let _ = fs::remove_file(source.as_str());
 	}
 
 	#[tokio::test]
@@ -12681,6 +13191,56 @@ mod tests {
 		})));
 		let (_, terminal, _) = render_tool_result_view(&renderers, &skipped, None);
 		assert_eq!(terminal, ToolTerminal::Skipped);
+
+		let system = Item {
+			kind: Some(item::Kind::Message(omp_proto::thread::v1::Message {
+				role:  omp_proto::thread::v1::Role::System as i32,
+				parts: vec![omp_proto::thread::v1::Part {
+					kind: Some(part::Kind::Text("private durable prompt".to_owned())),
+				}],
+			})),
+			..Default::default()
+		};
+		let call = Item {
+			kind: Some(item::Kind::ToolCall(omp_proto::thread::v1::ToolCall {
+				id: "interrupted".to_owned(),
+				name: "same".to_owned(),
+				args_json: Bytes::from_static(b"{}"),
+				..Default::default()
+			})),
+			props: Some(revision_props("test.1")),
+			..Default::default()
+		};
+		let mut interrupted = result_item("interrupted", Some("test.1"), "aborted");
+		let Some(item::Kind::ToolResult(result)) = interrupted.kind.as_mut() else {
+			panic!("tool result fixture");
+		};
+		result.details = Some(json_proto(serde_json::json!({
+			"kind": "aborted",
+			"value": { "kind": "interrupted", "reason": "user interrupt" }
+		})));
+		let replayed_events = replay_backend_events(&[system, call, interrupted], &renderers);
+		assert!(
+			!replayed_events
+				.iter()
+				.any(|event| matches!(event, BackendEvent::Notice(_))),
+			"same-process replay exposed durable system prompt context"
+		);
+		let replayed = replayed_events
+			.into_iter()
+			.find_map(|event| match event {
+				BackendEvent::ToolFinished { view, .. } => Some(view),
+				_ => None,
+			})
+			.expect("replayed interrupted result");
+		assert!(matches!(&replayed, ToolViewContent::Markup(_)));
+		assert!(
+			replayed
+				.as_str()
+				.contains("&quot;kind&quot;:&quot;interrupted&quot;"),
+			"replayed exact renderer erased durable interruption metadata: {}",
+			replayed.as_str()
+		);
 
 		let unknown = result_item("unknown", Some("unknown.9"), "faulted");
 		let (identity, terminal, view) = render_tool_result_view(&renderers, &unknown, None);

@@ -163,6 +163,27 @@ where
 				request.context.checkpoint(ErrorPhase::Readiness)?;
 				let jitter = full_jitter_delay(backoff, retry_index, random_u64());
 				let delay = retry_after.max(jitter);
+				let retry_attempt = retry_index.saturating_add(1);
+				let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+				if error.code.as_deref()
+					== Some(crate::codec::openai_chat::TEMPLATE_EFFORT_REJECTED_CODE)
+				{
+					tracing::warn!(
+						retry_attempt,
+						delay_ms,
+						error_kind = ?error.kind,
+						option = "reasoning_effort_template_kwargs",
+						"provider rejected an option encoding; retrying without unsupported option"
+					);
+				} else {
+					tracing::warn!(
+						retry_attempt,
+						delay_ms,
+						error_kind = ?error.kind,
+						error_phase = ?error.phase,
+						"provider request failed; retrying same route"
+					);
+				}
 				if !delay.is_zero() {
 					wait_retry_delay(request.context.clone(), delay).await?;
 				}

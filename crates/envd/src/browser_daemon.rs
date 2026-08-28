@@ -44,6 +44,12 @@ impl BrowserDaemon {
 
 #[async_trait]
 impl BrowserHost for BrowserDaemon {
+	#[tracing::instrument(
+		name = "browser_request",
+		level = "debug",
+		skip_all,
+		fields(action = ?params.action, tab = ?params.name),
+	)]
 	async fn execute(&self, params: Params) -> Result<Payload, Fault> {
 		let (reply, response) = flume::bounded(1);
 		self
@@ -66,6 +72,7 @@ impl BrowserHost for BrowserDaemon {
 }
 
 fn run(receiver: Receiver<Request>, blobs: BlobHost, mut headless: bool) {
+	tracing::info!(headless, "browser daemon started");
 	let mut tabs = HashMap::<Str, WebView>::new();
 	while let Ok(request) = receiver.recv() {
 		match request {
@@ -74,12 +81,20 @@ fn run(receiver: Receiver<Request>, blobs: BlobHost, mut headless: bool) {
 				let _ = reply.send(result);
 			},
 			Request::Restart { headless: next, reply } => {
+				let tabs_closed = tabs.len();
 				tabs.clear();
+				tracing::info!(
+					previous_headless = headless,
+					headless = next,
+					tabs_closed,
+					"browser daemon restarted for mode change",
+				);
 				headless = next;
 				let _ = reply.send(Ok(()));
 			},
 		}
 	}
+	tracing::info!(tabs_closed = tabs.len(), "browser daemon stopped");
 }
 
 fn execute(

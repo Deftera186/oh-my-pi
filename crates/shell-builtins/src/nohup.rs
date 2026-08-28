@@ -83,6 +83,7 @@ impl builtins::Command for NohupCommand {
 			}
 			// coreutils `nohup` with no operand fails with exit code 125.
 			if command.is_empty() {
+				tracing::warn!(builtin = "nohup", "builtin operand missing");
 				return Ok(report_missing_operand(context.stderr()));
 			}
 

@@ -18,9 +18,9 @@ use omp_tui::{
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
 		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
-		ContextGauge, ContextGaugeMode, EditorPane, GaugeCell, Img, KeywordAccent, Markdown, Segment,
-		Status, TextLeaf, ToolCard, ToolState, advisor_spend_label, boundary_layout,
-		collapse_hud_line, compaction_boundary_color, compaction_threshold_color,
+		ContextGauge, ContextGaugeMode, EditorPane, GaugeCell, Img, InlineAccent, KeywordAccent,
+		Markdown, Segment, Status, TextLeaf, ToolCard, ToolState, advisor_spend_label,
+		boundary_layout, collapse_hud_line, compaction_boundary_color, compaction_threshold_color,
 		hr::truncate_to_width, spend_label, write_compact_count,
 	},
 	next_slot, parse_with_origin,
@@ -645,8 +645,13 @@ impl AssistantEntry {
 }
 
 struct UserEntry {
-	body:  RichText,
-	chips: Vec<Str>,
+	body:   RichText,
+	chips:  Vec<Str>,
+	/// Waiting in the agent queue: rendered dim and kept unretired until the
+	/// queue settles or the host restores it to the composer.
+	queued: bool,
+	/// Pre-rendered dequeue hint shown beside the newest queued row.
+	hint:   Option<Str>,
 }
 
 /// One persisted tool-result image with its probed pixel dimensions.
@@ -1109,6 +1114,7 @@ struct ThinkingEntry {
 
 enum Entry {
 	User(UserEntry),
+	Welcome(WelcomeEntry),
 	Assistant(AssistantEntry),
 	Thinking(ThinkingEntry),
 	Peer { title: Str, detail: Option<Str> },
@@ -1142,7 +1148,7 @@ fn restyle_entry(entry: &mut Entry, ctx: &UiContext) {
 		Entry::Retained(frame) => {
 			let _ = frame.view.rendered.set_context(ctx.clone());
 		},
-		Entry::Compaction(_) | Entry::Notice { .. } => {},
+		Entry::Welcome(_) | Entry::Compaction(_) | Entry::Notice { .. } => {},
 	}
 }
 
@@ -1164,21 +1170,25 @@ fn activity_waveform_label(waveform: &ActivityWaveform, charset: Charset) -> Str
 }
 
 struct StatusLabels {
-	model:     Str,
-	activity:  Option<Str>,
-	git:       Option<Str>,
-	context:   Option<(Str, bool)>,
-	velocity:  Option<Str>,
-	cwd:       Option<Str>,
-	resources: SmallVec<Str, 5>,
-	hooks:     Option<Str>,
-	tasks:     Option<Str>,
-	collab:    Option<Str>,
-	account:   Option<Str>,
-	queued:    Option<Str>,
-	jobs:      Option<Str>,
-	attempt:   Option<Str>,
-	dropped:   Option<Str>,
+	model:        Str,
+	session:      Option<Str>,
+	turn_context: Option<Str>,
+	turn_cost:    Option<Str>,
+	turn_state:   Str,
+	activity:     Option<Str>,
+	git:          Option<Str>,
+	context:      Option<(Str, bool)>,
+	velocity:     Option<Str>,
+	folder:       Option<Str>,
+	resources:    SmallVec<Str, 5>,
+	hooks:        Option<Str>,
+	tasks:        Option<Str>,
+	collab:       Option<Str>,
+	account:      Option<Str>,
+	queued:       Option<Str>,
+	jobs:         Option<Str>,
+	attempt:      Option<Str>,
+	dropped:      Option<Str>,
 }
 
 impl StatusLabels {
@@ -1202,6 +1212,9 @@ impl StatusLabels {
 			if git.staged > 0 {
 				let _ = write!(label, " +{}", git.staged);
 			}
+			if git.untracked > 0 {
+				let _ = write!(label, " ?{}", git.untracked);
+			}
 			label.freeze()
 		});
 		let context = (facts.context_tokens > 0 || facts.context_window.is_some()).then(|| {
@@ -1214,16 +1227,39 @@ impl StatusLabels {
 		});
 		let mut labels = Self {
 			model: model.freeze(),
+			session: facts.session_id.as_ref().map(|session_id| {
+				let suffix = session_id
+					.get(session_id.len().saturating_sub(6)..)
+					.unwrap_or(session_id.as_str());
+				fmts_mut!("session {suffix}").freeze()
+			}),
+			turn_context: (facts.context_tokens > 0).then(|| sf!("context  {}", facts.context_tokens)),
+			turn_cost: (facts.cost_nanos > 0).then(|| {
+				let total_cents = facts.cost_nanos.saturating_add(5_000_000) / 10_000_000;
+				let dollars = total_cents / 100;
+				let cents = total_cents % 100;
+				sf!("cost     ${dollars}.{cents:02}")
+			}),
+			turn_state: if facts.working {
+				sf!("state    working")
+			} else {
+				sf!("state    idle")
+			},
 			activity,
 			git,
 			context,
 			velocity: facts
 				.tokens_per_second
 				.map(|rate| fmts_mut!("{rate} tok/s").freeze()),
-			cwd: facts
-				.cwd
-				.as_ref()
-				.map(|cwd| fmts_mut!("cwd {cwd}").freeze()),
+			folder: facts.cwd.as_ref().map(|cwd| {
+				let name = cwd
+					.trim_end_matches('/')
+					.rsplit('/')
+					.next()
+					.filter(|name| !name.is_empty())
+					.unwrap_or(cwd.as_str());
+				fmts_mut!("{} {name}", charset.icon(Icon::Folder)).freeze()
+			}),
 			resources: facts
 				.visible_resources
 				.iter()
@@ -1258,9 +1294,7 @@ impl StatusLabels {
 		}
 		for label in [
 			&mut self.activity,
-			&mut self.git,
 			&mut self.velocity,
-			&mut self.cwd,
 			&mut self.hooks,
 			&mut self.tasks,
 			&mut self.collab,
@@ -1316,6 +1350,8 @@ fn separated(text: &str, separator: StatusSeparator, charset: Charset) -> Str {
 struct WorkState {
 	facts:         StatusFacts,
 	labels:        StatusLabels,
+	/// Session title shown at the right end of the status row.
+	title:         Str,
 	elapsed_label: Option<(u64, Str)>,
 	active_brand:  StrMut,
 	indicator:     Option<WorkingIndicator>,
@@ -1378,7 +1414,7 @@ impl ChatStatus {
 		let mut props = Props::new();
 		props.set(Prop::Id, STATUS_ID);
 		props.set(Prop::NoSelect, true);
-		let idle_brand = fmts_mut!("{} omp", charset.icon(Icon::Omp)).freeze();
+		let idle_brand = fmts_mut!("{} omp idle", charset.icon(Icon::Omp)).freeze();
 		Self { props, slot: next_slot(), work, idle_brand, charset, theme, style }
 	}
 
@@ -1410,12 +1446,92 @@ impl ChatStatus {
 
 	fn left_group(&self, now: Duration) -> Status {
 		let work = self.work.borrow();
+		let facts = &work.facts;
+		let minimal = facts.layout == StatusLayout::Minimal;
+		let compact = facts.layout == StatusLayout::Compact;
 		let model = work.labels.model.clone();
+		let session = work.labels.session.clone();
+		let turn_context = if compact {
+			work.labels.turn_context.clone()
+		} else {
+			None
+		};
+		let turn_cost = if compact {
+			work.labels.turn_cost.clone()
+		} else {
+			None
+		};
+		let turn_state = compact.then(|| work.labels.turn_state.clone());
+		let folder = work.labels.folder.clone();
+		let git = work.labels.git.clone();
+		let spend = if compact {
+			Str::default()
+		} else {
+			spend_label(facts.cost_nanos, facts.model_subscription, self.charset)
+		};
+		let advisor_spend =
+			advisor_spend_label(facts.advisor_cost_nanos, facts.advisor_subscription, self.charset);
 		drop(work);
-		self
+		let mut status = self
 			.group()
 			.segment(self.brand_segment(now))
-			.segment(Segment::new().label(model).with(Prop::Fg, self.theme.ok))
+			.segment(Segment::new().label(model).with(Prop::Fg, self.theme.ok));
+		if minimal {
+			return status;
+		}
+		if let Some(session) = session {
+			status = status.segment(
+				Segment::new()
+					.label(session.clone())
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if let Some(folder) = folder {
+			status = status.segment(
+				Segment::new()
+					.label(folder)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if let Some(git) = git {
+			status = status.segment(Segment::new().label(git).with(Prop::Fg, self.theme.info));
+		}
+		if !spend.is_empty() {
+			status = status.segment(
+				Segment::new()
+					.label(spend)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if let Some(context) = turn_context {
+			status = status.segment(
+				Segment::new()
+					.label(context)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if let Some(cost) = turn_cost {
+			status = status.segment(
+				Segment::new()
+					.label(cost)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if let Some(turn_state) = turn_state {
+			status = status.segment(
+				Segment::new()
+					.label(turn_state)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		if !advisor_spend.is_empty() {
+			status = status.segment(
+				Segment::new()
+					.label(advisor_spend)
+					.with(Prop::Fg, self.theme.secondary),
+			);
+		}
+		status
 	}
 
 	fn right_group(&self, context_gauge: ContextGaugeMode, now: Duration) -> Status {
@@ -1437,24 +1553,6 @@ impl ChatStatus {
 					Segment::new()
 						.label(activity.clone())
 						.with(Prop::Fg, self.theme.accent),
-				);
-			}
-		}
-		if matches!(facts.layout, StatusLayout::Full | StatusLayout::Developer)
-			&& let Some(cwd) = &work.labels.cwd
-		{
-			status = status.segment(
-				Segment::new()
-					.label(cwd.clone())
-					.with(Prop::Fg, self.theme.secondary),
-			);
-		}
-		if let Some(git) = &work.labels.git {
-			if facts.layout != StatusLayout::Minimal {
-				status = status.segment(
-					Segment::new()
-						.label(git.clone())
-						.with(Prop::Fg, self.theme.info),
 				);
 			}
 		}
@@ -1518,23 +1616,6 @@ impl ChatStatus {
 			);
 		}
 		if facts.layout != StatusLayout::Minimal {
-			let spend = spend_label(facts.cost_nanos, facts.model_subscription, self.charset);
-			if !spend.is_empty() {
-				status = status.segment(
-					Segment::new()
-						.label(spend)
-						.with(Prop::Fg, self.theme.secondary),
-				);
-			}
-			let advisor_spend =
-				advisor_spend_label(facts.advisor_cost_nanos, facts.advisor_subscription, self.charset);
-			if !advisor_spend.is_empty() {
-				status = status.segment(
-					Segment::new()
-						.label(advisor_spend)
-						.with(Prop::Fg, self.theme.secondary),
-				);
-			}
 			if let Some(queued) = &work.labels.queued {
 				status = status.segment(
 					Segment::new()
@@ -1564,28 +1645,31 @@ impl ChatStatus {
 				);
 			}
 		}
+		if facts.layout != StatusLayout::Minimal && !work.title.is_empty() {
+			status = status.segment(
+				Segment::new()
+					.label(work.title.clone())
+					.with(Prop::Fg, self.theme.accent),
+			);
+		}
 		status
 	}
 
 	fn has_more(&self) -> bool {
-		let facts = &self.work.borrow().facts;
+		let work = self.work.borrow();
+		let facts = &work.facts;
 		if facts.layout == StatusLayout::Minimal {
 			return facts.context_tokens > 0 || facts.context_window.is_some();
 		}
 		facts.live_activity.is_some()
-			|| facts.git.is_some()
 			|| facts.tokens_per_second.is_some()
-			|| facts.cwd.is_some()
 			|| !facts.visible_resources.is_empty()
 			|| facts.hooks > 0
 			|| facts.tasks > 0
 			|| facts.collab_peers > 0
 			|| facts.account_override.is_some()
 			|| facts.context_tokens > 0
-			|| facts.cost_nanos > 0
-			|| facts.model_subscription
-			|| facts.advisor_cost_nanos > 0
-			|| facts.advisor_subscription
+			|| !work.title.is_empty()
 	}
 
 	fn paint_left(&self, pc: &mut PaintCtx<'_>, rect: Rect) {
@@ -1719,7 +1803,7 @@ impl Component for ChatStatus {
 						rect.width,
 						1,
 					),
-					ContextGaugeMode::Numeric,
+					layout.context_gauge,
 				);
 			},
 		}
@@ -1784,6 +1868,14 @@ struct ChromeLayout {
 	h_live:        u16,
 }
 
+/// Platform-default dequeue chord, mirroring the app's keybinding fallback;
+/// hosts with a resolved binding override it via [`Chat::set_dequeue_hint`].
+const DEQUEUE_HINT_DEFAULT: &str = if cfg!(target_os = "macos") {
+	"shift+up"
+} else {
+	"ctrl+up"
+};
+
 /// Immediate-mode designed chat scene driven entirely by host data.
 pub struct Chat {
 	started_at:              Instant,
@@ -1794,7 +1886,6 @@ pub struct Chat {
 	pending_submit:          VecDeque<(String, Vec<Attachment>, SubmitMode)>,
 	copied:                  Option<Str>,
 	work:                    Rc<RefCell<WorkState>>,
-	session_title:           Str,
 	blocks:                  Blocks,
 	replay:                  Option<Replay>,
 	/// Finalized semantic snapshots by ordinal. Snapshots at or past the
@@ -1833,6 +1924,8 @@ pub struct Chat {
 	smooth_streaming:        bool,
 	suppress_history_replay: bool,
 	hide_thinking:           bool,
+	/// Dequeue chord rendered in pending queued-row hints.
+	dequeue_hint:            Str,
 	hidden_thinking_label:   Option<Str>,
 	tools_expanded:          bool,
 }
@@ -1845,6 +1938,7 @@ impl Chat {
 		let work = Rc::new(RefCell::new(WorkState {
 			facts,
 			labels,
+			title: Str::default(),
 			elapsed_label: None,
 			active_brand: StrMut::new(""),
 			indicator: None,
@@ -1852,13 +1946,24 @@ impl Chat {
 		}));
 		let style = ComposerStyle::default();
 		let slash_commands = ReloadableSlashCommands::new(Vec::new(), |_| 0);
-		let pane = EditorPane::new()
+		let mut pane = EditorPane::new()
 			.composer_style(style)
 			.completion(Box::new(slash_commands.clone()))
 			.with(Prop::Id, INPUT_ID)
 			.with(Prop::Submit, true)
 			.status(ChatStatus::new(Rc::clone(&work), ctx.charset, ctx.theme, style));
 		let attachments = pane.attachments();
+		pane.set_inline_decorator(Some(Box::new(|text| {
+			crate::queue::decoration_spans(text)
+				.into_iter()
+				.map(|(start, end, span)| {
+					(start, end, match span {
+						crate::queue::QueueSpan::Prefix => InlineAccent::Dim,
+						crate::queue::QueueSpan::Marker => InlineAccent::Accent,
+					})
+				})
+				.collect()
+		})));
 		let mut editor_ui = Ui::from_root(pane, 0, ctx.clone());
 		editor_ui.focus_first();
 		Self {
@@ -1870,7 +1975,6 @@ impl Chat {
 			pending_submit: VecDeque::new(),
 			copied: None,
 			work,
-			session_title: Str::default(),
 			blocks: Blocks::new(),
 			replay: None,
 			entries: BTreeMap::new(),
@@ -1907,6 +2011,7 @@ impl Chat {
 			hide_thinking: false,
 			hidden_thinking_label: None,
 			tools_expanded: true,
+			dequeue_hint: Str::new_static(DEQUEUE_HINT_DEFAULT),
 		}
 	}
 
@@ -2280,7 +2385,88 @@ impl Chat {
 		self.enqueue_final(Entry::User(UserEntry {
 			body: RichText::user(text, self.layout_width.max(1), &self.ctx),
 			chips,
+			queued: false,
+			hint: None,
 		}));
+	}
+
+	/// Appends a pending queued user message: dim, hinted, and kept live
+	/// (unretired) until [`Chat::settle_queued`] or a dequeue restore.
+	pub fn push_user_queued(&mut self, text: impl Into<String>, chips: Vec<Str>) {
+		let text = mask_keywords(text.into(), &self.keyword_accent);
+		for entry in self.entries.values_mut() {
+			if let Entry::User(user) = entry {
+				user.hint = None;
+			}
+		}
+		let ordinal = self.blocks.create();
+		self.entries.insert(
+			ordinal,
+			Entry::User(UserEntry {
+				body: RichText::user(text, self.layout_width.max(1), &self.ctx),
+				chips,
+				queued: true,
+				hint: Some(fmts_mut!(" · {} to edit", self.dequeue_hint).freeze()),
+			}),
+		);
+		self.bump_live();
+	}
+
+	/// Finalizes queued user rows once the agent consumed or dropped the
+	/// queue, restyling them as settled transcript messages.
+	pub fn settle_queued(&mut self) {
+		let mut settled = SmallVec::<BlockOrdinal, 4>::new();
+		for (ordinal, entry) in &mut self.entries {
+			if let Entry::User(user) = entry
+				&& user.queued
+			{
+				user.queued = false;
+				user.hint = None;
+				settled.push(*ordinal);
+			}
+		}
+		if settled.is_empty() {
+			return;
+		}
+		for ordinal in settled {
+			self.blocks.finalize(ordinal);
+		}
+		self.bump_live();
+	}
+
+	/// Overrides the dequeue chord rendered beside pending queued rows.
+	pub fn set_dequeue_hint(&mut self, chord: impl IntoStr) {
+		self.dequeue_hint = chord.into_str();
+	}
+
+	/// Stages attachments recovered from durable history into the composer
+	/// band, re-probing image sources and re-collapsing pastes.
+	pub fn stage_attachments(&mut self, attachments: Vec<crate::RestoredAttachment>) {
+		if attachments.is_empty() {
+			return;
+		}
+		for attachment in attachments {
+			match attachment {
+				crate::RestoredAttachment::Image { source } => {
+					self.attachments.push_image(source);
+				},
+				crate::RestoredAttachment::Text(text) => {
+					self.attachments.push_text(text.as_str());
+				},
+			}
+		}
+		self.refresh_composer();
+	}
+
+	/// Appends the welcome banner card as a finalized transcript block.
+	pub fn push_welcome(&mut self, banner: crate::WelcomeBanner) {
+		let intro_until = if self.reduced_motion {
+			Duration::ZERO
+		} else {
+			self.started_at.elapsed().saturating_add(WELCOME_INTRO)
+		};
+		self.enqueue_final(Entry::Welcome(WelcomeEntry { banner, intro_until }));
+		self.bump_live();
 	}
 
 	/// Begins a live assistant prose message.
@@ -2874,9 +3060,12 @@ impl Chat {
 		}
 	}
 
-	/// Replaces the session title shown in the air row.
+	/// Replaces the session title shown at the right end of the status row.
 	pub fn set_session_title(&mut self, title: impl Into<Str>) {
-		self.session_title = hud_line(title.into(), self.ctx.charset);
+		self.work.borrow_mut().title = hud_line(title.into(), self.ctx.charset);
+		self
+			.editor_ui
+			.update_component::<EditorPane>(INPUT_ID, |_| true);
 		self.bump_live();
 	}
 
@@ -2917,15 +3106,17 @@ impl Chat {
 		let mut queued = String::new();
 		let mut attachments = Vec::new();
 		for prompt in prompts {
+			let masked = mask_keywords(prompt.text.to_string(), &self.keyword_accent);
 			if let Some(index) = self
 				.entries
 				.values()
-				.rposition(|entry| matches!(entry, Entry::User(user) if user.body.text == prompt.text))
+				.rposition(|entry| matches!(entry, Entry::User(user) if user.body.text == masked))
 			{
 				let ordinal = *self.entries.keys().nth(index).expect("entries index");
 				self
 					.entries
 					.insert(ordinal, Entry::Notice { text: Str::default(), error: false });
+				self.blocks.finalize(ordinal);
 			}
 			if !queued.is_empty() {
 				queued.push_str("\n\n");
@@ -3036,11 +3227,16 @@ impl Chat {
 	/// overlays.
 	pub fn apply_backend_event(&mut self, event: BackendEvent) -> Option<BackendEvent> {
 		match event {
-			BackendEvent::UserReplayed { text, chips } => {
+			BackendEvent::UserReplayed { text, chips, queued } => {
 				if !self.suppress_history_replay {
-					self.push_user(text.as_str(), chips);
+					if queued {
+						self.push_user_queued(text.as_str(), chips);
+					} else {
+						self.push_user(text.as_str(), chips);
+					}
 				}
 			},
+			BackendEvent::WelcomeBanner(banner) => self.push_welcome(banner),
 			BackendEvent::ThinkingReplayed { text } => {
 				if !self.suppress_history_replay {
 					self.push_thinking_replay(text.as_str());
@@ -3050,6 +3246,7 @@ impl Chat {
 				self.restore_dropped_prompt(text, attachments);
 			},
 			BackendEvent::QueuedPromptsRestored(prompts) => self.restore_queued_prompts(prompts),
+			BackendEvent::QueuedPromptsSettled => self.settle_queued(),
 			BackendEvent::AssistantBegin { id, thinking } => {
 				if thinking {
 					self.begin_thinking(id);
@@ -3128,9 +3325,10 @@ impl Chat {
 			},
 			BackendEvent::LiveVoiceStopped => self.stop_live_voice(),
 			BackendEvent::SessionTitle(title) => self.set_session_title(title),
-			BackendEvent::HistoryRewind { user_index, text } => {
+			BackendEvent::HistoryRewind { user_index, text, attachments } => {
 				self.suppress_history_replay = true;
 				let _ = self.rewind_user(user_index, text.as_str());
+				self.stage_attachments(attachments);
 			},
 			BackendEvent::HistoryReplayFinished => {
 				self.suppress_history_replay = false;
@@ -3159,6 +3357,8 @@ impl Chat {
 			| BackendEvent::PtyFinished { .. }
 			| BackendEvent::OpenModelPicker { .. }
 			| BackendEvent::ModelsUpdated { .. }
+			| BackendEvent::OpenModelHub(_)
+			| BackendEvent::ModelHubUpdated(_)
 			| BackendEvent::Sessions(_)
 			| BackendEvent::WelcomeLspServers(_)
 			| BackendEvent::LoginProviders(_)
@@ -3243,6 +3443,13 @@ impl Chat {
 			.filter(|deadline| elapsed < *deadline)
 			.map(|deadline| deadline.saturating_sub(elapsed))
 			.min();
+		let welcome_intro = self
+			.entries
+			.range(BlockOrdinal(self.blocks.frontier())..)
+			.any(
+				|(_, entry)| matches!(entry, Entry::Welcome(welcome) if elapsed < welcome.intro_until),
+			)
+			.then_some(anim::FRAME);
 		let celebration = self
 			.celebration_until
 			.filter(|deadline| elapsed < *deadline)
@@ -3258,7 +3465,7 @@ impl Chat {
 				.map(|deadline| deadline.saturating_sub(elapsed))
 		});
 		let voice = self.live_voice.is_some().then_some(LIVE_VOICE_FRAME);
-		[editor, download, retained, celebration, active, reveal, voice]
+		[editor, download, retained, welcome_intro, celebration, active, reveal, voice]
 			.into_iter()
 			.flatten()
 			.min()
@@ -3410,7 +3617,7 @@ impl Chat {
 				continue;
 			}
 			Self::resize_entry(entry, content_width, &self.ctx);
-			let height = Self::entry_height(entry, content_width);
+			let height = Self::entry_height(entry, content_width, self.ctx.charset);
 			if height > 0 {
 				settled.push((*ordinal, height));
 			}
@@ -3640,9 +3847,13 @@ impl Chat {
 			}
 		}
 		let visible = plan.overflow.as_ref().map(|overflow| &overflow.visible);
-		let mut y = 0_u16;
-		self.live_layout.clear();
-		for ((ordinal, desired, is_settled), alloc) in merged.iter().zip(&allocs) {
+		// One allocation pass, then a bottom-anchored draw pass: when the
+		// transcript does not fill the live area, blocks hug the composer (the
+		// newest content sits directly above the editor, matching pi) instead
+		// of stranding at the top of the viewport.
+		let mut final_allocs = SmallVec::<u16, 16>::new();
+		let mut total_rows = 0_u16;
+		for ((ordinal, _, is_settled), alloc) in merged.iter().zip(&allocs) {
 			let mut allocation = if *is_settled {
 				*alloc
 			} else if self
@@ -3668,7 +3879,40 @@ impl Chat {
 			{
 				allocation = 0;
 			}
-			allocation = allocation.min(h_live.saturating_sub(y));
+			allocation = allocation.min(h_live.saturating_sub(total_rows));
+			total_rows = total_rows.saturating_add(allocation);
+			final_allocs.push(allocation);
+		}
+		// The leading welcome banner pins to the top of the live area while the
+		// conversation hugs the composer; the blank band between them shrinks
+		// as messages accumulate and disappears once content fills the screen.
+		// Leading notices (e.g. the history-cleared divider) ride along in the
+		// top group, but only when a banner is actually present.
+		let leading = merged
+			.iter()
+			.take_while(|(ordinal, _, is_settled)| {
+				*is_settled
+					&& matches!(
+						self.entries.get(ordinal),
+						Some(Entry::Welcome(_) | Entry::Notice { .. })
+					)
+			})
+			.count();
+		let top_len = merged[..leading]
+			.iter()
+			.rposition(|(ordinal, ..)| matches!(self.entries.get(ordinal), Some(Entry::Welcome(_))))
+			.map_or(0, |last| last + 1);
+		let top_rows: u16 = final_allocs.iter().take(top_len).sum();
+		let bottom_rows = total_rows.saturating_sub(top_rows);
+		let mut y = 0_u16;
+		self.live_layout.clear();
+		for (index, ((ordinal, desired, is_settled), allocation)) in
+			merged.iter().zip(&final_allocs).enumerate()
+		{
+			let allocation = *allocation;
+			if index == top_len {
+				y = y.max(h_live.saturating_sub(bottom_rows));
+			}
 			if allocation == 0 {
 				continue;
 			}
@@ -3758,7 +4002,6 @@ impl Chat {
 				ink(self.ctx.theme.muted).dim().italic(),
 			)]);
 		}
-		self.draw_session_title_owned(title_y);
 		if self
 			.celebration_until
 			.is_some_and(|deadline| elapsed < deadline)
@@ -3885,7 +4128,7 @@ impl Chat {
 				},
 				Some(entry) => {
 					Self::resize_entry(entry, content_width, &self.ctx);
-					u32::from(Self::entry_height(entry, content_width))
+					u32::from(Self::entry_height(entry, content_width, self.ctx.charset))
 				},
 				None => 0,
 			};
@@ -3963,7 +4206,7 @@ impl Chat {
 				continue;
 			}
 			Self::resize_entry(entry, width, &self.ctx);
-			let height = Self::replay_entry_height(entry, width);
+			let height = Self::replay_entry_height(entry, width, self.ctx.charset);
 			if height == 0 {
 				continue;
 			}
@@ -3996,7 +4239,7 @@ impl Chat {
 					&& matches!(entry, Entry::Thinking(_)))
 			{
 				Self::resize_entry(entry, width, &self.ctx);
-				u32::from(Self::entry_height(entry, width))
+				u32::from(Self::entry_height(entry, width, self.ctx.charset))
 			} else {
 				0
 			};
@@ -4021,7 +4264,14 @@ impl Chat {
 			{
 				continue;
 			}
-			y = y.saturating_add(Self::draw_entry(&mut frame, entry, y, width, &self.ctx));
+			y = y.saturating_add(Self::draw_entry(
+				&mut frame,
+				entry,
+				y,
+				width,
+				&self.ctx,
+				Duration::MAX,
+			));
 		}
 		RetirementBatch { range, frame, replay_frames: None, kind }
 	}
@@ -4118,8 +4368,9 @@ impl Chat {
 		let Some(entry) = self.entries.get(&ordinal) else {
 			return;
 		};
+		let now = self.started_at.elapsed();
 		if height >= natural {
-			Self::draw_entry(&mut self.frame, entry, y, width, &self.ctx);
+			Self::draw_entry(&mut self.frame, entry, y, width, &self.ctx, now);
 			return;
 		}
 		let size = Size::new(width, natural);
@@ -4129,7 +4380,7 @@ impl Chat {
 		self
 			.clip_scratch
 			.fill(Rect::new(0, 0, width, natural), base_style(self.ctx.theme));
-		Self::draw_entry(&mut self.clip_scratch, entry, 0, width, &self.ctx);
+		Self::draw_entry(&mut self.clip_scratch, entry, 0, width, &self.ctx, now);
 		self.frame.blit(
 			&self.clip_scratch,
 			natural.saturating_sub(height.saturating_add(1)),
@@ -4189,15 +4440,17 @@ impl Chat {
 			Entry::Peer { .. } => {},
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
 			Entry::Retained(frame) => frame.view.resize(Self::tool_view_width(width), ctx),
-			Entry::Compaction(_) | Entry::Notice { .. } => {},
+			Entry::Welcome(_) | Entry::Compaction(_) | Entry::Notice { .. } => {},
 		}
 	}
 
-	fn entry_height(entry: &Entry, width: u16) -> u16 {
+	fn entry_height(entry: &Entry, width: u16, charset: Charset) -> u16 {
 		match entry {
 			Entry::User(user) => {
 				if user.body.text.trim().is_empty() && user.chips.is_empty() {
 					0
+				} else if user.queued {
+					queued_user_height(user)
 				} else {
 					user
 						.body
@@ -4206,6 +4459,7 @@ impl Chat {
 						.saturating_add(1)
 				}
 			},
+			Entry::Welcome(entry) => welcome_height(&entry.banner, width, charset).saturating_add(1),
 			Entry::Assistant(assistant) => {
 				if assistant.body.text.trim().is_empty() {
 					0
@@ -4242,7 +4496,7 @@ impl Chat {
 		}
 	}
 
-	fn replay_entry_height(entry: &Entry, width: u16) -> u16 {
+	fn replay_entry_height(entry: &Entry, width: u16, charset: Charset) -> u16 {
 		match entry {
 			Entry::Assistant(assistant) => {
 				if assistant.body.text.trim().is_empty() {
@@ -4251,7 +4505,7 @@ impl Chat {
 					assistant.body.height().saturating_add(1)
 				}
 			},
-			_ => Self::entry_height(entry, width),
+			_ => Self::entry_height(entry, width, charset),
 		}
 	}
 
@@ -4270,19 +4524,29 @@ impl Chat {
 					draw_rich(frame, y, &assistant.body, 0, width, ctx.theme).saturating_add(1)
 				}
 			},
-			_ => Self::draw_entry(frame, entry, y, width, ctx),
+			_ => Self::draw_entry(frame, entry, y, width, ctx, Duration::MAX),
 		}
 	}
 
-	fn draw_entry(frame: &mut Frame, entry: &Entry, y: u16, width: u16, ctx: &UiContext) -> u16 {
+	fn draw_entry(
+		frame: &mut Frame,
+		entry: &Entry,
+		y: u16,
+		width: u16,
+		ctx: &UiContext,
+		now: Duration,
+	) -> u16 {
 		match entry {
 			Entry::User(user) => {
 				if user.body.text.trim().is_empty() && user.chips.is_empty() {
 					0
+				} else if user.queued {
+					draw_user_queued(frame, y, user, ctx)
 				} else {
 					draw_user(frame, y, user, ctx)
 				}
 			},
+			Entry::Welcome(entry) => draw_welcome(frame, y, entry, width, ctx, now).saturating_add(1),
 			Entry::Assistant(assistant) => {
 				if assistant.body.text.trim().is_empty() {
 					0
@@ -4352,11 +4616,6 @@ impl Chat {
 			self.ctx.native_decor,
 			self.ctx.theme,
 		);
-	}
-
-	fn draw_session_title_owned(&mut self, y: u16) {
-		let right_inset = self.right_inset();
-		draw_session_title_impl(&mut self.frame, y, right_inset, &self.session_title, self.ctx.theme);
 	}
 }
 
@@ -4456,25 +4715,42 @@ fn draw_quota_celebration(
 	}
 }
 
-fn draw_session_title_impl(frame: &mut Frame, y: u16, right_inset: u16, title: &str, theme: Theme) {
-	if title.is_empty() || y >= frame.size().height {
-		return;
-	}
-	let width = frame.size().width.saturating_sub(right_inset);
-	let title = truncate_to_width(title, width.saturating_sub(2));
-	if title.width == 0 {
-		return;
-	}
-	let x = width.saturating_sub(title.width.saturating_add(1));
-	let style = ink(theme.border).italic();
-	draw_line(frame, x, y, title.width, &[
-		Span::new(title.text, style),
-		Span::new(if title.ellipsis { "…" } else { "" }, style),
-	]);
-}
-
 fn draw_user(frame: &mut Frame, y: u16, user: &UserEntry, ctx: &UiContext) -> u16 {
 	draw_user_body(frame, y, &user.body, &user.chips, ctx)
+}
+/// Rows used by one pending queued user message: hinted header, optional
+/// chip row, dim flowed body, trailing spacer.
+fn queued_user_height(user: &UserEntry) -> u16 {
+	flowed_height(&user.body.text, user.body.width.saturating_sub(2).max(1))
+		.saturating_add(u16::from(!user.chips.is_empty()))
+		.saturating_add(2)
+}
+
+/// Paints one pending queued user message: a dim `Queued` header with the
+/// dequeue hint, then the message body flowed dim under a 2-column indent.
+fn draw_user_queued(frame: &mut Frame, y: u16, user: &UserEntry, ctx: &UiContext) -> u16 {
+	let dim = ink(ctx.theme.muted).dim();
+	let mut at = y;
+	let mut x = frame.put(1, at, ctx.charset.icon(Icon::Selected), dim);
+	x = frame.put(x, at, " Queued", dim);
+	if let Some(hint) = &user.hint {
+		frame.put(x, at, hint, dim);
+	}
+	at = at.saturating_add(1);
+	if !user.chips.is_empty() {
+		let mut cx = frame.put(2, at, ctx.charset.icon(Icon::Image), dim);
+		for chip in &user.chips {
+			cx = frame.put(cx, at, " ", dim);
+			cx = frame.put(cx, at, chip, dim);
+		}
+		at = at.saturating_add(1);
+	}
+	let width = user.body.width.saturating_sub(2).max(1);
+	let used =
+		draw_flowed(frame, Rect::new(2, at, width, frame.size().height.saturating_sub(at)), &[
+			Span::new(&user.body.text, dim),
+		]);
+	at.saturating_sub(y).saturating_add(used).saturating_add(1)
 }
 
 fn draw_user_body(
@@ -4621,6 +4897,323 @@ fn mask_keywords(mut text: String, accent: &KeywordAccent) -> String {
 		text.replace_range(start..end, &"•".repeat(end - start));
 	}
 	text
+}
+/// Transcript welcome banner and its intro deadline on the scene timeline.
+struct WelcomeEntry {
+	banner:      crate::WelcomeBanner,
+	/// Scene instant the intro gradient sweep ends; `ZERO` = resting frame.
+	intro_until: Duration,
+}
+
+/// Banner box cap, matching pi's welcome card.
+const WELCOME_MAX_WIDTH: u16 = 100;
+/// Fixed logo-column width; dynamic labels truncate inside it.
+const WELCOME_LEFT_COL: u16 = 26;
+/// Narrow terminals use one generous column rather than two cramped ones.
+const WELCOME_MIN_TWO_COL_WIDTH: u16 = 72;
+/// Minimum width retained for the tips column.
+const WELCOME_MIN_RIGHT_COL: u16 = 20;
+/// Language-server rows shown before overflow is sliced.
+const WELCOME_LSP_SLOTS: usize = 4;
+/// Intro sweep length; afterwards the banner settles on the resting gradient.
+const WELCOME_INTRO: Duration = Duration::from_millis(3000);
+/// Full gradient rotations the intro sweeps through before settling.
+const WELCOME_SWEEPS: f32 = 2.5;
+/// Diagonal crossings of the shine highlight across the intro.
+const WELCOME_SHINE_TRAVERSALS: f32 = 3.0;
+/// Half-width of the shine band in gradient-t units.
+const WELCOME_SHINE_HALF_WIDTH: f32 = 0.18;
+/// Block-grid brand mark painted with the diagonal gradient.
+const WELCOME_LOGO: [&str; 5] =
+	["████████████", "   ██  ██   ", "   ██  ██   ", "   ▒▒  ██   ", "       ██   "];
+/// Brand gradient stops (pink → purple → cyan), shared with pi's welcome logo.
+const WELCOME_GRADIENT: [(f32, f32, f32); 3] =
+	[(248.0, 79.0, 204.0), (147.0, 98.0, 244.0), (0.0, 219.0, 228.0)];
+
+/// Resolves `(box_width, left_col, right_col)`; a zero right column collapses
+/// the card to the logo column only.
+fn welcome_columns(width: u16) -> (u16, u16, u16) {
+	let box_width = width.saturating_sub(2).min(WELCOME_MAX_WIDTH);
+	if box_width < 17 {
+		return (box_width, 0, 0);
+	}
+	let content = box_width - 3;
+	let left_min = 13; // "Welcome back!"
+	let desired = WELCOME_LEFT_COL
+		.min((content * 35 / 100).max(12))
+		.max(left_min);
+	if box_width >= WELCOME_MIN_TWO_COL_WIDTH && content > WELCOME_MIN_RIGHT_COL {
+		let left = desired.min(content - WELCOME_MIN_RIGHT_COL);
+		let right = content - left;
+		if left >= left_min && right >= WELCOME_MIN_RIGHT_COL {
+			return (box_width, left, right);
+		}
+	}
+	(box_width, box_width - 2, 0)
+}
+
+/// Left-column row count: blank framing, greeting, logo, model, provider.
+const fn welcome_left_rows(charset: Charset) -> u16 {
+	match charset {
+		Charset::Ascii => 5,
+		Charset::Unicode | Charset::NerdFont => 5 + WELCOME_LOGO.len() as u16 + 1,
+	}
+}
+
+/// Rows in the tips/LSP column.
+fn welcome_right_rows(banner: &crate::WelcomeBanner) -> u16 {
+	let lsp = banner.lsp_servers.len().clamp(1, WELCOME_LSP_SLOTS) as u16;
+	// Tips header + 4 shortcuts + rule + LSP header + rows + trailing blank.
+	8 + lsp
+}
+
+/// Full banner height, borders and tip line included.
+fn welcome_height(banner: &crate::WelcomeBanner, width: u16, charset: Charset) -> u16 {
+	let (box_width, left, right) = welcome_columns(width);
+	if box_width < 17 || left == 0 {
+		return 0;
+	}
+	let content = if right == 0 {
+		welcome_left_rows(charset)
+	} else {
+		welcome_left_rows(charset).max(welcome_right_rows(banner))
+	};
+	content
+		.saturating_add(2)
+		.saturating_add(u16::from(banner.tip.is_some()))
+}
+
+/// Gradient phase and shine band for a normalized intro progress in `[0, 1)`.
+///
+/// Ease-out cubic: the sweep decelerates into the resting frame (phase 0)
+/// while the shine crosses the diagonal at a steady pace and fades out.
+fn welcome_intro_frame(progress: f32) -> (f32, Option<(f32, f32)>) {
+	let eased = 1.0 - (1.0 - progress).powi(3);
+	let phase = ((1.0 - eased) * WELCOME_SWEEPS).fract();
+	let shine_pos = (progress * WELCOME_SHINE_TRAVERSALS).fract();
+	let strength = (1.0 - eased).powf(1.5);
+	(phase, Some((strength, shine_pos)))
+}
+
+/// Foreground for a normalized diagonal position `t`, compositing the sliding
+/// shine highlight toward white.
+fn welcome_gradient_color(t: f32, shine: Option<(f32, f32)>) -> Color {
+	let stops = WELCOME_GRADIENT;
+	let seg = (t * (stops.len() - 1) as f32).clamp(0.0, (stops.len() - 1) as f32);
+	let index = (seg as usize).min(stops.len() - 2);
+	let fraction = seg - index as f32;
+	let (ar, ag, ab) = stops[index];
+	let (br, bg, bb) = stops[index + 1];
+	let mut r = ar + (br - ar) * fraction;
+	let mut g = ag + (bg - ag) * fraction;
+	let mut b = ab + (bb - ab) * fraction;
+	if let Some((strength, pos)) = shine
+		&& strength > 0.0
+	{
+		let intensity = (1.0 - (t - pos).abs() / WELCOME_SHINE_HALF_WIDTH).max(0.0) * strength;
+		r += (255.0 - r) * intensity;
+		g += (255.0 - g) * intensity;
+		b += (255.0 - b) * intensity;
+	}
+	Color::Rgb(r.round() as u8, g.round() as u8, b.round() as u8)
+}
+
+/// Draws `text` centered inside `[x, x + width)`, truncating when oversized.
+fn put_centered(frame: &mut Frame, x: u16, y: u16, width: u16, text: &str, style: Style) {
+	let text_width = visible_width(text);
+	let pad = width.saturating_sub(text_width) / 2;
+	draw_line(frame, x.saturating_add(pad), y, width.saturating_sub(pad), &[Span::new(text, style)]);
+}
+
+/// Paints the gradient brand mark centered in the left column.
+fn draw_welcome_logo(
+	frame: &mut Frame,
+	x: u16,
+	y: u16,
+	left_col: u16,
+	phase: f32,
+	shine: Option<(f32, f32)>,
+) {
+	let cols = WELCOME_LOGO
+		.iter()
+		.map(|line| line.chars().count())
+		.max()
+		.unwrap_or(1);
+	let x_span = cols.saturating_sub(1).max(1) as f32;
+	let y_span = (WELCOME_LOGO.len() - 1).max(1) as f32;
+	let pad = left_col.saturating_sub(cols as u16) / 2;
+	let mut glyph = [0_u8; 4];
+	for (row, line) in WELCOME_LOGO.iter().enumerate() {
+		for (col, character) in line.chars().enumerate() {
+			if character == ' ' {
+				continue;
+			}
+			let base = (col as f32 / x_span + row as f32 / y_span) / 2.0;
+			let t = if phase == 0.0 {
+				base
+			} else {
+				(base + phase).fract()
+			};
+			frame.put(
+				x.saturating_add(pad).saturating_add(col as u16),
+				y.saturating_add(row as u16),
+				character.encode_utf8(&mut glyph),
+				ink(welcome_gradient_color(t, shine)),
+			);
+		}
+	}
+}
+
+/// Draws the welcome banner card: rounded dim border with an embedded title,
+/// the gradient logo column, the tips/LSP column, and the tip footer.
+/// Height always equals [`welcome_height`].
+fn draw_welcome(
+	frame: &mut Frame,
+	y: u16,
+	entry: &WelcomeEntry,
+	width: u16,
+	ctx: &UiContext,
+	now: Duration,
+) -> u16 {
+	let banner = &entry.banner;
+	let charset = ctx.charset;
+	let theme = ctx.theme;
+	let height = welcome_height(banner, width, charset);
+	if height == 0 {
+		return 0;
+	}
+	let (box_width, left_col, right_col) = welcome_columns(width);
+	let (tl, tr, bl, br, h, v) = charset.border(Border::Round);
+	let mut glyph = [0_u8; 4];
+	let dim = ink(theme.border);
+	let content_rows = height
+		.saturating_sub(2)
+		.saturating_sub(u16::from(banner.tip.is_some()));
+
+	// Top border with the embedded `omp v<version>` title.
+	let mut x = frame.put(0, y, tl.encode_utf8(&mut glyph), dim);
+	for _ in 0..3 {
+		x = frame.put(x, y, h.encode_utf8(&mut glyph), dim);
+	}
+	let title = fmts_mut!(" omp v{} ", banner.version);
+	x = draw_line(frame, x, y, box_width.saturating_sub(x + 1), &[Span::new(
+		title.as_str(),
+		ink(theme.muted),
+	)]);
+	while x < box_width - 1 {
+		x = frame.put(x, y, h.encode_utf8(&mut glyph), dim);
+	}
+	frame.put(box_width - 1, y, tr.encode_utf8(&mut glyph), dim);
+
+	// Column frames.
+	let left_x = 1;
+	let right_x = left_x + left_col + 1;
+	for row in 0..content_rows {
+		let row_y = y + 1 + row;
+		frame.put(0, row_y, v.encode_utf8(&mut glyph), dim);
+		if right_col > 0 {
+			frame.put(left_x + left_col, row_y, v.encode_utf8(&mut glyph), dim);
+		}
+		frame.put(box_width - 1, row_y, v.encode_utf8(&mut glyph), dim);
+	}
+
+	// Left column: greeting, gradient logo, model, provider — centered.
+	let logo_rows = if charset == Charset::Ascii {
+		0
+	} else {
+		WELCOME_LOGO.len() as u16
+	};
+	put_centered(frame, left_x, y + 2, left_col, "Welcome back!", ink(theme.fg).bold());
+	if logo_rows > 0 {
+		let intro_remaining = entry.intro_until.saturating_sub(now);
+		let (phase, shine) = if intro_remaining.is_zero() {
+			(0.0, None)
+		} else {
+			let progress =
+				1.0 - (intro_remaining.as_secs_f32() / WELCOME_INTRO.as_secs_f32()).clamp(0.0, 1.0);
+			welcome_intro_frame(progress)
+		};
+		draw_welcome_logo(frame, left_x, y + 4, left_col, phase, shine);
+	}
+	let model_y = if logo_rows > 0 {
+		y + 5 + logo_rows
+	} else {
+		y + 4
+	};
+	put_centered(frame, left_x, model_y, left_col, banner.model.as_str(), ink(theme.muted));
+	put_centered(frame, left_x, model_y + 1, left_col, banner.provider.as_str(), dim);
+
+	// Right column: tips, rule, language servers.
+	if right_col > 0 {
+		let text_x = right_x + 1;
+		let text_width = right_col.saturating_sub(1);
+		let mut row_y = y + 1;
+		draw_line(frame, text_x, row_y, text_width, &[Span::new("Tips", ink(theme.accent).bold())]);
+		row_y += 1;
+		for (symbol, hint) in [
+			("#", " for prompt actions"),
+			("/", " for commands"),
+			("!", " to run shell"),
+			("$", " to run python"),
+		] {
+			draw_line(frame, text_x, row_y, text_width, &[
+				Span::new(symbol, dim),
+				Span::new(hint, ink(theme.muted)),
+			]);
+			row_y += 1;
+		}
+		for column in 0..text_width.saturating_sub(1) {
+			frame.put(text_x + column, row_y, h.encode_utf8(&mut glyph), dim);
+		}
+		row_y += 1;
+		draw_line(frame, text_x, row_y, text_width, &[Span::new(
+			"LSP Servers",
+			ink(theme.accent).bold(),
+		)]);
+		row_y += 1;
+		if banner.lsp_servers.is_empty() {
+			draw_line(frame, text_x, row_y, text_width, &[Span::new("No LSP servers", dim)]);
+		} else {
+			for server in banner.lsp_servers.iter().take(WELCOME_LSP_SLOTS) {
+				let (icon, color) = if server.failed {
+					(charset.icon(Icon::Error), theme.err)
+				} else if server.stage_label.starts_with("ready") {
+					(charset.icon(Icon::Enabled), theme.ok)
+				} else {
+					(charset.icon(Icon::Enabled), theme.muted)
+				};
+				draw_line(frame, text_x, row_y, text_width, &[
+					Span::new(icon, ink(color)),
+					Span::new(" ", dim),
+					Span::new(server.name.as_str(), ink(theme.muted)),
+					Span::new(" ", dim),
+					Span::new(server.stage_label.as_str(), dim),
+				]);
+				row_y += 1;
+			}
+		}
+	}
+
+	// Bottom border with a column junction.
+	let bottom_y = y + 1 + content_rows;
+	x = frame.put(0, bottom_y, bl.encode_utf8(&mut glyph), dim);
+	while x < box_width - 1 {
+		x = frame.put(x, bottom_y, h.encode_utf8(&mut glyph), dim);
+	}
+	if right_col > 0 {
+		let junction = charset.grid().bottom.1;
+		frame.put(left_x + left_col, bottom_y, junction.encode_utf8(&mut glyph), dim);
+	}
+	frame.put(box_width - 1, bottom_y, br.encode_utf8(&mut glyph), dim);
+
+	// Tip footer under the card.
+	if let Some(tip) = &banner.tip {
+		draw_line(frame, 1, bottom_y + 1, box_width.saturating_sub(1), &[
+			Span::new("Tip: ", ink(theme.info).italic()),
+			Span::new(tip.as_str(), ink(theme.muted).italic()),
+		]);
+	}
+	height
 }
 
 fn preserves_attachments(text: &str) -> bool {
@@ -4891,6 +5484,45 @@ mod tests {
 		}
 	}
 	#[test]
+	fn idle_status_is_visible_without_the_sidebar() {
+		let mut chat = Chat::new(&ctx());
+		let rendered = frame_text(chat.render(Size::new(100, 32)).frame);
+
+		assert!(rendered.contains("omp idle"), "idle state is not visible: {rendered}");
+	}
+	#[test]
+	fn compact_status_keeps_the_session_identity_visible() {
+		let mut chat = Chat::new(&ctx());
+		chat.set_status(StatusFacts {
+			model: "DeepSeek V4 Flash".into(),
+			session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB1".into()),
+			cwd: Some("/tmp/project".into()),
+			context_tokens: 4_096,
+			context_window: Some(1_000_000),
+			cost_nanos: 1_500_000_000,
+			layout: StatusLayout::Compact,
+			..StatusFacts::default()
+		});
+		let rendered = frame_text(chat.render(Size::new(120, 32)).frame);
+
+		assert!(
+			rendered.contains("session 9G5FB1"),
+			"compact status omitted the session identity: {rendered}"
+		);
+		assert!(
+			rendered.contains("context  4096"),
+			"compact status omitted the turn context: {rendered}"
+		);
+		assert!(
+			rendered.contains("cost     $1.50"),
+			"compact status omitted the turn cost: {rendered}"
+		);
+		assert!(
+			rendered.contains("state    idle"),
+			"compact status omitted the turn state: {rendered}"
+		);
+	}
+	#[test]
 	fn clear_and_exit_bypass_editor_mutation() {
 		let mut chat = Chat::new(&ctx());
 		chat.set_composer_text("draft");
@@ -5064,7 +5696,8 @@ mod tests {
 		});
 		let text = frame_text(chat.render(Size::new(160, 8)).frame);
 		assert!(text.contains("Fable 5"), "{text}");
-		assert!(text.contains("10%/10k"), "{text}");
+		assert!(text.contains("10%"), "{text}");
+		assert!(text.contains("10k"), "{text}");
 		for hidden in ["queued 4", "jobs 5", "retry 2", "dropped 7", "$2", "$3"] {
 			assert!(!text.contains(hidden), "minimal status leaked {hidden}: {text}");
 		}
@@ -5424,6 +6057,77 @@ mod tests {
 		assert_eq!(batch.range.start, 0);
 		assert!(frame_text(&batch.frame).contains("follow-up"));
 	}
+	#[test]
+	fn queued_user_rows_render_dim_and_settle_into_plain_messages() {
+		let mut chat = Chat::new(&ctx());
+		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
+			text:   sf!("queued follow-up"),
+			chips:  Vec::new(),
+			queued: true,
+		});
+		let viewport = Size::new(60, 12);
+		let text = frame_text(chat.render(viewport).frame);
+		assert!(text.contains("Queued"), "{text}");
+		assert!(text.contains("to edit"), "{text}");
+		assert!(text.contains("queued follow-up"), "{text}");
+		// Pending rows stay unretired so a later dequeue can remove them.
+		assert!(matches!(
+			chat.blocks.phase(BlockOrdinal(0)),
+			Some(crate::BlockPhase::Queued | crate::BlockPhase::Active)
+		));
+		let _ = chat.apply_backend_event(BackendEvent::QueuedPromptsSettled);
+		let text = frame_text(chat.render(viewport).frame);
+		assert!(!text.contains("Queued"), "{text}");
+		assert!(text.contains("queued follow-up"), "{text}");
+	}
+
+	#[test]
+	fn newest_queued_row_owns_the_dequeue_hint() {
+		let mut chat = Chat::new(&ctx());
+		for message in ["first queued", "second queued"] {
+			let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
+				text:   Str::new_static(message),
+				chips:  Vec::new(),
+				queued: true,
+			});
+		}
+		let text = frame_text(chat.render(Size::new(60, 16)).frame);
+		assert_eq!(text.matches("to edit").count(), 1, "{text}");
+	}
+
+	#[test]
+	fn dequeue_restore_removes_queued_rows_and_refills_composer() {
+		let mut chat = Chat::new(&ctx());
+		let _ = chat.apply_backend_event(BackendEvent::UserReplayed {
+			text:   sf!("later message"),
+			chips:  Vec::new(),
+			queued: true,
+		});
+		let _ = chat.apply_backend_event(BackendEvent::QueuedPromptsRestored(vec![QueuedPrompt {
+			text:        sf!("later message"),
+			attachments: Vec::new(),
+		}]));
+		assert_eq!(chat.composer_text(), "later message");
+		let text = frame_text(chat.render(Size::new(60, 12)).frame);
+		assert!(!text.contains("Queued"), "{text}");
+	}
+
+	#[test]
+	fn history_rewind_stages_recovered_attachments() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_user("original prompt", Vec::new());
+		let _ = chat.apply_backend_event(BackendEvent::HistoryRewind {
+			user_index:  0,
+			text:        sf!("original prompt"),
+			attachments: vec![
+				crate::RestoredAttachment::Image { source: sf!("/nope/rewound.png") },
+				crate::RestoredAttachment::Text(sf!("pasted body\nsecond line")),
+			],
+		});
+		let staged = chat.composer_attachments();
+		assert_eq!(staged.len(), 2, "image and paste both restage");
+	}
+
 	#[test]
 	fn tool_result_images_render_inline_in_committed_cards() {
 		let mut chat = Chat::new(&ctx());

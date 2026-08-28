@@ -3,7 +3,6 @@
 use std::{
 	fs, io,
 	path::{Path, PathBuf},
-	process::Command,
 	sync::Arc,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +17,7 @@ use http::{
 use omp_core::{Str, sf};
 use omp_inference::auth::HeaderPlacement;
 use omp_tools::github::{DateField, Fault, GithubHost, Operation, Params, Payload};
+use omp_vcs::{PushOptions, git::GitRepo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{task, time};
@@ -33,7 +33,7 @@ pub(crate) struct GithubService {
 	root:        PathBuf,
 	worktrees:   PathBuf,
 	credentials: Arc<GithubCredentialBridge>,
-	client:      reqwest::Client,
+	client:      omp_http::Client,
 }
 
 impl GithubService {
@@ -50,6 +50,15 @@ impl GithubService {
 		})
 	}
 
+	#[tracing::instrument(
+		name = "github_api_request",
+		level = "debug",
+		skip_all,
+		fields(
+			method = ?method,
+			path = %api_path(path),
+		),
+	)]
 	async fn request(
 		&self,
 		method: Method,
@@ -151,6 +160,7 @@ impl GithubService {
 
 #[async_trait]
 impl GithubHost for GithubService {
+	#[tracing::instrument(name = "github_operation", level = "debug", skip_all, fields(operation = ?params.op))]
 	async fn execute(
 		&self,
 		params: Params,
@@ -364,19 +374,17 @@ impl GithubService {
 					fault("github_invalid_response", "pull request head branch is unavailable")
 				})?;
 			let path = self.worktrees.join(format!("pr-{number}"));
-			let root = self.root.clone();
-			let path_for_git = path.clone();
-			let git_clone_url = clone_url.to_owned();
-			let git_head = head.to_owned();
 			let force = params.force;
-			let worker = task::spawn_blocking(move || {
-				checkout_git(&root, &path_for_git, number, &git_clone_url, &git_head, force)
-			});
 			tokio::select! {
-				result = worker => {
-					result
-						.map_err(|_| fault("github_git_failed", "GitHub checkout worker failed"))??;
-				},
+				result = checkout_git(
+					&self.root,
+					&path,
+					number,
+					clone_url,
+					head,
+					force,
+					cancellation.clone(),
+				) => result?,
 				() = cancellation.cancelled() => return Err(cancelled_fault()),
 			}
 			fs::create_dir_all(&path).map_err(io_fault)?;
@@ -430,12 +438,8 @@ impl GithubService {
 				fault("github_checkout_missing", "pull request checkout metadata is invalid")
 			})?;
 			let force = params.force_with_lease;
-			let path_for_git = path.clone();
-			let worker = task::spawn_blocking(move || push_git(&path_for_git, &metadata, force));
 			tokio::select! {
-				result = worker => {
-					result.map_err(|_| fault("github_git_failed", "GitHub push worker failed"))??;
-				},
+				result = push_git(path.clone(), &metadata, force, cancellation.clone()) => result?,
 				() = cancellation.cancelled() => return Err(cancelled_fault()),
 			}
 			pushed.push(json!({ "pr": number, "path": path }));
@@ -588,10 +592,13 @@ impl GithubService {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Method {
 	Get,
 	Post,
+}
+fn api_path(path: &str) -> &str {
+	path.split_once('?').map_or(path, |(path, _)| path)
 }
 #[derive(Clone)]
 enum WatchTarget {
@@ -616,23 +623,59 @@ struct CheckoutMetadata {
 	head:      String,
 }
 
-fn checkout_git(
+async fn checkout_git(
 	root: &Path,
 	path: &Path,
 	number: u64,
 	remote: &str,
 	head: &str,
 	force: bool,
+	cancel: CancellationToken,
 ) -> Result<(), Fault> {
 	let parent = path
 		.parent()
 		.ok_or_else(|| fault("github_git_failed", "invalid worktree path"))?;
 	fs::create_dir_all(parent).map_err(io_fault)?;
-	run_git(root, &["fetch", remote, head])?;
+
+	let root = root.to_owned();
+	let repo = task::spawn_blocking(move || GitRepo::require(&root).map(Arc::new))
+		.await
+		.map_err(|_| fault("github_git_failed", "GitHub checkout worker failed"))?
+		.map_err(git_fault)?;
+	let fetch_branch = format!("omp/github-fetch/pr-{number}");
+	let fetch_ref = format!("refs/heads/{fetch_branch}");
+	repo
+		.fetch(remote, head, &fetch_ref, None, Some(cancel))
+		.await
+		.map_err(git_fault)?;
+
+	let path = path.to_owned();
+	task::spawn_blocking(move || finish_checkout_git(repo, &path, number, &fetch_branch, force))
+		.await
+		.map_err(|_| fault("github_git_failed", "GitHub checkout worker failed"))?
+}
+
+fn finish_checkout_git(
+	repo: Arc<GitRepo>,
+	path: &Path,
+	number: u64,
+	fetch_branch: &str,
+	force: bool,
+) -> Result<(), Fault> {
 	let branch = format!("pr-{number}");
+	let fetch_ref = format!("refs/heads/{fetch_branch}");
+	let fetched = repo
+		.resolve_ref(&fetch_ref)
+		.map_err(git_fault)?
+		.ok_or_else(|| git_fault(omp_vcs::Error::RefNotFound { name: fetch_ref }))?;
+	repo.delete_branch(fetch_branch, true).map_err(git_fault)?;
+
 	if path.exists() {
-		let active = git_stdout(path, &["symbolic-ref", "--short", "HEAD"])?;
-		if active != branch {
+		let active = GitRepo::require(path)
+			.map_err(git_fault)?
+			.current_branch()
+			.map_err(git_fault)?;
+		if active.as_deref() != Some(branch.as_str()) {
 			return Err(fault(
 				"github_git_failed",
 				"existing pull-request worktree has an unexpected branch",
@@ -640,83 +683,69 @@ fn checkout_git(
 		}
 		return Ok(());
 	}
-	let fetched = git_stdout(root, &["rev-parse", "FETCH_HEAD"])?;
-	if let Some(existing) = try_git_stdout(root, &["rev-parse", &format!("refs/heads/{branch}")])? {
-		if existing != fetched && !force {
-			return Err(fault(
-				"github_git_failed",
-				"local pull-request branch differs from the remote head; pass force=true to reset it",
-			));
-		}
-		if existing != fetched {
-			run_git(root, &["branch", "-f", &branch, "FETCH_HEAD"])?;
-		}
-	} else {
-		run_git(root, &["branch", &branch, "FETCH_HEAD"])?;
+
+	match repo
+		.resolve_ref(&format!("refs/heads/{branch}"))
+		.map_err(git_fault)?
+	{
+		Some(existing) if existing != fetched => {
+			if !force {
+				return Err(fault(
+					"github_git_failed",
+					"local pull-request branch differs from the remote head; pass force=true to reset \
+					 it",
+				));
+			}
+			repo
+				.create_branch(&branch, &fetched, true)
+				.map_err(git_fault)?;
+		},
+		None => repo
+			.create_branch(&branch, &fetched, false)
+			.map_err(git_fault)?,
+		_ => {},
 	}
-	let path = path.to_string_lossy();
-	run_git(root, &["worktree", "add", path.as_ref(), &branch])
+	repo.worktree_add(path, &branch, false).map_err(git_fault)
 }
 
-fn push_git(path: &Path, metadata: &CheckoutMetadata, force: bool) -> Result<(), Fault> {
-	let mut args = vec!["push"];
-	if force {
-		args.push("--force-with-lease");
-	}
-	let refspec = format!("HEAD:{}", metadata.head);
-	args.extend([metadata.clone_url.as_str(), refspec.as_str()]);
-	run_git(path, &args)
+async fn push_git(
+	path: PathBuf,
+	metadata: &CheckoutMetadata,
+	force: bool,
+	cancel: CancellationToken,
+) -> Result<(), Fault> {
+	let repo = task::spawn_blocking(move || GitRepo::require(&path).map(Arc::new))
+		.await
+		.map_err(|_| fault("github_git_failed", "GitHub push worker failed"))?
+		.map_err(git_fault)?;
+	repo
+		.push(
+			&PushOptions {
+				remote:           Some(metadata.clone_url.clone()),
+				refspec:          Some(format!("HEAD:{}", metadata.head)),
+				force_with_lease: force,
+			},
+			Some(cancel),
+		)
+		.await
+		.map_err(git_fault)
 }
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<(), Fault> {
-	let output = Command::new("git")
-		.current_dir(cwd)
-		.args(args)
-		.output()
-		.map_err(io_fault)?;
-	if output.status.success() {
-		return Ok(());
-	}
-	Err(Fault {
-		code:    sf!("github_git_failed"),
-		message: Str::new(String::from_utf8_lossy(&output.stderr).trim()),
-	})
-}
-fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, Fault> {
-	try_git_stdout(cwd, args)?.ok_or_else(|| Fault {
-		code:    sf!("github_git_failed"),
-		message: Str::new(format!("git {} failed", args.join(" "))),
-	})
-}
-fn try_git_stdout(cwd: &Path, args: &[&str]) -> Result<Option<String>, Fault> {
-	let output = Command::new("git")
-		.current_dir(cwd)
-		.args(args)
-		.output()
-		.map_err(io_fault)?;
-	if output.status.success() {
-		return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()));
-	}
-	if matches!(output.status.code(), Some(1) | Some(128)) {
-		return Ok(None);
-	}
-	Err(Fault {
-		code:    sf!("github_git_failed"),
-		message: Str::new(String::from_utf8_lossy(&output.stderr).trim()),
-	})
-}
 fn current_git_snapshot(root: &Path) -> Result<(Str, Str), Fault> {
-	let branch =
-		try_git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?.ok_or_else(|| {
-			fault("github_git_failed", "current checkout is detached; pass `branch` or `run`")
-		})?;
+	let repo = GitRepo::require(root).map_err(git_fault)?;
+	let branch = repo.current_branch().map_err(git_fault)?.ok_or_else(|| {
+		fault("github_git_failed", "current checkout is detached; pass `branch` or `run`")
+	})?;
 	if branch.is_empty() {
 		return Err(fault(
 			"github_git_failed",
 			"current checkout is detached; pass `branch` or `run`",
 		));
 	}
-	let head_sha = git_stdout(root, &["rev-parse", "--verify", "HEAD"])?;
+	let head_sha = repo
+		.head_sha()
+		.map_err(git_fault)?
+		.ok_or_else(|| git_fault(omp_vcs::Error::RefNotFound { name: "HEAD".to_owned() }))?;
 	Ok((Str::new(branch), Str::new(head_sha)))
 }
 fn has_scope(query: &str) -> bool {
@@ -1236,6 +1265,9 @@ fn cancelled_fault() -> Fault {
 }
 fn http_fault(error: reqwest::Error) -> Fault {
 	Fault { code: sf!("github_transport_failed"), message: Str::new(error.to_string()) }
+}
+fn git_fault(error: omp_vcs::Error) -> Fault {
+	Fault { code: sf!("github_git_failed"), message: Str::new(error.to_string()) }
 }
 fn io_fault(error: io::Error) -> Fault {
 	Fault { code: sf!("github_io_failed"), message: Str::new(error.to_string()) }

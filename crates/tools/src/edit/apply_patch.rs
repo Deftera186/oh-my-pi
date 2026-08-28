@@ -18,13 +18,14 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use super::{
 	AppliedOp, CommittedSection, EditAction, EditCommitError, EditDocuments, EditPrepared,
 	EditProposal, EditUpdate, Fault, FormatPolicy, Payload, PrepareRequest, ResolvedEdit, SectionOp,
 	SectionPayload, StalePolicy, commit_event, done_fault,
 	observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox},
-	param_event, rejection_text,
+	param_event, rejection_text, warn_edit_rejection,
 };
 use crate::{
 	path::{HostPaths, normalize_target},
@@ -85,6 +86,56 @@ pub struct FreeformEditTool<D> {
 	observer:        EditObserver,
 	guard_generated: bool,
 	spec:            ToolSpec,
+}
+
+/// Returns the host-free `edit@patch.1` specification.
+pub fn patch_spec() -> ToolSpec {
+	freeform_spec(FreeformKind::Patch)
+}
+
+/// Returns the host-free `edit@apply_patch.1` specification.
+pub fn apply_patch_spec() -> ToolSpec {
+	freeform_spec(FreeformKind::ApplyPatch)
+}
+
+/// Returns the host-free `edit@sloppy.1` specification.
+pub fn sloppy_spec() -> ToolSpec {
+	freeform_spec(FreeformKind::Sloppy)
+}
+
+fn freeform_spec(kind: FreeformKind) -> ToolSpec {
+	ToolSpec {
+		name:            sf!("edit"),
+		rev:             Rev { family: Str::new_static(kind.family()), n: 1 },
+		description:     Str::new_static(kind.description()),
+		schema:          omp_tool::schema::<FreeformEditParams>(),
+		constraint:      Constraint::Grammar {
+			priority:       100,
+			syntax:         omp_tool::GrammarSyntax::Lark,
+			definition:     Str::new_static(match kind.dialect() {
+				Dialect::Patch | Dialect::ApplyPatch => omp_hashline::grammars::APPLY_PATCH,
+				Dialect::Sloppy => omp_hashline::grammars::SLOPPY,
+				Dialect::Hashline | Dialect::Replace | Dialect::Native => "",
+			}),
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("**")].into_iter().collect(),
+			}),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("apply_patch.rs"),
+		)
+		.into(),
+	}
 }
 
 /// Constructs `edit@patch.1`.
@@ -154,37 +205,10 @@ fn new_tool<D: EditDocuments>(
 		kind,
 		observer,
 		guard_generated,
-		spec: ToolSpec {
-			name:            sf!("edit"),
-			rev:             Rev { family: Str::new_static(kind.family()), n: 1 },
-			description:     Str::new_static(kind.description()),
-			schema:          omp_tool::schema::<FreeformEditParams>(),
-			constraint:      Constraint::Grammar {
-				priority:       100,
-				syntax:         omp_tool::GrammarSyntax::Lark,
-				definition:     Str::new_static(match kind.dialect() {
-					Dialect::Patch | Dialect::ApplyPatch => omp_hashline::grammars::APPLY_PATCH,
-					Dialect::Sloppy => omp_hashline::grammars::SLOPPY,
-					Dialect::Hashline | Dialect::Replace | Dialect::Native => "",
-				}),
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect(),
-				}),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("apply_patch.rs"),
-			)
-			.into(),
+		spec: match kind {
+			FreeformKind::Patch => patch_spec(),
+			FreeformKind::ApplyPatch => apply_patch_spec(),
+			FreeformKind::Sloppy => sloppy_spec(),
 		},
 	}
 }
@@ -231,6 +255,12 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
+		let span = tracing::debug_span!(
+			"edit_execution",
+			revision = self.kind.family(),
+			path_count = tracing::field::Empty,
+			path = tracing::field::Empty,
+		);
 		stream! {
 			let FreeformEditParams { input } = match params.whole::<FreeformEditParams>().await {
 				Ok(params) => params,
@@ -241,6 +271,10 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 				Ok(_) => { yield done_fault(Fault::invalid("No edit operations found.")); return; },
 				Err(error) => { yield done_fault(Fault::invalid(error)); return; },
 			};
+			span.record("path_count", operations.len());
+			if let Some(operation) = operations.first() {
+				span.record("path", tracing::field::display(operation.path()));
+			}
 			let mut works = Vec::with_capacity(operations.len());
 			for mut op in operations {
 				let normalized = normalize_target(op.path(), None, HostPaths::current());
@@ -260,7 +294,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 						AuthoredOperation::Foreign(ForeignPatchFile::Add { .. })
 					),
 					guard_generated: self.guard_generated,
-				}).await {
+				}).instrument(span.clone()).await {
 					Ok(prepared) => prepared,
 					Err(fault) => { yield done_fault(fault); return; },
 				};
@@ -326,7 +360,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 						},
 						self.kind.family(),
 						&observer_args,
-					).await;
+					).instrument(span.clone()).await;
 					after = Some(inspected.content);
 					warnings.extend(inspected.notice);
 					pending = inspected.pending;
@@ -362,7 +396,7 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 			let result = {
 				let clipboard = self.documents.start_clipboard_batch();
 				let prepared = works.iter_mut().map(|work| &mut work.prepared).collect();
-				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+				let commit = self.documents.commit(prepared, proposals, clipboard).instrument(span.clone()).fuse();
 				let interrupt = params.next_interrupt().fuse();
 				pin_mut!(commit, interrupt);
 				select_biased! {
@@ -377,6 +411,15 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 			let Some(result) = result else { return; };
 			match result {
 				Ok(result) if result.sections.len() == works.len() => {
+					for (work, committed) in works.iter().zip(&result.sections) {
+						if committed.rebased {
+							tracing::warn!(
+								parent: &span,
+								path = %work.prepared.display_path(),
+								"edit transaction rebased a concurrent change",
+							);
+						}
+					}
 					for work in &works { self.documents.reset_noop(work.prepared.path()); }
 					for pending in pending_blackbox.into_iter().flatten() {
 						self.observer.record_committed(pending).await;
@@ -384,8 +427,14 @@ impl<D: EditDocuments> Tool for FreeformEditTool<D> {
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload(&works, &projections, &result.sections)), useless: false });
 				},
 				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
-				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
-				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+				Err(EditCommitError::Rejected(fault)) => {
+					warn_edit_rejection(&span, &fault);
+					yield done_fault(fault);
+				},
+				Err(EditCommitError::EffectsUnknown { reason }) => {
+					tracing::warn!(parent: &span, "edit commit result is unknown");
+					yield Ev::Aborted(Abort::EffectsUnknown { reason });
+				},
 			}
 		}
 	}

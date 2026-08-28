@@ -302,6 +302,12 @@ impl StringList {
 /// Scans direct and nested `SKILL.md` declarations from ordered sources,
 /// follows only contained symlinks, applies source/name gates before claiming
 /// names, and realpath-deduplicates declarations.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "skill_discovery",
+	fields(source_count = sources.len(), enabled = settings.enabled)
+)]
 pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> SkillDiscovery {
 	if !settings.enabled {
 		return SkillDiscovery::default();

@@ -1,6 +1,7 @@
 //! Shared model-path normalization for workspace tools.
 
 use std::{
+	borrow::Cow,
 	env,
 	path::{Component, Path, PathBuf},
 };
@@ -16,6 +17,27 @@ pub enum HostPaths {
 	Posix,
 	/// Windows drive, UNC, and extended-length spelling.
 	Windows,
+}
+/// Returns bounded-safe path metadata for tracing without URL credentials,
+/// query parameters, or fragments.
+pub(crate) fn tracing_path_metadata(input: &str) -> Cow<'_, str> {
+	if !input.contains("://") {
+		return Cow::Borrowed(input);
+	}
+	if input.contains([';', ',']) {
+		return Cow::Borrowed("<multiple targets>");
+	}
+	let Ok(mut url) = Url::parse(input) else {
+		return Cow::Borrowed("<url>");
+	};
+	let _ = url.set_username("");
+	let _ = url.set_password(None);
+	url.set_query(None);
+	url.set_fragment(None);
+	if url.scheme() != "file" {
+		url.set_path("");
+	}
+	Cow::Owned(url.into())
 }
 
 impl HostPaths {

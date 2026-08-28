@@ -289,6 +289,11 @@ pub struct ActivePromptSnapshots {
 
 /// Discovers the complete static prompt surface with identical provider,
 /// priority, user-scope, and native-root semantics for every session mode.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(root = %root.display(), additional_root_count = additional_roots.len())
+)]
 pub fn active_prompt_snapshots(
 	root: &Path,
 	additional_roots: &[PathBuf],
@@ -310,6 +315,12 @@ pub fn active_prompt_snapshots(
 		disabled_providers,
 		..context::ContextDiscoveryOptions::default()
 	});
+	tracing::debug!(
+		declaration_count = content.declarations.len(),
+		context_item_count = context.items.len(),
+		context_diagnostic_count = context.diagnostics.len(),
+		"active prompt snapshots discovered"
+	);
 	ActivePromptSnapshots { content, context }
 }
 
@@ -682,6 +693,12 @@ fn active_content_snapshots_with_home(
 		.any(|command| command.name.as_str().eq_ignore_ascii_case("init"))
 	{
 		commands.extend(embedded_workflow_commands());
+	}
+	if !discovered.warnings.is_empty() {
+		tracing::warn!(
+			warning_count = discovered.warnings.len(),
+			"prompt discovery completed with warnings"
+		);
 	}
 	ActiveContentSnapshots {
 		skills:           Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),

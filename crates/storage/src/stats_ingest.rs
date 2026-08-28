@@ -13,7 +13,7 @@ use std::{
 
 use flume::Receiver;
 use omp_core::Str;
-use omp_telemetry::{sentiment::analyze_user_sentiment, stats::LocalAnalyticsConsent};
+use omp_observability::{sentiment::analyze_user_sentiment, stats::LocalAnalyticsConsent};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -124,6 +124,12 @@ fn worker(database: &StatsDb, receiver: &Receiver<Job>) {
 ///
 /// Disabled consent does not advance the watermark, so enabling analytics
 /// later performs a complete private backfill.
+#[tracing::instrument(
+	name = "statistics_journal_scan",
+	level = "debug",
+	skip_all,
+	fields(path = %path.display())
+)]
 pub fn scan_journal(database: &StatsDb, path: &Path) -> Result<ScanReport, StatsIngestError> {
 	if database.consent() == LocalAnalyticsConsent::Disabled {
 		return Ok(ScanReport::default());
@@ -211,6 +217,19 @@ pub fn scan_journal(database: &StatsDb, path: &Path) -> Result<ScanReport, Stats
 		})
 	});
 	database.set_file_offset(&canonical, report.byte_watermark, modified_ns)?;
+	if report.malformed != 0 {
+		tracing::warn!(
+			malformed_record_count = report.malformed,
+			"statistics journal scan skipped malformed records"
+		);
+	}
+	tracing::debug!(
+		event_count = report.lines,
+		message_count = report.messages,
+		user_message_count = report.user_messages,
+		tool_call_count = report.tool_calls,
+		"statistics journal scan completed"
+	);
 	Ok(report)
 }
 

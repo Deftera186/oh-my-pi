@@ -1,5 +1,7 @@
 //! Clean-tree commit metadata, avatar, and identicon presentation.
 
+use std::time::Duration;
+
 use jiff::Timestamp;
 use md5::{Digest as _, Md5};
 use omp_core::{IntoStr, Str, sf};
@@ -25,7 +27,7 @@ pub(super) fn component(
 	let body = head.body.lines().take(8).map(Str::new).collect::<Vec<_>>();
 	let author = head.author_name.clone();
 	let email = head.author_email.clone();
-	let authored_ms = authored_age_ms(head.author_date.as_str());
+	let authored = authored_age(head.author_date.as_str());
 	let parents = head
 		.parents
 		.iter()
@@ -71,7 +73,7 @@ pub(super) fn component(
 				for line in identicon { <pre fg={identicon_color}>{line}</pre> }
 			}
 			<row w={width} gap=1><text bold truncate>{author}</text><text dim truncate>{sf!("<{email}>")}</text></row>
-			if let Some(age) = authored_ms {
+			if let Some(age) = authored {
 				<row w={width} gap=1><text dim>{"authored"}</text><time kind="relative" ms={age} dim/></row>
 			} else {
 				<text dim truncate>{sf!("authored {}", head.author_date)}</text>
@@ -97,11 +99,11 @@ pub(super) fn component(
 	}
 }
 
-/// Milliseconds elapsed since the authored timestamp, clamped to zero for
+/// Time elapsed since the authored timestamp, clamped to zero for
 /// future (clock-skewed) dates; `None` when the date string does not parse.
-fn authored_age_ms(value: &str) -> Option<u64> {
+fn authored_age(value: &str) -> Option<Duration> {
 	let then = value.parse::<Timestamp>().ok()?;
-	Some(u64::try_from(Timestamp::now().duration_since(then).as_millis()).unwrap_or(0))
+	Some(Duration::try_from(Timestamp::now().duration_since(then)).unwrap_or_default())
 }
 
 /// Builds deterministic mirrored 5×5 identicon rows for an email address.

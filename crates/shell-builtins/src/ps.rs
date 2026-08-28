@@ -312,6 +312,7 @@ impl builtins::Command for PsCommand {
 					return Ok(ExecutionResult::success());
 				},
 				Err((code, message)) => {
+					tracing::warn!(builtin = "ps", exit_code = code, "builtin arguments rejected");
 					writeln!(context.stderr(), "ps: {message}")?;
 					return Ok(ExecutionResult::new(code));
 				},
@@ -364,6 +365,11 @@ impl builtins::Command for PsCommand {
 				if err.kind() == io::ErrorKind::BrokenPipe {
 					return Ok(ExecutionResult::success());
 				}
+				tracing::warn!(
+					builtin = "ps",
+					error_kind = ?err.kind(),
+					"builtin output failed"
+				);
 				return Err(err.into());
 			}
 			Ok(if rows.is_empty() {

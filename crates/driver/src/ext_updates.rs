@@ -16,6 +16,7 @@ use omp_ext::{
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 /// Independently coalesced update authority.
 #[derive(Clone, Copy, Debug, Display, EnumString, Eq, PartialEq, Deserialize, Serialize)]
@@ -170,26 +171,66 @@ where
 	Fut: Future<Output = Result<CandidateReport, UpdateFailure>> + Send + 'static,
 {
 	if policy.mode == UpdateMode::Off {
+		tracing::debug!(scope = %scope, "extension update check disabled");
 		return Ok(None);
 	}
 	let interval_ms = u64::try_from(policy.interval.duration().as_millis()).unwrap_or(u64::MAX);
 	let Some(lease) = coordinator.acquire_due(scope, interval_ms, now_ms)? else {
+		tracing::debug!(scope = %scope, "extension update check coalesced or not due");
 		return Ok(None);
 	};
-	Ok(Some(tokio::spawn(async move {
-		let result = check().await;
-		let (report, failure, high_severity) = match result {
-			Ok(report) => {
-				let high_severity = !report.quarantined.is_empty();
-				(Some(report), None, high_severity)
-			},
-			Err(failure) => (None, Some(failure), false),
-		};
-		let _ = lease.complete(failure);
-		let _ = notifications
-			.send_async(UpdateNotification { scope, report, failure, high_severity })
-			.await;
-	})))
+	let span = tracing::debug_span!("extension_update_check", scope = %scope);
+	Ok(Some(tokio::spawn(
+		async move {
+			let result = check().await;
+			let (report, failure, high_severity) = match result {
+				Ok(report) => {
+					let high_severity = !report.quarantined.is_empty();
+					if high_severity {
+						tracing::warn!(
+							scope = %scope,
+							quarantined_count = report.quarantined.len(),
+							"extension update check quarantined extensions"
+						);
+					}
+					if report.items.is_empty() {
+						tracing::debug!(scope = %scope, "extension update check completed");
+					} else {
+						tracing::info!(
+							scope = %scope,
+							candidate_count = report.items.len(),
+							"extension updates verified"
+						);
+					}
+					(Some(report), None, high_severity)
+				},
+				Err(failure) => {
+					tracing::warn!(
+						scope = %scope,
+						kind = ?failure.kind,
+						code = ?failure.code,
+						"extension update check failed"
+					);
+					(None, Some(failure), false)
+				},
+			};
+			if let Err(error) = lease.complete(failure) {
+				tracing::warn!(
+					scope = %scope,
+					error = %error,
+					"failed to persist extension update check"
+				);
+			}
+			if notifications
+				.send_async(UpdateNotification { scope, report, failure, high_severity })
+				.await
+				.is_err()
+			{
+				tracing::debug!(scope = %scope, "extension update notification receiver closed");
+			}
+		}
+		.instrument(span),
+	)))
 }
 
 /// Returns the current Unix timestamp used for durable due checks.
@@ -245,6 +286,12 @@ impl ClientUpdatePaths {
 /// Revocations are fetched and verified before the signed index. Notify mode
 /// never calls the generation commit boundary; auto mode commits only when the
 /// shared verifier marks every item eligible.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "client_update_check",
+	fields(mode = %policy.mode)
+)]
 pub async fn check_client_updates(
 	paths: &ClientUpdatePaths,
 	policy: UpdatePolicy,
@@ -331,6 +378,12 @@ pub async fn check_client_updates(
 
 /// Requests the environment-owned workspace check and projects its structured
 /// report into the shared notification shape.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "workspace_update_check",
+	fields(mode = %policy.mode)
+)]
 pub async fn check_workspace_updates(
 	client: &omp_env::EnvClient,
 	policy: UpdatePolicy,

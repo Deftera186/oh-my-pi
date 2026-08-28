@@ -100,6 +100,12 @@ pub enum GrantPersistenceError {
 /// An exact grant takes precedence over a subtree grant rooted at the same
 /// workspace. Once a more-specific decision exists, a broader grant cannot
 /// silently override changed publisher, capability, tier, or shipping facts.
+#[tracing::instrument(
+	name = "extension_grant_verify",
+	level = "debug",
+	skip_all,
+	fields(extension_id = %id, layer = ?layer)
+)]
 pub fn grant_covers(
 	grants: &GrantsFile,
 	id: &Str,
@@ -315,6 +321,12 @@ impl KeysFile {
 
 	/// Pins a first-seen key, rejects a changed key, or accepts a rotation only
 	/// when its signature verifies against the old pin.
+	#[tracing::instrument(
+		name = "extension_publisher_trust",
+		level = "debug",
+		skip_all,
+		fields(extension_id = %id, rotation_provided = rotation.is_some())
+	)]
 	pub fn verify_or_pin(
 		&mut self,
 		id: &Str,
@@ -330,9 +342,11 @@ impl KeysFile {
 				introduced_version: version.clone(),
 				introduced_at:      now.clone(),
 			});
+			tracing::debug!("publisher key pinned");
 			return Ok(None);
 		};
 		if pin.key == *key {
+			tracing::debug!("publisher key matched existing pin");
 			return Ok(None);
 		}
 		let Some(rotation) =
@@ -345,28 +359,38 @@ impl KeysFile {
 		};
 		verify_publisher_rotation(pin.key.as_str(), id, key.as_str(), rotation)?;
 		pin.key.clone_from(key);
+		tracing::info!("publisher key rotation verified");
 		Ok(Some(ExtensionCode::WKeyRotated))
 	}
 }
 
 /// Verifies publisher-key continuity against the exact previously pinned key.
+#[tracing::instrument(
+	name = "extension_publisher_rotation_verify",
+	level = "debug",
+	skip_all,
+	fields(extension_id = %id)
+)]
 pub fn verify_publisher_rotation(
 	current_key: &str,
 	id: &Str,
 	new_key: &str,
 	rotation: &KeyRotation,
 ) -> Result<(), ExtensionError> {
-	if rotation.id != *id || rotation.new_key != new_key {
-		return Err(ExtensionError::new(
-			ExtensionCode::EKeyChanged,
-			"publisher key changed without a matching signed rotation",
-		));
-	}
-	verify_signature(
-		current_key,
-		format!("{}\n{}", rotation.id, rotation.new_key).as_bytes(),
-		rotation.signature.as_str(),
-	)
+	let result = (|| {
+		if rotation.id != *id || rotation.new_key != new_key {
+			return Err(ExtensionError::new(
+				ExtensionCode::EKeyChanged,
+				"publisher key changed without a matching signed rotation",
+			));
+		}
+		verify_signature(
+			current_key,
+			format!("{}\n{}", rotation.id, rotation.new_key).as_bytes(),
+			rotation.signature.as_str(),
+		)
+	})();
+	result
 }
 /// A revoked extension version predicate. Version matching is deliberately
 /// delegated to the resolver; materialization compares exact lock versions.
@@ -410,14 +434,36 @@ pub enum RevocationFreshness {
 
 impl RevocationsFile {
 	/// Reads a signed JSON revocation snapshot.
+	#[tracing::instrument(
+		name = "extension_revocations_load",
+		level = "debug",
+		skip_all,
+		fields(path = %path.display())
+	)]
 	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
-		let data = fs::read(path)
-			.map_err(|error| ExtensionError::new(ExtensionCode::ERevoked, error.to_string()))?;
-		serde_json::from_slice(&data)
+		let result = fs::read(path)
 			.map_err(|error| ExtensionError::new(ExtensionCode::ERevoked, error.to_string()))
+			.and_then(|data| {
+				serde_json::from_slice::<Self>(&data)
+					.map_err(|error| ExtensionError::new(ExtensionCode::ERevoked, error.to_string()))
+			});
+		if let Ok(revocations) = &result {
+			tracing::debug!(
+				cache_hit = true,
+				revocation_count = revocations.revoked.len(),
+				"extension revocation cache loaded"
+			);
+		}
+		result
 	}
 
 	/// Verifies the index signature over the canonical unsigned snapshot.
+	#[tracing::instrument(
+		name = "extension_revocations_verify",
+		level = "debug",
+		skip_all,
+		fields(revocation_count = self.revoked.len())
+	)]
 	pub fn verify(&self, index_key: &str) -> Result<(), ExtensionError> {
 		#[derive(Serialize)]
 		struct Unsigned<'a> {
@@ -426,14 +472,15 @@ impl RevocationsFile {
 			valid_until: &'a Str,
 			revoked:     &'a [RevokedVersion],
 		}
-		let payload = serde_json::to_vec(&Unsigned {
+		let result = serde_json::to_vec(&Unsigned {
 			version:     self.version,
 			issued_at:   &self.issued_at,
 			valid_until: &self.valid_until,
 			revoked:     &self.revoked,
 		})
-		.map_err(|error| ExtensionError::new(ExtensionCode::ESig, error.to_string()))?;
-		verify_signature(index_key, &payload, self.signature.as_str())
+		.map_err(|error| ExtensionError::new(ExtensionCode::ESig, error.to_string()))
+		.and_then(|payload| verify_signature(index_key, &payload, self.signature.as_str()));
+		result
 	}
 
 	/// Returns the matching revocation predicate for an exact locked version.
@@ -466,7 +513,7 @@ impl RevocationsFile {
 		let issued_at = Timestamp::from_str(self.issued_at.as_str());
 		let valid_until = Timestamp::from_str(self.valid_until.as_str());
 		let now = Timestamp::from_str(now);
-		if issued_at.is_ok_and(|issued_at| {
+		let freshness = if issued_at.is_ok_and(|issued_at| {
 			valid_until.is_ok_and(|valid_until| {
 				now.is_ok_and(|now| issued_at <= now && valid_until >= now && issued_at < valid_until)
 			})
@@ -476,7 +523,19 @@ impl RevocationsFile {
 			RevocationFreshness::Reject(ExtensionCode::ERevoked)
 		} else {
 			RevocationFreshness::Warn(ExtensionCode::WRevocationStale)
+		};
+		match freshness {
+			RevocationFreshness::Fresh => {
+				tracing::debug!(strict_offline, "extension revocation cache is fresh");
+			},
+			RevocationFreshness::Warn(code) => {
+				tracing::warn!(?code, strict_offline, "extension revocation cache is stale");
+			},
+			RevocationFreshness::Reject(code) => {
+				tracing::warn!(?code, strict_offline, "extension revocation cache rejected");
+			},
 		}
+		freshness
 	}
 }
 
@@ -497,6 +556,7 @@ pub fn capability_digest(
 }
 
 /// Verifies an Ed25519 signature over `blake3 || sha256 || capability_digest`.
+#[tracing::instrument(name = "extension_artifact_signature_verify", level = "debug", skip_all)]
 pub fn verify_artifact_signature(
 	key: &str,
 	blake3_digest: &str,
@@ -504,19 +564,24 @@ pub fn verify_artifact_signature(
 	capability_digest: &str,
 	signature: &str,
 ) -> Result<(), ExtensionError> {
-	let decode_digest = |digest: &str, prefix: &str| {
-		hex::decode(digest.strip_prefix(prefix).unwrap_or(digest).as_bytes())
-			.into_vec()
-			.map_err(|_| ExtensionError::new(ExtensionCode::ESig, format!("invalid {prefix} digest")))
-	};
-	let blake3 = decode_digest(blake3_digest, "b3:")?;
-	let sha256 = decode_digest(sha256_digest, "sha256:")?;
-	let capability = decode_digest(capability_digest, "b3:")?;
-	let mut message = Vec::with_capacity(blake3.len() + sha256.len() + capability.len());
-	message.extend_from_slice(&blake3);
-	message.extend_from_slice(&sha256);
-	message.extend_from_slice(&capability);
-	verify_signature(key, &message, signature)
+	let result = (|| {
+		let decode_digest = |digest: &str, prefix: &str| {
+			hex::decode(digest.strip_prefix(prefix).unwrap_or(digest).as_bytes())
+				.into_vec()
+				.map_err(|_| {
+					ExtensionError::new(ExtensionCode::ESig, format!("invalid {prefix} digest"))
+				})
+		};
+		let blake3 = decode_digest(blake3_digest, "b3:")?;
+		let sha256 = decode_digest(sha256_digest, "sha256:")?;
+		let capability = decode_digest(capability_digest, "b3:")?;
+		let mut message = Vec::with_capacity(blake3.len() + sha256.len() + capability.len());
+		message.extend_from_slice(&blake3);
+		message.extend_from_slice(&sha256);
+		message.extend_from_slice(&capability);
+		verify_signature(key, &message, signature)
+	})();
+	result
 }
 
 /// Verifies a detached Ed25519 signature over canonical authority-owned bytes.

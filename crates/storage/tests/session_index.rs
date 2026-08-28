@@ -183,23 +183,11 @@ fn prompt_history_lists_unique_prompts_newest_first() {
 	append_prompt(&index, &second, 0, 4_000, "duplicate prompt");
 	append_prompt(&index, &second, 1, 5_000, "newest prompt");
 
-	assert_eq!(
-		index.prompt_history("", 10).expect("recent prompt history"),
-		vec![
-			index::PromptHistoryEntry {
-				prompt: Str::from("newest prompt"),
-				ts_ms:  Some(5_000),
-			},
-			index::PromptHistoryEntry {
-				prompt: Str::from("duplicate prompt"),
-				ts_ms:  Some(4_000),
-			},
-			index::PromptHistoryEntry {
-				prompt: Str::from("older prompt"),
-				ts_ms:  Some(2_000),
-			},
-		]
-	);
+	assert_eq!(index.prompt_history("", 10).expect("recent prompt history"), vec![
+		index::PromptHistoryEntry { prompt: Str::from("newest prompt"), ts_ms: Some(5_000) },
+		index::PromptHistoryEntry { prompt: Str::from("duplicate prompt"), ts_ms: Some(4_000) },
+		index::PromptHistoryEntry { prompt: Str::from("older prompt"), ts_ms: Some(2_000) },
+	]);
 }
 
 #[test]
@@ -213,20 +201,12 @@ fn prompt_history_combines_prefix_and_token_and_substring_search() {
 	append_prompt(&index, &session, 2, 4_000, "parser only");
 	append_prompt(&index, &session, 3, 5_000, "tests only");
 
-	assert_eq!(
-		index.prompt_history("par tes", 10).expect("prefix search"),
-		vec![index::PromptHistoryEntry {
-			prompt: Str::from("parser tests"),
-			ts_ms:  Some(2_000),
-		}]
-	);
-	assert_eq!(
-		index.prompt_history("mit", 10).expect("infix search"),
-		vec![index::PromptHistoryEntry {
-			prompt: Str::from("commit changes"),
-			ts_ms:  Some(3_000),
-		}]
-	);
+	assert_eq!(index.prompt_history("par tes", 10).expect("prefix search"), vec![
+		index::PromptHistoryEntry { prompt: Str::from("parser tests"), ts_ms: Some(2_000) }
+	]);
+	assert_eq!(index.prompt_history("mit", 10).expect("infix search"), vec![
+		index::PromptHistoryEntry { prompt: Str::from("commit changes"), ts_ms: Some(3_000) }
+	]);
 	assert!(
 		index
 			.prompt_history("parser changes", 10)
@@ -246,13 +226,9 @@ fn prompt_history_excludes_non_interactive_sessions() {
 	append_prompt(&index, &interactive, 0, 2_000, "visible prompt");
 	append_prompt(&index, &subagent, 0, 3_000, "hidden prompt");
 
-	assert_eq!(
-		index.prompt_history("", 10).expect("interactive history"),
-		vec![index::PromptHistoryEntry {
-			prompt: Str::from("visible prompt"),
-			ts_ms:  Some(2_000),
-		}]
-	);
+	assert_eq!(index.prompt_history("", 10).expect("interactive history"), vec![
+		index::PromptHistoryEntry { prompt: Str::from("visible prompt"), ts_ms: Some(2_000) }
+	]);
 	assert!(
 		index
 			.prompt_history("hidden", 10)
@@ -318,19 +294,16 @@ fn opening_v4_index_migrates_prompt_history_without_fabricating_timestamps() {
 	let index = SessionIndex::open(&path).expect("migrate v4 index");
 	let migrated = Connection::open(&path).expect("inspect migrated database");
 	let schema_version = migrated
-		.query_row(
-			"SELECT schema_version FROM index_meta WHERE singleton = 1",
-			[],
-			|row| row.get::<_, i64>(0),
-		)
+		.query_row("SELECT schema_version FROM index_meta WHERE singleton = 1", [], |row| {
+			row.get::<_, i64>(0)
+		})
 		.expect("read migrated schema version");
 	assert_eq!(schema_version, 5);
 	assert_eq!(
-		index.prompt_history("", 10).expect("migrated prompt history"),
-		vec![index::PromptHistoryEntry {
-			prompt: Str::from("preserved prompt"),
-			ts_ms:  None,
-		}]
+		index
+			.prompt_history("", 10)
+			.expect("migrated prompt history"),
+		vec![index::PromptHistoryEntry { prompt: Str::from("preserved prompt"), ts_ms: None }]
 	);
 }
 

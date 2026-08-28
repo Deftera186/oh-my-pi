@@ -135,7 +135,18 @@ pub(crate) async fn pick_session(
 		})
 		.collect();
 	let picked = run_list("Resume session", &rows).await?;
-	Ok(picked.and_then(|index| sessions.into_iter().nth(index)))
+	let candidate_count = rows.len();
+	let selection = picked.and_then(|index| sessions.into_iter().nth(index));
+	if let Some(selection) = &selection {
+		tracing::debug!(
+			session_id = %selection.session.id.0,
+			candidate_count,
+			"session selected from resume picker"
+		);
+	} else {
+		tracing::debug!(candidate_count, "resume session picker closed without selection");
+	}
+	Ok(selection)
 }
 
 fn read_index(

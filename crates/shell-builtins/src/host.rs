@@ -277,6 +277,7 @@ impl Host {
 
 	/// Writes `<name>: <message>` to stderr and records exit status `code`.
 	pub fn error(&mut self, message: impl Display, code: i32) {
+		tracing::warn!(builtin = self.name.as_str(), exit_code = code, "builtin operation failed");
 		let _ = writeln!(self.stderr, "{}: {message}", self.name);
 		self.fail(code);
 	}
@@ -854,6 +855,7 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 	let argv = match U::rewrite_argv(argv) {
 		Ok(argv) => argv,
 		Err(message) => {
+			tracing::warn!(builtin = U::NAME, "builtin argument rewrite failed");
 			let _ = writeln!(context.stderr(), "{}: {message}", U::NAME);
 			return Ok(ExecutionResult::new(U::USAGE_ERROR));
 		},
@@ -866,6 +868,11 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 			// stdout with a success status, everything else on stderr.
 			let rendered = err.to_string();
 			if err.use_stderr() {
+				tracing::warn!(
+					builtin = U::NAME,
+					error_kind = ?err.kind(),
+					"builtin arguments rejected"
+				);
 				let _ = write!(context.stderr(), "{rendered}");
 				return Ok(ExecutionResult::new(U::USAGE_ERROR));
 			}
@@ -898,20 +905,38 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 				biased;
 				() = token.cancelled() => {
 					cancel_flag.store(true, Ordering::Relaxed);
-					let _ = (&mut handle).await;
+					let _ = resolve_builtin_task::<U>((&mut handle).await);
 					130
 				},
 				result = &mut handle => {
 					// If the token already fired, the task only finished because
 					// our cancel flag unblocked it — report interrupted.
-					if token_check.is_cancelled() { 130 } else { result.unwrap_or(1) }
+					if token_check.is_cancelled() {
+						130
+					} else {
+						resolve_builtin_task::<U>(result)
+					}
 				},
 			}
 		},
-		None => handle.await.unwrap_or(1),
+		None => resolve_builtin_task::<U>(handle.await),
 	};
 
 	Ok(ExecutionResult::new((code & 0xff) as u8))
+}
+
+fn resolve_builtin_task<U: Utility>(result: Result<i32, task::JoinError>) -> i32 {
+	match result {
+		Ok(code) => code,
+		Err(error) => {
+			tracing::error!(
+				builtin = U::NAME,
+				cancelled = error.is_cancelled(),
+				"builtin worker task failed"
+			);
+			1
+		},
+	}
 }
 
 /// Runs a utility body, containing any panic at the builtin boundary.
@@ -933,6 +958,7 @@ pub(crate) fn run_caught<U: Utility>(parsed: U, host: &mut Host) -> i32 {
 	match catch_unwind(AssertUnwindSafe(|| parsed.run(host))) {
 		Ok(code) => code,
 		Err(_) => {
+			tracing::error!(builtin = U::NAME, "builtin panicked");
 			let _ = writeln!(host.stderr, "{}: internal error", U::NAME);
 			1
 		},

@@ -297,6 +297,12 @@ impl DapProtocol {
 
 	/// Spawns an adapter using its declared stdio, TCP, Unix-socket, or
 	/// reverse-client transport and waits for a bounded owner-local connection.
+	#[tracing::instrument(
+		name = "dap_server_spawn",
+		level = "debug",
+		skip_all,
+		fields(command = %command)
+	)]
 	pub async fn spawn_adapter(
 		command: &str,
 		args: &[Str],

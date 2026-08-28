@@ -15,6 +15,7 @@ workspace = true
 omp-shell-builtins = { workspace = true }
 omp-shell-engine = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

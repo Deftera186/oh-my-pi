@@ -735,8 +735,12 @@ impl Spec {
 			("COMP_CWORD", context.token_index.to_string().into()),
 		];
 
-		tracing::debug!(target: trace_categories::COMPLETION, "[calling completion func '{function_name}']: {}",
-            vars_and_values.iter().map(|(k, v)| std::format!("{k}={v}")).collect::<Vec<String>>().join(" "));
+		tracing::debug!(
+			target: trace_categories::COMPLETION,
+			function = %function_name,
+			variable_count = vars_and_values.len(),
+			"invoking shell completion function"
+		);
 
 		let mut vars_to_remove = Vec::with_capacity(vars_and_values.len());
 		for (var, value) in vars_and_values {
@@ -769,8 +773,6 @@ impl Spec {
 			.invoke_function(function_name, args.iter(), &params)
 			.await;
 
-		tracing::debug!(target: trace_categories::COMPLETION, "[completion function '{function_name}' returned: {invoke_result:?}]");
-
 		shell.release_trap_delivery_block();
 
 		// Make a best-effort attempt to unset the temporary variables.
@@ -778,10 +780,15 @@ impl Spec {
 			let _ = shell.env_mut().unset(var_name);
 		}
 
-		let result = invoke_result.unwrap_or_else(|e| {
-            tracing::warn!(target: trace_categories::COMPLETION, "error while running completion function '{function_name}': {e}");
-            1 // Report back a non-zero exit code.
-        });
+		let result = invoke_result.unwrap_or_else(|error| {
+			tracing::warn!(
+				target: trace_categories::COMPLETION,
+				function = %function_name,
+				error = %error,
+				"shell completion function failed"
+			);
+			1 // Report back a non-zero exit code.
+		});
 
 		// When the function returns the special value 124, then it's a request
 		// for us to restart the completion process.
@@ -789,8 +796,6 @@ impl Spec {
 			Ok(Answer::RestartCompletionProcess)
 		} else {
 			if let Some(reply) = shell.env_mut().unset("COMPREPLY")? {
-				tracing::debug!(target: trace_categories::COMPLETION, "[completion function yielded: {reply:?}]");
-
 				match reply.value() {
 					variables::ShellValue::IndexedArray(values) => {
 						return Ok(Answer::Candidates(

@@ -365,13 +365,22 @@ impl SshService {
 		let host = self.hosts.get(alias)?;
 		let timeout = Duration::from_secs(host.timeout_secs.clamp(1, MAX_TIMEOUT_SECS));
 		let deadline = time::Instant::now() + timeout;
-		time::timeout_at(deadline, operation)
-			.await
-			.map_err(|_| SshError::Timeout)?
+		match time::timeout_at(deadline, operation).await {
+			Ok(result) => result,
+			Err(_) => Err(SshError::Timeout),
+		}
 	}
 
+	#[tracing::instrument(
+		name = "ssh_connect",
+		level = "debug",
+		skip_all,
+		fields(alias = %alias, host = tracing::field::Empty, port = tracing::field::Empty),
+	)]
 	async fn connect(&self, alias: &str) -> Result<client::Handle<ClientHandler>, SshError> {
 		let host = self.hosts.get(alias)?;
+		tracing::Span::current().record("host", host.address.as_str());
+		tracing::Span::current().record("port", host.port);
 		let connect = client::connect(
 			Arc::new(client::Config::default()),
 			(host.address.as_str(), host.port),
@@ -416,6 +425,7 @@ impl SshService {
 
 	/// Initializes SFTP, then marks both SFTP and exec available without running
 	/// a probe command.
+	#[tracing::instrument(name = "ssh_probe", level = "debug", skip_all, fields(alias = %alias))]
 	pub async fn probe(&self, alias: &str) -> Result<HostCapabilities, SshError> {
 		self
 			.with_deadline(alias, async {
@@ -433,6 +443,7 @@ impl SshService {
 	/// The effective bound is the smaller of `max_bytes` and 8 MiB; metadata
 	/// known to exceed it, or a stream that crosses it, returns
 	/// [`SshError::Limit`].
+	#[tracing::instrument(name = "ssh_read", level = "debug", skip_all, fields(alias = %alias, path = %path, max_bytes = max_bytes))]
 	pub async fn read(
 		&self,
 		alias: &str,
@@ -470,6 +481,12 @@ impl SshService {
 	///
 	/// The UTF-8 `path` is passed directly to SFTP, and completion includes a
 	/// server sync and channel shutdown.
+	#[tracing::instrument(
+		name = "ssh_write",
+		level = "debug",
+		skip_all,
+		fields(alias = %alias, path = %path, bytes = bytes.len()),
+	)]
 	pub async fn write(&self, alias: &str, path: &str, bytes: &[u8]) -> Result<(), SshError> {
 		if bytes.len() > DEFAULT_WRITE_LIMIT {
 			return Err(SshError::Limit { limit: DEFAULT_WRITE_LIMIT });
@@ -493,6 +510,7 @@ impl SshService {
 	///
 	/// The UTF-8 path is passed directly to SFTP; an omitted server length is
 	/// reported as zero.
+	#[tracing::instrument(name = "ssh_stat", level = "debug", skip_all, fields(alias = %alias, path = %path))]
 	pub async fn stat(&self, alias: &str, path: &str) -> Result<RemoteMetadata, SshError> {
 		self
 			.with_deadline(alias, async {
@@ -510,6 +528,7 @@ impl SshService {
 	///
 	/// At most the smaller of `max_entries` and 1,000 entries are returned; the
 	/// boolean result reports whether additional entries were discarded.
+	#[tracing::instrument(name = "ssh_list", level = "debug", skip_all, fields(alias = %alias, path = %path, max_entries = max_entries))]
 	pub async fn list(
 		&self,
 		alias: &str,
@@ -544,6 +563,7 @@ impl SshService {
 	}
 
 	/// Opens a bounded bidirectional channel to one remote command.
+	#[tracing::instrument(name = "ssh_interactive_open", level = "debug", skip_all, fields(alias = %alias))]
 	pub async fn open_interactive(
 		&self,
 		alias: &str,
@@ -566,6 +586,12 @@ impl SshService {
 
 	/// Binds a loopback listener and forwards accepted TCP connections through
 	/// the configured SSH host.
+	#[tracing::instrument(
+		name = "ssh_local_forward",
+		level = "debug",
+		skip_all,
+		fields(alias = %alias, local_port = local_port, remote_host = %remote_host, remote_port = remote_port),
+	)]
 	pub async fn local_forward(
 		&self,
 		alias: &str,
@@ -601,6 +627,7 @@ impl SshService {
 	///
 	/// NUL-containing commands are rejected. Stdout and stderr are each bounded
 	/// independently by the smaller of `max_bytes` and 1 MiB.
+	#[tracing::instrument(name = "ssh_exec", level = "debug", skip_all, fields(alias = %alias, max_bytes = max_bytes))]
 	pub async fn exec(
 		&self,
 		alias: &str,

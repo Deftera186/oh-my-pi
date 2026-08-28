@@ -21,3 +21,4 @@ omp-walker.workspace = true
 regex.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+tracing = { workspace = true }

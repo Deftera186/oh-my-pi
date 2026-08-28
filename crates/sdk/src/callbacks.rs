@@ -268,6 +268,10 @@ impl CredentialSource for SdkCredentialSource {
 		_lease: &'a CredentialLease,
 		_evidence: AuthRejection,
 	) -> futures::future::BoxFuture<'a, Result<(), CredentialError>> {
+		tracing::warn!(
+			session_id = %self.session_id,
+			"SDK credential rejected by provider"
+		);
 		Box::pin(std::future::ready(Ok(())))
 	}
 }

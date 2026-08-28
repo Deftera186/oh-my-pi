@@ -166,41 +166,43 @@ pub struct Computer {
 	spec: ToolSpec,
 }
 
+/// Builds the host-free `computer@1` declaration.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("computer"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(
+			"Captures and controls the native desktop through a persistent supervised session. Set \
+			 read_only for inspection-only calls."
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: None,
+			exec:      None,
+			inference: None,
+			desktop:   Some(DesktopEffects {
+				capture:       true,
+				accessibility: true,
+				input:         true,
+			}),
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("computer.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates `computer@1`.
 pub fn tool(host: Arc<dyn ComputerHost>) -> Computer {
-	Computer {
-		host,
-		spec: ToolSpec {
-			name:            sf!("computer"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(
-				"Captures and controls the native desktop through a persistent supervised session. \
-				 Set read_only for inspection-only calls."
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: None,
-				exec:      None,
-				inference: None,
-				desktop:   Some(DesktopEffects {
-					capture:       true,
-					accessibility: true,
-					input:         true,
-				}),
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("computer.rs"),
-			)
-			.into(),
-		},
-	}
+	Computer { host, spec: spec() }
 }
 
 impl Tool for Computer {

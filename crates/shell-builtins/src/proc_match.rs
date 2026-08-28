@@ -108,6 +108,11 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 					return Ok(ExecutionResult::success());
 				},
 				Err((code, message)) => {
+					tracing::warn!(
+						builtin = command_name.as_str(),
+						exit_code = code,
+						"builtin arguments rejected"
+					);
 					writeln!(context.stderr(), "{command_name}: {message}")?;
 					return Ok(ExecutionResult::new(code));
 				},
@@ -121,6 +126,7 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 				match select_processes(&mut options, context.params.process_scope()) {
 					Ok(selected) => selected,
 					Err(message) => {
+						tracing::warn!(builtin = command_name.as_str(), "process selection failed");
 						writeln!(context.stderr(), "{command_name}: {message}")?;
 						return Ok(ExecutionResult::new(2));
 					},
@@ -195,6 +201,11 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 						// tear down the session this shell runs in. Refuse late, at
 						// delivery, so only the destructive mode is affected.
 						if host.pids.contains(&process.pid()) {
+							tracing::warn!(
+								builtin = command_name.as_str(),
+								pid = process.pid(),
+								"process signal denied for shell process"
+							);
 							if !options.quiet {
 								writeln!(
 									context.stderr(),
@@ -210,6 +221,11 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 							.process_scope()
 							.is_some_and(|scope| !scope.may_signal(process.pid()))
 						{
+							tracing::warn!(
+								builtin = command_name.as_str(),
+								pid = process.pid(),
+								"process signal denied outside scope"
+							);
 							if !options.quiet {
 								writeln!(
 									context.stderr(),
@@ -221,6 +237,12 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 							continue;
 						}
 						if !process.signal(options.signal, options.queue) {
+							tracing::warn!(
+								builtin = command_name.as_str(),
+								pid = process.pid(),
+								signal = options.signal,
+								"process signal delivery failed"
+							);
 							if !options.quiet {
 								writeln!(
 									context.stderr(),

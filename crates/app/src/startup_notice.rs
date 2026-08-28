@@ -57,9 +57,11 @@ pub fn stop_watchdog() {
 		return;
 	};
 	let _ = watchdog.stop.send(());
+	let startup_dispatch_ms = watchdog.started.elapsed().as_millis();
 	if env::var_os("OMP_TIMING").is_some() {
-		eprintln!("OMP_TIMING startup_dispatch_ms={}", watchdog.started.elapsed().as_millis());
+		eprintln!("OMP_TIMING startup_dispatch_ms={}", startup_dispatch_ms);
 	}
+	tracing::info!(startup_dispatch_ms, "cli dispatch handed off");
 }
 
 const RELEASE_NOTES: &str = concat!(

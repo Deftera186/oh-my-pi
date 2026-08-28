@@ -7,6 +7,7 @@ use omp_shell::{
 	Error, ExecutionExitCode, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellExtensions,
 	SourceInfo, builtins, process_builtins, utility_builtins,
 };
+use tracing::Instrument as _;
 
 const USAGE: &str = "usage: omp-sh [-c command [name [argument ...]]] [script [argument ...]]";
 
@@ -17,6 +18,14 @@ enum Invocation {
 }
 
 impl Invocation {
+	fn kind(&self) -> &'static str {
+		match self {
+			Self::Command { .. } => "command",
+			Self::Script { .. } => "script",
+			Self::Stdin => "stdin",
+		}
+	}
+
 	fn parse() -> Result<Self, &'static str> {
 		let mut args = env::args().skip(1);
 		match args.next() {
@@ -39,14 +48,22 @@ async fn main() -> ExitCode {
 	ExitCode::from(run().await)
 }
 
+#[tracing::instrument(
+	level = "debug",
+	name = "shell_session",
+	skip_all,
+	fields(invocation = tracing::field::Empty)
+)]
 async fn run() -> u8 {
 	let mut invocation = match Invocation::parse() {
 		Ok(invocation) => invocation,
 		Err(message) => {
+			tracing::warn!("shell invocation rejected");
 			eprintln!("{message}\n{USAGE}");
 			return 2;
 		},
 	};
+	tracing::Span::current().record("invocation", invocation.kind());
 
 	let reads_stdin = matches!(invocation, Invocation::Stdin);
 	let (shell_name, shell_args) = match &mut invocation {
@@ -72,31 +89,37 @@ async fn run() -> u8 {
 				.map(|(name, reg)| (name.to_owned(), reg)),
 		)
 		.build()
+		.instrument(tracing::debug_span!("shell_open"))
 		.await
 	{
 		Ok(shell) => shell,
 		Err(error) => {
+			tracing::error!("shell session initialization failed");
 			eprintln!("omp-sh: {error}");
 			return u8::from(ExecutionExitCode::from(&error));
 		},
 	};
 
-	let result = match invocation {
-		Invocation::Command { command, .. } => shell.run_dash_c_command(command).await,
-		Invocation::Script { path, args } => shell.run_script(path, args.into_iter()).await,
-		Invocation::Stdin => {
-			let mut command = String::new();
-			if let Err(error) = io::stdin().read_to_string(&mut command) {
-				return report_error(&shell, error.into());
-			}
-			let params = shell.default_exec_params();
-			let result = shell
-				.run_string(command, &SourceInfo::from("<stdin>"), &params)
-				.await;
-			let _ = shell.on_exit().await;
-			result
-		},
-	};
+	let result = async {
+		match invocation {
+			Invocation::Command { command, .. } => shell.run_dash_c_command(command).await,
+			Invocation::Script { path, args } => shell.run_script(path, args.into_iter()).await,
+			Invocation::Stdin => {
+				let mut command = String::new();
+				if let Err(error) = io::stdin().read_to_string(&mut command) {
+					return Err(error.into());
+				}
+				let params = shell.default_exec_params();
+				let result = shell
+					.run_string(command, &SourceInfo::from("<stdin>"), &params)
+					.await;
+				let _ = shell.on_exit().await;
+				result
+			},
+		}
+	}
+	.instrument(tracing::debug_span!("shell_execute"))
+	.await;
 
 	match result {
 		Ok(result) => result.exit_code.into(),
@@ -105,6 +128,7 @@ async fn run() -> u8 {
 }
 
 fn report_error(shell: &Shell<impl ShellExtensions>, error: Error) -> u8 {
+	tracing::warn!("shell session operation failed");
 	let _ = shell.display_error(&mut io::stderr().lock(), &error);
 	error.into_result(shell).exit_code.into()
 }

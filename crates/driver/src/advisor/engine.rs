@@ -540,16 +540,13 @@ impl AdvisorEngine {
 	}
 
 	fn usage_for(&self, worker: &AdvisorWorker) -> AdvisorUsageTotals {
-		self
-			.transcripts
-			.as_ref()
-			.map_or(worker.usage, |transcripts| {
-				if transcripts.cost_restore_finished() {
-					transcripts.totals(worker.id.as_str())
-				} else {
-					worker.usage
-				}
-			})
+		let mut usage = worker.usage;
+		if let Some(transcripts) = &self.transcripts
+			&& transcripts.cost_restore_finished()
+		{
+			usage.accumulate(transcripts.totals(worker.id.as_str()));
+		}
+		usage
 	}
 
 	fn worker(&self, advisor_id: &str) -> Option<&AdvisorWorker> {

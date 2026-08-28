@@ -13,10 +13,7 @@ use futures::StreamExt as _;
 use image::{GenericImageView as _, ImageFormat, imageops::FilterType};
 use md5::{Digest as _, Md5};
 use omp_core::Str;
-use omp_envd::{
-	exec::ExecHost,
-	vcs::git::{commands::GitCommands, runner::GitRunner},
-};
+use omp_envd::vcs::git::commands::GitCommands;
 use regex::Regex;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +27,7 @@ const MAX_AVATAR_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AvatarLoader {
 	cache_dir: PathBuf,
-	client:    reqwest::Client,
+	client:    omp_http::Client,
 	commands:  GitCommands,
 }
 
@@ -38,11 +35,7 @@ impl AvatarLoader {
 	/// Creates a loader using the canonical OMP cache root.
 	pub fn new() -> Option<Self> {
 		let cache_dir = cache_root()?.join("avatars");
-		Some(Self {
-			cache_dir,
-			client: omp_http::default_client(),
-			commands: GitCommands::new(GitRunner::new(ExecHost::new())),
-		})
+		Some(Self { cache_dir, client: omp_http::default_client(), commands: GitCommands::new() })
 	}
 
 	/// Returns a cached or remotely resolved 64-pixel PNG, or `None` for a miss.

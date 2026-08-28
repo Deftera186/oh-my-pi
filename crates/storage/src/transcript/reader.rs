@@ -464,6 +464,12 @@ pub struct Reader {
 impl Reader {
 	/// Opens a transcript and parses its complete physical lines with bounded
 	/// `BufRead` scratch rather than loading the whole file.
+	#[tracing::instrument(
+		name = "journal_replay",
+		level = "debug",
+		skip_all,
+		fields(path = %path.display())
+	)]
 	pub fn open(path: &Path) -> Result<Self, Error> {
 		let file = File::open(path)?;
 		let identity = file_identity(&file.metadata()?);
@@ -529,6 +535,18 @@ impl Reader {
 		let log = Log { header, events, diagnostics };
 		let mut live = LiveSet::new();
 		log.live_into(&mut live);
+		if !log.diagnostics.is_empty() || tail_diagnostic.is_some() {
+			tracing::warn!(
+				diagnostic_count = log.diagnostics.len(),
+				tail_bytes,
+				"journal replay retained recoverable damage"
+			);
+		}
+		tracing::debug!(
+			event_count = log.len(),
+			live_event_count = live.len(),
+			"journal replay completed"
+		);
 		Ok(Self {
 			path: path.to_owned(),
 			file: Some(file),
@@ -817,6 +835,12 @@ pub fn load(path: &Path) -> Result<Log, Error> {
 /// `yield_batch` runs after each `batch_entries` records, allowing async owners
 /// to cooperatively yield without coupling storage to one executor. Returning
 /// `false` from `visit` stops after the current record.
+#[tracing::instrument(
+	name = "journal_replay",
+	level = "debug",
+	skip_all,
+	fields(path = %path.display(), batch_entries = batch_entries)
+)]
 pub fn visit_batched(
 	path: &Path,
 	batch_entries: usize,
@@ -895,6 +919,19 @@ pub fn visit_batched(
 			DiagnosticKind::Truncated => counters.truncated = counters.truncated.saturating_add(1),
 		}
 	}
+	if !diagnostics.is_empty() {
+		tracing::warn!(
+			malformed_records = counters.malformed,
+			truncated_records = counters.truncated,
+			"journal replay retained recoverable damage"
+		);
+	}
+	tracing::debug!(
+		event_count = records,
+		malformed_records = counters.malformed,
+		truncated_records = counters.truncated,
+		"journal replay completed"
+	);
 	Ok(VisitReport { header, records, counters, diagnostics })
 }
 

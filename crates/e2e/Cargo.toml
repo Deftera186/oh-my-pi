@@ -55,7 +55,7 @@ omp-serve = { workspace = true }
 omp-shell = { workspace = true }
 omp-shell-engine = { workspace = true }
 omp-storage = { workspace = true }
-omp-telemetry = { workspace = true }
+omp-observability = { workspace = true }
 omp-tool = { workspace = true }
 omp-tools = { workspace = true }
 omp-tui = { workspace = true }

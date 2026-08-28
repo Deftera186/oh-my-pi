@@ -670,7 +670,7 @@ impl Tool for ReportIssue {
 				"rev": params.rev,
 				"verdict": params.verdict,
 			});
-			let redacted = omp_telemetry::redact::redact_sensitive_credentials(&encoded.to_string());
+			let redacted = omp_observability::redact::redact_sensitive_credentials(&encoded.to_string());
 			let payload_len = match u32::try_from(redacted.len()) {
 				Ok(length) => length,
 				Err(_) => {

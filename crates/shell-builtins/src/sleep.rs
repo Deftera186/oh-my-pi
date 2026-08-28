@@ -19,6 +19,21 @@ pub(crate) struct SleepCommand {
 impl builtins::Command for SleepCommand {
 	type Error = omp_shell_engine::Error;
 
+	fn new<I>(args: I) -> result::Result<Self, clap::Error>
+	where
+		I: IntoIterator<Item = String>,
+	{
+		Self::try_parse_from(args).inspect_err(|error| {
+			if error.use_stderr() {
+				tracing::warn!(
+					builtin = "sleep",
+					error_kind = ?error.kind(),
+					"builtin arguments rejected"
+				);
+			}
+		})
+	}
+
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
@@ -31,6 +46,7 @@ impl builtins::Command for SleepCommand {
 			let mut total = Duration::ZERO;
 			for duration in &durations {
 				let Some(parsed) = parse_duration(duration) else {
+					tracing::warn!(builtin = "sleep", "builtin duration rejected");
 					let _ = writeln!(context.stderr(), "sleep: invalid time interval '{duration}'");
 					return Ok(ExecutionResult::new(1));
 				};

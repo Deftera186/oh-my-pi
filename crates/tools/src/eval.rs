@@ -25,6 +25,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
 use omp_core::{CowBytes, Str, sf};
+use omp_env::EnvClient;
 use omp_proto::inference::v1::{InvokeInput, invoke_input, invoke_input::chunk};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
@@ -34,7 +35,7 @@ use omp_tool::{
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::OnceCell;
+use tokio::{runtime, sync::OnceCell};
 
 use crate::{
 	auto_background::{
@@ -876,21 +877,65 @@ struct OwnerSession {
 /// External reset and disposal trigger used when chat identity changes.
 #[derive(Clone)]
 pub struct EvalSessionControl {
-	reset_generation: Arc<AtomicU64>,
-	dispose_all:      Arc<dyn Fn() + Send + Sync>,
+	inner: Arc<EvalSessionControlInner>,
+}
+
+enum EvalSessionControlInner {
+	Local { reset_generation: AtomicU64, dispose_all: Arc<dyn Fn() + Send + Sync> },
+	Remote { client: EnvClient, runtime: runtime::Handle },
 }
 
 impl Default for EvalSessionControl {
 	fn default() -> Self {
-		Self { reset_generation: Arc::new(AtomicU64::new(0)), dispose_all: Arc::new(|| {}) }
+		Self {
+			inner: Arc::new(EvalSessionControlInner::Local {
+				reset_generation: AtomicU64::new(0),
+				dispose_all:      Arc::new(|| {}),
+			}),
+		}
 	}
 }
 
 impl EvalSessionControl {
+	/// Creates a reset capability backed by a remote Environment client.
+	///
+	/// Calls to [`Self::request_reset`] remain synchronous and schedule exactly
+	/// one cold protocol request on the Tokio runtime active at construction.
+	#[must_use]
+	pub fn from_client(client: EnvClient) -> Self {
+		Self {
+			inner: Arc::new(EvalSessionControlInner::Remote {
+				client,
+				runtime: runtime::Handle::current(),
+			}),
+		}
+	}
+
 	/// Disposes every live process and makes each owner's next cell fresh.
 	pub fn request_reset(&self) {
-		self.reset_generation.fetch_add(1, Ordering::AcqRel);
-		(self.dispose_all)();
+		match self.inner.as_ref() {
+			EvalSessionControlInner::Local { reset_generation, dispose_all } => {
+				reset_generation.fetch_add(1, Ordering::AcqRel);
+				dispose_all();
+			},
+			EvalSessionControlInner::Remote { client, runtime } => {
+				let client = client.clone();
+				drop(runtime.spawn(async move {
+					if let Err(error) = client.reset_eval().await {
+						tracing::warn!(error = ?error, "remote evaluation reset failed");
+					}
+				}));
+			},
+		}
+	}
+
+	fn reset_generation(&self) -> u64 {
+		match self.inner.as_ref() {
+			EvalSessionControlInner::Local { reset_generation, .. } => {
+				reset_generation.load(Ordering::Acquire)
+			},
+			EvalSessionControlInner::Remote { .. } => 0,
+		}
 	}
 }
 
@@ -902,6 +947,42 @@ pub fn eval<E: EvalExec>(exec: E) -> EvalTool<E> {
 /// Constructs `eval@1` together with its owning session reset capability.
 pub fn eval_controlled<E: EvalExec>(exec: E) -> (EvalTool<E>, EvalSessionControl) {
 	eval_controlled_described(exec, standard_eval_description())
+}
+
+/// Builds the host-free `eval@1` declaration for a frozen prompt description.
+pub fn spec(description: Str) -> ToolSpec {
+	ToolSpec {
+		name: sf!("eval"),
+		rev: Rev { family: Str::default(), n: 1 },
+		description,
+		schema: omp_tool::schema::<Params>(),
+		constraint: Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects: Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("**")].into_iter().collect(),
+			}),
+			exec:      Some(ExecEffects {
+				commands: [sf!("*")].into_iter().collect(),
+				network:  true,
+			}),
+			inference: Some(InferenceEffects {
+				max_requests: u32::MAX,
+				max_usd:      Usd::from_nanos(u64::MAX),
+			}),
+			desktop:   None,
+			subagents: u32::MAX,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("eval.rs"),
+		)
+		.into(),
+	}
 }
 
 /// Constructs `eval@1` with task guidance frozen from one live session
@@ -919,8 +1000,10 @@ fn eval_controlled_described<E: EvalExec>(
 ) -> (EvalTool<E>, EvalSessionControl) {
 	let disposer = exec.clone();
 	let control = EvalSessionControl {
-		reset_generation: Arc::new(AtomicU64::new(0)),
-		dispose_all:      Arc::new(move || disposer.dispose_all()),
+		inner: Arc::new(EvalSessionControlInner::Local {
+			reset_generation: AtomicU64::new(0),
+			dispose_all:      Arc::new(move || disposer.dispose_all()),
+		}),
 	};
 	let tool = EvalTool {
 		exec,
@@ -928,38 +1011,7 @@ fn eval_controlled_described<E: EvalExec>(
 		control: control.clone(),
 		next_background_name: AtomicU64::new(1),
 		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
-		spec: ToolSpec {
-			name: sf!("eval"),
-			rev: Rev { family: Str::default(), n: 1 },
-			description,
-			schema: omp_tool::schema::<Params>(),
-			constraint: Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects: Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect(),
-				}),
-				exec:      Some(ExecEffects {
-					commands: [sf!("*")].into_iter().collect(),
-					network:  true,
-				}),
-				inference: Some(InferenceEffects {
-					max_requests: u32::MAX,
-					max_usd:      Usd::from_nanos(u64::MAX),
-				}),
-				desktop:   None,
-				subagents: u32::MAX,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("eval.rs"),
-			)
-			.into(),
-		},
+		spec: spec(description),
 	};
 	(tool, control)
 }
@@ -1013,7 +1065,7 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 				return;
 			}
 
-			let reset_generation = self.control.reset_generation.load(Ordering::Acquire);
+			let reset_generation = self.control.reset_generation();
 			let owned = self
 				.sessions
 				.entry(owner.clone())
@@ -1097,11 +1149,11 @@ impl<E: EvalExec> Tool for EvalTool<E> {
 							let name =
 								next_background_name("eval", &self.next_background_name);
 							if let Ok(job) = run.detach(name).await {
-											 yield Ev::Done(detached_terminal(job));
-											 return;
-										 }
-											 auto_background = false;
-											 continue;
+								yield Ev::Done(detached_terminal(job));
+								return;
+							}
+							auto_background = false;
+							continue;
 						},
 						PendingEval::Interrupt(interrupt) => {
 							let interrupt = match interrupt {
@@ -1550,5 +1602,45 @@ mod tests {
 		);
 		assert_eq!(frames.first().and_then(|frame| frame.data.as_ref().first()), Some(&b'a'));
 		assert_eq!(frames.last().and_then(|frame| frame.data.as_ref().last()), Some(&b'c'));
+	}
+	#[test]
+	fn local_control_increments_generation_and_disposes_synchronously() {
+		let disposals = Arc::new(AtomicU64::new(0));
+		let observed = Arc::clone(&disposals);
+		let control = EvalSessionControl {
+			inner: Arc::new(EvalSessionControlInner::Local {
+				reset_generation: AtomicU64::new(0),
+				dispose_all:      Arc::new(move || {
+					observed.fetch_add(1, Ordering::AcqRel);
+				}),
+			}),
+		};
+
+		control.request_reset();
+		assert_eq!(control.reset_generation(), 1);
+		assert_eq!(disposals.load(Ordering::Acquire), 1);
+	}
+
+	#[tokio::test]
+	async fn remote_control_emits_exactly_one_reset_request() {
+		let (client, transport) = EnvClient::in_process(0);
+		let (requests, responses) = transport.into_parts();
+		let control = EvalSessionControl::from_client(client);
+		control.request_reset();
+
+		let request = requests.recv_async().await.expect("receive eval reset");
+		assert!(matches!(request.body, Some(omp_proto::env::v1::client_frame::Body::EvalReset(_))));
+		responses
+			.send_async(omp_proto::env::v1::ServerFrame {
+				request_id: request.request_id,
+				body: Some(omp_proto::env::v1::server_frame::Body::EvalReset(
+					omp_proto::env::v1::EvalResetResponse {},
+				)),
+				..omp_proto::env::v1::ServerFrame::default()
+			})
+			.await
+			.expect("answer eval reset");
+		tokio::task::yield_now().await;
+		assert!(requests.try_recv().is_err(), "control emitted more than one reset request");
 	}
 }

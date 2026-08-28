@@ -1049,6 +1049,7 @@ impl Cdp {
 
 	/// Record a committed URL and notify the host.
 	fn set_url(&self, url: &str) {
+		tracing::debug!(scheme = crate::navigation_scheme(url), "webview navigation committed");
 		let url = url.to_str();
 		self.state.lock().url = url.clone();
 		let _ = self.events.send(WebViewEvent::Navigated(url));

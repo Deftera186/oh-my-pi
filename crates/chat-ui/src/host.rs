@@ -23,10 +23,10 @@ use crate::{
 	CommandPalette, ExtensionDialog, ExtensionInspector, ExtensionInspectorEvent,
 	ExtensionModalEvent, ExtensionOverlay, GitIntent, GitWorkbench, GitWorkbenchEvent,
 	HistoryInspector, HistoryInspectorEvent, ImageOverlay, ImageOverlayEvent, Intent, ListPicker,
-	ListRow, ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent, PickerEvent,
-	PromptEvent, PromptOverlay, ProviderPicker, PtyEvent, PtyOverlay, RawStreamEvent,
-	RawStreamViewer, RewindTargetRow, SelectionPurpose, SessionRow, SettingChange, SettingRow,
-	Sidebar, SubmitMode, Welcome, WelcomeEvent,
+	ListRow, ModelHub, ModelHubEvent, ModelHubIntent, ModelPicker, ModelRow, PaletteAction,
+	PaletteEntry, PaletteEvent, PickerEvent, PromptEvent, PromptOverlay, ProviderPicker, PtyEvent,
+	PtyOverlay, RawStreamEvent, RawStreamViewer, RewindTargetRow, SelectionPurpose, SessionRow,
+	SettingChange, SettingRow, Sidebar, SubmitMode, Welcome, WelcomeEvent,
 	approval::{ApprovalEvent, ApprovalOverlay},
 	ask::{self, AskDialog, AskDialogEvent, AskRequest},
 	autoqa::{AutoQaConsent, ConsentRequest, Decision},
@@ -110,6 +110,9 @@ pub struct HostOptions {
 	/// Effective configured application bindings, consulted before legacy
 	/// fallback keys.
 	pub input_actions:          Vec<InputBinding>,
+	/// Resolved dequeue chord label rendered in pending queued-row hints;
+	/// `None` keeps the scene's platform default.
+	pub dequeue_hint:           Option<Str>,
 }
 
 impl Default for HostOptions {
@@ -122,6 +125,7 @@ impl Default for HostOptions {
 			title_enabled:          true,
 			resize_scrollback:      ResizeScrollback::Rebuild,
 			input_actions:          Vec::new(),
+			dequeue_hint:           None,
 		}
 	}
 }
@@ -187,6 +191,7 @@ pub async fn run(
 		title_enabled:          true,
 		resize_scrollback:      ResizeScrollback::Rebuild,
 		input_actions:          Vec::new(),
+		dequeue_hint:           None,
 	})
 	.await
 	.map(|_| ())
@@ -975,6 +980,8 @@ pub enum InputAction {
 	CycleModelBackward,
 	/// Open model selection.
 	SelectModel,
+	/// Open the fullscreen models hub.
+	OpenModelHub,
 	/// Toggle the latest tool tree.
 	ToggleToolTree,
 	/// Temporarily hand the expanded composer draft to an external editor.
@@ -1010,6 +1017,7 @@ impl InputAction {
 			Self::CycleModelForward => Key::Ctrl('p'),
 			Self::CycleModelBackward => Key::CyclePrevious,
 			Self::SelectModel => Key::Alt('p'),
+			Self::OpenModelHub => Key::Alt('m'),
 			Self::ToggleToolTree => Key::Ctrl('o'),
 			Self::ExternalEditor => Key::JumpNext,
 			Self::FollowUp => Key::FollowUp,
@@ -1035,6 +1043,7 @@ impl InputAction {
 			"app.model.cycle_forward" => Self::CycleModelForward,
 			"app.model.cycle_backward" => Self::CycleModelBackward,
 			"app.model.select" => Self::SelectModel,
+			"app.model.hub" => Self::OpenModelHub,
 			"app.tools.toggle_tree" => Self::ToggleToolTree,
 			"app.editor.external" => Self::ExternalEditor,
 			"app.message.follow_up" => Self::FollowUp,
@@ -1319,6 +1328,7 @@ impl RetainedChat {
 			InputAction::CycleModelForward => self.host.cycle_model(false, &self.intents),
 			InputAction::CycleModelBackward => self.host.cycle_model(true, &self.intents),
 			InputAction::SelectModel => self.host.open_models(&self.ctx),
+			InputAction::OpenModelHub => send(&self.intents, Intent::OpenModelHub),
 			InputAction::ToggleToolTree => {
 				let _ = self.host.chat.handle_key(Key::Ctrl('o'));
 			},
@@ -1457,6 +1467,7 @@ enum ListPurpose {
 enum Overlay {
 	Git(GitWorkbench),
 	Models(ModelPicker),
+	ModelHub(ModelHub),
 	GuidedGoal(GuidedGoalInterview),
 	PlanReview(PlanReviewOverlay),
 	PlanSave { prompt: PromptOverlay, content: Str },
@@ -1495,6 +1506,8 @@ enum OverlayEvent {
 	PtyKill { id: Str },
 	Close,
 	Pick(usize),
+	ModelHub(ModelHubIntent),
+	LoginRequest(Str),
 	Palette(PaletteAction),
 	PromptCancel,
 	Prompt(Str),
@@ -1520,6 +1533,36 @@ enum OverlayEvent {
 }
 
 impl Overlay {
+	const fn kind(&self) -> &'static str {
+		match self {
+			Self::Git(_) => "git",
+			Self::Models(_) => "models",
+			Self::ModelHub(_) => "model_hub",
+			Self::GuidedGoal(_) => "guided_goal",
+			Self::PlanReview(_) => "plan_review",
+			Self::PlanSave { .. } => "plan_save",
+			Self::Extensions(_) => "extensions",
+			Self::Pty(_) => "pty",
+			Self::Palette(_) => "palette",
+			Self::List { .. } => "list",
+			Self::AgentHub(_) => "agent_hub",
+			Self::Settings(_) => "settings",
+			Self::Selection(_) => "selection",
+			Self::Images(_) => "images",
+			Self::History(_) => "history",
+			Self::RawStream(_) => "raw_stream",
+			Self::AgentPrompt { .. } => "agent_prompt",
+			Self::Providers(_) => "providers",
+			Self::Approval(_) => "approval",
+			Self::ApprovalAmend { .. } => "approval_amend",
+			Self::Ask { .. } => "ask",
+			Self::ExtensionDialog { .. } => "extension_dialog",
+			Self::ExtensionOverlay { .. } => "extension_overlay",
+			Self::AutoQaConsent { .. } => "auto_qa_consent",
+			Self::Login { .. } => "login",
+		}
+	}
+
 	fn handle_key(&mut self, key: Key) -> OverlayEvent {
 		match self {
 			Self::Git(workbench) => git_workbench_event(workbench.handle_key(key)),
@@ -1545,6 +1588,7 @@ impl Overlay {
 			},
 			Self::Palette(palette) => palette_event(palette.handle_key(key)),
 			Self::List { picker, .. } => picker_event(picker.handle_key(key)),
+			Self::ModelHub(hub) => model_hub_event(hub.handle_key(key)),
 			Self::AgentHub(hub) => agent_hub_event(hub.handle_key(key)),
 			Self::Settings(settings) => settings_event(settings.handle_key(key)),
 			Self::Selection(selection) => selection_event(selection.handle_key(key)),
@@ -1586,6 +1630,7 @@ impl Overlay {
 		match self {
 			Self::Git(workbench) => git_workbench_event(workbench.handle_paste(text)),
 			Self::Models(picker) => picker_event(picker.handle_paste(text)),
+			Self::ModelHub(hub) => model_hub_event(hub.handle_paste(text)),
 			Self::GuidedGoal(interview) => guided_goal_event(interview.handle_paste(text)),
 			Self::PlanReview(review) => {
 				let event = review.handle_paste(text);
@@ -1650,6 +1695,7 @@ impl Overlay {
 				git_workbench_event(workbench.handle_mouse(col, row, kind, viewport))
 			},
 			Self::Models(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
+			Self::ModelHub(hub) => model_hub_event(hub.handle_mouse(col, row, kind, viewport)),
 			Self::GuidedGoal(interview) => {
 				guided_goal_event(interview.handle_mouse(col, row, kind, viewport))
 			},
@@ -1714,6 +1760,7 @@ impl Overlay {
 		match self {
 			Self::Git(workbench) => workbench.layer(viewport),
 			Self::Models(picker) => picker.layer(viewport),
+			Self::ModelHub(hub) => hub.layer(viewport),
 			Self::GuidedGoal(interview) => interview.layer(viewport),
 			Self::PlanReview(review) => review.layer(viewport),
 			Self::PlanSave { prompt, .. } => prompt.layer(viewport),
@@ -1753,6 +1800,25 @@ const fn picker_event(event: PickerEvent) -> OverlayEvent {
 		PickerEvent::Consumed => OverlayEvent::Consumed,
 		PickerEvent::Close => OverlayEvent::Close,
 		PickerEvent::Pick(index) => OverlayEvent::Pick(index),
+	}
+}
+fn model_hub_event(event: ModelHubEvent) -> OverlayEvent {
+	match event {
+		ModelHubEvent::Consumed => OverlayEvent::Consumed,
+		ModelHubEvent::Close => OverlayEvent::Close,
+		ModelHubEvent::AssignRole { role, selector, thinking, scope } => {
+			OverlayEvent::ModelHub(ModelHubIntent::AssignRole { role, selector, thinking, scope })
+		},
+		ModelHubEvent::UnassignRole { role, scope } => {
+			OverlayEvent::ModelHub(ModelHubIntent::UnassignRole { role, scope })
+		},
+		ModelHubEvent::SetFallbackChain { key, chain } => {
+			OverlayEvent::ModelHub(ModelHubIntent::SetFallbackChain { key, chain })
+		},
+		ModelHubEvent::SetCycleOrder { order } => {
+			OverlayEvent::ModelHub(ModelHubIntent::SetCycleOrder { order })
+		},
+		ModelHubEvent::Login(provider) => OverlayEvent::LoginRequest(provider),
 	}
 }
 fn guided_goal_event(event: GuidedGoalEvent) -> OverlayEvent {
@@ -1953,6 +2019,9 @@ async fn run_chat(
 	let mut recap_at: Option<Instant> = None;
 	let mut requested_exit = HostExit::Quit;
 	let input_actions = options.input_actions.clone();
+	if let Some(hint) = options.dequeue_hint.clone() {
+		host.chat.set_dequeue_hint(hint);
+	}
 	let HostOptions {
 		exit_on_session_change,
 		completion_notify,
@@ -2113,13 +2182,17 @@ async fn run_chat(
 											viewport,
 											&mut resize,
 										)?;
-									} else if (key == Key::Alt('m') || key == Key::Alt('p'))
+									} else if key == Key::Alt('p')
 										&& action_enabled(InputAction::SelectModel)
 									{
 										host.open_models(ctx);
 										if host.overlay.is_some() {
 											open_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 										}
+									} else if key == Key::Alt('m')
+										&& action_enabled(InputAction::OpenModelHub)
+									{
+										send(intents, Intent::OpenModelHub);
 									} else if let Some(scope) = ClipboardRead::for_key(key) {
 										paste_read = Some(PasteRead::start(scope));
 									} else if key == Key::Esc
@@ -2465,8 +2538,9 @@ fn apply_terminal_backend(
 	ctx: &UiContext,
 ) -> Option<GitIntent> {
 	match event {
-		BackendEvent::HistoryRewind { user_index, text } => {
+		BackendEvent::HistoryRewind { user_index, text, attachments } => {
 			let _ = host.chat.rewind_user(user_index, text.as_str());
+			host.chat.stage_attachments(attachments);
 			host.suppress_history_replay = true;
 			None
 		},
@@ -2616,6 +2690,14 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 		},
 		BackendEvent::ModelsUpdated { rows, current } => {
 			update_models(host, rows, current);
+		},
+		BackendEvent::OpenModelHub(data) => {
+			host.overlay = Some(Overlay::ModelHub(ModelHub::open(data, ctx)));
+		},
+		BackendEvent::ModelHubUpdated(data) => {
+			if let Some(Overlay::ModelHub(hub)) = &mut host.overlay {
+				hub.update(data);
+			}
 		},
 		BackendEvent::Sessions(rows) => open_sessions(host, rows, ctx),
 		BackendEvent::WelcomeLspServers(_) => {},
@@ -2825,6 +2907,11 @@ fn apply_overlay_event(
 		},
 		OverlayEvent::PtyInput { id, data } => send(intents, Intent::PtyInput { id, data }),
 		OverlayEvent::PtyKill { id } => send(intents, Intent::PtyKill { id }),
+		OverlayEvent::ModelHub(intent) => send(intents, Intent::ModelHub(intent)),
+		OverlayEvent::LoginRequest(provider) => {
+			send(intents, Intent::Login(Some(provider)));
+			host.overlay = None;
+		},
 		OverlayEvent::Close => {
 			if matches!(host.overlay, Some(Overlay::Extensions(_))) {
 				send(intents, Intent::CloseExtensionInspector);
@@ -3042,6 +3129,12 @@ fn palette_entries() -> Vec<PaletteEntry> {
 		)
 		.key("Alt+P"),
 		PaletteEntry::new(
+			"Configure models",
+			"Assign model roles and retry fallbacks",
+			PaletteAction::Intent(Intent::OpenModelHub),
+		)
+		.key("Alt+M"),
+		PaletteEntry::new(
 			"Toggle sidebar",
 			"Show or hide session facts",
 			PaletteAction::ToggleSidebar,
@@ -3230,6 +3323,7 @@ fn open_overlay(
 	viewport: Size,
 	_resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
+	let overlay_kind = host.overlay.as_ref().expect("overlay opened").kind();
 	if matches!(host.overlay.as_ref(), Some(Overlay::Git(_))) && host.saved_git_keymap.is_none() {
 		host.saved_git_keymap = Some(terminal.keymap().clone());
 		terminal.edit_keymap(|keymap| {
@@ -3253,9 +3347,14 @@ fn open_overlay(
 			.expect("overlay opened")
 			.layer(viewport),
 	);
-	renderer
-		.repaint(alt_enter.as_deref().unwrap_or(""), rendered.frame.clone(), viewport.height, &layers)
-		.map(|_| ())
+	renderer.repaint(
+		alt_enter.as_deref().unwrap_or(""),
+		rendered.frame.clone(),
+		viewport.height,
+		&layers,
+	)?;
+	tracing::debug!(overlay.kind = overlay_kind, "chat overlay opened");
+	Ok(())
 }
 
 fn close_overlay(
@@ -3273,6 +3372,7 @@ fn close_overlay(
 	let alt_exit = terminal.stage_alt_leave().unwrap_or("");
 	renderer.repaint(alt_exit, rendered.frame.clone(), viewport.height, &layers)?;
 	terminal.commit_alt_leave();
+	tracing::debug!("chat overlay closed");
 	Ok(())
 }
 
@@ -4136,6 +4236,7 @@ mod tests {
 			context:     None,
 			input_mtok:  None,
 			output_mtok: None,
+			efforts:     std::sync::Arc::from([]),
 		};
 		events
 			.send(BackendEvent::ModelsUpdated {

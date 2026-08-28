@@ -449,6 +449,7 @@ impl Execute for ast::Program {
 				Err(err) => {
 					// Cancellation is control flow; the caller decides whether to report it.
 					if !matches!(err.kind(), error::ErrorKind::Interrupted) {
+						tracing::warn!("shell command execution failed");
 						let _ = shell.display_error(&mut params.stderr(shell), &err);
 					}
 					result = err.into_result(shell);
@@ -765,6 +766,12 @@ impl Execute for ast::AndOrList {
 }
 
 impl Execute for ast::Pipeline {
+	#[tracing::instrument(
+		name = "shell_execute",
+		level = "debug",
+		skip_all,
+		fields(command_count = self.seq.len())
+	)]
 	async fn execute<SE: extensions::ShellExtensions>(
 		&self,
 		shell: &mut Shell<SE>,

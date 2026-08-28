@@ -76,6 +76,15 @@ pub enum UpdateCheckOutcome<T, E> {
 /// Runs update checks with a fixed concurrency ceiling and per-check timeout.
 ///
 /// Results retain input order even though checks complete out of order.
+#[tracing::instrument(
+	name = "extension_index_fetch",
+	level = "debug",
+	skip_all,
+	fields(
+		concurrency = limits.concurrency(),
+		timeout_ms = %limits.timeout().as_millis()
+	)
+)]
 pub async fn run_bounded_update_checks<I, F, Fut, T, E>(
 	items: I,
 	limits: UpdateCheckLimits,
@@ -100,7 +109,29 @@ where
 		.collect::<Vec<_>>()
 		.await;
 	completed.sort_by_key(|(ordinal, _)| *ordinal);
-	completed.into_iter().map(|(_, outcome)| outcome).collect()
+	let outcomes = completed
+		.into_iter()
+		.map(|(_, outcome)| outcome)
+		.collect::<Vec<_>>();
+	let failed = outcomes
+		.iter()
+		.filter(|outcome| matches!(outcome, UpdateCheckOutcome::Failed(_)))
+		.count();
+	let timed_out = outcomes
+		.iter()
+		.filter(|outcome| matches!(outcome, UpdateCheckOutcome::TimedOut))
+		.count();
+	if failed == 0 && timed_out == 0 {
+		tracing::debug!(check_count = outcomes.len(), "extension index fetch completed");
+	} else {
+		tracing::warn!(
+			check_count = outcomes.len(),
+			failed,
+			timed_out,
+			"extension index fetch failed"
+		);
+	}
+	outcomes
 }
 
 /// Durable exact-version pins used only by explicit resolver operations.

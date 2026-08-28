@@ -10,12 +10,10 @@ use std::{
 use async_stream::stream;
 use futures::Stream;
 use omp_agent::TurnId;
-use omp_core::{Str, sf};
+use omp_core::{EnvPath, Str, sf};
+use omp_env::{EnvClient, TransactionOutcome};
 use omp_proto::{
-	document::v1::{
-		self as doc_pb, commit_transaction_response, read_document_response, read_selection,
-		text_mutation,
-	},
+	document::v1::{self as doc_pb, read_selection, text_mutation},
 	thread::v1::{Item, Message, Part as ThreadPart, Role, item},
 };
 use omp_sdk::Url;
@@ -46,9 +44,12 @@ pub enum ProductionError {
 	/// Canonical project/session composition failed.
 	#[error("compression child session failed")]
 	Session,
-	/// Document authority rejected or failed an operation.
+	/// Environment DATA document authority rejected or failed an operation.
 	#[error(transparent)]
-	Document(#[from] omp_envd::docs::DocumentError),
+	Document(#[from] omp_env::ClientError),
+	/// The caller cancelled an in-flight document operation.
+	#[error("document operation was cancelled")]
+	Cancelled,
 	/// Document bytes were not UTF-8.
 	#[error("compression source is not UTF-8: {path:?}")]
 	Utf8 {
@@ -95,7 +96,7 @@ pub trait CompressProgress: Send + Sync + 'static {
 pub struct ProductionCompressHost {
 	root:           PathBuf,
 	data_dir:       PathBuf,
-	documents:      omp_envd::docs::DocumentHost,
+	documents:      EnvClient,
 	model_settings: omp_catalog::settings::ModelSettings,
 	_environment:   omp_envd::ProjectEnvironment,
 	progress:       Arc<dyn CompressProgress>,
@@ -167,17 +168,17 @@ impl ProductionCompressHost {
 			omp_agent::advisor::AdvisorAdviceQueue::default(),
 			&active,
 		);
-		let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
-			&root,
-			&state_dir,
-			&omp_env::project_state::document_socket(&state_dir),
-			false,
-			active.extensions.as_ref(),
-			&[],
-			settings_snapshot,
-			bridges,
-		)
-		.await?;
+		let environment =
+			omp_envd::ProjectEnvironment::attach(&root, &state_dir, omp_envd::AttachOptions {
+				py_eval: false,
+				approval_mode: None,
+				trusted_extensions: active.extensions.iter().cloned().collect(),
+				contributed_values: Vec::new(),
+				settings: settings_snapshot,
+				bridges,
+				spawn_idle_timeout: None,
+			})
+			.await?;
 		let resource_roots = [root.clone()];
 		let _active = discovery::gate_resources_discover(
 			environment.admission_gate().as_ref(),
@@ -189,7 +190,7 @@ impl ProductionCompressHost {
 		)
 		.await
 		.map_err(|_| ProductionError::Session)?;
-		let documents = environment.documents().clone();
+		let documents = environment.client().clone();
 		Ok(Self { root, data_dir, documents, model_settings, _environment: environment, progress })
 	}
 
@@ -223,27 +224,38 @@ impl CompressHost for ProductionCompressHost {
 	) -> impl Future<Output = Result<Str, Self::Error>> + Send {
 		let path = path.to_owned();
 		async move {
+			if cancel.is_cancelled() {
+				return Err(ProductionError::Cancelled);
+			}
 			let uri = Url::from_file_path(&path)
 				.map_err(|()| ProductionError::MissingContent { path: path.clone() })?;
-			let lease = self
-				.documents
-				.open(Str::new(uri.as_str()), None, cancel)
-				.await?;
-			let response = self
-				.documents
-				.read(
-					&lease,
-					doc_pb::ReadSelection {
-						selection: Some(read_selection::Selection::Whole(doc_pb::WholeDocument {})),
-					},
-					cancel,
-				)
-				.await?;
-			let content = match response.body {
-				Some(read_document_response::Body::Content(content)) => content,
-				_ => return Err(ProductionError::MissingContent { path }),
+			let env_path = EnvPath::new(Str::new(uri.as_str()))
+				.map_err(|_| ProductionError::MissingContent { path: path.clone() })?;
+			let lease = tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(ProductionError::Cancelled),
+				result = self.documents.open_document(&env_path, None) => result?,
 			};
-			self.documents.close(lease, cancel).await?;
+			let response = tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(ProductionError::Cancelled),
+				result = self.documents.read_document(
+					&lease,
+					None,
+					Some(doc_pb::ReadSelection {
+						selection: Some(read_selection::Selection::Whole(doc_pb::WholeDocument {})),
+					}),
+				) => result?,
+			};
+			let content = response
+				.content()
+				.cloned()
+				.ok_or_else(|| ProductionError::MissingContent { path: path.clone() })?;
+			tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(ProductionError::Cancelled),
+				result = lease.close() => result?,
+			}
 			let text =
 				str::from_utf8(&content).map_err(|source| ProductionError::Utf8 { path, source })?;
 			Ok(Str::new(text))
@@ -277,6 +289,7 @@ impl CompressHost for ProductionCompressHost {
 					fork:                  None,
 					py_eval:               false,
 					approval_mode:         None,
+					spawn_idle_timeout:    None,
 					pty_denied:            false,
 					credential_provider:   None,
 					api_key:               None,
@@ -341,15 +354,22 @@ impl CompressHost for ProductionCompressHost {
 		let path = path.to_owned();
 		let text = bytes::Bytes::copy_from_slice(text.as_bytes());
 		async move {
+			if cancel.is_cancelled() {
+				return Err(ProductionError::Cancelled);
+			}
 			let uri = Url::from_file_path(&path)
 				.map_err(|()| ProductionError::MissingContent { path: path.clone() })?;
-			let mut lease = self
-				.documents
-				.open(Str::new(uri.as_str()), None, cancel)
-				.await?;
-			let result = self
-				.documents
-				.commit(
+			let env_path = EnvPath::new(Str::new(uri.as_str()))
+				.map_err(|_| ProductionError::MissingContent { path: path.clone() })?;
+			let mut lease = tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(ProductionError::Cancelled),
+				result = self.documents.open_document(&env_path, None) => result?,
+			};
+			let outcome = tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(ProductionError::Cancelled),
+				result = self.documents.commit_document(
 					&mut lease,
 					bytes::Bytes::copy_from_slice(omp_core::Ulid::generate().to_string().as_bytes()),
 					doc_pb::TextMutation {
@@ -358,19 +378,17 @@ impl CompressHost for ProductionCompressHost {
 						stale_policy:  doc_pb::StalePolicy::Fail as i32,
 						format_policy: doc_pb::FormatPolicy::Disabled as i32,
 					},
-					cancel,
-				)
-				.await?;
-			self.documents.close(lease, cancel).await?;
-			match result.outcome {
-				Some(commit_transaction_response::Outcome::Committed(_)) => Ok(()),
-				Some(commit_transaction_response::Outcome::Rejected(_)) => {
-					Err(ProductionError::WriteRejected)
-				},
-				Some(commit_transaction_response::Outcome::PartiallyCommitted(_)) => {
-					Err(ProductionError::WritePartial)
-				},
-				None => Err(ProductionError::WriteRejected),
+				) => result?,
+			};
+			tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(ProductionError::Cancelled),
+				result = lease.close() => result?,
+			}
+			match outcome {
+				TransactionOutcome::Committed(_) => Ok(()),
+				TransactionOutcome::Rejected(_) => Err(ProductionError::WriteRejected),
+				TransactionOutcome::Partial(_) => Err(ProductionError::WritePartial),
 			}
 		}
 	}
@@ -587,12 +605,10 @@ fn protocol_issue(message: Str) -> ArgIssue {
 fn message(role: Role, text: &str) -> Item {
 	Item {
 		kind: Some(item::Kind::Message(Message {
-			role: role as i32,
+			role:  role as i32,
 			parts: vec![ThreadPart {
 				kind: Some(omp_proto::thread::v1::part::Kind::Text(text.to_owned())),
-				..ThreadPart::default()
 			}],
-			..Message::default()
 		})),
 		..Item::default()
 	}

@@ -458,6 +458,10 @@ impl Driver {
 		match method {
 			"browsingContext.navigationStarted" if ours => {
 				if let Some(url) = params["url"].as_str() {
+					tracing::debug!(
+						scheme = crate::navigation_scheme(url),
+						"webview navigation observed"
+					);
 					let url = url.to_str();
 					self.state.lock().url = url.clone();
 					let _ = self.events.send(WebViewEvent::LoadStarted(url.clone()));
@@ -682,6 +686,11 @@ impl Driver {
 				if self.shot_failures >= MAX_SHOT_FAILURES {
 					return Err(Error::Protocol(err));
 				}
+				tracing::warn!(
+					attempt = self.shot_failures,
+					max_attempts = MAX_SHOT_FAILURES,
+					"webview frame capture failed; retrying"
+				);
 				return Ok(true);
 			},
 			Err(err) => return Err(err),

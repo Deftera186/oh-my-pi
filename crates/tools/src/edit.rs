@@ -31,6 +31,7 @@ use omp_tool::{
 pub use replace::{ReplaceParams, ReplaceTool, replace_tool, replace_tool_with_observer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{
 	path::{HostPaths, normalize_target},
@@ -624,6 +625,38 @@ pub struct EditTool<D, S = NoSnapshotStore> {
 	spec:            ToolSpec,
 }
 
+/// Returns the host-free `edit@hl.1` specification.
+pub fn hashline_spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("edit"),
+		rev:             Rev { family: sf!("hl"), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Grammar {
+			syntax:         omp_tool::GrammarSyntax::Lark,
+			definition:     Str::new_static(omp_hashline::grammars::HASHLINE),
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("**")].into_iter().collect(),
+			}),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("edit.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Constructs the built-in hashline edit tool.
 pub fn tool<D: EditDocuments>(
 	documents: D,
@@ -655,34 +688,7 @@ pub fn tool_with_observer<D: EditDocuments, S: EditSnapshotStore>(
 		format_policy,
 		observer,
 		guard_generated,
-		spec: ToolSpec {
-			name:            sf!("edit"),
-			rev:             Rev { family: sf!("hl"), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Grammar {
-				syntax:         omp_tool::GrammarSyntax::Lark,
-				definition:     Str::new_static(omp_hashline::grammars::HASHLINE),
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect(),
-				}),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("edit.rs"),
-			)
-			.into(),
-		},
+		spec: hashline_spec(),
 	}
 }
 
@@ -700,6 +706,12 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<EditUpdate, Payload, Fault>> + Send + 'c {
+		let span = tracing::debug_span!(
+			"edit_execution",
+			revision = "hl.1",
+			path_count = tracing::field::Empty,
+			path = tracing::field::Empty,
+		);
 		stream! {
 			let Params { input } = match params.whole::<Params>().await {
 				Ok(params) => params,
@@ -728,6 +740,10 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 					return;
 				},
 			};
+			span.record("path_count", patch.sections.len());
+			if let Some(section) = patch.sections.first() {
+				span.record("path", tracing::field::display(&section.path));
+			}
 
 			let mut parsed_sections = Vec::with_capacity(patch.sections.len());
 			for mut section in patch.sections {
@@ -760,7 +776,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 					allow_missing: false,
 					guard_generated: self.guard_generated,
 				};
-				let prepared = match self.documents.prepare(request).await {
+				let prepared = match self.documents.prepare(request).instrument(span.clone()).await {
 					Ok(prepared) => prepared,
 					Err(fault) => { yield done_fault(fault); return; },
 				};
@@ -814,11 +830,21 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 							live.bytes
 						},
 						Err(error) => {
+							tracing::warn!(
+								parent: &span,
+								path = %work.prepared.display_path(),
+								"edit head-tail rebase failed",
+							);
 							yield done_fault(Fault::invalid(error.to_string()));
 							return;
 						},
 					}
 				} else if applied.edits.is_empty() {
+					tracing::warn!(
+						parent: &span,
+						path = %work.prepared.display_path(),
+						"edit rebase rejected because no recoverable ranges remained",
+					);
 					let message = stale_message(work, true);
 					yield done_fault(Fault::stale(message));
 					return;
@@ -838,16 +864,34 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 						) {
 							Ok(content) => content,
 							Err(fault) => {
+								tracing::warn!(
+									parent: &span,
+									path = %work.prepared.display_path(),
+									"edit rebase application failed",
+								);
 								yield done_fault(fault);
 								return;
 							},
 						},
 						Err(_) => {
+							tracing::warn!(
+								parent: &span,
+								path = %work.prepared.display_path(),
+								"edit rebase overlapped a concurrent change",
+							);
 							yield done_fault(Fault::stale(stale_message(work, true)));
 							return;
 						},
 					}
 				};
+				if stale {
+					tracing::warn!(
+						parent: &span,
+						path = %work.prepared.display_path(),
+						strategy = if head_tail_drift { "head_tail" } else { "non_overlapping" },
+						"edit rebased over a changed document",
+					);
+				}
 
 				let mut warnings = work.canonical_recovery.iter().cloned()
 					.chain(work.prepared.warnings().iter().cloned())
@@ -870,7 +914,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 						},
 						"hashline",
 						&observer_args,
-					).await;
+					).instrument(span.clone()).await;
 					after = inspected.content;
 					warnings.extend(inspected.notice);
 					pending_blackbox.extend(inspected.pending);
@@ -974,7 +1018,7 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 			let result = {
 				let prepared =
 					parsed_sections.iter_mut().map(|work| &mut work.prepared).collect();
-				let commit = self.documents.commit(prepared, proposals, clipboard).fuse();
+				let commit = self.documents.commit(prepared, proposals, clipboard).instrument(span.clone()).fuse();
 				let interrupt = params.next_interrupt().fuse();
 				pin_mut!(commit, interrupt);
 				let result = select_biased! {
@@ -993,6 +1037,15 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 			let Some(result) = result else { return; };
 			match result {
 				Ok(result) if result.sections.len() == parsed_sections.len() => {
+					for (work, committed) in parsed_sections.iter().zip(&result.sections) {
+						if committed.rebased {
+							tracing::warn!(
+								parent: &span,
+								path = %work.prepared.display_path(),
+								"edit transaction rebased a concurrent change",
+							);
+						}
+					}
 					for work in &parsed_sections {
 						self.documents.reset_noop(work.prepared.path());
 					}
@@ -1016,8 +1069,14 @@ impl<D: EditDocuments, S: EditSnapshotStore> Tool for EditTool<D, S> {
 					yield Ev::Done(ToolTerminal::Done { result: Ok(payload), useless: false });
 				},
 				Ok(_) => yield Ev::Aborted(Abort::EffectsUnknown { reason: sf!("document transaction returned the wrong section count") }),
-				Err(EditCommitError::Rejected(fault)) => yield done_fault(fault),
-				Err(EditCommitError::EffectsUnknown { reason }) => yield Ev::Aborted(Abort::EffectsUnknown { reason }),
+				Err(EditCommitError::Rejected(fault)) => {
+					warn_edit_rejection(&span, &fault);
+					yield done_fault(fault);
+				},
+				Err(EditCommitError::EffectsUnknown { reason }) => {
+					tracing::warn!(parent: &span, "edit commit result is unknown");
+					yield Ev::Aborted(Abort::EffectsUnknown { reason });
+				},
 			}
 		}
 	}
@@ -1310,6 +1369,20 @@ fn op_details(edits: &[omp_hashline::Edit]) -> Vec<AppliedOp> {
 
 const fn done_fault(fault: Fault) -> Ev<EditUpdate, Payload, Fault> {
 	Ev::Done(ToolTerminal::Done { result: Err(fault), useless: false })
+}
+pub(super) fn warn_edit_rejection(span: &tracing::Span, fault: &Fault) {
+	let reason = match &fault.reason {
+		RejectionReason::Conflict => "conflict",
+		RejectionReason::StaleUnrecoverable { .. } => "stale_unrecoverable",
+		RejectionReason::Format { .. } => "format",
+		RejectionReason::InvalidPatch { .. } => "invalid_patch",
+	};
+	tracing::warn!(
+		parent: span,
+		reason = reason,
+		conflict_count = fault.conflicts.len(),
+		"edit transaction rejected",
+	);
 }
 
 fn param_event(error: ParamError) -> Ev<EditUpdate, Payload, Fault> {

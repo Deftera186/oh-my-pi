@@ -1871,7 +1871,7 @@ mod tests {
 		));
 	}
 	#[test]
-	fn closed_schema_preserves_unknown_members_for_typed_rejection() {
+	fn closed_schema_drops_unknown_members_before_the_typed_boundary() {
 		let definitions = [definition()];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
@@ -1888,11 +1888,11 @@ mod tests {
 		assert!(matches!(
 			output.as_slice(),
 			[.., ToolAssemblyEvent::Ready { call, .. }]
-				if call.arguments.as_value() == &json!({"query":"rust","extra":true})
+				if call.arguments.as_value() == &json!({"query":"rust"})
 		));
 	}
 	#[test]
-	fn scalar_repair_does_not_elide_a_later_unknown_member() {
+	fn scalar_repair_and_unknown_drop_share_one_canonical_document() {
 		let definition = ToolDefinition {
 			name:        sf!("count"),
 			description: None,
@@ -1907,7 +1907,7 @@ mod tests {
 			},
 		};
 		let (events, _) = call_with(definition, &json!({"count": "42", "extra": true}));
-		assert_eq!(ready_arguments(&events), Some(json!({"count": 42, "extra": true})),);
+		assert_eq!(ready_arguments(&events), Some(json!({"count": 42})));
 	}
 
 	#[test]

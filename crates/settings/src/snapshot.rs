@@ -177,33 +177,82 @@ impl SnapshotPublisher {
 	/// Creates a subscription that wakes only when `domain` advances.
 	pub fn subscribe(&self, domain: &'static str, current: DomainRevision) -> Subscription {
 		let (sender, receiver) = flume::bounded(1);
-		self.subscribers.lock().push(DomainSubscriber {
+		let subscriber_count = {
+			let mut subscribers = self.subscribers.lock();
+			subscribers.push(DomainSubscriber {
+				domain,
+				last_sent: current,
+				sender,
+				drain: receiver.clone(),
+			});
+			subscribers.len()
+		};
+		tracing::debug!(
 			domain,
-			last_sent: current,
-			sender,
-			drain: receiver.clone(),
-		});
+			revision = current.0,
+			subscriber_count,
+			"settings subscription registered",
+		);
 		Subscription { domain, current, receiver }
 	}
 
 	/// Publishes a committed snapshot only to domains that advanced. Each
 	/// subscriber retains at most the latest pending snapshot.
 	pub fn publish(&self, snapshot: Arc<SettingsSnapshot>) {
-		self.subscribers.lock().retain_mut(|subscriber| {
-			let revision = snapshot.domain_revision(subscriber.domain);
-			if revision <= subscriber.last_sent {
-				return !subscriber.sender.is_disconnected();
-			}
-			subscriber.last_sent = revision;
-			match subscriber.sender.try_send(Arc::clone(&snapshot)) {
-				Ok(()) => true,
-				Err(flume::TrySendError::Disconnected(_)) => false,
-				Err(flume::TrySendError::Full(latest)) => {
-					let _ = subscriber.drain.try_recv();
-					subscriber.sender.try_send(latest).is_ok() || !subscriber.sender.is_disconnected()
-				},
-			}
-		});
+		let mut advanced_subscription_count = 0_u64;
+		let mut notification_count = 0_u64;
+		let mut coalesced_count = 0_u64;
+		let mut disconnected_count = 0_u64;
+		let subscriber_count = {
+			let mut subscribers = self.subscribers.lock();
+			subscribers.retain_mut(|subscriber| {
+				let revision = snapshot.domain_revision(subscriber.domain);
+				if revision <= subscriber.last_sent {
+					let connected = !subscriber.sender.is_disconnected();
+					if !connected {
+						disconnected_count += 1;
+					}
+					return connected;
+				}
+				advanced_subscription_count += 1;
+				subscriber.last_sent = revision;
+				match subscriber.sender.try_send(Arc::clone(&snapshot)) {
+					Ok(()) => {
+						notification_count += 1;
+						true
+					},
+					Err(flume::TrySendError::Disconnected(_)) => {
+						disconnected_count += 1;
+						false
+					},
+					Err(flume::TrySendError::Full(latest)) => {
+						coalesced_count += 1;
+						let _ = subscriber.drain.try_recv();
+						let sent = subscriber.sender.try_send(latest).is_ok();
+						if sent {
+							notification_count += 1;
+						}
+						let connected = !subscriber.sender.is_disconnected();
+						if !connected {
+							disconnected_count += 1;
+						}
+						sent || connected
+					},
+				}
+			});
+			subscribers.len()
+		};
+		if advanced_subscription_count > 0 || disconnected_count > 0 {
+			tracing::debug!(
+				revision = snapshot.revision().0,
+				subscriber_count,
+				advanced_subscription_count,
+				notification_count,
+				coalesced_count,
+				disconnected_count,
+				"settings subscriptions notified",
+			);
+		}
 	}
 }
 

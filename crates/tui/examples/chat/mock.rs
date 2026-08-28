@@ -10,8 +10,9 @@ use std::{
 
 use flume::{Receiver, Sender};
 use omp_chat_ui::{
-	BackendEvent, CompactionBoundaries, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow,
-	SettingRow, StatusFacts, ThinkingLevel, ToolTerminal, ToolViewContent, login_panel::LoginEvent,
+	BackendEvent, CompactionBoundaries, GitFacts, Intent, ModelRow, QueuedPrompt, RewindTargetRow,
+	SessionRow, SettingRow, StatusFacts, ThinkingLevel, ToolTerminal, ToolViewContent,
+	WelcomeBanner, WelcomeLspServer, login_panel::LoginEvent,
 };
 use omp_core::{Str, sf};
 use omp_tui::components::ComposerStyle;
@@ -31,11 +32,24 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 	let mut composer_style = ComposerStyle::default();
 	let mut messages: Vec<(u64, Str)> = Vec::new();
 	let mut next_event = 1_u64;
+	let mut queued: Vec<QueuedPrompt> = Vec::new();
+	let mut streaming = false;
+	let (done_tx, done_rx) = flume::unbounded::<u64>();
 	let _ = events.send(BackendEvent::Sessions(sessions()));
 	let _ = events.send(BackendEvent::ModelsUpdated { rows: models.clone(), current: model });
 	let _ = events.send(BackendEvent::Status(status(&models[model].name, false)));
+	let _ = events.send(BackendEvent::WelcomeBanner(welcome_banner(&models[model])));
 
 	while let Ok(intent) = intents.recv_async().await {
+		while let Ok(turn) = done_rx.try_recv() {
+			if generation.load(Ordering::SeqCst) == turn {
+				streaming = false;
+				if !queued.is_empty() {
+					queued.clear();
+					let _ = events.send(BackendEvent::QueuedPromptsSettled);
+				}
+			}
+		}
 		match intent {
 			Intent::ExtensionShortcut(_) => {},
 			Intent::Submit { text, attachments, mode: _ } => {
@@ -54,17 +68,46 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				let chips = (0..attachments.len())
 					.map(|index| Str::from(format!("attachment {}", index + 1)))
 					.collect();
-				let _ = events.send(BackendEvent::UserReplayed { text: Str::from(text), chips });
+				if streaming {
+					let _ = events.send(BackendEvent::UserReplayed {
+						text: Str::from(text.clone()),
+						chips,
+						queued: true,
+					});
+					queued.push(QueuedPrompt { text: Str::from(text), attachments });
+					continue;
+				}
+				let _ = events.send(BackendEvent::UserReplayed {
+					text: Str::from(text),
+					chips,
+					queued: false,
+				});
 				let turn = generation.fetch_add(1, Ordering::SeqCst) + 1;
+				streaming = true;
 				let events = events.clone();
 				let generation = Arc::clone(&generation);
 				let model_name = models[model].name.clone();
-				tokio::spawn(stream_turn(events, generation, turn, model_name));
+				let done = done_tx.clone();
+				tokio::spawn(stream_turn(events, generation, turn, model_name, done));
 			},
 			Intent::Abort => {
 				generation.fetch_add(1, Ordering::SeqCst);
+				streaming = false;
 				let _ = events.send(BackendEvent::Ack { interrupted: true });
 				let _ = events.send(BackendEvent::Status(status(&models[model].name, false)));
+			},
+			Intent::Dequeue => {
+				if queued.is_empty() {
+					let _ = events.send(BackendEvent::Notice(sf!("No queued messages to restore.")));
+				} else {
+					let restored = queued.len();
+					let prompts = std::mem::take(&mut queued);
+					let _ = events.send(BackendEvent::QueuedPromptsRestored(prompts));
+					let _ = events.send(BackendEvent::Notice(sf!(
+						"Restored {restored} queued message{} to the editor.",
+						if restored == 1 { "" } else { "s" },
+					)));
+				}
 			},
 			Intent::RewindRequest => {
 				let rows = messages
@@ -77,8 +120,11 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				messages.retain(|(candidate, _)| *candidate <= event);
 				let _ = events.send(BackendEvent::HistoryCleared);
 				for (_, text) in &messages {
-					let _ = events
-						.send(BackendEvent::UserReplayed { text: text.clone(), chips: Vec::new() });
+					let _ = events.send(BackendEvent::UserReplayed {
+						text:   text.clone(),
+						chips:  Vec::new(),
+						queued: false,
+					});
 				}
 			},
 			Intent::SwitchModel(key) => {
@@ -113,14 +159,16 @@ async fn run(events: Sender<BackendEvent>, intents: Receiver<Intent>) {
 				let _ = events.send(BackendEvent::HistoryCleared);
 				let _ = events.send(BackendEvent::SessionTitle(Str::from(format!("Resumed {id}"))));
 				let _ = events.send(BackendEvent::UserReplayed {
-					text:  sf!("Continue from the last checkpoint."),
-					chips: Vec::new(),
+					text:   sf!("Continue from the last checkpoint."),
+					chips:  Vec::new(),
+					queued: false,
 				});
 			},
 			Intent::NewSession => {
 				messages.clear();
 				let _ = events.send(BackendEvent::HistoryCleared);
 				let _ = events.send(BackendEvent::SessionTitle(sf!("New local session")));
+				let _ = events.send(BackendEvent::WelcomeBanner(welcome_banner(&models[model])));
 			},
 			Intent::ApplySettings { changes, commit } => {
 				for change in changes {
@@ -152,6 +200,7 @@ async fn stream_turn(
 	generation: Arc<AtomicU64>,
 	turn: u64,
 	model: Str,
+	done: Sender<u64>,
 ) {
 	let active = || generation.load(Ordering::SeqCst) == turn;
 	let mut facts = status(&model, true);
@@ -204,6 +253,28 @@ async fn stream_turn(
 	let _ = events.send(BackendEvent::AssistantEnd { id: assistant });
 	let _ = events.send(BackendEvent::Ack { interrupted: false });
 	let _ = events.send(BackendEvent::Status(status(&model, false)));
+	let _ = done.send(turn);
+}
+
+fn welcome_banner(model: &ModelRow) -> WelcomeBanner {
+	WelcomeBanner {
+		version:     sf!("0.1.0"),
+		model:       model.name.clone(),
+		provider:    model.provider.clone(),
+		lsp_servers: vec![
+			WelcomeLspServer {
+				name:        sf!("rust-analyzer"),
+				stage_label: sf!("ready (rs)"),
+				failed:      false,
+			},
+			WelcomeLspServer {
+				name:        sf!("tsserver"),
+				stage_label: sf!("failed"),
+				failed:      true,
+			},
+		],
+		tip:         Some(sf!("Tired of typing \"keep going\"? Just send a '.'")),
+	}
 }
 
 fn status(model: &Str, working: bool) -> StatusFacts {
@@ -218,8 +289,9 @@ fn status(model: &Str, working: bool) -> StatusFacts {
 		jobs: usize::from(working),
 		attempt: 0,
 		dropped: 0,
-		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
+		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9, untracked: 2 }),
 		thinking: Some(ThinkingLevel::Max),
+		cwd: Some(sf!("/work/omp")),
 		compaction_boundaries: Some(CompactionBoundaries {
 			threshold_percent:   80.0,
 			speculation_percent: Some(70.0),
@@ -341,6 +413,7 @@ fn models() -> Vec<ModelRow> {
 		context:     Some(context),
 		input_mtok:  Some(input),
 		output_mtok: Some(output),
+		efforts:     Arc::from([sf!("low"), sf!("medium"), sf!("high")]),
 	})
 	.collect()
 }

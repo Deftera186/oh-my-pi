@@ -382,10 +382,21 @@ impl ServiceBroker {
 		manifest: ServiceManifest,
 	) -> Result<(), ServiceError> {
 		if self.manifests.contains_key(&host) {
+			tracing::warn!(
+				extension_id = %host.extension(),
+				"extension service roster publication rejected",
+			);
 			return Err(ServiceError::DuplicateManifest(host));
 		}
 		for service in manifest.provides() {
 			if let Some(first) = self.admitted.get(service) {
+				tracing::warn!(
+					extension_id = %host.extension(),
+					service = %service.name,
+					service_revision = service.rev,
+					first_extension_id = %first.extension(),
+					"extension service roster publication rejected",
+				);
 				return Err(ServiceError::DuplicateProvider {
 					service: service.clone(),
 					first:   first.clone(),
@@ -396,7 +407,16 @@ impl ServiceBroker {
 		for service in manifest.provides() {
 			self.admitted.insert(service.clone(), host.clone());
 		}
+		let provider_count = manifest.provides().len();
+		let requirement_count = manifest.requires().len();
+		let extension_id = host.extension().clone();
 		self.manifests.insert(host, manifest);
+		tracing::info!(
+			%extension_id,
+			provider_count,
+			requirement_count,
+			"extension service roster admitted",
+		);
 		Ok(())
 	}
 

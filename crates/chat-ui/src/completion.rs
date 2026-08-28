@@ -203,6 +203,12 @@ struct CachedCompletion {
 	items:    SuggestionList,
 }
 
+/// Rows currently visible in the composer, with the query that produced them.
+struct ShownCompletion {
+	query: CompletionQuery,
+	items: SuggestionList,
+}
+
 /// Bridges asynchronous extension completion to [`EditorCompletion`].
 ///
 /// `suggest` only drains a flume receiver, locally reranks an already-visible
@@ -213,7 +219,7 @@ pub struct DeferredCompletion {
 	response:  Receiver<CompletionResult>,
 	requested: Option<CompletionQuery>,
 	cache:     BTreeMap<(Str, Str), CachedCompletion>,
-	shown:     Option<Suggestions>,
+	shown:     Option<ShownCompletion>,
 	ghost:     ArcSwapOption<Str>,
 }
 
@@ -342,18 +348,6 @@ impl DeferredCompletion {
 			.max_by_key(|cached| cached.query.query.len())
 			.map(|cached| locally_rank(&cached.items, query.query.as_str(), query.rule.max_results))
 	}
-
-	fn show(&mut self, query: &CompletionQuery, text: &str, cursor: usize, items: SuggestionList) {
-		let hint = items.first().and_then(|item| {
-			item
-				.value()
-				.strip_prefix(query.query.as_str())
-				.filter(|hint| !hint.is_empty())
-		});
-		self.ghost.store(hint.map(|hint| Arc::new(Str::new(hint))));
-		self.shown =
-			Some(Suggestions { range: query.prefix_start..completion_token_end(text, cursor), items });
-	}
 }
 
 impl EditorCompletion for DeferredCompletion {
@@ -364,14 +358,40 @@ impl EditorCompletion for DeferredCompletion {
 			return None;
 		};
 		if let Some(items) = self.cached(&query) {
-			self.show(&query, text, cursor, items);
-		} else if self.requested.as_ref() != Some(&query) {
-			self.shown = None;
-			if self.request.try_send(query.clone()).is_ok() {
-				self.requested = Some(query);
+			self.shown = Some(ShownCompletion { query: query.clone(), items });
+		} else {
+			if self.requested.as_ref() != Some(&query) && self.request.try_send(query.clone()).is_ok()
+			{
+				self.requested = Some(query.clone());
+			}
+			// Keep the visible rows while the worker resolves the newer
+			// query (pi keeps the stale popup open); rows from another
+			// trigger family never survive.
+			if self
+				.shown
+				.as_ref()
+				.is_some_and(|shown| shown.query.prefix != query.prefix)
+			{
+				self.shown = None;
 			}
 		}
-		self.shown.clone().filter(|shown| !shown.items.is_empty())
+		let shown = self.shown.as_ref()?;
+		if shown.items.is_empty() {
+			return None;
+		}
+		// The range and ghost re-anchor to the live token on every call, so
+		// rows answered or retained asynchronously never carry stale offsets.
+		let hint = shown.items.first().and_then(|item| {
+			item
+				.value()
+				.strip_prefix(query.query.as_str())
+				.filter(|hint| !hint.is_empty())
+		});
+		self.ghost.store(hint.map(|hint| Arc::new(Str::new(hint))));
+		Some(Suggestions {
+			range: query.prefix_start..completion_token_end(text, cursor),
+			items: shown.items.clone(),
+		})
 	}
 
 	fn hint(&mut self, _text: &str, _cursor: usize) -> Option<Str> {
@@ -446,7 +466,8 @@ mod tests {
 
 	use super::{
 		CompletionChain, CompletionQuery, CompletionRule, CompletionSource, CompletionTrigger,
-		DeferredCompletion, ReloadableSlashCommands, SuggestionList,
+		DeferredCompletion, ReloadableSlashCommands, ShownCompletion, SuggestionList,
+		completion_token_end,
 	};
 
 	struct MentionCompletion;
@@ -518,18 +539,36 @@ mod tests {
 	}
 
 	#[test]
-	fn deferred_completion_replaces_the_current_token() {
+	fn deferred_rows_track_the_live_token_and_survive_pending_refreshes() {
 		let calls = Arc::new(AtomicUsize::new(0));
-		let rule = CompletionRule::native("@", CompletionTrigger::Mention);
-		let mut completion = DeferredCompletion::new([rule], Arc::new(CountingCompletion { calls }));
+		let rules = [
+			CompletionRule::native("@", CompletionTrigger::Mention),
+			CompletionRule::native("#", CompletionTrigger::Hash),
+		];
+		let mut completion = DeferredCompletion::new(rules, Arc::new(CountingCompletion { calls }));
 		let query = completion.query("@alixce", 3).expect("mention query");
-		completion.show(
-			&query,
-			"@alixce",
-			3,
-			[Suggestion::new("@alice", "alice")].into_iter().collect(),
+		completion.shown = Some(ShownCompletion {
+			query,
+			items: [Suggestion::new("@alice", "alice")].into_iter().collect(),
+		});
+		// The replacement range spans the whole live token, tail included.
+		assert_eq!(
+			completion
+				.suggest("@alixce", 3)
+				.expect("visible rows")
+				.range,
+			0..7
 		);
-		assert_eq!(completion.shown.expect("visible completion").range, 0..7);
+		// A cache miss (worker still resolving) keeps the rows, re-anchored.
+		assert_eq!(
+			completion
+				.suggest("@alixcez", 3)
+				.expect("retained rows")
+				.range,
+			0..8
+		);
+		// A different trigger family drops the retained rows.
+		assert!(completion.suggest("#alixce", 3).is_none());
 	}
 
 	#[test]

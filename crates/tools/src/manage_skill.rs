@@ -147,34 +147,36 @@ pub struct ManageSkillTool<A> {
 	spec:      ToolSpec,
 }
 
+/// Builds the host-free `manage_skill@1` declaration.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("manage_skill"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("managed-skills/**")].into_iter().collect(),
+			}),
+			..Effects::empty()
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("manage_skill.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates `manage_skill@1` over Environment-owned publication authority.
 pub fn tool<A: ManagedSkillAuthority>(authority: Arc<A>) -> ManageSkillTool<A> {
-	ManageSkillTool {
-		authority,
-		spec: ToolSpec {
-			name:            sf!("manage_skill"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("managed-skills/**")].into_iter().collect(),
-				}),
-				..Effects::empty()
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("manage_skill.rs"),
-			)
-			.into(),
-		},
-	}
+	ManageSkillTool { authority, spec: spec() }
 }
 
 impl<A: ManagedSkillAuthority> Tool for ManageSkillTool<A> {

@@ -298,13 +298,19 @@ pub fn open_credential_store_with_key_source(
 
 /// Composes the immutable production catalog from bundled facts, the fresh
 /// credential-blind discovery cache, and native user configuration.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(data_dir = %data_dir.display())
+)]
 pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, RegistryError> {
 	let base = snapshot::Catalog::try_embedded()
 		.map_err(RegistryError::Catalog)?
 		.clone();
 	let overlays = Arc::new(OverlayStore::default());
 	let cache_path = data_dir.join("models.db");
-	if cache_path.exists() {
+	let discovery_cache = cache_path.exists();
+	if discovery_cache {
 		let cache = Arc::new(
 			DiscoveryStore::open(&cache_path)
 				.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?,
@@ -335,17 +341,28 @@ pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, Reg
 			.hydrate_cached(&requests, now_ms)
 			.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?;
 	}
-	if let Some(loaded) = load_or_import_legacy(data_dir)
+	let user_overlay = if let Some(loaded) = load_or_import_legacy(data_dir)
 		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?
 	{
 		let overlay = lower_user_overlay(&loaded.config)
 			.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?;
 		overlays.replace(OverlaySource::UserConfig, overlay);
-	}
-	base
+		true
+	} else {
+		false
+	};
+	let catalog = base
 		.with_overlay_stack(&overlays.load(), UnsafeTrustScope::ALL)
-		.map(Arc::new)
-		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))
+		.map_err(|error| RegistryError::CatalogComposition(Box::new(error)))?;
+	tracing::debug!(
+		discovery_cache,
+		user_overlay,
+		provider_count = catalog.providers().len(),
+		model_count = catalog.models().len(),
+		route_count = catalog.routes().len(),
+		"production catalog composed"
+	);
+	Ok(Arc::new(catalog))
 }
 
 /// Builds the production inference registry over durable daemon state.
@@ -512,6 +529,17 @@ pub async fn production_inference(
 }
 
 /// Builds a session-owned production inference stack with ephemeral overrides.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	fields(
+		data_dir = %data_dir.display(),
+		project_root = ?project_root,
+		provider = ?overrides.provider.as_ref(),
+		catalog_override = overrides.catalog.is_some(),
+		settings_override = overrides.settings.is_some(),
+	)
+)]
 pub async fn production_inference_for_session(
 	data_dir: &Path,
 	tool_registry: Arc<omp_tool::Registry>,
@@ -524,7 +552,9 @@ pub async fn production_inference_for_session(
 	};
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
+	let provider_override = provider.is_some();
 	let catalog = overrides.catalog.clone();
+	let catalog_override = catalog.is_some();
 	let usage_fetchers = overrides.usage_fetchers.unwrap_or_default();
 	let provider_response_hooks = overrides.provider_response_hooks.unwrap_or_default();
 	let invocation_key = match (provider.as_ref(), overrides.api_key) {
@@ -565,7 +595,7 @@ pub async fn production_inference_for_session(
 		Arc::clone(&mcp_authority),
 		Arc::new(omp_envd::mcp::oauth::SystemBrowserLauncher),
 	));
-	Ok(ProductionInference {
+	let inference = ProductionInference {
 		registry,
 		builtins,
 		rpc,
@@ -575,7 +605,9 @@ pub async fn production_inference_for_session(
 		auth_manager,
 		auth_control,
 		usage_fetchers,
-	})
+	};
+	tracing::debug!(provider_override, catalog_override, "production inference stack composed");
+	Ok(inference)
 }
 
 fn inference_settings(
@@ -898,6 +930,15 @@ async fn production_assembly_with_catalog(
 				)
 			},
 			Err(evidence) => {
+				let route_count = apple_routes.len();
+				if route_count > 0 {
+					tracing::warn!(
+						provider = "applefm",
+						state = %evidence.state.code(),
+						route_count,
+						"local provider initialization failed; routes are unavailable"
+					);
+				}
 				let reason = ReasonId(Str::from(evidence.state.code()));
 				dependencies.with_local_unavailable(
 					apple_routes
@@ -965,8 +1006,22 @@ fn antigravity_version_task(
 		});
 		let pinned = release_ordinal(DEFAULT_ANTIGRAVITY_VERSION).unwrap_or_default();
 		match cached {
-			Some((version, ordinal)) if ordinal > pinned => version,
-			_ => sf!(DEFAULT_ANTIGRAVITY_VERSION),
+			Some((version, ordinal)) if ordinal > pinned => {
+				tracing::warn!(
+					provider = "google_antigravity",
+					fallback = "cached",
+					"provider version discovery failed; using fallback"
+				);
+				version
+			},
+			_ => {
+				tracing::warn!(
+					provider = "google_antigravity",
+					fallback = "pinned",
+					"provider version discovery failed; using fallback"
+				);
+				sf!(DEFAULT_ANTIGRAVITY_VERSION)
+			},
 		}
 	}
 }

@@ -620,8 +620,9 @@ pub struct PromptHit {
 pub struct PromptHistoryEntry {
 	/// Exact prompt text of the most recent submission.
 	pub prompt: Str,
-	/// Epoch-millisecond submission time of the most recent occurrence, when recorded.
-	pub ts_ms: Option<u64>,
+	/// Epoch-millisecond submission time of the most recent occurrence, when
+	/// recorded.
+	pub ts_ms:  Option<u64>,
 }
 
 /// Monotonic context position projected from durable boundaries.
@@ -699,6 +700,12 @@ pub trait SessionRenameObserver: Send + Sync + 'static {
 
 impl SessionIndex {
 	/// Opens or creates the authoritative write-time index.
+	#[tracing::instrument(
+		name = "session_index_open",
+		level = "debug",
+		skip_all,
+		fields(path = %path.as_ref().display(), mode = "writer")
+	)]
 	pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
 		let connection = Connection::open(path)?;
 		connection.busy_timeout(Duration::from_secs(5))?;
@@ -723,6 +730,12 @@ impl SessionIndex {
 	/// this connection into SQLite's query-only mode. This lets the project
 	/// owner become ready before journal-owning apps open their independent
 	/// transaction-serialized writer connections.
+	#[tracing::instrument(
+		name = "session_index_open",
+		level = "debug",
+		skip_all,
+		fields(path = %path.as_ref().display(), mode = "authoritative_reader")
+	)]
 	pub fn open_authoritative_reader(path: impl AsRef<Path>) -> Result<Self, Error> {
 		let connection = Connection::open(path)?;
 		connection.busy_timeout(Duration::from_secs(5))?;
@@ -750,6 +763,12 @@ impl SessionIndex {
 	}
 
 	/// Opens a thin-client cache read-only for explicitly stale offline listing.
+	#[tracing::instrument(
+		name = "session_index_open",
+		level = "debug",
+		skip_all,
+		fields(path = %path.as_ref().display(), mode = "offline_cache")
+	)]
 	pub fn open_offline_cache(path: impl AsRef<Path>, cached_at_ms: u64) -> Result<Self, Error> {
 		let connection = Connection::open_with_flags(
 			path,
@@ -922,6 +941,16 @@ impl SessionIndex {
 			&& let Some(observer) = self.rename_observer.read().as_ref()
 		{
 			observer.renamed(event.session, normalize_session_name(title));
+		}
+		if event.kind == "compact"
+			&& let EventProjection::Context { epoch, .. } = event.projection
+		{
+			tracing::info!(
+				session_id = %event.session.0,
+				event_index = position.event_index,
+				compaction_epoch = epoch,
+				"session compaction committed"
+			);
 		}
 		Ok(written)
 	}
@@ -1235,11 +1264,7 @@ impl SessionIndex {
 	/// Non-empty queries combine token-prefix FTS5 matching with token-AND
 	/// substring fallback. Empty, whitespace-only, and punctuation-only queries
 	/// return the most recent prompts.
-	pub fn prompt_history(
-		&self,
-		query: &str,
-		limit: u32,
-	) -> Result<Vec<PromptHistoryEntry>, Error> {
+	pub fn prompt_history(&self, query: &str, limit: u32) -> Result<Vec<PromptHistoryEntry>, Error> {
 		let limit = limit.min(1_000);
 		if limit == 0 {
 			return Ok(Vec::new());
@@ -1273,8 +1298,11 @@ impl SessionIndex {
 			return rows.collect::<Result<Vec<_>, _>>().map_err(Error::from);
 		}
 
-		let mut match_expression =
-			String::with_capacity(lower_query.len().saturating_add(tokens.len().saturating_mul(4)));
+		let mut match_expression = String::with_capacity(
+			lower_query
+				.len()
+				.saturating_add(tokens.len().saturating_mul(4)),
+		);
 		for token in &tokens {
 			if !match_expression.is_empty() {
 				match_expression.push(' ');
@@ -1513,12 +1541,19 @@ impl SessionIndex {
 	}
 }
 
+#[tracing::instrument(
+	name = "storage_migration",
+	level = "debug",
+	skip_all,
+	fields(database = "session_index", target_version = SCHEMA_VERSION)
+)]
 fn migrate_schema(connection: &Connection) -> Result<(), Error> {
 	let mut version = connection.query_row(
 		"SELECT schema_version FROM index_meta WHERE singleton = 1",
 		[],
 		|row| row.get::<_, i64>(0),
 	)?;
+	let initial_version = version;
 	if version == 1 {
 		connection.execute_batch(
 			"ALTER TABLE sessions ADD COLUMN serving_provider TEXT;
@@ -1569,6 +1604,15 @@ fn migrate_schema(connection: &Connection) -> Result<(), Error> {
 			 ALTER TABLE prompts_fts_v5 RENAME TO prompts_fts;
 			 UPDATE index_meta SET schema_version = 5 WHERE singleton = 1;",
 		)?;
+		version = 5;
+	}
+	if version != initial_version {
+		tracing::info!(
+			database = "session_index",
+			from_version = initial_version,
+			to_version = version,
+			"storage migration completed"
+		);
 	}
 	Ok(())
 }
@@ -1672,7 +1716,8 @@ fn index_event_inner(
 		},
 		EventProjection::Prompt { text } => {
 			transaction.execute(
-				"INSERT INTO prompts_fts(session_id, event_index, prompt, ts_ms) VALUES (?1, ?2, ?3, ?4)",
+				"INSERT INTO prompts_fts(session_id, event_index, prompt, ts_ms) VALUES (?1, ?2, ?3, \
+				 ?4)",
 				params![
 					event.session.0.as_str(),
 					sql_u64(position.event_index, "event_index")?,
@@ -1692,7 +1737,8 @@ fn index_event_inner(
 			insert_item_outcome(transaction, event, position, item)?;
 			if let Some(prompt) = prompt {
 				transaction.execute(
-					"INSERT INTO prompts_fts(session_id, event_index, prompt, ts_ms) VALUES (?1, ?2, ?3, ?4)",
+					"INSERT INTO prompts_fts(session_id, event_index, prompt, ts_ms) VALUES (?1, ?2, \
+					 ?3, ?4)",
 					params![
 						event.session.0.as_str(),
 						sql_u64(position.event_index, "event_index")?,

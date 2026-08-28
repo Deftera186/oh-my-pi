@@ -180,20 +180,11 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 						omp_settings::manager::SettingsPaths::discover(data_dir, None),
 					)
 					.into_diagnostic()?;
-					let mut roles = manager
-						.snapshot()
-						.project::<omp_catalog::settings::ModelSettings>()
-						.into_diagnostic()?
-						.get()
-						.roles
-						.clone();
-					roles.insert(Str::new_static("default"), value.clone());
-					let encoded = serde_json::to_string(&roles).into_diagnostic()?;
 					manager
 						.set(
 							omp_settings::manager::MutationScope::Global,
-							"model.roles",
-							&encoded,
+							"model.roles.default",
+							&toml::Value::String(value.to_string()).to_string(),
 						)
 						.await
 						.into_diagnostic()?;

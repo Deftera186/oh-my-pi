@@ -1356,7 +1356,6 @@ pub(crate) async fn run(
 	};
 	ensure_state_directory(&sessions_dir).map_err(|e| miette::miette!(e))?;
 	let requested_resume = picked_resume.or_else(|| args.resume.clone());
-	let document_socket = omp_env::project_state::document_socket(&state_dir);
 	let search_bridge = Arc::new(InferenceBridge::default());
 	let goal_control = AgentGoalControl::default();
 	let advise_queue = omp_agent::advisor::AdvisorAdviceQueue::default();
@@ -1391,28 +1390,36 @@ pub(crate) async fn run(
 		..bridges
 	};
 	let prompt_head = Arc::new(ProductionPromptHead::from_extension_specs(&admitted_extensions));
-	let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
-		&root,
-		&state_dir,
-		&document_socket,
-		args.py_eval,
-		&admitted_extensions,
-		&args.extension_launch.contributed,
-		Arc::clone(&settings_snapshot),
-		bridges,
-	)
-	.await
-	.map_err(|e| miette::miette!(e))?;
+	let environment =
+		omp_envd::ProjectEnvironment::attach(&root, &state_dir, omp_envd::AttachOptions {
+			py_eval: args.py_eval,
+			approval_mode,
+			trusted_extensions: admitted_extensions.clone(),
+			contributed_values: args.extension_launch.contributed.clone(),
+			settings: Arc::clone(&settings_snapshot),
+			bridges,
+			spawn_idle_timeout: args.envd_idle_timeout,
+		})
+		.instrument(tracing::debug_span!("environment_start"))
+		.await
+		.map_err(|e| miette::miette!(e))?;
+	if let Some(notice) = &environment.fallback_notice {
+		eprintln!("{notice}");
+		tracing::warn!(
+			project_root = %root.display(),
+			"project environment started with fallback"
+		);
+	}
 	let evidences = environment.extension_registry_evidences();
-	let catalog_owner = Arc::new(
+	let catalog_owner = Arc::new(tracing::debug_span!("catalog_load").in_scope(|| {
 		omp_driver::model_controls::compose_runtime_provider_catalog(
 			catalog,
 			evidences
 				.iter()
 				.flat_map(|evidence| evidence.providers.iter()),
 		)
-		.map_err(|error| miette::miette!(error))?,
-	);
+		.map_err(|error| miette::miette!(error))
+	})?);
 	let catalog = catalog_owner.as_ref();
 	let model =
 		resolve_model_selector(catalog, model.as_str()).map_err(|error| miette::miette!(error))?;
@@ -1532,14 +1539,18 @@ pub(crate) async fn run(
 	};
 	let session_resumed =
 		matches!(session_open, SessionOpen::Resume(_) | SessionOpen::ResumeMoved(_));
-	let mut session = open_session(
-		&root,
-		&sessions_dir,
-		session_open,
-		registry.as_ref(),
-		(!args.no_session).then(|| Arc::clone(&session_index)),
-	)
-	.map_err(|e| miette::miette!(e))?;
+	let session_open_span = tracing::debug_span!("session_open");
+	let mut session = session_open_span
+		.in_scope(|| {
+			open_session(
+				&root,
+				&sessions_dir,
+				session_open,
+				registry.as_ref(),
+				(!args.no_session).then(|| Arc::clone(&session_index)),
+			)
+		})
+		.map_err(|e| miette::miette!(e))?;
 	for ticket in extension_approval_tickets.drain(..) {
 		session
 			.journal

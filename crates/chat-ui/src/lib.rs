@@ -23,6 +23,7 @@ pub mod host;
 pub mod inspector;
 pub mod log_viewer;
 pub mod login_panel;
+pub mod model_hub;
 pub mod modes;
 mod overlays;
 pub mod palette;
@@ -60,6 +61,7 @@ pub use git::{
 pub use gradient::{EditorGradient, EditorHighlight, GradientStop};
 pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
 pub use inspector::{HistoryInspector, HistoryInspectorEvent};
+pub use model_hub::{ModelHub, ModelHubEvent};
 use omp_core::Str;
 use omp_proto::omp::ui::v1;
 pub use omp_tui::components::{Attachment, CompactionBoundaries, ComposerStyle};
@@ -97,6 +99,103 @@ pub struct ModelRow {
 	pub input_mtok:  Option<f64>,
 	/// Output price in dollars per million tokens, when known.
 	pub output_mtok: Option<f64>,
+	/// Supported thinking efforts ordered least to most intensive; empty for
+	/// non-reasoning models.
+	pub efforts:     Arc<[Str]>,
+}
+/// One resolved model role shown by the models hub.
+#[derive(Clone, Debug)]
+pub struct HubRole {
+	/// Stable role identifier.
+	pub id:       Str,
+	/// Human-readable display label.
+	pub name:     Str,
+	/// Optional configured color token.
+	pub color:    Option<Str>,
+	/// Configured selector; absent when the role falls back to auto-selection.
+	pub selector: Option<Str>,
+	/// Resolved catalog model key, absent when nothing matches.
+	pub resolved: Option<Str>,
+	/// Effective thinking annotation carried by the configured selector.
+	pub thinking: Option<Str>,
+}
+
+/// One credential-locked provider shown by the models hub sidebar.
+#[derive(Clone, Debug)]
+pub struct LockedProviderRow {
+	/// Stable provider identifier.
+	pub id:       Str,
+	/// Human-readable provider name.
+	pub name:     Str,
+	/// Catalog model count bundled for this provider.
+	pub models:   usize,
+	/// Whether the provider authenticates through OAuth login.
+	pub oauth:    bool,
+	/// Credential environment variable names accepted by the provider.
+	pub env_vars: Vec<Str>,
+}
+
+/// Snapshot backing the fullscreen `/models` hub overlay.
+#[derive(Clone, Debug, Default)]
+pub struct ModelHubData {
+	/// Selectable catalog models.
+	pub rows:            Vec<ModelRow>,
+	/// Index of the session's active model in `rows`.
+	pub current:         usize,
+	/// Visible roles in picker order.
+	pub roles:           Vec<HubRole>,
+	/// Role names in quick-cycle order.
+	pub cycle_order:     Vec<Str>,
+	/// Retry fallback chains keyed by role, model key, or `provider/*`.
+	pub chains:          Vec<(Str, Vec<Str>)>,
+	/// Whether role assignments persist to the project scope by default.
+	pub project_storage: bool,
+	/// Providers with catalog models but no usable credentials.
+	pub locked:          Vec<LockedProviderRow>,
+}
+
+/// Persistence scope chosen for one models-hub role mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HubScope {
+	/// User/profile configuration.
+	Global,
+	/// Exact project configuration.
+	Project,
+}
+
+/// One configuration mutation emitted by the models hub.
+#[derive(Clone, Debug)]
+pub enum ModelHubIntent {
+	/// Persist one role assignment.
+	AssignRole {
+		/// Role identifier.
+		role:     Str,
+		/// Catalog model key to assign.
+		selector: Str,
+		/// Optional explicit thinking annotation.
+		thinking: Option<Str>,
+		/// Explicit persistence scope; `None` follows configured storage.
+		scope:    Option<HubScope>,
+	},
+	/// Clear one configured role back to auto-selection.
+	UnassignRole {
+		/// Role identifier.
+		role:  Str,
+		/// Explicit persistence scope; `None` follows configured storage.
+		scope: Option<HubScope>,
+	},
+	/// Replace one retry fallback chain; an empty chain clears the key.
+	SetFallbackChain {
+		/// Role, model key, or `provider/*` chain key.
+		key:   Str,
+		/// Ordered fallback selectors.
+		chain: Vec<Str>,
+	},
+	/// Replace the quick-cycle role order.
+	SetCycleOrder {
+		/// Role names in cycle order.
+		order: Vec<Str>,
+	},
 }
 /// Immutable projection of the environment-owned todo tree for the sticky HUD.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -153,6 +252,20 @@ pub struct WelcomeLspServer {
 	pub stage_label: Str,
 	/// Whether the lifecycle ended in failure.
 	pub failed:      bool,
+}
+/// Facts rendered on the in-transcript welcome banner.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WelcomeBanner {
+	/// Application version shown in the banner title.
+	pub version:     Str,
+	/// Active model name.
+	pub model:       Str,
+	/// Active provider name.
+	pub provider:    Str,
+	/// Language servers discovered for the workspace.
+	pub lsp_servers: Vec<WelcomeLspServer>,
+	/// One-line tip shown under the card.
+	pub tip:         Option<Str>,
 }
 /// One live node projected from the core-owned `AgentTree` roster.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,11 +353,13 @@ pub struct TranscriptFrame {
 #[derive(Clone, Debug)]
 pub struct GitFacts {
 	/// Current branch name.
-	pub branch: Str,
+	pub branch:    Str,
 	/// Number of dirty paths.
-	pub dirty:  u32,
+	pub dirty:     u32,
 	/// Number of staged paths.
-	pub staged: u32,
+	pub staged:    u32,
+	/// Number of untracked paths.
+	pub untracked: u32,
 }
 
 /// Background compaction state rendered by status surfaces.
@@ -314,6 +429,8 @@ pub struct VisibleResourceFacts {
 pub struct StatusFacts {
 	/// Model label shown in the status line.
 	pub model:                  Str,
+	/// Stable session identifier shown in non-minimal status layouts.
+	pub session_id:             Option<Str>,
 	/// Whether the primary model uses subscription billing.
 	pub model_subscription:     bool,
 	/// Advisor model label, when an advisor is configured or active.
@@ -595,6 +712,10 @@ pub enum Intent {
 	},
 	/// Switch the active model.
 	SwitchModel(Str),
+	/// Ask the backend to open the fullscreen models hub.
+	OpenModelHub,
+	/// Apply one models-hub configuration mutation.
+	ModelHub(ModelHubIntent),
 	/// Start login, optionally for a specific provider.
 	Login(Option<Str>),
 	/// Continue provider/account selection or remove one stored credential.
@@ -697,6 +818,17 @@ pub struct QueuedPrompt {
 	/// Attachments staged with the text.
 	pub attachments: Vec<Attachment>,
 }
+/// One attachment recovered from durable history for composer restore.
+#[derive(Clone, Debug)]
+pub enum RestoredAttachment {
+	/// Image persisted to a temp file and restaged from that path.
+	Image {
+		/// Image source path.
+		source: Str,
+	},
+	/// Pasted text re-collapsed into a composer clip.
+	Text(Str),
+}
 
 /// One user-message target offered by history rewind.
 #[derive(Clone, Debug)]
@@ -745,9 +877,12 @@ pub enum BackendEvent {
 	/// Replay a user message from durable history.
 	UserReplayed {
 		/// Message text.
-		text:  Str,
+		text:   Str,
 		/// Display labels for replayed attachments.
-		chips: Vec<Str>,
+		chips:  Vec<Str>,
+		/// Accepted while a turn is active and not yet consumed by the agent;
+		/// rendered as a dim pending row until the queue settles.
+		queued: bool,
 	},
 	/// Replay one assistant reasoning block from durable history as a
 	/// settled dim-italic thinking entry.
@@ -764,6 +899,8 @@ pub enum BackendEvent {
 	},
 	/// Restore a batch of unstarted queued prompts to the composer.
 	QueuedPromptsRestored(Vec<QueuedPrompt>),
+	/// Settle queued user rows after the agent consumed or dropped the queue.
+	QueuedPromptsSettled,
 	/// Begin a streamed assistant message.
 	AssistantBegin {
 		/// Stable message identifier.
@@ -1032,10 +1169,16 @@ pub enum BackendEvent {
 		/// Current model index.
 		current: usize,
 	},
+	/// Open the fullscreen models hub over catalog, role, and fallback state.
+	OpenModelHub(ModelHubData),
+	/// Refresh models-hub state after a configuration mutation.
+	ModelHubUpdated(ModelHubData),
 	/// Replace resumable sessions.
 	Sessions(Vec<SessionRow>),
 	/// Replace language server facts shown while the welcome card is open.
 	WelcomeLspServers(Vec<WelcomeLspServer>),
+	/// Append the welcome banner as the next transcript block.
+	WelcomeBanner(WelcomeBanner),
 	/// Replace provider-login choices; each row's `id` is the provider key.
 	LoginProviders(Vec<SessionRow>),
 	/// Open one stage of provider logout selection.
@@ -1060,9 +1203,12 @@ pub enum BackendEvent {
 	/// Begin a rewind replay, identifying the selected user-message boundary.
 	HistoryRewind {
 		/// Chronological user-message index on the current branch.
-		user_index: usize,
+		user_index:  usize,
 		/// Exact selected user-authored text.
-		text:       Str,
+		text:        Str,
+		/// Attachment contents recovered from the rewound message, restored
+		/// into the composer beside the text.
+		attachments: Vec<RestoredAttachment>,
 	},
 	/// Finish the replay bracket opened by [`BackendEvent::HistoryRewind`].
 	HistoryReplayFinished,

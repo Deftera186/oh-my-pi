@@ -6,7 +6,6 @@ use std::{
 	collections::BTreeSet,
 	ffi, fs, io,
 	path::{Path, PathBuf},
-	process::{Command, Stdio},
 };
 
 use miette::IntoDiagnostic as _;
@@ -389,12 +388,9 @@ fn remove_worktree(row: &WorktreeRow) -> io::Result<Option<PathBuf>> {
 		if let Some(parent) = &row.parent_repo
 			&& row.class == "pr-checkout"
 		{
-			match run_git(parent, &[
-				ffi::OsStr::new("worktree"),
-				ffi::OsStr::new("remove"),
-				ffi::OsStr::new("--force"),
-				path.as_os_str(),
-			]) {
+			match omp_vcs::git::GitRepo::discover(parent)
+				.and_then(|repo| repo.map_or(Ok(false), |repo| repo.worktree_remove(path, true)))
+			{
 				Ok(true) => {},
 				Ok(false) | Err(_) => {
 					remove_path(path)?;
@@ -494,28 +490,10 @@ fn remove_path(path: &Path) -> io::Result<()> {
 }
 
 fn prune_git_worktrees(parent: &Path) -> io::Result<()> {
-	if run_git(parent, &[ffi::OsStr::new("worktree"), ffi::OsStr::new("prune")])? {
-		Ok(())
-	} else {
-		Err(io::Error::other("git worktree prune failed"))
-	}
-}
-
-fn run_git(cwd: &Path, args: &[&ffi::OsStr]) -> io::Result<bool> {
-	let mut command = Command::new("git");
-	command
-		.current_dir(cwd)
-		.stdin(Stdio::null())
-		.stdout(Stdio::null())
-		.stderr(Stdio::null())
-		.env_remove("GIT_DIR")
-		.env_remove("GIT_COMMON_DIR")
-		.env_remove("GIT_WORK_TREE")
-		.env_remove("GIT_INDEX_FILE")
-		.env("GIT_TERMINAL_PROMPT", "0")
-		.args(["-c", "core.askPass=", "-c", "core.editor=true"])
-		.args(args);
-	Ok(command.status()?.success())
+	let Some(repo) = omp_vcs::git::GitRepo::discover(parent).map_err(io::Error::other)? else {
+		return Err(io::Error::other("git worktree prune failed"));
+	};
+	repo.worktree_prune().map_err(io::Error::other)
 }
 
 fn prune_empty(path: &Path) -> io::Result<()> {

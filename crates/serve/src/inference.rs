@@ -684,6 +684,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 	type TurnStream = RpcStream<pb::TurnEvent>;
 	type WatchModelsStream = RpcStream<pb::ModelEvent>;
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "turn")
+	)]
 	async fn turn(
 		&self,
 		request: Request<tonic::Streaming<pb::TurnFrame>>,
@@ -796,6 +801,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(output)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "realtime")
+	)]
 	async fn realtime(
 		&self,
 		request: Request<tonic::Streaming<pb::RealtimeFrame>>,
@@ -874,9 +884,9 @@ impl pb::inference_server::Inference for InferenceRpc {
 			loop {
 				let event = tokio::select! {
 					error = errors.recv_async(), if errors_open => if let Ok(error) = error { Err(error) } else {
-								  errors_open = false;
-								  continue;
-							  },
+						errors_open = false;
+						continue;
+					},
 					event = session.recv() => match event {
 						Ok(Ok(event)) => Ok(event),
 						Ok(Err(error)) => Err(inference_status(error)),
@@ -893,6 +903,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(output)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "fork")
+	)]
 	async fn fork(
 		&self,
 		request: Request<pb::ForkRequest>,
@@ -943,6 +958,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(pb::ForkResponse { revision: Some(revision(&request.context_id, at)) }))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "drop")
+	)]
 	async fn drop(
 		&self,
 		request: Request<pb::DropRequest>,
@@ -957,6 +977,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(pb::DropResponse {}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "count_tokens")
+	)]
 	async fn count_tokens(
 		&self,
 		request: Request<pb::CountTokensRequest>,
@@ -1004,6 +1029,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "tokenize")
+	)]
 	async fn tokenize(
 		&self,
 		request: Request<pb::TokenizeRequest>,
@@ -1025,6 +1055,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "detokenize")
+	)]
 	async fn detokenize(
 		&self,
 		request: Request<pb::DetokenizeRequest>,
@@ -1040,6 +1075,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "embed")
+	)]
 	async fn embed(
 		&self,
 		request: Request<pb::EmbedRequest>,
@@ -1073,6 +1113,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		}))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "generate_image")
+	)]
 	async fn generate_image(
 		&self,
 		request: Request<pb::GenerateImageRequest>,
@@ -1137,6 +1182,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(image_events(events))))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "speak")
+	)]
 	async fn speak(
 		&self,
 		request: Request<pb::SpeakRequest>,
@@ -1176,6 +1226,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(output)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "transcribe")
+	)]
 	async fn transcribe(
 		&self,
 		request: Request<pb::TranscribeRequest>,
@@ -1250,6 +1305,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(response))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "search")
+	)]
 	async fn search(
 		&self,
 		request: Request<pb::SearchRequest>,
@@ -1390,6 +1450,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Err(inference_status(aggregate_search_failures(failures)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "generate_video")
+	)]
 	async fn generate_video(
 		&self,
 		request: Request<pb::GenerateVideoRequest>,
@@ -1450,6 +1515,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(initial))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "get_generation")
+	)]
 	async fn get_generation(
 		&self,
 		request: Request<pb::GetGenerationRequest>,
@@ -1459,6 +1529,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(status))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "attach_generation")
+	)]
 	async fn attach_generation(
 		&self,
 		request: Request<pb::AttachGenerationRequest>,
@@ -1490,6 +1565,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(output)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "cancel_generation")
+	)]
 	async fn cancel_generation(
 		&self,
 		request: Request<pb::CancelGenerationRequest>,
@@ -1513,6 +1593,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(status))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "usage")
+	)]
 	async fn usage(
 		&self,
 		request: Request<pb::UsageRequest>,
@@ -1549,6 +1634,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(usage_response(*answer)))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "native")
+	)]
 	async fn native(
 		&self,
 		request: Request<pb::NativeRequest>,
@@ -1607,6 +1697,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(native_response_stream(answer))))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "list_providers")
+	)]
 	async fn list_providers(
 		&self,
 		request: Request<pb::ListProvidersRequest>,
@@ -1628,6 +1723,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(pb::ListProvidersResponse { providers, cursor: Some(self.cursor()) }))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "list_models")
+	)]
 	async fn list_models(
 		&self,
 		request: Request<pb::ListModelsRequest>,
@@ -1635,6 +1735,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(self.list_models_response(&request.into_inner())))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "watch_models")
+	)]
 	async fn watch_models(
 		&self,
 		_request: Request<pb::WatchModelsRequest>,
@@ -1646,6 +1751,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		Ok(Response::new(Box::pin(stream::once(async move { Ok(event) }))))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "refresh_models")
+	)]
 	async fn refresh_models(
 		&self,
 		request: Request<pb::RefreshModelsRequest>,
@@ -1658,6 +1768,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		})))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "provider_catalog")
+	)]
 	async fn provider_catalog(
 		&self,
 		request: Request<pb::ProviderCatalogRequest>,
@@ -1670,6 +1785,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "watch_provider_catalog")
+	)]
 	async fn watch_provider_catalog(
 		&self,
 		request: Request<pb::WatchProviderCatalogRequest>,
@@ -1682,6 +1802,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "provider_authenticated")
+	)]
 	async fn provider_authenticated(
 		&self,
 		request: Request<pb::ProviderAuthenticatedRequest>,
@@ -1694,6 +1819,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "declare_provider")
+	)]
 	async fn declare_provider(
 		&self,
 		request: Request<pb::ProviderDeclarationRequest>,
@@ -1706,6 +1836,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "replace_provider")
+	)]
 	async fn replace_provider(
 		&self,
 		request: Request<pb::ProviderDeclarationRequest>,
@@ -1718,6 +1853,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "retract_provider")
+	)]
 	async fn retract_provider(
 		&self,
 		request: Request<pb::RetractProviderRequest>,
@@ -1730,6 +1870,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "execute_provider_request")
+	)]
 	async fn execute_provider_request(
 		&self,
 		request: Request<pb::ProviderOperationRequest>,
@@ -1742,6 +1887,11 @@ impl pb::inference_server::Inference for InferenceRpc {
 		))
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		skip_all,
+		fields(rpc.service = "inference", rpc.method = "mint_provider_session")
+	)]
 	async fn mint_provider_session(
 		&self,
 		request: Request<pb::ProviderOperationRequest>,

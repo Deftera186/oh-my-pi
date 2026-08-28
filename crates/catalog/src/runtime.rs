@@ -84,14 +84,17 @@ struct RuntimeBehavior {
 }
 
 impl RuntimeBehavior {
+	#[tracing::instrument(
+		name = "catalog_runtime_behavior_parse",
+		level = "debug",
+		skip_all,
+		fields(source_count = 1, file = FILE)
+	)]
 	fn parse(text: &str) -> Result<Self, CascadeError> {
-		let document: KdlDocument =
-			text
-				.parse()
-				.map_err(|error: kdl::KdlError| CascadeError::Parse {
-					file:    FILE.to_str(),
-					message: error.to_string().to_str(),
-				})?;
+		let document: KdlDocument = text.parse().map_err(|error: kdl::KdlError| {
+			tracing::warn!(file = FILE, "catalog runtime KDL failed to parse");
+			CascadeError::Parse { file: FILE.to_str(), message: error.to_string().to_str() }
+		})?;
 		let [root] = document.nodes() else {
 			return malformed("behavior");
 		};

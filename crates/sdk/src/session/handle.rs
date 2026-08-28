@@ -9,11 +9,12 @@ use omp_agent::{
 	RegimeRecord, RegimeSpec, StartOptions, StartReceipt, TurnClient, TurnId,
 };
 use omp_core::Str;
+use omp_observability::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionDispatch};
 use omp_proto::thread::v1::Item;
-use omp_telemetry::firehose::{Envelope, Event as TelemetryEvent, Firehose, SessionDispatch};
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::{runtime, sync::watch};
+use tracing::Instrument as _;
 
 use super::SessionDiagnostics;
 use crate::{ProtocolResolution, RuntimeCallbacks, UiContextUpdate};
@@ -369,6 +370,11 @@ impl SessionHandle {
 		let runtime_handle =
 			runtime::Handle::try_current().map_err(|_| SessionHandleError::NoRuntime)?;
 		runtime_handle.spawn(run_handle_actor(actor_inner, rx, runtime, revival, constructed_at));
+		tracing::info!(
+			session_id = %inner.identity.id,
+			lifecycle = ?initial,
+			"SDK session launched"
+		);
 		Ok(Self { inner })
 	}
 
@@ -439,6 +445,12 @@ impl SessionHandle {
 
 	/// Submits canonical caller-authored items. A disposed handle transparently
 	/// reloads its journal through the guarded revival factory first.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_submit",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn submit(
 		&self,
 		items: impl IntoIterator<Item = Item>,
@@ -450,13 +462,19 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::Submit { items: items.into_iter().collect(), turn_id, reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
+			.map_err(|_| actor_transport_closed())?;
 		rx.recv_async()
 			.await
-			.map_err(|_| SessionHandleError::Closed)?
+			.map_err(|_| actor_transport_closed())?
 	}
 
 	/// Rewinds and resubmits the latest durable user turn.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_retry",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn retry_last_turn(
 		&self,
 		turn_id: TurnId,
@@ -467,14 +485,20 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::Retry { turn_id, reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
+			.map_err(|_| actor_transport_closed())?;
 		response
 			.recv_async()
 			.await
-			.map_err(|_| SessionHandleError::Closed)?
+			.map_err(|_| actor_transport_closed())?
 	}
 
 	/// Executes and commits one manual compaction on the live agent loop.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_compact",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn compact_manual(
 		&self,
 		request: ManualCompactionRequest,
@@ -485,15 +509,21 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::Compact { request, reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
+			.map_err(|_| actor_transport_closed())?;
 		response
 			.recv_async()
 			.await
-			.map_err(|_| SessionHandleError::Closed)?
+			.map_err(|_| actor_transport_closed())?
 	}
 
 	/// Starts and journals a regime on the actor-owned agent loop, returning its
 	/// receipt and the complete active-regime projection.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_start_regime",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn start_regime(
 		&self,
 		spec: Arc<RegimeSpec>,
@@ -506,14 +536,20 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::StartRegime { spec, regime, options, reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
+			.map_err(|_| actor_transport_closed())?;
 		response
 			.recv_async()
 			.await
-			.map_err(|_| SessionHandleError::Closed)?
+			.map_err(|_| actor_transport_closed())?
 	}
 
 	/// Returns the complete active-regime projection from the actor-owned loop.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_active_regimes",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn active_regimes(&self) -> Result<Vec<RegimeRecord>, SessionHandleError> {
 		let (reply, response) = flume::bounded(1);
 		self
@@ -521,15 +557,21 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::ActiveRegimes { reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
+			.map_err(|_| actor_transport_closed())?;
 		response
 			.recv_async()
 			.await
-			.map_err(|_| SessionHandleError::Closed)?
+			.map_err(|_| actor_transport_closed())?
 	}
 
 	/// Stops one activation and returns whether it was stopped together with
 	/// the resulting complete active-regime projection.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_stop_regime",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn stop_regime(
 		&self,
 		activation: ActivationId,
@@ -541,11 +583,11 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::StopRegime { activation, now_ms, reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
+			.map_err(|_| actor_transport_closed())?;
 		response
 			.recv_async()
 			.await
-			.map_err(|_| SessionHandleError::Closed)?
+			.map_err(|_| actor_transport_closed())?
 	}
 
 	/// Interrupts the active submission without waiting for the actor mailbox.
@@ -557,6 +599,12 @@ impl SessionHandle {
 
 	/// Releases live loop resources while retaining durable identity. A later
 	/// submission remains valid when a cold-revival factory is installed.
+	#[tracing::instrument(
+		level = "debug",
+		name = "sdk_session_dispose",
+		skip_all,
+		fields(session_id = %self.inner.identity.id)
+	)]
 	pub async fn dispose(&self) -> Result<(), SessionHandleError> {
 		self.interrupt();
 		let (reply, rx) = flume::bounded(1);
@@ -565,11 +613,14 @@ impl SessionHandle {
 			.commands
 			.send_async(Command::Dispose { reply })
 			.await
-			.map_err(|_| SessionHandleError::Closed)?;
-		rx.recv_async()
-			.await
-			.map_err(|_| SessionHandleError::Closed)
+			.map_err(|_| actor_transport_closed())?;
+		rx.recv_async().await.map_err(|_| actor_transport_closed())
 	}
+}
+
+fn actor_transport_closed() -> SessionHandleError {
+	tracing::warn!("SDK session actor transport closed");
+	SessionHandleError::Closed
 }
 
 async fn run_handle_actor(
@@ -588,6 +639,10 @@ async fn run_handle_actor(
 				shared.abort.lock().take();
 				runtime = None;
 				shared.lifecycle.send_replace(SessionLifecycle::Disposed);
+				tracing::info!(
+					session_id = %shared.identity.id,
+					"SDK session disposed"
+				);
 				let _ = reply.send(());
 				continue;
 			},
@@ -676,11 +731,19 @@ async fn run_handle_actor(
 			Command::Submit { items, turn_id, reply } => {
 				if runtime.is_none() {
 					shared.lifecycle.send_replace(SessionLifecycle::Reviving);
+					tracing::info!(
+						session_id = %shared.identity.id,
+						"SDK session revival started"
+					);
 					let revived = if let Some(factory) = &revival {
 						factory(SessionRevivalRequest {
 							identity:  shared.identity.clone(),
 							callbacks: shared.callbacks.clone(),
 						})
+						.instrument(tracing::debug_span!(
+							"sdk_session_revive",
+							session_id = %shared.identity.id
+						))
 						.await
 					} else {
 						Err(SessionRevivalError::Unavailable)
@@ -691,6 +754,10 @@ async fn run_handle_actor(
 							*shared.abort.lock() = Some(next.abort.clone());
 							runtime = Some(next);
 							shared.lifecycle.send_replace(SessionLifecycle::Ready);
+							tracing::info!(
+								session_id = %shared.identity.id,
+								"SDK session revival completed"
+							);
 						},
 						Err(SessionRevivalError::Unavailable) if revival.is_none() => {
 							shared.lifecycle.send_replace(SessionLifecycle::Disposed);
@@ -699,6 +766,11 @@ async fn run_handle_actor(
 						},
 						Err(error) => {
 							shared.lifecycle.send_replace(SessionLifecycle::Disposed);
+							tracing::warn!(
+								session_id = %shared.identity.id,
+								%error,
+								"SDK session revival failed"
+							);
 							let _ = reply.send(Err(error.into()));
 							continue;
 						},
@@ -731,6 +803,10 @@ async fn run_handle_actor(
 	if let Some(shared) = inner.upgrade() {
 		shared.abort.lock().take();
 		shared.lifecycle.send_replace(SessionLifecycle::Closed);
+		tracing::info!(
+			session_id = %shared.identity.id,
+			"SDK session closed"
+		);
 	}
 }
 

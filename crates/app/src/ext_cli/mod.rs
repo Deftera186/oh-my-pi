@@ -2662,15 +2662,18 @@ async fn materialize_signed_wheel(
 	let settings =
 		SettingsManager::open(SettingsPaths::discover(&state.data_dir, Some(&state.project)))
 			.into_diagnostic()?;
-	let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
+	let environment = omp_envd::ProjectEnvironment::attach(
 		&state.project,
 		&state.project_state,
-		&omp_env::project_state::document_socket(&state.project_state),
-		false,
-		&[],
-		&[],
-		settings.snapshot(),
-		omp_envd::RegistryBridges::default(),
+		omp_envd::AttachOptions {
+			py_eval:            false,
+			approval_mode:      None,
+			trusted_extensions: Vec::new(),
+			contributed_values: Vec::new(),
+			settings:           settings.snapshot(),
+			bridges:            omp_envd::RegistryBridges::default(),
+			spawn_idle_timeout: None,
+		},
 	)
 	.await
 	.map_err(|error| miette!("{error}"))?;

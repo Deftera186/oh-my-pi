@@ -1055,6 +1055,12 @@ impl WalkRequest {
 		run_file_candidate_parallel(self, &sink, &heartbeat)
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		name = "walker_scan",
+		skip_all,
+		fields(root = %self.root.display(), entry_count = tracing::field::Empty)
+	)]
 	fn collect_with_rank_and_limit<E, H>(
 		&self,
 		rank: Option<WalkRank>,
@@ -1103,6 +1109,7 @@ impl WalkRequest {
 			filtered_entries,
 			limited_entries,
 		};
+		tracing::Span::current().record("entry_count", scan.entries.len());
 		Ok(WalkOutcome { entries: scan.entries, backend, stats })
 	}
 

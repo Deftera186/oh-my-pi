@@ -364,6 +364,12 @@ impl UiRoster {
 				.chain(declaration.aliases.iter().map(String::as_str))
 			{
 				if commands.contains_key(spelling) {
+					tracing::warn!(
+						extension_id = %host.extension(),
+						host_generation = roster.generation,
+						roster_key = %spelling,
+						"extension UI roster publication rejected",
+					);
 					return Err(UiRosterConflict { key: Str::from(spelling) });
 				}
 				commands.insert(Str::from(spelling), entry.clone());
@@ -371,6 +377,12 @@ impl UiRoster {
 		}
 		for declaration in &roster.shortcuts {
 			if shortcuts.contains_key(declaration.chord.as_str()) {
+				tracing::warn!(
+					extension_id = %host.extension(),
+					host_generation = roster.generation,
+					roster_key = %declaration.chord,
+					"extension UI roster publication rejected",
+				);
 				return Err(UiRosterConflict { key: Str::from(declaration.chord.as_str()) });
 			}
 			shortcuts.insert(Str::from(declaration.chord.as_str()), UiShortcutRosterEntry {
@@ -401,6 +413,12 @@ impl UiRoster {
 			let entries = renderers.entry(declaration.identity.clone()).or_default();
 			if !declaration.decorates && entries.iter().any(|entry| !entry.declaration.decorates) {
 				let identity = &declaration.identity;
+				tracing::warn!(
+					extension_id = %host.extension(),
+					host_generation = roster.generation,
+					renderer = %identity.name,
+					"extension UI roster publication rejected",
+				);
 				return Err(UiRosterConflict {
 					key: sf!("{}@{}.{}", identity.name, identity.rev.family, identity.rev.n),
 				});
@@ -419,6 +437,15 @@ impl UiRoster {
 		self.shortcuts = shortcuts;
 		self.completions = completions;
 		self.renderers = renderers;
+		tracing::info!(
+			extension_id = %host.extension(),
+			host_generation = roster.generation,
+			command_count = roster.commands.len(),
+			shortcut_count = roster.shortcuts.len(),
+			completion_count = roster.triggers.len(),
+			renderer_count = roster.renderers.len(),
+			"extension UI roster published",
+		);
 		Ok(())
 	}
 

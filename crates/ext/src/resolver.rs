@@ -360,16 +360,26 @@ impl ResolvePlan {
 	}
 
 	/// Executes every planned target and preserves each exact invocation.
+	#[tracing::instrument(
+		name = "extension_resolve",
+		level = "debug",
+		skip_all,
+		fields(target_count = self.requests.len(), frozen_count = frozen.len())
+	)]
 	pub fn run<R: UvRunner>(
 		&self,
 		runner: &R,
 		frozen: &[(&str, &str)],
 	) -> Result<Vec<ResolveOutcome>, ExtensionError> {
-		self
+		let result = self
 			.requests
 			.iter()
 			.map(|request| resolve_with(runner, request, frozen))
-			.collect()
+			.collect::<Result<Vec<_>, _>>();
+		if let Ok(outcomes) = &result {
+			tracing::debug!(outcome_count = outcomes.len(), "extension resolution completed");
+		}
+		result
 	}
 }
 

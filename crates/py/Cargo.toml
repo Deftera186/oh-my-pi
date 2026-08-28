@@ -34,6 +34,7 @@ omp-storage = { workspace = true }
 omp-scribe = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

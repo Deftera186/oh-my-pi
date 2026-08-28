@@ -408,7 +408,7 @@ fn write_extension_overlay(
 		.validate(scope)
 		.map_err(|error| miette!("{error}"))?;
 	let value = toml::Value::try_from(overlay).into_diagnostic()?;
-	mutate_document(path, &[DocumentMutation::Set { path: "extensions", value }])
+	mutate_document(path, &[DocumentMutation::Set { path: "extensions".to_owned(), value }])
 		.into_diagnostic()?;
 	Ok(())
 }

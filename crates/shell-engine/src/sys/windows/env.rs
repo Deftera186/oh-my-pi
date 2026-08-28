@@ -48,8 +48,8 @@ where
 			&& existing != &v
 		{
 			tracing::warn!(
-				"environment variable collision under canonical name {normalized}: two different \
-				 values were supplied (last-write wins)"
+				name = %normalized,
+				"environment variable collision; last value wins"
 			);
 		}
 		vars.insert(normalized, v);

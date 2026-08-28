@@ -334,10 +334,6 @@ fn parse_key_sequence(input: &str) -> Result<interfaces::KeySequence, BindError>
 fn parse_key_sequence_and_shell_command(
 	input: &str,
 ) -> Result<(interfaces::KeySequence, String), BindError> {
-	tracing::debug!(target: trace_categories::INPUT,
-		 "parsing key binding entry: '{input}'"
-	);
-
 	// First trim any whitespace.
 	let input = input.trim();
 
@@ -359,10 +355,6 @@ enum BindableReadlineTarget {
 fn parse_key_sequence_and_readline_target(
 	input: &str,
 ) -> Result<(interfaces::KeySequence, BindableReadlineTarget), BindError> {
-	tracing::debug!(target: trace_categories::INPUT,
-		 "parsing key binding entry: '{input}'"
-	);
-
 	// First trim any whitespace.
 	let input = input.trim();
 
@@ -390,10 +382,6 @@ fn bind_key_sequence_to_shell_cmd(
 	key_sequence: interfaces::KeySequence,
 	command: String,
 ) -> Result<(), BindError> {
-	tracing::debug!(target: trace_categories::INPUT,
-		 "binding key sequence: '{key_sequence}' => command '{command}'"
-	);
-
 	bindings.bind(key_sequence, interfaces::KeyAction::ShellCommand(command))?;
 
 	Ok(())
@@ -406,18 +394,10 @@ fn bind_key_sequence_to_readline_target(
 ) -> Result<(), BindError> {
 	match target {
 		BindableReadlineTarget::Function(func) => {
-			tracing::debug!(target: trace_categories::INPUT,
-				 "binding key sequence: '{key_sequence}' => readline function '{func}'"
-			);
-
 			bindings.bind(key_sequence, interfaces::KeyAction::DoInputFunction(func))?;
 			Ok(())
 		},
 		BindableReadlineTarget::Macro(cmd_macro) => {
-			tracing::debug!(target: trace_categories::INPUT,
-				 "binding key sequence: '{key_sequence}' => readline macro '{cmd_macro}'"
-			);
-
 			bindings.define_macro(key_sequence, cmd_macro)?;
 			Ok(())
 		},

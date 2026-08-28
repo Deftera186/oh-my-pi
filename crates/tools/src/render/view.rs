@@ -9,6 +9,8 @@
 //! tag, attribute, or theme token is a compile error instead of a silently
 //! broken card.
 
+use std::time::Duration;
+
 use omp_core::Str;
 use smallvec::SmallVec;
 use strum::IntoStaticStr;
@@ -264,6 +266,12 @@ pub enum Val {
 impl From<u64> for Val {
 	fn from(value: u64) -> Self {
 		Self::Uint(value)
+	}
+}
+/// Millisecond count for `ms`-valued props, saturating at `u64::MAX`.
+impl From<Duration> for Val {
+	fn from(value: Duration) -> Self {
+		Self::Uint(u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
 	}
 }
 impl From<u32> for Val {

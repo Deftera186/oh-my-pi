@@ -311,6 +311,7 @@ where
 			Err(error) => break Err(error.into()),
 		};
 		let Some(body) = frame.body else {
+			tracing::warn!(request_id = frame.request_id, "rejected protocol frame with missing body");
 			send_error(
 				&output,
 				frame.request_id,
@@ -322,6 +323,10 @@ where
 		};
 		if let client_frame::Body::Cancel(cancel) = body {
 			if frame.request_id != 0 {
+				tracing::warn!(
+					request_id = frame.request_id,
+					"rejected cancel frame with nonzero request id"
+				);
 				send_error(
 					&output,
 					frame.request_id,
@@ -337,6 +342,7 @@ where
 			continue;
 		}
 		if frame.request_id == 0 {
+			tracing::warn!("rejected protocol request with zero request id");
 			send_error(
 				&output,
 				0,
@@ -363,6 +369,12 @@ where
 			}
 		};
 		if let Some((code, message, terminal)) = admission_error {
+			tracing::warn!(
+				request_id = frame.request_id,
+				code = ?code,
+				terminal,
+				"protocol request admission rejected"
+			);
 			send_error(&output, frame.request_id, code, message).await;
 			if terminal {
 				break Ok(());
@@ -431,6 +443,7 @@ async fn accept_handshake(
 	output: &flume::Sender<ServerFrame>,
 ) -> Option<u32> {
 	let Some(client_frame::Body::Hello(hello)) = frame.body else {
+		tracing::warn!("rejected connection without client hello");
 		send_error(
 			output,
 			0,
@@ -441,6 +454,10 @@ async fn accept_handshake(
 		return None;
 	};
 	if frame.request_id != 0 {
+		tracing::warn!(
+			request_id = frame.request_id,
+			"rejected client hello with nonzero request id"
+		);
 		send_error(
 			output,
 			frame.request_id,
@@ -451,6 +468,11 @@ async fn accept_handshake(
 		return None;
 	}
 	if hello.protocol_major != PROTOCOL_MAJOR {
+		tracing::warn!(
+			client_protocol_major = hello.protocol_major,
+			server_protocol_major = PROTOCOL_MAJOR,
+			"rejected unsupported document protocol version"
+		);
 		send_error(
 			output,
 			0,

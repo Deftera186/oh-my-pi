@@ -16,7 +16,7 @@ use omp_env::{
 	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
 };
 use omp_envd::{
-	EnvServer, ProjectEnvironment, RegistryBridges,
+	AttachOptions, EnvServer, ProjectEnvironment, RegistryBridges,
 	eval::{
 		BridgeHostError, BridgeProgressSink, EvalSessionConfig, ParentBindingLease, ParentSessionHost,
 	},
@@ -41,6 +41,7 @@ use omp_proto::{
 		},
 	},
 };
+use omp_settings::manager::{SettingsManager, SettingsPaths};
 use omp_tool::{
 	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, LoweringCaps,
 	Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec,
@@ -2476,18 +2477,17 @@ async fn python_extension_data_reads_and_writes_live_workspace_only_during_invoc
 	extension.host_executable = Some(PathBuf::from(env!("CARGO_BIN_EXE_omp")));
 	extension.data_grants =
 		Grants::supported(["env.doc.read", "env.doc.write", "env.fs.read", "env.fs.write"]);
-	let environment = ProjectEnvironment::connect_or_start(
-		&root,
-		&state,
-		&state.join("env.sock"),
-		&state.join("docs.sock"),
-		false,
-		None,
-		&[extension],
-		&[],
-		omp_tool::DEFAULT_INTERRUPT_GRACE,
-		RegistryBridges::default(),
-	)
+	let environment = ProjectEnvironment::attach(&root, &state, AttachOptions {
+		py_eval:            false,
+		approval_mode:      None,
+		trusted_extensions: vec![extension],
+		contributed_values: Vec::new(),
+		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
+			.expect("settings manager")
+			.snapshot(),
+		bridges:            RegistryBridges::default(),
+		spawn_idle_timeout: Some(2),
+	})
 	.await
 	.expect("start extension DATA environment");
 	environment.client().set_admitter(AllowAdmission);
@@ -3433,18 +3433,17 @@ async fn owner_client_lsp_status_reports_discovered_workspace_roster() {
 	)
 	.expect("write config");
 
-	let environment = ProjectEnvironment::connect_or_start(
-		&root,
-		&state,
-		&state.join("env.sock"),
-		&state.join("docs.sock"),
-		false,
-		None,
-		&[],
-		&[],
-		omp_tool::DEFAULT_INTERRUPT_GRACE,
-		RegistryBridges::default(),
-	)
+	let environment = ProjectEnvironment::attach(&root, &state, AttachOptions {
+		py_eval:            false,
+		approval_mode:      None,
+		trusted_extensions: Vec::new(),
+		contributed_values: Vec::new(),
+		settings:           SettingsManager::open(SettingsPaths::discover(&state, Some(&root)))
+			.expect("settings manager")
+			.snapshot(),
+		bridges:            RegistryBridges::default(),
+		spawn_idle_timeout: Some(2),
+	})
 	.await
 	.expect("start project environment");
 

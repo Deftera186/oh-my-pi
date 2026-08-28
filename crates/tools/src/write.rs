@@ -503,6 +503,36 @@ pub struct WriteTool<D> {
 	spec:            ToolSpec,
 }
 
+/// Returns the host-free `write@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("write"),
+		rev:             Rev { family: Str::new(""), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("**")].into_iter().collect(),
+			}),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("write.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Construct the built-in whole-file write tool.
 pub fn tool<D: WriteDocuments>(documents: D) -> WriteTool<D> {
 	tool_with_conflicts(documents, Arc::new(ConflictRegistry::default()))
@@ -523,38 +553,7 @@ pub fn tool_with_policy_and_conflicts<D: WriteDocuments>(
 	format_policy: FormatPolicy,
 	guard_generated: bool,
 ) -> WriteTool<D> {
-	WriteTool {
-		documents,
-		conflicts,
-		format_policy,
-		guard_generated,
-		spec: ToolSpec {
-			name:            sf!("write"),
-			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect(),
-				}),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("write.rs"),
-			)
-			.into(),
-		},
-	}
+	WriteTool { documents, conflicts, format_policy, guard_generated, spec: spec() }
 }
 
 impl<D: WriteDocuments> Tool for WriteTool<D> {
@@ -572,438 +571,438 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
 		stream! {
-							let arguments = match params.whole::<Params>().await {
-								Ok(arguments) => arguments,
-								Err(error) => {
-									yield param_event(error);
-									return;
-								},
-							};
-							let authored_path = unwrap_hashline_header_path(&arguments.path);
-							let normalized = normalize_target(authored_path, None, HostPaths::current());
-							let path = normalized.canonical.clone();
-							let canonical_recovery = normalized.recovery_notice();
-							let conflict_request = match parse_uri(&path) {
-														Ok(Some(uri))
-									if uri.scheme == Scheme::Conflict && uri.resource == "*" =>
-								{
-									None
-								},
-		Ok(Some(uri)) if uri.scheme == Scheme::Conflict => {
-									if uri.selector_text.is_some() || uri.resource.contains('/') {
-										yield done(Err(Fault::UriLikeTarget {
-											message: sf!(
-												"Conflict splices target conflict://<id> without a scope or read selector",
-											),
-										}));
-										return;
-									}
-									let address = match parse_conflict_address(uri.resource) {
-										Ok(address) => address,
-										Err(fault) => {
-											yield done(Err(Fault::Document { message: fault.message().clone() }));
-											return;
-										},
-									};
-									let Some(entry) = self.conflicts.get(address.id) else {
-										yield done(Err(Fault::Document {
-											message: sf!(
-												"Conflict #{} is no longer registered",
-												address.id
-											),
-										}));
-										return;
-									};
-									Some(ConflictSpliceRequest {
-										entry,
-										replacement: parse_replacement(arguments.content.clone()),
-									})
-								},
-								Ok(_) => None,
-								Err(error) => {
-									yield done(Err(Fault::UriLikeTarget { message: Str::new(error.to_string()) }));
-									return;
-								},
-							};
-							let stripped = strip_write_content(&arguments.content);
-							let reported_len =
-								u64::try_from(stripped.text.encode_utf16().count()).unwrap_or(u64::MAX);
+			let arguments = match params.whole::<Params>().await {
+				Ok(arguments) => arguments,
+				Err(error) => {
+					yield param_event(error);
+					return;
+				},
+			};
+			let authored_path = unwrap_hashline_header_path(&arguments.path);
+			let normalized = normalize_target(authored_path, None, HostPaths::current());
+			let path = normalized.canonical.clone();
+			let canonical_recovery = normalized.recovery_notice();
+			let conflict_request = match parse_uri(&path) {
+				Ok(Some(uri))
+				if uri.scheme == Scheme::Conflict && uri.resource == "*" =>
+				{
+					None
+				},
+				Ok(Some(uri)) if uri.scheme == Scheme::Conflict => {
+					if uri.selector_text.is_some() || uri.resource.contains('/') {
+						yield done(Err(Fault::UriLikeTarget {
+							message: sf!(
+								"Conflict splices target conflict://<id> without a scope or read selector",
+							),
+						}));
+						return;
+					}
+					let address = match parse_conflict_address(uri.resource) {
+						Ok(address) => address,
+						Err(fault) => {
+							yield done(Err(Fault::Document { message: fault.message().clone() }));
+							return;
+						},
+					};
+					let Some(entry) = self.conflicts.get(address.id) else {
+						yield done(Err(Fault::Document {
+							message: sf!(
+								"Conflict #{} is no longer registered",
+								address.id
+							),
+						}));
+						return;
+					};
+					Some(ConflictSpliceRequest {
+						entry,
+						replacement: parse_replacement(arguments.content.clone()),
+					})
+				},
+				Ok(_) => None,
+				Err(error) => {
+					yield done(Err(Fault::UriLikeTarget { message: Str::new(error.to_string()) }));
+					return;
+				},
+			};
+			let stripped = strip_write_content(&arguments.content);
+			let reported_len =
+				u64::try_from(stripped.text.encode_utf16().count()).unwrap_or(u64::MAX);
 
-							match params.interruptable().committed().await {
-								Ok(_) => {},
-								Err(error) => {
-									yield commit_event(error);
-									return;
-								},
+			match params.interruptable().committed().await {
+				Ok(_) => {},
+				Err(error) => {
+					yield commit_event(error);
+					return;
+				},
+			}
+
+
+			if path == "conflict://*" {
+				let entries = self.conflicts.entries();
+				if entries.is_empty() {
+					yield done(Err(Fault::Document {
+						message: sf!("conflict://* has no registered conflicts to resolve"),
+					}));
+					return;
+				}
+				let directives = match parse_bulk_directives(&arguments.content) {
+					Ok(directives) => directives,
+					Err(fault) => {
+						yield done(Err(Fault::Document { message: fault.message().clone() }));
+						return;
+					},
+				};
+				if let Some(directives) = &directives {
+					let unknown = directives
+						.keys()
+						.filter(|id| !entries.iter().any(|entry| entry.id == **id))
+						.copied()
+						.collect::<Vec<_>>();
+					if !unknown.is_empty() {
+						yield done(Err(Fault::Document {
+							message: sf!(
+								"Bulk directive references unknown conflict ids: {:?}",
+								unknown
+							),
+						}));
+						return;
+					}
+				}
+				let uniform = parse_replacement(stripped.text.clone());
+				let mut by_file = BTreeMap::<Str, Vec<_>>::new();
+				for entry in entries {
+					let replacement = match &directives {
+						Some(directives) => {
+							let Some(replacement) = directives.get(&entry.id) else {
+								continue;
+							};
+							replacement.clone()
+						},
+						None => uniform.clone(),
+					};
+					by_file
+						.entry(entry.display_path.clone())
+						.or_default()
+						.push((entry, replacement));
+				}
+				if by_file.is_empty() {
+					yield done(Err(Fault::Document {
+						message: sf!("conflict://* directive block selected no conflicts"),
+					}));
+					return;
+				}
+				let mut succeeded = Vec::new();
+				let mut failed = Vec::new();
+				let mut resolved = 0usize;
+				let mut echo_trimmed = 0usize;
+				let mut byte_len = 0u64;
+				for (display_path, entries) in by_file {
+					let request =
+						ConflictBulkFileRequest { display_path: display_path.clone(), entries };
+					match self.documents.splice_conflict_file(request).await {
+						Ok(Some(result)) => {
+							for id in &result.resolved_ids {
+								self.conflicts.remove(*id);
 							}
-
-
-							if path == "conflict://*" {
-								let entries = self.conflicts.entries();
-								if entries.is_empty() {
-									yield done(Err(Fault::Document {
-										message: sf!("conflict://* has no registered conflicts to resolve"),
-									}));
-									return;
-								}
-								let directives = match parse_bulk_directives(&arguments.content) {
-									Ok(directives) => directives,
-									Err(fault) => {
-										yield done(Err(Fault::Document { message: fault.message().clone() }));
-										return;
-									},
-								};
-								if let Some(directives) = &directives {
-									let unknown = directives
-										.keys()
-										.filter(|id| !entries.iter().any(|entry| entry.id == **id))
-										.copied()
-										.collect::<Vec<_>>();
-									if !unknown.is_empty() {
-										yield done(Err(Fault::Document {
-											message: sf!(
-												"Bulk directive references unknown conflict ids: {:?}",
-												unknown
-											),
-										}));
-										return;
-									}
-								}
-								let uniform = parse_replacement(stripped.text.clone());
-								let mut by_file = BTreeMap::<Str, Vec<_>>::new();
-								for entry in entries {
-									let replacement = match &directives {
-										Some(directives) => {
-											let Some(replacement) = directives.get(&entry.id) else {
-												continue;
-											};
-											replacement.clone()
-										},
-										None => uniform.clone(),
-									};
-									by_file
-										.entry(entry.display_path.clone())
-										.or_default()
-										.push((entry, replacement));
-								}
-								if by_file.is_empty() {
-									yield done(Err(Fault::Document {
-										message: sf!("conflict://* directive block selected no conflicts"),
-									}));
-									return;
-								}
-								let mut succeeded = Vec::new();
-								let mut failed = Vec::new();
-								let mut resolved = 0usize;
-								let mut echo_trimmed = 0usize;
-								let mut byte_len = 0u64;
-								for (display_path, entries) in by_file {
-									let request =
-										ConflictBulkFileRequest { display_path: display_path.clone(), entries };
-									match self.documents.splice_conflict_file(request).await {
-										Ok(Some(result)) => {
-											for id in &result.resolved_ids {
-												self.conflicts.remove(*id);
-											}
-											resolved = resolved.saturating_add(result.resolved_ids.len());
-											echo_trimmed =
-												echo_trimmed.saturating_add(result.echo_trimmed);
-											byte_len = byte_len.saturating_add(result.write.byte_len);
-											succeeded.push(display_path);
-										},
-										Ok(None) => {
-											failed.push(ConflictBulkFailure {
-												path: display_path,
-												message: sf!(
-													"bulk conflict splices are unavailable in this deployment"
-												),
-											});
-										},
-										Err(WriteCommitError::Rejected(fault)) => {
-											failed.push(ConflictBulkFailure {
-												path: display_path,
-												message: Str::new(fault.to_string()),
-											});
-										},
-										Err(WriteCommitError::EffectsUnknown { reason }) => {
-											yield Ev::Aborted(Abort::EffectsUnknown {
-												reason: sf!(
-													"bulk conflict resolution committed {} files before \
+							resolved = resolved.saturating_add(result.resolved_ids.len());
+							echo_trimmed =
+								echo_trimmed.saturating_add(result.echo_trimmed);
+							byte_len = byte_len.saturating_add(result.write.byte_len);
+							succeeded.push(display_path);
+						},
+						Ok(None) => {
+							failed.push(ConflictBulkFailure {
+								path: display_path,
+								message: sf!(
+									"bulk conflict splices are unavailable in this deployment"
+								),
+							});
+						},
+						Err(WriteCommitError::Rejected(fault)) => {
+							failed.push(ConflictBulkFailure {
+								path: display_path,
+								message: Str::new(fault.to_string()),
+							});
+						},
+						Err(WriteCommitError::EffectsUnknown { reason }) => {
+							yield Ev::Aborted(Abort::EffectsUnknown {
+								reason: sf!(
+									"bulk conflict resolution committed {} files before \
 													 an uncertain outcome for {display_path}: {reason}",
-													succeeded.len()
-												),
-											});
-											return;
-										},
-									}
-								}
-								if succeeded.is_empty() {
-									let mut message =
-										String::from("conflict://* left every file unchanged:");
-									for failure in &failed {
-										write!(message, "\n  {}: {}", failure.path, failure.message)
-											.expect("writing to String cannot fail");
-									}
-									yield done(Err(Fault::Document { message: Str::new(message) }));
-									return;
-								}
-								yield done(Ok(Payload {
-									resolved_path: path.clone(),
-									display_path: path.clone(),
-									canonical_recovery,
-									byte_len,
-									reported_len,
-									disposition: WriteDisposition::Overwrote,
-									stripped_wrapper: stripped.stripped,
-									made_executable: false,
-									snapshot_tag: None,
-									operation: WriteOperation::ConflictBulk {
-										resolved,
-										succeeded,
-										failed,
-										echo_trimmed,
-									},
-								}));
-								return;
-							}
-							let resource_request = match route_resource_mutation(&path, stripped.text.clone()) {
-								Ok(request) => request,
-								Err(error) => {
-									yield done(Err(Fault::Document { message: Str::new(error.to_string()) }));
-									return;
+									succeeded.len()
+								),
+							});
+							return;
+						},
+					}
+				}
+				if succeeded.is_empty() {
+					let mut message =
+						String::from("conflict://* left every file unchanged:");
+					for failure in &failed {
+						write!(message, "\n  {}: {}", failure.path, failure.message)
+							.expect("writing to String cannot fail");
+					}
+					yield done(Err(Fault::Document { message: Str::new(message) }));
+					return;
+				}
+				yield done(Ok(Payload {
+					resolved_path: path.clone(),
+					display_path: path.clone(),
+					canonical_recovery,
+					byte_len,
+					reported_len,
+					disposition: WriteDisposition::Overwrote,
+					stripped_wrapper: stripped.stripped,
+					made_executable: false,
+					snapshot_tag: None,
+					operation: WriteOperation::ConflictBulk {
+						resolved,
+						succeeded,
+						failed,
+						echo_trimmed,
+					},
+				}));
+				return;
+			}
+			let resource_request = match route_resource_mutation(&path, stripped.text.clone()) {
+				Ok(request) => request,
+				Err(error) => {
+					yield done(Err(Fault::Document { message: Str::new(error.to_string()) }));
+					return;
+				},
+			};
+			if let Some(request) = resource_request {
+				let operation = self.documents.write_resource(request).fuse();
+				let interruption = params.next_interrupt().fuse();
+				pin_mut!(operation, interruption);
+				select_biased! {
+					result = operation => match result {
+						Ok(Some(receipt)) => {
+							yield done(Ok(Payload {
+								resolved_path: receipt.canonical_uri.clone(),
+								display_path: receipt.canonical_uri.clone(),
+								canonical_recovery,
+								byte_len: receipt.byte_len,
+								reported_len,
+								disposition: WriteDisposition::Overwrote,
+								stripped_wrapper: stripped.stripped,
+								made_executable: false,
+								snapshot_tag: None,
+								operation: WriteOperation::Resource {
+									uri: receipt.canonical_uri,
+									revision: receipt.revision,
 								},
-							};
-							if let Some(request) = resource_request {
-								let operation = self.documents.write_resource(request).fuse();
-								let interruption = params.next_interrupt().fuse();
-								pin_mut!(operation, interruption);
-								select_biased! {
-									result = operation => match result {
-										Ok(Some(receipt)) => {
-											yield done(Ok(Payload {
-												resolved_path: receipt.canonical_uri.clone(),
-												display_path: receipt.canonical_uri.clone(),
-												canonical_recovery,
-												byte_len: receipt.byte_len,
-												reported_len,
-												disposition: WriteDisposition::Overwrote,
-												stripped_wrapper: stripped.stripped,
-												made_executable: false,
-												snapshot_tag: None,
-												operation: WriteOperation::Resource {
-													uri: receipt.canonical_uri,
-													revision: receipt.revision,
-												},
-											}));
-											return;
-										},
-										Ok(None) => {
-											yield done(Err(Fault::UnsupportedScheme {
-												scheme: Str::new(path.split_once(':').map_or("resource", |(scheme, _)| scheme)),
-											}));
-											return;
-										},
-										Err(WriteCommitError::Rejected(fault)) => {
-											yield done(Err(fault));
-											return;
-										},
-										Err(WriteCommitError::EffectsUnknown { reason }) => {
-											yield Ev::Aborted(Abort::EffectsUnknown { reason });
-											return;
-										},
-									},
-									interrupt = interruption => {
-										yield interrupt_event(interrupt, true);
-										return;
-									},
-								}
-							}
-							if conflict_request.is_none() && let Some(fault) = reject_uri_like_target(&path) {
-								yield done(Err(fault));
-								return;
-							}
-				if let Some(request) = conflict_request {
-								let id = request.entry.id;
-								let operation = self.documents.splice_conflict(request).fuse();
-								let interruption = params.next_interrupt().fuse();
-								pin_mut!(operation, interruption);
-								select_biased! {
-									result = operation => match result {
-										Ok(Some(result)) => {
-											self.conflicts.remove(id);
-											yield done(Ok(Payload {
-												resolved_path: result.write.resolved_path,
-												display_path: result.write.display_path,
-												canonical_recovery: canonical_recovery.clone(),
-												byte_len: result.write.byte_len,
-												reported_len,
-												disposition: result.write.disposition,
-												stripped_wrapper: stripped.stripped,
-												made_executable: result.write.made_executable,
-												snapshot_tag: result.write.snapshot_tag,
-												operation: WriteOperation::ConflictSplice {
-													id,
-													start_line: result.range.0,
-													end_line: result.range.1,
-																							echo_trimmed: result.echo_trimmed,
-		},
-											}));
-										},
-										Ok(None) => yield done(Err(Fault::Document {
-											message: sf!(
-												"conflict:// writes are unavailable in this deployment",
-											),
-										})),
-										Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
-										Err(WriteCommitError::EffectsUnknown { reason }) => {
-											yield Ev::Aborted(Abort::EffectsUnknown { reason });
-										},
-									},
-									interrupt = interruption => {
-										yield interrupt_event(interrupt, true);
-									},
-								}
-								return;
-							}
-
-							let archive_result = {
-								let control = SpecialWriteControl::new();
-								let operation = self.documents.write_archive_member(
-									path.clone(),
-									Bytes::copy_from_slice(stripped.text.as_bytes()),
-									control.clone(),
-								).fuse();
-								let interruption = params.next_interrupt().fuse();
-								pin_mut!(operation, interruption);
-								select_biased! {
-									result = operation => match result {
-										Ok(result) => result,
-										Err(fault) => {
-											yield done(Err(Fault::Document { message: fault.message }));
-											return;
-										},
-									},
-									interrupt = interruption => {
-										let effects_started =
-											control.cancel() == SpecialWriteCancellation::EffectsUnknown;
-										yield interrupt_event(interrupt, effects_started);
-										return;
-									},
-								}
-							};
-							if let Some(result) = archive_result {
-								yield done(Ok(special_payload(
-									result,
-									stripped.stripped,
-									reported_len,
-									canonical_recovery.clone(),
-								)));
-								return;
-							}
-
-							let sqlite_result = {
-								let control = SpecialWriteControl::new();
-								let operation = self.documents.write_sqlite_row(
-									path.clone(),
-									stripped.text.clone(),
-									control.clone(),
-								).fuse();
-								let interruption = params.next_interrupt().fuse();
-								pin_mut!(operation, interruption);
-								select_biased! {
-									result = operation => match result {
-										Ok(result) => result,
-										Err(fault) => {
-											yield done(Err(Fault::Document { message: fault.message }));
-											return;
-										},
-									},
-									interrupt = interruption => {
-										let effects_started =
-											control.cancel() == SpecialWriteCancellation::EffectsUnknown;
-										yield interrupt_event(interrupt, effects_started);
-										return;
-									},
-								}
-							};
-							if let Some(result) = sqlite_result {
-								yield done(Ok(special_payload(
-									result,
-									stripped.stripped,
-									reported_len,
-									canonical_recovery.clone(),
-								)));
-								return;
-							}
-
-							let literal = {
-								let probe = self.documents.probe_literal(path.clone()).fuse();
-								let interruption = params.next_interrupt().fuse();
-								pin_mut!(probe, interruption);
-								select_biased! {
-									result = probe => match result {
-										Ok(result) => result,
-										Err(fault) => {
-											yield done(Err(fault));
-											return;
-										},
-									},
-									interrupt = interruption => {
-										yield interrupt_event(interrupt, false);
-										return;
-									},
-								}
-							};
-							if literal == LiteralPathProbe::Missing {
-								if let Some(count) = read_selector_list_misfire(&path) {
-									yield done(Err(Fault::ReadSelectorListMisfire { target: path, count }));
-									return;
-								}
-								if stripped.text.is_empty() {
-									let split = crate::read::selector::split_path_and_selector(&path);
-									if let Some(selector) = split.selector.map(Str::new) {
-										yield done(Err(Fault::ReadSelectorMisfire {
-											target: path.clone(),
-											selector,
-										}));
-										return;
-									}
-								}
-							}
-
-							let request = PlainWriteRequest {
-								path,
-								content: stripped.text,
-								format_policy: self.format_policy,
-								guard_generated: self.guard_generated,
-							};
-							let operation = self.documents.write_plain(request).fuse();
-							let interruption = params.next_interrupt().fuse();
-							pin_mut!(operation, interruption);
-							select_biased! {
-								result = operation => match result {
-									Ok(result) => yield done(Ok(Payload {
-										resolved_path: result.resolved_path,
-										display_path: result.display_path,
-										canonical_recovery,
-										byte_len: result.byte_len,
-										reported_len,
-										disposition: result.disposition,
-										stripped_wrapper: stripped.stripped,
-										made_executable: result.made_executable,
-										snapshot_tag: result.snapshot_tag,
-										operation: WriteOperation::Plain,
-									})),
-									Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
-									Err(WriteCommitError::EffectsUnknown { reason }) => {
-										yield Ev::Aborted(Abort::EffectsUnknown { reason });
-									},
+							}));
+							return;
+						},
+						Ok(None) => {
+							yield done(Err(Fault::UnsupportedScheme {
+								scheme: Str::new(path.split_once(':').map_or("resource", |(scheme, _)| scheme)),
+							}));
+							return;
+						},
+						Err(WriteCommitError::Rejected(fault)) => {
+							yield done(Err(fault));
+							return;
+						},
+						Err(WriteCommitError::EffectsUnknown { reason }) => {
+							yield Ev::Aborted(Abort::EffectsUnknown { reason });
+							return;
+						},
+					},
+					interrupt = interruption => {
+						yield interrupt_event(interrupt, true);
+						return;
+					},
+				}
+			}
+			if conflict_request.is_none() && let Some(fault) = reject_uri_like_target(&path) {
+				yield done(Err(fault));
+				return;
+			}
+			if let Some(request) = conflict_request {
+				let id = request.entry.id;
+				let operation = self.documents.splice_conflict(request).fuse();
+				let interruption = params.next_interrupt().fuse();
+				pin_mut!(operation, interruption);
+				select_biased! {
+					result = operation => match result {
+						Ok(Some(result)) => {
+							self.conflicts.remove(id);
+							yield done(Ok(Payload {
+								resolved_path: result.write.resolved_path,
+								display_path: result.write.display_path,
+								canonical_recovery: canonical_recovery.clone(),
+								byte_len: result.write.byte_len,
+								reported_len,
+								disposition: result.write.disposition,
+								stripped_wrapper: stripped.stripped,
+								made_executable: result.write.made_executable,
+								snapshot_tag: result.write.snapshot_tag,
+								operation: WriteOperation::ConflictSplice {
+									id,
+									start_line: result.range.0,
+									end_line: result.range.1,
+									echo_trimmed: result.echo_trimmed,
 								},
-								interrupt = interruption => {
-									yield interrupt_event(interrupt, true);
-								},
-							}
-						}
+							}));
+						},
+						Ok(None) => yield done(Err(Fault::Document {
+							message: sf!(
+								"conflict:// writes are unavailable in this deployment",
+							),
+						})),
+						Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
+						Err(WriteCommitError::EffectsUnknown { reason }) => {
+							yield Ev::Aborted(Abort::EffectsUnknown { reason });
+						},
+					},
+					interrupt = interruption => {
+						yield interrupt_event(interrupt, true);
+					},
+				}
+				return;
+			}
+
+			let archive_result = {
+				let control = SpecialWriteControl::new();
+				let operation = self.documents.write_archive_member(
+					path.clone(),
+					Bytes::copy_from_slice(stripped.text.as_bytes()),
+					control.clone(),
+				).fuse();
+				let interruption = params.next_interrupt().fuse();
+				pin_mut!(operation, interruption);
+				select_biased! {
+					result = operation => match result {
+						Ok(result) => result,
+						Err(fault) => {
+							yield done(Err(Fault::Document { message: fault.message }));
+							return;
+						},
+					},
+					interrupt = interruption => {
+						let effects_started =
+							control.cancel() == SpecialWriteCancellation::EffectsUnknown;
+						yield interrupt_event(interrupt, effects_started);
+						return;
+					},
+				}
+			};
+			if let Some(result) = archive_result {
+				yield done(Ok(special_payload(
+					result,
+					stripped.stripped,
+					reported_len,
+					canonical_recovery.clone(),
+				)));
+				return;
+			}
+
+			let sqlite_result = {
+				let control = SpecialWriteControl::new();
+				let operation = self.documents.write_sqlite_row(
+					path.clone(),
+					stripped.text.clone(),
+					control.clone(),
+				).fuse();
+				let interruption = params.next_interrupt().fuse();
+				pin_mut!(operation, interruption);
+				select_biased! {
+					result = operation => match result {
+						Ok(result) => result,
+						Err(fault) => {
+							yield done(Err(Fault::Document { message: fault.message }));
+							return;
+						},
+					},
+					interrupt = interruption => {
+						let effects_started =
+							control.cancel() == SpecialWriteCancellation::EffectsUnknown;
+						yield interrupt_event(interrupt, effects_started);
+						return;
+					},
+				}
+			};
+			if let Some(result) = sqlite_result {
+				yield done(Ok(special_payload(
+					result,
+					stripped.stripped,
+					reported_len,
+					canonical_recovery.clone(),
+				)));
+				return;
+			}
+
+			let literal = {
+				let probe = self.documents.probe_literal(path.clone()).fuse();
+				let interruption = params.next_interrupt().fuse();
+				pin_mut!(probe, interruption);
+				select_biased! {
+					result = probe => match result {
+						Ok(result) => result,
+						Err(fault) => {
+							yield done(Err(fault));
+							return;
+						},
+					},
+					interrupt = interruption => {
+						yield interrupt_event(interrupt, false);
+						return;
+					},
+				}
+			};
+			if literal == LiteralPathProbe::Missing {
+				if let Some(count) = read_selector_list_misfire(&path) {
+					yield done(Err(Fault::ReadSelectorListMisfire { target: path, count }));
+					return;
+				}
+				if stripped.text.is_empty() {
+					let split = crate::read::selector::split_path_and_selector(&path);
+					if let Some(selector) = split.selector.map(Str::new) {
+						yield done(Err(Fault::ReadSelectorMisfire {
+							target: path.clone(),
+							selector,
+						}));
+						return;
+					}
+				}
+			}
+
+			let request = PlainWriteRequest {
+				path,
+				content: stripped.text,
+				format_policy: self.format_policy,
+				guard_generated: self.guard_generated,
+			};
+			let operation = self.documents.write_plain(request).fuse();
+			let interruption = params.next_interrupt().fuse();
+			pin_mut!(operation, interruption);
+			select_biased! {
+				result = operation => match result {
+					Ok(result) => yield done(Ok(Payload {
+						resolved_path: result.resolved_path,
+						display_path: result.display_path,
+						canonical_recovery,
+						byte_len: result.byte_len,
+						reported_len,
+						disposition: result.disposition,
+						stripped_wrapper: stripped.stripped,
+						made_executable: result.made_executable,
+						snapshot_tag: result.snapshot_tag,
+						operation: WriteOperation::Plain,
+					})),
+					Err(WriteCommitError::Rejected(fault)) => yield done(Err(fault)),
+					Err(WriteCommitError::EffectsUnknown { reason }) => {
+						yield Ev::Aborted(Abort::EffectsUnknown { reason });
+					},
+				},
+				interrupt = interruption => {
+					yield interrupt_event(interrupt, true);
+				},
+			}
+		}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {

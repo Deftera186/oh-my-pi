@@ -720,6 +720,8 @@ fn chat_resume_args(gateway: &ScriptedGateway, project: &Path) -> Vec<String> {
 		project.display().to_string(),
 		"--gateway".to_owned(),
 		gateway.endpoint().display().to_string(),
+		"--envd-idle-timeout".to_owned(),
+		"2".to_owned(),
 		"--resume".to_owned(),
 		BINARY_SESSION.to_owned(),
 	]

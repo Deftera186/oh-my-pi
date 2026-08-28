@@ -1961,6 +1961,9 @@ pub struct ChatArgs {
 	/// Enable the built-in Python expression-evaluation tool for this chat's
 	/// environment.
 	pub py_eval:             bool,
+	/// Detached daemon idle timeout used by isolated acceptance harnesses.
+	#[arg(long, value_name = "SECONDS", hide = true)]
+	pub envd_idle_timeout:   Option<u64>,
 	/// Hide thinking blocks in the transcript for this invocation.
 	#[arg(long = "hide-thinking")]
 	pub hide_thinking:       bool,
@@ -2032,6 +2035,7 @@ impl ChatArgs {
 			api_key:             None,
 			prompt_cache_key:    None,
 			py_eval:             false,
+			envd_idle_timeout:   None,
 			hide_thinking:       false,
 			external_thinking:   false,
 			extension_launch:    LaunchExtensions::default(),
@@ -2537,8 +2541,8 @@ pub struct LocalInferArgs {
 	pub prompt: Str,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum DispatchTarget {
 	Agents,
 	BrowserRelay,
@@ -2592,7 +2596,6 @@ enum DispatchTarget {
 	Compress,
 }
 
-#[cfg(test)]
 const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	match command {
 		None | Some(Command::Chat(_)) => DispatchTarget::Chat,
@@ -3988,6 +3991,8 @@ mod tests {
 			"--resume",
 			"01ARZ3NDEKTSV4RRFFQ69G5FAV",
 			"--py-eval",
+			"--envd-idle-timeout",
+			"2",
 		])
 		.command
 		else {
@@ -3998,6 +4003,7 @@ mod tests {
 		assert_eq!(args.gateway.as_ref().map(LocalEndpoint::as_path), Some(Path::new(TEST_ENDPOINT)));
 		assert_eq!(args.resume, Some(sf!("01ARZ3NDEKTSV4RRFFQ69G5FAV")));
 		assert!(args.py_eval);
+		assert_eq!(args.envd_idle_timeout, Some(2));
 	}
 	#[test]
 	fn parses_ephemeral_inference_overrides_without_debugging_secret() {

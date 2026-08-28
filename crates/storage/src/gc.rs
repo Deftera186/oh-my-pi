@@ -66,6 +66,15 @@ impl SessionRoots {
 	///
 	/// Returns [`Error::NoSessionStores`] when no authoritative store exists and
 	/// [`Error::NoSessionJournals`] when all discovered stores are empty.
+	#[tracing::instrument(
+		name = "blob_gc_discovery",
+		level = "debug",
+		skip_all,
+		fields(
+			store = %store.root().display(),
+			custom_store_count = custom_stores.len()
+		)
+	)]
 	pub fn discover(store: &BlobStore, custom_stores: &[PathBuf]) -> Result<Self, Error> {
 		let blob_root = fs::canonicalize(store.root())?;
 		let mut canonical_custom_stores = Vec::with_capacity(custom_stores.len());
@@ -86,6 +95,11 @@ impl SessionRoots {
 			return Err(Error::NoSessionJournals);
 		}
 		journals.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+		tracing::debug!(
+			store_count = stores.len(),
+			journal_count = journals.len(),
+			"blob garbage collection roots discovered"
+		);
 		Ok(Self { blob_root, custom_stores: canonical_custom_stores, journals, stores })
 	}
 
@@ -890,6 +904,16 @@ const fn retention_rank(lifetime: ArtifactLifetime) -> u8 {
 /// store. Root revalidation, transcript parse, and database failures all happen
 /// before deletion. A filesystem failure during blob traversal or removal
 /// returns [`Error::Interrupted`] with exact partial accounting.
+#[tracing::instrument(
+	name = "blob_gc",
+	level = "debug",
+	skip_all,
+	fields(
+		store = %store.root().display(),
+		journal_count = roots.journal_count(),
+		min_age = ?min_age
+	)
+)]
 pub fn sweep(
 	store: &BlobStore,
 	roots: &SessionRoots,
@@ -933,9 +957,29 @@ pub fn sweep(
 	report.reachable_count = u64::try_from(reachable.len()).expect("blob root counts fit in u64");
 
 	if let Err(source) = sweep_blob_directory(store, &reachable, min_age, &mut report) {
+		tracing::warn!(
+			error = %source,
+			examined_count = report.examined_count,
+			reclaimed_count = report.reclaimed_count,
+			"blob garbage collection interrupted"
+		);
 		return Err(Error::Interrupted { report, source });
 	}
 	transaction.commit()?;
+	if report.corrupt_references != 0 {
+		tracing::warn!(
+			corrupt_reference_count = report.corrupt_references,
+			"blob garbage collection retained malformed journal references"
+		);
+	}
+	tracing::info!(
+		examined_count = report.examined_count,
+		examined_bytes = report.examined_bytes,
+		reclaimed_count = report.reclaimed_count,
+		reclaimed_bytes = report.reclaimed_bytes,
+		reachable_count = report.reachable_count,
+		"blob garbage collection completed"
+	);
 	Ok(report)
 }
 

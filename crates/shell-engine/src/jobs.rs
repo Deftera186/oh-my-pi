@@ -12,7 +12,7 @@ use std::{
 use futures::FutureExt;
 use tokio::{task::JoinHandle, time};
 
-use crate::{ExecutionResult, error, processes, sys, trace_categories, traps};
+use crate::{ExecutionResult, error, processes, sys, traps};
 pub(crate) type JobJoinHandle = JoinHandle<Result<ExecutionResult, error::Error>>;
 pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
 
@@ -566,8 +566,8 @@ impl Job {
 		&mut self,
 	) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
 		let mut result: Option<Result<ExecutionResult, error::Error>> = None;
-
-		tracing::debug!(target: trace_categories::JOBS, "Polling job {} for completion...", self.id);
+		let task_count = self.tasks.len();
+		let pgid = self.process_group_id();
 
 		while !self.tasks.is_empty() {
 			let task = &mut self.tasks[0];
@@ -582,7 +582,12 @@ impl Job {
 			}
 		}
 
-		tracing::debug!(target: trace_categories::JOBS, "Job {} has completed.", self.id);
+		tracing::info!(
+			job_id = self.id,
+			pgid = ?pgid,
+			task_count,
+			"shell job completed"
+		);
 
 		self.state = JobState::Done;
 
@@ -604,6 +609,8 @@ impl Job {
 		wait_for_terminate: bool,
 	) -> Result<ExecutionResult, error::Error> {
 		let mut result = ExecutionResult::success();
+		let task_count = self.tasks.len();
+		let pgid = self.process_group_id();
 
 		while let Some(task) = self.tasks.back_mut() {
 			match task.wait(wait_for_terminate).await? {
@@ -613,12 +620,24 @@ impl Job {
 				},
 				JobTaskWaitResult::Stopped => {
 					self.state = JobState::Stopped;
+					tracing::info!(
+						job_id = self.id,
+						pgid = ?pgid,
+						task_count,
+						"shell job stopped"
+					);
 					return Ok(ExecutionResult::stopped());
 				},
 			}
 		}
 
 		self.state = JobState::Done;
+		tracing::info!(
+			job_id = self.id,
+			pgid = ?pgid,
+			task_count,
+			"shell job completed"
+		);
 
 		Ok(result)
 	}
@@ -632,6 +651,7 @@ impl Job {
 					.ok_or(error::ErrorKind::FailedToSendSignal)?;
 				sys::signal::continue_process(pgid)?;
 				self.state = JobState::Running;
+				tracing::info!(job_id = self.id, pgid, "shell job resumed in background");
 				Ok(())
 			},
 			JobState::Running => Ok(()),
@@ -645,6 +665,7 @@ impl Job {
 			if let Some(pgid) = self.process_group_id() {
 				sys::signal::continue_process(pgid)?;
 				self.state = JobState::Running;
+				tracing::info!(job_id = self.id, pgid, "shell job resumed");
 			} else {
 				return Err(error::ErrorKind::FailedToSendSignal.into());
 			}
@@ -652,6 +673,7 @@ impl Job {
 
 		if let Some(pgid) = self.process_group_id() {
 			sys::terminal::move_to_foreground(pgid)?;
+			tracing::info!(job_id = self.id, pgid, "shell job moved to foreground");
 		}
 
 		Ok(())

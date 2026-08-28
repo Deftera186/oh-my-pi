@@ -992,6 +992,12 @@ impl LspServer {
 
 	/// Sends an arbitrary request after exact document synchronization when
 	/// provided.
+	#[tracing::instrument(
+		name = "lsp_request",
+		level = "debug",
+		skip_all,
+		fields(method = %method)
+	)]
 	pub async fn request(
 		&self,
 		method: &str,

@@ -534,20 +534,34 @@ async def _dispatch_device(
     if not isinstance(args, Mapping):
         raise SchemaError("dynamic device callback args must be a mapping")
     body = _dynamic_bodies.get(path)
+    legacy = False
     if body is None:
         candidates = tuple(
-            definition.body
+            definition
             for definition in registry.snapshot().device_definitions
             if definition.name == path
             and (family is None or definition.family == family)
             and (rev is None or definition.rev == rev)
         )
-        if len(candidates) != 1:
+        if len(candidates) == 1:
+            body = candidates[0].body
+        else:
+            legacy_candidates = tuple(
+                definition.handler
+                for definition in registry.worker_tool_definitions()
+                if definition.legacy
+                and definition.name == path
+                and (family is None or definition.family == family)
+                and (rev is None or definition.rev == rev)
+            )
+            if len(legacy_candidates) == 1:
+                body = legacy_candidates[0]
+                legacy = True
+        if body is None:
             raise DeviceUnavailable(
                 f"authoritative catalog selected unknown or ambiguous "
                 f"host device {path!r}"
             )
-        body = candidates[0]
     if hasattr(body, "__omp_tool_kind__"):
         # Parity with the stdio worker path: ergonomic tools receive the
         # ambient invocation context in their `ctx` parameter.
@@ -561,7 +575,7 @@ async def _dispatch_device(
         positional, keywords = _bind_tool_arguments(body, dict(args), context)
         result = body(*positional, **keywords)
     else:
-        result = body(**dict(args))
+        result = body(dict(args)) if legacy else body(**dict(args))
     if inspect.isawaitable(result):
         result = await result
     from ._registry import _lower_worker_result

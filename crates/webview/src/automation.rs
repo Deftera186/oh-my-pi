@@ -371,11 +371,26 @@ impl<'view> TabHandle<'view> {
 				.recv_timeout(deadline.saturating_duration_since(Instant::now()))
 			{
 				Ok(WebViewEvent::Frame(frame)) => return Ok(frame),
-				Ok(WebViewEvent::Closed | WebViewEvent::Crashed(_)) => {
+				Ok(WebViewEvent::Closed) => {
+					tracing::warn!(
+						engine = %self.view.engine(),
+						surface = %self.view.surface(),
+						error = "closed",
+						"webview frame capture failed"
+					);
 					return Err(Error::Closed);
 				},
+				Ok(WebViewEvent::Crashed(_)) => return Err(Error::Closed),
 				Ok(_) => {},
-				Err(_) => return Err(Error::Timeout("capturing browser frame")),
+				Err(_) => {
+					tracing::warn!(
+						engine = %self.view.engine(),
+						surface = %self.view.surface(),
+						error = "timeout",
+						"webview frame capture failed"
+					);
+					return Err(Error::Timeout("capturing browser frame"));
+				},
 			}
 		}
 	}
@@ -402,9 +417,32 @@ impl<'view> TabHandle<'view> {
 				return Err(Error::Unsupported("direct screenshot requires remote Chromium"));
 			};
 			let (tx, rx) = flume::bounded(1);
-			remote.send(Command::Screenshot { clip, full_page, reply: tx })?;
-			rx.recv_timeout(timeout)
-				.map_err(|_| Error::Timeout("capturing PNG screenshot"))??
+			remote
+				.send(Command::Screenshot { clip, full_page, reply: tx })
+				.inspect_err(|error| {
+					tracing::warn!(
+						engine = %self.view.engine(),
+						surface = %self.view.surface(),
+						error = error.kind(),
+						"webview screenshot capture failed"
+					);
+				})?;
+			let result = rx
+				.recv_timeout(timeout)
+				.map_err(|_| Error::Timeout("capturing PNG screenshot"))
+				.and_then(|result| result);
+			match result {
+				Ok(data) => data,
+				Err(error) => {
+					tracing::warn!(
+						engine = %self.view.engine(),
+						surface = %self.view.surface(),
+						error = error.kind(),
+						"webview screenshot capture failed"
+					);
+					return Err(error);
+				},
+			}
 		} else {
 			if selector.is_some() || full_page {
 				return Err(Error::Unsupported(

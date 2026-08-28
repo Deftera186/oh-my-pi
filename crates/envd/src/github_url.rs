@@ -106,7 +106,7 @@ pub(super) struct GithubResolver {
 	root:        PathBuf,
 	cache:       Arc<GithubCache>,
 	credentials: Arc<GithubCredentialBridge>,
-	client:      reqwest::Client,
+	client:      omp_http::Client,
 }
 
 impl GithubResolver {
@@ -119,8 +119,18 @@ impl GithubResolver {
 		Self { scheme, root, cache, credentials, client: omp_http::no_redirect_client() }
 	}
 
+	#[tracing::instrument(
+		name = "github_resource_resolve",
+		level = "debug",
+		skip_all,
+		fields(scheme = ?self.scheme, repo = tracing::field::Empty, number = tracing::field::Empty),
+	)]
 	async fn resolve(&self, resource: &str, query: Option<&str>) -> Result<Vec<u8>, Fault> {
 		let target = Target::parse(self.scheme, resource, query, &self.root)?;
+		tracing::Span::current().record("repo", target.repo.as_str());
+		if let Some(number) = target.number {
+			tracing::Span::current().record("number", number);
+		}
 		let key = target.cache_key()?;
 		let now = now_ms();
 		let cached = self.cache.get(&key, now).map_err(cache_fault)?;
@@ -143,6 +153,11 @@ impl GithubResolver {
 					match self.fetch_comments(&target).await {
 						Ok(comments) => Some(comments),
 						Err(error) => {
+							tracing::warn!(
+								error = ?error,
+								cached = cached.is_some(),
+								"GitHub comments refresh failed",
+							);
 							if let Some(cached) = &cached {
 								let mut warning =
 									b"> WARNING: Live GitHub comments refresh failed; cached content may be stale.\n\n"
@@ -164,6 +179,11 @@ impl GithubResolver {
 				Ok(rendered)
 			},
 			Err(error) => {
+				tracing::warn!(
+					error = ?error,
+					cached = cached.is_some(),
+					"GitHub resource refresh failed",
+				);
 				if let Some(cached) = cached {
 					let mut warning =
 						b"> WARNING: Live GitHub refresh failed; cached content may be stale.\n\n"
@@ -177,6 +197,12 @@ impl GithubResolver {
 		}
 	}
 
+	#[tracing::instrument(
+		name = "github_resource_fetch",
+		level = "debug",
+		skip_all,
+		fields(scheme = ?target.scheme, repo = %target.repo, number = ?target.number),
+	)]
 	async fn fetch(&self, target: &Target, etag: Option<&str>) -> Result<Fetch, Fault> {
 		let mut headers = HeaderMap::new();
 		headers.insert(USER_AGENT, HeaderValue::from_static("omp/issue-pr-resolver"));
@@ -226,6 +252,12 @@ impl GithubResolver {
 		Ok(Fetch::Body { body: bytes.freeze().to_vec(), etag })
 	}
 
+	#[tracing::instrument(
+		name = "github_comments_fetch",
+		level = "debug",
+		skip_all,
+		fields(scheme = ?target.scheme, repo = %target.repo, number = ?target.number),
+	)]
 	async fn fetch_comments(&self, target: &Target) -> Result<Vec<Value>, Fault> {
 		let mut comments = Vec::new();
 		let mut retained_bytes = 0usize;

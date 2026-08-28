@@ -474,6 +474,12 @@ mod replica_handle {
 
 	impl GuestReplicaHandle {
 		/// Starts an initial or reconnect snapshot for one authenticated room.
+		#[tracing::instrument(
+			level = "debug",
+			name = "collaboration_sync",
+			skip_all,
+			fields(expected_records)
+		)]
 		pub async fn begin_snapshot(
 			&self,
 			room_id: Str,
@@ -643,6 +649,11 @@ impl GuestRelayPump {
 		self.projection.ready = false;
 		self.projection.gap = false;
 		self.publish();
+		tracing::info!(
+			generation = self.projection.generation,
+			expected_records,
+			"collaboration synchronization started"
+		);
 		Ok(self.projection.clone())
 	}
 
@@ -659,6 +670,11 @@ impl GuestRelayPump {
 			self.projection.ready = true;
 			self.projection.gap = false;
 			self.publish();
+			tracing::info!(
+				generation = self.projection.generation,
+				watermark = self.projection.watermark,
+				"collaboration synchronization completed"
+			);
 		}
 		Ok(self.projection.clone())
 	}
@@ -678,6 +694,11 @@ impl GuestRelayPump {
 				self.projection.ready = false;
 				self.projection.gap = true;
 				self.publish();
+				tracing::warn!(
+					generation = self.projection.generation,
+					%error,
+					"collaboration replica revision gap; resynchronization required"
+				);
 				Err(error)
 			},
 			Err(error) => Err(error),

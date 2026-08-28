@@ -9,7 +9,7 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_telemetry::{sentiment::UserSentimentMetrics, stats::LocalAnalyticsConsent};
+use omp_observability::{sentiment::UserSentimentMetrics, stats::LocalAnalyticsConsent};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use thiserror::Error;
@@ -110,6 +110,12 @@ impl StatsDb {
 	}
 
 	/// Opens a statistics store, enables WAL, and applies monotonic migrations.
+	#[tracing::instrument(
+		name = "stats_store_open",
+		level = "debug",
+		skip_all,
+		fields(path = %path.as_ref().display())
+	)]
 	pub fn open(
 		path: impl AsRef<Path>,
 		consent: LocalAnalyticsConsent,
@@ -277,6 +283,12 @@ impl StatsDb {
 	}
 }
 
+#[tracing::instrument(
+	name = "storage_migration",
+	level = "debug",
+	skip_all,
+	fields(database = "stats", target_version = SCHEMA_VERSION)
+)]
 fn migrate(connection: &mut Connection) -> Result<(), rusqlite::Error> {
 	let version = connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
 	if version >= SCHEMA_VERSION {
@@ -305,7 +317,14 @@ fn migrate(connection: &mut Connection) -> Result<(), rusqlite::Error> {
 		 CREATE INDEX IF NOT EXISTS tool_calls_name ON tool_calls(tool_name);",
 	)?;
 	transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-	transaction.commit()
+	transaction.commit()?;
+	tracing::info!(
+		database = "stats",
+		from_version = version,
+		to_version = SCHEMA_VERSION,
+		"storage migration completed"
+	);
+	Ok(())
 }
 
 fn sql_u64(value: u64, field: &'static str) -> Result<i64, StatsDbError> {

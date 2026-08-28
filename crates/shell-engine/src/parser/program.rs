@@ -1,4 +1,4 @@
-use std::{fmt, io, path::PathBuf};
+use std::{io, path::PathBuf};
 
 use bon::bon;
 
@@ -169,9 +169,6 @@ impl<R: io::BufRead> Parser<R> {
 		// First we tokenize the input, according to the policy implied by provided
 		// options.
 		let mut tokenizer = Tokenizer::new(&mut self.reader, &self.options.tokenizer_options());
-
-		tracing::debug!(target: "tokenize", "Tokenizing...");
-
 		let mut tokens = vec![];
 		loop {
 			let result = match tokenizer.next_token() {
@@ -186,7 +183,6 @@ impl<R: io::BufRead> Parser<R> {
 
 			let reason = result.reason;
 			if let Some(token) = result.token {
-				tracing::debug!(target: "tokenize", "TOKEN {}: {:?} {reason:?}", tokens.len(), token);
 				tokens.push(token);
 			}
 
@@ -194,8 +190,6 @@ impl<R: io::BufRead> Parser<R> {
 				break;
 			}
 		}
-
-		tracing::debug!(target: "tokenize", "  => {} token(s)", tokens.len());
 
 		Ok(tokens)
 	}
@@ -237,18 +231,9 @@ pub(super) fn parse_redirection_fd(word: &str) -> Result<ast::IoFd, &'static str
 fn parse_result_to_error<R>(
 	parse_result: Result<R, ::peg::error::ParseError<usize>>,
 	tokens: &[Token],
-) -> Result<R, ParseError>
-where
-	R: fmt::Debug,
-{
+) -> Result<R, ParseError> {
 	match parse_result {
-		Ok(program) => {
-			tracing::debug!(target: "parse", "PROG: {:?}", program);
-			Ok(program)
-		},
-		Err(parse_error) => {
-			tracing::debug!(target: "parse", "Parse error: {:?}", parse_error);
-			Err(convert_peg_parse_error(&parse_error, tokens))
-		},
+		Ok(program) => Ok(program),
+		Err(parse_error) => Err(convert_peg_parse_error(&parse_error, tokens)),
 	}
 }

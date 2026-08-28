@@ -72,6 +72,12 @@ struct CachedOverlaySnapshot {
 }
 
 /// Writes one complete credential-blind discovery overlay for restart recovery.
+#[tracing::instrument(
+	name = "catalog_overlay_cache_write",
+	level = "debug",
+	skip_all,
+	fields(path = %path.display())
+)]
 pub fn write_discovery_overlay_cache(
 	path: &Path,
 	overlay: &CatalogOverlay,
@@ -87,28 +93,45 @@ pub fn write_discovery_overlay_cache(
 		.and_then(|name| name.to_str())
 		.unwrap_or("catalog-cache");
 	let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+	let byte_count = encoded.len();
 	fs::write(&temporary, encoded)?;
 	if let Err(source) = fs::rename(&temporary, path) {
 		let _ = fs::remove_file(&temporary);
 		return Err(OverlayCacheError::Io(source));
 	}
+	tracing::debug!(byte_count, "discovery overlay cache published");
 	Ok(())
 }
 
 /// Loads a credential-blind discovery overlay, rejecting unsupported cache
 /// schemas.
+#[tracing::instrument(
+	name = "catalog_overlay_cache_read",
+	level = "debug",
+	skip_all,
+	fields(path = %path.display())
+)]
 pub fn read_discovery_overlay_cache(
 	path: &Path,
 ) -> Result<Option<CatalogOverlay>, OverlayCacheError> {
 	let encoded = match fs::read(path) {
 		Ok(encoded) => encoded,
-		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			tracing::debug!("discovery overlay cache miss");
+			return Ok(None);
+		},
 		Err(error) => return Err(error.into()),
 	};
 	let cached: CachedOverlaySnapshot = serde_json::from_slice(&encoded)?;
 	if cached.schema != OVERLAY_CACHE_SCHEMA {
+		tracing::warn!(
+			schema = cached.schema,
+			expected_schema = OVERLAY_CACHE_SCHEMA,
+			"discovery overlay cache schema rejected"
+		);
 		return Err(OverlayCacheError::UnsupportedSchema(cached.schema));
 	}
+	tracing::debug!(byte_count = encoded.len(), "discovery overlay cache hit");
 	Ok(Some(cached.overlay))
 }
 
@@ -778,8 +801,21 @@ fn ensure_strictly_sorted<T: Ord>(
 	Ok(())
 }
 
+#[tracing::instrument(
+	name = "catalog_snapshot_load",
+	level = "debug",
+	skip_all,
+	fields(snapshot_bytes = EMBEDDED_BYTES.len())
+)]
 fn load_embedded() -> Result<Catalog, SnapshotError> {
-	Catalog::decode_for_source(EMBEDDED_BYTES, embedded_source_digest())
+	let catalog = Catalog::decode_for_source(EMBEDDED_BYTES, embedded_source_digest())?;
+	tracing::debug!(
+		provider_count = catalog.providers().len(),
+		model_count = catalog.models().len(),
+		route_count = catalog.routes().len(),
+		"embedded catalog snapshot loaded"
+	);
+	Ok(catalog)
 }
 
 fn embedded_source_digest() -> [u8; 32] {

@@ -57,7 +57,7 @@ impl History {
 			let line = match line {
 				Ok(line) => line,
 				Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-					tracing::warn!("unreadable history line; {err}");
+					tracing::warn!(error = %err, "unreadable shell history line");
 					continue;
 				},
 				Err(err) => return Err(err.into()),

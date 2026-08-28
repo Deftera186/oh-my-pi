@@ -564,6 +564,12 @@ impl StateStore {
 	///
 	/// Returns a fail-closed error if any physical record is missing, corrupt,
 	/// non-canonical, or cannot be read.
+	#[tracing::instrument(
+		name = "state_store_open",
+		level = "debug",
+		skip_all,
+		fields(root = %root.as_ref().display())
+	)]
 	pub fn open(root: impl AsRef<Path>) -> Result<Self, Error> {
 		let root = root.as_ref();
 		fs::create_dir_all(root)?;
@@ -594,6 +600,11 @@ impl StateStore {
 			#[cfg(unix)]
 			File::open(root)?.sync_all()?;
 		}
+		tracing::debug!(
+			event_count = replay.changes.len(),
+			durable_bytes = durable_len,
+			"state journal replay completed"
+		);
 		Ok(Self {
 			inner: Arc::new(StateInner {
 				path,

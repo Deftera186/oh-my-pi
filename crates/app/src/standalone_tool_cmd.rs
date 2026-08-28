@@ -121,6 +121,7 @@ pub(crate) async fn session_at(
 		fork: None,
 		py_eval: false,
 		approval_mode: None,
+		spawn_idle_timeout: None,
 		pty_denied: true,
 		credential_provider: None,
 		api_key: None,

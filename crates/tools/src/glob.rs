@@ -17,9 +17,11 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 use crate::{
 	grep::WorkspaceSearch,
+	path::tracing_path_metadata,
 	read::ReadBlobs,
 	render::{TextProjection, paths::format_grouped_paths, truncate::spill_truncated_text},
 };
@@ -227,7 +229,6 @@ impl Display for Fault {
 }
 
 impl error::Error for Fault {}
-
 /// Generic `glob@1` executor over environment-owned workspace and blob
 /// resources.
 pub struct Glob<W, B> {
@@ -236,42 +237,43 @@ pub struct Glob<W, B> {
 	spec:      ToolSpec,
 }
 
+/// Returns the host-free `glob@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("glob"),
+		rev:             Rev { family: Str::new(""), n: 1 },
+		description:     sf!(
+			"Globs files and directories with fast pattern matching.\n\n<instruction>\n- `path`: \
+			 glob, file, or directory; separate targets with `;` (`src/**/*.ts; test/**/*.ts`).\n- \
+			 `gitignore` defaults `true`. Set `false` for ignored files such as `.env*`, logs, or \
+			 build output.\n- `hidden` defaults `true`; pair it with `gitignore: false` for ignored \
+			 dotfiles.\n</instruction>\n\n<output>\nMatches are newest-first and grouped by \
+			 directory; directories end in `/`.\n</output>",
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("glob.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Constructs `glob@1` over `workspace` and the shared durable blob namespace.
 pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W, B> {
-	Glob {
-		workspace,
-		blobs,
-		spec: ToolSpec {
-			name:            sf!("glob"),
-			rev:             Rev { family: Str::new(""), n: 1 },
-			description:     sf!(
-				"Globs files and directories with fast pattern matching.\n\n<instruction>\n- `path`: \
-				 glob, file, or directory; separate targets with `;` (`src/**/*.ts; \
-				 test/**/*.ts`).\n- `gitignore` defaults `true`. Set `false` for ignored files such \
-				 as `.env*`, logs, or build output.\n- `hidden` defaults `true`; pair it with \
-				 `gitignore: false` for ignored dotfiles.\n</instruction>\n\n<output>\nMatches are \
-				 newest-first and grouped by directory; directories end in `/`.\n</output>",
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects { read: true, write_globs: Arc::default() }),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("glob.rs"),
-			)
-			.into(),
-		},
-	}
+	Glob { workspace, blobs, spec: spec() }
 }
 
 impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
@@ -288,66 +290,72 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 		&'c self,
 		mut params: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
+		let span = tracing::debug_span!("glob_execution", pattern = tracing::field::Empty);
 		stream! {
-					let arguments = match params.whole::<Params>().await {
-						Ok(arguments) => arguments,
-						Err(error) => {
-							yield param_event(error);
-							return;
-						},
-					};
-					match params.interruptable().committed().await {
-						Ok(_) => {},
-						Err(error) => {
-							yield commit_event(error);
-							return;
-						},
-					}
+			let arguments = match params.whole::<Params>().await {
+				Ok(arguments) => arguments,
+				Err(error) => {
+					yield param_event(error);
+					return;
+				},
+			};
+			match params.interruptable().committed().await {
+				Ok(_) => {},
+				Err(error) => {
+					yield commit_event(error);
+					return;
+				},
+			}
 
-					let limit = match effective_limit(arguments.limit) {
-						Ok(limit) => limit,
-						Err(fault) => {
-							yield done(Err(fault));
-							return;
-						},
-					};
-					let path = arguments.path.unwrap_or_else(|| sf!("."));
-					if path.trim().is_empty() {
-						yield done(Err(Fault::EmptyPath));
-						return;
-					}
-					if contains_root_target(&path) {
-						yield done(Err(Fault::RootSearch));
-						return;
-					}
-					let resource_scheme = unsupported_scheme(&path);
-					let request = walk_request(path, arguments.hidden, arguments.gitignore, limit);
-					if let Some(scheme) = resource_scheme {
-						let resource = self.workspace.glob_resource(request.clone()).await;
-						match resource {
-							Some(Ok(result)) => {
-								yield done(prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await);
-							},
-							Some(Err(fault)) => yield done(Err(fault)),
-							None => yield done(Err(Fault::UnsupportedScheme { scheme })),
-						}
-						return;
-					}
-		let operation = async {
-						let result = self.workspace.glob(request).await?;
-						prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await
-					}.fuse();
-					let interruption = params.next_interrupt().fuse();
-					pin_mut!(operation, interruption);
-					select_biased! {
-						result = operation => {
-							yield done(result);
-						},
-						interrupt = interruption => {
-							yield interrupt_event(interrupt, "glob traversal owner disappeared");
-						},
-					}
+			let limit = match effective_limit(arguments.limit) {
+				Ok(limit) => limit,
+				Err(fault) => {
+					yield done(Err(fault));
+					return;
+				},
+			};
+			let path = arguments.path.unwrap_or_else(|| sf!("."));
+			span.record("pattern", tracing::field::display(tracing_path_metadata(&path)));
+			if path.trim().is_empty() {
+				yield done(Err(Fault::EmptyPath));
+				return;
+			}
+			if contains_root_target(&path) {
+				yield done(Err(Fault::RootSearch));
+				return;
+			}
+			let resource_scheme = unsupported_scheme(&path);
+			let request = walk_request(path, arguments.hidden, arguments.gitignore, limit);
+			if let Some(scheme) = resource_scheme {
+				let resource = self.workspace.glob_resource(request.clone()).instrument(span.clone()).await;
+				match resource {
+					Some(Ok(result)) => {
+						yield done(prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await);
+					},
+					Some(Err(fault)) => {
+						yield done(Err(fault));
+					},
+					None => {
+						yield done(Err(Fault::UnsupportedScheme { scheme }));
+					},
 				}
+				return;
+			}
+			let operation = async {
+				let result = self.workspace.glob(request).await?;
+				prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await
+			}.instrument(span.clone()).fuse();
+			let interruption = params.next_interrupt().fuse();
+			pin_mut!(operation, interruption);
+			select_biased! {
+				result = operation => {
+					yield done(result);
+				},
+				interrupt = interruption => {
+					yield interrupt_event(interrupt, "glob traversal owner disappeared");
+				},
+			}
+		}
 	}
 
 	fn prompt(&self, view: Result<&Self::Payload, &Self::Fault>, caps: &PromptCaps) -> Vec<Part> {

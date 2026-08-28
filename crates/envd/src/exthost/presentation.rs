@@ -4,7 +4,7 @@ use std::{mem, sync::Arc};
 
 use async_trait::async_trait;
 use omp_core::{InvocationPhase, LifecyclePhase, Str};
-use omp_telemetry::authority::{
+use omp_observability::authority::{
 	DurableTelemetryQuery, SpanEvent, SpanFault, TelemetryAuthority, TelemetryAuthorityError,
 	TelemetryAuthorityIdentity, TelemetryCallContext,
 };

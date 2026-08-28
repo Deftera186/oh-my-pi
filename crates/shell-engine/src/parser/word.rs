@@ -587,14 +587,10 @@ fn cacheable_parse(
 	word: String,
 	options: ParserOptions,
 ) -> Result<Vec<WordPieceWithSource>, error::WordParseError> {
-	tracing::debug!(target: "expansion", "Parsing word '{}'", word);
-
 	let pieces = expansion_parser::unexpanded_word(word.as_str(), &options)
 		.map_err(|err| error::WordParseError::Word(word.clone(), err.into()))?;
 	validate_numeric_word_syntax(word.as_str(), &options, &pieces)
 		.map_err(error::WordParseError::NumericLiteralOutOfRange)?;
-
-	tracing::debug!(target: "expansion", "Parsed word '{}' => {{{:?}}}", word, pieces);
 
 	Ok(pieces)
 }

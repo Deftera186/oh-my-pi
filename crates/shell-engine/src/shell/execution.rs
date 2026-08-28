@@ -14,7 +14,6 @@ use crate::{
 		ParseError, Parser,
 		ast::{ArithmeticExpr, Program},
 	},
-	trace_categories,
 };
 
 impl<SE: ShellExtensions> Shell<SE> {
@@ -43,7 +42,7 @@ impl<SE: ShellExtensions> Shell<SE> {
 				.await?;
 			Ok(true)
 		} else {
-			tracing::debug!("skipping non-existent file: {}", path.display());
+			tracing::debug!(path = %path.display(), "skipping non-existent shell source");
 			Ok(false)
 		}
 	}
@@ -80,6 +79,12 @@ impl<SE: ShellExtensions> Shell<SE> {
 	/// * `args` - The arguments to pass to the script as positional parameters.
 	/// * `params` - Execution parameters.
 	/// * `call_type` - The type of script call being made.
+	#[tracing::instrument(
+		name = "shell_script",
+		level = "debug",
+		skip_all,
+		fields(path = %path.as_ref().display())
+	)]
 	async fn parse_and_execute_script_file<
 		S: Into<String>,
 		P: AsRef<Path>,
@@ -92,7 +97,7 @@ impl<SE: ShellExtensions> Shell<SE> {
 		call_type: callstack::ScriptCallType,
 	) -> Result<ExecutionResult, error::Error> {
 		let path = path.as_ref();
-		tracing::debug!("sourcing: {}", path.display());
+		tracing::debug!(path = %path.display(), "sourcing shell script");
 
 		let mut options = fs::File::options();
 		options.read(true);
@@ -147,8 +152,11 @@ impl<SE: ShellExtensions> Shell<SE> {
 		let mut reader = io::BufReader::new(file);
 		let mut parser = Parser::new(&mut reader, &self.parser_options());
 
-		tracing::debug!(target: trace_categories::PARSE, "Parsing sourced file: {}", source_info.source);
-		let parse_result = parser.parse_program();
+		let parse_result = tracing::debug_span!(
+			"shell_parse",
+			source = %source_info.source,
+		)
+		.in_scope(|| parser.parse_program());
 
 		let script_positional_args = args.map(Into::into);
 
@@ -173,6 +181,12 @@ impl<SE: ShellExtensions> Shell<SE> {
 	/// * `command` - The command to execute.
 	/// * `source_info` - Information about the source of the command text.
 	/// * `params` - Execution parameters.
+	#[tracing::instrument(
+		name = "shell_command",
+		level = "debug",
+		skip_all,
+		fields(source = %source_info.source)
+	)]
 	pub async fn run_string<S: Into<String>>(
 		&mut self,
 		command: S,
@@ -255,10 +269,16 @@ impl<SE: ShellExtensions> Shell<SE> {
 		// (per spec).
 		let result = match parse_result {
 			Ok(prog) => self.run_program(prog, params).await,
-			Err(parse_err) => Err(
-				error::Error::from(error::ErrorKind::ParseError(parse_err, source_info.clone()))
-					.into_fatal(),
-			),
+			Err(parse_err) => {
+				tracing::warn!(
+					source = %source_info.source,
+					"shell command parse failed"
+				);
+				Err(
+					error::Error::from(error::ErrorKind::ParseError(parse_err, source_info.clone()))
+						.into_fatal(),
+				)
+			},
 		};
 
 		// Report any errors.

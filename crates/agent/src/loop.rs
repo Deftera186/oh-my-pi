@@ -656,14 +656,18 @@ use crate::{
 };
 
 /// A live user message that can be rewound and edited.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RewindTarget {
 	/// Physical event index of the user message.
 	pub event: u64,
 	/// Previous live item event to retain, or the transcript root.
 	pub keep:  Option<u64>,
-	/// Concatenated text content of the user message.
+	/// Typed message text: plain text parts joined by newlines, excluding
+	/// `<attachment>`-wrapped pastes.
 	pub text:  Str,
+	/// Non-prose parts (image blobs and `<attachment>` pastes) in message
+	/// order, so hosts can restore the message into an editor.
+	pub parts: Vec<thread::Part>,
 }
 
 /// Failure while projecting, submitting, recovering, journaling, or executing
@@ -2125,13 +2129,24 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.as_ref()
 				.is_some_and(|props| props.fields.contains_key(omp_tool::TOOL_REV_PROP));
 			let mut text = String::new();
+			let mut parts = Vec::new();
 			for part in &message.parts {
-				if let Some(part::Kind::Text(part)) = part.kind.as_ref() {
-					text.push_str(part);
+				match part.kind.as_ref() {
+					Some(part::Kind::Text(body)) if body.starts_with("<attachment>") => {
+						parts.push(part.clone());
+					},
+					Some(part::Kind::Text(body)) => {
+						if !text.is_empty() {
+							text.push('\n');
+						}
+						text.push_str(body);
+					},
+					Some(part::Kind::Blob(_)) => parts.push(part.clone()),
+					_ => {},
 				}
 			}
 			if !synthetic && !text.starts_with("<system-injection>") {
-				targets.push(RewindTarget { event, keep: previous, text: Str::new(text) });
+				targets.push(RewindTarget { event, keep: previous, text: Str::new(text), parts });
 			}
 			previous = Some(event);
 		}
@@ -2423,13 +2438,23 @@ impl<C: TurnClient + Clone> Agent<C> {
 			if let Some(guard) = self.streaming_edit_guard.as_ref() {
 				guard.reset();
 			}
+			let turn_index = committed_turns.saturating_add(1);
 			self
 				.firehose
 				.publish(FirehoseEvent::TurnStart(FirehoseTurnStart {
 					envelope: telemetry_envelope(),
-					turn:     u64::from(committed_turns).saturating_add(1),
+					turn:     u64::from(turn_index),
 				}));
-			let turn = self.run_turn(turn_id.clone(), pending_indexes).await;
+			let turn_span = tracing::debug_span!(
+				"turn",
+				turn_index,
+				turn_id = %turn_id,
+				pending_items = pending_indexes.len(),
+			);
+			let turn = self
+				.run_turn(turn_id.clone(), pending_indexes)
+				.instrument(turn_span.clone())
+				.await;
 			let (outcome, mut speculative, submitted_context_id, snapshot, enabled_tools) = match turn
 			{
 				Ok(RunTurnResult::Complete(turn)) => turn,
@@ -4000,31 +4025,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 					props:      frozen_options.props.clone(),
 				},
 			};
-			let expected_head = match &provider_input {
-				TurnInput::Delta(context, delta) => {
-					let expected = context
-						.expected
-						.as_ref()
-						.ok_or(AgentError::Protocol("delta context missing revision"))?;
-					let retained = delta.truncate_to.unwrap_or(expected.head);
-					if retained > expected.head {
-						return Err(AgentError::Protocol("delta truncation exceeds expected head"));
-					}
-					Some(
-						retained
-							.checked_add(
-								u64::try_from(delta.append.len())
-									.map_err(|_| AgentError::Protocol("delta too large"))?,
-							)
-							.ok_or(AgentError::Protocol("delta head overflow"))?,
-					)
-				},
-				TurnInput::Full(thread) if frozen_options.context_id.is_some() => Some(
-					u64::try_from(thread.items.len())
-						.map_err(|_| AgentError::Protocol("full thread too large"))?,
-				),
-				TurnInput::Full(_) => None,
-			};
 			self.journal.start_turn(now_ms(), start)?;
 			self.transition(AgentPhase::Turning);
 			attempts = attempts.saturating_add(1);
@@ -4106,19 +4106,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 					if stateful && outcome.revision.is_none() {
 						return Err(AgentError::Protocol("stateful outcome missing revision"));
 					}
-					if let (Some(base), Some(revision)) = (expected_head, outcome.revision.as_ref()) {
-						let expected = base
-							.checked_add(
-								u64::try_from(outcome.output.len())
-									.map_err(|_| AgentError::Protocol("outcome too large"))?,
-							)
-							.ok_or(AgentError::Protocol("outcome head overflow"))?;
-						if revision.head != expected {
-							return Err(AgentError::Protocol(
-								"outcome revision head does not match committed append",
-							));
-						}
-					}
+					// The provider owns the post-commit revision. Its head may
+					// include provider-side context that is absent from the
+					// client projection; the opaque token is the actual fence.
+					// Validate the returned output as its consecutive suffix,
+					// then echo the complete revision on the next delta.
 					let (receipt, _) = self.journal.append_arbiter_outcome(
 						now_ms(),
 						turn_id.as_str(),
@@ -6921,6 +6913,58 @@ mod tests {
 			future::ready(Ok(ScriptedSession { events: events.into() }))
 		}
 	}
+	#[tokio::test]
+	async fn stateful_turn_echoes_provider_owned_revision_without_deriving_its_head() {
+		let first_revision =
+			thread::Revision { head: 41, token: Bytes::from_static(b"provider-context") };
+		let mut first = end_outcome("first");
+		first.output[0].seq = first_revision.head;
+		first.revision = Some(first_revision.clone());
+		let second_revision =
+			thread::Revision { head: 73, token: Bytes::from_static(b"provider-context-next") };
+		let mut second = end_outcome("second");
+		second.output[0].seq = second_revision.head;
+		second.revision = Some(second_revision.clone());
+
+		let (journal, path) = test_journal("provider-owned-revision");
+		let mut snapshot = AgentSnapshot::default();
+		snapshot.turn.context_id = Some(sf!("ctx"));
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				outcome_script(first),
+				outcome_script(second),
+			]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent = Agent::new(client, env, AgentState::new(snapshot), journal, test_caps());
+
+		agent
+			.submit([message(thread::Role::User, "first")], TurnId::new("first-turn"))
+			.await
+			.expect("provider-owned seed revision is accepted");
+		agent
+			.submit([message(thread::Role::User, "second")], TurnId::new("second-turn"))
+			.await
+			.expect("provider-owned delta revision is accepted");
+
+		let opened = opened.lock();
+		let TurnInput::Delta(context, _) = &opened[1].1 else {
+			panic!("follow-up must echo the provider context as a delta");
+		};
+		assert_eq!(context.expected.as_ref(), Some(&first_revision));
+		assert_eq!(
+			agent
+				.journal()
+				.latest_receipt()
+				.and_then(|receipt| receipt.outcome.revision.as_ref()),
+			Some(&second_revision),
+		);
+		drop(opened);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
 
 	fn outcome_script(outcome: Outcome) -> Vec<Result<pb::TurnEvent, TurnError>> {
 		vec![Ok(pb::TurnEvent { event: Some(turn_event::Event::Outcome(outcome)) })]
@@ -7976,6 +8020,57 @@ mod tests {
 		drop(opened);
 		drop(agent);
 		env_task.abort();
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn rewind_targets_split_attachment_parts_from_prose() {
+		let (journal, path) = test_journal("rewind-attachments");
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([outcome_script(end_outcome("answer"))]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let item = Item {
+			kind: Some(item::Kind::Message(thread::Message {
+				role:  i32::from(thread::Role::User),
+				parts: vec![
+					thread::Part { kind: Some(part::Kind::Text("look at this".to_owned())) },
+					thread::Part {
+						kind: Some(part::Kind::Text("<attachment>pasted body</attachment>".to_owned())),
+					},
+					thread::Part {
+						kind: Some(part::Kind::Blob(thread::Blob {
+							mime: "image/png".to_owned(),
+							inline: bytes::Bytes::from_static(b"png-bytes"),
+							..thread::Blob::default()
+						})),
+					},
+					thread::Part { kind: Some(part::Kind::Text("and this".to_owned())) },
+				],
+			})),
+			..Item::default()
+		};
+		agent
+			.submit([item], TurnId::new("rewind-attachments"))
+			.await
+			.expect("turn");
+		let targets = agent.rewind_targets().expect("list rewind targets");
+		let target = targets.first().expect("one rewind target");
+		assert_eq!(target.text.as_str(), "look at this\nand this");
+		assert_eq!(target.parts.len(), 2, "paste and blob split out of prose");
+		assert!(matches!(
+			target.parts[0].kind.as_ref(),
+			Some(part::Kind::Text(text)) if text == "<attachment>pasted body</attachment>"
+		));
+		assert!(matches!(
+			target.parts[1].kind.as_ref(),
+			Some(part::Kind::Blob(blob)) if blob.mime == "image/png"
+		));
+		drop(agent);
 		fs::remove_file(path).expect("remove journal");
 	}
 

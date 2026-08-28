@@ -83,11 +83,22 @@ pub enum WorkerSiteKind {
 	Attached,
 }
 
+/// Process boundary at which a tool executes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ToolLocus {
+	/// Tool executes in the project environment host.
+	Environment,
+	/// Tool executes in the calling session host.
+	Session,
+}
+
 /// Execution route associated with a live registry entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolRoute {
 	/// In-process typed Rust executor erased at registration.
 	Native,
+	/// Presentation-only declaration executed by the remote environment host.
+	Remote,
 	/// Externally supervised worker executor and its resolved placement.
 	Worker {
 		/// Worker site kind.
@@ -96,9 +107,11 @@ pub enum ToolRoute {
 		name: Str,
 	},
 }
+
 const fn is_model_callable(route: &ToolRoute) -> bool {
 	match route {
 		ToolRoute::Native | ToolRoute::Worker { .. } => true,
+		ToolRoute::Remote => true,
 	}
 }
 /// Model-visible tool declaration supplied by an attached RPC host.
@@ -1609,6 +1622,7 @@ struct RegistryEntry {
 	presentation: Presentation,
 	claims:       Claims,
 	execution:    ExecutionMode,
+	locus:        ToolLocus,
 }
 
 /// Revision-aware tool registry.
@@ -1733,6 +1747,7 @@ impl Registry {
 				}),
 				presentation: Presentation::Slot,
 				execution:    ExecutionMode::Parallel,
+				locus:        ToolLocus::Session,
 				claims:       Claims {
 					precedence: Precedence::INTEGRATION,
 					claimant:   claimant.clone(),
@@ -1960,6 +1975,29 @@ impl Registry {
 		presentation: Presentation,
 		claims: Claims,
 	) -> Result<(), RegistryError> {
+		self.register_typed(tool, presentation, claims, ToolLocus::Session)
+	}
+
+	/// Registers a typed tool that executes in the project environment host.
+	///
+	/// Older revisions from the same claimant remain only as pure lift steps.
+	/// Competing lower-precedence claimants remain qualified-addressable.
+	pub fn register_environment<T: Tool>(
+		&mut self,
+		tool: T,
+		presentation: Presentation,
+		claims: Claims,
+	) -> Result<(), RegistryError> {
+		self.register_typed(tool, presentation, claims, ToolLocus::Environment)
+	}
+
+	fn register_typed<T: Tool>(
+		&mut self,
+		tool: T,
+		presentation: Presentation,
+		claims: Claims,
+		locus: ToolLocus,
+	) -> Result<(), RegistryError> {
 		let spec = tool.spec();
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
@@ -1978,6 +2016,7 @@ impl Registry {
 			presentation,
 			claims,
 			execution: ExecutionMode::Parallel,
+			locus,
 		};
 		self.insert(name, rev, entry)
 	}
@@ -2052,6 +2091,47 @@ impl Registry {
 		worker_name: Str,
 		execution: ExecutionMode,
 	) -> Result<(), RegistryError> {
+		self.register_external(
+			spec,
+			presentation,
+			claims,
+			execution,
+			ToolRoute::Worker { site, name: worker_name },
+			ToolLocus::Session,
+		)
+	}
+
+	/// Declares a presentation-only tool executed by the remote environment.
+	///
+	/// The declaration participates in model advertisement and projection
+	/// identity, but direct registry invocation is rejected as externally
+	/// routed.
+	pub fn declare_remote(
+		&mut self,
+		spec: ToolSpec,
+		presentation: Presentation,
+		claims: Claims,
+		execution: ExecutionMode,
+	) -> Result<(), RegistryError> {
+		self.register_external(
+			spec,
+			presentation,
+			claims,
+			execution,
+			ToolRoute::Remote,
+			ToolLocus::Environment,
+		)
+	}
+
+	fn register_external(
+		&mut self,
+		spec: ToolSpec,
+		presentation: Presentation,
+		claims: Claims,
+		execution: ExecutionMode,
+		route: ToolRoute,
+		locus: ToolLocus,
+	) -> Result<(), RegistryError> {
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
 		let value = serde_json::from_slice(&spec.schema).map_err(|source| {
@@ -2063,13 +2143,14 @@ impl Registry {
 			tool: Arc::new(Worker {
 				spec,
 				schema: OpaqueJson::new(value),
-				route: ToolRoute::Worker { site, name: worker_name },
+				route,
 				cache: Arc::clone(&self.projection_cache),
 				cache_id,
 			}),
 			presentation,
 			claims,
 			execution,
+			locus,
 		};
 		self.insert(name, rev, entry)
 	}
@@ -2135,7 +2216,7 @@ impl Registry {
 	///
 	/// `selected = None` projects all visible slots. A selected set matches
 	/// [`Self::advertise_selected`] inclusion semantics, including explicitly
-	/// selected hidden slots. Worker and device declarations are absent.
+	/// selected hidden slots. Device declarations are absent.
 	pub const fn prompt_projection<'a>(
 		&'a self,
 		selected: Option<&'a [Str]>,
@@ -2202,6 +2283,24 @@ impl Registry {
 			.and_then(|roster| roster.entries.get(name))
 			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
 		Ok(entry.tool.route().clone())
+	}
+
+	/// Returns the execution locus of a winning or claimant-qualified entry.
+	pub fn locus(&self, name: &str) -> Result<ToolLocus, RegistryError> {
+		if let Ok(entry) = self.live_entry(name) {
+			return Ok(entry.locus);
+		}
+		let state = self.host_tools.read();
+		let claimant = state
+			.live
+			.get(name)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))?;
+		state
+			.rosters
+			.get(claimant)
+			.and_then(|roster| roster.entries.get(name))
+			.map(|entry| entry.locus)
+			.ok_or_else(|| RegistryError::UnknownTool(Str::new(name)))
 	}
 
 	/// Returns the presentation of a winning or claimant-qualified entry.
@@ -2429,7 +2528,7 @@ impl Registry {
 		mut params: IncomingParams<'a>,
 	) -> Result<ErasedStream<'a>, RegistryError> {
 		if let Ok(entry) = self.live_entry(name) {
-			if matches!(entry.tool.route(), ToolRoute::Worker { .. }) {
+			if !matches!(entry.tool.route(), ToolRoute::Native) {
 				return Err(external_error(entry.tool.spec(), "invoke"));
 			}
 			params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
@@ -2473,8 +2572,8 @@ impl Registry {
 	/// Dispatches one resolved native device while preserving the normal slot
 	/// invocation path unchanged.
 	///
-	/// Worker-routed devices are intentionally rejected here: the environment
-	/// router owns their `InvokeTool` transport after inspecting
+	/// Externally routed devices are intentionally rejected here: the
+	/// environment router owns their `InvokeTool` transport after inspecting
 	/// [`DeviceTarget::route`] from [`Self::resolve_device`].
 	pub fn invoke_device<'a>(
 		&'a self,
@@ -2489,14 +2588,14 @@ impl Registry {
 			.get(target.name)
 			.and_then(|versions| versions.get(target.rev))
 			.expect("resolved device target must retain its registered entry");
-		if matches!(entry.tool.route(), ToolRoute::Worker { .. }) {
+		if !matches!(entry.tool.route(), ToolRoute::Native) {
 			return Err(external_error(entry.tool.spec(), "invoke_device"));
 		}
 		params.bind_arg_specs(&entry.tool.spec().rev, &self.arg_specs);
 		Ok(entry.tool.call(params))
 	}
 
-	/// Lowers only policy-resolved native model-visible slots in priority order.
+	/// Lowers policy-resolved model-visible slots in priority order.
 	///
 	/// Larger priorities win. Core slots occupy the upper priority band, so an
 	/// extension declaration can never displace a core intent when a route is
@@ -2508,8 +2607,8 @@ impl Registry {
 	/// Lowers an exact frozen session selection, including selected hidden
 	/// tools.
 	///
-	/// Unknown, worker-routed, device-only, and unselected declarations are
-	/// omitted. Callers should obtain `names` from [`Self::resolve_inclusions`].
+	/// Unknown, device-only, and unselected declarations are omitted. Callers
+	/// should obtain `names` from [`Self::resolve_inclusions`].
 	pub fn advertise_selected(
 		&self,
 		caps: LoweringCaps,
@@ -2910,6 +3009,7 @@ fn projection_caps_hash(caps: &PromptCaps) -> Hash32 {
 fn hash_tool_route(hasher: &mut Hasher, route: &ToolRoute) {
 	match route {
 		ToolRoute::Native => hash_field(hasher, &[0]),
+		ToolRoute::Remote => hash_field(hasher, &[2]),
 		ToolRoute::Worker { site, name } => {
 			hash_field(hasher, &[1]);
 			hash_field(hasher, &[*site as u8]);
@@ -3446,6 +3546,108 @@ mod tests {
 		assert_eq!(lifted.raw_args, original.raw_args);
 		assert_eq!(lifted.verdict, original.verdict);
 	}
+
+	#[test]
+	fn registrations_retain_locus_and_remote_entries_are_presentation_only() {
+		let claims = Claims {
+			precedence: Precedence::DEFAULT,
+			claimant:   sf!("test/locus"),
+			replaces:   None,
+		};
+
+		let mut session = Registry::new();
+		session
+			.register(tool(1), Presentation::Slot, claims.clone())
+			.expect("session tool registers");
+		assert_eq!(session.locus("lift").expect("session locus resolves"), ToolLocus::Session);
+
+		let mut environment = Registry::new();
+		environment
+			.register_environment(tool(1), Presentation::Slot, claims.clone())
+			.expect("environment tool registers");
+		assert_eq!(
+			environment
+				.locus("lift")
+				.expect("environment locus resolves"),
+			ToolLocus::Environment
+		);
+
+		let mut qualified = Registry::new();
+		qualified
+			.register(tool(1), Presentation::Slot, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/session"),
+				replaces:   None,
+			})
+			.expect("qualified session tool registers");
+		qualified
+			.register_environment(tool(2), Presentation::Slot, Claims {
+				precedence: Precedence::ENHANCEMENT,
+				claimant:   sf!("test/environment"),
+				replaces:   None,
+			})
+			.expect("winning environment tool registers");
+		assert_eq!(qualified.locus("lift").expect("winning locus resolves"), ToolLocus::Environment);
+		assert_eq!(
+			qualified
+				.locus("lift@test/session")
+				.expect("claimant-qualified locus resolves"),
+			ToolLocus::Session
+		);
+
+		let mut worker = Registry::new();
+		worker
+			.register_worker(tool(1).spec, Presentation::Slot, claims.clone())
+			.expect("worker tool registers");
+		assert_eq!(worker.locus("lift").expect("worker locus resolves"), ToolLocus::Session);
+
+		let mut remote = Registry::new();
+		let spec = tool(1).spec;
+		let expected_spec = spec.clone();
+		remote
+			.declare_remote(spec, Presentation::Slot, claims, ExecutionMode::Parallel)
+			.expect("remote declaration registers");
+		assert_eq!(remote.locus("lift").expect("remote locus resolves"), ToolLocus::Environment);
+		assert_eq!(remote.route("lift").expect("remote route resolves"), ToolRoute::Remote);
+		assert_eq!(remote.live_spec("lift").expect("remote spec is live"), &expected_spec);
+		assert_eq!(
+			remote
+				.advertise(LoweringCaps {
+					strict_schema:  true,
+					grammar:        GrammarBits::empty(),
+					maximum_tools:  None,
+					maximum_strict: None,
+				})
+				.expect("remote declaration advertises")
+				.len(),
+			1
+		);
+		let projection_key = ProjectionKey::new(
+			&expected_spec.identity(),
+			br#"{"kind":"ok","value":null}"#,
+			&caps(),
+			remote.projection_hash(),
+		);
+		let projected =
+			ProjectedVerdict { parts: Arc::<[Part]>::from([]), is_error: false, useless: false };
+		remote
+			.cache_projected(&projection_key, projected.clone())
+			.expect("remote projection can be supplied externally");
+		assert_eq!(
+			remote
+				.project_cached(&projection_key)
+				.expect("remote projection cache is readable")
+				.expect("remote projection cache hits")
+				.as_ref(),
+			&projected
+		);
+		let (_feed, params) = IncomingParams::channel();
+		assert!(matches!(
+			remote.invoke("lift", params),
+			Err(RegistryError::UnsupportedExternal { operation: "invoke", .. })
+		));
+	}
+
 	struct HostExecutor;
 
 	impl HostToolExecutor for HostExecutor {
@@ -3501,6 +3703,7 @@ mod tests {
 			.expect("replacement host roster installs");
 		assert!(registry.resolved_identity("alpha").is_none());
 		assert!(registry.resolved_identity("beta").is_some());
+		assert_eq!(registry.locus("beta").expect("host locus resolves"), ToolLocus::Session);
 		assert!(matches!(
 			registry.replace_host_tools(sf!("rpc/client"), 2, Vec::new(), Arc::new(HostExecutor),),
 			Err(RegistryError::StaleHostRoster { .. })

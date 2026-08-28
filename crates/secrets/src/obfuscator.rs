@@ -109,11 +109,18 @@ impl SecretObfuscator {
 
 	fn key(&mut self) -> &str {
 		if self.key.is_none() {
+			let provider_configured = self.key_provider.is_some();
+			tracing::debug!(provider_configured, "secret placeholder key access started");
 			self.key = Some(
 				self
 					.key_provider
 					.take()
 					.map_or_else(String::new, |provider| provider()),
+			);
+			tracing::debug!(
+				provider_configured,
+				key_available = self.key.as_ref().is_some_and(|key| !key.is_empty()),
+				"secret placeholder key access completed"
 			);
 			self.register_key_redaction();
 		}

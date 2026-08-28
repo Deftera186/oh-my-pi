@@ -975,6 +975,12 @@ impl From<&str> for PropValue {
 		Self::Str(Str::new(value))
 	}
 }
+/// Millisecond count for `ms`-valued props, saturating at `u64::MAX`.
+impl From<Duration> for PropValue {
+	fn from(value: Duration) -> Self {
+		Self::U64(u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
+	}
+}
 impl From<String> for PropValue {
 	fn from(value: String) -> Self {
 		Self::Str(value.into())

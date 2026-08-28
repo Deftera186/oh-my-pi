@@ -113,44 +113,45 @@ pub struct AstEdit {
 	proposals: StagedProposalRegistry,
 }
 
+/// Returns the host-free `ast_edit@1` specification.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("ast_edit"),
+		rev:             Rev { family: Default::default(), n: 1 },
+		description:     sf!(
+			"Stages structural ast-grep rewrites across mixed-language targets. Every rewrite is \
+			 dry-run first; duplicate patterns and more than 200 files are rejected. Source hashes \
+			 are rechecked immediately before an all-file commit, and recovery snapshots are \
+			 retained under the project .omp state."
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: Some(DocEffects {
+				read:        true,
+				write_globs: [sf!("**")].into_iter().collect::<Arc<_>>(),
+			}),
+			exec:      None,
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("ast_edit.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Builds an `ast_edit` tool that stages proposals in `proposals` for later
 /// resolve or reject.
 pub fn tool(root: PathBuf, proposals: StagedProposalRegistry) -> AstEdit {
-	AstEdit {
-		root,
-		proposals,
-		spec: ToolSpec {
-			name:            sf!("ast_edit"),
-			rev:             Rev { family: Default::default(), n: 1 },
-			description:     sf!(
-				"Stages structural ast-grep rewrites across mixed-language targets. Every rewrite is \
-				 dry-run first; duplicate patterns and more than 200 files are rejected. Source \
-				 hashes are rechecked immediately before an all-file commit, and recovery snapshots \
-				 are retained under the project .omp state."
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: Some(DocEffects {
-					read:        true,
-					write_globs: [sf!("**")].into_iter().collect::<Arc<_>>(),
-				}),
-				exec:      None,
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("ast_edit.rs"),
-			)
-			.into(),
-		},
-	}
+	AstEdit { root, proposals, spec: spec() }
 }
 
 struct Prepared {

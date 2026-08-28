@@ -533,6 +533,18 @@ fn take_frame_end(
 /// `source_tokens` must be measured by the active model tokenizer. Frames are
 /// admitted only when their conservative image bill remains at least ten
 /// percent below that source measurement.
+#[tracing::instrument(
+	level = "debug",
+	name = "snapshot_compaction",
+	skip_all,
+	fields(
+		provider = provider.unwrap_or("unknown"),
+		model = target.model_id.unwrap_or("unknown"),
+		api = target.api.unwrap_or("unknown"),
+		source_tokens = source_tokens,
+		existing_images = existing_images
+	)
+)]
 pub fn render_archive(
 	text: &str,
 	source_tokens: u64,
@@ -589,6 +601,16 @@ pub fn render_archive(
 		image_tokens as f64 / source_tokens as f64
 	};
 	let frame_count = frames.len();
+	tracing::info!(
+		provider = provider.unwrap_or("unknown"),
+		model = target.model_id.unwrap_or("unknown"),
+		source_tokens,
+		image_tokens,
+		png_bytes,
+		frames = frame_count,
+		ratio,
+		"snapshot compaction completed"
+	);
 	Ok(Archive {
 		frames,
 		truncated_chars,

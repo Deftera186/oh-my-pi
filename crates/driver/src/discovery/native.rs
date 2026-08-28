@@ -137,6 +137,12 @@ pub fn user_config_root(home: &Path) -> PathBuf {
 
 /// Collects native `.omp` and standalone `AGENTS.md` walk-ups. The cap is an
 /// I/O bound as well as a cycle guard for malformed synthetic test paths.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "native_root_discovery",
+	fields(root = %cwd.display(), max_depth = max_depth)
+)]
 pub fn discover_roots(cwd: &Path, home: &Path, max_depth: usize) -> NativeRoots {
 	let mut project = Vec::new();
 	let mut agents = Vec::new();
@@ -245,6 +251,16 @@ pub struct NativeDiscovery {
 /// Discovers the canonical native content surface from realpath-deduplicated
 /// roots. Roots are ordered explicit, nearest project, then user unless
 /// explicit-only mode is selected.
+#[tracing::instrument(
+	level = "debug",
+	skip_all,
+	name = "native_capability_discovery",
+	fields(
+		root = %cwd.display(),
+		max_depth = max_depth,
+		explicit_root_count = options.explicit_roots.len()
+	)
+)]
 pub fn discover_capabilities(
 	cwd: &Path,
 	home: &Path,

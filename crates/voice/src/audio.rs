@@ -187,8 +187,22 @@ pub struct PlaybackStream {
 
 impl PlaybackStream {
 	/// Open and start the default speaker at the requested logical sample rate.
+	#[tracing::instrument(
+		level = "debug",
+		name = "device_open",
+		skip_all,
+		fields(audio.direction = "playback", audio.sample_rate = sample_rate)
+	)]
 	pub fn start(sample_rate: u32) -> VoiceResult<Self> {
-		let sample_rate = audio_sample_rate(sample_rate)?;
+		let sample_rate = audio_sample_rate(sample_rate).map_err(|error| {
+			tracing::warn!(
+				audio.direction = "playback",
+				audio.sample_rate = sample_rate,
+				error = %error,
+				"voice device configuration rejected"
+			);
+			error
+		})?;
 		let state = Arc::new(PlaybackState::new());
 		let (tx, rx) = flume::unbounded::<Vec<f32>>();
 		let (level_tx, level_rx) = watch::channel(0.0);
@@ -213,7 +227,20 @@ impl PlaybackStream {
 				level_tx.send_replace(rms_level(output));
 			}),
 		)
-		.map_err(|source| unavailable(AudioDirection::Playback, source))?;
+		.map_err(|source| {
+			let error = unavailable(AudioDirection::Playback, source);
+			tracing::warn!(
+				audio.direction = "playback",
+				error = %error,
+				"voice device open failed"
+			);
+			error
+		})?;
+		tracing::info!(
+			audio.direction = "playback",
+			audio.sample_rate = sample_rate,
+			"voice device opened"
+		);
 
 		Ok(Self {
 			device: Some(device),
@@ -279,7 +306,20 @@ impl PlaybackStream {
 		let Some(mut device) = self.device.take() else {
 			return Ok(());
 		};
-		device.stop()
+		match device.stop() {
+			Ok(()) => {
+				tracing::info!(audio.direction = "playback", "voice device closed");
+				Ok(())
+			},
+			Err(error) => {
+				tracing::warn!(
+					audio.direction = "playback",
+					error = %error,
+					"voice playback stop failed"
+				);
+				Err(error)
+			},
+		}
 	}
 }
 
@@ -300,11 +340,25 @@ pub struct CaptureStream {
 impl CaptureStream {
 	/// Open the default microphone at `sample_rate`. `on_audio` runs on the
 	/// realtime audio thread and must not block.
+	#[tracing::instrument(
+		level = "debug",
+		name = "device_open",
+		skip_all,
+		fields(audio.direction = "capture", audio.sample_rate = sample_rate)
+	)]
 	pub fn start<C>(sample_rate: u32, mut on_audio: C) -> VoiceResult<Self>
 	where
 		C: FnMut(&[f32]) + Send + 'static,
 	{
-		let sample_rate = audio_sample_rate(sample_rate)?;
+		let sample_rate = audio_sample_rate(sample_rate).map_err(|error| {
+			tracing::warn!(
+				audio.direction = "capture",
+				audio.sample_rate = sample_rate,
+				error = %error,
+				"voice device configuration rejected"
+			);
+			error
+		})?;
 		let config = DeviceConfig { sample_rate, period_ms: CAPTURE_PERIOD_MS };
 		let (level_tx, level_rx) = watch::channel(0.0);
 		let device = CaptureDevice::start(
@@ -316,7 +370,20 @@ impl CaptureStream {
 				}
 			}),
 		)
-		.map_err(|source| unavailable(AudioDirection::Capture, source))?;
+		.map_err(|source| {
+			let error = unavailable(AudioDirection::Capture, source);
+			tracing::warn!(
+				audio.direction = "capture",
+				error = %error,
+				"voice device open failed"
+			);
+			error
+		})?;
+		tracing::info!(
+			audio.direction = "capture",
+			audio.sample_rate = sample_rate,
+			"voice device opened"
+		);
 		Ok(Self { device: Some(device), levels: AudioLevelStream::new(level_rx) })
 	}
 
@@ -330,7 +397,20 @@ impl CaptureStream {
 		let Some(mut device) = self.device.take() else {
 			return Ok(());
 		};
-		device.stop()
+		match device.stop() {
+			Ok(()) => {
+				tracing::info!(audio.direction = "capture", "voice device closed");
+				Ok(())
+			},
+			Err(error) => {
+				tracing::warn!(
+					audio.direction = "capture",
+					error = %error,
+					"voice capture stop failed"
+				);
+				Err(error)
+			},
+		}
 	}
 }
 

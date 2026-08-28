@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
 use omp_core::{Str, sf};
 use tower::{Service, ServiceExt};
+use tracing::Instrument as _;
 
 use crate::{
 	answer::{Answer, AnswerBody, ResponseMeta},
@@ -352,6 +353,15 @@ impl RegistryBuilder {
 
 	/// Constructs every catalog route exactly once through a production
 	/// route-stack factory.
+	#[tracing::instrument(
+		level = "debug",
+		name = "registry_construct_routes",
+		skip_all,
+		fields(
+			catalog_revision = self.catalog.revision().as_str(),
+			route_count = self.catalog.routes().len()
+		)
+	)]
 	pub fn with_factory(mut self, factory: Arc<dyn RouteStackFactory>) -> Result<Self, Error> {
 		for route in self.catalog.routes() {
 			if self.bindings.contains_key(&route.id) {
@@ -388,6 +398,16 @@ impl RegistryBuilder {
 
 	/// Freezes all definitions and services into a clone-cheap immutable
 	/// registry.
+	#[tracing::instrument(
+		level = "debug",
+		name = "registry_build",
+		skip_all,
+		fields(
+			catalog_revision = self.catalog.revision().as_str(),
+			generation = self.generation,
+			route_count = self.catalog.routes().len()
+		)
+	)]
 	pub fn build(self) -> Result<Registry, Error> {
 		for route in self.catalog.routes() {
 			if !self.bindings.contains_key(&route.id) {
@@ -417,6 +437,11 @@ impl RegistryBuilder {
 				ExecutionReceipt::default(),
 			));
 		}
+		tracing::debug!(
+			generation = self.generation,
+			route_count = self.bindings.len(),
+			"inference registry built"
+		);
 		Ok(Registry {
 			inner: Arc::new(RegistryInner {
 				catalog:          self.catalog,
@@ -538,7 +563,19 @@ async fn dispatch_preplanned(
 				layered.context.receipt(),
 			)
 		})?;
-		let body = match manager.execute(request.as_ref().clone()).await {
+		let provider_span = tracing::debug_span!(
+			"provider_request",
+			provider = plan.provider.as_str(),
+			model = "",
+			route = plan.route.as_str(),
+			operation = %layered.payload.operation.kind(),
+			attempt = 1_u64,
+		);
+		let body = match manager
+			.execute(request.as_ref().clone())
+			.instrument(provider_span)
+			.await
+		{
 			Ok(body) => body,
 			Err(mut error) => {
 				attribute_error(&mut error, &plan.provider, &plan.route, &layered.payload.id);
@@ -575,8 +612,17 @@ async fn dispatch_preplanned(
 				Instant::now().checked_add(maximum.saturating_sub(layered.context.elapsed()))
 			})
 		});
+		let provider_span = tracing::debug_span!(
+			"provider_request",
+			provider = plan.provider.as_str(),
+			model = "",
+			route = plan.route.as_str(),
+			operation = %layered.payload.operation.kind(),
+			attempt = 1_u64,
+		);
 		let body = match manager
 			.execute(&plan.provider, &plan.route, request, deadline)
+			.instrument(provider_span)
 			.await
 		{
 			Ok(body) => body,
@@ -628,7 +674,19 @@ async fn dispatch_preplanned(
 			},
 		};
 		let attempt_start = layered.context.receipt().attempts.len();
-		match service.oneshot(layered.clone()).await {
+		let provider_span = tracing::debug_span!(
+			"provider_request",
+			provider = plan.provider.as_str(),
+			model = plan.model.as_ref().map_or("", |model| model.as_str()),
+			route = plan.route.as_str(),
+			operation = %layered.payload.operation.kind(),
+			attempt = index.saturating_add(1),
+		);
+		match service
+			.oneshot(layered.clone())
+			.instrument(provider_span)
+			.await
+		{
 			Ok(mut answer) => {
 				layered.context.merge_receipt(&answer.receipt);
 				answer.receipt = layered.context.receipt();
@@ -664,6 +722,20 @@ async fn dispatch_preplanned(
 				if context_promotion || fallback_is_safe(&error, has_next, credential_distinct) {
 					layered.context.merge_receipt(error.receipt());
 					hide_attempts_since(&layered.context, attempt_start);
+					let next = candidates.get(index);
+					tracing::warn!(
+						provider = plan.provider.as_str(),
+						model = plan.model.as_ref().map_or("", |model| model.as_str()),
+						route = plan.route.as_str(),
+						next_provider = next.map_or("", |candidate| candidate.provider.as_str()),
+						next_model = next
+							.and_then(|candidate| candidate.model.as_ref())
+							.map_or("", |model| model.as_str()),
+						error_kind = ?error.kind,
+						error_phase = ?error.phase,
+						context_promotion,
+						"provider request failed; trying planned fallback"
+					);
 					continue;
 				}
 				layered.context.finalize_error(&mut error);

@@ -167,6 +167,11 @@ where
 					});
 				}
 				request.context.abort_session_for_reseed();
+				tracing::warn!(
+					error_kind = ?error.kind,
+					error_phase = ?error.phase,
+					"provider session state rejected; reseeding from canonical history"
+				);
 				planner.reseed(&mut request.payload, &request.context)?;
 				let completion = planner.completion(&request.payload, &request.context)?;
 				request.context.set_session_completion(completion);

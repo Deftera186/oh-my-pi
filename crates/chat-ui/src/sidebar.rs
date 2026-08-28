@@ -280,7 +280,7 @@ mod tests {
 			jobs: 0,
 			attempt: 0,
 			dropped: 0,
-			git: Some(GitFacts { branch: sf!("main"), dirty: 1, staged: 0 }),
+			git: Some(GitFacts { branch: sf!("main"), dirty: 1, staged: 0, untracked: 0 }),
 			..StatusFacts::default()
 		}
 	}

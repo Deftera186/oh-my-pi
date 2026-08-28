@@ -171,6 +171,16 @@ pub fn list_foreign_sessions_in(format: ForeignFormat, root: &Path) -> Vec<Forei
 /// `header` is supplied by the native session creator and therefore carries a
 /// fresh session id and its selected working directory. A durable provenance
 /// label precedes all imported entries.
+#[tracing::instrument(
+	name = "session_import",
+	level = "debug",
+	skip_all,
+	fields(
+		source_format = ?info.source,
+		source = %info.path.display(),
+		destination = %destination.display()
+	)
+)]
 pub fn import_foreign_session(
 	info: &ForeignSessionInfo,
 	destination: &Path,
@@ -198,6 +208,17 @@ pub fn import_foreign_session(
 	let event_count = u64::try_from(events.len()).expect("event count fits in u64");
 	let mut writer = Writer::create_lazy(destination, &header)?;
 	writer.append_atomic(&events)?;
+	if !transcript.diagnostics.is_empty() {
+		tracing::warn!(
+			diagnostic_count = transcript.diagnostics.len(),
+			"session import omitted malformed or unsupported records"
+		);
+	}
+	tracing::info!(
+		event_count,
+		diagnostic_count = transcript.diagnostics.len(),
+		"session import completed"
+	);
 	Ok(ForeignImportReport { header, transcript, event_count })
 }
 
@@ -623,6 +644,16 @@ pub enum PiImportError {
 ///
 /// The source is never modified or removed. The destination is lazily
 /// materialized as one atomic header-plus-migration/event group.
+#[tracing::instrument(
+	name = "storage_migration",
+	level = "debug",
+	skip_all,
+	fields(
+		migration = "pi_session",
+		source = %source.display(),
+		destination = %destination.display()
+	)
+)]
 pub fn import_pi_file(
 	source: &Path,
 	destination: &Path,
@@ -768,6 +799,21 @@ pub fn import_pi_file(
 	writer.append_atomic(&events)?;
 	drop(writer);
 	load(destination)?;
+	if !diagnostics.is_empty() {
+		tracing::warn!(
+			diagnostic_count = diagnostics.len(),
+			dropped_field_count = dropped_fields.len(),
+			"session migration omitted malformed or unsupported records"
+		);
+	}
+	tracing::info!(
+		source_version,
+		source_bytes,
+		imported_event_count = imported_events,
+		diagnostic_count = diagnostics.len(),
+		dropped_field_count = dropped_fields.len(),
+		"session migration completed"
+	);
 	Ok(PiImportReport {
 		migration: PiMigrationRecord {
 			source_version,

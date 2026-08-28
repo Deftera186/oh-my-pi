@@ -297,6 +297,7 @@ mod tests {
 			context:     None,
 			input_mtok:  None,
 			output_mtok: None,
+			efforts:     std::sync::Arc::from([]),
 		}
 	}
 
@@ -311,6 +312,7 @@ mod tests {
 			context:     None,
 			input_mtok:  None,
 			output_mtok: None,
+			efforts:     std::sync::Arc::from([]),
 		};
 		let facts = facts(&row);
 		assert!(!facts.contains("ctx"));

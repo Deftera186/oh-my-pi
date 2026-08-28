@@ -1851,13 +1851,30 @@ impl CanonicalPromptSource {
 					.map(|(index, part)| (index as u64, part.as_bytes())),
 			)
 		});
-		let items = text.map(|parts| {
+		let [frozen, stable, epochal, volatile] = text;
+		let messages = |parts: Vec<String>| {
 			parts
 				.into_iter()
 				.filter(|part| !part.is_empty())
 				.map(system_text)
 				.collect()
-		});
+		};
+		// Stable contributions form one provider message. A repository-context
+		// refresh can then replace the complete stable head without shifting the
+		// preserved conversation tail behind internal prompt fragments.
+		let stable = stable
+			.into_iter()
+			.filter(|part| !part.is_empty())
+			.collect::<String>();
+		let items = [
+			messages(frozen),
+			(!stable.is_empty())
+				.then(|| system_text(stable))
+				.into_iter()
+				.collect(),
+			messages(epochal),
+			messages(volatile),
+		];
 		Ok(PromptBands { items, hashes })
 	}
 }

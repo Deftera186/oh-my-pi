@@ -59,7 +59,7 @@ omp-sdk = { workspace = true }
 omp-secrets = { workspace = true }
 omp-settings = { workspace = true }
 omp-storage = { workspace = true }
-omp-telemetry = { workspace = true }
+omp-observability = { workspace = true }
 omp-tool = { workspace = true }
 omp-tools = { workspace = true }
 omp-walker = { workspace = true }

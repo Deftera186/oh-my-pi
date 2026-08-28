@@ -141,18 +141,38 @@ pub async fn exchange_authorization_code(
 }
 
 /// Refreshes a grant and retains `refresh` when the server omits rotation.
+#[tracing::instrument(
+	name = "oauth_token_refresh",
+	level = "debug",
+	skip_all,
+	fields(
+		has_client_id = request.client_id.is_some(),
+		confidential_client = request.client_secret.is_some(),
+		resource_bound = request.resource.is_some(),
+	)
+)]
 pub async fn refresh_token(
 	http: &dyn OAuthHttpClient,
 	request: &TokenRequest<'_>,
 	refresh: SecretString,
 ) -> Result<TokenGrant, TokenError> {
+	tracing::debug!("OAuth token refresh preflight completed");
 	let body = {
 		let mut fields =
 			vec![("grant_type", "refresh_token"), ("refresh_token", refresh.expose_secret())];
 		append_public_fields(&mut fields, request);
 		encode_form(&fields)
 	};
-	post_encoded_form(http, request.endpoint, body, Some(refresh)).await
+	let result = post_encoded_form(http, request.endpoint, body, Some(refresh)).await;
+	match &result {
+		Ok(grant) => tracing::debug!(
+			refreshable = grant.is_refreshable(),
+			has_expiry = grant.expires_in().is_some(),
+			"OAuth token refresh completed"
+		),
+		Err(error) => tracing::warn!(%error, "OAuth token refresh failed"),
+	}
+	result
 }
 
 fn append_public_fields<'a>(fields: &mut Vec<(&'a str, &'a str)>, request: &'a TokenRequest<'a>) {

@@ -87,6 +87,8 @@ pub struct SpawnSpec {
 	pub python_site:         PathBuf,
 	/// Scoped Environment DATA socket.
 	pub env_socket:          PathBuf,
+	/// Optional workspace root granted to declared local callback sinks.
+	pub workspace_root:      Option<PathBuf>,
 	/// Generation assigned to this newly spawned child.
 	pub host_generation:     u64,
 	/// Session generation shared with the CONTROL parent.
@@ -150,6 +152,16 @@ pub enum RunningHostError {
 
 impl SpawnedHost {
 	/// Starts the sole parent reader and installs synchronous Core authority.
+	#[tracing::instrument(
+		level = "debug",
+		name = "extension_host_handshake",
+		skip_all,
+		fields(
+			extension_id = %self.key.extension(),
+			host_generation = identity.host_generation,
+			session_generation = identity.session_generation,
+		)
+	)]
 	pub async fn start_control(
 		self,
 		identity: ControlConnectionIdentity,
@@ -163,8 +175,27 @@ impl SpawnedHost {
 		if let Err(error) = handle.install_authority_snapshot(snapshot).await {
 			pump.abort();
 			let _ = child.start_kill();
+			let failure_kind = match &error {
+				ControlRuntimeError::Io(_) => "io",
+				ControlRuntimeError::Json(_) => "json",
+				ControlRuntimeError::Protocol(_) => "protocol",
+				ControlRuntimeError::Dispatch(_) => "dispatch",
+				ControlRuntimeError::Remote(_) => "remote",
+			};
+			tracing::warn!(
+				extension_id = %key.extension(),
+				host_generation = identity.host_generation,
+				failure_kind,
+				"extension host control handshake failed",
+			);
 			return Err(error.into());
 		}
+		tracing::info!(
+			extension_id = %key.extension(),
+			host_generation = identity.host_generation,
+			session_generation = identity.session_generation,
+			"extension host control handshake completed",
+		);
 		Ok(RunningHost {
 			key,
 			child,
@@ -296,6 +327,16 @@ impl RunningHost {
 	}
 
 	/// Waits for the sole CONTROL pump to finish.
+	#[tracing::instrument(
+		level = "debug",
+		name = "extension_host_control_drain",
+		skip_all,
+		fields(
+			extension_id = %self.key.extension(),
+			host_generation = self.identity.host_generation,
+			session_generation = self.identity.session_generation,
+		)
+	)]
 	pub async fn wait_control(mut self) -> Result<(), RunningHostError> {
 		let result = match (&mut self.pump).await {
 			Ok(result) => result.map_err(Into::into),
@@ -307,6 +348,24 @@ impl RunningHost {
 				.into(),
 			),
 		};
+		match &result {
+			Ok(()) => tracing::debug!(
+				extension_id = %self.key.extension(),
+				host_generation = self.identity.host_generation,
+				"extension host control reader drained",
+			),
+			Err(error) => tracing::warn!(
+				extension_id = %self.key.extension(),
+				host_generation = self.identity.host_generation,
+				failure_kind = match error {
+					RunningHostError::Control(_) => "control",
+					RunningHostError::Cancellation(_) => "cancellation",
+					RunningHostError::Spawn(_) => "spawn",
+					RunningHostError::GenerationExhausted => "generation_exhausted",
+				},
+				"extension host control reader failed",
+			),
+		}
 		self.terminate().await;
 		result
 	}
@@ -359,6 +418,12 @@ impl HostChildLimit {
 		let previous = self.live.fetch_add(1, Ordering::AcqRel);
 		if previous >= self.limit {
 			self.live.fetch_sub(1, Ordering::AcqRel);
+			tracing::warn!(
+				extension_id = %spec.key.extension(),
+				host_generation = spec.host_generation,
+				limit = self.limit,
+				"extension host admission denied by child limit",
+			);
 			return Err(SpawnError::ChildLimit { limit: self.limit });
 		}
 		match spawn(spec).await {
@@ -439,6 +504,17 @@ fn allow_loaded_runtime_images(
 }
 
 /// Spawns one isolated extension host with CONTROL on descriptor three.
+#[tracing::instrument(
+	level = "debug",
+	name = "extension_host_spawn",
+	skip_all,
+	fields(
+		extension_id = %spec.key.extension(),
+		host_generation = spec.host_generation,
+		session_generation = spec.session_generation,
+		trust_tier = %spec.key.tier(),
+	)
+)]
 pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	let restart_spec = spec.clone();
 	let (parent, child_control) = UnixStream::pair()?;
@@ -458,6 +534,10 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 			sandbox.allow_read(&spec.python_site)?;
 			sandbox.set_write(WriteMode::Scoped);
 			sandbox.allow_write(&env_socket)?;
+			if let Some(root) = &spec.workspace_root {
+				sandbox.allow_read(root)?;
+				sandbox.allow_write(root)?;
+			}
 			sandbox.allow_unix_socket(&env_socket)?;
 			sandbox.set_network(NetworkMode::Disabled);
 			sandbox.set_degradation(DegradationPolicy::Reject);
@@ -501,6 +581,9 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
+	if let Some(root) = &spec.workspace_root {
+		command.current_dir(root);
+	}
 	if let Some(snapshot) = &spec.package_snapshot {
 		command.env(PACKAGE_SNAPSHOT_ENV, snapshot.as_str());
 	} else {
@@ -540,12 +623,27 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	let mut child = command.spawn().map_err(SpawnError::Spawn)?;
 	drop(child_control);
 	let (logs_tx, logs) = flume::unbounded();
+	let extension_id = spec.key.extension().clone();
+	let host_generation = spec.host_generation;
 	if let Some(stdout) = child.stdout.take() {
-		capture(stdout, HostLogStream::Stdout, logs_tx.clone());
+		capture(
+			stdout,
+			HostLogStream::Stdout,
+			logs_tx.clone(),
+			extension_id.clone(),
+			host_generation,
+		);
 	}
 	if let Some(stderr) = child.stderr.take() {
-		capture(stderr, HostLogStream::Stderr, logs_tx);
+		capture(stderr, HostLogStream::Stderr, logs_tx, extension_id, host_generation);
 	}
+	tracing::info!(
+		extension_id = %spec.key.extension(),
+		host_generation = spec.host_generation,
+		session_generation = spec.session_generation,
+		process_id = ?child.id(),
+		"extension host spawned",
+	);
 	Ok(SpawnedHost {
 		key: spec.key,
 		child,
@@ -556,18 +654,39 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	})
 }
 
-fn capture<R>(stream: R, source: HostLogStream, logs: flume::Sender<HostLog>)
-where
+fn capture<R>(
+	stream: R,
+	source: HostLogStream,
+	logs: flume::Sender<HostLog>,
+	extension_id: Str,
+	host_generation: u64,
+) where
 	R: AsyncRead + Unpin + Send + 'static,
 {
 	tokio::spawn(async move {
 		let mut stream = stream;
 		let mut bytes = [0_u8; 4096];
 		loop {
-			let Ok(read) = stream.read(&mut bytes).await else {
-				return;
+			let read = match stream.read(&mut bytes).await {
+				Ok(read) => read,
+				Err(error) => {
+					tracing::warn!(
+						%extension_id,
+						host_generation,
+						stream = ?source,
+						%error,
+						"extension host output reader failed",
+					);
+					return;
+				},
 			};
 			if read == 0 {
+				tracing::debug!(
+					%extension_id,
+					host_generation,
+					stream = ?source,
+					"extension host output reader drained",
+				);
 				return;
 			}
 			if logs
@@ -575,6 +694,12 @@ where
 				.await
 				.is_err()
 			{
+				tracing::debug!(
+					%extension_id,
+					host_generation,
+					stream = ?source,
+					"extension host output drain receiver closed",
+				);
 				return;
 			}
 		}
@@ -647,6 +772,7 @@ mod tests {
 			executable:          PathBuf::from("/definitely/not/an/executable"),
 			python_site:         PathBuf::from("/definitely/not/a/site"),
 			env_socket:          PathBuf::from("/definitely/not/a/socket"),
+			workspace_root:      None,
 			host_generation:     1,
 			session_generation:  1,
 			package_snapshot:    None,

@@ -208,7 +208,15 @@ impl builtins::Command for TopCommand {
 	where
 		I: IntoIterator<Item = String>,
 	{
-		Self::try_parse_from(args.into_iter().map(normalize_top_flag))
+		Self::try_parse_from(args.into_iter().map(normalize_top_flag)).inspect_err(|error| {
+			if error.use_stderr() {
+				tracing::warn!(
+					builtin = "top",
+					error_kind = ?error.kind(),
+					"builtin arguments rejected"
+				);
+			}
+		})
 	}
 
 	fn execute<SE: omp_shell_engine::ShellExtensions>(
@@ -230,15 +238,18 @@ impl builtins::Command for TopCommand {
 		};
 		async move {
 			if !delay.is_finite() || delay < 0.0 || delay > Duration::MAX.as_secs_f64() {
+				tracing::warn!(builtin = "top", "builtin delay rejected");
 				writeln!(context.stderr(), "top: invalid delay '{delay}'")?;
 				return Ok(ExecutionResult::new(1));
 			}
 			if row_limit == Some(0) {
+				tracing::warn!(builtin = "top", "builtin row count rejected");
 				writeln!(context.stderr(), "top: row count must be greater than zero")?;
 				return Ok(ExecutionResult::new(1));
 			}
 			#[cfg(target_os = "windows")]
 			if user.is_some() {
+				tracing::warn!(builtin = "top", "builtin user filter unavailable");
 				writeln!(context.stderr(), "top: user filtering is unavailable on Windows")?;
 				return Ok(ExecutionResult::new(2));
 			}
@@ -330,6 +341,11 @@ impl builtins::Command for TopCommand {
 					if err.kind() == io::ErrorKind::BrokenPipe {
 						return Ok(ExecutionResult::success());
 					}
+					tracing::warn!(
+						builtin = "top",
+						error_kind = ?err.kind(),
+						"builtin output failed"
+					);
 					return Err(err.into());
 				}
 

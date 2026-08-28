@@ -597,6 +597,12 @@ const fn should_retry_dead_kernel_cancellation(
 }
 
 impl EvalChild {
+	#[tracing::instrument(
+		level = "debug",
+		name = "eval_child_spawn",
+		skip_all,
+		fields(external = interpreter != Path::new(EMBEDDED_INTERPRETER))
+	)]
 	async fn spawn(
 		executable: &Path,
 		interpreter: &Path,
@@ -658,7 +664,13 @@ impl EvalChild {
 			use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 			command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 		}
-		let mut child = command.spawn()?;
+		let mut child = match command.spawn() {
+			Ok(child) => child,
+			Err(error) => {
+				tracing::warn!(%error, "eval child spawn failed");
+				return Err(error.into());
+			},
+		};
 		let process_group = child.id();
 		let stdin = child
 			.stdin
@@ -688,14 +700,18 @@ impl EvalChild {
 			python_prelude: Str::from(PYTHON_PRELUDE),
 			interrupt_grace: Str::from(interrupt_grace.to_string()),
 		})
-		.await?;
+		.await
+		.map_err(|error| {
+			tracing::warn!(%error, "eval child handshake failed");
+			error
+		})?;
 		// Cold start covers exec plus embedded-interpreter boot; tolerate load
 		// spikes that the per-frame runtime deadlines must not.
 		let ready = time::timeout(Duration::from_secs(30), read_frame(&mut process.stdout)).await;
 		if let Some(runner) = external_runner {
 			let _ = fs::remove_file(runner);
 		}
-		match ready {
+		let result = match ready {
 			Ok(Ok(Some(ChildFrame::Ready))) => Ok(process),
 			Ok(Ok(Some(ChildFrame::Fatal { message }))) => Err(ProcessError::Protocol(message)),
 			Ok(Ok(Some(_))) => {
@@ -704,9 +720,19 @@ impl EvalChild {
 			Ok(Ok(None)) => Err(ProcessError::Exited),
 			Ok(Err(error)) => Err(error),
 			Err(_) => Err(ProcessError::Protocol(sf!("eval child startup timed out"))),
+		};
+		if let Err(error) = &result {
+			tracing::warn!(%error, "eval child handshake failed");
 		}
+		result
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		name = "eval_child_roundtrip",
+		skip_all,
+		fields(run_id = tracing::field::Empty)
+	)]
 	async fn run_cell(
 		&mut self,
 		cell_id: Bytes,
@@ -721,6 +747,7 @@ impl EvalChild {
 		retry_dead_cancellation: bool,
 	) -> RunCellDisposition {
 		let run_id = self.next_run.fetch_add(1, Ordering::Relaxed);
+		tracing::Span::current().record("run_id", run_id);
 		let started = Instant::now();
 		let timeout = TimeoutHandle::new(request.timeout);
 		let Ok(timeout_ns) = request
@@ -1525,6 +1552,7 @@ fn validate_runtime_snapshot(snapshot: RuntimeSnapshot) -> Result<RuntimeSnapsho
 }
 
 /// Runs the hidden eval child entry before ordinary CLI or telemetry startup.
+#[tracing::instrument(level = "debug", name = "eval_child_entry", skip_all)]
 pub async fn run_eval_child_entry() -> Result<(), ProcessError> {
 	let ShieldedProtocol { input, mut output, capture } = shield_protocol_fds()?;
 	let mut stdin = BufReader::new(input);

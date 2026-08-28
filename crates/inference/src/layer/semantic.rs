@@ -240,6 +240,12 @@ where
 					request.context.finalize_error(&mut error);
 					return Err(error);
 				}
+				tracing::warn!(
+					retry_attempt = semantic_retry.saturating_add(1),
+					error_kind = ?error.kind,
+					error_phase = ?error.phase,
+					"semantic validation rejected provider output; retrying"
+				);
 				semantic_retry += 1;
 				poll_fn(|cx| service.poll_ready(cx)).await?;
 			}

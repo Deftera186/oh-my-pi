@@ -357,14 +357,15 @@ pub async fn prepare_environment_inputs_bounded(
 }
 
 fn warn_prep_timeout(step: &str) {
-	eprintln!(
-		"Warning: system prompt preparation step `{step}` timed out after 5000ms; using minimal \
-		 fallback."
+	tracing::warn!(
+		step,
+		timeout_ms = PROMPT_PREP_DEADLINE.as_millis() as u64,
+		"system prompt preparation timed out; using minimal fallback"
 	);
 }
 
 fn warn_prep_fallback(step: &str) {
-	eprintln!("Warning: system prompt preparation step `{step}` failed; using minimal fallback.");
+	tracing::warn!(step, "system prompt preparation failed; using minimal fallback");
 }
 
 /// Creates the initial workspace input from already-frozen facets.

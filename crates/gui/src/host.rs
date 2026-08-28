@@ -1109,6 +1109,12 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 
 	/// Opens a window seeded with one tab holding one fresh pane. `size` is
 	/// the spawning window's logical size, or the config default.
+	#[tracing::instrument(
+		name = "window_initialize",
+		level = "debug",
+		skip_all,
+		fields(existing_windows = self.windows.len())
+	)]
 	fn spawn_window(&mut self, el: &ActiveEventLoop, size: Option<LogicalSize<f64>>) {
 		if !self.config.multiplex && !self.windows.is_empty() {
 			return;

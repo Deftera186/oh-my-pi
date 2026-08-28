@@ -940,6 +940,15 @@ pub enum CompileError {
 }
 
 /// Parses the two checked-in oracle source formats into typed records.
+#[tracing::instrument(
+	name = "catalog_oracle_parse",
+	level = "debug",
+	skip_all,
+	fields(
+		provider_source_bytes = providers_toml.len(),
+		model_source_bytes = models_json_zstd.len()
+	)
+)]
 pub fn parse_oracle(
 	providers_toml: &str,
 	models_json_zstd: &[u8],
@@ -974,6 +983,15 @@ pub fn compile(source: CatalogSource) -> Result<CompiledCatalog, CompileError> {
 	compile_with_oauth(source, include_str!("../../../fixtures/llm-oracle/catalog/oauth.toml"))
 }
 
+#[tracing::instrument(
+	name = "catalog_compile",
+	level = "debug",
+	skip_all,
+	fields(
+		provider_count = source.providers.len(),
+		model_provider_count = source.models.len()
+	)
+)]
 fn compile_with_oauth(
 	source: CatalogSource,
 	oauth_toml: &str,

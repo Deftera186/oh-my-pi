@@ -783,6 +783,7 @@ mod server {
 						if let Ok((stream, _)) = accepted {
 							let id = *next_conn;
 							*next_conn += 1;
+							tracing::info!(client_id = id, "tui debug client connected");
 							conns.push(Conn {
 								id,
 								stream,

@@ -26,7 +26,7 @@ use crate::{
 	pathsearch, processes,
 	results::{ExecutionSpawnResult, ExecutionWaitResult},
 	sys::{self, async_pipe::AsyncPipeReader},
-	trace_categories, traps, variables,
+	traps, variables,
 };
 
 /// Encapsulates the result of waiting for a command to complete.
@@ -741,16 +741,6 @@ pub(crate) fn execute_external_command(
 		},
 	}
 
-	// When tracing is enabled, report.
-	tracing::debug!(
-		 target: trace_categories::COMMANDS,
-		 "Spawning: cmd='{} {}'",
-		 cmd.get_program().to_string_lossy().to_string(),
-		 cmd.get_args()
-			  .map(|a| a.to_string_lossy().to_string())
-			  .join(" ")
-	);
-
 	match sys::process::spawn(cmd) {
 		Ok(child) => {
 			// Retrieve the pid.
@@ -766,6 +756,23 @@ pub(crate) fn execute_external_command(
 				}
 			} else {
 				tracing::warn!("could not retrieve pid for child process");
+			}
+
+			if let Some(pgid) = actual_pgid {
+				if new_pg {
+					tracing::info!(
+						pid = ?pid,
+						pgid,
+						detached = context.params.detach_reparent,
+						"shell process group started"
+					);
+				} else {
+					tracing::debug!(
+						pid = ?pid,
+						pgid,
+						"shell child joined process group"
+					);
+				}
 			}
 
 			// Report the spawned child for scoped teardown. Skipped for reparented

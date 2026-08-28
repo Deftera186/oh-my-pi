@@ -1300,6 +1300,7 @@ pub struct Terminal {
 impl Terminal {
 	/// Takes ownership of the controlling terminal and emits one
 	/// capability-aware entry batch.
+	#[tracing::instrument(level = "debug", name = "terminal_enter", skip_all)]
 	pub fn enter(mut options: TerminalOptions) -> io::Result<Self> {
 		ensure_restore_hooks()?;
 		let (caps, probe) = match options.caps {
@@ -1341,6 +1342,7 @@ impl Terminal {
 			deactivate_emergency_state();
 			return Err(error);
 		}
+		omp_core::logging::set_stderr_muted(true);
 
 		let keyboard = keyboard_mode(caps.kitty_keyboard);
 		let xterm_scroll_restore_modes = xterm_scroll_restore_modes(caps);
@@ -1509,6 +1511,7 @@ impl Terminal {
 		if raw_restored {
 			self.active = false;
 			deactivate_emergency_state();
+			omp_core::logging::set_stderr_muted(false);
 		}
 		if let Some(error) = first_error {
 			Err(error)
@@ -2342,6 +2345,7 @@ fn emergency_restore_inner() {
 	// This must precede every other crash-path operation: panic reporting uses
 	// fd 2, and Unix restoration is only an atomic swap plus dup2/close.
 	platform::emergency_restore_stderr();
+	omp_core::logging::set_stderr_muted(false);
 	if !ACTIVE.swap(false, Ordering::AcqRel) {
 		return;
 	}

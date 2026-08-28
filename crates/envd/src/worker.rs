@@ -584,7 +584,8 @@ impl ExtHostConfig {
 		self.control_authorities = Some(factory);
 	}
 
-	pub(crate) fn bind_registry_control(&mut self, registry: Arc<RegistryControlFactory>) {
+	/// Installs the authenticated dynamic-registry owner used by CONTROL hosts.
+	pub fn bind_registry_control(&mut self, registry: Arc<RegistryControlFactory>) {
 		self.registry_control = Some(registry);
 	}
 
@@ -1510,6 +1511,14 @@ impl ExtHostSupervisor {
 					.unwrap_or_else(|| config.executable.clone()),
 				python_site:         python_site.clone(),
 				env_socket:          env_socket.clone(),
+				workspace_root:      extension
+					.manifest
+					.static_declarations()
+					.ordered
+					.iter()
+					.any(|row| matches!(row.kind.as_str(), "telemetry" | "telemetry_subscription"))
+					.then(|| config.workspace_root.clone())
+					.flatten(),
 				host_generation:     1,
 				session_generation:  config.session_generation,
 				package_snapshot:    None,
@@ -2072,6 +2081,7 @@ impl ExtHostSupervisor {
 	pub fn sealed_registry_evidences(&self) -> Vec<Arc<SealedRegistryEvidence>> {
 		self.frozen_registry.lock().values().cloned().collect()
 	}
+
 	/// Returns every authenticated CONTROL identity, including hosts whose
 	/// declaration freeze has not yet published registry evidence.
 	pub fn control_identities(&self) -> Vec<Arc<ControlConnectionIdentity>> {
@@ -2125,14 +2135,11 @@ impl ExtHostSupervisor {
 				actual:   target.session_generation,
 			});
 		}
-		let activation = self
+		self
 			.control_activations
 			.iter()
 			.find(|activation| activation.key == key)
 			.ok_or(ExtensionCallbackError::UnknownHost)?;
-		if dispatch.authority.session != activation.session_id {
-			return Err(ExtensionCallbackError::Session);
-		}
 		let control = route.control.read().clone();
 		control.dispatch(dispatch).await.map_err(Into::into)
 	}
@@ -5272,6 +5279,18 @@ fn sealed_document_ids(
 }
 
 impl WorkerProcess {
+	#[tracing::instrument(
+		level = "debug",
+		name = "py_worker_spawn",
+		skip_all,
+		fields(
+			layer = %config.process_id.layer,
+			tier = %config.process_id.tier,
+			pool = %config.process_id.pool().map_or("", Str::as_str),
+			generation,
+			extension_count = config.manifests.len(),
+		)
+	)]
 	async fn spawn(
 		config: &ProcessConfig,
 		generation: u64,
@@ -5448,7 +5467,13 @@ impl WorkerProcess {
 			use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 			command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 		}
-		let mut child = command.spawn()?;
+		let mut child = match command.spawn() {
+			Ok(child) => child,
+			Err(error) => {
+				tracing::warn!(%error, "python worker spawn failed");
+				return Err(error.into());
+			},
+		};
 		let stdin = child
 			.stdin
 			.take()
@@ -5470,11 +5495,18 @@ impl WorkerProcess {
 		};
 		if let Err(error) = process.handshake(config, generation, cause).await {
 			process.terminate(config.interrupt_grace).await;
+			tracing::warn!(%error, "python worker handshake failed");
 			return Err(error);
 		}
 		Ok(process)
 	}
 
+	#[tracing::instrument(
+		level = "debug",
+		name = "py_worker_handshake",
+		skip_all,
+		fields(generation)
+	)]
 	async fn handshake(
 		&mut self,
 		config: &ProcessConfig,
@@ -8179,6 +8211,7 @@ fn omp_py_eval(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///
 /// # Errors
 /// Returns a worker startup, extension import, or stdio protocol error.
+#[tracing::instrument(level = "debug", name = "py_worker_entry", skip_all)]
 pub fn run_py_worker_entry() -> Result<(), WorkerError> {
 	let modules = configured_modules();
 	if modules

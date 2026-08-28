@@ -95,28 +95,30 @@ pub struct MemoryEditTool {
 	spec:    ToolSpec,
 }
 
+/// Builds the host-free `memory_edit@1` declaration.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("memory_edit"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects::empty(),
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("memory_edit.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates `memory_edit@1` over one active runtime.
 pub fn tool(runtime: Arc<MemoryRuntime>) -> MemoryEditTool {
-	MemoryEditTool {
-		runtime,
-		spec: ToolSpec {
-			name:            sf!("memory_edit"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects::empty(),
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("memory_edit.rs"),
-			)
-			.into(),
-		},
-	}
+	MemoryEditTool { runtime, spec: spec() }
 }
 
 impl Tool for MemoryEditTool {

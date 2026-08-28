@@ -20,7 +20,7 @@ use crate::{
 	patterns, prompt,
 	regex::{Regex, RegexPiece},
 	shell::Shell,
-	sys, trace_categories,
+	sys,
 	variables::{self, ShellValue, ShellValueUnsetType, ShellVariable},
 };
 
@@ -614,8 +614,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 	/// Apply tilde-expansion, parameter expansion, command substitution, and
 	/// arithmetic expansion; yield pieces that could be further processed.
 	async fn basic_expand(&mut self, word: &str) -> Result<Expansion, error::Error> {
-		tracing::debug!(target: trace_categories::EXPANSION, "Basic expanding: '{word}'");
-
 		// Quick short circuit to avoid more expensive parsing. The characters below are
 		// understood to be the *only* ones indicative of *possible* expansion. There's
 		// still a possibility no expansion needs to be done, but that's okay; we'll
@@ -638,11 +636,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 		// single word left every element after the first with a literal leading
 		// `~` (issue #5819).
 		let brace_expanded_words = self.brace_expand_words(word)?;
-		if tracing::enabled!(target: trace_categories::EXPANSION, tracing::Level::DEBUG)
-			&& !(brace_expanded_words.len() == 1 && brace_expanded_words[0] == word)
-		{
-			tracing::debug!(target: trace_categories::EXPANSION, "  => brace expanded to {brace_expanded_words:?}");
-		}
 
 		// Expand each brace element separately (tildes, parameters, command
 		// substitutions, arithmetic), separating elements with a splittable
@@ -732,7 +725,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 
 		let parse_result = parse_brace_expansions(word, &self.parser_options);
 		if parse_result.is_err() {
-			tracing::error!("failed to parse for brace expansion: {parse_result:?}");
+			tracing::warn!("brace expansion parse failed; preserving input");
 			return Ok(vec![word.into()]);
 		}
 
@@ -740,8 +733,6 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
 		let Some(brace_expansion_pieces) = brace_expansion_pieces else {
 			return Ok(vec![word.into()]);
 		};
-
-		tracing::debug!(target: trace_categories::EXPANSION, "Brace expansion pieces: {brace_expansion_pieces:?}");
 
 		let words = braceexpansion::generate_and_combine_brace_expansions(brace_expansion_pieces)
 			.into_iter()

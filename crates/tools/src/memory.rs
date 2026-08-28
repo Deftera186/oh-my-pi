@@ -166,19 +166,34 @@ pub struct RetainTool {
 	spec:    ToolSpec,
 }
 
+/// Builds the host-free `recall@1` declaration.
+pub fn recall_spec() -> ToolSpec {
+	memory_spec::<RecallParams>("recall", RECALL_DESCRIPTION)
+}
+
+/// Builds the host-free `reflect@1` declaration.
+pub fn reflect_spec() -> ToolSpec {
+	memory_spec::<ReflectParams>("reflect", REFLECT_DESCRIPTION)
+}
+
+/// Builds the host-free `retain@1` declaration.
+pub fn retain_spec() -> ToolSpec {
+	memory_spec::<RetainParams>("retain", RETAIN_DESCRIPTION)
+}
+
 /// Creates the revisioned recall leaf.
 pub fn recall_tool(runtime: Arc<MemoryRuntime>) -> RecallTool {
-	RecallTool { runtime, spec: spec::<RecallParams>("recall", RECALL_DESCRIPTION) }
+	RecallTool { runtime, spec: recall_spec() }
 }
 
 /// Creates the revisioned reflect leaf.
 pub fn reflect_tool<H: ReflectionHost>(runtime: Arc<MemoryRuntime>, host: H) -> ReflectTool<H> {
-	ReflectTool { runtime, host, spec: spec::<ReflectParams>("reflect", REFLECT_DESCRIPTION) }
+	ReflectTool { runtime, host, spec: reflect_spec() }
 }
 
 /// Creates the revisioned retain leaf.
 pub fn retain_tool(runtime: Arc<MemoryRuntime>) -> RetainTool {
-	RetainTool { runtime, spec: spec::<RetainParams>("retain", RETAIN_DESCRIPTION) }
+	RetainTool { runtime, spec: retain_spec() }
 }
 
 impl Tool for RecallTool {
@@ -392,7 +407,7 @@ impl Tool for RetainTool {
 	}
 }
 
-fn spec<P: JsonSchema>(name: &'static str, description: &'static str) -> ToolSpec {
+fn memory_spec<P: JsonSchema>(name: &'static str, description: &'static str) -> ToolSpec {
 	ToolSpec {
 		name:            Str::new_static(name),
 		rev:             Rev { family: Str::default(), n: 1 },

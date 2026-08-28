@@ -10,15 +10,17 @@ use std::{
 
 use bytes::Bytes;
 use flume::Receiver;
-use omp_core::{CowBytes, EnvPath, Str, encoding::hex, sf};
-use omp_env::{EnvClient, ExecEvent as ClientExecEvent, ExecRun as ClientExecRun};
-use omp_proto::env::{
-	v1,
-	v1::{
-		CloseSessionRequest, EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest,
-		OpenSessionRequest, OutputChannel as EnvOutputChannel, ProcessSpec, PtySpec, RestartPolicy,
-		RestartSpec, Script, ShellProfileInput, StartProcess,
+use omp_core::{CowBytes, Str, encoding::hex, sf};
+use omp_proto::{
+	env::{
+		v1,
+		v1::{
+			EnvironmentDelta, ExecOutcome as EnvExecOutcome, ExecRequest, OpenSessionRequest,
+			OutputChannel as EnvOutputChannel, ProcessSpec, PtySpec, RestartPolicy, RestartSpec,
+			Script, ShellProfileInput, StartProcess,
+		},
 	},
+	inference::v1::value,
 };
 use omp_tool::{BlobRef, JobOwner};
 use omp_tools::{
@@ -89,15 +91,14 @@ impl AcpExecSlot {
 	}
 
 	fn backend(&self) -> Option<Arc<dyn AcpExecBackend>> {
-		self.backend.read().clone()
+		tools::invocation_acp_exec().or_else(|| self.backend.read().clone())
 	}
 }
 
-/// Shell resource adapter backed by either the local execution authority or a
-/// retained remote Environment owner.
+/// Shell resource adapter backed by the local execution authority.
 #[derive(Clone)]
 pub struct ShellExecHost {
-	backend:            ShellBackend,
+	host:               ExecHost,
 	cwd_uri:            Str,
 	resolvers:          Arc<ResolverTable<UrlResolver>>,
 	settings:           ShellSettings,
@@ -106,11 +107,6 @@ pub struct ShellExecHost {
 	acp:                AcpExecSlot,
 	acp_routing:        bool,
 	acp_sessions:       Arc<Mutex<BTreeMap<Bytes, AcpSessionOptions>>>,
-}
-#[derive(Clone)]
-enum ShellBackend {
-	Local(ExecHost),
-	Remote(EnvClient),
 }
 #[derive(Clone)]
 struct AcpSessionOptions {
@@ -137,31 +133,7 @@ impl ShellExecHost {
 			host.configure_sandbox(&sandbox, &root);
 		}
 		Self {
-			backend: ShellBackend::Local(host),
-			cwd_uri,
-			resolvers,
-			settings,
-			sandbox,
-			acp,
-			acp_routing,
-			acp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
-		}
-	}
-
-	/// Binds shell execution to a retained Environment owner connection while
-	/// preserving this composition's URL resolvers, shell settings, and sandbox
-	/// policy.
-	pub(crate) fn new_remote(
-		client: EnvClient,
-		cwd_uri: Str,
-		resolvers: Arc<ResolverTable<UrlResolver>>,
-		settings: ShellSettings,
-		sandbox: SandboxSettings,
-		acp: AcpExecSlot,
-		acp_routing: bool,
-	) -> Self {
-		Self {
-			backend: ShellBackend::Remote(client),
+			host,
 			cwd_uri,
 			resolvers,
 			settings,
@@ -555,14 +527,6 @@ fn named_process(started: v1::ProcessStarted) -> DetachedJob {
 fn cwd_fault(message: impl Into<Str>) -> Fault {
 	Fault::Resource { operation: sf!("cwd"), message: message.into() }
 }
-fn env_path(cwd_uri: &str) -> Result<EnvPath, Fault> {
-	let path = Url::parse(cwd_uri)
-		.map_err(|error| cwd_fault(format!("working-directory URI is invalid: {error}")))?
-		.to_file_path()
-		.map_err(|()| cwd_fault("working-directory URI is not a local file URI"))?;
-	EnvPath::new(Str::from(path.to_string_lossy().as_ref()))
-		.map_err(|error| cwd_fault(format!("working-directory path is invalid: {error}")))
-}
 /// Foreground shell run retaining the concrete host's process-tree guard.
 pub(crate) struct HostShellRun {
 	host:            ExecHost,
@@ -685,58 +649,6 @@ impl ShellRun for HostShellRun {
 	}
 }
 
-struct RemoteShellRun {
-	client: EnvClient,
-	run:    tokio::sync::Mutex<Option<ClientExecRun>>,
-	exec:   Mutex<Option<Bytes>>,
-}
-
-impl ShellRun for RemoteShellRun {
-	async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
-		let mut run = self.run.lock().await;
-		let Some(run) = run.as_mut() else {
-			return Ok(None);
-		};
-		let event = run
-			.next_event()
-			.await
-			.map_err(|error| protocol_fault("run", sf!("{error}")))?;
-		if let Some(ClientExecEvent::Started(started)) = &event {
-			*self.exec.lock() = Some(started.exec.clone());
-		}
-		event.map(map_client_event).transpose()
-	}
-
-	async fn cancel(&self) -> Result<(), Fault> {
-		if let Some(run) = self.run.lock().await.as_ref() {
-			run.guard().cancel();
-		}
-		Ok(())
-	}
-
-	async fn detach(&self, name: Str) -> Result<DetachedJob, Fault> {
-		let exec = self.exec.lock().clone().ok_or_else(|| Fault::Resource {
-			operation: sf!("detach_running"),
-			message:   sf!("remote execution has not started"),
-		})?;
-		let run = self
-			.run
-			.lock()
-			.await
-			.take()
-			.ok_or_else(|| Fault::Resource {
-				operation: sf!("detach_running"),
-				message:   sf!("remote execution is no longer active"),
-			})?;
-		self
-			.client
-			.detach_exec(run, exec, name.to_string())
-			.await
-			.map(named_process)
-			.map_err(|error| protocol_fault("detach_running", sf!("{error}")))
-	}
-}
-
 /// Foreground run selected from the capability-advertised ACP backend or the
 /// normal Environment host.
 pub struct SelectedShellRun {
@@ -745,7 +657,6 @@ pub struct SelectedShellRun {
 
 enum SelectedShellRunKind {
 	Host(HostShellRun),
-	Remote(RemoteShellRun),
 	Acp(AcpExecRun),
 }
 
@@ -753,7 +664,6 @@ impl ShellRun for SelectedShellRun {
 	async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
 		match &mut self.kind {
 			SelectedShellRunKind::Host(run) => run.next_event().await,
-			SelectedShellRunKind::Remote(run) => run.next_event().await,
 			SelectedShellRunKind::Acp(run) => match run.events.recv_async().await {
 				Ok(event) => event.map(Some),
 				Err(_) => Ok(None),
@@ -767,7 +677,6 @@ impl ShellRun for SelectedShellRun {
 				run.run.cancel();
 				Ok(())
 			},
-			SelectedShellRunKind::Remote(run) => run.cancel().await,
 			SelectedShellRunKind::Acp(run) => {
 				run.cancel.cancel();
 				Ok(())
@@ -782,7 +691,6 @@ impl ShellRun for SelectedShellRun {
 				.detach_exec(run.run.id(), &name)
 				.map(named_process)
 				.map_err(|error| resource_fault("detach_running", error)),
-			SelectedShellRunKind::Remote(run) => run.detach(name).await,
 			SelectedShellRunKind::Acp(_) => Err(Fault::Resource {
 				operation: sf!("detach_running"),
 				message:   sf!("ACP terminal runs remain foreground-owned by the editor"),
@@ -834,17 +742,11 @@ impl ShellExec for ShellExecHost {
 			shell_profile: Some(self.shell_profile().await),
 			..Default::default()
 		};
-		let opened =
-			match &self.backend {
-				ShellBackend::Local(host) => host
-					.open_session(request)
-					.await
-					.map_err(|error| resource_fault("open_session", error))?,
-				ShellBackend::Remote(client) => client
-					.open_session(&env_path(&cwd_uri)?, request)
-					.await
-					.map_err(|error| protocol_fault("open_session", sf!("{error}")))?,
-			};
+		let opened = self
+			.host
+			.open_session(request)
+			.await
+			.map_err(|error| resource_fault("open_session", error))?;
 		Ok(Session { id: opened.session })
 	}
 
@@ -856,20 +758,11 @@ impl ShellExec for ShellExecHost {
 			if self.acp_sessions.lock().remove(&session.id).is_some() {
 				return Ok(());
 			}
-			match &self.backend {
-				ShellBackend::Local(host) => host
-					.close_session(&session.id)
-					.map(|_| ())
-					.map_err(|error| resource_fault("close_session", error)),
-				ShellBackend::Remote(client) => client
-					.close_session(CloseSessionRequest {
-						session: session.id.clone(),
-						..Default::default()
-					})
-					.await
-					.map(|_| ())
-					.map_err(|error| protocol_fault("close_session", sf!("{error}"))),
-			}
+			self
+				.host
+				.close_session(&session.id)
+				.map(|_| ())
+				.map_err(|error| resource_fault("close_session", error))
 		}
 	}
 
@@ -922,35 +815,19 @@ impl ShellExec for ShellExecHost {
 			..Default::default()
 		};
 		super::exec::set_run_environment(&mut exec_request, environment);
-		match &self.backend {
-			ShellBackend::Local(host) => {
-				let (_, run) = host
-					.exec(exec_request.clone(), request.timeout_ms.map(Duration::from_millis))
-					.await
-					.map_err(|error| resource_fault("run", error))?;
-				Ok(SelectedShellRun {
-					kind: SelectedShellRunKind::Host(HostShellRun::new(
-						host.clone(),
-						run,
-						exec_request,
-						request.timeout_ms.map(Duration::from_millis),
-					)),
-				})
-			},
-			ShellBackend::Remote(client) => {
-				let run = client
-					.exec(exec_request)
-					.await
-					.map_err(|error| protocol_fault("run", sf!("{error}")))?;
-				Ok(SelectedShellRun {
-					kind: SelectedShellRunKind::Remote(RemoteShellRun {
-						client: client.clone(),
-						run:    tokio::sync::Mutex::new(Some(run)),
-						exec:   Mutex::new(None),
-					}),
-				})
-			},
-		}
+		let (_, run) = self
+			.host
+			.exec(exec_request.clone(), request.timeout_ms.map(Duration::from_millis))
+			.await
+			.map_err(|error| resource_fault("run", error))?;
+		Ok(SelectedShellRun {
+			kind: SelectedShellRunKind::Host(HostShellRun::new(
+				self.host.clone(),
+				run,
+				exec_request,
+				request.timeout_ms.map(Duration::from_millis),
+			)),
+		})
 	}
 
 	async fn detach(&self, request: DetachRequest) -> Result<DetachedJob, Fault> {
@@ -985,29 +862,16 @@ impl ShellExec for ShellExecHost {
 			}),
 			..Default::default()
 		};
-		let started = match &self.backend {
-			ShellBackend::Local(host) => host
-				.start_process(start)
-				.await
-				.map_err(|error| resource_fault("detach", error))?,
-			ShellBackend::Remote(client) => client
-				.start_process(&env_path(&cwd_uri)?, start)
-				.await
-				.map_err(|error| protocol_fault("detach", sf!("{error}")))?,
-		};
+		let started = self
+			.host
+			.start_process(start)
+			.await
+			.map_err(|error| resource_fault("detach", error))?;
 		Ok(named_process(started))
 	}
 }
 
-fn map_client_event(event: ClientExecEvent) -> Result<RunEvent, Fault> {
-	match event {
-		ClientExecEvent::Started(started) => map_event(ExecEvent::Started { exec_id: started.exec }),
-		ClientExecEvent::Output(output) => map_event(ExecEvent::Output(output)),
-		ClientExecEvent::Exit(exit) => map_event(ExecEvent::Exit(exit)),
-	}
-}
-
-fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
+pub(crate) fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 	match event {
 		ExecEvent::Started { exec_id } => Ok(RunEvent::Started { exec_id }),
 		ExecEvent::Output(frame) => {
@@ -1027,8 +891,9 @@ fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 				data: CowBytes::owned(frame.data),
 				sequence: frame.sequence,
 				exec_id: frame.exec,
-				started: false,
-				terminal: channel == OutputChannel::Pty,
+				started: wire_bool(&frame.props, "acp/started").unwrap_or(false),
+				terminal: wire_bool(&frame.props, "acp/terminal")
+					.unwrap_or(channel == OutputChannel::Pty),
 			}))
 		},
 		ExecEvent::Exit(event) => {
@@ -1061,12 +926,19 @@ fn map_event(event: ExecEvent) -> Result<RunEvent, Fault> {
 				wall_clock_ms: status.wall_clock_ms,
 				spilled_output,
 				aborted: status.aborted,
-				effects_unknown: false,
+				effects_unknown: wire_bool(&status.props, "acp/effects-unknown").unwrap_or(false),
 				final_cwd_uri: (!event.final_cwd_uri.is_empty())
 					.then(|| Str::from(event.final_cwd_uri)),
 				final_cwd_revision: event.final_cwd_revision,
 			}))
 		},
+	}
+}
+
+fn wire_bool(props: &Option<omp_proto::inference::v1::ValueMap>, key: &str) -> Option<bool> {
+	match props.as_ref()?.fields.get(key)?.kind.as_ref()? {
+		value::Kind::Bool(value) => Some(*value),
+		_ => None,
 	}
 }
 

@@ -122,6 +122,7 @@ impl NativeLspSupervisor {
 			.to_file_path()
 			.unwrap_or_else(|()| PathBuf::from("/"));
 		let roster = discover_roster(&root, user_config_root)?;
+		tracing::info!(server_count = roster.len(), "LSP roster discovered");
 		let (pending, _) = watch::channel(0_usize);
 		Ok(Self {
 			inner: Arc::new(SupervisorInner {
@@ -161,6 +162,7 @@ impl NativeLspSupervisor {
 	///
 	/// # Errors
 	/// Returns configuration read, parse, or validation failures.
+	#[tracing::instrument(name = "lsp_roster_reload", level = "debug", skip_all)]
 	pub fn reload(&self) -> Result<(), LspConfigError> {
 		let fresh = discover_roster(&self.inner.root, self.inner.user_root.as_deref())?;
 		let mut roster = self.inner.roster.lock();
@@ -177,6 +179,9 @@ impl NativeLspSupervisor {
 				},
 			}
 		}
+		let server_count = roster.len();
+		drop(roster);
+		tracing::info!(server_count, "LSP roster reloaded");
 		Ok(())
 	}
 
@@ -238,6 +243,7 @@ impl NativeLspSupervisor {
 
 	/// Cancels in-flight starts and shuts down every pooled process, removing
 	/// registry bindings gracefully where possible.
+	#[tracing::instrument(name = "lsp_roster_shutdown", level = "debug", skip_all)]
 	pub async fn shutdown(&self) {
 		self.inner.cancel.cancel();
 		let keys: Vec<LspPoolKey> = {
@@ -251,9 +257,16 @@ impl NativeLspSupervisor {
 			if let Some(process) = self.inner.pool.evict(&key)
 				&& let Ok(process) = Arc::try_unwrap(process)
 			{
-				let _ = process.shutdown().await;
+				if let Err(error) = process.shutdown().await {
+					tracing::warn!(
+						server = %key.server,
+						%error,
+						"LSP server shutdown failed"
+					);
+				}
 			}
 		}
+		tracing::info!("LSP roster stopped");
 	}
 
 	/// Marks one available server as starting and spawns its startup task.
@@ -280,6 +293,12 @@ impl NativeLspSupervisor {
 		});
 	}
 
+	#[tracing::instrument(
+		name = "lsp_server_start",
+		level = "debug",
+		skip_all,
+		fields(server = %name)
+	)]
 	async fn run_start(&self, name: &Str) {
 		let Some(environment) = self.inner.environment.upgrade() else {
 			return;
@@ -308,10 +327,12 @@ impl NativeLspSupervisor {
 					.await;
 				self.set_state(name, LspServerState::Ready, None);
 				self.publish(name, LspStartupStage::Ready);
+				tracing::info!(server = %name, "LSP server ready");
 			},
 			Err(error) => {
 				self.set_state(name, LspServerState::Failed, Some(Str::from(error.to_string())));
 				self.publish(name, LspStartupStage::Failed);
+				tracing::warn!(server = %name, %error, "LSP server failed to start");
 			},
 		}
 	}

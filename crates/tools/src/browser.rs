@@ -168,37 +168,39 @@ pub struct Browser {
 	spec: ToolSpec,
 }
 
+/// Builds the host-free `browser@1` declaration.
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("browser"),
+		rev:             Rev { family: Str::default(), n: 1 },
+		description:     sf!(
+			"Controls named tabs through the supervised embedded browser daemon. Use open before run \
+			 and close when finished."
+		),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects {
+			documents: None,
+			exec:      Some(ExecEffects { commands: Arc::default(), network: true }),
+			inference: None,
+			desktop:   None,
+			subagents: 0,
+		},
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("browser.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Creates `browser@1`.
 pub fn tool(host: Arc<dyn BrowserHost>) -> Browser {
-	Browser {
-		host,
-		spec: ToolSpec {
-			name:            sf!("browser"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(
-				"Controls named tabs through the supervised embedded browser daemon. Use open before \
-				 run and close when finished."
-			),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects {
-				documents: None,
-				exec:      Some(ExecEffects { commands: Arc::default(), network: true }),
-				inference: None,
-				desktop:   None,
-				subagents: 0,
-			},
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("browser.rs"),
-			)
-			.into(),
-		},
-	}
+	Browser { host, spec: spec() }
 }
 
 impl Tool for Browser {
