@@ -56,7 +56,7 @@ mod trap;
 mod true_;
 mod type_;
 #[cfg(unix)]
-mod ulimit;
+pub(crate) mod ulimit;
 #[cfg(unix)]
 mod umask;
 mod unalias;

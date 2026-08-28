@@ -8,11 +8,15 @@ use clap::Parser;
 use tokio::process;
 
 use crate::{
-	Error, ErrorKind, ExecutionContext, ExecutionExitCode, ExecutionResult, ShellExtensions,
-	builtins, builtins::command::CommandCommand, commands,
+	Error, ErrorKind, ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
+	ShellExtensions, builtins, builtins::command::CommandCommand, commands,
 };
 
 /// Exec the provided command.
+///
+/// In a protected embedded host, unlike bash, `exec` spawns the command and
+/// exits only this shell after the child completes; it never replaces the
+/// embedding process image.
 #[derive(Parser)]
 pub(crate) struct ExecCommand {
 	/// Pass given name as zeroth argument to command.
@@ -50,17 +54,20 @@ impl builtins::Command for ExecCommand {
 			return Ok(ExecutionResult::success());
 		}
 
-		// If we know we're already running in a subshell, then `exec`ing is actually
-		// unsafe, since it would also replace the *parent* shell instance. We instead
-		// delegate to the `command` builtin to perform the execution, with an
-		// expectation of returning.
+		// A protected root shell must preserve the embedding process, so it always
+		// launches a child and exits after that child completes.
+		if context.params.protect_host_process() && !context.shell.is_subshell() {
+			return self.execute_external_in_subshell(context).await;
+		}
+
+		// A cloned subshell cannot safely replace its parent. Preserve the existing
+		// builtin delegation for the simple form, and spawn directly for exec flags.
 		if context.shell.is_subshell() {
 			if self.empty_environment || self.exec_as_login || self.name_for_argv0.is_some() {
 				return self.execute_external_in_subshell(context).await;
 			}
 
 			let cmd_cmd = CommandCommand { command_and_args: self.args.clone(), ..Default::default() };
-
 			return cmd_cmd.execute(context).await;
 		}
 
@@ -124,20 +131,27 @@ impl ExecCommand {
 				return Err(ErrorKind::from(spawn_err).into());
 			},
 		};
+		if let Some(observer) = context.params.spawn_observer()
+			&& let Some(pid) = child.id()
+			&& let Ok(pid) = i32::try_from(pid)
+		{
+			observer.on_spawn(pid, None);
+		}
 
 		let status = child.wait().await?;
-
-		if let Some(code) = status.code() {
+		let mut result = if let Some(code) = status.code() {
 			#[expect(clippy::cast_sign_loss, reason = "exit status is masked to one byte")]
-			return Ok(ExecutionResult::new((code & 0xff) as u8));
-		}
-
-		if let Some(signal) = status.signal() {
+			ExecutionResult::new((code & 0xff) as u8)
+		} else if let Some(signal) = status.signal() {
 			#[expect(clippy::cast_sign_loss, reason = "signal status is masked to one byte")]
-			return Ok(ExecutionResult::new((signal & 0xff) as u8 + 128));
+			ExecutionResult::new((signal & 0xff) as u8 + 128)
+		} else {
+			tracing::error!("unhandled process exit");
+			ExecutionExitCode::NotFound.into()
+		};
+		if context.params.protect_host_process() && !context.shell.is_subshell() {
+			result.next_control_flow = ExecutionControlFlow::ExitShell;
 		}
-
-		tracing::error!("unhandled process exit");
-		Ok(ExecutionExitCode::NotFound.into())
+		Ok(result)
 	}
 }

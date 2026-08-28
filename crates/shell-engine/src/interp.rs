@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
 	collections::VecDeque,
 	ffi::{OsStr, OsString},
@@ -114,6 +116,25 @@ pub trait SpawnWrapper: Send + Sync {
 	/// Returns whether an exported environment variable may reach external
 	/// children.
 	fn env_allowed(&self, key: &str) -> bool;
+	/// Applies this wrapper's complete environment policy to a child
+	/// environment.
+	///
+	/// Implementations with explicit overrides should filter and update `env` in
+	/// place. The default preserves the legacy include/deny behavior expressed
+	/// by [`SpawnWrapper::env_allowed`].
+	fn resolve_env(&self, env: &mut Vec<(OsString, OsString)>) {
+		env.retain(|(key, _)| key.to_str().is_some_and(|key| self.env_allowed(key)));
+	}
+}
+/// Scopes process-directed authority (signals, observation, and process
+/// metadata) for one execution.
+pub trait ProcessScope: Send + Sync {
+	/// Returns whether this execution may deliver signals to `pid`.
+	fn may_signal(&self, pid: i32) -> bool;
+
+	/// Returns whether `pid` may appear in listings or have its process metadata
+	/// read.
+	fn may_observe(&self, pid: i32) -> bool;
 }
 
 /// Parameters for execution.
@@ -144,6 +165,11 @@ pub struct ExecutionParameters {
 	path_policy:              Option<Arc<dyn PathPolicy>>,
 	/// Optional launcher and environment policy for external commands.
 	spawn_wrapper:            Option<Arc<dyn SpawnWrapper>>,
+	/// Optional process-directed authority for this execution.
+	process_scope:            Option<Arc<dyn ProcessScope>>,
+	/// Whether builtins must preserve the embedding process's image and global
+	/// state.
+	protect_host_process:     bool,
 }
 
 impl ExecutionParameters {
@@ -212,6 +238,28 @@ impl ExecutionParameters {
 	/// Returns the active external-command spawn wrapper, if any.
 	pub fn spawn_wrapper(&self) -> Option<&Arc<dyn SpawnWrapper>> {
 		self.spawn_wrapper.as_ref()
+	}
+
+	/// Assigns process-directed authority for this execution.
+	pub fn set_process_scope(&mut self, scope: Arc<dyn ProcessScope>) {
+		self.process_scope = Some(scope);
+	}
+
+	/// Returns the active process-directed authority, if any.
+	pub fn process_scope(&self) -> Option<&Arc<dyn ProcessScope>> {
+		self.process_scope.as_ref()
+	}
+
+	/// Sets whether builtins must preserve the embedding process's image and
+	/// global state.
+	pub const fn set_protect_host_process(&mut self, protect: bool) {
+		self.protect_host_process = protect;
+	}
+
+	/// Returns whether builtins must preserve the embedding process's image and
+	/// global state.
+	pub const fn protect_host_process(&self) -> bool {
+		self.protect_host_process
 	}
 
 	/// Returns the standard input file; usable with `write!` et al.
@@ -2106,6 +2154,10 @@ pub(crate) async fn setup_redirect(
 					}
 
 					let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
+					#[cfg(unix)]
+					if params.protect_host_process() {
+						options.mode(0o666 & !shell.virtual_umask());
+					}
 
 					let opened_file = shell
 						.open_file(&options, &expanded_file_path, params)
@@ -2296,6 +2348,10 @@ fn setup_redirect_output_and_error_to(
 		.write(true)
 		.truncate(!append)
 		.append(append);
+	#[cfg(unix)]
+	if params.protect_host_process() {
+		file_options.mode(0o666 & !shell.virtual_umask());
+	}
 
 	let stdout_file = shell
 		.open_file(&file_options, &abs_file_path, params)

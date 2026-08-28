@@ -2,7 +2,7 @@
 
 use std::{
 	borrow::Cow,
-	ffi::OsStr,
+	ffi::{OsStr, OsString},
 	fmt::{self, Display},
 	io::{self, Write},
 	iter, ops,
@@ -228,30 +228,43 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 	// Start with a clear environment.
 	cmd.env_clear();
 
-	// Add in exported variables.
+	// Add exported variables and functions. A wrapper receives the complete
+	// candidate environment once so explicit overrides are applied last.
 	if !empty_env {
-		for (k, v) in context.shell.env().iter_exported() {
-			// NOTE: To match bash behavior, we only include exported variables
-			// that are set (i.e., have a value). This means a variable that
-			// shows up in `declare -p` but has no *set* value will be omitted.
-			if v.value().is_set() && wrapper.is_none_or(|w| w.env_allowed(k.as_str())) {
-				cmd.env(k.as_str(), v.value().to_cow_str(context.shell).as_ref());
+		if let Some(wrapper) = wrapper {
+			let mut child_env = Vec::new();
+			for (key, variable) in context.shell.env().iter_exported() {
+				if variable.value().is_set() {
+					child_env.push((
+						OsString::from(key.as_str()),
+						variable.value().to_cow_str(context.shell).as_ref().into(),
+					));
+				}
 			}
-		}
-		// Set _ to the resolved command path for external commands.
-		if wrapper.is_none_or(|w| w.env_allowed("_")) {
+			child_env.push((OsString::from("_"), OsString::from(command_name)));
+			for (func_name, registration) in context.shell.funcs().iter() {
+				if registration.is_exported() {
+					child_env.push((
+						OsString::from(std::format!("BASH_FUNC_{func_name}%%")),
+						OsString::from(std::format!("() {}", registration.definition().body)),
+					));
+				}
+			}
+			wrapper.resolve_env(&mut child_env);
+			cmd.envs(child_env);
+		} else {
+			for (key, variable) in context.shell.env().iter_exported() {
+				if variable.value().is_set() {
+					cmd.env(key.as_str(), variable.value().to_cow_str(context.shell).as_ref());
+				}
+			}
 			cmd.env("_", command_name);
-		}
-	}
-
-	// Add in exported functions.
-	if !empty_env {
-		for (func_name, registration) in context.shell.funcs().iter() {
-			if registration.is_exported() {
-				let var_name = std::format!("BASH_FUNC_{func_name}%%");
-				let value = std::format!("() {}", registration.definition().body);
-				if wrapper.is_none_or(|w| w.env_allowed(&var_name)) {
-					cmd.env(var_name, value);
+			for (func_name, registration) in context.shell.funcs().iter() {
+				if registration.is_exported() {
+					cmd.env(
+						std::format!("BASH_FUNC_{func_name}%%"),
+						std::format!("() {}", registration.definition().body),
+					);
 				}
 			}
 		}
@@ -289,6 +302,19 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 		*fd != OpenFiles::STDIN_FD && *fd != OpenFiles::STDOUT_FD && *fd != OpenFiles::STDERR_FD
 	});
 	cmd.inject_fds(other_files)?;
+	#[cfg(unix)]
+	if context.params.protect_host_process() {
+		builtins::ulimit::apply_virtual_limits(context.shell, &mut cmd);
+		let mask = context.shell.virtual_umask();
+		let mask = libc::mode_t::try_from(mask).expect("shell umask fits mode_t");
+		// SAFETY: umask is async-signal-safe and runs in the child after fork.
+		unsafe {
+			cmd.pre_exec(move || {
+				libc::umask(mask);
+				Ok(())
+			});
+		}
+	}
 
 	Ok(cmd)
 }

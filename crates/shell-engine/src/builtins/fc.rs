@@ -120,7 +120,7 @@ impl FcCommand {
 
 		let editor = self.editor_name(&context);
 		if editor.as_deref() != Some("-") {
-			let temp_file = FcTempFile::create()?;
+			let temp_file = FcTempFile::create(context.params.path_policy())?;
 			fs::write(temp_file.path(), commands)?;
 
 			let edit_cmd =
@@ -388,12 +388,17 @@ struct FcTempFile {
 }
 
 impl FcTempFile {
-	fn create() -> Result<Self, crate::Error> {
+	fn create(
+		path_policy: Option<&std::sync::Arc<dyn crate::PathPolicy>>,
+	) -> Result<Self, crate::Error> {
 		let temp_dir = std::env::temp_dir();
 		let process_id = std::process::id();
 
 		for attempt in 0_u32..100 {
 			let path = temp_dir.join(format!("brush-fc-{process_id}-{attempt}.sh"));
+			if let Some(policy) = path_policy {
+				policy.check_write(&path)?;
+			}
 			match OpenOptions::new().write(true).create_new(true).open(&path) {
 				Ok(_) => return Ok(Self { path }),
 				Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
@@ -442,6 +447,14 @@ fn effective_history_count(history: &history::History) -> usize {
 mod tests {
 	use super::*;
 
+	struct DenyWrites;
+
+	impl crate::PathPolicy for DenyWrites {
+		fn check_write(&self, path: &Path) -> Result<(), crate::WriteDenied> {
+			Err(crate::WriteDenied { path: path.to_path_buf() })
+		}
+	}
+
 	fn sample_history() -> history::History {
 		let mut history = history::History::default();
 		for command in ["echo one", "pwd", "echo two", "fc -l"] {
@@ -462,5 +475,10 @@ mod tests {
 	#[test]
 	fn quotes_editor_paths_containing_single_quotes() {
 		assert_eq!(shell_quote_path(Path::new("a'b")), "'a'\\''b'");
+	}
+	#[test]
+	fn temp_script_creation_obeys_path_policy() {
+		let policy: std::sync::Arc<dyn crate::PathPolicy> = std::sync::Arc::new(DenyWrites);
+		assert!(FcTempFile::create(Some(&policy)).is_err());
 	}
 }

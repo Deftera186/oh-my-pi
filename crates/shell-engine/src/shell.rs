@@ -147,7 +147,12 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
 	key_bindings: Option<KeyBindingsHelper>,
 
 	/// Command history, when history is enabled.
-	history: Option<crate::history::History>,
+	history:       Option<crate::history::History>,
+	/// Shell-local umask used when host-process protection is active.
+	virtual_umask: u32,
+
+	/// Shell-local resource limits keyed by the `ulimit` option letter.
+	virtual_resource_limits: Vec<(char, u64, u64)>,
 }
 
 impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
@@ -186,6 +191,8 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
 			parser_impl: self.parser_impl,
 			key_bindings: self.key_bindings.clone(),
 			history: self.history.clone(),
+			virtual_umask: self.virtual_umask,
+			virtual_resource_limits: self.virtual_resource_limits.clone(),
 			depth: self.depth + 1,
 		}
 	}
@@ -364,6 +371,34 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 	/// Returns whether or not this shell is a subshell.
 	pub fn is_subshell(&self) -> bool {
 		self.depth > 0
+	}
+
+	pub(crate) const fn virtual_umask(&self) -> u32 {
+		self.virtual_umask
+	}
+
+	pub(crate) const fn set_virtual_umask(&mut self, mask: u32) {
+		self.virtual_umask = mask;
+	}
+
+	pub(crate) fn virtual_resource_limit(&self, key: char) -> Option<(u64, u64)> {
+		self
+			.virtual_resource_limits
+			.iter()
+			.find_map(|(candidate, soft, hard)| (*candidate == key).then_some((*soft, *hard)))
+	}
+
+	pub(crate) fn set_virtual_resource_limit(&mut self, key: char, soft: u64, hard: u64) {
+		if let Some((_, current_soft, current_hard)) = self
+			.virtual_resource_limits
+			.iter_mut()
+			.find(|(candidate, ..)| *candidate == key)
+		{
+			*current_soft = soft;
+			*current_hard = hard;
+		} else {
+			self.virtual_resource_limits.push((key, soft, hard));
+		}
 	}
 
 	/// Returns the last "SECONDS" captured time.

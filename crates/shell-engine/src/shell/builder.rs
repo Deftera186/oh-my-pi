@@ -269,6 +269,8 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
 			parser_impl: ParserImpl::default(),
 			key_bindings: None,
 			history: None,
+			virtual_umask: 0o022,
+			virtual_resource_limits: Vec::new(),
 		}
 	}
 }

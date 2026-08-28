@@ -19,6 +19,9 @@ impl builtins::Command for SuspendCommand {
 		&self,
 		context: crate::ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
+		if context.params.protect_host_process() {
+			return Err(crate::ErrorKind::SuspendNotSupportedInShellHost.into());
+		}
 		if context.shell.options().login_shell && !self.force {
 			writeln!(context.stderr(), "login shell cannot be suspended")?;
 			return Ok(ExecutionExitCode::InvalidUsage.into());

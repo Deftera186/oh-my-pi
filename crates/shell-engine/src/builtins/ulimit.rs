@@ -1,6 +1,8 @@
 use std::{
 	io::{self, ErrorKind, Write},
 	mem,
+	os::unix::process::CommandExt,
+	process,
 	str::FromStr,
 };
 
@@ -10,7 +12,7 @@ use clap::{
 };
 use nix::{sys::resource, unistd::PathconfVar};
 
-use crate::{Error, ExecutionContext, ExecutionResult, ShellExtensions, builtins};
+use crate::{Error, ExecutionContext, ExecutionResult, Shell, ShellExtensions, builtins};
 
 #[derive(Clone, Copy)]
 enum Unit {
@@ -392,8 +394,19 @@ impl ResourceDescription {
 		unit:        Unit::KBytes,
 	};
 
-	fn get(&self, hard: bool) -> io::Result<String> {
-		let (soft_limit, hard_limit) = self.resource.get()?;
+	fn get(
+		&self,
+		shell: &Shell<impl ShellExtensions>,
+		protected: bool,
+		hard: bool,
+	) -> io::Result<String> {
+		let (soft_limit, hard_limit) = if protected {
+			shell
+				.virtual_resource_limit(self.short)
+				.map_or_else(|| self.resource.get(), Ok)?
+		} else {
+			self.resource.get()?
+		};
 		let val = if hard { hard_limit } else { soft_limit };
 
 		if val == resource::RLIM_INFINITY {
@@ -420,11 +433,40 @@ impl ResourceDescription {
 		}
 	}
 
+	fn set_virtual(
+		&self,
+		shell: &mut Shell<impl ShellExtensions>,
+		set_hard: bool,
+		value: LimitValue,
+	) -> io::Result<()> {
+		let (soft, hard) = shell
+			.virtual_resource_limit(self.short)
+			.map_or_else(|| self.resource.get(), Ok)?;
+		let value = match value {
+			LimitValue::Soft => soft,
+			LimitValue::Hard => hard,
+			LimitValue::Unlimited => resource::RLIM_INFINITY,
+			LimitValue::Value(value) => value * self.unit.scale(),
+			LimitValue::Unset => return Ok(()),
+		};
+		if matches!(self.resource, Resource::Virt(Virtual::Pipe)) {
+			return Err(io::Error::from(ErrorKind::Unsupported));
+		}
+		let (soft, hard) = if set_hard {
+			(soft, value)
+		} else {
+			(value, hard)
+		};
+		shell.set_virtual_resource_limit(self.short, soft, hard);
+		Ok(())
+	}
+
 	/// Print either soft or hard limit
 	fn print(
 		&self,
 		context: &ExecutionContext<'_, impl ShellExtensions>,
 		hard: bool,
+		protected: bool,
 	) -> io::Result<()> {
 		if !self.resource.is_supported() {
 			return Ok(());
@@ -438,7 +480,9 @@ impl ResourceDescription {
 			Unit::Number => format!("(-{})", self.short),
 			Unit::Seconds => format!("(seconds, -{})", self.short),
 		};
-		let resource = self.get(hard).unwrap_or_else(|e| format!("{e}"));
+		let resource = self
+			.get(context.shell, protected, hard)
+			.unwrap_or_else(|e| format!("{e}"));
 		writeln!(context.stdout(), "{:<26}{:>16} {}", self.description, unit, resource)
 	}
 
@@ -624,17 +668,79 @@ impl builtins::Command for ULimitCommand {
 		}
 
 		for (resource, value) in resources_to_set {
-			resource.set(self.hard, value)?;
+			if context.params.protect_host_process() {
+				resource.set_virtual(context.shell, self.hard, value)?;
+			} else {
+				resource.set(self.hard, value)?;
+			}
 		}
 
 		if resources_to_get.len() == 1 {
-			writeln!(context.stdout(), "{}", resources_to_get[0].get(self.hard)?)?;
+			writeln!(
+				context.stdout(),
+				"{}",
+				resources_to_get[0].get(
+					context.shell,
+					context.params.protect_host_process(),
+					self.hard,
+				)?
+			)?;
 		} else {
 			for resource in resources_to_get {
-				resource.print(&context, self.hard)?;
+				resource.print(&context, self.hard, context.params.protect_host_process())?;
 			}
 		}
 
 		Ok(exit_code)
 	}
 }
+pub(crate) fn apply_virtual_limits(
+	shell: &Shell<impl ShellExtensions>,
+	command: &mut process::Command,
+) {
+	let limits: Vec<_> = RESOURCE_DESCRIPTIONS
+		.iter()
+		.filter_map(|description| {
+			shell
+				.virtual_resource_limit(description.short)
+				.map(|(soft, hard)| (description.resource, soft, hard))
+		})
+		.collect();
+	if limits.is_empty() {
+		return;
+	}
+	// SAFETY: setrlimit is async-signal-safe and each resource was validated when
+	// the shell-local value was set.
+	unsafe {
+		command.pre_exec(move || {
+			for (resource, soft, hard) in &limits {
+				resource.set(*soft, *hard)?;
+			}
+			Ok(())
+		});
+	}
+}
+
+const RESOURCE_DESCRIPTIONS: [ResourceDescription; 21] = [
+	ResourceDescription::SBSIZE,
+	ResourceDescription::CORE,
+	ResourceDescription::DATA,
+	ResourceDescription::FSIZE,
+	ResourceDescription::SIGPENDING,
+	ResourceDescription::KQUEUES,
+	ResourceDescription::MEMLOCK,
+	ResourceDescription::RSS,
+	ResourceDescription::LOCKS,
+	ResourceDescription::NOFILE,
+	ResourceDescription::PIPE,
+	ResourceDescription::NPTS,
+	ResourceDescription::NICE,
+	ResourceDescription::MSGQUEUE,
+	ResourceDescription::RTPRIO,
+	ResourceDescription::RTTIME,
+	ResourceDescription::STACK,
+	ResourceDescription::THREADS,
+	ResourceDescription::CPU,
+	ResourceDescription::NPROC,
+	ResourceDescription::VMEM,
+];

@@ -31,17 +31,34 @@ impl builtins::Command for UmaskCommand {
 		&self,
 		context: ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
+		let protected = context.params.protect_host_process();
 		if let Some(mode) = &self.mode {
 			if mode.starts_with(|c: char| c.is_digit(8)) {
 				let parsed = parse(mode.as_str(), 8)?;
-				set_umask(parsed)?;
+				if protected {
+					context.shell.set_virtual_umask(u32::from(parsed));
+				} else {
+					set_umask(parsed)?;
+				}
 			} else {
-				let current_umask = get_umask()?;
+				let current_umask = if protected {
+					context.shell.virtual_umask()
+				} else {
+					get_umask()?
+				};
 				let parsed = parse_symbolic_umask(mode, current_umask)?;
-				set_umask(parsed)?;
+				if protected {
+					context.shell.set_virtual_umask(u32::from(parsed));
+				} else {
+					set_umask(parsed)?;
+				}
 			}
 		} else {
-			let umask = get_umask()?;
+			let umask = if protected {
+				context.shell.virtual_umask()
+			} else {
+				get_umask()?
+			};
 
 			let formatted = if self.symbolic_output {
 				let u = symbolic_mask_from_bits((!umask & 0o700) >> 6);

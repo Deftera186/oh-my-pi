@@ -132,11 +132,17 @@ impl builtins::Command for KillCommand {
 			return Ok(ExecutionExitCode::InvalidUsage.into());
 		}
 
-		let protected = matches!(signal, KillSignal::Signal(_)).then(ProtectedProcesses::resolve);
+		let protected = (context.params.process_scope().is_none()
+			&& matches!(signal, KillSignal::Signal(_)))
+		.then(ProtectedProcesses::resolve);
 		let blocks = |target| {
 			protected
 				.as_ref()
 				.is_some_and(|protected| protected.blocks_target(target))
+				|| context
+					.params
+					.process_scope()
+					.is_some_and(|scope| !scope.may_signal(target))
 		};
 
 		#[cfg(unix)]
@@ -161,6 +167,20 @@ impl builtins::Command for KillCommand {
 						continue;
 					},
 				};
+				if context
+					.params
+					.process_scope()
+					.is_some_and(|scope| job.process_ids().any(|pid| !scope.may_signal(pid)))
+				{
+					writeln!(
+						context.stderr(),
+						"{}: {}: signalling is outside this shell's process scope",
+						context.command_name,
+						operand
+					)?;
+					had_failure = true;
+					continue;
+				}
 				#[cfg(unix)]
 				{
 					let mut targets: Vec<i32> = job

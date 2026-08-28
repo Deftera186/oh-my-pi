@@ -239,6 +239,9 @@ pub enum ErrorKind {
 	/// An invalid umask was provided.
 	#[error("invalid umask value")]
 	InvalidUmask,
+	/// Suspending an embedded protected shell would stop its host process.
+	#[error("suspend: not supported in this shell host")]
+	SuspendNotSupportedInShellHost,
 
 	/// The given open file cannot be read from.
 	#[error("cannot read from {0}")]
