@@ -533,7 +533,7 @@ const fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use omp_core::{Str, sf};
-	use omp_tool::{Effects, MountedDevice, Rev, ToolRoute, ToolsPolicy};
+	use omp_tool::{Effects, MountedDevice, Precedence, Rev, ToolRoute, ToolsPolicy};
 
 	use super::{
 		AUTO_QA_PROMPT_GUIDANCE, CatalogQuery, DOCS_TOTAL_BUDGET, DocsMode, EXTERNAL_SUMMARY_CAP,
@@ -554,11 +554,13 @@ mod tests {
 			name,
 			rev,
 			claimant,
+			precedence: Precedence::DEFAULT,
 			summary,
 			schema: br#"{"type":"object"}"#,
 			effects,
 			docs,
 			route,
+			metadata: None,
 		}
 	}
 
