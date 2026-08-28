@@ -61,6 +61,13 @@ class RecordingControl:
                          "omp.agents.set_continuation_policy", "omp.agents.schedule.pause",
                          "omp.agents.schedule.resume", "omp.agents.schedule.delete"):
             return None
+        if operation in ("omp.agents.abort", "omp.agents.shutdown",
+                         "omp.agents.reload_extensions", "omp.agents.wait_for_idle"):
+            return None
+        if operation == "omp.agents.is_idle":
+            return True
+        if operation == "omp.agents.pending_messages":
+            return 3
         if operation == "omp.agents.result":
             return None
         if operation == "omp.agents.wait":
@@ -228,6 +235,35 @@ async def contract():
     assert await omp.agents.inbox() == [] and await omp.agents.wait_for() is None
     assert (await omp.agents.peers())[0].name == "Scout"
     assert await omp.agents.inject("wake") is omp.agents.Receipt.DELIVERED
+    await omp.agents.abort()
+    assert backend.calls[-1] == ("omp.agents.abort", {})
+    await omp.agents.shutdown(reason="maintenance")
+    assert backend.calls[-1] == (
+        "omp.agents.shutdown", {"reason": "maintenance"}
+    )
+    await omp.agents.reload_extensions()
+    assert backend.calls[-1] == ("omp.agents.reload_extensions", {})
+    assert await omp.agents.is_idle() is True
+    await omp.agents.wait_for_idle()
+    assert backend.calls[-1] == ("omp.agents.wait_for_idle", {})
+    assert await omp.agents.pending_messages() == 3
+    try:
+        await omp.agents.shutdown(reason=object())
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("shutdown reason must be a string")
+
+    for operation in ("abort", "shutdown", "reload_extensions"):
+        spec = omp.operation_spec(f"omp.agents.{operation}")
+        assert spec.minimum_phase == omp.InvocationPhase.EFFECTS_AUTHORIZED
+        expected = (omp.Durability.EPHEMERAL
+                    if operation == "reload_extensions" else omp.Durability.DURABLE)
+        assert spec.durability == expected
+    for operation in ("is_idle", "wait_for_idle", "pending_messages"):
+        spec = omp.operation_spec(f"omp.agents.{operation}")
+        assert spec.minimum_phase == omp.InvocationPhase.OPEN
+        assert spec.durability == omp.Durability.EPHEMERAL
 
     assert (await omp.agents.rewind_targets())[0].event == 7
     assert (await omp.agents.rewind(3)).head == 3

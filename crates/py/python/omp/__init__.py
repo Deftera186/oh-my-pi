@@ -15,6 +15,7 @@ import os as _os
 import re as _re
 from dataclasses import KW_ONLY as _KW_ONLY
 from dataclasses import dataclass as _dataclass
+from dataclasses import field as _dataclass_field
 from enum import StrEnum as _StrEnum
 from collections.abc import Callable as _Callable
 from collections.abc import Mapping as _Mapping
@@ -120,10 +121,14 @@ class Field:
         object.__setattr__(self, "coerce", coercions)
 
 
+@_dataclass(frozen=True, slots=True, kw_only=True)
 class Fault:
     """Marker base for a device's durable typed failure value."""
 
-    __slots__ = ()
+    terminate: bool = _dataclass_field(
+        default=False,
+        metadata={"omp_terminal_control": True},
+    )
 
     def __init_subclass__(cls, **kwargs: _Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -788,6 +793,7 @@ from .sessions import (
     SessionInfo,
     SessionKind,
     SessionLink,
+    SessionNode,
     SessionNotFound,
     SessionSetup,
     SessionStatus,
@@ -940,6 +946,8 @@ from .policy import (
 from .devices import (
     Availability,
     AvailabilityDelta,
+    ConstraintFallback,
+    ConstraintKind,
     Devices,
     Device,
     DeviceError,
@@ -955,6 +963,7 @@ from .devices import (
     Effects,
     Example,
     ExecEffects,
+    GrammarSyntax,
     InferenceEffects,
     MountSpec,
     PER_DEVICE_CAP,
@@ -963,6 +972,7 @@ from .devices import (
     Router,
     SchemaError,
     ToolPath,
+    ToolConstraint,
     devices,
     router,
 )
@@ -1135,6 +1145,8 @@ def device(
     tier: Tier = Tier.WRITE,
     deadline: Duration | None = None,
     aliases: _Mapping[str, str] | None = None,
+    constraint: ToolConstraint | None = None,
+    serial: bool = False,
 ) -> _Callable[[_Any], Device]:
     """Declare a device while deferring its availability predicate to FREEZE."""
     parsed_place = Place.parse(place)
@@ -1150,6 +1162,10 @@ def device(
         raise SchemaError("device schema must be a type, dict, or None")
     if available is not None and not callable(available):
         raise SchemaError("device available predicate must be callable")
+    if constraint is not None and not isinstance(constraint, ToolConstraint):
+        raise SchemaError("device constraint must be ToolConstraint or None")
+    if not isinstance(serial, bool):
+        raise TypeError("device serial must be bool")
 
     frozen_examples = tuple(examples)
     if any(not isinstance(example, Example) for example in frozen_examples):
@@ -1218,6 +1234,8 @@ def device(
             tier=tier,
             deadline=deadline,
             aliases=frozen_aliases,
+            constraint=constraint,
+            serial=serial,
             body=body,
         )
         try:
@@ -1243,12 +1261,18 @@ def tool(
     effects: Effects | None = None,
     tier: Tier | None = None,
     rev: int = 1,
+    constraint: ToolConstraint | None = None,
+    serial: bool = False,
 ) -> _Callable[[_Callable[..., _Any]], Device] | Device:
     """Declare an ergonomic host leaf on the existing device registry path."""
     if kind not in {"soft", "hard"}:
         raise ValueError("tool kind must be 'soft' or 'hard'")
     if not isinstance(rev, int) or isinstance(rev, bool):
         raise TypeError("tool rev must be int")
+    if constraint is not None and not isinstance(constraint, ToolConstraint):
+        raise SchemaError("tool constraint must be ToolConstraint or None")
+    if not isinstance(serial, bool):
+        raise TypeError("tool serial must be bool")
 
     def decorate(function: _Any) -> Device:
         tool_name = function.__name__ if name is None or callable(name) else name
@@ -1262,6 +1286,8 @@ def tool(
             rev=rev,
             effects=effects,
             tier=Tier.WRITE if tier is None else tier,
+            constraint=constraint,
+            serial=serial,
         )(function)
 
     if callable(name):
@@ -1453,6 +1479,8 @@ __all__ = (
     "AuthSpec",
     "Availability",
     "AvailabilityDelta",
+    "ConstraintFallback",
+    "ConstraintKind",
     "CacheRetention",
     "Cap",
     "CatalogAlias",
@@ -1488,6 +1516,7 @@ __all__ = (
     "HARD_SLOT_BUDGET",
     "Example",
     "ExecEffects",
+    "GrammarSyntax",
     "Effort",
     "Facet",
     "HostedTool",
@@ -1563,6 +1592,7 @@ __all__ = (
     "ToolFeature",
     "ToolSchemaFlavor",
     "ToolPath",
+    "ToolConstraint",
     "Transport",
     "TrustDomain",
     "UnknownCapabilityPolicy",

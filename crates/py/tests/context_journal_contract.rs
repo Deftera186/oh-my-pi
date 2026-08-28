@@ -92,6 +92,8 @@ row = {
 class Backend:
     def __init__(self):
         self.calls = []
+        self.label = None
+        self.next_label_index = 17
 
     async def request(self, operation, arguments):
         # Every domain arm must remain valid on the JSON CONTROL transport.
@@ -158,9 +160,14 @@ class Backend:
         if operation == "omp.journal.latest":
             return {"schema": "omp.journal.latest.v1", "result": row}
         if operation == "omp.journal.label":
+            self.label = arguments["label"]
+            index = self.next_label_index
+            self.next_label_index += 1
             return {"schema": "omp.journal.label.v1", "result": {
-                "session": "session-1", "index": 17,
+                "session": "session-1", "index": index,
             }}
+        if operation == "omp.journal.label_of":
+            return {"schema": "omp.journal.label_of.v1", "result": self.label}
         raise AssertionError(operation)
 
 
@@ -217,6 +224,9 @@ async def exercise():
         )
         assert total == 2 and watermark.index == 12
         assert (await omp.journal.label(appended, "memory")).index == 17
+        assert await omp.journal.label_of(appended) == "memory"
+        assert (await omp.journal.label(appended, None)).index == 18
+        assert await omp.journal.label_of(appended) is None
 
         async with omp.context.lane(strict_epoch=True):
             await omp.journal.append(

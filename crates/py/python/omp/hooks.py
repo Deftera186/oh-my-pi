@@ -374,7 +374,9 @@ _DOMAIN_EVENTS = frozenset(
         "agent_settled",
         "compaction",
         "models_discover",
+        "provider_login",
         "provider_refresh",
+        "provider_sign",
         "provider_error",
         "provider_usage",
         "search_parse",
@@ -864,6 +866,9 @@ def _decision_from_wire(value: object) -> HookDecision:
 
 
 def _wire_value(value: object) -> object:
+    if isinstance(value, Secret):
+        with value.use() as revealed:
+            return bytes(revealed)
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, float) and not math.isfinite(value):
@@ -954,6 +959,12 @@ def _value_from_wire(annotation: object, value: object) -> object:
         if not isinstance(value, bytes):
             raise HookContractError("hook secret field must use the sealed bytes envelope")
         return Secret(value)
+    if (
+        isinstance(annotation, type)
+        and annotation.__name__ == "LoginUi"
+        and annotation.__module__ == "omp.provider"
+    ):
+        return annotation()
     if isinstance(annotation, type) and is_dataclass(annotation):
         if not isinstance(value, Mapping):
             raise HookContractError(

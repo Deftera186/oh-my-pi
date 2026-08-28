@@ -76,6 +76,15 @@ registry_module.configure_manifest(
             "api": 1,
             "failure": "fault",
         },
+        {
+            "id": "contract-renderer",
+            "kind": "verdict_renderer",
+            "module": "__main__",
+            "key": "contract_device@wire.7",
+            "trigger": "lazy",
+            "api": 1,
+            "failure": "fail-open",
+        },
     ),
 )
 skill_evaluations = 0
@@ -146,9 +155,37 @@ async def contract_device(args, ctx):
     return {"details": {"value": args["value"], "has_context": ctx is marker}}
 
 
-@omp.tool("contract_tool", kind="hard", rev=3)
-async def contract_tool(count: int, ctx: omp.Context) -> dict[str, int]:
-    return {"details": {"count": count}}
+@omp.tool(
+    "contract_tool",
+    kind="hard",
+    rev=3,
+    constraint=omp.ToolConstraint.grammar(
+        omp.GrammarSyntax.REGEX,
+        r"[0-9]+",
+        priority=77,
+        on_unsupported=omp.ConstraintFallback.ERROR,
+    ),
+    serial=True,
+)
+async def contract_tool(count: int, ctx: omp.Context):
+    ctx.update({"count": count})
+    yield omp.Update({"streamed": count})
+    yield omp.Done({"details": {"count": count}})
+
+
+def reduce_contract_renderer(acc, update):
+    return (acc or 0) + update["value"]
+
+
+@omp.renderer(
+    "contract_device",
+    family="wire",
+    rev=7,
+    reduce=reduce_contract_renderer,
+    decorates=True,
+)
+def render_contract_device(view, ctx):
+    return omp.ui.text(str(view.state))
 
 
 @omp.service("acme.contract", rev=2)
@@ -157,7 +194,15 @@ class ContractService:
         return {"value": value}
 
 
-marker = object()
+class Marker:
+    def __init__(self):
+        self.updates = []
+
+    def update(self, value):
+        self.updates.append(value)
+
+
+marker = Marker()
 snapshot = registry_module.freeze_declarations()
 tools, metadata_json = registry_module.project_worker_registry()
 assert skill_evaluations == 1
@@ -190,6 +235,13 @@ assert device_row.schema["properties"]["value"] == {"type": "integer"}
 assert device_row.strict is None
 assert tool_row.kind == "hard"
 assert tool_row.strict is True
+assert tool_row.serial is True
+assert tool_row.constraint == omp.ToolConstraint.grammar(
+    omp.GrammarSyntax.REGEX,
+    r"[0-9]+",
+    priority=77,
+    on_unsupported=omp.ConstraintFallback.ERROR,
+)
 assert tool_row.schema == {
     "type": "object",
     "properties": {"count": {"type": "integer"}},
@@ -200,8 +252,10 @@ assert asyncio.run(device_row.handler({"value": 11}, marker)) == {
     "details": {"value": 11, "has_context": True}
 }
 assert asyncio.run(tool_row.handler({"count": 4}, marker)) == {
+    "updates": [{"streamed": 4}],
     "details": {"count": 4}
 }
+assert marker.updates == [{"count": 4}]
 
 metadata = json.loads(metadata_json)
 assert metadata["skills"] == [{
@@ -209,6 +263,17 @@ assert metadata["skills"] == [{
     "path": "extension/.omp-generated/skills/review/SKILL.md",
 }]
 assert metadata["tools"][0]["rev"] == 7
+assert metadata["verdict_renderers"] == [{
+    "kind": "verdict_renderer",
+    "name": ["contract_device", "wire", 7],
+    "metadata": None,
+    "trigger": "lazy",
+    "value": {
+        "decorates": True,
+        "function": {"$omp.callable": "__main__.render_contract_device"},
+        "reduce": {"$omp.callable": "__main__.reduce_contract_renderer"},
+    },
+}]
 assert metadata["services"] == [{
     "methods": [{
         "input_schema": {

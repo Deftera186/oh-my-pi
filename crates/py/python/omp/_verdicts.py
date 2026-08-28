@@ -55,10 +55,14 @@ class BudgetError(OmpError, ValueError):
     """Report invalid use of a sealed projection budget or text fragment."""
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Payload:
     """Marker base for a device's durable success value."""
 
-    __slots__ = ()
+    terminate: bool = dataclasses.field(
+        default=False,
+        metadata={"omp_terminal_control": True},
+    )
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Reject unsupported durable field annotations when a payload is declared."""
@@ -764,6 +768,7 @@ def _encode_verdict(value: object, active: set[int]) -> object:
             return {
                 field.name: _encode_verdict(getattr(value, field.name), active)
                 for field in dataclasses.fields(value)
+                if not field.metadata.get("omp_terminal_control", False)
             }
         if isinstance(value, MappingABC):
             encoded: dict[str, object] = {}
@@ -944,7 +949,11 @@ def _decode_verdict(
         parameters = getattr(candidate, "__parameters__", ())
         if origin is not None and parameters:
             local_bindings.update(zip(parameters, args, strict=True))
-        fields = dataclasses.fields(candidate)
+        fields = tuple(
+            field
+            for field in dataclasses.fields(candidate)
+            if not field.metadata.get("omp_terminal_control", False)
+        )
         expected = {field.name for field in fields}
         actual = set(value)
         if actual != expected:

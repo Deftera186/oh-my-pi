@@ -48,6 +48,17 @@ async def review(event, ctx):
 
 
 @omp.hook(
+    "tool_call",
+    phase=omp.HookPhase.REVIEW,
+    name="acme.second-review",
+)
+async def second_review(event, ctx):
+    assert isinstance(event, omp.ToolCallEvent)
+    assert ctx.extension == "acme/devices-hooks"
+    return hook_module.Allow()
+
+
+@omp.hook(
     "user_bash",
     phase=omp.HookPhase.TRANSFORM,
     name="acme.shell-env-second",
@@ -131,7 +142,15 @@ for kwargs in (
         raise AssertionError(f"invalid agent_settled registration passed: {kwargs!r}")
 
 
-registry.freeze()
+snapshot = registry.freeze()
+assert len(snapshot.hook_definitions) == 6
+assert snapshot.hooks == frozenset({
+    ("tool_call", "review"),
+    ("user_bash", "transform"),
+    ("mcp_notification", "observe"),
+    ("provider_response", "observe"),
+    ("session_renamed", "observe"),
+})
 user_bash_spec = event_spec("user_bash")
 assert user_bash_spec.payload is omp.UserBashEvent
 mcp_spec = event_spec("mcp_notification")
@@ -492,6 +511,10 @@ async def exercise():
         "fatal": False,
         "code": "ACME_POLICY",
     }
+    second_callback = await hook_module._dispatch_hook_callback(
+        "tool_call", "review", "acme.second-review", payload, context
+    )
+    assert second_callback == {"kind": "allow", "reason": None}
 
     user_bash = {
         "command": "printf env",

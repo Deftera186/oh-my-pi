@@ -95,6 +95,8 @@ assert drift_error.missing_declarations == frozenset({
 assert drift_error.undeclared_declarations == frozenset({
     ("soft", "decorated_only@.1"),
 })
+assert drift_error.missing_tools == frozenset()
+assert drift_error.undeclared_tools == frozenset()
 assert "missing declarations" in str(drift_error)
 assert "undeclared declarations" in str(drift_error)
 assert "manifest_only@.1" in str(drift_error)
@@ -1114,6 +1116,15 @@ scope = Scope(
 )
 ctx = omp.Context.from_scope(scope)
 assert dict(ctx.settings) == {"token": "secret"}
+assert not ctx.signal.is_set()
+replacement_scope = dataclasses.replace(scope, generation=2)
+replacement_ctx = omp.Context.from_scope(replacement_scope)
+assert replacement_ctx.signal is not ctx.signal
+scope_module = importlib.import_module("omp._scope")
+assert scope_module._request_cancel(scope)
+assert ctx.signal.is_set()
+assert not replacement_ctx.signal.is_set()
+asyncio.run(ctx.signal.wait())
 ctx.log("info", "message", token="secret", count=1)
 assert logs == [
     (
@@ -2049,10 +2060,15 @@ assert decorated_registration.function is decorated_ui_renderer
 assert decorated_registration.decorates is True
 assert decorated_registration.reduce is None
 assert decorated_ui_renderer.__omp_renderer_decorates__ is True
-@omp.renderer("surface_device", rev=1)
+@omp.renderer(
+    "surface_device",
+    rev=1,
+    reduce=lambda acc, update: (acc or 0) + update,
+)
 def surface_verdict_renderer(view, ctx):
     assert isinstance(view.verdict, omp.Ok)
-    return omp.ui.text(f"{view.verdict.payload['value']}@{ctx.width}")
+    assert view.updates == ()
+    return omp.ui.text(f"{view.verdict.payload['value']}@{ctx.width}:{view.state}")
 
 surface_verdict = omp.ui._dispatch_renderer(
     "surface_device",
@@ -2060,7 +2076,7 @@ surface_verdict = omp.ui._dispatch_renderer(
     1,
     {
         "call_id": "surface-verdict",
-        "updates": [],
+        "updates": [2, 3],
         "state": None,
         "verdict": {"kind": "ok", "value": {"value": 3}},
         "elapsed": "1ms",
@@ -2077,7 +2093,7 @@ surface_verdict = omp.ui._dispatch_renderer(
         "place": "transcript",
     },
 )
-assert surface_verdict == omp.ui.text("3@80")
+assert surface_verdict == omp.ui.text("3@80:5")
 
 # Round 5 telemetry: prompt slot facts, request timings/content, and coalescing survive freeze.
 slot_fingerprint = telemetry_module.PromptSlotFingerprint(

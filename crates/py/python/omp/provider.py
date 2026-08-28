@@ -1988,24 +1988,38 @@ class AuthMethod(StrEnum):
     SESSION = "session"
 
 
-class LoginUi(Protocol):
+class LoginUi:
     """Provide reentrant user interaction during provider login."""
 
     async def prompt(self, text: str) -> str:
         """Prompt for a text value."""
-        ...
+        from . import ui
+
+        outcome = await ui.input(text)
+        if outcome.cancelled or outcome.value is None:
+            raise RuntimeError("provider login prompt was dismissed")
+        return outcome.value
 
     async def select(self, text: str, options: Sequence[str]) -> str:
         """Select one value from an ordered option list."""
-        ...
+        from . import ui
+
+        outcome = await ui.select(text, options)
+        if outcome.cancelled or outcome.value is None:
+            raise RuntimeError("provider login selection was dismissed")
+        return outcome.value
 
     async def open_url(self, url: str) -> None:
         """Open a login URL for the user."""
-        ...
+        from . import ui
+
+        ui.open_url(url)
 
     async def notify(self, text: str, level: str) -> None:
         """Show a login notification."""
-        ...
+        from . import ui
+
+        ui.notify(text, level=level)
 
 
 @dataclass(frozen=True, slots=True)

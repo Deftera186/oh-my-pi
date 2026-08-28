@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 import asyncio as _asyncio
 import inspect as _inspect
+import secrets as _secrets
 import warnings as _warnings
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
@@ -781,10 +782,10 @@ def set_status(key: str, content: Tml | None, *, order: int = 100, side: Slot = 
 def notify(message: str | Tml, *, level: Level | str = Level.INFO, title: str | None = None, desktop: bool = False, sound: Sound | None = None, urgency: Urgency | None = None) -> None: """Synchronously queue a fail-open notice effect."""; _emit("notify", message=message, level=Level(level), title=title, desktop=desktop, sound=sound, urgency=urgency)
 def set_working_message(content: Tml | None) -> None: """Synchronously replace the working-message banner."""; _emit("set_working_message", content=content)
 def set_working_indicator(frames: tuple[str, ...], interval_ms: int | None = None) -> None:
-    """Synchronously replace the core-timed working indicator for this turn."""
+    """Synchronously replace or hide the core-timed working indicator for this turn."""
     resolved = tuple(frames)
-    if not resolved or len(resolved) > 8 or any(not isinstance(frame, str) for frame in resolved):
-        raise ValueError("working indicator requires between one and eight string frames")
+    if len(resolved) > 8 or any(not isinstance(frame, str) for frame in resolved):
+        raise ValueError("working indicator requires at most eight string frames")
     if interval_ms is not None and (not isinstance(interval_ms, int) or interval_ms <= 0):
         raise ValueError("working indicator interval_ms must be a positive integer or None")
     _emit("set_working_indicator", frames=resolved, interval_ms=interval_ms)
@@ -893,9 +894,11 @@ async def terminal_input() -> _AsyncIterator[TerminalInputFrame]:
 
 def image(source: object, *, w: int | None = None, h: int | None = None, trim: bool = False) -> Tml:
     """Queue image materialization and return its stable markup placeholder."""
-    _emit("image", source=source, w=w, h=h, trim=trim)
+    resource = "ext-image-" + _secrets.token_hex(16)
+    _emit("image", resource=resource, source=source, w=w, h=h, trim=trim)
     dimensions = "".join(value for value in (f" w={w}" if w is not None else "", f" h={h}" if h is not None else "") if value)
-    return Tml.raw(f"<img{dimensions}/>")
+    trim_flag = " trim" if trim else ""
+    return Tml.raw(f"<img src={resource}{dimensions}{trim_flag}/>")
 def set_ghost(ghost: Ghost | None) -> None: """Synchronously replace the inline ghost suggestion."""; _emit("set_ghost", ghost=ghost)
 def clear_ghost() -> None: """Synchronously clear the inline ghost suggestion."""; set_ghost(None)
 def set_editor_text(text: str) -> None: """Synchronously replace composer text."""; _emit("set_editor_text", text=text)
@@ -929,14 +932,66 @@ async def presentation() -> Presentation:
     result = await _request("presentation")
     if not isinstance(result, Mapping):
         return Presentation()
-    body = dict(result)
     try:
-        body["charset"] = Charset(body.get("charset", Charset.UNICODE))
-        body["appearance"] = Appearance(body.get("appearance", Appearance.DARK))
-        body["graphics"] = Graphics(body.get("graphics", Graphics.CELLS))
-        return Presentation(**body)
-    except (TypeError, ValueError):
+        width = result["width"]
+        height = result["height"]
+        hyperlinks = result["hyperlinks"]
+        has_ui = result["has_ui"]
+        if (
+            not isinstance(width, int)
+            or isinstance(width, bool)
+            or not isinstance(height, int)
+            or isinstance(height, bool)
+            or not isinstance(hyperlinks, bool)
+            or not isinstance(has_ui, bool)
+        ):
+            return Presentation()
+        return Presentation(
+            charset=Charset(result["charset"]),
+            appearance=Appearance(result["appearance"]),
+            width=width,
+            height=height,
+            graphics=Graphics(result["graphics"]),
+            hyperlinks=hyperlinks,
+            has_ui=has_ui,
+        )
+    except (KeyError, TypeError, ValueError):
         return Presentation()
+
+
+async def commands() -> tuple[dict[str, object], ...]:
+    """Return the current invokable command roster."""
+    result = await _request("commands")
+    if not isinstance(result, Mapping):
+        return ()
+    roster = result.get("commands")
+    if not isinstance(roster, (list, tuple)):
+        return ()
+    decoded: list[dict[str, object]] = []
+    for command in roster:
+        if not isinstance(command, Mapping):
+            return ()
+        name = command.get("name")
+        aliases = command.get("aliases")
+        description = command.get("description")
+        source = command.get("source")
+        if (
+            not isinstance(name, str)
+            or not isinstance(aliases, (list, tuple))
+            or any(not isinstance(alias, str) for alias in aliases)
+            or not isinstance(description, str)
+            or not isinstance(source, str)
+        ):
+            return ()
+        decoded.append(
+            {
+                "name": name,
+                "aliases": tuple(aliases),
+                "description": description,
+                "source": source,
+            }
+        )
+    return tuple(decoded)
 
 
 async def icons(prefix: str = "") -> tuple[str, ...]:
@@ -985,25 +1040,77 @@ async def _dialog(kind: str, **body: object) -> DialogOutcome:
     result = await _request(kind, **body)
     if not isinstance(result, Mapping):
         return _unavailable()
-    decoded = dict(result)
     try:
-        if decoded.get("reason") is not None:
-            decoded["reason"] = DialogCancel(decoded["reason"])
-        decoded["values"] = tuple(decoded.get("values", ()))
-        decoded["fields"] = dict(decoded.get("fields", {}))
-        decoded["answers"] = tuple(
-            answer
-            if isinstance(answer, AskAnswer)
-            else AskAnswer(
-                question_id=str(answer["question_id"]),
-                selected=tuple(answer.get("selected", ())),
-                freeform=answer.get("freeform"),
-                note=answer.get("note"),
-                timed_out=bool(answer.get("timed_out", False)),
-            )
-            for answer in decoded.get("answers", ())
+        accepted = result["accepted"]
+        value = result["value"]
+        raw_values = result["values"]
+        raw_answers = result["answers"]
+        raw_reason = result["reason"]
+        if not isinstance(accepted, bool):
+            return _unavailable()
+        if value is not None and not isinstance(value, str):
+            return _unavailable()
+        if raw_values is not None and (
+            not isinstance(raw_values, (list, tuple))
+            or any(not isinstance(item, str) for item in raw_values)
+        ):
+            return _unavailable()
+        if raw_answers is not None and not isinstance(raw_answers, Mapping):
+            return _unavailable()
+
+        reason = None if raw_reason is None else DialogCancel(raw_reason)
+        if accepted and reason is not None:
+            return _unavailable()
+        if kind != "confirm" and accepted != (reason is None):
+            return _unavailable()
+
+        fields: dict[str, object] = {}
+        answers: tuple[AskAnswer, ...] = ()
+        if kind == "form" and raw_answers is not None:
+            fields = {str(key): item for key, item in raw_answers.items()}
+        elif kind == "ask_user" and raw_answers is not None:
+            decoded_answers: list[AskAnswer] = []
+            for question_id, answer in raw_answers.items():
+                if not isinstance(question_id, str) or not isinstance(answer, Mapping):
+                    return _unavailable()
+                selected = answer.get("selected", ())
+                freeform = answer.get("freeform")
+                note = answer.get("note")
+                timed_out = answer.get("timed_out", False)
+                if (
+                    not isinstance(selected, (list, tuple))
+                    or any(not isinstance(item, str) for item in selected)
+                    or (freeform is not None and not isinstance(freeform, str))
+                    or (note is not None and not isinstance(note, str))
+                    or not isinstance(timed_out, bool)
+                ):
+                    return _unavailable()
+                decoded_answers.append(
+                    AskAnswer(
+                        question_id=question_id,
+                        selected=tuple(selected),
+                        freeform=freeform,
+                        note=note,
+                        timed_out=timed_out,
+                    )
+                )
+            answers = tuple(decoded_answers)
+
+        confirmed = False
+        outcome_value = value
+        if kind == "confirm":
+            confirmed = accepted
+            outcome_value = None
+
+        return DialogOutcome(
+            cancelled=reason is not None,
+            reason=reason,
+            confirmed=confirmed,
+            value=outcome_value,
+            values=tuple(raw_values or ()),
+            fields=fields,
+            answers=answers,
         )
-        return DialogOutcome(**decoded)
     except (KeyError, TypeError, ValueError):
         return _unavailable()
 
@@ -1088,6 +1195,18 @@ def renderer(
         raise ValueError("renderer name must not be empty")
     if not isinstance(decorates, bool):
         raise TypeError("renderer decorates must be a bool")
+    if family is None or rev is None:
+        matches = tuple(
+            definition
+            for definition in _declarations.device_definitions()
+            if definition.name == name
+        )
+        if len(matches) == 1:
+            definition = matches[0]
+            if family is None:
+                family = definition.family
+            if rev is None:
+                rev = definition.rev
     key = (name, family or "", 0 if rev is None else rev)
     def decorate(function: Callable[..., Tml | None]) -> Callable[..., Tml | None]:
         if _inspect.iscoroutinefunction(function):
@@ -1154,6 +1273,11 @@ def _dispatch_renderer(name: str, family: str, rev: int, view: object, ctx: Rend
             updates = tuple(
                 decode("Update", update) for update in body.get("updates", ())
             )
+            state = body.get("state")
+            if registration.reduce is not None:
+                for update in updates:
+                    state = registration.reduce(state, update)
+                updates = ()
             elapsed = body.get("elapsed", "0s")
             if not isinstance(elapsed, Duration):
                 elapsed = Duration(str(elapsed))
@@ -1164,7 +1288,7 @@ def _dispatch_renderer(name: str, family: str, rev: int, view: object, ctx: Rend
                 identity=ToolIdentity(name, Rev(family, rev)),
                 call_id=str(body.get("call_id", "")),
                 updates=updates,
-                state=body.get("state"),
+                state=state,
                 verdict=verdict,
                 elapsed=elapsed,
                 phase=phase,
@@ -1209,7 +1333,7 @@ def completion(trigger: Trigger) -> Callable[[Callable[..., object]], Callable[.
     def decorate(function: Callable[..., object]) -> Callable[..., object]:
         if not callable(function):
             raise TypeError("completion providers must be callable")
-        _declarations.register_ui("completion", trigger.prefix, function)
+        _declarations.register_ui("completion", trigger.prefix, function, metadata=trigger)
         _completion_handlers[trigger.prefix] = function
         _completion_triggers[trigger.prefix] = trigger
         return function

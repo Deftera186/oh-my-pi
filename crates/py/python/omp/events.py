@@ -55,6 +55,7 @@ from .provider import (
     Role,
     RouteRef,
     SignRequest,
+    Signature,
     UsageQuery,
     UsageReport,
 )
@@ -333,6 +334,7 @@ class SessionStartEvent:
     trust: Trust
     head_event: int
     prompt_rev: str
+    previous_session: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +344,7 @@ class SessionShutdownEvent:
     session_id: str
     reason: ShutdownReason
     budget: Duration
+    target_session: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -757,6 +760,8 @@ class ModelChangedEvent:
     to_model: ModelRef
     role: str
     reason: ModelChangeReason
+    previous_thinking: Effort | None = None
+    thinking: Effort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1004,9 +1009,9 @@ _EVENT_METADATA = {
     "command_invoke": (CommandInvokeEvent, _HOOK, LatencyClass.INPUT, OnFailure.DEFER, True, _GATE, _ALLOW, {"name": Composition.REPLACE, "argv": Composition.REPLACE}),
     "resources_discover": (ResourcesDiscoverEvent, _HOOK, LatencyClass.SESSION, OnFailure.DENY, True, _GATE, _ALLOW, {"add": Composition.APPEND, "keep": Composition.INTERSECT}),
     "resources_changed": (ResourcesChangedEvent, _OBSERVE, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {}),
-    "provider_login": (LoginRequest, _HOOK, LatencyClass.SESSION, OnFailure.DENY, True, _GATE, _ALLOW, {}),
+    "provider_login": (LoginRequest, Credential, LatencyClass.SESSION, OnFailure.DENY, True, _DOMAIN, None, {}),
     "provider_refresh": (RefreshRequest, Credential, LatencyClass.SESSION, OnFailure.DENY, False, _DOMAIN, None, {}),
-    "provider_sign": (SignRequest, _HOOK, LatencyClass.TURN, OnFailure.DENY, False, _GATE, _ALLOW, {}),
+    "provider_sign": (SignRequest, Signature, LatencyClass.TURN, OnFailure.DENY, False, _DOMAIN, None, {}),
     "before_request": (RequestDraft, _HOOK, LatencyClass.TURN, OnFailure.DEFER, False, _GATE, _ALLOW, {"intents": Composition.INTERSECT}),
     "models_discover": (DiscoveryQuery, DiscoveryPage, LatencyClass.SESSION, OnFailure.DEFER, True, _DOMAIN, None, {"models": Composition.INTERSECT}),
     "provider_error": (ProviderError, Failover | None, LatencyClass.TURN, OnFailure.DENY, True, _DOMAIN, None, {}),

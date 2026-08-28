@@ -46,6 +46,7 @@ from . import packages as _packages
 _T = TypeVar("_T", bound=type)
 _ToolKey = tuple[str, str, int]
 _HookKey = tuple[str, str]
+_HookSubscriptionKey = tuple[str, str, str]
 _EntryKindKey = tuple[str, str]
 _ServiceKey = tuple[str, int]
 _ProviderKey = str
@@ -267,6 +268,8 @@ class DeviceDefinition:
     tier: object
     deadline: object | None
     aliases: Mapping[str, str] | None
+    constraint: object | None
+    serial: bool
     body: object
     arg_specs: tuple[ArgSpec, ...] = ()
     trigger: _ActivationTrigger = _ActivationTrigger.LAZY
@@ -312,6 +315,8 @@ class WorkerToolDefinition:
     kind: str
     place: object
     effects: object | None
+    constraint: object | None
+    serial: bool
     legacy: bool = False
 
 
@@ -423,6 +428,7 @@ class HookDefinition:
     phase: str
     handler: object
     trigger: _ActivationTrigger
+    def __getattr__(self, name: str) -> object: return getattr(self.handler, name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +438,7 @@ class UIDefinition:
     kind: str
     name: object
     value: object
+    metadata: object | None
     trigger: _ActivationTrigger
 
 
@@ -499,6 +506,7 @@ class DeclarationRegistry:
         "_manifest_capabilities",
         "_manifest_executables",
         "_uniform_manifest_configured",
+        "_trust_runtime_declarations",
         "_manifest_requires",
         "_manifest_services",
         "_manifest_tools",
@@ -534,8 +542,8 @@ class DeclarationRegistry:
         self._entry_kinds: dict[_EntryKindKey, EntryKindDefinition] = {}
         self._provider_candidates: dict[_ProviderKey, list[ProviderDefinition]] = {}
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
-        self._hooks: dict[_HookKey, object] = {}
-        self._hook_definitions: dict[_HookKey, HookDefinition] = {}
+        self._hooks: dict[_HookSubscriptionKey, object] = {}
+        self._hook_definitions: dict[_HookSubscriptionKey, HookDefinition] = {}
         self._regimes: dict[str, object] = {}
         self._telemetry: dict[str, TelemetryDefinition] = {}
         self._exports: dict[int, ExportDefinition] = {}
@@ -556,6 +564,7 @@ class DeclarationRegistry:
             tuple[str, str], _ExecutableDeclaration
         ] = {}
         self._uniform_manifest_configured = False
+        self._trust_runtime_declarations = False
         self._manifest_requires: frozenset[_ServiceKey] = frozenset()
         self._legacy_worker_tools: dict[_ToolKey, WorkerToolDefinition] = {}
 
@@ -588,10 +597,13 @@ class DeclarationRegistry:
             _packages.ContentDeclaration | Mapping[str, object]
         ] | None = None,
         extension: str | None = None,
+        trust_runtime_declarations: bool = False,
     ) -> None:
         """Install authoritative manifest sets before the first module import."""
 
         self._ensure_open("manifest")
+        if not isinstance(trust_runtime_declarations, bool):
+            raise TypeError("trust_runtime_declarations must be bool")
         content_declarations: list[_packages.ContentDeclaration] = []
         executable_declarations: dict[
             tuple[str, str], _ExecutableDeclaration
@@ -652,15 +664,16 @@ class DeclarationRegistry:
             _packages._configure_own_declarations(
                 extension, self._manifest_content
             )
-        manifest_tools = {_tool_key(*item) for item in tools}
-        manifest_hooks = {_hook_key(*item) for item in hooks}
-        for executable in executable_declarations.values():
-            if executable.kind in {"soft", "hard"}:
-                manifest_tools.add(_manifest_tool_key(executable.key))
-            elif executable.kind == "hook":
-                manifest_hooks.add(_manifest_hook_key(executable.key))
-        self._manifest_tools = frozenset(manifest_tools)
-        self._manifest_hooks = frozenset(manifest_hooks)
+        if declarations is None:
+            self._manifest_tools = frozenset(_tool_key(*item) for item in tools)
+            self._manifest_hooks = frozenset(_hook_key(*item) for item in hooks)
+            self._manifest_services = frozenset(
+                _service_key(*item) for item in services
+            )
+        else:
+            self._manifest_tools = frozenset()
+            self._manifest_hooks = frozenset()
+            self._manifest_services = frozenset()
         normalized_capabilities = frozenset(capabilities)
         if any(
             not isinstance(capability, str) or not capability
@@ -668,10 +681,10 @@ class DeclarationRegistry:
         ):
             raise ManifestError("omp.toml", "capabilities", "capabilities must be non-empty strings")
         self._manifest_capabilities = normalized_capabilities
-        self._manifest_services = frozenset(_service_key(*item) for item in services)
         self._manifest_requires = frozenset(_service_key(*item) for item in requires)
         self._manifest_executables = executable_declarations
         self._uniform_manifest_configured = declarations is not None
+        self._trust_runtime_declarations = trust_runtime_declarations
         self._extension_id = extension
         self._configured = True
 
@@ -781,6 +794,8 @@ class DeclarationRegistry:
             kind="legacy",
             place="host",
             effects=None,
+            constraint=None,
+            serial=False,
             legacy=True,
         )
         self.register_tool(name, family, rev, handler)
@@ -819,6 +834,8 @@ class DeclarationRegistry:
                     kind=kind,
                     place=str(definition.place),
                     effects=definition.effects,
+                    constraint=definition.constraint,
+                    serial=definition.serial,
                 )
             )
         return tuple(projected)
@@ -937,9 +954,9 @@ class DeclarationRegistry:
         return tuple(self._exports[key] for key in sorted(self._exports))
 
     def register_hook(self, event: str, phase: object, handler: object) -> object:
-        """Records a hook decorator during sequential manifest import."""
+        """Records a named hook subscription during sequential manifest import."""
 
-        key = _hook_key(event, phase)
+        key = _hook_subscription_key(event, phase, getattr(handler, "name", None))
         trigger = (
             _ActivationTrigger.EAGER_PROMPT
             if str(getattr(handler, "on_failure", "")) == "fail-closed"
@@ -1195,7 +1212,12 @@ class DeclarationRegistry:
         return tuple(self._commands[key] for key in sorted(self._commands))
 
     def register_ui(
-        self, kind: str, name: object, value: object
+        self,
+        kind: str,
+        name: object,
+        value: object,
+        *,
+        metadata: object | None = None,
     ) -> object:
         """Insert one completion or renderer through the shared declaration gate."""
 
@@ -1228,7 +1250,7 @@ class DeclarationRegistry:
             hash(name)
         except TypeError as error:
             raise TypeError("UI declaration name must be hashable") from error
-        definition = UIDefinition(kind, name, value, trigger)
+        definition = UIDefinition(kind, name, value, metadata, trigger)
         self._insert(declarations, name, definition, kind)
         return value
 
@@ -1319,17 +1341,20 @@ class DeclarationRegistry:
         undeclared_hooks: frozenset[_HookKey] = frozenset()
         missing_services: frozenset[_ServiceKey] = frozenset()
         undeclared_services: frozenset[_ServiceKey] = frozenset()
-        if self._configured:
+        if (
+            self._configured
+            and not self._uniform_manifest_configured
+            and not self._trust_runtime_declarations
+        ):
             actual_tools = frozenset(self._tools).union(
                 (definition.name, "prelude", definition.rev)
                 for definition in self._preludes.values()
             )
             missing_tools = self._manifest_tools.difference(actual_tools)
             undeclared_tools = actual_tools.difference(self._manifest_tools)
-            missing_hooks = self._manifest_hooks.difference(self._hooks)
-            undeclared_hooks = frozenset(self._hooks).difference(
-                self._manifest_hooks
-            )
+            actual_hooks = frozenset(key[:2] for key in self._hooks)
+            missing_hooks = self._manifest_hooks.difference(actual_hooks)
+            undeclared_hooks = actual_hooks.difference(self._manifest_hooks)
             uniform_service_names = {
                 declaration.key
                 for declaration in self._manifest_executables.values()
@@ -1344,7 +1369,7 @@ class DeclarationRegistry:
             )
         missing_declarations: frozenset[tuple[str, str]] = frozenset()
         undeclared_declarations: frozenset[tuple[str, str]] = frozenset()
-        if self._uniform_manifest_configured:
+        if self._uniform_manifest_configured and not self._trust_runtime_declarations:
             manifest_declarations = frozenset(self._manifest_executables)
             decorated_declarations = self._decorated_executable_keys()
             missing_declarations = manifest_declarations.difference(
@@ -1353,7 +1378,7 @@ class DeclarationRegistry:
             undeclared_declarations = decorated_declarations.difference(
                 manifest_declarations
             )
-        if self._configured:
+        if self._configured and not self._trust_runtime_declarations:
             manifest_skills = tuple(
                 declaration
                 for declaration in self._manifest_content
@@ -1434,7 +1459,7 @@ class DeclarationRegistry:
                 (str(kind or "soft"), _manifest_tool_static_key(key))
             )
         declarations.update(
-            ("hook", _manifest_hook_static_key(key)) for key in self._hooks
+            ("hook", _manifest_hook_static_key(key[:2])) for key in self._hooks
         )
         declarations.update(("regime", key) for key in self._regimes)
         declarations.update(("service", key[0]) for key in self._services)
@@ -1467,7 +1492,7 @@ class DeclarationRegistry:
             skills=self.skill_declarations(),
             tools=frozenset(self._tools),
             capabilities=self._manifest_capabilities,
-            hooks=frozenset(self._hooks),
+            hooks=frozenset(key[:2] for key in self._hooks),
             services=frozenset(self._services),
             preludes=self.prelude_definitions(),
             commands=self.command_definitions(),
@@ -1707,6 +1732,7 @@ def configure_manifest(
         _packages.ContentDeclaration | Mapping[str, object]
     ] | None = None,
     extension: str | None = None,
+    trust_runtime_declarations: bool = False,
 ) -> None:
     """Install authoritative existence and content sets before sequential import."""
 
@@ -1718,6 +1744,7 @@ def configure_manifest(
         requires=requires,
         declarations=declarations,
         extension=extension,
+        trust_runtime_declarations=trust_runtime_declarations,
     )
 
 
@@ -1748,6 +1775,9 @@ def bootstrap_worker_registry(
         requires=manifest.get("requires", ()),
         declarations=manifest.get("declarations"),
         extension=manifest.get("extension"),
+        trust_runtime_declarations=manifest.get(
+            "trust_runtime_declarations", False
+        ),
     )
     seen: set[str] = set()
     for module_name in modules:
@@ -2104,6 +2134,17 @@ def _executable_declaration(
         ),
         "shortcut": frozenset(
             {"action_id", "action", "description", "when", "callback"}
+        ),
+        "completion": frozenset(
+            {
+                "callback",
+                "at_line_start",
+                "min_chars",
+                "debounce",
+                "max_results",
+                "cache",
+                "refine_locally",
+            }
         ),
     }.get(value.get("kind"), frozenset())
     unknown = fields.difference(required | optional | {"grants"})
@@ -2580,8 +2621,38 @@ def _worker_handler(
         else:
             parameters = tuple(inspect.signature(body).parameters.values())
             result = body(params, context) if len(parameters) > 1 else body(params)
+        streamed_updates: list[object] | None = None
+        if inspect.isasyncgen(result):
+            from ._verdicts import Done, Update
+
+            streamed_updates = []
+            terminal: object = None
+            async for item in result:
+                if isinstance(item, Update):
+                    streamed_updates.append(item.payload)
+                elif isinstance(item, Done):
+                    terminal = item.result
+                    break
+                else:
+                    streamed_updates.append(item)
+            result = terminal
         if inspect.isawaitable(result):
-            return await result
+            result = await result
+        from . import Fault
+        from ._verdicts import Faulted, Ok, Payload, _canonical_json
+
+        if isinstance(result, (Payload, Fault)):
+            outcome = Ok(result) if isinstance(result, Payload) else Faulted(result)
+            return {
+                "updates": streamed_updates or [],
+                "details": json.loads(_canonical_json(outcome)),
+                "is_error": isinstance(result, Fault),
+                "terminate": result.terminate,
+            }
+        if streamed_updates is not None:
+            if isinstance(result, Mapping):
+                return {"updates": streamed_updates, **result}
+            return {"updates": streamed_updates, "details": result}
         return result
 
     return invoke
@@ -2663,6 +2734,15 @@ def _hook_key(event: str, phase: object) -> _HookKey:
     if not isinstance(value, str) or not value:
         raise ValueError("hook phase must be a non-empty string enum")
     return event, value.lower()
+
+
+def _hook_subscription_key(
+    event: str, phase: object, name: object
+) -> _HookSubscriptionKey:
+    event_name, phase_name = _hook_key(event, phase)
+    if not isinstance(name, str) or not name:
+        raise ValueError("hook subscription name must be a non-empty string")
+    return event_name, phase_name, name
 
 
 def _entry_kind_key(name: str, rev: str) -> _EntryKindKey:

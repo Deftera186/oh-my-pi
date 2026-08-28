@@ -457,6 +457,22 @@ async def label(target: EntryId, label: str | None) -> EntryId:
     return _entry_id(_payload(response, "omp.journal.label.v1"))
 
 
+async def label_of(target: EntryId) -> str | None:
+    """Return the latest live label assignment for a journal entry."""
+
+    from . import _control_request
+
+    if not isinstance(target, EntryId):
+        raise TypeError("target must be an EntryId")
+    response = _payload(
+        await _control_request("omp.journal.label_of", target=str(target)),
+        "omp.journal.label_of.v1",
+    )
+    if response is not None and not isinstance(response, str):
+        raise TypeError("omp.journal.label_of returned a non-string label")
+    return response
+
+
 async def append(
     entry: object,
     *,
@@ -631,5 +647,6 @@ __all__ = (
     "entries",
     "fold",
     "label",
+    "label_of",
     "latest",
 )

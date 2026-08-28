@@ -653,15 +653,16 @@ class Host:
             )
             timer.daemon = True
             dispatch.escalation = timer
-            first_cancel = dispatch.scope is not None and _scope._request_cancel(dispatch.scope)
+            scope = dispatch.scope
         loop = dispatch.task.get_loop()
-        loop.call_soon_threadsafe(dispatch.task.cancel)
-        if first_cancel:
+        if scope is not None:
+            loop.call_soon_threadsafe(_scope._request_cancel, scope)
             loop.call_soon_threadsafe(
                 _scope._fire_cancel_callbacks,
-                dispatch.scope,
+                scope,
                 lambda error: self._log_cancel_callback_error(invocation, error),
             )
+        loop.call_soon_threadsafe(dispatch.task.cancel)
         timer.start()
 
     def _log_cancel_callback_error(self, invocation: str, error: BaseException) -> None:

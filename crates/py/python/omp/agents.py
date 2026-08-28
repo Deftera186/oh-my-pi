@@ -1167,6 +1167,44 @@ async def set_model(model: str, *, thinking: str | None = None) -> ModelRef:
     )
 
 
+async def abort() -> None:
+    """Abort the main agent's active run, if any."""
+    await _request("omp.agents.abort")
+
+
+async def shutdown(reason: str = "") -> None:
+    """Gracefully shut down the current interactive session."""
+    if not isinstance(reason, str):
+        raise TypeError("reason must be a string")
+    await _request("omp.agents.shutdown", reason=reason)
+
+
+async def reload_extensions() -> None:
+    """Request a supervised hot reload of the extension hosts."""
+    await _request("omp.agents.reload_extensions")
+
+
+async def is_idle() -> bool:
+    """Return whether the main agent currently has no active run."""
+    response = await _request("omp.agents.is_idle")
+    if not isinstance(response, bool):
+        raise TypeError("agent idle response must be a boolean")
+    return response
+
+
+async def wait_for_idle() -> None:
+    """Wait until the main agent has no active run."""
+    await _request("omp.agents.wait_for_idle")
+
+
+async def pending_messages() -> int:
+    """Return the number of messages queued for the main agent."""
+    response = await _request("omp.agents.pending_messages")
+    if isinstance(response, bool) or not isinstance(response, int) or response < 0:
+        raise TypeError("pending message response must be a non-negative integer")
+    return response
+
+
 async def inject(
     prompt: str,
     *,
@@ -1904,6 +1942,7 @@ __all__ = (
     "UpgradePolicy",
     "Usage",
     "WorktreeOutcome",
+    "abort",
     "broadcast",
     "completion",
     "continuations",
@@ -1911,11 +1950,14 @@ __all__ = (
     "get",
     "inbox",
     "inject",
+    "is_idle",
     "limits",
     "set_model",
     "list",
     "loop_signal",
     "peers",
+    "pending_messages",
+    "reload_extensions",
     "restore",
     "revive",
     "rewind",
@@ -1924,6 +1966,7 @@ __all__ = (
     "schedules",
     "send",
     "set_continuation_policy",
+    "shutdown",
     "snapshot",
     "snapshots",
     "spawn",
@@ -1931,4 +1974,5 @@ __all__ = (
     "timer",
     "unschedule",
     "wait_for",
+    "wait_for_idle",
 )
