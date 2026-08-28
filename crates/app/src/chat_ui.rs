@@ -35,7 +35,7 @@ use omp_catalog::{
 };
 use omp_chat_ui::{
 	ActivityWaveform, AgentRow, ApprovalAction, ApprovalTicketView, Attachment, BackendEvent, Chat,
-	Intent, LiveVoiceAction, ModelRow, RawFrame, RewindTargetRow, SessionRow, StatusFacts,
+	Intent, ListRow, LiveVoiceAction, ModelRow, RawFrame, RewindTargetRow, SessionRow, StatusFacts,
 	StatusLayout, StatusSeparator, StreamSummary, SubmitMode, ThinkingLevel as StatusThinkingLevel,
 	ToolTerminal, ToolViewContent, TranscriptFrame, TranscriptFrameKind, VisibleResourceFacts,
 	completion::{CompletionQuery, CompletionRule, CompletionSource, CompletionTrigger},
@@ -5534,21 +5534,11 @@ where
 fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
 	let document =
 		toml::Value::try_from(settings).unwrap_or_else(|_| toml::Value::Table(toml::Table::new()));
-	let mut domains = omp_settings::registered_domains();
-	domains.sort_by_key(|domain| {
-		omp_settings::manager::EDITOR_PANELS
-			.iter()
-			.position(|panel| *panel == omp_settings::manager::panel_for_domain(domain.name))
-			.unwrap_or(omp_settings::manager::EDITOR_PANELS.len())
-	});
-	domains
+	let mut rows = omp_settings::registered_domains()
 		.into_iter()
 		.flat_map(|domain| {
 			let document = &document;
-			let panel = omp_settings::manager::panel_for_domain(domain.name);
-			let mut fields = domain.fields.to_vec();
-			fields.sort_unstable_by_key(|field| (field.order, field.path));
-			fields.into_iter().map(move |field| {
+			domain.fields.iter().map(move |field| {
 				let kind: &'static str = field.kind.into();
 				let value = (!field.secret)
 					.then(|| toml_value_at(document, field.path))
@@ -5564,7 +5554,8 @@ fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
 					toml_value_at(document, condition.field)
 						.is_some_and(|value| toml_setting_value(value).as_str() == condition.equals)
 				});
-				omp_chat_ui::SettingRow {
+				let panel = omp_settings::manager::panel_for_field(domain.name, field.path);
+				(field.order, omp_chat_ui::SettingRow {
 					panel: sf!(panel),
 					domain: sf!(domain.name),
 					path: sf!(field.path),
@@ -5575,10 +5566,18 @@ fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
 					value,
 					options,
 					visible,
-				}
+				})
 			})
 		})
-		.collect()
+		.collect::<Vec<_>>();
+	rows.sort_by_key(|(order, row)| {
+		let panel = omp_settings::manager::EDITOR_PANELS
+			.iter()
+			.position(|panel| *panel == row.panel.as_str())
+			.unwrap_or(omp_settings::manager::EDITOR_PANELS.len());
+		(panel, *order, row.path.clone())
+	});
+	rows.into_iter().map(|(_, row)| row).collect()
 }
 
 fn toml_value_at<'a>(document: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
@@ -8558,6 +8557,33 @@ where
 					}
 				}
 			}
+		},
+		Intent::SearchHistory => match session_index.prompt_history("", PROMPT_HISTORY_ROWS) {
+			Ok(entries) if entries.is_empty() => {
+				send_backend(backend, BackendEvent::Notice(sf!("No prompt history yet.")));
+			},
+			Ok(entries) => {
+				let rows = entries
+					.into_iter()
+					.map(|entry| ListRow {
+						key:    entry.prompt.clone(),
+						label:  Str::new(entry.prompt.lines().next().unwrap_or("")),
+						detail: entry
+							.ts_ms
+							.map(|ts| components::relative_age(now_ms().saturating_sub(ts)))
+							.unwrap_or_default(),
+					})
+					.collect();
+				send_backend(backend, BackendEvent::OpenSelection {
+					title: sf!("Prompt history"),
+					purpose: omp_chat_ui::SelectionPurpose::History,
+					rows,
+				});
+			},
+			Err(error) => send_backend(
+				backend,
+				BackendEvent::Error(sf!("Could not load prompt history: {error}")),
+			),
 		},
 		Intent::Rewind { event } => {
 			let target = state
@@ -11563,6 +11589,8 @@ pub fn now_ms() -> u64 {
 		.unwrap_or_default()
 		.as_millis() as u64
 }
+/// Newest unique prompts offered by the Ctrl+R history selector.
+const PROMPT_HISTORY_ROWS: u32 = 500;
 
 #[cfg(test)]
 mod tests {

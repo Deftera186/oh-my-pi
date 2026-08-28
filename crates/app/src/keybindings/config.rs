@@ -155,6 +155,7 @@ pub const APP_ACTION_IDS: &[&str] = &[
 	"app.message.follow_up",
 	"app.retry",
 	"app.message.dequeue",
+	"app.history.search",
 	"app.clipboard.paste_image",
 	"app.clipboard.paste_raw",
 	"app.copy",

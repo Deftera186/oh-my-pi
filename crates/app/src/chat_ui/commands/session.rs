@@ -393,4 +393,20 @@ mod tests {
 		let rendered = render_info(&full_info());
 		assert!(!rendered.contains("**LSP servers**"));
 	}
+	#[test]
+	fn parse_dir_routes_subcommands_and_rejects_malformed_input() {
+		assert_eq!(parse_dir("").unwrap(), WorkspaceRequest::List);
+		assert_eq!(parse_dir(" list ").unwrap(), WorkspaceRequest::List);
+		assert_eq!(
+			parse_dir("add /tmp/My Folder").unwrap(),
+			WorkspaceRequest::Add(Str::new_static("/tmp/My Folder"))
+		);
+		assert_eq!(
+			parse_dir("remove ../shared").unwrap(),
+			WorkspaceRequest::Remove(Str::new_static("../shared"))
+		);
+		assert!(parse_dir("add").is_err(), "mutation without a directory");
+		assert!(parse_dir("list extra").is_err(), "list takes no argument");
+		assert!(parse_dir("promote /tmp").is_err(), "unknown subcommand");
+	}
 }

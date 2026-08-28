@@ -173,6 +173,7 @@ const RETRY: &[&str] = &["alt+r"];
 const DEQUEUE_MACOS: &[&str] = &["shift+up"];
 const DEQUEUE_DEFAULT: &[&str] = &["ctrl+up"];
 const TOGGLE_PLAN: &[&str] = &["alt+shift+p"];
+const HISTORY_SEARCH: &[&str] = &["ctrl+r"];
 const TOGGLE_VOICE: &[&str] = &["ctrl+alt+s"];
 const TOGGLE_LIVE_VOICE: &[&str] = &["ctrl+alt+l"];
 const AGENT_HUB: &[&str] = &["alt+a"];
@@ -197,6 +198,7 @@ pub fn fallback_chords(action: &str, platform: KeyPlatform) -> &'static [&'stati
 		("app.message.dequeue", _) => DEQUEUE_DEFAULT,
 		("app.retry", _) => RETRY,
 		("app.plan.toggle", _) => TOGGLE_PLAN,
+		("app.history.search", _) => HISTORY_SEARCH,
 		("app.voice.toggle", _) => TOGGLE_VOICE,
 		("app.voice.live_toggle", _) => TOGGLE_LIVE_VOICE,
 		("app.agent_hub", _) => AGENT_HUB,

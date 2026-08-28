@@ -987,6 +987,8 @@ pub enum InputAction {
 	Dequeue,
 	/// Toggle plan mode.
 	TogglePlan,
+	/// Open the prompt-history search selector.
+	HistorySearch,
 	/// Toggle speech-to-text capture.
 	ToggleVoice,
 	/// Toggle realtime voice.
@@ -1014,6 +1016,7 @@ impl InputAction {
 			Self::Retry => Key::Alt('r'),
 			Self::Dequeue => Key::RestoreQueue,
 			Self::TogglePlan => Key::PlanToggle,
+			Self::HistorySearch => Key::Ctrl('r'),
 			Self::ToggleVoice => Key::CtrlAlt('s'),
 			Self::ToggleLiveVoice => Key::CtrlAlt('l'),
 			Self::AgentHub => Key::Alt('a'),
@@ -1038,6 +1041,7 @@ impl InputAction {
 			"app.retry" => Self::Retry,
 			"app.message.dequeue" => Self::Dequeue,
 			"app.plan.toggle" => Self::TogglePlan,
+			"app.history.search" => Self::HistorySearch,
 			"app.voice.toggle" => Self::ToggleVoice,
 			"app.voice.live_toggle" => Self::ToggleLiveVoice,
 			"app.agent_hub" => Self::AgentHub,
@@ -1201,6 +1205,10 @@ impl RetainedChat {
 			send(&self.intents, Intent::InspectHistory);
 			return RetainedChatEffect::Consumed;
 		}
+		if key == Key::Ctrl('r') {
+			send(&self.intents, Intent::SearchHistory);
+			return RetainedChatEffect::Consumed;
+		}
 		if key == Key::Ctrl('k') {
 			self.host.overlay =
 				Some(Overlay::Palette(CommandPalette::open(palette_entries(), &self.ctx)));
@@ -1321,6 +1329,7 @@ impl RetainedChat {
 			InputAction::Retry => send(&self.intents, Intent::Retry),
 			InputAction::Dequeue => send(&self.intents, Intent::Dequeue),
 			InputAction::TogglePlan => send(&self.intents, Intent::TogglePlan),
+			InputAction::HistorySearch => send(&self.intents, Intent::SearchHistory),
 			InputAction::ToggleVoice => send(&self.intents, Intent::ToggleStt),
 			InputAction::ToggleLiveVoice => send(&self.intents, Intent::ToggleLive),
 			InputAction::AgentHub => open_agents(&mut self.host, &self.ctx),
@@ -2080,6 +2089,10 @@ async fn run_chat(
 										send(intents, Intent::ToggleStt);
 									} else if key == Key::Alt('h') {
 										send(intents, Intent::InspectHistory);
+									} else if key == Key::Ctrl('r')
+										&& action_enabled(InputAction::HistorySearch)
+									{
+										send(intents, Intent::SearchHistory);
 									} else if key == Key::Ctrl('k') {
 										host.overlay = Some(Overlay::Palette(CommandPalette::open(palette_entries(), ctx)));
 										open_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
@@ -3050,6 +3063,12 @@ fn palette_entries() -> Vec<PaletteEntry> {
 			PaletteAction::Intent(Intent::InspectHistory),
 		)
 		.key("Alt+H"),
+		PaletteEntry::new(
+			"Search prompt history",
+			"Reuse a previously submitted prompt",
+			PaletteAction::Intent(Intent::SearchHistory),
+		)
+		.key("Ctrl+R"),
 		PaletteEntry::new("Help", "Show chat controls", PaletteAction::Intent(Intent::Help)),
 		PaletteEntry::new("Quit", "Leave chat", PaletteAction::Intent(Intent::Quit)),
 	]
@@ -3929,6 +3948,28 @@ mod tests {
 		));
 		assert_eq!(chat.key(Key::Esc), RetainedChatEffect::Consumed);
 		assert!(matches!(requests.try_recv(), Ok(Intent::LiveVoice(LiveVoiceAction::Close))));
+	}
+
+	#[test]
+	fn ctrl_r_requests_prompt_history_before_the_composer_sees_it() {
+		let ctx = UiContext::default();
+		let viewport = Size::new(80, 24);
+		let (_events, receiver) = flume::unbounded();
+		let (intents, requests) = flume::unbounded();
+		let mut chat = RetainedChat::new(
+			Chat::new(&ctx),
+			ctx,
+			receiver,
+			intents,
+			HostOptions::default(),
+			Default::default(),
+		);
+		chat.resize(viewport, true);
+		chat.host.chat.set_composer_text("draft survives");
+
+		assert_eq!(chat.key(Key::Ctrl('r')), RetainedChatEffect::Consumed);
+		assert!(matches!(requests.try_recv(), Ok(Intent::SearchHistory)));
+		assert_eq!(chat.host.chat.composer_text(), "draft survives");
 	}
 
 	#[test]

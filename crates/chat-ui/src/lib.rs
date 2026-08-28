@@ -586,6 +586,8 @@ pub enum Intent {
 	/// The terminal host binds this to Alt+H because legacy terminal input
 	/// decodes Ctrl+H as Backspace.
 	InspectHistory,
+	/// Ask the backend for prompt-history rows to open the history selector.
+	SearchHistory,
 	/// Rewind the durable transcript to an event.
 	Rewind {
 		/// Event to keep as the new live-chain tail.

@@ -590,6 +590,7 @@ impl RichText {
 	fn thinking(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
 		Self::styled(text, width, Flavor::Thinking, ctx)
 	}
+
 	/// Builds a user prompt rendered as a panel-filled bubble.
 	fn user(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
 		Self::styled(text, width, Flavor::User, ctx)
