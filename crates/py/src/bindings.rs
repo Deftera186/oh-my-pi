@@ -4,6 +4,7 @@ use std::{
 	cmp::Ordering,
 	collections::{BTreeMap, hash_map::DefaultHasher},
 	fmt::Display,
+	future::Future,
 	hash::{Hash, Hasher},
 	str::{self, FromStr},
 	sync::{Arc, LazyLock, OnceLock, atomic},
@@ -164,6 +165,22 @@ static ASYNC_RUNTIME: LazyLock<runtime::Runtime> = LazyLock::new(|| {
 		.build()
 		.expect("omp Python DATA runtime must initialize")
 });
+
+/// Blocks on DATA I/O without entering a Tokio runtime from one of its workers.
+fn block_on_data<F>(future: F) -> F::Output
+where
+	F: Future + Send,
+	F::Output: Send,
+{
+	if runtime::Handle::try_current().is_err() {
+		return ASYNC_RUNTIME.block_on(future);
+	}
+	std::thread::scope(|scope| match scope.spawn(move || ASYNC_RUNTIME.block_on(future)).join() {
+		Ok(output) => output,
+		Err(payload) => std::panic::resume_unwind(payload),
+	})
+}
+
 /// Document transactions require exactly 16 id bytes; ulids are unique and fit.
 fn fresh_transaction_id() -> Vec<u8> {
 	omp_core::Ulid::generate().to_bytes().to_vec()
@@ -1140,6 +1157,37 @@ fn environment_exception(py: Python<'_>, name: &str, message: &str) -> PyErr {
 		Ok(value) => PyErr::from_value(value),
 		Err(error) => error,
 	}
+}
+
+fn edit_rejection_exception(py: Python<'_>, rejected: &document_pb::TransactionRejected) -> PyErr {
+	let Some(conflict) = rejected.conflicts.first() else {
+		return environment_exception(py, "Stale", &rejected.message);
+	};
+	let result = (|| -> PyResult<PyErr> {
+		let value = py
+			.import("omp.env")?
+			.getattr("Conflict")?
+			.call1((&rejected.message,))?;
+		value.setattr("expected", revision_value(py, conflict.expected.as_ref())?)?;
+		value.setattr(
+			"current",
+			revision_value(
+				py,
+				conflict
+					.current
+					.as_ref()
+					.and_then(|head| head.revision.as_ref()),
+			)?,
+		)?;
+		let ranges: Vec<(u64, u64)> = conflict
+			.conflicting_ranges
+			.iter()
+			.map(|range| (range.start, range.end))
+			.collect();
+		value.setattr("ranges", ranges)?;
+		Ok(PyErr::from_value(value))
+	})();
+	result.unwrap_or_else(|error| error)
 }
 
 fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
@@ -2212,17 +2260,16 @@ impl PyEnvironmentBackend {
 				})
 			})
 			.transpose()?;
-		let response = ASYNC_RUNTIME
-			.block_on(self.client.open_session(&cwd, env_pb::OpenSessionRequest {
-				env_delta: Some(env_pb::EnvironmentDelta {
-					set:   env,
-					unset: Vec::new(),
-					props: Default::default(),
-				}),
-				pty,
-				..Default::default()
-			}))
-			.map_err(|error| client_error(py, error))?;
+		let response = block_on_data(self.client.open_session(&cwd, env_pb::OpenSessionRequest {
+			env_delta: Some(env_pb::EnvironmentDelta {
+				set:   env,
+				unset: Vec::new(),
+				props: Default::default(),
+			}),
+			pty,
+			..Default::default()
+		}))
+		.map_err(|error| client_error(py, error))?;
 		let result = PyDict::new(py);
 		result.set_item("id", PyBytes::new(py, &response.session))?;
 		result.set_item("cwd", path_value(py, &response.cwd_uri)?)?;
@@ -2618,9 +2665,7 @@ impl PyEnvironmentBackend {
 						}
 						Ok(result.unbind().into_any())
 					},
-					TransactionOutcome::Rejected(value) => {
-						Err(environment_exception(py, "Stale", &value.message))
-					},
+					TransactionOutcome::Rejected(value) => Err(edit_rejection_exception(py, &value)),
 					TransactionOutcome::Partial(value) => {
 						Err(environment_exception(py, "Partial", &value.message))
 					},
@@ -3229,15 +3274,13 @@ impl PyEnvironmentBackend {
 					.get_item("script")?
 					.ok_or_else(|| PyTypeError::new_err("script is required"))?
 					.extract::<String>()?;
-				let mut run = ASYNC_RUNTIME
-					.block_on(self.client.exec(env_pb::ExecRequest {
-						session: session.into(),
-						source:  Some(env_pb::Script { text: script, props: Default::default() }),
-						props:   Default::default(),
-					}))
-					.map_err(|error| client_error(py, error))?;
-				let started = ASYNC_RUNTIME
-					.block_on(run.next_event())
+				let mut run = block_on_data(self.client.exec(env_pb::ExecRequest {
+					session: session.into(),
+					source:  Some(env_pb::Script { text: script, props: Default::default() }),
+					props:   Default::default(),
+				}))
+				.map_err(|error| client_error(py, error))?;
+				let started = block_on_data(run.next_event())
 					.map_err(|error| client_error(py, error))?
 					.ok_or_else(|| {
 						environment_exception(py, "Disconnected", "exec stream ended before start")
@@ -3259,12 +3302,11 @@ impl PyEnvironmentBackend {
 					.get_item("session")?
 					.ok_or_else(|| PyTypeError::new_err("session is required"))?
 					.extract::<Vec<u8>>()?;
-				ASYNC_RUNTIME
-					.block_on(self.client.close_session(env_pb::CloseSessionRequest {
-						session: session.into(),
-						props:   Default::default(),
-					}))
-					.map_err(|error| client_error(py, error))?;
+				block_on_data(self.client.close_session(env_pb::CloseSessionRequest {
+					session: session.into(),
+					props:   Default::default(),
+				}))
+				.map_err(|error| client_error(py, error))?;
 				Ok(py.None())
 			},
 			"omp.env.Run.stdin" | "omp.env.Run.eof" | "omp.env.Run.signal" | "omp.env.Run.resize" => {

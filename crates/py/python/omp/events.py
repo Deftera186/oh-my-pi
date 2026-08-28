@@ -403,6 +403,8 @@ class SessionRewoundEvent:
     to_event: int | None
     new_head: int
     restored_workspace: bool
+    running_jobs: tuple[str, ...] = ()
+    cancelled_jobs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
