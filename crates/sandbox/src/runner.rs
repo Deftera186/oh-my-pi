@@ -31,6 +31,7 @@ static DOCKER_STATUS: LazyLock<BackendStatus> =
 static DOCKER_RUNSC_STATUS: LazyLock<BackendStatus> =
 	LazyLock::new(|| docker::probe(Backend::DockerRunscEphemeral));
 static APP_CONTAINER_STATUS: LazyLock<BackendStatus> = LazyLock::new(appcontainer::probe);
+pub(crate) const COMMAND_WRAPPER_PLACEHOLDER: &str = "<omp-sandbox-command>";
 
 /// Returns the cached live status for one backend.
 #[must_use]
@@ -149,18 +150,21 @@ impl Runner {
 	pub fn compile(self, spec: &SandboxSpec) -> Result<Plan, SandboxError> {
 		spec.validate()?;
 		let program = resolve_program(&spec.program)?;
+		self.compile_program(spec, &program)
+	}
+
+	fn compile_program(self, spec: &SandboxSpec, program: &Path) -> Result<Plan, SandboxError> {
+		spec.validate()?;
 		let requested = spec.requested_capabilities();
 		let missing = requested.difference(self.capabilities());
 		let enforced = requested.intersection(self.capabilities());
 		let mut plan = match self.backend {
-			Backend::Seatbelt => seatbelt::compile(spec, &program, requested, enforced),
-			Backend::Bubblewrap => bubblewrap::compile(spec, &program, requested, enforced),
-			Backend::Gvisor => gvisor::compile(spec, &program, requested, enforced),
-			Backend::DockerEphemeral => docker::compile(spec, &program, requested, enforced),
-			Backend::DockerRunscEphemeral => {
-				docker::compile_runsc(spec, &program, requested, enforced)
-			},
-			Backend::AppContainer => appcontainer::compile(spec, &program, requested, enforced),
+			Backend::Seatbelt => seatbelt::compile(spec, program, requested, enforced),
+			Backend::Bubblewrap => bubblewrap::compile(spec, program, requested, enforced),
+			Backend::Gvisor => gvisor::compile(spec, program, requested, enforced),
+			Backend::DockerEphemeral => docker::compile(spec, program, requested, enforced),
+			Backend::DockerRunscEphemeral => docker::compile_runsc(spec, program, requested, enforced),
+			Backend::AppContainer => appcontainer::compile(spec, program, requested, enforced),
 		}?;
 		if spec.degradation == DegradationPolicy::Reject {
 			let missing = requested.difference(plan.enforced());
@@ -183,6 +187,56 @@ impl Runner {
 			}
 		}
 		Ok(plan)
+	}
+
+	/// Compiles a reusable native launcher prefix from a program-less policy.
+	pub fn wrap_template(self, spec: &SandboxSpec) -> Result<CommandWrapper, SandboxError> {
+		if !matches!(self.backend, Backend::Seatbelt | Backend::Bubblewrap) {
+			return Err(SandboxError::CommandWrapperUnsupported { backend: self.backend });
+		}
+		if self.backend != native_command_backend()? {
+			return Err(SandboxError::CommandWrapperUnsupported { backend: self.backend });
+		}
+		if spec.no_exec {
+			return Err(SandboxError::CommandWrapperNoExec { backend: self.backend });
+		}
+
+		let placeholder = Path::new(COMMAND_WRAPPER_PLACEHOLDER);
+		let plan = self.compile_program(spec, placeholder)?;
+		let mut preparation_spec = spec.clone();
+		preparation_spec.environment = crate::EnvironmentPolicy::exact(Vec::new());
+		let mut prepared = self.prepare(plan, &preparation_spec)?;
+		let launcher = prepared
+			.program
+			.take()
+			.ok_or(SandboxError::EmptyPlanArgv { backend: self.backend })?;
+		let mut prefix_args = std::mem::take(&mut prepared.args);
+		match self.backend {
+			Backend::Seatbelt => {
+				prefix_args.truncate(2);
+				prefix_args.push(OsString::from("--"));
+			},
+			Backend::Bubblewrap => {
+				let separator = prefix_args
+					.iter()
+					.position(|arg| arg == OsStr::new("--"))
+					.ok_or(SandboxError::MissingPlanPlaceholder {
+						backend:     self.backend,
+						placeholder: "--",
+					})?;
+				prefix_args.truncate(separator + 1);
+			},
+			Backend::Gvisor
+			| Backend::DockerEphemeral
+			| Backend::DockerRunscEphemeral
+			| Backend::AppContainer => unreachable!("native backend checked above"),
+		}
+		Ok(CommandWrapper {
+			launcher,
+			prefix_args,
+			environment: spec.environment.clone(),
+			resources: std::mem::take(&mut prepared.resources),
+		})
 	}
 
 	/// Materializes runtime-only files, values, and owned cleanup resources.
@@ -367,6 +421,45 @@ pub struct RunOutput {
 	pub stdout: CowBytes<'static>,
 	/// Captured standard error, empty unless requested.
 	pub stderr: CowBytes<'static>,
+}
+
+/// Precompiled sandbox launcher reused across many command spawns.
+///
+/// Temporary profile and bind-mask resources remain alive until this value is
+/// dropped. The wrapper is `Send + Sync` and its accessors allocate nothing.
+pub struct CommandWrapper {
+	launcher:    OsString,
+	prefix_args: Vec<OsString>,
+	environment: crate::EnvironmentPolicy,
+	resources:   Vec<PreparedResource>,
+}
+
+impl CommandWrapper {
+	/// Returns the launcher program, such as `sandbox-exec` or `bwrap`.
+	#[must_use]
+	pub fn launcher(&self) -> &OsStr {
+		&self.launcher
+	}
+
+	/// Returns arguments placed before the wrapped program.
+	#[must_use]
+	pub fn prefix_args(&self) -> &[OsString] {
+		&self.prefix_args
+	}
+
+	/// Reports whether an exported environment variable may reach the child.
+	#[must_use]
+	pub fn env_allowed(&self, key: &str) -> bool {
+		self.environment.allows(key)
+	}
+}
+
+impl Drop for CommandWrapper {
+	fn drop(&mut self) {
+		while let Some(mut resource) = self.resources.pop() {
+			let _ = resource.cleanup();
+		}
+	}
 }
 
 /// Prepared normal-child command plus resources that must outlive it.

@@ -74,6 +74,11 @@ impl EnvironmentPolicy {
 		!self.allow.is_empty() || !self.deny.is_empty()
 	}
 
+	pub(crate) fn allows(&self, name: &str) -> bool {
+		let name = OsStr::new(name);
+		(self.allow.is_empty() || matches_any(name, &self.allow)) && !matches_any(name, &self.deny)
+	}
+
 	pub(crate) fn resolve(&self) -> Option<Vec<OsString>> {
 		let entries = match &self.source {
 			EnvironmentSource::Inherit if !self.scrubs() => return None,

@@ -133,6 +133,25 @@ fn overlay_is_scoped_deny_without_claiming_ephemeral_redirects() {
 }
 
 #[test]
+fn scoped_write_profile_excludes_denied_subtree() {
+	let root = tempdir().expect("writable scope");
+	let denied = root.path().join("denied");
+	fs::create_dir(&denied).expect("denied directory");
+	let program = std::env::current_exe().expect("test executable");
+	let mut spec = caveated_spec(&program);
+	spec.set_write(WriteMode::Scoped);
+	spec.allow_write(root.path()).expect("write scope");
+	spec.deny_write(&denied).expect("write denial");
+	let profile = compile(&spec)
+		.profile()
+		.expect("Seatbelt profile")
+		.to_owned();
+	let denied = sbpl_path(&fs::canonicalize(denied).expect("canonical denied"));
+	assert!(profile.contains(&format!("(require-not (subpath \"{denied}\"))")));
+	assert!(profile.contains(&format!("(require-not (literal \"{denied}\"))")));
+}
+
+#[test]
 fn no_exec_and_resources_are_caveated_without_false_capabilities() {
 	let program = std::env::current_exe().expect("test executable");
 	let mut spec = caveated_spec(&program);
@@ -241,6 +260,26 @@ mod live {
 	}
 
 	#[test]
+	fn wrapper_prefix_executes_and_filters_environment_names() {
+		let Some(runner) = runner() else { return };
+		let mut spec = SandboxSpec::new("");
+		spec.deny_env("*TOKEN*").expect("deny environment glob");
+		let wrapper = runner.wrap_template(&spec).expect("compile wrapper");
+		assert!(wrapper.env_allowed("PATH"));
+		assert!(!wrapper.env_allowed("API_TOKEN"));
+		assert_eq!(wrapper.prefix_args().last().and_then(|arg| arg.to_str()), Some("--"));
+
+		let output = Command::new(wrapper.launcher())
+			.args(wrapper.prefix_args())
+			.arg("/bin/echo")
+			.arg("wrapped")
+			.output()
+			.expect("run wrapped echo");
+		assert_success(&output);
+		assert_eq!(output.stdout, b"wrapped\n");
+	}
+
+	#[test]
 	fn scoped_writes_persist_and_outside_writes_fail() {
 		let Some(runner) = runner() else { return };
 		let root = tempdir().expect("temporary root");
@@ -259,6 +298,28 @@ mod live {
 		assert_success(&command.output().expect("run scoped-write probe"));
 		assert_eq!(fs::read(allowed.join("persisted")).expect("persisted write"), b"written");
 		assert!(!outside.join("blocked").exists());
+	}
+
+	#[test]
+	fn denied_write_subtree_is_read_only_while_sibling_stays_writable() {
+		let Some(runner) = runner() else { return };
+		let root = tempdir().expect("writable scope");
+		let denied = root.path().join("denied");
+		let sibling = root.path().join("sibling");
+		fs::create_dir(&denied).expect("denied directory");
+		fs::create_dir(&sibling).expect("sibling directory");
+		let mut spec = probe_spec();
+		spec.set_write(WriteMode::Scoped);
+		spec.allow_write(root.path()).expect("write scope");
+		spec.deny_write(&denied).expect("write denial");
+		let mut command = command_for(runner, &spec, "write-carveout");
+		command
+			.command
+			.env("OMP_ALLOWED", sibling.join("persisted"))
+			.env("OMP_DENIED", denied.join("blocked"));
+		assert_success(&command.output().expect("run write carve-out probe"));
+		assert_eq!(fs::read(sibling.join("persisted")).expect("sibling write"), b"written");
+		assert!(!denied.join("blocked").exists());
 	}
 
 	#[test]
@@ -432,6 +493,10 @@ mod live {
 			"write-deny" => {
 				assert!(fs::write(required_path("OMP_DENIED"), b"blocked").is_err());
 				assert!(fs::remove_file(required_path("OMP_EXISTING")).is_err());
+			},
+			"write-carveout" => {
+				fs::write(required_path("OMP_ALLOWED"), b"written").expect("sibling write");
+				assert!(fs::write(required_path("OMP_DENIED"), b"blocked").is_err());
 			},
 			"scoped-read" => {
 				assert_eq!(fs::read(required_path("OMP_ALLOWED")).expect("allowed read"), b"allowed");

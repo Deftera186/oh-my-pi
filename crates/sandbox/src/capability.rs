@@ -80,7 +80,7 @@ pub enum Capability {
 	#[strum(serialize = "fs.read.scope")]
 	#[serde(rename = "fs.read.scope")]
 	FsReadScope,
-	/// Deny writes to the host filesystem.
+	/// Deny host writes globally or beneath explicit carve-out paths.
 	#[strum(serialize = "fs.write.deny")]
 	#[serde(rename = "fs.write.deny")]
 	FsWriteDeny,
@@ -159,7 +159,7 @@ const DESCRIPTIONS: [&str; 17] = [
 	"read broadly except denied sensitive paths",
 	"read the host filesystem broadly",
 	"restrict host/user filesystem reads to an allowlist plus backend runtime paths",
-	"deny all writes to the host filesystem",
+	"deny host writes globally or beneath explicit read-only carve-out paths",
 	"permit backend ephemeral writes; configured host inputs stay untouched",
 	"permit writes under listed paths plus opt-in temp roots; listed-path writes persist",
 	"no host local IPC endpoint reachable",

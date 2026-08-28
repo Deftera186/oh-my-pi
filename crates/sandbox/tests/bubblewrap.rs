@@ -66,6 +66,25 @@ fn scoped_view_binds_loader_reads_and_writable_overrides() {
 }
 
 #[test]
+fn write_denies_remount_subtrees_read_only_after_writable_bind() {
+	let root = tempdir().expect("writable scope");
+	let denied = root.path().join("denied");
+	fs::create_dir(&denied).expect("denied directory");
+	let root = fs::canonicalize(root.path()).expect("canonical root");
+	let denied = fs::canonicalize(denied).expect("canonical denied");
+
+	let mut spec = SandboxSpec::new(executable());
+	spec.set_write(WriteMode::Scoped);
+	spec.allow_write(&root).expect("write scope");
+	spec.deny_write(&denied).expect("write denial");
+	let plan = compile(spec);
+	let writable_index = mount_index(plan.argv(), "--bind", &root);
+	let denied_index = mount_index(plan.argv(), "--ro-bind", &denied);
+	assert!(writable_index < denied_index, "read-only carve-out must shadow writable bind");
+	assert!(plan.enforced().contains(Capability::FsWriteDeny));
+}
+
+#[test]
 fn existing_read_denies_compile_to_typed_mask_mounts() {
 	let root = tempdir().expect("temporary paths");
 	let denied_file = root.path().join("secret");
@@ -209,6 +228,32 @@ fn explicit_unix_socket_is_bound_without_claiming_ipc_restriction() {
 	assert!(!plan.requested().contains(Capability::IpcRestrict));
 	assert!(!plan.enforced().contains(Capability::IpcRestrict));
 	assert_enforced_subset(&plan);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wrapper_prefix_executes_and_filters_environment_names() {
+	use std::process::Command;
+
+	if !omp_sandbox::backend_status(Backend::Bubblewrap).is_available() {
+		return;
+	}
+	let mut spec = SandboxSpec::new("");
+	spec.deny_env("*TOKEN*").expect("deny environment glob");
+	let wrapper = Runner::for_backend(Backend::Bubblewrap)
+		.wrap_template(&spec)
+		.expect("compile wrapper");
+	assert!(wrapper.env_allowed("PATH"));
+	assert!(!wrapper.env_allowed("API_TOKEN"));
+	assert_eq!(wrapper.prefix_args().last().and_then(|arg| arg.to_str()), Some("--"));
+	let output = Command::new(wrapper.launcher())
+		.args(wrapper.prefix_args())
+		.arg("/bin/echo")
+		.arg("wrapped")
+		.output()
+		.expect("run wrapped echo");
+	assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+	assert_eq!(output.stdout, b"wrapped\n");
 }
 
 #[cfg(target_os = "linux")]
@@ -413,6 +458,15 @@ fn has_mount(argv: &[std::ffi::OsString], option: &str, source: &Path, target: &
 	argv.windows(3).any(|window| {
 		window[0] == option && Path::new(&window[1]) == source && Path::new(&window[2]) == target
 	})
+}
+
+fn mount_index(argv: &[std::ffi::OsString], option: &str, target: &Path) -> usize {
+	argv
+		.windows(3)
+		.position(|window| {
+			window[0] == option && Path::new(&window[1]) == target && Path::new(&window[2]) == target
+		})
+		.expect("mount target")
 }
 
 fn mount_source<'a>(argv: &'a [std::ffi::OsString], option: &str, target: &Path) -> &'a Path {

@@ -23,7 +23,7 @@ pub use error::{
 };
 pub use plan::{Caveat, FilesystemVirtualizationKind, Plan};
 pub use runner::{
-	OutputMode, PreparedSandbox, RunOptions, RunOutput, Runner, SandboxExit, SandboxInput,
-	backend_status, backend_statuses,
+	CommandWrapper, OutputMode, PreparedSandbox, RunOptions, RunOutput, Runner, SandboxExit,
+	SandboxInput, backend_status, backend_statuses,
 };
 pub use spec::{DegradationPolicy, NetworkMode, ResourceLimits, SandboxSpec, WriteMode};

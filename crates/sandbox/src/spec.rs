@@ -170,6 +170,7 @@ pub struct SandboxSpec {
 	pub(crate) readable:      Vec<PathBuf>,
 	pub(crate) read_deny:     Vec<PathBuf>,
 	pub(crate) writable:      Vec<PathBuf>,
+	pub(crate) write_deny:    Vec<PathBuf>,
 	pub(crate) unix_sockets:  Vec<PathBuf>,
 	pub(crate) allow_temp:    bool,
 	pub(crate) no_exec:       bool,
@@ -192,6 +193,7 @@ impl SandboxSpec {
 			readable:      Vec::new(),
 			read_deny:     Vec::new(),
 			writable:      Vec::new(),
+			write_deny:    Vec::new(),
 			unix_sockets:  Vec::new(),
 			allow_temp:    false,
 			no_exec:       false,
@@ -273,6 +275,13 @@ impl SandboxSpec {
 		Ok(self)
 	}
 
+	/// Carves a canonicalized read-only subtree out of otherwise writable
+	/// scopes.
+	pub fn deny_write(&mut self, path: impl AsRef<Path>) -> Result<&mut Self, SandboxError> {
+		insert_path(&mut self.write_deny, canonicalize_deny(path.as_ref())?);
+		Ok(self)
+	}
+
 	/// Allows connection to one existing Unix-domain socket without enabling IP
 	/// networking. The socket is also readable so restricted filesystem
 	/// profiles can resolve the endpoint during `connect`.
@@ -348,6 +357,13 @@ impl SandboxSpec {
 		if self.write == WriteMode::Scoped && self.writable.is_empty() && !self.allow_temp {
 			return Err(SpecViolation::EmptyWriteScope.into());
 		}
+		if self
+			.write_deny
+			.iter()
+			.any(|path| !path_under_any(path, &self.writable))
+		{
+			return Err(SpecViolation::WriteDenyOutsideScope.into());
+		}
 		if let (Some(dir), false) = (&self.dir, self.readable.is_empty())
 			&& !path_under_any(dir, &self.readable)
 			&& !path_under_any(dir, &self.writable)
@@ -377,6 +393,9 @@ impl SandboxSpec {
 		}));
 		if !self.read_deny.is_empty() {
 			capabilities = capabilities.union(CapabilitySet::one(Capability::FsReadDeny));
+		}
+		if !self.write_deny.is_empty() {
+			capabilities = capabilities.union(CapabilitySet::one(Capability::FsWriteDeny));
 		}
 		if self.environment.scrubs() {
 			capabilities = capabilities.union(CapabilitySet::one(Capability::EnvScrub));
@@ -431,6 +450,7 @@ impl SandboxSpec {
 		hash_paths(&mut hasher, &self.readable);
 		hash_paths(&mut hasher, &self.read_deny);
 		hash_paths(&mut hasher, &self.writable);
+		hash_paths(&mut hasher, &self.write_deny);
 		hash_paths(&mut hasher, &self.unix_sockets);
 		hash_bool(&mut hasher, self.allow_temp);
 		hash_bool(&mut hasher, self.no_exec);

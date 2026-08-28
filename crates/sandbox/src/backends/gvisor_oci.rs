@@ -74,6 +74,7 @@ impl GvisorOciPlan {
 pub(crate) fn needs_filesystem_view(spec: &SandboxSpec) -> bool {
 	!spec.readable.is_empty()
 		|| !spec.read_deny.is_empty()
+		|| !spec.write_deny.is_empty()
 		|| !spec.unix_sockets.is_empty()
 		|| matches!(spec.write, WriteMode::Scoped | WriteMode::Overlay)
 }

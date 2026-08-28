@@ -40,6 +40,16 @@ pub(crate) fn compile(
 			});
 		}
 	}
+	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
+	if has_future_write_deny {
+		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
+		if spec.degradation == DegradationPolicy::Reject {
+			return Err(SandboxError::BackendCapabilities {
+				backend: Backend::Gvisor,
+				missing: CapabilitySet::one(Capability::FsWriteDeny),
+			});
+		}
+	}
 	let filesystem_view = needs_filesystem_view(spec);
 	if filesystem_view && enforced.contains(Capability::IpcRestrict) {
 		enforced = enforced.difference(CapabilitySet::one(Capability::IpcRestrict));
@@ -92,6 +102,18 @@ pub(crate) fn compile(
 			plan.add_caveat(Caveat::capability(
 				Capability::FsReadDeny,
 				"gVisor cannot pre-mount a read-deny mask for a path that does not yet exist",
+			));
+		}
+	}
+	if !spec.write_deny.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsWriteDeny,
+			"gVisor remounts existing denied write subtrees read-only inside writable bind mounts",
+		));
+		if has_future_write_deny {
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteDeny,
+				"gVisor cannot pre-mount a read-only carve-out for a path that does not yet exist",
 			));
 		}
 	}

@@ -52,6 +52,16 @@ pub(crate) fn compile(
 	if spec.write == WriteMode::Overlay {
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteEphemeral));
 	}
+	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
+	if has_future_write_deny {
+		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
+		if spec.degradation == DegradationPolicy::Reject {
+			return Err(SandboxError::BackendCapabilities {
+				backend: Backend::AppContainer,
+				missing: CapabilitySet::one(Capability::FsWriteDeny),
+			});
+		}
+	}
 	let capability_sids = capability_sids(spec.network);
 	let loses_ipc = !capability_sids.is_empty() && enforced.contains(Capability::IpcRestrict);
 	if loses_ipc {
@@ -109,6 +119,18 @@ pub(crate) fn compile(
 			Capability::FsReadDeny,
 			"temporary deny ACEs are applied only to existing paths whose DACL can be changed",
 		));
+	}
+	if !spec.write_deny.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsWriteDeny,
+			"temporary write-deny ACEs make existing carve-out paths read-only while the process runs",
+		));
+		if has_future_write_deny {
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteDeny,
+				"AppContainer cannot apply a write-deny ACE to a path that does not yet exist",
+			));
+		}
 	}
 	if !spec.unix_sockets.is_empty() {
 		plan.add_caveat(Caveat::general(
@@ -229,6 +251,14 @@ fn render_profile(spec: &SandboxSpec, program: &Path, sids: &[CapabilitySid]) ->
 		profile.push_str(&path.to_string_lossy());
 	}
 	if spec.read_deny.is_empty() {
+		profile.push_str(" none");
+	}
+	profile.push_str("\n  write deny:");
+	for path in &spec.write_deny {
+		profile.push(' ');
+		profile.push_str(&path.to_string_lossy());
+	}
+	if spec.write_deny.is_empty() {
 		profile.push_str(" none");
 	}
 	profile.push_str("\n  read grants: ");

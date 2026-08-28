@@ -15,7 +15,7 @@ use crate::SandboxOperation;
 use crate::{
 	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
 	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
-	WriteMode, paths::path_under_any,
+	WriteMode, paths::path_under_any, runner::COMMAND_WRAPPER_PLACEHOLDER,
 };
 
 pub(crate) const FILE_MASK_PLACEHOLDER: &str = "@omp-bwrap-file-mask@";
@@ -34,6 +34,11 @@ pub(crate) fn compile(
 	if has_future_deny {
 		unavailable = unavailable.union(CapabilitySet::one(Capability::FsReadDeny));
 		enforced = enforced.difference(CapabilitySet::one(Capability::FsReadDeny));
+	}
+	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
+	if has_future_write_deny {
+		unavailable = unavailable.union(CapabilitySet::one(Capability::FsWriteDeny));
+		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
 	}
 	if spec.degradation == DegradationPolicy::Reject && !unavailable.is_empty() {
 		return Err(SandboxError::BackendCapabilities {
@@ -92,7 +97,16 @@ pub(crate) fn compile(
 			push_bind(&mut argv, "--bind", path);
 		}
 	}
-
+	for socket in &spec.unix_sockets {
+		push_bind(&mut argv, "--bind", socket);
+	}
+	for path in spec
+		.write_deny
+		.iter()
+		.filter(|path| path.exists() && path_under_any(path, &spec.writable))
+	{
+		push_bind(&mut argv, "--ro-bind", path);
+	}
 	for path in spec.read_deny.iter().filter(|path| path.exists()) {
 		let placeholder = if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
 			DIRECTORY_MASK_PLACEHOLDER
@@ -105,9 +119,6 @@ pub(crate) fn compile(
 			path.as_os_str().to_owned(),
 		]);
 	}
-	for socket in &spec.unix_sockets {
-		push_bind(&mut argv, "--bind", socket);
-	}
 
 	argv.push(OsString::from("--"));
 	argv.push(program.as_os_str().to_owned());
@@ -116,6 +127,12 @@ pub(crate) fn compile(
 	let mut plan = Plan::new(Backend::Bubblewrap, requested, enforced, argv, true);
 	if spec.degradation == DegradationPolicy::AllowCaveats {
 		add_degradation_caveats(&mut plan, spec, unavailable, has_future_deny);
+		if has_future_write_deny {
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteDeny,
+				"Bubblewrap cannot pre-mount a read-only carve-out for a path that does not yet exist",
+			));
+		}
 	}
 	if spec.write == WriteMode::Overlay {
 		plan.set_filesystem(FilesystemVirtualizationKind::ScopedDeny);
@@ -137,7 +154,11 @@ fn launcher() -> OsString {
 }
 
 fn runtime_closure(program: &Path) -> Vec<PathBuf> {
-	let mut paths = vec![program.to_path_buf()];
+	let mut paths = if program == Path::new(COMMAND_WRAPPER_PLACEHOLDER) {
+		Vec::new()
+	} else {
+		vec![program.to_path_buf()]
+	};
 	for candidate in [
 		"/etc/ld.so.cache",
 		"/etc/ld.so.conf",

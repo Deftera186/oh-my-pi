@@ -4,7 +4,8 @@ use std::{ffi::OsString, fs, path::Path};
 
 use omp_sandbox::{
 	Backend, Capability, CapabilitySet, DegradationPolicy, EnvironmentSource, NetworkMode,
-	ResourceLimits, Runner, SandboxError, SandboxSpec, SpecViolation, portable_capabilities,
+	ResourceLimits, Runner, SandboxError, SandboxSpec, SpecViolation, WriteMode,
+	portable_capabilities,
 };
 use tempfile::tempdir;
 
@@ -111,6 +112,28 @@ fn deterministic_ids_cover_arguments_and_environment_without_leaking_values() {
 		.compile(&changed)
 		.expect("changed gVisor plan");
 	assert_ne!(plan_id(&first_plan), plan_id(&changed_plan));
+}
+
+#[test]
+fn deterministic_ids_include_write_deny_paths() {
+	let root = tempdir().expect("writable scope");
+	let denied = root.path().join("denied");
+	fs::create_dir(&denied).expect("denied directory");
+	let mut first = SandboxSpec::new(executable());
+	first
+		.set_write(WriteMode::Scoped)
+		.set_degradation(DegradationPolicy::AllowCaveats);
+	first.allow_write(root.path()).expect("write scope");
+	let mut second = first.clone();
+	second.deny_write(&denied).expect("write denial");
+
+	let first = Runner::for_backend(Backend::Gvisor)
+		.compile(&first)
+		.expect("first gVisor plan");
+	let second = Runner::for_backend(Backend::Gvisor)
+		.compile(&second)
+		.expect("second gVisor plan");
+	assert_ne!(plan_id(&first), plan_id(&second));
 }
 
 #[test]

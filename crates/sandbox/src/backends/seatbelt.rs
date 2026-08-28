@@ -15,7 +15,7 @@ use crate::SandboxOperation;
 use crate::{
 	Backend, BackendStatus, Capability, CapabilitySet, Caveat, DegradationPolicy,
 	FilesystemVirtualizationKind, NetworkMode, Plan, ProbeFailure, SandboxError, SandboxSpec,
-	WriteMode, paths::temp_roots,
+	WriteMode, paths::temp_roots, runner::COMMAND_WRAPPER_PLACEHOLDER,
 };
 
 const LAUNCHER: &str = "/usr/bin/sandbox-exec";
@@ -87,7 +87,7 @@ pub(crate) fn compile(
 				.readable
 				.iter()
 				.map(PathBuf::as_path)
-				.chain(std::iter::once(program)),
+				.chain((program != Path::new(COMMAND_WRAPPER_PLACEHOLDER)).then_some(program)),
 		);
 		if spec.write == WriteMode::Ephemeral {
 			push_paths(&mut profile, "allow", "file-read*", [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)]);
@@ -103,19 +103,18 @@ pub(crate) fn compile(
 		WriteMode::Deny => {},
 		WriteMode::Scoped | WriteMode::Overlay => {
 			let temporary = spec.allow_temp.then(temp_roots).unwrap_or_default();
-			push_scopes(
+			push_write_scopes(
 				&mut profile,
-				"allow",
-				"file-write*",
 				spec
 					.writable
 					.iter()
 					.map(PathBuf::as_path)
 					.chain(temporary.iter().map(PathBuf::as_path)),
+				&spec.write_deny,
 			);
 		},
 		WriteMode::Ephemeral => {
-			push_paths(&mut profile, "allow", "file-write*", [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)])
+			push_write_scopes(&mut profile, [Path::new(EPHEMERAL_ROOT_PLACEHOLDER)], &spec.write_deny)
 		},
 	}
 
@@ -189,6 +188,13 @@ pub(crate) fn compile(
 			Capability::FsReadDeny,
 			"Seatbelt read denials are path based and can be bypassed through an allowed hardlink to \
 			 the same inode",
+		));
+	}
+	if !spec.write_deny.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsWriteDeny,
+			"Seatbelt write denials are path based and can be bypassed through an allowed hardlink \
+			 to the same inode",
 		));
 	}
 	match spec.network {
@@ -340,6 +346,33 @@ fn push_scopes<'a>(
 		}
 	}
 	profile.push_str(")\n");
+}
+
+fn push_write_scopes<'a>(
+	profile: &mut String,
+	paths: impl IntoIterator<Item = &'a Path>,
+	denied: &[PathBuf],
+) {
+	for path in paths {
+		let filter = if path.is_dir() || !path.exists() {
+			"subpath"
+		} else {
+			"literal"
+		};
+		profile.push_str("(allow file-write* (require-all (");
+		profile.push_str(filter);
+		profile.push(' ');
+		push_path_string(profile, path);
+		profile.push(')');
+		for denied in denied {
+			profile.push_str(" (require-not (subpath ");
+			push_path_string(profile, denied);
+			profile.push_str(")) (require-not (literal ");
+			push_path_string(profile, denied);
+			profile.push_str("))");
+		}
+		profile.push_str("))\n");
+	}
 }
 
 fn push_path_string(profile: &mut String, path: &Path) {

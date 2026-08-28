@@ -80,6 +80,16 @@ fn compile_for(
 	}
 	let readable = &spec.readable;
 	let writable = &spec.writable;
+	let has_future_write_deny = spec.write_deny.iter().any(|path| !path.exists());
+	if has_future_write_deny {
+		enforced = enforced.difference(CapabilitySet::one(Capability::FsWriteDeny));
+		if spec.degradation == DegradationPolicy::Reject {
+			return Err(SandboxError::BackendCapabilities {
+				backend,
+				missing: CapabilitySet::one(Capability::FsWriteDeny),
+			});
+		}
+	}
 
 	if let Some(dir) = &spec.dir
 		&& !path_under_any(dir, readable)
@@ -130,6 +140,13 @@ fn compile_for(
 		if !path_under_any(path, &readable) && !path_under_any(path, &writable) {
 			push_mount(&mut argv, backend, path, path, true)?;
 		}
+	}
+	for path in spec
+		.write_deny
+		.iter()
+		.filter(|path| path.exists() && path_under_any(path, writable))
+	{
+		push_mount(&mut argv, backend, path, path, true)?;
 	}
 	if let Some(dir) = &spec.dir {
 		push_pair(&mut argv, "--workdir", dir.as_os_str());
@@ -208,6 +225,18 @@ fn compile_for(
 			"Docker read-deny masks apply only within container and mounted paths; broad host reads \
 			 are never exposed",
 		));
+	}
+	if !spec.write_deny.is_empty() {
+		plan.add_caveat(Caveat::capability(
+			Capability::FsWriteDeny,
+			"Docker overlays existing denied write subtrees with read-only bind mounts",
+		));
+		if has_future_write_deny {
+			plan.add_caveat(Caveat::capability(
+				Capability::FsWriteDeny,
+				"Docker cannot pre-mount a read-only carve-out for a path that does not yet exist",
+			));
+		}
 	}
 	if matches!(spec.write, WriteMode::Scoped | WriteMode::Overlay) {
 		plan.add_caveat(Caveat::general(

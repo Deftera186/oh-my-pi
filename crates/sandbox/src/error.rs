@@ -135,6 +135,9 @@ pub enum SpecViolation {
 	/// Scoped write mode needs at least one writable location.
 	#[error("write mode scope requires a writable path or temporary writes")]
 	EmptyWriteScope,
+	/// A write-deny carve-out must be nested under a writable scope.
+	#[error("write-deny paths must be inside an explicitly writable scope")]
+	WriteDenyOutsideScope,
 	/// A scoped-read working directory must itself be readable or writable.
 	#[error("the working directory is outside every readable and writable scope")]
 	DirectoryOutsideScope,
@@ -471,6 +474,18 @@ pub enum SandboxError {
 	#[error("sandbox backend {backend} cannot produce an external command")]
 	ExternalCommandUnsupported {
 		/// In-process backend.
+		backend: Backend,
+	},
+	/// The selected backend cannot compile a reusable command wrapper.
+	#[error("sandbox backend {backend} cannot compile a reusable command wrapper")]
+	CommandWrapperUnsupported {
+		/// Backend without a native reusable launcher.
+		backend: Backend,
+	},
+	/// A reusable wrapper cannot enforce a command-specific no-exec rule.
+	#[error("sandbox backend {backend} cannot apply no-exec to a program-less command wrapper")]
+	CommandWrapperNoExec {
+		/// Native backend requiring the initial executable path.
 		backend: Backend,
 	},
 	/// A preparation artifact could not be created or populated.
