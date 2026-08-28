@@ -485,7 +485,15 @@ impl SourceSpec {
 	/// Parses an install source together with its optional feature brackets.
 	pub fn parse_install(value: &str) -> Result<(Self, FeatureSelection), ExtensionError> {
 		let parsed = InstallSpec::parse(value)?;
-		let source = if parsed.source.contains(':') {
+		let path = Path::new(parsed.source.as_str());
+		let explicitly_local = path.is_absolute()
+			|| matches!(
+				path.components().next(),
+				Some(std::path::Component::CurDir | std::path::Component::ParentDir)
+			) || parsed.source.starts_with("~/");
+		let source = if explicitly_local {
+			Self::Path(path.to_path_buf())
+		} else if parsed.source.contains(':') {
 			Self::parse(parsed.source.as_str())?
 		} else {
 			Self::Index { index: String::new(), distribution: parsed.source }
@@ -578,27 +586,142 @@ impl SourceSpec {
 	}
 }
 
+/// One package-owned resource family that may be filtered independently.
+#[derive(
+	Clone, Copy, Debug, Display, EnumString, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum ResourceFamily {
+	/// Executable extension entries.
+	Extensions,
+	/// Skill documents.
+	Skills,
+	/// Reusable prompt templates.
+	Prompts,
+	/// Terminal themes.
+	Themes,
+}
+
+/// Per-package resource admission rules.
+///
+/// Plain patterns include by glob, `!` excludes by glob, `+` force-includes
+/// an exact path, and `-` force-excludes an exact path. The four classes are
+/// applied in that order regardless of their order in the input array.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PackageResourceFilter {
+	/// Whether this layer starts from the package defaults. `false` makes the
+	/// layer a delta over an earlier scope.
+	#[serde(default = "package_autoload_default")]
+	pub autoload:   bool,
+	/// Executable extension entry patterns.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub extensions: Option<Vec<Str>>,
+	/// Skill path patterns.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub skills:     Option<Vec<Str>>,
+	/// Prompt-template path patterns.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompts:    Option<Vec<Str>>,
+	/// Theme path patterns.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub themes:     Option<Vec<Str>>,
+}
+
+const fn package_autoload_default() -> bool {
+	true
+}
+
+impl Default for PackageResourceFilter {
+	fn default() -> Self {
+		Self {
+			autoload:   true,
+			extensions: None,
+			skills:     None,
+			prompts:    None,
+			themes:     None,
+		}
+	}
+}
+
+impl PackageResourceFilter {
+	/// Returns this package layer's patterns for one resource family.
+	pub fn patterns(&self, family: ResourceFamily) -> Option<&[Str]> {
+		match family {
+			ResourceFamily::Extensions => self.extensions.as_deref(),
+			ResourceFamily::Skills => self.skills.as_deref(),
+			ResourceFamily::Prompts => self.prompts.as_deref(),
+			ResourceFamily::Themes => self.themes.as_deref(),
+		}
+	}
+}
+
+/// Policy selected when a configured extension source is unavailable.
+#[derive(
+	Clone, Copy, Debug, Default, Display, EnumString, Eq, PartialEq, Deserialize, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum MissingSourcePolicy {
+	/// Materialize a remote source before admitting its resources.
+	#[default]
+	Install,
+	/// Omit the unavailable source for this discovery pass.
+	Skip,
+	/// Refuse discovery or resolution.
+	Error,
+}
+
+/// Typed action produced by missing-source policy evaluation.
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum MissingSourceOutcome {
+	/// Install or materialize the source.
+	Install,
+	/// Skip the source.
+	Skip,
+	/// Return a typed source error.
+	Error,
+}
+
+impl MissingSourcePolicy {
+	/// Returns the action to take for an unavailable configured source.
+	pub const fn outcome(self) -> MissingSourceOutcome {
+		match self {
+			Self::Install => MissingSourceOutcome::Install,
+			Self::Skip => MissingSourceOutcome::Skip,
+			Self::Error => MissingSourceOutcome::Error,
+		}
+	}
+}
+
 /// The `[extensions]` table for one precedence scope.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ExtensionOverlay {
 	/// Extension ids enabled by this scope.
 	#[serde(default)]
-	pub enabled:  BTreeSet<Str>,
+	pub enabled:        BTreeSet<Str>,
 	/// Extension ids disabled by this scope; this is the negative P7 input.
 	#[serde(default)]
-	pub disabled: BTreeSet<Str>,
+	pub disabled:       BTreeSet<Str>,
 	/// Workspace-only replacement declarations.
 	#[serde(default)]
-	pub replace:  BTreeSet<Str>,
+	pub replace:        BTreeSet<Str>,
 	/// Feature selections replacing the install-record feature selection.
 	#[serde(default)]
-	pub features: BTreeMap<Str, Vec<Str>>,
+	pub features:       BTreeMap<Str, Vec<Str>>,
 	/// Scalar, non-secret settings delivered to extensions.
 	#[serde(default)]
-	pub settings: BTreeMap<Str, BTreeMap<Str, toml::Value>>,
+	pub settings:       BTreeMap<Str, BTreeMap<Str, toml::Value>>,
+	/// Per-extension resource-family admission rules.
+	#[serde(default)]
+	pub resources:      BTreeMap<Str, PackageResourceFilter>,
+	/// Action taken when a configured source is unavailable.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub missing_source: Option<MissingSourcePolicy>,
 	/// Optional startup update policy. Workspace scope may only disable it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub updates:  Option<UpdateOverlay>,
+	pub updates:        Option<UpdateOverlay>,
 }
 
 impl ExtensionOverlay {
@@ -654,6 +777,17 @@ pub struct EffectiveExtensionConfig {
 	pub settings:         BTreeMap<Str, toml::Value>,
 	/// Workspace replacement was explicitly declared.
 	pub replace_declared: bool,
+	/// Ordered client then workspace resource-filter layers.
+	pub resource_filters: Vec<PackageResourceFilter>,
+}
+
+/// Folds missing-source policy with later scopes taking precedence.
+pub fn effective_missing_source(scopes: &[ScopedOverlay]) -> MissingSourcePolicy {
+	scopes
+		.iter()
+		.filter_map(|scope| scope.overlay.missing_source)
+		.next_back()
+		.unwrap_or_default()
 }
 
 /// Folds ordered client then workspace overlays. P7 is represented directly as
@@ -675,12 +809,146 @@ pub fn fold_extension(scopes: &[ScopedOverlay], id: &Str) -> EffectiveExtensionC
 				result.settings.insert(key.clone(), value.clone());
 			}
 		}
+		if let Some(filter) = overlay.resources.get(id) {
+			result.resource_filters.push(filter.clone());
+		}
 		result.replace_declared |= scope.scope == Scope::Workspace && overlay.replace.contains(id);
 	}
 	if result.disabled {
 		result.enabled = false;
 	}
 	result
+}
+
+impl EffectiveExtensionConfig {
+	/// Applies the five-tier package resource precedence for one relative path.
+	///
+	/// The caller supplies the manifest/default admission state. A normal
+	/// filter layer replaces it, while `autoload = false` changes only paths
+	/// matched by that layer.
+	pub fn resource_enabled(
+		&self,
+		family: ResourceFamily,
+		relative_path: &str,
+		default_enabled: bool,
+	) -> bool {
+		let mut enabled = default_enabled;
+		for filter in &self.resource_filters {
+			match (filter.autoload, filter.patterns(family)) {
+				(true, Some(patterns)) => {
+					enabled = if patterns.is_empty() {
+						false
+					} else {
+						resource_patterns_enabled(relative_path, patterns, true)
+					};
+				},
+				(true, None) => enabled = true,
+				(false, Some(patterns)) => {
+					if !patterns.is_empty() {
+						enabled = resource_delta_enabled(relative_path, patterns, enabled);
+					}
+				},
+				(false, None) => {},
+			}
+		}
+		enabled
+	}
+}
+
+fn resource_patterns_enabled(path: &str, patterns: &[Str], initial: bool) -> bool {
+	let mut has_includes = false;
+	let mut included = false;
+	let mut excluded = false;
+	let mut force_included = false;
+	let mut force_excluded = false;
+	for pattern in patterns {
+		let pattern = pattern.as_str();
+		let (prefix, target) = pattern
+			.as_bytes()
+			.first()
+			.filter(|prefix| matches!(prefix, b'!' | b'+' | b'-'))
+			.map_or((None, pattern), |prefix| (Some(*prefix), &pattern[1..]));
+		match prefix {
+			None => {
+				has_includes = true;
+				included |= resource_glob_match(target, path);
+			},
+			Some(b'!') => excluded |= resource_glob_match(target, path),
+			Some(b'+') => force_included |= exact_resource_match(target, path),
+			Some(b'-') => force_excluded |= exact_resource_match(target, path),
+			Some(_) => unreachable!("resource pattern prefix is closed"),
+		}
+	}
+	let mut enabled = if has_includes { included } else { initial };
+	if excluded {
+		enabled = false;
+	}
+	if force_included {
+		enabled = true;
+	}
+	if force_excluded {
+		enabled = false;
+	}
+	enabled
+}
+
+fn resource_delta_enabled(path: &str, patterns: &[Str], initial: bool) -> bool {
+	let mut enabled = initial;
+	for prefix in [None, Some(b'!'), Some(b'+'), Some(b'-')] {
+		for pattern in patterns {
+			let value = pattern.as_str();
+			let (actual, target) = value
+				.as_bytes()
+				.first()
+				.filter(|actual| matches!(actual, b'!' | b'+' | b'-'))
+				.map_or((None, value), |actual| (Some(*actual), &value[1..]));
+			if actual != prefix {
+				continue;
+			}
+			let matched = if matches!(prefix, Some(b'+' | b'-')) {
+				exact_resource_match(target, path)
+			} else {
+				resource_glob_match(target, path)
+			};
+			if matched {
+				enabled = !matches!(prefix, Some(b'!' | b'-'));
+			}
+		}
+	}
+	enabled
+}
+
+fn resource_glob_match(pattern: &str, path: &str) -> bool {
+	let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+	if glob_matches(pattern, path) {
+		return true;
+	}
+	let path = Path::new(path);
+	if path
+		.file_name()
+		.and_then(|name| name.to_str())
+		.is_some_and(|name| glob_matches(pattern, name))
+	{
+		return true;
+	}
+	if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+		return false;
+	}
+	path.parent().is_some_and(|parent| {
+		glob_matches(pattern, &parent.to_string_lossy())
+			|| parent
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| glob_matches(pattern, name))
+	})
+}
+
+fn exact_resource_match(pattern: &str, path: &str) -> bool {
+	let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+	if pattern == path {
+		return true;
+	}
+	path.strip_suffix("/SKILL.md") == Some(pattern)
 }
 
 /// Parses supported extension environment variables before CLI flag wiring.
@@ -1538,7 +1806,14 @@ fn validate_static_row(row: &StaticDeclaration) -> Result<(), ExtensionError> {
 	}
 	let content = matches!(
 		row.kind.as_str(),
-		"skills" | "rules" | "context-files" | "prompts" | "agents" | "lsp-servers" | "dap-adapters"
+		"skills"
+			| "rules"
+			| "context-files"
+			| "prompts"
+			| "agents"
+			| "lsp-servers"
+			| "dap-adapters"
+			| "themes"
 	);
 	if content {
 		let path = row.path.as_deref().ok_or_else(|| {
@@ -1820,7 +2095,7 @@ impl StaticDeclarations {
 				"secret" => secrets.push(row.clone()),
 				"worker" => workers.push(row.clone()),
 				"placement" => placement.push(row.clone()),
-				"skills" | "rules" | "context-files" | "prompts" => {},
+				"skills" | "rules" | "context-files" | "prompts" | "themes" => {},
 				"agents" => agents.push(row.clone()),
 				"lsp-servers" => lsp_servers.push(row.clone()),
 				"dap-adapters" => dap_adapters.push(row.clone()),
@@ -2053,6 +2328,25 @@ fn retain_selected_rows(value: &mut serde_json::Value, selected: &BTreeSet<&str>
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn missing_source_policy_uses_latest_scoped_setting() {
+		let client = ScopedOverlay {
+			scope:   Scope::Client,
+			overlay: ExtensionOverlay {
+				missing_source: Some(MissingSourcePolicy::Install),
+				..ExtensionOverlay::default()
+			},
+		};
+		let workspace = ScopedOverlay {
+			scope:   Scope::Workspace,
+			overlay: ExtensionOverlay {
+				missing_source: Some(MissingSourcePolicy::Skip),
+				..ExtensionOverlay::default()
+			},
+		};
+		assert_eq!(effective_missing_source(&[client, workspace]), MissingSourcePolicy::Skip);
+		assert_eq!(MissingSourcePolicy::Skip.outcome(), MissingSourceOutcome::Skip);
+	}
 
 	#[test]
 	fn update_policy_defaults_notify_and_workspace_can_only_disable() {
@@ -2106,6 +2400,89 @@ mod tests {
 		let effective = fold_extension(&[client, workspace], &id);
 		assert!(effective.disabled);
 		assert!(!effective.enabled);
+	}
+
+	#[test]
+	fn package_resource_filters_apply_fixed_override_precedence() {
+		let filter = PackageResourceFilter {
+			skills: Some(vec![
+				sf!("skills/**"),
+				sf!("!skills/private/**"),
+				sf!("+skills/private/keep/SKILL.md"),
+				sf!("-skills/private/keep/SKILL.md"),
+			]),
+			..PackageResourceFilter::default()
+		};
+		let config =
+			EffectiveExtensionConfig { resource_filters: vec![filter], ..Default::default() };
+
+		assert!(config.resource_enabled(ResourceFamily::Skills, "skills/public/SKILL.md", true));
+		assert!(!config.resource_enabled(
+			ResourceFamily::Skills,
+			"skills/private/other/SKILL.md",
+			true,
+		));
+		assert!(!config.resource_enabled(
+			ResourceFamily::Skills,
+			"skills/private/keep/SKILL.md",
+			true,
+		));
+		assert!(!config.resource_enabled(ResourceFamily::Skills, "outside/SKILL.md", true));
+	}
+
+	#[test]
+	fn workspace_autoload_false_is_a_delta_over_client_filter() {
+		let id = sf!("acme.reviewer");
+		let client_filter = PackageResourceFilter {
+			skills: Some(vec![sf!("skills/**"), sf!("!skills/private/**")]),
+			..PackageResourceFilter::default()
+		};
+		let workspace_filter = PackageResourceFilter {
+			autoload: false,
+			skills: Some(vec![sf!("+skills/private/keep/SKILL.md")]),
+			..PackageResourceFilter::default()
+		};
+		let client = ScopedOverlay {
+			scope:   Scope::Client,
+			overlay: ExtensionOverlay {
+				resources: [(id.clone(), client_filter)].into_iter().collect(),
+				..ExtensionOverlay::default()
+			},
+		};
+		let workspace = ScopedOverlay {
+			scope:   Scope::Workspace,
+			overlay: ExtensionOverlay {
+				resources: [(id.clone(), workspace_filter)].into_iter().collect(),
+				..ExtensionOverlay::default()
+			},
+		};
+		let effective = fold_extension(&[client, workspace], &id);
+
+		assert!(effective.resource_enabled(
+			ResourceFamily::Skills,
+			"skills/private/keep/SKILL.md",
+			true,
+		));
+		assert!(!effective.resource_enabled(
+			ResourceFamily::Skills,
+			"skills/private/other/SKILL.md",
+			true,
+		));
+	}
+
+	#[test]
+	fn empty_family_pattern_list_disables_that_family() {
+		let overlay: ExtensionOverlay = toml::from_str(
+			r#"
+[resources."acme.reviewer"]
+skills = []
+"#,
+		)
+		.expect("resource filter");
+		let effective =
+			fold_extension(&[ScopedOverlay { scope: Scope::Client, overlay }], &sf!("acme.reviewer"));
+		assert!(!effective.resource_enabled(ResourceFamily::Skills, "skills/a/SKILL.md", true));
+		assert!(effective.resource_enabled(ResourceFamily::Prompts, "prompts/a.md", false));
 	}
 
 	#[test]
@@ -2211,6 +2588,18 @@ max = 10
 				.selection,
 			FeatureSelection::Named(vec![sf!("a"), sf!("b")])
 		);
+		assert_eq!(
+			SourceSpec::parse_install("/tmp/acme").unwrap().0,
+			SourceSpec::Path(PathBuf::from("/tmp/acme"))
+		);
+		assert_eq!(
+			SourceSpec::parse_install("./acme").unwrap().0,
+			SourceSpec::Path(PathBuf::from("./acme"))
+		);
+		assert_eq!(SourceSpec::parse_install("acme").unwrap().0, SourceSpec::Index {
+			index:        String::new(),
+			distribution: sf!("acme"),
+		});
 	}
 
 	#[test]

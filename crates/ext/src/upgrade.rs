@@ -3,10 +3,15 @@
 use std::{
 	cmp,
 	collections::{BTreeMap, BTreeSet},
-	fs, io,
+	fs,
+	future::Future,
+	io,
+	num::NonZeroUsize,
 	path::{Path, PathBuf},
+	time::Duration,
 };
 
+use futures::{StreamExt as _, stream};
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
@@ -20,6 +25,83 @@ use super::{
 		RevocationFreshness, RevocationsFile, verify_artifact_signature, verify_publisher_rotation,
 	},
 };
+
+/// Bounds applied to one batch of update availability checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateCheckLimits {
+	concurrency: NonZeroUsize,
+	timeout:     Duration,
+}
+
+impl UpdateCheckLimits {
+	/// Builds positive concurrency and timeout limits.
+	pub fn new(concurrency: usize, timeout: Duration) -> Option<Self> {
+		Some(Self {
+			concurrency: NonZeroUsize::new(concurrency)?,
+			timeout:     (timeout > Duration::ZERO).then_some(timeout)?,
+		})
+	}
+
+	/// Maximum checks allowed to run at once.
+	pub const fn concurrency(self) -> usize {
+		self.concurrency.get()
+	}
+
+	/// Wall-clock deadline applied independently to each check.
+	pub const fn timeout(self) -> Duration {
+		self.timeout
+	}
+}
+
+impl Default for UpdateCheckLimits {
+	fn default() -> Self {
+		Self {
+			concurrency: NonZeroUsize::new(4).expect("four is non-zero"),
+			timeout:     Duration::from_secs(10),
+		}
+	}
+}
+
+/// Typed terminal state of one bounded update check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateCheckOutcome<T, E> {
+	/// The check completed successfully.
+	Ready(T),
+	/// The check completed with a typed source failure.
+	Failed(E),
+	/// The check exceeded its independent deadline.
+	TimedOut,
+}
+
+/// Runs update checks with a fixed concurrency ceiling and per-check timeout.
+///
+/// Results retain input order even though checks complete out of order.
+pub async fn run_bounded_update_checks<I, F, Fut, T, E>(
+	items: I,
+	limits: UpdateCheckLimits,
+	check: F,
+) -> Vec<UpdateCheckOutcome<T, E>>
+where
+	I: IntoIterator,
+	I::Item: Send,
+	F: Fn(I::Item) -> Fut + Copy,
+	Fut: Future<Output = Result<T, E>>,
+{
+	let mut completed = stream::iter(items.into_iter().enumerate())
+		.map(|(ordinal, item)| async move {
+			let outcome = match tokio::time::timeout(limits.timeout(), check(item)).await {
+				Ok(Ok(value)) => UpdateCheckOutcome::Ready(value),
+				Ok(Err(error)) => UpdateCheckOutcome::Failed(error),
+				Err(_) => UpdateCheckOutcome::TimedOut,
+			};
+			(ordinal, outcome)
+		})
+		.buffer_unordered(limits.concurrency())
+		.collect::<Vec<_>>()
+		.await;
+	completed.sort_by_key(|(ordinal, _)| *ordinal);
+	completed.into_iter().map(|(_, outcome)| outcome).collect()
+}
 
 /// Durable exact-version pins used only by explicit resolver operations.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -802,6 +884,16 @@ fn integrity(error: io::Error) -> ExtensionError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[tokio::test]
+	async fn bounded_update_checks_timeout_and_retain_input_order() {
+		let limits = UpdateCheckLimits::new(2, Duration::from_millis(10)).expect("positive limits");
+		let outcomes = run_bounded_update_checks([30_u64, 1], limits, |delay| async move {
+			tokio::time::sleep(Duration::from_millis(delay)).await;
+			Ok::<_, ()>(delay)
+		})
+		.await;
+		assert_eq!(outcomes, [UpdateCheckOutcome::TimedOut, UpdateCheckOutcome::Ready(1)]);
+	}
 
 	fn empty_generation(layer: Layer) -> Generation {
 		Generation {

@@ -13,6 +13,30 @@ use super::{
 	resolver::version_satisfies,
 };
 
+/// Directory containment covered by an operator grant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantScope {
+	/// Only the workspace recorded on the grant.
+	#[default]
+	Exact,
+	/// The recorded workspace and every workspace below it.
+	Subtree,
+}
+
+/// Lifetime of an interactive operator grant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantDuration {
+	/// Admit only the current interactive attempt.
+	Once,
+	/// Admit for the remainder of the current process session.
+	Session,
+	/// Persist the grant for future sessions.
+	#[default]
+	Persistent,
+}
+
 /// An operator-originated capability grant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Grant {
@@ -25,6 +49,9 @@ pub struct Grant {
 	/// Workspace identity, omitted for client-layer grants.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub workspace:         Option<WorkspaceUri>,
+	/// Workspace containment covered by this grant.
+	#[serde(default)]
+	pub scope:             GrantScope,
 	/// Hash of the canonical declared capability set.
 	pub capability_digest: Str,
 	/// Tier approved by the operator.
@@ -35,6 +62,9 @@ pub struct Grant {
 	pub granted_at:        Str,
 	/// Operator channel: interactive, flag, or env.
 	pub granted_by:        Str,
+	/// Lifetime selected by the operator.
+	#[serde(default)]
+	pub duration:          GrantDuration,
 }
 
 /// Local grant file, never committed with a workspace.
@@ -58,13 +88,18 @@ pub enum GrantPersistenceError {
 	/// The atomically replaced grant file could not be written.
 	#[error("extension grants could not be persisted")]
 	Write(#[source] io::Error),
+	/// A process-local grant was passed to the durable grant writer.
+	#[error("session-only extension grants cannot be persisted")]
+	SessionOnly,
 }
 
-/// Returns whether an existing operator grant exactly admits an extension.
+/// Returns whether the most-specific applicable operator grant admits an
+/// extension.
 ///
-/// Admission is intentionally equality-based: changing the publisher,
-/// workspace, capabilities, containment tier, or shipping level requires a
-/// fresh operator grant rather than silently widening an older decision.
+/// Workspace grants resolve from the requested workspace toward its ancestors.
+/// An exact grant takes precedence over a subtree grant rooted at the same
+/// workspace. Once a more-specific decision exists, a broader grant cannot
+/// silently override changed publisher, capability, tier, or shipping facts.
 pub fn grant_covers(
 	grants: &GrantsFile,
 	id: &Str,
@@ -75,15 +110,46 @@ pub fn grant_covers(
 	tier: TrustTier,
 	ship: &Str,
 ) -> bool {
+	let Some(specificity) = grants
+		.grants
+		.iter()
+		.filter(|grant| grant.id == *id && grant.layer == layer)
+		.filter_map(|grant| grant_specificity(grant, workspace))
+		.max()
+	else {
+		return false;
+	};
 	grants.grants.iter().any(|grant| {
 		grant.id == *id
-			&& grant.publisher == *publisher
 			&& grant.layer == layer
-			&& grant.workspace.as_ref() == workspace
+			&& grant_specificity(grant, workspace) == Some(specificity)
+			&& grant.publisher == *publisher
 			&& grant.capability_digest == *capability_digest
 			&& grant.tier == tier
 			&& grant.ship == *ship
 	})
+}
+
+fn grant_specificity(grant: &Grant, workspace: Option<&WorkspaceUri>) -> Option<(usize, bool)> {
+	match (grant.workspace.as_ref(), workspace, grant.scope) {
+		(None, None, GrantScope::Exact) => Some((0, true)),
+		(Some(granted), Some(requested), GrantScope::Exact) if granted == requested => {
+			Some((granted.uri.len(), true))
+		},
+		(Some(granted), Some(requested), GrantScope::Subtree)
+			if uri_contains(&granted.uri, &requested.uri) =>
+		{
+			Some((granted.uri.len(), false))
+		},
+		_ => None,
+	}
+}
+
+fn uri_contains(parent: &str, child: &str) -> bool {
+	parent == child
+		|| child
+			.strip_prefix(parent)
+			.is_some_and(|suffix| parent.ends_with('/') || suffix.starts_with('/'))
 }
 
 /// A non-interactive grant request parsed from `OMP_EXT_GRANT`.
@@ -153,14 +219,30 @@ pub fn validate_grant_request(
 }
 
 impl GrantsFile {
-	/// Reads an absent local grant file as an empty grant set.
+	/// Reads an absent local grant file as an empty durable grant set.
+	///
+	/// Process-local entries are ignored even if a hand-edited file contains
+	/// one, so a session decision cannot become durable by serialization.
 	pub fn read(path: &Path) -> Result<Self, ExtensionError> {
-		read_toml_or_default(path)
+		let mut grants: Self = read_toml_or_default(path)?;
+		grants
+			.grants
+			.retain(|grant| grant.duration == GrantDuration::Persistent);
+		Ok(grants)
 	}
 
-	/// Atomically writes the local grant file.
+	/// Atomically writes only durable grants to the local grant file.
 	pub fn write(&self, path: &Path) -> io::Result<()> {
-		atomic_toml(path, self)
+		let durable = Self {
+			version: self.version,
+			grants:  self
+				.grants
+				.iter()
+				.filter(|grant| grant.duration == GrantDuration::Persistent)
+				.cloned()
+				.collect(),
+		};
+		atomic_toml(path, &durable)
 	}
 
 	/// Replaces the prior decision for one extension and atomically persists the
@@ -170,6 +252,9 @@ impl GrantsFile {
 	/// callers cannot accidentally update an in-memory copy without committing
 	/// it through the trust domain's atomic writer.
 	pub fn persist(path: &Path, grant: Grant) -> Result<Self, GrantPersistenceError> {
+		if grant.duration != GrantDuration::Persistent {
+			return Err(GrantPersistenceError::SessionOnly);
+		}
 		let mut grants = Self::read(path).map_err(GrantPersistenceError::Read)?;
 		grants.grants.retain(|existing| {
 			existing.id != grant.id
@@ -515,11 +600,13 @@ mod tests {
 				publisher:         publisher.clone(),
 				layer:             Layer::Client,
 				workspace:         None,
+				scope:             GrantScope::Exact,
 				capability_digest: old,
 				tier:              TrustTier::Sandboxed,
 				ship:              sf!("installed"),
 				granted_at:        sf!("now"),
 				granted_by:        sf!("interactive"),
+				duration:          GrantDuration::Persistent,
 			}],
 		};
 		assert!(!grant_covers(
@@ -562,15 +649,114 @@ mod tests {
 			publisher:         sf!("ed25519:publisher"),
 			layer:             Layer::Client,
 			workspace:         None,
+			scope:             GrantScope::Exact,
 			capability_digest: sf!("b3:capabilities"),
 			tier:              TrustTier::Sandboxed,
 			ship:              sf!("installed"),
 			granted_at:        sf!("2026-08-27T00:00:00Z"),
 			granted_by:        sf!("interactive"),
+			duration:          GrantDuration::Persistent,
 		};
 		let persisted = GrantsFile::persist(&path, grant.clone()).expect("persist grant");
 		assert_eq!(persisted.grants, [grant.clone()]);
 		assert_eq!(GrantsFile::read(&path).expect("read grant").grants, [grant]);
+	}
+
+	fn workspace(uri: &'static str) -> WorkspaceUri {
+		WorkspaceUri { uri: Str::new_static(uri), digest: sf!("digest:{uri}") }
+	}
+
+	fn workspace_grant(workspace: WorkspaceUri, scope: GrantScope, digest: &'static str) -> Grant {
+		Grant {
+			id: sf!("acme.reviewer"),
+			publisher: sf!("ed25519:publisher"),
+			layer: Layer::Workspace,
+			workspace: Some(workspace),
+			scope,
+			capability_digest: Str::new_static(digest),
+			tier: TrustTier::Sandboxed,
+			ship: sf!("installed"),
+			granted_at: sf!("2026-08-28T00:00:00Z"),
+			granted_by: sf!("interactive"),
+			duration: GrantDuration::Persistent,
+		}
+	}
+
+	#[test]
+	fn subtree_grant_covers_a_child_workspace() {
+		let child = workspace("file:///work/team/project/");
+		let grant =
+			workspace_grant(workspace("file:///work/team/"), GrantScope::Subtree, "b3:capabilities");
+		let grants = GrantsFile { version: 1, grants: vec![grant.clone()] };
+		assert!(grant_covers(
+			&grants,
+			&grant.id,
+			&grant.publisher,
+			Layer::Workspace,
+			Some(&child),
+			&grant.capability_digest,
+			grant.tier,
+			&grant.ship,
+		));
+	}
+
+	#[test]
+	fn most_specific_workspace_grant_wins() {
+		let child = workspace("file:///work/team/project/");
+		let parent =
+			workspace_grant(workspace("file:///work/team/"), GrantScope::Subtree, "b3:parent");
+		let exact = workspace_grant(child.clone(), GrantScope::Exact, "b3:child");
+		let grants = GrantsFile { version: 1, grants: vec![parent.clone(), exact.clone()] };
+		assert!(!grant_covers(
+			&grants,
+			&parent.id,
+			&parent.publisher,
+			Layer::Workspace,
+			Some(&child),
+			&parent.capability_digest,
+			parent.tier,
+			&parent.ship,
+		));
+		assert!(grant_covers(
+			&grants,
+			&exact.id,
+			&exact.publisher,
+			Layer::Workspace,
+			Some(&child),
+			&exact.capability_digest,
+			exact.tier,
+			&exact.ship,
+		));
+	}
+
+	#[test]
+	fn session_only_grants_never_persist() {
+		let directory = tempfile::tempdir().expect("grant directory");
+		let path = directory.path().join("grants.toml");
+		let grant = Grant {
+			duration: GrantDuration::Session,
+			..workspace_grant(
+				workspace("file:///work/team/project/"),
+				GrantScope::Exact,
+				"b3:capabilities",
+			)
+		};
+		GrantsFile { version: 1, grants: vec![grant.clone()] }
+			.write(&path)
+			.expect("write durable subset");
+		assert!(
+			GrantsFile::read(&path)
+				.expect("read grants")
+				.grants
+				.is_empty()
+		);
+		assert!(matches!(GrantsFile::persist(&path, grant), Err(GrantPersistenceError::SessionOnly)));
+		assert!(
+			GrantsFile::read(&path)
+				.expect("read grants")
+				.grants
+				.is_empty()
+		);
 	}
 
 	#[test]

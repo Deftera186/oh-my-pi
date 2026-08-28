@@ -3,7 +3,7 @@
 use std::{
 	collections::BTreeSet,
 	ffi::OsString,
-	io,
+	fs, io,
 	path::PathBuf,
 	process::{Command, Output},
 	str::FromStr as _,
@@ -38,9 +38,11 @@ pub struct UvRequest {
 	pub indexes:           Vec<String>,
 	/// Optional R9 timestamp clamp.
 	pub exclude_newer:     Option<Str>,
-	/// Requirement file whose entries contain SHA-256 hashes.
+	/// Resolver input containing the root requirements and any pinned closure.
 	pub requirements_file: PathBuf,
-	/// Additional root requirements (one host child or explicit pool).
+	/// PEP 751 output written by uv and returned through [`ResolveOutcome`].
+	pub output_file:       PathBuf,
+	/// Root requirements used for frozen-conflict checks and diagnostics.
 	pub requirements:      Vec<ResolveRequirement>,
 }
 
@@ -50,13 +52,13 @@ impl UvRequest {
 	pub fn argv(&self) -> Vec<OsString> {
 		let mut argv = vec![
 			OsString::from("pip"),
-			OsString::from("install"),
-			OsString::from("--dry-run"),
-			OsString::from("--report"),
-			OsString::from("-"),
+			OsString::from("compile"),
+			OsString::from("--format"),
+			OsString::from("pylock.toml"),
+			OsString::from("--output-file"),
+			self.output_file.clone().into_os_string(),
 			OsString::from("--only-binary"),
 			OsString::from(":all:"),
-			OsString::from("--require-hashes"),
 			OsString::from("--python-platform"),
 			OsString::from(self.target.as_str()),
 			OsString::from("--python-version"),
@@ -72,14 +74,7 @@ impl UvRequest {
 			argv.push(OsString::from("--exclude-newer"));
 			argv.push(OsString::from(exclude_newer.as_str()));
 		}
-		argv.push(OsString::from("--requirement"));
 		argv.push(self.requirements_file.clone().into_os_string());
-		argv.extend(
-			self
-				.requirements
-				.iter()
-				.map(|requirement| OsString::from(requirement.requirement.as_str())),
-		);
 		argv
 	}
 
@@ -309,9 +304,8 @@ pub fn selected_requirements(
 impl ResolvePlan {
 	/// Builds per-target invocations without spawning `uv`.
 	///
-	/// `requirements_file` is the hash-pinned closure emitted by the install
-	/// backend from the manifest or durable lock. The CLI never reconstructs
-	/// dependency resolution itself.
+	/// `requirements_file` is the complete resolver input emitted by the
+	/// install backend from the manifest or durable lock.
 	pub fn build(
 		executable: PathBuf,
 		enabled: &[EnabledExtension],
@@ -338,13 +332,23 @@ impl ResolvePlan {
 		Ok(Self {
 			requests: targets
 				.iter()
-				.map(|target| UvRequest {
-					executable:        executable.clone(),
-					target:            target.clone(),
-					indexes:           indexes.clone(),
-					exclude_newer:     exclude_newer.clone(),
-					requirements_file: requirements_file.clone(),
-					requirements:      enabled.to_vec(),
+				.enumerate()
+				.map(|(ordinal, target)| {
+					let stem = requirements_file
+						.file_stem()
+						.and_then(|stem| stem.to_str())
+						.unwrap_or("resolve");
+					let output_file =
+						requirements_file.with_file_name(format!("pylock.{stem}-{ordinal}.toml"));
+					UvRequest {
+						executable: executable.clone(),
+						target: target.clone(),
+						indexes: indexes.clone(),
+						exclude_newer: exclude_newer.clone(),
+						requirements_file: requirements_file.clone(),
+						output_file,
+						requirements: enabled.to_vec(),
+					}
 				})
 				.collect(),
 		})
@@ -373,7 +377,7 @@ impl ResolvePlan {
 /// a deterministic resolver without a network or executable.
 pub trait UvRunner {
 	/// Executes an argv prepared by [`UvRequest::argv`].
-	fn run(&self, executable: &PathBuf, argv: &[OsString]) -> io::Result<Output>;
+	fn run(&self, request: &UvRequest) -> io::Result<Output>;
 }
 
 /// The production `uv` process runner.
@@ -381,8 +385,15 @@ pub trait UvRunner {
 pub struct SystemUv;
 
 impl UvRunner for SystemUv {
-	fn run(&self, executable: &PathBuf, argv: &[OsString]) -> io::Result<Output> {
-		Command::new(executable).args(argv).output()
+	fn run(&self, request: &UvRequest) -> io::Result<Output> {
+		let mut output = Command::new(&request.executable)
+			.args(request.argv())
+			.output()?;
+		if output.status.success() {
+			output.stdout = fs::read(&request.output_file)?;
+			let _ = fs::remove_file(&request.output_file);
+		}
+		Ok(output)
 	}
 }
 
@@ -406,7 +417,7 @@ pub fn resolve_with<R: UvRunner>(
 	request.reject_frozen_conflicts(frozen)?;
 	let argv = request.argv();
 	let output = runner
-		.run(&request.executable, &argv)
+		.run(request)
 		.map_err(|error| ExtensionError::new(ExtensionCode::EUnsat, error.to_string()))?;
 	if !output.status.success() {
 		return Err(ExtensionError::new(
@@ -503,6 +514,7 @@ mod tests {
 			indexes:           vec!["https://ext.omp.dev/simple".to_owned()],
 			exclude_newer:     Some(sf!("2026-08-20T00:00:00Z")),
 			requirements_file: PathBuf::from("requirements.txt"),
+			output_file:       PathBuf::from("pylock.test.toml"),
 			requirements:      vec![],
 		};
 		let argv = request
@@ -512,13 +524,13 @@ mod tests {
 			.collect::<Vec<_>>();
 		assert_eq!(argv, [
 			"pip",
-			"install",
-			"--dry-run",
-			"--report",
-			"-",
+			"compile",
+			"--format",
+			"pylock.toml",
+			"--output-file",
+			"pylock.test.toml",
 			"--only-binary",
 			":all:",
-			"--require-hashes",
 			"--python-platform",
 			"aarch64-apple-darwin",
 			"--python-version",
@@ -529,7 +541,6 @@ mod tests {
 			"https://ext.omp.dev/simple",
 			"--exclude-newer",
 			"2026-08-20T00:00:00Z",
-			"--requirement",
 			"requirements.txt"
 		]);
 	}
@@ -541,6 +552,7 @@ mod tests {
 			indexes:           Vec::new(),
 			exclude_newer:     None,
 			requirements_file: PathBuf::from("requirements.txt"),
+			output_file:       PathBuf::from("pylock.test.toml"),
 			requirements:      vec![ResolveRequirement {
 				extension_id: sf!("example"),
 				requirement:  sf!("{requirement}"),

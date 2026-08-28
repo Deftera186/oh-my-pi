@@ -7867,6 +7867,7 @@ dependencies = [
  "omp-telemetry",
  "omp-tool",
  "omp-tools",
+ "omp-tui",
  "omp-walker",
  "parking_lot",
  "prost",
@@ -8045,6 +8046,7 @@ name = "omp-ext"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "futures",
  "jiff",
  "omp-core",
  "pep440_rs",
@@ -8055,6 +8057,7 @@ dependencies = [
  "strum",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "toml",
 ]
 
