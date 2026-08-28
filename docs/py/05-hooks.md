@@ -1188,8 +1188,15 @@ class BranchReason(enum.StrEnum):
 	COMPACTION = "compaction"  # branch created by a handoff compaction
 ```
 
-`session_rewind` / `session_rewound` correspond exactly to `Agent::rewind`
-(`crates/agent/src/loop.rs:235`) and its `RewindTarget` list (`loop.rs:251-281`); `session_reset` to
+`session_rewind` is the admission gate for **user-initiated UI rewinds only**; loop-internal
+flavors (retry, checkpoint-regime rewinds, extension-requested `omp.agents.rewind`) are core turn
+machinery and are never gateable. `session_rewound` fires after **every** history rewrite — UI
+rewind, retry, checkpoint-regime rewind, and `omp.agents.rewind` — once the agent has reconciled
+journal-derived environment state (todo slot restore, background-job policy). `running_jobs` lists
+background jobs still pending after the rewrite; `cancelled_jobs` lists jobs whose launch the
+rewrite dropped and which were therefore cancelled (checkpoint rewinds cancel nothing). State
+rehydration remains fold-on-hook: `omp.sessions.journal(live=True)` opens a fresh reader per
+request and is immediately consistent with the truncated view. `session_reset` corresponds to
 journal `Kind::Reset`; `session_branch*` to `Kind::Branch`; `forked_from` to `Kind::ForkedFrom`
 (`crates/storage/src/transcript/event.rs:256-283`). `restore_workspace=True` is served by env
 snapshot/restore ([`11-env.md`](11-env.md)), not by an extension's shadow git repository — the
