@@ -58,10 +58,11 @@ proto-fmt-check:
 proto-lint:
     cd crates/proto && buf lint
 
-# Lint the Rust workspace with clippy (matches CI exactly).
+# Lint the Rust workspace with clippy (CI flags; own target dir so the
+# RUSTC_WORKSPACE_WRAPPER fingerprint never ping-pongs check/test artifacts).
 [group('format & lint')]
 clippy:
-    cargo clippy --workspace --locked
+    CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --locked
 
 # Warn (never fails) on lock-wrapped map/set state (`Mutex<HashMap<…>>` etc.); prefer
 # `dashmap::DashMap`/`DashSet` or another concurrent structure. clippy's `disallowed-types`
