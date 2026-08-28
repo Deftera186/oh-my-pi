@@ -4,8 +4,8 @@ use std::{future, io::Write, result, sync::Arc, time::Duration};
 
 use clap::Parser;
 use omp_shell_engine::{
-	ExecutionContext, ExecutionExitCode, ExecutionResult, ProcessGroupPolicy, SourceInfo,
-	SpawnObserver, builtins, sys, traps::TrapSignal,
+	ExecutionContext, ExecutionExitCode, ExecutionResult, ProcessGroupPolicy, ProcessScope,
+	SourceInfo, SpawnObserver, builtins, sys, traps::TrapSignal,
 };
 use parking_lot::Mutex;
 use tokio::time;
@@ -88,11 +88,18 @@ impl clap::Parser for TimeoutCommand {}
 /// *configured* signal requires knowing the child's pid/pgid; the shell reports
 /// those through its [`SpawnObserver`] hook.
 #[derive(Default)]
-struct SpawnRecorder(Mutex<Vec<(i32, Option<i32>)>>);
+struct SpawnRecorder {
+	spawns: Mutex<Vec<(i32, Option<i32>)>>,
+	parent: Option<Arc<dyn SpawnObserver>>,
+	scope:  Option<Arc<dyn ProcessScope>>,
+}
 
 impl SpawnObserver for SpawnRecorder {
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>) {
-		self.0.lock().push((pid, pgid));
+		self.spawns.lock().push((pid, pgid));
+		if let Some(parent) = &self.parent {
+			parent.on_spawn(pid, pgid);
+		}
 	}
 }
 
@@ -100,13 +107,20 @@ impl SpawnRecorder {
 	/// Sends `signal` to every recorded child — its whole process group when
 	/// `group` is set — and reports whether any delivery succeeded.
 	fn signal(&self, signal: TrapSignal, group: bool) -> bool {
-		let spawns = self.0.lock();
+		let spawns = self.spawns.lock();
 		let mut sent = false;
 		for &(pid, pgid) in spawns.iter() {
 			let target = match pgid {
 				Some(pgid) if group => -pgid,
 				_ => pid,
 			};
+			if self
+				.scope
+				.as_ref()
+				.is_some_and(|scope| !scope.may_signal(target))
+			{
+				continue;
+			}
 			if sys::signal::kill_process(target, signal).is_ok() {
 				sent = true;
 			}
@@ -191,7 +205,11 @@ impl builtins::Command for TimeoutCommand {
 		};
 
 		let child_cancel = CancellationToken::new();
-		let spawns = Arc::new(SpawnRecorder::default());
+		let spawns = Arc::new(SpawnRecorder {
+			spawns: Mutex::new(Vec::new()),
+			parent: context.params.spawn_observer().cloned(),
+			scope:  context.params.process_scope().cloned(),
+		});
 		let mut params = context.params.clone();
 		// GNU runs the command in its own process group and signals the whole
 		// group; `--foreground` keeps it in the invoking group and signals

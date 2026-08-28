@@ -11,7 +11,6 @@ use std::{
 	fmt::{self, Display},
 	fs,
 	io::{self, Read, Write},
-	process::Command,
 };
 
 use clap::{Arg, ArgAction, ArgMatches};
@@ -422,12 +421,8 @@ impl CommandBuilder<'_> {
 
 		match &self.options.action {
 			ExecAction::Command(_) => {
-				let mut command = Command::new(entry_point);
-				command
-					.args(&final_args)
-					.current_dir(host.cwd())
-					.env_clear()
-					.envs(host.env());
+				let mut command = host.command(entry_point);
+				command.args(&final_args).current_dir(host.cwd());
 				match host.run_captured(&mut command) {
 					Ok(status) => {
 						if status.success() {

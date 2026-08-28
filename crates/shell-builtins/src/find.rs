@@ -520,9 +520,7 @@ pub mod matchers {
 		// license that can be found in the LICENSE file or at
 		// https://opensource.org/licenses/MIT.
 
-		use std::{
-			cell::RefCell, error::Error, ffi::OsString, io::Write, path::Path, process::Command,
-		};
+		use std::{cell::RefCell, error::Error, ffi::OsString, io::Write, path::Path};
 
 		use super::{Matcher, MatcherIO, WalkEntry};
 
@@ -566,7 +564,7 @@ pub mod matchers {
 
 		impl Matcher for SingleExecMatcher {
 			fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-				let mut command = Command::new(&self.executable);
+				let mut command = matcher_io.host().command(&self.executable);
 				let path_to_file = if self.exec_in_parent_dir {
 					if let Some(f) = file_info.path().file_name() {
 						Path::new(".").join(f)
@@ -602,7 +600,6 @@ pub mod matchers {
 					// operand-relative `{}` against the shell cwd, not the host cwd.
 					command.current_dir(matcher_io.host().cwd());
 				}
-				command.env_clear().envs(matcher_io.host().env());
 				// The host process's stdio belongs to the embedding TUI; route the
 				// child's output through the scope streams instead of inheriting.
 				match matcher_io.host().run_captured(&mut command) {
@@ -665,12 +662,11 @@ pub mod matchers {
 				// so rebuild a std command from its accumulated state to attach the
 				// scope environment and context-captured stdio — the host process's
 				// stdio belongs to the embedding TUI and must never be inherited.
-				let mut std_command = Command::new(command.get_program());
+				let mut std_command = matcher_io.host().command(command.get_program());
 				std_command.args(command.get_args());
 				if let Some(dir) = command.get_current_dir() {
 					std_command.current_dir(dir);
 				}
-				std_command.env_clear().envs(matcher_io.host().env());
 				match matcher_io.host().run_captured(&mut std_command) {
 					Ok(status) => {
 						if !status.success() {

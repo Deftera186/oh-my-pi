@@ -42,7 +42,8 @@ use im::HashMap;
 #[cfg(test)]
 use omp_shell_engine::WriteDenied;
 use omp_shell_engine::{
-	Error, ExecutionContext, ExecutionResult, PathPolicy, ShellExtensions,
+	Error, ExecutionContext, ExecutionResult, PathPolicy, ProcessScope, ShellExtensions,
+	SpawnObserver, SpawnWrapper,
 	builtins::{self, Registration},
 	openfiles::{self, OpenFile, OpenFiles},
 	sys::fs,
@@ -102,6 +103,9 @@ pub(crate) struct Host {
 	cwd:                   PathBuf,
 	env:                   HashMap<String, String>,
 	path_policy:           Option<Arc<dyn PathPolicy>>,
+	spawn_wrapper:         Option<Arc<dyn SpawnWrapper>>,
+	process_scope:         Option<Arc<dyn ProcessScope>>,
+	spawn_observer:        Option<Arc<dyn SpawnObserver>>,
 	cancel:                Arc<AtomicBool>,
 	exit_code:             i32,
 	stdin_is_search_input: bool,
@@ -160,20 +164,81 @@ impl Host {
 		self.path_policy.as_ref()
 	}
 
-	/// Looks up an exported shell variable.
+	/// Returns whether this builtin is running behind a kernel sandbox launcher.
+	pub fn kernel_sandbox_active(&self) -> bool {
+		self
+			.spawn_wrapper
+			.as_ref()
+			.is_some_and(|wrapper| wrapper.launcher().is_some())
+	}
+
+	/// Returns whether the active process scope permits observing `pid`.
+	pub fn may_observe(&self, pid: i32) -> bool {
+		self
+			.process_scope
+			.as_ref()
+			.is_none_or(|scope| scope.may_observe(pid))
+	}
+
+	/// Returns whether the active process scope permits signalling `pid`.
+	pub fn may_signal(&self, pid: i32) -> bool {
+		self
+			.process_scope
+			.as_ref()
+			.is_none_or(|scope| scope.may_signal(pid))
+	}
+
+	/// Records a child spawned internally by this utility.
+	pub fn observe_spawn(&self, pid: u32) {
+		if let (Some(observer), Ok(pid)) = (&self.spawn_observer, i32::try_from(pid)) {
+			observer.on_spawn(pid, None);
+		}
+	}
+
+	/// Builds a child command with the sandbox launcher prefix when installed.
+	pub fn command(&self, program: impl AsRef<ffi::OsStr>) -> process::Command {
+		let program = program.as_ref();
+		let mut command = if let Some((launcher, prefix)) = self
+			.spawn_wrapper
+			.as_ref()
+			.and_then(|wrapper| wrapper.launcher())
+		{
+			let mut command = process::Command::new(launcher);
+			command.args(prefix).arg(program);
+			command
+		} else {
+			process::Command::new(program)
+		};
+		command.current_dir(&self.cwd).env_clear();
+		if let Some(wrapper) = &self.spawn_wrapper {
+			let mut environment: Vec<_> = self
+				.env
+				.iter()
+				.map(|(key, value)| (OsString::from(key), OsString::from(value)))
+				.collect();
+			wrapper.resolve_env(&mut environment);
+			command.envs(environment);
+		} else {
+			command.envs(self.env());
+		}
+		command
+	}
+
+	/// Iterates the exported shell variables captured for this utility
+	/// invocation.
 	///
 	/// The shell's exported variables are *not* present in the host process
 	/// environment, so `std::env::var` would miss them.
-	pub fn var(&self, key: &str) -> Option<&str> {
-		self.env.get(key).map(String::as_str)
+	pub fn env(&self) -> impl Iterator<Item = (&str, &str)> {
+		self
+			.env
+			.iter()
+			.map(|(key, value)| (key.as_str(), value.as_str()))
 	}
 
-	/// The exported shell environment, for building a child process
-	/// environment (`env_clear().envs(host.env())`).
-	pub fn env(
-		&self,
-	) -> impl Iterator<Item = (&str, &str)> + ExactSizeIterator + iter::FusedIterator {
-		self.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+	/// Looks up one exported shell variable.
+	pub fn var(&self, key: &str) -> Option<&str> {
+		self.env.get(key).map(String::as_str)
 	}
 
 	/// Whether the host has asked this invocation to stop (shell abort or
@@ -247,15 +312,18 @@ impl Host {
 	/// its compressor from inside the temp-file abstraction, for instance.
 	pub fn child_env(&self) -> ChildEnv {
 		ChildEnv {
-			cwd:    self.cwd.clone(),
-			env:    Arc::new(
+			cwd:            self.cwd.clone(),
+			env:            Arc::new(
 				self
 					.env
 					.iter()
 					.map(|(k, v)| (k.clone(), v.clone()))
 					.collect(),
 			),
-			stderr: self.stderr.dup_file(),
+			stderr:         self.stderr.dup_file(),
+			wrapper:        self.spawn_wrapper.clone(),
+			spawn_observer: self.spawn_observer.clone(),
+			process_scope:  self.process_scope.clone(),
 		}
 	}
 
@@ -268,8 +336,8 @@ impl Host {
 	/// streams through on the calling thread while a helper thread drains
 	/// stderr into a buffer, which is forwarded once the child exits.
 	///
-	/// Callers remain responsible for `current_dir` and the child environment
-	/// (`env_clear().envs(host.env())`).
+	/// Callers must construct the command through [`Host::command`] so its
+	/// directory, environment policy, and launcher prefix are already installed.
 	pub fn run_captured(
 		&mut self,
 		command: &mut process::Command,
@@ -279,6 +347,7 @@ impl Host {
 			.stdout(process::Stdio::piped())
 			.stderr(process::Stdio::piped());
 		let mut child = command.spawn()?;
+		self.observe_spawn(child.id());
 
 		let mut child_err = child.stderr.take();
 		let stderr_thread = thread::spawn(move || {
@@ -297,6 +366,17 @@ impl Host {
 			let _ = self.stderr.write_all(&buf);
 		}
 		status
+	}
+
+	/// Runs a child with fully captured output while recording its ownership.
+	pub fn run_output(&self, command: &mut process::Command) -> io::Result<process::Output> {
+		command
+			.stdin(process::Stdio::null())
+			.stdout(process::Stdio::piped())
+			.stderr(process::Stdio::piped());
+		let child = command.spawn()?;
+		self.observe_spawn(child.id());
+		child.wait_with_output()
 	}
 }
 /// A destination-aware buffered writer for utility output.
@@ -452,9 +532,12 @@ fn same_destination(_a: &OpenFile, _b: &OpenFile) -> bool {
 /// [`ChildEnv::forward_stderr`] drains it to the command's own fd 2.
 #[derive(Clone)]
 pub(crate) struct ChildEnv {
-	cwd:    PathBuf,
-	env:    Arc<Vec<(String, String)>>,
-	stderr: OpenFile,
+	cwd:            PathBuf,
+	env:            Arc<Vec<(String, String)>>,
+	stderr:         OpenFile,
+	wrapper:        Option<Arc<dyn SpawnWrapper>>,
+	spawn_observer: Option<Arc<dyn SpawnObserver>>,
+	process_scope:  Option<Arc<dyn ProcessScope>>,
 }
 
 impl ChildEnv {
@@ -464,12 +547,31 @@ impl ChildEnv {
 	/// Stdin and stdout are left untouched for the caller to wire; they default
 	/// to inherited, so a caller that leaves them alone MUST redirect them.
 	pub fn command(&self, program: impl AsRef<ffi::OsStr>) -> process::Command {
-		let mut command = process::Command::new(program);
+		let program = program.as_ref();
+		let mut command = if let Some((launcher, prefix)) =
+			self.wrapper.as_ref().and_then(|wrapper| wrapper.launcher())
+		{
+			let mut command = process::Command::new(launcher);
+			command.args(prefix).arg(program);
+			command
+		} else {
+			process::Command::new(program)
+		};
 		command
 			.current_dir(&self.cwd)
 			.env_clear()
-			.envs(self.env.iter().map(|(k, v)| (k, v)))
 			.stderr(process::Stdio::piped());
+		if let Some(wrapper) = &self.wrapper {
+			let mut environment: Vec<_> = self
+				.env
+				.iter()
+				.map(|(key, value)| (OsString::from(key), OsString::from(value)))
+				.collect();
+			wrapper.resolve_env(&mut environment);
+			command.envs(environment);
+		} else {
+			command.envs(self.env.iter().map(|(key, value)| (key, value)));
+		}
 		command
 	}
 
@@ -484,6 +586,23 @@ impl ChildEnv {
 		let mut stderr = self.stderr.clone();
 		thread::spawn(move || {
 			let _ = io::copy(&mut child_stderr, &mut stderr);
+		})
+	}
+
+	/// Records a child spawned through this environment.
+	pub fn observe_spawn(&self, pid: u32) {
+		if let (Some(observer), Ok(pid)) = (&self.spawn_observer, i32::try_from(pid)) {
+			observer.on_spawn(pid, None);
+		}
+	}
+
+	/// Returns whether the active process scope permits signalling `pid`.
+	pub fn may_signal(&self, pid: u32) -> bool {
+		i32::try_from(pid).is_ok_and(|pid| {
+			self
+				.process_scope
+				.as_ref()
+				.is_none_or(|scope| scope.may_signal(pid))
 		})
 	}
 }
@@ -849,6 +968,7 @@ fn build_host<SE: ShellExtensions>(
 			env.insert(key.clone(), var.value().to_cow_str(context.shell).into_owned());
 		}
 	}
+	let spawn_wrapper = context.params.spawn_wrapper().cloned();
 
 	let invoked = if context.command_name.is_empty() {
 		name.to_string()
@@ -877,6 +997,9 @@ fn build_host<SE: ShellExtensions>(
 		cwd: context.shell.working_dir().to_path_buf(),
 		env,
 		path_policy: context.params.path_policy().cloned(),
+		spawn_wrapper,
+		process_scope: context.params.process_scope().cloned(),
+		spawn_observer: context.params.spawn_observer().cloned(),
 		cancel,
 		exit_code: 0,
 		stdin_is_search_input,
@@ -983,7 +1106,8 @@ mod testing {
 
 	use super::{
 		Arc, AtomicBool, Error, HashMap, Host, OpenFile, Ordering, OsString, PathBuf, PathPolicy,
-		Read, Stdin, StreamWriter, Utility, Write, WriteDenied, io, openfiles, run_caught,
+		Read, SpawnWrapper, Stdin, StreamWriter, Utility, Write, WriteDenied, io, openfiles,
+		run_caught,
 	};
 
 	/// Test policy admitting writes only beneath one root.
@@ -1005,6 +1129,19 @@ mod testing {
 			} else {
 				Err(WriteDenied { path: path.to_path_buf() })
 			}
+		}
+	}
+	struct TestSpawnWrapper {
+		prefix: Vec<OsString>,
+	}
+
+	impl SpawnWrapper for TestSpawnWrapper {
+		fn launcher(&self) -> Option<(&std::ffi::OsStr, &[OsString])> {
+			Some((std::ffi::OsStr::new("/fake-wrapper"), &self.prefix))
+		}
+
+		fn env_allowed(&self, key: &str) -> bool {
+			key != "SECRET"
 		}
 	}
 
@@ -1079,6 +1216,9 @@ mod testing {
 				cwd: cwd.into(),
 				env: HashMap::new(),
 				path_policy: None,
+				spawn_wrapper: None,
+				process_scope: None,
+				spawn_observer: None,
 				cancel,
 				exit_code: 0,
 				stdin_is_search_input: false,
@@ -1097,10 +1237,39 @@ mod testing {
 			self.path_policy = Some(policy);
 		}
 
+		/// Installs a child spawn wrapper on a test host.
+		pub(crate) fn set_test_spawn_wrapper(&mut self, wrapper: Arc<dyn SpawnWrapper>) {
+			self.spawn_wrapper = Some(wrapper);
+		}
+
 		/// Requests cancellation on a test host.
 		pub(crate) fn cancel_for_test(&self) {
 			self.cancel.store(true, Ordering::Relaxed);
 		}
+	}
+	#[test]
+	fn child_command_applies_wrapper_prefix_and_environment_filter() {
+		let (mut host, _) = Host::for_test("test", "", "/");
+		host.set_test_var("KEEP", "yes");
+		host.set_test_var("SECRET", "no");
+		host.set_test_spawn_wrapper(Arc::new(TestSpawnWrapper {
+			prefix: vec![OsString::from("--capture")],
+		}));
+
+		let command = host.command("/bin/echo");
+		assert_eq!(command.get_program(), std::ffi::OsStr::new("/fake-wrapper"));
+		assert_eq!(command.get_args().collect::<Vec<_>>(), [
+			std::ffi::OsStr::new("--capture"),
+			std::ffi::OsStr::new("/bin/echo")
+		]);
+		assert!(command.get_envs().any(|(key, value)| {
+			key == std::ffi::OsStr::new("KEEP") && value == Some(std::ffi::OsStr::new("yes"))
+		}));
+		assert!(
+			!command
+				.get_envs()
+				.any(|(key, _)| key == std::ffi::OsStr::new("SECRET"))
+		);
 	}
 
 	#[cfg(windows)]
@@ -1312,7 +1481,7 @@ mod testing {
 	}
 }
 
-use std::{borrow, ffi, fmt, fmt::Display, iter, process, thread};
+use std::{borrow, ffi, fmt, fmt::Display, process, thread};
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]

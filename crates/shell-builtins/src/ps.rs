@@ -320,8 +320,18 @@ impl builtins::Command for PsCommand {
 				return Ok(ExecutionExitCode::Interrupted.into());
 			}
 
-			let mut processes = ProcInfo::all();
-			let current_pid = i32::try_from(process::id()).ok();
+			let mut processes = ProcInfo::all_filtered(|pid| {
+				context
+					.params
+					.process_scope()
+					.is_none_or(|scope| scope.may_observe(pid))
+			});
+			let current_pid = context
+				.params
+				.process_scope()
+				.is_none()
+				.then(|| i32::try_from(process::id()).ok())
+				.flatten();
 			let current =
 				current_pid.and_then(|pid| processes.iter().find(|process| process.pid() == pid));
 			let current_user = current.and_then(|process| {

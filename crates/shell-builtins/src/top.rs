@@ -262,7 +262,12 @@ impl builtins::Command for TopCommand {
 				next_previous.clear();
 				rows.clear();
 
-				for process in ProcInfo::all() {
+				for process in ProcInfo::all_filtered(|pid| {
+					context
+						.params
+						.process_scope()
+						.is_none_or(|scope| scope.may_observe(pid))
+				}) {
 					if !pid_filter.is_empty() && !pid_filter.contains(&process.pid()) {
 						continue;
 					}

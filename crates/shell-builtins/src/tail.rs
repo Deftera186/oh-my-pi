@@ -3000,6 +3000,11 @@ impl Utility for Tail {
 				return error.code();
 			},
 		};
+		if settings.pid != 0 && i32::try_from(settings.pid).map_or(true, |pid| !host.may_signal(pid))
+		{
+			host.error("the requested PID is outside this shell's process scope", 1);
+			return 1;
+		}
 		settings.resolve_paths(host);
 
 		match tail_main(&settings, host) {

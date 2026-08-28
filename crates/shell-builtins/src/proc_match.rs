@@ -23,7 +23,7 @@ use std::{mem, os::fd, ptr};
 #[cfg(unix)]
 use omp_shell_engine::openfiles::OpenFiles;
 use omp_shell_engine::{
-	ExecutionContext, ExecutionExitCode, ExecutionResult, builtins::signal_number,
+	ExecutionContext, ExecutionExitCode, ExecutionResult, ProcessScope, builtins::signal_number,
 };
 use regex::RegexBuilder;
 #[cfg(unix)]
@@ -117,13 +117,14 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 				return Ok(ExecutionExitCode::Interrupted.into());
 			}
 
-			let (processes, host) = match select_processes(&mut options) {
-				Ok(selected) => selected,
-				Err(message) => {
-					writeln!(context.stderr(), "{command_name}: {message}")?;
-					return Ok(ExecutionResult::new(2));
-				},
-			};
+			let (processes, host) =
+				match select_processes(&mut options, context.params.process_scope()) {
+					Ok(selected) => selected,
+					Err(message) => {
+						writeln!(context.stderr(), "{command_name}: {message}")?;
+						return Ok(ExecutionResult::new(2));
+					},
+				};
 			if processes.is_empty() {
 				if options.count && !options.quiet {
 					writeln!(context.stdout(), "0")?;
@@ -199,6 +200,21 @@ pub(crate) fn run<SE: omp_shell_engine::ShellExtensions>(
 									context.stderr(),
 									"{command_name}: refusing to signal pid {} (this shell or one of its \
 									 ancestors)",
+									process.pid()
+								)?;
+							}
+							continue;
+						}
+						if context
+							.params
+							.process_scope()
+							.is_some_and(|scope| !scope.may_signal(process.pid()))
+						{
+							if !options.quiet {
+								writeln!(
+									context.stderr(),
+									"{command_name}: signalling pid {} is outside this shell's process \
+									 scope",
 									process.pid()
 								)?;
 							}
@@ -636,8 +652,10 @@ fn has_proc_selectors(options: &ProcMatchOptions) -> bool {
 /// table again.
 fn select_processes(
 	options: &mut ProcMatchOptions,
+	scope: Option<&std::sync::Arc<dyn ProcessScope>>,
 ) -> result::Result<(Vec<proc_snapshot::ProcInfo>, proc_snapshot::HostProcesses), String> {
-	let all = proc_snapshot::ProcInfo::all();
+	let all =
+		proc_snapshot::ProcInfo::all_filtered(|pid| scope.is_none_or(|scope| scope.may_observe(pid)));
 	let host = proc_snapshot::HostProcesses::resolve_in(&all);
 	let host_pid = process::id() as i32;
 	let host_group = all

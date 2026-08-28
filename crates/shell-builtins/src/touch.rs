@@ -1002,7 +1002,7 @@ fn pathbuf_from_stdout() -> Result<PathBuf, TouchError> {
 	}
 	#[cfg(target_os = "android")]
 	{
-		Ok(PathBuf::from("/proc/self/fd/1"))
+		Ok(PathBuf::from("/dev/fd/1"))
 	}
 	#[cfg(windows)]
 	{

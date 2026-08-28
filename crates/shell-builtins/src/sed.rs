@@ -8080,23 +8080,19 @@ pub mod processor {
 
 	#[cfg(unix)]
 	fn shell_command(cmd: &str, host: &Host) -> process::Command {
-		let mut c = process::Command::new("/bin/sh");
+		let mut c = host.command("/bin/sh");
 		c.arg("-c").arg(cmd);
 		// run relative to the shell's cwd,
 		// not the host process cwd. `output()` already keeps the child's stdio
 		// away from the host's (stdin closed, stdout/stderr captured).
-		c.current_dir(host.cwd());
-		c.env_clear().envs(host.env());
 		c
 	}
 
 	#[cfg(windows)]
 	fn shell_command(cmd: &str, host: &Host) -> process::Command {
-		let mut c = process::Command::new("cmd.exe");
+		let mut c = host.command("cmd.exe");
 		c.arg("/C").arg(cmd);
 		// see the unix variant above.
-		c.current_dir(host.cwd());
-		c.env_clear().envs(host.env());
 		c
 	}
 
@@ -8221,7 +8217,8 @@ pub mod processor {
 			// Execute the pattern space as a shell command if the 'e' flag is set
 			if sub.execute {
 				let cmd_str = pattern.as_str()?.to_string();
-				let output_bytes = shell_command(&cmd_str, host).output().map_err(|e| {
+				let mut child = shell_command(&cmd_str, host);
+				let output_bytes = host.run_output(&mut child).map_err(|e| {
 					input_runtime_error::<()>(
 						&command.location,
 						context,
