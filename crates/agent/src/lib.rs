@@ -179,7 +179,7 @@ pub use project::{
 pub use prompt::{
 	ActiveRepositoryInput, BandHash, CachedContribution, CanonicalPromptSource, ContextFile,
 	ConventionsPromptSource, DeliveryPromptSource, EagerTaskPolicy, HostInfoInput, ModelPromptInput,
-	MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource,
+	MutationPromptInput, Personality, PolicyPromptSource, ProjectPromptSource, PromptBands,
 	PromptCapabilitiesInput, PromptDelegationInput, PromptDeviceInput, PromptError, PromptFacts,
 	PromptHash, PromptMemoryInput, PromptMemorySlotInput, PromptNamedInput, PromptOut,
 	PromptPatchSet, PromptSchemeInput, PromptSettingsInput, PromptSlotSource, PromptSource,

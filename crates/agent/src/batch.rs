@@ -7,7 +7,7 @@ use std::{
 		Arc, OnceLock,
 		atomic::{AtomicBool, AtomicU128, Ordering},
 	},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -25,14 +25,15 @@ use omp_proto::{
 	toolhost::v1::HookEventId,
 };
 use omp_tool::{
-	Abort, ArgIssue, ArgPath, CallOutcome, CallOutcomeDetails, CapsBase, Effects, JobRef, Part,
-	PromptCaps, Registry, ToolIdentity, ToolTerminal,
+	Abort, ArgIssue, ArgPath, CallOutcome, CallOutcomeDetails, CapsBase, Effects, ExecutionMode,
+	JobRef, Part, PromptCaps, Registry, ToolIdentity, ToolTerminal,
 };
 use serde_json::Value;
 use tokio::{sync::Notify, task, time};
 
 use crate::{
 	events::{AgentEvent, EventBus, EventProvenance, EventVisibility},
+	hooks::{HookGate, notify_json},
 	project::{tool_result_item, tool_result_item_canonical_parts},
 };
 
@@ -82,12 +83,76 @@ pub fn effects_mutate_environment(effects: &Effects) -> bool {
 		|| effects.subagents != 0
 }
 
+fn batch_execution_mode<'a>(
+	identities: impl IntoIterator<Item = &'a ToolIdentity>,
+	registry: &Registry,
+) -> ExecutionMode {
+	if identities.into_iter().any(|identity| {
+		registry
+			.execution_mode(&identity.name)
+			.is_ok_and(|mode| mode == ExecutionMode::Sequential)
+	}) {
+		ExecutionMode::Sequential
+	} else {
+		ExecutionMode::Parallel
+	}
+}
+
 fn string_value(value: &str) -> value_pb::Value {
 	value_pb::Value { kind: Some(value::Kind::String(value.to_owned())) }
 }
 
 const fn bool_value(value: bool) -> value_pb::Value {
 	value_pb::Value { kind: Some(value::Kind::Bool(value)) }
+}
+
+fn target_kind(_: &ToolIdentity) -> &'static str {
+	"core"
+}
+
+fn tool_target(identity: &ToolIdentity, args: &[u8]) -> Value {
+	let args = serde_json::from_slice::<Value>(args)
+		.ok()
+		.filter(Value::is_object)
+		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+	serde_json::json!({
+		"kind": target_kind(identity),
+		"name": identity.name,
+		"rev": identity.rev.to_string(),
+		"args": args,
+	})
+}
+
+fn outcome_kind(
+	outcome: Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
+) -> &'static str {
+	match outcome {
+		Some(CallOutcome::Ok(_)) => "ok",
+		Some(CallOutcome::Faulted(_)) => "faulted",
+		Some(CallOutcome::ArgsRejected(_)) => "args_rejected",
+		Some(CallOutcome::Aborted { .. }) | None => "aborted",
+	}
+}
+
+fn outcome_storage(
+	outcome: Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
+) -> (bool, Option<String>) {
+	let details = match outcome {
+		Some(CallOutcome::Ok(details) | CallOutcome::Faulted(details)) => Some(details),
+		_ => None,
+	};
+	match details {
+		Some(CallOutcomeDetails::Spilled { blob, .. }) => {
+			(true, Some(format!("blob://{}", blob.hash)))
+		},
+		_ => (false, None),
+	}
+}
+
+fn outcome_effects_unknown(
+	outcome: Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
+) -> bool {
+	matches!(outcome, Some(CallOutcome::Aborted { abort: Abort::EffectsUnknown { .. }, .. }))
 }
 
 /// Failure to open, relay, decode, project, or lower a tool invocation.
@@ -313,6 +378,23 @@ enum PumpOutput {
 	Update(Bytes),
 	Terminal(PumpTerminal),
 }
+
+struct ToolUpdateBatch {
+	latest:    Bytes,
+	coalesced: u32,
+}
+
+impl ToolUpdateBatch {
+	const fn new(latest: Bytes) -> Self {
+		Self { latest, coalesced: 1 }
+	}
+
+	fn push(&mut self, update: Bytes) {
+		self.latest = update;
+		self.coalesced = self.coalesced.saturating_add(1);
+	}
+}
+
 struct InterruptRequest {
 	reason:       Str,
 	acknowledged: flume::Sender<()>,
@@ -636,11 +718,12 @@ pub struct SpeculativeCall {
 }
 
 struct SpeculativeCallInner {
-	call_id:  Str,
-	identity: ToolIdentity,
-	pump:     InvocationPump,
-	events:   EventBus,
-	relayed:  StrMut,
+	call_id:   Str,
+	identity:  ToolIdentity,
+	pump:      InvocationPump,
+	events:    EventBus,
+	relayed:   StrMut,
+	hook_gate: Option<Arc<HookGate>>,
 }
 
 impl SpeculativeCall {
@@ -694,6 +777,7 @@ impl SpeculativeCall {
 				pump,
 				events: events.clone(),
 				relayed: StrMut::default(),
+				hook_gate: None,
 			}),
 		})
 	}
@@ -710,10 +794,12 @@ impl SpeculativeCall {
 
 	/// Installs the loop-owned hook, authority ceiling, and durable fact bus.
 	pub(crate) fn attach_runtime(
-		&self,
+		&mut self,
 		hooks: InvocationHookBus,
 		facts: flume::Sender<InvocationAdmissionFact>,
 		maximum_effects: Effects,
+		hook_gate: Option<Arc<HookGate>>,
+		turn_id: Str,
 	) -> Result<(), BatchError> {
 		let pump = &self.inner.as_ref().expect("live speculative call").pump;
 		pump
@@ -729,6 +815,17 @@ impl SpeculativeCall {
 			.set(facts)
 			.map_err(|_| BatchError::FactBusAlreadySet)?;
 		pump.maximum_ready.notify_one();
+		let inner = self.inner.as_mut().expect("live speculative call");
+		inner.hook_gate = hook_gate;
+		notify_json(HookEventId::HookEventCallOpen, inner.hook_gate.as_deref(), || {
+			serde_json::json!({
+				"call_id": inner.call_id,
+				"target": tool_target(&inner.identity, &[]),
+				"kind": target_kind(&inner.identity),
+				"turn_id": turn_id,
+				"place": {"kind": "env", "name": Value::Null},
+			})
+		});
 		Ok(())
 	}
 
@@ -792,7 +889,7 @@ impl SpeculativeCall {
 			.as_millis()
 			.try_into()
 			.unwrap_or(u64::MAX);
-		let SpeculativeCallInner { call_id, identity, pump, events, .. } =
+		let SpeculativeCallInner { call_id, identity, pump, events, hook_gate, .. } =
 			self.inner.take().expect("live speculative call");
 		let effects = pump.effects.get().cloned().unwrap_or_default();
 		CommittedCall {
@@ -804,6 +901,7 @@ impl SpeculativeCall {
 			effects,
 			pump,
 			events,
+			hook_gate,
 			usage: Default::default(),
 		}
 	}
@@ -830,6 +928,7 @@ pub struct CommittedCall {
 	effects:          Effects,
 	pump:             InvocationPump,
 	events:           EventBus,
+	hook_gate:        Option<Arc<HookGate>>,
 	usage:            v1::Usage,
 }
 
@@ -881,9 +980,12 @@ pub struct BatchUpdate {
 /// One ordered batch completion shared with the event feed.
 #[derive(Clone)]
 pub struct BatchResult {
-	event:   Arc<AgentEvent>,
-	job:     Option<JobRef>,
-	outcome: Option<CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
+	event:     Arc<AgentEvent>,
+	job:       Option<JobRef>,
+	outcome:   Option<CallOutcome<CallOutcomeDetails, CallOutcomeDetails>>,
+	identity:  ToolIdentity,
+	raw_args:  Bytes,
+	terminate: bool,
 }
 
 impl BatchResult {
@@ -917,8 +1019,16 @@ impl BatchResult {
 	pub const fn outcome(&self) -> Option<&CallOutcome<CallOutcomeDetails, CallOutcomeDetails>> {
 		self.outcome.as_ref()
 	}
+
 	/// Returns the resolved tool identity for hook projection.
+	pub(crate) const fn identity(&self) -> &ToolIdentity {
+		&self.identity
+	}
+
 	/// Returns the exact committed arguments for hook projection.
+	pub(crate) const fn raw_args(&self) -> &Bytes {
+		&self.raw_args
+	}
 
 	/// Takes detached job ownership for registration with the job board.
 	pub fn into_job(self) -> Option<JobRef> {
@@ -929,9 +1039,15 @@ impl BatchResult {
 	pub const fn is_detached(&self) -> bool {
 		self.job.is_some()
 	}
+
+	/// Returns whether this finalized result opts in to ending the tool loop.
+	pub const fn terminate(&self) -> bool {
+		self.terminate
+	}
 }
 
-/// A set of committed calls driven concurrently and returned in issued order.
+/// A set of committed calls driven under their declared mode and returned in
+/// issued order.
 pub struct ToolBatch {
 	calls: Vec<CommittedCall>,
 }
@@ -952,7 +1068,8 @@ impl ToolBatch {
 		self.calls.is_empty()
 	}
 
-	/// Sends every effect authorization and drives all calls concurrently.
+	/// Sends effect authorizations concurrently unless one declaration requires
+	/// issued-order execution.
 	///
 	/// Results remain in issued order. Once a call is authorized, environment
 	/// or lowering failures become canonical `EffectsUnknown` results so every
@@ -1025,24 +1142,18 @@ mod interruptible {
 			}
 
 			let mut interrupt_senders = Vec::with_capacity(self.calls.len());
+			let sequential =
+				batch_execution_mode(self.calls.iter().map(CommittedCall::identity), registry)
+					== ExecutionMode::Sequential;
 			let mut calls = Vec::with_capacity(self.calls.len());
 			for (index, call) in self.calls.into_iter().enumerate() {
 				let force_after_grace = !effects_mutate_environment(call.effects());
 				let (interrupt_tx, interrupt_rx) = flume::bounded(1);
 				interrupt_senders.push(InterruptTarget { sender: interrupt_tx });
-				calls.push(run_call(
-					index,
-					call,
-					registry,
-					caps,
-					interrupt_rx,
-					grace,
-					force_after_grace,
-					updates.clone(),
-				));
+				calls.push((index, call, interrupt_rx, force_after_grace));
 			}
 
-			let drive = join_all(calls);
+			let drive = drive_calls(calls, registry, caps, grace, updates, sequential);
 			let results = if let Some(mut interrupt) = interrupt {
 				let coordinate = coordinate_interrupts(&mut interrupt, &interrupt_senders, grace);
 				tokio::pin!(drive, coordinate);
@@ -1054,6 +1165,53 @@ mod interruptible {
 				drive.await
 			};
 			results.into_iter().map(|(_, result)| result).collect()
+		}
+	}
+
+	async fn drive_calls(
+		calls: Vec<(usize, CommittedCall, flume::Receiver<InterruptRequest>, bool)>,
+		registry: &Registry,
+		caps: &CapsBase,
+		grace: Duration,
+		updates: Option<flume::Sender<BatchUpdate>>,
+		sequential: bool,
+	) -> Vec<(usize, BatchResult)> {
+		if sequential {
+			let mut results = Vec::with_capacity(calls.len());
+			for (index, call, interrupt, force_after_grace) in calls {
+				results.push(
+					run_call(
+						index,
+						call,
+						registry,
+						caps,
+						interrupt,
+						grace,
+						force_after_grace,
+						updates.clone(),
+					)
+					.await,
+				);
+			}
+			results
+		} else {
+			join_all(
+				calls
+					.into_iter()
+					.map(|(index, call, interrupt, force_after_grace)| {
+						run_call(
+							index,
+							call,
+							registry,
+							caps,
+							interrupt,
+							grace,
+							force_after_grace,
+							updates.clone(),
+						)
+					}),
+			)
+			.await
 		}
 	}
 
@@ -1117,6 +1275,7 @@ mod interruptible {
 			.map_err(BatchError::InvalidOutcome)?;
 		let durable = durable_outcome(&wire.json, &outcome);
 		let is_error = !matches!(outcome, CallOutcome::Ok(_));
+		let terminate = wire.terminate.unwrap_or(false);
 		let mut result = if let Some(parts) = harness_parts(&outcome) {
 			lower_tool_parts(call, &wire.json, is_error, wire.useless, &parts)?
 		} else {
@@ -1130,6 +1289,7 @@ mod interruptible {
 			}
 		};
 		result.outcome = Some(durable);
+		result.terminate = terminate;
 		Ok(result)
 	}
 }
@@ -1145,6 +1305,16 @@ async fn run_call(
 	force_after_grace: bool,
 	updates: Option<flume::Sender<BatchUpdate>>,
 ) -> (usize, BatchResult) {
+	let started = Instant::now();
+	notify_json(HookEventId::HookEventToolExecutionStart, call.hook_gate.as_deref(), || {
+		serde_json::json!({
+			"call_id": call.call_id,
+			"invocation_id": call.call_id,
+			"target": tool_target(&call.identity, &call.raw_args),
+			"place": {"kind": "env", "name": Value::Null},
+			"deadline": Value::Null,
+		})
+	});
 	let receipt = match call.pump.begin_authorization(
 		call.raw_args.clone(),
 		Bytes::copy_from_slice(call.effect_token.as_bytes()),
@@ -1246,6 +1416,19 @@ async fn run_call(
 			reason: format!("environment invocation failed: {error}").to_str(),
 		}),
 	};
+	let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+	let (spilled, artifact) = outcome_storage(result.outcome());
+	notify_json(HookEventId::HookEventToolExecutionEnd, call.hook_gate.as_deref(), || {
+		serde_json::json!({
+			"call_id": call.call_id,
+			"target": tool_target(&call.identity, &call.raw_args),
+			"outcome": outcome_kind(result.outcome()),
+			"duration": format!("{duration_ms}ms"),
+			"spilled": spilled,
+			"artifact": artifact,
+			"effects_unknown": outcome_effects_unknown(result.outcome()),
+		})
+	});
 	(index, result)
 }
 
@@ -1258,10 +1441,50 @@ async fn drain_pump(
 			PumpOutput::Update(json) => {
 				if let Some(updates) = updates {
 					let _ = updates.send(BatchUpdate {
-						call_id: call.call_id.clone(),
+						call_id:  call.call_id.clone(),
 						identity: call.identity.clone(),
-						json,
+						json:     json.clone(),
 					});
+				}
+				let Some(gate) = call
+					.hook_gate
+					.as_deref()
+					.filter(|gate| gate.subscribed(HookEventId::HookEventToolUpdate))
+				else {
+					continue;
+				};
+				let mut batch = ToolUpdateBatch::new(json);
+				let mut terminal = None;
+				time::sleep(Duration::from_millis(16)).await;
+				while let Ok(output) = call.pump.outputs.try_recv() {
+					match output {
+						PumpOutput::Update(json) => {
+							if let Some(updates) = updates {
+								let _ = updates.send(BatchUpdate {
+									call_id:  call.call_id.clone(),
+									identity: call.identity.clone(),
+									json:     json.clone(),
+								});
+							}
+							batch.push(json);
+						},
+						PumpOutput::Terminal(value) => {
+							terminal = Some(value);
+							break;
+						},
+					}
+				}
+				notify_json(HookEventId::HookEventToolUpdate, Some(gate), || {
+					serde_json::json!({
+						"call_id": call.call_id,
+						"target": tool_target(&call.identity, &call.raw_args),
+						"update": serde_json::from_slice::<Value>(&batch.latest)
+							.unwrap_or(Value::Null),
+						"coalesced": batch.coalesced,
+					})
+				});
+				if let Some(terminal) = terminal {
+					return terminal;
 				}
 			},
 			PumpOutput::Terminal(terminal) => return terminal,
@@ -1359,7 +1582,14 @@ fn lower_detached(
 	let item = tool_result_item(0, &call.call_id, &call.identity, &raw, false, false, &parts)
 		.map_err(|error| BatchError::Projection(error.to_string().to_str()))?;
 	let event = finish_event(call, item);
-	Ok(BatchResult { event, job: Some(job), outcome: None })
+	Ok(BatchResult {
+		event,
+		job: Some(job),
+		outcome: None,
+		identity: call.identity.clone(),
+		raw_args: call.raw_args.clone(),
+		terminate: false,
+	})
 }
 
 fn lower_abort(call: &CommittedCall, abort: Abort) -> Result<BatchResult, BatchError> {
@@ -1385,7 +1615,14 @@ fn lower_tool_parts(
 ) -> Result<BatchResult, BatchError> {
 	let item = tool_result_item(0, &call.call_id, &call.identity, verdict, is_error, useless, parts)
 		.map_err(|error| BatchError::Projection(error.to_string().to_str()))?;
-	Ok(BatchResult { event: finish_event(call, item), job: None, outcome: None })
+	Ok(BatchResult {
+		event:     finish_event(call, item),
+		job:       None,
+		outcome:   None,
+		identity:  call.identity.clone(),
+		raw_args:  call.raw_args.clone(),
+		terminate: false,
+	})
 }
 
 fn lower_canonical_parts(
@@ -1405,7 +1642,14 @@ fn lower_canonical_parts(
 		parts,
 	)
 	.map_err(|error| BatchError::Projection(error.to_string().to_str()))?;
-	Ok(BatchResult { event: finish_event(call, item), job: None, outcome: None })
+	Ok(BatchResult {
+		event:     finish_event(call, item),
+		job:       None,
+		outcome:   None,
+		identity:  call.identity.clone(),
+		raw_args:  call.raw_args.clone(),
+		terminate: false,
+	})
 }
 
 fn durable_outcome(
@@ -1507,6 +1751,53 @@ mod tests {
 			media:              false,
 			model_class:        ModelClass::Standard,
 		}
+	}
+
+	#[test]
+	fn serial_worker_declaration_forces_batch_execution_mode() {
+		let spec = |name: &str| omp_tool::ToolSpec {
+			name:            Str::from(name),
+			rev:             Rev { family: sf!("test"), n: 1 },
+			description:     sf!("batch mode contract"),
+			schema:          Bytes::from_static(br#"{"type":"object","additionalProperties":false}"#),
+			constraint:      omp_tool::Constraint::None,
+			effects:         Effects::default(),
+			projection_code: [3; 32],
+		};
+		let claims = omp_tool::Claims {
+			precedence: omp_tool::Precedence::DEFAULT,
+			claimant:   sf!("batch.contract"),
+			replaces:   None,
+		};
+		let mut registry = Registry::new();
+		registry
+			.register_worker_with_mode(
+				spec("parallel_tool"),
+				omp_tool::Presentation::Device,
+				claims.clone(),
+				ExecutionMode::Parallel,
+			)
+			.expect("register parallel worker");
+		registry
+			.register_worker_with_mode(
+				spec("serial_tool"),
+				omp_tool::Presentation::Device,
+				claims,
+				ExecutionMode::Sequential,
+			)
+			.expect("register serial worker");
+		let parallel = identity("parallel_tool");
+		let serial = identity("serial_tool");
+		assert_eq!(batch_execution_mode([&parallel], &registry), ExecutionMode::Parallel);
+		assert_eq!(batch_execution_mode([&parallel, &serial], &registry), ExecutionMode::Sequential);
+	}
+
+	#[test]
+	fn tool_update_batch_keeps_latest_payload_and_raw_count() {
+		let mut batch = ToolUpdateBatch::new(Bytes::from_static(br#"{"step":1}"#));
+		batch.push(Bytes::from_static(br#"{"step":2}"#));
+		assert_eq!(batch.latest, Bytes::from_static(br#"{"step":2}"#));
+		assert_eq!(batch.coalesced, 2);
 	}
 
 	fn terminal_text(result: &BatchResult) -> &str {
@@ -1639,6 +1930,7 @@ mod tests {
 						invocation_id: "first".into(),
 						json: Bytes::from_static(br#"{"kind":"ok","value":{"answer":1}}"#),
 						parts: vec![ThreadPart { kind: Some(part::Kind::Text("one".into())) }],
+						terminate: Some(true),
 						..Default::default()
 					})),
 					..Default::default()
@@ -1676,6 +1968,8 @@ mod tests {
 
 		assert_eq!(results.len(), 2);
 		assert_eq!(terminal_text(&results[0]), "one");
+		assert!(results[0].terminate());
+		assert!(!results[1].terminate());
 		assert!(terminal_text(&results[1]).contains("failed to lower environment verdict"));
 		let mut finished = 0;
 		while let Ok(event) = observed.try_recv() {
@@ -1722,7 +2016,7 @@ mod tests {
 		let (client, transport) = EnvClient::in_process(0);
 		let (requests, responses) = transport.into_parts();
 		let events = EventBus::new();
-		let call = SpeculativeCall::open(
+		let mut call = SpeculativeCall::open(
 			&client,
 			&events,
 			sf!("abandoned"),
@@ -1734,7 +2028,7 @@ mod tests {
 		let (hooks, _hook_requests) = InvocationHookBus::channel();
 		let (facts, _fact_receiver) = flume::unbounded();
 		call
-			.attach_runtime(hooks, facts, Effects::empty())
+			.attach_runtime(hooks, facts, Effects::empty(), None, sf!("turn"))
 			.expect("attach runtime");
 		let opened = requests.recv_async().await.expect("invoke frame");
 		responses

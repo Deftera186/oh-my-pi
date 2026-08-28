@@ -424,6 +424,16 @@ impl Mailbox {
 		MailboxSender { tx: self.tx.clone(), commands: self.commands_tx.clone() }
 	}
 
+	/// Returns the number of interrupts waiting for a future drain point.
+	///
+	/// Pending channel items are first folded into the receiver-owned backlog so
+	/// deduplication uses the same rules as an ordinary drain.
+	pub fn pending_len(&mut self) -> usize {
+		self.service_commands();
+		self.pump(false);
+		self.backlog.len()
+	}
+
 	/// Waits until one interrupt is retained in the local backlog.
 	///
 	/// Cancelling this future leaves the channel unchanged. Once it completes,
@@ -696,5 +706,24 @@ mod tests {
 			.unwrap();
 		assert!(mailbox.drain(DrainPoint::Immediate, true).is_empty());
 		assert_eq!(mailbox.drain(DrainPoint::TurnBoundary, true).len(), 1);
+	}
+
+	#[test]
+	fn pending_len_counts_receiver_and_backlog_without_consuming() {
+		let mut mailbox = Mailbox::new();
+		let sender = mailbox.sender();
+		for name in ["first", "second"] {
+			sender
+				.try_enqueue(Interrupt {
+					class:  InterruptClass::TurnBoundary,
+					item:   item(),
+					source: InterruptSource::Producer(Str::new(name)),
+				})
+				.expect("enqueue");
+		}
+		assert_eq!(mailbox.pending_len(), 2);
+		assert_eq!(mailbox.pending_len(), 2);
+		assert_eq!(mailbox.drain(DrainPoint::TurnBoundary, false).len(), 2);
+		assert_eq!(mailbox.pending_len(), 0);
 	}
 }

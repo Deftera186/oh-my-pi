@@ -1039,8 +1039,9 @@ impl From<Hash32> for BandHash {
 /// Semantic stability of a prompt contribution.
 ///
 /// Discriminants are assembly order, not a wire vocabulary.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
+#[strum(serialize_all = "lowercase")]
 pub enum SlotClass {
 	/// Immutable for the process lifetime.
 	Frozen   = 0,
@@ -1053,8 +1054,9 @@ pub enum SlotClass {
 }
 
 /// The fixed prompt-slot catalog.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Display, EnumString, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
+#[strum(serialize_all = "lowercase")]
 pub enum SlotId {
 	/// RFC and harness conventions.
 	Conventions = 0,
@@ -1470,36 +1472,41 @@ impl SlotAssembler {
 			)
 		});
 		let band_bytes = slot_bytes.map(|slots| slots.concat());
-		let items = band_bytes
-			.into_iter()
-			.filter(|bytes| !bytes.is_empty())
-			.map(system_text)
-			.collect();
+		let items = band_bytes.map(|bytes| {
+			if bytes.is_empty() {
+				Vec::new()
+			} else {
+				vec![system_text(bytes)]
+			}
+		});
 		Ok(AssembledSlots { items, bands })
 	}
 }
 
 impl PromptSource for SlotAssembler {
 	fn render(&self, workspace: &Props) -> Result<Vec<Item>, PromptError> {
-		Ok(self.assemble(workspace)?.items)
+		Ok(self.assemble(workspace)?.into_items())
 	}
 
-	fn banded_render(
-		&self,
-		workspace: &Props,
-	) -> Result<Option<(Vec<Item>, [BandHash; 4])>, PromptError> {
+	fn banded_items_render(&self, workspace: &Props) -> Result<Option<PromptBands>, PromptError> {
 		let first = self.assemble(workspace)?;
 		let second = self.assemble(workspace)?;
 		if first.items != second.items {
 			return Err(PromptError::Volatile);
 		}
-		Ok(Some((first.items, first.bands)))
+		Ok(Some(PromptBands { items: first.items, hashes: first.bands }))
 	}
 }
 
 struct AssembledSlots {
-	items: Vec<Item>,
+	items: [Vec<Item>; 4],
 	bands: [BandHash; 4],
+}
+
+impl AssembledSlots {
+	fn into_items(self) -> Vec<Item> {
+		self.items.into_iter().flatten().collect()
+	}
 }
 
 fn hash_band(bytes: &[u8]) -> BandHash {
@@ -1533,21 +1540,58 @@ fn hash_banded_items(items: &[Item], bands: &[BandHash; 4]) -> Result<PromptHash
 }
 const fn default_slot_class(slot: SlotId) -> SlotClass {
 	match slot {
-		SlotId::Conventions => SlotClass::Frozen,
-		SlotId::Role
+		SlotId::Conventions
+		| SlotId::Role
 		| SlotId::Runtime
-		| SlotId::Tools
-		| SlotId::Policy
 		| SlotId::Workflow
+		| SlotId::Delivery => SlotClass::Frozen,
+		SlotId::Tools
+		| SlotId::Policy
 		| SlotId::Skills
 		| SlotId::Rules
 		| SlotId::Guidance
-		| SlotId::Workspace
-		| SlotId::Delivery => SlotClass::Stable,
+		| SlotId::Workspace => SlotClass::Stable,
 		SlotId::Memory | SlotId::Standing => SlotClass::Epochal,
 		SlotId::Recall | SlotId::Status => SlotClass::Volatile,
 	}
 }
+/// Canonical system items separated into semantic stability bands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptBands {
+	/// Provider-facing items in Frozen, Stable, Epochal, and Volatile order.
+	pub items:  [Vec<Item>; 4],
+	/// Semantic digest for each corresponding band.
+	pub hashes: [BandHash; 4],
+}
+
+impl PromptBands {
+	/// Appends another banded source without crossing a stability boundary.
+	pub fn append(&mut self, mut other: Self) {
+		for (index, (items, appended)) in self
+			.items
+			.iter_mut()
+			.zip(other.items.iter_mut())
+			.enumerate()
+		{
+			if appended.is_empty() {
+				continue;
+			}
+			items.append(appended);
+			let mut hasher = Hash32::hasher();
+			hasher.update(b"omp-agent/prompt/band-composition/v1");
+			hasher.update(&(index as u64).to_le_bytes());
+			hasher.update(self.hashes[index].as_bytes());
+			hasher.update(other.hashes[index].as_bytes());
+			self.hashes[index] = hasher.finalize().into();
+		}
+	}
+
+	/// Flattens the ordered bands into provider-facing prompt items.
+	pub fn into_items(self) -> Vec<Item> {
+		self.items.into_iter().flatten().collect()
+	}
+}
+
 /// A checked canonical prompt head and its semantic hash.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderedPrompt {
@@ -1566,12 +1610,20 @@ pub trait PromptSource: Send + Sync + 'static {
 	/// Renders one candidate prompt head from immutable input.
 	fn render(&self, workspace: &Props) -> Result<Vec<Item>, PromptError>;
 
+	/// Optionally renders provider-facing items separated by stability band.
+	fn banded_items_render(&self, _workspace: &Props) -> Result<Option<PromptBands>, PromptError> {
+		Ok(None)
+	}
+
 	/// Optionally renders a head whose stability bands have semantic hashes.
 	fn banded_render(
 		&self,
-		_workspace: &Props,
+		workspace: &Props,
 	) -> Result<Option<(Vec<Item>, [BandHash; 4])>, PromptError> {
-		Ok(None)
+		Ok(self.banded_items_render(workspace)?.map(|bands| {
+			let hashes = bands.hashes;
+			(bands.into_items(), hashes)
+		}))
 	}
 }
 
@@ -1583,7 +1635,7 @@ pub struct ConventionsPromptSource;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RolePromptSource;
 
-/// Frozen general tool-use policy.
+/// Stable general tool-use policy.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PolicyPromptSource;
 
@@ -1639,7 +1691,7 @@ template_prompt_source!(
 	PolicyPromptSource,
 	crate::prompt_engine::tool_policy,
 	SlotId::Policy,
-	SlotClass::Frozen,
+	SlotClass::Stable,
 	"omp.core.policy"
 );
 template_prompt_source!(
@@ -1657,7 +1709,7 @@ template_prompt_source!(
 	"omp.core.delivery"
 );
 
-/// Stable runtime, URL, skill, rule, and capability policy.
+/// Frozen runtime, URL, skill, rule, and capability policy.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuntimePromptSource;
 
@@ -1667,7 +1719,7 @@ impl RuntimePromptSource {
 		SlotRegistration {
 			decl:   SlotDecl {
 				slot:     SlotId::Runtime,
-				class:    SlotClass::Stable,
+				class:    SlotClass::Frozen,
 				owner:    sf!("omp.runtime"),
 				priority: 0,
 			},
@@ -1717,40 +1769,44 @@ impl SlotSource for ProjectPromptSource {
 pub struct CanonicalPromptSource;
 
 impl CanonicalPromptSource {
-	fn candidate(props: &Props) -> Result<(Vec<Item>, [BandHash; 4]), PromptError> {
+	fn candidate(props: &Props) -> Result<PromptBands, PromptError> {
 		if props
 			.get(prompt_keys::NULL_PROMPT)
 			.is_some_and(omp_scribe::Value::is_truthy)
 		{
-			return Ok((Vec::new(), [hash_band(&[]); 4]));
+			return Ok(PromptBands {
+				items:  array::from_fn(|_| Vec::new()),
+				hashes: [hash_band(&[]); 4],
+			});
 		}
 
 		let engine = prompt_engine::engine();
+		let custom = props
+			.get(prompt_keys::CUSTOM_PROMPT)
+			.and_then(omp_scribe::Value::as_str);
 		let mut frozen = String::new();
 		prompt_engine::conventions().render(engine, props, &mut frozen)?;
-
-		let mut system = frozen.clone();
-		if let Some(custom) = props
-			.get(prompt_keys::CUSTOM_PROMPT)
-			.and_then(omp_scribe::Value::as_str)
-		{
-			system.push_str(custom);
-			system.push_str("\n\n");
-		} else {
-			prompt_engine::role().render(engine, props, &mut system)?;
+		if custom.is_none() {
+			prompt_engine::role().render(engine, props, &mut frozen)?;
 		}
-		prompt_engine::runtime().render(engine, props, &mut system)?;
-		prompt_engine::tool_policy().render(engine, props, &mut system)?;
-		prompt_engine::workflow().render(engine, props, &mut system)?;
+		prompt_engine::runtime().render(engine, props, &mut frozen)?;
+		prompt_engine::workflow().render(engine, props, &mut frozen)?;
+		prompt_engine::delivery().render(engine, props, &mut frozen)?;
+
+		let mut stable = String::new();
+		if let Some(custom) = custom {
+			stable.push_str(custom);
+			stable.push_str("\n\n");
+		}
+		prompt_engine::tool_policy().render(engine, props, &mut stable)?;
 		if let Some(append) = props
 			.get(prompt_keys::APPEND_PROMPT)
 			.and_then(omp_scribe::Value::as_str)
 		{
-			system.push_str("\n§ Guidance\n");
-			system.push_str(append);
-			system.push('\n');
+			stable.push_str("\n§ Guidance\n");
+			stable.push_str(append);
+			stable.push('\n');
 		}
-		prompt_engine::delivery().render(engine, props, &mut system)?;
 
 		let project = prompt_engine::project()
 			.render_str(engine, props)?
@@ -1772,56 +1828,46 @@ impl CanonicalPromptSource {
 		} else {
 			String::new()
 		};
-
 		let memory = memory_entries(props);
-		let mut items = Vec::with_capacity(4 + memory.iter().filter(|entry| entry.is_some()).count());
-		items.push(system_text(system.clone()));
+		let mut text = [vec![frozen], vec![stable], Vec::with_capacity(2), Vec::with_capacity(1)];
 		if computer {
-			items.push(system_text(safety.clone()));
+			text[SlotClass::Stable as usize].push(safety);
 		}
-		items.push(system_text(project.clone()));
+		text[SlotClass::Stable as usize].push(project);
 		if !active.is_empty() {
-			items.push(system_text(active.clone()));
+			text[SlotClass::Stable as usize].push(active);
 		}
-		for content in memory.iter().flatten() {
-			items.push(system_text((*content).to_owned()));
+		for content in memory[..2].iter().flatten() {
+			text[SlotClass::Epochal as usize].push((*content).to_owned());
 		}
-
-		let stable = [
-			Some((0, system.as_bytes())),
-			computer.then_some((1, safety.as_bytes())),
-			Some((2, project.as_bytes())),
-			(!active.is_empty()).then_some((3, active.as_bytes())),
-		]
-		.into_iter()
-		.flatten();
-		let epochal = memory[..2]
-			.iter()
-			.enumerate()
-			.filter_map(|(index, content)| content.map(|content| (index as u64, content.as_bytes())));
-		let volatile = memory[2]
-			.map(|content| [(0, content.as_bytes())].into_iter())
-			.into_iter()
-			.flatten();
-		let bands = [
-			hash_framed([(0, frozen.as_bytes())]),
-			hash_framed(stable),
-			hash_framed(epochal),
-			hash_framed(volatile),
-		];
-		Ok((items, bands))
+		if let Some(content) = memory[2] {
+			text[SlotClass::Volatile as usize].push(content.to_owned());
+		}
+		let hashes = text.each_ref().map(|parts| {
+			hash_framed(
+				parts
+					.iter()
+					.enumerate()
+					.map(|(index, part)| (index as u64, part.as_bytes())),
+			)
+		});
+		let items = text.map(|parts| {
+			parts
+				.into_iter()
+				.filter(|part| !part.is_empty())
+				.map(system_text)
+				.collect()
+		});
+		Ok(PromptBands { items, hashes })
 	}
 }
 
 impl PromptSource for CanonicalPromptSource {
 	fn render(&self, props: &Props) -> Result<Vec<Item>, PromptError> {
-		Ok(Self::candidate(props)?.0)
+		Ok(Self::candidate(props)?.into_items())
 	}
 
-	fn banded_render(
-		&self,
-		props: &Props,
-	) -> Result<Option<(Vec<Item>, [BandHash; 4])>, PromptError> {
+	fn banded_items_render(&self, props: &Props) -> Result<Option<PromptBands>, PromptError> {
 		let first = Self::candidate(props)?;
 		let second = Self::candidate(props)?;
 		if first != second {

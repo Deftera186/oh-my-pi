@@ -25,6 +25,7 @@ use omp_proto::{
 		turn_event, value,
 	},
 	thread::v1::{self as thread, Item, Thread, item, part},
+	toolhost::v1 as hook_pb,
 };
 use omp_secrets::{
 	json::{deobfuscate_json, obfuscate_json},
@@ -34,7 +35,9 @@ use omp_secrets::{
 use omp_storage::{
 	blob::{self, BlobStore},
 	gc::{ArtifactCatalog, ArtifactLifetime},
-	transcript::{CallId, ChildLifecycleEntry, InvocationTransition, SnapcompactArchive},
+	transcript::{
+		CallId, ChildLifecycleEntry, HookOutcome, InvocationTransition, SnapcompactArchive,
+	},
 };
 use omp_telemetry::firehose::{
 	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
@@ -47,12 +50,13 @@ use serde_json::{Value, value::RawValue};
 use thiserror::Error;
 
 use crate::{
-	AgentRegistry, BatchError, CompactionCancellation, CompactionCoordinator, CompactionMethodOrder,
-	CompactionTier, Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode,
-	ManualCompactionOutcome, ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome,
-	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
-	SnapcompactPreparation, StreamSource, StreamingEditGuard, TtsrRegistry, TurnClient, TurnInput,
-	TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	AgentRegistry, BatchError, CompactionCancellation, CompactionCoordinator, CompactionEvent,
+	CompactionMethodOrder, CompactionReason, CompactionResolution, CompactionTier, HookPhase,
+	Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode, ManualCompactionOutcome,
+	ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome, PROMPT_CACHE_WARM_SUFFIX_TOKENS,
+	ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource, SnapcompactPreparation,
+	StreamSource, StreamingEditGuard, TtsrRegistry, TurnClient, TurnInput, TurnSession,
+	YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	advisor::{ADVISOR_TOOL_LOOP_THRESHOLD, AdvisorToolLoopAction, AdvisorToolLoopGuard},
 	arbiter::{
 		Arbiter, PointCx, StreamPart,
@@ -61,7 +65,8 @@ use crate::{
 		stream::{StreamCancel, stream_recovery_item},
 	},
 	batch::{
-		InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest, SpeculativeCall, ToolBatch,
+		BatchResult, InvocationAdmissionFact, InvocationHookBus, InvocationHookRequest,
+		SpeculativeCall, ToolBatch,
 	},
 	context::{ContextProjection, ContextProjectionHandler, apply_patches, project_context},
 	continuation::{
@@ -75,7 +80,7 @@ use crate::{
 	},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
-	hooks::HookGate,
+	hooks::{HookGate, JsonGateOutcome, gate_json, notify_json},
 	jobs::JobBoard,
 	journal::{
 		AbortDisposition, ReplicationSubscription, TurnInputRecord, TurnOptionsRecord, TurnStart,
@@ -96,6 +101,7 @@ const TOOL_DEADLINE: omp_core::Duration =
 const CONTROL_DRAIN_LIMIT: usize = 32;
 const MEMORY_RECALL_QUERY_MAX_CHARS: usize = 32 * 1024;
 const UNEXPECTED_STOP_RETRY_CAP: u8 = 3;
+
 #[derive(serde::Deserialize)]
 struct TodoSnapshotPayload {
 	phases: Vec<TodoSnapshotPhase>,
@@ -243,6 +249,362 @@ fn run_summary(
 	AgentRunSummary { outcome, committed_turns, interrupted, settlement, final_assistant }
 }
 
+const fn agent_phase_name(phase: AgentPhase) -> &'static str {
+	match phase {
+		AgentPhase::Idle => "idle",
+		AgentPhase::Projecting => "projecting",
+		AgentPhase::Turning => "turning",
+		AgentPhase::ToolBatch => "tool_batch",
+	}
+}
+
+const fn stop_reason_name(reason: pb::StopReason) -> &'static str {
+	match reason {
+		pb::StopReason::StopEndTurn => "end_turn",
+		pb::StopReason::StopToolUse => "tool_use",
+		pb::StopReason::StopMaxTokens => "max_tokens",
+		pb::StopReason::StopContentFilter => "content_filter",
+		pb::StopReason::StopUnspecified => "unspecified",
+	}
+}
+
+fn effort_name(effort: i32) -> &'static str {
+	match pb::Effort::try_from(effort).unwrap_or(pb::Effort::Unspecified) {
+		pb::Effort::Off => "off",
+		pb::Effort::Minimal => "minimal",
+		pb::Effort::Low => "low",
+		pb::Effort::Medium => "medium",
+		pb::Effort::High => "high",
+		pb::Effort::Xhigh => "xhigh",
+		pb::Effort::Max => "max",
+		pb::Effort::Unspecified => "off",
+	}
+}
+
+fn parse_effort(value: &str) -> Option<pb::Effort> {
+	Some(match value {
+		"off" => pb::Effort::Off,
+		"minimal" => pb::Effort::Minimal,
+		"low" => pb::Effort::Low,
+		"medium" => pb::Effort::Medium,
+		"high" => pb::Effort::High,
+		"xhigh" => pb::Effort::Xhigh,
+		"max" => pb::Effort::Max,
+		_ => return None,
+	})
+}
+
+fn hook_tool_target(identity: &omp_tool::ToolIdentity, raw_args: &[u8]) -> Value {
+	let args = serde_json::from_slice::<Value>(raw_args)
+		.ok()
+		.filter(Value::is_object)
+		.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+	serde_json::json!({
+		"kind": "core",
+		"name": identity.name,
+		"rev": identity.rev.to_string(),
+		"args": args,
+	})
+}
+
+fn hook_model_ref(model: &str) -> Value {
+	let (provider, name) = model.split_once('/').unwrap_or(("", model));
+	serde_json::json!({"provider": provider, "api": provider, "model": name})
+}
+fn emit_session_renamed(gate: Option<&HookGate>, session: &str, name: Option<&str>) {
+	notify_json(
+		hook_pb::HookEventId::HookEventSessionRenamed,
+		gate,
+		|| serde_json::json!({"session": session, "name": name}),
+	);
+}
+
+fn emit_fallback_model_changed(
+	gate: Option<&HookGate>,
+	current: impl FnOnce() -> (String, Option<i32>),
+	next: &str,
+) {
+	let Some(gate) =
+		gate.filter(|gate| gate.subscribed(hook_pb::HookEventId::HookEventModelChanged))
+	else {
+		return;
+	};
+	let (current, thinking) = current();
+	notify_json(hook_pb::HookEventId::HookEventModelChanged, Some(gate), || {
+		serde_json::json!({
+			"from_model": hook_model_ref(&current),
+			"to_model": hook_model_ref(next),
+			"previous_thinking": thinking.map(effort_name),
+			"thinking": thinking.map(effort_name),
+			"role": current.as_str(),
+			"reason": "fallback",
+		})
+	});
+}
+
+fn hook_outcome_kind(
+	outcome: Option<&CallOutcome<omp_tool::CallOutcomeDetails, omp_tool::CallOutcomeDetails>>,
+) -> &'static str {
+	match outcome {
+		Some(CallOutcome::Ok(_)) => "ok",
+		Some(CallOutcome::Faulted(_)) => "faulted",
+		Some(CallOutcome::ArgsRejected(_)) => "args_rejected",
+		Some(CallOutcome::Aborted { .. }) | None => "aborted",
+	}
+}
+
+fn apply_tool_result_hook(item: &mut Item, payload: &Value) {
+	let Some(item::Kind::ToolResult(result)) = item.kind.as_mut() else {
+		return;
+	};
+	let metadata = result.provider_metadata.get_or_insert_default();
+	for field in ["annotate", "spill"] {
+		let Some(json_value) = payload.get(field) else {
+			continue;
+		};
+		let Ok(encoded) = serde_json::to_string(json_value) else {
+			continue;
+		};
+		metadata
+			.fields
+			.insert(format!("omp/hook-{field}"), pb::Value {
+				kind: Some(value::Kind::String(encoded)),
+			});
+	}
+}
+
+fn hook_usage(usage: Option<&pb::Usage>) -> Value {
+	let usage = usage.cloned().unwrap_or_default();
+	serde_json::json!({
+		"input_tokens": usage.input_tokens,
+		"cached_input_tokens": usage.cache_read_tokens,
+		"output_tokens": usage.output_tokens,
+		"reasoning_tokens": usage.reasoning_tokens.unwrap_or_default(),
+		"cache_write_tokens": usage.cache_write_tokens,
+		"requests": 1,
+		"cost_usd": 0.0,
+		"wall": "0ms",
+	})
+}
+
+fn hook_item_ref(event_index: u64, item: &Item) -> Value {
+	let (kind, role) = match item.kind.as_ref() {
+		Some(item::Kind::Message(message)) => ("message", match message.role() {
+			thread::Role::User => Some("user"),
+			thread::Role::Assistant => Some("assistant"),
+			thread::Role::System => Some("system"),
+			thread::Role::Unspecified => None,
+		}),
+		Some(item::Kind::ToolCall(_)) => ("tool_call", None),
+		Some(item::Kind::ToolResult(_)) => ("tool_result", Some("tool")),
+		None => ("reasoning", None),
+	};
+	serde_json::json!({
+		"event_index": event_index,
+		"item_id": item.seq.to_string(),
+		"kind": kind,
+		"role": role,
+	})
+}
+
+fn hook_item_text(item: &Item) -> Option<String> {
+	let item::Kind::Message(message) = item.kind.as_ref()? else {
+		return None;
+	};
+	let mut text = String::new();
+	for part in &message.parts {
+		if let Some(part::Kind::Text(value)) = part.kind.as_ref() {
+			text.push_str(value);
+		}
+	}
+	Some(text)
+}
+
+fn replace_hook_item_text(item: &mut Item, replacement: &str) {
+	let Some(item::Kind::Message(message)) = item.kind.as_mut() else {
+		return;
+	};
+	for part in &mut message.parts {
+		if let Some(part::Kind::Text(value)) = part.kind.as_mut() {
+			replacement.clone_into(value);
+			return;
+		}
+	}
+	message
+		.parts
+		.push(thread::Part { kind: Some(part::Kind::Text(replacement.to_owned())) });
+}
+fn hook_custom_message_item(value: &Value) -> Option<Item> {
+	let text = match value {
+		Value::String(text) => text.to_owned(),
+		Value::Object(message) => {
+			let content = message
+				.get("text")
+				.or_else(|| message.get("content"))
+				.or_else(|| message.get("parts"))?;
+			if let Some(text) = content.as_str() {
+				text.to_owned()
+			} else {
+				let parts = content.as_array()?;
+				let mut text = String::new();
+				for part in parts {
+					if let Some(fragment) = part
+						.as_str()
+						.or_else(|| part.get("text").and_then(Value::as_str))
+					{
+						text.push_str(fragment);
+					}
+				}
+				text
+			}
+		},
+		_ => return None,
+	};
+	if text.is_empty() {
+		return None;
+	}
+	Some(Item {
+		kind: Some(item::Kind::Message(thread::Message {
+			role:  thread::Role::User as i32,
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(text)) }],
+		})),
+		..Item::default()
+	})
+}
+fn append_hook_custom_messages(items: &mut Vec<Item>, values: &[Value], requested: usize) {
+	items.extend(
+		values
+			.iter()
+			.skip(requested)
+			.filter_map(hook_custom_message_item),
+	);
+}
+const MESSAGE_HOOK_COALESCE: Duration = Duration::from_millis(16);
+
+struct MessageUpdateBatch {
+	part_index: u32,
+	kind:       &'static str,
+	delta:      String,
+	coalesced:  u32,
+}
+
+struct MessageHookStream {
+	gate:        Arc<HookGate>,
+	updates:     bool,
+	turn_id:     Str,
+	parts:       BTreeMap<u32, &'static str>,
+	pending:     Option<MessageUpdateBatch>,
+	total_chars: usize,
+	last_flush:  Instant,
+	ended:       bool,
+}
+
+impl MessageHookStream {
+	fn new(gate: Arc<HookGate>, turn_id: Str) -> Self {
+		let updates = gate.subscribed(hook_pb::HookEventId::HookEventMessageUpdate);
+		Self {
+			gate,
+			updates,
+			turn_id,
+			parts: BTreeMap::new(),
+			pending: None,
+			total_chars: 0,
+			last_flush: Instant::now(),
+			ended: false,
+		}
+	}
+
+	fn start(&mut self, part_index: u32, source: StreamSource) {
+		if self.parts.is_empty() {
+			notify_json(hook_pb::HookEventId::HookEventMessageStart, Some(self.gate.as_ref()), || {
+				serde_json::json!({
+					"turn_id": self.turn_id,
+					"item_id": self.turn_id,
+					"role": "assistant",
+					"index": 0,
+				})
+			});
+		}
+		self.parts.insert(part_index, stream_part_kind(source));
+	}
+
+	fn delta(&mut self, part_index: u32, fragment: &str) {
+		if !self.updates {
+			return;
+		}
+		let Some(kind) = self.parts.get(&part_index).copied() else {
+			return;
+		};
+		let fragment_chars = fragment.chars().count();
+		if let Some(batch) = self
+			.pending
+			.as_mut()
+			.filter(|batch| batch.part_index == part_index && batch.kind == kind)
+		{
+			self.total_chars = self.total_chars.saturating_add(fragment_chars);
+			batch.delta.push_str(fragment);
+			batch.coalesced = batch.coalesced.saturating_add(1);
+		} else {
+			self.flush();
+			self.total_chars = self.total_chars.saturating_add(fragment_chars);
+			self.pending =
+				Some(MessageUpdateBatch { part_index, kind, delta: fragment.to_owned(), coalesced: 1 });
+		}
+		if self.last_flush.elapsed() >= MESSAGE_HOOK_COALESCE {
+			self.flush();
+		}
+	}
+
+	fn flush(&mut self) {
+		let Some(batch) = self.pending.take() else {
+			return;
+		};
+		notify_json(hook_pb::HookEventId::HookEventMessageUpdate, Some(self.gate.as_ref()), || {
+			serde_json::json!({
+				"turn_id": self.turn_id,
+				"item_id": self.turn_id,
+				"part_index": batch.part_index,
+				"kind": batch.kind,
+				"delta": batch.delta,
+				"coalesced": batch.coalesced,
+				"total_chars": self.total_chars,
+			})
+		});
+		self.last_flush = Instant::now();
+	}
+
+	fn finish(&mut self, reason: &'static str) {
+		if self.ended || self.parts.is_empty() {
+			return;
+		}
+		self.flush();
+		self.ended = true;
+		notify_json(hook_pb::HookEventId::HookEventMessageEnd, Some(self.gate.as_ref()), || {
+			serde_json::json!({
+				"turn_id": self.turn_id,
+				"item_id": self.turn_id,
+				"role": "assistant",
+				"parts": self.parts.len(),
+				"finish": reason,
+			})
+		});
+	}
+}
+
+impl Drop for MessageHookStream {
+	fn drop(&mut self) {
+		self.finish("error");
+	}
+}
+
+const fn stream_part_kind(source: StreamSource) -> &'static str {
+	match source {
+		StreamSource::Text => "text",
+		StreamSource::Thinking => "reasoning",
+		StreamSource::Tool => "tool_args",
+	}
+}
+
 fn authoritative_assistant(outcome: &Outcome) -> Option<Str> {
 	let message = outcome.output.iter().rev().find_map(|item| {
 		let Some(item::Kind::Message(message)) = item.kind.as_ref() else {
@@ -262,7 +624,6 @@ fn authoritative_assistant(outcome: &Outcome) -> Option<Str> {
 use std::{future, iter, mem};
 
 use omp_inference::call::ToolChoice;
-use omp_proto::toolhost::v1;
 use omp_snapcompact::archive::DataUrlContext;
 use omp_storage::gc;
 use tokio::{
@@ -278,8 +639,9 @@ use crate::{
 	Regime, RegimeSpec, Resource, RevivalReport, ScopedSetting, SettingSlot, StartOptions,
 	StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
 	arbiter::ResolvedEvent,
-	attachments, batch, capture_interrupt, demote_interrupted_reasoning, effects_mutate_environment,
-	execute_snapcompact, hook_event_mask, inject_first_turn_metadata, is_capture_item,
+	attachments, batch, capture_interrupt, demote_interrupted_reasoning, dispatch_tier,
+	effects_mutate_environment, execute_snapcompact, hook_event_mask, inject_first_turn_metadata,
+	is_capture_item,
 	journal::Compact,
 	prompt_assets,
 	prompt_assets::PromptAssetId,
@@ -567,6 +929,7 @@ pub struct Agent<C: TurnClient> {
 	prompt_head_events: Vec<u64>,
 	settled_gate: Option<Arc<HookGate>>,
 	provider_error_gate: Option<Arc<HookGate>>,
+	hook_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
 	continuation_policies: BTreeMap<Str, ContinuationPolicy>,
 	session_stop_regime: SessionStopRegime,
@@ -580,6 +943,7 @@ pub struct Agent<C: TurnClient> {
 	session_memory: Option<SessionMemory>,
 	secret_obfuscator: Option<Arc<Mutex<SecretObfuscator>>>,
 	compaction: CompactionCoordinator,
+	compaction_running: bool,
 	blob_store: Option<BlobStore>,
 	artifact_catalog: Option<Arc<Mutex<ArtifactCatalog>>>,
 	autolearn: Option<AutolearnController>,
@@ -679,6 +1043,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			prompt_head_events,
 			settled_gate: None,
 			provider_error_gate: None,
+			hook_gate: None,
 			continuations: ContinuationLedger::new(8),
 			continuation_policies: BTreeMap::new(),
 			session_stop_regime: SessionStopRegime::default(),
@@ -692,6 +1057,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			session_memory: None,
 			secret_obfuscator: None,
 			compaction: CompactionCoordinator::default(),
+			compaction_running: false,
 			blob_store: None,
 			artifact_catalog: None,
 			autolearn: None,
@@ -824,7 +1190,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 	pub fn set_provider_error_gate(&mut self, gate: Arc<HookGate>) {
 		self.provider_error_gate = Some(gate);
 	}
+
 	/// Installs the catalog hook gate used by agent, message, and tool seams.
+	pub fn set_hook_gate(&mut self, gate: Arc<HookGate>) {
+		self.hook_gate = Some(gate);
+	}
 
 	/// Returns the active regime prompt setting.
 	pub fn prompt_slot(&self) -> Option<&str> {
@@ -887,6 +1257,28 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	/// Installs a bounded provider failover route regime.
 	pub fn set_provider_failover_routes(&mut self, routes: Vec<Str>) {
+		self.arbiter.set_retry_chain(routes);
+	}
+
+	fn apply_provider_failover(&mut self, routes: Vec<Str>) {
+		if let Some(next) = routes.first() {
+			emit_fallback_model_changed(
+				self.hook_gate.as_deref(),
+				|| {
+					let snapshot = self.state.snapshot();
+					(
+						snapshot.turn.params.model.clone(),
+						snapshot
+							.turn
+							.params
+							.thinking
+							.as_ref()
+							.map(|thinking| thinking.effort),
+					)
+				},
+				next,
+			);
+		}
 		self.arbiter.set_retry_chain(routes);
 	}
 
@@ -1100,6 +1492,59 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self,
 		request: ManualCompactionRequest,
 	) -> Result<ManualCompactionOutcome, AgentError> {
+		self
+			.compact_with_reason(request, CompactionReason::Manual)
+			.await
+	}
+
+	async fn compact_with_reason(
+		&mut self,
+		request: ManualCompactionRequest,
+		reason: CompactionReason,
+	) -> Result<ManualCompactionOutcome, AgentError> {
+		if self.compaction_running {
+			return Err(AgentError::Protocol("compaction is already running"));
+		}
+		self.compaction_running = true;
+		let preparation_id = Str::new(omp_core::Ulid::generate().to_string());
+		let tier = request.mode.map_or("local", |mode| match mode {
+			ManualCompactionMode::Soft | ManualCompactionMode::Snapcompact => "local",
+			ManualCompactionMode::Remote => "remote",
+		});
+		let result = self
+			.compact_manual_inner(request, preparation_id.clone(), reason)
+			.await;
+		self.compaction_running = false;
+		if let Err(error) = &result {
+			let epoch = self.journal.context_position().epoch;
+			let warning = error.to_string();
+			notify_json(
+				hook_pb::HookEventId::HookEventCompactionDone,
+				self.hook_gate.as_deref(),
+				|| {
+					serde_json::json!({
+						"preparation_id": preparation_id,
+						"tiers_run": [tier],
+						"from_extension": Value::Null,
+						"tokens_before": 0,
+						"tokens_after": 0,
+						"first_kept_id": "",
+						"epoch": epoch,
+						"summary_bytes": 0,
+						"warning": warning,
+					})
+				},
+			);
+		}
+		result
+	}
+
+	async fn compact_manual_inner(
+		&mut self,
+		request: ManualCompactionRequest,
+		preparation_id: Str,
+		reason: CompactionReason,
+	) -> Result<ManualCompactionOutcome, AgentError> {
 		if self.journal.pending_turn().is_some() {
 			return Err(AgentError::Protocol("cannot compact while a turn is pending"));
 		}
@@ -1110,9 +1555,15 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let method = decision
 			.order
 			.as_slice()
-			.first()
+			.iter()
+			.find(|tier| {
+				matches!(
+					tier,
+					CompactionTier::Local | CompactionTier::Remote | CompactionTier::Snapcompact
+				)
+			})
 			.copied()
-			.ok_or(AgentError::Protocol("manual compaction has no available method"))?;
+			.ok_or(AgentError::Protocol("manual compaction has no available summary method"))?;
 		let live_events = self.journal.live_item_events()?;
 		let live_items = self.journal.items_at(&live_events)?;
 		if live_items.len() < 2 {
@@ -1153,8 +1604,78 @@ impl<C: TurnClient + Clone> Agent<C> {
 				return Err(AgentError::Protocol("unsupported manual compaction method"));
 			},
 		};
+		let compaction_event = CompactionEvent {
+			preparation_id: preparation_id.clone(),
+			tier: method,
+			reason,
+			epoch: self.journal.context_position().epoch,
+			tokens_before,
+			target_tokens: u64::try_from(suffix_bytes.div_ceil(4)).unwrap_or(u64::MAX),
+			suggested_first_kept: Str::new(first_kept.to_string()),
+			to_summarize: live_events[..prefix_end]
+				.iter()
+				.zip(&live_items[..prefix_end])
+				.zip(&item_bytes[..prefix_end])
+				.map(|((&event, item), bytes)| compaction_message_ref(event, item, bytes.len()))
+				.collect(),
+			to_retain: live_events[prefix_end..]
+				.iter()
+				.zip(&live_items[prefix_end..])
+				.zip(&item_bytes[prefix_end..])
+				.map(|((&event, item), bytes)| compaction_message_ref(event, item, bytes.len()))
+				.collect(),
+			split_turn: false,
+			previous_summary: None,
+			previous_preserve: None,
+			custom_instructions: decision.focus.clone(),
+			deadline_ms: 30_000,
+		};
+		let resolution = self.dispatch_compaction_hook(&compaction_event).await;
+		let mut delegate = None;
+		let mut from_extension = None;
+		let mut hook_warning = None;
+		let custom = match resolution {
+			CompactionResolution::Cancel(cancel) => {
+				return Err(CompactionCancellation::ExtensionVeto { reason: cancel.reason }.into());
+			},
+			CompactionResolution::Custom { mut winner, source, losers } => {
+				if !live_events.contains(&winner.compact.first_kept) {
+					hook_warning = Some(sf!(
+						"extension compaction summary named a non-live first-kept item; used built-in \
+						 compaction"
+					));
+					None
+				} else {
+					from_extension = source;
+					let retained_start = live_events
+						.iter()
+						.position(|event| *event == winner.compact.first_kept)
+						.expect("validated live first-kept item");
+					let retained_bytes = item_bytes[retained_start..]
+						.iter()
+						.fold(0usize, |sum, bytes| sum.saturating_add(bytes.len()));
+					let summary_tokens =
+						u64::try_from(winner.compact.summary.len().div_ceil(4)).unwrap_or(u64::MAX);
+					winner.compact.tokens_before = tokens_before;
+					winner.compact.tokens_after = Some(
+						summary_tokens
+							.saturating_add(u64::try_from(retained_bytes.div_ceil(4)).unwrap_or(u64::MAX)),
+					);
+					winner.compact.method = Some(sf!("extension"));
+					winner.compact.superseded = losers;
+					Some(winner.compact)
+				}
+			},
+			CompactionResolution::Delegate(value) => {
+				delegate = Some(value);
+				None
+			},
+			CompactionResolution::Default => None,
+		};
 
-		let compact = if mode == ManualCompactionMode::Snapcompact {
+		let mut compact = if let Some(compact) = custom {
+			compact
+		} else if mode == ManualCompactionMode::Snapcompact {
 			let source = serde_json::to_string(&live_items[..prefix_end])?;
 			let source =
 				omp_snapcompact::archive::elide_data_urls(&source, DataUrlContext::Source).into_owned();
@@ -1211,7 +1732,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				 constraints.",
 			);
 			let remote = mode == ManualCompactionMode::Remote;
-			let instruction = if remote {
+			let mut instruction = if remote {
 				sf!(
 					"Produce a portable provider-compaction summary of the preceding conversation. \
 					 Focus: {focus}"
@@ -1219,6 +1740,27 @@ impl<C: TurnClient + Clone> Agent<C> {
 			} else {
 				sf!("Summarize the preceding conversation for context continuation. Focus: {focus}")
 			};
+			if let Some(delegate) = &delegate {
+				if !delegate.extra_instructions.is_empty() {
+					instruction = sf!(
+						"{}\nAdditional extension instructions: {}",
+						instruction.as_str(),
+						delegate.extra_instructions.as_str()
+					);
+				}
+				if !delegate.focus_ids.is_empty() {
+					let ids = delegate
+						.focus_ids
+						.iter()
+						.map(Str::as_str)
+						.collect::<Vec<_>>()
+						.join(", ");
+					instruction = sf!(
+						"{}\nPreserve these context item ids in the summary: {ids}",
+						instruction.as_str()
+					);
+				}
+			}
 			thread.items.push(compaction_instruction(instruction));
 			let snapshot = self.state.snapshot();
 			let mut options = snapshot.turn.clone();
@@ -1274,19 +1816,78 @@ impl<C: TurnClient + Clone> Agent<C> {
 				superseded: Vec::new(),
 			}
 		};
+		if compact.warning.is_none() {
+			compact.warning = hook_warning;
+		}
 		let tokens_after = compact.tokens_after.unwrap_or(tokens_before);
+		let first_kept = compact.first_kept;
+		let summary_bytes = compact.summary.len();
+		let warning = compact.warning.clone();
 		let frame_count = compact
 			.snapcompact
 			.as_ref()
 			.map_or(0, |archive| archive.frames.len());
 		let event = self.journal.compact(now_ms(), compact)?;
+		let epoch = self.journal.context_position().epoch;
+		notify_json(hook_pb::HookEventId::HookEventCompactionDone, self.hook_gate.as_deref(), || {
+			serde_json::json!({
+				"preparation_id": preparation_id.clone(),
+				"tiers_run": [match mode {
+					ManualCompactionMode::Remote => "remote",
+					ManualCompactionMode::Soft | ManualCompactionMode::Snapcompact => "local",
+				}],
+				"from_extension": from_extension.clone(),
+				"tokens_before": tokens_before,
+				"tokens_after": tokens_after,
+				"first_kept_id": first_kept.to_string(),
+				"epoch": epoch,
+				"summary_bytes": summary_bytes,
+				"warning": warning.clone(),
+			})
+		});
 		self.clear_provider_context();
 		self.prompt_hash = None;
 		self.prompt_head_events.clear();
 		self
-			.redeem_recovery(RedemptionEvidence::PostCompaction { epoch: event })
+			.redeem_recovery(RedemptionEvidence::PostCompaction { epoch })
 			.await;
-		Ok(ManualCompactionOutcome { method: mode, event, tokens_before, tokens_after, frame_count })
+		Ok(ManualCompactionOutcome {
+			preparation_id,
+			method: mode,
+			event,
+			first_kept,
+			epoch,
+			tokens_before,
+			tokens_after,
+			summary_bytes,
+			from_extension,
+			warning,
+			frame_count,
+		})
+	}
+
+	async fn dispatch_compaction_hook(&mut self, event: &CompactionEvent) -> CompactionResolution {
+		let Some(gate) = self.hook_gate.clone() else {
+			return CompactionResolution::Default;
+		};
+		let dispatch = dispatch_tier(&gate, event);
+		tokio::pin!(dispatch);
+		loop {
+			tokio::select! {
+				resolution = &mut dispatch => break resolution,
+				command = self.receivers.host_commands.recv_async() => {
+					match command {
+						Ok(command) if command.operation.as_str() == "omp.context.compact" => {
+							let _ = command.reply.send(Err(sf!(
+								"CompactionBusy: compaction is already running"
+							)));
+						},
+						Ok(command) => self.handle_host_control_sync(command),
+						Err(_) => std::future::pending().await,
+					}
+				},
+			}
+		}
 	}
 
 	fn promote_context_if_enabled(&mut self) -> bool {
@@ -1309,7 +1910,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 		true
 	}
 
-	async fn recover_context_overflow(&mut self, order: &CompactionMethodOrder) -> bool {
+	async fn recover_context_overflow(
+		&mut self,
+		order: &CompactionMethodOrder,
+		reason: CompactionReason,
+	) -> bool {
 		let mode = order.as_slice().iter().find_map(|tier| match tier {
 			CompactionTier::Local => Some(ManualCompactionMode::Soft),
 			CompactionTier::Snapcompact => Some(ManualCompactionMode::Snapcompact),
@@ -1323,7 +1928,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			return false;
 		};
 		self
-			.compact_manual(ManualCompactionRequest { mode: Some(mode), focus: None })
+			.compact_with_reason(ManualCompactionRequest { mode: Some(mode), focus: None }, reason)
 			.await
 			.is_ok()
 	}
@@ -1445,6 +2050,32 @@ impl<C: TurnClient + Clone> Agent<C> {
 		}
 		let capture_root = root_turn_id.clone();
 		let result = self.submit_inner(items, root_turn_id).await;
+		notify_json(hook_pb::HookEventId::HookEventAgentEnd, self.hook_gate.as_deref(), || {
+			let (summary, error) = match &result {
+				Ok(summary) => (
+					serde_json::json!({
+						"committed_turns": summary.committed_turns,
+						"interrupted": summary.interrupted,
+						"stop": summary.outcome.as_ref().map(|outcome| stop_reason_name(outcome.stop())),
+					}),
+					Value::Null,
+				),
+				Err(error) => (
+					serde_json::json!({
+						"committed_turns": 0,
+						"interrupted": false,
+						"stop": Value::Null,
+					}),
+					Value::String(error.to_string()),
+				),
+			};
+			serde_json::json!({
+				"submission_id": capture_root.as_str(),
+				"summary": summary,
+				"continued": false,
+				"error": error,
+			})
+		});
 		let aborted = result.as_ref().map_or(true, |summary| summary.interrupted);
 		let ending_prompt_slot = self.prompt_slot().unwrap_or("standard").to_str();
 		let mut decision = if let Some(controller) = self.autolearn.as_mut() {
@@ -1580,10 +2211,54 @@ impl<C: TurnClient + Clone> Agent<C> {
 				snapshot.defer_interrupts,
 				snapshot.steering_mode.delivery_limit(),
 			);
+			let staged_interrupts = queued.len();
+			let mut supplied_items = supplied.collect::<Vec<_>>();
+			let requested_items = supplied_items.len();
+			let text = supplied_items
+				.iter()
+				.filter_map(hook_item_text)
+				.collect::<Vec<_>>()
+				.join("\n");
+			match gate_json(
+				hook_pb::HookEventId::HookEventBeforeAgentStart,
+				self.hook_gate.as_deref(),
+				|| {
+					serde_json::json!({
+						"submission_id": root_turn_id.as_str(),
+						"text": text,
+						"items": supplied_items
+							.iter()
+							.map(|item| hook_item_ref(0, item))
+							.collect::<Vec<_>>(),
+						"source": "interactive",
+						"prompt_rev": self.prompt_hash.map_or_else(String::new, |hash| hash.to_string()),
+						"staged_interrupts": staged_interrupts,
+						"resuming": false,
+						"schedule_id": Value::Null,
+					})
+				},
+			)
+			.await
+			{
+				JsonGateOutcome::Allow(payload) => {
+					if let Some(replacement) = payload.get("text").and_then(Value::as_str)
+						&& let Some(item) = supplied_items.first_mut()
+					{
+						replace_hook_item_text(item, replacement);
+					}
+					if let Some(items) = payload.get("items").and_then(Value::as_array) {
+						append_hook_custom_messages(&mut supplied_items, items, requested_items);
+					}
+				},
+				JsonGateOutcome::Deny { .. } | JsonGateOutcome::Approval => {
+					return Err(AgentError::Protocol("before_agent_start hook denied"));
+				},
+				JsonGateOutcome::Bypassed => {},
+			}
 			let mut pending_indexes = self.journal.recoverable_input_events().to_vec();
 			pending_indexes.extend_from_slice(self.journal.recoverable_settlement_events());
 			pending_indexes.sort_unstable();
-			pending_indexes.extend(self.stage_interrupts(&root_turn_id, queued)?);
+			pending_indexes.extend(self.stage_interrupts(&root_turn_id, queued, DrainPoint::Idle)?);
 			for item in idle_fold.regime.injects {
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
@@ -1592,7 +2267,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.prompt_hash,
 				)?);
 			}
-			for item in supplied {
+			for item in supplied_items {
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
 					root_turn_id.as_str(),
@@ -1602,6 +2277,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 			}
 			(pending_indexes, root_turn_id)
 		};
+		notify_json(hook_pb::HookEventId::HookEventAgentStart, self.hook_gate.as_deref(), || {
+			serde_json::json!({
+				"submission_id": turn_id.as_str(),
+				"from_phase": agent_phase_name(self.phase),
+				"pending_items": pending_indexes.len(),
+			})
+		});
 		self.publish_live_history()?;
 		let mut committed_turns = 0_u32;
 		let mut last_outcome = None;
@@ -1661,7 +2343,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.iter()
 						.any(|interrupt| continues_loop(&interrupt.source));
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
-					pending_indexes = self.stage_interrupts(&next_turn_id, drained)?;
+					pending_indexes = self.stage_interrupts(&next_turn_id, drained, DrainPoint::Idle)?;
 					if has_producer {
 						turn_id = next_turn_id;
 						continue;
@@ -1746,7 +2428,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						self.publish_live_history()?;
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
 					}
-					self.arbiter.set_retry_chain(routes);
+					self.apply_provider_failover(routes);
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
 						PromptAssetId::AutoContinue,
@@ -1774,7 +2456,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 						continue;
 					}
 					let order = self.state.snapshot().compaction.clone();
-					if self.recover_context_overflow(&order).await {
+					if self
+						.recover_context_overflow(&order, CompactionReason::Rescue)
+						.await
+					{
 						let next_turn_id = follow_up_id(&turn_id, committed_turns);
 						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
 							PromptAssetId::AutoContinue,
@@ -1801,7 +2486,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					if routes.is_empty() {
 						return Err(AgentError::Turn(error));
 					}
-					self.arbiter.set_retry_chain(routes);
+					self.apply_provider_failover(routes);
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
 						PromptAssetId::AutoContinue,
@@ -1822,7 +2507,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						)?;
 						self.arbiter.flush(&mut self.journal, now_ms())?;
 						self.clear_provider_context();
-						self.arbiter.set_retry_chain(routes);
+						self.apply_provider_failover(routes);
 						let next_turn_id = follow_up_id(&turn_id, committed_turns);
 						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
 							PromptAssetId::AutoContinue,
@@ -1850,6 +2535,45 @@ impl<C: TurnClient + Clone> Agent<C> {
 			}
 
 			self.events.publish(AgentEvent::Snapshot(snapshot.clone()));
+			notify_json(hook_pb::HookEventId::HookEventTurnEnd, self.hook_gate.as_deref(), || {
+				let receipt = self.journal.latest_receipt();
+				let item_events = receipt
+					.map(|receipt| receipt.item_events.as_slice())
+					.unwrap_or(&[]);
+				let items = outcome
+					.output
+					.iter()
+					.enumerate()
+					.map(|(index, item)| {
+						hook_item_ref(item_events.get(index).copied().unwrap_or_default(), item)
+					})
+					.collect::<Vec<_>>();
+				let calls = outcome
+					.output
+					.iter()
+					.filter_map(|item| {
+						let item::Kind::ToolCall(call) = item.kind.as_ref()? else {
+							return None;
+						};
+						let identity = snapshot.registry.resolved_identity(&call.name)?;
+						Some(serde_json::json!({
+							"call_id": call.id,
+							"target": hook_tool_target(&identity, &call.args_json),
+						}))
+					})
+					.collect::<Vec<_>>();
+				serde_json::json!({
+					"turn_id": turn_id.as_str(),
+					"turn_index": committed_turns,
+					"event_index": item_events.last().copied().unwrap_or_default(),
+					"stop": stop_reason_name(outcome.stop()),
+					"usage": hook_usage(outcome.usage.as_ref()),
+					"session_usage": hook_usage(Some(&self.cumulative_usage)),
+					"revision": outcome.revision.as_ref().map(|revision| revision.head.to_string()),
+					"calls": calls,
+					"items": items,
+				})
+			});
 			self.publish_live_history()?;
 			self.retain_session_memory();
 			let turn_end =
@@ -1881,7 +2605,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				immediate.append(&mut boundary);
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.append_pending(&next_turn_id, next)?;
-				pending_indexes.extend(self.stage_interrupts(&next_turn_id, immediate)?);
+				pending_indexes.extend(self.stage_interrupts(
+					&next_turn_id,
+					immediate,
+					DrainPoint::TurnBoundary,
+				)?);
 				self.retain_session_memory();
 				last_outcome = Some(outcome);
 				turn_id = next_turn_id;
@@ -1895,6 +2623,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				boundary = mem::take(&mut immediate);
 				if let Err(error) = self
 					.reconcile_speculation(
+						&turn_id,
 						&outcome.output,
 						&mut speculative,
 						snapshot.registry.as_ref(),
@@ -2030,7 +2759,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							},
 							command = self.receivers.host_commands.recv_async() => {
 								if let Ok(command) = command {
-									self.handle_host_control(command);
+									self.handle_host_control(command).await;
 								}
 							},
 							event = self.control_mailbox.handle_next(&mut self.journal) => {
@@ -2063,6 +2792,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 						}
 					}
 				};
+				let terminate_after_batch =
+					batch_terminates(results.iter().map(BatchResult::terminate));
 				let mut next = Vec::with_capacity(results.len() + boundary.len());
 				for result in results {
 					self
@@ -2097,7 +2828,52 @@ impl<C: TurnClient + Clone> Agent<C> {
 								)
 							})?;
 					}
-					next.push(result.item().clone());
+					let mut result_item = result.item().clone();
+					if result.outcome().is_some() {
+						let useless = match result_item.kind.as_ref() {
+							Some(item::Kind::ToolResult(result)) => result.useless.unwrap_or(false),
+							_ => false,
+						};
+						let target = hook_tool_target(result.identity(), result.raw_args());
+						let outcome_kind = hook_outcome_kind(result.outcome());
+						match gate_json(
+							hook_pb::HookEventId::HookEventToolResult,
+							self.hook_gate.as_deref(),
+							|| {
+								serde_json::json!({
+									"call_id": result.call_id(),
+									"target": target,
+									"outcome": outcome_kind,
+									"payload": Value::Null,
+									"fault": Value::Null,
+									"abort": Value::Null,
+									"artifact": Value::Null,
+									"useless": useless,
+									"annotate": [],
+									"spill": Value::Null,
+								})
+							},
+						)
+						.await
+						{
+							JsonGateOutcome::Allow(payload) => {
+								apply_tool_result_hook(&mut result_item, &payload);
+							},
+							JsonGateOutcome::Deny { reason, .. } => {
+								self.journal.record_hook_outcome(now_ms(), HookOutcome {
+									invocation_id:   Some(result.call_id().clone()),
+									event_id:        27,
+									dispatch_id:     0,
+									subscription_id: None,
+									phase:           HookPhase::Review as u8,
+									decision:        sf!("deny"),
+									reason:          Some(reason),
+								})?;
+							},
+							JsonGateOutcome::Bypassed | JsonGateOutcome::Approval => {},
+						}
+					}
+					next.push(result_item);
 					if let Some(job) = result.into_job() {
 						let id = job.id.clone();
 						self.journal.register_job(now_ms(), job.clone())?;
@@ -2153,18 +2929,36 @@ impl<C: TurnClient + Clone> Agent<C> {
 					self.transition(AgentPhase::Idle);
 					return Ok(run_summary(Some(outcome), committed_turns, false));
 				}
+				if terminate_after_batch {
+					for item in next {
+						self
+							.journal
+							.append_optimistic(now_ms(), item, self.prompt_hash)?;
+					}
+					self.mailbox.requeue_front(boundary);
+					self.publish_live_history()?;
+					self.retain_session_memory();
+					self.transition(AgentPhase::Idle);
+					return Ok(run_summary(Some(outcome), committed_turns, false));
+				}
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
 				pending_indexes = self.append_pending(&next_turn_id, next)?;
 				self.retain_session_memory();
 				if mid_turn_compaction_due(snapshot.mid_turn_compaction, outcome.usage.as_ref())
-					&& self.recover_context_overflow(&snapshot.compaction).await
+					&& self
+						.recover_context_overflow(&snapshot.compaction, CompactionReason::MidTurn)
+						.await
 				{
 					self.clear_provider_context();
 				}
 				let has_producer = boundary
 					.iter()
 					.any(|interrupt| continues_loop(&interrupt.source));
-				pending_indexes.extend(self.stage_interrupts(&next_turn_id, mem::take(&mut boundary))?);
+				pending_indexes.extend(self.stage_interrupts(
+					&next_turn_id,
+					mem::take(&mut boundary),
+					DrainPoint::Immediate,
+				)?);
 				if deadline_elapsed {
 					return Err(AgentError::Deadline);
 				}
@@ -2220,7 +3014,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			boundary.append(&mut idle);
 			if !boundary.is_empty() {
 				let next_turn_id = follow_up_id(&turn_id, committed_turns);
-				pending_indexes = self.stage_interrupts(&next_turn_id, boundary)?;
+				pending_indexes = self.stage_interrupts(&next_turn_id, boundary, DrainPoint::Idle)?;
 				last_outcome = Some(outcome);
 				turn_id = next_turn_id;
 				continue;
@@ -2239,7 +3033,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 				);
 				if !boundary.is_empty() {
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
-					pending_indexes = self.stage_interrupts(&next_turn_id, boundary)?;
+					pending_indexes =
+						self.stage_interrupts(&next_turn_id, boundary, DrainPoint::Idle)?;
 					last_outcome = Some(outcome);
 					turn_id = next_turn_id;
 					continue;
@@ -2451,7 +3246,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			source_candidate(self.continuation_source.as_deref(), &self.loop_signal, now);
 		builtins.consider(SettledParticipant::ContinuationSource, candidate, policy);
 		if let Some(gate) = self.settled_gate.clone()
-			&& gate.subscribed(v1::HookEventId::HookEventAgentSettled)
+			&& gate.subscribed(hook_pb::HookEventId::HookEventAgentSettled)
 		{
 			let event = AgentSettledEvent {
 				agent_id:         sf!("agent"),
@@ -2541,10 +3336,32 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self,
 		turn_id: &TurnId<str>,
 		interrupts: impl IntoIterator<Item = Interrupt>,
+		drain_point: DrainPoint,
 	) -> Result<Vec<u64>, AgentError> {
 		let ts = now_ms();
 		let mut indexes = Vec::new();
 		for interrupt in interrupts {
+			notify_json(hook_pb::HookEventId::HookEventInterrupt, self.hook_gate.as_deref(), || {
+				serde_json::json!({
+					"source": if matches!(interrupt.source, InterruptSource::Job { .. }) {
+						"job"
+					} else {
+						"producer"
+					},
+					"reason": interrupt_reason(&interrupt.source),
+					"klass": match interrupt.class {
+						InterruptClass::Immediate => "immediate",
+						InterruptClass::TurnBoundary => "turn_boundary",
+						InterruptClass::Idle => "idle",
+					},
+					"drain_point": match drain_point {
+						DrainPoint::Immediate => "immediate",
+						DrainPoint::TurnBoundary => "turn_boundary",
+						DrainPoint::Idle => "idle",
+					},
+					"turn_id": turn_id.as_str(),
+				})
+			});
 			if let InterruptSource::Job { id } = &interrupt.source {
 				let Some(settlement) = self.jobs.lease_delivery(id.as_str()) else {
 					continue;
@@ -2599,6 +3416,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		turn_id: TurnId,
 		pending: Vec<u64>,
 	) -> Result<RunTurnResult, AgentError> {
+		let turn_started = Instant::now();
 		let _activity = self.run_activity.as_ref().map(|activity| {
 			activity.enter();
 			RunActivityGuard(Arc::clone(activity))
@@ -2694,7 +3512,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			}
 			self.prompt_hash = Some(rendered.hash);
 		}
-		let frozen_enabled_tools: Arc<[Str]> = durable.as_ref().map_or_else(
+		let mut frozen_enabled_tools: Arc<[Str]> = durable.as_ref().map_or_else(
 			|| {
 				if capture_turn {
 					snapshot
@@ -2784,6 +3602,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.deadline
 				.is_some_and(|deadline| Instant::now() >= deadline)
 			{
+				let elapsed = turn_started.elapsed();
+				notify_json(hook_pb::HookEventId::HookEventDeadline, self.hook_gate.as_deref(), || {
+					serde_json::json!({
+						"scope": "turn",
+						"elapsed": format!("{}ms", elapsed.as_millis()),
+						"budget": format!("{}ms", elapsed.as_millis()),
+						"turn_id": turn_id.as_str(),
+						"call_id": Value::Null,
+					})
+				});
 				return Err(AgentError::Deadline);
 			}
 			let context_base_revision = self.journal.context_position().revision;
@@ -2795,7 +3623,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					project_journal(&journal, journal.as_ref(), snapshot.registry.as_ref(), &self.caps)?;
 				let context_handlers = self.context_projection_handler.is_some()
 					|| self.hook_bus.union_mask()
-						& hook_event_mask(v1::HookEventId::HookEventThreadProjection)
+						& hook_event_mask(hook_pb::HookEventId::HookEventThreadProjection)
 						!= 0;
 				let mut thread = materialize_context_projection(
 					project_context(projected, &all_live, context_handlers),
@@ -2913,6 +3741,89 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.waits.insert(ticket)?;
 			}
 			self.waits.wait_empty(self.abort_rx.clone()).await?;
+			let model = frozen_options.params.model.clone();
+			let (provider, model_name) = model.split_once('/').unwrap_or(("", model.as_str()));
+			let thinking = frozen_options
+				.params
+				.thinking
+				.as_ref()
+				.map_or("off", |thinking| effort_name(thinking.effort));
+			let deadline_ms = latest.deadline.map(|deadline| {
+				u64::try_from(
+					deadline
+						.saturating_duration_since(Instant::now())
+						.as_millis(),
+				)
+				.unwrap_or(u64::MAX)
+			});
+			match gate_json(
+				hook_pb::HookEventId::HookEventTurnStart,
+				self.hook_gate.as_deref(),
+				|| {
+					serde_json::json!({
+						"turn_id": turn_id.as_str(),
+						"turn_index": attempts.saturating_add(1),
+						"prompt_hash": self.prompt_hash.expect("prompt rendered").to_string(),
+						"toolset_hash": toolset_hash.to_string(),
+						"enabled_tools": frozen_enabled_tools.iter().map(Str::as_str).collect::<Vec<_>>(),
+						"input_mode": if matches!(input, TurnInput::Full(_)) { "full" } else { "delta" },
+						"model": {"provider": provider, "api": provider, "model": model_name},
+						"route": {"provider": provider, "route": model},
+						"thinking": thinking,
+						"deadline": deadline_ms.map(|value| format!("{value}ms")),
+						"attempt": attempts.saturating_add(1),
+						"prompt_changed": changed_prompt,
+						"toolset_changed": changed_toolset,
+					})
+				},
+			)
+			.await
+			{
+				JsonGateOutcome::Bypassed => {},
+				JsonGateOutcome::Allow(payload) => {
+					if let Some(tools) = payload.get("enabled_tools").and_then(Value::as_array) {
+						frozen_enabled_tools = tools
+							.iter()
+							.filter_map(Value::as_str)
+							.filter(|tool| {
+								frozen_enabled_tools
+									.iter()
+									.any(|enabled| enabled.as_str() == *tool)
+							})
+							.map(Str::new)
+							.collect::<Vec<_>>()
+							.into();
+					}
+					if let Some(model) = payload.get("model").and_then(Value::as_object) {
+						let provider = model
+							.get("provider")
+							.and_then(Value::as_str)
+							.unwrap_or_default();
+						let name = model
+							.get("model")
+							.and_then(Value::as_str)
+							.unwrap_or_default();
+						if !name.is_empty() {
+							frozen_options.params.model = if provider.is_empty() {
+								name.to_owned()
+							} else {
+								format!("{provider}/{name}")
+							};
+						}
+					}
+					if let Some(effort) = payload
+						.get("thinking")
+						.and_then(Value::as_str)
+						.and_then(parse_effort)
+					{
+						frozen_options.params.thinking =
+							Some(pb::Reasoning { effort: effort as i32, ..pb::Reasoning::default() });
+					}
+				},
+				JsonGateOutcome::Deny { .. } | JsonGateOutcome::Approval => {
+					return Err(AgentError::Protocol("turn_start hook denied"));
+				},
+			}
 			let start = TurnStart {
 				turn_id: turn_id.as_str().to_str(),
 				item_events: input_events.clone(),
@@ -2971,6 +3882,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 			let selected = {
 				let mut abort_rx = self.abort_rx.clone();
+				let deadline_hook_gate = self.hook_gate.clone();
 				let session = self.drive_session(
 					turn_id.clone(),
 					provider_input,
@@ -2982,7 +3894,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 				tokio::pin!(session);
 				tokio::select! {
 					result = &mut session => Ok(result),
-					() = wait_deadline(latest.deadline) => Err(AgentError::Deadline),
+					() = wait_deadline(latest.deadline) => {
+						let elapsed = turn_started.elapsed();
+						notify_json(hook_pb::HookEventId::HookEventDeadline, deadline_hook_gate.as_deref(), || {
+							serde_json::json!({
+								"scope": "turn",
+								"elapsed": format!("{}ms", elapsed.as_millis()),
+								"budget": format!("{}ms", elapsed.as_millis()),
+								"turn_id": turn_id.as_str(),
+								"call_id": Value::Null,
+							})
+						});
+						Err(AgentError::Deadline)
+					},
 					_ = abort_rx.changed() => Err(AgentError::Interrupted),
 				}
 			};
@@ -3045,6 +3969,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 						turn_id.as_str(),
 						outcome.clone(),
 					)?;
+					for (event_index, item) in receipt.item_events.iter().copied().zip(&outcome.output) {
+						notify_json(
+							hook_pb::HookEventId::HookEventItemCommitted,
+							self.hook_gate.as_deref(),
+							|| {
+								serde_json::json!({
+									"event_index": event_index,
+									"turn_id": turn_id.as_str(),
+									"item": hook_item_ref(event_index, item),
+								})
+							},
+						);
+					}
 					self.arbiter.flush(&mut self.journal, now_ms())?;
 					if frozen_options.provider_reset {
 						self
@@ -3187,7 +4124,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				session = &mut opening => break session?,
 				command = self.receivers.host_commands.recv_async() => {
 					if let Ok(command) = command {
-						self.handle_host_control(command);
+						self.handle_host_control(command).await;
 					}
 				},
 				event = self.control_mailbox.handle_next(&mut self.journal) => {
@@ -3218,6 +4155,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
 		let mut stream_parts: BTreeMap<u32, (StreamSource, Option<Str>)> = BTreeMap::new();
 		let mut secret_streams: BTreeMap<u32, SecretStreamRestorer> = BTreeMap::new();
+		let mut message_hooks = self
+			.hook_gate
+			.as_ref()
+			.filter(|gate| {
+				[
+					hook_pb::HookEventId::HookEventMessageStart,
+					hook_pb::HookEventId::HookEventMessageUpdate,
+					hook_pb::HookEventId::HookEventMessageEnd,
+				]
+				.into_iter()
+				.any(|event| gate.subscribed(event))
+			})
+			.map(|gate| MessageHookStream::new(Arc::clone(gate), Str::new(turn_id.as_str())));
 		let mut saw_stream_event = false;
 		loop {
 			let watchdog_ms = if saw_stream_event {
@@ -3246,7 +4196,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					command = self.receivers.host_commands.recv_async() => {
 						match command {
 							Ok(command) => {
-								self.handle_host_control(command);
+								self.handle_host_control(command).await;
 								continue;
 							},
 							Err(_) => std::future::pending().await,
@@ -3300,7 +4250,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						command = self.receivers.host_commands.recv_async() => {
 							match command {
 								Ok(command) => {
-									self.handle_host_control(command);
+									self.handle_host_control(command).await;
 									continue;
 								},
 								Err(_) => std::future::pending().await,
@@ -3405,9 +4355,20 @@ impl<C: TurnClient + Clone> Agent<C> {
 			}
 			match event.event {
 				Some(turn_event::Event::Outcome(outcome)) => {
+					if let Some(hooks) = message_hooks.as_mut() {
+						let finish = match outcome.stop() {
+							pb::StopReason::StopMaxTokens => "truncated",
+							pb::StopReason::StopContentFilter => "error",
+							_ => "complete",
+						};
+						hooks.finish(finish);
+					}
 					return Ok(DriveSessionResult::Complete(outcome, speculative));
 				},
 				Some(turn_event::Event::Error(error)) => {
+					if let Some(hooks) = message_hooks.as_mut() {
+						hooks.finish("error");
+					}
 					return Err(TurnError::Terminal(Box::new(error)));
 				},
 				Some(turn_event::Event::PartStart(part)) => {
@@ -3418,6 +4379,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 						part_start::Kind::Unspecified => None,
 					};
 					if let Some(source) = source {
+						if let Some(hooks) = message_hooks.as_mut() {
+							hooks.start(part.index, source);
+						}
 						stream_parts.insert(
 							part.index,
 							(
@@ -3478,7 +4442,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					let invocation_props = self
 						.invocation_mode_props(&maximum_effects)
 						.map_err(|_| TurnError::Protocol("prewalk transition could not be recorded"))?;
-					let opened = SpeculativeCall::open_with_props(
+					let mut opened = SpeculativeCall::open_with_props(
 						&self.env,
 						&self.events,
 						call_id.clone(),
@@ -3493,6 +4457,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 							self.hook_bus.clone(),
 							self.invocation_fact_tx.clone(),
 							maximum_effects,
+							self.hook_gate.clone(),
+							Str::new(turn_id.as_str()),
 						)
 						.map_err(|_| TurnError::Protocol("failed to attach invocation runtime"))?;
 					self
@@ -3512,6 +4478,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 				Some(turn_event::Event::PartDelta(part)) => {
 					let fragment = str::from_utf8(&part.chunk)
 						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
+					if let Some(hooks) = message_hooks.as_mut() {
+						hooks.delta(part.index, fragment);
+					}
 					if let Some(call_id) = part_calls.get(&part.index)
 						&& let Some(guard) = streaming_edit_guard.as_ref()
 					{
@@ -3542,6 +4511,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 						)
 						.map_err(|_| TurnError::Protocol("failed to journal stream regime resolution"))?;
 					if stream_fold.regime.control == ResolutionKind::Cancel {
+						if let Some(hooks) = message_hooks.as_mut() {
+							hooks.finish("interrupted");
+						}
 						return Ok(DriveSessionResult::Cancelled(StreamCancel {
 							activation: stream_fold
 								.regime
@@ -3580,6 +4552,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	async fn reconcile_speculation(
 		&mut self,
+		turn_id: &TurnId<str>,
 		output: &[Item],
 		speculative: &mut BTreeMap<Str, SpeculativeCall>,
 		registry: &ToolRegistry,
@@ -3625,6 +4598,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.hook_bus.clone(),
 				self.invocation_fact_tx.clone(),
 				maximum_effects,
+				self.hook_gate.clone(),
+				Str::new(turn_id.as_str()),
 			)?;
 			let fragment = str::from_utf8(&restored)
 				.map_err(|_| AgentError::Protocol("tool arguments are not UTF-8"))?;
@@ -3646,7 +4621,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	fn drain_control(&mut self) {
 		while let Ok(command) = self.receivers.host_commands.try_recv() {
-			self.handle_host_control(command);
+			if command.operation.as_str() == "omp.context.compact" {
+				let _ = command.reply.send(Err(sf!(
+					"CompactionBusy: compaction requires an asynchronous agent-loop boundary"
+				)));
+			} else {
+				self.handle_host_control_sync(command);
+			}
 		}
 		let mut regimes = Vec::new();
 		let mut projections = Vec::new();
@@ -3665,7 +4646,66 @@ impl<C: TurnClient + Clone> Agent<C> {
 		}
 	}
 
-	fn handle_host_control(&mut self, command: AgentHostCommand) {
+	async fn handle_host_control(&mut self, command: AgentHostCommand) {
+		if command.operation.as_str() != "omp.context.compact" {
+			self.handle_host_control_sync(command);
+			return;
+		}
+		let result = self.context_control_compact(&command.arguments).await;
+		let _ = command.reply.send(result);
+	}
+
+	async fn context_control_compact(
+		&mut self,
+		arguments: &serde_json::Map<String, Value>,
+	) -> Result<Value, Str> {
+		if self.compaction_running || self.journal.pending_turn().is_some() {
+			return Err(sf!("CompactionBusy: compaction is already running or a turn is pending"));
+		}
+		let mode = match arguments.get("tier") {
+			None | Some(Value::Null) => None,
+			Some(Value::String(tier)) => match tier.as_str() {
+				"local" => Some(ManualCompactionMode::Soft),
+				"remote" => Some(ManualCompactionMode::Remote),
+				"prune" | "drop_media" | "elide" | "handoff" => {
+					return Err(sf!(
+						"CompactionRefused: requested tier is not an available summary method"
+					));
+				},
+				_ => return Err(sf!("ContextError: unknown compaction tier")),
+			},
+			Some(_) => return Err(sf!("ContextError: compaction tier must be a string or null")),
+		};
+		let focus = match arguments.get("focus") {
+			None => None,
+			Some(Value::String(focus)) if focus.is_empty() => None,
+			Some(Value::String(focus)) => Some(Str::new(focus)),
+			Some(_) => return Err(sf!("ContextError: compaction focus must be a string")),
+		};
+		let outcome = Box::pin(self.compact_with_reason(
+			ManualCompactionRequest { mode, focus },
+			CompactionReason::Extension,
+		))
+		.await
+		.map_err(|error| sf!("CompactionFailed: {error}"))?;
+		Ok(serde_json::json!({
+			"preparation_id": outcome.preparation_id,
+			"tiers_run": [match outcome.method {
+				ManualCompactionMode::Soft => "local",
+				ManualCompactionMode::Remote => "remote",
+				ManualCompactionMode::Snapcompact => "local",
+			}],
+			"from_extension": outcome.from_extension,
+			"tokens_before": outcome.tokens_before,
+			"tokens_after": outcome.tokens_after,
+			"first_kept_id": outcome.first_kept.to_string(),
+			"epoch": outcome.epoch,
+			"summary_bytes": outcome.summary_bytes,
+			"warning": outcome.warning,
+		}))
+	}
+
+	fn handle_host_control_sync(&mut self, command: AgentHostCommand) {
 		let result = match command.operation.as_str() {
 			"omp.sessions.rename" => (|| {
 				let title = command
@@ -3673,14 +4713,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.get("title")
 					.and_then(Value::as_str)
 					.ok_or_else(|| sf!("session title is required"))?;
+				let title = title.trim();
 				self
 					.journal
-					.append_title(
-						now_ms(),
-						Str::new(title.trim()),
-						omp_storage::transcript::TitleSource::User,
-					)
+					.append_title(now_ms(), Str::new(title), omp_storage::transcript::TitleSource::User)
 					.map_err(|error| sf!("durable session rename failed: {error}"))?;
+				emit_session_renamed(
+					self.hook_gate.as_deref(),
+					self.journal.session_id().0.as_str(),
+					(!title.is_empty()).then_some(title),
+				);
 				Ok(Value::Null)
 			})(),
 			"omp.jobs.register" => (|| {
@@ -3709,6 +4751,43 @@ impl<C: TurnClient + Clone> Agent<C> {
 					return Err(sf!("durable job id is bound to another descriptor"));
 				}
 				serde_json::to_value(job).map_err(|error| sf!("durable job response failed: {error}"))
+			})(),
+			"omp.hooks.record_outcome" => (|| {
+				let event_id = command
+					.arguments
+					.get("event_id")
+					.and_then(Value::as_u64)
+					.and_then(|value| u8::try_from(value).ok())
+					.ok_or_else(|| sf!("hook event id is required"))?;
+				let decision = command
+					.arguments
+					.get("decision")
+					.and_then(Value::as_str)
+					.map(Str::new)
+					.ok_or_else(|| sf!("hook decision is required"))?;
+				let invocation_id = command
+					.arguments
+					.get("invocation_id")
+					.and_then(Value::as_str)
+					.map(Str::new);
+				let reason = command
+					.arguments
+					.get("reason")
+					.and_then(Value::as_str)
+					.map(Str::new);
+				self
+					.journal
+					.record_hook_outcome(now_ms(), HookOutcome {
+						invocation_id,
+						event_id,
+						dispatch_id: 0,
+						subscription_id: None,
+						phase: HookPhase::Review.ordinal(),
+						decision,
+						reason,
+					})
+					.map_err(|error| sf!("durable hook outcome failed: {error}"))?;
+				Ok(Value::Null)
 			})(),
 			"omp.context.view" => self.context_control_view(),
 			"omp.context.usage" => self.context_control_view().and_then(|view| {
@@ -3775,6 +4854,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 							.and_then(context_proto_value_json)
 							.ok_or_else(|| sf!("NoVerdict: context item has no structured verdict"))
 					})
+			},
+			"omp.agents.pending_messages" => {
+				Ok(Value::from(u64::try_from(self.mailbox.pending_len()).unwrap_or(u64::MAX)))
 			},
 			"omp.agents.continuations" => Ok(serde_json::json!({
 				"consecutive": self.continuations.consecutive,
@@ -4269,6 +5351,97 @@ const fn empty_invocation_transition(
 		effects: None,
 		authorized_at: None,
 		outcome: None,
+	}
+}
+
+fn compaction_message_ref(event: u64, item: &Item, byte_len: usize) -> hook_pb::MessageRef {
+	let (kind, role, part_count, media_count, tool, is_error, useless, preview) =
+		match item.kind.as_ref() {
+			Some(item::Kind::Message(message)) => {
+				let role = match thread::Role::try_from(message.role) {
+					Ok(thread::Role::System) => "system",
+					Ok(thread::Role::User) => "user",
+					Ok(thread::Role::Assistant) => "assistant",
+					_ => "custom",
+				};
+				let preview = message
+					.parts
+					.iter()
+					.find_map(|part| match part.kind.as_ref() {
+						Some(part::Kind::Text(text)) => Some(text.clone()),
+						_ => None,
+					});
+				(
+					hook_pb::MessageKind::Message,
+					role,
+					message.parts.len(),
+					message
+						.parts
+						.iter()
+						.filter(|part| matches!(part.kind, Some(part::Kind::Blob(_))))
+						.count(),
+					None,
+					false,
+					false,
+					preview.unwrap_or_default(),
+				)
+			},
+			Some(item::Kind::ToolCall(call)) => (
+				hook_pb::MessageKind::ToolCall,
+				"assistant",
+				1,
+				0,
+				Some(call.name.clone()),
+				false,
+				false,
+				call.name.clone(),
+			),
+			Some(item::Kind::ToolResult(result)) => (
+				hook_pb::MessageKind::ToolResult,
+				"user",
+				result.parts.len(),
+				result
+					.parts
+					.iter()
+					.filter(|part| matches!(part.kind, Some(part::Kind::Blob(_))))
+					.count(),
+				Some(result.name.clone()),
+				result.is_error,
+				result.useless.unwrap_or(false),
+				result
+					.parts
+					.iter()
+					.find_map(|part| match part.kind.as_ref() {
+						Some(part::Kind::Text(text)) => Some(text.clone()),
+						_ => None,
+					})
+					.unwrap_or_default(),
+			),
+			None => {
+				(hook_pb::MessageKind::Reasoning, "assistant", 0, 0, None, false, false, String::new())
+			},
+		};
+	hook_pb::MessageRef {
+		id: event.to_string(),
+		event,
+		seq: item.seq,
+		kind: kind as i32,
+		role: role.to_owned(),
+		turn_id: None,
+		created_at_ms: item.created_at_ms,
+		tokens: u64::try_from(byte_len.div_ceil(4)).unwrap_or(u64::MAX),
+		byte_len: u64::try_from(byte_len).unwrap_or(u64::MAX),
+		part_count: u32::try_from(part_count).unwrap_or(u32::MAX),
+		media_count: u32::try_from(media_count).unwrap_or(u32::MAX),
+		tool,
+		is_error,
+		useless,
+		pinned: false,
+		elided: false,
+		superseded_by: None,
+		artifacts: Vec::new(),
+		preview,
+		props: None,
 	}
 }
 
@@ -5011,6 +6184,12 @@ fn duplex_turn_error(error: DuplexError) -> TurnError {
 fn follow_up_id(_root: &TurnId<str>, _ordinal: u32) -> TurnId {
 	TurnId::new(omp_core::Ulid::generate().to_string())
 }
+fn batch_terminates(results: impl IntoIterator<Item = bool>) -> bool {
+	let mut results = results.into_iter();
+	results
+		.next()
+		.is_some_and(|first| first && results.all(|terminate| terminate))
+}
 
 fn accumulate_usage(target: &mut pb::Usage, source: &pb::Usage) {
 	target.input_tokens = target.input_tokens.saturating_add(source.input_tokens);
@@ -5073,6 +6252,154 @@ mod tests {
 	use crate::{ContextPatchSet, InheritPosition, InvokeFrame, PatchOp};
 
 	type Script = Vec<Result<pb::TurnEvent, TurnError>>;
+	fn observe_subscription(event: hook_pb::HookEventId, id: u32) -> crate::Subscription {
+		crate::Subscription {
+			host: sf!("test"),
+			source: crate::SourceRef {
+				layer:        0,
+				publisher:    sf!("test"),
+				extension_id: sf!("stream"),
+			},
+			id,
+			event,
+			phase: HookPhase::Observe,
+			order: 0,
+			on_failure: crate::OnFailure::Defer,
+			when: crate::When::default(),
+		}
+	}
+
+	#[test]
+	fn before_agent_start_custom_message_values_lower_to_user_items() {
+		let mut items = vec![Item::default()];
+		append_hook_custom_messages(
+			&mut items,
+			&[
+				serde_json::json!({"kind": "message", "item_id": "existing"}),
+				serde_json::json!({"kind": "message", "content": "extension context"}),
+			],
+			1,
+		);
+		assert_eq!(items.len(), 2);
+		let item = items.pop().expect("custom message");
+		let item::Kind::Message(message) = item.kind.expect("message item") else {
+			panic!("expected message");
+		};
+		assert_eq!(message.role(), thread::Role::User);
+		assert!(matches!(
+			message.parts.as_slice(),
+			[thread::Part { kind: Some(part::Kind::Text(text)) }] if text == "extension context"
+		));
+	}
+
+	#[test]
+	fn message_hooks_coalesce_updates_and_report_running_char_count() {
+		let (gate, receiver) = HookGate::channel();
+		gate
+			.subscribe("test", [
+				observe_subscription(hook_pb::HookEventId::HookEventMessageStart, 18),
+				observe_subscription(hook_pb::HookEventId::HookEventMessageUpdate, 19),
+				observe_subscription(hook_pb::HookEventId::HookEventMessageEnd, 20),
+			])
+			.unwrap();
+		let mut stream = MessageHookStream::new(Arc::new(gate), sf!("turn-1"));
+		stream.last_flush = Instant::now() + Duration::from_secs(1);
+		stream.start(0, StreamSource::Text);
+		stream.delta(0, "hé");
+		stream.delta(0, "llo");
+		stream.finish("complete");
+		let start = receiver.try_recv().unwrap();
+		let update = receiver.try_recv().unwrap();
+		let end = receiver.try_recv().unwrap();
+		assert_eq!(start.event, hook_pb::HookEventId::HookEventMessageStart);
+		assert_eq!(update.event, hook_pb::HookEventId::HookEventMessageUpdate);
+		assert_eq!(end.event, hook_pb::HookEventId::HookEventMessageEnd);
+		let payload = serde_json::from_slice::<Value>(&update.payload).unwrap();
+		assert_eq!(payload["delta"], "héllo");
+		assert_eq!(payload["coalesced"], 2);
+		assert_eq!(payload["total_chars"], 5);
+		assert!(receiver.try_recv().is_err());
+	}
+	#[test]
+	fn message_delta_work_stays_empty_without_update_subscription() {
+		let (gate, _) = HookGate::channel();
+		gate
+			.subscribe("test", [observe_subscription(hook_pb::HookEventId::HookEventMessageStart, 18)])
+			.unwrap();
+		let mut stream = MessageHookStream::new(Arc::new(gate), sf!("turn-1"));
+		stream.start(0, StreamSource::Text);
+		stream.delta(0, "not accumulated");
+		assert_eq!(stream.total_chars, 0);
+		assert!(stream.pending.is_none());
+	}
+
+	#[test]
+	fn fallback_model_change_emits_reason_and_resolved_models_only_when_subscribed() {
+		let (gate, receiver) = HookGate::channel();
+		let builds = std::sync::atomic::AtomicUsize::new(0);
+		emit_fallback_model_changed(
+			Some(&gate),
+			|| {
+				builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				("anthropic/claude".to_owned(), Some(pb::Effort::Low as i32))
+			},
+			"openai/gpt",
+		);
+		assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+		gate
+			.subscribe("test", [crate::Subscription {
+				host:       sf!("test"),
+				source:     crate::SourceRef {
+					layer:        0,
+					publisher:    sf!("test"),
+					extension_id: sf!("fallback"),
+				},
+				id:         45,
+				event:      hook_pb::HookEventId::HookEventModelChanged,
+				phase:      HookPhase::Observe,
+				order:      0,
+				on_failure: crate::OnFailure::Defer,
+				when:       crate::When::default(),
+			}])
+			.unwrap();
+		emit_fallback_model_changed(
+			Some(&gate),
+			|| {
+				builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				("anthropic/claude".to_owned(), Some(pb::Effort::Low as i32))
+			},
+			"openai/gpt",
+		);
+		assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1);
+		let dispatch = receiver
+			.try_recv()
+			.expect("model_changed fallback observation");
+		assert_eq!(dispatch.event, hook_pb::HookEventId::HookEventModelChanged);
+		let payload = serde_json::from_slice::<Value>(&dispatch.payload).unwrap();
+		assert_eq!(payload["reason"], "fallback");
+		assert_eq!(payload["role"], "anthropic/claude");
+		assert_eq!(payload["from_model"]["provider"], "anthropic");
+		assert_eq!(payload["to_model"]["provider"], "openai");
+		assert_eq!(payload["previous_thinking"], "low");
+		assert_eq!(payload["thinking"], "low");
+	}
+	#[test]
+	fn session_renamed_observation_is_bitmap_gated() {
+		let (gate, receiver) = HookGate::channel();
+		emit_session_renamed(Some(&gate), "session-1", Some("First"));
+		assert!(receiver.try_recv().is_err());
+		gate
+			.subscribe("test", [observe_subscription(
+				hook_pb::HookEventId::HookEventSessionRenamed,
+				66,
+			)])
+			.unwrap();
+		emit_session_renamed(Some(&gate), "session-1", Some("Second"));
+		let dispatch = receiver.try_recv().unwrap();
+		let payload = serde_json::from_slice::<Value>(&dispatch.payload).unwrap();
+		assert_eq!(payload, serde_json::json!({"session": "session-1", "name": "Second"}));
+	}
 
 	struct DynamicHostExecutor;
 
@@ -5678,6 +7005,413 @@ mod tests {
 		drop(opened);
 		drop(agent);
 		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn compaction_hook_cancel_blocks_the_production_compactor() {
+		use omp_proto::prost::Message as _;
+
+		let (mut journal, path) = test_journal("compact-hook-cancel");
+		for (ts, (role, text)) in [
+			(1, (thread::Role::User, "first request")),
+			(2, (thread::Role::Assistant, "first answer")),
+			(3, (thread::Role::User, "second request")),
+		] {
+			journal
+				.append_optimistic(ts, message(role, text), None)
+				.expect("append compact source");
+		}
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client =
+			ScriptedClient { scripts: Arc::new(Mutex::new(VecDeque::new())), opened: opened.clone() };
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let (gate, receiver) = HookGate::channel();
+		let gate = Arc::new(gate);
+		gate
+			.subscribe("test", [crate::Subscription {
+				host:       sf!("test"),
+				source:     crate::SourceRef {
+					layer:        0,
+					publisher:    sf!("test"),
+					extension_id: sf!("cancel"),
+				},
+				id:         91,
+				event:      hook_pb::HookEventId::HookEventCompaction,
+				phase:      HookPhase::Review,
+				order:      0,
+				on_failure: crate::OnFailure::Defer,
+				when:       crate::When::default(),
+			}])
+			.unwrap();
+		agent.set_hook_gate(Arc::clone(&gate));
+		let response = async {
+			let dispatch = receiver
+				.recv_async()
+				.await
+				.expect("compaction hook dispatch");
+			let request = hook_pb::CompactionRequest::decode(dispatch.payload).unwrap();
+			assert_eq!(request.tier, "local");
+			assert_eq!(request.custom_instructions.as_deref(), Some("retain the decision"));
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					91,
+					crate::GateDecision::Domain(crate::encode_domain_verdict(Some(
+						&crate::CompactionVerdict::Cancel(crate::CancelCompaction {
+							reason:             sf!("managed externally"),
+							suppress_for_turns: 0,
+						}),
+					))),
+				)])
+				.unwrap();
+		};
+		let (result, ()) = tokio::join!(
+			agent.compact_manual(ManualCompactionRequest {
+				mode:  Some(ManualCompactionMode::Soft),
+				focus: Some(sf!("retain the decision")),
+			}),
+			response,
+		);
+		assert!(matches!(
+			result,
+			Err(AgentError::CompactionCancelled(CompactionCancellation::ExtensionVeto {
+				reason,
+			})) if reason.as_str() == "managed externally"
+		));
+		assert!(opened.lock().is_empty(), "cancelled hook must prevent the summarizer call");
+		assert_eq!(agent.journal().context_position().epoch, 0);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn compaction_hook_custom_summary_is_the_durable_compact_entry() {
+		let (mut journal, path) = test_journal("compact-hook-custom");
+		let mut events = Vec::new();
+		for (ts, (role, text)) in [
+			(1, (thread::Role::User, "first request")),
+			(2, (thread::Role::Assistant, "first answer")),
+			(3, (thread::Role::User, "second request")),
+		] {
+			events.push(
+				journal
+					.append_optimistic(ts, message(role, text), None)
+					.expect("append compact source"),
+			);
+		}
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client =
+			ScriptedClient { scripts: Arc::new(Mutex::new(VecDeque::new())), opened: opened.clone() };
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let (gate, receiver) = HookGate::channel();
+		let gate = Arc::new(gate);
+		gate
+			.subscribe("test", [crate::Subscription {
+				host:       sf!("test"),
+				source:     crate::SourceRef {
+					layer:        0,
+					publisher:    sf!("test"),
+					extension_id: sf!("summary"),
+				},
+				id:         92,
+				event:      hook_pb::HookEventId::HookEventCompaction,
+				phase:      HookPhase::Review,
+				order:      0,
+				on_failure: crate::OnFailure::Defer,
+				when:       crate::When::default(),
+			}])
+			.unwrap();
+		agent.set_hook_gate(Arc::clone(&gate));
+		let response = async {
+			let dispatch = receiver
+				.recv_async()
+				.await
+				.expect("compaction hook dispatch");
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					92,
+					crate::GateDecision::Domain(crate::encode_domain_verdict(Some(
+						&crate::CompactionVerdict::Custom(crate::CustomSummary {
+							compact:  Compact {
+								summary:       sf!("extension-authored durable summary"),
+								short:         Some(sf!("extension summary")),
+								first_kept:    events[1],
+								tokens_before: 0,
+								tokens_after:  None,
+								method:        None,
+								warning:       None,
+								superseded:    Vec::new(),
+								snapcompact:   None,
+							},
+							details:  None,
+							preserve: None,
+						}),
+					))),
+				)])
+				.unwrap();
+		};
+		let (outcome, ()) = tokio::join!(
+			agent.compact_manual(ManualCompactionRequest {
+				mode:  Some(ManualCompactionMode::Soft),
+				focus: None,
+			}),
+			response,
+		);
+		let outcome = outcome.expect("custom compaction commits");
+		assert_eq!(outcome.from_extension.as_deref(), Some("summary"));
+		assert!(opened.lock().is_empty(), "custom summary must replace the summarizer call");
+		let transcript = agent.journal().load().expect("load compact transcript");
+		let Some(Entry::Ok(entry)) = transcript.get(outcome.event) else {
+			panic!("compact journal entry");
+		};
+		let Kind::Compact { summary, first_kept, method, .. } = &entry.kind else {
+			panic!("durable custom summary must use the standard Compact entry");
+		};
+		assert_eq!(summary.as_str(), "extension-authored durable summary");
+		assert_eq!(*first_kept, events[1]);
+		assert_eq!(method.as_deref(), Some("extension"));
+		drop(transcript);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn compaction_hook_delegate_instructions_reach_the_summary_request() {
+		let (mut journal, path) = test_journal("compact-hook-delegate");
+		for (ts, (role, text)) in [
+			(1, (thread::Role::User, "first request")),
+			(2, (thread::Role::Assistant, "first answer")),
+			(3, (thread::Role::User, "second request")),
+		] {
+			journal
+				.append_optimistic(ts, message(role, text), None)
+				.expect("append compact source");
+		}
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([outcome_script(end_outcome(
+				"delegated summary",
+			))]))),
+			opened:  opened.clone(),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let (gate, receiver) = HookGate::channel();
+		let gate = Arc::new(gate);
+		gate
+			.subscribe("test", [crate::Subscription {
+				host:       sf!("test"),
+				source:     crate::SourceRef {
+					layer:        0,
+					publisher:    sf!("test"),
+					extension_id: sf!("delegate"),
+				},
+				id:         94,
+				event:      hook_pb::HookEventId::HookEventCompaction,
+				phase:      HookPhase::Review,
+				order:      0,
+				on_failure: crate::OnFailure::Defer,
+				when:       crate::When::default(),
+			}])
+			.unwrap();
+		agent.set_hook_gate(Arc::clone(&gate));
+		let response = async {
+			let dispatch = receiver
+				.recv_async()
+				.await
+				.expect("compaction hook dispatch");
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					94,
+					crate::GateDecision::Domain(crate::encode_domain_verdict(Some(
+						&crate::CompactionVerdict::Delegate(crate::DelegateCompaction {
+							extra_instructions: sf!("Keep the API choice verbatim."),
+							..Default::default()
+						}),
+					))),
+				)])
+				.unwrap();
+		};
+		let (outcome, ()) = tokio::join!(
+			agent.compact_manual(ManualCompactionRequest {
+				mode:  Some(ManualCompactionMode::Soft),
+				focus: None,
+			}),
+			response,
+		);
+		outcome.expect("delegated compaction succeeds");
+		let opened = opened.lock();
+		let TurnInput::Full(thread) = &opened[0].1 else {
+			panic!("compaction summarizer receives a full isolated thread");
+		};
+		assert!(
+			hook_item_text(thread.items.last().unwrap())
+				.is_some_and(|instruction| { instruction.contains("Keep the API choice verbatim.") })
+		);
+		drop(opened);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn failed_compaction_emits_structured_compaction_done_outcome() {
+		let (mut journal, path) = test_journal("compact-done-failure");
+		journal
+			.append_optimistic(1, message(thread::Role::User, "only item"), None)
+			.expect("append compact source");
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let (gate, receiver) = HookGate::channel();
+		gate
+			.subscribe("test", [crate::Subscription {
+				host:       sf!("test"),
+				source:     crate::SourceRef {
+					layer:        0,
+					publisher:    sf!("test"),
+					extension_id: sf!("done"),
+				},
+				id:         93,
+				event:      hook_pb::HookEventId::HookEventCompactionDone,
+				phase:      HookPhase::Observe,
+				order:      0,
+				on_failure: crate::OnFailure::Defer,
+				when:       crate::When::default(),
+			}])
+			.unwrap();
+		agent.set_hook_gate(Arc::new(gate));
+		assert!(
+			agent
+				.compact_manual(ManualCompactionRequest {
+					mode:  Some(ManualCompactionMode::Soft),
+					focus: None,
+				})
+				.await
+				.is_err()
+		);
+		let dispatch = receiver.try_recv().expect("failure compaction_done event");
+		let payload: Value = serde_json::from_slice(&dispatch.payload).unwrap();
+		assert_eq!(payload["tiers_run"], serde_json::json!(["local"]));
+		assert_eq!(payload["tokens_before"], 0);
+		assert_eq!(payload["summary_bytes"], 0);
+		assert!(
+			payload["warning"]
+				.as_str()
+				.is_some_and(|warning| !warning.is_empty())
+		);
+		assert!(
+			!payload["preparation_id"]
+				.as_str()
+				.unwrap_or_default()
+				.is_empty()
+		);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn context_compact_host_request_reaches_the_loop_and_returns_outcome() {
+		let (mut journal, path) = test_journal("context-compact-request");
+		for (ts, (role, text)) in [
+			(1, (thread::Role::User, "first request")),
+			(2, (thread::Role::Assistant, "first answer")),
+			(3, (thread::Role::User, "second request")),
+		] {
+			journal
+				.append_optimistic(ts, message(role, text), None)
+				.expect("append compact source");
+		}
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([outcome_script(end_outcome(
+				"host requested summary",
+			))]))),
+			opened:  opened.clone(),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let host = agent.host_control();
+		let request = host.request(
+			"omp.context.compact",
+			serde_json::Map::from_iter([
+				("tier".to_owned(), Value::String("local".to_owned())),
+				("focus".to_owned(), Value::String("preserve the chosen API".to_owned())),
+			]),
+		);
+		let service = async {
+			let command = agent
+				.receivers
+				.host_commands
+				.recv_async()
+				.await
+				.expect("host compact command");
+			agent.handle_host_control(command).await;
+		};
+		let (response, ()) = tokio::join!(request, service);
+		let response = response.expect("context compact response");
+		assert_eq!(response["tiers_run"], serde_json::json!(["local"]));
+		assert!(
+			response["tokens_after"]
+				.as_u64()
+				.is_some_and(|tokens| tokens > 0)
+		);
+		let opened = opened.lock();
+		let TurnInput::Full(thread) = &opened[0].1 else {
+			panic!("compaction summarizer receives a full isolated thread");
+		};
+		assert!(
+			hook_item_text(thread.items.last().unwrap())
+				.is_some_and(|instruction| { instruction.contains("preserve the chosen API") })
+		);
+		drop(opened);
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn pending_messages_host_request_counts_queued_mailbox_items() {
+		let (journal, path) = test_journal("pending-messages-request");
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		agent
+			.mailbox()
+			.try_enqueue(Interrupt {
+				class:  InterruptClass::TurnBoundary,
+				item:   message(thread::Role::User, "queued"),
+				source: InterruptSource::Producer(sf!("test")),
+			})
+			.expect("queue message");
+		let host = agent.host_control();
+		let request = host.request("omp.agents.pending_messages", serde_json::Map::new());
+		let service = async {
+			let command = agent
+				.receivers
+				.host_commands
+				.recv_async()
+				.await
+				.expect("host pending-messages command");
+			agent.handle_host_control(command).await;
+		};
+		let (response, ()) = tokio::join!(request, service);
+		assert_eq!(response.expect("pending-messages response"), Value::from(1_u64));
+		drop(agent);
+		if path.exists() {
+			fs::remove_file(path).expect("remove journal");
+		}
 	}
 
 	#[tokio::test]
@@ -6335,6 +8069,16 @@ mod tests {
 		let deadline = Instant::now() + Duration::from_millis(1);
 		let result = sleep_with_deadline(Duration::from_secs(60), Some(deadline)).await;
 		assert!(matches!(result, Err(AgentError::Deadline)));
+	}
+	#[test]
+	fn mixed_terminate_batch_stages_automatic_follow_up() {
+		assert!(!batch_terminates([true, false]));
+	}
+
+	#[test]
+	fn unanimous_terminate_batch_skips_automatic_follow_up() {
+		assert!(batch_terminates([true, true]));
+		assert!(!batch_terminates([]));
 	}
 	#[test]
 	fn advisor_tool_loop_abort_settles_without_terminal_failure() {

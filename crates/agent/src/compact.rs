@@ -52,7 +52,7 @@ pub const IDLE_PRUNE_AFTER: time::Duration = time::Duration::from_secs(90 * 60);
 	strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum CompactionTier {
 	/// Remove already-useless or superseded tool results without loss.
 	Prune,
@@ -666,16 +666,28 @@ pub fn execute_snapcompact(
 /// Observable result of one committed manual compaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManualCompactionOutcome {
+	/// Stable correlation identifier shared with compaction hook events.
+	pub preparation_id: Str,
 	/// Method that produced the durable boundary.
-	pub method:        ManualCompactionMode,
+	pub method:         ManualCompactionMode,
 	/// Physical compact event index.
-	pub event:         u64,
+	pub event:          u64,
+	/// First durable item retained verbatim after the summary.
+	pub first_kept:     u64,
+	/// Durable compaction epoch after the boundary.
+	pub epoch:          u64,
 	/// Context token estimate before compaction.
-	pub tokens_before: u64,
+	pub tokens_before:  u64,
 	/// Context token estimate after compaction.
-	pub tokens_after:  u64,
+	pub tokens_after:   u64,
+	/// Exact byte length of the durable textual summary.
+	pub summary_bytes:  usize,
+	/// Extension that supplied the winning custom summary.
+	pub from_extension: Option<Str>,
+	/// Warning attached to a degraded but committed compaction.
+	pub warning:        Option<Str>,
 	/// Number of durable Snapcompact PNG frames.
-	pub frame_count:   usize,
+	pub frame_count:    usize,
 }
 
 /// Work selected when a manual request takes ownership of the coordinator.
@@ -1376,6 +1388,9 @@ pub enum CompactionResolution {
 	Custom {
 		/// Winning extension summary.
 		winner: CustomSummary,
+		/// Extension that supplied the winner, when dispatch preserved
+		/// attribution.
+		source: Option<Str>,
 		/// Ordered loser records to persist alongside `Kind::Compact`.
 		losers: Vec<SupersededCompaction>,
 	},
@@ -1414,7 +1429,7 @@ impl CompactionResolution {
 	/// `Journal::compact`; cancellation and delegated/default outcomes leave
 	/// durable compaction to their respective built-in rungs.
 	pub fn into_compact(self) -> Option<Compact> {
-		let Self::Custom { mut winner, losers } = self else {
+		let Self::Custom { mut winner, losers, .. } = self else {
 			return None;
 		};
 		winner.compact.superseded = losers;
@@ -1427,7 +1442,7 @@ fn resolve_one(verdict: Option<CompactionVerdict>) -> CompactionResolution {
 	match verdict {
 		Some(CompactionVerdict::Cancel(cancel)) => CompactionResolution::Cancel(cancel),
 		Some(CompactionVerdict::Custom(winner)) => {
-			CompactionResolution::Custom { winner, losers: Vec::new() }
+			CompactionResolution::Custom { winner, source: None, losers: Vec::new() }
 		},
 		Some(CompactionVerdict::Delegate(delegate)) => CompactionResolution::Delegate(delegate),
 		None => CompactionResolution::Default,
@@ -1443,7 +1458,7 @@ pub fn resolve_verdicts(
 	verdicts: &mut [(SourceRef, Option<CompactionVerdict>)],
 ) -> CompactionResolution {
 	verdicts.sort_by(|left, right| left.0.cmp(&right.0));
-	let mut winner = None;
+	let mut winner: Option<(Str, CustomSummary)> = None;
 	let mut losers = Vec::new();
 	let mut delegate = DelegateCompaction::default();
 	for (source, returned) in verdicts {
@@ -1454,7 +1469,7 @@ pub fn resolve_verdicts(
 			CompactionVerdict::Cancel(cancel) => return CompactionResolution::Cancel(cancel.clone()),
 			CompactionVerdict::Custom(summary) => {
 				if winner.is_none() {
-					winner = Some(summary.clone());
+					winner = Some((source.extension_id.clone(), summary.clone()));
 				} else {
 					losers.push(SupersededCompaction {
 						extension_id: source.extension_id.clone(),
@@ -1468,8 +1483,8 @@ pub fn resolve_verdicts(
 			CompactionVerdict::Delegate(_) => {},
 		}
 	}
-	if let Some(winner) = winner {
-		CompactionResolution::Custom { winner, losers }
+	if let Some((source, winner)) = winner {
+		CompactionResolution::Custom { winner, source: Some(source), losers }
 	} else if delegate != DelegateCompaction::default() {
 		CompactionResolution::Delegate(delegate)
 	} else {

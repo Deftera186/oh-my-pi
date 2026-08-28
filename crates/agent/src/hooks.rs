@@ -7,6 +7,7 @@ use flume::Receiver;
 use omp_core::{Str, sf};
 use omp_proto::toolhost::v1::HookEventId;
 use parking_lot::Mutex;
+use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
 
 use crate::{ApprovalSpec, HookDecision, HookPhase};
@@ -244,16 +245,74 @@ pub trait HookEvent {
 	fn apply(&mut self, patch: &HookPatch) -> Result<(), GateError>;
 }
 /// Result of one JSON-encoded catalog gate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum JsonGateOutcome {
 	/// No extension subscribed, so no payload was constructed.
+	Bypassed,
 	/// The composed effective payload.
+	Allow(JsonValue),
 	/// A hook denied the event.
+	Deny {
 		/// Stable denial reason.
+		reason: Str,
 		/// Whether the denial is fatal to the caller submission.
+		fatal:  bool,
+	},
 	/// An approval requirement was returned at a gate that does not own tickets.
-		// The delegated CONTROL bridge uses the same target/newline/payload
-		// envelope as gateable events.
+	Approval,
+}
+
 /// Emits one JSON observation while preserving the bitmap-only negative path.
+pub(crate) fn notify_json(
+	event: HookEventId,
+	gate: Option<&HookGate>,
+	build: impl FnOnce() -> JsonValue,
+) {
+	let Some(gate) = gate else {
+		return;
+	};
+	if !gate.subscribed(event) {
+		return;
+	}
+	let Ok(payload) = serde_json::to_vec(&build()) else {
+		return;
+	};
+	gate.notify_payload(event, 1, Bytes::from(payload));
+}
+
 /// Runs one JSON admission gate while preserving the bitmap-only negative path.
+pub(crate) async fn gate_json(
+	event: HookEventId,
+	gate: Option<&HookGate>,
+	build: impl FnOnce() -> JsonValue,
+) -> JsonGateOutcome {
+	let Some(gate) = gate else {
+		return JsonGateOutcome::Bypassed;
+	};
+	if !gate.subscribed(event) {
+		return JsonGateOutcome::Bypassed;
+	}
+	// Denials at admission gates abort the submission; every other gate fails open.
+	let fatal =
+		matches!(event, HookEventId::HookEventBeforeAgentStart | HookEventId::HookEventTurnStart);
+	let Ok(payload) = serde_json::to_vec(&build()) else {
+		return JsonGateOutcome::Deny { reason: sf!("hook payload serialization failed"), fatal };
+	};
+	match gate
+		.gate(event, GateEvent::new(Str::default(), Bytes::from(payload)))
+		.await
+	{
+		GateOutcome::Allow { event, .. } => match serde_json::from_slice(&event.effective_args) {
+			Ok(payload) => JsonGateOutcome::Allow(payload),
+			Err(_) => JsonGateOutcome::Deny {
+				reason: sf!("hook transform returned malformed payload"),
+				fatal,
+			},
+		},
+		GateOutcome::Deny { reason, .. } => JsonGateOutcome::Deny { reason, fatal },
+		GateOutcome::Approval { .. } => JsonGateOutcome::Approval,
+	}
+}
 
 impl HookEvent for GateEvent {
 	type Return = ();
@@ -296,6 +355,7 @@ pub enum GateDecision {
 	/// A terminal refusal and stable reason.
 	Deny(Str),
 	/// A terminal refusal retaining its canonical structured evidence.
+	DenyPolicy(std::sync::Arc<omp_tool::PolicyDenied>),
 	/// A legal TRANSFORM patch.
 	Modify(HookPatch),
 	/// No opinion.
@@ -310,7 +370,7 @@ impl GateDecision {
 	const fn arm(&self) -> Option<HookDecision> {
 		Some(match self {
 			Self::Allow => HookDecision::Allow,
-			Self::Deny(_) => HookDecision::Deny,
+			Self::Deny(_) | Self::DenyPolicy(_) => HookDecision::Deny,
 			Self::Modify(_) => HookDecision::Modify,
 			Self::Defer => HookDecision::Defer,
 			Self::RequireApproval(_) => HookDecision::RequireApproval,
@@ -369,6 +429,7 @@ pub enum GateOutcome {
 		/// Stable refusal reason.
 		reason: Str,
 		/// Canonical structured denial when supplied by the live composer.
+		policy: Option<std::sync::Arc<omp_tool::PolicyDenied>>,
 		/// Ordered transform overwrite audit trail before refusal.
 		trail:  Vec<TransformTrail>,
 	},
@@ -418,6 +479,7 @@ pub struct HookGate {
 	next_id:          AtomicU64,
 	subscriptions:    Mutex<Vec<Subscription>>,
 	dropped_notifies: AtomicU64,
+	delegated:        bool,
 }
 
 impl HookGate {
@@ -432,6 +494,7 @@ impl HookGate {
 				next_id: AtomicU64::new(1),
 				subscriptions: Mutex::new(Vec::new()),
 				dropped_notifies: AtomicU64::new(0),
+				delegated: false,
 			},
 			receive,
 		)
@@ -442,7 +505,28 @@ impl HookGate {
 	/// Unlike [`Self::channel`], this mode emits one dispatch for the complete
 	/// event. The receiver owns phase ordering, failure policy, and callback
 	/// composition and answers with one final decision.
+	pub fn delegated_channel() -> (Self, Receiver<HookDispatch>) {
+		let (dispatch, receive) = flume::bounded(OBSERVE_HANDLER_CAP);
+		(
+			Self {
+				mask: [const { AtomicU64::new(0) }; MASK_WORDS],
+				dispatch,
+				pending: Mutex::new(omp_core::SparseMap::new()),
+				next_id: AtomicU64::new(1),
+				subscriptions: Mutex::new(Vec::new()),
+				dropped_notifies: AtomicU64::new(0),
+				delegated: true,
+			},
+			receive,
+		)
+	}
+
 	/// Publishes the complete event subscription bitmap for a delegated gate.
+	pub fn replace_union_mask(&self, mask: u128) {
+		self.mask[0].store(mask as u64, Ordering::Release);
+		self.mask[1].store((mask >> 64) as u64, Ordering::Release);
+	}
+
 	/// Replaces one host's subscriptions and publishes their event bits.
 	pub fn subscribe(
 		&self,
@@ -491,13 +575,17 @@ impl HookGate {
 		}
 		let mut encoded = BytesMut::new();
 		event.encode_into(&mut encoded);
+		self.notify_payload(E::ID, E::REV, encoded.freeze());
+	}
+
+	fn notify_payload(&self, event: HookEventId, rev: u32, payload: Bytes) {
 		let dispatch = HookDispatch {
-			dispatch_id:   self.next_id.fetch_add(1, Ordering::Relaxed),
-			event:         E::ID,
-			rev:           E::REV,
-			phase:         HookPhase::Observe,
-			subscriptions: self.selected(E::ID, HookPhase::Observe, "", ""),
-			payload:       encoded.freeze(),
+			dispatch_id: self.next_id.fetch_add(1, Ordering::Relaxed),
+			event,
+			rev,
+			phase: HookPhase::Observe,
+			subscriptions: self.selected(event, HookPhase::Observe, "", ""),
+			payload,
 		};
 		if self.dispatch.try_send(dispatch).is_err() {
 			self.dropped_notifies.fetch_add(1, Ordering::Relaxed);
@@ -529,19 +617,37 @@ impl HookGate {
 	}
 
 	/// Runs the phase-ordered decision procedure without boxing its future.
-	pub async fn gate(&self, mut event: GateEvent) -> GateOutcome {
+	pub async fn gate(&self, event_id: HookEventId, mut event: GateEvent) -> GateOutcome {
+		if self.delegated {
+			return self.gate_delegated(event_id, event).await;
+		}
 		let mut trail = Vec::new();
 		let mut approvals = Vec::new();
 		for phase in
 			[HookPhase::Precheck, HookPhase::Transform, HookPhase::Review, HookPhase::Approval]
 		{
-			let replies = self.dispatch_phase(&event, phase).await;
+			let replies = self.dispatch_phase(event_id, &event, phase).await;
 			for (subscription, decision) in replies {
 				if decision.arm().is_none_or(|arm| !arm.is_legal_in(phase)) {
-					return GateOutcome::Deny { event, reason: sf!("illegal hook decision"), trail };
+					return GateOutcome::Deny {
+						event,
+						reason: sf!("illegal hook decision"),
+						policy: None,
+						trail,
+					};
 				}
 				match decision {
-					GateDecision::Deny(reason) => return GateOutcome::Deny { event, reason, trail },
+					GateDecision::Deny(reason) => {
+						return GateOutcome::Deny { event, reason, policy: None, trail };
+					},
+					GateDecision::DenyPolicy(policy) => {
+						return GateOutcome::Deny {
+							event,
+							reason: policy.reason.clone(),
+							policy: Some(policy),
+							trail,
+						};
+					},
 					GateDecision::Modify(patch) => {
 						let previous_target = event.effective_target.clone();
 						let previous_args = event.effective_args.clone();
@@ -563,6 +669,93 @@ impl HookGate {
 			GateOutcome::Allow { event, trail }
 		} else {
 			GateOutcome::Approval { event, specs: approvals, trail }
+		}
+	}
+
+	async fn gate_delegated(&self, event_id: HookEventId, mut event: GateEvent) -> GateOutcome {
+		let dispatch_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+		let (reply, receive) = flume::bounded(1);
+		self
+			.pending
+			.lock()
+			.insert(dispatch_id, Pending { response: reply });
+		let mut payload = BytesMut::new();
+		event.encode_into(&mut payload);
+		let dispatch = HookDispatch {
+			dispatch_id,
+			event: event_id,
+			rev: GateEvent::REV,
+			phase: HookPhase::Review,
+			subscriptions: Vec::new(),
+			payload: payload.freeze(),
+		};
+		if self.dispatch.send_async(dispatch).await.is_err() {
+			self.pending.lock().remove(dispatch_id);
+			return GateOutcome::Deny {
+				event,
+				reason: sf!("required hook host unavailable"),
+				policy: None,
+				trail: Vec::new(),
+			};
+		}
+		let Ok(decisions) = receive.recv_async().await else {
+			return GateOutcome::Deny {
+				event,
+				reason: sf!("required hook host failed"),
+				policy: None,
+				trail: Vec::new(),
+			};
+		};
+		let Some((subscription_id, decision)) = decisions.into_iter().next() else {
+			return GateOutcome::Deny {
+				event,
+				reason: sf!("required hook host returned no decision"),
+				policy: None,
+				trail: Vec::new(),
+			};
+		};
+		match decision {
+			GateDecision::Allow | GateDecision::Defer => {
+				GateOutcome::Allow { event, trail: Vec::new() }
+			},
+			GateDecision::Deny(reason) => {
+				GateOutcome::Deny { event, reason, policy: None, trail: Vec::new() }
+			},
+			GateDecision::DenyPolicy(policy) => GateOutcome::Deny {
+				event,
+				reason: policy.reason.clone(),
+				policy: Some(policy),
+				trail: Vec::new(),
+			},
+			GateDecision::RequireApproval(spec) => {
+				GateOutcome::Approval { event, specs: vec![spec], trail: Vec::new() }
+			},
+			GateDecision::Modify(patch) => {
+				let previous_target = event.effective_target.clone();
+				let previous_args = event.effective_args.clone();
+				if event.apply(&patch).is_err() {
+					return GateOutcome::Deny {
+						event,
+						reason: sf!("illegal composed hook modification"),
+						policy: None,
+						trail: Vec::new(),
+					};
+				}
+				let trail = vec![TransformTrail {
+					subscription_id,
+					previous_target,
+					previous_args,
+					effective_target: event.effective_target.clone(),
+					effective_args: event.effective_args.clone(),
+				}];
+				GateOutcome::Allow { event, trail }
+			},
+			GateDecision::Domain(_) => GateOutcome::Deny {
+				event,
+				reason: sf!("illegal composed hook decision"),
+				policy: None,
+				trail: Vec::new(),
+			},
 		}
 	}
 
@@ -626,11 +819,12 @@ impl HookGate {
 
 	async fn dispatch_phase(
 		&self,
+		event_id: HookEventId,
 		event: &GateEvent,
 		phase: HookPhase,
 	) -> Vec<(Subscription, GateDecision)> {
 		let mut selected = self.selected(
-			HookEventId::HookEventToolCall,
+			event_id,
 			phase,
 			event.effective_target.as_str(),
 			event.effective_target.as_str(),
@@ -649,7 +843,7 @@ impl HookGate {
 			event.encode_into(&mut payload);
 			let dispatch = HookDispatch {
 				dispatch_id: id,
-				event: HookEventId::HookEventToolCall,
+				event: event_id,
 				rev: GateEvent::REV,
 				phase,
 				subscriptions: vec![subscription.clone()],
@@ -713,12 +907,15 @@ const fn event_position(event: HookEventId) -> (usize, u64) {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
 	use bytes::Bytes;
 	use omp_proto::toolhost::v1::HookEventId;
 
 	use super::{
 		AgentSettled, DomainReturn, GateDecision, GateError, GateEvent, GateOutcome, HookEvent,
-		HookGate, HookPatch, HookPhase, OnFailure, ProviderFailover, SourceRef, Subscription, When,
+		HookGate, HookPatch, HookPhase, JsonGateOutcome, OnFailure, ProviderFailover, SourceRef,
+		Subscription, When, gate_json, notify_json,
 	};
 
 	#[test]
@@ -760,6 +957,85 @@ mod tests {
 		assert!(gate.subscribed(HookEventId::HookEventMcpNotification));
 	}
 
+	#[test]
+	fn unsubscribed_json_observation_does_not_construct_payload() {
+		let (gate, _) = HookGate::channel();
+		let builds = AtomicUsize::new(0);
+		notify_json(HookEventId::HookEventAgentStart, Some(&gate), || {
+			builds.fetch_add(1, Ordering::Relaxed);
+			serde_json::json!({"submission_id": "s", "from_phase": "idle", "pending_items": 0})
+		});
+		assert_eq!(builds.load(Ordering::Relaxed), 0);
+	}
+
+	#[test]
+	fn agent_start_observation_is_delivered_with_json_envelope() {
+		let (gate, receiver) = HookGate::channel();
+		let mut observe = subscription(HookPhase::Observe, 11);
+		observe.event = HookEventId::HookEventAgentStart;
+		gate.subscribe("test", [observe]).unwrap();
+		notify_json(
+			HookEventId::HookEventAgentStart,
+			Some(&gate),
+			|| serde_json::json!({"submission_id": "s", "from_phase": "idle", "pending_items": 2}),
+		);
+		let dispatch = receiver.try_recv().expect("agent_start observation");
+		assert_eq!(dispatch.event, HookEventId::HookEventAgentStart);
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&dispatch.payload).unwrap(),
+			serde_json::json!({"submission_id": "s", "from_phase": "idle", "pending_items": 2}),
+		);
+	}
+
+	#[tokio::test]
+	async fn turn_start_deny_stops_the_gate() {
+		let (gate, receiver) = HookGate::channel();
+		let mut precheck = subscription(HookPhase::Precheck, 12);
+		precheck.event = HookEventId::HookEventTurnStart;
+		gate.subscribe("test", [precheck]).unwrap();
+		let work = gate_json(
+			HookEventId::HookEventTurnStart,
+			Some(&gate),
+			|| serde_json::json!({"turn_id": "t"}),
+		);
+		let driver = async {
+			let dispatch = receiver.recv_async().await.unwrap();
+			gate
+				.answer(dispatch.dispatch_id, vec![(12, GateDecision::Deny(sf!("blocked")))])
+				.unwrap();
+		};
+		let (outcome, ()) = tokio::join!(work, driver);
+		assert!(matches!(outcome, JsonGateOutcome::Deny { fatal: true, .. }));
+	}
+
+	#[tokio::test]
+	async fn delegated_tool_result_transform_returns_composed_annotations() {
+		let (gate, receiver) = HookGate::delegated_channel();
+		gate.replace_union_mask(1_u128 << HookEventId::HookEventToolResult as u32);
+		let work = gate_json(
+			HookEventId::HookEventToolResult,
+			Some(&gate),
+			|| serde_json::json!({"call_id": "c", "annotate": []}),
+		);
+		let driver = async {
+			let dispatch = receiver.recv_async().await.unwrap();
+			let effective = Bytes::from_static(
+				br#"{"call_id":"c","annotate":[{"kind":"lint","data":{},"display":true}]}"#,
+			);
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					27,
+					GateDecision::Modify(HookPatch { target: None, args: Some(effective) }),
+				)])
+				.unwrap();
+		};
+		let (outcome, ()) = tokio::join!(work, driver);
+		let JsonGateOutcome::Allow(payload) = outcome else {
+			panic!("tool_result transform must allow");
+		};
+		assert_eq!(payload["annotate"].as_array().unwrap().len(), 1);
+	}
+
 	#[tokio::test]
 	async fn transform_is_ordered_and_trails_every_overwrite() {
 		let (gate, receiver) = HookGate::channel();
@@ -768,7 +1044,10 @@ mod tests {
 		let mut second = subscription(HookPhase::Transform, 2);
 		second.order = 2;
 		gate.subscribe("test", [first, second]).unwrap();
-		let gate_future = gate.gate(GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")));
+		let gate_future = gate.gate(
+			HookEventId::HookEventToolCall,
+			GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")),
+		);
 		let driver = async {
 			for expected in [1, 2] {
 				let dispatch = receiver.recv_async().await.unwrap();
@@ -798,7 +1077,10 @@ mod tests {
 				subscription(HookPhase::Review, 2),
 			])
 			.unwrap();
-		let work = gate.gate(GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")));
+		let work = gate.gate(
+			HookEventId::HookEventToolCall,
+			GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")),
+		);
 		let driver = async {
 			let dispatch = rx.recv_async().await.unwrap();
 			gate
@@ -818,7 +1100,10 @@ mod tests {
 		drop(receiver);
 		assert!(matches!(
 			gate
-				.gate(GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")))
+				.gate(
+					HookEventId::HookEventToolCall,
+					GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")),
+				)
 				.await,
 			super::GateOutcome::Deny { .. }
 		));

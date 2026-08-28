@@ -6,13 +6,16 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use flume::Receiver;
 use omp_core::{Str, sf};
 use parking_lot::Mutex;
+use serde_json::Value;
 use tokio::{sync::oneshot, time};
+
+use crate::hooks::{HookGate, notify_json};
 
 /// One requirement merged into an invocation's single approval ticket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,8 +196,9 @@ pub struct ApprovalBook {
 /// ticket's declared policy instead of leaving the invocation suspended.
 #[derive(Clone)]
 pub struct ApprovalRoute {
-	book: Arc<ApprovalBook>,
-	tx:   flume::Sender<ApprovalRequest>,
+	book:      Arc<ApprovalBook>,
+	tx:        flume::Sender<ApprovalRequest>,
+	hook_gate: Option<Arc<HookGate>>,
 }
 
 /// Host-facing receiving half of an [`ApprovalRoute`].
@@ -231,9 +235,9 @@ impl ApprovalInbox {
 
 impl ApprovalRoute {
 	/// Creates a route and its single host inbox.
-	pub fn new(book: Arc<ApprovalBook>) -> (Self, ApprovalInbox) {
+	pub fn new(book: Arc<ApprovalBook>, hook_gate: Option<Arc<HookGate>>) -> (Self, ApprovalInbox) {
 		let (tx, rx) = flume::unbounded();
-		(Self { book, tx }, ApprovalInbox { rx })
+		(Self { book, tx, hook_gate }, ApprovalInbox { rx })
 	}
 
 	/// Files, dispatches, and awaits one durable approval ticket.
@@ -252,6 +256,8 @@ impl ApprovalRoute {
 		if ticket.state != TicketState::Pending {
 			return ticket;
 		}
+		let requested_at = Instant::now();
+		self.notify_requested(&ticket);
 		let _guard = self
 			.book
 			.guard(ticket.ticket_id.as_str())
@@ -268,14 +274,19 @@ impl ApprovalRoute {
 			.send(ApprovalRequest { ticket: ticket.clone(), reply })
 			.is_err()
 		{
-			return self.resolve_unreachable(&ticket, "approval host disconnected");
+			let resolved = self.resolve_unreachable(&ticket, "approval host disconnected");
+			self.notify_resolved(&resolved, requested_at.elapsed());
+			return resolved;
 		}
 		let decision = match timeout_ms {
 			Some(timeout_ms) => {
 				match time::timeout(Duration::from_millis(timeout_ms), response).await {
 					Ok(Ok(decision)) => decision,
 					Ok(Err(_)) => {
-						return self.resolve_unreachable(&ticket, "approval host became unreachable");
+						let resolved =
+							self.resolve_unreachable(&ticket, "approval host became unreachable");
+						self.notify_resolved(&resolved, requested_at.elapsed());
+						return resolved;
 					},
 					Err(_) => timeout_decision(&ticket),
 				}
@@ -283,14 +294,58 @@ impl ApprovalRoute {
 			None => match response.await {
 				Ok(decision) => decision,
 				Err(_) => {
-					return self.resolve_unreachable(&ticket, "approval host became unreachable");
+					let resolved = self.resolve_unreachable(&ticket, "approval host became unreachable");
+					self.notify_resolved(&resolved, requested_at.elapsed());
+					return resolved;
 				},
 			},
 		};
-		self
+		let resolved = self
 			.book
 			.decide(ticket.ticket_id.as_str(), decision)
-			.expect("dispatched approval ticket exists")
+			.expect("dispatched approval ticket exists");
+		self.notify_resolved(&resolved, requested_at.elapsed());
+		resolved
+	}
+
+	fn notify_requested(&self, ticket: &ApprovalTicket) {
+		notify_json(
+			omp_proto::toolhost::v1::HookEventId::HookEventToolApprovalRequested,
+			self.hook_gate.as_deref(),
+			|| {
+				let target = approval_target(ticket);
+				serde_json::json!({
+					"call_id": ticket.invocation_id,
+					"ticket_id": ticket.ticket_id,
+					"target": target,
+					"reasons": ticket.reasons.iter().map(|reason| reason.title.as_str()).collect::<Vec<_>>(),
+					"requested_by": ticket.reasons.iter().find_map(|reason| reason.approver.as_deref()).unwrap_or("core"),
+				})
+			},
+		);
+	}
+
+	fn notify_resolved(&self, ticket: &ApprovalTicket, waited: Duration) {
+		notify_json(
+			omp_proto::toolhost::v1::HookEventId::HookEventToolApprovalResolved,
+			self.hook_gate.as_deref(),
+			|| {
+				let decision = ticket.decision.as_ref();
+				let resolved_by = decision
+					.and_then(|decision| decision.decided_by.as_deref())
+					.or_else(|| decision.map(|decision| <&'static str>::from(decision.source)))
+					.unwrap_or("core");
+				serde_json::json!({
+					"call_id": ticket.invocation_id,
+					"ticket_id": ticket.ticket_id,
+					"target": approval_target(ticket),
+					"approved": decision.is_some_and(|decision| decision.approved),
+					"reason": decision.and_then(|decision| decision.reason.as_deref()),
+					"resolved_by": resolved_by,
+					"waited": format!("{}ms", waited.as_millis()),
+				})
+			},
+		);
 	}
 
 	fn resolve_unreachable(&self, ticket: &ApprovalTicket, reason: &'static str) -> ApprovalTicket {
@@ -312,6 +367,17 @@ impl ApprovalRoute {
 			.decide(ticket.ticket_id.as_str(), decision)
 			.expect("dispatched approval ticket exists")
 	}
+}
+fn approval_target(ticket: &ApprovalTicket) -> Value {
+	let Some(reason) = ticket.reasons.first() else {
+		return serde_json::json!({"kind": "core", "name": "approval", "rev": "1", "args": {}});
+	};
+	serde_json::json!({
+		"kind": "core",
+		"name": reason.kind,
+		"rev": "1",
+		"args": {"subject": reason.subject},
+	})
 }
 
 fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
@@ -541,9 +607,30 @@ impl Default for ApprovalBook {
 mod tests {
 	use std::sync::Arc;
 
+	use omp_proto::toolhost::v1::HookEventId;
+	use serde_json::Value;
+
 	use super::{
 		ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalSource, ApprovalSpec, TicketState,
 	};
+	use crate::{HookPhase, OnFailure, SourceRef, Subscription, When};
+
+	fn subscription(event: HookEventId, id: u32) -> Subscription {
+		Subscription {
+			host: sf!("test"),
+			source: SourceRef {
+				layer:        0,
+				publisher:    sf!("test"),
+				extension_id: sf!("approval-observer"),
+			},
+			id,
+			event,
+			phase: HookPhase::Observe,
+			order: 0,
+			on_failure: OnFailure::Defer,
+			when: When::default(),
+		}
+	}
 	fn spec() -> ApprovalSpec {
 		ApprovalSpec {
 			title:         sf!("Run"),
@@ -612,7 +699,7 @@ mod tests {
 	#[tokio::test]
 	async fn route_suspends_then_resumes_with_first_decision() {
 		let book = Arc::new(ApprovalBook::new());
-		let (route, inbox) = ApprovalRoute::new(Arc::clone(&book));
+		let (route, inbox) = ApprovalRoute::new(Arc::clone(&book), None);
 		let request = route.request(Some(sf!("routed")), vec![spec()], 1);
 		let answer = async {
 			let pending = inbox.recv().await.unwrap();
@@ -636,12 +723,54 @@ mod tests {
 	#[tokio::test]
 	async fn route_fails_closed_when_host_is_lost() {
 		let book = Arc::new(ApprovalBook::new());
-		let (route, inbox) = ApprovalRoute::new(book);
+		let (route, inbox) = ApprovalRoute::new(book, None);
 		drop(inbox);
 		let ticket = route.request(Some(sf!("lost")), vec![spec()], 1).await;
 		let decision = ticket.decision.unwrap();
 		assert!(!decision.approved);
 		assert_eq!(decision.source, ApprovalSource::Unavailable);
 		assert!(decision.reason.unwrap().contains("disconnected"));
+	}
+	#[tokio::test]
+	async fn route_emits_requested_and_resolved_through_subscribed_gate() {
+		let (gate, dispatches) = crate::HookGate::channel();
+		gate
+			.subscribe("test", [
+				subscription(HookEventId::HookEventToolApprovalRequested, 28),
+				subscription(HookEventId::HookEventToolApprovalResolved, 29),
+			])
+			.unwrap();
+		let book = Arc::new(ApprovalBook::new());
+		let (route, inbox) = ApprovalRoute::new(book, Some(Arc::new(gate)));
+		let request = route.request(Some(sf!("call-1")), vec![spec()], 1);
+		let answer = async {
+			inbox
+				.recv()
+				.await
+				.unwrap()
+				.respond(ApprovalDecision {
+					approved:   true,
+					scope:      sf!("once"),
+					source:     ApprovalSource::User,
+					decided_by: Some(sf!("operator")),
+					reason:     Some(sf!("approved")),
+					audited:    false,
+				})
+				.unwrap();
+		};
+		let (ticket, ()) = tokio::join!(request, answer);
+		assert!(ticket.decision.unwrap().approved);
+		let requested = dispatches.try_recv().unwrap();
+		let resolved = dispatches.try_recv().unwrap();
+		assert_eq!(requested.event, HookEventId::HookEventToolApprovalRequested);
+		assert_eq!(resolved.event, HookEventId::HookEventToolApprovalResolved);
+		let requested: Value = serde_json::from_slice(&requested.payload).unwrap();
+		let resolved: Value = serde_json::from_slice(&resolved.payload).unwrap();
+		assert_eq!(requested["call_id"], "call-1");
+		assert_eq!(requested["target"]["name"], "exec");
+		assert_eq!(requested["reasons"], serde_json::json!(["Run"]));
+		assert_eq!(resolved["approved"], true);
+		assert_eq!(resolved["resolved_by"], "operator");
+		assert!(dispatches.try_recv().is_err());
 	}
 }
