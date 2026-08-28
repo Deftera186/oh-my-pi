@@ -902,7 +902,7 @@ impl ControlAuthority for PolicyControlOwner {
 					));
 				}
 				let cwd = policy_cwd(&context, arguments.remove("cwd").as_ref())?;
-				Ok(bash_ir_json(&script, &cwd, &policy_root(&context)?))
+				Ok(user_bash_ir(&script, &cwd, &policy_root(&context)?))
 			},
 			"omp.policy.match_paths" => match_paths_json(&context, &mut arguments),
 			"omp.policy.capabilities" => serde_json::to_value(
@@ -1260,9 +1260,9 @@ fn command_json(command: &v1::BashCommand) -> Value {
 	})
 }
 
-fn bash_ir_json(script: &str, cwd: &Path, root: &Path) -> Value {
 /// Parses one direct user shell submission into the canonical BashIR JSON
 /// consumed by policy and hook admission.
+pub fn user_bash_ir(script: &str, cwd: &Path, root: &Path) -> Value {
 	let ir = admission::bash_ir("bash", &json!({"command": script}), cwd, root)
 		.expect("shell analysis always returns BashIr");
 	let parse_error = ir
@@ -1365,7 +1365,7 @@ fn match_paths_json(
 	})]))
 }
 
-fn approval_spec(value: Value) -> Result<omp_agent::ApprovalSpec, ControlProtocolError> {
+pub(crate) fn approval_spec(value: Value) -> Result<omp_agent::ApprovalSpec, ControlProtocolError> {
 	let object = value
 		.as_object()
 		.ok_or_else(|| ControlProtocolError::new("InvalidArguments", "approval must be an object"))?;

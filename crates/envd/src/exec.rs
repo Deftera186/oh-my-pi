@@ -2070,17 +2070,17 @@ enum RunTerminal {
 
 impl RunTerminal {
 	fn status(self, elapsed: Duration) -> ExecStatusMsg {
-		let (outcome, exit_code, aborted) = match self {
-			Self::Exited(code) if code == 0 => (ExecOutcome::Exited, Some(code), false),
-			Self::Exited(code) => (ExecOutcome::Failed, Some(code), false),
-			Self::Failed => (ExecOutcome::Failed, None, false),
-			Self::Timeout => (ExecOutcome::Timeout, None, true),
-			Self::Cancelled => (ExecOutcome::Cancelled, None, true),
+		let (outcome, exit_code, signal, aborted) = match self {
+			Self::Exited(code) if code == 0 => (ExecOutcome::Exited, Some(code), "", false),
+			Self::Exited(code) => (ExecOutcome::Failed, Some(code), "", false),
+			Self::Failed => (ExecOutcome::Failed, None, "", false),
+			Self::Timeout => (ExecOutcome::Timeout, None, "SIGKILL", true),
+			Self::Cancelled => (ExecOutcome::Cancelled, None, "SIGKILL", true),
 		};
 		ExecStatusMsg {
 			outcome: outcome as i32,
 			exit_code,
-			signal: String::new(),
+			signal: signal.to_owned(),
 			wall_clock_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
 			spilled_output: None,
 			aborted,
@@ -3090,6 +3090,33 @@ fn errno_io(error: Errno) -> ExecError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn terminal_receipts_distinguish_exit_failure_timeout_and_kill() {
+		let success = RunTerminal::Exited(0).status(Duration::from_millis(1));
+		assert_eq!(success.outcome, ExecOutcome::Exited as i32);
+		assert_eq!(success.exit_code, Some(0));
+		assert!(success.signal.is_empty());
+		assert!(!success.aborted);
+
+		let failure = RunTerminal::Exited(17).status(Duration::from_millis(2));
+		assert_eq!(failure.outcome, ExecOutcome::Failed as i32);
+		assert_eq!(failure.exit_code, Some(17));
+		assert!(failure.signal.is_empty());
+		assert!(!failure.aborted);
+
+		let timeout = RunTerminal::Timeout.status(Duration::from_millis(3));
+		assert_eq!(timeout.outcome, ExecOutcome::Timeout as i32);
+		assert_eq!(timeout.exit_code, None);
+		assert_eq!(timeout.signal, "SIGKILL");
+		assert!(timeout.aborted);
+
+		let cancelled = RunTerminal::Cancelled.status(Duration::from_millis(4));
+		assert_eq!(cancelled.outcome, ExecOutcome::Cancelled as i32);
+		assert_eq!(cancelled.exit_code, None);
+		assert_eq!(cancelled.signal, "SIGKILL");
+		assert!(cancelled.aborted);
+	}
 
 	async fn run_output(host: &ExecHost, request: ExecRequest) -> Vec<u8> {
 		let (_, run) = host.exec(request, None).await.expect("exec starts");

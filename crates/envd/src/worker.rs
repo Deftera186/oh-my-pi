@@ -25,10 +25,12 @@ use nix::sys::signal;
 #[cfg(unix)]
 use nix::unistd::Pid;
 use notify::{RecursiveMode, Watcher as _};
+use omp_agent::{GateError, HookEvent, HookGate, HookPatch};
 use omp_core::{
 	CowBytes, Duration as CoreDuration, DurationUnit, InvocationPhase, LifecyclePhase, Principal,
 	RestartReason, Str, sf,
 };
+use omp_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt},
 	inference::v1::{ToolDef, Value, ValueMap, tool_def, value},
@@ -39,27 +41,29 @@ use omp_proto::{
 		v1::{
 			ActivateExtension, ActivateReason as WireActivateReason,
 			ActivationCliValue as WireActivationCliValue, AdmitExtensions, AdmittedExtension,
-			ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CancelTool, ExtensionActivated,
-			ExtensionDecl, FreezeDeclarations, HostFrame, InvokeTool, JournalHostEnvelope,
-			LifecycleHostEnvelope, OutcomeKind, Ping, Pong, PreludeParam, PreludeParamKind,
-			PrincipalRef, ProtocolError, ProtocolErrorCode, PullReply, PullRequest, QuotaDrop,
-			QuotaStatus, RegimeApply, RegimeControl, RegimeControlKind, RegimeDraft, RegimeEffect,
-			RegimeEffectKind, RegimeHostEnvelope, RegimeStart, RegimeStop, RegimeWorkerEnvelope,
-			RegisterTools, ResourceUpdate, RestartReason as WireRestartReason,
+			ArgIssue, ArgumentHostEnvelope, ArgumentWorkerEnvelope, CancelTool, ContextHostEnvelope,
+			ContextWorkerEnvelope, ExtensionActivated, ExtensionDecl, FreezeDeclarations, HostFrame,
+			InvokeTool, JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping, Pong,
+			PreludeParam, PreludeParamKind, PrincipalRef, PromptContribution, ProtocolError,
+			ProtocolErrorCode, PullReply, PullRequest, QuotaDrop, QuotaStatus, RegimeApply,
+			RegimeControl, RegimeControlKind, RegimeDraft, RegimeEffect, RegimeEffectKind,
+			RegimeHostEnvelope, RegimeStart, RegimeStop, RegimeWorkerEnvelope, RegisterTools,
+			ResourceUpdate, RestartReason as WireRestartReason,
 			ServiceDispatch as WireServiceDispatch, ServiceReply, ServiceResult, ToolAborted,
 			ToolArgs, ToolComplete, ToolDecl, ToolUpdate, UiHostEnvelope, UiWorkerEnvelope,
 			WorkerFrame, WorkerHello, activation_cli_value, argument_host_envelope,
-			argument_worker_envelope, host_frame, lifecycle_host_envelope, lifecycle_worker_envelope,
-			regime_host_envelope, regime_worker_envelope, ui_host_envelope, ui_worker_envelope,
-			worker_frame,
+			argument_worker_envelope, context_host_envelope, context_worker_envelope, host_frame,
+			lifecycle_host_envelope, lifecycle_worker_envelope, regime_host_envelope,
+			regime_worker_envelope, ui_host_envelope, ui_worker_envelope, worker_frame,
 		},
 	},
 	ui::v1::{
-		CommandArgDecl, CommandDecl, CommandDispatchResult, RegisterUi, ShortcutDecl,
-		ShortcutDispatchResult, UiDispatchResult, UiError, command_dispatch_result, ui_dispatch,
-		ui_dispatch_result,
+		CommandArgDecl, CommandDecl, CommandDispatchResult, CompletionCandidate, RegisterUi,
+		ShortcutDecl, ShortcutDispatchResult, TriggerDecl, UiDispatchResult, UiError,
+		command_dispatch_result, ui_dispatch, ui_dispatch_result,
 	},
 };
+use omp_tool::{Rev, ToolIdentity};
 use omp_tools::read::resolver::SchemeSnapshot;
 use parking_lot::{Mutex, RwLock};
 use pyo3::{
@@ -92,7 +96,7 @@ use crate::{
 		GenerationFence, HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError,
 		ServiceBroker, ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta,
 		ServiceResponse, SpawnSpec, SpawnedHost, ToolDeclarationKey, VerifiedMarkdownTransformer,
-		VerifiedUiRoster,
+		VerifiedRendererDeclaration, VerifiedUiRoster,
 		control::{
 			ActivationCliValue, ContributedValueDelivery, ControlAuthoritySnapshot,
 			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlHandle,
@@ -100,7 +104,13 @@ use crate::{
 			ExternalJournalRequest, JournalConnectionIdentity, JournalControl, JournalDispatch,
 			journal_rows,
 		},
-		dispatch::{CallbackDispatcher, REGIME_SUBMISSION_TIMEOUT, UiCallbackDispatch},
+		dispatch::{
+			CallbackDispatcher, PROMPT_CONTEXT_PROP, PROMPT_KEY_PROP, PROMPT_OWNER_PROP,
+			PromptContributionProvider, PromptContributionRecord, PromptDispatchError,
+			PromptPullContext, PromptSlotBinding, REGIME_SUBMISSION_TIMEOUT, UiCallbackDispatch,
+			decode_prompt_contribution, prompt_prop, prompt_pull_frame, prompt_slot_binding,
+		},
+		notify_extension_load, notify_extension_unload, notify_host_reconnect,
 		services::{
 			ServiceControlAuthorityFactory, ServiceDispatch, ServiceDispatchBackend,
 			ServiceMethodSchema, ServiceProviderDeclaration,
@@ -480,11 +490,11 @@ pub struct ExtHostConfig {
 	pub python_rev:         Str,
 	/// Maximum accepted encoded frame size.
 	pub max_frame_bytes:    NonZeroUsize,
-	/// Time allowed for hello, registration, ping, and individual frame reads.
+	/// Time allowed for steady-state pings and individual frame reads.
 	pub health_timeout:     Duration,
-	/// Time allowed for a cold worker to produce its hello and registration
-	/// frames; spawn covers process exec plus embedded-interpreter boot, so it
-	/// tolerates load the steady-state health deadline must not.
+	/// Time allowed for a cold worker to complete hello, registration, and
+	/// activation; spawn covers process exec plus embedded-interpreter boot, so
+	/// it tolerates load the steady-state health deadline must not.
 	pub spawn_timeout:      Duration,
 	/// Idle interval between worker health probes.
 	pub ping_interval:      Duration,
@@ -687,6 +697,8 @@ pub struct WorkerCompletion {
 	pub args_issue:   Option<ArgIssue>,
 	/// Whether model-facing parts may be compacted.
 	pub useless:      bool,
+	/// Whether this result opts in to suppressing the automatic model follow-up.
+	pub terminate:    bool,
 }
 
 /// One ordered event from a committed Python invocation.
@@ -900,9 +912,11 @@ impl Drop for WorkerInvocation {
 #[derive(Clone, Debug)]
 pub struct OwnedToolDecl {
 	/// Owning extension host.
-	pub owner:       HostKey,
+	pub owner:        HostKey,
 	/// Worker declaration.
-	pub declaration: ToolDecl,
+	pub declaration:  ToolDecl,
+	/// Whether the authenticated deployment grant covers this named hard slot.
+	pub hard_granted: bool,
 }
 
 struct AgentsControlBinding {
@@ -1144,18 +1158,27 @@ fn control_manifest_snapshot(spec: &ExtHostSpec) -> Result<Str, WorkerError> {
 		.requires()
 		.map(|service| serde_json::json!([service.name.as_str(), service.rev]))
 		.collect::<Vec<_>>();
-	let static_declarations = spec.manifest.static_declarations();
-	serde_json::to_string(&serde_json::json!({
+	let mut snapshot = serde_json::json!({
 		"extension": spec.key.extension().as_str(),
 		"tools": tools,
 		"hooks": hooks,
 		"capabilities": spec.data_grants.iter().collect::<Vec<_>>(),
 		"services": services,
 		"requires": requires,
-		"declarations": &static_declarations.ordered,
-	}))
-	.map(Str::from)
-	.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))
+		"trust_runtime_declarations": spec.manifest.runtime_declarations_trusted(),
+	});
+	if spec.manifest.has_uniform_declarations() {
+		snapshot
+			.as_object_mut()
+			.expect("manifest snapshot is an object")
+			.insert(
+				"declarations".into(),
+				serde_json::json!(&spec.manifest.static_declarations().ordered),
+			);
+	}
+	serde_json::to_string(&snapshot)
+		.map(Str::from)
+		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))
 }
 
 fn control_connection_identity(
@@ -1206,6 +1229,7 @@ struct PendingControlActivation {
 	host_factory:       Arc<HostControlAuthorityFactory>,
 	agents_factory:     Arc<dyn ControlAuthorityFactory>,
 	registry_control:   Option<Arc<RegistryControlFactory>>,
+	lifecycle_gate:     Option<Arc<HookGate>>,
 	registered_ui:      Arc<RwLock<Option<RegisterUi>>>,
 	settings:           serde_json::Map<String, serde_json::Value>,
 }
@@ -1381,6 +1405,8 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 pub struct ExtHostSupervisor {
 	routes:               BTreeMap<(Str, Str), HostRoute>,
 	registrations:        Arc<[OwnedToolDecl]>,
+	prompt_registrations: Arc<[PromptSlotBinding]>,
+	prompt_routes:        BTreeMap<Str, PromptRoute>,
 	next_invocation:      AtomicU64,
 	actors:               Vec<HostActor>,
 	data_authority:       Option<Arc<AuthorityTable>>,
@@ -1397,6 +1423,8 @@ pub struct ExtHostSupervisor {
 	control_activations:  Vec<PendingControlActivation>,
 	live_controls:        BTreeMap<HostKey, Arc<LiveControlRoute>>,
 	watchers:             Vec<LinkWatcher>,
+	lifecycle_gate:       Option<Arc<HookGate>>,
+	lifecycle_manifests:  Arc<[ExtensionManifest]>,
 }
 impl ExtHostSupervisor {
 	/// Starts and verifies every configured active extension.
@@ -1411,6 +1439,19 @@ impl ExtHostSupervisor {
 		let control_authorities = config.control_authorities.clone();
 		let registry_control = config.registry_control.clone();
 		let hook_control = config.hook_control.clone();
+		let lifecycle_gate = hook_control.as_ref().map(|hooks| hooks.admission_gate());
+		let lifecycle_manifests = config
+			.extensions
+			.iter()
+			.filter(|extension| {
+				extension
+					.manifest
+					.activation_triggers
+					.iter()
+					.any(|trigger| trigger.requires_host())
+			})
+			.map(|extension| extension.manifest.clone())
+			.collect::<Arc<[_]>>();
 		let domain_control = Arc::clone(&config.domain_control);
 		let agents_control = Arc::new(AgentsControlSlot {
 			session_generation: config.session_generation,
@@ -1430,17 +1471,17 @@ impl ExtHostSupervisor {
 				continue;
 			};
 			let static_declarations = extension.manifest.static_declarations();
-			let control_declared =
-				static_declarations.ordered.iter().any(|declaration| {
+			let control_declared = extension.manifest.runtime_declarations_trusted()
+				|| static_declarations.ordered.iter().any(|declaration| {
 					!matches!(declaration.kind.as_str(), "soft" | "hard" | "prelude")
 				}) || !static_declarations.capability_grants.is_empty()
-					|| extension.manifest.declarations.hooks().next().is_some()
-					|| extension.manifest.services.provides().next().is_some()
-					|| extension.manifest.services.requires().next().is_some()
-					|| extension
-						.manifest
-						.declarations
-						.permits(EscapeCapability::DirectFilesystem);
+				|| extension.manifest.declarations.hooks().next().is_some()
+				|| extension.manifest.services.provides().next().is_some()
+				|| extension.manifest.services.requires().next().is_some()
+				|| extension
+					.manifest
+					.declarations
+					.permits(EscapeCapability::DirectFilesystem);
 			if !control_declared {
 				continue;
 			}
@@ -1488,19 +1529,34 @@ impl ExtHostSupervisor {
 				.start_control((*identity).clone(), authority, &ControlAuthoritySnapshot::default())
 				.await
 				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
-			if extension.manifest.declarations.hooks().next().is_some()
+			if (extension.manifest.runtime_declarations_trusted()
+				|| extension.manifest.declarations.hooks().next().is_some())
 				&& let Some(hooks) = &hook_control
 			{
 				let registry = registry_control.as_ref().ok_or_else(|| {
 					WorkerError::Protocol(sf!("hook CONTROL owner requires registry CONTROL owner"))
 				})?;
-				let evidence = registry.evidence(&identity).ok_or_else(|| {
-					WorkerError::Protocol(sf!("CONTROL handshake omitted sealed hook registry evidence"))
-				})?;
+				let evidence = time::timeout(config.spawn_timeout, registry.wait_evidence(&identity))
+					.await
+					.map_err(|_| {
+						// Blind timeouts are undiagnosable; carry the child's captured
+						// output tail as evidence.
+						let mut tail = Vec::new();
+						while let Ok(log) = running.logs().try_recv() {
+							tail.extend_from_slice(&log.bytes);
+						}
+						let start = tail.len().saturating_sub(800);
+						WorkerError::Protocol(Str::from(format!(
+							"CONTROL handshake timed out before sealed hook registry evidence; host \
+							 output tail: {}",
+							String::from_utf8_lossy(&tail[start..]).trim()
+						)))
+					})?;
 				for hook in evidence.hooks.iter() {
 					hooks
 						.subscribe(HookSubscription {
 							identity:     Arc::clone(&identity),
+							session:      config.session_id.clone(),
 							event:        hook.event.clone(),
 							phase:        hook.phase.clone(),
 							name:         hook.name.clone(),
@@ -1536,6 +1592,7 @@ impl ExtHostSupervisor {
 				host_factory: Arc::clone(factory),
 				agents_factory: Arc::clone(&agents),
 				registry_control: registry_control.clone(),
+				lifecycle_gate: hook_control.as_ref().map(|hooks| hooks.admission_gate()),
 				registered_ui: Arc::new(RwLock::new(None)),
 				settings: extension.settings.clone(),
 			};
@@ -1651,8 +1708,22 @@ impl ExtHostSupervisor {
 			});
 		}
 		let mut registrations = Vec::new();
+		let mut prompt_registrations = Vec::new();
+		let mut prompt_processes = BTreeMap::<Str, ProcessKey>::new();
 		let mut registration_error = None;
 		'registration: for (process_config, process) in &prepared {
+			for binding in &process.prompt_registrations {
+				if let Some(existing) =
+					prompt_processes.insert(binding.owner.clone(), process_config.process_id.clone())
+					&& existing != process_config.process_id
+				{
+					registration_error = Some(WorkerError::Protocol(sf!(
+						"one extension registered prompt slots from multiple worker processes",
+					)));
+					break 'registration;
+				}
+				prompt_registrations.push(binding.clone());
+			}
 			for declaration in &process.registrations {
 				let owner = match process_config.owner_for(declaration) {
 					Ok(owner) => owner,
@@ -1694,7 +1765,12 @@ impl ExtHostSupervisor {
 					)));
 					break 'registration;
 				}
-				registrations.push(OwnedToolDecl { owner, declaration: declaration.clone() });
+				let hard_granted = process_config.hard_tool_granted(&owner, definition.name.as_str());
+				registrations.push(OwnedToolDecl {
+					owner,
+					declaration: declaration.clone(),
+					hard_granted,
+				});
 			}
 		}
 		if let Some(error) = registration_error {
@@ -1711,6 +1787,8 @@ impl ExtHostSupervisor {
 			let session_generation = process_config.session_generation;
 			let host_generation = Arc::new(AtomicU64::new(1));
 			let expected_registrations: Arc<[ToolDecl]> = process.registrations.clone().into();
+			let expected_prompt_registrations: Arc<[PromptSlotBinding]> =
+				process.prompt_registrations.clone().into();
 			let (commands, mailbox) = flume::unbounded();
 			let shutdown = CancellationToken::new();
 			for owner in process_config.manifests.keys() {
@@ -1745,6 +1823,7 @@ impl ExtHostSupervisor {
 				process_config,
 				process,
 				expected_registrations,
+				expected_prompt_registrations,
 				mailbox,
 				host_generation.clone(),
 				1,
@@ -1761,6 +1840,15 @@ impl ExtHostSupervisor {
 			});
 		}
 		actors.extend(control_actors);
+		let prompt_routes = prompt_processes
+			.into_iter()
+			.map(|(owner, process_id)| {
+				let (commands, ..) = senders
+					.get(&process_id)
+					.expect("every prompt renderer has a worker process");
+				(owner, PromptRoute { commands: commands.clone() })
+			})
+			.collect();
 		let mut watchers = Vec::new();
 		for extension in &config.extensions {
 			let Some(root) = extension.watch_root.as_ref() else {
@@ -1774,9 +1862,12 @@ impl ExtHostSupervisor {
 			else {
 				continue;
 			};
-			if let Some(watcher) =
-				spawn_link_watcher(root, extension.key.extension().clone(), commands)
-			{
+			if let Some(watcher) = spawn_link_watcher(
+				root,
+				extension.key.extension().clone(),
+				commands,
+				lifecycle_gate.clone(),
+			) {
 				watchers.push(watcher);
 			}
 		}
@@ -1800,6 +1891,8 @@ impl ExtHostSupervisor {
 		Ok(Self {
 			routes,
 			registrations: registrations.into(),
+			prompt_registrations: prompt_registrations.into(),
+			prompt_routes,
 			next_invocation: AtomicU64::new(1),
 			actors,
 			data_authority,
@@ -1816,6 +1909,8 @@ impl ExtHostSupervisor {
 			control_activations,
 			live_controls,
 			watchers,
+			lifecycle_gate,
+			lifecycle_manifests,
 		})
 	}
 
@@ -1833,6 +1928,11 @@ impl ExtHostSupervisor {
 				Arc::clone(&self.frozen_registry),
 			)
 			.await?;
+		}
+		if let Some(gate) = self.lifecycle_gate.as_deref() {
+			for manifest in self.lifecycle_manifests.iter() {
+				notify_extension_load(gate, &manifest.provenance, false);
+			}
 		}
 		Ok(())
 	}
@@ -2076,10 +2176,38 @@ impl ExtHostSupervisor {
 				]),
 				UiDispatchKind::Shortcut,
 			),
+			Some(ui_dispatch::Kind::Completion(completion)) => {
+				let (operation, arguments) = if let Some(command) = completion.command {
+					(
+						sf!("omp.ui.command_completion"),
+						serde_json::Map::from_iter([
+							("name".to_owned(), serde_json::Value::String(command)),
+							(
+								"query".to_owned(),
+								serde_json::json!({
+									"prefix": completion.text,
+									"argv": completion.argv,
+								}),
+							),
+							("ctx".to_owned(), serde_json::json!({})),
+						]),
+					)
+				} else {
+					(
+						sf!("omp.ui.completion"),
+						serde_json::Map::from_iter([
+							("trigger".to_owned(), serde_json::Value::String(completion.trigger)),
+							("query".to_owned(), serde_json::Value::String(completion.text)),
+							("ctx".to_owned(), serde_json::json!({})),
+						]),
+					)
+				};
+				(operation, arguments, UiDispatchKind::Completion)
+			},
 			_ => {
 				return Err(ControlProtocolError::new(
 					"InvalidUiDispatch",
-					"typed UI callback route accepts only commands and shortcuts",
+					"typed UI callback route accepts only commands, shortcuts, and completions",
 				));
 			},
 		};
@@ -2092,27 +2220,31 @@ impl ExtHostSupervisor {
 				deadline: request.deadline,
 			})
 			.await;
-		let result = match result {
+		let (result, candidates) = match result {
 			Ok(value) => match kind {
-				UiDispatchKind::Command => {
-					ui_dispatch_result::Result::Command(ui_command_dispatch_result(value))
-				},
+				UiDispatchKind::Command => (
+					Some(ui_dispatch_result::Result::Command(ui_command_dispatch_result(value))),
+					Vec::new(),
+				),
 				UiDispatchKind::Shortcut => {
-					ui_dispatch_result::Result::Shortcut(ShortcutDispatchResult {})
+					(Some(ui_dispatch_result::Result::Shortcut(ShortcutDispatchResult {})), Vec::new())
 				},
+				UiDispatchKind::Completion => (None, ui_completion_candidates(value)),
 			},
-			Err(ExtensionCallbackError::Runtime(ControlRuntimeError::Remote(error))) => {
-				ui_dispatch_result::Result::Error(UiError {
+			Err(ExtensionCallbackError::Runtime(ControlRuntimeError::Remote(error))) => (
+				Some(ui_dispatch_result::Result::Error(UiError {
 					code: error.code.to_string(),
 					message: error.message.to_string(),
 					..Default::default()
-				})
-			},
+				})),
+				Vec::new(),
+			),
 			Err(error) => return Err(extension_callback_protocol_error(error)),
 		};
 		let payload = UiWorkerEnvelope {
 			body:  Some(ui_worker_envelope::Body::DispatchResult(UiDispatchResult {
-				result: Some(result),
+				result,
+				candidates,
 				generation: owner.generation,
 				declaration_id: owner.declaration_id.to_string(),
 				..Default::default()
@@ -2318,6 +2450,40 @@ impl ExtHostSupervisor {
 enum UiDispatchKind {
 	Command,
 	Shortcut,
+	Completion,
+}
+
+fn ui_completion_candidates(value: serde_json::Value) -> Vec<CompletionCandidate> {
+	let Some(items) = value.as_array() else {
+		return Vec::new();
+	};
+	items
+		.iter()
+		.take(100)
+		.filter_map(|item| {
+			let item = item.as_object()?;
+			let value = item.get("insert")?.as_str()?.to_owned();
+			let optional = |name| {
+				item
+					.get(name)
+					.and_then(serde_json::Value::as_str)
+					.map(str::to_owned)
+			};
+			Some(CompletionCandidate {
+				value,
+				display: optional("label"),
+				description: optional("desc"),
+				hint: optional("hint"),
+				group: optional("group"),
+				icon: optional("icon"),
+				sort: item
+					.get("sort")
+					.and_then(serde_json::Value::as_i64)
+					.unwrap_or_default()
+					.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+			})
+		})
+		.collect()
 }
 
 fn ui_command_dispatch_result(value: serde_json::Value) -> CommandDispatchResult {
@@ -2472,6 +2638,46 @@ impl CallbackDispatcher for ExtHostSupervisor {
 	}
 }
 
+#[async_trait::async_trait]
+impl PromptContributionProvider for ExtHostSupervisor {
+	fn declarations(&self) -> Vec<PromptSlotBinding> {
+		self.prompt_registrations.to_vec()
+	}
+
+	async fn pull(
+		&self,
+		binding: &PromptSlotBinding,
+		context: &PromptPullContext,
+	) -> Result<PromptContributionRecord, PromptDispatchError> {
+		let route = self
+			.prompt_routes
+			.get(&binding.owner)
+			.ok_or(PromptDispatchError::Undeclared)?;
+		let request_id = self.next_invocation.fetch_add(1, Ordering::Relaxed).max(1);
+		let (reply, response) = flume::bounded(1);
+		route
+			.commands
+			.send_async(SupervisorCommand::PromptPull {
+				request_id,
+				binding: binding.clone(),
+				context: context.clone(),
+				reply,
+			})
+			.await
+			.map_err(|_| PromptDispatchError::Worker(WorkerError::Unavailable))?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| PromptDispatchError::Worker(WorkerError::Unavailable))?
+			.map_err(PromptDispatchError::Worker)
+	}
+}
+
+#[derive(Clone)]
+struct PromptRoute {
+	commands: flume::Sender<SupervisorCommand>,
+}
+
 #[derive(Clone)]
 struct HostRoute {
 	commands:           flume::Sender<SupervisorCommand>,
@@ -2485,6 +2691,24 @@ struct HostRoute {
 struct LinkWatcher {
 	shutdown: CancellationToken,
 	actor:    JoinHandle<()>,
+}
+
+struct ResourcesChangedEvent;
+
+impl HookEvent for ResourcesChangedEvent {
+	type Return = ();
+
+	const ID: v1::HookEventId = v1::HookEventId::HookEventResourcesChanged;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(b"\n");
+		out.extend_from_slice(br#"{"added":[],"removed":[],"reason":"extension_changed"}"#);
+	}
+
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+		Ok(())
+	}
 }
 
 async fn reload_host(commands: &flume::Sender<SupervisorCommand>) -> Result<u64, WorkerError> {
@@ -2503,6 +2727,7 @@ fn spawn_link_watcher(
 	root: &Path,
 	extension: Str,
 	commands: flume::Sender<SupervisorCommand>,
+	hook_gate: Option<Arc<HookGate>>,
 ) -> Option<LinkWatcher> {
 	let (events, changes) = flume::unbounded();
 	let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -2527,7 +2752,14 @@ fn spawn_link_watcher(
 					while changes.try_recv().is_ok() {}
 					loop {
 						match reload_host(&commands).await {
-							Ok(_) => break,
+							Ok(_) => {
+								if let Some(gate) = hook_gate.as_deref()
+									&& gate.subscribed(v1::HookEventId::HookEventResourcesChanged)
+								{
+									gate.notify(&ResourcesChangedEvent);
+								}
+								break;
+							},
 							Err(WorkerError::Unavailable) => {
 								tokio::select! {
 									() = task_shutdown.cancelled() => return,
@@ -2700,6 +2932,12 @@ enum SupervisorCommand {
 		frame:      WireServiceDispatch,
 		reply:      flume::Sender<Result<ServiceResult, WorkerError>>,
 	},
+	PromptPull {
+		request_id: u64,
+		binding:    PromptSlotBinding,
+		context:    PromptPullContext,
+		reply:      flume::Sender<Result<PromptContributionRecord, WorkerError>>,
+	},
 	Cancel {
 		id:     u64,
 		reason: Str,
@@ -2789,6 +3027,7 @@ struct ProcessConfig {
 	resources:            Arc<Mutex<ControlQuotaLedger>>,
 	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
 	availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
+	lifecycle_gate:       Option<Arc<HookGate>>,
 }
 
 impl ProcessConfig {
@@ -2913,6 +3152,10 @@ impl ProcessConfig {
 			resources,
 			availability_sink: Arc::clone(&root.availability_sink),
 			availability_pending,
+			lifecycle_gate: root
+				.hook_control
+				.as_ref()
+				.map(|hooks| hooks.admission_gate()),
 		})
 	}
 
@@ -2927,6 +3170,44 @@ impl ProcessConfig {
 					"worker registered a declaration for an unconfigured extension",
 				))
 			})
+	}
+
+	fn hard_tool_granted(&self, owner: &HostKey, name: &str) -> bool {
+		let Some(manifest) = self.manifests.get(owner) else {
+			return false;
+		};
+		if manifest.runtime_declarations_trusted() {
+			return true;
+		}
+		let declarations = manifest.static_declarations();
+		let declared = declarations.tools.iter().any(|row| {
+			row.kind == "hard"
+				&& (row.key == name
+					|| row
+						.key
+						.split_once('@')
+						.is_some_and(|(tool, _)| tool == name)
+					|| row.id == name)
+		});
+		if !declared {
+			return false;
+		}
+		// `native` is an exact invocation root selected directly by the operator.
+		if owner.layer() == "native" {
+			return true;
+		}
+		let grants = declarations
+			.capability_grants
+			.get("tools.hard")
+			.or_else(|| {
+				declarations
+					.capability_grants
+					.get("tools")
+					.and_then(|tools| tools.get("hard"))
+			});
+		grants
+			.and_then(serde_json::Value::as_array)
+			.is_some_and(|names| names.iter().any(|granted| granted.as_str() == Some(name)))
 	}
 }
 
@@ -2959,6 +3240,7 @@ struct WorkerProcess {
 	read_scratch:          BytesMut,
 	write_scratch:         BytesMut,
 	registrations:         Vec<ToolDecl>,
+	prompt_registrations:  Vec<PromptSlotBinding>,
 	ui_registrations:      BTreeMap<HostKey, RegisterUi>,
 	service_registrations: BTreeMap<HostKey, Box<[ServiceProviderDeclaration]>>,
 }
@@ -2973,6 +3255,64 @@ struct RegisteredMarkdownTransformer {
 	name:    String,
 	value:   RegisteredCallback,
 	trigger: String,
+}
+#[derive(Deserialize)]
+struct RegisteredRendererValue {
+	function:  RegisteredCallback,
+	#[serde(default)]
+	reduce:    Option<RegisteredCallback>,
+	#[serde(default)]
+	decorates: bool,
+}
+
+#[derive(Deserialize)]
+struct RegisteredRenderer {
+	kind:    String,
+	name:    (String, String, u16),
+	value:   RegisteredRendererValue,
+	trigger: String,
+}
+
+#[derive(Deserialize)]
+struct RegisteredCompletion {
+	kind:     String,
+	name:     String,
+	value:    RegisteredCallback,
+	metadata: RegisteredCompletionTrigger,
+	trigger:  String,
+}
+
+#[derive(Deserialize)]
+struct RegisteredCompletionTrigger {
+	prefix:         String,
+	#[serde(default)]
+	at_line_start:  bool,
+	#[serde(default)]
+	min_chars:      u32,
+	#[serde(default = "default_completion_debounce")]
+	debounce:       serde_json::Value,
+	#[serde(default = "default_completion_max_results")]
+	max_results:    u32,
+	#[serde(default = "default_completion_cache")]
+	cache:          serde_json::Value,
+	#[serde(default = "default_completion_refine_locally")]
+	refine_locally: bool,
+}
+
+fn default_completion_debounce() -> serde_json::Value {
+	serde_json::Value::String("90ms".to_owned())
+}
+
+const fn default_completion_max_results() -> u32 {
+	20
+}
+
+fn default_completion_cache() -> serde_json::Value {
+	serde_json::Value::String("2s".to_owned())
+}
+
+const fn default_completion_refine_locally() -> bool {
+	true
 }
 
 #[derive(Deserialize)]
@@ -3092,7 +3432,11 @@ struct RegisteredRegistrySnapshot {
 	#[serde(default)]
 	shortcuts:             Vec<RegisteredShortcut>,
 	#[serde(default)]
+	completions:           Vec<RegisteredCompletion>,
+	#[serde(default)]
 	markdown_transformers: Vec<RegisteredMarkdownTransformer>,
+	#[serde(default)]
+	verdict_renderers:     Vec<RegisteredRenderer>,
 	#[serde(default)]
 	providers:             Vec<serde_json::Value>,
 	#[serde(default)]
@@ -4339,7 +4683,9 @@ pub fn seal_registry_evidence(
 		.iter()
 		.map(|hook| (hook.event.as_str(), hook.phase.to_string()))
 		.collect::<BTreeSet<_>>();
-	if manifest_tools != runtime_tools || manifest_hooks != runtime_hooks {
+	if !manifest.runtime_declarations_trusted()
+		&& (manifest_tools != runtime_tools || manifest_hooks != runtime_hooks)
+	{
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	let mut runtime_skills = BTreeMap::new();
@@ -4361,7 +4707,7 @@ pub fn seal_registry_evidence(
 		})
 		.map(|row| (row.path.clone().expect("filtered skill row has a path"), row.metadata.clone()))
 		.collect::<BTreeMap<_, _>>();
-	if manifest_skills != runtime_skills {
+	if !manifest.runtime_declarations_trusted() && manifest_skills != runtime_skills {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	let declared_provider_ids = manifest
@@ -4378,7 +4724,10 @@ pub fn seal_registry_evidence(
 		.collect::<BTreeSet<_>>();
 	let runtime_provider_ids = sealed_document_ids(&snapshot.providers)?;
 	let runtime_regime_ids = sealed_document_ids(&snapshot.regimes)?;
-	if declared_provider_ids != runtime_provider_ids || declared_regime_ids != runtime_regime_ids {
+	if !manifest.runtime_declarations_trusted()
+		&& (declared_provider_ids != runtime_provider_ids
+			|| declared_regime_ids != runtime_regime_ids)
+	{
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	let modules = iter::once(manifest.entry.as_str())
@@ -4401,7 +4750,7 @@ pub fn seal_registry_evidence(
 			})
 			.and_then(|row| row.filter.as_ref())
 		else {
-			if hook.event == "mcp_notification" {
+			if !manifest.runtime_declarations_trusted() && hook.event == "mcp_notification" {
 				return Err(SealedRegistryEvidenceError::ManifestDrift);
 			}
 			continue;
@@ -4415,7 +4764,9 @@ pub fn seal_registry_evidence(
 		identity,
 		snapshot.commands,
 		snapshot.shortcuts,
+		snapshot.completions,
 		snapshot.markdown_transformers,
+		snapshot.verdict_renderers,
 	)?;
 	Ok(SealedRegistryEvidence {
 		identity: Arc::clone(identity),
@@ -4460,7 +4811,9 @@ fn seal_registered_ui(
 	identity: &ControlConnectionIdentity,
 	commands: Vec<RegisteredCommand>,
 	shortcuts: Vec<RegisteredShortcut>,
+	completions: Vec<RegisteredCompletion>,
 	markdown_transformers: Vec<RegisteredMarkdownTransformer>,
+	renderers: Vec<RegisteredRenderer>,
 ) -> Result<VerifiedUiRoster, SealedRegistryEvidenceError> {
 	let mut register = RegisterUi {
 		generation: identity.host_generation,
@@ -4502,6 +4855,10 @@ fn seal_registered_ui(
 		});
 	}
 	register.shortcuts = seal_registered_shortcuts(manifest, shortcuts)?;
+	register.triggers = completions
+		.into_iter()
+		.map(|completion| seal_registered_completion(manifest, completion))
+		.collect::<Result<Vec<_>, _>>()?;
 	let mut verified = verify_ui_registration(manifest.static_declarations(), register)?;
 	verified.markdown_transformers = markdown_transformers
 		.into_iter()
@@ -4531,8 +4888,157 @@ fn seal_registered_ui(
 		})
 		.collect::<Result<Vec<_>, _>>()?
 		.into_boxed_slice();
+	let mut renderer_keys = BTreeSet::new();
+	verified.renderers = renderers
+		.into_iter()
+		.map(|renderer| {
+			if !renderer_keys.insert(renderer.name.clone()) {
+				return Err(SealedRegistryEvidenceError::Duplicate);
+			}
+			seal_registered_renderer(manifest, renderer)
+		})
+		.collect::<Result<Vec<_>, _>>()?
+		.into_boxed_slice();
+	let expected_renderers = manifest
+		.static_declarations()
+		.ui
+		.verdict_renderers
+		.iter()
+		.map(|row| row.id.as_str())
+		.collect::<BTreeSet<_>>();
+	let published_renderers = verified
+		.renderers
+		.iter()
+		.map(|renderer| renderer.declaration_id.as_str())
+		.collect::<BTreeSet<_>>();
+	if expected_renderers != published_renderers {
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
 	Ok(verified)
 }
+
+fn seal_registered_renderer(
+	manifest: &ExtensionManifest,
+	renderer: RegisteredRenderer,
+) -> Result<VerifiedRendererDeclaration, SealedRegistryEvidenceError> {
+	if renderer.kind != "verdict_renderer" || renderer.name.0.is_empty() {
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	let (name, family, revision) = renderer.name;
+	let key = if family.is_empty() && revision == 0 {
+		name.clone()
+	} else {
+		format!("{name}@{family}.{revision}")
+	};
+	let row = manifest
+		.static_declarations()
+		.ui
+		.verdict_renderers
+		.iter()
+		.find(|row| row.key.as_str() == key)
+		.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+	let callback = renderer.value.function.callable;
+	let module = manifest_module_for_callback(manifest, callback.as_str())?;
+	if row.module.as_str() != module
+		|| (!row.trigger.is_empty() && row.trigger.as_str() != renderer.trigger)
+	{
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	let reduce = renderer
+		.value
+		.reduce
+		.map(|reduce| {
+			let callable = Str::new(reduce.callable);
+			manifest_module_for_callback(manifest, callable.as_str()).map(|_| callable)
+		})
+		.transpose()?;
+	Ok(VerifiedRendererDeclaration {
+		declaration_id: row.id.clone(),
+		identity: ToolIdentity {
+			name: Str::new(name),
+			rev:  Rev { family: Str::new(family), n: revision },
+		},
+		callback: Str::new(callback),
+		reduce,
+		decorates: renderer.value.decorates,
+		module: row.module.clone(),
+	})
+}
+fn seal_registered_completion(
+	manifest: &ExtensionManifest,
+	completion: RegisteredCompletion,
+) -> Result<TriggerDecl, SealedRegistryEvidenceError> {
+	if completion.kind != "completion"
+		|| completion.name.is_empty()
+		|| completion.metadata.prefix != completion.name
+		|| completion.metadata.max_results == 0
+	{
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	let row = manifest
+		.static_declarations()
+		.ui
+		.completions
+		.iter()
+		.find(|row| row.key.as_str() == completion.name)
+		.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+	let module = manifest_module_for_callback(manifest, completion.value.callable.as_str())?;
+	if row.module.as_str() != module
+		|| (!row.trigger.is_empty() && row.trigger.as_str() != completion.trigger)
+	{
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	Ok(TriggerDecl {
+		prefix:             completion.name,
+		kind:               "completion".to_owned(),
+		at_line_start:      completion.metadata.at_line_start,
+		min_chars:          completion.metadata.min_chars,
+		debounce_ms:        completion_duration_millis(&completion.metadata.debounce)?,
+		max_results:        completion.metadata.max_results.min(100),
+		cache_ms:           completion_duration_millis(&completion.metadata.cache)?,
+		refine_locally:     completion.metadata.refine_locally,
+		declaration_id:     row.id.to_string(),
+		callback:           completion.value.callable,
+		module:             module.to_owned(),
+		activation_trigger: if completion.trigger.is_empty() {
+			row.trigger.to_string()
+		} else {
+			completion.trigger
+		},
+		props:              None,
+	})
+}
+
+fn completion_duration_millis(
+	value: &serde_json::Value,
+) -> Result<u64, SealedRegistryEvidenceError> {
+	if let Some(milliseconds) = value.as_u64() {
+		return Ok(milliseconds);
+	}
+	let text = value
+		.as_str()
+		.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+	let (number, multiplier) = if let Some(number) = text.strip_suffix("ms") {
+		(number, 1.0)
+	} else if let Some(number) = text.strip_suffix('s') {
+		(number, 1_000.0)
+	} else if let Some(number) = text.strip_suffix('m') {
+		(number, 60_000.0)
+	} else if let Some(number) = text.strip_suffix('h') {
+		(number, 3_600_000.0)
+	} else {
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	};
+	let milliseconds = number
+		.parse::<f64>()
+		.map_err(|_| SealedRegistryEvidenceError::ManifestDrift)?
+		* multiplier;
+	if !milliseconds.is_finite() || milliseconds < 0.0 || milliseconds > u64::MAX as f64 {
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	Ok(milliseconds.round() as u64)
+}
+
 fn seal_registered_shortcuts(
 	manifest: &ExtensionManifest,
 	shortcuts: Vec<RegisteredShortcut>,
@@ -4805,6 +5311,15 @@ impl WorkerProcess {
 			.into_iter()
 			.map(|(name, rev)| serde_json::json!([name.as_str(), rev]))
 			.collect::<Vec<_>>();
+		let has_uniform_declarations = config
+			.manifests
+			.values()
+			.any(|manifest| manifest.has_uniform_declarations());
+		let trust_runtime_declarations = config.manifests.len() == 1
+			&& config
+				.manifests
+				.values()
+				.all(|manifest| manifest.runtime_declarations_trusted());
 		let manifest_declarations = config
 			.manifests
 			.values()
@@ -4830,15 +5345,22 @@ impl WorkerProcess {
 				.extension()
 				.as_str()
 		});
-		let manifest_snapshot = serde_json::to_string(&serde_json::json!({
+		let mut manifest_snapshot = serde_json::json!({
 			"extension": extension,
 			"tools": manifest_tools,
 			"hooks": manifest_hooks,
 			"services": manifest_services,
 			"requires": manifest_requires,
-			"declarations": manifest_declarations,
-		}))
-		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+			"trust_runtime_declarations": trust_runtime_declarations,
+		});
+		if has_uniform_declarations {
+			manifest_snapshot
+				.as_object_mut()
+				.expect("manifest snapshot is an object")
+				.insert("declarations".into(), serde_json::Value::Array(manifest_declarations));
+		}
+		let manifest_snapshot = serde_json::to_string(&manifest_snapshot)
+			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 		command.env("OMP_EXT_MANIFEST_SNAPSHOT", manifest_snapshot);
 		if let Some(socket) = &config.data_socket {
 			command.env(ENV_SOCKET_ENV, socket);
@@ -4907,6 +5429,7 @@ impl WorkerProcess {
 			read_scratch: BytesMut::with_capacity(8 * 1024),
 			write_scratch: BytesMut::with_capacity(8 * 1024),
 			registrations: Vec::new(),
+			prompt_registrations: Vec::new(),
 			ui_registrations: BTreeMap::new(),
 			service_registrations: BTreeMap::new(),
 		};
@@ -4989,8 +5512,8 @@ impl WorkerProcess {
 			tools,
 			generation: registration_generation,
 			extensions,
+			slots,
 			props,
-			..
 		})) = registrations.body
 		else {
 			return Err(WorkerError::Protocol(sf!("RegisterTools must follow WorkerHello",)));
@@ -5014,6 +5537,31 @@ impl WorkerProcess {
 		}
 		validate_registrations(&tools)?;
 		validate_manifest_registrations(config, &tools)?;
+		let mut prompt_keys = HashSet::with_capacity(slots.len());
+		self.prompt_registrations = slots
+			.iter()
+			.map(|declaration| {
+				let owner =
+					prompt_prop(declaration.props.as_ref(), PROMPT_OWNER_PROP).ok_or_else(|| {
+						WorkerError::Protocol(sf!("prompt declaration has no authenticated owner"))
+					})?;
+				if !config
+					.manifests
+					.keys()
+					.any(|key| key.extension().as_str() == owner)
+				{
+					return Err(WorkerError::Protocol(sf!("prompt declaration owner is not admitted",)));
+				}
+				let binding = prompt_slot_binding(owner, declaration)
+					.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+				if !prompt_keys.insert(binding.key.clone()) {
+					return Err(WorkerError::Protocol(sf!(
+						"prompt declaration key is registered more than once",
+					)));
+				}
+				Ok(binding)
+			})
+			.collect::<Result<_, WorkerError>>()?;
 		self.ui_registrations = parse_ui_registrations(config, props.as_ref(), generation)?;
 		self.service_registrations = parse_service_registrations(config, props.as_ref())?;
 		self.registrations = tools;
@@ -5029,7 +5577,11 @@ impl WorkerProcess {
 	) -> Result<(), WorkerError> {
 		let mut request_id = 1_u64;
 		for (owner, manifest) in &config.manifests {
-			let declared = actual_declarations(config, &self.registrations, owner)?;
+			let declared = if manifest.runtime_declarations_trusted() {
+				manifest.declarations.clone()
+			} else {
+				actual_declarations(config, &self.registrations, owner)?
+			};
 			let mut machine = manifest.lifecycle(config.session_started_at, config.session_generation);
 			let register_ui = self
 				.ui_registrations
@@ -5227,7 +5779,7 @@ impl LifecycleHost for WorkerLifecycleAdapter<'_> {
 			loop {
 				let reply = self
 					.process
-					.read_timeout(self.config)
+					.read_deadline(self.config.spawn_timeout, self.config)
 					.await
 					.map_err(|error| Str::from(error.to_string()))?;
 				let Some(worker_frame::Body::Lifecycle(envelope)) = reply.body else {
@@ -5385,6 +5937,24 @@ async fn activate_control_generation(
 			.ui
 			.shortcuts
 			.is_empty()
+		|| !activation
+			.manifest
+			.static_declarations()
+			.ui
+			.completions
+			.is_empty()
+		|| !activation
+			.manifest
+			.static_declarations()
+			.ui
+			.message_renderers
+			.is_empty()
+		|| !activation
+			.manifest
+			.static_declarations()
+			.ui
+			.verdict_renderers
+			.is_empty()
 	{
 		let mut registration = activation.registered_ui.read().clone().ok_or_else(|| {
 			WorkerError::Protocol(sf!("worker handshake omitted sealed UI registry evidence"))
@@ -5498,6 +6068,9 @@ async fn run_control_supervisor(
 		};
 		let Some(command) = command else {
 			if !running.is_disabled() && running.has_exited().unwrap_or(true) {
+				if let Some(gate) = activation.lifecycle_gate.as_deref() {
+					notify_extension_unload(gate, activation.key.extension(), "error", 0);
+				}
 				loop {
 					let authority = match next_control_authority(&activation, &running) {
 						Ok(authority) => authority,
@@ -5512,6 +6085,7 @@ async fn run_control_supervisor(
 					};
 					match restarted {
 						Ok(()) => {
+							let connected_at = Instant::now();
 							advance_control_activation(&mut activation, &running);
 							if wait_control_registry(&activation).await.is_err() {
 								continue;
@@ -5531,6 +6105,16 @@ async fn run_control_supervisor(
 							*live_control.control.write() = running.control();
 							*live_control.identity.write() = Arc::clone(&activation.identity);
 							host_generation.store(running.generation(), Ordering::Release);
+							if let Some(gate) = activation.lifecycle_gate.as_deref() {
+								notify_extension_load(gate, &activation.manifest.provenance, false);
+								notify_host_reconnect(
+									gate,
+									running.generation(),
+									0,
+									RestartReason::Crash,
+									connected_at.elapsed(),
+								);
+							}
 							break;
 						},
 						Err(_) => {
@@ -5608,7 +6192,7 @@ async fn run_control_supervisor(
 					call: Some(invocation.call.invocation_id.clone()),
 					device: Some(invocation.call.name.clone()),
 					effects: Box::new([]),
-					place_kind: sf!("extension"),
+					place_kind: sf!("host"),
 					lifecycle: LifecyclePhase::Active,
 					roots: Box::new([]),
 					remote: false,
@@ -5659,6 +6243,7 @@ async fn run_control_supervisor(
 										details_blob: None,
 										args_issue:   None,
 										useless:      false,
+										terminate:    false,
 									}));
 							},
 							Err(error) => {
@@ -5700,10 +6285,16 @@ async fn run_control_supervisor(
 			SupervisorCommand::ServiceDispatch { reply, .. } => {
 				let _ = reply.send(Err(WorkerError::Unavailable));
 			},
+			SupervisorCommand::PromptPull { reply, .. } => {
+				let _ = reply.send(Err(WorkerError::Unavailable));
+			},
 			SupervisorCommand::Reload { reply } => {
 				if !pending.is_empty() || !in_flight.lock().is_empty() {
 					let _ = reply.send(Err(WorkerError::Unavailable));
 					continue;
+				}
+				if let Some(gate) = activation.lifecycle_gate.as_deref() {
+					notify_extension_unload(gate, activation.key.extension(), "reload", 0);
 				}
 				let result = async {
 					let authority = next_control_authority(&activation, &running)?;
@@ -5711,6 +6302,7 @@ async fn run_control_supervisor(
 						.restart_with_authority(authority)
 						.await
 						.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+					let connected_at = Instant::now();
 					advance_control_activation(&mut activation, &running);
 					wait_control_registry(&activation).await?;
 					activate_control_generation(
@@ -5724,6 +6316,16 @@ async fn run_control_supervisor(
 					*live_control.control.write() = running.control();
 					*live_control.identity.write() = Arc::clone(&activation.identity);
 					host_generation.store(running.generation(), Ordering::Release);
+					if let Some(gate) = activation.lifecycle_gate.as_deref() {
+						notify_extension_load(gate, &activation.manifest.provenance, true);
+						notify_host_reconnect(
+							gate,
+							running.generation(),
+							0,
+							RestartReason::HotReload,
+							connected_at.elapsed(),
+						);
+					}
 					Ok(running.generation())
 				}
 				.await;
@@ -5739,6 +6341,9 @@ async fn run_control_supervisor(
 				}));
 			},
 		}
+	}
+	if let Some(gate) = activation.lifecycle_gate.as_deref() {
+		notify_extension_unload(gate, activation.key.extension(), "shutdown", 0);
 	}
 	for invocation in pending.into_values() {
 		let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
@@ -5757,6 +6362,7 @@ async fn run_supervisor(
 	config: ProcessConfig,
 	mut process: WorkerProcess,
 	expected_registrations: Arc<[ToolDecl]>,
+	expected_prompt_registrations: Arc<[PromptSlotBinding]>,
 	mailbox: Receiver<SupervisorCommand>,
 	host_generation: Arc<AtomicU64>,
 	mut generation: u64,
@@ -5788,10 +6394,12 @@ async fn run_supervisor(
 					if healthy_since.elapsed() >= config.healthy_reset {
 						backoff = initial_backoff(&config);
 					}
+					notify_process_unload(&config, "error");
 					process.terminate(config.interrupt_grace).await;
-					let Some(replacement) = respawn(
+					let Some((replacement, uptime)) = respawn(
 						&config,
 						&expected_registrations,
+						&expected_prompt_registrations,
 						&mut generation,
 						&mut backoff,
 						reason,
@@ -5809,6 +6417,7 @@ async fn run_supervisor(
 					};
 					process = replacement;
 					host_generation.store(generation, Ordering::Release);
+					notify_process_reconnect(&config, generation, reason, uptime);
 					let mut broker = service_router.broker.lock();
 					for owner in config.manifests.keys() {
 						broker.deactivate_provider(owner, "provider process restarted");
@@ -5822,6 +6431,7 @@ async fn run_supervisor(
 					healthy_since = Instant::now();
 				},
 				InvocationAction::Shutdown => {
+					notify_process_unload(&config, "shutdown");
 					process.terminate(config.interrupt_grace).await;
 					return;
 				},
@@ -5831,6 +6441,7 @@ async fn run_supervisor(
 
 		tokio::select! {
 			() = shutdown.cancelled() => {
+				notify_process_unload(&config, "shutdown");
 				process.terminate(config.interrupt_grace).await;
 				abort_queued_invocations(
 					&mut pending,
@@ -5851,6 +6462,23 @@ async fn run_supervisor(
 						interrupt: None,
 						events,
 					});
+				},
+				Ok(SupervisorCommand::PromptPull { request_id, binding, context, reply }) => {
+					let result = async {
+						let frame = prompt_pull_frame(request_id, &binding, &context)
+							.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+						process.write(&frame, &config).await?;
+						let response = process.read_timeout(&config).await?;
+						if response.request_id != request_id {
+							return Err(WorkerError::Protocol(sf!(
+								"prompt contribution correlation is stale",
+							)));
+						}
+						decode_prompt_contribution(response, &binding)
+							.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))
+					}
+					.await;
+					let _ = reply.send(result);
 				},
 				Ok(SupervisorCommand::ServiceDispatch { request_id, frame, reply }) => {
 					let result = async {
@@ -5891,10 +6519,12 @@ async fn run_supervisor(
 					let _ = reply.send(result);
 				},
 				Ok(SupervisorCommand::Reload { reply }) => {
+					notify_process_unload(&config, "reload");
 					process.terminate(config.interrupt_grace).await;
-					let Some(replacement) = respawn(
+					let Some((replacement, uptime)) = respawn(
 						&config,
 						&expected_registrations,
+						&expected_prompt_registrations,
 						&mut generation,
 						&mut backoff,
 						RestartReason::HotReload,
@@ -5913,6 +6543,12 @@ async fn run_supervisor(
 					};
 					process = replacement;
 					host_generation.store(generation, Ordering::Release);
+					notify_process_reconnect(
+						&config,
+						generation,
+						RestartReason::HotReload,
+						uptime,
+					);
 					let mut broker = service_router.broker.lock();
 					for owner in config.manifests.keys() {
 						broker.deactivate_provider(owner, "provider process hot-reloaded");
@@ -5929,11 +6565,13 @@ async fn run_supervisor(
 					let _ = reply.send(Ok(generation));
 				},
 				Ok(SupervisorCommand::Shutdown) => {
+					notify_process_unload(&config, "shutdown");
 					process.terminate(config.interrupt_grace).await;
 					return;
 				},
 				Ok(command) => stage_pending(&mut pending, command),
 				Err(_) => {
+					notify_process_unload(&config, "shutdown");
 					process.terminate(config.interrupt_grace).await;
 					return;
 				},
@@ -5952,10 +6590,12 @@ async fn run_supervisor(
 					if healthy_since.elapsed() >= config.healthy_reset {
 						backoff = initial_backoff(&config);
 					}
+					notify_process_unload(&config, "error");
 					process.terminate(config.interrupt_grace).await;
-					let Some(replacement) = respawn(
+					let Some((replacement, uptime)) = respawn(
 						&config,
 						&expected_registrations,
+						&expected_prompt_registrations,
 						&mut generation,
 						&mut backoff,
 						RestartReason::HealthTimeout,
@@ -5973,6 +6613,12 @@ async fn run_supervisor(
 					};
 					process = replacement;
 					host_generation.store(generation, Ordering::Release);
+					notify_process_reconnect(
+						&config,
+						generation,
+						RestartReason::HealthTimeout,
+						uptime,
+					);
 					healthy_since = Instant::now();
 				}
 			},
@@ -6688,6 +7334,12 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 			))));
 			return;
 		},
+		SupervisorCommand::PromptPull { reply, .. } => {
+			let _ = reply.send(Err(WorkerError::Protocol(sf!(
+				"prompt renderer worker is busy; reentrant callbacks are disabled",
+			))));
+			return;
+		},
 		SupervisorCommand::Reload { reply } => {
 			let _ = reply.send(Err(WorkerError::Protocol(sf!(
 				"extension worker is busy; retry reload after the active invocation drains",
@@ -6704,6 +7356,7 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 		| SupervisorCommand::Interrupt { id, .. } => *id,
 		SupervisorCommand::Open { .. }
 		| SupervisorCommand::ServiceDispatch { .. }
+		| SupervisorCommand::PromptPull { .. }
 		| SupervisorCommand::Reload { .. }
 		| SupervisorCommand::Shutdown => return,
 	};
@@ -6767,6 +7420,7 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 		},
 		SupervisorCommand::Open { .. }
 		| SupervisorCommand::ServiceDispatch { .. }
+		| SupervisorCommand::PromptPull { .. }
 		| SupervisorCommand::Cancel { .. }
 		| SupervisorCommand::Reload { .. }
 		| SupervisorCommand::Shutdown => {},
@@ -6796,6 +7450,7 @@ fn args_rejected(call_id: &Str, issue: ArgIssue) -> WorkerCompletion {
 		details_blob: None,
 		args_issue:   Some(issue),
 		useless:      false,
+		terminate:    false,
 	}
 }
 
@@ -6806,6 +7461,30 @@ fn send_abort(invocation: &PendingInvocation, kind: WorkerAbortKind, reason: &st
 		reason: Str::from(reason),
 		effects_unknown: invocation.committed.is_some(),
 	}));
+}
+
+fn notify_process_unload(config: &ProcessConfig, reason: &'static str) {
+	let Some(gate) = config.lifecycle_gate.as_deref() else {
+		return;
+	};
+	for manifest in config.manifests.values() {
+		notify_extension_unload(gate, manifest.provenance.extension_id(), reason, 0);
+	}
+}
+
+fn notify_process_reconnect(
+	config: &ProcessConfig,
+	generation: u64,
+	reason: RestartReason,
+	uptime: Duration,
+) {
+	let Some(gate) = config.lifecycle_gate.as_deref() else {
+		return;
+	};
+	for manifest in config.manifests.values() {
+		notify_extension_load(gate, &manifest.provenance, reason == RestartReason::HotReload);
+	}
+	notify_host_reconnect(gate, generation, 0, reason, uptime);
 }
 
 fn initial_backoff(config: &ProcessConfig) -> Duration {
@@ -6833,12 +7512,13 @@ fn cancellation_reason(config: &ProcessConfig, owner: &HostKey, reason: &str) ->
 async fn respawn(
 	config: &ProcessConfig,
 	expected: &[ToolDecl],
+	expected_prompts: &[PromptSlotBinding],
 	generation: &mut u64,
 	backoff: &mut Duration,
 	reason: RestartReason,
 	shutdown: &CancellationToken,
 	mailbox: &Receiver<SupervisorCommand>,
-) -> Option<WorkerProcess> {
+) -> Option<(WorkerProcess, Duration)> {
 	let max_delay = config.max_backoff.max(Duration::from_millis(1));
 	loop {
 		if shutdown.is_cancelled() || mailbox.is_disconnected() {
@@ -6852,6 +7532,7 @@ async fn respawn(
 			return None;
 		}
 		*generation = generation.wrapping_add(1).max(1);
+		let started_at = Instant::now();
 		let spawned = tokio::select! {
 			() = shutdown.cancelled() => return None,
 			result = WorkerProcess::spawn(
@@ -6861,9 +7542,12 @@ async fn respawn(
 			) => result,
 		};
 		match spawned {
-			Ok(process) if process.registrations.as_slice() == expected => {
+			Ok(process)
+				if process.registrations.as_slice() == expected
+					&& process.prompt_registrations.as_slice() == expected_prompts =>
+			{
 				*backoff = backoff.saturating_mul(2).min(max_delay);
-				return Some(process);
+				return Some((process, started_at.elapsed()));
 			},
 			Ok(mut process) => process.terminate(config.interrupt_grace).await,
 			Err(_) => {},
@@ -6892,6 +7576,9 @@ fn abort_queued_invocations(
 				});
 			},
 			SupervisorCommand::ServiceDispatch { reply, .. } => {
+				let _ = reply.send(Err(WorkerError::Unavailable));
+			},
+			SupervisorCommand::PromptPull { reply, .. } => {
 				let _ = reply.send(Err(WorkerError::Unavailable));
 			},
 			SupervisorCommand::Reload { reply } => {
@@ -6941,6 +7628,7 @@ impl TryFrom<ToolComplete> for WorkerCompletion {
 			details_blob: complete.details_blob,
 			args_issue: complete.args_issue,
 			useless: complete.useless,
+			terminate: complete.terminate.unwrap_or(false),
 		})
 	}
 }
@@ -6982,6 +7670,9 @@ fn validate_manifest_registrations(
 	tools: &[ToolDecl],
 ) -> Result<(), WorkerError> {
 	for (owner, manifest) in &config.manifests {
+		if manifest.runtime_declarations_trusted() {
+			continue;
+		}
 		let actual = actual_declarations(config, tools, owner)?;
 		if actual != manifest.declarations {
 			return Err(WorkerError::Protocol(manifest_registration_diff(
@@ -7173,12 +7864,28 @@ fn parse_ui_registrations(
 				props: None,
 			});
 	}
+	for completion in snapshot.completions {
+		let owner = ui_callback_owner(config, completion.value.callable.as_str())?
+			.0
+			.clone();
+		let manifest = config
+			.manifests
+			.get(&owner)
+			.expect("UI callback owner is admitted");
+		let trigger = seal_registered_completion(manifest, completion)
+			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+		registrations
+			.get_mut(&owner)
+			.expect("UI callback owner has a registration")
+			.triggers
+			.push(trigger);
+	}
 	Ok(registrations)
 }
 
 fn ui_callback_owner<'a>(
 	config: &'a ProcessConfig,
-	callback: &'a str,
+	callback: &str,
 ) -> Result<(&'a HostKey, &'a str), WorkerError> {
 	let owners = config
 		.manifests
@@ -7273,7 +7980,7 @@ fn manifest_registration_diff(
 }
 
 fn actual_declarations(
-	_config: &ProcessConfig,
+	config: &ProcessConfig,
 	tools: &[ToolDecl],
 	owner: &HostKey,
 ) -> Result<DeclarationSet, WorkerError> {
@@ -7292,7 +7999,13 @@ fn actual_declarations(
 			Ok(ToolDeclarationKey::new(definition.name.as_str(), rev.family, rev.n))
 		})
 		.collect::<Result<Vec<_>, WorkerError>>()?;
-	Ok(DeclarationSet::new(tools, []))
+	let hooks = config
+		.manifests
+		.get(owner)
+		.into_iter()
+		.flat_map(|manifest| manifest.declarations.hooks())
+		.cloned();
+	Ok(DeclarationSet::new(tools, hooks))
 }
 
 #[pyfunction]
@@ -7485,6 +8198,99 @@ fn configure_python_manifest(engine: &omp_py::Engine) -> Result<(), WorkerError>
 		.map_err(WorkerError::from)
 }
 
+fn load_prompt_slots(
+	engine: &omp_py::Engine,
+	admitted_modules: &BTreeMap<&str, &str>,
+) -> Result<Vec<v1::SlotDecl>, WorkerError> {
+	engine
+		.attach(|py| -> PyResult<Vec<v1::SlotDecl>> {
+			let registry = PyModule::import(py, "omp._registry")?.getattr("registry")?;
+			let snapshot = registry.call_method0("snapshot")?;
+			let definitions = snapshot.getattr("prompt_slots")?;
+			let mut slots = Vec::new();
+			for definition in PyIterator::from_object(&definitions)? {
+				let definition = definition?;
+				let renderer = definition.getattr("renderer")?;
+				let module: String = renderer.getattr("__module__")?.extract()?;
+				let qualname: String = renderer.getattr("__qualname__")?.extract()?;
+				let owner = admitted_modules.get(module.as_str()).ok_or_else(|| {
+					PyValueError::new_err("prompt renderer module is not an admitted extension")
+				})?;
+				let slot: String = definition.getattr("slot")?.extract()?;
+				let slot = slot.parse::<omp_agent::SlotId>().map_err(|_| {
+					PyValueError::new_err("prompt renderer named an unknown catalog slot")
+				})?;
+				let class: String = definition.getattr("cls")?.extract()?;
+				let priority: i32 = definition.getattr("priority")?.extract()?;
+				let key = format!("{module}.{qualname}");
+				slots.push(v1::SlotDecl {
+					slot: slot as u32,
+					class,
+					priority,
+					props: Some(ValueMap {
+						fields: BTreeMap::from([
+							(PROMPT_OWNER_PROP.to_owned(), Value {
+								kind: Some(value::Kind::String((*owner).to_owned())),
+							}),
+							(PROMPT_KEY_PROP.to_owned(), Value { kind: Some(value::Kind::String(key)) }),
+						]),
+					}),
+				});
+			}
+			Ok(slots)
+		})
+		.map_err(WorkerError::from)
+}
+
+fn render_python_prompt_slot(
+	engine: &omp_py::Engine,
+	key: &str,
+	context_json: &str,
+) -> Result<String, WorkerError> {
+	engine
+		.attach(|py| -> PyResult<String> {
+			let registry = PyModule::import(py, "omp._registry")?.getattr("registry")?;
+			let snapshot = registry.call_method0("snapshot")?;
+			let definitions = snapshot.getattr("prompt_slots")?;
+			let json = PyModule::import(py, "json")?;
+			let kwargs = json.call_method1("loads", (context_json,))?;
+			let kwargs = kwargs.cast::<PyDict>()?;
+			let prompts = PyModule::import(py, "omp.prompts")?;
+			let class = kwargs
+				.get_item("cls")?
+				.ok_or_else(|| PyKeyError::new_err("prompt context has no cls"))?;
+			kwargs.set_item("cls", prompts.getattr("SlotClass")?.call1((class,))?)?;
+			let context = prompts.getattr("PromptContext")?.call((), Some(kwargs))?;
+			for definition in PyIterator::from_object(&definitions)? {
+				let definition = definition?;
+				let renderer = definition.getattr("renderer")?;
+				let module: String = renderer.getattr("__module__")?.extract()?;
+				let qualname: String = renderer.getattr("__qualname__")?.extract()?;
+				if format!("{module}.{qualname}") != key {
+					continue;
+				}
+				let first = renderer.call1((&context,))?;
+				let second = renderer.call1((&context,))?;
+				if !first.eq(&second)? {
+					return Err(PyValueError::new_err(
+						"prompt renderer returned different bytes for identical input",
+					));
+				}
+				if first.is_none() {
+					return Ok(String::new());
+				}
+				let value = first
+					.cast::<PyString>()
+					.map_err(|_| PyTypeError::new_err("prompt renderer must return str or None"))?;
+				return value
+					.extract::<String>()
+					.map_err(|_| PyTypeError::new_err("prompt renderer must return str or None"));
+			}
+			Err(PyKeyError::new_err("prompt renderer declaration is not registered"))
+		})
+		.map_err(WorkerError::from)
+}
+
 fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerError> {
 	engine.attach(|py| -> PyResult<()> {
 		let sys = PyModule::import(py, "sys")?;
@@ -7582,6 +8388,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 		tool.decl.extension_id = (*extension_id).to_owned();
 	}
 	let declarations = tools.iter().map(|tool| tool.decl.clone()).collect();
+	let prompt_slots = load_prompt_slots(engine, &admitted_modules)?;
 	let entry_modules =
 		admitted
 			.extensions
@@ -7613,6 +8420,7 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 				tools: declarations,
 				generation: host_generation,
 				extensions,
+				slots: prompt_slots.clone(),
 				props: Some(ValueMap {
 					fields: BTreeMap::from([("omp/registry-snapshot-json".to_owned(), Value {
 						kind: Some(value::Kind::String(registry_metadata)),
@@ -7772,6 +8580,58 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 								error,
 								props: None,
 							})),
+							props: None,
+						})),
+						props:      None,
+					},
+					limit,
+					&mut write_scratch,
+				)?;
+			},
+			Some(host_frame::Body::Context(ContextHostEnvelope {
+				body: Some(context_host_envelope::Body::PromptPull(pull)),
+				..
+			})) => {
+				let owner = prompt_prop(pull.props.as_ref(), PROMPT_OWNER_PROP)
+					.ok_or_else(|| WorkerError::Protocol(sf!("PromptPull has no owner")))?;
+				let key = prompt_prop(pull.props.as_ref(), PROMPT_KEY_PROP)
+					.ok_or_else(|| WorkerError::Protocol(sf!("PromptPull has no declaration key")))?;
+				let context = prompt_prop(pull.props.as_ref(), PROMPT_CONTEXT_PROP)
+					.ok_or_else(|| WorkerError::Protocol(sf!("PromptPull has no context")))?;
+				let declared = prompt_slots.iter().any(|declaration| {
+					declaration.slot == pull.slot
+						&& prompt_prop(declaration.props.as_ref(), PROMPT_OWNER_PROP) == Some(owner)
+						&& prompt_prop(declaration.props.as_ref(), PROMPT_KEY_PROP) == Some(key)
+				});
+				if !declared {
+					return Err(WorkerError::Protocol(sf!(
+						"PromptPull names an unregistered declaration",
+					)));
+				}
+				let content = render_python_prompt_slot(engine, key, context)?;
+				let props = ValueMap {
+					fields: BTreeMap::from([
+						(PROMPT_OWNER_PROP.to_owned(), Value {
+							kind: Some(value::Kind::String(owner.to_owned())),
+						}),
+						(PROMPT_KEY_PROP.to_owned(), Value {
+							kind: Some(value::Kind::String(key.to_owned())),
+						}),
+					]),
+				};
+				write_sync_frame(
+					&mut writer,
+					&WorkerFrame {
+						request_id: frame.request_id,
+						body:       Some(worker_frame::Body::Context(ContextWorkerEnvelope {
+							body:  Some(context_worker_envelope::Body::PromptContribution(
+								PromptContribution {
+									slot:      pull.slot,
+									parts:     vec![Part { kind: Some(part::Kind::Text(content)) }],
+									cache_key: None,
+									props:     Some(props),
+								},
+							)),
 							props: None,
 						})),
 						props:      None,
@@ -8275,6 +9135,13 @@ fn load_tools(
 						})?;
 					Some(omp_proto::policy::v1::EffectEnvelope::from(&effects))
 				};
+				let constraint = python_tool_constraint(&row)?;
+				let kind_name: String = row.getattr("kind")?.extract()?;
+				let execution_mode = if row.getattr("serial")?.extract::<bool>()? {
+					v1::ToolExecutionMode::Sequential
+				} else {
+					v1::ToolExecutionMode::Parallel
+				};
 				tools.push(PythonTool {
 					decl: ToolDecl {
 						definition: Some(ToolDef {
@@ -8286,10 +9153,12 @@ fn load_tools(
 							})),
 						}),
 						rev,
-						constraint: None,
+						constraint,
 						extension_id: row.getattr("source_module")?.extract()?,
 						streams_args: row.getattr("streams_args")?.extract()?,
 						effects,
+						kind: kind_name,
+						execution_mode: execution_mode as i32,
 						props: None,
 						..Default::default()
 					},
@@ -8300,6 +9169,46 @@ fn load_tools(
 			Ok((tools, metadata))
 		})
 		.map_err(WorkerError::from)
+}
+
+fn python_tool_constraint(row: &Bound<'_, PyAny>) -> PyResult<Option<v1::ToolConstraint>> {
+	let constraint = row.getattr("constraint")?;
+	if constraint.is_none() {
+		return Ok(None);
+	}
+	let priority: u32 = constraint.getattr("priority")?.extract()?;
+	let fallback: String = constraint.getattr("on_unsupported")?.extract()?;
+	let on_unsupported = match fallback.as_str() {
+		"unspecified" => omp_proto::inference::v1::Fallback::Unspecified,
+		"error" => omp_proto::inference::v1::Fallback::Error,
+		"drop" => omp_proto::inference::v1::Fallback::Ignore,
+		_ => return Err(PyValueError::new_err("unknown tool constraint fallback")),
+	};
+	let kind: String = constraint.getattr("kind")?.extract()?;
+	let kind = match kind.as_str() {
+		"schema" => v1::tool_constraint::Kind::Schema(v1::SchemaConstraint {
+			priority,
+			on_unsupported: on_unsupported as i32,
+		}),
+		"grammar" => {
+			let syntax: String = constraint.getattr("syntax")?.extract()?;
+			let syntax = match syntax.as_str() {
+				"lark" => v1::GrammarSyntax::Lark,
+				"regex" => v1::GrammarSyntax::Regex,
+				"ebnf" => v1::GrammarSyntax::Ebnf,
+				"gbnf" => v1::GrammarSyntax::Gbnf,
+				_ => return Err(PyValueError::new_err("unknown tool constraint grammar syntax")),
+			};
+			v1::tool_constraint::Kind::Grammar(v1::GrammarConstraint {
+				syntax: syntax as i32,
+				definition: constraint.getattr("definition")?.extract()?,
+				priority,
+				on_unsupported: on_unsupported as i32,
+			})
+		},
+		_ => return Err(PyValueError::new_err("unknown tool constraint kind")),
+	};
+	Ok(Some(v1::ToolConstraint { kind: Some(kind) }))
 }
 
 fn load_prelude(engine: &omp_py::Engine, _modules: &[Str]) -> Result<Vec<PythonTool>, WorkerError> {
@@ -8448,7 +9357,16 @@ fn serve_invocation<W: Write>(
 		);
 	};
 	let call_id = invoke.call_id.clone();
-	let result =
+	let argument_issue = python_argument_issue(tool, &invoke.args_json);
+	let result = if let Some(issue) = argument_issue {
+		Ok(PythonCompletion {
+			parts:        Vec::new(),
+			details_json: Bytes::from_static(b"null"),
+			kind:         OutcomeKind::ArgsRejected,
+			args_issue:   Some(issue),
+			terminate:    false,
+		})
+	} else {
 		engine.attach(|py| -> Result<PythonCompletion, WorkerError> {
 			let json = PyModule::import(py, "json")?;
 			let args = str::from_utf8(invoke.args_json.as_ref())
@@ -8466,6 +9384,7 @@ fn serve_invocation<W: Write>(
 			}
 			let environment = PyModule::import(py, "omp.env")?;
 			let invoke_with_environment = environment.getattr("_invoke_with_environment")?;
+			let pending_updates = PyList::empty(py);
 			let coroutine =
 				match &tool.kind {
 					PythonToolKind::Legacy | PythonToolKind::Prelude => invoke_with_environment
@@ -8486,6 +9405,7 @@ fn serve_invocation<W: Write>(
 						kwargs.set_item("generation", host_generation)?;
 						kwargs.set_item("call", invoke.call_id.as_str())?;
 						kwargs.set_item("device", invoke.name.as_str())?;
+						kwargs.set_item("_update_sink", pending_updates.getattr("append")?)?;
 						kwargs.set_item(
 							"place",
 							omp.getattr("Place")?
@@ -8504,6 +9424,9 @@ fn serve_invocation<W: Write>(
 			let value = PyModule::import(py, "asyncio")?
 				.getattr("run")?
 				.call1((coroutine,))?;
+			for update in pending_updates.iter() {
+				write_update(writer, request_id, &call_id, &json, &update, limit, scratch)?;
+			}
 			if matches!(&tool.kind, PythonToolKind::Prelude) {
 				let details_json = Bytes::from(
 					json
@@ -8515,6 +9438,7 @@ fn serve_invocation<W: Write>(
 					details_json,
 					kind: OutcomeKind::Ok,
 					args_issue: None,
+					terminate: false,
 				});
 			}
 			if let Ok(dict) = value.cast::<PyDict>() {
@@ -8550,6 +9474,7 @@ fn serve_invocation<W: Write>(
 					details_json: Bytes::from_static(b"null"),
 					kind:         OutcomeKind::Ok,
 					args_issue:   None,
+					terminate:    false,
 				});
 			}
 			let details_json = Bytes::from(
@@ -8564,8 +9489,10 @@ fn serve_invocation<W: Write>(
 				details_json,
 				kind: OutcomeKind::Ok,
 				args_issue: None,
+				terminate: false,
 			})
-		});
+		})
+	};
 	let completion = match result {
 		Ok(completion) => completion,
 		Err(error) => PythonCompletion {
@@ -8579,9 +9506,10 @@ fn serve_invocation<W: Write>(
 			),
 			kind:         OutcomeKind::Aborted,
 			args_issue:   None,
+			terminate:    false,
 		},
 	};
-	let PythonCompletion { parts, details_json, kind, args_issue } = completion;
+	let PythonCompletion { parts, details_json, kind, args_issue, terminate } = completion;
 	let body = if let Some(issue) = args_issue {
 		worker_frame::Body::Arguments(ArgumentWorkerEnvelope {
 			body:  Some(argument_worker_envelope::Body::ToolArgs(ToolArgs {
@@ -8598,6 +9526,7 @@ fn serve_invocation<W: Write>(
 			details_json,
 			is_error: matches!(kind, OutcomeKind::Faulted),
 			kind: kind.into(),
+			terminate: terminate.then_some(true),
 			props: None,
 			..Default::default()
 		})
@@ -8615,6 +9544,89 @@ struct PythonCompletion {
 	details_json: Bytes,
 	kind:         OutcomeKind,
 	args_issue:   Option<ArgIssue>,
+	terminate:    bool,
+}
+
+fn python_argument_issue(tool: &PythonTool, args_json: &[u8]) -> Option<ArgIssue> {
+	let schema = tool
+		.decl
+		.definition
+		.as_ref()
+		.and_then(|definition| definition.input.as_ref())
+		.and_then(|input| match input {
+			tool_def::Input::JsonSchema(schema) => Some(schema),
+			tool_def::Input::Grammar(_) => None,
+		})?;
+	schema_argument_issue(&schema.schema_json, args_json)
+}
+
+fn schema_argument_issue(schema_json: &[u8], args_json: &[u8]) -> Option<ArgIssue> {
+	let arguments = match serde_json::from_slice::<serde_json::Value>(args_json) {
+		Ok(serde_json::Value::Object(arguments)) => serde_json::Value::Object(arguments),
+		Ok(value) => {
+			return Some(ArgIssue {
+				expected: "an argument object".into(),
+				kind: "type_mismatch".into(),
+				found: Some(json_value_kind(&value).into()),
+				..ArgIssue::default()
+			});
+		},
+		Err(_) => {
+			return Some(ArgIssue {
+				expected: "one complete JSON argument object".into(),
+				kind: "malformed".into(),
+				..ArgIssue::default()
+			});
+		},
+	};
+	let schema_value = serde_json::from_slice::<serde_json::Value>(schema_json).ok()?;
+	let violation =
+		validate_schema(&schema_value, &arguments, false, ToolAssemblyLimits::default()).err()?;
+	let expected = if violation.rule == "required" {
+		"required parameter".into()
+	} else if violation.rule == "type" && !violation.expected_types.is_empty() {
+		violation
+			.expected_types
+			.iter()
+			.map(Str::as_str)
+			.collect::<Vec<_>>()
+			.join(" or ")
+	} else {
+		format!("arguments matching the declared schema ({})", violation.rule)
+	};
+	Some(ArgIssue {
+		path: json_pointer_path(&violation.path),
+		expected,
+		kind: if violation.rule == "required" {
+			"missing".into()
+		} else if violation.rule == "type" {
+			"type_mismatch".into()
+		} else {
+			"malformed".into()
+		},
+		..ArgIssue::default()
+	})
+}
+
+fn json_pointer_path(pointer: &str) -> Vec<String> {
+	pointer
+		.strip_prefix('/')
+		.filter(|path| !path.is_empty())
+		.into_iter()
+		.flat_map(|path| path.split('/'))
+		.map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+		.collect()
+}
+
+const fn json_value_kind(value: &serde_json::Value) -> &'static str {
+	match value {
+		serde_json::Value::Null => "null",
+		serde_json::Value::Bool(_) => "boolean",
+		serde_json::Value::Number(_) => "number",
+		serde_json::Value::String(_) => "string",
+		serde_json::Value::Array(_) => "array",
+		serde_json::Value::Object(_) => "object",
+	}
 }
 
 fn completion_from_dict(
@@ -8665,7 +9677,12 @@ fn completion_from_dict(
 	} else {
 		OutcomeKind::Ok
 	};
-	Ok(PythonCompletion { parts, details_json, kind, args_issue })
+	let terminate = dict
+		.get_item("terminate")?
+		.map(|value| value.extract::<bool>())
+		.transpose()?
+		.unwrap_or(false);
+	Ok(PythonCompletion { parts, details_json, kind, args_issue, terminate })
 }
 
 fn optional_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
@@ -8943,6 +9960,213 @@ mod tests {
 	}
 
 	#[test]
+	fn python_argument_validation_returns_typed_issues() {
+		let schema = br#"{
+			"type":"object",
+			"properties":{"i":{"type":"string"},"count":{"type":"integer"}},
+			"required":["i","count"],
+			"additionalProperties":false
+		}"#;
+		let missing = schema_argument_issue(schema, br#"{"count":3}"#)
+			.expect("missing required parameter must be rejected");
+		assert_eq!(missing.path, ["i"]);
+		assert_eq!(missing.kind, "missing");
+
+		let mistyped = schema_argument_issue(schema, br#"{"i":"x","count":"three"}"#)
+			.expect("wrong scalar type must be rejected after charitable repair is exhausted");
+		assert_eq!(mistyped.path, ["count"]);
+		assert_eq!(mistyped.kind, "type_mismatch");
+		assert_eq!(mistyped.expected, "integer");
+
+		let malformed = schema_argument_issue(schema, br#"{"i":"x""#)
+			.expect("truncated document must be rejected");
+		assert!(malformed.path.is_empty());
+		assert_eq!(malformed.kind, "malformed");
+	}
+	#[test]
+	fn python_completion_lowers_terminate_opt_in() {
+		let engine = python_engine().expect("initialize embedded Python");
+		let completion = engine
+			.attach(|py| {
+				py.run(
+					c_str!(
+						r#"
+from dataclasses import dataclass
+import omp
+from omp._verdicts import _canonical_json, loads
+
+@dataclass(frozen=True, slots=True)
+class Result(omp.Payload):
+    value: int
+
+@dataclass(frozen=True, slots=True)
+class Failure(omp.Fault):
+    reason: str
+
+result = Result(7, terminate=True)
+failure = Failure("no", terminate=True)
+assert result.terminate is True and failure.terminate is True
+assert _canonical_json(result) == b'{"value":7}'
+assert _canonical_json(failure) == b'{"reason":"no"}'
+assert loads(b'{"value":7}', Result) == Result(7)
+assert loads(b'{"reason":"no"}', Failure) == Failure("no")
+"#
+					),
+					None,
+					None,
+				)?;
+				let json = PyModule::import(py, "json")?;
+				let dict = PyDict::new(py);
+				dict.set_item("details", 7)?;
+				dict.set_item("terminate", true)?;
+				completion_from_dict(&dict, &json)
+			})
+			.expect("lower Python completion");
+		assert!(completion.terminate);
+
+		let wire = ToolComplete {
+			call_id: "terminate".to_owned(),
+			details_json: completion.details_json,
+			terminate: completion.terminate.then_some(true),
+			..ToolComplete::default()
+		};
+		assert!(
+			WorkerCompletion::try_from(wire)
+				.expect("decode terminal frame")
+				.terminate
+		);
+	}
+
+	#[test]
+	fn python_constraint_round_trips_into_registration() {
+		let engine = python_engine().expect("initialize embedded Python");
+		let wire = engine
+			.attach(|py| {
+				let devices = PyModule::import(py, "omp.devices")?;
+				let types = PyModule::import(py, "types")?;
+				let constraint_kwargs = PyDict::new(py);
+				constraint_kwargs.set_item("priority", 81)?;
+				constraint_kwargs.set_item(
+					"on_unsupported",
+					devices.getattr("ConstraintFallback")?.getattr("ERROR")?,
+				)?;
+				let constraint = devices.getattr("ToolConstraint")?.call_method(
+					"grammar",
+					(devices.getattr("GrammarSyntax")?.getattr("REGEX")?, "[0-9]+"),
+					Some(&constraint_kwargs),
+				)?;
+				let kwargs = PyDict::new(py);
+				kwargs.set_item("constraint", constraint)?;
+				let row = types.getattr("SimpleNamespace")?.call((), Some(&kwargs))?;
+				python_tool_constraint(&row)
+			})
+			.expect("lower Python constraint")
+			.expect("constraint is present");
+		let Some(v1::tool_constraint::Kind::Grammar(grammar)) = wire.kind else {
+			panic!("constraint did not lower as grammar");
+		};
+		assert_eq!(grammar.syntax, v1::GrammarSyntax::Regex as i32);
+		assert_eq!(grammar.definition, "[0-9]+");
+		assert_eq!(grammar.priority, 81);
+		assert_eq!(grammar.on_unsupported, omp_proto::inference::v1::Fallback::Error as i32);
+	}
+
+	#[test]
+	fn contextual_python_update_sink_emits_update_before_completion() {
+		let engine = python_engine().expect("initialize embedded Python");
+		let handler = engine
+			.attach(|py| {
+				let locals = PyDict::new(py);
+				py.run(
+					c_str!(
+						r#"
+async def handler(params, ctx):
+    ctx.update({"step": params["step"]})
+    return {"details": {"done": True}}
+"#
+					),
+					None,
+					Some(&locals),
+				)?;
+				Ok::<_, PyErr>(
+					locals
+						.get_item("handler")?
+						.expect("handler defined")
+						.unbind(),
+				)
+			})
+			.expect("define Python handler");
+		let tool = PythonTool {
+			decl: ToolDecl {
+				definition: Some(ToolDef {
+					name: "stream_contract".to_owned(),
+					description: "stream update contract".to_owned(),
+					input: Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+						schema_json: Bytes::from_static(
+							br#"{"type":"object","properties":{"step":{"type":"integer"}},"required":["step"],"additionalProperties":false}"#,
+						),
+						strict: Some(true),
+					})),
+				}),
+				rev: "1".to_owned(),
+				extension_id: "stream.contract".to_owned(),
+				kind: "soft".to_owned(),
+				execution_mode: v1::ToolExecutionMode::Parallel as i32,
+				..ToolDecl::default()
+			},
+			handler,
+			kind: PythonToolKind::Contextual { place: "host".to_owned() },
+		};
+		let invoke = InvokeTool {
+			call_id: "stream-call".to_owned(),
+			name: "stream_contract".to_owned(),
+			args_json: Bytes::from_static(br#"{"step":2}"#),
+			rev: "1".to_owned(),
+			..InvokeTool::default()
+		};
+		let commit = ArgsCommitted {
+			invocation_id: "stream-call".to_owned(),
+			raw: invoke.args_json.clone(),
+			..ArgsCommitted::default()
+		};
+		let mut wire = Vec::new();
+		serve_invocation(
+			&engine,
+			&[tool],
+			7,
+			invoke,
+			&commit,
+			"session",
+			"principal",
+			"Principal",
+			1,
+			1,
+			&mut wire,
+			NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES).expect("nonzero frame limit"),
+			&mut BytesMut::new(),
+		)
+		.expect("serve contextual invocation");
+
+		let mut cursor = std::io::Cursor::new(wire);
+		let limit = NonZeroUsize::new(DEFAULT_MAX_FRAME_BYTES).expect("nonzero frame limit");
+		let mut scratch = BytesMut::new();
+		let update = read_sync_frame::<_, WorkerFrame>(&mut cursor, limit, &mut scratch)
+			.expect("decode update frame")
+			.expect("update frame");
+		let Some(worker_frame::Body::ToolUpdate(update)) = update.body else {
+			panic!("first frame was not a tool update");
+		};
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&update.json).expect("update JSON"),
+			serde_json::json!({"step": 2})
+		);
+		let complete = read_sync_frame::<_, WorkerFrame>(&mut cursor, limit, &mut scratch)
+			.expect("decode completion frame")
+			.expect("completion frame");
+		assert!(matches!(complete.body, Some(worker_frame::Body::ToolComplete(_))));
+	}
+
+	#[test]
 	fn prelude_declaration_extracts_and_invokes_adapter() {
 		let engine = python_engine().expect("initialize embedded Python");
 		engine
@@ -9088,7 +10312,8 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 		let source = tree.path().join("extension.py");
 		std::fs::write(&source, "value = 1\n").expect("initial source");
 		let (commands, mailbox) = flume::unbounded();
-		let watcher = spawn_link_watcher(tree.path(), sf!("demo"), commands).expect("source watcher");
+		let watcher =
+			spawn_link_watcher(tree.path(), sf!("demo"), commands, None).expect("source watcher");
 		time::sleep(Duration::from_millis(50)).await;
 		std::fs::write(&source, "value = 2\n").expect("first edit");
 		std::fs::write(&source, "value = 3\n").expect("second edit");

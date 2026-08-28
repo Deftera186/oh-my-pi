@@ -12,7 +12,9 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt as _;
+use omp_agent::{GateEvent, GateOutcome, HookGate};
 use omp_core::{Duration, DurationUnit, Hash32, Str, sf};
+use omp_proto::toolhost::v1::HookEventId;
 use omp_shell_engine::{
 	builtins::{ContentOptions, ContentType, Registration},
 	commands::{CommandArg, ExecutionContext},
@@ -54,29 +56,80 @@ pub struct XdHost {
 	catalog:            DeviceCatalog,
 	invoker:            Arc<dyn ErasedDeviceInvoker>,
 	proposals:          StagedProposalRegistry,
+	hooks:              Arc<HookGate>,
 	catalog_cache:      Mutex<Option<CatalogCache>>,
 	next_invocation_id: AtomicU64,
 }
 
 impl XdHost {
-	/// Binds one live device catalog, worker dispatcher, and proposal registry.
+	/// Binds one live device catalog, worker dispatcher, proposal registry, and
+	/// session hook gate.
 	pub fn new(
 		catalog: DeviceCatalog,
 		invoker: Arc<dyn ErasedDeviceInvoker>,
 		proposals: StagedProposalRegistry,
+		hooks: Arc<HookGate>,
 	) -> Self {
 		Self {
 			catalog,
 			invoker,
 			proposals,
+			hooks,
 			catalog_cache: Mutex::new(None),
 			next_invocation_id: AtomicU64::new(1),
 		}
 	}
 
-	fn catalog(&self, registry: &Registry, query: &CatalogQuery, subtree: Option<&str>) -> Str {
+	async fn catalog(
+		&self,
+		registry: &Registry,
+		query: &CatalogQuery,
+		subtree: Option<&str>,
+	) -> Result<Str, Str> {
+		if self.hooks.subscribed(HookEventId::HookEventDeviceList) {
+			let device_hash = registry.device_hash();
+			let devices = registry
+				.devices()
+				.map(device_event_json)
+				.collect::<Vec<_>>();
+			let payload = serde_json::to_vec(&serde_json::json!({
+				"devices": devices,
+				"turn_id": null,
+			}))
+			.expect("device list payload must serialize to JSON");
+			let outcome = self
+				.hooks
+				.gate(
+					HookEventId::HookEventDeviceList,
+					GateEvent::new(sf!("device_list:{}", device_hash.to_hex()), Bytes::from(payload)),
+				)
+				.await;
+			let effective = match outcome {
+				GateOutcome::Allow { event, .. } => event.effective_args,
+				GateOutcome::Deny { reason, .. } => return Err(reason),
+				GateOutcome::Approval { .. } => {
+					return Err(sf!("device list cannot require approval"));
+				},
+			};
+			let effective: Value = serde_json::from_slice(&effective)
+				.map_err(|_| sf!("device list returned a malformed effective payload"))?;
+			let selected = effective
+				.get("devices")
+				.and_then(Value::as_array)
+				.ok_or_else(|| sf!("device list omitted its effective devices"))?
+				.iter()
+				.filter_map(|device| device.get("name").and_then(Value::as_str))
+				.collect::<std::collections::BTreeSet<_>>();
+			return Ok(render_catalog_query(
+				registry
+					.devices()
+					.filter(|device| selected.contains(device.name.as_str())),
+				query,
+				subtree,
+			));
+		}
 		if *query != CatalogQuery::default() || subtree.is_some() {
-			return render_catalog_query(registry.devices(), query, subtree);
+			return Ok(render_catalog_query(registry.devices(), query, subtree));
 		}
 		let hash = registry.device_hash();
 		if let Some(cached) = self
@@ -85,17 +138,72 @@ impl XdHost {
 			.as_ref()
 			.filter(|cached| cached.hash == hash)
 		{
-			return cached.rendered.clone();
+			return Ok(cached.rendered.clone());
 		}
 		let rendered = render_catalog(registry.devices());
 		*self.catalog_cache.lock() = Some(CatalogCache { hash, rendered: rendered.clone() });
-		rendered
+		Ok(rendered)
 	}
 
 	fn invocation_id(&self) -> Str {
 		let sequence = self.next_invocation_id.fetch_add(1, Ordering::Relaxed);
 		sf!("xd-{sequence}")
 	}
+}
+
+fn device_event_json(device: omp_tool::MountedDevice<'_>) -> Value {
+	let place = match device.route {
+		ToolRoute::Native => String::from("env"),
+		ToolRoute::Worker { name, .. } => format!("worker:{name}"),
+	};
+	let mut row = Map::from_iter([
+		("name".to_owned(), Value::String(device.name.to_string())),
+		("family".to_owned(), Value::String(device.rev.family.to_string())),
+		("rev".to_owned(), Value::from(device.rev.n)),
+		("identity".to_owned(), Value::String(format!("{}@{}", device.name, device.claimant))),
+		("claimant".to_owned(), Value::String(device.claimant.to_string())),
+		("path".to_owned(), Value::String(device.name.to_string())),
+		("summary".to_owned(), Value::String(device.summary.to_string())),
+		("place".to_owned(), Value::String(place)),
+		("precedence".to_owned(), Value::from(device.precedence.0)),
+		(
+			"effects".to_owned(),
+			serde_json::to_value(device.effects).expect("device effects must serialize to JSON"),
+		),
+		("mounted".to_owned(), Value::Bool(true)),
+		("enabled".to_owned(), Value::Bool(true)),
+		("available".to_owned(), Value::Bool(true)),
+		("reason".to_owned(), Value::Null),
+		("shadowed_by".to_owned(), Value::Null),
+		("source".to_owned(), Value::String(device.claimant.to_string())),
+		("slotted".to_owned(), Value::Bool(false)),
+		("schema_bytes".to_owned(), Value::from(device.schema.len())),
+	]);
+	if let Some(metadata) = device.metadata {
+		let mut provenance = Map::new();
+		for (name, value) in [
+			("publisher", metadata.publisher.as_ref()),
+			("extension_id", metadata.extension_id.as_ref()),
+			("version", metadata.version.as_ref()),
+			("artifact_digest", metadata.artifact_digest.as_ref()),
+			("layer", metadata.layer.as_ref()),
+			("tier", metadata.tier.as_ref()),
+		] {
+			if let Some(value) = value {
+				provenance.insert(name.to_owned(), Value::String(value.to_string()));
+			}
+		}
+		if let Some(generation) = metadata.generation {
+			provenance.insert("generation".to_owned(), Value::from(generation));
+		}
+		if !provenance.is_empty() {
+			row.insert("provenance".to_owned(), Value::Object(provenance));
+		}
+		if let Some(tier) = &metadata.tier {
+			row.insert("tier".to_owned(), Value::String(tier.to_string()));
+		}
+	}
+	Value::Object(row)
 }
 
 /// Builds the `xd` builtin registration bound to one live environment host.
@@ -146,12 +254,21 @@ async fn run<SE: ShellExtensions>(
 	};
 
 	let Some(first) = argv.first() else {
-		let rendered = host.catalog(&registry, &CatalogQuery::default(), None);
+		let rendered = match host
+			.catalog(&registry, &CatalogQuery::default(), None)
+			.await
+		{
+			Ok(rendered) => rendered,
+			Err(reason) => {
+				print_error(&context, reason.as_str())?;
+				return Ok(ExecutionResult::general_error());
+			},
+		};
 		print_stdout(&context, rendered.as_str())?;
 		return Ok(ExecutionResult::success());
 	};
 	if first.starts_with('-') {
-		return catalog_command(&host, &registry, &context, &argv);
+		return catalog_command(&host, &registry, &context, &argv).await;
 	}
 	if matches!(first.as_str(), "resolve" | "reject") {
 		return proposal_command(&host, &context, &argv);
@@ -170,7 +287,7 @@ async fn run<SE: ShellExtensions>(
 	invoke_command(host, registry, context, first, &argv[1..]).await
 }
 
-fn catalog_command<SE: ShellExtensions>(
+async fn catalog_command<SE: ShellExtensions>(
 	host: &XdHost,
 	registry: &Registry,
 	context: &ExecutionContext<'_, SE>,
@@ -183,7 +300,13 @@ fn catalog_command<SE: ShellExtensions>(
 			return Ok(ExecutionResult::new(2));
 		},
 	};
-	let rendered = host.catalog(registry, &query, subtree.as_deref());
+	let rendered = match host.catalog(registry, &query, subtree.as_deref()).await {
+		Ok(rendered) => rendered,
+		Err(reason) => {
+			print_error(context, reason.as_str())?;
+			return Ok(ExecutionResult::general_error());
+		},
+	};
 	print_stdout(context, rendered.as_str())?;
 	Ok(ExecutionResult::success())
 }
@@ -646,7 +769,7 @@ mod tests {
 	use tempfile::TempDir;
 	use url::Url;
 
-	use super::{XdHost, registration};
+	use super::{CatalogQuery, HookEventId, HookGate, XdHost, registration};
 	use crate::exec::{ExecEvent, ExecHost};
 
 	#[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -669,14 +792,18 @@ mod tests {
 
 	impl FixtureTool {
 		fn new(seen: Arc<Mutex<Vec<Value>>>) -> Self {
+			Self::named(sf!("fixture"), seen)
+		}
+
+		fn named(name: Str, seen: Arc<Mutex<Vec<Value>>>) -> Self {
 			Self {
 				spec: ToolSpec {
-					name:            sf!("fixture"),
-					rev:             Rev { family: Str::default(), n: 1 },
-					description:     sf!("Echoes schema-derived arguments."),
-					schema:          schema::<FixtureParams>(),
-					constraint:      Constraint::None,
-					effects:         Effects::empty(),
+					name,
+					rev: Rev { family: Str::default(), n: 1 },
+					description: sf!("Echoes schema-derived arguments."),
+					schema: schema::<FixtureParams>(),
+					constraint: Constraint::None,
+					effects: Effects::empty(),
 					projection_code: [0; 32],
 				},
 				seen,
@@ -772,7 +899,12 @@ mod tests {
 			.install_registry(Arc::clone(&registry))
 			.expect("catalog installs");
 		let host = ExecHost::new();
-		host.install_devices(Arc::new(XdHost::new(catalog, Arc::new(UnusedInvoker), proposals)));
+		host.install_devices(Arc::new(XdHost::new(
+			catalog,
+			Arc::new(UnusedInvoker),
+			proposals,
+			Arc::new(HookGate::channel().0),
+		)));
 		let root = tempfile::tempdir().expect("temp root");
 		let opened = host
 			.open_session(OpenSessionRequest {
@@ -894,12 +1026,105 @@ mod tests {
 		]));
 	}
 
+	#[tokio::test]
+	async fn device_list_intersection_narrows_catalog_without_changing_slot_hash() {
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		let mut registry = Registry::new();
+		let claims = |claimant: &'static str| Claims {
+			precedence: Precedence::DEFAULT,
+			claimant:   Str::new_static(claimant),
+			replaces:   None,
+		};
+		registry
+			.register(
+				FixtureTool::named(sf!("fixture"), Arc::clone(&seen)),
+				Presentation::Device,
+				claims("fixture/owner"),
+			)
+			.expect("fixture device");
+		registry
+			.register(
+				FixtureTool::named(sf!("hidden"), Arc::clone(&seen)),
+				Presentation::Device,
+				claims("hidden/owner"),
+			)
+			.expect("hidden device");
+		registry
+			.register(FixtureTool::named(sf!("slot"), seen), Presentation::Slot, Claims {
+				precedence: Precedence::CORE,
+				claimant:   sf!("omp/core"),
+				replaces:   None,
+			})
+			.expect("slot");
+		let slot_hash = registry.slot_hash();
+		let registry = Arc::new(registry);
+		let catalog = DeviceCatalog::default();
+		catalog
+			.install_registry(Arc::clone(&registry))
+			.expect("catalog");
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [omp_agent::Subscription {
+				host:       sf!("test"),
+				source:     omp_agent::SourceRef {
+					layer:        0,
+					publisher:    sf!("test"),
+					extension_id: sf!("device-filter"),
+				},
+				id:         30,
+				event:      HookEventId::HookEventDeviceList,
+				phase:      omp_agent::HookPhase::Transform,
+				order:      0,
+				on_failure: omp_agent::OnFailure::Deny,
+				when:       omp_agent::When::default(),
+			}])
+			.expect("device subscription");
+		let gate = Arc::new(gate);
+		let responder_gate = Arc::clone(&gate);
+		let responder = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("device dispatch");
+			assert_eq!(dispatch.event, HookEventId::HookEventDeviceList);
+			let separator = dispatch
+				.payload
+				.iter()
+				.position(|byte| *byte == b'\n')
+				.expect("payload separator");
+			let mut payload: Value =
+				serde_json::from_slice(&dispatch.payload[separator + 1..]).expect("payload");
+			payload["devices"]
+				.as_array_mut()
+				.expect("devices")
+				.retain(|device| device["name"] == "fixture");
+			responder_gate
+				.answer(dispatch.dispatch_id, vec![(
+					30,
+					omp_agent::GateDecision::Modify(omp_agent::HookPatch {
+						target: None,
+						args:   Some(Bytes::from(
+							serde_json::to_vec(&payload).expect("effective payload"),
+						)),
+					}),
+				)])
+				.expect("device decision");
+		});
+		let host = XdHost::new(catalog, Arc::new(UnusedInvoker), StagedProposalRegistry::new(), gate);
+		let rendered = host
+			.catalog(&registry, &CatalogQuery::default(), None)
+			.await
+			.expect("filtered catalog");
+		responder.await.expect("device responder");
+		assert!(rendered.contains("fixture"));
+		assert!(!rendered.contains("hidden"));
+		assert_eq!(registry.slot_hash(), slot_hash);
+	}
+
 	#[test]
 	fn registration_help_is_static() {
 		let host = Arc::new(XdHost::new(
 			DeviceCatalog::default(),
 			Arc::new(UnusedInvoker),
 			StagedProposalRegistry::new(),
+			Arc::new(HookGate::channel().0),
 		));
 		let registration = registration::<DefaultShellExtensions>(host);
 		let help = (registration.content_func)("xd", ContentType::DetailedHelp, &Default::default())

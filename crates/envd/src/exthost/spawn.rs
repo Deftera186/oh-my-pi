@@ -1,7 +1,7 @@
 //! Extension-host child spawning over a dedicated CONTROL descriptor.
 
 use std::{
-	env, io, mem,
+	env, fs, io, mem,
 	os::fd,
 	path::PathBuf,
 	process::Stdio,
@@ -11,6 +11,8 @@ use std::{
 	},
 	time::Duration,
 };
+#[cfg(target_os = "macos")]
+use std::{ffi::CStr, path::Path};
 
 use flume::Receiver;
 #[cfg(unix)]
@@ -374,20 +376,89 @@ impl HostChildLimit {
 	}
 }
 
+/// Adds the exact non-system image directories already loaded by this same
+/// binary.
+#[cfg(target_os = "macos")]
+fn allow_loaded_runtime_images(
+	sandbox: &mut SandboxSpec,
+	executable: &Path,
+) -> Result<(), SandboxError> {
+	unsafe extern "C" {
+		fn _dyld_image_count() -> u32;
+		fn _dyld_get_image_name(image_index: u32) -> *const std::ffi::c_char;
+	}
+
+	let executable = fs::canonicalize(executable)
+		.map_err(|source| SandboxError::Canonicalize { path: executable.to_path_buf(), source })?;
+	let image_count = unsafe { _dyld_image_count() };
+	for index in 0..image_count {
+		let name = unsafe { _dyld_get_image_name(index) };
+		if name.is_null() {
+			continue;
+		}
+		let Ok(name) = unsafe { CStr::from_ptr(name) }.to_str() else {
+			continue;
+		};
+		let image = Path::new(name);
+		if !image.is_absolute() || image.starts_with("/System") || image.starts_with("/usr/lib") {
+			continue;
+		}
+		let Ok(canonical) = fs::canonicalize(image) else {
+			continue;
+		};
+		if canonical == executable {
+			continue;
+		}
+		if let Some(parent) = image.parent() {
+			sandbox.allow_read(parent)?;
+		}
+		if let Some(parent) = canonical.parent() {
+			sandbox.allow_read(parent)?;
+		}
+		// Package managers load through symlink farms (`/opt/homebrew/opt/<pkg>`
+		// → `../Cellar/<pkg>/<version>`); the child resolves install names via
+		// the LINK path, which never appears in this process's canonical image
+		// list. Grant the whole world-readable prefix instead of chasing links.
+		for prefix in ["/opt/homebrew", "/usr/local/Cellar", "/usr/local/opt", "/opt/local"] {
+			if (image.starts_with(prefix) || canonical.starts_with(prefix))
+				&& fs::symlink_metadata(prefix).is_ok()
+			{
+				sandbox.allow_read(Path::new(prefix))?;
+			}
+		}
+	}
+	Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn allow_loaded_runtime_images(
+	_sandbox: &mut SandboxSpec,
+	_executable: &std::path::Path,
+) -> Result<(), SandboxError> {
+	Ok(())
+}
+
 /// Spawns one isolated extension host with CONTROL on descriptor three.
 pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	let restart_spec = spec.clone();
 	let (parent, child_control) = UnixStream::pair()?;
 	let fd = fd::AsRawFd::as_raw_fd(&child_control);
+	let env_socket = if spec.key.tier().as_str() == "sandboxed" {
+		fs::canonicalize(&spec.env_socket)
+			.map_err(|source| SandboxError::Canonicalize { path: spec.env_socket.clone(), source })?
+	} else {
+		spec.env_socket.clone()
+	};
 	let sandbox_launch = match spec.key.tier().as_str() {
 		"sandboxed" => {
 			let mut sandbox = SandboxSpec::new(spec.executable.as_os_str());
 			sandbox.arg(EXT_HOST_ARG);
 			sandbox.allow_read(&spec.executable)?;
+			allow_loaded_runtime_images(&mut sandbox, &spec.executable)?;
 			sandbox.allow_read(&spec.python_site)?;
 			sandbox.set_write(WriteMode::Scoped);
-			sandbox.allow_write(&spec.env_socket)?;
-			sandbox.allow_unix_socket(&spec.env_socket)?;
+			sandbox.allow_write(&env_socket)?;
+			sandbox.allow_unix_socket(&env_socket)?;
 			sandbox.set_network(NetworkMode::Disabled);
 			sandbox.set_degradation(DegradationPolicy::Reject);
 			Some({
@@ -409,7 +480,7 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 	command
 		.env(CONTROL_FD_ENV, "3")
 		.env(PY_SITE_ENV, &spec.python_site)
-		.env(ENV_SOCKET_ENV, &spec.env_socket)
+		.env(ENV_SOCKET_ENV, &env_socket)
 		.env("OMP_EXT_LAYER", spec.key.layer().as_str())
 		.env("OMP_EXT_TIER", spec.key.tier().as_str())
 		.env("OMP_EXT_HOST_GENERATION", spec.host_generation.to_string())

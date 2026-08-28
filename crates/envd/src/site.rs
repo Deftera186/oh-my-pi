@@ -119,9 +119,17 @@ pub fn validate_trusted_module(path: &Path) -> Result<TrustedModule, SiteError> 
 	if !canonical.is_file() {
 		return Err(trusted_load_error(path, "trusted module is not a regular file"));
 	}
-	let module = canonical
-		.file_stem()
-		.and_then(|value| value.to_str())
+	let stem = canonical.file_stem().and_then(|value| value.to_str());
+	// A package `__init__.py` imports under its directory's name.
+	let module = if stem == Some("__init__") {
+		canonical
+			.parent()
+			.and_then(|parent| parent.file_name())
+			.and_then(|name| name.to_str())
+	} else {
+		stem
+	};
+	let module = module
 		.filter(|value| python_identifier(value))
 		.map(Str::new)
 		.ok_or_else(|| trusted_load_error(path, "module filename is not a Python identifier"))?;

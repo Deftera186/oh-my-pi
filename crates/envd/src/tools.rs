@@ -13,12 +13,19 @@ use std::{
 	time,
 };
 
-use omp_agent::control;
+use omp_agent::{GateDecision, HookDispatch as AgentHookDispatch, HookGate, HookPatch, control};
 use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
-use omp_core::{Duration, ExposeSecret as _, Hash32, InvocationPhase, LifecyclePhase, Str, sf};
+use omp_core::{
+	Duration, ExposeSecret as _, Hash32, InvocationPhase, LifecyclePhase, SecretString, Str, Ulid,
+	sf,
+};
 use omp_env::EnvClient;
 use omp_inference::{
-	ProviderResponseObservation, ProviderResponseObserver,
+	BeforeRequestDenied, BeforeRequestDraft, BeforeRequestMutation, CredentialDisabledObservation,
+	ModelsDiscoverHookPage, ModelsDiscoverHookRequest, ProviderHookCredential, ProviderHookError,
+	ProviderHookObserver, ProviderLoginHookRequest, ProviderRefreshHookRequest,
+	ProviderResponseObservation, ProviderResponseObserver, ProviderSignHookRequest,
+	ProviderSignature,
 	answer::{
 		UsageAccountMetadata, UsageAmount, UsageQuantity, UsageUnit, UsageWindow, UsageWindowKind,
 	},
@@ -33,7 +40,8 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1::Blob,
 	toolhost::v1::{
-		GrammarSyntax as WorkerGrammarSyntax, PreludeParamKind, ToolDecl, tool_constraint,
+		GrammarSyntax as WorkerGrammarSyntax, HookEventId, PreludeParamKind, ToolDecl,
+		ToolExecutionMode as WorkerExecutionMode, tool_constraint,
 	},
 };
 use omp_settings::{
@@ -45,9 +53,9 @@ use omp_storage::{
 	transcript::SessionId,
 };
 use omp_tool::{
-	AvailabilityDelta, Claims, Constraint, GrammarSyntax, LeafOwner, LeafReplacementError,
-	LeafReplacementRegistry, LeafVersion, Precedence, Presentation, Registry, RegistryLeaf, Rev,
-	Tool, ToolSpec, ToolsPolicy,
+	AvailabilityDelta, Claims, Constraint, ExecutionMode, GrammarSyntax, LeafOwner,
+	LeafReplacementError, LeafReplacementRegistry, LeafVersion, Precedence, Presentation, Registry,
+	RegistryLeaf, Rev, Tool, ToolSpec, ToolsPolicy,
 };
 use omp_tools::{
 	ask::PresenterSlot,
@@ -67,6 +75,7 @@ use omp_tools::{
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use tokio::sync::Notify;
 
 use super::{
 	EnvdError,
@@ -109,7 +118,7 @@ use super::{
 	tool_url::{UrlResolver, production_url_resolvers},
 	vault::VaultService,
 	worker::{
-		ExtHostSupervisor, SealedRegistryEvidence, SealedRegistryEvidenceError,
+		ExtHostSupervisor, OwnedToolDecl, SealedRegistryEvidence, SealedRegistryEvidenceError,
 		seal_registry_evidence,
 	},
 	workspace::WorkspaceHost,
@@ -118,6 +127,8 @@ use super::{
 use crate::{
 	browser_daemon::BrowserDaemon, github_url::GithubCredentialBridge, host_settings::HostSettings,
 };
+
+const HARD_SLOT_BUDGET: usize = 8;
 
 tokio::task_local! {
 	static PTY_DENIED: bool;
@@ -233,6 +244,7 @@ fn stale_connection() -> ControlProtocolError {
 pub struct RegistryControlFactory {
 	manifests: Arc<BTreeMap<(Str, Str, Str), ExtensionManifest>>,
 	evidence:  Arc<RwLock<BTreeMap<ControlConnectionKey, Arc<SealedRegistryEvidence>>>>,
+	published: Arc<Notify>,
 }
 
 impl RegistryControlFactory {
@@ -241,6 +253,7 @@ impl RegistryControlFactory {
 		Arc::new(Self {
 			manifests: Arc::new(manifests),
 			evidence:  Arc::new(RwLock::new(BTreeMap::new())),
+			published: Arc::new(Notify::new()),
 		})
 	}
 
@@ -251,6 +264,23 @@ impl RegistryControlFactory {
 		identity: &ControlConnectionIdentity,
 	) -> Option<Arc<SealedRegistryEvidence>> {
 		self.evidence.read().get(&connection_key(identity)).cloned()
+	}
+
+	/// Waits until the exact child generation publishes sealed registry
+	/// evidence.
+	pub async fn wait_evidence(
+		&self,
+		identity: &ControlConnectionIdentity,
+	) -> Arc<SealedRegistryEvidence> {
+		loop {
+			let published = self.published.notified();
+			tokio::pin!(published);
+			published.as_mut().enable();
+			if let Some(evidence) = self.evidence(identity) {
+				return evidence;
+			}
+			published.await;
+		}
 	}
 
 	fn admits(&self, identity: &ControlConnectionIdentity) -> bool {
@@ -295,6 +325,8 @@ impl RegistryControlFactory {
 		published
 			.retain(|key, _| key.0 != connection.0 || key.1 != connection.1 || key.2 != connection.2);
 		published.insert(connection, Arc::clone(&evidence));
+		drop(published);
+		self.published.notify_waiters();
 		Ok(evidence)
 	}
 }
@@ -995,6 +1027,8 @@ pub struct HookEventPolicy {
 pub struct HookSubscription {
 	/// Authenticated child generation owning the callback.
 	pub identity:     Arc<ControlConnectionIdentity>,
+	/// Authenticated durable session owning this callback.
+	pub session:      Str,
 	/// Stable event name.
 	pub event:        Str,
 	/// Frozen phase spelling.
@@ -1237,6 +1271,7 @@ pub struct HookControlFactory {
 	mcp_journal:                  Arc<RwLock<Option<(Arc<TelemetryIndex>, Str)>>>,
 	provider_response_subscribed: Arc<AtomicBool>,
 	settings:                     Arc<BTreeMap<(Str, Str, Str), JsonMap<String, JsonValue>>>,
+	admission_gate:               Arc<HookGate>,
 }
 
 impl HookControlFactory {
@@ -1247,7 +1282,8 @@ impl HookControlFactory {
 		policies: BTreeMap<Str, HookEventPolicy>,
 		settings: BTreeMap<(Str, Str, Str), JsonMap<String, JsonValue>>,
 	) -> Arc<Self> {
-		Arc::new(Self {
+		let (admission_gate, dispatches) = HookGate::delegated_channel();
+		let owner = Arc::new(Self {
 			registries,
 			dispatcher: Arc::clone(&dispatcher),
 			callbacks: Arc::new(NestedCallbackDispatcher::new(dispatcher)),
@@ -1258,7 +1294,20 @@ impl HookControlFactory {
 			mcp_journal: Arc::new(RwLock::new(None)),
 			provider_response_subscribed: Arc::new(AtomicBool::new(false)),
 			settings: Arc::new(settings),
-		})
+			admission_gate: Arc::new(admission_gate),
+		});
+		let weak = Arc::downgrade(&owner);
+		tokio::spawn(async move {
+			while let Ok(dispatch) = dispatches.recv_async().await {
+				let Some(owner) = weak.upgrade() else {
+					break;
+				};
+				tokio::spawn(async move {
+					owner.answer_admission_dispatch(dispatch).await;
+				});
+			}
+		});
+		owner
 	}
 
 	fn settings_for(&self, identity: &ControlConnectionIdentity) -> JsonMap<String, JsonValue> {
@@ -1269,12 +1318,101 @@ impl HookControlFactory {
 			.unwrap_or_default()
 	}
 
+	async fn answer_admission_dispatch(&self, dispatch: AgentHookDispatch) {
+		let event = hook_event_name(dispatch.event);
+		let identity = event.as_deref().and_then(|event| {
+			self
+				.subscriptions
+				.read()
+				.values()
+				.flatten()
+				.find(|row| row.event == event)
+				.map(|row| (Arc::clone(&row.identity), row.session.clone()))
+		});
+		let decision = match (event, identity) {
+			(Some(event), Some((identity, session))) => {
+				let payload = if dispatch.phase == omp_agent::HookPhase::Observe {
+					serde_json::from_slice::<JsonValue>(&dispatch.payload).ok()
+				} else {
+					dispatch
+						.payload
+						.iter()
+						.position(|byte| *byte == b'\n')
+						.and_then(|separator| {
+							serde_json::from_slice::<JsonValue>(&dispatch.payload[separator + 1..]).ok()
+						})
+				};
+				match payload {
+					Some(payload) => {
+						let shutdown_bounded = event == "session_shutdown";
+						let mut arguments = JsonMap::new();
+						arguments.insert("event".to_owned(), JsonValue::String(event.clone()));
+						arguments
+							.insert("event_rev".to_owned(), JsonValue::from(u64::from(dispatch.rev)));
+						arguments.insert("payload".to_owned(), payload.clone());
+						let settings = self.settings_for(&identity);
+						let context = ControlRequestContext {
+							connection: identity,
+							request_id: dispatch.dispatch_id,
+							invocation: Some(ControlInvocationAuthority {
+								invocation: sf!("hook-admission:{}", dispatch.dispatch_id),
+								phase: InvocationPhase::EffectsAuthorized,
+								session,
+								turn: None,
+								event: Some(Str::from(event)),
+								call: None,
+								device: None,
+								effects: Box::new([]),
+								place_kind: sf!("host"),
+								lifecycle: LifecyclePhase::Active,
+								roots: Box::new([]),
+								remote: false,
+								has_ui: false,
+								headless: true,
+								settings,
+								secret_settings: Box::new([]),
+								data: None,
+								direct_filesystem: None,
+							}),
+						};
+						let composed = if shutdown_bounded {
+							match tokio::time::timeout(
+								time::Duration::from_secs(2),
+								self.compose(&context, &arguments),
+							)
+							.await
+							{
+								Ok(result) => result,
+								Err(_) => Ok(json!({"kind": "defer"})),
+							}
+						} else {
+							self.compose(&context, &arguments).await
+						};
+						match composed {
+							Ok(value) => gate_decision_from_json(value, payload),
+							Err(error) => GateDecision::Deny(error.message),
+						}
+					},
+					None => GateDecision::Deny(sf!("malformed hook admission payload")),
+				}
+			},
+			_ => GateDecision::Deny(sf!("required hook subscription unavailable")),
+		};
+		let _ = self
+			.admission_gate
+			.answer(dispatch.dispatch_id, vec![(0, decision)]);
+	}
+
 	/// Binds durable accounting for drop-oldest MCP queue overflow.
 	pub fn bind_mcp_drop_journal(&self, telemetry: Arc<TelemetryIndex>, session: Str) {
 		*self.mcp_journal.write() = Some((telemetry, session));
 	}
 
 	/// Returns the per-session admission gate backed by this live composer.
+	pub fn admission_gate(&self) -> Arc<HookGate> {
+		Arc::clone(&self.admission_gate)
+	}
+
 	/// Returns the shared runtime provider usage registry.
 	pub fn usage_fetchers(&self) -> UsageFetcherRegistry {
 		self.usage_fetchers.clone()
@@ -1349,10 +1487,7 @@ impl HookControlFactory {
 		if rows.last().is_some_and(|row| row.event == "provider_usage") {
 			let fetchers = self.usage_fetchers.clone();
 			let row = rows.last().expect("subscription was just inserted");
-			let session = evidence
-				.session
-				.clone()
-				.unwrap_or_else(|| row.identity.extension.clone());
+			let session = row.session.clone();
 			for provider in row.providers.as_deref().unwrap_or_default() {
 				fetchers.register_runtime(
 					usage_registration_id(row),
@@ -1377,6 +1512,12 @@ impl HookControlFactory {
 				.any(|row| row.event == "provider_response" && row.phase == "observe"),
 			Ordering::Release,
 		);
+		let mask = subscriptions
+			.values()
+			.flatten()
+			.filter_map(|row| hook_event_id(row.event.as_str()))
+			.fold(0_u128, |mask, event| mask | (1_u128 << event as u32));
+		self.admission_gate.replace_union_mask(mask);
 		Ok(())
 	}
 
@@ -1519,6 +1660,101 @@ impl HookControlFactory {
 		}
 	}
 
+	async fn dispatch_provider_domain(
+		&self,
+		event: &'static str,
+		provider: &ProviderId<str>,
+		payload: JsonValue,
+		fail_closed: bool,
+	) -> Result<Vec<JsonValue>, ProviderHookError> {
+		let mut rows = self
+			.subscriptions
+			.read()
+			.values()
+			.flat_map(|rows| rows.iter())
+			.filter(|row| {
+				row.event == event
+					&& row.phase == "domain"
+					&& row.providers.as_ref().is_none_or(|providers| {
+						providers
+							.iter()
+							.any(|candidate| candidate.as_str() == provider.as_str())
+					})
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		rows.sort_by(|left, right| {
+			left
+				.identity
+				.layer
+				.cmp(&right.identity.layer)
+				.then_with(|| left.identity.tier.cmp(&right.identity.tier))
+				.then_with(|| left.identity.extension.cmp(&right.identity.extension))
+				.then_with(|| left.name.cmp(&right.name))
+		});
+		if rows.is_empty() {
+			return Err(ProviderHookError::Unavailable);
+		}
+		let mut values = Vec::with_capacity(rows.len());
+		for row in rows {
+			let session = row.session.clone();
+			let context = ControlRequestContext {
+				connection: Arc::clone(&row.identity),
+				request_id: 0,
+				invocation: Some(ControlInvocationAuthority {
+					invocation: sf!("{event}:{}", Ulid::generate()),
+					phase: InvocationPhase::EffectsAuthorized,
+					session,
+					turn: None,
+					event: Some(Str::new_static(event)),
+					call: None,
+					device: None,
+					effects: Box::new([]),
+					place_kind: sf!("host"),
+					lifecycle: LifecyclePhase::Active,
+					roots: Box::new([]),
+					remote: false,
+					has_ui: event == "provider_login",
+					headless: event != "provider_login",
+					settings: self.settings_for(&row.identity),
+					secret_settings: Box::new([]),
+					data: None,
+					direct_filesystem: None,
+				}),
+			};
+			let mut callback = JsonMap::new();
+			callback.insert("event".to_owned(), JsonValue::String(event.to_owned()));
+			callback.insert("phase".to_owned(), JsonValue::String("domain".to_owned()));
+			callback.insert("name".to_owned(), JsonValue::String(row.name.to_string()));
+			callback.insert("payload".to_owned(), payload.clone());
+			match self
+				.callbacks
+				.dispatch_provider_hook(
+					Arc::clone(&row.identity),
+					&context,
+					event,
+					callback,
+					row.concurrency,
+					row.timeout.unwrap_or(row.event_policy.timeout),
+				)
+				.await
+			{
+				Ok(value) => values.push(value),
+				Err(_) if fail_closed => return Err(ProviderHookError::Failed),
+				Err(_) => {},
+			}
+		}
+		if values.is_empty() {
+			Err(if fail_closed {
+				ProviderHookError::Failed
+			} else {
+				ProviderHookError::Unavailable
+			})
+		} else {
+			Ok(values)
+		}
+	}
+
 	async fn compose(
 		&self,
 		context: &ControlRequestContext,
@@ -1537,6 +1773,7 @@ impl HookControlFactory {
 			));
 		}
 		let mut payload = arguments.get("payload").cloned().unwrap_or(JsonValue::Null);
+		let scoped_provider = payload.get("provider").and_then(JsonValue::as_str);
 		let mut rows = self
 			.subscriptions
 			.read()
@@ -1545,6 +1782,17 @@ impl HookControlFactory {
 			.filter(|row| {
 				row.event == event
 					&& row.identity.session_generation == context.connection.session_generation
+					&& row.providers.as_ref().is_none_or(|providers| {
+						scoped_provider.is_none_or(|provider| {
+							providers
+								.iter()
+								.any(|candidate| candidate.as_str() == provider)
+						})
+					}) && lifecycle_hook_recipient(
+					event.as_str(),
+					&payload,
+					row.identity.extension.as_str(),
+				)
 			})
 			.cloned()
 			.collect::<Vec<_>>();
@@ -1608,6 +1856,115 @@ impl HookControlFactory {
 	}
 }
 
+fn hook_event_id(event: &str) -> Option<HookEventId> {
+	let mut name = String::with_capacity("HOOK_EVENT_".len() + event.len());
+	name.push_str("HOOK_EVENT_");
+	name.extend(
+		event
+			.chars()
+			.map(|character| character.to_ascii_uppercase()),
+	);
+	HookEventId::from_str_name(&name)
+}
+
+fn hook_event_name(event: HookEventId) -> Option<String> {
+	event
+		.as_str_name()
+		.strip_prefix("HOOK_EVENT_")
+		.map(str::to_ascii_lowercase)
+}
+
+fn gate_decision_from_json(value: JsonValue, mut payload: JsonValue) -> GateDecision {
+	let Some(decision) = value.as_object() else {
+		return GateDecision::Deny(sf!("hook composer returned a non-object decision"));
+	};
+	match decision.get("kind").and_then(JsonValue::as_str) {
+		Some("allow") => GateDecision::Allow,
+		Some("defer") => GateDecision::Defer,
+		Some("modify") => {
+			let Some(effective) = payload.as_object_mut() else {
+				return GateDecision::Deny(sf!("hook modification requires an object payload"));
+			};
+			for (field, value) in decision
+				.get("patch")
+				.and_then(JsonValue::as_object)
+				.into_iter()
+				.flatten()
+			{
+				effective.insert(field.clone(), value.clone());
+			}
+			for field in decision
+				.get("unset")
+				.and_then(JsonValue::as_array)
+				.into_iter()
+				.flatten()
+				.filter_map(JsonValue::as_str)
+			{
+				effective.remove(field);
+			}
+			match serde_json::to_vec(&payload) {
+				Ok(args) => GateDecision::Modify(HookPatch {
+					target: None,
+					args:   Some(bytes::Bytes::from(args)),
+				}),
+				Err(error) => GateDecision::Deny(Str::from(format!(
+					"could not encode effective hook payload: {error}"
+				))),
+			}
+		},
+		Some("deny") => {
+			let reason = decision
+				.get("reason")
+				.and_then(JsonValue::as_str)
+				.map_or_else(|| sf!("hook policy denied operation"), Str::from);
+			let code = decision
+				.get("code")
+				.and_then(JsonValue::as_str)
+				.map(Str::from);
+			let decision_id = decision
+				.get("decision_id")
+				.and_then(JsonValue::as_str)
+				.map_or_else(|| Str::from(Ulid::generate().to_string()), Str::from);
+			let rules = decision
+				.get("rules")
+				.and_then(JsonValue::as_array)
+				.into_iter()
+				.flatten()
+				.filter_map(|rule| {
+					rule
+						.as_object()
+						.and_then(|rule| rule.get("id"))
+						.and_then(JsonValue::as_str)
+						.map(Str::from)
+				})
+				.collect::<Vec<_>>();
+			GateDecision::DenyPolicy(Arc::new(omp_tool::PolicyDenied {
+				reason,
+				code,
+				decision_id,
+				rules: rules.into(),
+			}))
+		},
+		Some("require_approval") => {
+			match decision
+				.get("spec")
+				.cloned()
+				.ok_or_else(|| {
+					ControlProtocolError::new(
+						"HookContractError",
+						"approval decision omitted its specification",
+					)
+				})
+				.and_then(crate::policy::approval_spec)
+			{
+				Ok(spec) => GateDecision::RequireApproval(spec),
+				Err(error) => GateDecision::Deny(error.message),
+			}
+		},
+		_ => GateDecision::Deny(sf!("hook composer returned an illegal admission decision")),
+	}
+}
+
 impl McpNotificationSink for HookControlFactory {
 	fn interested(&self, server: &str, method: &str) -> bool {
 		self
@@ -1658,7 +2015,521 @@ impl McpNotificationSink for HookControlFactory {
 	}
 }
 
+impl ProviderHookObserver for HookControlFactory {
+	fn provider_login_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		provider_hook_subscribed(self, "provider_login", provider)
+	}
+
+	fn provider_login<'a>(
+		&'a self,
+		request: ProviderLoginHookRequest,
+	) -> std::pin::Pin<
+		Box<dyn Future<Output = Result<ProviderHookCredential, ProviderHookError>> + Send + 'a>,
+	> {
+		Box::pin(async move {
+			let method: &'static str = request.method.into();
+			let mut values = self
+				.dispatch_provider_domain(
+					"provider_login",
+					&request.provider,
+					json!({
+						"provider": request.provider,
+						"method": method.replace('-', "_"),
+						"ui": {},
+					}),
+					true,
+				)
+				.await?;
+			parse_provider_credential(values.pop().ok_or(ProviderHookError::Failed)?)
+		})
+	}
+
+	fn provider_refresh_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		provider_hook_subscribed(self, "provider_refresh", provider)
+	}
+
+	fn provider_refresh<'a>(
+		&'a self,
+		request: ProviderRefreshHookRequest,
+	) -> std::pin::Pin<
+		Box<dyn Future<Output = Result<ProviderHookCredential, ProviderHookError>> + Send + 'a>,
+	> {
+		Box::pin(async move {
+			let mut values = self
+				.dispatch_provider_domain(
+					"provider_refresh",
+					&request.provider,
+					json!({
+						"provider": request.provider,
+						"identity": request.identity,
+						"refresh_token": {
+							"$bytes": omp_core::base64::encode(
+								request.refresh_token.expose_secret().as_bytes()
+							),
+						},
+						"expires_at_ms": request.expires_at_ms,
+						"props": request.props,
+						"reason": request.reason.to_string(),
+					}),
+					true,
+				)
+				.await?;
+			parse_provider_credential(values.pop().ok_or(ProviderHookError::Failed)?)
+		})
+	}
+
+	fn provider_sign_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		provider_hook_subscribed(self, "provider_sign", provider)
+	}
+
+	fn provider_sign<'a>(
+		&'a self,
+		request: ProviderSignHookRequest,
+	) -> std::pin::Pin<
+		Box<dyn Future<Output = Result<ProviderSignature, ProviderHookError>> + Send + 'a>,
+	> {
+		Box::pin(async move {
+			let provider = request.provider.clone();
+			let headers = request
+				.headers
+				.iter()
+				.map(|header| (header.name.to_string(), JsonValue::String(header.value.to_string())))
+				.collect::<JsonMap<_, _>>();
+			let mut values = self
+				.dispatch_provider_domain(
+					"provider_sign",
+					&provider,
+					json!({
+						"provider": request.provider,
+						"route": request.route,
+						"method": request.method,
+						"url": request.url,
+						"headers": headers,
+						"body_sha256": {
+							"$bytes": omp_core::base64::encode(&request.body_sha256),
+						},
+						"signer": {},
+					}),
+					true,
+				)
+				.await?;
+			parse_provider_signature(values.pop().ok_or(ProviderHookError::Failed)?)
+		})
+	}
+
+	fn models_discover_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		provider_hook_subscribed(self, "models_discover", provider)
+	}
+
+	fn models_discover<'a>(
+		&'a self,
+		request: ModelsDiscoverHookRequest,
+	) -> std::pin::Pin<
+		Box<dyn Future<Output = Result<ModelsDiscoverHookPage, ProviderHookError>> + Send + 'a>,
+	> {
+		Box::pin(async move {
+			let values = self
+				.dispatch_provider_domain(
+					"models_discover",
+					&request.provider,
+					json!({
+						"provider": request.provider,
+						"route": request.route,
+						"cursor": request.cursor,
+						"page_size": request.page_size,
+						"trigger": request.trigger,
+					}),
+					false,
+				)
+				.await?;
+			let mut pages = values
+				.into_iter()
+				.map(parse_discovery_page)
+				.collect::<Result<Vec<_>, _>>()?;
+			let Some(mut page) = pages.pop() else {
+				return Err(ProviderHookError::Unavailable);
+			};
+			for prior in pages {
+				let ids = page
+					.models
+					.iter()
+					.filter_map(|model| model.get("id").and_then(JsonValue::as_str))
+					.map(Str::new)
+					.collect::<BTreeSet<_>>();
+				let retained = prior
+					.models
+					.into_vec()
+					.into_iter()
+					.filter(|model| {
+						model
+							.get("id")
+							.and_then(JsonValue::as_str)
+							.is_some_and(|id| ids.contains(id))
+					})
+					.collect::<Vec<_>>();
+				page.models = retained.into_boxed_slice();
+				page.authoritative |= prior.authoritative;
+			}
+			Ok(page)
+		})
+	}
+}
+
+fn provider_hook_subscribed(
+	owner: &HookControlFactory,
+	event: &str,
+	provider: &ProviderId<str>,
+) -> bool {
+	owner.subscriptions.read().values().flatten().any(|row| {
+		row.event == event
+			&& row.phase == "domain"
+			&& row.providers.as_ref().is_none_or(|providers| {
+				providers
+					.iter()
+					.any(|candidate| candidate.as_str() == provider.as_str())
+			})
+	})
+}
+
+fn parse_provider_credential(
+	value: JsonValue,
+) -> Result<ProviderHookCredential, ProviderHookError> {
+	let object = value.as_object().ok_or(ProviderHookError::InvalidResult)?;
+	let kind = object
+		.get("kind")
+		.and_then(JsonValue::as_str)
+		.filter(|kind| matches!(*kind, "api_key" | "bearer" | "oauth" | "aws" | "session"))
+		.ok_or(ProviderHookError::InvalidResult)?;
+	let secret = parse_hook_secret(
+		object
+			.get("secret")
+			.ok_or(ProviderHookError::InvalidResult)?,
+	)?;
+	let refresh_token = object
+		.get("refresh_token")
+		.filter(|value| !value.is_null())
+		.map(parse_hook_secret)
+		.transpose()?;
+	let props = object
+		.get("props")
+		.and_then(JsonValue::as_object)
+		.cloned()
+		.unwrap_or_default();
+	if props.values().any(|value| {
+		!matches!(value, JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_))
+	}) {
+		return Err(ProviderHookError::InvalidResult);
+	}
+	Ok(ProviderHookCredential {
+		kind: Str::new(kind),
+		secret,
+		refresh_token,
+		expires_at_ms: object.get("expires_at_ms").and_then(JsonValue::as_u64),
+		identity: object
+			.get("identity")
+			.and_then(JsonValue::as_str)
+			.map(Str::new),
+		props,
+	})
+}
+
+fn parse_hook_secret(value: &JsonValue) -> Result<SecretString, ProviderHookError> {
+	let encoded = value
+		.as_object()
+		.and_then(|object| object.get("$bytes"))
+		.and_then(JsonValue::as_str)
+		.ok_or(ProviderHookError::InvalidResult)?;
+	let bytes = omp_core::base64::decode(encoded)
+		.into_vec()
+		.map_err(|_| ProviderHookError::InvalidResult)?;
+	let value = String::from_utf8(bytes).map_err(|_| ProviderHookError::InvalidResult)?;
+	if value.is_empty() {
+		return Err(ProviderHookError::InvalidResult);
+	}
+	Ok(SecretString::from(value))
+}
+
+fn parse_provider_signature(value: JsonValue) -> Result<ProviderSignature, ProviderHookError> {
+	let object = value.as_object().ok_or(ProviderHookError::InvalidResult)?;
+	let parse = |field: &str| {
+		object
+			.get(field)
+			.and_then(JsonValue::as_object)
+			.into_iter()
+			.flatten()
+			.map(|(name, value)| {
+				let value = value
+					.as_str()
+					.filter(|value| !value.is_empty())
+					.ok_or(ProviderHookError::InvalidResult)?;
+				Ok((Str::new(name), SecretString::from(value)))
+			})
+			.collect::<Result<Vec<_>, ProviderHookError>>()
+			.map(Vec::into_boxed_slice)
+	};
+	Ok(ProviderSignature { headers: parse("headers")?, query: parse("query")? })
+}
+
+fn parse_discovery_page(value: JsonValue) -> Result<ModelsDiscoverHookPage, ProviderHookError> {
+	if let JsonValue::Array(models) = value {
+		return Ok(ModelsDiscoverHookPage {
+			models:        models.into_boxed_slice(),
+			next_cursor:   None,
+			authoritative: false,
+		});
+	}
+	let object = value.as_object().ok_or(ProviderHookError::InvalidResult)?;
+	let models = object
+		.get("models")
+		.and_then(JsonValue::as_array)
+		.cloned()
+		.ok_or(ProviderHookError::InvalidResult)?;
+	if models
+		.iter()
+		.any(|model| model.get("id").and_then(JsonValue::as_str).is_none())
+	{
+		return Err(ProviderHookError::InvalidResult);
+	}
+	Ok(ModelsDiscoverHookPage {
+		models:        models.into_boxed_slice(),
+		next_cursor:   object
+			.get("next_cursor")
+			.and_then(JsonValue::as_str)
+			.map(Str::new),
+		authoritative: object
+			.get("authoritative")
+			.and_then(JsonValue::as_bool)
+			.unwrap_or(false),
+	})
+}
+
 impl ProviderResponseObserver for HookControlFactory {
+	fn before_request_subscribed(&self) -> bool {
+		self
+			.admission_gate
+			.subscribed(HookEventId::HookEventBeforeRequest)
+	}
+
+	fn before_request<'a>(
+		&'a self,
+		draft: &'a BeforeRequestDraft,
+	) -> std::pin::Pin<
+		Box<dyn Future<Output = Result<BeforeRequestMutation, BeforeRequestDenied>> + Send + 'a>,
+	> {
+		let owner = self.clone();
+		Box::pin(async move {
+			let identity = owner
+				.subscriptions
+				.read()
+				.values()
+				.flatten()
+				.find(|row| {
+					row.event == "before_request"
+						&& row.providers.as_ref().is_none_or(|providers| {
+							providers
+								.iter()
+								.any(|provider| provider == draft.provider.as_str())
+						})
+				})
+				.map(|row| (Arc::clone(&row.identity), row.session.clone()));
+			let Some((identity, session)) = identity else {
+				return Ok(BeforeRequestMutation::default());
+			};
+			let context = ControlRequestContext {
+				connection: Arc::clone(&identity),
+				request_id: 0,
+				invocation: Some(ControlInvocationAuthority {
+					invocation: sf!("before-request:{}", Ulid::generate()),
+					phase: InvocationPhase::EffectsAuthorized,
+					session,
+					turn: None,
+					event: Some(sf!("before_request")),
+					call: None,
+					device: None,
+					effects: Box::new([]),
+					place_kind: sf!("host"),
+					lifecycle: LifecyclePhase::Active,
+					roots: Box::new([]),
+					remote: false,
+					has_ui: false,
+					headless: true,
+					settings: owner.settings_for(&identity),
+					secret_settings: Box::new([]),
+					data: None,
+					direct_filesystem: None,
+				}),
+			};
+			let headers = draft
+				.headers
+				.iter()
+				.map(|header| (header.name.to_string(), JsonValue::String(header.value.to_string())))
+				.collect::<JsonMap<_, _>>();
+			let mut arguments = JsonMap::new();
+			arguments.insert("event".to_owned(), JsonValue::String("before_request".to_owned()));
+			arguments.insert("event_rev".to_owned(), JsonValue::from(1));
+			arguments.insert(
+				"payload".to_owned(),
+				json!({
+					"provider": draft.provider,
+					"route": draft.route,
+					"model": draft.model,
+					"operation": draft.operation.to_string(),
+					"scalars": draft.scalars,
+					"headers": headers,
+					"intents": draft.intents,
+					"message_count": draft.message_count,
+					"approx_prompt_tokens": draft.approx_prompt_tokens,
+				}),
+			);
+			let decision = match owner.compose(&context, &arguments).await {
+				Ok(decision) => decision,
+				Err(_) => return Ok(BeforeRequestMutation::default()),
+			};
+			let Some(decision) = decision.as_object() else {
+				return Ok(BeforeRequestMutation::default());
+			};
+			match decision.get("kind").and_then(JsonValue::as_str) {
+				Some("deny") => {
+					let reason = decision
+						.get("reason")
+						.and_then(JsonValue::as_str)
+						.unwrap_or("provider request denied");
+					return Err(BeforeRequestDenied {
+						reason: Str::new(reason),
+						code:   decision
+							.get("code")
+							.and_then(JsonValue::as_str)
+							.map(Str::new),
+					});
+				},
+				Some("modify") => {},
+				_ => return Ok(BeforeRequestMutation::default()),
+			}
+			let patch = decision
+				.get("patch")
+				.and_then(JsonValue::as_object)
+				.cloned()
+				.unwrap_or_default();
+			let body = patch
+				.get("body")
+				.and_then(JsonValue::as_object)
+				.cloned()
+				.unwrap_or_default();
+			let headers = patch
+				.get("headers")
+				.and_then(JsonValue::as_object)
+				.map(|headers| {
+					headers
+						.iter()
+						.filter_map(|(name, value)| {
+							(value.is_null() || value.is_string())
+								.then(|| (Str::new(name), value.as_str().map(Str::new)))
+						})
+						.collect::<Vec<_>>()
+						.into_boxed_slice()
+				})
+				.unwrap_or_default();
+			let intents = patch
+				.get("intents")
+				.and_then(JsonValue::as_array)
+				.map(|values| values.clone().into_boxed_slice());
+			let timeout = patch
+				.get("timeout")
+				.and_then(|value| {
+					value
+						.as_str()
+						.or_else(|| value.get("$duration").and_then(JsonValue::as_str))
+				})
+				.and_then(|value| value.parse::<omp_core::Duration>().ok())
+				.and_then(|value| value.to_std().ok());
+			Ok(BeforeRequestMutation { body, headers, intents, timeout })
+		})
+	}
+
+	fn credential_disabled_subscribed(&self) -> bool {
+		self
+			.admission_gate
+			.subscribed(HookEventId::HookEventCredentialDisabled)
+	}
+
+	fn observe_credential_disabled(&self, observation: CredentialDisabledObservation) {
+		let subscriptions = self
+			.subscriptions
+			.read()
+			.values()
+			.flatten()
+			.filter(|row| {
+				row.event == "credential_disabled"
+					&& row.phase == "observe"
+					&& row.providers.as_ref().is_none_or(|providers| {
+						providers
+							.iter()
+							.any(|provider| provider == observation.provider.as_str())
+					})
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		if subscriptions.is_empty() {
+			return;
+		}
+		let owner = self.clone();
+		tokio::spawn(async move {
+			for subscription in subscriptions {
+				let mut arguments = JsonMap::new();
+				arguments.insert(
+					String::from("event"),
+					JsonValue::String(String::from("credential_disabled")),
+				);
+				arguments.insert(String::from("phase"), JsonValue::String(String::from("observe")));
+				arguments
+					.insert(String::from("name"), JsonValue::String(subscription.name.to_string()));
+				arguments.insert(
+					String::from("payload"),
+					json!({
+						"provider": observation.provider,
+						"account": observation.account.as_ref().map(ToString::to_string),
+						"cause": observation.cause,
+					}),
+				);
+				let session_generation = subscription.identity.session_generation;
+				let _ = owner
+					.dispatcher
+					.dispatch(Arc::clone(&subscription.identity), ControlDispatch {
+						operation: sf!("omp.hooks.dispatch"),
+						arguments,
+						authority: ControlInvocationAuthority {
+							invocation:        sf!("credential-disabled:{}", observation.provider),
+							phase:             InvocationPhase::Open,
+							session:           sf!("session-{session_generation}"),
+							turn:              None,
+							event:             Some(sf!("credential_disabled")),
+							call:              None,
+							device:            None,
+							effects:           Box::new([]),
+							place_kind:        sf!("host"),
+							lifecycle:         LifecyclePhase::Active,
+							roots:             Box::new([]),
+							remote:            false,
+							has_ui:            false,
+							headless:          true,
+							settings:          owner.settings_for(&subscription.identity),
+							secret_settings:   Box::new([]),
+							data:              None,
+							direct_filesystem: None,
+						},
+						policy: subscription.concurrency,
+						deadline: EventDeadline {
+							at: time::Instant::now()
+								+ subscription
+									.timeout
+									.unwrap_or(subscription.event_policy.timeout),
+						},
+					})
+					.await;
+			}
+		});
+	}
+
 	fn subscribed(&self) -> bool {
 		self.provider_response_subscribed.load(Ordering::Relaxed)
 	}
@@ -1893,6 +2764,14 @@ fn hook_phase_rank(phase: &str) -> u8 {
 	}
 }
 
+fn lifecycle_hook_recipient(event: &str, payload: &JsonValue, extension: &str) -> bool {
+	!matches!(event, "extension_load" | "extension_unload")
+		|| payload
+			.get("extension")
+			.and_then(JsonValue::as_str)
+			.is_none_or(|subject| subject != extension)
+}
+
 fn compose_hook_modify(
 	policy: &HookEventPolicy,
 	payload: &mut JsonValue,
@@ -1960,12 +2839,14 @@ fn compose_hook_modify(
 						format!("intersect-composed hook field {field} must be an array"),
 					)
 				})?;
-				JsonValue::Array(
+				JsonValue::Array(if payload_object.get(&field).is_none_or(JsonValue::is_null) {
+					requested.clone()
+				} else {
 					current
 						.into_iter()
 						.filter(|item| requested.contains(item))
-						.collect(),
-				)
+						.collect()
+				})
 			},
 		};
 		payload_object.insert(field.clone(), composed.clone());
@@ -2254,6 +3135,7 @@ pub(crate) fn production_registry<
 	acp_settings: &AcpSettings,
 	acp_exec: AcpExecSlot,
 	autolearn_settings: &omp_memory::config::AutolearnSettings,
+	hooks: Arc<HookGate>,
 	device_invoker: I,
 	prelude_invoker: P,
 	policy: ToolsPolicy,
@@ -2410,7 +3292,11 @@ pub(crate) fn production_registry<
 	}
 	if autolearn_settings.enabled {
 		if let Some(managed_skills_root) = content.managed_skills_root {
-			let authority = Arc::new(ManagedSkills::new(managed_skills_root, content.authored_skills));
+			let authority = Arc::new(ManagedSkills::new(
+				managed_skills_root,
+				content.authored_skills,
+				Arc::clone(&hooks),
+			));
 			registry.register(
 				omp_tools::manage_skill::tool(Arc::clone(&authority)),
 				Presentation::Device,
@@ -2762,6 +3648,7 @@ pub(crate) fn production_registry<
 			catalog.clone(),
 			Arc::new(device_invoker),
 			previews.clone(),
+			Arc::clone(&hooks),
 		)));
 	}
 	if tool_settings.enabled("bash") && shell_settings.enabled {
@@ -2844,6 +3731,7 @@ pub(crate) fn production_registry<
 	} else {
 		None
 	};
+	let granted_hard_slots = granted_hard_slots(workers.registrations(), &policy);
 	for registration in workers.registrations() {
 		let declaration = &registration.declaration;
 		if is_prelude_declaration(declaration)? {
@@ -2853,10 +3741,25 @@ pub(crate) fn production_registry<
 		if flattened_slots.is_some() {
 			spec.name = Str::from(spec.name.as_str().replace('/', "_"));
 		}
+		let device_name = spec.name.clone();
+		let owner = registration.owner.clone();
 		ensure_name_absent(&registry, &spec.name)?;
-		registry.register_worker(
+		let execution = match WorkerExecutionMode::try_from(declaration.execution_mode) {
+			Ok(WorkerExecutionMode::Unspecified | WorkerExecutionMode::Parallel) => {
+				ExecutionMode::Parallel
+			},
+			Ok(WorkerExecutionMode::Sequential) => ExecutionMode::Sequential,
+			Err(_) => {
+				return Err(worker_declaration_error("worker execution mode is invalid"));
+			},
+		};
+		registry.register_worker_with_mode(
 			spec,
 			if flattened_slots.is_some() {
+				Presentation::Slot
+			} else if granted_hard_slots
+				.contains(&(device_name.clone(), registration.owner.extension().clone()))
+			{
 				Presentation::Slot
 			} else {
 				Presentation::Device
@@ -2866,7 +3769,18 @@ pub(crate) fn production_registry<
 				claimant:   registration.owner.extension().clone(),
 				replaces:   None,
 			},
+			execution,
 		)?;
+		registry.bind_device_metadata(
+			device_name,
+			owner.extension().clone(),
+			omp_tool::DeviceMetadata {
+				extension_id: Some(owner.extension().clone()),
+				layer: Some(owner.layer().clone()),
+				tier: Some(owner.tier().clone()),
+				..omp_tool::DeviceMetadata::default()
+			},
+		);
 	}
 	let registry = Arc::new(registry);
 	catalog
@@ -3030,6 +3944,31 @@ fn preflight_python_eval(
 	python_engine()?;
 	ProcessEvalExec::production(host, interrupt_grace, blobs, configured_interpreter)
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))
+}
+
+fn granted_hard_slots(
+	registrations: &[OwnedToolDecl],
+	policy: &ToolsPolicy,
+) -> BTreeSet<(Str, Str)> {
+	if *policy != ToolsPolicy::Auto {
+		return BTreeSet::new();
+	}
+	let mut claims = registrations
+		.iter()
+		.filter(|registration| registration.hard_granted && registration.declaration.kind == "hard")
+		.filter_map(|registration| {
+			registration
+				.declaration
+				.definition
+				.as_ref()
+				.map(|definition| {
+					(Str::from(definition.name.as_str()), registration.owner.extension().clone())
+				})
+		})
+		.collect::<Vec<_>>();
+	claims.sort_unstable();
+	claims.truncate(HARD_SLOT_BUDGET);
+	claims.into_iter().collect()
 }
 
 fn ensure_name_absent(registry: &Registry, name: &str) -> Result<(), EnvdError> {
@@ -3315,12 +4254,13 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 	match kind {
 		tool_constraint::Kind::Schema(schema) => Ok(Constraint::Schema {
 			priority:       constraint_priority(schema.priority)?,
-			on_unsupported: v1::Fallback::Unspecified,
+			on_unsupported: worker_fallback(schema.on_unsupported)?,
 		}),
 		tool_constraint::Kind::Grammar(grammar) => {
 			let syntax = match WorkerGrammarSyntax::try_from(grammar.syntax) {
 				Ok(WorkerGrammarSyntax::Lark) => GrammarSyntax::Lark,
 				Ok(WorkerGrammarSyntax::Regex) => GrammarSyntax::Regex,
+				Ok(WorkerGrammarSyntax::Ebnf) => GrammarSyntax::Ebnf,
 				_ => {
 					return Err(worker_declaration_error(
 						"worker grammar constraint has an unsupported syntax",
@@ -3331,7 +4271,7 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 				syntax,
 				definition: Str::from(grammar.definition.as_str()),
 				priority: constraint_priority(grammar.priority)?,
-				on_unsupported: v1::Fallback::Unspecified,
+				on_unsupported: worker_fallback(grammar.on_unsupported)?,
 			})
 		},
 		tool_constraint::Kind::Textual(_) => {
@@ -3341,6 +4281,11 @@ fn worker_constraint(declaration: &ToolDecl) -> Result<Constraint, EnvdError> {
 			Err(worker_declaration_error("worker JSON constraints are not supported"))
 		},
 	}
+}
+
+fn worker_fallback(value: i32) -> Result<v1::Fallback, EnvdError> {
+	v1::Fallback::try_from(value)
+		.map_err(|_| worker_declaration_error("worker constraint fallback is invalid"))
 }
 
 fn constraint_priority(priority: u32) -> Result<u8, EnvdError> {
@@ -3369,6 +4314,54 @@ mod tests {
 			annotation:   None,
 			props:        None,
 		}
+	}
+
+	#[test]
+	fn lifecycle_observe_excludes_subject_and_reaches_second_active_extension() {
+		let payload = json!({"extension": "publisher.subject"});
+		let active = ["publisher.subject", "publisher.observer"];
+		let recipients = active
+			.into_iter()
+			.filter(|extension| lifecycle_hook_recipient("extension_load", &payload, extension))
+			.collect::<Vec<_>>();
+		assert_eq!(recipients, ["publisher.observer"]);
+		assert!(!lifecycle_hook_recipient("extension_unload", &payload, "publisher.subject",));
+		assert!(lifecycle_hook_recipient("extension_unload", &payload, "publisher.observer",));
+	}
+
+	#[test]
+	fn session_branch_transform_composes_summarize() {
+		let policy = HookEventPolicy {
+			revision:    1,
+			timeout:     time::Duration::from_secs(1),
+			on_failure:  HookFailurePolicy::Defer,
+			default:     json!({"kind": "allow"}),
+			composition: BTreeMap::from([(sf!("summarize"), HookFieldComposition::Replace)]),
+		};
+		let mut payload = json!({
+			"at_event": 9,
+			"keep_event": 9,
+			"reason": "user",
+			"summarize": false,
+		});
+		let mut modification = None;
+		let decision = json!({"kind": "modify", "patch": {"summarize": true}});
+		compose_hook_modify(
+			&policy,
+			&mut payload,
+			&mut modification,
+			decision.as_object().expect("modify object"),
+		)
+		.expect("compose branch summarize");
+		assert_eq!(payload["summarize"], true);
+		assert_eq!(
+			modification
+				.as_ref()
+				.and_then(|value| value.get("patch"))
+				.and_then(JsonValue::as_object)
+				.and_then(|patch| patch.get("summarize")),
+			Some(&JsonValue::Bool(true)),
+		);
 	}
 
 	#[test]
@@ -3476,6 +4469,86 @@ mod tests {
 			decode_extension_usage(json!({"windows": [{"id": "bad", "unit": "secret"}]}), observed),
 			Err(UsageFetchError::Protocol),
 		));
+	}
+
+	#[test]
+	fn hard_tool_grants_are_budgeted_and_participate_in_slot_digest() {
+		let owner = crate::worker::HostKey::new("project", "sandboxed", "hard.contract");
+		let declaration = |name: &str, granted: bool| OwnedToolDecl {
+			owner:        owner.clone(),
+			declaration:  ToolDecl {
+				definition: Some(omp_proto::inference::v1::ToolDef {
+					name:        name.to_owned(),
+					description: "hard contract".to_owned(),
+					input:       Some(tool_def::Input::JsonSchema(
+						omp_proto::inference::v1::tool_def::JsonSchema {
+							schema_json: bytes::Bytes::from_static(
+								br#"{"type":"object","additionalProperties":false}"#,
+							),
+							strict:      Some(true),
+						},
+					)),
+				}),
+				rev: "1".to_owned(),
+				kind: "hard".to_owned(),
+				..ToolDecl::default()
+			},
+			hard_granted: granted,
+		};
+		let mut registrations = (0..=HARD_SLOT_BUDGET)
+			.map(|index| declaration(&format!("hard_{index}"), true))
+			.collect::<Vec<_>>();
+		registrations.push(declaration("hard_missing", false));
+		let slots = granted_hard_slots(&registrations, &ToolsPolicy::Auto);
+		assert_eq!(slots.len(), HARD_SLOT_BUDGET);
+		assert!(slots.contains(&(sf!("hard_0"), sf!("hard.contract"))));
+		assert!(!slots.contains(&(sf!("hard_8"), sf!("hard.contract"))));
+		assert!(!slots.contains(&(sf!("hard_missing"), sf!("hard.contract"))));
+		assert!(granted_hard_slots(&registrations, &ToolsPolicy::DeviceOnly).is_empty());
+
+		let spec = |name: &str| ToolSpec {
+			name:            Str::from(name),
+			rev:             "1".parse().expect("revision"),
+			description:     sf!("hard contract"),
+			schema:          bytes::Bytes::from_static(
+				br#"{"type":"object","additionalProperties":false}"#,
+			),
+			constraint:      Constraint::None,
+			effects:         omp_tool::Effects::default(),
+			projection_code: [1; 32],
+		};
+		let claims = Claims {
+			precedence: Precedence::DEFAULT,
+			claimant:   sf!("hard.contract"),
+			replaces:   None,
+		};
+		let mut registry = Registry::new();
+		let baseline = registry.slot_hash();
+		registry
+			.register_worker(spec("hard_missing"), Presentation::Device, claims.clone())
+			.expect("ungranted hard tool remains a device");
+		assert_eq!(registry.slot_hash(), baseline);
+		registry
+			.register_worker(spec("hard_0"), Presentation::Slot, claims)
+			.expect("granted hard tool occupies a slot");
+		assert_ne!(registry.slot_hash(), baseline);
+	}
+
+	#[test]
+	fn worker_constraint_preserves_registration_fallback() {
+		let declaration = ToolDecl {
+			constraint: Some(v1::ToolConstraint {
+				kind: Some(tool_constraint::Kind::Schema(v1::SchemaConstraint {
+					priority:       73,
+					on_unsupported: omp_proto::inference::v1::Fallback::Error as i32,
+				})),
+			}),
+			..ToolDecl::default()
+		};
+		assert_eq!(worker_constraint(&declaration).expect("constraint lowers"), Constraint::Schema {
+			priority:       73,
+			on_unsupported: omp_proto::inference::v1::Fallback::Error,
+		});
 	}
 
 	#[test]

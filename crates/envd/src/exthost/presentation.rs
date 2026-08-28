@@ -20,6 +20,8 @@ use super::control::{
 pub enum UiControlRequest {
 	/// Current presentation facts.
 	Presentation,
+	/// Current invokable command roster.
+	Commands,
 	/// Icon catalog prefix lookup.
 	Icons {
 		/// Optional name prefix supplied by the extension to filter the app-owned
@@ -138,6 +140,7 @@ impl ControlAuthority for UiControlAuthority {
 		matches!(
 			operation,
 			"omp.ui.presentation"
+				| "omp.ui.commands"
 				| "omp.ui.icons"
 				| "omp.ui.editor_text"
 				| "omp.ui.themes"
@@ -485,6 +488,7 @@ fn decode_ui_request(
 ) -> Result<UiControlRequest, ControlProtocolError> {
 	let request = match operation {
 		"omp.ui.presentation" => UiControlRequest::Presentation,
+		"omp.ui.commands" => UiControlRequest::Commands,
 		"omp.ui.icons" => UiControlRequest::Icons {
 			prefix: optional_string(arguments, "prefix")?.unwrap_or_default(),
 		},
@@ -743,10 +747,10 @@ fn validate_working_indicator(effect: &Value) -> Result<(), ControlProtocolError
 		.get("frames")
 		.and_then(Value::as_array)
 		.ok_or_else(|| protocol("InvalidWorkingIndicator", "frames must be an array"))?;
-	if frames.is_empty() || frames.len() > 8 {
+	if frames.len() > 8 {
 		return Err(protocol(
 			"InvalidWorkingIndicator",
-			"working indicator requires between one and eight frames",
+			"working indicator requires at most eight frames",
 		));
 	}
 	for frame in frames {
@@ -799,13 +803,17 @@ mod tests {
 	}
 
 	#[test]
+	fn command_roster_request_decodes() {
+		let request = decode_ui_request("omp.ui.commands", &mut Map::new());
+		assert!(matches!(request, Ok(UiControlRequest::Commands)));
+	}
+
+	#[test]
 	fn working_indicator_validates_count_width_and_interval() {
 		assert!(validate_working_indicator(&indicator(json!(["◐", "◓"]), json!(80))).is_ok());
-		for invalid in [
-			indicator(json!([]), json!(80)),
-			indicator(json!(["123456789"]), json!(80)),
-			indicator(json!(["a"]), json!(0)),
-		] {
+		assert!(validate_working_indicator(&indicator(json!([]), Value::Null)).is_ok());
+		for invalid in [indicator(json!(["123456789"]), json!(80)), indicator(json!(["a"]), json!(0))]
+		{
 			assert!(validate_working_indicator(&invalid).is_err());
 		}
 	}

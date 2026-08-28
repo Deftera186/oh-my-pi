@@ -28,9 +28,11 @@ pub use control::{
 };
 pub use dispatch::{
 	CallbackConcurrency, DispatchError, DispatchPending, DispatchRequest, DispatchRouter,
-	EventDeadline, REGIME_SUBMISSION_TIMEOUT, RegimeDispatch, RegimeDispatchError,
-	UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry, UiDispatchError, UiRoster,
-	UiRosterConflict, UiShortcutRosterEntry, decode_regime_draft, decode_ui_dispatch_result,
+	EventDeadline, PromptContributionProvider, PromptContributionRecord, PromptDispatchError,
+	PromptPullContext, PromptSlotBinding, REGIME_SUBMISSION_TIMEOUT, RegimeDispatch,
+	RegimeDispatchError, UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry,
+	UiCompletionRosterEntry, UiDispatchError, UiRendererRosterEntry, UiRoster, UiRosterConflict,
+	UiShortcutRosterEntry, decode_regime_draft, decode_ui_dispatch_result,
 	shortcut_dispatch_succeeded,
 };
 pub use lifecycle::{
@@ -39,9 +41,10 @@ pub use lifecycle::{
 	ExtensionManifest, GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost,
 	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegimeDeclarationTable,
 	RegimeManifestError, RegistryAvailabilitySink, RestartReason, ToolDeclarationKey,
-	UiRegistrationError, VerifiedMarkdownTransformer, VerifiedUiRoster, validate_regime_manifests,
-	verify_ui_registration,
+	UiRegistrationError, VerifiedMarkdownTransformer, VerifiedRendererDeclaration, VerifiedUiRoster,
+	validate_regime_manifests, verify_ui_registration,
 };
+pub(crate) use lifecycle::{notify_extension_load, notify_extension_unload, notify_host_reconnect};
 pub use params::{
 	DIRECT_FILESYSTEM_CAPABILITY, DirectFilesystemAuthorityError, DirectFilesystemControlOwner,
 	DirectFilesystemEntry, DirectFilesystemExecutor, DirectFilesystemJournal,

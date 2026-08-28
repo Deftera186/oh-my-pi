@@ -385,6 +385,8 @@ pub enum BridgeHostError {
 	#[error("{0}")]
 	Message(Str),
 	/// Canonical policy denial produced before a child session exists.
+	#[error("child session spawn was denied by policy")]
+	PolicyDenied(Arc<omp_tool::PolicyDenied>),
 }
 
 impl BridgeHostError {

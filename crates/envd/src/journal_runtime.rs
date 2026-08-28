@@ -431,6 +431,7 @@ impl ControlAuthority for PersistenceControlOwner {
 			"omp.journal.entries" | "omp.journal.latest" => {
 				self.journal_query(operation.as_str(), &arguments).await
 			},
+			"omp.journal.label_of" => self.journal_label(&arguments),
 			"omp.state.append" | "omp.state.entries" | "omp.state.latest" | "omp.state.cas_put"
 			| "omp.state.cas_get" => {
 				self
@@ -439,6 +440,7 @@ impl ControlAuthority for PersistenceControlOwner {
 			},
 			"omp.sessions.list"
 			| "omp.sessions.get"
+			| "omp.sessions.journal"
 			| "omp.sessions.lineage"
 			| "omp.sessions.usage" => self.sessions_request(operation.as_str(), &arguments),
 			"omp.sessions.rename" => self.rename_session(&arguments).await,
@@ -503,6 +505,24 @@ impl PersistenceControlOwner {
 		let mut get = Map::new();
 		get.insert(String::from("session_id"), Value::String(session_id.to_owned()));
 		self.sessions_request("omp.sessions.get", &get)
+	}
+
+	fn journal_label(&self, arguments: &Map<String, Value>) -> Result<Value, ControlProtocolError> {
+		let (session, index) = parse_entry_id(required_string(arguments, "target")?)?;
+		if session != self.actor.session_id.as_str() {
+			return Err(ControlProtocolError::new(
+				"EntryAccessDenied",
+				"journal label target belongs to another session",
+			));
+		}
+		let label = resolved_journal_label(
+			&self
+				.actor
+				.sessions_dir
+				.join(format!("{}.jsonl", self.actor.session_id)),
+			index,
+		)?;
+		Ok(json!({"schema": "omp.journal.label_of.v1", "result": label}))
 	}
 
 	async fn journal_mutation(
@@ -2063,6 +2083,128 @@ fn artifact_stat_json(
 		"lines": Value::Null,
 	})
 }
+fn resolved_journal_label(path: &Path, target: u64) -> Result<Option<Str>, ControlProtocolError> {
+	let reader = transcript::Reader::open(path).map_err(protocol_error)?;
+	if target >= u64::try_from(reader.log().len()).unwrap_or(u64::MAX) {
+		return Err(ControlProtocolError::new(
+			"JournalError",
+			format!("journal target {target} is outside the physical event range"),
+		));
+	}
+	let live = reader.live();
+	let mut resolved = None;
+	for index in live.iter() {
+		let Some(transcript::Entry::Ok(event)) = reader.log().get(index) else {
+			continue;
+		};
+		if let transcript::Kind::Label { target: labelled, label } = &event.kind
+			&& *labelled == target
+		{
+			resolved = label.clone();
+		}
+	}
+	Ok(resolved)
+}
+
+fn historical_structure_page(
+	reader: &transcript::Reader,
+	session: &SessionId,
+	arguments: &Map<String, Value>,
+) -> Result<Value, ControlProtocolError> {
+	let cursor = arguments
+		.get("cursor")
+		.and_then(Value::as_str)
+		.map(str::parse::<u64>)
+		.transpose()
+		.map_err(protocol_error)?;
+	let mut current = None;
+	let mut emitted = BTreeSet::new();
+	let mut parents = BTreeMap::new();
+	let mut labels = BTreeMap::<u64, Option<Str>>::new();
+	for index in 0..u64::try_from(reader.log().len()).unwrap_or(u64::MAX) {
+		let Some(transcript::Entry::Ok(event)) = reader.log().get(index) else {
+			current = None;
+			continue;
+		};
+		match &event.kind {
+			transcript::Kind::Rewind { to } => {
+				current = (*to).filter(|target| emitted.contains(target));
+			},
+			transcript::Kind::Label { target, label } => {
+				if reader.live().contains(index) {
+					labels.insert(*target, label.clone());
+				}
+			},
+			transcript::Kind::Reset => {
+				parents.insert(index, None);
+				emitted.insert(index);
+				current = Some(index);
+			},
+			_ => {
+				parents.insert(index, current);
+				emitted.insert(index);
+				current = Some(index);
+			},
+		}
+	}
+	let leaf = reader
+		.live()
+		.iter()
+		.rev()
+		.find(|index| emitted.contains(index));
+	let mut rows = Vec::with_capacity(201);
+	for (index, parent) in parents {
+		if cursor.is_some_and(|cursor| index <= cursor) {
+			continue;
+		}
+		let Some(transcript::Entry::Ok(event)) = reader.log().get(index) else {
+			continue;
+		};
+		let mut raw = Vec::new();
+		transcript::write_line(event, &mut raw).map_err(protocol_error)?;
+		let mut data = serde_json::from_slice::<Map<String, Value>>(&raw).map_err(protocol_error)?;
+		let kind = data
+			.remove("k")
+			.and_then(|value| value.as_str().map(ToOwned::to_owned))
+			.ok_or_else(|| ControlProtocolError::new("EntryUndecodable", "event kind is missing"))?;
+		data.remove("ts");
+		rows.push(json!({
+			"id": {"session": session.0.as_str(), "index": index},
+			"parent": parent.map(|parent| json!({
+				"session": session.0.as_str(),
+				"index": parent,
+			})),
+			"kind": kind,
+			"ts": event.ts,
+			"data": data,
+			"label": labels.get(&index).cloned().flatten(),
+		}));
+		if rows.len() == 201 {
+			break;
+		}
+	}
+	let has_more = rows.len() > 200;
+	if has_more {
+		rows.pop();
+	}
+	let next = has_more.then(|| {
+		rows
+			.last()
+			.and_then(|row| row.get("id"))
+			.and_then(Value::as_object)
+			.and_then(|id| id.get("index"))
+			.and_then(Value::as_u64)
+			.unwrap_or_default()
+			.to_string()
+	});
+	Ok(json!({
+		"entries": rows,
+		"cursor": next,
+		"done": !has_more,
+		"leaf": leaf.map(|index| json!({"session": session.0.as_str(), "index": index})),
+	}))
+}
+
 fn historical_journal_page(
 	sessions_dir: &Path,
 	session: &SessionId,
@@ -2070,6 +2212,13 @@ fn historical_journal_page(
 ) -> Result<Value, ControlProtocolError> {
 	let path = sessions_dir.join(format!("{}.jsonl", session.0));
 	let reader = transcript::Reader::open(&path).map_err(protocol_error)?;
+	if arguments
+		.get("structure")
+		.and_then(Value::as_bool)
+		.unwrap_or(false)
+	{
+		return historical_structure_page(&reader, session, arguments);
+	}
 	let since = arguments.get("since").and_then(Value::as_u64);
 	let cursor = arguments
 		.get("cursor")
@@ -2150,7 +2299,7 @@ mod tests {
 	use omp_agent::{Journal, JournalAuthor, JournalRequestStamp, control::ControlMailboxEvent};
 	use omp_core::{ArtifactDigest, Principal, Provenance};
 	use omp_proto::toolhost::v1::{AdoptArtifact, PinArtifact, QueryJournal, StatArtifact};
-	use omp_storage::transcript::{Header, SessionId};
+	use omp_storage::transcript::{Event, Header, Kind, SessionId, TitleSource, Writer};
 
 	use super::*;
 
@@ -2203,6 +2352,88 @@ mod tests {
 			.send(ExternalJournalCall { request, identity: identity(), reply })
 			.expect("send external request");
 		replies.recv_async().await.expect("external response")
+	}
+
+	#[test]
+	fn resolved_label_observes_a_durable_clear() {
+		let directory = tempfile::tempdir().expect("session directory");
+		let path = directory.path().join("session.jsonl");
+		let mut journal = Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(sf!("session")),
+			created: 1,
+			cwd:     directory.path().to_path_buf(),
+		})
+		.expect("create journal");
+		let target = journal.reset(1).expect("append target");
+		let author = JournalAuthor {
+			principal:  identity().principal,
+			provenance: Provenance::new(
+				sf!("publisher"),
+				sf!("dev.example"),
+				sf!("1.0.0"),
+				ArtifactDigest::new([7; 32]),
+				sf!("workspace"),
+				sf!("trusted"),
+				0,
+			),
+		};
+		let mut label_stamp = stamp("label");
+		label_stamp.host_generation = 0;
+		label_stamp.session_generation = 0;
+		journal
+			.label(2, target, Some(sf!("remember")), &label_stamp, &author)
+			.expect("append label");
+		assert_eq!(
+			resolved_journal_label(&path, target).expect("resolve label"),
+			Some(sf!("remember"))
+		);
+
+		let mut clear_stamp = stamp("clear");
+		clear_stamp.host_generation = 0;
+		clear_stamp.session_generation = 0;
+		journal
+			.label(3, target, None, &clear_stamp, &author)
+			.expect("append label clear");
+		assert_eq!(resolved_journal_label(&path, target).expect("resolve cleared label"), None);
+	}
+
+	#[test]
+	fn structure_page_materializes_physical_branches_root_first() {
+		let directory = tempfile::tempdir().expect("session directory");
+		let path = directory.path().join("session.jsonl");
+		let mut writer = Writer::create(&path, &Header {
+			v:       4,
+			id:      SessionId(sf!("session")),
+			created: 1,
+			cwd:     directory.path().to_path_buf(),
+		})
+		.expect("create journal");
+		for event in [
+			Event { ts: 1, kind: Kind::Title { title: sf!("root"), source: TitleSource::User } },
+			Event { ts: 2, kind: Kind::Title { title: sf!("first"), source: TitleSource::User } },
+			Event { ts: 3, kind: Kind::Rewind { to: Some(0) } },
+			Event { ts: 4, kind: Kind::Title { title: sf!("second"), source: TitleSource::User } },
+			Event { ts: 5, kind: Kind::Label { target: 0, label: Some(sf!("root-label")) } },
+		] {
+			writer.append(&event).expect("append structure event");
+		}
+		drop(writer);
+		let reader = transcript::Reader::open(&path).expect("open journal");
+		let page = historical_structure_page(&reader, &SessionId(sf!("session")), &Map::new())
+			.expect("materialize structure");
+		let rows = page["entries"].as_array().expect("structure rows");
+		assert_eq!(
+			rows
+				.iter()
+				.map(|row| row["id"]["index"].as_u64())
+				.collect::<Vec<_>>(),
+			[Some(0), Some(1), Some(3),]
+		);
+		assert_eq!(rows[1]["parent"]["index"], json!(0));
+		assert_eq!(rows[2]["parent"]["index"], json!(0));
+		assert_eq!(rows[0]["label"], json!("root-label"));
+		assert_eq!(page["leaf"]["index"], json!(3));
 	}
 
 	#[tokio::test]

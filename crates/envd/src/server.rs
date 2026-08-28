@@ -16,7 +16,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
 use futures::StreamExt as _;
-use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, TicketState, control::ControlSender};
+use omp_agent::{
+	ApprovalBook, ApprovalRoute, ApprovalSpec, HookGate, TicketState, control::ControlSender,
+};
 use omp_core::{Hash32, Str, Ulid, sf};
 #[cfg(any(unix, windows))]
 use omp_docserver::connection::ConnectionConfig;
@@ -420,11 +422,14 @@ impl ConnectionPolicy {
 }
 
 /// One extension host's isolated DATA listener identity and grants.
-#[derive(Clone, Debug)]
-pub(crate) struct ExtensionDataBinding {
-	key:    HostKey,
-	path:   PathBuf,
-	grants: Grants,
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ExtensionDataBinding {
+	key:               HostKey,
+	path:              PathBuf,
+	grants:            Grants,
+	#[cfg(unix)]
+	prepared_listener: Option<std::os::unix::net::UnixListener>,
 }
 
 impl ExtensionDataBinding {
@@ -460,7 +465,7 @@ impl ExtensionDataBinding {
 
 	/// Derives one private endpoint carrying only the manifest-derived grants
 	/// admitted for `key`.
-	pub(crate) fn scoped(
+	pub fn scoped(
 		state_dir: &Path,
 		key: HostKey,
 		session_id: &str,
@@ -489,12 +494,38 @@ impl ExtensionDataBinding {
 			}
 			PathBuf::from(format!("extension-data-{}", hasher.finalize().to_hex()))
 		};
-		Self { key, path, grants }
+		Self {
+			key,
+			path,
+			grants,
+			#[cfg(unix)]
+			prepared_listener: None,
+		}
 	}
 
 	/// Returns the socket path passed only to this binding's child.
-	pub(crate) fn path(&self) -> &Path {
+	pub fn path(&self) -> &Path {
 		&self.path
+	}
+
+	/// Materializes the generated socket inode before sandbox policy
+	/// compilation.
+	///
+	/// The real DATA server takes over this listener after the extension host
+	/// has been admitted, preserving the inode granted to Linux sandboxes.
+	#[cfg(unix)]
+	pub fn prepare_endpoint(&mut self) -> io::Result<()> {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let parent = self.path.parent().ok_or_else(|| {
+			io::Error::new(io::ErrorKind::InvalidInput, "extension DATA socket has no parent")
+		})?;
+		ensure_directory(parent)?;
+		let listener = std::os::unix::net::UnixListener::bind(&self.path)?;
+		fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+		listener.set_nonblocking(true)?;
+		self.prepared_listener = Some(listener);
+		Ok(())
 	}
 
 	/// Returns the exact grants enforced for this listener.
@@ -1892,6 +1923,7 @@ pub struct EnvServer {
 	github_credentials:      Arc<GithubCredentialBridge>,
 	usage_fetchers:          omp_inference::operation::usage::UsageFetcherRegistry,
 	provider_response_hooks: omp_inference::ProviderResponseHooks,
+	admission_gate:          Arc<HookGate>,
 	checkpoint_control:      AgentCheckpointControl,
 	previews:                StagedProposalRegistry,
 	sessions_index:          Arc<SessionIndex>,
@@ -2286,6 +2318,7 @@ impl EnvServer {
 		github_credentials: Arc<GithubCredentialBridge>,
 		usage_fetchers: omp_inference::operation::usage::UsageFetcherRegistry,
 		provider_response_hooks: omp_inference::ProviderResponseHooks,
+		admission_gate: Arc<HookGate>,
 		checkpoint_control: AgentCheckpointControl,
 		previews: StagedProposalRegistry,
 		sessions_index: Arc<SessionIndex>,
@@ -2327,6 +2360,7 @@ impl EnvServer {
 			github_credentials,
 			usage_fetchers,
 			provider_response_hooks,
+			admission_gate,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2493,6 +2527,7 @@ impl EnvServer {
 			&acp_settings,
 			acp_exec.clone(),
 			&host_settings.autolearn,
+			control_bindings.hooks.admission_gate(),
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			PreludeBridgeInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
@@ -2514,6 +2549,7 @@ impl EnvServer {
 		let usage_fetchers = control_bindings.hooks.usage_fetchers();
 		let provider_response_hooks =
 			omp_inference::ProviderResponseHooks::new(control_bindings.hooks.clone());
+		let admission_gate = control_bindings.hooks.admission_gate();
 		Ok(Self::new(
 			identity,
 			documents,
@@ -2540,6 +2576,7 @@ impl EnvServer {
 			github_credentials,
 			usage_fetchers,
 			provider_response_hooks,
+			admission_gate,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2716,6 +2753,7 @@ impl EnvServer {
 			&acp_settings,
 			acp_exec.clone(),
 			&host_settings.autolearn,
+			control_bindings.hooks.admission_gate(),
 			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
 			PreludeBridgeInvoker::new(Arc::clone(&ext_hosts)),
 			omp_tool::ToolsPolicy::Auto,
@@ -2737,6 +2775,7 @@ impl EnvServer {
 		let usage_fetchers = control_bindings.hooks.usage_fetchers();
 		let provider_response_hooks =
 			omp_inference::ProviderResponseHooks::new(control_bindings.hooks.clone());
+		let admission_gate = control_bindings.hooks.admission_gate();
 		Ok(Self::new(
 			identity,
 			documents,
@@ -2763,6 +2802,7 @@ impl EnvServer {
 			github_credentials,
 			usage_fetchers,
 			provider_response_hooks,
+			admission_gate,
 			checkpoint_control,
 			previews,
 			sessions_index,
@@ -2863,6 +2903,12 @@ impl EnvServer {
 		Arc::new(WeakExtensionCallbackDispatcher { supervisor: Arc::downgrade(&self.ext_hosts) })
 	}
 
+	/// Returns the eager prompt-contribution provider over live worker actors.
+	pub fn extension_prompt_provider(&self) -> Arc<dyn crate::exthost::PromptContributionProvider> {
+		let provider: Arc<dyn crate::exthost::PromptContributionProvider> = self.ext_hosts.clone();
+		provider
+	}
+
 	/// Drains idle extension workers and respawns their hot-reload generations.
 	pub async fn reload_extensions(&self) -> Result<Vec<u64>, WorkerError> {
 		self.ext_hosts.reload().await
@@ -2890,6 +2936,10 @@ impl EnvServer {
 	}
 
 	/// Returns the live per-session admission hook gate.
+	pub fn admission_gate(&self) -> Arc<HookGate> {
+		Arc::clone(&self.admission_gate)
+	}
+
 	/// Returns the sealed deployment manifest for an exact live CONTROL
 	/// connection generation.
 	pub fn extension_control_manifest(
@@ -3194,24 +3244,29 @@ impl EnvServer {
 		connection_gauge: Option<watch::Sender<usize>>,
 	) -> Result<(), EnvdError> {
 		self
-			.serve_uds_with_policy(path, shutdown, None, connection_gauge)
+			.serve_uds_with_policy(path, shutdown, None, connection_gauge, None)
 			.await
 	}
 
 	/// Binds a Unix socket whose connections are restricted to one extension
 	/// host binding.
 	#[cfg(unix)]
-	pub(crate) async fn serve_extension_uds(
+	pub async fn serve_extension_uds(
 		self: Arc<Self>,
-		binding: ExtensionDataBinding,
+		mut binding: ExtensionDataBinding,
 		shutdown: CancellationToken,
 	) -> Result<(), EnvdError> {
 		self
 			.authority
 			.register_host(binding.key.clone(), binding.grants.clone());
 		let policy = binding.policy();
+		let listener = binding
+			.prepared_listener
+			.take()
+			.map(UnixListener::from_std)
+			.transpose()?;
 		let result = self
-			.serve_uds_with_policy(&binding.path, shutdown, Some(policy), None)
+			.serve_uds_with_policy(&binding.path, shutdown, Some(policy), None, listener)
 			.await;
 		if let Err(error) = &result {
 			tracing::error!(
@@ -3233,6 +3288,7 @@ impl EnvServer {
 		shutdown: CancellationToken,
 		connection_policy: Option<ConnectionPolicy>,
 		connection_gauge: Option<watch::Sender<usize>>,
+		prepared_listener: Option<UnixListener>,
 	) -> Result<(), EnvdError> {
 		use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
@@ -3240,43 +3296,58 @@ impl EnvServer {
 			io::Error::new(io::ErrorKind::InvalidInput, "environment socket has no parent")
 		})?;
 		ensure_directory(parent)?;
-		match tokio::fs::symlink_metadata(path).await {
-			Ok(metadata) if metadata.file_type().is_socket() => {
-				if UnixStream::connect(path).await.is_ok() {
-					return Err(
-						io::Error::new(
-							io::ErrorKind::AddrInUse,
-							"environment socket is already accepting connections",
-						)
-						.into(),
-					);
-				}
-				tokio::fs::remove_file(path).await?;
-			},
-			Ok(_) => {
+		let (listener, socket_metadata) = if let Some(listener) = prepared_listener {
+			let metadata = fs::symlink_metadata(path)?;
+			if !metadata.file_type().is_socket() {
 				return Err(
 					io::Error::new(
-						io::ErrorKind::AlreadyExists,
-						"refusing to replace a non-socket environment path",
+						io::ErrorKind::InvalidData,
+						"prepared environment path is not a socket",
 					)
 					.into(),
 				);
-			},
-			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-			Err(error) => return Err(error.into()),
-		}
-		// Bind under a staging name, restrict, then rename into place so the
-		// published path never exposes a permissive-mode window to connectors.
-		let staging = path.with_extension(format!("staging-{}", process::id()));
-		match tokio::fs::symlink_metadata(&staging).await {
-			Ok(_) => tokio::fs::remove_file(&staging).await?,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-			Err(error) => return Err(error.into()),
-		}
-		let listener = UnixListener::bind(&staging)?;
-		tokio::fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).await?;
-		tokio::fs::rename(&staging, path).await?;
-		let socket_metadata = fs::symlink_metadata(path)?;
+			}
+			(listener, metadata)
+		} else {
+			match tokio::fs::symlink_metadata(path).await {
+				Ok(metadata) if metadata.file_type().is_socket() => {
+					if UnixStream::connect(path).await.is_ok() {
+						return Err(
+							io::Error::new(
+								io::ErrorKind::AddrInUse,
+								"environment socket is already accepting connections",
+							)
+							.into(),
+						);
+					}
+					tokio::fs::remove_file(path).await?;
+				},
+				Ok(_) => {
+					return Err(
+						io::Error::new(
+							io::ErrorKind::AlreadyExists,
+							"refusing to replace a non-socket environment path",
+						)
+						.into(),
+					);
+				},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			}
+			// Bind under a staging name, restrict, then rename into place so the
+			// published path never exposes a permissive-mode window to connectors.
+			let staging = path.with_extension(format!("staging-{}", process::id()));
+			match tokio::fs::symlink_metadata(&staging).await {
+				Ok(_) => tokio::fs::remove_file(&staging).await?,
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			}
+			let listener = UnixListener::bind(&staging)?;
+			tokio::fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).await?;
+			tokio::fs::rename(&staging, path).await?;
+			let metadata = fs::symlink_metadata(path)?;
+			(listener, metadata)
+		};
 		let _socket_path_guard = UnixSocketPathGuard::new(path.to_path_buf(), &socket_metadata);
 		let retire = CancellationToken::new();
 		let mut listener = Some(listener);
@@ -4129,7 +4200,9 @@ impl EnvServer {
 							self.workspace.root(),
 							self.workspace.root(),
 						);
-						if let Err(error) = invocation.arg_text(request) {
+						if invocation.streams_args()
+							&& let Err(error) = invocation.arg_text(request)
+						{
 							send_error(
 								responses,
 								frame.request_id,
@@ -7949,6 +8022,7 @@ async fn forward_native_event(
 						parts: Vec::new(),
 						is_error,
 						useless,
+						terminate: None,
 						props: Default::default(),
 					}),
 				)
@@ -8088,6 +8162,7 @@ fn spawn_worker_invocation(
 							details_blob,
 							is_error,
 							useless: complete.useless,
+							terminate: complete.terminate.then_some(true),
 							props: Default::default(),
 						}),
 					)
@@ -8153,6 +8228,7 @@ async fn send_abort_verdict(
 			parts:         Vec::new(),
 			is_error:      true,
 			useless:       false,
+			terminate:     None,
 			props:         Default::default(),
 		}),
 	)
@@ -8202,6 +8278,7 @@ async fn send_policy_denied_verdict(
 			parts:         Vec::new(),
 			is_error:      true,
 			useless:       false,
+			terminate:     None,
 			props:         Default::default(),
 		}),
 	)
@@ -10014,6 +10091,9 @@ pub async fn run_with_registry(
 		extension_bindings.push(binding);
 	}
 	let (env_connections, env_connection_rx) = watch::channel(0);
+	for binding in &mut extension_bindings {
+		binding.prepare_endpoint()?;
+	}
 	let (doc_connections, doc_connection_rx) = watch::channel(0);
 	let server = Arc::new(
 		EnvServer::open_project(
@@ -10540,6 +10620,7 @@ mod tests {
 			Arc::new(GithubCredentialBridge::new()),
 			omp_inference::operation::usage::UsageFetcherRegistry::default(),
 			omp_inference::ProviderResponseHooks::default(),
+			Arc::new(omp_agent::HookGate::channel().0),
 			AgentCheckpointControl::default(),
 			StagedProposalRegistry::new(),
 			sessions_index,

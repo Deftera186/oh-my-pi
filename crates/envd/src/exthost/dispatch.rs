@@ -4,6 +4,7 @@ use std::{
 	collections::{BTreeMap, VecDeque},
 	fs, io,
 	path::{Path, PathBuf},
+	str::FromStr,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -13,20 +14,25 @@ use std::{
 };
 
 use flume::Receiver;
-use omp_agent::JournalCustomEntry;
-use omp_core::{CowBytes, InvocationPhase, LifecyclePhase, SparseMap, Str, sf};
+use omp_agent::{JournalCustomEntry, SlotClass, SlotId};
+use omp_core::{CowBytes, Hash32, InvocationPhase, LifecyclePhase, SparseMap, Str, sf};
 use omp_proto::{
+	inference::v1::{Value, ValueMap, value},
 	toolhost::{
 		v1,
 		v1::{
-			Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId, HookHostEnvelope,
-			LifecycleEventContext, RegimeApply, RegimeDraft, RegimeHostEnvelope, RegimeWorkerEnvelope,
-			RetryLifecycleEventV1, TtsrTriggeredEventV1, UiHostEnvelope, UiWorkerEnvelope,
-			WorkerFrame, hook_host_envelope, lifecycle_worker_envelope, regime_host_envelope,
-			regime_worker_envelope, ui_host_envelope, ui_worker_envelope, worker_frame,
+			ContextHostEnvelope, Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId,
+			HookHostEnvelope, HostFrame, LifecycleEventContext, PromptContribution, PromptPull,
+			RegimeApply, RegimeDraft, RegimeHostEnvelope, RegimeWorkerEnvelope, RetryLifecycleEventV1,
+			TtsrTriggeredEventV1, UiHostEnvelope, UiWorkerEnvelope, WorkerFrame,
+			context_host_envelope, context_worker_envelope, hook_host_envelope, host_frame,
+			lifecycle_worker_envelope, regime_host_envelope, regime_worker_envelope, ui_host_envelope,
+			ui_worker_envelope, worker_frame,
 		},
 	},
-	ui::v1::{CommandDecl, ShortcutDecl, UiDispatch, UiDispatchResult, ui_dispatch_result},
+	ui::v1::{
+		CommandDecl, ShortcutDecl, TriggerDecl, UiDispatch, UiDispatchResult, ui_dispatch_result,
+	},
 };
 use parking_lot::{Mutex, RwLock};
 use prost::Message;
@@ -140,7 +146,7 @@ use super::{
 	},
 	lifecycle::{
 		AvailabilityBatch, AvailabilitySink, HeadlessLifecycleSink, HeadlessSinkError,
-		VerifiedUiRoster,
+		VerifiedRendererDeclaration, VerifiedUiRoster,
 	},
 };
 use crate::worker::HostKey;
@@ -288,11 +294,30 @@ pub struct UiShortcutRosterEntry {
 	pub declaration: ShortcutDecl,
 }
 
-/// Atomic manifest-verified command and shortcut ownership table.
+/// One manifest-verified exact-revision renderer roster entry.
+#[derive(Clone, Debug)]
+pub struct UiRendererRosterEntry {
+	/// Generation-fenced callback owner.
+	pub owner:       UiCallbackOwner,
+	/// Frozen renderer declaration.
+	pub declaration: VerifiedRendererDeclaration,
+}
+/// One manifest-verified extension completion roster entry.
+#[derive(Clone, Debug)]
+pub struct UiCompletionRosterEntry {
+	/// Generation-fenced callback owner.
+	pub owner:       UiCallbackOwner,
+	/// Static trigger metadata available without starting Python.
+	pub declaration: TriggerDecl,
+}
+
+/// Atomic manifest-verified command, shortcut, and completion ownership table.
 #[derive(Clone, Debug, Default)]
 pub struct UiRoster {
-	commands:  BTreeMap<Str, UiCommandRosterEntry>,
-	shortcuts: BTreeMap<Str, UiShortcutRosterEntry>,
+	commands:    BTreeMap<Str, UiCommandRosterEntry>,
+	shortcuts:   BTreeMap<Str, UiShortcutRosterEntry>,
+	completions: BTreeMap<Str, Vec<UiCompletionRosterEntry>>,
+	renderers:   BTreeMap<omp_tool::ToolIdentity, Vec<UiRendererRosterEntry>>,
 }
 
 /// A roster publication attempted to shadow another admitted owner.
@@ -313,8 +338,18 @@ impl UiRoster {
 	) -> Result<(), UiRosterConflict> {
 		let mut commands = self.commands.clone();
 		let mut shortcuts = self.shortcuts.clone();
+		let mut completions = self.completions.clone();
+		let mut renderers = self.renderers.clone();
 		commands.retain(|_, entry| entry.owner.host != host);
 		shortcuts.retain(|_, entry| entry.owner.host != host);
+		completions.retain(|_, entries| {
+			entries.retain(|entry| entry.owner.host != host);
+			!entries.is_empty()
+		});
+		renderers.retain(|_, entries| {
+			entries.retain(|entry| entry.owner.host != host);
+			!entries.is_empty()
+		});
 		for declaration in &roster.commands {
 			let entry = UiCommandRosterEntry {
 				owner:       UiCallbackOwner {
@@ -348,8 +383,42 @@ impl UiRoster {
 				declaration: declaration.clone(),
 			});
 		}
+		for declaration in &roster.triggers {
+			completions
+				.entry(Str::from(declaration.prefix.as_str()))
+				.or_default()
+				.push(UiCompletionRosterEntry {
+					owner:       UiCallbackOwner {
+						host:           host.clone(),
+						generation:     roster.generation,
+						declaration_id: Str::from(declaration.declaration_id.as_str()),
+						callback:       Str::from(declaration.callback.as_str()),
+					},
+					declaration: declaration.clone(),
+				});
+		}
+		for declaration in &roster.renderers {
+			let entries = renderers.entry(declaration.identity.clone()).or_default();
+			if !declaration.decorates && entries.iter().any(|entry| !entry.declaration.decorates) {
+				let identity = &declaration.identity;
+				return Err(UiRosterConflict {
+					key: sf!("{}@{}.{}", identity.name, identity.rev.family, identity.rev.n),
+				});
+			}
+			entries.push(UiRendererRosterEntry {
+				owner:       UiCallbackOwner {
+					host:           host.clone(),
+					generation:     roster.generation,
+					declaration_id: declaration.declaration_id.clone(),
+					callback:       declaration.callback.clone(),
+				},
+				declaration: declaration.clone(),
+			});
+		}
 		self.commands = commands;
 		self.shortcuts = shortcuts;
+		self.completions = completions;
+		self.renderers = renderers;
 		Ok(())
 	}
 
@@ -357,6 +426,14 @@ impl UiRoster {
 	pub fn remove(&mut self, host: &HostKey) {
 		self.commands.retain(|_, entry| &entry.owner.host != host);
 		self.shortcuts.retain(|_, entry| &entry.owner.host != host);
+		self.completions.retain(|_, entries| {
+			entries.retain(|entry| &entry.owner.host != host);
+			!entries.is_empty()
+		});
+		self.renderers.retain(|_, entries| {
+			entries.retain(|entry| &entry.owner.host != host);
+			!entries.is_empty()
+		});
 	}
 
 	/// Resolves a canonical command name or alias without allocating.
@@ -381,6 +458,24 @@ impl UiRoster {
 	/// Iterates every normalized shortcut row.
 	pub fn shortcuts(&self) -> impl Iterator<Item = &UiShortcutRosterEntry> {
 		self.shortcuts.values()
+	}
+
+	/// Returns extension folds registered for one exact tool revision.
+	pub fn renderers(
+		&self,
+		identity: &omp_tool::ToolIdentity,
+	) -> impl Iterator<Item = &UiRendererRosterEntry> {
+		self.renderers.get(identity).into_iter().flatten()
+	}
+
+	/// Iterates every extension completion row in prefix order.
+	pub fn completions(&self) -> impl Iterator<Item = &UiCompletionRosterEntry> {
+		self.completions.values().flatten()
+	}
+
+	/// Resolves every completion provider sharing one literal prefix.
+	pub fn completions_for(&self, prefix: &str) -> impl Iterator<Item = &UiCompletionRosterEntry> {
+		self.completions.get(prefix).into_iter().flatten()
 	}
 }
 
@@ -459,6 +554,31 @@ impl NestedCallbackDispatcher {
 				policy,
 				deadline: EventDeadline { at: Instant::now() + timeout },
 			})
+			.await
+	}
+
+	/// Dispatches one provider hook through the authenticated hook callback
+	/// operation while preserving its exact domain event in nested authority.
+	pub async fn dispatch_provider_hook(
+		&self,
+		target: Arc<ControlConnectionIdentity>,
+		caller: &ControlRequestContext,
+		event: &'static str,
+		arguments: serde_json::Map<String, serde_json::Value>,
+		policy: CallbackConcurrency,
+		timeout: Duration,
+	) -> Result<serde_json::Value, ControlProtocolError> {
+		self
+			.dispatch(
+				target,
+				caller,
+				"omp.hooks.dispatch",
+				arguments,
+				policy,
+				timeout,
+				Some(Str::new_static(event)),
+				None,
+			)
 			.await
 	}
 }
@@ -672,6 +792,295 @@ fn bounded_event_text(value: Str, limit: usize) -> String {
 	let mut value = value.to_string();
 	value.truncate(value.floor_char_boundary(limit));
 	value
+}
+
+/// Default maximum UTF-8 bytes allocated to one extension prompt contribution.
+pub const DEFAULT_PROMPT_CONTRIBUTION_BUDGET: usize = 64 * 1024;
+
+pub(crate) const PROMPT_OWNER_PROP: &str = "omp/prompt-owner";
+pub(crate) const PROMPT_KEY_PROP: &str = "omp/prompt-key";
+pub(crate) const PROMPT_CONTEXT_PROP: &str = "omp/prompt-context-json";
+
+/// One manifest-verified prompt renderer reachable through a worker process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptSlotBinding {
+	/// Stable callable identity within the owning extension.
+	pub key:          Str,
+	/// Authenticated extension identity.
+	pub owner:        Str,
+	/// Catalog destination.
+	pub slot:         SlotId,
+	/// Declared stability band.
+	pub class:        SlotClass,
+	/// Descending order within the slot.
+	pub priority:     i16,
+	/// Maximum accepted UTF-8 bytes.
+	pub budget_bytes: usize,
+}
+
+/// Immutable context supplied to one pure Python prompt renderer.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct PromptPullContext {
+	/// Stable session identity.
+	pub session_id:     Str,
+	/// Selected model identity.
+	pub model:          Str,
+	/// Selected provider identity.
+	pub provider:       Str,
+	/// Model context window in tokens.
+	pub context_window: u64,
+	/// Current compaction epoch.
+	pub epoch:          u64,
+	/// Active working directory.
+	pub cwd:            Str,
+	/// Active workspace roots.
+	pub roots:          Vec<Str>,
+	/// Current VCS branch, when known.
+	pub vcs_branch:     Option<Str>,
+	/// Current VCS commit, when known.
+	pub vcs_commit:     Option<Str>,
+	/// Whether this prompt belongs to a child agent.
+	pub is_subagent:    bool,
+	/// Child agent kind, when applicable.
+	pub agent_kind:     Option<Str>,
+}
+
+/// Cached, bounded result of one prompt renderer pull.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptContributionRecord {
+	/// Declaration which produced these bytes.
+	pub binding:   PromptSlotBinding,
+	/// Valid UTF-8 contribution bytes.
+	pub content:   Str,
+	/// Whether the worker result exceeded its allocation.
+	pub truncated: bool,
+}
+
+/// Pulls manifest-verified prompt declarations through live extension actors.
+#[async_trait::async_trait]
+pub trait PromptContributionProvider: Send + Sync + 'static {
+	/// Returns every declaration available before the first prompt.
+	fn declarations(&self) -> Vec<PromptSlotBinding>;
+
+	/// Refreshes one exact declaration from its owning Python worker.
+	async fn pull(
+		&self,
+		binding: &PromptSlotBinding,
+		context: &PromptPullContext,
+	) -> Result<PromptContributionRecord, PromptDispatchError>;
+}
+
+/// Invalid prompt registration, pull, or contribution frame.
+#[derive(Debug, Error)]
+pub enum PromptDispatchError {
+	/// A declaration named an unknown numeric catalog slot.
+	#[error("prompt declaration names unknown slot {0}")]
+	UnknownSlot(u32),
+	/// A declaration targeted a core-owned slot.
+	#[error("prompt declaration targets non-writable slot {0}")]
+	ReadOnlySlot(SlotId),
+	/// A declaration class was malformed.
+	#[error("prompt declaration has invalid class")]
+	InvalidClass,
+	/// A declaration attempted to place weaker content in a stronger band.
+	#[error("prompt declaration class is looser than slot {slot}")]
+	ClassConflict {
+		/// Catalog slot.
+		slot: SlotId,
+	},
+	/// A declaration priority did not fit the supported ordering type.
+	#[error("prompt declaration priority is out of range")]
+	Priority,
+	/// A live renderer was not present in the admitted manifest table.
+	#[error("prompt renderer is not present in the admitted declaration table")]
+	Undeclared,
+	/// The prompt provider was not activated with immutable context.
+	#[error("prompt provider has no active prompt context")]
+	MissingContext,
+	/// Prompt context could not be encoded.
+	#[error("prompt context could not be encoded")]
+	Context(#[source] serde_json::Error),
+	/// A worker frame was malformed protobuf.
+	#[error("worker returned a malformed prompt contribution")]
+	Decode(#[source] prost::DecodeError),
+	/// A worker response was not a prompt contribution.
+	#[error("worker returned no prompt contribution")]
+	MissingContribution,
+	/// A contribution did not match the declaration which was pulled.
+	#[error("worker returned a prompt contribution for another declaration")]
+	StaleContribution,
+	/// Prompt contributions may contain text parts only.
+	#[error("prompt contribution contains a non-text part")]
+	NonTextPart,
+	/// The owning worker could not complete the pull.
+	#[error("prompt contribution worker failed")]
+	Worker(#[source] crate::worker::WorkerError),
+}
+
+/// Decodes one worker declaration using its transport-authenticated owner.
+pub fn prompt_slot_binding(
+	owner: impl Into<Str>,
+	declaration: &v1::SlotDecl,
+) -> Result<PromptSlotBinding, PromptDispatchError> {
+	let owner = owner.into();
+	let slot = prompt_slot_id(declaration.slot)?;
+	if !prompt_slot_writable(slot) {
+		return Err(PromptDispatchError::ReadOnlySlot(slot));
+	}
+	let class =
+		SlotClass::from_str(&declaration.class).map_err(|_| PromptDispatchError::InvalidClass)?;
+	if class > prompt_slot_default_class(slot) {
+		return Err(PromptDispatchError::ClassConflict { slot });
+	}
+	let priority = i16::try_from(declaration.priority).map_err(|_| PromptDispatchError::Priority)?;
+	let key = prompt_prop(declaration.props.as_ref(), PROMPT_KEY_PROP)
+		.map(Str::from)
+		.unwrap_or_else(|| sf!("{owner}:{slot}:{priority}"));
+	Ok(PromptSlotBinding {
+		key,
+		owner,
+		slot,
+		class,
+		priority,
+		budget_bytes: DEFAULT_PROMPT_CONTRIBUTION_BUDGET,
+	})
+}
+
+/// Builds one correlated prompt pull for the exact declaration.
+pub fn prompt_pull_frame(
+	request_id: u64,
+	binding: &PromptSlotBinding,
+	context: &PromptPullContext,
+) -> Result<HostFrame, PromptDispatchError> {
+	let turn_id = context.session_id.to_string();
+	let mut context = serde_json::to_value(context).map_err(PromptDispatchError::Context)?;
+	let object = context
+		.as_object_mut()
+		.expect("PromptPullContext serializes as an object");
+	object.insert("slot".to_owned(), serde_json::Value::String(binding.slot.to_string()));
+	object.insert("cls".to_owned(), serde_json::Value::String(binding.class.to_string()));
+	object.insert("budget_bytes".to_owned(), serde_json::Value::from(binding.budget_bytes));
+	let context = serde_json::to_string(&context).map_err(PromptDispatchError::Context)?;
+	let context_digest = Hash32::sum(context.as_bytes()).into_bytes();
+	let props = ValueMap {
+		fields: BTreeMap::from([
+			(PROMPT_OWNER_PROP.to_owned(), string_value(binding.owner.as_str())),
+			(PROMPT_KEY_PROP.to_owned(), string_value(binding.key.as_str())),
+			(PROMPT_CONTEXT_PROP.to_owned(), string_value(&context)),
+		]),
+	};
+	Ok(HostFrame {
+		request_id,
+		body: Some(host_frame::Body::Context(ContextHostEnvelope {
+			body:  Some(context_host_envelope::Body::PromptPull(PromptPull {
+				slot: binding.slot as u32,
+				turn_id,
+				context_digest: context_digest.to_vec().into(),
+				props: Some(props),
+			})),
+			props: None,
+		})),
+		props: None,
+	})
+}
+
+/// Decodes, identity-checks, and bounds one worker prompt contribution.
+pub fn decode_prompt_contribution(
+	frame: WorkerFrame,
+	binding: &PromptSlotBinding,
+) -> Result<PromptContributionRecord, PromptDispatchError> {
+	let Some(worker_frame::Body::Context(context)) = frame.body else {
+		return Err(PromptDispatchError::MissingContribution);
+	};
+	let Some(context_worker_envelope::Body::PromptContribution(PromptContribution {
+		slot,
+		parts,
+		props,
+		..
+	})) = context.body
+	else {
+		return Err(PromptDispatchError::MissingContribution);
+	};
+	if slot != binding.slot as u32
+		|| prompt_prop(props.as_ref(), PROMPT_OWNER_PROP) != Some(binding.owner.as_str())
+		|| prompt_prop(props.as_ref(), PROMPT_KEY_PROP) != Some(binding.key.as_str())
+	{
+		return Err(PromptDispatchError::StaleContribution);
+	}
+	let mut content = String::new();
+	for part in parts {
+		let Some(omp_proto::thread::v1::part::Kind::Text(text)) = part.kind else {
+			return Err(PromptDispatchError::NonTextPart);
+		};
+		content.push_str(&text);
+	}
+	let truncated = content.len() > binding.budget_bytes;
+	if truncated {
+		content.truncate(content.floor_char_boundary(binding.budget_bytes));
+	}
+	Ok(PromptContributionRecord { binding: binding.clone(), content: Str::from(content), truncated })
+}
+
+fn prompt_slot_id(slot: u32) -> Result<SlotId, PromptDispatchError> {
+	match slot {
+		0 => Ok(SlotId::Conventions),
+		1 => Ok(SlotId::Role),
+		2 => Ok(SlotId::Runtime),
+		3 => Ok(SlotId::Tools),
+		4 => Ok(SlotId::Policy),
+		5 => Ok(SlotId::Workflow),
+		6 => Ok(SlotId::Skills),
+		7 => Ok(SlotId::Rules),
+		8 => Ok(SlotId::Guidance),
+		9 => Ok(SlotId::Workspace),
+		10 => Ok(SlotId::Memory),
+		11 => Ok(SlotId::Standing),
+		12 => Ok(SlotId::Recall),
+		13 => Ok(SlotId::Status),
+		14 => Ok(SlotId::Delivery),
+		unknown => Err(PromptDispatchError::UnknownSlot(unknown)),
+	}
+}
+
+const fn prompt_slot_writable(slot: SlotId) -> bool {
+	matches!(
+		slot,
+		SlotId::Runtime
+			| SlotId::Policy
+			| SlotId::Workflow
+			| SlotId::Skills
+			| SlotId::Rules
+			| SlotId::Guidance
+			| SlotId::Workspace
+			| SlotId::Memory
+			| SlotId::Standing
+			| SlotId::Recall
+			| SlotId::Status
+	)
+}
+
+const fn prompt_slot_default_class(slot: SlotId) -> SlotClass {
+	match slot {
+		SlotId::Runtime | SlotId::Workflow => SlotClass::Frozen,
+		SlotId::Policy | SlotId::Skills | SlotId::Rules | SlotId::Guidance | SlotId::Workspace => {
+			SlotClass::Stable
+		},
+		SlotId::Memory | SlotId::Standing => SlotClass::Epochal,
+		SlotId::Recall | SlotId::Status => SlotClass::Volatile,
+		SlotId::Conventions | SlotId::Role | SlotId::Tools | SlotId::Delivery => SlotClass::Frozen,
+	}
+}
+
+pub(crate) fn prompt_prop<'a>(props: Option<&'a ValueMap>, key: &str) -> Option<&'a str> {
+	let value = props?.fields.get(key)?;
+	match value.kind.as_ref()? {
+		value::Kind::String(value) => Some(value),
+		_ => None,
+	}
+}
+
+fn string_value(value: &str) -> Value {
+	Value { kind: Some(value::Kind::String(value.to_owned())) }
 }
 
 /// Invocation bytes awaiting host dispatch.
@@ -1270,6 +1679,60 @@ mod tests {
 		assert!(!shortcut_dispatch_succeeded(&[0xff], &owner));
 	}
 
+	fn renderer_declaration(
+		identity: omp_tool::ToolIdentity,
+		decorates: bool,
+	) -> VerifiedRendererDeclaration {
+		VerifiedRendererDeclaration {
+			declaration_id: sf!("renderer"),
+			identity,
+			callback: sf!("extension.render"),
+			reduce: Some(sf!("extension.reduce")),
+			decorates,
+			module: sf!("extension"),
+		}
+	}
+
+	#[test]
+	fn renderer_roster_is_exact_revision_and_composes_decorations() {
+		let identity = omp_tool::ToolIdentity {
+			name: sf!("counter"),
+			rev:  omp_tool::Rev { family: sf!("counter"), n: 2 },
+		};
+		let host = HostKey::new("project", "trusted", "extension");
+		let mut roster = UiRoster::default();
+		roster
+			.install(host.clone(), &VerifiedUiRoster {
+				generation: 7,
+				extension: sf!("extension"),
+				renderers: vec![
+					renderer_declaration(identity.clone(), false),
+					renderer_declaration(identity.clone(), true),
+				]
+				.into_boxed_slice(),
+				..Default::default()
+			})
+			.unwrap();
+		let rows = roster.renderers(&identity).collect::<Vec<_>>();
+		assert_eq!(rows.len(), 2);
+		assert!(!rows[0].declaration.decorates);
+		assert!(rows[1].declaration.decorates);
+
+		let competing = HostKey::new("project", "trusted", "competing");
+		assert!(
+			roster
+				.install(competing, &VerifiedUiRoster {
+					generation: 8,
+					extension: sf!("competing"),
+					renderers: vec![renderer_declaration(identity.clone(), false)].into_boxed_slice(),
+					..Default::default()
+				})
+				.is_err()
+		);
+		roster.remove(&host);
+		assert_eq!(roster.renderers(&identity).count(), 0);
+	}
+
 	#[test]
 	fn regime_callbacks_use_submission_latency_and_serialized_reentrancy() {
 		let request = RegimeDispatch {
@@ -1307,5 +1770,85 @@ mod tests {
 		}
 		.encode_to_vec();
 		assert_eq!(decode_regime_draft(&bytes).unwrap(), expected);
+	}
+
+	#[test]
+	fn prompt_contribution_is_identity_checked_and_truncated_at_utf8_boundary() {
+		let declaration = v1::SlotDecl {
+			slot:     SlotId::Policy as u32,
+			class:    "stable".to_owned(),
+			priority: 20,
+			props:    Some(ValueMap {
+				fields: BTreeMap::from([(
+					PROMPT_KEY_PROP.to_owned(),
+					string_value("dev.example.policy"),
+				)]),
+			}),
+		};
+		let mut binding = prompt_slot_binding("dev.example", &declaration).expect("binding");
+		binding.budget_bytes = 5;
+		let props = ValueMap {
+			fields: BTreeMap::from([
+				(PROMPT_OWNER_PROP.to_owned(), string_value(binding.owner.as_str())),
+				(PROMPT_KEY_PROP.to_owned(), string_value(binding.key.as_str())),
+			]),
+		};
+		let frame = WorkerFrame {
+			request_id: 9,
+			body:       Some(worker_frame::Body::Context(v1::ContextWorkerEnvelope {
+				body:  Some(context_worker_envelope::Body::PromptContribution(PromptContribution {
+					slot: binding.slot as u32,
+					parts: vec![omp_proto::thread::v1::Part {
+						kind: Some(omp_proto::thread::v1::part::Kind::Text("ééé".to_owned())),
+					}],
+					props: Some(props),
+					..Default::default()
+				})),
+				props: None,
+			})),
+			props:      None,
+		};
+		let contribution = decode_prompt_contribution(frame, &binding).expect("contribution");
+		assert_eq!(contribution.content.as_str(), "éé");
+		assert!(contribution.truncated);
+	}
+
+	#[test]
+	fn prompt_pull_carries_exact_context_and_declaration_identity() {
+		let binding = PromptSlotBinding {
+			key:          sf!("dev.example.memory"),
+			owner:        sf!("dev.example"),
+			slot:         SlotId::Memory,
+			class:        SlotClass::Epochal,
+			priority:     4,
+			budget_bytes: 1024,
+		};
+		let context = PromptPullContext {
+			session_id:     sf!("session"),
+			model:          sf!("model"),
+			provider:       sf!("provider"),
+			context_window: 32_000,
+			epoch:          3,
+			cwd:            sf!("/workspace"),
+			roots:          vec![sf!("/workspace")],
+			vcs_branch:     Some(sf!("main")),
+			vcs_commit:     None,
+			is_subagent:    false,
+			agent_kind:     None,
+		};
+		let frame = prompt_pull_frame(17, &binding, &context).expect("pull frame");
+		let Some(host_frame::Body::Context(envelope)) = frame.body else {
+			panic!("context frame");
+		};
+		let Some(context_host_envelope::Body::PromptPull(pull)) = envelope.body else {
+			panic!("prompt pull");
+		};
+		assert_eq!(pull.slot, SlotId::Memory as u32);
+		let props = pull.props.as_ref().expect("props");
+		assert_eq!(prompt_prop(Some(props), PROMPT_OWNER_PROP), Some("dev.example"));
+		let encoded = prompt_prop(Some(props), PROMPT_CONTEXT_PROP).expect("context");
+		let value: serde_json::Value = serde_json::from_str(encoded).expect("json");
+		assert_eq!(value["budget_bytes"], 1024);
+		assert_eq!(value["cls"], "epochal");
 	}
 }

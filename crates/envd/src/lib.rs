@@ -96,7 +96,7 @@ use omp_storage::index::SessionIndex;
 use omp_tool::Registry;
 use omp_tools::eval::EvalSessionControl;
 pub use presence::PresenceError;
-pub use server::{AgentControlBinding, EnvServer, EnvdError};
+pub use server::{AgentControlBinding, EnvServer, EnvdError, ExtensionDataBinding};
 pub use site::validate_trusted_module;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -117,7 +117,6 @@ use windows::OwnerPipeListener;
 pub use worker::run_py_worker_entry;
 
 use self::{
-	server::ExtensionDataBinding,
 	tool_settings::ApprovalMode,
 	worker::{ExtHostConfig, ExtHostSpec, HostKey, PY_EVAL_MODULE},
 };
@@ -1290,6 +1289,10 @@ impl ProjectEnvironment {
 	}
 
 	/// Returns the live per-session admission hook gate.
+	pub fn admission_gate(&self) -> Arc<omp_agent::HookGate> {
+		self.lifecycle.server.admission_gate()
+	}
+
 	/// Returns the sealed deployment manifest only when every authenticated
 	/// connection and generation fact exactly matches the live activation.
 	pub fn extension_control_manifest(
@@ -1311,6 +1314,11 @@ impl ProjectEnvironment {
 	/// Returns every currently sealed exact-generation extension registry.
 	pub fn extension_registry_evidences(&self) -> Vec<Arc<worker::SealedRegistryEvidence>> {
 		self.lifecycle.server.extension_registry_evidences()
+	}
+
+	/// Returns the eager prompt-contribution provider over live worker actors.
+	pub fn extension_prompt_provider(&self) -> Arc<dyn exthost::PromptContributionProvider> {
+		self.lifecycle.server.extension_prompt_provider()
 	}
 
 	/// Returns the live resolver over exact-generation regime declarations
@@ -1467,6 +1475,12 @@ fn worker_config(
 		extension.data_socket = Some(extension_data_endpoint(&binding));
 		config.extensions.push(extension);
 		bindings.push(binding);
+	}
+	#[cfg(unix)]
+	{
+		for binding in &mut bindings {
+			binding.prepare_endpoint()?;
+		}
 	}
 	Ok((config, bindings))
 }

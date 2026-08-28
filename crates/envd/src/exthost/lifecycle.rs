@@ -10,17 +10,21 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::BytesMut;
 use flume::Receiver;
-use omp_agent::{HookPhase, MailboxSender, device_availability_interrupt};
+use omp_agent::{
+	GateError, HookEvent, HookGate, HookPatch, HookPhase, MailboxSender,
+	device_availability_interrupt,
+};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{InvocationPhase, Provenance, Str};
 use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use omp_proto::{
 	thread::v1::{Item, Message, Part, Role, item, part},
-	toolhost::v1::{RegimeDeclare, RegimeLifetime, RegimeManifest, SetAvailability},
-	ui::v1::{CommandDecl, RegisterUi, ShortcutDecl, UiEffect, UiRequest},
+	toolhost::v1::{HookEventId, RegimeDeclare, RegimeLifetime, RegimeManifest, SetAvailability},
+	ui::v1::{CommandDecl, RegisterUi, ShortcutDecl, TriggerDecl, UiEffect, UiRequest},
 };
-use omp_tool::{AvailabilityDelta, Registry};
+use omp_tool::{AvailabilityDelta, Registry, ToolIdentity};
 use thiserror::Error;
 
 use super::{
@@ -453,8 +457,29 @@ pub struct VerifiedUiRoster {
 	pub commands:              Box<[CommandDecl]>,
 	/// Verified shortcut declarations.
 	pub shortcuts:             Box<[ShortcutDecl]>,
+	/// Verified completion trigger declarations.
+	pub triggers:              Box<[TriggerDecl]>,
 	/// Verified transcript markdown transformer declarations.
 	pub markdown_transformers: Box<[VerifiedMarkdownTransformer]>,
+	/// Verified exact-revision device renderer declarations.
+	pub renderers:             Box<[VerifiedRendererDeclaration]>,
+}
+
+/// One manifest-verified exact-revision Python renderer fold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRendererDeclaration {
+	/// Stable signed declaration id.
+	pub declaration_id: Str,
+	/// Exact tool identity rendered by the fold.
+	pub identity:       ToolIdentity,
+	/// Python renderer callable address admitted by the signed manifest.
+	pub callback:       Str,
+	/// Optional Python reducer callable address.
+	pub reduce:         Option<Str>,
+	/// Whether this fold augments rather than replaces the winning base.
+	pub decorates:      bool,
+	/// Package-contained declaration module.
+	pub module:         Str,
 }
 
 /// One manifest-verified transcript markdown transformer callback.
@@ -619,19 +644,158 @@ pub struct ActivationEvent {
 	pub trigger:            ActivationTrigger,
 }
 
+struct ExtensionLoadEvent<'a> {
+	extension: &'a str,
+	version:   &'a str,
+	source:    String,
+	trust:     &'a str,
+	reloaded:  bool,
+}
+
+impl HookEvent for ExtensionLoadEvent<'_> {
+	type Return = ();
+
+	const ID: HookEventId = HookEventId::HookEventExtensionLoad;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(self.extension.as_bytes());
+		out.extend_from_slice(b"\n");
+		let payload = serde_json::json!({
+			"extension": self.extension,
+			"version": self.version,
+			"source": self.source.as_str(),
+			"trust": self.trust,
+			"reloaded": self.reloaded,
+		});
+		if let Ok(encoded) = serde_json::to_vec(&payload) {
+			out.extend_from_slice(&encoded);
+		}
+	}
+
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+		Ok(())
+	}
+}
+
+struct ExtensionUnloadEvent<'a> {
+	extension:     &'a str,
+	reason:        &'static str,
+	pending_hooks: usize,
+}
+
+impl HookEvent for ExtensionUnloadEvent<'_> {
+	type Return = ();
+
+	const ID: HookEventId = HookEventId::HookEventExtensionUnload;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(self.extension.as_bytes());
+		out.extend_from_slice(b"\n");
+		let payload = serde_json::json!({
+			"extension": self.extension,
+			"reason": self.reason,
+			"pending_hooks": self.pending_hooks,
+		});
+		if let Ok(encoded) = serde_json::to_vec(&payload) {
+			out.extend_from_slice(&encoded);
+		}
+	}
+
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+		Ok(())
+	}
+}
+
+struct HostReconnectEvent {
+	generation:    u64,
+	missed_events: u64,
+	restart_cause: &'static str,
+	uptime:        Duration,
+}
+
+impl HookEvent for HostReconnectEvent {
+	type Return = ();
+
+	const ID: HookEventId = HookEventId::HookEventHostReconnect;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(self.restart_cause.as_bytes());
+		out.extend_from_slice(b"\n");
+		let payload = serde_json::json!({
+			"generation": self.generation,
+			"missed_events": self.missed_events,
+			"restart_cause": self.restart_cause,
+			"uptime": format!("{}.{:09}s", self.uptime.as_secs(), self.uptime.subsec_nanos()),
+		});
+		if let Ok(encoded) = serde_json::to_vec(&payload) {
+			out.extend_from_slice(&encoded);
+		}
+	}
+
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
+		Ok(())
+	}
+}
+
 /// Emits `extension_load` after activation, without constructing its payload
 /// when no extension observes the event.
+pub(crate) fn notify_extension_load(gate: &HookGate, provenance: &Provenance, reloaded: bool) {
+	if !gate.subscribed(HookEventId::HookEventExtensionLoad) {
+		return;
+	}
+	gate.notify(&ExtensionLoadEvent {
+		extension: provenance.extension_id(),
+		version: provenance.version(),
+		source: provenance.artifact_digest().to_string(),
+		trust: provenance.tier(),
+		reloaded,
+	});
+}
+
 /// Emits `extension_unload` before teardown, without constructing its payload
 /// when no extension observes the event.
 ///
 /// Supervisor seams pass zero until callback dispatch owns a per-extension
 /// pending-hook count; tool invocation counts are not a valid substitute.
+pub(crate) fn notify_extension_unload(
+	gate: &HookGate,
+	extension: &str,
+	reason: &'static str,
+	pending_hooks: usize,
+) {
+	if !gate.subscribed(HookEventId::HookEventExtensionUnload) {
+		return;
+	}
+	gate.notify(&ExtensionUnloadEvent { extension, reason, pending_hooks });
+}
+
 /// Emits `host_reconnect` after replacement activation, carrying the newly
 /// authenticated host generation.
 ///
 /// Callers pass zero for `missed_events` until CONTROL owns a per-host outage
 /// counter; the existing global observer-queue drop count is not a truthful
 /// proxy for events missed by one replacement host.
+pub(crate) fn notify_host_reconnect(
+	gate: &HookGate,
+	generation: u64,
+	missed_events: u64,
+	reason: RestartReason,
+	uptime: Duration,
+) {
+	if !gate.subscribed(HookEventId::HookEventHostReconnect) {
+		return;
+	}
+	gate.notify(&HostReconnectEvent {
+		generation,
+		missed_events,
+		restart_cause: reason.into(),
+		uptime,
+	});
+}
+
 /// Result of requesting activation for a generation.
 #[derive(Clone, Debug)]
 pub enum ActivationDisposition {
@@ -907,21 +1071,25 @@ pub fn validate_regime_manifests(manifests: &[RegimeManifest]) -> Result<(), Reg
 #[derive(Clone, Debug)]
 pub struct ExtensionManifest {
 	/// Core-authenticated artifact and installation provenance.
-	pub provenance:          Provenance,
+	pub provenance:               Provenance,
 	/// Canonical entry module imported first.
-	pub entry:               Str,
+	pub entry:                    Str,
 	/// Declaration modules in manifest order after `entry`.
-	pub declaration_modules: Box<[Str]>,
+	pub declaration_modules:      Box<[Str]>,
 	/// Authoritative tool and hook existence sets.
-	pub declarations:        DeclarationSet,
+	pub declarations:             DeclarationSet,
 	/// Provider declarations and consumer service grants.
-	pub services:            ServiceManifest,
+	pub services:                 ServiceManifest,
 	/// Uniform sealed CONTROL declaration snapshot from the deployment manifest.
-	static_declarations:     Arc<StaticDeclarations>,
+	static_declarations:          Arc<StaticDeclarations>,
+	/// Whether the deployment supplied the uniform declaration table.
+	uniform_declarations:         bool,
+	/// Whether an operator-trusted module may publish declarations at runtime.
+	runtime_declarations_trusted: bool,
 	/// Per-extension CONTROL quota definitions.
-	pub resource_limits:     Box<[QuotaSpec]>,
+	pub resource_limits:          Box<[QuotaSpec]>,
 	/// Every boot class reachable from this manifest's declaration rows.
-	pub activation_triggers: BTreeSet<ActivationTrigger>,
+	pub activation_triggers:      BTreeSet<ActivationTrigger>,
 }
 
 impl ExtensionManifest {
@@ -935,7 +1103,7 @@ impl ExtensionManifest {
 		resource_limits: impl IntoIterator<Item = QuotaSpec>,
 		activation_triggers: impl IntoIterator<Item = ActivationTrigger>,
 	) -> Self {
-		Self::new_with_static(
+		let mut manifest = Self::new_with_static(
 			provenance,
 			entry,
 			declaration_modules,
@@ -944,7 +1112,9 @@ impl ExtensionManifest {
 			StaticDeclarations::default(),
 			resource_limits,
 			activation_triggers,
-		)
+		);
+		manifest.uniform_declarations = false;
+		manifest
 	}
 
 	/// Builds a mandatory manifest contract including every sealed public
@@ -996,6 +1166,8 @@ impl ExtensionManifest {
 			declarations,
 			services,
 			static_declarations: Arc::new(static_declarations),
+			uniform_declarations: true,
+			runtime_declarations_trusted: false,
 			resource_limits: resource_limits.into_iter().collect(),
 			activation_triggers,
 		}
@@ -1004,6 +1176,22 @@ impl ExtensionManifest {
 	/// Returns the immutable declaration snapshot admitted before child import.
 	pub fn static_declarations(&self) -> &StaticDeclarations {
 		&self.static_declarations
+	}
+
+	/// Returns whether the deployment supplied an authoritative uniform table.
+	pub const fn has_uniform_declarations(&self) -> bool {
+		self.uniform_declarations
+	}
+
+	/// Allows an explicitly operator-trusted module to publish runtime
+	/// declarations.
+	pub fn trust_runtime_declarations(&mut self) {
+		self.runtime_declarations_trusted = true;
+	}
+
+	/// Returns whether runtime-published declarations are operator-trusted.
+	pub const fn runtime_declarations_trusted(&self) -> bool {
+		self.runtime_declarations_trusted
 	}
 
 	/// Builds the explicit first-party `omp_py_eval` manifest.
@@ -1036,6 +1224,7 @@ impl ExtensionManifest {
 			self.entry.clone(),
 			self.declaration_modules.iter().cloned(),
 			self.declarations.clone(),
+			self.runtime_declarations_trusted,
 			Arc::clone(&self.static_declarations),
 			self.activation_triggers.clone(),
 			session_started_at,
@@ -1049,6 +1238,7 @@ pub struct LifecycleMachine {
 	extension:           Str,
 	modules:             Box<[Str]>,
 	expected:            DeclarationSet,
+	trust_runtime:       bool,
 	expected_ui:         Arc<StaticDeclarations>,
 	verified_ui:         Option<VerifiedUiRoster>,
 	regimes:             RegimeDeclarationTable,
@@ -1068,6 +1258,7 @@ impl LifecycleMachine {
 		entry: impl Into<Str>,
 		declaration_modules: impl IntoIterator<Item = Str>,
 		expected: DeclarationSet,
+		trust_runtime: bool,
 		expected_ui: Arc<StaticDeclarations>,
 		activation_triggers: BTreeSet<ActivationTrigger>,
 		session_started_at: SystemTime,
@@ -1087,6 +1278,7 @@ impl LifecycleMachine {
 			extension: extension.into(),
 			modules: modules.into_boxed_slice(),
 			expected,
+			trust_runtime,
 			expected_ui,
 			verified_ui: None,
 			regimes: RegimeDeclarationTable::default(),
@@ -1246,10 +1438,12 @@ impl LifecycleMachine {
 			self.phase = LifecyclePhase::Degraded;
 			return Err(UiRegistrationError::Missing { declaration: row.id.clone() }.into());
 		}
-		let drift = DeclarationDrift::between(&self.expected, declared);
-		if !drift.is_empty() {
-			self.phase = LifecyclePhase::Degraded;
-			return Err(LifecycleError::Drift(drift));
+		if !self.trust_runtime {
+			let drift = DeclarationDrift::between(&self.expected, declared);
+			if !drift.is_empty() {
+				self.phase = LifecyclePhase::Degraded;
+				return Err(LifecycleError::Drift(drift));
+			}
 		}
 		if let Err(error) = self.regimes.freeze() {
 			self.phase = LifecyclePhase::Degraded;
@@ -1290,13 +1484,57 @@ pub fn verify_ui_registration(
 	let extension = Str::from(registration.extension_id.as_str());
 	validate_ui_commands(&expected.ui.commands, &registration.commands)?;
 	validate_ui_shortcuts(&expected.ui.shortcuts, &registration.shortcuts)?;
+	validate_ui_completions(&expected.ui.completions, &registration.triggers)?;
 	Ok(VerifiedUiRoster {
 		generation,
 		extension,
 		commands: registration.commands.into_boxed_slice(),
 		shortcuts: registration.shortcuts.into_boxed_slice(),
+		triggers: registration.triggers.into_boxed_slice(),
 		markdown_transformers: Box::new([]),
+		renderers: Box::new([]),
 	})
+}
+
+fn validate_ui_completions(
+	expected: &[StaticDeclaration],
+	actual: &[TriggerDecl],
+) -> Result<(), UiRegistrationError> {
+	let expected = expected
+		.iter()
+		.map(|row| (row.id.as_str(), row))
+		.collect::<BTreeMap<_, _>>();
+	let mut ids = BTreeSet::new();
+	for trigger in actual {
+		if trigger.prefix.is_empty()
+			|| trigger.kind != "completion"
+			|| trigger.max_results == 0
+			|| !ids.insert(trigger.declaration_id.as_str())
+		{
+			return Err(UiRegistrationError::Unexpected {
+				declaration: Str::from(trigger.declaration_id.as_str()),
+			});
+		}
+		let Some(row) = expected.get(trigger.declaration_id.as_str()) else {
+			return Err(UiRegistrationError::Unexpected {
+				declaration: Str::from(trigger.declaration_id.as_str()),
+			});
+		};
+		let callback = manifest_string(row, "callback");
+		if trigger.prefix != row.key.as_str()
+			|| trigger.module != row.module.as_str()
+			|| (!row.trigger.is_empty() && trigger.activation_trigger != row.trigger.as_str())
+			|| callback.is_some_and(|callback| trigger.callback != callback)
+		{
+			return Err(UiRegistrationError::Metadata { declaration: row.id.clone() });
+		}
+	}
+	for id in expected.keys() {
+		if !ids.contains(id) {
+			return Err(UiRegistrationError::Missing { declaration: Str::from(*id) });
+		}
+	}
+	Ok(())
 }
 
 fn validate_ui_commands(
@@ -1444,6 +1682,8 @@ fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::ArtifactDigest;
+
 	use super::*;
 
 	fn core_regime(
@@ -1491,6 +1731,82 @@ mod tests {
 			..Default::default()
 		}
 	}
+	fn lifecycle_provenance() -> Provenance {
+		Provenance::new(
+			sf!("publisher"),
+			sf!("publisher.extension"),
+			sf!("1.2.3"),
+			ArtifactDigest::new([7; 32]),
+			sf!("workspace"),
+			sf!("trusted"),
+			1,
+		)
+	}
+
+	fn observe_gate(event: HookEventId) -> (HookGate, Receiver<omp_agent::HookDispatch>) {
+		let (gate, receiver) = HookGate::delegated_channel();
+		gate.replace_union_mask(1_u128 << event as u32);
+		(gate, receiver)
+	}
+
+	fn payload(dispatch: &omp_agent::HookDispatch) -> serde_json::Value {
+		let separator = dispatch
+			.payload
+			.iter()
+			.position(|byte| *byte == b'\n')
+			.expect("lifecycle payload prefix");
+		serde_json::from_slice(&dispatch.payload[separator + 1..]).expect("lifecycle JSON payload")
+	}
+
+	#[test]
+	fn lifecycle_observe_payloads_and_unsubscribed_fast_path() {
+		let (load_gate, load_frames) = observe_gate(HookEventId::HookEventExtensionLoad);
+		notify_extension_load(&load_gate, &lifecycle_provenance(), true);
+		let load = load_frames.try_recv().expect("extension load frame");
+		assert_eq!(load.event, HookEventId::HookEventExtensionLoad);
+		assert_eq!(load.phase, HookPhase::Observe);
+		assert_eq!(
+			payload(&load),
+			serde_json::json!({
+				"extension": "publisher.extension",
+				"version": "1.2.3",
+				"source": ArtifactDigest::new([7; 32]).to_string(),
+				"trust": "trusted",
+				"reloaded": true,
+			})
+		);
+
+		let (unload_gate, unload_frames) = observe_gate(HookEventId::HookEventExtensionUnload);
+		notify_extension_unload(&unload_gate, "publisher.extension", "reload", 3);
+		assert_eq!(
+			payload(&unload_frames.try_recv().expect("extension unload frame")),
+			serde_json::json!({
+				"extension": "publisher.extension",
+				"reason": "reload",
+				"pending_hooks": 3,
+			})
+		);
+
+		let (reconnect_gate, reconnect_frames) = observe_gate(HookEventId::HookEventHostReconnect);
+		notify_host_reconnect(
+			&reconnect_gate,
+			9,
+			2,
+			RestartReason::HealthTimeout,
+			Duration::from_millis(125),
+		);
+		let reconnect = payload(&reconnect_frames.try_recv().expect("host reconnect frame"));
+		assert_eq!(reconnect["generation"], 9);
+		assert_eq!(reconnect["missed_events"], 2);
+		assert_eq!(reconnect["restart_cause"], "health_timeout");
+		assert_eq!(reconnect["uptime"], "0.125000000s");
+
+		let (unsubscribed, frames) = HookGate::delegated_channel();
+		notify_extension_load(&unsubscribed, &lifecycle_provenance(), false);
+		notify_extension_unload(&unsubscribed, "publisher.extension", "shutdown", 0);
+		notify_host_reconnect(&unsubscribed, 10, 0, RestartReason::Crash, Duration::ZERO);
+		assert!(frames.is_empty());
+	}
 
 	#[test]
 	fn register_ui_exact_validates_manifest_metadata_and_duplicates() {
@@ -1536,6 +1852,7 @@ mod tests {
 			"entry",
 			[],
 			DeclarationSet::default(),
+			false,
 			Arc::new(StaticDeclarations::default()),
 			BTreeSet::new(),
 			SystemTime::UNIX_EPOCH,
@@ -1575,6 +1892,7 @@ mod tests {
 			"entry",
 			[],
 			DeclarationSet::default(),
+			false,
 			Arc::new(StaticDeclarations::default()),
 			BTreeSet::new(),
 			SystemTime::UNIX_EPOCH,
