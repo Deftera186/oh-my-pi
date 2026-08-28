@@ -1747,6 +1747,15 @@ impl AgentTree {
 			.write()
 			.insert(Str::from(name.as_str().to_ascii_lowercase()), index);
 		self.publish_roster_change();
+		if kind == AgentKind::Subagent {
+			tracing::info!(
+				agent_id = %node.id,
+				agent_name = %node.name,
+				parent_id = ?node.parent,
+				depth = node.depth,
+				"subagent admitted"
+			);
+		}
 		Ok(node)
 	}
 

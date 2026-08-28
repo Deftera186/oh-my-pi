@@ -2984,10 +2984,24 @@ impl Journal {
 	/// Like [`Self::truncate_to`], compaction is rejected while a started turn
 	/// lacks a terminal receipt, preventing an authorized batch from being
 	/// stranded outside the resulting live chain.
+	#[tracing::instrument(
+		name = "context_compaction",
+		level = "debug",
+		skip_all,
+		fields(
+			tokens_before = compact.tokens_before,
+			tokens_after = ?compact.tokens_after,
+			first_kept = compact.first_kept,
+			method = ?compact.method,
+		)
+	)]
 	pub fn compact(&mut self, ts: u64, compact: Compact) -> Result<u64, JournalError> {
 		if self.pending_turn().is_some() {
 			return Err(JournalError::CompactWhilePending);
 		}
+		let tokens_before = compact.tokens_before;
+		let tokens_after = compact.tokens_after;
+		let first_kept = compact.first_kept;
 		let event = Event {
 			ts,
 			kind: Kind::Compact {
@@ -3025,6 +3039,15 @@ impl Journal {
 				source,
 			});
 		}
+		tracing::info!(
+			event_index = appended.index,
+			tokens_before,
+			tokens_after = ?tokens_after,
+			first_kept,
+			context_revision = context.revision,
+			compaction_epoch = context.epoch,
+			"context compacted"
+		);
 		Ok(appended.index)
 	}
 

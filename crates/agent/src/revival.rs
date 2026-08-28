@@ -52,6 +52,12 @@ pub fn revive(path: &Path, snapshot: AgentSnapshot) -> Result<RevivedSession, Re
 
 /// Reconstructs durable intent while retaining an already-open sole journal
 /// owner.
+#[tracing::instrument(
+	name = "revive_existing",
+	level = "debug",
+	skip_all,
+	fields(path = %path.display())
+)]
 pub fn revive_existing(
 	path: &Path,
 	journal: Journal,
@@ -102,6 +108,14 @@ pub fn revive_existing(
 			.collect::<Vec<Str>>()
 			.into();
 	}
+	tracing::info!(
+		path = %path.display(),
+		additional_root_count = roots.secondary().len(),
+		enabled_tool_count = snapshot.enabled_tools.len(),
+		provider_reset,
+		has_model_override = model_override.is_some(),
+		"session revived"
+	);
 	Ok(RevivedSession {
 		journal,
 		snapshot,

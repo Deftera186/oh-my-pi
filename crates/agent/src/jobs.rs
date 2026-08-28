@@ -199,6 +199,11 @@ impl JobBoard {
 				})
 				.count() >= self.inner.max_running
 		{
+			tracing::debug!(
+				job_id = %job.id,
+				limit = self.inner.max_running,
+				"job scheduling deferred at capacity"
+			);
 			return Err(JobAdmissionError::Capacity { limit: self.inner.max_running });
 		}
 		match pending.entry(job.id.clone()) {
@@ -215,6 +220,11 @@ impl JobBoard {
 			Entry::Occupied(_) => return Ok(false),
 		}
 
+		tracing::debug!(
+			job_id = %job.id,
+			status = ?job.metadata.status,
+			"job registered"
+		);
 		if let JobOwner::NamedProcess { name, generation } = &job.owner {
 			let name = name.clone();
 			let generation = *generation;
@@ -225,7 +235,14 @@ impl JobBoard {
 			let watcher = tokio::spawn(async move {
 				let item = match watch_job(&env, &job, &name, generation).await {
 					Ok(item) => item,
-					Err(reason) => settlement_error_item(&job, &reason),
+					Err(reason) => {
+						tracing::warn!(
+							job_id = %job.id,
+							%reason,
+							"job settlement watcher failed"
+						);
+						settlement_error_item(&job, &reason)
+					},
 				};
 				if let Some(inner) = weak.upgrade() {
 					if inner.complete(&id, item).is_err() {
@@ -400,6 +417,11 @@ impl JobBoard {
 				})
 				.count() >= self.inner.max_running
 		{
+			tracing::debug!(
+				job_id = id,
+				limit = self.inner.max_running,
+				"queued job remains at capacity"
+			);
 			return Err(JobAdmissionError::Capacity { limit: self.inner.max_running });
 		}
 		let entry = pending.get_mut(id).expect("entry retained under lock");
@@ -409,6 +431,7 @@ impl JobBoard {
 		entry.job.metadata = Arc::new(metadata);
 		drop(pending);
 		self.inner.bump();
+		tracing::debug!(job_id = id, "job started");
 		Ok(true)
 	}
 
@@ -635,6 +658,7 @@ impl JobBoardInner {
 			events.publish(AgentEvent::JobSettled { job_id: Str::new(job_id) });
 		}
 		self.flush_locked(job_id, &mut pending)?;
+		tracing::debug!(job_id, "job settled");
 		self.bump();
 		Ok(true)
 	}
@@ -1024,6 +1048,11 @@ fn schedule_delivery_retry(inner: Weak<JobBoardInner>, job_id: Str) {
 					dead.remove(&oldest);
 				}
 			}
+			tracing::warn!(
+				job_id = %job_id,
+				attempts = DELIVERY_RETRY_LIMIT,
+				"job settlement delivery exhausted retries"
+			);
 			inner.bump();
 			return;
 		}
@@ -1041,6 +1070,12 @@ fn schedule_delivery_retry(inner: Weak<JobBoardInner>, job_id: Str) {
 			.iter()
 			.fold(0_u64, |sum, byte| sum.wrapping_add(u64::from(*byte)))
 			% 200,
+	);
+	tracing::warn!(
+		job_id = %job_id,
+		attempt,
+		backoff_ms = u64::try_from(exponential.saturating_add(jitter).as_millis()).unwrap_or(u64::MAX),
+		"job settlement delivery failed; retrying"
 	);
 	let weak = Arc::downgrade(&inner);
 	tokio::spawn(async move {

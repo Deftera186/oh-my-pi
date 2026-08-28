@@ -1,10 +1,12 @@
 //! Worker process contract tests.
 
 use std::{
+	collections::BTreeMap,
 	fs,
 	io::Write as _,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
+	sync::Arc,
 	time::{Duration, Instant},
 };
 
@@ -14,9 +16,18 @@ use omp_core::{
 	ArtifactDigest, Duration as CoreDuration, DurationUnit, Principal, Provenance, Str, sf,
 };
 use omp_envd::{
+	DeviceCatalogObserver, DeviceControlFactory, DeviceInvocationAdmission,
+	DynamicDeviceCatalogEntry, RegistryControlFactory,
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
-		control::{ControlError, HostRequestMap},
+		control::{
+			ControlAuthority, ControlAuthorityFactory, ControlEffect, ControlError,
+			ControlProtocolError, ControlRequestContext, EnvdControlAuthorities,
+			ExternalControlAuthorities, FixedControlAuthorityFactory, HostControlAuthorityFactory,
+			HostRequestMap, PersistenceControlAuthorities, PolicyControlAuthorities,
+			PresentationControlAuthorities, ProviderControlAuthorities, RegistryControlAuthorities,
+		},
+		dispatch::CallbackDispatcherSlot,
 	},
 	worker::{
 		ExtHostConfig, ExtHostSpec, ExtHostSupervisor, HostKey, OpenToolCall, PY_EVAL_MODULE,
@@ -455,11 +466,15 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		.to_std()
 		.expect("test interrupt grace");
 	let respawn_timeout = config.spawn_timeout;
+	let callbacks = bind_test_control(&mut config);
 
-	let supervisor = time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
-		.await
-		.expect("worker hello and registration timed out")
-		.expect("spawn same-binary Python worker");
+	let supervisor = Arc::new(
+		time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+			.await
+			.expect("worker hello and registration timed out")
+			.expect("spawn same-binary Python worker"),
+	);
+	callbacks.bind(supervisor.clone());
 
 	let names = supervisor
 		.registrations()
@@ -875,6 +890,120 @@ async fn wait_for_marker(path: &Path) -> i32 {
 	})
 	.await
 	.expect("native Python call did not enter ctypes sleep")
+}
+
+struct InertAuthority;
+
+#[async_trait::async_trait]
+impl ControlAuthority for InertAuthority {
+	fn handles(&self, _operation: &str) -> bool {
+		true
+	}
+
+	fn authorize(
+		&self,
+		_context: &ControlRequestContext,
+		_operation: &str,
+		_arguments: &serde_json::Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		Ok(())
+	}
+
+	async fn request(
+		&self,
+		_context: ControlRequestContext,
+		_operation: Str,
+		_arguments: serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		Ok(Value::Null)
+	}
+
+	async fn effect(
+		&self,
+		_context: ControlRequestContext,
+		_effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		Ok(())
+	}
+}
+
+struct IgnoreCatalog;
+
+impl DeviceCatalogObserver for IgnoreCatalog {
+	fn catalog_changed(&self, _epoch: u64, _catalog: Arc<[DynamicDeviceCatalogEntry]>) {}
+}
+
+struct AllowDevices;
+
+#[async_trait::async_trait]
+impl DeviceInvocationAdmission for AllowDevices {
+	async fn admit(
+		&self,
+		_caller: &ControlRequestContext,
+		_target: &DynamicDeviceCatalogEntry,
+		_arguments: &serde_json::Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		Ok(())
+	}
+}
+
+fn inert_factory() -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(FixedControlAuthorityFactory::new(Arc::new(InertAuthority)))
+}
+
+fn host_factory(
+	registry: Arc<dyn ControlAuthorityFactory>,
+	devices: Arc<dyn ControlAuthorityFactory>,
+) -> Arc<HostControlAuthorityFactory> {
+	let envd = EnvdControlAuthorities::new(
+		RegistryControlAuthorities::new(registry, devices, inert_factory()),
+		PersistenceControlAuthorities::new(
+			inert_factory(),
+			inert_factory(),
+			inert_factory(),
+			inert_factory(),
+			inert_factory(),
+			inert_factory(),
+		),
+		PolicyControlAuthorities::new(inert_factory(), inert_factory()),
+		PresentationControlAuthorities::new(inert_factory(), inert_factory(), inert_factory()),
+		ProviderControlAuthorities::new(inert_factory(), inert_factory(), inert_factory()),
+		inert_factory(),
+		inert_factory(),
+	);
+	Arc::new(HostControlAuthorityFactory::new(
+		envd,
+		ExternalControlAuthorities::new(inert_factory(), inert_factory()),
+	))
+}
+
+fn bind_test_control(config: &mut ExtHostConfig) -> Arc<CallbackDispatcherSlot> {
+	let manifests = config
+		.extensions
+		.iter()
+		.map(|extension| {
+			(
+				(
+					extension.key.layer().clone(),
+					extension.key.tier().clone(),
+					extension.key.extension().clone(),
+				),
+				extension.manifest.clone(),
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
+	let registry = RegistryControlFactory::new(manifests);
+	let callbacks = CallbackDispatcherSlot::new();
+	let devices: Arc<dyn ControlAuthorityFactory> = DeviceControlFactory::new(
+		Arc::clone(&registry),
+		callbacks.clone(),
+		Arc::new(IgnoreCatalog),
+		Arc::new(AllowDevices),
+	);
+	let registry_factory: Arc<dyn ControlAuthorityFactory> = registry.clone();
+	config.bind_control_authorities(host_factory(registry_factory, devices));
+	config.bind_registry_control(registry);
+	callbacks
 }
 
 fn test_config(executable: PathBuf) -> ExtHostConfig {

@@ -10,7 +10,7 @@ use std::{
 	time::SystemTime,
 };
 
-use omp_telemetry::redact::redact_sensitive_credentials;
+use omp_observability::redact::redact_sensitive_credentials;
 use thiserror::Error;
 
 /// Maximum bytes returned by one viewer page.

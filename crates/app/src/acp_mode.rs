@@ -1188,6 +1188,12 @@ impl AcpEventMapper {
 }
 
 impl Runtime {
+	#[tracing::instrument(
+		name = "acp_request",
+		level = "debug",
+		skip_all,
+		fields(method = tracing::field::Empty)
+	)]
 	async fn dispatch(self: &Arc<Self>, frame: Value) -> miette::Result<()> {
 		let id = frame.get("id").cloned();
 		let Some(method) = frame.get("method").and_then(Value::as_str) else {
@@ -1196,6 +1202,7 @@ impl Runtime {
 			}
 			return Ok(());
 		};
+		tracing::Span::current().record("method", method);
 		let params = frame
 			.get("params")
 			.and_then(Value::as_object)

@@ -304,6 +304,12 @@ fn import(
 				routing:               AccountRoutingContext::default(),
 			})
 			.into_diagnostic()?;
+		tracing::info!(
+			provider = %plan.provider,
+			source = %plan.source.display(),
+			disabled = plan.disabled,
+			"credential imported"
+		);
 		println!(
 			"imported {}: {}{} from {}",
 			plan.provider,
@@ -338,6 +344,11 @@ fn load_import_plan(
 		let input = match fs::read(&source) {
 			Ok(input) => Zeroizing::new(input),
 			Err(error) => {
+				tracing::warn!(
+					path = %source.display(),
+					%error,
+					"credential import skipped unreadable file"
+				);
 				eprintln!("skip {}: unreadable credential file: {error}", source.display());
 				continue;
 			},
@@ -345,11 +356,20 @@ fn load_import_plan(
 		let record: CliProxyCredential = match serde_json::from_slice(&input) {
 			Ok(record) => record,
 			Err(error) => {
+				tracing::warn!(
+					path = %source.display(),
+					%error,
+					"credential import skipped malformed JSON"
+				);
 				eprintln!("skip {}: unreadable JSON: {error}", source.display());
 				continue;
 			},
 		};
 		if record.disabled && !include_disabled {
+			tracing::warn!(
+				path = %source.display(),
+				"credential import skipped disabled record"
+			);
 			eprintln!(
 				"skip {}: credential marked disabled (use --include-disabled to import anyway)",
 				source.display()
@@ -357,6 +377,10 @@ fn load_import_plan(
 			continue;
 		}
 		let Some(provider) = resolve_cli_proxy_provider(&record, &source, override_provider) else {
+			tracing::warn!(
+				path = %source.display(),
+				"credential import skipped unresolved provider"
+			);
 			eprintln!(
 				"skip {}: cannot determine OMP provider from type={}",
 				source.display(),
@@ -365,16 +389,29 @@ fn load_import_plan(
 			continue;
 		};
 		let (Some(access), Some(refresh)) = (record.access_token, record.refresh_token) else {
+			tracing::warn!(
+				path = %source.display(),
+				"credential import skipped incomplete token pair"
+			);
 			eprintln!("skip {}: missing access_token or refresh_token", source.display());
 			continue;
 		};
 		let Some(expired) = record.expired else {
+			tracing::warn!(
+				path = %source.display(),
+				"credential import skipped missing expiration"
+			);
 			eprintln!("skip {}: missing expired timestamp", source.display());
 			continue;
 		};
 		let expires_at = match expired.parse::<jiff::Timestamp>() {
 			Ok(timestamp) => SystemTime::from(timestamp),
 			Err(error) => {
+				tracing::warn!(
+					path = %source.display(),
+					%error,
+					"credential import skipped invalid expiration"
+				);
 				eprintln!("skip {}: cannot parse expired={expired}: {error}", source.display());
 				continue;
 			},
@@ -399,6 +436,11 @@ fn load_import_plan(
 			.map(|route| route.id.clone())
 			.collect::<BTreeSet<_>>();
 		if routes.is_empty() {
+			tracing::warn!(
+				path = %source.display(),
+				%provider,
+				"credential import skipped unknown provider"
+			);
 			eprintln!("skip {}: unknown credential provider `{provider}`", source.display());
 			continue;
 		}

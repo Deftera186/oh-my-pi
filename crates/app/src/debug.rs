@@ -200,8 +200,8 @@ pub fn collect_system_facts() -> SystemFacts {
 		memory_bytes:  platform_memory_bytes(),
 		omp_version:   env!("CARGO_PKG_VERSION"),
 		target_family: consts::FAMILY,
-		shell:         omp_telemetry::redact::redact_sensitive_credentials(&shell),
-		cwd:           omp_telemetry::redact::redact_sensitive_credentials(&cwd),
+		shell:         omp_observability::redact::redact_sensitive_credentials(&shell),
+		cwd:           omp_observability::redact::redact_sensitive_credentials(&cwd),
 	}
 }
 
@@ -265,7 +265,7 @@ pub fn export_transcript(directory: &Path, text: &str) -> io::Result<PathBuf> {
 		.unwrap_or(Duration::ZERO)
 		.as_nanos();
 	let path = directory.join(format!("omp-transcript-{}-{nonce}.txt", process::id()));
-	let redacted = omp_telemetry::redact::redact_sensitive_credentials(text);
+	let redacted = omp_observability::redact::redact_sensitive_credentials(text);
 	fs::write(&path, redacted)?;
 	Ok(path)
 }

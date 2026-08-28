@@ -119,9 +119,11 @@ impl AutolearnController {
 		}
 		if self.capture_in_flight {
 			self.capture_pending = true;
+			tracing::debug!(settled_tool_call_count = tool_calls, "autolearn capture coalesced");
 			CaptureDecision::None
 		} else {
 			self.capture_in_flight = true;
+			tracing::debug!(settled_tool_call_count = tool_calls, "autolearn capture scheduled");
 			CaptureDecision::Enqueue
 		}
 	}

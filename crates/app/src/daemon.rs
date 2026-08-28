@@ -503,6 +503,7 @@ impl BearerAuth {
 		if valid {
 			Ok(request)
 		} else {
+			tracing::warn!("gateway authentication denied");
 			Err(Status::unauthenticated("valid gateway bearer token required"))
 		}
 	}
@@ -539,6 +540,7 @@ async fn watch_gateway_token(
 						&& next.expose_secret() != token.read().expose_secret()
 					{
 						*token.write() = next;
+						tracing::debug!("gateway bearer token reloaded");
 					}
 				}
 			},
@@ -702,6 +704,7 @@ impl DaemonHandle {
 				}
 			},
 		};
+		tracing::info!(endpoint = %endpoint, routes, "daemon listening");
 		Ok(Self {
 			readiness: DaemonReadiness { endpoint, routes },
 			registry,
@@ -761,6 +764,7 @@ impl DaemonHandle {
 			}
 		}
 
+		tracing::info!(endpoint = %self.readiness.endpoint, "daemon stopped");
 		Ok(())
 	}
 }

@@ -30,7 +30,7 @@ omp-snapcompact = { workspace = true }
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-scribe = { workspace = true }
 # The sole sanctioned direct storage edge is the durable journal subscriber.
-omp-telemetry = { workspace = true }
+omp-observability = { workspace = true }
 omp-storage = { workspace = true }
 omp-tool = { workspace = true }
 parking_lot = { workspace = true }

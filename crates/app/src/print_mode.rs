@@ -306,7 +306,7 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	}
 	session
 		.finalizer_mut()
-		.set_telemetry(|| async { omp_telemetry::export::shutdown() });
+		.set_telemetry(|| async { omp_observability::export::shutdown() });
 	if let Some(runtime) = advisor_runtime.as_ref() {
 		let runtime = Arc::clone(runtime);
 		session
@@ -502,6 +502,12 @@ fn startup_plan_ignored(
 	settings.plan.enabled && settings.plan.default_on_startup && fresh && !plan_yolo
 }
 
+#[tracing::instrument(
+	name = "print_turn",
+	level = "debug",
+	skip_all,
+	fields(turn_id = tracing::field::Empty)
+)]
 async fn submit_print_turn(
 	session: &mut HeadlessSession,
 	events: &EventSubscription,
@@ -515,6 +521,7 @@ async fn submit_print_turn(
 	stderr: &mut Stderr,
 ) -> Result<AgentRunSummary, PrintTurnError> {
 	let turn_id = omp_agent::TurnId::new(turn_id());
+	tracing::Span::current().record("turn_id", turn_id.as_str());
 	json_state.part_kinds.clear();
 	json_state.part_tool_calls.clear();
 	json_state.opened_tools.clear();

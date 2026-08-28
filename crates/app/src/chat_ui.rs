@@ -59,6 +59,9 @@ use omp_driver::{
 };
 use omp_envd::exthost::lifecycle::HeadlessLifecycleKind;
 use omp_inference::{call::AuthInput, id::TurnId};
+use omp_observability::firehose::{
+	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
+};
 use omp_proto::{
 	env::v1::{
 		CloseSessionRequest, EnvironmentDelta, ExecControlKind, ExecOutcome, ExecRequest,
@@ -79,9 +82,6 @@ use omp_proto::{
 use omp_storage::{
 	index::{NewSession, SessionIndex, SessionKind},
 	transcript::{self, SessionId},
-};
-use omp_telemetry::firehose::{
-	Event as FirehoseEvent, Kind as FirehoseKind, SubscriptionHandle, SubscriptionOptions,
 };
 use omp_tool::{
 	Registry, Rev, TOOL_REV_PROP, ToolIdentity,
@@ -4550,6 +4550,7 @@ fn silent_command() -> CommandFuture<'static> {
 fn toggle_live_voice(backend: &flume::Sender<BackendEvent>, state: &mut BridgeState) {
 	if state.audio.live_active() {
 		state.audio.stop_live();
+		tracing::debug!(session_id = %state.session_id, "live voice stopped");
 		send_backend(backend, BackendEvent::LiveVoiceStopped);
 		send_backend(backend, BackendEvent::Notice(sf!("Live voice stopped.")));
 		return;
@@ -4557,6 +4558,7 @@ fn toggle_live_voice(backend: &flume::Sender<BackendEvent>, state: &mut BridgeSt
 	match state.audio.start_live() {
 		Ok(()) => {
 			state.live_activity = ActivityWaveform::new();
+			tracing::debug!(session_id = %state.session_id, "live voice started");
 			send_backend(backend, BackendEvent::LiveVoiceStarted);
 			send_backend(
 				backend,
@@ -4564,6 +4566,11 @@ fn toggle_live_voice(backend: &flume::Sender<BackendEvent>, state: &mut BridgeSt
 			);
 		},
 		Err(error) => {
+			tracing::warn!(
+				%error,
+				session_id = %state.session_id,
+				"live voice start denied"
+			);
 			send_backend(backend, BackendEvent::Error(sf!("Could not start live voice: {error}")))
 		},
 	}
@@ -6559,12 +6566,26 @@ where
 				let mut engine = advisor.lock();
 				let enabled = !engine.enabled();
 				engine.set_enabled(enabled);
-				advisor_status(&engine.status())
+				let status = engine.status();
+				tracing::debug!(
+					session_id = %self.state.session_id,
+					enabled = status.enabled,
+					advisor_count = status.advisors.len(),
+					"advisor state changed"
+				);
+				advisor_status(&status)
 			},
 			AdvisorRequest::SetEnabled(enabled) => {
 				let mut engine = advisor.lock();
 				engine.set_enabled(enabled);
-				advisor_status(&engine.status())
+				let status = engine.status();
+				tracing::debug!(
+					session_id = %self.state.session_id,
+					enabled = status.enabled,
+					advisor_count = status.advisors.len(),
+					"advisor state changed"
+				);
+				advisor_status(&status)
 			},
 			AdvisorRequest::Status => advisor_status(&advisor.lock().status()),
 			AdvisorRequest::DumpRaw => advisor.lock().dump(false),
@@ -7387,12 +7408,20 @@ fn maybe_spawn_session_title<C>(
 		let resolved = match resolved {
 			Ok(Ok(prompt)) => prompt,
 			Ok(Err(error)) => {
-				tracing::debug!(%error, "title system prompt could not be resolved");
+				tracing::debug!(
+					%error,
+					session_id = %session_id,
+					"title system prompt could not be resolved"
+				);
 				in_flight.store(false, Ordering::Release);
 				return;
 			},
 			Err(error) => {
-				tracing::debug!(%error, "title system prompt resolution task failed");
+				tracing::debug!(
+					%error,
+					session_id = %session_id,
+					"title system prompt resolution task failed"
+				);
 				in_flight.store(false, Ordering::Release);
 				return;
 			},
@@ -7530,7 +7559,11 @@ where
 					let thread = match control.project_thread().await {
 						Ok(thread) => thread,
 						Err(error) => {
-							tracing::debug!(%error, "idle recap thread projection failed");
+							tracing::debug!(
+								%error,
+								session_id = %session_id,
+								"idle recap thread projection failed"
+							);
 							return;
 						},
 					};
@@ -7539,11 +7572,28 @@ where
 							if let Some(preview) =
 								recap_preview(omp_driver::chat::outcome_text(&outcome).as_str())
 							{
+								tracing::debug!(
+									session_id = %session_id,
+									preview_bytes = preview.as_str().len(),
+									"idle recap generated"
+								);
 								send_backend(&backend, BackendEvent::Recap(preview));
+							} else {
+								tracing::debug!(
+									session_id = %session_id,
+									"idle recap produced no preview"
+								);
 							}
 						},
-						Ok(None) => {},
-						Err(error) => tracing::debug!(%error, "idle recap request failed"),
+						Ok(None) => tracing::debug!(
+							session_id = %session_id,
+							"idle recap request returned no outcome"
+						),
+						Err(error) => tracing::debug!(
+							%error,
+							session_id = %session_id,
+							"idle recap request failed"
+						),
 					}
 				}));
 			}
@@ -8428,6 +8478,7 @@ where
 		},
 		Intent::LiveVoice(LiveVoiceAction::Close) => {
 			state.audio.stop_live();
+			tracing::debug!(session_id = %state.session_id, "live voice closed");
 			send_backend(backend, BackendEvent::LiveVoiceStopped);
 			send_status(backend, state, bus, dropped);
 		},

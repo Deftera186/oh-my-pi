@@ -622,6 +622,18 @@ pub struct SnapcompactOutcome {
 /// PNG frames remain byte values in this result; the journal owner must spill
 /// each through its `BlobStore` before committing `compact`, preventing base64
 /// request payloads from becoming transcript truth.
+#[tracing::instrument(
+	name = "snapcompact",
+	level = "debug",
+	skip_all,
+	fields(
+		provider = ?preparation.provider,
+		model = ?preparation.model_id,
+		source_tokens = preparation.source_tokens,
+		tokens_before = preparation.tokens_before,
+		existing_image_count = preparation.existing_images,
+	)
+)]
 pub fn execute_snapcompact(
 	preparation: &SnapcompactPreparation,
 ) -> Result<SnapcompactOutcome, omp_snapcompact::archive::ArchiveError> {
@@ -1237,6 +1249,18 @@ impl HookEvent for CompactionEvent {
 /// behavior rather than leaving the session over budget. A rescue-time
 /// `HANDOFF` cancellation is refused because the ladder has no remaining rung
 /// that can make the next provider request fit.
+#[tracing::instrument(
+	name = "compaction_tier",
+	level = "debug",
+	skip_all,
+	fields(
+		tier = %event.tier,
+		reason = %event.reason,
+		epoch = event.epoch,
+		tokens_before = event.tokens_before,
+		target_tokens = event.target_tokens,
+	)
+)]
 pub async fn dispatch_tier(gate: &HookGate, event: &CompactionEvent) -> CompactionResolution {
 	let mut outcome = gate.gate_domain(event).await;
 	let resolution = if outcome.contributions.is_empty() {

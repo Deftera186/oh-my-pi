@@ -384,6 +384,13 @@ impl SubagentRunState {
 		}
 		self.lifecycle.store(next as u8, Ordering::Release);
 		self.append(SubagentRunEventKind::Lifecycle(next));
+		tracing::debug!(
+			agent_id = %self.agent_id,
+			generation = self.generation().0,
+			from = %current,
+			to = %next,
+			"subagent lifecycle changed"
+		);
 		Ok(())
 	}
 
@@ -431,6 +438,13 @@ impl SubagentRunState {
 			.lifecycle
 			.store(SubagentLifecycle::Starting as u8, Ordering::Release);
 		self.append(SubagentRunEventKind::Lifecycle(SubagentLifecycle::Starting));
+		tracing::debug!(
+			agent_id = %self.agent_id,
+			generation,
+			from = %lifecycle,
+			to = %SubagentLifecycle::Starting,
+			"subagent generation started"
+		);
 		Ok(SubagentGeneration(generation))
 	}
 

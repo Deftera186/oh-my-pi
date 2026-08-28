@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! OMP command-line entry point.
 
 use std::{env, panic, process::ExitCode};
@@ -49,6 +51,7 @@ fn set_process_title() {}
 
 fn install_panic_hook() {
 	panic::set_hook(Box::new(|info| {
+		tracing::error!(target: "omp", panic = %info, "panic");
 		eprintln!("\x1b[31momp internal error:\x1b[0m {info}");
 	}));
 }
@@ -56,6 +59,7 @@ fn install_panic_hook() {
 #[tokio::main]
 async fn main() -> ExitCode {
 	process_bootstrap();
+	omp_observability::logging::init();
 	install_panic_hook();
 	if env::args_os()
 		.nth(1)
@@ -105,11 +109,11 @@ async fn main() -> ExitCode {
 			},
 		};
 	}
-	omp_telemetry::export::init();
+	omp_observability::export::init();
 	omp_app::startup_notice::start_watchdog();
 	let result = omp_app::run().await;
 	omp_app::startup_notice::stop_watchdog();
-	omp_telemetry::export::shutdown();
+	omp_observability::export::shutdown();
 	match result {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) => {

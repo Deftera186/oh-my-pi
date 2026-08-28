@@ -363,6 +363,17 @@ impl Arbiter {
 		for record in &report.failed {
 			journal.append_regime_record(now_ms, record)?;
 		}
+		if report.failed.is_empty() {
+			if !report.resumed.is_empty() {
+				tracing::debug!(resumed_count = report.resumed.len(), "durable regimes resumed");
+			}
+		} else {
+			tracing::warn!(
+				resumed_count = report.resumed.len(),
+				failed_count = report.failed.len(),
+				"durable regime recovery failed for some activations"
+			);
+		}
 		Ok(report)
 	}
 

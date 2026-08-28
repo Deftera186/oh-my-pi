@@ -212,6 +212,12 @@ async fn refresh() -> miette::Result<()> {
 				let page = match page {
 					Ok(page) => page,
 					Err(error) => {
+						tracing::warn!(
+							provider = %provider,
+							route = %route,
+							%error,
+							"model discovery refresh failed"
+						);
 						failures.push(format!("{}: {error}", provider.as_str()));
 						break;
 					},

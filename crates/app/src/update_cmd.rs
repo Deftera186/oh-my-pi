@@ -94,6 +94,12 @@ impl Drop for UpdateLock {
 }
 
 /// Runs the signed core updater or explicitly delegates extension upgrades.
+#[tracing::instrument(
+	level = "debug",
+	name = "update",
+	skip_all,
+	fields(check = args.check, force = args.force, plugins = args.plugins)
+)]
 pub async fn run(args: UpdateArgs) -> miette::Result<()> {
 	if args.plugins {
 		if args.check || args.force || args.index.is_some() || args.index_key.is_some() {
@@ -113,6 +119,14 @@ pub async fn run(args: UpdateArgs) -> miette::Result<()> {
 	let manager = classify_installation(&env::current_exe().into_diagnostic()?);
 	let current = env!("CARGO_PKG_VERSION");
 	let newer = compare_versions(selected.release.version.as_str(), current).is_gt();
+	tracing::debug!(
+		current_version = current,
+		latest_version = %selected.release.version,
+		%target,
+		?manager,
+		update_available = newer,
+		"verified signed update metadata"
+	);
 	if args.check || (!newer && !args.force) {
 		println!(
 			"current={current}\tlatest={}\ttarget={target}\tmanager={manager:?}\\
@@ -126,6 +140,7 @@ pub async fn run(args: UpdateArgs) -> miette::Result<()> {
 	}
 	let version = selected.release.version.clone();
 	install(selected).await?;
+	tracing::info!(version = %version, %target, "update installed");
 	println!("updated omp to {version} ({target})");
 	Ok(())
 }
@@ -136,6 +151,12 @@ fn release_override_requested(args: &UpdateArgs) -> bool {
 		|| env::var_os("OMP_RELEASE_INDEX_KEY").is_some()
 }
 
+#[tracing::instrument(
+	level = "debug",
+	name = "github_update",
+	skip_all,
+	fields(check = args.check, force = args.force)
+)]
 async fn run_github_update(args: UpdateArgs) -> miette::Result<()> {
 	let release = fetch_github_release(std::time::Duration::from_secs(15)).await?;
 	let target = platform_target();
@@ -153,6 +174,14 @@ async fn run_github_update(args: UpdateArgs) -> miette::Result<()> {
 	let manager = classify_installation(&env::current_exe().into_diagnostic()?);
 	let current = env!("CARGO_PKG_VERSION");
 	let newer = compare_versions(version, current).is_gt();
+	tracing::debug!(
+		current_version = current,
+		latest_version = version,
+		%target,
+		?manager,
+		update_available = newer,
+		"verified GitHub update metadata"
+	);
 	if args.check || (!newer && !args.force) {
 		println!(
 			"current={current}\tlatest={version}\ttarget={target}\tmanager={manager:?}\\
@@ -164,6 +193,7 @@ async fn run_github_update(args: UpdateArgs) -> miette::Result<()> {
 		return Err(miette!("{}", manager_instruction(manager)));
 	}
 	install_github_asset(asset, digest, version).await?;
+	tracing::info!(%version, %target, "update installed");
 	println!("updated omp to {version} ({target})");
 	Ok(())
 }
@@ -198,6 +228,12 @@ fn github_sha256(asset: &GithubAsset) -> miette::Result<&str> {
 	Ok(digest)
 }
 
+#[tracing::instrument(
+	level = "debug",
+	name = "update_install",
+	skip_all,
+	fields(source = "github", %version)
+)]
 async fn install_github_asset(
 	asset: &GithubAsset,
 	expected_sha256: &str,
@@ -279,6 +315,12 @@ fn update_cache_dir() -> miette::Result<PathBuf> {
 }
 
 /// Inspects the verified package registry without mutating locks or TOFU pins.
+#[tracing::instrument(
+	level = "debug",
+	name = "update_registry_inspect",
+	skip_all,
+	fields(package = %args.package, json = args.json)
+)]
 pub fn registry(args: RegistryArgs) -> miette::Result<()> {
 	let (index, _) = load_index(args.index.as_deref(), args.index_key.as_deref())?;
 	let target = platform_target();
@@ -391,6 +433,12 @@ fn target_artifact<'a>(release: &'a IndexRelease, target: &str) -> Option<&'a In
 		.find(|artifact| artifact.target.as_str() == target)
 }
 
+#[tracing::instrument(
+	level = "debug",
+	name = "update_install",
+	skip_all,
+	fields(source = "signed_index", version = %selected.release.version)
+)]
 async fn install(selected: Selected<'_>) -> miette::Result<()> {
 	if selected.artifact.size > MAX_ASSET_BYTES {
 		return Err(miette!("signed update asset exceeds the 256 MiB safety ceiling"));

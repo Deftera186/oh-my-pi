@@ -2920,6 +2920,12 @@ pub async fn run() -> miette::Result<()> {
 	clippy::future_not_send,
 	reason = "chat dispatch preserves the thread-confined omp_tui::App future"
 )]
+#[tracing::instrument(
+	level = "debug",
+	name = "cli_dispatch",
+	skip_all,
+	fields(command = <&'static str>::from(dispatch_target(cli.command.as_ref())))
+)]
 pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 	startup_notice::stop_watchdog();
 	if cli.version {

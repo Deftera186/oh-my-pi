@@ -34,6 +34,12 @@ pub struct PromptOutcome {
 /// Presents each pending install grant through a native, Core-owned approval
 /// ticket and returns the grants admitted for this session.
 #[expect(clippy::future_not_send, reason = "the trust dialog owns a thread-confined omp_tui::App")]
+#[tracing::instrument(
+	level = "debug",
+	name = "extension_trust_prompt",
+	skip_all,
+	fields(request_count = requests.len(), grant_path = %grant_path.display())
+)]
 pub async fn prompt(
 	requests: &[ExtensionGrantRequest],
 	grant_path: &Path,
@@ -83,6 +89,18 @@ pub async fn prompt(
 			}
 		};
 		let decision = action.decision();
+		if action == GrantAction::Deny {
+			tracing::warn!(
+				extension.id = %request.grant.id,
+				"extension grant denied"
+			);
+		} else {
+			tracing::info!(
+				extension.id = %request.grant.id,
+				action = <&'static str>::from(action),
+				"extension grant approved"
+			);
+		}
 		pending
 			.respond(decision)
 			.map_err(|_| miette!("extension approval ticket was already settled"))?;

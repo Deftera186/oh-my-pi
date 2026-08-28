@@ -65,6 +65,12 @@ enum AuthLocation {
 /// A clean cancellation returns `None`; provider login and model selection are
 /// completed inside this retained terminal host before it is dropped.
 #[expect(clippy::future_not_send, reason = "the setup wizard owns a thread-confined omp_tui::App")]
+#[tracing::instrument(
+	level = "debug",
+	name = "setup_wizard",
+	skip_all,
+	fields(data_dir = %data_dir.display())
+)]
 pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<Str>> {
 	fs::create_dir_all(data_dir).into_diagnostic()?;
 	let store = omp_driver::registry::open_credential_store(data_dir.join("credentials.db"))
@@ -125,6 +131,11 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 								step = Step::Authenticating;
 							},
 							Err(error) => {
+								tracing::warn!(
+									provider = active_provider.as_deref().unwrap_or("unknown"),
+									%error,
+									"wizard authentication response was rejected"
+								);
 								open_setup_provider_step(app.ui_mut(), catalog);
 								set_status(app.ui_mut(), sf!("Setup error: {error}"));
 								auth_location = None;
@@ -167,6 +178,11 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 							step = Step::Authenticating;
 						},
 						Err(error) => {
+							tracing::warn!(
+								provider = %value,
+								%error,
+								"wizard authentication could not start"
+							);
 							open_setup_provider_step(app.ui_mut(), catalog);
 							set_status(app.ui_mut(), sf!("Setup error: {error}"));
 							step = Step::Provider;
@@ -285,6 +301,10 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(ChatAuthEvent::Complete(_))
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
+					tracing::info!(
+						provider = active_provider.as_deref().unwrap_or("unknown"),
+						"wizard authentication completed"
+					);
 					close_auth_scene(app.ui_mut());
 					open_setup_model_step(
 						app.ui_mut(),
@@ -299,6 +319,10 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 				Some(ChatAuthEvent::CredentialStorageLocked)
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) =>
 				{
+					tracing::warn!(
+						provider = active_provider.as_deref().unwrap_or("unknown"),
+						"wizard credential storage is locked"
+					);
 					if matches!(step, Step::Prompt(_)) {
 						let _ = app.ui_mut().close_top_overlay();
 						show_authenticating(app.ui_mut());
@@ -309,6 +333,10 @@ pub async fn run(data_dir: &Path, catalog: &Catalog) -> miette::Result<Option<St
 					step = Step::CredentialStorageLocked;
 				},
 				Some(ChatAuthEvent::Failed(message)) => {
+					tracing::warn!(
+						provider = active_provider.as_deref().unwrap_or("unknown"),
+						"wizard authentication failed"
+					);
 					if matches!(step, Step::Authenticating | Step::Prompt(_)) {
 						close_auth_scene(app.ui_mut());
 						open_setup_provider_step(app.ui_mut(), catalog);

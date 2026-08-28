@@ -39,6 +39,7 @@ impl DraftStore {
 			use std::os::unix::fs::PermissionsExt as _;
 			fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 		}
+		tracing::debug!(path = %directory.display(), "session draft store ready");
 		Ok(Self { directory })
 	}
 
@@ -60,9 +61,15 @@ impl DraftStore {
 				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 				Err(error) => return Err(error.into()),
 			}
+			tracing::debug!(session_id = %session.0, "session draft cleared");
 			return Ok(());
 		}
 		atomic::commit(&path, draft.as_bytes(), || true)?;
+		tracing::debug!(
+			session_id = %session.0,
+			draft_bytes = draft.len(),
+			"session draft saved"
+		);
 		Ok(())
 	}
 
@@ -72,13 +79,23 @@ impl DraftStore {
 		let claimed = path.with_extension(format!("claimed-{}", omp_core::Ulid::generate()));
 		match fs::rename(&path, &claimed) {
 			Ok(()) => {},
-			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {
+				tracing::debug!(session_id = %session.0, "no saved session draft found");
+				return Ok(None);
+			},
 			Err(error) => return Err(error.into()),
 		}
 		let result = fs::read_to_string(&claimed);
 		let removal = fs::remove_file(&claimed);
 		match (result, removal) {
-			(Ok(draft), Ok(())) => Ok(Some(draft)),
+			(Ok(draft), Ok(())) => {
+				tracing::debug!(
+					session_id = %session.0,
+					draft_bytes = draft.len(),
+					"saved session draft consumed"
+				);
+				Ok(Some(draft))
+			},
 			(Err(error), _) | (Ok(_), Err(error)) => Err(error.into()),
 		}
 	}

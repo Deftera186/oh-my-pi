@@ -67,6 +67,9 @@ pub(crate) async fn search(args: SearchCliArgs) -> miette::Result<()> {
 			println!("\n{}\n{}\n{}", source.title, source.url, source.snippet);
 		}
 	}
+	if !response.warnings.is_empty() {
+		tracing::warn!(warning_count = response.warnings.len(), "web search completed with warnings");
+	}
 	for warning in response.warnings {
 		eprintln!("Warning: {warning}");
 	}

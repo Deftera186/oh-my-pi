@@ -102,6 +102,7 @@ use parking_lot::Mutex;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tonic::transport;
+use tracing::Instrument as _;
 
 use crate::{
 	chat_ui::{
@@ -734,7 +735,7 @@ fn presentation_control_factory(
 }
 
 fn telemetry_control_factory(
-	query: Arc<dyn omp_telemetry::authority::DurableTelemetryQuery>,
+	query: Arc<dyn omp_observability::authority::DurableTelemetryQuery>,
 ) -> Arc<dyn ControlAuthorityFactory> {
 	Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
 		Ok(Arc::new(TelemetryControlAuthority::new(identity, now_ms(), Arc::clone(&query)))
@@ -911,6 +912,14 @@ fn resume_command(profile: Option<&str>, session_id: &str) -> String {
 	command
 }
 
+fn exit_before_ui_for_timing() -> bool {
+	if omp_observability::logging::timing_mode() != omp_observability::logging::TimingMode::Exit {
+		return false;
+	}
+	eprintln!("OMP_TIMING startup complete; exiting before UI");
+	true
+}
+
 #[cfg(test)]
 mod resume_hint_tests {
 	use super::*;
@@ -1000,6 +1009,12 @@ pub(crate) async fn run(
 				recorded_root.display(),
 				launch_root.display()
 			);
+			tracing::info!(
+				session_id = %selection.session.id.0,
+				recorded_root = %recorded_root.display(),
+				launch_root = %launch_root.display(),
+				"session workspace root moved"
+			);
 		}
 	}
 	if args.from_claude || args.from_codex {
@@ -1058,25 +1073,40 @@ pub(crate) async fn run(
 				"Import warning at {source_label} line {}: {}",
 				diagnostic.line, diagnostic.reason
 			);
+			tracing::warn!(
+				source = source_label,
+				line = diagnostic.line,
+				"foreign session import diagnostic"
+			);
 		}
 		eprintln!(
 			"Imported {source_label} session {} as {imported_id} ({} events).",
 			info.id, report.event_count
 		);
+		tracing::info!(
+			source = source_label,
+			session_id = %imported_id,
+			event_count = report.event_count,
+			diagnostic_count = report.transcript.diagnostics.len(),
+			"foreign session imported"
+		);
 		picked_resume = Some(imported_id);
 		selected_sessions_dir = Some(import_sessions_dir);
 	}
-	let catalog_owner = omp_driver::registry::production_catalog(&data_dir)
-		.map_err(|error| miette::miette!(error))?;
+	let catalog_owner = tracing::debug_span!("catalog_load").in_scope(|| {
+		omp_driver::registry::production_catalog(&data_dir).map_err(|error| miette::miette!(error))
+	})?;
 	let catalog = catalog_owner.as_ref();
 	let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&root));
 	settings_paths.overlays.extend(args.config.iter().cloned());
+	let settings_span = tracing::debug_span!("settings_load");
+	let settings_guard = settings_span.enter();
 	let settings_manager =
 		Arc::new(SettingsManager::open(settings_paths).map_err(|error| miette::miette!(error))?);
-	if let Some(approval_mode) = args
+	let approval_mode: Option<omp_envd::tool_settings::ApprovalMode> = args
 		.effective_approval()
-		.map(omp_envd::tool_settings::ApprovalMode::from)
-	{
+		.map(omp_envd::tool_settings::ApprovalMode::from);
+	if let Some(approval_mode) = &approval_mode {
 		settings_manager
 			.set_sync(MutationScope::Runtime, "tools.approval_mode", &approval_mode.to_string())
 			.map_err(|error| miette::miette!(error))?;
@@ -1178,12 +1208,16 @@ pub(crate) async fn run(
 		extension_scopes,
 		extension_overrides: args.extension_launch.settings.clone().into(),
 	};
-	let mut prompt_discovery = omp_driver::discovery::active_prompt_snapshots(
-		&root,
-		&args.add_dir,
-		&home,
-		&prompt_discovery_settings,
-	);
+	drop(settings_guard);
+	drop(settings_span);
+	let mut prompt_discovery = tracing::debug_span!("discovery").in_scope(|| {
+		omp_driver::discovery::active_prompt_snapshots(
+			&root,
+			&args.add_dir,
+			&home,
+			&prompt_discovery_settings,
+		)
+	});
 	if args.no_prompt_templates {
 		prompt_discovery.content.declarations = prompt_discovery
 			.content
@@ -1202,6 +1236,7 @@ pub(crate) async fn run(
 	if args.no_context_files {
 		prompt_discovery.context = Default::default();
 	}
+	let extension_admission_span = tracing::debug_span!("extension_admission");
 	let mut extension_keys = BTreeSet::new();
 	let mut extension_approval_tickets = Vec::new();
 	if !prompt_discovery.content.extension_grants.is_empty() {
@@ -1210,6 +1245,7 @@ pub(crate) async fn run(
 			prompt_discovery.content.extension_grants.as_ref(),
 			&grant_path,
 		)
+		.instrument(extension_admission_span.clone())
 		.await?;
 		prompt_discovery_settings
 			.grants
@@ -1217,13 +1253,16 @@ pub(crate) async fn run(
 			.expect("interactive discovery installs a grant authority")
 			.session = outcome.session_grants.into();
 		extension_approval_tickets = outcome.tickets;
-		prompt_discovery = omp_driver::discovery::active_prompt_snapshots(
-			&root,
-			&args.add_dir,
-			&home,
-			&prompt_discovery_settings,
-		);
+		prompt_discovery = tracing::debug_span!("discovery").in_scope(|| {
+			omp_driver::discovery::active_prompt_snapshots(
+				&root,
+				&args.add_dir,
+				&home,
+				&prompt_discovery_settings,
+			)
+		});
 	}
+	let extension_admission_guard = extension_admission_span.enter();
 	let mut admitted_extensions = prompt_discovery
 		.content
 		.extensions
@@ -1263,8 +1302,11 @@ pub(crate) async fn run(
 		admitted_extensions.retain(|extension| !startup_revoked.contains(extension.key.extension()));
 		for id in startup_revoked {
 			eprintln!("SECURITY: revoked extension {id} was not admitted");
+			tracing::warn!(extension_id = %id, "revoked extension denied at startup");
 		}
 	}
+	drop(extension_admission_guard);
+	drop(extension_admission_span);
 	let roles = roles::resolve_launch_roles(
 		catalog,
 		&model_settings,
@@ -1455,6 +1497,7 @@ pub(crate) async fn run(
 		&prompt_discovery_settings,
 		prompt_discovery.content,
 	)
+	.instrument(tracing::debug_span!("gate_discovery"))
 	.await
 	.map_err(|error| miette::miette!(error))?;
 	let credential_control_grants =
@@ -1576,6 +1619,12 @@ pub(crate) async fn run(
 					""
 				}
 			);
+			tracing::warn!(
+				session_id = %session.id,
+				pending_jobs,
+				pending_turn,
+				"resumed session has pending work"
+			);
 		}
 	}
 	let blueprint = session_blueprint(
@@ -1614,7 +1663,8 @@ pub(crate) async fn run(
 	if resume.is_some() {
 		let path = sessions_dir.join(format!("{}.jsonl", session.id.as_str()));
 		let Session { id, journal, initial_items } = session;
-		let revived = omp_agent::revive_existing(&path, journal, snapshot)
+		let revived = session_open_span
+			.in_scope(|| omp_agent::revive_existing(&path, journal, snapshot))
 			.map_err(|error| miette::miette!(error))?;
 		session = Session { id, journal: revived.journal, initial_items };
 		snapshot = revived.snapshot;
@@ -1634,8 +1684,15 @@ pub(crate) async fn run(
 				"Session model `{saved}` is unavailable; resumed with `{fallback}` without changing \
 				 the session pin."
 			);
+			tracing::warn!(
+				session_id = %session.id,
+				model = saved,
+				fallback_model = %fallback,
+				"resumed session model unavailable"
+			);
 		}
 	}
+	drop(session_open_span);
 	snapshot.compaction = settings.compaction.method_order();
 	snapshot.unexpected_stop = settings.interaction.unexpected_stop_detection;
 	snapshot.reasoning_dialect = interrupted_reasoning_dialect(catalog, &snapshot.turn.params.model);
@@ -1713,17 +1770,37 @@ pub(crate) async fn run(
 				eprintln!(
 					"SECURITY: extension {id} in the startup generation was revoked and quarantined"
 				);
+				tracing::warn!(
+					extension_id = %id,
+					"startup extension revoked and quarantined"
+				);
 			}
 			for item in report.items {
 				match item.refusal {
-					Some(refusal) => eprintln!(
-						"Extension update {} {} -> {} is notify-only: {refusal}",
-						item.diff.id, item.diff.from_version, item.diff.to_version
-					),
-					None => eprintln!(
-						"Extension update {} {} -> {} verified",
-						item.diff.id, item.diff.from_version, item.diff.to_version
-					),
+					Some(refusal) => {
+						eprintln!(
+							"Extension update {} {} -> {} is notify-only: {refusal}",
+							item.diff.id, item.diff.from_version, item.diff.to_version
+						);
+						tracing::warn!(
+							extension_id = %item.diff.id,
+							from_version = %item.diff.from_version,
+							to_version = %item.diff.to_version,
+							"extension update restricted to notification"
+						);
+					},
+					None => {
+						eprintln!(
+							"Extension update {} {} -> {} verified",
+							item.diff.id, item.diff.from_version, item.diff.to_version
+						);
+						tracing::info!(
+							extension_id = %item.diff.id,
+							from_version = %item.diff.from_version,
+							to_version = %item.diff.to_version,
+							"extension update verified"
+						);
+					},
 				}
 			}
 		}
@@ -1743,8 +1820,20 @@ pub(crate) async fn run(
 		min_tool_calls: configured_autolearn.min_tool_calls,
 	};
 	let active_content = prompt_discovery.content;
+	if !active_content.warnings.is_empty() {
+		tracing::warn!(
+			warning_count = active_content.warnings.len(),
+			"extension content loaded with warnings"
+		);
+	}
 	for warning in active_content.warnings.iter() {
 		eprintln!("Extension load warning: {warning}");
+	}
+	if !prompt_discovery.context.diagnostics.is_empty() {
+		tracing::warn!(
+			diagnostic_count = prompt_discovery.context.diagnostics.len(),
+			"context content loaded with diagnostics"
+		);
 	}
 	for diagnostic in prompt_discovery.context.diagnostics.iter() {
 		eprintln!("Context load warning: {diagnostic:?}");
@@ -1769,22 +1858,27 @@ pub(crate) async fn run(
 		}
 	};
 	prompt_facts.context_files = context::prompt_files(&prompt_discovery.context);
-	let prepared_prompt = PromptSnapshot::freeze(
-		prompt_facts,
-		registry.as_ref(),
-		Some(&snapshot.enabled_tools),
-		Arc::from([]),
-		Default::default(),
-		Default::default(),
-		Default::default(),
-		prompt_rules,
-		prompt_skills,
-		Arc::from([]),
-	);
+	let prompt_freeze_span = tracing::debug_span!("prompt_freeze");
+	let prepared_prompt = prompt_freeze_span.in_scope(|| {
+		PromptSnapshot::freeze(
+			prompt_facts,
+			registry.as_ref(),
+			Some(&snapshot.enabled_tools),
+			Arc::from([]),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			prompt_rules,
+			prompt_skills,
+			Arc::from([]),
+		)
+	});
 	let mut prompt_facts = prepared_prompt.workspace;
 	let prepared =
 		omp_driver::prompt_prep::prepare_environment_inputs_bounded(&env, &session.journal, &root)
+			.instrument(prompt_freeze_span.clone())
 			.await;
+	drop(prompt_freeze_span);
 	prompt_facts.host = prepared.host;
 	prompt_facts.roots = prepared.roots;
 	snapshot.props = prompt_facts
@@ -1810,8 +1904,10 @@ pub(crate) async fn run(
 				"--api-key and --prompt-cache-key require in-process inference"
 			));
 		}
+		let inference_build_span = tracing::debug_span!("inference_build");
 		let channel = endpoint
 			.connect()
+			.instrument(inference_build_span.clone())
 			.await
 			.into_diagnostic()
 			.wrap_err_with(|| format!("could not connect to {endpoint}"))?;
@@ -1819,6 +1915,10 @@ pub(crate) async fn run(
 			.search_bridge()
 			.bind_remote(channel.clone())
 			.into_diagnostic()?;
+		drop(inference_build_span);
+		if exit_before_ui_for_timing() {
+			return Ok(());
+		}
 		Box::pin(run_ui(
 			RpcTurnClient::new(channel.clone()),
 			&environment,
@@ -1873,6 +1973,7 @@ pub(crate) async fn run(
 		.await
 		.into_diagnostic()
 	} else {
+		let inference_build_span = tracing::debug_span!("inference_build");
 		let omp_driver::registry::ProductionInference {
 			registry: inference_registry,
 			rpc: inference,
@@ -1894,6 +1995,7 @@ pub(crate) async fn run(
 				settings:                Some(Arc::clone(&settings_snapshot)),
 			},
 		)
+		.instrument(inference_build_span.clone())
 		.await
 		.into_diagnostic()?;
 		search_bridge
@@ -1904,9 +2006,14 @@ pub(crate) async fn run(
 			.bind(credential_authority)
 			.map_err(|_| miette::miette!("GitHub credential authority is already bound"))?;
 		let client = InProcTurnClient::new(inference)
+			.instrument(inference_build_span.clone())
 			.await
 			.map_err(ChatError::from)
 			.into_diagnostic()?;
+		drop(inference_build_span);
+		if exit_before_ui_for_timing() {
+			return Ok(());
+		}
 		Box::pin(run_ui(
 			client,
 			&environment,

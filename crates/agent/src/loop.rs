@@ -18,6 +18,11 @@ use omp_memory::{
 	retain::{OwnedRetentionMessage, RetentionRole},
 	session::SessionMemory,
 };
+use omp_observability::firehose::{
+	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
+	ProviderError, ToolCall as FirehoseToolCall, TurnEnd as FirehoseTurnEnd,
+	TurnStart as FirehoseTurnStart,
+};
 use omp_proto::{
 	env::v1::InvokeTool,
 	inference::v1::{
@@ -39,15 +44,11 @@ use omp_storage::{
 		CallId, ChildLifecycleEntry, HookOutcome, InvocationTransition, SnapcompactArchive,
 	},
 };
-use omp_telemetry::firehose::{
-	Branch, BranchOp, Envelope, Event as FirehoseEvent, Firehose, ModelAttempt, ModelRequest,
-	ProviderError, ToolCall as FirehoseToolCall, TurnEnd as FirehoseTurnEnd,
-	TurnStart as FirehoseTurnStart,
-};
 use omp_tool::{Abort, CallOutcome, CapsBase, Registry as ToolRegistry};
 use parking_lot::Mutex;
 use serde_json::{Value, value::RawValue};
 use thiserror::Error;
+use tracing::Instrument as _;
 
 use crate::{
 	AgentRegistry, BatchError, CompactionCancellation, CompactionCoordinator, CompactionEvent,
@@ -2499,6 +2500,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 					let has_producer = drained
 						.iter()
 						.any(|interrupt| continues_loop(&interrupt.source));
+					tracing::info!(
+						turn_index,
+						queued_interrupts = drained.len(),
+						continues = has_producer,
+						"agent turn interrupted"
+					);
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					pending_indexes = self.stage_interrupts(&next_turn_id, drained, DrainPoint::Idle)?;
 					if has_producer {
@@ -2807,6 +2814,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 				};
 				let mut calls = calls;
 				if calls.len() != tool_call_count {
+					tracing::warn!(
+						turn_index = committed_turns,
+						turn_id = %turn_id,
+						expected = tool_call_count,
+						actual = calls.len(),
+						"tool-call commitment count mismatch"
+					);
 					return Err(AgentError::Protocol("tool-call commitment count mismatch"));
 				}
 				for call in &mut calls {
@@ -2894,18 +2908,32 @@ impl<C: TurnClient + Clone> Agent<C> {
 						interrupt_tx.send_replace(Some(sf!("user interrupt")));
 					}
 				}
+				let batch_span = tracing::debug_span!(
+					parent: &turn_span,
+					"tool_batch",
+					turn_index = committed_turns,
+					turn_id = %turn_id,
+					tool_count = calls.len(),
+					queued_interrupts = boundary.len(),
+					result_count = tracing::field::Empty,
+				);
 				let results = {
 					let caps = self.caps;
-					let drive = ToolBatch::new(calls).drive_interruptible(
-						snapshot.registry.as_ref(),
-						&caps,
-						interrupt_rx,
-						runtime_duration(INTERRUPT_GRACE),
-					);
+					let drive = ToolBatch::new(calls)
+						.drive_interruptible(
+							snapshot.registry.as_ref(),
+							&caps,
+							interrupt_rx,
+							runtime_duration(INTERRUPT_GRACE),
+						)
+						.instrument(batch_span.clone());
 					tokio::pin!(drive);
 					loop {
 						tokio::select! {
-							results = &mut drive => break results,
+							results = &mut drive => {
+								batch_span.record("result_count", results.len());
+								break results;
+							},
 							() = wait_deadline(snapshot.deadline), if !deadline_elapsed => {
 								deadline_elapsed = true;
 								interrupt_tx.send_replace(Some(sf!("agent deadline elapsed")));
@@ -2955,6 +2983,18 @@ impl<C: TurnClient + Clone> Agent<C> {
 						}
 					}
 				};
+				if aborted || deadline_elapsed || regime_cancel || had_immediate {
+					tracing::info!(
+						turn_index = committed_turns,
+						caller_abort = aborted,
+						deadline_elapsed,
+						regime_cancel,
+						steering_interrupt = had_immediate,
+						queued_interrupts = boundary.len(),
+						"tool batch interrupted"
+					);
+				}
+				drop(batch_span);
 				let terminate_after_batch =
 					batch_terminates(results.iter().map(BatchResult::terminate));
 				let mut next = Vec::with_capacity(results.len() + boundary.len());

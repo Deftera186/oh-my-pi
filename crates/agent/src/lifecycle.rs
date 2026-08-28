@@ -237,6 +237,7 @@ pub async fn shutdown_ordered(
 	mut tasks: Vec<ShutdownTask>,
 	budget: Duration,
 ) -> Vec<ShutdownOutcome> {
+	tracing::info!(task_count = tasks.len(), "agent lifecycle shutdown started");
 	tasks.sort_by_key(|task| task.stage);
 	let deadline = Instant::now() + budget;
 	let mut outcomes = Vec::with_capacity(tasks.len());
@@ -244,6 +245,11 @@ pub async fn shutdown_ordered(
 	while let Some(mut task) = tasks.next() {
 		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() {
+			tracing::warn!(
+				stage = %task.stage,
+				aborted_later = tasks.len(),
+				"agent lifecycle shutdown timed out"
+			);
 			task.task.abort();
 			outcomes.push(ShutdownOutcome::TimedOut(task.stage));
 			for later in tasks {
@@ -253,9 +259,24 @@ pub async fn shutdown_ordered(
 			break;
 		}
 		match time::timeout(remaining, &mut task.task).await {
-			Ok(Ok(())) => outcomes.push(ShutdownOutcome::Settled(task.stage)),
-			Ok(Err(source)) => outcomes.push(ShutdownOutcome::Failed { stage: task.stage, source }),
+			Ok(Ok(())) => {
+				tracing::info!(stage = %task.stage, "agent lifecycle stage stopped");
+				outcomes.push(ShutdownOutcome::Settled(task.stage));
+			},
+			Ok(Err(source)) => {
+				tracing::warn!(
+					stage = %task.stage,
+					%source,
+					"agent lifecycle stage failed while stopping"
+				);
+				outcomes.push(ShutdownOutcome::Failed { stage: task.stage, source });
+			},
 			Err(_) => {
+				tracing::warn!(
+					stage = %task.stage,
+					aborted_later = tasks.len(),
+					"agent lifecycle shutdown timed out"
+				);
 				task.task.abort();
 				outcomes.push(ShutdownOutcome::TimedOut(task.stage));
 				for later in tasks {
@@ -266,6 +287,7 @@ pub async fn shutdown_ordered(
 			},
 		}
 	}
+	tracing::info!(outcome_count = outcomes.len(), "agent lifecycle shutdown completed");
 	outcomes
 }
 #[cfg(test)]

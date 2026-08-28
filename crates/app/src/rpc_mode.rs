@@ -531,6 +531,7 @@ async fn dispatch_inputs(runtime: Arc<Runtime>, receiver: Receiver<Input>) -> mi
 		while let Ok(input) = receiver.recv_async().await {
 			match input {
 				Input::Malformed(message) => {
+					tracing::warn!(error = %message, "malformed RPC request");
 					runtime.send_error(None, "parse", "parse_error", message)?;
 				},
 				Input::Request(value) if is_immediate_frame(&value) => {
@@ -1033,6 +1034,12 @@ impl Runtime {
 		}
 	}
 
+	#[tracing::instrument(
+		name = "rpc_request",
+		level = "debug",
+		skip_all,
+		fields(method = tracing::field::Empty)
+	)]
 	async fn handle_request(self: &Arc<Self>, value: Value) -> miette::Result<()> {
 		let request = match serde_json::from_value::<RpcRequest>(value) {
 			Ok(request) => request,
@@ -1040,6 +1047,7 @@ impl Runtime {
 				return self.send_error(None, "parse", "invalid_request", error.to_string());
 			},
 		};
+		tracing::Span::current().record("method", request.command.as_str());
 		if request.command == "bash" {
 			return self.start_bash(request).await;
 		}
@@ -1055,8 +1063,18 @@ impl Runtime {
 		}
 	}
 
+	#[tracing::instrument(
+		name = "rpc_request",
+		level = "debug",
+		skip_all,
+		fields(method = tracing::field::Empty)
+	)]
 	async fn handle_immediate(self: &Arc<Self>, value: Value) -> miette::Result<()> {
-		match value.get("type").and_then(Value::as_str) {
+		let method = value.get("type").and_then(Value::as_str);
+		if let Some(method) = method {
+			tracing::Span::current().record("method", method);
+		}
+		match method {
 			Some("bash") => {
 				let request = match serde_json::from_value::<RpcRequest>(value) {
 					Ok(request) => request,

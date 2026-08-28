@@ -56,7 +56,7 @@ fn list(index: &TelemetryIndex, args: &GrievancesArgs) -> Result<()> {
 					"revision": finding.issue.rev,
 					"createdAtMs": finding.issue.created_at_ms,
 					"uploaded": finding.issue.remote_ack.is_some(),
-					"report": omp_telemetry::autoqa::project_payload(&finding.payload),
+					"report": omp_observability::autoqa::project_payload(&finding.payload),
 				})
 			})
 			.collect::<Vec<_>>();
@@ -70,7 +70,7 @@ fn list(index: &TelemetryIndex, args: &GrievancesArgs) -> Result<()> {
 	for finding in &findings {
 		let revision = finding.issue.rev.as_deref().unwrap_or("unknown");
 		println!("#{} {} (rev {revision})", finding.issue.id, finding.issue.device);
-		println!("  {}", omp_telemetry::autoqa::project_payload(&finding.payload));
+		println!("  {}", omp_observability::autoqa::project_payload(&finding.payload));
 		println!();
 	}
 	if let Some(tool) = args.tool.as_deref() {
