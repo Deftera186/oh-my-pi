@@ -263,6 +263,7 @@ mod live {
 	fn wrapper_prefix_executes_and_filters_environment_names() {
 		let Some(runner) = runner() else { return };
 		let mut spec = SandboxSpec::new("");
+		spec.tolerate_missing(omp_sandbox::Capability::IpcRestrict);
 		spec.deny_env("*TOKEN*").expect("deny environment glob");
 		let wrapper = runner.wrap_template(&spec).expect("compile wrapper");
 		assert!(wrapper.env_allowed("PATH"));

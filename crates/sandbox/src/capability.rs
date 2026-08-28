@@ -247,6 +247,10 @@ impl CapabilitySet {
 	pub(crate) const fn from_bits(bits: u32) -> Self {
 		Self(bits)
 	}
+
+	pub(crate) const fn bits(self) -> u32 {
+		self.0
+	}
 }
 
 impl FromIterator<Capability> for CapabilitySet {

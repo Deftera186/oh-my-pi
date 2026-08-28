@@ -177,6 +177,7 @@ pub struct SandboxSpec {
 	pub(crate) mach_services: Vec<Str>,
 	pub(crate) resources:     ResourceLimits,
 	pub(crate) degradation:   DegradationPolicy,
+	pub(crate) tolerated:     CapabilitySet,
 }
 
 impl SandboxSpec {
@@ -200,6 +201,7 @@ impl SandboxSpec {
 			mach_services: Vec::new(),
 			resources:     ResourceLimits::default(),
 			degradation:   DegradationPolicy::Reject,
+			tolerated:     CapabilitySet::empty(),
 		}
 	}
 
@@ -339,6 +341,17 @@ impl SandboxSpec {
 		self
 	}
 
+	/// Accepts one requested capability going unenforced under
+	/// [`DegradationPolicy::Reject`].
+	///
+	/// The capability stays requested: backends that can enforce it still do,
+	/// while a backend unable to enforce it records a caveat instead of
+	/// failing compilation. Every other missing guarantee still rejects.
+	pub const fn tolerate_missing(&mut self, capability: Capability) -> &mut Self {
+		self.tolerated = self.tolerated.union(CapabilitySet::one(capability));
+		self
+	}
+
 	/// Sets whether unsupported guarantees reject compilation or produce
 	/// caveats.
 	pub const fn set_degradation(&mut self, degradation: DegradationPolicy) -> &mut Self {
@@ -462,6 +475,7 @@ impl SandboxSpec {
 		hash_u64(&mut hasher, self.resources.memory_bytes().unwrap_or(0));
 		hash_u64(&mut hasher, u64::from(self.resources.pids().unwrap_or(0)));
 		hash_bytes(&mut hasher, degradation.as_bytes());
+		hash_u64(&mut hasher, u64::from(self.tolerated.bits()));
 		let digest = hasher.finalize().to_hex();
 		Str::from(format!("{prefix}-{}", &digest.as_str()[..16]))
 	}

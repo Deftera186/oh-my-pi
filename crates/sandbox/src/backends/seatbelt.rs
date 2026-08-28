@@ -73,6 +73,13 @@ pub(crate) fn compile(
 		// loader widening but before user scopes, so an explicit user grant wins.
 		profile.push_str("(deny file-read* (subpath \"/System/Volumes/Data\"))\n");
 		profile.push_str("(allow file-read-data (literal \"/\"))\n");
+		// Allowed scopes are canonicalized under /private; callers still address
+		// them through these firmlink symlinks, whose resolution needs a read.
+		push_literals(&mut profile, "allow", "file-read*", [
+			Path::new("/tmp"),
+			Path::new("/var"),
+			Path::new("/etc"),
+		]);
 		push_literals(&mut profile, "allow", "file-read*", [
 			Path::new("/dev/null"),
 			Path::new("/dev/zero"),

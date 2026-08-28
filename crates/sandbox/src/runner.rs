@@ -168,8 +168,24 @@ impl Runner {
 		}?;
 		if spec.degradation == DegradationPolicy::Reject {
 			let missing = requested.difference(plan.enforced());
-			if !missing.is_empty() {
-				return Err(SandboxError::BackendCapabilities { backend: self.backend, missing });
+			let fatal = missing.difference(spec.tolerated);
+			if !fatal.is_empty() {
+				return Err(SandboxError::BackendCapabilities {
+					backend: self.backend,
+					missing: fatal,
+				});
+			}
+			for capability in missing.iter() {
+				if !plan
+					.caveats()
+					.iter()
+					.any(|caveat| caveat.capability == Some(capability))
+				{
+					plan.add_caveat(Caveat::capability(
+						capability,
+						Str::from(format!("{} cannot enforce tolerated {capability}", self.backend)),
+					));
+				}
 			}
 		}
 		if spec.degradation == DegradationPolicy::AllowCaveats {
