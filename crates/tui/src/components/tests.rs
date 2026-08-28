@@ -1497,7 +1497,10 @@ fn bracketed_paste_sanitizes_multiline_editor_and_single_line_input() {
 
 	let input = ui.focus_ring()[1];
 	ui.set_focus_slot(Some(input));
-	assert_eq!(ui.handle_paste("a\r\nb"), UiEvent::None);
+	assert_eq!(ui.handle_paste("a\r\nb"), UiEvent::Changed {
+		id:    "i".into(),
+		value: "a b".into(),
+	});
 	assert_eq!(ui.values()["i"], json!("a b"));
 }
 

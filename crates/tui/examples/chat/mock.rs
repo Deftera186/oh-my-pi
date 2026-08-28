@@ -229,8 +229,8 @@ fn status(model: &Str, working: bool) -> StatusFacts {
 }
 
 fn setting_rows(style: ComposerStyle) -> Vec<SettingRow> {
-	vec![SettingRow {
-		panel:       sf!("interaction"),
+	let mut rows = vec![SettingRow {
+		panel:       sf!("appearance"),
 		domain:      sf!("core"),
 		path:        sf!("composer.shape"),
 		label:       sf!("Composer shape"),
@@ -242,7 +242,87 @@ fn setting_rows(style: ComposerStyle) -> Vec<SettingRow> {
 			.map(|style| Str::from(style.to_string()))
 			.collect(),
 		visible:     true,
-	}]
+	}];
+	// Filler rows across several panels so the example exercises tab
+	// wrapping, viewport scrolling, and live search.
+	for (panel, domain, path, label, description, kind, value) in [
+		("appearance", "tui", "tui.theme", "Theme", "Color theme name.", "text", "default"),
+		("appearance", "tui", "tui.shimmer", "Shimmer", "Animated accent shimmer.", "bool", "true"),
+		("model", "model", "model.effort", "Effort", "Default reasoning effort.", "text", "medium"),
+		(
+			"model",
+			"model",
+			"model.fallback",
+			"Model fallback",
+			"Retry on a fallback model.",
+			"bool",
+			"true",
+		),
+		(
+			"interaction",
+			"interaction",
+			"interaction.steering",
+			"Steering mode",
+			"How mid-turn input steers the agent.",
+			"text",
+			"queue",
+		),
+		(
+			"interaction",
+			"interaction",
+			"interaction.typo_detection",
+			"Typo detection",
+			"Warn on likely typos before submit.",
+			"bool",
+			"true",
+		),
+		(
+			"context",
+			"compaction",
+			"compaction.enabled",
+			"Automatic compaction",
+			"Compact the thread near the context limit.",
+			"bool",
+			"true",
+		),
+		(
+			"context",
+			"compaction",
+			"compaction.recent_tokens",
+			"Recent tokens",
+			"Tokens preserved verbatim during compaction.",
+			"number",
+			"20000",
+		),
+	] {
+		rows.push(SettingRow {
+			panel:       sf!(panel),
+			domain:      sf!(domain),
+			path:        sf!(path),
+			label:       sf!(label),
+			description: sf!(description),
+			kind:        sf!(kind),
+			secret:      false,
+			value:       Some(Str::from(value)),
+			options:     Vec::new(),
+			visible:     true,
+		});
+	}
+	for index in 0..24u32 {
+		rows.push(SettingRow {
+			panel:       sf!("tools_tasks"),
+			domain:      sf!("tools"),
+			path:        Str::from(format!("tools.filler_{index}")),
+			label:       Str::from(format!("Filler setting {index}")),
+			description: sf!("Synthetic row exercising the scrolling viewport."),
+			kind:        sf!("bool"),
+			secret:      false,
+			value:       Some(sf!("false")),
+			options:     Vec::new(),
+			visible:     true,
+		});
+	}
+	rows
 }
 
 fn models() -> Vec<ModelRow> {

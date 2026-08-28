@@ -293,6 +293,7 @@ enum Parsed {
 	},
 	Tab {
 		title:    Str,
+		icon:     Str,
 		children: Vec<Cached>,
 		at:       usize,
 	},
@@ -1423,8 +1424,9 @@ fn finish_element(
 		},
 		"tab" => {
 			let title = props.title().cloned().unwrap_or_else(|| Str::new("tab"));
+			let icon = props.str_of(Prop::Icon).cloned().unwrap_or_default();
 			let children = cached_children(parts, "tab")?;
-			Ok(Parsed::Tab { title, children, at })
+			Ok(Parsed::Tab { title, icon, children, at })
 		},
 		"node" => {
 			let body_label = take_label(&mut parts);
@@ -1592,7 +1594,7 @@ fn finish_element(
 			*tabs.props_mut() = props;
 			for part in parts {
 				match part {
-					Parsed::Tab { title, children, .. } => tabs = tabs.pane(title, children),
+					Parsed::Tab { title, icon, children, .. } => tabs = tabs.pane_icon(icon, title, children),
 					other => return Err(parent_error(other.name(), "tabs", at)),
 				}
 			}

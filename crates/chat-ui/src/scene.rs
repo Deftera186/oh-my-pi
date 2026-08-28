@@ -562,34 +562,58 @@ impl<'a> Span<'a> {
 		Self { text, style }
 	}
 }
+/// Presentation flavor of one transcript prose body.
+#[derive(Clone, Copy)]
+enum Flavor {
+	/// Plain assistant prose.
+	Prose,
+	/// Reasoning prose rendered dim and italic, matching the live stream.
+	Thinking,
+	/// User prompt on a padded panel-colored band spanning the transcript
+	/// width, matching pi's user-message bubble.
+	User,
+}
+
 struct RichText {
-	text:     String,
-	width:    u16,
-	/// Reasoning prose renders dim and italic, matching the live stream.
-	thinking: bool,
-	view:     Option<Ui>,
+	text:   String,
+	width:  u16,
+	flavor: Flavor,
+	view:   Option<Ui>,
 }
 
 impl RichText {
 	fn new(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
-		Self::styled(text, width, false, ctx)
+		Self::styled(text, width, Flavor::Prose, ctx)
 	}
 
 	/// Builds a reasoning body rendered dim and italic.
 	fn thinking(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
-		Self::styled(text, width, true, ctx)
+		Self::styled(text, width, Flavor::Thinking, ctx)
+	}
+	/// Builds a user prompt rendered as a panel-filled bubble.
+	fn user(text: impl Into<String>, width: u16, ctx: &UiContext) -> Self {
+		Self::styled(text, width, Flavor::User, ctx)
 	}
 
-	fn styled(text: impl Into<String>, width: u16, thinking: bool, ctx: &UiContext) -> Self {
+	fn styled(text: impl Into<String>, width: u16, flavor: Flavor, ctx: &UiContext) -> Self {
 		let text = text.into();
-		let view = Self::view(&text, width, thinking, ctx);
-		Self { text, width, thinking, view }
+		let view = Self::view(&text, width, flavor, ctx);
+		Self { text, width, flavor, view }
 	}
 
-	fn view(text: &str, width: u16, thinking: bool, ctx: &UiContext) -> Option<Ui> {
+	fn view(text: &str, width: u16, flavor: Flavor, ctx: &UiContext) -> Option<Ui> {
 		let mut markdown = Markdown::new();
-		if thinking {
-			markdown = markdown.with(Prop::Dim, true).with(Prop::Italic, true);
+		match flavor {
+			Flavor::Prose => {},
+			Flavor::Thinking => {
+				markdown = markdown.with(Prop::Dim, true).with(Prop::Italic, true);
+			},
+			Flavor::User => {
+				markdown = markdown
+					.with_str(Prop::Bg, "panel")
+					.with(Prop::PadX, 1_u16)
+					.with(Prop::PadY, 1_u16);
+			},
 		}
 		Some(Ui::from_root(markdown.text(Str::new(text)), width.max(1), ctx.clone()))
 	}
@@ -597,7 +621,7 @@ impl RichText {
 	fn resize(&mut self, width: u16, ctx: &UiContext) {
 		if self.width != width {
 			self.width = width;
-			self.view = Self::view(&self.text, width, self.thinking, ctx);
+			self.view = Self::view(&self.text, width, self.flavor, ctx);
 		}
 	}
 
@@ -2253,7 +2277,7 @@ impl Chat {
 	pub fn push_user(&mut self, text: impl Into<String>, chips: Vec<Str>) {
 		let text = mask_keywords(text.into(), &self.keyword_accent);
 		self.enqueue_final(Entry::User(UserEntry {
-			body: RichText::new(text, Self::message_width(self.layout_width), &self.ctx),
+			body: RichText::user(text, self.layout_width.max(1), &self.ctx),
 			chips,
 		}));
 	}
@@ -4157,9 +4181,8 @@ impl Chat {
 	}
 
 	fn resize_entry(entry: &mut Entry, width: u16, ctx: &UiContext) {
-		let message_width = Self::message_width(width);
 		match entry {
-			Entry::User(user) => user.body.resize(message_width, ctx),
+			Entry::User(user) => user.body.resize(width.max(1), ctx),
 			Entry::Assistant(assistant) => assistant.body.resize(width.max(1), ctx),
 			Entry::Thinking(thinking) => thinking.body.resize(width.max(1), ctx),
 			Entry::Peer { .. } => {},
@@ -4469,9 +4492,7 @@ fn draw_user_body(
 		}
 		at = at.saturating_add(1);
 	}
-	let x = frame.put(0, at, ctx.charset.cursor(), ink(ctx.theme.ok));
-	frame.put(x, at, " ", ink(ctx.theme.ok));
-	let used = draw_rich(frame, at, body, 3, body.width, ctx.theme);
+	let used = draw_rich(frame, at, body, 0, body.width, ctx.theme);
 	at.saturating_sub(y).saturating_add(used).saturating_add(1)
 }
 

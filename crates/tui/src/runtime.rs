@@ -1339,7 +1339,7 @@ mod tests {
 		// Unreserved, the same chord stays the input's kill-line.
 		assert_eq!(
 			route_key_event(&mut ui, Key::Ctrl('k'), &quit, &[], true),
-			Routed::Event(AppEvent::Updated)
+			Routed::Event(AppEvent::Changed { id: "composer".into(), value: "".into() })
 		);
 		assert_eq!(ui.values()["composer"], "");
 	}

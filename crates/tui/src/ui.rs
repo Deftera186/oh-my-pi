@@ -703,7 +703,7 @@ impl Ui {
 	/// component, or spent moving focus. An unclaimed key routed through
 	/// the tree untouched — pending damage from animations or unrelated
 	/// components never counts as a claim.
-	pub(crate) fn handle_key_claimed(&mut self, key: Key) -> (UiEvent, bool) {
+	pub fn handle_key_claimed(&mut self, key: Key) -> (UiEvent, bool) {
 		if let Some(index) = self.key_target() {
 			let modal = self.overlays[index].options.modal;
 			let had_focus = self.overlays[index].ui.focus.is_some();

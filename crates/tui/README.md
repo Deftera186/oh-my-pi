@@ -1129,7 +1129,10 @@ let mut ui = Ui::from_root(
 );
 
 assert_eq!(ui.values()["query"], "a");
-assert_eq!(ui.handle_key(Key::Char('b')), UiEvent::None);
+assert_eq!(ui.handle_key(Key::Char('b')), UiEvent::Changed {
+    id:    "query".into(),
+    value: "ab".into(),
+});
 assert_eq!(ui.values()["query"], "ab");
 assert!(ui.frame().size().height > 0);
 ```
