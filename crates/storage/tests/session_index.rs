@@ -24,6 +24,7 @@ use omp_storage::{
 	maintenance::MaintenanceMode,
 	transcript::{SessionId, TitleSource},
 };
+use rusqlite::Connection;
 use smallvec::smallvec;
 use tempfile::tempdir;
 
@@ -70,6 +71,48 @@ fn create_after_journal(index: &SessionIndex, id: &SessionId, after_journal: imp
 			},
 		)
 		.expect("write header and session index row");
+}
+
+fn create_kind(index: &SessionIndex, id: &SessionId, kind: SessionKind) {
+	index
+		.create_session(
+			&NewSession {
+				id,
+				cwd: "/workspace/project",
+				project: "/workspace/project",
+				created_ms: 1_000,
+				kind,
+				parent: None,
+				remote: false,
+			},
+			|| Ok::<_, io::Error>(((), 64)),
+		)
+		.expect("write header and session index row");
+}
+
+fn append_prompt(
+	index: &SessionIndex,
+	session: &SessionId,
+	event_index: u64,
+	ts_ms: u64,
+	prompt: &str,
+) {
+	index
+		.append(
+			&IndexedEvent {
+				session,
+				ts_ms,
+				kind: "prompt",
+				projection: EventProjection::Prompt { text: prompt },
+			},
+			|| {
+				Ok::<_, io::Error>(((), JournalPosition {
+					event_index,
+					byte_watermark: 128 + event_index,
+				}))
+			},
+		)
+		.expect("append prompt");
 }
 
 #[derive(Default)]
@@ -124,6 +167,171 @@ fn committed_ui_and_extension_renames_emit_once_while_create_and_resume_stay_sil
 		(session.0.clone(), Some(sf!("Extension title"))),
 		(session.0.clone(), None),
 	]);
+}
+
+#[test]
+fn prompt_history_lists_unique_prompts_newest_first() {
+	let directory = tempdir().expect("temporary index");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("index");
+	let first = session_id("first");
+	let second = session_id("second");
+	create(&index, &first);
+	create(&index, &second);
+
+	append_prompt(&index, &first, 0, 2_000, "older prompt");
+	append_prompt(&index, &first, 1, 3_000, "duplicate prompt");
+	append_prompt(&index, &second, 0, 4_000, "duplicate prompt");
+	append_prompt(&index, &second, 1, 5_000, "newest prompt");
+
+	assert_eq!(
+		index.prompt_history("", 10).expect("recent prompt history"),
+		vec![
+			index::PromptHistoryEntry {
+				prompt: Str::from("newest prompt"),
+				ts_ms:  Some(5_000),
+			},
+			index::PromptHistoryEntry {
+				prompt: Str::from("duplicate prompt"),
+				ts_ms:  Some(4_000),
+			},
+			index::PromptHistoryEntry {
+				prompt: Str::from("older prompt"),
+				ts_ms:  Some(2_000),
+			},
+		]
+	);
+}
+
+#[test]
+fn prompt_history_combines_prefix_and_token_and_substring_search() {
+	let directory = tempdir().expect("temporary index");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("index");
+	let session = session_id("search");
+	create(&index, &session);
+	append_prompt(&index, &session, 0, 2_000, "parser tests");
+	append_prompt(&index, &session, 1, 3_000, "commit changes");
+	append_prompt(&index, &session, 2, 4_000, "parser only");
+	append_prompt(&index, &session, 3, 5_000, "tests only");
+
+	assert_eq!(
+		index.prompt_history("par tes", 10).expect("prefix search"),
+		vec![index::PromptHistoryEntry {
+			prompt: Str::from("parser tests"),
+			ts_ms:  Some(2_000),
+		}]
+	);
+	assert_eq!(
+		index.prompt_history("mit", 10).expect("infix search"),
+		vec![index::PromptHistoryEntry {
+			prompt: Str::from("commit changes"),
+			ts_ms:  Some(3_000),
+		}]
+	);
+	assert!(
+		index
+			.prompt_history("parser changes", 10)
+			.expect("token-AND search")
+			.is_empty()
+	);
+}
+
+#[test]
+fn prompt_history_excludes_non_interactive_sessions() {
+	let directory = tempdir().expect("temporary index");
+	let index = SessionIndex::open(directory.path().join("sessions.sqlite3")).expect("index");
+	let interactive = session_id("interactive");
+	let subagent = session_id("subagent");
+	create_kind(&index, &interactive, SessionKind::Interactive);
+	create_kind(&index, &subagent, SessionKind::Subagent);
+	append_prompt(&index, &interactive, 0, 2_000, "visible prompt");
+	append_prompt(&index, &subagent, 0, 3_000, "hidden prompt");
+
+	assert_eq!(
+		index.prompt_history("", 10).expect("interactive history"),
+		vec![index::PromptHistoryEntry {
+			prompt: Str::from("visible prompt"),
+			ts_ms:  Some(2_000),
+		}]
+	);
+	assert!(
+		index
+			.prompt_history("hidden", 10)
+			.expect("filtered prompt search")
+			.is_empty()
+	);
+}
+
+#[test]
+fn opening_v4_index_migrates_prompt_history_without_fabricating_timestamps() {
+	let directory = tempdir().expect("temporary index");
+	let path = directory.path().join("sessions.sqlite3");
+	let connection = Connection::open(&path).expect("open v4 database");
+	connection
+		.execute_batch(
+			"CREATE TABLE index_meta (
+			    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			    schema_version INTEGER NOT NULL
+			 );
+			 INSERT INTO index_meta(singleton, schema_version) VALUES (1, 4);
+			 CREATE TABLE sessions (
+			    id TEXT PRIMARY KEY,
+			    title TEXT,
+			    title_source TEXT,
+			    cwd TEXT NOT NULL,
+			    project TEXT NOT NULL,
+			    created_ms INTEGER NOT NULL,
+			    updated_ms INTEGER NOT NULL,
+			    status TEXT NOT NULL,
+			    kind TEXT NOT NULL,
+			    parent TEXT,
+			    parent_checkpoint INTEGER,
+			    entries INTEGER NOT NULL DEFAULT 0,
+			    turns INTEGER NOT NULL DEFAULT 0,
+			    remote INTEGER NOT NULL,
+			    journal_watermark INTEGER NOT NULL,
+			    last_event_index INTEGER,
+			    repair_watermark INTEGER NOT NULL DEFAULT 0,
+			    serving_provider TEXT,
+			    serving_model TEXT,
+			    context_anchor INTEGER,
+			    context_revision INTEGER NOT NULL DEFAULT 0,
+			    compaction_epoch INTEGER NOT NULL DEFAULT 0
+			 );
+			 INSERT INTO sessions(
+			    id, cwd, project, created_ms, updated_ms, status, kind, remote, journal_watermark
+			 ) VALUES (
+			    'legacy', '/workspace/project', '/workspace/project', 1000, 2000,
+			    'complete', 'interactive', 0, 128
+			 );
+			 CREATE VIRTUAL TABLE prompts_fts USING fts5(
+			    session_id UNINDEXED,
+			    event_index UNINDEXED,
+			    prompt,
+			    tokenize = 'unicode61'
+			 );
+			 INSERT INTO prompts_fts(session_id, event_index, prompt)
+			 VALUES ('legacy', 0, 'preserved prompt');",
+		)
+		.expect("create v4 schema");
+	drop(connection);
+
+	let index = SessionIndex::open(&path).expect("migrate v4 index");
+	let migrated = Connection::open(&path).expect("inspect migrated database");
+	let schema_version = migrated
+		.query_row(
+			"SELECT schema_version FROM index_meta WHERE singleton = 1",
+			[],
+			|row| row.get::<_, i64>(0),
+		)
+		.expect("read migrated schema version");
+	assert_eq!(schema_version, 5);
+	assert_eq!(
+		index.prompt_history("", 10).expect("migrated prompt history"),
+		vec![index::PromptHistoryEntry {
+			prompt: Str::from("preserved prompt"),
+			ts_ms:  None,
+		}]
+	);
 }
 
 fn outcome(input: u64, output: u64) -> pb::Outcome {

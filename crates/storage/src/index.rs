@@ -32,14 +32,14 @@ use thiserror::Error;
 
 use crate::transcript::{SessionId, TitleSource};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS index_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 4);
+INSERT OR IGNORE INTO index_meta(singleton, schema_version) VALUES (1, 5);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -132,6 +132,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
     session_id UNINDEXED,
     event_index UNINDEXED,
     prompt,
+    ts_ms UNINDEXED,
     tokenize = 'unicode61'
 );
 
@@ -612,6 +613,15 @@ pub struct PromptHit {
 	pub event_index: u64,
 	/// Exact indexed prompt text.
 	pub prompt:      Str,
+}
+
+/// One unique prompt from the owner-local history projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptHistoryEntry {
+	/// Exact prompt text of the most recent submission.
+	pub prompt: Str,
+	/// Epoch-millisecond submission time of the most recent occurrence, when recorded.
+	pub ts_ms: Option<u64>,
 }
 
 /// Monotonic context position projected from durable boundaries.
@@ -1220,6 +1230,127 @@ impl SessionIndex {
 		Ok(hits)
 	}
 
+	/// Returns unique, newest-first prompts from interactive sessions only.
+	///
+	/// Non-empty queries combine token-prefix FTS5 matching with token-AND
+	/// substring fallback. Empty, whitespace-only, and punctuation-only queries
+	/// return the most recent prompts.
+	pub fn prompt_history(
+		&self,
+		query: &str,
+		limit: u32,
+	) -> Result<Vec<PromptHistoryEntry>, Error> {
+		let limit = limit.min(1_000);
+		if limit == 0 {
+			return Ok(Vec::new());
+		}
+		let connection = self.connection.lock();
+		let lower_query = query.to_lowercase();
+		let tokens = lower_query
+			.split(|character: char| !character.is_alphanumeric())
+			.filter(|token| !token.is_empty())
+			.collect::<Vec<_>>();
+
+		if tokens.is_empty() {
+			let mut statement = connection.prepare(
+				"SELECT prompt, ts_ms, MAX(prompts_fts.rowid)
+				 FROM prompts_fts
+				 JOIN sessions
+				   ON sessions.id = prompts_fts.session_id
+				  AND sessions.kind = 'interactive'
+				 GROUP BY prompt
+				 ORDER BY MAX(prompts_fts.rowid) DESC
+				 LIMIT ?1",
+			)?;
+			// With exactly one MAX aggregate, SQLite takes bare columns from the
+			// row containing that maximum, so `ts_ms` belongs to the newest prompt.
+			let rows = statement.query_map([i64::from(limit)], |row| {
+				Ok(PromptHistoryEntry {
+					prompt: Str::new(row.get::<_, String>(0)?),
+					ts_ms:  row.get(1)?,
+				})
+			})?;
+			return rows.collect::<Result<Vec<_>, _>>().map_err(Error::from);
+		}
+
+		let mut match_expression =
+			String::with_capacity(lower_query.len().saturating_add(tokens.len().saturating_mul(4)));
+		for token in &tokens {
+			if !match_expression.is_empty() {
+				match_expression.push(' ');
+			}
+			match_expression.push('"');
+			for character in token.chars() {
+				if character == '"' {
+					match_expression.push('"');
+				}
+				match_expression.push(character);
+			}
+			match_expression.push_str("\"*");
+		}
+		let mut merged = BTreeMap::<Str, (Option<u64>, i64)>::new();
+
+		let fts_rows = (|| -> rusqlite::Result<Vec<(Str, Option<u64>, i64)>> {
+			let mut statement = connection.prepare(
+				"SELECT prompt, ts_ms, MAX(prompts_fts.rowid)
+				 FROM prompts_fts
+				 JOIN sessions
+				   ON sessions.id = prompts_fts.session_id
+				  AND sessions.kind = 'interactive'
+				 WHERE prompts_fts MATCH ?1
+				 GROUP BY prompt
+				 ORDER BY MAX(prompts_fts.rowid) DESC
+				 LIMIT ?2",
+			)?;
+			let rows = statement.query_map(params![match_expression, i64::from(limit)], |row| {
+				Ok((Str::new(row.get::<_, String>(0)?), row.get(1)?, row.get(2)?))
+			})?;
+			rows.collect()
+		})();
+		// A malformed FTS expression must not prevent the deterministic fallback.
+		if let Ok(rows) = fts_rows {
+			for (prompt, ts_ms, rowid) in rows {
+				merged.insert(prompt, (ts_ms, rowid));
+			}
+		}
+
+		let mut substring_sql = String::from(
+			"SELECT prompt, ts_ms, MAX(prompts_fts.rowid)
+			 FROM prompts_fts
+			 JOIN sessions
+			   ON sessions.id = prompts_fts.session_id
+			  AND sessions.kind = 'interactive'
+			 WHERE 1 = 1",
+		);
+		let mut values = Vec::with_capacity(tokens.len().saturating_add(1));
+		for token in &tokens {
+			substring_sql.push_str(" AND instr(lower(prompt), ?) > 0");
+			values.push(Value::Text((*token).to_owned()));
+		}
+		substring_sql.push_str(
+			" GROUP BY prompt
+			  ORDER BY MAX(prompts_fts.rowid) DESC
+			  LIMIT ?",
+		);
+		values.push(Value::Integer(i64::from(limit)));
+		let mut statement = connection.prepare(&substring_sql)?;
+		let rows = statement.query_map(params_from_iter(values), |row| {
+			Ok((Str::new(row.get::<_, String>(0)?), row.get(1)?, row.get(2)?))
+		})?;
+		for row in rows {
+			let (prompt, ts_ms, rowid) = row?;
+			merged.entry(prompt).or_insert((ts_ms, rowid));
+		}
+
+		let mut history = merged
+			.into_iter()
+			.map(|(prompt, (ts_ms, rowid))| (PromptHistoryEntry { prompt, ts_ms }, rowid))
+			.collect::<Vec<_>>();
+		history.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+		history.truncate(usize::try_from(limit).expect("u32 fits in usize"));
+		Ok(history.into_iter().map(|(entry, _)| entry).collect())
+	}
+
 	/// Loads the latest monotonic context position for one session.
 	pub fn context_position(&self, session: &SessionId) -> Result<Option<ContextPosition>, Error> {
 		let connection = self.connection.lock();
@@ -1421,6 +1552,23 @@ fn migrate_schema(connection: &Connection) -> Result<(), Error> {
 			"ALTER TABLE sessions ADD COLUMN parent_checkpoint INTEGER;
 			 UPDATE index_meta SET schema_version = 4 WHERE singleton = 1;",
 		)?;
+		version = 4;
+	}
+	if version == 4 {
+		connection.execute_batch(
+			"CREATE VIRTUAL TABLE prompts_fts_v5 USING fts5(
+			    session_id UNINDEXED,
+			    event_index UNINDEXED,
+			    prompt,
+			    ts_ms UNINDEXED,
+			    tokenize = 'unicode61'
+			 );
+			 INSERT INTO prompts_fts_v5(session_id, event_index, prompt, ts_ms)
+			 SELECT session_id, event_index, prompt, NULL FROM prompts_fts;
+			 DROP TABLE prompts_fts;
+			 ALTER TABLE prompts_fts_v5 RENAME TO prompts_fts;
+			 UPDATE index_meta SET schema_version = 5 WHERE singleton = 1;",
+		)?;
 	}
 	Ok(())
 }
@@ -1524,8 +1672,13 @@ fn index_event_inner(
 		},
 		EventProjection::Prompt { text } => {
 			transaction.execute(
-				"INSERT INTO prompts_fts(session_id, event_index, prompt) VALUES (?1, ?2, ?3)",
-				params![event.session.0.as_str(), sql_u64(position.event_index, "event_index")?, text,],
+				"INSERT INTO prompts_fts(session_id, event_index, prompt, ts_ms) VALUES (?1, ?2, ?3, ?4)",
+				params![
+					event.session.0.as_str(),
+					sql_u64(position.event_index, "event_index")?,
+					text,
+					sql_u64(event.ts_ms, "ts_ms")?,
+				],
 			)?;
 		},
 		EventProjection::Context { anchor, revision, epoch } => {
@@ -1539,11 +1692,12 @@ fn index_event_inner(
 			insert_item_outcome(transaction, event, position, item)?;
 			if let Some(prompt) = prompt {
 				transaction.execute(
-					"INSERT INTO prompts_fts(session_id, event_index, prompt) VALUES (?1, ?2, ?3)",
+					"INSERT INTO prompts_fts(session_id, event_index, prompt, ts_ms) VALUES (?1, ?2, ?3, ?4)",
 					params![
 						event.session.0.as_str(),
 						sql_u64(position.event_index, "event_index")?,
 						prompt,
+						sql_u64(event.ts_ms, "ts_ms")?,
 					],
 				)?;
 			}

@@ -352,8 +352,8 @@ fn relocate_attached(
 		[session.as_str()],
 	)?;
 	transaction.execute(
-		"INSERT INTO relocation_destination.prompts_fts(session_id, event_index, prompt)
-		 SELECT session_id, event_index, prompt FROM main.prompts_fts WHERE session_id = ?1",
+		"INSERT INTO relocation_destination.prompts_fts(session_id, event_index, prompt, ts_ms)
+		 SELECT session_id, event_index, prompt, ts_ms FROM main.prompts_fts WHERE session_id = ?1",
 		[session.as_str()],
 	)?;
 	transaction.execute("DELETE FROM main.prompts_fts WHERE session_id = ?1", [session.as_str()])?;
