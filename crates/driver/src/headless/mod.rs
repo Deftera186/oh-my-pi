@@ -24,7 +24,6 @@ use omp_envd::exthost::{
 		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlDispatch,
 		ControlInvocationAuthority,
 	},
-	dispatch::CallbackDispatcher,
 };
 use omp_inference::Registry as InferenceRegistry;
 use omp_proto::thread::v1::Item;
@@ -676,6 +675,27 @@ impl HeadlessSession {
 			.cloned()
 			.collect::<Vec<_>>();
 		validate_extension_host_keys(extension_specs.iter().map(|extension| &extension.key))?;
+		let has_runtime_providers = extension_specs.iter().any(|extension| {
+			!extension
+				.manifest
+				.static_declarations()
+				.providers
+				.is_empty()
+		});
+		let preselected_model = if has_runtime_providers {
+			None
+		} else {
+			let model = chat::resolve_model_selector(base_catalog, options.model.as_str())
+				.map_err(composition)?;
+			if !crate::discovery::roles::model_selector_allowed(
+				base_catalog,
+				&model_settings,
+				model.as_str(),
+			) {
+				return Err(HeadlessError::MissingRoute(model));
+			}
+			Some(model)
+		};
 		let prompt_head =
 			Arc::new(crate::prompt_head::ProductionPromptHead::from_extension_specs(&extension_specs));
 		let mut bridges = builtin_with_content(
@@ -701,22 +721,36 @@ impl HeadlessSession {
 		.await
 		.map_err(composition)?;
 		let evidences = environment.extension_registry_evidences();
-		let catalog_owner = Arc::new(
-			crate::model_controls::compose_runtime_provider_catalog(
-				base_catalog,
-				evidences
-					.iter()
-					.flat_map(|evidence| evidence.providers.iter()),
+		let catalog_owner = if has_runtime_providers {
+			Arc::new(
+				crate::model_controls::compose_runtime_provider_catalog(
+					base_catalog,
+					evidences
+						.iter()
+						.flat_map(|evidence| evidence.providers.iter()),
+				)
+				.map_err(composition)?,
 			)
-			.map_err(composition)?,
-		);
+		} else {
+			base_catalog_owner
+		};
 		let catalog = catalog_owner.as_ref();
-		let model =
-			chat::resolve_model_selector(catalog, options.model.as_str()).map_err(composition)?;
-		if !crate::discovery::roles::model_selector_allowed(catalog, &model_settings, model.as_str())
-		{
-			return Err(HeadlessError::MissingRoute(model));
-		}
+		let model = match preselected_model {
+			Some(model) => model,
+			None => {
+				let model = chat::resolve_model_selector(catalog, options.model.as_str())
+					.map_err(composition)?;
+				if !crate::discovery::roles::model_selector_allowed(
+					catalog,
+					&model_settings,
+					model.as_str(),
+				) {
+					return Err(HeadlessError::MissingRoute(model));
+				}
+				model
+			},
+		};
+		let catalog_override = has_runtime_providers.then(|| Arc::clone(&catalog_owner));
 		let credential_provider = match (&options.credential_provider, options.api_key.as_ref()) {
 			(Some(provider), _) => Some(provider.clone()),
 			(None, Some(_)) => {
@@ -956,7 +990,7 @@ impl HeadlessSession {
 				prompt_cache_affinity:   options.prompt_cache_affinity,
 				usage_fetchers:          Some(environment.usage_fetchers()),
 				provider_response_hooks: Some(environment.provider_response_hooks()),
-				catalog:                 Some(Arc::clone(&catalog_owner)),
+				catalog:                 catalog_override,
 				settings:                Some(Arc::clone(&settings_snapshot)),
 			},
 		)
@@ -1050,6 +1084,9 @@ impl HeadlessSession {
 			agent.set_secret_obfuscator(secrets.transform_handle());
 		}
 		agent.set_hook_gate(environment.admission_gate());
+		if settings.tools.enabled("todo") {
+			agent.add_stateful_component(Arc::new(omp_agent::TodoRestore));
+		}
 		if let Err(error) = agent.restore_session_state().await {
 			tracing::warn!(%error, "journal-derived session state was not restored");
 		}
@@ -1141,6 +1178,14 @@ impl HeadlessSession {
 			agent.abort_handle(),
 			agent.events().clone(),
 		);
+		let session_handle = blueprint
+			.launch(
+				SessionIdentity { id: session.id.clone(), journal_path, expected_revision: None },
+				SessionRuntime::from_agent(agent),
+				None,
+				None,
+			)
+			.map_err(composition)?;
 		let regime_factory = chat::extension_regime_control_factory(
 			control.clone(),
 			environment.extension_regime_resolver(),
@@ -1170,14 +1215,6 @@ impl HeadlessSession {
 			.map_err(composition)?;
 		let eval_parent_control = environment
 			.bind_eval_sdk_parent(advisor_parent.session_id(), advisor_parent.clone())
-			.map_err(composition)?;
-		let session_handle = blueprint
-			.launch(
-				SessionIdentity { id: session.id.clone(), journal_path, expected_revision: None },
-				SessionRuntime::from_agent(agent),
-				None,
-				None,
-			)
 			.map_err(composition)?;
 		let events = session_handle.subscribe_lossless();
 		let (lifecycle, lifecycle_events) = HeadlessLifecycleSink::new(options.session_generation);

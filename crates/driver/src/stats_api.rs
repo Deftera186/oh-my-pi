@@ -397,6 +397,7 @@ pub mod telemetry_backend {
 	fn parse_scope(scope: &str) -> Result<&'static str, TelemetryAuthorityError> {
 		match scope {
 			"session" => Ok("session"),
+			"self" | "tree" => Ok("session"),
 			"project" => Ok("project"),
 			_ => Err(invalid("scope must be session or project")),
 		}

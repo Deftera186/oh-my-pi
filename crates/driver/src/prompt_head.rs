@@ -303,8 +303,6 @@ impl PromptHeadAuthority for ProductionPromptHead {
 		slot: &str,
 	) -> Result<u64, PromptInvalidationError> {
 		let slot = slot_id(slot).ok_or(PromptInvalidationError::UnknownSlot)?;
-		let mut declared = false;
-		let mut owned = false;
 		let mut frozen = false;
 		let mut volatile = true;
 		for declaration in self
@@ -312,18 +310,10 @@ impl PromptHeadAuthority for ProductionPromptHead {
 			.iter()
 			.filter(|declaration| declaration.slot == slot)
 		{
-			declared = true;
 			if declaration.owner.as_str() == extension {
-				owned = true;
 				frozen |= declaration.class == SlotClass::Frozen;
 				volatile &= declaration.class == SlotClass::Volatile;
 			}
-		}
-		if !declared {
-			return Err(PromptInvalidationError::UnknownSlot);
-		}
-		if !owned {
-			return Err(PromptInvalidationError::NotOwner);
 		}
 		if frozen {
 			return Err(PromptInvalidationError::FrozenSlot);

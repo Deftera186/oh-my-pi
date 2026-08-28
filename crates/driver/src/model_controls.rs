@@ -2690,7 +2690,16 @@ impl ControlAuthorityFactory for ProviderControlAuthorityFactory {
 
 impl ProviderControlAuthority {
 	fn validate(&self, context: &ControlRequestContext) -> Result<(), ControlProtocolError> {
-		if Arc::ptr_eq(&context.connection, &self.identity) {
+		if context.connection.extension == self.identity.extension
+			&& context.connection.principal == self.identity.principal
+			&& context.connection.artifact_digest == self.identity.artifact_digest
+			&& context.connection.layer == self.identity.layer
+			&& context.connection.tier == self.identity.tier
+			&& context.connection.trust == self.identity.trust
+			&& context.connection.host_generation == self.identity.host_generation
+			&& context.connection.session_generation == self.identity.session_generation
+			&& context.connection.capabilities == self.identity.capabilities
+		{
 			Ok(())
 		} else {
 			Err(ControlProtocolError::new(
