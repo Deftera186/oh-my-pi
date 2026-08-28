@@ -206,8 +206,8 @@ fn bind_extension_telemetry(
 ) -> Vec<tokio::task::JoinHandle<()>> {
 	let dispatcher = environment.extension_callback_dispatcher();
 	let mut tasks = Vec::new();
-	for evidence in environment.extension_registry_evidences() {
-		let Some(manifest) = environment.extension_control_manifest(&evidence.identity) else {
+	for evidence in environment.extension_control_identities() {
+		let Some(manifest) = environment.extension_control_manifest(&evidence) else {
 			continue;
 		};
 		for declaration in &manifest.static_declarations().telemetry.subscriptions {
@@ -221,7 +221,7 @@ fn bind_extension_telemetry(
 				continue;
 			};
 			let dispatcher = Arc::clone(&dispatcher);
-			let identity = Arc::clone(&evidence.identity);
+			let identity = Arc::clone(&evidence);
 			let qualified_name = sf!("{}.{}", declaration.module, declaration.id);
 			let session = session.clone();
 			tasks.push(tokio::spawn(async move {

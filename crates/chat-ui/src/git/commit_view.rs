@@ -25,7 +25,7 @@ pub(super) fn component(
 	let body = head.body.lines().take(8).map(Str::new).collect::<Vec<_>>();
 	let author = head.author_name.clone();
 	let email = head.author_email.clone();
-	let when = relative_date(head.author_date.as_str());
+	let authored_ms = authored_age_ms(head.author_date.as_str());
 	let parents = head
 		.parents
 		.iter()
@@ -71,7 +71,11 @@ pub(super) fn component(
 				for line in identicon { <pre fg={identicon_color}>{line}</pre> }
 			}
 			<row w={width} gap=1><text bold truncate>{author}</text><text dim truncate>{sf!("<{email}>")}</text></row>
-			<text dim truncate>{when}</text>
+			if let Some(age) = authored_ms {
+				<row w={width} gap=1><text dim>{"authored"}</text><time kind="relative" ms={age} dim/></row>
+			} else {
+				<text dim truncate>{sf!("authored {}", head.author_date)}</text>
+			}
 			if !parents.is_empty() {
 				<row w={width} gap=1><text dim>{"parent:"}</text><text fg=accent truncate>{parents}</text></row>
 			}
@@ -93,30 +97,11 @@ pub(super) fn component(
 	}
 }
 
-fn relative_date(value: &str) -> Str {
-	let Ok(then) = value.parse::<Timestamp>() else {
-		return sf!("authored {value}");
-	};
-	let seconds = Timestamp::now().duration_since(then).as_secs();
-	let magnitude = seconds.unsigned_abs();
-	let (count, unit) = if magnitude >= 31_536_000 {
-		(magnitude / 31_536_000, "y")
-	} else if magnitude >= 2_592_000 {
-		(magnitude / 2_592_000, "mo")
-	} else if magnitude >= 86_400 {
-		(magnitude / 86_400, "d")
-	} else if magnitude >= 3_600 {
-		(magnitude / 3_600, "h")
-	} else if magnitude >= 60 {
-		(magnitude / 60, "m")
-	} else {
-		(magnitude, "s")
-	};
-	if seconds >= 0 {
-		sf!("authored {count}{unit} ago")
-	} else {
-		sf!("authored in {count}{unit}")
-	}
+/// Milliseconds elapsed since the authored timestamp, clamped to zero for
+/// future (clock-skewed) dates; `None` when the date string does not parse.
+fn authored_age_ms(value: &str) -> Option<u64> {
+	let then = value.parse::<Timestamp>().ok()?;
+	Some(u64::try_from(Timestamp::now().duration_since(then).as_millis()).unwrap_or(0))
 }
 
 /// Builds deterministic mirrored 5×5 identicon rows for an email address.

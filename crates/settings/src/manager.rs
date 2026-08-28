@@ -250,13 +250,13 @@ impl SettingsManager {
 			.map(|id| SettingsEditorPanel { id, fields: Vec::new() })
 			.collect::<Vec<_>>();
 		for domain in registered_domains() {
-			let target = panels
-				.iter_mut()
-				.find(|panel| panel.id == panel_for_domain(domain.name))
-				.expect("domain panel exists");
 			let mut fields = domain.fields.to_vec();
 			fields.sort_unstable_by_key(|field| (field.order, field.path));
 			for descriptor in fields {
+				let target = panels
+					.iter_mut()
+					.find(|panel| panel.id == panel_for_field(domain.name, descriptor.path))
+					.expect("field panel exists");
 				let raw = value_at(snapshot.document(), descriptor.path).cloned();
 				let value = if descriptor.secret {
 					raw.as_ref()
@@ -478,16 +478,37 @@ pub const EDITOR_PANELS: &[&str] = &[
 /// Maps a registered settings domain to its stable editor panel id.
 pub fn panel_for_domain(domain: &str) -> &'static str {
 	match domain {
-		"tui" | "chat_ui" | "appearance" => "appearance",
-		"model" | "catalog" | "inference" => "model",
-		"interaction" | "voice" | "collaboration" => "interaction",
-		"agent" | "memory" | "compaction" => "context",
-		"files" | "shell" | "sandbox" | "lsp" | "eval" => "files_shell",
-		"tools" | "tasks" | "approvals" | "browser" => "tools_tasks",
-		"orchestration" | "subagent" => "orchestration",
-		"providers" | "search" => "providers",
+		"tui" | "chat_ui" | "appearance" | "display" | "root-display" => "appearance",
+		"model" | "catalog" | "inference" | "sampling" | "retry" | "prompt" => "model",
+		"interaction" | "voice" | "collaboration" | "completion" | "error" | "title" | "recap" => {
+			"interaction"
+		},
+		"agent" | "memory" | "compaction" | "rules" | "skills" | "discovery" | "foreign" => "context",
+		"files" | "shell" | "sandbox" | "lsp" | "eval" | "read" => "files_shell",
+		"tools" | "tasks" | "approvals" | "browser" | "fetch" | "images" => "tools_tasks",
+		"orchestration" | "subagent" | "task" | "irc" | "acp" | "async" | "ttsr" => "orchestration",
+		"providers" | "search" | "web_search" | "provider_runtime" => "providers",
 		"extensions" | "mcp" => "extensions",
 		_ => "lifecycle",
+	}
+}
+
+/// Maps one reflected field to its stable editor panel id. The aggregate
+/// `app-core` domain spans every concern, so its fields route by their root
+/// table instead of the owning domain.
+pub fn panel_for_field(domain: &str, path: &str) -> &'static str {
+	if domain != "app-core" {
+		return panel_for_domain(domain);
+	}
+	match path.split('.').next().unwrap_or(path) {
+		"compaction" | "context_promotion" | "memory" | "mnemopi" | "autolearn" => "context",
+		"auto_thinking" | "images" => "model",
+		"worktree" => "files_shell",
+		"tools" | "security" => "tools_tasks",
+		"extensions" => "extensions",
+		"secrets" => "providers",
+		"export" | "lifecycle" => "lifecycle",
+		_ => "interaction",
 	}
 }
 
