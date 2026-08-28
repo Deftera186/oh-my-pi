@@ -1316,6 +1316,10 @@ impl ProjectEnvironment {
 	pub fn extension_registry_evidences(&self) -> Vec<Arc<worker::SealedRegistryEvidence>> {
 		self.lifecycle.server.extension_registry_evidences()
 	}
+	/// Returns every authenticated extension CONTROL identity.
+	pub fn extension_control_identities(&self) -> Vec<Arc<ControlConnectionIdentity>> {
+		self.lifecycle.server.extension_control_identities()
+	}
 
 	/// Returns the eager prompt-contribution provider over live worker actors.
 	pub fn extension_prompt_provider(&self) -> Arc<dyn exthost::PromptContributionProvider> {

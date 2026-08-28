@@ -662,11 +662,10 @@ impl ShellRun for HostShellRun {
 				.map_or_else(Str::default, |source| Str::from(source.text.as_str()));
 			let host = self.host.clone();
 			self.pending_denial = Some(event);
-			*self.approval.get_mut() = Some(Box::pin(async move {
-				host
-					.approve_sandbox_bypass(&command, &denied_path)
-					.await
-			}));
+			*self.approval.get_mut() =
+				Some(Box::pin(
+					async move { host.approve_sandbox_bypass(&command, &denied_path).await },
+				));
 		}
 	}
 
@@ -1118,10 +1117,7 @@ mod tests {
 			Str::from(root_uri),
 			Arc::new(ResolverTable::default()),
 			ShellSettings::default(),
-			SandboxSettings {
-				mode: ExecSandboxMode::WorkspaceWrite,
-				..SandboxSettings::default()
-			},
+			SandboxSettings { mode: ExecSandboxMode::WorkspaceWrite, ..SandboxSettings::default() },
 			AcpExecSlot::default(),
 			false,
 		);

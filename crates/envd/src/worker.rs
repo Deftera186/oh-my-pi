@@ -1523,7 +1523,12 @@ impl ExtHostSupervisor {
 				.await
 				.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
 			if (extension.manifest.runtime_declarations_trusted()
-				|| extension.manifest.declarations.hooks().next().is_some())
+				|| extension.manifest.declarations.hooks().next().is_some()
+				|| !extension
+					.manifest
+					.static_declarations()
+					.providers
+					.is_empty())
 				&& let Some(hooks) = &hook_control
 			{
 				let registry = registry_control.as_ref().ok_or_else(|| {
@@ -1591,9 +1596,13 @@ impl ExtHostSupervisor {
 				roots: config
 					.workspace_root
 					.iter()
-					.map(|root| Str::from(Url::from_file_path(root)
-						.expect("workspace root is an absolute filesystem path")
-						.as_str()))
+					.map(|root| {
+						Str::from(
+							Url::from_file_path(root)
+								.expect("workspace root is an absolute filesystem path")
+								.as_str(),
+						)
+					})
 					.collect(),
 			};
 			let live_control = Arc::new(LiveControlRoute {
@@ -2062,6 +2071,15 @@ impl ExtHostSupervisor {
 	/// roster publication.
 	pub fn sealed_registry_evidences(&self) -> Vec<Arc<SealedRegistryEvidence>> {
 		self.frozen_registry.lock().values().cloned().collect()
+	}
+	/// Returns every authenticated CONTROL identity, including hosts whose
+	/// declaration freeze has not yet published registry evidence.
+	pub fn control_identities(&self) -> Vec<Arc<ControlConnectionIdentity>> {
+		self
+			.control_activations
+			.iter()
+			.map(|activation| Arc::clone(&activation.identity))
+			.collect()
 	}
 
 	/// Dispatches one device or hook callback to the exact retained child
@@ -4612,7 +4630,7 @@ fn seal_frozen_control_evidence(
 		.static_declarations()
 		.providers
 		.iter()
-		.map(|declaration| declaration.id.as_str())
+		.map(|row| row.key.as_str())
 		.collect::<BTreeSet<_>>();
 	if runtime_regime_ids != declared_regime_ids || runtime_provider_ids != declared_provider_ids {
 		return Err(frozen_declaration_error(
@@ -4731,7 +4749,7 @@ pub fn seal_registry_evidence(
 		.static_declarations()
 		.providers
 		.iter()
-		.map(|row| row.id.as_str())
+		.map(|row| row.key.as_str())
 		.collect::<BTreeSet<_>>();
 	let declared_regime_ids = manifest
 		.static_declarations()

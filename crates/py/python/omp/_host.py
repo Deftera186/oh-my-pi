@@ -342,7 +342,26 @@ class Host:
     def current_session(self) -> Any:
         """Return the immutable Core-issued current-session snapshot."""
         if self._current_session_snapshot is None:
-            raise HostDisconnected("CONTROL current-session snapshot is not installed")
+            scope = _scope.current()
+            cwd = scope.roots[0] if scope.roots else "file:///"
+            return {
+                "id": scope.session,
+                "title": None,
+                "title_source": "system",
+                "cwd": cwd,
+                "project": cwd,
+                "created_ms": 0,
+                "updated_ms": 0,
+                "status": "pending",
+                "kind": "interactive",
+                "parent": None,
+                "entries": 0,
+                "turns": 0,
+                "usage": {},
+                "cost": {"nanos_usd": 0, "estimated": True},
+                "models": (),
+                "remote": scope.remote,
+            }
         return self._current_session_snapshot
 
     def tier_of(self, target: Mapping[str, str]) -> str | None:

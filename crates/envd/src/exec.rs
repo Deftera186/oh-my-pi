@@ -77,6 +77,7 @@ const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
 const RUN_ENVIRONMENT_PROP: &str = "omp/run-environment";
 const SANDBOX_DENIED_PATH_PROP: &str = "omp/sandbox-denied-path";
 const SANDBOX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const WRITE_DENIED_DIAGNOSTIC: &[u8] = b"sandbox denied write to ";
 
 /// Content identity of the process environment inherited by new shell sessions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -289,20 +290,20 @@ pub struct ExecHost {
 }
 
 struct HostInner {
-	next_id:       AtomicU64,
-	next_revision: AtomicU64,
-	sessions:      Mutex<HashMap<Bytes, SessionHandle>>,
-	runs:          Mutex<HashMap<Bytes, Weak<RunControl>>>,
-	final_cwds:    Mutex<HashMap<Bytes, ExecFinalCwd>>,
-	processes:     Mutex<HashMap<Str, Arc<NamedProcess>>>,
-	starting:      Mutex<HashSet<Str>>,
-	environment:   Mutex<WorkspaceEnvironment>,
-	github_cache:  Mutex<Option<Arc<GithubCache>>>,
-	devices:       Mutex<Option<Arc<crate::devices_host::DynHost>>>,
-	persistence:   Mutex<Option<ProcessPersistence>>,
-	next_order:               AtomicU64,
-	sandbox:                  Mutex<Option<SandboxConfig>>,
-	sandbox_approval_route:   Mutex<Option<ApprovalRoute>>,
+	next_id:                AtomicU64,
+	next_revision:          AtomicU64,
+	sessions:               Mutex<HashMap<Bytes, SessionHandle>>,
+	runs:                   Mutex<HashMap<Bytes, Weak<RunControl>>>,
+	final_cwds:             Mutex<HashMap<Bytes, ExecFinalCwd>>,
+	processes:              Mutex<HashMap<Str, Arc<NamedProcess>>>,
+	starting:               Mutex<HashSet<Str>>,
+	environment:            Mutex<WorkspaceEnvironment>,
+	github_cache:           Mutex<Option<Arc<GithubCache>>>,
+	devices:                Mutex<Option<Arc<crate::devices_host::DynHost>>>,
+	persistence:            Mutex<Option<ProcessPersistence>>,
+	next_order:             AtomicU64,
+	sandbox:                Mutex<Option<SandboxConfig>>,
+	sandbox_approval_route: Mutex<Option<ApprovalRoute>>,
 }
 
 struct SandboxConfig {
@@ -505,17 +506,17 @@ impl ExecHost {
 	pub fn new() -> Self {
 		Self {
 			inner: Arc::new(HostInner {
-				next_id:       AtomicU64::new(1),
-				next_revision: AtomicU64::new(1),
-				sessions:      Mutex::new(HashMap::new()),
-				runs:          Mutex::new(HashMap::new()),
-				final_cwds:    Mutex::new(HashMap::new()),
-				processes:     Mutex::new(HashMap::new()),
-				starting:      Mutex::new(HashSet::new()),
-				environment:   Mutex::new(read_workspace_environment()),
-				github_cache:  Mutex::new(None),
-				devices:       Mutex::new(None),
-				persistence:   Mutex::new(None),
+				next_id:                AtomicU64::new(1),
+				next_revision:          AtomicU64::new(1),
+				sessions:               Mutex::new(HashMap::new()),
+				runs:                   Mutex::new(HashMap::new()),
+				final_cwds:             Mutex::new(HashMap::new()),
+				processes:              Mutex::new(HashMap::new()),
+				starting:               Mutex::new(HashSet::new()),
+				environment:            Mutex::new(read_workspace_environment()),
+				github_cache:           Mutex::new(None),
+				devices:                Mutex::new(None),
+				persistence:            Mutex::new(None),
 				next_order:             AtomicU64::new(1),
 				sandbox:                Mutex::new(None),
 				sandbox_approval_route: Mutex::new(None),
@@ -2344,20 +2345,16 @@ enum RunTerminal {
 	Failed,
 	Timeout,
 	Cancelled,
-	Denied {
-		exit_code: Option<i32>,
-		path:      Str,
-	},
+	Denied { exit_code: Option<i32>, path: Str },
 }
 
 impl RunTerminal {
 	fn status(self, elapsed: Duration) -> ExecStatusMsg {
 		let props = match &self {
 			Self::Denied { path, .. } => Some(WireValueMap {
-				fields: BTreeMap::from([(
-					SANDBOX_DENIED_PATH_PROP.to_owned(),
-					WireValue { kind: Some(wire_value::Kind::String(path.to_string())) },
-				)]),
+				fields: BTreeMap::from([(SANDBOX_DENIED_PATH_PROP.to_owned(), WireValue {
+					kind: Some(wire_value::Kind::String(path.to_string())),
+				})]),
 			}),
 			_ => None,
 		};
@@ -2403,6 +2400,20 @@ fn classify_sandbox_denial(
 			path:      Str::from(denied.path.to_string_lossy().as_ref()),
 		});
 	}
+	let command_failed = match result {
+		RunTerminal::Failed => true,
+		RunTerminal::Exited(code) => *code != 0,
+		_ => false,
+	};
+	if command_failed && let Some(path) = shell_write_denied_path(stderr) {
+		return Some(SandboxDenial {
+			exit_code: match result {
+				RunTerminal::Exited(code) => Some(*code),
+				_ => None,
+			},
+			path,
+		});
+	}
 	let RunTerminal::Exited(exit_code) = result else {
 		return None;
 	};
@@ -2414,6 +2425,20 @@ fn classify_sandbox_denial(
 		exit_code: Some(*exit_code),
 		path:      sandbox_denied_path(stderr, marker),
 	})
+}
+
+fn shell_write_denied_path(stderr: &[u8]) -> Option<Str> {
+	let marker = stderr
+		.windows(WRITE_DENIED_DIAGNOSTIC.len())
+		.position(|window| window == WRITE_DENIED_DIAGNOSTIC)?;
+	let path_start = marker + WRITE_DENIED_DIAGNOSTIC.len();
+	let path_end = stderr[path_start..]
+		.iter()
+		.position(|byte| *byte == b'\n' || *byte == b'\r')
+		.map_or(stderr.len(), |position| path_start + position);
+	let path = String::from_utf8_lossy(&stderr[path_start..path_end]);
+	let path = path.trim();
+	(!path.is_empty()).then(|| Str::from(path))
 }
 
 fn sandbox_denial_marker(stderr: &[u8]) -> Option<usize> {
@@ -2452,7 +2477,9 @@ fn sandbox_denied_path(stderr: &[u8], marker: usize) -> Str {
 	let line = String::from_utf8_lossy(&stderr[line_start..line_end]);
 	let prefix = String::from_utf8_lossy(&stderr[line_start..marker]);
 	let prefix = prefix.trim().trim_end_matches(':').trim();
-	let candidate = prefix.rsplit_once(':').map_or(prefix, |(_, path)| path.trim());
+	let candidate = prefix
+		.rsplit_once(':')
+		.map_or(prefix, |(_, path)| path.trim());
 	if candidate.starts_with('/') || candidate.starts_with("./") || candidate.starts_with("../") {
 		Str::from(candidate)
 	} else {
@@ -2559,11 +2586,14 @@ impl OutputSequencer {
 		let Some(diagnostic) = self.sandbox_diagnostic.as_mut() else {
 			return;
 		};
-		if sandbox_denial_marker(diagnostic).is_some() {
+		if shell_write_denied_path(diagnostic).is_some()
+			|| sandbox_denial_marker(diagnostic).is_some()
+		{
 			return;
 		}
 		diagnostic.extend_from_slice(data);
-		if sandbox_denial_marker(diagnostic).is_none()
+		if shell_write_denied_path(diagnostic).is_none()
+			&& sandbox_denial_marker(diagnostic).is_none()
 			&& diagnostic.len() > SANDBOX_DIAGNOSTIC_BYTES
 		{
 			let discard = diagnostic.len() - SANDBOX_DIAGNOSTIC_BYTES;
@@ -3557,15 +3587,20 @@ mod tests {
 		let denied_path = PathBuf::from("/private/blocked");
 		let write_error: omp_shell_engine::Error =
 			omp_shell_engine::WriteDenied { path: denied_path.clone() }.into();
-		let denial = classify_sandbox_denial(
-			true,
-			&RunTerminal::Failed,
-			Some(&write_error),
-			b"",
-		)
-		.expect("typed write denial");
+		let denial = classify_sandbox_denial(true, &RunTerminal::Failed, Some(&write_error), b"")
+			.expect("typed write denial");
 		assert_eq!(denial.path, Str::from(denied_path.to_string_lossy().as_ref()));
 		assert_eq!(denial.exit_code, None);
+
+		let denial = classify_sandbox_denial(
+			true,
+			&RunTerminal::Exited(2),
+			None,
+			b"env/v1 exec: sandbox denied write to /private/handled\n",
+		)
+		.expect("shell-handled typed write denial");
+		assert_eq!(denial.path, "/private/handled");
+		assert_eq!(denial.exit_code, Some(2));
 
 		let denial = classify_sandbox_denial(
 			true,
@@ -3586,32 +3621,14 @@ mod tests {
 			)
 			.is_none()
 		);
+		assert!(classify_sandbox_denial(true, &RunTerminal::Exited(0), None, b"EPERM",).is_none());
 		assert!(
-			classify_sandbox_denial(
-				true,
-				&RunTerminal::Exited(0),
-				None,
-				b"EPERM",
-			)
-			.is_none()
+			classify_sandbox_denial(true, &RunTerminal::Exited(1), None, b"permission denied",)
+				.is_none()
 		);
 		assert!(
-			classify_sandbox_denial(
-				true,
-				&RunTerminal::Exited(1),
-				None,
-				b"permission denied",
-			)
-			.is_none()
-		);
-		assert!(
-			classify_sandbox_denial(
-				true,
-				&RunTerminal::Exited(1),
-				None,
-				b"NOT_EPERMISSION",
-			)
-			.is_none()
+			classify_sandbox_denial(true, &RunTerminal::Exited(1), None, b"NOT_EPERMISSION",)
+				.is_none()
 		);
 	}
 
@@ -3641,11 +3658,8 @@ mod tests {
 		assert_eq!(cancelled.signal, "SIGKILL");
 		assert!(cancelled.aborted);
 
-		let denied = RunTerminal::Denied {
-			exit_code: Some(1),
-			path:      sf!("/private/blocked"),
-		}
-		.status(Duration::from_millis(5));
+		let denied = RunTerminal::Denied { exit_code: Some(1), path: sf!("/private/blocked") }
+			.status(Duration::from_millis(5));
 		assert_eq!(denied.outcome, ExecOutcome::Denied as i32);
 		assert_eq!(denied.exit_code, Some(1));
 		assert_eq!(
@@ -3768,10 +3782,7 @@ mod tests {
 		assert!(!workspace.join(".git/blocked.txt").exists());
 
 		let (_, bypass) = host
-			.exec_without_sandbox(
-				script_request(session, "echo approved > .git/approved.txt"),
-				None,
-			)
+			.exec_without_sandbox(script_request(session, "echo approved > .git/approved.txt"), None)
 			.await
 			.expect("one-shot bypass starts");
 		loop {
@@ -3786,13 +3797,10 @@ mod tests {
 				None => panic!("bypass event stream closed before exit"),
 			}
 		}
-		assert_eq!(
-			fs::read(workspace.join(".git/approved.txt")).unwrap(),
-			b"approved\n"
-		);
+		assert_eq!(fs::read(workspace.join(".git/approved.txt")).unwrap(), b"approved\n");
 
 		// The next ordinary command is sandboxed again.
-		let (outcome, _, _) =
+		let (outcome, ..) =
 			run_failure(&host, script_request(session, "echo no > .git/blocked-again.txt")).await;
 		assert_eq!(outcome, ExecOutcome::Denied as i32);
 		assert!(!workspace.join(".git/blocked-again.txt").exists());

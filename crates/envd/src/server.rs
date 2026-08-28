@@ -2960,6 +2960,10 @@ impl EnvServer {
 	pub fn extension_registry_evidences(&self) -> Vec<Arc<SealedRegistryEvidence>> {
 		self.ext_hosts.sealed_registry_evidences()
 	}
+	/// Returns every authenticated extension CONTROL identity.
+	pub fn extension_control_identities(&self) -> Vec<Arc<ControlConnectionIdentity>> {
+		self.ext_hosts.control_identities()
+	}
 
 	/// Returns the session-owned MCP manager for late bridge injection.
 	pub(crate) const fn mcp_manager(&self) -> &Arc<McpManager> {

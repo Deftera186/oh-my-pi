@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use url::Url;
 
 use super::{
 	admission,
@@ -1069,7 +1070,7 @@ fn policy_cwd(
 	let roots = invocation
 		.roots
 		.iter()
-		.map(|root| PathBuf::from(root.as_str()))
+		.map(|root| control_root_path(root.as_str()))
 		.collect::<Vec<_>>();
 	let root = roots.first().ok_or_else(|| {
 		ControlProtocolError::new(
@@ -1095,12 +1096,18 @@ fn policy_cwd(
 		))
 	}
 }
+fn control_root_path(root: &str) -> PathBuf {
+	Url::parse(root)
+		.ok()
+		.and_then(|url| url.to_file_path().ok())
+		.unwrap_or_else(|| PathBuf::from(root))
+}
 fn policy_root(context: &ControlRequestContext) -> Result<PathBuf, ControlProtocolError> {
 	context
 		.invocation
 		.as_ref()
 		.and_then(|invocation| invocation.roots.first())
-		.map(|root| PathBuf::from(root.as_str()))
+		.map(|root| control_root_path(root.as_str()))
 		.ok_or_else(|| {
 			ControlProtocolError::new(
 				"WorkspaceScopeDenied",
@@ -1281,6 +1288,44 @@ pub fn user_bash_ir(script: &str, cwd: &Path, root: &Path) -> Value {
 			})
 		})
 		.collect::<Vec<_>>();
+	let command_values = ir.commands.iter().map(command_json).collect::<Vec<_>>();
+	let mut pipeline_commands = vec![Vec::<Value>::new()];
+	let mut operators = Vec::<&str>::new();
+	for (index, command) in ir.commands.iter().enumerate() {
+		if index > 0 {
+			let previous_end =
+				ir.commands[index - 1].span.as_ref().map_or(0, |span| span.end as usize);
+			let next_start = command.span.as_ref().map_or(previous_end, |span| span.start as usize);
+			let separator = script.get(previous_end..next_start).unwrap_or_default();
+			if separator.contains("&&") || separator.contains("||") {
+				operators.push(if separator.contains("&&") { "and" } else { "or" });
+				pipeline_commands.push(Vec::new());
+			}
+		}
+		pipeline_commands
+			.last_mut()
+			.expect("at least one pipeline exists")
+			.push(command_values[index].clone());
+	}
+	let lists = (!command_values.is_empty()).then(|| {
+		let pipelines = pipeline_commands
+			.into_iter()
+			.map(|commands| {
+				let span = commands
+					.first()
+					.and_then(|command| command.get("span"))
+					.cloned()
+					.unwrap_or_else(|| span_json(None));
+				json!({"commands": commands, "negated": false, "timed": false, "span": span})
+			})
+			.collect::<Vec<_>>();
+		json!({
+			"pipelines": pipelines,
+			"operators": operators,
+			"separator": "sequence",
+			"span": span_json(ir.commands.first().and_then(|command| command.span.as_ref())),
+		})
+	});
 	json!({
 		"source": script,
 		"rev": if ir.rev.is_empty() { "bashir@3" } else { ir.rev.as_str() },
@@ -1291,8 +1336,8 @@ pub fn user_bash_ir(script: &str, cwd: &Path, root: &Path) -> Value {
 		"node_count": ir.node_count,
 		"is_compound": ir.is_compound,
 		"has_dynamic_eval": ir.has_dynamic_eval,
-		"lists": Vec::<Value>::new(),
-		"commands": ir.commands.iter().map(command_json).collect::<Vec<_>>(),
+		"lists": lists.into_iter().collect::<Vec<_>>(),
+		"commands": command_values,
 		"functions": Vec::<Value>::new(),
 		"reads": ir.reads.iter().map(path_ref_json).collect::<Vec<_>>(),
 		"writes": ir.writes.iter().map(path_ref_json).collect::<Vec<_>>(),
