@@ -106,9 +106,8 @@ class PyHooksEvents(unittest.TestCase):
 		finally:
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_transform_modify_rewrites_tool_arguments(self):
-		"""Ledger: transform-modify hooks do not produce the rewritten tool output."""
+		"""A transform-phase Modify decision rewrites the arguments the tool receives."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-hooks-modify-"))
 		try:
 			with extension_fixture("hooks/transform-modify") as directory:

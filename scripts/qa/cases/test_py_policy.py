@@ -161,9 +161,8 @@ class PyPolicy(unittest.TestCase):
 		self.assertEqual(encoded["pipeline_widths"], [1, 2])
 		self.assertEqual(encoded["segments"][1], "printf '%s' two")
 
-	@unittest.expectedFailure
 	def test_precheck_policy_denies_a_matching_shell_invocation(self):
-		"""Ledger: policy precheck denial does not surface its rule identifier to the model."""
+		"""A matching BashIR policy denial blocks execution and names its rule to the model."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-policy-deny-"))
 		try:
 			with extension_fixture("policy/precheck-deny") as directory:
@@ -184,9 +183,8 @@ class PyPolicy(unittest.TestCase):
 		finally:
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_approval_requirement_denies_when_no_approver_is_reachable(self):
-		"""Ledger: approval denial does not surface its rule identifier to the model."""
+		"""RequireApproval without a reachable approver denies and names its rule."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-policy-approval-"))
 		try:
 			with extension_fixture("policy/approval-required") as directory:
