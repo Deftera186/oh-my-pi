@@ -86,8 +86,11 @@ const RPC_HISTORY_CAPS_BASE: CapsBase = CapsBase {
 
 /// Stream returned by RPC methods whose typed operation produces events.
 pub type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
-/// Authoritative provider application operations exposed only when the
-/// application installs its live provider owner.
+/// Authoritative provider application operations exposed only when an
+/// extension CONTROL session installs its live provider owner.
+///
+/// Plain `serve` has no authenticated extension caller or capability grant and
+/// must not manufacture one from protobuf identity fields.
 #[tonic::async_trait]
 pub trait ProviderGatewayAuthority: Send + Sync + 'static {
 	/// Returns the current model catalog, optionally filtered to one provider.
@@ -280,7 +283,10 @@ impl InferenceRpc {
 
 	fn provider_authority(&self) -> Result<&Arc<dyn ProviderGatewayAuthority>, Status> {
 		self.provider_authority.as_ref().ok_or_else(|| {
-			Status::failed_precondition("provider application authority is not installed")
+			Status::failed_precondition(
+				"provider application authority is not installed; an extension CONTROL session must \
+				 establish provider declaration and operation authority",
+			)
 		})
 	}
 
