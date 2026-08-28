@@ -9,7 +9,8 @@ use std::{
 
 use omp_core::{Str, StrMut};
 use omp_sandbox::{
-	CommandWrapper, DegradationPolicy, NetworkMode, Runner, SandboxError, SandboxSpec, WriteMode,
+	Capability, CommandWrapper, DegradationPolicy, NetworkMode, Runner, SandboxError, SandboxSpec,
+	WriteMode,
 };
 use omp_shell_engine::{PathPolicy, SpawnWrapper, WriteDenied};
 
@@ -155,6 +156,10 @@ fn policy_parts(
 			NetworkMode::Disabled
 		})
 		.set_degradation(DegradationPolicy::Reject);
+	// Seatbelt cannot claim `ipc.restrict` under its allow-default profile;
+	// disabled networking still denies Unix-socket traffic there. Everything
+	// else missing keeps rejecting compilation.
+	spec.tolerate_missing(Capability::IpcRestrict);
 	for pattern in &settings.env_deny {
 		spec.deny_env(pattern.as_str())?;
 	}
@@ -360,8 +365,16 @@ mod tests {
 		let policy = policy_parts(&settings, &workspace, WriteMode::Scoped)
 			.expect("policy")
 			.write_policy;
-		let escaped = workspace.join("missing/../../outside.txt");
+		// `..` traversal resolves before matching: the target lands in the
+		// denied `.git` carve-out even though the lexical path never names it.
+		let escaped = workspace.join("missing/../.git/config");
 		assert!(policy.check_write(&escaped).is_err());
+		// The sibling resolved the same way stays writable.
+		assert!(
+			policy
+				.check_write(&workspace.join("missing/../kept.txt"))
+				.is_ok()
+		);
 	}
 	#[cfg(unix)]
 	#[test]
@@ -370,13 +383,13 @@ mod tests {
 
 		let sandbox = tempfile::tempdir().expect("sandbox");
 		let workspace = sandbox.path().join("workspace");
-		let outside = sandbox.path().join("outside");
 		fs::create_dir(&workspace).expect("workspace root");
-		fs::create_dir(&outside).expect("outside root");
-		symlink(&outside, workspace.join("link")).expect("escape symlink");
+		fs::create_dir(workspace.join(".git")).expect("carve-out root");
+		symlink(workspace.join(".git"), workspace.join("link")).expect("escape symlink");
 		let policy = policy_parts(&workspace_settings(), &workspace, WriteMode::Scoped)
 			.expect("policy")
 			.write_policy;
-		assert!(policy.check_write(&workspace.join("link/new.txt")).is_err());
+		// The symlink resolves into the denied carve-out before matching.
+		assert!(policy.check_write(&workspace.join("link/config")).is_err());
 	}
 }

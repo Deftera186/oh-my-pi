@@ -2198,7 +2198,6 @@ impl HostControlAuthorityFactory {
 		let mut registry_effect = None;
 		let mut ui_effect = None;
 		let mut telemetry_effect = None;
-		let mut provider_effect = None;
 		for (domain, name, factory) in factories {
 			let authority = factory
 				.bind(Arc::clone(&identity))
@@ -2207,7 +2206,6 @@ impl HostControlAuthorityFactory {
 				ControlDomain::Registry => registry_effect = Some(Arc::clone(&authority)),
 				ControlDomain::Ui => ui_effect = Some(Arc::clone(&authority)),
 				ControlDomain::Telemetry => telemetry_effect = Some(Arc::clone(&authority)),
-				ControlDomain::Provider => provider_effect = Some(Arc::clone(&authority)),
 				_ => {},
 			}
 			domains.push(Arc::new(RoutedControlAuthority { domain, authority }));
@@ -2221,7 +2219,6 @@ impl HostControlAuthorityFactory {
 			registry:  registry_effect.expect("registry domain was bound"),
 			ui:        ui_effect.expect("UI domain was bound"),
 			telemetry: telemetry_effect.expect("telemetry domain was bound"),
-			provider:  provider_effect.expect("provider domain was bound"),
 			fallback:  effect_owner,
 		});
 		Ok(Arc::new(CompositeControlAuthority::new(domains, effect_owner)))
@@ -2231,7 +2228,6 @@ struct DomainEffectAuthority {
 	registry:  Arc<dyn ControlAuthority>,
 	ui:        Arc<dyn ControlAuthority>,
 	telemetry: Arc<dyn ControlAuthority>,
-	provider:  Arc<dyn ControlAuthority>,
 	fallback:  Arc<dyn ControlAuthority>,
 }
 
@@ -2274,7 +2270,7 @@ impl ControlAuthority for DomainEffectAuthority {
 			ControlEffect::Registry(_) => &self.registry,
 			ControlEffect::Ui(_) => &self.ui,
 			ControlEffect::Instrument(_) => &self.telemetry,
-			ControlEffect::Intent(_) => &self.provider,
+			ControlEffect::Intent(_) => &self.fallback,
 			ControlEffect::Log(_) => &self.fallback,
 		};
 		owner.effect(context, effect).await

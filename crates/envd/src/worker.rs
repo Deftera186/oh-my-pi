@@ -772,6 +772,12 @@ impl WorkerInvocation {
 		self.streams_args
 	}
 
+	/// Returns the registered maximum as a wire envelope for trusted internal
+	/// dispatches that have no external admission frame to carry a narrowing.
+	pub fn maximum_effect_envelope(&self) -> omp_proto::policy::v1::EffectEnvelope {
+		omp_proto::policy::v1::EffectEnvelope::from(&self.maximum_effects)
+	}
+
 	/// Forwards one speculative argument fragment verbatim.
 	///
 	/// # Errors
@@ -1470,21 +1476,6 @@ impl ExtHostSupervisor {
 			else {
 				continue;
 			};
-			let static_declarations = extension.manifest.static_declarations();
-			let control_declared = extension.manifest.runtime_declarations_trusted()
-				|| static_declarations.ordered.iter().any(|declaration| {
-					!matches!(declaration.kind.as_str(), "soft" | "hard" | "prelude")
-				}) || !static_declarations.capability_grants.is_empty()
-				|| extension.manifest.declarations.hooks().next().is_some()
-				|| extension.manifest.services.provides().next().is_some()
-				|| extension.manifest.services.requires().next().is_some()
-				|| extension
-					.manifest
-					.declarations
-					.permits(EscapeCapability::DirectFilesystem);
-			if !control_declared {
-				continue;
-			}
 			let Some(trigger) = extension
 				.manifest
 				.activation_triggers
@@ -1756,6 +1747,7 @@ impl ExtHostSupervisor {
 							owner.clone(),
 							declaration.streams_args,
 							maximum_effects,
+							declaration.place.clone(),
 						),
 					)
 					.is_some()
@@ -1873,9 +1865,11 @@ impl ExtHostSupervisor {
 		}
 		let routes = routes
 			.into_iter()
-			.map(|(route, (process_id, owner, streams_args, maximum_effects))| {
-				let (commands, host_generation, session_generation) = control_routes
-					.get(&owner)
+			.map(|(route, (process_id, owner, streams_args, maximum_effects, place))| {
+				let control = (place == "host")
+					.then(|| control_routes.get(&owner))
+					.flatten();
+				let (commands, host_generation, session_generation) = control
 					.or_else(|| senders.get(&process_id))
 					.expect("every verified process has a command channel");
 				(route, HostRoute {
@@ -2075,6 +2069,7 @@ impl ExtHostSupervisor {
 			&& !operation.starts_with("omp.ui.")
 			&& !operation.starts_with("omp.jobs.")
 			&& !operation.starts_with("omp.prompts.")
+			&& !operation.starts_with("omp.telemetry.")
 		{
 			return Err(ExtensionCallbackError::InvalidOperation);
 		}
@@ -3550,7 +3545,8 @@ impl ExtensionRegimeResolver {
 		&self,
 		identity: &ControlConnectionIdentity,
 		regime: &str,
-		state: Option<&str>,
+		state: Option<&[u8]>,
+		state_revision: Option<u32>,
 	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
 		let evidence = (self.evidence)(identity).ok_or_else(|| {
 			ControlProtocolError::new(
@@ -3581,6 +3577,18 @@ impl ExtensionRegimeResolver {
 				)
 			})?;
 		let declaration = FrozenRegimeDeclaration::parse(document)?;
+		let state = state.unwrap_or_default();
+		if (!state.is_empty() || state_revision.is_some())
+			&& declaration.state_revision != state_revision
+		{
+			return Err(ControlProtocolError::new(
+				"InvalidRegimeState",
+				"regime state revision differs from the sealed declaration",
+			));
+		}
+		let state = std::str::from_utf8(state).map_err(|_| {
+			ControlProtocolError::new("InvalidRegimeState", "regime state must be UTF-8")
+		})?;
 		let spec = declaration.spec();
 		let mut owners = self.owners.lock();
 		if owners
@@ -3602,7 +3610,7 @@ impl ExtensionRegimeResolver {
 			revision: declaration.revision,
 			state_revision: declaration.state_revision,
 			on_failure: declaration.on_failure,
-			state: Str::from(state.unwrap_or_default()),
+			state: Str::from(state),
 			started_activation: None,
 			runtime: self.runtime.clone(),
 		};
@@ -9211,6 +9219,7 @@ fn load_tools(
 				};
 				let constraint = python_tool_constraint(&row)?;
 				let kind_name: String = row.getattr("kind")?.extract()?;
+				let place: String = row.getattr("place")?.extract()?;
 				let execution_mode = if row.getattr("serial")?.extract::<bool>()? {
 					v1::ToolExecutionMode::Sequential
 				} else {
@@ -9234,6 +9243,7 @@ fn load_tools(
 						kind: kind_name,
 						execution_mode: execution_mode as i32,
 						props: None,
+						place,
 						..Default::default()
 					},
 					handler: handler.unbind(),
@@ -9459,6 +9469,34 @@ fn serve_invocation<W: Write>(
 			let environment = PyModule::import(py, "omp.env")?;
 			let invoke_with_environment = environment.getattr("_invoke_with_environment")?;
 			let pending_updates = PyList::empty(py);
+			let scope_module = PyModule::import(py, "omp._scope")?;
+			let scope_kwargs = PyDict::new(py);
+			scope_kwargs.set_item("invocation", invoke.call_id.as_str())?;
+			scope_kwargs.set_item("generation", host_generation)?;
+			scope_kwargs.set_item(
+				"principal",
+				omp_py::bind_principal(
+					py,
+					Principal::new(Str::from(principal_id), Str::from(principal_display)),
+				)?,
+			)?;
+			scope_kwargs.set_item(
+				"phase",
+				scope_module
+					.getattr("InvocationPhase")?
+					.getattr("EFFECTS_AUTHORIZED")?,
+			)?;
+			scope_kwargs.set_item("extension", tool.decl.extension_id.as_str())?;
+			scope_kwargs.set_item("session", session_id)?;
+			scope_kwargs.set_item("call", invoke.call_id.as_str())?;
+			scope_kwargs.set_item("device", invoke.name.as_str())?;
+			scope_kwargs.set_item("place_kind", match &tool.kind {
+				PythonToolKind::Contextual { place } => place.as_str(),
+				PythonToolKind::Legacy | PythonToolKind::Prelude => "host",
+			})?;
+			let scope = scope_module
+				.getattr("Scope")?
+				.call((), Some(&scope_kwargs))?;
 			let coroutine =
 				match &tool.kind {
 					PythonToolKind::Legacy | PythonToolKind::Prelude => invoke_with_environment
@@ -9495,9 +9533,11 @@ fn serve_invocation<W: Write>(
 						))?
 					},
 				};
-			let value = PyModule::import(py, "asyncio")?
-				.getattr("run")?
-				.call1((coroutine,))?;
+			let asyncio_run = PyModule::import(py, "asyncio")?.getattr("run")?;
+			let scope_token = scope_module.getattr("install")?.call1((&scope,))?;
+			let value = asyncio_run.call1((coroutine,));
+			scope_module.getattr("reset")?.call1((scope_token,))?;
+			let value = value?;
 			for update in pending_updates.iter() {
 				write_update(writer, request_id, &call_id, &json, &update, limit, scratch)?;
 			}
@@ -9658,6 +9698,8 @@ fn schema_argument_issue(schema_json: &[u8], args_json: &[u8]) -> Option<ArgIssu
 		validate_schema(&schema_value, &arguments, false, ToolAssemblyLimits::default()).err()?;
 	let expected = if violation.rule == "required" {
 		"required parameter".into()
+	} else if violation.rule == "additionalProperties" {
+		"no additional properties".into()
 	} else if violation.rule == "type" && !violation.expected_types.is_empty() {
 		violation
 			.expected_types
@@ -9678,6 +9720,7 @@ fn schema_argument_issue(schema_json: &[u8], args_json: &[u8]) -> Option<ArgIssu
 		} else {
 			"malformed".into()
 		},
+		found: (violation.rule == "additionalProperties").then(|| "additional property".into()),
 		..ArgIssue::default()
 	})
 }
@@ -10056,6 +10099,38 @@ mod tests {
 			.expect("truncated document must be rejected");
 		assert!(malformed.path.is_empty());
 		assert_eq!(malformed.kind, "malformed");
+
+		let additional = schema_argument_issue(schema, br#"{"i":"x","count":3,"extra":true}"#)
+			.expect("closed schema must reject an unknown member");
+		assert_eq!(additional.path, ["extra"]);
+		assert_eq!(additional.kind, "malformed");
+		assert_eq!(additional.expected, "no additional properties");
+		assert_eq!(additional.found.as_deref(), Some("additional property"));
+	}
+
+	#[test]
+	fn python_argument_validation_checks_nested_required_properties() {
+		let schema = br#"{
+			"type":"object",
+			"properties":{
+				"args":{
+					"type":"object",
+					"properties":{
+						"flag":{"type":"boolean"},
+						"label":{"type":"string"}
+					},
+					"required":["flag","label"],
+					"additionalProperties":false
+				}
+			},
+			"required":["args"],
+			"additionalProperties":false
+		}"#;
+		let missing = schema_argument_issue(schema, br#"{"args":{"flag":true}}"#)
+			.expect("nested required parameter must be rejected");
+		assert_eq!(missing.path, ["args", "label"]);
+		assert_eq!(missing.kind, "missing");
+		assert_eq!(missing.expected, "required parameter");
 	}
 	#[test]
 	fn control_completion_matches_stdio_envelopes() {

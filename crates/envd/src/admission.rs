@@ -456,7 +456,7 @@ pub fn effects_narrow_or_refuse(
 	let requested = requested.map(Effects::try_from).transpose().ok()?;
 	match requested {
 		Some(requested) => maximum.narrow(requested),
-		None => Some(Effects::empty()),
+		None => Some(maximum.clone()),
 	}
 }
 
@@ -697,5 +697,14 @@ mod tests {
 			..EffectEnvelope::default()
 		};
 		assert!(effects_narrow_or_refuse(Some(&requested), &maximum).is_none());
+	}
+
+	#[test]
+	fn absent_effect_envelope_retains_declared_maximum() {
+		let maximum = Effects {
+			exec: Some(ToolExecEffects { commands: [sf!("git")].into(), network: false }),
+			..Effects::empty()
+		};
+		assert_eq!(effects_narrow_or_refuse(None, &maximum), Some(maximum));
 	}
 }
