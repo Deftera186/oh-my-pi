@@ -17,6 +17,7 @@ use omp_catalog::ProviderId;
 use omp_core::{ExposeSecret as _, Hash32, Secret, SecretString, Str};
 use omp_inference::{
 	Client, Error as InferenceError, ErrorKind, Registry,
+	account::AccountPoolEvent,
 	answer::{
 		AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthSession, UsageQuantity, UsageReport,
 		UsageStatus, UsageUnit, UsageWindowKind,
@@ -421,12 +422,48 @@ impl pb::auth_server::Auth for AuthRpc {
 		&self,
 		_request: Request<pb::WatchCredentialsRequest>,
 	) -> Result<Response<Self::WatchCredentialsStream>, Status> {
-		let stream = futures::stream::once(async {
-			Ok(pb::CredentialEvent {
+		let mut changes = self.control()?.subscribe();
+		let rpc = self.clone();
+		let stream = async_stream::stream! {
+			yield Ok(pb::CredentialEvent {
 				cursor: None,
 				event:  Some(credential_event::Event::Reset(pb::credential_event::Reset {})),
-			})
-		});
+			});
+			loop {
+				match changes.recv().await {
+					Ok(AccountPoolEvent::Upserted(account)) => {
+						match rpc.control_meta(account) {
+							Ok(metadata) => yield Ok(pb::CredentialEvent {
+								cursor: None,
+								event: Some(credential_event::Event::Upserted(metadata)),
+							}),
+							Err(status) if status.code() == tonic::Code::NotFound => continue,
+							Err(status) => {
+								yield Err(status);
+								break;
+							},
+						}
+					},
+					Ok(AccountPoolEvent::Deleted(account)) => {
+						yield Ok(pb::CredentialEvent {
+							cursor: None,
+							event: Some(credential_event::Event::DeletedId(wire_account_id(
+								&account,
+							))),
+						});
+					},
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+						yield Ok(pb::CredentialEvent {
+							cursor: None,
+							event: Some(credential_event::Event::Reset(
+								pb::credential_event::Reset {},
+							)),
+						});
+					},
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+				}
+			}
+		};
 		Ok(Response::new(Box::pin(stream)))
 	}
 
@@ -685,6 +722,12 @@ impl pb::auth_server::Auth for AuthRpc {
 		request: Request<pb::ImportOAuthRequest>,
 	) -> Result<Response<pb::CredentialMeta>, Status> {
 		let request = request.into_inner();
+		if request.provider.is_empty() {
+			return Err(Status::invalid_argument("provider is required"));
+		}
+		if request.refresh_token.is_empty() {
+			return Err(Status::invalid_argument("refresh_token is required"));
+		}
 		let provider = ProviderId::from(request.provider.as_str());
 		let identity = (!request.identity.is_empty()).then(|| request.identity.into());
 		let principal =

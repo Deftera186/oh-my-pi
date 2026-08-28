@@ -11,6 +11,7 @@ use std::{
 use omp_catalog::{ProviderId, RouteId};
 use omp_core::Str;
 use parking_lot::RwLock;
+use tokio::sync::broadcast;
 
 use super::{
 	AccountAffinity, AccountChangeEvidence, AccountStateStore, AccountStateStoreError,
@@ -342,10 +343,27 @@ struct PoolState {
 }
 
 /// Concurrent, durable-aware account metadata and eligibility state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AccountPool {
-	state: Arc<RwLock<PoolState>>,
-	store: Option<Arc<AccountStateStore>>,
+	state:   Arc<RwLock<PoolState>>,
+	store:   Option<Arc<AccountStateStore>>,
+	changes: broadcast::Sender<AccountPoolEvent>,
+}
+
+/// Secret-free mutation emitted by the canonical account pool.
+#[derive(Clone, Debug)]
+pub enum AccountPoolEvent {
+	/// Account metadata was inserted or replaced.
+	Upserted(AccountRecord),
+	/// Account metadata was removed.
+	Deleted(AccountId),
+}
+
+impl Default for AccountPool {
+	fn default() -> Self {
+		let (changes, _) = broadcast::channel(64);
+		Self { state: Arc::default(), store: None, changes }
+	}
 }
 
 impl AccountPool {
@@ -363,7 +381,8 @@ impl AccountPool {
 			state.accounts.insert(account.clone(), record);
 			hydrate_account_state(&mut state, account, persisted);
 		}
-		Ok(Self { state: Arc::new(RwLock::new(state)), store: Some(store) })
+		let (changes, _) = broadcast::channel(64);
+		Ok(Self { state: Arc::new(RwLock::new(state)), store: Some(store), changes })
 	}
 
 	/// Returns the durable account-state dependency, when configured.
@@ -432,17 +451,30 @@ impl AccountPool {
 				summary: Str::new(error.to_string()),
 			})?;
 		let account = record.account.clone();
+		let event = record.clone();
 		state.accounts.insert(account.clone(), record);
 		if let Some(persisted) = persisted {
 			hydrate_account_state(&mut state, account, persisted);
 		}
+		drop(state);
+		let _ = self.changes.send(AccountPoolEvent::Upserted(event));
 		Ok(())
 	}
 
 	/// Removes account metadata while retaining independent cooldown, rate, and
 	/// quota observations.
 	pub fn remove(&self, account: &AccountId<str>) -> Option<AccountRecord> {
-		self.state.write().accounts.remove(account)
+		let removed = self.state.write().accounts.remove(account);
+		if removed.is_some() {
+			let _ = self
+				.changes
+				.send(AccountPoolEvent::Deleted(account.to_owned()));
+		}
+		removed
+	}
+
+	pub(crate) fn subscribe(&self) -> broadcast::Receiver<AccountPoolEvent> {
+		self.changes.subscribe()
 	}
 
 	/// Returns an account metadata snapshot.
@@ -471,6 +503,9 @@ impl AccountPool {
 			return Ok(false);
 		};
 		record.enabled = enabled;
+		let event = record.clone();
+		drop(state);
+		let _ = self.changes.send(AccountPoolEvent::Upserted(event));
 		Ok(true)
 	}
 
@@ -579,6 +614,7 @@ impl AccountPool {
 			return Ok(false);
 		}
 		record.credential_generation = generation;
+		let event = record.clone();
 		if state
 			.rejections
 			.get(account)
@@ -586,6 +622,8 @@ impl AccountPool {
 		{
 			state.rejections.remove(account);
 		}
+		drop(state);
+		let _ = self.changes.send(AccountPoolEvent::Upserted(event));
 		Ok(true)
 	}
 

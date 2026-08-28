@@ -32,8 +32,8 @@ use super::{
 };
 use crate::{
 	account::{
-		AccountPool, AccountRecord, CredentialFreshness, RateWindowId, RefreshCoordinator,
-		RefreshRequest,
+		AccountPool, AccountPoolEvent, AccountRecord, CredentialFreshness, RateWindowId,
+		RefreshCoordinator, RefreshRequest,
 	},
 	answer::{
 		AccountState, AccountSummary, AuthAnswer, AuthEvent, AuthPrompt, AuthPromptKind,
@@ -89,6 +89,11 @@ pub struct AuthControlHandle {
 }
 
 impl AuthControlHandle {
+	/// Subscribes to future secret-free mutations of the canonical account pool.
+	pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AccountPoolEvent> {
+		self.manager.accounts.subscribe()
+	}
+
 	/// Lists live secret-free account records in deterministic order.
 	pub fn accounts(&self, provider: Option<&ProviderId<str>>) -> Vec<AccountRecord> {
 		self
