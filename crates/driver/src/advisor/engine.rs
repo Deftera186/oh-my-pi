@@ -287,6 +287,15 @@ impl AdvisorEngine {
 		self.worker(advisor_id).map(|worker| worker.queue.clone())
 	}
 
+	/// Invalidates every advisor's pending primary delta after a history
+	/// rewrite (rewind or reset); the next update re-primes full context.
+	pub fn history_rewritten(&mut self) {
+		for worker in &mut self.workers {
+			worker.delta.history_rewritten();
+			worker.pending = false;
+		}
+	}
+
 	/// Pushes rendered primary-session text into every advisor's pending delta.
 	pub fn observe_primary_text(&mut self, text: &str) {
 		if text.is_empty() {

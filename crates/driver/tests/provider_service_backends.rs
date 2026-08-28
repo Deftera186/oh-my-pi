@@ -104,7 +104,7 @@ fn regime_resolver_uses_only_the_sealed_owner_generation() {
 	let resolver = SealedRegimeControlResolver::new([declaration]).expect("sealed resolver");
 	let identity = identity();
 	let (resolved, regime) = resolver
-		.resolve(&identity, "dev.example.regime", Some("{}"))
+		.resolve(&identity, "dev.example.regime", Some(b"{}"), None)
 		.expect("owned generation resolves");
 	assert_eq!(resolved.id, "dev.example.regime");
 	assert_eq!(regime.state(), "{}");
@@ -112,7 +112,7 @@ fn regime_resolver_uses_only_the_sealed_owner_generation() {
 	let mut stale = (*identity).clone();
 	stale.host_generation += 1;
 	let error = resolver
-		.resolve(&stale, "dev.example.regime", None)
+		.resolve(&stale, "dev.example.regime", None, None)
 		.err()
 		.expect("old declaration cannot bind a replacement generation");
 	assert_eq!(error.code, "StaleGeneration");

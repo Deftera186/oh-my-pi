@@ -464,6 +464,8 @@ pub struct InferenceSessionOverrides {
 	pub usage_fetchers:          Option<UsageFetcherRegistry>,
 	/// Session-owned provider response hook sink.
 	pub provider_response_hooks: Option<omp_inference::ProviderResponseHooks>,
+	/// Catalog composed with frozen extension providers before model selection.
+	pub catalog:                 Option<Arc<snapshot::Catalog>>,
 	/// Exact layered settings snapshot frozen by the session composer.
 	pub settings:                Option<Arc<SettingsSnapshot>>,
 }
@@ -522,6 +524,7 @@ pub async fn production_inference_for_session(
 	};
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let provider = overrides.provider.clone();
+	let catalog = overrides.catalog.clone();
 	let usage_fetchers = overrides.usage_fetchers.unwrap_or_default();
 	let provider_response_hooks = overrides.provider_response_hooks.unwrap_or_default();
 	let invocation_key = match (provider.as_ref(), overrides.api_key) {
@@ -537,12 +540,13 @@ pub async fn production_inference_for_session(
 	};
 	let inference_settings = inference_settings(settings.as_ref(), project_root)?;
 	let (registry, sessions, authority, mcp_authority, auth_manager, usage_manager, builtins) =
-		production_assembly_for_session(
+		production_assembly_with_catalog(
 			data_dir,
 			credential_store,
 			invocation_key,
 			usage_fetchers,
 			inference_settings,
+			catalog,
 		)
 		.await?;
 	let usage_fetchers = usage_manager.fetchers();
@@ -646,8 +650,41 @@ async fn production_assembly_for_session(
 	),
 	RegistryError,
 > {
+	production_assembly_with_catalog(
+		data_dir,
+		credential_store,
+		invocation_key,
+		usage_fetchers,
+		inference_settings,
+		None,
+	)
+	.await
+}
+
+async fn production_assembly_with_catalog(
+	data_dir: &Path,
+	credential_store: Arc<CredentialStore>,
+	invocation_key: Option<(omp_catalog::ProviderId, SecretString)>,
+	usage_fetchers: UsageFetcherRegistry,
+	inference_settings: omp_inference::InferenceSettings,
+	catalog: Option<Arc<snapshot::Catalog>>,
+) -> Result<
+	(
+		Registry,
+		ConversationSessionPlanner,
+		Arc<dyn omp_envd::github_url::CredentialAuthority>,
+		Arc<auth_backend::CombinedAuthAuthority>,
+		AuthManager,
+		ConsoleUsageManager,
+		BuiltinConfig,
+	),
+	RegistryError,
+> {
 	fs::create_dir_all(data_dir).map_err(RegistryError::PrepareState)?;
-	let catalog = production_catalog(data_dir)?;
+	let catalog = match catalog {
+		Some(catalog) => catalog,
+		None => production_catalog(data_dir)?,
+	};
 	#[cfg(feature = "local-applefm")]
 	let apple_routes = catalog
 		.routes()

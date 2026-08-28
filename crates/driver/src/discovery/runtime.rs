@@ -124,7 +124,8 @@ impl RegimeControlResolver for SealedRegimeControlResolver {
 		&self,
 		identity: &ControlConnectionIdentity,
 		regime: &str,
-		state: Option<&str>,
+		state: Option<&[u8]>,
+		_state_revision: Option<u32>,
 	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
 		let declaration = self.declarations.get(regime).ok_or_else(|| {
 			ControlProtocolError::new(
@@ -146,6 +147,13 @@ impl RegimeControlResolver for SealedRegimeControlResolver {
 				"regime declaration belongs to a replaced host or session generation",
 			));
 		}
+		let state = state
+			.map(|state| {
+				std::str::from_utf8(state).map_err(|_| {
+					ControlProtocolError::new("InvalidRegimeState", "regime state must be UTF-8")
+				})
+			})
+			.transpose()?;
 		let regime = (declaration.constructor)(state)?;
 		Ok((Arc::clone(&declaration.spec), regime))
 	}

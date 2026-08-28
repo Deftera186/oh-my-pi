@@ -6802,11 +6802,28 @@ pub trait RegimeControlResolver: Send + Sync + 'static {
 		&self,
 		identity: &ControlConnectionIdentity,
 		regime: &str,
-		state: Option<&str>,
+		state: Option<&[u8]>,
+		state_revision: Option<u32>,
 	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError>;
 
 	/// Returns the owning extension for a frozen declaration.
 	fn owner(&self, regime: &str) -> Option<Str>;
+}
+
+impl RegimeControlResolver for omp_envd::worker::ExtensionRegimeResolver {
+	fn resolve(
+		&self,
+		identity: &ControlConnectionIdentity,
+		regime: &str,
+		state: Option<&[u8]>,
+		state_revision: Option<u32>,
+	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
+		self.resolve(identity, regime, state, state_revision)
+	}
+
+	fn owner(&self, regime: &str) -> Option<Str> {
+		self.owner(regime)
+	}
 }
 
 /// Regime backend delegating every mutation and projection to the sole live
@@ -6865,6 +6882,16 @@ impl RegimeControlAuthorityFactory {
 	pub fn new(backend: Arc<AgentRegimeControlBackend>) -> Self {
 		Self { backend }
 	}
+}
+
+/// Builds extension regime CONTROL ownership over the live agent.
+pub fn extension_regime_control_factory(
+	control: omp_agent::ControlSender,
+	resolver: Arc<omp_envd::worker::ExtensionRegimeResolver>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	let resolver: Arc<dyn RegimeControlResolver> = resolver;
+	let backend = Arc::new(AgentRegimeControlBackend::new(control, resolver));
+	Arc::new(RegimeControlAuthorityFactory::new(backend))
 }
 
 struct RegimeControlAuthority {
@@ -6959,21 +6986,66 @@ impl ControlAuthority for RegimeControlAuthority {
 		match operation.as_str() {
 			"omp.regimes.start" => {
 				let regime = arguments
-					.get("regime")
+					.get("regime_id")
 					.and_then(Value::as_str)
 					.filter(|regime| !regime.is_empty())
 					.ok_or_else(|| {
 						ControlProtocolError::new("InvalidRegime", "regime identity is required")
 					})?;
-				let state = arguments.get("state").and_then(Value::as_str);
+				let state = match arguments.get("state") {
+					None | Some(Value::Null) => None,
+					Some(Value::Object(envelope))
+						if envelope.len() == 1
+							&& envelope.get("$bytes").and_then(Value::as_str).is_some() =>
+					{
+						let encoded = envelope
+							.get("$bytes")
+							.and_then(Value::as_str)
+							.expect("validated regime state envelope");
+						Some(omp_core::base64::decode(encoded).into_vec().map_err(|_| {
+							ControlProtocolError::new(
+								"InvalidRegimeState",
+								"regime state is not valid base64",
+							)
+						})?)
+					},
+					Some(_) => {
+						return Err(ControlProtocolError::new(
+							"InvalidRegimeState",
+							"regime state must be a CONTROL bytes envelope",
+						));
+					},
+				};
+				let state_revision = match arguments.get("state_revision") {
+					None | Some(Value::Null) => None,
+					Some(Value::Number(revision)) => revision
+						.as_u64()
+						.and_then(|revision| u32::try_from(revision).ok())
+						.filter(|revision| *revision > 0)
+						.ok_or_else(|| {
+							ControlProtocolError::new(
+								"InvalidRegimeState",
+								"regime state revision must be a positive integer",
+							)
+						})
+						.map(Some)?,
+					Some(_) => {
+						return Err(ControlProtocolError::new(
+							"InvalidRegimeState",
+							"regime state revision must be a positive integer or null",
+						));
+					},
+				};
 				let queue = arguments
 					.get("queue")
 					.and_then(Value::as_bool)
 					.unwrap_or(false);
-				let (spec, handler) = self
-					.backend
-					.resolver
-					.resolve(&self.identity, regime, state)?;
+				let (spec, handler) = self.backend.resolver.resolve(
+					&self.identity,
+					regime,
+					state.as_deref(),
+					state_revision,
+				)?;
 				let receipt = self
 					.backend
 					.control
