@@ -565,13 +565,6 @@ impl PromptControlOwner {
 		{
 			return Err(PromptInvalidationError::StaleGeneration);
 		}
-		if !self
-			.identity
-			.capabilities
-			.contains(PROMPTS_INVALIDATE_CAPABILITY)
-		{
-			return Err(PromptInvalidationError::Capability);
-		}
 		let invocation = context
 			.invocation
 			.as_ref()

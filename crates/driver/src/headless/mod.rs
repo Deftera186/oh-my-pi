@@ -6,7 +6,9 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	env, error,
 	path::{Path, PathBuf},
+	str::FromStr,
 	sync::Arc,
+	time::{Duration, Instant},
 };
 
 use omp_agent::{
@@ -14,17 +16,32 @@ use omp_agent::{
 	ApprovalInbox, ApprovalRoute, Budget, EventSubscription, InProcTurnClient, TurnId,
 };
 use omp_catalog::{ModelKey, ProviderId, snapshot};
-use omp_core::{SecretString, Str, sf};
+use omp_core::{InvocationPhase, LifecyclePhase, SecretString, Str, sf};
+use omp_envd::exthost::{
+	CallbackConcurrency, EventDeadline, TelemetryControlAuthority,
+	backends::EnvdHostOwnerBackends,
+	control::{
+		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlDispatch,
+		ControlInvocationAuthority,
+	},
+	dispatch::CallbackDispatcher,
+};
 use omp_inference::Registry as InferenceRegistry;
 use omp_proto::thread::v1::Item;
 use omp_sdk::{SessionHandle, SessionIdentity, SessionRuntime};
 use omp_settings::manager::{MutationScope, SettingsManager, SettingsPaths};
 use omp_storage::{
+	blob::BlobStore,
 	index::SessionFilter,
+	telemetry_index::TelemetryIndex,
 	transcript::{
 		ModelChange as JournalModelChange, ModelId as JournalModelId, ModelRef as JournalModelRef,
 		ProviderId as JournalProviderId,
 	},
+};
+use omp_telemetry::firehose::{
+	Envelope as TelemetryEnvelope, Event as TelemetryEvent, Firehose, Kind as TelemetryKind,
+	SubscriptionOptions,
 };
 use parking_lot::Mutex;
 
@@ -46,6 +63,241 @@ pub enum HeadlessError {
 fn composition(error: impl error::Error + Send + Sync + 'static) -> HeadlessError {
 	HeadlessError::Composition(Box::new(error))
 }
+fn prompt_control_factory(
+	head: Arc<dyn rulebook::PromptHeadAuthority>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
+		Ok(Arc::new(rulebook::PromptControlOwner::new(identity, Arc::clone(&head)))
+			as Arc<dyn ControlAuthority>)
+	})
+}
+
+fn telemetry_control_factory(
+	query: Arc<dyn omp_telemetry::authority::DurableTelemetryQuery>,
+) -> Arc<dyn ControlAuthorityFactory> {
+	Arc::new(move |identity: Arc<ControlConnectionIdentity>| {
+		Ok(Arc::new(TelemetryControlAuthority::new(identity, now_ms(), Arc::clone(&query)))
+			as Arc<dyn ControlAuthority>)
+	})
+}
+
+fn provider_control_factory(
+	registry: omp_inference::Registry,
+	builtins: omp_inference::layer::stack::BuiltinConfig,
+	blobs: BlobStore,
+) -> Arc<dyn ControlAuthorityFactory> {
+	let owner = Arc::new(ProductionProviderApplicationOwner::new(registry, builtins, blobs));
+	let backend = Arc::new(ChatProviderControlBackend::new(owner));
+	Arc::new(ProviderControlAuthorityFactory::new(backend))
+}
+fn telemetry_envelope(event: &TelemetryEvent) -> Option<&TelemetryEnvelope> {
+	match event {
+		TelemetryEvent::SessionStart(event) => Some(&event.envelope),
+		TelemetryEvent::SessionDispatch(event) => Some(&event.envelope),
+		TelemetryEvent::SessionEnd(event) => Some(&event.envelope),
+		TelemetryEvent::TurnStart(event) => Some(&event.envelope),
+		TelemetryEvent::TurnEnd(event) => Some(&event.envelope),
+		TelemetryEvent::ModelRequest(event) => Some(&event.envelope),
+		TelemetryEvent::ModelAttempt(event) => Some(&event.envelope),
+		TelemetryEvent::ProviderError(event) => Some(&event.envelope),
+		TelemetryEvent::ToolCall(event) => Some(&event.envelope),
+		TelemetryEvent::CapabilityDegraded(event) => Some(&event.envelope),
+		TelemetryEvent::Compaction(event) => Some(&event.envelope),
+		TelemetryEvent::Branch(event) => Some(&event.envelope),
+		TelemetryEvent::ArtifactSpill(event) => Some(&event.envelope),
+		TelemetryEvent::IssueReport(event) => Some(&event.envelope),
+		TelemetryEvent::HostWarning(event) => Some(&event.envelope),
+		_ => None,
+	}
+}
+
+fn telemetry_event_wire(event: &TelemetryEvent, sequence: u64) -> serde_json::Value {
+	let kind = event.kind().as_str();
+	let envelope = telemetry_envelope(event);
+	let mut value = serde_json::json!({
+		"kind": kind,
+		"seq": sequence,
+		"at_ms": envelope.map_or(0, |value| value.occurred_at_ms),
+		"session": envelope.map_or("", |value| value.session_id.as_str()),
+		"agent": envelope.map_or("", |value| value.agent_id.as_str()),
+		"depth": 0,
+		"conversation": envelope.map_or("", |value| value.session_id.as_str()),
+		"trace": null,
+		"principal": envelope.map_or("", |value| value.principal.as_str()),
+		"generation": envelope.map_or(0, |value| value.generation),
+	});
+	let fields = value
+		.as_object_mut()
+		.expect("telemetry envelope is an object");
+	match event {
+		TelemetryEvent::ModelRequest(request) => {
+			fields.extend(
+				serde_json::json!({
+					"usage": {},
+					"prompt": {
+						"digest": omp_core::hex::encode(&request.prompt.digest).to_string(),
+						"slots": {},
+						"changed": request.prompt.changed.iter().map(Str::as_str).collect::<Vec<_>>(),
+						"prefix_stable_bytes": request.prompt.prefix_stable_bytes,
+						"cache_key": request.prompt.cache_key.as_deref().unwrap_or(""),
+						"retention": "",
+						"mode": "",
+						"ttl": "",
+						"breakpoint": "",
+						"breakpoint_indices": [],
+					},
+					"served_model": request.served_model.as_str(),
+					"latency_ms": 0,
+					"ttft_ms": null,
+					"degraded": [],
+					"request_content": null,
+					"response_content": null,
+				})
+				.as_object()
+				.expect("model request projection is an object")
+				.clone(),
+			);
+		},
+		TelemetryEvent::TurnStart(turn) => {
+			fields.extend(
+				serde_json::json!({
+					"turn": turn.turn,
+					"trigger": "",
+					"input_chars": 0,
+					"input_parts": 0,
+					"attachments": 0,
+					"model": "",
+					"effort": null,
+				})
+				.as_object()
+				.expect("turn projection is an object")
+				.clone(),
+			);
+		},
+		TelemetryEvent::TurnEnd(turn) => {
+			fields.extend(
+				serde_json::json!({
+					"turn": turn.turn,
+					"steps": 0,
+					"requests": 0,
+					"calls": 0,
+					"tokens": {},
+					"cost": null,
+					"latency_ms": 0,
+					"stop": "complete",
+					"tools_used": [],
+					"faults": 0,
+					"interrupted": false,
+					"context": {},
+				})
+				.as_object()
+				.expect("turn projection is an object")
+				.clone(),
+			);
+		},
+		_ => {},
+	}
+	value
+}
+
+fn bind_extension_telemetry(
+	environment: &omp_envd::ProjectEnvironment,
+	firehose: &Arc<Firehose>,
+	session: &Str,
+) -> Vec<tokio::task::JoinHandle<()>> {
+	let dispatcher = environment.extension_callback_dispatcher();
+	let mut tasks = Vec::new();
+	for evidence in environment.extension_registry_evidences() {
+		let Some(manifest) = environment.extension_control_manifest(&evidence.identity) else {
+			continue;
+		};
+		for declaration in &manifest.static_declarations().telemetry.subscriptions {
+			let Ok(kind) = TelemetryKind::from_str(declaration.key.as_str()) else {
+				continue;
+			};
+			let Ok(subscription) = firehose.subscribe(
+				SubscriptionOptions::new([kind], omp_telemetry::firehose::QUEUE_DEFAULT)
+					.expect("one telemetry kind and the default queue are valid"),
+			) else {
+				continue;
+			};
+			let dispatcher = Arc::clone(&dispatcher);
+			let identity = Arc::clone(&evidence.identity);
+			let qualified_name = sf!("{}.{}", declaration.module, declaration.id);
+			let session = session.clone();
+			tasks.push(tokio::spawn(async move {
+				let mut delivered = 0_u64;
+				while let Ok(event) = subscription.recv().await {
+					delivered = delivered.saturating_add(1);
+					let kind = event.kind();
+					let turn = match event.as_ref() {
+						TelemetryEvent::TurnStart(event) => Some(event.turn),
+						TelemetryEvent::TurnEnd(event) => Some(event.turn),
+						_ => None,
+					};
+					let invocation = sf!("telemetry:{}:{delivered}", qualified_name);
+					let result = dispatcher
+						.dispatch(Arc::clone(&identity), ControlDispatch {
+							operation: sf!("omp.telemetry.dispatch"),
+							arguments: serde_json::Map::from_iter([
+								(
+									"qualified_name".to_owned(),
+									serde_json::Value::String(qualified_name.to_string()),
+								),
+								("event".to_owned(), telemetry_event_wire(event.as_ref(), delivered)),
+								("ctx".to_owned(), serde_json::Value::Null),
+								(
+									"stats".to_owned(),
+									serde_json::json!({
+										"delivered": delivered,
+										"dropped": subscription.drop_stats().dropped,
+										"coalesced": 0,
+										"errored": 0,
+										"replay_skipped": subscription.drop_stats().replay_skipped,
+										"queue_depth": 0,
+										"first_drop_seq": null,
+										"since_ms": 0,
+									}),
+								),
+							]),
+							authority: ControlInvocationAuthority {
+								invocation,
+								phase: InvocationPhase::EffectsAuthorized,
+								session: session.clone(),
+								turn,
+								event: Some(sf!(kind.as_str())),
+								call: None,
+								device: None,
+								effects: Box::new([]),
+								place_kind: sf!("host"),
+								lifecycle: LifecyclePhase::Active,
+								roots: Box::new([]),
+								remote: false,
+								has_ui: false,
+								headless: true,
+								settings: serde_json::Map::new(),
+								secret_settings: Box::new([]),
+								data: None,
+								direct_filesystem: None,
+							},
+							policy:    CallbackConcurrency::Serialized,
+							deadline:  EventDeadline { at: Instant::now() + Duration::from_secs(5) },
+						})
+						.await;
+					if let Err(error) = result {
+						tracing::warn!(
+							extension = %identity.extension,
+							subscription = %qualified_name,
+							%error,
+							"extension telemetry delivery failed"
+						);
+					}
+				}
+			}));
+		}
+	}
+	tasks
+}
 
 use std::mem;
 
@@ -55,10 +307,11 @@ use tokio::io;
 
 use crate::{
 	bridges::{AgentGoalBinding, AgentGoalControl, InferenceBridge, builtin_with_content},
-	chat::{self},
+	chat::{self, ChatProviderControlBackend},
 	discovery,
 	discovery::context,
 	memory::{ExtractionWorker, InferenceExtractionLane},
+	model_controls::{ProductionProviderApplicationOwner, ProviderControlAuthorityFactory},
 	modes::RegimeHandle,
 	prompt_prep::{PromptSnapshot, settings::PromptSettings},
 	registry::{
@@ -66,8 +319,12 @@ use crate::{
 		production_redemption_authority,
 	},
 	rulebook,
+	secrets::{
+		credential_control_grants, credential_secret_control_factory, session::SecretSessionSnapshot,
+	},
 	settings::Settings,
 	skills,
+	stats_api::telemetry_backend::TelemetryIndexQuery,
 };
 
 /// Inputs required to create one production headless session.
@@ -223,37 +480,41 @@ fn validate_extension_host_keys<'a>(
 /// Field order is deliberate: the Agent and its cloned Environment client are
 /// dropped before the project Environment authority.
 pub struct HeadlessSession {
-	session:             SessionHandle,
-	advisor_parent:      Arc<chat::ChatParentHost<InProcTurnClient>>,
-	advise_queue:        omp_agent::advisor::AdvisorAdviceQueue,
-	state:               AgentState,
-	control:             omp_agent::ControlSender,
-	env:                 omp_env::EnvClient,
-	regimes:             Arc<RegimeHandle>,
-	tree:                Arc<AgentTree>,
-	events:              Option<EventSubscription>,
-	lifecycle:           HeadlessLifecycleSink,
-	lifecycle_events:    Option<HeadlessLifecycleSubscription>,
-	approval_book:       Arc<ApprovalBook>,
-	approval_route:      ApprovalRoute,
-	approval_inbox:      Option<ApprovalInbox>,
-	finalizer:           HeadlessFinalizerHandle,
-	_goal_binding:       AgentGoalBinding,
-	session_id:          Str,
-	discovery_warnings:  Arc<[Str]>,
-	initial_items:       Vec<Item>,
-	_inference_registry: InferenceRegistry,
-	_catalog:            Arc<snapshot::Catalog>,
-	_edit_repair_task:   Option<tokio::task::JoinHandle<()>>,
-	_memory_extraction:  Option<ExtractionWorker>,
-	_ephemeral_sessions: Option<chat::EphemeralSessions>,
-	_tool_policy:        HeadlessToolPolicy,
-	_lsp_enabled:        bool,
-	_compaction_methods: omp_agent::CompactionMethodOrder,
-	_mid_turn_policy:    omp_agent::MidTurnCompactionPolicy,
-	_retry_policy:       omp_agent::RetryPolicy,
-	_forced_tool:        Mutex<Option<Str>>,
-	_environment:        omp_envd::ProjectEnvironment,
+	session:              SessionHandle,
+	advisor_parent:       Arc<chat::ChatParentHost<InProcTurnClient>>,
+	advise_queue:         omp_agent::advisor::AdvisorAdviceQueue,
+	state:                AgentState,
+	control:              omp_agent::ControlSender,
+	env:                  omp_env::EnvClient,
+	regimes:              Arc<RegimeHandle>,
+	tree:                 Arc<AgentTree>,
+	events:               Option<EventSubscription>,
+	lifecycle:            HeadlessLifecycleSink,
+	lifecycle_events:     Option<HeadlessLifecycleSubscription>,
+	approval_book:        Arc<ApprovalBook>,
+	approval_route:       ApprovalRoute,
+	approval_inbox:       Option<ApprovalInbox>,
+	finalizer:            HeadlessFinalizerHandle,
+	_goal_binding:        AgentGoalBinding,
+	session_id:           Str,
+	discovery_warnings:   Arc<[Str]>,
+	initial_items:        Vec<Item>,
+	_inference_registry:  InferenceRegistry,
+	_catalog:             Arc<snapshot::Catalog>,
+	_edit_repair_task:    Option<tokio::task::JoinHandle<()>>,
+	_telemetry_tasks:     Vec<tokio::task::JoinHandle<()>>,
+	_memory_extraction:   Option<ExtractionWorker>,
+	_ephemeral_sessions:  Option<chat::EphemeralSessions>,
+	_tool_policy:         HeadlessToolPolicy,
+	_lsp_enabled:         bool,
+	_compaction_methods:  omp_agent::CompactionMethodOrder,
+	_mid_turn_policy:     omp_agent::MidTurnCompactionPolicy,
+	_retry_policy:        omp_agent::RetryPolicy,
+	_forced_tool:         Mutex<Option<Str>>,
+	_external_control:    omp_envd::exthost::ExternalControlAuthorityBinding,
+	_journal_control:     omp_envd::AgentControlBinding,
+	_eval_parent_control: omp_envd::eval::ParentBindingLease,
+	_environment:         omp_envd::ProjectEnvironment,
 }
 
 impl HeadlessSession {
@@ -319,10 +580,9 @@ impl HeadlessSession {
 	) -> Result<Self, HeadlessError> {
 		let root = chat::canonical_project(&options.project).map_err(composition)?;
 		let home = env::var_os("HOME").map_or_else(|| root.clone(), PathBuf::from);
-		let catalog_owner = crate::registry::production_catalog(&data_dir).map_err(composition)?;
-		let catalog = catalog_owner.as_ref();
-		let model =
-			chat::resolve_model_selector(catalog, options.model.as_str()).map_err(composition)?;
+		let base_catalog_owner =
+			crate::registry::production_catalog(&data_dir).map_err(composition)?;
+		let base_catalog = base_catalog_owner.as_ref();
 		let mut settings_paths = SettingsPaths::discover(&data_dir, Some(&root));
 		settings_paths
 			.overlays
@@ -383,10 +643,6 @@ impl HeadlessSession {
 			&home,
 			&prompt_discovery_settings,
 		);
-		if !crate::discovery::roles::model_selector_allowed(catalog, &model_settings, model.as_str())
-		{
-			return Err(HeadlessError::MissingRoute(model));
-		}
 		let state_dir = omp_env::project_state::directory(&data_dir, &root).map_err(composition)?;
 		let mut ephemeral_sessions = None;
 		let sessions_dir = match (&policy.session, policy.sessions_dir.as_ref()) {
@@ -430,7 +686,7 @@ impl HeadlessSession {
 			advise_queue.clone(),
 			&prompt_discovery.content,
 		);
-		bridges.edit_model = Some(model.clone());
+		bridges.edit_model = Some(options.model.clone());
 		bridges.edit_repair = settings.tools.edit_auto_repair.then_some(edit_repair);
 		let environment = omp_envd::ProjectEnvironment::start_with_settings_snapshot(
 			&root,
@@ -444,6 +700,30 @@ impl HeadlessSession {
 		)
 		.await
 		.map_err(composition)?;
+		let evidences = environment.extension_registry_evidences();
+		let catalog_owner = Arc::new(
+			crate::model_controls::compose_runtime_provider_catalog(
+				base_catalog,
+				evidences
+					.iter()
+					.flat_map(|evidence| evidence.providers.iter()),
+			)
+			.map_err(composition)?,
+		);
+		let catalog = catalog_owner.as_ref();
+		let model =
+			chat::resolve_model_selector(catalog, options.model.as_str()).map_err(composition)?;
+		if !crate::discovery::roles::model_selector_allowed(catalog, &model_settings, model.as_str())
+		{
+			return Err(HeadlessError::MissingRoute(model));
+		}
+		let credential_provider = match (&options.credential_provider, options.api_key.as_ref()) {
+			(Some(provider), _) => Some(provider.clone()),
+			(None, Some(_)) => {
+				Some(chat::resolve_model_provider(catalog, model.as_str(), None).map_err(composition)?)
+			},
+			(None, None) => None,
+		};
 		prompt_head.bind_provider(environment.extension_prompt_provider());
 		let mut resource_roots =
 			Vec::with_capacity(1 + options.additional_roots.len() + extension_specs.len());
@@ -659,6 +939,7 @@ impl HeadlessSession {
 		});
 		let ProductionInference {
 			registry: inference_registry,
+			builtins: provider_builtins,
 			rpc: inference,
 			credential_authority,
 			mcp_authority,
@@ -670,11 +951,12 @@ impl HeadlessSession {
 			Arc::clone(&registry),
 			Some(&root),
 			InferenceSessionOverrides {
-				provider:                options.credential_provider,
+				provider:                credential_provider,
 				api_key:                 options.api_key,
 				prompt_cache_affinity:   options.prompt_cache_affinity,
 				usage_fetchers:          Some(environment.usage_fetchers()),
 				provider_response_hooks: Some(environment.provider_response_hooks()),
+				catalog:                 Some(Arc::clone(&catalog_owner)),
 				settings:                Some(Arc::clone(&settings_snapshot)),
 			},
 		)
@@ -683,7 +965,7 @@ impl HeadlessSession {
 		let _ = search.bind(inference.clone());
 		let _ = environment.github_credentials().bind(credential_authority);
 		environment
-			.bind_mcp_oauth(mcp_authority, mcp_oauth, auth_control)
+			.bind_mcp_oauth(mcp_authority, mcp_oauth, auth_control.clone())
 			.await
 			.map_err(composition)?;
 		let client = InProcTurnClient::new(inference)
@@ -734,9 +1016,43 @@ impl HeadlessSession {
 				settings.mnemopi.shutdown_timeout_ms,
 			)
 		});
+		let approval_book = Arc::new(ApprovalBook::new());
+		let control_root = sessions_dir.join(session.id.as_str()).join("control");
+		let host_backends =
+			EnvdHostOwnerBackends::production(&control_root, Arc::clone(&approval_book));
+		let secrets = SecretSessionSnapshot::build(
+			0,
+			&data_dir.join("secrets.toml"),
+			&root.join(".omp/secrets.toml"),
+			std::iter::empty(),
+		)
+		.map_err(composition)?;
+		let credential_factory = Arc::new(credential_secret_control_factory(
+			auth_control.clone(),
+			credential_control_grants(&extension_specs),
+			&secrets,
+		)) as Arc<dyn ControlAuthorityFactory>;
+		let telemetry_index = Arc::new(
+			TelemetryIndex::open(&state_dir.join("telemetry"), &state_dir.join("telemetry.sqlite3"))
+				.map_err(composition)?,
+		);
+		let telemetry_query = Arc::new(TelemetryIndexQuery::new(telemetry_index, session.id.clone()));
+		let telemetry_factory = telemetry_control_factory(telemetry_query);
+		let prompt_factory = prompt_control_factory(prompt_head.clone());
+		let provider_factory = provider_control_factory(
+			inference_registry.clone(),
+			provider_builtins,
+			BlobStore::open(&data_dir).map_err(composition)?,
+		);
 		let mut agent =
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
+		if settings.secrets.enabled {
+			agent.set_secret_obfuscator(secrets.transform_handle());
+		}
 		agent.set_hook_gate(environment.admission_gate());
+		if let Err(error) = agent.restore_session_state().await {
+			tracing::warn!(%error, "journal-derived session state was not restored");
+		}
 		let compaction_methods = settings.compaction.method_order();
 		let mid_turn_policy = omp_agent::MidTurnCompactionPolicy {
 			enabled: settings.compaction.enabled && settings.compaction.mid_turn_enabled,
@@ -770,6 +1086,7 @@ impl HeadlessSession {
 		agent
 			.events()
 			.set_session_generation(options.session_generation);
+		let telemetry_firehose = agent.firehose();
 		let control = agent.control();
 		agent
 			.recover_regimes(omp_agent::core_regime, now_ms())
@@ -824,6 +1141,36 @@ impl HeadlessSession {
 			agent.abort_handle(),
 			agent.events().clone(),
 		);
+		let regime_factory = chat::extension_regime_control_factory(
+			control.clone(),
+			environment.extension_regime_resolver(),
+		);
+		let external_control = environment.bind_external_control_authorities(
+			chat::AgentsControlAuthority::factory(Arc::clone(&advisor_parent)),
+			omp_envd::exthost::ExternalDomainControlFactories {
+				policy:            Some(host_backends.policy_factory),
+				parameters:        Some(host_backends.parameter_factory),
+				workers:           Some(host_backends.worker_factory),
+				direct_filesystem: Some(host_backends.direct_filesystem_factory),
+				credentials:       Some(credential_factory),
+				prompts:           Some(prompt_factory),
+				sessions:          None,
+				ui:                None,
+				telemetry:         Some(telemetry_factory),
+				jobs:              None,
+				provider:          Some(provider_factory),
+				regimes:           Some(regime_factory),
+				services:          None,
+			},
+		);
+		let telemetry_tasks =
+			bind_extension_telemetry(&environment, &telemetry_firehose, &session.id);
+		let journal_control = environment
+			.bind_agent_control(control.clone())
+			.map_err(composition)?;
+		let eval_parent_control = environment
+			.bind_eval_sdk_parent(advisor_parent.session_id(), advisor_parent.clone())
+			.map_err(composition)?;
 		let session_handle = blueprint
 			.launch(
 				SessionIdentity { id: session.id.clone(), journal_path, expected_revision: None },
@@ -834,7 +1181,6 @@ impl HeadlessSession {
 			.map_err(composition)?;
 		let events = session_handle.subscribe_lossless();
 		let (lifecycle, lifecycle_events) = HeadlessLifecycleSink::new(options.session_generation);
-		let approval_book = Arc::new(ApprovalBook::new());
 		let (approval_route, approval_inbox) =
 			ApprovalRoute::new(Arc::clone(&approval_book), Some(environment.admission_gate()));
 		advisor_parent.bind_spawn_approval_route(approval_route.clone());
@@ -863,6 +1209,7 @@ impl HeadlessSession {
 			_inference_registry: inference_registry,
 			_catalog: catalog_owner,
 			_edit_repair_task: edit_repair_task,
+			_telemetry_tasks: telemetry_tasks,
 			_memory_extraction: memory_extraction,
 			_ephemeral_sessions: ephemeral_sessions,
 			_tool_policy: policy.tools,
@@ -871,6 +1218,9 @@ impl HeadlessSession {
 			_mid_turn_policy: mid_turn_policy,
 			_retry_policy: retry_policy,
 			_forced_tool: Mutex::new(None),
+			_external_control: external_control,
+			_journal_control: journal_control,
+			_eval_parent_control: eval_parent_control,
 			_environment: environment,
 		})
 	}
