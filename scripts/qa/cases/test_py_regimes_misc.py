@@ -133,9 +133,8 @@ class PyRegimesMiscSurface(unittest.TestCase):
 		self.assertIn("Sealed", report["sealed"])
 		self.assertEqual(3, len(report["diagnostics"]))
 
-	@unittest.expectedFailure
 	def test_prompt_invalidate_returns_generation(self) -> None:
-		"""Ledger: prompts.invalidate is not wired in a tool invocation."""
+		"""Prompt invalidation returns the resulting generation."""
 		result = _run_fixture("qainvalidate", call("hello"), "done", timeout=30)
 		self.assertFalse(result.timed_out, result.stderr)
 		self.assertEqual(0, result.exit_code, result.stderr)

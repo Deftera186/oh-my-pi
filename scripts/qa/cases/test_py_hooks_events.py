@@ -88,9 +88,8 @@ class PyHooksEvents(unittest.TestCase):
 		finally:
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_precheck_deny_blocks_tool_execution(self):
-		"""Ledger: hook-bearing extensions currently corrupt dispatch/result handling."""
+		"""A denying precheck hook blocks the tool before it executes."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-hooks-deny-"))
 		try:
 			with extension_fixture("hooks/precheck-deny") as directory:
@@ -109,7 +108,7 @@ class PyHooksEvents(unittest.TestCase):
 
 	@unittest.expectedFailure
 	def test_transform_modify_rewrites_tool_arguments(self):
-		"""Ledger: hook-bearing extensions currently corrupt dispatch/result handling."""
+		"""Ledger: transform-modify hooks do not produce the rewritten tool output."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-hooks-modify-"))
 		try:
 			with extension_fixture("hooks/transform-modify") as directory:

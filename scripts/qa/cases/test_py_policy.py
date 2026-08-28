@@ -144,9 +144,8 @@ class PyPolicy(unittest.TestCase):
 		self.assertEqual(encoded["decision"]["source"], "extension")
 		self.assertTrue(encoded["decision"]["approved"])
 
-	@unittest.expectedFailure
 	def test_parse_exposes_simple_commands_argv_structure_and_exact_segments(self):
-		"""Ledger: policy.parse has no CONTROL binding inside a hard-tool worker."""
+		"""Policy parsing exposes command arguments, pipelines, and exact segments."""
 		with extension_fixture("policy/parse-shell") as directory:
 			result = drive(
 				call("hello", script="echo one && printf '%s' two | cat"),
@@ -164,7 +163,7 @@ class PyPolicy(unittest.TestCase):
 
 	@unittest.expectedFailure
 	def test_precheck_policy_denies_a_matching_shell_invocation(self):
-		"""Ledger: hook-bearing extensions currently corrupt dispatch/result handling."""
+		"""Ledger: policy precheck denial does not surface its rule identifier to the model."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-policy-deny-"))
 		try:
 			with extension_fixture("policy/precheck-deny") as directory:
@@ -187,7 +186,7 @@ class PyPolicy(unittest.TestCase):
 
 	@unittest.expectedFailure
 	def test_approval_requirement_denies_when_no_approver_is_reachable(self):
-		"""Ledger: hook-bearing extensions currently corrupt dispatch/result handling."""
+		"""Ledger: approval denial does not surface its rule identifier to the model."""
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-policy-approval-"))
 		try:
 			with extension_fixture("policy/approval-required") as directory:

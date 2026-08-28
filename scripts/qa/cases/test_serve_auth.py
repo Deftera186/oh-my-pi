@@ -197,9 +197,8 @@ else:
 				self.assertEqual(by_id[aws.id].kind, auth_pb2.CredentialMeta.KIND_AWS)
 				self.assertEqual(by_id[oauth.id].kind, auth_pb2.CredentialMeta.KIND_OAUTH)
 
-		@unittest.expectedFailure
 		def test_import_oauth_rejects_missing_required_material(self):
-			"""Ledger: ImportOAuth accepts an empty provider and refresh token."""
+			"""ImportOAuth rejects requests missing required provider and token material."""
 			with auth_server() as server:
 				stub = auth_pb2_grpc.AuthStub(server.channel)
 				self.assert_rpc_code(
@@ -334,9 +333,8 @@ else:
 				)
 				self.assertIn("per-client usage accounting", client.details())
 
-		@unittest.expectedFailure
 		def test_watch_credentials_observes_mutation(self):
-			"""Ledger: WatchCredentials ends after reset instead of emitting store mutations."""
+			"""WatchCredentials streams credential store mutations after its initial reset."""
 			with auth_server() as server:
 				stub = auth_pb2_grpc.AuthStub(server.channel)
 				stream = stub.WatchCredentials(

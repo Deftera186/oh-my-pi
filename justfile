@@ -23,12 +23,17 @@ setup-python:
 
 # Format the whole repo in place: Rust (rustfmt) + Protobuf (buf).
 [group('format & lint')]
-fmt: fmt-rust proto-fmt
+fmt: fmt-rust fmt-streams proto-fmt
 
 # Format every Rust source in place (hard tabs, see rustfmt.toml).
 [group('format & lint')]
 fmt-rust:
     cargo fmt --all
+
+# Reindent stream!/try_stream! macro bodies that rustfmt cannot parse (yield).
+[group('format & lint')]
+fmt-streams *paths='crates':
+    python3 scripts/fmt-stream.py {{ paths }}
 
 # Check the whole repo's formatting without writing (CI gate).
 [group('format & lint')]

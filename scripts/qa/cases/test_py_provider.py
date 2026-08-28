@@ -199,9 +199,8 @@ class ProviderApi(unittest.TestCase):
 		finally:
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_models_control_io_returns_resolved_cards(self):
-		"""Ledger: omp.provider.models CONTROL dispatch is not wired in extension tools."""
+		"""Provider model control dispatch returns the resolved model cards."""
 		with extension_fixture("provider/control") as directory:
 			result = drive(
 				call("hello", operation="models"),
@@ -213,9 +212,8 @@ class ProviderApi(unittest.TestCase):
 		self.assertEqual(result.exit_code, 0, result.stderr)
 		self.assertIsInstance(_tool_result_json(result)["cards"], int)
 
-	@unittest.expectedFailure
 	def test_intent_contributions_reach_control_host(self):
-		"""Ledger: omp.provider.intents CONTROL effect dispatch is not wired."""
+		"""Provider intent contributions reach the control host."""
 		with extension_fixture("provider/control") as directory:
 			result = drive(
 				call("hello", operation="intents"),
@@ -227,9 +225,8 @@ class ProviderApi(unittest.TestCase):
 		self.assertEqual(result.exit_code, 0, result.stderr)
 		self.assertEqual(_tool_result_json(result)["intent"], "service_tier")
 
-	@unittest.expectedFailure
 	def test_dynamic_provider_model_is_listed_with_plugin_dir(self):
-		"""Ledger: models rejects extension launch controls before provider activation."""
+		"""Models activates plugin providers before listing their declared models."""
 		data_dir = Path(tempfile.mkdtemp(prefix="omp-qa-provider-data-"))
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-provider-proj-"))
 		try:
@@ -259,9 +256,8 @@ class ProviderApi(unittest.TestCase):
 			shutil.rmtree(data_dir, ignore_errors=True)
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_dynamic_provider_routes_inference_to_declared_endpoint(self):
-		"""Ledger: provider declarations are not admitted before model selection."""
+		"""Provider declarations are admitted before inference model selection."""
 		data_dir = Path(tempfile.mkdtemp(prefix="omp-qa-provider-data-"))
 		project = Path(tempfile.mkdtemp(prefix="omp-qa-provider-proj-"))
 		try:

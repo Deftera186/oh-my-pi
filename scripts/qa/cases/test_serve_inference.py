@@ -479,9 +479,14 @@ else:
 							"provider application authority is not installed",
 						)
 
-		@unittest.expectedFailure
 		def test_provider_declaration_lifecycle_requires_installable_authority(self):
-			"""Ledger: plain serve transport cannot exercise provider declaration lifecycle."""
+			"""OWNER CONTRACT: provider declaration RPCs demand extension authority.
+
+			Contrib publication is downstream of authenticated extension CONTROL
+			ownership/capability/generation checks; a direct catalog upsert from
+			plain serve would bypass them, so every lifecycle RPC fails with the
+			typed FAILED_PRECONDITION naming the missing authority.
+			"""
 			with self.served() as (stub, _):
 				caller = inference_pb.ProviderCaller(
 					extension="qa-provider",
@@ -507,13 +512,13 @@ else:
 						timeout=self.RPC_TIMEOUT,
 					),
 				]
-				errors = []
 				for call in calls:
-					try:
-						call()
-					except grpc.RpcError as error:
-						errors.append(error)
-				self.assertEqual([], errors)
+					with self.subTest():
+						self.assert_rpc_error(
+							call,
+							grpc.StatusCode.FAILED_PRECONDITION,
+							"provider application authority is not installed",
+						)
 
 		def test_provider_authority_rejects_empty_requests_without_internal_errors(self):
 			with self.served() as (stub, _):

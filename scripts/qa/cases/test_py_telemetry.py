@@ -131,9 +131,8 @@ class PyTelemetry(unittest.TestCase):
 		finally:
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_subscription_admits_and_delivers_model_request(self):
-		"""Ledger: telemetry subscription admits but matching event delivery never reaches Python."""
+		"""An admitted telemetry subscription delivers matching model request events."""
 		project, result = _drive_extension("subscription")
 		try:
 			self.assertFalse(result.timed_out, result.stderr)
@@ -148,9 +147,8 @@ class PyTelemetry(unittest.TestCase):
 		finally:
 			shutil.rmtree(project, ignore_errors=True)
 
-	@unittest.expectedFailure
 	def test_rev_metrics_is_callable_from_tool(self):
-		"""Ledger: telemetry rev_metrics CONTROL operation is not handled by the current core."""
+		"""Telemetry revision metrics are callable from an extension tool."""
 		project, result = _drive_extension("rev-metrics")
 		try:
 			self.assertFalse(result.timed_out, result.stderr)
