@@ -2631,9 +2631,6 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			agent.abort_handle(),
 			agent.events().clone(),
 		);
-		if let Err(error) = agent.restore_session_state().await {
-			tracing::warn!(%error, "journal-derived session state was not restored");
-		}
 		agent.set_unexpected_stop_classifier(parent.clone());
 		if auto_thinking_selected {
 			agent.set_difficulty_classifier(parent.clone());
@@ -2644,6 +2641,12 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			.map_err(|source| SettingsManagerError::Projection { source })?
 			.get()
 			.clone();
+		if runtime_settings.tools.enabled("todo") {
+			agent.add_stateful_component(Arc::new(omp_agent::TodoRestore));
+		}
+		if let Err(error) = agent.restore_session_state().await {
+			tracing::warn!(%error, "journal-derived session state was not restored");
+		}
 		agent.configure_streaming_edit_guard(
 			scope.root.to_path_buf(),
 			runtime_settings.tools.edit_streaming_abort,

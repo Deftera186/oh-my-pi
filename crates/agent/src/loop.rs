@@ -91,7 +91,7 @@ use crate::{
 	state::{
 		AgentState, ContextPromotionPolicy, MidTurnCompactionPolicy, SteeringMode, UnexpectedStopMode,
 	},
-	todo_restore::latest_todo_phases,
+	stateful::StatefulComponent,
 	turn::Error as TurnError,
 };
 
@@ -942,6 +942,7 @@ pub struct Agent<C: TurnClient> {
 	waits: WaitSet,
 	pending_rewinds: VecDeque<ScheduledRewind>,
 	pending_history_rewrite: Option<PendingHistoryRewrite>,
+	stateful_components: Vec<Arc<dyn StatefulComponent>>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
 	jobs_restored: bool,
@@ -1057,6 +1058,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			waits: WaitSet::default(),
 			pending_rewinds: VecDeque::new(),
 			pending_history_rewrite: None,
+			stateful_components: Vec::new(),
 			mailbox,
 			jobs,
 			jobs_restored: false,
@@ -2014,8 +2016,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let Some(PendingHistoryRewrite { to, cause }) = self.pending_history_rewrite else {
 			return Ok(());
 		};
-		let phases = latest_todo_phases(&self.journal)?;
-		self.restore_todo_slot(phases).await;
+		for component in &self.stateful_components {
+			component.restore(&self.journal, &self.env).await;
+		}
 		if !self.jobs_restored {
 			for job in self.journal.pending_jobs() {
 				self.jobs.register(job.clone());
@@ -2082,67 +2085,24 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	/// Seeds resumed sessions with journal-derived environment state.
 	///
-	/// Todo restore only: `session_start{resumed}` already notifies
+	/// Stateful components only: `session_start{resumed}` already notifies
 	/// extensions, and job watchers lazily re-register on the next submit.
 	pub async fn restore_session_state(&mut self) -> Result<(), AgentError> {
-		let phases = latest_todo_phases(&self.journal)?;
-		self.restore_todo_slot(phases).await;
+		for component in &self.stateful_components {
+			component.restore(&self.journal, &self.env).await;
+		}
 		Ok(())
+	}
+
+	/// Registers one journal-derived environment-state component re-seeded
+	/// after history rewrites and on session resume.
+	pub fn add_stateful_component(&mut self, component: Arc<dyn StatefulComponent>) {
+		self.stateful_components.push(component);
 	}
 
 	/// Journals the durable snapshot of a user-driven todo edit.
 	pub fn append_todo_edit(&mut self, phases: &RawValue) -> Result<u64, AgentError> {
 		Ok(self.journal.todo_edit(now_ms(), phases)?)
-	}
-
-	/// Drives one best-effort `todo@1` init restoring the journal-derived
-	/// snapshot; an absent snapshot clears the slot.
-	async fn restore_todo_slot(&self, phases: Option<serde_json::Value>) {
-		let list = phases.unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-		let Ok(args) = serde_json::to_vec(&serde_json::json!({"op": "init", "list": list})) else {
-			return;
-		};
-		let invocation_id = sf!("todo-restore-{}", omp_core::Ulid::generate());
-		let Ok(mut invocation) = self
-			.env
-			.invoke(InvokeTool {
-				invocation_id: invocation_id.to_string(),
-				name: "todo".to_owned(),
-				rev: "1".to_owned(),
-				..Default::default()
-			})
-			.await
-		else {
-			tracing::warn!("todo restore invocation was not accepted by the environment");
-			return;
-		};
-		if !matches!(invocation.next_event().await, Ok(Some(InvocationEvent::Accepted(_)))) {
-			tracing::warn!("todo restore invocation was not accepted by the environment");
-			return;
-		}
-		if invocation
-			.commit_args(Bytes::from(args), Bytes::from_static(b"todo-restore"), now_ms(), None)
-			.await
-			.is_err()
-		{
-			tracing::warn!("todo restore argument commit failed");
-			return;
-		}
-		loop {
-			match invocation.next_event().await {
-				Ok(Some(InvocationEvent::Verdict(verdict))) => {
-					if verdict.is_error {
-						tracing::warn!("todo restore invocation returned an error verdict");
-					}
-					return;
-				},
-				Ok(Some(_)) => {},
-				_ => {
-					tracing::warn!("todo restore invocation ended without a verdict");
-					return;
-				},
-			}
-		}
 	}
 
 	/// Lists live user messages from oldest to newest for rewind selection.
@@ -8091,6 +8051,261 @@ mod tests {
 		let cleared = agent.rewind(None).expect("rewind to root");
 		assert!(cleared.is_empty());
 		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	fn loop_job(id: &str) -> omp_tool::JobRef {
+		omp_tool::JobRef {
+			id:       Str::new(id),
+			owner:    omp_tool::JobOwner::AgentLoop { agent_id: sf!("child-agent") },
+			metadata: Arc::default(),
+			artifact: omp_tool::ExpectedArtifact {
+				description: sf!("artifact"),
+				media_type:  None,
+				lifetime:    omp_tool::ArtifactLifetime::Session,
+			},
+		}
+	}
+
+	/// Serves the slot-invocation protocol the way envd's device host would:
+	/// acknowledge InvokeTool, require committed-argument admission, and answer
+	/// a terminal ok verdict.
+	fn serve_slot_invocations(
+		transport: omp_env::InProcessEnvTransport,
+	) -> (Arc<Mutex<Vec<(String, serde_json::Value)>>>, tokio::task::JoinHandle<()>) {
+		use omp_env::frame::{self, client_frame, server_frame};
+
+		let (requests, responses) = transport.into_parts();
+		let commits = Arc::new(Mutex::new(Vec::new()));
+		let record = Arc::clone(&commits);
+		let server = tokio::spawn(async move {
+			let mut invocations: BTreeMap<String, (u64, String)> = BTreeMap::new();
+			let mut pending_commits = BTreeMap::new();
+			while let Ok(env_frame) = requests.recv_async().await {
+				match env_frame.body {
+					Some(client_frame::Body::InvokeTool(invoke)) => {
+						let _ = responses
+							.send_async(frame::ServerFrame {
+								request_id: env_frame.request_id,
+								body: Some(server_frame::Body::InvocationAccepted(frame::InvokeAccepted {
+									invocation_id: invoke.invocation_id.clone(),
+									..Default::default()
+								})),
+								..Default::default()
+							})
+							.await;
+						invocations
+							.insert(invoke.invocation_id.clone(), (env_frame.request_id, invoke.name));
+					},
+					Some(client_frame::Body::ArgsCommitted(committed)) => {
+						let Some((request_id, _)) = invocations.get(&committed.invocation_id).cloned()
+						else {
+							continue;
+						};
+						let invocation_id = committed.invocation_id.clone();
+						pending_commits.insert(invocation_id.clone(), committed);
+						let _ = responses
+							.send_async(frame::ServerFrame {
+								request_id,
+								body: Some(server_frame::Body::AdmitInvocation(frame::AdmitInvocation {
+									invocation_id,
+									..Default::default()
+								})),
+								..Default::default()
+							})
+							.await;
+					},
+					Some(client_frame::Body::Admission(admission)) => {
+						assert!(admission.allow, "todo restore admission must be allowed");
+						let committed = pending_commits
+							.remove(&admission.invocation_id)
+							.expect("admission follows committed args");
+						let (request_id, name) = invocations
+							.get(&admission.invocation_id)
+							.cloned()
+							.expect("admission names an open invocation");
+						record.lock().push((
+							name,
+							serde_json::from_slice(&committed.raw).expect("committed args decode"),
+						));
+						let _ = responses
+							.send_async(frame::ServerFrame {
+								request_id,
+								body: Some(server_frame::Body::Verdict(frame::Verdict {
+									invocation_id: committed.invocation_id,
+									json: Bytes::from_static(
+										br#"{"kind":"ok","value":{"phases":[],"rendered":""}}"#,
+									),
+									..Default::default()
+								})),
+								..Default::default()
+							})
+							.await;
+					},
+					_ => {},
+				}
+			}
+		});
+		(commits, server)
+	}
+	async fn reconcile_with_timeout(agent: &mut Agent<ScriptedClient>) {
+		tokio::time::timeout(std::time::Duration::from_secs(1), agent.reconcile_history_rewrite())
+			.await
+			.expect("todo restore answered admission before the startup deadline")
+			.expect("reconcile history rewrite");
+	}
+
+	fn history_rewritten_events(
+		events: &crate::events::EventSubscription,
+	) -> Vec<(Option<u64>, u64, Vec<Str>)> {
+		let mut seen = Vec::new();
+		while let Ok(event) = events.try_recv() {
+			if let AgentEvent::HistoryRewritten { to, head, escalate_jobs } = event.as_ref() {
+				seen.push((*to, *head, escalate_jobs.clone()));
+			}
+		}
+		seen
+	}
+
+	fn journal_has_rewind_warning(journal: &Journal) -> bool {
+		let log = journal.load().expect("load journal");
+		(0..u64::try_from(log.len()).expect("indexes fit"))
+			.filter_map(|index| match log.get(index) {
+				Some(Entry::Ok(event)) => match &event.kind {
+					Kind::Item(record) => Some(record.item.clone()),
+					_ => None,
+				},
+				_ => None,
+			})
+			.any(|item| {
+				matches!(
+					item.kind.as_ref(),
+					Some(item::Kind::Message(message)) if message.parts.iter().any(|part| {
+						matches!(
+							part.kind.as_ref(),
+							Some(part::Kind::Text(text)) if text.contains("Rewind left")
+						)
+					})
+				)
+			})
+	}
+
+	#[tokio::test]
+	async fn user_rewind_reconciles_todo_state_and_cancels_dropped_jobs() {
+		use crate::todo_restore::test_support::todo_outcome_item;
+
+		let (mut journal, path) = test_journal("reconcile-user");
+		let phases_one = serde_json::json!([
+			{"phase": "Build", "items": [{"text": "port", "status": "pending"}]}
+		]);
+		let phases_two = serde_json::json!([
+			{"phase": "Build", "items": [{"text": "port", "status": "completed"}]}
+		]);
+		journal
+			.append_optimistic(1, message(thread::Role::User, "turn one"), None)
+			.expect("first user turn");
+		let keep = journal
+			.append_optimistic(2, todo_outcome_item(&phases_one), None)
+			.expect("first todo outcome");
+		journal
+			.append_optimistic(3, todo_outcome_item(&phases_two), None)
+			.expect("second todo outcome");
+		journal
+			.register_job(4, loop_job("dropped-job"))
+			.expect("register dropped job");
+
+		let (env, transport) = EnvClient::in_process(1);
+		let (commits, server) = serve_slot_invocations(transport);
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		agent.add_stateful_component(Arc::new(crate::TodoRestore));
+		let events = agent.events().subscribe_lossless();
+
+		agent.rewind(Some(keep)).expect("rewind to first outcome");
+		reconcile_with_timeout(&mut agent).await;
+		{
+			let commits = commits.lock();
+			assert_eq!(commits.len(), 1);
+			assert_eq!(commits[0].0, "todo");
+			assert_eq!(commits[0].1, serde_json::json!({"op": "init", "list": phases_one}));
+		}
+		let rewrites = history_rewritten_events(&events);
+		assert_eq!(rewrites.len(), 1);
+		let (to, head, escalated) = &rewrites[0];
+		assert_eq!(*to, Some(keep));
+		let expected_head =
+			u64::try_from(agent.journal().load().expect("load").len()).expect("head fits") - 1;
+		assert_eq!(*head, expected_head);
+		assert_eq!(escalated.as_slice(), [Str::new("dropped-job")]);
+		assert!(
+			!journal_has_rewind_warning(agent.journal()),
+			"every pending job was cancelled, so no background warning is appended"
+		);
+
+		// A second rewrite to the root clears the slot.
+		agent.rewind(None).expect("rewind to root");
+		reconcile_with_timeout(&mut agent).await;
+		{
+			let commits = commits.lock();
+			assert_eq!(commits.len(), 2);
+			assert_eq!(
+				commits[1].1,
+				serde_json::json!({"op": "init", "list": serde_json::Value::Array(Vec::new())})
+			);
+		}
+		drop(agent);
+		server.abort();
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
+	async fn checkpoint_rewind_keeps_jobs_and_appends_the_background_warning() {
+		use crate::todo_restore::test_support::todo_outcome_item;
+
+		let (mut journal, path) = test_journal("reconcile-checkpoint");
+		let phases = serde_json::json!([
+			{"phase": "Explore", "items": [{"text": "scout", "status": "pending"}]}
+		]);
+		let keep = journal
+			.append_optimistic(1, todo_outcome_item(&phases), None)
+			.expect("todo outcome");
+		journal
+			.append_optimistic(2, message(thread::Role::User, "explore"), None)
+			.expect("user turn");
+		journal
+			.register_job(3, loop_job("scout-job"))
+			.expect("register scout job");
+
+		let (env, transport) = EnvClient::in_process(1);
+		let (commits, server) = serve_slot_invocations(transport);
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		agent.add_stateful_component(Arc::new(crate::TodoRestore));
+		let events = agent.events().subscribe_lossless();
+
+		agent.rewind(Some(keep)).expect("rewind");
+		agent.pending_history_rewrite =
+			Some(PendingHistoryRewrite { to: Some(keep), cause: HistoryRewriteCause::Checkpoint });
+		reconcile_with_timeout(&mut agent).await;
+
+		assert_eq!(commits.lock().len(), 1, "todo restore still runs for checkpoint rewinds");
+		let rewrites = history_rewritten_events(&events);
+		assert_eq!(rewrites.len(), 1);
+		assert!(rewrites[0].2.is_empty(), "checkpoint rewinds cancel nothing");
+		assert!(
+			journal_has_rewind_warning(agent.journal()),
+			"surviving jobs are announced with the background warning"
+		);
+		drop(agent);
+		server.abort();
 		fs::remove_file(path).expect("remove journal");
 	}
 

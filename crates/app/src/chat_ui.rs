@@ -5225,10 +5225,10 @@ where
 					}
 				},
 				WorkspaceRequest::Add(_) => {
-					return Err(commands::workspace::mutation_unavailable("add-dir"));
+					return Err(commands::workspace::mutation_unavailable("dir add"));
 				},
 				WorkspaceRequest::Remove(_) => {
-					return Err(commands::workspace::mutation_unavailable("remove-dir"));
+					return Err(commands::workspace::mutation_unavailable("dir remove"));
 				},
 			};
 			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
@@ -5534,11 +5534,21 @@ where
 fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
 	let document =
 		toml::Value::try_from(settings).unwrap_or_else(|_| toml::Value::Table(toml::Table::new()));
-	omp_settings::registered_domains()
+	let mut domains = omp_settings::registered_domains();
+	domains.sort_by_key(|domain| {
+		omp_settings::manager::EDITOR_PANELS
+			.iter()
+			.position(|panel| *panel == omp_settings::manager::panel_for_domain(domain.name))
+			.unwrap_or(omp_settings::manager::EDITOR_PANELS.len())
+	});
+	domains
 		.into_iter()
 		.flat_map(|domain| {
 			let document = &document;
-			domain.fields.iter().map(move |field| {
+			let panel = omp_settings::manager::panel_for_domain(domain.name);
+			let mut fields = domain.fields.to_vec();
+			fields.sort_unstable_by_key(|field| (field.order, field.path));
+			fields.into_iter().map(move |field| {
 				let kind: &'static str = field.kind.into();
 				let value = (!field.secret)
 					.then(|| toml_value_at(document, field.path))
@@ -5555,7 +5565,7 @@ fn setting_rows(settings: &Settings) -> Vec<omp_chat_ui::SettingRow> {
 						.is_some_and(|value| toml_setting_value(value).as_str() == condition.equals)
 				});
 				omp_chat_ui::SettingRow {
-					panel: sf!("interaction"),
+					panel: sf!(panel),
 					domain: sf!(domain.name),
 					path: sf!(field.path),
 					label: sf!(field.label),

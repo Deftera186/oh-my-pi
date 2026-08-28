@@ -55,8 +55,8 @@ pub(crate) fn render(roots: &WorkspaceRoots, current: &Path) -> Str {
 /// Reports the absent Environment mutation authority precisely.
 pub(crate) fn mutation_unavailable(command: &str) -> miette::Report {
 	let rpc = match command {
-		"add-dir" => "AddWorkspaceRoot",
-		"remove-dir" => "RemoveWorkspaceRoot",
+		"dir add" => "AddWorkspaceRoot",
+		"dir remove" => "RemoveWorkspaceRoot",
 		_ => "MutateWorkspaceRoots",
 	};
 	miette::miette!(

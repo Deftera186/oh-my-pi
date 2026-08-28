@@ -59,6 +59,18 @@ async fn main() -> ExitCode {
 	install_panic_hook();
 	if env::args_os()
 		.nth(1)
+		.is_some_and(|arg| arg == omp_sandbox::HIDDEN_CHILD_ARG)
+	{
+		return match omp_sandbox::run_child_entry() {
+			Ok(()) => ExitCode::SUCCESS,
+			Err(error) => {
+				eprintln!("omp sandbox child: {error}");
+				ExitCode::FAILURE
+			},
+		};
+	}
+	if env::args_os()
+		.nth(1)
 		.is_some_and(|arg| arg == omp_envd::EVAL_CHILD_ARG)
 	{
 		return match omp_envd::run_eval_child_entry().await {

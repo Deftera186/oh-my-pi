@@ -21,9 +21,7 @@ command!(jobs, 81, "jobs", icon: Job, [], "List active background jobs", [Execut
 command!(agents, 82, "agents", icon: Agents, [], "Open the live agent hierarchy", [Execution], false, none => |host| host.agents());
 command!(pause, 83, "pause", icon: Pause, [], "Pause the interactive session", [Execution], false, none => |host| host.pause());
 command!(move_root, 90, "move", icon: FolderMove, [], "Set the primary workspace root for the next resume", [Workspace, Owner], false, required("<directory>") => |host, root| host.workspace(WorkspaceRequest::Move(root)));
-command!(add_dir, 100, "add-dir", icon: FolderPlus, [], "Add a directory to this session's workspace roots", [Workspace, Owner], false, required("<directory>") => |host, root| host.workspace(WorkspaceRequest::Add(root)));
-command!(remove_dir, 110, "remove-dir", icon: FolderMinus, [], "Remove a directory from this session's workspace roots", [Workspace, Owner], false, required("<directory>") => |host, root| host.workspace(WorkspaceRequest::Remove(root)));
-command!(dirs, 120, "dirs", icon: Folder, [], "List this session's effective workspace roots", [Workspace], true, none => |host| host.workspace(WorkspaceRequest::List));
+command!(dir, 100, "dir", icon: Folder, [], "List or mutate this session's workspace roots", [Workspace, Owner], false, typed("[add|remove <directory>|list]", [("add", "Add a workspace root"), ("remove", "Remove a workspace root"), ("list", "List effective workspace roots")], parse_dir) => |host, request| host.workspace(request));
 
 command!(handoff, 121, "handoff", icon: Handoff, [], "Summarize the session into a handoff document and compact in place", [Session, Execution], false, optional("[focus instructions]") => |host, instructions| host.handoff(instructions));
 command!(branch, 122, "branch", icon: Branch, [], "Create a new branch from a checkpoint", [Session, Execution], false, typed("[checkpoint]", [], parse_branch) => |host, request| host.branch(request));
@@ -46,6 +44,17 @@ fn parse_session(args: &str) -> miette::Result<SessionRequest> {
 		(Some("pin"), None, None) => Ok(SessionRequest::Pin(None)),
 		(Some("pin"), Some(session), None) => Ok(SessionRequest::Pin(Some(Str::new(session)))),
 		_ => Err(miette::miette!("usage: /session info|delete|pin [session id]")),
+	}
+}
+fn parse_dir(args: &str) -> miette::Result<WorkspaceRequest> {
+	let args = args.trim();
+	let (op, directory) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+	let directory = directory.trim();
+	match (op, directory.is_empty()) {
+		("" | "list", true) => Ok(WorkspaceRequest::List),
+		("add", false) => Ok(WorkspaceRequest::Add(Str::new(directory))),
+		("remove", false) => Ok(WorkspaceRequest::Remove(Str::new(directory))),
+		_ => Err(miette::miette!("usage: /dir [list] or /dir add|remove <directory>")),
 	}
 }
 /// Provider facts resolved from the catalog for the active model.

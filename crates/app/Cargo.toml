@@ -82,6 +82,7 @@ omp-serve.workspace = true
 omp-proto = { workspace = true, features = ["tonic"] }
 omp-py.workspace = true
 omp-rpc.workspace = true
+omp-sandbox.workspace = true
 omp-sdk.workspace = true
 omp-scribe.workspace = true
 omp-settings.workspace = true

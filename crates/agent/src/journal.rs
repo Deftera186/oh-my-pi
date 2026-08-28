@@ -5113,6 +5113,48 @@ mod tests {
 		fs::remove_file(path).expect("remove journal");
 	}
 	#[test]
+	fn todo_edit_appends_a_live_core_entry_and_jobs_expose_registration_indexes() {
+		let path = path("todo-edit");
+		let mut journal = Journal::create(&path, &header()).expect("create journal");
+		let phases = serde_json::json!([{"phase": "Build", "items": []}]);
+		let raw = serde_json::value::to_raw_value(&phases).expect("raw phases");
+		let edit_index = journal.todo_edit(2, &raw).expect("append todo edit");
+		{
+			let log = journal.load().expect("load journal");
+			let live = log.as_ref();
+			let entries: Vec<_> = log.custom(live, TODO_EDIT_KIND).collect();
+			assert_eq!(entries.len(), 1);
+			assert_eq!(entries[0].0, edit_index);
+			let Kind::Custom(custom) = &entries[0].1.kind else {
+				panic!("todo edit is a custom entry");
+			};
+			let data: serde_json::Value =
+				serde_json::from_str(custom.data().expect("edit data").get()).expect("edit json");
+			assert_eq!(data["phases"], phases);
+		}
+		let job = JobRef {
+			id:       sf!("job-a"),
+			owner:    JobOwner::NamedProcess { name: sf!("job-a"), generation: 1 },
+			metadata: Arc::default(),
+			artifact: ExpectedArtifact {
+				description: sf!("artifact"),
+				media_type:  None,
+				lifetime:    ArtifactLifetime::Session,
+			},
+		};
+		let registered = journal.register_job(3, job).expect("register job");
+		assert_eq!(
+			journal
+				.pending_jobs_with_events()
+				.map(|(index, job)| (index, job.id.clone()))
+				.collect::<Vec<_>>(),
+			vec![(registered, sf!("job-a"))]
+		);
+		drop(journal);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[test]
 	fn repeated_append_projection_cycles_keep_the_complete_live_prefix() {
 		let path = path("incremental-project");
 		let mut journal = Journal::create(&path, &header()).expect("create journal");

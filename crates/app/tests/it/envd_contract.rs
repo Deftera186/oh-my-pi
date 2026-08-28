@@ -814,6 +814,48 @@ fn eval_output(payload: &eval::Payload, channel: OutputChannel) -> Vec<u8> {
 		.flat_map(|frame| frame.data.as_ref().iter().copied())
 		.collect()
 }
+#[tokio::test]
+async fn todo_restore_answers_its_own_admission_query() {
+	use omp_agent::{StatefulComponent as _, TodoRestore};
+	use omp_storage::transcript::{Header, SessionId};
+
+	let harness = Harness::start(Registry::new()).await;
+	// Production chat restores over a connection with no client-wide admitter,
+	// so the component must answer the environment's admission query itself.
+	// An unanswered query parks the gate until its deadline (300 s) and stalls
+	// host startup behind it.
+	let (client, transport) = EnvClient::in_process(64);
+	let host = Arc::clone(&harness.server);
+	let server_task = tokio::spawn(async move { host.serve_in_process(transport).await });
+	client
+		.hello(ClientHello {
+			client: "todo-restore-contract".into(),
+			schema_rev: SCHEMA_REV,
+			..ClientHello::default()
+		})
+		.await
+		.expect("environment hello");
+	let journal_path = harness.state.path().join("todo-restore.jsonl");
+	let journal = omp_agent::Journal::create(&journal_path, &Header {
+		v:       4,
+		id:      SessionId(Str::new("todo-restore")),
+		created: 1,
+		cwd:     harness.root.path().to_path_buf(),
+	})
+	.expect("create restore journal");
+	let client = client
+		.with_principal("test-session", "todo-restore-agent")
+		.expect("restore principal");
+	time::timeout(Duration::from_secs(30), TodoRestore.restore(&journal, &client))
+		.await
+		.expect("todo restore must answer its admission query, not stall to the gate deadline");
+	// The restore drove a real init: a follow-up view succeeds against the slot.
+	let verdict =
+		invoke_builtin(harness.client(), "todo-restore-view", "todo", "1", json!({"op": "view"}))
+			.await;
+	ok_builtin_payload(verdict, "todo view");
+	server_task.abort();
+}
 
 #[tokio::test]
 async fn write_name_is_reserved_before_production_registry_assembly() {

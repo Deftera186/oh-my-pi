@@ -244,20 +244,8 @@ impl SettingsManager {
 
 	/// Builds a current, secret-safe editor model from typed descriptors.
 	pub fn editor_panels(&self) -> Vec<SettingsEditorPanel> {
-		const IDS: &[&str] = &[
-			"appearance",
-			"model",
-			"interaction",
-			"context",
-			"files_shell",
-			"tools_tasks",
-			"orchestration",
-			"providers",
-			"extensions",
-			"lifecycle",
-		];
 		let snapshot = self.snapshot();
-		let mut panels = IDS
+		let mut panels = EDITOR_PANELS
 			.iter()
 			.map(|id| SettingsEditorPanel { id, fields: Vec::new() })
 			.collect::<Vec<_>>();
@@ -473,7 +461,22 @@ fn scalar_spelling(value: &toml::Value) -> String {
 	}
 }
 
-fn panel_for_domain(domain: &str) -> &'static str {
+/// Stable settings-overlay panel identifiers in display order.
+pub const EDITOR_PANELS: &[&str] = &[
+	"appearance",
+	"model",
+	"interaction",
+	"context",
+	"files_shell",
+	"tools_tasks",
+	"orchestration",
+	"providers",
+	"extensions",
+	"lifecycle",
+];
+
+/// Maps a registered settings domain to its stable editor panel id.
+pub fn panel_for_domain(domain: &str) -> &'static str {
 	match domain {
 		"tui" | "chat_ui" | "appearance" => "appearance",
 		"model" | "catalog" | "inference" => "model",

@@ -617,6 +617,12 @@ fn repair_schema_arguments(
 }
 
 fn apply_schema_repair(instance: &mut Value, issue: &SchemaViolation) -> bool {
+	// Charitable decoding: models routinely emit stray arguments; under a
+	// strict schema one unknown key would fail the whole call, so drop it and
+	// keep the invocation alive. Union-branch violations are exempt — there a
+	// "stray" member is evidence the model meant a different branch, and
+	// removal would corrupt that shape. Post-repair arguments are the
+	// journaled canonical document, so replay sees exactly what executed.
 	if issue.rule == "additionalProperties" {
 		return !issue.from_union_branch && remove_pointer(instance, issue.path.as_str());
 	}
@@ -713,29 +719,29 @@ fn pointer_mut<'a>(instance: &'a mut Value, path: &str) -> Option<&'a mut Value>
 		instance.pointer_mut(path)
 	}
 }
-
+/// Removes the member or element addressed by a JSON pointer; `true` only
+/// when something was actually removed.
 fn remove_pointer(instance: &mut Value, path: &str) -> bool {
-	let Some((parent, key)) = path.rsplit_once('/') else {
+	let Some((parent, leaf)) = path.rsplit_once('/') else {
 		return false;
 	};
-	let key = key.replace("~1", "/").replace("~0", "~");
-	let parent = if parent.is_empty() {
-		instance
-	} else if let Some(parent) = instance.pointer_mut(parent) {
-		parent
-	} else {
+	let parent = if parent.is_empty() { "/" } else { parent };
+	let Some(parent) = pointer_mut(instance, parent) else {
 		return false;
 	};
+	let leaf = leaf.replace("~1", "/").replace("~0", "~");
 	match parent {
-		Value::Object(object) => object.remove(&key).is_some(),
-		Value::Array(array) => key
-			.parse::<usize>()
-			.ok()
-			.filter(|index| *index < array.len())
-			.map(|index| {
-				array.remove(index);
-			})
-			.is_some(),
+		Value::Object(members) => members.shift_remove(leaf.as_str()).is_some(),
+		Value::Array(elements) => {
+			let Ok(index) = leaf.parse::<usize>() else {
+				return false;
+			};
+			if index >= elements.len() {
+				return false;
+			}
+			elements.remove(index);
+			true
+		},
 		_ => false,
 	}
 }
@@ -1863,6 +1869,45 @@ mod tests {
 			[.., ToolAssemblyEvent::Ready { call, .. }]
 				if call.arguments.as_value() == &json!({"query":"","extra":true})
 		));
+	}
+	#[test]
+	fn closed_schema_preserves_unknown_members_for_typed_rejection() {
+		let definitions = [definition()];
+		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		assembler.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
+			source_index: 9,
+			id:           None,
+			name:         Bytes::from_static(b"search"),
+		});
+		assembler.push(ToolFragment::ArgumentsDelta {
+			source_index: 9,
+			bytes:        Bytes::from_static(br#"{"query":"rust","extra":true}"#),
+		});
+		let output = assembler.push(ToolFragment::End { source_index: 9 });
+		assert!(matches!(
+			output.as_slice(),
+			[.., ToolAssemblyEvent::Ready { call, .. }]
+				if call.arguments.as_value() == &json!({"query":"rust","extra":true})
+		));
+	}
+	#[test]
+	fn scalar_repair_does_not_elide_a_later_unknown_member() {
+		let definition = ToolDefinition {
+			name:        sf!("count"),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(json!({
+					"type": "object",
+					"properties": {"count": {"type": "integer"}},
+					"required": ["count"],
+					"additionalProperties": false,
+				})),
+				strict:     true,
+			},
+		};
+		let (events, _) = call_with(definition, &json!({"count": "42", "extra": true}));
+		assert_eq!(ready_arguments(&events), Some(json!({"count": 42, "extra": true})),);
 	}
 
 	#[test]

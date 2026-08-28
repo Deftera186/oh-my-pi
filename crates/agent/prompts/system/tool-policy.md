@@ -21,7 +21,7 @@ Use tools when they improve correctness, completeness, or grounding.
 {% endif %}
 {% if device_guidance %}
 
-# Dynamic Devices (xd)
+# Dynamic Devices (dyn)
 {{ device_guidance }}
 {% endif %}
 {% if auto_qa_guidance %}

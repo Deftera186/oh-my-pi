@@ -49,6 +49,7 @@ mod revival;
 mod schedule;
 pub mod scheduler;
 mod state;
+mod stateful;
 pub mod streaming_edit_guard;
 mod subagent;
 mod todo_restore;
@@ -209,6 +210,7 @@ pub use state::{
 	AgentSnapshot, AgentState, ContextPromotionPolicy, MidTurnCompactionPolicy, RetryPolicy,
 	RetryPolicyError, SteeringMode, UnexpectedStopMode,
 };
+pub use stateful::{RestoreFuture, StatefulComponent};
 pub use streaming_edit_guard::{StreamingEditAbort, StreamingEditDialect, StreamingEditGuard};
 pub use subagent::{
 	MAX_DISPOSITION_PREVIEW_BYTES, MAX_PROGRESS_ACTIVITY_BYTES, MAX_TERMINAL_SUMMARY_BYTES,
@@ -216,6 +218,7 @@ pub use subagent::{
 	SubagentLifecycle, SubagentProgressSnapshot, SubagentRunEvent, SubagentRunEventKind,
 	SubagentRunState, SubagentStateError, SubagentTerminalKind, SubagentTerminalStatus,
 };
+pub use todo_restore::TodoRestore;
 pub use tree::{
 	AgentAuxiliary, AgentDefinition, AgentDefinitionError, AgentKind, AgentModelPurpose, AgentNode,
 	AgentStatus, AgentTree, AgentTreeLimits, AssembledYield, Budget, BudgetCeiling, BudgetExceeded,

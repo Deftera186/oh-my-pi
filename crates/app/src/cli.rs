@@ -2316,19 +2316,23 @@ pub enum ConfigCommand {
 /// Model catalog command tree.
 #[derive(Clone, Debug, Args)]
 pub struct ModelsArgs {
+	/// Invocation-local extension launch controls used to compose provider
+	/// declarations.
+	#[command(flatten)]
+	pub extensions: InvocationExtensionArgs,
 	/// Catalog operation; omitted means list.
 	#[command(subcommand)]
-	pub command: Option<ModelsCommand>,
+	pub command:    Option<ModelsCommand>,
 	/// Optional provider/model/display-name filter for the default list
 	/// operation.
 	#[arg(value_name = "FILTER")]
-	pub filter:  Option<Str>,
+	pub filter:     Option<Str>,
 	/// Emit structured JSON for the default list operation.
 	#[arg(long)]
-	pub json:    bool,
+	pub json:       bool,
 	/// Pick one deterministic cycling role from matching rows.
 	#[arg(long)]
-	pub role:    Option<ModelRole>,
+	pub role:       Option<ModelRole>,
 }
 
 /// Model catalog operations.
@@ -2785,6 +2789,7 @@ fn command_extension_args(command: Option<&Command>) -> Option<&InvocationExtens
 		Some(Command::Print(args)) => Some(&args.launch.extensions),
 		Some(Command::Rpc(args) | Command::RpcUi(args)) => Some(&args.launch.extensions),
 		Some(Command::Acp(args)) => Some(&args.launch.extensions),
+		Some(Command::Models(args)) => Some(&args.extensions),
 		_ => None,
 	}
 }
