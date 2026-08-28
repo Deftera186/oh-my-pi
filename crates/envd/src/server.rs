@@ -621,6 +621,7 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 				raw: request.args_json,
 				effect_token,
 				authorized_at_ms,
+				effects: Some(invocation.maximum_effect_envelope()),
 				..omp_proto::env::v1::ArgsCommitted::default()
 			};
 			if let Err(error) = invocation.args_committed(committed) {
@@ -877,25 +878,14 @@ impl DeclaredExternalDomain {
 	fn declared(self, manifest: &ExtensionManifest) -> bool {
 		let declarations = manifest.static_declarations();
 		match self {
-			Self::Policy => {
-				manifest
-					.static_declarations()
-					.capability_grants
-					.keys()
-					.any(|capability| {
-						capability.as_str().starts_with("policy")
-							|| capability.as_str().starts_with("approvals")
-					})
-			},
+			Self::Policy => true,
 			Self::Parameters => manifest.declarations.tools().next().is_some(),
 			Self::Workers => !declarations.workers.is_empty() || !declarations.placement.is_empty(),
 			Self::DirectFilesystem => manifest
 				.declarations
 				.permits(EscapeCapability::DirectFilesystem),
-			Self::Credentials => {
-				!declarations.credentials.is_empty() || !declarations.secrets.is_empty()
-			},
-			Self::Prompts => !declarations.prompt_slots.is_empty(),
+			Self::Credentials => true,
+			Self::Prompts => true,
 			Self::Sessions => !declarations.ui.commands.is_empty(),
 			Self::Ui => {
 				!declarations.ui.commands.is_empty()
@@ -903,12 +893,9 @@ impl DeclaredExternalDomain {
 					|| !declarations.ui.message_renderers.is_empty()
 					|| !declarations.ui.completions.is_empty()
 			},
-			Self::Telemetry => {
-				!declarations.telemetry.subscriptions.is_empty()
-					|| !declarations.telemetry.exports.is_empty()
-			},
+			Self::Telemetry => true,
 			Self::Jobs => !declarations.ui.verdict_renderers.is_empty(),
-			Self::Provider => !declarations.providers.is_empty(),
+			Self::Provider => true,
 			Self::Regimes => !declarations.regimes.is_empty(),
 			Self::Services => {
 				manifest.services.provides().next().is_some()
@@ -11261,7 +11248,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn extension_site_write_is_refused_even_with_grant() {
+	async fn extension_unpinned_read_works_and_site_write_is_refused_even_with_grant() {
 		let (requests, responses, root, _state) =
 			test_connection(&["env.doc.read", "env.site"], false).await;
 		let path = root.path().join("sample.txt");
@@ -11294,16 +11281,16 @@ mod tests {
 		else {
 			panic!("expected document open response");
 		};
-		let revision = opened.head.as_ref().and_then(|head| head.revision.clone());
+		let opened_revision = opened.head.as_ref().and_then(|head| head.revision.clone());
 		requests
 			.send_async(data_frame(
 				2,
 				data_request::Body::Document(pb::DocumentOp {
 					op:    Some(document_op::Op::Read(document_pb::ReadDocumentRequest {
-						document: Some(document_pb::DocumentTarget {
+						document:  Some(document_pb::DocumentTarget {
 							target: Some(document_target::Target::LeaseId(opened.lease_id)),
 						}),
-						revision,
+						revision:  None,
 						selection: Some(document_pb::ReadSelection {
 							selection: Some(read_selection::Selection::Whole(
 								document_pb::WholeDocument::default(),
@@ -11316,16 +11303,18 @@ mod tests {
 			.await
 			.expect("send read");
 		let read = responses.recv_async().await.expect("read response");
-		assert!(matches!(
-			read.body,
-			Some(server_frame::Body::Data(pb::DataResponse {
-				body: Some(data_response::Body::Document(pb::DocumentResult {
-					result: Some(document_result::Result::Read(_)),
+		let Some(server_frame::Body::Data(pb::DataResponse {
+			body:
+				Some(data_response::Body::Document(pb::DocumentResult {
+					result: Some(document_result::Result::Read(read)),
 					..
 				})),
-				..
-			}))
-		));
+			..
+		})) = read.body
+		else {
+			panic!("expected document read response");
+		};
+		assert_eq!(read.head.as_ref().and_then(|head| head.revision.clone()), opened_revision);
 		requests
 			.send_async(data_frame(3, data_request::Body::Site(env_pb::MaterializeSite::default())))
 			.await

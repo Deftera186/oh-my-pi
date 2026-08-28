@@ -522,7 +522,7 @@ fn canonical_url_vocabulary_matches_dense_rust_dispatch_and_selector_parser() {
 			assert_eq!(Scheme::parse(&wire), scheme);
 		}
 	}
-	assert_eq!(Scheme::parse("xd"), Scheme::Unknown);
+	assert_eq!(Scheme::parse("custom"), Scheme::Unknown);
 	for selector in
 		["5", "5-16,960-973", "5..16", "5+12", "5-", "raw", "conflicts", "img", "raw:5-16"]
 	{
@@ -1679,7 +1679,7 @@ async fn unknown_scheme_is_a_typed_fault() {
 	let tool = read::tool(Sources::default(), Blobs::default());
 	let (feed, params) = IncomingParams::channel();
 	feed
-		.args_committed(sf!(r#"{{"path":"xd://pending"}}"#))
+		.args_committed(sf!(r#"{{"path":"custom://pending"}}"#))
 		.expect("unknown-scheme invocation remains live");
 	let events = tool.call(params).collect::<Vec<_>>().await;
 	let [Ev::Done(ToolTerminal::Done { result: Err(Fault::UnknownScheme { scheme, .. }), .. })] =
@@ -1687,5 +1687,5 @@ async fn unknown_scheme_is_a_typed_fault() {
 	else {
 		panic!("expected typed unknown-scheme fault: {events:?}");
 	};
-	assert_eq!(scheme.as_str(), "xd");
+	assert_eq!(scheme.as_str(), "custom");
 }

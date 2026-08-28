@@ -13,7 +13,10 @@ use std::{
 	time,
 };
 
-use omp_agent::{GateDecision, HookDispatch as AgentHookDispatch, HookGate, HookPatch, control};
+use omp_agent::{
+	GateDecision, GateEvent, GateOutcome, HookDispatch as AgentHookDispatch, HookGate, HookPatch,
+	control,
+};
 use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
 use omp_core::{
 	Duration, ExposeSecret as _, Hash32, InvocationPhase, LifecyclePhase, SecretString, Str, Ulid,
@@ -60,7 +63,7 @@ use omp_tool::{
 use omp_tools::{
 	ask::PresenterSlot,
 	checkpoint,
-	device::{DeviceCatalog, flatten_slots, xd_enabled},
+	device::{DeviceCatalog, dyn_enabled, flatten_slots},
 	edit::{EditRevisionCandidates, resolve_edit_revision},
 	eval::{EvalSessionControl, TaskDescriptionSnapshot},
 	goal,
@@ -81,6 +84,7 @@ use super::{
 	EnvdError,
 	blobs::BlobHost,
 	computer::ComputerSessionHost,
+	devices_host::DynHost,
 	docs::{DocumentHost, ResourceMutationServices},
 	document_cache,
 	eval::{
@@ -122,7 +126,6 @@ use super::{
 		seal_registry_evidence,
 	},
 	workspace::WorkspaceHost,
-	xd::XdHost,
 };
 use crate::{
 	browser_daemon::BrowserDaemon, github_url::GithubCredentialBridge, host_settings::HostSettings,
@@ -1842,7 +1845,13 @@ impl HookControlFactory {
 				Some("deny" | "require_approval") => return Ok(result),
 				Some("allow" | "defer") => {},
 				Some("modify") => {
-					compose_hook_modify(&policy, &mut payload, &mut modification, decision)?;
+					compose_hook_modify(
+						event.as_str(),
+						&policy,
+						&mut payload,
+						&mut modification,
+						decision,
+					)?;
 				},
 				_ => {
 					return Err(ControlProtocolError::new(
@@ -2318,104 +2327,67 @@ impl ProviderResponseObserver for HookControlFactory {
 	> {
 		let owner = self.clone();
 		Box::pin(async move {
-			let identity = owner
-				.subscriptions
-				.read()
-				.values()
-				.flatten()
-				.find(|row| {
-					row.event == "before_request"
-						&& row.providers.as_ref().is_none_or(|providers| {
-							providers
-								.iter()
-								.any(|provider| provider == draft.provider.as_str())
-						})
-				})
-				.map(|row| (Arc::clone(&row.identity), row.session.clone()));
-			let Some((identity, session)) = identity else {
-				return Ok(BeforeRequestMutation::default());
-			};
-			let context = ControlRequestContext {
-				connection: Arc::clone(&identity),
-				request_id: 0,
-				invocation: Some(ControlInvocationAuthority {
-					invocation: sf!("before-request:{}", Ulid::generate()),
-					phase: InvocationPhase::EffectsAuthorized,
-					session,
-					turn: None,
-					event: Some(sf!("before_request")),
-					call: None,
-					device: None,
-					effects: Box::new([]),
-					place_kind: sf!("host"),
-					lifecycle: LifecyclePhase::Active,
-					roots: Box::new([]),
-					remote: false,
-					has_ui: false,
-					headless: true,
-					settings: owner.settings_for(&identity),
-					secret_settings: Box::new([]),
-					data: None,
-					direct_filesystem: None,
-				}),
-			};
 			let headers = draft
 				.headers
 				.iter()
 				.map(|header| (header.name.to_string(), JsonValue::String(header.value.to_string())))
 				.collect::<JsonMap<_, _>>();
-			let mut arguments = JsonMap::new();
-			arguments.insert("event".to_owned(), JsonValue::String("before_request".to_owned()));
-			arguments.insert("event_rev".to_owned(), JsonValue::from(1));
-			arguments.insert(
-				"payload".to_owned(),
-				json!({
-					"provider": draft.provider,
-					"route": draft.route,
-					"model": draft.model,
-					"operation": draft.operation.to_string(),
-					"scalars": draft.scalars,
-					"headers": headers,
-					"intents": draft.intents,
-					"message_count": draft.message_count,
-					"approx_prompt_tokens": draft.approx_prompt_tokens,
-				}),
-			);
-			let decision = match owner.compose(&context, &arguments).await {
-				Ok(decision) => decision,
-				Err(_) => return Ok(BeforeRequestMutation::default()),
-			};
-			let Some(decision) = decision.as_object() else {
-				return Ok(BeforeRequestMutation::default());
-			};
-			match decision.get("kind").and_then(JsonValue::as_str) {
-				Some("deny") => {
-					let reason = decision
-						.get("reason")
-						.and_then(JsonValue::as_str)
-						.unwrap_or("provider request denied");
+			let payload = json!({
+				"provider": draft.provider,
+				"route": draft.route,
+				"model": draft.model,
+				"operation": draft.operation.to_string(),
+				"scalars": draft.scalars,
+				"headers": headers,
+				"intents": draft.intents,
+				"message_count": draft.message_count,
+				"approx_prompt_tokens": draft.approx_prompt_tokens,
+			});
+			let requested = serde_json::to_vec(&payload)
+				.map(bytes::Bytes::from)
+				.map_err(|_| BeforeRequestDenied {
+					reason: sf!("provider request hook payload could not be encoded"),
+					code:   Some(sf!("HookContractError")),
+				})?;
+			let effective = match owner
+				.admission_gate
+				.gate(
+					HookEventId::HookEventBeforeRequest,
+					GateEvent::new(sf!("before_request"), requested.clone()),
+				)
+				.await
+			{
+				GateOutcome::Allow { event, .. } => {
+					if event.effective_args == requested {
+						return Ok(BeforeRequestMutation::default());
+					}
+					serde_json::from_slice::<JsonValue>(&event.effective_args).map_err(|_| {
+						BeforeRequestDenied {
+							reason: sf!("provider request hook payload could not be decoded"),
+							code:   Some(sf!("HookContractError")),
+						}
+					})?
+				},
+				GateOutcome::Deny { reason, .. } => {
+					return Err(BeforeRequestDenied { reason, code: None });
+				},
+				GateOutcome::Approval { .. } => {
 					return Err(BeforeRequestDenied {
-						reason: Str::new(reason),
-						code:   decision
-							.get("code")
-							.and_then(JsonValue::as_str)
-							.map(Str::new),
+						reason: sf!("provider request hook requested unsupported approval"),
+						code:   Some(sf!("HookContractError")),
 					});
 				},
-				Some("modify") => {},
-				_ => return Ok(BeforeRequestMutation::default()),
-			}
-			let patch = decision
-				.get("patch")
-				.and_then(JsonValue::as_object)
-				.cloned()
-				.unwrap_or_default();
-			let body = patch
+			};
+			let effective = effective.as_object().ok_or_else(|| BeforeRequestDenied {
+				reason: sf!("provider request hook returned a non-object payload"),
+				code:   Some(sf!("HookContractError")),
+			})?;
+			let body = effective
 				.get("body")
 				.and_then(JsonValue::as_object)
 				.cloned()
 				.unwrap_or_default();
-			let headers = patch
+			let headers = effective
 				.get("headers")
 				.and_then(JsonValue::as_object)
 				.map(|headers| {
@@ -2429,11 +2401,11 @@ impl ProviderResponseObserver for HookControlFactory {
 						.into_boxed_slice()
 				})
 				.unwrap_or_default();
-			let intents = patch
+			let intents = effective
 				.get("intents")
 				.and_then(JsonValue::as_array)
 				.map(|values| values.clone().into_boxed_slice());
-			let timeout = patch
+			let timeout = effective
 				.get("timeout")
 				.and_then(|value| {
 					value
@@ -2773,6 +2745,7 @@ fn lifecycle_hook_recipient(event: &str, payload: &JsonValue, extension: &str) -
 }
 
 fn compose_hook_modify(
+	event: &str,
 	policy: &HookEventPolicy,
 	payload: &mut JsonValue,
 	modification: &mut Option<JsonMap<String, JsonValue>>,
@@ -2781,17 +2754,15 @@ fn compose_hook_modify(
 	let output = modification.get_or_insert_with(|| {
 		JsonMap::from_iter([(String::from("kind"), JsonValue::String(String::from("modify")))])
 	});
-	for field in ["target", "args", "reason"] {
-		if let Some(value) = decision.get(field).filter(|value| !value.is_null()) {
-			output.insert(String::from(field), value.clone());
-		}
+	if let Some(reason) = decision.get("reason").filter(|value| !value.is_null()) {
+		output.insert(String::from("reason"), reason.clone());
 	}
-	let patch = decision
+	let mut patch = decision
 		.get("patch")
 		.and_then(JsonValue::as_object)
 		.cloned()
 		.unwrap_or_default();
-	let unset = decision
+	let mut unset = decision
 		.get("unset")
 		.and_then(JsonValue::as_array)
 		.cloned()
@@ -2799,6 +2770,49 @@ fn compose_hook_modify(
 	let payload_object = payload.as_object_mut().ok_or_else(|| {
 		ControlProtocolError::new("HookContractError", "hook modification requires an object payload")
 	})?;
+	if event == "tool_call" {
+		let mut args = decision
+			.get("args")
+			.and_then(JsonValue::as_object)
+			.cloned()
+			.or_else(|| {
+				payload_object
+					.get("args")
+					.and_then(JsonValue::as_object)
+					.cloned()
+			})
+			.unwrap_or_default();
+		let mut args_changed = decision.get("args").is_some_and(JsonValue::is_object);
+		patch.retain(|field, value| {
+			if policy.composition.contains_key(field.as_str()) {
+				true
+			} else {
+				args.insert(field.clone(), value.clone());
+				args_changed = true;
+				false
+			}
+		});
+		unset.retain(|field| {
+			let Some(field) = field.as_str() else {
+				return true;
+			};
+			if policy.composition.contains_key(field) {
+				true
+			} else {
+				args.remove(field);
+				args_changed = true;
+				false
+			}
+		});
+		if args_changed {
+			patch.insert(String::from("args"), JsonValue::Object(args));
+		}
+	} else if let Some(args) = decision.get("args").filter(|value| !value.is_null()) {
+		patch.insert(String::from("args"), args.clone());
+	}
+	if let Some(target) = decision.get("target").filter(|value| !value.is_null()) {
+		patch.insert(String::from("target"), target.clone());
+	}
 	let output_patch = output
 		.entry(String::from("patch"))
 		.or_insert_with(|| JsonValue::Object(JsonMap::new()))
@@ -3645,9 +3659,9 @@ pub(crate) fn production_registry<
 		registry.register(rewind, Presentation::Slot, core_claims())?;
 	}
 	let catalog = DeviceCatalog::default();
-	let xd_installed = tool_settings.enabled("xd") && xd_enabled(policy);
-	if xd_installed {
-		exec.install_devices(Arc::new(XdHost::new(
+	let dyn_installed = tool_settings.enabled("dyn") && dyn_enabled(policy);
+	if dyn_installed {
+		exec.install_devices(Arc::new(DynHost::new(
 			catalog.clone(),
 			Arc::new(device_invoker),
 			previews.clone(),
@@ -3665,7 +3679,7 @@ pub(crate) fn production_registry<
 		let snapshot = omp_tools::shell::ShellPromptSnapshot {
 			sibling_tools,
 			platform: Str::new(consts::OS),
-			devices: xd_installed,
+			devices: dyn_installed,
 			embedded_builtins: shell_settings.embedded_builtins,
 			interceptor_enabled: shell_settings.interceptor.enabled,
 			interceptor_rules: shell_settings
@@ -4353,6 +4367,7 @@ mod tests {
 		let mut modification = None;
 		let decision = json!({"kind": "modify", "patch": {"summarize": true}});
 		compose_hook_modify(
+			"session_branch",
 			&policy,
 			&mut payload,
 			&mut modification,
@@ -4367,6 +4382,51 @@ mod tests {
 				.and_then(JsonValue::as_object)
 				.and_then(|patch| patch.get("summarize")),
 			Some(&JsonValue::Bool(true)),
+		);
+	}
+
+	#[test]
+	fn tool_call_transform_patches_effective_arguments() {
+		let policy = HookEventPolicy {
+			revision:    1,
+			timeout:     time::Duration::from_secs(1),
+			on_failure:  HookFailurePolicy::Deny,
+			default:     json!({"kind": "allow"}),
+			composition: BTreeMap::from([
+				(sf!("target"), HookFieldComposition::Replace),
+				(sf!("args"), HookFieldComposition::Replace),
+				(sf!("cwd"), HookFieldComposition::Replace),
+				(sf!("deadline"), HookFieldComposition::Replace),
+			]),
+		};
+		let mut payload = json!({
+			"target": {"kind": "core", "name": "bash", "rev": "core.1", "args": {
+				"command": "printf original"
+			}},
+			"args": {"command": "printf original"},
+			"cwd": ".",
+			"deadline": null,
+		});
+		let mut modification = None;
+		let decision = json!({"kind": "modify", "patch": {"command": "printf modified"}});
+		compose_hook_modify(
+			"tool_call",
+			&policy,
+			&mut payload,
+			&mut modification,
+			decision.as_object().expect("modify object"),
+		)
+		.expect("compose tool arguments");
+		assert_eq!(payload["args"]["command"], "printf modified");
+		assert_eq!(
+			modification
+				.as_ref()
+				.and_then(|value| value.get("patch"))
+				.and_then(JsonValue::as_object)
+				.and_then(|patch| patch.get("args"))
+				.and_then(JsonValue::as_object)
+				.and_then(|args| args.get("command")),
+			Some(&JsonValue::String(String::from("printf modified"))),
 		);
 	}
 

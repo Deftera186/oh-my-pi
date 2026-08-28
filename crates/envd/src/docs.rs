@@ -646,24 +646,26 @@ impl DocumentHost {
 	}
 
 	/// Forwards one canonical read request after validating its connection-owned
-	/// lease and pinned revision.
+	/// lease. The protocol permits omitting the revision to read the current
+	/// head and permits an explicit retained revision.
 	pub(crate) async fn read_request(
 		&self,
 		lease: &DocumentLease,
 		request: pb::ReadDocumentRequest,
 		cancel: &CancellationToken,
 	) -> Result<pb::ReadDocumentResponse, DocumentError> {
-		self.ensure_request_pin(lease, request.document.as_ref(), request.revision.as_ref())?;
+		self.ensure_request_lease(lease, request.document.as_ref())?;
 		if request.selection.is_none() {
 			return Err(unexpected("ReadDocumentRequest.selection"));
 		}
+		let requested_revision = request.revision.clone();
 		let body = self
 			.request(client_frame::Body::ReadDocument(request), cancel)
 			.await?;
 		let server_frame::Body::DocumentRead(response) = body else {
 			return Err(unexpected("ReadDocumentResponse"));
 		};
-		ensure_pinned_head(response.head.as_ref(), lease)?;
+		ensure_requested_head(response.head.as_ref(), requested_revision.as_ref())?;
 		Ok(response)
 	}
 
@@ -688,24 +690,25 @@ impl DocumentHost {
 	}
 
 	/// Forwards one canonical summary request after validating its
-	/// connection-owned lease and pinned revision.
+	/// connection-owned lease and optional requested revision.
 	pub(crate) async fn summarize_request(
 		&self,
 		lease: &DocumentLease,
 		request: pb::SummarizeDocumentRequest,
 		cancel: &CancellationToken,
 	) -> Result<pb::SummarizeDocumentResponse, DocumentError> {
-		self.ensure_request_pin(lease, request.document.as_ref(), request.revision.as_ref())?;
+		self.ensure_request_lease(lease, request.document.as_ref())?;
 		if request.options.is_none() {
 			return Err(unexpected("SummarizeDocumentRequest.options"));
 		}
+		let requested_revision = request.revision.clone();
 		let body = self
 			.request(client_frame::Body::SummarizeDocument(request), cancel)
 			.await?;
 		let server_frame::Body::DocumentSummarized(response) = body else {
 			return Err(unexpected("SummarizeDocumentResponse"));
 		};
-		ensure_pinned_head(response.head.as_ref(), lease)?;
+		ensure_requested_head(response.head.as_ref(), requested_revision.as_ref())?;
 		Ok(response)
 	}
 
@@ -1165,19 +1168,18 @@ impl DocumentHost {
 		}
 	}
 
-	fn ensure_request_pin(
+	fn ensure_request_lease(
 		&self,
 		lease: &DocumentLease,
 		target: Option<&pb::DocumentTarget>,
-		revision: Option<&pb::Revision>,
 	) -> Result<(), DocumentError> {
 		self.ensure_owned(lease)?;
 		let lease_target = matches!(
 			target.and_then(|target| target.target.as_ref()),
 			Some(omp_proto::document::v1::document_target::Target::LeaseId(id)) if id == lease.id()
 		);
-		if !lease_target || revision != lease.head.revision.as_ref() {
-			return Err(unexpected("connection-owned lease and pinned revision"));
+		if !lease_target {
+			return Err(unexpected("connection-owned document lease"));
 		}
 		Ok(())
 	}
@@ -1255,16 +1257,16 @@ impl Drop for PendingRequest {
 		});
 	}
 }
-fn ensure_pinned_head(
+fn ensure_requested_head(
 	head: Option<&pb::DocumentHead>,
-	lease: &DocumentLease,
+	requested_revision: Option<&pb::Revision>,
 ) -> Result<(), DocumentError> {
-	let Some(head) = head else {
-		return Err(unexpected("response head"));
-	};
-	if head.revision != lease.head.revision {
+	let revision = head
+		.and_then(|head| head.revision.as_ref())
+		.ok_or_else(|| unexpected("revision-pinned response head"))?;
+	if requested_revision.is_some_and(|requested| requested != revision) {
 		return Err(DocumentError::MalformedResponse(sf!(
-			"document server returned a revision other than the requested pin",
+			"document server returned a revision other than the requested revision",
 		)));
 	}
 	Ok(())

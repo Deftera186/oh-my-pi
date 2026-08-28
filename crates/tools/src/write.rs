@@ -766,14 +766,7 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 								}));
 								return;
 							}
-							if conflict_request.is_none()
-								&& retired_device_syntax(&path)
-								&& let Some(fault) = reject_uri_like_target(&path)
-							{
-								yield done(Err(fault));
-								return;
-							}
-		let resource_request = match route_resource_mutation(&path, stripped.text.clone()) {
+							let resource_request = match route_resource_mutation(&path, stripped.text.clone()) {
 								Ok(request) => request,
 								Err(error) => {
 									yield done(Err(Fault::Document { message: Str::new(error.to_string()) }));
@@ -1202,58 +1195,18 @@ fn read_selector_list_misfire(target: &str) -> Option<usize> {
 	(count >= 2).then_some(count)
 }
 
-fn retired_device_syntax(target: &str) -> bool {
-	let trimmed = target.trim();
-	if trimmed
-		.get(..3)
-		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("xd/"))
-	{
-		return true;
-	}
-	let Some((scheme, suffix)) = trimmed.split_once(':') else {
-		return false;
-	};
-	matches!(scheme.to_ascii_lowercase().as_str(), "xd" | "dx" | "xdd" | "xdt" | "device")
-		&& suffix.starts_with('/')
-}
-
 fn reject_uri_like_target(target: &str) -> Option<Fault> {
 	let trimmed = target.trim();
 	if windows_absolute(trimmed) {
 		return None;
-	}
-	if trimmed
-		.get(..3)
-		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("xd/"))
-	{
-		let rest = trimmed[3..].trim_start_matches('/');
-		let guidance = device_guidance(Some(rest));
-		return Some(Fault::UriLikeTarget {
-			message: sf!(
-				"Unknown retired device target.{guidance} Prefix the path with './' to write it as a \
-				 filesystem path."
-			),
-		});
 	}
 	let colon = trimmed.find(':')?;
 	let scheme = &trimmed[..colon];
 	if !valid_uri_scheme(scheme) {
 		return None;
 	}
-	let is_retired_device_scheme =
-		matches!(scheme.to_ascii_lowercase().as_str(), "xd" | "dx" | "xdd" | "xdt");
 	let suffix = &trimmed[colon + 1..];
-	if let Some(body) = suffix.strip_prefix("//") {
-		if is_retired_device_scheme {
-			let rest = body.trim_start_matches('/');
-			let guidance = device_guidance(Some(rest));
-			return Some(Fault::UriLikeTarget {
-				message: sf!(
-					"Unknown retired device target.{guidance} Prefix the path with './' to write it as \
-					 a filesystem path."
-				),
-			});
-		}
+	if suffix.starts_with("//") {
 		return Some(Fault::UnsupportedScheme { scheme: Str::new(scheme.to_ascii_lowercase()) });
 	}
 	if !suffix.starts_with('/') {
@@ -1261,14 +1214,10 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 	}
 	let rest = suffix.trim_start_matches('/');
 	let guidance = device_guidance(Some(rest));
-	let prefix = if is_retired_device_scheme {
-		"Unknown retired device target.".to_owned()
-	} else {
-		format!("Unknown URI-like write target '{trimmed}'.")
-	};
 	Some(Fault::UriLikeTarget {
 		message: sf!(
-			"{prefix}{guidance} Prefix the path with './' to write it as a filesystem path."
+			"Unknown URI-like write target '{trimmed}'.{guidance} Prefix the path with './' to write \
+			 it as a filesystem path."
 		),
 	})
 }
@@ -1276,11 +1225,11 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 fn device_guidance(tool_path: Option<&str>) -> String {
 	match tool_path.filter(|path| !path.is_empty()) {
 		Some(path) => format!(
-			" `xd` runs in the bash tool: `xd` lists devices, `xd {path} --help` shows usage, `xd \
-			 {path} [args…]` invokes."
+			" `dyn` runs in the bash tool: `dyn` lists devices, `dyn {path} --help` shows usage, \
+			 `dyn {path} [args…]` invokes."
 		),
-		None => " `xd` runs in the bash tool: `xd` lists devices, `xd <device> --help` shows usage, \
-		         `xd <device> [args…]` invokes."
+		None => " `dyn` runs in the bash tool: `dyn` lists devices, `dyn <device> --help` shows \
+		         usage, `dyn <device> [args…]` invokes."
 			.to_owned(),
 	}
 }
@@ -1578,38 +1527,12 @@ mod tests {
 		);
 		assert!(reject_uri_like_target("C:\\tmp\\x").is_none());
 
-		let guidance_cases = [
-			("xd/report_issue", "report_issue"),
-			("xd://report_issue", "report_issue"),
-			("xd:/report_issue", "report_issue"),
-			("dx:/report_issue", "report_issue"),
-			("device:/custom", "custom"),
-		];
-		for (target, device) in guidance_cases {
-			let fault = reject_uri_like_target(target).expect("fault rejected");
-			let message = fault.to_string();
-			assert!(message.contains("`xd` runs in the bash tool"), "missing shell hint: {message}");
-			assert!(message.contains("`xd` lists devices"), "missing catalog hint: {message}");
-			assert!(
-				message.contains(&format!("`xd {device} --help` shows usage")),
-				"missing device help hint: {message}"
-			);
-			assert!(
-				message.contains(&format!("`xd {device} [args…]` invokes")),
-				"missing device invocation hint: {message}"
-			);
-			assert!(!message.contains("dyn"), "found retired tool: {message}");
-			assert!(!message.contains("do_"), "found retired envelope: {message}");
-			assert!(!message.contains("xd://"), "found invocation URL: {message}");
-		}
-		let generic_fault = reject_uri_like_target("xd/")
+		let fault = reject_uri_like_target("device:/custom")
 			.expect("fault rejected")
 			.to_string();
-		assert!(generic_fault.contains("`xd` lists devices"));
-		assert!(generic_fault.contains("`xd <device> --help` shows usage"));
-		assert!(generic_fault.contains("`xd <device> [args…]` invokes"));
-		assert!(!generic_fault.contains("dyn"));
-		assert!(!generic_fault.contains("do_"));
-		assert!(!generic_fault.contains("xd://"));
+		assert!(fault.contains("`dyn` runs in the bash tool"));
+		assert!(fault.contains("`dyn` lists devices"));
+		assert!(fault.contains("`dyn custom --help` shows usage"));
+		assert!(fault.contains("`dyn custom [args…]` invokes"));
 	}
 }

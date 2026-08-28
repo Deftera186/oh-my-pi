@@ -397,82 +397,31 @@ fn unsupported_uri_is_rejected_before_any_document_probe() {
 }
 
 #[test]
-fn retired_device_write_targets_are_rejected_with_xd_builtin_guidance() {
-	let cases = [
-		("xd/report_issue", Some("report_issue"), true),
-		("xd://report_issue", Some("report_issue"), true),
-		("xd:/report_issue", Some("report_issue"), true),
-		("dx:/report_issue", Some("report_issue"), true),
-		("xdd://report_issue", Some("report_issue"), true),
-		("xdt:/report_issue", Some("report_issue"), true),
-		("device:/custom_tool", Some("custom_tool"), false),
-		("xd/", None, true),
-	];
+fn uri_like_device_target_is_rejected_with_dyn_builtin_guidance() {
+	let target = "device:/custom_tool";
+	let documents = FakeDocuments::success(
+		LiteralPathProbe::Missing,
+		committed(WriteDisposition::Created, 0, false, None),
+	);
+	let probed = Arc::clone(&documents.probed);
+	let requests = Arc::clone(&documents.requests);
+	let raw = serde_json::to_string(&json!({
+		"path": target,
+		"content": "payload"
+	}))
+	.unwrap();
+	let invocation = invoke(documents, &raw);
 
-	for (target, tool_name, is_retired) in cases {
-		let documents = FakeDocuments::success(
-			LiteralPathProbe::Missing,
-			committed(WriteDisposition::Created, 0, false, None),
-		);
-		let probed = Arc::clone(&documents.probed);
-		let requests = Arc::clone(&documents.requests);
-		let raw = serde_json::to_string(&json!({
-			"path": target,
-			"content": "payload"
-		}))
-		.unwrap();
-		let invocation = invoke(documents, &raw);
+	assert!(invocation.result.is_err());
+	assert!(probed.lock().is_empty());
+	assert!(requests.lock().is_empty());
 
-		assert!(invocation.result.is_err(), "target '{target}' should fail");
-		assert!(probed.lock().is_empty(), "target '{target}' probed document");
-		assert!(requests.lock().is_empty(), "target '{target}' requested write");
-
-		let text = &invocation.text;
-		if is_retired {
-			assert!(
-				text.starts_with("Unknown retired device target."),
-				"expected retired target prefix for '{target}', got: '{text}'"
-			);
-		} else {
-			assert!(
-				text.starts_with(&format!("Unknown URI-like write target '{target}'.")),
-				"expected URI-like target prefix for '{target}', got: '{text}'"
-			);
-		}
-		assert!(
-			text.contains("`xd` runs in the bash tool"),
-			"missing shell builtin guidance in '{text}' for '{target}'"
-		);
-		assert!(
-			text.contains("`xd` lists devices"),
-			"missing catalog guidance in '{text}' for '{target}'"
-		);
-		if let Some(name) = tool_name {
-			assert!(
-				text.contains(&format!("`xd {name} --help` shows usage")),
-				"missing specific help command in '{text}' for '{target}'"
-			);
-			assert!(
-				text.contains(&format!("`xd {name} [args…]` invokes")),
-				"missing specific invocation command in '{text}' for '{target}'"
-			);
-		} else {
-			assert!(
-				text.contains("`xd <device> --help` shows usage"),
-				"missing generic help command in '{text}' for '{target}'"
-			);
-			assert!(
-				text.contains("`xd <device> [args…]` invokes"),
-				"missing generic invocation command in '{text}' for '{target}'"
-			);
-		}
-		assert!(
-			!text.contains("xd://"),
-			"diagnostic for '{target}' suggests an xd invocation URL: '{text}'"
-		);
-		assert!(!text.contains("dyn"), "retired dyn guidance in '{text}' for '{target}'");
-		assert!(!text.contains("do_"), "retired do_ guidance in '{text}' for '{target}'");
-	}
+	let text = &invocation.text;
+	assert!(text.starts_with("Unknown URI-like write target 'device:/custom_tool'."));
+	assert!(text.contains("`dyn` runs in the bash tool"));
+	assert!(text.contains("`dyn` lists devices"));
+	assert!(text.contains("`dyn custom_tool --help` shows usage"));
+	assert!(text.contains("`dyn custom_tool [args…]` invokes"));
 }
 
 async fn interrupt_stalled_special_write(

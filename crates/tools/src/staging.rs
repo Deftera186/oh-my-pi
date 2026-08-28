@@ -19,8 +19,8 @@ use serde_json::Value;
 
 /// Stable notice appended when a tool leaves a proposal uncommitted.
 pub const PROPOSAL_PENDING_NOTICE: &str =
-	"A staged proposal is pending. Finalize it by running `xd resolve \"<one-sentence reason>\"` \
-	 or `xd reject \"<one-sentence reason>\"` in the shell before using another tool.";
+	"A staged proposal is pending. Finalize it by running `dyn resolve \"<one-sentence reason>\"` \
+	 or `dyn reject \"<one-sentence reason>\"` in the shell before using another tool.";
 /// Why a staged proposal was rejected.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

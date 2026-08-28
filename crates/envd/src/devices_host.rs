@@ -1,7 +1,8 @@
-//! Envd-owned loopback bridge behind the embedded shell's `xd` builtin.
+//! Envd-owned loopback bridge behind the embedded shell's `dyn` builtin.
 
 use std::{
-	fmt, fs,
+	fmt::{self, Write as _},
+	fs,
 	io::{self, Read as _, Write as _},
 	path::{Path, PathBuf},
 	sync::{
@@ -24,7 +25,7 @@ use omp_shell_engine::{
 };
 use omp_tool::{
 	DevicePath, ErasedEv, ErasedOutcome, ErasedStream, IncomingParams, Part, PromptCaps, Registry,
-	ToolIdentity, ToolRoute,
+	RegistryError, ToolIdentity, ToolRoute,
 };
 use omp_tools::{
 	device::{
@@ -38,12 +39,12 @@ use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-const XD_HELP: &str = "xd — invoke dynamic devices through the embedded shell\n\nUsage:\nxd [--q \
-                       TEXT] [--tag TAG] [--provenance OWNER] [--offset N] [--limit N]\nxd \
-                       [--depth N] [--under SUBTREE]\nxd <device> --help\nxd <device> [args…]\nxd \
-                       <device> --json '<payload>'\nxd resolve \"<one-sentence reason>\"\nxd \
-                       reject \"<one-sentence reason>\"\n\nThe first tokens `resolve`, `reject`, \
-                       and `help` are reserved by this builtin.";
+const DYN_HELP: &str = "dyn — invoke dynamic devices through the embedded shell\n\nUsage:\ndyn \
+                        [--q TEXT] [--tag TAG] [--provenance OWNER] [--offset N] [--limit N]\ndyn \
+                        [--depth N] [--under SUBTREE]\ndyn <device> --help\ndyn <device> \
+                        [args…]\ndyn <device> --json '<payload>'\ndyn resolve \"<one-sentence \
+                        reason>\"\ndyn reject \"<one-sentence reason>\"\n\nThe first tokens \
+                        `resolve`, `reject`, and `help` are reserved by this builtin.";
 
 #[derive(Clone)]
 struct CatalogCache {
@@ -51,8 +52,8 @@ struct CatalogCache {
 	rendered: Str,
 }
 
-/// Envd-owned loopback bridge behind the `xd` shell builtin.
-pub struct XdHost {
+/// Envd-owned loopback bridge behind the `dyn` shell builtin.
+pub struct DynHost {
 	catalog:            DeviceCatalog,
 	invoker:            Arc<dyn ErasedDeviceInvoker>,
 	proposals:          StagedProposalRegistry,
@@ -61,7 +62,7 @@ pub struct XdHost {
 	next_invocation_id: AtomicU64,
 }
 
-impl XdHost {
+impl DynHost {
 	/// Binds one live device catalog, worker dispatcher, proposal registry, and
 	/// session hook gate.
 	pub fn new(
@@ -147,7 +148,7 @@ impl XdHost {
 
 	fn invocation_id(&self) -> Str {
 		let sequence = self.next_invocation_id.fetch_add(1, Ordering::Relaxed);
-		sf!("xd-{sequence}")
+		sf!("dyn-{sequence}")
 	}
 }
 
@@ -206,8 +207,8 @@ fn device_event_json(device: omp_tool::MountedDevice<'_>) -> Value {
 	Value::Object(row)
 }
 
-/// Builds the `xd` builtin registration bound to one live environment host.
-pub fn registration<SE: ShellExtensions>(host: Arc<XdHost>) -> Registration<SE> {
+/// Builds the `dyn` builtin registration bound to one live environment host.
+pub fn registration<SE: ShellExtensions>(host: Arc<DynHost>) -> Registration<SE> {
 	Registration {
 		execute_func: Arc::new(move |context, args| {
 			let host = Arc::clone(&host);
@@ -226,12 +227,12 @@ fn content(
 	_content_type: ContentType,
 	_options: &ContentOptions,
 ) -> Result<String, error::Error> {
-	Ok(XD_HELP.to_owned())
+	Ok(DYN_HELP.to_owned())
 }
 
 // A device must not re-enter this ExecHost session while the builtin awaits it.
 async fn run<SE: ShellExtensions>(
-	host: Arc<XdHost>,
+	host: Arc<DynHost>,
 	context: ExecutionContext<'_, SE>,
 	args: Vec<CommandArg>,
 ) -> Result<ExecutionResult, error::Error> {
@@ -245,7 +246,7 @@ async fn run<SE: ShellExtensions>(
 		.collect::<Vec<_>>();
 
 	if argv.len() == 1 && is_help(argv[0].as_str()) {
-		print_stdout(&context, XD_HELP)?;
+		print_stdout(&context, DYN_HELP)?;
 		return Ok(ExecutionResult::success());
 	}
 	let Some(registry) = host.catalog.registry() else {
@@ -275,7 +276,7 @@ async fn run<SE: ShellExtensions>(
 	}
 	if first == "help" {
 		let Some(device) = argv.get(1) else {
-			print_stdout(&context, XD_HELP)?;
+			print_stdout(&context, DYN_HELP)?;
 			return Ok(ExecutionResult::success());
 		};
 		return help_command(&registry, &context, device.as_str());
@@ -288,7 +289,7 @@ async fn run<SE: ShellExtensions>(
 }
 
 async fn catalog_command<SE: ShellExtensions>(
-	host: &XdHost,
+	host: &DynHost,
 	registry: &Registry,
 	context: &ExecutionContext<'_, SE>,
 	argv: &[Str],
@@ -312,7 +313,7 @@ async fn catalog_command<SE: ShellExtensions>(
 }
 
 fn proposal_command<SE: ShellExtensions>(
-	host: &XdHost,
+	host: &DynHost,
 	context: &ExecutionContext<'_, SE>,
 	argv: &[Str],
 ) -> Result<ExecutionResult, error::Error> {
@@ -371,7 +372,7 @@ fn help_command<SE: ShellExtensions>(
 		return Ok(ExecutionResult::new(2));
 	};
 	let mut rendered = render_device_docs(&device, raw);
-	let invocation = format!("xd {raw}");
+	let invocation = format!("dyn {raw}");
 	match serde_json::from_slice::<Value>(device.schema)
 		.ok()
 		.and_then(|schema| DeviceCli::compile(&schema).ok())
@@ -387,7 +388,7 @@ fn help_command<SE: ShellExtensions>(
 }
 
 async fn invoke_command<SE: ShellExtensions>(
-	host: Arc<XdHost>,
+	host: Arc<DynHost>,
 	registry: Arc<Registry>,
 	context: ExecutionContext<'_, SE>,
 	raw_path: &Str,
@@ -443,7 +444,7 @@ async fn invoke_command<SE: ShellExtensions>(
 		Ok(parsed) => parsed,
 		Err(parse_error) => {
 			print_error(&context, &parse_error)?;
-			let hint = format!("run `xd {} --help`", raw_path.as_str());
+			let hint = format!("run `dyn {} --help`", raw_path.as_str());
 			print_error(&context, &hint)?;
 			return Ok(ExecutionResult::new(2));
 		},
@@ -546,24 +547,27 @@ fn project_result<SE: ShellExtensions>(
 		dialect:            Default::default(),
 		model_class:        Default::default(),
 	};
-	let parts = match registry.prompt(identity, verdict, &caps) {
-		Ok(parts) => parts,
+	let mut rendered = String::new();
+	match registry.prompt(identity, verdict, &caps) {
+		Ok(Some(parts)) => {
+			for text in parts.iter().filter_map(|part| match part {
+				Part::Text { text } => Some(text.as_str()),
+				Part::Json { .. } | Part::Blob { .. } => None,
+			}) {
+				if !rendered.is_empty() {
+					rendered.push('\n');
+				}
+				rendered.push_str(text);
+			}
+		},
+		Ok(None) => {},
+		Err(RegistryError::UnsupportedExternal { .. }) => {
+			render_external_verdict(verdict, &mut rendered);
+		},
 		Err(projection_error) => {
 			print_dispatch_error(context, &projection_error)?;
 			return Ok(ExecutionResult::general_error());
 		},
-	};
-	let mut rendered = String::new();
-	if let Some(parts) = parts {
-		for text in parts.iter().filter_map(|part| match part {
-			Part::Text { text } => Some(text.as_str()),
-			Part::Json { .. } | Part::Blob { .. } => None,
-		}) {
-			if !rendered.is_empty() {
-				rendered.push('\n');
-			}
-			rendered.push_str(text);
-		}
 	}
 	if rendered.is_empty() {
 		rendered.push_str("(device returned non-text output)");
@@ -574,6 +578,19 @@ fn project_result<SE: ShellExtensions>(
 	} else {
 		print_stdout(context, &rendered)?;
 		Ok(ExecutionResult::success())
+	}
+}
+
+fn render_external_verdict(verdict: &[u8], rendered: &mut String) {
+	let Ok(verdict) = serde_json::from_slice::<Value>(verdict) else {
+		return;
+	};
+	let Some(value) = verdict.get("value") else {
+		return;
+	};
+	match value {
+		Value::String(text) => rendered.push_str(text),
+		other => write!(rendered, "{other}").expect("writing JSON into a string cannot fail"),
 	}
 }
 
@@ -714,7 +731,7 @@ fn print_error<SE: ShellExtensions>(
 	message: &(impl fmt::Display + ?Sized),
 ) -> Result<(), error::Error> {
 	let mut stderr = context.stderr();
-	writeln!(stderr, "xd: {message}")?;
+	writeln!(stderr, "dyn: {message}")?;
 	Ok(())
 }
 
@@ -723,7 +740,7 @@ fn print_dispatch_error<SE: ShellExtensions>(
 	message: &(impl fmt::Display + ?Sized),
 ) -> Result<(), error::Error> {
 	let mut stderr = context.stderr();
-	writeln!(stderr, "xd: device dispatch failed: {message}")?;
+	writeln!(stderr, "dyn: device dispatch failed: {message}")?;
 	Ok(())
 }
 
@@ -769,7 +786,9 @@ mod tests {
 	use tempfile::TempDir;
 	use url::Url;
 
-	use super::{CatalogQuery, HookEventId, HookGate, XdHost, registration};
+	use super::{
+		CatalogQuery, DynHost, HookEventId, HookGate, registration, render_external_verdict,
+	};
 	use crate::exec::{ExecEvent, ExecHost};
 
 	#[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -899,7 +918,7 @@ mod tests {
 			.install_registry(Arc::clone(&registry))
 			.expect("catalog installs");
 		let host = ExecHost::new();
-		host.install_devices(Arc::new(XdHost::new(
+		host.install_devices(Arc::new(DynHost::new(
 			catalog,
 			Arc::new(UnusedInvoker),
 			proposals,
@@ -962,7 +981,7 @@ mod tests {
 		let (host, session, seen, root, _registry) =
 			host_fixture(StagedProposalRegistry::new()).await;
 
-		let catalog = execute(&host, &session, "xd").await;
+		let catalog = execute(&host, &session, "dyn").await;
 		assert_eq!(catalog.status, 0, "stderr: {}", catalog.stderr);
 		assert!(
 			catalog
@@ -970,26 +989,26 @@ mod tests {
 				.contains("fixture — Echoes schema-derived arguments.")
 		);
 
-		let help = execute(&host, &session, "xd fixture --help").await;
+		let help = execute(&host, &session, "dyn fixture --help").await;
 		assert_eq!(help.status, 0);
 		assert!(help.stdout.contains("fixture @ test/fixture"));
 		assert!(help.stdout.contains("Usage:"));
 		assert!(help.stdout.contains("<message>"));
 
 		fs::write(root.path().join("message.txt"), "from file").expect("fixture file");
-		let invoked = execute(&host, &session, "xd fixture @message.txt --flag value").await;
+		let invoked = execute(&host, &session, "dyn fixture @message.txt --flag value").await;
 		assert_eq!(invoked.status, 0);
 		assert_eq!(invoked.stdout, "fixture:from file:value\n");
 		assert_eq!(seen.lock().as_slice(), &[json!({ "message": "from file", "flag": "value" })],);
 
-		let unknown = execute(&host, &session, "xd nope").await;
+		let unknown = execute(&host, &session, "dyn nope").await;
 		assert_eq!(unknown.status, 2);
 		assert!(unknown.stderr.contains("Nearest:"));
 
-		let bad_flag = execute(&host, &session, "xd fixture --bogus").await;
+		let bad_flag = execute(&host, &session, "dyn fixture --bogus").await;
 		assert_eq!(bad_flag.status, 2);
 		assert!(bad_flag.stderr.contains("unknown flag"));
-		assert!(bad_flag.stderr.contains("run `xd fixture --help`"));
+		assert!(bad_flag.stderr.contains("run `dyn fixture --help`"));
 	}
 
 	#[tokio::test]
@@ -1005,10 +1024,10 @@ mod tests {
 			.stage(sf!("ast_edit"), sf!("one file changed"), RecordingAction(Arc::clone(&decisions)))
 			.await
 			.expect("first proposal stages");
-		let missing = execute(&host, &session, "xd resolve").await;
+		let missing = execute(&host, &session, "dyn resolve").await;
 		assert_eq!(missing.status, 2, "stderr: {}", missing.stderr);
 		assert!(missing.stderr.contains("a one-sentence reason is required"));
-		let resolved = execute(&host, &session, "xd resolve applied").await;
+		let resolved = execute(&host, &session, "dyn resolve applied").await;
 		assert_eq!(resolved.status, 0);
 		assert_eq!(resolved.stdout, "{\"settled\":true}\n");
 		assert!(!proposals.is_pending(first.id.as_str()));
@@ -1017,7 +1036,7 @@ mod tests {
 			.stage(sf!("edit"), sf!("one file changed"), RecordingAction(Arc::clone(&decisions)))
 			.await
 			.expect("second proposal stages");
-		let rejected = execute(&host, &session, "xd reject wrong").await;
+		let rejected = execute(&host, &session, "dyn reject wrong").await;
 		assert_eq!(rejected.status, 0);
 		assert!(!proposals.is_pending(second.id.as_str()));
 		assert!(matches!(decisions.lock().as_slice(), [
@@ -1107,7 +1126,8 @@ mod tests {
 				)])
 				.expect("device decision");
 		});
-		let host = XdHost::new(catalog, Arc::new(UnusedInvoker), StagedProposalRegistry::new(), gate);
+		let host =
+			DynHost::new(catalog, Arc::new(UnusedInvoker), StagedProposalRegistry::new(), gate);
 		let rendered = host
 			.catalog(&registry, &CatalogQuery::default(), None)
 			.await
@@ -1119,16 +1139,26 @@ mod tests {
 	}
 
 	#[test]
+	fn external_verdict_projection_preserves_structured_values() {
+		let mut rendered = String::new();
+		render_external_verdict(br#"{"kind":"ok","value":"placed"}"#, &mut rendered);
+		assert_eq!(rendered, "placed");
+		rendered.clear();
+		render_external_verdict(br#"{"kind":"ok","value":{"placed":true}}"#, &mut rendered);
+		assert_eq!(rendered, r#"{"placed":true}"#);
+	}
+
+	#[test]
 	fn registration_help_is_static() {
-		let host = Arc::new(XdHost::new(
+		let host = Arc::new(DynHost::new(
 			DeviceCatalog::default(),
 			Arc::new(UnusedInvoker),
 			StagedProposalRegistry::new(),
 			Arc::new(HookGate::channel().0),
 		));
 		let registration = registration::<DefaultShellExtensions>(host);
-		let help = (registration.content_func)("xd", ContentType::DetailedHelp, &Default::default())
+		let help = (registration.content_func)("dyn", ContentType::DetailedHelp, &Default::default())
 			.expect("help renders");
-		assert!(help.contains("xd <device> --help"));
+		assert!(help.contains("dyn <device> --help"));
 	}
 }

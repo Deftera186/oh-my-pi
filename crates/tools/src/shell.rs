@@ -380,7 +380,7 @@ pub struct ShellPromptSnapshot {
 	pub minimizer_enabled:   bool,
 	/// Whether embedded shell builtins are enabled.
 	pub embedded_builtins:   bool,
-	/// Whether the `xd` dynamic-device builtin is installed.
+	/// Whether the `dyn` dynamic-device builtin is installed.
 	pub devices:             bool,
 	/// Whether shell-intent interception is enabled.
 	pub interceptor_enabled: bool,
@@ -447,7 +447,7 @@ impl ShellPromptSnapshot {
 		);
 		if self.devices {
 			description
-				.push_str(" Dynamic devices: `xd` builtin (list `xd`; docs `xd <device> --help`).");
+				.push_str(" Dynamic devices: `dyn` builtin (list `dyn`; docs `dyn <device> --help`).");
 		}
 		Str::from(description)
 	}
@@ -1244,16 +1244,15 @@ mod tests {
 	}
 
 	#[test]
-	fn shell_description_mentions_xd_only_when_devices_are_installed() {
+	fn shell_description_mentions_dyn_only_when_devices_are_installed() {
 		let enabled = prompt_snapshot(true).description();
 		assert!(
 			enabled
-				.ends_with(" Dynamic devices: `xd` builtin (list `xd`; docs `xd <device> --help`).")
+				.ends_with(" Dynamic devices: `dyn` builtin (list `dyn`; docs `dyn <device> --help`).")
 		);
-		assert!(!enabled.contains("`dyn`"));
+		assert!(enabled.contains("`dyn`"));
 
 		let disabled = prompt_snapshot(false).description();
-		assert!(!disabled.contains("`xd`"));
 		assert!(!disabled.contains("`dyn`"));
 	}
 	#[test]

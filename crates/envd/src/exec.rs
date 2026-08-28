@@ -273,7 +273,7 @@ struct HostInner {
 	starting:      Mutex<HashSet<Str>>,
 	environment:   Mutex<WorkspaceEnvironment>,
 	github_cache:  Mutex<Option<Arc<GithubCache>>>,
-	devices:       Mutex<Option<Arc<crate::xd::XdHost>>>,
+	devices:       Mutex<Option<Arc<crate::devices_host::DynHost>>>,
 	persistence:   Mutex<Option<ProcessPersistence>>,
 	next_order:    AtomicU64,
 	sandbox:       Mutex<Option<SandboxConfig>>,
@@ -564,7 +564,7 @@ impl ExecHost {
 
 	/// Installs the live dynamic-device bridge used by subsequently opened
 	/// sessions.
-	pub fn install_devices(&self, host: Arc<crate::xd::XdHost>) {
+	pub fn install_devices(&self, host: Arc<crate::devices_host::DynHost>) {
 		*self.inner.devices.lock() = Some(host);
 	}
 
@@ -601,7 +601,7 @@ impl ExecHost {
 			.do_not_inherit_env(true)
 			.builtins(omp_shell_engine::builtins::default_builtins());
 		if let Some(host) = self.inner.devices.lock().clone() {
-			builder = builder.builtin("xd", crate::xd::registration(host));
+			builder = builder.builtin("dyn", crate::devices_host::registration(host));
 		}
 		for (name, value) in variables.iter() {
 			let mut variable = ShellVariable::new(value.to_string());
@@ -3244,6 +3244,96 @@ mod tests {
 				None => panic!("exec event stream closed before exit"),
 			}
 		}
+	}
+	async fn run_exit_code(host: &ExecHost, request: ExecRequest) -> Option<i32> {
+		let (_, run) = host.exec(request, None).await.expect("exec starts");
+		loop {
+			match run.next_event().await {
+				Some(ExecEvent::Output(_) | ExecEvent::Started { .. }) => {},
+				Some(ExecEvent::Exit(event)) => return event.status.expect("exit status").exit_code,
+				None => panic!("exec event stream closed before exit"),
+			}
+		}
+	}
+
+	fn script_request(session: &Bytes, text: &str) -> ExecRequest {
+		ExecRequest {
+			session: session.clone(),
+			source: Some(v1::Script { text: text.to_owned(), ..Default::default() }),
+			..Default::default()
+		}
+	}
+
+	/// Live proof for both enforcement lanes: the Seatbelt launcher confines
+	/// external commands while the in-process write policy covers redirections,
+	/// with the `.git` carve-out denied and secret-shaped names filtered from
+	/// child environments.
+	#[cfg(target_os = "macos")]
+	#[tokio::test]
+	async fn sandboxed_session_enforces_kernel_and_software_write_lanes() {
+		if !omp_sandbox::backend_status(omp_sandbox::Backend::Seatbelt).is_available() {
+			return;
+		}
+		let root = tempfile::tempdir().unwrap();
+		let workspace = root.path().canonicalize().unwrap();
+		fs::create_dir(workspace.join(".git")).unwrap();
+		let host = ExecHost::new();
+		host.configure_sandbox(
+			&crate::exec_settings::SandboxSettings {
+				mode: crate::exec_settings::ExecSandboxMode::WorkspaceWrite,
+				..Default::default()
+			},
+			&workspace,
+		);
+		let opened = host
+			.open_session(OpenSessionRequest {
+				cwd_uri: Url::from_directory_path(&workspace).unwrap().to_string(),
+				env_delta: Some(EnvironmentDelta {
+					set: BTreeMap::from([(String::from("MY_TOKEN"), String::from("secret"))]),
+					..EnvironmentDelta::default()
+				}),
+				..OpenSessionRequest::default()
+			})
+			.await
+			.expect("sandboxed session opens");
+		let session = &opened.session;
+
+		// Software lane: an in-process redirection persists inside the workspace.
+		assert_eq!(
+			run_exit_code(&host, script_request(session, "echo ok > allowed.txt")).await,
+			Some(0)
+		);
+		assert_eq!(fs::read(workspace.join("allowed.txt")).unwrap(), b"ok\n");
+		// Software lane: the same redirection into the carve-out is denied.
+		assert_ne!(
+			run_exit_code(&host, script_request(session, "echo no > .git/blocked.txt")).await,
+			Some(0)
+		);
+		assert!(!workspace.join(".git/blocked.txt").exists());
+
+		// Kernel lane: an external binary writes inside the workspace.
+		assert_eq!(
+			run_exit_code(&host, script_request(session, "/usr/bin/touch external.txt")).await,
+			Some(0)
+		);
+		assert!(workspace.join("external.txt").exists());
+		// Kernel lane: the Seatbelt profile denies the carve-out for externals.
+		assert_ne!(
+			run_exit_code(&host, script_request(session, "/usr/bin/touch .git/external.txt")).await,
+			Some(0)
+		);
+		assert!(!workspace.join(".git/external.txt").exists());
+
+		// Secret-shaped names stay visible in-shell but never reach children.
+		assert_eq!(
+			run_output(&host, script_request(session, "printf '%s' \"$MY_TOKEN\"")).await,
+			b"secret"
+		);
+		assert_ne!(
+			run_exit_code(&host, script_request(session, "/usr/bin/printenv MY_TOKEN")).await,
+			Some(0)
+		);
+		host.close_session(&opened.session).expect("session closes");
 	}
 
 	struct InterruptedReader {
