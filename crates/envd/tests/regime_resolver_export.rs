@@ -142,7 +142,7 @@ async fn retained_freeze_table_resolves_only_its_live_generation() {
 	});
 
 	let (spec, machine) = resolver
-		.resolve(&live, "retry", Some("seed"))
+		.resolve(&live, "retry", Some(b"seed"), Some(2))
 		.expect("live frozen declaration");
 	assert_eq!(spec.id, "retry");
 	assert_eq!(spec.family_rev, "fixture.RetryState@2");
@@ -152,9 +152,15 @@ async fn retained_freeze_table_resolves_only_its_live_generation() {
 	assert_eq!(machine.state(), "seed");
 	assert_eq!(resolver.owner("retry").as_deref(), Some("fixture.extension"));
 
+	let error = resolver
+		.resolve(&live, "retry", Some(b"seed"), Some(3))
+		.err()
+		.expect("mismatched state revision must be rejected");
+	assert_eq!(error.code, "InvalidRegimeState");
+
 	let stale = identity(8);
 	let error = resolver
-		.resolve(&stale, "retry", None)
+		.resolve(&stale, "retry", None, None)
 		.err()
 		.expect("stale generation must be rejected");
 	assert!(error.to_string().contains("generation"));

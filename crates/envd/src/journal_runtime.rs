@@ -2482,7 +2482,9 @@ mod tests {
 			loop {
 				match mailbox.handle_next(&mut journal).await {
 					ControlMailboxEvent::Closed => break,
-					ControlMailboxEvent::JournalHandled | ControlMailboxEvent::Rewind(_) => {},
+					ControlMailboxEvent::JournalHandled
+					| ControlMailboxEvent::HistoryReset
+					| ControlMailboxEvent::Rewind(_) => {},
 					ControlMailboxEvent::Regime(command) => {
 						command.reject_unavailable();
 					},

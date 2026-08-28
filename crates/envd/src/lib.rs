@@ -6,6 +6,7 @@ pub mod blobs;
 mod browser_daemon;
 pub mod browser_fetch;
 mod computer;
+mod devices_host;
 mod direnv;
 pub mod docs;
 pub mod document_cache;
@@ -59,7 +60,6 @@ pub mod worker;
 pub mod worker_pool;
 pub mod workspace;
 pub mod workspace_roots;
-mod xd;
 use std::{
 	env,
 	fs::{self, OpenOptions},
@@ -1225,7 +1225,7 @@ impl ProjectEnvironment {
 		&self,
 		owner: Str,
 		parent: Arc<dyn ParentSessionHost>,
-	) -> Result<impl Drop + use<>, BridgeHostError> {
+	) -> Result<eval::ParentBindingLease, BridgeHostError> {
 		self.eval_bridge.bind_sdk_parent(owner, parent)
 	}
 
