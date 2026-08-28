@@ -2473,14 +2473,11 @@ mod sandbox_tests {
 
 		let denied_path = denied.path().join("denied.txt");
 		let denied_program = shell.parse_string(format!("> {}", denied_path.display()))?;
-		let error = match shell.run_program(denied_program, &params).await {
-			Ok(_) => panic!("denied redirect unexpectedly succeeded"),
-			Err(error) => error,
-		};
-		match error.kind() {
-			error::ErrorKind::WriteDenied(denial) => assert_eq!(denial.path, denied_path),
-			other => panic!("expected typed write denial, got {other:?}"),
-		}
+		// A failed redirection fails the command and continues the program,
+		// matching bash; the denial must leave no file behind.
+		let result = shell.run_program(denied_program, &params).await?;
+		assert!(!result.is_success());
+		assert!(!denied_path.exists());
 
 		Ok(())
 	}
