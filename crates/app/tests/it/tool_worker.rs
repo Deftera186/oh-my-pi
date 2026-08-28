@@ -382,9 +382,9 @@ async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
 	fs::write(
 		&module,
 		format!(
-			"import omp\n\n@omp.tool(\"trusted_echo\", kind=\"hard\")\nasync def trusted_echo(value: str) -> \
-			 str:\n    return value\n\ndef extension_activate(_event, _context):\n    with open(\
-			 {marker_json}, 'w', encoding='utf-8') as marker:\n        marker.write(__file__)\n",
+			"import omp\n\n@omp.tool(\"trusted_echo\", kind=\"hard\")\nasync def trusted_echo(value: \
+			 str) -> str:\n    return value\n\ndef extension_activate(_event, _context):\n    with \
+			 open({marker_json}, 'w', encoding='utf-8') as marker:\n        marker.write(__file__)\n",
 		),
 	)
 	.expect("write trusted extension module");

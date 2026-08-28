@@ -95,13 +95,7 @@ impl ExtensionHarness {
 			}),
 		)
 		.await??;
-		Ok(Self {
-			client,
-			server,
-			task: Some(task),
-			data_tasks,
-			data_shutdown,
-		})
+		Ok(Self { client, server, task: Some(task), data_tasks, data_shutdown })
 	}
 
 	/// Returns the hello-complete Environment client.

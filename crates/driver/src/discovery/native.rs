@@ -1067,6 +1067,13 @@ fn load_deployment_extension(
 		Str::new_static("settings"),
 		serde_json::to_value(&manifest.settings).unwrap_or_default(),
 	);
+	// Deployment capabilities are a flat name list; the static-declaration
+	// schema groups grants by authority domain. Environment capabilities ride
+	// the DATA domain so `ExtHostSpec::data_grants` sees them.
+	extra.insert(
+		Str::new_static("capabilities"),
+		serde_json::json!({ "data": manifest.capabilities }),
+	);
 	Ok((path.to_path_buf(), ExtensionManifest {
 		name: Some(manifest.id.to_string()),
 		description: None,
