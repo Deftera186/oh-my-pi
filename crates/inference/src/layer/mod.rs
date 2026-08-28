@@ -84,6 +84,7 @@ struct ExecutionState {
 	started:                 Instant,
 	budget:                  ExecutionBudget,
 	cancelled:               AtomicBool,
+	cancel_notify:           tokio::sync::Notify,
 	committed:               AtomicBool,
 	attempts:                AtomicU32,
 	sign_budget_exhaustions: AtomicU32,
@@ -114,6 +115,7 @@ impl ExecutionContext {
 			started: Instant::now(),
 			budget,
 			cancelled: AtomicBool::new(false),
+			cancel_notify: tokio::sync::Notify::new(),
 			committed: AtomicBool::new(false),
 			attempts: AtomicU32::new(0),
 			input_tokens: AtomicU64::new(0),
@@ -150,6 +152,7 @@ impl ExecutionContext {
 	/// Requests cooperative cancellation and wakes the active wire transport.
 	pub fn cancel(&self) {
 		self.0.cancelled.store(true, Ordering::Release);
+		self.0.cancel_notify.notify_waiters();
 		if let Some(cancel) = self.0.transport_cancel.lock().as_ref() {
 			cancel.cancel();
 		}
@@ -158,6 +161,20 @@ impl ExecutionContext {
 	/// Returns whether cancellation was requested.
 	pub fn is_cancelled(&self) -> bool {
 		self.0.cancelled.load(Ordering::Acquire)
+	}
+
+	/// Resolves once cooperative cancellation is requested.
+	///
+	/// Event-driven: waiters park on a [`tokio::sync::Notify`] instead of
+	/// polling the flag, so retry backoff waits burn no CPU.
+	pub async fn cancelled(&self) {
+		loop {
+			let notified = self.0.cancel_notify.notified();
+			if self.is_cancelled() {
+				return;
+			}
+			notified.await;
+		}
 	}
 
 	/// Marks the first ordinary consumer-visible event as committed.

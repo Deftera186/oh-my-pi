@@ -351,6 +351,9 @@ mod live {
 		let _listener = UnixListener::bind(&socket).expect("Unix listener");
 		let inherited = File::open("/dev/null").expect("inherited descriptor");
 		let mut spec = probe_spec();
+		spec
+			.allow_read(std::env::current_exe().expect("test executable"))
+			.expect("restricted reads");
 		spec.allow_unix_socket(&socket).expect("socket allowance");
 		let mut command = command_for(runner, &spec, "socket-fd");
 		command.command.env("OMP_SOCKET", &socket);

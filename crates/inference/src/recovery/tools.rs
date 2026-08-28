@@ -162,7 +162,10 @@ pub enum ToolAssemblyEvent {
 		/// Exact accepted fragment.
 		bytes:        Bytes,
 	},
-	/// The complete call passed JSON parsing and schema validation.
+	/// The complete call is ready for the authoritative typed tool decoder.
+	/// Schema-directed charitable repairs have been applied. Structurally
+	/// invalid input is represented by a non-object sentinel that every tool
+	/// argument boundary rejects before effects.
 	Ready {
 		/// Codec-local call index.
 		source_index: u32,
@@ -438,7 +441,7 @@ impl<'a> ToolAssembler<'a> {
 						}
 						arguments
 					},
-					Err(error) => {
+					Err(error @ RecoveryError::LimitExceeded { .. }) => {
 						return ToolAssemblyEvent::Rejected {
 							source_index,
 							reason: ToolRejection::MalformedArguments {
@@ -447,8 +450,12 @@ impl<'a> ToolAssembler<'a> {
 							},
 						};
 					},
+					Err(_) => {
+						self.record("tool.argument-decode-failure", call.arguments.len() as u64, 1);
+						Value::Null
+					},
 				};
-				let arguments = match repair_schema_arguments(
+				let (arguments, schema_valid) = match repair_schema_arguments(
 					parameters.as_value(),
 					&arguments,
 					strict,
@@ -462,9 +469,16 @@ impl<'a> ToolAssembler<'a> {
 								repairs,
 							);
 						}
-						arguments
+						(arguments, true)
 					},
-					Err(reason) => {
+					Err((arguments, _reason, repairs)) => {
+						if repairs > 0 {
+							self.record(
+								"tool.schema-directed-argument-repair",
+								call.arguments.len() as u64,
+								repairs,
+							);
+						}
 						match normalize_flattened_arguments(&arguments).filter(|rebuilt| {
 							validate_schema(parameters.as_value(), rebuilt, strict, self.limits).is_ok()
 						}) {
@@ -474,18 +488,21 @@ impl<'a> ToolAssembler<'a> {
 									call.arguments.len() as u64,
 									1,
 								);
-								rebuilt
+								(rebuilt, true)
 							},
-							None => {
-								return ToolAssemblyEvent::Rejected {
-									source_index,
-									reason: ToolRejection::SchemaViolation(reason),
-								};
-							},
+							None => (arguments, false),
 						}
 					},
 				};
-				self.record("tool.complete-schema-valid", call.arguments.len() as u64, 1);
+				self.record(
+					if schema_valid {
+						"tool.complete-schema-valid"
+					} else {
+						"tool.complete-schema-invalid"
+					},
+					call.arguments.len() as u64,
+					1,
+				);
 				arguments
 			},
 			ToolInputKind::Freeform => {
@@ -585,7 +602,7 @@ fn repair_schema_arguments(
 	instance: &Value,
 	strict: bool,
 	limits: ToolAssemblyLimits,
-) -> Result<(Value, u32), SchemaViolation> {
+) -> Result<(Value, u32), (Value, SchemaViolation, u32)> {
 	let mut repaired = instance.clone();
 	let mut repairs = 0_u32;
 	loop {
@@ -594,7 +611,7 @@ fn repair_schema_arguments(
 			Err(issue) if repairs < 16 && apply_schema_repair(&mut repaired, &issue) => {
 				repairs = repairs.saturating_add(1);
 			},
-			Err(issue) => return Err(issue),
+			Err(issue) => return Err((repaired, issue, repairs)),
 		}
 	}
 }
@@ -1623,17 +1640,20 @@ mod tests {
 	}
 
 	#[test]
-	fn grammar_fallback_json_still_enforces_the_fallback_schema() {
+	fn grammar_fallback_json_defers_missing_required_input_to_the_tool() {
 		let definitions = [grammar_definition(edit_fallback_schema())];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
-		// A missing required `input` is beyond schema-directed repair.
 		let output = complete_call(&mut assembler, ToolInputKind::Json, br"{}");
 		assert!(
-			matches!(output.as_slice(), [.., ToolAssemblyEvent::Rejected {
-				reason: ToolRejection::SchemaViolation(_),
-				..
-			}]),
-			"non-conforming fallback arguments must reject: {output:?}"
+			matches!(output.as_slice(), [.., ToolAssemblyEvent::Ready { call, .. }]
+				if call.arguments.as_value() == &json!({})),
+			"typed tool decoder must receive non-conforming arguments: {output:?}"
+		);
+		assert!(
+			assembler
+				.take_evidence()
+				.iter()
+				.any(|record| record.rule.0 == "tool.complete-schema-invalid")
 		);
 	}
 
@@ -1788,7 +1808,7 @@ mod tests {
 		});
 		assembler.push(ToolFragment::ArgumentsDelta {
 			source_index: 4,
-			bytes:        Bytes::from_static(b"{'query':'rust',"),
+			bytes:        Bytes::from_static(b"{'query':'rust',}"),
 		});
 		let output = assembler.push(ToolFragment::End { source_index: 4 });
 		assert!(matches!(
@@ -1805,29 +1825,44 @@ mod tests {
 	}
 
 	#[test]
-	fn malformed_and_schema_invalid_arguments_are_rejected() {
+	fn malformed_arguments_and_schema_issues_reach_the_typed_tool() {
 		let definitions = [definition()];
-		for (source_index, arguments) in
-			[(7, b"{".as_slice()), (8, br#"{"query":"","extra":true}"#.as_slice())]
-		{
-			let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
-			assembler.push(ToolFragment::Start {
-				input_kind: ToolInputKind::Json,
-				source_index,
-				id: None,
-				name: Bytes::from_static(b"search"),
-			});
-			assembler.push(ToolFragment::ArgumentsDelta {
-				source_index,
-				bytes: Bytes::copy_from_slice(arguments),
-			});
-			assert!(matches!(
-				assembler
-					.push(ToolFragment::End { source_index })
-					.as_slice(),
-				[ToolAssemblyEvent::Rejected { .. }]
-			));
-		}
+		let mut malformed = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		malformed.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
+			source_index: 7,
+			id:           None,
+			name:         Bytes::from_static(b"search"),
+		});
+		malformed.push(ToolFragment::ArgumentsDelta {
+			source_index: 7,
+			bytes:        Bytes::from_static(b"{"),
+		});
+		assert!(matches!(
+			malformed
+				.push(ToolFragment::End { source_index: 7 })
+				.as_slice(),
+			[ToolAssemblyEvent::Ready { call, .. }]
+				if call.arguments.as_value().is_null()
+		));
+
+		let mut schema_invalid = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
+		schema_invalid.push(ToolFragment::Start {
+			input_kind:   ToolInputKind::Json,
+			source_index: 8,
+			id:           None,
+			name:         Bytes::from_static(b"search"),
+		});
+		schema_invalid.push(ToolFragment::ArgumentsDelta {
+			source_index: 8,
+			bytes:        Bytes::from_static(br#"{"query":"","extra":true}"#),
+		});
+		let output = schema_invalid.push(ToolFragment::End { source_index: 8 });
+		assert!(matches!(
+			output.as_slice(),
+			[.., ToolAssemblyEvent::Ready { call, .. }]
+				if call.arguments.as_value() == &json!({"query":"","extra":true})
+		));
 	}
 
 	#[test]
@@ -1888,20 +1923,7 @@ mod tests {
 	}
 
 	#[test]
-	fn truncated_nested_arguments_repair_privately_before_authorization() {
-		let nested = ToolDefinition {
-			name:        sf!("search"),
-			description: None,
-			input:       ToolInputConstraint::JsonSchema {
-				parameters: OpaqueJson::new(json!({
-					"type":"object",
-					"properties":{"query":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}}}},
-					"required":["query"],
-					"additionalProperties":false
-				})),
-				strict:     true,
-			},
-		};
+	fn truncated_json_document_is_not_repaired() {
 		let mut repair = JsonRepairStage::new(
 			JsonEnforcement::NativeOrRepair,
 			JsonRepairLimits::default(),
@@ -1911,12 +1933,16 @@ mod tests {
 		let malformed = Bytes::from_static(br"{'query': {'text': 'rust',");
 		let mut documents = Vec::new();
 		Stage::push(&mut repair, malformed, &mut |_| {}).expect("bounded fragment accepted");
-		Stage::finish(&mut repair, &mut |document| documents.push(document))
-			.expect("repair succeeds");
-		let document = documents.pop().expect("one repaired document");
-		assert!(document.recovery.is_some());
+		assert!(matches!(
+			Stage::finish(&mut repair, &mut |document| documents.push(document)),
+			Err(RecoveryError::InvalidDocument { .. })
+		));
+		assert!(documents.is_empty());
+	}
 
-		let definitions = [nested];
+	#[test]
+	fn truncated_tool_arguments_use_rejection_sentinel() {
+		let definitions = [definition()];
 		let mut assembler = ToolAssembler::new(&definitions, ToolAssemblyLimits::default(), 1);
 		assembler.push(ToolFragment::Start {
 			input_kind:   ToolInputKind::Json,
@@ -1924,13 +1950,16 @@ mod tests {
 			id:           None,
 			name:         Bytes::from_static(b"search"),
 		});
-		assembler
-			.push(ToolFragment::ArgumentsDelta { source_index: 9, bytes: document.bytes });
+		assembler.push(ToolFragment::ArgumentsDelta {
+			source_index: 9,
+			bytes:        Bytes::from_static(br#"{"query":"rust","i":"Truncated"#),
+		});
 		assert!(matches!(
 			assembler
 				.push(ToolFragment::End { source_index: 9 })
 				.as_slice(),
-			[ToolAssemblyEvent::Ready { .. }]
+			[ToolAssemblyEvent::Ready { call, .. }]
+				if call.arguments.as_value().is_null()
 		));
 	}
 
@@ -2133,7 +2162,7 @@ mod tests {
 			},
 		};
 		let (events, _) = call_with(definition, &value);
-		assert!(ready_arguments(&events).is_none());
+		assert_eq!(ready_arguments(&events), Some(value));
 	}
 	#[test]
 	fn failed_union_branch_still_allows_lossless_scalar_repair() {
@@ -2204,7 +2233,7 @@ mod tests {
 				},
 			};
 			let (events, _) = call_with(definition, &value);
-			assert!(ready_arguments(&events).is_none());
+			assert_eq!(ready_arguments(&events), Some(value));
 		}
 	}
 
@@ -2385,32 +2414,23 @@ mod tests {
 	}
 
 	#[test]
-	fn malformed_indexed_keys_surface_the_validation_error() {
-		let (events, _) = call_with(ask_definition(), &json!({"questions[foo]": "nope"}));
-		assert!(matches!(
-			events.first(),
-			Some(ToolAssemblyEvent::Rejected { reason: ToolRejection::SchemaViolation(_), .. })
-		));
+	fn malformed_indexed_keys_defer_to_the_typed_tool_decoder() {
+		let arguments = json!({"questions[foo]": "nope"});
+		let (events, _) = call_with(ask_definition(), &arguments);
+		assert_eq!(ready_arguments(&events).expect("call reaches typed decoder"), arguments);
 	}
 
 	#[test]
-	fn schema_mismatch_without_flattened_keys_still_rejects() {
-		let (events, _) = call_with(ask_definition(), &json!({"label": "300"}));
-		assert!(matches!(
-			events.first(),
-			Some(ToolAssemblyEvent::Rejected { reason: ToolRejection::SchemaViolation(_), .. })
-		));
+	fn schema_mismatch_without_flattened_keys_defers_to_the_typed_tool_decoder() {
+		let arguments = json!({"label": "300"});
+		let (events, _) = call_with(ask_definition(), &arguments);
+		assert_eq!(ready_arguments(&events).expect("call reaches typed decoder"), arguments);
 	}
 
 	#[test]
-	fn flattened_path_colliding_with_plain_key_bails_to_validation_error() {
-		// Ambiguous input must not lose the plain key — fall through to a
-		// genuine validation error instead of a partial rebuild.
-		let (events, _) =
-			call_with(ask_definition(), &json!({"questions": [5], "questions[0].id": "x"}));
-		assert!(matches!(
-			events.first(),
-			Some(ToolAssemblyEvent::Rejected { reason: ToolRejection::SchemaViolation(_), .. })
-		));
+	fn flattened_path_collision_preserves_arguments_for_the_typed_decoder() {
+		let arguments = json!({"questions": [5], "questions[0].id": "x"});
+		let (events, _) = call_with(ask_definition(), &arguments);
+		assert_eq!(ready_arguments(&events).expect("call reaches typed decoder"), arguments);
 	}
 }

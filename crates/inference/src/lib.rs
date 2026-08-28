@@ -41,7 +41,13 @@ pub mod transport;
 pub use answer::*;
 pub use call::*;
 pub use client::*;
-pub use codec::{ProviderResponseHooks, ProviderResponseObservation, ProviderResponseObserver};
+pub use codec::{
+	BeforeRequestDenied, BeforeRequestDraft, BeforeRequestMutation, CredentialDisabledObservation,
+	ModelsDiscoverHookPage, ModelsDiscoverHookRequest, ProviderHookCredential, ProviderHookError,
+	ProviderHookObserver, ProviderLoginHookRequest, ProviderRefreshHookRequest,
+	ProviderRefreshReason, ProviderResponseHooks, ProviderResponseObservation,
+	ProviderResponseObserver, ProviderSignHookRequest, ProviderSignature,
+};
 pub use difficulty::*;
 pub use error::*;
 pub use event::*;

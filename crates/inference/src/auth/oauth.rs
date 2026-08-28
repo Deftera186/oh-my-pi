@@ -19,7 +19,10 @@ use http::{
 	HeaderMap, HeaderValue, Method,
 	header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
 };
-use omp_catalog::provider::{OAuthExchangeKind, PrincipalResolution};
+use omp_catalog::{
+	ProviderId,
+	provider::{OAuthExchangeKind, PrincipalResolution},
+};
 use omp_core::{ExposeSecret, SecretBox, SecretString, Str, base64_url, sf};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
@@ -43,6 +46,7 @@ use crate::{
 	},
 	answer::{AuthEvent, AuthPrompt, AuthPromptKind},
 	call::AuthInput,
+	codec::{ProviderRefreshHookRequest, ProviderRefreshReason, ProviderResponseHooks},
 	id::{AccountId, PrincipalId, ProjectId},
 };
 
@@ -692,6 +696,110 @@ where
 				move |refresh_token| async move { custom.refresh(&spec, refresh_token).await },
 			)
 			.await
+	}
+
+	/// Refreshes and fenced-persists one rejected generation through an
+	/// extension `provider_refresh` callback.
+	pub(crate) async fn refresh_extension_persisted(
+		&self,
+		coordinator: &RefreshCoordinator,
+		store: Arc<CredentialStore>,
+		hooks: ProviderResponseHooks,
+		provider: ProviderId,
+		identity: Option<Str>,
+		request: RefreshRequest,
+		reason: ProviderRefreshReason,
+		origin: CredentialOrigin,
+	) -> Result<RefreshOutcome, OAuthCredentialManagerError> {
+		let account = request.account.clone();
+		let principal = request.principal.clone();
+		let rejected_generation = request.rejected.generation;
+		let requested_at = request.requested_at;
+		let expires_at_ms = request.rejected.expires_at.map(unix_millis).transpose()?;
+		coordinator
+			.refresh(store.clone(), request, move |refresh_lease| {
+				let store = store.clone();
+				async move {
+					let stored = store
+						.load_oauth_bundle(&account)
+						.map_err(refresh_store_operation)?;
+					if stored.metadata.generation != rejected_generation {
+						return Err(RefreshOperationError {
+							code:    sf!("generation-changed"),
+							summary: sf!("credential generation changed before refresh"),
+						});
+					}
+					if stored.metadata.principal_id != principal {
+						return Err(RefreshOperationError {
+							code:    sf!("principal-changed"),
+							summary: sf!("credential principal changed before refresh"),
+						});
+					}
+					let bundle =
+						StoredOAuthBundle::decode(&stored.bundle).map_err(refresh_oauth_operation)?;
+					let refresh_token = bundle.into_refresh().map_err(refresh_oauth_operation)?;
+					let refreshed = hooks
+						.provider_refresh(ProviderRefreshHookRequest {
+							provider,
+							identity,
+							refresh_token: refresh_token.clone(),
+							expires_at_ms,
+							props: serde_json::Map::new(),
+							reason,
+						})
+						.await
+						.map_err(|_| RefreshOperationError {
+							code:    sf!("provider-refresh-hook"),
+							summary: sf!("extension credential refresh failed"),
+						})?;
+					if !matches!(refreshed.kind.as_str(), "oauth" | "bearer") {
+						return Err(RefreshOperationError {
+							code:    sf!("provider-refresh-kind"),
+							summary: sf!("extension refresh returned an incompatible credential kind"),
+						});
+					}
+					let refresh_token = refreshed.refresh_token.unwrap_or(refresh_token);
+					let expires_at = refreshed
+						.expires_at_ms
+						.map(system_time_from_millis)
+						.transpose()
+						.map_err(refresh_manager_operation)?;
+					let expires_in =
+						expires_at.and_then(|expires_at| expires_at.duration_since(requested_at).ok());
+					let bundle = StoredOAuthBundle {
+						access_token: refreshed.secret,
+						refresh_token: Some(refresh_token),
+						token_type: sf!("Bearer"),
+						expires_in,
+					}
+					.encode()
+					.map_err(refresh_oauth_operation)?;
+					let write = OAuthCredentialWrite {
+						account_id: &account,
+						principal_id: &principal,
+						bundle: &bundle,
+						expires_at_ms: refreshed.expires_at_ms,
+						origin,
+						now_ms: unix_millis(requested_at).map_err(refresh_manager_operation)?,
+						expected_generation: Some(rejected_generation),
+					};
+					let metadata = store
+						.put_oauth_bundle_under_refresh_lease(write, &refresh_lease, requested_at)
+						.map_err(refresh_store_operation)?;
+					Ok(RefreshedCredential {
+						account:   metadata.account_id,
+						principal: metadata.principal_id,
+						freshness: CredentialFreshness {
+							generation: metadata.generation,
+							issued_at: Some(requested_at),
+							expires_at,
+							observed_at: requested_at,
+						},
+					})
+				}
+			})
+			.await
+			.map_err(|error| OAuthCredentialManagerError::Refresh(Box::new(error)))
 	}
 
 	async fn refresh_persisted_with<F, Fut>(

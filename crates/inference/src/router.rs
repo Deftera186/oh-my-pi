@@ -316,7 +316,10 @@ impl Router {
 			.provider(provider)
 			.ok_or_else(|| target_not_found(&call.target))?;
 		let operation = call.operation.kind();
-		let provider_support = definition.management.supports(operation);
+		let direct_management = (operation == OperationKind::Auth
+			&& self.registry.contains_auth_manager())
+			|| (operation == OperationKind::Usage && self.registry.contains_usage_manager());
+		let provider_support = definition.management.supports(operation) || direct_management;
 		let requirements = extract_requirements(&call.operation);
 		let policy = operation_policy(&call.operation);
 		let evidence_route = pinned_route
@@ -347,11 +350,23 @@ impl Router {
 			) {
 				continue;
 			}
-			if let Err(error) = self.registry.route_service(route_id, operation) {
+			if !direct_management && let Err(error) = self.registry.route_service(route_id, operation)
+			{
 				last_error = Some(prefer_error(last_error, error));
 				continue;
 			}
-			let runtime =
+			let runtime = if direct_management {
+				RuntimeRouteEvidence {
+					route:            route_id.clone(),
+					generation:       self.registry.generation(),
+					health:           RouteHealth::Unknown,
+					quota_millionths: 0,
+					latency:          Duration::MAX,
+					affinity:         false,
+					operation:        CapabilityAvailability::Native,
+					capabilities:     Arc::from([]),
+				}
+			} else {
 				self
 					.runtime
 					.get(route_id)
@@ -365,7 +380,8 @@ impl Router {
 						affinity:         false,
 						operation:        CapabilityAvailability::Native,
 						capabilities:     Arc::from([]),
-					});
+					})
+			};
 			if runtime.generation != self.registry.generation() {
 				last_error = Some(route_contract_error(route_id, "runtime-evidence-generation-stale"));
 				continue;

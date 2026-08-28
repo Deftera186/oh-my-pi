@@ -8,7 +8,6 @@ use std::{
 };
 
 use ring::rand::{SecureRandom as _, SystemRandom};
-use tokio::task;
 use tower::{Layer, Service};
 
 use crate::{
@@ -225,9 +224,7 @@ async fn wait_retry_delay(context: ExecutionContext, delay: time::Duration) -> R
 }
 
 async fn wait_cancelled(context: ExecutionContext) {
-	while !context.is_cancelled() {
-		task::yield_now().await;
-	}
+	context.cancelled().await;
 }
 
 #[cfg(test)]

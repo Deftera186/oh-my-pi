@@ -177,6 +177,17 @@ impl RateState {
 		self.windows.iter()
 	}
 
+	/// Clears selected windows, or every window when the selection is empty.
+	pub fn clear(&mut self, scopes: &[Str]) {
+		if scopes.is_empty() {
+			self.windows.clear();
+		} else {
+			for scope in scopes {
+				self.windows.remove(&RateWindowId::new(scope.clone()));
+			}
+		}
+	}
+
 	/// Computes aggregate availability; the latest active reset wins
 	/// deterministically.
 	pub fn availability(&self, now: SystemTime) -> RateAvailability {

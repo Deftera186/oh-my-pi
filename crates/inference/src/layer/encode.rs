@@ -2,19 +2,21 @@
 //! credentials.
 
 use std::{
+	future,
 	sync::Arc,
 	task::{Context, Poll},
 	time::{Duration, SystemTime},
 };
 
-use omp_core::sf;
+use omp_core::{Hash32, Str, sf};
 use parking_lot::Mutex;
 use tokio::time;
 use tower::{Layer, Service};
 
 use crate::{
 	auth::{AuthSpec, CredentialLease, lease::AppliedCredentials},
-	codec::{Cancellation, TransportRequest},
+	body::BodySource,
+	codec::{BeforeRequestMutation, Cancellation, ProviderSignHookRequest, TransportRequest},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	layer::{
 		ExecutionContext, LayerCall,
@@ -29,12 +31,21 @@ pub trait AttemptEncoder<R, L>: Clone + Send + 'static {
 	/// Runs the session-scoped request gate against a bounded typed draft.
 	///
 	/// The default is allocation-free for route stacks without a provider hook.
+	fn before_request(
+		&self,
+		_request: &mut R,
+		_execution: &ExecutionContext,
+	) -> impl Future<Output = Result<BeforeRequestMutation, Error>> + Send {
+		future::ready(Ok(BeforeRequestMutation::default()))
+	}
+
 	/// Encodes with a fresh body source and decoder; it must not acquire
 	/// credentials or perform I/O.
 	fn encode(
 		&self,
 		request: &R,
 		lease: &L,
+		mutation: &BeforeRequestMutation,
 		execution: &ExecutionContext,
 		attempt: u32,
 		provisional: bool,
@@ -117,7 +128,7 @@ where
 	}
 
 	fn call(&mut self, request: LayerCall<Authorized<R, A, L>>) -> Self::Future {
-		let Authorized { request: planned, account, lease } = request.payload;
+		let Authorized { request: mut planned, account, lease } = request.payload;
 		let attempt = request.context.attempts().saturating_sub(1);
 		let context = request.context;
 		let hook = self.hook.clone();
@@ -133,8 +144,9 @@ where
 			if let Some(hook) = hook {
 				let _ = hook.before_request(&context).await;
 			}
+			let mutation = encoder.before_request(&mut planned, &context).await?;
 			let transport =
-				encoder.encode(&planned, &lease, &context, attempt, provisional, cancel)?;
+				encoder.encode(&planned, &lease, &mutation, &context, attempt, provisional, cancel)?;
 			let future = {
 				let mut service = inner.lock();
 				let future = service
@@ -285,6 +297,31 @@ where
 		let future = applied.map(|()| {
 			let inner = Arc::clone(&self.inner);
 			async move {
+				if transport
+					.response_hooks
+					.provider_sign_subscribed(&transport.attempt.provider)
+				{
+					let BodySource::Bytes(body) = &transport.encoded.body else {
+						return Err(provider_sign_failed(&context, "provider-sign-body-not-buffered"));
+					};
+					let method: &'static str = transport.encoded.method.into();
+					let request = ProviderSignHookRequest {
+						provider:    transport.attempt.provider.clone(),
+						route:       transport.attempt.route.clone(),
+						method:      Str::new_static(method),
+						url:         transport.encoded.uri.clone(),
+						headers:     transport.encoded.headers.clone(),
+						body_sha256: Hash32::sum(body).into_bytes(),
+					};
+					let budget = Duration::from_millis(250);
+					match time::timeout(budget, transport.response_hooks.provider_sign(request)).await {
+						Ok(Ok(signature)) => transport.signature = Some(signature),
+						Ok(Err(_)) => {
+							return Err(provider_sign_failed(&context, "provider-sign-hook-failed"));
+						},
+						Err(_) => return Err(provider_sign_timeout(&context, budget)),
+					}
+				}
 				if let Some(hook) = hook {
 					let budget = hook.sign_budget();
 					match time::timeout(budget, hook.provider_sign(&transport, &context)).await {
@@ -306,6 +343,16 @@ where
 	}
 }
 
+fn provider_sign_failed(context: &ExecutionContext, reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::Authentication,
+		ErrorPhase::Authentication,
+		RetryAction::Never,
+		context.receipt(),
+	)
+	.detail(ErrorDetail::target(sf!(reason)))
+}
+
 fn provider_sign_timeout(context: &ExecutionContext, budget: Duration) -> Error {
 	context.record_sign_budget_exhaustion();
 	Error::new(
@@ -325,13 +372,17 @@ fn provider_sign_timeout(context: &ExecutionContext, budget: Duration) -> Error 
 mod tests {
 	use std::{
 		future::{self, Future},
-		sync::Arc,
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		},
 		task::{Context, Poll},
 		time::{self, Duration},
 	};
 
 	use bytes::Bytes;
 	use futures::future::{Ready, ready};
+	use omp_core::{Hash32, SecretString};
 	use parking_lot::Mutex;
 	use tower::Service;
 
@@ -339,9 +390,12 @@ mod tests {
 		AttemptEncoder, CredentialApplier, CredentialApplyService, EncodeService, EncodedAttempt,
 	};
 	use crate::{
+		BeforeRequestMutation,
 		body::BodySource,
 		codec::{
-			Cancellation, Decoder, EncodedRequest, RawEvent, RequestMethod, SizeBounds,
+			Cancellation, Decoder, EncodedRequest, ProviderHookError, ProviderHookObserver,
+			ProviderResponseHooks, ProviderResponseObservation, ProviderResponseObserver,
+			ProviderSignHookRequest, ProviderSignature, RawEvent, RequestMethod, SizeBounds,
 			TransportAttempt, TransportRequest,
 		},
 		error::{Error, ErrorKind, RetryAction},
@@ -378,6 +432,7 @@ mod tests {
 				sealed_body: None,
 			},
 			credentials:    None,
+			signature:      None,
 			decoder:        Some(Box::new(EmptyDecoder)),
 			realtime:       None,
 			cancel:         Cancellation::default(),
@@ -404,6 +459,7 @@ mod tests {
 			&self,
 			&(): &(),
 			_: &u8,
+			_: &BeforeRequestMutation,
 			_: &ExecutionContext,
 			_: u32,
 			_: bool,
@@ -443,6 +499,79 @@ mod tests {
 			ready(Ok(()))
 		}
 	}
+	struct StubExthost;
+
+	impl ProviderHookObserver for StubExthost {
+		fn provider_sign_subscribed(&self, provider: &omp_catalog::ProviderId<str>) -> bool {
+			provider.as_str() == "provider"
+		}
+
+		fn provider_sign<'a>(
+			&'a self,
+			request: ProviderSignHookRequest,
+		) -> std::pin::Pin<
+			Box<dyn Future<Output = Result<ProviderSignature, ProviderHookError>> + Send + 'a>,
+		> {
+			Box::pin(async move {
+				assert_eq!(request.method, "POST");
+				assert_eq!(request.body_sha256, Hash32::sum(&[]).into_bytes());
+				Ok(ProviderSignature {
+					headers: Box::new([(
+						omp_core::Str::new_static("x-extension-signature"),
+						SecretString::from("signed"),
+					)]),
+					query:   Box::new([]),
+				})
+			})
+		}
+	}
+
+	impl ProviderResponseObserver for StubExthost {
+		fn subscribed(&self) -> bool {
+			false
+		}
+
+		fn observe(&self, _observation: ProviderResponseObservation) {}
+	}
+
+	#[derive(Clone)]
+	struct SigningWire(Arc<AtomicBool>);
+
+	impl Service<TransportRequest> for SigningWire {
+		type Error = Error;
+		type Future = Ready<Result<(), Error>>;
+		type Response = ();
+
+		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, request: TransportRequest) -> Self::Future {
+			self.0.store(request.signature.is_some(), Ordering::Release);
+			ready(Ok(()))
+		}
+	}
+
+	#[tokio::test]
+	async fn extension_provider_sign_runs_after_credentials_and_before_wire() {
+		let signed = Arc::new(AtomicBool::new(false));
+		let mut request = transport();
+		request.response_hooks = ProviderResponseHooks::new(Arc::new(StubExthost));
+		let mut service = CredentialApplyService::<_, _, NoHookHandle> {
+			inner:   Arc::new(Mutex::new(SigningWire(Arc::clone(&signed)))),
+			applier: Applier(Arc::new(Mutex::new(Vec::new()))),
+			hook:    None,
+		};
+		service
+			.call(LayerCall {
+				payload: EncodedAttempt { account: (), transport: request, lease: 7 },
+				context: ExecutionContext::new(ExecutionBudget::default()),
+			})
+			.await
+			.expect("signed request");
+		assert!(signed.load(Ordering::Acquire));
+	}
+
 	#[derive(Clone, Copy)]
 	struct SlowSigner;
 	impl HookHandle for SlowSigner {

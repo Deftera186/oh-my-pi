@@ -274,6 +274,22 @@ async fn execute(
 			)
 		})?;
 	}
+	if let Some(signature) = &request.signature
+		&& signature.apply(&mut upgrade).is_err()
+	{
+		return Err(failure(
+			simple_error(
+				ErrorKind::Authentication,
+				ErrorPhase::Authentication,
+				false,
+				"websocket-provider-signature-finalization",
+			),
+			&request,
+			&evidence,
+			started,
+			false,
+		));
+	}
 	let upgrade = upgrade.map(|_| ());
 	let (mut socket, response) = tokio::select! {
 		result = connect_async(upgrade) => result.map_err(|_| failure(simple_error(ErrorKind::Connectivity, ErrorPhase::Connecting, false, "websocket-connect"), &request, &evidence, started, false))?,

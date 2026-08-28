@@ -11,7 +11,7 @@ use omp_app::chat_ui::presentation_authority::{
 };
 use omp_env::EnvClient;
 use omp_envd::{
-	EnvServer, RegistryBridges,
+	EnvServer, ExtensionDataBinding, RegistryBridges,
 	exthost::{
 		UiControlAuthority,
 		control::{
@@ -24,6 +24,7 @@ use omp_envd::{
 use omp_proto::{SCHEMA_REV, env::v1::ClientHello};
 use omp_tool::Registry;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
 	Context as _, Result,
@@ -32,15 +33,32 @@ use crate::{
 
 /// Real local Environment plus its owned Python extension-host process tree.
 pub struct ExtensionHarness {
-	client: EnvClient,
-	server: Arc<EnvServer>,
-	task:   Option<JoinHandle<()>>,
+	client:        EnvClient,
+	server:        Arc<EnvServer>,
+	task:          Option<JoinHandle<()>>,
+	data_tasks:    Vec<JoinHandle<()>>,
+	data_shutdown: CancellationToken,
 }
 
 impl ExtensionHarness {
 	/// Starts envd in process while extension and worker entrypoints re-enter
 	/// the production `omp_e2e_host` child executable.
-	pub async fn spawn(scratch: &Scratch, config: ExtHostConfig) -> Result<Self> {
+	pub async fn spawn(scratch: &Scratch, mut config: ExtHostConfig) -> Result<Self> {
+		let mut data_bindings = Vec::new();
+		for extension in &mut config.extensions {
+			let mut binding = ExtensionDataBinding::scoped(
+				scratch.state(),
+				extension.key.clone(),
+				config.session_id.as_str(),
+				config.session_generation,
+				extension.data_grants.clone(),
+			);
+			binding
+				.prepare_endpoint()
+				.context("preparing extension DATA endpoint")?;
+			extension.data_socket = Some(binding.path().to_owned());
+			data_bindings.push(binding);
+		}
 		let server = Arc::new(
 			EnvServer::open_local(
 				scratch.project(),
@@ -52,6 +70,17 @@ impl ExtensionHarness {
 			.await
 			.context("opening extension proof environment")?,
 		);
+		let data_shutdown = CancellationToken::new();
+		let data_tasks = data_bindings
+			.into_iter()
+			.map(|binding| {
+				let server = Arc::clone(&server);
+				let shutdown = data_shutdown.clone();
+				tokio::spawn(async move {
+					let _ = server.serve_extension_uds(binding, shutdown).await;
+				})
+			})
+			.collect();
 		let (client, transport) = EnvClient::in_process(64);
 		client.set_admitter(AllowAdmission);
 		let task_server = Arc::clone(&server);
@@ -66,7 +95,13 @@ impl ExtensionHarness {
 			}),
 		)
 		.await??;
-		Ok(Self { client, server, task: Some(task) })
+		Ok(Self {
+			client,
+			server,
+			task: Some(task),
+			data_tasks,
+			data_shutdown,
+		})
 	}
 
 	/// Returns the hello-complete Environment client.
@@ -80,8 +115,16 @@ impl ExtensionHarness {
 	}
 
 	/// Returns the live extension-backed hook admission gate.
+	pub fn admission_gate(&self) -> Arc<omp_agent::HookGate> {
+		self.server.admission_gate()
+	}
+
 	/// Stops the connection task and drops the server-owned child process tree.
 	pub async fn shutdown(mut self) {
+		self.data_shutdown.cancel();
+		for task in self.data_tasks.drain(..) {
+			let _ = task.await;
+		}
 		if let Some(task) = self.task.take() {
 			task.abort();
 			let _ = task.await;
@@ -91,6 +134,10 @@ impl ExtensionHarness {
 
 impl Drop for ExtensionHarness {
 	fn drop(&mut self) {
+		self.data_shutdown.cancel();
+		for task in self.data_tasks.drain(..) {
+			task.abort();
+		}
 		if let Some(task) = self.task.take() {
 			task.abort();
 		}

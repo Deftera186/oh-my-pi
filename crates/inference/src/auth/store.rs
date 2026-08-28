@@ -767,6 +767,25 @@ impl CredentialStore {
 		account_id: &AccountId<str>,
 		grant: &ScopedCredentialGrant,
 	) -> Result<ScopedCredentialToken, StoreError> {
+		self.mint_scoped_token_inner(account_id, grant, false)
+	}
+
+	/// Mints a grant or replays its original expiration when an RPC retry
+	/// reconstructs the same durable request.
+	pub fn mint_scoped_token_replay(
+		&self,
+		account_id: &AccountId<str>,
+		grant: &ScopedCredentialGrant,
+	) -> Result<ScopedCredentialToken, StoreError> {
+		self.mint_scoped_token_inner(account_id, grant, true)
+	}
+
+	fn mint_scoped_token_inner(
+		&self,
+		account_id: &AccountId<str>,
+		grant: &ScopedCredentialGrant,
+		replay_expiration: bool,
+	) -> Result<ScopedCredentialToken, StoreError> {
 		if grant.extension.is_empty()
 			|| grant.caller_principal.is_empty()
 			|| grant.provider.is_empty()
@@ -808,13 +827,17 @@ impl CredentialStore {
 				},
 			)
 			.optional()?;
+		let mut effective = grant.clone();
+		if replay_expiration && let Some(existing) = &existing {
+			effective.expires_at_ms = existing.5;
+		}
 		let key = if let Some(existing) = existing {
 			if existing.0 != account_id.as_str()
-				|| existing.1 != grant.caller_principal.as_str()
-				|| existing.2 != grant.provider.as_str()
-				|| existing.3 != grant.facet.as_str()
-				|| existing.4 != grant.session_generation
-				|| existing.5 != grant.expires_at_ms
+				|| existing.1 != effective.caller_principal.as_str()
+				|| existing.2 != effective.provider.as_str()
+				|| existing.3 != effective.facet.as_str()
+				|| existing.4 != effective.session_generation
+				|| existing.5 != effective.expires_at_ms
 			{
 				return Err(StoreError::InvalidScopedGrant);
 			}
@@ -828,15 +851,15 @@ impl CredentialStore {
 				 created_at_ms
 				 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
 				params![
-					grant.extension.as_str(),
-					grant.caller_principal.as_str(),
-					grant.provider.as_str(),
-					grant.facet.as_str(),
-					grant.host_generation,
-					grant.session_generation,
-					grant.request_id,
+					effective.extension.as_str(),
+					effective.caller_principal.as_str(),
+					effective.provider.as_str(),
+					effective.facet.as_str(),
+					effective.host_generation,
+					effective.session_generation,
+					effective.request_id,
 					account_id.as_str(),
-					grant.expires_at_ms,
+					effective.expires_at_ms,
 					key.id().as_str(),
 					unix_ms(SystemTime::now())?,
 				],
@@ -844,10 +867,10 @@ impl CredentialStore {
 			key
 		};
 		transaction.commit()?;
-		let token = scoped_token_material(&key, account_id, grant);
+		let token = scoped_token_material(&key, account_id, &effective);
 		Ok(ScopedCredentialToken {
 			token:         SecretString::from(token),
-			expires_at_ms: grant.expires_at_ms,
+			expires_at_ms: effective.expires_at_ms,
 		})
 	}
 

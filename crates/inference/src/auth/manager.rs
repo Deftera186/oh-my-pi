@@ -40,6 +40,7 @@ use crate::{
 		AuthResponse, AuthSession,
 	},
 	call::{AccountRoutingContext, AuthInput, AuthMethod, AuthRequest, LoginRequest},
+	codec::{CredentialDisabledObservation, ProviderRefreshReason, ProviderResponseHooks},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	id::{AccountId, LoginSessionId, PrincipalId, RegionId},
 	receipt::ExecutionReceipt,
@@ -194,6 +195,7 @@ impl AuthControlHandle {
 		&self,
 		account: &AccountId<str>,
 		enabled: bool,
+		cause: Option<&str>,
 	) -> Result<AccountRecord, StoreError> {
 		if !self
 			.manager
@@ -203,11 +205,22 @@ impl AuthControlHandle {
 		{
 			return Err(StoreError::NotFound);
 		}
-		self
+		let record = self
 			.manager
 			.accounts
 			.account(account)
-			.ok_or(StoreError::NotFound)
+			.ok_or(StoreError::NotFound)?;
+		if !enabled {
+			let hooks = self.manager.provider_hooks.lock().clone();
+			if hooks.credential_disabled_subscribed() {
+				hooks.observe_credential_disabled(CredentialDisabledObservation {
+					provider: record.provider.clone(),
+					account:  Some(record.account.clone()),
+					cause:    Str::new(cause.unwrap_or("disabled")),
+				});
+			}
+		}
+		Ok(record)
 	}
 
 	/// Durably records one client-observed rate block.
@@ -257,6 +270,31 @@ impl AuthControlHandle {
 			.collect()
 	}
 
+	/// Clears selected durable block scopes, or every scope when empty.
+	pub fn clear_blocks(&self, account: &AccountId<str>, scopes: &[Str]) -> Result<(), StoreError> {
+		if self.manager.accounts.account(account).is_none() {
+			return Err(StoreError::NotFound);
+		}
+		self
+			.manager
+			.accounts
+			.clear_rate(account, scopes)
+			.map_err(|_| StoreError::AccountState)
+	}
+
+	/// Invalidates cached provider usage observations.
+	pub fn invalidate_usage(
+		&self,
+		provider: Option<&ProviderId<str>>,
+		account: Option<&AccountId<str>>,
+	) -> Result<(), StoreError> {
+		self
+			.manager
+			.accounts
+			.invalidate_usage(provider, account)
+			.map_err(|_| StoreError::AccountState)
+	}
+
 	/// Mints one idempotent scoped token from the credential store's durable
 	/// grant ledger.
 	pub fn mint_scoped_token(
@@ -265,6 +303,16 @@ impl AuthControlHandle {
 		grant: &ScopedCredentialGrant,
 	) -> Result<ScopedCredentialToken, StoreError> {
 		self.manager.store.mint_scoped_token(account, grant)
+	}
+
+	/// Mints or replays a scoped token while preserving the expiration recorded
+	/// by the first RPC attempt.
+	pub fn mint_scoped_token_replay(
+		&self,
+		account: &AccountId<str>,
+		grant: &ScopedCredentialGrant,
+	) -> Result<ScopedCredentialToken, StoreError> {
+		self.manager.store.mint_scoped_token_replay(account, grant)
 	}
 
 	/// Forces refresh through the manager's existing single-flight engine.
@@ -415,6 +463,8 @@ pub trait AuthLoginEngine: Send + Sync {
 pub trait AuthRefreshEngine: Send + Sync {
 	/// Refreshes one exact account and returns its secret-free state.
 	fn refresh(&self, account: AccountId) -> BoxFuture<'_, Result<AccountSummary, Error>>;
+	/// Binds the session extension hook sink used by automatic refreshes.
+	fn bind_provider_hooks(&self, _hooks: ProviderResponseHooks) {}
 }
 
 /// Construction failure for a static secret login engine.
@@ -1003,11 +1053,12 @@ pub struct StoredOAuthRefreshEngine<C, K> {
 	clock:       Arc<K>,
 	custom:      Arc<OAuthCustomDispatcher>,
 	coordinator: Arc<RefreshCoordinator>,
+	hooks:       Arc<Mutex<ProviderResponseHooks>>,
 }
 
 impl<C, K> StoredOAuthRefreshEngine<C, K> {
 	/// Constructs an OAuth refresh adapter over one shared coordinator.
-	pub const fn new(
+	pub fn new(
 		catalog: Arc<Catalog>,
 		store: Arc<CredentialStore>,
 		accounts: AccountPool,
@@ -1016,7 +1067,16 @@ impl<C, K> StoredOAuthRefreshEngine<C, K> {
 		custom: Arc<OAuthCustomDispatcher>,
 		coordinator: Arc<RefreshCoordinator>,
 	) -> Self {
-		Self { catalog, store, accounts, http, clock, custom, coordinator }
+		Self {
+			catalog,
+			store,
+			accounts,
+			http,
+			clock,
+			custom,
+			coordinator,
+			hooks: Arc::new(Mutex::new(ProviderResponseHooks::default())),
+		}
 	}
 }
 
@@ -1033,11 +1093,80 @@ where
 		let clock = Arc::clone(&self.clock);
 		let custom = Arc::clone(&self.custom);
 		let coordinator = Arc::clone(&self.coordinator);
+		let hooks = self.hooks.lock().clone();
 		async move {
 			let record = accounts.account(&account).ok_or_else(auth_not_found)?;
 			let provider = catalog
 				.provider(&record.provider)
 				.ok_or_else(auth_not_found)?;
+			if hooks.provider_refresh_subscribed(&record.provider) {
+				let metadata = store
+					.metadata(&account)
+					.map_err(|_| auth_store_failure())?
+					.ok_or_else(auth_not_found)?;
+				if metadata.principal_id != record.principal {
+					return Err(auth_store_failure());
+				}
+				let requested_at = clock.now();
+				let expires_at = metadata
+					.expires_at_ms
+					.map(system_time_from_millis)
+					.transpose()?;
+				let request = RefreshRequest {
+					account: account.clone(),
+					principal: record.principal.clone(),
+					rejected: CredentialFreshness {
+						generation: metadata.generation,
+						issued_at: Some(system_time_from_millis(metadata.updated_at_ms)?),
+						expires_at,
+						observed_at: requested_at,
+					},
+					requested_at,
+				};
+				let outcome = match OAuthEngine::new(http.as_ref(), clock.as_ref())
+					.refresh_extension_persisted(
+						&coordinator,
+						Arc::clone(&store),
+						hooks.clone(),
+						record.provider.clone(),
+						Some(Str::from(record.principal.as_str())),
+						request,
+						ProviderRefreshReason::Expiring,
+						CredentialOrigin::Persistent,
+					)
+					.await
+				{
+					Ok(outcome) => outcome,
+					Err(error) => {
+						let _ = accounts.set_enabled(&account, false);
+						if hooks.credential_disabled_subscribed() {
+							hooks.observe_credential_disabled(CredentialDisabledObservation {
+								provider: record.provider.clone(),
+								account:  Some(account.clone()),
+								cause:    sf!("provider_refresh"),
+							});
+						}
+						return Err(oauth_manager_error(error));
+					},
+				};
+				if !accounts
+					.update_credential_generation(
+						&account,
+						&record.principal,
+						outcome.result.freshness.generation,
+					)
+					.map_err(|_| auth_store_failure())?
+				{
+					return Err(auth_store_failure());
+				}
+				return Ok(AccountSummary {
+					account,
+					provider: record.provider,
+					principal: Some(record.principal),
+					label: None,
+					state: AccountState::Active,
+				});
+			}
 			let mut runtime = None;
 			for id in &provider.auth {
 				let auth = catalog.auth_spec(id).ok_or_else(auth_not_found)?;
@@ -1127,6 +1256,10 @@ where
 		}
 		.boxed()
 	}
+
+	fn bind_provider_hooks(&self, hooks: ProviderResponseHooks) {
+		*self.hooks.lock() = hooks;
+	}
 }
 
 /// Typed failure constructing a complete direct authentication service.
@@ -1156,14 +1289,15 @@ struct AuthSessionControl {
 /// codecs.
 #[derive(Clone)]
 pub struct AuthManager {
-	catalog:  Arc<Catalog>,
-	store:    Arc<CredentialStore>,
-	broker:   CredentialBroker,
-	accounts: AccountPool,
-	affinity: Option<CredentialAffinityResolver>,
-	login:    Arc<BTreeMap<AuthMethodKey, Vec<Arc<dyn AuthLoginEngine>>>>,
-	refresh:  Arc<dyn AuthRefreshEngine>,
-	sessions: Arc<Mutex<BTreeMap<LoginSessionId, AuthSessionControl>>>,
+	catalog:        Arc<Catalog>,
+	store:          Arc<CredentialStore>,
+	broker:         CredentialBroker,
+	accounts:       AccountPool,
+	affinity:       Option<CredentialAffinityResolver>,
+	login:          Arc<BTreeMap<AuthMethodKey, Vec<Arc<dyn AuthLoginEngine>>>>,
+	refresh:        Arc<dyn AuthRefreshEngine>,
+	sessions:       Arc<Mutex<BTreeMap<LoginSessionId, AuthSessionControl>>>,
+	provider_hooks: Arc<Mutex<ProviderResponseHooks>>,
 }
 
 impl AuthManager {
@@ -1199,12 +1333,20 @@ impl AuthManager {
 			login: Arc::new(login),
 			refresh,
 			sessions: Arc::new(Mutex::new(BTreeMap::new())),
+			provider_hooks: Arc::new(Mutex::new(ProviderResponseHooks::default())),
 		})
 	}
 
 	/// Returns a narrow clone-cheap handle for authenticated lifecycle CONTROL.
 	pub fn control_handle(&self) -> AuthControlHandle {
 		AuthControlHandle { manager: self.clone() }
+	}
+
+	/// Binds the session-owned provider hook sink to credential lifecycle
+	/// events.
+	pub fn bind_provider_hooks(&self, hooks: ProviderResponseHooks) {
+		*self.provider_hooks.lock() = hooks.clone();
+		self.refresh.bind_provider_hooks(hooks);
 	}
 
 	/// Installs the credential-authority-owned opaque affinity resolver.
@@ -1313,6 +1455,63 @@ impl AuthManager {
 			.ok_or_else(auth_not_found)?;
 		let (spec, method) = select_auth_spec(&self.catalog, &provider.auth, request.method)?
 			.ok_or_else(auth_not_found)?;
+		let hooks = self.provider_hooks.lock().clone();
+		if hooks.provider_login_subscribed(&request.provider) {
+			let credential = hooks
+				.provider_login(crate::codec::ProviderLoginHookRequest {
+					provider: request.provider.clone(),
+					method,
+				})
+				.await
+				.map_err(|_| auth_unavailable())?;
+			let identity = credential
+				.identity
+				.clone()
+				.unwrap_or_else(|| sf!("extension"));
+			let principal = PrincipalId::from(identity.as_str());
+			let summary = if credential.kind.as_str() == "oauth" {
+				let refresh_token = credential.refresh_token.ok_or_else(auth_unavailable)?;
+				let (_, record) = self
+					.control_handle()
+					.import_oauth(OAuthControlImport {
+						provider: request.provider.clone(),
+						principal: principal.clone(),
+						identity: credential.identity,
+						access_token: Some(credential.secret),
+						refresh_token,
+						expires_at_ms: credential.expires_at_ms,
+					})
+					.map_err(auth_store_error)?;
+				AccountSummary {
+					account:   record.account,
+					provider:  record.provider,
+					principal: Some(record.principal),
+					label:     None,
+					state:     AccountState::Active,
+				}
+			} else {
+				let secret = credential.secret.expose_secret().as_bytes().to_vec();
+				let (_, record) = self
+					.control_handle()
+					.store(CredentialControlWrite {
+						provider:      request.provider.clone(),
+						principal:     principal.clone(),
+						identity:      credential.identity,
+						kind:          credential.kind,
+						secret:        Secret::from(secret),
+						expires_at_ms: credential.expires_at_ms,
+					})
+					.map_err(auth_store_error)?;
+				AccountSummary {
+					account:   record.account,
+					provider:  record.provider,
+					principal: Some(record.principal),
+					label:     None,
+					state:     AccountState::Active,
+				}
+			};
+			return Ok(AuthAnswer::Refreshed(summary));
+		}
 		let engines = self
 			.login
 			.get(&AuthMethodKey::from(method))

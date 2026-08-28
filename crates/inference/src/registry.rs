@@ -110,6 +110,17 @@ impl Registry {
 		self.inner.auth_manager.is_some()
 	}
 
+	/// Reports whether direct route-independent usage operations are
+	/// constructed.
+	pub fn contains_usage_manager(&self) -> bool {
+		self.inner.usage_manager.is_some()
+	}
+
+	/// Returns the constructed route-independent usage manager.
+	pub fn usage_manager(&self) -> Option<ConsoleUsageManager> {
+		self.inner.usage_manager.clone()
+	}
+
 	/// Returns typed construction evidence for an unavailable route.
 	pub fn unavailability(&self, route: &RouteId<str>) -> Option<&RouteUnavailable> {
 		match self.inner.bindings.get(route) {

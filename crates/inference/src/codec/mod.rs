@@ -2,6 +2,7 @@
 
 use std::{
 	fmt,
+	future::Future,
 	pin::Pin,
 	sync::{
 		Arc,
@@ -20,6 +21,7 @@ use omp_catalog::{
 	WireTarget, policy::WirePolicy,
 };
 use omp_core::{IntoStr, Str, sf};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use smallvec::SmallVec;
 
 use crate::{
@@ -53,6 +55,12 @@ pub mod openai_embedding;
 pub mod openai_media;
 pub mod openai_realtime;
 pub mod openai_responses;
+pub mod provider_hooks;
+pub use provider_hooks::{
+	ModelsDiscoverHookPage, ModelsDiscoverHookRequest, ProviderHookCredential, ProviderHookError,
+	ProviderHookObserver, ProviderLoginHookRequest, ProviderRefreshHookRequest,
+	ProviderRefreshReason, ProviderSignHookRequest, ProviderSignature,
+};
 
 pub mod bedrock;
 pub mod devin;
@@ -79,7 +87,8 @@ pub mod search_tavily;
 pub mod search_tinyfish;
 /// HTTP method used by a wire request without pulling policy into the
 /// transport.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "UPPERCASE")]
 pub enum RequestMethod {
 	/// Read a resource.
 	Get,
@@ -1001,37 +1010,95 @@ pub struct ProviderResponseObservation {
 }
 
 /// Bounded provider request facts exposed before canonical wire encoding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BeforeRequestDraft {
 	/// Catalog provider identity.
+	pub provider:             ProviderId,
 	/// Concrete route selected for this attempt.
+	pub route:                RouteId,
 	/// Normalized model identity, when the operation has one.
+	pub model:                Option<ModelKey>,
 	/// Closed operation vocabulary.
+	pub operation:            OperationKind,
 	/// Top-level scalar settings; message content is never included.
+	pub scalars:              JsonMap<String, JsonValue>,
 	/// Public headers known before codec lowering.
+	pub headers:              Box<[RequestHeader]>,
 	/// Negotiated intents in their canonical CONTROL representation.
+	pub intents:              Box<[JsonValue]>,
 	/// Number of canonical chat messages without their content.
+	pub message_count:        usize,
 	/// Prompt-size estimate when one is already available.
+	pub approx_prompt_tokens: Option<u64>,
+}
+
 /// Accepted `before_request` transform after ordered host composition.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BeforeRequestMutation {
 	/// Shallow top-level request-body overlay.
+	pub body:    JsonMap<String, JsonValue>,
 	/// Public header replacements; `None` removes a header.
+	pub headers: Box<[(Str, Option<Str>)]>,
 	/// Optional narrowing of the draft's capability intents.
+	pub intents: Option<Box<[JsonValue]>>,
 	/// Optional tighter transport timeout.
+	pub timeout: Option<Duration>,
+}
+
 /// Explicit `before_request` denial returned by a subscribed extension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeforeRequestDenied {
 	/// User-safe denial reason.
+	pub reason: Str,
 	/// Stable extension-provided classifier, when present.
-/// Session hook sink for provider response observations.
-pub trait ProviderResponseObserver: Send + Sync + 'static {
+	pub code:   Option<Str>,
+}
+
+/// Secret-free credential disable facts emitted by the auth authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialDisabledObservation {
+	/// Catalog provider identity.
+	pub provider: ProviderId,
+	/// Stable account identity, when known.
+	pub account:  Option<AccountId>,
+	/// Authority-supplied disable cause.
+	pub cause:    Str,
+}
+
+/// Session hook sink for provider request gates and response observations.
+pub trait ProviderResponseObserver: provider_hooks::ProviderHookObserver {
 	/// Returns the subscription bitmap bit without constructing a payload.
 	fn subscribed(&self) -> bool;
 	/// Offers one already-sanitized response payload.
 	fn observe(&self, observation: ProviderResponseObservation);
+
 	/// Returns whether `before_request` has any subscribed handler.
+	fn before_request_subscribed(&self) -> bool {
+		false
+	}
+
 	/// Composes one bounded pre-encoding request gate.
 	///
 	/// Callback failures are fail-open and return the default mutation. Only
 	/// an explicit hook denial returns [`BeforeRequestDenied`].
+	fn before_request<'a>(
+		&'a self,
+		_draft: &'a BeforeRequestDraft,
+	) -> Pin<Box<dyn Future<Output = Result<BeforeRequestMutation, BeforeRequestDenied>> + Send + 'a>>
+	{
+		Box::pin(async { Ok(BeforeRequestMutation::default()) })
+	}
+
+	/// Returns whether `credential_disabled` has any subscribed observer.
+	fn credential_disabled_subscribed(&self) -> bool {
+		false
+	}
+
+	/// Offers one secret-free credential disable observation.
+	fn observe_credential_disabled(&self, _observation: CredentialDisabledObservation) {}
 }
 
-/// Clone-cheap optional provider response hook sink.
+/// Clone-cheap optional provider request/response hook sink.
 #[derive(Clone, Default)]
 pub struct ProviderResponseHooks(Option<Arc<dyn ProviderResponseObserver>>);
 
@@ -1056,8 +1123,118 @@ impl ProviderResponseHooks {
 			observer.observe(observation);
 		}
 	}
+
 	/// Returns the `before_request` subscription bitmap bit.
+	#[inline]
+	pub fn before_request_subscribed(&self) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.before_request_subscribed())
+	}
+
 	/// Composes one bounded request gate through the installed session sink.
+	pub async fn before_request(
+		&self,
+		draft: &BeforeRequestDraft,
+	) -> Result<BeforeRequestMutation, BeforeRequestDenied> {
+		match &self.0 {
+			Some(observer) => observer.before_request(draft).await,
+			None => Ok(BeforeRequestMutation::default()),
+		}
+	}
+
+	/// Returns the `credential_disabled` subscription bitmap bit.
+	#[inline]
+	pub fn credential_disabled_subscribed(&self) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.credential_disabled_subscribed())
+	}
+
+	/// Offers one credential disable observation to the installed session sink.
+	pub fn observe_credential_disabled(&self, observation: CredentialDisabledObservation) {
+		if let Some(observer) = &self.0 {
+			observer.observe_credential_disabled(observation);
+		}
+	}
+
+	/// Returns whether `provider_login` has a provider-matching handler.
+	pub fn provider_login_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.provider_login_subscribed(provider))
+	}
+
+	/// Dispatches one fail-closed extension login.
+	pub async fn provider_login(
+		&self,
+		request: ProviderLoginHookRequest,
+	) -> Result<ProviderHookCredential, ProviderHookError> {
+		match &self.0 {
+			Some(observer) => observer.provider_login(request).await,
+			None => Err(ProviderHookError::Unavailable),
+		}
+	}
+
+	/// Returns whether `provider_refresh` has a provider-matching handler.
+	pub fn provider_refresh_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.provider_refresh_subscribed(provider))
+	}
+
+	/// Dispatches one fail-closed extension refresh.
+	pub async fn provider_refresh(
+		&self,
+		request: ProviderRefreshHookRequest,
+	) -> Result<ProviderHookCredential, ProviderHookError> {
+		match &self.0 {
+			Some(observer) => observer.provider_refresh(request).await,
+			None => Err(ProviderHookError::Unavailable),
+		}
+	}
+
+	/// Returns whether `provider_sign` has a provider-matching handler.
+	pub fn provider_sign_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.provider_sign_subscribed(provider))
+	}
+
+	/// Dispatches one fail-closed attempt signer.
+	pub async fn provider_sign(
+		&self,
+		request: ProviderSignHookRequest,
+	) -> Result<ProviderSignature, ProviderHookError> {
+		match &self.0 {
+			Some(observer) => observer.provider_sign(request).await,
+			None => Err(ProviderHookError::Unavailable),
+		}
+	}
+
+	/// Returns whether `models_discover` has a provider-matching handler.
+	pub fn models_discover_subscribed(&self, provider: &ProviderId<str>) -> bool {
+		self
+			.0
+			.as_ref()
+			.is_some_and(|observer| observer.models_discover_subscribed(provider))
+	}
+
+	/// Dispatches one fail-open-at-caller extension discovery page.
+	pub async fn models_discover(
+		&self,
+		request: ModelsDiscoverHookRequest,
+	) -> Result<ModelsDiscoverHookPage, ProviderHookError> {
+		match &self.0 {
+			Some(observer) => observer.models_discover(request).await,
+			None => Err(ProviderHookError::Unavailable),
+		}
+	}
 }
 
 impl fmt::Debug for ProviderResponseHooks {
@@ -1076,6 +1253,9 @@ pub struct TransportRequest {
 	/// Credentials applied at the innermost boundary and ignored by logs and
 	/// cassettes.
 	pub credentials:    Option<AppliedCredentials>,
+	/// Sensitive extension-produced signing additions applied beside
+	/// credentials only at the innermost transport boundary.
+	pub signature:      Option<ProviderSignature>,
 	/// Fresh ordinary provider decoder, present exactly when `realtime` is
 	/// absent.
 	pub decoder:        Option<DecoderState>,

@@ -584,6 +584,33 @@ impl AccountStateStore {
 		Ok(())
 	}
 
+	/// Clears selected durable rate windows for one account, or every window
+	/// when the selection is empty.
+	pub fn clear_rate(
+		&self,
+		account: &AccountId<str>,
+		scopes: &[Str],
+	) -> Result<(), AccountStateStoreError> {
+		let _guard = self.writes.lock();
+		let mut connection = self.connection()?;
+		let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+		if scopes.is_empty() {
+			transaction.execute("DELETE FROM account_state_rate_receipts WHERE account_id = ?1", [
+				account.as_str(),
+			])?;
+		} else {
+			for scope in scopes {
+				transaction.execute(
+					"DELETE FROM account_state_rate_receipts
+					 WHERE account_id = ?1 AND window_id = ?2",
+					params![account.as_str(), scope.as_str()],
+				)?;
+			}
+		}
+		transaction.commit()?;
+		Ok(())
+	}
+
 	/// Appends one partial quota receipt atomically.
 	pub fn append_quota(
 		&self,

@@ -12,13 +12,14 @@ use std::{
 };
 
 use futures::StreamExt as _;
-use http::HeaderValue;
+use http::{HeaderName, HeaderValue};
 use omp_catalog::{
 	OperationBits, OperationKind,
 	provider::{AuthSpecKind, CodecProfile, DiscoveryKind, RouteDef, TransportKind},
 	snapshot::Catalog,
 };
 use omp_core::{ExposeSecret as _, Str, sf};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use tower::{Service, ServiceExt as _, util::BoxCloneSyncService};
 use url::Url;
 
@@ -39,8 +40,9 @@ use crate::{
 	},
 	catalog::{AuthSpecId, RouteId},
 	codec::{
-		Cancellation, Codec, DecodeContext, DecoderState, EncodeAttempt, EncodeContext,
-		EncodedRequest, HandshakenResponse, NativeResponseFormat, ProviderStateEvent, RawEvent,
+		BeforeRequestDenied, BeforeRequestDraft, BeforeRequestMutation, Cancellation, Codec,
+		DecodeContext, DecoderState, EncodeAttempt, EncodeContext, EncodedRequest,
+		HandshakenResponse, NativeResponseFormat, ProviderStateEvent, RawEvent,
 		RealtimeWireCodecState, RequestHeader, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
 		bedrock::{BedrockConverseCodec, BedrockGuardrail, BedrockOptions, guardrail_arn_region},
@@ -248,6 +250,7 @@ impl Service<TransportRequest> for ProtocolTransport {
 				let creation_request = TransportRequest {
 					encoded:        creation,
 					credentials:    request.credentials.clone(),
+					signature:      request.signature.clone(),
 					decoder:        Some(Box::new(WorkflowCreationDecoder::new())),
 					realtime:       None,
 					cancel:         request.cancel.clone(),
@@ -1241,10 +1244,39 @@ fn azure_effective_route(
 }
 
 impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
+	fn before_request(
+		&self,
+		call: &mut Call,
+		execution: &ExecutionContext,
+	) -> impl Future<Output = Result<BeforeRequestMutation, Error>> + Send {
+		let route = self.route.clone();
+		let headers = self.headers.clone();
+		let execution = execution.clone();
+		async move {
+			if !call.response_hooks.before_request_subscribed() {
+				return Ok(BeforeRequestMutation::default());
+			}
+			let draft = before_request_draft(call, &route, headers);
+			let mutation = call
+				.response_hooks
+				.before_request(&draft)
+				.await
+				.map_err(|denial| before_request_denied(&execution, denial))?;
+			narrow_before_request_intents(
+				call,
+				&draft.intents,
+				mutation.intents.as_deref(),
+				&execution,
+			)?;
+			Ok(mutation)
+		}
+	}
+
 	fn encode(
 		&self,
 		call: &Call,
 		lease: &Option<CredentialLease>,
+		mutation: &BeforeRequestMutation,
 		execution: &ExecutionContext,
 		attempt: u32,
 		provisional: bool,
@@ -1348,6 +1380,7 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			execution,
 		)?;
 		merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
+		apply_before_request_mutation(&mut encoded, mutation, execution)?;
 		let header_names = encoded
 			.headers
 			.iter()
@@ -1367,6 +1400,9 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			&capture_payload,
 		);
 		let mut timeout = self.transport_timeout;
+		if let Some(hook_timeout) = mutation.timeout {
+			timeout = timeout.min(hook_timeout);
+		}
 		if let Some(deadline) = call.deadline {
 			timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
 		}
@@ -1410,6 +1446,7 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 		Ok(TransportRequest {
 			encoded,
 			credentials: None,
+			signature: None,
 			decoder,
 			realtime,
 			cancel,
@@ -1429,6 +1466,250 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			},
 		})
 	}
+}
+
+fn before_request_draft(
+	call: &Call,
+	route: &RouteDef,
+	headers: Box<[RequestHeader]>,
+) -> BeforeRequestDraft {
+	let plan = call
+		.execution
+		.as_ref()
+		.expect("request gate runs only after plan validation");
+	let mut scalars = JsonMap::new();
+	let mut intents = Vec::new();
+	let mut message_count = 0;
+	if let OperationCall::Chat(chat) = &call.operation {
+		message_count = chat.messages.len();
+		if let Some(value) = chat.sampling.temperature {
+			scalars.insert("temperature".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.top_p {
+			scalars.insert("top_p".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.top_k {
+			scalars.insert("top_k".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.min_p {
+			scalars.insert("min_p".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.seed {
+			scalars.insert("seed".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.presence_penalty {
+			scalars.insert("presence_penalty".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.frequency_penalty {
+			scalars.insert("frequency_penalty".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.sampling.repetition_penalty {
+			scalars.insert("repetition_penalty".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.max_output_tokens {
+			scalars.insert("max_output_tokens".to_owned(), json!(value));
+		}
+		if let Some(value) = chat.top_logprobs {
+			scalars.insert("top_logprobs".to_owned(), json!(value));
+		}
+		let mut push_intent = |kind: &'static str| {
+			intents.push(json!({
+				"kind": kind,
+				"on_unsupported": "unspecified",
+				"priority": 0,
+				"payload": null,
+			}));
+		};
+		if !matches!(chat.tool_choice, Setting::Unset) {
+			push_intent("force_call");
+		}
+		if !matches!(chat.output, Setting::Unset) {
+			push_intent("strict");
+		}
+		if !matches!(chat.reasoning, Setting::Unset) {
+			push_intent("reasoning");
+		}
+		if !matches!(chat.verbosity, Setting::Unset) {
+			push_intent("verbosity");
+		}
+		if !matches!(chat.cache_retention, Setting::Unset) {
+			push_intent("cache_retention");
+		}
+		if !matches!(chat.service_tier, Setting::Unset) {
+			push_intent("service_tier");
+		}
+		if !chat.hosted_tools.is_empty() {
+			push_intent("hosted_tool");
+		}
+		if !chat.safety.is_empty() {
+			push_intent("safety");
+		}
+		if chat.sampling.seed.is_some() {
+			push_intent("determinism");
+		}
+	}
+	BeforeRequestDraft {
+		provider: plan.provider.clone(),
+		route: route.id.clone(),
+		model: plan.model.clone(),
+		operation: call.operation.kind(),
+		scalars,
+		headers,
+		intents: intents.into_boxed_slice(),
+		message_count,
+		approx_prompt_tokens: None,
+	}
+}
+
+fn narrow_before_request_intents(
+	call: &mut Call,
+	original: &[JsonValue],
+	effective: Option<&[JsonValue]>,
+	execution: &ExecutionContext,
+) -> Result<(), Error> {
+	let Some(effective) = effective else {
+		return Ok(());
+	};
+	if effective.iter().any(|intent| !original.contains(intent)) {
+		return Err(before_request_contract(execution, "before-request-intents-widened"));
+	}
+	let OperationCall::Chat(chat) = &mut call.operation else {
+		return Ok(());
+	};
+	let retained = |kind: &str| {
+		effective.iter().any(|intent| {
+			intent
+				.get("kind")
+				.and_then(JsonValue::as_str)
+				.is_some_and(|candidate| candidate == kind)
+		})
+	};
+	let chat = Arc::make_mut(chat);
+	if !retained("force_call") {
+		chat.tool_choice = Setting::Unset;
+	}
+	if !retained("strict") && !retained("grammar") {
+		chat.output = Setting::Unset;
+	}
+	if !retained("reasoning") {
+		chat.reasoning = Setting::Unset;
+	}
+	if !retained("verbosity") {
+		chat.verbosity = Setting::Unset;
+	}
+	if !retained("cache_retention") {
+		chat.cache_retention = Setting::Unset;
+	}
+	if !retained("service_tier") {
+		chat.service_tier = Setting::Unset;
+	}
+	if !retained("hosted_tool") {
+		chat.hosted_tools = Arc::from([]);
+	}
+	if !retained("safety") {
+		chat.safety = Arc::from([]);
+	}
+	if !retained("determinism") {
+		chat.sampling.seed = None;
+	}
+	Ok(())
+}
+
+fn apply_before_request_mutation(
+	encoded: &mut EncodedRequest,
+	mutation: &BeforeRequestMutation,
+	execution: &ExecutionContext,
+) -> Result<(), Error> {
+	if !mutation.body.is_empty() {
+		if encoded.operation == OperationKind::Chat
+			&& mutation
+				.body
+				.keys()
+				.any(|field| matches!(field.as_str(), "messages" | "input" | "contents" | "system"))
+		{
+			return Err(before_request_contract(
+				execution,
+				"before-request-message-mutation-prohibited",
+			));
+		}
+		let BodySource::Bytes(bytes) = &encoded.body else {
+			return Err(before_request_contract(execution, "before-request-body-is-not-bounded-json"));
+		};
+		let mut body = serde_json::from_slice::<JsonValue>(bytes)
+			.map_err(|_| before_request_contract(execution, "before-request-body-is-not-json"))?;
+		let body = body
+			.as_object_mut()
+			.ok_or_else(|| before_request_contract(execution, "before-request-body-is-not-object"))?;
+		for (field, value) in &mutation.body {
+			body.insert(field.clone(), value.clone());
+		}
+		let bytes = serde_json::to_vec(&body)
+			.map_err(|_| before_request_contract(execution, "before-request-body-encode-failed"))?;
+		if bytes.len() as u64 > encoded.bounds.request_body {
+			return Err(before_request_contract(execution, "before-request-body-limit-exceeded"));
+		}
+		encoded.body = BodySource::bytes(bytes.into());
+	}
+	if !mutation.headers.is_empty() {
+		let mut headers = encoded
+			.headers
+			.iter()
+			.map(|header| (header.name.to_ascii_lowercase(), header.clone()))
+			.collect::<BTreeMap<_, _>>();
+		for (name, value) in &mutation.headers {
+			let normalized = name.to_ascii_lowercase();
+			if matches!(
+				normalized.as_str(),
+				"authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+			) {
+				return Err(before_request_contract(
+					execution,
+					"before-request-credential-header-prohibited",
+				));
+			}
+			normalized.parse::<HeaderName>().map_err(|_| {
+				before_request_contract(execution, "before-request-header-name-invalid")
+			})?;
+			match value {
+				Some(value) => {
+					HeaderValue::from_str(value.as_str()).map_err(|_| {
+						before_request_contract(execution, "before-request-header-value-invalid")
+					})?;
+					headers
+						.insert(normalized, RequestHeader { name: name.clone(), value: value.clone() });
+				},
+				None => {
+					headers.remove(&normalized);
+				},
+			}
+		}
+		encoded.headers = headers.into_values().collect::<Vec<_>>().into_boxed_slice();
+	}
+	Ok(())
+}
+
+fn before_request_denied(execution: &ExecutionContext, denial: BeforeRequestDenied) -> Error {
+	let mut error = Error::new(
+		ErrorKind::Authorization,
+		ErrorPhase::Admission,
+		RetryAction::Never,
+		execution.receipt(),
+	)
+	.detail(ErrorDetail::provider(denial.reason));
+	if let Some(code) = denial.code {
+		error = error.code(code);
+	}
+	error
+}
+
+fn before_request_contract(execution: &ExecutionContext, reason: &'static str) -> Error {
+	Error::new(
+		ErrorKind::InvalidRequest,
+		ErrorPhase::Encoding,
+		RetryAction::Never,
+		execution.receipt(),
+	)
+	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
 }
 
 fn merge_static_headers(
@@ -1886,6 +2167,8 @@ fn session_trust_error(context: &ExecutionContext) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
 	use bytes::Bytes;
 	use http::{Request, header::AUTHORIZATION};
 	use omp_catalog::{ModelKey, PolicyModel, ProviderId, WireTarget};
@@ -1897,8 +2180,14 @@ mod tests {
 			AuthScheme, AuthSpec, CredentialLease, CredentialShaperRegistry, LeaseMeta,
 			ShapedCredential,
 		},
-		call::{DiscoveryRequest, InferenceAttribution, NegotiationPolicy, RealtimeRequest, Target},
-		codec::google_cca::AntigravityFingerprint,
+		call::{
+			ChatRequest, DiscoveryRequest, HostedTool, InferenceAttribution, NegotiationPolicy,
+			RealtimeRequest, Sampling, Target,
+		},
+		codec::{
+			ProviderResponseObservation, ProviderResponseObserver, RequestMethod, SizeBounds,
+			google_cca::AntigravityFingerprint,
+		},
 		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision},
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
@@ -1907,6 +2196,55 @@ mod tests {
 		receipt::ExecutionBudget,
 		session::{CredentialGenerationPolicy, PendingServerStateBinding},
 	};
+	struct BeforeRequestObserver {
+		subscribed: bool,
+		calls:      AtomicUsize,
+		result:     Result<BeforeRequestMutation, BeforeRequestDenied>,
+	}
+
+	impl crate::codec::ProviderHookObserver for BeforeRequestObserver {}
+
+	impl ProviderResponseObserver for BeforeRequestObserver {
+		fn subscribed(&self) -> bool {
+			false
+		}
+
+		fn observe(&self, _: ProviderResponseObservation) {}
+
+		fn before_request_subscribed(&self) -> bool {
+			self.subscribed
+		}
+
+		fn before_request<'a>(
+			&'a self,
+			_: &'a BeforeRequestDraft,
+		) -> Pin<
+			Box<dyn Future<Output = Result<BeforeRequestMutation, BeforeRequestDenied>> + Send + 'a>,
+		> {
+			self.calls.fetch_add(1, Ordering::Relaxed);
+			let result = self.result.clone();
+			Box::pin(async move { result })
+		}
+	}
+
+	fn request_hook_chat() -> ChatRequest {
+		ChatRequest {
+			messages:          Arc::from([]),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([HostedTool::CodeExecution]),
+			tool_choice:       Setting::Prefer(ToolChoice::Required),
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Sampling::default(),
+			max_output_tokens: Some(128),
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+		}
+	}
 
 	fn lease(provider: &ProviderId<str>, secret: &str) -> CredentialLease {
 		CredentialLease::bearer(
@@ -2114,6 +2452,97 @@ mod tests {
 		)
 	}
 
+	#[tokio::test]
+	async fn before_request_transform_adds_header_and_intersects_intents() {
+		let (encoder, mut call, ..) = discovery_fixture();
+		call.operation = OperationCall::Chat(Arc::new(request_hook_chat()));
+		let retained = json!({
+			"kind": "hosted_tool",
+			"on_unsupported": "unspecified",
+			"priority": 0,
+			"payload": null,
+		});
+		let observer = Arc::new(BeforeRequestObserver {
+			subscribed: true,
+			calls:      AtomicUsize::new(0),
+			result:     Ok(BeforeRequestMutation {
+				headers: Box::new([(sf!("x-extension"), Some(sf!("enabled")))]),
+				intents: Some(Box::new([retained])),
+				..BeforeRequestMutation::default()
+			}),
+		});
+		call.response_hooks = crate::codec::ProviderResponseHooks::new(observer.clone());
+		let context = ExecutionContext::new(call.budget.clone());
+
+		let mutation = encoder
+			.before_request(&mut call, &context)
+			.await
+			.expect("transform accepted");
+
+		let OperationCall::Chat(chat) = &call.operation else {
+			panic!("chat request remains chat");
+		};
+		assert!(matches!(chat.tool_choice, Setting::Unset));
+		assert_eq!(chat.hosted_tools.len(), 1);
+		assert_eq!(observer.calls.load(Ordering::Relaxed), 1);
+
+		let mut encoded = EncodedRequest::new(
+			OperationKind::Chat,
+			RequestMethod::Post,
+			sf!("https://provider.example/chat"),
+			Box::new([]),
+			BodySource::bytes(Bytes::from_static(b"{}")),
+			crate::transport::FramingProtocol::Raw,
+			SizeBounds { request_body: 1024, frame: 1024, response: 1024 },
+		);
+		apply_before_request_mutation(&mut encoded, &mutation, &context)
+			.expect("header mutation applies");
+		assert_eq!(encoded.headers.as_ref(), [RequestHeader::new_static("x-extension", "enabled")]);
+	}
+
+	#[tokio::test]
+	async fn before_request_deny_fails_the_request() {
+		let (encoder, mut call, ..) = discovery_fixture();
+		call.response_hooks =
+			crate::codec::ProviderResponseHooks::new(Arc::new(BeforeRequestObserver {
+				subscribed: true,
+				calls:      AtomicUsize::new(0),
+				result:     Err(BeforeRequestDenied {
+					reason: sf!("request rejected"),
+					code:   Some(sf!("extension_policy")),
+				}),
+			}));
+		let context = ExecutionContext::new(call.budget.clone());
+
+		let error = encoder
+			.before_request(&mut call, &context)
+			.await
+			.expect_err("explicit Deny fails request");
+
+		assert_eq!(error.kind, ErrorKind::Authorization);
+		assert_eq!(error.code.as_deref(), Some("extension_policy"));
+	}
+
+	#[tokio::test]
+	async fn before_request_unsubscribed_builds_no_payload_or_frame() {
+		let (encoder, mut call, ..) = discovery_fixture();
+		let observer = Arc::new(BeforeRequestObserver {
+			subscribed: false,
+			calls:      AtomicUsize::new(0),
+			result:     Ok(BeforeRequestMutation::default()),
+		});
+		call.response_hooks = crate::codec::ProviderResponseHooks::new(observer.clone());
+		let context = ExecutionContext::new(call.budget.clone());
+
+		let mutation = encoder
+			.before_request(&mut call, &context)
+			.await
+			.expect("unsubscribed gate is a no-op");
+
+		assert_eq!(mutation, BeforeRequestMutation::default());
+		assert_eq!(observer.calls.load(Ordering::Relaxed), 0);
+	}
+
 	fn assert_applied_bearer(
 		mut transport: TransportRequest,
 		account: &RouteAccount,
@@ -2154,7 +2583,15 @@ mod tests {
 		});
 		let context = ExecutionContext::new(call.budget.clone());
 		let transport = encoder
-			.encode(&call, &Some(shaped.clone()), &context, 0, false, Cancellation::default())
+			.encode(
+				&call,
+				&Some(shaped.clone()),
+				&BeforeRequestMutation::default(),
+				&context,
+				0,
+				false,
+				Cancellation::default(),
+			)
 			.expect("encode discovery");
 		assert!(
 			transport
@@ -2174,7 +2611,15 @@ mod tests {
 		let raw = lease(&provider, "raw");
 		let context = ExecutionContext::new(call.budget.clone());
 		let transport = encoder
-			.encode(&call, &Some(raw.clone()), &context, 0, false, Cancellation::default())
+			.encode(
+				&call,
+				&Some(raw.clone()),
+				&BeforeRequestMutation::default(),
+				&context,
+				0,
+				false,
+				Cancellation::default(),
+			)
 			.expect("encode discovery");
 		assert!(
 			transport
@@ -2190,7 +2635,15 @@ mod tests {
 		let (encoder, call, account, auth, ..) = discovery_fixture();
 		let context = ExecutionContext::new(call.budget.clone());
 		let mut transport = encoder
-			.encode(&call, &None, &context, 0, false, Cancellation::default())
+			.encode(
+				&call,
+				&None,
+				&BeforeRequestMutation::default(),
+				&context,
+				0,
+				false,
+				Cancellation::default(),
+			)
 			.expect("encode anonymous-capable request");
 		RouteCredentialApplier { auth: Box::new([auth]), required: false }
 			.apply(&account, None, &mut transport, &context)
@@ -2206,6 +2659,7 @@ mod tests {
 			.encode(
 				&call,
 				&Some(lease(&provider, "unused")),
+				&BeforeRequestMutation::default(),
 				&context,
 				0,
 				false,
@@ -2276,9 +2730,15 @@ mod tests {
 		.commit(Revision::new("revision"));
 		context.set_session_state(Some(binding));
 
-		let Err(error) =
-			encoder.encode(&call, &Some(shaped), &context, 0, false, Cancellation::default())
-		else {
+		let Err(error) = encoder.encode(
+			&call,
+			&Some(shaped),
+			&BeforeRequestMutation::default(),
+			&context,
+			0,
+			false,
+			Cancellation::default(),
+		) else {
 			panic!("endpoint change must reseed provider state");
 		};
 

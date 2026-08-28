@@ -274,7 +274,8 @@ impl SandboxSpec {
 	}
 
 	/// Allows connection to one existing Unix-domain socket without enabling IP
-	/// networking.
+	/// networking. The socket is also readable so restricted filesystem
+	/// profiles can resolve the endpoint during `connect`.
 	pub fn allow_unix_socket(&mut self, path: impl AsRef<Path>) -> Result<&mut Self, SandboxError> {
 		let path = canonicalize_existing(path.as_ref())?;
 		#[cfg(unix)]
@@ -289,6 +290,7 @@ impl SandboxSpec {
 				return Err(SandboxError::NotUnixSocket { path });
 			}
 		}
+		insert_path(&mut self.readable, path.clone());
 		insert_path(&mut self.unix_sockets, path);
 		Ok(self)
 	}

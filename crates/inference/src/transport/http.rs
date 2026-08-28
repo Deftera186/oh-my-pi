@@ -703,6 +703,19 @@ async fn execute(
 					false,
 				)
 			})?;
+		if let Some(signature) = &transport.signature
+			&& signature.apply(&mut request).is_err()
+		{
+			return Err(record_failure(
+				authentication_error("provider-signature-finalization"),
+				&attempt,
+				&evidence,
+				None,
+				None,
+				started,
+				false,
+			));
+		}
 		let (parts, bytes) = request.into_parts();
 		let body = Full::new(bytes)
 			.map_err(|never: Infallible| -> Error { match never {} })
@@ -726,6 +739,20 @@ async fn execute(
 			drop(request);
 			return Err(record_failure(
 				authentication_error("credential-finalization"),
+				&attempt,
+				&evidence,
+				None,
+				None,
+				started,
+				false,
+			));
+		}
+		if let Some(signature) = &transport.signature
+			&& signature.apply(&mut request).is_err()
+		{
+			drop(request);
+			return Err(record_failure(
+				authentication_error("provider-signature-finalization"),
 				&attempt,
 				&evidence,
 				None,
@@ -1730,7 +1757,16 @@ fn authentication_error(reason: &'static str) -> Error {
 fn connectivity(phase: ErrorPhase, committed: bool, reason: &'static str) -> Error {
 	let mut error = structured_error(ErrorKind::Connectivity, phase, committed, reason);
 	if !committed {
-		error.action = RetryAction::SameRoute { after: time::Duration::ZERO };
+		// A pre-handshake dial failure (refused/unreachable local or remote
+		// endpoint) fails identically on every immediate reattempt; the default
+		// same-route ladder would spend the full exponential budget (minutes,
+		// silently) before surfacing. Bound it to a couple of fast retries and
+		// let the terminal error reach the caller.
+		error.action = if phase == ErrorPhase::Connecting {
+			RetryAction::SameRouteLimited { after: time::Duration::ZERO, max_retries: 2 }
+		} else {
+			RetryAction::SameRoute { after: time::Duration::ZERO }
+		};
 	}
 	error
 }

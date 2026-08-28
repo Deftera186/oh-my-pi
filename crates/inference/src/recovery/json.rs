@@ -250,7 +250,7 @@ fn repair(input: &[u8], limits: JsonRepairLimits) -> Result<(Vec<u8>, u32), Reco
 					}
 				}
 				if !closed {
-					bump(&mut steps, limits.max_steps)?;
+					return Err(RecoveryError::Incomplete { stage: "json-string" });
 				}
 				output.push(b'"');
 				expecting_key = false;
@@ -330,9 +330,8 @@ fn repair(input: &[u8], limits: JsonRepairLimits) -> Result<(Vec<u8>, u32), Reco
 		output.pop();
 		bump(&mut steps, limits.max_steps)?;
 	}
-	while let Some(open) = stack.pop() {
-		output.push(if open == b'{' { b'}' } else { b']' });
-		bump(&mut steps, limits.max_steps)?;
+	if !stack.is_empty() {
+		return Err(RecoveryError::Incomplete { stage: "json-container" });
 	}
 	if output.len() > limits.max_bytes {
 		return Err(RecoveryError::LimitExceeded { stage: "json", limit: limits.max_bytes });
@@ -510,6 +509,18 @@ mod tests {
 		assert_eq!(document.value, serde_json::json!({"value":"bad\\q\ntruncated\\u12"}),);
 		assert!(document.recovery.is_some());
 	}
+	#[test]
+	fn structural_truncation_is_never_repaired() {
+		for input in
+			[b"{\"command\":\"echo never\",\"i\":\"Truncated".as_slice(), b"{answer:'yes'".as_slice()]
+		{
+			assert!(matches!(
+				run(input, JsonEnforcement::NativeOrRepair, input.len()),
+				Err(RecoveryError::InvalidDocument { .. })
+			));
+		}
+	}
+
 	#[test]
 	fn depth_and_step_limits_are_typed() {
 		assert!(matches!(

@@ -48,6 +48,8 @@ struct ResponseObserver {
 	observed:   StdMutex<Vec<ProviderResponseObservation>>,
 }
 
+impl crate::codec::ProviderHookObserver for ResponseObserver {}
+
 impl ProviderResponseObserver for ResponseObserver {
 	fn subscribed(&self) -> bool {
 		self.subscribed
@@ -198,6 +200,7 @@ fn request(
 			sealed_body: None,
 		},
 		credentials: None,
+		signature: None,
 		decoder: Some(Box::new(decoder)),
 		realtime: None,
 		cancel,

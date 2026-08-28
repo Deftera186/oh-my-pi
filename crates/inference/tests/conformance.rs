@@ -660,6 +660,7 @@ fn cassette_request(body: BodySource, format: NativeResponseFormat) -> Transport
 			SizeBounds { request_body: 1024, frame: 1024 * 1024, response: 1024 * 1024 },
 		),
 		credentials:    None,
+		signature:      None,
 		decoder:        Some(Box::new(NativeFacadeDecoder::new(format))),
 		realtime:       None,
 		cancel:         Cancellation::default(),

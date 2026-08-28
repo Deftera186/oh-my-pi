@@ -677,6 +677,22 @@ impl AccountPool {
 			.unwrap_or_default()
 	}
 
+	/// Clears selected rate-block windows for one account, or every window
+	/// when the selection is empty.
+	pub fn clear_rate(
+		&self,
+		account: &AccountId<str>,
+		scopes: &[Str],
+	) -> Result<(), AccountStateStoreError> {
+		if let Some(store) = &self.store {
+			store.clear_rate(account, scopes)?;
+		}
+		if let Some(rate) = self.state.write().rate.get_mut(account) {
+			rate.clear(scopes);
+		}
+		Ok(())
+	}
+
 	/// Returns an independent quota-state snapshot.
 	pub fn quota_state(&self, account: &AccountId<str>) -> QuotaState {
 		self
@@ -686,6 +702,38 @@ impl AccountPool {
 			.get(account)
 			.cloned()
 			.unwrap_or_default()
+	}
+
+	/// Invalidates cached rate and quota observations for the selected provider
+	/// or account.
+	pub fn invalidate_usage(
+		&self,
+		provider: Option<&ProviderId<str>>,
+		account: Option<&AccountId<str>>,
+	) -> Result<(), AccountStateStoreError> {
+		if let Some(store) = &self.store {
+			store.invalidate_usage(provider, account)?;
+		}
+		let mut state = self.state.write();
+		if let Some(account) = account {
+			state.rate.remove(account);
+			state.quota.remove(account);
+		} else if let Some(provider) = provider {
+			let accounts = state
+				.accounts
+				.values()
+				.filter(|record| &record.provider == provider)
+				.map(|record| record.account.clone())
+				.collect::<Vec<_>>();
+			for account in accounts {
+				state.rate.remove(&account);
+				state.quota.remove(&account);
+			}
+		} else {
+			state.rate.clear();
+			state.quota.clear();
+		}
+		Ok(())
 	}
 
 	/// Records durable scope affinity independently of credential material.
