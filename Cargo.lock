@@ -5939,6 +5939,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "layout-rs"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7524,6 +7535,7 @@ dependencies = [
  "omp-proto",
  "omp-py",
  "omp-rpc",
+ "omp-sandbox",
  "omp-scribe",
  "omp-sdk",
  "omp-serve",
@@ -8308,10 +8320,12 @@ name = "omp-sandbox"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "landlock",
  "libc",
  "nix 0.31.3",
  "omp-core",
  "parking_lot",
+ "seccompiler",
  "serde",
  "serde_json",
  "strum",
@@ -11103,7 +11117,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11336,6 +11350,15 @@ dependencies = [
  "hybrid-array",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
