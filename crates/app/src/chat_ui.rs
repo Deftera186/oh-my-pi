@@ -10985,57 +10985,6 @@ fn send_models_updated(backend: &flume::Sender<BackendEvent>, state: &BridgeStat
 	let current = current_model_index(&rows, &state.model);
 	send_backend(backend, BackendEvent::ModelsUpdated { rows, current });
 }
-
-fn provider_rows(catalog: &Catalog, current: Option<&str>) -> Vec<SessionRow> {
-	let mut providers = catalog
-		.providers()
-		.iter()
-		.filter(|provider| provider_supports_login(catalog, provider))
-		.map(|provider| {
-			let oauth = provider_uses_oauth(catalog, provider);
-			(provider, oauth, current == Some(provider.id.as_str()))
-		})
-		.collect::<Vec<_>>();
-	providers.sort_by_key(|(_, oauth, current)| (!*current, !*oauth));
-	providers
-		.into_iter()
-		.map(|(provider, oauth, _)| SessionRow {
-			id:     Str::from(provider.id.as_str()),
-			label:  provider.name.clone(),
-			detail: sf!(if oauth { "OAuth" } else { "API key" }),
-			pinned: false,
-		})
-		.collect()
-}
-
-fn provider_supports_login(catalog: &Catalog, provider: &ProviderDef) -> bool {
-	provider
-		.auth
-		.iter()
-		.filter_map(|auth_id| catalog.auth_spec(auth_id))
-		.any(|auth| auth.kind != AuthSpecKind::None)
-}
-
-fn provider_uses_oauth(catalog: &Catalog, provider: &ProviderDef) -> bool {
-	provider.auth.iter().any(|auth_id| {
-		catalog
-			.auth_spec(auth_id)
-			.and_then(|auth| auth.oauth.as_ref())
-			.is_some_and(|oauth_id| catalog.oauth_spec(oauth_id).is_some())
-	})
-}
-
-fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
-	choices
-		.into_iter()
-		.map(|choice| SessionRow {
-			id:     choice.id,
-			label:  choice.label,
-			detail: choice.detail,
-			pinned: choice.pinned,
-		})
-		.collect()
-}
 fn send_open_model_hub(
 	backend: &flume::Sender<BackendEvent>,
 	settings_manager: &SettingsManager,
@@ -11267,6 +11216,57 @@ fn refresh_model_settings(settings_manager: &SettingsManager, state: &mut Bridge
 	if let Ok(projection) = settings_manager.snapshot().project::<ModelSettings>() {
 		state.model_settings = projection.get().resolve_path_scopes(&workspace, &home);
 	}
+}
+
+fn provider_rows(catalog: &Catalog, current: Option<&str>) -> Vec<SessionRow> {
+	let mut providers = catalog
+		.providers()
+		.iter()
+		.filter(|provider| provider_supports_login(catalog, provider))
+		.map(|provider| {
+			let oauth = provider_uses_oauth(catalog, provider);
+			(provider, oauth, current == Some(provider.id.as_str()))
+		})
+		.collect::<Vec<_>>();
+	providers.sort_by_key(|(_, oauth, current)| (!*current, !*oauth));
+	providers
+		.into_iter()
+		.map(|(provider, oauth, _)| SessionRow {
+			id:     Str::from(provider.id.as_str()),
+			label:  provider.name.clone(),
+			detail: sf!(if oauth { "OAuth" } else { "API key" }),
+			pinned: false,
+		})
+		.collect()
+}
+
+fn provider_supports_login(catalog: &Catalog, provider: &ProviderDef) -> bool {
+	provider
+		.auth
+		.iter()
+		.filter_map(|auth_id| catalog.auth_spec(auth_id))
+		.any(|auth| auth.kind != AuthSpecKind::None)
+}
+
+fn provider_uses_oauth(catalog: &Catalog, provider: &ProviderDef) -> bool {
+	provider.auth.iter().any(|auth_id| {
+		catalog
+			.auth_spec(auth_id)
+			.and_then(|auth| auth.oauth.as_ref())
+			.is_some_and(|oauth_id| catalog.oauth_spec(oauth_id).is_some())
+	})
+}
+
+fn session_rows(choices: Vec<ResumeChoice>) -> Vec<SessionRow> {
+	choices
+		.into_iter()
+		.map(|choice| SessionRow {
+			id:     choice.id,
+			label:  choice.label,
+			detail: choice.detail,
+			pinned: choice.pinned,
+		})
+		.collect()
 }
 
 async fn switch_model<C>(
