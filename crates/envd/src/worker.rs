@@ -6022,6 +6022,83 @@ fn next_control_authority(
 		.bind_with_agents(Arc::new(identity), Arc::clone(&activation.agents_factory))
 		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))
 }
+fn control_completion(
+	call_id: Str,
+	result: serde_json::Value,
+) -> Result<WorkerCompletion, WorkerError> {
+	if let serde_json::Value::Object(mut completion) = result {
+		let parts = match completion.remove("parts") {
+			Some(serde_json::Value::Array(parts)) => parts
+				.into_iter()
+				.map(|part| {
+					part
+						.as_str()
+						.map(|text| text_part(text.to_owned()))
+						.ok_or_else(|| {
+							WorkerError::Protocol(sf!(
+								"CONTROL completion parts must contain only strings"
+							))
+						})
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+			Some(_) => {
+				return Err(WorkerError::Protocol(sf!("CONTROL completion parts must be an array")));
+			},
+			None => Vec::new(),
+		};
+		let details = completion
+			.remove("details")
+			.unwrap_or(serde_json::Value::Null);
+		let is_error = match completion.remove("is_error") {
+			Some(serde_json::Value::Bool(is_error)) => is_error,
+			Some(_) => {
+				return Err(WorkerError::Protocol(sf!("CONTROL completion is_error must be boolean")));
+			},
+			None => false,
+		};
+		let terminate = match completion.remove("terminate") {
+			Some(serde_json::Value::Bool(terminate)) => terminate,
+			Some(_) => {
+				return Err(WorkerError::Protocol(sf!("CONTROL completion terminate must be boolean")));
+			},
+			None => false,
+		};
+		return Ok(WorkerCompletion {
+			call_id,
+			kind: if is_error {
+				WorkerOutcomeKind::Faulted
+			} else {
+				WorkerOutcomeKind::Ok
+			},
+			parts,
+			details_json: Some(Bytes::from(
+				serde_json::to_vec(&details).expect("serializing an existing JSON value cannot fail"),
+			)),
+			details_blob: None,
+			args_issue: None,
+			useless: false,
+			terminate,
+		});
+	}
+
+	let text = match &result {
+		serde_json::Value::String(text) => text.clone(),
+		_ => serde_json::to_string(&result).expect("serializing an existing JSON value cannot fail"),
+	};
+	Ok(WorkerCompletion {
+		call_id,
+		kind: WorkerOutcomeKind::Ok,
+		parts: vec![text_part(text)],
+		details_json: Some(Bytes::from(
+			serde_json::to_vec(&result).expect("serializing an existing JSON value cannot fail"),
+		)),
+		details_blob: None,
+		args_issue: None,
+		useless: false,
+		terminate: false,
+	})
+}
+
 async fn wait_control_registry(activation: &PendingControlActivation) -> Result<(), WorkerError> {
 	let Some(registry) = activation.registry_control.as_ref() else {
 		return Ok(());
@@ -6229,22 +6306,19 @@ async fn run_control_supervisor(
 					} else {
 						match result {
 							Ok(result) => {
-								let text =
-									serde_json::to_string(&result).unwrap_or_else(|_| String::from("null"));
-								let _ = invocation
-									.events
-									.send(WorkerEvent::Complete(WorkerCompletion {
-										call_id:      invocation.call.invocation_id,
-										kind:         WorkerOutcomeKind::Ok,
-										parts:        vec![Part {
-											kind: Some(omp_proto::thread::v1::part::Kind::Text(text)),
-										}],
-										details_json: None,
-										details_blob: None,
-										args_issue:   None,
-										useless:      false,
-										terminate:    false,
-									}));
+								match control_completion(invocation.call.invocation_id.clone(), result) {
+									Ok(completion) => {
+										let _ = invocation.events.send(WorkerEvent::Complete(completion));
+									},
+									Err(error) => {
+										let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
+											call_id:         invocation.call.invocation_id,
+											kind:            WorkerAbortKind::Crashed,
+											reason:          Str::from(error.to_string()),
+											effects_unknown: true,
+										}));
+									},
+								}
 							},
 							Err(error) => {
 								let _ = invocation.events.send(WorkerEvent::Aborted(WorkerAbort {
@@ -9984,6 +10058,31 @@ mod tests {
 		assert_eq!(malformed.kind, "malformed");
 	}
 	#[test]
+	fn control_completion_matches_stdio_envelopes() {
+		let plain = control_completion(sf!("plain"), serde_json::json!("Hello"))
+			.expect("lower plain CONTROL result");
+		assert_eq!(plain.parts, vec![text_part("Hello".to_owned())]);
+		assert_eq!(plain.details_json.as_deref(), Some(br#""Hello""#.as_slice()));
+
+		let payload = control_completion(
+			sf!("payload"),
+			serde_json::json!({
+				"updates": [],
+				"details": {"payload": {"plain": "yes"}},
+				"is_error": false,
+				"terminate": true,
+			}),
+		)
+		.expect("lower structured CONTROL result");
+		assert!(payload.parts.is_empty());
+		assert_eq!(
+			payload.details_json.as_deref(),
+			Some(br#"{"payload":{"plain":"yes"}}"#.as_slice()),
+		);
+		assert!(payload.terminate);
+	}
+
+	#[test]
 	fn python_completion_lowers_terminate_opt_in() {
 		let engine = python_engine().expect("initialize embedded Python");
 		let completion = engine
@@ -10005,7 +10104,10 @@ class Failure(omp.Fault):
 
 result = Result(7, terminate=True)
 failure = Failure("no", terminate=True)
+inline = omp.Payload({"plain": "yes"}, terminate=True)
 assert result.terminate is True and failure.terminate is True
+assert inline.terminate is True
+assert _canonical_json(inline) == b'{"plain":"yes"}'
 assert _canonical_json(result) == b'{"value":7}'
 assert _canonical_json(failure) == b'{"reason":"no"}'
 assert loads(b'{"value":7}', Result) == Result(7)

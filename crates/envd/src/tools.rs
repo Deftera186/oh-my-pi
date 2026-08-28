@@ -88,7 +88,7 @@ use super::{
 		PreludeParamStub, PreludeTable, ProcessEvalExec, SessionBridgeHost,
 	},
 	exec::ExecHost,
-	exec_settings::{AcpRouting, AcpSettings, ShellSettings},
+	exec_settings::{AcpRouting, AcpSettings, SandboxSettings, ShellSettings},
 	exthost::{
 		CallbackConcurrency, ExtensionManifest,
 		control::{
@@ -3132,6 +3132,7 @@ pub(crate) fn production_registry<
 	tool_settings: &ToolSettings,
 	browser_settings: &BrowserSettings,
 	shell_settings: &ShellSettings,
+	sandbox_settings: &SandboxSettings,
 	acp_settings: &AcpSettings,
 	acp_exec: AcpExecSlot,
 	autolearn_settings: &omp_memory::config::AutolearnSettings,
@@ -3170,6 +3171,7 @@ pub(crate) fn production_registry<
 		ask_presenter,
 		content,
 	} = bridges;
+	exec.configure_sandbox(sandbox_settings, workspace.root());
 	let previews = StagedProposalRegistry::new();
 	let ask_presenter = PresenterSlot::new(
 		ask_presenter.unwrap_or_else(|| Arc::new(omp_tools::ask::HeadlessPresenter)),
@@ -3576,6 +3578,7 @@ pub(crate) fn production_registry<
 	let mut eval_control = EvalSessionControl::default();
 	if tool_settings.enabled("eval") {
 		match preflight_python_eval(
+			exec.clone(),
 			Arc::clone(&eval_host),
 			interrupt_grace,
 			blobs.clone(),
@@ -3687,6 +3690,7 @@ pub(crate) fn production_registry<
 					root_uri.clone(),
 					Arc::clone(&resolvers),
 					shell_settings.clone(),
+					sandbox_settings.clone(),
 					acp_exec,
 					acp_settings.routing != AcpRouting::Never,
 				)
@@ -3696,6 +3700,7 @@ pub(crate) fn production_registry<
 					root_uri.clone(),
 					Arc::clone(&resolvers),
 					shell_settings.clone(),
+					sandbox_settings.clone(),
 					acp_exec,
 					acp_settings.routing != AcpRouting::Never,
 				)
@@ -3936,13 +3941,14 @@ pub(super) fn python_engine() -> Result<Arc<omp_py::Engine>, EnvdError> {
 }
 
 fn preflight_python_eval(
+	exec: ExecHost,
 	host: Arc<SessionBridgeHost>,
 	interrupt_grace: Duration,
 	blobs: BlobHost,
 	configured_interpreter: Option<PathBuf>,
 ) -> Result<ProcessEvalExec, EnvdError> {
 	python_engine()?;
-	ProcessEvalExec::production(host, interrupt_grace, blobs, configured_interpreter)
+	ProcessEvalExec::production(exec, host, interrupt_grace, blobs, configured_interpreter)
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))
 }
 

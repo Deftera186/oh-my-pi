@@ -102,7 +102,7 @@ use super::{
 		BridgeHostError, ParentBindingLease, ParentSessionHost, PreludeInvoker, SessionBridgeHost,
 	},
 	exec::{ExecError, ExecEvent, ExecHost, ExecRun, ProcessEvent},
-	exec_settings::{AcpSettings, ShellSettings},
+	exec_settings::{AcpSettings, SandboxSettings, ShellSettings},
 	exthost::{ExtensionManifest, control::CompositeControlAuthority, lifecycle::EscapeCapability},
 	github_url::GithubCredentialBridge,
 	host_info::HostInfoHost,
@@ -1939,7 +1939,8 @@ pub struct EnvServer {
 fn execution_settings(
 	data_dir: &Path,
 	project_root: &Path,
-) -> Result<(HostSettings, BrowserSettings, ShellSettings, AcpSettings), EnvdError> {
+) -> Result<(HostSettings, BrowserSettings, ShellSettings, SandboxSettings, AcpSettings), EnvdError>
+{
 	let manager = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)))
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 	let snapshot = manager.snapshot();
@@ -1948,7 +1949,8 @@ fn execution_settings(
 
 fn execution_settings_from_snapshot(
 	snapshot: &SettingsSnapshot,
-) -> Result<(HostSettings, BrowserSettings, ShellSettings, AcpSettings), EnvdError> {
+) -> Result<(HostSettings, BrowserSettings, ShellSettings, SandboxSettings, AcpSettings), EnvdError>
+{
 	let mut host = snapshot
 		.project::<HostSettings>()
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
@@ -1964,12 +1966,17 @@ fn execution_settings_from_snapshot(
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 		.get()
 		.clone();
+	let sandbox = snapshot
+		.project::<SandboxSettings>()
+		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
+		.get()
+		.clone();
 	let acp = snapshot
 		.project::<AcpSettings>()
 		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
 		.get()
 		.clone();
-	Ok((host, browser, shell, acp))
+	Ok((host, browser, shell, sandbox, acp))
 }
 fn mcp_settings(
 	data_dir: &Path,
@@ -2476,8 +2483,9 @@ impl EnvServer {
 			state_dir,
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
-		let (host_settings, browser_settings, shell_settings, acp_settings) =
+		let (host_settings, browser_settings, shell_settings, sandbox_settings, acp_settings) =
 			execution_settings(state_dir, workspace.root())?;
+		exec.configure_sandbox(&sandbox_settings, workspace.root());
 		let mcp_settings = mcp_settings(state_dir, workspace.root(), None)?;
 		mcp.start_native_configs(mcp_settings.enable_project_config)
 			.await
@@ -2524,6 +2532,7 @@ impl EnvServer {
 			&host_settings.tools,
 			&browser_settings,
 			&shell_settings,
+			&sandbox_settings,
 			&acp_settings,
 			acp_exec.clone(),
 			&host_settings.autolearn,
@@ -2695,12 +2704,13 @@ impl EnvServer {
 			state_dir,
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
-		let (mut host_settings, browser_settings, shell_settings, acp_settings) =
+		let (mut host_settings, browser_settings, shell_settings, sandbox_settings, acp_settings) =
 			if let Some(snapshot) = settings_snapshot {
 				execution_settings_from_snapshot(snapshot)?
 			} else {
 				execution_settings(state_dir, workspace.root())?
 			};
+		exec.configure_sandbox(&sandbox_settings, workspace.root());
 		host_settings.tools = host_settings
 			.tools
 			.with_approval_mode_override(approval_mode);
@@ -2750,6 +2760,7 @@ impl EnvServer {
 			&host_settings.tools,
 			&browser_settings,
 			&shell_settings,
+			&sandbox_settings,
 			&acp_settings,
 			acp_exec.clone(),
 			&host_settings.autolearn,
@@ -8140,17 +8151,18 @@ fn spawn_worker_invocation(
 					break;
 				},
 				Some(WorkerEvent::Complete(complete)) => {
-					let Ok((json, details_blob, is_error)) = worker_completion_json(&complete) else {
-						send_abort_verdict(
-							&responses,
-							request_id,
-							&invocation_id,
-							omp_tool::Abort::EffectsUnknown {
-								reason: sf!("worker returned invalid structured result JSON"),
-							},
-						)
-						.await;
-						break;
+					let (json, details_blob, is_error) = match worker_completion_json(&complete) {
+						Ok(completion) => completion,
+						Err(reason) => {
+							send_abort_verdict(
+								&responses,
+								request_id,
+								&invocation_id,
+								omp_tool::Abort::EffectsUnknown { reason },
+							)
+							.await;
+							break;
+						},
 					};
 					send_invocation_terminal_body(
 						&responses,

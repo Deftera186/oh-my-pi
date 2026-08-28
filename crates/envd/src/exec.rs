@@ -2,7 +2,9 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-	env, fs, future,
+	env,
+	ffi::OsStr,
+	fs, future,
 	io::{self, Read, Write as _},
 	net,
 	os::fd::{self, AsFd as _, AsRawFd as _},
@@ -55,6 +57,8 @@ use url::Url;
 use super::{
 	admission,
 	admission::GithubMutationTarget,
+	exec_sandbox::ExecSandbox,
+	exec_settings::{ExecSandboxMode, SandboxSettings},
 	process_identity::{IdentityError, ProcessIdentity},
 	process_log,
 	process_log::{LogChunk, ProcessLog},
@@ -163,6 +167,15 @@ pub enum ExecError {
 	/// Another daemon already owns the durable process namespace.
 	#[error(transparent)]
 	ProcessLease(#[from] LeaseError),
+	/// The configured command sandbox could not be compiled.
+	#[error("failed to enable sandbox mode {mode}")]
+	Sandbox {
+		/// Requested user-facing posture.
+		mode:   &'static str,
+		/// Typed sandbox compiler failure.
+		#[source]
+		source: omp_sandbox::SandboxError,
+	},
 }
 
 /// One ordered event emitted by an execution.
@@ -263,6 +276,13 @@ struct HostInner {
 	devices:       Mutex<Option<Arc<crate::xd::XdHost>>>,
 	persistence:   Mutex<Option<ProcessPersistence>>,
 	next_order:    AtomicU64,
+	sandbox:       Mutex<Option<SandboxConfig>>,
+}
+
+struct SandboxConfig {
+	settings:       SandboxSettings,
+	workspace_root: PathBuf,
+	compiled:       Option<Arc<ExecSandbox>>,
 }
 
 struct ProcessPersistence {
@@ -277,6 +297,7 @@ struct SessionHandle {
 	pty:            Option<PtySpec>,
 	command_prefix: Str,
 	user_shell:     Option<UserShell>,
+	sandbox:        Option<Arc<ExecSandbox>>,
 }
 #[derive(Clone)]
 struct UserShell {
@@ -439,6 +460,7 @@ struct SessionCommand {
 	cancel_rx:      Receiver<CancelRequest>,
 	events:         flume::Sender<ExecEvent>,
 	github_targets: Vec<GithubMutationTarget>,
+	sandbox:        Option<Arc<ExecSandbox>>,
 }
 
 impl Default for ExecHost {
@@ -464,8 +486,34 @@ impl ExecHost {
 				devices:       Mutex::new(None),
 				persistence:   Mutex::new(None),
 				next_order:    AtomicU64::new(1),
+				sandbox:       Mutex::new(None),
 			}),
 		}
+	}
+
+	/// Configures sandbox policy for subsequently opened sessions and detached
+	/// processes.
+	pub(crate) fn configure_sandbox(&self, settings: &SandboxSettings, workspace_root: &Path) {
+		let config = (settings.mode != ExecSandboxMode::Off).then(|| SandboxConfig {
+			settings:       settings.clone(),
+			workspace_root: workspace_root.to_path_buf(),
+			compiled:       None,
+		});
+		*self.inner.sandbox.lock() = config;
+	}
+
+	pub(crate) fn active_sandbox(&self) -> Result<Option<Arc<ExecSandbox>>, ExecError> {
+		let mut config = self.inner.sandbox.lock();
+		let Some(config) = config.as_mut() else {
+			return Ok(None);
+		};
+		if let Some(sandbox) = &config.compiled {
+			return Ok(Some(Arc::clone(sandbox)));
+		}
+		let sandbox = ExecSandbox::compile(&config.settings, &config.workspace_root)
+			.map_err(|source| ExecError::Sandbox { mode: config.settings.mode.into(), source })?;
+		config.compiled = sandbox.clone();
+		Ok(sandbox)
 	}
 
 	/// Enables durable named-process metadata and recovers verified detached
@@ -544,6 +592,7 @@ impl ExecHost {
 			}
 		}
 		let cwd = cwd_from_uri(&request.cwd_uri)?.map_or_else(env::current_dir, Ok)?;
+		let sandbox = self.active_sandbox()?;
 		let variables = Arc::clone(&self.inner.environment.lock().variables);
 		let mut builder = Shell::builder()
 			.profile(omp_shell_engine::ProfileLoadBehavior::Skip)
@@ -607,6 +656,7 @@ impl ExecHost {
 				pty: request.pty.clone(),
 				command_prefix,
 				user_shell,
+				sandbox,
 			});
 
 		Ok(OpenSessionResponse {
@@ -778,6 +828,7 @@ impl ExecHost {
 			cancel_rx,
 			events: events_tx,
 			github_targets,
+			sandbox: session.sandbox,
 		};
 		session
 			.tx
@@ -1063,14 +1114,24 @@ impl ExecHost {
 			.text
 			.clone();
 		let cwd = cwd_from_uri(&spec.cwd_uri)?.map_or_else(env::current_dir, Ok)?;
-		let mut command = detached_command(&source);
+		let sandbox = self.active_sandbox()?;
+		let mut command = detached_command(&source, sandbox.as_deref());
+		if let Some(sandbox) = sandbox.as_deref() {
+			command
+				.env_clear()
+				.envs(env::vars_os().filter(|(key, _)| sandbox.env_allowed_os(key.as_os_str())));
+		}
 		command
 			.current_dir(cwd)
 			.stdin(Stdio::null())
 			.stdout(Stdio::from(output))
 			.stderr(Stdio::from(stderr));
 		if let Some(delta) = spec.env_delta.as_ref() {
-			command.envs(&delta.set);
+			command.envs(delta.set.iter().filter(|(key, _)| {
+				sandbox
+					.as_deref()
+					.is_none_or(|sandbox| sandbox.env_allowed_os(OsStr::new(key.as_str())))
+			}));
 			for name in &delta.unset {
 				command.env_remove(name);
 			}
@@ -1934,7 +1995,7 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		command.exec.clone(),
 		command.events.clone(),
 	);
-	let Ok((mut params, readers)) = setup else {
+	let Ok((mut params, readers, sequencer)) = setup else {
 		finish_session_command(
 			&command,
 			RunTerminal::Failed,
@@ -1962,6 +2023,10 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		.send(ExecEvent::Started { exec_id: command.exec.clone() });
 	params.process_group_policy = omp_shell_engine::ProcessGroupPolicy::NewProcessGroup;
 	params.set_spawn_observer(command.control.spawns.clone());
+	if let Some(sandbox) = command.sandbox.as_ref() {
+		params.set_path_policy(sandbox.clone());
+		params.set_spawn_wrapper(sandbox.clone());
+	}
 	let source_info = SourceInfo::from("env/v1 exec");
 	let result = {
 		let timeout = async {
@@ -2005,6 +2070,13 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 	} else {
 		result
 	};
+	if result != RunTerminal::Exited(0)
+		&& let Some(sandbox) = command.sandbox.as_ref()
+	{
+		sequencer
+			.lock()
+			.sandbox_note(&command.exec, sandbox.failure_note());
+	}
 	finish_session_command(&command, result, started_at.elapsed(), shell.working_dir());
 	cancelled
 }
@@ -2110,9 +2182,10 @@ fn setup_io(
 	control: Arc<RunControl>,
 	exec: Bytes,
 	events: flume::Sender<ExecEvent>,
-) -> Result<(ExecutionParameters, Vec<task::JoinHandle<()>>), ExecError> {
+) -> Result<(ExecutionParameters, Vec<task::JoinHandle<()>>, Arc<Mutex<OutputSequencer>>), ExecError>
+{
 	let mut params = ExecutionParameters::default();
-	let sequencer = Arc::new(Mutex::new(OutputSequencer { next: 1, events }));
+	let sequencer = Arc::new(Mutex::new(OutputSequencer { next: 1, events, at_line_start: true }));
 	if let Some(pty) = pty {
 		let winsize = nix::pty::Winsize {
 			ws_row:    clamp_u16(pty.rows),
@@ -2133,8 +2206,9 @@ fn setup_io(
 		params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(slave.try_clone()?));
 		params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(slave));
 		*control.input.lock() = Some(InputSink::Pty(master_write));
-		let reader = spawn_reader(fs::File::from(master_read), OutputChannel::Pty, exec, sequencer);
-		Ok((params, vec![reader]))
+		let reader =
+			spawn_reader(fs::File::from(master_read), OutputChannel::Pty, exec, sequencer.clone());
+		Ok((params, vec![reader], sequencer))
 	} else {
 		let (stdin_read, stdin_write) = io::pipe()?;
 		let (stdout_read, stdout_write) = io::pipe()?;
@@ -2158,16 +2232,39 @@ fn setup_io(
 		params.set_fd(OpenFiles::STDOUT_FD, stdout_write.into());
 		params.set_fd(OpenFiles::STDERR_FD, stderr_write.into());
 		*control.input.lock() = Some(InputSink::Pipe(stdin_write));
-		Ok((params, vec![
-			spawn_reader(stdout_read, OutputChannel::Stdout, exec.clone(), sequencer.clone()),
-			spawn_reader(stderr_read, OutputChannel::Stderr, exec, sequencer),
-		]))
+		Ok((
+			params,
+			vec![
+				spawn_reader(stdout_read, OutputChannel::Stdout, exec.clone(), sequencer.clone()),
+				spawn_reader(stderr_read, OutputChannel::Stderr, exec, sequencer.clone()),
+			],
+			sequencer,
+		))
 	}
 }
 
 struct OutputSequencer {
-	next:   u64,
-	events: flume::Sender<ExecEvent>,
+	next:          u64,
+	events:        flume::Sender<ExecEvent>,
+	at_line_start: bool,
+}
+impl OutputSequencer {
+	fn sandbox_note(&mut self, exec: &Bytes, note: &str) {
+		let mut data = Vec::with_capacity(note.len() + usize::from(!self.at_line_start) + 1);
+		if !self.at_line_start {
+			data.push(b'\n');
+		}
+		data.extend_from_slice(note.as_bytes());
+		data.push(b'\n');
+		let _ = self.events.send(ExecEvent::Output(OutputFrame {
+			exec: exec.clone(),
+			channel: OutputChannel::Stderr as i32,
+			data: Bytes::from(data),
+			sequence: self.next,
+			..OutputFrame::default()
+		}));
+		self.next += 1;
+	}
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -2184,6 +2281,7 @@ fn spawn_reader<R: Read + Send + 'static>(
 				Ok(read) => read,
 			};
 			let mut sequencer = sequencer.lock();
+			sequencer.at_line_start = buffer[read - 1] == b'\n';
 			let frame = OutputFrame {
 				exec:     exec.clone(),
 				channel:  channel as i32,
@@ -2507,16 +2605,28 @@ fn phase_for_state(state: i32) -> ProcessPhase {
 }
 
 #[cfg(unix)]
-fn detached_command(source: &str) -> Command {
-	let mut command = Command::new("/bin/sh");
-	command.arg("-lc").arg(source);
+fn detached_command(source: &str, sandbox: Option<&ExecSandbox>) -> Command {
+	let args = [OsStr::new("-lc"), OsStr::new(source)];
+	let mut command = sandbox.map_or_else(
+		|| Command::new("/bin/sh"),
+		|sandbox| sandbox.command(OsStr::new("/bin/sh"), &args),
+	);
+	if sandbox.is_none() {
+		command.args(args);
+	}
 	command
 }
 
 #[cfg(windows)]
-fn detached_command(source: &str) -> Command {
-	let mut command = Command::new("cmd.exe");
-	command.arg("/d").arg("/s").arg("/c").arg(source);
+fn detached_command(source: &str, sandbox: Option<&ExecSandbox>) -> Command {
+	let args = [OsStr::new("/d"), OsStr::new("/s"), OsStr::new("/c"), OsStr::new(source)];
+	let mut command = sandbox.map_or_else(
+		|| Command::new("cmd.exe"),
+		|sandbox| sandbox.command(OsStr::new("cmd.exe"), &args),
+	);
+	if sandbox.is_none() {
+		command.args(args);
+	}
 	command
 }
 

@@ -37,7 +37,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
 	io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-	net::TcpListener,
 	process::{Child, Command},
 	runtime,
 	sync::Mutex as AsyncMutex,
@@ -56,6 +55,7 @@ use super::{
 		ChildBridgeTransport, PreludeStubWire, SessionBridgeHost,
 	},
 };
+use crate::{exec::ExecHost, exec_sandbox::ExecSandbox};
 
 /// Private argv selector used to re-enter `omp` as an eval kernel child.
 pub const EVAL_CHILD_ARG: &str = "__omp-eval-child";
@@ -84,6 +84,7 @@ pub struct ProcessEvalExec {
 struct ProcessEvalInner {
 	executable:      PathBuf,
 	interpreter:     PathBuf,
+	exec:            ExecHost,
 	host:            Arc<SessionBridgeHost>,
 	blobs:           Option<BlobHost>,
 	interrupt_grace: OmpDuration,
@@ -123,6 +124,7 @@ impl ProcessEvalExec {
 	/// is set, interpreter discovery is deferred until the authoritative
 	/// runtime working directory is available.
 	pub fn production(
+		exec: ExecHost,
 		host: Arc<SessionBridgeHost>,
 		interrupt_grace: OmpDuration,
 		blobs: BlobHost,
@@ -143,12 +145,13 @@ impl ProcessEvalExec {
 			})?,
 			None => PathBuf::from(EMBEDDED_INTERPRETER),
 		};
-		Ok(Self::new_inner(executable, interpreter, host, interrupt_grace, Some(blobs)))
+		Ok(Self::new_inner(executable, interpreter, exec, host, interrupt_grace, Some(blobs)))
 	}
 
 	fn new_inner(
 		executable: PathBuf,
 		interpreter: PathBuf,
+		exec: ExecHost,
 		host: Arc<SessionBridgeHost>,
 		interrupt_grace: OmpDuration,
 		blobs: Option<BlobHost>,
@@ -157,6 +160,7 @@ impl ProcessEvalExec {
 			inner: Arc::new(ProcessEvalInner {
 				executable,
 				interpreter,
+				exec,
 				host,
 				blobs,
 				interrupt_grace,
@@ -296,6 +300,14 @@ impl ProcessEvalExec {
 			message: sf!("unknown supervised Python process session"),
 		})?;
 		let gate = Arc::clone(&owned.run_gate).lock_owned().await;
+		let sandbox = self
+			.inner
+			.exec
+			.active_sandbox()
+			.map_err(|error| Fault::Resource {
+				operation: sf!("open_session"),
+				message:   Str::from(error.to_string()),
+			})?;
 		// The gate covers child replacement as well as execution, so callers
 		// queued on the same session coalesce around the first fresh child.
 		let forced_reset = owned.needs_reset.swap(false, Ordering::AcqRel);
@@ -353,6 +365,7 @@ impl ProcessEvalExec {
 							.unwrap_or_else(|| Path::new(".")),
 						Arc::clone(&host),
 						interrupt_grace,
+						sandbox.clone(),
 					)
 					.await
 					{
@@ -591,46 +604,50 @@ impl EvalChild {
 		cwd: &Path,
 		host: Arc<SessionBridgeHost>,
 		interrupt_grace: OmpDuration,
+		sandbox: Option<Arc<ExecSandbox>>,
 	) -> Result<Self, ProcessError> {
 		let interrupt_grace_std = interrupt_grace.to_std()?;
 		let capabilities = host.capabilities()?.allowed_names();
 		let prelude = host.prelude_stubs();
 		let token = Str::from(Ulid::generate().to_string());
 		let parent_pid = process::id();
-		let (mut command, external_protocol, external_runner) =
-			if interpreter == Path::new(EMBEDDED_INTERPRETER) {
-				let mut command = Command::new(executable);
-				command.arg(EVAL_CHILD_ARG);
-				(command, None, None)
-			} else {
-				let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-				let address = listener.local_addr()?;
-				let secret = Str::from(Ulid::generate().to_string());
-				let runner = stage_external_runner()?;
-				let mut command = Command::new(interpreter);
-				command
-					.arg("-u")
-					.arg(&runner)
-					.arg("--omp-connect")
-					.arg(address.to_string())
-					.arg(secret.as_str());
-				(command, Some((listener, address, secret)), Some(runner))
-			};
+		// Both worker forms keep their authenticated protocol on inherited pipes.
+		// The external runner duplicates these descriptors before redirecting user
+		// stdout/stderr, so confinement needs no loopback or Unix-socket exception.
+		let command_for = |program: &Path| {
+			sandbox.as_deref().map_or_else(
+				|| Command::new(program),
+				|sandbox| sandbox.tokio_command(program.as_os_str()),
+			)
+		};
+		let (mut command, external_runner) = if interpreter == Path::new(EMBEDDED_INTERPRETER) {
+			let mut command = command_for(executable);
+			command.arg(EVAL_CHILD_ARG);
+			(command, None)
+		} else {
+			let runner = stage_external_runner()?;
+			let mut command = command_for(interpreter);
+			command.arg("-u").arg(&runner);
+			(command, Some(runner))
+		};
+		let environment = sanitized_spawn_env();
 		command
 			.current_dir(cwd)
 			.env_clear()
-			.envs(sanitized_spawn_env())
+			.envs(environment.iter().filter_map(|(key, value)| {
+				sandbox
+					.as_deref()
+					.is_none_or(|sandbox| sandbox.env_allowed_os(key.as_os_str()))
+					.then_some((key, value))
+			}))
 			.env("PYTHONUNBUFFERED", "1")
 			.env("PYTHONIOENCODING", "utf-8")
 			.env("MPLBACKEND", "Agg")
 			.env("OMP_EVAL_SESSION", String::from_utf8_lossy(session_id.as_ref()).as_ref())
 			.stderr(Stdio::inherit())
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
 			.kill_on_drop(true);
-		if external_protocol.is_some() {
-			command.stdin(Stdio::null()).stdout(Stdio::null());
-		} else {
-			command.stdin(Stdio::piped()).stdout(Stdio::piped());
-		}
 		#[cfg(unix)]
 		{
 			use std::os::unix::process::CommandExt;
@@ -643,34 +660,16 @@ impl EvalChild {
 		}
 		let mut child = command.spawn()?;
 		let process_group = child.id();
-		let (stdin, stdout) = if let Some((listener, _, secret)) = external_protocol {
-			let (stream, _) = time::timeout(Duration::from_secs(30), listener.accept())
-				.await
-				.map_err(|_| {
-					ProcessError::Protocol(sf!("external Python protocol connect timed out"))
-				})??;
-			let (reader, writer) = stream.into_split();
-			let mut reader = BufReader::new(Box::new(reader) as ProtocolInput);
-			match read_frame::<_, ExternalHello>(&mut reader).await? {
-				Some(ExternalHello { secret: actual }) if actual == secret => {},
-				_ => {
-					return Err(ProcessError::Protocol(sf!(
-						"external Python protocol authentication failed"
-					)));
-				},
-			}
-			(Box::new(writer) as ProtocolOutput, reader)
-		} else {
-			let stdin = child
-				.stdin
-				.take()
-				.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdin unavailable")))?;
-			let stdout = child
-				.stdout
-				.take()
-				.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdout unavailable")))?;
-			(Box::new(stdin) as ProtocolOutput, BufReader::new(Box::new(stdout) as ProtocolInput))
-		};
+		let stdin = child
+			.stdin
+			.take()
+			.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdin unavailable")))?;
+		let stdout = child
+			.stdout
+			.take()
+			.ok_or_else(|| ProcessError::Protocol(sf!("eval child stdout unavailable")))?;
+		let (stdin, stdout) =
+			(Box::new(stdin) as ProtocolOutput, BufReader::new(Box::new(stdout) as ProtocolInput));
 		let mut process = Self {
 			child,
 			stdin,
@@ -1088,11 +1087,6 @@ impl Drop for EvalChild {
 			let _ = self.child.start_kill();
 		}
 	}
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ExternalHello {
-	secret: Str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2162,6 +2156,7 @@ mod tests {
 			&cwd,
 			Arc::clone(&host),
 			"1s".parse().expect("interrupt grace"),
+			None,
 		)
 		.await
 		.expect("launch selected interpreter");
@@ -2289,6 +2284,7 @@ mod tests {
 			&cwd,
 			Arc::clone(&host),
 			"1s".parse().expect("interrupt grace"),
+			None,
 		)
 		.await
 		.expect("launch selected interpreter");

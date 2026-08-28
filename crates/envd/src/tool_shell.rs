@@ -40,7 +40,7 @@ use url::Url;
 use super::{
 	direnv::DirenvDelta,
 	exec::{ExecError, ExecEvent, ExecHost, ExecRun},
-	exec_settings::{DirenvMode, ShellProfile, ShellSettings},
+	exec_settings::{DirenvMode, ExecSandboxMode, SandboxSettings, ShellProfile, ShellSettings},
 	tool_url::UrlResolver,
 	tools,
 };
@@ -97,13 +97,15 @@ impl AcpExecSlot {
 /// retained remote Environment owner.
 #[derive(Clone)]
 pub struct ShellExecHost {
-	backend:      ShellBackend,
-	cwd_uri:      Str,
-	resolvers:    Arc<ResolverTable<UrlResolver>>,
-	settings:     ShellSettings,
-	acp:          AcpExecSlot,
-	acp_routing:  bool,
-	acp_sessions: Arc<Mutex<BTreeMap<Bytes, AcpSessionOptions>>>,
+	backend:            ShellBackend,
+	cwd_uri:            Str,
+	resolvers:          Arc<ResolverTable<UrlResolver>>,
+	settings:           ShellSettings,
+	/// Sandbox posture compiled for external commands and in-process writes.
+	pub(crate) sandbox: SandboxSettings,
+	acp:                AcpExecSlot,
+	acp_routing:        bool,
+	acp_sessions:       Arc<Mutex<BTreeMap<Bytes, AcpSessionOptions>>>,
 }
 #[derive(Clone)]
 enum ShellBackend {
@@ -125,14 +127,21 @@ impl ShellExecHost {
 		cwd_uri: Str,
 		resolvers: Arc<ResolverTable<UrlResolver>>,
 		settings: ShellSettings,
+		sandbox: SandboxSettings,
 		acp: AcpExecSlot,
 		acp_routing: bool,
 	) -> Self {
+		if let Ok(uri) = Url::parse(&cwd_uri)
+			&& let Ok(root) = uri.to_file_path()
+		{
+			host.configure_sandbox(&sandbox, &root);
+		}
 		Self {
 			backend: ShellBackend::Local(host),
 			cwd_uri,
 			resolvers,
 			settings,
+			sandbox,
 			acp,
 			acp_routing,
 			acp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -140,12 +149,14 @@ impl ShellExecHost {
 	}
 
 	/// Binds shell execution to a retained Environment owner connection while
-	/// preserving this composition's URL resolvers and shell settings.
+	/// preserving this composition's URL resolvers, shell settings, and sandbox
+	/// policy.
 	pub(crate) fn new_remote(
 		client: EnvClient,
 		cwd_uri: Str,
 		resolvers: Arc<ResolverTable<UrlResolver>>,
 		settings: ShellSettings,
+		sandbox: SandboxSettings,
 		acp: AcpExecSlot,
 		acp_routing: bool,
 	) -> Self {
@@ -154,6 +165,7 @@ impl ShellExecHost {
 			cwd_uri,
 			resolvers,
 			settings,
+			sandbox,
 			acp,
 			acp_routing,
 			acp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -699,7 +711,11 @@ impl ShellExec for ShellExecHost {
 		let environment = self
 			.environment(&cwd_uri, self.expand_environment(options.env).await?, pty)
 			.await;
-		if self.acp_routing && self.acp.backend().is_some() && !pty {
+		if self.sandbox.mode == ExecSandboxMode::Off
+			&& self.acp_routing
+			&& self.acp.backend().is_some()
+			&& !pty
+		{
 			let cwd = Url::parse(&cwd_uri)
 				.ok()
 				.and_then(|uri| uri.to_file_path().ok())
@@ -774,7 +790,9 @@ impl ShellExec for ShellExecHost {
 			.await?;
 		let environment = command_environment(self.expand_environment(request.environment).await?);
 		let acp_options = self.acp_sessions.lock().get(&session.id).cloned();
-		if let Some(options) = acp_options {
+		if self.sandbox.mode == ExecSandboxMode::Off
+			&& let Some(options) = acp_options
+		{
 			let backend = self.acp.backend().ok_or_else(|| Fault::Resource {
 				operation: sf!("run"),
 				message:   sf!("ACP terminal backend disconnected"),
@@ -974,6 +992,7 @@ mod tests {
 			Str::from(root_uri),
 			Arc::new(ResolverTable::default()),
 			ShellSettings::default(),
+			SandboxSettings::default(),
 			AcpExecSlot::default(),
 			false,
 		)
