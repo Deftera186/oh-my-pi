@@ -479,7 +479,7 @@ fn panel_for_domain(domain: &str) -> &'static str {
 		"model" | "catalog" | "inference" => "model",
 		"interaction" | "voice" | "collaboration" => "interaction",
 		"agent" | "memory" | "compaction" => "context",
-		"files" | "shell" | "lsp" | "eval" => "files_shell",
+		"files" | "shell" | "sandbox" | "lsp" | "eval" => "files_shell",
 		"tools" | "tasks" | "approvals" | "browser" => "tools_tasks",
 		"orchestration" | "subagent" => "orchestration",
 		"providers" | "search" => "providers",

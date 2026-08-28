@@ -244,6 +244,12 @@ fn file_truncate(
 	}
 
 	let create = !no_create;
+	if !create && !resolved.exists() {
+		return Ok(());
+	}
+	let resolved = host
+		.ensure_writable(filename)
+		.map_err(|error| error.to_string())?;
 	let file = match OpenOptions::new()
 		.write(true)
 		.create(create)

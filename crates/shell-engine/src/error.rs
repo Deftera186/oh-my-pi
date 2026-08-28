@@ -8,7 +8,7 @@ use crate::{
 	Shell, ShellFd, SourceInfo,
 	arithmetic::EvalError,
 	env::EnvironmentScope,
-	extensions,
+	extensions, interp,
 	parser::{ParseError, TestCommandParseError, WordParseError},
 	results, sys,
 };
@@ -139,6 +139,9 @@ pub enum ErrorKind {
 	/// The requested input or output redirection is invalid.
 	#[error("invalid redirection target")]
 	InvalidRedirection,
+	/// A sandbox write-path policy refused a filesystem mutation.
+	#[error(transparent)]
+	WriteDenied(#[from] interp::WriteDenied),
 
 	/// An error occurred while redirecting input or output with the given file.
 	#[error("failed to redirect to {0}: {1}")]

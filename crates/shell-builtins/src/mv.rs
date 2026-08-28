@@ -962,9 +962,13 @@ fn rename(
 			},
 		}
 
+		host.ensure_writable(from)?;
+		host.ensure_writable(to)?;
+
 		// numbered-backup probing hits the shell's working directory.
 		backup_path = backup_control::get_backup_path(opts.backup, &to_fs, &opts.suffix);
 		if let Some(backup_path) = &backup_path {
+			host.ensure_writable(backup_path)?;
 			// For backup renames, we don't need to track hardlinks as we're just moving the
 			// existing file
 			rename_with_fallback(host, to, backup_path, display_manager, false, None, None)?;
@@ -1048,8 +1052,8 @@ fn rename_with_fallback(
 	#[cfg(not(unix))] _hardlink_tracker: Option<()>,
 	#[cfg(not(unix))] _hardlink_scanner: Option<()>,
 ) -> io::Result<()> {
-	let from_fs = host.resolve(from);
-	let to_fs = host.resolve(to);
+	let from_fs = host.ensure_writable(from)?;
+	let to_fs = host.ensure_writable(to)?;
 
 	fs::rename(&from_fs, &to_fs).or_else(|err| {
 		#[cfg(windows)]
@@ -1328,6 +1332,8 @@ fn copy_dir_contents_recursive(
 		let file_name = entry.file_name();
 		let from_path = from_dir.join(&file_name);
 		let to_path = to_dir.join(&file_name);
+		host.ensure_writable(&from_path)?;
+		host.ensure_writable(&to_path)?;
 
 		if let Some(pb) = progress_bar {
 			pb.set_message(from_path.to_string_lossy().to_string());

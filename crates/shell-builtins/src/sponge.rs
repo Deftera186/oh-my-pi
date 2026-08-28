@@ -57,7 +57,13 @@ impl Utility for Sponge {
 			return 0;
 		};
 
-		let target = host.resolve(file);
+		let target = match host.ensure_writable(file) {
+			Ok(path) => path,
+			Err(err) => {
+				host.error(format_args!("{}: {err}", file.to_string_lossy()), 1);
+				return 1;
+			},
+		};
 		let result = if self.matches.get_flag(OPT_APPEND) {
 			append_to(&target, &buffer)
 		} else {
@@ -197,10 +203,31 @@ pub(crate) fn sponge_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::{ffi::OsString, fs, str};
+	use std::{ffi::OsString, fs, str, sync::Arc};
 
 	use super::Sponge;
-	use crate::host::run_util;
+	use crate::host::{ScopedPathPolicy, run_util, run_util_with_policy};
+
+	#[test]
+	fn write_policy_denies_outside_root_and_allows_inside() {
+		let dir = tempfile::tempdir().unwrap();
+		let allowed = dir.path().join("allowed");
+		fs::create_dir(&allowed).unwrap();
+		let denied = dir.path().join("denied");
+		fs::write(&denied, b"original").unwrap();
+		let policy = Arc::new(ScopedPathPolicy::new(&allowed));
+
+		let (code, capture) =
+			run_util_with_policy::<Sponge>(&["denied"], "replacement", dir.path(), policy.clone());
+		assert_eq!(code, 1);
+		assert!(capture.err().contains("sandbox denied write"));
+		assert_eq!(fs::read(&denied).unwrap(), b"original");
+
+		let (code, capture) =
+			run_util_with_policy::<Sponge>(&["allowed/output"], "written", dir.path(), policy);
+		assert_eq!((code, capture.err()), (0, String::new()));
+		assert_eq!(fs::read(allowed.join("output")).unwrap(), b"written");
+	}
 
 	#[test]
 	fn stdin_written_to_file_exactly() {

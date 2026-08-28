@@ -7769,7 +7769,10 @@ pub mod named_writer {
 		io::{BufWriter, Write},
 		path::PathBuf,
 		rc::Rc,
+		sync::Arc,
 	};
+
+	use omp_shell_engine::PathPolicy;
 
 	use crate::{
 		sed::error_handling::{ScriptLocation, SedResult, runtime_error},
@@ -7779,6 +7782,27 @@ pub mod named_writer {
 	thread_local! {
 		 /// Global list of all writers that should be flushed at shutdown
 		 static FLUSH_LIST: RefCell<Vec<Rc<RefCell<NamedWriter>>>> = const { RefCell::new(Vec::new()) };
+		 /// Write policy scoped to the current sed invocation.
+		 static WRITE_POLICY: RefCell<Option<Arc<dyn PathPolicy>>> = const { RefCell::new(None) };
+	}
+
+	/// Restores the thread-local write policy when a sed invocation finishes.
+	pub(crate) struct PathPolicyGuard(Option<Arc<dyn PathPolicy>>);
+
+	impl PathPolicyGuard {
+		/// Installs the invocation's write policy for script-named output files.
+		pub(crate) fn install(policy: Option<Arc<dyn PathPolicy>>) -> Self {
+			let previous = WRITE_POLICY.with(|slot| slot.replace(policy));
+			Self(previous)
+		}
+	}
+
+	impl Drop for PathPolicyGuard {
+		fn drop(&mut self) {
+			WRITE_POLICY.with(|slot| {
+				let _ = slot.replace(self.0.take());
+			});
+		}
 	}
 
 	#[derive(Debug)]
@@ -7792,6 +7816,14 @@ pub mod named_writer {
 	impl NamedWriter {
 		/// Create a new writer, truncate the file, and register it for flushing.
 		pub fn new(path: PathBuf, location: ScriptLocation) -> SedResult<Rc<RefCell<Self>>> {
+			WRITE_POLICY.with(|slot| {
+				if let Some(policy) = slot.borrow().as_ref() {
+					policy
+						.check_write(&path)
+						.map_err(|error| runtime_error::<()>(&location, error).unwrap_err())?;
+				}
+				Ok::<(), crate::sed::SedError>(())
+			})?;
 			let file = OpenOptions::new()
 				.create(true)
 				.write(true)
@@ -8646,6 +8678,23 @@ pub mod processor {
 			let mut reader = LineReader::open_with_host(path, host)
 				.map_err_context(|| format!("error opening input file {}", path.quote()))?;
 			let resolved_path = host.resolve(path);
+			if context.in_place {
+				host
+					.ensure_writable(&resolved_path)
+					.map_err_context(|| format!("checking write access to {}", path.quote()))?;
+				if let Some(suffix) = &context.in_place_suffix {
+					let mut backup_path = resolved_path.clone();
+					let mut backup_name = backup_path
+						.file_name()
+						.expect("input path has a file name")
+						.to_os_string();
+					backup_name.push(suffix);
+					backup_path.set_file_name(backup_name);
+					host.ensure_writable(&backup_path).map_err_context(|| {
+						format!("checking write access to backup {}", backup_path.quote())
+					})?;
+				}
+			}
 			let output = in_place.begin(&resolved_path)?;
 
 			if context.separate || index == 0 {
@@ -9447,6 +9496,7 @@ impl Utility for Sed {
 
 	fn run(self, host: &mut Host) -> i32 {
 		named_writer::reset();
+		let _path_policy = named_writer::PathPolicyGuard::install(host.path_policy().cloned());
 		if !self.matches.args_present() {
 			let _ = write!(host.stdout, "{}", uu_app().render_help());
 			return 1;

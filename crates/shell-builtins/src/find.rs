@@ -156,6 +156,12 @@ pub mod matchers {
 					return true;
 				}
 
+				if let Err(error) = matcher_io.host().ensure_writable(path) {
+					matcher_io.set_exit_code(1);
+					writeln!(&mut matcher_io.host().stderr, "Failed to delete {path_str}: {error}")
+						.unwrap();
+					return false;
+				}
 				match self.delete(file_info) {
 					Ok(()) => true,
 					Err(e) => {
@@ -4063,7 +4069,7 @@ pub mod matchers {
 	/// Creates a file if it doesn't exist.
 	/// If it does exist, it will be overwritten.
 	fn get_or_create_file(path: &str, host: &Host) -> Result<File, Box<dyn Error>> {
-		let file = File::create(host.resolve(path))?;
+		let file = File::create(host.ensure_writable(path)?)?;
 		Ok(file)
 	}
 
@@ -5155,10 +5161,10 @@ pub(crate) fn find_builtin<SE: ShellExtensions>() -> Registration<SE> {
 
 #[cfg(test)]
 mod tests {
-	use std::{fs, path::PathBuf};
+	use std::{fs, path::PathBuf, sync::Arc};
 
 	use super::Find;
-	use crate::host::{Capture, run_util};
+	use crate::host::{Capture, ScopedPathPolicy, run_util, run_util_with_policy};
 
 	fn fixture() -> (tempfile::TempDir, PathBuf) {
 		let dir = tempfile::tempdir().unwrap();
@@ -5172,6 +5178,30 @@ mod tests {
 	fn run(root: &PathBuf, args: &[String]) -> (i32, Capture) {
 		let args: Vec<&str> = args.iter().map(String::as_str).collect();
 		run_util::<Find>(&args, "", root)
+	}
+
+	#[test]
+	fn delete_obeys_write_policy() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = fs::canonicalize(dir.path()).unwrap();
+		let allowed = root.join("allowed");
+		fs::create_dir(&allowed).unwrap();
+		let denied = root.join("denied");
+		let permitted = allowed.join("permitted");
+		fs::write(&denied, b"keep").unwrap();
+		fs::write(&permitted, b"delete").unwrap();
+		let policy = Arc::new(ScopedPathPolicy::new(&allowed));
+
+		let (code, capture) =
+			run_util_with_policy::<Find>(&["denied", "-delete"], "", &root, policy.clone());
+		assert_eq!(code, 1);
+		assert!(capture.err().contains("sandbox denied write"));
+		assert_eq!(fs::read(&denied).unwrap(), b"keep");
+
+		let (code, capture) =
+			run_util_with_policy::<Find>(&["allowed/permitted", "-delete"], "", &root, policy);
+		assert_eq!((code, capture.err()), (0, String::new()));
+		assert!(!permitted.exists());
 	}
 
 	#[test]

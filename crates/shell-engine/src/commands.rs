@@ -202,11 +202,22 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 	args: &[S],
 	empty_env: bool,
 ) -> Result<process::Command, error::Error> {
-	let mut cmd = process::Command::new(command_name);
+	let wrapper = context.params.spawn_wrapper();
+	let mut cmd = if let Some((launcher, prefix_args)) = wrapper.and_then(|w| w.launcher()) {
+		let mut cmd = process::Command::new(launcher);
+		cmd.args(prefix_args);
+		cmd.arg(command_name);
+		cmd
+	} else {
+		let mut cmd = process::Command::new(command_name);
 
-	// Override argv[0].
-	// NOTE: Not supported on all platforms.
-	cmd.arg0(argv0);
+		// Override argv[0].
+		// NOTE: Not supported on all platforms. A wrapper skips this override:
+		// the launcher execs the target, and argv[0] rewriting is not portable
+		// through that extra process boundary.
+		cmd.arg0(argv0);
+		cmd
+	};
 
 	// Pass through args.
 	cmd.args(args);
@@ -223,12 +234,14 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 			// NOTE: To match bash behavior, we only include exported variables
 			// that are set (i.e., have a value). This means a variable that
 			// shows up in `declare -p` but has no *set* value will be omitted.
-			if v.value().is_set() {
+			if v.value().is_set() && wrapper.is_none_or(|w| w.env_allowed(k.as_str())) {
 				cmd.env(k.as_str(), v.value().to_cow_str(context.shell).as_ref());
 			}
 		}
 		// Set _ to the resolved command path for external commands.
-		cmd.env("_", command_name);
+		if wrapper.is_none_or(|w| w.env_allowed("_")) {
+			cmd.env("_", command_name);
+		}
 	}
 
 	// Add in exported functions.
@@ -237,7 +250,9 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
 			if registration.is_exported() {
 				let var_name = std::format!("BASH_FUNC_{func_name}%%");
 				let value = std::format!("() {}", registration.definition().body);
-				cmd.env(var_name, value);
+				if wrapper.is_none_or(|w| w.env_allowed(&var_name)) {
+					cmd.env(var_name, value);
+				}
 			}
 		}
 	}
@@ -1079,4 +1094,46 @@ pub const fn child_session_action(
 	}
 
 	ChildSessionAction::DetachSession
+}
+#[cfg(test)]
+mod sandbox_tests {
+	use std::{
+		ffi::{OsStr, OsString},
+		sync::Arc,
+	};
+
+	use super::*;
+	use crate::SpawnWrapper;
+
+	struct EnvWrapper {
+		prefix: Vec<OsString>,
+	}
+
+	impl SpawnWrapper for EnvWrapper {
+		fn launcher(&self) -> Option<(&OsStr, &[OsString])> {
+			Some((OsStr::new("/usr/bin/env"), &self.prefix))
+		}
+
+		fn env_allowed(&self, key: &str) -> bool {
+			key != "FILTERED"
+		}
+	}
+
+	#[test]
+	fn compose_std_command_prefixes_spawn_wrapper() -> crate::TestResult<()> {
+		let mut shell: Shell = Shell::default();
+		let mut params = ExecutionParameters::default();
+		params.set_spawn_wrapper(Arc::new(EnvWrapper { prefix: vec![OsString::from("--")] }));
+		let context = ExecutionContext { shell: &mut shell, command_name: "echo".into(), params };
+
+		let cmd = compose_std_command(&context, "/bin/echo", "custom-argv0", &["hello"], true)?;
+		assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/env"));
+		assert_eq!(cmd.get_args().collect::<Vec<_>>(), [
+			OsStr::new("--"),
+			OsStr::new("/bin/echo"),
+			OsStr::new("hello")
+		]);
+
+		Ok(())
+	}
 }

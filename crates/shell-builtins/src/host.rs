@@ -39,8 +39,10 @@ use std::{
 use std::{ffi::OsStr, os::fd};
 
 use im::HashMap;
+#[cfg(test)]
+use omp_shell_engine::WriteDenied;
 use omp_shell_engine::{
-	Error, ExecutionContext, ExecutionResult, ShellExtensions,
+	Error, ExecutionContext, ExecutionResult, PathPolicy, ShellExtensions,
 	builtins::{self, Registration},
 	openfiles::{self, OpenFile, OpenFiles},
 	sys::fs,
@@ -99,6 +101,7 @@ pub(crate) struct Host {
 	name:                  String,
 	cwd:                   PathBuf,
 	env:                   HashMap<String, String>,
+	path_policy:           Option<Arc<dyn PathPolicy>>,
 	cancel:                Arc<AtomicBool>,
 	exit_code:             i32,
 	stdin_is_search_input: bool,
@@ -140,6 +143,21 @@ impl Host {
 		} else {
 			self.cwd.join(path)
 		}
+	}
+
+	/// Resolves a user-named write path and admits it through the installed
+	/// policy.
+	pub fn ensure_writable(&self, path: impl AsRef<Path>) -> io::Result<PathBuf> {
+		let path = self.resolve(path);
+		if let Some(policy) = &self.path_policy {
+			policy.check_write(&path).map_err(io::Error::other)?;
+		}
+		Ok(path)
+	}
+
+	/// Returns the installed write-path policy.
+	pub fn path_policy(&self) -> Option<&Arc<dyn PathPolicy>> {
+		self.path_policy.as_ref()
 	}
 
 	/// Looks up an exported shell variable.
@@ -858,6 +876,7 @@ fn build_host<SE: ShellExtensions>(
 		name: invoked,
 		cwd: context.shell.working_dir().to_path_buf(),
 		env,
+		path_policy: context.params.path_policy().cloned(),
 		cancel,
 		exit_code: 0,
 		stdin_is_search_input,
@@ -963,9 +982,31 @@ mod testing {
 	use parking_lot::Mutex;
 
 	use super::{
-		Arc, AtomicBool, Error, HashMap, Host, OpenFile, Ordering, OsString, PathBuf, Read, Stdin,
-		StreamWriter, Utility, Write, io, openfiles, run_caught,
+		Arc, AtomicBool, Error, HashMap, Host, OpenFile, Ordering, OsString, PathBuf, PathPolicy,
+		Read, Stdin, StreamWriter, Utility, Write, WriteDenied, io, openfiles, run_caught,
 	};
+
+	/// Test policy admitting writes only beneath one root.
+	pub(crate) struct ScopedPathPolicy {
+		root: PathBuf,
+	}
+
+	impl ScopedPathPolicy {
+		/// Creates a policy admitting `root` and its descendants.
+		pub(crate) fn new(root: impl AsRef<std::path::Path>) -> Self {
+			Self { root: root.as_ref().to_path_buf() }
+		}
+	}
+
+	impl PathPolicy for ScopedPathPolicy {
+		fn check_write(&self, path: &std::path::Path) -> Result<(), WriteDenied> {
+			if path.starts_with(&self.root) {
+				Ok(())
+			} else {
+				Err(WriteDenied { path: path.to_path_buf() })
+			}
+		}
+	}
 
 	/// Captured in-memory output from [`Host::for_test`].
 	pub(crate) struct Capture {
@@ -1037,6 +1078,7 @@ mod testing {
 				name: name.to_string(),
 				cwd: cwd.into(),
 				env: HashMap::new(),
+				path_policy: None,
 				cancel,
 				exit_code: 0,
 				stdin_is_search_input: false,
@@ -1048,6 +1090,11 @@ mod testing {
 		/// Sets an exported variable on a test host.
 		pub(crate) fn set_test_var(&mut self, key: &str, value: &str) {
 			self.env.insert(key.to_string(), value.to_string());
+		}
+
+		/// Installs a write-path policy on a test host.
+		pub(crate) fn set_test_path_policy(&mut self, policy: Arc<dyn PathPolicy>) {
+			self.path_policy = Some(policy);
 		}
 
 		/// Requests cancellation on a test host.
@@ -1072,7 +1119,29 @@ mod testing {
 		stdin: &str,
 		cwd: impl Into<PathBuf>,
 	) -> (i32, Capture) {
+		run_util_inner::<U>(argv, stdin, cwd.into(), None)
+	}
+
+	/// Runs a utility with a write-path policy installed on its host.
+	pub(crate) fn run_util_with_policy<U: Utility>(
+		argv: &[&str],
+		stdin: &str,
+		cwd: impl Into<PathBuf>,
+		policy: Arc<dyn PathPolicy>,
+	) -> (i32, Capture) {
+		run_util_inner::<U>(argv, stdin, cwd.into(), Some(policy))
+	}
+
+	fn run_util_inner<U: Utility>(
+		argv: &[&str],
+		stdin: &str,
+		cwd: PathBuf,
+		policy: Option<Arc<dyn PathPolicy>>,
+	) -> (i32, Capture) {
 		let (mut host, capture) = Host::for_test(U::NAME, stdin.as_bytes().to_vec(), cwd);
+		if let Some(policy) = policy {
+			host.set_test_path_policy(policy);
+		}
 		let full: Vec<OsString> = iter::once(OsString::from(U::NAME))
 			.chain(argv.iter().map(OsString::from))
 			.collect();
@@ -1247,5 +1316,5 @@ use std::{borrow, ffi, fmt, fmt::Display, iter, process, thread};
 
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{Capture, run_util};
+pub(crate) use testing::{Capture, ScopedPathPolicy, run_util, run_util_with_policy};
 use tokio::task;

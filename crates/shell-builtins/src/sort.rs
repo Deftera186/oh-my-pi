@@ -4750,9 +4750,18 @@ fn uu_sort(
 		open(file)?;
 	}
 
-	let output_path = matches
-		.get_one::<OsString>(options::OUTPUT)
-		.map(|path| host.resolve(path).into_os_string());
+	let output_path = match matches.get_one::<OsString>(options::OUTPUT) {
+		Some(path) => Some(
+			host
+				.ensure_writable(path)
+				.map_err(|error| SortError::OpenFailed {
+					path: PathBuf::from(path.as_os_str()),
+					error,
+				})?
+				.into_os_string(),
+		),
+		None => None,
+	};
 	let output = Output::new(output_path.as_ref(), Some(host.stdout_clone()))?;
 
 	if settings.debug {

@@ -1,5 +1,6 @@
 use std::{
 	collections::VecDeque,
+	ffi::{OsStr, OsString},
 	fs,
 	future::Future,
 	io,
@@ -87,6 +88,33 @@ pub trait SpawnObserver: Send + Sync {
 	/// group id when known (always its own pid under `NewProcessGroup`).
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>);
 }
+/// Write-path admission consulted by in-process redirections and mutating
+/// builtins.
+pub trait PathPolicy: Send + Sync {
+	/// Checks whether `path` (absolute) may be created, truncated, modified, or
+	/// deleted.
+	fn check_write(&self, path: &Path) -> Result<(), WriteDenied>;
+}
+
+/// Typed sandbox denial naming the refused write path.
+#[derive(Debug, thiserror::Error)]
+#[error("sandbox denied write to {path}")]
+pub struct WriteDenied {
+	/// Absolute path whose mutation was refused.
+	pub path: PathBuf,
+}
+
+/// Rewrites external-command launches with a sandbox prefix and environment
+/// filter.
+pub trait SpawnWrapper: Send + Sync {
+	/// Launcher program and prefix arguments to prepend before the resolved
+	/// program, if any.
+	fn launcher(&self) -> Option<(&OsStr, &[OsString])>;
+
+	/// Returns whether an exported environment variable may reach external
+	/// children.
+	fn env_allowed(&self, key: &str) -> bool;
+}
 
 /// Parameters for execution.
 #[derive(Clone, Default)]
@@ -112,6 +140,10 @@ pub struct ExecutionParameters {
 	pub suppress_errexit:     bool,
 	/// Optional hook reporting spawned external children for scoped teardown.
 	spawn_observer:           Option<Arc<dyn SpawnObserver>>,
+	/// Optional write-path admission policy for in-process filesystem mutations.
+	path_policy:              Option<Arc<dyn PathPolicy>>,
+	/// Optional launcher and environment policy for external commands.
+	spawn_wrapper:            Option<Arc<dyn SpawnWrapper>>,
 }
 
 impl ExecutionParameters {
@@ -160,6 +192,26 @@ impl ExecutionParameters {
 	/// Returns the active spawn-observer hook, if any.
 	pub fn spawn_observer(&self) -> Option<&Arc<dyn SpawnObserver>> {
 		self.spawn_observer.as_ref()
+	}
+
+	/// Assigns a write-path policy for this execution.
+	pub fn set_path_policy(&mut self, policy: Arc<dyn PathPolicy>) {
+		self.path_policy = Some(policy);
+	}
+
+	/// Returns the active write-path policy, if any.
+	pub fn path_policy(&self) -> Option<&Arc<dyn PathPolicy>> {
+		self.path_policy.as_ref()
+	}
+
+	/// Assigns an external-command spawn wrapper for this execution.
+	pub fn set_spawn_wrapper(&mut self, wrapper: Arc<dyn SpawnWrapper>) {
+		self.spawn_wrapper = Some(wrapper);
+	}
+
+	/// Returns the active external-command spawn wrapper, if any.
+	pub fn spawn_wrapper(&self) -> Option<&Arc<dyn SpawnWrapper>> {
+		self.spawn_wrapper.as_ref()
 	}
 
 	/// Returns the standard input file; usable with `write!` et al.
@@ -2000,6 +2052,13 @@ pub(crate) async fn setup_redirect(
 						shell.absolute_path(Path::new(expanded_fields.remove(0).as_str()));
 
 					let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
+					if !matches!(
+						kind,
+						ast::IoFileRedirectKind::Read | ast::IoFileRedirectKind::DuplicateInput
+					) && let Some(policy) = params.path_policy()
+					{
+						policy.check_write(&expanded_file_path)?;
+					}
 					match kind {
 						ast::IoFileRedirectKind::Read => {
 							options.read(true);
@@ -2227,6 +2286,9 @@ fn setup_redirect_output_and_error_to(
 	append: bool,
 ) -> Result<(), error::Error> {
 	let abs_file_path: PathBuf = shell.absolute_path(Path::new(file_path));
+	if let Some(policy) = params.path_policy() {
+		policy.check_write(&abs_file_path)?;
+	}
 
 	let mut file_options = fs::File::options();
 	file_options
@@ -2376,4 +2438,50 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
 	}
 
 	Ok(reader.into())
+}
+#[cfg(test)]
+mod sandbox_tests {
+	use super::*;
+
+	struct RootPolicy(PathBuf);
+
+	impl PathPolicy for RootPolicy {
+		fn check_write(&self, path: &Path) -> Result<(), WriteDenied> {
+			if path.starts_with(&self.0) {
+				Ok(())
+			} else {
+				Err(WriteDenied { path: path.to_path_buf() })
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn redirect_write_consults_path_policy() -> crate::TestResult<()> {
+		let allowed = tempfile::tempdir()?;
+		let denied = tempfile::tempdir()?;
+		let mut shell = Shell::builder()
+			.working_dir(allowed.path().to_path_buf())
+			.build()
+			.await?;
+		let mut params = shell.default_exec_params();
+		params.set_path_policy(Arc::new(RootPolicy(allowed.path().to_path_buf())));
+
+		let allowed_program = shell.parse_string("> allowed.txt")?;
+		let result = shell.run_program(allowed_program, &params).await?;
+		assert!(result.is_success());
+		assert!(allowed.path().join("allowed.txt").is_file());
+
+		let denied_path = denied.path().join("denied.txt");
+		let denied_program = shell.parse_string(format!("> {}", denied_path.display()))?;
+		let error = match shell.run_program(denied_program, &params).await {
+			Ok(_) => panic!("denied redirect unexpectedly succeeded"),
+			Err(error) => error,
+		};
+		match error.kind() {
+			error::ErrorKind::WriteDenied(denial) => assert_eq!(denial.path, denied_path),
+			other => panic!("expected typed write denial, got {other:?}"),
+		}
+
+		Ok(())
+	}
 }

@@ -604,7 +604,10 @@ fn touch_file(
 			return Ok(());
 		}
 
-		if let Err(error) = File::create(&resolved) {
+		let writable = host
+			.ensure_writable(path)
+			.map_err(|error| io_context(error, format!("cannot touch {}", filename.quote())))?;
+		if let Err(error) = File::create(&writable) {
 			// A trailing separator denotes a directory, but `File::create`
 			// cannot create one.
 			let is_directory = path
@@ -634,6 +637,11 @@ fn touch_file(
 		}
 	}
 
+	if !is_stdout {
+		host
+			.ensure_writable(path)
+			.map_err(|error| io_context(error, format!("setting times of {}", filename.quote())))?;
+	}
 	update_times(path, &resolved, is_stdout, opts, atime, mtime)
 }
 

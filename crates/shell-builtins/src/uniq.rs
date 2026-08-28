@@ -818,7 +818,14 @@ fn run_uniq(matches: &ArgMatches, host: &mut Host) -> PortResult<()> {
 	}
 
 	let input_path = operand_path(host, in_file_name);
-	let output_path = operand_path(host, out_file_name);
+	let output_path = out_file_name
+		.filter(|path| *path != "-")
+		.map(|path| {
+			host
+				.ensure_writable(path)
+				.map_err(|error| io_error(&format!("Could not open {}", path.maybe_quote()), error))
+		})
+		.transpose()?;
 
 	let input_file = input_path
 		.as_ref()

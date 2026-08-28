@@ -1,8 +1,13 @@
-use std::{fs::File, io::Write, path::PathBuf};
+use std::{
+	fs::File,
+	io::{self, Write},
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use clap::Parser;
 
-use crate::{ExecutionExitCode, ExecutionResult, builtins, history};
+use crate::{ExecutionExitCode, ExecutionResult, PathPolicy, builtins, history, sys::fs};
 
 /// Query or manipulate the shell's command history.
 #[derive(Parser)]
@@ -50,7 +55,9 @@ pub(crate) struct HistoryCommand {
 
 struct HistoryConfig {
 	default_history_file_path: Option<PathBuf>,
-	time_format:               Option<String>,
+	time_format: Option<String>,
+	cwd: PathBuf,
+	path_policy: Option<Arc<dyn PathPolicy>>,
 }
 
 impl builtins::Command for HistoryCommand {
@@ -63,7 +70,9 @@ impl builtins::Command for HistoryCommand {
 		// Retrieve the shell's history config while we still can.
 		let config = HistoryConfig {
 			default_history_file_path: context.shell.history_file_path(),
-			time_format:               context.shell.history_time_format(),
+			time_format: context.shell.history_time_format(),
+			cwd: context.shell.working_dir().to_path_buf(),
+			path_policy: context.params.path_policy().cloned(),
 		};
 
 		let stdout = context.stdout();
@@ -124,6 +133,7 @@ impl HistoryCommand {
 				config.default_history_file_path,
 				append_option.as_ref(),
 			) {
+				ensure_history_writable(&config.cwd, config.path_policy.as_ref(), &file_path)?;
 				history.flush(
 					file_path,
 					true,                         /* append? */
@@ -159,6 +169,7 @@ impl HistoryCommand {
 			if let Some(file_path) =
 				get_effective_history_file_path(config.default_history_file_path, write_option.as_ref())
 			{
+				ensure_history_writable(&config.cwd, config.path_policy.as_ref(), &file_path)?;
 				history.flush(
 					file_path,
 					false,                        /* append? */
@@ -189,6 +200,23 @@ impl HistoryCommand {
 
 		Ok(ExecutionResult::success())
 	}
+}
+
+fn ensure_history_writable(
+	cwd: &Path,
+	path_policy: Option<&Arc<dyn PathPolicy>>,
+	path: &Path,
+) -> Result<(), crate::Error> {
+	let normalized = fs::normalize_shell_path(path);
+	let path = if normalized.is_absolute() {
+		normalized.into_owned()
+	} else {
+		cwd.join(normalized)
+	};
+	if let Some(policy) = path_policy {
+		policy.check_write(&path).map_err(io::Error::other)?;
+	}
+	Ok(())
 }
 
 fn expand_history_args(
