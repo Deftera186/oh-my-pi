@@ -84,10 +84,11 @@ use tokio::{
 	time::{Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
+use url::Url;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console;
 
-use super::exthost::{DispatchError, control::ControlRuntimeError, lifecycle::EscapeCapability};
+use super::exthost::{DispatchError, control::ControlRuntimeError};
 use crate::{
 	exthost::{
 		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
@@ -1238,6 +1239,7 @@ struct PendingControlActivation {
 	lifecycle_gate:     Option<Arc<HookGate>>,
 	registered_ui:      Arc<RwLock<Option<RegisterUi>>>,
 	settings:           serde_json::Map<String, serde_json::Value>,
+	roots:              Box<[Str]>,
 }
 struct LiveControlRoute {
 	control:  RwLock<ControlHandle>,
@@ -1586,6 +1588,13 @@ impl ExtHostSupervisor {
 				lifecycle_gate: hook_control.as_ref().map(|hooks| hooks.admission_gate()),
 				registered_ui: Arc::new(RwLock::new(None)),
 				settings: extension.settings.clone(),
+				roots: config
+					.workspace_root
+					.iter()
+					.map(|root| Str::from(Url::from_file_path(root)
+						.expect("workspace root is an absolute filesystem path")
+						.as_str()))
+					.collect(),
 			};
 			let live_control = Arc::new(LiveControlRoute {
 				control:  RwLock::new(running.control()),
@@ -1913,7 +1922,6 @@ impl ExtHostSupervisor {
 	/// factory bundle is bound before first user reach.
 	pub async fn activate_control_hosts(&self) -> Result<(), WorkerError> {
 		for activation in &self.control_activations {
-			wait_control_registry(activation).await?;
 			activate_control_generation(
 				activation,
 				activation.control.clone(),
@@ -1922,6 +1930,7 @@ impl ExtHostSupervisor {
 				Arc::clone(&self.frozen_registry),
 			)
 			.await?;
+			wait_control_registry(activation).await?;
 		}
 		if let Some(gate) = self.lifecycle_gate.as_deref() {
 			for manifest in self.lifecycle_manifests.iter() {
@@ -6279,7 +6288,7 @@ async fn run_control_supervisor(
 					effects: Box::new([]),
 					place_kind: sf!("host"),
 					lifecycle: LifecyclePhase::Active,
-					roots: Box::new([]),
+					roots: activation.roots.clone(),
 					remote: false,
 					has_ui: false,
 					headless: true,

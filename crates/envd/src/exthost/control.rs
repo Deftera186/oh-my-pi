@@ -2664,7 +2664,11 @@ impl ControlRuntime {
 						.accept_effect(frame, ControlEffectKind::Registry)
 						.await?
 				},
-				"IntentEffect" => self.accept_effect(frame, ControlEffectKind::Intent).await?,
+				"IntentEffect" => {
+					if let Err(error) = self.accept_effect(frame, ControlEffectKind::Intent).await {
+						tracing::warn!(%error, "extension intent effect was rejected");
+					}
+				},
 				"UiEffect" => self.accept_effect(frame, ControlEffectKind::Ui).await?,
 				"Log" => self.accept_effect(frame, ControlEffectKind::Log).await?,
 				"Instrument" => {

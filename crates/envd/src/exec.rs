@@ -3,7 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	env,
-	ffi::OsStr,
+	ffi::{OsStr, OsString},
 	fs, future,
 	io::{self, Read, Write as _},
 	net,
@@ -22,6 +22,7 @@ use bytes::{Buf as _, Bytes, BytesMut};
 use flume::Receiver;
 use futures::future::try_join_all;
 use nix::errno::Errno;
+use omp_agent::{ApprovalRoute, ApprovalSpec, TicketState};
 use omp_core::{Hash32, Str, sf};
 use omp_proto::{
 	env::{
@@ -40,7 +41,7 @@ use omp_proto::{
 	toolhost::v1::{HostFrame, Ping, WorkerFrame, host_frame, worker_frame},
 };
 use omp_shell_engine::{
-	ExecutionParameters, Shell, ShellValue, ShellVariable, SourceInfo, SpawnObserver,
+	ExecutionParameters, ProcessScope, Shell, ShellValue, ShellVariable, SourceInfo, SpawnObserver,
 	env::EnvironmentScope,
 	openfiles::{OpenFile, OpenFiles},
 	processes::{ProcessSignal, signal_process_group},
@@ -74,6 +75,8 @@ const RESTART_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 const RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
 const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
 const RUN_ENVIRONMENT_PROP: &str = "omp/run-environment";
+const SANDBOX_DENIED_PATH_PROP: &str = "omp/sandbox-denied-path";
+const SANDBOX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 /// Content identity of the process environment inherited by new shell sessions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -192,6 +195,28 @@ pub enum ExecEvent {
 	Exit(ExitEvent),
 }
 
+pub(crate) fn sandbox_denied_event_path(event: &ExecEvent) -> Option<Str> {
+	let ExecEvent::Exit(event) = event else {
+		return None;
+	};
+	let status = event.status.as_ref()?;
+	if status.outcome != ExecOutcome::Denied as i32 {
+		return None;
+	}
+	let path = status
+		.props
+		.as_ref()?
+		.fields
+		.get(SANDBOX_DENIED_PATH_PROP)?
+		.kind
+		.as_ref()
+		.and_then(|kind| match kind {
+			wire_value::Kind::String(path) => Some(path.as_str()),
+			_ => None,
+		})?;
+	Some(Str::from(path))
+}
+
 /// One event emitted by an attached named process.
 #[derive(Clone, Debug)]
 pub enum ProcessEvent {
@@ -275,14 +300,16 @@ struct HostInner {
 	github_cache:  Mutex<Option<Arc<GithubCache>>>,
 	devices:       Mutex<Option<Arc<crate::devices_host::DynHost>>>,
 	persistence:   Mutex<Option<ProcessPersistence>>,
-	next_order:    AtomicU64,
-	sandbox:       Mutex<Option<SandboxConfig>>,
+	next_order:               AtomicU64,
+	sandbox:                  Mutex<Option<SandboxConfig>>,
+	sandbox_approval_route:   Mutex<Option<ApprovalRoute>>,
 }
 
 struct SandboxConfig {
 	settings:       SandboxSettings,
 	workspace_root: PathBuf,
-	compiled:       Option<Arc<ExecSandbox>>,
+	supervised:     Option<Arc<ExecSandbox>>,
+	detached:       Option<Arc<ExecSandbox>>,
 }
 
 struct ProcessPersistence {
@@ -298,6 +325,7 @@ struct SessionHandle {
 	command_prefix: Str,
 	user_shell:     Option<UserShell>,
 	sandbox:        Option<Arc<ExecSandbox>>,
+	process_scope:  Arc<SpawnBook>,
 }
 #[derive(Clone)]
 struct UserShell {
@@ -446,7 +474,9 @@ enum InputSink {
 }
 
 struct SpawnBook {
-	groups: Mutex<Vec<i32>>,
+	groups:  Mutex<Vec<i32>>,
+	pids:    Mutex<Vec<i32>>,
+	session: Option<Arc<SpawnBook>>,
 }
 
 struct SessionCommand {
@@ -461,6 +491,7 @@ struct SessionCommand {
 	events:         flume::Sender<ExecEvent>,
 	github_targets: Vec<GithubMutationTarget>,
 	sandbox:        Option<Arc<ExecSandbox>>,
+	bypass_sandbox: bool,
 }
 
 impl Default for ExecHost {
@@ -485,8 +516,9 @@ impl ExecHost {
 				github_cache:  Mutex::new(None),
 				devices:       Mutex::new(None),
 				persistence:   Mutex::new(None),
-				next_order:    AtomicU64::new(1),
-				sandbox:       Mutex::new(None),
+				next_order:             AtomicU64::new(1),
+				sandbox:                Mutex::new(None),
+				sandbox_approval_route: Mutex::new(None),
 			}),
 		}
 	}
@@ -494,26 +526,90 @@ impl ExecHost {
 	/// Configures sandbox policy for subsequently opened sessions and detached
 	/// processes.
 	pub(crate) fn configure_sandbox(&self, settings: &SandboxSettings, workspace_root: &Path) {
-		let config = (settings.mode != ExecSandboxMode::Off).then(|| SandboxConfig {
+		let config = (settings.mode != ExecSandboxMode::Off
+			|| !settings.environment_policy_is_default())
+		.then(|| SandboxConfig {
 			settings:       settings.clone(),
 			workspace_root: workspace_root.to_path_buf(),
-			compiled:       None,
+			supervised:     None,
+			detached:       None,
 		});
 		*self.inner.sandbox.lock() = config;
 	}
 
 	pub(crate) fn active_sandbox(&self) -> Result<Option<Arc<ExecSandbox>>, ExecError> {
+		self.compiled_sandbox(true)
+	}
+
+	fn detached_sandbox(&self) -> Result<Option<Arc<ExecSandbox>>, ExecError> {
+		self.compiled_sandbox(false)
+	}
+
+	fn compiled_sandbox(&self, supervised: bool) -> Result<Option<Arc<ExecSandbox>>, ExecError> {
 		let mut config = self.inner.sandbox.lock();
 		let Some(config) = config.as_mut() else {
 			return Ok(None);
 		};
-		if let Some(sandbox) = &config.compiled {
+		if let Some(sandbox) = if supervised {
+			config.supervised.as_ref()
+		} else {
+			config.detached.as_ref()
+		} {
 			return Ok(Some(Arc::clone(sandbox)));
 		}
-		let sandbox = ExecSandbox::compile(&config.settings, &config.workspace_root)
+		let sandbox = ExecSandbox::compile(&config.settings, &config.workspace_root, supervised)
 			.map_err(|source| ExecError::Sandbox { mode: config.settings.mode.into(), source })?;
-		config.compiled = sandbox.clone();
+		if supervised {
+			config.supervised = sandbox.clone();
+		} else {
+			config.detached = sandbox.clone();
+		}
 		Ok(sandbox)
+	}
+
+	/// Binds the interactive approval route used for one-shot sandbox bypasses.
+	pub(crate) fn bind_sandbox_approval_route(&self, route: Option<ApprovalRoute>) {
+		*self.inner.sandbox_approval_route.lock() = route;
+	}
+
+	/// Requests approval to rerun one exact command without its sandbox hooks.
+	pub(crate) async fn approve_sandbox_bypass(&self, command: &str, denied_path: &str) -> bool {
+		let Some(route) = self.inner.sandbox_approval_route.lock().clone() else {
+			return false;
+		};
+		let ticket = route
+			.request(
+				None,
+				vec![ApprovalSpec {
+					title:         sf!("Rerun command without sandbox"),
+					body:          sf!(
+						"The sandbox denied access to {denied_path}. Approve one unsandboxed rerun of \
+						 this exact command?\n\n{command}"
+					),
+					subject:       Str::from(denied_path),
+					kind:          sf!("sandbox_bypass"),
+					scopes:        vec![sf!("once")],
+					default:       Some(false),
+					route:         sf!("local"),
+					approver:      None,
+					timeout_ms:    120_000,
+					unreachable:   sf!("fail_closed"),
+					require_human: true,
+					pattern:       Some(Str::from(command)),
+					evidence:      vec![sf!("sandbox denial")],
+				}],
+				unix_time_ms(),
+			)
+			.await;
+		ticket.state == TicketState::Decided
+			&& ticket
+				.decision
+				.as_ref()
+				.is_some_and(|decision| decision.approved && decision.scope == "once")
+			&& ticket
+				.reasons
+				.iter()
+				.any(|reason| reason.kind == "sandbox_bypass" && reason.subject == denied_path)
 	}
 
 	/// Enables durable named-process metadata and recovers verified detached
@@ -639,6 +735,11 @@ impl ExecHost {
 		let session = self.new_id();
 		let lease = self.new_id();
 		let (tx, rx) = flume::unbounded();
+		let process_scope = Arc::new(SpawnBook {
+			groups:  Mutex::new(Vec::new()),
+			pids:    Mutex::new(Vec::new()),
+			session: None,
+		});
 		let sessions = Arc::downgrade(&self.inner);
 		let session_for_task = session.clone();
 		tokio::spawn(async move {
@@ -657,6 +758,7 @@ impl ExecHost {
 				command_prefix,
 				user_shell,
 				sandbox,
+				process_scope,
 			});
 
 		Ok(OpenSessionResponse {
@@ -772,8 +874,26 @@ impl ExecHost {
 	/// Starts a script in a session. A session serializes its scripts.
 	pub async fn exec(
 		&self,
+		request: ExecRequest,
+		timeout: Option<Duration>,
+	) -> Result<(ExecStarted, ExecRun), ExecError> {
+		self.exec_controlled(request, timeout, false).await
+	}
+
+	/// Starts one script while bypassing sandbox hooks for only this command.
+	pub(crate) async fn exec_without_sandbox(
+		&self,
+		request: ExecRequest,
+		timeout: Option<Duration>,
+	) -> Result<(ExecStarted, ExecRun), ExecError> {
+		self.exec_controlled(request, timeout, true).await
+	}
+
+	async fn exec_controlled(
+		&self,
 		mut request: ExecRequest,
 		timeout: Option<Duration>,
+		bypass_sandbox: bool,
 	) -> Result<(ExecStarted, ExecRun), ExecError> {
 		let session = self
 			.inner
@@ -812,7 +932,11 @@ impl ExecHost {
 		let control = Arc::new(RunControl {
 			cancel_tx,
 			input: Mutex::new(None),
-			spawns: Arc::new(SpawnBook { groups: Mutex::new(Vec::new()) }),
+			spawns: Arc::new(SpawnBook {
+				groups:  Mutex::new(Vec::new()),
+				pids:    Mutex::new(Vec::new()),
+				session: Some(session.process_scope.clone()),
+			}),
 			finished: AtomicBool::new(false),
 			retained: Mutex::new(None),
 			events: Arc::downgrade(&events),
@@ -829,11 +953,11 @@ impl ExecHost {
 			events: events_tx,
 			github_targets,
 			sandbox: session.sandbox,
+			bypass_sandbox,
 		};
 		session
 			.tx
-			.send_async(command)
-			.await
+			.send(command)
 			.map_err(|_| ExecError::SessionClosed)?;
 		self
 			.inner
@@ -1114,24 +1238,27 @@ impl ExecHost {
 			.text
 			.clone();
 		let cwd = cwd_from_uri(&spec.cwd_uri)?.map_or_else(env::current_dir, Ok)?;
-		let sandbox = self.active_sandbox()?;
+		let sandbox = self.detached_sandbox()?;
 		let mut command = detached_command(&source, sandbox.as_deref());
-		if let Some(sandbox) = sandbox.as_deref() {
-			command
-				.env_clear()
-				.envs(env::vars_os().filter(|(key, _)| sandbox.env_allowed_os(key.as_os_str())));
-		}
 		command
 			.current_dir(cwd)
 			.stdin(Stdio::null())
 			.stdout(Stdio::from(output))
 			.stderr(Stdio::from(stderr));
-		if let Some(delta) = spec.env_delta.as_ref() {
-			command.envs(delta.set.iter().filter(|(key, _)| {
-				sandbox
-					.as_deref()
-					.is_none_or(|sandbox| sandbox.env_allowed_os(OsStr::new(key.as_str())))
-			}));
+		if let Some(sandbox) = sandbox.as_deref() {
+			let mut environment = env::vars_os().collect::<Vec<_>>();
+			if let Some(delta) = spec.env_delta.as_ref() {
+				environment.retain(|(name, _)| {
+					!delta.unset.iter().any(|unset| name == OsStr::new(unset))
+						&& !delta.set.keys().any(|set| name == OsStr::new(set.as_str()))
+				});
+				environment.extend(delta.set.iter().map(|(name, value)| {
+					(OsString::from(name.as_str()), OsString::from(value.as_str()))
+				}));
+			}
+			command.env_clear().envs(sandbox.resolve_env(environment));
+		} else if let Some(delta) = spec.env_delta.as_ref() {
+			command.envs(&delta.set);
 			for name in &delta.unset {
 				command.env_remove(name);
 			}
@@ -1166,7 +1293,11 @@ impl ExecHost {
 		let control = Arc::new(RunControl {
 			cancel_tx,
 			input: Mutex::new(None),
-			spawns: Arc::new(SpawnBook { groups: Mutex::new(vec![pid as i32]) }),
+			spawns: Arc::new(SpawnBook {
+				groups:  Mutex::new(vec![pid as i32]),
+				pids:    Mutex::new(Vec::new()),
+				session: None,
+			}),
 			finished: AtomicBool::new(false),
 			retained: Mutex::new(None),
 			events: Weak::new(),
@@ -1377,7 +1508,11 @@ impl ExecHost {
 			let control = Arc::new(RunControl {
 				cancel_tx,
 				input: Mutex::new(None),
-				spawns: Arc::new(SpawnBook { groups: Mutex::new(vec![record.identity.pid as i32]) }),
+				spawns: Arc::new(SpawnBook {
+					groups:  Mutex::new(vec![record.identity.pid as i32]),
+					pids:    Mutex::new(Vec::new()),
+					session: None,
+				}),
 				finished: AtomicBool::new(false),
 				retained: Mutex::new(None),
 				events: Weak::new(),
@@ -1902,16 +2037,52 @@ impl RunControl {
 }
 
 impl SpawnObserver for SpawnBook {
-	fn on_spawn(&self, _pid: i32, pgid: Option<i32>) {
+	fn on_spawn(&self, pid: i32, pgid: Option<i32>) {
+		self.record_spawn(pid, pgid);
+		if let Some(session) = self.session.as_ref() {
+			session.record_spawn(pid, pgid);
+		}
+	}
+}
+impl ProcessScope for SpawnBook {
+	fn may_signal(&self, pid: i32) -> bool {
+		self.owns_process(pid)
+	}
+
+	fn may_observe(&self, pid: i32) -> bool {
+		self.owns_process(pid)
+	}
+}
+
+impl SpawnBook {
+	fn record_spawn(&self, pid: i32, pgid: Option<i32>) {
+		let mut pids = self.pids.lock();
+		if !pids.contains(&pid) {
+			pids.push(pid);
+		}
+		drop(pids);
 		let Some(pgid) = pgid else { return };
 		let mut groups = self.groups.lock();
 		if !groups.contains(&pgid) {
 			groups.push(pgid);
 		}
 	}
-}
 
-impl SpawnBook {
+	fn owns_process(&self, pid: i32) -> bool {
+		if pid == process::id() as i32 {
+			return false;
+		}
+		self.pids.lock().contains(&pid)
+			|| self.groups.lock().contains(&pid)
+			|| pid
+				.checked_neg()
+				.is_some_and(|pgid| self.groups.lock().contains(&pgid))
+			|| self
+				.session
+				.as_ref()
+				.is_some_and(|session| session.owns_process(pid))
+	}
+
 	fn signal(&self, signal: ProcessSignal) -> Result<(), io::Error> {
 		for pgid in self.groups.lock().iter().copied() {
 			signal_process_group(pgid, signal)?;
@@ -1989,11 +2160,17 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		Err(flume::TryRecvError::Empty) => {},
 	}
 	let cancel_rx = command.cancel_rx.clone();
+	let sandbox_active = !command.bypass_sandbox
+		&& command
+			.sandbox
+			.as_ref()
+			.is_some_and(|sandbox| sandbox.kernel_active());
 	let setup = setup_io(
 		command.pty.as_ref(),
 		command.control.clone(),
 		command.exec.clone(),
 		command.events.clone(),
+		sandbox_active,
 	);
 	let Ok((mut params, readers, sequencer)) = setup else {
 		finish_session_command(
@@ -2023,8 +2200,14 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		.send(ExecEvent::Started { exec_id: command.exec.clone() });
 	params.process_group_policy = omp_shell_engine::ProcessGroupPolicy::NewProcessGroup;
 	params.set_spawn_observer(command.control.spawns.clone());
-	if let Some(sandbox) = command.sandbox.as_ref() {
-		params.set_path_policy(sandbox.clone());
+	params.set_process_scope(command.control.spawns.clone());
+	params.set_protect_host_process(true);
+	if !command.bypass_sandbox
+		&& let Some(sandbox) = command.sandbox.as_ref()
+	{
+		if sandbox.kernel_active() {
+			params.set_path_policy(sandbox.clone());
+		}
 		params.set_spawn_wrapper(sandbox.clone());
 	}
 	let source_info = SourceInfo::from("env/v1 exec");
@@ -2040,20 +2223,30 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 		tokio::pin!(execution);
 		tokio::select! {
 			  result = &mut execution => match result {
-					 Ok(result) => RunTerminal::Exited(i32::from(u8::from(result.exit_code))),
-					 Err(_error) => RunTerminal::Failed,
+					 Ok(result) => (
+						 RunTerminal::Exited(i32::from(u8::from(result.exit_code))),
+						 None,
+					 ),
+					 Err(error) => (RunTerminal::Failed, Some(error)),
 			  },
 			  request = cancel_rx.recv_async() => {
 					 let request = request.unwrap_or(CancelRequest { grace: CANCEL_GRACE });
 					 command.control.spawns.terminate(request.grace).await;
-					 RunTerminal::Cancelled
+					 (RunTerminal::Cancelled, None)
 			  },
 			  () = &mut timeout => {
 					 command.control.spawns.terminate(CANCEL_GRACE).await;
-					 RunTerminal::Timeout
+					 (RunTerminal::Timeout, None)
 			  },
 		}
 	};
+	let (result, shell_error) = result;
+	if let Some(error) = shell_error.as_ref()
+		&& sandbox_active
+	{
+		let mut stderr = params.stderr(shell);
+		let _ = shell.display_error(&mut stderr, error);
+	}
 	drop(params);
 	command.control.close_input();
 	for reader in readers {
@@ -2070,7 +2263,20 @@ async fn run_session_command(shell: &mut Shell, command: SessionCommand) -> bool
 	} else {
 		result
 	};
-	if result != RunTerminal::Exited(0)
+	let denial = {
+		let sequencer = sequencer.lock();
+		classify_sandbox_denial(
+			sandbox_active,
+			&result,
+			shell_error.as_ref(),
+			sequencer.sandbox_diagnostic.as_deref().unwrap_or_default(),
+		)
+	};
+	let result = denial.map_or(result, |denial| RunTerminal::Denied {
+		exit_code: denial.exit_code,
+		path:      denial.path,
+	});
+	if matches!(&result, RunTerminal::Denied { .. })
 		&& let Some(sandbox) = command.sandbox.as_ref()
 	{
 		sequencer
@@ -2132,22 +2338,36 @@ fn finish_session_command(
 	let _ = command.events.send(event);
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum RunTerminal {
 	Exited(i32),
 	Failed,
 	Timeout,
 	Cancelled,
+	Denied {
+		exit_code: Option<i32>,
+		path:      Str,
+	},
 }
 
 impl RunTerminal {
 	fn status(self, elapsed: Duration) -> ExecStatusMsg {
+		let props = match &self {
+			Self::Denied { path, .. } => Some(WireValueMap {
+				fields: BTreeMap::from([(
+					SANDBOX_DENIED_PATH_PROP.to_owned(),
+					WireValue { kind: Some(wire_value::Kind::String(path.to_string())) },
+				)]),
+			}),
+			_ => None,
+		};
 		let (outcome, exit_code, signal, aborted) = match self {
 			Self::Exited(code) if code == 0 => (ExecOutcome::Exited, Some(code), "", false),
 			Self::Exited(code) => (ExecOutcome::Failed, Some(code), "", false),
 			Self::Failed => (ExecOutcome::Failed, None, "", false),
 			Self::Timeout => (ExecOutcome::Timeout, None, "SIGKILL", true),
 			Self::Cancelled => (ExecOutcome::Cancelled, None, "SIGKILL", true),
+			Self::Denied { exit_code, .. } => (ExecOutcome::Denied, exit_code, "", false),
 		};
 		ExecStatusMsg {
 			outcome: outcome as i32,
@@ -2156,8 +2376,87 @@ impl RunTerminal {
 			wall_clock_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
 			spilled_output: None,
 			aborted,
-			props: Default::default(),
+			props,
 		}
+	}
+}
+
+struct SandboxDenial {
+	exit_code: Option<i32>,
+	path:      Str,
+}
+
+fn classify_sandbox_denial(
+	sandbox_active: bool,
+	result: &RunTerminal,
+	error: Option<&omp_shell_engine::Error>,
+	stderr: &[u8],
+) -> Option<SandboxDenial> {
+	if !sandbox_active {
+		return None;
+	}
+	if let Some(omp_shell_engine::ErrorKind::WriteDenied(denied)) =
+		error.map(omp_shell_engine::Error::kind)
+	{
+		return Some(SandboxDenial {
+			exit_code: None,
+			path:      Str::from(denied.path.to_string_lossy().as_ref()),
+		});
+	}
+	let RunTerminal::Exited(exit_code) = result else {
+		return None;
+	};
+	if *exit_code == 0 {
+		return None;
+	}
+	let marker = sandbox_denial_marker(stderr)?;
+	Some(SandboxDenial {
+		exit_code: Some(*exit_code),
+		path:      sandbox_denied_path(stderr, marker),
+	})
+}
+
+fn sandbox_denial_marker(stderr: &[u8]) -> Option<usize> {
+	stderr
+		.windows(b"Operation not permitted".len())
+		.position(|window| window == b"Operation not permitted")
+		.or_else(|| {
+			stderr
+				.windows(b"EPERM".len())
+				.enumerate()
+				.find_map(|(position, window)| {
+					if window != b"EPERM" {
+						return None;
+					}
+					let before = position
+						.checked_sub(1)
+						.and_then(|index| stderr.get(index))
+						.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+					let after = stderr
+						.get(position + b"EPERM".len())
+						.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+					(before && after).then_some(position)
+				})
+		})
+}
+
+fn sandbox_denied_path(stderr: &[u8], marker: usize) -> Str {
+	let line_start = stderr[..marker]
+		.iter()
+		.rposition(|byte| *byte == b'\n' || *byte == b'\r')
+		.map_or(0, |position| position + 1);
+	let line_end = stderr[marker..]
+		.iter()
+		.position(|byte| *byte == b'\n' || *byte == b'\r')
+		.map_or(stderr.len(), |position| marker + position);
+	let line = String::from_utf8_lossy(&stderr[line_start..line_end]);
+	let prefix = String::from_utf8_lossy(&stderr[line_start..marker]);
+	let prefix = prefix.trim().trim_end_matches(':').trim();
+	let candidate = prefix.rsplit_once(':').map_or(prefix, |(_, path)| path.trim());
+	if candidate.starts_with('/') || candidate.starts_with("./") || candidate.starts_with("../") {
+		Str::from(candidate)
+	} else {
+		Str::from(line.trim())
 	}
 }
 
@@ -2182,10 +2481,16 @@ fn setup_io(
 	control: Arc<RunControl>,
 	exec: Bytes,
 	events: flume::Sender<ExecEvent>,
+	capture_sandbox_diagnostic: bool,
 ) -> Result<(ExecutionParameters, Vec<task::JoinHandle<()>>, Arc<Mutex<OutputSequencer>>), ExecError>
 {
 	let mut params = ExecutionParameters::default();
-	let sequencer = Arc::new(Mutex::new(OutputSequencer { next: 1, events, at_line_start: true }));
+	let sequencer = Arc::new(Mutex::new(OutputSequencer {
+		next: 1,
+		events,
+		at_line_start: true,
+		sandbox_diagnostic: capture_sandbox_diagnostic.then(Vec::new),
+	}));
 	if let Some(pty) = pty {
 		let winsize = nix::pty::Winsize {
 			ws_row:    clamp_u16(pty.rows),
@@ -2244,11 +2549,28 @@ fn setup_io(
 }
 
 struct OutputSequencer {
-	next:          u64,
-	events:        flume::Sender<ExecEvent>,
-	at_line_start: bool,
+	next:               u64,
+	events:             flume::Sender<ExecEvent>,
+	at_line_start:      bool,
+	sandbox_diagnostic: Option<Vec<u8>>,
 }
 impl OutputSequencer {
+	fn capture_sandbox_diagnostic(&mut self, data: &[u8]) {
+		let Some(diagnostic) = self.sandbox_diagnostic.as_mut() else {
+			return;
+		};
+		if sandbox_denial_marker(diagnostic).is_some() {
+			return;
+		}
+		diagnostic.extend_from_slice(data);
+		if sandbox_denial_marker(diagnostic).is_none()
+			&& diagnostic.len() > SANDBOX_DIAGNOSTIC_BYTES
+		{
+			let discard = diagnostic.len() - SANDBOX_DIAGNOSTIC_BYTES;
+			diagnostic.drain(..discard);
+		}
+	}
+
 	fn sandbox_note(&mut self, exec: &Bytes, note: &str) {
 		let mut data = Vec::with_capacity(note.len() + usize::from(!self.at_line_start) + 1);
 		if !self.at_line_start {
@@ -2282,6 +2604,9 @@ fn spawn_reader<R: Read + Send + 'static>(
 			};
 			let mut sequencer = sequencer.lock();
 			sequencer.at_line_start = buffer[read - 1] == b'\n';
+			if matches!(channel, OutputChannel::Stderr | OutputChannel::Pty) {
+				sequencer.capture_sandbox_diagnostic(&buffer[..read]);
+			}
 			let frame = OutputFrame {
 				exec:     exec.clone(),
 				channel:  channel as i32,
@@ -3200,6 +3525,95 @@ fn errno_io(error: Errno) -> ExecError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn spawn_book_scopes_process_authority_to_observed_children() {
+		let book = SpawnBook {
+			groups:  Mutex::new(Vec::new()),
+			pids:    Mutex::new(Vec::new()),
+			session: None,
+		};
+		book.on_spawn(41_001, Some(41_000));
+		assert!(book.may_signal(41_001));
+		assert!(book.may_observe(41_000));
+		assert!(book.may_signal(-41_000));
+		assert!(!book.may_observe(41_002));
+		assert!(!book.may_signal(process::id() as i32));
+		let session = Arc::new(SpawnBook {
+			groups:  Mutex::new(Vec::new()),
+			pids:    Mutex::new(Vec::new()),
+			session: None,
+		});
+		session.on_spawn(42_001, Some(42_000));
+		let next_run = SpawnBook {
+			groups:  Mutex::new(Vec::new()),
+			pids:    Mutex::new(Vec::new()),
+			session: Some(session),
+		};
+		assert!(next_run.may_observe(42_001));
+	}
+
+	#[test]
+	fn sandbox_denial_classification_is_typed_and_conservative() {
+		let denied_path = PathBuf::from("/private/blocked");
+		let write_error: omp_shell_engine::Error =
+			omp_shell_engine::WriteDenied { path: denied_path.clone() }.into();
+		let denial = classify_sandbox_denial(
+			true,
+			&RunTerminal::Failed,
+			Some(&write_error),
+			b"",
+		)
+		.expect("typed write denial");
+		assert_eq!(denial.path, Str::from(denied_path.to_string_lossy().as_ref()));
+		assert_eq!(denial.exit_code, None);
+
+		let denial = classify_sandbox_denial(
+			true,
+			&RunTerminal::Exited(1),
+			None,
+			b"touch: /private/blocked: Operation not permitted\n",
+		)
+		.expect("EPERM-shaped stderr");
+		assert_eq!(denial.path, "/private/blocked");
+		assert_eq!(denial.exit_code, Some(1));
+
+		assert!(
+			classify_sandbox_denial(
+				false,
+				&RunTerminal::Exited(1),
+				None,
+				b"touch: /private/blocked: Operation not permitted",
+			)
+			.is_none()
+		);
+		assert!(
+			classify_sandbox_denial(
+				true,
+				&RunTerminal::Exited(0),
+				None,
+				b"EPERM",
+			)
+			.is_none()
+		);
+		assert!(
+			classify_sandbox_denial(
+				true,
+				&RunTerminal::Exited(1),
+				None,
+				b"permission denied",
+			)
+			.is_none()
+		);
+		assert!(
+			classify_sandbox_denial(
+				true,
+				&RunTerminal::Exited(1),
+				None,
+				b"NOT_EPERMISSION",
+			)
+			.is_none()
+		);
+	}
 
 	#[test]
 	fn terminal_receipts_distinguish_exit_failure_timeout_and_kill() {
@@ -3226,6 +3640,22 @@ mod tests {
 		assert_eq!(cancelled.exit_code, None);
 		assert_eq!(cancelled.signal, "SIGKILL");
 		assert!(cancelled.aborted);
+
+		let denied = RunTerminal::Denied {
+			exit_code: Some(1),
+			path:      sf!("/private/blocked"),
+		}
+		.status(Duration::from_millis(5));
+		assert_eq!(denied.outcome, ExecOutcome::Denied as i32);
+		assert_eq!(denied.exit_code, Some(1));
+		assert_eq!(
+			denied
+				.props
+				.as_ref()
+				.and_then(|props| props.fields.get(SANDBOX_DENIED_PATH_PROP))
+				.and_then(|value| value.kind.as_ref()),
+			Some(&wire_value::Kind::String(String::from("/private/blocked")))
+		);
 	}
 
 	async fn run_output(host: &ExecHost, request: ExecRequest) -> Vec<u8> {
@@ -3251,6 +3681,21 @@ mod tests {
 			match run.next_event().await {
 				Some(ExecEvent::Output(_) | ExecEvent::Started { .. }) => {},
 				Some(ExecEvent::Exit(event)) => return event.status.expect("exit status").exit_code,
+				None => panic!("exec event stream closed before exit"),
+			}
+		}
+	}
+	async fn run_failure(host: &ExecHost, request: ExecRequest) -> (i32, Option<i32>, Vec<u8>) {
+		let (_, run) = host.exec(request, None).await.expect("exec starts");
+		let mut output = Vec::new();
+		loop {
+			match run.next_event().await {
+				Some(ExecEvent::Output(frame)) => output.extend_from_slice(&frame.data),
+				Some(ExecEvent::Exit(event)) => {
+					let status = event.status.expect("exit status");
+					return (status.outcome, status.exit_code, output);
+				},
+				Some(ExecEvent::Started { .. }) => {},
 				None => panic!("exec event stream closed before exit"),
 			}
 		}
@@ -3305,11 +3750,64 @@ mod tests {
 		);
 		assert_eq!(fs::read(workspace.join("allowed.txt")).unwrap(), b"ok\n");
 		// Software lane: the same redirection into the carve-out is denied.
-		assert_ne!(
-			run_exit_code(&host, script_request(session, "echo no > .git/blocked.txt")).await,
-			Some(0)
+		let (outcome, exit, output) =
+			run_failure(&host, script_request(session, "echo no > .git/blocked.txt")).await;
+		assert_eq!(outcome, ExecOutcome::Denied as i32);
+		assert_ne!(exit, Some(0));
+		let output = String::from_utf8_lossy(&output);
+		assert!(output.contains("sandbox denied write"));
+		assert!(output.contains(".git/blocked.txt"));
+		assert!(output.contains("sandbox: mode=workspace-write"));
+		assert!(output.contains("network=off"));
+		assert_eq!(
+			output
+				.matches("Seatbelt write scopes are path based")
+				.count(),
+			1
 		);
 		assert!(!workspace.join(".git/blocked.txt").exists());
+
+		let (_, bypass) = host
+			.exec_without_sandbox(
+				script_request(session, "echo approved > .git/approved.txt"),
+				None,
+			)
+			.await
+			.expect("one-shot bypass starts");
+		loop {
+			match bypass.next_event().await {
+				Some(ExecEvent::Output(_) | ExecEvent::Started { .. }) => {},
+				Some(ExecEvent::Exit(event)) => {
+					let status = event.status.expect("bypass status");
+					assert_eq!(status.outcome, ExecOutcome::Exited as i32);
+					assert_eq!(status.exit_code, Some(0));
+					break;
+				},
+				None => panic!("bypass event stream closed before exit"),
+			}
+		}
+		assert_eq!(
+			fs::read(workspace.join(".git/approved.txt")).unwrap(),
+			b"approved\n"
+		);
+
+		// The next ordinary command is sandboxed again.
+		let (outcome, _, _) =
+			run_failure(&host, script_request(session, "echo no > .git/blocked-again.txt")).await;
+		assert_eq!(outcome, ExecOutcome::Denied as i32);
+		assert!(!workspace.join(".git/blocked-again.txt").exists());
+		// A dangling redirect still resolves through its symlink into `.git`.
+		std::os::unix::fs::symlink(".git/new", workspace.join("redirect")).unwrap();
+		assert_ne!(
+			run_exit_code(&host, script_request(session, "echo no > redirect/blocked.txt")).await,
+			Some(0)
+		);
+		assert!(!workspace.join(".git/new/blocked.txt").exists());
+		// `/dev/null` remains the one globally writable device sink.
+		assert_eq!(
+			run_exit_code(&host, script_request(session, "echo ok > /dev/null")).await,
+			Some(0)
+		);
 
 		// Kernel lane: an external binary writes inside the workspace.
 		assert_eq!(

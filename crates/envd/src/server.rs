@@ -3021,7 +3021,8 @@ impl EnvServer {
 		book: Option<Arc<ApprovalBook>>,
 		route: Option<ApprovalRoute>,
 	) {
-		self.approvals.bind(book, route);
+		self.approvals.bind(book, route.clone());
+		self.exec.bind_sandbox_approval_route(route);
 	}
 
 	/// Returns the session bridge binding retained by this environment.

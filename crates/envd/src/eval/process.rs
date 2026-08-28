@@ -631,15 +631,15 @@ impl EvalChild {
 			(command, Some(runner))
 		};
 		let environment = sanitized_spawn_env();
+		let environment = if let Some(sandbox) = sandbox.as_deref() {
+			sandbox.resolve_env(environment)
+		} else {
+			environment
+		};
 		command
 			.current_dir(cwd)
 			.env_clear()
-			.envs(environment.iter().filter_map(|(key, value)| {
-				sandbox
-					.as_deref()
-					.is_none_or(|sandbox| sandbox.env_allowed_os(key.as_os_str()))
-					.then_some((key, value))
-			}))
+			.envs(environment)
 			.env("PYTHONUNBUFFERED", "1")
 			.env("PYTHONIOENCODING", "utf-8")
 			.env("MPLBACKEND", "Agg")

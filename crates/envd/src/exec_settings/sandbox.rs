@@ -1,6 +1,6 @@
 //! Agent command sandbox posture and policy settings.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use omp_core::Str;
 use omp_settings::{
@@ -11,6 +11,24 @@ use serde::{Deserialize, Serialize};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 const MODE_VALUES: &[&str] = &["off", "read-only", "workspace-write"];
+const ENV_INHERIT_VALUES: &[&str] = &["all", "core", "none"];
+const ENV_INHERIT_OPTIONS: &[SettingOption] = &[
+	SettingOption {
+		value:       "all",
+		label:       "All",
+		description: Some("Start children with the complete inherited environment."),
+	},
+	SettingOption {
+		value:       "core",
+		label:       "Core",
+		description: Some("Start children with only platform-core environment variables."),
+	},
+	SettingOption {
+		value:       "none",
+		label:       "None",
+		description: Some("Start children with an empty environment."),
+	},
+];
 const MODE_OPTIONS: &[SettingOption] = &[
 	SettingOption {
 		value:       "off",
@@ -99,32 +117,91 @@ pub enum UnscopedWrites {
 	/// Redirect unscoped writes to an ephemeral sandbox-private layer.
 	Overlay,
 }
+/// Base environment inherited by child processes.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Serialize,
+	Eq,
+	PartialEq,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
+pub enum EnvironmentInheritance {
+	/// Inherit every exported environment variable.
+	#[default]
+	All,
+	/// Inherit only platform-core environment variables.
+	Core,
+	/// Inherit no environment variables.
+	None,
+}
 
 /// User-facing sandbox configuration for agent command execution.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxSettings {
 	/// Sandbox posture applied to agent command execution.
-	pub mode:            ExecSandboxMode,
+	pub mode:              ExecSandboxMode,
 	/// Whether sandboxed commands may access the network.
-	pub network:         bool,
+	pub network:           bool,
 	/// Additional absolute roots that workspace-write mode may modify.
-	pub writable_roots:  Vec<Str>,
+	pub writable_roots:    Vec<Str>,
 	/// Policy for writes outside configured roots in workspace-write mode.
-	pub unscoped_writes: UnscopedWrites,
+	pub unscoped_writes:   UnscopedWrites,
 	/// Exported environment variable name globs withheld from external commands.
-	pub env_deny:        Vec<Str>,
+	pub env_deny:          Vec<Str>,
+	/// Base environment inherited by child processes.
+	pub env_inherit:       EnvironmentInheritance,
+	/// Environment variable name globs retained before deny filtering.
+	pub env_include_only:  Vec<Str>,
+	/// Explicit child environment values applied after filtering.
+	pub env_set:           BTreeMap<Str, Str>,
+	/// Whether workspace-write excludes the platform temporary directory.
+	pub exclude_tmpdir:    bool,
+	/// Whether workspace-write excludes `/tmp`.
+	pub exclude_slash_tmp: bool,
+	/// Additional absolute paths hidden from sandboxed processes.
+	pub read_deny:         Vec<Str>,
+	/// Additional absolute paths protected from writes in both policy lanes.
+	pub write_deny:        Vec<Str>,
 }
 
 impl Default for SandboxSettings {
 	fn default() -> Self {
 		Self {
-			mode:            ExecSandboxMode::Off,
-			network:         false,
-			writable_roots:  Vec::new(),
-			unscoped_writes: UnscopedWrites::Deny,
-			env_deny:        default_env_deny(),
+			mode:              ExecSandboxMode::Off,
+			network:           false,
+			writable_roots:    Vec::new(),
+			unscoped_writes:   UnscopedWrites::Deny,
+			env_deny:          default_env_deny(),
+			env_inherit:       EnvironmentInheritance::All,
+			env_include_only:  Vec::new(),
+			env_set:           BTreeMap::new(),
+			exclude_tmpdir:    false,
+			exclude_slash_tmp: false,
+			read_deny:         Vec::new(),
+			write_deny:        Vec::new(),
 		}
+	}
+}
+impl SandboxSettings {
+	/// Reports whether child environment behavior matches the default policy.
+	pub(crate) fn environment_policy_is_default(&self) -> bool {
+		self.env_inherit == EnvironmentInheritance::All
+			&& self.env_include_only.is_empty()
+			&& self.env_set.is_empty()
+			&& self
+				.env_deny
+				.iter()
+				.map(Str::as_str)
+				.eq(["*KEY*", "*SECRET*", "*TOKEN*"])
 	}
 }
 
@@ -176,6 +253,69 @@ impl SettingsDomain for SandboxSettings {
 			None,
 			None,
 		),
+		field(
+			"sandbox.env_inherit",
+			"Inherited Environment",
+			"Choose the base environment inherited by child processes.",
+			SettingKind::Enum(ENV_INHERIT_VALUES),
+			60,
+			Some(OptionProvider::Static(ENV_INHERIT_OPTIONS)),
+			None,
+		),
+		field(
+			"sandbox.env_include_only",
+			"Included Environment Variables",
+			"Environment variable name globs retained before deny filtering.",
+			SettingKind::Array,
+			70,
+			None,
+			None,
+		),
+		field(
+			"sandbox.env_set",
+			"Set Environment Variables",
+			"Explicit child environment values applied after filtering.",
+			SettingKind::Table,
+			80,
+			None,
+			None,
+		),
+		field(
+			"sandbox.exclude_tmpdir",
+			"Exclude Platform Temporary Directory",
+			"Do not grant workspace-write access to the platform temporary directory.",
+			SettingKind::Boolean,
+			90,
+			None,
+			WORKSPACE_WRITE_ONLY,
+		),
+		field(
+			"sandbox.exclude_slash_tmp",
+			"Exclude /tmp",
+			"Do not grant workspace-write access to /tmp.",
+			SettingKind::Boolean,
+			100,
+			None,
+			WORKSPACE_WRITE_ONLY,
+		),
+		field(
+			"sandbox.read_deny",
+			"Denied Read Paths",
+			"Additional absolute paths made unreadable by the kernel sandbox.",
+			SettingKind::Array,
+			110,
+			None,
+			None,
+		),
+		field(
+			"sandbox.write_deny",
+			"Denied Write Paths",
+			"Additional absolute paths protected from writes.",
+			SettingKind::Array,
+			120,
+			None,
+			None,
+		),
 	];
 
 	fn validate(&self) -> Result<(), ValidationError> {
@@ -183,7 +323,16 @@ impl SettingsDomain for SandboxSettings {
 			.writable_roots
 			.iter()
 			.any(|root| !Path::new(root.as_str()).is_absolute())
-			|| self.env_deny.iter().any(Str::is_empty)
+			|| self
+				.read_deny
+				.iter()
+				.chain(&self.write_deny)
+				.any(|path| !Path::new(path.as_str()).is_absolute())
+			|| self
+				.env_deny
+				.iter()
+				.chain(&self.env_include_only)
+				.any(|pattern| omp_sandbox::validate_env_pattern(pattern.as_str()).is_err())
 		{
 			return Err(ValidationError::DomainInvariant { domain: Self::DOMAIN });
 		}
@@ -264,6 +413,13 @@ network = true
 writable_roots = ["/workspace", "/var/cache/omp"]
 unscoped_writes = "overlay"
 env_deny = ["*PASSWORD*", "CI_JOB_TOKEN"]
+env_inherit = "core"
+env_include_only = ["OMP_*", "PATH"]
+env_set = { OMP_TEST = "yes" }
+exclude_tmpdir = true
+exclude_slash_tmp = true
+read_deny = ["/private"]
+write_deny = ["/protected"]
 "#,
 		)
 		.expect("sandbox TOML");
@@ -272,11 +428,18 @@ env_deny = ["*PASSWORD*", "CI_JOB_TOKEN"]
 			.project::<SandboxSettings>()
 			.expect("configured sandbox projection");
 		assert_eq!(settings.get(), &SandboxSettings {
-			mode:            ExecSandboxMode::WorkspaceWrite,
-			network:         true,
-			writable_roots:  vec![Str::new_static("/workspace"), Str::new_static("/var/cache/omp"),],
-			unscoped_writes: UnscopedWrites::Overlay,
-			env_deny:        vec![Str::new_static("*PASSWORD*"), Str::new_static("CI_JOB_TOKEN"),],
+			mode:              ExecSandboxMode::WorkspaceWrite,
+			network:           true,
+			writable_roots:    vec![Str::new_static("/workspace"), Str::new_static("/var/cache/omp"),],
+			unscoped_writes:   UnscopedWrites::Overlay,
+			env_deny:          vec![Str::new_static("*PASSWORD*"), Str::new_static("CI_JOB_TOKEN"),],
+			env_inherit:       EnvironmentInheritance::Core,
+			env_include_only:  vec![Str::new_static("OMP_*"), Str::new_static("PATH")],
+			env_set:           BTreeMap::from([(Str::new_static("OMP_TEST"), Str::new_static("yes"))]),
+			exclude_tmpdir:    true,
+			exclude_slash_tmp: true,
+			read_deny:         vec![Str::new_static("/private")],
+			write_deny:        vec![Str::new_static("/protected")],
 		});
 	}
 
@@ -287,5 +450,18 @@ env_deny = ["*PASSWORD*", "CI_JOB_TOKEN"]
 			..SandboxSettings::default()
 		};
 		assert!(settings.validate().is_err());
+	}
+	#[test]
+	fn sandbox_validation_rejects_relative_policy_paths_and_invalid_environment_globs() {
+		let relative = SandboxSettings {
+			read_deny: vec![Str::new_static("private")],
+			..SandboxSettings::default()
+		};
+		assert!(relative.validate().is_err());
+		let invalid_glob = SandboxSettings {
+			env_include_only: vec![Str::new_static("[")],
+			..SandboxSettings::default()
+		};
+		assert!(invalid_glob.validate().is_err());
 	}
 }
