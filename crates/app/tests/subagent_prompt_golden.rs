@@ -88,17 +88,30 @@ fn subagent_props_inherit_parent_secrets_policy() {
 		eager:             TaskEagerMode::Default,
 	};
 	let child = child_props(&input, &parent);
+	assert!(
+		child
+			.get(omp_agent::prompt_keys::SECRETS_ENABLED)
+			.is_some_and(omp_scribe::Value::is_truthy),
+		"child props must retain the parent secrets policy",
+	);
 	let items = omp_agent::CanonicalPromptSource
 		.render(&child)
 		.expect("child canonical prompt");
-	let text = match &items[0].kind {
-		Some(item::Kind::Message(message)) => match &message.parts[0].kind {
-			Some(part::Kind::Text(text)) => text,
-			_ => panic!("text part"),
-		},
-		_ => panic!("system message"),
-	};
-	assert!(text.contains("redaction tokens are opaque strings"));
+	assert!(
+		items.iter().any(|item| {
+			let Some(item::Kind::Message(message)) = &item.kind else {
+				return false;
+			};
+			message.parts.iter().any(|part| {
+				matches!(
+					&part.kind,
+					Some(part::Kind::Text(text))
+						if text.contains("redaction tokens are opaque strings")
+				)
+			})
+		}),
+		"secrets policy must render in the banded child canonical prompt",
+	);
 }
 
 #[test]

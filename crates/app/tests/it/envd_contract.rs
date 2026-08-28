@@ -2534,6 +2534,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 	worker.interrupt_grace = omp_core::Duration::new(150, omp_core::DurationUnit::Milliseconds);
 	worker.initial_backoff = Duration::from_millis(10);
 	worker.max_backoff = Duration::from_millis(50);
+	let respawn_timeout = worker.spawn_timeout;
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
 	let started = site.path().join("worker-started");
 
@@ -2620,7 +2621,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		)
 		.await
 		.expect("commit next worker request");
-	let next_terminal = time::timeout(Duration::from_secs(5), async {
+	let next_terminal = time::timeout(respawn_timeout, async {
 		loop {
 			match next
 				.next_event()
@@ -2671,7 +2672,7 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 		)
 		.await
 		.expect("commit worker fault request");
-	let fault_terminal = time::timeout(Duration::from_secs(5), async {
+	let fault_terminal = time::timeout(respawn_timeout, async {
 		loop {
 			match fault
 				.next_event()
@@ -2709,6 +2710,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 	worker.interrupt_grace = omp_core::Duration::new(100, omp_core::DurationUnit::Milliseconds);
 	worker.initial_backoff = Duration::from_millis(10);
 	worker.max_backoff = Duration::from_millis(50);
+	let respawn_timeout = worker.spawn_timeout;
 	let harness = Harness::start_with_worker(Registry::new(), worker).await;
 	let (client_b, client_b_task) = harness.connect("envd-contract-b").await;
 	let started_a = site.path().join("worker-a-started");
@@ -2836,7 +2838,7 @@ async fn same_worker_invocation_id_on_two_connections_cancels_only_its_owner() {
 		.await
 		.expect("commit follow-up worker");
 	assert!(matches!(
-		tokio::time::timeout(Duration::from_secs(5), next.next_event())
+		tokio::time::timeout(respawn_timeout, next.next_event())
 			.await
 			.expect("follow-up worker timeout")
 			.expect("follow-up worker event"),

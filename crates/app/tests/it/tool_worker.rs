@@ -382,8 +382,9 @@ async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
 	fs::write(
 		&module,
 		format!(
-			"def extension_activate(_event, _context):\n    with open({marker_json}, 'w', \
-			 encoding='utf-8') as marker:\n        marker.write(__file__)\n",
+			"import omp\n\n@omp.tool(\"trusted_echo\", kind=\"hard\")\nasync def trusted_echo(value: str) -> \
+			 str:\n    return value\n\ndef extension_activate(_event, _context):\n    with open(\
+			 {marker_json}, 'w', encoding='utf-8') as marker:\n        marker.write(__file__)\n",
 		),
 	)
 	.expect("write trusted extension module");
@@ -406,7 +407,18 @@ async fn trusted_cli_module_is_loaded_and_activated_from_its_exact_file() {
 			.expect("canonical trusted module")
 			.to_string_lossy(),
 	);
-	assert!(supervisor.registrations().is_empty());
+	let registrations = supervisor.registrations();
+	assert_eq!(registrations.len(), 1);
+	assert!(registrations[0].hard_granted);
+	assert_eq!(
+		registrations[0]
+			.declaration
+			.definition
+			.as_ref()
+			.expect("trusted tool definition")
+			.name,
+		"trusted_echo",
+	);
 	supervisor.shutdown().await;
 }
 
@@ -442,6 +454,7 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		.interrupt_grace
 		.to_std()
 		.expect("test interrupt grace");
+	let respawn_timeout = config.spawn_timeout;
 
 	let supervisor = time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
@@ -578,12 +591,10 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 		sibling_after, sibling_pid,
 		"cancelling one extension restarted its independently supervised sibling"
 	);
-	let (second_update, second_complete) = time::timeout(
-		Duration::from_secs(5),
-		echo_roundtrip(&supervisor, "echo-after", "after respawn"),
-	)
-	.await
-	.expect("respawned worker did not serve the next invocation");
+	let (second_update, second_complete) =
+		time::timeout(respawn_timeout, echo_roundtrip(&supervisor, "echo-after", "after respawn"))
+			.await
+			.expect("respawned worker did not serve the next invocation");
 	assert_eq!(second_update["message"], "after respawn");
 	assert_eq!(completion_text(&second_complete), "after respawn");
 	let second_details: Value = serde_json::from_slice(
@@ -623,6 +634,7 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		.interrupt_grace
 		.to_std()
 		.expect("test interrupt grace");
+	let respawn_timeout = config.spawn_timeout;
 	let supervisor = time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
 		.await
 		.expect("py_eval worker registration timed out")
@@ -714,12 +726,10 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 		"sleeping evaluation did not terminate promptly: {cancel_elapsed:?}"
 	);
 
-	let second = time::timeout(
-		Duration::from_secs(5),
-		py_eval_roundtrip(&supervisor, "py-eval-after", "40 + 2"),
-	)
-	.await
-	.expect("respawned py_eval worker did not recover");
+	let second =
+		time::timeout(respawn_timeout, py_eval_roundtrip(&supervisor, "py-eval-after", "40 + 2"))
+			.await
+			.expect("respawned py_eval worker did not recover");
 	assert_eq!(
 		serde_json::from_slice::<Value>(completion_details(&second)).expect("respawn result JSON"),
 		json!({ "result": 42 })

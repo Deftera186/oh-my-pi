@@ -15,7 +15,7 @@ use im::OrdMap;
 use omp_agent::{empty_stop, project_thread_history};
 use omp_catalog::{
 	Availability, GrammarBits, ModalityBits, ModelAvailability, ModelKey, ModelSpec, OperationKind,
-	ProviderDef, ProviderId,
+	ProviderDef, ProviderId, model::ProvenanceKind, provider::AuthSpecKind,
 };
 use omp_core::{Str, encoding::hex, sf};
 use omp_inference::{
@@ -171,6 +171,13 @@ struct ResolvedTurn {
 	provider_session:      Option<SessionRequest>,
 	provider_conversation: Option<ConversationId>,
 	provider_heads:        OrdMap<u64, ProviderRevision>,
+	resolved_route:        Arc<Mutex<ResolvedRoute>>,
+}
+
+#[derive(Default)]
+struct ResolvedRoute {
+	provider: Option<ProviderId>,
+	model:    Option<ModelKey>,
 }
 
 #[derive(Default)]
@@ -341,15 +348,20 @@ impl InferenceRpc {
 
 	/// Resolves a model selector to a routing target.
 	///
-	/// Exact catalog keys pass through; declared catalog aliases canonicalize
-	/// to their target key. Anything else stays verbatim so the router reports
+	/// Exact catalog keys and aliases canonicalize to their target key. A wire
+	/// `provider/model` ID for a provider-local configured key additionally pins
+	/// that provider domain. Anything else stays verbatim so the router reports
 	/// the typed `TargetNotFound`.
 	fn target(&self, selector: &str, operation: OperationKind) -> Result<Target, Status> {
 		if !selector.is_empty() {
 			let catalog = self.registry.catalog();
-			if catalog.model(ModelKey::from_ref(selector)).is_none()
-				&& let Some(spec) = catalog.resolve_alias(selector)
-			{
+			let direct = catalog.model(ModelKey::from_ref(selector));
+			let aliased = if direct.is_none() {
+				catalog.resolve_alias(selector)
+			} else {
+				None
+			};
+			if let Some(spec) = direct.or(aliased) {
 				if let Some(provider) = &self.session_provider {
 					return Ok(Target::Provider {
 						provider: provider.clone(),
@@ -357,6 +369,21 @@ impl InferenceRpc {
 					});
 				}
 				return Ok(Target::Model(spec.key.clone()));
+			}
+			if let Some((provider, local_model)) = selector.split_once('/')
+				&& let Some(spec) = catalog.models().iter().find(|model| {
+					model.key.as_str() == local_model
+						&& model.routes.iter().any(|route| {
+							catalog
+								.route(route)
+								.is_some_and(|route| route.provider.as_str() == provider)
+						})
+				}) {
+				let provider = self
+					.session_provider
+					.clone()
+					.unwrap_or_else(|| ProviderId::from(provider));
+				return Ok(Target::Provider { provider, model: spec.key.clone() });
 			}
 			if let Some(provider) = &self.session_provider {
 				return Ok(Target::Provider {
@@ -471,6 +498,7 @@ impl InferenceRpc {
 						provider_session:      None,
 						provider_conversation: None,
 						provider_heads:        OrdMap::new(),
+						resolved_route:        Arc::default(),
 					});
 				}
 				if self.contexts.lock().contains_key(&seed.context_id) {
@@ -484,6 +512,7 @@ impl InferenceRpc {
 						provider_session:      None,
 						provider_conversation: None,
 						provider_heads:        OrdMap::new(),
+						resolved_route:        Arc::default(),
 					});
 				}
 				let root = self
@@ -509,6 +538,7 @@ impl InferenceRpc {
 					provider_session:      Some(provider_session),
 					provider_conversation: Some(conversation),
 					provider_heads:        [(0u64, revision)].into_iter().collect(),
+					resolved_route:        Arc::default(),
 				})
 			},
 			Some(turn_request::Input::Incremental(incremental)) => {
@@ -553,6 +583,7 @@ impl InferenceRpc {
 						provider_session: None,
 						provider_conversation: None,
 						provider_heads: OrdMap::new(),
+						resolved_route: Arc::default(),
 					});
 				}
 				let (request_messages, conversation, revision, provider_heads, forked) =
@@ -617,6 +648,7 @@ impl InferenceRpc {
 					provider_session: Some(provider_session),
 					provider_conversation: Some(conversation),
 					provider_heads,
+					resolved_route: Arc::default(),
 				})
 			},
 			None => Err(Status::invalid_argument("TurnRequest.input is required")),
@@ -694,32 +726,49 @@ impl pb::inference_server::Inference for InferenceRpc {
 			};
 		let projection = Arc::new(Mutex::new(TurnProjection::default()));
 		let request_id = RequestId::from(open.turn_id.as_str());
+		let chat =
+			chat_request(mem::take(&mut resolved.request_messages), params, &self.tool_registry)?;
+		let target = self.target(&params.model, OperationKind::Chat)?;
+		let mut client =
+			self.turn_client(target, request_id.clone(), resolved.provider_session.clone());
+		let planned = match client.plan(&chat) {
+			Ok(planned) => planned,
+			Err(error) => {
+				let event = inference_turn_error(error);
+				return Ok(Response::new(Box::pin(stream::once(async move { Ok(event) }))));
+			},
+		};
+		{
+			let mut route = resolved.resolved_route.lock();
+			route.provider = Some(planned.execution_plan().provider.clone());
+			route.model = planned.execution_plan().model.clone();
+		}
 		if resolved.provider_session.is_some() {
 			let replay_projection = Arc::clone(&projection);
 			let replay_context = resolved.context_id.clone();
 			let committed_len = resolved.committed_messages.len();
+			let resolved_route = Arc::clone(&resolved.resolved_route);
 			self.sessions.stage_turn_replay(
-				request_id.clone(),
+				request_id,
 				turn.clone(),
 				request_bytes.clone(),
 				move |completion| {
+					let route = resolved_route.lock();
 					Ok(Bytes::from(
 						build_turn_outcome(
 							&replay_projection.lock(),
 							completion,
 							replay_context.as_deref(),
 							committed_len,
+							route.provider.as_ref().map(|provider| provider.as_str()),
+							route.model.as_ref().map(|model| model.as_str()),
 						)
 						.encode_to_vec(),
 					))
 				},
 			);
 		}
-		let chat =
-			chat_request(mem::take(&mut resolved.request_messages), params, &self.tool_registry)?;
-		let target = self.target(&params.model, OperationKind::Chat)?;
-		let mut client = self.turn_client(target, request_id, resolved.provider_session.clone());
-		let events = match client.execute(chat).await {
+		let events = match client.execute_plan(planned).await {
 			Ok(events) => events,
 			Err(error) => {
 				let event = inference_turn_error(error);
@@ -934,7 +983,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		};
 		let target = self.target(&request.model, OperationKind::CountTokens)?;
 		let mut client = self.client(target, rpc_request_id("count"));
-		let answer = client.execute(operation).await.map_err(inference_status)?;
+		let answer = client
+			.execute(operation)
+			.await
+			.map_err(|error| capability_status(error, &request.model, OperationKind::CountTokens))?;
 		Ok(Response::new(pb::CountTokensResponse {
 			tokens:     answer.tokens,
 			accuracy:   if answer.provenance.exact {
@@ -957,7 +1009,10 @@ impl pb::inference_server::Inference for InferenceRpc {
 		};
 		let target = self.target(&request.model, OperationKind::Tokenize)?;
 		let mut client = self.client(target, rpc_request_id("tokenize"));
-		let answer = client.execute(operation).await.map_err(inference_status)?;
+		let answer = client
+			.execute(operation)
+			.await
+			.map_err(|error| capability_status(error, &request.model, OperationKind::Tokenize))?;
 		Ok(Response::new(pb::TokenizeResponse {
 			tokens:     answer.tokens,
 			provenance: Some(tokenizer_provenance(answer.provenance)),
@@ -1457,6 +1512,13 @@ impl pb::inference_server::Inference for InferenceRpc {
 		request: Request<pb::UsageRequest>,
 	) -> Result<Response<pb::UsageResponse>, Status> {
 		let request = request.into_inner();
+		if request.provider.is_empty()
+			&& request.account.is_empty()
+			&& request.scope == usage_request::Scope::Unspecified as i32
+			&& !request.allow_stale
+		{
+			return Err(Status::invalid_argument("UsageRequest must specify a provider or scope"));
+		}
 		let provider =
 			(!request.provider.is_empty()).then(|| ProviderId::from(request.provider.as_str()));
 		let operation = UsageRequest {
@@ -1707,11 +1769,21 @@ fn provider_card(registry: &Registry, provider: &ProviderDef) -> pb::ProviderCar
 		.collect::<BTreeSet<_>>()
 		.into_iter()
 		.collect();
+	let auth = if provider
+		.auth
+		.iter()
+		.filter_map(|auth| registry.catalog().auth_spec(auth))
+		.any(|auth| matches!(auth.kind, AuthSpecKind::None | AuthSpecKind::OptionalBearer))
+	{
+		vec![pb::provider_card::AuthKind::None as i32]
+	} else {
+		Vec::new()
+	};
 	pb::ProviderCard {
 		id: provider.id.as_str().to_owned(),
 		name: provider.name.as_str().to_owned(),
 		facets,
-		auth: Vec::new(),
+		auth,
 		credentialed: provider
 			.routes
 			.iter()
@@ -1722,10 +1794,33 @@ fn provider_card(registry: &Registry, provider: &ProviderDef) -> pb::ProviderCar
 }
 
 fn model_card(model: &ModelSpec, provider: &str, facets: Vec<i32>) -> pb::ModelCard {
+	let local_model = model
+		.key
+		.as_str()
+		.strip_prefix(provider)
+		.and_then(|model| model.strip_prefix('/'))
+		.unwrap_or(model.key.as_str());
+	let source = if model
+		.provenance
+		.sources
+		.iter()
+		.any(|source| source.kind == ProvenanceKind::Configured)
+	{
+		model_card::Source::Configured
+	} else if model
+		.provenance
+		.sources
+		.iter()
+		.any(|source| source.kind == ProvenanceKind::Discovered)
+	{
+		model_card::Source::Discovered
+	} else {
+		model_card::Source::Bundled
+	};
 	pb::ModelCard {
-		id: model.key.as_str().to_owned(),
+		id: format!("{provider}/{local_model}"),
 		provider: provider.to_owned(),
-		model: model.key.as_str().to_owned(),
+		model: local_model.to_owned(),
 		name: model.display_name.as_str().to_owned(),
 		family: model.class.as_str().to_owned(),
 		facets,
@@ -1743,7 +1838,7 @@ fn model_card(model: &ModelSpec, provider: &str, facets: Vec<i32>) -> pb::ModelC
 			ModelAvailability::Blocked => pb::Availability::Blocked,
 			ModelAvailability::Disabled => pb::Availability::Disabled,
 		} as i32,
-		source: model_card::Source::Bundled as i32,
+		source: source as i32,
 		blocked_until_ms: model.provenance.blocked_until_ms.unwrap_or_default(),
 		deprecated: model.provenance.deprecated,
 		updated_at_ms: model.provenance.updated_at_ms.unwrap_or_default(),
@@ -1807,6 +1902,15 @@ fn rpc_request_id(prefix: &str) -> RequestId {
 	use std::sync::atomic::{AtomicU64, Ordering};
 	static NEXT: AtomicU64 = AtomicU64::new(1);
 	RequestId::from(format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn capability_status(error: Error, model: &str, operation: OperationKind) -> Status {
+	if matches!(error.kind, ErrorKind::CapabilityMismatch | ErrorKind::CapabilityUnknown) {
+		return Status::failed_precondition(format!(
+			"model `{model}` lacks required capability `{operation}`"
+		));
+	}
+	inference_status(error)
 }
 
 fn inference_status(error: Error) -> Status {
@@ -2349,6 +2453,8 @@ fn build_turn_outcome(
 	completion: &Completion,
 	context_id: Option<&str>,
 	committed_len: usize,
+	resolved_provider: Option<&str>,
+	resolved_model: Option<&str>,
 ) -> pb::Outcome {
 	let mut output = projection.output.clone();
 	let parts = projection
@@ -2383,18 +2489,28 @@ fn build_turn_outcome(
 		head = head.saturating_add(1);
 		item.seq = head;
 	}
-	let provider = completion
-		.receipt
-		.plan
-		.provider
-		.as_ref()
-		.map_or_else(String::new, |value| value.as_str().to_owned());
-	let model = completion
-		.receipt
-		.plan
-		.model
-		.as_ref()
-		.map_or_else(String::new, |value| value.as_str().to_owned());
+	let provider = resolved_provider
+		.or_else(|| {
+			completion
+				.receipt
+				.plan
+				.provider
+				.as_ref()
+				.map(|value| value.as_str())
+		})
+		.unwrap_or_default()
+		.to_owned();
+	let model = resolved_model
+		.or_else(|| {
+			completion
+				.receipt
+				.plan
+				.model
+				.as_ref()
+				.map(|value| value.as_str())
+		})
+		.unwrap_or_default()
+		.to_owned();
 	let diagnostics = completion
 		.receipt
 		.recoveries
@@ -2806,7 +2922,11 @@ fn turn_events(
 				},
 			};
 			match event {
-				ChatEvent::Started(_) => {},
+				ChatEvent::Started(meta) => {
+					let mut route = resolved.resolved_route.lock();
+					route.provider = Some(meta.provider);
+					route.model = meta.model;
+				},
 				ChatEvent::BlockStarted { index, kind } => {
 					let kind = match kind {
 						BlockKind::Text => part_start::Kind::Text,
@@ -2984,11 +3104,17 @@ fn turn_events(
 							})),
 						};
 					}
+					let (route_provider, route_model) = {
+						let route = resolved.resolved_route.lock();
+						(route.provider.clone(), route.model.clone())
+					};
 					let outcome = build_turn_outcome(
 						&projection.lock(),
 						&completion,
 						resolved.context_id.as_deref(),
 						resolved.committed_messages.len(),
+						route_provider.as_ref().map(|provider| provider.as_str()),
+						route_model.as_ref().map(|model| model.as_str()),
 					);
 					let provider_revision = if let Some(conversation) =
 						resolved.provider_conversation.as_ref()
@@ -3476,6 +3602,8 @@ fn realtime_chat_event(event: ChatEvent) -> Result<pb::TurnEvent, Status> {
 			&completion,
 			None,
 			0,
+			None,
+			None,
 		)),
 		ChatEvent::WorkflowAction(_)
 		| ChatEvent::WorkflowResume(_)
@@ -3920,6 +4048,7 @@ mod tests {
 		model.display_name = sf!("Fixture Display");
 		model.limits.context_window = Some(1_000_000);
 		model.limits.maximum_output_tokens = Some(128_000);
+		model.provenance.sources[0].kind = ProvenanceKind::Configured;
 		let chat = model
 			.capabilities
 			.chat
@@ -3929,11 +4058,52 @@ mod tests {
 		chat.tools = Availability::Unsupported;
 
 		let card = model_card(&model, "fixture", Vec::new());
+		assert_eq!(card.id, format!("fixture/{}", model.key));
+		assert_eq!(card.provider, "fixture");
+		assert_eq!(card.model, model.key.as_str());
+		assert_eq!(card.source, model_card::Source::Configured as i32);
 		assert_eq!(card.name, "Fixture Display");
 		assert_eq!(card.context_window, 1_000_000);
 		assert_eq!(card.max_output_tokens, 128_000);
 		assert_eq!(card.inputs, vec![pb::Modality::Text as i32, pb::Modality::Image as i32]);
 		assert_eq!(card.supports_tools, Some(false));
+	}
+
+	#[test]
+	fn tokenizer_capability_errors_are_failed_preconditions() {
+		let error = Error::new(
+			ErrorKind::CapabilityMismatch,
+			ErrorPhase::Planning,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		);
+		let status = capability_status(error, "provider/model", OperationKind::Tokenize);
+		assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+		assert!(status.message().contains("provider/model"));
+		assert!(status.message().contains("tokenize"));
+		assert!(!status.message().contains("Planning"));
+	}
+
+	#[test]
+	fn turn_outcome_uses_planned_identity_when_provider_receipt_omits_it() {
+		let completion = Completion {
+			reason:  FinishReason::Stop,
+			blocks:  0,
+			usage:   Usage::default(),
+			receipt: ExecutionReceipt::default().into(),
+		};
+
+		let outcome = build_turn_outcome(
+			&TurnProjection::default(),
+			&completion,
+			None,
+			0,
+			Some("provider-planned"),
+			Some("model-planned"),
+		);
+
+		assert_eq!(outcome.provider, "provider-planned");
+		assert_eq!(outcome.model, "model-planned");
 	}
 
 	#[test]
@@ -3964,7 +4134,8 @@ mod tests {
 			receipt: receipt.into(),
 		};
 
-		let outcome = build_turn_outcome(&TurnProjection::default(), &completion, None, 0);
+		let outcome =
+			build_turn_outcome(&TurnProjection::default(), &completion, None, 0, None, None);
 
 		assert_eq!(outcome.diagnostics, vec![
 			pb::Diagnostic {
@@ -4037,7 +4208,8 @@ mod tests {
 			Some("route-fork")
 		);
 		assert_eq!(completion.receipt.recoveries.len(), 1);
-		let outcome = build_turn_outcome(&TurnProjection::default(), &completion, None, 0);
+		let outcome =
+			build_turn_outcome(&TurnProjection::default(), &completion, None, 0, None, None);
 		assert_eq!(outcome.provider, "provider-fork");
 		assert_eq!(outcome.model, "model-fork");
 		assert_eq!(outcome.diagnostics.len(), 1);

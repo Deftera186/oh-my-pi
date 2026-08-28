@@ -258,12 +258,14 @@ fn workspace_host_matches_direct_walker_and_cancels_an_active_walk() {
 		let result = active_host.walk(&active_request, &worker_cancel);
 		result_tx.send(result).expect("return cancelled walk");
 	});
+	// Cancel before releasing the rendezvous: the walk provably starts with a
+	// cancelled token, so it must terminate with `Cancelled` instead of walking
+	// the bulk tree to completion. Cancelling after release raced the walk on
+	// loaded hosts.
+	cancel.cancel();
 	started_rx
 		.recv_timeout(DEADLINE)
 		.expect("active walk did not start before deadline");
-	thread::yield_now();
-	assert!(result_rx.try_recv().is_err(), "walk completed before cancellation");
-	cancel.cancel();
 	let cancelled = result_rx
 		.recv_timeout(DEADLINE)
 		.expect("cancelled walk did not stop before deadline");

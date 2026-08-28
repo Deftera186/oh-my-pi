@@ -105,7 +105,7 @@ async fn headless_runtime() {
 	assert!(matches!(events.try_recv().unwrap().as_ref(), AgentEvent::ToolFinished { .. }));
 
 	let book = Arc::new(ApprovalBook::new());
-	let (route, inbox) = ApprovalRoute::new(Arc::clone(&book));
+	let (route, inbox) = ApprovalRoute::new(Arc::clone(&book), None);
 	let waiting = route.request(Some(sf!("call-1")), vec![approval_spec()], 3);
 	let answering = async {
 		let request = inbox.recv().await.expect("approval dispatched");
@@ -124,7 +124,7 @@ async fn headless_runtime() {
 	let (approved, ()) = tokio::join!(waiting, answering);
 	assert!(approved.decision.expect("decision").approved);
 
-	let (lost_route, lost_inbox) = ApprovalRoute::new(Arc::new(ApprovalBook::new()));
+	let (lost_route, lost_inbox) = ApprovalRoute::new(Arc::new(ApprovalBook::new()), None);
 	drop(lost_inbox);
 	let denied = lost_route
 		.request(Some(sf!("call-lost")), vec![approval_spec()], 4)
