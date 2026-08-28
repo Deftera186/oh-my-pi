@@ -668,6 +668,11 @@ pub struct SubscriptionHandle {
 }
 
 impl SubscriptionHandle {
+	/// Waits for the next retained event or reports that the firehose closed.
+	pub async fn recv(&self) -> Result<Arc<Event>, flume::RecvError> {
+		self.receiver.recv_async().await
+	}
+
 	/// Attempts to receive one event without waiting.
 	pub fn try_recv(&self) -> Result<Arc<Event>, TryRecvError> {
 		self.receiver.try_recv()
