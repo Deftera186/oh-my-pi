@@ -7,7 +7,6 @@
 //! keep working across the rewrite. Where `pi` extends the OpenTelemetry
 //! `GenAI` semantic conventions it does so under the `omp.gen_ai.*` /
 //! `omp.*` prefixes.
-//! renamed.
 //!
 //! Layering mirrors the original split:
 //! - [`attrs`] / [`semconv`] — the constant vocabulary (attribute keys, span
@@ -15,6 +14,8 @@
 //! - [`span`] / [`content`] — span lifecycle and policy-bounded, always-masked
 //!   content capture.
 //! - [`metrics`] / [`collector`] — instruments and per-run aggregation.
+//! - [`logging`] — process-wide tracing, rotating JSON logs, timing output, and
+//!   the tracing-to-OTLP bridge.
 //! - [`export`] / [`redact`] — OTLP bootstrap, configuration, and scrubbing.
 
 pub mod attrs;
@@ -24,6 +25,7 @@ pub mod config;
 pub mod content;
 pub mod export;
 pub mod firehose;
+pub mod logging;
 pub mod metrics;
 pub mod redact;
 pub mod semconv;

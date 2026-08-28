@@ -1,12 +1,12 @@
 [package]
-name = "omp-telemetry"
+name = "omp-observability"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "OpenTelemetry instrumentation, metrics, export, and redaction for OMP agent runs"
+description = "OpenTelemetry instrumentation, local file logging, metrics, export, and redaction for OMP"
 
 [dependencies]
 omp-core = { workspace = true }
@@ -14,6 +14,7 @@ omp-secrets = { workspace = true }
 flume = { workspace = true }
 omp-proto = { workspace = true }
 omp-tool = { workspace = true }
+jiff = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 opentelemetry-otlp = { workspace = true }
@@ -25,9 +26,14 @@ serde_json = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

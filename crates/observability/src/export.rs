@@ -490,6 +490,7 @@ fn init_sync() -> bool {
 					.with_batch_exporter(exporter)
 					.with_resource(resource)
 					.build();
+				crate::logging::attach_otel_bridge(&provider);
 				state.logger = Some(provider.logger(METER_NAME));
 				state.logger_provider = Some(provider);
 				LOGGER_ENABLED.store(true, Ordering::Release);
@@ -766,6 +767,21 @@ fn process_attributes() -> Vec<(Key, AnyValue)> {
 fn should_emit(level: ForwardedLogLevel) -> bool {
 	LOGGER_ENABLED.load(Ordering::Acquire)
 		&& level.threshold().weight() <= LOG_LEVEL.load(Ordering::Relaxed)
+}
+
+pub(crate) fn tracing_log_enabled(level: tracing::Level) -> bool {
+	let weight = if level == tracing::Level::ERROR {
+		1
+	} else if level == tracing::Level::WARN {
+		2
+	} else if level == tracing::Level::INFO {
+		3
+	} else if level == tracing::Level::DEBUG {
+		4
+	} else {
+		5
+	};
+	LOGGER_ENABLED.load(Ordering::Acquire) && weight <= LOG_LEVEL.load(Ordering::Relaxed)
 }
 
 fn log_attribute_value(value: &JsonValue) -> Option<AnyValue> {

@@ -21,7 +21,7 @@ rewrite of `pi`: port observable behavior, not TS shape.
   index metadata, and trust domain (`omp-ext`).
 - `crates/serve`: gRPC transport projections serving inference, auth, and
   blob services (`omp-serve`).
-- `crates/core|storage|proto|rpc|telemetry`: allocation-aware primitives,
+- `crates/core|storage|proto|rpc|observability`: allocation-aware primitives,
   append-only transcript/blob persistence, wire contracts, RPC, observability.
 - `crates/agent`: durable turn state, interrupts, event projection, tool
   batching. `crates/catalog`: model/provider data (`data/`) + transports.
@@ -146,7 +146,7 @@ irregularity ≠ excuse to hand-write); `ascii_case_insensitive` lax input;
 derive + `map_err`. ONLY escape hatch when strum can't express the shape
 (per-arm logic, data variants w/ dynamic strings, one labeled error across
 many enums): local `macro_rules!` emitting both directions from one
-variant→string table (`vocab!`, `crates/telemetry/src/semconv.rs`). New bare
+variant→string table (`vocab!`, `crates/observability/src/semconv.rs`). New bare
 match table = reviewer-reject; migrate on touch.
 
 Composition/errors/state:

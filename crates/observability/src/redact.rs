@@ -11,7 +11,7 @@ use omp_secrets::{
 };
 use parking_lot::Mutex;
 
-const MASK_KEY: &str = "omp-telemetry-private-mask";
+const MASK_KEY: &str = "omp-observability-private-mask";
 const REDACTED: &str = "[REDACTED]";
 
 static CREDENTIAL_MASKER: LazyLock<Option<Mutex<SecretObfuscator>>> = LazyLock::new(|| {

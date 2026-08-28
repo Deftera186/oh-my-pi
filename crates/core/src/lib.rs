@@ -26,6 +26,7 @@ pub mod fasthash;
 pub mod fs;
 pub mod hash32;
 pub mod location;
+pub mod logging;
 pub mod open;
 pub mod path;
 pub mod phase;
