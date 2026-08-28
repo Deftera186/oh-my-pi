@@ -7,25 +7,30 @@ use async_trait::async_trait;
 use futures::{Stream, stream};
 use omp_agent::{
 	AgentKind, AgentSnapshot, AgentState, AgentTree, Broker, Budget, DeliveryMode, InvokeFrame,
-	Mailbox, PeerMessage, PromptFacts, TurnClient, TurnInput, TurnOptions, TurnSession,
+	Journal, Mailbox, PeerMessage, PromptFacts, TurnClient, TurnInput, TurnOptions, TurnSession,
+	control_channel,
 };
-use omp_core::{Principal, Str, sf};
+use omp_catalog::{settings::ModelSettings, snapshot};
+use omp_core::{InvocationPhase, LifecyclePhase, Principal, Str, sf};
 use omp_driver::{
-	chat::{AgentsControlAuthority, ChatParentHost},
+	chat::{AgentsControlAuthority, ChatParentHost, InteractiveSessionControl},
 	hub::share_inbox,
 };
 use omp_envd::{
 	exthost::control::{
 		ControlAuthority, ControlAuthorityFactory, ControlConnectionIdentity, ControlEffect,
-		ControlProtocolError, ControlRequestContext, EnvdControlAuthorities,
-		ExternalControlAuthorities, FixedControlAuthorityFactory, HostControlAuthorityFactory,
-		PersistenceControlAuthorities, PolicyControlAuthorities, PresentationControlAuthorities,
-		ProviderControlAuthorities, RegistryControlAuthorities,
+		ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
+		EnvdControlAuthorities, ExternalControlAuthorities, FixedControlAuthorityFactory,
+		HostControlAuthorityFactory, PersistenceControlAuthorities, PolicyControlAuthorities,
+		PresentationControlAuthorities, ProviderControlAuthorities, RegistryControlAuthorities,
 	},
 	worker::{ExtHostConfig, ExtHostSupervisor},
 };
 use omp_inference::TurnId;
-use omp_storage::index::SessionIndex;
+use omp_storage::{
+	index::SessionIndex,
+	transcript::{Header, SessionId},
+};
 use serde_json::{Value, json};
 
 fn node(tree: &AgentTree, id: &str, name: &str) -> Arc<omp_agent::AgentNode> {
@@ -341,4 +346,90 @@ async fn live_host_agents_requests_follow_the_exact_bound_chat_parent() {
 		.authorize(&request_context(identity), "omp.agents.list", &serde_json::Map::new())
 		.expect_err("released owner must reject new requests");
 	assert_eq!(error.code.as_str(), "AgentsOwnerUnavailable");
+}
+#[tokio::test]
+async fn set_model_control_request_commits_before_switching_the_live_snapshot() {
+	let scratch = tempfile::tempdir().expect("scratch");
+	let parent = parent(&scratch, "session-model", "marker");
+	let root = scratch.path().join("session-model");
+	let catalog = Arc::new(snapshot::Catalog::embedded().clone());
+	let selected = catalog
+		.models()
+		.iter()
+		.find(|model| !model.routes.is_empty())
+		.expect("routed embedded model")
+		.key
+		.as_str()
+		.to_owned();
+	let state = AgentState::new(AgentSnapshot::default());
+	let path = root.join("model-control.jsonl");
+	let journal = Journal::create(&path, &Header {
+		v:       4,
+		id:      SessionId(sf!("session-model")),
+		created: 1,
+		cwd:     root.clone(),
+	})
+	.expect("journal");
+	let (control, mailbox) = control_channel();
+	let owner = tokio::spawn(async move {
+		let mut journal = journal;
+		assert!(matches!(
+			mailbox.handle_next(&mut journal).await,
+			omp_agent::ControlMailboxEvent::JournalHandled
+		));
+		journal
+			.effective_model_override()
+			.expect("read model override")
+			.expect("model override")
+	});
+	let session_control = Arc::new(InteractiveSessionControl::new(
+		root.clone(),
+		root.join("sessions"),
+		Arc::new(SessionIndex::open(root.join("model-index.sqlite3")).expect("session index")),
+		Arc::clone(&catalog),
+		ModelSettings::default(),
+		state.clone(),
+		control,
+	));
+	let authority = AgentsControlAuthority::with_session_control(parent, session_control);
+	let identity = control_identity();
+	let context = ControlRequestContext {
+		connection: Arc::clone(&identity),
+		request_id: 9,
+		invocation: Some(ControlInvocationAuthority {
+			invocation:        sf!("command"),
+			phase:             InvocationPhase::EffectsAuthorized,
+			session:           sf!("session-model"),
+			turn:              None,
+			event:             None,
+			call:              None,
+			device:            None,
+			effects:           Box::new([]),
+			place_kind:        sf!("host"),
+			lifecycle:         LifecyclePhase::Active,
+			roots:             Box::new([]),
+			remote:            false,
+			has_ui:            true,
+			headless:          false,
+			settings:          serde_json::Map::new(),
+			secret_settings:   Box::new([]),
+			data:              None,
+			direct_filesystem: None,
+		}),
+	};
+	let arguments = serde_json::Map::from_iter([
+		("model".to_owned(), Value::String(selected.clone())),
+		("thinking".to_owned(), Value::String("high".to_owned())),
+	]);
+	authority
+		.authorize(&context, "omp.agents.set_model", &arguments)
+		.expect("set_model authorized");
+	let response = authority
+		.request(context, sf!("omp.agents.set_model"), arguments)
+		.await
+		.expect("set_model request");
+	let durable = owner.await.expect("journal owner");
+	assert_eq!(response["model"], json!(selected));
+	assert_eq!(durable.model.model.0.as_str(), selected);
+	assert_eq!(state.snapshot().turn.params.model, selected);
 }

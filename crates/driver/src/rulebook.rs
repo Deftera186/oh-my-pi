@@ -474,7 +474,7 @@ impl Resolve for RuleResolver {
 pub const PROMPTS_INVALIDATE_CAPABILITY: &str = "prompts.invalidate";
 
 /// Prompt-head rejection for an authenticated invalidation.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Debug, Error)]
 pub enum PromptInvalidationError {
 	/// The CONTROL connection was replaced.
 	#[error("prompt invalidation authority belongs to a stale connection generation")]
@@ -494,10 +494,21 @@ pub enum PromptInvalidationError {
 	/// The extension has no contribution in the requested slot.
 	#[error("extension does not own a contribution in the prompt slot")]
 	NotOwner,
-	/// Prompt-head state could not be durably advanced.
-	#[error("prompt-head invalidation failed: {0}")]
-	Head(Str),
+	/// Prompt-head generation space was exhausted.
+	#[error("prompt-slot generation exhausted")]
+	GenerationExhausted,
+	/// The live extension contribution could not be refreshed.
+	#[error("prompt contribution refresh failed")]
+	Refresh(#[source] omp_envd::exthost::PromptDispatchError),
 }
+
+impl PartialEq for PromptInvalidationError {
+	fn eq(&self, other: &Self) -> bool {
+		std::mem::discriminant(self) == std::mem::discriminant(other)
+	}
+}
+
+impl Eq for PromptInvalidationError {}
 
 impl PromptInvalidationError {
 	fn protocol(&self) -> ControlProtocolError {
@@ -507,7 +518,7 @@ impl PromptInvalidationError {
 			Self::Phase => "InvalidPhase",
 			Self::UnknownSlot => "UnknownSlot",
 			Self::FrozenSlot => "SlotClassConflict",
-			Self::Head(_) => "PromptInvalidationFailed",
+			Self::GenerationExhausted | Self::Refresh(_) => "PromptInvalidationFailed",
 		};
 		ControlProtocolError::new(code, Str::from(self.to_string()))
 	}

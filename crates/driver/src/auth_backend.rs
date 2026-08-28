@@ -363,14 +363,16 @@ impl ControlAuthority for CredentialSecretControlAuthority {
 			"omp.creds.disable" | "omp.creds.enable" => {
 				let account = self.selected_account(&arguments)?;
 				let enabled = operation.as_str() == "omp.creds.enable";
+				let cause = (!enabled)
+					.then(|| required_str(&arguments, "cause"))
+					.transpose()?;
 				let record = self
 					.control
-					.set_enabled(&account, enabled)
+					.set_enabled(&account, enabled, cause)
 					.map_err(store_control_error)?;
 				let mut value = self.metadata_value(record)?;
-				if !enabled {
-					value["disabled_cause"] =
-						Value::String(required_str(&arguments, "cause")?.to_owned());
+				if let Some(cause) = cause {
+					value["disabled_cause"] = Value::String(cause.to_owned());
 				}
 				Ok(value)
 			},

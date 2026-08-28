@@ -114,7 +114,11 @@ pub enum AdvisorChildError {
 		source: ChatError,
 	},
 	/// A policy extension denied advisor admission before composition.
+	#[error("advisor child spawn was denied by policy")]
+	PolicyDenied {
 		/// Canonical structured policy denial.
+		denial: omp_tool::PolicyDenied,
+	},
 	/// Advisor tree admission failed.
 	#[error("failed to admit advisor {id}")]
 	Admission {
@@ -174,6 +178,7 @@ pub(crate) struct AdvisorSpawnContext<C: TurnClient + Clone + Send + 'static> {
 	pub(crate) root:          PathBuf,
 	pub(crate) session_index: Arc<SessionIndex>,
 	pub(crate) tree:          Arc<AgentTree>,
+	pub(crate) hook_gate:     Arc<omp_agent::HookGate>,
 }
 
 #[derive(Clone)]
@@ -293,6 +298,7 @@ pub(crate) async fn spawn<C: TurnClient + Clone + Send + 'static>(
 		journal,
 		CHAT_CAPS_BASE,
 	);
+	child.set_hook_gate(context.hook_gate);
 	child.enable_advisor_tool_loop_guard();
 	let events = child.events().subscribe_lossless();
 	context

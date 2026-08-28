@@ -3,7 +3,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	env, fs,
-	io::Read,
+	io::{self, Read},
 	path::{Path, PathBuf},
 	sync::Arc,
 };
@@ -12,6 +12,7 @@ use omp_core::Str;
 use omp_ext::lock::{InstalledRecord, LockFile};
 use omp_walker::WalkRequest;
 use serde::Deserialize;
+use thiserror::Error;
 
 use super::{
 	containment::contained_existing,
@@ -19,7 +20,7 @@ use super::{
 		CapabilityPayload, ContextPayload, DiscoveredCapability, ExtensionGrantFacts,
 		ExtensionPayload, HookPayload, HookPhase, InstructionPayload, PromptPayload,
 		PythonWorkerDeclaration, SettingsPayload, SourceProvenance, SourceScope, SystemPromptPayload,
-		ToolHandlerDeclaration, ToolPayload,
+		ThemePayload, ToolHandlerDeclaration, ToolPayload,
 	},
 	mcp_ssh::{parse_mcp_file, parse_ssh_file},
 	packages::{self, ExtensionRootMode},
@@ -200,12 +201,16 @@ pub enum NativeRootMode {
 /// Native static capability discovery options.
 #[derive(Clone, Debug)]
 pub struct NativeDiscoveryOptions {
-	/// Ordered explicit `.omp`/agent roots.
+	/// Ordered explicit invocation-local `.omp`/extension roots.
 	pub explicit_roots:     Vec<PathBuf>,
 	/// Explicit-root merge behavior.
 	pub root_mode:          NativeRootMode,
 	/// Skill source, name, and custom-directory policy for every native root.
 	pub skill_settings:     SkillDiscoverySettings,
+	/// Ordered invocation-local prompt-template files or directories.
+	pub prompt_templates:   Vec<PathBuf>,
+	/// Ordered invocation-local JSON theme files or directories.
+	pub themes:             Vec<PathBuf>,
 	/// Whether implicit project roots and standalone project files participate.
 	pub include_workspace:  bool,
 	/// Authoritative selected-profile installed extension record.
@@ -219,6 +224,8 @@ impl Default for NativeDiscoveryOptions {
 			explicit_roots:     Vec::new(),
 			root_mode:          NativeRootMode::Merge,
 			skill_settings:     SkillDiscoverySettings::default(),
+			prompt_templates:   Vec::new(),
+			themes:             Vec::new(),
 			include_workspace:  true,
 			client_installed:   None,
 			workspace_identity: None,
@@ -249,7 +256,7 @@ pub fn discover_capabilities(
 	let mut roots = options
 		.explicit_roots
 		.iter()
-		.map(|path| (path.clone(), SourceScope::Project))
+		.map(|path| (path.clone(), SourceScope::Native))
 		.collect::<Vec<_>>();
 	if options.root_mode == NativeRootMode::Merge {
 		if options.include_workspace {
@@ -270,6 +277,8 @@ pub fn discover_capabilities(
 	});
 
 	let mut output = NativeDiscovery::default();
+	load_one_shot_prompts(&options.prompt_templates, &mut output);
+	load_one_shot_themes(&options.themes, &mut output);
 	let custom_skills = skills::discover(&[], &options.skill_settings);
 	output.declarations.extend(custom_skills.declarations);
 	output.warnings.extend(
@@ -290,7 +299,7 @@ pub fn discover_capabilities(
 		install_records.push(installed.clone());
 	}
 	for (root, scope) in roots {
-		load_root(&root, scope, &root_skill_settings, None, &mut output);
+		load_root(&root, scope, &root_skill_settings, None, None, &mut output);
 	}
 	let mut extension_roots = BTreeSet::new();
 	for installed_path in install_records {
@@ -369,6 +378,7 @@ pub fn discover_capabilities(
 					&extension.path,
 					SourceScope::Package,
 					&root_skill_settings,
+					Some(&extension.id),
 					grant,
 					&mut output,
 				);
@@ -463,9 +473,11 @@ fn load_root(
 	root: &Path,
 	scope: SourceScope,
 	skill_settings: &SkillDiscoverySettings,
+	package_id: Option<&Str>,
 	grant: Option<Arc<ExtensionGrantFacts>>,
 	output: &mut NativeDiscovery,
 ) {
+	let declaration_start = output.declarations.len();
 	let source_id = match scope {
 		SourceScope::Project => Str::from("native-project"),
 		SourceScope::User => Str::from("native-user"),
@@ -584,6 +596,96 @@ fn load_root(
 			filename,
 			payload,
 			SourceProvenance::native(source_id.clone(), path, scope),
+		));
+	}
+	if let Some(package_id) = package_id {
+		for declaration in &mut output.declarations[declaration_start..] {
+			declaration.source.installed_package_id = Some(package_id.clone());
+			declaration.source.source_id = Str::from(format!("package:{package_id}"));
+		}
+	}
+}
+
+fn one_shot_files(paths: &[PathBuf], extension: &str) -> Vec<PathBuf> {
+	let mut files = Vec::new();
+	for path in paths {
+		let candidates = if path.is_dir() {
+			WalkRequest::new(path)
+				.hidden(false)
+				.gitignore(true)
+				.skip_git(true)
+				.depth(1, 16)
+				.limit(1_024)
+				.collect_files()
+				.unwrap_or_default()
+				.into_iter()
+				.map(|entry| entry.absolute_path(path))
+				.collect()
+		} else {
+			vec![path.clone()]
+		};
+		files.extend(candidates.into_iter().filter(|candidate| {
+			candidate
+				.extension()
+				.is_some_and(|value| value.eq_ignore_ascii_case(extension))
+		}));
+	}
+	files.sort();
+	files.dedup();
+	files
+}
+
+fn load_one_shot_prompts(paths: &[PathBuf], output: &mut NativeDiscovery) {
+	for path in one_shot_files(paths, "md") {
+		let Ok(content) = fs::read_to_string(&path) else {
+			output
+				.warnings
+				.push(Str::from(format!("ignored unreadable prompt template {}", path.display())));
+			continue;
+		};
+		let name = Str::from(
+			path
+				.file_stem()
+				.and_then(|value| value.to_str())
+				.unwrap_or("prompt"),
+		);
+		output.declarations.push(DiscoveredCapability::keyed(
+			name.clone(),
+			CapabilityPayload::Prompts(PromptPayload {
+				name,
+				path: path.clone(),
+				content: Str::from(content),
+			}),
+			SourceProvenance::native("cli-prompt", path, SourceScope::Native),
+		));
+	}
+}
+
+fn load_one_shot_themes(paths: &[PathBuf], output: &mut NativeDiscovery) {
+	for path in one_shot_files(paths, "json") {
+		let Ok(content) = fs::read_to_string(&path) else {
+			output
+				.warnings
+				.push(Str::from(format!("ignored unreadable theme {}", path.display())));
+			continue;
+		};
+		let name = serde_json::from_str::<serde_json::Value>(&content)
+			.ok()
+			.and_then(|value| value.get("name")?.as_str().map(Str::new));
+		let Some(name) = name.filter(|name| !name.is_empty()) else {
+			output
+				.warnings
+				.push(Str::from(format!("ignored invalid theme {}", path.display())));
+			continue;
+		};
+		output.declarations.push(DiscoveredCapability::keyed(
+			name.clone(),
+			CapabilityPayload::Themes(ThemePayload {
+				name,
+				path: path.clone(),
+				content: Str::from(content),
+			}),
+			SourceProvenance::native("cli-theme", path, SourceScope::Native),
 		));
 	}
 }
@@ -857,6 +959,41 @@ struct ExtensionManifest {
 	extra:             BTreeMap<Str, serde_json::Value>,
 }
 
+#[derive(Debug, Error)]
+enum ExtensionManifestLoadError {
+	#[error("extension root {root} contains neither omp.toml nor extension.json")]
+	Missing { root: PathBuf },
+	#[error(
+		"extension manifest {path} uses unsupported [[tools]] entries; declare them under \
+		 [[declarations]]"
+	)]
+	UnsupportedTools { path: PathBuf },
+	#[error("failed to read extension manifest {path}: {source}")]
+	Read {
+		path:   PathBuf,
+		#[source]
+		source: io::Error,
+	},
+	#[error("failed to parse extension manifest {path}: {source}")]
+	Parse {
+		path:   PathBuf,
+		#[source]
+		source: omp_ext::ExtensionError,
+	},
+	#[error("invalid extension manifest {path}: {source}")]
+	Invalid {
+		path:   PathBuf,
+		#[source]
+		source: omp_ext::ExtensionError,
+	},
+	#[error("failed to parse legacy extension manifest {path}: {source}")]
+	LegacyParse {
+		path:   PathBuf,
+		#[source]
+		source: serde_json::Error,
+	},
+}
+
 fn load_extension(
 	root: &Path,
 	source_id: Str,
@@ -866,35 +1003,24 @@ fn load_extension(
 ) {
 	let legacy_path = root.join("extension.json");
 	let deployment_path = root.join("omp.toml");
-	let (path, manifest) = if let Some(manifest) = fs::read_to_string(&legacy_path)
-		.ok()
-		.and_then(|source| serde_json::from_str::<ExtensionManifest>(&source).ok())
-	{
-		(legacy_path, manifest)
-	} else if let Some(manifest) = fs::read_to_string(&deployment_path)
-		.ok()
-		.and_then(|source| omp_ext::config::DeploymentManifest::parse(&source).ok())
-		.filter(|manifest| manifest.validate().is_ok())
-	{
-		let mut extra = BTreeMap::new();
-		extra.insert(
-			Str::new_static("declarations"),
-			serde_json::to_value(&manifest.declarations).unwrap_or_default(),
-		);
-		extra.insert(
-			Str::new_static("settings"),
-			serde_json::to_value(&manifest.settings).unwrap_or_default(),
-		);
-		(deployment_path, ExtensionManifest {
-			name: Some(manifest.id.to_string()),
-			description: None,
-			worker: Some(PythonWorkerDeclaration { module: manifest.entry.clone(), entry: None }),
-			cli: Vec::new(),
-			selected_features: Box::new([]),
-			extra,
-		})
+	let loaded = if deployment_path.is_file() {
+		load_deployment_extension(&deployment_path)
+	} else if legacy_path.is_file() {
+		load_legacy_extension(&legacy_path)
 	} else {
+		if scope == SourceScope::Native {
+			output.warnings.push(Str::from(
+				ExtensionManifestLoadError::Missing { root: root.to_path_buf() }.to_string(),
+			));
+		}
 		return;
+	};
+	let (path, manifest) = match loaded {
+		Ok(manifest) => manifest,
+		Err(error) => {
+			output.warnings.push(Str::from(error.to_string()));
+			return;
+		},
 	};
 	let name = manifest.name.as_deref().unwrap_or_else(|| {
 		root
@@ -919,11 +1045,72 @@ fn load_extension(
 	));
 }
 
+fn load_deployment_extension(
+	path: &Path,
+) -> Result<(PathBuf, ExtensionManifest), ExtensionManifestLoadError> {
+	let source = fs::read_to_string(path)
+		.map_err(|source| ExtensionManifestLoadError::Read { path: path.to_path_buf(), source })?;
+	let manifest = omp_ext::config::DeploymentManifest::parse(&source)
+		.map_err(|source| ExtensionManifestLoadError::Parse { path: path.to_path_buf(), source })?;
+	if toml::from_str::<toml::Table>(&source).is_ok_and(|table| table.contains_key("tools")) {
+		return Err(ExtensionManifestLoadError::UnsupportedTools { path: path.to_path_buf() });
+	}
+	manifest
+		.validate()
+		.map_err(|source| ExtensionManifestLoadError::Invalid { path: path.to_path_buf(), source })?;
+	let mut extra = BTreeMap::new();
+	extra.insert(
+		Str::new_static("declarations"),
+		serde_json::to_value(&manifest.declarations).unwrap_or_default(),
+	);
+	extra.insert(
+		Str::new_static("settings"),
+		serde_json::to_value(&manifest.settings).unwrap_or_default(),
+	);
+	Ok((path.to_path_buf(), ExtensionManifest {
+		name: Some(manifest.id.to_string()),
+		description: None,
+		worker: Some(PythonWorkerDeclaration { module: manifest.entry.clone(), entry: None }),
+		cli: Vec::new(),
+		selected_features: Box::new([]),
+		extra,
+	}))
+}
+
+fn load_legacy_extension(
+	path: &Path,
+) -> Result<(PathBuf, ExtensionManifest), ExtensionManifestLoadError> {
+	let source = fs::read_to_string(path)
+		.map_err(|source| ExtensionManifestLoadError::Read { path: path.to_path_buf(), source })?;
+	let manifest = serde_json::from_str(&source).map_err(|source| {
+		ExtensionManifestLoadError::LegacyParse { path: path.to_path_buf(), source }
+	})?;
+	Ok((path.to_path_buf(), manifest))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
 
 	use super::*;
+	#[test]
+	fn one_shot_prompt_and_theme_paths_are_discovered_first() {
+		let tree = tempfile::tempdir().expect("tree");
+		let prompt = tree.path().join("review.md");
+		let theme = tree.path().join("ocean.json");
+		fs::write(&prompt, "Review this change.").expect("prompt");
+		fs::write(&theme, r#"{"name":"ocean"}"#).expect("theme");
+		let options = NativeDiscoveryOptions {
+			root_mode: NativeRootMode::ExplicitOnly,
+			prompt_templates: vec![prompt],
+			themes: vec![theme],
+			..NativeDiscoveryOptions::default()
+		};
+		let discovered = discover_capabilities(tree.path(), tree.path(), 0, &options);
+		assert!(matches!(&discovered.declarations[0].payload, CapabilityPayload::Prompts(_)));
+		assert!(matches!(&discovered.declarations[1].payload, CapabilityPayload::Themes(_)));
+	}
+
 	#[test]
 	fn config_roots_exclude_foreign_families() {
 		let tree = tempfile::tempdir().expect("tree");
@@ -979,7 +1166,14 @@ mod tests {
 		.expect("command");
 		fs::write(root.join("commands/broken.md"), "---\ndescription: broken").expect("broken");
 		let mut output = NativeDiscovery::default();
-		load_root(&root, SourceScope::Project, &SkillDiscoverySettings::default(), None, &mut output);
+		load_root(
+			&root,
+			SourceScope::Project,
+			&SkillDiscoverySettings::default(),
+			None,
+			None,
+			&mut output,
+		);
 		assert!(output.declarations.iter().any(|declaration| {
 			matches!(
 				&declaration.payload,
@@ -993,6 +1187,47 @@ mod tests {
 				.any(|warning| warning.contains("/broken"))
 		);
 	}
+
+	#[test]
+	fn explicit_manifest_root_is_native_and_parse_failures_are_reported() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let extension = tree.path().join("demo");
+		fs::create_dir_all(&home).expect("home");
+		fs::create_dir_all(&extension).expect("extension");
+		fs::write(extension.join("omp.toml"), "id = [").expect("invalid manifest");
+		let options = NativeDiscoveryOptions {
+			explicit_roots: vec![extension.clone()],
+			root_mode: NativeRootMode::ExplicitOnly,
+			..NativeDiscoveryOptions::default()
+		};
+		let invalid = discover_capabilities(tree.path(), &home, 1, &options);
+		assert!(invalid.declarations.is_empty());
+		assert_eq!(invalid.warnings.len(), 1);
+		assert!(invalid.warnings[0].contains(extension.join("omp.toml").to_string_lossy().as_ref()));
+		assert!(invalid.warnings[0].contains("failed to parse extension manifest"));
+
+		fs::write(
+			extension.join("omp.toml"),
+			"id = \"demo\"\nentry = \"demo\"\n[[tools]]\nname = \"hello\"\n",
+		)
+		.expect("unsupported manifest");
+		let unsupported = discover_capabilities(tree.path(), &home, 1, &options);
+		assert!(unsupported.declarations.is_empty());
+		assert_eq!(unsupported.warnings.len(), 1);
+		assert!(unsupported.warnings[0].contains("unsupported [[tools]]"));
+
+		fs::write(extension.join("omp.toml"), "id = \"demo\"\nentry = \"demo\"\n")
+			.expect("valid manifest");
+		let valid = discover_capabilities(tree.path(), &home, 1, &options);
+		let declaration = valid
+			.declarations
+			.iter()
+			.find(|declaration| matches!(&declaration.payload, CapabilityPayload::Extensions(_)))
+			.expect("extension declaration");
+		assert_eq!(declaration.source.scope, SourceScope::Native);
+	}
+
 	#[test]
 	fn script_tool_header_keeps_jsdoc_and_drops_symlink_footnotes() {
 		let tree = tempfile::tempdir().expect("tree");

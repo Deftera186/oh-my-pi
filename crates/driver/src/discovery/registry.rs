@@ -31,6 +31,7 @@ const MAX_PROVIDER_DEADLINE: Duration = Duration::from_secs(30);
 /// Canonical capability kind order used by diagnostics and frozen snapshots.
 pub const CAPABILITY_KINDS: &[CapabilityKind] = &[
 	CapabilityKind::Skills,
+	CapabilityKind::Themes,
 	CapabilityKind::Rules,
 	CapabilityKind::Mcps,
 	CapabilityKind::ContextFiles,
@@ -57,6 +58,11 @@ const CAPABILITY_METADATA: &[CapabilityMetadata] = &[
 		kind:         CapabilityKind::Skills,
 		display_name: "Skills",
 		description:  "Specialized knowledge and workflow declarations",
+	},
+	CapabilityMetadata {
+		kind:         CapabilityKind::Themes,
+		display_name: "Themes",
+		description:  "Named terminal appearance resources",
 	},
 	CapabilityMetadata {
 		kind:         CapabilityKind::Rules,

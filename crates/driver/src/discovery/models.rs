@@ -7,11 +7,12 @@ use std::{
 };
 
 use omp_catalog::{
-	Availability, CatalogOverlay, CatalogOverlayBuilder, ClassId, ContextStrategy,
-	EvidenceConfidence, ModalityBits, ModelAvailability, ModelKey, ModelLimits, ModelOverlay,
-	ModelPatch, ModelProvenance, ModelSpec, OverlaySource, OverlayStore, PremiumMultiplier, Pricing,
-	ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, RouteDef, RouteId, RouteOverlay,
-	RoutePatch, ThinkingPolicy, ThinkingRouting, WireModelId,
+	AccountScope, AuthSpec, AuthSpecKind, Availability, CatalogOverlay, CatalogOverlayBuilder,
+	ClassId, ContextStrategy, CredentialSourceSpec, EvidenceConfidence, ModalityBits,
+	ModelAvailability, ModelKey, ModelLimits, ModelOverlay, ModelPatch, ModelProvenance, ModelSpec,
+	OverlaySource, OverlayStore, PremiumMultiplier, Pricing, ProvenanceKind, ProvenanceSource,
+	ProviderDef, ProviderId, RouteDef, RouteId, RouteOverlay, RoutePatch, ThinkingPolicy,
+	ThinkingRouting, WireModelId,
 };
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
@@ -225,6 +226,14 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 	let mut builder = CatalogOverlayBuilder::new(source.clone());
 	let catalog = omp_catalog::Catalog::embedded();
 	for (provider, definition) in &config.providers {
+		let configured_auth = definition
+			.auth
+			.as_deref()
+			.map(|auth| configured_auth_spec(provider, auth))
+			.transpose()?;
+		if let Some(spec) = &configured_auth {
+			builder = builder.with_auth_spec(spec.clone());
+		}
 		let base_provider = catalog.provider(ProviderId::from_ref(provider.as_str()));
 		let configured_route = if let Some(base_provider) = base_provider {
 			for route_id in &base_provider.routes {
@@ -250,10 +259,7 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 					added: None,
 					patch: RoutePatch {
 						endpoint,
-						auth: definition
-							.auth
-							.as_deref()
-							.map(omp_catalog::AuthSpecId::from),
+						auth: configured_auth.as_ref().map(|spec| spec.id.clone()),
 						discovery: definition.discovery.as_ref().map(|_| discovery),
 						disable_strict_tools: definition.disable_strict_tools,
 						..RoutePatch::default()
@@ -269,13 +275,23 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 			added_provider.id = ProviderId::from(provider.as_str());
 			added_provider.name = provider.clone();
 			added_provider.routes = Box::new([route_id.clone()]);
-			if let Some(auth) = definition.auth.as_deref() {
-				added_provider.auth = Box::new([omp_catalog::AuthSpecId::from(auth)]);
+			if let Some(auth) = &configured_auth {
+				added_provider.auth = Box::new([auth.id.clone()]);
 			}
 			builder = builder.with_provider(added_provider);
 			let mut added_route: RouteDef = template_route.clone();
 			added_route.id = route_id.clone();
 			added_route.provider = ProviderId::from(provider.as_str());
+			if let Some((codec, transport)) = definition
+				.models
+				.values()
+				.chain(definition.model_overrides.values())
+				.find_map(|model| model.api.as_deref())
+				.and_then(omp_catalog::resolve_source_transport)
+			{
+				added_route.codec = codec;
+				added_route.transport = transport;
+			}
 			if let Some(base_url) = &definition.base_url {
 				added_route.endpoint.base_url = base_url.clone();
 				if let Ok(url) = url::Url::parse(base_url)
@@ -290,8 +306,8 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 					added_route.trust_domain.allow_plaintext = url.scheme() == "http";
 				}
 			}
-			if let Some(auth) = definition.auth.as_deref() {
-				added_route.auth = omp_catalog::AuthSpecId::from(auth);
+			if let Some(auth) = &configured_auth {
+				added_route.auth = auth.id.clone();
 			}
 			added_route.discovery = definition
 				.discovery
@@ -521,6 +537,75 @@ fn configured_chat_capabilities() -> omp_catalog::ModelCapabilities {
 ///
 /// Modes accept snake_case, kebab-case, and legacy camelCase spellings
 /// (`apiKey`, `optional-bearer`, `API_KEY` are all `api_key`-class inputs).
+fn configured_auth_spec(provider: &str, auth: &str) -> Result<AuthSpec, ModelsConfigError> {
+	let mut normalized = String::with_capacity(auth.len() + 4);
+	let camel = auth.chars().any(|c| c.is_ascii_lowercase());
+	for c in auth.chars() {
+		if c == '-' {
+			normalized.push('_');
+		} else if c.is_ascii_uppercase() {
+			if camel && !normalized.is_empty() && !normalized.ends_with('_') {
+				normalized.push('_');
+			}
+			normalized.push(c.to_ascii_lowercase());
+		} else {
+			normalized.push(c);
+		}
+	}
+	let kind = normalized
+		.parse::<AuthSpecKind>()
+		.ok()
+		.filter(|kind| {
+			matches!(
+				kind,
+				AuthSpecKind::None
+					| AuthSpecKind::ApiKey
+					| AuthSpecKind::Bearer
+					| AuthSpecKind::OptionalBearer
+					| AuthSpecKind::Basic
+			)
+		})
+		.ok_or_else(|| ModelsConfigError::InvalidAuth { provider: Str::new(provider) })?;
+	let env_base: String = provider
+		.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() {
+				c.to_ascii_uppercase()
+			} else {
+				'_'
+			}
+		})
+		.collect();
+	let bearer =
+		matches!(kind, AuthSpecKind::ApiKey | AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer);
+	let credential_sources: Box<[CredentialSourceSpec]> = match kind {
+		AuthSpecKind::None => Box::new([]),
+		AuthSpecKind::Basic => Box::new([CredentialSourceSpec::BasicEnvironment {
+			username_names: Box::new([Str::from(format!("OMP_{env_base}_USERNAME"))]),
+			password_names: Box::new([Str::from(format!("OMP_{env_base}_PASSWORD"))]),
+		}]),
+		_ => Box::new([
+			CredentialSourceSpec::Environment {
+				ordered_names: Box::new([Str::from(format!("OMP_{env_base}_API_KEY"))]),
+			},
+			CredentialSourceSpec::Stored,
+		]),
+	};
+	Ok(AuthSpec {
+		id: omp_catalog::AuthSpecId::from(format!("{provider}-configured-auth")),
+		kind,
+		header_name: bearer.then(|| Str::new_static("authorization")),
+		query_parameter: None,
+		prefix: bearer.then(|| Str::new_static("Bearer ")),
+		sealed_body: None,
+		scopes: Box::new([]),
+		audience: None,
+		account_scope: AccountScope::Provider,
+		credential_sources,
+		oauth: None,
+		signing: None,
+	})
+}
 
 fn configured_model_record(
 	catalog: &omp_catalog::Catalog,
@@ -659,7 +744,14 @@ pub enum ModelsConfigError {
 		field:    &'static str,
 	},
 	/// A configured provider `auth` mode names no supported specification kind.
+	#[error(
+		"invalid `auth` for configured provider {provider}; expected one of none, api_key, bearer, \
+		 optional_bearer, basic"
+	)]
+	InvalidAuth {
 		/// Provider containing the invalid auth mode.
+		provider: Str,
+	},
 	/// Reading the configured source failed.
 	#[error(transparent)]
 	Io(#[from] io::Error),
@@ -761,5 +853,63 @@ mod tests {
 			.expect("model");
 		assert_eq!(model.routes.as_ref(), provider.routes.as_ref());
 		assert_eq!(model.limits.context_window, Some(128_000));
+	}
+	#[test]
+	fn configured_provider_is_chat_capable_and_speaks_its_declared_api() {
+		let value: ModelsConfig = toml::from_str(
+			"[providers.demo]\nbaseUrl='http://127.0.0.1:9/v1'\nauth='none'\n[providers.demo.models.fast]\napi='openai-completions'\nsupportsTools=true\n",
+		)
+		.expect("decode");
+		let overlay = lower_user_overlay(&value).expect("overlay");
+		let stack = omp_catalog::OverlayStack::from_layers([(OverlaySource::UserConfig, overlay)]);
+		let catalog = omp_catalog::Catalog::embedded()
+			.with_overlay_stack(&stack, omp_catalog::UnsafeTrustScope::ALL)
+			.expect("materialize configured provider");
+		let model = catalog
+			.models()
+			.iter()
+			.find(|model| model.key.as_str() == "fast")
+			.expect("model");
+		assert!(
+			model
+				.capabilities
+				.operations
+				.contains_kind(omp_catalog::OperationKind::Chat),
+			"configured models must admit the chat operation"
+		);
+		let chat = model.capabilities.chat.as_ref().expect("chat block");
+		assert!(matches!(chat.tools, Availability::Native(_)));
+		let route = catalog
+			.route(&RouteId::from("demo-configured"))
+			.expect("route");
+		assert_eq!(route.codec.as_str(), "openai-chat");
+		let auth = catalog.auth_spec(&route.auth).expect("interned auth spec");
+		assert_eq!(auth.kind, AuthSpecKind::None);
+		assert!(auth.credential_sources.is_empty());
+	}
+
+	#[test]
+	fn configured_auth_modes_normalize_and_reject_unknown_kinds() {
+		for (input, kind) in [
+			("none", AuthSpecKind::None),
+			("apiKey", AuthSpecKind::ApiKey),
+			("api-key", AuthSpecKind::ApiKey),
+			("API_KEY", AuthSpecKind::ApiKey),
+			("optionalBearer", AuthSpecKind::OptionalBearer),
+			("basic", AuthSpecKind::Basic),
+		] {
+			let spec = configured_auth_spec("demo", input).expect(input);
+			assert_eq!(spec.kind, kind, "{input}");
+		}
+		let spec = configured_auth_spec("my-provider", "bearer").expect("bearer");
+		assert!(matches!(
+			&spec.credential_sources[0],
+			CredentialSourceSpec::Environment { ordered_names }
+				if ordered_names.as_ref() == ["OMP_MY_PROVIDER_API_KEY"]
+		));
+		assert!(matches!(
+			configured_auth_spec("demo", "oauth"),
+			Err(ModelsConfigError::InvalidAuth { .. })
+		));
 	}
 }

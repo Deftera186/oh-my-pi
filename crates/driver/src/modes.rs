@@ -10,8 +10,9 @@ use std::sync::{
 
 use omp_agent::{
 	AgentState, CachedContribution, Continuation, ContinuationPolicy, ContinuationSource,
-	LoopSignal, PromptError, PromptSlotSource, PromptSource, Props, RESOURCE_TABLE, RegimeRecord,
-	RegimeSet, RegimeStatus, Resource, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotRegistration,
+	LoopSignal, PromptBands, PromptError, PromptSlotSource, PromptSource, Props, RESOURCE_TABLE,
+	RegimeRecord, RegimeSet, RegimeStatus, Resource, SlotAssembler, SlotClass, SlotDecl, SlotId,
+	SlotRegistration,
 };
 use omp_core::{Str, sf};
 /// One visible resource owner projected by the driver.
@@ -436,9 +437,8 @@ struct ModeAwarePromptSource {
 	modes: RegimeHandle,
 }
 
-impl PromptSource for ModeAwarePromptSource {
-	fn render(&self, workspace: &Props) -> Result<Vec<Item>, PromptError> {
-		let mut items = self.base.render(workspace)?;
+impl ModeAwarePromptSource {
+	fn registrations(&self) -> Vec<SlotRegistration> {
 		let mut registrations = Vec::new();
 		if let Some(slot) = self.modes.mode_holder() {
 			registrations.push(PromptSlotSource::new(slot).registration());
@@ -461,10 +461,29 @@ impl PromptSource for ModeAwarePromptSource {
 				source: Arc::new(CachedContribution::new(goal::prompt_context(&goal, todo.as_deref()))),
 			});
 		}
-		if !registrations.is_empty() {
-			items.extend(SlotAssembler::new(registrations).render(workspace)?);
+		registrations
+	}
+}
+
+impl PromptSource for ModeAwarePromptSource {
+	fn render(&self, workspace: &Props) -> Result<Vec<Item>, PromptError> {
+		let Some(bands) = self.banded_items_render(workspace)? else {
+			return self.base.render(workspace);
+		};
+		Ok(bands.into_items())
+	}
+
+	fn banded_items_render(&self, workspace: &Props) -> Result<Option<PromptBands>, PromptError> {
+		let Some(mut bands) = self.base.banded_items_render(workspace)? else {
+			return Ok(None);
+		};
+		let registrations = self.registrations();
+		if !registrations.is_empty()
+			&& let Some(extra) = SlotAssembler::new(registrations).banded_items_render(workspace)?
+		{
+			bands.append(extra);
 		}
-		Ok(items)
+		Ok(Some(bands))
 	}
 }
 

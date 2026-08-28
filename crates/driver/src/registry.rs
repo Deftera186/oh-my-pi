@@ -552,8 +552,9 @@ pub async fn production_inference_for_session(
 		.clone();
 	let rpc = InferenceRpc::new(registry.clone(), sessions, tool_registry)
 		.with_session_overrides(provider, overrides.prompt_cache_affinity)
-		.with_provider_response_hooks(provider_response_hooks)
+		.with_provider_response_hooks(provider_response_hooks.clone())
 		.with_search_settings(search_settings);
+	auth_manager.bind_provider_hooks(provider_response_hooks);
 	let auth_control = auth_manager.control_handle();
 	let mcp_oauth = Arc::new(omp_envd::mcp::oauth::McpOAuth::new(
 		Arc::new(SystemOAuthHttpClient::new()),

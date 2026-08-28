@@ -2,7 +2,12 @@
 
 pub mod finalize;
 
-use std::{collections::BTreeSet, env, error, path::PathBuf, sync::Arc};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	env, error,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use omp_agent::{
 	Agent, AgentEvent, AgentKind, AgentRunSummary, AgentState, AgentStatus, AgentTree, ApprovalBook,
@@ -235,6 +240,7 @@ pub struct HeadlessSession {
 	finalizer:           HeadlessFinalizerHandle,
 	_goal_binding:       AgentGoalBinding,
 	session_id:          Str,
+	discovery_warnings:  Arc<[Str]>,
 	initial_items:       Vec<Item>,
 	_inference_registry: InferenceRegistry,
 	_catalog:            Arc<snapshot::Catalog>,
@@ -371,7 +377,7 @@ impl HeadlessSession {
 			extension_scopes,
 			extension_overrides: Arc::from([]),
 		};
-		let prompt_discovery = discovery::active_prompt_snapshots(
+		let mut prompt_discovery = discovery::active_prompt_snapshots(
 			&root,
 			&options.additional_roots,
 			&home,
@@ -414,6 +420,8 @@ impl HeadlessSession {
 			.cloned()
 			.collect::<Vec<_>>();
 		validate_extension_host_keys(extension_specs.iter().map(|extension| &extension.key))?;
+		let prompt_head =
+			Arc::new(crate::prompt_head::ProductionPromptHead::from_extension_specs(&extension_specs));
 		let mut bridges = builtin_with_content(
 			&root,
 			Arc::clone(&search),
@@ -433,6 +441,30 @@ impl HeadlessSession {
 			policy.contributed_values.as_ref(),
 			Arc::clone(&settings_snapshot),
 			bridges,
+		)
+		.await
+		.map_err(composition)?;
+		prompt_head.bind_provider(environment.extension_prompt_provider());
+		let mut resource_roots =
+			Vec::with_capacity(1 + options.additional_roots.len() + extension_specs.len());
+		resource_roots.push(root.clone());
+		resource_roots.extend(options.additional_roots.iter().cloned());
+		resource_roots.extend(extension_specs.iter().filter_map(|extension| {
+			extension.watch_root.clone().or_else(|| {
+				extension
+					.entry_path
+					.as_ref()?
+					.parent()
+					.map(Path::to_path_buf)
+			})
+		}));
+		prompt_discovery.content = discovery::gate_resources_discover(
+			environment.admission_gate().as_ref(),
+			discovery::DiscoverReason::Startup,
+			&root,
+			&resource_roots,
+			&prompt_discovery_settings,
+			prompt_discovery.content,
 		)
 		.await
 		.map_err(composition)?;
@@ -523,6 +555,7 @@ impl HeadlessSession {
 		for warning in content.warnings.iter() {
 			tracing::warn!(%warning, "headless content discovery warning");
 		}
+		let discovery_warnings = Arc::clone(&content.warnings);
 		for diagnostic in prompt_discovery.context.diagnostics.iter() {
 			tracing::warn!(?diagnostic, "headless context discovery warning");
 		}
@@ -586,6 +619,44 @@ impl HeadlessSession {
 			min_tool_calls: settings.autolearn.min_tool_calls,
 		};
 		let state = AgentState::new(snapshot);
+		let (prompt_model, prompt_context_window) = {
+			let snapshot = state.snapshot();
+			(
+				Str::from(snapshot.turn.params.model.as_str()),
+				chat::model_context_window(catalog, &snapshot.turn.params.model).unwrap_or(0),
+			)
+		};
+		let prompt_provider = prompt_model
+			.split_once('/')
+			.map_or_else(|| Str::new_static(""), |(provider, _)| Str::from(provider));
+		let mut prompt_roots = Vec::with_capacity(1 + options.additional_roots.len());
+		prompt_roots.push(Str::from(root.to_string_lossy().as_ref()));
+		prompt_roots.extend(
+			options
+				.additional_roots
+				.iter()
+				.map(|root| Str::from(root.to_string_lossy().as_ref())),
+		);
+		prompt_head
+			.activate(omp_envd::exthost::PromptPullContext {
+				session_id:     session.id.clone(),
+				model:          prompt_model,
+				provider:       prompt_provider,
+				context_window: prompt_context_window,
+				epoch:          0,
+				cwd:            Str::from(blueprint.options().cwd.to_string_lossy().as_ref()),
+				roots:          prompt_roots,
+				vcs_branch:     None,
+				vcs_commit:     None,
+				is_subagent:    false,
+				agent_kind:     None,
+			})
+			.await
+			.map_err(composition)?;
+		state.update(|snapshot| {
+			snapshot.prompt_source =
+				prompt_head.wrap_prompt_source(Arc::clone(&snapshot.prompt_source));
+		});
 		let ProductionInference {
 			registry: inference_registry,
 			rpc: inference,
@@ -630,6 +701,8 @@ impl HeadlessSession {
 			settings.security.enabled,
 			Arc::clone(&tree),
 		));
+		advisor_parent.bind_admission_gate(environment.admission_gate());
+		advisor_parent.bind_extension_reload(environment.extension_reload_handle());
 		advisor_parent.set_prompt_discovery_settings(prompt_discovery_settings);
 		if let Some(auto_thinking) = policy.auto_thinking {
 			advisor_parent.set_auto_thinking_settings(auto_thinking);
@@ -663,6 +736,7 @@ impl HeadlessSession {
 		});
 		let mut agent =
 			Agent::new(client, env.clone(), state.clone(), session.journal, chat::CHAT_CAPS_BASE);
+		agent.set_hook_gate(environment.admission_gate());
 		let compaction_methods = settings.compaction.method_order();
 		let mid_turn_policy = omp_agent::MidTurnCompactionPolicy {
 			enabled: settings.compaction.enabled && settings.compaction.mid_turn_enabled,
@@ -743,6 +817,13 @@ impl HeadlessSession {
 			)
 			.map_err(composition)?;
 		node.set_status(AgentStatus::Running);
+		advisor_parent.bind_agent_controls(
+			session.id.clone(),
+			agent.host_control(),
+			agent.control(),
+			agent.abort_handle(),
+			agent.events().clone(),
+		);
 		let session_handle = blueprint
 			.launch(
 				SessionIdentity { id: session.id.clone(), journal_path, expected_revision: None },
@@ -754,7 +835,9 @@ impl HeadlessSession {
 		let events = session_handle.subscribe_lossless();
 		let (lifecycle, lifecycle_events) = HeadlessLifecycleSink::new(options.session_generation);
 		let approval_book = Arc::new(ApprovalBook::new());
-		let (approval_route, approval_inbox) = ApprovalRoute::new(Arc::clone(&approval_book));
+		let (approval_route, approval_inbox) =
+			ApprovalRoute::new(Arc::clone(&approval_book), Some(environment.admission_gate()));
+		advisor_parent.bind_spawn_approval_route(approval_route.clone());
 		environment
 			.bind_approval_authority(Some(Arc::clone(&approval_book)), Some(approval_route.clone()));
 		Ok(Self {
@@ -775,6 +858,7 @@ impl HeadlessSession {
 			finalizer: HeadlessFinalizerHandle::new(),
 			_goal_binding: goal_binding,
 			session_id: session.id,
+			discovery_warnings,
 			initial_items: session.initial_items,
 			_inference_registry: inference_registry,
 			_catalog: catalog_owner,
@@ -796,7 +880,15 @@ impl HeadlessSession {
 		&mut self,
 		items: impl IntoIterator<Item = Item>,
 		turn_id: TurnId,
-	) -> Result<AgentRunSummary, omp_sdk::SessionHandleError> {
+	) -> Result<AgentRunSummary, HeadlessError> {
+		let mut items = items.into_iter().collect::<Vec<_>>();
+		self
+			.advisor_parent
+			.admit_user_input(&mut items, "rpc", false)
+			.await
+			.map_err(|denial| {
+				composition(io::Error::new(io::ErrorKind::PermissionDenied, denial.reason.to_string()))
+			})?;
 		let forced = self._forced_tool.lock().take();
 		let previous = forced
 			.as_ref()
@@ -810,7 +902,11 @@ impl HeadlessSession {
 				});
 			});
 		}
-		let result = self.session.submit(items, turn_id).await;
+		let result = self
+			.session
+			.submit(items, turn_id)
+			.await
+			.map_err(composition);
 		if let Some(previous) = previous {
 			self
 				.state
@@ -819,7 +915,34 @@ impl HeadlessSession {
 		result
 	}
 
+	/// Gates one direct headless shell command before execution.
+	pub async fn admit_user_bash(
+		&self,
+		command: &str,
+		cwd: &Path,
+	) -> Result<(Str, omp_core::EnvPath, BTreeMap<String, Option<String>>), omp_tool::PolicyDenied>
+	{
+		self
+			.advisor_parent
+			.admit_user_bash(command, cwd, true)
+			.await
+	}
+
 	/// Gates one parsed headless extension command before handler dispatch.
+	pub async fn admit_command_invoke(
+		&self,
+		name: &str,
+		argv: &[Str],
+		raw: &str,
+		mode: &'static str,
+		source: &'static str,
+	) -> Result<(Str, Vec<Str>), omp_tool::PolicyDenied> {
+		self
+			.advisor_parent
+			.admit_command_invoke(name, argv, raw, mode, source)
+			.await
+	}
+
 	/// Forces one exact registered tool for the next submitted turn only.
 	pub fn force_tool_once(&self, name: Str) -> Result<(), HeadlessError> {
 		if !self.state.snapshot().enabled_tools.contains(&name) {
@@ -898,6 +1021,11 @@ impl HeadlessSession {
 	/// Returns the durable session identifier.
 	pub fn session_id(&self) -> &str {
 		self.session_id.as_str()
+	}
+
+	/// Returns startup discovery diagnostics for the presentation adapter.
+	pub fn discovery_warnings(&self) -> &[Str] {
+		&self.discovery_warnings
 	}
 
 	/// Returns the session-local parent authority used by persistent advisor

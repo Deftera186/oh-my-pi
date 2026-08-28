@@ -1,13 +1,21 @@
 //! Production prompt invalidation authority and its consumed generation state.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
-use omp_agent::{BandHash, PromptError, PromptSource, SlotClass, SlotDecl, SlotId};
-use omp_core::{Hash32, hash32::Hasher};
-use omp_envd::worker::ExtHostSpec;
+use omp_agent::{
+	BandHash, CachedContribution, PromptBands, PromptError, PromptSource, SlotAssembler, SlotClass,
+	SlotDecl, SlotId, SlotRegistration,
+};
+use omp_core::{Hash32, Str, hash32::Hasher};
+use omp_envd::{
+	exthost::{
+		PromptContributionProvider, PromptContributionRecord, PromptPullContext, PromptSlotBinding,
+	},
+	worker::ExtHostSpec,
+};
 use omp_scribe::Props;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::rulebook::{PromptHeadAuthority, PromptInvalidationError};
 
@@ -43,7 +51,7 @@ impl PromptGenerationStore {
 		let generation = generations.entry((session_generation, slot)).or_default();
 		let next = generation
 			.checked_add(1)
-			.ok_or_else(|| PromptInvalidationError::Head("prompt-slot generation exhausted".into()))?;
+			.ok_or(PromptInvalidationError::GenerationExhausted)?;
 		*generation = next;
 		Ok(next)
 	}
@@ -82,16 +90,24 @@ fn hash_generation(hasher: &mut Hasher, key: &(u64, SlotId), generation: u64) {
 /// The declarations are retained as the single authoritative declaration
 /// table. Invalidation validates directly against them instead of maintaining
 /// a second slot or ownership registry.
-#[derive(Clone)]
 pub struct ProductionPromptHead {
-	declarations: Arc<[SlotDecl]>,
-	generations:  PromptGenerationStore,
+	declarations:  Arc<[SlotDecl]>,
+	generations:   PromptGenerationStore,
+	provider:      RwLock<Option<Arc<dyn PromptContributionProvider>>>,
+	context:       RwLock<Option<PromptPullContext>>,
+	contributions: Arc<RwLock<BTreeMap<(Str, Str), PromptContributionRecord>>>,
 }
 
 impl ProductionPromptHead {
 	/// Creates an authority over the declarations supplied to prompt assembly.
 	pub fn new(declarations: Vec<SlotDecl>) -> Self {
-		Self { declarations: declarations.into(), generations: PromptGenerationStore::default() }
+		Self {
+			declarations:  declarations.into(),
+			generations:   PromptGenerationStore::default(),
+			provider:      RwLock::new(None),
+			context:       RwLock::new(None),
+			contributions: Arc::new(RwLock::new(BTreeMap::new())),
+		}
 	}
 
 	/// Creates an authority from the sealed declarations admitted for extension
@@ -142,6 +158,71 @@ impl ProductionPromptHead {
 		Self::new(declarations)
 	}
 
+	/// Installs the live extension provider used for activation and
+	/// invalidation pulls.
+	pub fn bind_provider(&self, provider: Arc<dyn PromptContributionProvider>) {
+		*self.provider.write() = Some(provider);
+	}
+
+	/// Pulls every eager prompt renderer before the first model request.
+	pub async fn activate(&self, context: PromptPullContext) -> Result<(), PromptInvalidationError> {
+		*self.context.write() = Some(context.clone());
+		let Some(provider) = self.provider.read().clone() else {
+			return Ok(());
+		};
+		let bindings = provider.declarations();
+		for binding in &bindings {
+			self.validate_binding(binding)?;
+		}
+		let mut refreshed = Vec::with_capacity(bindings.len());
+		for binding in &bindings {
+			refreshed.push(
+				provider
+					.pull(binding, &context)
+					.await
+					.map_err(PromptInvalidationError::Refresh)?,
+			);
+		}
+		let mut contributions = self.contributions.write();
+		contributions.clear();
+		for contribution in refreshed {
+			contributions.insert(
+				(contribution.binding.owner.clone(), contribution.binding.key.clone()),
+				contribution,
+			);
+		}
+		Ok(())
+	}
+
+	/// Installs one already-pulled contribution.
+	///
+	/// This is the synchronous seam used by embedded hosts which performed
+	/// their eager pull during startup.
+	pub fn install(
+		&self,
+		contribution: PromptContributionRecord,
+	) -> Result<(), PromptInvalidationError> {
+		self.validate_binding(&contribution.binding)?;
+		self.contributions.write().insert(
+			(contribution.binding.owner.clone(), contribution.binding.key.clone()),
+			contribution,
+		);
+		Ok(())
+	}
+
+	fn validate_binding(&self, binding: &PromptSlotBinding) -> Result<(), PromptInvalidationError> {
+		if self.declarations.iter().any(|declaration| {
+			declaration.owner == binding.owner
+				&& declaration.slot == binding.slot
+				&& declaration.class == binding.class
+				&& declaration.priority == binding.priority
+		}) {
+			Ok(())
+		} else {
+			Err(PromptInvalidationError::Refresh(omp_envd::exthost::PromptDispatchError::Undeclared))
+		}
+	}
+
 	/// Returns the shared generation store prompt assembly and cache keys
 	/// consume.
 	pub fn generation_store(&self) -> PromptGenerationStore {
@@ -159,32 +240,57 @@ impl ProductionPromptHead {
 			source,
 			declarations: Arc::clone(&self.declarations),
 			generations: self.generations.clone(),
+			contributions: Arc::clone(&self.contributions),
 		})
 	}
 }
 
 struct GenerationPromptSource {
-	source:       Arc<dyn PromptSource>,
-	declarations: Arc<[SlotDecl]>,
-	generations:  PromptGenerationStore,
+	source:        Arc<dyn PromptSource>,
+	declarations:  Arc<[SlotDecl]>,
+	generations:   PromptGenerationStore,
+	contributions: Arc<RwLock<BTreeMap<(Str, Str), PromptContributionRecord>>>,
 }
 
 impl PromptSource for GenerationPromptSource {
 	fn render(&self, props: &Props) -> Result<Vec<omp_agent::Item>, PromptError> {
-		self.source.render(props)
-	}
-
-	fn banded_render(
-		&self,
-		props: &Props,
-	) -> Result<Option<(Vec<omp_agent::Item>, [BandHash; 4])>, PromptError> {
-		let Some((items, mut bands)) = self.source.banded_render(props)? else {
+		let Some(bands) = self.banded_items_render(props)? else {
 			return Err(PromptError::Source(
-				"prompt invalidation requires a banded prompt source".into(),
+				"prompt contributions require a banded prompt source".into(),
 			));
 		};
-		self.generations.fold_bands(&self.declarations, &mut bands);
-		Ok(Some((items, bands)))
+		Ok(bands.into_items())
+	}
+
+	fn banded_items_render(&self, props: &Props) -> Result<Option<PromptBands>, PromptError> {
+		let Some(mut bands) = self.source.banded_items_render(props)? else {
+			return Err(PromptError::Source(
+				"prompt contributions require a banded prompt source".into(),
+			));
+		};
+		let registrations = self
+			.contributions
+			.read()
+			.values()
+			.map(|contribution| SlotRegistration {
+				decl:   SlotDecl {
+					slot:     contribution.binding.slot,
+					class:    contribution.binding.class,
+					owner:    contribution.binding.owner.clone(),
+					priority: contribution.binding.priority,
+				},
+				source: Arc::new(CachedContribution::new(contribution.content.clone())),
+			})
+			.collect::<Vec<_>>();
+		if !registrations.is_empty()
+			&& let Some(extra) = SlotAssembler::new(registrations).banded_items_render(props)?
+		{
+			bands.append(extra);
+		}
+		self
+			.generations
+			.fold_bands(&self.declarations, &mut bands.hashes);
+		Ok(Some(bands))
 	}
 }
 
@@ -200,6 +306,7 @@ impl PromptHeadAuthority for ProductionPromptHead {
 		let mut declared = false;
 		let mut owned = false;
 		let mut frozen = false;
+		let mut volatile = true;
 		for declaration in self
 			.declarations
 			.iter()
@@ -209,6 +316,7 @@ impl PromptHeadAuthority for ProductionPromptHead {
 			if declaration.owner.as_str() == extension {
 				owned = true;
 				frozen |= declaration.class == SlotClass::Frozen;
+				volatile &= declaration.class == SlotClass::Volatile;
 			}
 		}
 		if !declared {
@@ -220,38 +328,50 @@ impl PromptHeadAuthority for ProductionPromptHead {
 		if frozen {
 			return Err(PromptInvalidationError::FrozenSlot);
 		}
+		if volatile {
+			return Ok(self.generations.generation(session_generation, slot));
+		}
+		let provider = self.provider.read().clone();
+		if let Some(provider) = provider {
+			let context = self.context.read().clone().ok_or_else(|| {
+				PromptInvalidationError::Refresh(omp_envd::exthost::PromptDispatchError::MissingContext)
+			})?;
+			let bindings = provider
+				.declarations()
+				.into_iter()
+				.filter(|binding| binding.owner.as_str() == extension && binding.slot == slot)
+				.collect::<Vec<_>>();
+			if bindings.is_empty() {
+				return Err(PromptInvalidationError::Refresh(
+					omp_envd::exthost::PromptDispatchError::Undeclared,
+				));
+			}
+			let mut refreshed = Vec::with_capacity(bindings.len());
+			for binding in &bindings {
+				refreshed.push(
+					provider
+						.pull(binding, &context)
+						.await
+						.map_err(PromptInvalidationError::Refresh)?,
+				);
+			}
+			let mut contributions = self.contributions.write();
+			for contribution in refreshed {
+				contributions.insert(
+					(contribution.binding.owner.clone(), contribution.binding.key.clone()),
+					contribution,
+				);
+			}
+		}
 		self.generations.advance(session_generation, slot)
 	}
 }
 
 fn slot_id(slot: &str) -> Option<SlotId> {
-	match slot {
-		"conventions" => Some(SlotId::Conventions),
-		"role" => Some(SlotId::Role),
-		"runtime" => Some(SlotId::Runtime),
-		"tools" => Some(SlotId::Tools),
-		"policy" => Some(SlotId::Policy),
-		"workflow" => Some(SlotId::Workflow),
-		"skills" => Some(SlotId::Skills),
-		"rules" => Some(SlotId::Rules),
-		"guidance" => Some(SlotId::Guidance),
-		"workspace" => Some(SlotId::Workspace),
-		"memory" => Some(SlotId::Memory),
-		"standing" => Some(SlotId::Standing),
-		"recall" => Some(SlotId::Recall),
-		"status" => Some(SlotId::Status),
-		"delivery" => Some(SlotId::Delivery),
-		_ => None,
-	}
+	SlotId::from_str(slot).ok()
 }
 fn slot_class(class: &str) -> Option<SlotClass> {
-	match class {
-		"frozen" => Some(SlotClass::Frozen),
-		"stable" => Some(SlotClass::Stable),
-		"epochal" => Some(SlotClass::Epochal),
-		"volatile" => Some(SlotClass::Volatile),
-		_ => None,
-	}
+	SlotClass::from_str(class).ok()
 }
 
 const fn extension_slot_class(slot: SlotId) -> SlotClass {
@@ -263,5 +383,153 @@ const fn extension_slot_class(slot: SlotId) -> SlotClass {
 		SlotId::Memory | SlotId::Standing => SlotClass::Epochal,
 		SlotId::Recall | SlotId::Status => SlotClass::Volatile,
 		SlotId::Conventions | SlotId::Role | SlotId::Tools | SlotId::Delivery => SlotClass::Frozen,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use async_trait::async_trait;
+	use omp_agent::{CanonicalPromptSource, PromptSource};
+	use omp_core::sf;
+	use omp_envd::exthost::{
+		PromptContributionProvider, PromptContributionRecord, PromptDispatchError, PromptPullContext,
+		PromptSlotBinding,
+	};
+	use omp_proto::thread::v1::{item, part};
+	use parking_lot::RwLock;
+
+	use super::*;
+
+	struct Provider {
+		binding: PromptSlotBinding,
+		content: RwLock<Str>,
+	}
+
+	#[async_trait]
+	impl PromptContributionProvider for Provider {
+		fn declarations(&self) -> Vec<PromptSlotBinding> {
+			vec![self.binding.clone()]
+		}
+
+		async fn pull(
+			&self,
+			binding: &PromptSlotBinding,
+			_context: &PromptPullContext,
+		) -> Result<PromptContributionRecord, PromptDispatchError> {
+			Ok(PromptContributionRecord {
+				binding:   binding.clone(),
+				content:   self.content.read().clone(),
+				truncated: false,
+			})
+		}
+	}
+
+	fn binding() -> PromptSlotBinding {
+		PromptSlotBinding {
+			key:          sf!("dev.example.policy"),
+			owner:        sf!("dev.example"),
+			slot:         SlotId::Policy,
+			class:        SlotClass::Stable,
+			priority:     10,
+			budget_bytes: 64,
+		}
+	}
+
+	fn head() -> ProductionPromptHead {
+		let binding = binding();
+		ProductionPromptHead::new(vec![SlotDecl {
+			slot:     binding.slot,
+			class:    binding.class,
+			owner:    binding.owner,
+			priority: binding.priority,
+		}])
+	}
+
+	fn context() -> PromptPullContext {
+		PromptPullContext {
+			session_id:     sf!("session"),
+			model:          sf!("model"),
+			provider:       sf!("provider"),
+			context_window: 128_000,
+			epoch:          0,
+			cwd:            sf!("/workspace"),
+			roots:          vec![sf!("/workspace")],
+			vcs_branch:     None,
+			vcs_commit:     None,
+			is_subagent:    false,
+			agent_kind:     None,
+		}
+	}
+
+	fn band_text(source: &dyn PromptSource, class: SlotClass) -> String {
+		let bands = source
+			.banded_items_render(&Props::default())
+			.expect("render")
+			.expect("banded");
+		bands.items[class as usize]
+			.iter()
+			.filter_map(|item| match item.kind.as_ref()? {
+				item::Kind::Message(message) => Some(message),
+				_ => None,
+			})
+			.flat_map(|message| &message.parts)
+			.filter_map(|part| match part.kind.as_ref()? {
+				part::Kind::Text(text) => Some(text.as_str()),
+				_ => None,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn installed_contribution_renders_only_in_declared_band() {
+		let head = head();
+		head
+			.install(PromptContributionRecord {
+				binding:   binding(),
+				content:   sf!("EXTENSION POLICY"),
+				truncated: false,
+			})
+			.expect("install");
+		let base = CanonicalPromptSource
+			.banded_items_render(&Props::default())
+			.expect("base render")
+			.expect("base bands");
+		let source = head.wrap_prompt_source(Arc::new(CanonicalPromptSource));
+		let contributed = source
+			.banded_items_render(&Props::default())
+			.expect("contributed render")
+			.expect("contributed bands");
+		assert_eq!(
+			contributed.hashes[SlotClass::Frozen as usize],
+			base.hashes[SlotClass::Frozen as usize],
+		);
+		assert!(band_text(source.as_ref(), SlotClass::Stable).contains("EXTENSION POLICY"));
+		assert!(!band_text(source.as_ref(), SlotClass::Frozen).contains("EXTENSION POLICY"));
+	}
+
+	#[tokio::test]
+	async fn invalidation_pulls_fresh_content_before_advancing_generation() {
+		let head = head();
+		let provider = Arc::new(Provider {
+			binding: binding(),
+			content: RwLock::new(sf!("PROMPT_SLOT_OLD_SENTINEL")),
+		});
+		head.bind_provider(provider.clone());
+		head.activate(context()).await.expect("activate");
+		let source = head.wrap_prompt_source(Arc::new(CanonicalPromptSource));
+		assert!(band_text(source.as_ref(), SlotClass::Stable).contains("PROMPT_SLOT_OLD_SENTINEL"),);
+		*provider.content.write() = sf!("PROMPT_SLOT_NEW_SENTINEL");
+		assert_eq!(
+			head
+				.invalidate("dev.example", 7, "policy")
+				.await
+				.expect("invalidate"),
+			1
+		);
+		let rendered = band_text(source.as_ref(), SlotClass::Stable);
+		assert!(rendered.contains("PROMPT_SLOT_NEW_SENTINEL"));
+		assert!(!rendered.contains("PROMPT_SLOT_OLD_SENTINEL"));
 	}
 }

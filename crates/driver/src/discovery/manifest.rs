@@ -42,6 +42,8 @@ use super::native::scan_capability_dir;
 pub enum CapabilityKind {
 	/// Markdown skill content.
 	Skills,
+	/// Named terminal themes shipped as JSON resources.
+	Themes,
 	/// Declarative rules and constraints.
 	Rules,
 	/// Native Model Context Protocol server declarations.
@@ -210,6 +212,16 @@ pub struct CapabilityProvenance {
 pub struct SkillFrontmatter {
 	/// Optional declared description.
 	pub description:              Option<Str>,
+	/// Optional license name or path to a bundled license file.
+	pub license:                  Option<Str>,
+	/// Optional environment compatibility requirements.
+	pub compatibility:            Option<Str>,
+	/// Arbitrary author metadata retained from the skill declaration.
+	#[serde(default)]
+	pub metadata:                 BTreeMap<Str, serde_json::Value>,
+	/// Pre-approved tool names declared by the experimental Agent Skills field.
+	#[serde(default)]
+	pub allowed_tools:            Vec<Str>,
 	/// Optional file applicability globs.
 	#[serde(default)]
 	pub globs:                    Vec<Str>,
@@ -235,7 +247,7 @@ pub struct SkillPayload {
 	pub content:      Str,
 	/// Typed frontmatter.
 	#[serde(default)]
-	pub frontmatter:  SkillFrontmatter,
+	pub frontmatter:  Arc<SkillFrontmatter>,
 	/// Optional containment root for packaged resources.
 	pub contain_root: Option<PathBuf>,
 }
@@ -688,6 +700,16 @@ pub struct AgentPayload {
 	/// Markdown declaration body.
 	pub content: Str,
 }
+/// Named JSON theme retained for the presentation owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ThemePayload {
+	/// Theme name declared by the JSON resource.
+	pub name:    Str,
+	/// Canonical theme file path.
+	pub path:    PathBuf,
+	/// Exact JSON source, frozen with the discovery snapshot.
+	pub content: Str,
+}
 
 /// Typed capability declaration payload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -695,6 +717,8 @@ pub struct AgentPayload {
 pub enum CapabilityPayload {
 	/// Skill declaration.
 	Skills(SkillPayload),
+	/// Named JSON theme declaration.
+	Themes(ThemePayload),
 	/// Rule declaration.
 	Rules(RulePayload),
 	/// MCP declaration.
@@ -732,6 +756,7 @@ impl CapabilityPayload {
 	pub const fn kind(&self) -> CapabilityKind {
 		match self {
 			Self::Skills(_) => CapabilityKind::Skills,
+			Self::Themes(_) => CapabilityKind::Themes,
 			Self::Rules(_) => CapabilityKind::Rules,
 			Self::Mcps(_) => CapabilityKind::Mcps,
 			Self::ContextFiles(_) => CapabilityKind::ContextFiles,
@@ -773,6 +798,7 @@ impl CapabilityPayload {
 		};
 		match self {
 			Self::Skills(value) => missing_name(&value.name).or_else(|| missing_path(&value.path)),
+			Self::Themes(value) => missing_name(&value.name).or_else(|| missing_path(&value.path)),
 			Self::Rules(value) => missing_name(&value.name).or_else(|| missing_path(&value.path)),
 			Self::Mcps(value) => missing_name(&value.name)
 				.or_else(|| {
@@ -942,6 +968,127 @@ pub struct AgentDiscovery {
 	pub definitions: Vec<(Str, omp_agent::AgentDefinition)>,
 	/// Malformed definitions skipped without aborting discovery.
 	pub warnings:    Vec<AgentDiscoveryWarning>,
+}
+/// Extension-packaged themes plus non-fatal malformed-resource diagnostics.
+#[derive(Debug, Default)]
+pub struct ThemeDiscovery {
+	/// First-wins named theme declarations in manifest order.
+	pub declarations: Vec<DiscoveredCapability>,
+	/// Theme files or rows skipped during discovery.
+	pub warnings:     Vec<ThemeDiscoveryWarning>,
+}
+
+/// One rejected extension-packaged theme row or file.
+#[derive(Debug)]
+pub struct ThemeDiscoveryWarning {
+	/// Manifest path or concrete file associated with the warning.
+	pub path: PathBuf,
+	/// Typed warning reason.
+	pub kind: ThemeDiscoveryWarningKind,
+}
+
+/// Typed extension theme discovery warning.
+#[derive(Debug, thiserror::Error)]
+pub enum ThemeDiscoveryWarningKind {
+	/// The row omitted a distribution-relative theme path.
+	#[error("theme manifest row has no path")]
+	MissingPath,
+	/// The row path was absolute, traversing, or escaped through a link.
+	#[error("theme manifest path escapes its package")]
+	EscapingPath,
+	/// The theme file could not be read.
+	#[error("theme file could not be read")]
+	Io(#[source] io::Error),
+	/// The theme JSON was malformed.
+	#[error("theme file could not be parsed")]
+	Parse(#[source] serde_json::Error),
+	/// The theme JSON omitted its registry name.
+	#[error("theme file has no name")]
+	MissingName,
+}
+
+#[derive(Deserialize)]
+struct ThemeIdentity {
+	name: Option<String>,
+}
+
+/// Loads selected `themes` rows as inert, package-contained JSON resources.
+pub fn discover_manifest_themes(
+	extension_id: &Str,
+	package_root: &Path,
+	rows: &[omp_ext::config::StaticDeclaration],
+) -> ThemeDiscovery {
+	let mut output = ThemeDiscovery::default();
+	let mut claimed = BTreeSet::new();
+	for row in rows.iter().filter(|row| row.kind == "themes") {
+		let Some(declared_path) = row.path.as_deref() else {
+			output.warnings.push(ThemeDiscoveryWarning {
+				path: package_root.to_path_buf(),
+				kind: ThemeDiscoveryWarningKind::MissingPath,
+			});
+			continue;
+		};
+		let paths = match theme_files(package_root, declared_path) {
+			Ok(paths) => paths,
+			Err(kind) => {
+				output
+					.warnings
+					.push(ThemeDiscoveryWarning { path: package_root.join(declared_path), kind });
+				continue;
+			},
+		};
+		for path in paths {
+			let content = match fs::read_to_string(&path) {
+				Ok(content) => content,
+				Err(source) => {
+					output.warnings.push(ThemeDiscoveryWarning {
+						path,
+						kind: ThemeDiscoveryWarningKind::Io(source),
+					});
+					continue;
+				},
+			};
+			let identity = match serde_json::from_str::<ThemeIdentity>(&content) {
+				Ok(identity) => identity,
+				Err(source) => {
+					output.warnings.push(ThemeDiscoveryWarning {
+						path,
+						kind: ThemeDiscoveryWarningKind::Parse(source),
+					});
+					continue;
+				},
+			};
+			let Some(name) = identity
+				.name
+				.as_deref()
+				.map(str::trim)
+				.filter(|name| !name.is_empty())
+			else {
+				output
+					.warnings
+					.push(ThemeDiscoveryWarning { path, kind: ThemeDiscoveryWarningKind::MissingName });
+				continue;
+			};
+			let key = Str::new(name);
+			if !claimed.insert(key.clone()) {
+				continue;
+			}
+			let mut source =
+				SourceProvenance::native(extension_id.clone(), path.clone(), SourceScope::Package);
+			source.read_only = true;
+			source.installed_package_id = Some(extension_id.clone());
+			output.declarations.push(DiscoveredCapability::keyed(
+				key.clone(),
+				CapabilityPayload::Themes(ThemePayload {
+					name: key,
+					path,
+					content: Str::from(content),
+				}),
+				source,
+			));
+		}
+	}
+	output
 }
 
 /// Loads manifest-declared agent directories through the common static
@@ -1175,6 +1322,62 @@ pub fn enabled_agents<'a>(
 		})
 }
 
+fn theme_files(
+	package_root: &Path,
+	declared_path: &str,
+) -> Result<Vec<PathBuf>, ThemeDiscoveryWarningKind> {
+	let relative = Path::new(declared_path);
+	if declared_path.contains('\\')
+		|| relative.is_absolute()
+		|| relative.components().any(|component| {
+			matches!(
+				component,
+				std::path::Component::ParentDir
+					| std::path::Component::RootDir
+					| std::path::Component::Prefix(_)
+			)
+		}) {
+		return Err(ThemeDiscoveryWarningKind::EscapingPath);
+	}
+	let package_root = fs::canonicalize(package_root).map_err(ThemeDiscoveryWarningKind::Io)?;
+	if !declared_path.contains(['*', '?']) {
+		let path =
+			fs::canonicalize(package_root.join(relative)).map_err(ThemeDiscoveryWarningKind::Io)?;
+		return path
+			.starts_with(&package_root)
+			.then(|| vec![path])
+			.ok_or(ThemeDiscoveryWarningKind::EscapingPath);
+	}
+	let prefix = declared_path
+		.find(['*', '?'])
+		.map_or(declared_path, |wildcard| &declared_path[..wildcard]);
+	let prefix = Path::new(prefix);
+	let scan_root = if prefix.extension().is_some() {
+		prefix.parent().unwrap_or_else(|| Path::new(""))
+	} else {
+		prefix
+	};
+	let scan_root =
+		fs::canonicalize(package_root.join(scan_root)).map_err(ThemeDiscoveryWarningKind::Io)?;
+	if !scan_root.starts_with(&package_root) {
+		return Err(ThemeDiscoveryWarningKind::EscapingPath);
+	}
+	let mut paths = scan_capability_dir(&scan_root)
+		.into_iter()
+		.filter(|path| path.extension().and_then(ffi::OsStr::to_str) == Some("json"))
+		.filter(|path| path.starts_with(&package_root))
+		.filter(|path| {
+			path
+				.strip_prefix(&package_root)
+				.ok()
+				.map(|relative| relative.to_string_lossy().replace('\\', "/"))
+				.is_some_and(|relative| glob_matches(declared_path, &relative))
+		})
+		.collect::<Vec<_>>();
+	paths.sort();
+	Ok(paths)
+}
+
 fn agent_files(declaration: &CapabilityDeclaration) -> Vec<PathBuf> {
 	let root = &declaration.root;
 	if root.is_file() {
@@ -1332,6 +1535,7 @@ mod tests {
 	fn every_canonical_kind_round_trips() {
 		for kind in [
 			CapabilityKind::Skills,
+			CapabilityKind::Themes,
 			CapabilityKind::Rules,
 			CapabilityKind::Mcps,
 			CapabilityKind::ContextFiles,

@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use flume::Receiver;
 use futures::StreamExt as _;
 use omp_agent::{
-	Agent, AgentKind, AgentNode, AgentSnapshot, AgentState, AgentStatus, AgentTree, Budget,
-	ChildKind, CompletionError, CompletionRequest, EntryKindDecl, Journal, JournalAuthor,
+	AbortHandle, Agent, AgentKind, AgentNode, AgentPhase, AgentSnapshot, AgentState, AgentStatus,
+	AgentTree, ApprovalRoute, Budget, ChildKind, CompletionError, CompletionRequest, EntryKindDecl,
+	EventBus, GateEvent, GateOutcome, HookEvent, HookGate, Journal, JournalAuthor,
 	JournalGenerations, JournalRequestStamp, MAX_YIELD_SCHEMA_RETRIES, PromptFacts, RegistryStatus,
 	SubagentDisposition, SubagentLifecycle, SubagentProgressSnapshot, SubagentRunState,
 	SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId, TurnInput, TurnOptions,
@@ -31,7 +32,7 @@ use omp_catalog::{
 	AuthSpecKind, GrammarBits, ThinkingEffort, model::ProvenanceKind, settings::ModelSettings,
 	snapshot,
 };
-use omp_core::{ExposeSecret as _, Str, sf};
+use omp_core::{EnvPath, ExposeSecret as _, Str, sf};
 use omp_envd::{
 	eval::{
 		BridgeHostError, ParentSessionHost,
@@ -249,6 +250,75 @@ pub const CHAT_CAPS_BASE: CapsBase = CapsBase {
 	model_class:        ModelClass::Standard,
 };
 const DEFAULT_EVAL_CONCURRENCY_LIMIT: usize = omp_agent::DEFAULT_MAX_CONCURRENCY;
+struct ModelChangedHookEvent {
+	payload: bytes::Bytes,
+}
+
+impl HookEvent for ModelChangedHookEvent {
+	type Return = ();
+
+	const ID: omp_proto::toolhost::v1::HookEventId =
+		omp_proto::toolhost::v1::HookEventId::HookEventModelChanged;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut bytes::BytesMut) {
+		out.extend_from_slice(&self.payload);
+	}
+
+	fn apply(&mut self, _: &omp_agent::HookPatch) -> Result<(), omp_agent::GateError> {
+		Ok(())
+	}
+}
+fn emit_model_changed(
+	gate: &HookGate,
+	from_model: Option<&JournalModelRef>,
+	to_model: &JournalModelRef,
+	previous_thinking: Option<Effort>,
+	thinking: Option<Effort>,
+	role: &str,
+	reason: &'static str,
+) {
+	if !gate.subscribed(ModelChangedHookEvent::ID) {
+		return;
+	}
+	let model = |model: &JournalModelRef| {
+		json!({
+			"provider": model.provider.0,
+			"api": model.api,
+			"model": model.model.0,
+		})
+	};
+	let payload = json!({
+		"from_model": from_model.map(model),
+		"to_model": model(to_model),
+		"previous_thinking": previous_thinking.and_then(portable_thinking_name),
+		"thinking": thinking.and_then(portable_thinking_name),
+		"role": role,
+		"reason": reason,
+	});
+	if let Ok(payload) = serde_json::to_vec(&payload) {
+		gate.notify(&ModelChangedHookEvent { payload: bytes::Bytes::from(payload) });
+	}
+}
+const fn portable_thinking_effort(effort: Effort) -> Option<ThinkingEffort> {
+	match effort {
+		Effort::Off => Some(ThinkingEffort::Off),
+		Effort::Minimal => Some(ThinkingEffort::Minimal),
+		Effort::Low => Some(ThinkingEffort::Low),
+		Effort::Medium => Some(ThinkingEffort::Medium),
+		Effort::High => Some(ThinkingEffort::High),
+		Effort::Xhigh => Some(ThinkingEffort::XHigh),
+		Effort::Max => Some(ThinkingEffort::Max),
+		Effort::Unspecified => None,
+	}
+}
+fn portable_thinking_name(effort: Effort) -> Option<&'static str> {
+	portable_thinking_effort(effort).map(Into::into)
+}
+
+tokio::task_local! {
+	static SUBAGENT_ADMISSION_COMPLETE: bool;
+}
 
 /// Failures while resolving or running one durable project-chat session.
 #[derive(Debug, Error)]
@@ -320,6 +390,9 @@ pub enum ChatError {
 	/// The project environment authority failed to start or connect.
 	#[error(transparent)]
 	Environment(#[from] omp_envd::EnvdError),
+	/// Eager extension prompt contributions could not be activated.
+	#[error(transparent)]
+	PromptActivation(#[from] rulebook::PromptInvalidationError),
 	/// The in-process turn authority could not be constructed.
 	#[error(transparent)]
 	TurnClient(#[from] omp_agent::Error),
@@ -851,15 +924,55 @@ pub struct ChatParentHost<C: TurnClient + Clone + Send + 'static> {
 	revival: Mutex<BTreeMap<Str, flume::Sender<omp_agent::RevivalRequest>>>,
 	inboxes: Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
 	controls: Arc<Mutex<BTreeMap<Str, AgentLoopControls>>>,
+	extension_reload: Mutex<Option<omp_envd::ExtensionReloadHandle>>,
+	shutdown: tokio::sync::watch::Sender<Option<Str>>,
 	discovery_model_settings: Mutex<Option<discovery::PromptDiscoverySettings>>,
 	auto_thinking: Mutex<AutoThinkingSettings>,
 	difficulty_classifier: omp_inference::DifficultyClassifier,
+	admission_gate: Mutex<Arc<HookGate>>,
+	spawn_approval: Mutex<Option<ApprovalRoute>>,
 }
 /// Live request handles into one agent loop, bound per owning session.
 #[derive(Clone)]
 struct AgentLoopControls {
 	host:    omp_agent::AgentHostControl,
 	control: omp_agent::ControlSender,
+	abort:   AbortHandle,
+	events:  EventBus,
+}
+
+#[cfg(test)]
+static SUBAGENT_SPAWN_PAYLOADS: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static SUBAGENT_SPAWN_DENIAL_JOURNALS: std::sync::atomic::AtomicUsize =
+	std::sync::atomic::AtomicUsize::new(0);
+
+fn spawn_policy_denied(
+	reason: Str,
+	code: &'static str,
+	decision_id: Str,
+) -> omp_tool::PolicyDenied {
+	omp_tool::PolicyDenied {
+		reason,
+		code: Some(Str::new_static(code)),
+		decision_id,
+		rules: Arc::from([]),
+	}
+}
+
+fn spawn_policy_error(denial: omp_tool::PolicyDenied) -> ControlProtocolError {
+	let rules = denial
+		.rules
+		.iter()
+		.map(|rule| json!({"id": rule}))
+		.collect::<Vec<_>>();
+	ControlProtocolError::new("PolicyDenied", denial.reason.clone()).with_details(json!({
+		"reason": denial.reason,
+		"code": denial.code.as_deref().unwrap_or("policy_denied"),
+		"decision_id": denial.decision_id,
+		"rules": rules,
+	}))
 }
 
 struct EvalRunCancelGuard<C: TurnClient + Clone + Send + 'static> {
@@ -911,6 +1024,7 @@ struct ProductionChildReviver<C: TurnClient + Clone + Send + 'static> {
 	inboxes:                  Arc<Mutex<BTreeMap<Str, hub_backend::SharedBrokerInbox>>>,
 	controls:                 Arc<Mutex<BTreeMap<Str, AgentLoopControls>>>,
 	discovery_model_settings: Option<discovery::PromptDiscoverySettings>,
+	hook_gate:                Arc<HookGate>,
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -950,6 +1064,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 		let inboxes = Arc::clone(&self.inboxes);
 		let controls = Arc::clone(&self.controls);
 		let discovery_model_settings = self.discovery_model_settings.clone();
+		let hook_gate = Arc::clone(&self.hook_gate);
 		Box::pin(async move {
 			let isolated_environment = if let Some(state) = isolated_state {
 				Some(
@@ -1012,9 +1127,12 @@ impl<C: TurnClient + Clone + Send + 'static> ChildReviver<C> for ProductionChild
 				journal,
 				CHAT_CAPS_BASE,
 			);
+			child.set_hook_gate(hook_gate);
 			controls.lock().insert(node.id.clone(), AgentLoopControls {
 				host:    child.host_control(),
 				control: child.control(),
+				abort:   child.abort_handle(),
+				events:  child.events().clone(),
 			});
 			child.set_ttsr_registry(ttsr);
 			let control_binding = if let Some(environment) = &isolated_environment {
@@ -1123,6 +1241,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			tracing::warn!(error = %error, "could not reserve historical subagent artifact names");
 		}
 		let supervisor = Arc::new(SessionSupervisor::new(Arc::clone(&tree)));
+		let (shutdown, _) = tokio::sync::watch::channel(None);
 		Self {
 			client,
 			env,
@@ -1146,9 +1265,13 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			revival: Mutex::new(BTreeMap::new()),
 			inboxes: Arc::new(Mutex::new(BTreeMap::new())),
 			controls: Arc::new(Mutex::new(BTreeMap::new())),
+			extension_reload: Mutex::new(None),
+			shutdown,
 			discovery_model_settings: Mutex::new(None),
 			auto_thinking: Mutex::new(AutoThinkingSettings::default()),
 			difficulty_classifier: omp_inference::DifficultyClassifier::new(),
+			admission_gate: Mutex::new(Arc::new(HookGate::channel().0)),
+			spawn_approval: Mutex::new(None),
 		}
 	}
 
@@ -1179,11 +1302,93 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		owner: Str,
 		host: omp_agent::AgentHostControl,
 		control: omp_agent::ControlSender,
+		abort: AbortHandle,
+		events: EventBus,
 	) {
 		self
 			.controls
 			.lock()
-			.insert(owner, AgentLoopControls { host, control });
+			.insert(owner, AgentLoopControls { host, control, abort, events });
+	}
+
+	/// Binds the supervised extension-generation replacement authority.
+	pub fn bind_extension_reload(&self, reload: omp_envd::ExtensionReloadHandle) {
+		*self.extension_reload.lock() = Some(reload);
+	}
+
+	fn main_controls(&self) -> Option<AgentLoopControls> {
+		let session = self.session_id();
+		self.controls.lock().get(session.as_str()).cloned()
+	}
+
+	fn abort_main(&self) -> Result<(), ControlProtocolError> {
+		let controls = self.main_controls().ok_or_else(|| {
+			ControlProtocolError::new("AgentsOwnerUnavailable", "main agent loop is unavailable")
+		})?;
+		controls.abort.abort();
+		Ok(())
+	}
+
+	/// Returns whether the main agent loop is waiting for work.
+	pub fn is_idle(&self) -> bool {
+		self
+			.main_controls()
+			.is_none_or(|controls| controls.events.phase() == AgentPhase::Idle)
+	}
+
+	/// Waits until the main agent loop is waiting for work.
+	pub async fn wait_for_idle(&self) {
+		let Some(controls) = self.main_controls() else {
+			return;
+		};
+		let events = controls.events.subscribe_lossless();
+		if controls.events.phase() == AgentPhase::Idle {
+			return;
+		}
+		while let Ok(event) = events.recv().await {
+			if matches!(event.as_ref(), omp_agent::AgentEvent::PhaseChanged {
+				to: AgentPhase::Idle,
+				..
+			}) {
+				return;
+			}
+		}
+	}
+
+	fn request_shutdown(&self, reason: Str) {
+		if !reason.is_empty() {
+			tracing::info!(reason = %reason, "extension requested graceful session shutdown");
+		}
+		self.shutdown.send_if_modified(|pending| {
+			if pending.is_some() {
+				false
+			} else {
+				*pending = Some(reason);
+				true
+			}
+		});
+	}
+
+	/// Waits for an extension-authorized graceful session shutdown request.
+	pub async fn wait_for_shutdown(&self) -> Str {
+		let mut shutdown = self.shutdown.subscribe();
+		loop {
+			if let Some(reason) = shutdown.borrow_and_update().clone() {
+				return reason;
+			}
+			if shutdown.changed().await.is_err() {
+				return Str::default();
+			}
+		}
+	}
+
+	fn extension_reload(&self) -> Result<omp_envd::ExtensionReloadHandle, ControlProtocolError> {
+		self.extension_reload.lock().clone().ok_or_else(|| {
+			ControlProtocolError::new(
+				"AgentsOwnerUnavailable",
+				"extension reload authority is unavailable",
+			)
+		})
 	}
 
 	fn host_control(&self, owner: &str) -> Option<omp_agent::AgentHostControl> {
@@ -1236,12 +1441,426 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 	}
 
 	/// Binds the live extension-backed admission gate for driver-owned events.
+	pub fn bind_admission_gate(&self, gate: Arc<HookGate>) {
+		self.supervisor.bind_hook_gate(Arc::clone(&gate));
+		*self.admission_gate.lock() = gate;
+	}
+
+	async fn admit_driver_event(
+		&self,
+		event_id: omp_proto::toolhost::v1::HookEventId,
+		event_name: &'static str,
+		build: impl FnOnce() -> Value,
+	) -> Result<Option<Value>, omp_tool::PolicyDenied> {
+		let gate = Arc::clone(&self.admission_gate.lock());
+		if !gate.subscribed(event_id) {
+			return Ok(None);
+		}
+		let mut payload = build();
+		let encoded = serde_json::to_vec(&payload).map_err(|_| {
+			spawn_policy_denied(
+				sf!("hook payload serialization failed"),
+				"hook.invalid_payload",
+				Str::from(omp_core::Ulid::generate().to_string()),
+			)
+		})?;
+		let outcome = gate
+			.gate(event_id, GateEvent::new(sf!(event_name), bytes::Bytes::from(encoded)))
+			.await;
+		let (event, transformed) = match outcome {
+			GateOutcome::Allow { event, trail } => (event, !trail.is_empty()),
+			GateOutcome::Deny { reason, policy, .. } => {
+				return Err(
+					policy
+						.map(|policy| omp_tool::PolicyDenied::clone(&policy))
+						.unwrap_or_else(|| {
+							spawn_policy_denied(
+								reason,
+								"policy_denied",
+								Str::from(omp_core::Ulid::generate().to_string()),
+							)
+						}),
+				);
+			},
+			GateOutcome::Approval { event, specs, .. } => {
+				let Some(route) = self.spawn_approval.lock().clone() else {
+					return Err(spawn_policy_denied(
+						sf!("approval route is unavailable"),
+						"approval.unavailable",
+						Str::from(omp_core::Ulid::generate().to_string()),
+					));
+				};
+				let invocation_id = Str::from(omp_core::Ulid::generate().to_string());
+				let ticket = route.request(Some(invocation_id), specs, now_ms()).await;
+				if !ticket
+					.decision
+					.as_ref()
+					.is_some_and(|decision| decision.approved)
+				{
+					let reason = ticket
+						.decision
+						.as_ref()
+						.and_then(|decision| decision.reason.clone())
+						.unwrap_or_else(|| sf!("approval was denied"));
+					return Err(spawn_policy_denied(reason, "approval.denied", ticket.ticket_id));
+				}
+				(event, true)
+			},
+		};
+		if transformed {
+			let patch = serde_json::from_slice::<Value>(&event.effective_args)
+				.ok()
+				.and_then(|value| value.as_object().cloned())
+				.ok_or_else(|| {
+					spawn_policy_denied(
+						sf!("hook transform returned a malformed patch"),
+						"hook.invalid_transform",
+						Str::from(omp_core::Ulid::generate().to_string()),
+					)
+				})?;
+			let target = payload.as_object_mut().ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("hook event payload is not an object"),
+					"hook.invalid_payload",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?;
+			for (field, value) in patch {
+				target.insert(field, value);
+			}
+		}
+		Ok(Some(payload))
+	}
+
 	/// Gates one user submission before it reaches the journal or mailbox.
+	pub async fn admit_user_input(
+		&self,
+		items: &mut [Item],
+		source: &'static str,
+		pasted: bool,
+	) -> Result<(), omp_tool::PolicyDenied> {
+		let event_id = omp_proto::toolhost::v1::HookEventId::HookEventUserInput;
+		if !self.admission_gate.lock().subscribed(event_id) {
+			return Ok(());
+		}
+		let Some(message) = items.iter().find_map(|item| {
+			let item::Kind::Message(message) = item.kind.as_ref()? else {
+				return None;
+			};
+			(message.role == i32::from(Role::User)).then_some(message)
+		}) else {
+			return Ok(());
+		};
+		let text = message
+			.parts
+			.iter()
+			.find_map(|part| {
+				let part::Kind::Text(text) = part.kind.as_ref()? else {
+					return None;
+				};
+				Some(text.clone())
+			})
+			.unwrap_or_default();
+		let images = message
+			.parts
+			.iter()
+			.filter_map(|part| {
+				let part::Kind::Blob(blob) = part.kind.as_ref()? else {
+					return None;
+				};
+				Some(json!({
+					"hash": omp_core::hex::encode(blob.hash.as_ref()).to_string(),
+					"size": blob.size,
+				}))
+			})
+			.collect::<Vec<_>>();
+		let original_images = images.len();
+		let session_id = self.session_id();
+		let Some(payload) = self
+			.admit_driver_event(event_id, "user_input", || {
+				json!({
+					"text": text,
+					"images": images,
+					"source": source,
+					"session_id": session_id,
+					"pasted": pasted,
+				})
+			})
+			.await?
+		else {
+			return Ok(());
+		};
+		let transformed_text = payload
+			.get("text")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("user_input transform omitted text"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?
+			.to_owned();
+		let transformed_images =
+			payload
+				.get("images")
+				.and_then(Value::as_array)
+				.ok_or_else(|| {
+					spawn_policy_denied(
+						sf!("user_input transform returned invalid images"),
+						"hook.invalid_transform",
+						Str::from(omp_core::Ulid::generate().to_string()),
+					)
+				})?;
+		let Some(message) = items.iter_mut().find_map(|item| {
+			let item::Kind::Message(message) = item.kind.as_mut()? else {
+				return None;
+			};
+			(message.role == i32::from(Role::User)).then_some(message)
+		}) else {
+			return Ok(());
+		};
+		if let Some(text) = message.parts.iter_mut().find_map(|part| {
+			let part::Kind::Text(text) = part.kind.as_mut()? else {
+				return None;
+			};
+			Some(text)
+		}) {
+			*text = transformed_text;
+		} else {
+			message
+				.parts
+				.insert(0, Part { kind: Some(part::Kind::Text(transformed_text)) });
+		}
+		for image in transformed_images.iter().skip(original_images) {
+			let Some(hash) = image.get("hash").and_then(Value::as_str) else {
+				continue;
+			};
+			let Ok(hash) = omp_core::hex::decode(hash).into_vec() else {
+				continue;
+			};
+			let Some(size) = image.get("size").and_then(Value::as_u64) else {
+				continue;
+			};
+			message.parts.push(Part {
+				kind: Some(part::Kind::Blob(v1::Blob {
+					hash: hash.into(),
+					size,
+					detail: v1::blob::Detail::Auto as i32,
+					..v1::Blob::default()
+				})),
+			});
+		}
+		Ok(())
+	}
+
 	/// Gates one direct user shell command and returns its effective fields.
+	pub async fn admit_user_bash(
+		&self,
+		command: &str,
+		cwd: &Path,
+		exclude_from_context: bool,
+	) -> Result<(Str, EnvPath, BTreeMap<String, Option<String>>), omp_tool::PolicyDenied> {
+		let event_id = omp_proto::toolhost::v1::HookEventId::HookEventUserBash;
+		let root = self.context.lock().root.clone();
+		let Some(payload) = self
+			.admit_driver_event(event_id, "user_bash", || {
+				json!({
+					"command": command,
+					"cwd": cwd.to_string_lossy(),
+					"exclude_from_context": exclude_from_context,
+					"bash": omp_envd::policy::user_bash_ir(command, cwd, &root),
+					"env_overrides": {},
+				})
+			})
+			.await?
+		else {
+			let cwd = EnvPath::new(Str::from(cwd.to_string_lossy().as_ref())).map_err(|_| {
+				spawn_policy_denied(
+					sf!("user_bash cwd is not an environment path"),
+					"hook.invalid_payload",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?;
+			return Ok((Str::new(command), cwd, BTreeMap::new()));
+		};
+		let command = payload
+			.get("command")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("user_bash transform omitted command"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?;
+		let cwd = payload
+			.get("cwd")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.and_then(|cwd| EnvPath::new(cwd).ok())
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("user_bash transform returned invalid cwd"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?;
+		let env = payload
+			.get("env_overrides")
+			.and_then(Value::as_object)
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("user_bash transform returned invalid env_overrides"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?
+			.iter()
+			.map(|(name, value)| {
+				value
+					.as_str()
+					.map(|value| (name.clone(), Some(value.to_owned())))
+					.or_else(|| value.is_null().then(|| (name.clone(), None)))
+					.ok_or_else(|| {
+						spawn_policy_denied(
+							sf!("user_bash env override must be a string or null"),
+							"hook.invalid_transform",
+							Str::from(omp_core::Ulid::generate().to_string()),
+						)
+					})
+			})
+			.collect::<Result<BTreeMap<_, _>, _>>()?;
+		Ok((command, cwd, env))
+	}
+
 	/// Gates one direct user evaluation and returns its effective code.
-	/// Gates one parsed extension command and returns its effective name and argv.
+	pub async fn admit_user_eval(
+		&self,
+		code: &str,
+		cwd: &Path,
+		exclude_from_context: bool,
+	) -> Result<Str, omp_tool::PolicyDenied> {
+		let Some(payload) = self
+			.admit_driver_event(
+				omp_proto::toolhost::v1::HookEventId::HookEventUserEval,
+				"user_eval",
+				|| {
+					json!({
+						"code": code,
+						"language": "py",
+						"cwd": cwd.to_string_lossy(),
+						"exclude_from_context": exclude_from_context,
+					})
+				},
+			)
+			.await?
+		else {
+			return Ok(Str::new(code));
+		};
+		payload
+			.get("code")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("user_eval transform omitted code"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})
+	}
+
+	/// Gates one parsed extension command and returns its effective name and
+	/// argv.
+	pub async fn admit_command_invoke(
+		&self,
+		name: &str,
+		argv: &[Str],
+		raw: &str,
+		mode: &'static str,
+		source: &'static str,
+	) -> Result<(Str, Vec<Str>), omp_tool::PolicyDenied> {
+		let Some(payload) = self
+			.admit_driver_event(
+				omp_proto::toolhost::v1::HookEventId::HookEventCommandInvoke,
+				"command_invoke",
+				|| {
+					json!({
+						"name": name,
+						"argv": argv,
+						"raw": raw,
+						"mode": mode,
+						"source": source,
+					})
+				},
+			)
+			.await?
+		else {
+			return Ok((Str::new(name), argv.to_vec()));
+		};
+		let name = payload
+			.get("name")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("command_invoke transform omitted name"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?;
+		let argv = payload
+			.get("argv")
+			.and_then(Value::as_array)
+			.ok_or_else(|| {
+				spawn_policy_denied(
+					sf!("command_invoke transform returned invalid argv"),
+					"hook.invalid_transform",
+					Str::from(omp_core::Ulid::generate().to_string()),
+				)
+			})?
+			.iter()
+			.map(|value| {
+				value.as_str().map(Str::new).ok_or_else(|| {
+					spawn_policy_denied(
+						sf!("command_invoke argv must contain strings"),
+						"hook.invalid_transform",
+						Str::from(omp_core::Ulid::generate().to_string()),
+					)
+				})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		Ok((name, argv))
+	}
+
 	/// Observes one committed model selection change.
+	pub fn notify_model_changed(
+		&self,
+		from_model: Option<&JournalModelRef>,
+		to_model: &JournalModelRef,
+		previous_thinking: Option<Effort>,
+		thinking: Option<Effort>,
+		role: &str,
+		reason: &'static str,
+	) {
+		emit_model_changed(
+			self.admission_gate.lock().as_ref(),
+			from_model,
+			to_model,
+			previous_thinking,
+			thinking,
+			role,
+			reason,
+		);
+	}
+
 	/// Binds the durable approval route used by spawn admission.
+	pub fn bind_spawn_approval_route(&self, route: ApprovalRoute) {
+		*self.spawn_approval.lock() = Some(route);
+	}
+
 	/// Replaces the live parent state after a session switch.
 	pub fn update(&self, state: AgentState, session_id: Str) {
 		let mut context = self.context.lock();
@@ -1280,21 +1899,164 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		self.context.lock().session_id.clone()
 	}
 
+	async fn journal_subagent_spawn_denial(
+		&self,
+		owner: &str,
+		invocation_id: &str,
+		denial: &omp_tool::PolicyDenied,
+	) {
+		#[cfg(test)]
+		SUBAGENT_SPAWN_DENIAL_JOURNALS.fetch_add(1, Ordering::Relaxed);
+		let Some(control) = self.host_control(owner) else {
+			tracing::warn!(
+				owner,
+				invocation_id,
+				reason = %denial.reason,
+				"scheduled subagent denial could not reach the journal owner"
+			);
+			return;
+		};
+		if let Err(error) = control
+			.request(
+				"omp.hooks.record_outcome",
+				serde_json::Map::from_iter([
+					(
+						"event_id".to_owned(),
+						Value::from(omp_proto::toolhost::v1::HookEventId::HookEventSubagentSpawn as i32),
+					),
+					("decision".to_owned(), Value::String("deny".to_owned())),
+					("invocation_id".to_owned(), Value::String(invocation_id.to_owned())),
+					("reason".to_owned(), Value::String(denial.reason.to_string())),
+				]),
+			)
+			.await
+		{
+			tracing::warn!(
+				owner,
+				invocation_id,
+				%error,
+				"scheduled subagent denial could not be journaled"
+			);
+		}
+	}
+
+	async fn admit_subagent_spawn(
+		&self,
+		invocation_id: &str,
+		caller: &str,
+		spec: &Value,
+	) -> Result<(), omp_tool::PolicyDenied> {
+		let gate = Arc::clone(&self.admission_gate.lock());
+		if !gate.subscribed(omp_proto::toolhost::v1::HookEventId::HookEventSubagentSpawn) {
+			return Ok(());
+		}
+		let Some(parent) = self.tree().node(caller) else {
+			return Ok(());
+		};
+		let depth = parent.depth.saturating_add(1);
+		let limits = self.tree().limits();
+		let remaining_concurrency = (limits.max_concurrency != 0)
+			.then(|| limits.max_concurrency.saturating_sub(limits.active));
+		let mut payload = spec.clone();
+		let Some(payload) = payload.as_object_mut() else {
+			return Err(spawn_policy_denied(
+				sf!("subagent specification is not an object"),
+				"policy.invalid_payload",
+				Str::from(omp_core::Ulid::generate().to_string()),
+			));
+		};
+		payload.insert("depth".to_owned(), Value::from(depth));
+		payload.insert(
+			"remaining_concurrency".to_owned(),
+			remaining_concurrency.map_or(Value::Null, Value::from),
+		);
+		#[cfg(test)]
+		SUBAGENT_SPAWN_PAYLOADS.fetch_add(1, Ordering::Relaxed);
+		let encoded = serde_json::to_vec(payload).expect("JSON value encodes");
+		let event = GateEvent::new(sf!("subagent_spawn"), bytes::Bytes::from(encoded));
+		match gate
+			.gate(omp_proto::toolhost::v1::HookEventId::HookEventSubagentSpawn, event)
+			.await
+		{
+			GateOutcome::Allow { .. } => Ok(()),
+			GateOutcome::Deny { reason, policy, .. } => {
+				Err(policy.map(Arc::unwrap_or_clone).unwrap_or_else(|| {
+					spawn_policy_denied(
+						reason,
+						"policy_denied",
+						Str::from(omp_core::Ulid::generate().to_string()),
+					)
+				}))
+			},
+			GateOutcome::Approval { specs, .. } => {
+				let Some(route) = self.spawn_approval.lock().clone() else {
+					return Err(spawn_policy_denied(
+						sf!("spawn approval route is unavailable"),
+						"approval.unavailable",
+						Str::from(omp_core::Ulid::generate().to_string()),
+					));
+				};
+				let ticket = route
+					.request(Some(Str::new(invocation_id)), specs, now_ms())
+					.await;
+				if ticket
+					.decision
+					.as_ref()
+					.is_some_and(|decision| decision.approved)
+				{
+					Ok(())
+				} else {
+					let reason = ticket
+						.decision
+						.as_ref()
+						.and_then(|decision| decision.reason.clone())
+						.unwrap_or_else(|| sf!("subagent spawn approval was denied"));
+					Err(spawn_policy_denied(reason, "approval.denied", ticket.ticket_id))
+				}
+			},
+		}
+	}
+
 	/// Composes one persistent advisor child without starting an inference turn.
 	pub async fn spawn_advisor(&self, spec: AdvisorChildSpec) -> Result<Str, AdvisorChildError> {
 		let context = self.context.lock().clone();
+		let invocation_id = sf!("advisor-spawn:{}:{}", context.session_id, spec.id);
+		let payload = json!({
+			"task": spec.system_prompt.as_str(),
+			"name": spec.display_name.as_str(),
+			"agent": "advisor",
+			"model": spec.model.as_str(),
+			"allowed_devices": &spec.tools,
+			"background": true,
+			"max_depth": 0,
+		});
+		if let Err(denial) = self
+			.admit_subagent_spawn(invocation_id.as_str(), context.session_id.as_str(), &payload)
+			.await
+		{
+			self
+				.journal_subagent_spawn_denial(
+					context.session_id.as_str(),
+					invocation_id.as_str(),
+					&denial,
+				)
+				.await;
+			return Err(AdvisorChildError::PolicyDenied { denial });
+		}
+		let hook_gate = Arc::clone(&self.admission_gate.lock());
 		advisor_child::spawn(
 			AdvisorSpawnContext {
-				client:        self.client.clone(),
-				env:           self.env.clone(),
-				broker:        self.broker.clone(),
-				supervisor:    Arc::clone(&self.supervisor),
-				state:         context.state,
-				session_id:    context.session_id,
-				sessions_dir:  context.sessions_dir,
-				root:          context.root,
+				client: self.client.clone(),
+				env: self.env.clone(),
+				broker: self.broker.clone(),
+				supervisor: Arc::clone(&self.supervisor),
+				state: context.state,
+				session_id: context.session_id,
+				sessions_dir: context.sessions_dir,
+				root: context.root,
 				session_index: context.session_index,
-				tree:          context.tree,
+				tree: context.tree,
+				hook_gate,
 			},
 			&self.advisor_children,
 			spec,
@@ -1646,6 +2408,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 			inboxes: Arc::clone(&self.inboxes),
 			controls: Arc::clone(&self.controls),
 			discovery_model_settings: self.discovery_model_settings.lock().clone(),
+			hook_gate: Arc::clone(&self.admission_gate.lock()),
 		});
 		self.supervisor.register_parked(node, reviver)?;
 		self.ensure_revival_transport(&record.id);
@@ -1956,14 +2719,15 @@ struct SessionInjectionOwner {
 /// Active interactive-session control shared by model mutation, session
 /// creation, and post-switch injection handlers.
 pub struct InteractiveSessionControl {
-	root:         PathBuf,
-	sessions_dir: PathBuf,
-	index:        Arc<SessionIndex>,
-	catalog:      Arc<snapshot::Catalog>,
-	settings:     ModelSettings,
-	state:        AgentState,
-	control:      omp_agent::ControlSender,
-	owners:       Mutex<BTreeMap<Str, SessionInjectionOwner>>,
+	root:           PathBuf,
+	sessions_dir:   PathBuf,
+	index:          Arc<SessionIndex>,
+	catalog:        Arc<snapshot::Catalog>,
+	settings:       ModelSettings,
+	state:          AgentState,
+	control:        omp_agent::ControlSender,
+	admission_gate: Mutex<Option<Arc<HookGate>>>,
+	owners:         Mutex<BTreeMap<Str, SessionInjectionOwner>>,
 }
 
 impl InteractiveSessionControl {
@@ -1986,8 +2750,14 @@ impl InteractiveSessionControl {
 			settings,
 			state,
 			control,
+			admission_gate: Mutex::new(None),
 			owners: Mutex::new(BTreeMap::new()),
 		}
+	}
+
+	/// Binds the live observation gate used by model mutation callbacks.
+	pub fn bind_admission_gate(&self, gate: Arc<HookGate>) {
+		*self.admission_gate.lock() = Some(gate);
 	}
 
 	async fn set_model(
@@ -2012,6 +2782,17 @@ impl InteractiveSessionControl {
 			ControlProtocolError::new("ModelSwitchDenied", error.to_string())
 				.with_details(json!({"model": selector}))
 		})?;
+		if let Some(gate) = self.admission_gate.lock().as_ref() {
+			emit_model_changed(
+				gate,
+				mutation.previous_model.as_ref(),
+				&mutation.model,
+				mutation.previous_thinking,
+				mutation.thinking,
+				"temporary",
+				"user",
+			);
+		}
 		Ok(json!({
 			"provider": mutation.model.provider.0,
 			"api": mutation.model.api,
@@ -2154,6 +2935,41 @@ impl InteractiveSessionControl {
 				)
 				.with_details(json!({"session": session, "reason": "queue"}))
 			})
+	}
+}
+
+fn authorize_agent_operation(
+	context: &control::ControlRequestContext,
+	operation: &str,
+) -> Result<(), ControlProtocolError> {
+	let spec = omp_tool::operation_spec(operation).ok_or_else(|| {
+		ControlProtocolError::new(
+			"invalid_operation",
+			format!("agent operation has no canonical OperationSpec: {operation}"),
+		)
+	})?;
+	let phase_error = if spec.minimum_phase == omp_core::InvocationPhase::EffectsAuthorized {
+		"effects_not_authorized"
+	} else {
+		"invalid_phase"
+	};
+	let invocation = context.invocation.as_ref().ok_or_else(|| {
+		ControlProtocolError::new(phase_error, "agent operation requires an active invocation")
+	})?;
+	if invocation.phase.allows_operation(spec.minimum_phase) {
+		Ok(())
+	} else {
+		Err(
+			ControlProtocolError::new(
+				phase_error,
+				format!("{operation} requires {}", <&'static str>::from(spec.minimum_phase)),
+			)
+			.with_details(json!({
+				"operation": operation,
+				"phase": <&'static str>::from(invocation.phase),
+				"minimum_phase": <&'static str>::from(spec.minimum_phase),
+			})),
+		)
 	}
 }
 
@@ -2854,6 +3670,11 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 				.with_details(json!({"reason": "invalid depth", "field": "max_depth"}))
 			})?;
 		let id = stable_id.unwrap_or_else(|| Str::from(omp_core::Ulid::generate().to_string()));
+		self
+			.parent
+			.admit_subagent_spawn(id.as_str(), caller.as_str(), &spec)
+			.await
+			.map_err(spawn_policy_error)?;
 		let mut bridge = serde_json::Map::new();
 		bridge.insert("prompt".to_owned(), Value::String(task.to_owned()));
 		bridge.insert("stableId".to_owned(), Value::String(id.to_string()));
@@ -2907,12 +3728,16 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		let child_id = id.clone();
 		let result_id = child_id.clone();
 		let mut task = tokio::spawn(async move {
-			let result = ParentSessionHost::agent(
-				parent.as_ref(),
-				Value::Object(bridge),
-				&omp_envd::eval::NoopBridgeProgress,
-			)
-			.await;
+			let result = SUBAGENT_ADMISSION_COMPLETE
+				.scope(
+					true,
+					ParentSessionHost::agent(
+						parent.as_ref(),
+						Value::Object(bridge),
+						&omp_envd::eval::NoopBridgeProgress,
+					),
+				)
+				.await;
 			if let Ok(value) = &result {
 				let _ = parent
 					.supervisor
@@ -3263,7 +4088,18 @@ impl<C: TurnClient + Clone + Send + 'static> AgentsControlAuthority<C> {
 		let caller = Self::caller(context)?;
 		arguments
 			.insert("_owner".to_owned(), Value::String(context.connection.extension.to_string()));
-		let control = self.parent.host_control(caller.as_str()).ok_or_else(|| {
+		self
+			.host_request_to(caller.as_str(), operation, arguments)
+			.await
+	}
+
+	async fn host_request_to(
+		&self,
+		owner: &str,
+		operation: &str,
+		arguments: serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		let control = self.parent.host_control(owner).ok_or_else(|| {
 			ControlProtocolError::new("AgentsError", "calling agent loop is no longer live")
 		})?;
 		control
@@ -3452,6 +4288,12 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 				| "omp.agents.peers"
 				| "omp.agents.inject"
 				| "omp.agents.set_model"
+				| "omp.agents.abort"
+				| "omp.agents.shutdown"
+				| "omp.agents.reload_extensions"
+				| "omp.agents.is_idle"
+				| "omp.agents.wait_for_idle"
+				| "omp.agents.pending_messages"
 				| "omp.agents.rewind_targets"
 				| "omp.agents.rewind"
 				| "omp.agents.snapshot"
@@ -3497,6 +4339,12 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 				Self::require_capability(context, "subagents")?;
 				Self::require_effects_authorized(context)
 			},
+			"omp.agents.abort"
+			| "omp.agents.shutdown"
+			| "omp.agents.reload_extensions"
+			| "omp.agents.is_idle"
+			| "omp.agents.wait_for_idle"
+			| "omp.agents.pending_messages" => authorize_agent_operation(context, operation),
 			"omp.agents.set_model" => authorize_active_model_mutation(context),
 			"omp.agents.broadcast"
 				if arguments.get("scope").and_then(Value::as_str) == Some("project") =>
@@ -3529,6 +4377,43 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 		self.ensure_current()?;
 		match operation.as_str() {
 			"omp.agents.completion" => self.completion(&context, arguments).await,
+			"omp.agents.abort" => {
+				self.parent.abort_main()?;
+				Ok(Value::Null)
+			},
+			"omp.agents.shutdown" => {
+				let reason = match arguments.get("reason") {
+					Some(Value::String(reason)) => Str::new(reason),
+					None => Str::default(),
+					Some(_) => {
+						return Err(ControlProtocolError::new(
+							"InvalidRequest",
+							"shutdown reason must be a string",
+						));
+					},
+				};
+				let parent = Arc::clone(&self.parent);
+				drop(tokio::spawn(async move {
+					tokio::task::yield_now().await;
+					parent.request_shutdown(reason);
+				}));
+				Ok(Value::Null)
+			},
+			"omp.agents.reload_extensions" => {
+				let reload = self.parent.extension_reload()?;
+				drop(tokio::spawn(async move {
+					tokio::task::yield_now().await;
+					if let Err(error) = reload.reload().await {
+						tracing::warn!(%error, "extension-requested hot reload failed");
+					}
+				}));
+				Ok(Value::Null)
+			},
+			"omp.agents.is_idle" => Ok(Value::Bool(self.parent.is_idle())),
+			"omp.agents.wait_for_idle" => {
+				self.parent.wait_for_idle().await;
+				Ok(Value::Null)
+			},
 			"omp.agents.set_model" => {
 				let controls = self.session_control.as_ref().ok_or_else(|| {
 					ControlProtocolError::new(
@@ -3544,6 +4429,11 @@ impl<C: TurnClient + Clone + Send + 'static> ControlAuthority for AgentsControlA
 			| "omp.agents.rewind_targets" => {
 				self
 					.host_request(&context, operation.as_str(), arguments)
+					.await
+			},
+			"omp.agents.pending_messages" => {
+				self
+					.host_request_to(self.expected_session_id.as_str(), operation.as_str(), arguments)
 					.await
 			},
 			"omp.agents.rewind" => {
@@ -4993,6 +5883,37 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 				"security reviewer follow-up must retain its canonical profile",
 			));
 		}
+		let admission_complete = SUBAGENT_ADMISSION_COMPLETE
+			.try_with(|complete| *complete)
+			.unwrap_or(false);
+		if !admission_complete && self.supervisor.state(&id).is_none() {
+			let caller = args
+				.get("_parentId")
+				.and_then(Value::as_str)
+				.unwrap_or(context.session_id.as_str());
+			let merge_mode = if merge {
+				"branch"
+			} else if apply {
+				"patch"
+			} else {
+				"none"
+			};
+			let payload = json!({
+				"task": request.prompt.as_str(),
+				"name": request.name.as_deref(),
+				"agent": request.agent.as_str(),
+				"worktree": isolated,
+				"merge": merge_mode,
+				"background": false,
+				"output_schema": request.output_schema.as_ref(),
+				"schema_mode": request.schema_mode.to_string(),
+				"max_depth": 1,
+			});
+			self
+				.admit_subagent_spawn(id.as_str(), caller, &payload)
+				.await
+				.map_err(|denial| BridgeHostError::PolicyDenied(Arc::new(denial)))?;
+		}
 		progress.progress(json!({
 			"op": "agent",
 			"id": id,
@@ -5288,7 +6209,14 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			journal,
 			CHAT_CAPS_BASE,
 		);
-		self.bind_agent_controls(id.clone(), child.host_control(), child.control());
+		child.set_hook_gate(Arc::clone(&self.admission_gate.lock()));
+		self.bind_agent_controls(
+			id.clone(),
+			child.host_control(),
+			child.control(),
+			child.abort_handle(),
+			child.events().clone(),
+		);
 		child.set_ttsr_registry(child_ttsr);
 		let control_binding = if let Some(environment) = &isolated_environment {
 			let binding = environment
@@ -5349,6 +6277,7 @@ impl<C: TurnClient + Clone + Send + 'static> ParentSessionHost for ChatParentHos
 			inboxes: Arc::clone(&self.inboxes),
 			controls: Arc::clone(&self.controls),
 			discovery_model_settings: self.discovery_model_settings.lock().clone(),
+			hook_gate: Arc::clone(&self.admission_gate.lock()),
 		});
 		self
 			.supervisor
@@ -7152,13 +8081,17 @@ pub fn apply_launch_tool_selection(
 #[derive(Clone, Debug)]
 pub struct ActiveModelMutation {
 	/// Canonical catalog key selected for subsequent turns.
-	pub key:            Str,
+	pub key:               Str,
 	/// Provider/API/model identity returned to extension callers.
-	pub model:          JournalModelRef,
+	pub model:             JournalModelRef,
+	/// Provider/API/model identity replaced by this mutation, when resolvable.
+	pub previous_model:    Option<JournalModelRef>,
 	/// Selected model context-window limit.
-	pub context_window: Option<u64>,
-	/// Explicit reasoning effort applied with the model, when requested.
-	pub thinking:       Option<Effort>,
+	pub context_window:    Option<u64>,
+	/// Effective reasoning effort after the mutation.
+	pub thinking:          Option<Effort>,
+	/// Effective reasoning effort replaced by this mutation.
+	pub previous_thinking: Option<Effort>,
 }
 
 /// Failure produced by the same session model-switch seam used by interactive
@@ -7182,6 +8115,18 @@ pub enum ActiveModelMutationError {
 	Journal(Str),
 }
 
+fn journal_model_ref(catalog: &snapshot::Catalog, selector: &str) -> Option<JournalModelRef> {
+	let spec = catalog
+		.model(omp_catalog::ModelKey::from_ref(selector))
+		.or_else(|| catalog.resolve_alias(selector))?;
+	let route = spec.routes.first().and_then(|route| catalog.route(route))?;
+	Some(JournalModelRef {
+		provider: JournalProviderId(Str::new(route.provider.as_str())),
+		api:      Str::new(route.codec.as_str()),
+		model:    JournalModelId(Str::new(spec.key.as_str())),
+	})
+}
+
 /// Applies one non-durable model/thinking selection to the active interactive
 /// session.
 ///
@@ -7195,6 +8140,14 @@ pub async fn set_active_session_model(
 	selector: &str,
 	thinking: Option<&str>,
 ) -> Result<ActiveModelMutation, ActiveModelMutationError> {
+	let previous = state.snapshot();
+	let previous_model = journal_model_ref(catalog, &previous.turn.params.model);
+	let previous_thinking = previous
+		.turn
+		.params
+		.thinking
+		.as_ref()
+		.and_then(|reasoning| Effort::try_from(reasoning.effort).ok());
 	let role_selector = settings
 		.role_selector(selector)
 		.map(|_| format!("@{selector}"));
@@ -7251,8 +8204,10 @@ pub async fn set_active_session_model(
 	Ok(ActiveModelMutation {
 		key,
 		model,
+		previous_model,
 		context_window: spec.limits.context_window,
-		thinking: effort,
+		thinking: effort.or(previous_thinking),
+		previous_thinking,
 	})
 }
 
@@ -7326,6 +8281,126 @@ mod tests {
 	use omp_storage::transcript::{Event, ItemRecord, TitleSource, Writer};
 
 	use super::*;
+
+	#[test]
+	fn agent_control_operations_follow_canonical_phase_specs() {
+		use omp_core::{ArtifactDigest, InvocationPhase, LifecyclePhase, Principal};
+
+		let identity = Arc::new(ControlConnectionIdentity {
+			extension:          sf!("dev.test"),
+			principal:          Principal::new(sf!("user"), sf!("User")),
+			artifact_digest:    Str::from(ArtifactDigest::new([1; 32]).to_string()),
+			layer:              sf!("workspace"),
+			tier:               sf!("trusted"),
+			trust:              sf!("trusted"),
+			host_generation:    1,
+			session_generation: 1,
+			capabilities:       Arc::new(BTreeSet::new()),
+		});
+		let context_at = |phase| control::ControlRequestContext {
+			connection: Arc::clone(&identity),
+			request_id: 1,
+			invocation: Some(control::ControlInvocationAuthority {
+				invocation: sf!("test"),
+				phase,
+				session: sf!("session"),
+				turn: None,
+				event: None,
+				call: None,
+				device: None,
+				effects: Box::new([]),
+				place_kind: sf!("host"),
+				lifecycle: LifecyclePhase::Active,
+				roots: Box::new([]),
+				remote: false,
+				has_ui: true,
+				headless: false,
+				settings: serde_json::Map::new(),
+				secret_settings: Box::new([]),
+				data: None,
+				direct_filesystem: None,
+			}),
+		};
+		let open = context_at(InvocationPhase::Open);
+		assert!(authorize_agent_operation(&open, "omp.agents.is_idle").is_ok());
+		assert_eq!(
+			authorize_agent_operation(&open, "omp.agents.abort")
+				.expect_err("abort must wait for effect authorization")
+				.code,
+			"effects_not_authorized",
+		);
+		let effects = context_at(InvocationPhase::EffectsAuthorized);
+		for operation in ["omp.agents.abort", "omp.agents.shutdown", "omp.agents.reload_extensions"] {
+			assert!(authorize_agent_operation(&effects, operation).is_ok());
+		}
+		let settled = context_at(InvocationPhase::Settled);
+		assert!(authorize_agent_operation(&settled, "omp.agents.pending_messages").is_err());
+	}
+
+	#[tokio::test]
+	async fn agent_control_request_arms_acknowledge_introspection_and_shutdown() {
+		use omp_core::{ArtifactDigest, InvocationPhase, LifecyclePhase, Principal};
+
+		let (_scratch, host) = admission_host();
+		let identity = Arc::new(ControlConnectionIdentity {
+			extension:          sf!("dev.test"),
+			principal:          Principal::new(sf!("user"), sf!("User")),
+			artifact_digest:    Str::from(ArtifactDigest::new([2; 32]).to_string()),
+			layer:              sf!("workspace"),
+			tier:               sf!("trusted"),
+			trust:              sf!("trusted"),
+			host_generation:    1,
+			session_generation: 1,
+			capabilities:       Arc::new(BTreeSet::new()),
+		});
+		let context = control::ControlRequestContext {
+			connection: identity,
+			request_id: 1,
+			invocation: Some(control::ControlInvocationAuthority {
+				invocation:        sf!("test"),
+				phase:             InvocationPhase::EffectsAuthorized,
+				session:           sf!("parent-session"),
+				turn:              None,
+				event:             None,
+				call:              None,
+				device:            None,
+				effects:           Box::new([]),
+				place_kind:        sf!("host"),
+				lifecycle:         LifecyclePhase::Active,
+				roots:             Box::new([]),
+				remote:            false,
+				has_ui:            true,
+				headless:          false,
+				settings:          serde_json::Map::new(),
+				secret_settings:   Box::new([]),
+				data:              None,
+				direct_filesystem: None,
+			}),
+		};
+		let authority = AgentsControlAuthority::new(Arc::clone(&host));
+		assert_eq!(
+			authority
+				.request(context.clone(), sf!("omp.agents.is_idle"), serde_json::Map::new())
+				.await
+				.expect("idle request"),
+			Value::Bool(true),
+		);
+		let mut arguments = serde_json::Map::new();
+		arguments.insert("reason".to_owned(), Value::String("maintenance".to_owned()));
+		assert_eq!(
+			authority
+				.request(context, sf!("omp.agents.shutdown"), arguments)
+				.await
+				.expect("shutdown request"),
+			Value::Null,
+		);
+		assert_eq!(
+			tokio::time::timeout(Duration::from_secs(1), host.wait_for_shutdown())
+				.await
+				.expect("shutdown signal"),
+			"maintenance",
+		);
+	}
 
 	#[test]
 	fn seeded_session_is_atomic_idempotent_and_does_not_start_a_turn() {
@@ -7603,6 +8678,8 @@ mod tests {
 		.await
 		.expect("switch model");
 		assert_eq!(switched.key.as_str(), model.key.as_str());
+		assert_eq!(switched.previous_thinking, None);
+		assert_eq!(switched.thinking, Some(Effort::High));
 		assert_eq!(state.snapshot().turn.params.model, model.key.as_str());
 		assert_eq!(
 			state
@@ -7771,6 +8848,449 @@ mod tests {
 			model: "scripted".to_owned(),
 			..inference_pb::Outcome::default()
 		}
+	}
+
+	fn admission_host() -> (tempfile::TempDir, Arc<ChatParentHost<ScriptedParentClient>>) {
+		let scratch = tempfile::tempdir().expect("admission scratch");
+		let root = scratch.path().join("project");
+		let sessions_dir = root.join("sessions");
+		fs::create_dir_all(&sessions_dir).expect("session directory");
+		let state = AgentState::new(AgentSnapshot::new(
+			TurnOptions::default(),
+			PromptFacts::new(&root, Arc::from([]))
+				.props()
+				.expect("test prompt facts"),
+			Arc::new(Registry::new()),
+		));
+		let (env, _transport) = EnvClient::in_process(1);
+		let host = Arc::new(ChatParentHost::new(
+			ScriptedParentClient {
+				scripts: Arc::new(Mutex::new(VecDeque::new())),
+				inputs:  Arc::new(Mutex::new(Vec::new())),
+				options: Arc::new(Mutex::new(Vec::new())),
+			},
+			env,
+			state,
+			sf!("parent-session"),
+			sessions_dir,
+			root,
+			Arc::new(
+				SessionIndex::open(scratch.path().join("sessions.sqlite3")).expect("session index"),
+			),
+			false,
+		));
+		host
+			.tree()
+			.register(
+				sf!("parent-session"),
+				sf!("Main"),
+				AgentKind::Main,
+				None,
+				sf!("parent-session"),
+				Budget::default(),
+			)
+			.expect("root registration");
+		(scratch, host)
+	}
+
+	fn driver_subscription(
+		event: omp_proto::toolhost::v1::HookEventId,
+		phase: omp_agent::HookPhase,
+		id: u32,
+	) -> omp_agent::Subscription {
+		omp_agent::Subscription {
+			host: sf!("test"),
+			source: omp_agent::SourceRef {
+				layer:        0,
+				publisher:    sf!("test"),
+				extension_id: sf!("driver-policy"),
+			},
+			id,
+			event,
+			phase,
+			order: 0,
+			on_failure: omp_agent::OnFailure::Deny,
+			when: omp_agent::When::default(),
+		}
+	}
+
+	fn spawn_subscription(phase: omp_agent::HookPhase, id: u32) -> omp_agent::Subscription {
+		driver_subscription(omp_proto::toolhost::v1::HookEventId::HookEventSubagentSpawn, phase, id)
+	}
+
+	#[tokio::test]
+	async fn task_spawn_surfaces_subagent_policy_denial() {
+		let (_scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [spawn_subscription(omp_agent::HookPhase::Review, 7)])
+			.expect("spawn subscription");
+		let gate = Arc::new(gate);
+		host.bind_admission_gate(Arc::clone(&gate));
+		let responder = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("spawn dispatch");
+			assert_eq!(dispatch.event, omp_proto::toolhost::v1::HookEventId::HookEventSubagentSpawn);
+			let separator = dispatch
+				.payload
+				.iter()
+				.position(|byte| *byte == b'\n')
+				.expect("payload separator");
+			let payload: Value =
+				serde_json::from_slice(&dispatch.payload[separator + 1..]).expect("spawn payload");
+			assert_eq!(payload["task"], "blocked task");
+			assert_eq!(payload["depth"], 1);
+			assert!(payload.get("remaining_concurrency").is_some());
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					7,
+					omp_agent::GateDecision::Deny(sf!("delegation blocked")),
+				)])
+				.expect("deny spawn");
+		});
+		let authority = AgentsControlAuthority::new(Arc::clone(&host));
+		let error = authority
+			.spawn_one_for(
+				sf!("parent-session"),
+				None,
+				json!({"task": "blocked task", "max_depth": 1}),
+			)
+			.await
+			.expect_err("policy must deny task spawn");
+		responder.await.expect("gate responder");
+		assert_eq!(error.code, "PolicyDenied");
+		assert_eq!(error.details["reason"], "delegation blocked");
+		assert_eq!(host.tree().roster().count(), 1);
+	}
+
+	#[tokio::test]
+	async fn scheduled_spawn_denial_is_journaled_before_child_session_composition() {
+		let (scratch, host) = admission_host();
+		let journal_attempts = SUBAGENT_SPAWN_DENIAL_JOURNALS.load(Ordering::Relaxed);
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [spawn_subscription(omp_agent::HookPhase::Review, 9)])
+			.expect("spawn subscription");
+		let gate = Arc::new(gate);
+		host.bind_admission_gate(Arc::clone(&gate));
+		let responder = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("advisor dispatch");
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					9,
+					omp_agent::GateDecision::Deny(sf!("advisor blocked")),
+				)])
+				.expect("deny advisor");
+		});
+		let error = host
+			.spawn_advisor(AdvisorChildSpec {
+				id:            sf!("scheduled"),
+				display_name:  sf!("Scheduled advisor"),
+				model:         sf!("test/model"),
+				tools:         Vec::new(),
+				system_prompt: sf!("Review scheduled work."),
+			})
+			.await
+			.expect_err("policy must deny advisor");
+		responder.await.expect("gate responder");
+		assert!(matches!(error, AdvisorChildError::PolicyDenied { denial }
+			if denial.reason == "advisor blocked"));
+		assert_eq!(
+			SUBAGENT_SPAWN_DENIAL_JOURNALS.load(Ordering::Relaxed),
+			journal_attempts + 1,
+			"scheduled denial did not reach the journal seam",
+		);
+		assert_eq!(host.tree().roster().count(), 1);
+		assert!(
+			!scratch.path().join("project/sessions/eval-agents").exists(),
+			"denied advisor must not instantiate a child session"
+		);
+	}
+
+	#[tokio::test]
+	async fn unsubscribed_spawn_admission_builds_no_payload_or_control_frame() {
+		let (_scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		host.bind_admission_gate(Arc::new(gate));
+		let before = SUBAGENT_SPAWN_PAYLOADS.load(Ordering::Relaxed);
+		host
+			.admit_subagent_spawn(
+				"unsubscribed-spawn",
+				"parent-session",
+				&json!({"task": "allowed task", "max_depth": 1}),
+			)
+			.await
+			.expect("unsubscribed spawn admission");
+		assert_eq!(SUBAGENT_SPAWN_PAYLOADS.load(Ordering::Relaxed), before);
+		assert!(dispatches.try_recv().is_err(), "unsubscribed gate emitted CONTROL");
+	}
+
+	#[tokio::test]
+	async fn spawn_approval_uses_the_durable_ticket_book() {
+		let (_scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [spawn_subscription(omp_agent::HookPhase::Approval, 11)])
+			.expect("spawn subscription");
+		let gate = Arc::new(gate);
+		host.bind_admission_gate(Arc::clone(&gate));
+		let book = Arc::new(omp_agent::ApprovalBook::new());
+		let (route, inbox) = omp_agent::ApprovalRoute::new(Arc::clone(&book), None);
+		host.bind_spawn_approval_route(route);
+		let responder = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("approval dispatch");
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					11,
+					omp_agent::GateDecision::RequireApproval(omp_agent::ApprovalSpec {
+						title:         sf!("Delegate"),
+						body:          sf!("Allow this subagent?"),
+						subject:       sf!("approved task"),
+						kind:          sf!("spawn"),
+						scopes:        vec![sf!("once")],
+						default:       Some(false),
+						route:         sf!("user"),
+						approver:      None,
+						timeout_ms:    5_000,
+						unreachable:   sf!("deny"),
+						require_human: true,
+						pattern:       None,
+						evidence:      Vec::new(),
+					}),
+				)])
+				.expect("require approval");
+		});
+		let approver = tokio::spawn(async move {
+			let request = inbox.recv().await.expect("approval ticket");
+			let ticket_id = request.ticket.ticket_id.clone();
+			request
+				.respond(omp_agent::ApprovalDecision {
+					approved:   true,
+					scope:      sf!("once"),
+					source:     omp_agent::ApprovalSource::User,
+					decided_by: Some(sf!("tester")),
+					reason:     None,
+					audited:    false,
+				})
+				.expect("approve spawn");
+			ticket_id
+		});
+		host
+			.admit_subagent_spawn(
+				"approval-spawn",
+				"parent-session",
+				&json!({"task": "approved task", "max_depth": 1}),
+			)
+			.await
+			.expect("approved spawn");
+		responder.await.expect("gate responder");
+		let ticket_id = approver.await.expect("approval responder");
+		let ticket = book.ticket(ticket_id.as_str()).expect("durable ticket");
+		assert_eq!(ticket.state, omp_agent::TicketState::Decided);
+		assert!(ticket.decision.is_some_and(|decision| decision.approved));
+	}
+	#[tokio::test]
+	async fn user_input_denial_consumes_before_submission() {
+		let (_scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [driver_subscription(
+				omp_proto::toolhost::v1::HookEventId::HookEventUserInput,
+				omp_agent::HookPhase::Review,
+				31,
+			)])
+			.expect("user input subscription");
+		let gate = Arc::new(gate);
+		host.bind_admission_gate(Arc::clone(&gate));
+		let responder = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("user input dispatch");
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					31,
+					omp_agent::GateDecision::DenyPolicy(Arc::new(omp_tool::PolicyDenied {
+						reason:      sf!("input blocked"),
+						code:        Some(sf!("test.input")),
+						decision_id: sf!("decision-31"),
+						rules:       Arc::from([sf!("rule-31")]),
+					})),
+				)])
+				.expect("deny user input");
+		});
+		let mut items = vec![bridge_message(Role::User, "do not journal this")];
+		let denial = host
+			.admit_user_input(&mut items, "interactive", false)
+			.await
+			.expect_err("user input must be consumed");
+		responder.await.expect("input responder");
+		assert_eq!(denial.reason, "input blocked");
+		assert_eq!(denial.code.as_deref(), Some("test.input"));
+		assert!(host.client.inputs.lock().is_empty(), "denied input reached the agent client");
+	}
+	#[tokio::test]
+	async fn user_bash_composes_one_admission_with_effective_shell_fields() {
+		let (scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [driver_subscription(
+				omp_proto::toolhost::v1::HookEventId::HookEventUserBash,
+				omp_agent::HookPhase::Transform,
+				32,
+			)])
+			.expect("user bash subscription");
+		let gate = Arc::new(gate);
+		host.bind_admission_gate(Arc::clone(&gate));
+		let cwd = scratch.path().join("project");
+		let rewritten_cwd = cwd.join("sandbox");
+		let responder = tokio::spawn({
+			let rewritten_cwd = rewritten_cwd.clone();
+			async move {
+				let dispatch = dispatches.recv_async().await.expect("user bash dispatch");
+				let separator = dispatch
+					.payload
+					.iter()
+					.position(|byte| *byte == b'\n')
+					.expect("payload separator");
+				let payload: Value = serde_json::from_slice(&dispatch.payload[separator + 1..])
+					.expect("user bash payload");
+				assert_eq!(payload["command"], "echo requested");
+				assert!(payload["bash"]["parse_ok"].as_bool().is_some());
+				assert!(dispatches.try_recv().is_err(), "user_bash emitted a second admission");
+				let effective = json!({
+					"command": "echo effective",
+					"cwd": rewritten_cwd,
+					"exclude_from_context": true,
+					"bash": payload["bash"].clone(),
+					"env_overrides": {"HTTP_PROXY": "http://proxy", "SECRET": null},
+				});
+				gate
+					.answer(dispatch.dispatch_id, vec![(
+						32,
+						omp_agent::GateDecision::Modify(omp_agent::HookPatch {
+							target: None,
+							args:   Some(bytes::Bytes::from(
+								serde_json::to_vec(&effective).expect("effective bash payload"),
+							)),
+						}),
+					)])
+					.expect("modify user bash");
+			}
+		});
+		let (command, effective_cwd, env) = host
+			.admit_user_bash("echo requested", &cwd, true)
+			.await
+			.expect("user bash admission");
+		responder.await.expect("bash responder");
+		assert_eq!(command, "echo effective");
+		assert_eq!(effective_cwd.as_str(), rewritten_cwd.to_string_lossy().as_ref());
+		assert_eq!(env.get("HTTP_PROXY").and_then(Option::as_deref), Some("http://proxy"));
+		assert_eq!(env.get("SECRET"), Some(&None));
+	}
+	#[tokio::test]
+	async fn user_eval_and_command_invoke_apply_composed_replacements() {
+		let (scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [
+				driver_subscription(
+					omp_proto::toolhost::v1::HookEventId::HookEventUserEval,
+					omp_agent::HookPhase::Transform,
+					33,
+				),
+				driver_subscription(
+					omp_proto::toolhost::v1::HookEventId::HookEventCommandInvoke,
+					omp_agent::HookPhase::Transform,
+					34,
+				),
+			])
+			.expect("eval and command subscriptions");
+		let gate = Arc::new(gate);
+		host.bind_admission_gate(Arc::clone(&gate));
+		let responder_gate = Arc::clone(&gate);
+		let responder = tokio::spawn(async move {
+			for (id, effective) in [
+				(
+					33,
+					json!({
+						"code": "print('effective')",
+						"language": "py",
+						"cwd": ".",
+						"exclude_from_context": false,
+					}),
+				),
+				(
+					34,
+					json!({
+						"name": "effective",
+						"argv": ["two", "args"],
+						"raw": "one",
+						"mode": "headless",
+						"source": "rpc",
+					}),
+				),
+			] {
+				let dispatch = dispatches.recv_async().await.expect("driver gate dispatch");
+				responder_gate
+					.answer(dispatch.dispatch_id, vec![(
+						id,
+						omp_agent::GateDecision::Modify(omp_agent::HookPatch {
+							target: None,
+							args:   Some(bytes::Bytes::from(
+								serde_json::to_vec(&effective).expect("effective payload"),
+							)),
+						}),
+					)])
+					.expect("modify driver event");
+			}
+		});
+		let code = host
+			.admit_user_eval("print('requested')", scratch.path(), false)
+			.await
+			.expect("eval admission");
+		assert_eq!(code, "print('effective')");
+		let (name, argv) = host
+			.admit_command_invoke("requested", &[sf!("one")], "one", "headless", "rpc")
+			.await
+			.expect("command admission");
+		responder.await.expect("driver responders");
+		assert_eq!(name, "effective");
+		assert_eq!(argv, vec![sf!("two"), sf!("args")]);
+	}
+
+	#[test]
+	fn model_changed_user_payload_is_exact_and_bitmap_gated() {
+		let (_scratch, host) = admission_host();
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [driver_subscription(
+				omp_proto::toolhost::v1::HookEventId::HookEventModelChanged,
+				omp_agent::HookPhase::Observe,
+				45,
+			)])
+			.expect("model changed subscription");
+		host.bind_admission_gate(Arc::new(gate));
+		host.notify_model_changed(
+			Some(&JournalModelRef {
+				provider: JournalProviderId(sf!("old-provider")),
+				api:      sf!("old-api"),
+				model:    JournalModelId(sf!("old-model")),
+			}),
+			&JournalModelRef {
+				provider: JournalProviderId(sf!("new-provider")),
+				api:      sf!("new-api"),
+				model:    JournalModelId(sf!("new-model")),
+			},
+			Some(Effort::Low),
+			Some(Effort::High),
+			"temporary",
+			"user",
+		);
+		let dispatch = dispatches.try_recv().expect("model changed observation");
+		let payload: Value = serde_json::from_slice(&dispatch.payload).expect("model payload");
+		assert_eq!(payload["from_model"]["model"], "old-model");
+		assert_eq!(payload["to_model"]["model"], "new-model");
+		assert_eq!(payload["previous_thinking"], "low");
+		assert_eq!(payload["thinking"], "high");
+		assert_eq!(payload["role"], "temporary");
+		assert_eq!(payload["reason"], "user");
 	}
 
 	fn write_session(sessions_dir: &Path, root: &Path, prompt: &str, title: Option<&str>) -> Str {

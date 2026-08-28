@@ -8,17 +8,21 @@ use std::{
 
 use async_trait::async_trait;
 use omp_catalog::{
-	CatalogOverlayBuilder, DiscoveryNormalizer, DiscoveryPollGate, DiscoveryPollKey, DiscoverySpec,
-	EvidenceConfidence, ModelOverlay, ModelPatch, OverlaySource, OverlayStore, ProvenanceKind,
-	ProvenanceSource, ProviderId, ScopedAlias,
+	CatalogOverlayBuilder, ClassId, DiscoveredModel, DiscoveryNormalizer, DiscoveryPollGate,
+	DiscoveryPollKey, DiscoverySpec, EvidenceConfidence, ModelLimits, ModelOverlay, ModelPatch,
+	OperationBits, OperationKind, OverlaySource, OverlayStore, ProvenanceKind, ProvenanceSource,
+	ProviderId, ScopedAlias, WireModelId,
 };
 use omp_core::{Principal, Str, sf};
 use omp_envd::exthost::control::{
 	ControlAuthorityFactory, ControlConnectionIdentity, ControlProtocolError,
 };
-use omp_inference::discovery::{
-	DiscoveryCacheKey, DiscoveryHttpClient, DiscoveryProbe, DiscoveryStore, DiscoveryStoreError,
-	ProbeError, ProviderDiscoveryState, ProviderLifecycle,
+use omp_inference::{
+	ModelsDiscoverHookRequest, ProviderResponseHooks,
+	discovery::{
+		DiscoveryCacheKey, DiscoveryHttpClient, DiscoveryProbe, DiscoveryStore, DiscoveryStoreError,
+		ProbeError, ProviderDiscoveryState, ProviderLifecycle,
+	},
 };
 use omp_proto::inference::v1::{
 	self as pb, Effort, inference_client::InferenceClient, model_event, price,
@@ -156,10 +160,17 @@ impl RegimeControlResolver for SealedRegimeControlResolver {
 
 /// One daemon-wide discovery coordinator shared by every attached session.
 pub struct DiscoveryRuntime {
-	gate:     DiscoveryPollGate,
-	cache:    Arc<DiscoveryStore>,
-	overlays: Arc<OverlayStore>,
-	disabled: BTreeSet<omp_catalog::ProviderId>,
+	gate:      DiscoveryPollGate,
+	cache:     Arc<DiscoveryStore>,
+	overlays:  Arc<OverlayStore>,
+	disabled:  BTreeSet<omp_catalog::ProviderId>,
+	extension: Mutex<ExtensionDiscoveryState>,
+}
+
+#[derive(Default)]
+struct ExtensionDiscoveryState {
+	generations: BTreeMap<ProviderId, u64>,
+	models:      BTreeMap<ProviderId, BTreeMap<Str, Value>>,
 }
 
 impl DiscoveryRuntime {
@@ -174,6 +185,7 @@ impl DiscoveryRuntime {
 			cache,
 			overlays,
 			disabled: disabled.into_iter().collect(),
+			extension: Mutex::new(ExtensionDiscoveryState::default()),
 		}
 	}
 
@@ -237,6 +249,102 @@ impl DiscoveryRuntime {
 			.overlays
 			.replace(OverlaySource::DiskCache, builder.build());
 		Ok(hydrated)
+	}
+
+	/// Runs one extension `models_discover` page and publishes it under a
+	/// provider-scoped generation fence.
+	///
+	/// Hook failure and malformed rows retain the prior extension overlay.
+	/// A newer in-flight generation suppresses this invocation's publication.
+	pub async fn refresh_extension(
+		&self,
+		hooks: &ProviderResponseHooks,
+		request: ModelsDiscoverHookRequest,
+		normalizer: &DiscoveryNormalizer,
+		now_ms: u64,
+	) -> Result<RefreshOutcome, DiscoveryRuntimeError> {
+		if self.disabled.contains(&request.provider) {
+			return Ok(RefreshOutcome::Disabled);
+		}
+		if !hooks.models_discover_subscribed(&request.provider) {
+			return Ok(RefreshOutcome::NotDue);
+		}
+		let generation = {
+			let mut state = self.extension.lock().await;
+			let generation = state
+				.generations
+				.entry(request.provider.clone())
+				.or_default();
+			*generation = generation.saturating_add(1);
+			*generation
+		};
+		let provider = request.provider.clone();
+		let route = request.route.clone();
+		let page = match hooks.models_discover(request).await {
+			Ok(page) => page,
+			Err(_) => return Ok(RefreshOutcome::Retained),
+		};
+		let mut state = self.extension.lock().await;
+		if state.generations.get(&provider).copied() != Some(generation) {
+			return Ok(RefreshOutcome::Superseded);
+		}
+		let mut next = if page.authoritative {
+			BTreeMap::new()
+		} else {
+			state.models.get(&provider).cloned().unwrap_or_default()
+		};
+		for model in page.models {
+			let Some(id) = model
+				.get("id")
+				.and_then(Value::as_str)
+				.filter(|id| !id.is_empty())
+			else {
+				return Ok(RefreshOutcome::Retained);
+			};
+			next.insert(Str::new(id), model);
+		}
+		let rows = next
+			.values()
+			.map(|model| discovered_hook_model(&provider, &route, model, now_ms))
+			.collect::<Option<Vec<_>>>();
+		let Some(rows) = rows else {
+			return Ok(RefreshOutcome::Retained);
+		};
+		let normalized = match normalizer.normalize_batch(&rows) {
+			Ok(normalized) => normalized,
+			Err(_) => return Ok(RefreshOutcome::Retained),
+		};
+		let source = ProvenanceSource {
+			kind:           ProvenanceKind::Discovered,
+			origin:         sf!("models-discover:{}", provider),
+			revision:       None,
+			confidence:     EvidenceConfidence::Declared,
+			observed_at_ms: Some(now_ms),
+		};
+		let mut builder = CatalogOverlayBuilder::new(source);
+		for item in normalized {
+			let selector =
+				omp_catalog::ExactSelector::new(item.provider.clone(), item.model.key.clone());
+			builder = builder.with_model(ModelOverlay {
+				selector,
+				added: Some(item.model),
+				patch: ModelPatch::default(),
+			});
+			builder = builder.with_aliases(
+				item
+					.aliases
+					.into_vec()
+					.into_iter()
+					.map(|definition| ScopedAlias { provider: item.provider.clone(), definition }),
+			);
+		}
+		let models = next.len();
+		self.overlays.replace(
+			OverlaySource::Extension { id: sf!("models-discover:{}", provider) },
+			builder.build(),
+		);
+		state.models.insert(provider, next);
+		Ok(RefreshOutcome::Published { models })
 	}
 
 	/// Runs one due probe, writes its complete SQLite generation, and atomically
@@ -332,6 +440,79 @@ pub struct CachedDiscoveryHydration {
 	pub normalizer: DiscoveryNormalizer,
 }
 
+fn discovered_hook_model(
+	provider: &ProviderId<str>,
+	route: &omp_catalog::RouteId<str>,
+	model: &Value,
+	now_ms: u64,
+) -> Option<DiscoveredModel> {
+	let object = model.as_object()?;
+	let id = object.get("id")?.as_str().filter(|id| !id.is_empty())?;
+	let wire_model = object
+		.get("wire_ids")
+		.and_then(Value::as_object)
+		.and_then(|wire_ids| {
+			wire_ids.get(route.as_str()).or_else(|| {
+				route
+					.as_str()
+					.rsplit('/')
+					.next()
+					.and_then(|id| wire_ids.get(id))
+			})
+		})
+		.and_then(Value::as_str)
+		.unwrap_or(id);
+	let mut operations = OperationBits::empty();
+	for operation in object
+		.get("operations")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(Value::as_str)
+		.filter_map(|operation| operation.parse::<OperationKind>().ok())
+	{
+		operations.insert_kind(operation);
+	}
+	if operations.is_empty() {
+		operations.insert_kind(OperationKind::Chat);
+	}
+	let limits = ModelLimits {
+		context_window:        object.get("context_window").and_then(Value::as_u64),
+		maximum_input_tokens:  object.get("max_input_tokens").and_then(Value::as_u64),
+		maximum_output_tokens: object.get("max_output_tokens").and_then(Value::as_u64),
+		maximum_batch:         object
+			.get("max_batch")
+			.and_then(Value::as_u64)
+			.and_then(|value| value.try_into().ok()),
+	};
+	Some(DiscoveredModel {
+		provider:              provider.to_owned(),
+		route:                 route.to_owned(),
+		wire_model:            WireModelId::from(wire_model),
+		aliases:               Box::new([]),
+		display_name:          object
+			.get("display_name")
+			.and_then(Value::as_str)
+			.map(Str::new),
+		declared_class:        object
+			.get("family")
+			.and_then(Value::as_str)
+			.map(ClassId::from),
+		declared_operations:   operations,
+		declared_capabilities: None,
+		declared_limits:       Some(limits),
+		extended_context_mode: None,
+		availability:          object
+			.get("availability")
+			.and_then(Value::as_str)
+			.and_then(|value| value.parse().ok()),
+		source:                sf!("models-discover:{}", provider),
+		observed_at_ms:        Some(now_ms),
+		updated_at_ms:         object.get("updated_at_ms").and_then(Value::as_u64),
+		deprecated:            object.get("deprecated").and_then(Value::as_bool),
+	})
+}
+
 fn probe_error_code(error: ProbeError) -> Str {
 	match error {
 		ProbeError::Timeout => Str::new_static("timeout"),
@@ -346,8 +527,13 @@ fn probe_error_code(error: ProbeError) -> Str {
 pub enum RefreshOutcome {
 	/// Explicit disabled-provider policy won.
 	Disabled,
-	/// Another session/process-local caller owns the interval.
+	/// Another session/process-local caller owns the interval or no extension
+	/// handler applies.
 	NotDue,
+	/// The hook failed open and the prior published rows were retained.
+	Retained,
+	/// A newer provider generation completed or claimed publication first.
+	Superseded,
 	/// A complete generation was published.
 	Published {
 		/// Number of normalized model rows.
@@ -1221,12 +1407,22 @@ fn provider_result_from_pb(
 
 #[cfg(test)]
 mod tests {
-	use std::iter;
+	use std::{
+		future::Future,
+		iter,
+		pin::Pin,
+		sync::atomic::{AtomicBool, Ordering},
+	};
 
 	use omp_catalog::{
 		ContextStrategy, DiscoveredModel, DiscoveryDefaults, ModelAvailability, OperationBits,
 		Pricing, RouteId, WireModelId, WirePolicyId,
 	};
+	use omp_inference::{
+		ModelsDiscoverHookPage, ProviderHookError, ProviderHookObserver, ProviderResponseObservation,
+		ProviderResponseObserver,
+	};
+	use serde_json::json;
 
 	use super::*;
 
@@ -1258,6 +1454,91 @@ mod tests {
 			thinking:             None,
 			pricing:              Pricing::default(),
 		})
+	}
+
+	struct StubExthost {
+		fail: AtomicBool,
+	}
+
+	impl ProviderHookObserver for StubExthost {
+		fn models_discover_subscribed(&self, provider: &ProviderId<str>) -> bool {
+			provider.as_str() == "extension-provider"
+		}
+
+		fn models_discover<'a>(
+			&'a self,
+			_request: ModelsDiscoverHookRequest,
+		) -> Pin<
+			Box<dyn Future<Output = Result<ModelsDiscoverHookPage, ProviderHookError>> + Send + 'a>,
+		> {
+			Box::pin(async move {
+				if self.fail.load(Ordering::Acquire) {
+					return Err(ProviderHookError::Failed);
+				}
+				Ok(ModelsDiscoverHookPage {
+					models:        Box::new([json!({
+						"id": "dynamic-model",
+						"display_name": "Dynamic Model",
+						"routes": ["configured-route"],
+						"operations": ["chat"],
+						"context_window": 32_000,
+					})]),
+					next_cursor:   None,
+					authoritative: true,
+				})
+			})
+		}
+	}
+
+	impl ProviderResponseObserver for StubExthost {
+		fn subscribed(&self) -> bool {
+			false
+		}
+
+		fn observe(&self, _observation: ProviderResponseObservation) {}
+	}
+
+	#[tokio::test]
+	async fn extension_discovery_publishes_and_failure_retains_previous_generation() {
+		let directory = tempfile::tempdir().expect("directory");
+		let overlays = Arc::new(OverlayStore::default());
+		let runtime = DiscoveryRuntime::new(
+			Arc::new(DiscoveryStore::open(&directory.path().join("models.db")).expect("store")),
+			Arc::clone(&overlays),
+			iter::empty::<ProviderId>(),
+		);
+		let exthost = Arc::new(StubExthost { fail: AtomicBool::new(false) });
+		let hooks = ProviderResponseHooks::new(exthost.clone());
+		let request = ModelsDiscoverHookRequest {
+			provider:  ProviderId::from("extension-provider"),
+			route:     RouteId::from("configured-route"),
+			cursor:    None,
+			page_size: Some(100),
+			trigger:   sf!("session_start"),
+		};
+		assert_eq!(
+			runtime
+				.refresh_extension(&hooks, request.clone(), &normalizer(), 200)
+				.await
+				.expect("publish"),
+			RefreshOutcome::Published { models: 1 }
+		);
+		let published = overlays.load();
+		assert!(
+			published
+				.sources()
+				.contains(&OverlaySource::Extension { id: sf!("models-discover:extension-provider") })
+		);
+		let generation = published.generation();
+		exthost.fail.store(true, Ordering::Release);
+		assert_eq!(
+			runtime
+				.refresh_extension(&hooks, request, &normalizer(), 201)
+				.await
+				.expect("retain"),
+			RefreshOutcome::Retained
+		);
+		assert_eq!(overlays.load().generation(), generation);
 	}
 
 	#[test]

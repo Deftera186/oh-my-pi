@@ -19,8 +19,15 @@ use super::{
 };
 
 /// Standalone repository context filenames accepted during ancestor discovery.
-pub const REPO_SURFACE_CONTEXT_FILES: &[&str] =
-	&["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules"];
+pub const REPO_SURFACE_CONTEXT_FILES: &[&str] = &[
+	"AGENTS.override.md",
+	"AGENTS.md",
+	"AGENTS.MD",
+	"CLAUDE.md",
+	"CLAUDE.MD",
+	"GEMINI.md",
+	".cursorrules",
+];
 
 /// One Environment-granted root and the working directory whose ancestor chain
 /// is eligible within that root.
@@ -125,6 +132,7 @@ pub fn discover(
 			diagnostics.push(ContextDiagnostic::OutsideGrant(start));
 			continue;
 		}
+		let shadowed_context = find_shadowed_context_file(&start, &root, &allowed);
 		let mut current = start.as_path();
 		let mut reached_root = false;
 		let mut native_owner_found = false;
@@ -137,6 +145,17 @@ pub fn discover(
 					admit_candidate(
 						&mut project_winners,
 						(root_index, depth),
+						ContextCandidate::project(
+							root_index,
+							depth,
+							101,
+							native.join("AGENTS.override.md"),
+						),
+						&mut diagnostics,
+					);
+					admit_candidate(
+						&mut project_winners,
+						(root_index, depth),
 						ContextCandidate::project(root_index, depth, 100, native.join("AGENTS.md")),
 						&mut diagnostics,
 					);
@@ -144,7 +163,11 @@ pub fn discover(
 			}
 			for name in &allowed {
 				let (provider, priority) = match *name {
+					"AGENTS.override.md" => ("agents-md", 95),
+					"AGENTS.md" => ("agents-md", 90),
+					"AGENTS.MD" => ("agents-md", 89),
 					"CLAUDE.md" => ("claude", 80),
+					"CLAUDE.MD" => ("claude", 79),
 					"GEMINI.md" => ("gemini", 60),
 					".cursorrules" => ("cursor", 50),
 					_ => ("agents-md", 10),
@@ -152,10 +175,16 @@ pub fn discover(
 				if disabled.contains(provider) {
 					continue;
 				}
+				let path = current.join(name);
+				if shadowed_context.as_ref().is_some_and(|shadowed| {
+					fs::canonicalize(&path).is_ok_and(|candidate| candidate == *shadowed)
+				}) {
+					continue;
+				}
 				admit_candidate(
 					&mut project_winners,
 					(root_index, depth),
-					ContextCandidate::project(root_index, depth, priority, current.join(name)),
+					ContextCandidate::project(root_index, depth, priority, path),
 					&mut diagnostics,
 				);
 			}
@@ -210,9 +239,10 @@ pub fn discover(
 	});
 	if let Some(home) = options.home.as_deref() {
 		let mut user_winner = None;
-		let native = super::native::user_config_root(home).join("AGENTS.md");
+		let native = super::native::user_config_root(home);
 		for (provider, path, priority) in [
-			("native", native, 100),
+			("native", native.join("AGENTS.override.md"), 101),
+			("native", native.join("AGENTS.md"), 100),
 			("claude", home.join(".claude/CLAUDE.md"), 80),
 			("codex", home.join(".codex/AGENTS.md"), 70),
 			("agents", home.join(".agent/AGENTS.md"), 70),
@@ -280,6 +310,49 @@ struct ContextCandidate {
 impl ContextCandidate {
 	fn project(root_index: usize, depth: u16, priority: u8, path: PathBuf) -> Self {
 		Self { item: ContextItem { root_index, path, depth, content: Str::new_static("") }, priority }
+	}
+}
+
+fn find_shadowed_context_file(
+	start: &Path,
+	boundary: &Path,
+	allowed: &BTreeSet<&str>,
+) -> Option<PathBuf> {
+	let worktree_root = start
+		.ancestors()
+		.take_while(|ancestor| ancestor.starts_with(boundary))
+		.find(|ancestor| ancestor.join(".git").is_file())?;
+	let marker = fs::read_to_string(worktree_root.join(".git")).ok()?;
+	let git_dir = marker
+		.trim()
+		.strip_prefix("gitdir:")
+		.map(str::trim)
+		.filter(|path| !path.is_empty())?;
+	let git_dir = resolve_git_path(worktree_root, Path::new(git_dir));
+	let common = fs::read_to_string(git_dir.join("commondir")).ok()?;
+	let common_git_dir =
+		fs::canonicalize(resolve_git_path(&git_dir, Path::new(common.trim()))).ok()?;
+	let worktree_root = fs::canonicalize(worktree_root).ok()?;
+	let main_root = common_git_dir.parent()?;
+	let nested = worktree_root
+		.strip_prefix(main_root)
+		.ok()
+		.is_some_and(|relative| !relative.as_os_str().is_empty());
+	if !nested || fs::canonicalize(main_root.join(".git")).ok().as_deref() != Some(&common_git_dir) {
+		return None;
+	}
+	let selected = REPO_SURFACE_CONTEXT_FILES
+		.iter()
+		.copied()
+		.find(|name| allowed.contains(name) && worktree_root.join(name).is_file())?;
+	fs::canonicalize(main_root.join(selected)).ok()
+}
+
+fn resolve_git_path(base: &Path, path: &Path) -> PathBuf {
+	if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		base.join(path)
 	}
 }
 
@@ -404,6 +477,50 @@ mod tests {
 		assert_eq!(snapshot.items.len(), 2);
 		assert!(snapshot.items[0].path.ends_with("CLAUDE.md"));
 		assert!(snapshot.items[1].path.ends_with(".cursorrules"));
+	}
+
+	#[test]
+	fn agents_override_wins_its_sibling_context_files() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("repo");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("AGENTS.md"), "agents").unwrap();
+		fs::write(root.join("AGENTS.override.md"), "override").unwrap();
+		fs::write(root.join("CLAUDE.md"), "claude").unwrap();
+		let snapshot = discover(
+			&[GrantedContextRoot { root: root.clone(), start: root }],
+			&ContextDiscoveryOptions::default(),
+		);
+		assert_eq!(snapshot.items.len(), 1);
+		assert!(snapshot.items[0].path.ends_with("AGENTS.override.md"));
+		assert_eq!(snapshot.items[0].content.as_str(), "override");
+	}
+
+	#[test]
+	fn nested_linked_worktree_suppresses_main_worktree_copy() {
+		let tree = tempfile::tempdir().unwrap();
+		let main = tree.path().join("repo");
+		let linked = main.join(".worktrees/feature");
+		let cwd = linked.join("src");
+		let git_dir = main.join(".git/worktrees/feature");
+		fs::create_dir_all(&cwd).unwrap();
+		fs::create_dir_all(&git_dir).unwrap();
+		fs::write(linked.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+		fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+		fs::write(main.join("AGENTS.md"), "main copy").unwrap();
+		fs::write(linked.join("AGENTS.md"), "linked copy").unwrap();
+		let snapshot = discover(
+			&[GrantedContextRoot { root: main, start: cwd }],
+			&ContextDiscoveryOptions::default(),
+		);
+		assert_eq!(
+			snapshot
+				.items
+				.iter()
+				.map(|item| item.content.as_str())
+				.collect::<Vec<_>>(),
+			["linked copy"]
+		);
 	}
 
 	#[test]

@@ -15,8 +15,8 @@ use std::{
 use flume::Receiver;
 use omp_agent::{
 	AbortHandle, Agent, AgentError, AgentEvent, AgentNode, AgentRunSummary, AgentStatus, AgentTree,
-	AgentTreeLimits, Interrupt, InterruptClass, InterruptSource, JobBoard, MailboxSender,
-	SubagentActivity, SubagentActivityKind, SubagentDisposition, SubagentLifecycle,
+	AgentTreeLimits, HookEvent, HookGate, Interrupt, InterruptClass, InterruptSource, JobBoard,
+	MailboxSender, SubagentActivity, SubagentActivityKind, SubagentDisposition, SubagentLifecycle,
 	SubagentProgressSnapshot, SubagentRunState, SubagentStateError, SubagentTerminalKind,
 	SubagentTerminalStatus, TurnClient, TurnId,
 };
@@ -28,6 +28,7 @@ use omp_proto::{
 use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef};
 use omp_tools::yield_tool::YieldType;
 use parking_lot::RwLock;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::{sync::Notify, time, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -159,6 +160,92 @@ impl Drop for SessionPermit {
 	}
 }
 
+struct JobRegisteredHookEvent {
+	payload: bytes::Bytes,
+}
+
+impl HookEvent for JobRegisteredHookEvent {
+	type Return = ();
+
+	const ID: omp_proto::toolhost::v1::HookEventId =
+		omp_proto::toolhost::v1::HookEventId::HookEventJobRegistered;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut bytes::BytesMut) {
+		out.extend_from_slice(&self.payload);
+	}
+
+	fn apply(&mut self, _: &omp_agent::HookPatch) -> Result<(), omp_agent::GateError> {
+		Ok(())
+	}
+}
+
+struct JobSettledHookEvent {
+	payload: bytes::Bytes,
+}
+
+impl HookEvent for JobSettledHookEvent {
+	type Return = ();
+
+	const ID: omp_proto::toolhost::v1::HookEventId =
+		omp_proto::toolhost::v1::HookEventId::HookEventJobSettled;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut bytes::BytesMut) {
+		out.extend_from_slice(&self.payload);
+	}
+
+	fn apply(&mut self, _: &omp_agent::HookPatch) -> Result<(), omp_agent::GateError> {
+		Ok(())
+	}
+}
+
+fn notify_job_registered(gate: Option<&HookGate>, job: &JobRef) {
+	let Some(gate) = gate else {
+		return;
+	};
+	if !gate.subscribed(JobRegisteredHookEvent::ID) {
+		return;
+	}
+	let owner = match &job.owner {
+		JobOwner::NamedProcess { name, .. } => name.as_str(),
+		JobOwner::AgentLoop { agent_id } => agent_id.as_str(),
+	};
+	let payload = serde_json::json!({
+		"job_id": job.id,
+		"owner": owner,
+		"call_id": Value::Null,
+		"lifetime": job.artifact.lifetime.to_string(),
+		"expected_artifact": Value::Null,
+	});
+	if let Ok(payload) = serde_json::to_vec(&payload) {
+		gate.notify(&JobRegisteredHookEvent { payload: bytes::Bytes::from(payload) });
+	}
+}
+
+fn notify_job_settled(gate: Option<&HookGate>, job: &JobRef, failed: bool, duration_ms: u64) {
+	let Some(gate) = gate else {
+		return;
+	};
+	if !gate.subscribed(JobSettledHookEvent::ID) {
+		return;
+	}
+	let owner = match &job.owner {
+		JobOwner::NamedProcess { name, .. } => name.as_str(),
+		JobOwner::AgentLoop { agent_id } => agent_id.as_str(),
+	};
+	let payload = serde_json::json!({
+		"job_id": job.id,
+		"owner": owner,
+		"artifact": Value::Null,
+		"failed": failed,
+		"duration": format!("{duration_ms}ms"),
+	});
+	if let Ok(payload) = serde_json::to_vec(&payload) {
+		gate.notify(&JobSettledHookEvent { payload: bytes::Bytes::from(payload) });
+	}
+}
+
 enum ChildCommand {
 	Run(RunCommand),
 	Revive(flume::Sender<Result<u64, SupervisorError>>),
@@ -179,6 +266,7 @@ pub struct SessionSupervisor<C: TurnClient + Clone + Send + 'static> {
 	children:    RwLock<HashMap<Str, ChildHandle>>,
 	settings:    RwLock<Arc<TaskSettings>>,
 	parent_jobs: RwLock<Option<Arc<JobBoard>>>,
+	hook_gate:   RwLock<Option<Arc<HookGate>>>,
 	_marker:     marker::PhantomData<fn() -> C>,
 }
 
@@ -191,6 +279,7 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			children: RwLock::new(HashMap::new()),
 			settings: RwLock::new(Arc::new(TaskSettings::default())),
 			parent_jobs: RwLock::new(None),
+			hook_gate: RwLock::new(None),
 			_marker: marker::PhantomData,
 		}
 	}
@@ -206,6 +295,10 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 	}
 
 	/// Binds the observation gate used by driver-owned job lifecycle seams.
+	pub fn bind_hook_gate(&self, gate: Arc<HookGate>) {
+		*self.hook_gate.write() = Some(gate);
+	}
+
 	/// Returns the parent board used for self-delivering durable child turns.
 	pub fn parent_jobs(&self) -> Option<Arc<JobBoard>> {
 		self.parent_jobs.read().clone()
@@ -410,6 +503,8 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 		{
 			return Err(SupervisorError::DuplicateJob { id: job.id.clone() });
 		}
+		let hook_gate = self.hook_gate.read().clone();
+		notify_job_registered(hook_gate.as_deref(), &job);
 		let (reply, response) = flume::bounded(1);
 		let settings = Arc::clone(&self.settings.read());
 		let cancel = Arc::new(CancellationToken::new());
@@ -420,15 +515,29 @@ impl<C: TurnClient + Clone + Send + 'static> SessionSupervisor<C> {
 			.map_err(|_| SupervisorError::Stopped { id: Str::from(id) })?;
 		let settlement_board = board;
 		let settlement_id = job.id.clone();
+		let settlement_job = job.clone();
 		tokio::spawn(async move {
-			let text = match response.recv_async().await {
-				Ok(Ok(summary)) => summary
-					.final_assistant()
-					.map_or_else(|| sf!("subagent completed"), Str::new),
-				Ok(Err(_)) => sf!("subagent failed; inspect its durable history for details"),
-				Err(_) => sf!("subagent supervisor stopped before settlement"),
+			let (text, failed) = match response.recv_async().await {
+				Ok(Ok(summary)) => (
+					summary
+						.final_assistant()
+						.map_or_else(|| sf!("subagent completed"), Str::new),
+					false,
+				),
+				Ok(Err(_)) => (sf!("subagent failed; inspect its durable history for details"), true),
+				Err(_) => (sf!("subagent supervisor stopped before settlement"), true),
 			};
-			let _ = settlement_board.settle(settlement_id.as_str(), system_item(text));
+			if settlement_board
+				.settle(settlement_id.as_str(), system_item(text))
+				.is_ok_and(|accepted| accepted)
+			{
+				notify_job_settled(
+					hook_gate.as_deref(),
+					&settlement_job,
+					failed,
+					now_ms().saturating_sub(now),
+				);
+			}
 		});
 		Ok(job)
 	}
@@ -1447,6 +1556,52 @@ mod tests {
 			})),
 			..Default::default()
 		}
+	}
+
+	#[test]
+	fn job_registered_and_settled_observations_preserve_payloads() {
+		let (gate, dispatches) = HookGate::channel();
+		let subscription = |event, id| omp_agent::Subscription {
+			host: sf!("test"),
+			source: omp_agent::SourceRef {
+				layer:        0,
+				publisher:    sf!("test"),
+				extension_id: sf!("jobs"),
+			},
+			id,
+			event,
+			phase: omp_agent::HookPhase::Observe,
+			order: 0,
+			on_failure: omp_agent::OnFailure::Defer,
+			when: omp_agent::When::default(),
+		};
+		gate
+			.subscribe("test", [
+				subscription(omp_proto::toolhost::v1::HookEventId::HookEventJobRegistered, 52),
+				subscription(omp_proto::toolhost::v1::HookEventId::HookEventJobSettled, 53),
+			])
+			.expect("job subscriptions");
+		let job = JobRef {
+			id:       sf!("job-1"),
+			owner:    JobOwner::AgentLoop { agent_id: sf!("worker-1") },
+			metadata: Arc::new(JobMetadata::running(JobKind::Task, sf!("task"), 10)),
+			artifact: ExpectedArtifact {
+				description: sf!("result"),
+				media_type:  None,
+				lifetime:    ArtifactLifetime::Durable,
+			},
+		};
+		notify_job_registered(Some(&gate), &job);
+		notify_job_settled(Some(&gate), &job, true, 25);
+		let registered = dispatches.try_recv().expect("job registered frame");
+		let settled = dispatches.try_recv().expect("job settled frame");
+		let registered: Value =
+			serde_json::from_slice(&registered.payload).expect("registered payload");
+		let settled: Value = serde_json::from_slice(&settled.payload).expect("settled payload");
+		assert_eq!(registered["job_id"], "job-1");
+		assert_eq!(registered["lifetime"], "durable");
+		assert_eq!(settled["failed"], true);
+		assert_eq!(settled["duration"], "25ms");
 	}
 
 	#[test]

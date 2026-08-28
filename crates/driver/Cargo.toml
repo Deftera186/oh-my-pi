@@ -93,6 +93,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+omp-tui = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 

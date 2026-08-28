@@ -25,18 +25,20 @@ pub mod skills;
 pub mod slash_commands;
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	env, iter,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
+use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
+use omp_agent::{GateError, GateEvent, GateOutcome, HookEvent, HookGate};
 use omp_catalog::{
 	ContextStrategy, Pricing, RouteId, ThinkingPolicyId, WirePolicyId,
 	discover::{DiscoveredModel, DiscoveryDefaults, DiscoveryNormalizer, NormalizedDiscovery},
 };
-use omp_core::{ArtifactDigest, Hash32, Provenance, Str};
+use omp_core::{ArtifactDigest, Hash32, Provenance, Str, sf};
 use omp_envd::{
 	exthost::{
 		DeclarationSet, ExtensionManifest, HookDeclarationKey, ServiceManifest, ToolDeclarationKey,
@@ -45,11 +47,14 @@ use omp_envd::{
 };
 use omp_ext::{
 	config::{
-		CliSettingOverride, DeploymentManifest, ScopedOverlay, fold_extension,
+		CliSettingOverride, DeploymentManifest, ResourceFamily, ScopedOverlay, fold_extension,
 		resolve_extension_settings,
 	},
 	trust::{Grant, GrantsFile, grant_covers},
 };
+use omp_proto::toolhost::v1::HookEventId;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use self::{
 	foreign::ForeignContentSettings,
@@ -97,24 +102,111 @@ pub struct ExtensionGrantSettings {
 }
 
 /// Stable resource families exposed at one discovery boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
 	/// One bounded skill document.
+	Skill,
 	/// One reusable prompt template.
+	Prompt,
 	/// One terminal theme.
+	Theme,
 	/// One declarative rule document.
+	Rule,
 	/// One static subagent definition.
+	Agent,
+}
+
 /// Reason one resource snapshot was assembled or refreshed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverReason {
 	/// Initial session discovery.
+	Startup,
 	/// Explicit resource reload.
+	Reload,
 	/// Workspace files changed.
+	WorkspaceChanged,
 	/// An installed or linked extension changed.
+	ExtensionChanged,
+}
+
 /// One file-backed resource visible to extension discovery hooks.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ResourceRef {
 	/// Canonical Environment path.
+	pub uri:    Str,
 	/// Typed resource family.
+	pub kind:   ResourceKind,
 	/// Stable discovery source identity.
+	pub origin: Str,
+}
+
+#[derive(Serialize)]
+struct ResourcesDiscoverPayload<'a> {
+	reason: DiscoverReason,
+	root:   &'a str,
+	found:  &'a [ResourceRef],
+	add:    &'a [ResourceRef],
+	keep:   Option<&'a BTreeSet<Str>>,
+}
+
+#[derive(Deserialize)]
+struct EffectiveResourcesDiscoverPayload {
+	#[serde(default)]
+	add:  Vec<ResourceRef>,
+	keep: Option<BTreeSet<Str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ResourcesChangedEvent {
+	added:   Box<[ResourceRef]>,
+	removed: Box<[ResourceRef]>,
+	reason:  DiscoverReason,
+}
+
+impl HookEvent for ResourcesChangedEvent {
+	type Return = ();
+
+	const ID: HookEventId = HookEventId::HookEventResourcesChanged;
+	const REV: u32 = 1;
+
+	fn encode_into(&self, out: &mut BytesMut) {
+		out.extend_from_slice(b"\n");
+		out.extend_from_slice(
+			&serde_json::to_vec(self).expect("resource change payload must serialize to JSON"),
+		);
+	}
+
+	fn apply(&mut self, _: &omp_agent::HookPatch) -> Result<(), GateError> {
+		Ok(())
+	}
+}
+
 /// Fail-closed refusal or malformed effective payload from resource discovery.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ResourceDiscoveryError {
 	/// A discovery handler denied the refresh.
+	#[error("resource discovery denied: {0}")]
+	Denied(Str),
 	/// A discovery handler returned a payload that did not match the event.
+	#[error("resource discovery returned a malformed effective payload")]
+	Malformed,
 	/// A contributed skill path failed containment or bounded-file admission.
+	#[error("resource discovery contribution was rejected: {0}")]
+	Contribution(Str),
+}
+
+#[derive(Debug, Error)]
+enum ExtensionAdmissionError {
+	#[error("extension {extension} at {path} was not admitted: duplicate extension identity")]
+	DuplicateIdentity { extension: Str, path: PathBuf },
+	#[error(
+		"extension {extension} was not admitted: entry module `{module}` was not found under {site}"
+	)]
+	MissingEntry { extension: Str, module: Str, site: PathBuf },
+}
+
 /// One installed extension omitted pending a Core-owned operator decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionGrantRequest {
@@ -269,8 +361,151 @@ pub fn active_content_snapshots_with_skill_contributions(
 ///
 /// The immutable snapshot is returned unchanged when ordinal 35 is not
 /// subscribed, without constructing the resource inventory or a CONTROL frame.
+pub async fn gate_resources_discover(
+	gate: &HookGate,
+	reason: DiscoverReason,
+	root: &Path,
+	allowed_roots: &[PathBuf],
+	settings: &PromptDiscoverySettings,
+	snapshot: ActiveContentSnapshots,
+) -> Result<ActiveContentSnapshots, ResourceDiscoveryError> {
+	if !gate.subscribed(HookEventId::HookEventResourcesDiscover) {
+		return Ok(snapshot);
+	}
+	let found = resource_refs(snapshot.declarations.as_ref());
+	let root_text = root.to_string_lossy();
+	let requested = ResourcesDiscoverPayload {
+		reason,
+		root: root_text.as_ref(),
+		found: &found,
+		add: &[],
+		keep: None,
+	};
+	let bytes =
+		serde_json::to_vec(&requested).expect("resource discovery payload must serialize to JSON");
+	let outcome = gate
+		.gate(
+			HookEventId::HookEventResourcesDiscover,
+			GateEvent::new(sf!("resources_discover"), Bytes::from(bytes)),
+		)
+		.await;
+	let effective = match outcome {
+		GateOutcome::Allow { event, .. } => event.effective_args,
+		GateOutcome::Deny { reason, .. } => return Err(ResourceDiscoveryError::Denied(reason)),
+		GateOutcome::Approval { .. } => {
+			return Err(ResourceDiscoveryError::Denied(sf!(
+				"resource discovery cannot require approval"
+			)));
+		},
+	};
+	let effective: EffectiveResourcesDiscoverPayload =
+		serde_json::from_slice(&effective).map_err(|_| ResourceDiscoveryError::Malformed)?;
+	let before = snapshot.clone();
+	let after = apply_resource_transform(snapshot, settings, allowed_roots, effective)?;
+	notify_resources_changed(gate, reason, &before, &after);
+	Ok(after)
+}
+
 /// Emits one observe notification when a committed discovery refresh changed
 /// the representable resource set.
+pub fn notify_resources_changed(
+	gate: &HookGate,
+	reason: DiscoverReason,
+	before: &ActiveContentSnapshots,
+	after: &ActiveContentSnapshots,
+) {
+	if !gate.subscribed(HookEventId::HookEventResourcesChanged) {
+		return;
+	}
+	let before = resource_refs(before.declarations.as_ref())
+		.into_iter()
+		.collect::<BTreeSet<_>>();
+	let after = resource_refs(after.declarations.as_ref())
+		.into_iter()
+		.collect::<BTreeSet<_>>();
+	let added = after.difference(&before).cloned().collect::<Vec<_>>();
+	let removed = before.difference(&after).cloned().collect::<Vec<_>>();
+	if added.is_empty() && removed.is_empty() {
+		return;
+	}
+	gate.notify(&ResourcesChangedEvent {
+		added: added.into_boxed_slice(),
+		removed: removed.into_boxed_slice(),
+		reason,
+	});
+}
+
+fn apply_resource_transform(
+	mut snapshot: ActiveContentSnapshots,
+	settings: &PromptDiscoverySettings,
+	allowed_roots: &[PathBuf],
+	effective: EffectiveResourcesDiscoverPayload,
+) -> Result<ActiveContentSnapshots, ResourceDiscoveryError> {
+	let mut declarations = snapshot.declarations.as_ref().to_vec();
+	for addition in effective
+		.add
+		.iter()
+		.filter(|addition| addition.kind == ResourceKind::Skill)
+	{
+		let composed = serde_json::json!({"add": [addition]});
+		let admitted =
+			omp_envd::exthost::dispatch::admit_skill_path_contributions(&composed, allowed_roots)
+				.map_err(|error| ResourceDiscoveryError::Contribution(Str::from(error.to_string())))?;
+		let sources = skills::contributed_sources(
+			&addition.origin,
+			admitted
+				.into_iter()
+				.map(|contribution| (contribution.path, contribution.contain_root)),
+		);
+		let discovered = skills::discover(&sources, &settings.skills);
+		declarations.extend(discovered.declarations);
+		let mut warnings = snapshot.warnings.as_ref().to_vec();
+		warnings.extend(
+			discovered
+				.warnings
+				.into_iter()
+				.map(|warning| warning.message),
+		);
+		snapshot.warnings = warnings.into();
+	}
+	if let Some(keep) = effective.keep {
+		declarations.retain(|declaration| {
+			declaration_resource_ref(declaration).is_none_or(|resource| keep.contains(&resource.uri))
+		});
+	}
+	snapshot.skills = Arc::new(SkillSnapshot::from_declarations(&declarations));
+	snapshot.rules = Arc::new(RuleSnapshot::from_declarations(&declarations, &settings.rules));
+	snapshot.declarations = declarations.into();
+	Ok(snapshot)
+}
+
+fn resource_refs(declarations: &[DiscoveredCapability]) -> Vec<ResourceRef> {
+	let mut resources = declarations
+		.iter()
+		.filter(|declaration| declaration.enabled)
+		.filter_map(declaration_resource_ref)
+		.collect::<Vec<_>>();
+	resources.sort();
+	resources.dedup();
+	resources
+}
+
+fn declaration_resource_ref(declaration: &DiscoveredCapability) -> Option<ResourceRef> {
+	let (kind, path) = match &declaration.payload {
+		CapabilityPayload::Skills(value) => (ResourceKind::Skill, value.path.as_path()),
+		CapabilityPayload::Themes(value) => (ResourceKind::Theme, value.path.as_path()),
+		CapabilityPayload::Prompts(value) => (ResourceKind::Prompt, value.path.as_path()),
+		CapabilityPayload::Rules(value) => (ResourceKind::Rule, value.path.as_path()),
+		CapabilityPayload::Agents(value) => (ResourceKind::Agent, value.path.as_path()),
+		_ => return None,
+	};
+	Some(ResourceRef {
+		uri: Str::from(path.to_string_lossy().as_ref()),
+		kind,
+		origin: declaration.source.source_id.clone(),
+	})
+}
+
 /// Derives the canonical local workspace grant identity used by extension
 /// admission and extension management commands.
 pub fn workspace_identity(root: &Path) -> omp_ext::WorkspaceUri {
@@ -321,6 +556,29 @@ fn active_content_snapshots_with_home(
 			.into_iter()
 			.map(|warning| warning.message),
 	);
+	let extension_themes = discovered
+		.declarations
+		.iter()
+		.filter_map(|declaration| {
+			let CapabilityPayload::Extensions(extension) = &declaration.payload else {
+				return None;
+			};
+			let static_declarations = extension.static_declarations().ok()?;
+			Some(manifest::discover_manifest_themes(
+				&extension.name,
+				&extension.root,
+				&static_declarations.ordered,
+			))
+		})
+		.collect::<Vec<_>>();
+	for themes in extension_themes {
+		discovered.declarations.extend(themes.declarations);
+		discovered.warnings.extend(
+			themes.warnings.into_iter().map(|warning| {
+				Str::from(format!("ignored extension theme {}", warning.path.display()))
+			}),
+		);
+	}
 	let contributed_skills = skills::discover(contributed_skill_sources, &settings.skills);
 	discovered
 		.declarations
@@ -345,6 +603,19 @@ fn active_content_snapshots_with_home(
 	discovered
 		.warnings
 		.extend(managed.warnings.into_iter().map(|warning| warning.message));
+	discovered.declarations.retain(|declaration| {
+		let Some(package_id) = declaration.source.installed_package_id.as_ref() else {
+			return true;
+		};
+		let Some((family, path)) = package_resource_path(declaration) else {
+			return true;
+		};
+		fold_extension(&settings.extension_scopes, package_id).resource_enabled(
+			family,
+			path.as_str(),
+			true,
+		)
+	});
 	discovered.declarations.retain(|declaration| {
 		discovery_provider_id(declaration.source.source_id.as_str()).is_none_or(|provider| {
 			!disabled_providers
@@ -426,6 +697,39 @@ fn active_content_snapshots_with_home(
 		process_tools:    Arc::new(process_tools),
 	}
 }
+
+fn package_resource_path(declaration: &DiscoveredCapability) -> Option<(ResourceFamily, String)> {
+	let family = match &declaration.payload {
+		CapabilityPayload::Extensions(_) => ResourceFamily::Extensions,
+		CapabilityPayload::Skills(_) => ResourceFamily::Skills,
+		CapabilityPayload::Prompts(_) => ResourceFamily::Prompts,
+		CapabilityPayload::Themes(_) => ResourceFamily::Themes,
+		_ => return None,
+	};
+	let directory = family.to_string();
+	let components = declaration.source.path.components().collect::<Vec<_>>();
+	let start = components
+		.iter()
+		.position(|component| component.as_os_str() == directory.as_str());
+	let path = start.map_or_else(
+		|| {
+			declaration
+				.source
+				.path
+				.file_name()
+				.map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+		},
+		|start| {
+			components[start..]
+				.iter()
+				.map(|component| component.as_os_str().to_string_lossy())
+				.collect::<Vec<_>>()
+				.join("/")
+		},
+	);
+	Some((family, path))
+}
+
 fn admit_extension_specs(
 	declarations: &[DiscoveredCapability],
 	grant_settings: Option<&ExtensionGrantSettings>,
@@ -454,6 +758,13 @@ fn admit_extension_specs(
 			continue;
 		};
 		if !seen.insert(extension.name.clone()) {
+			warnings.push(Str::from(
+				ExtensionAdmissionError::DuplicateIdentity {
+					extension: extension.name.clone(),
+					path:      declaration.source.path.clone(),
+				}
+				.to_string(),
+			));
 			continue;
 		}
 		let Some(worker) = &extension.worker else {
@@ -482,7 +793,11 @@ fn admit_extension_specs(
 					.map(Str::new)
 			})
 			.collect::<std::collections::BTreeSet<_>>();
-		if let Some(_settings) = grant_settings {
+		// An explicit invocation root is itself the operator's admission decision;
+		// durable grants apply only to installed package records.
+		if let Some(_settings) = grant_settings
+			&& declaration.source.scope != SourceScope::Native
+		{
 			let Some(facts) = extension.grant.as_ref() else {
 				warnings.push(Str::from(format!(
 					"extension {} was not admitted: installed package has no locked grant identity",
@@ -551,11 +866,13 @@ fn admit_extension_specs(
 						publisher:         facts.publisher.clone(),
 						layer:             facts.layer,
 						workspace:         facts.workspace.clone(),
+						scope:             omp_ext::trust::GrantScope::Exact,
 						capability_digest: facts.capability_digest.clone(),
 						tier:              facts.tier,
 						ship:              facts.ship.clone(),
 						granted_at:        Str::new_static(""),
 						granted_by:        Str::new_static("interactive"),
+						duration:          omp_ext::trust::GrantDuration::Persistent,
 					},
 					requested_capabilities: requested_capabilities
 						.iter()
@@ -575,41 +892,49 @@ fn admit_extension_specs(
 			.tools
 			.iter()
 			.filter_map(|row| {
-				let name = if row.key.is_empty() {
-					&row.id
-				} else {
-					&row.key
-				};
-				if name.is_empty() {
-					return None;
-				}
-				let family = row
-					.properties
-					.get("family")
-					.and_then(serde_json::Value::as_str)
-					.unwrap_or(extension.name.as_str());
-				let rev = row
-					.properties
-					.get("rev")
-					.and_then(serde_json::Value::as_u64)
-					.and_then(|rev| u16::try_from(rev).ok())
-					.unwrap_or_else(|| u16::try_from(row.api).unwrap_or(1).max(1));
-				Some(ToolDeclarationKey::new(name.clone(), family, rev))
+				let uniform_key = row.key.rsplit_once('@').and_then(|(name, revision)| {
+					let (family, rev) = revision.rsplit_once('.')?;
+					let rev = rev.parse::<u16>().ok()?;
+					(!name.is_empty()).then_some((name, family, rev))
+				});
+				let (name, family, rev) = uniform_key.unwrap_or_else(|| {
+					let name = if row.key.is_empty() {
+						row.id.as_str()
+					} else {
+						row.key.as_str()
+					};
+					let family = row
+						.properties
+						.get("family")
+						.and_then(serde_json::Value::as_str)
+						.unwrap_or(extension.name.as_str());
+					let rev = row
+						.properties
+						.get("rev")
+						.and_then(serde_json::Value::as_u64)
+						.and_then(|rev| u16::try_from(rev).ok())
+						.unwrap_or_else(|| u16::try_from(row.api).unwrap_or(1).max(1));
+					(name, family, rev)
+				});
+				(!name.is_empty()).then(|| ToolDeclarationKey::new(name, family, rev))
 			})
 			.collect::<Vec<_>>();
 		let hooks = static_declarations
 			.hooks
 			.iter()
 			.filter_map(|row| {
+				let uniform_key = row.key.rsplit_once('/');
 				let event = row
 					.properties
 					.get("event")
 					.and_then(serde_json::Value::as_str)
+					.or_else(|| uniform_key.map(|(event, _)| event))
 					.unwrap_or(row.key.as_str());
 				let phase = row
 					.properties
 					.get("phase")
 					.and_then(serde_json::Value::as_str)
+					.or_else(|| uniform_key.map(|(_, phase)| phase))
 					.unwrap_or("observe")
 					.parse::<omp_agent::HookPhase>()
 					.ok()?;
@@ -647,8 +972,10 @@ fn admit_extension_specs(
 			.get("version")
 			.and_then(serde_json::Value::as_str)
 			.map_or_else(|| Str::new_static("0"), Str::new);
-		let tier = admitted_tier
-			.map_or_else(|| Str::new_static("native"), |tier| Str::from(tier.to_string()));
+		// Ungranted loads (one-invocation --plugin-dir, unsigned links) launch in
+		// the default isolated tier; the spawn policy only knows sandboxed and
+		// trusted.
+		let tier = Str::from(admitted_tier.unwrap_or_default().to_string());
 		let settings_schema = extension
 			.manifest
 			.get("settings")
@@ -731,11 +1058,21 @@ fn admit_extension_specs(
 		let module_path = python_site.join(worker.module.as_str().replace('.', "/"));
 		let module_file = module_path.with_extension("py");
 		let package_file = module_path.join("__init__.py");
-		if module_file.is_file() {
-			spec.entry_path = Some(module_file);
+		spec.entry_path = if module_file.is_file() {
+			Some(module_file)
 		} else if package_file.is_file() {
-			spec.entry_path = Some(package_file);
-		}
+			Some(package_file)
+		} else {
+			warnings.push(Str::from(
+				ExtensionAdmissionError::MissingEntry {
+					extension: extension.name.clone(),
+					module:    worker.module.clone(),
+					site:      python_site,
+				}
+				.to_string(),
+			));
+			continue;
+		};
 		match omp_ext::config::CliContributionSet::build(extension.cli.clone(), []) {
 			Ok(cli) => spec.cli_contributions = cli,
 			Err(error) => {
@@ -917,6 +1254,54 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn packaged_theme_is_discovered_and_loadable() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let repo = home.join("repo");
+		let theme = repo.join(".omp/demo/themes/ocean.json");
+		fs::create_dir_all(theme.parent().expect("theme parent")).expect("theme directory");
+		fs::write(&theme, r##"{"name":"ocean","dark":{"fg":"#dcecff","accent":"#32a8c6"}}"##)
+			.expect("theme");
+		fs::write(
+			repo.join(".omp/omp.toml"),
+			r#"
+id = "demo"
+entry = "demo"
+
+[[declarations]]
+kind = "themes"
+path = "demo/themes/*.json"
+"#,
+		)
+		.expect("manifest");
+		let snapshot = active_content_snapshots_with_home(
+			&repo,
+			&home,
+			&[],
+			&PromptDiscoverySettings::default(),
+			&[],
+		);
+		let declaration = snapshot
+			.declarations
+			.iter()
+			.find(|declaration| matches!(&declaration.payload, CapabilityPayload::Themes(_)))
+			.expect("packaged theme");
+		let CapabilityPayload::Themes(theme) = &declaration.payload else {
+			unreachable!()
+		};
+		assert_eq!(declaration.source.scope, SourceScope::Package);
+		assert_eq!(declaration.source.installed_package_id.as_deref(), Some("demo"));
+		assert_eq!(theme.name, "ocean");
+		assert!(theme.path.ends_with("themes/ocean.json"));
+		assert_eq!(
+			omp_tui::JsonTheme::parse(theme.content.as_str())
+				.expect("loadable theme")
+				.name,
+			"ocean"
+		);
+	}
+
 	#[tokio::test]
 	async fn static_extension_skill_is_frozen_until_the_next_snapshot() {
 		let tree = tempfile::tempdir().expect("tree");
@@ -987,10 +1372,18 @@ entry = "demo"
 id = "hello"
 kind = "soft"
 module = "demo"
-key = "hello"
+key = "hello@demo.1"
+trigger = "lazy"
 api = 1
-family = "demo"
-rev = 1
+failure = "fail-closed"
+[[declarations]]
+id = "activated"
+kind = "hook"
+module = "demo"
+key = "extension_activate/observe"
+trigger = "lazy"
+api = 1
+failure = "fail-open"
 "#,
 		)
 		.expect("deployment manifest");
@@ -1032,6 +1425,23 @@ rev = 1
 		assert_eq!(spec.watch_root.as_deref(), Some(linked.as_path()));
 		let entry = linked.join("src/demo/__init__.py");
 		assert_eq!(spec.entry_path.as_deref(), Some(entry.as_path()));
+		let tool = spec
+			.manifest
+			.declarations
+			.tools()
+			.next()
+			.expect("uniform tool declaration");
+		assert_eq!(tool.name, "hello");
+		assert_eq!(tool.family, "demo");
+		assert_eq!(tool.rev, 1);
+		let hook = spec
+			.manifest
+			.declarations
+			.hooks()
+			.next()
+			.expect("uniform hook declaration");
+		assert_eq!(hook.event, "extension_activate");
+		assert_eq!(hook.phase, omp_agent::HookPhase::Observe);
 	}
 
 	#[test]
@@ -1054,7 +1464,54 @@ rev = 1
 		assert!(!snapshot.content.process_tools.is_empty());
 	}
 
+	#[test]
+	fn explicit_invocation_extension_does_not_require_an_installed_grant() {
+		let tree = tempfile::tempdir().expect("tree");
+		let home = tree.path().join("home");
+		let repo = home.join("repo");
+		let extension = tree.path().join("demo");
+		fs::create_dir_all(&repo).expect("repository");
+		fs::create_dir_all(extension.join("src/demo")).expect("extension package");
+		fs::write(extension.join("omp.toml"), "id = \"demo\"\nentry = \"demo\"\n").expect("manifest");
+		fs::write(extension.join("src/demo/__init__.py"), "def activate(): pass\n").expect("worker");
+		let mut settings = PromptDiscoverySettings {
+			native: native::NativeDiscoveryOptions {
+				explicit_roots: vec![extension.clone()],
+				root_mode: native::NativeRootMode::ExplicitOnly,
+				..native::NativeDiscoveryOptions::default()
+			},
+			grants: Some(ExtensionGrantSettings {
+				path:    tree.path().join("grants.toml"),
+				session: Arc::from([]),
+			}),
+			..PromptDiscoverySettings::default()
+		};
+		let snapshot = active_prompt_snapshots(&repo, &[], &home, &settings);
+		assert!(snapshot.content.warnings.is_empty(), "{:?}", snapshot.content.warnings);
+		assert_eq!(snapshot.content.extensions.len(), 1);
+		let spec = &snapshot.content.extensions[0];
+		assert_eq!(spec.key.extension(), "demo");
+		assert_eq!(spec.key.layer(), "native");
+		let entry = fs::canonicalize(extension.join("src/demo/__init__.py")).expect("entry path");
+		assert_eq!(spec.entry_path.as_deref(), Some(entry.as_path()));
+
+		let duplicate = tree.path().join("duplicate");
+		fs::create_dir_all(duplicate.join("src/demo")).expect("duplicate package");
+		fs::write(duplicate.join("omp.toml"), "id = \"demo\"\nentry = \"demo\"\n")
+			.expect("duplicate manifest");
+		fs::write(duplicate.join("src/demo/__init__.py"), "def activate(): pass\n")
+			.expect("duplicate worker");
+		settings.native.explicit_roots.push(duplicate.clone());
+		let duplicate_snapshot = active_prompt_snapshots(&repo, &[], &home, &settings);
+		assert_eq!(duplicate_snapshot.content.extensions.len(), 1);
+		assert!(duplicate_snapshot.content.warnings.iter().any(|warning| {
+			warning.contains(duplicate.join("omp.toml").to_string_lossy().as_ref())
+				&& warning.contains("duplicate extension identity")
+		}));
+	}
+
 	fn installed_extension(root: &Path, capabilities: &[&str]) -> DiscoveredCapability {
+		std::fs::write(root.join("worker.py"), "").expect("fixture entry module");
 		let manifest = [(sf!("capabilities"), serde_json::json!({"data": capabilities}))]
 			.into_iter()
 			.collect();
@@ -1149,11 +1606,13 @@ rev = 1
 		let once = Grant {
 			granted_at: sf!("now"),
 			granted_by: sf!("interactive-once"),
+			duration: omp_ext::trust::GrantDuration::Once,
 			..requests[0].grant.clone()
 		};
 		let session = grant_settings(&tree.path().join("grants.toml"), vec![once]);
-		let (admitted, pending, _) = admit_extension_specs(&declarations, Some(&session), &[], &[]);
-		assert_eq!(admitted.len(), 1);
+		let (admitted, pending, session_warnings) =
+			admit_extension_specs(&declarations, Some(&session), &[], &[]);
+		assert_eq!(admitted.len(), 1, "{session_warnings:?}");
 		assert!(pending.is_empty());
 		let (next_session, denied, warnings) =
 			admit_extension_specs(&declarations, Some(&empty), &[], &[]);
@@ -1181,8 +1640,188 @@ rev = 1
 		GrantsFile::persist(&path, grant).expect("persist grant");
 		let (admitted, pending, warnings) =
 			admit_extension_specs(&declarations, Some(&settings), &[], &[]);
-		assert_eq!(admitted.len(), 1);
+		assert_eq!(admitted.len(), 1, "{warnings:?}");
 		assert!(pending.is_empty());
 		assert!(warnings.is_empty());
+	}
+
+	fn resource_subscription(
+		event: HookEventId,
+		phase: omp_agent::HookPhase,
+		id: u32,
+	) -> omp_agent::Subscription {
+		omp_agent::Subscription {
+			host: sf!("test"),
+			source: omp_agent::SourceRef {
+				layer:        0,
+				publisher:    sf!("test"),
+				extension_id: sf!("resource-hooks"),
+			},
+			id,
+			event,
+			phase,
+			order: 0,
+			on_failure: omp_agent::OnFailure::Deny,
+			when: omp_agent::When::default(),
+		}
+	}
+
+	fn write_skill(path: &Path, name: &str) {
+		fs::create_dir_all(path.parent().expect("skill parent")).expect("skill directory");
+		fs::write(
+			path,
+			format!("---\nname: {name}\ndescription: '{name} skill.'\n---\n\n# {name}\n"),
+		)
+		.expect("skill");
+	}
+
+	#[tokio::test]
+	async fn resources_discover_appends_skill_and_intersects_existing_resources() {
+		let tree = tempfile::tempdir().expect("tree");
+		let repo = tree.path().join("repo");
+		fs::create_dir_all(&repo).expect("repository");
+		let keep = tree.path().join("existing/keep/SKILL.md");
+		let drop_path = tree.path().join("existing/drop/SKILL.md");
+		let added = tree.path().join("added/new/SKILL.md");
+		write_skill(&keep, "keep");
+		write_skill(&drop_path, "drop");
+		write_skill(&added, "added");
+		let contain_root = tree.path().canonicalize().expect("contain root");
+		let before =
+			active_content_snapshots_with_skill_contributions(&repo, &sf!("fixture.static"), &[
+				omp_envd::exthost::dispatch::SkillPathContribution {
+					path:         keep.canonicalize().expect("keep path"),
+					contain_root: contain_root.clone(),
+				},
+				omp_envd::exthost::dispatch::SkillPathContribution {
+					path:         drop_path.canonicalize().expect("drop path"),
+					contain_root: contain_root.clone(),
+				},
+			]);
+		let keep_uri = Str::from(
+			keep
+				.canonicalize()
+				.expect("keep path")
+				.to_string_lossy()
+				.as_ref(),
+		);
+		let added_uri = Str::from(
+			added
+				.canonicalize()
+				.expect("added path")
+				.to_string_lossy()
+				.as_ref(),
+		);
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [resource_subscription(
+				HookEventId::HookEventResourcesDiscover,
+				omp_agent::HookPhase::Transform,
+				35,
+			)])
+			.expect("resource subscription");
+		let gate = Arc::new(gate);
+		let responder_gate = Arc::clone(&gate);
+		let responder_keep = keep_uri.clone();
+		let responder_added = added_uri.clone();
+		let responder = tokio::spawn(async move {
+			let dispatch = dispatches.recv_async().await.expect("resource dispatch");
+			assert_eq!(dispatch.event, HookEventId::HookEventResourcesDiscover);
+			let separator = dispatch
+				.payload
+				.iter()
+				.position(|byte| *byte == b'\n')
+				.expect("payload separator");
+			let mut payload: serde_json::Value =
+				serde_json::from_slice(&dispatch.payload[separator + 1..]).expect("payload");
+			assert!(
+				payload["found"]
+					.as_array()
+					.is_some_and(|found| found.len() >= 2)
+			);
+			payload["add"] = serde_json::json!([{
+				"uri": responder_added,
+				"kind": "skill",
+				"origin": "fixture.dynamic",
+			}]);
+			payload["keep"] = serde_json::json!([responder_keep, responder_added]);
+			responder_gate
+				.answer(dispatch.dispatch_id, vec![(
+					35,
+					omp_agent::GateDecision::Modify(omp_agent::HookPatch {
+						target: None,
+						args:   Some(Bytes::from(
+							serde_json::to_vec(&payload).expect("effective payload"),
+						)),
+					}),
+				)])
+				.expect("resource decision");
+		});
+		let after = gate_resources_discover(
+			&gate,
+			DiscoverReason::Startup,
+			&repo,
+			&[contain_root],
+			&PromptDiscoverySettings::default(),
+			before,
+		)
+		.await
+		.expect("resource discovery");
+		responder.await.expect("resource responder");
+		let names = after
+			.skills
+			.all()
+			.iter()
+			.map(|skill| skill.name.as_str())
+			.collect::<BTreeSet<_>>();
+		assert!(names.contains("keep"));
+		assert!(names.contains("added"));
+		assert!(!names.contains("drop"));
+	}
+
+	#[test]
+	fn resources_changed_emits_one_frame_for_one_committed_refresh() {
+		let tree = tempfile::tempdir().expect("tree");
+		let repo = tree.path().join("repo");
+		fs::create_dir_all(&repo).expect("repository");
+		let first = tree.path().join("skills/first/SKILL.md");
+		let second = tree.path().join("skills/second/SKILL.md");
+		write_skill(&first, "first");
+		write_skill(&second, "second");
+		let contain_root = tree.path().canonicalize().expect("contain root");
+		let contribution = |path: &Path| omp_envd::exthost::dispatch::SkillPathContribution {
+			path:         path.canonicalize().expect("skill path"),
+			contain_root: contain_root.clone(),
+		};
+		let before =
+			active_content_snapshots_with_skill_contributions(&repo, &sf!("fixture.static"), &[
+				contribution(&first),
+			]);
+		let after =
+			active_content_snapshots_with_skill_contributions(&repo, &sf!("fixture.static"), &[
+				contribution(&first),
+				contribution(&second),
+			]);
+		let (gate, dispatches) = HookGate::channel();
+		gate
+			.subscribe("test", [resource_subscription(
+				HookEventId::HookEventResourcesChanged,
+				omp_agent::HookPhase::Observe,
+				36,
+			)])
+			.expect("resource changed subscription");
+		notify_resources_changed(&gate, DiscoverReason::Reload, &before, &after);
+		let dispatch = dispatches.try_recv().expect("one resource changed frame");
+		assert_eq!(dispatch.event, HookEventId::HookEventResourcesChanged);
+		let separator = dispatch
+			.payload
+			.iter()
+			.position(|byte| *byte == b'\n')
+			.expect("payload separator");
+		let payload: serde_json::Value =
+			serde_json::from_slice(&dispatch.payload[separator + 1..]).expect("payload");
+		assert_eq!(payload["added"].as_array().map(Vec::len), Some(1));
+		assert_eq!(payload["removed"].as_array().map(Vec::len), Some(0));
+		assert!(dispatches.try_recv().is_err(), "refresh emitted more than one frame");
 	}
 }

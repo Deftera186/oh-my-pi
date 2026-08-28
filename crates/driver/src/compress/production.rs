@@ -178,6 +178,17 @@ impl ProductionCompressHost {
 			bridges,
 		)
 		.await?;
+		let resource_roots = [root.clone()];
+		let _active = discovery::gate_resources_discover(
+			environment.admission_gate().as_ref(),
+			discovery::DiscoverReason::Startup,
+			&root,
+			&resource_roots,
+			&prompt_settings,
+			active,
+		)
+		.await
+		.map_err(|_| ProductionError::Session)?;
 		let documents = environment.documents().clone();
 		Ok(Self { root, data_dir, documents, model_settings, _environment: environment, progress })
 	}

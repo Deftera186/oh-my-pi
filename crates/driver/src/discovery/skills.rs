@@ -4,6 +4,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use omp_core::Str;
@@ -227,6 +228,12 @@ pub struct SkillDiscovery {
 struct SkillHeader {
 	name:                     Option<String>,
 	description:              Option<String>,
+	license:                  Option<String>,
+	compatibility:            Option<String>,
+	#[serde(default)]
+	metadata:                 BTreeMap<Str, serde_json::Value>,
+	#[serde(default, rename = "allowed-tools", alias = "allowedTools")]
+	allowed_tools:            ToolList,
 	#[serde(default)]
 	globs:                    StringList,
 	#[serde(default)]
@@ -235,8 +242,32 @@ struct SkillHeader {
 	enabled:                  Option<bool>,
 	#[serde(default, alias = "hide")]
 	hidden:                   bool,
-	#[serde(default)]
+	#[serde(default, alias = "disable-model-invocation")]
 	disable_model_invocation: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(untagged)]
+enum ToolList {
+	One(String),
+	Many(Vec<String>),
+	#[default]
+	None,
+}
+
+impl ToolList {
+	fn values(self) -> Vec<Str> {
+		match self {
+			Self::One(value) => value.split_whitespace().map(Str::from).collect(),
+			Self::Many(values) => values
+				.into_iter()
+				.map(|value| value.trim().to_owned())
+				.filter(|value| !value.is_empty())
+				.map(Str::from)
+				.collect(),
+			Self::None => Vec::new(),
+		}
+	}
 }
 
 #[derive(Default, Deserialize)]
@@ -417,19 +448,27 @@ pub fn discover(sources: &[SkillSource], settings: &SkillDiscoverySettings) -> S
 				name:         key.clone(),
 				path:         canonical.clone(),
 				content:      Str::from(content),
-				frontmatter:  SkillFrontmatter {
+				frontmatter:  Arc::new(SkillFrontmatter {
 					description:              header
 						.description
 						.map(|value| Str::from(value.trim().to_owned())),
+					license:                  header
+						.license
+						.map(|value| Str::from(value.trim().to_owned())),
+					compatibility:            header
+						.compatibility
+						.map(|value| Str::from(value.trim().to_owned())),
+					metadata:                 header.metadata,
+					allowed_tools:            header.allowed_tools.values(),
 					globs:                    header.globs.values(),
 					always_apply:             header.always_apply,
 					hidden:                   header.hidden,
 					disable_model_invocation: header.disable_model_invocation,
-				},
+				}),
 				contain_root: source.contain_root.clone(),
 			};
 			if let Some(description) = managed_description {
-				payload.frontmatter.description = Some(description);
+				Arc::make_mut(&mut payload.frontmatter).description = Some(description);
 			}
 			let mut provenance = SourceProvenance::native(source.id.clone(), canonical, source.scope);
 			provenance.read_only = source.read_only;
@@ -685,6 +724,47 @@ mod tests {
 	use std::fs;
 
 	use super::*;
+
+	#[test]
+	fn pi_frontmatter_spelling_and_compatibility_fields_are_retained() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("frontmatter");
+		let skill = root.join("compat/SKILL.md");
+		fs::create_dir_all(skill.parent().unwrap()).unwrap();
+		fs::write(
+			&skill,
+			"---\nname: compat\ndescription: compatible\nlicense: Apache-2.0\ncompatibility: \
+			 Requires git\nmetadata:\n  author: pi\n  revision: 2\nallowed-tools: Read Grep \
+			 Bash\ndisable-model-invocation: true\n---\nbody",
+		)
+		.unwrap();
+		let result = discover(
+			&[SkillSource {
+				id: Str::new_static("test"),
+				root,
+				scope: SourceScope::Project,
+				include_root: false,
+				require_description: true,
+				contain_root: None,
+				read_only: false,
+				kind: SkillSourceKind::Native,
+			}],
+			&SkillDiscoverySettings::default(),
+		);
+		let CapabilityPayload::Skills(skill) = &result.declarations[0].payload else {
+			panic!("skill payload")
+		};
+		assert!(skill.frontmatter.disable_model_invocation);
+		assert_eq!(skill.frontmatter.license.as_deref(), Some("Apache-2.0"));
+		assert_eq!(skill.frontmatter.compatibility.as_deref(), Some("Requires git"));
+		assert_eq!(skill.frontmatter.allowed_tools, [
+			Str::new_static("Read"),
+			Str::new_static("Grep"),
+			Str::new_static("Bash")
+		]);
+		assert_eq!(skill.frontmatter.metadata["author"], "pi");
+		assert_eq!(skill.frontmatter.metadata["revision"], 2);
+	}
 
 	#[test]
 	fn scans_nested_skills_and_applies_gates_before_collision() {

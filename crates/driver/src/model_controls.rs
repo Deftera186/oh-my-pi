@@ -12,10 +12,11 @@ use bytes::BytesMut;
 use futures::StreamExt as _;
 use http::header::{HeaderName, HeaderValue};
 use omp_catalog::{
-	AccountScope, AuthSpecKind, CredentialSourceSpec, EndpointSpec, ModelKey, ProvenanceKind,
-	ThinkingEffort, capability,
+	AccountScope, AuthSpecKind, CredentialSourceSpec, EndpointSpec, ModelKey, ModelSpec,
+	ProvenanceKind, ThinkingEffort, capability,
 	capability::{AudioFormatBits, SearchFeatureBits},
 	provider::CodexTransportPreference,
+	settings::{ModelSettings, PathScopedStringEntry, model_pattern_matches},
 	snapshot,
 };
 use omp_core::{InvocationPhase, LifecyclePhase, Str, sf};
@@ -144,6 +145,65 @@ impl ModelControls {
 		self.scoped = scoped;
 	}
 
+	/// Resolves the ordered settings scope against the live catalog.
+	///
+	/// Patterns are expanded in settings order, and the first occurrence of a
+	/// model owns its thinking effort. The availability predicate removes
+	/// models that cannot currently be selected before cycling.
+	/// Path-scoped settings must be resolved for the session before this call.
+	pub fn set_scoped_from_settings(
+		&mut self,
+		catalog: &snapshot::Catalog,
+		settings: &ModelSettings,
+		available: impl Fn(&ModelKey<str>) -> bool,
+	) {
+		let candidates = catalog
+			.models()
+			.iter()
+			.filter(|model| {
+				available(&model.key)
+					&& model.routes.iter().any(|route| {
+						catalog
+							.route(route)
+							.is_some_and(|route| settings.provider_allowed(route.provider.as_str()))
+					})
+			})
+			.collect::<Vec<_>>();
+		let mut scoped = Vec::new();
+		let mut seen = BTreeSet::new();
+		for pattern in settings
+			.enabled_models
+			.iter()
+			.filter_map(|entry| match entry {
+				PathScopedStringEntry::Bare(pattern) => Some(pattern.as_str()),
+				PathScopedStringEntry::Scoped(_) => None,
+			}) {
+			if pattern
+				.bytes()
+				.any(|byte| matches!(byte, b'*' | b'?' | b'['))
+			{
+				let (pattern, thinking) = split_glob_thinking(pattern);
+				for model in candidates
+					.iter()
+					.copied()
+					.filter(|model| scope_pattern_matches(catalog, settings, model, pattern))
+				{
+					push_scoped(&mut scoped, &mut seen, model, thinking);
+				}
+			} else if let Some((model, thinking)) =
+				resolve_named_scope_pattern(catalog, settings, &candidates, pattern)
+			{
+				push_scoped(&mut scoped, &mut seen, model, thinking);
+			}
+		}
+		self.scoped = scoped.into();
+	}
+
+	/// Returns the resolved temporary cycle scope.
+	pub fn scoped_models(&self) -> &[ScopedModel] {
+		&self.scoped
+	}
+
 	/// Cycles the filtered scope in either direction and journals the result.
 	pub fn cycle_scoped(
 		&mut self,
@@ -214,6 +274,159 @@ fn cycle_index(current: usize, len: usize, direction: CycleDirection) -> usize {
 		CycleDirection::Forward => (current + 1) % len,
 		CycleDirection::Backward => (current + len - 1) % len,
 	}
+}
+
+fn push_scoped(
+	scoped: &mut Vec<ScopedModel>,
+	seen: &mut BTreeSet<ModelKey>,
+	model: &ModelSpec,
+	thinking: Option<ThinkingEffort>,
+) {
+	if seen.insert(model.key.clone()) {
+		scoped.push(ScopedModel { model: model.key.clone(), thinking });
+	}
+}
+
+fn split_glob_thinking(pattern: &str) -> (&str, Option<ThinkingEffort>) {
+	pattern
+		.rsplit_once(':')
+		.map_or((pattern, None), |(prefix, suffix)| {
+			suffix
+				.parse()
+				.map_or((pattern, None), |thinking| (prefix, Some(thinking)))
+		})
+}
+
+fn resolve_named_scope_pattern<'a>(
+	catalog: &snapshot::Catalog,
+	settings: &ModelSettings,
+	candidates: &[&'a ModelSpec],
+	pattern: &str,
+) -> Option<(&'a ModelSpec, Option<ThinkingEffort>)> {
+	let mut candidate = pattern;
+	let mut thinking = None;
+	let mut invalid_suffix = false;
+	loop {
+		if let Some(model) = find_exact_scope_model(catalog, settings, candidates, candidate)
+			.or_else(|| find_fuzzy_scope_model(candidates, candidate))
+		{
+			let thinking = if invalid_suffix { None } else { thinking };
+			return Some((model, thinking));
+		}
+		let (prefix, suffix) = candidate.rsplit_once(':')?;
+		match suffix.parse::<ThinkingEffort>() {
+			Ok(effort) if thinking.is_none() && !invalid_suffix => thinking = Some(effort),
+			Ok(_) => {},
+			Err(_) => {
+				thinking = None;
+				invalid_suffix = true;
+			},
+		}
+		candidate = prefix;
+	}
+}
+
+fn find_exact_scope_model<'a>(
+	catalog: &snapshot::Catalog,
+	settings: &ModelSettings,
+	candidates: &[&'a ModelSpec],
+	pattern: &str,
+) -> Option<&'a ModelSpec> {
+	if let Some(model) = candidates
+		.iter()
+		.copied()
+		.find(|model| model.key.as_str().eq_ignore_ascii_case(pattern))
+	{
+		return Some(model);
+	}
+	let mut matches = candidates
+		.iter()
+		.copied()
+		.filter(|model| scope_exact_matches(catalog, settings, model, pattern));
+	let model = matches.next()?;
+	matches.next().is_none().then_some(model)
+}
+
+fn scope_exact_matches(
+	catalog: &snapshot::Catalog,
+	settings: &ModelSettings,
+	model: &ModelSpec,
+	pattern: &str,
+) -> bool {
+	let logical_id = model_logical_id(model);
+	model.routes.iter().any(|route| {
+		catalog.route(route).is_some_and(|route| {
+			settings.provider_allowed(route.provider.as_str())
+				&& pattern.split_once('/').map_or_else(
+					|| pattern.eq_ignore_ascii_case(logical_id),
+					|(provider, model)| {
+						provider.eq_ignore_ascii_case(route.provider.as_str())
+							&& model.eq_ignore_ascii_case(logical_id)
+					},
+				)
+		})
+	})
+}
+
+fn scope_pattern_matches(
+	catalog: &snapshot::Catalog,
+	settings: &ModelSettings,
+	model: &ModelSpec,
+	pattern: &str,
+) -> bool {
+	let logical_id = model_logical_id(model);
+	model.routes.iter().any(|route| {
+		catalog.route(route).is_some_and(|route| {
+			settings.provider_allowed(route.provider.as_str())
+				&& model_pattern_matches(pattern, route.provider.as_str(), logical_id)
+		})
+	})
+}
+
+fn find_fuzzy_scope_model<'a>(
+	candidates: &[&'a ModelSpec],
+	pattern: &str,
+) -> Option<&'a ModelSpec> {
+	candidates
+		.iter()
+		.copied()
+		.filter(|model| {
+			let logical_id = model_logical_id(model);
+			contains_ascii_case_insensitive(logical_id, pattern)
+				|| contains_ascii_case_insensitive(model.display_name.as_str(), pattern)
+		})
+		.max_by(|left, right| {
+			is_alias(left)
+				.cmp(&is_alias(right))
+				.then_with(|| model_logical_id(left).cmp(model_logical_id(right)))
+		})
+}
+
+fn is_alias(model: &ModelSpec) -> bool {
+	let id = model_logical_id(model);
+	let bytes = id.as_bytes();
+	bytes.len() < 9
+		|| bytes[bytes.len() - 9] != b'-'
+		|| !bytes[bytes.len() - 8..].iter().all(u8::is_ascii_digit)
+}
+
+fn model_logical_id(model: &ModelSpec) -> &str {
+	model
+		.key
+		.as_str()
+		.split_once('/')
+		.map_or(model.key.as_str(), |(_, model)| model)
+}
+
+fn contains_ascii_case_insensitive(value: &str, pattern: &str) -> bool {
+	!pattern.is_empty()
+		&& pattern.len() <= value.len()
+		&& value.as_bytes().windows(pattern.len()).any(|window| {
+			window
+				.iter()
+				.zip(pattern.as_bytes())
+				.all(|(left, right)| left.eq_ignore_ascii_case(right))
+		})
 }
 
 /// Stable catalog projection consumed by `omp.provider.models`.
@@ -2804,5 +3017,37 @@ mod tests {
 			)
 			.unwrap();
 		assert_eq!(previous.role, "smol");
+	}
+
+	#[test]
+	fn settings_scope_drives_order_dedup_availability_thinking_and_wraparound() {
+		let catalog = snapshot::Catalog::embedded();
+		let [first, second, third, ..] = catalog.models() else {
+			panic!("embedded catalog needs at least three models");
+		};
+		let mut settings = ModelSettings::default();
+		settings.enabled_models = Arc::from([
+			PathScopedStringEntry::Bare(sf!("{}:high", second.key)),
+			PathScopedStringEntry::Bare(Str::new(first.key.as_str())),
+			PathScopedStringEntry::Bare(sf!("{}:low", second.key)),
+			PathScopedStringEntry::Bare(sf!("{}:max", third.key)),
+		]);
+
+		let mut controls = ModelControls::default();
+		controls.set_scoped_from_settings(catalog, &settings, |key| key != &third.key);
+		assert_eq!(controls.scoped_models(), &[
+			ScopedModel { model: second.key.clone(), thinking: Some(ThinkingEffort::High) },
+			ScopedModel { model: first.key.clone(), thinking: None },
+		],);
+
+		let wrapped = controls
+			.cycle_scoped(&first.key, CycleDirection::Forward)
+			.expect("scope wraps");
+		assert_eq!(wrapped.model, second.key);
+		assert_eq!(wrapped.thinking, Some(ThinkingEffort::High));
+		let backward = controls
+			.cycle_scoped(&first.key, CycleDirection::Backward)
+			.expect("scope wraps backward");
+		assert_eq!(backward.model, second.key);
 	}
 }
