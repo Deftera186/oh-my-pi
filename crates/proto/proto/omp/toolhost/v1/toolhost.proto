@@ -86,6 +86,11 @@ enum PreludeParamKind {
   PRELUDE_PARAM_KIND_POSITIONAL_OR_KEYWORD = 1;
   PRELUDE_PARAM_KIND_KEYWORD_ONLY = 2;
 }
+enum ToolExecutionMode {
+  TOOL_EXECUTION_MODE_UNSPECIFIED = 0;
+  TOOL_EXECUTION_MODE_PARALLEL = 1;
+  TOOL_EXECUTION_MODE_SEQUENTIAL = 2;
+}
 
 // Python parameter shape for an eval-prelude helper (declarations with
 // revision family "prelude").
@@ -112,6 +117,10 @@ message ToolDecl {
   // Maximum device envelope; Core may only narrow it at authorization.
   optional omp.policy.v1.EffectEnvelope effects = 11;
   repeated PreludeParam prelude_params = 12;
+  // Declaration intent ("soft" or "hard"); Core resolves the mounted surface.
+  string kind = 13;
+  // Per-tool batch scheduling constraint.
+  ToolExecutionMode execution_mode = 14;
   omp.inference.v1.ValueMap props = 15;
 }
 
@@ -181,6 +190,8 @@ message ToolComplete {
   bool useless = 5;
   optional ArgIssue args_issue = 6;
   optional omp.thread.v1.Blob details_blob = 7;
+  // Suppress the automatic model follow-up only when every result in the batch opts in.
+  optional bool terminate = 8;
   omp.inference.v1.ValueMap props = 15;
   OutcomeKind kind = 16;
 }
@@ -585,6 +596,42 @@ message ProviderResponseEventV1 {
 message SessionRenamedEventV1 {
   string session = 1;
   optional string name = 2;
+}
+message SessionOriginV1 {
+  string session_id = 1;
+  optional uint64 at_event = 2;
+}
+message SessionStartEventV1 {
+  string session_id = 1;
+  string root = 2;
+  string cwd = 3;
+  repeated string dirs = 4;
+  bool resumed = 5;
+  optional SessionOriginV1 forked_from = 6;
+  optional string agent = 7;
+  string trust = 8;
+  uint64 head_event = 9;
+  string prompt_rev = 10;
+  optional string previous_session = 11;
+}
+message SessionShutdownEventV1 {
+  string session_id = 1;
+  string reason = 2;
+  uint64 budget_ms = 3;
+  optional string target_session = 4;
+}
+message HookModelRefV1 {
+  string provider = 1;
+  string api = 2;
+  string model = 3;
+}
+message ModelChangedEventV1 {
+  optional HookModelRefV1 from_model = 1;
+  HookModelRefV1 to_model = 2;
+  string role = 3;
+  string reason = 4;
+  optional string previous_thinking = 5;
+  optional string thinking = 6;
 }
 message When {
   repeated string names = 1;

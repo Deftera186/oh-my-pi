@@ -176,6 +176,9 @@ message Dialog {
   string title = 2;
   optional Tml content = 3;
   repeated string choices = 4;
+  // Lossless dialog-specific controls and DialogOptions serialized by the
+  // extension host. Renderers consume only the fields supported by the kind.
+  omp.inference.v1.ValueMap props = 15;
 }
 message ComposerText {}
 message Presentation {
@@ -205,6 +208,10 @@ message DialogOutcome {
   bool cancelled = 2;
   optional string value = 3;
   repeated string values = 4;
+  // Form field values or ask-user answers, preserving their JSON shape.
+  omp.inference.v1.ValueMap answers = 5;
+  // Stable cancellation reason: dismissed, timed_out, superseded, unavailable.
+  optional string reason = 6;
 }
 message OverlayOpened {
   string overlay_id = 1;
@@ -251,6 +258,8 @@ message CompletionQuery {
   string trigger = 1;
   string text = 2;
   uint32 cursor = 3;
+  repeated string argv = 4;
+  optional string command = 5;
 }
 message RenderRequest {
   string name = 1;
@@ -288,6 +297,10 @@ message CompletionCandidate {
   string value = 1;
   optional string display = 2;
   optional string description = 3;
+  optional string hint = 4;
+  optional string group = 5;
+  optional string icon = 6;
+  sint32 sort = 7;
 }
 message RenderedView {
   Tml content = 1;
@@ -347,6 +360,16 @@ message ShortcutDecl {
 message TriggerDecl {
   string prefix = 1;
   string kind = 2;
+  bool at_line_start = 3;
+  uint32 min_chars = 4;
+  uint64 debounce_ms = 5;
+  uint32 max_results = 6;
+  uint64 cache_ms = 7;
+  bool refine_locally = 8;
+  string declaration_id = 9;
+  string callback = 10;
+  string module = 11;
+  string activation_trigger = 12;
   omp.inference.v1.ValueMap props = 15;
 }
 message RendererDecl {
