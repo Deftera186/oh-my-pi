@@ -783,8 +783,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.advisor": "\uea70",
 	// pick:  | alt: ◷ ◴
 	"icon.time": "\uf017",
-	// pick: 󰵗 (nf-md-pi) | alt:  π ∏ ∑
-	"icon.omp": "\u{f0d57}",
+	// pick: 󰏿 (nf-md-pi) | alt:  π ∏ ∑
+	"icon.omp": "\u{f03ff}",
 	// pick: 󱊷 (nf-md-keyboard_esc) | alt: ⎋
 	"icon.esc": "\u{f12b7}",
 	// pick: 󰊠 (nf-md-ghost) | alt: 👻
