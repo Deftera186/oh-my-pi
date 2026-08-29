@@ -49,6 +49,30 @@ function invalidToolError(path: string, index: number, source: ToolLoadError["so
 	};
 }
 
+// Feed Bun pre-transpiled JavaScript so runtime TypeScript tools do not leave
+// compiler-pool threads spinning on WSL after the session becomes idle.
+const customToolTranspiler = new Bun.Transpiler({ loader: "ts", target: "bun" });
+const registeredTypeScriptTools = new Set<string>();
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function registerTypeScriptToolLoader(resolvedPath: string): void {
+	if (!resolvedPath.endsWith(".ts") || registeredTypeScriptTools.has(resolvedPath)) return;
+	registeredTypeScriptTools.add(resolvedPath);
+	const filter = new RegExp(`^${escapeRegExp(resolvedPath)}$`);
+	Bun.plugin({
+		name: `omp:custom-tool:${Bun.hash(resolvedPath).toString(36)}`,
+		setup(build) {
+			build.onLoad({ filter, namespace: "file" }, async args => ({
+				contents: customToolTranspiler.transformSync(await Bun.file(args.path).text()),
+				loader: "js",
+			}));
+		},
+	});
+}
+
 /**
  * Load a single tool module using native Bun import.
  */
@@ -59,6 +83,7 @@ async function loadTool(
 	source?: { provider: string; providerName: string; level: "user" | "project" },
 ): Promise<LoadToolResult> {
 	const resolvedPath = resolvePath(toolPath, cwd);
+	registerTypeScriptToolLoader(resolvedPath);
 
 	// Skip declarative tool files (.md, .json) - these are metadata only, not executable modules
 	if (resolvedPath.endsWith(".md") || resolvedPath.endsWith(".json")) {

@@ -317,4 +317,27 @@ describe("custom tool loader", () => {
 			process.stdin.removeListener("data", hostListener);
 		}
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"loads TypeScript tools without leaving Bun compiler-pool threads alive",
+		async () => {
+			const probePath = path.join(import.meta.dir, "..", "fixtures", "custom-tool-thread-probe.ts");
+			const proc = Bun.spawn([process.execPath, probePath], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+
+			expect(exitCode, stderr).toBe(0);
+			expect(JSON.parse(stdout)).toEqual({
+				poolDelta: 0,
+				errors: [],
+				toolNames: ["typed_pool_probe"],
+			});
+		},
+	);
 });
