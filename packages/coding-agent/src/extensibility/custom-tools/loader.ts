@@ -63,10 +63,12 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Bun transpiler for a TypeScript-family path, or `null` for anything else. */
+/** Bun transpiler for ESM TypeScript paths, or `null` for anything else. */
 function toolTranspilerFor(filePath: string): Bun.Transpiler | null {
 	if (filePath.endsWith(".tsx")) return tsxToolTranspiler;
-	if (filePath.endsWith(".ts") || filePath.endsWith(".mts") || filePath.endsWith(".cts")) return tsToolTranspiler;
+	if (filePath.endsWith(".ts") || filePath.endsWith(".mts")) return tsToolTranspiler;
+	// Preserve native CommonJS interop for `.cts`; emitting it as loader `js`
+	// loses `module.exports` instead of exposing the factory as `default`.
 	return null;
 }
 
@@ -77,7 +79,7 @@ function registerTypeScriptToolRoot(root: string): void {
 	// entry and its relative dependencies share the hook. `node_modules` is
 	// excluded: published deps ship `.js`, and transpiling a dependency's own
 	// `.ts` with our bare transpiler would drop its packaged tsconfig.
-	const filter = new RegExp(`^${escapeRegExp(root + path.sep)}.*\\.(?:ts|tsx|mts|cts)$`);
+	const filter = new RegExp(`^${escapeRegExp(root + path.sep)}.*\\.(?:ts|tsx|mts)$`);
 	const nodeModulesSegment = `${path.sep}node_modules${path.sep}`;
 	Bun.plugin({
 		name: `omp:custom-tool:${Bun.hash(root).toString(36)}`,

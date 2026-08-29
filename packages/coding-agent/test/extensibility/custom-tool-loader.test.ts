@@ -387,4 +387,25 @@ describe("custom tool loader", () => {
 			transformSpy.mockRestore();
 		}
 	});
+
+	it("preserves CommonJS exports for explicitly configured .cts tools", async () => {
+		const toolPath = await writeTool(
+			"commonjs-tool.cts",
+			[
+				"module.exports = api => ({",
+				'\tname: "commonjs_typescript_tool",',
+				'\tdescription: "Loaded through CommonJS semantics",',
+				"\tparameters: api.arktype({}),",
+				"\tasync execute() {",
+				'\t\treturn { content: [{ type: "text", text: "ok" }] };',
+				"\t},",
+				"});",
+			].join("\n"),
+		);
+
+		const result = await loadCustomTools([{ path: toolPath }], requireTempRoot(), []);
+
+		expect(result.errors).toEqual([]);
+		expect(result.tools.map(tool => tool.tool.name)).toEqual(["commonjs_typescript_tool"]);
+	});
 });
