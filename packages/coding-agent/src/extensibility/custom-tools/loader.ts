@@ -4,6 +4,7 @@
  * Dependencies are injected through CustomToolAPI so tools loaded from user
  * directories do not depend on workspace module resolution.
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import * as zod from "@oh-my-pi/omptype/zod";
@@ -69,9 +70,7 @@ function toolTranspilerFor(filePath: string): Bun.Transpiler | null {
 	return null;
 }
 
-function registerTypeScriptToolLoader(resolvedPath: string): void {
-	if (toolTranspilerFor(resolvedPath) === null) return;
-	const root = path.dirname(resolvedPath);
+function registerTypeScriptToolRoot(root: string): void {
 	if (registeredTypeScriptToolRoots.has(root)) return;
 	registeredTypeScriptToolRoots.add(root);
 	// Match every TypeScript-family module under the tool's directory so the
@@ -92,6 +91,17 @@ function registerTypeScriptToolLoader(resolvedPath: string): void {
 	});
 }
 
+async function registerTypeScriptToolLoader(resolvedPath: string): Promise<void> {
+	if (toolTranspilerFor(resolvedPath) === null) return;
+	registerTypeScriptToolRoot(path.dirname(resolvedPath));
+	try {
+		const canonicalPath = await fs.realpath(resolvedPath);
+		registerTypeScriptToolRoot(path.dirname(canonicalPath));
+	} catch {
+		// The import below owns the user-facing missing/inaccessible-file error.
+	}
+}
+
 /**
  * Load a single tool module using native Bun import.
  */
@@ -102,7 +112,7 @@ async function loadTool(
 	source?: { provider: string; providerName: string; level: "user" | "project" },
 ): Promise<LoadToolResult> {
 	const resolvedPath = resolvePath(toolPath, cwd);
-	registerTypeScriptToolLoader(resolvedPath);
+	await registerTypeScriptToolLoader(resolvedPath);
 
 	// Skip declarative tool files (.md, .json) - these are metadata only, not executable modules
 	if (resolvedPath.endsWith(".md") || resolvedPath.endsWith(".json")) {
