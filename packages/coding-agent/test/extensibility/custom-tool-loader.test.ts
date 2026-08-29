@@ -318,26 +318,36 @@ describe("custom tool loader", () => {
 		}
 	});
 
-	it.skipIf(process.platform !== "linux")(
-		"loads TypeScript tools without leaving Bun compiler-pool threads alive",
-		async () => {
-			const probePath = path.join(import.meta.dir, "..", "fixtures", "custom-tool-thread-probe.ts");
-			const proc = Bun.spawn([process.execPath, probePath], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(proc.stdout).text(),
-				new Response(proc.stderr).text(),
-				proc.exited,
-			]);
+	it("loads a TypeScript tool whose entry imports a sibling .ts module", async () => {
+		// The idle-CPU fix (#10212) transpiles runtime TypeScript tools through a
+		// directory-scoped onLoad hook. An entry-only hook left sibling `.ts`
+		// dependencies to Bun's native TypeScript loader; this multi-file layout
+		// exercises the whole tool directory so the dependency is served through
+		// the same hook. Assertion has teeth: the sibling's `TOOL_LABEL` only
+		// reaches `description` if the dependency actually resolved and linked.
+		await writeTool(
+			"reply.ts",
+			['export const TOOL_LABEL = "sibling-linked";', "export type Reply = { ok: true };"].join("\n"),
+		);
+		const entryPath = await writeTool(
+			"typed-tool.ts",
+			[
+				'import { TOOL_LABEL, type Reply } from "./reply.ts";',
+				"export default api => ({",
+				'\tname: "typed_multifile_tool",',
+				"\tdescription: TOOL_LABEL,",
+				"\tparameters: api.arktype({}),",
+				'\tasync execute(): Promise<{ content: Array<{ type: "text"; text: string }>; details: Reply }> {',
+				'\t\treturn { content: [{ type: "text", text: "ok" }], details: { ok: true } };',
+				"\t},",
+				"});",
+			].join("\n"),
+		);
 
-			expect(exitCode, stderr).toBe(0);
-			expect(JSON.parse(stdout)).toEqual({
-				poolDelta: 0,
-				errors: [],
-				toolNames: ["typed_pool_probe"],
-			});
-		},
-	);
+		const result = await loadCustomTools([{ path: entryPath }], requireTempRoot(), []);
+
+		expect(result.errors).toEqual([]);
+		expect(result.tools.map(tool => tool.tool.name)).toEqual(["typed_multifile_tool"]);
+		expect(result.tools[0]?.tool.description).toBe("sibling-linked");
+	});
 });

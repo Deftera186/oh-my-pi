@@ -50,25 +50,44 @@ function invalidToolError(path: string, index: number, source: ToolLoadError["so
 }
 
 // Feed Bun pre-transpiled JavaScript so runtime TypeScript tools do not leave
-// compiler-pool threads spinning on WSL after the session becomes idle.
-const customToolTranspiler = new Bun.Transpiler({ loader: "ts", target: "bun" });
-const registeredTypeScriptTools = new Set<string>();
+// compiler-pool threads spinning on WSL after the session becomes idle. The
+// hook is scoped to the tool's directory subtree so sibling/nested `.ts`
+// dependencies transpile through the same path — an entry-only hook would let
+// Bun load those dependencies natively and recreate the compiler pool.
+const tsToolTranspiler = new Bun.Transpiler({ loader: "ts", target: "bun" });
+const tsxToolTranspiler = new Bun.Transpiler({ loader: "tsx", target: "bun" });
+const registeredTypeScriptToolRoots = new Set<string>();
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** Bun transpiler for a TypeScript-family path, or `null` for anything else. */
+function toolTranspilerFor(filePath: string): Bun.Transpiler | null {
+	if (filePath.endsWith(".tsx")) return tsxToolTranspiler;
+	if (filePath.endsWith(".ts") || filePath.endsWith(".mts") || filePath.endsWith(".cts")) return tsToolTranspiler;
+	return null;
+}
+
 function registerTypeScriptToolLoader(resolvedPath: string): void {
-	if (!resolvedPath.endsWith(".ts") || registeredTypeScriptTools.has(resolvedPath)) return;
-	registeredTypeScriptTools.add(resolvedPath);
-	const filter = new RegExp(`^${escapeRegExp(resolvedPath)}$`);
+	if (toolTranspilerFor(resolvedPath) === null) return;
+	const root = path.dirname(resolvedPath);
+	if (registeredTypeScriptToolRoots.has(root)) return;
+	registeredTypeScriptToolRoots.add(root);
+	// Match every TypeScript-family module under the tool's directory so the
+	// entry and its relative dependencies share the hook. `node_modules` is
+	// excluded: published deps ship `.js`, and transpiling a dependency's own
+	// `.ts` with our bare transpiler would drop its packaged tsconfig.
+	const filter = new RegExp(`^${escapeRegExp(root + path.sep)}.*\\.(?:ts|tsx|mts|cts)$`);
+	const nodeModulesSegment = `${path.sep}node_modules${path.sep}`;
 	Bun.plugin({
-		name: `omp:custom-tool:${Bun.hash(resolvedPath).toString(36)}`,
+		name: `omp:custom-tool:${Bun.hash(root).toString(36)}`,
 		setup(build) {
-			build.onLoad({ filter, namespace: "file" }, async args => ({
-				contents: customToolTranspiler.transformSync(await Bun.file(args.path).text()),
-				loader: "js",
-			}));
+			build.onLoad({ filter, namespace: "file" }, async args => {
+				const transpiler = toolTranspilerFor(args.path);
+				if (transpiler === null || args.path.includes(nodeModulesSegment)) return undefined;
+				return { contents: transpiler.transformSync(await Bun.file(args.path).text()), loader: "js" };
+			});
 		},
 	});
 }
