@@ -1473,12 +1473,12 @@ export function getPackageDir(): string {
 }
 
 // Legacy pi's `@earendil-works/pi-coding-agent` re-exported `estimateTokens`,
-// `compact`, and `serializeConversation` from its package root (via
-// `./core/compaction/index.ts`). In omp `compact` and `serializeConversation`
-// live in `@oh-my-pi/pi-agent-core/compaction`, and the coding-agent barrel
-// below does not forward them, so legacy extensions importing them fail Bun's
-// static export check during validation (issues #6583, #7174, #7403).
-export { compact, serializeConversation } from "@oh-my-pi/pi-agent-core/compaction";
+// `compact`, `serializeConversation`, and `calculateContextTokens` from its
+// package root (via `./core/compaction/index.ts`). In omp these live in
+// `@oh-my-pi/pi-agent-core/compaction`, and the coding-agent barrel below does
+// not forward them, so legacy extensions importing them fail Bun's static
+// export check during validation (issues #6583, #7174, #7403, #10278).
+export { calculateContextTokens, compact, serializeConversation } from "@oh-my-pi/pi-agent-core/compaction";
 
 const legacyTokenizer = new Tokenizer();
 

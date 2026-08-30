@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- Fixed `omp plugin install` failing for legacy pi extensions that import `calculateContextTokens` (e.g. pi-blackhole) by re-exporting it from the coding-agent compat shim ([#10278](https://github.com/can1357/oh-my-pi/issues/10278))
 - Fixed an issue where custom model overrides were lost during configuration updates
 - Fixed "Please use nerdfont" notification incorrectly persisting after theme configuration
 - Fixed sampling parameter errors for newer Anthropic models (Opus 4.7+, Sonnet 5+)
