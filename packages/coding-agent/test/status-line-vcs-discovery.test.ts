@@ -83,10 +83,10 @@ interface Harness {
 	dispose: () => void;
 }
 
-function mountStatusLine(): Harness {
+function mountStatusLine(repoFactory: (id: number, probe: ReadProbe) => VcsRepo | null = fakeRepo): Harness {
 	const probe: ReadProbe = { kindIds: [], statusIds: [] };
 	let nextId = 0;
-	const repoSpy: Mock<typeof vcs.repo> = spyOn(vcs, "repo").mockImplementation(() => fakeRepo(nextId++, probe));
+	const repoSpy: Mock<typeof vcs.repo> = spyOn(vcs, "repo").mockImplementation(() => repoFactory(nextId++, probe));
 	const gitSpy = spyOn(vcs, "git").mockImplementation(() => fakeRepo(-1, probe).asGit());
 	const infoSpy = spyOn(vcs, "gitInfo").mockImplementation(() => fakeGitInfo());
 
@@ -135,6 +135,35 @@ describe("status line VCS discovery", () => {
 			expect(perFrame()).toBe(0);
 			expect(perFrame()).toBe(0);
 		} finally {
+			dispose();
+		}
+	});
+
+	it("bounds negative discovery and retries after the fallback polling interval", () => {
+		let now = 1_000_000;
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		const { component, repoSpy, dispose } = mountStatusLine(() => null);
+		try {
+			// Warm the unrelated active-repository resolution, then isolate the
+			// status line's repo memo.
+			component.getTopBorder(120);
+			component.invalidateGitCaches();
+			repoSpy.mockClear();
+
+			component.getTopBorder(120);
+			expect(repoSpy).toHaveBeenCalledTimes(1);
+			component.getTopBorder(120);
+			now += 4_999;
+			component.getTopBorder(120);
+			expect(repoSpy).toHaveBeenCalledTimes(1);
+
+			// A bounded miss must expire so `git init` becomes visible without a
+			// cwd or HEAD watcher event.
+			now += 1;
+			component.getTopBorder(120);
+			expect(repoSpy).toHaveBeenCalledTimes(2);
+		} finally {
+			nowSpy.mockRestore();
 			dispose();
 		}
 	});

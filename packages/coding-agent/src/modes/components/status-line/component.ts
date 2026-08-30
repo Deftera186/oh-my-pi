@@ -439,14 +439,14 @@ export class StatusLineComponent implements Component {
 	#collabStatus: CollabStatus | null = null;
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
-	// Repository-handle memo. `vcs.repo()` is a native filesystem walk; the three
-	// git-backed segments (branch, status, PR) each rediscover the same cwd on
-	// every rendered frame, so the working-spinner repaint loop re-walked the FS
-	// dozens of times per second (issue #10231, costly on WSL). Cache the handle
-	// per cwd; positive-only so a later `git init` is still picked up by the next
-	// discovery. Dropped by invalidateGitCaches (cwd switch / HEAD move).
+	// Repository-discovery memo. `vcs.repo()` is a native filesystem walk; the
+	// three git-backed segments (branch, status, PR) otherwise rediscover the
+	// same cwd on every rendered frame. Positive handles remain cached until
+	// explicit invalidation; negative results use a short TTL so a later
+	// `git init` is detected without spinner repaints repeatedly walking the FS.
 	#cachedRepoHandle: VcsRepo | null = null;
 	#cachedRepoHandleCwd: string | undefined = undefined;
+	#repoDiscoveryLastFetch: number | undefined = undefined;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
@@ -547,10 +547,9 @@ export class StatusLineComponent implements Component {
 	 * branch, status, and PR segments each locate the same effective cwd every
 	 * frame, and a fresh `vcs.repo()` walks the filesystem each call, so the
 	 * working-spinner repaint loop re-walked the FS dozens of times per second
-	 * (issue #10231, costly on WSL). Cache the positive handle per cwd so a
-	 * steady idle session discovers once; a null result is never cached so a
-	 * later `git init` is still seen. Dropped on cwd switch or HEAD move via
-	 * {@link invalidateGitCaches}.
+	 * (issue #10231, costly on WSL). Positive handles remain cached until
+	 * invalidation. Negative results expire at the watcher-failure polling
+	 * interval, bounding idle discovery while still detecting a later `git init`.
 	 *
 	 * Use this ONLY for the cheap, stable gate checks the render path makes on
 	 * every frame — `kind()`, `asGit()`, and the null test. It MUST NOT back a
@@ -562,17 +561,19 @@ export class StatusLineComponent implements Component {
 	 * reopen a fresh handle instead.
 	 */
 	#repoFor(gitCwd: string): VcsRepo | null {
-		if (this.#cachedRepoHandle && this.#cachedRepoHandleCwd === gitCwd) {
-			return this.#cachedRepoHandle;
+		if (this.#cachedRepoHandleCwd === gitCwd) {
+			if (this.#cachedRepoHandle) return this.#cachedRepoHandle;
+			if (
+				this.#repoDiscoveryLastFetch !== undefined &&
+				Date.now() - this.#repoDiscoveryLastFetch < WATCHER_FAILURE_POLL_TTL_MS
+			) {
+				return null;
+			}
 		}
 		const repository = vcs.repo(gitCwd);
-		if (repository) {
-			this.#cachedRepoHandle = repository;
-			this.#cachedRepoHandleCwd = gitCwd;
-		} else if (this.#cachedRepoHandleCwd === gitCwd) {
-			this.#cachedRepoHandle = null;
-			this.#cachedRepoHandleCwd = undefined;
-		}
+		this.#cachedRepoHandle = repository;
+		this.#cachedRepoHandleCwd = gitCwd;
+		this.#repoDiscoveryLastFetch = Date.now();
 		return repository;
 	}
 
@@ -970,6 +971,7 @@ export class StatusLineComponent implements Component {
 		// a `.git` removal must be re-discovered on the next render.
 		this.#cachedRepoHandle = null;
 		this.#cachedRepoHandleCwd = undefined;
+		this.#repoDiscoveryLastFetch = undefined;
 		// Abort before releasing the in-flight slot. Releasing alone would allow
 		// repeated invalidations to fan out still-running git subprocesses.
 		this.#branchResolveActive?.controller.abort();
