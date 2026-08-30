@@ -248,6 +248,72 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.isStreaming).toBe(false);
 	});
 
+	it("persists next-turn custom messages queued during streaming exactly once", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			handler: async () => {
+				started.resolve();
+				await release.promise;
+				return { content: ["Done"] };
+			},
+		});
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await started.promise;
+		await session.sendCustomMessage(
+			{
+				customType: "async-result",
+				content: "Background result",
+				display: true,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn" },
+		);
+
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+		).toHaveLength(1);
+
+		release.resolve();
+		await firstPrompt;
+		await session.prompt("Next user prompt");
+		await session.settleInFlightMessagePersistence();
+
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+		).toHaveLength(1);
+		expect(
+			mock.calls
+				.at(-1)
+				?.context.messages.some(message =>
+					typeof message.content === "string"
+						? message.content.includes("Background result")
+						: message.content.some(
+								content => content.type === "text" && content.text.includes("Background result"),
+							),
+				),
+		).toBe(true);
+	});
+
 	it("uses non-empty session_stop reason when additional context is empty", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({

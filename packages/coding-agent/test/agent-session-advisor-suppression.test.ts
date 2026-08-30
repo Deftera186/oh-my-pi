@@ -497,11 +497,11 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const running = session.prompt("do the thing");
 		await streamStarted;
 
-		// A suppressed delivery arriving while the turn is still streaming parks the
-		// concern hidden in #pendingNextTurnMessages (the mid-abort race window).
+		// A suppressed delivery arriving while the turn is still streaming stays
+		// hidden from live context but is durable during the mid-abort race window.
 		await session.sendCustomMessage(advisorCard("parked mid-abort"), { deliverAs: "nextTurn", triggerTurn: false });
 		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(0);
-		expect(persisted).toEqual([]);
+		expect(persisted).toEqual(["parked mid-abort"]);
 
 		await session.abort({ reason: USER_INTERRUPT_LABEL });
 		await session.waitForIdle();

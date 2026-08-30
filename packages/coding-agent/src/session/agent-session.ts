@@ -545,6 +545,8 @@ export class AgentSession {
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
+	/** Queued next-turn messages already persisted before their eventual message-end replay. */
+	#persistedNextTurnMessages = new WeakSet<CustomMessage>();
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#queuedMessageDrainScheduled = false;
 	#planModeState: PlanModeState | undefined;
@@ -2533,9 +2535,10 @@ export class AgentSession {
 
 	#persistMessageEnd(message: AgentMessage): void {
 		if (message.role === "hookMessage" || message.role === "custom") {
+			const alreadyPersisted = message.role === "custom" && this.#persistedNextTurnMessages.delete(message);
 			// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
 			// resurrect the consumed prompt on resume, fork, or any context rebuild.
-			if (!isPrewalkPlanNudge(message)) {
+			if (!isPrewalkPlanNudge(message) && !alreadyPersisted) {
 				this.sessionManager.appendCustomMessageEntry(
 					message.customType,
 					message.content,
@@ -6547,6 +6550,19 @@ export class AgentSession {
 		return delivered;
 	}
 
+	#queueDurableNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+			message.attribution ?? "agent",
+			message.timestamp,
+		);
+		this.#persistedNextTurnMessages.add(message);
+		this.#queueHiddenNextTurnMessage(message, triggerTurn);
+	}
+
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
 		this.#pendingNextTurnMessages.push(message);
 		if (!triggerTurn) return;
@@ -6733,7 +6749,7 @@ export class AgentSession {
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		if (this.isStreaming) {
 			if (options?.deliverAs === "nextTurn") {
-				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
+				this.#queueDurableNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
 				return false;
 			}
 			this.#allowQueuedMessageDrainRetry();
@@ -6750,7 +6766,7 @@ export class AgentSession {
 		if (options?.deliverAs === "nextTurn") {
 			if (options?.triggerTurn) {
 				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
-					this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
+					this.#queueDurableNextTurnMessage(normalizedAppMessage, false);
 					return false;
 				}
 				await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
@@ -6771,7 +6787,7 @@ export class AgentSession {
 
 		if (options?.triggerTurn) {
 			if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
-				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
+				this.#queueDurableNextTurnMessage(normalizedAppMessage, false);
 				return false;
 			}
 			await this.#promptAgentInitiatedMessage(normalizedAppMessage);
