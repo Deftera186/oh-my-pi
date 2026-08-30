@@ -1486,21 +1486,6 @@ export function getPackageDir(): string {
 	return getOmpPackageDir() ?? (isCompiledBinary() ? path.dirname(process.execPath) : process.cwd());
 }
 
-/** Resolve omp's bundled README through the legacy package-root contract. */
-export function getReadmePath(): string {
-	return path.resolve(getPackageDir(), "README.md");
-}
-
-/** Resolve omp's bundled documentation directory through the legacy package-root contract. */
-export function getDocsPath(): string {
-	return path.resolve(getPackageDir(), "docs");
-}
-
-/** Resolve omp's bundled examples directory through the legacy package-root contract. */
-export function getExamplesPath(): string {
-	return path.resolve(getPackageDir(), "examples");
-}
-
 /** Parsed legacy `<skill>` invocation embedded in a user message. */
 export interface ParsedSkillBlock {
 	name: string;
