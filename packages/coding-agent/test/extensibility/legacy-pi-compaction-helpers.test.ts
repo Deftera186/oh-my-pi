@@ -4,8 +4,12 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import {
 	calculateContextTokens,
 	compact,
+	DEFAULT_COMPACTION_SETTINGS,
 	estimateTokens,
+	getLastAssistantUsage,
+	prepareBranchEntries,
 	serializeConversation,
+	shouldCompact,
 } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
 
 // Issue #6583: pi extensions import `estimateTokens` from
@@ -59,5 +63,11 @@ describe("legacy shim compaction helpers", () => {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		};
 		expect(calculateContextTokens(usage)).toBe(115);
+	});
+
+	it("preserves the audited legacy compaction utility behavior", () => {
+		expect(getLastAssistantUsage([])).toBeUndefined();
+		expect(prepareBranchEntries([], 1_000)).toMatchObject({ messages: [], totalTokens: 0 });
+		expect(shouldCompact(90_000, 100_000, DEFAULT_COMPACTION_SETTINGS)).toBe(true);
 	});
 });
