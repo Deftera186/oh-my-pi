@@ -543,14 +543,23 @@ export class StatusLineComponent implements Component {
 	}
 
 	/**
-	 * Memoized {@link vcs.repo} for the render path: the branch, status, and PR
-	 * segments all resolve the same effective cwd every frame, and a fresh
-	 * `vcs.repo()` walks the filesystem each call. Cache the positive handle per
-	 * cwd so a steady idle session discovers once instead of once per segment per
-	 * frame; a null result is never cached so a later `git init` is still seen.
-	 * The handle is a live repository reference (its reads re-hit disk), so
-	 * reusing it across frames returns fresh branch/status. Dropped on cwd switch
-	 * or HEAD move via {@link invalidateGitCaches}.
+	 * Memoized {@link vcs.repo} discovery for the synchronous render path. The
+	 * branch, status, and PR segments each locate the same effective cwd every
+	 * frame, and a fresh `vcs.repo()` walks the filesystem each call, so the
+	 * working-spinner repaint loop re-walked the FS dozens of times per second
+	 * (issue #10231, costly on WSL). Cache the positive handle per cwd so a
+	 * steady idle session discovers once; a null result is never cached so a
+	 * later `git init` is still seen. Dropped on cwd switch or HEAD move via
+	 * {@link invalidateGitCaches}.
+	 *
+	 * Use this ONLY for the cheap, stable gate checks the render path makes on
+	 * every frame — `kind()`, `asGit()`, and the null test. It MUST NOT back a
+	 * ref-sensitive read: gitoxide's cached handle snapshots refs at first open
+	 * (`crates/pi-vcs/src/git/open.rs`), and a commit that advances the current
+	 * branch updates `refs/heads/*` without touching `.git/HEAD`, so the HEAD
+	 * watcher never fires and this memo would keep comparing the fresh index
+	 * against a stale HEAD tree. Reads that resolve HEAD (git `statusSummary`)
+	 * reopen a fresh handle instead.
 	 */
 	#repoFor(gitCwd: string): VcsRepo | null {
 		if (this.#cachedRepoHandle && this.#cachedRepoHandleCwd === gitCwd) {
@@ -1161,9 +1170,12 @@ export class StatusLineComponent implements Component {
 			(async () => {
 				let next: { staged: number; unstaged: number; untracked: number } | null = null;
 				try {
-					next = await repository.statusSummary(
-						withTimeoutSignal(JJ_COMMAND_TIMEOUT_MS, request.controller.signal),
-					);
+					// Fresh handle: jj status resolves the working commit; the memoized
+					// discovery handle can lag an op the watcher has not yet observed.
+					const freshRepo = vcs.repo(gitCwd);
+					next = freshRepo
+						? await freshRepo.statusSummary(withTimeoutSignal(JJ_COMMAND_TIMEOUT_MS, request.controller.signal))
+						: null;
 				} catch {
 					next = null;
 				} finally {
@@ -1190,7 +1202,12 @@ export class StatusLineComponent implements Component {
 		(async () => {
 			let nextStatus: { staged: number; unstaged: number; untracked: number } | null = null;
 			try {
-				nextStatus = (await repository.statusSummary()) ?? null;
+				// Reopen a fresh handle: staged = index vs HEAD tree, and the memoized
+				// discovery handle snapshots refs at open, so a same-branch commit
+				// (which never touches `.git/HEAD`, so the watcher stays quiet) would
+				// otherwise leave already-committed files counted as staged (#10235).
+				const freshRepo = vcs.repo(gitCwd);
+				nextStatus = (await freshRepo?.statusSummary()) ?? null;
 			} catch {
 				nextStatus = null;
 			} finally {
