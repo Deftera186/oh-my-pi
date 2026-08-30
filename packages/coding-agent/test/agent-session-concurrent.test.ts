@@ -288,11 +288,17 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(
 			sessionManager
 				.getEntries()
-				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+				.filter(entry => entry.type === "custom" && entry.customType === "agent-session-next-turn-queued"),
 		).toHaveLength(1);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+		).toHaveLength(0);
 
 		release.resolve();
 		await firstPrompt;
+		expect(JSON.stringify(sessionManager.buildSessionContext().messages)).not.toContain("Background result");
 		await session.prompt("Next user prompt");
 		await session.settleInFlightMessagePersistence();
 
@@ -300,6 +306,18 @@ describe("AgentSession concurrent prompt guard", () => {
 			sessionManager
 				.getEntries()
 				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+		).toHaveLength(1);
+		expect(sessionManager.buildSessionContext().messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"custom",
+			"assistant",
+		]);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom" && entry.customType === "agent-session-next-turn-consumed"),
 		).toHaveLength(1);
 		expect(
 			mock.calls
@@ -312,6 +330,81 @@ describe("AgentSession concurrent prompt guard", () => {
 							),
 				),
 		).toBe(true);
+	});
+
+	it("restores durable next-turn messages after a streaming interruption without reordering the transcript", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "First message", timestamp: Date.now() });
+		sessionManager.appendCustomEntry("agent-session-next-turn-queued", {
+			message: {
+				role: "custom",
+				customType: "async-result",
+				content: "Background result",
+				display: true,
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+		});
+		const firstAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Done" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage(firstAssistant);
+
+		const mock = createMockModel({ handler: () => ({ content: ["Continued"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		await session.prompt("Next user prompt");
+		await session.settleInFlightMessagePersistence();
+
+		expect(sessionManager.buildSessionContext().messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"custom",
+			"assistant",
+		]);
+		expect(mock.calls.at(-1)?.context.messages.map(message => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"developer",
+		]);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+		).toHaveLength(1);
 	});
 
 	it("uses non-empty session_stop reason when additional context is empty", async () => {

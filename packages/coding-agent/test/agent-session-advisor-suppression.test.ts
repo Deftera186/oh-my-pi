@@ -498,10 +498,10 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		await streamStarted;
 
 		// A suppressed delivery arriving while the turn is still streaming stays
-		// hidden from live context but is durable during the mid-abort race window.
+		// hidden and queued durably until abort cleanup can place it after the turn.
 		await session.sendCustomMessage(advisorCard("parked mid-abort"), { deliverAs: "nextTurn", triggerTurn: false });
 		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(0);
-		expect(persisted).toEqual(["parked mid-abort"]);
+		expect(persisted).toEqual([]);
 
 		await session.abort({ reason: USER_INTERRUPT_LABEL });
 		await session.waitForIdle();
