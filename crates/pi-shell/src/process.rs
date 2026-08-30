@@ -1464,10 +1464,10 @@ impl Process {
 		// Polite wave. A negative grace skips this entire wave: a child subreaper
 		// must stay alive until the hard wave snapshots its adopted descendants.
 		if graceful_ms >= 0 {
+			let descendants = self.signalable_descendants(&protected);
 			if let Some(pgid) = process_group {
 				let _ = kill_process_group(pgid, TERM_SIGNAL);
 			}
-			let descendants = self.signalable_descendants(&protected);
 			for child in &descendants {
 				let _ = child.inner.kill(TERM_SIGNAL);
 			}
@@ -1487,13 +1487,15 @@ impl Process {
 			}
 		}
 
-		// Hard wave. Walk the tree immediately before signalling so descendants
-		// spawned during the grace period or reparented to the root are retained
-		// as stable handles for the exit wait below.
+		// Hard wave. Snapshot the descendant tree before signalling the process
+		// group: a group SIGKILL can reap the subreaper root, and an adopted
+		// session-escaping worker (outside the group) would then reparent to init
+		// before any later walk. The pre-kill snapshot pins a stable pidfd handle
+		// so the worker still receives the hard kill and is awaited below.
+		let descendants = self.signalable_descendants(&protected);
 		if let Some(pgid) = process_group {
 			let _ = kill_process_group(pgid, KILL_SIGNAL);
 		}
-		let descendants = self.signalable_descendants(&protected);
 		for child in &descendants {
 			let _ = child.inner.kill(KILL_SIGNAL);
 		}
