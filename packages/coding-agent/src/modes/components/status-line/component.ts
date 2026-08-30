@@ -5,6 +5,7 @@ import {
 	getAntigravityCounterKeyForModel,
 	scopeAntigravityLimitsForModel,
 } from "@oh-my-pi/pi-ai/usage/google-antigravity";
+import type { VcsRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import {
 	type Component,
@@ -438,6 +439,14 @@ export class StatusLineComponent implements Component {
 	#collabStatus: CollabStatus | null = null;
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
+	// Repository-handle memo. `vcs.repo()` is a native filesystem walk; the three
+	// git-backed segments (branch, status, PR) each rediscover the same cwd on
+	// every rendered frame, so the working-spinner repaint loop re-walked the FS
+	// dozens of times per second (issue #10231, costly on WSL). Cache the handle
+	// per cwd; positive-only so a later `git init` is still picked up by the next
+	// discovery. Dropped by invalidateGitCaches (cwd switch / HEAD move).
+	#cachedRepoHandle: VcsRepo | null = null;
+	#cachedRepoHandleCwd: string | undefined = undefined;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
@@ -531,6 +540,31 @@ export class StatusLineComponent implements Component {
 		const worktree = activeRepo ? null : resolveWorktreeContext(effectiveGitCwd);
 		this.#activeRepoCache = { projectDir, activeRepo, effectiveGitCwd, worktree };
 		return this.#activeRepoCache;
+	}
+
+	/**
+	 * Memoized {@link vcs.repo} for the render path: the branch, status, and PR
+	 * segments all resolve the same effective cwd every frame, and a fresh
+	 * `vcs.repo()` walks the filesystem each call. Cache the positive handle per
+	 * cwd so a steady idle session discovers once instead of once per segment per
+	 * frame; a null result is never cached so a later `git init` is still seen.
+	 * The handle is a live repository reference (its reads re-hit disk), so
+	 * reusing it across frames returns fresh branch/status. Dropped on cwd switch
+	 * or HEAD move via {@link invalidateGitCaches}.
+	 */
+	#repoFor(gitCwd: string): VcsRepo | null {
+		if (this.#cachedRepoHandle && this.#cachedRepoHandleCwd === gitCwd) {
+			return this.#cachedRepoHandle;
+		}
+		const repository = vcs.repo(gitCwd);
+		if (repository) {
+			this.#cachedRepoHandle = repository;
+			this.#cachedRepoHandleCwd = gitCwd;
+		} else if (this.#cachedRepoHandleCwd === gitCwd) {
+			this.#cachedRepoHandle = null;
+			this.#cachedRepoHandleCwd = undefined;
+		}
+		return repository;
 	}
 
 	/**
@@ -923,6 +957,10 @@ export class StatusLineComponent implements Component {
 		this.#cachedBranch = undefined;
 		this.#cachedBranchRepoId = undefined;
 		this.#cachedBranchCwd = undefined;
+		// Drop the memoized repo handle: a cwd switch re-points the repository and
+		// a `.git` removal must be re-discovered on the next render.
+		this.#cachedRepoHandle = null;
+		this.#cachedRepoHandleCwd = undefined;
 		// Abort before releasing the in-flight slot. Releasing alone would allow
 		// repeated invalidations to fan out still-running git subprocesses.
 		this.#branchResolveActive?.controller.abort();
@@ -968,7 +1006,7 @@ export class StatusLineComponent implements Component {
 		if (!this.#gitEnabled()) return null;
 
 		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const repository = vcs.repo(gitCwd);
+		const repository = this.#repoFor(gitCwd);
 		if (!repository) return null;
 		const gitRepository = repository.asGit();
 		if (!gitRepository) {
@@ -1108,7 +1146,7 @@ export class StatusLineComponent implements Component {
 		if (!this.#gitEnabled()) return null;
 
 		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const repository = vcs.repo(gitCwd);
+		const repository = this.#repoFor(gitCwd);
 		if (!repository) return null;
 		if (repository.kind() === "jj") {
 			if (this.#jjStatusActive || Date.now() - this.#jjStatusLastFetch < JJ_REFRESH_TTL_MS) {
@@ -1176,7 +1214,7 @@ export class StatusLineComponent implements Component {
 		if (!this.#gitEnabled()) return null;
 
 		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		if (vcs.repo(gitCwd)?.kind() !== "git") return null;
+		if (this.#repoFor(gitCwd)?.kind() !== "git") return null;
 		const branch = this.#getBranchLabel(gitCwd);
 		const currentContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : null;
 
