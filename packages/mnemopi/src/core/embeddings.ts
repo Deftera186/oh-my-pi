@@ -406,7 +406,8 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 	}
 	const cacheDir = getFastembedCacheDir();
 	mkdirSync(cacheDir, { recursive: true });
-	const loading = localModelInitializer({
+	let loading: Promise<LocalEmbeddingModel | null>;
+	loading = localModelInitializer({
 		model: modelName,
 		cacheDir,
 		showDownloadProgress: false,
@@ -415,7 +416,7 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 			model: modelName,
 			error: String(error),
 		});
-		localModelPromise = null;
+		if (localModelPromise === loading) localModelPromise = null;
 		return null;
 	});
 	localModelPromise = loading;
