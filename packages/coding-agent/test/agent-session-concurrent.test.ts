@@ -407,6 +407,88 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toHaveLength(1);
 	});
 
+	it("restores durable next-turn messages when switching into a session mid-queue", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const seedDir = path.join(tempDir, "seed-sessions");
+		fs.mkdirSync(seedDir, { recursive: true });
+		const seedManager = SessionManager.create(tempDir, seedDir);
+		seedManager.appendMessage({ role: "user", content: "First message", timestamp: Date.now() });
+		seedManager.appendCustomEntry("agent-session-next-turn-queued", {
+			message: {
+				role: "custom",
+				customType: "async-result",
+				content: "Background result",
+				display: true,
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+		});
+		seedManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "Done" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		await seedManager.flush();
+		const seedFile = seedManager.getSessionFile();
+		if (!seedFile) throw new Error("Expected seeded session file");
+		await seedManager.close();
+
+		const activeDir = path.join(tempDir, "active-sessions");
+		fs.mkdirSync(activeDir, { recursive: true });
+		const sessionManager = SessionManager.create(tempDir, activeDir);
+		const mock = createMockModel({ handler: () => ({ content: ["Continued"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+		});
+
+		expect(await session.switchSession(seedFile)).toBe(true);
+		await session.prompt("Next user prompt");
+		await session.settleInFlightMessagePersistence();
+
+		expect(
+			mock.calls
+				.at(-1)
+				?.context.messages.some(message =>
+					typeof message.content === "string"
+						? message.content.includes("Background result")
+						: message.content.some(
+								content => content.type === "text" && content.text.includes("Background result"),
+							),
+				),
+		).toBe(true);
+		expect(
+			session.sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+		).toHaveLength(1);
+		expect(
+			session.sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "custom" && entry.customType === "agent-session-next-turn-consumed"),
+		).toHaveLength(1);
+	});
+
 	it("uses non-empty session_stop reason when additional context is empty", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({

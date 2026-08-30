@@ -8469,6 +8469,12 @@ export class AgentSession {
 				previousSessionContext !== undefined &&
 				didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
 			this.#rehydrateCheckpointRewindState();
+			// Re-arm durable next-turn messages from the freshly loaded branch: the
+			// wholesale clear above dropped the previous session's queue, and the
+			// constructor's restore never runs on switch/reload (issue #10311). The
+			// rollback snapshot at #pendingNextTurnMessages taken earlier restores
+			// the prior queue if this switch fails.
+			this.#restoreDurableNextTurnMessages();
 
 			// Emit session_switch event to hooks
 			if (this.#extensionRunner) {
