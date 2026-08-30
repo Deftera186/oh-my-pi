@@ -1,6 +1,9 @@
 import { beforeAll, describe, expect, it, type Mock, spyOn } from "bun:test";
+import * as path from "node:path";
 import type { VcsGitRepo, VcsGitRepoInfo, VcsRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { getProjectDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
+import { $ } from "bun";
 import { Settings } from "../src/config/settings";
 import { StatusLineComponent } from "../src/modes/components/status-line";
 import { initTheme } from "../src/modes/theme/theme";
@@ -41,14 +44,7 @@ function fakeSession(): AgentSession {
 	return session as unknown as AgentSession;
 }
 
-/** Records which repo instance each ref-sensitive read ran on. */
-interface ReadProbe {
-	kindIds: number[];
-	statusIds: number[];
-}
-
-/** A Git-backed repo handle tagged so tests can tell reused vs freshly opened. */
-function fakeRepo(id: number, probe: ReadProbe): VcsRepo {
+function fakeRepo(): VcsRepo {
 	const git = {
 		headSync: () => ({ kind: "ref", branch: "main" }),
 		head: async () => ({ kind: "ref", branch: "main" }),
@@ -56,17 +52,11 @@ function fakeRepo(id: number, probe: ReadProbe): VcsRepo {
 		defaultBranch: async () => "main",
 	};
 	const repo = {
-		kind: () => {
-			probe.kindIds.push(id);
-			return "git";
-		},
+		kind: () => "git",
 		asJj: () => null,
 		asGit: () => git as unknown as VcsGitRepo,
 		label: async () => "main",
-		statusSummary: async () => {
-			probe.statusIds.push(id);
-			return { staged: 0, unstaged: 0, untracked: 0 };
-		},
+		statusSummary: async () => ({ staged: 0, unstaged: 0, untracked: 0 }),
 	};
 	return repo as unknown as VcsRepo;
 }
@@ -78,16 +68,13 @@ function fakeGitInfo(): VcsGitRepoInfo {
 
 interface Harness {
 	component: StatusLineComponent;
-	probe: ReadProbe;
 	repoSpy: Mock<typeof vcs.repo>;
 	dispose: () => void;
 }
 
-function mountStatusLine(repoFactory: (id: number, probe: ReadProbe) => VcsRepo | null = fakeRepo): Harness {
-	const probe: ReadProbe = { kindIds: [], statusIds: [] };
-	let nextId = 0;
-	const repoSpy: Mock<typeof vcs.repo> = spyOn(vcs, "repo").mockImplementation(() => repoFactory(nextId++, probe));
-	const gitSpy = spyOn(vcs, "git").mockImplementation(() => fakeRepo(-1, probe).asGit());
+function mountStatusLine(repoFactory: () => VcsRepo | null = fakeRepo): Harness {
+	const repoSpy: Mock<typeof vcs.repo> = spyOn(vcs, "repo").mockImplementation(repoFactory);
+	const gitSpy = spyOn(vcs, "git").mockImplementation(() => fakeRepo().asGit());
 	const infoSpy = spyOn(vcs, "gitInfo").mockImplementation(() => fakeGitInfo());
 
 	const component = new StatusLineComponent(fakeSession());
@@ -100,7 +87,6 @@ function mountStatusLine(repoFactory: (id: number, probe: ReadProbe) => VcsRepo 
 	});
 	return {
 		component,
-		probe,
 		repoSpy,
 		dispose: () => {
 			component.dispose();
@@ -168,22 +154,69 @@ describe("status line VCS discovery", () => {
 		}
 	});
 
-	it("reads status through a freshly opened handle, not the memoized one", () => {
-		const { component, probe, dispose } = mountStatusLine();
-		try {
-			// One render on a cold status cache: the cheap `kind()` gate runs on the
-			// memoized discovery handle, while `statusSummary` (staged = index vs HEAD
-			// tree) must reopen a fresh handle so a same-branch commit — which never
-			// touches `.git/HEAD`, so the HEAD watcher stays quiet — cannot leave the
-			// status segment comparing against a stale, ref-snapshotted HEAD.
+	it("clears the staged indicator after a same-branch commit", async () => {
+		using tempDir = TempDir.createSync("@omp-status-line-vcs-discovery-");
+		const cwd = tempDir.path();
+		await $`git init --initial-branch=main`.cwd(cwd).quiet();
+		await $`git config user.name "Test User"`.cwd(cwd).quiet();
+		await $`git config user.email "test@example.com"`.cwd(cwd).quiet();
+		await Bun.write(path.join(cwd, "tracked.txt"), "base\n");
+		await $`git add tracked.txt && git commit -m base`.cwd(cwd).quiet();
+		await Bun.write(path.join(cwd, "tracked.txt"), "staged\n");
+		await $`git add tracked.txt`.cwd(cwd).quiet();
+
+		const originalProjectDir = getProjectDir();
+		const discoverRepo = vcs.repo;
+		let statusReadDone: (() => void) | undefined;
+		const repoSpy = spyOn(vcs, "repo").mockImplementation(repoCwd => {
+			const repository = discoverRepo(repoCwd);
+			if (!repository) return null;
+			const statusSummary = repository.statusSummary.bind(repository);
+			repository.statusSummary = async signal => {
+				try {
+					return await statusSummary(signal);
+				} finally {
+					statusReadDone?.();
+					statusReadDone = undefined;
+				}
+			};
+			return repository;
+		});
+		const awaitStatusRead = async (component: StatusLineComponent): Promise<string> => {
+			const settled = Promise.withResolvers<void>();
+			statusReadDone = settled.resolve;
 			component.getTopBorder(120);
-			expect(probe.statusIds.length).toBeGreaterThan(0);
-			expect(probe.kindIds.length).toBeGreaterThan(0);
-			const memoizedGateHandle = probe.kindIds[0];
-			expect(probe.kindIds.every(id => id === memoizedGateHandle)).toBe(true);
-			expect(probe.statusIds.every(id => id !== memoizedGateHandle)).toBe(true);
+			await settled.promise;
+			await Promise.resolve();
+			return Bun.stripANSI(component.getTopBorder(120).content);
+		};
+
+		const headPath = path.join(cwd, ".git", "HEAD");
+		const headBeforeCommit = await Bun.file(headPath).text();
+		let now = 1_000_000;
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		setProjectDir(cwd);
+		const component = new StatusLineComponent(fakeSession());
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["git"],
+			rightSegments: [],
+			separator: "powerline-thin",
+			sessionAccent: false,
+		});
+		try {
+			expect(await awaitStatusRead(component)).toContain("+1");
+
+			await $`git commit -m staged`.cwd(cwd).quiet();
+			expect(await Bun.file(headPath).text()).toBe(headBeforeCommit);
+			now += 1_000;
+
+			expect(await awaitStatusRead(component)).not.toContain("+1");
 		} finally {
-			dispose();
+			component.dispose();
+			setProjectDir(originalProjectDir);
+			nowSpy.mockRestore();
+			repoSpy.mockRestore();
 		}
 	});
 });
