@@ -407,7 +407,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toHaveLength(1);
 	});
 
-	it("restores durable next-turn messages when switching into a session mid-queue", async () => {
+	it("restores durable advisor messages after session switch resets advisor state", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const seedDir = path.join(tempDir, "seed-sessions");
 		fs.mkdirSync(seedDir, { recursive: true });
@@ -416,8 +416,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		seedManager.appendCustomEntry("agent-session-next-turn-queued", {
 			message: {
 				role: "custom",
-				customType: "async-result",
-				content: "Background result",
+				customType: "advisor",
+				content: "Persisted concern",
 				display: true,
 				attribution: "agent",
 				timestamp: Date.now(),
@@ -471,16 +471,16 @@ describe("AgentSession concurrent prompt guard", () => {
 				.at(-1)
 				?.context.messages.some(message =>
 					typeof message.content === "string"
-						? message.content.includes("Background result")
+						? message.content.includes("Persisted concern")
 						: message.content.some(
-								content => content.type === "text" && content.text.includes("Background result"),
+								content => content.type === "text" && content.text.includes("Persisted concern"),
 							),
 				),
 		).toBe(true);
 		expect(
 			session.sessionManager
 				.getEntries()
-				.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
+				.filter(entry => entry.type === "custom_message" && entry.customType === "advisor"),
 		).toHaveLength(1);
 		expect(
 			session.sessionManager
