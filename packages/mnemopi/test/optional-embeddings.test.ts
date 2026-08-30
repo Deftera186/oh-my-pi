@@ -215,7 +215,7 @@ describe("optional embeddings", () => {
 		}
 	});
 
-	it("retries local model initialization after a transient failure", async () => {
+	it("returns null to every caller sharing a failed local model initialization, then retries", async () => {
 		await withEnv(
 			{
 				NODE_ENV: undefined,
@@ -229,17 +229,27 @@ describe("optional embeddings", () => {
 			},
 			async () => {
 				let initCalls = 0;
+				const unavailable = Promise.withResolvers<never>();
+				const initializationStarted = Promise.withResolvers<void>();
 				const observedCacheDirs: Array<string | undefined> = [];
 				setLocalModelInitializerForTests(async options => {
 					initCalls += 1;
 					observedCacheDirs.push(options.cacheDir);
-					if (initCalls === 1) throw new Error("transient init failure");
+					if (initCalls === 1) {
+						initializationStarted.resolve();
+						return unavailable.promise;
+					}
 					return {
 						embed: streamRows(texts => texts.map(text => [text.length, text.charCodeAt(0) || 0])),
 					};
 				});
 
-				expect(await embed(["first"])).toBeNull();
+				const first = embed(["first"]);
+				await initializationStarted.promise;
+				const waiter = embed(["same initialization"]);
+				unavailable.reject(new Error("mnemopi embed subprocess unavailable"));
+
+				expect(await Promise.all([first, waiter])).toEqual([null, null]);
 				expect(await embed(["second"])).toEqual([new Float32Array([6, 115])]);
 				expect(initCalls).toBe(2);
 				expect(observedCacheDirs).toEqual([getFastembedCacheDir(), getFastembedCacheDir()]);
