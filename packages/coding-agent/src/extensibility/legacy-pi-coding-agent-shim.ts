@@ -1548,7 +1548,8 @@ export async function resizeImage(
 	mimeType: string,
 	options?: ImageResizeOptions,
 ): Promise<ResizedImage | null> {
-	return resizeOmpImage({ type: "image", data: Buffer.from(inputBytes).toBase64(), mimeType }, options);
+	const resized = await resizeOmpImage({ type: "image", data: Buffer.from(inputBytes).toBase64(), mimeType }, options);
+	return resized.decodeFailed ? null : resized;
 }
 
 /** Format the coordinate note produced for a resized legacy image. */

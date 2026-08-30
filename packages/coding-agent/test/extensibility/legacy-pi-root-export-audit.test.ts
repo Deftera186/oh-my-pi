@@ -225,4 +225,9 @@ describe("legacy pi coding-agent root export audit", () => {
 		bus.emit("audit", "ok");
 		expect(await received.promise).toBe("ok");
 	});
+
+	it("maps malformed image input back to the legacy null result", async () => {
+		const malformed = new TextEncoder().encode("not an image");
+		expect(await legacy.resizeImage(malformed, "image/png")).toBeNull();
+	});
 });
