@@ -36,6 +36,24 @@ afterEach(async () => {
 	for (const root of roots.splice(0)) await fs.promises.rm(root, { recursive: true, force: true });
 });
 
+/**
+ * Wait for `pid` to stop running, up to `timeoutMs`, returning its last observed
+ * status. A tree-killed descendant dies within tens of ms, but SIGKILL delivery
+ * and reaping lag under runner CPU contention, so a single immediate status read
+ * races that lag and flakes (issue #10259). An uncontained descendant stays
+ * Running for the whole window, so a caller's `.not.toBe(Running)` still fails.
+ * Real subprocess/kernel reaping: fake timers cannot advance a child's clock, so
+ * this must poll the wall clock (same rationale as the marker oracles below).
+ */
+async function statusAfterKill(pid: number, timeoutMs = 2000): Promise<ProcessStatus | undefined> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const status = Process.fromPid(pid)?.status();
+		if (status !== ProcessStatus.Running || Date.now() >= deadline) return status;
+		await Bun.sleep(20);
+	}
+}
+
 test.skipIf(process.platform === "win32")(
 	"config !command children cannot read descriptors the launcher passed omp",
 	async () => {
@@ -116,15 +134,20 @@ test.skipIf(process.platform === "win32")(
 		let escaped: Process | null = null;
 		try {
 			// The intermediate shell exits immediately after backgrounding the
-			// worker. Waiting for its pid file proves the worker started before
-			// the resolver timeout, but PID-tree traversal can no longer find it.
-			const command = `sh -c '"${worker}" &' & while [ ! -s "${pidFile}" ]; do :; done; sleep 10`;
-			const result = await runShellCommand(command, 150);
+			// worker. A yielding poll (not a busy-spin) waits for its pid file so
+			// the worker is fully established before the timeout without starving
+			// the very startup it waits on; PID-tree traversal can no longer find
+			// it once it reparents.
+			const command = `sh -c '"${worker}" &' & until [ -s "${pidFile}" ]; do sleep 0.01; done; sleep 10`;
+			const result = await runShellCommand(command, 500);
 			expect(result).toBeUndefined();
 
 			const pid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+			expect(Number.isFinite(pid), "reparented worker never recorded its pid").toBe(true);
 			escaped = Process.fromPid(pid);
-			expect(escaped?.status(), `reparented descendant ${pid} survived the timeout`).not.toBe(ProcessStatus.Running);
+			expect(await statusAfterKill(pid), `reparented descendant ${pid} survived the timeout`).not.toBe(
+				ProcessStatus.Running,
+			);
 		} finally {
 			escaped?.killTree(9);
 		}
@@ -145,13 +168,17 @@ test.skipIf(process.platform !== "linux")(
 			// `setsid` moves the intermediate into a new session, then that
 			// intermediate backgrounds the worker and exits. The worker is no
 			// longer in the resolver shell's PID tree or original process group.
-			const command = `setsid sh -c '"${worker}" &' </dev/null >/dev/null 2>&1 & while [ ! -s "${pidFile}" ]; do :; done; sleep 10`;
-			const result = await runShellCommand(command, 150);
+			// A yielding poll (not a busy-spin) waits for the pid file so the
+			// worker is fully established before the timeout without starving the
+			// startup it waits on.
+			const command = `setsid sh -c '"${worker}" &' </dev/null >/dev/null 2>&1 & until [ -s "${pidFile}" ]; do sleep 0.01; done; sleep 10`;
+			const result = await runShellCommand(command, 500);
 			expect(result).toBeUndefined();
 
 			const pid = Number.parseInt((await Bun.file(pidFile).text()).trim(), 10);
+			expect(Number.isFinite(pid), "session-escaping worker never recorded its pid").toBe(true);
 			escaped = Process.fromPid(pid);
-			expect(escaped?.status(), `session-escaping descendant ${pid} survived the timeout`).not.toBe(
+			expect(await statusAfterKill(pid), `session-escaping descendant ${pid} survived the timeout`).not.toBe(
 				ProcessStatus.Running,
 			);
 		} finally {
