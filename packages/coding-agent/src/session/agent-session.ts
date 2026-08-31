@@ -1023,6 +1023,7 @@ export class AgentSession {
 		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
 			suppliedTitle: title,
 			statePlanFilePath: state.planFilePath,
+			reentry: state.reentry,
 			readPlan: url => this.#readPlanFile(url),
 			listPlanFiles: () => this.#listPlanFiles(),
 		});

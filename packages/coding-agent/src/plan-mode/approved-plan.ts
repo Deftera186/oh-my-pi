@@ -134,6 +134,11 @@ export interface ResolveApprovedPlanInput {
 	suppliedTitle?: unknown;
 	/** The plan path recorded in plan-mode state (the entry default or a prior plan). */
 	statePlanFilePath: string;
+	/** Whether plan mode was RE-entered (a plan already ran this session). On
+	 *  re-entry `statePlanFilePath` is the previously approved plan, so a supplied
+	 *  title that resolves to no fresh artifact must fail closed instead of reusing
+	 *  it (issue #6569). Absent/false keeps the lenient first-entry fallback. */
+	reentry?: boolean;
 	/** Read a plan `local://` URL, returning null when the file does not exist. */
 	readPlan: (planUrl: string) => Promise<string | null>;
 	/** Optional fallback: list candidate plan `local://` URLs (newest first) so a
@@ -160,26 +165,49 @@ export async function resolveApprovedPlan(input: ResolveApprovedPlanInput): Prom
 	};
 
 	const slug = planSlugFromSupplied(input.suppliedTitle);
-	consider(slug ? planFileUrlForSlug(slug) : undefined);
+	const titleUrl = slug ? planFileUrlForSlug(slug) : undefined;
+	consider(titleUrl);
 
 	const listed = input.listPlanFiles ? await input.listPlanFiles() : [];
+	// On re-entry `statePlanFilePath` is the plan approved earlier this session,
+	// not the draft being proposed now. A supplied title is a positive claim to a
+	// fresh `local://<slug>-plan.md`; when it — and every fresh scanned draft —
+	// resolves to nothing we fail closed rather than silently reuse the old
+	// approved plan, which would let the operator approve and execute a stale plan
+	// (issue #6569, re-entry variant). First entry and dropped-title re-entry keep
+	// the lenient fallback so a deliberately-set current plan still resolves.
+	const supplied = typeof input.suppliedTitle === "string" && input.suppliedTitle.trim().length > 0;
+	const excludeStatePlan = input.reentry === true && supplied;
+
+	// Compare canonical `local://` spellings so a resumed `local:/…` state path
+	// still matches the scanner's `local://…` entry (normalizeLocalScheme).
+	const canonicalState = normalizeLocalScheme(input.statePlanFilePath);
+	const canonicalListed = new Set(listed.map(normalizeLocalScheme));
 	// A state plan the scan cannot surface (cwd-relative, or a local file whose
 	// name does not end in `plan.md`) has no mtime in `listed` to compete on, so
 	// it keeps precedence over scanned artifacts — otherwise a stale older draft
 	// could shadow the deliberately-set current plan. A state plan already inside
-	// the scan competes purely on the newest-first ordering below (issue #6569).
-	// Compare canonical `local://` spellings so a resumed `local:/…` state path
-	// still matches the scanner's `local://…` entry (normalizeLocalScheme).
-	const canonicalListed = new Set(listed.map(normalizeLocalScheme));
-	if (input.statePlanFilePath && !canonicalListed.has(normalizeLocalScheme(input.statePlanFilePath))) {
+	// the scan competes purely on the newest-first ordering below.
+	if (!excludeStatePlan && input.statePlanFilePath && !canonicalListed.has(canonicalState)) {
 		consider(input.statePlanFilePath);
 	}
-	for (const url of listed) consider(url);
-	consider(input.statePlanFilePath);
+	for (const url of listed) {
+		if (excludeStatePlan && normalizeLocalScheme(url) === canonicalState) continue;
+		consider(url);
+	}
+	if (!excludeStatePlan) consider(input.statePlanFilePath);
 
 	for (const url of ordered) {
 		const content = await input.readPlan(url);
 		if (content !== null) return finalizeApprovedPlan(url, content, input.suppliedTitle);
+	}
+
+	if (excludeStatePlan) {
+		throw new ToolError(
+			titleUrl
+				? `Plan file not found at ${titleUrl}. Write the finalized plan there before requesting approval — on plan re-entry a new proposal must be backed by its own local://<slug>-plan.md artifact; the previously approved plan is never reused.`
+				: `No plan artifact found for the proposed plan. Write the finalized plan to a new local://<slug>-plan.md (short kebab-case <slug>) and submit that <slug> — not the plan body — to xd://propose; the previously approved plan is never reused.`,
+		);
 	}
 
 	const target = ordered[0] ?? input.statePlanFilePath;

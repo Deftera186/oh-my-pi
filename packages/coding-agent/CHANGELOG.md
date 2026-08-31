@@ -20,6 +20,7 @@
 - Fixed an issue where custom model overrides were lost during configuration updates
 - Fixed "Please use nerdfont" notification incorrectly persisting after theme configuration
 - Fixed sampling parameter errors for newer Anthropic models (Opus 4.7+, Sonnet 5+)
+- Fixed plan re-entry approving and executing the previously completed plan when a new proposal was submitted without writing its own `local://<slug>-plan.md` artifact (e.g. the whole plan body pasted into `xd://propose`); plan resolution now fails closed with an actionable error instead of silently reusing the old approved plan ([#6569](https://github.com/can1357/oh-my-pi/issues/6569)).
 
 ## [18.0.11] - 2026-08-29
 

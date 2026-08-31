@@ -1890,6 +1890,7 @@ export class AcpAgent implements Agent {
 		} = await resolveApprovedPlan({
 			suppliedTitle: title,
 			statePlanFilePath: state.planFilePath,
+			reentry: state.reentry,
 			readPlan: url => this.#readAcpPlanFile(session, url),
 			listPlanFiles: () => this.#listAcpLocalPlanFiles(session),
 		});

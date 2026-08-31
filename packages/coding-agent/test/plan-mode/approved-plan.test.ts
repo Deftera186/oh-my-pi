@@ -119,6 +119,73 @@ describe("resolveApprovedPlan", () => {
 			}),
 		).rejects.toThrow("Plan file not found at local://ghost-plan.md");
 	});
+
+	it("fails closed on re-entry when the plan body is pasted as the title and only the old plan exists", async () => {
+		await expect(
+			resolveApprovedPlan({
+				// Model sent the whole markdown to xd://propose instead of a slug.
+				suppliedTitle: "# Bassez rolling pipeline\n\nStep 1: run scripts/a.sh and/or b.sh",
+				reentry: true,
+				statePlanFilePath: "local://hpc-environment-containerization-plan.md",
+				readPlan: reader({
+					"local://hpc-environment-containerization-plan.md": "# HPC\n\nPreviously approved plan",
+				}),
+				listPlanFiles: async () => ["local://hpc-environment-containerization-plan.md"],
+			}),
+		).rejects.toThrow("No plan artifact found for the proposed plan");
+	});
+
+	it("fails closed on re-entry when the title's slug artifact is missing and no fresh draft exists", async () => {
+		await expect(
+			resolveApprovedPlan({
+				suppliedTitle: "bassez-spelling-correction",
+				reentry: true,
+				statePlanFilePath: "local://hpc-environment-containerization-plan.md",
+				readPlan: reader({
+					"local://hpc-environment-containerization-plan.md": "# HPC\n\nPreviously approved plan",
+				}),
+				listPlanFiles: async () => ["local://hpc-environment-containerization-plan.md"],
+			}),
+		).rejects.toThrow("Plan file not found at local://bassez-spelling-correction-plan.md");
+	});
+
+	it("recovers on re-entry to a fresh draft when the title is mismatched", async () => {
+		const result = await resolveApprovedPlan({
+			suppliedTitle: "Different title",
+			reentry: true,
+			statePlanFilePath: "local://completed-plan.md",
+			readPlan: reader({
+				"local://completed-plan.md": "# Completed\n\nOld plan",
+				"local://new-draft-plan.md": "# New\n\nNew plan",
+			}),
+			listPlanFiles: async () => ["local://new-draft-plan.md", "local://completed-plan.md"],
+		});
+		expect(result.planFilePath).toBe("local://new-draft-plan.md");
+		expect(result.planContent).toContain("New plan");
+	});
+
+	it("returns the prior plan on re-entry only when its own slug is submitted (deliberate re-target)", async () => {
+		const result = await resolveApprovedPlan({
+			suppliedTitle: "completed",
+			reentry: true,
+			statePlanFilePath: "local://completed-plan.md",
+			readPlan: reader({ "local://completed-plan.md": "# Completed\n\nReused plan" }),
+			listPlanFiles: async () => ["local://completed-plan.md"],
+		});
+		expect(result.planFilePath).toBe("local://completed-plan.md");
+		expect(result.planContent).toContain("Reused plan");
+	});
+
+	it("stays lenient on re-entry with a dropped title (unambiguous single plan)", async () => {
+		const result = await resolveApprovedPlan({
+			suppliedTitle: undefined,
+			reentry: true,
+			statePlanFilePath: "local://completed-plan.md",
+			readPlan: reader({ "local://completed-plan.md": "# Completed\n\nOnly plan" }),
+			listPlanFiles: async () => ["local://completed-plan.md"],
+		});
+		expect(result.planFilePath).toBe("local://completed-plan.md");
+	});
 });
 
 describe("humanizePlanTitle", () => {
