@@ -32,7 +32,7 @@ Agents can create or replace a local file with `write`, and can update a previou
 
 ## URL syntax
 
-Internal URLs use `scheme://target`. Pass the complete URL anywhere a tool accepts a readable path. The `read` tool also supports its normal selectors on internal resources:
+Internal URLs use `scheme://target`. Pass the complete URL anywhere a tool accepts a readable path. The `read` tool supports its normal selectors on most built-in schemes:
 
 | Form | Effect |
 | --- | --- |
@@ -41,7 +41,9 @@ Internal URLs use `scheme://target`. Pass the complete URL anywhere a tool accep
 | `scheme://name:50-100` | Read an inclusive line range |
 | `scheme://name:raw` | Read the resource without document conversion |
 
-Percent-encode a literal `:`, `?`, or `#` in a resource name as `%3A`, `%3F`, or `%23`; otherwise it can be interpreted as a selector or URL delimiter. Availability is session-dependent: for example, `mcp://` needs a connected MCP server, `ssh://` needs a configured host, and `vault://` needs Obsidian integration.
+Selectors are not parsed for `mcp://`, server-native MCP resource URIs, or `xd://`. A suffix such as `:50-100` or `:raw` remains part of the resource URI or device name and usually causes lookup to fail. Use the exact MCP resource URI or `xd://<name>` instead.
+
+For selector-capable schemes, percent-encode a literal `:`, `?`, or `#` in a resource name as `%3A`, `%3F`, or `%23`; otherwise it can be interpreted as a selector or URL delimiter. MCP resource URIs are opaque and matched verbatim, so use the exact URI advertised by the server. Availability is session-dependent: for example, `mcp://` needs a connected MCP server, `ssh://` needs a configured host, and `vault://` needs Obsidian integration.
 
 ## Built-in schemes
 
