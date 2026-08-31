@@ -2,7 +2,7 @@
 
 Oh My Pi uses URL-shaped paths for resources managed by the harness rather than the workspace filesystem. The `read` tool accepts these paths directly, so an agent can open a plan, artifact, transcript, skill, or other resource without first finding its backing file on disk.
 
-An internal URL is not a normal filesystem path. Do not expect `cat local://plan.md` or an editor outside OMP to understand it; ask the agent to read the URL, or pass it as the `path` argument when invoking the `read` tool through the SDK or RPC interface.
+An internal URL is a handle the harness resolves, not a shell path: `cat local://plan.md` will not work, and neither will an editor that receives the literal string. Most schemes (`agent://`, `history://`, `omp://`, …) are harness state with no standalone file to open, so you read them through the agent or the `read` tool via the SDK or RPC interface. `local://` is the exception worth calling out — it is backed by ordinary files on your own disk, so you can open a plan directly without any model round-trip (see [Opening a local file directly](#opening-a-local-file-directly)).
 
 ## Reading a `local://` plan
 
@@ -24,6 +24,14 @@ The bare `local://` URL returns a recursive listing with links. Reading a file U
 local://auth-token-refresh-plan.md
 local://auth-token-refresh-plan.md:40-80
 local://auth-token-refresh-plan.md:raw
+```
+
+### Opening a local file directly
+
+`local://` files are real files on the local disk, so you do not need the agent — or any tokens — to read one you already have. They live under the session's artifacts directory in a `local/` subdirectory, falling back to `<tmpdir>/omp-local/<session-id>/` when no artifacts directory is set. The bare `local://` listing prints the resolved absolute path on its `Root:` line; open that path with any editor or `cat`:
+
+```text
+cat "$TMPDIR/omp-local/<session-id>/auth-token-refresh-plan.md"
 ```
 
 `local://` is session-scoped scratch space. Plans, large intermediate data, and subagent handoff files live there instead of changing the working tree. Parent agents and their subagents share the same local root. The files remain associated with the session when it is resumed, but they are not project files or a replacement for durable documentation that belongs in the repository.
