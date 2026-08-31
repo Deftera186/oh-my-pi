@@ -28,7 +28,7 @@ local://auth-token-refresh-plan.md:raw
 
 `local://` is session-scoped scratch space. Plans, large intermediate data, and subagent handoff files live there instead of changing the working tree. Parent agents and their subagents share the same local root. The files remain associated with the session when it is resumed, but they are not project files or a replacement for durable documentation that belongs in the repository.
 
-Agents can create or replace a local file with `write`, and can update a previously read text file with `edit`. The local handler confines every resolved path to the session root; `..` traversal and symlinks that escape the root are rejected.
+Agents can create or replace a local file with `write`, and can update a previously read text file with `edit`. Every resolved path is kept lexically within the session root, so `..` traversal is rejected. Read resolution additionally follows symlinks and rejects any that resolve outside the root; write and edit resolution is lexical only, so an existing in-root symlink can still redirect a mutation elsewhere.
 
 ## URL syntax
 
