@@ -12,11 +12,25 @@ import * as path from "node:path";
  * only used as a fallback when Bun's own resolver fails.
  */
 
+// Bun resolves and loads TypeScript/JSX entries at runtime (even in a compiled
+// binary), so the fallback must probe them too — e.g. a dep with `"main": "entry"`
+// backed by `entry.ts`. Ordered JS-family first, then TS/JSX, then data/native.
+
 /** File extensions probed when a specifier or exports target has none. */
-const FILE_EXTENSIONS = [".js", ".mjs", ".cjs", ".json", ".node"];
+const FILE_EXTENSIONS = [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".json", ".node"];
 
 /** Directory index filenames probed when a target resolves to a directory. */
-const INDEX_FILES = ["index.js", "index.mjs", "index.cjs", "index.json"];
+const INDEX_FILES = [
+	"index.js",
+	"index.mjs",
+	"index.cjs",
+	"index.jsx",
+	"index.ts",
+	"index.tsx",
+	"index.mts",
+	"index.cts",
+	"index.json",
+];
 
 /** Condition preference for `import()`-shaped resolution. */
 export const IMPORT_CONDITIONS = ["node", "import", "module", "default"];

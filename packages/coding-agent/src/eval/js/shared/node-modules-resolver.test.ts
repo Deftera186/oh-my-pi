@@ -44,6 +44,8 @@ beforeAll(() => {
 	writePackage(projNm, "legacy", { main: "lib/entry.js" }, { "lib/entry.js": "module.exports = 'legacy';" });
 	// No entry fields at all: index.js fallback.
 	writePackage(projNm, "indexonly", {}, { "index.js": "module.exports = 'index';" });
+	// Extensionless legacy main backed by a TypeScript file (Bun resolves/loads it natively).
+	writePackage(projNm, "tsentry", { main: "entry" }, { "entry.ts": "export default 42;" });
 	// Scoped package with subpath pattern exports.
 	writePackage(
 		projNm,
@@ -83,6 +85,12 @@ describe("resolveBareSpecifier", () => {
 		);
 		expect(resolveBareSpecifier("indexonly", projectDir, IMPORT_CONDITIONS)).toBe(
 			path.join(projectDir, "node_modules", "indexonly", "index.js"),
+		);
+	});
+
+	test("probes TypeScript extensions for an extensionless main", () => {
+		expect(resolveBareSpecifier("tsentry", projectDir, IMPORT_CONDITIONS)).toBe(
+			path.join(projectDir, "node_modules", "tsentry", "entry.ts"),
 		);
 	});
 
