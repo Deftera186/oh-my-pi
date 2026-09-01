@@ -188,6 +188,16 @@ describe("resolveBareSpecifier", () => {
 		);
 	});
 
+	test("preserves a query/fragment suffix on the resolved path", () => {
+		// `?raw` is stripped for subpath matching, then re-appended to the resolved file.
+		expect(resolveBareSpecifier("@scope/pkg/feature/thing?raw", projectDir, IMPORT_CONDITIONS)).toBe(
+			`${path.join(projectDir, "node_modules", "@scope", "pkg", "src", "thing.js")}?raw`,
+		);
+		expect(resolveBareSpecifier("dual?v=1", projectDir, IMPORT_CONDITIONS)).toBe(
+			`${path.join(projectDir, "node_modules", "dual", "esm.mjs")}?v=1`,
+		);
+	});
+
 	test("walks the node_modules chain upward from the base directory", () => {
 		// `shared` lives only in outer/node_modules; resolving from outer's own dir finds it.
 		expect(resolveBareSpecifier("shared", nestedDir, IMPORT_CONDITIONS)).toBe(

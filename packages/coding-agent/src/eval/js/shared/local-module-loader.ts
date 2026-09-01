@@ -406,6 +406,10 @@ function isManagedLocalModulePath(target: string): boolean {
 }
 
 function normalizeImportTarget(target: string): string {
-	if (path.isAbsolute(target)) return pathToFileURL(target).href;
-	return target;
+	if (!path.isAbsolute(target)) return target;
+	// Preserve a `?query`/`#fragment` suffix through file-URL conversion; pathToFileURL
+	// would otherwise percent-encode `?`/`#` into the pathname and break the query.
+	const cut = target.search(/[?#]/);
+	if (cut === -1) return pathToFileURL(target).href;
+	return pathToFileURL(target.slice(0, cut)).href + target.slice(cut);
 }

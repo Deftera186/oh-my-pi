@@ -59,6 +59,18 @@ interface PackageJson {
  * @param conditions ordered export-condition preference (see {@link IMPORT_CONDITIONS}).
  */
 export function resolveBareSpecifier(specifier: string, baseDir: string, conditions: string[]): string | null {
+	// A trailing `?query`/`#fragment` (e.g. `pkg/feature?raw`) is not part of the
+	// package subpath: strip it for resolution and re-append it to the resolved path,
+	// matching how `Bun.resolveSync` retains the suffix on the resolved module URL.
+	const cut = specifier.search(/[?#]/);
+	const bare = cut === -1 ? specifier : specifier.slice(0, cut);
+	const suffix = cut === -1 ? "" : specifier.slice(cut);
+	const resolved = resolveBarePath(bare, baseDir, conditions);
+	return resolved === null ? null : resolved + suffix;
+}
+
+/** Resolve the query-free bare specifier to an absolute file path (see {@link resolveBareSpecifier}). */
+function resolveBarePath(specifier: string, baseDir: string, conditions: string[]): string | null {
 	const { name, subpath } = splitSpecifier(specifier);
 	if (!name) return null;
 	const pkgDir = findPackageDir(name, baseDir);
