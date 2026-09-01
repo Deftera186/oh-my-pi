@@ -67,6 +67,16 @@ beforeAll(() => {
 			"src/thing.js": "module.exports = 'scoped-feature';",
 		},
 	);
+	// Overlapping wildcard patterns: the most-specific (longest-prefix) key must win.
+	writePackage(
+		projNm,
+		"overlap",
+		{ exports: { "./*": "./general/*.js", "./feature/*": "./specific/*.js" } },
+		{
+			"general/other.js": "module.exports = 'general';",
+			"specific/x.js": "module.exports = 'specific';",
+		},
+	);
 	// Package resolvable only by walking up: installed in a nested dependency's node_modules.
 	writePackage(
 		path.join(nestedDir, "node_modules"),
@@ -117,6 +127,17 @@ describe("resolveBareSpecifier", () => {
 		);
 		expect(resolveBareSpecifier("@scope/pkg/feature/thing", projectDir, IMPORT_CONDITIONS)).toBe(
 			path.join(projectDir, "node_modules", "@scope", "pkg", "src", "thing.js"),
+		);
+	});
+
+	test("selects the most-specific overlapping wildcard pattern", () => {
+		// `./feature/*` (longer prefix) must beat `./*` for `overlap/feature/x`.
+		expect(resolveBareSpecifier("overlap/feature/x", projectDir, IMPORT_CONDITIONS)).toBe(
+			path.join(projectDir, "node_modules", "overlap", "specific", "x.js"),
+		);
+		// A subpath only the broad `./*` matches still resolves through it.
+		expect(resolveBareSpecifier("overlap/other", projectDir, IMPORT_CONDITIONS)).toBe(
+			path.join(projectDir, "node_modules", "overlap", "general", "other.js"),
 		);
 	});
 

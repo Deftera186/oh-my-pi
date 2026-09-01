@@ -155,12 +155,31 @@ function resolveExports(exports: unknown, subpath: string, conditions: string[])
 	}
 
 	if (subpath in record) return resolveConditional(record[subpath], conditions);
+	// Node/Bun select the most-specific `*` pattern: longest literal prefix, then
+	// longest key — not the first declared. Rank all matches before resolving.
+	let best: { prefixLength: number; keyLength: number; captured: string; value: unknown } | null = null;
 	for (const key in record) {
-		if (!key.includes("*")) continue;
-		const captured = matchStar(key, subpath);
-		if (captured === null) continue;
-		const target = resolveConditional(record[key], conditions);
-		if (target) return target.replace(/\*/g, captured);
+		const star = key.indexOf("*");
+		if (star === -1) continue;
+		const prefix = key.slice(0, star);
+		const suffix = key.slice(star + 1);
+		if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) continue;
+		if (subpath.length < prefix.length + suffix.length) continue;
+		const better =
+			!best ||
+			prefix.length > best.prefixLength ||
+			(prefix.length === best.prefixLength && key.length > best.keyLength);
+		if (!better) continue;
+		best = {
+			prefixLength: prefix.length,
+			keyLength: key.length,
+			captured: subpath.slice(prefix.length, subpath.length - suffix.length),
+			value: record[key],
+		};
+	}
+	if (best) {
+		const target = resolveConditional(best.value, conditions);
+		if (target) return target.replace(/\*/g, best.captured);
 	}
 	return null;
 }
@@ -187,17 +206,6 @@ function resolveConditional(value: unknown, conditions: string[]): string | null
 		if (resolved) return resolved;
 	}
 	return null;
-}
-
-/** Match a single-`*` exports pattern against `subpath`, returning the captured segment. */
-function matchStar(pattern: string, subpath: string): string | null {
-	const star = pattern.indexOf("*");
-	if (star === -1) return null;
-	const prefix = pattern.slice(0, star);
-	const suffix = pattern.slice(star + 1);
-	if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) return null;
-	if (subpath.length < prefix.length + suffix.length) return null;
-	return subpath.slice(prefix.length, subpath.length - suffix.length);
 }
 
 /** Resolve `candidate` to an existing file, probing extensions when it has none. */
