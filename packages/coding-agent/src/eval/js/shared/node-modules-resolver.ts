@@ -67,13 +67,10 @@ export function resolveBareSpecifier(specifier: string, baseDir: string, conditi
 
 	if (pkg && pkg.exports != null) {
 		const target = resolveExports(pkg.exports, subpath, conditions);
-		if (target === EXCLUDED) return null;
-		if (typeof target === "string" && (target.startsWith("./") || target.startsWith("../"))) {
-			const resolved = finalizeFile(path.resolve(pkgDir, target));
-			if (resolved) return resolved;
-		}
-		// `exports` present but no usable match: fall through to legacy fields only for
-		// the package root, mirroring Node's leniency for missing subpath maps.
+		if (typeof target !== "string" || (!target.startsWith("./") && !target.startsWith("../"))) return null;
+		// A non-null `exports` field encapsulates the package. An unmatched target
+		// or a target whose file is missing must not fall through to `main`/index.
+		return finalizeFile(path.resolve(pkgDir, target));
 	}
 
 	if (subpath === ".") {

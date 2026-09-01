@@ -64,6 +64,31 @@ beforeAll(() => {
 		{ exports: { ".": { bun: null, default: "./fallback.js" } } },
 		{ "fallback.js": "module.exports = 'fallback';" },
 	);
+	// A non-null exports field encapsulates the package root, even when legacy main exists.
+	writePackage(
+		projNm,
+		"subpathonly",
+		{ main: "./main.js", exports: { "./feature": "./feature.js" } },
+		{
+			"main.js": "module.exports = 'legacy-main';",
+			"feature.js": "module.exports = 'feature';",
+		},
+	);
+	writePackage(
+		projNm,
+		"inactivecond",
+		{ main: "./main.js", exports: { ".": { deno: "./deno.js" } } },
+		{
+			"main.js": "module.exports = 'legacy-main';",
+			"deno.js": "module.exports = 'deno';",
+		},
+	);
+	writePackage(
+		projNm,
+		"missingtarget",
+		{ main: "./main.js", exports: { ".": "./missing.js" } },
+		{ "main.js": "module.exports = 'legacy-main';" },
+	);
 	// Scoped package with subpath pattern exports.
 	writePackage(
 		projNm,
@@ -135,6 +160,12 @@ describe("resolveBareSpecifier", () => {
 		expect(resolveBareSpecifier("excluded", projectDir, ["node", "import", "default"])).toBe(
 			path.join(projectDir, "node_modules", "excluded", "fallback.js"),
 		);
+	});
+
+	test("does not bypass a non-null exports boundary with legacy root fallbacks", () => {
+		expect(resolveBareSpecifier("subpathonly", projectDir, IMPORT_CONDITIONS)).toBeNull();
+		expect(resolveBareSpecifier("inactivecond", projectDir, IMPORT_CONDITIONS)).toBeNull();
+		expect(resolveBareSpecifier("missingtarget", projectDir, IMPORT_CONDITIONS)).toBeNull();
 	});
 
 	test("resolves scoped root and subpath-pattern exports", () => {
