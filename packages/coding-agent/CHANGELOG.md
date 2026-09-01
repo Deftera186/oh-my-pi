@@ -5,6 +5,7 @@
 ### Fixed
 
 - Claude marketplace MCP servers now resolve environment placeholders in stdio environment values instead of passing strings such as `${NAME:-}` literally ([#10481](https://github.com/can1357/oh-my-pi/pull/10481) by [@mrexodia](https://github.com/mrexodia)).
+- eval JS cells now resolve project `node_modules` dependencies by bare specifier (`require('pkg')` / `import('pkg')`) in the compiled binary, walking the on-disk `node_modules` chain from the cwd instead of the binary's embedded filesystem ([#10496](https://github.com/can1357/oh-my-pi/issues/10496)).
 ## [18.1.2] - 2026-09-01
 
 ### Added
