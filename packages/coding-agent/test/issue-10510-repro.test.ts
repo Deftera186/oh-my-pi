@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, type AgentTurnEndContext } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -9,10 +9,11 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, PREWALK_PLAN_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { PrewalkCoordinator, type PrewalkCoordinatorHost } from "@oh-my-pi/pi-coding-agent/session/prewalk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 /**
  * Issue #10510: with prewalk armed and `todo.eager=always`, the session injected
@@ -21,6 +22,12 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
  * plan first, then todo"). Prewalk's plan flow already owns todo creation, so
  * the eager prelude must yield to it while a prewalk is armed.
  */
+function modelOrThrow(id: string): Model<Api> {
+	const model = getBundledModel("anthropic", id);
+	if (!model) throw new Error(`Expected bundled model ${id}`);
+	return model;
+}
+
 describe("issue #10510: prewalk + eager-todo conflict", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -37,12 +44,6 @@ describe("issue #10510: prewalk + eager-todo conflict", () => {
 		authStorage.close();
 		tempDir.removeSync();
 	});
-
-	function modelOrThrow(id: string): Model<Api> {
-		const model = getBundledModel("anthropic", id);
-		if (!model) throw new Error(`Expected bundled model ${id}`);
-		return model;
-	}
 
 	function messageText(message: AgentMessage): string {
 		if (!("content" in message)) return "";
@@ -142,5 +143,141 @@ describe("issue #10510: prewalk + eager-todo conflict", () => {
 		const text = await collectInjectedText({ prewalk: "noop" });
 		expect(text.includes("write complete plan")).toBe(false);
 		expect(text.includes("You MUST call") && text.includes("first in this turn")).toBe(true);
+	});
+});
+
+/**
+ * Issue #10511: prewalk's plan nudge is steered live and never persisted, so a
+ * mid-run compaction rebuild (which calls `agent.replaceMessages` with the
+ * rebuilt-from-session context) drops it. The coordinator latched `#planInjected`
+ * and never re-showed it, so the todo gate never opened and prewalk stayed on the
+ * expensive model. It must re-inject while the gate is still closed.
+ */
+describe("PrewalkCoordinator plan-nudge robustness", () => {
+	function makeAgent(model: Model<Api>): Agent {
+		return new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+				thinkingLevel: Effort.Medium,
+			},
+			convertToLlm,
+		});
+	}
+
+	function makeHost(agent: Agent, model: Model<Api>): PrewalkCoordinatorHost {
+		const unsupported = (name: string): (() => never) => {
+			return () => {
+				throw new Error(`unexpected PrewalkCoordinatorHost call: ${name}`);
+			};
+		};
+		return {
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			model: () => model,
+			configuredThinkingLevel: () => Effort.Medium,
+			emitNotice: () => {},
+			getActiveToolNames: () => ["todo"],
+			setModelTemporary: async () => {},
+			setActiveToolsByName: async () => {},
+			setActiveToolPresentation: async () => {},
+			runToolRegistryMutation: async mutation => mutation(),
+			getEnabledToolNames: () => ["todo"],
+			getSelectedMCPToolNames: () => [],
+			getMountedXdevToolNames: () => [],
+			hasBuiltInTool: () => false,
+			getPlanModeState: () => undefined,
+			setPlanModeState: () => {},
+			getPlanReferencePath: () => "",
+			setPlanProposalHandler: () => {},
+			waitForSessionMessagePersistence: async () => {},
+			localProtocolOptions: unsupported("localProtocolOptions"),
+		};
+	}
+
+	const turnEnd = (): AgentTurnEndContext => ({
+		message: createAssistantMessage(""),
+		toolResults: [],
+		willContinue: false,
+	});
+
+	const planNudgeQueued = (agent: Agent): boolean =>
+		agent
+			.peekSteeringQueue()
+			.some(
+				(message: AgentMessage) => message.role === "custom" && message.customType === PREWALK_PLAN_MESSAGE_TYPE,
+			);
+
+	// Moves the steered nudge into live state exactly as the agent loop does when
+	// it consumes a one-at-a-time steering message on the next turn.
+	function consumeSteeredNudge(agent: Agent): void {
+		for (const message of agent.peekSteeringQueue()) agent.appendMessage(message);
+		agent.clearSteeringQueue();
+	}
+
+	it("re-injects the plan nudge after a rebuild drops it before the todo gate opens", async () => {
+		const primary = modelOrThrow("claude-sonnet-4-5");
+		const target = modelOrThrow("claude-sonnet-4-6");
+		const agent = makeAgent(primary);
+		const coordinator = new PrewalkCoordinator(makeHost(agent, primary), { prewalk: { target } });
+
+		// Turn 1: no todo -> the plan nudge is steered.
+		await coordinator.advanceAtTurnEnd(agent.state.messages, turnEnd());
+		expect(planNudgeQueued(agent)).toBe(true);
+		consumeSteeredNudge(agent);
+
+		// Turn 2: nudge is now in live state and the gate is still closed -> no re-inject.
+		await coordinator.advanceAtTurnEnd(agent.state.messages, turnEnd());
+		expect(planNudgeQueued(agent)).toBe(false);
+
+		// Compaction rebuild drops the non-persisted nudge from live state.
+		agent.replaceMessages(
+			agent.state.messages.filter(
+				message => !(message.role === "custom" && message.customType === PREWALK_PLAN_MESSAGE_TYPE),
+			),
+		);
+
+		// Turn 3: nudge gone, gate still closed -> it must be re-injected.
+		await coordinator.advanceAtTurnEnd(agent.state.messages, turnEnd());
+		expect(planNudgeQueued(agent)).toBe(true);
+	});
+
+	it("does not re-inject once the todo gate has opened", async () => {
+		const primary = modelOrThrow("claude-sonnet-4-5");
+		const target = modelOrThrow("claude-sonnet-4-6");
+		const agent = makeAgent(primary);
+		const coordinator = new PrewalkCoordinator(makeHost(agent, primary), { prewalk: { target } });
+
+		await coordinator.advanceAtTurnEnd(agent.state.messages, turnEnd());
+		consumeSteeredNudge(agent);
+
+		// A successful todo result opens the gate.
+		const todoResult: AgentTurnEndContext = {
+			message: createAssistantMessage(""),
+			toolResults: [
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					toolName: "todo",
+					content: [{ type: "text", text: "listed" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			],
+			willContinue: false,
+		};
+		await coordinator.advanceAtTurnEnd(agent.state.messages, todoResult);
+
+		// Even if a later rebuild drops the nudge, the consumed requirement must not return.
+		agent.replaceMessages(
+			agent.state.messages.filter(
+				message => !(message.role === "custom" && message.customType === PREWALK_PLAN_MESSAGE_TYPE),
+			),
+		);
+		await coordinator.advanceAtTurnEnd(agent.state.messages, turnEnd());
+		expect(planNudgeQueued(agent)).toBe(false);
 	});
 });

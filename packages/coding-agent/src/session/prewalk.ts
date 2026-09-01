@@ -140,6 +140,20 @@ export class PrewalkCoordinator {
 		);
 	}
 
+	/** Steers the hidden plan nudge and marks it awaiting a continuation. */
+	#steerPlanNudge(): void {
+		this.#planInjected = true;
+		this.#continuePending = true;
+		this.#host.agent.steer({
+			role: "custom",
+			customType: PREWALK_PLAN_MESSAGE_TYPE,
+			content: prewalkPlanPrompt,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+	}
+
 	/** Advances the one-way prewalk switch at a completed assistant-turn boundary. */
 	async advanceAtTurnEnd(liveMessages: AgentMessage[], context: AgentTurnEndContext | undefined): Promise<void> {
 		const prewalk = this.#prewalk;
@@ -171,18 +185,27 @@ export class PrewalkCoordinator {
 			? context.toolResults.find(result => isPrewalkImplementationAction(result))
 			: undefined;
 		if (!action) {
+			// Re-inject when the nudge was never shown, or when a context rebuild
+			// (e.g. mid-run compaction) dropped the non-persisted nudge before the
+			// todo gate opened. Without this, `#planInjected` stays latched, the
+			// nudge never returns, the gate never opens, and prewalk strands on the
+			// expensive model (#10511).
+			// A re-injected nudge sits in the steering queue until the next turn
+			// consumes it into live state, so treat either location as "present".
+			const planNudgePresent =
+				this.#host.agent.state.messages.some(isPrewalkPlanNudge) ||
+				this.#host.agent.peekSteeringQueue().some(isPrewalkPlanNudge);
+			const planNudgeLost = this.#planInjected && !this.#todoSeen && !planNudgePresent;
 			if (!this.#planInjected) {
-				this.#planInjected = true;
-				this.#continuePending = true;
-				this.#host.agent.steer({
-					role: "custom",
-					customType: PREWALK_PLAN_MESSAGE_TYPE,
-					content: prewalkPlanPrompt,
-					display: false,
-					attribution: "agent",
-					timestamp: Date.now(),
-				});
+				this.#steerPlanNudge();
 				this.#host.emitNotice("info", "Prewalk: injected deep-plan nudge.", "prewalk");
+			} else if (planNudgeLost) {
+				this.#steerPlanNudge();
+				this.#host.emitNotice(
+					"info",
+					"Prewalk: re-injected deep-plan nudge after a context rebuild dropped it.",
+					"prewalk",
+				);
 			}
 			return;
 		}
@@ -235,17 +258,8 @@ export class PrewalkCoordinator {
 			return false;
 		}
 		this.#prewalk = candidate;
-		this.#planInjected = true;
-		this.#continuePending = true;
 		this.#todoSeen = false;
-		this.#host.agent.steer({
-			role: "custom",
-			customType: PREWALK_PLAN_MESSAGE_TYPE,
-			content: prewalkPlanPrompt,
-			display: false,
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
+		this.#steerPlanNudge();
 		this.#host.emitNotice(
 			"info",
 			`Prewalk: armed for ${target.provider}/${target.id} — will switch at the first edit/write once the todo list exists.`,
