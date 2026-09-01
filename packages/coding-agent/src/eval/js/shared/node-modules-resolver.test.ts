@@ -57,6 +57,13 @@ beforeAll(() => {
 			"default.js": "module.exports = 'default';",
 		},
 	);
+	// `bun` condition mapped to null: an explicit block. Must not fall through to default.
+	writePackage(
+		projNm,
+		"excluded",
+		{ exports: { ".": { bun: null, default: "./fallback.js" } } },
+		{ "fallback.js": "module.exports = 'fallback';" },
+	);
 	// Scoped package with subpath pattern exports.
 	writePackage(
 		projNm,
@@ -119,6 +126,15 @@ describe("resolveBareSpecifier", () => {
 		const bunTarget = path.join(projectDir, "node_modules", "runtimecond", "bun.js");
 		expect(resolveBareSpecifier("runtimecond", projectDir, IMPORT_CONDITIONS)).toBe(bunTarget);
 		expect(resolveBareSpecifier("runtimecond", projectDir, REQUIRE_CONDITIONS)).toBe(bunTarget);
+	});
+
+	test("treats an explicit null export condition as excluded", () => {
+		// `bun` is active and maps to null -> hard block; must NOT fall through to default.
+		expect(resolveBareSpecifier("excluded", projectDir, IMPORT_CONDITIONS)).toBeNull();
+		// When `bun` is not an active condition, the null key is skipped and default wins.
+		expect(resolveBareSpecifier("excluded", projectDir, ["node", "import", "default"])).toBe(
+			path.join(projectDir, "node_modules", "excluded", "fallback.js"),
+		);
 	});
 
 	test("resolves scoped root and subpath-pattern exports", () => {

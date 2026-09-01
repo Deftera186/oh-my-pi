@@ -67,7 +67,8 @@ export function resolveBareSpecifier(specifier: string, baseDir: string, conditi
 
 	if (pkg && pkg.exports != null) {
 		const target = resolveExports(pkg.exports, subpath, conditions);
-		if (target && (target.startsWith("./") || target.startsWith("../"))) {
+		if (target === EXCLUDED) return null;
+		if (typeof target === "string" && (target.startsWith("./") || target.startsWith("../"))) {
 			const resolved = finalizeFile(path.resolve(pkgDir, target));
 			if (resolved) return resolved;
 		}
@@ -127,19 +128,33 @@ function mainFields(pkg: PackageJson | null, conditions: string[]): string[] {
 }
 
 /**
+ * A resolved `exports` target: a relative target string, the {@link EXCLUDED}
+ * sentinel when an active condition maps to `null`, or `null` when nothing matched.
+ */
+type ExportTarget = string | typeof EXCLUDED | null;
+
+/**
+ * Sentinel for an explicitly excluded export (`"exports": { "bun": null }`). Node/Bun
+ * treat a `null` target as a hard block: resolution stops and does NOT fall through to
+ * `default`, a sibling condition, or the legacy `main`/index fields.
+ */
+const EXCLUDED: unique symbol = Symbol("excluded-export");
+
+/**
  * Resolve an `exports` value for `subpath` under `conditions`. Handles string
  * targets, condition maps, subpath maps, and `*` patterns per the Node exports spec.
  */
-function resolveExports(exports: unknown, subpath: string, conditions: string[]): string | null {
+function resolveExports(exports: unknown, subpath: string, conditions: string[]): ExportTarget {
 	if (typeof exports === "string") return subpath === "." ? exports : null;
+	if (exports === null) return subpath === "." ? EXCLUDED : null;
 	if (Array.isArray(exports)) {
 		for (const entry of exports) {
 			const resolved = resolveExports(entry, subpath, conditions);
-			if (resolved) return resolved;
+			if (resolved !== null) return resolved;
 		}
 		return null;
 	}
-	if (!exports || typeof exports !== "object") return null;
+	if (typeof exports !== "object") return null;
 
 	const record = exports as Record<string, unknown>;
 	let isSubpathMap = false;
@@ -179,31 +194,33 @@ function resolveExports(exports: unknown, subpath: string, conditions: string[])
 	}
 	if (best) {
 		const target = resolveConditional(best.value, conditions);
-		if (target) return target.replace(/\*/g, best.captured);
+		return typeof target === "string" ? target.replace(/\*/g, best.captured) : target;
 	}
 	return null;
 }
 
 /**
- * Collapse a conditional export value to a string target. Object keys are evaluated
- * in declaration order — the first key active in `conditions` (or `default`) wins,
- * matching Node's condition-resolution semantics.
+ * Collapse a conditional export value to a target. Object keys are evaluated in
+ * declaration order — the first key active in `conditions` (or `default`) wins,
+ * matching Node's condition-resolution semantics. A matched condition whose target is
+ * `null` yields {@link EXCLUDED} and stops the search.
  */
-function resolveConditional(value: unknown, conditions: string[]): string | null {
+function resolveConditional(value: unknown, conditions: string[]): ExportTarget {
+	if (value === null) return EXCLUDED;
 	if (typeof value === "string") return value;
 	if (Array.isArray(value)) {
 		for (const entry of value) {
 			const resolved = resolveConditional(entry, conditions);
-			if (resolved) return resolved;
+			if (resolved !== null) return resolved;
 		}
 		return null;
 	}
-	if (!value || typeof value !== "object") return null;
+	if (typeof value !== "object") return null;
 	const record = value as Record<string, unknown>;
 	for (const key in record) {
 		if (key !== "default" && !conditions.includes(key)) continue;
 		const resolved = resolveConditional(record[key], conditions);
-		if (resolved) return resolved;
+		if (resolved !== null) return resolved;
 	}
 	return null;
 }
