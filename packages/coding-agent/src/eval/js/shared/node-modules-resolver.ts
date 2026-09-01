@@ -32,11 +32,16 @@ const INDEX_FILES = [
 	"index.json",
 ];
 
+// Condition sets mirror `extensibility/plugins/legacy-pi-compat.ts`
+// (`SUPPORTED_PACKAGE_{IMPORT,REQUIRE}_CONDITIONS`): Bun activates the `bun`
+// condition ahead of `node`, and the non-standard `module` condition is not a
+// runtime condition (declaration order in `exports` still decides ties).
+
 /** Condition preference for `import()`-shaped resolution. */
-export const IMPORT_CONDITIONS = ["node", "import", "module", "default"];
+export const IMPORT_CONDITIONS = ["bun", "node", "import", "default"];
 
 /** Condition preference for `require()`-shaped resolution. */
-export const REQUIRE_CONDITIONS = ["node", "require", "default"];
+export const REQUIRE_CONDITIONS = ["bun", "node", "require", "default"];
 
 interface PackageJson {
 	main?: unknown;

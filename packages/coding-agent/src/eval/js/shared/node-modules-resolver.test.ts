@@ -46,6 +46,17 @@ beforeAll(() => {
 	writePackage(projNm, "indexonly", {}, { "index.js": "module.exports = 'index';" });
 	// Extensionless legacy main backed by a TypeScript file (Bun resolves/loads it natively).
 	writePackage(projNm, "tsentry", { main: "entry" }, { "entry.ts": "export default 42;" });
+	// `bun` condition listed ahead of `node`: must win under both import and require, matching native Bun.
+	writePackage(
+		projNm,
+		"runtimecond",
+		{ exports: { ".": { bun: "./bun.js", node: "./node.js", default: "./default.js" } } },
+		{
+			"bun.js": "module.exports = 'bun';",
+			"node.js": "module.exports = 'node';",
+			"default.js": "module.exports = 'default';",
+		},
+	);
 	// Scoped package with subpath pattern exports.
 	writePackage(
 		projNm,
@@ -92,6 +103,12 @@ describe("resolveBareSpecifier", () => {
 		expect(resolveBareSpecifier("tsentry", projectDir, IMPORT_CONDITIONS)).toBe(
 			path.join(projectDir, "node_modules", "tsentry", "entry.ts"),
 		);
+	});
+
+	test("activates the bun export condition over node", () => {
+		const bunTarget = path.join(projectDir, "node_modules", "runtimecond", "bun.js");
+		expect(resolveBareSpecifier("runtimecond", projectDir, IMPORT_CONDITIONS)).toBe(bunTarget);
+		expect(resolveBareSpecifier("runtimecond", projectDir, REQUIRE_CONDITIONS)).toBe(bunTarget);
 	});
 
 	test("resolves scoped root and subpath-pattern exports", () => {
