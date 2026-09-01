@@ -4,8 +4,11 @@
 
 ### Fixed
 
+- Anthropic sessions now keep tool-roster changes and warm-prefix pruning from invalidating preserved thinking or the prompt cache.
+- TypeScript code intelligence now works on TypeScript 7 projects: the built-in `typescript-native` server runs `tsc --lsp --stdio` when the resolved TypeScript install no longer ships `tsserver.js`, replacing `typescript-language-server` for that project.
 - Claude marketplace MCP servers now resolve environment placeholders in stdio environment values instead of passing strings such as `${NAME:-}` literally ([#10481](https://github.com/can1357/oh-my-pi/pull/10481) by [@mrexodia](https://github.com/mrexodia)).
 - eval JS cells now resolve project `node_modules` dependencies by bare specifier (`require('pkg')` / `import('pkg')`) in the compiled binary, walking the on-disk `node_modules` chain from the cwd instead of the binary's embedded filesystem ([#10496](https://github.com/can1357/oh-my-pi/issues/10496)).
+- Fixed prewalk conflicting with `todo.eager=always`: the forced eager-todo prelude ("call todo first this turn") was injected alongside the prewalk plan nudge ("write a complete plan first, then todo"), giving the model contradictory instructions; the eager-todo prelude is now suppressed only when prewalk will perform a handoff ([#10510](https://github.com/can1357/oh-my-pi/issues/10510)).
 ## [18.1.2] - 2026-09-01
 
 ### Added
