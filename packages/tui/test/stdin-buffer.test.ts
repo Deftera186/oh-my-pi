@@ -556,6 +556,25 @@ describe("StdinBuffer", () => {
 				expect(emittedSequences).toEqual([sequence]);
 			});
 		}
+
+		for (const { label, key } of [
+			{ label: "legacy Enter", key: "\r" },
+			{ label: "kitty CSI-u Enter", key: "\x1b[13u" },
+		]) {
+			it(`routes leading terminal reports before the paste while preserving ${label}`, () => {
+				const reports = ["\x1b[?1;2c", "\x1b[?997;1n"];
+				const events: string[] = [];
+				buffer.on("data", sequence => events.push(`data:${sequence}`));
+				buffer.on("paste", (_content, trailingInput = "") => events.push(`paste:${trailingInput}`));
+
+				processInput(`\x1b[200~paste\x1b[201~${reports.join("")}${key}`);
+
+				expect(emittedSequences).toEqual(reports);
+				expect(emittedPaste).toEqual(["paste"]);
+				expect(emittedPasteRemainders).toEqual([key]);
+				expect(events).toEqual([...reports.map(report => `data:${report}`), `paste:${key}`]);
+			});
+		}
 		it("re-processes a partial trailing escape so cross-read assembly still holds it", () => {
 			// Read ends mid-escape after the paste; the partial must buffer for the next
 			// read instead of riding the paste event as a broken fragment.
@@ -798,10 +817,13 @@ describe("StdinBuffer", () => {
 			// mode clears the buffer. Otherwise a complete post-paste string
 			// sequence whose terminator is before the old offset is retained
 			// and later flushed together with trailing text.
+			const pasteTails: string[] = [];
+			buffer.on("paste", (_content, trailingInput = "") => pasteTails.push(trailingInput));
 			processInput(`\x1b]${"x".repeat(100)}`);
 			processInput("\x1b[200~paste\x1b[201~\x1b]z\x07abc");
 
-			expect(emittedSequences).toEqual(["\x1b]z\x07", "a", "b", "c"]);
+			expect(emittedSequences).toEqual(["\x1b]z\x07", "b", "c"]);
+			expect(pasteTails).toEqual(["a"]);
 			expect(buffer.getBuffer()).toBe("");
 		});
 
