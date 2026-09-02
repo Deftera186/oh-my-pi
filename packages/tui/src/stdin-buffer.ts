@@ -350,6 +350,30 @@ function extractCompleteSequences(
 	return { sequences, remainder: "", resumeSearchFrom: 0 };
 }
 
+/**
+ * Split `remaining` (bytes trailing a completed bracketed paste in the same read)
+ * into the first complete keypress and the rest, or `undefined` when the head is
+ * not a keypress that may ride the paste dispatch.
+ *
+ * Returns `undefined` when the head is a partial escape still needing cross-read
+ * assembly, a capped-junk string, or a terminal report (OSC/DCS/APC string
+ * sequence or a mouse report) — those must stay on the normal data-event route so
+ * their special handling and routing are preserved. A plain control byte,
+ * printable, or CSI/SS3 keypress rides with the paste so a submit key delivered in
+ * the same burst reaches the focused component before a paste-opened overlay can
+ * steal it.
+ */
+function firstKeypressTail(remaining: string): { key: string; rest: string } | undefined {
+	const parsed = extractCompleteSequences(remaining, 0);
+	if (parsed.discardFrom !== undefined) return undefined;
+	const first = parsed.sequences[0];
+	if (first === undefined) return undefined;
+	// OSC/DCS/APC string sequences and SGR/legacy mouse reports are terminal
+	// reports, never submit keys.
+	if (/^\x1b[\]P_]/.test(first) || /^\x1b\[[<M]/.test(first)) return undefined;
+	return { key: first, rest: remaining.slice(first.length) };
+}
+
 export type StdinBufferOptions = {
 	/**
 	 * Maximum time to wait for sequence completion (default: 75ms).
@@ -377,7 +401,7 @@ export type StdinBufferOptions = {
 
 export type StdinBufferEventMap = {
 	data: [string];
-	paste: [content: string, submitRemainder?: string];
+	paste: [content: string, trailingInput?: string];
 };
 
 /**
@@ -577,12 +601,20 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteBytes = 0;
 		this.#pendingKittyPrintableCodepoint = undefined;
 
-		// Keep a same-read Enter attached to the paste so a newly opened overlay cannot
-		// steal its submit. Other tails still need normal escape-sequence extraction.
-		const submitRemainder = remaining === "\r" || remaining === "\n" ? remaining : "";
-		this.emit("paste", pastedContent, submitRemainder);
-		if (remaining.length > 0 && submitRemainder.length === 0) {
-			this.process(remaining);
+		// Keep a same-read trailing keypress attached to the paste so an overlay opened by
+		// the paste (e.g. the large-paste menu) cannot steal a submit key that shared the
+		// burst. StdinBuffer cannot know which key submits — the kitty protocol encodes
+		// Enter as CSI-u (`\x1b[13u`) and the binding may be remapped — so it forwards the
+		// first complete keypress verbatim and lets the focused component match it against
+		// the live keybindings. Terminal reports (OSC/DCS/APC, mouse) and partial escapes
+		// that still need cross-read assembly take the normal data-event route instead.
+		const attach = remaining.length > 0 ? firstKeypressTail(remaining) : undefined;
+		if (attach) {
+			this.emit("paste", pastedContent, attach.key);
+			if (attach.rest.length > 0) this.process(attach.rest);
+		} else {
+			this.emit("paste", pastedContent);
+			if (remaining.length > 0) this.process(remaining);
 		}
 	}
 

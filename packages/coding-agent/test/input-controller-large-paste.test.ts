@@ -82,19 +82,27 @@ describe("InputController.handleLargePaste gate", () => {
 		expect(spies.insertTextAttachment).not.toHaveBeenCalled();
 	});
 
-	it("stages and submits a threshold-sized paste when Enter follows in the same input burst", () => {
-		const editor = new CustomEditor(getEditorTheme());
-		const { controller, spies } = createContext({ threshold: 100, editor });
-		editor.onLargePaste = (text, lineCount, options) => controller.handleLargePaste(text, lineCount, options);
-		const submitted = vi.fn();
-		editor.onSubmit = submitted;
-		const payload = Array.from({ length: 100 }, (_, index) => `line ${index + 1}`).join("\n");
+	// The submit key that shares the paste burst is encoded differently per keyboard
+	// protocol: legacy terminals send `\r`, the kitty protocol sends CSI-u `\x1b[13u`.
+	// Both must stage the attachment synchronously and submit without opening the menu.
+	for (const [label, enter] of [
+		["legacy \\r", "\r"],
+		["kitty CSI-u \\x1b[13u", "\x1b[13u"],
+	] as const) {
+		it(`stages and submits a threshold-sized paste when Enter (${label}) follows in the same burst`, () => {
+			const editor = new CustomEditor(getEditorTheme());
+			const { controller, spies } = createContext({ threshold: 100, editor });
+			editor.onLargePaste = (text, lineCount, options) => controller.handleLargePaste(text, lineCount, options);
+			const submitted = vi.fn();
+			editor.onSubmit = submitted;
+			const payload = Array.from({ length: 100 }, (_, index) => `line ${index + 1}`).join("\n");
 
-		editor.handleInput(`\x1b[200~${payload}\x1b[201~\r`);
+			editor.handleInput(`\x1b[200~${payload}\x1b[201~${enter}`);
 
-		expect(spies.showHookSelector).not.toHaveBeenCalled();
-		expect(submitted).toHaveBeenCalledWith(payload);
-	});
+			expect(spies.showHookSelector).not.toHaveBeenCalled();
+			expect(submitted).toHaveBeenCalledWith(payload);
+		});
+	}
 });
 
 describe("InputController.presentLargePasteMenu actions", () => {

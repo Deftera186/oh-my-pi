@@ -517,19 +517,38 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual([]);
 		});
 
-		it("preserves non-submit input after a boundary-split end marker", () => {
+		it("keeps complete trailing input attached to the paste so the burst stays one dispatch", () => {
 			processInput("\x1b[200~paste\x1b");
 			processInput("[201~x");
 			expect(emittedPaste).toEqual(["paste"]);
-			expect(emittedPasteRemainders).toEqual([""]);
-			expect(emittedSequences).toEqual(["x"]);
+			expect(emittedPasteRemainders).toEqual(["x"]);
+			expect(emittedSequences).toEqual([]);
 		});
 
-		it("keeps a same-read Enter in the paste event so the submit retains focus", () => {
+		it("keeps a same-read legacy Enter in the paste event so the submit retains focus", () => {
 			processInput("\x1b[200~paste\x1b[201~\r");
 			expect(emittedPaste).toEqual(["paste"]);
 			expect(emittedPasteRemainders).toEqual(["\r"]);
 			expect(emittedSequences).toEqual([]);
+		});
+
+		it("keeps a same-read kitty CSI-u Enter in the paste event (submit key is not \\r under kitty)", () => {
+			processInput("\x1b[200~paste\x1b[201~\x1b[13u");
+			expect(emittedPaste).toEqual(["paste"]);
+			expect(emittedPasteRemainders).toEqual(["\x1b[13u"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("re-processes a partial trailing escape so cross-read assembly still holds it", () => {
+			// Read ends mid-escape after the paste; the partial must buffer for the next
+			// read instead of riding the paste event as a broken fragment.
+			processInput("\x1b[200~paste\x1b[201~\x1b[13");
+			expect(emittedPaste).toEqual(["paste"]);
+			expect(emittedPasteRemainders).toEqual([""]);
+			expect(emittedSequences).toEqual([]);
+
+			processInput("u");
+			expect(emittedSequences).toEqual(["\x1b[13u"]);
 		});
 
 		it("does not end the paste on a partial end-marker prefix in the body", () => {
