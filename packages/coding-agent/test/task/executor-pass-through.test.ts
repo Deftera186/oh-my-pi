@@ -486,4 +486,31 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(0);
 		expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({ modelRole: "reviewer" }));
 	});
+	it("reports an unresolved agent model selector before opening the subagent session", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const session = createMockSession(() => {
+			throw new Error("No model selected.");
+		});
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: {
+				...baseAgent,
+				name: "probe",
+				model: ["@fast"],
+				source: "project",
+				filePath: "/tmp/.omp/agents/probe.md",
+			},
+			id: "subagent-unresolved-model",
+			modelRegistry: createModelRegistry(model),
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(
+			'Agent "probe": no model matched "@fast" (agent definition .omp/agents/probe.md)',
+		);
+		expect(spy).not.toHaveBeenCalled();
+	});
 });

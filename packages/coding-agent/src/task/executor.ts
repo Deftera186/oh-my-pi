@@ -60,6 +60,7 @@ import { LIST_STATUS_ORDER } from "../tools/hub/messaging";
 import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
+import { formatPathRelativeToCwd } from "../tools/path-utils";
 import { ToolAbortError } from "../tools/tool-errors";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -3008,6 +3009,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					id,
 				),
 			);
+			if (!model && modelPatterns.length > 0) {
+				const requested = modelPatterns.map(pattern => JSON.stringify(pattern)).join(", ");
+				const selector = modelPatterns.length === 1 ? requested : `any of ${requested}`;
+				const definition = agent.filePath
+					? ` (agent definition ${formatPathRelativeToCwd(agent.filePath, cwd)})`
+					: "";
+				throw new Error(`Agent "${agent.name}": no model matched ${selector}${definition}`);
+			}
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
