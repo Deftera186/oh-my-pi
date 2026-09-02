@@ -3009,14 +3009,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					id,
 				),
 			);
-			if (!model && modelPatterns.length > 0) {
-				const requested = modelPatterns.map(pattern => JSON.stringify(pattern)).join(", ");
-				const selector = modelPatterns.length === 1 ? requested : `any of ${requested}`;
-				const definition = agent.filePath
-					? ` (agent definition ${formatPathRelativeToCwd(agent.filePath, cwd)})`
-					: "";
-				throw new Error(`Agent "${agent.name}": no model matched ${selector}${definition}`);
-			}
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,
@@ -3276,6 +3268,23 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				throw err;
 			}
 			sessionCreatedAt = performance.now();
+			// An explicit agent selector that resolves to nothing must report itself
+			// as a resolution failure, not the generic "No model selected." credential
+			// error the prompt path throws. The check runs AFTER createAgentSession so
+			// the deferred `modelPattern` path (extension-provided models, initial
+			// discovery refresh) gets to resolve first; only a selector that stays
+			// unmatched against an otherwise-populated registry fails here. The eager
+			// `!model` guard keeps the branch off the auth-fallback and inherited-model
+			// paths that already carry a resolved model. (issue #10608)
+			if (!model && !session.model && modelPatterns.length > 0 && modelRegistry.getAvailable().length > 0) {
+				await session.dispose().catch(() => {});
+				const requested = modelPatterns.map(pattern => JSON.stringify(pattern)).join(", ");
+				const selector = modelPatterns.length === 1 ? requested : `any of ${requested}`;
+				const definition = agent.filePath
+					? ` (agent definition ${formatPathRelativeToCwd(agent.filePath, cwd)})`
+					: "";
+				throw new Error(`Agent "${agent.name}": no model matched ${selector}${definition}`);
+			}
 
 			monitor.setActiveSession(session);
 			// Run-state notifications precede deferrable wire-level `agent_end`,

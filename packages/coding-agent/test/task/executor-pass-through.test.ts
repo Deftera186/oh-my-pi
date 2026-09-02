@@ -486,9 +486,11 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(0);
 		expect(initSpy).toHaveBeenCalledWith(expect.objectContaining({ modelRole: "reviewer" }));
 	});
-	it("reports an unresolved agent model selector before opening the subagent session", async () => {
+	it("reports an unresolved agent model selector after deferred resolution stays unmatched", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		// Mirrors the live prompt path: a modelless session throws the generic
+		// credential error, so a regressed guard would surface that instead.
 		const session = createMockSession(() => {
 			throw new Error("No model selected.");
 		});
@@ -504,6 +506,9 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				filePath: "/tmp/.omp/agents/probe.md",
 			},
 			id: "subagent-unresolved-model",
+			// Structured dispatch funnels the frontmatter selector into modelOverride,
+			// which is what arms the SDK's deferred modelPattern resolution.
+			modelOverride: "@fast",
 			modelRegistry: createModelRegistry(model),
 		});
 
@@ -511,6 +516,9 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.stderr).toContain(
 			'Agent "probe": no model matched "@fast" (agent definition .omp/agents/probe.md)',
 		);
-		expect(spy).not.toHaveBeenCalled();
+		// The deferred resolution path must be allowed to run before the failure is
+		// reported: createAgentSession is invoked with the unresolved pattern.
+		expect(spy).toHaveBeenCalled();
+		expect(spy.mock.calls[0]?.[0]?.modelPattern).toEqual(["@fast"]);
 	});
 });
