@@ -552,4 +552,38 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.stderr).toContain("(agent definition ~/.omp/agent/agents/probe.md)");
 		expect(result.stderr).not.toContain(os.homedir());
 	});
+	it("reports an unresolved selector even when no provider is authenticated", async () => {
+		// First-time setup: the registry has no available (authenticated/keyless)
+		// models, so a typo'd selector must still be diagnosed as unmatched rather
+		// than falling through to the generic credential message.
+		const emptyRegistry = {
+			authStorage: {},
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => undefined,
+		} as unknown as ModelRegistry;
+		const session = createMockSession(() => {
+			throw new Error("No model selected.");
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: {
+				...baseAgent,
+				name: "probe",
+				model: ["@fast"],
+				source: "project",
+				filePath: "/tmp/.omp/agents/probe.md",
+			},
+			id: "subagent-unresolved-model-no-auth",
+			modelOverride: "@fast",
+			modelRegistry: emptyRegistry,
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain(
+			'Agent "probe": no model matched "@fast" (agent definition .omp/agents/probe.md)',
+		);
+	});
 });

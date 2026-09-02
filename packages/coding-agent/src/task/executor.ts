@@ -3282,12 +3282,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// An explicit agent selector that resolves to nothing must report itself
 			// as a resolution failure, not the generic "No model selected." credential
 			// error the prompt path throws. The check runs AFTER createAgentSession so
-			// the deferred `modelPattern` path (extension-provided models, initial
-			// discovery refresh) gets to resolve first; only a selector that stays
-			// unmatched against an otherwise-populated registry fails here. The eager
+			// the deferred `modelPattern` path resolves first: a VALID selector always
+			// populates `session.model` (the SDK falls back to the full catalog, so an
+			// unauthenticated-but-real model still resolves and its own credential
+			// error surfaces later), while a typo leaves it unset even during
+			// first-time setup when no provider is authenticated yet. The eager
 			// `!model` guard keeps the branch off the auth-fallback and inherited-model
 			// paths that already carry a resolved model. (issue #10608)
-			if (!model && !session.model && modelPatterns.length > 0 && modelRegistry.getAvailable().length > 0) {
+			if (!model && !session.model && modelPatterns.length > 0) {
 				await session.dispose().catch(() => {});
 				const requested = modelPatterns.map(pattern => JSON.stringify(pattern)).join(", ");
 				const selector = modelPatterns.length === 1 ? requested : `any of ${requested}`;
