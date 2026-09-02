@@ -539,6 +539,23 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual([]);
 		});
 
+		for (const { label, sequence } of [
+			{ label: "DA1", sequence: "\x1b[?1;2c" },
+			{ label: "secondary device attributes", sequence: "\x1b[>0;95;0c" },
+			{ label: "DECRPM", sequence: "\x1b[?2026;1$y" },
+			{ label: "Mode 2031 appearance", sequence: "\x1b[?997;1n" },
+			{ label: "in-band resize", sequence: "\x1b[48;24;80;480;800t" },
+			{ label: "cursor position", sequence: "\x1b[12;40R" },
+			{ label: "cell size", sequence: "\x1b[6;16;8t" },
+			{ label: "kitty capability", sequence: "\x1b[?5u" },
+		]) {
+			it(`keeps a same-read ${label} CSI report on the terminal data route`, () => {
+				processInput(`\x1b[200~paste\x1b[201~${sequence}`);
+				expect(emittedPaste).toEqual(["paste"]);
+				expect(emittedPasteRemainders).toEqual([""]);
+				expect(emittedSequences).toEqual([sequence]);
+			});
+		}
 		it("re-processes a partial trailing escape so cross-read assembly still holds it", () => {
 			// Read ends mid-escape after the paste; the partial must buffer for the next
 			// read instead of riding the paste event as a broken fragment.

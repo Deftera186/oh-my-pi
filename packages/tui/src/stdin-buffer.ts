@@ -17,7 +17,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 import { EventEmitter } from "events";
-import { isKittyProtocolActive } from "./keys";
+import { isKittyProtocolActive, parseKey } from "./keys";
 
 const ESC = "\x1b";
 const BRACKETED_PASTE_START = "\x1b[200~";
@@ -352,25 +352,19 @@ function extractCompleteSequences(
 
 /**
  * Split `remaining` (bytes trailing a completed bracketed paste in the same read)
- * into the first complete keypress and the rest, or `undefined` when the head is
- * not a keypress that may ride the paste dispatch.
+ * into the first recognized keypress and the rest.
  *
- * Returns `undefined` when the head is a partial escape still needing cross-read
- * assembly, a capped-junk string, or a terminal report (OSC/DCS/APC string
- * sequence or a mouse report) — those must stay on the normal data-event route so
- * their special handling and routing are preserved. A plain control byte,
- * printable, or CSI/SS3 keypress rides with the paste so a submit key delivered in
- * the same burst reaches the focused component before a paste-opened overlay can
- * steal it.
+ * Unknown sequences stay on the normal data-event route. This includes every
+ * terminal response — private and public CSI reports, OSC/DCS/APC strings, and
+ * mouse reports — so ProcessTerminal can update capability, appearance, and
+ * geometry state instead of leaking report bytes into the focused component.
+ * Partial escapes likewise stay buffered for cross-read assembly.
  */
 function firstKeypressTail(remaining: string): { key: string; rest: string } | undefined {
 	const parsed = extractCompleteSequences(remaining, 0);
 	if (parsed.discardFrom !== undefined) return undefined;
 	const first = parsed.sequences[0];
-	if (first === undefined) return undefined;
-	// OSC/DCS/APC string sequences and SGR/legacy mouse reports are terminal
-	// reports, never submit keys.
-	if (/^\x1b[\]P_]/.test(first) || /^\x1b\[[<M]/.test(first)) return undefined;
+	if (first === undefined || parseKey(first) === undefined) return undefined;
 	return { key: first, rest: remaining.slice(first.length) };
 }
 
