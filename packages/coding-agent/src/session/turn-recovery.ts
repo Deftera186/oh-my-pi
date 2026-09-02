@@ -933,11 +933,22 @@ export class TurnRecovery {
 
 		this.#unexpectedStopRetryCount++;
 		if (this.#unexpectedStopRetryCount > UNEXPECTED_STOP_MAX_RETRIES) {
-			logger.warn("Assistant returned unexpected stop after retry cap", {
-				attempts: this.#unexpectedStopRetryCount - 1,
+			const attempts = this.#unexpectedStopRetryCount - 1;
+			const finalError = `Assistant stopped unexpectedly after ${attempts} recovery retries; try compacting context or switching models`;
+			assistantMessage.stopReason = "error";
+			assistantMessage.errorMessage = finalError;
+			logger.warn(finalError, {
+				attempts,
 				model: assistantMessage.model,
 				provider: assistantMessage.provider,
 			});
+			await this.#host.emitSessionEvent({
+				type: "auto_retry_end",
+				success: false,
+				attempt: attempts,
+				finalError,
+			});
+			await this.#host.sessionManager.rewriteEntries();
 			this.#unexpectedStopRetryCount = 0;
 			return false;
 		}
