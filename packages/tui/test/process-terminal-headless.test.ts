@@ -94,6 +94,25 @@ describe("ProcessTerminal headless suppression", () => {
 		}
 	});
 
+	it("dispatches a bracketed paste and same-read Enter to one focused component", () => {
+		const previous = setTerminalHeadless(false);
+		const terminal = new ProcessTerminal();
+		const input: string[] = [];
+		const burst = "\x1b[200~line 1\nline 2\x1b[201~\r";
+		try {
+			terminal.start(
+				data => input.push(data),
+				() => {},
+			);
+			process.stdin.emit("data", Buffer.from(burst));
+
+			expect(input).toEqual([burst]);
+		} finally {
+			terminal.stop();
+			setTerminalHeadless(previous);
+		}
+	});
+
 	// #6374: arrows stopped working inside omp and stayed broken in the shell
 	// after exit — a missing cursor-key/keypad reset. omp owns the TTY and emits
 	// a full private-mode reset menu, but never restored normal cursor-key

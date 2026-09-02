@@ -377,7 +377,7 @@ export type StdinBufferOptions = {
 
 export type StdinBufferEventMap = {
 	data: [string];
-	paste: [string];
+	paste: [content: string, submitRemainder?: string];
 };
 
 /**
@@ -577,9 +577,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteBytes = 0;
 		this.#pendingKittyPrintableCodepoint = undefined;
 
-		this.emit("paste", pastedContent);
-
-		if (remaining.length > 0) {
+		// Keep a same-read Enter attached to the paste so a newly opened overlay cannot
+		// steal its submit. Other tails still need normal escape-sequence extraction.
+		const submitRemainder = remaining === "\r" || remaining === "\n" ? remaining : "";
+		this.emit("paste", pastedContent, submitRemainder);
+		if (remaining.length > 0 && submitRemainder.length === 0) {
 			this.process(remaining);
 		}
 	}

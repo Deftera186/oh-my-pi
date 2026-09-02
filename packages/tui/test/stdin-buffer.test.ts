@@ -434,6 +434,7 @@ describe("StdinBuffer", () => {
 
 	describe("Bracketed Paste", () => {
 		let emittedPaste: string[] = [];
+		let emittedPasteRemainders: string[] = [];
 
 		beforeEach(() => {
 			buffer = new StdinBuffer({ timeout: 10 });
@@ -446,8 +447,10 @@ describe("StdinBuffer", () => {
 
 			// Collect paste events
 			emittedPaste = [];
-			buffer.on("paste", (data: string) => {
+			emittedPasteRemainders = [];
+			buffer.on("paste", (data: string, remaining: string = "") => {
 				emittedPaste.push(data);
+				emittedPasteRemainders.push(remaining);
 			});
 		});
 
@@ -514,11 +517,19 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual([]);
 		});
 
-		it("preserves trailing input after a boundary-split end marker", () => {
+		it("preserves non-submit input after a boundary-split end marker", () => {
 			processInput("\x1b[200~paste\x1b");
 			processInput("[201~x");
 			expect(emittedPaste).toEqual(["paste"]);
+			expect(emittedPasteRemainders).toEqual([""]);
 			expect(emittedSequences).toEqual(["x"]);
+		});
+
+		it("keeps a same-read Enter in the paste event so the submit retains focus", () => {
+			processInput("\x1b[200~paste\x1b[201~\r");
+			expect(emittedPaste).toEqual(["paste"]);
+			expect(emittedPasteRemainders).toEqual(["\r"]);
+			expect(emittedSequences).toEqual([]);
 		});
 
 		it("does not end the paste on a partial end-marker prefix in the body", () => {

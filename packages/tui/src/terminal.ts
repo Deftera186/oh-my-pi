@@ -1359,10 +1359,11 @@ export class ProcessTerminal implements Terminal {
 			}
 		});
 
-		// Re-wrap paste content with bracketed paste markers for existing editor handling
-		this.#stdinBuffer.on("paste", (content: string) => {
+		// Re-wrap paste content for existing editor handling and preserve any bytes
+		// from the same stdin burst so focus cannot change between paste and submit.
+		this.#stdinBuffer.on("paste", (content: string, remaining: string = "") => {
 			if (this.#inputHandler) {
-				this.#inputHandler(`\x1b[200~${content}\x1b[201~`);
+				this.#inputHandler(`\x1b[200~${content}\x1b[201~${remaining}`);
 			}
 		});
 
