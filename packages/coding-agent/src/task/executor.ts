@@ -61,6 +61,7 @@ import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
+import { shortenPath } from "../tools/render-utils";
 import { ToolAbortError } from "../tools/tool-errors";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -163,6 +164,16 @@ function normalizeModelPatterns(value: string | string[] | undefined): string[] 
 		.split(",")
 		.map(entry => entry.trim())
 		.filter(Boolean);
+}
+
+/**
+ * Render an agent definition path for a tool error: project-relative when it
+ * lives under `cwd`, else home-shortened (`~/…`) so a user- or extension-level
+ * definition never leaks an absolute home directory into model/TUI output.
+ */
+function formatAgentDefinitionPath(filePath: string, cwd: string): string {
+	const relative = formatPathRelativeToCwd(filePath, cwd);
+	return path.isAbsolute(relative) ? shortenPath(filePath) : relative;
 }
 
 const SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX = "subagent:";
@@ -3281,7 +3292,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				const requested = modelPatterns.map(pattern => JSON.stringify(pattern)).join(", ");
 				const selector = modelPatterns.length === 1 ? requested : `any of ${requested}`;
 				const definition = agent.filePath
-					? ` (agent definition ${formatPathRelativeToCwd(agent.filePath, cwd)})`
+					? ` (agent definition ${formatAgentDefinitionPath(agent.filePath, cwd)})`
 					: "";
 				throw new Error(`Agent "${agent.name}": no model matched ${selector}${definition}`);
 			}

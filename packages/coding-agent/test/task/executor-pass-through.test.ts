@@ -3,6 +3,8 @@
  * to `createAgentSession` so subagents skip the FS scans the parent already
  * paid for. Regression guard for issue #2190.
  */
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -520,5 +522,34 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		// reported: createAgentSession is invoked with the unresolved pattern.
 		expect(spy).toHaveBeenCalled();
 		expect(spy.mock.calls[0]?.[0]?.modelPattern).toEqual(["@fast"]);
+	});
+	it("home-shortens an out-of-project agent definition path in the error", async () => {
+		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
+		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const session = createMockSession(() => {
+			throw new Error("No model selected.");
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const definitionPath = path.join(os.homedir(), ".omp", "agent", "agents", "probe.md");
+
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: path.join(os.tmpdir(), "project-outside-home"),
+			agent: {
+				...baseAgent,
+				name: "probe",
+				model: ["@fast"],
+				source: "user",
+				filePath: definitionPath,
+			},
+			id: "subagent-unresolved-model-home",
+			modelOverride: "@fast",
+			modelRegistry: createModelRegistry(model),
+		});
+
+		expect(result.exitCode).toBe(1);
+		// The user-level path is rendered with ~, never the absolute home directory.
+		expect(result.stderr).toContain("(agent definition ~/.omp/agent/agents/probe.md)");
+		expect(result.stderr).not.toContain(os.homedir());
 	});
 });
