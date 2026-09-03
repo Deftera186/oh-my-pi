@@ -35,7 +35,6 @@ raw-window-handle.workspace = true
 
 [dev-dependencies]
 flume.workspace = true
-omp-chat-ui.workspace = true
 omp-webview.workspace = true
 xutf.workspace = true
 
