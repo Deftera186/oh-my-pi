@@ -827,12 +827,18 @@ def _freeze_registry_ack() -> dict[str, object]:
     registry = importlib.import_module("omp._registry").registry
     if not registry.sealed:
         registry.freeze()
-    regimes = importlib.import_module("omp.regimes")
+    registry_module = importlib.import_module("omp._registry")
+    snapshot = registry.snapshot()
     provider = importlib.import_module("omp.provider")
     return {
-        "regimes": regimes._sealed_regime_declaration(
-            _scope.current().generation
-        ),
+        "directors": [
+            registry_module._worker_wire_value(value)
+            for value in snapshot.directors
+        ],
+        "components": [
+            registry_module._worker_wire_value(value)
+            for value in snapshot.components
+        ],
         "providers": list(provider._sealed_provider_declarations()),
     }
 
@@ -872,11 +878,17 @@ async def _dispatch_lifecycle_activate(
 
 def _builtin_dispatch(operation: str) -> DispatchHandler | None:
     targets = {
-        "omp.regimes.apply": ("omp.regimes", "dispatch_regime_apply"),
-        "omp.regimes.start": ("omp.regimes", "dispatch_regime_start"),
-        "omp.regimes.stop": ("omp.regimes", "dispatch_regime_stop"),
         "omp.services.dispatch": ("omp._registry", "dispatch_service"),
         "omp.hooks.dispatch": ("omp.hooks", "_dispatch_hook_callback"),
+        "omp.extensions.director.before_inference": (
+            "omp.extensions", "_dispatch_director_before_inference"
+        ),
+        "omp.extensions.director.on_yield": (
+            "omp.extensions", "_dispatch_director_on_yield"
+        ),
+        "omp.extensions.component.apply": (
+            "omp.extensions", "_dispatch_component_apply"
+        ),
         "omp.devices.call": ("omp.devices", "_dispatch_device"),
         "omp.ui.completion": ("omp.ui", "_dispatch_completion"),
         "omp.ui.command_completion": ("omp.ui", "_dispatch_command_completion"),

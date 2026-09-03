@@ -33,7 +33,6 @@ use omp_env::{
 use omp_scribe::{
 	Engine as ScribeEngine, Error as ScribeError, Props as ScribeProps, Value as ScribeValue, canon,
 };
-use omp_storage::state::StateScope;
 use omp_tool::{Authority, CostClass, Durability, OperationSpec};
 use parking_lot::{Mutex, RwLock};
 use pyo3::{
@@ -73,25 +72,15 @@ create_exception!(_omp, TemplateError, OmpError, "A scribe template failed to co
 pub(crate) struct PySessionSetup {
 	title:          Option<Str>,
 	parent:         Option<Str>,
-	entries:        Py<PyTuple>,
 	initial_prompt: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl PySessionSetup {
 	#[new]
-	#[pyo3(signature = (title = None, parent = None, entries = None, initial_prompt = None))]
-	fn new(
-		py: Python<'_>,
-		title: Option<&str>,
-		parent: Option<&str>,
-		entries: Option<&Bound<'_, PyTuple>>,
-		initial_prompt: Option<Py<PyAny>>,
-	) -> Self {
-		let entries = entries
-			.map(|values| values.clone().unbind())
-			.unwrap_or_else(|| PyTuple::empty(py).unbind());
-		Self { title: title.map(Str::from), parent: parent.map(Str::from), entries, initial_prompt }
+	#[pyo3(signature = (title = None, parent = None, initial_prompt = None))]
+	fn new(title: Option<&str>, parent: Option<&str>, initial_prompt: Option<Py<PyAny>>) -> Self {
+		Self { title: title.map(Str::from), parent: parent.map(Str::from), initial_prompt }
 	}
 
 	/// Optional user-assigned title.
@@ -104,12 +93,6 @@ impl PySessionSetup {
 	#[getter]
 	fn parent(&self) -> Option<&str> {
 		self.parent.as_deref()
-	}
-
-	/// Extension-owned values declared with `@omp.entry_kind`.
-	#[getter]
-	fn entries(&self, py: Python<'_>) -> Py<PyTuple> {
-		self.entries.clone_ref(py)
 	}
 
 	/// Optional visible user prompt which is persisted without submission.
@@ -490,6 +473,15 @@ fn compare(ordering: Ordering, op: CompareOp) -> bool {
 		CompareOp::Gt => ordering == Ordering::Greater,
 		CompareOp::Ge => ordering != Ordering::Less,
 	}
+}
+
+#[derive(Clone, Copy, Debug, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+enum StateScope {
+	Session,
+	Project,
+	User,
+	Organization,
 }
 
 macro_rules! string_enum {

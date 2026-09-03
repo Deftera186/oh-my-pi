@@ -47,7 +47,6 @@ for name in omp.__all__:
 for suffix in (
     "agents", "context", "policy", "limits", "telemetry", "provider",
     "env", "ui", "hooks", "events", "prompts", "packages",
-    "regimes",
     "sessions", "journal", "artifacts", "index", "diagnostics", "urls", "devices",
     "scribe",
 ):
@@ -197,133 +196,42 @@ registry_module.configure_manifest(
             "model-request-telemetry", "telemetry", "model_request"
         ),
         executable_declaration(
-            "surface-regime", "regime", "surface-regime"
+            "continue-once", "director", "continue-once"
         ),
         executable_declaration(
-            "scoped-regime", "regime", "scoped-regime"
-        ),
-        executable_declaration(
-            "apply-regime", "regime", "apply-regime"
-        ),
-        executable_declaration(
-            "three-turn-regime", "regime", "three-turn-regime"
+            "ext-state", "component", "ext-state"
         ),
     ),
 )
 
-@dataclasses.dataclass
-class SurfaceRegimeState:
-    attempts: int = 0
 
-
-@omp.regime(
-    "surface-regime",
-    on=(omp.CONTEXT, omp.SETTLE),
-    lifetime=omp.RegimeLifetime.SESSION,
-    state=SurfaceRegimeState,
-    max_steps=3,
-    owns=("mode", "worktree"),
-    sets={"toolset": "read-only"},
-    )
-class SurfaceRegime:
-    def apply(self, ctx, next_):
-        ctx.context.append(omp.user_text("surface"))
-
-
-@omp.regime(
-    "scoped-regime",
-    on=omp.CONTEXT,
-    lifetime="session",
-    sets={"model": "surface"},
+@omp.director(
+    "continue-once",
+    claims=("loop",),
+    binds={"ai_fastmode": True},
 )
-class ScopedRegime:
-    def apply(self, ctx, next_):
-        ctx.settings.set("model", "surface")
+class ContinueOnce:
+    def on_yield(self, event):
+        return "continue"
 
 
-regime_declarations = {
-    declaration.id: declaration
-    for declaration in registry_module.registry.snapshot().regimes
-}
-surface_regime = regime_declarations["surface-regime"]
-assert surface_regime.id == "surface-regime"
-assert surface_regime.points == (omp.Point.CONTEXT, omp.Point.SETTLE)
-assert surface_regime.state.family.endswith(".SurfaceRegimeState")
-assert surface_regime.state.revision == 1
-assert surface_regime.owns == ("mode", "worktree")
-assert surface_regime.sets == {"toolset": "read-only"}
-assert regime_declarations["scoped-regime"].sets == {"model": "surface"}
-surface_state = SurfaceRegimeState(attempts=2)
-encoded_surface_state = surface_regime.state.encode(surface_state)
-assert surface_regime.state.decode(encoded_surface_state, 1) == surface_state
+@omp.component(
+    "ext-state",
+    interested=("turn.start@1", "patch@1"),
+)
+def ext_state(entry, dom):
+    return (("set", "ext-state", "seen", True),)
+
+
+surface_snapshot = registry_module.registry.snapshot()
+assert surface_snapshot.directors[0].id == "continue-once"
+assert surface_snapshot.directors[0].claims == ("loop",)
+assert dict(surface_snapshot.directors[0].binds) == {"ai_fastmode": True}
+assert surface_snapshot.components[0].id == "ext-state"
+assert surface_snapshot.components[0].interested == ("turn.start@1", "patch@1")
 assert not hasattr(omp, "campaign")
 assert not hasattr(omp, "CampaignScope")
 assert not hasattr(omp, "Ladder")
-assert not hasattr(omp, "Verdict")
-
-
-@omp.regime("apply-regime", on=omp.SETTLE)
-def apply_regime(ctx, next_):
-    assert ctx.event.turn == 3
-    return next_.retry()
-
-
-@dataclasses.dataclass(frozen=True)
-class ThreeTurnState:
-    turns: int = 0
-
-
-@omp.regime(
-    "three-turn-regime",
-    on=omp.SETTLE,
-    state=ThreeTurnState,
-    max_steps=3,
-)
-def three_turn_regime(ctx, next_):
-    next_state = ThreeTurnState(ctx.state.value.turns + 1)
-    ctx.state.replace(next_state)
-    if next_state.turns == 3:
-        return next_.complete()
-    return next_.retry()
-
-
-applied = asyncio.run(
-    omp.regimes.dispatch_regime_apply(
-        "apply-regime",
-        omp.SETTLE,
-        b'{"turn":3}',
-        activation_id="apply-1",
-    )
-)
-assert applied["control"] == {"kind": "retry", "props": {}}
-assert applied["effects"] == []
-
-
-three_turn_declaration = next(
-    declaration
-    for declaration in registry_module.registry.snapshot().regimes
-    if declaration.id == "three-turn-regime"
-)
-three_turn_state = three_turn_declaration.state.encode(ThreeTurnState())
-three_turn_controls = []
-for turn in range(1, 4):
-    draft = asyncio.run(
-        omp.regimes.dispatch_regime_apply(
-            "three-turn-regime",
-            omp.SETTLE,
-            b'{"state_revision":1}',
-            three_turn_state,
-            activation_id="three-turn-1",
-            state_revision=1,
-        )
-    )
-    three_turn_controls.append(draft["control"]["kind"])
-    state_effect = next(
-        effect for effect in draft["effects"] if effect["kind"] == "replace_state"
-    )
-    three_turn_state = state_effect["payload"]
-assert three_turn_controls == ["retry", "retry", "complete"]
-assert three_turn_declaration.state.decode(three_turn_state, 1) == ThreeTurnState(3)
 
 
 class FrozenControlHost:
@@ -427,24 +335,8 @@ class FrozenControlHost:
 
     async def request(self, operation, arguments):
         self.calls.append((operation, arguments))
-        if operation not in {"omp.ui.dynamic_mount", "omp.jobs.register", "omp.regimes.start"}:
+        if operation not in {"omp.ui.dynamic_mount", "omp.jobs.register"}:
             json.dumps(arguments, allow_nan=False)
-        if operation == "omp.regimes.start":
-            return {
-                "id": "activation-1",
-                "regime": arguments["regime_id"],
-                "extension": "acme-ext",
-                "status": "queued" if arguments["queue"] else "active",
-            }
-        if operation == "omp.regimes.active":
-            return [{
-                "id": "activation-1",
-                "regime": "surface-regime",
-                "extension": "acme-ext",
-                "status": "active",
-            }]
-        if operation == "omp.regimes.stop":
-            return arguments["activation_id"] == "activation-1"
         if operation == "omp.telemetry.export.stats":
             return {
                 "sent": 8, "dropped": 1, "failures": 0, "queue_depth": 2,
@@ -522,15 +414,6 @@ class FrozenControlHost:
             }
         if operation == "omp.context.epoch":
             return {"schema": "omp.context.epoch.v1", "result": 7}
-        if operation == "omp.journal.append":
-            return {
-                "schema": "omp.journal.append.v1",
-                "result": {"session": "surface-session", "index": 1},
-            }
-        if operation == "omp.journal.latest":
-            return {"schema": "omp.journal.latest.v1", "result": None}
-        if operation == "omp.journal.entries":
-            return {"schema": "omp.journal.entries.v1", "result": []}
         if operation == "omp.hooks.dispatch":
             return {"kind": "deny", "reason": "host composed", "fatal": False,
                     "code": "SURFACE"}
@@ -582,7 +465,7 @@ class FrozenControlHost:
         if operation == "omp.sessions.create":
             setup = arguments["setup"]
             assert setup["schema"] == "omp.sessions.setup.v1"
-            assert setup["entries"][0]["kind"] == "acme.surface-entry"
+            assert setup["entries"] == []
             assert setup["initial_prompt"] == [{"kind": "text", "text": "Continue"}]
             return self._session_row("created-session", setup["title"])
         if operation in {"omp.sessions.resume", "omp.sessions.rename"}:
@@ -680,24 +563,6 @@ class FrozenControlHost:
 
 frozen_host = FrozenControlHost()
 omp._install_control_backend(frozen_host)
-activation = asyncio.run(omp.regimes.start("surface-regime", state=surface_state))
-assert (activation.id, activation.regime, activation.status) == (
-    "activation-1", "surface-regime", "active"
-)
-start_call = next(call for call in frozen_host.calls if call[0] == "omp.regimes.start")
-assert start_call[1]["regime_id"] == "surface-regime"
-assert start_call[1]["state_revision"] == 1
-assert json.loads(start_call[1]["state"]) == {"attempts": 2}
-active_regimes = asyncio.run(omp.regimes.active())
-assert len(active_regimes) == 1
-assert active_regimes[0] == omp.RegimeRecord(
-    "activation-1", "surface-regime", "acme-ext", "active"
-)
-assert asyncio.run(activation.stop())
-assert asyncio.run(omp.regimes.stop("activation-1"))
-assert frozen_host.calls[-1] == (
-    "omp.regimes.stop", {"activation_id": "activation-1"}
-)
 assert omp.Done().result is None
 
 
@@ -1607,34 +1472,6 @@ path_meta = omp.env.PathMeta(
 assert path_meta.kind is omp.env.FileKind.DIRECTORY
 assert asyncio.run(omp.env.worktree()) == worktree
 
-@omp.entry_kind("acme.surface-entry", rev="surface.1", spill=False)
-@dataclasses.dataclass(frozen=True, slots=True)
-class SurfaceEntry:
-    value: int
-
-async def journal_contract():
-    projected = await omp.context.view()
-    assert projected.epoch == 7 and projected.usage.usable_tokens == 90
-    async with omp.context.lane(strict_epoch=True):
-        appended = await omp.journal.append(
-            SurfaceEntry(3), idempotency_key="surface-append"
-        )
-    assert appended == omp.EntryId("surface-session", 1)
-    assert await omp.journal.latest(SurfaceEntry) is None
-    total, watermark = await omp.journal.fold(
-        SurfaceEntry, lambda state, entry: state + entry.value.value, 0
-    )
-    assert total == 0 and watermark is None
-
-asyncio.run(journal_contract())
-append_request = next(
-    arguments for operation, arguments in frozen_host.calls
-    if operation == "omp.journal.append"
-)
-assert append_request["idempotency_key"] == "surface-append"
-assert append_request["expected_context_epoch"] == 7
-assert append_request["entry"]["kind"] == "acme.surface-entry"
-assert json.loads(append_request["entry"]["data"]) == {"value": 3}
 assert asyncio.iscoroutinefunction(omp.urls.read)
 
 # Turn inference selection: thinking patches and scope-backed route/effort.
@@ -1704,19 +1541,12 @@ lineage = asyncio.run(omp.sessions.lineage("surface-session"))
 assert lineage == (omp.SessionLink("surface-session", None, 1),)
 assert asyncio.run(omp.sessions.resume("surface-session")).id == "surface-session"
 setup = omp.sessions.SessionSetup(
-    title="Created", parent="surface-session",
-    entries=(SurfaceEntry(7),), initial_prompt="Continue",
+    title="Created", parent="surface-session", initial_prompt="Continue",
 )
 assert setup is not omp.sessions.SessionSetup()
 expect_raises(AttributeError, lambda: setattr(setup, "title", "Changed"))
 created_session = asyncio.run(omp.sessions.create(setup))
 assert created_session.id == "created-session" and created_session.title == "Created"
-expect_raises(
-    omp.UnknownEntryKind,
-    lambda: asyncio.run(
-        omp.sessions.create(omp.sessions.SessionSetup(entries=(object(),)))
-    ),
-)
 renamed = asyncio.run(omp.sessions.rename("surface-session", "New title"))
 assert renamed.title == "New title"
 asyncio.run(
@@ -2774,12 +2604,12 @@ assert not combined_patch.is_empty()
 # Hard-quota faults retain the quota identity and atomic receipt snapshot.
 quota_receipt = omp.resources()
 quota_error = omp.QuotaExceeded(
-	quota="journal.appends",
+	quota="extension.callbacks",
 	receipt=quota_receipt,
 )
-assert quota_error.quota == "journal.appends"
+assert quota_error.quota == "extension.callbacks"
 assert quota_error.receipt is quota_receipt
-assert "journal.appends" in str(quota_error)
+assert "extension.callbacks" in str(quota_error)
 assert issubclass(omp.QuotaExceeded, omp.OmpError)
 assert "QuotaExceeded" in omp.__all__
 
@@ -2799,10 +2629,11 @@ assert "JournalError" in omp.journal.__all__
 
 # FREEZE evaluates deferred availability exactly once and seals the projection.
 snapshot = registry_module.freeze_declarations()
-assert surface_regime in snapshot.regimes
+assert snapshot.directors[0].id == "continue-once"
+assert snapshot.components[0].id == "ext-state"
 expect_raises(
-    omp.LateRegistration,
-    lambda: omp.regime("late-regime", on=omp.IDLE),
+    omp.DeclarationSealed,
+    lambda: omp.director("late-director")(lambda: None),
 )
 assert bare_definition in snapshot.providers
 assert ("surface_device/inspect/detail", "", 1) in snapshot.tools

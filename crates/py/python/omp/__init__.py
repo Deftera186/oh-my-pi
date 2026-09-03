@@ -209,15 +209,11 @@ from ._verdicts import (
 from .journal import (
     EntryAccessDenied,
     EntryId,
-    EntryKindConflict,
     EntryTooLarge,
     EntryUndecodable,
     JournalEntry,
     JournalError,
     JournalIndeterminate,
-    StateEntry,
-    StateEntryId,
-    UnknownEntryKind,
 )
 
 
@@ -840,7 +836,6 @@ from ._registry import (
     ServiceDefinition,
     Services,
     resources,
-    entry_kind,
     service,
     services,
     skill,
@@ -1094,8 +1089,8 @@ from .provider import (
 )
 from . import hooks as hooks
 from .hooks import *
-from . import regimes as regimes
-from .regimes import *
+from . import extensions as extensions
+from .extensions import *
 from . import events as events
 from .events import *
 # Hooks and policy document the same top-level approval deadline; policy owns
@@ -1780,7 +1775,6 @@ __all__ += (
     "CommitAborted",
     "DOCS_TOTAL_BUDGET",
     "EntryAccessDenied",
-    "EntryKindConflict",
     "EntryTooLarge",
     "EntryUndecodable",
     "Ev",
@@ -1816,12 +1810,9 @@ __all__ += (
     "Services",
     "SessionAccessDenied",
     "SessionError",
-    "StateEntry",
-    "StateEntryId",
     "StreamWatchdog",
     "TelemetryError",
     "ToolEntry",
-    "UnknownEntryKind",
     "VerdictSchemaError",
     "VerdictShapeError",
     "VolatilePrompt",
@@ -1846,7 +1837,7 @@ __all__ += (
 )
 __all__ += (
     hooks.__all__
-    + regimes.__all__
+    + extensions.__all__
     + events.__all__
-    + ("hooks", "regimes", "events")
+    + ("hooks", "extensions", "events")
 )

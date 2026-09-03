@@ -30,9 +30,9 @@ pyo3-introspection = { workspace = true, optional = true }
 omp-core.workspace = true
 omp-env.workspace = true
 omp-tool.workspace = true
-omp-storage.workspace = true
 omp-scribe.workspace = true
 parking_lot.workspace = true
+strum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

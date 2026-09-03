@@ -591,13 +591,11 @@ def _wire_initial_prompt(value: str | tuple[object, ...] | None) -> object:
 def _wire_setup(setup: SessionSetup) -> dict[str, object]:
     if not isinstance(setup, SessionSetup):
         raise TypeError("setup must be an omp.SessionSetup")
-    from .journal import _entry_wire
-
     return {
         "schema": "omp.sessions.setup.v1",
         "title": setup.title,
         "parent": setup.parent,
-        "entries": [_entry_wire(entry) for entry in setup.entries],
+        "entries": [],
         "initial_prompt": _wire_initial_prompt(setup.initial_prompt),
     }
 

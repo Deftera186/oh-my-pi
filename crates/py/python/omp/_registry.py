@@ -47,7 +47,6 @@ _T = TypeVar("_T", bound=type)
 _ToolKey = tuple[str, str, int]
 _HookKey = tuple[str, str]
 _HookSubscriptionKey = tuple[str, str, str]
-_EntryKindKey = tuple[str, str]
 _ServiceKey = tuple[str, int]
 _ProviderKey = str
 _WorkerKey = str
@@ -67,7 +66,8 @@ _EXECUTABLE_KINDS = frozenset(
         "soft",
         "hard",
         "hook",
-        "regime",
+        "director",
+        "component",
         "worker",
         "provider",
         "prompt_slot",
@@ -179,16 +179,6 @@ class ServiceDefinition:
     method_schemas: tuple[ServiceMethodDefinition, ...]
     trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 
-@dataclass(frozen=True, slots=True)
-class EntryKindDefinition:
-    """One import-time ``@omp.entry_kind`` declaration."""
-
-    name: str
-    rev: str
-    display: bool | None
-    spill: bool
-    implementation: type
-    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
 @dataclass(frozen=True, slots=True)
 class ProviderDefinition:
     """One import-time ``@omp.provider`` declaration."""
@@ -432,6 +422,27 @@ class HookDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectorDefinition:
+    """One lifecycle behavior registered on the engine Director stack."""
+
+    id: str
+    callable: object
+    claims: tuple[str, ...]
+    binds: Mapping[str, bool | int | float | str]
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentDefinition:
+    """One pure journal-to-``<meta>`` component reducer."""
+
+    id: str
+    callable: object
+    interested: tuple[str, ...]
+    trigger: _ActivationTrigger = _ActivationTrigger.LAZY
+
+
+@dataclass(frozen=True, slots=True)
 class UIDefinition:
     """One UI callback declaration stored by the shared registry."""
 
@@ -446,7 +457,6 @@ class UIDefinition:
 class DeclarationSnapshot:
     """Immutable view of the complete decorator registry."""
 
-    entry_kinds: tuple[EntryKindDefinition, ...]
     skills: tuple[SkillDecl, ...]
     tools: frozenset[_ToolKey]
     capabilities: frozenset[str]
@@ -467,11 +477,12 @@ class DeclarationSnapshot:
     arg_specs: tuple[tuple[_ToolKey, tuple[ArgSpec, ...]], ...] = ()
     hook_definitions: tuple[HookDefinition, ...] = ()
     service_definitions: tuple[ServiceDefinition, ...] = ()
+    directors: tuple[DirectorDefinition, ...] = ()
+    components: tuple[ComponentDefinition, ...] = ()
     completions: tuple[UIDefinition, ...] = ()
     message_renderers: tuple[UIDefinition, ...] = ()
     markdown_transformers: tuple[UIDefinition, ...] = ()
     verdict_renderers: tuple[UIDefinition, ...] = ()
-    regimes: tuple[object, ...] = ()
 
 
 class DeclarationRegistry:
@@ -490,7 +501,8 @@ class DeclarationRegistry:
         "_device_definitions",
         "_child_device_definitions",
         "_device_states",
-        "_entry_kinds",
+        "_directors",
+        "_components",
         "_export_sequence",
         "_exports",
         "_extension_id",
@@ -498,7 +510,6 @@ class DeclarationRegistry:
         "_provider_candidates",
         "_hooks",
         "_hook_definitions",
-        "_regimes",
         "_prompt_slots",
         "_preludes",
         "_telemetry",
@@ -539,12 +550,12 @@ class DeclarationRegistry:
             str, list[tuple[int, str | None, _ToolKey]]
         ] = {}
         self._device_states: dict[_ToolKey, tuple[bool, str | None]] = {}
-        self._entry_kinds: dict[_EntryKindKey, EntryKindDefinition] = {}
+        self._directors: dict[str, DirectorDefinition] = {}
+        self._components: dict[str, ComponentDefinition] = {}
         self._provider_candidates: dict[_ProviderKey, list[ProviderDefinition]] = {}
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookSubscriptionKey, object] = {}
         self._hook_definitions: dict[_HookSubscriptionKey, HookDefinition] = {}
-        self._regimes: dict[str, object] = {}
         self._telemetry: dict[str, TelemetryDefinition] = {}
         self._exports: dict[int, ExportDefinition] = {}
         self._export_sequence = 0
@@ -646,7 +657,8 @@ class DeclarationRegistry:
         if (
             self._tools
             or self._hooks
-            or self._regimes
+            or self._directors
+            or self._components
             or self._services
             or self._commands
             or self._completions
@@ -967,16 +979,40 @@ class DeclarationRegistry:
             key[0], key[1], handler, trigger
         )
         return handler
-    def register_regime(self, regime_id: str, declaration: object) -> object:
-        """Record one regime decorator during sequential manifest import."""
+    def register_director(
+        self,
+        director_id: str,
+        callback: object,
+        claims: tuple[str, ...],
+        binds: Mapping[str, bool | int | float | str],
+    ) -> object:
+        """Record one Director callback during sequential manifest import."""
 
-        self._insert(self._regimes, regime_id, declaration, "regime")
-        return declaration
+        definition = DirectorDefinition(director_id, callback, claims, binds)
+        self._insert(self._directors, director_id, definition, "director")
+        return callback
 
-    def regime_definitions(self) -> tuple[object, ...]:
-        """Return regime declarations in stable identifier order."""
+    def director_definitions(self) -> tuple[DirectorDefinition, ...]:
+        """Return Director declarations in stable identifier order."""
 
-        return tuple(self._regimes[key] for key in sorted(self._regimes))
+        return tuple(self._directors[key] for key in sorted(self._directors))
+
+    def register_component(
+        self,
+        component_id: str,
+        callback: object,
+        interested: tuple[str, ...],
+    ) -> object:
+        """Record one journal-to-DOM Component callback."""
+
+        definition = ComponentDefinition(component_id, callback, interested)
+        self._insert(self._components, component_id, definition, "component")
+        return callback
+
+    def component_definitions(self) -> tuple[ComponentDefinition, ...]:
+        """Return Component declarations in stable identifier order."""
+
+        return tuple(self._components[key] for key in sorted(self._components))
 
     def register_approver(
         self,
@@ -1040,34 +1076,6 @@ class DeclarationRegistry:
         self._insert(self._prompt_slots, key, definition, "prompt slot")
         return renderer
 
-    def register_entry_kind(
-        self,
-        name: str,
-        rev: str,
-        display: bool | None,
-        spill: bool,
-        implementation: type,
-    ) -> type:
-        """Records one typed journal entry declaration during import."""
-
-        key = _entry_kind_key(name, rev)
-        if not isinstance(implementation, type):
-            raise TypeError("@omp.entry_kind may decorate only a class")
-        if display is not None and not isinstance(display, bool):
-            raise TypeError("entry kind display must be bool or None")
-        if not isinstance(spill, bool):
-            raise TypeError("entry kind spill must be bool")
-        definition = EntryKindDefinition(
-            key[0], key[1], display, spill, implementation
-        )
-        self._insert(self._entry_kinds, key, definition, "entry kind")
-        return implementation
-
-
-    def entry_kind_definitions(self) -> tuple[EntryKindDefinition, ...]:
-        """Returns entry-kind rows in deterministic declaration-key order."""
-
-        return tuple(self._entry_kinds[key] for key in sorted(self._entry_kinds))
     def register_provider(
         self,
         provider_id: str,
@@ -1461,7 +1469,8 @@ class DeclarationRegistry:
         declarations.update(
             ("hook", _manifest_hook_static_key(key[:2])) for key in self._hooks
         )
-        declarations.update(("regime", key) for key in self._regimes)
+        declarations.update(("director", key) for key in self._directors)
+        declarations.update(("component", key) for key in self._components)
         declarations.update(("service", key[0]) for key in self._services)
         declarations.update(("command", key) for key in self._commands)
         declarations.update(("shortcut", key) for key in self._shortcuts)
@@ -1488,7 +1497,6 @@ class DeclarationRegistry:
         """Returns the current declaration existence sets without mutation."""
 
         return DeclarationSnapshot(
-            entry_kinds=self.entry_kind_definitions(),
             skills=self.skill_declarations(),
             tools=frozenset(self._tools),
             capabilities=self._manifest_capabilities,
@@ -1502,6 +1510,8 @@ class DeclarationRegistry:
                 self._prompt_slots[key] for key in sorted(self._prompt_slots)
             ),
             providers=self.provider_definitions(),
+            directors=self.director_definitions(),
+            components=self.component_definitions(),
             workers=self.worker_definitions(),
             device_definitions=self.device_definitions(),
             child_device_definitions=self.child_device_definitions(),
@@ -1536,7 +1546,6 @@ class DeclarationRegistry:
                 self._verdict_renderers[key]
                 for key in sorted(self._verdict_renderers, key=repr)
             ),
-            regimes=self.regime_definitions(),
         )
 
 
@@ -1577,10 +1586,10 @@ class DeclarationRegistry:
             + len(self._verdict_renderers)
             + len(self._shortcuts)
             + len(self._hooks)
-            + len(self._regimes)
+            + len(self._directors)
+            + len(self._components)
             + len(self._approvers)
             + len(self._services)
-            + len(self._entry_kinds)
             + len(self._telemetry)
             + len(self._prompt_slots)
             + sum(len(candidates) for candidates in self._provider_candidates.values())
@@ -1869,9 +1878,9 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
             }
             for definition in snapshot.service_definitions
         ],
-        "entry_kinds": [_worker_wire_value(value) for value in snapshot.entry_kinds],
         "providers": [_worker_wire_value(value) for value in snapshot.providers],
-        "regimes": [_worker_wire_value(value) for value in snapshot.regimes],
+        "directors": [_worker_wire_value(value) for value in snapshot.directors],
+        "components": [_worker_wire_value(value) for value in snapshot.components],
         "commands": [_worker_wire_value(value) for value in snapshot.commands],
         "shortcuts": [_worker_wire_value(value) for value in snapshot.shortcuts],
         "telemetry": [_worker_wire_value(value) for value in snapshot.telemetry],
@@ -2068,25 +2077,6 @@ def service(name: str, *, rev: int) -> Callable[[_T], _T]:
 
     return decorate
 
-
-def entry_kind(
-    name: str,
-    *,
-    rev: str,
-    display: bool | None = None,
-    spill: bool = True,
-) -> Callable[[_T], _T]:
-    """Declare a typed, versioned session-journal entry kind."""
-
-    key = _entry_kind_key(name, rev)
-
-    def decorate(implementation: _T) -> _T:
-        registry.register_entry_kind(
-            key[0], key[1], display, spill, implementation
-        )
-        return implementation
-
-    return decorate
 
 
 async def dispatch_service(
@@ -2766,16 +2756,6 @@ def _hook_subscription_key(
     return event_name, phase_name, name
 
 
-def _entry_kind_key(name: str, rev: str) -> _EntryKindKey:
-    if not isinstance(name, str) or "." not in name or name.startswith("omp."):
-        raise ValueError("entry kind name must be a non-core globally qualified name")
-    if not isinstance(rev, str):
-        raise TypeError("entry kind rev must be a string")
-    family, separator, number = rev.rpartition(".")
-    if not separator or not family or not number.isascii() or not number.isdigit():
-        raise ValueError("entry kind rev must have the form '<family>.<n>'")
-    return name, rev
-
 
 def _service_key(name: str, rev: int) -> _ServiceKey:
     if not name or "." not in name:
@@ -2796,7 +2776,9 @@ __all__ = (
     "DeclarationDrift",
     "CommandDefinition",
     "ShortcutDefinition",
+    "ComponentDefinition",
     "DeclarationRegistry",
+    "DirectorDefinition",
     "ChildDeviceDefinition",
     "DeviceDefinition",
     "DeclarationSnapshot",
@@ -2805,7 +2787,6 @@ __all__ = (
     "PreludeParamSpec",
     "MAX_DECLARATIONS",
     "QuotaExceeded",
-    "EntryKindDefinition",
     "ExportDefinition",
     "QuotaStatus",
     "ResourceReceipt",
@@ -2814,7 +2795,6 @@ __all__ = (
     "ServiceMethodDefinition",
     "Services",
     "WorkerToolDefinition",
-    "entry_kind",
     "configure_manifest",
     "dispatch_service",
     "freeze_declarations",
