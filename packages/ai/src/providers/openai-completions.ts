@@ -131,6 +131,13 @@ type OpenAICompletionsDeltaWithReasoningDetails = ChatCompletionChunk.Choice["de
 	reasoning_details?: unknown;
 };
 
+type GeminiMessageThoughtSignatureField = "thinking_signature" | "thought_signature";
+
+type GeminiMessageThoughtSignature = {
+	field: GeminiMessageThoughtSignatureField;
+	signature: string;
+};
+
 type GeminiThoughtSignatureNamespace = "google" | "vertex";
 
 type GeminiThoughtSignatureExtraContent = Partial<
@@ -142,6 +149,11 @@ type OpenAICompletionsFunctionToolCall = ChatCompletionMessageFunctionToolCall &
 };
 
 const GEMINI_THOUGHT_SIGNATURE_NAMESPACES: readonly GeminiThoughtSignatureNamespace[] = ["google", "vertex"];
+
+const GEMINI_MESSAGE_THOUGHT_SIGNATURE_FIELDS: readonly GeminiMessageThoughtSignatureField[] = [
+	"thinking_signature",
+	"thought_signature",
+];
 
 function getGeminiThoughtSignatureExtraContent(value: unknown): GeminiThoughtSignatureExtraContent | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
@@ -157,20 +169,26 @@ function getGeminiThoughtSignatureExtraContent(value: unknown): GeminiThoughtSig
 	return undefined;
 }
 
-function parseGeminiThoughtSignatureExtraContent(
-	thoughtSignature: string | undefined,
-): GeminiThoughtSignatureExtraContent | undefined {
+function getGeminiMessageThoughtSignature(value: unknown): GeminiMessageThoughtSignature | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	for (const field of GEMINI_MESSAGE_THOUGHT_SIGNATURE_FIELDS) {
+		const signature = Reflect.get(value, field);
+		if (typeof signature === "string" && signature.length > 0) return { field, signature };
+	}
+	return undefined;
+}
+
+function parseStoredThoughtSignature(thoughtSignature: string | undefined): unknown {
 	if (!thoughtSignature) return undefined;
 	try {
-		const parsed: unknown = JSON.parse(thoughtSignature);
-		return getGeminiThoughtSignatureExtraContent(parsed);
+		return JSON.parse(thoughtSignature);
 	} catch {
 		return undefined;
 	}
 }
 
 type OpenAICompletionsAssistantMessageParam = ChatCompletionAssistantMessageParam &
-	Partial<Record<OpenAICompletionsReasoningField, string>> & {
+	Partial<Record<OpenAICompletionsReasoningField | GeminiMessageThoughtSignatureField, string>> & {
 		reasoning_details?: unknown[];
 	};
 
@@ -886,6 +904,7 @@ const streamOpenAICompletionsOnce = (
 				}
 			};
 			let currentBlock: OpenAIStreamBlock | undefined;
+			let messageThoughtSignature: GeminiMessageThoughtSignature | undefined;
 			const blockIndex = (block: OpenAIStreamBlock | undefined): number => {
 				if (!block) return Math.max(0, output.content.length - 1);
 				return output.content.indexOf(block);
@@ -1359,6 +1378,18 @@ const streamOpenAICompletionsOnce = (
 									matchingToolCall.thoughtSignature = JSON.stringify(detailObject);
 								}
 							}
+						}
+					}
+
+					const incomingMessageThoughtSignature = getGeminiMessageThoughtSignature(choice.delta);
+					if (incomingMessageThoughtSignature) messageThoughtSignature = incomingMessageThoughtSignature;
+					if (messageThoughtSignature) {
+						for (const block of output.content) {
+							if (block.type !== "toolCall") continue;
+							block.thoughtSignature = JSON.stringify({
+								[messageThoughtSignature.field]: messageThoughtSignature.signature,
+							});
+							break;
 						}
 					}
 				}
@@ -2279,19 +2310,30 @@ export function convertMessages(
 							arguments: serializeToolArguments(tc.arguments),
 						},
 					};
-					const extraContent = parseGeminiThoughtSignatureExtraContent(tc.thoughtSignature);
+					const extraContent = getGeminiThoughtSignatureExtraContent(
+						parseStoredThoughtSignature(tc.thoughtSignature),
+					);
 					if (extraContent) replayedToolCall.extra_content = extraContent;
 					return replayedToolCall;
 				});
+				for (const toolCall of toolCalls) {
+					const messageSignature = getGeminiMessageThoughtSignature(
+						parseStoredThoughtSignature(toolCall.thoughtSignature),
+					);
+					if (!messageSignature) continue;
+					assistantMsg[messageSignature.field] = messageSignature.signature;
+					break;
+				}
 				const reasoningDetails = toolCalls.flatMap(tc => {
-					const thoughtSignature = tc.thoughtSignature;
-					if (!thoughtSignature) return [];
-					try {
-						const parsed: unknown = JSON.parse(thoughtSignature);
-						return getGeminiThoughtSignatureExtraContent(parsed) ? [] : [parsed];
-					} catch {
+					const parsed = parseStoredThoughtSignature(tc.thoughtSignature);
+					if (
+						parsed === undefined ||
+						getGeminiThoughtSignatureExtraContent(parsed) ||
+						getGeminiMessageThoughtSignature(parsed)
+					) {
 						return [];
 					}
+					return [parsed];
 				});
 				if (reasoningDetails.length > 0) {
 					assistantMsg.reasoning_details = reasoningDetails;
