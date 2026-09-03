@@ -821,9 +821,15 @@ export class ModelRegistry {
 				// reader crashes, or an identity left over from a different id.
 				// Rows of other providers pass through untouched; rebuilding a
 				// full catalog on every projection costs more than it can fix.
-				projected = modifyModels(structuredClone(cloneableModels), credential).map(model =>
-					model.provider === providerName ? buildModel(toModelSpec(model)) : model,
-				);
+				projected = modifyModels(structuredClone(cloneableModels), credential).map(model => {
+					if (model.provider !== providerName) return model;
+					// `identity` exists only on built rows. Without it the hook
+					// authored a spec, where `compat` already is the sparse
+					// override `toModelSpec` would drop while reading the absent
+					// `compatConfig`; built rows keep resolving from that field
+					// instead of feeding the resolved view back in as an override.
+					return buildModel(model.identity === undefined ? (model as ModelSpec<Api>) : toModelSpec(model));
+				});
 			} catch (error) {
 				this.#warnModelModifierFailure(providerName, error instanceof Error ? error.message : String(error));
 			}
