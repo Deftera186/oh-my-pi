@@ -5,11 +5,8 @@ use std::{fs, io, path::PathBuf, pin, sync::Arc};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use omp_core::Hash32;
+use omp_journal::blob::{self, BlobRef, BlobStore};
 use omp_proto::omp::blob::v1::{self as pb, blob_server};
-use omp_storage::{
-	blob,
-	blob::{BlobRef, BlobStore},
-};
 use tokio::task;
 use tonic::{Request, Response, Status};
 

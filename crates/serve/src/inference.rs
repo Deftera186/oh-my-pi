@@ -12,12 +12,11 @@ use bytes::Bytes;
 use flume::Receiver;
 use futures::{Stream, StreamExt as _, stream};
 use im::OrdMap;
-use omp_agent::{empty_stop, project_thread_history};
 use omp_catalog::{
 	Availability, GrammarBits, ModalityBits, ModelAvailability, ModelKey, ModelSpec, OperationKind,
 	ProviderDef, ProviderId, model::ProvenanceKind, provider::AuthSpecKind,
 };
-use omp_core::{Str, encoding::hex, sf};
+use omp_core::Str;
 use omp_inference::{
 	Client, ProviderResponseHooks, Registry, RetryAction,
 	answer::{
@@ -26,16 +25,12 @@ use omp_inference::{
 		RealtimeEvent as CanonicalRealtimeEvent, RealtimeInput, SearchFailureKind, SearchResults,
 		TranscriptEvent, UsageReport, UsageStatus, UsageUnit, UsageWindowKind, VideoArtifact,
 	},
-	auth::{
-		APP_HEADER, ClientUsageIdentity, HOSTNAME_HEADER, INSTALL_ID_HEADER, UsageAttribution,
-		resolve_forwarded_attribution,
-	},
 	call::{
-		self, CallMeta, ContentPart, ContextStrategy, CountAccuracy, CountTokensRequest,
-		DetokenizeRequest, Dimensions, EmbedRequest, EmbeddingInput, ImageFormat, ImageQuality,
-		ImageRequest, MediaInput, Message, NativeMethod, NativePath, NativePayload, NativeRequest,
+		self, CallMeta, ContextStrategy, CountAccuracy, CountTokensRequest, DetokenizeRequest,
+		Dimensions, EmbedRequest, EmbeddingInput, ImageFormat, ImageQuality, ImageRequest,
+		MediaInput, Message, NativeMethod, NativePath, NativePayload, NativeRequest,
 		NativeResponseFraming, NegotiationPolicy, OpaqueJson, RawJson, RealtimeModality,
-		RealtimeRequest, Role, Sampling, SearchRecency, SearchRequest, SessionRequest, Setting,
+		RealtimeRequest, Sampling, SearchRecency, SearchRequest, SessionRequest, Setting,
 		SpeechRequest, Target, TimestampGranularity, TokenizeRequest, ToolChoice, ToolDefinition,
 		ToolGrammar, ToolGrammarSyntax, ToolInputConstraint, ToolResultContent, TranscriptionRequest,
 		TruncationPolicy, UsageRequest, UsageScope, VideoRequest,
@@ -50,6 +45,7 @@ use omp_inference::{
 		TurnId as ProviderTurnId,
 	},
 	operation::{
+		discovery::CatalogDiscoveryProjectorError,
 		job::{JobCancelError, JobCancellationReceipt},
 		search::fallback_allowed as search_fallback_allowed,
 		search_query::{parse_date_value, parse_search_query},
@@ -74,7 +70,7 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1::{self as thread_pb, blob, item, part},
 };
-use omp_storage::index::{ClientUsageRecord, SessionIndex};
+use omp_session::projection::{PROVIDER_RESET_PROP, empty_stop, project_thread_history};
 use omp_tool::{CapsBase, LoweringCaps, ModelClass, Registry as ToolRegistry, TOOL_REV_PROP};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, oneshot};
@@ -161,8 +157,6 @@ pub struct InferenceRpc {
 	prompt_cache_affinity: Option<Str>,
 	provider_authority:    Option<Arc<dyn ProviderGatewayAuthority>>,
 	response_hooks:        ProviderResponseHooks,
-	client_usage:          Option<Arc<SessionIndex>>,
-	gateway_attribution:   Option<UsageAttribution>,
 }
 
 #[derive(Clone, Default)]
@@ -273,17 +267,7 @@ impl InferenceRpc {
 			prompt_cache_affinity: None,
 			provider_authority: None,
 			response_hooks: ProviderResponseHooks::default(),
-			client_usage: None,
-			gateway_attribution: None,
 		}
-	}
-
-	/// Binds append-only per-client usage accounting and the gateway fallback
-	/// identity.
-	pub fn with_client_usage(mut self, store: Arc<SessionIndex>, gateway: UsageAttribution) -> Self {
-		self.client_usage = Some(store);
-		self.gateway_attribution = Some(gateway);
-		self
 	}
 
 	/// Installs the session-owned provider response observation sink.
@@ -710,23 +694,6 @@ impl pb::inference_server::Inference for InferenceRpc {
 		&self,
 		request: Request<tonic::Streaming<pb::TurnFrame>>,
 	) -> Result<Response<Self::TurnStream>, Status> {
-		let attribution = self.gateway_attribution.as_ref().map(|gateway| {
-			resolve_forwarded_attribution(
-				request
-					.metadata()
-					.get(INSTALL_ID_HEADER)
-					.and_then(|value| value.to_str().ok()),
-				request
-					.metadata()
-					.get(APP_HEADER)
-					.and_then(|value| value.to_str().ok()),
-				request
-					.metadata()
-					.get(HOSTNAME_HEADER)
-					.and_then(|value| value.to_str().ok()),
-				gateway,
-			)
-		});
 		let mut incoming = request.into_inner();
 		let first = incoming
 			.message()
@@ -755,7 +722,7 @@ impl pb::inference_server::Inference for InferenceRpc {
 		let provider_reset = open
 			.props
 			.as_ref()
-			.and_then(|props| props.fields.get(omp_agent::PROVIDER_RESET_PROP))
+			.and_then(|props| props.fields.get(PROVIDER_RESET_PROP))
 			.and_then(|value| value.kind.as_ref())
 			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
 		let mut resolved =
@@ -831,8 +798,6 @@ impl pb::inference_server::Inference for InferenceRpc {
 			projection,
 			Arc::clone(&self.tool_registry),
 			self.test_live_responses.clone(),
-			self.client_usage.clone(),
-			attribution,
 		);
 		Ok(Response::new(Box::pin(output)))
 	}
@@ -2183,6 +2148,12 @@ fn inference_turn_error(error: Error) -> pb::TurnEvent {
 		if let Some(evidence) = error.detail_ref() {
 			let _ = write!(detail, ": {evidence}");
 		}
+		if error.kind == ErrorKind::RouteUnavailable
+			&& let Some(source) = std::error::Error::source(&error)
+			&& let Some(projector) = source.downcast_ref::<CatalogDiscoveryProjectorError>()
+		{
+			let _ = write!(detail, " (source: {projector})");
+		}
 		detail
 	};
 	let retry_after_ms = match error.action {
@@ -2319,108 +2290,11 @@ fn thread_messages(thread: &thread_pb::Thread) -> Result<Vec<Message>, Status> {
 /// assistant turn's parallel tool calls into a single provider message) belong
 /// to the codecs, never to this projection.
 fn items_messages(items: &[thread_pb::Item]) -> Result<Vec<Message>, Status> {
-	items
-		.iter()
-		.map(|item| match item.kind.as_ref() {
-			Some(item::Kind::Message(message)) => message_from_proto(message),
-			Some(item::Kind::ToolCall(call)) => Ok(Message {
-				role:    Role::Assistant,
-				content: Arc::from([ContentPart::ToolCall {
-					call:      ToolCallId::from(call.id.as_str()),
-					name:      call.name.as_str().into(),
-					arguments: opaque_json(&call.args_json, "ToolCall.args_json")?,
-					proof:     None,
-				}]),
-				name:    None,
-			}),
-			Some(item::Kind::ToolResult(result)) => {
-				let content = result
-					.parts
-					.iter()
-					.map(tool_result_part)
-					.collect::<Result<Vec<_>, _>>()?;
-				Ok(Message {
-					role:    Role::Tool,
-					content: Arc::from([ContentPart::ToolResult {
-						call:     ToolCallId::from(result.call_id.as_str()),
-						name:     (!result.name.is_empty()).then(|| result.name.as_str().into()),
-						content:  content.into(),
-						is_error: result.is_error,
-					}]),
-					name:    None,
-				})
-			},
-			None => Err(Status::invalid_argument("thread item kind is required")),
-		})
-		.collect()
-}
-
-fn message_from_proto(message: &thread_pb::Message) -> Result<Message, Status> {
-	let role = match thread_pb::Role::try_from(message.role).unwrap_or(thread_pb::Role::Unspecified)
-	{
-		thread_pb::Role::System => Role::System,
-		thread_pb::Role::User => Role::User,
-		thread_pb::Role::Assistant => Role::Assistant,
-		thread_pb::Role::Unspecified => {
-			return Err(Status::invalid_argument("message role is required"));
-		},
-	};
-	let content = message
-		.parts
-		.iter()
-		.map(content_part)
-		.collect::<Result<Vec<_>, _>>()?;
-	Ok(Message { role, content: content.into(), name: None })
-}
-
-fn content_part(part: &thread_pb::Part) -> Result<ContentPart, Status> {
-	match part.kind.as_ref() {
-		Some(part::Kind::Text(text)) => {
-			Ok(ContentPart::Text { text: text.as_str().into(), proof: None })
-		},
-		Some(part::Kind::Thinking(thinking)) if thinking.signature.is_empty() => {
-			Ok(ContentPart::Reasoning { text: thinking.text.as_str().into(), proof: None })
-		},
-		Some(part::Kind::Thinking(_)) => Err(Status::invalid_argument(
-			"unscoped reasoning signatures cannot enter canonical inference",
-		)),
-		Some(part::Kind::Blob(blob)) => Ok(ContentPart::Image(media_input(blob)?)),
-		Some(part::Kind::Fallback(_) | part::Kind::ServerTool(_)) => Err(Status::invalid_argument(
-			"legacy fallback/server-tool parts require an explicit canonical projection",
-		)),
-		None => Err(Status::invalid_argument("message part kind is required")),
-	}
-}
-
-fn tool_result_part(part: &thread_pb::Part) -> Result<ToolResultContent, Status> {
-	match part.kind.as_ref() {
-		Some(part::Kind::Text(text)) => Ok(ToolResultContent::Text(text.as_str().into())),
-		Some(part::Kind::Blob(blob)) => Ok(ToolResultContent::Document(media_input(blob)?)),
-		_ => Err(Status::invalid_argument(
-			"tool result contains a part that has no canonical projection",
-		)),
-	}
+	Message::from_thread_items(items).map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 fn media_input(blob: &thread_pb::Blob) -> Result<MediaInput, Status> {
-	if blob.mime.is_empty() {
-		return Err(Status::invalid_argument("Blob.mime is required"));
-	}
-	if !blob.inline.is_empty() {
-		return Ok(MediaInput::Bytes {
-			media_type: blob.mime.as_str().into(),
-			data:       Bytes::copy_from_slice(&blob.inline),
-		});
-	}
-	if blob.hash.is_empty() {
-		return Err(Status::invalid_argument("Blob requires inline bytes or a content hash"));
-	}
-	let id = hex::encode(&blob.hash).into_string();
-	Ok(MediaInput::Stored(omp_inference::answer::ArtifactRef {
-		store:    sf!("omp-rpc-blobs"),
-		id:       id.as_str().into(),
-		revision: id.as_str().into(),
-	}))
+	call::media_from_thread(blob).map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 fn opaque_json(bytes: &[u8], field: &'static str) -> Result<OpaqueJson, Status> {
@@ -3044,8 +2918,6 @@ fn turn_events(
 	projection: Arc<Mutex<TurnProjection>>,
 	tool_registry: Arc<ToolRegistry>,
 	test_live_responses: Option<flume::Sender<WorkflowResponse>>,
-	client_usage: Option<Arc<SessionIndex>>,
-	attribution: Option<ClientUsageIdentity>,
 ) -> impl Stream<Item = Result<pb::TurnEvent, Status>> + Send + 'static {
 	let control = events.control();
 	async_stream::try_stream! {
@@ -3308,47 +3180,6 @@ fn turn_events(
 						let route = resolved.resolved_route.lock();
 						(route.provider.clone(), route.model.clone())
 					};
-					if let (Some(store), Some(attribution), Some(provider), Some(model)) =
-						(&client_usage, &attribution, &route_provider, &route_model)
-					{
-						let usage = completion.usage;
-						let tokens = usage
-							.input_tokens
-							.saturating_add(usage.output_tokens)
-							.saturating_add(usage.cache_read_tokens)
-							.saturating_add(usage.cache_write_tokens);
-						if tokens != 0 {
-							let recorded_ms = SystemTime::now()
-								.duration_since(UNIX_EPOCH)
-								.unwrap_or_default()
-								.as_millis()
-								.try_into()
-								.unwrap_or(u64::MAX);
-							let cost = proto_cost(completion.receipt.cost);
-							if store
-								.record_client_usage(&ClientUsageRecord {
-									recorded_ms,
-									install_id: attribution.install_id(),
-									hostname: attribution.hostname(),
-									app: attribution.app(),
-									provider: provider.as_str(),
-									model: model
-										.as_str()
-										.split_once('/')
-										.map_or(model.as_str(), |(_, logical)| logical),
-									requests: 1,
-									input_tokens: usage.input_tokens,
-									output_tokens: usage.output_tokens,
-									cache_read_tokens: usage.cache_read_tokens,
-									cache_write_tokens: usage.cache_write_tokens,
-									cost_nanos_usd: cost.nanos_usd,
-								})
-								.is_err()
-							{
-								tracing::warn!("client usage observation was not recorded");
-							}
-						}
-					}
 					let outcome = build_turn_outcome(
 						&projection.lock(),
 						&completion,
@@ -3745,8 +3576,9 @@ fn realtime_input(frame: pb::RealtimeFrame) -> Result<RealtimeInput, Status> {
 			content:  result
 				.parts
 				.iter()
-				.map(tool_result_part)
-				.collect::<Result<Vec<_>, _>>()?
+				.map(ToolResultContent::from_thread_part)
+				.collect::<Result<Vec<_>, _>>()
+				.map_err(|error| Status::invalid_argument(error.to_string()))?
 				.into(),
 			is_error: result.is_error,
 		}),
@@ -4057,8 +3889,9 @@ fn system_time_ms(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
 	use omp_catalog::snapshot;
+	use omp_core::sf;
 	use omp_inference::{
-		RouteId,
+		Role, RouteId,
 		error::{ErrorPhase, RetryAction},
 		receipt::{ExecutionReceipt, ReasonId, RecoveryKind, RecoveryRecord},
 	};
@@ -4081,10 +3914,14 @@ mod tests {
 				created_at_ms: 0,
 				props:         None,
 				kind:          Some(item::Kind::Message(thread_pb::Message {
-					role:  thread_pb::Role::Assistant as i32,
-					parts: vec![thread_pb::Part {
+					role:            thread_pb::Role::Assistant as i32,
+					parts:           vec![thread_pb::Part {
 						kind: Some(part::Kind::Text("writing two files".to_owned())),
 					}],
+					synthetic:       None,
+					user_initiated:  None,
+					completed_at_ms: None,
+					usage:           None,
 				})),
 			},
 			tool_call_item("call_a"),
@@ -4516,14 +4353,14 @@ mod tests {
 		let thought_only = expect_turn_error(inference_turn_error(thought_only));
 		assert_eq!(thought_only.kind, turn_error::Kind::EmptyOutput as i32);
 		assert_eq!(thought_only.diagnostics.len(), 1);
-		assert_eq!(thought_only.diagnostics[0].code, omp_agent::empty_stop::NO_FINAL_OUTPUT);
+		assert_eq!(thought_only.diagnostics[0].code, empty_stop::NO_FINAL_OUTPUT);
 
 		// Zero-block empty stops join the session-level bounded continuation
 		// instead of failing as opaque upstream errors.
 		let no_content = expect_turn_error(inference_turn_error(no_content));
 		assert_eq!(no_content.kind, turn_error::Kind::EmptyOutput as i32);
 		assert_eq!(no_content.diagnostics.len(), 1);
-		assert_eq!(no_content.diagnostics[0].code, omp_agent::empty_stop::EMPTY);
+		assert_eq!(no_content.diagnostics[0].code, empty_stop::EMPTY);
 	}
 
 	#[test]
@@ -4533,7 +4370,7 @@ mod tests {
 		let error = expect_turn_error(inference_turn_error(error));
 		assert_eq!(error.kind, turn_error::Kind::EmptyOutput as i32);
 		assert_eq!(error.diagnostics.len(), 1);
-		assert_eq!(error.diagnostics[0].code, omp_agent::empty_stop::BILLED_OUTPUT);
+		assert_eq!(error.diagnostics[0].code, empty_stop::BILLED_OUTPUT);
 		assert_eq!(error.diagnostics[0].detail, "42");
 		assert_eq!(error.diagnostics[0].model, "model-a");
 		assert_eq!(error.diagnostics[0].attempt, 1);
@@ -4547,7 +4384,7 @@ mod tests {
 		let whitespace =
 			empty_stop_error(ErrorKind::EmptyCompletion, empty_stop_receipt("whitespace-only", 42));
 		let whitespace = expect_turn_error(inference_turn_error(whitespace));
-		assert_eq!(whitespace.diagnostics[0].code, omp_agent::empty_stop::EMPTY);
+		assert_eq!(whitespace.diagnostics[0].code, empty_stop::EMPTY);
 
 		// Reasoning-only billing is reported in the separate reasoning
 		// dimension; a zero-block stop without billed output keeps the
@@ -4555,7 +4392,7 @@ mod tests {
 		let reasoning_only =
 			empty_stop_error(ErrorKind::EmptyCompletion, empty_stop_receipt("no-content", 0));
 		let reasoning_only = expect_turn_error(inference_turn_error(reasoning_only));
-		assert_eq!(reasoning_only.diagnostics[0].code, omp_agent::empty_stop::EMPTY);
+		assert_eq!(reasoning_only.diagnostics[0].code, empty_stop::EMPTY);
 	}
 
 	#[test]
