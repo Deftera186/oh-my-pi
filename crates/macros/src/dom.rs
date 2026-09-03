@@ -572,12 +572,13 @@ macro_rules! prop_rows {
 		[$(($name, stringify!($variant)),)+]
 	};
 }
-const PROPS: &[(&str, &str)] = &omp_tui_vocab::for_each_prop! { prop_rows };
+const PROPS: &[(&str, &str)] = &omp_vocab::for_each_prop! { prop_rows };
 
 fn prop_variant(name: &str) -> Option<&'static str> {
+	let dashed = name.replace('_', "-");
 	PROPS
 		.iter()
-		.find_map(|&(attr, variant)| (attr == name).then_some(variant))
+		.find_map(|&(attr, variant)| (attr == dashed).then_some(variant))
 }
 
 macro_rules! component_rows {
@@ -585,7 +586,7 @@ macro_rules! component_rows {
 		[$((stringify!($tag), stringify!($type)),)+]
 	};
 }
-const COMPONENTS: &[(&str, &str)] = &omp_tui_vocab::for_each_component! { component_rows };
+const COMPONENTS: &[(&str, &str)] = &omp_vocab::for_each_component! { component_rows };
 
 fn component_type(name: &str) -> Option<&'static str> {
 	COMPONENTS

@@ -51,132 +51,7 @@ use omp_core::{IntoStr, SemVer, Str};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-/// Value shape a directive accepts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AxisKind {
-	/// Exactly one scalar argument.
-	Scalar,
-	/// One or more scalar arguments, resolved as a JSON array.
-	Array,
-	/// A children block of verbatim wire-JSON keys (possibly empty).
-	Object,
-}
-
-/// Axis namespace: request-wire compatibility or thinking-control surface.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AxisSet {
-	/// `wire/*` request compatibility overrides.
-	Wire,
-	/// Thinking/reasoning control-surface profile.
-	Thinking,
-}
-
-/// Closed directive vocabulary: kebab directive, namespace, resolved key,
-/// and accepted shape. Resolved keys use the frozen-oracle spellings.
-///
-/// Kept in lock-step with the oracle; `tests/compat_cascade.rs` fails when
-/// either side drifts.
-pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
-	(
-		"allows-synthetic-reasoning-content-for-tool-calls",
-		AxisSet::Wire,
-		"allows_synthetic_reasoning_content_for_tool_calls",
-		AxisKind::Scalar,
-	),
-	("disable-adaptive-thinking", AxisSet::Wire, "disable_adaptive_thinking", AxisKind::Scalar),
-	(
-		"disable-reasoning-on-tool-choice",
-		AxisSet::Wire,
-		"disable_reasoning_on_tool_choice",
-		AxisKind::Scalar,
-	),
-	("escape-builtin-tool-names", AxisSet::Wire, "escape_builtin_tool_names", AxisKind::Scalar),
-	("extra-body", AxisSet::Wire, "extra_body", AxisKind::Object),
-	("filter-reasoning-history", AxisSet::Wire, "filter_reasoning_history", AxisKind::Scalar),
-	("flatten-root-unions", AxisSet::Wire, "flatten_root_unions", AxisKind::Scalar),
-	("glyph-tokenization", AxisSet::Wire, "glyph_tokenization", AxisKind::Scalar),
-	("include-encrypted-reasoning", AxisSet::Wire, "include_encrypted_reasoning", AxisKind::Scalar),
-	("image-encoding-format", AxisSet::Wire, "image_encoding_format", AxisKind::Scalar),
-	("leaked-thinking-healer", AxisSet::Wire, "leaked_thinking_healer", AxisKind::Scalar),
-	("max-tokens-field", AxisSet::Wire, "max_tokens_field", AxisKind::Scalar),
-	("official-endpoint", AxisSet::Wire, "official_endpoint", AxisKind::Scalar),
-	("omit-reasoning-effort", AxisSet::Wire, "omit_reasoning_effort", AxisKind::Scalar),
-	("template-reasoning-effort", AxisSet::Wire, "template_reasoning_effort", AxisKind::Scalar),
-	("reasoning-content-field", AxisSet::Wire, "reasoning_content_field", AxisKind::Scalar),
-	("reasoning-disable-mode", AxisSet::Wire, "reasoning_disable_mode", AxisKind::Scalar),
-	("reasoning-effort-map", AxisSet::Wire, "reasoning_effort_map", AxisKind::Object),
-	("replay-unsigned-thinking", AxisSet::Wire, "replay_unsigned_thinking", AxisKind::Scalar),
-	(
-		"requires-assistant-content-for-tool-calls",
-		AxisSet::Wire,
-		"requires_assistant_content_for_tool_calls",
-		AxisKind::Scalar,
-	),
-	(
-		"requires-reasoning-content-for-all-assistant-turns",
-		AxisSet::Wire,
-		"requires_reasoning_content_for_all_assistant_turns",
-		AxisKind::Scalar,
-	),
-	(
-		"requires-reasoning-content-for-tool-calls",
-		AxisSet::Wire,
-		"requires_reasoning_content_for_tool_calls",
-		AxisKind::Scalar,
-	),
-	("requires-thinking-enabled", AxisSet::Wire, "requires_thinking_enabled", AxisKind::Scalar),
-	("requires-tool-result-id", AxisSet::Wire, "requires_tool_result_id", AxisKind::Scalar),
-	("signing-endpoint", AxisSet::Wire, "signing_endpoint", AxisKind::Scalar),
-	("stream-idle-timeout-ms", AxisSet::Wire, "stream_idle_timeout_ms", AxisKind::Scalar),
-	("thinking-close-max-retries", AxisSet::Wire, "thinking_close_max_retries", AxisKind::Scalar),
-	("supports-developer-role", AxisSet::Wire, "supports_developer_role", AxisKind::Scalar),
-	(
-		"supports-eager-tool-input-streaming",
-		AxisSet::Wire,
-		"supports_eager_tool_input_streaming",
-		AxisKind::Scalar,
-	),
-	("supports-forced-tool-choice", AxisSet::Wire, "supports_forced_tool_choice", AxisKind::Scalar),
-	(
-		"supports-image-detail-original",
-		AxisSet::Wire,
-		"supports_image_detail_original",
-		AxisKind::Scalar,
-	),
-	(
-		"supports-long-cache-retention",
-		AxisSet::Wire,
-		"supports_long_cache_retention",
-		AxisKind::Scalar,
-	),
-	(
-		"supports-mid-conversation-system",
-		AxisSet::Wire,
-		"supports_mid_conversation_system",
-		AxisKind::Scalar,
-	),
-	("supports-reasoning-effort", AxisSet::Wire, "supports_reasoning_effort", AxisKind::Scalar),
-	("supports-reasoning-summary", AxisSet::Wire, "supports_reasoning_summary", AxisKind::Scalar),
-	("supports-sampling-params", AxisSet::Wire, "supports_sampling_params", AxisKind::Scalar),
-	("supports-store", AxisSet::Wire, "supports_store", AxisKind::Scalar),
-	("supports-tool-choice", AxisSet::Wire, "supports_tool_choice", AxisKind::Scalar),
-	("supports-usage-in-streaming", AxisSet::Wire, "supports_usage_in_streaming", AxisKind::Scalar),
-	("thinking-format", AxisSet::Wire, "thinking_format", AxisKind::Scalar),
-	(
-		"thinking-tool-choice-conflict",
-		AxisSet::Wire,
-		"thinking_tool_choice_conflict",
-		AxisKind::Scalar,
-	),
-	("when-thinking", AxisSet::Wire, "when_thinking", AxisKind::Object),
-	("thinking-default-level", AxisSet::Thinking, "defaultLevel", AxisKind::Scalar),
-	("thinking-effort-budgets", AxisSet::Thinking, "effortBudgets", AxisKind::Object),
-	("thinking-efforts", AxisSet::Thinking, "efforts", AxisKind::Array),
-	("thinking-mode", AxisSet::Thinking, "mode", AxisKind::Scalar),
-	("thinking-requires-effort", AxisSet::Thinking, "requiresEffort", AxisKind::Scalar),
-	("thinking-suppress-when-off", AxisSet::Thinking, "suppressWhenOff", AxisKind::Scalar),
-	("thinking-supports-display", AxisSet::Thinking, "supportsDisplay", AxisKind::Scalar),
-];
+use crate::compat::{AxisSet, AxisShape, axis};
 
 macro_rules! sources {
 	($($name:literal),+ $(,)?) => {
@@ -220,6 +95,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"providers/baseten",
 	"providers/bedrock-mantle",
 	"providers/cerebras",
+	"providers/cline-pass",
 	"providers/cloudflare-ai-gateway",
 	"providers/cohere",
 	"providers/coreweave",
@@ -240,7 +116,10 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"providers/inception",
 	"providers/kilo",
 	"providers/kimi-code",
+	"providers/llama.cpp",
+	"providers/lm-studio",
 	"providers/meta",
+	"providers/minimax",
 	"providers/minimax-code",
 	"providers/minimax-code-cn",
 	"providers/mistral",
@@ -248,6 +127,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"providers/nanogpt",
 	"providers/novita",
 	"providers/nvidia",
+	"providers/ollama",
 	"providers/ollama-cloud",
 	"providers/openai",
 	"providers/openai-codex",
@@ -268,6 +148,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"providers/umans",
 	"providers/venice",
 	"providers/vercel-ai-gateway",
+	"providers/vllm",
 	"providers/wafer-serverless",
 	"providers/xai",
 	"providers/xai-oauth",
@@ -320,21 +201,35 @@ pub enum CascadeError {
 		/// Enclosing context.
 		context: Str,
 	},
-	/// A directive is not in [`KNOWN_AXES`].
-	#[error("{file}: unknown directive `{directive}`")]
+	/// A directive is absent from the closed compatibility vocabulary.
+	#[error("{file}:{line}: unknown directive `{directive}`")]
 	UnknownDirective {
 		/// Offending source file.
 		file:      Str,
+		/// One-based source line.
+		line:      usize,
 		/// Kebab-case directive as written.
 		directive: Str,
 	},
-	/// A directive has an argument shape its [`AxisKind`] rejects.
+	/// A directive has an argument shape its [`AxisShape`] rejects.
 	#[error("{file}: directive `{directive}` has a malformed value")]
 	MalformedDirective {
 		/// Offending source file.
 		file:      Str,
 		/// Kebab-case directive as written.
 		directive: Str,
+	},
+	/// A string value is outside an axis's closed enumeration.
+	#[error("{file}:{line}: directive `{directive}` rejects value `{value}`")]
+	InvalidDirectiveValue {
+		/// Offending source file.
+		file:      Str,
+		/// One-based source line.
+		line:      usize,
+		/// Kebab-case directive as written.
+		directive: Str,
+		/// Rejected string value.
+		value:     Str,
 	},
 	/// The same axis was assigned twice within one rule block.
 	#[error("{file}: axis `{axis}` assigned twice in one block")]
@@ -572,8 +467,8 @@ impl CompatCascade {
 			})?;
 			for node in document.nodes() {
 				match node.name().value() {
-					"class" => parse_class(file, node, &mut rules)?,
-					"provider" => parse_provider(file, node, &mut rules)?,
+					"class" => parse_class(file, text, node, &mut rules)?,
+					"provider" => parse_provider(file, text, node, &mut rules)?,
 					other => {
 						return Err(CascadeError::UnexpectedNode {
 							file:    file.to_str(),
@@ -698,10 +593,25 @@ struct RuleScope {
 	models:    Option<Vec<Selector>>,
 }
 
-fn parse_class(file: &str, node: &KdlNode, rules: &mut Vec<Rule>) -> Result<(), CascadeError> {
+fn source_line(source: &str, node: &KdlNode) -> usize {
+	let offset = node.span().offset().min(source.len());
+	source[..offset]
+		.bytes()
+		.filter(|byte| *byte == b'\n')
+		.count()
+		+ 1
+}
+
+fn parse_class(
+	file: &str,
+	source: &str,
+	node: &KdlNode,
+	rules: &mut Vec<Rule>,
+) -> Result<(), CascadeError> {
 	let class = required_name(file, node, "class")?.to_str();
 	parse_scope(
 		file,
+		source,
 		node,
 		RuleScope { class: Some(class), ..RuleScope::default() },
 		CLASS_CHILDREN,
@@ -709,10 +619,16 @@ fn parse_class(file: &str, node: &KdlNode, rules: &mut Vec<Rule>) -> Result<(), 
 	)
 }
 
-fn parse_provider(file: &str, node: &KdlNode, rules: &mut Vec<Rule>) -> Result<(), CascadeError> {
+fn parse_provider(
+	file: &str,
+	source: &str,
+	node: &KdlNode,
+	rules: &mut Vec<Rule>,
+) -> Result<(), CascadeError> {
 	let provider = required_name(file, node, "provider")?.to_str();
 	parse_scope(
 		file,
+		source,
 		node,
 		RuleScope { providers: Some(vec![provider]), ..RuleScope::default() },
 		PROVIDER_CHILDREN,
@@ -722,6 +638,7 @@ fn parse_provider(file: &str, node: &KdlNode, rules: &mut Vec<Rule>) -> Result<(
 
 fn parse_scope(
 	file: &str,
+	source: &str,
 	node: &KdlNode,
 	scope: RuleScope,
 	allowed: u8,
@@ -738,7 +655,7 @@ fn parse_scope(
 				"revision" => (CHILD_REVISION, REVISION_CHILDREN),
 				"models" => (CHILD_MODELS, 0),
 				_ => {
-					axes.collect(file, child)?;
+					axes.collect(file, source_line(source, child), child)?;
 					continue;
 				},
 			};
@@ -767,7 +684,7 @@ fn parse_scope(
 				CHILD_MODELS => nested.models = Some(selector_arguments(child, file)?),
 				_ => unreachable!("known selector bit"),
 			}
-			parse_scope(file, child, nested, next_allowed, rules)?;
+			parse_scope(file, source, child, nested, next_allowed, rules)?;
 		}
 	}
 	push_rule(rules, scope, priority, node, axes, file);
@@ -859,7 +776,7 @@ impl RuleAxes {
 		self.wire.is_empty() && self.thinking.is_empty() && self.catalog.is_empty()
 	}
 
-	fn collect(&mut self, file: &str, node: &KdlNode) -> Result<(), CascadeError> {
+	fn collect(&mut self, file: &str, line: usize, node: &KdlNode) -> Result<(), CascadeError> {
 		if node.entries().iter().any(|entry| entry.name().is_some()) {
 			return Err(CascadeError::MalformedDirective {
 				file:      file.to_str(),
@@ -867,62 +784,69 @@ impl RuleAxes {
 			});
 		}
 		let written = node.name().value();
-		if written == "long-context-cost" {
-			let value =
-				node_value(node, AxisKind::Object).ok_or_else(|| CascadeError::MalformedDirective {
-					file:      file.to_str(),
-					directive: written.to_str(),
-				})?;
-			if self.catalog.insert("longContext".to_str(), value).is_some() {
-				return Err(CascadeError::DuplicateAxis {
-					file: file.to_str(),
-					axis: "longContext".to_str(),
-				});
-			}
-			return Ok(());
-		}
-		if written == "edit-revision" {
-			let value = node_value(node, AxisKind::Scalar)
-				.filter(|value| {
-					value
-						.as_str()
-						.is_some_and(|revision| !revision.trim().is_empty())
-				})
-				.ok_or_else(|| CascadeError::MalformedDirective {
-					file:      file.to_str(),
-					directive: written.to_str(),
-				})?;
-			if self
-				.catalog
-				.insert("editRevision".to_str(), value)
-				.is_some()
-			{
-				return Err(CascadeError::DuplicateAxis {
-					file: file.to_str(),
-					axis: "editRevision".to_str(),
-				});
-			}
-			return Ok(());
-		}
-		let Some(&(_, set, key, kind)) = KNOWN_AXES
-			.iter()
-			.find(|(directive, ..)| *directive == written)
-		else {
+		let Some(definition) = axis(written) else {
 			return Err(CascadeError::UnknownDirective {
-				file:      file.to_str(),
+				file: file.to_str(),
+				line,
 				directive: written.to_str(),
 			});
 		};
-		let value = node_value(node, kind).ok_or_else(|| CascadeError::MalformedDirective {
-			file:      file.to_str(),
-			directive: written.to_str(),
-		})?;
-		let map = match set {
+		let value =
+			node_value(node, definition.shape, definition.verbatim_keys).ok_or_else(|| {
+				CascadeError::MalformedDirective {
+					file:      file.to_str(),
+					directive: written.to_str(),
+				}
+			})?;
+		if !definition.values.is_empty() {
+			let invalid = match &value {
+				Value::String(value) => {
+					(!definition.values.contains(&value.as_str())).then_some(value.as_str())
+				},
+				Value::Array(values) => values.iter().find_map(|value| {
+					value
+						.as_str()
+						.filter(|value| !definition.values.contains(value))
+				}),
+				_ => {
+					return Err(CascadeError::MalformedDirective {
+						file:      file.to_str(),
+						directive: written.to_str(),
+					});
+				},
+			};
+			if let Some(value) = invalid {
+				return Err(CascadeError::InvalidDirectiveValue {
+					file: file.to_str(),
+					line,
+					directive: written.to_str(),
+					value: value.to_str(),
+				});
+			}
+		}
+		if written == "edit-revision"
+			&& value
+				.as_str()
+				.is_some_and(|revision| revision.trim().is_empty())
+		{
+			return Err(CascadeError::MalformedDirective {
+				file:      file.to_str(),
+				directive: written.to_str(),
+			});
+		}
+		let map = match definition.set {
 			AxisSet::Wire => &mut self.wire,
 			AxisSet::Thinking => &mut self.thinking,
+			AxisSet::Catalog => &mut self.catalog,
 		};
-		if map.insert(key.to_str(), value).is_some() {
-			return Err(CascadeError::DuplicateAxis { file: file.to_str(), axis: key.to_str() });
+		if map
+			.insert(definition.resolved_key.to_str(), value)
+			.is_some()
+		{
+			return Err(CascadeError::DuplicateAxis {
+				file: file.to_str(),
+				axis: definition.resolved_key.to_str(),
+			});
 		}
 		Ok(())
 	}
@@ -965,20 +889,20 @@ fn fmt_label(file: &str, parts: &[&str]) -> Str {
 	label.to_str()
 }
 
-/// Converts one directive node into wire JSON per its [`AxisKind`].
-fn node_value(node: &KdlNode, kind: AxisKind) -> Option<Value> {
+/// Converts one directive node into JSON per its [`AxisShape`].
+fn node_value(node: &KdlNode, shape: AxisShape, verbatim_keys: bool) -> Option<Value> {
 	let arguments: Vec<&KdlValue> = node
 		.entries()
 		.iter()
 		.filter(|e| e.name().is_none())
 		.map(kdl::KdlEntry::value)
 		.collect();
-	match kind {
-		AxisKind::Scalar => match (arguments.as_slice(), node.children()) {
+	match shape {
+		AxisShape::Scalar => match (arguments.as_slice(), node.children()) {
 			([value], None) => scalar_value(value),
 			_ => None,
 		},
-		AxisKind::Array => {
+		AxisShape::Array => {
 			if arguments.is_empty() || node.children().is_some() {
 				return None;
 			}
@@ -988,15 +912,15 @@ fn node_value(node: &KdlNode, kind: AxisKind) -> Option<Value> {
 				.collect::<Option<Vec<_>>>()
 				.map(Value::from)
 		},
-		AxisKind::Object => match (arguments.as_slice(), node.children()) {
-			([], Some(children)) => object_value(children),
+		AxisShape::Object => match (arguments.as_slice(), node.children()) {
+			([], Some(children)) => object_value(children, verbatim_keys),
 			_ => None,
 		},
 	}
 }
 
-/// Nested payload node → JSON: verbatim keys, scalars or deeper objects.
-fn object_value(children: &KdlDocument) -> Option<Value> {
+/// Nested payload node → JSON: scalar or deeper object values.
+fn object_value(children: &KdlDocument, verbatim_keys: bool) -> Option<Value> {
 	let mut object = Map::new();
 	for child in children.nodes() {
 		let arguments: Vec<&KdlValue> = child
@@ -1007,12 +931,40 @@ fn object_value(children: &KdlDocument) -> Option<Value> {
 			.collect();
 		let value = match (arguments.as_slice(), child.children()) {
 			([value], None) => scalar_value(value)?,
-			([], Some(nested)) => object_value(nested)?,
+			([], Some(nested)) => object_value(nested, verbatim_keys)?,
 			_ => return None,
 		};
-		object.insert(child.name().value().into(), value);
+		let written = child.name().value();
+		let key = if verbatim_keys {
+			written.to_owned()
+		} else {
+			kebab_to_camel(written)?
+		};
+		object.insert(key, value);
 	}
 	Some(Value::Object(object))
+}
+
+fn kebab_to_camel(written: &str) -> Option<String> {
+	if written.is_empty() || written.bytes().any(|byte| byte.is_ascii_uppercase()) {
+		return None;
+	}
+	let mut key = String::with_capacity(written.len());
+	let mut uppercase = false;
+	for character in written.chars() {
+		if character == '-' {
+			if uppercase || key.is_empty() {
+				return None;
+			}
+			uppercase = true;
+		} else if uppercase {
+			key.extend(character.to_uppercase());
+			uppercase = false;
+		} else {
+			key.push(character);
+		}
+	}
+	(!uppercase).then_some(key)
 }
 
 fn scalar_value(value: &KdlValue) -> Option<Value> {
@@ -1096,18 +1048,18 @@ mod tests {
 	#[test]
 	fn deepseek_vision_exemption_requires_a_bounded_token() {
 		let cascade = CompatCascade::bundled().expect("bundled cascade parses");
-		let encoding = |model| {
+		let strip_images = |model| {
 			cascade
 				.resolve(&target("custom-proxy", "deepseek", model, false))
 				.expect("DeepSeek model resolves")
-				.wire["image_encoding_format"]
+				.wire["strip_image_input"]
 				.clone()
 		};
 		for model in ["deepseek-v4-flash-vision-exp", "deepseek_vision", "vision-deepseek-v4"] {
-			assert_eq!(encoding(model), Value::from("open_ai_url"), "{model}");
+			assert_eq!(strip_images(model), Value::Bool(false), "{model}");
 		}
 		for model in ["deepseek-r1-revision-0528", "deepseek-v4-provisioned"] {
-			assert_eq!(encoding(model), Value::from("none"), "{model}");
+			assert_eq!(strip_images(model), Value::Bool(true), "{model}");
 		}
 	}
 
@@ -1117,11 +1069,11 @@ mod tests {
 			r#"provider "subscription" {
 				models "model-a" {
 					long-context-cost {
-						inputThreshold 272000
+						input-threshold 272000
 						input 10.0
 						output 45.0
-						cacheRead 1.0
-						cacheWrite 12.5
+						cache-read 1.0
+						cache-write 12.5
 					}
 				}
 			}"#,
@@ -1286,8 +1238,8 @@ mod tests {
 			Err(CascadeError::MalformedDirective { .. })
 		));
 		assert!(matches!(
-			&parse_one(r#"provider "acme" { thinking-format "a"
-				thinking-format "b" }"#),
+			&parse_one(r#"provider "acme" { thinking-format "openai"
+				thinking-format "zai" }"#),
 			Err(CascadeError::DuplicateAxis { axis, .. }) if axis.as_str() == "thinking_format"
 		));
 		assert!(matches!(
@@ -1346,7 +1298,7 @@ mod tests {
 		let resolved = cascade
 			.resolve(&target("local", "qwen", "qwen3.8-27b", true))
 			.expect("resolves");
-		assert_eq!(resolved.wire["template_reasoning_effort"], Value::Bool(true));
+		assert_eq!(resolved.wire["qwen_template_reasoning_effort"], Value::Bool(true));
 		assert_eq!(
 			resolved.wire["thinking_tool_choice_conflict"],
 			Value::from("drop_thinking_when_any")
@@ -1381,7 +1333,7 @@ mod tests {
 		let cascade = parse_one(
 			r#"class "gemini" {
 				revision ">=2.5" { supports-store #true }
-				family "flash" { thinking-format "gemini" }
+				family "flash" { thinking-format "openai" }
 			}"#,
 		)
 		.expect("valid cascade");
@@ -1414,8 +1366,8 @@ mod tests {
 		let cascade = parse_one(
 			r#"class "gemini" {
 				family "flash" {
-					thinking-format "family"
-					revision ">=2.5" { thinking-format "family-revision" }
+					thinking-format "openai"
+					revision ">=2.5" { thinking-format "openrouter" }
 				}
 			}"#,
 		)
@@ -1430,7 +1382,7 @@ mod tests {
 		};
 		assert_eq!(
 			cascade.resolve(&candidate).expect("resolves").wire["thinking_format"],
-			Value::from("family-revision")
+			Value::from("openrouter")
 		);
 	}
 
@@ -1438,8 +1390,8 @@ mod tests {
 	fn overlapping_revision_ranges_need_priority() {
 		let ambiguous = parse_one(
 			r#"class "gemini" {
-				revision ">=2" { thinking-format "lower" }
-				revision "<3" { thinking-format "upper" }
+				revision ">=2" { thinking-format "openai" }
+				revision "<3" { thinking-format "openrouter" }
 			}"#,
 		)
 		.expect("valid cascade");
@@ -1455,8 +1407,8 @@ mod tests {
 
 		let prioritized = parse_one(
 			r#"class "gemini" {
-				revision ">=2" priority=1 { thinking-format "lower" }
-				revision "<3" { thinking-format "upper" }
+				revision ">=2" priority=1 { thinking-format "openai" }
+				revision "<3" { thinking-format "openrouter" }
 			}"#,
 		)
 		.expect("valid cascade");
@@ -1465,7 +1417,7 @@ mod tests {
 				.resolve(&candidate)
 				.expect("priority resolves")
 				.wire["thinking_format"],
-			Value::from("lower")
+			Value::from("openai")
 		);
 	}
 

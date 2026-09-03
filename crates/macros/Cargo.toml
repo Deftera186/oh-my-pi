@@ -12,7 +12,7 @@ description = "Workspace proc macros for declarative TUI markup"
 proc-macro = true
 
 [dependencies]
-omp-tui-vocab.workspace = true
+omp-vocab.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
 strum.workspace = true

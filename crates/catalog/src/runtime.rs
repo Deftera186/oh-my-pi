@@ -137,6 +137,8 @@ impl RuntimeBehavior {
 				},
 				"quota-tiers" => quota_tiers.push(parse_quota_tiers(node)?),
 				"hosted-default" => hosted_defaults.push(parse_hosted_default(node)?),
+				"retired-providers" | "plan-requirement" | "api-routes" | "exclude-models"
+				| "model-limits" | "pricing-peer" => validate_extension(node)?,
 				other => return unexpected(other, "behavior"),
 			}
 		}
@@ -309,6 +311,103 @@ fn parse_hosted_default(node: &KdlNode) -> Result<HostedDefault, CascadeError> {
 		return malformed("hosted-default");
 	}
 	Ok(HostedDefault { provider: provider.to_str(), model: model.to_str() })
+}
+
+fn validate_extension(node: &KdlNode) -> Result<(), CascadeError> {
+	match node.name().value() {
+		"retired-providers" => {
+			validate_properties(node, "retired-providers", &[])?;
+			if positional_strings(node)?.is_empty() || node.children().is_some() {
+				return malformed("retired-providers");
+			}
+		},
+		"exclude-models" => {
+			validate_properties(node, "exclude-models", &[
+				"provider",
+				"exact",
+				"prefix",
+				"substring",
+				"token",
+				"glob",
+			])?;
+			if required_property(node, "provider", "exclude-models")?.is_empty()
+				|| !positional_strings(node)?.is_empty()
+				|| node.children().is_some()
+			{
+				return malformed("exclude-models");
+			}
+		},
+		"plan-requirement" => {
+			ensure_container(node, "plan-requirement", &["provider"])?;
+			for child in node.children().expect("container validated").nodes() {
+				ensure_leaf(child, "tier", &["exact", "prefix", "substring", "token", "glob"])?;
+				let values = positional_strings(child)?;
+				let [tier] = values.as_slice() else {
+					return malformed("tier");
+				};
+				if child.name().value() != "tier" || tier.is_empty() {
+					return malformed("tier");
+				}
+			}
+		},
+		"api-routes" => {
+			ensure_container(node, "api-routes", &["provider", "default"])?;
+			for child in node.children().expect("container validated").nodes() {
+				ensure_leaf(child, "route", &[
+					"exact",
+					"prefix",
+					"substring",
+					"token",
+					"glob",
+					"strip-prefix",
+				])?;
+				let values = positional_strings(child)?;
+				let [api] = values.as_slice() else {
+					return malformed("route");
+				};
+				if child.name().value() != "route" || api.is_empty() {
+					return malformed("route");
+				}
+			}
+		},
+		"model-limits" => {
+			ensure_container(node, "model-limits", &["provider"])?;
+			for child in node.children().expect("container validated").nodes() {
+				ensure_leaf(child, "limits", &["context", "max-tokens"])?;
+				let values = positional_strings(child)?;
+				let [model] = values.as_slice() else {
+					return malformed("limits");
+				};
+				if child.name().value() != "limits" || model.is_empty() {
+					return malformed("limits");
+				}
+			}
+		},
+		"pricing-peer" => {
+			validate_properties(node, "pricing-peer", &["provider", "peers"])?;
+			if required_property(node, "provider", "pricing-peer")?.is_empty()
+				|| required_property(node, "peers", "pricing-peer")?.is_empty()
+				|| node.children().is_none()
+			{
+				return malformed("pricing-peer");
+			}
+			for child in node.children().expect("children checked").nodes() {
+				ensure_leaf(child, "alias", &["peer-id"])?;
+				let values = positional_strings(child)?;
+				let [model] = values.as_slice() else {
+					return malformed("alias");
+				};
+				if child.name().value() != "alias"
+					|| model.is_empty()
+					|| required_property(child, "peer-id", "alias")?.is_empty()
+				{
+					return malformed("alias");
+				}
+			}
+		},
+		_ => return unexpected(node.name().value(), "behavior"),
+	}
+	Ok(())
 }
 
 fn ensure_container(

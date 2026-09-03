@@ -179,6 +179,9 @@ pub struct SourceLongContextCost {
 	/// Whether the source threshold itself activates the replacement schedule.
 	#[serde(default)]
 	pub input_threshold_inclusive: bool,
+	/// Optional multiplier applied to the row's live base rates.
+	#[serde(default)]
+	pub multiplier:                Option<Number>,
 	/// Input price.
 	#[serde(default = "zero_number")]
 	pub input:                     Number,
@@ -493,9 +496,6 @@ pub struct SourceDiscovery {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SourceWirePolicy {
-	/// Streaming usage support.
-	#[serde(alias = "supportsUsageInStreaming")]
-	pub usage_in_streaming: Option<bool>,
 	/// Reversible private-use glyph tokenization at the provider wire boundary.
 	pub glyph_tokenization: Option<bool>,
 	/// Multiple system-message support.
@@ -514,9 +514,6 @@ pub struct SourceWirePolicy {
 	pub tool_strict_mode: Option<Str>,
 	/// Named tool choice.
 	pub named_tool_choice: Option<bool>,
-	/// Forced tool choice.
-	#[serde(alias = "supportsForcedToolChoice")]
-	pub forced_tool_choice: Option<bool>,
 	/// General tool-choice support.
 	#[serde(alias = "supportsToolChoice")]
 	pub supports_tool_choice: Option<bool>,
@@ -539,8 +536,8 @@ pub struct SourceWirePolicy {
 	#[serde(alias = "promptCacheMinimumTokens")]
 	pub prompt_cache_minimum_tokens: Option<u64>,
 	/// Bedrock maximum explicit prompt-cache checkpoints.
-	#[serde(alias = "promptCacheMaxCheckpoints")]
-	pub prompt_cache_max_checkpoints: Option<u8>,
+	#[serde(alias = "prompt_cache_max_checkpoints", alias = "promptCacheMaxCheckpoints")]
+	pub prompt_cache_maximum_checkpoints: Option<u8>,
 	/// Image encoding.
 	pub image_encoding_format: Option<Str>,
 	/// Stop-sequence support.
@@ -549,8 +546,8 @@ pub struct SourceWirePolicy {
 	pub tool_schema_flavor: Option<Str>,
 	/// Leaked-thinking healer.
 	pub leaked_thinking_healer: Option<Str>,
-	/// Thinking loop guard.
-	pub thinking_loop_guard: Option<bool>,
+	/// Thinking loop guard profile.
+	pub thinking_loop_guard: Option<Str>,
 	/// Stream watchdog.
 	pub stream_watchdog: Option<SourceStreamWatchdog>,
 	/// Model stream idle timeout.
@@ -656,6 +653,134 @@ pub struct SourceWirePolicy {
 	/// Original image detail support.
 	#[serde(alias = "supportsImageDetailOriginal")]
 	pub supports_image_detail_original: Option<bool>,
+	/// Compiled `allow-anthropic-header-overrides` compatibility fact.
+	pub allow_anthropic_header_overrides: Option<bool>,
+	/// Compiled `always-send-max-tokens` compatibility fact.
+	pub always_send_max_tokens: Option<bool>,
+	/// Compiled `antigravity-claude-tool-mode` compatibility fact.
+	pub antigravity_claude_tool_mode: Option<bool>,
+	/// Compiled `antigravity-usage-label` compatibility fact.
+	pub antigravity_usage_label: Option<Str>,
+	/// Compiled `cca-legacy-parameters-schema` compatibility fact.
+	pub cca_legacy_parameters_schema: Option<bool>,
+	/// Compiled `clamp-output-to-model-max` compatibility fact.
+	pub clamp_output_to_model_max: Option<bool>,
+	/// Compiled `claude-thinking-beta-header` compatibility fact.
+	pub claude_thinking_beta_header: Option<bool>,
+	/// Compiled `disable-reasoning-on-forced-tool-choice` compatibility fact.
+	pub disable_reasoning_on_forced_tool_choice: Option<bool>,
+	/// Compiled `disable-strict-tools` compatibility fact.
+	pub disable_strict_tools: Option<bool>,
+	/// Compiled `drop-thinking-when-reasoning-effort` compatibility fact.
+	pub drop_thinking_when_reasoning_effort: Option<bool>,
+	/// Compiled `drop-unsigned-thinking` compatibility fact.
+	pub drop_unsigned_thinking: Option<bool>,
+	/// Compiled `empty-length-finish-is-context-error` compatibility fact.
+	pub empty_length_finish_is_context_error: Option<bool>,
+	/// Compiled `flash-stream-leak-workaround` compatibility fact.
+	pub flash_stream_leak_workaround: Option<bool>,
+	/// Compiled `harmony-leak-mitigation` compatibility fact.
+	pub harmony_leak_mitigation: Option<bool>,
+	/// Compiled `inject-claude-code-instruction` compatibility fact.
+	pub inject_claude_code_instruction: Option<bool>,
+	/// Compiled `kimi-api-format` compatibility fact.
+	pub kimi_api_format: Option<Str>,
+	/// Compiled `model-router` compatibility fact.
+	pub model_router: Option<bool>,
+	/// Compiled `multimodal-function-response` compatibility fact.
+	pub multimodal_function_response: Option<bool>,
+	/// Compiled `native-kimi-k3-reasoning` compatibility fact.
+	pub native_kimi_k3_reasoning: Option<bool>,
+	/// Compiled `prompt-cache-breakpoint-ttl` compatibility fact.
+	pub prompt_cache_breakpoint_ttl: Option<Str>,
+	/// Compiled `prompt-cache-session-header` compatibility fact.
+	pub prompt_cache_session_header: Option<Str>,
+	/// Compiled `qwen-preserve-thinking` compatibility fact.
+	pub qwen_preserve_thinking: Option<bool>,
+	/// Compiled `reasoning-deltas-may-be-cumulative` compatibility fact.
+	pub reasoning_deltas_may_be_cumulative: Option<bool>,
+	/// Compiled `reject-root-object-union` compatibility fact.
+	pub reject_root_object_union: Option<bool>,
+	/// Compiled `replay-reasoning-content` compatibility fact.
+	pub replay_reasoning_content: Option<bool>,
+	/// Compiled `requires-assistant-after-tool-result` compatibility fact.
+	pub requires_assistant_after_tool_result: Option<bool>,
+	/// Compiled `requires-mistral-tool-ids` compatibility fact.
+	pub requires_mistral_tool_ids: Option<bool>,
+	/// Compiled `requires-reasoning-off-juice-instruction` compatibility fact.
+	pub requires_reasoning_off_juice_instruction: Option<bool>,
+	/// Compiled `requires-skip-thought-signature` compatibility fact.
+	pub requires_skip_thought_signature: Option<bool>,
+	/// Compiled `requires-thinking-as-text` compatibility fact.
+	pub requires_thinking_as_text: Option<bool>,
+	/// Compiled `requires-tool-result-name` compatibility fact.
+	pub requires_tool_result_name: Option<bool>,
+	/// Compiled `retry-without-strict-on-grammar-error` compatibility fact.
+	pub retry_without_strict_on_grammar_error: Option<bool>,
+	/// Compiled `stream-first-event-timeout-ms` compatibility fact.
+	pub stream_first_event_timeout_ms: Option<u64>,
+	/// Compiled `stream-markup-healing-pattern` compatibility fact.
+	pub stream_markup_healing_pattern: Option<Str>,
+	/// Compiled `strict-responses-pairing` compatibility fact.
+	pub strict_responses_pairing: Option<bool>,
+	/// Compiled `strip-deepseek-special-tokens` compatibility fact.
+	pub strip_deepseek_special_tokens: Option<bool>,
+	/// Compiled `strip-image-input` compatibility fact.
+	pub strip_image_input: Option<bool>,
+	/// Compiled `supports-all-turns-reasoning-context` compatibility fact.
+	pub supports_all_turns_reasoning_context: Option<bool>,
+	/// Compiled `supports-context-management` compatibility fact.
+	pub supports_context_management: Option<bool>,
+	/// Compiled `supports-forced-tool-choice` compatibility fact.
+	#[serde(alias = "forced_tool_choice", alias = "supportsForcedToolChoice")]
+	pub supports_forced_tool_choice: Option<bool>,
+	/// Compiled `supports-function-part-id` compatibility fact.
+	pub supports_function_part_id: Option<bool>,
+	/// Compiled `supports-long-prompt-cache-retention` compatibility fact.
+	pub supports_long_prompt_cache_retention: Option<bool>,
+	/// Compiled `supports-mid-conversation-tool-changes` compatibility fact.
+	pub supports_mid_conversation_tool_changes: Option<bool>,
+	/// Compiled `supports-multiple-system-messages` compatibility fact.
+	pub supports_multiple_system_messages: Option<bool>,
+	/// Compiled `supports-named-tool-choice` compatibility fact.
+	pub supports_named_tool_choice: Option<bool>,
+	/// Compiled `supports-obfuscation-opt-out` compatibility fact.
+	pub supports_obfuscation_opt_out: Option<bool>,
+	/// Compiled `supports-output-effort` compatibility fact.
+	pub supports_output_effort: Option<bool>,
+	/// Compiled `supports-parallel-tool-calls` compatibility fact.
+	pub supports_parallel_tool_calls: Option<bool>,
+	/// Compiled `supports-penalty-and-stop-params` compatibility fact.
+	pub supports_penalty_and_stop_params: Option<bool>,
+	/// Compiled `supports-per-message-effort` compatibility fact.
+	pub supports_per_message_effort: Option<bool>,
+	/// Compiled `supports-prompt-cache-breakpoints` compatibility fact.
+	pub supports_prompt_cache_breakpoints: Option<bool>,
+	/// Compiled `supports-prompt-cache-key` compatibility fact.
+	pub supports_prompt_cache_key: Option<bool>,
+	/// Compiled `supports-reasoning-params` compatibility fact.
+	pub supports_reasoning_params: Option<bool>,
+	/// Compiled `supports-strict-mode` compatibility fact.
+	pub supports_strict_mode: Option<bool>,
+	/// Compiled `supports-thinking-binding-controls` compatibility fact.
+	pub supports_thinking_binding_controls: Option<bool>,
+	/// Compiled `supports-turn-scoped-system` compatibility fact.
+	pub supports_turn_scoped_system: Option<bool>,
+	/// Compiled `supports-usage-in-streaming` compatibility fact.
+	#[serde(alias = "usage_in_streaming", alias = "supportsUsageInStreaming")]
+	pub supports_usage_in_streaming: Option<bool>,
+	/// Compiled `template-reasoning-effort` compatibility fact.
+	pub qwen_template_reasoning_effort: Option<bool>,
+	/// Compiled `thinking-keep` compatibility fact.
+	pub thinking_keep: Option<bool>,
+	/// Compiled `trust-explicit-thinking-only` compatibility fact.
+	pub trust_explicit_thinking_only: Option<bool>,
+	/// Compiled `uses-openai-tool-call-id-limit` compatibility fact.
+	pub uses_openai_tool_call_id_limit: Option<bool>,
+	/// Compiled `wire-model-id-mode` compatibility fact.
+	pub wire_model_id_mode: Option<Str>,
+	/// Compiled `zai-reasoning-effort-dialect` compatibility fact.
+	pub zai_reasoning_effort_dialect: Option<bool>,
 }
 
 /// Typed source watchdog bounds.
@@ -934,6 +1059,9 @@ pub enum CompileError {
 	/// Compatibility cascade parsing or resolution failed.
 	#[error("compatibility cascade is invalid: {0}")]
 	Cascade(#[from] CascadeError),
+	/// A computed pricing multiplier was not a finite JSON number.
+	#[error("computed pricing multiplier is not finite")]
+	InvalidPriceMultiplier,
 	/// Source data violated a catalog invariant.
 	#[error("catalog invariant failed: {0}")]
 	Invariant(Str),
@@ -3464,6 +3592,8 @@ fn compile_models(
 					wire_ids.push((route.clone(), WireModelId::new(logical_id.clone())));
 				}
 			}
+			wire_ids.sort();
+			wire_ids.dedup();
 			let capability_override = exact_capability_override(&provider, &logical_id);
 			let resolved = cascade.resolve(&ResolveTarget {
 				provider:  provider.as_str(),
@@ -3852,12 +3982,7 @@ fn collapsible_groups(classified: &BTreeMap<Str, ModelClassification>) -> BTreeS
 fn axis_map_to_source_wire_policy(source: AxisMap) -> Result<SourceWirePolicy, CompileError> {
 	let mut object = Map::new();
 	for (key, value) in source {
-		let key = match key.as_str() {
-			"supports_usage_in_streaming" => "usage_in_streaming",
-			"supports_forced_tool_choice" => "forced_tool_choice",
-			key => key,
-		};
-		object.insert(key.to_owned(), value);
+		object.insert(key.as_str().to_owned(), value);
 	}
 	Ok(serde_json::from_value(Value::Object(object))?)
 }
@@ -3874,12 +3999,15 @@ fn compile_wire_policy(
 	mut policy: WirePolicy,
 	source: &SourceWirePolicy,
 ) -> Result<WirePolicy, CompileError> {
-	policy.usage.in_streaming = source.usage_in_streaming.or(policy.usage.in_streaming);
+	policy.usage.in_streaming = source
+		.supports_usage_in_streaming
+		.or(policy.usage.in_streaming);
 	policy.context.glyph_tokenization = source
 		.glyph_tokenization
 		.or(policy.context.glyph_tokenization);
 	policy.role.multiple_system_messages = source
-		.multiple_system_messages
+		.supports_multiple_system_messages
+		.or(source.multiple_system_messages)
 		.or(policy.role.multiple_system_messages);
 	policy.context.max_tokens_field =
 		parse_policy(source.max_tokens_field.as_deref(), policy.context.max_tokens_field)?;
@@ -3887,8 +4015,13 @@ fn compile_wire_policy(
 	policy.structured.penalties = source.penalties.or(policy.structured.penalties);
 	policy.tool.strict_mode =
 		parse_policy(source.tool_strict_mode.as_deref(), policy.tool.strict_mode)?;
-	policy.tool.named_choice = source.named_tool_choice.or(policy.tool.named_choice);
-	policy.tool.forced_choice = source.forced_tool_choice.or(policy.tool.forced_choice);
+	policy.tool.named_choice = source
+		.supports_named_tool_choice
+		.or(source.named_tool_choice)
+		.or(policy.tool.named_choice);
+	policy.tool.forced_choice = source
+		.supports_forced_tool_choice
+		.or(policy.tool.forced_choice);
 	policy.tool.flatten_root_unions = source
 		.flatten_root_unions
 		.or(policy.tool.flatten_root_unions);
@@ -3915,7 +4048,7 @@ fn compile_wire_policy(
 		.prompt_cache_minimum_tokens
 		.or(policy.cache.minimum_tokens);
 	policy.cache.maximum_checkpoints = source
-		.prompt_cache_max_checkpoints
+		.prompt_cache_maximum_checkpoints
 		.or(policy.cache.maximum_checkpoints);
 	policy.image.encoding =
 		parse_policy(source.image_encoding_format.as_deref(), policy.image.encoding)?;
@@ -3924,7 +4057,13 @@ fn compile_wire_policy(
 		parse_policy(source.tool_schema_flavor.as_deref(), policy.tool.schema_flavor)?;
 	policy.reasoning.leaked_healer =
 		parse_policy(source.leaked_thinking_healer.as_deref(), policy.reasoning.leaked_healer)?;
-	policy.reasoning.loop_guard = source.thinking_loop_guard.or(policy.reasoning.loop_guard);
+	policy.reasoning.loop_guard_profile =
+		parse_policy(source.thinking_loop_guard.as_deref(), policy.reasoning.loop_guard_profile)?;
+	policy.reasoning.loop_guard = source
+		.thinking_loop_guard
+		.as_ref()
+		.map(|_| true)
+		.or(policy.reasoning.loop_guard);
 	if let Some(watchdog) = source.stream_watchdog {
 		policy.streaming.watchdog = Some(StreamWatchdog {
 			first_event_ms: watchdog.first_event_ms,
@@ -3972,7 +4111,8 @@ fn compile_wire_policy(
 		.omit_reasoning_effort
 		.or(policy.reasoning.omit_effort);
 	policy.reasoning.template_reasoning_effort = source
-		.template_reasoning_effort
+		.qwen_template_reasoning_effort
+		.or(source.template_reasoning_effort)
 		.or(policy.reasoning.template_reasoning_effort);
 	if !source.reasoning_effort_map.is_empty() {
 		policy
@@ -4027,7 +4167,8 @@ fn compile_wire_policy(
 			Some(serde_json::from_str::<WhenThinkingPolicy>(raw.json())?);
 	}
 	policy.cache.supports_long_retention = source
-		.supports_long_cache_retention
+		.supports_long_prompt_cache_retention
+		.or(source.supports_long_cache_retention)
 		.or(policy.cache.supports_long_retention);
 	policy.context.supports_store = source.supports_store.or(policy.context.supports_store);
 	policy.image.supports_detail_original = source
@@ -4041,6 +4182,174 @@ fn compile_wire_policy(
 	policy.streaming.thinking_close_max_retries = source
 		.thinking_close_max_retries
 		.or(policy.streaming.thinking_close_max_retries);
+
+	policy.headers.allow_anthropic_overrides = source
+		.allow_anthropic_header_overrides
+		.or(policy.headers.allow_anthropic_overrides);
+	policy.context.always_send_max_tokens = source
+		.always_send_max_tokens
+		.or(policy.context.always_send_max_tokens);
+	policy.tool.antigravity_claude_mode = source
+		.antigravity_claude_tool_mode
+		.or(policy.tool.antigravity_claude_mode);
+	policy.usage.antigravity_label = source
+		.antigravity_usage_label
+		.clone()
+		.or(policy.usage.antigravity_label);
+	policy.tool.cca_legacy_parameters_schema = source
+		.cca_legacy_parameters_schema
+		.or(policy.tool.cca_legacy_parameters_schema);
+	policy.context.clamp_output_to_model_max = source
+		.clamp_output_to_model_max
+		.or(policy.context.clamp_output_to_model_max);
+	policy.headers.claude_thinking_beta = source
+		.claude_thinking_beta_header
+		.or(policy.headers.claude_thinking_beta);
+	policy.tool.disable_reasoning_on_forced_choice = source
+		.disable_reasoning_on_forced_tool_choice
+		.or(policy.tool.disable_reasoning_on_forced_choice);
+	policy.tool.disable_strict_tools = source
+		.disable_strict_tools
+		.or(policy.tool.disable_strict_tools);
+	policy.reasoning.drop_thinking_when_effort = source
+		.drop_thinking_when_reasoning_effort
+		.or(policy.reasoning.drop_thinking_when_effort);
+	policy.reasoning.drop_unsigned = source
+		.drop_unsigned_thinking
+		.or(policy.reasoning.drop_unsigned);
+	policy.streaming.empty_length_finish_is_context_error = source
+		.empty_length_finish_is_context_error
+		.or(policy.streaming.empty_length_finish_is_context_error);
+	policy.streaming.flash_leak_workaround = source
+		.flash_stream_leak_workaround
+		.or(policy.streaming.flash_leak_workaround);
+	policy.streaming.harmony_leak_mitigation = source
+		.harmony_leak_mitigation
+		.or(policy.streaming.harmony_leak_mitigation);
+	policy.role.inject_claude_code_instruction = source
+		.inject_claude_code_instruction
+		.or(policy.role.inject_claude_code_instruction);
+	policy.dialect.kimi_api_format =
+		parse_policy(source.kimi_api_format.as_deref(), policy.dialect.kimi_api_format)?;
+	policy.dialect.model_router = source.model_router.or(policy.dialect.model_router);
+	policy.image.multimodal_function_response = source
+		.multimodal_function_response
+		.or(policy.image.multimodal_function_response);
+	policy.reasoning.native_kimi_k3 = source
+		.native_kimi_k3_reasoning
+		.or(policy.reasoning.native_kimi_k3);
+	policy.cache.breakpoint_ttl =
+		parse_policy(source.prompt_cache_breakpoint_ttl.as_deref(), policy.cache.breakpoint_ttl)?;
+	policy.headers.prompt_cache_session = parse_policy(
+		source.prompt_cache_session_header.as_deref(),
+		policy.headers.prompt_cache_session,
+	)?;
+	policy.reasoning.qwen_preserve_thinking = source
+		.qwen_preserve_thinking
+		.or(policy.reasoning.qwen_preserve_thinking);
+	policy.streaming.reasoning_deltas_cumulative = source
+		.reasoning_deltas_may_be_cumulative
+		.or(policy.streaming.reasoning_deltas_cumulative);
+	policy.tool.reject_root_object_union = source
+		.reject_root_object_union
+		.or(policy.tool.reject_root_object_union);
+	policy.reasoning.replay_content = source
+		.replay_reasoning_content
+		.or(policy.reasoning.replay_content);
+	policy.tool.requires_assistant_after_result = source
+		.requires_assistant_after_tool_result
+		.or(policy.tool.requires_assistant_after_result);
+	policy.tool.requires_mistral_ids = source
+		.requires_mistral_tool_ids
+		.or(policy.tool.requires_mistral_ids);
+	policy.reasoning.requires_off_juice_instruction = source
+		.requires_reasoning_off_juice_instruction
+		.or(policy.reasoning.requires_off_juice_instruction);
+	policy.tool.requires_skip_thought_signature = source
+		.requires_skip_thought_signature
+		.or(policy.tool.requires_skip_thought_signature);
+	policy.reasoning.requires_thinking_as_text = source
+		.requires_thinking_as_text
+		.or(policy.reasoning.requires_thinking_as_text);
+	policy.tool.requires_result_name = source
+		.requires_tool_result_name
+		.or(policy.tool.requires_result_name);
+	policy.tool.retry_without_strict_on_grammar_error = source
+		.retry_without_strict_on_grammar_error
+		.or(policy.tool.retry_without_strict_on_grammar_error);
+	if let Some(first_event_ms) = source.stream_first_event_timeout_ms {
+		let mut watchdog = policy.streaming.watchdog.unwrap_or_default();
+		watchdog.first_event_ms = Some(first_event_ms);
+		policy.streaming.watchdog = Some(watchdog);
+	}
+	policy.streaming.markup_healing_pattern = parse_policy(
+		source.stream_markup_healing_pattern.as_deref(),
+		policy.streaming.markup_healing_pattern,
+	)?;
+	policy.tool.strict_responses_pairing = source
+		.strict_responses_pairing
+		.or(policy.tool.strict_responses_pairing);
+	policy.streaming.strip_deepseek_special_tokens = source
+		.strip_deepseek_special_tokens
+		.or(policy.streaming.strip_deepseek_special_tokens);
+	policy.image.strip_input = source.strip_image_input.or(policy.image.strip_input);
+	policy.reasoning.supports_all_turns_context = source
+		.supports_all_turns_reasoning_context
+		.or(policy.reasoning.supports_all_turns_context);
+	policy.context.supports_management = source
+		.supports_context_management
+		.or(policy.context.supports_management);
+	policy.tool.supports_function_part_id = source
+		.supports_function_part_id
+		.or(policy.tool.supports_function_part_id);
+	policy.tool.supports_mid_conversation_changes = source
+		.supports_mid_conversation_tool_changes
+		.or(policy.tool.supports_mid_conversation_changes);
+	policy.streaming.supports_obfuscation_opt_out = source
+		.supports_obfuscation_opt_out
+		.or(policy.streaming.supports_obfuscation_opt_out);
+	policy.reasoning.supports_output_effort = source
+		.supports_output_effort
+		.or(policy.reasoning.supports_output_effort);
+	policy.tool.supports_parallel_calls = source
+		.supports_parallel_tool_calls
+		.or(policy.tool.supports_parallel_calls);
+	policy.structured.penalty_and_stop_params = source
+		.supports_penalty_and_stop_params
+		.or(policy.structured.penalty_and_stop_params);
+	policy.reasoning.supports_per_message_effort = source
+		.supports_per_message_effort
+		.or(policy.reasoning.supports_per_message_effort);
+	policy.cache.supports_breakpoints = source
+		.supports_prompt_cache_breakpoints
+		.or(policy.cache.supports_breakpoints);
+	policy.cache.supports_key = source
+		.supports_prompt_cache_key
+		.or(policy.cache.supports_key);
+	policy.reasoning.supports_params = source
+		.supports_reasoning_params
+		.or(policy.reasoning.supports_params);
+	policy.tool.supports_strict_mode = source
+		.supports_strict_mode
+		.or(policy.tool.supports_strict_mode);
+	policy.reasoning.supports_binding_controls = source
+		.supports_thinking_binding_controls
+		.or(policy.reasoning.supports_binding_controls);
+	policy.role.supports_turn_scoped_system = source
+		.supports_turn_scoped_system
+		.or(policy.role.supports_turn_scoped_system);
+	policy.reasoning.keep = source.thinking_keep.or(policy.reasoning.keep);
+	policy.reasoning.trust_explicit_only = source
+		.trust_explicit_thinking_only
+		.or(policy.reasoning.trust_explicit_only);
+	policy.tool.uses_openai_id_limit = source
+		.uses_openai_tool_call_id_limit
+		.or(policy.tool.uses_openai_id_limit);
+	policy.dialect.wire_model_id_mode =
+		parse_policy(source.wire_model_id_mode.as_deref(), policy.dialect.wire_model_id_mode)?;
+	policy.dialect.zai_reasoning_effort = source
+		.zai_reasoning_effort_dialect
+		.or(policy.dialect.zai_reasoning_effort);
 	Ok(policy)
 }
 
@@ -4113,6 +4422,8 @@ fn compile_thinking(
 			efforts,
 			default_level,
 			effort_budgets: BTreeMap::new(),
+			effort_map: BTreeMap::new(),
+			prefix_binding: None,
 			supports_display: None,
 			suppress_when_off: None,
 			requires_effort: (!has_off_route).then_some(true),
@@ -4126,6 +4437,8 @@ fn compile_thinking(
 			efforts:           source.efforts.clone(),
 			default_level:     source.default_level,
 			effort_budgets:    source.effort_budgets.clone(),
+			effort_map:        source.effort_map.clone(),
+			prefix_binding:    None,
 			supports_display:  None,
 			suppress_when_off: None,
 			requires_effort:   None,
@@ -4220,6 +4533,20 @@ fn compile_thinking(
 					.unwrap_or_else(|| base_wire.clone()),
 			),
 		);
+	}
+	if (tier_collapsed || provider == "cursor")
+		&& !routing.effort_routing.is_empty()
+		&& let Some(profile) = profile.as_mut()
+	{
+		profile
+			.efforts
+			.retain(|effort| routing.effort_routing.contains_key(effort));
+		if profile
+			.default_level
+			.is_some_and(|effort| !profile.efforts.contains(&effort))
+		{
+			profile.default_level = profile.efforts.first().copied();
+		}
 	}
 	if let Some(profile) = &profile {
 		routing
@@ -4808,7 +5135,7 @@ fn compile_pricing(
 			}
 		}
 	}
-	let authored_long_context = authored_long_context
+	let mut authored_long_context = authored_long_context
 		.map(|value| {
 			serde_json::from_value::<SourceLongContextCost>(value.clone()).map_err(|error| {
 				CompileError::Invariant(Str::from(format!(
@@ -4817,6 +5144,21 @@ fn compile_pricing(
 			})
 		})
 		.transpose()?;
+	if let Some(tier) = authored_long_context.as_mut()
+		&& let Some(multiplier) = tier.multiplier.as_ref()
+	{
+		let base_has_price = [&cost.input, &cost.output, &cost.cache_read, &cost.cache_write]
+			.into_iter()
+			.any(|price| price.as_f64().is_some_and(|price| price != 0.0));
+		if base_has_price {
+			tier.input = multiply_number(&cost.input, multiplier)?;
+			tier.output = multiply_number(&cost.output, multiplier)?;
+			tier.cache_read = multiply_number(&cost.cache_read, multiplier)?;
+			tier.cache_write = multiply_number(&cost.cache_write, multiplier)?;
+		} else {
+			authored_long_context = None;
+		}
+	}
 	let long_context = authored_long_context
 		.as_ref()
 		.or(cost.long_context.as_ref());
@@ -4840,6 +5182,15 @@ fn compile_pricing(
 	Pricing::new(components, tiers).map_err(|error| {
 		CompileError::Invariant(Str::from(format!("invalid pricing schedule: {error}")))
 	})
+}
+
+fn multiply_number(value: &Number, multiplier: &Number) -> Result<Number, CompileError> {
+	let product = value
+		.as_f64()
+		.zip(multiplier.as_f64())
+		.and_then(|(value, multiplier)| Number::from_f64(value * multiplier))
+		.ok_or(CompileError::InvalidPriceMultiplier)?;
+	Ok(product)
 }
 
 fn price_components(
@@ -5111,12 +5462,13 @@ fn compile_auth(
 }
 
 fn canonical_env_names(names: &[Str]) -> Result<Box<[Str]>, CompileError> {
-	for name in names {
-		if !name.starts_with("OMP_") {
-			return Err(CompileError::Invariant(Str::from(format!(
-				"credential environment variable `{name}` must use the OMP_ prefix"
-			))));
-		}
+	let Some(first) = names.first() else {
+		return Err(CompileError::Invariant(sf!("credential environment source must not be empty")));
+	};
+	if !first.starts_with("OMP_") {
+		return Err(CompileError::Invariant(sf!(
+			"credential environment source must lead with an OMP_* name"
+		)));
 	}
 	Ok(names.to_vec().into_boxed_slice())
 }
@@ -5260,6 +5612,229 @@ mod tests {
 		serde_json::from_value(value).expect("source model")
 	}
 
+	#[test]
+	fn every_new_wire_axis_reaches_typed_wire_policy() {
+		let cases = [
+			(
+				"allow_anthropic_header_overrides",
+				serde_json::json!(true),
+				"/headers/allow_anthropic_overrides",
+			),
+			("always_send_max_tokens", serde_json::json!(true), "/context/always_send_max_tokens"),
+			("antigravity_claude_tool_mode", serde_json::json!(true), "/tool/antigravity_claude_mode"),
+			("antigravity_usage_label", serde_json::json!("claude"), "/usage/antigravity_label"),
+			("cache_control_format", serde_json::json!("anthropic"), "/cache/control_format"),
+			(
+				"cca_legacy_parameters_schema",
+				serde_json::json!(true),
+				"/tool/cca_legacy_parameters_schema",
+			),
+			(
+				"clamp_output_to_model_max",
+				serde_json::json!(true),
+				"/context/clamp_output_to_model_max",
+			),
+			("claude_thinking_beta_header", serde_json::json!(true), "/headers/claude_thinking_beta"),
+			(
+				"disable_reasoning_on_forced_tool_choice",
+				serde_json::json!(true),
+				"/tool/disable_reasoning_on_forced_choice",
+			),
+			("disable_strict_tools", serde_json::json!(true), "/tool/disable_strict_tools"),
+			(
+				"drop_thinking_when_reasoning_effort",
+				serde_json::json!(true),
+				"/reasoning/drop_thinking_when_effort",
+			),
+			("drop_unsigned_thinking", serde_json::json!(true), "/reasoning/drop_unsigned"),
+			(
+				"empty_length_finish_is_context_error",
+				serde_json::json!(true),
+				"/streaming/empty_length_finish_is_context_error",
+			),
+			(
+				"flash_stream_leak_workaround",
+				serde_json::json!(true),
+				"/streaming/flash_leak_workaround",
+			),
+			("harmony_leak_mitigation", serde_json::json!(true), "/streaming/harmony_leak_mitigation"),
+			(
+				"inject_claude_code_instruction",
+				serde_json::json!(true),
+				"/role/inject_claude_code_instruction",
+			),
+			("kimi_api_format", serde_json::json!("openai"), "/dialect/kimi_api_format"),
+			("model_router", serde_json::json!(true), "/dialect/model_router"),
+			(
+				"multimodal_function_response",
+				serde_json::json!(true),
+				"/image/multimodal_function_response",
+			),
+			("native_kimi_k3_reasoning", serde_json::json!(true), "/reasoning/native_kimi_k3"),
+			("prompt_cache_breakpoint_ttl", serde_json::json!("30m"), "/cache/breakpoint_ttl"),
+			("prompt_cache_maximum_checkpoints", serde_json::json!(7), "/cache/maximum_checkpoints"),
+			("prompt_cache_minimum_tokens", serde_json::json!(7), "/cache/minimum_tokens"),
+			("prompt_cache_mode", serde_json::json!("none"), "/cache/prompt_cache_mode"),
+			(
+				"prompt_cache_session_header",
+				serde_json::json!("x-grok-conv-id"),
+				"/headers/prompt_cache_session",
+			),
+			("qwen_preserve_thinking", serde_json::json!(true), "/reasoning/qwen_preserve_thinking"),
+			(
+				"reasoning_deltas_may_be_cumulative",
+				serde_json::json!(true),
+				"/streaming/reasoning_deltas_cumulative",
+			),
+			("reject_root_object_union", serde_json::json!(true), "/tool/reject_root_object_union"),
+			("replay_reasoning_content", serde_json::json!(true), "/reasoning/replay_content"),
+			(
+				"requires_assistant_after_tool_result",
+				serde_json::json!(true),
+				"/tool/requires_assistant_after_result",
+			),
+			("requires_mistral_tool_ids", serde_json::json!(true), "/tool/requires_mistral_ids"),
+			(
+				"requires_reasoning_off_juice_instruction",
+				serde_json::json!(true),
+				"/reasoning/requires_off_juice_instruction",
+			),
+			(
+				"requires_skip_thought_signature",
+				serde_json::json!(true),
+				"/tool/requires_skip_thought_signature",
+			),
+			(
+				"requires_thinking_as_text",
+				serde_json::json!(true),
+				"/reasoning/requires_thinking_as_text",
+			),
+			("requires_tool_result_name", serde_json::json!(true), "/tool/requires_result_name"),
+			(
+				"retry_without_strict_on_grammar_error",
+				serde_json::json!(true),
+				"/tool/retry_without_strict_on_grammar_error",
+			),
+			(
+				"stream_first_event_timeout_ms",
+				serde_json::json!(7),
+				"/streaming/watchdog/first_event_ms",
+			),
+			(
+				"stream_markup_healing_pattern",
+				serde_json::json!("kimi"),
+				"/streaming/markup_healing_pattern",
+			),
+			("strict_responses_pairing", serde_json::json!(true), "/tool/strict_responses_pairing"),
+			(
+				"strip_deepseek_special_tokens",
+				serde_json::json!(true),
+				"/streaming/strip_deepseek_special_tokens",
+			),
+			("strip_image_input", serde_json::json!(true), "/image/strip_input"),
+			(
+				"supports_all_turns_reasoning_context",
+				serde_json::json!(true),
+				"/reasoning/supports_all_turns_context",
+			),
+			("supports_context_management", serde_json::json!(true), "/context/supports_management"),
+			("supports_function_part_id", serde_json::json!(true), "/tool/supports_function_part_id"),
+			(
+				"supports_long_prompt_cache_retention",
+				serde_json::json!(true),
+				"/cache/supports_long_retention",
+			),
+			(
+				"supports_mid_conversation_tool_changes",
+				serde_json::json!(true),
+				"/tool/supports_mid_conversation_changes",
+			),
+			(
+				"supports_multiple_system_messages",
+				serde_json::json!(true),
+				"/role/multiple_system_messages",
+			),
+			("supports_named_tool_choice", serde_json::json!(true), "/tool/named_choice"),
+			(
+				"supports_obfuscation_opt_out",
+				serde_json::json!(true),
+				"/streaming/supports_obfuscation_opt_out",
+			),
+			("supports_output_effort", serde_json::json!(true), "/reasoning/supports_output_effort"),
+			("supports_parallel_tool_calls", serde_json::json!(true), "/tool/supports_parallel_calls"),
+			(
+				"supports_penalty_and_stop_params",
+				serde_json::json!(true),
+				"/structured/penalty_and_stop_params",
+			),
+			(
+				"supports_per_message_effort",
+				serde_json::json!(true),
+				"/reasoning/supports_per_message_effort",
+			),
+			(
+				"supports_prompt_cache_breakpoints",
+				serde_json::json!(true),
+				"/cache/supports_breakpoints",
+			),
+			("supports_prompt_cache_key", serde_json::json!(true), "/cache/supports_key"),
+			("supports_reasoning_params", serde_json::json!(true), "/reasoning/supports_params"),
+			("supports_strict_mode", serde_json::json!(true), "/tool/supports_strict_mode"),
+			(
+				"supports_thinking_binding_controls",
+				serde_json::json!(true),
+				"/reasoning/supports_binding_controls",
+			),
+			(
+				"supports_turn_scoped_system",
+				serde_json::json!(true),
+				"/role/supports_turn_scoped_system",
+			),
+			("thinking_keep", serde_json::json!(true), "/reasoning/keep"),
+			("thinking_loop_guard", serde_json::json!("gemini"), "/reasoning/loop_guard_profile"),
+			("tool_schema_flavor", serde_json::json!("moonshot-mfjs"), "/tool/schema_flavor"),
+			("tool_strict_mode", serde_json::json!("all_strict"), "/tool/strict_mode"),
+			(
+				"trust_explicit_thinking_only",
+				serde_json::json!(true),
+				"/reasoning/trust_explicit_only",
+			),
+			("uses_openai_tool_call_id_limit", serde_json::json!(true), "/tool/uses_openai_id_limit"),
+			("wire_model_id_mode", serde_json::json!("raw"), "/dialect/wire_model_id_mode"),
+			("zai_reasoning_effort_dialect", serde_json::json!(true), "/dialect/zai_reasoning_effort"),
+		];
+		assert_eq!(cases.len(), 67);
+		for (resolved_key, value, pointer) in cases {
+			let source = axis_map_to_source_wire_policy(BTreeMap::from([(
+				Str::new(resolved_key),
+				value.clone(),
+			)]))
+			.expect("axis source compiles");
+			let policy = compile_wire_policy(WirePolicy::overrides(), &source)
+				.expect("typed wire policy compiles");
+			let encoded = serde_json::to_value(policy).expect("typed wire policy serializes");
+			assert_eq!(encoded.pointer(pointer), Some(&value), "{resolved_key} -> {pointer}");
+		}
+	}
+
+	#[test]
+	fn new_thinking_axes_reach_typed_thinking_policy() {
+		let effort_map = serde_json::json!({ "low": "low-native" });
+		let source = axis_map_to_thinking_policy(BTreeMap::from([
+			(sf!("mode"), serde_json::json!("effort")),
+			(sf!("efforts"), serde_json::json!([])),
+			(sf!("defaultLevel"), Value::Null),
+			(sf!("effortMap"), effort_map),
+			(sf!("prefixBinding"), serde_json::json!(true)),
+			(sf!("supportsDisplay"), Value::Null),
+			(sf!("suppressWhenOff"), Value::Null),
+			(sf!("requiresEffort"), Value::Null),
+		]))
+		.expect("thinking axes compile");
+		assert_eq!(source.effort_map.get(&ThinkingEffort::Low).map(Str::as_str), Some("low-native"));
+		assert_eq!(source.prefix_binding, Some(true));
+	}
+
 	fn classifications(
 		provider: &str,
 		rows: &BTreeMap<Str, SourceModelRecord>,
@@ -5350,6 +5925,15 @@ mod tests {
 		let mut stale = Some(ModelKey::from("cursor/stale"));
 		retarget_collapsed_model_reference(&mut stale, &live, &aliases);
 		assert_eq!(stale, Some(ModelKey::from("cursor/stale")));
+	}
+
+	#[test]
+	fn credential_environment_names_require_only_the_leading_name_to_be_omp_prefixed() {
+		let names = canonical_env_names(&[sf!("OMP_ANTHROPIC_API_KEY"), sf!("ANTHROPIC_API_KEY")])
+			.expect("vendor fallback after canonical name");
+		assert_eq!(names.as_ref(), &[sf!("OMP_ANTHROPIC_API_KEY"), sf!("ANTHROPIC_API_KEY")]);
+		assert!(canonical_env_names(&[]).is_err());
+		assert!(canonical_env_names(&[sf!("ANTHROPIC_API_KEY")]).is_err());
 	}
 
 	#[test]
@@ -5642,6 +6226,11 @@ facets = ["chat"]
 				_ => None,
 			})
 			.expect("Anthropic API-key environment");
+		assert_eq!(api_key_names.as_ref(), &[
+			sf!("OMP_ANTHROPIC_API_KEY"),
+			sf!("OMP_ANTHROPIC_FOUNDRY_API_KEY"),
+			sf!("ANTHROPIC_API_KEY"),
+		]);
 		assert!(
 			!api_key_names
 				.iter()

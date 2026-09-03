@@ -10,7 +10,7 @@ use std::{
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use strum::{Display, EnumString, IntoStaticStr};
+use strum::{Display, EnumString, IntoStaticStr, VariantNames};
 
 use crate::{
 	id::{ThinkingPolicyId, WireModelId},
@@ -32,6 +32,7 @@ use crate::{
 	PartialOrd,
 	Serialize,
 	Deserialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -186,6 +187,12 @@ pub struct ThinkingPolicy {
 	/// Per-effort thinking token budgets.
 	#[serde(default)]
 	pub effort_budgets:    BTreeMap<ThinkingEffort, u64>,
+	/// Per-effort native control spellings.
+	#[serde(default)]
+	pub effort_map:        BTreeMap<ThinkingEffort, Str>,
+	/// Whether signed thinking binds to the exact preceding prefix.
+	#[serde(default)]
+	pub prefix_binding:    Option<bool>,
 	/// Whether adaptive-thinking display controls are supported.
 	pub supports_display:  Option<bool>,
 	/// Whether disabling reasoning must be explicit on the wire.
@@ -205,6 +212,8 @@ impl ThinkingPolicy {
 			efforts: efforts.into_iter().collect(),
 			default_level: None,
 			effort_budgets: BTreeMap::new(),
+			effort_map: BTreeMap::new(),
+			prefix_binding: None,
 			supports_display: None,
 			suppress_when_off: None,
 			requires_effort: None,

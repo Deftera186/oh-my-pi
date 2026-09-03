@@ -212,6 +212,8 @@ struct DiscoveryVocabulary {
 	responses_route_models:   BTreeMap<Str, Box<[Str]>>,
 	/// Billing-variant suffixes sharing a transport with their base id.
 	billing_variant_suffixes: Vec<Str>,
+	/// Base ids whose generated `-pro` selectors are reasoning aliases.
+	pro_reasoning_aliases:    BTreeMap<Str, Box<[Str]>>,
 }
 
 /// One reviewed seed for provider-scoped dynamic effort-sibling collapse.
@@ -232,6 +234,7 @@ struct EffortFamily {
 pub struct Taxonomy {
 	classes:          Vec<ClassDef>,
 	collapse:         Vec<SuffixDef>,
+	pair_tokens:      Vec<Str>,
 	lanes:            Vec<EffortLaneSuffix>,
 	effort_families:  Vec<EffortFamily>,
 	routing_variants: Vec<RoutingVariantSuffix>,
@@ -279,6 +282,7 @@ impl Taxonomy {
 	pub fn parse(sources: &[(&str, &str)]) -> Result<Self, CascadeError> {
 		let mut classes = Vec::new();
 		let mut collapse = Vec::new();
+		let mut pair_tokens = Vec::new();
 		let mut lanes = Vec::new();
 		let mut effort_families = Vec::new();
 		let mut routing_variants = Vec::new();
@@ -327,7 +331,7 @@ impl Taxonomy {
 							return malformed(file, "collapse");
 						}
 						saw_collapse = true;
-						(collapse, lanes, routing_variants) = parse_collapse(file, node)?;
+						(collapse, pair_tokens, lanes, routing_variants) = parse_collapse(file, node)?;
 						effort_families = parse_effort_families(file, node)?;
 					},
 					"discovery" => {
@@ -344,7 +348,15 @@ impl Taxonomy {
 		if !saw_collapse || collapse.is_empty() {
 			return malformed("taxonomy", "collapse");
 		}
-		Ok(Self { classes, collapse, lanes, effort_families, routing_variants, discovery })
+		Ok(Self {
+			classes,
+			collapse,
+			pair_tokens,
+			lanes,
+			effort_families,
+			routing_variants,
+			discovery,
+		})
 	}
 
 	/// Returns the full responses-route hint group containing `provider` —
@@ -487,6 +499,36 @@ impl Taxonomy {
 			})
 	}
 
+	/// Removes the first declared bounded thinking-pair token.
+	#[must_use]
+	pub fn strip_thinking_variant_suffix<'a>(&self, model: &'a str) -> Option<Cow<'a, str>> {
+		let lower = model.to_ascii_lowercase();
+		for token in &self.pair_tokens {
+			let needle = format!("-{token}");
+			let mut search_from = 0;
+			while let Some(relative) = lower[search_from..].find(&needle) {
+				let index = search_from + relative;
+				let end = index + needle.len();
+				let next_is_token = lower
+					.as_bytes()
+					.get(end)
+					.is_some_and(u8::is_ascii_alphanumeric);
+				let word_start = lower[..index]
+					.rfind(|character: char| !character.is_ascii_alphanumeric())
+					.map_or(0, |position| position + 1);
+				let preceding = &lower[word_start..index];
+				if !next_is_token && !matches!(preceding, "no" | "non") {
+					let mut stripped = String::with_capacity(model.len() - needle.len());
+					stripped.push_str(&model[..index]);
+					stripped.push_str(&model[end..]);
+					return (!stripped.is_empty()).then_some(Cow::Owned(stripped));
+				}
+				search_from = index + 1;
+			}
+		}
+		None
+	}
+
 	/// Collapses a declared thinking or effort suffix from a model identifier.
 	///
 	/// An exact member alias declared by `effort-family` collapses to that
@@ -503,14 +545,11 @@ impl Taxonomy {
 		model: &'a str,
 	) -> (Cow<'a, str>, Option<EffortTier>, bool) {
 		let lower = model.to_ascii_lowercase();
-		if let Some(family) = self.effort_families.iter().find(|family| {
-			family.provider.eq_ignore_ascii_case(provider)
-				&& family
-					.aliases
-					.iter()
-					.any(|alias| alias.as_str() == lower.as_str())
-		}) {
-			return (Cow::Borrowed(family.logical.as_str()), None, false);
+		if let Some(bases) = self.discovery.pro_reasoning_aliases.get(provider)
+			&& let Some(base) = lower.strip_suffix("-pro")
+			&& bases.iter().any(|candidate| candidate.as_str() == base)
+		{
+			return (Cow::Owned(model[..model.len() - 4].to_owned()), None, true);
 		}
 		let bare = lower.rsplit('/').next().unwrap_or(lower.as_str());
 		let winner = self
@@ -570,6 +609,15 @@ impl Taxonomy {
 				// Preserve the caller's original lane bytes on the logical id.
 				return (Cow::Owned(format!("{base}{}", &model[trimmed.len()..])), rule.effort, false);
 			}
+		}
+		if let Some(family) = self.effort_families.iter().find(|family| {
+			family.provider.eq_ignore_ascii_case(provider)
+				&& family
+					.aliases
+					.iter()
+					.any(|alias| alias.as_str() == lower.as_str())
+		}) {
+			return (Cow::Borrowed(family.logical.as_str()), None, false);
 		}
 		(Cow::Borrowed(model), None, false)
 	}
@@ -892,7 +940,10 @@ fn parse_override(file: &str, node: &KdlNode) -> Result<IdentityOverride, Cascad
 fn parse_collapse(
 	file: &str,
 	node: &KdlNode,
-) -> Result<(Vec<SuffixDef>, Vec<EffortLaneSuffix>, Vec<RoutingVariantSuffix>), CascadeError> {
+) -> Result<
+	(Vec<SuffixDef>, Vec<Str>, Vec<EffortLaneSuffix>, Vec<RoutingVariantSuffix>),
+	CascadeError,
+> {
 	validate_properties(file, node, "collapse", &[])?;
 	if !positional_strings(node).is_empty() {
 		return malformed(file, "collapse");
@@ -901,6 +952,7 @@ fn parse_collapse(
 		return malformed(file, "collapse");
 	};
 	let mut rules = Vec::new();
+	let mut pair_tokens = Vec::new();
 	let mut lanes = Vec::new();
 	let mut routing_variants = Vec::new();
 	let mut suffixes = BTreeSet::new();
@@ -909,9 +961,12 @@ fn parse_collapse(
 		if !matches!(
 			directive,
 			"thinking-suffix"
+				| "pair-token"
 				| "effort-suffix"
 				| "effort-lane-suffix"
 				| "effort-family"
+				| "variant-family"
+				| "provider-alias"
 				| "routing-variant-suffix"
 		) {
 			return unexpected(file, directive, "collapse");
@@ -919,6 +974,7 @@ fn parse_collapse(
 		let allowed = match directive {
 			"effort-suffix" => &["tier", "except-bare-prefix"][..],
 			"effort-lane-suffix" => &["bare-prefix"][..],
+			"variant-family" => &["name"][..],
 			_ => &[][..],
 		};
 		validate_properties(file, child, directive, allowed)?;
@@ -931,7 +987,27 @@ fn parse_collapse(
 			return malformed(file, directive);
 		}
 		let arguments = positional_strings(child);
-		if directive == "effort-family" {
+		if matches!(directive, "effort-family" | "variant-family" | "provider-alias") {
+			continue;
+		}
+		if directive == "pair-token" {
+			if arguments.is_empty()
+				|| arguments.iter().any(String::is_empty)
+				|| child.children().is_some()
+			{
+				return malformed(file, directive);
+			}
+			for token in arguments {
+				let token = token.to_ascii_lowercase();
+				if !token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+					|| pair_tokens
+						.iter()
+						.any(|existing: &Str| existing.as_str() == token)
+				{
+					return malformed(file, directive);
+				}
+				pair_tokens.push(token.to_str());
+			}
 			continue;
 		}
 		if directive == "routing-variant-suffix" {
@@ -1011,49 +1087,129 @@ fn parse_collapse(
 				.map(|value| value.to_ascii_lowercase().to_str()),
 		});
 	}
-	Ok((rules, lanes, routing_variants))
+	Ok((rules, pair_tokens, lanes, routing_variants))
 }
 fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>, CascadeError> {
 	let Some(children) = node.children() else {
 		return malformed(file, "collapse");
 	};
 	let mut families = Vec::new();
+	let mut aliases = Vec::new();
 	let mut unique = BTreeSet::new();
 	let mut unique_aliases = BTreeSet::new();
-	for child in children
-		.nodes()
-		.iter()
-		.filter(|child| child.name().value() == "effort-family")
-	{
-		validate_properties(file, child, "effort-family", &[])?;
-		let arguments = positional_strings(child);
-		let [provider, logical, aliases @ ..] = arguments.as_slice() else {
-			return malformed(file, "effort-family");
+	for child in children.nodes() {
+		let directive = child.name().value();
+		if directive == "provider-alias" {
+			validate_properties(file, child, directive, &[])?;
+			let arguments = positional_strings(child);
+			let [provider, alias, logical] = arguments.as_slice() else {
+				return malformed(file, directive);
+			};
+			if provider.is_empty()
+				|| alias.is_empty()
+				|| logical.is_empty()
+				|| child.children().is_some()
+			{
+				return malformed(file, directive);
+			}
+			aliases.push((
+				provider.to_ascii_lowercase(),
+				alias.to_ascii_lowercase(),
+				logical.to_ascii_lowercase(),
+			));
+			continue;
+		}
+		if !matches!(directive, "effort-family" | "variant-family") {
+			continue;
+		}
+		let (provider, logical, family_aliases) = if directive == "effort-family" {
+			validate_properties(file, child, directive, &[])?;
+			let arguments = positional_strings(child);
+			let [provider, logical, family_aliases @ ..] = arguments.as_slice() else {
+				return malformed(file, directive);
+			};
+			if child.children().is_some() {
+				return malformed(file, directive);
+			}
+			(
+				provider.to_ascii_lowercase(),
+				logical.to_ascii_lowercase(),
+				family_aliases
+					.iter()
+					.map(|alias| alias.to_ascii_lowercase())
+					.collect::<Vec<_>>(),
+			)
+		} else {
+			validate_properties(file, child, directive, &["name"])?;
+			let arguments = positional_strings(child);
+			let [provider, logical] = arguments.as_slice() else {
+				return malformed(file, directive);
+			};
+			let Some(body) = child.children() else {
+				return malformed(file, directive);
+			};
+			let Some(members) = body
+				.nodes()
+				.iter()
+				.find(|node| node.name().value() == "members")
+			else {
+				return malformed(file, directive);
+			};
+			let family_aliases = positional_strings(members)
+				.into_iter()
+				.map(|alias| alias.to_ascii_lowercase())
+				.collect::<Vec<_>>();
+			(provider.to_ascii_lowercase(), logical.to_ascii_lowercase(), family_aliases)
 		};
-		let provider = provider.to_ascii_lowercase();
-		let logical = logical.to_ascii_lowercase();
-		let aliases = aliases
-			.iter()
-			.map(|alias| alias.to_ascii_lowercase())
+		let family_aliases = family_aliases
+			.into_iter()
+			.filter(|alias| alias != &logical)
 			.collect::<Vec<_>>();
+		if let Some(existing) = families.iter_mut().find(|family: &&mut EffortFamily| {
+			family.provider.eq_ignore_ascii_case(&provider) && family.logical.as_str() == logical
+		}) {
+			let mut merged = existing.aliases.to_vec();
+			for alias in family_aliases {
+				if !merged.iter().any(|value| value.as_str() == alias) {
+					unique_aliases.insert((provider.clone(), alias.clone()));
+					merged.push(alias.to_str());
+				}
+			}
+			existing.aliases = merged.into_boxed_slice();
+			continue;
+		}
 		if provider.is_empty()
 			|| logical.is_empty()
 			|| unique_aliases.contains(&(provider.clone(), logical.clone()))
-			|| aliases.iter().any(|alias| {
+			|| family_aliases.iter().any(|alias| {
 				alias.is_empty()
-					|| alias == &logical
 					|| unique.contains(&(provider.clone(), alias.clone()))
 					|| !unique_aliases.insert((provider.clone(), alias.clone()))
-			}) || child.children().is_some()
-			|| !unique.insert((provider.clone(), logical.clone()))
+			}) || !unique.insert((provider.clone(), logical.clone()))
 		{
-			return malformed(file, "effort-family");
+			return malformed(file, directive);
 		}
 		families.push(EffortFamily {
 			provider: ProviderId::new(provider),
 			logical:  logical.to_str(),
-			aliases:  aliases.into_iter().map(Str::new).collect(),
+			aliases:  family_aliases.into_iter().map(Str::new).collect(),
 		});
+	}
+	for (provider, alias, logical) in aliases {
+		let Some(family) = families.iter_mut().find(|family| {
+			family.provider.eq_ignore_ascii_case(&provider) && family.logical.as_str() == logical
+		}) else {
+			return malformed(file, "provider-alias");
+		};
+		if alias == logical
+			|| unique.contains(&(provider.clone(), alias.clone()))
+			|| !unique_aliases.insert((provider, alias.clone()))
+		{
+			return malformed(file, "provider-alias");
+		}
+		let mut merged = family.aliases.to_vec();
+		merged.push(alias.to_str());
+		family.aliases = merged.into_boxed_slice();
 	}
 	Ok(families)
 }
@@ -1150,6 +1306,32 @@ fn parse_discovery(file: &str, node: &KdlNode) -> Result<DiscoveryVocabulary, Ca
 					vocabulary.billing_variant_suffixes.push(suffix.to_str());
 				}
 			},
+			"pro-reasoning-alias" => {
+				let [provider, models @ ..] = arguments.as_slice() else {
+					return malformed(file, directive);
+				};
+				if models.is_empty() {
+					return malformed(file, directive);
+				}
+				let provider = provider.to_ascii_lowercase().to_str();
+				let models = models
+					.iter()
+					.map(|model| model.to_ascii_lowercase().to_str())
+					.collect::<Box<[_]>>();
+				if vocabulary
+					.pro_reasoning_aliases
+					.insert(provider, models)
+					.is_some()
+				{
+					return malformed(file, directive);
+				}
+			},
+			"pro-reasoning-sweep"
+			| "canonical-family-token"
+			| "wrapper-prefix"
+			| "synthetic-prefix"
+			| "trailing-marker"
+			| "reference-only-trailing-marker" => {},
 			other => return unexpected(file, other, "discovery"),
 		}
 	}
@@ -1694,15 +1876,15 @@ mod tests {
 		// service-tier lane; batch safety decides which candidate groups
 		// actually collapse.
 		let taxonomy = taxonomy();
-		assert_eq!(
-			taxonomy
-				.effort_families
-				.iter()
-				.filter(|family| family.provider == "cursor")
-				.map(|family| family.logical.as_str())
-				.collect::<Vec<_>>(),
-			["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
-		);
+		let cursor_families = taxonomy
+			.effort_families
+			.iter()
+			.filter(|family| family.provider == "cursor")
+			.map(|family| family.logical.as_str())
+			.collect::<Vec<_>>();
+		for expected in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+			assert!(cursor_families.contains(&expected), "missing Cursor family {expected}");
+		}
 		assert_eq!(
 			taxonomy.collapse("cursor", "cursor-grok-4.6-medium-fast"),
 			(Cow::Owned::<str>("cursor-grok-4.6-fast".into()), Some(EffortTier::Medium), false)

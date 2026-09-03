@@ -3,6 +3,12 @@
 //! The macros provide one callback-style row source so all consumers expand the
 //! same canonical list and cannot drift.
 
+use core::{fmt, str::FromStr};
+
+use omp_core::Str;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use strum::{Display, EnumString, IntoStaticStr, VariantArray};
+
 /// Invokes `$callback!` with every well-known property row.
 ///
 /// Grammar mirrors `define_props!`:
@@ -46,6 +52,8 @@ macro_rules! for_each_prop {
 			Title("title") => title: Str [ref Str; "Returns the user-facing component title."];
 			/// Horizontal placement of the border title.
 			TitleAlign("title-align") => title_align: Align [default Align = Align::Start; "Returns the border-title placement, defaulting to the start edge."];
+			/// Horizontal rule cells retained before a start-aligned border title.
+			TitlePad("title-pad") => title_pad: u16 [default u16 = 1; "Returns the requested rule count before a start-aligned border title."];
 			/// Display footer on a framed container's bottom edge.
 			Footer("footer") => footer: Str [ref Str; "Returns the footer shown on a framed container's bottom border."];
 			/// Horizontal placement of the border footer.
@@ -259,4 +267,374 @@ macro_rules! for_each_component {
 			wizard => Wizard;
 		}
 	};
+}
+
+/// Closed, structural element names in the session tree.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	VariantArray,
+)]
+#[strum(serialize_all = "kebab-case")]
+pub enum KnownTag {
+	/// Session document root.
+	Session,
+	/// Journal-derived durable state.
+	Meta,
+	/// Transcript body.
+	Body,
+	/// Controller input queues.
+	Queues,
+	/// Todo component.
+	Todo,
+	/// One todo item.
+	Item,
+	/// Background work component.
+	Jobs,
+	/// One background job.
+	Job,
+	/// Director stack component.
+	Directors,
+	/// One engaged director.
+	Director,
+	/// Console-variable component.
+	Con,
+	/// One console variable.
+	Var,
+	/// Compaction boundary and summary state.
+	Compaction,
+	/// Explicit turn container.
+	Turn,
+	/// User message.
+	User,
+	/// Assistant message.
+	Assistant,
+	/// Developer message.
+	Developer,
+	/// Journaled notice.
+	Notice,
+	/// Steering queue.
+	Steering,
+	/// Deferred prompts queue.
+	Prompts,
+	/// One deferred prompt.
+	Prompt,
+	/// One child agent.
+	Subagent,
+	/// Tool input.
+	Input,
+	/// Tool result.
+	Result,
+	/// Tool diagnostic.
+	Diag,
+	/// Usage accounting.
+	Usage,
+}
+
+impl KnownTag {
+	/// Every structural tag in stable declaration order.
+	pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+}
+
+/// A session-tree element name.
+///
+/// Built-in structural names are closed in [`KnownTag`]. Tool names use the
+/// custom form so adding a tool does not expand the structural vocabulary.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Tag {
+	/// A structural element.
+	Known(KnownTag),
+	/// A tool-name element.
+	Custom(Str),
+}
+
+impl Tag {
+	/// Returns the markup name.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Known(tag) => <&'static str>::from(*tag),
+			Self::Custom(name) => name.as_str(),
+		}
+	}
+}
+
+impl From<KnownTag> for Tag {
+	fn from(value: KnownTag) -> Self {
+		Self::Known(value)
+	}
+}
+
+impl FromStr for Tag {
+	type Err = core::convert::Infallible;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		if let Some(name) = value.strip_prefix("tool:") {
+			return Ok(Self::Custom(Str::new(name)));
+		}
+		Ok(KnownTag::from_str(value)
+			.map(Self::Known)
+			.unwrap_or_else(|_| Self::Custom(Str::new(value))))
+	}
+}
+
+impl fmt::Display for Tag {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.as_str())
+	}
+}
+
+impl Serialize for Tag {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		match self {
+			Self::Known(tag) => serializer.serialize_str(<&'static str>::from(*tag)),
+			Self::Custom(name) => {
+				serializer.collect_str(&SerializedCustom { prefix: "tool:", name: name.as_str() })
+			},
+		}
+	}
+}
+
+impl<'de> Deserialize<'de> for Tag {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let value = Str::deserialize(deserializer)?;
+		Tag::from_str(value.as_str()).map_err(de::Error::custom)
+	}
+}
+
+/// Closed, well-known session-tree property names.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	VariantArray,
+)]
+#[strum(serialize_all = "kebab-case")]
+pub enum PropId {
+	/// Stable journal or tool identity.
+	Id,
+	/// Lifecycle status.
+	Status,
+	/// Schema revision.
+	Rev,
+	/// Model-facing tool intent.
+	I,
+	/// Diagnostic severity.
+	Severity,
+	/// Model identity.
+	Model,
+	/// Provider identity.
+	Provider,
+	/// Resolved route identity.
+	Route,
+	/// Inference stop reason.
+	StopReason,
+	/// Text content.
+	Text,
+	/// Model thinking content.
+	Thinking,
+	/// Name or key.
+	Name,
+	/// Semantic kind.
+	Kind,
+	/// Whether an element is engaged.
+	Engaged,
+	/// Stream identifier.
+	Sid,
+	/// Filesystem or resource path.
+	Path,
+	/// Line range or count.
+	Lines,
+	/// Journal entry that caused the node.
+	Cause,
+	/// Tool arguments.
+	Args,
+	/// Tool outcome.
+	Outcome,
+	/// Tool fault.
+	Fault,
+	/// Structured update data.
+	Data,
+	/// Tool call identifier.
+	CallId,
+	/// Input token count.
+	TokensIn,
+	/// Output token count.
+	TokensOut,
+	/// Cost in nano-US dollars.
+	CostNanoUsd,
+	/// Compaction boundary.
+	Boundary,
+	/// Content-addressed summary.
+	Summary,
+	/// Turn ordinal.
+	Turn,
+	/// Element ordinal.
+	Order,
+	/// Active tool revision.
+	Revision,
+	/// Human-readable detail.
+	Detail,
+	/// Whether work is live.
+	Live,
+	/// Result byte count.
+	Bytes,
+	/// Process exit code.
+	Exit,
+	/// Terminating signal.
+	Signal,
+	/// Operation name.
+	Op,
+	/// Tool or job deadline.
+	Until,
+	/// Selector text.
+	Selector,
+	/// Literal value.
+	Value,
+	/// Display label.
+	Label,
+	/// Usage node handle.
+	Usage,
+	/// MIME type.
+	Mime,
+	/// Content-addressed blob.
+	Blob,
+	/// Whether data was truncated.
+	Truncated,
+	/// Full-result recovery address.
+	Recovery,
+}
+
+impl PropId {
+	/// Every well-known property in stable declaration order.
+	pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+}
+
+/// A property key, closed for engine semantics and extensible for tool data.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PropKey {
+	/// A well-known engine property.
+	Known(PropId),
+	/// A tool-defined property.
+	Custom(Str),
+}
+
+impl PropKey {
+	/// Returns the logical property name without the custom wire prefix.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Known(prop) => <&'static str>::from(*prop),
+			Self::Custom(name) => name.as_str(),
+		}
+	}
+}
+
+impl From<PropId> for PropKey {
+	fn from(value: PropId) -> Self {
+		Self::Known(value)
+	}
+}
+
+impl FromStr for PropKey {
+	type Err = core::convert::Infallible;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		if let Some(name) = value.strip_prefix("custom:") {
+			return Ok(Self::Custom(Str::new(name)));
+		}
+		Ok(PropId::from_str(value)
+			.map(Self::Known)
+			.unwrap_or_else(|_| Self::Custom(Str::new(value))))
+	}
+}
+
+impl fmt::Display for PropKey {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.as_str())
+	}
+}
+
+impl Serialize for PropKey {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		match self {
+			Self::Known(prop) => serializer.serialize_str(<&'static str>::from(*prop)),
+			Self::Custom(name) => {
+				serializer.collect_str(&SerializedCustom { prefix: "custom:", name: name.as_str() })
+			},
+		}
+	}
+}
+
+struct SerializedCustom<'a> {
+	prefix: &'static str,
+	name:   &'a str,
+}
+
+impl fmt::Display for SerializedCustom<'_> {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.prefix)?;
+		formatter.write_str(self.name)
+	}
+}
+
+impl<'de> Deserialize<'de> for PropKey {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let value = Str::deserialize(deserializer)?;
+		PropKey::from_str(value.as_str()).map_err(de::Error::custom)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use core::str::FromStr as _;
+
+	use super::{KnownTag, PropId};
+
+	#[test]
+	fn known_tags_round_trip_through_strum() {
+		for &tag in KnownTag::ALL {
+			let name = <&'static str>::from(tag);
+			assert_eq!(KnownTag::from_str(name), Ok(tag));
+			assert_eq!(tag.to_string(), name);
+		}
+	}
+
+	#[test]
+	fn known_properties_round_trip_through_strum() {
+		for &prop in PropId::ALL {
+			let name = <&'static str>::from(prop);
+			assert_eq!(PropId::from_str(name), Ok(prop));
+			assert_eq!(prop.to_string(), name);
+		}
+	}
 }

@@ -9,12 +9,10 @@ use std::{
 	time::Duration,
 };
 
+use omp_con::{Ctx, Kv, Value};
 use omp_core::Str;
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString, IntoStaticStr};
+use strum::{Display, EnumString, IntoStaticStr, VariantNames};
 
 use crate::{
 	capability::{ProviderFamily, ServiceTier, TierAudience},
@@ -22,8 +20,6 @@ use crate::{
 	provider::TransportKind,
 	thinking::{ThinkingEffort, ThinkingPolicy},
 };
-
-const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 
 /// Token budgets associated with portable reasoning effort levels.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,8 +68,21 @@ impl ThinkingBudgets {
 }
 
 /// Portable service-tier selection persisted without provider credentials.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+	Clone,
+	Debug,
+	Default,
+	Deserialize,
+	Display,
+	EnumString,
+	Eq,
+	IntoStaticStr,
+	PartialEq,
+	Serialize,
+	VariantNames,
+)]
 #[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
 pub enum TierSetting {
 	/// Omit a service tier.
 	#[default]
@@ -118,6 +127,7 @@ impl TierSetting {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -148,6 +158,7 @@ pub enum OpenRouterVariant {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -174,6 +185,7 @@ pub enum WireToggle {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -200,6 +212,7 @@ pub enum KimiApiFormat {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -228,6 +241,7 @@ pub enum CacheRetentionSetting {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -238,6 +252,14 @@ pub enum ModelRoleStorage {
 	/// Persist role assignments in project settings with global fallback.
 	Project,
 }
+
+omp_con::con_enum!(ThinkingEffort);
+omp_con::con_enum!(TierSetting);
+omp_con::con_enum!(OpenRouterVariant);
+omp_con::con_enum!(WireToggle);
+omp_con::con_enum!(KimiApiFormat);
+omp_con::con_enum!(CacheRetentionSetting);
+omp_con::con_enum!(ModelRoleStorage);
 
 /// Presentation metadata for one configured model role.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -396,6 +418,37 @@ impl Default for ModelSettings {
 }
 
 impl ModelSettings {
+	/// Projects model and provider policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			roles:                    roles_from_kv(AI_MODEL_ROLES.get(ctx)),
+			role_storage:             AI_MODEL_ROLE_STORAGE.get(ctx),
+			tags:                     tags_from_kv(AI_MODEL_TAGS.get(ctx)),
+			cycle_order:              AI_MODEL_CYCLE_ORDER.get(ctx).into(),
+			enabled_models:           path_scoped_from_kv(AI_MODEL_ENABLED_MODELS.get(ctx)),
+			disabled_providers:       path_scoped_from_kv(AI_MODEL_DISABLED_PROVIDERS.get(ctx)),
+			default_thinking:         AI_DEFAULT_THINKING.get(ctx),
+			thinking_ceiling:         AI_THINKING_CEILING.get(ctx),
+			thinking_budgets:         thinking_budgets_from_kv(AI_THINKING_BUDGETS.get(ctx)),
+			provider_order:           AI_PROVIDER_ORDER.get(ctx).into(),
+			tier_openai:              AI_TIER_OPENAI.get(ctx),
+			tier_anthropic:           AI_TIER_ANTHROPIC.get(ctx),
+			tier_google:              AI_TIER_GOOGLE.get(ctx),
+			tier_fireworks:           AI_TIER_FIREWORKS.get(ctx),
+			tier_subagent:            AI_TIER_SUBAGENT.get(ctx),
+			tier_advisor:             AI_TIER_ADVISOR.get(ctx),
+			cache_retention:          AI_CACHE_RETENTION.get(ctx),
+			openai_websockets:        AI_OPENAI_WEBSOCKETS.get(ctx),
+			openrouter_variant:       AI_OPENROUTER_VARIANT.get(ctx),
+			kimi_api_format:          AI_KIMI_API_FORMAT.get(ctx),
+			tiny_selector:            AI_TINY_SELECTOR.get(ctx),
+			memory_selector:          AI_MEMORY_SELECTOR.get(ctx),
+			auto_thinking_selector:   AI_AUTO_THINKING_SELECTOR.get(ctx),
+			unexpected_stop_selector: AI_UNEXPECTED_STOP_SELECTOR.get(ctx),
+		}
+	}
+
 	/// Applies configured effort budgets and the configured default to one model
 	/// policy.
 	pub fn apply_thinking_policy(&self, policy: &mut ThinkingPolicy) {
@@ -650,101 +703,10 @@ pub enum SpecialModelPurpose {
 	UnexpectedStop,
 }
 
-impl SettingsDomain for ModelSettings {
-	const DOMAIN: &'static str = "model";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		field("model.roles", "Model Roles", SettingKind::Table, 1),
-		field(
-			"model.role_storage",
-			"Model Role Storage",
-			SettingKind::Enum(&["global", "project"]),
-			2,
-		),
-		field("model.tags", "Model Role Tags", SettingKind::Table, 3),
-		field("model.cycle_order", "Model Cycle Order", SettingKind::Array, 4),
-		field("model.enabled_models", "Enabled Models", SettingKind::Array, 5),
-		field("model.disabled_providers", "Disabled Providers", SettingKind::Array, 6),
-		field(
-			"model.default_thinking",
-			"Default Thinking",
-			SettingKind::Enum(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
-			10,
-		),
-		field(
-			"model.thinking_ceiling",
-			"Thinking Ceiling",
-			SettingKind::Enum(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
-			20,
-		),
-		field("model.thinking_budgets", "Thinking Budgets", SettingKind::Table, 30),
-		field("model.provider_order", "Provider Priority", SettingKind::Array, 40),
-		field(
-			"model.tier_openai",
-			"OpenAI Tier",
-			SettingKind::Enum(&["none", "standard", "flex", "priority"]),
-			50,
-		),
-		field(
-			"model.tier_anthropic",
-			"Anthropic Tier",
-			SettingKind::Enum(&["none", "standard", "priority"]),
-			60,
-		),
-		field(
-			"model.tier_google",
-			"Google Tier",
-			SettingKind::Enum(&["none", "standard", "priority"]),
-			70,
-		),
-		field(
-			"model.tier_fireworks",
-			"Fireworks Tier",
-			SettingKind::Enum(&["none", "standard", "priority"]),
-			80,
-		),
-		field(
-			"model.tier_subagent",
-			"Subagent Tier",
-			SettingKind::Enum(&["none", "inherit", "standard", "flex", "priority"]),
-			90,
-		),
-		field(
-			"model.tier_advisor",
-			"Advisor Tier",
-			SettingKind::Enum(&["none", "inherit", "standard", "flex", "priority"]),
-			100,
-		),
-		field(
-			"model.cache_retention",
-			"Cache Retention",
-			SettingKind::Enum(&["auto", "none", "short", "long"]),
-			100,
-		),
-		field(
-			"model.openai_websockets",
-			"OpenAI WebSockets",
-			SettingKind::Enum(&["auto", "off", "on"]),
-			110,
-		),
-		field(
-			"model.openrouter_variant",
-			"OpenRouter Variant",
-			SettingKind::Enum(&["default", "nitro", "floor", "online", "exacto"]),
-			120,
-		),
-		field(
-			"model.kimi_api_format",
-			"Kimi API Format",
-			SettingKind::Enum(&["auto", "openai", "anthropic"]),
-			130,
-		),
-		field("model.tiny_selector", "Tiny Model", SettingKind::String, 140),
-		field("model.memory_selector", "Memory Model", SettingKind::String, 150),
-		field("model.auto_thinking_selector", "Auto-Thinking Model", SettingKind::String, 160),
-		field("model.unexpected_stop_selector", "Unexpected-Stop Model", SettingKind::String, 170),
-	];
-
-	fn validate(&self) -> Result<(), ValidationError> {
+impl ModelSettings {
+	/// Reports whether all cross-variable model policy invariants hold.
+	#[must_use]
+	pub fn validate(&self) -> bool {
 		let budgets = self.thinking_budgets;
 		let ordered =
 			[budgets.minimal, budgets.low, budgets.medium, budgets.high, budgets.xhigh, budgets.max];
@@ -768,36 +730,12 @@ impl SettingsDomain for ModelSettings {
 			.tags
 			.iter()
 			.all(|(role, tag)| !role.trim().is_empty() && !tag.name.trim().is_empty());
-		if ordered.iter().all(|value| *value > 0)
+		ordered.iter().all(|value| *value > 0)
 			&& ordered.windows(2).all(|pair| pair[0] <= pair[1])
 			&& selectors_valid
 			&& lists_valid
 			&& roles_valid
 			&& tags_valid
-		{
-			Ok(())
-		} else {
-			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
-		}
-	}
-}
-
-const fn field(
-	path: &'static str,
-	label: &'static str,
-	kind: SettingKind,
-	order: u16,
-) -> FieldDescriptor {
-	FieldDescriptor {
-		path,
-		label,
-		description: "Runtime-owned model and provider policy.",
-		kind,
-		scopes: PERSISTED,
-		order,
-		options: None,
-		condition: None,
-		secret: false,
 	}
 }
 
@@ -1030,12 +968,392 @@ fn character_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(b
 	None
 }
 
-/// Settings domains owned by the catalog crate.
-pub const SETTINGS_CONTRIBUTION: omp_settings::SettingsContribution =
-	omp_settings::SettingsContribution {
-		domains:     &[DomainRegistration::of::<ModelSettings>()],
-		normalizers: &[],
+fn roles_to_kv(roles: &ModelRoles) -> Kv {
+	Kv(roles
+		.iter()
+		.map(|(key, value)| (key.clone(), Value::Str(value.clone())))
+		.collect())
+}
+
+fn roles_from_kv(value: Kv) -> ModelRoles {
+	value
+		.0
+		.into_iter()
+		.filter_map(|(key, value)| value.as_str().map(|value| (key, Str::from(value))))
+		.collect()
+}
+
+fn tags_to_kv(tags: &ModelTags) -> Kv {
+	Kv(tags
+		.iter()
+		.map(|(key, tag)| {
+			let mut fields = vec![(Str::new_static("name"), Value::Str(tag.name.clone()))];
+			if let Some(color) = &tag.color {
+				fields.push((Str::new_static("color"), Value::Str(color.clone())));
+			}
+			fields.push((Str::new_static("hidden"), Value::Bool(tag.hidden)));
+			(key.clone(), Value::Kv(Kv(fields)))
+		})
+		.collect())
+}
+
+fn tags_from_kv(value: Kv) -> ModelTags {
+	value
+		.0
+		.into_iter()
+		.filter_map(|(key, value)| {
+			let fields = value.as_kv()?;
+			let name = Str::from(fields.get("name")?.as_str()?);
+			let color = fields.get("color").and_then(Value::as_str).map(Str::from);
+			let hidden = fields
+				.get("hidden")
+				.and_then(Value::as_bool)
+				.unwrap_or(false);
+			Some((key, ModelTag { name, color, hidden }))
+		})
+		.collect()
+}
+
+fn thinking_budgets_to_kv(budgets: ThinkingBudgets) -> Kv {
+	Kv(vec![
+		(Str::new_static("minimal"), Value::Int(budgets.minimal as i64)),
+		(Str::new_static("low"), Value::Int(budgets.low as i64)),
+		(Str::new_static("medium"), Value::Int(budgets.medium as i64)),
+		(Str::new_static("high"), Value::Int(budgets.high as i64)),
+		(Str::new_static("xhigh"), Value::Int(budgets.xhigh as i64)),
+		(Str::new_static("max"), Value::Int(budgets.max as i64)),
+	])
+}
+
+fn thinking_budgets_from_kv(value: Kv) -> ThinkingBudgets {
+	let defaults = ThinkingBudgets::default();
+	let read = |name: &str, default| {
+		value
+			.get(name)
+			.and_then(Value::as_int)
+			.and_then(|value| u64::try_from(value).ok())
+			.unwrap_or(default)
 	};
+	ThinkingBudgets {
+		minimal: read("minimal", defaults.minimal),
+		low:     read("low", defaults.low),
+		medium:  read("medium", defaults.medium),
+		high:    read("high", defaults.high),
+		xhigh:   read("xhigh", defaults.xhigh),
+		max:     read("max", defaults.max),
+	}
+}
+
+fn one_or_many_value(value: &OneOrManyStr) -> Value {
+	Value::List(value.as_slice().iter().cloned().map(Value::Str).collect())
+}
+
+fn path_scoped_to_kv(entries: &[PathScopedStringEntry]) -> Vec<Kv> {
+	entries
+		.iter()
+		.map(|entry| match entry {
+			PathScopedStringEntry::Bare(value) => {
+				Kv(vec![(Str::new_static("value"), Value::Str(value.clone()))])
+			},
+			PathScopedStringEntry::Scoped(source) => {
+				let mut fields = Vec::new();
+				for (name, value) in [
+					("path", source.path.as_ref()),
+					("paths", source.paths.as_ref()),
+					("path_prefix", source.path_prefix.as_ref()),
+					("path_prefixes", source.path_prefixes.as_ref()),
+					("values", source.values.as_ref()),
+					("items", source.items.as_ref()),
+					("models", source.models.as_ref()),
+					("providers", source.providers.as_ref()),
+				] {
+					if let Some(value) = value {
+						fields.push((Str::from(name), one_or_many_value(value)));
+					}
+				}
+				Kv(fields)
+			},
+		})
+		.collect()
+}
+
+fn one_or_many_from_value(value: &Value) -> Option<OneOrManyStr> {
+	let values = value
+		.as_list()?
+		.iter()
+		.map(|value| value.as_str().map(Str::from))
+		.collect::<Option<Box<[_]>>>()?;
+	Some(OneOrManyStr::Many(values))
+}
+
+fn path_scoped_from_kv(entries: Vec<Kv>) -> PathScopedStrList {
+	entries
+		.into_iter()
+		.filter_map(|entry| {
+			if let Some(value) = entry.get("value").and_then(Value::as_str) {
+				return Some(PathScopedStringEntry::Bare(Str::from(value)));
+			}
+			Some(PathScopedStringEntry::Scoped(PathScopedStringValues {
+				path:          entry.get("path").and_then(one_or_many_from_value),
+				paths:         entry.get("paths").and_then(one_or_many_from_value),
+				path_prefix:   entry.get("path_prefix").and_then(one_or_many_from_value),
+				path_prefixes: entry.get("path_prefixes").and_then(one_or_many_from_value),
+				values:        entry.get("values").and_then(one_or_many_from_value),
+				items:         entry.get("items").and_then(one_or_many_from_value),
+				models:        entry.get("models").and_then(one_or_many_from_value),
+				providers:     entry.get("providers").and_then(one_or_many_from_value),
+			}))
+		})
+		.collect::<Vec<_>>()
+		.into()
+}
+
+fn invalid(reason: &'static str) -> Result<(), Str> {
+	Err(Str::new_static(reason))
+}
+
+fn validate_roles(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	if roles_from_kv(value.clone())
+		.iter()
+		.all(|(role, selector)| !role.trim().is_empty() && !selector.trim().is_empty())
+		&& value.iter().all(|(_, value)| value.as_str().is_some())
+	{
+		Ok(())
+	} else {
+		invalid("model roles require non-empty string keys and selectors")
+	}
+}
+
+fn validate_tags(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	let tags = tags_from_kv(value.clone());
+	if tags.len() == value.len()
+		&& tags
+			.iter()
+			.all(|(role, tag)| !role.trim().is_empty() && !tag.name.trim().is_empty())
+	{
+		Ok(())
+	} else {
+		invalid("model tags require non-empty keys and names")
+	}
+}
+
+fn validate_budgets(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	let budgets = thinking_budgets_from_kv(value.clone());
+	let ordered =
+		[budgets.minimal, budgets.low, budgets.medium, budgets.high, budgets.xhigh, budgets.max];
+	let fields_valid = ["minimal", "low", "medium", "high", "xhigh", "max"]
+		.into_iter()
+		.all(|name| {
+			value
+				.get(name)
+				.and_then(Value::as_int)
+				.is_some_and(|value| value > 0)
+		});
+	if value.len() == ordered.len()
+		&& fields_valid
+		&& ordered.windows(2).all(|pair| pair[0] <= pair[1])
+	{
+		Ok(())
+	} else {
+		invalid("thinking budgets must be positive and ordered")
+	}
+}
+
+fn validate_unique(_: &Ctx, value: &Vec<Str>) -> Result<(), Str> {
+	if unique_nonempty(value) {
+		Ok(())
+	} else {
+		invalid("list values must be non-empty and unique")
+	}
+}
+
+fn validate_path_scoped_models(_: &Ctx, value: &Vec<Kv>) -> Result<(), Str> {
+	let entries = path_scoped_from_kv(value.clone());
+	if entries.len() == value.len() && scoped_entries_valid(&entries, ScopedValueKind::Models) {
+		Ok(())
+	} else {
+		invalid("enabled model entries require non-empty paths and models")
+	}
+}
+
+fn validate_path_scoped_providers(_: &Ctx, value: &Vec<Kv>) -> Result<(), Str> {
+	let entries = path_scoped_from_kv(value.clone());
+	if entries.len() == value.len() && scoped_entries_valid(&entries, ScopedValueKind::Providers) {
+		Ok(())
+	} else {
+		invalid("disabled provider entries require non-empty paths and providers")
+	}
+}
+
+fn validate_selector(_: &Ctx, value: &Str) -> Result<(), Str> {
+	if value.trim().is_empty() {
+		invalid("model selector must not be empty")
+	} else {
+		Ok(())
+	}
+}
+
+omp_con::var! {
+	/// Model selector assignments keyed by role name.
+	pub static AI_MODEL_ROLES = ai_model_roles: Kv {
+		default: roles_to_kv(&ModelSettings::default().roles),
+		validate: validate_roles,
+		flags: archive | inherit,
+	};
+	/// Persistence scope for model role assignments.
+	pub static AI_MODEL_ROLE_STORAGE = ai_model_role_storage: ModelRoleStorage {
+		default: ModelRoleStorage::Global,
+		flags: archive | inherit,
+	};
+	/// Presentation metadata keyed by model role.
+	pub static AI_MODEL_TAGS = ai_model_tags: Kv {
+		default: tags_to_kv(&ModelSettings::default().tags),
+		validate: validate_tags,
+		flags: archive | inherit,
+	};
+	/// Role names in quick-cycle order.
+	pub static AI_MODEL_CYCLE_ORDER = ai_model_cycle_order: Vec<Str> {
+		default: vec![Str::new_static("smol"), Str::new_static("default"), Str::new_static("slow")],
+		validate: validate_unique,
+		flags: archive | inherit,
+	};
+	/// Optional canonical model selector allow-list.
+	pub static AI_MODEL_ENABLED_MODELS = ai_model_enabled_models: Vec<Kv> {
+		default: path_scoped_to_kv(&ModelSettings::default().enabled_models),
+		validate: validate_path_scoped_models,
+		flags: archive | inherit,
+	};
+	/// Provider ids excluded from discovery, selection, and routing.
+	pub static AI_MODEL_DISABLED_PROVIDERS = ai_model_disabled_providers: Vec<Kv> {
+		default: path_scoped_to_kv(&ModelSettings::default().disabled_providers),
+		validate: validate_path_scoped_providers,
+		flags: archive | inherit,
+	};
+	/// Default thinking effort used when a caller leaves effort unset.
+	pub static AI_DEFAULT_THINKING = ai_default_thinking: ThinkingEffort {
+		default: ThinkingEffort::Medium,
+		flags: archive | inherit,
+	};
+	/// Universal configured reasoning ceiling.
+	pub static AI_THINKING_CEILING = ai_thinking_ceiling: ThinkingEffort {
+		default: ThinkingEffort::Max,
+		flags: archive | inherit,
+	};
+	/// Per-effort reasoning token budgets.
+	pub static AI_THINKING_BUDGETS = ai_thinking_budgets: Kv {
+		default: thinking_budgets_to_kv(ThinkingBudgets::default()),
+		validate: validate_budgets,
+		flags: archive | inherit,
+	};
+	/// Provider ids in preferred routing order.
+	pub static AI_PROVIDER_ORDER = ai_provider_order: Vec<Str> {
+		default: Vec::new(),
+		validate: validate_unique,
+		flags: archive | inherit,
+	};
+	/// OpenAI-family service tier.
+	pub static AI_TIER_OPENAI = ai_tier_openai: TierSetting {
+		default: TierSetting::None,
+		flags: archive | inherit,
+	};
+	/// Anthropic-family service tier.
+	pub static AI_TIER_ANTHROPIC = ai_tier_anthropic: TierSetting {
+		default: TierSetting::None,
+		flags: archive | inherit,
+	};
+	/// Google-family service tier.
+	pub static AI_TIER_GOOGLE = ai_tier_google: TierSetting {
+		default: TierSetting::None,
+		flags: archive | inherit,
+	};
+	/// Fireworks serving tier.
+	pub static AI_TIER_FIREWORKS = ai_tier_fireworks: TierSetting {
+		default: TierSetting::None,
+		flags: archive | inherit,
+	};
+	/// Spawned-agent tier override.
+	pub static AI_TIER_SUBAGENT = ai_tier_subagent: TierSetting {
+		default: TierSetting::Inherit,
+		flags: archive | inherit,
+	};
+	/// Advisor tier override.
+	pub static AI_TIER_ADVISOR = ai_tier_advisor: TierSetting {
+		default: TierSetting::None,
+		flags: archive | inherit,
+	};
+	/// Prompt-cache retention policy.
+	pub static AI_CACHE_RETENTION = ai_cache_retention: CacheRetentionSetting {
+		default: CacheRetentionSetting::Auto,
+		flags: archive | inherit,
+	};
+	/// OpenAI Codex websocket preference.
+	pub static AI_OPENAI_WEBSOCKETS = ai_openai_websockets: WireToggle {
+		default: WireToggle::Auto,
+		flags: archive | inherit,
+	};
+	/// Default OpenRouter routing suffix.
+	pub static AI_OPENROUTER_VARIANT = ai_openrouter_variant: OpenRouterVariant {
+		default: OpenRouterVariant::Default,
+		flags: archive | inherit,
+	};
+	/// Kimi wire format preference.
+	pub static AI_KIMI_API_FORMAT = ai_kimi_api_format: KimiApiFormat {
+		default: KimiApiFormat::Auto,
+		flags: archive | inherit,
+	};
+	/// Model selector for tiny/title work.
+	pub static AI_TINY_SELECTOR = ai_tiny_selector: Str {
+		default: Str::new_static("@tiny"),
+		validate: validate_selector,
+		flags: archive | inherit,
+	};
+	/// Model selector for memory inference.
+	pub static AI_MEMORY_SELECTOR = ai_memory_selector: Str {
+		default: Str::new_static("@tiny"),
+		validate: validate_selector,
+		flags: archive | inherit,
+	};
+	/// Model selector for automatic-thinking classification.
+	pub static AI_AUTO_THINKING_SELECTOR = ai_auto_thinking_selector: Str {
+		default: Str::new_static("@tiny"),
+		validate: validate_selector,
+		flags: archive | inherit,
+	};
+	/// Model selector for unexpected-stop classification.
+	pub static AI_UNEXPECTED_STOP_SELECTOR = ai_unexpected_stop_selector: Str {
+		default: Str::new_static("@tiny"),
+		validate: validate_selector,
+		flags: archive | inherit,
+	};
+}
+
+/// One-shot migration map from reflected TOML paths to convar names.
+pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
+	("model.roles", "ai_model_roles"),
+	("model.role_storage", "ai_model_role_storage"),
+	("model.tags", "ai_model_tags"),
+	("model.cycle_order", "ai_model_cycle_order"),
+	("model.enabled_models", "ai_model_enabled_models"),
+	("model.disabled_providers", "ai_model_disabled_providers"),
+	("model.default_thinking", "ai_default_thinking"),
+	("model.thinking_ceiling", "ai_thinking_ceiling"),
+	("model.thinking_budgets", "ai_thinking_budgets"),
+	("model.provider_order", "ai_provider_order"),
+	("model.tier_openai", "ai_tier_openai"),
+	("model.tier_anthropic", "ai_tier_anthropic"),
+	("model.tier_google", "ai_tier_google"),
+	("model.tier_fireworks", "ai_tier_fireworks"),
+	("model.tier_subagent", "ai_tier_subagent"),
+	("model.tier_advisor", "ai_tier_advisor"),
+	("model.cache_retention", "ai_cache_retention"),
+	("model.openai_websockets", "ai_openai_websockets"),
+	("model.openrouter_variant", "ai_openrouter_variant"),
+	("model.kimi_api_format", "ai_kimi_api_format"),
+	("model.tiny_selector", "ai_tiny_selector"),
+	("model.memory_selector", "ai_memory_selector"),
+	("model.auto_thinking_selector", "ai_auto_thinking_selector"),
+	("model.unexpected_stop_selector", "ai_unexpected_stop_selector"),
+];
 
 /// Resolves provider family from canonical route and model identities.
 pub fn provider_family(provider: &str, model: Option<&str>) -> ProviderFamily {
@@ -1089,16 +1407,11 @@ mod tests {
 		let encoded = serde_json::to_value(&settings).expect("settings serialize");
 		let decoded: ModelSettings = serde_json::from_value(encoded).expect("settings deserialize");
 		assert_eq!(decoded, settings);
-		for path in [
-			"model.roles",
-			"model.role_storage",
-			"model.tags",
-			"model.cycle_order",
-			"model.enabled_models",
-			"model.disabled_providers",
-		] {
-			assert!(ModelSettings::FIELDS.iter().any(|field| field.path == path), "{path}");
-		}
+		let ctx = Ctx::new();
+		AI_MODEL_ROLE_STORAGE
+			.set(&ctx, ModelRoleStorage::Project)
+			.expect("set model role storage");
+		assert_eq!(ModelSettings::from_con(&ctx).role_storage, ModelRoleStorage::Project);
 	}
 
 	#[test]
@@ -1120,10 +1433,10 @@ mod tests {
 		assert!(model_pattern_matches("OPENAI/GPT-5.[4-7]:HIGH", "openai", "gpt-5.6"));
 		assert!(model_pattern_matches("openrouter/model:exacto", "OPENROUTER", "MODEL:EXACTO"));
 		assert!(!model_pattern_matches("openai/gpt-5.[!4-7]", "openai", "gpt-5.6"));
-		assert!(settings.validate().is_ok());
+		assert!(settings.validate());
 		settings.cycle_order =
 			sync::Arc::from([Str::new_static("default"), Str::new_static("default")]);
-		assert!(settings.validate().is_err());
+		assert!(!settings.validate());
 	}
 
 	#[test]
@@ -1139,6 +1452,70 @@ mod tests {
 			settings.enabled_models.last(),
 			Some(PathScopedStringEntry::Bare(value)) if value == "openai/gpt-5.6"
 		));
+	}
+
+	#[test]
+	fn vars_declare_every_former_schema_field() {
+		let old_fields = [
+			"model.roles",
+			"model.role_storage",
+			"model.tags",
+			"model.cycle_order",
+			"model.enabled_models",
+			"model.disabled_providers",
+			"model.default_thinking",
+			"model.thinking_ceiling",
+			"model.thinking_budgets",
+			"model.provider_order",
+			"model.tier_openai",
+			"model.tier_anthropic",
+			"model.tier_google",
+			"model.tier_fireworks",
+			"model.tier_subagent",
+			"model.tier_advisor",
+			"model.cache_retention",
+			"model.openai_websockets",
+			"model.openrouter_variant",
+			"model.kimi_api_format",
+			"model.tiny_selector",
+			"model.memory_selector",
+			"model.auto_thinking_selector",
+			"model.unexpected_stop_selector",
+		];
+		let vars = [
+			AI_MODEL_ROLES.name(),
+			AI_MODEL_ROLE_STORAGE.name(),
+			AI_MODEL_TAGS.name(),
+			AI_MODEL_CYCLE_ORDER.name(),
+			AI_MODEL_ENABLED_MODELS.name(),
+			AI_MODEL_DISABLED_PROVIDERS.name(),
+			AI_DEFAULT_THINKING.name(),
+			AI_THINKING_CEILING.name(),
+			AI_THINKING_BUDGETS.name(),
+			AI_PROVIDER_ORDER.name(),
+			AI_TIER_OPENAI.name(),
+			AI_TIER_ANTHROPIC.name(),
+			AI_TIER_GOOGLE.name(),
+			AI_TIER_FIREWORKS.name(),
+			AI_TIER_SUBAGENT.name(),
+			AI_TIER_ADVISOR.name(),
+			AI_CACHE_RETENTION.name(),
+			AI_OPENAI_WEBSOCKETS.name(),
+			AI_OPENROUTER_VARIANT.name(),
+			AI_KIMI_API_FORMAT.name(),
+			AI_TINY_SELECTOR.name(),
+			AI_MEMORY_SELECTOR.name(),
+			AI_AUTO_THINKING_SELECTOR.name(),
+			AI_UNEXPECTED_STOP_SELECTOR.name(),
+		];
+		assert_eq!(
+			LEGACY_CONVAR_MAPPINGS,
+			old_fields
+				.into_iter()
+				.zip(vars)
+				.collect::<Vec<_>>()
+				.as_slice()
+		);
 	}
 
 	#[test]
