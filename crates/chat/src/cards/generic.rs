@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge};
 
 /// Fallback renderer that presents every standard child of a tool element.
 pub struct GenericCard;
@@ -33,9 +33,10 @@ impl GenericCard {
 					match view.status {
 						CardStatus::Failed => <i:error/>,
 						CardStatus::Done => <i:done/>,
-						CardStatus::StreamingArgs | CardStatus::InProgress => <icon name="spin-2" fg=muted/>,
+						CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status fg=muted/>,
 					}
 					<text bold>{title}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				if expanded {
 					<row><i:space/></row>

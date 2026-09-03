@@ -14,35 +14,75 @@ use std::{
 
 use flume::{Receiver, Sender};
 use omp_agent::{KernelEvent, Up};
-use omp_con::{AI_COMPACT_THRESHOLD, AI_MODEL, AI_THINKING, CL_SHOWTHINKING, Ctx, Source};
+use omp_con::{
+	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_THINKING, CL_IME_SAFE_CURSOR, CL_SHOWTHINKING,
+	CL_STATUS_COMPACT_THINKING, Ctx, Source,
+};
 use omp_core::Str;
 use omp_dom::{Dom, Event, KnownTag, PropId, Snapshot, Tag, Value};
-use omp_journal::blob::BlobRef;
+use omp_journal::{EntryId, blob::BlobRef};
 use omp_tui::{
 	CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, Layer, OverlayAnchor, OverlayOptions,
 	Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut, Ui, UiContext,
-	components::{Col, Spacer},
-	detect, respond_debug_query,
-	slots::{BlockId, Mode, ResizePolicy, Slots},
+	anim::Intro,
+	components::Countdown,
+	detect,
+	paste::{Clipboard, ClipboardRead, spawn_clipboard_read},
+	respond_debug_query,
+	slots::{Mode, ResizePolicy},
 };
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use crate::{
-	actions::{HostAction, HostMailbox},
+	actions::{CL_DOUBLE_ESCAPE, CL_STT_HOLD, EscapeHook, EscapeRung, HostAction, HostMailbox},
+	autocomplete::slash,
 	cards::CardRegistry,
 	chrome::{ModelBadge, StatusFacts, Welcome, display_path, tip_for},
-	autocomplete::slash,
-	composer::{Composer, ComposerAction},
+	commands::{CompactionMethod, Selector},
+	composer::{Composer, ComposerAction, SpaceHold, SpaceHoldEvent},
+	gitwatch::{GitFacts, GitWatch},
 	input::Bindings,
-	overlays::{HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PickerEvent},
+	overlays::{
+		HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PanelAction, PanelAnchor,
+		PanelCx, PanelEvent, PickerEvent, Services,
+	},
 	project::{BlockKind, BlockView, RenderedBlock, project},
+	status_band::Speculation,
 	status_line::StatusLine,
+	transcript::Projection,
+	welcome::{WelcomeFacts, tip_seeded, welcome_seed},
 };
 
 /// Console command that engages the plan Director.
 const PLAN_DIRECTOR: &str = "plan";
+/// Director family engaged by `/loop` (rung 5 of the Esc ladder).
+const LOOP_DIRECTOR: &str = "loop_mode";
 /// Notice shown when a bound command wants a reasoning level the model lacks.
 const NO_THINKING: &str = "Current model does not support thinking";
+/// pi: a second Esc within this window on an empty composer opens the
+/// rewind or tree selector.
+const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
+/// pi `LEFT_DOUBLE_TAP_MIN_GAP_MS`: taps closer than this are a terminal
+/// burst, never a human double-tap.
+const LEFT_DOUBLE_TAP_MIN_GAP: Duration = Duration::from_millis(40);
+/// pi `LEFT_DOUBLE_TAP_MAX_GAP_MS`: a quiet gap this long starts a fresh
+/// tap sequence.
+const LEFT_DOUBLE_TAP_MAX_GAP: Duration = Duration::from_millis(500);
+/// How long a background clipboard read may take before the paste is
+/// abandoned.
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(8);
+/// pi `process.exit(130)`: a second Ctrl+C while teardown hangs.
+const HARD_ABORT_CODE: i32 = 130;
+
+/// Which side-channel spawn a slash command asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpawnKind {
+	/// `/btw`: a side question that never enters the main transcript.
+	Btw,
+	/// `/tan`: a fire-and-forget background task.
+	Tan,
+}
 
 /// Commands emitted by the presentation actor to the application controller.
 #[derive(Clone, Debug)]
@@ -78,6 +118,87 @@ pub enum HostCommand {
 	PlanMode {
 		/// `true` engages plan mode; `false` exits it.
 		engage: bool,
+	},
+	/// Switch to a stored session file (`/resume`, session picker).
+	SessionOpen {
+		/// Journal path.
+		path: PathBuf,
+	},
+	/// Start a brand-new session file (`/new`, `/fresh`).
+	SessionNew {
+		/// Optional model selector for the new session.
+		model: Option<Str>,
+	},
+	/// Delete the current session file and restart (`/drop`).
+	SessionDrop,
+	/// Roll the live chain back to `target` (`/rewind`, rewind selector).
+	Rewind {
+		/// Entry the next append branches from.
+		target: EntryId,
+	},
+	/// Branch a new session file from `target` (`/fork`).
+	Fork {
+		/// Entry to branch from; `None` is the current head.
+		target: Option<EntryId>,
+	},
+	/// Run a manual compaction path (`/compact`, `/handoff`, `/shake`).
+	Compact {
+		/// Summary path.
+		method: CompactionMethod,
+		/// Focus instructions, handoff prompt, or shake mode.
+		hint:   Option<Str>,
+	},
+	/// Append a prompt to `<queues><prompts>` (`/queue`).
+	Queue {
+		/// Prompt run after the active turn.
+		prompt: Str,
+	},
+	/// Engage or exit a Director by id (`/vibe`, `/goal`, `/loop`, `/force`).
+	Director {
+		/// Director family.
+		id:     Str,
+		/// `true` engages; `false` exits.
+		engage: bool,
+		/// Director arguments.
+		args:   Vec<Str>,
+	},
+	/// Spawn a side-channel agent (`/btw`, `/tan`).
+	Spawn {
+		/// Which side channel.
+		kind: SpawnKind,
+		/// Prompt text.
+		text: Str,
+	},
+	/// Rename the session (`/rename`).
+	Rename {
+		/// Human-readable session title.
+		title: Str,
+	},
+	/// Edit the `<meta><todo>` checklist (`/todo`).
+	Todo(crate::commands::TodoOp),
+	/// Gate new turns and queued prompts (`/pause`).
+	Pause {
+		/// `true` pauses; `false` resumes.
+		active: bool,
+	},
+	/// Mark queued prompts as dequeued: the host pulled their text back into
+	/// the composer (pi `app.message.dequeue`).
+	Dequeue {
+		/// `<prompt id>` values under `<queues><prompts>`.
+		prompts: Vec<Str>,
+	},
+	/// Push-to-talk recording edge: the app owns the microphone lease and
+	/// the recognizer, and posts the transcript back through the console
+	/// mailbox as [`HostAction::InsertText`].
+	PushToTalk {
+		/// `true` starts recording; `false` stops it and transcribes.
+		active: bool,
+	},
+	/// Duplex live-voice session edge (pi `/live`, Ctrl+L): the app owns the
+	/// microphone lease and the realtime transport.
+	LiveVoice {
+		/// `true` starts the session; `false` ends it.
+		active: bool,
 	},
 	/// Stop the application-owned controller loop.
 	Quit,
@@ -129,11 +250,15 @@ pub struct HostOptions {
 	pub resize_policy: ResizePolicy,
 	/// Launch model facts for the banner and status band.
 	pub model:         ModelBadge,
-	/// Checked-out git branch of the project: an observer-local fact the
-	/// app probes, never journaled.
-	pub branch:        Option<Str>,
+	/// Project directory. The host watches its git checkout for the band's
+	/// branch/dirty facts: observer-local, never journaled.
+	pub project:       PathBuf,
+	/// Launch facts for the welcome box (recent sessions, language servers).
+	pub welcome:       WelcomeFacts,
 	/// Ambient renderer context.
 	pub ui:            UiContext,
+	/// Application-supplied data feeds for dashboards and account commands.
+	pub services:      Arc<dyn Services>,
 }
 
 /// Chat actor or terminal delivery failure.
@@ -153,84 +278,188 @@ pub enum HostError {
 	Delivery(#[from] omp_tui::DeliveryError),
 }
 
+/// pi `#detectLeftDoubleTap`: two Left taps a human-plausible interval
+/// apart, never a terminal-synthesized burst.
+#[derive(Clone, Copy, Debug, Default)]
+struct LeftTaps {
+	last:  Option<Instant>,
+	count: u8,
+}
+
+impl LeftTaps {
+	/// Records a tap at `now`; returns whether it completed a double-tap.
+	fn tap(&mut self, now: Instant) -> bool {
+		let since = self.last.map(|last| now.duration_since(last));
+		self.last = Some(now);
+		match since {
+			Some(gap) if gap < LEFT_DOUBLE_TAP_MAX_GAP => {
+				self.count = self.count.saturating_add(1);
+				if self.count == 2 && gap >= LEFT_DOUBLE_TAP_MIN_GAP {
+					self.count = 0;
+					self.last = None;
+					return true;
+				}
+				false
+			},
+			_ => {
+				self.count = 1;
+				false
+			},
+		}
+	}
+}
+
 /// Presentation state shared by the terminal and native actors.
-struct Presenter {
-	replica:        Dom,
-	dom_events:     Receiver<Event>,
-	kernel_events:  Receiver<KernelEvent>,
-	commands:       Sender<HostCommand>,
-	up:             Sender<Up>,
-	con:            Arc<Ctx>,
-	bindings:       Bindings,
-	cards:          CardRegistry,
-	ui:             UiContext,
-	model:          ModelBadge,
-	local:          LocalFacts,
-	composer:       Composer,
-	overlays:       Overlays,
-	turn_active:    bool,
+pub(crate) struct Presenter {
+	pub(crate) replica:        Dom,
+	pub(crate) dom_events:     Receiver<Event>,
+	pub(crate) kernel_events:  Receiver<KernelEvent>,
+	pub(crate) commands:       Sender<HostCommand>,
+	pub(crate) up:             Sender<Up>,
+	pub(crate) con:            Arc<Ctx>,
+	pub(crate) bindings:       Bindings,
+	pub(crate) cards:          CardRegistry,
+	pub(crate) ui:             UiContext,
+	pub(crate) model:          ModelBadge,
+	pub(crate) local:          LocalFacts,
+	pub(crate) composer:       Composer,
+	pub(crate) overlays:       Overlays,
+	pub(crate) turn_active:    bool,
 	/// Presentation-clock start of the in-flight turn (the band timer).
-	turn_started:   Option<Duration>,
-	last_interrupt: Option<Instant>,
+	pub(crate) turn_started:   Option<Duration>,
+	pub(crate) last_interrupt: Option<Instant>,
 	/// Last `cl_clear` press, for pi's double-press exit window.
-	last_clear:     Option<Instant>,
-	clock:          Instant,
+	pub(crate) last_clear:     Option<Instant>,
+	/// Last Esc that reached the empty-composer rung, for the double-Esc
+	/// selector window.
+	pub(crate) last_escape:    Option<Instant>,
+	/// Double-Left gesture state (pi `#detectLeftDoubleTap`).
+	left_taps:                 LeftTaps,
+	pub(crate) clock:          Instant,
+	/// Launch facts painted in the welcome box's right column.
+	pub(crate) welcome:        WelcomeFacts,
+	/// Presentation-clock start of pi's 3000ms brand intro; `None` once a
+	/// rebuilt welcome should rest.
+	intro:                     Option<Duration>,
 	/// The one console mailbox: bound commands post actions here.
-	mailbox:        Arc<HostMailbox>,
-	models:         Vec<ModelRow>,
-	cycle:          Vec<(Str, Str)>,
+	pub(crate) mailbox:        Arc<HostMailbox>,
+	pub(crate) models:         Vec<ModelRow>,
+	pub(crate) cycle:          Vec<(Str, Str)>,
 	/// Last prompt sent as a turn, for `cl_retry`.
-	last_prompt:    Option<Str>,
+	pub(crate) last_prompt:    Option<Str>,
 	/// Text the composer asked to copy; the terminal loop drains it into
 	/// the clipboard (OSC 52 / native).
-	clipboard:      Option<Str>,
+	pub(crate) clipboard:      Option<Str>,
+	/// Live git facts for the band; `None` outside a checkout. The watch is
+	/// a drop guard: it runs for the presenter's lifetime.
+	#[expect(dead_code, reason = "drop guard keeping the git watcher task alive")]
+	pub(crate) git_watch:      Option<GitWatch>,
+	pub(crate) git_facts:      Option<Receiver<GitFacts>>,
+	/// Clipboard read the host asked for; the terminal loop starts it.
+	pub(crate) clipboard_read: Option<ClipboardRead>,
+	/// Application data feeds for panels.
+	pub(crate) services:       Arc<dyn Services>,
+	/// Registered Esc hooks (rungs 1 and 4 of the ladder).
+	pub(crate) escape_hooks:   Vec<EscapeHook>,
+	/// Subagent whose session the view shows (pi `focusedAgentId`).
+	pub(crate) focused_agent:  Option<Str>,
+	/// This actor is a collaboration guest (pi `collabGuest`).
+	pub(crate) collab_guest:   bool,
+	/// Space-hold push-to-talk detector.
+	pub(crate) space_hold:     SpaceHold,
+	/// Whether push-to-talk is recording (space hold or `cl_stt_toggle`).
+	pub(crate) stt_recording:  bool,
+	/// Whether a live-voice session is on (pi `liveVoiceActive`).
+	pub(crate) live_active:    bool,
+	/// Presentation-clock instant the visible approval prompt appeared, for
+	/// its countdown.
+	approval_shown:            Option<Duration>,
+	/// Last presented terminal height, for panel viewports.
+	viewport_height:           u16,
+	/// Observer-local transcript facts: tool start instants, the thinking
+	/// speed gauge, and the reset banner.
+	pub(crate) transcript:     crate::transcript::Local,
+	/// Decides which desktop toasts a settled turn earns (pi
+	/// `sendCompletionNotification` / `sendErrorNotification`).
+	pub(crate) notifier:       crate::notify::Notifier,
+	/// Toasts decided since the last terminal delivery.
+	pub(crate) notifications:  Vec<omp_tui::Notification>,
+	/// Periodic Codex quota refresh behind the reset fireworks.
+	quota:                     crate::celebrate::QuotaWatch,
 }
 
 /// Observer-local band facts that never enter the DOM.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalFacts {
 	/// Checked-out git branch.
-	pub branch:   Option<Str>,
+	pub branch:           Option<Str>,
+	/// The checkout has staged, unstaged, or untracked changes.
+	pub dirty:            bool,
 	/// Platform temp directory, for pi's scratch-project labeling.
-	pub tmp:      Option<Str>,
+	pub tmp:              Option<Str>,
 	/// Live reasoning level when the model can reason.
-	pub thinking: Option<Str>,
+	pub thinking:         Option<Str>,
 	/// Live model route override (`ai_model`) when set.
-	pub model:    Option<Str>,
+	pub model:            Option<Str>,
 	/// Auto-compaction threshold as a whole percent (`ai_compact_threshold`).
-	pub compact:  u8,
+	pub compact:          u8,
+	/// Fast mode is on (`ai_fastmode`).
+	pub fast:             bool,
+	/// Thinking level rides the model icon (`cl_status_compact_thinking`).
+	pub compact_thinking: bool,
 }
 
 impl Default for LocalFacts {
 	fn default() -> Self {
-		Self { branch: None, tmp: None, thinking: None, model: None, compact: 80 }
+		Self {
+			branch:           None,
+			dirty:            false,
+			tmp:              None,
+			thinking:         None,
+			model:            None,
+			compact:          80,
+			fast:             false,
+			compact_thinking: true,
+		}
 	}
 }
 
 impl LocalFacts {
-	/// Facts fixed at launch: the app's branch probe and the platform temp
-	/// directory.
-	fn at_launch(branch: Option<Str>) -> Self {
+	/// Facts fixed at launch: the git watch's launch probe and the platform
+	/// temp directory.
+	fn at_launch(git: Option<&GitFacts>) -> Self {
 		let tmp = env::temp_dir();
-		let tmp = tmp
-			.to_str()
-			.map(|tmp| Str::new(tmp.trim_end_matches('/')));
-		Self { branch, tmp, ..Self::default() }
+		let tmp = tmp.to_str().map(|tmp| Str::new(tmp.trim_end_matches('/')));
+		let mut facts = Self { tmp, ..Self::default() };
+		if let Some(git) = git {
+			facts.set_git(git);
+		}
+		facts
+	}
+
+	/// Applies one git watch delivery.
+	fn set_git(&mut self, git: &GitFacts) {
+		self.branch.clone_from(&git.branch);
+		self.dirty = git.dirty;
 	}
 
 	/// Refreshes the convar-backed facts (`ai_thinking`, `ai_model`,
-	/// `ai_compact_threshold`).
+	/// `ai_compact_threshold`, `ai_fastmode`, `cl_status_compact_thinking`).
 	fn sync_con(&mut self, con: &Ctx, badge: &ModelBadge) {
 		self.thinking = badge.reasoning.then(|| AI_THINKING.get(con));
 		self.model = Some(AI_MODEL.get(con)).filter(|model| !model.is_empty());
-		self.compact = (AI_COMPACT_THRESHOLD.get(con) * 100.0).round().clamp(0.0, 100.0) as u8;
+		self.compact = (AI_COMPACT_THRESHOLD.get(con) * 100.0)
+			.round()
+			.clamp(0.0, 100.0) as u8;
+		self.fast = AI_FASTMODE.get(con);
+		self.compact_thinking = CL_STATUS_COMPACT_THINKING.get(con);
 	}
 }
 
 /// What one routed input asked the host to do next. Ordered by strength so
 /// several actions from one console line fold to the strongest.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum Routed {
+pub(crate) enum Routed {
 	/// Nothing changed.
 	Ignored,
 	/// Presentation may have changed; repaint.
@@ -261,6 +490,19 @@ enum Pause {
 	DisplayReset,
 }
 
+/// pi `handleCtrlC` during shutdown: once the chat has quit and the tty is
+/// restored, a further Ctrl+C (SIGINT) exits the process with 130 at once
+/// instead of waiting for a hanging teardown (a wedged tool, a slow
+/// `process_exit`). Defense in depth: the controller's own teardown still
+/// runs first when it is quick.
+fn arm_hard_abort() {
+	tokio::spawn(async {
+		if tokio::signal::ctrl_c().await.is_ok() {
+			std::process::exit(HARD_ABORT_CODE);
+		}
+	});
+}
+
 /// pi `handleCtrlZ`: job-control suspend of the whole process group. A
 /// no-op on platforms without POSIX job control.
 fn suspend_process() {
@@ -285,7 +527,8 @@ impl Presenter {
 		let replica = Dom::from_snapshot(&options.snapshot);
 		let mut overlays = Overlays::default();
 		overlays.sync_approval(&replica);
-		let mut local = LocalFacts::at_launch(options.branch);
+		let (git_watch, git_facts) = GitWatch::start(&options.project).unzip();
+		let mut local = LocalFacts::at_launch(git_watch.as_ref().map(GitWatch::launch));
 		local.sync_con(&options.con, &options.model);
 		let facts = status_facts(&replica, &options.model, &local, None);
 		let composer = Composer::new(
@@ -295,6 +538,9 @@ impl Presenter {
 			slash::roster(&options.con),
 			project_root(&replica).as_deref(),
 		);
+		// A resumed or already-running session starts active (pi derives
+		// `isStreaming` from the session, never from a local edge).
+		let turn_active = has_active_turn(&replica);
 		Self {
 			replica,
 			dom_events: options.dom_events,
@@ -309,16 +555,36 @@ impl Presenter {
 			local,
 			composer,
 			overlays,
-			turn_active: false,
+			turn_active,
 			turn_started: None,
 			last_interrupt: None,
 			last_clear: None,
+			last_escape: None,
+			left_taps: LeftTaps::default(),
 			clock: Instant::now(),
+			intro: Some(Duration::ZERO),
 			mailbox,
 			models: options.models,
 			cycle: options.cycle,
 			last_prompt: None,
 			clipboard: None,
+			git_watch,
+			git_facts,
+			welcome: options.welcome,
+			clipboard_read: None,
+			services: options.services,
+			escape_hooks: Vec::new(),
+			focused_agent: None,
+			collab_guest: false,
+			space_hold: SpaceHold::default(),
+			stt_recording: false,
+			live_active: false,
+			approval_shown: None,
+			viewport_height: 24,
+			transcript: crate::transcript::Local::default(),
+			quota: crate::celebrate::QuotaWatch::default(),
+			notifier: crate::notify::Notifier::new(None),
+			notifications: Vec::new(),
 		}
 	}
 
@@ -337,12 +603,25 @@ impl Presenter {
 		CL_SHOWTHINKING.get(&self.con)
 	}
 
+	/// The welcome block. While pi's 3000ms brand intro runs the block stays
+	/// mutable and unfinalized so it cannot retire into scrollback
+	/// (ADR 0034); the block mounts with the intro time already elapsed, since
+	/// a mounted block's clock starts at its epoch. Once the intro settles
+	/// `finalized` flips, the projection remounts the block once, and that
+	/// remount paints the resting frame.
 	fn welcome(&self) -> RenderedBlock {
 		let status = StatusLine::from_dom(&self.replica);
+		let now = self.clock.elapsed();
+		let intro = self
+			.intro
+			.map(|start| now.saturating_sub(start))
+			.filter(|elapsed| !Intro::done(*elapsed));
 		let welcome = Welcome::new(
 			Str::new_static(env!("CARGO_PKG_VERSION")),
 			&self.model,
-			tip_for(status.session.as_str()),
+			tip_for(status.session.as_str(), self.ui.charset),
+			self.welcome.clone(),
+			intro,
 		);
 		RenderedBlock {
 			view:      BlockView {
@@ -350,61 +629,182 @@ impl Presenter {
 				kind:      BlockKind::Welcome,
 				text:      Str::new_static("welcome"),
 				mode:      Mode::Mutable,
-				finalized: true,
+				finalized: intro.is_none(),
 			},
 			component: Box::new(welcome),
+			stream:    None,
+		}
+	}
+
+	/// Observer-local projection switches for this paint.
+	fn project_options(&self) -> crate::project::Options<'_> {
+		crate::project::Options {
+			show_thinking: self.show_thinking(),
+			expanded:      crate::actions::CL_TOOLS_EXPANDED.get(&self.con),
+			smooth:        crate::transcript::CL_SMOOTH_STREAMING.get(&self.con),
+			prose_only:    crate::transcript::CL_THINKING_PROSE_ONLY.get(&self.con),
+			local:         &self.transcript,
 		}
 	}
 
 	fn blocks(&self) -> Vec<RenderedBlock> {
 		let mut blocks = vec![self.welcome()];
-		blocks.extend(project(&self.replica, &self.cards, &self.ui, self.show_thinking()));
+		blocks.extend(project(&self.replica, &self.cards, &self.ui, &self.project_options()));
 		blocks
 	}
 
 	fn apply_dom_event(&mut self, event: &Event) -> Result<(), HostError> {
+		if let Event::Reset { snapshot } = event {
+			let next = Dom::from_snapshot(snapshot);
+			self.transcript.on_reset(&self.replica, &next);
+		}
 		self.replica.apply_event(event)?;
+		self.transcript.observe(&self.replica, self.clock.elapsed());
+		let was_active = self.turn_active;
 		self.set_turn_active(has_active_turn(&self.replica));
+		if was_active
+			&& !self.turn_active
+			&& let Some(end) = crate::notify::Notifier::turn_end_from_dom(&self.replica)
+			&& let Some(toast) = self.notifier.turn_ended(&self.con, end)
+		{
+			self.notifications.push(toast);
+		}
+		let before = self.overlays.approval().map(|approval| approval.id.clone());
 		self.overlays.sync_approval(&self.replica);
+		let after = self.overlays.approval().map(|approval| approval.id.clone());
+		if before != after {
+			self.approval_shown = after.is_some().then(|| self.clock.elapsed());
+		}
 		Ok(())
+	}
+
+	/// Facts a panel reads while opening or running a call.
+	fn panel_cx(&self, viewport: Size) -> PanelCx<'_> {
+		PanelCx {
+			dom:      &self.replica,
+			con:      &self.con,
+			ui:       &self.ui,
+			viewport,
+			services: &self.services,
+		}
+	}
+
+	/// Whether a Director of `family` is active on the live chain (frames
+	/// nest under `<meta><directors>`, so the scan is recursive).
+	fn director_engaged(&self, family: &str) -> bool {
+		let dom = &self.replica;
+		let Some(root) = dom.children(dom.meta()).iter().copied().find(|handle| {
+			dom.get(*handle)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Directors))
+		}) else {
+			return false;
+		};
+		let family_key = omp_dom::PropKey::Custom(Str::new_static("family"));
+		let status = omp_dom::PropKey::Custom(Str::new_static("status"));
+		let mut pending = dom.children(root).to_vec();
+		while let Some(handle) = pending.pop() {
+			let Some(node) = dom.get(handle) else {
+				continue;
+			};
+			if node.tag == Tag::Known(KnownTag::Director)
+				&& node.prop(&family_key).and_then(Value::as_str) == Some(family)
+				&& node.prop(&status).and_then(Value::as_str) == Some("active")
+			{
+				return true;
+			}
+			pending.extend(node.kids.iter().copied());
+		}
+		false
+	}
+
+	/// Pending queued prompts under `<queues><prompts>` (`/queue`), oldest
+	/// first, as `(id, text)`.
+	fn queued_prompts(&self) -> Vec<(Str, Str)> {
+		let dom = &self.replica;
+		let kind = PropId::Kind.into();
+		let status = PropId::Status.into();
+		let id = PropId::Id.into();
+		dom.children(dom.queues())
+			.iter()
+			.filter_map(|handle| dom.get(*handle))
+			.find(|node| node.tag == Tag::Known(KnownTag::Prompts))
+			.into_iter()
+			.flat_map(|prompts| prompts.kids.iter())
+			.filter_map(|handle| dom.get(*handle))
+			.filter(|node| {
+				node.tag == Tag::Known(KnownTag::Prompt)
+					&& node.prop(&kind).and_then(Value::as_str) == Some("queued")
+					&& node.prop(&status).and_then(Value::as_str) == Some("pending")
+			})
+			.filter_map(|node| {
+				let id = node.prop(&id).and_then(Value::as_str)?;
+				Some((Str::new(id), node.content.clone().unwrap_or_default()))
+			})
+			.collect()
 	}
 
 	fn sync_status(&mut self) -> bool {
 		self.local.sync_con(&self.con, &self.model);
 		let facts = status_facts(&self.replica, &self.model, &self.local, self.turn_started);
-		self.composer.set_status(facts)
+		// The composer wears the rail while the plan Director is engaged, and
+		// the band sits flush under the notice row painted directly above it
+		// (pi `EditorTopGap` / `statusRowOccupied`).
+		let reshaped = self.composer.set_plan_mode(self.plan_engaged());
+		let gapped = self
+			.composer
+			.set_status_row_occupied(self.overlays.notice().is_some());
+		let ime = self
+			.composer
+			.set_ime_safe_cursor(CL_IME_SAFE_CURSOR.get(&self.con));
+		self.composer.set_status(facts) || reshaped || gapped || ime
 	}
 
-	/// Routes one decoded key: an open picker consumes it first, then the
-	/// approval hotkeys, then the console bind table (pi checks app actions
-	/// before editor keys, except Esc while the autocomplete popup is open),
-	/// then the composer.
+	/// Routes one decoded key: the topmost focused overlay consumes it
+	/// first (pickers, approval hotkeys, command panels), then the console
+	/// bind table (pi checks app actions before editor keys, except Esc
+	/// while the autocomplete popup is open), then the space-hold gesture
+	/// and the double-Left gesture, then the composer.
 	fn route_key(&mut self, key: Key) -> Result<Routed, HostError> {
 		// pi's status row disappears on the next input.
 		let had_notice = self.overlays.notice().is_some();
 		self.overlays.clear_notice();
-		match self.overlays.active_mut() {
-			Some(Overlay::Models(picker)) => {
-				let event = picker.key(key);
-				return self.apply_picker_event(event);
-			},
-			Some(Overlay::History(picker)) => {
-				let event = picker.key(key);
-				return self.apply_picker_event(event);
-			},
-			Some(Overlay::Approval(approval)) => {
-				if let Key::Char(value @ ('y' | 'n' | 'a')) = key {
-					let approval = approval.clone();
-					if let Some(decision) = approval.decision(value) {
-						let _ = self
-							.commands
-							.send(HostCommand::Approve { id: approval.id, decision });
+		if self.overlays.modal() {
+			let event = match self.overlays.active_mut() {
+				Some(Overlay::Models(picker)) => Some(picker.key(key)),
+				Some(Overlay::History(picker)) => Some(picker.key(key)),
+				Some(Overlay::Approval(approval)) => {
+					if let Key::Char(value @ ('y' | 'n' | 'a')) = key {
+						let approval = approval.clone();
+						if let Some(decision) = approval.decision(value) {
+							let _ = self
+								.commands
+								.send(HostCommand::Approve { id: approval.id, decision });
+						}
+						self.overlays.dismiss();
+						return Ok(Routed::Repaint);
 					}
-					self.overlays.dismiss();
-					return Ok(Routed::Repaint);
-				}
-			},
-			Some(Overlay::Notice(_)) | None => {},
+					None
+				},
+				Some(Overlay::Panel(panel)) => {
+					let event = match PanelAction::from_key(key) {
+						Some(action) => match panel.action(action) {
+							PanelEvent::Ignored => panel.key(key),
+							event => event,
+						},
+						None => panel.key(key),
+					};
+					let event = match (event, key) {
+						// A panel that ignores Esc still closes on it.
+						(PanelEvent::Ignored, Key::Esc) => PanelEvent::Close,
+						(event, _) => event,
+					};
+					return self.apply_panel_event(event);
+				},
+				None => None,
+			};
+			if let Some(event) = event {
+				return self.apply_picker_event(event);
+			}
 		}
 		if let Some(command) = self.bindings.command(key) {
 			let esc_to_popup = command == "cl_interrupt" && self.composer.popup_open();
@@ -416,7 +816,63 @@ impl Presenter {
 			// Emergency control: pi keeps Ctrl+C live even before bindings load.
 			return self.act(HostAction::Clear);
 		}
-		let routed = match self.composer.key(key) {
+		if let Some(routed) = self.gesture(key)? {
+			return Ok(routed);
+		}
+		let routed = self.composer_key(key)?;
+		Ok(if had_notice && routed == Routed::Ignored {
+			Routed::Repaint
+		} else {
+			routed
+		})
+	}
+
+	/// Composer-bound gestures that run before the editor sees the key:
+	/// the space-hold push-to-talk cadence and the double-Left subagent
+	/// unfocus. `None` hands the key on.
+	fn gesture(&mut self, key: Key) -> Result<Option<Routed>, HostError> {
+		let now = self.clock.elapsed();
+		let enabled = CL_STT_HOLD.get(&self.con) && !self.composer.popup_open();
+		match self.space_hold.observe(key, now, enabled) {
+			SpaceHoldEvent::Pass => {},
+			SpaceHoldEvent::Swallow => return Ok(Some(Routed::Ignored)),
+			SpaceHoldEvent::Begin { track_back } => {
+				self.composer.delete_before_caret(track_back);
+				return Ok(Some(self.set_recording(true)));
+			},
+			SpaceHoldEvent::EndThenPass => {
+				self.set_recording(false);
+			},
+		}
+		if key == Key::Left
+			&& self.focused_agent.is_some()
+			&& self.composer.text().is_empty()
+			&& self.left_taps.tap(Instant::now())
+		{
+			return Ok(Some(self.act(HostAction::FocusAgent(None))?));
+		}
+		Ok(None)
+	}
+
+	/// Starts or stops push-to-talk; the app owns the microphone.
+	fn set_recording(&mut self, active: bool) -> Routed {
+		if self.stt_recording == active {
+			return Routed::Ignored;
+		}
+		self.stt_recording = active;
+		if !active {
+			self.space_hold.end();
+		}
+		let _ = self.commands.send(HostCommand::PushToTalk { active });
+		self.notice(if active {
+			"Listening… release space to transcribe"
+		} else {
+			"Transcribing…"
+		})
+	}
+
+	fn composer_key(&mut self, key: Key) -> Result<Routed, HostError> {
+		Ok(match self.composer.key(key) {
 			ComposerAction::Submit(text) => self.submit(text),
 			// A submitted `/name args` line is the console statement
 			// `name args`, exactly like a bound key.
@@ -427,19 +883,179 @@ impl Presenter {
 			},
 			ComposerAction::Changed => Routed::Repaint,
 			ComposerAction::Ignored => Routed::Ignored,
+		})
+	}
+
+	/// pi `onEscape`: the eleven-rung ladder, top to bottom. Each rung that
+	/// applies consumes the key.
+	fn escape(&mut self) -> Result<Routed, HostError> {
+		// 1. `/mcp test` (and any one-shot cancel hook): fire all, forget all.
+		let cancels = self
+			.escape_hooks
+			.iter()
+			.filter(|hook| hook.rung == EscapeRung::Cancel)
+			.cloned()
+			.collect::<Vec<_>>();
+		if !cancels.is_empty() {
+			self.escape_hooks.retain(|hook| hook.rung != EscapeRung::Cancel);
+			for hook in cancels {
+				let _ = hook.fire();
+			}
+			return Ok(Routed::Repaint);
+		}
+		// 2. Side-channel panels (`/btw`, `/omfg`, `/cleanse`) are the topmost
+		// view; a focused overlay never reaches here.
+		if self.overlays.side_panel() {
+			self.close_overlay();
+			return Ok(Routed::Repaint);
+		}
+		// 3. Maintenance (compaction, handoff, retry backoff) runs inside the
+		// kernel turn: interrupting the turn cancels it (main view only).
+		if self.focused_agent.is_none() && self.maintenance_active() {
+			return Ok(self.interrupt_turn());
+		}
+		// 4. Silence the vocalizer before touching the turn.
+		let silenced = self
+			.escape_hooks
+			.iter()
+			.filter(|hook| hook.rung == EscapeRung::Silence)
+			.any(EscapeHook::fire);
+		if silenced {
+			self.last_escape = None;
+			return Ok(Routed::Repaint);
+		}
+		// 5. Loop mode: abort the streaming iteration, else pause the loop.
+		if self.director_engaged(LOOP_DIRECTOR) {
+			if self.turn_active {
+				return Ok(self.interrupt_turn());
+			}
+			return self.run_console("pause");
+		}
+		// 6. Subagent view: clear typed text, else return to main; never
+		// interrupts the subagent's turn.
+		if self.focused_agent.is_some() {
+			if !self.composer.text().trim().is_empty() {
+				self.composer.clear();
+				return Ok(Routed::Repaint);
+			}
+			return self.act(HostAction::FocusAgent(None));
+		}
+		// 7. Collaboration guest: ask the host to interrupt its agent.
+		if self.collab_guest {
+			if self.turn_active {
+				let _ = self.commands.send(HostCommand::Interrupt);
+			}
+			return Ok(Routed::Ignored);
+		}
+		// 8. Bash / eval prefix mode: clear the draft and leave the mode.
+		if self.composer.prefix_mode().is_some() {
+			self.composer.clear();
+			return Ok(Routed::Repaint);
+		}
+		// 9. Streaming turn: abort, restoring queued messages to the editor.
+		if self.turn_active {
+			let restored = self.restore_queued(true);
+			let routed = self.interrupt_turn();
+			return Ok(routed.max(restored));
+		}
+		// 10. Esc must not destroy an in-progress draft.
+		if !self.composer.text().trim().is_empty() {
+			self.last_escape = None;
+			return Ok(Routed::Ignored);
+		}
+		// 11. Double Esc on an empty composer opens the configured selector.
+		let action = CL_DOUBLE_ESCAPE.get(&self.con);
+		let selector = match action.as_str() {
+			"tree" => Some(Selector::Tree),
+			"none" | "off" => None,
+			_ => Some(Selector::Rewind),
 		};
-		Ok(if had_notice && routed == Routed::Ignored {
+		let Some(selector) = selector else {
+			return Ok(Routed::Ignored);
+		};
+		let now = Instant::now();
+		let doubled = self
+			.last_escape
+			.is_some_and(|prior| now.duration_since(prior) < DOUBLE_ESCAPE_WINDOW);
+		if doubled {
+			self.last_escape = None;
+			return self.run_console(match selector {
+				Selector::Tree => "tree",
+				Selector::Rewind => "branch",
+			});
+		}
+		self.last_escape = Some(now);
+		Ok(Routed::Ignored)
+	}
+
+	/// Whether main-session maintenance (compaction, handoff) is in flight:
+	/// the compaction Director is active while the kernel summarizes.
+	fn maintenance_active(&self) -> bool {
+		self.turn_active && self.director_engaged("compaction")
+	}
+
+	fn interrupt_turn(&mut self) -> Routed {
+		self.last_interrupt = Some(Instant::now());
+		let _ = self.commands.send(HostCommand::Interrupt);
+		Routed::Ignored
+	}
+
+	/// pi `restoreQueuedMessagesToEditor`: pulls queued prompts (and, while
+	/// a turn runs, undelivered steering) back into the composer ahead of
+	/// the current draft. `abort` is the Esc path; a plain dequeue keeps the
+	/// stream running.
+	fn restore_queued(&mut self, abort: bool) -> Routed {
+		let mut texts = Vec::new();
+		if self.turn_active {
+			let (tx, rx) = flume::bounded(1);
+			if self.up.send(Up::Unqueue(tx)).is_ok()
+				&& let Ok(steering) = rx.recv_timeout(Duration::from_millis(200))
+			{
+				texts.extend(steering);
+			}
+		}
+		let queued = self.queued_prompts();
+		if !queued.is_empty() {
+			let _ = self.commands.send(HostCommand::Dequeue {
+				prompts: queued.iter().map(|(id, _)| id.clone()).collect(),
+			});
+			texts.extend(queued.into_iter().map(|(_, text)| text));
+		}
+		if texts.is_empty() {
+			return if abort {
+				Routed::Ignored
+			} else {
+				self.notice("No queued messages to restore")
+			};
+		}
+		let restored = texts.len();
+		let current = self.composer.text();
+		let mut combined = String::new();
+		for text in texts.iter().chain(std::iter::once(&Str::new(current.as_str()))) {
+			if text.trim().is_empty() {
+				continue;
+			}
+			if !combined.is_empty() {
+				combined.push_str("\n\n");
+			}
+			combined.push_str(text);
+		}
+		self.composer.set_text(&combined);
+		if abort {
 			Routed::Repaint
 		} else {
-			routed
-		})
+			self.notice(format!(
+				"Restored {restored} queued message{} to editor",
+				if restored > 1 { "s" } else { "" }
+			))
+		}
 	}
 
 	/// Executes one console line and applies every action it posted.
 	///
 	/// Console failures become a notice rather than ending the host: a
 	/// mistyped `bind` in `config.cfg` must not kill the chat.
-	fn run_console(&mut self, command: &str) -> Result<Routed, HostError> {
+	pub(crate) fn run_console(&mut self, command: &str) -> Result<Routed, HostError> {
 		let before = self.projection_inputs();
 		let failure = self.con.exec(command, Source::Console).err();
 		let mut routed = if before == self.projection_inputs() {
@@ -452,30 +1068,80 @@ impl Presenter {
 			routed = routed.max(self.act(action)?);
 		}
 		if let Some(error) = failure {
-			self.overlays.show(Overlay::Notice(Str::new(error.to_string())));
+			self.overlays.notify(error.to_string());
 			routed = routed.max(Routed::Repaint);
 		}
 		Ok(routed)
 	}
 
+	/// Applies a finished clipboard read: an image persists to a temp file
+	/// and stages as a chip through the drop path, text pastes sanitized or
+	/// verbatim (`raw`, the Ctrl+Shift+V contract).
+	fn deliver_clipboard(&mut self, clipboard: Option<Clipboard>, raw: bool) -> Routed {
+		match clipboard {
+			None => self.notice("Clipboard is empty"),
+			Some(Clipboard::Text(text)) => {
+				if raw {
+					self.composer.paste_raw(&text);
+				} else {
+					self.composer.paste(&text);
+				}
+				Routed::Repaint
+			},
+			Some(Clipboard::Image(image)) => match image.persist() {
+				Ok(path) => {
+					self.composer.paste(&path.to_string_lossy());
+					Routed::Repaint
+				},
+				Err(error) => self.notice(format!("Could not stage the pasted image: {error}")),
+			},
+			Some(Clipboard::Paths(paths)) => {
+				let mut joined = String::new();
+				for path in &paths {
+					if !joined.is_empty() {
+						joined.push(' ');
+					}
+					joined.push('"');
+					joined.push_str(path);
+					joined.push('"');
+				}
+				self.composer.paste(&joined);
+				Routed::Repaint
+			},
+		}
+	}
+
+	/// Drains actions posted outside a console line (app-side results such
+	/// as a speech transcript).
+	fn drain_mailbox(&mut self) -> Result<Routed, HostError> {
+		let mut routed = Routed::Ignored;
+		let actions = self.mailbox.drain().collect::<Vec<_>>();
+		for action in actions {
+			routed = routed.max(self.act(action)?);
+		}
+		Ok(routed)
+	}
+
 	/// Convars whose change forces a transcript rebuild.
-	fn projection_inputs(&self) -> (bool, bool, bool) {
+	fn projection_inputs(&self) -> (bool, bool, bool, bool, bool) {
 		(
 			self.show_thinking(),
 			crate::actions::CL_SHOWTOOLS.get(&self.con),
 			crate::actions::CL_TOOLS_EXPANDED.get(&self.con),
+			crate::transcript::CL_SMOOTH_STREAMING.get(&self.con),
+			crate::transcript::CL_THINKING_PROSE_ONLY.get(&self.con),
 		)
 	}
 
-	fn notice(&mut self, text: impl Into<Str>) -> Routed {
-		self.overlays.show(Overlay::Notice(text.into()));
+	pub(crate) fn notice(&mut self, text: impl Into<Str>) -> Routed {
+		self.overlays.notify(text);
 		Routed::Repaint
 	}
 
 	/// Sends the draft as a submission. The controller — which knows whether
 	/// a turn is really running — starts a turn or steers the active one;
 	/// the replica's view may lag the kernel, so the host never decides.
-	fn submit(&mut self, text: Str) -> Routed {
+	pub(crate) fn submit(&mut self, text: Str) -> Routed {
 		if text.trim().is_empty() {
 			return Routed::Ignored;
 		}
@@ -488,19 +1154,14 @@ impl Presenter {
 	}
 
 	/// Applies one posted host action.
-	fn act(&mut self, action: HostAction) -> Result<Routed, HostError> {
+	pub(crate) fn act(&mut self, action: HostAction) -> Result<Routed, HostError> {
 		Ok(match action {
 			HostAction::Interrupt => {
 				if self.overlays.modal() {
-					self.overlays.dismiss();
+					self.close_overlay();
 					Routed::Repaint
-				} else if self.turn_active {
-					self.last_interrupt = Some(Instant::now());
-					let _ = self.commands.send(HostCommand::Interrupt);
-					Routed::Ignored
 				} else {
-					// Esc never destroys an in-progress draft.
-					Routed::Ignored
+					return self.escape();
 				}
 			},
 			HostAction::Clear => {
@@ -509,6 +1170,10 @@ impl Presenter {
 					.last_clear
 					.is_some_and(|prior| now.duration_since(prior) <= Duration::from_millis(500));
 				self.last_clear = Some(now);
+				if self.stt_recording {
+					self.set_recording(false);
+					return Ok(Routed::Repaint);
+				}
 				if !self.composer.text().is_empty() {
 					self.composer.clear();
 					return Ok(Routed::Repaint);
@@ -544,10 +1209,9 @@ impl Presenter {
 					&self.ui,
 				);
 				self.overlays.show(Overlay::Models(picker));
-				let _ = self.commands.send(HostCommand::Overlay {
-					id:   Str::new_static("models"),
-					open: true,
-				});
+				let _ = self
+					.commands
+					.send(HostCommand::Overlay { id: Str::new_static("models"), open: true });
 				Routed::Repaint
 			},
 			HostAction::FollowUp => {
@@ -584,15 +1248,157 @@ impl Presenter {
 				if prompts.is_empty() {
 					return Ok(self.notice("No prompt history in this session"));
 				}
-				let picker =
-					HistoryPicker::open(prompts, self.composer.frame().size().width, &self.ui);
+				let picker = HistoryPicker::open(prompts, self.composer.frame().size().width, &self.ui);
 				self.overlays.show(Overlay::History(picker));
 				Routed::Repaint
 			},
 			HostAction::ExternalEditor => Routed::ExternalEditor,
+			HostAction::Dequeue => self.restore_queued(false),
+			HostAction::PasteImage => {
+				self.clipboard_read = Some(ClipboardRead::Smart);
+				Routed::Ignored
+			},
+			HostAction::PasteRaw => {
+				self.clipboard_read = Some(ClipboardRead::Text);
+				Routed::Ignored
+			},
+			HostAction::CopyLine => {
+				let line = self.composer.current_line();
+				if line.is_empty() {
+					return Ok(self.notice("Nothing to copy on this line"));
+				}
+				self.clipboard = Some(line);
+				self.notice("Copied line")
+			},
+			HostAction::CopyPrompt => {
+				let text = self.composer.text();
+				if text.is_empty() {
+					return Ok(self.notice("Nothing to copy"));
+				}
+				self.clipboard = Some(Str::new(text));
+				self.notice("Copied prompt")
+			},
+			HostAction::FocusAgent(agent) => {
+				let changed = self.focused_agent != agent;
+				let _ = self.commands.send(HostCommand::Overlay {
+					id:   Str::new(format!(
+						"agent:{}",
+						agent
+							.as_deref()
+							.or(self.focused_agent.as_deref())
+							.unwrap_or_default()
+					)),
+					open: agent.is_some(),
+				});
+				self.focused_agent = agent;
+				self.left_taps = LeftTaps::default();
+				self.last_escape = None;
+				if !changed {
+					return Ok(Routed::Ignored);
+				}
+				match self.focused_agent.as_deref() {
+					Some(id) => self.notice(format!("Viewing subagent {id} · Esc returns to main")),
+					None => self.notice("Back to main session"),
+				}
+			},
+			HostAction::CollabGuest(guest) => {
+				self.collab_guest = guest;
+				Routed::Ignored
+			},
+			HostAction::SttToggle => {
+				let active = !self.stt_recording;
+				self.set_recording(active)
+			},
+			HostAction::PushToTalk { active } => self.set_recording(active),
+			HostAction::LiveToggle => {
+				if self.stt_recording {
+					self.set_recording(false);
+				}
+				self.live_active = !self.live_active;
+				let active = self.live_active;
+				let _ = self.commands.send(HostCommand::LiveVoice { active });
+				self.notice(if active {
+					"Live voice on · Ctrl+L to stop"
+				} else {
+					"Live voice off"
+				})
+			},
+			HostAction::InsertText(text) => {
+				if self.stt_recording {
+					// Recognized while a toggle recording continues.
+					self.composer.paste(text.as_str());
+				} else {
+					self.composer.paste(text.as_str());
+					self.overlays.clear_notice();
+				}
+				Routed::Repaint
+			},
+			HostAction::EscapeHook(hook) => {
+				self.escape_hooks.retain(|prior| prior.id != hook.id);
+				self.escape_hooks.push(hook);
+				Routed::Ignored
+			},
+			HostAction::DropEscapeHook(id) => {
+				self.escape_hooks.retain(|prior| prior.id != id);
+				Routed::Ignored
+			},
+			HostAction::Open(opener) => {
+				let viewport = self.viewport();
+				let opened = opener.open(&self.panel_cx(viewport));
+				match opened {
+					Ok(panel) => {
+						let _ = self.commands.send(HostCommand::Overlay {
+							id:   Str::new_static(panel.id()),
+							open: true,
+						});
+						self.overlays.show(Overlay::Panel(panel));
+						Routed::Repaint
+					},
+					Err(error) => self.notice(error),
+				}
+			},
+			HostAction::Call(call) => {
+				let viewport = self.viewport();
+				let event = call.call(&self.panel_cx(viewport));
+				self.apply_panel_event(event)?
+			},
+			HostAction::Command(action) => self.run_command(action)?,
 			HostAction::Reply { severity, text } => match severity {
 				omp_con::Severity::Info if text.is_empty() => Routed::Ignored,
 				_ => self.notice(text),
+			},
+		})
+	}
+
+	/// The terminal viewport panels size against: the composer width and
+	/// the last presented height.
+	fn viewport(&self) -> Size {
+		Size::new(self.composer.frame().size().width, self.viewport_height)
+	}
+
+	/// Applies what a panel (or a command-owned call) asked for.
+	fn apply_panel_event(&mut self, event: PanelEvent) -> Result<Routed, HostError> {
+		Ok(match event {
+			PanelEvent::Ignored => Routed::Ignored,
+			PanelEvent::Consumed => Routed::Repaint,
+			PanelEvent::Close => {
+				self.close_overlay();
+				Routed::Repaint
+			},
+			PanelEvent::Run(line) => self.run_console(line.as_str())?.max(Routed::Repaint),
+			PanelEvent::Finish(line) => {
+				self.close_overlay();
+				self.run_console(line.as_str())?.max(Routed::Repaint)
+			},
+			PanelEvent::Recall(text) => {
+				self.close_overlay();
+				self.composer.set_text(text.as_str());
+				Routed::Repaint
+			},
+			PanelEvent::Notice(text) => self.notice(text),
+			PanelEvent::Copy(text) => {
+				self.clipboard = Some(text);
+				Routed::Repaint
 			},
 		})
 	}
@@ -624,14 +1430,14 @@ impl Presenter {
 		})
 	}
 
-	fn close_overlay(&mut self) {
-		if matches!(self.overlays.active(), Some(Overlay::Models(_))) {
-			let _ = self.commands.send(HostCommand::Overlay {
-				id:   Str::new_static("models"),
-				open: false,
-			});
+	pub(crate) fn close_overlay(&mut self) {
+		if let Some(overlay) = self.overlays.dismiss()
+			&& matches!(overlay, Overlay::Models(_) | Overlay::Panel(_))
+		{
+			let _ = self
+				.commands
+				.send(HostCommand::Overlay { id: Str::new_static(overlay.id()), open: false });
 		}
-		self.overlays.dismiss();
 	}
 
 	/// Writes the picked model to the control plane: `ai_model` for the
@@ -738,10 +1544,7 @@ impl Presenter {
 			return self.notice("Only one role model available");
 		}
 		let live = self.live_model();
-		let at = self
-			.cycle
-			.iter()
-			.position(|(_, model)| *model == live);
+		let at = self.cycle.iter().position(|(_, model)| *model == live);
 		let len = self.cycle.len();
 		let next = match (at, backward) {
 			(Some(index), false) => (index + 1) % len,
@@ -784,33 +1587,8 @@ impl Presenter {
 	/// Whether the plan Director is engaged on the live chain: an active
 	/// `<director family=plan>` anywhere under `<meta><directors>` (frames
 	/// nest, so the scan is recursive).
-	fn plan_engaged(&self) -> bool {
-		let dom = &self.replica;
-		let Some(root) = dom
-			.children(dom.meta())
-			.iter()
-			.copied()
-			.find(|handle| {
-				dom.get(*handle)
-					.is_some_and(|node| node.tag == Tag::Known(KnownTag::Directors))
-			})
-		else {
-			return false;
-		};
-		let family = omp_dom::PropKey::Custom(Str::new_static("family"));
-		let status = omp_dom::PropKey::Custom(Str::new_static("status"));
-		let mut pending = dom.children(root).to_vec();
-		while let Some(handle) = pending.pop() {
-			let Some(node) = dom.get(handle) else { continue };
-			if node.tag == Tag::Known(KnownTag::Director)
-				&& node.prop(&family).and_then(Value::as_str) == Some(PLAN_DIRECTOR)
-				&& node.prop(&status).and_then(Value::as_str) == Some("active")
-			{
-				return true;
-			}
-			pending.extend(node.kids.iter().copied());
-		}
-		false
+	pub(crate) fn plan_engaged(&self) -> bool {
+		self.director_engaged(PLAN_DIRECTOR)
 	}
 
 	/// Whether the newest turn closed with an error notice.
@@ -819,8 +1597,7 @@ impl Presenter {
 		let Some(turn) = dom.children(dom.body()).last() else {
 			return false;
 		};
-		dom
-			.children(*turn)
+		dom.children(*turn)
 			.iter()
 			.rev()
 			.filter_map(|handle| dom.get(*handle))
@@ -831,19 +1608,127 @@ impl Presenter {
 	}
 
 	fn approval_frame(&self, width: u16) -> Option<Frame> {
-		self
-			.overlays
-			.approval()
-			.map(|approval| approval_frame(approval, width, &self.ui))
+		let approval = self.overlays.approval()?;
+		let countdown = approval.timeout.and_then(|timeout| {
+			let shown = self.approval_shown?;
+			let countdown = Countdown::new("auto-decides in", shown, timeout);
+			Some(countdown.remaining(self.clock.elapsed()))
+		});
+		Some(approval_frame(approval, countdown, width, &self.ui))
 	}
 
-	/// Bottom-anchored picker frame, when a picker is open.
-	fn picker_frame(&mut self, size: Size) -> Option<Frame> {
-		match self.overlays.active_mut() {
-			Some(Overlay::Models(picker)) => Some(picker.frame(size).clone()),
-			Some(Overlay::History(picker)) => Some(picker.frame(size).clone()),
-			_ => None,
+	/// Next whole-second wake while an approval countdown is showing.
+	fn approval_wake(&self) -> Option<Duration> {
+		let approval = self.overlays.approval()?;
+		let timeout = approval.timeout?;
+		let shown = self.approval_shown?;
+		let now = self.clock.elapsed();
+		if now.saturating_sub(shown) >= timeout {
+			return None;
 		}
+		let elapsed = now.saturating_sub(shown);
+		Some(shown + Duration::from_secs(elapsed.as_secs() + 1))
+	}
+
+	/// Frame and anchor of the topmost focused overlay (picker or panel),
+	/// when one is open.
+	fn overlay_frame(&mut self, size: Size) -> Option<(Frame, PanelAnchor)> {
+		let center = Size::new(size.width * 4 / 5, size.height.saturating_sub(2));
+		match self.overlays.active_mut() {
+			Some(Overlay::Models(picker)) => Some((picker.frame(size).clone(), PanelAnchor::Bottom)),
+			Some(Overlay::History(picker)) => {
+				Some((picker.frame(size).clone(), PanelAnchor::Bottom))
+			},
+			Some(Overlay::Panel(panel)) => {
+				let anchor = panel.anchor();
+				let viewport = match anchor {
+					PanelAnchor::Center => center,
+					PanelAnchor::Bottom | PanelAnchor::Full | PanelAnchor::Side => size,
+				};
+				Some((panel.frame(viewport).clone(), anchor))
+			},
+			Some(Overlay::Approval(_)) | None => None,
+		}
+	}
+
+	/// Advances the topmost panel's animations, closing a panel that
+	/// reports itself finished.
+	fn tick_overlay(&mut self, now: Duration) -> Result<bool, HostError> {
+		let (changed, finished, settled) = match self.overlays.active_mut() {
+			Some(Overlay::Panel(panel)) => {
+				let changed = panel.tick(now);
+				let settled = if changed { panel.settled() } else { None };
+				(changed, panel.finished(), settled)
+			},
+			_ => (false, false, None),
+		};
+		if finished {
+			self.close_overlay();
+			return Ok(true);
+		}
+		if let Some(event) = settled {
+			self.apply_panel_event(event)?;
+			return Ok(true);
+		}
+		Ok(changed)
+	}
+
+	/// Earliest wake among the overlay stack, the approval countdown, the
+	/// space-hold release timer, and the quota refresh.
+	fn next_wake(&self) -> Option<Duration> {
+		let panel = match self.overlays.active() {
+			Some(Overlay::Panel(panel)) => panel.next_wake(),
+			_ => None,
+		};
+		let quota = crate::celebrate::CL_CODEX_FIREWORKS
+			.get(&self.con)
+			.then(|| {
+				self
+					.quota
+					.next_wake(self.clock.elapsed(), self.model.provider.as_str())
+			})
+			.flatten();
+		[panel, self.approval_wake(), self.space_hold.next_wake(), quota]
+			.into_iter()
+			.flatten()
+			.min()
+	}
+
+	/// Polls the Codex quota watch and opens the reset fireworks when
+	/// consecutive reports show an unscheduled weekly reset (pi
+	/// `#applyUsageRefreshReports` → `showCodexResetFireworks`).
+	fn tick_quota(&mut self, now: Duration) -> Result<bool, HostError> {
+		if !crate::celebrate::CL_CODEX_FIREWORKS.get(&self.con) {
+			return Ok(false);
+		}
+		let Some(event) = self
+			.quota
+			.poll(self.services.as_ref(), self.model.provider.as_str(), now)
+		else {
+			return Ok(false);
+		};
+		let showing = matches!(
+			self.overlays.active(),
+			Some(Overlay::Panel(panel)) if panel.id() == "fireworks"
+		);
+		if showing {
+			return Ok(false);
+		}
+		let opener = crate::overlays::PanelOpener::new(move |cx| {
+			Ok(Box::new(crate::overlays::fireworks::Fireworks::open(event, cx))
+				as Box<dyn crate::overlays::Panel>)
+		});
+		self.act(HostAction::Open(opener))?;
+		Ok(true)
+	}
+
+	/// Ends a push-to-talk hold whose release gap elapsed.
+	fn tick_space_hold(&mut self, now: Duration) -> bool {
+		if self.space_hold.release_due(now) {
+			self.set_recording(false);
+			return true;
+		}
+		false
 	}
 
 	/// One-row notice frame above the composer, when a notice is showing.
@@ -885,7 +1770,7 @@ impl Host {
 			let mut renderer = Renderer::new(TtyOut::new()?);
 			renderer.apply_caps(&caps)?;
 			let size = terminal.size()?;
-			self.presenter.composer.resize(size.width);
+			self.presenter.composer.resize(size.width, size.height);
 			self.rebuild_projection(size);
 			let result = self.event_loop(&mut terminal, &mut renderer, size).await;
 			let leave = terminal.leave();
@@ -897,15 +1782,20 @@ impl Host {
 			// The terminal is fully restored here: the shell, a child editor,
 			// or a fresh probe owns it until the loop re-enters.
 			match pause {
-				Pause::Quit => return Ok(()),
+				Pause::Quit => {
+					arm_hard_abort();
+					return Ok(());
+				},
 				Pause::Suspend => suspend_process(),
 				Pause::ExternalEditor => {
+					// pi `handleExternalEditor`: chips expand to their pasted text
+					// before the draft reaches `$EDITOR`; the result lands verbatim.
 					let draft = self.presenter.composer.text();
 					match crate::editor::edit_draft_detached(
 						&draft,
 						crate::editor::EditorOptions::default(),
 					) {
-						Ok(Some(edited)) => self.presenter.composer.set_text(&edited),
+						Ok(Some(edited)) => self.presenter.composer.replace_edited(&edited),
 						Ok(None) => {},
 						Err(error) => {
 							self.presenter.notice(error.to_string());
@@ -924,8 +1814,16 @@ impl Host {
 		mut size: Size,
 	) -> Result<Pause, HostError> {
 		self.present(renderer, size)?;
+		// One background clipboard read at a time (Ctrl+V / Ctrl+Shift+V);
+		// a stale result is dropped with its receiver.
+		let mut clipboard: Option<(oneshot::Receiver<Option<Clipboard>>, bool, Instant)> = None;
+		let mailbox = Arc::clone(&self.presenter.mailbox);
 		loop {
 			let deadline = self.next_deadline();
+			if let Some(scope) = self.presenter.clipboard_read.take() {
+				clipboard = Some((spawn_clipboard_read(scope), scope == ClipboardRead::Text, Instant::now()));
+			}
+			let clipboard_pending = clipboard.is_some();
 			tokio::select! {
 				biased;
 				terminal_event = terminal.next() => {
@@ -933,30 +1831,34 @@ impl Host {
 						TerminalEvent::Resize => {
 							if let Some(next) = terminal.take_resize()? {
 								size = next;
-								self.presenter.composer.resize(next.width);
+								self.presenter.composer.resize(next.width, next.height);
 								self.projection_mut().resize(next);
 								self.present(renderer, size)?;
 							}
 						},
 						TerminalEvent::Input(event) => {
 							if terminal.handle_input_event(&event, renderer)? {
+								// A completed OSC 5522 offer carries an image or text
+								// paste out of band (pi enhanced paste).
+								if let Some(pasted) = terminal.take_paste() {
+									let clipboard = match pasted {
+										omp_tui::Pasted::Text(text) => Clipboard::Text(text.to_string()),
+										omp_tui::Pasted::Image(image) => Clipboard::Image(image),
+									};
+									let routed = self.presenter.deliver_clipboard(Some(clipboard), false);
+									if let Some(pause) = self.apply_routed(routed, renderer, size)? {
+										return Ok(pause);
+									}
+								}
 								continue;
 							}
 							let routed = self.input(event)?;
 							if let Some(text) = self.presenter.clipboard.take() {
 								terminal.copy_to_clipboard(&text)?;
 							}
-							match routed {
-								Routed::Quit => break,
-								Routed::Suspend => return Ok(Pause::Suspend),
-								Routed::ExternalEditor => return Ok(Pause::ExternalEditor),
-								Routed::DisplayReset => return Ok(Pause::DisplayReset),
-								Routed::Ignored => {},
-								Routed::Repaint => self.present(renderer, size)?,
-								Routed::RebuildProjection => {
-									self.rebuild_projection(size);
-									self.present(renderer, size)?;
-								},
+							match self.apply_routed(routed, renderer, size)? {
+								Some(pause) => return Ok(pause),
+								None => {},
 							}
 						},
 						TerminalEvent::Debug(query) => {
@@ -972,20 +1874,67 @@ impl Host {
 						self.present(renderer, size)?;
 					}
 				},
+				action = mailbox.next() => {
+					if let Some(action) = action {
+						let routed = self.presenter.act(action)?.max(self.presenter.drain_mailbox()?);
+						if let Some(text) = self.presenter.clipboard.take() {
+							terminal.copy_to_clipboard(&text)?;
+						}
+						if let Some(pause) = self.apply_routed(routed, renderer, size)? {
+							return Ok(pause);
+						}
+					}
+				},
+				read = async {
+					match clipboard.as_mut() {
+						Some((rx, _, started)) => {
+							let elapsed = started.elapsed();
+							match tokio::time::timeout(CLIPBOARD_READ_TIMEOUT.saturating_sub(elapsed), rx).await {
+								Ok(Ok(content)) => content,
+								Ok(Err(_)) | Err(_) => None,
+							}
+						},
+						None => future::pending().await,
+					}
+				}, if clipboard_pending => {
+					let raw = clipboard.take().is_some_and(|(_, raw, _)| raw);
+					let routed = self.presenter.deliver_clipboard(read, raw);
+					if let Some(pause) = self.apply_routed(routed, renderer, size)? {
+						return Ok(pause);
+					}
+				},
 				dom_event = self.presenter.dom_events.recv_async() => {
 					let Ok(event) = dom_event else { break };
 					let reset = matches!(event, Event::Reset { .. });
 					self.presenter.apply_dom_event(&event)?;
 					if reset {
-						self.rebuild_projection(size);
+						self.reset_projection(size);
 					} else {
 						self.reconcile_projection(size);
 					}
 					self.present(renderer, size)?;
+					// Toasts the settled turn earned go out after its paint (OSC
+					// 99/9/777, then BEL by capability).
+					for toast in self.presenter.notifications.drain(..) {
+						if let Err(error) = terminal.notify(&toast) {
+							tracing::debug!(%error, "notification delivery failed");
+						}
+					}
 				},
 				kernel_event = self.presenter.kernel_events.recv_async() => {
-					if kernel_event.is_err() {
+					let Ok(event) = kernel_event else {
 						break;
+					};
+					let now = self.presenter.clock.elapsed();
+					if self.presenter.transcript.on_kernel_event(&event, now) {
+						self.reconcile_projection(size);
+						self.present(renderer, size)?;
+					}
+				},
+				git = recv_git(self.presenter.git_facts.as_ref()) => {
+					self.presenter.local.set_git(&git);
+					if self.presenter.sync_status() {
+						self.present(renderer, size)?;
 					}
 				},
 			}
@@ -995,18 +1944,47 @@ impl Host {
 		Ok(Pause::Quit)
 	}
 
-	/// Earliest animation wake across the composer and mounted blocks, in
-	/// host-clock time.
+	/// Applies a routing outcome to the terminal; `Some` releases the tty.
+	fn apply_routed(
+		&mut self,
+		routed: Routed,
+		renderer: &mut Renderer<TtyOut>,
+		size: Size,
+	) -> Result<Option<Pause>, HostError> {
+		match routed {
+			Routed::Quit => {
+				let _ = self.presenter.up.send(Up::Cancel);
+				let _ = self.presenter.commands.send(HostCommand::Quit);
+				Ok(Some(Pause::Quit))
+			},
+			Routed::Suspend => Ok(Some(Pause::Suspend)),
+			Routed::ExternalEditor => Ok(Some(Pause::ExternalEditor)),
+			Routed::DisplayReset => Ok(Some(Pause::DisplayReset)),
+			Routed::Ignored => Ok(None),
+			Routed::Repaint => {
+				self.present(renderer, size)?;
+				Ok(None)
+			},
+			Routed::RebuildProjection => {
+				self.rebuild_projection(size);
+				self.present(renderer, size)?;
+				Ok(None)
+			},
+		}
+	}
+
+	/// Earliest animation wake across the composer, mounted blocks, the
+	/// overlay stack, and the gesture timers, in host-clock time.
 	fn next_deadline(&self) -> Option<Duration> {
 		let composer = self.presenter.composer.next_wake();
 		let blocks = self
 			.projection
 			.as_ref()
 			.and_then(|projection| projection.next_wake());
-		match (composer, blocks) {
-			(Some(a), Some(b)) => Some(a.min(b)),
-			(a, b) => a.or(b),
-		}
+		[composer, blocks, self.presenter.next_wake()]
+			.into_iter()
+			.flatten()
+			.min()
 	}
 
 	fn tick(&mut self) -> bool {
@@ -1016,7 +1994,17 @@ impl Host {
 			.projection
 			.as_mut()
 			.is_some_and(|projection| projection.tick(now));
-		composer || blocks
+		let overlay = self.presenter.tick_overlay(now).unwrap_or_else(|error| {
+			self.presenter.notice(error.to_string());
+			true
+		});
+		let countdown = self.presenter.approval_wake().is_some();
+		let hold = self.presenter.tick_space_hold(now);
+		let quota = self.presenter.tick_quota(now).unwrap_or_else(|error| {
+			self.presenter.notice(error.to_string());
+			true
+		});
+		composer || blocks || overlay || countdown || hold || quota
 	}
 
 	fn debug_response(&self, op: DebugOp, size: Size) -> serde_json::Value {
@@ -1091,17 +2079,17 @@ impl Host {
 				"values": {
 					"composer": presenter.composer.text(),
 					"overlay_open": presenter.overlays.modal(),
-					"overlay": match presenter.overlays.active() {
-						Some(Overlay::Models(_)) => "models",
-						Some(Overlay::History(_)) => "history",
-						Some(Overlay::Approval(_)) => "approval",
-						Some(Overlay::Notice(_)) => "notice",
-						None => "",
-					},
+					"overlay": presenter.overlays.active().map(Overlay::id).unwrap_or_default(),
+					"overlay_depth": presenter.overlays.depth(),
 					"notice": presenter.overlays.notice().unwrap_or_default(),
 					"model": presenter.live_model(),
 					"thinking": AI_THINKING.get(&presenter.con),
 					"turn_active": presenter.turn_active,
+					"focused_agent": presenter.focused_agent.as_deref().unwrap_or_default(),
+					"collab_guest": presenter.collab_guest,
+					"recording": presenter.stt_recording,
+					"prefix_mode": presenter.composer.prefix_mode().map(|mode| format!("{mode:?}").to_lowercase()).unwrap_or_default(),
+					"escape_hooks": presenter.escape_hooks.iter().map(|hook| hook.id.as_str()).collect::<Vec<_>>(),
 					"cursor": presenter.composer.frame().cursor().map(|(column, row)| vec![row, column]),
 				},
 			}),
@@ -1113,6 +2101,20 @@ impl Host {
 		match event {
 			InputEvent::Key(key) => self.presenter.route_key(key),
 			InputEvent::Paste(text) => {
+				// An empty bracketed paste is how some terminals announce an
+				// image-only pasteboard (macOS Cmd+V): read the clipboard.
+				if text.is_empty() {
+					self.presenter.clipboard_read = Some(ClipboardRead::Smart);
+					return Ok(Routed::Ignored);
+				}
+				if let Some(Overlay::Panel(panel)) = self.presenter.overlays.active_mut()
+					&& panel.anchor() != PanelAnchor::Side
+				{
+					let event = panel.paste(text.as_str());
+					if event != PanelEvent::Ignored {
+						return self.presenter.apply_panel_event(event);
+					}
+				}
 				self.presenter.composer.paste(text.as_str());
 				Ok(Routed::Repaint)
 			},
@@ -1146,10 +2148,24 @@ impl Host {
 		}
 	}
 
+	/// A session reset (`/new`, `/drop`, rewind, resume): the live document is
+	/// replaced in place while rows already in native scrollback stay put
+	/// (ADR 0034; pi `resetTranscript` minus its `clearScrollback`).
+	fn reset_projection(&mut self, size: Size) {
+		let now = self.presenter.clock.elapsed();
+		let blocks = self.presenter.blocks();
+		let mirror = self.presenter.blocks();
+		match self.projection.as_mut() {
+			Some(projection) => projection.reset_in_place(blocks, mirror, now),
+			None => self.rebuild_projection(size),
+		}
+	}
+
 	fn present(&mut self, renderer: &mut Renderer<TtyOut>, size: Size) -> Result<(), HostError> {
 		self.presenter.sync_status();
+		self.presenter.viewport_height = size.height;
 		let approval = self.presenter.approval_frame(size.width);
-		let picker = self.presenter.picker_frame(size);
+		let overlay = self.presenter.overlay_frame(size);
 		let notice = self.presenter.notice_frame(size.width);
 		let composer = &self.presenter.composer;
 		let projection = self
@@ -1167,11 +2183,42 @@ impl Host {
 			.width(Dim::Pct(80))
 			.anchor(OverlayAnchor::Center)
 			.z(30);
-		// Pickers replace the composer band (pi swaps the editor slot).
-		let picker_options = OverlayOptions::default()
-			.width(Dim::Cells(size.width))
-			.anchor(OverlayAnchor::BottomLeft)
-			.z(20);
+		// Pickers replace the composer band (pi swaps the editor slot);
+		// dialogs center; dashboards cover the viewport; side panels sit
+		// above the still-live composer.
+		let (picker_options, picker_modal) = match overlay.as_ref().map(|(_, anchor)| *anchor) {
+			Some(PanelAnchor::Center) => (
+				OverlayOptions::default()
+					.width(Dim::Pct(80))
+					.anchor(OverlayAnchor::Center)
+					.z(20),
+				true,
+			),
+			Some(PanelAnchor::Full) => (
+				OverlayOptions::default()
+					.width(Dim::Cells(size.width))
+					.anchor(OverlayAnchor::TopLeft)
+					.z(20),
+				true,
+			),
+			Some(PanelAnchor::Side) => (
+				OverlayOptions::default()
+					.width(Dim::Cells(size.width))
+					.anchor(OverlayAnchor::BottomLeft)
+					.margin(omp_tui::OverlayMargin { bottom: composer.height(), ..Default::default() })
+					.non_modal()
+					.z(20),
+				false,
+			),
+			Some(PanelAnchor::Bottom) | None => (
+				OverlayOptions::default()
+					.width(Dim::Cells(size.width))
+					.anchor(OverlayAnchor::BottomLeft)
+					.z(20),
+				true,
+			),
+		};
+		let picker = overlay.map(|(frame, _)| frame);
 		// pi's status row sits directly above the editor.
 		let notice_options = OverlayOptions::default()
 			.width(Dim::Cells(size.width))
@@ -1179,17 +2226,18 @@ impl Host {
 			.margin(omp_tui::OverlayMargin { bottom: composer.height(), ..Default::default() })
 			.non_modal()
 			.z(15);
-		let modal = approval.is_some() || picker.is_some();
-		let mut layers = vec![Layer {
-			frame:   &document,
-			options: &document_options,
-			active:  !modal,
-		}];
+		let modal = approval.is_some() || (picker.is_some() && picker_modal);
+		let mut layers =
+			vec![Layer { frame: &document, options: &document_options, active: !modal }];
 		if let Some(frame) = notice.as_ref() {
 			layers.push(Layer { frame, options: &notice_options, active: false });
 		}
 		if let Some(frame) = picker.as_ref() {
-			layers.push(Layer { frame, options: &picker_options, active: approval.is_none() });
+			layers.push(Layer {
+				frame,
+				options: &picker_options,
+				active: approval.is_none() && picker_modal,
+			});
 		}
 		if let Some(frame) = approval.as_ref() {
 			layers.push(Layer { frame, options: &approval_options, active: true });
@@ -1256,6 +2304,15 @@ impl NativeHost {
 		while self.presenter.kernel_events.try_recv().is_ok() {
 			changed = true;
 		}
+		while let Some(git) = self
+			.presenter
+			.git_facts
+			.as_ref()
+			.and_then(|facts| facts.try_recv().ok())
+		{
+			self.presenter.local.set_git(&git);
+			changed |= self.presenter.sync_status();
+		}
 		let now = self.presenter.clock.elapsed();
 		changed |= self.presenter.composer.tick(now);
 		if changed {
@@ -1269,7 +2326,7 @@ impl NativeHost {
 	/// Reflows the native projection for a new cell viewport.
 	pub fn resize(&mut self, size: Size) {
 		self.size = size;
-		self.presenter.composer.resize(size.width);
+		self.presenter.composer.resize(size.width, size.height);
 		self.refresh();
 	}
 
@@ -1281,12 +2338,13 @@ impl NativeHost {
 			// A window has no tty to release: the external editor runs in
 			// place, suspend and display reset degrade to a repaint.
 			Routed::ExternalEditor => {
+				// Chips expand into the draft; the edited text lands verbatim.
 				let draft = self.presenter.composer.text();
 				match crate::editor::edit_draft_detached(
 					&draft,
 					crate::editor::EditorOptions::default(),
 				) {
-					Ok(Some(edited)) => self.presenter.composer.set_text(&edited),
+					Ok(Some(edited)) => self.presenter.composer.replace_edited(&edited),
 					Ok(None) => {},
 					Err(error) => {
 						self.presenter.notice(error.to_string());
@@ -1295,10 +2353,7 @@ impl NativeHost {
 				self.refresh();
 				NativeEffect::Consumed
 			},
-			Routed::Repaint
-			| Routed::RebuildProjection
-			| Routed::Suspend
-			| Routed::DisplayReset => {
+			Routed::Repaint | Routed::RebuildProjection | Routed::Suspend | Routed::DisplayReset => {
 				self.refresh();
 				NativeEffect::Consumed
 			},
@@ -1330,9 +2385,104 @@ impl NativeHost {
 		self.presenter.overlays.modal()
 	}
 
-	/// Frame of the open picker, when one is showing.
+	/// Frame of the open picker or panel, when one is showing.
 	pub fn picker_frame(&mut self) -> Option<Frame> {
-		self.presenter.picker_frame(self.size)
+		self
+			.presenter
+			.overlay_frame(self.size)
+			.map(|(frame, _)| frame)
+	}
+
+	/// Identity of the topmost overlay, when one is open.
+	#[must_use]
+	pub fn overlay_id(&self) -> Option<&'static str> {
+		self.presenter.overlays.active().map(Overlay::id)
+	}
+
+	/// Number of stacked overlays.
+	#[must_use]
+	pub fn overlay_depth(&self) -> usize {
+		self.presenter.overlays.depth()
+	}
+
+	/// Current unsent draft.
+	#[must_use]
+	pub fn composer_text(&self) -> String {
+		self.presenter.composer.text()
+	}
+
+	/// Subagent the view is focused on, when any.
+	#[must_use]
+	pub fn focused_agent(&self) -> Option<&str> {
+		self.presenter.focused_agent.as_deref()
+	}
+
+	/// Whether push-to-talk is recording.
+	#[must_use]
+	pub const fn recording(&self) -> bool {
+		self.presenter.stt_recording
+	}
+
+	/// Ids of the registered Esc hooks.
+	#[must_use]
+	pub fn escape_hooks(&self) -> Vec<Str> {
+		self
+			.presenter
+			.escape_hooks
+			.iter()
+			.map(|hook| hook.id.clone())
+			.collect()
+	}
+
+	/// Text the last key asked to copy, if any (drained).
+	pub fn take_clipboard(&mut self) -> Option<Str> {
+		self.presenter.clipboard.take()
+	}
+
+	/// Clipboard read the last key asked for, if any (drained).
+	pub fn take_clipboard_read(&mut self) -> Option<ClipboardRead> {
+		self.presenter.clipboard_read.take()
+	}
+
+	/// Delivers a finished clipboard read exactly as the terminal loop would.
+	pub fn deliver_clipboard(&mut self, clipboard: Option<Clipboard>, raw: bool) -> NativeEffect {
+		let routed = self.presenter.deliver_clipboard(clipboard, raw);
+		self.native_effect(routed)
+	}
+
+	/// Applies one host action directly (what a posted mailbox action does).
+	pub fn act(&mut self, action: HostAction) -> Result<NativeEffect, HostError> {
+		let routed = self.presenter.act(action)?;
+		Ok(self.native_effect(routed))
+	}
+
+	/// Advances the presentation clock to `now` (gesture and countdown
+	/// timers); returns whether anything repainted.
+	pub fn tick(&mut self, now: Duration) -> bool {
+		let changed = self.presenter.composer.tick(now)
+			| self.presenter.tick_overlay(now).unwrap_or(true)
+			| self.presenter.tick_space_hold(now);
+		if changed {
+			self.refresh();
+		}
+		changed
+	}
+
+	/// Presentation-clock epoch, for driving [`NativeHost::tick`].
+	#[must_use]
+	pub const fn clock(&self) -> Instant {
+		self.presenter.clock
+	}
+
+	fn native_effect(&mut self, routed: Routed) -> NativeEffect {
+		match routed {
+			Routed::Quit => NativeEffect::Quit,
+			Routed::Ignored => NativeEffect::Ignored,
+			_ => {
+				self.refresh();
+				NativeEffect::Consumed
+			},
+		}
 	}
 
 	/// Routes clipboard text through the same composer used by the terminal.
@@ -1396,6 +2546,18 @@ async fn frame_deadline(clock: Instant, deadline: Option<Duration>) {
 	}
 }
 
+/// Next git watch delivery; pends forever outside a checkout or once the
+/// watcher has stopped.
+async fn recv_git(facts: Option<&Receiver<GitFacts>>) -> GitFacts {
+	match facts {
+		Some(facts) => match facts.recv_async().await {
+			Ok(facts) => facts,
+			Err(_) => future::pending().await,
+		},
+		None => future::pending().await,
+	}
+}
+
 /// Project root for `@` file completion: the session cwd projected into
 /// the prompt facts, when the kernel has published one.
 fn project_root(dom: &Dom) -> Option<PathBuf> {
@@ -1414,10 +2576,7 @@ fn status_facts(
 ) -> StatusFacts {
 	let status = StatusLine::from_dom(dom);
 	// A live `ai_model` pick shows before its first turn journals it.
-	let route = local
-		.model
-		.as_deref()
-		.unwrap_or(status.model.as_str());
+	let route = local.model.as_deref().unwrap_or(status.model.as_str());
 	let model = if route.is_empty() || route == badge.identifier {
 		badge.short_name()
 	} else {
@@ -1425,221 +2584,43 @@ fn status_facts(
 	};
 	let home = (!status.home.is_empty()).then_some(status.home.as_str());
 	let path = display_path(status.session.as_str(), home, local.tmp.as_deref());
+	// Not yet journaled anywhere the replica can see: the advisor roster,
+	// compaction speculation, the credential's billing plan and account.
 	StatusFacts {
 		model,
 		thinking: local.thinking.clone(),
+		compact_thinking: local.compact_thinking,
+		fast: local.fast,
+		advisor: None,
 		cwd: path.text,
 		scratch: path.scratch,
 		branch: local.branch.clone(),
+		dirty: local.dirty,
+		session_name: status.name,
 		tokens: status.context,
 		context_window: badge.context_window,
 		compact_percent: local.compact,
+		speculation: Speculation::None,
+		tokens_in: status.tokens_in,
+		tokens_out: status.tokens_out,
+		cache_read: status.cache_read,
+		cache_write: status.cache_write,
+		tokens_per_second: status.tokens_per_second,
+		cost_nano_usd: status.cost_nano_usd,
+		subscription: false,
+		premium_requests: 0,
+		account: None,
 		working,
 	}
 }
 
-/// Retained transcript: the history ledger plus one live tree per block.
-struct Projection {
-	slots:  Slots,
-	blocks: Vec<Mounted>,
-	ctx:    UiContext,
-	width:  u16,
-}
-
-struct Mounted {
-	view:    BlockView,
-	id:      BlockId,
-	ui:      Ui,
-	/// Host-clock time when `ui` was created; its animation clock epoch.
-	epoch:   Duration,
-	retired: bool,
-}
-
-impl Mounted {
-	const fn rows(&self) -> u16 {
-		self.ui.frame().size().height
-	}
-}
-
-/// Wraps a block for retention: the block plus one blank separator row,
-/// so history rows carry the same spacing as the live document.
-fn spaced(component: crate::cards::Component) -> Col {
-	Col::new().child(component).child(Spacer::new())
-}
-
-impl Projection {
-	fn new(
-		size: Size,
-		policy: ResizePolicy,
-		ctx: &UiContext,
-		blocks: Vec<RenderedBlock>,
-		mirror: Vec<RenderedBlock>,
-		now: Duration,
-	) -> Self {
-		let mut slots = Slots::new(size.width, size.height, policy);
-		slots.set_context(ctx.clone());
-		let mut projection = Self {
-			slots,
-			blocks: Vec::with_capacity(blocks.len()),
-			ctx: ctx.clone(),
-			width: size.width,
-		};
-		for (block, twin) in blocks.into_iter().zip(mirror) {
-			projection.mount(block, twin, now);
-		}
-		projection
-	}
-
-	fn mount(&mut self, block: RenderedBlock, twin: RenderedBlock, now: Duration) {
-		let mounted = self.open(block, twin, now);
-		self.blocks.push(mounted);
-	}
-
-	fn open(&mut self, block: RenderedBlock, twin: RenderedBlock, now: Duration) -> Mounted {
-		let id = self.slots.open(Mode::Mutable);
-		self.slots.set(id, spaced(block.component));
-		let ui = Ui::from_root(spaced(twin.component), self.width, self.ctx.clone());
-		Mounted { view: block.view, id, ui, epoch: now, retired: false }
-	}
-
-	/// Applies a fresh projection. Blocks may appear anywhere (a thinking
-	/// block materializing after the answer started); a mounted block that
-	/// disappears or reorders returns `false` and the caller rebuilds.
-	fn reconcile(
-		&mut self,
-		blocks: Vec<RenderedBlock>,
-		mirror: Vec<RenderedBlock>,
-		now: Duration,
-	) -> bool {
-		let mut next_keys = blocks.iter().map(|block| block.view.key);
-		let is_subsequence = self
-			.blocks
-			.iter()
-			.all(|mounted| next_keys.any(|key| key == mounted.view.key));
-		if !is_subsequence {
-			return false;
-		}
-		let mut old = std::mem::take(&mut self.blocks).into_iter().peekable();
-		let mut merged = Vec::with_capacity(blocks.len());
-		for (next, twin) in blocks.into_iter().zip(mirror) {
-			let Some(mut mounted) = old.next_if(|mounted| mounted.view.key == next.view.key) else {
-				merged.push(self.open(next, twin, now));
-				continue;
-			};
-			// Rows already in native scrollback are never rewritten (ADR 0034).
-			if mounted.view != next.view && !mounted.retired {
-				self.slots.set(mounted.id, spaced(next.component));
-				mounted.ui = Ui::from_root(spaced(twin.component), self.width, self.ctx.clone());
-				mounted.epoch = now;
-			}
-			mounted.view = next.view;
-			merged.push(mounted);
-		}
-		self.blocks = merged;
-		true
-	}
-
-	fn resize(&mut self, size: Size) {
-		self.width = size.width;
-		self.slots.resize(size.width, size.height);
-		for mounted in &mut self.blocks {
-			mounted.ui.resize(size.width);
-		}
-	}
-
-	fn live(&self) -> impl Iterator<Item = &Mounted> {
-		self.blocks.iter().filter(|mounted| !mounted.retired)
-	}
-
-	fn live_rows(&self) -> u32 {
-		self.live().map(|mounted| u32::from(mounted.rows())).sum()
-	}
-
-	/// Retires the oldest finished blocks into native scrollback until the
-	/// live document fits the terminal (the row-pressure rule of ADR 0034).
-	fn retire_under_pressure(&mut self, chrome_rows: u16, height: u16) {
-		let budget = u32::from(height);
-		let mut live_rows = self.live_rows().saturating_add(u32::from(chrome_rows));
-		for mounted in &mut self.blocks {
-			if live_rows <= budget {
-				break;
-			}
-			if mounted.retired {
-				continue;
-			}
-			if !mounted.view.finalized {
-				break;
-			}
-			self.slots.finalize(mounted.id);
-			mounted.retired = true;
-			live_rows = live_rows.saturating_sub(u32::from(mounted.rows()));
-		}
-	}
-
-	/// Composes the on-screen document: live blocks then the composer,
-	/// top-anchored while everything fits and tail-anchored otherwise.
-	fn document(&self, composer: &Frame, size: Size) -> Frame {
-		let mut document = Frame::new(size);
-		let chrome_rows = composer.size().height.min(size.height);
-		let content_rows = self.live_rows();
-		let available = u32::from(size.height.saturating_sub(chrome_rows));
-		if content_rows <= available {
-			let mut y = 0_u16;
-			for mounted in self.live() {
-				let frame = mounted.ui.frame();
-				document.blit(frame, 0, frame.size().height, 0, y);
-				y = y.saturating_add(frame.size().height);
-			}
-			document.blit(composer, 0, chrome_rows, 0, y);
-			return document;
-		}
-		let mut bottom = u16::try_from(available).unwrap_or(u16::MAX);
-		let live = self.live().collect::<Vec<_>>();
-		for mounted in live.into_iter().rev() {
-			if bottom == 0 {
-				break;
-			}
-			let frame = mounted.ui.frame();
-			let rows = frame.size().height;
-			if rows <= bottom {
-				bottom -= rows;
-				document.blit(frame, 0, rows, 0, bottom);
-			} else {
-				document.blit(frame, rows - bottom, bottom, 0, 0);
-				bottom = 0;
-			}
-		}
-		let chrome_top = u16::try_from(available).unwrap_or(u16::MAX);
-		document.blit(composer, composer.size().height - chrome_rows, chrome_rows, 0, chrome_top);
-		document
-	}
-
-	fn next_wake(&self) -> Option<Duration> {
-		self
-			.live()
-			.filter_map(|mounted| {
-				mounted
-					.ui
-					.next_wake()
-					.map(|wake| mounted.epoch.saturating_add(wake))
-			})
-			.min()
-	}
-
-	fn tick(&mut self, now: Duration) -> bool {
-		let mut changed = false;
-		for mounted in self.blocks.iter_mut().filter(|mounted| !mounted.retired) {
-			let local = now.saturating_sub(mounted.epoch);
-			changed |= mounted.ui.tick(local);
-		}
-		changed
-	}
-}
-
-/// Whether the kernel is still working on the last turn: decided by the
-/// newest lifecycle element in it. A receipt or notice closes the turn; an
-/// open assistant or running tool keeps it active; a turn with only the
-/// user's message is awaiting its first inference.
+/// Whether the kernel is still working on the last turn, decided by the
+/// newest lifecycle element in it. A notice closes the turn (the kernel ends
+/// an interrupted or failed turn with one); an open assistant or a running
+/// tool keeps it active; a settled tool defers to its assistant, whose
+/// `tool_calls` stop means another inference follows; `<usage>` is
+/// per-inference accounting and closes nothing; a turn with only the user's
+/// message is awaiting its first inference.
 fn has_active_turn(dom: &Dom) -> bool {
 	let Some(turn) = dom.children(dom.body()).last() else {
 		return false;
@@ -1649,15 +2630,21 @@ fn has_active_turn(dom: &Dom) -> bool {
 			continue;
 		};
 		match node.tag {
-			Tag::Known(KnownTag::Usage | KnownTag::Notice) => return false,
+			Tag::Known(KnownTag::Notice) => return false,
 			Tag::Known(KnownTag::Assistant) => {
-				return node.prop(&PropId::StopReason.into()).is_none();
+				return node
+					.prop(&PropId::StopReason.into())
+					.and_then(Value::as_str)
+					.is_none_or(|reason| reason == "tool_calls");
 			},
 			Tag::Custom(_) => {
-				return !node
+				let settled = node
 					.prop(&PropId::Status.into())
 					.and_then(Value::as_str)
 					.is_some_and(|status| matches!(status, "ok" | "error" | "cancelled" | "aborted"));
+				if !settled {
+					return true;
+				}
 			},
 			_ => {},
 		}
@@ -1667,16 +2654,25 @@ fn has_active_turn(dom: &Dom) -> bool {
 
 fn approval_frame(
 	approval: &crate::overlays::ApprovalOverlay,
+	countdown: Option<u64>,
 	width: u16,
 	ui: &UiContext,
 ) -> Frame {
 	let title = approval.title.clone();
 	let reason = approval.reason.clone();
 	let scope = Str::new(approval.scope.as_str());
+	// pi `CountdownTimer`: the modal shows `(Ns remaining)` ticking once a
+	// second until the kernel answers with the prompt's default.
+	let remaining = countdown.map_or_else(Str::default, |seconds| {
+		Str::new(format!("  ({seconds}s remaining)"))
+	});
 	let tree = omp_tui::dom! {
 		<box border=round bc=warning pad="1 2">
 			<col gap=1>
-				<text fg=warning attr=bold>{title}</text>
+				<row>
+					<text fg=warning attr=bold>{title}</text>
+					<text fg=muted>{remaining}</text>
+				</row>
 				<md>{reason}</md>
 				<text fg=muted>{"Scope: "}{scope}</text>
 				<row gap=1>
@@ -1720,262 +2716,20 @@ pub fn render_surface(
 		component: Box::new(Welcome::new(
 			Str::new_static(env!("CARGO_PKG_VERSION")),
 			model,
-			tip_for(status.session.as_str()),
+			tip_seeded(welcome_seed(status.session.as_str()), ui.charset),
+			WelcomeFacts::default(),
+			None,
 		)),
+		stream:    None,
 	};
 	let cards = CardRegistry::standard();
+	let transcript = crate::transcript::Local::default();
+	let options = crate::project::Options::new(&transcript);
 	let mut blocks = vec![welcome()];
-	blocks.extend(project(&replica, &cards, ui, true));
+	blocks.extend(project(&replica, &cards, ui, &options));
 	let mut mirror = vec![welcome()];
-	mirror.extend(project(&replica, &cards, ui, true));
+	mirror.extend(project(&replica, &cards, ui, &options));
 	let projection =
 		Projection::new(size, ResizePolicy::Rebuild, ui, blocks, mirror, Duration::ZERO);
 	projection.document(composer.frame(), size)
-}
-
-#[cfg(test)]
-mod tests {
-	use omp_tui::IntoComponent as _;
-
-	use super::*;
-
-	fn block(key: u64, kind: BlockKind, text: &'static str, finalized: bool) -> RenderedBlock {
-		RenderedBlock {
-			view:      BlockView {
-				key,
-				kind,
-				text: Str::new_static(text),
-				mode: Mode::Mutable,
-				finalized,
-			},
-			component: text.into_component(),
-		}
-	}
-
-	fn projection(rows: u16, finalized: &[bool]) -> Projection {
-		let build = || {
-			finalized
-				.iter()
-				.enumerate()
-				.map(|(index, done)| block(index as u64 + 1, BlockKind::User, "row", *done))
-				.collect::<Vec<_>>()
-		};
-		Projection::new(
-			Size::new(20, rows),
-			ResizePolicy::Rebuild,
-			&UiContext::default(),
-			build(),
-			build(),
-			Duration::ZERO,
-		)
-	}
-
-	#[test]
-	fn blocks_stay_live_until_row_pressure_then_retire_oldest_done_first() {
-		// Three two-row blocks (text + spacer) plus a three-row chrome fit in ten rows.
-		let mut projection = projection(10, &[true, true, false]);
-		projection.retire_under_pressure(3, 10);
-		assert_eq!(projection.live().count(), 3);
-		assert!(projection.slots.plan().rows().is_empty(), "nothing retires without pressure");
-
-		// Shrinking to seven rows retires exactly the oldest finished block.
-		projection.retire_under_pressure(3, 7);
-		assert!(projection.blocks[0].retired);
-		assert!(!projection.blocks[1].retired);
-		assert_eq!(projection.slots.plan().rows().len(), 2);
-
-		// An unfinished frontier block stalls later retirement (ADR 0034).
-		projection.retire_under_pressure(3, 1);
-		assert!(projection.blocks[1].retired);
-		assert!(!projection.blocks[2].retired);
-	}
-
-	#[test]
-	fn document_is_top_anchored_when_it_fits_and_tail_anchored_otherwise() {
-		let projection = projection(6, &[true, true]);
-		let mut chrome = Frame::new(Size::new(20, 1));
-		chrome.put(0, 0, "chrome", omp_tui::Style::default());
-		chrome.set_cursor(6, 0);
-		let fitting = projection.document(&chrome, Size::new(20, 6));
-		let rows = omp_tui::frame_text(&fitting)
-			.lines()
-			.map(str::to_owned)
-			.collect::<Vec<_>>();
-		assert_eq!(rows[0].trim_end(), "row");
-		assert_eq!(rows[4].trim_end(), "chrome");
-		assert_eq!(fitting.cursor(), Some((6, 4)));
-
-		let tail = projection.document(&chrome, Size::new(20, 3));
-		let rows = omp_tui::frame_text(&tail)
-			.lines()
-			.map(str::to_owned)
-			.collect::<Vec<_>>();
-		assert_eq!(rows[0].trim_end(), "row", "the newest block's rows fill from the bottom");
-		assert_eq!(rows[2].trim_end(), "chrome");
-		assert_eq!(tail.cursor(), Some((6, 2)));
-	}
-
-	#[test]
-	fn streaming_under_pressure_never_rebuilds_history() {
-		use omp_tui::slots::Delivered;
-		let lines = |count: usize| -> String {
-			(1..=count)
-				.map(|index| index.to_string())
-				.collect::<Vec<_>>()
-				.join("\n")
-		};
-		let mut projection = projection(12, &[true]);
-		let mut retired_rows = 0;
-		let mut step = |projection: &mut Projection, blocks: Vec<(u64, String, bool)>| {
-			let build = || {
-				let mut out = vec![block(1, BlockKind::User, "row", true)];
-				out.extend(blocks.iter().map(|(key, text, done)| RenderedBlock {
-					view:      BlockView {
-						key:       *key,
-						kind:      BlockKind::Assistant,
-						text:      Str::new(text.as_str()),
-						mode:      Mode::Mutable,
-						finalized: *done,
-					},
-					component: Str::new(text.as_str()).into_component(),
-				}));
-				out
-			};
-			assert!(projection.reconcile(build(), build(), Duration::ZERO));
-			projection.retire_under_pressure(3, 12);
-			let plan = projection.slots.plan();
-			assert!(!plan.rebuild(), "streaming must never reset native history");
-			retired_rows += plan.rows().len();
-			projection.slots.commit(plan, Delivered::All);
-		};
-		for count in 1..=20 {
-			step(&mut projection, vec![(2, lines(count), false)]);
-		}
-		step(&mut projection, vec![(2, lines(20), true)]);
-		step(&mut projection, vec![(2, lines(20), true), (3, lines(5), true)]);
-		assert_eq!(retired_rows, projection.slots.logical_history().count());
-		assert_eq!(retired_rows, 2 + 21, "the first block and the finished stream retired once each");
-	}
-
-	#[test]
-	fn live_turn_reconciles_without_rebuilding() {
-		use omp_session::{ComponentRegistry, Session};
-		let directory = tempfile::tempdir().expect("temp directory");
-		let path = directory.path().join("turn.oms");
-		let mut session = Session::create(path, ComponentRegistry::standard()).expect("session");
-		let cards = CardRegistry::standard();
-		let ui = UiContext::default();
-		let blocks = |session: &Session| {
-			let mut out = vec![block(0, BlockKind::Welcome, "welcome", true)];
-			out.extend(project(session.dom(), &cards, &ui, true));
-			out
-		};
-		let mut projection = Projection::new(
-			Size::new(60, 12),
-			ResizePolicy::Rebuild,
-			&ui,
-			blocks(&session),
-			blocks(&session),
-			Duration::ZERO,
-		);
-		let mut check = |session: &Session, projection: &mut Projection, step: &str| {
-			assert!(
-				projection.reconcile(blocks(session), blocks(session), Duration::ZERO),
-				"reconcile rebuilt at {step}"
-			);
-		};
-		session.begin_turn().expect("turn");
-		check(&session, &mut projection, "turn");
-		session.user("hello", Vec::new()).expect("user");
-		check(&session, &mut projection, "user");
-		session
-			.assistant_start("test/model", "test", "test/model")
-			.expect("assistant");
-		check(&session, &mut projection, "assistant start");
-		let turn = *session
-			.dom()
-			.children(session.dom().body())
-			.last()
-			.expect("turn");
-		let assistant = *session.dom().children(turn).last().expect("assistant");
-		let thinking = session
-			.stream_open(assistant, PropId::Thinking.into())
-			.expect("thinking");
-		check(&session, &mut projection, "thinking open");
-		for delta in ["think", "ing\nmore"] {
-			session.stream_append(thinking, delta).expect("delta");
-			check(&session, &mut projection, "thinking delta");
-		}
-		session.stream_close(thinking).expect("close");
-		check(&session, &mut projection, "thinking close");
-		let text = session
-			.stream_open(assistant, PropId::Text.into())
-			.expect("text");
-		check(&session, &mut projection, "text open");
-		for delta in ["1\n", "2\n", "3\n"] {
-			session.stream_append(text, delta).expect("delta");
-			check(&session, &mut projection, "text delta");
-		}
-		let live = crate::project::block_views(session.dom(), true);
-		assert_eq!(live[1].kind, BlockKind::Thinking);
-		assert_eq!(live[1].text, "thinking\nmore", "open thinking stream projects live");
-		assert_eq!(live[2].kind, BlockKind::Assistant);
-		assert_eq!(live[2].text, "1\n2\n3\n", "open text stream projects live");
-		session.stream_close(text).expect("close");
-		session.assistant_end("stop").expect("end");
-		check(&session, &mut projection, "assistant end");
-		session.receipt(10, 5, 0).expect("receipt");
-		check(&session, &mut projection, "receipt");
-	}
-
-	#[test]
-	fn reconcile_keeps_retired_rows_and_replaces_changed_live_blocks() {
-		let mut projection = projection(4, &[true, true]);
-		projection.retire_under_pressure(3, 4);
-		assert!(projection.blocks[0].retired);
-		let next = vec![
-			block(1, BlockKind::User, "changed", true),
-			block(2, BlockKind::User, "changed", true),
-		];
-		let mirror = vec![
-			block(1, BlockKind::User, "changed", true),
-			block(2, BlockKind::User, "changed", true),
-		];
-		assert!(projection.reconcile(next, mirror, Duration::ZERO));
-		assert_eq!(projection.blocks[0].view.text, "changed");
-		assert!(!projection.reconcile(
-			vec![block(9, BlockKind::User, "x", true)],
-			vec![block(9, BlockKind::User, "x", true)],
-			Duration::ZERO
-		));
-	}
-
-	#[test]
-	fn reconcile_inserts_a_block_that_materializes_before_an_existing_one() {
-		let mut projection = projection(20, &[true, false]);
-		let build = || {
-			vec![
-				block(1, BlockKind::User, "row", true),
-				block(5, BlockKind::Thinking, "late thinking", false),
-				block(2, BlockKind::Assistant, "row", false),
-			]
-		};
-		assert!(projection.reconcile(build(), build(), Duration::ZERO));
-		assert_eq!(
-			projection
-				.blocks
-				.iter()
-				.map(|mounted| mounted.view.key)
-				.collect::<Vec<_>>(),
-			[1, 5, 2]
-		);
-		assert_eq!(projection.slots.logical_history().count(), 0);
-		let dropped = || {
-			vec![block(1, BlockKind::User, "row", true), block(2, BlockKind::Assistant, "row", false)]
-		};
-		assert!(
-			!projection.reconcile(dropped(), dropped(), Duration::ZERO),
-			"a vanished block rebuilds"
-		);
-	}
 }

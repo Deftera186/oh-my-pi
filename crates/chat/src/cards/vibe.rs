@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{Border, IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge};
 
 #[derive(Clone, Copy)]
 enum VibeOp {
@@ -94,7 +94,9 @@ impl Card for VibeCard {
 				.into_component()
 			},
 			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
-				<row gap=1><i:pending/><text>{title}</text></row>
+				<row gap=1><i:pending/><text>{title}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
+				</row>
 			}
 			.into_component(),
 			CardStatus::Done => {

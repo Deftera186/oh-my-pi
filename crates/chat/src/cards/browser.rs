@@ -3,7 +3,7 @@
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Browser automation code-cell card.
 pub struct BrowserCard;
@@ -59,24 +59,21 @@ impl Card for BrowserCard {
 				.and_then(Value::as_str)
 				.map(str::to_owned)
 		});
+		let live = matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress);
 		let state = match view.status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => {
-				format!("{} running tab \"{name}\"", icon(ui, "spin-2"))
-			},
+			CardStatus::StreamingArgs | CardStatus::InProgress => format!("running tab \"{name}\""),
 			CardStatus::Done => format!("{} tab \"{name}\"", icon(ui, "done")),
 			CardStatus::Failed => format!("{} tab \"{name}\"", icon(ui, "error")),
 		};
-		let mut title = state;
-		if !url.is_empty() {
-			title.push_str(" · ");
-			title.push_str(&url);
-		}
-		if !kind.is_empty() {
-			title.push_str(" · ");
-			title.push_str(&kind);
-		}
 		dom! {
-			<box border=round pad-x=1 title={title} title_pad=3>
+			<box border=round pad-x=1 title_pad=3>
+				<row kind=title gap=1 bold>
+					if live { <spinner kind=status/> }
+					<text bold>{state}</text>
+					if !url.is_empty() { <text bold>{"·"}</text><text bold>{url}</text> }
+					if !kind.is_empty() { <text bold>{"·"}</text><text bold>{kind}</text> }
+					if let Some(badge) = elapsed_badge(view) { {badge} }
+				</row>
 				if !code.is_empty() { <pre>{code}</pre> }
 				if matches!(view.status, CardStatus::Done | CardStatus::Failed) {
 					<hr title="Output" title_pad=3/>

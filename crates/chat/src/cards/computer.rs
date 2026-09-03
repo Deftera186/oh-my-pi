@@ -2,7 +2,7 @@
 
 use omp_tui::{IntoComponent as _, UiContext, dom};
 
-use super::{Card, CardStatus, CardView, Component};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge};
 
 /// Native-desktop status card.
 pub struct ComputerCard;
@@ -26,6 +26,7 @@ impl Card for ComputerCard {
 						CardStatus::Failed => <i:error/>,
 					}
 					<text>{if view.status == CardStatus::Failed { "Computer: error" } else { "Computer" }}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				<text fg=muted>{" "}</text>
 			</col>

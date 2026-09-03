@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Structural-search card.
 pub struct AstGrepCard;
@@ -74,6 +74,7 @@ impl Card for AstGrepCard {
 							if !path.is_empty() {
 								<text fg=muted>{"in"}</text><text>{path}</text>
 							}
+							if let Some(badge) = elapsed_badge(view) { {badge} }
 						</row>
 					},
 					CardStatus::Done => {

@@ -2,7 +2,7 @@
 
 use omp_tui::{IntoComponent as _, UiContext, dom};
 
-use super::{Card, CardView, Component};
+use super::{Card, CardView, Component, elapsed_badge};
 
 /// Renders accepted approval resolutions.
 pub struct ResolveCard;
@@ -44,7 +44,11 @@ fn render_resolution(view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> C
 			</col>
 		}
 		.into_component(),
-		_ => dom! { <row gap=1><i:pending/><text>{"Resolve ⟨proposed -> rejected⟩"}</text></row> }
-			.into_component(),
+		_ => dom! {
+			<row gap=1><i:pending/><text>{"Resolve ⟨proposed -> rejected⟩"}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
+		}
+		.into_component(),
 	}
 }

@@ -5,7 +5,9 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+};
 
 /// Card for `edit` calls.
 pub struct EditCard;
@@ -68,8 +70,8 @@ pub(crate) fn render_edit(
 		.or_else(|| string_at(&args, "previewDiff"))
 		.or_else(|| string_at(&args, "preview_diff"))
 		.unwrap_or_default();
-	let rows = diff_rows(diff);
 	let (added, removed) = diff_stats(diff);
+	let diff = presented_diff(view.status, diff);
 	let fault = typed_fault::<omp_tools::edit::Fault>(view).or_else(|| diag_text(view.diag));
 	let lead = if fault.is_some() {
 		icon(ui, "error")
@@ -83,27 +85,21 @@ pub(crate) fn render_edit(
 	} else {
 		Str::default()
 	};
-	let title = sf!(
-		"{lead}{}Edit: {} {path}{stats}",
-		if lead.is_empty() { "" } else { " " },
-		icon(ui, "typescript")
-	);
+	let title = sf!("Edit: {} {path}{stats}", icon(ui, "typescript"));
 	dom! {
-		<box border=round title={title} title_pad=3>
+		<box border=round title_pad=3>
+			<row kind=title gap=1 bold>
+				if !lead.is_empty() { <text bold>{lead}</text> }
+				<text bold>{title}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
 			if let Some(fault) = fault {
 				<text fg=err wrap=word>{fault}</text>
 			} else {
-				<col>
-					for row in &rows {
-						<row kind={row.kind} gap=0>
-							for _ in 0..row.indent { <i:space/> }
-							<text kind={row.kind}>{row.text.clone()}</text>
-						</row>
-					}
-				</col>
+				<diff path={path}>{diff}</diff>
 				if matches!(view.status, CardStatus::StreamingArgs) {
 					<row gap=1>
-						if patch { <icon name="spin-4"/> } else { <icon name="spin-2"/> }
+						<spinner kind=status/>
 						if !expanded { <text fg=muted>{"(preview)"}</text> }
 					</row>
 				} else if matches!(view.status, CardStatus::InProgress) && !expanded {
@@ -163,29 +159,42 @@ fn render_move(view: &CardView<'_>, source: &str, destination: &str, ui: &UiCont
 	.into_component()
 }
 
-struct DiffRow {
-	kind:   &'static str,
-	text:   Str,
-	indent: usize,
+/// The diff text a card paints for `status`: streaming previews drop
+/// unbalanced trailing removals so the card does not jitter; settled cards
+/// show the full diff.
+fn presented_diff(status: CardStatus, diff: &str) -> &str {
+	if matches!(status, CardStatus::StreamingArgs | CardStatus::InProgress) {
+		strip_unbalanced_removals(diff)
+	} else {
+		diff
+	}
 }
 
-fn diff_rows(diff: &str) -> Vec<DiffRow> {
-	diff
-		.lines()
-		.map(|line| {
-			if line.starts_with("@@") {
-				DiffRow { kind: "hunk", text: Str::new(line), indent: 0 }
-			} else if let Some(text) = line.strip_prefix('+') {
-				DiffRow { kind: "add", text: sf!("+{}", text.replace('\t', "···")), indent: 0 }
-			} else if let Some(text) = line.strip_prefix('-') {
-				DiffRow { kind: "del", text: sf!("-{}", text.replace('\t', "···")), indent: 0 }
-			} else {
-				let text = line.strip_prefix(' ').unwrap_or(line);
-				let indent = if text.starts_with('\t') { 4 } else { 1 };
-				DiffRow { kind: "ctx", text: Str::new(text.trim_start()), indent }
-			}
-		})
-		.collect()
+/// Drops trailing `-` and `@@` rows that no `+` row has answered yet (pi
+/// `stripTrailingUnbalancedRemoval`).
+///
+/// A streaming preview shows removals before the matching additions arrive;
+/// without this the card would paint `-old` alone and then grow `+new`
+/// beneath it. Once such a trailing row exists everything after the last
+/// addition is cut, and a diff with no addition at all disappears until one
+/// arrives.
+pub(crate) fn strip_unbalanced_removals(diff: &str) -> &str {
+	let mut last_add_end = None;
+	let mut unbalanced_after = false;
+	let mut offset = 0;
+	for line in diff.split('\n') {
+		if line.starts_with('+') {
+			last_add_end = Some(offset + line.len());
+			unbalanced_after = false;
+		} else if line.starts_with('-') || line.starts_with("@@") {
+			unbalanced_after = true;
+		}
+		offset += line.len() + 1;
+	}
+	if !unbalanced_after {
+		return diff;
+	}
+	last_add_end.map_or("", |end| &diff[..end])
 }
 
 fn diff_stats(diff: &str) -> (u64, u64) {
@@ -231,4 +240,29 @@ fn fault_message(value: &Value) -> Option<&str> {
 		.or_else(|| string_at(value, "error"))
 		.or_else(|| string_at(value, "message"))
 		.or_else(|| value.get("reason").and_then(fault_message))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{CardStatus, diff_stats, presented_diff, strip_unbalanced_removals};
+
+	#[test]
+	fn unbalanced_trailing_removals_are_stripped_while_streaming() {
+		assert_eq!(strip_unbalanced_removals("-a\n+b\n-c"), "-a\n+b");
+		assert_eq!(strip_unbalanced_removals("-a\n+b\n c\n@@ -5 +5 @@\n-d"), "-a\n+b");
+		assert_eq!(strip_unbalanced_removals("-a\n+b\n c\n@@ -5 +5 @@"), "-a\n+b");
+		assert_eq!(strip_unbalanced_removals("-a\n+b"), "-a\n+b", "balanced tail is untouched");
+		assert_eq!(strip_unbalanced_removals("-a\n+b\n c"), "-a\n+b\n c", "context may trail");
+		assert_eq!(strip_unbalanced_removals("-a"), "", "no addition yet hides the diff");
+		assert_eq!(strip_unbalanced_removals("@@ -1 +1 @@\n-a"), "");
+		assert_eq!(strip_unbalanced_removals(""), "");
+		assert_eq!(strip_unbalanced_removals(" only\n context"), " only\n context");
+
+		let diff = "@@ -1,2 +1,2 @@\n-old\n+new\n-gone";
+		assert_eq!(presented_diff(CardStatus::StreamingArgs, diff), "@@ -1,2 +1,2 @@\n-old\n+new");
+		assert_eq!(presented_diff(CardStatus::InProgress, diff), "@@ -1,2 +1,2 @@\n-old\n+new");
+		assert_eq!(presented_diff(CardStatus::Done, diff), diff, "settled cards show everything");
+		assert_eq!(presented_diff(CardStatus::Failed, diff), diff);
+		assert_eq!(diff_stats(diff), (1, 2), "stats count the full diff");
+	}
 }

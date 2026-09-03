@@ -3,7 +3,7 @@
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Structural-rewrite proposal card.
 pub struct AstEditCard;
@@ -82,7 +82,9 @@ impl Card for AstEditCard {
 			<col>
 				match view.status {
 				CardStatus::StreamingArgs | CardStatus::InProgress => {
-					<row kind=title gap=1><i:pending/><text bold>{"AST Edit:"}</text><text bold>{pattern}</text><text fg=muted>{"in"}</text><text>{target}</text></row>
+					<row kind=title gap=1><i:pending/><text bold>{"AST Edit:"}</text><text bold>{pattern}</text><text fg=muted>{"in"}</text><text>{target}</text>
+						if let Some(badge) = elapsed_badge(view) { {badge} }
+					</row>
 				},
 				CardStatus::Done => {
 					<box border=round pad-x=1 title={done_title} title_pad=3>

@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{Card, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
 
 /// Renders debugger session state and stack frames.
 pub struct DebugCard;
@@ -34,8 +34,12 @@ impl Card for DebugCard {
 			}.into_component();
 		}
 		let Some(result) = typed_result::<omp_tools::debug::Payload>(view) else {
-			return dom! { <row gap=1><i:pending/><text>{format!("Debug: {action}")}</text></row> }
-				.into_component();
+			return dom! {
+				<row gap=1><i:pending/><text>{format!("Debug: {action}")}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
+				</row>
+			}
+			.into_component();
 		};
 		let session = result.get("session").unwrap_or(&Value::Null);
 		let frames = result

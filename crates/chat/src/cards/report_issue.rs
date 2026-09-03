@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{Border, IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardView, Component};
+use super::{Card, CardView, Component, elapsed_badge};
 
 /// Renders issue-report arguments and the recording outcome.
 pub struct ReportIssueCard;
@@ -28,12 +28,11 @@ impl Card for ReportIssueCard {
 			})
 			.collect();
 		let icon = match view.status.as_str() {
-			"ok" => "done",
-			"error" => "error",
-			_ if expanded => "launch-pending",
-			_ => "spin-4",
+			"ok" => Some("done"),
+			"error" => Some("error"),
+			_ => None,
 		};
-		let icon = ui.charset.icon_named(icon).unwrap_or_default();
+		let icon = icon.map(|icon| ui.charset.icon_named(icon).unwrap_or_default());
 		let (_, last, _) = ui.charset.guides(Border::Square);
 		let summary = fields
 			.iter()
@@ -47,7 +46,11 @@ impl Card for ReportIssueCard {
 		};
 		dom! {
 			<col pad-x=1>
-				<row gap=1><text>{icon}</text><text>{"Report Tool Issue"}</text></row>
+				<row gap=1>
+					if let Some(icon) = icon { <text>{icon}</text> } else { <spinner kind=status/> }
+					<text>{"Report Tool Issue"}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
+				</row>
 				if expanded {
 					<spacer h=1/>
 					<text>{"Args"}</text>

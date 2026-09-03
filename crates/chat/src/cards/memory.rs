@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{Card, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
 
 /// Renders scored memory-search results.
 pub struct RecallCard;
@@ -52,8 +52,12 @@ fn render_recall(view: &CardView<'_>, expanded: bool) -> Component {
 			.into_component();
 	}
 	let Some(result) = typed_result::<omp_tools::memory::RecallPayload>(view) else {
-		return dom! { <row gap=1><i:pending/><text>{format!("Recall: {query}")}</text></row> }
-			.into_component();
+		return dom! {
+			<row gap=1><i:pending/><text>{format!("Recall: {query}")}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
+		}
+		.into_component();
 	};
 	let items = result
 		.get("items")
@@ -91,8 +95,12 @@ fn render_reflect(view: &CardView<'_>, expanded: bool) -> Component {
 			.into_component();
 	}
 	let Some(result) = typed_result::<omp_tools::memory::ReflectPayload>(view) else {
-		return dom! { <row gap=1><i:pending/><text>{format!("Reflect: {query}")}</text></row> }
-			.into_component();
+		return dom! {
+			<row gap=1><i:pending/><text>{format!("Reflect: {query}")}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
+		}
+		.into_component();
 	};
 	let answer = field(&result, "answer").unwrap_or_default();
 	let lines: Vec<&str> = answer.lines().collect();
@@ -137,6 +145,7 @@ fn render_retain(view: &CardView<'_>) -> Component {
 			<row gap=1>
 				if settled { <icon name="memory-tool"/> } else { <i:pending/> }
 				<text>{title}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			for item in &items {
 				<row gap=1 pad-x=2><i:enabled/><text>{field(item, "content").unwrap_or_default()}</text></row>

@@ -10,9 +10,72 @@
 //! Commands only *ask*; presentation state stays observer-local (ADR 0005)
 //! and never enters the session DOM.
 
+use std::{fmt, sync::Arc};
+
 use flume::{Receiver, Sender};
 use omp_con::{ConResult, Ctx, CtxBuilder, Severity};
 use omp_core::Str;
+
+use crate::{
+	commands::CommandAction,
+	overlays::{PanelCall, PanelOpener},
+};
+
+/// Which rung of pi's Escape ladder an [`EscapeHook`] answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EscapeRung {
+	/// Rung 1 (`/mcp test`): every registered hook fires on one Esc and is
+	/// removed, so the next Esc reaches the rungs below.
+	Cancel,
+	/// Rung 4 (vocalizer): persistent; consumes Esc only while it reports
+	/// something to silence.
+	Silence,
+}
+
+/// An observer-local Esc handler registered by a command (`/mcp test`
+/// cancellation, vocalizer silence). Compared by identity.
+#[derive(Clone)]
+pub struct EscapeHook {
+	/// Stable identity; re-registering an id replaces the prior hook.
+	pub id:   Str,
+	/// Ladder rung.
+	pub rung: EscapeRung,
+	hook:     Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl EscapeHook {
+	/// Registers `hook`, which returns whether it consumed the Esc.
+	pub fn new(
+		id: impl Into<Str>,
+		rung: EscapeRung,
+		hook: impl Fn() -> bool + Send + Sync + 'static,
+	) -> Self {
+		Self { id: id.into(), rung, hook: Arc::new(hook) }
+	}
+
+	/// Fires the hook; returns whether it consumed the Esc.
+	#[must_use]
+	pub fn fire(&self) -> bool {
+		(self.hook)()
+	}
+}
+
+impl fmt::Debug for EscapeHook {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("EscapeHook")
+			.field("id", &self.id)
+			.field("rung", &self.rung)
+			.finish_non_exhaustive()
+	}
+}
+
+impl PartialEq for EscapeHook {
+	fn eq(&self, other: &Self) -> bool {
+		self.id == other.id && self.rung == other.rung && Arc::ptr_eq(&self.hook, &other.hook)
+	}
+}
+
+impl Eq for EscapeHook {}
 
 /// One observer-local request posted by a console command.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +123,51 @@ pub enum HostAction {
 	/// `cl_editor_external` (pi `app.editor.external`, Ctrl+G): edit the
 	/// draft in `$VISUAL`/`$EDITOR`.
 	ExternalEditor,
+	/// `cl_dequeue` (pi `app.message.dequeue`, Alt+Up / Shift+Up): pull
+	/// every queued message back into the composer.
+	Dequeue,
+	/// `cl_paste_image` (pi `app.clipboard.pasteImage`, Ctrl+V / Cmd+V):
+	/// read the system clipboard, preferring an image, and stage it as a
+	/// composer chip.
+	PasteImage,
+	/// `cl_paste_raw` (pi `app.clipboard.pasteTextRaw`, Ctrl+Shift+V /
+	/// Alt+Shift+V): paste clipboard text verbatim.
+	PasteRaw,
+	/// `cl_copy_line` (pi `app.clipboard.copyLine`, Alt+Shift+L): copy the
+	/// current composer line.
+	CopyLine,
+	/// `cl_copy_prompt` (pi `app.clipboard.copyPrompt`, Alt+Shift+C): copy
+	/// the whole draft.
+	CopyPrompt,
+	/// `cl_agent_focus [id]`: view a subagent (`None` returns to the main
+	/// session). pi `focusSession` / `unfocusSession`.
+	FocusAgent(Option<Str>),
+	/// `cl_collab_guest on|off`: this actor is a collaboration guest, so
+	/// Esc asks the remote host to interrupt instead of aborting locally.
+	CollabGuest(bool),
+	/// `cl_stt_toggle` (pi `app.stt.toggle`): start or stop push-to-talk
+	/// recording without the space-hold gesture.
+	SttToggle,
+	/// `cl_live_toggle` (pi `app.live.toggle`, Ctrl+L): start or stop the
+	/// duplex live-voice session; the app owns the microphone and transport.
+	LiveToggle,
+	/// Push-to-talk recording edge from the space-hold gesture.
+	PushToTalk {
+		/// `true` when recording begins, `false` when the bar is released.
+		active: bool,
+	},
+	/// Text recognized by speech-to-text, inserted at the caret.
+	InsertText(Str),
+	/// Register (or replace) an observer-local Esc hook.
+	EscapeHook(EscapeHook),
+	/// Remove an Esc hook by id.
+	DropEscapeHook(Str),
+	/// Open a command-owned panel on the overlay stack.
+	Open(PanelOpener),
+	/// Run a command-owned host effect and apply its panel event.
+	Call(PanelCall),
+	/// A typed slash-command request (`crate::commands`).
+	Command(CommandAction),
 	/// A console reply line (the sink installed by [`HostMailbox::attach`]).
 	Reply {
 		/// Reply severity.
@@ -117,9 +225,17 @@ impl HostMailbox {
 	pub fn drain(&self) -> impl Iterator<Item = HostAction> + '_ {
 		self.rx.try_iter()
 	}
+
+	/// Waits for the next posted action (app-side results such as a
+	/// speech transcript wake the actor through this).
+	pub async fn next(&self) -> Option<HostAction> {
+		self.rx.recv_async().await.ok()
+	}
 }
 
-fn post(ctx: &Ctx, action: HostAction) -> ConResult<()> {
+/// Posts `action` into the attached host mailbox, or warns on the console
+/// when no interactive host is attached (a cfg script under `omp print`).
+pub fn post(ctx: &Ctx, action: HostAction) -> ConResult<()> {
 	match ctx.user::<HostMailbox>() {
 		Some(mailbox) => {
 			mailbox.post(action);
@@ -195,6 +311,60 @@ omp_con::cmd! {
 
 	/// Edits the draft in the external editor.
 	cl_editor_external() = |ctx, _args| post(ctx, HostAction::ExternalEditor);
+
+	/// Restores every queued message to the composer.
+	cl_dequeue() = |ctx, _args| post(ctx, HostAction::Dequeue);
+
+	/// Pastes the clipboard, attaching an image as a chip.
+	cl_paste_image() = |ctx, _args| post(ctx, HostAction::PasteImage);
+
+	/// Pastes clipboard text verbatim.
+	cl_paste_raw() = |ctx, _args| post(ctx, HostAction::PasteRaw);
+
+	/// Copies the current composer line to the clipboard.
+	cl_copy_line() = |ctx, _args| post(ctx, HostAction::CopyLine);
+
+	/// Copies the whole draft to the clipboard.
+	cl_copy_prompt() = |ctx, _args| post(ctx, HostAction::CopyPrompt);
+
+	/// Views a subagent's session; no id returns to the main session.
+	cl_agent_focus(?id: Str) = |ctx, args| {
+		let id = args.opt::<Str>(0)?.filter(|id| !id.is_empty());
+		post(ctx, HostAction::FocusAgent(id))
+	};
+
+	/// Marks this actor as a collaboration guest (`on`) or host (`off`).
+	cl_collab_guest(state: Str) = |ctx, args| {
+		let state = args.get::<Str>(0)?;
+		post(ctx, HostAction::CollabGuest(matches!(state.as_str(), "on" | "1" | "true")))
+	};
+
+	/// Starts or stops push-to-talk recording.
+	cl_stt_toggle() = |ctx, _args| post(ctx, HostAction::SttToggle);
+
+	/// Starts or stops the duplex live-voice session.
+	cl_live_toggle() = |ctx, _args| post(ctx, HostAction::LiveToggle);
+
+	/// Removes an observer-local Esc hook by id.
+	cl_escape_unhook(id: Str) = |ctx, args| {
+		let id = args.get::<Str>(0)?;
+		post(ctx, HostAction::DropEscapeHook(id))
+	};
+}
+
+omp_con::var! {
+	/// What a double Esc on an empty composer opens (pi
+	/// `doubleEscapeAction`): `branch` (rewind selector), `tree`, or `none`.
+	pub static CL_DOUBLE_ESCAPE = cl_double_escape: Str {
+		default: Str::new_static("branch"),
+		flags: archive,
+	};
+	/// Whether holding the space bar starts push-to-talk (pi
+	/// `stt.holdToTalk`).
+	pub static CL_STT_HOLD = cl_stt_hold: bool {
+		default: true,
+		flags: archive,
+	};
 }
 
 #[cfg(test)]
@@ -218,6 +388,7 @@ mod tests {
 	#[test]
 	fn host_commands_without_a_mailbox_warn_instead_of_failing() {
 		let ctx = Ctx::new();
-		ctx.run("cl_interrupt").expect("command degrades to a warning");
+		ctx.run("cl_interrupt")
+			.expect("command degrades to a warning");
 	}
 }

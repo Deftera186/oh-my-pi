@@ -3,7 +3,7 @@
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Language-server request and reference-result card.
 pub struct LspCard;
@@ -73,6 +73,7 @@ impl Card for LspCard {
 						if !symbol.is_empty() {
 							<text>{format!("({symbol})")}</text>
 						}
+						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 				},
 				CardStatus::Done | CardStatus::Failed => {

@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_result};
 
 /// Parallel subagent task card.
 pub struct TaskCard;
@@ -20,8 +20,15 @@ impl Card for TaskCard {
 		let _fault = view.fault::<omp_tools::task::Fault>();
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => {
-				let title = sf!("{} Task: task", ui.charset.icon_named("task").unwrap_or(">>>"));
-				dom! { <box border=round title={title} title_pad=3 pad="0 1"/> }.into_component()
+				dom! {
+					<box border=round title_pad=3 pad="0 1">
+						<row kind=title gap=1 bold>
+							<i:task/><text bold>{"Task: task"}</text>
+							if let Some(badge) = elapsed_badge(view) { {badge} }
+						</row>
+					</box>
+				}
+				.into_component()
 			},
 			CardStatus::Done | CardStatus::Failed => render_settled(view, expanded, ui),
 		}

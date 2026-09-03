@@ -5,7 +5,9 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+};
 
 /// Card for `write` calls.
 pub struct WriteCard;
@@ -23,7 +25,7 @@ impl Card for WriteCard {
 		let content = string_at(&args, "content").unwrap_or_default();
 		match view.status {
 			CardStatus::StreamingArgs => render_streaming(path, content, expanded, ui),
-			CardStatus::InProgress => render_progress(path, content, expanded, ui),
+			CardStatus::InProgress => render_progress(view, path, content, expanded, ui),
 			CardStatus::Done => render_done(view, path, content, expanded, ui),
 			CardStatus::Failed => render_failed(view, path, ui),
 		}
@@ -37,7 +39,7 @@ fn render_streaming(path: &str, content: &str, expanded: bool, ui: &UiContext) -
 		<box border=round title={title} title_pad=3>
 			<pre pad-x=1>{body}</pre>
 			<row pad-x=1 gap=1>
-				if expanded { <icon name="spin-3"/> } else { <icon name="spin-4"/> }
+				<spinner kind=status/>
 				<text fg=muted>{"… (streaming)"}</text>
 			</row>
 		</box>
@@ -45,13 +47,23 @@ fn render_streaming(path: &str, content: &str, expanded: bool, ui: &UiContext) -
 	.into_component()
 }
 
-fn render_progress(path: &str, content: &str, expanded: bool, ui: &UiContext) -> Component {
+fn render_progress(
+	view: &CardView<'_>,
+	path: &str,
+	content: &str,
+	expanded: bool,
+	ui: &UiContext,
+) -> Component {
 	let lines: Vec<&str> = content.lines().collect();
 	let full = number_lines(&lines.join("\n"), 1);
 	let middle = number_lines(&lines.iter().skip(4).copied().collect::<Vec<_>>().join("\n"), 5);
 	let title = sf!("Write: {} {path}", icon(ui, "typescript"));
 	dom! {
-		<box border=round title={title} title_pad=3>
+		<box border=round title_pad=3>
+			<row kind=title gap=1 bold>
+				<text bold>{title}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
 			if expanded {
 				<pre pad-x=1>{full}</pre>
 				<row pad-x=2><text fg=muted>{"16"}</text></row>

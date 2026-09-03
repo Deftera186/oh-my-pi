@@ -2,10 +2,12 @@
 
 use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
-use omp_tui::{IntoComponent as _, UiContext, dom};
+use omp_tui::{IntoComponent as _, UiContext, components::STRIKE_TOTAL_FRAMES, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+};
 
 /// Session todo/checklist card.
 pub struct TodoCard;
@@ -32,10 +34,34 @@ fn render_live(view: &CardView<'_>) -> Component {
 		.and_then(Value::as_str)
 		.or_else(|| partial_string(view.args_text().unwrap_or_default(), "op"))
 		.unwrap_or_default();
-	dom! { <row gap=1><i:pending/><text>{"Todo"}</text><text>{op}</text></row> }.into_component()
+	dom! {
+		<row gap=1><i:pending/><text>{"Todo"}</text><text>{op}</text>
+			if let Some(badge) = elapsed_badge(view) { {badge} }
+		</row>
+	}
+	.into_component()
+}
+
+/// pi `#updateTodoStrikeAnimation` ticks the completion strike every 65 ms
+/// for `TODO_STRIKE_TOTAL_FRAMES` frames; `<strike reveal>` sweeps over the
+/// same total on the shared clock.
+const TODO_STRIKE_FRAME_MS: u64 = 65;
+
+/// The task a settled `done` op just completed (pi `completedTasks`):
+/// `(phase, item)` from the call's own arguments, so only that row sweeps.
+fn newly_completed(view: &CardView<'_>) -> Option<(Option<Str>, Str)> {
+	let args = typed_input::<omp_tools::todo::Params>(view)?;
+	if args.get("op").and_then(Value::as_str) != Some("done") {
+		return None;
+	}
+	let item = args.get("item").and_then(Value::as_str).map(Str::new)?;
+	let phase = args.get("phase").and_then(Value::as_str).map(Str::new);
+	Some((phase, item))
 }
 
 fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Component {
+	let completed_now = newly_completed(view);
+	let sweep = sf!("{}ms", TODO_STRIKE_FRAME_MS * u64::from(STRIKE_TOTAL_FRAMES));
 	let result = typed_result::<omp_tools::todo::Payload>(view).unwrap_or(Value::Null);
 	let phases = result
 		.get("phases")
@@ -76,12 +102,18 @@ fn render_checklist(view: &CardView<'_>, _expanded: bool, ui: &UiContext) -> Com
 				.filter(|text| !text.is_empty())
 				.map(Str::new);
 			let last = task_index + 1 == tasks.len();
+			let sweeping = completed
+				&& completed_now.as_ref().is_some_and(|(phase, item)| {
+					*item == text && phase.as_ref().is_none_or(|phase| phase == title)
+				});
 			phase_rows.push(
 				dom! {
 					<row gap=1 pad-x=2>
 						if last { <i:tree-last/> } else { <i:tree-branch/> }
 						if completed { <i:checked/> } else { <i:unchecked/> }
-						if completed { <text strike>{text}</text> } else { <text>{text}</text> }
+						if sweeping { <strike reveal={sweep.clone()}>{text}</strike> }
+						else if completed { <text strike>{text}</text> }
+						else { <text>{text}</text> }
 						if let Some(blocker) = blocker { <text fg=muted>{sf!("— {blocker}")}</text> }
 					</row>
 				}
@@ -153,4 +185,86 @@ fn diag_text(node: Option<&Node>) -> Option<Str> {
 				.map(Str::new)
 		})
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use omp_core::Str;
+	use omp_dom::{KnownTag, Node, PropId, Value};
+	use omp_tui::{CellContent, Ui, UiContext, test_support::frame_row_text};
+
+	use super::TodoCard;
+	use crate::cards::{Card as _, CardStatus, CardView};
+
+	const RESULT: &str = r#"{"phases":[{"title":"Foundation","tasks":[{"text":"Scaffold crate","status":"completed"},{"text":"Wire workspace","status":"completed"}]}]}"#;
+
+	fn text_node(tag: KnownTag, text: &'static str) -> Node {
+		let mut props = smallvec::SmallVec::new();
+		props.push((PropId::Text.into(), Value::Str(Str::new_static(text))));
+		Node { tag: tag.into(), props, kids: Vec::new(), content: None }
+	}
+
+	fn struck(ui: &Ui, row: u16, from: u16, len: u16) -> Vec<bool> {
+		(from..from + len)
+			.filter(|x| matches!(ui.frame().cell(*x, row).content(), CellContent::Grapheme { .. }))
+			.map(|x| ui.frame().cell(x, row).style().spec().strikethrough)
+			.collect()
+	}
+
+	#[test]
+	fn todo_strike_reveals_progressively_then_settles() {
+		let input = text_node(
+			KnownTag::Input,
+			r#"{"op":"done","phase":"Foundation","item":"Scaffold crate"}"#,
+		);
+		let result = text_node(KnownTag::Result, RESULT);
+		let view = CardView {
+			input:   &input,
+			result:  Some(&result),
+			diag:    None,
+			usage:   None,
+			status:  CardStatus::Done,
+			output:  None,
+			started: None,
+		};
+		let mut ui = Ui::from_root(TodoCard.render(&view, false, &UiContext::default()), 40, UiContext::default());
+		let row = frame_row_text(ui.frame(), 2);
+		let at = u16::try_from(row.find("Scaffold").expect("task row")).unwrap();
+		let len = u16::try_from("Scaffold crate".len()).unwrap();
+		// The task the op just completed starts plain and sweeps; the other
+		// completed task was struck already and stays struck throughout.
+		assert!(struck(&ui, 2, at, len).iter().all(|s| !s), "frame 0 holds plain: {row}");
+		assert!(struck(&ui, 3, at, len).iter().all(|s| *s));
+		assert_eq!(ui.next_wake(), Some(Duration::from_millis(65)));
+		ui.tick(Duration::from_millis(455));
+		let mid = struck(&ui, 2, at, len);
+		let count = mid.iter().filter(|s| **s).count();
+		assert!(count > 0 && count < usize::from(len), "mid-sweep: {count}");
+		assert!(mid[..count].iter().all(|s| *s), "the strike grows from the start");
+		ui.tick(Duration::from_millis(910));
+		assert!(struck(&ui, 2, at, len).iter().all(|s| *s));
+		assert_eq!(ui.next_wake(), None, "settled sweeps stop waking");
+		assert_eq!(frame_row_text(ui.frame(), 2), row, "the text itself never changes");
+	}
+
+	#[test]
+	fn todo_without_a_done_op_strikes_statically() {
+		let input = text_node(KnownTag::Input, r#"{"op":"view"}"#);
+		let result = text_node(KnownTag::Result, RESULT);
+		let view = CardView {
+			input:   &input,
+			result:  Some(&result),
+			diag:    None,
+			usage:   None,
+			status:  CardStatus::Done,
+			output:  None,
+			started: None,
+		};
+		let ui = Ui::from_root(TodoCard.render(&view, false, &UiContext::default()), 40, UiContext::default());
+		let at = u16::try_from(frame_row_text(ui.frame(), 2).find("Scaffold").unwrap()).unwrap();
+		assert!(struck(&ui, 2, at, 14).iter().all(|s| *s));
+		assert_eq!(ui.next_wake(), None);
+	}
 }

@@ -3,7 +3,7 @@
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Persistent Python-kernel cell card.
 pub struct EvalCard;
@@ -59,24 +59,24 @@ impl Card for EvalCard {
 				.and_then(Value::as_str)
 				.map(str::to_owned)
 		});
+		let live = matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress);
 		let state = match view.status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => {
-				format!("{} running", icon(ui, if expanded { "spin-2" } else { "spin-3" }))
-			},
-			CardStatus::Done => icon(ui, "done").to_owned(),
-			CardStatus::Failed => icon(ui, "error").to_owned(),
+			CardStatus::StreamingArgs | CardStatus::InProgress => "running",
+			CardStatus::Done => icon(ui, "done"),
+			CardStatus::Failed => icon(ui, "error"),
 		};
-		let mut card_title = format!("{} {state}", icon(ui, "python"));
-		if !title.is_empty() {
-			card_title.push(' ');
-			card_title.push_str(&title);
-		}
-		if let Some(duration) = duration {
-			card_title.push_str(&format!(" · ({duration}ms)"));
-		}
+		let duration = duration.map(|duration| format!("· ({duration}ms)"));
 		dom! {
 			<col>
-				<box border=round pad-x=1 title={card_title} title_pad=3>
+				<box border=round pad-x=1 title_pad=3>
+					<row kind=title gap=1 bold>
+						<i:python/>
+						if live { <spinner kind=status/> }
+						<text bold>{state}</text>
+						if !title.is_empty() { <text bold>{title}</text> }
+						if let Some(duration) = duration { <text bold>{duration}</text> }
+						if let Some(badge) = elapsed_badge(view) { {badge} }
+					</row>
 					if !code.is_empty() {
 						<pre>{code}</pre>
 					}

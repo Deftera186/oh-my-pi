@@ -3,7 +3,7 @@
 use omp_tui::{Border, IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardView, Component, typed_input, typed_result};
+use super::{Card, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Renders a web-search answer, source list, provider metadata, or fault.
 pub struct WebSearchCard;
@@ -20,7 +20,12 @@ impl Card for WebSearchCard {
 			.and_then(Value::as_str)
 			.unwrap_or_default();
 		let Some(result) = typed_result::<omp_tools::web_search::Payload>(view) else {
-			return dom! { <row gap=1><i:pending/><text>{format!("Web Search: {query}")}</text></row> }.into_component();
+			return dom! {
+				<row gap=1><i:pending/><text>{format!("Web Search: {query}")}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
+				</row>
+			}
+			.into_component();
 		};
 		let provider = provider_name(
 			result

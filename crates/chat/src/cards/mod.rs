@@ -31,15 +31,69 @@ pub mod vibe;
 pub mod web_search;
 pub mod write;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 pub use generic::GenericCard;
+use omp_core::{Str, sf};
 use omp_dom::{Node, PropId};
-use omp_tui::UiContext;
+use omp_tui::{Graphics, IntoComponent as _, UiContext, dom};
 use serde::de::DeserializeOwned;
 
 /// A boxed retained TUI component.
 pub type Component = Box<dyn omp_tui::Component>;
+
+/// Inline tool-result image column cap (pi `tui.maxInlineImageColumns`
+/// default); the layout further bounds it by the card's width.
+pub(crate) const INLINE_IMAGE_MAX_COLS: u16 = 100;
+/// Inline tool-result image row cap (pi `tui.maxInlineImageRows` default,
+/// the explicit bound pi takes when it is tighter than 60% of the
+/// viewport).
+pub(crate) const INLINE_IMAGE_MAX_ROWS: u16 = 20;
+
+/// Whether the terminal renders real inline images (pi
+/// `TERMINAL.imageProtocol`): Kitty, Sixel, or iTerm2 graphics.
+pub(crate) const fn inline_images(ui: &UiContext) -> bool {
+	!matches!(ui.graphics, Graphics::Cells)
+}
+
+/// pi `imageFallback`: `[Image: <name> [<mime>] <WxH>]`, the text stand-in
+/// for a result image the terminal cannot draw.
+pub(crate) fn image_placeholder(
+	mime: &str,
+	dimensions: Option<(u32, u32)>,
+	filename: Option<&str>,
+) -> Str {
+	let mut text = String::from("[Image:");
+	if let Some(name) = filename.filter(|name| !name.is_empty()) {
+		text.push(' ');
+		text.push_str(name);
+	}
+	text.push_str(" [");
+	text.push_str(mime);
+	text.push(']');
+	if let Some((width, height)) = dimensions {
+		text.push_str(&sf!(" {width}x{height}"));
+	}
+	text.push(']');
+	Str::new(text)
+}
+
+/// A tool-result image (pi `tool-execution.ts` image blocks): the image
+/// itself through `<img>` when the terminal supports a graphics protocol,
+/// else pi's text placeholder in the tool-output color.
+pub(crate) fn result_image(
+	src: &Str,
+	mime: &str,
+	filename: Option<&str>,
+	ui: &UiContext,
+) -> Component {
+	if inline_images(ui) {
+		dom! { <img src={src.clone()} w={INLINE_IMAGE_MAX_COLS} max-rows={INLINE_IMAGE_MAX_ROWS}/> }
+			.into_component()
+	} else {
+		dom! { <text fg=muted>{image_placeholder(mime, None, filename)}</text> }.into_component()
+	}
+}
 
 /// Tool lifecycle state derived from the tool element's `status` property.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +144,16 @@ pub struct CardView<'a> {
 	pub usage:  Option<&'a Node>,
 	/// Tool lifecycle status.
 	pub status: CardStatus,
+	/// Accumulated ordered output of a running call: the open stream the
+	/// dispatcher binds to the `<result>` text (ADR 0008 tool output
+	/// streaming; `Dom::stream_text`). `None` once the stream closes and the
+	/// settled result materializes into `result`.
+	pub output: Option<&'a str>,
+	/// Presentation-clock instant the observer first saw the call executing
+	/// (pi `executionStartedAtNow`); `None` while streaming arguments or once
+	/// settled. Cards paint a live elapsed badge against
+	/// [`omp_tui::PaintCtx::now`] from it.
+	pub started: Option<Duration>,
 }
 
 impl CardView<'_> {
@@ -142,6 +206,22 @@ impl CardView<'_> {
 		let node = self.diag?;
 		serde_json::from_str(node_data(node).or_else(|| node_text(node))?).ok()
 	}
+}
+
+/// Live elapsed badge for a running call: pi's dim ` Ns` after a muted ` · `
+/// (tool-execution.ts `#renderCompact`), counting whole seconds from
+/// [`CardView::started`] on the shared clock. Absent unless the call is
+/// executing and the projection recorded when it started, so gallery and
+/// settled cards paint no badge.
+pub(crate) fn elapsed_badge(view: &CardView<'_>) -> Option<Component> {
+	if view.status != CardStatus::InProgress {
+		return None;
+	}
+	let since = u64::try_from(view.started?.as_millis()).unwrap_or(u64::MAX);
+	Some(
+		dom! { <row gap=1><text fg=muted>{"·"}</text><time kind=elapsed dim ms={since}/></row> }
+			.into_component(),
+	)
 }
 
 pub(crate) fn typed_input<P>(view: &CardView<'_>) -> Option<serde_json::Value>

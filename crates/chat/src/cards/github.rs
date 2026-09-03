@@ -5,7 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{Card, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result};
 
 /// Renders GitHub operation summaries and results.
 pub struct GithubCard;
@@ -46,7 +46,12 @@ impl Card for GithubCard {
 				let fault = failure(view);
 				dom! { <box border=round title={title} title_pad=3 pad="0 1"><text>{fault}</text></box> }.into_component()
 			},
-			_ => dom! { <row gap=1><i:pending/><text>{heading}</text></row> }.into_component(),
+			_ => dom! {
+				<row gap=1><i:pending/><text>{heading}</text>
+					if let Some(badge) = elapsed_badge(view) { {badge} }
+				</row>
+			}
+			.into_component(),
 		}
 	}
 }

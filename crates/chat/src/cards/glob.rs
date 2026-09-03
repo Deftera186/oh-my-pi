@@ -5,7 +5,9 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
+};
 
 /// Card for `glob` calls.
 pub struct GlobCard;
@@ -30,6 +32,7 @@ impl Card for GlobCard {
 					<row gap=1 pad-x=1>
 						<i:pending/><text bold>{"Glob:"}</text><text>{query}</text>
 						if let Some(limit) = limit { <text>{sf!("limit:{limit}")}</text> }
+						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 				}
 				.into_component()

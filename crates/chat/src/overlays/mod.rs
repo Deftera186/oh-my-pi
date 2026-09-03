@@ -1,15 +1,263 @@
 //! Observer-local overlays: approval prompts projected from controller-owned
 //! DOM state, plus the model picker, prompt-history picker, and transient
 //! notices that live only in the actor (ADR 0005).
+//!
+//! Every other overlay (session picker, tree, rewind, dashboards, side
+//! panels) is a [`Panel`]: a retained component the host stacks, routes keys
+//! to, and composites by its [`PanelAnchor`]. Panels ask for effects through
+//! [`PanelEvent`] — a console line (ADR 0014), a composer recall, a notice,
+//! a clipboard write — and never touch the session DOM.
 
-use std::fmt::{self, Write as _};
+use std::{
+	fmt::{self, Write as _},
+	sync::Arc,
+	time::Duration,
+};
 
 use omp_agent::{ApprovalDecision, ApprovalScope, ApprovalSource};
+use omp_con::Ctx;
 use omp_core::{Str, StrMut, sf};
 use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
-use omp_tui::{
-	Frame, Key, Prop, Size, Ui, UiContext, UiEvent, assets::provider_logo, dom,
-};
+use omp_tui::{Frame, Key, Prop, Size, Ui, UiContext, UiEvent, assets::provider_logo, dom};
+
+/// Codex quota-reset fireworks celebration.
+pub mod fireworks;
+/// `/pause` full-screen hold screen.
+pub mod pause;
+/// `/plan-review` plan review dialog.
+pub mod plan_review;
+/// Centered scrollable markdown report.
+pub mod report;
+/// `/git` fullscreen Git workbench.
+pub mod git;
+/// `/copy` transcript picker.
+pub mod copy;
+/// `/agents` agent-definition browser.
+pub mod agents;
+/// `/hub` live agent supervisor and its transcript viewer.
+pub mod hub;
+/// `/extensions` Extension Control Center dashboard.
+pub mod extensions;
+/// `/plugins`, `/marketplace` plugin selector.
+pub mod plugins;
+/// Login dialog, logout account selector, and provider picker.
+pub mod login;
+/// Debug tools selector plus the context, hotkeys, and changelog reports.
+pub mod info;
+/// Full-screen `/usage` dashboard.
+pub mod usage;
+/// Loader-then-result panel over one asynchronous service request.
+pub mod tasks;
+/// `/branch` rewind selector.
+pub mod rewind;
+/// `/resume` session picker.
+pub mod sessions;
+/// Side-channel panels above the editor (`/btw`).
+pub mod side;
+/// `/tree` branch explorer.
+pub mod tree;
+/// Application-supplied data feeds for dashboards and account commands.
+pub mod services;
+
+pub use services::{NoServices, Services};
+
+/// Where the host composites a [`Panel`] frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelAnchor {
+	/// Replaces the composer band (pi swaps the editor slot for pickers).
+	Bottom,
+	/// Centered modal dialog at 80% width.
+	Center,
+	/// Full-screen dashboard.
+	Full,
+	/// Side-channel panel above the editor (`/btw`, `/omfg`, `/cleanse`);
+	/// the composer stays live and Esc closes it at rung 2 of the ladder.
+	Side,
+}
+
+/// What a routed panel key or call asked the host to do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PanelEvent {
+	/// The panel did not consume the input.
+	Ignored,
+	/// The panel changed; repaint.
+	Consumed,
+	/// Close the panel.
+	Close,
+	/// Run a console line; the panel stays open.
+	Run(Str),
+	/// Close the panel, then run a console line.
+	Finish(Str),
+	/// Close the panel and place text in the composer.
+	Recall(Str),
+	/// Show a transient status notice; the panel stays open.
+	Notice(Str),
+	/// Write text to the clipboard; the panel stays open.
+	Copy(Str),
+}
+
+/// pi panel chords the host lowers before handing a panel the raw key
+/// (`app.session.*`, `app.tree.*`, `app.tools.expand`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelAction {
+	/// Ctrl+P: full vs relative session path.
+	TogglePath,
+	/// Ctrl+S: mtime vs creation-date sort.
+	ToggleSort,
+	/// Ctrl+R: inline rename prompt.
+	Rename,
+	/// Ctrl+D: delete with confirmation.
+	Delete,
+	/// Ctrl+Backspace (decoded as the readline `ctrl+w` chord): delete
+	/// without confirmation.
+	DeleteFast,
+	/// Ctrl+Left / Alt+Left: fold the subtree or move to the parent.
+	FoldUp,
+	/// Ctrl+Right / Alt+Right: unfold the subtree or move to the first child.
+	UnfoldDown,
+	/// Ctrl+O: expand the focused entry.
+	Expand,
+}
+
+impl PanelAction {
+	/// Lowers a decoded key to its pi panel action.
+	#[must_use]
+	pub const fn from_key(key: Key) -> Option<Self> {
+		Some(match key {
+			Key::Ctrl('p') => Self::TogglePath,
+			Key::Ctrl('s') => Self::ToggleSort,
+			Key::Ctrl('r') => Self::Rename,
+			Key::Ctrl('d') => Self::Delete,
+			Key::Ctrl('w') => Self::DeleteFast,
+			Key::WordLeft => Self::FoldUp,
+			Key::WordRight => Self::UnfoldDown,
+			Key::Ctrl('o') => Self::Expand,
+			_ => return None,
+		})
+	}
+}
+
+/// Facts a panel may read while opening or running a call.
+pub struct PanelCx<'a> {
+	/// Detached session replica.
+	pub dom:      &'a Dom,
+	/// Console context (convars, registered commands).
+	pub con:      &'a Ctx,
+	/// Ambient renderer context.
+	pub ui:       &'a UiContext,
+	/// Current viewport.
+	pub viewport: Size,
+	/// Application-supplied data feeds; panels that poll a `Pending`
+	/// request clone the handle.
+	pub services: &'a Arc<dyn Services>,
+}
+
+/// A retained observer-local overlay the host stacks and routes to.
+pub trait Panel {
+	/// Stable identity reported through `HostCommand::Overlay` and the
+	/// debug `values` op.
+	fn id(&self) -> &'static str;
+	/// Where the frame is composited.
+	fn anchor(&self) -> PanelAnchor {
+		PanelAnchor::Bottom
+	}
+	/// Applies one lowered pi panel chord. `Ignored` hands the raw key to
+	/// [`Panel::key`].
+	fn action(&mut self, _action: PanelAction) -> PanelEvent {
+		PanelEvent::Ignored
+	}
+	/// Applies one raw key.
+	fn key(&mut self, key: Key) -> PanelEvent;
+	/// Applies pasted text.
+	fn paste(&mut self, _text: &str) -> PanelEvent {
+		PanelEvent::Ignored
+	}
+	/// Reflows for a viewport and returns the frame to composite.
+	fn frame(&mut self, viewport: Size) -> &Frame;
+	/// Advances animations (countdowns); returns whether a repaint is due.
+	fn tick(&mut self, _now: Duration) -> bool {
+		false
+	}
+	/// Next animation deadline on the host clock.
+	fn next_wake(&self) -> Option<Duration> {
+		None
+	}
+	/// Whether the panel finished on its own (an animation ran out); the
+	/// host closes it after the tick that reported it.
+	fn finished(&self) -> bool {
+		false
+	}
+	/// An effect the panel wants applied after a tick that repainted (an
+	/// asynchronous request settled): the host feeds it through the normal
+	/// panel-event path.
+	fn settled(&mut self) -> Option<PanelEvent> {
+		None
+	}
+}
+
+/// Deferred panel constructor posted by a console command; the host runs
+/// it with its live facts. Compared by identity.
+#[derive(Clone)]
+pub struct PanelOpener(Arc<dyn Fn(&PanelCx<'_>) -> Result<Box<dyn Panel>, Str> + Send + Sync>);
+
+impl PanelOpener {
+	/// Wraps a constructor.
+	pub fn new(
+		open: impl Fn(&PanelCx<'_>) -> Result<Box<dyn Panel>, Str> + Send + Sync + 'static,
+	) -> Self {
+		Self(Arc::new(open))
+	}
+
+	/// Runs the constructor.
+	pub fn open(&self, cx: &PanelCx<'_>) -> Result<Box<dyn Panel>, Str> {
+		(self.0)(cx)
+	}
+}
+
+impl fmt::Debug for PanelOpener {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("PanelOpener")
+	}
+}
+
+impl PartialEq for PanelOpener {
+	fn eq(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.0, &other.0)
+	}
+}
+
+impl Eq for PanelOpener {}
+
+/// Deferred host-side effect posted by a console command that needs the
+/// host's facts but opens nothing; its event runs through the panel path.
+#[derive(Clone)]
+pub struct PanelCall(Arc<dyn Fn(&PanelCx<'_>) -> PanelEvent + Send + Sync>);
+
+impl PanelCall {
+	/// Wraps a call.
+	pub fn new(call: impl Fn(&PanelCx<'_>) -> PanelEvent + Send + Sync + 'static) -> Self {
+		Self(Arc::new(call))
+	}
+
+	/// Runs the call.
+	pub fn call(&self, cx: &PanelCx<'_>) -> PanelEvent {
+		(self.0)(cx)
+	}
+}
+
+impl fmt::Debug for PanelCall {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("PanelCall")
+	}
+}
+
+impl PartialEq for PanelCall {
+	fn eq(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.0, &other.0)
+	}
+}
+
+impl Eq for PanelCall {}
 
 const MODEL_HINT: &str =
 	"↑/↓ models · Enter switch · type to search · Alt+P task model · Esc close";
@@ -31,7 +279,10 @@ pub struct ApprovalOverlay {
 	/// Explanation supplied by host policy.
 	pub reason: Str,
 	/// Default scope offered by the controller.
-	pub scope:  ApprovalScope,
+	pub scope:   ApprovalScope,
+	/// Controller-set deadline after which the kernel answers with the
+	/// prompt's default (`timeout-ms`); `None` waits indefinitely.
+	pub timeout: Option<Duration>,
 }
 
 impl ApprovalOverlay {
@@ -169,13 +420,10 @@ impl ModelPicker {
 
 	/// Reflows for a viewport, returning the frame to composite.
 	pub fn frame(&mut self, viewport: Size) -> &Frame {
-		let rows = (viewport.height * 2 / 5)
-			.saturating_sub(FRAME_ROWS)
-			.max(5);
+		let rows = (viewport.height * 2 / 5).saturating_sub(FRAME_ROWS).max(5);
 		if rows != self.list_rows {
 			self.list_rows = rows;
-			self.ui
-				.set_prop("models", Prop::H, rows.saturating_add(1));
+			self.ui.set_prop("models", Prop::H, rows.saturating_add(1));
 		}
 		if self.width != viewport.width {
 			self.width = viewport.width;
@@ -303,7 +551,11 @@ fn build_models(
 	} else {
 		"Switch Model"
 	};
-	let hint = if task_mode { MODEL_TASK_HINT } else { MODEL_HINT };
+	let hint = if task_mode {
+		MODEL_TASK_HINT
+	} else {
+		MODEL_HINT
+	};
 	let height = list_rows.saturating_add(1);
 	let tree = dom! {
 		<box border=round title={title} pad-x=1>
@@ -432,13 +684,10 @@ impl HistoryPicker {
 
 	/// Reflows for a viewport, returning the frame to composite.
 	pub fn frame(&mut self, viewport: Size) -> &Frame {
-		let rows = (viewport.height * 2 / 5)
-			.saturating_sub(FRAME_ROWS)
-			.max(5);
+		let rows = (viewport.height * 2 / 5).saturating_sub(FRAME_ROWS).max(5);
 		if rows != self.rows {
 			self.rows = rows;
-			self.ui
-				.set_prop("prompts", Prop::H, rows.saturating_add(1));
+			self.ui.set_prop("prompts", Prop::H, rows.saturating_add(1));
 		}
 		if self.width != viewport.width {
 			self.width = viewport.width;
@@ -509,20 +758,62 @@ pub enum Overlay {
 	History(HistoryPicker),
 	/// Tool approval prompt projected from the session queue.
 	Approval(ApprovalOverlay),
-	/// Transient one-line status (pi `showStatus`), cleared by the next key.
-	Notice(Str),
+	/// Command-owned panel (session picker, tree, dashboards, side panels).
+	Panel(Box<dyn Panel>),
 }
 
-/// Retained local overlay stack.
+impl Overlay {
+	/// Stable identity for `HostCommand::Overlay` and the debug `values` op.
+	#[must_use]
+	pub fn id(&self) -> &'static str {
+		match self {
+			Self::Models(_) => "models",
+			Self::History(_) => "history",
+			Self::Approval(_) => "approval",
+			Self::Panel(panel) => panel.id(),
+		}
+	}
+
+	/// Whether this overlay holds keyboard focus (everything but a side
+	/// panel, which leaves the composer live).
+	#[must_use]
+	pub fn modal(&self) -> bool {
+		match self {
+			Self::Panel(panel) => panel.anchor() != PanelAnchor::Side,
+			_ => true,
+		}
+	}
+}
+
+/// Retained local overlay stack plus the one transient status notice.
 #[derive(Default)]
 pub struct Overlays {
-	active: Option<Overlay>,
+	stack:  Vec<Overlay>,
+	notice: Option<Str>,
 }
 
 impl Overlays {
-	/// Replaces the visible overlay.
+	/// Pushes an overlay on top of the stack.
 	pub fn show(&mut self, overlay: Overlay) {
-		self.active = Some(overlay);
+		self.stack.push(overlay);
+	}
+
+	/// Shows a transient status line (pi `showStatus`), cleared by the next
+	/// key; it never displaces an interactive overlay.
+	pub fn notify(&mut self, text: impl Into<Str>) {
+		self.notice = Some(text.into());
+	}
+
+	/// Number of stacked overlays.
+	#[must_use]
+	pub const fn depth(&self) -> usize {
+		self.stack.len()
+	}
+
+	/// Whether the topmost overlay is a side-channel panel.
+	#[must_use]
+	pub fn side_panel(&self) -> bool {
+		matches!(self.stack.last(), Some(Overlay::Panel(panel)) if panel.anchor() == PanelAnchor::Side)
 	}
 
 	/// Reprojects the first pending approval from the detached DOM replica.
@@ -549,65 +840,79 @@ impl Overlays {
 					.unwrap_or("once")
 					.parse::<ApprovalScope>()
 					.expect("approval scope parsing is infallible");
+				let timeout = node
+					.prop(&PropKey::Custom(Str::new_static("timeout-ms")))
+					.and_then(|value| match value {
+						Value::Int(ms) => u64::try_from(*ms).ok(),
+						_ => None,
+					})
+					.filter(|ms| *ms > 0)
+					.map(Duration::from_millis);
 				Some(ApprovalOverlay {
 					id: Str::new(id),
 					title: Str::new(text_prop(node, PropId::Label).unwrap_or("Approval required")),
 					reason: Str::new(text_prop(node, PropId::Detail).unwrap_or_default()),
 					scope,
+					timeout,
 				})
 			});
-		match (approval, self.active.as_ref()) {
-			(Some(approval), _) => self.active = Some(Overlay::Approval(approval)),
-			(None, Some(Overlay::Approval(_))) => self.active = None,
-			(None, _) => {},
+		let at = self
+			.stack
+			.iter()
+			.position(|overlay| matches!(overlay, Overlay::Approval(_)));
+		match (approval, at) {
+			(Some(approval), Some(at)) => {
+				self.stack.remove(at);
+				self.stack.push(Overlay::Approval(approval));
+			},
+			(Some(approval), None) => self.stack.push(Overlay::Approval(approval)),
+			(None, Some(at)) => {
+				self.stack.remove(at);
+			},
+			(None, None) => {},
 		}
 	}
 
-	/// Dismisses the visible observer-local overlay.
-	pub fn dismiss(&mut self) {
-		self.active = None;
+	/// Pops the topmost observer-local overlay.
+	pub fn dismiss(&mut self) -> Option<Overlay> {
+		self.stack.pop()
 	}
 
-	/// Drops a transient notice, keeping any interactive overlay.
+	/// Drops the transient notice, keeping every interactive overlay.
 	pub fn clear_notice(&mut self) {
-		if matches!(self.active, Some(Overlay::Notice(_))) {
-			self.active = None;
-		}
+		self.notice = None;
 	}
 
-	/// Returns the visible overlay.
+	/// Returns the topmost overlay.
 	#[must_use]
-	pub const fn active(&self) -> Option<&Overlay> {
-		self.active.as_ref()
+	pub fn active(&self) -> Option<&Overlay> {
+		self.stack.last()
 	}
 
-	/// Returns the visible overlay mutably.
-	pub const fn active_mut(&mut self) -> Option<&mut Overlay> {
-		self.active.as_mut()
+	/// Returns the topmost overlay mutably.
+	pub fn active_mut(&mut self) -> Option<&mut Overlay> {
+		self.stack.last_mut()
 	}
 
-	/// Whether an interactive (key-consuming) overlay is open.
+	/// Whether the topmost overlay holds keyboard focus.
 	#[must_use]
-	pub const fn modal(&self) -> bool {
-		matches!(self.active, Some(Overlay::Models(_) | Overlay::History(_) | Overlay::Approval(_)))
+	pub fn modal(&self) -> bool {
+		self.stack.last().is_some_and(Overlay::modal)
 	}
 
-	/// Returns the pending approval, when one is visible.
+	/// Returns the pending approval, when one is stacked.
 	#[must_use]
 	pub fn approval(&self) -> Option<&ApprovalOverlay> {
-		match self.active.as_ref() {
-			Some(Overlay::Approval(approval)) => Some(approval),
+		self.stack.iter().rev().find_map(|overlay| match overlay {
+			Overlay::Approval(approval) => Some(approval),
 			_ => None,
-		}
+		})
 	}
 
 	/// Returns the visible notice text.
 	#[must_use]
 	pub fn notice(&self) -> Option<&str> {
-		match self.active.as_ref() {
-			Some(Overlay::Notice(text)) => Some(text.as_str()),
-			_ => None,
-		}
+		self.notice.as_deref()
 	}
 }
 
@@ -617,11 +922,15 @@ pub fn prompt_history(dom: &Dom) -> Vec<Str> {
 	let mut prompts = Vec::new();
 	for turn in dom.children(dom.body()).iter().rev() {
 		for child in dom.children(*turn).iter().rev() {
-			let Some(node) = dom.get(*child) else { continue };
+			let Some(node) = dom.get(*child) else {
+				continue;
+			};
 			if node.tag != Tag::Known(KnownTag::User) {
 				continue;
 			}
-			let Some(text) = node.content.as_ref() else { continue };
+			let Some(text) = node.content.as_ref() else {
+				continue;
+			};
 			if !text.trim().is_empty() && !prompts.contains(text) {
 				prompts.push(text.clone());
 			}
@@ -712,7 +1021,10 @@ mod tests {
 		let prompts = vec![Str::new_static("newest"), Str::new_static("older\nsecond line")];
 		let mut picker = HistoryPicker::open(prompts, 80, &UiContext::default());
 		assert_eq!(picker.key(Key::Down), PickerEvent::Consumed);
-		assert_eq!(picker.key(Key::Enter), PickerEvent::Recall(Str::new_static("older\nsecond line")));
+		assert_eq!(
+			picker.key(Key::Enter),
+			PickerEvent::Recall(Str::new_static("older\nsecond line"))
+		);
 		let text = omp_tui::frame_text(picker.frame(Size::new(80, 30)));
 		assert!(text.contains("Search History"), "{text}");
 		assert!(text.contains("(+1 lines)"), "{text}");
@@ -721,13 +1033,61 @@ mod tests {
 	#[test]
 	fn notices_never_displace_a_modal_overlay_and_clear_on_request() {
 		let mut overlays = Overlays::default();
-		overlays.show(Overlay::Notice(Str::new_static("hi")));
+		overlays.notify("hi");
 		assert_eq!(overlays.notice(), Some("hi"));
 		assert!(!overlays.modal());
 		overlays.clear_notice();
 		assert!(overlays.active().is_none());
 		overlays.show(Overlay::Models(picker(vec![row("a", "b")], 0, 0)));
+		overlays.notify("still");
 		overlays.clear_notice();
 		assert!(overlays.modal());
+		assert_eq!(overlays.notice(), None);
+	}
+
+	struct Side;
+
+	impl Panel for Side {
+		fn id(&self) -> &'static str {
+			"side"
+		}
+
+		fn anchor(&self) -> PanelAnchor {
+			PanelAnchor::Side
+		}
+
+		fn key(&mut self, _key: Key) -> PanelEvent {
+			PanelEvent::Ignored
+		}
+
+		fn frame(&mut self, _viewport: Size) -> &Frame {
+			unreachable!("never painted in this test")
+		}
+	}
+
+	#[test]
+	fn overlays_stack_and_a_pending_approval_always_rises_to_the_top() {
+		let mut overlays = Overlays::default();
+		overlays.show(Overlay::Panel(Box::new(Side)));
+		assert!(overlays.side_panel());
+		assert!(!overlays.modal());
+		overlays.show(Overlay::Models(picker(vec![row("a", "b")], 0, 0)));
+		assert!(overlays.modal());
+		assert_eq!(overlays.depth(), 2);
+		assert_eq!(overlays.dismiss().map(|overlay| overlay.id()), Some("models"));
+		assert_eq!(overlays.active().map(Overlay::id), Some("side"));
+	}
+
+	#[test]
+	fn panel_actions_lower_the_pi_session_and_tree_chords() {
+		assert_eq!(PanelAction::from_key(Key::Ctrl('p')), Some(PanelAction::TogglePath));
+		assert_eq!(PanelAction::from_key(Key::Ctrl('s')), Some(PanelAction::ToggleSort));
+		assert_eq!(PanelAction::from_key(Key::Ctrl('r')), Some(PanelAction::Rename));
+		assert_eq!(PanelAction::from_key(Key::Ctrl('d')), Some(PanelAction::Delete));
+		assert_eq!(PanelAction::from_key(Key::Ctrl('w')), Some(PanelAction::DeleteFast));
+		assert_eq!(PanelAction::from_key(Key::WordLeft), Some(PanelAction::FoldUp));
+		assert_eq!(PanelAction::from_key(Key::WordRight), Some(PanelAction::UnfoldDown));
+		assert_eq!(PanelAction::from_key(Key::Ctrl('o')), Some(PanelAction::Expand));
+		assert_eq!(PanelAction::from_key(Key::Char('x')), None);
 	}
 }

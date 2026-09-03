@@ -7,7 +7,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_input, typed_result};
 
 /// Unified hub card; the `op` argument selects the compact presentation.
 pub struct HubCard;
@@ -57,7 +57,9 @@ fn render_generic(view: &CardView<'_>) -> Component {
 	};
 	dom! {
 		<col>
-			<row gap=1>{icon}<text bold>{"Hub"}</text></row>
+			<row gap=1>{icon}<text bold>{"Hub"}</text>
+				if let Some(badge) = elapsed_badge(view) { {badge} }
+			</row>
 			if let Some(detail) = detail { <text pad-x=2>{detail}</text> }
 			if let Some(fault) = fault { <text pad-x=2 fg=err>{fault}</text> }
 		</col>
@@ -108,7 +110,7 @@ fn render_process(
 		CardStatus::Done => dom! { <i:launch/> }.into_component(),
 		CardStatus::Failed => dom! { <i:error/> }.into_component(),
 		CardStatus::StreamingArgs | CardStatus::InProgress => {
-			dom! { <i:launch-pending/> }.into_component()
+			dom! { <spinner kind=status/> }.into_component()
 		},
 	};
 	dom! {
@@ -119,6 +121,7 @@ fn render_process(
 				if let Some(detail) = detail { <text fg=muted>{detail}</text> }
 				if let Some(pid) = pid { <text fg=muted>{"· pid"}</text><text fg=muted>{sf!("{pid}")}</text> }
 				if let Some(wall_ms) = wall_ms { <text fg=muted>{"· up"}</text><time ms={wall_ms}/> }
+				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if let Some(text) = text { <text>{text}</text> }
 			if let Some(fault) = fault { <text fg=err>{fault}</text> }
@@ -147,8 +150,9 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, ui: &UiContext) -> Com
 				.and_then(Value::as_bool)
 				.unwrap_or(false);
 			dom! {
-				<row gap=1><i:launch-pending/><text bold>{"Launch logs:"}</text><text>{name}</text>
+				<row gap=1><spinner kind=status/><text bold>{"Launch logs:"}</text><text>{name}</text>
 					if follow { <text fg=muted>{"follow"}</text> }
+					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
 			.into_component()
@@ -231,6 +235,7 @@ fn render_send(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 		<col>
 			<row gap=1>{icon}<text bold>{"IRC"}</text><i:selected/><text>{to.clone()}</text>
 				if let Some(kind) = kind { <text fg=muted>{kind}</text> }
+				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if let Some(message) = message {
 				<row gap=1 pad-x=2><i:tree-vertical/><text>{message}</text></row>
@@ -319,6 +324,7 @@ fn render_inbox(view: &CardView<'_>, args: Option<&Value>, raw: &str, waiting: b
 				if matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress) && waiting {
 					if let Some(timeout) = timeout { <text fg=muted>{"timeout"}</text><text fg=muted>{timeout}</text> }
 				}
+				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if !rows.is_empty() {
 				if waiting { <col pad-x=2>{rows}</col> } else { <col>{rows}</col> }
@@ -389,6 +395,7 @@ fn render_roster(view: &CardView<'_>) -> Component {
 		<col pad-x=1>
 			<row gap=1>{icon}<text bold>{"IRC peers"}</text>
 				if !peers.is_empty() { <text>{sf!("{idle} idle · {parked} parked · {unread} unread")}</text> }
+				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			if !rows.is_empty() { <col>{rows}</col> }
 			if let Some(fault) = fault { <text fg=err pad-x=2>{fault}</text> }
@@ -418,6 +425,7 @@ fn render_jobs(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 				if count == 1 { <text>{ids[0].as_str().unwrap_or_default()}</text> }
 				else if count > 1 { <text>{sf!("{count}")}</text><text>{"jobs"}</text> }
 				else if let Some(id) = partial_id { <text>{id}</text> }
+				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 		}
 		.into_component();
