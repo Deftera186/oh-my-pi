@@ -6174,6 +6174,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
+name = "linkme"
+version = "0.3.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045e122bd98aef8ec3ad58ce84f0791f64e70163d1a02710af4aa11a4d54cc5"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77060ebe535362c3da75682cd17b0431017b6e7c5661e714fc69a7ad017d1301"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7581,44 +7601,29 @@ dependencies = [
 name = "omp-agent"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "bytes",
  "flume",
  "futures",
- "globset",
- "hifijson",
- "hyper-util",
  "insta",
- "jaq-core",
- "jaq-json",
- "jaq-std",
- "omp-ast",
  "omp-core",
- "omp-env",
+ "omp-dom",
  "omp-inference",
- "omp-memory",
- "omp-observability",
+ "omp-journal",
  "omp-proto",
  "omp-scribe",
- "omp-secrets",
- "omp-slopjson",
- "omp-snapcompact",
- "omp-storage",
+ "omp-session",
  "omp-tool",
+ "omp-vocab",
  "parking_lot",
- "proptest",
- "regex",
- "schemars",
  "serde",
  "serde_json",
- "serde_yaml",
  "smallvec 2.0.0-alpha.12",
  "strum",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-stream",
  "tokio-util",
- "tonic",
  "tower",
  "tracing",
 ]
@@ -7647,11 +7652,14 @@ dependencies = [
  "nix 0.31.3",
  "omp-agent",
  "omp-ar",
+ "omp-cache",
  "omp-catalog",
- "omp-chat-ui",
+ "omp-chat",
  "omp-collab",
+ "omp-con",
  "omp-core",
  "omp-docserver",
+ "omp-dom",
  "omp-driver",
  "omp-env",
  "omp-envd",
@@ -7661,6 +7669,7 @@ dependencies = [
  "omp-hashline",
  "omp-http",
  "omp-inference",
+ "omp-journal",
  "omp-memory",
  "omp-observability",
  "omp-proto",
@@ -7670,10 +7679,9 @@ dependencies = [
  "omp-scribe",
  "omp-sdk",
  "omp-serve",
- "omp-settings",
+ "omp-session",
  "omp-shell",
  "omp-slopjson",
- "omp-storage",
  "omp-tool",
  "omp-tools",
  "omp-tui",
@@ -7801,14 +7809,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-cache"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "omp-core",
+ "parking_lot",
+ "pretty_assertions",
+ "proptest",
+ "rand 0.10.2",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "omp-catalog"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
  "globset",
  "kdl",
+ "omp-con",
  "omp-core",
- "omp-settings",
  "parking_lot",
  "postcard",
  "serde",
@@ -7823,30 +7851,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-chat-ui"
+name = "omp-chat"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
- "bytes",
  "flume",
- "jiff",
- "md-5",
+ "insta",
+ "nix 0.31.3",
  "omp-agent",
+ "omp-con",
  "omp-core",
- "omp-proto",
- "omp-storage",
+ "omp-dom",
+ "omp-journal",
+ "omp-session",
  "omp-tools",
  "omp-tui",
+ "omp-walker",
  "parking_lot",
- "proptest",
- "prost",
+ "serde",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
- "strum",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "xutf",
 ]
 
 [[package]]
@@ -7859,7 +7886,6 @@ dependencies = [
  "http",
  "omp-core",
  "omp-proto",
- "omp-storage",
  "prost",
  "rand 0.10.2",
  "ring",
@@ -7872,6 +7898,21 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "omp-con"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+ "omp-core",
+ "omp-session",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7971,6 +8012,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "omp-dom"
+version = "0.1.0"
+dependencies = [
+ "flume",
+ "omp-core",
+ "omp-journal",
+ "omp-vocab",
+ "pretty_assertions",
+ "proptest",
+ "serde",
+ "serde_json",
+ "smallvec 2.0.0-alpha.12",
+ "strum",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "omp-driver"
 version = "0.1.0"
 dependencies = [
@@ -7984,6 +8042,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "im",
  "jiff",
@@ -7991,26 +8050,28 @@ dependencies = [
  "notify",
  "omp-agent",
  "omp-ar",
+ "omp-cache",
  "omp-catalog",
  "omp-collab",
+ "omp-con",
  "omp-core",
  "omp-docserver",
+ "omp-dom",
  "omp-env",
  "omp-envd",
  "omp-ext",
  "omp-http",
  "omp-inference",
+ "omp-journal",
  "omp-memory",
  "omp-observability",
  "omp-proto",
  "omp-rpc",
  "omp-scribe",
- "omp-sdk",
  "omp-secrets",
  "omp-serve",
- "omp-settings",
+ "omp-session",
  "omp-slopjson",
- "omp-storage",
  "omp-tool",
  "omp-tools",
  "omp-tui",
@@ -8022,6 +8083,7 @@ dependencies = [
  "reqwest 0.13.4",
  "ring",
  "rusqlite",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
@@ -8054,20 +8116,25 @@ dependencies = [
  "omp-agent",
  "omp-app",
  "omp-catalog",
+ "omp-con",
  "omp-core",
  "omp-docserver",
+ "omp-dom",
+ "omp-driver",
  "omp-env",
  "omp-envd",
  "omp-ext",
  "omp-hashline",
  "omp-inference",
+ "omp-journal",
  "omp-observability",
  "omp-proto",
  "omp-rpc",
+ "omp-scribe",
  "omp-serve",
+ "omp-session",
  "omp-shell",
  "omp-shell-engine",
- "omp-storage",
  "omp-tool",
  "omp-tools",
  "omp-tui",
@@ -8133,16 +8200,20 @@ dependencies = [
  "notify",
  "omp-agent",
  "omp-ar",
+ "omp-cache",
  "omp-catalog",
+ "omp-con",
  "omp-core",
  "omp-desktop",
  "omp-docserver",
+ "omp-dom",
  "omp-env",
  "omp-ext",
  "omp-grep",
  "omp-hashline",
  "omp-http",
  "omp-inference",
+ "omp-journal",
  "omp-memory",
  "omp-oauth",
  "omp-observability",
@@ -8150,9 +8221,9 @@ dependencies = [
  "omp-py",
  "omp-sandbox",
  "omp-secrets",
- "omp-settings",
+ "omp-session",
+ "omp-shell-builtins",
  "omp-shell-engine",
- "omp-storage",
  "omp-tool",
  "omp-tools",
  "omp-vcs",
@@ -8235,7 +8306,6 @@ dependencies = [
  "fontdb 0.24.0",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
- "omp-chat-ui",
  "omp-core",
  "omp-tui",
  "omp-webview",
@@ -8286,6 +8356,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-stream",
+ "brotli",
  "bytes",
  "candle-core",
  "candle-nn",
@@ -8306,11 +8377,11 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "omp-catalog",
+ "omp-con",
  "omp-core",
  "omp-oauth",
  "omp-proto",
  "omp-secrets",
- "omp-settings",
  "omp-slopjson",
  "omp-voice-kokoro",
  "parking_lot",
@@ -8342,6 +8413,24 @@ dependencies = [
  "voice-g2p",
  "xutf",
  "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "omp-journal"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cap-std",
+ "memchr",
+ "omp-ar",
+ "omp-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8349,7 +8438,7 @@ name = "omp-macros"
 version = "0.1.0"
 dependencies = [
  "omp-core",
- "omp-tui-vocab",
+ "omp-vocab",
  "proc-macro2",
  "quote",
  "strum",
@@ -8452,12 +8541,12 @@ dependencies = [
  "omp-core",
  "omp-env",
  "omp-scribe",
- "omp-storage",
  "omp-tool",
  "parking_lot",
  "pyo3",
  "pyo3-introspection",
  "serde_json",
+ "strum",
  "tokio",
  "tracing",
 ]
@@ -8511,6 +8600,7 @@ version = "0.1.0"
 dependencies = [
  "im",
  "omp-core",
+ "omp-dom",
  "serde",
  "serde_json",
  "smallvec 2.0.0-alpha.12",
@@ -8521,28 +8611,19 @@ dependencies = [
 name = "omp-sdk"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "flume",
  "futures",
  "omp-agent",
  "omp-catalog",
  "omp-core",
- "omp-docserver",
- "omp-env",
+ "omp-dom",
  "omp-inference",
- "omp-observability",
- "omp-proto",
- "omp-secrets",
+ "omp-journal",
+ "omp-session",
  "omp-tool",
- "omp-tools",
- "omp-walker",
- "parking_lot",
- "serde_json",
- "strum",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -8550,8 +8631,8 @@ name = "omp-secrets"
 version = "0.1.0"
 dependencies = [
  "hmac 0.12.1",
+ "omp-cache",
  "omp-core",
- "omp-storage",
  "parking_lot",
  "pretty_assertions",
  "regex",
@@ -8572,12 +8653,12 @@ dependencies = [
  "flume",
  "futures",
  "im",
- "omp-agent",
  "omp-catalog",
  "omp-core",
  "omp-inference",
+ "omp-journal",
  "omp-proto",
- "omp-storage",
+ "omp-session",
  "omp-tool",
  "parking_lot",
  "serde",
@@ -8589,23 +8670,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-settings"
+name = "omp-session"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flume",
- "globset",
- "libc",
- "omp-slopjson",
- "parking_lot",
- "rusqlite",
+ "omp-core",
+ "omp-dom",
+ "omp-journal",
+ "omp-proto",
+ "omp-tool",
+ "proptest",
  "serde",
  "serde_json",
- "serde_yaml",
- "strum",
  "tempfile",
  "thiserror 2.0.20",
- "toml",
- "tracing",
 ]
 
 [[package]]
@@ -8747,35 +8826,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-storage"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "cap-std",
- "flume",
- "omp-ar",
- "omp-core",
- "omp-observability",
- "omp-proto",
- "omp-tool",
- "parking_lot",
- "pretty_assertions",
- "proptest",
- "rand 0.10.2",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "smallvec 2.0.0-alpha.12",
- "strum",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "xutf",
- "zeroize",
-]
-
-[[package]]
 name = "omp-tool"
 version = "0.1.0"
 dependencies = [
@@ -8820,6 +8870,7 @@ dependencies = [
  "libc",
  "omp-ar",
  "omp-ast",
+ "omp-con",
  "omp-core",
  "omp-docserver",
  "omp-env",
@@ -8829,7 +8880,6 @@ dependencies = [
  "omp-memory",
  "omp-proto",
  "omp-py",
- "omp-settings",
  "omp-shell-engine",
  "omp-slopjson",
  "omp-tool",
@@ -8872,13 +8922,13 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
- "omp-chat-ui",
  "omp-core",
  "omp-macros",
  "omp-snapcompact",
- "omp-tui-vocab",
+ "omp-vocab",
  "parking_lot",
  "png 0.18.1",
+ "proptest",
  "rayon",
  "serde",
  "serde_json",
@@ -8897,10 +8947,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "omp-tui-vocab"
-version = "0.1.0"
-
-[[package]]
 name = "omp-vcs"
 version = "0.1.0"
 dependencies = [
@@ -8911,6 +8957,15 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "omp-vocab"
+version = "0.1.0"
+dependencies = [
+ "omp-core",
+ "serde",
+ "strum",
 ]
 
 [[package]]

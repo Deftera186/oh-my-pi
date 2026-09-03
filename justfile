@@ -150,7 +150,7 @@ test-pkg pkg:
     cargo test --doc -p {{ pkg }} --locked
 
 # ---------------------------------------------------------------------------
-# E2E acceptance suite (crates/e2e, joined-system proofs P1-P8)
+# E2E acceptance suite (crates/e2e, joined-system proofs P1-P10)
 # ---------------------------------------------------------------------------
 
 # Compile every acceptance proof without running them.
@@ -179,16 +179,29 @@ e2e-p7:
 e2e-p8:
     cargo nextest run -p omp-e2e --test p8_baselines --locked
 
+# Run proof P9: isolated environment and extension control registration.
+[group('e2e')]
+e2e-p9:
+    cargo nextest run -p omp-e2e --locked \
+        --test p9_isolation \
+        --test p9_extension_control
+
+# Run proof P10: idempotent historical tool lift through live dispatch.
+[group('e2e')]
+e2e-p10:
+    cargo nextest run -p omp-e2e --test p10_lift_idempotence --locked
+
 # Record a fresh P8 performance-baseline artifact.
 [group('e2e')]
 e2e-baseline:
     cargo run -p omp-e2e --bin baseline --locked -- \
         --artifact target/e2e-artifacts/p8-baselines.json
 
-# Run every P1-P8 proof plus the tool-sources check, in CI order.
+# Run every P1-P10 proof plus the tool-sources check, in CI order.
 [group('e2e')]
-e2e: e2e-build e2e-core e2e-p7 e2e-p8
+e2e: e2e-build e2e-core e2e-p7 e2e-p9 e2e-p10
     cargo nextest run -p omp-e2e --test tool_sources --locked
+    cargo nextest run -p omp-e2e --test p8_baselines --locked
 
 # ---------------------------------------------------------------------------
 # LLM catalog & compat cascade (crates/llm-catalog)

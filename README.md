@@ -59,9 +59,14 @@ names are `omp-` prefixed; directory names are not.
 
 | Crate            | What it is                                                                           |
 | ---------------- | ------------------------------------------------------------------------------------ |
+| `journal`        | Authoritative `.oms` event journal and content-addressed blob store                   |
+| `dom` / `vocab`  | Materialized session tree and shared closed structural vocabulary                    |
+| `session`        | Journal-first session fold, components, rewind, subscriptions, and projections        |
+| `con`            | Typed convars, command stream, bindings, aliases, and cfg persistence                 |
+| `cache`          | Document, GitHub, MCP, secret-key, and statistics caches                              |
 | `tool` / `tools` | Typed revisioned tool contracts/registry, and the resource-owning built-in executors |
-| `agent`          | Durable, interruptible agent-loop foundations                                        |
-| `driver`         | Headless session composition, execution modes, orchestration, discovery, and settings                       |
+| `agent`          | Kernel, dispatch, cancellation, jobs, Directors, hooks, and approvals                |
+| `driver`         | Headless kernel composition, discovery, cfg execution, registries, and subagent spawn |
 | `app`            | Production CLI application and daemon                                                |
 | `e2e`            | Executable cross-crate acceptance proofs                                             |
 | `ext`            | Extension configuration, dependency resolution, lockfiles, index metadata, and local trust state |
@@ -81,7 +86,7 @@ names are `omp-` prefixed; directory names are not.
 | Crate          | What it is                                                                    |
 | -------------- | ----------------------------------------------------------------------------- |
 | `tui`          | Retained-mode terminal UI: components, rendering, input, terminal integration |
-| `chat-ui`      | Host-agnostic immediate-mode chat scene and overlays shared by omp frontends |
+| `chat`         | Actor over `Session::subscribe()`: transcript projection, cards, composer, overlays |
 | `macros`       | Procedural macros for declarative TUI markup and per-thread function caching |
 | `gui`          | GPU-accelerated native window host for omp-tui apps                           |
 | `desktop`      | Actor-owned native desktop capture, input, and accessibility automation |
@@ -94,7 +99,6 @@ names are `omp-` prefixed; directory names are not.
 
 | Crate      | What it is |
 | ---------- | ---------- |
-| `settings` | Typed reflected settings schemas and immutable revisioned snapshots |
 | `secrets`  | Secret-rule validation, reversible keyed placeholders, and provider-bound text redaction |
 | `sandbox`  | Deferred isolation boundary for OMP process confinement |
 | `http`     | Process-wide outbound HTTP connection pools and TLS policy |
@@ -103,9 +107,9 @@ names are `omp-` prefixed; directory names are not.
 
 | Path                  | What it is                                            |
 | --------------------- | ----------------------------------------------------- |
-| `PLAN.md`             | Authoritative plan: decisions, ledger, eight parts    |
-| `.plan/feature-map/`  | Feature map and milestone roadmap                    |
-| `.plan/quirks/`       | Catalog and inference notes                          |
+| `PLAN.md`             | P0–P7 verification gate ledger                        |
+| `.plan/quirks/`       | Catalog and inference notes                           |
+| `.plan/qa/`           | Joined-system QA findings and stable regressions      |
 | `fixtures/llm-oracle` | Recorded inference fixtures                           |
 | `npm/pi-coding-agent` | npm package shim (`scripts/gen-npm-packages.py`)      |
 | `vendor/python`       | Gitignored embedded-Python build inputs (see below)   |
