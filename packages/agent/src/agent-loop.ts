@@ -2299,6 +2299,15 @@ async function prepareToolCallDispatch(
 	}
 	return prepared;
 }
+function resolveToolCallFlag<TArgs>(policy: boolean | ((args: TArgs) => boolean) | undefined, args: TArgs): boolean {
+	if (typeof policy !== "function") return policy === true;
+	try {
+		return policy(args);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Execute tool calls from an assistant message.
  */
@@ -2365,25 +2374,14 @@ async function executeToolCalls(
 			args: toolCall.arguments as Record<string, unknown>,
 		};
 		const { tool, args } = prepared;
-		const interruptibleMode = tool?.interruptible;
-		let interruptible = false;
-		if (typeof interruptibleMode === "function") {
-			try {
-				// Resolved from the prepared (possibly hook-revised) args so an
-				// argument-dependent policy governs the call that actually runs.
-				interruptible = interruptibleMode(args);
-			} catch {
-				// Resolver failures default to preserving the tool's outcome.
-				interruptible = false;
-			}
-		} else {
-			interruptible = interruptibleMode === true;
-		}
+		const interruptible = resolveToolCallFlag(tool?.interruptible, args);
+		const deferSteering = resolveToolCallFlag(tool?.deferSteering, args);
 		return {
 			toolCall,
 			tool,
 			args,
 			interruptible,
+			deferSteering,
 			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
 			started: false,
 			result: undefined as AgentToolResult<any> | undefined,
@@ -2503,8 +2501,12 @@ async function executeToolCalls(
 		// work still queued behind the aborted wait too — otherwise a batched
 		// `todo`/`write` gets dropped as "Skipped due to pending peer interrupt"
 		// purely for being ordered after the wait (#7493). User/system steering
-		// still preempts everything queued.
-		if (interruptState.triggered && (record.interruptible || interruptState.source !== "irc")) {
+		// still preempts queued work unless the call protects a committed outcome.
+		if (
+			interruptState.triggered &&
+			!record.deferSteering &&
+			(record.interruptible || interruptState.source !== "irc")
+		) {
 			// Skip both span emission and the collector orphan record here. The
 			// tail sweep below (after `Promise.allSettled`) is the single path
 			// that handles "no result message was produced" — it calls

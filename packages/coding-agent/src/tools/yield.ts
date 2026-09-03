@@ -268,6 +268,11 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	strict = true;
 	readonly intent = "omit" as const;
 	lenientArgValidation = true;
+	/** Protects terminal submissions; incremental section yields remain steerable. */
+	readonly deferSteering = (args: unknown): boolean => {
+		if (!isPlainRecord(args)) return true;
+		return !Array.isArray(args.type);
+	};
 
 	readonly #validate?: (value: unknown) => JsonSchemaValidationResult;
 	readonly #validateSection?: ReadonlyMap<string, (value: unknown) => JsonSchemaValidationResult>;
