@@ -192,6 +192,8 @@ fn render_fixture(
 		diag: child(&snapshot, tool, KnownTag::Diag),
 		usage: child(&snapshot, tool, KnownTag::Usage),
 		status,
+		output: None,
+		started: None,
 	};
 	let mut ui_context = UiContext::default();
 	ui_context.charset = Charset::NerdFont;
