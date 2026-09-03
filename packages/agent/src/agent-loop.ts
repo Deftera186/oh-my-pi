@@ -2407,15 +2407,18 @@ async function executeToolCalls(
 	});
 
 	const checkIrcInterrupts = async (): Promise<void> => {
-		// IRC only fires once: a peer interrupt already recorded on interruptState
-		// must not re-abort, and (unlike steering) never re-consumes a queue.
-		if (!shouldInterruptImmediately || signal?.aborted || interruptState.triggered) return;
-		if (hasIrcInterrupts && (await hasIrcInterrupts())) {
+		// IRC has its own abort channel: steering may have fired first while a
+		// deferred interruptible call is still running. The controller, not the
+		// shared first-interrupt state, is the idempotence guard.
+		if (!shouldInterruptImmediately || signal?.aborted || ircAbortController.signal.aborted) return;
+		if (hasIrcInterrupts && (await hasIrcInterrupts()) && !ircAbortController.signal.aborted) {
 			// Peer IRC hard-aborts interruptible waits only; foreground tools keep
 			// running (no partial side effects) but get the cooperative soft
 			// signal so backgroundable work can step aside for the peer message.
-			interruptState.triggered = true;
-			interruptState.source = "irc";
+			if (!interruptState.triggered) {
+				interruptState.triggered = true;
+				interruptState.source = "irc";
+			}
 			ircAbortController.abort();
 			steeringSoftController.abort();
 		}
@@ -2456,6 +2459,9 @@ async function executeToolCalls(
 				steeringAbortController.abort();
 				steeringSoftController.abort();
 			}
+			// IRC uses an independent queue and must remain observable after
+			// steering so deferred interruptible calls retain peer cancellation.
+			await checkIrcInterrupts();
 			return;
 		}
 		await checkIrcInterrupts();
@@ -2735,7 +2741,7 @@ async function executeToolCalls(
 	// detection hard-aborts interruptible waits, soft-signals cooperative tools
 	// (auto-background bash), and skips not-yet-started tools, so the boundary
 	// dequeue below injects the message promptly. Gated on immediate-interrupt
-	// mode; checkSteering is idempotent (no-op once triggered).
+	// mode; per-channel abort controllers make repeated checks idempotent.
 	const watchSteeringWhileRunning =
 		shouldInterruptImmediately && (hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined);
 	const eventDrivenSteeringWatch =
