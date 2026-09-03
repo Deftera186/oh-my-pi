@@ -795,8 +795,10 @@ export interface AgentTool<
 	 */
 	interruptible?: boolean | ((args: Partial<Static<TParameters>>) => boolean);
 	/**
-	 * Whether a queued steering message must wait for this not-yet-started call
-	 * to execute. A function resolves this per call from the prepared arguments.
+	 * Whether a queued steering message must wait for this call to execute. A
+	 * function resolves this per call from the prepared arguments. When both
+	 * policies are enabled, this overrides {@link interruptible} for steering;
+	 * external and peer-IRC aborts still apply.
 	 *
 	 * Reserve this for calls whose emitted result is a committed protocol
 	 * outcome; ordinary queued work remains skippable so immediate steering stays

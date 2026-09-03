@@ -2351,11 +2351,16 @@ async function executeToolCalls(
 	// anything; ignoring it is always safe.
 	const steeringSoftController = new AbortController();
 	// Interruptible tools (pure waits: hub wait, vibe) observe steering +
-	// external + IRC aborts. Every other tool sees ONLY the external signal:
-	// neither queued steering nor a peer IRC ever hard-kills a partially
-	// side-effecting foreground tool (e.g. `bash`) — those get the cooperative
-	// `steeringSignal` above, and the message injects at the next boundary.
+	// external + IRC aborts. Calls that defer steering omit only the steering
+	// abort, retaining external and peer-IRC cancellation. Every other tool sees
+	// ONLY the external signal: neither queued steering nor a peer IRC ever
+	// hard-kills a partially side-effecting foreground tool (e.g. `bash`) —
+	// those get the cooperative `steeringSignal` above, and the message injects
+	// at the next boundary.
 	const nonInterruptibleSignal: AbortSignal = signal ?? new AbortController().signal;
+	const deferredSteeringSignal: AbortSignal = signal
+		? AbortSignal.any([signal, ircAbortController.signal])
+		: ircAbortController.signal;
 	const interruptibleSignal: AbortSignal = signal
 		? AbortSignal.any([signal, steeringAbortController.signal, ircAbortController.signal])
 		: AbortSignal.any([steeringAbortController.signal, ircAbortController.signal]);
@@ -2376,13 +2381,18 @@ async function executeToolCalls(
 		const { tool, args } = prepared;
 		const interruptible = resolveToolCallFlag(tool?.interruptible, args);
 		const deferSteering = resolveToolCallFlag(tool?.deferSteering, args);
+		const toolSignal = interruptible
+			? deferSteering
+				? deferredSteeringSignal
+				: interruptibleSignal
+			: nonInterruptibleSignal;
 		return {
 			toolCall,
 			tool,
 			args,
 			interruptible,
 			deferSteering,
-			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
+			signal: toolSignal,
 			started: false,
 			result: undefined as AgentToolResult<any> | undefined,
 			isError: false,
@@ -2502,9 +2512,10 @@ async function executeToolCalls(
 		// `todo`/`write` gets dropped as "Skipped due to pending peer interrupt"
 		// purely for being ordered after the wait (#7493). User/system steering
 		// still preempts queued work unless the call protects a committed outcome.
+		const defersCurrentInterrupt = record.deferSteering && interruptState.source !== "irc";
 		if (
 			interruptState.triggered &&
-			!record.deferSteering &&
+			!defersCurrentInterrupt &&
 			(record.interruptible || interruptState.source !== "irc")
 		) {
 			// Skip both span emission and the collector orphan record here. The
