@@ -3,7 +3,7 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { TodoPhase, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 
 function createTool(name: string, execute: AgentTool["execute"]): AgentTool {
@@ -76,6 +76,53 @@ describe("callSessionTool", () => {
 			undefined,
 			context,
 		);
+	});
+
+	it("persists only successful mutating todo calls executed through the eval bridge", async () => {
+		let phases: TodoPhase[] = [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "first", status: "in_progress" },
+					{ content: "second", status: "pending" },
+				],
+			},
+		];
+		const execute = vi
+			.fn()
+			.mockImplementationOnce(async () => {
+				phases = [
+					{
+						name: "Work",
+						tasks: [
+							{ content: "first", status: "completed" },
+							{ content: "second", status: "in_progress" },
+						],
+					},
+				];
+				return { content: [{ type: "text", text: "updated" }], details: { op: "done", phases } };
+			})
+			.mockResolvedValueOnce({ content: [{ type: "text", text: "current" }], details: { op: "view", phases } })
+			.mockResolvedValueOnce({
+				content: [{ type: "text", text: "missing task" }],
+				details: { op: "done", phases },
+				isError: true,
+			});
+		const persistTodoPhases = vi.fn((_phases: TodoPhase[]) => {});
+		const session: ToolSession = {
+			...createSession([createTool("todo", execute)]),
+			persistTodoPhases,
+		};
+
+		await callSessionTool("todo", { op: "done", task: "first" }, { session });
+
+		expect(phases[0]?.tasks.map(task => task.status)).toEqual(["completed", "in_progress"]);
+		expect(persistTodoPhases).toHaveBeenCalledWith(phases);
+
+		persistTodoPhases.mockClear();
+		await callSessionTool("todo", { op: "view" }, { session });
+		await callSessionTool("todo", { op: "done", task: "missing" }, { session });
+		expect(persistTodoPhases).not.toHaveBeenCalled();
 	});
 
 	it("returns structured tool results when details or images are present", async () => {

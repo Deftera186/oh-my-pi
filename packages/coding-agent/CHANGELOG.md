@@ -14,6 +14,7 @@
 ### Fixed
 
 - Fixed protocol handler incorrectly escaping raw text content from agent responses
+- Fixed `todo` updates made through eval leaving the TUI list and reload state stale ([#10647](https://github.com/can1357/oh-my-pi/issues/10647)).
 - Fixed `<task-result>` previews of structured subagent yields collapsing to a lone `{` when the JSON's second line exceeded the preview budget
 - Fixed `/usage` freezing the TUI for several seconds while it loaded the activity heatmap on a large stats database; the dashboard now opens immediately and the heatmap plus session sync load from a background subprocess.
 - Fixed the status line missing from the first frame at startup and appearing only after the session loaded; the last run's status row is cached per project and painted immediately, then replaced in place by the live one.

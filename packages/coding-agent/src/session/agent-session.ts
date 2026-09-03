@@ -1163,6 +1163,7 @@ export class AgentSession {
 			model: () => this.model,
 			agentKind: () => this.#agentKind,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
+			emitTodoUpdated: phases => this.#emit({ type: "todo_updated", phases }),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
 			promptGeneration: () => this.#promptGeneration,
 			hasPendingAsyncWake: () => this.#hasPendingAsyncWake(),

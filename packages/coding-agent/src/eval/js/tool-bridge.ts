@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
 import { ToolError } from "../../tools/tool-errors";
+import { isTodoPhase } from "../../tools/todo";
 import { EVAL_AGENT_BRIDGE_NAME, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { EVAL_COMPLETION_BRIDGE_NAME, runEvalCompletion } from "../completion-bridge";
@@ -34,6 +35,32 @@ function toolResultHasError(result: AgentToolResult): boolean {
 		return false;
 	}
 	return (result.details as { isError?: unknown }).isError === true;
+}
+
+function isTodoMutationOperation(value: unknown): boolean {
+	switch (value) {
+		case "init":
+		case "start":
+		case "done":
+		case "rm":
+		case "drop":
+		case "block":
+		case "unblock":
+		case "append":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function persistTodoMutation(name: string, result: AgentToolResult, hasError: boolean, session: ToolSession): void {
+	if (name !== "todo" || hasError) return;
+	const details = result.details;
+	if (!details || typeof details !== "object" || !("op" in details) || !("phases" in details)) return;
+	if (!isTodoMutationOperation(details.op) || !Array.isArray(details.phases) || !details.phases.every(isTodoPhase)) {
+		return;
+	}
+	session.persistTodoPhases?.(details.phases);
 }
 
 function getTool(session: ToolSession, name: string): AgentTool {
@@ -146,6 +173,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		);
 		const text = textBlocks.map(block => block.text).join("");
 		const hasError = toolResultHasError(result);
+		persistTodoMutation(name, result, hasError, options.session);
 		options.emitStatus?.(summarizeToolResult(name, normalizedArgs, result, text, hasError));
 		if (result.details === undefined && imageBlocks.length === 0 && !hasError) {
 			return text;

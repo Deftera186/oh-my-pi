@@ -266,6 +266,7 @@ export class EventController {
 			retry_fallback_succeeded: e => this.#handleRetryFallbackSucceeded(e),
 			ttsr_triggered: e => this.#handleTtsrTriggered(e),
 			todo_reminder: e => this.#handleTodoReminder(e),
+			todo_updated: e => this.#handleTodoUpdated(e),
 			todo_auto_clear: e => this.#handleTodoAutoClear(e),
 			irc_message: e => this.#handleIrcMessage(e),
 			notice: e => this.#handleNotice(e),
@@ -2225,6 +2226,17 @@ export class EventController {
 		component.setExpanded(this.ctx.toolOutputExpanded);
 		this.ctx.present(component);
 		this.#lastTtsrNotification = component;
+	}
+
+	async #handleTodoUpdated(event: Extract<AgentSessionEvent, { type: "todo_updated" }>): Promise<void> {
+		// Eval-bridged mutations have no standalone todo tool card. Refresh the
+		// current same-turn snapshot in place so the eval remains the transcript
+		// action and the todo board does not stack a synthetic result beside it.
+		const component = this.#displaceableTodoComponent;
+		if (component?.isDisplaceableBlock()) {
+			component.updateResult({ content: [], details: { phases: event.phases } }, false);
+		}
+		this.ctx.setTodos(event.phases);
 	}
 
 	async #handleTodoReminder(event: Extract<AgentSessionEvent, { type: "todo_reminder" }>): Promise<void> {
