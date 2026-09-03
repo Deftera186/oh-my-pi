@@ -42,8 +42,10 @@ partitioned `EnvClient`. An embedded full host is used only as a loud spawn
 fallback or by explicitly isolated compositions.
 
 The document socket is build-stable while environment sockets are build-keyed.
-`DocumentHost` reconnects after a server restart, and a surviving non-owner
+`DocumentHost` reconnects after a server restart, and a surviving current-build
 environment may rehost the document authority without invalidating its clones.
+A stale-build daemon drains without rehosting and releases authority as soon as
+its last client disconnects.
 
 The crate is deliberately below the headless driver and application layers.
 Capabilities that require regime state, inference composition,

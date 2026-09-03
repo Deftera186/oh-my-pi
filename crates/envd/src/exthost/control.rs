@@ -15,34 +15,6 @@ pub const MAX_RAW_TERMINAL_FRAME_BYTES: usize = 4096;
 /// Maximum payload admitted through the trusted direct-filesystem escape.
 pub const MAX_DIRECT_FILESYSTEM_BYTES: usize = 1024 * 1024;
 
-/// Manifest capability permitting cross-extension regime projection.
-pub const REGIMES_READ_CAPABILITY: &str = "regimes.read";
-
-/// Cross-extension regime projection authorization failure.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum RegimeAccessError {
-	/// The caller requested another extension without `regimes.read`.
-	#[error("cross-extension regime reads require regimes.read")]
-	ReadCapability,
-}
-
-/// Authorizes own-extension reads and capability-gated cross-extension reads.
-pub fn authorize_regime_read(
-	caller: &str,
-	target: &str,
-	capabilities: &BTreeSet<Str>,
-) -> Result<(), RegimeAccessError> {
-	if caller == target
-		|| capabilities
-			.iter()
-			.any(|capability| capability.as_str() == REGIMES_READ_CAPABILITY)
-	{
-		Ok(())
-	} else {
-		Err(RegimeAccessError::ReadCapability)
-	}
-}
-
 /// Focus-owned raw-input admission failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RawInputError {
@@ -253,12 +225,6 @@ pub fn admit_direct_filesystem(
 use std::{env, io, iter, mem};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use omp_agent::{
-	JournalAuthor, JournalCustomEntry, JournalOperation, JournalQuery, JournalRequest,
-	JournalRequestStamp, PendingCustomEntry,
-	control::{ControlError as AgentControlError, ControlSender},
-};
 use omp_core::{
 	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex,
 };
@@ -273,23 +239,17 @@ use omp_proto::{
 	toolhost::{
 		v1,
 		v1::{
-			AdoptArtifact, AppendEntriesAtomic, AppendEntry, ArtifactRow, DeclareEntryKinds,
-			DeclareSecretRules, EntryAppended, JournalHostEnvelope, JournalRow, JournalWorkerEnvelope,
-			ListArtifacts, ListSessions, PinArtifact, PullReply, PullRequest, QueryJournal,
-			QueryUsage, SecretRuleDeclaration, SessionRow, SessionTransitionDenied,
-			SessionTransitionRefusalCode, StatArtifact, StateCas, StateGet, StateScope, StateWatch,
+			ArtifactRow, DeclareSecretRules, JournalHostEnvelope, JournalWorkerEnvelope,
+			ListArtifacts, ListSessions, PullReply, PullRequest, QueryUsage, SecretRuleDeclaration,
+			SessionRow, SessionTransitionDenied, SessionTransitionRefusalCode, StatArtifact,
 			UsageReport, journal_host_envelope, journal_worker_envelope,
 		},
 	},
 };
 use omp_secrets::rule::{SecretKind, SecretMode, SecretRule, SecretRuleError};
-use omp_storage::{
-	blob::BlobRef,
-	transcript::msg::{Content, UserBlock},
-};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json, value::RawValue};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -867,16 +827,8 @@ fn validate_pull_bounds(pull: &PullRequest) -> Result<(), ControlError> {
 	Ok(())
 }
 
-fn validate_state_scope(scope: i32) -> Result<StateScope, JournalControlError> {
-	let scope = StateScope::try_from(scope).map_err(|_| JournalControlError::InvalidStateScope)?;
-	if scope == StateScope::Unspecified {
-		Err(JournalControlError::InvalidStateScope)
-	} else {
-		Ok(scope)
-	}
-}
-
-/// Core-authenticated identity attached to a journal CONTROL connection.
+/// Core-authenticated identity attached to a read-only journal CONTROL
+/// connection.
 ///
 /// Neither principal nor provenance is decoded from worker frames.
 #[derive(Clone, Debug)]
@@ -891,19 +843,9 @@ pub struct JournalConnectionIdentity {
 	pub session_generation: u64,
 }
 
-/// A journal/session/artifact request that must be served by its authoritative
-/// read or artifact backend after host authentication.
+/// A read-only session or artifact request served by its authoritative backend.
 #[derive(Debug)]
 pub enum ExternalJournalRequest {
-	/// Scoped journal scan.
-	Query {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Authenticated extension namespace.
-		extension:  Str,
-		/// Worker query payload.
-		query:      QueryJournal,
-	},
 	/// Authoritative sessions-index page.
 	ListSessions {
 		/// Envelope correlation.
@@ -917,18 +859,6 @@ pub enum ExternalJournalRequest {
 		request_id: u64,
 		/// Worker query payload.
 		query:      QueryUsage,
-	},
-	/// Artifact adoption. The backend must stat `source_url` authoritatively
-	/// before persisting identity and must not infer or trust a peer size.
-	AdoptArtifact {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Authenticated durable request stamp.
-		stamp:      JournalRequestStamp,
-		/// Core-authenticated author; never decoded from the worker frame.
-		author:     JournalAuthor,
-		/// Worker request without any authorship fields.
-		request:    AdoptArtifact,
 	},
 	/// Authoritative artifact metadata lookup.
 	StatArtifact {
@@ -944,61 +874,14 @@ pub enum ExternalJournalRequest {
 		/// Worker query payload.
 		request:    ListArtifacts,
 	},
-	/// Durable artifact pin or lifetime change.
-	PinArtifact {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Authenticated durable request stamp.
-		stamp:      JournalRequestStamp,
-		/// Core-authenticated author; never decoded from the worker frame.
-		author:     JournalAuthor,
-		/// Worker request without any authorship fields.
-		request:    PinArtifact,
-	},
-	/// Scoped state value lookup delegated to the authoritative state backend.
-	StateGet {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Authenticated extension namespace owner.
-		extension:  Str,
-		/// Worker request without principal fields.
-		request:    StateGet,
-	},
-	/// Durable scoped state compare-and-swap.
-	StateCas {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Authenticated durable request stamp.
-		stamp:      JournalRequestStamp,
-		/// Core-authenticated author.
-		author:     JournalAuthor,
-		/// Worker request without principal fields.
-		request:    StateCas,
-	},
-	/// Fused scoped state watch stream.
-	StateWatch {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Authenticated extension namespace owner.
-		extension:  Str,
-		/// Worker request without principal fields.
-		request:    StateWatch,
-	},
 }
 
-/// Result of dispatching one journal-domain worker envelope.
+/// Result of dispatching one read-only journal-domain worker envelope.
 #[derive(Debug)]
 pub enum JournalDispatch {
-	/// Immediate host reply from the Agent Journal owner.
+	/// Immediate host reply.
 	Reply(JournalHostEnvelope),
-	/// Current-session rows returned by the serialized Agent Journal owner.
-	Rows {
-		/// Envelope correlation.
-		request_id: u64,
-		/// Ordered authenticated raw rows.
-		rows:       Vec<JournalCustomEntry>,
-	},
-	/// Authenticated request for the authoritative read/artifact backend.
+	/// Authenticated request for the authoritative read backend.
 	External(ExternalJournalRequest),
 }
 
@@ -1011,143 +894,38 @@ pub enum JournalControlError {
 	/// Journal envelope omitted its body.
 	#[error("journal CONTROL envelope has no body")]
 	MissingBody,
-	/// A durable request omitted its idempotency key.
-	#[error("durable journal CONTROL request has no idempotency key")]
-	MissingIdempotencyKey,
-	/// A durable request was fenced by a stale host or session generation.
-	#[error("durable journal CONTROL request carries stale generations")]
-	StaleGeneration,
-	/// JSON data was invalid before it reached the journal staging point.
-	#[error("journal entry data_json is not one complete JSON value")]
-	InvalidJson,
-	/// A context part cannot be represented in extension journal context.
-	#[error("journal context contains an unsupported or malformed part")]
-	InvalidContext,
-	/// An entry-kind declaration carried an invalid revision.
-	#[error("entry-kind declaration revision is invalid")]
-	InvalidRevision,
-	/// A state request omitted its mandatory scope.
-	#[error("state CONTROL request has unspecified scope")]
-	InvalidStateScope,
-	/// The serialized Agent Journal owner rejected the request.
-	#[error(transparent)]
-	Agent(#[from] AgentControlError),
+	/// Extensions may not declare journal kinds, append custom entries, or own
+	/// an independent state log.
+	#[error("extension journal mutation is unsupported; register a DOM Component")]
+	UnsupportedMutation,
 }
 
-const _: () = assert!(
-	std::mem::size_of::<JournalControlError>() <= 128,
-	"JournalControlError must stay compact"
-);
-
-/// Authenticated journal-domain CONTROL dispatcher for one extension.
+/// Read-only journal-domain CONTROL dispatcher.
 ///
-/// Durable frames are generation-fenced and fully decoded before the one
-/// mailbox message is sent, so an atomic group cannot be partially staged.
-pub struct JournalControl {
-	sender:             ControlSender,
-	extension:          Str,
-	granted_extensions: Vec<Str>,
-	identity:           JournalConnectionIdentity,
-}
+/// Extension state is reduced into `<meta>` by registered Components. There is
+/// deliberately no declaration, append, or scoped-state mutation path here.
+#[derive(Default)]
+pub struct JournalControl;
 
 impl JournalControl {
-	/// Binds a journal dispatcher to core-authenticated connection identity.
-	pub const fn new(
-		sender: ControlSender,
-		extension: Str,
-		granted_extensions: Vec<Str>,
-		identity: JournalConnectionIdentity,
-	) -> Self {
-		Self { sender, extension, granted_extensions, identity }
+	/// Creates a read-only dispatcher.
+	#[must_use]
+	pub const fn new() -> Self {
+		Self
 	}
 
 	/// Dispatches one worker journal envelope.
-	///
-	/// Query rows are returned as [`ExternalJournalRequest`] so the app can
-	/// stream each authoritative backend row into `JournalHostEnvelope` and set
-	/// that row's `terminal` bit; no intermediate collection is required.
-	///
-	/// # Errors
-	/// Rejects missing correlation, stale generations, malformed declarations,
-	/// JSON, or context before any journal bytes are staged.
-	pub async fn dispatch(
+	pub fn dispatch(
 		&self,
 		request_id: u64,
 		envelope: JournalWorkerEnvelope,
-		ts: u64,
+		_ts: u64,
 	) -> Result<JournalDispatch, JournalControlError> {
 		if request_id == 0 {
 			return Err(JournalControlError::ZeroRequestId);
 		}
 		let body = envelope.body.ok_or(JournalControlError::MissingBody)?;
 		match body {
-			journal_worker_envelope::Body::DeclareEntryKinds(declare) => {
-				self.declare(declare).await?;
-				Ok(JournalDispatch::Reply(appended_reply(Vec::new())))
-			},
-			journal_worker_envelope::Body::AppendEntry(entry) => {
-				let stamp = self.entry_stamp(request_id, &entry)?;
-				let operation = JournalOperation::Append(pending_entry(entry)?);
-				let reply = self
-					.sender
-					.journal(JournalRequest { ts, stamp, author: self.author(), operation })
-					.await?;
-				Ok(JournalDispatch::Reply(appended_reply(reply.indexes)))
-			},
-			journal_worker_envelope::Body::AppendEntriesAtomic(group) => {
-				let (stamp, entries) = self.atomic(request_id, group)?;
-				let reply = self
-					.sender
-					.journal(JournalRequest {
-						ts,
-						stamp,
-						author: self.author(),
-						operation: JournalOperation::AppendAtomic(entries),
-					})
-					.await?;
-				Ok(JournalDispatch::Reply(appended_reply(reply.indexes)))
-			},
-			journal_worker_envelope::Body::QueryJournal(query) => {
-				if !query.session.is_empty() {
-					return Ok(JournalDispatch::External(ExternalJournalRequest::Query {
-						request_id,
-						extension: self.extension.clone(),
-						query,
-					}));
-				}
-				let kinds = if query.kinds.is_empty() {
-					vec![None]
-				} else {
-					query
-						.kinds
-						.iter()
-						.map(|kind| Some(Str::from(kind.as_str())))
-						.collect()
-				};
-				let limit = query.limit.map(|limit| limit as usize);
-				let queries = kinds
-					.into_iter()
-					.map(|kind| JournalQuery {
-						caller_extension: self.extension.clone(),
-						granted_extensions: self.granted_extensions.clone(),
-						kind,
-						rev: None,
-						since: query.since_index,
-						limit: query.until_index.map_or(limit, |_| None),
-						live: query.live_only,
-					})
-					.collect();
-				let mut rows = self.sender.query(queries).await?;
-				if let Some(until) = query.until_index {
-					rows.retain(|row| row.index <= until);
-					if let Some(limit) = limit
-						&& rows.len() > limit
-					{
-						rows.drain(..rows.len() - limit);
-					}
-				}
-				Ok(JournalDispatch::Rows { request_id, rows })
-			},
 			journal_worker_envelope::Body::ListSessions(query) => {
 				Ok(JournalDispatch::External(ExternalJournalRequest::ListSessions {
 					request_id,
@@ -1156,20 +934,6 @@ impl JournalControl {
 			},
 			journal_worker_envelope::Body::QueryUsage(query) => {
 				Ok(JournalDispatch::External(ExternalJournalRequest::QueryUsage { request_id, query }))
-			},
-			journal_worker_envelope::Body::AdoptArtifact(request) => {
-				let stamp = self.durable_stamp(
-					request_id,
-					request.idempotency_key.as_str(),
-					request.host_generation,
-					request.session_generation,
-				)?;
-				Ok(JournalDispatch::External(ExternalJournalRequest::AdoptArtifact {
-					request_id,
-					stamp,
-					author: self.author(),
-					request,
-				}))
 			},
 			journal_worker_envelope::Body::StatArtifact(request) => {
 				Ok(JournalDispatch::External(ExternalJournalRequest::StatArtifact {
@@ -1180,51 +944,6 @@ impl JournalControl {
 			journal_worker_envelope::Body::ListArtifacts(request) => {
 				Ok(JournalDispatch::External(ExternalJournalRequest::ListArtifacts {
 					request_id,
-					request,
-				}))
-			},
-			journal_worker_envelope::Body::PinArtifact(request) => {
-				let stamp = self.durable_stamp(
-					request_id,
-					request.idempotency_key.as_str(),
-					request.host_generation,
-					request.session_generation,
-				)?;
-				Ok(JournalDispatch::External(ExternalJournalRequest::PinArtifact {
-					request_id,
-					stamp,
-					author: self.author(),
-					request,
-				}))
-			},
-			journal_worker_envelope::Body::StateGet(request) => {
-				validate_state_scope(request.scope)?;
-				Ok(JournalDispatch::External(ExternalJournalRequest::StateGet {
-					request_id,
-					extension: self.extension.clone(),
-					request,
-				}))
-			},
-			journal_worker_envelope::Body::StateCas(request) => {
-				validate_state_scope(request.scope)?;
-				let stamp = self.durable_stamp(
-					request_id,
-					request.idempotency_key.as_str(),
-					request.host_generation,
-					request.session_generation,
-				)?;
-				Ok(JournalDispatch::External(ExternalJournalRequest::StateCas {
-					request_id,
-					stamp,
-					author: self.author(),
-					request,
-				}))
-			},
-			journal_worker_envelope::Body::StateWatch(request) => {
-				validate_state_scope(request.scope)?;
-				Ok(JournalDispatch::External(ExternalJournalRequest::StateWatch {
-					request_id,
-					extension: self.extension.clone(),
 					request,
 				}))
 			},
@@ -1239,100 +958,15 @@ impl JournalControl {
 					}),
 				)))
 			},
-		}
-	}
-
-	async fn declare(&self, declaration: DeclareEntryKinds) -> Result<(), JournalControlError> {
-		let declarations = declaration
-			.kinds
-			.into_iter()
-			.map(|kind| {
-				omp_agent::EntryKindDecl::parse(
-					Str::from(kind.name),
-					kind.rev.as_str(),
-					kind.display,
-					kind.has_projection,
-					None,
-				)
-				.map_err(|_| JournalControlError::InvalidRevision)
-			})
-			.collect::<Result<Vec<_>, _>>()?;
-		self
-			.sender
-			.declare_entry_kinds(self.extension.clone(), declarations)
-			.await?;
-		Ok(())
-	}
-
-	fn atomic(
-		&self,
-		request_id: u64,
-		group: AppendEntriesAtomic,
-	) -> Result<(JournalRequestStamp, Vec<PendingCustomEntry>), JournalControlError> {
-		let stamp = self.durable_stamp(
-			request_id,
-			group.idempotency_key.as_str(),
-			group.host_generation,
-			group.session_generation,
-		)?;
-		let mut entries = Vec::with_capacity(group.entries.len());
-		for entry in group.entries {
-			self.generations(entry.host_generation, entry.session_generation)?;
-			entries.push(pending_entry(entry)?);
-		}
-		Ok((stamp, entries))
-	}
-
-	fn entry_stamp(
-		&self,
-		request_id: u64,
-		entry: &AppendEntry,
-	) -> Result<JournalRequestStamp, JournalControlError> {
-		self.durable_stamp(
-			request_id,
-			entry.idempotency_key.as_str(),
-			entry.host_generation,
-			entry.session_generation,
-		)
-	}
-
-	fn durable_stamp(
-		&self,
-		request_id: u64,
-		idempotency_key: &str,
-		host_generation: u64,
-		session_generation: u64,
-	) -> Result<JournalRequestStamp, JournalControlError> {
-		if idempotency_key.is_empty() {
-			return Err(JournalControlError::MissingIdempotencyKey);
-		}
-		self.generations(host_generation, session_generation)?;
-		Ok(JournalRequestStamp {
-			request_id: Str::from(request_id.to_string()),
-			idempotency_key: Str::from(idempotency_key),
-			host_generation,
-			session_generation,
-		})
-	}
-
-	const fn generations(
-		&self,
-		host_generation: u64,
-		session_generation: u64,
-	) -> Result<(), JournalControlError> {
-		if host_generation == self.identity.host_generation
-			&& session_generation == self.identity.session_generation
-		{
-			Ok(())
-		} else {
-			Err(JournalControlError::StaleGeneration)
-		}
-	}
-
-	fn author(&self) -> JournalAuthor {
-		JournalAuthor {
-			principal:  self.identity.principal.clone(),
-			provenance: self.identity.provenance.clone(),
+			journal_worker_envelope::Body::DeclareEntryKinds(_)
+			| journal_worker_envelope::Body::AppendEntry(_)
+			| journal_worker_envelope::Body::AppendEntriesAtomic(_)
+			| journal_worker_envelope::Body::QueryJournal(_)
+			| journal_worker_envelope::Body::AdoptArtifact(_)
+			| journal_worker_envelope::Body::PinArtifact(_)
+			| journal_worker_envelope::Body::StateGet(_)
+			| journal_worker_envelope::Body::StateCas(_)
+			| journal_worker_envelope::Body::StateWatch(_) => Err(JournalControlError::UnsupportedMutation),
 		}
 	}
 }
@@ -1340,74 +974,6 @@ impl JournalControl {
 /// Wraps one streamed journal row for a correlated host reply.
 pub const fn journal_row_reply(body: journal_host_envelope::Body) -> JournalHostEnvelope {
 	JournalHostEnvelope { body: Some(body), props: None }
-}
-
-const fn appended_reply(indexes: Vec<u64>) -> JournalHostEnvelope {
-	journal_row_reply(journal_host_envelope::Body::EntryAppended(EntryAppended {
-		indexes,
-		terminal: true,
-		props: None,
-	}))
-}
-
-fn pending_entry(entry: AppendEntry) -> Result<PendingCustomEntry, JournalControlError> {
-	let data = serde_json::from_slice::<Box<RawValue>>(&entry.data_json)
-		.map_err(|_| JournalControlError::InvalidJson)?;
-	let context = (!entry.context.is_empty())
-		.then(|| {
-			entry
-				.context
-				.into_iter()
-				.map(user_block)
-				.collect::<Result<Content, _>>()
-		})
-		.transpose()?;
-	Ok(PendingCustomEntry {
-		kind: Str::from(entry.kind),
-		rev: Str::from(entry.rev),
-		data: Some(data),
-		context,
-		display: entry.display,
-	})
-}
-
-/// Encodes current-session journal rows as a fused CONTROL reply stream.
-///
-/// An empty result emits one terminal sentinel row so an empty query cannot be
-/// mistaken for a dropped stream.
-pub fn journal_rows(
-	rows: &[JournalCustomEntry],
-) -> impl DoubleEndedIterator<Item = JournalHostEnvelope> + '_ {
-	let terminal = rows.last().map(|row| row.index);
-	let sentinel = rows.is_empty().then(|| {
-		journal_row_reply(journal_host_envelope::Body::JournalRow(JournalRow {
-			terminal: true,
-			..Default::default()
-		}))
-	});
-	rows
-		.iter()
-		.map(move |row| {
-			let entry = &row.entry;
-			let context = entry
-				.context()
-				.into_iter()
-				.flatten()
-				.map(proto_part)
-				.collect();
-			journal_row_reply(journal_host_envelope::Body::JournalRow(JournalRow {
-				index: row.index,
-				kind: entry.kind().into(),
-				rev: entry.rev().unwrap_or_default().into(),
-				data_json: entry
-					.data()
-					.map_or_else(Bytes::new, |data| Bytes::copy_from_slice(data.get().as_bytes())),
-				context,
-				terminal: terminal == Some(row.index),
-				props: None,
-			}))
-		})
-		.chain(sentinel)
 }
 
 /// Marks the last sessions-index row terminal, or emits one empty terminal
@@ -1461,33 +1027,6 @@ fn fuse_rows<T: Default>(
 	})
 }
 
-fn proto_part(block: &UserBlock) -> Part {
-	use omp_proto::thread::v1;
-
-	match block {
-		UserBlock::Text { text } => Part { kind: Some(part::Kind::Text(text.to_string())) },
-		UserBlock::Image { blob } => Part {
-			kind: Some(part::Kind::Blob(v1::Blob {
-				hash: Bytes::copy_from_slice(blob.hash.as_bytes()),
-				size: blob.size,
-				..Default::default()
-			})),
-		},
-	}
-}
-
-fn user_block(part: Part) -> Result<UserBlock, JournalControlError> {
-	match part.kind {
-		Some(part::Kind::Text(text)) => Ok(UserBlock::Text { text: Str::from(text) }),
-		Some(part::Kind::Blob(blob)) => {
-			let hash = <[u8; 32]>::try_from(blob.hash.as_ref())
-				.map_err(|_| JournalControlError::InvalidContext)?;
-			Ok(UserBlock::Image { blob: BlobRef { hash: Hash32::new(hash), size: blob.size } })
-		},
-		Some(part::Kind::Thinking(_) | part::Kind::Fallback(_) | part::Kind::ServerTool(_))
-		| None => Err(JournalControlError::InvalidContext),
-	}
-}
 /// Maximum length of one JSON CONTROL frame.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1624,10 +1163,6 @@ impl ControlProtocolError {
 			.with_details(json!({"field": field, "expected": expected, "actual": actual}))
 	}
 }
-/// Maximum number of extension-authored entries seeded into one new session.
-pub const MAX_SESSION_SETUP_ENTRIES: usize = 64;
-/// Maximum aggregate canonical entry bytes admitted into one new session.
-pub const MAX_SESSION_SETUP_BYTES: usize = 1024 * 1024;
 /// Maximum visible prompt parts admitted into one new session.
 pub const MAX_SESSION_PROMPT_PARTS: usize = 32;
 /// Maximum aggregate visible prompt text admitted into one new session.
@@ -1641,8 +1176,6 @@ pub struct CanonicalSessionCreate {
 	pub title:              Option<Str>,
 	/// Optional accessible lineage parent.
 	pub parent:             Option<Str>,
-	/// Canonical declared custom entries in requested order.
-	pub entries:            Vec<PendingCustomEntry>,
 	/// Optional visible user item; it is not a turn input.
 	pub initial_prompt:     Option<Item>,
 	/// Stable logical identity shared by retries inside one command invocation.
@@ -1694,60 +1227,15 @@ pub fn canonical_session_create(
 	}
 	let title = bounded_setup_string(setup, "title", 512)?;
 	let parent = bounded_setup_string(setup, "parent", 128)?;
-	let wire_entries = setup
+	if setup
 		.get("entries")
 		.and_then(Value::as_array)
-		.ok_or_else(|| {
-			session_transition_denied("invalid_setup", "setup.entries must be an array")
-		})?;
-	if wire_entries.len() > MAX_SESSION_SETUP_ENTRIES {
+		.is_some_and(|entries| !entries.is_empty())
+	{
 		return Err(session_transition_denied(
-			"quota_exceeded",
-			"session setup entry count exceeds the limit",
+			"invalid_setup",
+			"extension session setup entries are prohibited; register a DOM Component",
 		));
-	}
-	let mut total_bytes = 0_usize;
-	let mut entries = Vec::with_capacity(wire_entries.len());
-	for wire in wire_entries {
-		let entry = wire.as_object().ok_or_else(|| {
-			session_transition_denied("invalid_setup", "every setup entry must be an object")
-		})?;
-		if entry.get("schema").and_then(Value::as_str) != Some("omp.journal.entry.v1") {
-			return Err(session_transition_denied(
-				"invalid_setup",
-				"every setup entry must use omp.journal.entry.v1",
-			));
-		}
-		let data = entry.get("data").and_then(Value::as_str).ok_or_else(|| {
-			session_transition_denied("invalid_setup", "setup entry data must be canonical JSON")
-		})?;
-		total_bytes = total_bytes.saturating_add(data.len());
-		if total_bytes > MAX_SESSION_SETUP_BYTES {
-			return Err(session_transition_denied(
-				"quota_exceeded",
-				"session setup entry bytes exceed the limit",
-			));
-		}
-		let parsed: Value = serde_json::from_str(data)
-			.map_err(|_| session_transition_denied("invalid_setup", "setup entry data is not JSON"))?;
-		if serde_json::to_string(&parsed).ok().as_deref() != Some(data) {
-			return Err(session_transition_denied(
-				"invalid_setup",
-				"setup entry data is not canonical JSON",
-			));
-		}
-		let data = serde_json::from_str::<Box<RawValue>>(data).map_err(|_| {
-			session_transition_denied("invalid_setup", "setup entry data is not canonical JSON")
-		})?;
-		let kind = required_setup_string(entry, "kind")?;
-		let rev = required_setup_string(entry, "rev")?;
-		entries.push(PendingCustomEntry {
-			kind,
-			rev,
-			data: Some(data),
-			context: None,
-			display: entry.get("display").and_then(Value::as_bool),
-		});
 	}
 	let initial_prompt = setup
 		.get("initial_prompt")
@@ -1768,7 +1256,6 @@ pub fn canonical_session_create(
 	Ok(CanonicalSessionCreate {
 		title,
 		parent,
-		entries,
 		initial_prompt,
 		idempotency_key,
 		host_generation: context.connection.host_generation,
@@ -1794,20 +1281,6 @@ fn bounded_setup_string(
 			format!("setup.{field} must be a string or null"),
 		)),
 	}
-}
-
-fn required_setup_string(
-	object: &serde_json::Map<String, Value>,
-	field: &'static str,
-) -> Result<Str, ControlProtocolError> {
-	object
-		.get(field)
-		.and_then(Value::as_str)
-		.filter(|value| !value.is_empty())
-		.map(Str::new)
-		.ok_or_else(|| {
-			session_transition_denied("invalid_setup", format!("setup entry {field} is required"))
-		})
 }
 
 fn canonical_session_prompt(value: &Value) -> Result<Item, ControlProtocolError> {
@@ -2031,27 +1504,21 @@ impl RegistryControlAuthorities {
 	}
 }
 
-/// Context, journal, state, session, artifact, and credential authorities.
+/// Session, artifact, and credential authorities.
 pub struct PersistenceControlAuthorities {
-	context:     Arc<dyn ControlAuthorityFactory>,
-	journal:     Arc<dyn ControlAuthorityFactory>,
-	state:       Arc<dyn ControlAuthorityFactory>,
 	sessions:    Arc<dyn ControlAuthorityFactory>,
 	artifacts:   Arc<dyn ControlAuthorityFactory>,
 	credentials: Arc<dyn ControlAuthorityFactory>,
 }
 
 impl PersistenceControlAuthorities {
-	/// Installs every durable and session-local persistence owner.
+	/// Installs the remaining persistence owners.
 	pub fn new(
-		context: Arc<dyn ControlAuthorityFactory>,
-		journal: Arc<dyn ControlAuthorityFactory>,
-		state: Arc<dyn ControlAuthorityFactory>,
 		sessions: Arc<dyn ControlAuthorityFactory>,
 		artifacts: Arc<dyn ControlAuthorityFactory>,
 		credentials: Arc<dyn ControlAuthorityFactory>,
 	) -> Self {
-		Self { context, journal, state, sessions, artifacts, credentials }
+		Self { sessions, artifacts, credentials }
 	}
 }
 
@@ -2089,21 +1556,19 @@ impl PresentationControlAuthorities {
 	}
 }
 
-/// Provider, regime, and extension-service authorities.
+/// Provider and extension-service authorities.
 pub struct ProviderControlAuthorities {
 	provider: Arc<dyn ControlAuthorityFactory>,
-	regimes:  Arc<dyn ControlAuthorityFactory>,
 	services: Arc<dyn ControlAuthorityFactory>,
 }
 
 impl ProviderControlAuthorities {
-	/// Installs provider handoff, regime, and service-broker owners.
+	/// Installs provider handoff and service-broker owners.
 	pub fn new(
 		provider: Arc<dyn ControlAuthorityFactory>,
-		regimes: Arc<dyn ControlAuthorityFactory>,
 		services: Arc<dyn ControlAuthorityFactory>,
 	) -> Self {
-		Self { provider, regimes, services }
+		Self { provider, services }
 	}
 }
 
@@ -2180,9 +1645,6 @@ impl HostControlAuthorityFactory {
 			(ControlDomain::Registry, "registry", &self.envd.registry.registry),
 			(ControlDomain::Devices, "devices", &self.envd.registry.devices),
 			(ControlDomain::Hooks, "hooks", &self.envd.registry.hooks),
-			(ControlDomain::Context, "context", &self.envd.persistence.context),
-			(ControlDomain::Journal, "journal", &self.envd.persistence.journal),
-			(ControlDomain::State, "state", &self.envd.persistence.state),
 			(ControlDomain::Sessions, "sessions", &self.envd.persistence.sessions),
 			(ControlDomain::Artifacts, "artifacts", &self.envd.persistence.artifacts),
 			(ControlDomain::Credentials, "credentials", &self.envd.persistence.credentials),
@@ -2192,7 +1654,6 @@ impl HostControlAuthorityFactory {
 			(ControlDomain::Telemetry, "telemetry", &self.envd.presentation.telemetry),
 			(ControlDomain::Jobs, "jobs", &self.envd.presentation.jobs),
 			(ControlDomain::Provider, "provider", &self.envd.provider.provider),
-			(ControlDomain::Regimes, "regimes", &self.envd.provider.regimes),
 			(ControlDomain::Services, "services", &self.envd.provider.services),
 			(ControlDomain::Auxiliary, "auxiliary", &self.envd.auxiliary),
 			(ControlDomain::Agents, "agents", &agents),
@@ -2286,9 +1747,6 @@ enum ControlDomain {
 	Registry,
 	Devices,
 	Hooks,
-	Context,
-	Journal,
-	State,
 	Sessions,
 	Artifacts,
 	Credentials,
@@ -2298,7 +1756,6 @@ enum ControlDomain {
 	Telemetry,
 	Jobs,
 	Provider,
-	Regimes,
 	Services,
 	Auxiliary,
 	Agents,
@@ -2311,9 +1768,6 @@ impl ControlDomain {
 			Self::Registry => operation.starts_with("omp.registry."),
 			Self::Devices => operation.starts_with("omp.devices."),
 			Self::Hooks => operation.starts_with("omp.hooks."),
-			Self::Context => operation.starts_with("omp.context."),
-			Self::Journal => operation.starts_with("omp.journal."),
-			Self::State => operation.starts_with("omp.state.") || operation == "omp.state_dir",
 			Self::Sessions => operation.starts_with("omp.sessions."),
 			Self::Artifacts => operation.starts_with("omp.artifacts."),
 			Self::Credentials => {
@@ -2327,11 +1781,11 @@ impl ControlDomain {
 			Self::Provider => {
 				operation.starts_with("omp.provider.") || operation.starts_with("omp.intents.")
 			},
-			Self::Regimes => operation.starts_with("omp.regimes."),
 			Self::Services => operation.starts_with("omp.services."),
 			Self::Auxiliary => {
 				operation.starts_with("omp.params.")
 					|| operation.starts_with("omp.urls.")
+					|| operation == "omp.state_dir"
 					|| operation == "omp.direct_filesystem.request"
 					|| operation.starts_with("omp.workers.")
 					|| operation.starts_with("omp.direct_filesystem.")
@@ -3275,20 +2729,4 @@ async fn write_json_control_frame(
 	writer.write_all(&payload).await?;
 	writer.flush().await?;
 	Ok(())
-}
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn regime_reads_are_own_extension_or_capability_gated() {
-		let mut capabilities = BTreeSet::new();
-		assert_eq!(authorize_regime_read("dev.a", "dev.a", &capabilities), Ok(()));
-		assert_eq!(
-			authorize_regime_read("dev.a", "dev.b", &capabilities),
-			Err(RegimeAccessError::ReadCapability)
-		);
-		capabilities.insert(Str::new_static(REGIMES_READ_CAPABILITY));
-		assert_eq!(authorize_regime_read("dev.a", "dev.b", &capabilities), Ok(()));
-	}
 }

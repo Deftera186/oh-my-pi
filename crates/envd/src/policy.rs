@@ -3,6 +3,7 @@
 use std::{
 	collections::HashMap,
 	path::{Path, PathBuf},
+	str::FromStr,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -11,6 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use omp_agent::{
+	ApprovalDecision, ApprovalRoute, ApprovalScope, ApprovalSource, ApprovalSpec, ApprovalTicket,
+	TicketState,
+};
 use omp_core::{InvocationPhase, LifecyclePhase, Str};
 use omp_proto::policy::v1;
 use parking_lot::Mutex;
@@ -665,7 +670,7 @@ pub trait SandboxPolicyRuntime: Send + Sync + 'static {
 		patch: SandboxProfile,
 		scope: PolicyScope,
 		reason: Str,
-		approval: Option<omp_agent::ApprovalSpec>,
+		approval: Option<ApprovalSpec>,
 	) -> Result<(), PolicyControlFailure>;
 }
 
@@ -673,10 +678,7 @@ pub trait SandboxPolicyRuntime: Send + Sync + 'static {
 #[async_trait]
 pub trait PolicyAuditSink: Send + Sync + 'static {
 	/// Persists the exact terminal approval record.
-	async fn approval_decided(
-		&self,
-		ticket: &omp_agent::ApprovalTicket,
-	) -> Result<(), PolicyControlFailure>;
+	async fn approval_decided(&self, ticket: &ApprovalTicket) -> Result<(), PolicyControlFailure>;
 }
 
 /// Authoritative policy/profile/approval CONTROL owner for one authenticated
@@ -684,7 +686,7 @@ pub trait PolicyAuditSink: Send + Sync + 'static {
 pub struct PolicyControlOwner {
 	identity:  Arc<ControlConnectionIdentity>,
 	runtime:   Arc<dyn SandboxPolicyRuntime>,
-	approvals: Arc<omp_agent::ApprovalBook>,
+	approvals: ApprovalRoute,
 	audit:     Arc<dyn PolicyAuditSink>,
 }
 
@@ -693,7 +695,7 @@ impl PolicyControlOwner {
 	pub fn new(
 		identity: Arc<ControlConnectionIdentity>,
 		runtime: Arc<dyn SandboxPolicyRuntime>,
-		approvals: Arc<omp_agent::ApprovalBook>,
+		approvals: ApprovalRoute,
 		audit: Arc<dyn PolicyAuditSink>,
 	) -> Self {
 		Self { identity, runtime, approvals, audit }
@@ -777,13 +779,13 @@ impl PolicyControlOwner {
 		let decision: Decision = serde_json::from_value(value)
 			.map_err(|error| PolicyControlFailure::Invalid(Str::from(error.to_string())))?;
 		let source = match decision.source.as_str() {
-			"user" => omp_agent::ApprovalSource::User,
-			"external" => omp_agent::ApprovalSource::External,
-			"forwarded" => omp_agent::ApprovalSource::Forwarded,
-			"config" => omp_agent::ApprovalSource::Config,
-			"extension" => omp_agent::ApprovalSource::Extension,
-			"timeout" => omp_agent::ApprovalSource::Timeout,
-			"unavailable" => omp_agent::ApprovalSource::Unavailable,
+			"user" => ApprovalSource::User,
+			"external" => ApprovalSource::External,
+			"forwarded" => ApprovalSource::Forwarded,
+			"config" => ApprovalSource::Config,
+			"extension" => ApprovalSource::Extension,
+			"timeout" => ApprovalSource::Timeout,
+			"unavailable" => ApprovalSource::Unavailable,
 			_ => {
 				return Err(PolicyControlFailure::Invalid(Str::new_static("unknown approval source")));
 			},
@@ -795,9 +797,10 @@ impl PolicyControlOwner {
 			PolicyScope::Session => Str::new_static("session"),
 			PolicyScope::Persist => Str::new_static("persist"),
 		};
-		let decision = omp_agent::ApprovalDecision {
+		let decision = ApprovalDecision {
 			approved: decision.approved,
-			scope,
+			scope: ApprovalScope::from_str(scope.as_str())
+				.expect("approval scope parsing is infallible"),
 			source,
 			decided_by: decision.decided_by,
 			reason: decision.reason,
@@ -815,7 +818,7 @@ impl PolicyControlOwner {
 			};
 		}
 		let mut durable = existing;
-		durable.state = omp_agent::TicketState::Decided;
+		durable.state = TicketState::Decided;
 		durable.decision = Some(decision.clone());
 		self.audit.approval_decided(&durable).await?;
 		self
@@ -1432,7 +1435,7 @@ fn match_paths_json(
 	})]))
 }
 
-pub(crate) fn approval_spec(value: Value) -> Result<omp_agent::ApprovalSpec, ControlProtocolError> {
+pub(crate) fn approval_spec(value: Value) -> Result<ApprovalSpec, ControlProtocolError> {
 	let object = value
 		.as_object()
 		.ok_or_else(|| ControlProtocolError::new("InvalidArguments", "approval must be an object"))?;
@@ -1461,7 +1464,7 @@ pub(crate) fn approval_spec(value: Value) -> Result<omp_agent::ApprovalSpec, Con
 		.get("timeout")
 		.and_then(Value::as_f64)
 		.map_or(300_000, |seconds| (seconds.max(0.0) * 1_000.0) as u64);
-	Ok(omp_agent::ApprovalSpec {
+	Ok(ApprovalSpec {
 		title: required("title")?,
 		body: required("body")?,
 		subject: required("subject")?,
@@ -1500,7 +1503,7 @@ pub(crate) fn approval_spec(value: Value) -> Result<omp_agent::ApprovalSpec, Con
 	})
 }
 
-fn approval_decision_json(decision: &omp_agent::ApprovalDecision) -> Value {
+fn approval_decision_json(decision: &ApprovalDecision) -> Value {
 	json!({
 		"approved": decision.approved,
 		"scope": decision.scope,
@@ -1511,7 +1514,7 @@ fn approval_decision_json(decision: &omp_agent::ApprovalDecision) -> Value {
 	})
 }
 
-fn approval_ticket_json(ticket: &omp_agent::ApprovalTicket) -> Value {
+fn approval_ticket_json(ticket: &ApprovalTicket) -> Value {
 	json!({
 		"ticket_id": ticket.ticket_id,
 		"invocation_id": ticket.invocation_id,

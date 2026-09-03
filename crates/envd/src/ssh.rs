@@ -154,7 +154,7 @@ impl HostStore {
 fn persist_hosts(path: &Path, hosts: &BTreeMap<Str, HostConfig>) -> Result<(), SshError> {
 	let body = toml::to_string_pretty(&HostFile { hosts: hosts.clone() })
 		.map_err(|source| SshError::ConfigEncode { path: path.to_path_buf(), source })?;
-	omp_settings::io::atomic_replace(path, &body)
+	crate::atomic_replace(path, &body)
 		.map_err(|source| SshError::ConfigWrite { path: path.to_path_buf(), source })
 }
 
@@ -879,9 +879,9 @@ pub enum SshError {
 	ConfigWrite {
 		/// Configuration path that could not be replaced.
 		path:   PathBuf,
-		/// Atomic settings-write failure.
+		/// Atomic filesystem failure.
 		#[source]
-		source: omp_settings::io::SettingsIoError,
+		source: io::Error,
 	},
 	/// A host alias was empty, exceeded 128 bytes, or contained a disallowed
 	/// ASCII character.

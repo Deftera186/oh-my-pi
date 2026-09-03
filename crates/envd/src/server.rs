@@ -16,9 +16,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
 use futures::StreamExt as _;
-use omp_agent::{
-	ApprovalBook, ApprovalRoute, ApprovalSpec, HookGate, TicketState, control::ControlSender,
-};
+use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, HookGate, KernelSender, TicketState};
+use omp_cache::{github_cache::GithubCache, telemetry_cache::TelemetryIndex};
+use omp_con::Ctx;
 use omp_core::{Hash32, Str, Ulid, sf};
 #[cfg(any(unix, windows))]
 use omp_docserver::connection::ConnectionConfig;
@@ -27,6 +27,7 @@ use omp_docserver::daemon;
 #[cfg(windows)]
 use omp_docserver::windows::OwnerPipeListener;
 use omp_env::{EnvClient, InProcessEnvTransport, partition::FramePipe};
+use omp_journal::blob;
 use omp_proto::{
 	blob::v1 as blob_pb,
 	document::v1::{self as document_pb, commit_transaction_response, document_target},
@@ -40,15 +41,6 @@ use omp_proto::{
 	prost::Message as _,
 	thread::v1 as thread_pb,
 	ui::v1::UiDispatchResult,
-};
-use omp_settings::{
-	BrowserSettings, SettingsCatalog,
-	manager::{SettingsManager, SettingsPaths},
-	snapshot::SettingsSnapshot,
-};
-use omp_storage::{
-	blob, github_cache::GithubCache, index::SessionIndex, state::StateStore,
-	telemetry_index::TelemetryIndex,
 };
 use omp_tool::{
 	Abort, ArgIssue, ArgPath, CallOutcome, Effects, ErasedEv, ErasedOutcome, IncomingParams,
@@ -94,6 +86,7 @@ use url::Url;
 use super::{
 	admission::{AdmissionDecision, AdmissionGate, ApprovalPolicy, effects_narrow_or_refuse},
 	blobs::{BlobError, BlobHost, BlobRead},
+	browser_daemon::BrowserSettings,
 	docs::{
 		AcpDocumentBackend, DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost,
 		DocumentLease, LspEvents, LspRegistryEvent,
@@ -106,10 +99,10 @@ use super::{
 	exthost::{ExtensionManifest, control::CompositeControlAuthority, lifecycle::EscapeCapability},
 	github_url::GithubCredentialBridge,
 	host_info::HostInfoHost,
-	host_settings::{HostSettings, load as load_host_settings},
+	host_settings::HostSettings,
 	http_egress::{HttpEgressError, HttpEgressHost},
 	journal_runtime::{ExternalJournalActor, PersistenceControlFactory},
-	lsp_settings::{LspSettings, load as load_lsp_settings},
+	lsp_settings::LspSettings,
 	mcp::{
 		McpService, McpServiceError, ServiceSubscription, SubscriptionEvent,
 		control::McpControl,
@@ -128,7 +121,6 @@ use super::{
 	schedules::{DurableScheduleError, ScheduleDeliveryBackend},
 	search_backend::SearchBridgeHost,
 	site::{SiteError, SiteMaterializer, record_modules},
-	staged_preview,
 	tool_document::{PrivilegedMutationFault, privileged_unlink, privileged_write},
 	tool_settings::{ApprovalMode, ToolSettings},
 	tool_shell::{AcpExecBackend, AcpExecSlot},
@@ -212,18 +204,18 @@ impl InvocationExecutionPolicy {
 	fn from_request(request: &pb::InvokeTool) -> Self {
 		let props = request.props.as_ref();
 		let mode = props
-			.and_then(|props| props.fields.get(omp_agent::EXECUTION_MODE_PROP))
+			.and_then(|props| props.fields.get("omp/execution-mode"))
 			.and_then(|value| value.kind.as_ref())
 			.and_then(|kind| match kind {
 				value::Kind::String(value) => Some(value.as_str()),
 				_ => None,
 			});
 		let plan_yolo = props
-			.and_then(|props| props.fields.get(omp_agent::PLAN_YOLO_PROP))
+			.and_then(|props| props.fields.get("omp/plan-yolo"))
 			.and_then(|value| value.kind.as_ref())
 			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
 		let core_admission = props
-			.and_then(|props| props.fields.get(omp_agent::CORE_ADMISSION_PROP))
+			.and_then(|props| props.fields.get("omp/core-admission"))
 			.and_then(|value| value.kind.as_ref())
 			.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)));
 		Self {
@@ -236,7 +228,7 @@ impl InvocationExecutionPolicy {
 
 	fn denial(&self, effects: &Effects, raw: &[u8]) -> Option<Str> {
 		if !self.plan
-			|| !omp_agent::effects_mutate_environment(effects)
+			|| !omp_tool::effects_mutate_environment(effects)
 			|| self.plan_yolo
 			|| plan_exempt_target(&self.tool, raw)
 		{
@@ -321,9 +313,6 @@ pub enum EnvdError {
 	/// Durable named-process supervision could not be initialized.
 	#[error(transparent)]
 	Exec(#[from] ExecError),
-	/// The authoritative sessions index could not be opened.
-	#[error("sessions index failed: {0}")]
-	SessionIndex(Str),
 	/// The non-session durable state authority could not be opened.
 	#[error("state authority failed: {0}")]
 	State(Str),
@@ -364,11 +353,16 @@ pub enum EnvdError {
 	/// The embedded document authority exited before accepting a verified hello.
 	#[error("embedded document authority exited before its hello handshake")]
 	DocserverExited,
-	/// Another process already serves this project's document authority.
+	/// Another process still holds this project's document authority.
 	#[error(
-		"project document authority is already served by another process; retry after it drains"
+		"project document authority for {path:?} is held by another process (holder pid: {holder:?})"
 	)]
-	DocumentAuthorityHeld,
+	DocumentAuthorityHeldBy {
+		/// Canonical project path whose authority is held.
+		path:   PathBuf,
+		/// Best-effort owner process identifier, when available.
+		holder: Option<u32>,
+	},
 }
 
 impl From<DocumentError> for EnvdError {
@@ -904,7 +898,6 @@ enum DeclaredExternalDomain {
 	Telemetry,
 	Jobs,
 	Provider,
-	Regimes,
 	Services,
 }
 
@@ -930,7 +923,6 @@ impl DeclaredExternalDomain {
 			Self::Telemetry => true,
 			Self::Jobs => !declarations.ui.verdict_renderers.is_empty(),
 			Self::Provider => true,
-			Self::Regimes => !declarations.regimes.is_empty(),
 			Self::Services => {
 				manifest.services.provides().next().is_some()
 					|| manifest.services.requires().next().is_some()
@@ -951,7 +943,6 @@ impl DeclaredExternalDomain {
 			Self::Telemetry => "telemetry",
 			Self::Jobs => "jobs",
 			Self::Provider => "provider",
-			Self::Regimes => "regimes",
 			Self::Services => "services",
 		}
 	}
@@ -972,7 +963,6 @@ impl DeclaredExternalDomain {
 			Self::Telemetry => factories.telemetry.clone(),
 			Self::Jobs => factories.jobs.clone(),
 			Self::Provider => factories.provider.clone(),
-			Self::Regimes => factories.regimes.clone(),
 			Self::Services => factories.services.clone(),
 		}
 	}
@@ -1872,25 +1862,14 @@ fn production_control_authorities(
 	let telemetry_owner = gated(DeclaredExternalDomain::Telemetry);
 	let jobs = gated(DeclaredExternalDomain::Jobs);
 	let provider_owner = gated(DeclaredExternalDomain::Provider);
-	let regimes = gated(DeclaredExternalDomain::Regimes);
 	let services = gated(DeclaredExternalDomain::Services);
 	let auxiliary: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
 		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem].into_boxed_slice(),
 	});
-	let session_owner: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
-		owners: vec![Arc::clone(&persistent), sessions].into_boxed_slice(),
-	});
-	let persistence = PersistenceControlAuthorities::new(
-		Arc::clone(&persistent),
-		Arc::clone(&persistent),
-		Arc::clone(&persistent),
-		session_owner,
-		persistent,
-		credentials,
-	);
+	let persistence = PersistenceControlAuthorities::new(sessions, persistent, credentials);
 	let policy = PolicyControlAuthorities::new(policy_owner, prompts);
 	let presentation = PresentationControlAuthorities::new(ui, telemetry_owner, jobs);
-	let provider = ProviderControlAuthorities::new(provider_owner, regimes, services);
+	let provider = ProviderControlAuthorities::new(provider_owner, services);
 	let envd = EnvdControlAuthorities::new(
 		registry,
 		persistence,
@@ -1954,7 +1933,6 @@ pub struct EnvServer {
 	admission_gate:          Arc<HookGate>,
 	checkpoint_control:      AgentCheckpointControl,
 	previews:                StagedProposalRegistry,
-	sessions_index:          Arc<SessionIndex>,
 	journal_external:        ExternalJournalActor,
 	workers:                 Arc<WorkerSupervisor>,
 	authority:               Arc<AuthorityTable>,
@@ -1964,69 +1942,15 @@ pub struct EnvServer {
 }
 
 fn execution_settings(
-	data_dir: &Path,
-	project_root: &Path,
-	catalog: SettingsCatalog,
-) -> Result<(HostSettings, BrowserSettings, ShellSettings, SandboxSettings, AcpSettings), EnvdError>
-{
-	let manager =
-		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	let snapshot = manager.snapshot();
-	execution_settings_from_snapshot(&snapshot)
-}
-
-fn execution_settings_from_snapshot(
-	snapshot: &SettingsSnapshot,
-) -> Result<(HostSettings, BrowserSettings, ShellSettings, SandboxSettings, AcpSettings), EnvdError>
-{
-	let mut host = snapshot
-		.project::<HostSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-		.get()
-		.clone();
-	host.mnemopi = host.mnemopi.normalize();
-	let browser = snapshot
-		.project::<BrowserSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	let browser = *browser.get();
-	let shell = snapshot
-		.project::<ShellSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-		.get()
-		.clone();
-	let sandbox = snapshot
-		.project::<SandboxSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-		.get()
-		.clone();
-	let acp = snapshot
-		.project::<AcpSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-		.get()
-		.clone();
-	Ok((host, browser, shell, sandbox, acp))
-}
-fn mcp_settings(
-	data_dir: &Path,
-	project_root: &Path,
-	snapshot: Option<&SettingsSnapshot>,
-	catalog: SettingsCatalog,
-) -> Result<McpSettings, EnvdError> {
-	let owned;
-	let snapshot = if let Some(snapshot) = snapshot {
-		snapshot
-	} else {
-		owned = SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-			.snapshot();
-		&owned
-	};
-	Ok(snapshot
-		.project::<McpSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-		.get()
-		.clone())
+	ctx: &Ctx,
+) -> (HostSettings, BrowserSettings, ShellSettings, SandboxSettings, AcpSettings) {
+	(
+		HostSettings::from_con(ctx),
+		BrowserSettings::from_con(ctx),
+		ShellSettings::from_con(ctx),
+		SandboxSettings::from_con(ctx),
+		AcpSettings::from_con(ctx),
+	)
 }
 
 async fn start_memory_runtime(
@@ -2056,28 +1980,6 @@ async fn start_memory_runtime(
 	.map_err(|error| EnvdError::State(Str::from(error.to_string())))
 }
 
-fn open_journal_authorities(
-	state_dir: &Path,
-	writer: bool,
-) -> Result<(Arc<SessionIndex>, Option<Arc<StateStore>>), EnvdError> {
-	let sessions_dir = state_dir.join("sessions");
-	fs::create_dir_all(&sessions_dir)
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	let index_path = sessions_dir.join("sessions.sqlite3");
-	let sessions_index = if writer {
-		SessionIndex::open(index_path)
-	} else {
-		SessionIndex::open_authoritative_reader(index_path)
-	}
-	.map_err(|error| EnvdError::SessionIndex(Str::from(error.to_string())))?;
-	let state_store = writer
-		.then(|| StateStore::open(state_dir.join("state")))
-		.transpose()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-		.map(Arc::new);
-	Ok((Arc::new(sessions_index), state_store))
-}
-
 #[derive(Debug, Error)]
 enum PrivilegedDispatchError {
 	#[error("{0}")]
@@ -2087,7 +1989,6 @@ enum PrivilegedDispatchError {
 }
 #[derive(Clone)]
 struct ApprovalAuthority {
-	book:  Arc<ApprovalBook>,
 	route: ApprovalRoute,
 }
 
@@ -2095,10 +1996,8 @@ struct ApprovalAuthority {
 struct ApprovalAuthoritySlot(Arc<parking_lot::RwLock<Option<ApprovalAuthority>>>);
 
 impl ApprovalAuthoritySlot {
-	fn bind(&self, book: Option<Arc<ApprovalBook>>, route: Option<ApprovalRoute>) {
-		*self.0.write() = book
-			.zip(route)
-			.map(|(book, route)| ApprovalAuthority { book, route });
+	fn bind(&self, _book: Option<Arc<ApprovalBook>>, route: Option<ApprovalRoute>) {
+		*self.0.write() = route.map(|route| ApprovalAuthority { route });
 	}
 
 	async fn approve_privileged(
@@ -2141,7 +2040,7 @@ impl ApprovalAuthoritySlot {
 			let Ok(ticket_id) = str::from_utf8(ticket) else {
 				return false;
 			};
-			let Some(ticket) = authority.book.ticket(ticket_id) else {
+			let Some(ticket) = authority.route.ticket(ticket_id) else {
 				return false;
 			};
 			ticket
@@ -2385,7 +2284,6 @@ impl EnvServer {
 		admission_gate: Arc<HookGate>,
 		checkpoint_control: AgentCheckpointControl,
 		previews: StagedProposalRegistry,
-		sessions_index: Arc<SessionIndex>,
 		journal_external: ExternalJournalActor,
 		authority: Arc<AuthorityTable>,
 		state_dir: &Path,
@@ -2425,7 +2323,6 @@ impl EnvServer {
 			admission_gate,
 			checkpoint_control,
 			previews,
-			sessions_index,
 			journal_external,
 			workers: Arc::new(WorkerSupervisor::new(
 				DEFAULT_WORKER_LAYER_CEILING,
@@ -2455,15 +2352,14 @@ impl EnvServer {
 		state_dir: &Path,
 		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
-		settings_catalog: SettingsCatalog,
+		con: &Ctx,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		mcp.bind_config_paths(state_dir, workspace.root());
-		let lsp_settings = load_lsp_settings(state_dir, workspace.root(), settings_catalog)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+		let lsp_settings = LspSettings::from_con(con);
 		let doc_config = omp_docserver::ServerConfig::new(root)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
 			.with_server_build(omp_env::build_id::current());
@@ -2482,7 +2378,6 @@ impl EnvServer {
 		let hello = documents.hello().clone();
 		let interrupt_grace = ext_host_config.interrupt_grace;
 		let session_id = ext_host_config.session_id.clone();
-		let (sessions_index, state_store) = open_journal_authorities(state_dir, true)?;
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_workspace_root(workspace.root());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
@@ -2507,16 +2402,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
-		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
-		let project_path = Str::from(workspace.root().to_string_lossy().as_ref());
-		let journal_external = ExternalJournalActor::spawn(
-			Arc::clone(&sessions_index),
-			state_store.clone(),
-			blobs.clone(),
-			session_id.clone(),
-			project_scope,
-			project_path,
-		)?;
+		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
 			&session_id,
@@ -2526,7 +2412,6 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 		);
-		sessions_index.bind_rename_observer(control_bindings.hooks.clone());
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
@@ -2545,9 +2430,9 @@ impl EnvServer {
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
 		let (host_settings, browser_settings, shell_settings, sandbox_settings, acp_settings) =
-			execution_settings(state_dir, workspace.root(), settings_catalog)?;
+			execution_settings(con);
 		exec.configure_sandbox(&sandbox_settings, workspace.root());
-		let mcp_settings = mcp_settings(state_dir, workspace.root(), None, settings_catalog)?;
+		let mcp_settings = McpSettings::from_con(con);
 		mcp.start_native_configs(mcp_settings.enable_project_config)
 			.await
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
@@ -2579,7 +2464,7 @@ impl EnvServer {
 			&blobs,
 			&exec,
 			state_dir,
-			settings_catalog,
+			con,
 			session_id.as_str(),
 			Arc::clone(&github_cache),
 			&mcp,
@@ -2652,7 +2537,6 @@ impl EnvServer {
 			admission_gate,
 			checkpoint_control,
 			previews,
-			sessions_index,
 			journal_external,
 			authority,
 			state_dir,
@@ -2686,8 +2570,7 @@ impl EnvServer {
 		doc_connections: Option<watch::Sender<usize>>,
 		require_document_ownership: bool,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
-		settings_catalog: SettingsCatalog,
-		settings_snapshot: Option<&SettingsSnapshot>,
+		con: &Ctx,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let workspace = WorkspaceHost::open(root)?;
@@ -2695,13 +2578,13 @@ impl EnvServer {
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 		mcp.bind_config_paths(state_dir, workspace.root());
-		let lsp_settings = load_lsp_settings(state_dir, &root, settings_catalog)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
+		let lsp_settings = LspSettings::from_con(con);
 		let document_lsp = omp_docserver::NativeLspOptions {
 			enabled: lsp_settings.enabled,
 			lazy:    lsp_settings.lazy,
 		};
 		let document_user_config = omp_core::dirs::data_dir(None).ok();
+		let server_build = Str::from(omp_env::build_id::current());
 		let (documents, mut document_authority) = connect_or_start_docserver(
 			&root,
 			docserver_socket,
@@ -2709,6 +2592,7 @@ impl EnvServer {
 			require_document_ownership,
 			document_lsp.clone(),
 			document_user_config.clone(),
+			server_build.clone(),
 		)
 		.await?;
 		if !require_document_ownership {
@@ -2716,6 +2600,7 @@ impl EnvServer {
 			let rehost_root = root.clone();
 			let rehost_socket = docserver_socket.to_path_buf();
 			let rehost_connections = doc_connections.clone();
+			let rehost_state_dir = state_dir.to_path_buf();
 			documents.install_rehost(Arc::new(move || -> super::docs::RehostFuture {
 				let retained_authority = Arc::clone(&retained_authority);
 				let root = rehost_root.clone();
@@ -2723,21 +2608,24 @@ impl EnvServer {
 				let connections = rehost_connections.clone();
 				let lsp = document_lsp.clone();
 				let user_config_root = document_user_config.clone();
+				let state_dir = rehost_state_dir.clone();
+				let server_build = server_build.clone();
 				Box::pin(async move {
 					let mut retained = retained_authority.lock().await;
 					retained.take();
-					match connect_or_start_docserver(
+					match rehost_document_authority(
 						&root,
+						&state_dir,
 						&socket,
 						connections,
-						false,
 						lsp,
 						user_config_root,
+						server_build,
 					)
 					.await
 					{
-						Ok((_connection, authority)) => *retained = authority,
-						Err(EnvdError::DocumentAuthorityHeld) => {},
+						Ok(authority) => *retained = authority,
+						Err(EnvdError::DocumentAuthorityHeldBy { .. }) => {},
 						Err(error) => {
 							tracing::debug!(%error, "document authority rehost race did not win");
 						},
@@ -2748,8 +2636,6 @@ impl EnvServer {
 		let hello = documents.hello().clone();
 		let interrupt_grace = ext_host_config.interrupt_grace;
 		let session_id = ext_host_config.session_id.clone();
-		let writer = doc_connections.is_none();
-		let (sessions_index, state_store) = open_journal_authorities(state_dir, writer)?;
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
@@ -2778,16 +2664,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
-		let project_scope = Str::from(omp_core::hex::encode(&hello.workspace_id).to_string());
-		let project_path = Str::from(workspace.root().to_string_lossy().as_ref());
-		let journal_external = ExternalJournalActor::spawn(
-			Arc::clone(&sessions_index),
-			state_store.clone(),
-			blobs.clone(),
-			session_id.clone(),
-			project_scope,
-			project_path,
-		)?;
+		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
 			&session_id,
@@ -2797,7 +2674,6 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 		);
-		sessions_index.bind_rename_observer(control_bindings.hooks.clone());
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
@@ -2816,17 +2692,12 @@ impl EnvServer {
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
 		let (mut host_settings, browser_settings, shell_settings, sandbox_settings, acp_settings) =
-			if let Some(snapshot) = settings_snapshot {
-				execution_settings_from_snapshot(snapshot)?
-			} else {
-				execution_settings(state_dir, workspace.root(), settings_catalog)?
-			};
+			execution_settings(con);
 		exec.configure_sandbox(&sandbox_settings, workspace.root());
 		host_settings.tools = host_settings
 			.tools
 			.with_approval_mode_override(approval_mode);
-		let mcp_settings =
-			mcp_settings(state_dir, workspace.root(), settings_snapshot, settings_catalog)?;
+		let mcp_settings = McpSettings::from_con(con);
 		mcp.start_native_configs(mcp_settings.enable_project_config)
 			.await
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
@@ -2858,7 +2729,7 @@ impl EnvServer {
 			&blobs,
 			&exec,
 			state_dir,
-			settings_catalog,
+			con,
 			session_id.as_str(),
 			Arc::clone(&github_cache),
 			&mcp,
@@ -2931,7 +2802,6 @@ impl EnvServer {
 			admission_gate,
 			checkpoint_control,
 			previews,
-			sessions_index,
 			journal_external,
 			authority,
 			state_dir,
@@ -2952,7 +2822,7 @@ impl EnvServer {
 		registry: Registry,
 		mut ext_host_config: ExtHostConfig,
 		approval_mode: Option<super::tool_settings::ApprovalMode>,
-		settings_snapshot: &SettingsSnapshot,
+		con: &Ctx,
 		bridges: RegistryBridges,
 		owner: EnvClient,
 	) -> Result<Self, EnvdError> {
@@ -2960,7 +2830,6 @@ impl EnvServer {
 		let workspace = WorkspaceHost::open(root)?;
 		let root = workspace.root().to_path_buf();
 		let session_id = ext_host_config.session_id.clone();
-		let (sessions_index, state_store) = open_journal_authorities(state_dir, true)?;
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
@@ -2987,23 +2856,14 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
-		let mcp_settings =
-			mcp_settings(state_dir, &root, Some(settings_snapshot), settings_snapshot.catalog())?;
+		let mcp_settings = McpSettings::from_con(con);
 		// Native config mounting requires the bound manager: reload resolves
 		// through the live transport supervisor.
 		mcp.start_native_configs(mcp_settings.enable_project_config)
 			.await
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 
-		let project_scope = Str::from(omp_core::hex::encode(&owner_info.workspace_id).to_string());
-		let journal_external = ExternalJournalActor::spawn(
-			Arc::clone(&sessions_index),
-			state_store,
-			blobs.clone(),
-			session_id.clone(),
-			project_scope,
-			Str::from(root.to_string_lossy().as_ref()),
-		)?;
+		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
 			&session_id,
@@ -3013,7 +2873,6 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 		);
-		sessions_index.bind_rename_observer(control_bindings.hooks.clone());
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
 		ext_host_config.bind_registry_control(Arc::clone(&control_bindings.registry));
@@ -3033,7 +2892,7 @@ impl EnvServer {
 			&crate::tool_url::local::session_local_root(&state_dir.join("sessions"), &session_id),
 		)?;
 		let (mut host_settings, browser_settings, shell_settings, _sandbox_settings, acp_settings) =
-			execution_settings_from_snapshot(settings_snapshot)?;
+			execution_settings(con);
 		host_settings.tools = host_settings
 			.tools
 			.with_approval_mode_override(approval_mode);
@@ -3050,6 +2909,7 @@ impl EnvServer {
 			edit_model: _,
 			edit_repair: _,
 			host_resources: _,
+			session_authority: _,
 			telemetry_upload,
 			ask_presenter,
 			content,
@@ -3057,7 +2917,7 @@ impl EnvServer {
 		let declarations = build_environment_declaration_inputs(
 			state_dir,
 			&root,
-			settings_snapshot.catalog(),
+			con,
 			ext_hosts.as_ref(),
 			&host_settings.tools,
 			&shell_settings,
@@ -3132,7 +2992,6 @@ impl EnvServer {
 			admission_gate,
 			session.checkpoint_control,
 			StagedProposalRegistry::new(),
-			sessions_index,
 			journal_external,
 			authority,
 			state_dir,
@@ -3295,6 +3154,15 @@ impl EnvServer {
 		self.ext_hosts.sealed_registry_evidence(identity)
 	}
 
+	/// Registers frozen Python Directors and Components with an engine
+	/// registrar.
+	pub fn register_python_extensions(
+		&self,
+		registrar: &mut omp_agent::ExtensionRegistrar,
+	) -> Result<Vec<crate::exthost::PyComponent>, crate::exthost::PyExtensionError> {
+		self.ext_hosts.register_python_extensions(registrar)
+	}
+
 	/// Returns every currently sealed exact-generation extension registry.
 	pub fn extension_registry_evidences(&self) -> Vec<Arc<SealedRegistryEvidence>> {
 		self.ext_hosts.sealed_registry_evidences()
@@ -3418,12 +3286,6 @@ impl EnvServer {
 		Arc::clone(&self.github_credentials)
 	}
 
-	/// Returns the single authoritative sessions index shared with the Agent
-	/// Journal.
-	pub(crate) fn sessions_index(&self) -> Arc<SessionIndex> {
-		Arc::clone(&self.sessions_index)
-	}
-
 	/// Returns the session generation fencing CONTROL connections.
 	pub(crate) fn session_generation(&self) -> u64 {
 		self.ext_hosts.session_generation()
@@ -3469,28 +3331,27 @@ impl EnvServer {
 	/// attempted after extension child activation.
 	pub(crate) fn bind_agent_control(
 		self: &Arc<Self>,
-		sender: ControlSender,
+		sender: KernelSender,
 	) -> Result<AgentControlBinding, EnvdError> {
 		let id = NEXT_AGENT_CONTROL_BINDING.fetch_add(1, Ordering::Relaxed);
-		let host = sender.host_control().ok_or_else(|| {
-			EnvdError::Worker(WorkerError::Protocol(sf!(
-				"agent live context CONTROL mailbox is not installed"
-			)))
-		})?;
 		self
-			.journal_external
-			.bind_agent_with_host(id, sender.clone(), Some(host))?;
-		if let Err(error) = self.ext_hosts.bind_journal_runtime(id, JournalRuntime {
-			agent:    sender.clone(),
-			external: self.journal_external.sender(),
-		}) {
-			self.journal_external.unbind_agent(id);
-			return Err(error.into());
-		}
+			.ext_hosts
+			.bind_journal_runtime(id, JournalRuntime { external: self.journal_external.sender() })?;
 		self.checkpoint_control.bind(id, sender.clone());
 		self
 			.previews
-			.install_activation_observer(staged_preview::observer(sender, self.previews.clone()));
+			.install_activation_observer(Arc::new(move |pending| {
+				let sender = sender.clone();
+				Box::pin(async move {
+					sender
+						.send_async(omp_agent::Up::Env(omp_agent::EnvEvent::StagedPreview {
+							proposal_id: pending.id,
+							source_tool: pending.source_tool,
+						}))
+						.await
+						.map_err(|_| omp_tools::staging::ProposalActivationError::Rejected)
+				})
+			}));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
 	}
 
@@ -3506,12 +3367,11 @@ impl EnvServer {
 	fn release_agent_control(&self, id: u64) {
 		self.previews.remove_activation_observer();
 		self.ext_hosts.unbind_journal_runtime(id);
-		self.journal_external.unbind_agent(id);
 		self.checkpoint_control.unbind(id);
 	}
 
 	/// Binds extension device availability to the active Agent turn boundary.
-	pub(crate) fn bind_device_availability(&self, mailbox: omp_agent::MailboxSender) {
+	pub(crate) fn bind_device_availability(&self, mailbox: KernelSender) {
 		self
 			.ext_hosts
 			.bind_availability_sink(Arc::new(RegistryAvailabilitySink::new(
@@ -11264,10 +11124,10 @@ where
 #[cfg(unix)]
 pub async fn run(
 	args: EnvdConfig,
-	catalog: SettingsCatalog,
+	con: Arc<Ctx>,
 	bridges: RegistryBridges,
 ) -> Result<(), EnvdError> {
-	run_with_registry(args, Registry::new(), catalog, bridges).await
+	run_with_registry(args, Registry::new(), con, bridges).await
 }
 
 /// Assembles production dispatch plus caller-provided tool revisions.
@@ -11285,14 +11145,13 @@ pub async fn run(
 pub async fn run_with_registry(
 	args: EnvdConfig,
 	registry: Registry,
-	catalog: SettingsCatalog,
+	con: Arc<Ctx>,
 	bridges: RegistryBridges,
 ) -> Result<(), EnvdError> {
 	let workspace = WorkspaceHost::open(&args.root)?;
 	let root = workspace.root().to_path_buf();
 	let data_dir = omp_core::dirs::data_dir(None).map_err(io::Error::other)?;
-	let settings = load_host_settings(&data_dir, &root, catalog).map_err(io::Error::other)?;
-	let interrupt_grace = settings.runtime.interrupt_grace;
+	let interrupt_grace = super::host_settings::SV_INTERRUPT_GRACE.get(&con);
 	let state_dir = if let Some(path) = args.state_dir {
 		path
 	} else {
@@ -11310,7 +11169,7 @@ pub async fn run_with_registry(
 		socket
 	};
 	if require_document_ownership {
-		ensure_document_socket_free(&docserver_socket).await?;
+		ensure_document_socket_free(&root, &docserver_socket).await?;
 	}
 	let (principal_authority, session_id, session_generation) = authenticated_runtime_identity()?;
 	let mut ext_host_config = ExtHostConfig::current(
@@ -11363,8 +11222,7 @@ pub async fn run_with_registry(
 			Some(doc_connections),
 			require_document_ownership,
 			None,
-			catalog,
-			None,
+			&con,
 			bridges,
 		)
 		.await?,
@@ -11406,12 +11264,18 @@ pub async fn run_with_registry(
 		});
 	}
 	let idle_timeout = Duration::from_secs(args.idle_timeout);
+	let idle_state_dir = state_dir.clone();
+	let idle_server_build = Str::from(omp_env::build_id::current());
 	let idle = async move {
-		if idle_timeout.is_zero() {
-			future::pending::<()>().await;
-		} else {
-			wait_idle(env_connection_rx, doc_connection_rx, 1, idle_timeout).await;
-		}
+		wait_idle(
+			env_connection_rx,
+			doc_connection_rx,
+			1,
+			idle_timeout,
+			idle_state_dir,
+			idle_server_build,
+		)
+		.await;
 	};
 	tokio::pin!(idle);
 	let serve_result = async {
@@ -11454,7 +11318,11 @@ async fn wait_idle(
 	mut docs: watch::Receiver<usize>,
 	reserved_docs: usize,
 	timeout: Duration,
+	state_dir: PathBuf,
+	server_build: Str,
 ) {
+	const BUILD_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
 	let mut env_open = true;
 	let mut docs_open = true;
 	loop {
@@ -11465,7 +11333,16 @@ async fn wait_idle(
 				else => future::pending::<()>().await,
 			}
 		}
-		let idle = time::sleep(timeout);
+		if crate::launcher_build_is_stale(&state_dir, server_build.as_str()) {
+			return;
+		}
+		let idle = async {
+			if timeout.is_zero() {
+				future::pending::<()>().await;
+			} else {
+				time::sleep(timeout).await;
+			}
+		};
 		tokio::pin!(idle);
 		loop {
 			tokio::select! {
@@ -11482,6 +11359,11 @@ async fn wait_idle(
 						break;
 					}
 				},
+				() = time::sleep(BUILD_CHECK_INTERVAL) => {
+					if crate::launcher_build_is_stale(&state_dir, server_build.as_str()) {
+						return;
+					}
+				},
 			}
 		}
 	}
@@ -11495,6 +11377,40 @@ pub async fn run(_args: EnvdConfig, _bridges: RegistryBridges) -> Result<(), Env
 	)
 }
 
+#[cfg(any(unix, windows))]
+async fn rehost_document_authority(
+	root: &Path,
+	state_dir: &Path,
+	socket: &Path,
+	connections: Option<watch::Sender<usize>>,
+	lsp: omp_docserver::NativeLspOptions,
+	user_config_root: Option<PathBuf>,
+	server_build: Str,
+) -> Result<Option<DocumentAuthority>, EnvdError> {
+	if crate::launcher_build_is_stale(state_dir, server_build.as_str()) {
+		tracing::debug!(
+			build = %server_build,
+			"stale-build environment daemon declined to rehost document authority"
+		);
+		return Ok(None);
+	}
+	let (_connection, authority) = connect_or_start_docserver(
+		root,
+		socket,
+		connections,
+		false,
+		lsp,
+		user_config_root,
+		server_build.clone(),
+	)
+	.await?;
+	if crate::launcher_build_is_stale(state_dir, server_build.as_str()) {
+		drop(authority);
+		return Ok(None);
+	}
+	Ok(authority)
+}
+
 #[cfg(unix)]
 async fn connect_or_start_docserver(
 	root: &Path,
@@ -11503,83 +11419,131 @@ async fn connect_or_start_docserver(
 	require_ownership: bool,
 	lsp: omp_docserver::NativeLspOptions,
 	user_config_root: Option<PathBuf>,
+	server_build: Str,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
-	if require_ownership {
-		if UnixStream::connect(socket).await.is_ok() {
-			return Err(EnvdError::DocumentAuthorityHeld);
+	const HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
+	const RETRY_STEP: Duration = Duration::from_millis(50);
+	const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+	let handoff_deadline = Instant::now() + HANDOFF_TIMEOUT;
+	'connect_or_serve: loop {
+		if let Ok(stream) = UnixStream::connect(socket).await {
+			if require_ownership {
+				return Err(document_authority_held(root));
+			}
+			match DocumentHost::connect_uds_stream(socket, stream).await {
+				Ok(documents) => {
+					validate_document_root(root, documents.hello().root_uri.as_str())?;
+					if !omp_env::build_id::is_stale(
+						server_build.as_str(),
+						documents.hello().server_build.as_str(),
+					) {
+						return Ok((documents, None));
+					}
+					tracing::warn!(
+						socket = %socket.display(),
+						owner_build = %documents.hello().server_build,
+						launcher_build = %server_build,
+						"waiting for stale-build document daemon to drain"
+					);
+					drop(documents);
+				},
+				Err(error) if Instant::now() >= handoff_deadline => return Err(error.into()),
+				Err(_) => {},
+			}
+			if Instant::now() >= handoff_deadline {
+				return Err(document_authority_held(root));
+			}
+			time::sleep(RETRY_STEP).await;
+			continue;
 		}
-	} else {
-		let deadline = Instant::now() + Duration::from_secs(1);
+		if let Some(parent) = socket.parent() {
+			fs::create_dir_all(parent)?;
+		}
+
+		let shutdown = CancellationToken::new();
+		let task_shutdown = shutdown.clone();
+		let task_root = root.to_path_buf();
+		let task_socket = socket.to_path_buf();
+		let task_lsp = lsp.clone();
+		let task_user_config_root = user_config_root.clone();
+		let task_server_build = server_build.clone();
+		let task_connections = connections.clone();
+		let task = tokio::spawn(async move {
+			omp_docserver::daemon::serve(
+				task_root,
+				daemon::Transport::Socket(task_socket),
+				omp_docserver::daemon::ServeOptions {
+					lsp_config_paths: Vec::new(),
+					lsp:              task_lsp,
+					user_config_root: task_user_config_root,
+					shutdown:         Some(task_shutdown),
+					server_build:     task_server_build,
+					connections:      task_connections,
+				},
+			)
+			.await
+		});
+		let mut authority = DocumentAuthority { shutdown, task: Some(task) };
+		let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
 		loop {
-			match UnixStream::connect(socket).await {
-				Ok(stream) => match DocumentHost::connect_uds_stream(socket, stream).await {
+			if let Some(result) = authority.finished_result().await {
+				match result? {
+					Ok(()) => return Err(EnvdError::DocserverExited),
+					Err(error) if document_daemon_authority_held(&error) => {
+						if Instant::now() >= handoff_deadline {
+							return Err(document_authority_held(root));
+						}
+						time::sleep(RETRY_STEP).await;
+						continue 'connect_or_serve;
+					},
+					Err(error) => return Err(EnvdError::Document(Str::from(error.to_string()))),
+				}
+			}
+			if let Ok(stream) = UnixStream::connect(socket).await {
+				match DocumentHost::connect_uds_stream(socket, stream).await {
 					Ok(documents) => {
 						validate_document_root(root, documents.hello().root_uri.as_str())?;
 						if omp_env::build_id::is_stale(
-							omp_env::build_id::current(),
+							server_build.as_str(),
 							documents.hello().server_build.as_str(),
 						) {
-							tracing::warn!(
-								socket = %socket.display(),
-								"stale-build document daemon owns the socket and will be replaced once it drains"
-							);
+							drop(documents);
+							drop(authority);
+							if Instant::now() >= handoff_deadline {
+								return Err(document_authority_held(root));
+							}
+							time::sleep(RETRY_STEP).await;
+							continue 'connect_or_serve;
 						}
-						return Ok((documents, None));
+						return Ok((documents, Some(authority)));
 					},
-					Err(error) if Instant::now() >= deadline => return Err(error.into()),
 					Err(_) => {},
-				},
-				Err(_) if !socket.exists() => break,
-				Err(_) if Instant::now() >= deadline => break,
-				Err(_) => {},
+				}
 			}
-			time::sleep(Duration::from_millis(25)).await;
+			if Instant::now() >= startup_deadline {
+				return Err(
+					io::Error::new(io::ErrorKind::TimedOut, "document-server hello timed out").into(),
+				);
+			}
+			time::sleep(RETRY_STEP).await;
 		}
 	}
-	if let Some(parent) = socket.parent() {
-		fs::create_dir_all(parent)?;
-	}
+}
 
-	let shutdown = CancellationToken::new();
-	let task_shutdown = shutdown.clone();
-	let task_root = root.to_path_buf();
-	let task_socket = socket.to_path_buf();
-	let task = tokio::spawn(async move {
-		omp_docserver::daemon::serve(
-			task_root,
-			daemon::Transport::Socket(task_socket),
-			omp_docserver::daemon::ServeOptions {
-				lsp_config_paths: Vec::new(),
-				lsp,
-				user_config_root,
-				shutdown: Some(task_shutdown),
-				server_build: Str::from(omp_env::build_id::current()),
-				connections,
-			},
-		)
-		.await
-	});
-	let mut authority = DocumentAuthority { shutdown, task: Some(task) };
-	let deadline = Instant::now() + Duration::from_secs(10);
-	loop {
-		if let Some(result) = authority.finished_result().await {
-			match result? {
-				Ok(()) => return Err(EnvdError::DocserverExited),
-				Err(error) => return Err(EnvdError::Document(Str::from(error.to_string()))),
-			}
-		}
-		if let Ok(stream) = UnixStream::connect(socket).await {
-			let documents = DocumentHost::connect_uds_stream(socket, stream).await?;
-			validate_document_root(root, documents.hello().root_uri.as_str())?;
-			return Ok((documents, Some(authority)));
-		}
-		if Instant::now() >= deadline {
-			return Err(
-				io::Error::new(io::ErrorKind::TimedOut, "document-server hello timed out").into(),
-			);
-		}
-		time::sleep(Duration::from_millis(25)).await;
+#[cfg(unix)]
+fn document_daemon_authority_held(error: &daemon::Error) -> bool {
+	match error {
+		daemon::Error::AcquireAuthorityLock { .. } => true,
+		daemon::Error::Document(omp_docserver::Error::Io { source, .. }) => {
+			source.kind() == io::ErrorKind::WouldBlock
+		},
+		_ => false,
 	}
+}
+
+fn document_authority_held(path: &Path) -> EnvdError {
+	EnvdError::DocumentAuthorityHeldBy { path: path.to_path_buf(), holder: None }
 }
 
 #[cfg(windows)]
@@ -11590,19 +11554,24 @@ async fn connect_or_start_docserver(
 	require_ownership: bool,
 	lsp: omp_docserver::NativeLspOptions,
 	user_config_root: Option<PathBuf>,
+	server_build: Str,
 ) -> Result<(DocumentHost, Option<DocumentAuthority>), EnvdError> {
 	if let Ok(stream) = omp_docserver::windows::connect_owner_pipe(socket) {
 		if require_ownership {
-			return Err(EnvdError::DocumentAuthorityHeld);
+			return Err(document_authority_held(root));
 		}
 		let documents = DocumentHost::connect_pipe_stream(socket, stream).await?;
 		validate_document_root(root, documents.hello().root_uri.as_str())?;
+		if omp_env::build_id::is_stale(server_build.as_str(), documents.hello().server_build.as_str())
+		{
+			return Err(document_authority_held(root));
+		}
 		return Ok((documents, None));
 	}
 	let listener = OwnerPipeListener::bind(socket)?;
 	let config = omp_docserver::ServerConfig::new(root)
 		.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
-		.with_server_build(omp_env::build_id::current());
+		.with_server_build(server_build);
 	let environment = omp_docserver::Environment::new(config)
 		.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?;
 	if lsp.enabled {
@@ -11658,9 +11627,9 @@ fn validate_document_root(root: &Path, authority_root_uri: &str) -> Result<(), E
 /// client would chain daemon lifetimes across builds, keeping a draining
 /// generation alive forever through the successor's own connection.
 #[cfg(unix)]
-async fn ensure_document_socket_free(socket: &Path) -> Result<(), EnvdError> {
+async fn ensure_document_socket_free(root: &Path, socket: &Path) -> Result<(), EnvdError> {
 	match UnixStream::connect(socket).await {
-		Ok(_) => Err(EnvdError::DocumentAuthorityHeld),
+		Ok(_) => Err(document_authority_held(root)),
 		Err(_) => Ok(()),
 	}
 }
@@ -11712,7 +11681,7 @@ mod tests {
 	use std::{fs, os::unix::fs::PermissionsExt as _, sync::Arc};
 
 	use flume::Receiver;
-	use omp_agent::{ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalSource};
+	use omp_agent::{ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalScope, ApprovalSource};
 	use omp_core::{EnvPath, Principal};
 	use omp_docserver::{
 		Environment, ServerConfig,
@@ -11974,22 +11943,8 @@ mod tests {
 		let hello = documents.hello().clone();
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state.path().join("blobs")).expect("blob host");
-		fs::create_dir_all(state.path().join("sessions")).expect("sessions directory");
-		let sessions_index = Arc::new(
-			SessionIndex::open(state.path().join("sessions").join("sessions.sqlite3"))
-				.expect("sessions index"),
-		);
-		let state_store =
-			Arc::new(StateStore::open(state.path().join("state")).expect("state store"));
-		let journal_external = ExternalJournalActor::spawn(
-			Arc::clone(&sessions_index),
-			Some(Arc::clone(&state_store)),
-			blobs.clone(),
-			sf!("test-session"),
-			sf!("test-project"),
-			sf!("/test-project"),
-		)
-		.expect("external journal actor");
+		let journal_external =
+			ExternalJournalActor::spawn(state.path()).expect("external journal actor");
 		let workspace_ops = WorkspaceOperations::open(
 			workspace.clone(),
 			documents.clone(),
@@ -12063,10 +12018,9 @@ mod tests {
 			Arc::new(GithubCredentialBridge::new()),
 			omp_inference::operation::usage::UsageFetcherRegistry::default(),
 			omp_inference::ProviderResponseHooks::default(),
-			Arc::new(omp_agent::HookGate::channel().0),
+			Arc::new(HookGate::channel().0),
 			AgentCheckpointControl::default(),
 			StagedProposalRegistry::new(),
-			sessions_index,
 			journal_external,
 			Arc::new(AuthorityTable::default()),
 			state.path(),
@@ -12302,7 +12256,7 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
-				crate::TEST_SETTINGS_CATALOG,
+				&Ctx::new(),
 				RegistryBridges::default(),
 			)
 			.await
@@ -12432,7 +12386,7 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
-				crate::TEST_SETTINGS_CATALOG,
+				&Ctx::new(),
 				RegistryBridges::default(),
 			)
 			.await
@@ -12940,16 +12894,23 @@ mod tests {
 
 	#[tokio::test]
 	async fn standalone_daemon_refuses_a_served_document_socket() {
+		let root = tempfile::tempdir().expect("document workspace");
 		let scratch = tempfile::tempdir().expect("scratch socket directory");
 		let socket = scratch.path().join("doc.sock");
 
-		assert!(ensure_document_socket_free(&socket).await.is_ok(), "absent socket must be free");
+		assert!(
+			ensure_document_socket_free(root.path(), &socket)
+				.await
+				.is_ok(),
+			"absent socket must be free"
+		);
 
 		let listener = UnixListener::bind(&socket).expect("bind document socket");
 		assert!(
 			matches!(
-				ensure_document_socket_free(&socket).await,
-				Err(EnvdError::DocumentAuthorityHeld)
+				ensure_document_socket_free(root.path(), &socket).await,
+				Err(EnvdError::DocumentAuthorityHeldBy { path, holder: None })
+					if path == root.path()
 			),
 			"live authority must refuse a second daemon"
 		);
@@ -12958,7 +12919,10 @@ mod tests {
 		drop(listener);
 		time::timeout(Duration::from_secs(1), async {
 			loop {
-				if ensure_document_socket_free(&socket).await.is_ok() {
+				if ensure_document_socket_free(root.path(), &socket)
+					.await
+					.is_ok()
+				{
 					break;
 				}
 				time::sleep(Duration::from_millis(1)).await;
@@ -12986,10 +12950,18 @@ mod tests {
 
 	#[tokio::test]
 	async fn idle_wait_requires_one_continuous_quiet_window() {
+		let state = tempfile::tempdir().expect("daemon state");
 		let window = Duration::from_millis(30);
 		let (env_tx, env_rx) = watch::channel(1);
 		let (docs_tx, docs_rx) = watch::channel(2);
-		let busy = tokio::spawn(wait_idle(env_rx, docs_rx, 1, window));
+		let busy = tokio::spawn(wait_idle(
+			env_rx,
+			docs_rx,
+			1,
+			window,
+			state.path().to_path_buf(),
+			sf!("same-build"),
+		));
 		time::sleep(Duration::from_millis(5)).await;
 		assert!(!busy.is_finished(), "busy environment was considered idle");
 		env_tx.send_replace(0);
@@ -13003,7 +12975,14 @@ mod tests {
 
 		let (env_tx, env_rx) = watch::channel(0);
 		let (_docs_tx, docs_rx) = watch::channel(1);
-		let reset = tokio::spawn(wait_idle(env_rx, docs_rx, 1, window));
+		let reset = tokio::spawn(wait_idle(
+			env_rx,
+			docs_rx,
+			1,
+			window,
+			state.path().to_path_buf(),
+			sf!("same-build"),
+		));
 		time::sleep(Duration::from_millis(15)).await;
 		env_tx.send_replace(1);
 		task::yield_now().await;
@@ -13049,6 +13028,7 @@ mod tests {
 			true,
 			omp_docserver::NativeLspOptions { enabled: true, lazy: true },
 			None,
+			sf!("test-build"),
 		)
 		.await
 		.expect("spawn document authority");
@@ -13071,15 +13051,20 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn stale_document_authority_is_joined_without_replacement() {
+	async fn new_build_attach_waits_for_stale_docserver_authority_to_drain() {
 		let root = tempfile::tempdir().expect("document workspace");
 		let state = tempfile::tempdir().expect("document socket directory");
 		let socket = state.path().join("document.sock");
+		let old_config = ServerConfig::new(root.path())
+			.expect("old document config")
+			.with_server_build("old-build");
+		assert_eq!(old_config.server_build().as_str(), "old-build");
+
 		let shutdown = CancellationToken::new();
 		let serve_shutdown = shutdown.clone();
 		let serve_root = root.path().to_path_buf();
 		let serve_socket = socket.clone();
-		let task = tokio::spawn(async move {
+		let old_task = tokio::spawn(async move {
 			omp_docserver::daemon::serve(
 				serve_root,
 				daemon::Transport::Socket(serve_socket),
@@ -13088,7 +13073,7 @@ mod tests {
 					lsp:              omp_docserver::NativeLspOptions { enabled: false, lazy: true },
 					user_config_root: None,
 					shutdown:         Some(serve_shutdown),
-					server_build:     sf!("stale-build"),
+					server_build:     old_config.server_build().clone(),
 					connections:      None,
 				},
 			)
@@ -13109,18 +13094,12 @@ mod tests {
 		.await
 		.expect("stale document authority did not become ready");
 
-		assert!(matches!(
-			connect_or_start_docserver(
-				root.path(),
-				&socket,
-				None,
-				true,
-				omp_docserver::NativeLspOptions { enabled: false, lazy: true },
-				None,
-			)
-			.await,
-			Err(EnvdError::DocumentAuthorityHeld)
-		));
+		let drain = shutdown.clone();
+		tokio::spawn(async move {
+			time::sleep(Duration::from_millis(100)).await;
+			drain.cancel();
+		});
+		let started = Instant::now();
 		let (documents, authority) = connect_or_start_docserver(
 			root.path(),
 			&socket,
@@ -13128,18 +13107,107 @@ mod tests {
 			false,
 			omp_docserver::NativeLspOptions { enabled: false, lazy: true },
 			None,
+			sf!("new-build"),
 		)
 		.await
-		.expect("join stale document authority");
-		assert_eq!(documents.hello().server_build.as_str(), "stale-build");
-		assert!(authority.is_none(), "joined authority was incorrectly claimed");
+		.expect("new build takes document authority after stale drain");
+		assert!(started.elapsed() < Duration::from_secs(5));
+		assert_eq!(documents.hello().server_build.as_str(), "new-build");
+		assert!(authority.is_some(), "new build did not claim document authority");
 
-		drop(documents);
-		shutdown.cancel();
-		task
+		old_task
 			.await
 			.expect("stale authority task")
 			.expect("stale authority shutdown");
+		drop(documents);
+		drop(authority);
+	}
+
+	#[tokio::test]
+	async fn document_authority_collision_retries_until_holder_releases() {
+		let root = tempfile::tempdir().expect("document workspace");
+		let state = tempfile::tempdir().expect("document socket directory");
+		let socket = state.path().join("document.sock");
+		let old_config = ServerConfig::new(root.path())
+			.expect("old document config")
+			.with_server_build("old-build");
+		let old_authority = old_config.try_lock_authority().expect("old authority");
+		tokio::spawn(async move {
+			time::sleep(Duration::from_millis(100)).await;
+			drop(old_authority);
+		});
+
+		let (documents, authority) = connect_or_start_docserver(
+			root.path(),
+			&socket,
+			None,
+			false,
+			omp_docserver::NativeLspOptions { enabled: false, lazy: true },
+			None,
+			sf!("new-build"),
+		)
+		.await
+		.expect("new document authority starts after old lock releases");
+		assert_eq!(documents.hello().server_build.as_str(), "new-build");
+		assert!(authority.is_some());
+		drop(documents);
+		drop(authority);
+	}
+
+	#[tokio::test]
+	async fn stale_daemon_does_not_rehost_after_drain() {
+		let root = tempfile::tempdir().expect("document workspace");
+		let state = tempfile::tempdir().expect("daemon state");
+		crate::atomic_replace(&crate::launcher_build_path(state.path()), "new-build")
+			.expect("publish replacement build");
+
+		let old_config = ServerConfig::new(root.path())
+			.expect("old document config")
+			.with_server_build("old-build");
+		let old_authority = old_config.try_lock_authority().expect("old authority");
+		let socket = state.path().join("document.sock");
+		let rehosted = rehost_document_authority(
+			root.path(),
+			state.path(),
+			&socket,
+			None,
+			omp_docserver::NativeLspOptions { enabled: false, lazy: true },
+			None,
+			old_config.server_build().clone(),
+		)
+		.await
+		.expect("stale rehost check");
+		assert!(rehosted.is_none(), "stale daemon rehosted document authority");
+		assert!(
+			UnixStream::connect(&socket).await.is_err(),
+			"stale daemon published a document socket"
+		);
+
+		let (env_tx, env_rx) = watch::channel(1);
+		let (_docs_tx, docs_rx) = watch::channel(1);
+		let idle = tokio::spawn(wait_idle(
+			env_rx,
+			docs_rx,
+			1,
+			Duration::from_secs(60),
+			state.path().to_path_buf(),
+			old_config.server_build().clone(),
+		));
+		time::sleep(Duration::from_millis(75)).await;
+		assert!(!idle.is_finished(), "stale daemon shut down before its client drained");
+		env_tx.send_replace(0);
+		time::timeout(Duration::from_secs(1), idle)
+			.await
+			.expect("stale daemon did not shut down after its last client drained")
+			.expect("idle task");
+
+		drop(old_authority);
+		let new_config = ServerConfig::new(root.path())
+			.expect("new document config")
+			.with_server_build("new-build");
+		let _new_authority = new_config
+			.try_lock_authority()
+			.expect("stale daemon rehosted document authority after drain");
 	}
 	#[cfg(target_os = "macos")]
 	#[tokio::test]
@@ -13161,7 +13229,7 @@ mod tests {
 					sf!("test-session"),
 					1,
 				),
-				crate::TEST_SETTINGS_CATALOG,
+				&Ctx::new(),
 				RegistryBridges::default(),
 			)
 			.await
@@ -13202,7 +13270,7 @@ mod tests {
 			request
 				.respond(ApprovalDecision {
 					approved:   true,
-					scope:      sf!("once"),
+					scope:      ApprovalScope::Once,
 					source:     ApprovalSource::User,
 					decided_by: Some(sf!("test approver")),
 					reason:     None,

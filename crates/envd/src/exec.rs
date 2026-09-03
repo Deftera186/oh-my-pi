@@ -22,7 +22,8 @@ use bytes::{Buf as _, Bytes, BytesMut};
 use flume::Receiver;
 use futures::future::try_join_all;
 use nix::errno::Errno;
-use omp_agent::{ApprovalRoute, ApprovalSpec, TicketState};
+use omp_agent::{ApprovalRoute, ApprovalScope, ApprovalSpec, TicketState};
+use omp_cache::github_cache::GithubCache;
 use omp_core::{Hash32, Str, sf};
 use omp_proto::{
 	env::{
@@ -48,7 +49,6 @@ use omp_shell_engine::{
 	processes::{ProcessSignal, signal_process_group},
 	variables::ShellValueUnsetType,
 };
-use omp_storage::github_cache::GithubCache;
 use parking_lot::Mutex;
 use prost::Message as _;
 use regex::bytes::Regex;
@@ -591,7 +591,7 @@ impl ExecHost {
 			&& ticket
 				.decision
 				.as_ref()
-				.is_some_and(|decision| decision.approved && decision.scope == "once")
+				.is_some_and(|decision| decision.approved && decision.scope == ApprovalScope::Once)
 			&& ticket
 				.reasons
 				.iter()
@@ -696,7 +696,7 @@ impl ExecHost {
 			.do_not_inherit_env(true)
 			.builtins(omp_shell_engine::builtins::default_builtins());
 		if let Some(host) = self.inner.devices.lock().clone() {
-			builder = builder.builtin("dyn", crate::devices_host::registration(host));
+			builder = builder.builtin("dyn", omp_shell_builtins::dyn_builtin(host));
 		}
 		for (name, value) in &variables {
 			let Some(name) = name.to_str() else { continue };

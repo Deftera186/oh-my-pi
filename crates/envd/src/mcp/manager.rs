@@ -24,7 +24,8 @@ use omp_inference::{
 };
 use omp_oauth::{AuthChallenge, ChallengeKind, discover_auth_challenge};
 use omp_proto::env::v1 as pb;
-use omp_tool::{LeafOwner, LeafVersion};
+use omp_shell_builtins::{DynDevice, DynFault, DynFuture, DynHost, DynOutput, DynSchema};
+use omp_tool::{LeafOwner, LeafVersion, PublishedLeaf};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -2352,6 +2353,154 @@ impl McpManager {
 
 	fn next_generation(&self) -> u64 {
 		self.generation.fetch_add(1, atomic::Ordering::Relaxed)
+	}
+}
+
+impl DynHost for McpManager {
+	fn list(&self) -> DynFuture<'_, Vec<DynDevice>> {
+		let snapshot = self.catalog_snapshot();
+		let devices = snapshot
+			.leaves
+			.iter()
+			.filter_map(mcp_dyn_device)
+			.collect::<Vec<_>>();
+		Box::pin(async move { Ok(devices) })
+	}
+
+	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema> {
+		let snapshot = self.catalog_snapshot();
+		let schema = snapshot
+			.leaves
+			.iter()
+			.find_map(|leaf| mcp_dyn_schema(leaf, name));
+		let name = Str::new(name);
+		Box::pin(async move {
+			schema.ok_or_else(|| DynFault::new(format!("unknown MCP device `{name}`")))
+		})
+	}
+
+	fn call(&self, name: &str, args: Value) -> DynFuture<'_, DynOutput> {
+		let snapshot = self.catalog_snapshot();
+		let target = snapshot
+			.leaves
+			.iter()
+			.find_map(|leaf| mcp_dyn_target(leaf, name));
+		let Some((server, tool)) = target else {
+			let name = Str::new(name);
+			return Box::pin(
+				async move { Err(DynFault::new(format!("unknown MCP device `{name}`"))) },
+			);
+		};
+		let request = pb::McpInvokeRequest {
+			server:         Some(pb::McpServerRef {
+				name:             server.to_string(),
+				definition_epoch: self.service.definition_epoch(),
+			}),
+			tool:           tool.to_string(),
+			arguments_json: match serde_json::to_vec(&args) {
+				Ok(arguments) => Bytes::from(arguments),
+				Err(_) => {
+					return Box::pin(async {
+						Err(DynFault::new("failed to encode MCP device arguments"))
+					});
+				},
+			},
+			timeout_ms:     0,
+			max_bytes:      8 * 1024 * 1024,
+			wire_revision:  omp_proto::SCHEMA_REV,
+		};
+		let service = Arc::clone(&self.service);
+		Box::pin(async move {
+			let result = service
+				.invoke(request, CancellationToken::new())
+				.await
+				.map_err(|error| DynFault::new(format!("MCP device invocation failed: {error}")))?;
+			mcp_dyn_output(&result)
+		})
+	}
+}
+
+fn mcp_dyn_device(leaf: &PublishedLeaf<McpLeaf>) -> Option<DynDevice> {
+	let (name, definition) = mcp_dyn_definition(leaf)?;
+	Some(DynDevice {
+		name,
+		description: definition
+			.get("description")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.or_else(|| leaf.value.documentation.clone()),
+	})
+}
+
+fn mcp_dyn_schema(leaf: &PublishedLeaf<McpLeaf>, requested: &str) -> Option<DynSchema> {
+	let (name, definition) = mcp_dyn_definition(leaf)?;
+	if name != requested {
+		return None;
+	}
+	let description = definition
+		.get("description")
+		.and_then(Value::as_str)
+		.map(Str::new)
+		.or_else(|| leaf.value.documentation.clone());
+	let schema = definition
+		.get("inputSchema")
+		.cloned()
+		.unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+	Some(DynSchema { name, description, schema })
+}
+
+fn mcp_dyn_target(leaf: &PublishedLeaf<McpLeaf>, requested: &str) -> Option<(Str, Str)> {
+	let (name, definition) = mcp_dyn_definition(leaf)?;
+	if name != requested {
+		return None;
+	}
+	Some((leaf.value.server.clone(), Str::new(definition.get("name")?.as_str()?)))
+}
+
+fn mcp_dyn_definition(leaf: &PublishedLeaf<McpLeaf>) -> Option<(Str, Value)> {
+	if !leaf.mounted || leaf.value.kind != "tool" {
+		return None;
+	}
+	let definition: Value = serde_json::from_slice(&leaf.value.definition_json).ok()?;
+	let tool = definition.get("name")?.as_str()?;
+	Some((Str::new(format!("{}/{tool}", leaf.value.server)), definition))
+}
+
+fn mcp_dyn_output(result: &pb::McpInvokeResult) -> Result<DynOutput, DynFault> {
+	let value = if result.structured_content_json.is_empty() {
+		serde_json::from_slice::<Value>(&result.content_json)
+			.map_err(|_| DynFault::new("MCP device returned malformed JSON"))?
+	} else {
+		serde_json::from_slice::<Value>(&result.structured_content_json)
+			.map_err(|_| DynFault::new("MCP device returned malformed structured JSON"))?
+	};
+	let output = mcp_dyn_project(value);
+	if result.is_error {
+		let message = match output {
+			DynOutput::Text(text) => text,
+			DynOutput::Json(value) => Str::new(value.to_string()),
+		};
+		Err(DynFault::new(message))
+	} else {
+		Ok(output)
+	}
+}
+
+fn mcp_dyn_project(value: Value) -> DynOutput {
+	let Some(content) = value.as_array() else {
+		return DynOutput::Json(value);
+	};
+	let text = content
+		.iter()
+		.map(|item| {
+			(item.get("type").and_then(Value::as_str) == Some("text"))
+				.then(|| item.get("text").and_then(Value::as_str))
+				.flatten()
+		})
+		.collect::<Option<Vec<_>>>();
+	match text {
+		Some(parts) => DynOutput::Text(Str::new(parts.join("\n"))),
+		None => DynOutput::Json(value),
 	}
 }
 

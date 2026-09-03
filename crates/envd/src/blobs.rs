@@ -9,11 +9,8 @@ use std::{
 
 use bytes::Bytes;
 use omp_core::{Hash32, Str, sf};
+use omp_journal::blob::{self, BlobRef, BlobStage, BlobStore};
 use omp_proto::blob::v1 as blob_pb;
-use omp_storage::{
-	blob,
-	blob::{BlobRef, BlobStage, BlobStore},
-};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;

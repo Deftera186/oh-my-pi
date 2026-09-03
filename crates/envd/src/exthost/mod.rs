@@ -6,9 +6,9 @@
 
 pub mod backends;
 pub mod cancel;
-pub mod context;
 pub mod control;
 pub mod dispatch;
+pub mod extensions;
 pub mod lifecycle;
 pub mod params;
 pub mod presentation;
@@ -19,7 +19,6 @@ pub use cancel::{
 	CANCEL_GRACE, CancelStage, CancellationError, CancellationJournal, CancellationLadder,
 	CancellationOutcome, MAX_KILL_ESCALATIONS_PER_SESSION,
 };
-pub use context::LiveContextControlOwner;
 pub use control::{
 	ControlAuthority, ControlAuthorityFactory, ControlCompositionError, EnvdControlAuthorities,
 	ExternalControlAuthorities, FixedControlAuthorityFactory, HostControlAuthorityFactory,
@@ -29,20 +28,21 @@ pub use control::{
 pub use dispatch::{
 	CallbackConcurrency, DispatchError, DispatchPending, DispatchRequest, DispatchRouter,
 	EventDeadline, PromptContributionProvider, PromptContributionRecord, PromptDispatchError,
-	PromptPullContext, PromptSlotBinding, REGIME_SUBMISSION_TIMEOUT, RegimeDispatch,
-	RegimeDispatchError, UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry,
+	PromptPullContext, PromptSlotBinding, UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry,
 	UiCompletionRosterEntry, UiDispatchError, UiRendererRosterEntry, UiRoster, UiRosterConflict,
-	UiShortcutRosterEntry, decode_regime_draft, decode_ui_dispatch_result,
-	shortcut_dispatch_succeeded,
+	UiShortcutRosterEntry, decode_ui_dispatch_result, shortcut_dispatch_succeeded,
+};
+pub use extensions::{
+	DEFAULT_EXTENSION_HOOK_TIMEOUT, PyComponent, PyDirector, PyExtensionError,
+	register_python_extensions,
 };
 pub use lifecycle::{
 	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,
 	AvailabilityBatch, AvailabilitySink, ControlLifecycleHost, DeclarationDrift, DeclarationSet,
 	ExtensionManifest, GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost,
-	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegimeDeclarationTable,
-	RegimeManifestError, RegistryAvailabilitySink, RestartReason, ToolDeclarationKey,
-	UiRegistrationError, VerifiedMarkdownTransformer, VerifiedRendererDeclaration, VerifiedUiRoster,
-	validate_regime_manifests, verify_ui_registration,
+	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegistryAvailabilitySink,
+	RestartReason, ToolDeclarationKey, UiRegistrationError, VerifiedMarkdownTransformer,
+	VerifiedRendererDeclaration, VerifiedUiRoster, verify_ui_registration,
 };
 pub(crate) use lifecycle::{notify_extension_load, notify_extension_unload, notify_host_reconnect};
 pub use params::{
@@ -72,7 +72,6 @@ pub use spawn::{
 };
 
 pub use crate::worker::{
-	ControlHostStartError, ExtHostSupervisor, ExtensionRegimeResolver,
-	ExternalControlAuthorityBinding, ExternalDomainControlBinding, ExternalDomainControlFactories,
-	HostKey,
+	ControlHostStartError, ExtHostSupervisor, ExternalControlAuthorityBinding,
+	ExternalDomainControlBinding, ExternalDomainControlFactories, HostKey,
 };

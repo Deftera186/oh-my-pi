@@ -27,10 +27,6 @@ use omp_proto::document::v1::{
 	self as pb, commit_transaction_response, document_mutation, document_target,
 	read_document_response, read_selection, text_mutation,
 };
-use omp_storage::{
-	gc::{ArtifactCatalog, ArtifactLifetime},
-	transcript::SessionId,
-};
 use omp_tool::BlobRef;
 use omp_tools::{
 	edit::{
@@ -221,21 +217,13 @@ impl EditSnapshotStore for BlobHost {
 /// Session-bound blob and artifact adoption authority for read-family spills.
 #[derive(Clone)]
 pub(crate) struct SessionReadBlobs {
-	blobs:   BlobHost,
-	catalog: Arc<Mutex<ArtifactCatalog>>,
-	session: SessionId,
+	blobs: BlobHost,
 }
 
 impl SessionReadBlobs {
-	/// Opens the artifact catalog for one stable active session.
-	pub(crate) fn open(blobs: BlobHost, session_id: &str) -> Result<Self, Str> {
-		let catalog =
-			ArtifactCatalog::open(blobs.store()).map_err(|error| Str::from(error.to_string()))?;
-		Ok(Self {
-			blobs,
-			catalog: Arc::new(Mutex::new(catalog)),
-			session: SessionId(Str::new(session_id)),
-		})
+	/// Binds read-family spills to the journal blob store.
+	pub(crate) fn open(blobs: BlobHost, _session_id: &str) -> Result<Self, Str> {
+		Ok(Self { blobs })
 	}
 }
 
@@ -267,18 +255,14 @@ impl ReadBlobs for SessionReadBlobs {
 				.blobs
 				.put(&bytes)
 				.map_err(|error| ReadFault::Blob { message: Str::from(error.to_string()) })?;
-			let record = self
-				.catalog
-				.lock()
-				.adopt(&self.session, id.hash, Some(id.size), ArtifactLifetime::Session)
-				.map_err(|error| ReadFault::Blob { message: Str::from(error.to_string()) })?;
+			let digest = hex::encode_n(&id.hash);
 			Ok(StoredArtifact {
 				blob: BlobRef {
 					hash: Str::from(hex::encode_n(&id.hash).as_str()),
 					media_type,
 					byte_len: id.size,
 				},
-				uri:  Str::from(format!("artifact://{}", record.ordinal)),
+				uri:  Str::from(format!("artifact://sha256/{digest}")),
 			})
 		})();
 		ready(result)

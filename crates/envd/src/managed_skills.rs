@@ -13,7 +13,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use omp_agent::{GateError, HookEvent, HookGate};
+use omp_agent::{GateError, HookEvent, HookGate, HookPatch};
 use omp_core::Str;
 use omp_proto::toolhost::v1::HookEventId;
 use omp_tools::manage_skill::{
@@ -51,7 +51,7 @@ impl HookEvent for ManagedResourcesChangedEvent<'_> {
 		);
 	}
 
-	fn apply(&mut self, _: &omp_agent::HookPatch) -> Result<(), GateError> {
+	fn apply(&mut self, _: &HookPatch) -> Result<(), GateError> {
 		Ok(())
 	}
 }

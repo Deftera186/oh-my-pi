@@ -1,16 +1,12 @@
 //! Proves normal server construction installs live production CONTROL owners.
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
+use omp_con::Ctx;
 use omp_core::{Principal, sf};
 use omp_envd::{
 	EnvServer, RegistryBridges, exthost::control::ControlConnectionIdentity, worker::ExtHostConfig,
 };
 use omp_tool::Registry;
-
-const CATALOG: omp_settings::SettingsCatalog = omp_settings::SettingsCatalog::new(&[
-	&omp_settings::SETTINGS_CONTRIBUTION,
-	&omp_envd::SETTINGS_CONTRIBUTION,
-]);
 
 fn identity(principal: Principal) -> Arc<ControlConnectionIdentity> {
 	Arc::new(ControlConnectionIdentity {
@@ -42,7 +38,7 @@ async fn normal_server_refuses_control_identity_without_admitted_manifest() {
 		state.path(),
 		Registry::new(),
 		config,
-		CATALOG,
+		&Ctx::new(),
 		RegistryBridges::default(),
 	)
 	.await

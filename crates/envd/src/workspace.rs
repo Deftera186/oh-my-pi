@@ -20,67 +20,13 @@ use omp_walker::{
 	EntryMeta, FileCandidate, WalkDecision, WalkError, WalkOutcome, WalkRequest, WalkStatus,
 };
 use thiserror::Error;
-
-/// Environment-owned workspace-root synchronization failure.
-#[derive(Debug, Error)]
-pub enum WorkspaceRootSyncError {
-	/// The Environment root snapshot request failed.
-	#[error(transparent)]
-	Environment(#[from] omp_env::ClientError),
-	/// An Environment grant contained a non-file or malformed canonical URI.
-	#[error("Environment returned an invalid canonical workspace root")]
-	InvalidRoot,
-	/// The root change could not be committed to the session journal.
-	#[error(transparent)]
-	Journal(#[from] omp_agent::JournalError),
-}
-
-/// Reconciles durable secondary roots with the canonical Environment grant
-/// snapshot in one atomic journal append.
-///
-/// The immutable primary root is never recorded as an add/remove mutation.
-pub async fn sync_session_roots(
-	environment: &omp_env::EnvClient,
-	journal: &mut omp_agent::Journal,
-	primary: &Path,
-	ts: u64,
-) -> Result<Vec<u64>, WorkspaceRootSyncError> {
-	let snapshot = environment
-		.workspace_roots(v1::WorkspaceRootSetRequest { wire_revision: 1 })
-		.await?;
-	let mut desired = Vec::with_capacity(snapshot.granted.len());
-	for grant in snapshot.granted {
-		let uri =
-			Url::parse(&grant.canonical_uri).map_err(|_| WorkspaceRootSyncError::InvalidRoot)?;
-		let path = uri
-			.to_file_path()
-			.map_err(|()| WorkspaceRootSyncError::InvalidRoot)?;
-		if path != primary && !desired.contains(&path) {
-			desired.push(path);
-		}
-	}
-	let current = journal.workspace_roots(primary)?;
-	let remove = current
-		.secondary()
-		.iter()
-		.filter(|root| !desired.contains(root))
-		.cloned()
-		.collect::<Vec<_>>();
-	let add = desired
-		.into_iter()
-		.filter(|root| !current.secondary().contains(root))
-		.collect::<Vec<_>>();
-	Ok(journal.replace_workspace_dirs(ts, remove, add)?)
-}
 use tokio_util::sync::CancellationToken;
 
 mod operations;
 
 use std::{fs, num, thread};
 
-use omp_proto::env::v1;
 pub use operations::{WorkspaceOperationError, WorkspaceOperations, WorktreeMerge};
-use url::Url;
 
 const SEARCH_CHANNEL_DEPTH: usize = 16;
 const SEARCH_POLL_INTERVAL: Duration = Duration::from_millis(10);

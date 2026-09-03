@@ -19,9 +19,9 @@ use http::{
 	HeaderMap, HeaderName, HeaderValue, StatusCode,
 	header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
 };
+use omp_cache::document_cache::{DocumentCache, DocumentCacheKey};
 use omp_core::{Hash32, Str, dirs::home_dir, sf, shorten_home_path};
 use omp_hashline::RevisionToken;
-use omp_storage::document_cache::{DocumentCache, DocumentCacheKey};
 use omp_tools::read::{
 	DirectoryEntry, DirectorySource, Fault, ReadLease, ReadSources, SNAPSHOT_MAX_BYTES,
 	SnapshotRecord, SourceKind, SourceStat,
@@ -54,7 +54,7 @@ static READ_CLIENT: LazyLock<omp_http::Client> = LazyLock::new(|| {
 		.into()
 });
 
-use omp_storage::atomic;
+use omp_cache::atomic;
 use reqwest::redirect;
 use thiserror::Error;
 use tokio::task;
@@ -101,7 +101,7 @@ pub fn commit_document_media(
 	fs::create_dir(&stage)?;
 	let committed = (|| {
 		for attachment in &conversion.attachments {
-			omp_storage::atomic::commit(
+			omp_cache::atomic::commit(
 				&stage.join(attachment.name.as_str()),
 				&attachment.bytes,
 				|| true,
@@ -557,14 +557,12 @@ impl HttpClient for ReadSourceAdapter {
 		let result = task::spawn_blocking(move || {
 			let key = document_cache_key(request)?;
 			let entry = cache.get(key, SystemTime::now())?;
-			Ok::<_, omp_storage::document_cache::DocumentCacheError>(entry.map(|entry| {
-				CachedDocument {
-					content:  entry.content,
-					location: DocumentCacheLocation {
-						key:  entry.metadata.key.digest(),
-						blob: entry.metadata.blob,
-					},
-				}
+			Ok::<_, omp_cache::document_cache::DocumentCacheError>(entry.map(|entry| CachedDocument {
+				content:  entry.content,
+				location: DocumentCacheLocation {
+					key:  entry.metadata.key.digest(),
+					blob: entry.metadata.blob,
+				},
 			}))
 		})
 		.await;
@@ -591,7 +589,7 @@ impl HttpClient for ReadSourceAdapter {
 		let result = task::spawn_blocking(move || {
 			let key = document_cache_key(request)?;
 			let metadata = cache.put(key, &published, SystemTime::now(), None)?;
-			Ok::<_, omp_storage::document_cache::DocumentCacheError>(DocumentCacheLocation {
+			Ok::<_, omp_cache::document_cache::DocumentCacheError>(DocumentCacheLocation {
 				key:  metadata.key.digest(),
 				blob: metadata.blob,
 			})
@@ -613,7 +611,7 @@ impl HttpClient for ReadSourceAdapter {
 
 fn document_cache_key(
 	request: DocumentCacheRequest,
-) -> Result<DocumentCacheKey, omp_storage::document_cache::DocumentCacheError> {
+) -> Result<DocumentCacheKey, omp_cache::document_cache::DocumentCacheError> {
 	DocumentCacheKey::derive(
 		request.source_digest,
 		request.converter,

@@ -2,72 +2,9 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use omp_con::{Ctx, Kv, Value};
 use omp_core::Str;
-use omp_settings::{
-	Condition, FieldDescriptor, OptionProvider, SettingKind, SettingOption, SettingScope,
-	SettingsDomain, ValidationError,
-};
 use serde::{Deserialize, Serialize};
-
-const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
-const MODE_VALUES: &[&str] = &["off", "read-only", "workspace-write"];
-const ENV_INHERIT_VALUES: &[&str] = &["all", "core", "none"];
-const READ_MODE_VALUES: &[&str] = &["host", "minimal", "scoped"];
-const NETWORK_MODE_VALUES: &[&str] = &["disabled", "open", "scoped"];
-const ENV_INHERIT_OPTIONS: &[SettingOption] = &[
-	SettingOption {
-		value:       "all",
-		label:       "All",
-		description: Some("Start children with the complete inherited environment."),
-	},
-	SettingOption {
-		value:       "core",
-		label:       "Core",
-		description: Some("Start children with only platform-core environment variables."),
-	},
-	SettingOption {
-		value:       "none",
-		label:       "None",
-		description: Some("Start children with an empty environment."),
-	},
-];
-const MODE_OPTIONS: &[SettingOption] = &[
-	SettingOption {
-		value:       "off",
-		label:       "Off",
-		description: Some("Do not sandbox agent commands."),
-	},
-	SettingOption {
-		value:       "read-only",
-		label:       "Read only",
-		description: Some("Commands cannot write anywhere."),
-	},
-	SettingOption {
-		value:       "workspace-write",
-		label:       "Workspace write",
-		description: Some(
-			"Commands may write only to the workspace, /tmp, $TMPDIR, and extra roots.",
-		),
-	},
-];
-const UNSCOPED_WRITES_VALUES: &[&str] = &["deny", "overlay"];
-const UNSCOPED_WRITES_OPTIONS: &[SettingOption] = &[
-	SettingOption {
-		value:       "deny",
-		label:       "Deny",
-		description: Some("Writes outside configured roots fail."),
-	},
-	SettingOption {
-		value:       "overlay",
-		label:       "Ephemeral overlay",
-		description: Some(
-			"Writes outside configured roots land in an ephemeral layer visible only inside the \
-			 sandbox; hosts without overlay support deny them.",
-		),
-	},
-];
-const WORKSPACE_WRITE_ONLY: Option<Condition> =
-	Some(Condition { field: "sandbox.mode", equals: "workspace-write" });
 
 /// Exec sandbox posture selected by the user.
 #[derive(
@@ -82,6 +19,7 @@ const WORKSPACE_WRITE_ONLY: Option<Condition> =
 	strum::Display,
 	strum::EnumString,
 	strum::IntoStaticStr,
+	strum::VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
@@ -109,6 +47,7 @@ pub enum ExecSandboxMode {
 	strum::Display,
 	strum::EnumString,
 	strum::IntoStaticStr,
+	strum::VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
@@ -132,6 +71,7 @@ pub enum UnscopedWrites {
 	strum::Display,
 	strum::EnumString,
 	strum::IntoStaticStr,
+	strum::VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
@@ -157,6 +97,7 @@ pub enum EnvironmentInheritance {
 	strum::Display,
 	strum::EnumString,
 	strum::IntoStaticStr,
+	strum::VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
@@ -183,6 +124,7 @@ pub enum ReadMode {
 	strum::Display,
 	strum::EnumString,
 	strum::IntoStaticStr,
+	strum::VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
@@ -194,6 +136,127 @@ pub enum SandboxNetworkMode {
 	Open,
 	/// Permit only policy-authorized egress through the sandbox broker.
 	Scoped,
+}
+
+omp_con::con_enum!(ExecSandboxMode);
+omp_con::con_enum!(UnscopedWrites);
+omp_con::con_enum!(EnvironmentInheritance);
+omp_con::con_enum!(ReadMode);
+omp_con::con_enum!(SandboxNetworkMode);
+
+omp_con::var! {
+	/// Choose the filesystem sandbox posture for agent commands.
+	pub static SV_SANDBOX_MODE = sv_sandbox_mode: ExecSandboxMode {
+		default: ExecSandboxMode::Off,
+		flags: archive | inherit,
+	};
+	/// Choose disabled, open, or scoped network access.
+	pub static SV_SANDBOX_NETWORK_MODE = sv_sandbox_network_mode: SandboxNetworkMode {
+		default: SandboxNetworkMode::Disabled,
+		flags: archive | inherit,
+	};
+	/// Exact or leading wildcard domains allowed by scoped networking.
+	pub static SV_SANDBOX_ALLOW_DOMAINS = sv_sandbox_allow_domains: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_domains(values),
+		flags: archive | inherit,
+	};
+	/// Domains denied before scoped allow rules.
+	pub static SV_SANDBOX_DENY_DOMAINS = sv_sandbox_deny_domains: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_domains(values),
+		flags: archive | inherit,
+	};
+	/// TCP ports allowed by scoped networking.
+	pub static SV_SANDBOX_ALLOW_PORTS = sv_sandbox_allow_ports: Vec<u16> {
+		default: vec![80, 443],
+		validate: |_ctx, values| validate_ports(values),
+		flags: archive | inherit,
+	};
+	/// Allow scoped networking to loopback addresses.
+	pub static SV_SANDBOX_ALLOW_LOCALHOST = sv_sandbox_allow_localhost: bool {
+		default: false,
+		flags: archive | inherit,
+	};
+	/// Existing absolute Unix-domain socket paths allowed independently of IP networking.
+	pub static SV_SANDBOX_ALLOW_UNIX_SOCKETS = sv_sandbox_allow_unix_sockets: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_sockets(values),
+		flags: archive | inherit,
+	};
+	/// Absolute paths that workspace-write mode may modify.
+	pub static SV_SANDBOX_WRITABLE_ROOTS = sv_sandbox_writable_roots: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_absolute_paths(values),
+		flags: archive | inherit,
+	};
+	/// Choose how workspace-write handles writes outside configured roots.
+	pub static SV_SANDBOX_UNSCOPED_WRITES = sv_sandbox_unscoped_writes: UnscopedWrites {
+		default: UnscopedWrites::Deny,
+		flags: archive | inherit,
+	};
+	/// Environment variable name globs withheld from external commands.
+	pub static SV_SANDBOX_ENV_DENY = sv_sandbox_env_deny: Vec<Str> {
+		default: default_env_deny(),
+		validate: |_ctx, values| validate_env_patterns(values),
+		flags: archive | inherit,
+	};
+	/// Choose the base environment inherited by child processes.
+	pub static SV_SANDBOX_ENV_INHERIT = sv_sandbox_env_inherit: EnvironmentInheritance {
+		default: EnvironmentInheritance::All,
+		flags: archive | inherit,
+	};
+	/// Environment variable name globs retained before deny filtering.
+	pub static SV_SANDBOX_ENV_INCLUDE_ONLY = sv_sandbox_env_include_only: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_env_patterns(values),
+		flags: archive | inherit,
+	};
+	/// Explicit child environment values applied after filtering.
+	pub static SV_SANDBOX_ENV_SET = sv_sandbox_env_set: Kv {
+		default: Kv::new(),
+		validate: |_ctx, values| validate_string_map(values),
+		flags: archive | inherit,
+	};
+	/// Do not grant workspace-write access to the platform temporary directory.
+	pub static SV_SANDBOX_EXCLUDE_TMPDIR = sv_sandbox_exclude_tmpdir: bool {
+		default: false,
+		flags: archive | inherit,
+	};
+	/// Do not grant workspace-write access to `/tmp`.
+	pub static SV_SANDBOX_EXCLUDE_SLASH_TMP = sv_sandbox_exclude_slash_tmp: bool {
+		default: false,
+		flags: archive | inherit,
+	};
+	/// Additional absolute paths made unreadable by the kernel sandbox.
+	pub static SV_SANDBOX_READ_DENY = sv_sandbox_read_deny: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_absolute_paths(values),
+		flags: archive | inherit,
+	};
+	/// Choose whether reads use host, workspace-only, or scoped roots.
+	pub static SV_SANDBOX_READ_MODE = sv_sandbox_read_mode: ReadMode {
+		default: ReadMode::Host,
+		flags: archive | inherit,
+	};
+	/// Absolute paths readable in scoped mode.
+	pub static SV_SANDBOX_READABLE_ROOTS = sv_sandbox_readable_roots: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_absolute_paths(values),
+		flags: archive | inherit,
+	};
+	/// Glob patterns denied when supported by the selected sandbox backend.
+	pub static SV_SANDBOX_READ_DENY_GLOBS = sv_sandbox_read_deny_globs: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_path_globs(values),
+		flags: archive | inherit,
+	};
+	/// Additional absolute paths protected from writes.
+	pub static SV_SANDBOX_WRITE_DENY = sv_sandbox_write_deny: Vec<Str> {
+		default: Vec::new(),
+		validate: |_ctx, values| validate_absolute_paths(values),
+		flags: archive | inherit,
+	};
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -284,247 +347,115 @@ impl SandboxSettings {
 	}
 }
 
-impl SettingsDomain for SandboxSettings {
-	const DOMAIN: &'static str = "sandbox";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		field(
-			"sandbox.mode",
-			"Command Sandbox",
-			"Choose the filesystem sandbox posture for agent commands.",
-			SettingKind::Enum(MODE_VALUES),
-			10,
-			Some(OptionProvider::Static(MODE_OPTIONS)),
-			None,
-		),
-		field(
-			"sandbox.network_mode",
-			"Sandbox Network Access",
-			"Choose disabled, open, or scoped network access.",
-			SettingKind::Enum(NETWORK_MODE_VALUES),
-			20,
-			None,
-			None,
-		),
-		field(
-			"sandbox.allow_domains",
-			"Allowed Domains",
-			"Exact or leading wildcard domains allowed by scoped networking.",
-			SettingKind::Array,
-			21,
-			None,
-			None,
-		),
-		field(
-			"sandbox.deny_domains",
-			"Denied Domains",
-			"Domains denied before scoped allow rules.",
-			SettingKind::Array,
-			22,
-			None,
-			None,
-		),
-		field(
-			"sandbox.allow_ports",
-			"Allowed Network Ports",
-			"TCP ports allowed by scoped networking.",
-			SettingKind::Array,
-			23,
-			None,
-			None,
-		),
-		field(
-			"sandbox.allow_localhost",
-			"Allow Localhost",
-			"Allow scoped networking to loopback addresses.",
-			SettingKind::Boolean,
-			24,
-			None,
-			None,
-		),
-		field(
-			"sandbox.allow_unix_sockets",
-			"Allowed Unix Sockets",
-			"Existing absolute Unix-domain socket paths allowed independently of IP networking.",
-			SettingKind::Array,
-			25,
-			None,
-			None,
-		),
-		field(
-			"sandbox.writable_roots",
-			"Additional Writable Roots",
-			"Absolute paths that workspace-write mode may modify.",
-			SettingKind::Array,
-			30,
-			None,
-			WORKSPACE_WRITE_ONLY,
-		),
-		field(
-			"sandbox.unscoped_writes",
-			"Unscoped Writes",
-			"Choose how workspace-write handles writes outside configured roots.",
-			SettingKind::Enum(UNSCOPED_WRITES_VALUES),
-			40,
-			Some(OptionProvider::Static(UNSCOPED_WRITES_OPTIONS)),
-			WORKSPACE_WRITE_ONLY,
-		),
-		field(
-			"sandbox.env_deny",
-			"Denied Environment Variables",
-			"Environment variable name globs withheld from external commands.",
-			SettingKind::Array,
-			50,
-			None,
-			None,
-		),
-		field(
-			"sandbox.env_inherit",
-			"Inherited Environment",
-			"Choose the base environment inherited by child processes.",
-			SettingKind::Enum(ENV_INHERIT_VALUES),
-			60,
-			Some(OptionProvider::Static(ENV_INHERIT_OPTIONS)),
-			None,
-		),
-		field(
-			"sandbox.env_include_only",
-			"Included Environment Variables",
-			"Environment variable name globs retained before deny filtering.",
-			SettingKind::Array,
-			70,
-			None,
-			None,
-		),
-		field(
-			"sandbox.env_set",
-			"Set Environment Variables",
-			"Explicit child environment values applied after filtering.",
-			SettingKind::Table,
-			80,
-			None,
-			None,
-		),
-		field(
-			"sandbox.exclude_tmpdir",
-			"Exclude Platform Temporary Directory",
-			"Do not grant workspace-write access to the platform temporary directory.",
-			SettingKind::Boolean,
-			90,
-			None,
-			WORKSPACE_WRITE_ONLY,
-		),
-		field(
-			"sandbox.exclude_slash_tmp",
-			"Exclude /tmp",
-			"Do not grant workspace-write access to /tmp.",
-			SettingKind::Boolean,
-			100,
-			None,
-			WORKSPACE_WRITE_ONLY,
-		),
-		field(
-			"sandbox.read_deny",
-			"Denied Read Paths",
-			"Additional absolute paths made unreadable by the kernel sandbox.",
-			SettingKind::Array,
-			110,
-			None,
-			None,
-		),
-		field(
-			"sandbox.read_mode",
-			"Read Authority",
-			"Choose whether reads use host, workspace-only, or scoped roots.",
-			SettingKind::Enum(READ_MODE_VALUES),
-			115,
-			None,
-			None,
-		),
-		field(
-			"sandbox.readable_roots",
-			"Additional Readable Roots",
-			"Absolute paths readable in scoped mode.",
-			SettingKind::Array,
-			116,
-			None,
-			None,
-		),
-		field(
-			"sandbox.read_deny_globs",
-			"Denied Read Path Globs",
-			"Glob patterns denied when supported by the selected sandbox backend.",
-			SettingKind::Array,
-			117,
-			None,
-			None,
-		),
-		field(
-			"sandbox.write_deny",
-			"Denied Write Paths",
-			"Additional absolute paths protected from writes.",
-			SettingKind::Array,
-			120,
-			None,
-			None,
-		),
-	];
-
-	fn validate(&self) -> Result<(), ValidationError> {
-		if self
-			.writable_roots
-			.iter()
-			.chain(&self.readable_roots)
-			.any(|root| !Path::new(root.as_str()).is_absolute())
-			|| self
-				.allow_unix_sockets
-				.iter()
-				.any(|path| !is_existing_unix_socket(Path::new(path.as_str())))
-			|| self.allow_ports.contains(&0)
-			|| self
-				.allow_domains
-				.iter()
-				.chain(&self.deny_domains)
-				.any(|domain| !valid_domain_pattern(domain.as_str()))
-			|| self
-				.read_deny
-				.iter()
-				.chain(&self.write_deny)
-				.any(|path| !Path::new(path.as_str()).is_absolute())
-			|| self
-				.env_deny
-				.iter()
-				.chain(&self.env_include_only)
-				.any(|pattern| omp_sandbox::validate_env_pattern(pattern.as_str()).is_err())
-			|| self
-				.read_deny_globs
-				.iter()
-				.any(|pattern| globset::Glob::new(pattern.as_str()).is_err())
-		{
-			return Err(ValidationError::DomainInvariant { domain: Self::DOMAIN });
+impl SandboxSettings {
+	/// Resolves sandbox policy from the process control context.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			mode:               SV_SANDBOX_MODE.get(ctx),
+			network_mode:       SV_SANDBOX_NETWORK_MODE.get(ctx),
+			allow_domains:      SV_SANDBOX_ALLOW_DOMAINS.get(ctx),
+			deny_domains:       SV_SANDBOX_DENY_DOMAINS.get(ctx),
+			allow_ports:        SV_SANDBOX_ALLOW_PORTS.get(ctx),
+			allow_localhost:    SV_SANDBOX_ALLOW_LOCALHOST.get(ctx),
+			allow_unix_sockets: SV_SANDBOX_ALLOW_UNIX_SOCKETS.get(ctx),
+			writable_roots:     SV_SANDBOX_WRITABLE_ROOTS.get(ctx),
+			unscoped_writes:    SV_SANDBOX_UNSCOPED_WRITES.get(ctx),
+			env_deny:           SV_SANDBOX_ENV_DENY.get(ctx),
+			env_inherit:        SV_SANDBOX_ENV_INHERIT.get(ctx),
+			env_include_only:   SV_SANDBOX_ENV_INCLUDE_ONLY.get(ctx),
+			env_set:            SV_SANDBOX_ENV_SET
+				.get(ctx)
+				.0
+				.into_iter()
+				.filter_map(|(key, value)| Some((key, Str::new(value.as_str()?))))
+				.collect(),
+			exclude_tmpdir:     SV_SANDBOX_EXCLUDE_TMPDIR.get(ctx),
+			exclude_slash_tmp:  SV_SANDBOX_EXCLUDE_SLASH_TMP.get(ctx),
+			read_deny:          SV_SANDBOX_READ_DENY.get(ctx),
+			readable_roots:     SV_SANDBOX_READABLE_ROOTS.get(ctx),
+			read_mode:          SV_SANDBOX_READ_MODE.get(ctx),
+			read_deny_globs:    SV_SANDBOX_READ_DENY_GLOBS.get(ctx),
+			write_deny:         SV_SANDBOX_WRITE_DENY.get(ctx),
 		}
+	}
+}
+
+fn validation_error(message: &'static str) -> Str {
+	Str::new_static(message)
+}
+
+fn validate_absolute_paths(values: &[Str]) -> Result<(), Str> {
+	if values
+		.iter()
+		.all(|value| Path::new(value.as_str()).is_absolute())
+	{
+		Ok(())
+	} else {
+		Err(validation_error("paths must be absolute"))
+	}
+}
+
+fn validate_sockets(values: &[Str]) -> Result<(), Str> {
+	if values
+		.iter()
+		.all(|value| is_existing_unix_socket(Path::new(value.as_str())))
+	{
+		Ok(())
+	} else {
+		Err(validation_error("Unix socket paths must name existing sockets"))
+	}
+}
+
+fn validate_ports(values: &[u16]) -> Result<(), Str> {
+	if values.contains(&0) {
+		Err(validation_error("port zero is invalid"))
+	} else {
 		Ok(())
 	}
 }
 
-const fn field(
-	path: &'static str,
-	label: &'static str,
-	description: &'static str,
-	kind: SettingKind,
-	order: u16,
-	options: Option<OptionProvider>,
-	condition: Option<Condition>,
-) -> FieldDescriptor {
-	FieldDescriptor {
-		path,
-		label,
-		description,
-		kind,
-		scopes: PERSISTED,
-		order,
-		options,
-		condition,
-		secret: false,
+fn validate_domains(values: &[Str]) -> Result<(), Str> {
+	if values
+		.iter()
+		.all(|value| valid_domain_pattern(value.as_str()))
+	{
+		Ok(())
+	} else {
+		Err(validation_error("invalid domain pattern"))
+	}
+}
+
+fn validate_env_patterns(values: &[Str]) -> Result<(), Str> {
+	if values
+		.iter()
+		.all(|value| omp_sandbox::validate_env_pattern(value.as_str()).is_ok())
+	{
+		Ok(())
+	} else {
+		Err(validation_error("invalid environment pattern"))
+	}
+}
+
+fn validate_path_globs(values: &[Str]) -> Result<(), Str> {
+	if values
+		.iter()
+		.all(|value| globset::Glob::new(value.as_str()).is_ok())
+	{
+		Ok(())
+	} else {
+		Err(validation_error("invalid path glob"))
+	}
+}
+
+fn validate_string_map(values: &Kv) -> Result<(), Str> {
+	if values
+		.iter()
+		.all(|(_, value)| matches!(value, Value::Str(_)))
+	{
+		Ok(())
+	} else {
+		Err(validation_error("environment values must be strings"))
 	}
 }
 
@@ -562,108 +493,49 @@ fn is_existing_unix_socket(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::SettingsSnapshot;
-
 	use super::*;
 
 	#[test]
-	fn default_sandbox_round_trips_and_absent_table_projects_off() {
-		let expected = SandboxSettings::default();
-		let snapshot = SettingsSnapshot::isolated(expected.clone(), crate::TEST_SETTINGS_CATALOG)
-			.expect("isolated sandbox");
-		assert_eq!(
-			snapshot
-				.project::<SandboxSettings>()
-				.expect("round-trip sandbox projection")
-				.get(),
-			&expected
+	fn default_sandbox_projects_off() {
+		let settings = SandboxSettings::from_con(&Ctx::new());
+		assert_eq!(settings, SandboxSettings::default());
+		assert_eq!(settings.mode, ExecSandboxMode::Off);
+	}
+
+	#[test]
+	fn configured_sandbox_convars_project() {
+		let ctx = Ctx::new();
+		SV_SANDBOX_MODE
+			.set(&ctx, ExecSandboxMode::WorkspaceWrite)
+			.expect("set mode");
+		SV_SANDBOX_NETWORK_MODE
+			.set(&ctx, SandboxNetworkMode::Scoped)
+			.expect("set network");
+		SV_SANDBOX_ALLOW_DOMAINS
+			.set(&ctx, vec![Str::new_static("*.example.com")])
+			.expect("set domains");
+		SV_SANDBOX_ENV_SET
+			.set(&ctx, Kv(vec![(Str::new_static("OMP_TEST"), Value::Str(Str::new_static("yes")))]))
+			.expect("set env");
+		let settings = SandboxSettings::from_con(&ctx);
+		assert_eq!(settings.mode, ExecSandboxMode::WorkspaceWrite);
+		assert_eq!(settings.network_mode, SandboxNetworkMode::Scoped);
+		assert_eq!(settings.allow_domains, vec![Str::new_static("*.example.com")]);
+		assert_eq!(settings.env_set.get("OMP_TEST").map(Str::as_str), Some("yes"));
+	}
+
+	#[test]
+	fn sandbox_convars_reject_invalid_policy_values() {
+		let ctx = Ctx::new();
+		assert!(
+			SV_SANDBOX_WRITABLE_ROOTS
+				.set(&ctx, vec![Str::new_static("relative/path")])
+				.is_err()
 		);
-		let absent =
-			SettingsSnapshot::isolated_document(toml::Table::new(), crate::TEST_SETTINGS_CATALOG);
-		let settings = absent
-			.project::<SandboxSettings>()
-			.expect("absent sandbox projection");
-		assert_eq!(settings.get(), &expected);
-		assert_eq!(settings.get().mode, ExecSandboxMode::Off);
-	}
-
-	#[test]
-	fn fully_configured_sandbox_table_projects() {
-		let document = toml::from_str::<toml::Table>(
-			r#"
-[sandbox]
-mode = "workspace-write"
-network_mode = "scoped"
-allow_domains = ["*.example.com", "api.omp.dev"]
-deny_domains = ["telemetry.example.com"]
-allow_ports = [443, 8443]
-allow_localhost = true
-writable_roots = ["/workspace", "/var/cache/omp"]
-unscoped_writes = "overlay"
-env_deny = ["*PASSWORD*", "CI_JOB_TOKEN"]
-env_inherit = "core"
-env_include_only = ["OMP_*", "PATH"]
-env_set = { OMP_TEST = "yes" }
-exclude_tmpdir = true
-exclude_slash_tmp = true
-read_deny = ["/private"]
-read_mode = "scoped"
-readable_roots = ["/reference"]
-read_deny_globs = ["/private/**"]
-write_deny = ["/protected"]
-"#,
-		)
-		.expect("sandbox TOML");
-		let snapshot = SettingsSnapshot::isolated_document(document, crate::TEST_SETTINGS_CATALOG);
-		let settings = snapshot
-			.project::<SandboxSettings>()
-			.expect("configured sandbox projection");
-		assert_eq!(settings.get(), &SandboxSettings {
-			mode:               ExecSandboxMode::WorkspaceWrite,
-			network_mode:       SandboxNetworkMode::Scoped,
-			allow_domains:      vec![Str::new_static("*.example.com"), Str::new_static("api.omp.dev")],
-			deny_domains:       vec![Str::new_static("telemetry.example.com")],
-			allow_ports:        vec![443, 8443],
-			allow_localhost:    true,
-			allow_unix_sockets: Vec::new(),
-			writable_roots:     vec![Str::new_static("/workspace"), Str::new_static("/var/cache/omp"),],
-			unscoped_writes:    UnscopedWrites::Overlay,
-			env_deny:           vec![Str::new_static("*PASSWORD*"), Str::new_static("CI_JOB_TOKEN"),],
-			env_inherit:        EnvironmentInheritance::Core,
-			env_include_only:   vec![Str::new_static("OMP_*"), Str::new_static("PATH")],
-			env_set:            BTreeMap::from([(
-				Str::new_static("OMP_TEST"),
-				Str::new_static("yes")
-			)]),
-			exclude_tmpdir:     true,
-			exclude_slash_tmp:  true,
-			read_deny:          vec![Str::new_static("/private")],
-			read_mode:          ReadMode::Scoped,
-			readable_roots:     vec![Str::new_static("/reference")],
-			read_deny_globs:    vec![Str::new_static("/private/**")],
-			write_deny:         vec![Str::new_static("/protected")],
-		});
-	}
-
-	#[test]
-	fn sandbox_validation_rejects_relative_writable_root() {
-		let settings = SandboxSettings {
-			writable_roots: vec![Str::new_static("relative/path")],
-			..SandboxSettings::default()
-		};
-		assert!(settings.validate().is_err());
-	}
-	#[test]
-	fn sandbox_validation_rejects_relative_policy_paths_and_invalid_environment_globs() {
-		let relative = SandboxSettings {
-			read_deny: vec![Str::new_static("private")],
-			..SandboxSettings::default()
-		};
-		assert!(relative.validate().is_err());
-		let invalid_glob = SandboxSettings {
-			env_include_only: vec![Str::new_static("[")],
-			..SandboxSettings::default()
-		};
-		assert!(invalid_glob.validate().is_err());
+		assert!(
+			SV_SANDBOX_ENV_INCLUDE_ONLY
+				.set(&ctx, vec![Str::new_static("[")])
+				.is_err()
+		);
 	}
 }

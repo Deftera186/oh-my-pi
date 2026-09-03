@@ -969,7 +969,7 @@ mod tests {
 		request
 			.respond(omp_agent::ApprovalDecision {
 				approved:   true,
-				scope:      sf!("once"),
+				scope:      omp_agent::ApprovalScope::Once,
 				source:     omp_agent::ApprovalSource::User,
 				decided_by: Some(sf!("test approver")),
 				reason:     None,
@@ -1107,7 +1107,7 @@ mod tests {
 			request
 				.respond(omp_agent::ApprovalDecision {
 					approved:   true,
-					scope:      sf!("once"),
+					scope:      omp_agent::ApprovalScope::Once,
 					source:     omp_agent::ApprovalSource::User,
 					decided_by: Some(sf!("test approver")),
 					reason:     None,

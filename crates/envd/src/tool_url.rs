@@ -10,17 +10,12 @@ mod memory;
 pub(super) mod ssh;
 pub(super) mod vault;
 
-use std::{
-	fmt::Display,
-	fs,
-	path::{Path, PathBuf},
-	str,
-	sync::Arc,
-};
+use std::{fmt::Display, path::PathBuf, str, sync::Arc};
 
-use omp_agent::AgentRegistry;
+use omp_agent::SessionAuthority;
+use omp_cache::github_cache::GithubCache;
 use omp_core::{CowBytes, Str};
-use omp_storage::{blob::BlobStore, github_cache::GithubCache};
+use omp_journal::blob::BlobStore;
 use omp_tools::read::{
 	Fault,
 	conflicts::{ConflictRegistry, ConflictResolver},
@@ -31,7 +26,6 @@ use omp_tools::read::{
 	},
 	selector::ParsedSelector,
 };
-use url::Url;
 
 use super::{
 	github_url::{GithubCredentialBridge, GithubResolver, GithubScheme},
@@ -48,31 +42,20 @@ enum RegistryResource {
 }
 
 pub(super) struct RegistryResolver {
-	resource:              RegistryResource,
-	lines:                 LineOffsetCache,
-	session_id:            Str,
-	root_file:             PathBuf,
-	preferred_artifacts:   PathBuf,
-	preferred_transcripts: PathBuf,
+	resource:  RegistryResource,
+	lines:     LineOffsetCache,
+	authority: Option<Arc<dyn SessionAuthority>>,
 }
 
 impl RegistryResolver {
-	fn new(resource: RegistryResource, sessions_dir: &Path, session_id: &str) -> Self {
-		Self {
-			resource,
-			lines: LineOffsetCache::default(),
-			session_id: Str::new(session_id),
-			root_file: sessions_dir.join(format!("{session_id}.jsonl")),
-			preferred_artifacts: sessions_dir.join(session_id),
-			preferred_transcripts: sessions_dir.join("eval-agents"),
-		}
+	fn new(resource: RegistryResource, authority: Option<Arc<dyn SessionAuthority>>) -> Self {
+		Self { resource, lines: LineOffsetCache::default(), authority }
 	}
 
-	fn refresh(&self) {
-		if self.preferred_transcripts.is_dir() {
-			AgentRegistry::global()
-				.restore_transcripts_once(&self.root_file, &self.preferred_transcripts);
-		}
+	fn authority(&self) -> Result<&dyn SessionAuthority, Fault> {
+		self.authority.as_deref().ok_or_else(|| Fault::Source {
+			message: Str::new_static("No live session registry is bound."),
+		})
 	}
 }
 
@@ -91,66 +74,44 @@ impl Resolve for RegistryResolver {
 		query: Option<&'a str>,
 		selector: &'a ParsedSelector,
 	) -> Result<CowBytes<'static>, Fault> {
-		self.refresh();
-		let bytes = match self.resource {
-			RegistryResource::Agent => {
-				let (base, path) = resource.split_once('/').unwrap_or((resource, ""));
-				if query.is_some() && !path.is_empty() {
-					return Err(Fault::Invalid {
-						message: Str::new_static("agent:// cannot combine path extraction with ?q=."),
-					});
-				}
-				if let Some(query) = query {
-					let expression = parse_agent_query(query)?;
-					AgentRegistry::global()
-						.resolve_agent_query_from(resource, &expression, &self.preferred_artifacts)
-						.map_err(registry_fault)?
-				} else {
-					match AgentRegistry::global().resolve_agent_from(resource, &self.preferred_artifacts)
-					{
-						Ok(bytes) => bytes,
-						Err(_) if !path.is_empty() => {
-							let bytes = AgentRegistry::global()
-								.resolve_agent_from(base, &self.preferred_artifacts)
-								.map_err(registry_fault)?;
-							project_json(bytes, None, Some(path))?
-						},
-						Err(error) => return Err(registry_fault(error)),
+		let authority = self.authority()?;
+		let bytes = if matches!(self.resource, RegistryResource::History)
+			&& resource.trim_matches('/').is_empty()
+		{
+			let rows = authority
+				.list()
+				.into_iter()
+				.map(|endpoint| {
+					serde_json::json!({
+						"id": endpoint.id,
+						"name": endpoint.name,
+					})
+				})
+				.collect::<Vec<_>>();
+			serde_json::to_vec(&rows).map_err(json_fault)?
+		} else {
+			let (base, path) = resource.split_once('/').unwrap_or((resource, ""));
+			let endpoint = authority.lookup(base).ok_or_else(|| Fault::Source {
+				message: Str::new(format!("Session `{base}` is not live.")),
+			})?;
+			let bytes = endpoint.snapshot.read().as_bytes().to_vec();
+			match self.resource {
+				RegistryResource::Agent => {
+					if query.is_some() && !path.is_empty() {
+						return Err(Fault::Invalid {
+							message: Str::new_static("agent:// cannot combine path extraction with ?q=."),
+						});
 					}
-				}
-			},
-			RegistryResource::History => {
-				let registry = AgentRegistry::global();
-				let bytes = if resource.trim_matches('/').is_empty() {
-					registry
-						.history_index_for_root(self.session_id.as_str())
-						.into_bytes()
-				} else {
-					registry
-						.resolve_history_from(resource, &self.preferred_transcripts)
-						.map_err(registry_fault)?
-				};
-				render_history(resource, bytes)?
-			},
+					project_json(bytes, query, (!path.is_empty()).then_some(path))?
+				},
+				RegistryResource::History => render_history(resource, bytes)?,
+			}
 		};
 		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
 	}
 
-	async fn path(&self, resource: &str) -> Result<Option<Str>, Fault> {
-		self.refresh();
-		if !matches!(self.resource, RegistryResource::Agent) || resource.contains('/') {
-			return Ok(None);
-		}
-		let path = AgentRegistry::global()
-			.agent_path_from(resource, &self.preferred_artifacts)
-			.map_err(registry_fault)?;
-		let path = fs::canonicalize(path).map_err(|_| Fault::Source {
-			message: Str::new_static("Agent output path was not found."),
-		})?;
-		let uri = Url::from_file_path(path).map_err(|()| Fault::Invalid {
-			message: Str::new_static("Agent output path cannot be represented as a file URI."),
-		})?;
-		Ok(Some(Str::from(uri.to_string())))
+	async fn path(&self, _resource: &str) -> Result<Option<Str>, Fault> {
+		Ok(None)
 	}
 
 	async fn list(
@@ -159,23 +120,23 @@ impl Resolve for RegistryResolver {
 		max_entries: usize,
 		max_bytes: usize,
 	) -> Result<ResourceList, Fault> {
-		self.refresh();
 		if !resource.trim_matches('/').is_empty() {
 			return Err(Fault::Invalid {
 				message: Str::new_static(
-					"Agent resource listing is supported only at the scheme root.",
+					"Session resource listing is supported only at the scheme root.",
 				),
 			});
 		}
+		let scheme = match self.resource {
+			RegistryResource::Agent => "agent",
+			RegistryResource::History => "history",
+		};
 		let mut entries = Vec::new();
 		let mut bytes = 0usize;
 		let mut truncated = false;
-		for record in AgentRegistry::global().roster_for_root(self.session_id.as_str(), false) {
-			let uri = match self.resource {
-				RegistryResource::Agent => format!("agent://{}", record.id),
-				RegistryResource::History => format!("history://{}", record.id),
-			};
-			let entry_bytes = uri.len().saturating_add(record.name.len());
+		for endpoint in self.authority()?.list() {
+			let uri = format!("{scheme}://{}", endpoint.id);
+			let entry_bytes = uri.len().saturating_add(endpoint.name.len());
 			if entries.len() == max_entries || bytes.saturating_add(entry_bytes) > max_bytes {
 				truncated = true;
 				break;
@@ -183,7 +144,7 @@ impl Resolve for RegistryResolver {
 			bytes += entry_bytes;
 			entries.push(ResourceEntry {
 				uri:       Str::new(uri),
-				name:      record.id,
+				name:      endpoint.name,
 				directory: false,
 				size:      0,
 			});
@@ -196,20 +157,20 @@ impl Resolve for RegistryResolver {
 		query: &str,
 		max_results: usize,
 	) -> Result<Vec<ResourceCompletion>, Fault> {
-		self.refresh();
 		let scheme = match self.resource {
 			RegistryResource::Agent => "agent",
 			RegistryResource::History => "history",
 		};
-		let mut matches = AgentRegistry::global()
-			.roster_for_root(self.session_id.as_str(), false)
+		let mut matches = self
+			.authority()?
+			.list()
 			.into_iter()
-			.filter_map(|record| {
+			.filter_map(|endpoint| {
 				let score =
-					fuzzy_score(query, &record.id).or_else(|| fuzzy_score(query, &record.name))?;
+					fuzzy_score(query, &endpoint.id).or_else(|| fuzzy_score(query, &endpoint.name))?;
 				Some(ResourceCompletion {
-					value: Str::new(format!("{scheme}://{}", record.id)),
-					description: record.name,
+					value: Str::new(format!("{scheme}://{}", endpoint.id)),
+					description: endpoint.name,
 					score,
 				})
 			})
@@ -398,6 +359,7 @@ pub(super) fn production_url_resolvers(
 	github_credentials: Arc<GithubCredentialBridge>,
 	content: Vec<Arc<dyn ContentResolver>>,
 	host_resources: Option<Arc<dyn HostResources>>,
+	session_authority: Option<Arc<dyn SessionAuthority>>,
 	mcp: Arc<McpService>,
 	ssh: SshService,
 	vault: VaultService,
@@ -472,6 +434,7 @@ pub(super) fn production_url_resolvers(
 			UrlResolver::Attachment(attachment::AttachmentUrlResolver::new(
 				blob_store.clone(),
 				session_id,
+				session_authority.clone(),
 			)),
 		)
 		.expect("attachment URL resolver is unique");
@@ -511,8 +474,7 @@ pub(super) fn production_url_resolvers(
 				.with_capabilities(true, true, true),
 			UrlResolver::Agent(RegistryResolver::new(
 				RegistryResource::Agent,
-				&sessions_dir,
-				session_id,
+				session_authority.clone(),
 			)),
 		)
 		.expect("agent URL resolver is unique");
@@ -520,11 +482,7 @@ pub(super) fn production_url_resolvers(
 		.register(
 			SchemeEntry::new(Scheme::History, true, false, "read-only agent transcript index")
 				.with_capabilities(true, false, true),
-			UrlResolver::History(RegistryResolver::new(
-				RegistryResource::History,
-				&sessions_dir,
-				session_id,
-			)),
+			UrlResolver::History(RegistryResolver::new(RegistryResource::History, session_authority)),
 		)
 		.expect("history URL resolver is unique");
 	builder
@@ -542,29 +500,6 @@ pub(super) fn production_url_resolvers(
 		.expect("omp URL resolver is unique");
 	Arc::new(builder.build())
 }
-fn parse_agent_query(query: &str) -> Result<Str, Fault> {
-	let mut selected = None;
-	for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-		if name == "q" {
-			if selected.replace(value.into_owned()).is_some() {
-				return Err(Fault::Invalid {
-					message: Str::new_static("agent:// accepts exactly one ?q= value."),
-				});
-			}
-		} else {
-			return Err(Fault::Invalid {
-				message: Str::new(format!("Unsupported agent:// query parameter '{name}'.")),
-			});
-		}
-	}
-	selected
-		.filter(|value| !value.is_empty())
-		.map(Str::new)
-		.ok_or_else(|| Fault::Invalid {
-			message: Str::new_static("agent:// query form requires a nonempty ?q= value."),
-		})
-}
-
 fn project_json(bytes: Vec<u8>, query: Option<&str>, path: Option<&str>) -> Result<Vec<u8>, Fault> {
 	let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
 		Fault::Invalid { message: Str::new(format!("Agent output is not valid JSON: {source}")) }
@@ -652,10 +587,6 @@ fn find_json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a s
 		},
 		_ => None,
 	}
-}
-
-fn registry_fault(error: impl Display) -> Fault {
-	Fault::Source { message: Str::new(error.to_string()) }
 }
 
 fn json_fault(error: impl Display) -> Fault {

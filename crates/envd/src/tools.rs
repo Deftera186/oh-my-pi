@@ -16,9 +16,11 @@ use std::{
 use futures::StreamExt as _;
 use omp_agent::{
 	GateDecision, GateEvent, GateOutcome, HookDispatch as AgentHookDispatch, HookGate, HookPatch,
-	control,
+	HookPhase, KernelSender,
 };
+use omp_cache::{github_cache::GithubCache, telemetry_cache::TelemetryIndex};
 use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
+use omp_con::Ctx;
 use omp_core::{
 	Duration, ExposeSecret as _, FastHashSet, Hash32, InvocationPhase, LifecyclePhase, SecretString,
 	Str, Ulid, sf,
@@ -47,14 +49,6 @@ use omp_proto::{
 		GrammarSyntax as WorkerGrammarSyntax, HookEventId, PreludeParamKind, ToolDecl,
 		ToolExecutionMode as WorkerExecutionMode, tool_constraint,
 	},
-};
-use omp_settings::{
-	BrowserSettings, SettingsCatalog,
-	manager::{SettingsManager, SettingsPaths},
-};
-use omp_storage::{
-	github_cache::GithubCache, index::SessionRenameObserver, telemetry_index::TelemetryIndex,
-	transcript::SessionId,
 };
 use omp_tool::{
 	AvailabilityDelta, Claims, Constraint, Ev, ExecutionMode, GrammarSyntax, IncomingParams,
@@ -129,7 +123,8 @@ use super::{
 	workspace::WorkspaceHost,
 };
 use crate::{
-	browser_daemon::BrowserDaemon, github_url::GithubCredentialBridge, host_settings::HostSettings,
+	browser_daemon::{BrowserDaemon, BrowserSettings},
+	github_url::GithubCredentialBridge,
 };
 
 const HARD_SLOT_BUDGET: usize = 8;
@@ -195,6 +190,9 @@ pub struct RegistryBridges {
 	pub edit_repair:            Option<omp_tools::edit::observer::EditRepairClient>,
 	/// Host-resource broker used by composition-owned internal resource URLs.
 	pub host_resources:         Option<Arc<dyn HostResources>>,
+	/// Live session routing authority for `agent://`, `history://`, and
+	/// attachments.
+	pub session_authority:      Option<Arc<dyn omp_agent::SessionAuthority>>,
 	/// Background telemetry delivery started once credentials exist.
 	pub telemetry_upload:       Option<Arc<dyn TelemetryUpload>>,
 	/// Fallback presenter for interactive `ask` invocations.
@@ -1482,7 +1480,7 @@ impl HookControlFactory {
 		});
 		let decision = match (event, identity) {
 			(Some(event), Some((identity, session))) => {
-				let payload = if dispatch.phase == omp_agent::HookPhase::Observe {
+				let payload = if dispatch.phase == HookPhase::Observe {
 					serde_json::from_slice::<JsonValue>(&dispatch.payload).ok()
 				} else {
 					dispatch
@@ -2780,70 +2778,6 @@ impl ProviderResponseObserver for HookControlFactory {
 	}
 }
 
-impl SessionRenameObserver for HookControlFactory {
-	fn renamed(&self, session: &SessionId, name: Option<&str>) {
-		let subscriptions = self
-			.subscriptions
-			.read()
-			.values()
-			.flatten()
-			.filter(|row| row.event == "session_renamed" && row.phase == "observe")
-			.cloned()
-			.collect::<Vec<_>>();
-		if subscriptions.is_empty() {
-			return;
-		}
-		let owner = self.clone();
-		let session = session.0.clone();
-		let name = name.map(Str::new);
-		tokio::spawn(async move {
-			for subscription in subscriptions {
-				let mut arguments = JsonMap::new();
-				arguments
-					.insert(String::from("event"), JsonValue::String(String::from("session_renamed")));
-				arguments.insert(String::from("phase"), JsonValue::String(String::from("observe")));
-				arguments
-					.insert(String::from("name"), JsonValue::String(subscription.name.to_string()));
-				arguments.insert(String::from("payload"), json!({"session": session, "name": name}));
-				let _ = owner
-					.dispatcher
-					.dispatch(Arc::clone(&subscription.identity), ControlDispatch {
-						operation: sf!("omp.hooks.dispatch"),
-						arguments,
-						authority: ControlInvocationAuthority {
-							invocation:        sf!("session-renamed:{session}"),
-							phase:             InvocationPhase::Open,
-							session:           session.clone(),
-							turn:              None,
-							event:             Some(sf!("session_renamed")),
-							call:              None,
-							device:            None,
-							effects:           Box::new([]),
-							place_kind:        sf!("host"),
-							lifecycle:         LifecyclePhase::Active,
-							roots:             Box::new([]),
-							remote:            false,
-							has_ui:            false,
-							headless:          true,
-							settings:          owner.settings_for(&subscription.identity),
-							secret_settings:   Box::new([]),
-							data:              None,
-							direct_filesystem: None,
-						},
-						policy: subscription.concurrency,
-						deadline: EventDeadline {
-							at: time::Instant::now()
-								+ subscription
-									.timeout
-									.unwrap_or(subscription.event_policy.timeout),
-						},
-					})
-					.await;
-			}
-		});
-	}
-}
-
 fn mcp_subscription_matches(subscription: &HookSubscription, server: &str, method: &str) -> bool {
 	mcp_filter_matches(subscription.servers.as_deref(), &subscription.method_globs, server, method)
 }
@@ -3326,25 +3260,15 @@ pub(super) fn pty_denied() -> bool {
 	PTY_DENIED.try_with(|denied| *denied).unwrap_or(false)
 }
 
-fn configured_model_edit_revision(
-	data_dir: &Path,
-	project_root: &Path,
-	catalog: SettingsCatalog,
-) -> Result<Option<Rev>, EnvdError> {
-	let manager =
-		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	let snapshot = manager.snapshot();
-	let settings = snapshot
-		.project::<HostSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	let Some(selector) = settings.get().default_model.clone() else {
+fn configured_model_edit_revision(ctx: &Ctx) -> Result<Option<Rev>, EnvdError> {
+	let settings = omp_catalog::settings::ModelSettings::from_con(ctx);
+	let Some(selector) = settings.role_selector("default") else {
 		return Ok(None);
 	};
 	let catalog = Catalog::embedded();
 	let model = catalog
-		.model(ModelKey::from_ref(&selector))
-		.or_else(|| catalog.resolve_alias(&selector));
+		.model(ModelKey::from_ref(selector))
+		.or_else(|| catalog.resolve_alias(selector));
 	let Some(revision) = model.and_then(|model| model.edit_revision.as_deref()) else {
 		return Ok(None);
 	};
@@ -3354,19 +3278,10 @@ fn configured_model_edit_revision(
 		.map_err(|error| EnvdError::EditDialect(error.to_string().into()))
 }
 
-fn configured_model_identity(
-	data_dir: &Path,
-	project_root: &Path,
-	catalog: SettingsCatalog,
-) -> Result<Option<Str>, EnvdError> {
-	let manager =
-		SettingsManager::open(SettingsPaths::discover(data_dir, Some(project_root)), catalog)
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	let snapshot = manager.snapshot();
-	let settings = snapshot
-		.project::<HostSettings>()
-		.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-	Ok(settings.get().default_model.as_deref().map(Str::new))
+fn configured_model_identity(ctx: &Ctx) -> Option<Str> {
+	omp_catalog::settings::ModelSettings::from_con(ctx)
+		.role_selector("default")
+		.cloned()
 }
 fn prepare_registry(registry: &mut Registry) -> Result<(), EnvdError> {
 	registry.protect_core_claims([
@@ -3637,9 +3552,9 @@ pub(crate) struct EnvironmentDeclarationInputs {
 	reason = "declaration projection mirrors independent tool setting domains"
 )]
 pub(crate) fn build_environment_declaration_inputs(
-	state_dir: &Path,
-	project_root: &Path,
-	settings_catalog: SettingsCatalog,
+	_state_dir: &Path,
+	_project_root: &Path,
+	con: &Ctx,
 	workers: &ExtHostSupervisor,
 	tool_settings: &ToolSettings,
 	shell_settings: &ShellSettings,
@@ -3651,8 +3566,7 @@ pub(crate) fn build_environment_declaration_inputs(
 ) -> Result<EnvironmentDeclarationInputs, EnvdError> {
 	let environment_edit_dialect = env::var("OMP_EDIT_DIALECT").ok();
 	let force_hashline = env::var_os("OMP_STRICT_EDIT_MODE").is_some();
-	let model_edit_revision =
-		configured_model_edit_revision(state_dir, project_root, settings_catalog)?;
+	let model_edit_revision = configured_model_edit_revision(con)?;
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
 		model_rule: model_edit_revision.as_ref(),
@@ -3951,7 +3865,7 @@ pub(crate) fn production_registry<
 	blobs: &BlobHost,
 	exec: &ExecHost,
 	state_dir: &Path,
-	settings_catalog: SettingsCatalog,
+	con: &Ctx,
 	session_id: &str,
 	github_cache: Arc<GithubCache>,
 	mcp: &Arc<McpService>,
@@ -3999,6 +3913,7 @@ pub(crate) fn production_registry<
 		edit_model,
 		edit_repair,
 		host_resources,
+		session_authority,
 		telemetry_upload,
 		ask_presenter,
 		content,
@@ -4119,14 +4034,14 @@ pub(crate) fn production_registry<
 		Arc::clone(&github_credentials),
 		url_resolvers,
 		host_resources,
+		session_authority,
 		Arc::clone(mcp),
 		ssh,
 		vault,
 	);
 	let environment_edit_dialect = env::var("OMP_EDIT_DIALECT").ok();
 	let force_hashline = env::var_os("OMP_STRICT_EDIT_MODE").is_some();
-	let model_edit_revision =
-		configured_model_edit_revision(state_dir, workspace.root(), settings_catalog)?;
+	let model_edit_revision = configured_model_edit_revision(con)?;
 	let selected_edit = resolve_edit_revision(EditRevisionCandidates {
 		environment: environment_edit_dialect.as_deref(),
 		model_rule: model_edit_revision.as_ref(),
@@ -4168,7 +4083,7 @@ pub(crate) fn production_registry<
 				}
 			}),
 			model: edit_model
-				.or(configured_model_identity(state_dir, workspace.root(), settings_catalog)?)
+				.or_else(|| configured_model_identity(con))
 				.unwrap_or_else(|| sf!("unknown")),
 			..omp_tools::edit::observer::EditBlackboxConfig::default()
 		},
@@ -4473,7 +4388,7 @@ impl omp_tools::goal::GoalControl for GoalControlAdapter {
 #[derive(Clone)]
 struct CheckpointBinding {
 	id:     u64,
-	sender: omp_agent::ControlSender,
+	sender: KernelSender,
 }
 
 /// Late-bound bridge from environment-owned checkpoint tools to the active
@@ -4485,7 +4400,7 @@ pub struct AgentCheckpointControl {
 
 impl AgentCheckpointControl {
 	/// Replaces the active session binding.
-	pub fn bind(&self, id: u64, sender: omp_agent::ControlSender) {
+	pub fn bind(&self, id: u64, sender: KernelSender) {
 		*self.sender.write() = Some(CheckpointBinding { id, sender });
 	}
 
@@ -4497,7 +4412,7 @@ impl AgentCheckpointControl {
 		}
 	}
 
-	fn sender(&self) -> Result<omp_agent::ControlSender, omp_tools::checkpoint::CheckpointFault> {
+	fn sender(&self) -> Result<KernelSender, omp_tools::checkpoint::CheckpointFault> {
 		self
 			.sender
 			.read()
@@ -4515,12 +4430,29 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 		&self,
 		goal: Str,
 	) -> Result<omp_tools::checkpoint::CheckpointAck, omp_tools::checkpoint::CheckpointFault> {
-		let ack = self
+		let started_at = u64::try_from(
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map_err(|error| checkpoint_fault(Str::new(error.to_string())))?
+				.as_millis(),
+		)
+		.unwrap_or(u64::MAX);
+		let token = sf!("checkpoint-{started_at}");
+		let ack = omp_tools::checkpoint::CheckpointAck { token: token.clone(), started_at };
+		let payload = serde_json::to_string(&serde_json::json!({
+			"goal": goal,
+			"token": token,
+			"started_at": started_at,
+		}))
+		.map_err(|error| checkpoint_fault(Str::new(error.to_string())))?;
+		self
 			.sender()?
-			.checkpoint(goal)
-			.await
-			.map_err(checkpoint_fault)?;
-		Ok(omp_tools::checkpoint::CheckpointAck { token: ack.token, started_at: ack.started_at })
+			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointControl {
+				operation: sf!("checkpoint"),
+				payload:   Str::new(payload),
+			}))
+			.map_err(|_| checkpoint_fault(sf!("active Agent mailbox is closed")))?;
+		Ok(ack)
 	}
 
 	async fn schedule_rewind(
@@ -4528,51 +4460,28 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 		token: Str,
 		report: Str,
 	) -> Result<omp_tools::checkpoint::RewindAck, omp_tools::checkpoint::CheckpointFault> {
-		let ack = self
+		let receipt = sf!("rewind-{}", token);
+		let ack =
+			omp_tools::checkpoint::RewindAck { token: token.clone(), receipt: receipt.clone() };
+		let payload = serde_json::to_string(&serde_json::json!({
+			"token": token,
+			"report": report,
+			"receipt": receipt,
+		}))
+		.map_err(|error| checkpoint_fault(Str::new(error.to_string())))?;
+		self
 			.sender()?
-			.schedule_rewind(token, report)
-			.await
-			.map_err(checkpoint_fault)?;
-		Ok(omp_tools::checkpoint::RewindAck { token: ack.token, receipt: ack.receipt })
+			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointControl {
+				operation: sf!("schedule_rewind"),
+				payload:   Str::new(payload),
+			}))
+			.map_err(|_| checkpoint_fault(sf!("active Agent mailbox is closed")))?;
+		Ok(ack)
 	}
 }
 
-fn checkpoint_fault(error: control::ControlError) -> omp_tools::checkpoint::CheckpointFault {
-	let (code, message) = match error {
-		control::ControlError::CheckpointAlreadyActive => {
-			(checkpoint::FaultCode::AlreadyActive, sf!("checkpoint already active"))
-		},
-		control::ControlError::NoActiveCheckpoint => (
-			checkpoint::FaultCode::NoActive,
-			sf!("no active checkpoint; create a checkpoint before calling rewind"),
-		),
-		control::ControlError::CheckpointAlreadyCompleted => (
-			checkpoint::FaultCode::AlreadyCompleted,
-			sf!("checkpoint already completed; continue from the retained rewind report"),
-		),
-		control::ControlError::WrongCheckpointToken => (
-			checkpoint::FaultCode::WrongToken,
-			sf!("checkpoint token does not belong to the active session"),
-		),
-		control::ControlError::EmptyRewindReport => {
-			(checkpoint::FaultCode::EmptyReport, sf!("rewind report must not be empty"))
-		},
-		control::ControlError::RewindAlreadyScheduled => (
-			checkpoint::FaultCode::AlreadyScheduled,
-			sf!("rewind already scheduled for the active checkpoint"),
-		),
-		control::ControlError::Closed
-		| control::ControlError::Journal(_)
-		| control::ControlError::Projection(_)
-		| control::ControlError::ProjectionUnavailable
-		| control::ControlError::RegimeStart(_)
-		| control::ControlError::RegimeStop(_)
-		| control::ControlError::RegimeArbiter(_)
-		| control::ControlError::UnknownCoreRegime { .. } => {
-			(checkpoint::FaultCode::Control, sf!("active Agent CONTROL checkpoint operation failed"))
-		},
-	};
-	omp_tools::checkpoint::CheckpointFault { code, message }
+fn checkpoint_fault(message: Str) -> omp_tools::checkpoint::CheckpointFault {
+	omp_tools::checkpoint::CheckpointFault { code: checkpoint::FaultCode::Control, message }
 }
 
 pub(super) fn python_engine() -> Result<Arc<omp_py::Engine>, EnvdError> {

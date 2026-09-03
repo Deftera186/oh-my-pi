@@ -8,7 +8,7 @@ use std::{fs, path::Path, time::Duration};
 use omp_core::Str;
 use thiserror::Error;
 
-use crate::{ScheduleBudget, Trigger};
+use crate::schedules::{ScheduleBudget, Trigger};
 
 /// Bounded number of cron instants inspected while finding the next match.
 const MAX_CRON_STEPS: usize = 366 * 24 * 60 * 60;
@@ -113,30 +113,6 @@ pub fn next_occurrence(
 		},
 		Trigger::Cron { expr, timezone } => next_cron(expr, timezone, after_ms),
 	}
-}
-
-/// Enumerates due occurrences oldest-first, stopping at `limit`.
-pub fn occurrences_through(
-	trigger: &Trigger,
-	schedule_id: &str,
-	anchor_ms: u64,
-	after_ms: u64,
-	through_ms: u64,
-	limit: usize,
-) -> Result<Vec<u64>, PlannerError> {
-	let mut out = Vec::new();
-	let mut cursor = after_ms;
-	while out.len() < limit {
-		let Some(next) = next_occurrence(trigger, schedule_id, anchor_ms, cursor)? else {
-			break;
-		};
-		if next > through_ms {
-			break;
-		}
-		out.push(next);
-		cursor = next;
-	}
-	Ok(out)
 }
 
 fn duration_ms(duration: Duration) -> Result<u64, PlannerError> {

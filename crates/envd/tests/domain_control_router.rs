@@ -103,9 +103,6 @@ async fn routes_requests_callbacks_and_effects_to_domain_owners() {
 			owner("hooks", &calls),
 		),
 		PersistenceControlAuthorities::new(
-			owner("context", &calls),
-			owner("journal", &calls),
-			owner("state", &calls),
 			owner("sessions", &calls),
 			owner("artifacts", &calls),
 			owner("credentials", &calls),
@@ -116,11 +113,7 @@ async fn routes_requests_callbacks_and_effects_to_domain_owners() {
 			owner("telemetry", &calls),
 			owner("verdicts", &calls),
 		),
-		ProviderControlAuthorities::new(
-			owner("provider", &calls),
-			owner("regimes", &calls),
-			owner("services", &calls),
-		),
+		ProviderControlAuthorities::new(owner("provider", &calls), owner("services", &calls)),
 		owner("auxiliary", &calls),
 		owner("effects", &calls),
 	);
@@ -135,9 +128,7 @@ async fn routes_requests_callbacks_and_effects_to_domain_owners() {
 		("omp.registry.freeze", "registry"),
 		("omp.devices.invoke", "devices"),
 		("omp.hooks.dispatch", "hooks"),
-		("omp.context.view", "context"),
-		("omp.journal.append", "journal"),
-		("omp.state.latest", "state"),
+		("omp.state_dir", "auxiliary"),
 		("omp.sessions.get", "sessions"),
 		("omp.artifacts.stat", "artifacts"),
 		("omp.creds.list", "credentials"),
@@ -147,10 +138,6 @@ async fn routes_requests_callbacks_and_effects_to_domain_owners() {
 		("omp.telemetry.query", "telemetry"),
 		("omp.jobs.register", "verdicts"),
 		("omp.provider.request", "provider"),
-		("omp.regimes.start", "regimes"),
-		("omp.regimes.active", "regimes"),
-		("omp.regimes.stop", "regimes"),
-		("omp.regimes.apply", "regimes"),
 		("omp.services.call", "services"),
 		("omp.params.pull", "auxiliary"),
 		("omp.workers.spawn", "auxiliary"),
@@ -165,6 +152,10 @@ async fn routes_requests_callbacks_and_effects_to_domain_owners() {
 			.expect("routed request/callback");
 		assert_eq!(result, Value::String(expected.to_owned()));
 	}
+	assert!(!router.handles("omp.context.view"));
+	assert!(!router.handles("omp.journal.append"));
+	assert!(!router.handles("omp.state.latest"));
+	assert!(!router.handles("omp.regimes.start"));
 
 	for (index, (effect, expected)) in [
 		(ControlEffect::Registry(json!({})), "registry:registry"),

@@ -8,7 +8,7 @@ use std::{
 	io::{self, BufRead, BufReader, Read, Write},
 	net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
 	sync::{
-		Arc, Mutex,
+		Arc,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 	thread::{self, JoinHandle},
@@ -16,6 +16,7 @@ use std::{
 };
 
 use omp_core::{FastHashMap, Str, Ulid, encoding::base64};
+use parking_lot::Mutex;
 #[cfg(target_os = "linux")]
 use tempfile::TempDir;
 use url::Url;
@@ -105,10 +106,7 @@ impl ScopedProxy {
 	/// token.
 	pub(crate) fn begin_attempt(&self) -> Str {
 		let token = Str::from(Ulid::generate().to_string());
-		let mut attempts = self
-			.attempts
-			.lock()
-			.expect("proxy attempt registry poisoned");
+		let mut attempts = self.attempts.lock();
 		if attempts.len() >= MAX_ATTEMPTS
 			&& let Some(expired) = attempts.keys().next().cloned()
 		{
@@ -120,7 +118,7 @@ impl ScopedProxy {
 
 	/// Consumes this capability's denial and invalidates it.
 	pub(crate) fn finish_attempt(&self, token: &Str) -> Option<(Str, u16)> {
-		self.attempts.lock().ok()?.remove(token).flatten()
+		self.attempts.lock().remove(token).flatten()
 	}
 
 	/// Returns an HTTP proxy URL carrying this attempt capability.
@@ -286,10 +284,7 @@ impl ProxyPolicy {
 	}
 
 	fn attempt_is_active(&self, token: &Str) -> bool {
-		self
-			.attempts
-			.lock()
-			.is_ok_and(|attempts| attempts.contains_key(token))
+		self.attempts.lock().contains_key(token)
 	}
 
 	fn authorize(&self, token: &Str, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
@@ -315,9 +310,7 @@ impl ProxyPolicy {
 						.iter()
 						.any(|rule| domain_matches(rule.as_str(), &host)))
 		{
-			if let Ok(mut attempts) = self.attempts.lock()
-				&& let Some(denial) = attempts.get_mut(token)
-			{
+			if let Some(denial) = self.attempts.lock().get_mut(token) {
 				*denial = Some((Str::from(host.as_str()), port));
 			}
 			return Err(policy_blocked());
@@ -1536,7 +1529,7 @@ mod tests {
 		for _ in 0..=MAX_ATTEMPTS {
 			proxy.begin_attempt();
 		}
-		assert!(proxy.attempts.lock().expect("attempt registry").len() <= MAX_ATTEMPTS);
+		assert!(proxy.attempts.lock().len() <= MAX_ATTEMPTS);
 	}
 
 	#[test]

@@ -9,12 +9,11 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time,
 	time::{Duration, Instant},
 };
 
 use flume::Receiver;
-use omp_agent::{JournalCustomEntry, SlotClass, SlotId};
+use omp_agent::{SlotClass, SlotId};
 use omp_core::{CowBytes, Hash32, InvocationPhase, LifecyclePhase, SparseMap, Str, sf};
 use omp_proto::{
 	inference::v1::{Value, ValueMap, value},
@@ -23,11 +22,9 @@ use omp_proto::{
 		v1::{
 			ContextHostEnvelope, Dispatch as HookDispatch, FallbackLifecycleEventV1, HookEventId,
 			HookHostEnvelope, HostFrame, LifecycleEventContext, PromptContribution, PromptPull,
-			RegimeApply, RegimeDraft, RegimeHostEnvelope, RegimeWorkerEnvelope, RetryLifecycleEventV1,
-			TtsrTriggeredEventV1, UiHostEnvelope, UiWorkerEnvelope, WorkerFrame,
+			RetryLifecycleEventV1, UiHostEnvelope, UiWorkerEnvelope, WorkerFrame,
 			context_host_envelope, context_worker_envelope, hook_host_envelope, host_frame,
-			lifecycle_worker_envelope, regime_host_envelope, regime_worker_envelope, ui_host_envelope,
-			ui_worker_envelope, worker_frame,
+			lifecycle_worker_envelope, ui_host_envelope, ui_worker_envelope, worker_frame,
 		},
 	},
 	ui::v1::{
@@ -687,71 +684,6 @@ impl LifecycleEvent {
 	}
 }
 
-const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
-const MAX_EVENT_ID_BYTES: usize = 128;
-const MAX_EVENT_TEXT_BYTES: usize = 4096;
-
-/// Projection failure for one durable authoritative lifecycle journal fact.
-#[derive(Debug, Error)]
-pub enum JournalLifecycleEventError {
-	/// The core-authored TTSR payload is absent.
-	#[error("TTSR journal entry has no data payload")]
-	MissingPayload,
-	/// The core-authored TTSR payload did not match its fixed revision.
-	#[error("TTSR journal entry payload is malformed")]
-	InvalidPayload(#[source] serde_json::Error),
-	/// A required provenance identifier exceeded the event protocol bound.
-	#[error("TTSR lifecycle event provenance exceeds protocol bounds")]
-	ProvenanceTooLarge,
-}
-
-#[derive(serde::Deserialize)]
-struct TtsrInjection<'a> {
-	turn_id: &'a str,
-	rules:   Vec<&'a str>,
-	content: &'a str,
-}
-
-/// Projects the authoritative durable TTSR custom entry into the revisioned
-/// extension event. Raw streamed deltas are deliberately not accepted by this
-/// seam; the physical journal index supplies the exactly-once sequence.
-pub fn ttsr_event_from_journal(
-	session_id: &str,
-	entry: &JournalCustomEntry,
-) -> Result<Option<LifecycleEvent>, JournalLifecycleEventError> {
-	if entry.entry.kind() != TTSR_INJECTION_KIND {
-		return Ok(None);
-	}
-	let raw = entry
-		.entry
-		.data()
-		.ok_or(JournalLifecycleEventError::MissingPayload)?;
-	let payload: TtsrInjection<'_> =
-		serde_json::from_str(raw.get()).map_err(JournalLifecycleEventError::InvalidPayload)?;
-	if session_id.len() > MAX_EVENT_ID_BYTES || payload.turn_id.len() > MAX_EVENT_ID_BYTES {
-		return Err(JournalLifecycleEventError::ProvenanceTooLarge);
-	}
-	let mut rules = payload.rules.join(",");
-	rules.truncate(rules.floor_char_boundary(MAX_EVENT_TEXT_BYTES));
-	let mut matched = payload.content.to_owned();
-	matched.truncate(matched.floor_char_boundary(MAX_EVENT_TEXT_BYTES));
-	let event = TtsrTriggeredEventV1 {
-		context: Some(LifecycleEventContext {
-			session_id: session_id.to_owned(),
-			turn_id:    payload.turn_id.to_owned(),
-			sequence:   entry.index,
-		}),
-		rule: rules,
-		matched,
-		interrupted: true,
-	};
-	Ok(Some(LifecycleEvent {
-		id:       HookEventId::HookEventTtsrTriggered,
-		revision: 1,
-		payload:  CowBytes::from(event.encode_to_vec()),
-	}))
-}
-
 /// Emits one revision-1 inference retry transition.
 pub fn retry_event(
 	context: LifecycleEventContext,
@@ -1092,7 +1024,7 @@ const fn prompt_slot_default_class(slot: SlotId) -> SlotClass {
 		SlotId::Policy | SlotId::Skills | SlotId::Rules | SlotId::Guidance | SlotId::Workspace => {
 			SlotClass::Stable
 		},
-		SlotId::Memory | SlotId::Standing => SlotClass::Epochal,
+		SlotId::Memory | SlotId::Standing => SlotClass::Dynamic,
 		SlotId::Recall | SlotId::Status => SlotClass::Volatile,
 		SlotId::Conventions | SlotId::Role | SlotId::Tools | SlotId::Delivery => SlotClass::Frozen,
 	}
@@ -1122,9 +1054,6 @@ pub struct DispatchRequest {
 	/// Already encoded request payload.
 	pub payload:  CowBytes<'static>,
 }
-
-/// Submission-latency deadline shared by extension regime callbacks.
-pub const REGIME_SUBMISSION_TIMEOUT: Duration = time::Duration::from_secs(30);
 
 /// One typed command or shortcut callback routed to an exact roster owner.
 #[derive(Clone, Debug)]
@@ -1220,59 +1149,6 @@ pub fn shortcut_dispatch_succeeded(payload: &[u8], owner: &UiCallbackOwner) -> b
 		.ok()
 		.and_then(|result| result.result)
 		.is_some_and(|result| matches!(result, ui_dispatch_result::Result::Shortcut(_)))
-}
-
-/// One revisioned regime callback routed through the ordinary actor.
-#[derive(Clone, Debug)]
-pub struct RegimeDispatch {
-	/// Extension actor that owns the regime declaration.
-	pub extension: Str,
-	/// Revision-1 callback payload.
-	pub apply:     RegimeApply,
-}
-
-impl RegimeDispatch {
-	/// Encodes this callback with serialized hook-equivalent reentrancy.
-	pub fn request(mut self, id: u64) -> Result<DispatchRequest, RegimeDispatchError> {
-		if id == 0 {
-			return Err(RegimeDispatchError::ZeroId);
-		}
-		self.apply.deadline_ms =
-			u64::try_from(REGIME_SUBMISSION_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-		let envelope = RegimeHostEnvelope {
-			body:  Some(regime_host_envelope::Body::Apply(self.apply)),
-			props: None,
-		};
-		Ok(DispatchRequest {
-			id,
-			policy: CallbackConcurrency::Serialized,
-			deadline: EventDeadline { at: Instant::now() + REGIME_SUBMISSION_TIMEOUT },
-			payload: CowBytes::from(envelope.encode_to_vec()),
-		})
-	}
-}
-
-/// Invalid regime callback envelope or correlation.
-#[derive(Debug, Error)]
-pub enum RegimeDispatchError {
-	/// Zero cannot identify a correlated callback.
-	#[error("regime dispatch correlation id must be nonzero")]
-	ZeroId,
-	/// The worker payload was not a regime draft.
-	#[error("worker returned no regime draft")]
-	MissingDraft,
-	/// The worker payload was malformed protobuf.
-	#[error("worker returned a malformed regime draft")]
-	Decode(#[source] prost::DecodeError),
-}
-
-/// Decodes one worker regime response after ordinary router correlation.
-pub fn decode_regime_draft(payload: &[u8]) -> Result<RegimeDraft, RegimeDispatchError> {
-	let envelope = RegimeWorkerEnvelope::decode(payload).map_err(RegimeDispatchError::Decode)?;
-	match envelope.body {
-		Some(regime_worker_envelope::Body::Draft(draft)) => Ok(draft),
-		_ => Err(RegimeDispatchError::MissingDraft),
-	}
 }
 
 /// Correlated completion receiver returned to the caller.
@@ -1561,12 +1437,9 @@ impl ExtensionActor {
 }
 #[cfg(test)]
 mod tests {
-	use omp_proto::{
-		toolhost::v1::{RegimePoint, RegimeWorkerEnvelope, regime_worker_envelope},
-		ui::v1::{
-			CommandDispatchResult, CommandInvoked, ShortcutDispatchResult, UiError,
-			command_dispatch_result, ui_dispatch,
-		},
+	use omp_proto::ui::v1::{
+		CommandDispatchResult, CommandInvoked, ShortcutDispatchResult, UiError,
+		command_dispatch_result, ui_dispatch,
 	};
 
 	use super::*;
@@ -1761,45 +1634,6 @@ mod tests {
 	}
 
 	#[test]
-	fn regime_callbacks_use_submission_latency_and_serialized_reentrancy() {
-		let request = RegimeDispatch {
-			extension: Str::new_static("dev.example"),
-			apply:     RegimeApply {
-				regime_id: "retry".to_owned(),
-				activation_id: "activation-1".to_owned(),
-				regime_revision: 1,
-				point: RegimePoint::Settle.into(),
-				..Default::default()
-			},
-		}
-		.request(7)
-		.expect("regime request");
-		assert_eq!(request.id, 7);
-		assert_eq!(request.policy, CallbackConcurrency::Serialized);
-		let envelope = RegimeHostEnvelope::decode(request.payload.as_ref()).expect("host envelope");
-		let Some(regime_host_envelope::Body::Apply(apply)) = envelope.body else {
-			panic!("regime apply body");
-		};
-		assert_eq!(apply.deadline_ms, 30_000);
-	}
-
-	#[test]
-	fn regime_draft_decode_is_revisioned_and_typed() {
-		let expected = RegimeDraft {
-			activation_id: "activation-1".to_owned(),
-			regime_revision: 1,
-			event_revision: 1,
-			..Default::default()
-		};
-		let bytes = RegimeWorkerEnvelope {
-			body:  Some(regime_worker_envelope::Body::Draft(expected.clone())),
-			props: None,
-		}
-		.encode_to_vec();
-		assert_eq!(decode_regime_draft(&bytes).unwrap(), expected);
-	}
-
-	#[test]
 	fn prompt_contribution_is_identity_checked_and_truncated_at_utf8_boundary() {
 		let declaration = v1::SlotDecl {
 			slot:     SlotId::Policy as u32,
@@ -1846,7 +1680,7 @@ mod tests {
 			key:          sf!("dev.example.memory"),
 			owner:        sf!("dev.example"),
 			slot:         SlotId::Memory,
-			class:        SlotClass::Epochal,
+			class:        SlotClass::Dynamic,
 			priority:     4,
 			budget_bytes: 1024,
 		};
@@ -1876,6 +1710,6 @@ mod tests {
 		let encoded = prompt_prop(Some(props), PROMPT_CONTEXT_PROP).expect("context");
 		let value: serde_json::Value = serde_json::from_str(encoded).expect("json");
 		assert_eq!(value["budget_bytes"], 1024);
-		assert_eq!(value["cls"], "epochal");
+		assert_eq!(value["cls"], "dynamic");
 	}
 }

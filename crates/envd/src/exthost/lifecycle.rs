@@ -12,16 +12,12 @@ use std::{
 
 use bytes::BytesMut;
 use flume::Receiver;
-use omp_agent::{
-	GateError, HookEvent, HookGate, HookPatch, HookPhase, MailboxSender,
-	device_availability_interrupt,
-};
+use omp_agent::{EnvEvent, GateError, HookEvent, HookGate, HookPatch, HookPhase, KernelSender, Up};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{InvocationPhase, Provenance, Str};
 use omp_ext::config::{StaticDeclaration, StaticDeclarations};
 use omp_proto::{
-	thread::v1::{Item, Message, Part, Role, item, part},
-	toolhost::v1::{HookEventId, RegimeDeclare, RegimeLifetime, RegimeManifest, SetAvailability},
+	toolhost::v1::{HookEventId, SetAvailability},
 	ui::v1::{CommandDecl, RegisterUi, ShortcutDecl, TriggerDecl, UiEffect, UiRequest},
 };
 use omp_tool::{AvailabilityDelta, Registry, ToolIdentity};
@@ -240,12 +236,12 @@ pub trait AvailabilitySink: Send + Sync {
 /// allowing normal next-turn composition to surface availability changes.
 pub struct RegistryAvailabilitySink {
 	registry: Arc<Registry>,
-	mailbox:  MailboxSender,
+	mailbox:  KernelSender,
 }
 
 impl RegistryAvailabilitySink {
 	/// Binds a shared catalog and the agent's turn-boundary mailbox producer.
-	pub const fn new(registry: Arc<Registry>, mailbox: MailboxSender) -> Self {
+	pub const fn new(registry: Arc<Registry>, mailbox: KernelSender) -> Self {
 		Self { registry, mailbox }
 	}
 }
@@ -269,19 +265,19 @@ impl AvailabilitySink for RegistryAvailabilitySink {
 			}
 			text.push('.');
 		}
-		let item = Item {
-			seq:           0,
-			created_at_ms: 0,
-			kind:          Some(item::Kind::Message(Message {
-				role: Role::System as i32,
-				parts: vec![Part { kind: Some(part::Kind::Text(text)) }],
-				..Default::default()
-			})),
-			props:         None,
-		};
-		let _ = self
-			.mailbox
-			.try_enqueue(device_availability_interrupt(item));
+		let payload = serde_json::json!({
+			"summary": text,
+			"devices": batch.deltas.iter().map(|delta| {
+				serde_json::json!({
+					"name": delta.name.as_str(),
+					"available": delta.mounted,
+					"reason": delta.reason.as_deref(),
+				})
+			}).collect::<Vec<_>>(),
+		});
+		let _ = self.mailbox.try_send(Up::Env(EnvEvent::DeviceAvailability {
+			payload: Str::new(payload.to_string()),
+		}));
 	}
 }
 /// A tool identity in the authoritative manifest declaration set.
@@ -976,93 +972,9 @@ pub enum LifecycleError {
 	/// The typed UI registry differed from the signed manifest rows.
 	#[error(transparent)]
 	UiRegistration(#[from] UiRegistrationError),
-	/// A regime declaration violated the mode-slot contract.
-	#[error(transparent)]
-	RegimeManifest(#[from] RegimeManifestError),
 	/// An activation handler failed.
 	#[error("extension activation failed: {0}")]
 	Activation(Str),
-}
-
-/// Structured rejection for a regime declaration that can silently act as a
-/// mode.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum RegimeManifestError {
-	/// A Session regime sets a mode-affecting surface without owning the
-	/// mode resource.
-	#[error("session regime {regime} sets {setting} without owning mode")]
-	ModeOwnershipRequired {
-		/// Regime specification identifier.
-		regime:  Str,
-		/// Mode-affecting setting that triggered the rejection.
-		setting: Str,
-	},
-	/// A declaration's scoped settings were not a canonical JSON object.
-	#[error("regime {regime} sets must encode a JSON object")]
-	InvalidSettings {
-		/// Regime specification identifier.
-		regime: Str,
-	},
-}
-
-/// Declarations retained by the extension host from DECLARE through FREEZE.
-#[derive(Clone, Debug, Default)]
-pub struct RegimeDeclarationTable {
-	manifests: Box<[RegimeManifest]>,
-}
-
-impl RegimeDeclarationTable {
-	/// Validates and retains one worker declaration table.
-	pub fn declare(declaration: RegimeDeclare) -> Result<Self, RegimeManifestError> {
-		validate_regime_manifests(&declaration.manifests)?;
-		Ok(Self { manifests: declaration.manifests.into_boxed_slice() })
-	}
-
-	/// Revalidates the sealed table at FREEZE before any regime may activate.
-	pub fn freeze(&self) -> Result<(), RegimeManifestError> {
-		validate_regime_manifests(&self.manifests)
-	}
-
-	/// Returns the exact declaration order supplied by the worker.
-	pub fn manifests(&self) -> &[RegimeManifest] {
-		&self.manifests
-	}
-}
-
-/// Rejects session regimes that set the model or toolset without owning `mode`.
-pub fn validate_regime_manifests(manifests: &[RegimeManifest]) -> Result<(), RegimeManifestError> {
-	for manifest in manifests {
-		if RegimeLifetime::try_from(manifest.lifetime) != Ok(RegimeLifetime::Session)
-			|| manifest.owns.iter().any(|resource| resource == "mode")
-		{
-			continue;
-		}
-		let sets = if manifest.sets.is_empty() {
-			None
-		} else {
-			Some(
-				serde_json::from_slice::<serde_json::Value>(&manifest.sets)
-					.ok()
-					.and_then(|sets| sets.as_object().cloned())
-					.ok_or_else(|| RegimeManifestError::InvalidSettings {
-						regime: Str::from(manifest.id.as_str()),
-					})?,
-			)
-		};
-		if let Some(setting) = sets.as_ref().and_then(|sets| {
-			sets.keys().find(|setting| {
-				setting.eq_ignore_ascii_case("toolset")
-					|| setting.eq_ignore_ascii_case("model")
-					|| setting.eq_ignore_ascii_case("model_route")
-			})
-		}) {
-			return Err(RegimeManifestError::ModeOwnershipRequired {
-				regime:  Str::from(manifest.id.as_str()),
-				setting: Str::from(setting.as_str()),
-			});
-		}
-	}
-	Ok(())
 }
 
 /// Authoritative admitted manifest data required to start one extension.
@@ -1242,7 +1154,6 @@ pub struct LifecycleMachine {
 	trust_runtime:       bool,
 	expected_ui:         Arc<StaticDeclarations>,
 	verified_ui:         Option<VerifiedUiRoster>,
-	regimes:             RegimeDeclarationTable,
 	activation_triggers: BTreeSet<ActivationTrigger>,
 	phase:               LifecyclePhase,
 	session_started_at:  SystemTime,
@@ -1282,7 +1193,6 @@ impl LifecycleMachine {
 			trust_runtime,
 			expected_ui,
 			verified_ui: None,
-			regimes: RegimeDeclarationTable::default(),
 			activation_triggers,
 			phase: LifecyclePhase::Declared,
 			session_started_at,
@@ -1301,7 +1211,6 @@ impl LifecycleMachine {
 			LifecycleError::Freeze(_) => "freeze",
 			LifecycleError::Drift(_) => "declaration_drift",
 			LifecycleError::UiRegistration(_) => "ui_registration",
-			LifecycleError::RegimeManifest(_) => "regime_manifest",
 			LifecycleError::Activation(_) => "activation",
 		};
 		tracing::warn!(
@@ -1383,17 +1292,6 @@ impl LifecycleMachine {
 	/// Returns the manifest-verified UI roster, when registration completed.
 	pub fn verified_ui(&self) -> Option<&VerifiedUiRoster> {
 		self.verified_ui.as_ref()
-	}
-
-	/// Accepts and validates the worker regime table before FREEZE.
-	pub fn declare_regimes(&mut self, declaration: RegimeDeclare) -> Result<(), LifecycleError> {
-		match RegimeDeclarationTable::declare(declaration) {
-			Ok(regimes) => {
-				self.regimes = regimes;
-				Ok(())
-			},
-			Err(error) => Err(self.quarantine(LifecycleError::RegimeManifest(error))),
-		}
 	}
 
 	/// Iterates over the resolved import order.
@@ -1491,9 +1389,6 @@ impl LifecycleMachine {
 			if !drift.is_empty() {
 				return Err(self.quarantine(LifecycleError::Drift(drift)));
 			}
-		}
-		if let Err(error) = self.regimes.freeze() {
-			return Err(self.quarantine(LifecycleError::RegimeManifest(error)));
 		}
 		if let Err(message) = host.freeze().await {
 			return Err(self.quarantine(LifecycleError::Freeze(message)));
@@ -1732,168 +1627,7 @@ fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-	use omp_core::ArtifactDigest;
-
 	use super::*;
-
-	fn core_regime(
-		id: &str,
-		lifetime: RegimeLifetime,
-		owns: &[&str],
-		sets: serde_json::Value,
-	) -> RegimeManifest {
-		RegimeManifest {
-			id: id.to_owned(),
-			lifetime: lifetime.into(),
-			owns: owns.iter().map(|value| (*value).to_owned()).collect(),
-			sets: serde_json::to_vec(&sets)
-				.expect("serialize regime settings")
-				.into(),
-			..Default::default()
-		}
-	}
-
-	fn command_row(id: &str, key: &str) -> StaticDeclaration {
-		StaticDeclaration {
-			id: sf!("{id}"),
-			kind: sf!("command"),
-			module: sf!("extension.commands"),
-			trigger: sf!("lazy"),
-			key: sf!("{key}"),
-			properties: BTreeMap::from([
-				(sf!("aliases"), serde_json::json!(["alias"])),
-				(sf!("description"), serde_json::json!("Runs command")),
-				(sf!("callback"), serde_json::json!("extension.commands.run")),
-			]),
-			..Default::default()
-		}
-	}
-
-	fn command_decl(id: &str, name: &str) -> CommandDecl {
-		CommandDecl {
-			name: name.to_owned(),
-			description: "Runs command".to_owned(),
-			aliases: vec!["alias".to_owned()],
-			declaration_id: id.to_owned(),
-			callback: "extension.commands.run".to_owned(),
-			module: "extension.commands".to_owned(),
-			activation_trigger: "lazy".to_owned(),
-			..Default::default()
-		}
-	}
-	fn lifecycle_provenance() -> Provenance {
-		Provenance::new(
-			sf!("publisher"),
-			sf!("publisher.extension"),
-			sf!("1.2.3"),
-			ArtifactDigest::new([7; 32]),
-			sf!("workspace"),
-			sf!("trusted"),
-			1,
-		)
-	}
-
-	fn observe_gate(event: HookEventId) -> (HookGate, Receiver<omp_agent::HookDispatch>) {
-		let (gate, receiver) = HookGate::delegated_channel();
-		gate.replace_union_mask(1_u128 << event as u32);
-		(gate, receiver)
-	}
-
-	fn payload(dispatch: &omp_agent::HookDispatch) -> serde_json::Value {
-		let separator = dispatch
-			.payload
-			.iter()
-			.position(|byte| *byte == b'\n')
-			.expect("lifecycle payload prefix");
-		serde_json::from_slice(&dispatch.payload[separator + 1..]).expect("lifecycle JSON payload")
-	}
-
-	#[test]
-	fn lifecycle_observe_payloads_and_unsubscribed_fast_path() {
-		let (load_gate, load_frames) = observe_gate(HookEventId::HookEventExtensionLoad);
-		notify_extension_load(&load_gate, &lifecycle_provenance(), true);
-		let load = load_frames.try_recv().expect("extension load frame");
-		assert_eq!(load.event, HookEventId::HookEventExtensionLoad);
-		assert_eq!(load.phase, HookPhase::Observe);
-		assert_eq!(
-			payload(&load),
-			serde_json::json!({
-				"extension": "publisher.extension",
-				"version": "1.2.3",
-				"source": ArtifactDigest::new([7; 32]).to_string(),
-				"trust": "trusted",
-				"reloaded": true,
-			})
-		);
-
-		let (unload_gate, unload_frames) = observe_gate(HookEventId::HookEventExtensionUnload);
-		notify_extension_unload(&unload_gate, "publisher.extension", "reload", 3);
-		assert_eq!(
-			payload(&unload_frames.try_recv().expect("extension unload frame")),
-			serde_json::json!({
-				"extension": "publisher.extension",
-				"reason": "reload",
-				"pending_hooks": 3,
-			})
-		);
-
-		let (reconnect_gate, reconnect_frames) = observe_gate(HookEventId::HookEventHostReconnect);
-		notify_host_reconnect(
-			&reconnect_gate,
-			9,
-			2,
-			RestartReason::HealthTimeout,
-			Duration::from_millis(125),
-		);
-		let reconnect = payload(&reconnect_frames.try_recv().expect("host reconnect frame"));
-		assert_eq!(reconnect["generation"], 9);
-		assert_eq!(reconnect["missed_events"], 2);
-		assert_eq!(reconnect["restart_cause"], "health_timeout");
-		assert_eq!(reconnect["uptime"], "0.125000000s");
-
-		let (unsubscribed, frames) = HookGate::delegated_channel();
-		notify_extension_load(&unsubscribed, &lifecycle_provenance(), false);
-		notify_extension_unload(&unsubscribed, "publisher.extension", "shutdown", 0);
-		notify_host_reconnect(&unsubscribed, 10, 0, RestartReason::Crash, Duration::ZERO);
-		assert!(frames.is_empty());
-	}
-
-	#[test]
-	fn register_ui_exact_validates_manifest_metadata_and_duplicates() {
-		let mut expected = StaticDeclarations::default();
-		expected.ui.commands = vec![command_row("command", "run")].into_boxed_slice();
-		let exact = RegisterUi {
-			commands: vec![command_decl("command", "run")],
-			generation: 4,
-			extension_id: "extension".to_owned(),
-			..Default::default()
-		};
-		let roster = verify_ui_registration(&expected, exact).expect("exact UI table");
-		assert_eq!(roster.commands[0].name, "run");
-
-		let duplicate = RegisterUi {
-			commands: vec![command_decl("command", "run"), command_decl("other", "alias")],
-			generation: 4,
-			extension_id: "extension".to_owned(),
-			..Default::default()
-		};
-		assert!(matches!(
-			verify_ui_registration(&expected, duplicate),
-			Err(UiRegistrationError::DuplicateCommand { .. })
-		));
-
-		let mut drifted = command_decl("command", "run");
-		drifted.aliases = vec!["undeclared".to_owned()];
-		assert!(matches!(
-			verify_ui_registration(&expected, RegisterUi {
-				commands: vec![drifted],
-				generation: 4,
-				extension_id: "extension".to_owned(),
-				..Default::default()
-			}),
-			Err(UiRegistrationError::Metadata { .. })
-		));
-	}
 
 	#[test]
 	fn stale_ui_registration_degrades_generation() {
@@ -1920,77 +1654,5 @@ mod tests {
 			.expect_err("registration generation must match transport generation");
 		assert!(matches!(error, LifecycleError::StaleGeneration { .. }));
 		assert_eq!(lifecycle.phase(), LifecyclePhase::Degraded);
-	}
-
-	#[test]
-	fn core_regime_specs_cannot_declare_stealth_modes() {
-		let stealth = core_regime(
-			"stealth",
-			RegimeLifetime::Session,
-			&["worktree"],
-			serde_json::json!({"toolset": "coding"}),
-		);
-		assert_eq!(
-			validate_regime_manifests(&[stealth]),
-			Err(RegimeManifestError::ModeOwnershipRequired {
-				regime:  Str::from("stealth"),
-				setting: Str::from("toolset"),
-			})
-		);
-		let mut lifecycle = LifecycleMachine::new(
-			"core",
-			"entry",
-			[],
-			DeclarationSet::default(),
-			false,
-			Arc::new(StaticDeclarations::default()),
-			BTreeSet::new(),
-			SystemTime::UNIX_EPOCH,
-			1,
-		);
-		let error = lifecycle
-			.declare_regimes(RegimeDeclare {
-				manifests: vec![core_regime(
-					"stealth",
-					RegimeLifetime::Session,
-					&[],
-					serde_json::json!({"model": "fast"}),
-				)],
-				..Default::default()
-			})
-			.expect_err("stealth mode must fail at declare");
-		assert!(matches!(
-			error,
-			LifecycleError::RegimeManifest(RegimeManifestError::ModeOwnershipRequired { .. })
-		));
-		assert_eq!(lifecycle.phase(), LifecyclePhase::Degraded);
-	}
-
-	#[test]
-	fn core_regime_specs_may_own_or_avoid_the_mode_resource() {
-		let manifests = [
-			core_regime(
-				"plan",
-				RegimeLifetime::Session,
-				&["mode", "worktree"],
-				serde_json::json!({"toolset": "planning"}),
-			),
-			core_regime("turn-route", RegimeLifetime::Run, &[], serde_json::json!({"model": "fast"})),
-			core_regime(
-				"prompt-notice",
-				RegimeLifetime::Session,
-				&[],
-				serde_json::json!({"prompt_slot": "notice"}),
-			),
-		];
-		assert_eq!(validate_regime_manifests(&manifests), Ok(()));
-
-		let table = RegimeDeclarationTable::declare(RegimeDeclare {
-			manifests: manifests.into(),
-			..Default::default()
-		})
-		.expect("valid core regime declarations");
-		assert_eq!(table.manifests().len(), 3);
-		assert_eq!(table.freeze(), Ok(()));
 	}
 }

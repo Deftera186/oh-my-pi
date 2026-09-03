@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use omp_agent::{ApprovalBook, ApprovalSpec};
+use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, ApprovalTicket};
 use omp_core::{InvocationPhase, LifecyclePhase, Principal, Str, sf};
 use omp_envd::{
 	exthost::{
@@ -155,10 +155,7 @@ struct PolicyAudit(AtomicBool);
 
 #[async_trait]
 impl PolicyAuditSink for PolicyAudit {
-	async fn approval_decided(
-		&self,
-		_ticket: &omp_agent::ApprovalTicket,
-	) -> Result<(), PolicyControlFailure> {
+	async fn approval_decided(&self, _ticket: &ApprovalTicket) -> Result<(), PolicyControlFailure> {
 		self.0.store(true, Ordering::Release);
 		Ok(())
 	}
@@ -280,11 +277,12 @@ async fn domains_delegate_to_native_owners_with_generation_and_audit_fences() {
 	let context = context(Arc::clone(&identity));
 
 	let approvals = Arc::new(ApprovalBook::new());
+	let (approval_route, _approval_inbox) = ApprovalRoute::new(approvals, None);
 	let audit = Arc::new(PolicyAudit(AtomicBool::new(false)));
 	let policy = PolicyControlOwner::new(
 		Arc::clone(&identity),
 		Arc::new(PolicyRuntime),
-		Arc::clone(&approvals),
+		approval_route,
 		audit,
 	);
 	let parsed = policy

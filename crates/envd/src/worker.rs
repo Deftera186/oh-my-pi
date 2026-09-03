@@ -45,16 +45,14 @@ use omp_proto::{
 			ContextWorkerEnvelope, ExtensionActivated, ExtensionDecl, FreezeDeclarations, HostFrame,
 			InvokeTool, JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping, Pong,
 			PreludeParam, PreludeParamKind, PrincipalRef, PromptContribution, ProtocolError,
-			ProtocolErrorCode, PullReply, PullRequest, QuotaDrop, QuotaStatus, RegimeApply,
-			RegimeControl, RegimeControlKind, RegimeDraft, RegimeEffect, RegimeEffectKind,
-			RegimeHostEnvelope, RegimeStart, RegimeStop, RegimeWorkerEnvelope, RegisterTools,
+			ProtocolErrorCode, PullReply, PullRequest, QuotaDrop, QuotaStatus, RegisterTools,
 			ResourceUpdate, RestartReason as WireRestartReason,
 			ServiceDispatch as WireServiceDispatch, ServiceReply, ServiceResult, ToolAborted,
 			ToolArgs, ToolComplete, ToolDecl, ToolUpdate, UiHostEnvelope, UiWorkerEnvelope,
 			WorkerFrame, WorkerHello, activation_cli_value, argument_host_envelope,
 			argument_worker_envelope, context_host_envelope, context_worker_envelope, host_frame,
-			lifecycle_host_envelope, lifecycle_worker_envelope, regime_host_envelope,
-			regime_worker_envelope, ui_host_envelope, ui_worker_envelope, worker_frame,
+			lifecycle_host_envelope, lifecycle_worker_envelope, ui_host_envelope, ui_worker_envelope,
+			worker_frame,
 		},
 	},
 	ui::v1::{
@@ -78,7 +76,6 @@ use thiserror::Error;
 use tokio::{
 	io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
 	process::{Child, ChildStdin, ChildStdout, Command},
-	runtime,
 	task::JoinHandle,
 	time,
 	time::{Instant, MissedTickBehavior},
@@ -103,13 +100,12 @@ use crate::{
 			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlHandle,
 			ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
 			ExternalJournalRequest, JournalConnectionIdentity, JournalControl, JournalDispatch,
-			journal_rows,
 		},
 		dispatch::{
 			CallbackDispatcher, PROMPT_CONTEXT_PROP, PROMPT_KEY_PROP, PROMPT_OWNER_PROP,
 			PromptContributionProvider, PromptContributionRecord, PromptDispatchError,
-			PromptPullContext, PromptSlotBinding, REGIME_SUBMISSION_TIMEOUT, UiCallbackDispatch,
-			decode_prompt_contribution, prompt_prop, prompt_pull_frame, prompt_slot_binding,
+			PromptPullContext, PromptSlotBinding, UiCallbackDispatch, decode_prompt_contribution,
+			prompt_prop, prompt_pull_frame, prompt_slot_binding,
 		},
 		notify_extension_load, notify_extension_unload, notify_host_reconnect,
 		services::{
@@ -256,11 +252,9 @@ pub struct ExternalJournalCall {
 	pub reply:    flume::Sender<Result<JournalHostEnvelope, Str>>,
 }
 
-/// Agent-Journal and storage-backend handles installed into extension hosts.
+/// External storage-backend handle installed into extension hosts.
 #[derive(Clone)]
 pub struct JournalRuntime {
-	/// Serialized Agent Journal mailbox sender.
-	pub agent:    omp_agent::control::ControlSender,
 	/// Environment composition endpoint for session indexes, state, usage, and
 	/// artifacts.
 	pub external: flume::Sender<ExternalJournalCall>,
@@ -386,8 +380,6 @@ pub struct ExternalDomainControlFactories {
 	pub jobs:              Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Inference provider mutation owner.
 	pub provider:          Option<Arc<dyn ControlAuthorityFactory>>,
-	/// Session/turn regime owner.
-	pub regimes:           Option<Arc<dyn ControlAuthorityFactory>>,
 	/// Inter-extension service broker owner.
 	pub services:          Option<Arc<dyn ControlAuthorityFactory>>,
 }
@@ -2082,6 +2074,47 @@ impl ExtHostSupervisor {
 		self.frozen_registry.lock().values().cloned().collect()
 	}
 
+	/// Registers every frozen Python Director and Component with the engine.
+	pub fn register_python_extensions(
+		&self,
+		registrar: &mut omp_agent::ExtensionRegistrar,
+	) -> Result<Vec<crate::exthost::PyComponent>, crate::exthost::PyExtensionError> {
+		let evidence = self.frozen_registry.lock();
+		let mut components = Vec::new();
+		for activation in &self.control_activations {
+			let key = (
+				activation.identity.layer.clone(),
+				activation.identity.tier.clone(),
+				activation.identity.extension.clone(),
+			);
+			let Some(sealed) = evidence.get(&key) else {
+				continue;
+			};
+			let mut host = FrozenControlLifecycleHost::new(
+				activation.control.clone(),
+				activation.identity.extension.clone(),
+				activation.session_id.clone(),
+				activation.identity.host_generation,
+				Arc::clone(&activation.identity),
+				activation.manifest.clone(),
+				sealed.ui.clone(),
+				Arc::clone(&self.frozen_registry),
+				activation.settings.clone(),
+			);
+			let authority =
+				host.authority("extension.register", InvocationPhase::Open, LifecyclePhase::Active);
+			components.extend(crate::exthost::register_python_extensions(
+				registrar,
+				&sealed.directors,
+				&sealed.components,
+				activation.control.clone(),
+				authority,
+				None,
+			)?);
+		}
+		Ok(components)
+	}
+
 	/// Returns every authenticated CONTROL identity, including hosts whose
 	/// declaration freeze has not yet published registry evidence.
 	pub fn control_identities(&self) -> Vec<Arc<ControlConnectionIdentity>> {
@@ -2101,7 +2134,6 @@ impl ExtHostSupervisor {
 	) -> Result<serde_json::Value, ExtensionCallbackError> {
 		let operation = dispatch.operation.as_str();
 		if !matches!(operation, "omp.devices.call" | "omp.hooks.dispatch")
-			&& !operation.starts_with("omp.regimes.")
 			&& !operation.starts_with("omp.provider.")
 			&& !operation.starts_with("omp.ui.")
 			&& !operation.starts_with("omp.jobs.")
@@ -3469,7 +3501,9 @@ struct RegisteredRegistrySnapshot {
 	#[serde(default)]
 	providers:             Vec<serde_json::Value>,
 	#[serde(default)]
-	regimes:               Vec<serde_json::Value>,
+	directors:             Vec<serde_json::Value>,
+	#[serde(default)]
+	components:            Vec<serde_json::Value>,
 }
 
 /// One manifest-verified runtime tool registration.
@@ -3541,974 +3575,11 @@ pub struct SealedRegistryEvidence {
 	pub ui:         VerifiedUiRoster,
 	/// Full frozen runtime provider declaration documents.
 	pub providers:  Arc<[serde_json::Value]>,
-	/// Full frozen runtime regime declaration documents.
-	pub regimes:    Arc<[serde_json::Value]>,
+	/// Python lifecycle declarations registered as Directors.
+	pub directors:  Arc<[serde_json::Value]>,
+	/// Python state declarations registered as Components.
+	pub components: Arc<[serde_json::Value]>,
 }
-type RegimeEvidenceLookup =
-	dyn Fn(&ControlConnectionIdentity) -> Option<Arc<SealedRegistryEvidence>> + Send + Sync;
-
-/// Resolves executable extension regimes only from exact-generation FREEZE
-/// evidence.
-pub struct ExtensionRegimeResolver {
-	callbacks: Arc<dyn CallbackDispatcher>,
-	evidence:  Arc<RegimeEvidenceLookup>,
-	owners:    Mutex<BTreeMap<Str, Str>>,
-	runtime:   Option<runtime::Handle>,
-}
-
-impl ExtensionRegimeResolver {
-	/// Binds the live callback router to the retained frozen declaration lookup.
-	pub fn new<F>(callbacks: Arc<dyn CallbackDispatcher>, evidence: F) -> Arc<Self>
-	where
-		F: Fn(&ControlConnectionIdentity) -> Option<Arc<SealedRegistryEvidence>>
-			+ Send
-			+ Sync
-			+ 'static,
-	{
-		Arc::new(Self {
-			callbacks,
-			evidence: Arc::new(evidence),
-			owners: Mutex::new(BTreeMap::new()),
-			runtime: runtime::Handle::try_current().ok(),
-		})
-	}
-
-	/// Resolves one declaration and constructs its exact-generation callback
-	/// machine.
-	pub fn resolve(
-		&self,
-		identity: &ControlConnectionIdentity,
-		regime: &str,
-		state: Option<&[u8]>,
-		state_revision: Option<u32>,
-	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
-		let evidence = (self.evidence)(identity).ok_or_else(|| {
-			ControlProtocolError::new(
-				"StaleGeneration",
-				"regime declarations are unavailable for this host or session generation",
-			)
-		})?;
-		if !same_control_identity(&evidence.identity, identity) {
-			return Err(ControlProtocolError::new(
-				"StaleGeneration",
-				"regime declaration belongs to a replaced host or session generation",
-			));
-		}
-		let session = evidence.session.clone().ok_or_else(|| {
-			ControlProtocolError::new(
-				"InvalidRegimeDeclaration",
-				"regime declaration has no authenticated callback session",
-			)
-		})?;
-		let document = evidence
-			.regimes
-			.iter()
-			.find(|document| document.get("id").and_then(serde_json::Value::as_str) == Some(regime))
-			.ok_or_else(|| {
-				ControlProtocolError::new(
-					"TargetNotFound",
-					"regime is absent from the sealed declaration table",
-				)
-			})?;
-		let declaration = FrozenRegimeDeclaration::parse(document)?;
-		let state = state.unwrap_or_default();
-		if (!state.is_empty() || state_revision.is_some())
-			&& declaration.state_revision != state_revision
-		{
-			return Err(ControlProtocolError::new(
-				"InvalidRegimeState",
-				"regime state revision differs from the sealed declaration",
-			));
-		}
-		let state = std::str::from_utf8(state).map_err(|_| {
-			ControlProtocolError::new("InvalidRegimeState", "regime state must be UTF-8")
-		})?;
-		let spec = declaration.spec();
-		let mut owners = self.owners.lock();
-		if owners
-			.get(&spec.id)
-			.is_some_and(|owner| owner != &identity.extension)
-		{
-			return Err(ControlProtocolError::new(
-				"InvalidRegimeDeclaration",
-				"two extensions resolved the same frozen regime identity",
-			));
-		}
-		owners.insert(spec.id.clone(), identity.extension.clone());
-		drop(owners);
-		let machine = ExtensionRegime {
-			callbacks: Arc::clone(&self.callbacks),
-			identity: Arc::clone(&evidence.identity),
-			session,
-			regime: spec.id.clone(),
-			revision: declaration.revision,
-			state_revision: declaration.state_revision,
-			on_failure: declaration.on_failure,
-			state: Str::from(state),
-			started_activation: None,
-			runtime: self.runtime.clone(),
-		};
-		Ok((Arc::new(spec), Box::new(machine)))
-	}
-
-	/// Returns the owner retained when a frozen declaration was resolved.
-	pub fn owner(&self, regime: &str) -> Option<Str> {
-		self.owners.lock().get(regime).cloned()
-	}
-}
-
-#[derive(Clone, Copy)]
-enum RegimeFailurePolicy {
-	Defer,
-	Deny,
-}
-
-struct FrozenRegimeDeclaration {
-	id: Str,
-	revision: u32,
-	events: omp_core::PointSet,
-	precedence: i16,
-	max_steps: Option<u32>,
-	committed_step_interval_ms: Option<u64>,
-	has_on_limit: bool,
-	lifetime: omp_agent::RegimeLifetime,
-	family_rev: Str,
-	state_revision: Option<u32>,
-	when: Option<omp_agent::RegimeWhen>,
-	owns: Arc<[omp_agent::Resource]>,
-	sets: Arc<[omp_agent::ScopedSetting]>,
-	minimum_duration_ms: Option<u64>,
-	on_failure: RegimeFailurePolicy,
-}
-
-impl FrozenRegimeDeclaration {
-	fn parse(document: &serde_json::Value) -> Result<Self, ControlProtocolError> {
-		let object = document
-			.as_object()
-			.ok_or_else(|| frozen_declaration_error("sealed regime manifest must be an object"))?;
-		let text = |name: &str| {
-			object
-				.get(name)
-				.and_then(serde_json::Value::as_str)
-				.filter(|value| !value.is_empty())
-				.ok_or_else(|| frozen_declaration_error(sf!("regime omitted {name}")))
-		};
-		let id = Str::from(text("id")?);
-		let revision = object
-			.get("revision")
-			.and_then(serde_json::Value::as_u64)
-			.and_then(|revision| u32::try_from(revision).ok())
-			.filter(|revision| *revision > 0)
-			.ok_or_else(|| frozen_declaration_error("regime revision must be positive"))?;
-		let mut events = omp_core::PointSet::EMPTY;
-		for point in object
-			.get("points")
-			.and_then(serde_json::Value::as_array)
-			.ok_or_else(|| frozen_declaration_error("regime omitted points"))?
-		{
-			events = events.with(parse_regime_point(
-				point
-					.as_str()
-					.ok_or_else(|| frozen_declaration_error("regime point must be a string"))?,
-			)?);
-		}
-		if events == omp_core::PointSet::EMPTY {
-			return Err(frozen_declaration_error("regime points must not be empty"));
-		}
-		let precedence = object
-			.get("precedence")
-			.and_then(serde_json::Value::as_i64)
-			.and_then(|value| i16::try_from(value).ok())
-			.ok_or_else(|| frozen_declaration_error("regime precedence is invalid"))?;
-		let lifetime = match text("lifetime")? {
-			"turn" => omp_agent::RegimeLifetime::Turn,
-			"run" => omp_agent::RegimeLifetime::Run,
-			"session" => omp_agent::RegimeLifetime::Session,
-			_ => return Err(frozen_declaration_error("regime has an unknown lifetime")),
-		};
-		let max_steps = optional_u32(object, "max_steps")?;
-		let committed_step_interval_ms = optional_u64(object, "committed_step_interval_ms")?;
-		let has_on_limit = object
-			.get("has_on_limit")
-			.and_then(serde_json::Value::as_bool)
-			.ok_or_else(|| frozen_declaration_error("regime omitted has_on_limit"))?;
-		if has_on_limit && max_steps.is_none() {
-			return Err(frozen_declaration_error("regime on_limit requires max_steps"));
-		}
-		let state_family = optional_text(object, "state_family")?;
-		let state_revision = optional_u32(object, "state_revision")?;
-		let family_rev = match (state_family, state_revision) {
-			(Some(family), Some(state_revision)) => sf!("{family}@{state_revision}"),
-			(None, None) => sf!("{}@{revision}", id),
-			_ => return Err(frozen_declaration_error("regime state family is malformed")),
-		};
-		let when = match decode_manifest_json(
-			object
-				.get("when")
-				.ok_or_else(|| frozen_declaration_error("regime omitted when"))?,
-		)? {
-			serde_json::Value::Null => None,
-			when => Some(parse_regime_when(&when)?),
-		};
-		let owns = object
-			.get("owns")
-			.and_then(serde_json::Value::as_array)
-			.ok_or_else(|| frozen_declaration_error("regime omitted owns"))?
-			.iter()
-			.map(|resource| {
-				let resource = resource
-					.as_str()
-					.filter(|resource| !resource.is_empty())
-					.ok_or_else(|| frozen_declaration_error("regime resource must be a string"))?;
-				Ok(match resource {
-					"tool_choice" => omp_agent::Resource::ToolChoice,
-					"worktree" => omp_agent::Resource::Worktree,
-					"director" => omp_agent::Resource::Director,
-					"editor-surface" => omp_agent::Resource::EditorSurface,
-					"batch-execution" => omp_agent::Resource::BatchExecution,
-					"mode" => omp_agent::Resource::Mode,
-					other => omp_agent::Resource::Named(Str::from(other)),
-				})
-			})
-			.collect::<Result<Vec<_>, ControlProtocolError>>()?;
-		let sets = decode_manifest_json(
-			object
-				.get("sets")
-				.ok_or_else(|| frozen_declaration_error("regime omitted sets"))?,
-		)?
-		.as_object()
-		.ok_or_else(|| frozen_declaration_error("regime sets must encode an object"))?
-		.iter()
-		.map(|(name, value)| {
-			Ok(omp_agent::ScopedSetting {
-				slot:  setting_slot(name),
-				value: json_setting_value(value)?,
-			})
-		})
-		.collect::<Result<Vec<_>, ControlProtocolError>>()?;
-		let minimum_duration_ms = optional_u64(object, "minimum_duration_ms")?;
-		let on_failure = match text("on_failure")? {
-			"defer" => RegimeFailurePolicy::Defer,
-			"deny" => RegimeFailurePolicy::Deny,
-			_ => return Err(frozen_declaration_error("regime has an unknown failure policy")),
-		};
-		Ok(Self {
-			id,
-			revision,
-			events,
-			precedence,
-			max_steps,
-			committed_step_interval_ms,
-			has_on_limit,
-			lifetime,
-			family_rev,
-			state_revision,
-			when,
-			owns: owns.into(),
-			sets: sets.into(),
-			minimum_duration_ms,
-			on_failure,
-		})
-	}
-
-	fn spec(&self) -> omp_agent::RegimeSpec {
-		omp_agent::RegimeSpec {
-			id: self.id.clone(),
-			events: self.events,
-			precedence: self.precedence,
-			max_steps: self.max_steps,
-			committed_step_interval_ms: self.committed_step_interval_ms,
-			on_limit: self.has_on_limit,
-			lifetime: self.lifetime,
-			family_rev: self.family_rev.clone(),
-			when: self.when.clone(),
-			owns: Arc::clone(&self.owns),
-			sets: Arc::clone(&self.sets),
-			minimum_duration_ms: self.minimum_duration_ms,
-		}
-	}
-}
-
-fn optional_text(
-	object: &serde_json::Map<String, serde_json::Value>,
-	name: &str,
-) -> Result<Option<Str>, ControlProtocolError> {
-	match object.get(name) {
-		Some(serde_json::Value::Null) => Ok(None),
-		Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(Str::from(value))),
-		_ => Err(frozen_declaration_error(sf!("regime {name} is malformed"))),
-	}
-}
-
-fn decode_manifest_json(
-	value: &serde_json::Value,
-) -> Result<serde_json::Value, ControlProtocolError> {
-	let bytes = callback_bytes(value)
-		.map_err(|_| frozen_declaration_error("regime manifest byte field is malformed"))?;
-	serde_json::from_slice(&bytes)
-		.map_err(|_| frozen_declaration_error("regime manifest JSON field is malformed"))
-}
-
-fn optional_u32(
-	object: &serde_json::Map<String, serde_json::Value>,
-	name: &str,
-) -> Result<Option<u32>, ControlProtocolError> {
-	optional_u64(object, name)?
-		.map(|value| {
-			u32::try_from(value)
-				.map_err(|_| frozen_declaration_error(sf!("regime {name} is too large")))
-		})
-		.transpose()
-}
-
-fn optional_u64(
-	object: &serde_json::Map<String, serde_json::Value>,
-	name: &str,
-) -> Result<Option<u64>, ControlProtocolError> {
-	match object.get(name) {
-		Some(serde_json::Value::Null) => Ok(None),
-		Some(value) => value
-			.as_u64()
-			.map(Some)
-			.ok_or_else(|| frozen_declaration_error(sf!("regime {name} is malformed"))),
-		None => Err(frozen_declaration_error(sf!("regime omitted {name}"))),
-	}
-}
-
-fn parse_regime_point(value: &str) -> Result<omp_core::Point, ControlProtocolError> {
-	match value {
-		"context" => Ok(omp_core::Point::Context),
-		"tool_choice" => Ok(omp_core::Point::ToolChoice),
-		"pre_model" => Ok(omp_core::Point::PreModel),
-		"stream" => Ok(omp_core::Point::Stream),
-		"admission" => Ok(omp_core::Point::Admission),
-		"batch" => Ok(omp_core::Point::Batch),
-		"turn_end" => Ok(omp_core::Point::TurnEnd),
-		"settle" => Ok(omp_core::Point::Settle),
-		"idle" => Ok(omp_core::Point::Idle),
-		_ => Err(frozen_declaration_error("regime has an unknown point")),
-	}
-}
-
-fn parse_regime_when(
-	value: &serde_json::Value,
-) -> Result<omp_agent::RegimeWhen, ControlProtocolError> {
-	let object = value
-		.as_object()
-		.ok_or_else(|| frozen_declaration_error("regime when must be an object"))?;
-	const KEYS: [&str; 5] =
-		["point", "invocation_id", "stream_contains", "delivered", "checkpoint_active"];
-	if object.keys().any(|key| !KEYS.contains(&key.as_str())) {
-		return Err(frozen_declaration_error("regime when has an unknown field"));
-	}
-	let optional_string = |name: &str| match object.get(name) {
-		None | Some(serde_json::Value::Null) => Ok(None),
-		Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(Str::from(value))),
-		_ => Err(frozen_declaration_error(sf!("regime when {name} is malformed"))),
-	};
-	let optional_bool = |name: &str| match object.get(name) {
-		None | Some(serde_json::Value::Null) => Ok(None),
-		Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
-		_ => Err(frozen_declaration_error(sf!("regime when {name} is malformed"))),
-	};
-	Ok(omp_agent::RegimeWhen {
-		point:             parse_regime_point(
-			object
-				.get("point")
-				.and_then(serde_json::Value::as_str)
-				.ok_or_else(|| frozen_declaration_error("regime when omitted point"))?,
-		)?,
-		invocation_id:     optional_string("invocation_id")?,
-		stream_contains:   optional_string("stream_contains")?,
-		delivered:         optional_bool("delivered")?,
-		checkpoint_active: optional_bool("checkpoint_active")?,
-	})
-}
-
-fn setting_slot(name: &str) -> omp_agent::SettingSlot {
-	match name {
-		"toolset" => omp_agent::SettingSlot::Toolset,
-		"model" | "model_route" => omp_agent::SettingSlot::ModelRoute,
-		"prompt" | "prompt_slot" => omp_agent::SettingSlot::PromptSlot,
-		"delivery" | "delivery_policy" => omp_agent::SettingSlot::DeliveryPolicy,
-		other => omp_agent::SettingSlot::Named(Str::from(other)),
-	}
-}
-
-fn json_setting_value(value: &serde_json::Value) -> Result<Str, ControlProtocolError> {
-	value
-		.as_str()
-		.map(Str::from)
-		.ok_or_else(|| frozen_declaration_error("regime setting values must be strings"))
-}
-
-struct ExtensionRegime {
-	callbacks:          Arc<dyn CallbackDispatcher>,
-	identity:           Arc<ControlConnectionIdentity>,
-	session:            Str,
-	regime:             Str,
-	revision:           u32,
-	state_revision:     Option<u32>,
-	on_failure:         RegimeFailurePolicy,
-	state:              Str,
-	started_activation: Option<Str>,
-	runtime:            Option<runtime::Handle>,
-}
-
-#[derive(Debug, Error)]
-enum ExtensionRegimeError {
-	#[error("extension regime callback runtime is unavailable")]
-	RuntimeUnavailable,
-	#[error("extension regime callback dispatch failed")]
-	Dispatch(#[source] ControlProtocolError),
-	#[error("extension regime event encoding failed")]
-	EventEncode(#[source] serde_json::Error),
-	#[error("extension regime callback returned an invalid draft")]
-	Draft(#[source] RegimeDraftError),
-}
-
-impl ExtensionRegimeError {
-	const fn failure_reason(&self) -> &'static str {
-		match self {
-			Self::RuntimeUnavailable => "extension regime callback runtime is unavailable",
-			Self::Dispatch(_) => "extension regime callback dispatch failed",
-			Self::EventEncode(_) => "extension regime event encoding failed",
-			Self::Draft(_) => "extension regime callback returned an invalid draft",
-		}
-	}
-}
-
-#[derive(Clone, Copy, Debug, Error)]
-enum RegimeDraftError {
-	#[error("regime callback draft has an invalid envelope")]
-	Envelope,
-	#[error("regime callback draft correlation is stale")]
-	StaleCorrelation,
-	#[error("regime callback control is invalid")]
-	Control,
-	#[error("regime callback effect is invalid")]
-	Effect,
-	#[error("regime callback context payload is invalid")]
-	Context,
-	#[error("regime callback byte payload is invalid")]
-	Bytes,
-}
-
-enum DecodedRegimeControl {
-	Retry,
-	Wait(omp_agent::WaitTicket),
-	Reject(Str),
-	Cancel(Str),
-	Complete,
-	Fail(omp_agent::RegimeFailure),
-}
-
-enum DecodedRegimeEffect {
-	AppendContext(Vec<omp_proto::thread::v1::Item>),
-	RewriteContext(omp_agent::ContextPatch),
-	RequireTool(Str),
-	SetScoped(omp_agent::ScopedSetting),
-	ReplaceState(Str),
-}
-
-struct DecodedRegimeDraft {
-	control: Option<DecodedRegimeControl>,
-	effects: Vec<DecodedRegimeEffect>,
-}
-
-impl ExtensionRegime {
-	const fn point_name(point: omp_core::Point) -> &'static str {
-		match point {
-			omp_core::Point::Context => "context",
-			omp_core::Point::ToolChoice => "tool_choice",
-			omp_core::Point::PreModel => "pre_model",
-			omp_core::Point::Stream => "stream",
-			omp_core::Point::Admission => "admission",
-			omp_core::Point::Batch => "batch",
-			omp_core::Point::TurnEnd => "turn_end",
-			omp_core::Point::Settle => "settle",
-			omp_core::Point::Idle => "idle",
-		}
-	}
-
-	fn failure(&self, next: omp_agent::Next<'_>, error: ExtensionRegimeError) {
-		if matches!(self.on_failure, RegimeFailurePolicy::Deny) {
-			next.reject(error.failure_reason());
-		}
-	}
-
-	fn authority(
-		&self,
-		activation: &str,
-		point: Option<omp_core::Point>,
-		call: Option<&str>,
-	) -> ControlInvocationAuthority {
-		ControlInvocationAuthority {
-			invocation:        sf!(
-				"regime:{}:{}:{}",
-				self.identity.extension,
-				self.identity.host_generation,
-				activation
-			),
-			phase:             InvocationPhase::EffectsAuthorized,
-			session:           self.session.clone(),
-			turn:              None,
-			event:             point.map(|point| sf!(Self::point_name(point))),
-			call:              call.map(Str::from),
-			device:            None,
-			effects:           Box::new([]),
-			place_kind:        sf!("host"),
-			lifecycle:         LifecyclePhase::Active,
-			roots:             Box::new([]),
-			remote:            false,
-			has_ui:            false,
-			headless:          true,
-			settings:          serde_json::Map::new(),
-			secret_settings:   Box::new([]),
-			data:              None,
-			direct_filesystem: None,
-		}
-	}
-
-	fn dispatch(
-		&self,
-		operation: &'static str,
-		activation: &str,
-		point: Option<omp_core::Point>,
-		call: Option<&str>,
-		arguments: serde_json::Map<String, serde_json::Value>,
-	) -> Result<serde_json::Value, ExtensionRegimeError> {
-		use std::time::Instant;
-
-		let runtime = self
-			.runtime
-			.clone()
-			.ok_or(ExtensionRegimeError::RuntimeUnavailable)?;
-		let callback = self
-			.callbacks
-			.dispatch(Arc::clone(&self.identity), ControlDispatch {
-				operation: sf!(operation),
-				arguments,
-				authority: self.authority(activation, point, call),
-				policy: CallbackConcurrency::Serialized,
-				deadline: EventDeadline { at: Instant::now() + REGIME_SUBMISSION_TIMEOUT },
-			});
-		if runtime::Handle::try_current().is_ok() {
-			futures::executor::block_on(callback)
-		} else {
-			runtime.block_on(callback)
-		}
-		.map_err(ExtensionRegimeError::Dispatch)
-	}
-
-	fn ensure_started(
-		&mut self,
-		ctx: &omp_agent::RegimeContext<'_>,
-	) -> Result<(), ExtensionRegimeError> {
-		if self.started_activation.as_deref() == Some(ctx.activation_id()) {
-			return Ok(());
-		}
-		let mut arguments = serde_json::Map::new();
-		arguments.insert("regime_id".to_owned(), self.regime.to_string().into());
-		arguments.insert("activation_id".to_owned(), ctx.activation_id().into());
-		arguments.insert("regime_revision".to_owned(), self.revision.into());
-		arguments.insert(
-			"state".to_owned(),
-			serde_json::json!({"$bytes": omp_core::base64::encode(self.state.as_bytes())}),
-		);
-		arguments.insert(
-			"state_revision".to_owned(),
-			self
-				.state_revision
-				.map_or(serde_json::Value::Null, Into::into),
-		);
-		arguments.insert(
-			"deadline_ms".to_owned(),
-			u64::try_from(REGIME_SUBMISSION_TIMEOUT.as_millis())
-				.unwrap_or(u64::MAX)
-				.into(),
-		);
-		arguments.insert("props".to_owned(), serde_json::json!({}));
-		self.dispatch(
-			"omp.regimes.start",
-			ctx.activation_id(),
-			Some(ctx.point()),
-			ctx.facts().invocation_id,
-			arguments,
-		)?;
-		self.started_activation = Some(Str::from(ctx.activation_id()));
-		Ok(())
-	}
-
-	fn apply_callback(
-		&self,
-		ctx: &omp_agent::RegimeContext<'_>,
-		limit_handler: bool,
-	) -> Result<DecodedRegimeDraft, ExtensionRegimeError> {
-		let event = serde_json::to_vec(&serde_json::json!({
-			"turn_id": ctx.facts().turn_id,
-			"invocation_id": ctx.facts().invocation_id,
-			"stream_delta": ctx.facts().stream_delta,
-			"stream_part": ctx.facts().stream_part.map(|part| {
-				serde_json::json!({
-					"index": part.index,
-					"source": <&'static str>::from(part.source),
-					"tool_name": part.tool_name,
-				})
-			}),
-			"now_ms": ctx.facts().now_ms,
-			"delivered": ctx.facts().delivered,
-			"checkpoint_active": ctx.facts().checkpoint_active,
-			"hidden": ctx.facts().hidden,
-			"empty_output": ctx.facts().empty_output,
-			"trailing_aborts": ctx.facts().trailing_aborts,
-		}))
-		.map_err(ExtensionRegimeError::EventEncode)?;
-		let mut arguments = serde_json::Map::new();
-		arguments.insert("regime_id".to_owned(), self.regime.to_string().into());
-		arguments.insert("activation_id".to_owned(), ctx.activation_id().into());
-		arguments.insert("regime_revision".to_owned(), self.revision.into());
-		arguments.insert("point".to_owned(), Self::point_name(ctx.point()).into());
-		arguments.insert("event_revision".to_owned(), 1.into());
-		arguments.insert(
-			"event_payload".to_owned(),
-			serde_json::json!({"$bytes": omp_core::base64::encode(&event)}),
-		);
-		arguments.insert(
-			"state".to_owned(),
-			serde_json::json!({"$bytes": omp_core::base64::encode(self.state.as_bytes())}),
-		);
-		arguments.insert(
-			"state_revision".to_owned(),
-			self
-				.state_revision
-				.map_or(serde_json::Value::Null, Into::into),
-		);
-		arguments.insert("committed_steps".to_owned(), ctx.committed_steps().into());
-		arguments.insert(
-			"deadline_ms".to_owned(),
-			u64::try_from(REGIME_SUBMISSION_TIMEOUT.as_millis())
-				.unwrap_or(u64::MAX)
-				.into(),
-		);
-		arguments.insert("limit_handler".to_owned(), limit_handler.into());
-		arguments.insert("props".to_owned(), serde_json::json!({}));
-		let result = self.dispatch(
-			"omp.regimes.apply",
-			ctx.activation_id(),
-			Some(ctx.point()),
-			ctx.facts().invocation_id,
-			arguments,
-		)?;
-		decode_callback_draft(&result, ctx.activation_id(), self.revision, self.state_revision)
-			.map_err(ExtensionRegimeError::Draft)
-	}
-
-	fn commit_draft(
-		draft: DecodedRegimeDraft,
-		ctx: &mut omp_agent::RegimeContext<'_>,
-		next: omp_agent::Next<'_>,
-	) {
-		for effect in draft.effects {
-			match effect {
-				DecodedRegimeEffect::AppendContext(items) => ctx.append_context(items),
-				DecodedRegimeEffect::RewriteContext(patch) => ctx.rewrite_context(patch),
-				DecodedRegimeEffect::RequireTool(tool) => ctx.require_tool(tool),
-				DecodedRegimeEffect::SetScoped(setting) => ctx.set_scoped(setting),
-				DecodedRegimeEffect::ReplaceState(state) => ctx.replace_state(state),
-			}
-		}
-		match draft.control {
-			None => {},
-			Some(DecodedRegimeControl::Retry) => next.retry(),
-			Some(DecodedRegimeControl::Wait(ticket)) => next.wait(ticket),
-			Some(DecodedRegimeControl::Reject(reason)) => next.reject(reason),
-			Some(DecodedRegimeControl::Cancel(reason)) => next.cancel(reason),
-			Some(DecodedRegimeControl::Complete) => next.complete(),
-			Some(DecodedRegimeControl::Fail(detail)) => next.fail(detail),
-		}
-	}
-
-	fn evaluate(
-		&mut self,
-		ctx: &mut omp_agent::RegimeContext<'_>,
-		next: omp_agent::Next<'_>,
-		limit_handler: bool,
-	) -> Result<(), omp_agent::RegimeError> {
-		if let Err(error) = self.ensure_started(ctx) {
-			self.failure(next, error);
-			return Ok(());
-		}
-		let draft = match self.apply_callback(ctx, limit_handler) {
-			Ok(draft) => draft,
-			Err(error) => {
-				self.failure(next, error);
-				return Ok(());
-			},
-		};
-		Self::commit_draft(draft, ctx, next);
-		Ok(())
-	}
-}
-
-impl omp_agent::Regime for ExtensionRegime {
-	fn apply(
-		&mut self,
-		ctx: &mut omp_agent::RegimeContext<'_>,
-		next: omp_agent::Next<'_>,
-	) -> Result<(), omp_agent::RegimeError> {
-		self.evaluate(ctx, next, false)
-	}
-
-	fn on_limit(
-		&mut self,
-		ctx: &mut omp_agent::RegimeContext<'_>,
-		next: omp_agent::Next<'_>,
-	) -> Result<(), omp_agent::RegimeError> {
-		self.evaluate(ctx, next, true)
-	}
-
-	fn state(&self) -> Str {
-		self.state.clone()
-	}
-
-	fn restore(&mut self, payload: &str) -> Result<(), omp_agent::RegimeStateError> {
-		self.state = Str::from(payload);
-		Ok(())
-	}
-}
-
-impl Drop for ExtensionRegime {
-	fn drop(&mut self) {
-		use std::time::Instant;
-
-		let (Some(runtime), Some(activation)) =
-			(self.runtime.clone(), self.started_activation.clone())
-		else {
-			return;
-		};
-		let mut arguments = serde_json::Map::new();
-		arguments.insert("regime_id".to_owned(), self.regime.to_string().into());
-		arguments.insert("activation_id".to_owned(), activation.to_string().into());
-		arguments.insert("regime_revision".to_owned(), self.revision.into());
-		arguments.insert("reason".to_owned(), "core_activation_stopped".into());
-		arguments.insert(
-			"deadline_ms".to_owned(),
-			u64::try_from(REGIME_SUBMISSION_TIMEOUT.as_millis())
-				.unwrap_or(u64::MAX)
-				.into(),
-		);
-		arguments.insert("props".to_owned(), serde_json::json!({}));
-		let callbacks = Arc::clone(&self.callbacks);
-		let identity = Arc::clone(&self.identity);
-		let dispatch = ControlDispatch {
-			operation: sf!("omp.regimes.stop"),
-			arguments,
-			authority: self.authority(activation.as_str(), None, None),
-			policy: CallbackConcurrency::Serialized,
-			deadline: EventDeadline { at: Instant::now() + REGIME_SUBMISSION_TIMEOUT },
-		};
-		runtime.spawn(async move {
-			let _ = callbacks.dispatch(identity, dispatch).await;
-		});
-	}
-}
-
-fn decode_callback_draft(
-	value: &serde_json::Value,
-	activation: &str,
-	revision: u32,
-	state_revision: Option<u32>,
-) -> Result<DecodedRegimeDraft, RegimeDraftError> {
-	let object = value.as_object().ok_or(RegimeDraftError::Envelope)?;
-	if object
-		.get("activation_id")
-		.and_then(serde_json::Value::as_str)
-		!= Some(activation)
-		|| object
-			.get("regime_revision")
-			.and_then(serde_json::Value::as_u64)
-			!= Some(u64::from(revision))
-		|| object
-			.get("event_revision")
-			.and_then(serde_json::Value::as_u64)
-			!= Some(1)
-	{
-		return Err(RegimeDraftError::StaleCorrelation);
-	}
-	let control = decode_callback_control(object.get("control").ok_or(RegimeDraftError::Envelope)?)?;
-	let effects = object
-		.get("effects")
-		.and_then(serde_json::Value::as_array)
-		.ok_or(RegimeDraftError::Envelope)?
-		.iter()
-		.map(|effect| decode_callback_effect(effect, state_revision))
-		.collect::<Result<Vec<_>, _>>()?;
-	Ok(DecodedRegimeDraft { control, effects })
-}
-
-fn decode_callback_control(
-	value: &serde_json::Value,
-) -> Result<Option<DecodedRegimeControl>, RegimeDraftError> {
-	let Some(object) = value.as_object() else {
-		return if value.is_null() {
-			Ok(None)
-		} else {
-			Err(RegimeDraftError::Control)
-		};
-	};
-	let kind = object
-		.get("kind")
-		.and_then(serde_json::Value::as_str)
-		.ok_or(RegimeDraftError::Control)?;
-	let text = |name: &str| {
-		object
-			.get(name)
-			.and_then(serde_json::Value::as_str)
-			.filter(|value| !value.is_empty())
-			.map(Str::from)
-			.ok_or(RegimeDraftError::Control)
-	};
-	Ok(Some(match kind {
-		"retry" => DecodedRegimeControl::Retry,
-		"wait" => DecodedRegimeControl::Wait(omp_agent::WaitTicket {
-			id:          text("wait_ticket")?,
-			deadline_ms: object
-				.get("wait_deadline_ms")
-				.and_then(serde_json::Value::as_u64)
-				.ok_or(RegimeDraftError::Control)?,
-			reason:      text("reason")?,
-		}),
-		"reject" => DecodedRegimeControl::Reject(text("reason")?),
-		"cancel" => DecodedRegimeControl::Cancel(text("reason")?),
-		"complete" => DecodedRegimeControl::Complete,
-		"fail" => DecodedRegimeControl::Fail(omp_agent::RegimeFailure::structured(
-			bytes::Bytes::from(callback_bytes(object.get("error").ok_or(RegimeDraftError::Control)?)?),
-		)),
-		_ => return Err(RegimeDraftError::Control),
-	}))
-}
-
-fn decode_callback_effect(
-	value: &serde_json::Value,
-	state_revision: Option<u32>,
-) -> Result<DecodedRegimeEffect, RegimeDraftError> {
-	let object = value.as_object().ok_or(RegimeDraftError::Effect)?;
-	let kind = object
-		.get("kind")
-		.and_then(serde_json::Value::as_str)
-		.ok_or(RegimeDraftError::Effect)?;
-	let payload = callback_bytes(object.get("payload").ok_or(RegimeDraftError::Effect)?)?;
-	let name = || {
-		object
-			.get("name")
-			.and_then(serde_json::Value::as_str)
-			.filter(|name| !name.is_empty())
-			.map(Str::from)
-			.ok_or(RegimeDraftError::Effect)
-	};
-	match kind {
-		"append_context" => decode_context_items(&payload).map(DecodedRegimeEffect::AppendContext),
-		"rewrite_context" => Ok(DecodedRegimeEffect::RewriteContext(omp_agent::ContextPatch(
-			bytes::Bytes::from(payload),
-		))),
-		"require_tool" => Ok(DecodedRegimeEffect::RequireTool(name()?)),
-		"set_scoped" => {
-			let value =
-				serde_json::from_slice::<String>(&payload).map_err(|_| RegimeDraftError::Effect)?;
-			Ok(DecodedRegimeEffect::SetScoped(omp_agent::ScopedSetting {
-				slot:  setting_slot(name()?.as_str()),
-				value: Str::from(value),
-			}))
-		},
-		"replace_state" => {
-			let effect_revision = object
-				.get("state_revision")
-				.and_then(serde_json::Value::as_u64)
-				.and_then(|revision| u32::try_from(revision).ok());
-			if effect_revision != state_revision {
-				return Err(RegimeDraftError::Effect);
-			}
-			Ok(DecodedRegimeEffect::ReplaceState(Str::from(
-				String::from_utf8(payload).map_err(|_| RegimeDraftError::Effect)?,
-			)))
-		},
-		_ => Err(RegimeDraftError::Effect),
-	}
-}
-
-fn decode_context_items(
-	payload: &[u8],
-) -> Result<Vec<omp_proto::thread::v1::Item>, RegimeDraftError> {
-	use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
-
-	let items = serde_json::from_slice::<Vec<serde_json::Value>>(payload)
-		.map_err(|_| RegimeDraftError::Context)?;
-	items
-		.into_iter()
-		.map(|value| {
-			let object = value.as_object().ok_or(RegimeDraftError::Context)?;
-			if object
-				.get("props")
-				.and_then(serde_json::Value::as_object)
-				.is_some_and(|props| !props.is_empty())
-			{
-				return Err(RegimeDraftError::Context);
-			}
-			let message = object
-				.get("message")
-				.and_then(serde_json::Value::as_object)
-				.ok_or(RegimeDraftError::Context)?;
-			let role = match message.get("role").and_then(serde_json::Value::as_str) {
-				Some("ROLE_SYSTEM") => Role::System,
-				Some("ROLE_USER") => Role::User,
-				Some("ROLE_ASSISTANT") => Role::Assistant,
-				_ => return Err(RegimeDraftError::Context),
-			};
-			let parts = message
-				.get("parts")
-				.and_then(serde_json::Value::as_array)
-				.ok_or(RegimeDraftError::Context)?
-				.iter()
-				.map(|part| {
-					part
-						.get("text")
-						.and_then(serde_json::Value::as_str)
-						.map(|text| Part { kind: Some(part::Kind::Text(text.to_owned())) })
-						.ok_or(RegimeDraftError::Context)
-				})
-				.collect::<Result<Vec<_>, _>>()?;
-			Ok(Item {
-				seq:           object
-					.get("seq")
-					.and_then(serde_json::Value::as_u64)
-					.unwrap_or(0),
-				created_at_ms: object
-					.get("created_at_ms")
-					.and_then(serde_json::Value::as_u64)
-					.unwrap_or(0),
-				kind:          Some(item::Kind::Message(Message {
-					role: role.into(),
-					parts,
-					..Default::default()
-				})),
-				props:         None,
-			})
-		})
-		.collect()
-}
-
-fn callback_bytes(value: &serde_json::Value) -> Result<Vec<u8>, RegimeDraftError> {
-	let encoded = value
-		.as_object()
-		.and_then(|value| value.get("$bytes"))
-		.and_then(serde_json::Value::as_str)
-		.ok_or(RegimeDraftError::Bytes)?;
-	omp_core::base64::decode(encoded)
-		.into_vec()
-		.map_err(|_| RegimeDraftError::Bytes)
-}
-
 /// Rejection while sealing a child registry publication.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SealedRegistryEvidenceError {
@@ -4539,7 +3610,7 @@ pub enum SealedRegistryEvidenceError {
 }
 
 fn frozen_declaration_error(message: impl Into<Str>) -> ControlProtocolError {
-	ControlProtocolError::new("InvalidRegimeDeclaration", message)
+	ControlProtocolError::new("InvalidExtensionDeclaration", message)
 }
 
 fn seal_frozen_control_evidence(
@@ -4551,103 +3622,31 @@ fn seal_frozen_control_evidence(
 	let root = payload
 		.as_object()
 		.ok_or_else(|| frozen_declaration_error("FREEZE acknowledgment must be an object"))?;
-	let regimes = root
-		.get("regimes")
-		.and_then(serde_json::Value::as_object)
-		.ok_or_else(|| {
-			frozen_declaration_error("FREEZE acknowledgment omitted the sealed regime table")
-		})?;
-	if regimes
-		.get("extension_id")
-		.and_then(serde_json::Value::as_str)
-		!= Some(identity.extension.as_str())
-	{
-		return Err(frozen_declaration_error("sealed regime table belongs to another extension"));
-	}
-	if regimes
-		.get("generation")
-		.and_then(serde_json::Value::as_u64)
-		!= Some(identity.host_generation)
-	{
-		return Err(frozen_declaration_error(
-			"sealed regime table belongs to another host generation",
-		));
-	}
-	if regimes.get("api_level").and_then(serde_json::Value::as_u64) != Some(1) {
-		return Err(frozen_declaration_error("sealed regime table has an unsupported API level"));
-	}
-	if regimes
-		.get("table_revision")
-		.and_then(serde_json::Value::as_u64)
-		!= Some(1)
-	{
-		return Err(frozen_declaration_error("sealed regime table has an unsupported revision"));
-	}
-	const POINT_TABLE: [&str; 9] = [
-		"context",
-		"tool_choice",
-		"pre_model",
-		"stream",
-		"admission",
-		"batch",
-		"turn_end",
-		"settle",
-		"idle",
-	];
-	const CONTROL_TABLE: [&str; 6] = ["retry", "wait", "reject", "cancel", "complete", "fail"];
-	const EFFECT_TABLE: [&str; 5] =
-		["append_context", "rewrite_context", "require_tool", "set_scoped", "replace_state"];
-	let table_matches = |name: &str, expected: &[&str]| {
-		regimes
+	let array = |name: &'static str| {
+		root
 			.get(name)
 			.and_then(serde_json::Value::as_array)
-			.is_some_and(|actual| {
-				actual.len() == expected.len()
-					&& actual
-						.iter()
-						.zip(expected)
-						.all(|(actual, expected)| actual.as_str() == Some(*expected))
-			})
+			.cloned()
+			.ok_or_else(|| frozen_declaration_error(format!("FREEZE acknowledgment omitted {name}")))
 	};
-	if !table_matches("point_table", &POINT_TABLE)
-		|| !table_matches("control_table", &CONTROL_TABLE)
-		|| !table_matches("effect_table", &EFFECT_TABLE)
-	{
-		return Err(frozen_declaration_error(
-			"sealed regime vocabulary differs from the host protocol",
-		));
-	}
-	let regime_documents = regimes
-		.get("manifests")
-		.and_then(serde_json::Value::as_array)
-		.ok_or_else(|| frozen_declaration_error("sealed regime table omitted manifests"))?
-		.clone();
-	let provider_documents = root
-		.get("providers")
-		.and_then(serde_json::Value::as_array)
-		.ok_or_else(|| frozen_declaration_error("FREEZE acknowledgment omitted providers"))?
-		.clone();
-	let runtime_regime_ids = sealed_document_ids(&regime_documents)
-		.map_err(|error| frozen_declaration_error(error.to_string()))?;
+	let provider_documents = array("providers")?;
+	let directors = array("directors")?;
+	let components = array("components")?;
 	let runtime_provider_ids = sealed_document_ids(&provider_documents)
 		.map_err(|error| frozen_declaration_error(error.to_string()))?;
-	let declared_regime_ids = manifest
-		.static_declarations()
-		.regimes
-		.iter()
-		.map(|declaration| declaration.id.as_str())
-		.collect::<BTreeSet<_>>();
 	let declared_provider_ids = manifest
 		.static_declarations()
 		.providers
 		.iter()
 		.map(|row| row.key.as_str())
 		.collect::<BTreeSet<_>>();
-	if runtime_regime_ids != declared_regime_ids || runtime_provider_ids != declared_provider_ids {
+	if runtime_provider_ids != declared_provider_ids {
 		return Err(frozen_declaration_error(
-			"FREEZE declarations differ from the authenticated manifest",
+			"FREEZE provider declarations differ from the authenticated manifest",
 		));
 	}
+	validate_extension_registrations(&directors, "director")?;
+	validate_extension_registrations(&components, "component")?;
 	Ok(SealedRegistryEvidence {
 		identity:   Arc::clone(&identity),
 		session:    Some(session),
@@ -4660,8 +3659,35 @@ fn seal_frozen_control_evidence(
 			..Default::default()
 		},
 		providers:  provider_documents.into(),
-		regimes:    regime_documents.into(),
+		directors:  directors.into(),
+		components: components.into(),
 	})
+}
+
+fn validate_extension_registrations(
+	declarations: &[serde_json::Value],
+	kind: &'static str,
+) -> Result<(), ControlProtocolError> {
+	let mut ids = BTreeSet::new();
+	for declaration in declarations {
+		let id = declaration
+			.get("id")
+			.and_then(serde_json::Value::as_str)
+			.filter(|id| !id.is_empty())
+			.ok_or_else(|| frozen_declaration_error(format!("{kind} declaration omitted its id")))?;
+		if !ids.insert(id) {
+			return Err(frozen_declaration_error(format!("{kind} declaration `{id}` is duplicated")));
+		}
+		if !declaration
+			.get("callable")
+			.is_some_and(serde_json::Value::is_object)
+		{
+			return Err(frozen_declaration_error(format!(
+				"{kind} declaration `{id}` omitted its callable"
+			)));
+		}
+	}
+	Ok(())
 }
 
 /// Validates one complete registry effect against authenticated manifest facts.
@@ -4762,18 +3788,8 @@ pub fn seal_registry_evidence(
 		.iter()
 		.map(|row| row.key.as_str())
 		.collect::<BTreeSet<_>>();
-	let declared_regime_ids = manifest
-		.static_declarations()
-		.regimes
-		.iter()
-		.map(|row| row.id.as_str())
-		.collect::<BTreeSet<_>>();
 	let runtime_provider_ids = sealed_document_ids(&snapshot.providers)?;
-	let runtime_regime_ids = sealed_document_ids(&snapshot.regimes)?;
-	if !manifest.runtime_declarations_trusted()
-		&& (declared_provider_ids != runtime_provider_ids
-			|| declared_regime_ids != runtime_regime_ids)
-	{
+	if !manifest.runtime_declarations_trusted() && declared_provider_ids != runtime_provider_ids {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	let modules = iter::once(manifest.entry.as_str())
@@ -4839,7 +3855,8 @@ pub fn seal_registry_evidence(
 		),
 		ui,
 		providers: snapshot.providers.into(),
-		regimes: snapshot.regimes.into(),
+		directors: snapshot.directors.into(),
+		components: snapshot.components.into(),
 	})
 }
 fn hook_when_matches_filter(
@@ -6808,15 +5825,9 @@ async fn dispatch_journal_control(
 		host_generation,
 		session_generation: config.session_generation,
 	};
-	let control = JournalControl::new(
-		runtime.agent.clone(),
-		invocation.owner.extension().clone(),
-		Vec::new(),
-		identity.clone(),
-	);
+	let control = JournalControl::new();
 	match control
 		.dispatch(request_id, envelope, committed.authorized_at_ms)
-		.await
 		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?
 	{
 		JournalDispatch::Reply(reply) => {
@@ -6826,21 +5837,6 @@ async fn dispatch_journal_control(
 					config,
 				)
 				.await
-		},
-		JournalDispatch::Rows { request_id, rows } => {
-			for reply in journal_rows(&rows) {
-				process
-					.write(
-						&HostFrame {
-							request_id,
-							body: Some(host_frame::Body::Journal(reply)),
-							props: None,
-						},
-						config,
-					)
-					.await?;
-			}
-			Ok(())
 		},
 		JournalDispatch::External(request) => {
 			let (reply, replies) = flume::unbounded();
@@ -8786,40 +7782,6 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 					&mut write_scratch,
 				)?;
 			},
-			Some(host_frame::Body::Regimes(RegimeHostEnvelope { body: Some(body), .. })) => {
-				let draft = match body {
-					regime_host_envelope::Body::Start(start) => {
-						dispatch_python_regime_start(engine, &start)
-					},
-					regime_host_envelope::Body::Apply(apply) => {
-						dispatch_python_regime_apply(engine, &apply)
-					},
-					regime_host_envelope::Body::Stop(stop) => dispatch_python_regime_stop(engine, &stop),
-				};
-				match draft {
-					Ok(draft) => write_sync_frame(
-						&mut writer,
-						&WorkerFrame {
-							request_id: frame.request_id,
-							body:       Some(worker_frame::Body::Regimes(RegimeWorkerEnvelope {
-								body:  Some(regime_worker_envelope::Body::Draft(draft)),
-								props: None,
-							})),
-							props:      None,
-						},
-						limit,
-						&mut write_scratch,
-					)?,
-					Err(error) => write_protocol_error(
-						&mut writer,
-						frame.request_id,
-						ProtocolErrorCode::Internal,
-						error.to_string().as_str(),
-						limit,
-						&mut write_scratch,
-					)?,
-				}
-			},
 			Some(host_frame::Body::InvokeTool(invoke)) => {
 				let Some(commit_frame) =
 					read_sync_frame::<_, HostFrame>(&mut reader, limit, &mut read_scratch)?
@@ -8913,179 +7875,6 @@ fn serve_worker(engine: &omp_py::Engine, modules: &[Str]) -> Result<(), WorkerEr
 			)?,
 		}
 	}
-}
-
-fn dispatch_python_regime_start(
-	engine: &omp_py::Engine,
-	start: &RegimeStart,
-) -> Result<RegimeDraft, WorkerError> {
-	engine
-		.attach(|py| -> PyResult<()> {
-			let regimes = PyModule::import(py, "omp.regimes")?;
-			let kwargs = PyDict::new(py);
-			kwargs.set_item("regime_revision", start.regime_revision)?;
-			kwargs.set_item("state_revision", start.state_revision)?;
-			kwargs.set_item("deadline_ms", (start.deadline_ms != 0).then_some(start.deadline_ms))?;
-			kwargs.set_item("props", py.None())?;
-			let awaitable = regimes.getattr("dispatch_regime_start")?.call(
-				(start.regime_id.as_str(), start.activation_id.as_str(), start.state.as_ref()),
-				Some(&kwargs),
-			)?;
-			PyModule::import(py, "asyncio")?.call_method1("run", (awaitable,))?;
-			Ok(())
-		})
-		.map_err(WorkerError::from)?;
-	Ok(RegimeDraft {
-		activation_id:   start.activation_id.clone(),
-		regime_revision: start.regime_revision,
-		event_revision:  0,
-		control:         None,
-		effects:         Vec::new(),
-		props:           None,
-	})
-}
-
-fn dispatch_python_regime_apply(
-	engine: &omp_py::Engine,
-	apply: &RegimeApply,
-) -> Result<RegimeDraft, WorkerError> {
-	let point = v1::RegimePoint::try_from(apply.point)
-		.map_err(|_| WorkerError::Protocol(sf!("RegimeApply has an invalid point")))?;
-	let point = point
-		.as_str_name()
-		.strip_prefix("REGIME_POINT_")
-		.expect("regime point prefix")
-		.to_ascii_lowercase();
-	engine
-		.attach(|py| -> PyResult<RegimeDraft> {
-			let regimes = PyModule::import(py, "omp.regimes")?;
-			let kwargs = PyDict::new(py);
-			kwargs.set_item("activation_id", apply.activation_id.as_str())?;
-			kwargs.set_item("regime_revision", apply.regime_revision)?;
-			kwargs.set_item("event_revision", apply.event_revision)?;
-			kwargs.set_item("committed_steps", apply.committed_steps)?;
-			kwargs.set_item("state_revision", apply.state_revision)?;
-			kwargs.set_item("deadline_ms", (apply.deadline_ms != 0).then_some(apply.deadline_ms))?;
-			kwargs.set_item("limit_handler", apply.limit_handler)?;
-			kwargs.set_item("props", py.None())?;
-			let awaitable = regimes.getattr("dispatch_regime_apply")?.call(
-				(
-					apply.regime_id.as_str(),
-					point.as_str(),
-					apply.event_payload.as_ref(),
-					apply.state.as_ref(),
-				),
-				Some(&kwargs),
-			)?;
-			let result = PyModule::import(py, "asyncio")?.call_method1("run", (awaitable,))?;
-			let activation_id: String = result.get_item("activation_id")?.extract()?;
-			let regime_revision: u32 = result.get_item("regime_revision")?.extract()?;
-			let event_revision: u32 = result.get_item("event_revision")?.extract()?;
-			if activation_id != apply.activation_id
-				|| regime_revision != apply.regime_revision
-				|| event_revision != apply.event_revision
-			{
-				return Err(PyValueError::new_err(
-					"regime draft correlation does not match the applied activation",
-				));
-			}
-			let control = result.get_item("control")?;
-			let control = if control.is_none() {
-				None
-			} else {
-				let control = control.cast::<PyDict>()?;
-				let kind: String = control
-					.get_item("kind")?
-					.ok_or_else(|| PyKeyError::new_err("regime control omitted kind"))?
-					.extract()?;
-				let kind_name = format!("REGIME_CONTROL_KIND_{}", kind.to_ascii_uppercase());
-				let kind = RegimeControlKind::from_str_name(&kind_name)
-					.filter(|kind| *kind != RegimeControlKind::Unspecified)
-					.ok_or_else(|| PyValueError::new_err("regime draft has an unknown control"))?;
-				Some(RegimeControl {
-					kind:             kind.into(),
-					reason:           optional_string(control, "reason")?,
-					wait_ticket:      optional_string(control, "wait_ticket")?,
-					wait_deadline_ms: control
-						.get_item("wait_deadline_ms")?
-						.map(|value| value.extract())
-						.transpose()?,
-					error:            control
-						.get_item("error")?
-						.map(|value| value.extract::<Vec<u8>>())
-						.transpose()?
-						.unwrap_or_default()
-						.into(),
-					props:            None,
-				})
-			};
-			let effects = result.get_item("effects")?;
-			let mut ordered_effects = Vec::new();
-			for effect in PyIterator::from_object(&effects)? {
-				let effect = effect?;
-				let effect = effect.cast::<PyDict>()?;
-				let kind: String = effect
-					.get_item("kind")?
-					.ok_or_else(|| PyKeyError::new_err("regime effect omitted kind"))?
-					.extract()?;
-				let kind_name = format!("REGIME_EFFECT_KIND_{}", kind.to_ascii_uppercase());
-				let kind = RegimeEffectKind::from_str_name(&kind_name)
-					.filter(|kind| *kind != RegimeEffectKind::Unspecified)
-					.ok_or_else(|| PyValueError::new_err("regime draft has an unknown effect"))?;
-				ordered_effects.push(RegimeEffect {
-					kind:           kind.into(),
-					payload:        effect
-						.get_item("payload")?
-						.ok_or_else(|| PyKeyError::new_err("regime effect omitted payload"))?
-						.extract::<Vec<u8>>()?
-						.into(),
-					name:           optional_string(effect, "name")?,
-					state_revision: effect
-						.get_item("state_revision")?
-						.map(|value| value.extract())
-						.transpose()?,
-					props:          None,
-				});
-			}
-			Ok(RegimeDraft {
-				activation_id,
-				regime_revision,
-				event_revision,
-				control,
-				effects: ordered_effects,
-				props: None,
-			})
-		})
-		.map_err(WorkerError::from)
-}
-
-fn dispatch_python_regime_stop(
-	engine: &omp_py::Engine,
-	stop: &RegimeStop,
-) -> Result<RegimeDraft, WorkerError> {
-	engine
-		.attach(|py| -> PyResult<()> {
-			let regimes = PyModule::import(py, "omp.regimes")?;
-			let kwargs = PyDict::new(py);
-			kwargs.set_item("regime_revision", stop.regime_revision)?;
-			kwargs.set_item("reason", stop.reason.as_deref())?;
-			kwargs.set_item("deadline_ms", (stop.deadline_ms != 0).then_some(stop.deadline_ms))?;
-			kwargs.set_item("props", py.None())?;
-			let awaitable = regimes
-				.getattr("dispatch_regime_stop")?
-				.call((stop.regime_id.as_str(), stop.activation_id.as_str()), Some(&kwargs))?;
-			PyModule::import(py, "asyncio")?.call_method1("run", (awaitable,))?;
-			Ok(())
-		})
-		.map_err(WorkerError::from)?;
-	Ok(RegimeDraft {
-		activation_id:   stop.activation_id.clone(),
-		regime_revision: stop.regime_revision,
-		event_revision:  0,
-		control:         None,
-		effects:         Vec::new(),
-		props:           None,
-	})
 }
 
 fn freeze_python_declarations(engine: &omp_py::Engine) -> Result<(), WorkerError> {

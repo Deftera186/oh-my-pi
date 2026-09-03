@@ -14,11 +14,8 @@ use std::{
 use bytes::Bytes;
 use omp_core::{ArtifactDigest, Hash32, Str, encoding::hex};
 use omp_ext::{ExtensionCode, ExtensionError, config::StaticDeclarations};
+use omp_journal::blob::{self, BlobRef, BlobStore};
 use omp_proto::env::v1 as pb;
-use omp_storage::{
-	blob,
-	blob::{BlobRef, BlobStore},
-};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 static SITE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -534,8 +531,8 @@ fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
 mod tests {
 	use bytes::Bytes;
 	use omp_core::sf;
+	use omp_journal::blob::BlobStore;
 	use omp_proto::env::v1;
-	use omp_storage::blob::BlobStore;
 
 	use super::{OwnershipMap, SiteError, SiteMaterializer};
 

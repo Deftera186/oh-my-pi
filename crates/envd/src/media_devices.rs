@@ -14,12 +14,12 @@ use std::{
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
+use omp_cache::telemetry_cache::{StoredIssue, TelemetryIndex};
 use omp_core::{ArtifactUrl, Str, sf};
 use omp_proto::{
 	inference::v1::{self as inference_pb, generate_image_request, value},
 	thread::v1::{self as thread_pb, blob},
 };
-use omp_storage::telemetry_index::{StoredIssue, TelemetryIndex};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
 	InferenceEffects, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,

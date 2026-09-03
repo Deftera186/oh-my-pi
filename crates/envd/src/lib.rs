@@ -3,7 +3,7 @@
 
 mod admission;
 pub mod blobs;
-mod browser_daemon;
+pub mod browser_daemon;
 pub mod browser_fetch;
 mod computer;
 mod devices_host;
@@ -36,13 +36,13 @@ pub mod process_store;
 pub mod recovery;
 mod resource_materializer;
 mod sandbox_proxy;
+mod schedule_plan;
 pub mod schedules;
 pub mod search_backend;
 mod server;
 pub mod shell_profile;
 pub mod site;
 pub mod ssh;
-mod staged_preview;
 mod tool_debug;
 mod tool_document;
 mod tool_lsp;
@@ -66,9 +66,13 @@ use std::{
 	env,
 	fs::{self, OpenOptions},
 	io,
+	io::Write as _,
 	path::{Path, PathBuf},
 	process::{Stdio, id},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -88,7 +92,8 @@ use github_url::GithubCredentialBridge;
 use miette::IntoDiagnostic as _;
 #[cfg(unix)]
 use nix::unistd::User;
-use omp_agent::control::ControlSender;
+use omp_agent::KernelSender;
+use omp_con::Ctx;
 use omp_core::{Hash32, Str, Ulid, sf};
 use omp_env::{AcpRequest, EnvClient, PartitionedEnvTransport, in_process_frames};
 use omp_ext::config::ContributedCliValue;
@@ -103,10 +108,6 @@ use omp_proto::{
 	},
 	inference::v1::{Value, ValueMap, value},
 };
-use omp_settings::{
-	DomainRegistration, SettingsCatalog, SettingsContribution, snapshot::SettingsSnapshot,
-};
-use omp_storage::index::SessionIndex;
 use omp_tool::Registry;
 use omp_tools::{
 	eval::EvalSessionControl,
@@ -139,38 +140,180 @@ use self::{
 };
 use crate::eval::{BridgeHostError, ParentSessionHost};
 
-/// Settings domains owned by the environment daemon.
-pub const SETTINGS_CONTRIBUTION: SettingsContribution = SettingsContribution {
-	domains:     &[
-		DomainRegistration::of::<lsp_settings::LspSettings>(),
-		DomainRegistration::of::<tool_settings::ToolSettings>(),
-		DomainRegistration::of::<exec_settings::AcpSettings>(),
-		DomainRegistration::of::<exec_settings::AsyncJobSettings>(),
-		DomainRegistration::of::<exec_settings::SandboxSettings>(),
-		DomainRegistration::of::<exec_settings::ShellSettings>(),
-		DomainRegistration::of::<mcp::settings::McpSettings>(),
-	],
-	normalizers: &[],
-};
+/// One-shot migration map from legacy TOML field paths to convar names.
+pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
+	("runtime.interrupt_grace", "sv_interrupt_grace"),
+	("memory.backend", "ai_memory_backend"),
+	("mnemopi.scoping", "ai_mnemopi_scoping"),
+	("autolearn.enabled", "ai_autolearn_enabled"),
+	("autolearn.auto_continue", "ai_autolearn_auto_continue"),
+	("autolearn.min_tool_calls", "ai_autolearn_min_tool_calls"),
+	("worktree.base", "sv_worktree_base"),
+	("browser.enabled", "sv_browser_enabled"),
+	("browser.headless", "sv_browser_headless"),
+	("lsp.enabled", "sv_lsp_enabled"),
+	("lsp.lazy", "sv_lsp_lazy"),
+	("lsp.formatOnWrite", "sv_lsp_format_on_write"),
+	("lsp.diagnosticsOnWrite", "sv_lsp_diagnostics_on_write"),
+	("lsp.diagnosticsOnEdit", "sv_lsp_diagnostics_on_edit"),
+	("lsp.diagnosticsDeduplicate", "sv_lsp_diagnostics_deduplicate"),
+	("tools.enabled", "sv_tools_enabled"),
+	("tools.max_timeout", "sv_tools_max_timeout"),
+	("tools.edit_dialect", "sv_tools_edit_dialect"),
+	("tools.edit_blackbox_path", "sv_tools_edit_blackbox_path"),
+	("tools.edit_auto_repair", "sv_tools_edit_auto_repair"),
+	("tools.edit_streaming_abort", "sv_tools_edit_streaming_abort"),
+	("tools.approval_mode", "sv_tools_approval_mode"),
+	("tools.approval", "sv_tools_approval"),
+	("tools.edit_fuzzy", "sv_tools_edit_fuzzy"),
+	("tools.edit_require_seen", "sv_tools_edit_require_seen"),
+	("tools.edit_guard_generated", "sv_tools_edit_guard_generated"),
+	("tools.read_max_bytes", "sv_tools_read_max_bytes"),
+	("tools.read_summarize", "sv_tools_read_summarize"),
+	("tools.read_line_numbers", "sv_tools_read_line_numbers"),
+	("tools.grep_context_lines", "sv_tools_grep_context_lines"),
+	("tools.eval_interpreters", "sv_tools_eval_interpreters"),
+	("tools.output_spill_bytes", "sv_tools_output_spill_bytes"),
+	("tools.output_max_bytes", "sv_tools_output_max_bytes"),
+	("tools.intent_tracing", "sv_tools_intent_tracing"),
+	("tools.loop_guard_limit", "sv_tools_loop_guard_limit"),
+	("acp.routing", "sv_acp_routing"),
+	("async.enabled", "sv_async_enabled"),
+	("async.max_jobs", "sv_async_max_jobs"),
+	("async.retention_ms", "sv_async_retention_ms"),
+	("async.poll_wait_duration", "sv_async_poll_wait_duration"),
+	("sandbox.mode", "sv_sandbox_mode"),
+	("sandbox.network_mode", "sv_sandbox_network_mode"),
+	("sandbox.allow_domains", "sv_sandbox_allow_domains"),
+	("sandbox.deny_domains", "sv_sandbox_deny_domains"),
+	("sandbox.allow_ports", "sv_sandbox_allow_ports"),
+	("sandbox.allow_localhost", "sv_sandbox_allow_localhost"),
+	("sandbox.allow_unix_sockets", "sv_sandbox_allow_unix_sockets"),
+	("sandbox.writable_roots", "sv_sandbox_writable_roots"),
+	("sandbox.unscoped_writes", "sv_sandbox_unscoped_writes"),
+	("sandbox.env_deny", "sv_sandbox_env_deny"),
+	("sandbox.env_inherit", "sv_sandbox_env_inherit"),
+	("sandbox.env_include_only", "sv_sandbox_env_include_only"),
+	("sandbox.env_set", "sv_sandbox_env_set"),
+	("sandbox.exclude_tmpdir", "sv_sandbox_exclude_tmpdir"),
+	("sandbox.exclude_slash_tmp", "sv_sandbox_exclude_slash_tmp"),
+	("sandbox.read_deny", "sv_sandbox_read_deny"),
+	("sandbox.read_mode", "sv_sandbox_read_mode"),
+	("sandbox.readable_roots", "sv_sandbox_readable_roots"),
+	("sandbox.read_deny_globs", "sv_sandbox_read_deny_globs"),
+	("sandbox.write_deny", "sv_sandbox_write_deny"),
+	("shell.enabled", "sv_shell_enabled"),
+	("shell.profile", "sv_shell_profile"),
+	("shell.executable", "sv_shell_executable"),
+	("shell.args", "sv_shell_args"),
+	("shell.login", "sv_shell_login"),
+	("shell.command_prefix", "sv_shell_command_prefix"),
+	("shell.embedded_builtins", "sv_shell_embedded_builtins"),
+	("shell.auto_background.enabled", "sv_shell_auto_background_enabled"),
+	("shell.auto_background.threshold_ms", "sv_shell_auto_background_threshold_ms"),
+	("shell.interceptor.enabled", "sv_shell_interceptor_enabled"),
+	("shell.interceptor.patterns", "sv_shell_interceptor_patterns"),
+	("shell.direnv", "sv_shell_direnv"),
+	("shell.direnv_load_timeout_ms", "sv_shell_direnv_load_timeout_ms"),
+	("shell.minimizer.enabled", "sv_shell_minimizer_enabled"),
+	("shell.minimizer.settings_path", "sv_shell_minimizer_settings_path"),
+	("shell.minimizer.only", "sv_shell_minimizer_only"),
+	("shell.minimizer.except", "sv_shell_minimizer_except"),
+	("shell.minimizer.max_capture_bytes", "sv_shell_minimizer_max_capture_bytes"),
+	("shell.minimizer.source_outline_level", "sv_shell_minimizer_source_outline_level"),
+	("shell.minimizer.legacy_filters", "sv_shell_minimizer_legacy_filters"),
+	("mcp.enableProjectConfig", "sv_mcp_enable_project_config"),
+];
 
-#[cfg(test)]
-const TEST_SETTINGS_CATALOG: SettingsCatalog =
-	SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &SETTINGS_CONTRIBUTION]);
+static ATOMIC_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod settings_tests {
 	use super::*;
 
 	#[test]
-	fn contribution_lists_every_envd_domain() {
-		assert_eq!(
-			SETTINGS_CONTRIBUTION
-				.domains
-				.iter()
-				.map(|domain| domain.descriptor().name)
-				.collect::<Vec<_>>(),
-			["lsp", "tools", "acp", "async", "sandbox", "shell", "mcp"]
-		);
+	fn vars_declare_every_former_schema_field() {
+		let ctx = Ctx::new();
+		let mut fields = BTreeMap::new();
+		for &(legacy, convar) in LEGACY_CONVAR_MAPPINGS {
+			assert!(fields.insert(legacy, convar).is_none(), "duplicate legacy field {legacy}");
+			assert!(ctx.get(convar).is_some(), "missing convar {convar} for {legacy}");
+		}
+		assert_eq!(fields.len(), LEGACY_CONVAR_MAPPINGS.len());
+	}
+}
+
+pub(crate) fn atomic_replace(path: &Path, content: &str) -> io::Result<()> {
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent)?;
+	}
+	let sequence = ATOMIC_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+	let name = path
+		.file_name()
+		.and_then(|name| name.to_str())
+		.unwrap_or("state");
+	let temporary = path.with_file_name(format!(".{name}.{}.{}.tmp", id(), sequence));
+	let mut options = OpenOptions::new();
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt as _;
+		options.mode(0o600);
+	}
+	let mut file = options.open(&temporary)?;
+	let result = (|| {
+		file.write_all(content.as_bytes())?;
+		file.sync_all()?;
+		drop(file);
+		replace_atomic_path(&temporary, path)?;
+		#[cfg(unix)]
+		if let Some(parent) = path.parent() {
+			fs::File::open(parent)?.sync_all()?;
+		}
+		Ok(())
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temporary);
+	}
+	result
+}
+
+const LAUNCHER_BUILD_FILE: &str = "launcher-build";
+
+fn launcher_build_path(state_dir: &Path) -> PathBuf {
+	state_dir.join(LAUNCHER_BUILD_FILE)
+}
+
+fn publish_launcher_build(state_dir: &Path) -> io::Result<()> {
+	atomic_replace(&launcher_build_path(state_dir), omp_env::build_id::current())
+}
+
+pub(crate) fn launcher_build_is_stale(state_dir: &Path, server_build: &str) -> bool {
+	fs::read_to_string(launcher_build_path(state_dir))
+		.is_ok_and(|latest| omp_env::build_id::is_stale(latest.trim(), server_build))
+}
+
+fn replace_atomic_path(temporary: &Path, path: &Path) -> io::Result<()> {
+	match fs::rename(temporary, path) {
+		Ok(()) => Ok(()),
+		#[cfg(windows)]
+		Err(original) if original.raw_os_error() == Some(5) => {
+			let backup = path.with_extension(format!("{}.bak", id()));
+			match fs::rename(path, &backup) {
+				Ok(()) => {},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {
+					return fs::rename(temporary, path);
+				},
+				Err(_) => return Err(original),
+			}
+			if let Err(error) = fs::rename(temporary, path) {
+				let _ = fs::rename(&backup, path);
+				return Err(error);
+			}
+			let _ = fs::remove_file(backup);
+			Ok(())
+		},
+		Err(error) => Err(error),
 	}
 }
 
@@ -234,6 +377,7 @@ pub async fn register_project_presence(
 ) -> Result<ClientPresenceLease, EnvdError> {
 	let root = fs::canonicalize(project_root)?;
 	let state_dir = omp_env::project_state::directory(data_dir, &root)?;
+	publish_launcher_build(&state_dir)?;
 	let socket = omp_env::project_state::environment_socket(&state_dir);
 	let (client, bridge) = match connect_presence_owner(&socket).await {
 		Ok(connection) => connection,
@@ -324,36 +468,30 @@ pub fn migrate_session_artifacts(
 #[cfg(unix)]
 pub async fn run(
 	config: EnvdConfig,
-	catalog: SettingsCatalog,
+	con: Arc<Ctx>,
 	bridges: RegistryBridges,
 ) -> miette::Result<()> {
-	server::run(config, catalog, bridges)
-		.await
-		.into_diagnostic()
+	server::run(config, con, bridges).await.into_diagnostic()
 }
 
 /// Starts the Windows named-pipe project environment daemon.
 #[cfg(windows)]
 pub async fn run(
 	config: EnvdConfig,
-	catalog: SettingsCatalog,
+	con: Arc<Ctx>,
 	bridges: RegistryBridges,
 ) -> miette::Result<()> {
-	windows::run(config, catalog, bridges)
-		.await
-		.into_diagnostic()
+	windows::run(config, con, bridges).await.into_diagnostic()
 }
 
 /// Reports that no owner-local environment transport exists on this target.
 #[cfg(not(any(unix, windows)))]
 pub async fn run(
 	config: EnvdConfig,
-	catalog: SettingsCatalog,
+	con: Arc<Ctx>,
 	bridges: RegistryBridges,
 ) -> miette::Result<()> {
-	server::run(config, catalog, bridges)
-		.await
-		.into_diagnostic()
+	server::run(config, con, bridges).await.into_diagnostic()
 }
 
 /// Options for attaching a session composition to its detached project daemon.
@@ -366,9 +504,9 @@ pub struct AttachOptions {
 	pub trusted_extensions: Vec<ExtHostSpec>,
 	/// Extension-contributed command-line values available to workers.
 	pub contributed_values: Vec<ContributedCliValue>,
-	/// Exact layered settings snapshot used to compose the session host or an
-	/// embedded fallback.
-	pub settings:           Arc<SettingsSnapshot>,
+	/// Process control context used to compose the session host or an embedded
+	/// fallback.
+	pub con:                Arc<Ctx>,
 	/// Composition-supplied capabilities the environment host cannot own.
 	pub bridges:            RegistryBridges,
 	/// Optional idle timeout forwarded only when this attach spawns the daemon.
@@ -512,15 +650,10 @@ impl ProjectEnvironment {
 		state_dir: &Path,
 		options: AttachOptions,
 	) -> Result<Self, EnvdError> {
+		publish_launcher_build(state_dir)?;
 		let socket = omp_env::project_state::environment_socket(state_dir);
 		let docserver_socket = omp_env::project_state::document_socket(state_dir);
-		let interrupt_grace = options
-			.settings
-			.project::<host_settings::HostSettings>()
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-			.get()
-			.runtime
-			.interrupt_grace;
+		let interrupt_grace = host_settings::SV_INTERRUPT_GRACE.get(&options.con);
 		match attach_owner(
 			root,
 			state_dir,
@@ -537,7 +670,7 @@ impl ProjectEnvironment {
 					approval_mode,
 					trusted_extensions,
 					contributed_values,
-					settings,
+					con,
 					bridges,
 					spawn_idle_timeout: _,
 				} = options;
@@ -550,7 +683,7 @@ impl ProjectEnvironment {
 					&trusted_extensions,
 					&contributed_values,
 					interrupt_grace,
-					settings,
+					con,
 					owner,
 					owner_bridge,
 					bridges,
@@ -583,7 +716,7 @@ impl ProjectEnvironment {
 			options.py_eval,
 			&options.trusted_extensions,
 			&options.contributed_values,
-			options.settings,
+			options.con,
 			options.bridges,
 		)
 		.await?;
@@ -591,11 +724,10 @@ impl ProjectEnvironment {
 		Ok(environment)
 	}
 
-	/// Starts an isolated in-process environment from one exact layered settings
-	/// snapshot.
+	/// Starts an isolated in-process environment from one exact control context.
 	///
 	/// This path never joins or reuses an existing environment owner, so every
-	/// tool and security owner is composed from `settings` for `root`.
+	/// tool and security owner is composed from `con` for `root`.
 	#[tracing::instrument(
 		name = "environment_start",
 		level = "debug",
@@ -615,15 +747,10 @@ impl ProjectEnvironment {
 		py_eval: bool,
 		trusted_extensions: &[ExtHostSpec],
 		contributed_values: &[ContributedCliValue],
-		settings: Arc<SettingsSnapshot>,
+		con: Arc<Ctx>,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
-		let interrupt_grace = settings
-			.project::<host_settings::HostSettings>()
-			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?
-			.get()
-			.runtime
-			.interrupt_grace;
+		let interrupt_grace = host_settings::SV_INTERRUPT_GRACE.get(&con);
 		let command_credentials = bridges.command_credentials.clone();
 		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
 		let (worker_config, data_bindings) = worker_config(
@@ -642,8 +769,7 @@ impl ProjectEnvironment {
 			None,
 			false,
 			None,
-			settings.catalog(),
-			Some(settings.as_ref()),
+			con.as_ref(),
 			bridges,
 		)
 		.await?;
@@ -712,7 +838,7 @@ impl ProjectEnvironment {
 		trusted_extensions: &[ExtHostSpec],
 		contributed_values: &[ContributedCliValue],
 		interrupt_grace: omp_core::Duration,
-		settings: Arc<SettingsSnapshot>,
+		con: Arc<Ctx>,
 		owner_client: EnvClient,
 		owner_bridge: JoinHandle<()>,
 		bridges: RegistryBridges,
@@ -735,7 +861,7 @@ impl ProjectEnvironment {
 			Registry::new(),
 			worker_config,
 			approval_mode,
-			settings.as_ref(),
+			con.as_ref(),
 			bridges,
 			owner_client,
 		)
@@ -836,15 +962,15 @@ impl ProjectEnvironment {
 	pub async fn isolated(
 		root: &Path,
 		state_dir: &Path,
-		catalog: SettingsCatalog,
+		con: &Ctx,
 		bridges: RegistryBridges,
 	) -> Result<Self, EnvdError> {
 		let command_credentials = bridges.command_credentials.clone();
 		let dynamic_tool_factories = bridges.dynamic_tool_factories.clone();
 		let (worker_config, data_bindings) =
-			worker_config(state_dir, true, &[], &[], omp_tool::DEFAULT_INTERRUPT_GRACE)?;
+			worker_config(state_dir, true, &[], &[], host_settings::SV_INTERRUPT_GRACE.get(con))?;
 		let server = Arc::new(
-			EnvServer::open_local(root, state_dir, Registry::new(), worker_config, catalog, bridges)
+			EnvServer::open_local(root, state_dir, Registry::new(), worker_config, con, bridges)
 				.await?,
 		);
 		let registry = server.registry();
@@ -1004,11 +1130,6 @@ impl ProjectEnvironment {
 		Arc::clone(&self.github_credentials)
 	}
 
-	/// Returns the Environment-owned authoritative sessions index.
-	pub fn sessions_index(&self) -> Arc<SessionIndex> {
-		self.lifecycle.server.sessions_index()
-	}
-
 	/// Returns the authenticated session generation fencing CONTROL clients.
 	pub fn session_generation(&self) -> u64 {
 		self.lifecycle.server.session_generation()
@@ -1072,6 +1193,15 @@ impl ProjectEnvironment {
 		self.lifecycle.server.extension_registry_evidences()
 	}
 
+	/// Registers frozen Python Directors and Components with an engine
+	/// registrar.
+	pub fn register_python_extensions(
+		&self,
+		registrar: &mut omp_agent::ExtensionRegistrar,
+	) -> Result<Vec<exthost::PyComponent>, exthost::PyExtensionError> {
+		self.lifecycle.server.register_python_extensions(registrar)
+	}
+
 	/// Returns every authenticated extension CONTROL identity.
 	pub fn extension_control_identities(&self) -> Vec<Arc<ControlConnectionIdentity>> {
 		self.lifecycle.server.extension_control_identities()
@@ -1080,16 +1210,6 @@ impl ProjectEnvironment {
 	/// Returns the eager prompt-contribution provider over live worker actors.
 	pub fn extension_prompt_provider(&self) -> Arc<dyn exthost::PromptContributionProvider> {
 		self.lifecycle.server.extension_prompt_provider()
-	}
-
-	/// Returns the live resolver over exact-generation regime declarations
-	/// retained from extension FREEZE acknowledgments.
-	pub fn extension_regime_resolver(&self) -> Arc<worker::ExtensionRegimeResolver> {
-		let server = Arc::clone(&self.lifecycle.server);
-		let callbacks = server.extension_callback_dispatcher();
-		worker::ExtensionRegimeResolver::new(callbacks, move |identity| {
-			server.extension_registry_evidence(identity)
-		})
 	}
 
 	/// Returns a cloneable authority for retained MCP commands and inspection.
@@ -1153,7 +1273,7 @@ impl ProjectEnvironment {
 	/// is attempted after child activation began.
 	pub fn bind_agent_control(
 		&self,
-		sender: ControlSender,
+		sender: KernelSender,
 	) -> Result<server::AgentControlBinding, EnvdError> {
 		self.lifecycle.server.bind_agent_control(sender)
 	}
@@ -1173,7 +1293,7 @@ impl ProjectEnvironment {
 	}
 
 	/// Binds extension device availability notifications to the active turn.
-	pub fn bind_device_availability(&self, mailbox: omp_agent::MailboxSender) {
+	pub fn bind_device_availability(&self, mailbox: KernelSender) {
 		self.lifecycle.server.bind_device_availability(mailbox);
 	}
 }

@@ -15,14 +15,12 @@ use http::{
 	HeaderMap, HeaderValue,
 	header::{ACCEPT, ETAG, IF_NONE_MATCH, USER_AGENT},
 };
+use omp_cache::github_cache::{GithubCache, GithubCacheKey, GithubCacheStatus, GithubResourceKind};
 use omp_catalog::AuthSpecId;
 use omp_core::{CowBytes, Str, sf};
 use omp_inference::{
 	auth::{CredentialError, CredentialLease, CredentialNeed, HeaderPlacement},
 	id::{AccountId, PrincipalId},
-};
-use omp_storage::github_cache::{
-	GithubCache, GithubCacheKey, GithubCacheStatus, GithubResourceKind,
 };
 use omp_tools::read::{Fault, resolver::Resolve, selector::ParsedSelector};
 use serde_json::Value;

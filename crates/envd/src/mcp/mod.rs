@@ -39,9 +39,9 @@ use std::{
 use bytes::Bytes;
 use flume::Receiver;
 use futures::future::BoxFuture;
+use omp_cache::mcp_cache::{McpCacheError, McpDefinitionCache};
 use omp_core::Str;
 use omp_proto::env::v1 as pb;
-use omp_storage::mcp_cache::{McpCacheError, McpDefinitionCache};
 use omp_tool::{
 	LeafCatalogSnapshot, LeafOwner, LeafReplacementError, LeafReplacementRegistry, LeafVersion,
 	RegistryLeaf, Rev,

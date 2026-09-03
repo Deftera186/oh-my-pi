@@ -501,7 +501,7 @@ impl BridgeProgressSink for ProgressChannel {
 struct OutputSpill {
 	host:        Option<BlobHost>,
 	buffered:    Vec<u8>,
-	stage:       Option<omp_storage::blob::BlobStage>,
+	stage:       Option<omp_journal::blob::BlobStage>,
 	total_lines: usize,
 	total_bytes: usize,
 }

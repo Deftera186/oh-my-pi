@@ -4,8 +4,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, thread, time::Duration
 
 use async_trait::async_trait;
 use flume::Receiver;
+use omp_con::Ctx;
 use omp_core::{ArtifactUrl, Str, sf};
-use omp_settings::BrowserSettings;
 use omp_tools::browser::{Action, BrowserHost, Fault, Params, Payload, RunOperation};
 use omp_webview::{
 	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig,
@@ -17,6 +17,58 @@ use crate::blobs::{BlobError, BlobHost};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
+
+omp_con::var! {
+	/// Enable the browser tool for scripted web automation.
+	pub static SV_BROWSER_ENABLED = sv_browser_enabled: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+	/// Run browser automation offscreen instead of showing a browser window.
+	pub static SV_BROWSER_HEADLESS = sv_browser_headless: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+}
+
+/// Browser-tool availability and presentation mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrowserSettings {
+	/// Enables the browser automation tool.
+	pub enabled:  bool,
+	/// Uses an offscreen frame surface instead of an engine-owned window.
+	pub headless: bool,
+}
+
+impl BrowserSettings {
+	/// Resolves browser policy from the process control context.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self { enabled: SV_BROWSER_ENABLED.get(ctx), headless: SV_BROWSER_HEADLESS.get(ctx) }
+	}
+}
+
+impl Default for BrowserSettings {
+	fn default() -> Self {
+		Self { enabled: true, headless: true }
+	}
+}
+
+#[cfg(test)]
+mod settings_tests {
+	use super::*;
+
+	#[test]
+	fn browser_settings_project_from_con() {
+		let ctx = Ctx::new();
+		SV_BROWSER_ENABLED.set(&ctx, false).expect("set enabled");
+		SV_BROWSER_HEADLESS.set(&ctx, false).expect("set headless");
+		assert_eq!(BrowserSettings::from_con(&ctx), BrowserSettings {
+			enabled:  false,
+			headless: false,
+		});
+	}
+}
 
 enum Request {
 	Execute { params: Params, reply: flume::Sender<Result<Payload, Fault>> },

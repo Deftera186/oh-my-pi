@@ -6,7 +6,7 @@ mod sandbox;
 mod shell;
 
 pub(crate) use acp::{AcpRouting, AcpSettings};
-pub(crate) use async_jobs::AsyncJobSettings;
+pub use async_jobs::AsyncJobSettings;
 pub(crate) use sandbox::{
 	EnvironmentInheritance, ExecSandboxMode, ReadMode, SandboxNetworkMode, SandboxSettings,
 	UnscopedWrites,
