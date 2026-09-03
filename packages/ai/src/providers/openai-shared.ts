@@ -21,7 +21,7 @@ import {
 	removeBlankCoreWeaveProjectHeaders,
 } from "@oh-my-pi/pi-catalog/wire/coreweave";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
-import { isOpenCodeProvider, opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
+import { opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	classifyJsonPrefix,
@@ -150,7 +150,7 @@ export interface OpenAIStrictToolsState {
 export interface OpenAIRequestSetupModel extends OpenAIModelIdentity {
 	headers?: Record<string, string>;
 	premiumMultiplier?: number;
-	compat?: Pick<ResolvedOpenAISharedCompat, "promptCacheSessionHeader">;
+	compat?: Pick<ResolvedOpenAISharedCompat, "promptCacheSessionHeader" | "requiresOpenCodeRoutingHeaders">;
 }
 
 /** Cache identity controls shared by OpenAI-family transports. */
@@ -321,7 +321,7 @@ export function resolveOpenAIRequestSetup(
 	// inference requests and error header-less callers; `x-opencode-client`
 	// attributes the request for upstream stats. Defaults only — explicit
 	// user/config headers of the same name already sit in `headers` and win.
-	if (isOpenCodeProvider(model.provider)) {
+	if (model.compat?.requiresOpenCodeRoutingHeaders) {
 		const routing = opencodeRoutingHeaders(options.opencodeSessionId);
 		for (const name in routing) {
 			setHeaderIfAbsent(headers, name, routing[name]);

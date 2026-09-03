@@ -1,6 +1,8 @@
 // Provider-wire compat for "opencode-go"; regenerated from the frozen census using deployment contract selectors.
 
 provider "opencode-go" {
+	// OpenCode requires stable routing identity on every inference transport.
+	requires-opencode-routing-headers #true
 	// Replaces the OpenCode reasoning-model whenThinking fallback object.
 	when-thinking {
 		requires-reasoning-content-for-tool-calls #true

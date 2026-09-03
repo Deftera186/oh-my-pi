@@ -343,6 +343,8 @@ export interface OpenAICompat {
 	extraBody?: Record<string, unknown>;
 	/** Request-session header that should mirror the normalized prompt-cache key. Default: unset. */
 	promptCacheSessionHeader?: "x-grok-conv-id";
+	/** Whether requests require OpenCode's per-conversation routing headers. */
+	requiresOpenCodeRoutingHeaders?: boolean;
 	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
 	cacheControlFormat?: "anthropic" | undefined;
 	/**
@@ -532,6 +534,8 @@ export interface AnthropicCompat {
 	 * OAuth defaults on non-official Anthropic endpoints.
 	 */
 	allowAnthropicHeaderOverrides?: boolean;
+	/** Whether requests require OpenCode's per-conversation routing headers. */
+	requiresOpenCodeRoutingHeaders?: boolean;
 	/**
 	 * Replay unsigned `thinking` blocks from prior assistant turns as native
 	 * thinking instead of demoting them to text. Official Anthropic enforces
@@ -697,6 +701,8 @@ export interface ResolvedOpenAISharedCompat {
 	emptyLengthFinishIsContextError: boolean;
 	usesOpenAIToolCallIdLimit: boolean;
 	promptCacheSessionHeader?: OpenAICompat["promptCacheSessionHeader"];
+	/** Whether requests require OpenCode's per-conversation routing headers. */
+	requiresOpenCodeRoutingHeaders?: boolean;
 	/**
 	 * Whether this model accepts explicit OpenAI prompt-cache breakpoints.
 	 * Built catalog models always materialize this false-by-default value;
@@ -770,6 +776,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "emptyLengthFinishIsContextError"
 			| "usesOpenAIToolCallIdLimit"
 			| "promptCacheSessionHeader"
+			| "requiresOpenCodeRoutingHeaders"
 			| "supportsPromptCacheBreakpoints"
 			| "promptCacheBreakpointTtl"
 			| "openRouterRouting"
@@ -853,7 +860,11 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 export type ResolvedOpenRouterCompat = ResolvedOpenAICompat & ResolvedOpenAIResponsesCompat;
 
 /** Fully-resolved anthropic-messages compat view (same contract as `ResolvedOpenAICompat`). */
-export type ResolvedAnthropicCompat = Required<Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard">> & {
+export type ResolvedAnthropicCompat = Required<
+	Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard" | "requiresOpenCodeRoutingHeaders">
+> & {
+	/** Whether requests require OpenCode's per-conversation routing headers. */
+	requiresOpenCodeRoutingHeaders?: boolean;
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: AnthropicCompat["thinkingLoopGuard"];
 	/**
@@ -903,6 +914,8 @@ export type ResolvedDevinCompat = Required<DevinCompat>;
  * compat cascade; sparse overrides follow the same shape.
  */
 export interface GoogleCompat {
+	/** Whether requests require OpenCode's per-conversation routing headers. */
+	requiresOpenCodeRoutingHeaders?: boolean;
 	/** Whether functionCall/functionResponse parts carry the `id` field. */
 	supportsFunctionPartId?: boolean;
 	/** Add the bypass sentinel to every unsigned Gemini function call. */
@@ -937,13 +950,19 @@ export interface GoogleCompat {
 export type ResolvedGoogleCompat = Required<
 	Omit<
 		GoogleCompat,
-		"streamFirstEventTimeoutMs" | "streamIdleTimeoutMs" | "thinkingLoopGuard" | "antigravityUsageLabel"
+		| "streamFirstEventTimeoutMs"
+		| "streamIdleTimeoutMs"
+		| "thinkingLoopGuard"
+		| "antigravityUsageLabel"
+		| "requiresOpenCodeRoutingHeaders"
 	>
 > & {
 	streamFirstEventTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
 	thinkingLoopGuard?: GoogleCompat["thinkingLoopGuard"];
 	antigravityUsageLabel?: string;
+	/** Whether requests require OpenCode's per-conversation routing headers. */
+	requiresOpenCodeRoutingHeaders?: boolean;
 };
 
 /** Sparse, user-authored compat overrides for a given API (models.json / config vocabulary). */

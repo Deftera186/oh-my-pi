@@ -1,4 +1,4 @@
-import { isOpenCodeProvider, opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
+import { opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import type { Context, Model, StreamFunction } from "../types";
@@ -39,7 +39,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai"> = (
 			const url = `${base}/models/${model.id}:streamGenerateContent?alt=sse`;
 			const headers: Record<string, string> = {
 				"x-goog-api-key": apiKey,
-				...(isOpenCodeProvider(model.provider) ? opencodeRoutingHeaders(options?.sessionId) : {}),
+				...(model.compat.requiresOpenCodeRoutingHeaders ? opencodeRoutingHeaders(options?.sessionId) : {}),
 				...model.headers,
 				...options?.headers,
 			};

@@ -1,6 +1,8 @@
 // Provider-wire compat for "opencode-zen"; regenerated from the frozen census using deployment contract selectors.
 
 provider "opencode-zen" {
+	// OpenCode requires stable routing identity on every inference transport.
+	requires-opencode-routing-headers #true
 	// Replaces the OpenCode reasoning-model whenThinking fallback object.
 	// Applies to every completions-routed reasoning model, discovered ids
 	// included; the engine drops whenThinking for non-reasoning specs.

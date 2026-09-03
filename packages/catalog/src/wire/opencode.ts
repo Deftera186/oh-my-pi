@@ -11,11 +11,6 @@
 /** Client identifier reported to OpenCode's routing gateway. */
 export const OPENCODE_CLIENT_ID = "omp";
 
-/** Whether a provider routes through the OpenCode Go/Zen gateway. */
-export function isOpenCodeProvider(provider: string): boolean {
-	return provider === "opencode-go" || provider === "opencode-zen";
-}
-
 /**
  * Routing headers for an OpenCode inference request. `x-opencode-session` is
  * emitted only when a stable session id is available; `x-opencode-client` is

@@ -396,6 +396,10 @@ function buildCompactionV2Headers(
 	const cacheOptions = { sessionId: request.sessionId, promptCacheKey: request.promptCacheKey };
 	const routingSessionId = getOpenAIResponsesRoutingSessionId(cacheOptions);
 	const promptCacheSessionId = getOpenAIPromptCacheKey(cacheOptions);
+	const requiresOpenCodeRoutingHeaders =
+		model.compat !== undefined &&
+		"requiresOpenCodeRoutingHeaders" in model.compat &&
+		model.compat.requiresOpenCodeRoutingHeaders === true;
 	const headers: Record<string, string> =
 		api === "azure-openai-responses"
 			? {
@@ -406,7 +410,13 @@ function buildCompactionV2Headers(
 			: {
 					"content-type": "application/json",
 					...resolveOpenAIRequestSetup(
-						{ provider: model.provider, id: model.id, baseUrl: model.baseUrl, headers: model.headers },
+						{
+							provider: model.provider,
+							id: model.id,
+							baseUrl: model.baseUrl,
+							headers: model.headers,
+							compat: { requiresOpenCodeRoutingHeaders },
+						},
 						{
 							apiKey,
 							messages: [],

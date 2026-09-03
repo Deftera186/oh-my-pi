@@ -223,6 +223,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"supports-function-part-id": wire("supportsFunctionPartId", ["google"]),
 
 	// ── wire: shared across surfaces ──
+	"requires-opencode-routing-headers": wire("requiresOpenCodeRoutingHeaders", [...OAI, "anthropic", "google"]),
 	"stream-first-event-timeout-ms": wire("streamFirstEventTimeoutMs", [...OAI, "google"]),
 	"stream-idle-timeout-ms": wire("streamIdleTimeoutMs", [...OAI, "anthropic", "bedrock", "google"]),
 	"strip-image-input": wire("stripImageInput", [...OAI, "anthropic", "google"]),
