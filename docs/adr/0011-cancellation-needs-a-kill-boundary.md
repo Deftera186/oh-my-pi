@@ -53,7 +53,19 @@ same boundary viewed from the stop side.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/agent/src/cancel.rs`. The cancellation tree and supervised process groups provide session, turn, foreground, read-only, and background kill boundaries.
+**Implemented.** Primary implementation: `crates/agent/src/cancel.rs` (scopes) and
+`crates/agent/src/dispatch.rs` (the ladder). Every tool scope carries two views of one stop: the
+*commit* token a foreground mutation observes (session-only, so a turn interrupt never tears an
+atomic commit) and the *interrupt* token the host raises on turn interruption or session
+cancellation. `Dispatcher::dispatch` answers the interrupt token with cooperative settlement (feed
+interrupt for in-process tools; `ExternalDispatchRequest.cancellation` for worker/remote units,
+which `crates/driver/src/headless/kernel.rs` forwards to envd where `ExecHost` applies TERM →
+`sv_interrupt_grace` → KILL to the process group), waits `DispatchPolicy::interrupt_grace` for the
+unit's own verdict, then forcibly terminates and journals `Abort::EffectsUnknown` — never a missing
+`tool.result@1`. A cancelled turn is recorded in the tree (`msg.assistant.end@1 cancelled` when an
+assistant is open, then `<notice kind=warn>`), so the chat host derives "turn over" from the DOM.
+Proof: `crates/agent/tests/dispatch.rs::interrupt_kills_a_running_shell_tool_and_settles_aborted`,
+`crates/agent/tests/cancel.rs`, `crates/e2e/tests/p7_tui.rs` (real PTY ctrl+c over a `sleep 30`).
 
 ## References
 
