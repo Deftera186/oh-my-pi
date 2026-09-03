@@ -14,10 +14,6 @@ path = "examples/gallery/main.rs"
 test = true
 
 [[example]]
-name = "chat"
-path = "examples/chat/main.rs"
-test = true
-[[example]]
 name = "diff"
 path = "examples/diff.rs"
 test = true
@@ -36,7 +32,7 @@ mermaid-text.workspace = true
 omp-core.workspace = true
 omp-macros.workspace = true
 omp-snapcompact.workspace = true
-omp-tui-vocab.workspace = true
+omp-vocab.workspace = true
 png.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
@@ -66,4 +62,4 @@ objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
 
 [dev-dependencies]
-omp-chat-ui.workspace = true
+proptest.workspace = true

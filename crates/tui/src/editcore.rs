@@ -244,6 +244,37 @@ impl EditBuffer {
 		self.break_sequence();
 	}
 
+	/// Moves the cursor to the start (`end == false`) or end of the whole
+	/// message, collapsing any selection (pi `moveToMessageStart/End`).
+	pub fn move_to_message_edge(&mut self, end: bool) -> BufferOutcome {
+		let at = if end { self.text.len() } else { 0 };
+		self.anchor = None;
+		self.desired = None;
+		self.move_to(at)
+	}
+
+	/// Undoes the last meaningful edit while ignoring `transient` text that
+	/// was just removed at the cursor (pi `undoPastTransientText`): every
+	/// undo snapshot that only differs from the current text by a partially
+	/// typed `transient` is discarded first, so a `#undo` trigger never
+	/// counts as the edit being undone.
+	pub fn undo_past_transient(&mut self, transient: &str) -> BufferOutcome {
+		let (before, after) = self.text.split_at(self.cursor);
+		while let Some((text, _, _)) = self.undo.last() {
+			let typed = text
+				.strip_prefix(before)
+				.and_then(|rest| rest.strip_suffix(after));
+			let Some(typed) = typed else {
+				break;
+			};
+			if !transient.starts_with(typed) {
+				break;
+			}
+			self.undo.pop();
+		}
+		self.undo()
+	}
+
 	/// Places the cursor on a logical line and cell column.
 	pub fn set_cursor_line_column(&mut self, line: usize, column: u16) {
 		let mut start = 0;
@@ -1599,6 +1630,14 @@ pub trait EditorCompletion {
 			TabAction::Pass
 		}
 	}
+
+	/// One of this engine's rows was accepted: `replaced` is the buffer
+	/// text the row's value overwrote (the typed trigger and query). Engines
+	/// whose rows are actions rather than text (pi's `#` prompt actions)
+	/// record the side effect here for the host to apply.
+	fn accepted(&mut self, replaced: &str, suggestion: &Suggestion) {
+		let _ = (replaced, suggestion);
+	}
 }
 
 /// One retained row in a visible picker window.
@@ -1633,13 +1672,20 @@ impl Picker {
 		(start, &self.suggestions[start..start + visible])
 	}
 
-	/// Returns visible rows including category headers.
+	/// Returns visible rows including category headers. Headers only
+	/// separate mixed categories: a dropdown whose rows all share one
+	/// category is a plain list (pi's slash menu carries no heading).
 	pub fn visible_rows(&self) -> SmallVec<PickerRow<'_>, 8> {
 		let (start, suggestions) = self.visible_suggestions();
 		let mut rows = SmallVec::new();
+		let first = self.suggestions.first().and_then(|suggestion| suggestion.category.as_ref());
+		let uniform = self
+			.suggestions
+			.iter()
+			.all(|suggestion| suggestion.category.as_ref() == first);
 		let mut category: Option<&Str> = None;
 		for (offset, suggestion) in suggestions.iter().enumerate() {
-			if suggestion.category.as_ref() != category {
+			if !uniform && suggestion.category.as_ref() != category {
 				category = suggestion.category.as_ref();
 				if let Some(header) = category {
 					rows.push(PickerRow::Header(header));
@@ -2173,9 +2219,47 @@ impl Editor {
 				.and_then(|completion| completion.hint(self.buffer.text(), cursor));
 			return EditOutcome::Changed;
 		}
-		self.buffer.replace_range(picker.range, &suggestion.value);
+		self.apply_suggestion(&picker, suggestion);
 		self.refresh();
 		EditOutcome::Changed
+	}
+
+	/// Replaces the picker's range with the row's value and, for
+	/// engine-provided rows, reports the acceptance to the engine.
+	fn apply_suggestion(&mut self, picker: &Picker, suggestion: &Suggestion) {
+		let Some(completion) = self.completion.as_mut().filter(|_| picker.provided) else {
+			self.buffer.replace_range(picker.range.clone(), &suggestion.value);
+			return;
+		};
+		let replaced = Str::new(&self.buffer.text()[picker.range.clone()]);
+		self.buffer.replace_range(picker.range.clone(), &suggestion.value);
+		completion.accepted(&replaced, suggestion);
+	}
+
+	/// Moves the cursor to the start or end of the whole message.
+	pub fn move_to_message_edge(&mut self, end: bool) -> EditOutcome {
+		match self.buffer.move_to_message_edge(end) {
+			BufferOutcome::Changed => {
+				self.refresh();
+				EditOutcome::Changed
+			},
+			BufferOutcome::Ignored => EditOutcome::Ignored,
+		}
+	}
+
+	/// Undoes the last meaningful edit, skipping snapshots that only carry
+	/// the just-removed `transient` trigger text (see
+	/// [`EditBuffer::undo_past_transient`]).
+	pub fn undo_past_transient(&mut self, transient: &str) -> EditOutcome {
+		self.history_index = None;
+		self.history_query = None;
+		match self.buffer.undo_past_transient(transient) {
+			BufferOutcome::Changed => {
+				self.refresh();
+				EditOutcome::Changed
+			},
+			BufferOutcome::Ignored => EditOutcome::Ignored,
+		}
 	}
 
 	/// When the dropdown is open, a command row with nothing before its token
@@ -2208,7 +2292,7 @@ impl Editor {
 			return;
 		};
 		let suggestion = &picker.suggestions[picker.selected];
-		self.buffer.replace_range(picker.range, &suggestion.value);
+		self.apply_suggestion(&picker, suggestion);
 		self.hint = None;
 	}
 

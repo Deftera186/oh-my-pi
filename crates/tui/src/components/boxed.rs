@@ -135,7 +135,7 @@ mod tests {
 	use super::Boxed;
 	use crate::{
 		component::{Cached, PaintCtx},
-		components::TextLeaf,
+		components::{Hr, TextLeaf},
 		context::UiContext,
 		frame::{Frame, Rect, Size},
 		markup::Border,
@@ -160,6 +160,46 @@ mod tests {
 		assert!(frame_row_text(&frame, 0).starts_with("╭─ Panel "));
 		assert_eq!(frame_row_text(&frame, 1), "│body        │");
 		assert_eq!(frame_row_text(&frame, height - 1), "╰────────────╯");
+	}
+
+	#[test]
+	fn child_rule_joins_box_border() {
+		let ctx = UiContext::default();
+		let mut root = Cached::new(Box::new(
+			Boxed::new()
+				.with(Prop::Border, Border::Round)
+				.child(TextLeaf::new().text("above"))
+				.child(
+					Hr::new()
+						.with(Prop::Title, "Output")
+						.with(Prop::TitlePad, 3_u16),
+				)
+				.child(TextLeaf::new().text("below")),
+		));
+		let height = root.height(&ctx, 16);
+		root.place(&ctx, Rect::new(0, 0, 16, height));
+		let mut frame = Frame::new(Size::new(16, height));
+		let mut hits = Vec::new();
+		root.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
+		assert_eq!(frame_row_text(&frame, 2), "├─── Output ───┤");
+	}
+
+	#[test]
+	fn title_pad_retains_requested_rule_cells_before_title() {
+		let ctx = UiContext::default();
+		let mut root = Cached::new(Box::new(
+			Boxed::new()
+				.with(Prop::Border, Border::Round)
+				.with(Prop::Title, "Panel")
+				.with(Prop::TitlePad, 3_u16)
+				.child(TextLeaf::new().text("body")),
+		));
+		let height = root.height(&ctx, 16);
+		root.place(&ctx, Rect::new(0, 0, 16, height));
+		let mut frame = Frame::new(Size::new(16, height));
+		let mut hits = Vec::new();
+		root.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
+		assert!(frame_row_text(&frame, 0).starts_with("╭─── Panel "));
 	}
 
 	#[test]

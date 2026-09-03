@@ -311,6 +311,32 @@ impl Ui {
 		true
 	}
 
+	/// Locates a named component, downcasts it to `T`, and reads through
+	/// `probe` without invalidating anything; an unknown id or mismatched
+	/// concrete type returns `None`.
+	pub fn with_component<T: Component, R>(
+		&self,
+		id: &str,
+		probe: impl FnOnce(&T) -> R,
+	) -> Option<R> {
+		fn find<'a>(cached: &'a Cached, id: &str) -> Option<&'a Cached> {
+			if cached
+				.comp()
+				.props()
+				.id()
+				.is_some_and(|candidate| candidate == id)
+			{
+				return Some(cached);
+			}
+			cached
+				.comp()
+				.children()
+				.iter()
+				.find_map(|child| find(child, id))
+		}
+		find(&self.root, id)?.comp().downcast_ref::<T>().map(probe)
+	}
+
 	/// Locates a named component, downcasts it to `T`, and applies `update`.
 	/// A successful typed mutation invalidates the component and returns the
 	/// closure's value; an unknown id or mismatched concrete type returns
@@ -2245,7 +2271,7 @@ mod tests {
 			}
 		};
 	}
-	omp_tui_vocab::for_each_component! { assert_tag_types }
+	omp_vocab::for_each_component! { assert_tag_types }
 
 	fn frame_text(ui: &Ui) -> Vec<String> {
 		let size = ui.frame().size();

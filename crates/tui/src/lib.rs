@@ -46,6 +46,8 @@ pub mod scene;
 /// CPU fragment-shader effects packed into half-block cells.
 pub mod shader;
 mod sixel;
+/// Elastic speculative transcript slots and delivery transactions.
+pub mod slots;
 pub mod spelling;
 pub mod syntax;
 mod terminal;
@@ -103,9 +105,7 @@ pub use overlay::{Layer, OverlayAnchor, OverlayBand, OverlayId, OverlayMargin, O
 pub use paste::{Pasted, PastedImage};
 pub use props::{Prop, PropValue, Props};
 pub use pump::{DebugOp, DebugQuery, TerminalEvent};
-pub use renderer::{
-	HistoryReplay, OutputState, PaintStats, Renderer, RetireStats, file_link_target,
-};
+pub use renderer::{DeliveryError, OutputState, PaintStats, Renderer, file_link_target};
 pub use rich::{
 	Clip, Measure, Pipeline, Prefix, Prefixed, Restyle, RichSink, RichText, Rows, Tee, Wrap,
 	cell_width, decompose,

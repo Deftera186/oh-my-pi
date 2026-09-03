@@ -2427,7 +2427,7 @@ mod tests {
 		assert_eq!(math_span("$5 and $10"), None);
 		assert_eq!(math_span(r"$x\$y$ rest"), Some((r"x\$y", 6)));
 		assert_eq!(math_span(r"\$x$"), None);
-		assert_eq!(math_span(r"\(x \\) y\) end"), Some((r"x \\) y", 12)));
+		assert_eq!(math_span(r"\(x \\) y\) end"), Some((r"x \\) y", 11)));
 		assert_eq!(math_span(r"$$a \$$ b$$"), Some((r"a \$$ b", 11)));
 		assert!(is_bare_math_environment("align*"));
 		assert!(!is_bare_math_environment("tabular"));

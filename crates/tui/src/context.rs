@@ -269,10 +269,14 @@ impl Charset {
 	}
 
 	/// Status-band chrome: `(left cap, segment separator, right cap)`.
-	pub(crate) const fn status_band(self) -> (&'static str, &'static str, &'static str) {
+	///
+	/// Mirrors pi's symbol presets: the thin powerline separator between
+	/// segments and the solid powerline cap closing the group; only the
+	/// Nerd Font tier has a soft opening cap.
+	pub const fn status_band(self) -> (&'static str, &'static str, &'static str) {
 		match self {
 			Self::Ascii => ("", ">", ">"),
-			Self::Unicode => ("", "›", "›"),
+			Self::Unicode => ("", ">", "▶"),
 			Self::NerdFont => ("\u{e0b6}", "\u{e0b1}", "\u{e0b0}"),
 		}
 	}
@@ -280,11 +284,11 @@ impl Charset {
 	/// Right-docked status-band chrome, [`Charset::status_band`] mirrored:
 	/// the opening cap points left into the surrounding background and the
 	/// closing edge ends flat, solid against the right margin.
-	pub(crate) const fn status_band_end(self) -> (&'static str, &'static str, &'static str) {
+	pub const fn status_band_end(self) -> (&'static str, &'static str, &'static str) {
 		match self {
-			Self::Ascii => ("<", ">", ""),
-			Self::Unicode => ("‹", "›", ""),
-			Self::NerdFont => ("\u{e0b2}", "\u{e0b1}", ""),
+			Self::Ascii => ("<", "<", ""),
+			Self::Unicode => ("◀", "<", ""),
+			Self::NerdFont => ("\u{e0b2}", "\u{e0b3}", ""),
 		}
 	}
 

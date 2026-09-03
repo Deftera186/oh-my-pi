@@ -684,7 +684,7 @@ mod tests {
 			)
 			.segment(Segment::new().label("gamma").with(Prop::Fg, "blue"));
 		let (frame, hits) = paint(status, 40);
-		assert_eq!(frame_row_text(&frame, 0), " alpha › beta › gamma ›");
+		assert_eq!(frame_row_text(&frame, 0), " alpha > beta > gamma ▶");
 		assert_eq!(frame.cell(1, 0).style.foreground_color(), Color::Rgb(255, 0, 0));
 		assert_eq!(frame.cell(9, 0).style.foreground_color(), Color::Rgb(0, 128, 0));
 		assert_eq!(frame.cell(16, 0).style.foreground_color(), Color::Rgb(0, 0, 255));
@@ -743,7 +743,7 @@ mod tests {
 				.segment(Segment::new().label("beta")),
 			20,
 		);
-		assert_eq!(frame_row_text(&frame, 0), "‹ alpha › beta");
+		assert_eq!(frame_row_text(&frame, 0), "◀ alpha < beta");
 	}
 
 	#[test]
@@ -754,13 +754,13 @@ mod tests {
 			.segment(Segment::new().label("gamma"));
 		let (frame, _) = paint(status, 10);
 		let painted = frame_row_text(&frame, 0);
-		assert_eq!(painted, " alpha ›");
+		assert_eq!(painted, " alpha ▶");
 		assert!(!painted.contains("beta"));
 	}
 
 	#[test]
 	fn status_truncates_its_last_chip_at_boundary_widths() {
-		for (width, expected) in [(7, " alp… ›"), (4, " … ›"), (3, " …›"), (2, "…›")]
+		for (width, expected) in [(7, " alp… ▶"), (4, " … ▶"), (3, " …▶"), (2, "…▶")]
 		{
 			let status = Status::new().segment(Segment::new().label("alphabet"));
 			let (frame, _) = paint(status, width);
@@ -777,7 +777,7 @@ mod tests {
 		)
 		.expect("status markup should parse");
 		let painted = frame_row_text(ui.frame(), 0);
-		assert!(painted.contains("alpha › beta"));
+		assert!(painted.contains("alpha > beta"));
 	}
 
 	#[test]
@@ -837,7 +837,7 @@ mod tests {
 	fn context_gauge_embeds_percent_and_window_labels() {
 		let gauge = ContextGauge::plan(30, 50_000, Some(200_000), None);
 		assert!(!gauge.overflowed());
-		assert_eq!(gauge_row(&gauge), "======25%----------------200k-");
+		assert_eq!(gauge_row(&gauge), "======25%----------------200K-");
 	}
 
 	#[test]
@@ -845,14 +845,14 @@ mod tests {
 		let boundaries =
 			CompactionBoundaries { threshold_percent: 80.0, speculation_percent: Some(70.0) };
 		let gauge = ContextGauge::plan(30, 160_000, Some(200_000), Some(boundaries));
-		assert_eq!(gauge_row(&gauge), "==================S=T80%-200k-");
+		assert_eq!(gauge_row(&gauge), "==================S=T80%-200K-");
 	}
 
 	#[test]
 	fn context_gauge_overflow_breaks_the_percent_past_the_window_label() {
 		let gauge = ContextGauge::plan(30, 400_000, Some(200_000), None);
 		assert!(gauge.overflowed());
-		assert_eq!(gauge_row(&gauge), "=====================200k-200%");
+		assert_eq!(gauge_row(&gauge), "=====================200K-200%");
 	}
 
 	#[test]
@@ -864,7 +864,7 @@ mod tests {
 	#[test]
 	fn context_gauge_keeps_one_accent_cell_for_a_fresh_session() {
 		let gauge = ContextGauge::plan(30, 0, Some(200_000), None);
-		assert_eq!(gauge_row(&gauge), "=0%----------------------200k-");
+		assert_eq!(gauge_row(&gauge), "=0%----------------------200K-");
 	}
 
 	#[test]
@@ -882,10 +882,10 @@ mod tests {
 	fn compact_counts_share_the_context_label_notation() {
 		let mut label = String::new();
 		let _ = write_compact_count(&mut label, 200_000);
-		assert_eq!(label, "200k");
+		assert_eq!(label, "200K");
 		label.clear();
 		let _ = write_compact_count(&mut label, 1_500_000);
-		assert_eq!(label, "1.5m");
+		assert_eq!(label, "1.5M");
 		label.clear();
 		let _ = write_compact_count(&mut label, 999);
 		assert_eq!(label, "999");

@@ -496,6 +496,19 @@ impl EditInput {
 		self.editor.set_completion(completion);
 	}
 
+	/// Moves the caret to the start or end of the whole draft.
+	pub fn move_to_message_edge(&mut self, end: bool) {
+		self.editor.move_to_message_edge(end);
+	}
+
+	/// Undoes the last edit made before the just-removed `transient`
+	/// trigger text (pi `undoPastTransientText`).
+	pub fn undo_past_transient(&mut self, transient: &str) {
+		if self.editor.undo_past_transient(transient) == EditOutcome::Changed {
+			self.refresh_keyword_spans();
+		}
+	}
+
 	/// Reports whether the cursor is on the first logical line.
 	pub fn cursor_on_first_line(&self) -> bool {
 		self.editor.buffer().cursor_line() == 0
@@ -948,10 +961,17 @@ impl Component for EditInput {
 		} else {
 			None
 		};
-		let shell = text.trim_start().starts_with('!');
+		// pi `isBashMode` / `isPythonMode`: a `!` or `$` prefix recolors the
+		// composer chrome (here the prompt gutter) for the whole draft.
+		let prefix_mode = match text.trim_start().as_bytes().first() {
+			Some(b'!') => Some(pc.ctx.theme.warn),
+			Some(b'$') => Some(pc.ctx.theme.info),
+			_ => None,
+		};
+		let shell = prefix_mode.is_some();
 		let keyword_accent = !self.keyword_spans.is_empty();
-		let active_color = if shell {
-			pc.ctx.theme.warn
+		let active_color = if let Some(color) = prefix_mode {
+			color
 		} else if keyword_accent && (pc.now.as_millis() / 180).is_multiple_of(2) {
 			pc.ctx.theme.secondary
 		} else {
@@ -1048,13 +1068,6 @@ impl Component for EditInput {
 				ComposerStyle::Claude | ComposerStyle::Borderless | ComposerStyle::Rule => {},
 			}
 		}
-		let cursor_style = Style::new()
-			.fg(
-				pc.ctx
-					.theme
-					.foreground_on(pc.ctx.theme.contrast, pc.ctx.theme.accent),
-			)
-			.bg(pc.ctx.theme.accent);
 		let buffer_start = text.as_ptr() as usize;
 		let mut scanned = 0;
 		let mut in_comment = false;
@@ -1165,17 +1178,25 @@ impl Component for EditInput {
 				.then_some(content.cursor_column)
 				.flatten()
 				.map(|column| byte_at_column(content.text, column));
-			paint_xml_runs(
+			paint_xml_range(
 				pc.frame,
 				x,
 				y,
 				content.text,
 				&runs,
+				0,
+				content.text.len(),
 				selection_bytes,
 				pc.ctx.theme.selection,
-				cursor,
-				cursor_style,
 			);
+			// pi `useTerminalCursor`: the hardware cursor alone marks the
+			// insertion point — the caret cell keeps its text styling, so no
+			// painted block competes with the terminal's own cursor (and
+			// IMEs, screen readers, and PTY drivers see the real caret).
+			if let Some(cursor) = cursor {
+				pc.frame
+					.set_cursor(x.saturating_add(cell_width(&content.text[..cursor])), y);
+			}
 			// Dim ghost text after an end-of-row cursor: the completion
 			// engine's usage hint or the platform word completion.
 			if let Some(hint) = &hint
@@ -1956,11 +1977,28 @@ impl EditorPane {
 
 	/// Replaces the composer's completion source.
 	pub fn set_completion(&mut self, completion: Box<dyn Completion>) {
+		self.input_mut().set_completion(completion);
+	}
+
+	/// Moves the caret to the start or end of the whole draft (pi prompt
+	/// actions "Move cursor to message start/end").
+	pub fn move_to_message_edge(&mut self, end: bool) {
+		self.input_mut().move_to_message_edge(end);
+		self.children[0].invalidate();
+	}
+
+	/// Undoes the last edit made before the just-removed `transient`
+	/// trigger text (pi prompt action "Undo").
+	pub fn undo_past_transient(&mut self, transient: &str) {
+		self.input_mut().undo_past_transient(transient);
+		self.children[0].invalidate();
+	}
+
+	fn input_mut(&mut self) -> &mut EditInput {
 		self.children[0]
 			.comp_mut()
 			.downcast_mut::<EditInput>()
-			.expect("completion requires the default editor input")
-			.set_completion(completion);
+			.expect("editor actions require the default editor input")
 	}
 
 	/// Adds or replaces the composer status component.
@@ -2177,6 +2215,14 @@ impl EditorPane {
 			.comp()
 			.downcast_ref::<EditInput>()
 			.map_or("", EditInput::current_line)
+	}
+
+	/// Whether the completion dropdown is open under the editable surface.
+	pub fn popup_open(&self) -> bool {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.is_some_and(|input| input.editor.picker().is_some())
 	}
 
 	#[cfg(test)]
@@ -2411,41 +2457,6 @@ fn paint_xml_range(
 		}
 	}
 	x
-}
-
-fn paint_xml_runs(
-	frame: &mut Frame,
-	x: u16,
-	y: u16,
-	text: &str,
-	runs: &[SyntaxRun],
-	selection: Option<(usize, usize)>,
-	selection_color: Color,
-	cursor: Option<usize>,
-	cursor_style: Style,
-) {
-	let Some(cursor) = cursor else {
-		paint_xml_range(frame, x, y, text, runs, 0, text.len(), selection, selection_color);
-		return;
-	};
-	let mut x = paint_xml_range(frame, x, y, text, runs, 0, cursor, selection, selection_color);
-	if cursor == text.len() {
-		frame.put(x, y, " ", cursor_style);
-		return;
-	}
-	let under = text[cursor..].graphemes().next().unwrap_or(" ");
-	x = frame.put(x, y, under, cursor_style);
-	paint_xml_range(
-		frame,
-		x,
-		y,
-		text,
-		runs,
-		cursor + under.len(),
-		text.len(),
-		selection,
-		selection_color,
-	);
 }
 
 /// Injection-safe executable and arguments for an external editor.
@@ -2914,11 +2925,40 @@ mod tests {
 		let selection = Color::Rgb(0x44, 0x55, 0x66);
 		let style = Style::new().fg(foreground).bold();
 		let runs = [SyntaxRun { start: 0, end: 3, style }];
-		paint_xml_runs(&mut frame, 0, 0, "abc", &runs, Some((1, 2)), selection, None, Style::new());
+		paint_xml_range(&mut frame, 0, 0, "abc", &runs, 0, 3, Some((1, 2)), selection);
 
 		assert_eq!(frame.cell(0, 0).style(), style);
 		assert_eq!(frame.cell(1, 0).style(), style.bg(selection));
 		assert_eq!(frame.cell(2, 0).style(), style);
+	}
+
+	/// pi `useTerminalCursor`: only the hardware cursor marks the caret; the
+	/// cell under it and the cell after the text stay unstyled.
+	#[test]
+	fn caret_is_hardware_only_and_never_paints_a_styled_cell() {
+		let mut ui = Ui::from_root(
+			EditInput::new()
+				.composer_style(ComposerStyle::Borderless)
+				.with(Prop::Id, "composer"),
+			40,
+			UiContext::default(),
+		);
+		ui.focus_first();
+		for character in "hi".chars() {
+			ui.handle_key(Key::Char(character));
+		}
+		let frame = ui.frame();
+		let (column, row) = frame.cursor().expect("hardware caret placed");
+		assert_eq!((column, row), (5, 0));
+		let accent = ui.context().theme.accent;
+		for x in 0..frame.size().width {
+			let style = frame.cell(x, row).style();
+			assert_ne!(style.background_color(), accent, "column {x} paints a caret block");
+		}
+		ui.handle_key(Key::Left);
+		let frame = ui.frame();
+		assert_eq!(frame.cursor(), Some((4, 0)));
+		assert_ne!(frame.cell(4, 0).style().background_color(), accent);
 	}
 
 	#[test]

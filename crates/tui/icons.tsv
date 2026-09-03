@@ -134,6 +134,7 @@ cancelled	status.cancelled	[x]	⊘	
 candle	object.candle	candle	🕯	󰗢
 candy	object.candy	candy	🍬	󱥰
 capricorn	object.capricorn	Cap	♑	󰪀
+card-bullet	format.cardBullet	*	•	•
 card-file-word-box	file.cardFileWordBox	cards	🗃	󰈭
 card-index-card	object.cardIndexCard	card	📇	󰭯
 carousel-horse	object.carouselHorse	ride	🎠	
@@ -499,6 +500,7 @@ last-quarter-moon	object.lastQuarterMoon	moon	🌗	󰽣
 latin-cross	object.latinCross	cross	✝	
 latin-letters-input	object.latinLettersInput	ABC	🔤	󱌯
 launch	tool.launch	run	🚀	
+launch-pending	status.launchPending	[*]	⏳	󱑍
 leafless-tree	object.leaflessTree	tree	🪾	
 leafy-green	object.leafyGreen	leaf	🥬	
 left	nav.left	<	◀	
@@ -897,6 +899,9 @@ speaker-low	device.speakerLow	vol-	🔈	
 speedboat-sailboat	object.speedboatSailboat	boat	🚤	󰻈
 spider	object.spider	spider	🕷	
 spider-web	object.spiderWeb	web	🕸	󰯊
+spin-2	anim.spin2	o	◶	󱑌
+spin-3	anim.spin3	o	◷	󱑍
+spin-4	anim.spin4	o	◴	󱑎
 split	git.split	[|]	◫	
 spoon	object.spoon	spoon	🥄	
 sport-utility-car-sports	object.sportUtilityCarSports	SUV	🚙	󰞬
@@ -918,6 +923,7 @@ stopwatch	object.stopwatch	timer	⏱	
 storm-cloud-rain	object.stormCloudRain	storm	⛈	
 straight-ruler	object.straightRuler	ruler	📏	
 straw-cup	object.strawCup	cup	🥤	󰆪
+stream-cursor	status.streamCursor	|	▌	▌
 studio-microphone	device.studioMicrophone	mic	🎙	
 subscription	icon.subscription	(sub)	(sub)	󰙺
 success	status.success	[ok]	✔	
@@ -1031,6 +1037,7 @@ usb	device.usb	usb	🔌	
 user-add	user.add	+usr	👤	
 user-remove	user.remove	-usr	👤	
 vertical-traffic-light	object.verticalTrafficLight	light	🚦	
+vibe-send-arrow	tool.vibeSendArrow	->	→	→
 vibrate	cmd.vibrate	vib	📳	󰕦
 video	comm.video	cam	📹	
 video-file	file.video	[vid]	🎥	

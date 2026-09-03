@@ -1594,7 +1594,12 @@ const DEFAULT_BINDINGS: &[(Key, u8, Key)] = &[
 	(Key::Char('C'), 3, Key::CopyPrompt),
 	(Key::Char('l'), 3, Key::CopyLine),
 	(Key::Char('L'), 3, Key::CopyLine),
+	// kitty CSI-u reports the unshifted codepoint with the shift bit set
+	// (`112;6u`), so the lowercase rows must exist or shift folds away and
+	// Ctrl+Shift+P collapses into Ctrl+P.
+	(Key::Char('p'), 5, Key::CyclePrevious),
 	(Key::Char('P'), 5, Key::CyclePrevious),
+	(Key::Char('p'), 3, Key::PlanToggle),
 	(Key::Char('P'), 3, Key::PlanToggle),
 	// pi tui.input.newLine: Shift/Ctrl-Enter spelling; Alt+Enter maps to FollowUp.
 	// Rows cover each combination so the semantics stay table-owned.
@@ -2293,6 +2298,40 @@ mod tests {
 			Key::Char('é'),
 			Key::Esc,
 		]);
+	}
+
+	#[test]
+	fn alt_chords_decode_from_legacy_meta_and_kitty_encodings() {
+		// alt+p / alt+m (model pickers), alt+l, alt+r, shift+tab (thinking
+		// cycle), ctrl+shift+p and alt+shift+p as every terminal spells them:
+		// legacy `ESC x`, kitty CSI-u with the alt bit (3 = 1+2), shifted
+		// kitty spellings, and `CSI Z` for Shift+Tab.
+		let cases: &[(&[u8], Key)] = &[
+			(b"\x1bp", Key::Alt('p')),
+			(b"\x1bm", Key::Alt('m')),
+			(b"\x1bl", Key::Alt('l')),
+			(b"\x1br", Key::Alt('r')),
+			(b"\x1b[112;3u", Key::Alt('p')),
+			(b"\x1b[109;3u", Key::Alt('m')),
+			(b"\x1b[Z", Key::BackTab),
+			(b"\x1b[9;2u", Key::BackTab),
+			(b"\x1b[112;6u", Key::CyclePrevious),
+			(b"\x1b[112;4u", Key::PlanToggle),
+			(b"\x1b[1;3A", Key::RestoreQueue),
+			(b"\x1b[15~", Key::Function(5)),
+		];
+		for (bytes, expected) in cases {
+			let mut keys = Vec::new();
+			decode_keys(bytes, &mut keys);
+			assert_eq!(keys, [*expected], "{bytes:?}");
+		}
+		// A split `ESC` + `p` within the escape hold is still one alt chord.
+		let start = Instant::now();
+		let mut decoder = InputDecoder::new();
+		let mut events = Vec::new();
+		decoder.feed(b"\x1b", start, &mut events);
+		decoder.feed(b"p", start + Duration::from_millis(20), &mut events);
+		assert_eq!(events, [InputEvent::Key(Key::Alt('p'))]);
 	}
 
 	#[test]

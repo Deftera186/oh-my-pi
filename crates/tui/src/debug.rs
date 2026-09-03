@@ -289,6 +289,7 @@ pub fn terminal_response(op: DebugOp) -> Option<serde_json::Value> {
 				"cols": snapshot.cols,
 				"rows": snapshot.rows,
 				"height": snapshot.doc_height,
+				"cursor": snapshot.cursor.map(|(row, col)| vec![row, col]),
 				"window_top": snapshot.window_top,
 				"alt_screen": crate::terminal::alt_screen_active(),
 				"overlay": snapshot.overlay,

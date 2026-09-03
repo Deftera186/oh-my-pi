@@ -1432,7 +1432,7 @@ mod tests {
 		assert_eq!(plain("$x^2$"), "x²");
 		assert_eq!(plain(r"\(x^2\)"), "x²");
 		assert_eq!(plain(r"\$x$"), "$x$");
-		assert_eq!(math_span(r"\(x \\) y\) end"), Some((r"x \\) y", 12)));
+		assert_eq!(math_span(r"\(x \\) y\) end"), Some((r"x \\) y", 11)));
 		assert_eq!(math_span(r"$$a \$$ b$$"), Some((r"a \$$ b", 11)));
 	}
 
