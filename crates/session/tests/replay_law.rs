@@ -145,7 +145,7 @@ fn failing_writes_never_poison_the_journal() {
 
 	let missing =
 		omp_journal::blob::BlobRef { hash: omp_core::Hash32::sum(b"not stored"), size: 10 };
-	assert!(session.compaction(missing, cause).is_err());
+	assert!(session.compaction(omp_journal::data::Compaction::new(missing, cause)).is_err());
 	assert_journal_unchanged(&path, &before);
 }
 
@@ -347,7 +347,7 @@ fn write_api_assigns_the_declared_causes() {
 	session
 		.settle(call, raw(serde_json::json!({"text":"done"})))
 		.expect("result");
-	let receipt = session.receipt(1, 2, 3).expect("receipt");
+	let receipt = session.receipt(omp_journal::data::TurnReceipt::tokens(1, 2, 3)).expect("receipt");
 	session
 		.patch(Txn {
 			cause: receipt,
@@ -359,7 +359,7 @@ fn write_api_assigns_the_declared_causes() {
 			}],
 		})
 		.expect("patch");
-	session.compaction(summary, receipt).expect("compaction");
+	session.compaction(omp_journal::data::Compaction::new(summary, receipt)).expect("compaction");
 	drop(session);
 
 	let (_, entries) = Journal::open(path).expect("journal opens");
@@ -374,6 +374,70 @@ fn write_api_assigns_the_declared_causes() {
 		};
 		assert_eq!(entry.by, Some(expected), "wrong cause for {}", entry.kind);
 	}
+}
+
+/// Receipt timing/cache facts and compaction method/token facts are element
+/// props on the live tree and read back identically from a reopened journal
+/// (the transcript's usage row and maintenance dividers project only these).
+#[test]
+fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
+	use omp_journal::data::{Compaction, TurnReceipt};
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("facts.oms");
+	let store = omp_journal::blob::BlobStore::open(directory.path()).expect("blob store opens");
+	let summary = store.put(b"# Summary").expect("summary stores");
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	session.begin_turn().expect("turn");
+	session.user("user", Vec::new()).expect("user");
+	let receipt = session
+		.receipt(TurnReceipt {
+			tokens_in:     1_000,
+			tokens_out:    200,
+			cost_nano_usd: 5,
+			cache_read:    800,
+			cache_write:   100,
+			ttft_ms:       Some(420),
+			duration_ms:   Some(3_100),
+		})
+		.expect("receipt");
+	session
+		.compaction(Compaction {
+			summary,
+			boundary: receipt,
+			method: Some(Str::new_static("handoff")),
+			tokens_before: Some(256_000),
+			tokens_after: Some(20_000),
+			warning: Some(Str::new_static("dead end")),
+		})
+		.expect("compaction");
+	let live = session.dom().snapshot();
+	drop(session);
+
+	let reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
+	assert_eq!(reopened.dom().snapshot(), live);
+	let dom = reopened.dom();
+	let usage = dom.select("body turn usage").expect("selector").next().expect("usage");
+	let usage = dom.get(usage).expect("usage node");
+	let int = |node: &omp_dom::Node, prop: PropId| match node.prop(&prop.into()) {
+		Some(Value::Int(value)) => *value,
+		other => panic!("{prop:?} is {other:?}"),
+	};
+	assert_eq!(int(usage, PropId::CacheRead), 800);
+	assert_eq!(int(usage, PropId::CacheWrite), 100);
+	assert_eq!(int(usage, PropId::TtftMs), 420);
+	assert_eq!(int(usage, PropId::DurationMs), 3_100);
+	let compaction = dom.select("meta compaction").expect("selector").next().expect("compaction");
+	let compaction = dom.get(compaction).expect("compaction node");
+	assert_eq!(
+		compaction.prop(&PropId::Method.into()).and_then(Value::as_str),
+		Some("handoff")
+	);
+	assert_eq!(int(compaction, PropId::TokensBefore), 256_000);
+	assert_eq!(int(compaction, PropId::TokensAfter), 20_000);
+	assert_eq!(
+		compaction.prop(&PropId::Warning.into()).and_then(Value::as_str),
+		Some("dead end")
+	);
 }
 
 proptest! {

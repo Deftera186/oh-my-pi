@@ -220,7 +220,7 @@ fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
 		.expect("assistant delta appends");
 	session.stream_close(sid).expect("assistant stream closes");
 	session
-		.compaction(summary, boundary)
+		.compaction(omp_journal::data::Compaction::new(summary, boundary))
 		.expect("compaction appends");
 	session.begin_turn().expect("new turn starts");
 	session.user("new", Vec::new()).expect("new user appends");

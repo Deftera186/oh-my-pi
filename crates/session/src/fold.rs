@@ -324,10 +324,18 @@ impl Session {
 	fn fold_receipt(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: TurnReceipt = serde_json::from_str(entry.data.as_str())?;
 		let turn = self.current_turn_handle()?;
-		let node = entry_node(KnownTag::Usage, entry)
+		let mut node = entry_node(KnownTag::Usage, entry)
 			.with_prop(PropId::TokensIn, unsigned(payload.tokens_in))
 			.with_prop(PropId::TokensOut, unsigned(payload.tokens_out))
-			.with_prop(PropId::CostNanoUsd, unsigned(payload.cost_nano_usd));
+			.with_prop(PropId::CostNanoUsd, unsigned(payload.cost_nano_usd))
+			.with_prop(PropId::CacheRead, unsigned(payload.cache_read))
+			.with_prop(PropId::CacheWrite, unsigned(payload.cache_write));
+		if let Some(ttft) = payload.ttft_ms {
+			node = node.with_prop(PropId::TtftMs, unsigned(ttft));
+		}
+		if let Some(duration) = payload.duration_ms {
+			node = node.with_prop(PropId::DurationMs, unsigned(duration));
+		}
 		self.insert_last(entry, turn, node)?;
 		Ok(())
 	}
@@ -342,11 +350,24 @@ impl Session {
 		let payload: Compaction = serde_json::from_str(entry.data.as_str())?;
 		let summary = self.compaction_summary(&payload.summary)?;
 		let meta = self.dom.meta();
-		let node = NodeSpec::new(KnownTag::Compaction)
+		let mut node = NodeSpec::new(KnownTag::Compaction)
+			.with_prop(PropId::Id, Value::Str(Str::new(entry.id.to_string())))
 			.with_prop(PropId::Cause, Value::Str(Str::new(entry.id.to_string())))
 			.with_prop(PropId::Boundary, Value::Str(Str::new(payload.boundary.to_string())))
 			.with_prop(PropId::Summary, Value::Str(summary))
 			.with_prop(PropId::Blob, Value::Str(blob_address(&payload.summary)));
+		if let Some(method) = payload.method {
+			node = node.with_prop(PropId::Method, Value::Str(method));
+		}
+		if let Some(before) = payload.tokens_before {
+			node = node.with_prop(PropId::TokensBefore, unsigned(before));
+		}
+		if let Some(after) = payload.tokens_after {
+			node = node.with_prop(PropId::TokensAfter, unsigned(after));
+		}
+		if let Some(warning) = payload.warning {
+			node = node.with_prop(PropId::Warning, Value::Str(warning));
+		}
 		self.insert_last(entry, meta, node)?;
 		Ok(())
 	}

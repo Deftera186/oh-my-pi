@@ -490,19 +490,10 @@ impl Session {
 		})
 	}
 
-	/// Records token and cost accounting for the active turn.
-	pub fn receipt(
-		&mut self,
-		tokens_in: u64,
-		tokens_out: u64,
-		cost_nano_usd: u64,
-	) -> Result<EntryId, SessionError> {
+	/// Records token, cache, cost, and timing accounting for the active turn.
+	pub fn receipt(&mut self, receipt: TurnReceipt) -> Result<EntryId, SessionError> {
 		let by = self.turn_cause()?;
-		self.commit(KindName::TurnReceipt, Some(by), None, None, &TurnReceipt {
-			tokens_in,
-			tokens_out,
-			cost_nano_usd,
-		})
+		self.commit(KindName::TurnReceipt, Some(by), None, None, &receipt)
 	}
 
 	/// Journals and applies a caller-built DOM transaction.
@@ -516,22 +507,19 @@ impl Session {
 		self.commit(KindName::Patch, Some(txn.cause), txn.label, None, &Patch { ops })
 	}
 
-	/// Records a content-addressed compaction summary and its hidden boundary.
-	pub fn compaction(
-		&mut self,
-		summary: BlobRef,
-		boundary: EntryId,
-	) -> Result<EntryId, SessionError> {
+	/// Records a content-addressed compaction summary, its hidden boundary,
+	/// and the maintenance facts the transcript divider labels.
+	pub fn compaction(&mut self, compaction: Compaction) -> Result<EntryId, SessionError> {
 		let by = self.turn_cause()?;
 		if !self
 			.chain_indices(self.head.ok_or(SessionError::NoActiveTurn)?)?
 			.into_iter()
-			.any(|index| self.entries[index].id == boundary)
+			.any(|index| self.entries[index].id == compaction.boundary)
 		{
-			return Err(SessionError::UnknownEntry { id: boundary });
+			return Err(SessionError::UnknownEntry { id: compaction.boundary });
 		}
-		self.compaction_summary(&summary)?;
-		self.commit(KindName::Compaction, Some(by), None, None, &Compaction { summary, boundary })
+		self.compaction_summary(&compaction.summary)?;
+		self.commit(KindName::Compaction, Some(by), None, None, &compaction)
 	}
 
 	/// Selects `target` by canonical prefix replay and stages it as the next
