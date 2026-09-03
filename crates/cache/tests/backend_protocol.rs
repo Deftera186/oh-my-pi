@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, convert::Infallible};
 
-use omp_storage::backend::{
+use omp_cache::backend::{
 	ByteJournalStore, DaemonWriter, MemoryStore,
 	redis::{Command as RedisCommand, RedisStore, Reply as RedisReply, Transport as RedisTransport},
 	sql::{

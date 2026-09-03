@@ -1,33 +1,24 @@
 [package]
-name = "omp-storage"
+name = "omp-cache"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Append-only session transcripts and content-addressed blob storage for omp"
+description = "Reusable document, GitHub, MCP, and secret caches for omp"
 
 [dependencies]
-cap-std.workspace = true
 bytes.workspace = true
-flume.workspace = true
 omp-core.workspace = true
-omp-ar.workspace = true
-omp-proto.workspace = true
-omp-observability.workspace = true
-omp-tool.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-smallvec.workspace = true
 strum.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-xutf.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
