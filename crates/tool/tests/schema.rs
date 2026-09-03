@@ -49,9 +49,13 @@ fn generated_schema_is_compact_inlined_and_model_facing() {
 						"enabled": {"type": "boolean"}
 					},
 					"required": ["enabled"]
+				},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
 				}
 			},
-			"required": ["required"],
+			"required": ["i", "required"],
 			"additionalProperties": false
 		}),
 		"generator settings and serde annotations must project exactly"

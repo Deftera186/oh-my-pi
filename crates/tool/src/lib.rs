@@ -66,10 +66,48 @@ pub fn schema<T: schemars::JsonSchema>() -> Bytes {
 	let mut root = generator.into_root_schema_for::<T>();
 	root.remove("$schema");
 	root.remove("title");
+	let mut value =
+		serde_json::to_value(root.as_value()).expect("schemars-generated JSON Schema must serialize");
+	let object = value
+		.as_object_mut()
+		.expect("tool parameter schemas must describe an object");
+	let properties = object
+		.entry("properties")
+		.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+		.as_object_mut()
+		.expect("tool parameter schema properties must be an object");
+	properties.insert(
+		"i".to_owned(),
+		serde_json::json!({
+			"type": "string",
+			"description": "Short present-participle intent for this call."
+		}),
+	);
+	let required = object
+		.entry("required")
+		.or_insert_with(|| serde_json::Value::Array(Vec::new()))
+		.as_array_mut()
+		.expect("tool parameter schema required must be an array");
+	if !required.iter().any(|name| name.as_str() == Some("i")) {
+		required.insert(0, serde_json::Value::String("i".to_owned()));
+	}
 	Bytes::from(
-		serde_json::to_vec(root.as_value())
+		serde_json::to_vec(&value)
 			.expect("schemars-generated JSON Schema must serialize to compact JSON"),
 	)
+}
+
+/// Deserializes a tool's parameters after removing the protocol-owned `i`
+/// intent field.
+///
+/// `i` is journal and presentation metadata shared by every tool, not a field
+/// each executor must duplicate in its domain-specific parameter type.
+pub fn decode_params<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::Error> {
+	let mut value = serde_json::from_str::<serde_json::Value>(json)?;
+	if let Some(object) = value.as_object_mut() {
+		object.remove("i");
+	}
+	serde_json::from_value(value)
 }
 
 /// Namespaced thread-item property carrying a committed tool revision.
@@ -383,6 +421,12 @@ pub struct Effects {
 
 const _: () = assert!(size_of::<Effects>() <= 96, "Effects must stay compact");
 
+/// Returns whether an effect envelope may mutate environment-owned state.
+#[must_use]
+pub fn effects_mutate_environment(effects: &Effects) -> bool {
+	effects.mutates_environment()
+}
+
 impl Effects {
 	/// Empty deny-all envelope for an explicitly effect-free tool.
 	pub const fn empty() -> Self {
@@ -399,6 +443,16 @@ impl Effects {
 				.is_none_or(InferenceEffects::is_empty)
 			&& self.desktop.as_ref().is_none_or(DesktopEffects::is_empty)
 			&& self.subagents == 0
+	}
+
+	/// Returns whether this envelope may mutate environment-owned state.
+	pub fn mutates_environment(&self) -> bool {
+		self
+			.documents
+			.as_ref()
+			.is_some_and(|documents| !documents.write_globs.is_empty())
+			|| self.exec.as_ref().is_some_and(|exec| !exec.is_empty())
+			|| self.subagents != 0
 	}
 
 	/// Returns whether this envelope is a conservative subset of `maximum`.

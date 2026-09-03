@@ -901,11 +901,8 @@ impl<'c> IncomingParams<'c> {
 	/// Explicitly opts into decoding and validating the one canonical complete
 	/// argument shape.
 	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, ParamError> {
-		self
-			.finalize()
-			.await?
-			.effective()
-			.deserialize_into()
+		let finalized = self.finalize().await?;
+		crate::decode_params(finalized.effective_json())
 			.map_err(|_| malformed_issue(any::type_name::<T>(), None))
 	}
 
@@ -1185,12 +1182,8 @@ impl InterruptibleParams<'_, '_> {
 
 	/// Whole-document decode with interrupt observation.
 	pub async fn whole<T: DeserializeOwned>(&mut self) -> Result<T, ParamError> {
-		self
-			.inner
-			.finalize_with_interrupts(true)
-			.await?
-			.effective()
-			.deserialize_into()
+		let finalized = self.inner.finalize_with_interrupts(true).await?;
+		crate::decode_params(finalized.effective_json())
 			.map_err(|_| malformed_issue(any::type_name::<T>(), None))
 	}
 
@@ -1307,6 +1300,24 @@ mod tests {
 	use super::*;
 
 	const EXAMPLE: &str = r#"{"path":"résumé/💾"}"#;
+
+	#[derive(Debug, Deserialize, Eq, PartialEq)]
+	#[serde(deny_unknown_fields)]
+	struct ExampleParams {
+		path: Str,
+	}
+
+	#[test]
+	fn whole_decodes_tool_params_without_protocol_intent() {
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.args_committed(sf!(r#"{{"i":"Reading fixture","path":"fixture.txt"}}"#))
+			.expect("arguments remain connected");
+		assert_eq!(
+			block_on(params.whole::<ExampleParams>()).expect("intent is protocol metadata"),
+			ExampleParams { path: sf!("fixture.txt") },
+		);
+	}
 
 	fn declarations() -> (Rev, ArgSpecRegistry) {
 		let rev = Rev { family: sf!("native"), n: 7 };
