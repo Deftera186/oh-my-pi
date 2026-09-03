@@ -72,6 +72,14 @@ codegen-backend = "cranelift"
 
 [profile.dev.package."*"]
 codegen-backend = "llvm"
+# omp-con declarations use linkme distributed slices so vars, commands, and
+# actions declared by downstream crates register without a central roster.
+[profile.dev.package.omp-con]
+codegen-backend = "llvm"
+# Telemetry hooks are fail-open across user callbacks and rely on
+# `catch_unwind`; cranelift does not emit the required landing pads.
+[profile.dev.package.omp-observability]
+codegen-backend = "llvm"
 [profile.dev.build-override]
 codegen-backend = "llvm"
 [profile.release]
