@@ -41,7 +41,6 @@ use omp_proto::{
 		},
 	},
 };
-use omp_settings::manager::{SettingsManager, SettingsPaths};
 use omp_tool::{
 	Abort, CallOutcome, Claims, Constraint, DocEffects, Effects, Ev, IncomingParams, LoweringCaps,
 	Part, Precedence, Presentation, PromptCaps, Registry, Rev, Tool, ToolRoute, ToolSpec,
@@ -587,13 +586,14 @@ impl Harness {
 	async fn start_with_worker(registry: Registry, worker: ExtHostConfig) -> Self {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("state scratch directory");
+		let con = omp_con::Ctx::new();
 		let server = Arc::new(
 			EnvServer::open_local(
 				root.path(),
 				state.path(),
 				registry,
 				worker,
-				omp_app::SETTINGS_CATALOG,
+				&con,
 				RegistryBridges::default(),
 			)
 			.await
@@ -817,49 +817,6 @@ fn eval_output(payload: &eval::Payload, channel: OutputChannel) -> Vec<u8> {
 		.collect()
 }
 #[tokio::test]
-async fn todo_restore_answers_its_own_admission_query() {
-	use omp_agent::{StatefulComponent as _, TodoRestore};
-	use omp_storage::transcript::{Header, SessionId};
-
-	let harness = Harness::start(Registry::new()).await;
-	// Production chat restores over a connection with no client-wide admitter,
-	// so the component must answer the environment's admission query itself.
-	// An unanswered query parks the gate until its deadline (300 s) and stalls
-	// host startup behind it.
-	let (client, transport) = EnvClient::in_process(64);
-	let host = Arc::clone(&harness.server);
-	let server_task = tokio::spawn(async move { host.serve_in_process(transport).await });
-	client
-		.hello(ClientHello {
-			client: "todo-restore-contract".into(),
-			schema_rev: SCHEMA_REV,
-			..ClientHello::default()
-		})
-		.await
-		.expect("environment hello");
-	let journal_path = harness.state.path().join("todo-restore.jsonl");
-	let journal = omp_agent::Journal::create(&journal_path, &Header {
-		v:       4,
-		id:      SessionId(Str::new("todo-restore")),
-		created: 1,
-		cwd:     harness.root.path().to_path_buf(),
-	})
-	.expect("create restore journal");
-	let client = client
-		.with_principal("test-session", "todo-restore-agent")
-		.expect("restore principal");
-	time::timeout(Duration::from_secs(30), TodoRestore.restore(&journal, &client))
-		.await
-		.expect("todo restore must answer its admission query, not stall to the gate deadline");
-	// The restore drove a real init: a follow-up view succeeds against the slot.
-	let verdict =
-		invoke_builtin(harness.client(), "todo-restore-view", "todo", "1", json!({"op": "view"}))
-			.await;
-	ok_builtin_payload(verdict, "todo view");
-	server_task.abort();
-}
-
-#[tokio::test]
 async fn write_name_is_reserved_before_production_registry_assembly() {
 	let root = tempfile::tempdir().expect("workspace scratch directory");
 	let state = tempfile::tempdir().expect("state scratch directory");
@@ -868,12 +825,13 @@ async fn write_name_is_reserved_before_production_registry_assembly() {
 	registry
 		.register(EffectTool::named("write", marker), Presentation::Slot, test_claims())
 		.expect("register colliding caller write tool");
+	let con = omp_con::Ctx::new();
 	let result = EnvServer::open_local(
 		root.path(),
 		state.path(),
 		registry,
 		test_config(),
-		omp_app::SETTINGS_CATALOG,
+		&con,
 		RegistryBridges::default(),
 	)
 	.await;
@@ -961,10 +919,14 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		&json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["path", "content"],
+			"required": ["i", "path", "content"],
 			"properties": {
 				"path": {"type": "string", "description": "file path"},
-				"content": {"type": "string", "description": "file content"}
+				"content": {"type": "string", "description": "file content"},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
+				}
 			}
 		})
 	);
@@ -989,9 +951,10 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["pattern"],
+			"required": ["i", "pattern"],
 			"properties": {
 				"pattern": {"type": "string", "description": "regex pattern"},
+				"i": {"type": "string", "description": "Short present-participle intent for this call."},
 				"path": {"type": "string", "description": "file, directory, glob, internal URL, or \"<file>:<lines>\" selector to search; pass several as a semicolon-delimited list (\"src; tests\"). Omitted -> searches the workspace root (\".\")"},
 				"case": {"type": "boolean", "description": "case-sensitive search"},
 				"gitignore": {"type": "boolean", "description": "respect gitignore"},
@@ -1004,8 +967,10 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
+			"required": ["i"],
 			"properties": {
 				"path": {"type": "string", "description": "glob, file, or directory to search — a single path or a semicolon-delimited list (\"src/**/*.ts; test/**/*.ts\"). Omitted -> searches the workspace root (\".\")"},
+				"i": {"type": "string", "description": "Short present-participle intent for this call."},
 				"hidden": {"type": "boolean", "description": "include hidden files"},
 				"gitignore": {"type": "boolean", "description": "respect gitignore"},
 				"limit": {"type": "number", "description": "max results"}
@@ -1017,9 +982,10 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["path"],
+			"required": ["i", "path"],
 			"properties": {
-				"path": {"type": "string", "description": "Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."}
+				"path": {"type": "string", "description": "Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."},
+				"i": {"type": "string", "description": "Short present-participle intent for this call."}
 			}
 		})
 	);
@@ -1028,8 +994,11 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["input"],
-			"properties": {"input": {"type": "string"}}
+			"required": ["i", "input"],
+			"properties": {
+				"input": {"type": "string"},
+				"i": {"type": "string", "description": "Short present-participle intent for this call."}
+			}
 		})
 	);
 	assert_eq!(
@@ -1037,8 +1006,12 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["language", "code"],
+			"required": ["i", "language", "code"],
 			"properties": {
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
+				},
 				"language": {
 					"type": "string",
 					"enum": ["py"],
@@ -1085,7 +1058,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		})
 	);
 	let bash_schema = schema("bash");
-	assert_eq!(bash_schema["required"], json!(["command"]));
+	assert_eq!(bash_schema["required"], json!(["i", "command"]));
 	assert_eq!(bash_schema["properties"]["timeout"]["type"], "number");
 	assert_eq!(bash_schema["properties"]["async"]["default"], false);
 	assert!(bash_schema["properties"].get("name").is_none());
@@ -2478,12 +2451,7 @@ async fn python_extension_data_reads_and_writes_live_workspace_only_during_invoc
 		approval_mode:      None,
 		trusted_extensions: vec![extension],
 		contributed_values: Vec::new(),
-		settings:           SettingsManager::open(
-			SettingsPaths::discover(&state, Some(&root)),
-			omp_app::SETTINGS_CATALOG,
-		)
-		.expect("settings manager")
-		.snapshot(),
+		con:                Arc::new(omp_con::Ctx::new()),
 		bridges:            RegistryBridges::default(),
 		spawn_idle_timeout: Some(2),
 	})
@@ -3437,12 +3405,7 @@ async fn owner_client_lsp_status_reports_discovered_workspace_roster() {
 		approval_mode:      None,
 		trusted_extensions: Vec::new(),
 		contributed_values: Vec::new(),
-		settings:           SettingsManager::open(
-			SettingsPaths::discover(&state, Some(&root)),
-			omp_app::SETTINGS_CATALOG,
-		)
-		.expect("settings manager")
-		.snapshot(),
+		con:                Arc::new(omp_con::Ctx::new()),
 		bridges:            RegistryBridges::default(),
 		spawn_idle_timeout: Some(2),
 	})

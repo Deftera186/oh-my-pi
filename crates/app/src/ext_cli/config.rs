@@ -1,10 +1,9 @@
 //! Interactive scoped extension-resource configuration.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use clap::Args;
 use miette::{IntoDiagnostic as _, miette};
-use omp_chat_ui::OverlayPanel;
 use omp_core::{Str, sf};
 use omp_ext::{
 	config::{
@@ -13,10 +12,9 @@ use omp_ext::{
 	},
 	lock::{InstalledExtension, InstalledRecord},
 };
-use omp_settings::io::{DocumentMutation, mutate_document, read_document};
 use omp_tui::{
 	AppEvent, AppOptions, Dim, Key, OverlayAnchor, OverlayMargin, OverlayOptions, Prop, Size, Ui,
-	components::{Button, Col, Row, Select, SelectOption, Shader, TextLeaf},
+	components::{Boxed, Button, Col, Row, Select, SelectOption, Shader, TextLeaf},
 	shader::Eclipse,
 };
 use strum::Display;
@@ -372,7 +370,16 @@ fn show_selector(ui: &mut Ui, model: &SelectorModel, replace: bool) {
 				.text("Tab switches scope | Space cycles state | Enter applies | Esc cancels"),
 		);
 	ui.show_overlay(
-		OverlayPanel::new("Extension resources").child(content),
+		Boxed::new().child(
+			Col::new()
+				.with(Prop::Gap, 1_u16)
+				.child(
+					TextLeaf::new()
+						.with(Prop::Bold, true)
+						.text("Extension resources"),
+				)
+				.child(content),
+		),
 		OverlayOptions::default()
 			.anchor(OverlayAnchor::Center)
 			.width(Dim::Pct(72))
@@ -385,7 +392,14 @@ fn show_selector(ui: &mut Ui, model: &SelectorModel, replace: bool) {
 }
 
 fn read_extension_overlay(path: &Path, scope: Scope) -> miette::Result<ExtensionOverlay> {
-	let document = read_document(path).into_diagnostic()?;
+	let document = if path.is_file() {
+		fs::read_to_string(path)
+			.into_diagnostic()?
+			.parse::<toml::Table>()
+			.into_diagnostic()?
+	} else {
+		toml::Table::new()
+	};
 	let overlay: ExtensionOverlay = document
 		.get("extensions")
 		.cloned()
@@ -408,8 +422,21 @@ fn write_extension_overlay(
 		.validate(scope)
 		.map_err(|error| miette!("{error}"))?;
 	let value = toml::Value::try_from(overlay).into_diagnostic()?;
-	mutate_document(path, &[DocumentMutation::Set { path: "extensions".to_owned(), value }])
-		.into_diagnostic()?;
+	let mut document = if path.is_file() {
+		fs::read_to_string(path)
+			.into_diagnostic()?
+			.parse::<toml::Table>()
+			.into_diagnostic()?
+	} else {
+		toml::Table::new()
+	};
+	document.insert("extensions".to_owned(), value);
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent).into_diagnostic()?;
+	}
+	let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+	fs::write(&temporary, toml::to_string_pretty(&document).into_diagnostic()?).into_diagnostic()?;
+	fs::rename(&temporary, path).into_diagnostic()?;
 	Ok(())
 }
 
@@ -762,7 +789,10 @@ mod tests {
 			WriteScope::Workspace,
 		);
 		write_extension_overlay(&path, Scope::Workspace, &overlay).expect("persist overlay");
-		let document = read_document(&path).expect("read config");
+		let document = std::fs::read_to_string(&path)
+			.expect("read config")
+			.parse::<toml::Table>()
+			.expect("parse config");
 		assert_eq!(document["appearance"]["theme"].as_str(), Some("night"));
 		let loaded = read_extension_overlay(&path, Scope::Workspace).expect("read overlay");
 		assert!(loaded.disabled.contains(&id()));

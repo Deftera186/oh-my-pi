@@ -19,10 +19,10 @@ client APIs live in `omp-env`.
   ownership.
 - `cli` defines and dispatches the public command tree and lowers parsed
   options into driver or command-adapter inputs.
-- `chat_cmd` and `chat_ui` adapt durable driver session behavior to the
-  interactive terminal surface. `print_mode`, `rpc_mode`, and `acp_mode`
-  expose non-interactive and protocol-specific presentation adapters over the
-  headless composition.
+- `chat_cmd` owns the controller task and feeds detached session snapshots and
+  patches to `omp-chat` for terminal or native-GUI presentation. `print_mode`,
+  `rpc_mode`, and `acp_mode` expose pure text and protocol actors over the same
+  journal-first composition.
 - `auth_*`, `models_cmd`, `setup_cmd`, and the other `*_cmd` modules implement
   user-facing command policy and diagnostics.
 - `daemon` and `gateway_rpc` adapt the production inference gateway. They are
@@ -31,7 +31,7 @@ client APIs live in `omp-env`.
 ## Philosophy
 
 App parses, presents, and reports; driver composes. Reusable agent sessions,
-execution modes, discovery, settings, registries, and environment bridges
+execution modes, discovery, convar projections, registries, and environment bridges
 belong in `omp-driver`. Filesystem/process/document/tool authorities and
 extension-host/worker internals belong in `omp-envd`. App may retain the
 lifetimes returned by those layers and dispatch their process entry points,

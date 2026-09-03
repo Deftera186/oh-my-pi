@@ -10,7 +10,7 @@ use std::{
 use miette::{IntoDiagnostic as _, miette};
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use omp_catalog::ProviderId;
-use omp_core::ExposeSecret as _;
+use omp_core::{ExposeSecret as _, SecretString, Str};
 use omp_inference::{
 	Client,
 	answer::{
@@ -24,7 +24,7 @@ use omp_inference::{
 use tokio::task;
 use zeroize::Zeroizing;
 
-use crate::{chat_ui, chat_ui::AuthPromptKind, cli::AuthCommand};
+use crate::cli::AuthCommand;
 
 /// Opens encrypted credential state and executes one typed authentication
 /// operation.
@@ -175,15 +175,28 @@ fn auth_input(prompt: &AuthPrompt, value: &str) -> miette::Result<AuthInput> {
 		) {
 		return Err(miette!("authentication input must not be empty"));
 	}
-	let kind = match prompt.input {
-		InferenceAuthPromptKind::AuthorizationCode => AuthPromptKind::AuthorizationCode,
-		InferenceAuthPromptKind::ApiKey => AuthPromptKind::ApiKey,
-		InferenceAuthPromptKind::SessionToken => AuthPromptKind::SessionToken,
-		InferenceAuthPromptKind::PlainText => AuthPromptKind::PlainText,
-		InferenceAuthPromptKind::OptionalSecret => AuthPromptKind::OptionalSecret,
-		InferenceAuthPromptKind::Confirmation => AuthPromptKind::Confirmation,
-	};
-	Ok(chat_ui::auth_input(kind, value.to_owned()))
+	Ok(match prompt.input {
+		InferenceAuthPromptKind::AuthorizationCode => {
+			if value.contains("://") {
+				AuthInput::CallbackUrl(SecretString::from(value))
+			} else {
+				AuthInput::AuthorizationCode(SecretString::from(value))
+			}
+		},
+		InferenceAuthPromptKind::ApiKey => AuthInput::ApiKey(SecretString::from(value)),
+		InferenceAuthPromptKind::SessionToken => AuthInput::SessionToken(SecretString::from(value)),
+		InferenceAuthPromptKind::PlainText => AuthInput::PlainText(Str::new(value)),
+		InferenceAuthPromptKind::OptionalSecret => {
+			AuthInput::OptionalSecret(SecretString::from(value))
+		},
+		InferenceAuthPromptKind::Confirmation => {
+			if matches!(value.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+				AuthInput::DeviceConfirmed
+			} else {
+				AuthInput::Cancel
+			}
+		},
+	})
 }
 
 #[cfg(test)]

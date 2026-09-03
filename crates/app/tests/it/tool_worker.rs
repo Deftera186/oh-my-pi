@@ -957,17 +957,10 @@ fn host_factory(
 ) -> Arc<HostControlAuthorityFactory> {
 	let envd = EnvdControlAuthorities::new(
 		RegistryControlAuthorities::new(registry, devices, inert_factory()),
-		PersistenceControlAuthorities::new(
-			inert_factory(),
-			inert_factory(),
-			inert_factory(),
-			inert_factory(),
-			inert_factory(),
-			inert_factory(),
-		),
+		PersistenceControlAuthorities::new(inert_factory(), inert_factory(), inert_factory()),
 		PolicyControlAuthorities::new(inert_factory(), inert_factory()),
 		PresentationControlAuthorities::new(inert_factory(), inert_factory(), inert_factory()),
-		ProviderControlAuthorities::new(inert_factory(), inert_factory(), inert_factory()),
+		ProviderControlAuthorities::new(inert_factory(), inert_factory()),
 		inert_factory(),
 		inert_factory(),
 	);

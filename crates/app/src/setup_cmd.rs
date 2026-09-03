@@ -3,8 +3,6 @@
 use std::{cell::Cell, fs, io, io::IsTerminal as _, path::Path, str::FromStr as _};
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_catalog::snapshot;
-use omp_chat_ui::ListRow;
 use omp_core::Str;
 use omp_inference::local::{
 	ArtifactStore, LocalCancellation, SystemArtifactFetcher,
@@ -16,8 +14,8 @@ use serde_json::json;
 use crate::{
 	cli::{SetupArgs, SetupCommand},
 	pickers,
+	pickers::ListRow,
 	progress_reporter::ProgressReporter,
-	wizard,
 };
 
 /// Executes one standalone setup flow.
@@ -26,9 +24,13 @@ pub async fn run(args: SetupArgs) -> miette::Result<()> {
 	fs::create_dir_all(&data_dir).into_diagnostic()?;
 	match args.command.unwrap_or(SetupCommand::Wizard) {
 		SetupCommand::Wizard => {
-			let catalog =
-				snapshot::Catalog::try_embedded().map_err(|error| miette!(error.to_string()))?;
-			wizard::run(&data_dir, catalog).await?;
+			let catalog = omp_driver::registry::production_catalog(&data_dir)
+				.map_err(|source| miette!(source))?;
+			println!(
+				"OMP is ready with {} models. Use `omp auth login <provider>` to add credentials and \
+				 `omp config set ai_model <provider/model>` to choose the default.",
+				catalog.models().len(),
+			);
 			Ok(())
 		},
 		SetupCommand::Python { json } => python(json),

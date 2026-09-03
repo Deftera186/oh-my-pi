@@ -3,8 +3,8 @@
 use std::{fs, sync::Arc};
 
 use miette::{IntoDiagnostic as _, Result, miette};
+use omp_cache::telemetry_cache::{IssueDeleteSelector, IssueInventoryFilter, TelemetryIndex};
 use omp_envd::github_url::GithubCredentialBridge;
-use omp_storage::telemetry_index::{IssueDeleteSelector, IssueInventoryFilter, TelemetryIndex};
 use serde_json::json;
 
 use crate::cli::{GrievanceAction, GrievancesArgs};

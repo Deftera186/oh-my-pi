@@ -1,12 +1,12 @@
 //! Deterministic pre-chat native subsystem probes.
 
 use std::{
-	env, fs, io,
+	env, fs,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
 use omp_catalog::snapshot;
-use omp_storage::index::SessionIndex;
+use omp_journal::Journal;
 
 /// One named smoke probe result.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,9 +79,9 @@ fn probe_storage() -> ProbeResult {
 		.as_nanos();
 	let root = env::temp_dir().join(format!("omp-smoke-{}-{stamp}", std::process::id()));
 	let result = fs::create_dir(&root).and_then(|()| {
-		SessionIndex::open(root.join("sessions.sqlite3"))
+		Journal::create(root.join("session.oms"))
 			.map(|_| ())
-			.map_err(io::Error::other)
+			.map_err(std::io::Error::other)
 	});
 	let _ = fs::remove_dir_all(&root);
 	match result {

@@ -10,15 +10,10 @@ mod envd_policy;
 mod envd_windows;
 #[cfg(unix)]
 mod envd_workspace;
-mod extension_ui_routing;
-mod headless_runtime;
 mod process_smoke;
-mod session_index;
 mod stock_sdk_clients;
 #[cfg(unix)]
 mod tool_worker;
-#[cfg(unix)]
-mod turn_rpc;
 #[cfg(windows)]
 mod windows_named_pipe;
 mod zz_sizes;

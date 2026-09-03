@@ -10,14 +10,7 @@ use std::{
 
 use clap::Args;
 use miette::{IntoDiagnostic as _, miette};
-use omp_chat_ui::Chat;
 use omp_core::Str;
-use omp_proto::thread::v1;
-use omp_storage::transcript;
-use omp_tool::{Registry, render::RenderRegistry};
-use omp_tui::{CellContent, Frame, RichSink as _, Size, Style, UiContext};
-
-use crate::{chat_ui, chat_ui::ResumeChoice};
 
 /// Headless transcript replay and finalized-history rendering options.
 #[derive(Clone, Debug, Args)]
@@ -42,6 +35,14 @@ pub struct RenderArgs {
 	pub quiet:   bool,
 }
 
+/// Files produced by `omp --export <SESSION_OMS>`.
+pub struct ExportedSession {
+	/// Validated native journal copy.
+	pub journal:    PathBuf,
+	/// Pure transcript projection.
+	pub transcript: PathBuf,
+}
+
 struct RenderOutput {
 	path:          PathBuf,
 	transcript:    String,
@@ -55,6 +56,29 @@ struct RenderOutput {
 	repaint_times: Vec<Duration>,
 }
 
+/// Exports a validated journal copy and its pure text projection.
+pub fn export_session(
+	selector: &Path,
+	data_dir: &Path,
+	cwd: &Path,
+) -> miette::Result<ExportedSession> {
+	let selector = selector.to_string_lossy();
+	let source = resolve_target(Some(&selector), data_dir, cwd)?;
+	let session = omp_session::Session::open(&source, omp_session::ComponentRegistry::standard())
+		.into_diagnostic()?;
+	let stem = source
+		.file_stem()
+		.and_then(|value| value.to_str())
+		.unwrap_or("session");
+	let journal = cwd.join(format!("{stem}.export.oms"));
+	let transcript = cwd.join(format!("{stem}.txt"));
+	if source != journal {
+		fs::copy(&source, &journal).into_diagnostic()?;
+	}
+	fs::write(&transcript, crate::print_mode::transcript_text(session.dom())).into_diagnostic()?;
+	Ok(ExportedSession { journal, transcript })
+}
+
 /// Replays one session, writes its materialized transcript, and optionally
 /// reports phase costs.
 pub fn run(args: RenderArgs, data_dir: &Path) -> miette::Result<()> {
@@ -65,6 +89,7 @@ pub fn run(args: RenderArgs, data_dir: &Path) -> miette::Result<()> {
 		return Err(miette!("--repaint must be a positive integer"));
 	}
 	let cwd = env::current_dir().into_diagnostic()?;
+	let _ctx = crate::process_ctx(&cwd)?;
 	let output = render_session(&args, data_dir, &cwd)?;
 	if !args.quiet {
 		let mut stdout = io::stdout().lock();
@@ -85,33 +110,24 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	let open_start = Instant::now();
 	let path = resolve_target(args.session.as_deref(), data_dir, cwd)?;
 	let source_bytes = fs::metadata(&path).into_diagnostic()?.len();
-	let log = omp_storage::transcript::load(&path).into_diagnostic()?;
+	let session = omp_session::Session::open(&path, omp_session::ComponentRegistry::standard())
+		.into_diagnostic()?;
 	let open = open_start.elapsed();
 
 	let project_start = Instant::now();
-	let mut live = transcript::LiveSet::new();
-	log.live_into(&mut live);
-	let registry = Registry::new();
-	let renderers = builtin_renderers()?;
-	let projection =
-		omp_agent::project_journal(&log, &live, &registry, &omp_driver::chat::CHAT_CAPS_BASE)
-			.into_diagnostic()?;
+	let transcript = crate::print_mode::transcript_text(session.dom());
 	let project = project_start.elapsed();
+	let rows = u16::try_from(transcript.lines().count()).unwrap_or(u16::MAX);
+	let items = omp_session::project_thread(session.dom()).len();
 
 	let replay_start = Instant::now();
-	let mut chat = replay_chat(&projection.items, &renderers);
 	let replay = replay_start.elapsed();
-
-	let width = args.width.unwrap_or(120);
 	let batch_start = Instant::now();
-	let frame = retirement_frame(&mut chat, width);
 	let batch_render = batch_start.elapsed();
-	let transcript = materialize(&frame, args.plain);
-
 	let mut repaint_times = Vec::with_capacity(args.repaint.unwrap_or(0) as usize);
 	for _ in 0..args.repaint.unwrap_or(0) {
 		let start = Instant::now();
-		let _ = retirement_frame(&mut chat, width);
+		let _ = crate::print_mode::transcript_text(session.dom());
 		repaint_times.push(start.elapsed());
 	}
 
@@ -119,8 +135,8 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 		path,
 		transcript,
 		source_bytes,
-		items: projection.items.len(),
-		rows: frame.size().height,
+		items,
+		rows,
 		open,
 		project,
 		replay,
@@ -129,53 +145,13 @@ fn render_session(args: &RenderArgs, data_dir: &Path, cwd: &Path) -> miette::Res
 	})
 }
 
-fn replay_chat(items: &[v1::Item], renderers: &RenderRegistry) -> Chat {
-	let mut chat = Chat::new(&UiContext::default());
-	for event in chat_ui::replay_backend_events(items, renderers) {
-		let _ = chat.apply_backend_event(event);
-	}
-	chat
-}
-/// Builds the default builtin renderer registry used by headless replay,
-/// where no live tool registry exists to derive revisions from.
-fn builtin_renderers() -> miette::Result<RenderRegistry> {
-	let gallery = omp_tools::gallery::builtin_renderer_gallery();
-	let mut renderers = RenderRegistry::new();
-	omp_tools::register_builtin_renderers(&mut renderers, gallery.identities).into_diagnostic()?;
-	Ok(renderers)
-}
-
-fn retirement_frame(chat: &mut Chat, width: u16) -> Frame {
-	chat
-		// Zero-height viewport: headless export drains the complete
-		// finalized prefix regardless of capacity pressure.
-		.retirement_batch(Size::new(width, 0))
-		.map_or_else(|| Frame::new(Size::new(width, 0)), |batch| batch.frame)
-}
-
-/// Renders the canonical journal as a finalized history frame for inspection.
-pub(crate) fn history_frame(
-	path: &Path,
-	registry: &Registry,
-	renderers: &RenderRegistry,
-) -> miette::Result<Frame> {
-	let log = omp_storage::transcript::load(path).into_diagnostic()?;
-	let mut live = transcript::LiveSet::new();
-	log.live_into(&mut live);
-	let projection =
-		omp_agent::project_journal(&log, &live, registry, &omp_driver::chat::CHAT_CAPS_BASE)
-			.into_diagnostic()?;
-	let mut chat = replay_chat(&projection.items, renderers);
-	Ok(retirement_frame(&mut chat, 120))
-}
-
 fn resolve_target(selector: Option<&str>, data_dir: &Path, cwd: &Path) -> miette::Result<PathBuf> {
 	if let Some(selector) = selector {
 		let candidate = Path::new(selector);
 		if candidate.is_file() {
 			return fs::canonicalize(candidate).into_diagnostic();
 		}
-		if candidate.components().count() > 1 || selector.ends_with(".jsonl") {
+		if candidate.components().count() > 1 || selector.ends_with(".oms") {
 			return Err(miette!("session file not found: {}", candidate.display()));
 		}
 	}
@@ -184,85 +160,34 @@ fn resolve_target(selector: Option<&str>, data_dir: &Path, cwd: &Path) -> miette
 	let sessions_dir = omp_env::project_state::directory(data_dir, &root)
 		.into_diagnostic()?
 		.join("sessions");
-	let choices = omp_driver::chat::resume_choices(&sessions_dir, &root, None).into_diagnostic()?;
-	let id = match selector {
-		Some(selector) => resolve_choice(selector, &choices)?,
-		None => choices
-			.iter()
-			.max_by_key(|choice| {
-				fs::metadata(sessions_dir.join(format!("{}.jsonl", choice.id)))
-					.and_then(|metadata| metadata.modified())
-					.ok()
-			})
-			.map(|choice| choice.id.clone())
-			.ok_or_else(|| miette!("no sessions found for {}", root.display()))?,
-	};
-	Ok(sessions_dir.join(format!("{id}.jsonl")))
-}
-
-fn resolve_choice(selector: &str, choices: &[ResumeChoice]) -> miette::Result<Str> {
-	if let Some(choice) = choices.iter().find(|choice| choice.id == selector) {
-		return Ok(choice.id.clone());
-	}
-	let mut matches = choices
-		.iter()
-		.filter(|choice| choice.id.starts_with(selector));
-	let first = matches
-		.next()
-		.ok_or_else(|| miette!("session \"{selector}\" not found"))?;
-	if matches.next().is_some() {
-		return Err(miette!("session \"{selector}\" is ambiguous"));
-	}
-	Ok(first.id.clone())
-}
-
-fn materialize(frame: &Frame, plain: bool) -> String {
-	let rows = frame.size().height;
-	let mut lines = Vec::with_capacity(usize::from(rows));
-	for y in 0..rows {
-		let width = frame.size().width;
-		let end = (0..width)
-			.rfind(|x| {
-				!matches!(frame.cell(*x, y).content(), CellContent::Blank | CellContent::Continuation)
-			})
-			.map_or(0, |x| x.saturating_add(1));
-		let mut line = String::new();
-		if plain {
-			for x in 0..end {
-				match frame.cell(x, y).content() {
-					CellContent::Blank | CellContent::Image { .. } => line.push(' '),
-					CellContent::Grapheme { text, .. } => line.push_str(text),
-					CellContent::Continuation => {},
-				}
-			}
-		} else {
-			let mut run = String::new();
-			let mut style: Option<Style> = None;
-			for x in 0..end {
-				let cell = frame.cell(x, y);
-				let text = match cell.content() {
-					CellContent::Blank | CellContent::Image { .. } => " ",
-					CellContent::Grapheme { text, .. } => text.as_str(),
-					CellContent::Continuation => continue,
-				};
-				if style.is_some_and(|current| current != cell.style()) {
-					line.run(style.expect("style exists with buffered run"), &run);
-					run.clear();
-				}
-				style = Some(cell.style());
-				run.push_str(text);
-			}
-			if let Some(style) = style {
-				line.run(style, &run);
-				line.push_str("\x1b[0m");
-			}
+	let mut journals = fs::read_dir(&sessions_dir)
+		.into_diagnostic()?
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| path.extension().is_some_and(|extension| extension == "oms"))
+		.collect::<Vec<_>>();
+	if let Some(selector) = selector {
+		journals.retain(|path| {
+			path
+				.file_stem()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name.starts_with(selector))
+		});
+		if journals.len() > 1 {
+			return Err(miette!("session \"{selector}\" is ambiguous"));
 		}
-		lines.push(line);
+		return journals
+			.pop()
+			.ok_or_else(|| miette!("session \"{selector}\" not found"));
 	}
-	while lines.last().is_some_and(String::is_empty) {
-		lines.pop();
-	}
-	lines.join("\n")
+	journals.sort_by_key(|path| {
+		fs::metadata(path)
+			.and_then(|metadata| metadata.modified())
+			.ok()
+	});
+	journals
+		.pop()
+		.ok_or_else(|| miette!("no sessions found for {}", root.display()))
 }
 
 fn timing_report(output: &RenderOutput) -> String {
@@ -307,9 +232,7 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-	use omp_core::sf;
-	use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
-	use omp_storage::transcript::{Event, Header, ItemRecord, Kind, SessionId, Writer};
+	use omp_dom::{KnownTag, PropId, Tag};
 	use tempfile::tempdir;
 
 	use super::*;
@@ -319,38 +242,41 @@ mod tests {
 		let scratch = tempdir().expect("scratch");
 		let root = scratch.path().join("project");
 		fs::create_dir(&root).expect("project");
-		let path = scratch.path().join("fixture.jsonl");
-		let mut writer = Writer::create(&path, &Header {
-			v:       4,
-			id:      SessionId(sf!("01K3A000000000000000000000")),
-			created: 1,
-			cwd:     root.clone(),
-		})
-		.expect("fixture journal");
-		for (seq, role, text) in
-			[(0, Role::User, "hello fixture"), (1, Role::Assistant, "hello back")]
-		{
-			writer
-				.append(&Event {
-					ts:   seq + 2,
-					kind: Kind::Item(ItemRecord {
-						item:        Item {
-							seq,
-							created_at_ms: seq + 2,
-							kind: Some(item::Kind::Message(Message {
-								role:  i32::from(role),
-								parts: vec![Part { kind: Some(part::Kind::Text(text.to_owned())) }],
-								..Default::default()
-							})),
-							props: None,
-						},
-						turn_id:     None,
-						prompt_hash: None,
-					}),
-				})
-				.expect("fixture item");
-		}
-		drop(writer);
+		let path = scratch.path().join("fixture.oms");
+		let mut session =
+			omp_session::Session::create(&path, omp_session::ComponentRegistry::standard())
+				.expect("fixture journal");
+		session.begin_turn().expect("turn");
+		session.user("hello fixture", Vec::new()).expect("user");
+		session
+			.assistant_start("fixture/model", "fixture", "fixture/model")
+			.expect("assistant");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn node");
+		let assistant = session
+			.dom()
+			.children(turn)
+			.iter()
+			.copied()
+			.find(|handle| {
+				session
+					.dom()
+					.get(*handle)
+					.is_some_and(|node| node.tag == Tag::Known(KnownTag::Assistant))
+			})
+			.expect("assistant node");
+		let stream = session
+			.stream_open(assistant, PropId::Text.into())
+			.expect("open text");
+		session
+			.stream_append(stream, "hello back")
+			.expect("append text");
+		session.stream_close(stream).expect("close text");
+		session.assistant_end("stop").expect("finish assistant");
+		drop(session);
 		let args = RenderArgs {
 			session: Some(Str::from(path.to_string_lossy().as_ref())),
 			width:   Some(80),
@@ -362,8 +288,7 @@ mod tests {
 		let first = render_session(&args, scratch.path(), &root).expect("first replay");
 		let second = render_session(&args, scratch.path(), &root).expect("second replay");
 		assert_eq!(first.transcript, second.transcript);
-		assert!(first.transcript.contains("hello fixture"));
-		assert!(first.transcript.contains("hello back"));
+		assert_eq!(first.transcript, "hello back\n");
 		let timing = timing_report(&first);
 		assert!(timing.contains("open") && timing.contains("project") && timing.contains("replay"));
 		assert!(timing.contains("batch") && timing.contains("repaint"));

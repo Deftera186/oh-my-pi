@@ -77,13 +77,13 @@ use crate::{
 	gallery_cmd::GalleryArgs,
 	gc_cmd, git_cmd,
 	git_cmd::GitArgs,
-	grep_cmd, grievances_cmd, join_cmd, models_cmd, print_mode, profile_alias, render_cmd,
+	grep_cmd, grievances_cmd, models_cmd, print_mode, profile_alias, render_cmd,
 	render_cmd::RenderArgs,
-	rpc_mode, say_cmd, setup_cmd, share_cmd, smoke_test, ssh_cmd,
+	rpc_mode, say_cmd, setup_cmd, smoke_test, ssh_cmd,
 	ssh_cmd::SshArgs,
 	startup_notice,
 	startup_notice::Eligibility,
-	stats_cmd, tiny_models_cmd, ttsr_cmd, update_cmd, usage_cmd,
+	tiny_models_cmd, update_cmd, usage_cmd,
 	usage_error::CliUsageError,
 	worktree_cmd,
 };
@@ -110,22 +110,6 @@ pub enum ThinkingLevel {
 	Max,
 	/// Leave effort selection to the provider.
 	Auto,
-}
-
-impl From<ThinkingLevel> for omp_driver::chat::ThinkingLevel {
-	fn from(value: ThinkingLevel) -> Self {
-		match value {
-			ThinkingLevel::Off => Self::Off,
-			ThinkingLevel::Minimal => Self::Minimal,
-			ThinkingLevel::Low => Self::Low,
-			ThinkingLevel::Medium => Self::Medium,
-			ThinkingLevel::High => Self::High,
-			ThinkingLevel::Extreme => Self::Extreme,
-			ThinkingLevel::XHigh => Self::XHigh,
-			ThinkingLevel::Max => Self::Max,
-			ThinkingLevel::Auto => Self::Auto,
-		}
-	}
 }
 
 impl FromStr for ThinkingLevel {
@@ -406,9 +390,9 @@ pub struct OmpCli {
 	/// Suppress the workspace extension layer for this invocation.
 	#[arg(long = "no-workspace-ext", hide = true)]
 	pub no_workspace_ext:  bool,
-	/// Export one durable session journal to a self-contained HTML file and
+	/// Export one validated native journal copy and its text transcript, then
 	/// exit.
-	#[arg(long, global = true, value_name = "SESSION_JSONL")]
+	#[arg(long, global = true, value_name = "SESSION_OMS")]
 	pub export:            Option<PathBuf>,
 	/// Operation to run. Defaults to interactive project chat.
 	#[command(subcommand)]
@@ -459,87 +443,21 @@ fn omp_command(hide_launch_controls: bool) -> clap::Command {
 }
 
 /// Production application commands.
-/// Statistics dashboard and JSON query options.
-#[derive(Clone, Debug, Args)]
-pub struct StatsArgs {
-	/// Override the profile state directory containing `sessions.sqlite3`.
-	#[arg(long, value_name = "PATH")]
-	pub state_dir: Option<PathBuf>,
-	/// Statistics operation; omitted prints a concise 30-day summary.
-	#[command(subcommand)]
-	pub command:   Option<StatsCommand>,
-}
-
-/// Statistics service operations.
-#[derive(Clone, Debug, Subcommand)]
-pub enum StatsCommand {
-	/// Print a concise summary from the authoritative write-time index.
-	Summary {
-		/// Time range: 24h, 7d, 30d, 90d, or all.
-		#[arg(long)]
-		range: Option<String>,
-	},
-	/// Serve the embedded read-only dashboard and versioned REST API.
-	Serve {
-		/// IP address to bind; non-loopback addresses require authentication.
-		#[arg(long, default_value = "127.0.0.1")]
-		host:       String,
-		/// TCP port; zero requests an ephemeral port.
-		#[arg(long, default_value_t = omp_driver::stats_server::DEFAULT_PORT)]
-		port:       u16,
-		/// Bearer token required for non-loopback service access.
-		#[arg(long)]
-		auth_token: Option<String>,
-		/// Do not open the dashboard in the default browser.
-		#[arg(long)]
-		no_open:    bool,
-	},
-	/// Print the API overview envelope as JSON.
-	Json {
-		/// Time range: 24h, 7d, 30d, 90d, or all.
-		#[arg(long, default_value = "30d")]
-		range: String,
-	},
-	/// Serialize a manual write-time index synchronization checkpoint.
-	Sync,
-}
-
 /// Lock-safe storage maintenance options.
 #[derive(Clone, Debug, Args)]
 pub struct GcArgs {
 	/// Override the profile data directory.
 	#[arg(long, value_name = "PATH")]
-	pub data_dir:                Option<PathBuf>,
+	pub data_dir:     Option<PathBuf>,
 	/// Override the session-journal directory.
 	#[arg(long, value_name = "PATH")]
-	pub sessions_dir:            Option<PathBuf>,
-	/// Override the authoritative sessions index.
-	#[arg(long, value_name = "SQLITE")]
-	pub index:                   Option<PathBuf>,
+	pub sessions_dir: Option<PathBuf>,
 	/// Apply destructive operations; omission is a dry run.
 	#[arg(long)]
-	pub apply:                   bool,
-	/// Gzip cold journals and move their artifact directories.
-	#[arg(long)]
-	pub archive:                 bool,
-	/// Minimum inactive age in days for cold archives.
-	#[arg(long, default_value_t = 30)]
-	pub cold_archive_after_days: u64,
-	/// Protect this many newest sessions globally.
-	#[arg(long, default_value_t = 20)]
-	pub retain_newest_global:    usize,
-	/// Protect this many newest sessions per working directory.
-	#[arg(long, default_value_t = 3)]
-	pub retain_newest_per_cwd:   usize,
-	/// Blob put-before-journal grace period.
-	#[arg(long, default_value_t = 300)]
-	pub min_age_seconds:         u64,
-	/// Truncate SQLite WAL files after maintenance.
-	#[arg(long)]
-	pub wal:                     bool,
+	pub apply:        bool,
 	/// Emit machine-readable JSON.
 	#[arg(long)]
-	pub json:                    bool,
+	pub json:         bool,
 }
 /// Image blob-store inspection and maintenance options.
 #[derive(Clone, Debug, Args)]
@@ -550,13 +468,6 @@ pub struct ImagesArgs {
 	/// Emit machine-readable JSON.
 	#[arg(long)]
 	pub json:    bool,
-	/// Apply destructive purge operations; omission is a dry run.
-	#[arg(long)]
-	pub apply:   bool,
-	/// Purge all unreachable blobs, including those inside the normal grace
-	/// period.
-	#[arg(long)]
-	pub all:     bool,
 	/// Override the profile data directory containing the blob store.
 	#[arg(long, value_name = "PATH")]
 	pub dir:     Option<PathBuf>,
@@ -576,8 +487,6 @@ pub enum ImagesAction {
 	Doctor,
 	/// Exercise a write, verified read, and cleanup against the real store.
 	Probe,
-	/// Reclaim blobs not rooted by sessions or the durable artifact catalog.
-	Purge,
 }
 
 /// Top-level extension installation shorthand.
@@ -603,9 +512,6 @@ pub struct InstallArgs {
 /// Durable quota-history options.
 #[derive(Clone, Debug, Args)]
 pub struct UsageArgs {
-	/// Optional usage report to render.
-	#[arg(value_enum)]
-	pub action:     Option<UsageAction>,
 	/// Override the profile data directory containing credentials and usage
 	/// state.
 	#[arg(long, value_name = "PATH")]
@@ -622,19 +528,6 @@ pub struct UsageArgs {
 	/// Emit machine-readable JSON.
 	#[arg(long)]
 	pub json:       bool,
-	/// Reporting window in days for client usage.
-	#[arg(long, default_value_t = 7)]
-	pub days:       u32,
-	/// Gateway endpoint for fleet-wide client usage.
-	#[arg(long, value_name = "LOCAL_ENDPOINT")]
-	pub gateway:    Option<LocalEndpoint>,
-}
-
-/// Optional durable-usage report selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum UsageAction {
-	/// Per-installation and per-application gateway token burn.
-	Clients,
 }
 
 /// Benchmark workload selection.
@@ -1023,23 +916,6 @@ pub struct RegistryArgs {
 	pub json:      bool,
 }
 
-/// Encrypted transcript sharing options.
-#[derive(Clone, Debug, Args)]
-pub struct ShareArgs {
-	/// Durable session journal. Omit to choose from the native session index.
-	#[arg(value_name = "SESSION_JSONL")]
-	pub journal:   Option<PathBuf>,
-	/// HTTPS blob-store endpoint accepting the sealed envelope.
-	#[arg(long, value_name = "URL")]
-	pub server:    Option<Str>,
-	/// Browser viewer base URL.
-	#[arg(long, value_name = "URL", default_value = "https://omp.dev/share")]
-	pub viewer:    Str,
-	/// Disable irreversible secret redaction.
-	#[arg(long)]
-	pub no_redact: bool,
-}
-
 /// Standalone collaboration guest options.
 #[derive(Clone, Debug, Args)]
 pub struct JoinArgs {
@@ -1093,8 +969,6 @@ pub struct CompressCliArgs {
 /// Production application commands.
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
-	/// Materialize bundled task-agent definitions.
-	Agents(AgentsArgs),
 	/// Install or serve the local Chrome CDP relay.
 	#[command(name = "browser-relay")]
 	BrowserRelay(BrowserRelayArgs),
@@ -1121,8 +995,6 @@ pub enum Command {
 	Acp(AcpArgs),
 	/// Run one typed operation in process.
 	Infer(InferArgs),
-	/// Join a live collaboration in a replica-backed standalone composer.
-	Join(JoinArgs),
 	/// Manage provider credentials.
 	Auth(AuthArgs),
 	/// Manage generated model-catalog data.
@@ -1154,16 +1026,12 @@ pub enum Command {
 	Update(UpdateArgs),
 	/// Inspect the signed native package registry and platform assets.
 	Registry(RegistryArgs),
-	/// Redact, encrypt, and upload a durable transcript projection.
-	Share(ShareArgs),
 	/// Inspect models from the validated embedded catalog.
 	#[command(alias = "model")]
 	Models(ModelsArgs),
 	/// Inspect or clear Environment-owned worktrees.
 	#[command(alias = "wt")]
 	Worktree(WorktreeArgs),
-	/// Inspect usage statistics or serve the embedded dashboard.
-	Stats(StatsArgs),
 	/// Inspect or apply lock-safe session and blob maintenance.
 	Gc(GcArgs),
 	/// Render native tool lifecycle cards to text or PNG fixtures.
@@ -1195,8 +1063,6 @@ pub enum Command {
 	Grievances(GrievancesArgs),
 	/// Manage scoped native SSH hosts and run bounded client operations.
 	Ssh(SshArgs),
-	/// Inspect and test active Time-Traveling Stream Rules.
-	Ttsr(TtsrArgs),
 	/// Detect, repair, and verify native project diagnostics.
 	Cleanse(CleanseCliArgs),
 	/// Generate a static shell completion script.
@@ -1512,7 +1378,6 @@ pub struct CommandSpec {
 
 /// Complete registry for the commands implemented by this binary.
 pub const COMMAND_REGISTRY: &[CommandSpec] = &[
-	CommandSpec { name: "agents", aliases: &[] },
 	CommandSpec { name: "browser-relay", aliases: &[] },
 	CommandSpec { name: "commit", aliases: &[] },
 	CommandSpec { name: "serve", aliases: &[] },
@@ -1521,7 +1386,6 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "print", aliases: &["p"] },
 	CommandSpec { name: "render", aliases: &[] },
 	CommandSpec { name: "infer", aliases: &[] },
-	CommandSpec { name: "join", aliases: &[] },
 	CommandSpec { name: "rpc", aliases: &[] },
 	CommandSpec { name: "rpc-ui", aliases: &[] },
 	CommandSpec { name: "acp", aliases: &[] },
@@ -1557,7 +1421,6 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
 	CommandSpec { name: "grep", aliases: &[] },
 	CommandSpec { name: "grievances", aliases: &[] },
 	CommandSpec { name: "ssh", aliases: &[] },
-	CommandSpec { name: "ttsr", aliases: &[] },
 	CommandSpec { name: "cleanse", aliases: &[] },
 	CommandSpec { name: "completions", aliases: &[] },
 	CommandSpec { name: "__complete", aliases: &[] },
@@ -1722,7 +1585,7 @@ impl EnvdArgs {
 pub struct PromptArgs {
 	/// Select the prompt personality preset.
 	#[arg(long, value_name = "PRESET")]
-	pub personality:             Option<omp_agent::Personality>,
+	pub personality:             Option<Str>,
 	/// Surface the active model identifier in workstation facts.
 	#[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
 	pub include_model_in_prompt: Option<bool>,
@@ -2209,7 +2072,7 @@ pub enum ConfigScope {
 	/// User/profile settings.
 	#[default]
 	Global,
-	/// Nearest project `.omp/config.toml`.
+	/// Exact project `.omp/config.cfg`.
 	Project,
 }
 
@@ -2285,9 +2148,13 @@ pub enum McpConfigCommand {
 	},
 }
 
-/// Schema-validated settings operations.
+/// Typed command-stream configuration operations.
 #[derive(Clone, Debug, Subcommand)]
 pub enum ConfigCommand {
+	/// Convert legacy TOML settings and keybindings into `config.cfg`.
+	Migrate,
+	/// Print the deterministic current `config.cfg` script.
+	Dump,
 	/// Initialize canonical XDG roots and migrate recognized legacy storage
 	/// without replacing existing destinations.
 	#[command(name = "init-xdg")]
@@ -2296,20 +2163,20 @@ pub enum ConfigCommand {
 		#[arg(long)]
 		json: bool,
 	},
-	/// List schema keys, types, and effective values.
+	/// List convars with their values, defaults, and policy flags.
 	List {
 		/// Emit structured JSON.
 		#[arg(long)]
 		json: bool,
 	},
-	/// Read one schema key.
+	/// Read one convar.
 	Get {
-		/// Schema key.
+		/// Convar name.
 		key: Str,
 	},
-	/// Set one schema key after validating its typed value.
+	/// Set one convar after validating its typed value.
 	Set {
-		/// Schema key.
+		/// Convar name.
 		key:   Str,
 		/// Typed value.
 		value: Str,
@@ -2317,15 +2184,15 @@ pub enum ConfigCommand {
 		#[arg(long, value_enum, default_value_t)]
 		scope: ConfigScope,
 	},
-	/// Remove one schema key from a writable layer.
+	/// Restore one convar to its default in a writable cfg.
 	Unset {
-		/// Schema key.
+		/// Convar name.
 		key:   Str,
 		/// Writable native scope.
 		#[arg(long, value_enum, default_value_t)]
 		scope: ConfigScope,
 	},
-	/// Print a native settings file path.
+	/// Print a native cfg file path.
 	Path {
 		/// Writable native scope.
 		#[arg(long, value_enum, default_value_t)]
@@ -2566,7 +2433,6 @@ pub struct LocalInferArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 enum DispatchTarget {
-	Agents,
 	BrowserRelay,
 	Commit,
 	Serve,
@@ -2578,7 +2444,6 @@ enum DispatchTarget {
 	RpcUi,
 	Acp,
 	Infer,
-	Join,
 	Auth,
 	CatalogImport,
 	LocalInfer,
@@ -2593,12 +2458,10 @@ enum DispatchTarget {
 	Token,
 	Update,
 	Registry,
-	Share,
 	Models,
 	AuthBroker,
 	AuthGateway,
 	Worktree,
-	Stats,
 	Gc,
 	Gallery,
 	Git,
@@ -2611,7 +2474,6 @@ enum DispatchTarget {
 	Grep,
 	Grievances,
 	Ssh,
-	Ttsr,
 	Cleanse,
 	Completions,
 	Complete,
@@ -2621,7 +2483,6 @@ enum DispatchTarget {
 const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 	match command {
 		None | Some(Command::Chat(_)) => DispatchTarget::Chat,
-		Some(Command::Agents(_)) => DispatchTarget::Agents,
 		Some(Command::BrowserRelay(_)) => DispatchTarget::BrowserRelay,
 		Some(Command::Commit(_)) => DispatchTarget::Commit,
 		Some(Command::Print(_)) => DispatchTarget::Print,
@@ -2632,7 +2493,6 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Serve(_)) => DispatchTarget::Serve,
 		Some(Command::Envd(_)) => DispatchTarget::Envd,
 		Some(Command::Infer(_)) => DispatchTarget::Infer,
-		Some(Command::Join(_)) => DispatchTarget::Join,
 		Some(Command::Auth(_)) => DispatchTarget::Auth,
 		Some(Command::Catalog(CatalogArgs { command: CatalogCommand::Import(_) })) => {
 			DispatchTarget::CatalogImport
@@ -2651,10 +2511,8 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Token(_)) => DispatchTarget::Token,
 		Some(Command::Update(_)) => DispatchTarget::Update,
 		Some(Command::Registry(_)) => DispatchTarget::Registry,
-		Some(Command::Share(_)) => DispatchTarget::Share,
 		Some(Command::Models(_)) => DispatchTarget::Models,
 		Some(Command::Worktree(_)) => DispatchTarget::Worktree,
-		Some(Command::Stats(_)) => DispatchTarget::Stats,
 		Some(Command::Gc(_)) => DispatchTarget::Gc,
 		Some(Command::Gallery(_)) => DispatchTarget::Gallery,
 		Some(Command::Git(_)) => DispatchTarget::Git,
@@ -2667,7 +2525,6 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Grep(_)) => DispatchTarget::Grep,
 		Some(Command::Grievances(_)) => DispatchTarget::Grievances,
 		Some(Command::Ssh(_)) => DispatchTarget::Ssh,
-		Some(Command::Ttsr(_)) => DispatchTarget::Ttsr,
 		Some(Command::Cleanse(_)) => DispatchTarget::Cleanse,
 		Some(Command::Completions { .. }) => DispatchTarget::Completions,
 		Some(Command::Complete { .. }) => DispatchTarget::Complete,
@@ -2959,9 +2816,11 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		return Ok(());
 	}
 	if let Some(journal) = cli.export.as_deref() {
-		let output = journal.with_extension("html");
-		let exported = omp_driver::export::export_session(journal, &output).into_diagnostic()?;
-		println!("Exported to: {}", exported.display());
+		let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
+		let cwd = env::current_dir().into_diagnostic()?;
+		let exported = crate::render_cmd::export_session(journal, &data_dir, &cwd)?;
+		println!("Journal: {}", exported.journal.display());
+		println!("Transcript: {}", exported.transcript.display());
 		return Ok(());
 	}
 	if cli.smoke_test {
@@ -3028,19 +2887,19 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		return Err(miette!("--gui is only supported by interactive chat"));
 	}
 	match command {
-		Command::Agents(args) => crate::agents_cmd::run(args),
 		Command::BrowserRelay(args) => crate::browser_relay_cmd::run(args).await,
 		Command::Commit(args) => crate::commit_cmd::run(args).await,
 		Command::Serve(args) => serve(args).await,
 		Command::Envd(args) => {
+			let project = std::fs::canonicalize(&args.root).into_diagnostic()?;
+			let ctx = Arc::new(crate::process_ctx(&project)?);
 			let bridges = omp_driver::bridges::builtin(
 				&args.root,
 				Arc::new(InferenceBridge::default()),
 				AgentGoalControl::default(),
 				None,
-				omp_agent::advisor::AdvisorAdviceQueue::default(),
 			);
-			omp_envd::run(args.into_config(), crate::SETTINGS_CATALOG, bridges).await
+			omp_envd::run(args.into_config(), ctx, bridges).await
 		},
 		Command::Chat(args) => {
 			run_interactive_chat(
@@ -3078,7 +2937,6 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 			}
 		},
 		Command::Infer(args) => infer(args).await,
-		Command::Join(args) => join_cmd::run(args).await,
 		Command::Auth(args) => auth(args).await,
 		Command::Catalog(CatalogArgs { command: CatalogCommand::Import(args) }) => {
 			catalog_import(&args)
@@ -3097,12 +2955,10 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Token(args) => crate::token_cmd::run(args).await,
 		Command::Update(args) => update_cmd::run(args).await,
 		Command::Registry(args) => update_cmd::registry(args),
-		Command::Share(args) => share_cmd::run(args).await,
 		Command::Models(args) => models_cmd::run(&args, &launch_extensions).await,
 		Command::Worktree(args) => {
 			worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args)
 		},
-		Command::Stats(args) => stats_cmd::run(args).await,
 		Command::Gc(args) => gc_cmd::run(args),
 		Command::Gallery(args) => gallery_cmd::run(args),
 		Command::Git(args) => git_cmd::run(args).await,
@@ -3115,7 +2971,6 @@ pub async fn dispatch(cli: OmpCli) -> miette::Result<()> {
 		Command::Grep(args) => grep_cmd::run(args),
 		Command::Grievances(args) => grievances_cmd::run(args).await,
 		Command::Ssh(args) => ssh_cmd::run(args).await,
-		Command::Ttsr(args) => ttsr_cmd::run(args),
 		Command::Cleanse(args) => {
 			cleanse_cmd::run(CleanseArgs {
 				agents:  args.agents,
@@ -3924,15 +3779,6 @@ mod tests {
 	}
 
 	#[test]
-	fn parses_standalone_join_link() {
-		let Some(Command::Join(args)) = parse(&["omp", "join", "room.credentials"]).command else {
-			panic!("join command");
-		};
-		assert_eq!(args.link.as_str(), "room.credentials");
-		assert_eq!(dispatch_target(Some(&Command::Join(args))), DispatchTarget::Join);
-	}
-
-	#[test]
 	fn parses_grievance_actions_and_selectors() {
 		let Some(Command::Grievances(list)) = parse(&["omp", "grievances"]).command else {
 			panic!("grievances list command");
@@ -4019,7 +3865,6 @@ mod tests {
 	#[test]
 	fn parses_documented_standalone_command_surface() {
 		let cases = [
-			(&["omp", "agents", "unpack", "--json"][..], DispatchTarget::Agents),
 			(&["omp", "browser-relay", "install"][..], DispatchTarget::BrowserRelay),
 			(&["omp", "commit", "--dry-run"][..], DispatchTarget::Commit),
 			(&["omp", "ps", "list", "--json"][..], DispatchTarget::Ps),
@@ -4265,15 +4110,14 @@ mod tests {
 	#[test]
 	fn parses_images_actions_alias_and_flags() {
 		let Some(Command::Images(args)) =
-			parse(&["omp", "img", "purge", "--apply", "--all", "--dir", "profile"]).command
+			parse(&["omp", "img", "status", "--dir", "profile"]).command
 		else {
 			panic!("images command");
 		};
-		assert_eq!(args.action, ImagesAction::Purge);
-		assert!(args.apply && args.all);
+		assert_eq!(args.action, ImagesAction::Status);
 		assert_eq!(args.dir, Some(PathBuf::from("profile")));
 
-		for action in ["status", "doctor", "probe", "purge"] {
+		for action in ["status", "doctor", "probe"] {
 			assert!(matches!(parse(&["omp", "images", action]).command, Some(Command::Images(_))));
 		}
 	}
@@ -4388,7 +4232,7 @@ mod tests {
 		let Some(Command::Chat(args)) = cli.command else {
 			panic!("chat command");
 		};
-		assert_eq!(args.prompt_settings.personality, Some(omp_agent::Personality::Pragmatic));
+		assert_eq!(args.prompt_settings.personality.as_deref(), Some("pragmatic"));
 		assert_eq!(args.prompt_settings.include_model_in_prompt, Some(false));
 		assert_eq!(args.prompt_settings.include_workstation, Some(true));
 		assert_eq!(args.prompt_settings.include_workspace_tree, Some(true));
@@ -4808,10 +4652,6 @@ mod tests {
 		assert!(matches!(
 			parse(&["omp", "registry", "--json"]).command,
 			Some(Command::Registry(RegistryArgs { json: true, .. }))
-		));
-		assert!(matches!(
-			parse(&["omp", "share", "--server", "https://share.example"]).command,
-			Some(Command::Share(_))
 		));
 		assert!(matches!(
 			parse(&["omp", "auth-broker", "status"]).command,

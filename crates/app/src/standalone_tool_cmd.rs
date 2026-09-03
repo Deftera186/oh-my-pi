@@ -5,8 +5,7 @@ use std::{env, sync::Arc};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::{Str, sf};
-use omp_driver::headless::{HeadlessSession, HeadlessSessionOptions};
-use omp_settings::manager::{SettingsManager, SettingsPaths};
+use omp_driver::headless::kernel::{ComposedInference, KernelOptions, compose_kernel};
 use omp_tool::{CallOutcome, ErasedEv, ErasedOutcome, Registry};
 
 use crate::cli::{ReadCliArgs, SearchCliArgs};
@@ -76,13 +75,29 @@ pub(crate) async fn search(args: SearchCliArgs) -> miette::Result<()> {
 	Ok(())
 }
 
-pub(crate) async fn session() -> miette::Result<HeadlessSession> {
+pub(crate) struct StandaloneSession {
+	_kernel:  omp_agent::Kernel<ComposedInference>,
+	_session: omp_session::Session,
+	registry: Arc<Registry>,
+}
+
+impl StandaloneSession {
+	fn tool_registry(&self) -> Arc<Registry> {
+		Arc::clone(&self.registry)
+	}
+
+	pub(crate) fn env(&self) -> &omp_env::EnvClient {
+		self._kernel.inference().environment_client()
+	}
+}
+
+async fn session() -> miette::Result<StandaloneSession> {
 	session_at(None).await
 }
 
 pub(crate) async fn session_at(
 	project: Option<std::path::PathBuf>,
-) -> miette::Result<HeadlessSession> {
+) -> miette::Result<StandaloneSession> {
 	let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 	let project = project
 		.map_or_else(env::current_dir, Ok)
@@ -90,17 +105,9 @@ pub(crate) async fn session_at(
 		.canonicalize()
 		.into_diagnostic()?;
 	let home = env::var_os("HOME").map_or_else(|| project.clone(), std::path::PathBuf::from);
-	let settings_manager = SettingsManager::open(
-		SettingsPaths::discover(&data_dir, Some(&project)),
-		crate::SETTINGS_CATALOG,
-	)
-	.into_diagnostic()?;
-	let settings_snapshot = settings_manager.snapshot();
-	let model_settings = settings_snapshot
-		.project::<omp_catalog::settings::ModelSettings>()
-		.into_diagnostic()?
-		.get()
-		.resolve_path_scopes(&project, &home);
+	let ctx = Arc::new(crate::process_ctx(&project)?);
+	let model_settings =
+		omp_catalog::settings::ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home);
 	let catalog = omp_driver::registry::production_catalog(&data_dir).into_diagnostic()?;
 	let roles = omp_driver::discovery::roles::resolve_launch_roles(
 		catalog.as_ref(),
@@ -115,27 +122,16 @@ pub(crate) async fn session_at(
 		.primary
 		.map(|model| Str::from(model.as_str()))
 		.ok_or_else(|| miette!("standalone tools require a configured default model role"))?;
-	HeadlessSession::open(data_dir, HeadlessSessionOptions {
-		project,
-		settings_overlays: Box::default(),
-		additional_roots: Box::default(),
-		model,
-		initial_regime: None,
-		initial_prompt_slot: None,
-		plan_handoff: None,
-		resume: None,
-		fork: None,
-		py_eval: false,
-		approval_mode: None,
-		spawn_idle_timeout: None,
-		pty_denied: true,
-		credential_provider: None,
-		api_key: None,
-		prompt_cache_affinity: None,
-		session_generation: 1,
-	})
-	.await
-	.into_diagnostic()
+	let (kernel, session, _) =
+		compose_kernel(&data_dir, &project, model.as_str(), ctx, KernelOptions {
+			ephemeral: true,
+			no_tools: false,
+			..KernelOptions::default()
+		})
+		.await
+		.into_diagnostic()?;
+	let registry = Arc::clone(kernel.tool_registry());
+	Ok(StandaloneSession { _kernel: kernel, _session: session, registry })
 }
 
 trait StandaloneFault {

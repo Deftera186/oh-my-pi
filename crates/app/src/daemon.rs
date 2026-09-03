@@ -2,15 +2,14 @@
 
 use std::{
 	env, fs, io,
-	io::BufRead as _,
 	net::SocketAddr,
 	path::{Path, PathBuf},
-	slice, str,
+	str,
 	sync::Arc,
 	time::Duration,
 };
 
-use omp_core::{ExposeSecret as _, Hash32, SecretString, sf};
+use omp_core::{ExposeSecret as _, SecretString, sf};
 use omp_inference::{
 	Client, ProviderService, Registry,
 	account::AccountStateStoreError,
@@ -22,23 +21,15 @@ use omp_inference::{
 	router::Router,
 	session::{ConversationError, ConversationSessionPlanner},
 };
+use omp_journal::blob::{self, BlobStore};
 use omp_proto::{
 	auth::v1::auth_server::AuthServer,
 	blob::v1::blob_server::BlobServer,
-	control::v1 as control_pb,
 	gateway::v1::{forward_proxy_server::ForwardProxyServer, gateway_server::GatewayServer},
 	inference::v1::inference_server::InferenceServer,
-	thread::v1::Item,
 };
 use omp_serve::{auth::AuthRpc, blob::BlobRpc, inference::InferenceRpc};
-use omp_settings::manager::SettingsManagerError;
-use omp_storage::{
-	blob,
-	blob::BlobStore,
-	transcript,
-	transcript::{Event, Header, ItemRecord, Kind, SessionId, Writer, writer::JournalError},
-};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tokio::{
 	net::TcpListener,
 	sync::watch::{self, Receiver},
@@ -52,288 +43,6 @@ use zeroize::Zeroizing;
 use crate::{endpoint::LocalEndpoint, gateway_rpc::GatewayRpc};
 
 const DATA_DIR_ENV: &str = "OMP_DATA_DIR";
-/// Daemon-owned session journal replication failure.
-#[derive(Debug, thiserror::Error)]
-pub enum SessionAuthorityError {
-	/// Journal filesystem operation failed.
-	#[error("session journal I/O failed")]
-	Io(#[from] io::Error),
-	/// Transcript append failed with a proven or indeterminate outcome.
-	#[error(transparent)]
-	Journal(#[from] JournalError),
-	/// Transcript header, codec, or recovery validation failed.
-	#[error(transparent)]
-	Transcript(#[from] transcript::Error),
-	/// An RPC addressed a different session authority.
-	#[error("session RPC addressed an unknown session")]
-	SessionMismatch,
-	/// Structured ingestion omitted its thread item.
-	#[error("session ingestion omitted its structured item")]
-	MissingItem,
-}
-
-struct SessionAuthorityState {
-	writer:   Writer,
-	revision: u64,
-}
-
-/// Single-daemon owner for fenced session snapshots, deltas, and structured
-/// ingestion.
-///
-/// Clients receive canonical journal bytes but can submit only typed thread
-/// items. Revision checks occur while holding the same lock as the append, so
-/// stale clients can never write or truncate history.
-pub struct SessionJournalAuthority {
-	id:    SessionId,
-	path:  PathBuf,
-	state: Mutex<SessionAuthorityState>,
-}
-
-impl SessionJournalAuthority {
-	/// Creates a fileless authority; the first accepted ingest atomically
-	/// publishes header plus event.
-	pub fn create(path: impl AsRef<Path>, header: &Header) -> Result<Self, SessionAuthorityError> {
-		let path = path.as_ref().to_owned();
-		if let Some(parent) = path.parent() {
-			fs::create_dir_all(parent)?;
-		}
-		Ok(Self {
-			id:    header.id.clone(),
-			path:  path.clone(),
-			state: Mutex::new(SessionAuthorityState {
-				writer:   Writer::create_lazy(&path, header)?,
-				revision: 0,
-			}),
-		})
-	}
-
-	/// Opens an existing journal and restores its monotonic revision.
-	pub fn open(path: impl AsRef<Path>) -> Result<Self, SessionAuthorityError> {
-		let path = path.as_ref().to_owned();
-		let reader = transcript::Reader::open(&path)?;
-		let id = reader.log().header().id.clone();
-		let revision = reader.next_index();
-		drop(reader);
-		Ok(Self {
-			id,
-			path: path.clone(),
-			state: Mutex::new(SessionAuthorityState { writer: Writer::open_append(&path)?, revision }),
-		})
-	}
-
-	/// Returns a consistent exact-byte snapshot fenced by the current revision.
-	pub fn snapshot(
-		&self,
-		request: &control_pb::SessionSnapshotRequest,
-	) -> Result<control_pb::SessionSnapshotMsg, SessionAuthorityError> {
-		if request.session_id != self.id.0 {
-			return Err(SessionAuthorityError::SessionMismatch);
-		}
-		let state = self.state.lock();
-		let journal = match fs::read(&self.path) {
-			Ok(bytes) => bytes,
-			Err(source) if source.kind() == io::ErrorKind::NotFound && state.revision == 0 => {
-				Vec::new()
-			},
-			Err(source) => return Err(source.into()),
-		};
-		let integrity = Hash32::sum(&journal).into_bytes().to_vec();
-		Ok(control_pb::SessionSnapshotMsg {
-			session_id: self.id.0.as_str().to_owned(),
-			revision:   state.revision,
-			journal:    journal.into(),
-			integrity:  integrity.into(),
-			props:      None,
-		})
-	}
-
-	/// Returns bounded exact event lines after a client revision.
-	pub fn delta(
-		&self,
-		request: &control_pb::SessionDeltaRequest,
-	) -> Result<control_pb::SessionDeltaMsg, SessionAuthorityError> {
-		if request.session_id != self.id.0 {
-			return Err(SessionAuthorityError::SessionMismatch);
-		}
-		let state = self.state.lock();
-		let head_revision = state.revision;
-		if request.after_revision >= head_revision {
-			return Ok(control_pb::SessionDeltaMsg {
-				session_id: self.id.0.as_str().to_owned(),
-				base_revision: request.after_revision.min(head_revision),
-				head_revision,
-				entries: Vec::new(),
-				has_more: false,
-				props: None,
-			});
-		}
-		let maximum = if request.maximum_entries == 0 {
-			256
-		} else {
-			request.maximum_entries.min(4_096)
-		};
-		let file = fs::File::open(&self.path)?;
-		let mut reader = io::BufReader::new(file);
-		let mut line = Vec::new();
-		reader.read_until(b'\n', &mut line)?;
-		let mut revision = 0_u64;
-		let mut entries = Vec::new();
-		loop {
-			line.clear();
-			let read = reader.read_until(b'\n', &mut line)?;
-			if read == 0 {
-				break;
-			}
-			revision = revision.saturating_add(1);
-			if revision <= request.after_revision {
-				continue;
-			}
-			if line.last() == Some(&b'\n') {
-				line.pop();
-			}
-			entries
-				.push(control_pb::SessionJournalEntryMsg { revision, event_json: line.clone().into() });
-			if entries.len() == usize::try_from(maximum).expect("u32 fits in usize") {
-				break;
-			}
-		}
-		let returned = u64::try_from(entries.len()).expect("delta count fits in u64");
-		Ok(control_pb::SessionDeltaMsg {
-			session_id: self.id.0.as_str().to_owned(),
-			base_revision: request.after_revision,
-			head_revision,
-			entries,
-			has_more: request.after_revision.saturating_add(returned) < head_revision,
-			props: None,
-		})
-	}
-
-	/// Fenced structured ingestion encoded and appended only by the daemon.
-	pub fn ingest(
-		&self,
-		request: control_pb::SessionIngestRequest,
-	) -> Result<control_pb::SessionIngestResultMsg, SessionAuthorityError> {
-		if request.session_id != self.id.0 {
-			return Ok(control_pb::SessionIngestResultMsg {
-				session_id: request.session_id,
-				revision:   0,
-				refusal:    Some(control_pb::SessionIngestRefusal::UnknownSession.into()),
-				props:      None,
-			});
-		}
-		let mut state = self.state.lock();
-		if request.expected_revision != state.revision {
-			return Ok(control_pb::SessionIngestResultMsg {
-				session_id: self.id.0.as_str().to_owned(),
-				revision:   state.revision,
-				refusal:    Some(control_pb::SessionIngestRefusal::Conflict.into()),
-				props:      None,
-			});
-		}
-		let mut item: Item = request.item.ok_or(SessionAuthorityError::MissingItem)?;
-		omp_agent::truncate_item_for_persistence(&mut item);
-		let event = Event {
-			ts:   item.created_at_ms,
-			kind: Kind::Item(ItemRecord { item, turn_id: None, prompt_hash: None }),
-		};
-		match state.writer.append_atomic(slice::from_ref(&event)) {
-			Ok(indexes) => state.revision = indexes[0].saturating_add(1),
-			Err(JournalError::Indeterminate(_)) => {
-				return Ok(control_pb::SessionIngestResultMsg {
-					session_id: self.id.0.as_str().to_owned(),
-					revision:   state.revision,
-					refusal:    Some(control_pb::SessionIngestRefusal::WriterHalted.into()),
-					props:      None,
-				});
-			},
-			Err(error) => return Err(error.into()),
-		}
-		Ok(control_pb::SessionIngestResultMsg {
-			session_id: self.id.0.as_str().to_owned(),
-			revision:   state.revision,
-			refusal:    None,
-			props:      None,
-		})
-	}
-}
-
-#[cfg(test)]
-mod session_authority_tests {
-	use omp_proto::thread::v1::{Message, Part, Role, item, part};
-	use tempfile::tempdir;
-
-	use super::*;
-
-	#[test]
-	fn structured_ingest_is_revision_fenced_and_daemon_encoded() {
-		let directory = tempdir().expect("temporary directory");
-		let path = directory.path().join("session.jsonl");
-		let header = Header {
-			v:       4,
-			id:      SessionId(sf!("rpc-session")),
-			created: 1,
-			cwd:     directory.path().to_owned(),
-		};
-		let authority = SessionJournalAuthority::create(&path, &header).expect("create authority");
-		let empty = authority
-			.snapshot(&control_pb::SessionSnapshotRequest {
-				session_id:  header.id.0.as_str().to_owned(),
-				if_revision: None,
-				props:       None,
-			})
-			.expect("empty snapshot");
-		assert_eq!(empty.revision, 0);
-		assert!(empty.journal.is_empty());
-		assert!(!path.exists());
-
-		let item = Item {
-			created_at_ms: 2,
-			kind: Some(item::Kind::Message(Message {
-				role:  Role::User.into(),
-				parts: vec![Part { kind: Some(part::Kind::Text("hello".to_owned())) }],
-				..Default::default()
-			})),
-			..Item::default()
-		};
-		let accepted = authority
-			.ingest(control_pb::SessionIngestRequest {
-				request_id:         1,
-				idempotency_key:    "one".to_owned(),
-				host_generation:    1,
-				session_generation: 1,
-				session_id:         header.id.0.as_str().to_owned(),
-				expected_revision:  0,
-				item:               Some(item.clone()),
-				props:              None,
-			})
-			.expect("ingest");
-		assert_eq!(accepted.revision, 1);
-		assert!(accepted.refusal.is_none());
-		let conflict = authority
-			.ingest(control_pb::SessionIngestRequest {
-				request_id:         2,
-				idempotency_key:    "stale".to_owned(),
-				host_generation:    1,
-				session_generation: 1,
-				session_id:         header.id.0.as_str().to_owned(),
-				expected_revision:  0,
-				item:               Some(item),
-				props:              None,
-			})
-			.expect("conflict result");
-		assert_eq!(conflict.refusal, Some(control_pb::SessionIngestRefusal::Conflict.into()));
-		let delta = authority
-			.delta(&control_pb::SessionDeltaRequest {
-				session_id:      header.id.0.as_str().to_owned(),
-				after_revision:  0,
-				maximum_entries: 8,
-				props:           None,
-			})
-			.expect("delta");
-		assert_eq!(delta.entries.len(), 1);
-		assert_eq!(delta.head_revision, 1);
-	}
-}
 /// Production daemon construction options.
 pub struct DaemonConfig {
 	data_dir:          Option<PathBuf>,
@@ -399,12 +108,6 @@ pub enum DaemonError {
 	/// Owner-only credential key file provisioning failed.
 	#[error(transparent)]
 	CredentialKeyFile(#[from] FileKeyError),
-	/// Native settings authority could not be opened.
-	#[error(transparent)]
-	SettingsManager(#[from] SettingsManagerError),
-	/// Web-search settings could not be projected.
-	#[error(transparent)]
-	SettingsSnapshot(#[from] omp_settings::SnapshotError),
 	/// Durable account state could not be opened.
 	#[error(transparent)]
 	AccountState(#[from] AccountStateStoreError),
@@ -434,12 +137,6 @@ pub enum DaemonError {
 	/// Content-addressed blob state could not be opened.
 	#[error(transparent)]
 	BlobStore(#[from] blob::Error),
-	/// Gateway client-usage state could not be opened.
-	#[error(transparent)]
-	UsageStore(#[from] omp_storage::index::Error),
-	/// Gateway usage attribution identity could not be composed.
-	#[error(transparent)]
-	UsageAttribution(#[from] omp_inference::auth::AttributionError),
 	/// Owner-local RPC listener could not bind.
 	#[error("could not bind owner-local RPC endpoint")]
 	RpcListen(#[source] omp_rpc::Error),
@@ -617,7 +314,7 @@ impl DaemonHandle {
 		config: DaemonConfig,
 		data_dir: PathBuf,
 		registry: Registry,
-		mut inference: InferenceRpc,
+		inference: InferenceRpc,
 		auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	) -> Result<Self, DaemonError> {
 		let routes = registry
@@ -630,17 +327,10 @@ impl DaemonHandle {
 		let bearer_token_file = config.bearer_token_file;
 		let (shutdown, mut rpc_shutdown) = watch::channel(false);
 		let blobs = Arc::new(BlobStore::open(&data_dir)?);
-		let usage =
-			Arc::new(omp_storage::index::SessionIndex::open(data_dir.join("sessions.sqlite3"))?);
-		let gateway_attribution =
-			omp_inference::auth::UsageAttribution::compose(&data_dir, Some("gateway"))?;
-		inference = inference.with_client_usage(Arc::clone(&usage), gateway_attribution);
-		let auth_rpc = auth_control
-			.map_or_else(
-				|| AuthRpc::new(registry.clone()),
-				|control| AuthRpc::with_control(registry.clone(), control),
-			)
-			.with_usage_store(usage);
+		let auth_rpc = auth_control.map_or_else(
+			|| AuthRpc::new(registry.clone()),
+			|control| AuthRpc::with_control(registry.clone(), control),
+		);
 		let hello = || {
 			omp_rpc::HelloService::new(env!("CARGO_PKG_VERSION"), vec![
 				sf!("auth"),

@@ -9,7 +9,6 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_storage::{blob::BlobStore, gc};
 use serde::Serialize;
 use strum::{Display, EnumString, IntoStaticStr};
 use url::Url;
@@ -38,8 +37,6 @@ pub enum DebugAction {
 	ProbeProtocols,
 	/// Export the visible transcript to a temporary artifact.
 	ExportTranscript,
-	/// Run reachability-based artifact garbage collection.
-	GarbageCollect,
 }
 
 /// Human-facing immutable action metadata.
@@ -105,11 +102,6 @@ pub const ACTIONS: &[DebugActionInfo] = &[
 		label:       "Export visible transcript",
 		description: "Write the current TUI transcript to a temporary text artifact",
 	},
-	DebugActionInfo {
-		action:      DebugAction::GarbageCollect,
-		label:       "Garbage collect artifacts",
-		description: "Sweep unreachable eligible blobs and report reclaimed bytes",
-	},
 ];
 
 /// Concrete app/UI surface launched by one catalog action.
@@ -131,8 +123,6 @@ pub enum DebugTarget {
 	ProtocolProbe,
 	/// Export the currently visible transcript.
 	TranscriptExport,
-	/// Invoke reachability-based storage garbage collection.
-	GarbageCollect,
 }
 
 /// Optional native attachments selected for a diagnostic report.
@@ -159,7 +149,6 @@ pub fn target(action: DebugAction, caps: omp_tui::TerminalCaps) -> DebugTarget {
 		DebugAction::ViewTerminal => DebugTarget::Terminal(collect_terminal_facts(caps)),
 		DebugAction::ProbeProtocols => DebugTarget::ProtocolProbe,
 		DebugAction::ExportTranscript => DebugTarget::TranscriptExport,
-		DebugAction::GarbageCollect => DebugTarget::GarbageCollect,
 	}
 }
 
@@ -275,15 +264,6 @@ pub fn artifact_url(path: &Path) -> Option<Url> {
 	Url::from_file_path(path).ok()
 }
 
-/// Sweeps only blobs unreachable from the authoritative profile session roots.
-pub fn garbage_collect(
-	store: &BlobStore,
-	min_age: Duration,
-) -> Result<omp_storage::gc::SweepReport, gc::Error> {
-	let roots = omp_storage::gc::SessionRoots::discover(store, &[])?;
-	omp_storage::gc::sweep(store, &roots, min_age)
-}
-
 #[cfg(target_os = "linux")]
 fn platform_memory_bytes() -> Option<u64> {
 	let text = fs::read_to_string("/proc/meminfo").ok()?;
@@ -306,15 +286,4 @@ const fn platform_memory_bytes() -> Option<u64> {
 pub fn action_key(action: DebugAction) -> Str {
 	let value: &'static str = action.into();
 	Str::new_static(value)
-}
-/// Projects the app-owned catalog into the host-agnostic selector model.
-pub fn selector_rows() -> Vec<omp_chat_ui::debug_selector::DebugActionRow> {
-	ACTIONS
-		.iter()
-		.map(|info| omp_chat_ui::debug_selector::DebugActionRow {
-			key:         action_key(info.action),
-			label:       Str::new_static(info.label),
-			description: Str::new_static(info.description),
-		})
-		.collect()
 }

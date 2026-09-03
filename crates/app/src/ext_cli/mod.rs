@@ -6,6 +6,7 @@ pub(crate) mod service;
 use std::{
 	fs,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -35,9 +36,8 @@ use omp_ext::{
 		set_enabled,
 	},
 };
+use omp_journal::blob::BlobStore;
 use omp_proto::env::v1::{MaterializeSite, SiteFile};
-use omp_settings::manager::{SettingsManager, SettingsPaths};
-use omp_storage::blob::BlobStore;
 use sha2::{Digest as _, Sha256};
 use toml::map;
 const MAX_WHEEL_BYTES: usize = 256 * 1024 * 1024;
@@ -2659,21 +2659,17 @@ async fn materialize_signed_wheel(
 		idempotency_key: format!("ext-install-{site_key}"),
 		..MaterializeSite::default()
 	};
-	let settings = SettingsManager::open(
-		SettingsPaths::discover(&state.data_dir, Some(&state.project)),
-		crate::SETTINGS_CATALOG,
-	)
-	.into_diagnostic()?;
+	let con = Arc::new(crate::process_ctx(&state.project)?);
 	let environment = omp_envd::ProjectEnvironment::attach(
 		&state.project,
 		&state.project_state,
 		omp_envd::AttachOptions {
-			py_eval:            false,
-			approval_mode:      None,
+			py_eval: false,
+			approval_mode: None,
 			trusted_extensions: Vec::new(),
 			contributed_values: Vec::new(),
-			settings:           settings.snapshot(),
-			bridges:            omp_envd::RegistryBridges::default(),
+			con,
+			bridges: omp_envd::RegistryBridges::default(),
 			spawn_idle_timeout: None,
 		},
 	)
