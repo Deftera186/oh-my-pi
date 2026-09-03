@@ -1046,6 +1046,8 @@ interface SubagentRunMonitor {
 	/** Best-effort capture of the last assistant text for cancelled-run salvage. */
 	captureSalvage(session: AgentSession): void;
 	lastAssistantSalvageText(): string | undefined;
+	/** Last non-empty completed assistant message text for data-less yields. */
+	lastAssistantText(): string | undefined;
 	/** Final raw output: end-of-run assistant text when available, else accumulated chunks. */
 	rawOutput(): string;
 	scheduleProgress(flush?: boolean): void;
@@ -1136,6 +1138,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let terminalError: string | undefined;
 	let consecutiveYieldToolErrors = 0;
 	let lastAssistantSalvageText: string | undefined;
+	let lastAssistantText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
 
 	const abortActiveSession = (): Promise<void> => {
@@ -1638,11 +1641,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					progress.requests += 1;
 					const eventContent = isRecord(event) && "content" in event ? event.content : undefined;
 					const messageContent = getMessageContent(event.message) || eventContent;
+					let messageText = "";
 					if (messageContent && Array.isArray(messageContent)) {
 						for (const block of messageContent) {
 							if (!isRecord(block)) continue;
 							if (block.type === "text" && typeof block.text === "string") {
 								outputChunks.push(block.text);
+								messageText = messageText ? `${messageText}\n${block.text}` : block.text;
 								continue;
 							}
 							if (block.type !== "toolCall" || typeof block.name !== "string") continue;
@@ -1651,6 +1656,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 								flushProgress = true;
 							}
 						}
+					}
+					if (messageText.trim()) {
+						lastAssistantText = messageText;
 					}
 					if (softRequestBudget > 0 && !abortSent && !yieldCallPending) {
 						const stopThreshold = softRequestBudget * 1.5;
@@ -1724,14 +1732,19 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				// Extract final content from assistant messages only (not user prompts)
 				if (event.messages && Array.isArray(event.messages)) {
 					for (const msg of event.messages) {
-						if ((msg as { role?: string })?.role !== "assistant") continue;
+						if (!isRecord(msg) || msg.role !== "assistant") continue;
 						const messageContent = getMessageContent(msg);
+						let messageText = "";
 						if (messageContent && Array.isArray(messageContent)) {
 							for (const block of messageContent) {
 								if (block.type === "text" && block.text) {
 									finalOutputChunks.push(block.text);
+									messageText = messageText ? `${messageText}\n${block.text}` : block.text;
 								}
 							}
+						}
+						if (messageText.trim()) {
+							lastAssistantText = messageText;
 						}
 					}
 				}
@@ -1888,6 +1901,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		attach,
 		captureSalvage,
 		lastAssistantSalvageText: () => lastAssistantSalvageText,
+		lastAssistantText: () => lastAssistantText,
 		rawOutput: () => (finalOutputChunks.length > 0 ? finalOutputChunks.join("") : outputChunks.join("")),
 		scheduleProgress,
 		finish: () => {
@@ -2226,7 +2240,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 			outputSchema: args.outputSchema,
 			outputSchemaMode: args.outputSchemaMode,
 			outputSchemaSource: args.outputSchemaSource,
-			lastAssistantText: monitor.lastAssistantSalvageText(),
+			lastAssistantText: monitor.lastAssistantText() ?? monitor.lastAssistantSalvageText(),
 		});
 	} finally {
 		popLoopPhase();
