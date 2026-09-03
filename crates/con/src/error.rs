@@ -107,6 +107,10 @@ pub enum ConError {
 		/// The variable name.
 		name: Str,
 	},
+	/// A command rejected its input with a user-facing message (usage text,
+	/// a value outside the command's domain).
+	#[error("{0}")]
+	Usage(Str),
 	/// Required command argument absent.
 	#[error("`{cmd}` missing required argument `{arg}`")]
 	MissingArg {

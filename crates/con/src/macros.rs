@@ -10,6 +10,9 @@
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __con_name {
+	($name:literal) => {
+		$name
+	};
 	($first:ident $($rest:ident)*) => {
 		concat!(stringify!($first) $(, "::", stringify!($rest))*)
 	};
@@ -182,16 +185,39 @@ macro_rules! __cmd_args {
 /// surplus trailing arguments still reach the handler via
 /// [`Args::raw`](crate::Args::raw). Handlers must be non-capturing; state
 /// comes from [`Ctx::user`](crate::Ctx::user).
+///
+/// A name that is not a Rust ident (`"plan-review"`) is written as a string
+/// literal in place of the ident path.
 #[macro_export]
 macro_rules! cmd {
-	($(
+	() => {};
+	(
+		$(#[doc = $doc:literal])*
+		$name:literal ( $($args:tt)* ) = $handler:expr;
+		$($rest:tt)*
+	) => {
+		$crate::__cmd_one!($name; [$($doc)*]; [$($args)*]; $handler);
+		$crate::cmd!($($rest)*);
+	};
+	(
 		$(#[doc = $doc:literal])*
 		$($seg:ident)::+ ( $($args:tt)* ) = $handler:expr;
-	)+) => {$(
+		$($rest:tt)*
+	) => {
+		$crate::__cmd_one!($crate::__con_name!($($seg)+); [$($doc)*]; [$($args)*]; $handler);
+		$crate::cmd!($($rest)*);
+	};
+}
+
+/// Registers one command spec for [`cmd!`](crate::cmd).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cmd_one {
+	($name:expr; [$($doc:literal)*]; [$($args:tt)*]; $handler:expr) => {
 		const _: () = {
 			static ARGS: &[$crate::ArgSpec] = &$crate::__cmd_args!([] $($args)*);
 			static SPEC: $crate::CmdSpec = $crate::CmdSpec::new(
-				$crate::__con_name!($($seg)+),
+				$name,
 				concat!($($doc, "\n"),*),
 				ARGS,
 				{
@@ -203,7 +229,7 @@ macro_rules! cmd {
 			#[linkme(crate = $crate::__private::linkme)]
 			static REG: $crate::RegItem = $crate::RegItem::Cmd(&SPEC);
 		};
-	)+};
+	};
 }
 
 /// Declares held-input actions: each registers the `+name`/`-name` command

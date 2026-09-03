@@ -297,22 +297,22 @@ impl CtxBuilder {
 	#[must_use]
 	pub fn build(self) -> Ctx {
 		let ctx = Ctx {
-			items:        AppendVec::new(),
-			dynamic_vars: AppendVec::new(),
-			dynamic_cmds: AppendVec::new(),
-			names:        RwLock::new(FastHashMap::default()),
-			aliases:      RwLock::new(FastHashMap::default()),
-			binds:        RwLock::new(FastHashMap::default()),
+			items:         AppendVec::new(),
+			dynamic_vars:  AppendVec::new(),
+			dynamic_cmds:  AppendVec::new(),
+			names:         RwLock::new(FastHashMap::default()),
+			aliases:       RwLock::new(FastHashMap::default()),
+			binds:         RwLock::new(FastHashMap::default()),
 			bind_baseline: RwLock::new(None),
-			completers:   RwLock::new(FastHashMap::default()),
-			observers:    RwLock::new(Vec::new()),
-			user:         RwLock::new(self.user.into_iter().collect()),
-			layers:       RwLock::new(Layers::default()),
-			depth:        AtomicU32::new(0),
-			sink:         self.sink,
-			loader:       self.loader,
-			saver:        self.saver,
-			role:         self.role,
+			completers:    RwLock::new(FastHashMap::default()),
+			observers:     RwLock::new(Vec::new()),
+			user:          RwLock::new(self.user.into_iter().collect()),
+			layers:        RwLock::new(Layers::default()),
+			depth:         AtomicU32::new(0),
+			sink:          self.sink,
+			loader:        self.loader,
+			saver:         self.saver,
+			role:          self.role,
 		};
 		if !self.isolated {
 			for item in crate::REGISTRY {

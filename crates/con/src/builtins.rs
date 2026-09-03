@@ -83,6 +83,18 @@ crate::var! {
 		default: true,
 		flags: archive | session | inherit,
 	};
+	/// Status band shows the thinking level as the model icon instead of a
+	/// ` · <level>` tail after the model name.
+	pub static CL_STATUS_COMPACT_THINKING = cl_status_compact_thinking: bool {
+		default: true,
+		flags: archive | session | inherit,
+	};
+	/// IME-safe composer layout: the caret row leaves its right chrome open
+	/// so terminal preedit never shifts the frame (pi `tui.imeSafeCursor`).
+	pub static CL_IME_SAFE_CURSOR = cl_ime_safe_cursor: bool {
+		default: false,
+		flags: archive | session | inherit,
+	};
 	/// Renderer character set.
 	pub static CL_CHARSET = cl_charset: Str {
 		default: Str::new_static("unicode"),
