@@ -953,6 +953,51 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(getProviderModels(registry, "projecting-provider")).toEqual([]);
 	});
 
+	test("oauth.modifyModels output is materialized through buildModel", async () => {
+		await authStorage.set("materializing-provider", {
+			type: "oauth",
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 60_000,
+		});
+
+		// Extensions author specs, so a hook that builds its own catalog (rather
+		// than deriving it from the models it was handed) returns records with no
+		// resolved surface at all. The registry must still hand out built models:
+		// consumers read `identity` unconditionally.
+		const config: ProviderConfigInput = {
+			api: "custom-materialize-api",
+			baseUrl: "https://example.invalid/",
+			streamSimple,
+			models: [baseModel],
+			oauth: {
+				name: "Materializing OAuth",
+				login: async () => ({ access: "a", refresh: "r", expires: Date.now() + 60_000 }),
+				refreshToken: async credentials => credentials,
+				getApiKey: credentials => credentials.access,
+				modifyModels: models => [
+					...models.filter(model => model.provider !== "materializing-provider"),
+					{
+						...baseModel,
+						id: "claude-sonnet-4-5",
+						name: "Synthesized Model",
+						provider: "materializing-provider",
+						api: "custom-materialize-api",
+						baseUrl: "https://example.invalid/",
+					} as unknown as Model<Api>,
+				],
+			},
+		};
+
+		registry.registerProvider("materializing-provider", config, "ext://oauth");
+
+		const [projected, ...rest] = getProviderModels(registry, "materializing-provider");
+		expect(rest).toEqual([]);
+		expect(projected?.id).toBe("claude-sonnet-4-5");
+		expect(projected?.identity).toEqual({ class: "anthropic", family: "sonnet", revision: "4.5.0" });
+		expect(projected?.tokenizer).toBe("claude-v3");
+	});
+
 	test("a throwing modifyModels degrades to the unprojected catalog", async () => {
 		await authStorage.set("throwing-provider", {
 			type: "oauth",
