@@ -2,6 +2,8 @@
 
 `omp-docserver` is the local document authority for an OMP environment. It coordinates document state with filesystem access, revisions and rebased edits, transactions, file watching, and language-server sessions, and exposes the service over framed protocol connections.
 
+The crate stays because it is live infrastructure beyond the retired chat stack: `omp-envd` uses it as the document and LSP authority, `omp-tools` uses that authority for the `lsp` tool, and the SDK consumes its diagnostics contracts. Removing it would duplicate host-owned document state and break those surviving paths.
+
 ## Structure
 
 - `actor`, `types`, and `environment` define the document store, authority model, shared environment, and connection-local sessions.
