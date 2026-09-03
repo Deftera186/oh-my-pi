@@ -81,7 +81,7 @@ impl SearchBridgeHost {
 
 	/// Routes speech synthesis and concatenates encoded chunks in wire order.
 	#[tracing::instrument(name = "media_speak", level = "debug", skip_all)]
-	pub(crate) async fn speak(&self, request: pb::SpeakRequest) -> Result<Vec<u8>, BackendError> {
+	pub async fn speak(&self, request: pb::SpeakRequest) -> Result<Vec<u8>, BackendError> {
 		let Some(inference) = self.inference.get() else {
 			return Err(unbound_media());
 		};
