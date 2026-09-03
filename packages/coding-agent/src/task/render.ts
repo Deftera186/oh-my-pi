@@ -165,6 +165,7 @@ function extractIncrementalReviewResult(
 		type: item.type,
 		status: item.status === "aborted" ? "aborted" : item.status === "success" ? "success" : undefined,
 		useLastTurn: item.useLastTurn,
+		lastTurnText: item.lastTurnText,
 	}));
 	const assembled = assembleYieldResult(yieldItems, undefined, REVIEWER_ARRAY_LABELS);
 	const data = assembled?.data;
@@ -195,6 +196,8 @@ interface RenderYieldItem {
 	type?: string | string[];
 	status?: string;
 	useLastTurn?: boolean;
+	/** Assistant text bound to this yield when it executed (see `YieldItem.lastTurnText`). */
+	lastTurnText?: string;
 }
 
 /**
@@ -234,6 +237,7 @@ function normalizeYieldData(value: unknown): RenderYieldItem[] {
 			type,
 			status: typeof record.status === "string" ? record.status : undefined,
 			useLastTurn: record.useLastTurn === true ? true : undefined,
+			lastTurnText: typeof record.lastTurnText === "string" ? record.lastTurnText : undefined,
 		});
 	}
 	return normalized;
