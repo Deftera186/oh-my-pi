@@ -136,7 +136,9 @@ fn boot_surface_keeps_the_composer_reachable_at_80x24() {
 fn working_surface_swaps_the_brand_for_spinner_and_timer() {
 	let mut session = boot_session();
 	session.begin_turn().expect("turn");
-	session.user("hello world", Vec::new()).expect("user message");
+	session
+		.user("hello world", Vec::new())
+		.expect("user message");
 	let (rows, _) = surface_of(&mut session, 120, 40);
 	insta::assert_snapshot!(rows.join("\n"));
 	let band = rows
@@ -152,15 +154,15 @@ fn working_surface_swaps_the_brand_for_spinner_and_timer() {
 /// compaction threshold.
 fn capture_facts(scenario: &str) -> StatusFacts {
 	StatusFacts {
-		model:           Str::new_static("Fable 5"),
-		thinking:        Some(Str::new_static("high")),
-		cwd:             Str::new(format!("pi-face-filler-{scenario}/pi-capture")),
-		scratch:         true,
-		branch:          Some(Str::new_static("main")),
-		tokens:          23_500,
-		context_window:  Some(1_000_000),
+		model: Str::new_static("Fable 5"),
+		thinking: Some(Str::new_static("high")),
+		cwd: Str::new(format!("pi-face-filler-{scenario}/pi-capture")),
+		scratch: true,
+		branch: Some(Str::new_static("main")),
+		tokens: 23_500,
+		context_window: Some(1_000_000),
 		compact_percent: 85,
-		working:         None,
+		..StatusFacts::default()
 	}
 }
 
@@ -201,10 +203,18 @@ fn status_band_working_row_carries_spinner_and_elapsed_time() {
 		ui(),
 	);
 	ui.tick(Duration::from_millis(12_080));
-	let row = frame_text(ui.frame()).lines().next().unwrap().trim_end().to_owned();
+	let row = frame_text(ui.frame())
+		.lines()
+		.next()
+		.unwrap()
+		.trim_end()
+		.to_owned();
 	let reference = reference_band("boot-120x40", 24);
-	let group = reference[..reference.find('▶').expect("cap") + '▶'.len_utf8()]
-		.replacen(" π  >", " ⠙ 12s  >", 1);
+	let group = reference[..reference.find('▶').expect("cap") + '▶'.len_utf8()].replacen(
+		" π  >",
+		" ⠙ 12s  >",
+		1,
+	);
 	// The timer widens the brand by four cells, so the gauge re-plans on a
 	// 45-cell gap: `2%` still sits on cell 1, the 85% tick moves with the
 	// scale, and the window label keeps its trailing rule cell.

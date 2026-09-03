@@ -43,6 +43,8 @@ where
 		diag:   None,
 		usage:  None,
 		status: CardStatus::Done,
+		output: None,
+		started: None,
 	};
 	let registry = CardRegistry::standard();
 	assert!(registry.contains(tool), "{tool} must not fall back to GenericCard");

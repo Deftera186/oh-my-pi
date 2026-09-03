@@ -23,7 +23,7 @@ expression: "rows.join(\"\\n\")"
 │                          │                                                                       │
 │                          │                                                                       │
 ╰──────────────────────────┴───────────────────────────────────────────────────────────────────────╯
- Tip: Press shift+tab to cycle through reasoning effort levels
+ Tip: Spaghetti code? Try complaining with /omfg
 
 
  π  > ⬢ Fable 5 > 📁 omp > ⑂ main ▶─0%───────────────────────────────────────────────────────────────┃───────────────1M─

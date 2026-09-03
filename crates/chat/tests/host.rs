@@ -60,7 +60,7 @@ fn fixture() -> (Session, omp_journal::EntryId) {
 	let outcome = serde_json::value::to_raw_value(&serde_json::json!({"text":"hello from fixture"}))
 		.expect("outcome");
 	session.settle(call, outcome).expect("tool result");
-	session.receipt(12, 7, 0).expect("receipt");
+	session.receipt(omp_journal::data::TurnReceipt::tokens(12, 7, 0)).expect("receipt");
 	(session, genesis)
 }
 
@@ -101,6 +101,23 @@ fn ctrl_c_interrupts_active_turn_and_quits_when_idle_or_repeated() {
 	assert_eq!(ctrl_c_action(true, false), CtrlCAction::Interrupt);
 	assert_eq!(ctrl_c_action(false, false), CtrlCAction::Quit);
 	assert_eq!(ctrl_c_action(true, true), CtrlCAction::Quit);
+}
+
+#[test]
+fn ctrl_c_during_an_active_turn_emits_one_interrupt_and_stays_open() {
+	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
+	host.key(Key::Char('g')).expect("type");
+	host.key(Key::Char('o')).expect("type");
+	assert_eq!(host.key(Key::Enter).expect("enter"), NativeEffect::Consumed);
+	assert!(matches!(commands.recv().expect("submit"), HostCommand::Submit(text) if text == "go"));
+	assert_ne!(host.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
+	assert!(matches!(commands.recv().expect("interrupt"), HostCommand::Interrupt));
+	assert!(commands.try_recv().is_err(), "one ctrl+c posts exactly one interrupt");
+	assert_eq!(host.key(Key::Char('!')).expect("type"), NativeEffect::Consumed);
+	// Idle ctrl+c (no active turn) still quits, per `ctrl_c_action`.
+	let (mut idle, idle_commands) = bound_host(vec![row("test/model", &[])]);
+	assert_eq!(idle.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
+	assert!(idle_commands.try_recv().is_err());
 }
 
 #[test]
@@ -152,8 +169,10 @@ fn pending_approval_projects_overlay_and_hotkeys() {
 			models: Vec::new(),
 			cycle: Vec::new(),
 			resize_policy: ResizePolicy::Rebuild,
-			branch: None,
+			project: std::path::PathBuf::new(),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
 			ui: UiContext::default(),
+			services: Arc::new(omp_chat::overlays::NoServices),
 		},
 		Size::new(80, 24),
 	);
@@ -169,12 +188,23 @@ fn pending_approval_projects_overlay_and_hotkeys() {
 }
 
 fn bound_host(models: Vec<omp_chat::ModelRow>) -> (NativeHost, flume::Receiver<HostCommand>) {
+	let (host, commands, _) = bound_host_with_session(models);
+	(host, commands)
+}
+
+fn bound_host_with_session(
+	models: Vec<omp_chat::ModelRow>,
+) -> (NativeHost, flume::Receiver<HostCommand>, Session) {
 	let (mut session, _) = fixture();
 	let (snapshot, dom_events) = session.subscribe();
 	let (_, kernel_events) = flume::unbounded();
 	let (commands, command_rx) = flume::unbounded();
 	let (up, _) = flume::unbounded();
-	let con = Arc::new(omp_chat::HostMailbox::new().attach(omp_con::Ctx::builder()).build());
+	let con = Arc::new(
+		omp_chat::HostMailbox::new()
+			.attach(omp_con::Ctx::builder())
+			.build(),
+	);
 	con.run(
 		r#"bind alt+p "cl_model_select session"; bind shift+tab cl_thinking_cycle; bind ctrl+r cl_history_search; bind escape cl_interrupt"#,
 	)
@@ -197,12 +227,68 @@ fn bound_host(models: Vec<omp_chat::ModelRow>) -> (NativeHost, flume::Receiver<H
 			models,
 			cycle: Vec::new(),
 			resize_policy: ResizePolicy::Rebuild,
-			branch: None,
+			project: std::path::PathBuf::new(),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
 			ui: UiContext::default(),
+			services: Arc::new(omp_chat::overlays::NoServices),
 		},
 		Size::new(100, 30),
 	);
-	(host, command_rx)
+	(host, command_rx, session)
+}
+
+#[test]
+fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
+	use omp_dom::{NodeSpec, Op, Txn, Value};
+	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
+	// A second turn: the assistant stopped for tool calls, the bash call is
+	// running, and the per-inference receipt already landed after it.
+	session.begin_turn().expect("begin turn");
+	session.user("interrupt me", Vec::new()).expect("user");
+	session
+		.assistant_start("test/model", "test", "test/model")
+		.expect("assistant start");
+	let args =
+		serde_json::value::to_raw_value(&serde_json::json!({"command":"sleep 30"})).expect("args");
+	let call = session
+		.call("bash", 1, "slow-shell", None, Some(args), None)
+		.expect("tool call");
+	session.assistant_end("tool_calls").expect("assistant end");
+	session.receipt(omp_journal::data::TurnReceipt::tokens(0, 0, 0)).expect("receipt");
+	host.poll().expect("apply dom events");
+	assert_ne!(host.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
+	assert!(matches!(commands.recv().expect("interrupt"), HostCommand::Interrupt));
+	assert!(commands.try_recv().is_err());
+
+	// The kernel settles the call as aborted and ends the turn with a notice:
+	// the tree now says the turn is over, so ctrl+c quits.
+	let fault = serde_json::value::to_raw_value(&serde_json::json!({
+		"kind":"aborted","value":{"abort":{"kind":"interrupted","reason":"cancelled"},"kind":"cancelled"}
+	}))
+	.expect("fault");
+	session.fail(call, fault).expect("aborted result");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	let cause = session.head().expect("head");
+	session
+		.patch(Txn {
+			cause,
+			label: None,
+			ops: vec![Op::Ins {
+				parent: turn,
+				after:  session.dom().children(turn).last().copied(),
+				node:   NodeSpec::new(KnownTag::Notice)
+					.with_prop(PropId::Kind, Value::Str(omp_core::Str::new_static("warn")))
+					.with_content(omp_core::Str::new_static("Turn interrupted")),
+			}],
+		})
+		.expect("interrupt notice");
+	host.poll().expect("apply dom events");
+	std::thread::sleep(std::time::Duration::from_millis(1100));
+	assert_eq!(host.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
 }
 
 fn row(key: &'static str, efforts: &[&'static str]) -> omp_chat::ModelRow {
@@ -214,7 +300,10 @@ fn row(key: &'static str, efforts: &[&'static str]) -> omp_chat::ModelRow {
 		context:     Some(200_000),
 		input_mtok:  None,
 		output_mtok: None,
-		efforts:     efforts.iter().map(|effort| omp_core::Str::new_static(effort)).collect(),
+		efforts:     efforts
+			.iter()
+			.map(|effort| omp_core::Str::new_static(effort))
+			.collect(),
 	}
 }
 
@@ -227,12 +316,18 @@ fn alt_p_opens_the_model_picker_and_enter_sets_ai_model_for_the_session() {
 	assert!(host.overlay_open(), "alt+p opens the picker");
 	let frame = host.picker_frame().expect("picker frame");
 	assert!(omp_tui::frame_text(&frame).contains("Switch Model"));
-	assert!(matches!(commands.recv().expect("overlay open"), HostCommand::Overlay { open: true, .. }));
+	assert!(matches!(commands.recv().expect("overlay open"), HostCommand::Overlay {
+		open: true,
+		..
+	}));
 	host.key(Key::Down).expect("down");
 	host.key(Key::Enter).expect("enter");
 	assert!(!host.overlay_open(), "picking closes the picker");
 	assert_eq!(host.notice(), Some("Session model: test/other"));
-	assert!(matches!(commands.recv().expect("overlay close"), HostCommand::Overlay { open: false, .. }));
+	assert!(matches!(commands.recv().expect("overlay close"), HostCommand::Overlay {
+		open: false,
+		..
+	}));
 	assert!(commands.try_recv().is_err(), "a session-only pick never reaches the controller");
 }
 
@@ -273,7 +368,11 @@ fn ctrl_r_recalls_a_prior_prompt_into_the_composer() {
 fn slash_and_unknown_commands_surface_as_notices_not_host_errors() {
 	let (mut host, _commands) = bound_host(Vec::new());
 	assert_eq!(host.console("no_such_command").expect("console"), NativeEffect::Consumed);
-	assert!(host.notice().is_some_and(|text| text.contains("no_such_command")));
+	assert!(
+		host
+			.notice()
+			.is_some_and(|text| text.contains("no_such_command"))
+	);
 	assert_eq!(host.console("cl_model_select").expect("console"), NativeEffect::Consumed);
 	assert_eq!(host.notice(), Some("No models are available to switch to"));
 }
