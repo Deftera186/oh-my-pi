@@ -19,6 +19,7 @@ use xutf::Text;
 use super::{ContextGaugeMode, Img, StatusPlacement, hr::truncate_to_width};
 use crate::{
 	Completion, EditBuffer, EditOutcome, Editor, EditorOptions, Icon, PickerRow, SuggestionDisplay,
+	anim,
 	component::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, next_slot,
 	},
@@ -226,30 +227,110 @@ pub enum InlineAccent {
 /// Pure host decoration from full editor text to accented byte spans.
 pub type InlineDecorator = Box<dyn Fn(&str) -> SmallVec<(usize, usize, InlineAccent), 4>>;
 
-/// Data-driven accent policy for editor keywords.
+/// HSL hue sweep painted across one magic keyword (pi
+/// `GradientHighlightSpec`): stop `i` of [`STOPS`](Self::STOPS) takes hue
+/// `start + (i / STOPS) * span` at 90% saturation and 62% lightness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeywordGradient {
+	/// Hue in degrees at `t = 0`.
+	pub hue_start: f32,
+	/// Hue travelled across the sweep, in degrees.
+	pub hue_span:  f32,
+}
+
+impl KeywordGradient {
+	/// Color stops swept across the gradient (pi `stops: 14`).
+	pub const STOPS: usize = 14;
+	/// Time for the gradient to sweep one full cycle across each keyword
+	/// (pi `CustomEditor.SHIMMER_PERIOD_MS`).
+	pub const SHIMMER_PERIOD: Duration = Duration::from_millis(1800);
+	/// Repaint cadence while a keyword shimmers (pi
+	/// `CustomEditor.SHIMMER_FRAME_MS`): ~14 frames/s reads as motion without
+	/// flooding the renderer.
+	pub const SHIMMER_FRAME: Duration = Duration::from_millis(70);
+	const SATURATION: f32 = 0.90;
+	const LIGHTNESS: f32 = 0.62;
+
+	/// pi `ultrathink.ts`: the full rainbow, `t * 330`.
+	pub const ULTRATHINK: Self = Self { hue_start: 0.0, hue_span: 330.0 };
+	/// pi `orchestrate.ts`: green through blue to violet, `150 + t * 130`.
+	pub const ORCHESTRATE: Self = Self { hue_start: 150.0, hue_span: 130.0 };
+	/// pi `workflow.ts`: orange through green, `30 + t * 120`.
+	pub const WORKFLOWZ: Self = Self { hue_start: 30.0, hue_span: 120.0 };
+
+	/// Compiles the stop palette once per color depth: truecolor keeps the
+	/// HSL sample, 256-color terminals take the nearest indexed entry.
+	fn palette(self, truecolor: bool) -> [Color; Self::STOPS] {
+		let mut palette = [Color::Default; Self::STOPS];
+		for (index, slot) in palette.iter_mut().enumerate() {
+			let t = index as f32 / Self::STOPS as f32;
+			let hue = self.hue_span.mul_add(t, self.hue_start).round();
+			let color = anim::hsl(hue, Self::SATURATION, Self::LIGHTNESS);
+			*slot = if truecolor { color } else { color.quantized_256() };
+		}
+		palette
+	}
+
+	/// Stop for character `index` of an `len`-character keyword at `phase`
+	/// (pi `paint`: `floor(((i / n + phase) mod 1) * stops) mod stops`).
+	#[must_use]
+	pub fn stop(index: usize, len: usize, phase: f32) -> usize {
+		let t = anim::wrap_unit(index as f32 / len.max(1) as f32 + phase);
+		((t * Self::STOPS as f32).floor() as usize) % Self::STOPS
+	}
+}
+
+/// One accented keyword with its palettes compiled for both color depths.
+#[derive(Clone, Debug)]
+struct Keyword {
+	text:     Str,
+	/// `[256-color, truecolor]`.
+	palettes: [[Color; KeywordGradient::STOPS]; 2],
+}
+
+/// Data-driven accent policy for editor keywords: each keyword shimmers
+/// through its own [`KeywordGradient`] while the editor is focused.
 #[derive(Clone, Debug, Default)]
 pub struct KeywordAccent {
-	keywords: Arc<[Str]>,
+	keywords: Arc<[Keyword]>,
 }
 
 impl KeywordAccent {
 	/// Creates an immutable keyword set. Empty values are ignored.
-	pub fn new(keywords: impl IntoIterator<Item = Str>) -> Self {
+	pub fn new(keywords: impl IntoIterator<Item = (Str, KeywordGradient)>) -> Self {
 		Self {
 			keywords: keywords
 				.into_iter()
-				.filter(|keyword| !keyword.is_empty())
+				.filter(|(keyword, _)| !keyword.is_empty())
+				.map(|(text, gradient)| Keyword {
+					text,
+					palettes: [gradient.palette(false), gradient.palette(true)],
+				})
 				.collect(),
 		}
 	}
 
-	/// Uses an already shared immutable keyword set without copying it.
-	pub fn from_shared(keywords: Arc<[Str]>) -> Self {
-		Self { keywords }
+	/// pi's built-in magic keywords (`magic-keywords.ts`): `ultrathink`,
+	/// `orchestrate`, and `workflowz`, each with its own hue sweep.
+	#[must_use]
+	pub fn magic() -> Self {
+		Self::new([
+			(Str::new_static("ultrathink"), KeywordGradient::ULTRATHINK),
+			(Str::new_static("orchestrate"), KeywordGradient::ORCHESTRATE),
+			(Str::new_static("workflowz"), KeywordGradient::WORKFLOWZ),
+		])
 	}
 
-	/// Finds case-insensitive whole-word keyword spans in one immutable text.
-	pub fn matched_spans(&self, text: &str) -> SmallVec<(usize, usize), 8> {
+	/// Palette of keyword `index` (as reported by
+	/// [`matched_spans`](Self::matched_spans)) for the color depth.
+	#[must_use]
+	pub fn palette(&self, index: usize, truecolor: bool) -> &[Color; KeywordGradient::STOPS] {
+		&self.keywords[index].palettes[usize::from(truecolor)]
+	}
+
+	/// Finds case-insensitive whole-word keyword spans in one immutable
+	/// text, each with the index of the keyword it matched.
+	pub fn matched_spans(&self, text: &str) -> SmallVec<(usize, usize, usize), 8> {
 		let mut spans = SmallVec::new();
 		for (at, _) in text.char_indices() {
 			let boundary_before = text[..at]
@@ -259,8 +340,8 @@ impl KeywordAccent {
 			if !boundary_before {
 				continue;
 			}
-			for keyword in self.keywords.iter() {
-				let end = at.saturating_add(keyword.len());
+			for (index, keyword) in self.keywords.iter().enumerate() {
+				let end = at.saturating_add(keyword.text.len());
 				let Some(candidate) = text.get(at..end) else {
 					continue;
 				};
@@ -271,9 +352,9 @@ impl KeywordAccent {
 				if boundary_after
 					&& xutf::equals_ignore_ascii_case::<xutf::Utf8, xutf::Utf8>(
 						candidate.as_bytes(),
-						keyword.as_bytes(),
+						keyword.text.as_bytes(),
 					) {
-					spans.push((at, end));
+					spans.push((at, end, index));
 					break;
 				}
 			}
@@ -292,7 +373,7 @@ pub struct EditInput {
 	dragging:          bool,
 	last_click:        Option<((u16, u16), Instant)>,
 	keyword_accent:    KeywordAccent,
-	keyword_spans:     SmallVec<(usize, usize), 8>,
+	keyword_spans:     SmallVec<(usize, usize, usize), 8>,
 	inline_decorator:  Option<InlineDecorator>,
 	decoration_spans:  SmallVec<(usize, usize, InlineAccent), 4>,
 	spelling:          SpellingAssist,
@@ -301,6 +382,10 @@ pub struct EditInput {
 	/// Cursor position an in-flight autocorrect request was made at; the
 	/// correction only applies while the cursor still sits there.
 	correction_guard:  Option<usize>,
+	/// pi `setImeSafeCursorLayout`: leave the caret row empty to its right
+	/// in side-bordered shapes so terminal-local IME preedit cannot shift the
+	/// chrome onto the next row.
+	ime_safe_cursor:   bool,
 }
 
 impl EditInput {
@@ -322,7 +407,16 @@ impl EditInput {
 			spelling_features: SpellingFeatures::default(),
 			spelling_mask:     SmallVec::new(),
 			correction_guard:  None,
+			ime_safe_cursor:   false,
 		}
+	}
+
+	/// Enables pi's IME-safe cursor layout (`tui.imeSafeCursor`): in
+	/// side-bordered shapes (box, field, rail) the row whose caret sits at
+	/// its end paints no right chrome, so marked text a terminal renders
+	/// locally during IME composition never pushes the frame apart.
+	pub const fn set_ime_safe_cursor(&mut self, enabled: bool) {
+		self.ime_safe_cursor = enabled;
 	}
 
 	/// Binds the composer's shared attachment queue: image path drops stage
@@ -970,16 +1064,30 @@ impl Component for EditInput {
 		};
 		let shell = prefix_mode.is_some();
 		let keyword_accent = !self.keyword_spans.is_empty();
+		// pi `CustomEditor.decorateText`: the keyword gradient shimmers only
+		// while the prompt is focused and a magic keyword is on screen; the
+		// next frame decides whether to schedule another, so the chain stops
+		// by itself when focus leaves or the keyword is deleted.
+		let shimmer = focused && keyword_accent;
+		let phase = if shimmer {
+			pc.wake(
+				self.slot,
+				pc.now.saturating_add(KeywordGradient::SHIMMER_FRAME),
+			);
+			anim::phase(pc.now, KeywordGradient::SHIMMER_PERIOD)
+		} else {
+			0.0
+		};
 		let active_color = if let Some(color) = prefix_mode {
 			color
-		} else if keyword_accent && (pc.now.as_millis() / 180).is_multiple_of(2) {
+		} else if shimmer && (pc.now.as_millis() / 180).is_multiple_of(2) {
 			pc.ctx.theme.secondary
 		} else {
 			pc.ctx.theme.accent
 		};
-		if keyword_accent {
-			pc.wake(self.slot, pc.now.saturating_add(time::Duration::from_millis(40)));
-		}
+		// Terminals without truecolor run a quantized theme (every token
+		// indexed); the accent is the tell.
+		let truecolor = matches!(pc.ctx.theme.accent, Color::Rgb(..));
 		let edge = Style::new().fg(if shell || keyword_accent {
 			active_color
 		} else {
@@ -1022,17 +1130,30 @@ impl Component for EditInput {
 			}
 		}
 		let content_y = rect.y.saturating_add(layout.top_rows);
+		// pi `imeSafeCursorTail`: the focused caret row whose text ends at the
+		// caret keeps no right chrome (box border, field cap, surface fill).
+		let ime_tail_row = (self.ime_safe_cursor && focused)
+			.then(|| {
+				rows.iter().position(|content| {
+					content.cursor_column == Some(cell_width(content.text))
+				})
+			})
+			.flatten()
+			.and_then(|row| u16::try_from(row).ok());
 		for row in 0..content_height {
 			let y = content_y.saturating_add(row);
 			if y >= pc.clip {
 				break;
 			}
+			let ime_tail = ime_tail_row == Some(row);
 			match self.style {
 				ComposerStyle::Box => {
 					pc.frame
 						.put(rect.x, y, vertical.encode_utf8(&mut [0; 4]), edge);
-					pc.frame
-						.put(right, y, vertical.encode_utf8(&mut [0; 4]), edge);
+					if !ime_tail {
+						pc.frame
+							.put(right, y, vertical.encode_utf8(&mut [0; 4]), edge);
+					}
 				},
 				ComposerStyle::Pi => {
 					pc.frame
@@ -1051,19 +1172,37 @@ impl Component for EditInput {
 						if glyph == vertical { edge } else { accent },
 					);
 				},
-				ComposerStyle::Field => {
-					pc.frame.fill(Rect::new(rect.x, y, rect.width, 1), surface);
-					let (left, right_cap) = field_caps(pc.ctx.charset);
+				ComposerStyle::Field | ComposerStyle::Rail => {
+					// The IME tail row fills only up to the caret: rows[row]
+					// exists whenever a tail was found on it.
+					let fill_width = if ime_tail {
+						rows
+							.get(usize::from(row))
+							.and_then(|content| content.cursor_column)
+							.map_or(rect.width, |column| {
+								layout
+									.side_chrome
+									.saturating_add(column)
+									.min(rect.width)
+							})
+					} else {
+						rect.width
+					};
 					pc.frame
-						.put(rect.x, y, left.encode_utf8(&mut [0; 4]), accent);
-					pc.frame
-						.put(right, y, right_cap.encode_utf8(&mut [0; 4]), accent);
-				},
-				ComposerStyle::Rail => {
-					pc.frame.fill(Rect::new(rect.x, y, rect.width, 1), surface);
-					let rail = accent_rail(pc.ctx.charset, focused);
-					pc.frame
-						.put(rect.x, y, rail.encode_utf8(&mut [0; 4]), accent);
+						.fill(Rect::new(rect.x, y, fill_width, 1), surface);
+					if self.style == ComposerStyle::Field {
+						let (left, right_cap) = field_caps(pc.ctx.charset);
+						pc.frame
+							.put(rect.x, y, left.encode_utf8(&mut [0; 4]), accent);
+						if !ime_tail {
+							pc.frame
+								.put(right, y, right_cap.encode_utf8(&mut [0; 4]), accent);
+						}
+					} else {
+						let rail = accent_rail(pc.ctx.charset, focused);
+						pc.frame
+							.put(rect.x, y, rail.encode_utf8(&mut [0; 4]), accent);
+					}
 				},
 				ComposerStyle::Claude | ComposerStyle::Borderless | ComposerStyle::Rule => {},
 			}
@@ -1115,23 +1254,34 @@ impl Component for EditInput {
 			}
 			runs = overlay_chip_runs(&runs, &typo_runs, content.text.len());
 			let mut keyword_runs: SmallVec<(usize, usize, Style), 16> = SmallVec::new();
-			for &(keyword_start, keyword_end) in &self.keyword_spans {
+			for &(keyword_start, keyword_end, keyword) in &self.keyword_spans {
 				let from = keyword_start.max(start);
 				let to = keyword_end.min(scanned);
 				if from >= to {
 					continue;
 				}
+				let palette = self.keyword_accent.palette(keyword, truecolor);
 				let keyword_len = text[keyword_start..keyword_end].chars().count().max(1);
 				let mut position = text[keyword_start..from].chars().count();
+				// Coalesce consecutive characters that resolve to the same stop.
+				let mut run: Option<(usize, usize, usize)> = None;
 				for (offset, character) in text[from..to].char_indices() {
 					let run_start = from - start + offset;
 					let run_end = run_start + character.len_utf8();
-					keyword_runs.push((
-						run_start,
-						run_end,
-						keyword_gradient_style(position, keyword_len),
-					));
+					let stop = KeywordGradient::stop(position, keyword_len, phase);
 					position += 1;
+					match &mut run {
+						Some((_, end, current)) if *current == stop => *end = run_end,
+						_ => {
+							if let Some((start, end, stop)) = run.take() {
+								keyword_runs.push((start, end, Style::new().fg(palette[stop])));
+							}
+							run = Some((run_start, run_end, stop));
+						},
+					}
+				}
+				if let Some((start, end, stop)) = run {
+					keyword_runs.push((start, end, Style::new().fg(palette[stop])));
 				}
 			}
 			runs = overlay_chip_runs(&runs, &keyword_runs, content.text.len());
@@ -1564,24 +1714,6 @@ fn chip_style(marker: &str) -> Option<Style> {
 }
 
 /// Whether a paste is large enough to collapse into an attachment chip.
-/// Returns the cool teal-to-violet gradient used for magic editor keywords.
-fn keyword_gradient_style(position: usize, len: usize) -> Style {
-	const START: [u8; 3] = [45, 212, 191];
-	const END: [u8; 3] = [139, 92, 246];
-	let denominator = len.saturating_sub(1).max(1);
-	let blend = |from: u8, to: u8| {
-		let from = usize::from(from);
-		let to = usize::from(to);
-		u8::try_from((from * denominator.saturating_sub(position) + to * position) / denominator)
-			.unwrap_or(to as u8)
-	};
-	Style::new().fg(Color::Rgb(
-		blend(START[0], END[0]),
-		blend(START[1], END[1]),
-		blend(START[2], END[2]),
-	))
-}
-
 fn collapses_to_chip(text: &str) -> bool {
 	text.len() > 1000 || text.bytes().filter(|byte| *byte == b'\n').count() >= 10
 }
@@ -1928,6 +2060,32 @@ impl EditorPane {
 		}
 	}
 
+	/// Enables pi's IME-safe cursor layout on the editable surface; see
+	/// [`EditInput::set_ime_safe_cursor`].
+	pub fn ime_safe_cursor(mut self, enabled: bool) -> Self {
+		self.set_ime_safe_cursor(enabled);
+		self
+	}
+
+	/// Toggles pi's IME-safe cursor layout at runtime.
+	pub fn set_ime_safe_cursor(&mut self, enabled: bool) {
+		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
+			input.set_ime_safe_cursor(enabled);
+			self.children[0].invalidate();
+		}
+	}
+
+	/// Caps the editable surface at `rows` (`max-rows`), the terminal-size
+	/// budget hosts recompute on resize (pi `setMaxHeight`).
+	pub fn set_max_rows(&mut self, rows: u16) {
+		let input = &mut self.children[0];
+		if input.comp().props().max_rows() == Some(rows) {
+			return;
+		}
+		input.comp_mut().props_mut().set(Prop::MaxRows, rows);
+		input.invalidate();
+	}
+
 	/// Selects the data-driven composer keyword accent policy.
 	pub fn keyword_accent(mut self, accent: KeywordAccent) -> Self {
 		self.set_keyword_accent(accent);
@@ -2215,6 +2373,15 @@ impl EditorPane {
 			.comp()
 			.downcast_ref::<EditInput>()
 			.map_or("", EditInput::current_line)
+	}
+
+	/// Text as displayed, with attachment chips collapsed to their markers
+	/// (the `value` expands them); empty when the editable leaf was replaced.
+	pub fn displayed_text(&self) -> &str {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.map_or("", |input| input.editor.text())
 	}
 
 	/// Whether the completion dropdown is open under the editable surface.
@@ -2959,6 +3126,151 @@ mod tests {
 		let frame = ui.frame();
 		assert_eq!(frame.cursor(), Some((4, 0)));
 		assert_ne!(frame.cell(4, 0).style().background_color(), accent);
+	}
+
+	/// Wide graphemes occupy two cells: the caret lands after the whole
+	/// glyph, never between its halves, and walking left steps a full glyph.
+	#[test]
+	fn caret_skips_wide_graphemes_as_whole_cells() {
+		let mut ui = Ui::from_root(
+			EditInput::new()
+				.composer_style(ComposerStyle::Borderless)
+				.with(Prop::Id, "composer"),
+			40,
+			UiContext::default(),
+		);
+		ui.focus_first();
+		for character in "日本🙂x".chars() {
+			ui.handle_key(Key::Char(character));
+		}
+		// `╰─ ` gutter (3) + 2 + 2 + 2 + 1.
+		assert_eq!(ui.frame().cursor(), Some((10, 0)), "end of buffer after wide text");
+		ui.handle_key(Key::Left);
+		assert_eq!(ui.frame().cursor(), Some((9, 0)));
+		ui.handle_key(Key::Left);
+		assert_eq!(ui.frame().cursor(), Some((7, 0)), "the emoji is one two-cell step");
+		ui.handle_key(Key::Left);
+		assert_eq!(ui.frame().cursor(), Some((5, 0)));
+		ui.handle_key(Key::Home);
+		ui.handle_key(Key::Right);
+		assert_eq!(ui.frame().cursor(), Some((5, 0)), "never between the halves of 日");
+	}
+
+	/// pi `imeSafeCursorTail` (`#5563`): with the IME-safe layout on, the
+	/// focused caret row of a side-bordered shape keeps no right chrome, so
+	/// terminal-local preedit cannot push the border onto the next row. Off
+	/// (pi's default) and unfocused, the border stays.
+	#[test]
+	fn ime_safe_layout_drops_right_chrome_on_the_caret_row() {
+		let mut ui = Ui::from_root(
+			EditorPane::new()
+				.composer_style(ComposerStyle::Box)
+				.ime_safe_cursor(true)
+				.with(Prop::Id, "composer")
+				.with(Prop::Value, "ast\nsecond"),
+			20,
+			UiContext::default(),
+		);
+		ui.focus_first();
+		// Caret at the end of the last line: that row is open to the right,
+		// the first content row and the bottom border keep their chrome.
+		let rows: Vec<String> = (0..4).map(|row| frame_row_text(ui.frame(), row)).collect();
+		assert!(rows[0].starts_with('╭') && rows[0].ends_with('╮'), "{rows:?}");
+		assert!(rows[1].ends_with('│'), "{rows:?}");
+		assert_eq!(rows[2].trim_end(), "│  second", "{rows:?}");
+		assert!(rows[3].starts_with('╰') && rows[3].ends_with('╯'), "{rows:?}");
+		assert_eq!(ui.frame().cursor(), Some((3 + 6, 2)));
+		// Caret mid-line: nothing to protect, the right border returns.
+		ui.handle_key(Key::Left);
+		assert!(frame_row_text(ui.frame(), 2).ends_with('│'));
+		// Unfocused: no caret, so no open row.
+		ui.handle_key(Key::End);
+		ui.blur();
+		assert!(frame_row_text(ui.frame(), 2).ends_with('│'));
+
+		let mut plain = Ui::from_root(
+			EditorPane::new()
+				.composer_style(ComposerStyle::Box)
+				.with(Prop::Id, "composer")
+				.with(Prop::Value, "ast"),
+			20,
+			UiContext::default(),
+		);
+		plain.focus_first();
+		assert!(frame_row_text(plain.frame(), 1).ends_with('│'), "pi default keeps the compact box");
+
+		let mut rail = Ui::from_root(
+			EditorPane::new()
+				.composer_style(ComposerStyle::Rail)
+				.ime_safe_cursor(true)
+				.with(Prop::Id, "composer")
+				.with(Prop::Value, "ast"),
+			20,
+			UiContext::default(),
+		);
+		rail.focus_first();
+		let (column, row) = rail.frame().cursor().expect("caret");
+		let panel = rail.context().theme.panel;
+		assert_ne!(rail.frame().cell(column, row).style().background_color(), panel);
+		assert_eq!(rail.frame().cell(column - 1, row).style().background_color(), panel);
+	}
+
+	/// pi `CustomEditor.decorateText`: magic keywords shimmer on the paint
+	/// clock (1800 ms sweep, 70 ms frames) only while focused; unfocused the
+	/// gradient rests at phase 0 and schedules nothing.
+	#[test]
+	fn magic_keywords_shimmer_only_while_focused() {
+		fn row_colors(ui: &Ui, row: u16, from: u16, len: u16) -> Vec<Color> {
+			(from..from + len)
+				.map(|x| ui.frame().cell(x, row).style().foreground_color())
+				.collect()
+		}
+		// Platform spelling would add its own 16 ms polls; only the shimmer
+		// clock is under test.
+		let mut ui = Ui::from_root(
+			EditorPane::new()
+				.keyword_accent(KeywordAccent::magic())
+				.spelling_features(assist_features(false, false))
+				.with(Prop::Id, "composer")
+				.with(Prop::Value, "ultrathink now"),
+			40,
+			UiContext::default(),
+		);
+		ui.focus_first();
+		let resting = row_colors(&ui, 0, 3, 10);
+		let magic = KeywordAccent::magic();
+		let palette = magic.palette(0, true);
+		let expected: Vec<Color> = (0..10)
+			.map(|i| palette[KeywordGradient::stop(i, 10, 0.0)])
+			.collect();
+		assert_eq!(resting, expected, "phase 0 paints pi's static palette");
+		assert_eq!(resting[0], anim::hsl(0.0, 0.90, 0.62));
+		assert_eq!(
+			ui.next_wake(),
+			Some(KeywordGradient::SHIMMER_FRAME),
+			"a focused keyword schedules the next shimmer frame"
+		);
+		assert!(ui.tick(KeywordGradient::SHIMMER_FRAME), "the frame repaints");
+		let moved = row_colors(&ui, 0, 3, 10);
+		assert_ne!(moved, resting, "70 ms later the gradient has rotated");
+		assert_eq!(
+			ui.next_wake(),
+			Some(KeywordGradient::SHIMMER_FRAME * 2),
+			"the chain continues while focused"
+		);
+		// Plain text after the keyword is never painted from the palette.
+		let plain = ui.frame().cell(3 + 11, 0).style().foreground_color();
+		assert!(!palette.contains(&plain), "{plain:?}");
+
+		ui.blur();
+		ui.tick(KeywordGradient::SHIMMER_FRAME * 3);
+		assert_eq!(row_colors(&ui, 0, 3, 10), expected, "unfocused: phase 0");
+		assert_eq!(ui.next_wake(), None, "unfocused: no shimmer wake");
+
+		// 256-color terminals take the nearest indexed stop.
+		let indexed = magic.palette(0, false);
+		assert!(indexed.iter().all(|color| matches!(color, Color::Indexed(_))), "{indexed:?}");
+		assert_eq!(indexed[0], anim::hsl(0.0, 0.90, 0.62).quantized_256());
 	}
 
 	#[test]
@@ -3740,6 +4052,52 @@ mod tests {
 			Some(paste),
 			"the restored chip expands back to the pasted text"
 		);
+	}
+
+	/// The nerd-font chip label is a private-use glyph (two cells, three
+	/// bytes) plus `#N`: every delete key removes the whole chip from either
+	/// side, and the caret never rests inside it.
+	#[test]
+	fn wide_glyph_chips_delete_atomically_from_both_sides() {
+		let paste = (0..12)
+			.map(|n| format!("line{n}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
+		for (key, from_left) in [
+			(Key::Backspace, false),
+			(Key::Ctrl('w'), false),
+			(Key::Delete, true),
+			(Key::WordDelete, true),
+		] {
+			let mut ui = Ui::from_root(
+				EditorPane::new()
+					.with(Prop::Id, "composer")
+					.status(Status::new().segment(Segment::new().label("ready"))),
+				40,
+				ctx.clone(),
+			);
+			ui.focus_first();
+			let base = ui.height();
+			ui.handle_paste(&paste);
+			let chip = chip_label(&editor_pane(&ui).attachments.snapshot()[0], Charset::NerdFont);
+			assert!(chip.starts_with(Charset::NerdFont.icon(Icon::TextFile)), "{chip}");
+			assert_eq!(editor_pane(&ui).buffer().text(), format!("{chip} "));
+			// Walking left over the chip lands before it, never inside.
+			ui.handle_key(Key::Left);
+			ui.handle_key(Key::Left);
+			assert_eq!(editor_pane(&ui).buffer().cursor(), 0, "{key:?}");
+			if from_left {
+				ui.handle_key(key);
+				assert_eq!(editor_pane(&ui).buffer().text(), " ", "{key:?}");
+			} else {
+				ui.handle_key(Key::End);
+				ui.handle_key(Key::Backspace);
+				ui.handle_key(key);
+				assert_eq!(editor_pane(&ui).buffer().text(), "", "{key:?}");
+			}
+			assert_eq!(ui.height(), base, "{key:?}: deleting the chip collapses the band");
+		}
 	}
 
 	#[test]

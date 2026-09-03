@@ -260,7 +260,7 @@ impl EditBuffer {
 	/// counts as the edit being undone.
 	pub fn undo_past_transient(&mut self, transient: &str) -> BufferOutcome {
 		let (before, after) = self.text.split_at(self.cursor);
-		while let Some((text, _, _)) = self.undo.last() {
+		while let Some((text, ..)) = self.undo.last() {
 			let typed = text
 				.strip_prefix(before)
 				.and_then(|rest| rest.strip_suffix(after));
@@ -1678,7 +1678,10 @@ impl Picker {
 	pub fn visible_rows(&self) -> SmallVec<PickerRow<'_>, 8> {
 		let (start, suggestions) = self.visible_suggestions();
 		let mut rows = SmallVec::new();
-		let first = self.suggestions.first().and_then(|suggestion| suggestion.category.as_ref());
+		let first = self
+			.suggestions
+			.first()
+			.and_then(|suggestion| suggestion.category.as_ref());
 		let uniform = self
 			.suggestions
 			.iter()
@@ -2228,11 +2231,15 @@ impl Editor {
 	/// engine-provided rows, reports the acceptance to the engine.
 	fn apply_suggestion(&mut self, picker: &Picker, suggestion: &Suggestion) {
 		let Some(completion) = self.completion.as_mut().filter(|_| picker.provided) else {
-			self.buffer.replace_range(picker.range.clone(), &suggestion.value);
+			self
+				.buffer
+				.replace_range(picker.range.clone(), &suggestion.value);
 			return;
 		};
 		let replaced = Str::new(&self.buffer.text()[picker.range.clone()]);
-		self.buffer.replace_range(picker.range.clone(), &suggestion.value);
+		self
+			.buffer
+			.replace_range(picker.range.clone(), &suggestion.value);
 		completion.accepted(&replaced, suggestion);
 	}
 
@@ -2301,17 +2308,30 @@ impl Editor {
 	fn refresh(&mut self) {
 		let cursor = self.buffer.cursor();
 		let text = self.buffer.text();
-		let mut picker = self.completion.as_mut().and_then(|completion| {
-			let suggestions = completion.suggest(text, cursor)?;
-			(!suggestions.items.is_empty()).then(|| Picker {
-				range:       clamp_completion_range(text, cursor, suggestions.range),
-				suggestions: suggestions.items,
-				selected:    0,
-				provided:    true,
+		let atoms = self.buffer.atom_ranges();
+		// A dropdown replaces its range on accept; a range that touches an
+		// atomic marker (a `<icon> #N` chip whose text merely looks like a
+		// trigger) would tear the unit, so no engine may open over one.
+		let clear_of_atoms = |range: &ops::Range<usize>| {
+			atoms
+				.iter()
+				.all(|&(start, end)| range.end <= start || range.start >= end)
+		};
+		let mut picker = self
+			.completion
+			.as_mut()
+			.and_then(|completion| {
+				let suggestions = completion.suggest(text, cursor)?;
+				(!suggestions.items.is_empty()).then(|| Picker {
+					range:       clamp_completion_range(text, cursor, suggestions.range),
+					suggestions: suggestions.items,
+					selected:    0,
+					provided:    true,
+				})
 			})
-		});
+			.filter(|picker| clear_of_atoms(&picker.range));
 		if picker.is_none() && self.options.emoji {
-			picker = emoji_picker(text, cursor);
+			picker = emoji_picker(text, cursor).filter(|picker| clear_of_atoms(&picker.range));
 		}
 		self.hint = self
 			.completion
@@ -3213,6 +3233,41 @@ mod tests {
 		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
 		assert!(editor.text().starts_with("value"), "{}", editor.text());
 	}
+
+	/// A `#N` chip marker looks like a `#<number>` reference trigger, but the
+	/// engine's range would tear the atom on accept: no dropdown opens over
+	/// it, and the same key still removes the whole chip.
+	#[test]
+	fn completion_never_opens_over_an_atomic_marker() {
+		struct HashRefs;
+		impl EditorCompletion for HashRefs {
+			fn suggest(&mut self, text: &str, cursor: usize) -> Option<Suggestions> {
+				let hash = text[..cursor].rfind('#')?;
+				let digits = &text[hash + 1..cursor];
+				(!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).then(|| {
+					Suggestions {
+						range: hash..cursor,
+						items: [Suggestion::new("pr://1 ", "pr #1")].into_iter().collect(),
+					}
+				})
+			}
+		}
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.set_completion(Box::new(HashRefs));
+		let chip = "\u{f15c} #1";
+		editor.insert_reference_group(&[(chip.to_owned(), "payload".to_owned())], " ");
+		assert_eq!(editor.text(), format!("{chip} "));
+		assert_eq!(editor.handle_key(Key::Backspace), EditOutcome::Changed);
+		assert_eq!(editor.text(), chip);
+		assert!(editor.picker().is_none(), "the chip's `#1` is not a reference token");
+		assert_eq!(editor.handle_key(Key::Backspace), EditOutcome::Changed);
+		assert_eq!(editor.text(), "");
+		// Ordinary text after the chip still completes.
+		editor.insert_reference_group(&[(chip.to_owned(), "payload".to_owned())], " ");
+		type_text(&mut editor, "#2");
+		assert!(editor.picker().is_some(), "a typed reference after the chip completes");
+	}
+
 	#[test]
 	fn command_frequency_breaks_equal_text_score_ties() {
 		let mut usage = HashMap::new();

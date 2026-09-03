@@ -15,7 +15,9 @@ use crate::{
 	Graphics, TerminalCaps, debug,
 	debug::ScreenSnapshot,
 	escape::esc,
-	frame::{Cell, CellContent, Color, Frame, LinkId, Size, Style, Underline, with_link_url},
+	frame::{
+		Cell, CellContent, Color, Frame, LinkId, RowMark, Size, Style, Underline, with_link_url,
+	},
 	imagereg,
 	iterm2::{Iterm2Image, Iterm2Viewport, iterm2_output},
 	kitty::{
@@ -1922,6 +1924,32 @@ fn emit_window_diff_rows(
 		}
 		let previous_y = previous_window.top.saturating_add(screen_y);
 		let next_y = next_window.top.saturating_add(screen_y);
+		// A zone-marked row is re-emitted whole so its OSC 133 markers
+		// bracket the full row: when its cells changed, or when the mark
+		// itself arrived on cells that did not.
+		if row_zone_marked(next, next_y) {
+			let marks_changed = !previous.base.row_mark(previous_y, RowMark::PromptStart)
+				&& next.base.row_mark(next_y, RowMark::PromptStart)
+				|| !previous.base.row_mark(previous_y, RowMark::PromptEnd)
+					&& next.base.row_mark(next_y, RowMark::PromptEnd);
+			let cells_changed = (0..width).any(|x| {
+				!cells_equal(
+					previous.cell_or(previous_y, x, &blank),
+					next.cell_or(next_y, x, &blank),
+					hyperlinks,
+				)
+			});
+			if marks_changed || cells_changed {
+				move_cursor_row(output, &mut cursor_row, screen_top.saturating_add(screen_y));
+				output.push('\r');
+				encode_row(output, next, next_y, graphics, hyperlinks);
+				output.push_str(RESET_STYLE);
+				active_style = Style::default();
+				stats.runs += 1;
+				stats.changed_cells += usize::from(width);
+			}
+			continue;
+		}
 		let mut x = 0;
 		while x < width {
 			if cells_equal(
@@ -2131,6 +2159,24 @@ fn encode_frame_row(
 	}
 }
 
+/// OSC 133 shell integration around a prompt zone (pi `user-message.ts`).
+///
+/// The zone is closed within the same paint: `133;B` latches a sticky
+/// `.input` cursor semantic in Ghostty (and cmux) that only a command
+/// marker clears, and a latched zone turns every left-click into
+/// synthesized arrow keys under `cursor-click-to-move`. `133;C` followed
+/// by `133;D;0` right after `133;B` clears it without grouping later
+/// output under the prompt.
+const OSC133_ZONE_START: &str = esc!(osc, "133;A", bel);
+const OSC133_ZONE_CLOSE: &str = esc!(osc, "133;B", bel, osc, "133;C", bel, osc, "133;D;0", bel);
+
+/// Whether document row `row` carries a zone mark. Like wrap joinability,
+/// a pure document property: overlay layers never move a zone.
+#[inline]
+fn row_zone_marked(frame: &ComposedFrame<'_>, row: u16) -> bool {
+	frame.base.row_mark(row, RowMark::PromptStart) || frame.base.row_mark(row, RowMark::PromptEnd)
+}
+
 fn encode_row(
 	output: &mut String,
 	frame: &ComposedFrame<'_>,
@@ -2139,6 +2185,9 @@ fn encode_row(
 	hyperlinks: bool,
 ) {
 	output.push_str(RESET_STYLE);
+	if frame.base.row_mark(row, RowMark::PromptStart) {
+		output.push_str(OSC133_ZONE_START);
+	}
 	let blank = Cell::blank(Style::default());
 	let mut active_style = Style::default();
 	let mut x = 0;
@@ -2173,6 +2222,9 @@ fn encode_row(
 		}
 	}
 	close_active_link(output, &mut active_style, hyperlinks);
+	if frame.base.row_mark(row, RowMark::PromptEnd) {
+		output.push_str(OSC133_ZONE_CLOSE);
+	}
 }
 
 #[allow(clippy::too_many_arguments, reason = "flat cell emission hot path")]
@@ -2378,7 +2430,7 @@ mod tests {
 		ConptyChunks, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES, OutputBacklogGuard,
 		RESET_HISTORY, Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END,
 	};
-	use crate::{Frame, Graphics, Size, Style, test_support::TerminalModel};
+	use crate::{Frame, Graphics, RowMark, Size, Style, test_support::TerminalModel};
 
 	fn frame(width: u16, lines: &[&str]) -> Frame {
 		let mut frame =
@@ -2424,6 +2476,63 @@ mod tests {
 		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
 		assert!(output.ends_with("\x1b[H\x1b[2J\x1b[3J"), "{output:?}");
 		assert!(!output.contains("\x1b[3J\x1b[2J"), "{output:?}");
+	}
+
+	#[test]
+	fn renderer_emits_osc133_around_marked_rows() {
+		const START: &str = "\x1b]133;A\x07";
+		const CLOSE: &str = "\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+		fn zone_order(output: &str) -> Option<(usize, usize)> {
+			Some((output.find(START)?, output.find(CLOSE)?))
+		}
+
+		// Viewport paint: the zone opens before the first bubble row and
+		// closes right after the last one, within the same paint.
+		let mut renderer = Renderer::new(Vec::new());
+		let mut bubble = frame(8, &["before", "hello", "world", "after"]);
+		bubble.mark_row(1, RowMark::PromptStart);
+		bubble.mark_row(2, RowMark::PromptEnd);
+		renderer.present(bubble.clone(), 4, &[]).unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
+		let (start, close) = zone_order(&output).expect("zone markers present");
+		let hello = output.find("hello").expect("first bubble row painted");
+		let world = output.find("world").expect("last bubble row painted");
+		assert!(start < hello && hello < world && world < close, "{output:?}");
+		assert_eq!(output.matches(START).count(), 1, "{output:?}");
+		assert_eq!(output.matches(CLOSE).count(), 1, "{output:?}");
+		assert!(!output.contains("\x1b]133;B\x07\x1b]133;B"), "{output:?}");
+		let mut terminal = TerminalModel::new(8, 4);
+		terminal.apply(&output);
+		assert_eq!(terminal.visible_rows(), ["before", "hello", "world", "after"]);
+
+		// Damage diff: a mark arriving on unchanged cells still re-emits the
+		// row with its markers.
+		let mut marked_more = bubble.clone();
+		marked_more.mark_row(3, RowMark::PromptEnd);
+		renderer
+			.present_damaged(&marked_more, &[(3, 4)], 4, &[])
+			.unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
+		assert!(output.contains(CLOSE), "{output:?}");
+		assert!(output.find("after").unwrap() < output.find(CLOSE).unwrap(), "{output:?}");
+		assert!(!output.contains(START), "unmarked rows are not re-emitted: {output:?}");
+
+		// History retirement: single-row frames carry their marks into
+		// scrollback with the same ordering.
+		let mut renderer = Renderer::new(Vec::new());
+		let viewport = frame(8, &["view"]);
+		let mut first = frame(8, &["hello"]);
+		first.mark_row(0, RowMark::PromptStart);
+		let mut last = frame(8, &["world"]);
+		last.mark_row(0, RowMark::PromptEnd);
+		renderer
+			.append_history_rows(&[first, last], 2, &viewport, 1, &[])
+			.unwrap();
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
+		let (start, close) = zone_order(&output).expect("zone markers in history append");
+		let hello = output.find("hello").unwrap();
+		let world = output.find("world").unwrap();
+		assert!(start < hello && hello < world && world < close, "{output:?}");
 	}
 
 	#[test]

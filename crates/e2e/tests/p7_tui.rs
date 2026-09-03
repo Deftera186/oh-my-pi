@@ -925,10 +925,12 @@ async fn chat_tui_drives_real_pty_tools_interrupt_resize_and_clean_quit() {
 	debug
 		.op("resize")
 		.unwrap_or_else(|error| panic!("resize injection failed: {error}"));
+	// At 32 rows the settled cards retire into native scrollback; the live
+	// card, band, and composer must survive the rebuild.
 	let resized = wait_snapshot(&mut debug, &raw_capture, "streaming resize", |snapshot| {
 		let surface = snapshot.combined();
-		surface.contains("Read scratch.txt")
-			&& surface.contains("The deterministic tool sequence is complete.")
+		surface.contains("sleep 30")
+			&& surface.contains("interrupt the next tool")
 			&& surface.contains(COMPOSER_PROMPT)
 	});
 	assert_surface(&resized, "resized");
@@ -1072,7 +1074,9 @@ async fn chat_tui_persists_thinking_blocks_across_turns_and_resume() {
 	assert!(second_journal.matches("event: msg.assistant.end@1").count() >= 2);
 	assert_journal_chain(&second_journal);
 
-	debug.keys("ctrl+c");
+	// pi: ctrl+c on an idle composer arms exit; a second press within the
+	// window quits.
+	debug.keys("ctrl+c ctrl+c");
 	drop(debug);
 	let before = process.before.clone();
 	let (status, raw, stdout, stderr, after) = process.wait(READY_TIMEOUT);
@@ -1108,7 +1112,7 @@ async fn chat_tui_persists_thinking_blocks_across_turns_and_resume() {
 	);
 	assert_journal_chain(&resumed_journal);
 
-	resume_debug.keys("ctrl+c");
+	resume_debug.keys("ctrl+c ctrl+c");
 	drop(resume_debug);
 	let resumed_before = resumed.before.clone();
 	let (resumed_status, resumed_bytes, resumed_stdout, resumed_stderr, resumed_after) =

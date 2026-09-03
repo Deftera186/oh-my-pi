@@ -469,6 +469,12 @@ fn parse_token(token: &str) -> Result<Key, String> {
 		"word-left" => Key::WordLeft,
 		"word-right" => Key::WordRight,
 		"word-delete" => Key::WordDelete,
+		"alt-up" | "restore-queue" => Key::RestoreQueue,
+		"copy-line" => Key::CopyLine,
+		"copy-prompt" => Key::CopyPrompt,
+		"paste" => Key::Paste,
+		"paste-raw" => Key::PasteRaw,
+		"plan-toggle" => Key::PlanToggle,
 		other => {
 			if let Some(number) = other.strip_prefix('f')
 				&& let Ok(number) = number.parse::<u8>()

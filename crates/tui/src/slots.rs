@@ -15,7 +15,9 @@ use crate::{
 	frame_text,
 };
 
-const APPEND_TEXT_ID: &str = "elastic-slots-append";
+/// Component id an append-only stream root must carry: [`Slots::append`]
+/// drives the block's text through `Ui::set_text` at this id.
+pub const STREAM_ID: &str = "elastic-slots-append";
 
 /// Stable, creation-ordered block identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -168,6 +170,10 @@ struct Block {
 	mode:        Mode,
 	state:       BlockState,
 	ui:          Option<Ui>,
+	/// Whether `ui` is a host-supplied stream root ([`Slots::open_with`])
+	/// rather than the engine's plain text leaf: its settled render, not a
+	/// preformatted copy of `text`, is what commits.
+	custom_root: bool,
 	text:        String,
 	rendered:    Vec<Arc<Frame>>,
 	commit_rows: Vec<Arc<Frame>>,
@@ -180,10 +186,31 @@ impl Block {
 			mode,
 			state: BlockState::Active,
 			ui: None,
+			custom_root: false,
 			text: String::new(),
 			rendered: Vec::new(),
 			commit_rows: Vec::new(),
 			emitted: 0,
+		}
+	}
+
+	fn stream_root(width: u16, ctx: UiContext) -> Ui {
+		Ui::from_root(
+			TextLeaf::new()
+				.with(Prop::Id, STREAM_ID)
+				.with(Prop::Reveal, true),
+			width,
+			ctx,
+		)
+	}
+
+	/// Settles a custom stream root — the reveal cursor jumps to the end —
+	/// so the frame it presents is the block's committed shape.
+	fn settle_root(&mut self) {
+		if let Some(ui) = &mut self.ui
+			&& self.custom_root
+		{
+			ui.set_prop(STREAM_ID, Prop::Reveal, false);
 		}
 	}
 }
@@ -259,6 +286,26 @@ impl Slots {
 		id
 	}
 
+	/// Opens a new active block presented by a host-supplied root.
+	///
+	/// An append-only root must contain a component with `id` =
+	/// [`STREAM_ID`] (a `<text>` or `<md>` carrying `reveal`): every
+	/// [`Slots::append`] sets that component's text to the block's whole
+	/// text, and [`Slots::finalize`] commits the root's settled rows.
+	pub fn open_with(&mut self, mode: Mode, root: impl IntoComponent) -> BlockId {
+		let id = self.open(mode);
+		let width = self.width;
+		let ctx = self.ctx.clone();
+		let block = self.block_mut(id);
+		block.ui = Some(Ui::from_root(root, width, ctx));
+		block.custom_root = true;
+		Self::render_block(width, block);
+		if mode == Mode::Mutable {
+			block.commit_rows.clone_from(&block.rendered);
+		}
+		id
+	}
+
 	/// Replaces a mutable active or finalized-but-uncommitted block snapshot.
 	///
 	/// Replacing a final whose prefix was physically delivered schedules an
@@ -272,6 +319,7 @@ impl Slots {
 		assert_eq!(block.mode, Mode::Mutable, "set requires a mutable block");
 		assert_ne!(block.state, BlockState::Committed, "committed blocks are immutable");
 		block.ui = Some(Ui::from_root(content, width, ctx));
+		block.custom_root = false;
 		block.text.clear();
 		Self::render_block(width, block);
 		block.commit_rows.clone_from(&block.rendered);
@@ -288,18 +336,41 @@ impl Slots {
 		let block = self.block_mut(id);
 		assert_eq!(block.mode, Mode::AppendOnly, "append requires an append-only block");
 		assert_eq!(block.state, BlockState::Active, "append requires an active block");
+		let first = block.text.is_empty() && !text.is_empty();
 		block.text.push_str(text);
-		let ui = block.ui.get_or_insert_with(|| {
-			Ui::from_root(
-				TextLeaf::new()
-					.with(Prop::Id, APPEND_TEXT_ID)
-					.with(Prop::Reveal, true),
-				width,
-				ctx,
-			)
-		});
-		ui.set_text(APPEND_TEXT_ID, Str::from(block.text.as_str()));
+		let ui = block
+			.ui
+			.get_or_insert_with(|| Block::stream_root(width, ctx));
+		// A root built with its opening text already in place reports no
+		// change; the id lookup is what proves the stream child exists.
+		let changed = ui.set_text(STREAM_ID, Str::from(block.text.as_str()));
+		debug_assert!(
+			changed || !first || ui.invalidate(STREAM_ID),
+			"an append-only stream root must contain a component with id `{STREAM_ID}`",
+		);
 		Self::render_block(width, block);
+	}
+
+	/// Retires an active block that vanished before it finalized.
+	///
+	/// Nothing it never emitted enters history: with no rows acknowledged
+	/// it commits empty, so later blocks are not stalled behind it;
+	/// otherwise it finalizes on exactly the emitted prefix — committed
+	/// rows are never rewritten.
+	pub fn discard(&mut self, id: BlockId) {
+		self.rollback_pending();
+		let block = self.block_mut(id);
+		assert_eq!(block.state, BlockState::Active, "only active blocks discard");
+		if block.emitted == 0 {
+			block.commit_rows.clear();
+			block.state = BlockState::Committed;
+		} else {
+			// Only an append-only stream emits while active, and it emits
+			// from its rendered rows: those acknowledged are the block.
+			block.commit_rows = block.rendered[..block.emitted.min(block.rendered.len())].to_vec();
+			block.state = BlockState::Finalized;
+		}
+		self.advance_frontier();
 	}
 
 	/// Seals a block. Finalization itself never writes history.
@@ -311,16 +382,16 @@ impl Slots {
 		assert_eq!(block.state, BlockState::Active, "only active blocks finalize");
 		if block.mode == Mode::AppendOnly {
 			if block.ui.is_none() {
-				block.ui = Some(Ui::from_root(
-					TextLeaf::new()
-						.with(Prop::Id, APPEND_TEXT_ID)
-						.with(Prop::Reveal, true),
-					width,
-					ctx.clone(),
-				));
+				block.ui = Some(Block::stream_root(width, ctx.clone()));
 				Self::render_block(width, block);
 			}
-			block.commit_rows = Self::settled_text_rows(width, block.text.as_str(), ctx);
+			if block.custom_root {
+				block.settle_root();
+				Self::render_block(width, block);
+				block.commit_rows.clone_from(&block.rendered);
+			} else {
+				block.commit_rows = Self::settled_text_rows(width, block.text.as_str(), ctx);
+			}
 		}
 		block.state = BlockState::Finalized;
 		self.advance_frontier();
@@ -419,6 +490,13 @@ impl Slots {
 		self.block(id).emitted
 	}
 
+	/// Rows the block's retained root currently renders, acknowledged or
+	/// not: a host shows rows `[emitted..stream_rows)` of a mid-stream
+	/// append-only block in its live viewport.
+	pub fn stream_rows(&self, id: BlockId) -> usize {
+		self.block(id).rendered.len()
+	}
+
 	/// Current terminal width.
 	pub const fn width(&self) -> u16 {
 		self.width
@@ -469,7 +547,8 @@ impl Slots {
 				ui.resize(width);
 			}
 			Self::render_block(width, block);
-			if block.mode == Mode::Mutable {
+			if block.mode == Mode::Mutable || (block.custom_root && block.state != BlockState::Active)
+			{
 				block.commit_rows.clone_from(&block.rendered);
 			} else if block.state != BlockState::Active {
 				block.commit_rows =
@@ -623,6 +702,11 @@ impl Slots {
 
 	fn advance_frontier(&mut self) {
 		while let Some(block) = self.blocks.get_mut(self.frontier) {
+			// A discarded block committed empty ahead of the frontier.
+			if block.state == BlockState::Committed {
+				self.frontier += 1;
+				continue;
+			}
 			if block.state != BlockState::Finalized || block.emitted != block.commit_rows.len() {
 				break;
 			}
@@ -709,5 +793,121 @@ impl Slots {
 	fn id(index: usize) -> BlockId {
 		let number = u32::try_from(index + 1).expect("slot block identity overflow");
 		BlockId(NonZeroU32::new(number).expect("block identities start at one"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{anim, components::Markdown};
+
+	fn history(slots: &Slots) -> Vec<(u32, String)> {
+		slots
+			.logical_history()
+			.map(|row| (row.block().get(), row.text().to_owned()))
+			.collect()
+	}
+
+	#[test]
+	fn append_only_block_with_markdown_root_streams_stable_rows_and_commits_settled_rows() {
+		const SOURCE: &str = "# Title\n\nalpha beta gamma delta epsilon zeta eta theta\n\n- one \
+		                      two three\n- four five six\n\n**bold** tail line\n";
+		let width = 24;
+		let mut slots = Slots::new(width, 2, ResizePolicy::Rebuild);
+		let id = slots.open_with(
+			Mode::AppendOnly,
+			Markdown::new()
+				.with(Prop::Id, STREAM_ID)
+				.with(Prop::Reveal, "264ms"),
+		);
+		slots.append(id, &SOURCE[..10]);
+		slots.append(id, &SOURCE[10..]);
+		assert_eq!(slots.stream_rows(id), 0, "the cursor arms before revealing anything");
+
+		let mut streamed = 0;
+		let mut now = Duration::ZERO;
+		for _ in 0..400 {
+			now += anim::FRAME + Duration::from_millis(1);
+			slots.tick(now);
+			let plan = slots.plan();
+			assert!(!plan.rebuild(), "streaming never resets the history epoch");
+			slots.commit(plan, Delivered::All);
+			streamed = slots.emitted(id);
+			assert!(streamed <= slots.stream_rows(id));
+		}
+		assert!(streamed > 0, "rows past the viewport are emitted mid-stream");
+		let mid_stream = history(&slots);
+
+		slots.finalize(id);
+		let plan = slots.plan();
+		assert!(!plan.rebuild(), "finalizing a settled stream never rebuilds");
+		slots.commit(plan, Delivered::All);
+		assert_eq!(slots.state(id), BlockState::Committed);
+		let committed = history(&slots);
+		assert!(committed.starts_with(&mid_stream), "emitted rows are a prefix of the block");
+
+		let fresh = Ui::from_root(Markdown::text_of(SOURCE), width, UiContext::default());
+		let expected = (0..fresh.frame().size().height)
+			.map(|row| (id.get(), frame_text(&one_row(width, fresh.frame(), row))))
+			.collect::<Vec<_>>();
+		assert_eq!(committed, expected, "committed rows equal a fresh full render");
+	}
+
+	fn one_row(width: u16, frame: &Frame, row: u16) -> Frame {
+		let mut one = Frame::new(Size::new(width, 1));
+		one.blit(frame, row, 1, 0, 0);
+		one
+	}
+
+	#[test]
+	fn discarded_block_writes_nothing_and_unblocks_the_frontier() {
+		let mut slots = Slots::new(16, 2, ResizePolicy::Rebuild);
+		let a = slots.open(Mode::AppendOnly);
+		let b = slots.open(Mode::AppendOnly);
+		let c = slots.open(Mode::AppendOnly);
+		slots.append(a, "a-row\n");
+		slots.finalize(a);
+		slots.append(b, "b-row\n");
+		slots.discard(b);
+		assert_eq!(slots.state(b), BlockState::Committed);
+		slots.append(c, "c-row\n");
+		slots.finalize(c);
+
+		let plan = slots.plan();
+		assert_eq!(
+			plan
+				.rows()
+				.iter()
+				.map(|row| row.logical().text().to_owned())
+				.collect::<Vec<_>>(),
+			["a-row", "c-row"],
+		);
+		slots.commit(plan, Delivered::All);
+		assert_eq!(history(&slots), [(a.get(), "a-row".to_owned()), (c.get(), "c-row".to_owned())]);
+		assert_eq!(slots.state(c), BlockState::Committed);
+	}
+
+	#[test]
+	fn discarding_a_partly_emitted_stream_keeps_exactly_the_emitted_prefix() {
+		let mut slots = Slots::new(16, 2, ResizePolicy::Rebuild);
+		let id = slots.open(Mode::AppendOnly);
+		slots.append(id, "one\ntwo\nthree\nfour\n");
+		let mut now = Duration::ZERO;
+		while slots.emitted(id) == 0 {
+			now += anim::FRAME + Duration::from_millis(1);
+			assert!(now < Duration::from_secs(5), "rows never left the viewport");
+			slots.tick(now);
+			let plan = slots.plan();
+			slots.commit(plan, Delivered::All);
+		}
+		let emitted = slots.emitted(id);
+		let before = history(&slots);
+		slots.discard(id);
+		assert_eq!(slots.state(id), BlockState::Committed);
+		let plan = slots.plan();
+		assert!(plan.rows().is_empty(), "a discarded stream stages no more rows");
+		slots.commit(plan, Delivered::All);
+		assert_eq!(history(&slots), before);
+		assert_eq!(slots.emitted(id), emitted);
 	}
 }

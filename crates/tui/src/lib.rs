@@ -78,8 +78,8 @@ pub use editcore::{
 	SlashCommands, Suggestion, SuggestionDisplay, SuggestionList, Suggestions, TabAction, VisualRow,
 };
 pub use frame::{
-	Cell, CellContent, Color, Decor, DecorFill, DecorKind, Frame, Gradient, LinkId, Rect, Size,
-	Style, StyleSpec, Underline, with_link_url,
+	Cell, CellContent, Color, Decor, DecorFill, DecorKind, Frame, Gradient, LinkId, Rect, RowMark,
+	Size, Style, StyleSpec, Underline, with_link_url,
 };
 pub use graphics::{
 	NotifyProtocol, ProbeParser, ProbeResults, TerminalCaps, TerminalId, TerminalPlatform, detect,
@@ -91,6 +91,8 @@ pub use imagefmt::ImageFormat;
 pub use imagereg::bytes as image_bytes;
 /// Registers immutable renderer-local image bytes under an opaque TML source.
 pub use imagereg::register as register_image_source;
+/// Installs an application resolver for one `<img src>` URI scheme.
+pub use imagereg::{SourceResolver as ImageSourceResolver, register_scheme as register_image_scheme};
 pub use input::{
 	Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,

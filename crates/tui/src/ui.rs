@@ -3185,6 +3185,33 @@ mod tests {
 	}
 
 	#[test]
+	fn text_zone_prompt_marks_its_first_and_last_rows() {
+		use crate::RowMark;
+
+		let ui = Ui::from_markup(
+			r#"<col><text>above</text><text zone=prompt pad="1 1">hello world again</text><text>below</text></col>"#,
+			8,
+			UiContext::default(),
+		)
+		.unwrap();
+		let frame = ui.frame();
+		let rows = frame_text(&ui);
+		assert_eq!(ui.height(), 7, "{rows:?}");
+		assert!(frame.row_mark(1, RowMark::PromptStart), "top padding row opens: {rows:?}");
+		assert!(frame.row_mark(5, RowMark::PromptEnd), "bottom padding row closes: {rows:?}");
+		for row in [0, 2, 3, 4, 6] {
+			assert!(!frame.row_mark(row, RowMark::PromptStart), "row {row}: {rows:?}");
+		}
+		for row in [0, 1, 2, 3, 4, 6] {
+			assert!(!frame.row_mark(row, RowMark::PromptEnd), "row {row}: {rows:?}");
+		}
+
+		let plain = Ui::from_markup(r#"<text zone=none>hi</text>"#, 8, UiContext::default()).unwrap();
+		assert!(!plain.frame().row_mark(0, RowMark::PromptStart));
+		assert!(!plain.frame().row_mark(0, RowMark::PromptEnd));
+	}
+
+	#[test]
 	fn boxes_are_transparent_until_bg_is_named() {
 		use crate::Color;
 

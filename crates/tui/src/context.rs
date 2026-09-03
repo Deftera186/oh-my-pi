@@ -68,35 +68,7 @@ pub struct Grid {
 	pub bottom: (char, char, char),
 }
 
-/// Semantic prefixes for diff lines.
-#[derive(Clone, Copy, Debug)]
-pub struct DiffPrefixes {
-	/// Header or file metadata prefix.
-	pub header:       &'static str,
-	/// Unchanged context line prefix.
-	pub context:      &'static str,
-	/// Added line prefix.
-	pub add:          &'static str,
-	/// Removed line prefix.
-	pub remove:       &'static str,
-	/// Continuation line prefix for wrapped text.
-	pub continuation: &'static str,
-}
-
 impl Charset {
-	/// Prefixes diff lines for this terminal's capability tier.
-	pub(crate) const fn diff_prefixes(self) -> DiffPrefixes {
-		match self {
-			Self::Unicode | Self::NerdFont | Self::Ascii => DiffPrefixes {
-				header:       "  ",
-				context:      "  ",
-				add:          "+ ",
-				remove:       "- ",
-				continuation: "  ",
-			},
-		}
-	}
-
 	/// Resolves a semantic icon through this terminal's capability tier.
 	pub const fn icon(self, icon: Icon) -> &'static str {
 		icon.glyph(self)
@@ -245,7 +217,7 @@ impl Charset {
 	}
 
 	/// Progress bar `(filled, empty)`.
-	pub(crate) const fn progress(self) -> (&'static str, &'static str) {
+	pub const fn progress(self) -> (&'static str, &'static str) {
 		match self {
 			Self::Ascii => ("#", "."),
 			_ => ("█", "░"),
@@ -306,6 +278,33 @@ impl Charset {
 		match self {
 			Self::Ascii => Frames::SPINNER_ASCII,
 			_ => Frames::SPINNER,
+		}
+	}
+
+	/// Tool-status spinner frames for this tier: pi's `status` spinner set,
+	/// advancing every 80 ms (`SPINNER_GLYPH_ADVANCE_MS`) on the shared clock
+	/// so every live tool card shows the same glyph at the same instant.
+	pub const fn status_spinner(self) -> Frames {
+		const STEP: Duration = Duration::from_millis(80);
+		match self {
+			Self::Ascii => Frames::new(&["|", "/", "-", "\\"], STEP),
+			Self::Unicode => Frames::new(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"], STEP),
+			Self::NerdFont => Frames::new(
+				&[
+					"\u{f1456}", "\u{f144b}", "\u{f144c}", "\u{f144d}", "\u{f144e}", "\u{f144f}",
+					"\u{f1450}", "\u{f1451}", "\u{f1452}", "\u{f1453}", "\u{f1454}", "\u{f1455}",
+				],
+				STEP,
+			),
+		}
+	}
+
+	/// Starburst facets for the breathing thinking pulse (pi
+	/// `THINKING_DOTS_FRAMES`): eight single-cell glyphs cycled in place.
+	pub const fn starburst(self) -> &'static [&'static str; 8] {
+		match self {
+			Self::Ascii => &["*", "+", "x", "#", "*", "+", "x", "#"],
+			_ => &["✻", "✼", "❉", "❊", "✺", "✹", "✸", "✶"],
 		}
 	}
 

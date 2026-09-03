@@ -712,6 +712,19 @@ impl Cell {
 	}
 }
 
+/// A semantic mark on one frame row, materialized by the terminal renderer
+/// as an OSC 133 shell-integration zone around the row's cells (pi
+/// `user-message.ts`). Marks are row metadata like soft-wrap flags: they
+/// ride along with single-row blits and never touch cell content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowMark {
+	/// First row of a prompt zone: `OSC 133;A` precedes the row.
+	PromptStart,
+	/// Last row of a prompt zone: `OSC 133;B`, `133;C`, and `133;D;0`
+	/// follow the row, closing the zone within the same paint.
+	PromptEnd,
+}
+
 /// A complete declarative terminal viewport.
 ///
 /// Each frame owns a fixed cell grid. Wide graphemes reserve continuation
@@ -729,6 +742,10 @@ pub struct Frame {
 	/// Soft row boundaries: bit `y` set means row `y` wraps onto row
 	/// `y + 1` mid-word, forming one logical line broken only by width.
 	soft_wraps:      SmolBitmap,
+	/// Rows carrying [`RowMark::PromptStart`].
+	prompt_starts:   SmolBitmap,
+	/// Rows carrying [`RowMark::PromptEnd`].
+	prompt_ends:     SmolBitmap,
 }
 
 impl Frame {
@@ -744,6 +761,8 @@ impl Frame {
 			source_id: NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
 			revision: 0,
 			soft_wraps: SmolBitmap::new(),
+			prompt_starts: SmolBitmap::new(),
+			prompt_ends: SmolBitmap::new(),
 		}
 	}
 
@@ -768,6 +787,9 @@ impl Frame {
 		// drop them so a later regrowth cannot resurrect stale joins.
 		let first_invalid = usize::from(height.saturating_sub(1));
 		self.soft_wraps.retain(|index| index < first_invalid);
+		let rows = usize::from(height);
+		self.prompt_starts.retain(|index| index < rows);
+		self.prompt_ends.retain(|index| index < rows);
 		self.size.height = height;
 		if self.cursor.is_some_and(|(_, y)| y >= height) {
 			self.cursor = None;
@@ -801,6 +823,44 @@ impl Frame {
 	#[inline]
 	pub fn soft_wrap(&self, y: u16) -> bool {
 		y.saturating_add(1) < self.size.height && self.soft_wraps.get(usize::from(y))
+	}
+
+	/// Marks row `y` with a semantic zone boundary. Rows outside the frame
+	/// are ignored. Marks are metadata: they do not change cell content.
+	pub fn mark_row(&mut self, y: u16, mark: RowMark) {
+		if y >= self.size.height {
+			return;
+		}
+		self.touch();
+		self.marks_mut(mark).insert(usize::from(y));
+	}
+
+	/// Whether row `y` carries `mark`.
+	#[inline]
+	pub fn row_mark(&self, y: u16, mark: RowMark) -> bool {
+		y < self.size.height && self.marks(mark).get(usize::from(y))
+	}
+
+	const fn marks(&self, mark: RowMark) -> &SmolBitmap {
+		match mark {
+			RowMark::PromptStart => &self.prompt_starts,
+			RowMark::PromptEnd => &self.prompt_ends,
+		}
+	}
+
+	const fn marks_mut(&mut self, mark: RowMark) -> &mut SmolBitmap {
+		match mark {
+			RowMark::PromptStart => &mut self.prompt_starts,
+			RowMark::PromptEnd => &mut self.prompt_ends,
+		}
+	}
+
+	/// Drops every row mark on rows `[top, bottom)`.
+	fn clear_row_marks(&mut self, top: u16, bottom: u16) {
+		for index in usize::from(top)..usize::from(bottom.min(self.size.height)) {
+			self.prompt_starts.set(index, false);
+			self.prompt_ends.set(index, false);
+		}
 	}
 
 	#[inline]
@@ -873,6 +933,8 @@ impl Frame {
 		self.decors.clear();
 		self.noselect.clear();
 		self.soft_wraps.clear();
+		self.prompt_starts.clear();
+		self.prompt_ends.clear();
 	}
 
 	/// Fills a clipped rectangle with styled blanks.
@@ -893,6 +955,11 @@ impl Frame {
 		// Blanking any part of a row invalidates its exact joinability;
 		// painters re-flag when they redraw.
 		self.clear_soft_wraps_touching(top, bottom);
+		// A full-width blank retires the row's zone marks the same way;
+		// a partial blank keeps them, since the marked content survives.
+		if left == 0 && right == self.size.width {
+			self.clear_row_marks(top, bottom);
+		}
 
 		let blank = Cell::blank(style);
 		for y in top..bottom {
@@ -1127,6 +1194,8 @@ impl Frame {
 		self.size == other.size
 			&& self.cursor == other.cursor
 			&& self.soft_wraps == other.soft_wraps
+			&& self.prompt_starts == other.prompt_starts
+			&& self.prompt_ends == other.prompt_ends
 			&& self.cells == other.cells
 	}
 
@@ -1142,6 +1211,8 @@ impl Frame {
 		let other_start = usize::from(other_row) * width;
 		self.cells[start..start + width] == other.cells[other_start..other_start + width]
 			&& self.soft_wrap(row) == other.soft_wrap(other_row)
+			&& self.row_mark(row, RowMark::PromptStart) == other.row_mark(other_row, RowMark::PromptStart)
+			&& self.row_mark(row, RowMark::PromptEnd) == other.row_mark(other_row, RowMark::PromptEnd)
 	}
 
 	/// Copies one row's cells from `src` (same width required). The
@@ -1165,6 +1236,11 @@ impl Frame {
 		if self.soft_wraps != src.soft_wraps {
 			self.touch();
 			self.soft_wraps.clone_from(&src.soft_wraps);
+		}
+		if self.prompt_starts != src.prompt_starts || self.prompt_ends != src.prompt_ends {
+			self.touch();
+			self.prompt_starts.clone_from(&src.prompt_starts);
+			self.prompt_ends.clone_from(&src.prompt_ends);
 		}
 	}
 
@@ -1277,10 +1353,24 @@ impl Frame {
 		// boundaries; anything else conservatively hardens the touched
 		// rows, since exact joinability cannot survive a partial rewrite.
 		self.clear_soft_wraps_touching(dst_y, dst_y.saturating_add(copied));
-		if dst_x == 0 && width == self.size.width && width == src.size.width {
+		let full_width = dst_x == 0 && width == self.size.width && width == src.size.width;
+		if full_width {
 			for offset in 0..copied.saturating_sub(1) {
 				if src.soft_wrap(src_top.saturating_add(offset)) {
 					self.set_soft_wrap(dst_y.saturating_add(offset));
+				}
+			}
+			// A full-width copy replaces the rows' zone marks outright.
+			self.clear_row_marks(dst_y, dst_y.saturating_add(copied));
+		}
+		// Zone marks are row metadata, so every copied row carries them —
+		// including the single-row blits that retire history.
+		for offset in 0..copied {
+			let from_y = src_top.saturating_add(offset);
+			let to_y = dst_y.saturating_add(offset);
+			for mark in [RowMark::PromptStart, RowMark::PromptEnd] {
+				if src.row_mark(from_y, mark) {
+					self.mark_row(to_y, mark);
 				}
 			}
 		}
@@ -1393,7 +1483,9 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
-	use super::{CellContent, Color, Decor, DecorFill, DecorKind, Frame, Rect, Size, Style};
+	use super::{
+		CellContent, Color, Decor, DecorFill, DecorKind, Frame, Rect, RowMark, Size, Style,
+	};
 	use crate::{
 		context::JamoWidth,
 		rich::{jamo_width, set_jamo_width},
@@ -1581,6 +1673,47 @@ mod tests {
 		partial.set_soft_wrap(1);
 		partial.blit(&source, 0, 3, 1, 1);
 		assert!(!partial.soft_wrap(1), "an offset copy hardens the rows it rewrites");
+	}
+
+	#[test]
+	fn prompt_zone_marks_first_and_last_rows() {
+		let mut frame = Frame::new(Size::new(4, 5));
+		frame.mark_row(1, RowMark::PromptStart);
+		frame.mark_row(3, RowMark::PromptEnd);
+		frame.mark_row(9, RowMark::PromptEnd);
+		assert!(frame.row_mark(1, RowMark::PromptStart));
+		assert!(!frame.row_mark(1, RowMark::PromptEnd));
+		assert!(frame.row_mark(3, RowMark::PromptEnd));
+		assert!(!frame.row_mark(9, RowMark::PromptEnd), "marks outside the frame are ignored");
+
+		// Single-row blits (history retirement) carry the marks with the row.
+		let mut start = Frame::new(Size::new(4, 1));
+		start.blit(&frame, 1, 1, 0, 0);
+		assert!(start.row_mark(0, RowMark::PromptStart));
+		assert!(!start.row_mark(0, RowMark::PromptEnd));
+		let mut end = Frame::new(Size::new(4, 1));
+		end.blit(&frame, 3, 1, 0, 0);
+		assert!(end.row_mark(0, RowMark::PromptEnd));
+		let mut middle = Frame::new(Size::new(4, 1));
+		middle.mark_row(0, RowMark::PromptStart);
+		middle.blit(&frame, 2, 1, 0, 0);
+		assert!(!middle.row_mark(0, RowMark::PromptStart), "a full-width copy replaces marks");
+
+		// Row equality sees marks so damage diffing re-emits a marked row.
+		let plain = Frame::new(Size::new(4, 5));
+		assert!(!frame.row_equals(1, &plain, 1));
+		assert!(frame.row_equals(2, &plain, 2));
+
+		// A full-width fill retires the marks; clear drops them all.
+		frame.fill(Rect::new(0, 1, 4, 1), Style::default());
+		assert!(!frame.row_mark(1, RowMark::PromptStart));
+		frame.fill(Rect::new(1, 3, 2, 1), Style::default());
+		assert!(frame.row_mark(3, RowMark::PromptEnd), "a partial fill keeps the row's mark");
+		frame.resize_height(3, Style::default());
+		assert!(!frame.row_mark(3, RowMark::PromptEnd), "shrinking drops stale marks");
+		frame.mark_row(0, RowMark::PromptStart);
+		frame.clear(Style::default());
+		assert!(!frame.row_mark(0, RowMark::PromptStart));
 	}
 
 	#[test]

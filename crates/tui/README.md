@@ -414,6 +414,16 @@ A terminal image with a cell-rendered fallback.
 - **Source:** `src` is a filesystem path to PNG or binary P6 PPM data. `trim` crops fully transparent margins before cell sampling, keeping padded logos visible as tiny thumbnails.
 - **Graphics:** `UiContext::graphics` selects cells, sixel, Kitty placeholders, Kitty direct placements, or iTerm2. For protocol images, pair `Img::kitty(id, rows, cols)` with `Renderer::register_image`.
 
+#### `<diff>`
+
+A unified diff painted the way pi's transcript paints tool edits.
+
+- **Content:** Diff source, one row per line. `+`/`-`/space markers may carry a canonical `123|` or legacy `123 ` line-number gutter (`DiffLine::parse`); `!` rows are diagnostics; hunk headers and other unmarked rows stay verbatim; blank or `...` rows become a gap marker.
+- **Props:** Shared; `path`; `context`; `max-rows`; `overflow`.
+- **Gutter:** Numbered rows reserve at least three digits (`  -88│`), so a streaming diff never reflows rows it already painted; a number repeated by the next row is blanked. Unnumbered rows keep the bare marker.
+- **Emphasis:** A single removed row followed by a single added row is word-diffed and the changed tokens paint in reverse video; leading indentation is never emphasized. Leading tabs and spaces render as dim `→`/`·` glyphs (`diff-indent-tab`, `diff-indent-space`); interior tabs expand to three cells.
+- **Highlighting:** `path` infers a language from the extension (or bare file name) and syntax-highlights context rows; added and removed rows keep their semantic color.
+
 #### `DiffPane` — Rust-built interactive source diff
 
 `components::DiffPane` presents a `DiffDocument::build(old, new, path, options)` as split,
@@ -725,6 +735,7 @@ Runtime markup inherits `fg`, text-style flags, and `truncate` into descendants.
 | `required` | Flag | Wizard validation for an ID-bearing value component |
 | `match` | Anchored simple pattern | Wizard validation after trimming nonempty text |
 | `src` | Filesystem path | PNG or P6 PPM image source |
+| `path` | Source file path | `<diff>` language inference for context-row syntax highlighting |
 | `icon` | Icon name | Callout leading icon; runtime `<icon>` name |
 | `badge` | String | Compact callout header badge |
 | `submit` | Flag | Submit button or submitting wizard |

@@ -603,10 +603,12 @@ impl Props {
 			},
 			Prop::Match => self.match_pattern.as_ref(),
 			Prop::Src => self.src.as_ref(),
+			Prop::Path => self.path.as_ref(),
 			Prop::Icon => self.icon.as_ref(),
 			Prop::Badge => self.badge.as_ref(),
 			Prop::Placeholder => self.placeholder.as_ref(),
 			Prop::Status => self.status.as_ref(),
+			Prop::Zone => self.zone.as_ref(),
 			_ => None,
 		}
 	}

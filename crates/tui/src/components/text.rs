@@ -278,6 +278,16 @@ impl TextLeaf {
 	pub(crate) const fn content(&self) -> &Str {
 		&self.text
 	}
+
+	/// Whether the leaf shows all of its text: no `reveal`, or a cursor
+	/// that has caught up with the current text.
+	pub fn reveal_settled(&self) -> bool {
+		self.props.reveal().is_none()
+			|| self
+				.reveal
+				.as_deref()
+				.is_some_and(|reveal| reveal.covers(&self.text))
+	}
 }
 
 /// Reveal bookkeeping for one leaf: the pacing cursor plus grapheme-cluster
@@ -286,7 +296,7 @@ impl TextLeaf {
 /// those clusters but never earlier ones — so each streamed chunk and each
 /// cursor step re-segments only the suffix it touched.
 #[derive(Default)]
-struct RevealState {
+pub(crate) struct RevealState {
 	pace:        anim::Reveal,
 	/// The text the memos below describe (O(1) clone of the leaf's text).
 	seen:        Str,
@@ -306,7 +316,7 @@ impl RevealState {
 	/// Reconciles the memos with the leaf's current text: an extension
 	/// recounts from the final counted cluster, anything else recounts in
 	/// full and restarts the cursor.
-	fn sync(&mut self, text: &Str) {
+	pub(crate) fn sync(&mut self, text: &Str) {
 		if self.seen == *text {
 			return;
 		}
@@ -333,7 +343,7 @@ impl RevealState {
 	/// Advances the cursor at `now` and returns the byte end of the shown
 	/// prefix. Always re-walks from the final shown cluster, so an append
 	/// that extended it is picked up even when the cursor held still.
-	fn advance(&mut self, now: Duration, horizon: Duration) -> usize {
+	pub(crate) fn advance(&mut self, now: Duration, horizon: Duration) -> usize {
 		let units = self.pace.advance(now, self.total, horizon);
 		if units >= self.total {
 			self.shown_units = self.total;
@@ -369,9 +379,15 @@ impl RevealState {
 		self.shown_end
 	}
 
-	/// Whether the shown prefix covers the whole text.
-	const fn is_settled(&self) -> bool {
+	/// Whether the shown prefix covers the whole synced text.
+	pub(crate) const fn is_settled(&self) -> bool {
 		self.shown_units >= self.total
+	}
+
+	/// Whether the shown prefix covers all of `text` — settled, and no
+	/// unsynced append is waiting for the next render.
+	pub(crate) fn covers(&self, text: &Str) -> bool {
+		self.is_settled() && self.seen == *text
 	}
 }
 

@@ -10,6 +10,7 @@ adhesive-bandage	object.adhesiveBandage	bandg	🩹	
 admin	user.admin	admin	👑	
 admission-ticket	object.admissionTicket	tkt	🎟	
 advisor	icon.advisor	(adv)	👁	
+advisor-closed	icon.advisorClosed	(adv)	🙈	
 agents	icon.agents	AG	👥	
 airplane	object.airplane	plane	✈	
 airplane-arrival	object.airplaneArrival	<fly	🛬	
@@ -247,6 +248,9 @@ desktop	device.desktop	desk	🖥	
 diamond-dot	object.diamondDot	<.>	💠	
 diamond-suit	object.diamondSuit	<>	♦	
 diff	git.diff	diff	±	
+diff-gap	diff.gap	...	…	…
+diff-indent-space	diff.indentSpace	.	·	·
+diff-indent-tab	diff.indentTab	>	→	→
 dim-button-five	device.dimButtonFive	dim	🔅	󰃞
 disabled	status.disabled	[\s]	⦸	
 divide-sign	object.divideSign	/	➗	

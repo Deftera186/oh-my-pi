@@ -20,7 +20,7 @@ use crate::{
 	anim::{self, Easing, Lerp, Tween},
 	components::{Markdown, hr::truncate_to_width},
 	context::UiContext,
-	frame::{Color, Decor, DecorFill, DecorKind, Frame, Gradient, Rect, Style},
+	frame::{Color, Decor, DecorFill, DecorKind, Frame, Gradient, Rect, RowMark, Style},
 	input::{Key, Mods, Mouse, UiEvent},
 	markup::{Align, Border, Dim},
 	props::{Prop, PropValue, Props},
@@ -401,6 +401,26 @@ impl Cached {
 		if self.comp.props().noselect() {
 			// The whole chrome opts out of host text selection.
 			pc.frame.push_noselect(chrome);
+		}
+		if self
+			.comp
+			.props()
+			.str_of(Prop::Zone)
+			.is_some_and(|zone| zone.as_str() == "prompt")
+			&& chrome.height > 0
+		{
+			// The chrome's first and last painted rows bracket an OSC 133
+			// prompt zone (pi `user-message.ts`); rows past the paint clip
+			// are not on screen, so the zone closes on the last visible one.
+			let bottom = chrome
+				.y
+				.saturating_add(chrome.height)
+				.min(pc.clip)
+				.min(pc.frame.size().height);
+			if chrome.y < bottom {
+				pc.frame.mark_row(chrome.y, RowMark::PromptStart);
+				pc.frame.mark_row(bottom - 1, RowMark::PromptEnd);
+			}
 		}
 		if risen > 0 {
 			paint_lift_shadow(pc, chrome, rect);

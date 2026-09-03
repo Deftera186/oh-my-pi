@@ -1983,6 +1983,68 @@ mod tests {
 	}
 
 	#[test]
+	fn orphan_closing_fence_before_heading_is_repaired() {
+		let source = Str::new(
+			"Latency: 1,240 ms\n```\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| api | 1/1 |",
+		);
+		assert_eq!(
+			repair_orphan_closing_fence(&source),
+			"Latency: 1,240 ms\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| api | 1/1 |",
+		);
+		let rows = plain(source.as_str(), 80);
+		assert!(rows.iter().any(|row| row.contains("Status")), "heading lost: {rows:?}");
+		assert!(!rows.iter().any(|row| row.contains("```")), "fence rendered literally: {rows:?}");
+	}
+
+	#[test]
+	fn orphan_fence_before_table_is_repaired() {
+		let source =
+			Str::new("Results below\n```\n| Name | Value |\n|:---|---:|\n| a | 1 |\n\n## Summary\nDone");
+		assert_eq!(
+			repair_orphan_closing_fence(&source),
+			"Results below\n| Name | Value |\n|:---|---:|\n| a | 1 |\n\n## Summary\nDone",
+		);
+		let rows = plain(source.as_str(), 80);
+		assert!(!rows.iter().any(|row| row.contains("|:---|")), "delimiter stayed literal: {rows:?}");
+		// Without the heading the shape is ambiguous and pi keeps the fence.
+		let table_only = Str::new("Results below\n```\n| Name | Value |\n|:---|---:|\n| a | 1 |");
+		assert_eq!(repair_orphan_closing_fence(&table_only), table_only);
+	}
+
+	#[test]
+	fn real_closing_fence_is_kept() {
+		for source in [
+			// A matched pair is never an orphan.
+			"```rust\nlet x = 1;\n```\n\n### After\n\n| a | b |\n| --- | --- |",
+			// An opener with an info string is a code block, not an orphan.
+			"intro\n```yaml\n### key\n\n| a | b |\n| --- | --- |",
+			// A fence introduced by a colon or a source intro is intentional.
+			"Here is the output:\n```\n### key\n\n| a | b |\n| --- | --- |",
+			"Markdown source\n```\n### key\n\n| a | b |\n| --- | --- |",
+			// A fence opening the document has no prose before it.
+			"```\n### key\n\n| a | b |\n| --- | --- |",
+		] {
+			let source = Str::new(source);
+			assert_eq!(repair_orphan_closing_fence(&source), source, "repaired {source:?}");
+		}
+	}
+
+	#[test]
+	fn partial_render_does_not_repair() {
+		let source = "Latency: 1,240 ms\n```\n\n### Status\n\n| Workload | Pods |\n| --- | --- |\n| api | 1/1 |";
+		let streaming = plain_partial(source, 80);
+		assert!(
+			streaming.iter().any(|row| row.contains("| --- | --- |")),
+			"streaming render repaired the fence: {streaming:?}",
+		);
+		let settled = plain(source, 80);
+		assert!(
+			!settled.iter().any(|row| row.contains("| --- | --- |")),
+			"final render kept the orphan: {settled:?}",
+		);
+	}
+
+	#[test]
 	fn final_render_keeps_intentional_unclosed_markdown_example() {
 		let source = "Markdown source:\n```\n### Production Deployment Status\n\n| Workload | Pod \
 		              Status |\n| :--- | :--- |\n| google-scraper | 1/1 Running |";

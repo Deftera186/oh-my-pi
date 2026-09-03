@@ -23,6 +23,9 @@ const YEAR_MS: u64 = 365 * DAY_MS;
 enum Mode {
 	Duration,
 	Relative,
+	/// Whole seconds since a presentation-clock instant (`ms`): pi's running
+	/// tool-card badge, ` Ns`.
+	Elapsed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
@@ -47,9 +50,16 @@ enum RelativeUnit {
 enum FormatKey {
 	Duration(u64),
 	Relative(RelativeUnit, u64),
+	Elapsed(u64),
 }
 
-/// A compact duration or live relative age backing the `<time>` markup tag.
+/// A compact duration, live relative age, or live elapsed-seconds badge
+/// backing the `<time>` markup tag.
+///
+/// - `<time ms=N/>`: compact duration (`1.2s`, `3m04s`).
+/// - `<time kind=relative ms=N/>`: age that keeps counting from first paint.
+/// - `<time kind=elapsed ms=N/>`: `Ns` whole seconds since presentation-clock
+///   instant `N`, never negative, repainting exactly on each second boundary.
 pub struct Time {
 	props:  Props,
 	slot:   Slot,
@@ -77,14 +87,10 @@ impl Time {
 	}
 
 	fn mode(&self) -> Mode {
-		if self
-			.props
-			.str_of(Prop::Kind)
-			.is_some_and(|kind| kind == "relative")
-		{
-			Mode::Relative
-		} else {
-			Mode::Duration
+		match self.props.str_of(Prop::Kind).map(Str::as_str) {
+			Some("relative") => Mode::Relative,
+			Some("elapsed") => Mode::Elapsed,
+			_ => Mode::Duration,
 		}
 	}
 
@@ -118,12 +124,32 @@ impl Time {
 				let next = age.checked_add(delta).map(|_| delta);
 				(FormatKey::Relative(unit, value), next)
 			},
+			Mode::Elapsed => {
+				self.anchor = None;
+				let since = Duration::from_millis(self.source_ms());
+				let elapsed =
+					u64::try_from(now.saturating_sub(since).as_millis()).unwrap_or(u64::MAX);
+				// A clock still behind the start instant reads zero until
+				// one full second after it.
+				let lead = u64::try_from(since.saturating_sub(now).as_millis()).unwrap_or(u64::MAX);
+				let seconds = elapsed / SECOND_MS;
+				// Wake exactly on the next whole-second boundary since `since`.
+				let next = seconds
+					.checked_add(1)
+					.and_then(|next| next.checked_mul(SECOND_MS))
+					.and_then(|at| at.checked_sub(elapsed))
+					.and_then(|delta| delta.checked_add(lead));
+				(FormatKey::Elapsed(seconds), next)
+			},
 		};
 		if self.key != Some(key) {
 			self.text.clear();
 			match key {
 				FormatKey::Duration(ms) => write_duration(&mut self.text, ms),
 				FormatKey::Relative(unit, value) => write_relative(&mut self.text, unit, value),
+				FormatKey::Elapsed(seconds) => {
+					write!(self.text, "{seconds}s").expect("writing to String cannot fail");
+				},
 			}
 			self.key = Some(key);
 		}
@@ -240,6 +266,10 @@ mod tests {
 		Time::new().with(Prop::Ms, ms).with(Prop::Kind, "relative")
 	}
 
+	fn elapsed(since_ms: u64) -> Time {
+		Time::new().with(Prop::Ms, since_ms).with(Prop::Kind, "elapsed")
+	}
+
 	fn paint_at(time: &mut Time, now_ms: u64) -> (String, Vec<Wake>) {
 		let mut ctx = UiContext::default();
 		ctx.now = Duration::from_millis(now_ms);
@@ -295,6 +325,34 @@ mod tests {
 				layout: false,
 			}]);
 		}
+	}
+
+	#[test]
+	fn elapsed_badge_counts_whole_seconds_and_wakes_on_the_boundary() {
+		// Started at 2.4 s on the shared clock; painted 350 ms later.
+		let mut time = elapsed(2_400);
+		let (text, wakes) = paint_at(&mut time, 2_750);
+		assert_eq!(text, "0s");
+		assert_eq!(wakes, vec![Wake {
+			slot:   time.slot,
+			at:     Duration::from_millis(3_400),
+			layout: false,
+		}]);
+		// Exactly on the boundary the count flips and the next wake is one
+		// full second later — no drift, no sub-second repaints.
+		let (text, wakes) = paint_at(&mut time, 3_400);
+		assert_eq!(text, "1s");
+		assert_eq!(wakes[0].at, Duration::from_millis(4_400));
+		let (text, wakes) = paint_at(&mut time, 61_399);
+		assert_eq!(text, "58s");
+		assert_eq!(wakes[0].at, Duration::from_millis(61_400));
+		let pointer = time.text.as_ptr();
+		assert_eq!(paint_at(&mut time, 61_399).0, "58s");
+		assert_eq!(time.text.as_ptr(), pointer, "an unchanged second re-slices the cached text");
+		// A clock behind the start instant reads as zero, never negative.
+		let mut future = elapsed(9_000);
+		assert_eq!(paint_at(&mut future, 1_000).0, "0s");
+		assert_eq!(paint_at(&mut future, 1_000).1[0].at, Duration::from_millis(10_000));
 	}
 
 	#[test]

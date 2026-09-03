@@ -14,7 +14,8 @@ use std::{
 	collections::{HashMap, HashSet},
 	fs,
 	io::Cursor,
-	sync::LazyLock,
+	path::PathBuf,
+	sync::{Arc, LazyLock},
 };
 
 use omp_core::{CowBytes, Str};
@@ -44,6 +45,37 @@ struct Registry {
 }
 
 static IMAGES: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
+
+/// Application-installed resolver mapping one URI scheme's `<img src>`
+/// sources to filesystem paths.
+pub type SourceResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// Scheme → resolver, kept apart from [`IMAGES`] because sources resolve
+/// while the interner lock is held.
+static SCHEMES: LazyLock<Mutex<Vec<(&'static str, SourceResolver)>>> =
+	LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Installs a resolver for `scheme://…` image sources (`artifact` → the
+/// session blob store). The resolver receives the whole source and returns
+/// the file to read; a later registration for the same scheme replaces the
+/// earlier one.
+pub fn register_scheme(scheme: &'static str, resolver: SourceResolver) {
+	let mut schemes = SCHEMES.lock();
+	match schemes.iter_mut().find(|(name, _)| *name == scheme) {
+		Some(entry) => entry.1 = resolver,
+		None => schemes.push((scheme, resolver)),
+	}
+}
+
+fn resolve_scheme(source: &str) -> Option<PathBuf> {
+	let (scheme, _) = source.split_once("://")?;
+	let resolver = SCHEMES
+		.lock()
+		.iter()
+		.find(|(name, _)| *name == scheme)
+		.map(|(_, resolver)| Arc::clone(resolver))?;
+	resolver(source)
+}
 
 /// Interns a PNG filesystem path or packaged `asset://login/<provider>`
 /// source, returning its stable terminal image ID and pixel dimensions.
@@ -180,7 +212,9 @@ fn convert_to_png(source: &str) -> Option<CowBytes<'static>> {
 	Some(CowBytes::from(output.into_inner()))
 }
 
-/// Loads bytes from a filesystem path or packaged provider-logo URI.
+/// Loads bytes from a filesystem path, a packaged provider-logo URI, or a
+/// source whose scheme an application resolver ([`register_scheme`]) maps
+/// to a file.
 ///
 /// Embedded assets stay backed directly by executable static data; file
 /// sources retain their owned read buffer.
@@ -188,5 +222,30 @@ pub fn source_bytes(source: &str) -> Option<CowBytes<'static>> {
 	if let Some(provider_id) = source.strip_prefix("asset://login/") {
 		return assets::provider_logo(provider_id).map(CowBytes::from_static);
 	}
+	if let Some(path) = resolve_scheme(source) {
+		return fs::read(path).ok().map(CowBytes::from);
+	}
 	fs::read(source).ok().map(CowBytes::from)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{env, fs, sync::Arc};
+
+	use super::{register_scheme, source_bytes};
+
+	#[test]
+	fn registered_scheme_resolves_sources_to_files() {
+		let path = env::temp_dir().join(format!("omp-tui-imagereg-scheme-{}.bin", std::process::id()));
+		fs::write(&path, b"payload").expect("fixture");
+		let resolved = path.clone();
+		register_scheme(
+			"omp-test",
+			Arc::new(move |source| (source == "omp-test://one").then(|| resolved.clone())),
+		);
+		assert_eq!(source_bytes("omp-test://one").as_deref(), Some(&b"payload"[..]));
+		assert!(source_bytes("omp-test://two").is_none(), "resolver misses read nothing");
+		assert!(source_bytes("nope://one").is_none(), "unknown schemes fall through to the path");
+		let _ = fs::remove_file(path);
+	}
 }

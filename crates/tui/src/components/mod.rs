@@ -1,4 +1,5 @@
 mod boxed;
+mod brand;
 mod button;
 mod callout;
 mod checkbox;
@@ -22,10 +23,12 @@ mod input;
 mod json;
 mod latex;
 mod layout;
+mod loader;
 mod logo;
 mod markdown;
 mod number;
 mod progress;
+mod pulse;
 mod qr;
 mod quote;
 mod radio;
@@ -38,6 +41,7 @@ mod shader;
 mod spinner;
 pub mod state;
 mod status;
+mod strike;
 mod table;
 mod tabs;
 mod text;
@@ -137,6 +141,7 @@ pub(super) fn paint_overflow_footer(pc: &mut PaintCtx<'_>, rect: Rect, plan: Ove
 mod tests;
 
 pub use boxed::Boxed;
+pub use brand::Brand;
 pub use button::{Button, ButtonVariant};
 pub use callout::Callout;
 pub use checkbox::Checkbox;
@@ -156,14 +161,15 @@ pub use diffstat::DiffStat;
 pub use editor::{
 	Attachment, AttachmentContent, Attachments, ComposerLayout, ComposerStatusAttachment,
 	ComposerStyle, EditInput, EditorPane, InlineAccent, InlineDecorator, KeywordAccent,
-	attachment_color, chip_label,
+	KeywordGradient, attachment_color, chip_label,
 };
 pub use fact::Fact;
 pub use files::Files;
 pub use form::{Field, Form};
 pub use hr::{Hr, Spacer};
+pub use loader::Loader;
 pub use icon::Icon;
-pub use img::{Img, draw_image_inline, image_cell_box};
+pub use img::{Img, RowBound, draw_image_inline, image_cell_box};
 pub(crate) use img::{ImgState, decode_source};
 pub use input::Input;
 pub use json::JsonPreview;
@@ -172,6 +178,7 @@ pub use logo::Logo;
 pub use markdown::Markdown;
 pub use number::{NumberLeaf, write_compact_count};
 pub use progress::Progress;
+pub use pulse::{Pulse, SPEED_MAX, SPEED_WINDOW, SpeedGauge, write_compact};
 pub use qr::Qr;
 pub use quote::Quote;
 pub use radio::Radio;
@@ -183,6 +190,7 @@ pub use select::{Select, SelectOption};
 pub use shader::Shader;
 pub use spinner::Spinner;
 pub use state::State;
+pub use strike::{STRIKE_HOLD_FRAMES, STRIKE_REVEAL_FRAMES, STRIKE_TOTAL_FRAMES, Strike};
 pub use status::{
 	BoundaryLayout, CompactionBoundaries, ContextGauge, ContextGaugeMode, GaugeCell, Segment,
 	Status, StatusPlacement, advisor_spend_label, boundary_layout, compaction_boundary_color,

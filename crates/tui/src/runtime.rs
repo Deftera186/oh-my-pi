@@ -170,7 +170,7 @@ impl ImageLoader {
 		slot: Slot,
 		source: Str,
 		width: u16,
-		height: Option<u16>,
+		rows: components::RowBound,
 		trim: bool,
 		prepare_kitty: bool,
 	) {
@@ -179,7 +179,7 @@ impl ImageLoader {
 			if prepare_kitty {
 				let _ = imagereg::prepare_png(&source);
 			}
-			let state = components::decode_source(&source, width, height, trim);
+			let state = components::decode_source(&source, width, rows, trim);
 			let _ = tx.send(Msg::ImageDecoded { slot, state });
 		});
 	}

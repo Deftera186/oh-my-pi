@@ -84,11 +84,11 @@ use strum::{EnumString, IntoStaticStr};
 use crate::{
 	component::{Cached, Component},
 	components::{
-		Boxed, Button, Callout, Checkbox, Choice, Col, CustomElement, DiffKind, DiffStat, DiffView,
+		Boxed, Button, Callout, Checkbox, Choice, Col, CustomElement, DiffStat, DiffView,
 		EditorPane, Fact, Field, Files, Form, Hr, Icon, Img, Input, JsonPreview, Latex, Markdown,
-		NumberLeaf, Pre, Progress, Qr, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
-		SelectOption, Spacer, Spinner, State, Status, Table, TableCell, TableRow, Tabs, TaskStatus,
-		TextLeaf, Time, Todo, TodoTask, Tree, TreeNode, Wizard,
+		NumberLeaf, Pre, Progress, Pulse, Qr, Quote, Radio, Row, Scroll, Segment, Segmented, Select,
+		SelectOption, Spacer, Spinner, State, Status, Strike, Table, TableCell, TableRow, Tabs,
+		TaskStatus, TextLeaf, Time, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
 	context::{Charset, UiContext},
 	markdown,
@@ -1084,6 +1084,8 @@ fn is_catalog_tag(name: &str) -> bool {
 			| "segmented"
 			| "checkbox"
 			| "spinner"
+			| "pulse"
+			| "strike"
 			| "status"
 			| "segment"
 			| "input"
@@ -1297,6 +1299,8 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		"radio" => configured!(Radio::new()),
 		"checkbox" => configured!(Checkbox::new()),
 		"spinner" => configured!(Spinner::new().label(body.clone())),
+		"strike" => configured!(Strike::new().text(body.clone())),
+		"pulse" => configured!(Pulse::new().label(body.clone())),
 		"time" => configured!(Time::new()),
 		"num" => configured!(NumberLeaf::new()),
 		"bytes" => configured!(NumberLeaf::bytes()),
@@ -1312,14 +1316,7 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		"progress" => configured!(Progress::new()),
 		"qr" => configured!(Qr::new().text(body.clone())),
 		"img" => configured!(Img::new()),
-		"diff" => {
-			let mut diff = DiffView::new();
-			for line in body.lines() {
-				let (kind, text) = unified_diff_line(line);
-				diff.push(kind, text);
-			}
-			configured!(diff)
-		},
+		"diff" => configured!(DiffView::new().text(body.clone())),
 		"callout" => configured!(Callout::new().text(body.clone())),
 		"editor" => configured!(EditorPane::new()),
 		"icon" => {
@@ -1336,24 +1333,6 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		},
 		_ => return None,
 	})
-}
-
-/// Classifies one unified-diff source line for the retained [`DiffView`].
-fn unified_diff_line(line: &str) -> (DiffKind, &str) {
-	match line.as_bytes().first() {
-		Some(b'+') if !line.starts_with("+++") => (DiffKind::Add, &line[1..]),
-		Some(b'-') if !line.starts_with("---") => (DiffKind::Remove, &line[1..]),
-		Some(b' ') => (DiffKind::Context, &line[1..]),
-		Some(b'!') => (DiffKind::Diagnostic, line[1..].strip_prefix(' ').unwrap_or(&line[1..])),
-		_ if line.starts_with("@@")
-			|| line.starts_with("diff ")
-			|| line.starts_with("+++")
-			|| line.starts_with("---") =>
-		{
-			(DiffKind::Header, line)
-		},
-		_ => (DiffKind::Context, line),
-	}
 }
 
 fn finish_element(
