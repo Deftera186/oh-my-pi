@@ -8,7 +8,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use omp_core::{SecretString, Str, sf};
+use omp_core::{SecretString, Str, encoding::hex, sf};
+use omp_proto::thread::v1::{self as thread_pb, item, part};
 use serde_json::{Value, value::RawValue};
 use strum::IntoStaticStr;
 
@@ -486,6 +487,13 @@ pub enum ToolResultContent {
 	Document(MediaInput),
 }
 
+impl ToolResultContent {
+	/// Projects one canonical thread part used by a tool result.
+	pub fn from_thread_part(part: &thread_pb::Part) -> Result<Self, ThreadProjectionError> {
+		tool_result_from_thread(part)
+	}
+}
+
 /// One canonical message content part.
 #[derive(Clone, Debug)]
 pub enum ContentPart {
@@ -545,6 +553,164 @@ pub struct Message {
 	pub content: Arc<[ContentPart]>,
 	/// Optional caller-facing author label.
 	pub name:    Option<Str>,
+}
+
+impl Message {
+	/// Projects canonical thread items into one inference message per item.
+	///
+	/// The one-to-one mapping is load-bearing for retained context revisions;
+	/// provider-specific grouping belongs to codecs.
+	pub fn from_thread_items(items: &[thread_pb::Item]) -> Result<Vec<Self>, ThreadProjectionError> {
+		items
+			.iter()
+			.map(|item| match item.kind.as_ref() {
+				Some(item::Kind::Message(message)) => message_from_thread(message),
+				Some(item::Kind::ToolCall(call)) => Ok(Self {
+					role:    Role::Assistant,
+					content: Arc::from([ContentPart::ToolCall {
+						call:      ToolCallId::from(call.id.as_str()),
+						name:      call.name.as_str().into(),
+						arguments: thread_opaque_json(&call.args_json, "ToolCall.args_json")?,
+						proof:     None,
+					}]),
+					name:    None,
+				}),
+				Some(item::Kind::ToolResult(result)) => {
+					let content = result
+						.parts
+						.iter()
+						.map(tool_result_from_thread)
+						.collect::<Result<Vec<_>, _>>()?;
+					Ok(Self {
+						role:    Role::Tool,
+						content: Arc::from([ContentPart::ToolResult {
+							call:     ToolCallId::from(result.call_id.as_str()),
+							name:     (!result.name.is_empty()).then(|| result.name.as_str().into()),
+							content:  content.into(),
+							is_error: result.is_error,
+						}]),
+						name:    None,
+					})
+				},
+				None => Err(ThreadProjectionError::MissingItemKind),
+			})
+			.collect()
+	}
+}
+
+/// A canonical thread item cannot be represented by the inference contract.
+#[derive(Debug, thiserror::Error)]
+pub enum ThreadProjectionError {
+	/// A thread item omitted its required kind.
+	#[error("thread item kind is required")]
+	MissingItemKind,
+	/// A message omitted its required role.
+	#[error("message role is required")]
+	MissingMessageRole,
+	/// A message part omitted its required kind.
+	#[error("message part kind is required")]
+	MissingPartKind,
+	/// A reasoning signature was supplied without provider scope.
+	#[error("unscoped reasoning signatures cannot enter canonical inference")]
+	UnscopedReasoningSignature,
+	/// A legacy part requires an explicit canonical projection.
+	#[error("legacy fallback/server-tool parts require an explicit canonical projection")]
+	LegacyPart,
+	/// A tool result part has no canonical inference representation.
+	#[error("tool result contains a part that has no canonical projection")]
+	UnsupportedToolResultPart,
+	/// A blob omitted its media type.
+	#[error("blob media type is required")]
+	MissingBlobMediaType,
+	/// A blob supplied neither inline bytes nor a content hash.
+	#[error("blob requires inline bytes or a content hash")]
+	MissingBlobData,
+	/// An opaque JSON field was malformed.
+	#[error("{field} is invalid JSON")]
+	InvalidJson {
+		/// Stable field name.
+		field:  &'static str,
+		/// JSON decoding failure.
+		#[source]
+		source: serde_json::Error,
+	},
+}
+
+fn message_from_thread(message: &thread_pb::Message) -> Result<Message, ThreadProjectionError> {
+	let role = match thread_pb::Role::try_from(message.role).unwrap_or(thread_pb::Role::Unspecified)
+	{
+		thread_pb::Role::System => Role::System,
+		thread_pb::Role::User => Role::User,
+		thread_pb::Role::Assistant => Role::Assistant,
+		thread_pb::Role::Unspecified => return Err(ThreadProjectionError::MissingMessageRole),
+	};
+	let content = message
+		.parts
+		.iter()
+		.map(content_from_thread)
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Message { role, content: content.into(), name: None })
+}
+
+fn content_from_thread(part: &thread_pb::Part) -> Result<ContentPart, ThreadProjectionError> {
+	match part.kind.as_ref() {
+		Some(part::Kind::Text(text)) => {
+			Ok(ContentPart::Text { text: text.as_str().into(), proof: None })
+		},
+		Some(part::Kind::Thinking(thinking)) if thinking.signature.is_empty() => {
+			Ok(ContentPart::Reasoning { text: thinking.text.as_str().into(), proof: None })
+		},
+		Some(part::Kind::Thinking(_)) => Err(ThreadProjectionError::UnscopedReasoningSignature),
+		Some(part::Kind::Blob(blob)) => Ok(ContentPart::Image(media_from_thread(blob)?)),
+		Some(part::Kind::Fallback(_) | part::Kind::ServerTool(_)) => {
+			Err(ThreadProjectionError::LegacyPart)
+		},
+		None => Err(ThreadProjectionError::MissingPartKind),
+	}
+}
+
+fn tool_result_from_thread(
+	part: &thread_pb::Part,
+) -> Result<ToolResultContent, ThreadProjectionError> {
+	match part.kind.as_ref() {
+		Some(part::Kind::Text(text)) => Ok(ToolResultContent::Text(text.as_str().into())),
+		Some(part::Kind::Blob(blob)) => Ok(ToolResultContent::Document(media_from_thread(blob)?)),
+		_ => Err(ThreadProjectionError::UnsupportedToolResultPart),
+	}
+}
+
+/// Converts a thread blob part into an inference media input.
+///
+/// # Errors
+/// Missing media type, or neither inline bytes nor a content hash.
+pub fn media_from_thread(blob: &thread_pb::Blob) -> Result<MediaInput, ThreadProjectionError> {
+	if blob.mime.is_empty() {
+		return Err(ThreadProjectionError::MissingBlobMediaType);
+	}
+	if !blob.inline.is_empty() {
+		return Ok(MediaInput::Bytes {
+			media_type: blob.mime.as_str().into(),
+			data:       Bytes::copy_from_slice(&blob.inline),
+		});
+	}
+	if blob.hash.is_empty() {
+		return Err(ThreadProjectionError::MissingBlobData);
+	}
+	let id = hex::encode(&blob.hash).into_string();
+	Ok(MediaInput::Stored(ArtifactRef {
+		store:    sf!("omp-rpc-blobs"),
+		id:       id.as_str().into(),
+		revision: id.as_str().into(),
+	}))
+}
+
+fn thread_opaque_json(
+	bytes: &[u8],
+	field: &'static str,
+) -> Result<OpaqueJson, ThreadProjectionError> {
+	serde_json::from_slice(bytes)
+		.map(OpaqueJson::new)
+		.map_err(|source| ThreadProjectionError::InvalidJson { field, source })
 }
 
 /// Grammar language for a freeform tool input.

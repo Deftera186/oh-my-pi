@@ -68,6 +68,41 @@ impl ResponsesRouteHints {
 	}
 }
 
+/// A catalog route cannot construct its discovery projector.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CatalogDiscoveryProjectorError {
+	/// The route advertises discovery without naming a discovery specification.
+	#[error("route has no discovery specification")]
+	RouteHasNoDiscoverySpec,
+	/// The route names a discovery specification absent from the catalog.
+	#[error("catalog discovery specification is missing")]
+	CatalogDiscoverySpecMissing,
+	/// The route names a provider absent from the catalog.
+	#[error("catalog discovery provider is missing")]
+	CatalogDiscoveryProviderMissing,
+	/// The provider has no authored defaults for discovered models.
+	#[error("provider discovery defaults are missing")]
+	ProviderDiscoveryDefaultsMissing,
+	/// Discovery defaults attempted to inherit thinking or pricing.
+	#[error("discovery defaults must not inherit thinking or pricing")]
+	DefaultsInheritThinkingOrPricing,
+	/// Discovery defaults and the provider disagree on wire policy.
+	#[error("discovery wire policy does not match provider")]
+	WirePolicyMismatch,
+	/// Two catalog models claim the same wire identifier on this route.
+	#[error(
+		"wire model {wire_model} is claimed by both {first} and {second} on the discovery route"
+	)]
+	DuplicateRouteWireModelIdentifier {
+		/// Duplicated provider wire identifier.
+		wire_model: WireModelId,
+		/// First normalized model claiming the identifier.
+		first:      ModelKey,
+		/// Second normalized model claiming the identifier.
+		second:     ModelKey,
+	},
+}
+
 /// Route-scoped projector applying canonical discovery normalization during
 /// response recovery.
 #[derive(Clone, Debug)]
@@ -98,50 +133,44 @@ impl CatalogDiscoveryProjector {
 
 	/// Constructs a mixed bundled/unknown projector from authored provider
 	/// discovery defaults.
-	pub fn for_route(catalog: &Catalog, route: &RouteDef) -> Result<Self, Error> {
+	pub fn for_route(
+		catalog: &Catalog,
+		route: &RouteDef,
+	) -> Result<Self, CatalogDiscoveryProjectorError> {
 		let discovery = route
 			.discovery
 			.as_ref()
-			.ok_or_else(|| capability_error("discovery.spec", "route_has_no_discovery_spec"))?;
+			.ok_or(CatalogDiscoveryProjectorError::RouteHasNoDiscoverySpec)?;
 		catalog
 			.discovery_spec(discovery)
-			.ok_or_else(|| capability_error("discovery.spec", "catalog_discovery_spec_missing"))?;
-		let provider = catalog.provider(&route.provider).ok_or_else(|| {
-			capability_error("discovery.provider", "catalog_discovery_provider_missing")
-		})?;
+			.ok_or(CatalogDiscoveryProjectorError::CatalogDiscoverySpecMissing)?;
+		let provider = catalog
+			.provider(&route.provider)
+			.ok_or(CatalogDiscoveryProjectorError::CatalogDiscoveryProviderMissing)?;
 		let defaults = catalog
 			.discovery_defaults(&route.provider)
 			.cloned()
-			.ok_or_else(|| {
-				capability_error("discovery.defaults", "provider_discovery_defaults_missing")
-			})?;
+			.ok_or(CatalogDiscoveryProjectorError::ProviderDiscoveryDefaultsMissing)?;
 		if defaults.thinking.is_some() || defaults.pricing != Pricing::default() {
-			return Err(capability_error(
-				"discovery.defaults",
-				"discovery_defaults_must_not_inherit_thinking_or_pricing",
-			));
+			return Err(CatalogDiscoveryProjectorError::DefaultsInheritThinkingOrPricing);
 		}
 		if defaults.wire_policy != provider.wire_policy {
-			return Err(capability_error(
-				"discovery.defaults",
-				"discovery_wire_policy_does_not_match_provider",
-			));
+			return Err(CatalogDiscoveryProjectorError::WirePolicyMismatch);
 		}
-		let mut allowlist = BTreeMap::new();
+		let mut allowlist: BTreeMap<WireModelId, ModelSpec> = BTreeMap::new();
 		for model in catalog.models() {
 			for (candidate, wire_model) in &model.wire_ids {
 				if candidate != &route.id {
 					continue;
 				}
-				if allowlist
-					.insert(wire_model.clone(), model.clone())
-					.is_some()
-				{
-					return Err(capability_error(
-						"discovery.allowlist",
-						"duplicate_route_wire_model_identifier",
-					));
+				if let Some(existing) = allowlist.get(wire_model) {
+					return Err(CatalogDiscoveryProjectorError::DuplicateRouteWireModelIdentifier {
+						wire_model: wire_model.clone(),
+						first:      existing.key.clone(),
+						second:     model.key.clone(),
+					});
 				}
+				allowlist.insert(wire_model.clone(), model.clone());
 			}
 		}
 		let hints = responses_route_hints(catalog, route);

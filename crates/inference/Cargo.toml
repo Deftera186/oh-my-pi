@@ -39,6 +39,7 @@ local-tts = [
 dashmap.workspace = true
 arc-swap.workspace = true
 async-stream.workspace = true
+brotli.workspace = true
 bytes.workspace = true
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
@@ -58,11 +59,11 @@ libc.workspace = true
 llama-cpp-sys-2 = { workspace = true, optional = true }
 omp-core.workspace = true
 omp-catalog.workspace = true
+omp-con.workspace = true
 omp-oauth.workspace = true
 omp-proto.workspace = true
 omp-secrets.workspace = true
 omp-slopjson.workspace = true
-omp-settings.workspace = true
 omp-voice-kokoro = { workspace = true, optional = true }
 parking_lot.workspace = true
 pin-project-lite.workspace = true
@@ -90,6 +91,7 @@ url.workspace = true
 voice-g2p = { workspace = true, optional = true }
 xutf.workspace = true
 zeroize.workspace = true
+zstd.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, optional = true }

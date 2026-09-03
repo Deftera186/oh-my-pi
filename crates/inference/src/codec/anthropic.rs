@@ -1,9 +1,10 @@
 //! Typed Anthropic Messages projection and incremental event decoding.
-use std::str;
+use std::{str, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use omp_catalog::{
-	CodecId, OperationKind, ProviderId, ServiceTier, ThinkingEffort, ThinkingSelection,
+	CodecId, OperationKind, ProviderId, ServiceTier, ThinkingEffort, ThinkingMode,
+	ThinkingSelection, WirePolicy,
 };
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,8 @@ const CLAUDE_CODE_UTILITY_BETAS: &[&str] = &[
 	"prompt-caching-scope-2026-01-05",
 	"structured-outputs-2025-12-15",
 ];
+/// Beta required for native context-management edits.
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 /// OAuth beta required for native effort controls.
 const CLAUDE_CODE_EFFORT_BETA: &str = "effort-2025-11-24";
 /// Subscription fallback-credit beta emitted after optional effort.
@@ -81,6 +84,9 @@ const CLAUDE_CODE_SYSTEM_INSTRUCTION: &str =
 const CLAUDE_CODE_TOOL_PREFIX: &str = "_";
 /// Claude Code's per-request output-token ceiling.
 const CLAUDE_CODE_MAX_OUTPUT_TOKENS: u64 = 64_000;
+/// Minimum same-route delay before replaying a stream the provider closed
+/// before any output; matches the in-stream `overloaded_error` backoff.
+const ENVELOPE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Anthropic Messages hosting envelope.
 #[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq)]
@@ -1104,7 +1110,7 @@ struct ToolSchemaPlan {
 /// Plans every client tool's wire schema: the base whitelist normalization
 /// for all tools, then strict promotion for allowlisted strict-declared tools
 /// whose schemas fit Anthropic's strict subset within cross-tool budgets.
-fn plan_tool_schemas(tools: &[ToolDefinition]) -> Vec<ToolSchemaPlan> {
+fn plan_tool_schemas(tools: &[ToolDefinition], disable_strict: bool) -> Vec<ToolSchemaPlan> {
 	let mut plans: Vec<ToolSchemaPlan> = tools
 		.iter()
 		.map(|tool| ToolSchemaPlan {
@@ -1112,6 +1118,9 @@ fn plan_tool_schemas(tools: &[ToolDefinition]) -> Vec<ToolSchemaPlan> {
 			strict:       false,
 		})
 		.collect();
+	if disable_strict {
+		return plans;
+	}
 	let mut strict_tools = 0_usize;
 	let mut optional_used = 0_usize;
 	let mut union_used = 0_usize;
@@ -1151,6 +1160,7 @@ fn lower_count_tokens(
 	codec: &CodecId<str>,
 	request: &CountTokensRequest,
 	claude_code_oauth: bool,
+	policy: &WirePolicy,
 ) -> Result<Bytes, Error> {
 	let mut body = CountTokensBody {
 		model,
@@ -1159,17 +1169,27 @@ fn lower_count_tokens(
 		tools: Vec::with_capacity(request.tools.len()),
 	};
 	for message in request.messages.iter() {
-		let blocks = lower_parts(&message.content, None, provider, codec)?;
+		let blocks = lower_parts(
+			&message.content,
+			None,
+			provider,
+			codec,
+			policy.image.strip_input == Some(true),
+		)?;
 		match message.role {
 			Role::System | Role::Developer => body.system.extend(blocks),
 			Role::User | Role::Tool => append_message(&mut body.messages, "user", blocks),
 			Role::Assistant => append_message(&mut body.messages, "assistant", blocks),
 		}
 	}
-	if claude_code_oauth {
+	if claude_code_oauth && policy.role.inject_claude_code_instruction != Some(false) {
 		prepend_claude_code_identity(&mut body.system);
 	}
-	for (tool, plan) in request.tools.iter().zip(plan_tool_schemas(&request.tools)) {
+	for (tool, plan) in request
+		.tools
+		.iter()
+		.zip(plan_tool_schemas(&request.tools, policy.tool.disable_strict_tools == Some(true)))
+	{
 		body.tools.push(Tool::Client(ClientTool {
 			name:                  if claude_code_oauth {
 				claude_code_tool_name(&tool.name)
@@ -1265,7 +1285,9 @@ fn strip_claude_code_tool_prefix(name: Str) -> Str {
 }
 
 fn apply_claude_code_fingerprint(body: &mut MessagesRequest, context: &EncodeContext<'_>) {
-	prepend_claude_code_identity(&mut body.system);
+	if context.policy.role.inject_claude_code_instruction != Some(false) {
+		prepend_claude_code_identity(&mut body.system);
+	}
 	for tool in &mut body.tools {
 		if let Tool::Client(tool) = tool {
 			tool.name = claude_code_tool_name(&tool.name);
@@ -1305,7 +1327,10 @@ pub fn lower_chat(
 	model: Str,
 	provider: &ProviderId<str>,
 	codec: &CodecId<str>,
+	policy: &WirePolicy,
+	thinking_mode: Option<ThinkingMode>,
 	thinking_selection: Option<&ThinkingSelection>,
+	catalog_max_output_tokens: Option<u64>,
 	request: &ChatRequest,
 ) -> Result<MessagesRequest, Error> {
 	if !matches!(request.reasoning, Setting::Unset) && thinking_selection.is_none() {
@@ -1327,9 +1352,14 @@ pub fn lower_chat(
 		return Err(capability_error("anthropic.verbosity_unsupported"));
 	}
 	let cache = cache_control(&request.cache_retention);
+	let max_tokens = match (request.max_output_tokens, catalog_max_output_tokens) {
+		(Some(requested), Some(limit)) => Some(requested.min(limit)),
+		(Some(requested), None) => Some(requested),
+		(None, limit) => limit,
+	};
 	let mut body = MessagesRequest {
 		model: Some(model),
-		max_tokens: request.max_output_tokens,
+		max_tokens,
 		temperature: request.sampling.temperature,
 		top_p: request.sampling.top_p,
 		top_k: request.sampling.top_k,
@@ -1338,14 +1368,24 @@ pub fn lower_chat(
 		..MessagesRequest::default()
 	};
 	for message in request.messages.iter() {
-		let blocks = lower_parts(&message.content, cache.clone(), provider, codec)?;
+		let blocks = lower_parts(
+			&message.content,
+			cache.clone(),
+			provider,
+			codec,
+			policy.image.strip_input == Some(true),
+		)?;
 		match message.role {
 			Role::System | Role::Developer => body.system.extend(blocks),
 			Role::User | Role::Tool => append_message(&mut body.messages, "user", blocks),
 			Role::Assistant => append_message(&mut body.messages, "assistant", blocks),
 		}
 	}
-	for (tool, plan) in request.tools.iter().zip(plan_tool_schemas(&request.tools)) {
+	for (tool, plan) in request
+		.tools
+		.iter()
+		.zip(plan_tool_schemas(&request.tools, policy.tool.disable_strict_tools == Some(true)))
+	{
 		body.tools.push(Tool::Client(ClientTool {
 			name:                  tool.name.clone(),
 			description:           tool.description.clone(),
@@ -1386,16 +1426,33 @@ pub fn lower_chat(
 		}
 	}
 	body.tool_choice = lower_tool_choice(&request.tool_choice);
-	body.thinking = lower_thinking(thinking_selection, &request.reasoning);
-	if let Some(budget) = thinking_selection.and_then(|selection| selection.budget) {
-		body.max_tokens = Some(
-			body
-				.max_tokens
-				.unwrap_or(0)
-				.max(budget.saturating_add(1024)),
-		);
+	body.thinking = lower_thinking(
+		thinking_mode,
+		thinking_selection,
+		&request.reasoning,
+		policy.reasoning.disable_adaptive == Some(true),
+	);
+	if policy.context.supports_management != Some(false)
+		&& matches!(body.thinking, Some(Thinking::Enabled { .. } | Thinking::Adaptive { .. }))
+	{
+		body.context_management = Some(ContextManagement {
+			edits: vec![ContextEdit::ClearThinking20251015 { keep: sf!("all") }],
+		});
 	}
-	body.output_config = lower_output_config(thinking_selection, &request.output)?;
+	if let Some(budget) = thinking_selection.and_then(|selection| selection.budget) {
+		let with_reasoning = body
+			.max_tokens
+			.unwrap_or(0)
+			.max(budget.saturating_add(1024));
+		body.max_tokens =
+			Some(catalog_max_output_tokens.map_or(with_reasoning, |limit| with_reasoning.min(limit)));
+	}
+	body.output_config = lower_output_config(
+		thinking_mode,
+		thinking_selection,
+		&request.output,
+		policy.reasoning.supports_output_effort == Some(true),
+	)?;
 	if let Some(tier) = setting_value(&request.service_tier) {
 		lower_service_tier(&mut body, tier)?;
 	}
@@ -1426,9 +1483,13 @@ fn lower_parts(
 	cache: Option<CacheControl>,
 	provider: &ProviderId<str>,
 	codec: &CodecId<str>,
+	strip_images: bool,
 ) -> Result<Vec<ContentBlock>, Error> {
 	let mut blocks = Vec::with_capacity(parts.len());
 	for part in parts {
+		if strip_images && matches!(part, CanonicalPart::Image(_)) {
+			continue;
+		}
 		let block = match part {
 			CanonicalPart::Text { text, proof } => {
 				if let Some(proof) = proof {
@@ -1622,8 +1683,10 @@ fn lower_tool_choice(setting: &Setting<ToolChoice>) -> Option<WireToolChoice> {
 }
 
 fn lower_thinking(
+	mode: Option<ThinkingMode>,
 	selection: Option<&ThinkingSelection>,
 	request: &Setting<ReasoningRequest>,
+	disable_adaptive: bool,
 ) -> Option<Thinking> {
 	let selection = selection?;
 	if selection.effort == ThinkingEffort::Off {
@@ -1633,8 +1696,15 @@ fn lower_thinking(
 		(reasoning.visibility != ReasoningVisibility::Visible)
 			.then(|| sf!(<&'static str>::from(reasoning.visibility)))
 	});
-	if let Some(tokens) = selection.budget {
+	// Adaptive models reject `thinking.type: enabled`; a resolved budget only
+	// applies to them when the rule set explicitly disables adaptive thinking.
+	let adaptive = mode == Some(ThinkingMode::AnthropicAdaptive) && !disable_adaptive;
+	if adaptive {
+		Some(Thinking::Adaptive { display })
+	} else if let Some(tokens) = selection.budget {
 		Some(Thinking::Enabled { budget_tokens: tokens, display })
+	} else if mode == Some(ThinkingMode::AnthropicAdaptive) {
+		Some(Thinking::Enabled { budget_tokens: 1_024, display })
 	} else {
 		Some(Thinking::Adaptive { display })
 	}
@@ -1661,11 +1731,15 @@ const fn anthropic_thinking_effort(effort: ThinkingEffort) -> AnthropicThinkingE
 }
 
 fn lower_output_config(
+	mode: Option<ThinkingMode>,
 	selection: Option<&ThinkingSelection>,
 	output: &Setting<StructuredOutput>,
+	supports_output_effort: bool,
 ) -> Result<Option<OutputConfig>, Error> {
-	let effort =
-		selection.and_then(|selection| {
+	let effort = (supports_output_effort && mode == Some(ThinkingMode::AnthropicAdaptive))
+		.then(|| selection)
+		.flatten()
+		.and_then(|selection| {
 			if selection.effort == ThinkingEffort::Off && selection.suppress_when_off {
 				return None;
 			}
@@ -1782,18 +1856,24 @@ fn extend_claude_code_headers(headers: &mut Vec<RequestHeader>, context: &Encode
 	}
 }
 
-fn claude_code_betas(extra: &BetaSet, agent_request: bool, thinking: bool) -> BetaSet {
+fn claude_code_betas(
+	extra: &BetaSet,
+	agent_request: bool,
+	output_effort: bool,
+	disable_strict: bool,
+	supports_context_management: bool,
+) -> BetaSet {
 	let mut betas = BetaSet::default();
-	betas.extend(
-		if agent_request {
-			CLAUDE_CODE_AGENT_BETAS
-		} else {
-			CLAUDE_CODE_UTILITY_BETAS
-		}
-		.iter()
-		.copied(),
-	);
-	if agent_request && thinking {
+	let defaults = if agent_request {
+		CLAUDE_CODE_AGENT_BETAS
+	} else {
+		CLAUDE_CODE_UTILITY_BETAS
+	};
+	betas.extend(defaults.iter().copied().filter(|beta| {
+		(supports_context_management || *beta != CONTEXT_MANAGEMENT_BETA)
+			&& (!disable_strict || *beta != "structured-outputs-2025-12-15")
+	}));
+	if agent_request && output_effort {
 		betas.insert(Str::new_static(CLAUDE_CODE_EFFORT_BETA));
 	}
 	if agent_request {
@@ -1824,6 +1904,7 @@ fn encoded_count_tokens(
 		&target.codec,
 		request,
 		claude_code_oauth,
+		context.policy,
 	)?;
 	let mut headers = vec![
 		RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
@@ -1831,7 +1912,13 @@ fn encoded_count_tokens(
 	];
 	let merged_betas = if claude_code_oauth {
 		extend_claude_code_headers(&mut headers, context);
-		claude_code_betas(betas, !request.tools.is_empty(), false)
+		claude_code_betas(
+			betas,
+			!request.tools.is_empty(),
+			false,
+			context.policy.tool.disable_strict_tools == Some(true),
+			context.policy.context.supports_management != Some(false),
+		)
 	} else {
 		betas.clone()
 	};
@@ -1874,19 +1961,42 @@ impl Codec for AnthropicCodec {
 			Str::new(target.wire_model.as_str()),
 			&context.route.provider,
 			&target.codec,
+			context.policy,
+			context.thinking_policy.map(|policy| policy.mode),
 			context.thinking_selection,
+			context
+				.policy_model
+				.and_then(|model| model.limits.maximum_output_tokens),
 			request,
 		)?;
 		let claude_code_oauth = is_claude_code_oauth(context, self.adapter);
-		let betas = if claude_code_oauth {
+		let has_context_management = body.context_management.is_some();
+		let has_output_effort = body
+			.output_config
+			.as_ref()
+			.and_then(|config| config.effort.as_ref())
+			.is_some();
+		let mut betas = if claude_code_oauth {
 			apply_claude_code_fingerprint(&mut body, context);
-			let thinking = setting_value(&request.reasoning).is_some();
-			let agent_request =
-				thinking || !request.tools.is_empty() || !request.hosted_tools.is_empty();
-			claude_code_betas(&self.betas, agent_request, thinking)
+			let agent_request = setting_value(&request.reasoning).is_some()
+				|| !request.tools.is_empty()
+				|| !request.hosted_tools.is_empty();
+			claude_code_betas(
+				&self.betas,
+				agent_request,
+				has_output_effort,
+				context.policy.tool.disable_strict_tools == Some(true),
+				context.policy.context.supports_management != Some(false),
+			)
 		} else {
 			self.betas.clone()
 		};
+		if has_context_management {
+			betas.insert(sf!(CONTEXT_MANAGEMENT_BETA));
+		}
+		if has_output_effort {
+			betas.insert(sf!(CLAUDE_CODE_EFFORT_BETA));
+		}
 		let projected = project(MessagesIntent { body, fallbacks: Vec::new(), betas }, self.adapter)?;
 		let mut headers =
 			vec![RequestHeader { name: sf!("content-type"), value: sf!("application/json") }];
@@ -2143,13 +2253,28 @@ pub(crate) fn endpoint_region(base_url: &str) -> Option<&str> {
 		})
 }
 #[derive(Debug)]
-struct AnthropicWireDecoder {
+pub(crate) struct AnthropicWireDecoder {
 	adapter:           AnthropicAdapter,
 	claude_code_oauth: bool,
 	inner:             AnthropicDecoder,
 	signature_cursor:  usize,
 	citation_cursor:   usize,
 	history_cursor:    usize,
+}
+
+impl AnthropicWireDecoder {
+	/// Builds the API-key direct Messages SSE decoder for transport fixtures.
+	#[cfg(test)]
+	pub(crate) fn direct() -> Self {
+		Self {
+			adapter:           AnthropicAdapter::Direct,
+			claude_code_oauth: false,
+			inner:             AnthropicDecoder::new(),
+			signature_cursor:  0,
+			citation_cursor:   0,
+			history_cursor:    0,
+		}
+	}
 }
 
 impl Decoder for AnthropicWireDecoder {
@@ -2420,12 +2545,22 @@ impl AnthropicDecoder {
 	}
 
 	/// Finishes the stream, rejecting a response that omitted `message_stop`.
+	///
+	/// A body that ends before any canonical block opened carried nothing the
+	/// caller could have seen, so the attempt is a transient envelope failure
+	/// that is replayed on the same route (pi retries
+	/// `AnthropicStreamEnvelopeError` while no replay-unsafe content streamed).
+	/// Once a text, thinking, or tool block opened the truncation is terminal.
 	pub(crate) fn finish(&self) -> Result<Vec<AnthropicEvent>, Error> {
 		if self.completed {
-			Ok(Vec::new())
-		} else {
-			Err(protocol_error("anthropic.sse.truncated", self.canonical_blocks != 0))
+			return Ok(Vec::new());
 		}
+		if self.canonical_blocks != 0 {
+			return Err(protocol_error("anthropic.sse.truncated", true));
+		}
+		let mut error = protocol_error("anthropic.sse.truncated_before_output", false);
+		error.action = RetryAction::SameRoute { after: ENVELOPE_RETRY_DELAY };
+		Err(error)
 	}
 
 	fn accepts_truncated_tool_delta(&self, data: &[u8]) -> bool {
@@ -2910,7 +3045,6 @@ fn protocol_error(reason: &'static str, committed: bool) -> Error {
 }
 
 fn provider_error(kind: Str, _message: Str, committed: bool) -> Error {
-	use std::time::Duration;
 	let (error_kind, status, action) = match kind.as_str() {
 		"authentication_error" => (
 			ErrorKind::Authentication,
@@ -3017,7 +3151,7 @@ mod tests {
 	use std::{sync::Arc, time::UNIX_EPOCH};
 
 	use http::{HeaderName, HeaderValue, Request};
-	use omp_catalog::{Catalog, WireTarget};
+	use omp_catalog::{Catalog, ThinkingPolicy, ThinkingRouting, WireModelId, WireTarget};
 	use omp_core::SecretString;
 
 	use super::*;
@@ -3085,6 +3219,303 @@ mod tests {
 			safety:            Arc::from([]),
 			negotiation:       NegotiationPolicy::default(),
 		}
+	}
+
+	fn resolved_thinking(mode: ThinkingMode) -> ThinkingSelection {
+		let policy = ThinkingPolicy::new(mode, [ThinkingEffort::High])
+			.expect("valid Anthropic thinking policy");
+		ThinkingRouting::default()
+			.resolve(&policy, Some(ThinkingEffort::High), WireModelId::from_ref("claude-test"))
+			.expect("thinking selection resolves")
+	}
+
+	#[test]
+	fn effort_is_gated_by_catalog_thinking_mode() {
+		let request = canonical_chat(&[]);
+		let adaptive = resolved_thinking(ThinkingMode::AnthropicAdaptive);
+		let mut policy = WirePolicy::baseline();
+		policy.reasoning.supports_output_effort = Some(true);
+		let adaptive_body = lower_chat(
+			sf!("claude-adaptive"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&policy,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&adaptive),
+			Some(16_384),
+			&request,
+		)
+		.expect("adaptive model lowers");
+		assert_eq!(
+			adaptive_body
+				.output_config
+				.as_ref()
+				.and_then(|config| config.effort.as_deref()),
+			Some("high"),
+		);
+
+		let budget = resolved_thinking(ThinkingMode::Budget);
+		let budget_body = lower_chat(
+			sf!("claude-budget"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::Budget),
+			Some(&budget),
+			Some(16_384),
+			&request,
+		)
+		.expect("budget model lowers");
+		assert!(
+			budget_body
+				.output_config
+				.as_ref()
+				.and_then(|config| config.effort.as_ref())
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn thinking_effort_map_matches_pi_request_shape() {
+		let mut thinking =
+			ThinkingPolicy::new(ThinkingMode::AnthropicAdaptive, [ThinkingEffort::High])
+				.expect("valid Anthropic thinking policy");
+		thinking
+			.effort_map
+			.insert(ThinkingEffort::High, sf!("provider-high"));
+		let mut routing = ThinkingRouting::default();
+		routing.effort_map.clone_from(&thinking.effort_map);
+		let selection = routing
+			.resolve(&thinking, Some(ThinkingEffort::High), WireModelId::from_ref("claude-test"))
+			.expect("mapped thinking selection resolves");
+		let mut policy = WirePolicy::baseline();
+		policy.reasoning.supports_output_effort = Some(true);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&policy,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert_eq!(
+			body
+				.output_config
+				.as_ref()
+				.and_then(|config| config.effort.as_deref()),
+			Some("provider-high"),
+		);
+	}
+
+	#[test]
+	fn reasoning_disabled_still_emits_catalog_max_tokens() {
+		let mut request = canonical_chat(&[]);
+		request.max_output_tokens = None;
+		let body = lower_chat(
+			sf!("claude-budget"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::Budget),
+			None,
+			Some(16_384),
+			&request,
+		)
+		.expect("non-reasoning model lowers");
+		assert_eq!(body.max_tokens, Some(16_384));
+
+		request.max_output_tokens = Some(8_192);
+		let explicit = lower_chat(
+			sf!("claude-budget"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::Budget),
+			None,
+			Some(16_384),
+			&request,
+		)
+		.expect("explicit maximum lowers");
+		assert_eq!(explicit.max_tokens, Some(8_192));
+
+		request.max_output_tokens = Some(32_768);
+		let clamped = lower_chat(
+			sf!("claude-budget"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			Some(ThinkingMode::Budget),
+			None,
+			Some(16_384),
+			&request,
+		)
+		.expect("oversized maximum lowers");
+		assert_eq!(clamped.max_tokens, Some(16_384));
+	}
+
+	fn lower_with_policy(
+		request: &ChatRequest,
+		policy: &WirePolicy,
+		mode: Option<ThinkingMode>,
+		selection: Option<&ThinkingSelection>,
+	) -> MessagesRequest {
+		lower_chat(
+			sf!("claude-test"),
+			ProviderId::from_ref("anthropic"),
+			CodecId::from_ref("anthropic"),
+			policy,
+			mode,
+			selection,
+			Some(16_384),
+			request,
+		)
+		.expect("policy request lowers")
+	}
+
+	#[test]
+	fn disable_strict_tools_matches_pi_request_shape() {
+		let mut request = canonical_chat(&[]);
+		let mut tool = request.tools[0].clone();
+		tool.name = sf!("bash");
+		request.tools = Arc::from([tool]);
+		let mut policy = WirePolicy::baseline();
+		policy.tool.disable_strict_tools = Some(true);
+		let body = lower_with_policy(&request, &policy, None, None);
+		let Tool::Client(tool) = &body.tools[0] else {
+			panic!("client tool expected");
+		};
+		assert!(tool.strict.is_none());
+	}
+
+	#[test]
+	fn inject_claude_code_instruction_matches_pi_request_shape() {
+		let mut enabled = WirePolicy::baseline();
+		enabled.role.inject_claude_code_instruction = Some(true);
+		let mut body = lower_with_policy(&canonical_chat(&["caller"]), &enabled, None, None);
+		let context = EncodeContext { policy: &enabled, ..EncodeContext::default() };
+		apply_claude_code_fingerprint(&mut body, &context);
+		assert!(matches!(
+			&body.system[0],
+			ContentBlock::Text { text, .. } if text.as_str() == CLAUDE_CODE_SYSTEM_INSTRUCTION
+		));
+
+		let mut disabled = WirePolicy::baseline();
+		disabled.role.inject_claude_code_instruction = Some(false);
+		let mut body = lower_with_policy(&canonical_chat(&["caller"]), &disabled, None, None);
+		let context = EncodeContext { policy: &disabled, ..EncodeContext::default() };
+		apply_claude_code_fingerprint(&mut body, &context);
+		assert!(matches!(
+			&body.system[0],
+			ContentBlock::Text { text, .. } if text.as_str() == "caller"
+		));
+	}
+
+	#[test]
+	fn supports_context_management_matches_pi_request_shape() {
+		let selection = resolved_thinking(ThinkingMode::AnthropicAdaptive);
+		let mut enabled = WirePolicy::baseline();
+		enabled.context.supports_management = Some(true);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&enabled,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert!(matches!(
+			body.context_management
+				.as_ref()
+				.and_then(|management| management.edits.first()),
+			Some(ContextEdit::ClearThinking20251015 { keep }) if keep.as_str() == "all"
+		));
+
+		enabled.context.supports_management = Some(false);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&enabled,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert!(body.context_management.is_none());
+	}
+
+	#[test]
+	fn supports_output_effort_matches_pi_request_shape() {
+		let selection = resolved_thinking(ThinkingMode::AnthropicAdaptive);
+		let mut policy = WirePolicy::baseline();
+		policy.reasoning.supports_output_effort = Some(false);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&policy,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert!(
+			body
+				.output_config
+				.as_ref()
+				.and_then(|config| config.effort.as_ref())
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn strip_image_input_matches_pi_request_shape() {
+		let mut request = canonical_chat(&[]);
+		request.messages = Arc::from([CanonicalMessage {
+			role:    Role::User,
+			content: Arc::from([
+				CanonicalContentPart::Image(MediaInput::Remote {
+					uri:        sf!("https://example.invalid/image.png"),
+					media_type: Some(sf!("image/png")),
+					name:       None,
+				}),
+				CanonicalContentPart::Text { text: sf!("describe"), proof: None },
+			]),
+			name:    None,
+		}]);
+		let mut policy = WirePolicy::baseline();
+		policy.image.strip_input = Some(true);
+		let body = lower_with_policy(&request, &policy, None, None);
+		assert_eq!(body.messages[0].content.len(), 1);
+		assert!(
+			matches!(&body.messages[0].content[0], ContentBlock::Text { text, .. } if text == "describe")
+		);
+	}
+
+	#[test]
+	fn disable_adaptive_thinking_matches_pi_request_shape() {
+		let selection = resolved_thinking(ThinkingMode::AnthropicAdaptive);
+		let mut policy = WirePolicy::baseline();
+		policy.reasoning.disable_adaptive = Some(true);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&policy,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Enabled { budget_tokens: 1_024, .. })));
+	}
+
+	#[test]
+	fn adaptive_mode_ignores_resolved_budget_unless_adaptive_is_disabled() {
+		let mut selection = resolved_thinking(ThinkingMode::AnthropicAdaptive);
+		selection.budget = Some(8_192);
+		let policy = WirePolicy::baseline();
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&policy,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Adaptive { .. })), "{:?}", body.thinking);
+
+		let mut disabled = WirePolicy::baseline();
+		disabled.reasoning.disable_adaptive = Some(true);
+		let body = lower_with_policy(
+			&canonical_chat(&[]),
+			&disabled,
+			Some(ThinkingMode::AnthropicAdaptive),
+			Some(&selection),
+		);
+		assert!(matches!(body.thinking, Some(Thinking::Enabled { budget_tokens: 8_192, .. })));
 	}
 
 	fn encoded_anthropic(kind: CredentialKind, system: &[&str]) -> EncodedRequest {
@@ -3196,7 +3627,7 @@ mod tests {
 
 	#[test]
 	fn subscription_oauth_beta_fingerprint_matches_cowork_order() {
-		let betas = claude_code_betas(&BetaSet::default(), true, true);
+		let betas = claude_code_betas(&BetaSet::default(), true, true, false, true);
 		assert_eq!(
 			betas.header_value(),
 			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
@@ -3204,7 +3635,7 @@ mod tests {
 			 prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
 			 advanced-tool-use-2025-11-20,effort-2025-11-24,fallback-credit-2026-06-01",
 		);
-		let utility = claude_code_betas(&BetaSet::default(), false, false);
+		let utility = claude_code_betas(&BetaSet::default(), false, false, false, true);
 		assert_eq!(
 			utility.header_value(),
 			"oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
@@ -3492,6 +3923,9 @@ mod tests {
 			sf!("claude-opus-5"),
 			ProviderId::from_ref("anthropic"),
 			CodecId::from_ref("anthropic"),
+			&WirePolicy::baseline(),
+			None,
+			None,
 			None,
 			&request,
 		)
@@ -3596,7 +4030,7 @@ mod tests {
 				},
 			},
 		]);
-		let plans = plan_tool_schemas(&tools);
+		let plans = plan_tool_schemas(&tools, false);
 		// Allowlisted, closed object: promoted; the optional `timeout`
 		// property stays optional within the optional budget.
 		assert!(plans[0].strict);
@@ -3632,7 +4066,7 @@ mod tests {
 				strict:     true,
 			},
 		}]);
-		let plans = plan_tool_schemas(&tools);
+		let plans = plan_tool_schemas(&tools, false);
 		assert!(plans[0].strict);
 		let required = plans[0].input_schema["required"]
 			.as_array()
@@ -3677,6 +4111,7 @@ mod tests {
 			None,
 			&provider,
 			&codec,
+			false,
 		)
 		.expect("tool results lower");
 		assert_eq!(
@@ -3909,8 +4344,56 @@ mod tests {
 				truncated.push_data(data).unwrap();
 			},
 		);
-		assert_eq!(truncated.finish().unwrap_err().kind, ErrorKind::StreamCorruption);
+		let truncated = truncated.finish().unwrap_err();
+		assert_eq!(truncated.kind, ErrorKind::StreamCorruption);
+		assert!(truncated.committed, "a truncated tool block is visible output");
+		assert_eq!(truncated.action, RetryAction::Never);
 	}
+
+	#[test]
+	fn stream_closed_before_any_output_is_replayed_on_the_same_route() {
+		// The provider answered 200, opened the envelope, kept the connection
+		// alive, then closed the body before a single content block: nothing
+		// reached the caller, so the attempt is replay-safe (pi retries
+		// `AnthropicStreamEnvelopeError` until replay-unsafe content streams).
+		let mut envelope_only = AnthropicDecoder::new();
+		for data in [
+			br#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":22029,"output_tokens":1}}}"#.as_slice(),
+			br#"{"type":"ping"}"#.as_slice(),
+			br#"{"type":"ping"}"#.as_slice(),
+		] {
+			assert!(envelope_only.push_data(data).expect("preamble decodes").is_empty());
+		}
+		let error = envelope_only.finish().unwrap_err();
+		assert_eq!(error.kind, ErrorKind::StreamCorruption);
+		assert!(!error.committed);
+		assert_eq!(error.action, RetryAction::SameRoute { after: ENVELOPE_RETRY_DELAY });
+		assert!(matches!(
+			error.detail_ref(),
+			Some(ErrorDetail::Protocol { reason }) if reason.0.as_str() == "anthropic.sse.truncated_before_output"
+		));
+
+		let empty = AnthropicDecoder::new();
+		let error = empty.finish().unwrap_err();
+		assert!(!error.committed);
+		assert_eq!(error.action, RetryAction::SameRoute { after: ENVELOPE_RETRY_DELAY });
+
+		// Once a canonical block opened the caller may have seen output; the
+		// truncation is terminal exactly as before.
+		let mut text_opened = AnthropicDecoder::new();
+		text_opened
+			.push_data(br#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#)
+			.expect("text block opens");
+		let error = text_opened.finish().unwrap_err();
+		assert_eq!(error.kind, ErrorKind::StreamCorruption);
+		assert!(error.committed);
+		assert_eq!(error.action, RetryAction::Never);
+		assert!(matches!(
+			error.detail_ref(),
+			Some(ErrorDetail::Protocol { reason }) if reason.0.as_str() == "anthropic.sse.truncated"
+		));
+	}
+
 	#[test]
 	fn repairable_tool_arguments_remain_raw_until_recovery() {
 		let mut decoder = AnthropicDecoder::new();
@@ -3980,6 +4463,7 @@ mod tests {
 			None,
 			&provider,
 			&codec,
+			false,
 		)
 		.expect("same-provider opaque history replays");
 		assert!(matches!(

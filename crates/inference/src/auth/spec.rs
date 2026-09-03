@@ -425,8 +425,9 @@ pub enum CatalogAuthSpecError {
 	/// A dynamic `SigV4` region was not resolved during route construction.
 	#[error("catalog SigV4 route requires a resolved signing region")]
 	MissingSigningRegion,
-	/// Catalog contains a non-OMP credential environment declaration.
-	#[error("catalog credential environment source must contain only OMP_* names")]
+	/// Catalog credential environment declaration does not lead with an OMP
+	/// name.
+	#[error("catalog credential environment source must lead with an OMP_* name")]
 	InvalidEnvironmentSource,
 	/// Converted runtime data failed structural validation.
 	#[error("catalog auth converts to an invalid runtime specification")]
@@ -807,18 +808,25 @@ impl AdcSpec {
 			return Err(AuthSpecError::EmptySources);
 		}
 		for names in [&self.api_key_env, &self.project_env, &self.location_env] {
-			if names.iter().any(|name| !name.starts_with("OMP_")) {
+			if names.first().is_some_and(|name| !name.starts_with("OMP_")) {
 				return Err(AuthSpecError::InvalidEnvironmentSource);
 			}
+		}
+		if self
+			.sources
+			.iter()
+			.find_map(|source| match source {
+				AdcSourceSpec::EnvironmentAccessToken { variable } => Some(variable),
+				_ => None,
+			})
+			.is_some_and(|name| !name.starts_with("OMP_"))
+		{
+			return Err(AuthSpecError::InvalidEnvironmentSource);
 		}
 		self.placement.validate()?;
 		for source in &self.sources {
 			match source {
-				AdcSourceSpec::EnvironmentAccessToken { variable } => {
-					if !variable.starts_with("OMP_") {
-						return Err(AuthSpecError::InvalidEnvironmentSource);
-					}
-				},
+				AdcSourceSpec::EnvironmentAccessToken { .. } => {},
 				AdcSourceSpec::CredentialFile { path_variable, default_path } => {
 					if path_variable.is_none() && default_path.is_none() {
 						return Err(AuthSpecError::MissingCredentialPath);
@@ -837,7 +845,7 @@ impl AdcSpec {
 	}
 }
 fn validate_environment_names(names: &[Str]) -> Result<(), CatalogAuthSpecError> {
-	if names.is_empty() || names.iter().any(|name| !name.starts_with("OMP_")) {
+	if names.first().is_none_or(|name| !name.starts_with("OMP_")) {
 		Err(CatalogAuthSpecError::InvalidEnvironmentSource)
 	} else {
 		Ok(())
@@ -916,8 +924,9 @@ pub enum AuthSpecError {
 	/// `SigV4` unsigned-header names must already be canonical lower case.
 	#[error("SigV4 unsigned-header name is not lower case")]
 	UnsignedHeaderNotLowercase,
-	/// Credential environment variables must be explicitly OMP-prefixed.
-	#[error("credential environment source must contain only OMP_* names")]
+	/// Credential environment variable lists must lead with an OMP-prefixed
+	/// name.
+	#[error("credential environment source must lead with an OMP_* name")]
 	InvalidEnvironmentSource,
 }
 
@@ -927,19 +936,19 @@ fn validate_sources(sources: &[CredentialSourceSpec]) -> Result<(), AuthSpecErro
 	}
 	for source in sources {
 		if let CredentialSourceSpec::Environment { variables } = source
-			&& (variables.is_empty() || variables.iter().any(|name| !name.starts_with("OMP_")))
+			&& variables
+				.first()
+				.is_none_or(|name| !name.starts_with("OMP_"))
 		{
 			return Err(AuthSpecError::InvalidEnvironmentSource);
 		}
 		if let CredentialSourceSpec::BasicEnvironment { username_variables, password_variables } =
-			source && (username_variables.is_empty()
-			|| password_variables.is_empty()
-			|| username_variables
-				.iter()
-				.any(|name| !name.starts_with("OMP_"))
+			source && (username_variables
+			.first()
+			.is_none_or(|name| !name.starts_with("OMP_"))
 			|| password_variables
-				.iter()
-				.any(|name| !name.starts_with("OMP_")))
+				.first()
+				.is_none_or(|name| !name.starts_with("OMP_")))
 		{
 			return Err(AuthSpecError::InvalidEnvironmentSource);
 		}
@@ -1044,6 +1053,18 @@ mod tests {
 			spec(OAuthExchangeKind::PerplexityEmailOtp).validate(),
 			Err(AuthSpecError::EmptyField("OAuth client id"))
 		);
+	}
+
+	#[test]
+	fn environment_sources_require_only_the_first_name_to_be_omp_prefixed() {
+		let invalid =
+			[CredentialSourceSpec::Environment { variables: vec!["ANTHROPIC_API_KEY".into()] }];
+		assert_eq!(validate_sources(&invalid), Err(AuthSpecError::InvalidEnvironmentSource));
+
+		let valid = [CredentialSourceSpec::Environment {
+			variables: vec!["OMP_ANTHROPIC_API_KEY".into(), "ANTHROPIC_API_KEY".into()],
+		}];
+		assert_eq!(validate_sources(&valid), Ok(()));
 	}
 
 	#[test]

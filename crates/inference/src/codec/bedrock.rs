@@ -10,8 +10,8 @@ use std::{
 use bytes::Bytes;
 use omp_catalog::{
 	Availability, ChatCapabilities, ClassId, DiscoveredModel, ModalityBits, ModelAvailability,
-	ModelCapabilities, OperationBits, OperationKind, ReasoningEffort, ThinkingEffort, ThinkingMode,
-	ThinkingToolChoiceConflict, WireModelId,
+	ModelCapabilities, OperationBits, OperationKind, PromptCacheMode, ReasoningEffort,
+	ThinkingEffort, ThinkingMode, ThinkingToolChoiceConflict, WireModelId,
 };
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize, Serializer};
@@ -556,27 +556,26 @@ fn encode_converse_request(
 			&mut explicit_cache,
 		)?;
 	}
-	if !explicit_cache && let Some(retention) = setting_value(&request.cache_retention) {
-		if matches!(retention, CacheRetention::Long)
-			&& context.policy.cache.supports_long_retention == Some(false)
-		{
-			return Err(encoding_error(
-				ErrorKind::CapabilityMismatch,
-				"bedrock.cache.long_retention_unsupported",
-			));
-		}
-		let point = cache_point(*retention);
-		if let Some(message) = messages
-			.iter_mut()
-			.rev()
-			.find(|message| message.role == "user")
+	if !explicit_cache
+		&& let Some(retention) = setting_value(&request.cache_retention)
+		&& context.policy.cache.prompt_cache_mode == Some(PromptCacheMode::Explicit)
+	{
+		let mut remaining = context.policy.cache.maximum_checkpoints.unwrap_or(0).min(2);
+		let long_retention = matches!(retention, CacheRetention::Long)
+			&& context.policy.cache.supports_long_retention == Some(true);
+		if remaining > 0
+			&& let Some(message) = messages
+				.iter_mut()
+				.rev()
+				.find(|message| message.role == "user")
 		{
 			message
 				.content
-				.push(WireContentBlock::CachePoint { cache_point: point });
+				.push(WireContentBlock::CachePoint { cache_point: cache_point(long_retention) });
+			remaining -= 1;
 		}
-		if !system.is_empty() {
-			system.push(SystemBlock::CachePoint { cache_point: cache_point(*retention) });
+		if remaining > 0 && !system.is_empty() {
+			system.push(SystemBlock::CachePoint { cache_point: cache_point(long_retention) });
 		}
 	}
 
@@ -625,16 +624,13 @@ fn encode_message(
 					));
 				},
 				ContentPart::CachePoint(retention) => {
-					if matches!(retention, CacheRetention::Long)
-						&& context.policy.cache.supports_long_retention == Some(false)
-					{
-						return Err(encoding_error(
-							ErrorKind::CapabilityMismatch,
-							"bedrock.cache.long_retention_unsupported",
-						));
-					}
 					*explicit_cache = true;
-					system.push(SystemBlock::CachePoint { cache_point: cache_point(*retention) });
+					system.push(SystemBlock::CachePoint {
+						cache_point: cache_point(
+							matches!(retention, CacheRetention::Long)
+								&& context.policy.cache.supports_long_retention == Some(true),
+						),
+					});
 				},
 				ContentPart::Text { .. } => {},
 				_ => {
@@ -746,16 +742,13 @@ fn encode_message(
 				return Err(encoding_error(ErrorKind::InvalidRequest, "bedrock.tool_result.role"));
 			},
 			ContentPart::CachePoint(retention) => {
-				if matches!(retention, CacheRetention::Long)
-					&& context.policy.cache.supports_long_retention == Some(false)
-				{
-					return Err(encoding_error(
-						ErrorKind::CapabilityMismatch,
-						"bedrock.cache.long_retention_unsupported",
-					));
-				}
 				*explicit_cache = true;
-				content.push(WireContentBlock::CachePoint { cache_point: cache_point(*retention) });
+				content.push(WireContentBlock::CachePoint {
+					cache_point: cache_point(
+						matches!(retention, CacheRetention::Long)
+							&& context.policy.cache.supports_long_retention == Some(true),
+					),
+				});
 			},
 		}
 	}
@@ -878,8 +871,8 @@ fn tool_result_content(content: &ToolResultContent) -> Result<WireToolResultCont
 	}
 }
 
-fn cache_point(retention: CacheRetention) -> CachePoint {
-	CachePoint { kind: "default", ttl: matches!(retention, CacheRetention::Long).then_some("1h") }
+const fn cache_point(long_retention: bool) -> CachePoint {
+	CachePoint { kind: "default", ttl: if long_retention { Some("1h") } else { None } }
 }
 
 fn inference_config(request: &ChatRequest) -> Option<InferenceConfig> {
@@ -2291,7 +2284,7 @@ fn stream_error(kind: ErrorKind, reason: &'static str, committed: bool) -> Error
 mod tests {
 	use std::sync::Arc;
 
-	use omp_catalog::{Catalog, CodecId, PolicyModel, ProviderId, WireTarget};
+	use omp_catalog::{Catalog, CodecId, PolicyModel, ProviderId, WirePolicy, WireTarget};
 
 	use super::*;
 	use crate::{
@@ -2309,6 +2302,16 @@ mod tests {
 		options: &BedrockOptions,
 		mode: ThinkingMode,
 		interleaved: bool,
+	) -> Bytes {
+		encode_fixture_with_policy(request, options, mode, interleaved, |_| {})
+	}
+
+	fn encode_fixture_with_policy(
+		request: &ChatRequest,
+		options: &BedrockOptions,
+		mode: ThinkingMode,
+		interleaved: bool,
+		configure: impl FnOnce(&mut WirePolicy),
 	) -> Bytes {
 		let catalog = Catalog::embedded();
 		let fixture_model = if mode == ThinkingMode::AnthropicAdaptive {
@@ -2339,6 +2342,7 @@ mod tests {
 			.expect("embedded Bedrock wire policy")
 			.clone();
 		policy.reasoning.interleaved_thinking = interleaved.then_some(true);
+		configure(&mut policy);
 		let mut explicit_thinking_policy = model
 			.thinking
 			.as_ref()
@@ -2555,8 +2559,105 @@ mod tests {
 			text_message(Role::User, "Continue without more tools."),
 		]);
 		request.cache_retention = Setting::Require(CacheRetention::Long);
-		assert_fixture(encode_fixture(&request, &BedrockOptions::default()), "cache");
+		assert_fixture(
+			encode_fixture_with_policy(
+				&request,
+				&BedrockOptions::default(),
+				ThinkingMode::Budget,
+				false,
+				|policy| policy.cache.supports_long_retention = Some(true),
+			),
+			"cache",
+		);
 	}
+	#[test]
+	fn prompt_cache_mode_matches_pi_request_shape() {
+		let mut request = base_request(vec![
+			text_message(Role::System, "stable system"),
+			text_message(Role::User, "cache me"),
+		]);
+		request.cache_retention = Setting::Require(CacheRetention::Short);
+
+		let automatic = encode_fixture_with_policy(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Budget,
+			false,
+			|policy| {
+				policy.cache.prompt_cache_mode = Some(PromptCacheMode::Automatic);
+				policy.cache.maximum_checkpoints = Some(2);
+			},
+		);
+		let automatic: Value =
+			serde_json::from_slice(&automatic).expect("automatic cache request is JSON");
+		assert!(!automatic.to_string().contains("cachePoint"));
+
+		let explicit = encode_fixture_with_policy(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Budget,
+			false,
+			|policy| {
+				policy.cache.prompt_cache_mode = Some(PromptCacheMode::Explicit);
+				policy.cache.maximum_checkpoints = Some(2);
+			},
+		);
+		let explicit: Value =
+			serde_json::from_slice(&explicit).expect("explicit cache request is JSON");
+		assert_eq!(
+			explicit["messages"][0]["content"][1],
+			serde_json::json!({"cachePoint":{"type":"default"}}),
+		);
+		assert_eq!(explicit["system"][1], serde_json::json!({"cachePoint":{"type":"default"}}),);
+	}
+
+	#[test]
+	fn prompt_cache_maximum_checkpoints_matches_pi_request_shape() {
+		let mut request = base_request(vec![
+			text_message(Role::System, "stable system"),
+			text_message(Role::User, "cache me"),
+		]);
+		request.cache_retention = Setting::Require(CacheRetention::Short);
+		let body = encode_fixture_with_policy(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Budget,
+			false,
+			|policy| {
+				policy.cache.prompt_cache_mode = Some(PromptCacheMode::Explicit);
+				policy.cache.maximum_checkpoints = Some(1);
+			},
+		);
+		let body: Value = serde_json::from_slice(&body).expect("cache request is JSON");
+		assert_eq!(
+			body["messages"][0]["content"][1],
+			serde_json::json!({"cachePoint":{"type":"default"}}),
+		);
+		assert_eq!(body["system"], serde_json::json!([{"text":"stable system"}]));
+	}
+
+	#[test]
+	fn supports_long_prompt_cache_retention_matches_pi_request_shape() {
+		let mut request = base_request(vec![text_message(Role::User, "cache me")]);
+		request.cache_retention = Setting::Require(CacheRetention::Long);
+		let body = encode_fixture_with_policy(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Budget,
+			false,
+			|policy| {
+				policy.cache.prompt_cache_mode = Some(PromptCacheMode::Explicit);
+				policy.cache.maximum_checkpoints = Some(1);
+				policy.cache.supports_long_retention = Some(true);
+			},
+		);
+		let body: Value = serde_json::from_slice(&body).expect("long cache request is JSON");
+		assert_eq!(
+			body["messages"][0]["content"][1],
+			serde_json::json!({"cachePoint":{"type":"default","ttl":"1h"}}),
+		);
+	}
+
 	#[test]
 	fn replay_demotes_unsigned_reasoning_and_preserves_signed_reasoning_content() {
 		let proof = ProviderProof {

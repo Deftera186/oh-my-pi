@@ -16,7 +16,7 @@ use tracing::Instrument as _;
 
 use crate::{
 	answer::{Answer, AnswerBody, ResponseMeta},
-	auth::AuthManager,
+	auth::{AuthManager, CatalogAuthSpecError},
 	body::RetryDecision,
 	call::{Call, OperationCall},
 	catalog::{CatalogRevision, OperationKind, ProviderId, RouteDef, RouteId, snapshot::Catalog},
@@ -31,21 +31,101 @@ use crate::{
 			build_execution_stack,
 		},
 	},
-	operation::usage::ConsoleUsageManager,
+	operation::{discovery::CatalogDiscoveryProjectorError, usage::ConsoleUsageManager},
 	provider::ProviderService,
 	receipt::{AttemptOutcome, ExecutionReceipt, ReasonId},
 	settings,
 };
 
 /// Typed evidence explaining why a catalog route has no constructed service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RouteUnavailable {
-	/// Catalog route that could not be constructed.
-	pub route:     RouteId,
-	/// Stable secret-free reason.
-	pub reason:    ReasonId,
-	/// Operation affected when the failure is narrower than the route.
-	pub operation: Option<OperationKind>,
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum RouteUnavailable {
+	/// Construction failed without a more precise typed source.
+	#[error("route unavailable")]
+	Static {
+		/// Catalog route that could not be constructed.
+		route:     RouteId,
+		/// Stable secret-free reason.
+		reason:    ReasonId,
+		/// Operation affected when the failure is narrower than the route.
+		operation: Option<OperationKind>,
+	},
+	/// The route's catalog discovery projection is invalid.
+	#[error("route discovery projector is invalid")]
+	CatalogDiscoveryProjector {
+		/// Catalog route that could not be constructed.
+		route:     RouteId,
+		/// Stable secret-free reason.
+		reason:    ReasonId,
+		/// Operation affected when the failure is narrower than the route.
+		operation: Option<OperationKind>,
+		/// Exact catalog projection failure.
+		#[source]
+		source:    CatalogDiscoveryProjectorError,
+	},
+	/// The route's catalog authentication specification is invalid.
+	#[error("route authentication specification is invalid")]
+	CatalogAuthSpec {
+		/// Catalog route that could not be constructed.
+		route:     RouteId,
+		/// Stable secret-free reason.
+		reason:    ReasonId,
+		/// Operation affected when the failure is narrower than the route.
+		operation: Option<OperationKind>,
+		/// Exact catalog authentication conversion failure.
+		#[source]
+		source:    CatalogAuthSpecError,
+	},
+	/// The route's model-discovery codec specification is invalid.
+	#[error("route discovery codec specification is invalid")]
+	DiscoveryCodec {
+		/// Catalog route that could not be constructed.
+		route:     RouteId,
+		/// Stable secret-free reason.
+		reason:    ReasonId,
+		/// Operation affected when the failure is narrower than the route.
+		operation: Option<OperationKind>,
+		/// Exact codec construction failure.
+		#[source]
+		source:    Error,
+	},
+}
+
+impl RouteUnavailable {
+	/// Creates source-free construction evidence.
+	pub const fn new(route: RouteId, reason: ReasonId, operation: Option<OperationKind>) -> Self {
+		Self::Static { route, reason, operation }
+	}
+
+	/// Returns the catalog route that could not be constructed.
+	pub const fn route(&self) -> &RouteId {
+		match self {
+			Self::Static { route, .. }
+			| Self::CatalogDiscoveryProjector { route, .. }
+			| Self::CatalogAuthSpec { route, .. }
+			| Self::DiscoveryCodec { route, .. } => route,
+		}
+	}
+
+	/// Returns the stable secret-free reason.
+	pub const fn reason(&self) -> &ReasonId {
+		match self {
+			Self::Static { reason, .. }
+			| Self::CatalogDiscoveryProjector { reason, .. }
+			| Self::CatalogAuthSpec { reason, .. }
+			| Self::DiscoveryCodec { reason, .. } => reason,
+		}
+	}
+
+	/// Returns the operation affected by this construction failure.
+	pub const fn operation(&self) -> Option<OperationKind> {
+		match self {
+			Self::Static { operation, .. }
+			| Self::CatalogDiscoveryProjector { operation, .. }
+			| Self::CatalogAuthSpec { operation, .. }
+			| Self::DiscoveryCodec { operation, .. } => *operation,
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -324,13 +404,13 @@ impl RegistryBuilder {
 	/// Registers typed unavailability for a catalog route that cannot be
 	/// constructed.
 	pub fn register_unavailable(mut self, evidence: RouteUnavailable) -> Result<Self, Error> {
-		self.require_catalog_route(&evidence.route)?;
+		self.require_catalog_route(evidence.route())?;
 		if self
 			.bindings
-			.insert(evidence.route.clone(), RouteBinding::Unavailable(evidence.clone()))
+			.insert(evidence.route().clone(), RouteBinding::Unavailable(evidence.clone()))
 			.is_some()
 		{
-			return Err(duplicate_route_error(&evidence.route));
+			return Err(duplicate_route_error(evidence.route()));
 		}
 		self.generation = self.generation.saturating_add(1);
 		Ok(self)
@@ -785,18 +865,28 @@ fn hide_attempts_since(context: &ExecutionContext, start: usize) {
 	});
 }
 
-fn route_unavailable_error(evidence: &RouteUnavailable, operation: OperationKind) -> Error {
-	let reason = if evidence.operation.is_none() || evidence.operation == Some(operation) {
-		evidence.reason.clone()
+/// Projects construction evidence into the planning error returned to callers.
+pub(crate) fn route_unavailable_error(
+	evidence: &RouteUnavailable,
+	operation: OperationKind,
+) -> Error {
+	let reason = if evidence.operation().is_none() || evidence.operation() == Some(operation) {
+		evidence.reason().clone()
 	} else {
 		ReasonId(sf!("route-operation-not-constructed"))
 	};
-	Error::planning(
+	let error = Error::planning(
 		ErrorKind::RouteUnavailable,
 		ErrorDetail::capability(Str::new(operation.to_string()), reason),
 		ExecutionReceipt::default(),
 	)
-	.route(evidence.route.clone())
+	.route(evidence.route().clone());
+	match evidence {
+		RouteUnavailable::CatalogDiscoveryProjector { source, .. } => {
+			error.projector_source(source.clone())
+		},
+		_ => error,
+	}
 }
 
 fn target_error(selector: &str) -> Error {

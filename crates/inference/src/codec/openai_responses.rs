@@ -26,7 +26,8 @@ use crate::{
 	catalog::{
 		ModalityBits, OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
 		policy::{
-			ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport, ImageEncodingFormat,
+			ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
+			ImageEncodingFormat,
 		},
 	},
 	error::{Error, ErrorKind, RetryAction},
@@ -135,42 +136,46 @@ pub enum ResponsesImageDetail {
 pub struct ResponsesContent {
 	/// Content discriminator.
 	#[serde(rename = "type")]
-	pub kind:      ResponsesContentKind,
+	pub kind:                    ResponsesContentKind,
 	/// Text or refusal content.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub text:      Option<Str>,
+	pub text:                    Option<Str>,
 	/// Data or remote image URL.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub image_url: Option<Str>,
+	pub image_url:               Option<Str>,
 	/// Image detail, omitted to preserve the server default.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub detail:    Option<ResponsesImageDetail>,
+	pub detail:                  Option<ResponsesImageDetail>,
 	/// Data URL carrying an inline file.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub file_data: Option<Str>,
+	pub file_data:               Option<Str>,
 	/// Remote file URL.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub file_url:  Option<Str>,
+	pub file_url:                Option<Str>,
 	/// Original file name.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub filename:  Option<Str>,
+	pub filename:                Option<Str>,
 	/// Provider file identity.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub file_id:   Option<Str>,
+	pub file_id:                 Option<Str>,
+	/// Explicit OpenAI prompt-cache breakpoint.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_breakpoint: Option<ResponsesPromptCacheBreakpoint>,
 }
 
 impl ResponsesContent {
 	/// Constructs a text input part.
 	pub fn input_text(text: impl Into<Str>) -> Self {
 		Self {
-			kind:      ResponsesContentKind::InputText,
-			text:      Some(text.into()),
-			image_url: None,
-			detail:    None,
-			file_data: None,
-			file_url:  None,
-			filename:  None,
-			file_id:   None,
+			kind:                    ResponsesContentKind::InputText,
+			text:                    Some(text.into()),
+			image_url:               None,
+			detail:                  None,
+			file_data:               None,
+			file_url:                None,
+			filename:                None,
+			file_id:                 None,
+			prompt_cache_breakpoint: None,
 		}
 	}
 }
@@ -200,6 +205,14 @@ impl ResponsesInputContent {
 		}
 	}
 
+	/// Visits typed parts; compact text has no part list.
+	pub fn parts(&self) -> Option<&[ResponsesContent]> {
+		match self {
+			Self::Text(_) => None,
+			Self::Parts(parts) => Some(parts),
+		}
+	}
+
 	/// Mutably visits typed parts; compact text has no part list.
 	pub fn parts_mut(&mut self) -> Option<&mut [ResponsesContent]> {
 		match self {
@@ -207,6 +220,23 @@ impl ResponsesInputContent {
 			Self::Parts(parts) => Some(parts),
 		}
 	}
+}
+
+/// Explicit cache breakpoint attached to one stable content part.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesPromptCacheBreakpoint {
+	/// Breakpoint selection mode.
+	pub mode: Str,
+}
+
+/// Top-level explicit prompt-cache controls.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResponsesPromptCacheOptions {
+	/// Prompt-cache selection mode.
+	pub mode: Str,
+	/// Optional provider retention.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ttl:  Option<Str>,
 }
 
 /// Prompt-cache marker attached to an individual input item.
@@ -630,9 +660,12 @@ pub struct ResponsesTextOptions {
 	pub format:    Option<ResponsesTextFormat>,
 }
 
-/// Codex stream controls.
+/// Responses stream controls.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResponsesStreamOptions {
+	/// Disable provider-added stream obfuscation padding.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub include_obfuscation:        Option<bool>,
 	/// Reasoning-summary delivery strategy.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reasoning_summary_delivery: Option<Str>,
@@ -663,6 +696,12 @@ pub struct ResponsesRequest {
 	/// Prompt-cache retention string.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prompt_cache_retention: Option<Str>,
+	/// Explicit cache-breakpoint controls.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_options:   Option<ResponsesPromptCacheOptions>,
+	/// Anthropic-compatible cache control accepted by compatible gateways.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_control:          Option<ResponsesCacheControl>,
 	/// Requested native output inclusions.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub include:                Vec<Str>,
@@ -741,6 +780,8 @@ pub struct OpenAiResponsesOptions {
 	pub reasoning_mode:         Option<Str>,
 	/// Explicit reasoning summary selection; `Some(None)` sends JSON null.
 	pub reasoning_summary:      Option<Option<Str>>,
+	/// Provider reasoning-history scope.
+	pub reasoning_context:      Option<Str>,
 	/// Extra typed custom tools not expressible as canonical function tools.
 	pub custom_tools:           Vec<ResponsesTool>,
 	/// Native computer-use tool declaration.
@@ -2383,11 +2424,14 @@ impl OpenAiResponsesCodec {
 		let target = context
 			.target
 			.ok_or(ResponsesEncodeError::MissingWireTarget)?;
-		let supports_images = supports_tool_result_images(context);
+		let supports_images =
+			supports_tool_result_images(context) && context.policy.image.strip_input != Some(true);
 		let supports_detail_original = context.policy.image.supports_detail_original == Some(true);
 		let mut adjustments = Vec::new();
 		let mut input = Vec::new();
 		let mut instructions = Vec::new();
+		let mut has_prompt_cache_breakpoint = false;
+		let mut known_call_ids = BTreeSet::new();
 		let mut continuation_id = self
 			.options
 			.continuation
@@ -2560,7 +2604,11 @@ impl OpenAiResponsesCodec {
 							metadata: BTreeMap::new(),
 						});
 					},
-					ContentPart::Image(media) => content.push(encode_media_content(media, true)?),
+					ContentPart::Image(media) => {
+						if context.policy.image.strip_input != Some(true) {
+							content.push(encode_media_content(media, true)?);
+						}
+					},
 					ContentPart::Document(media) => content.push(encode_media_content(media, false)?),
 					ContentPart::Audio(_) => {
 						return Err(ResponsesEncodeError::UnsupportedOutputFormat);
@@ -2610,6 +2658,7 @@ impl OpenAiResponsesCodec {
 									.and_then(serde_json::Value::as_str)
 									.map_or_else(|| Str::new(serialized.as_str()), Str::new)
 							});
+							known_call_ids.insert(call_id.clone());
 							input.push(ResponsesInputItem {
 								kind: Some(if custom {
 									ResponsesInputItemKind::CustomToolCall
@@ -2636,19 +2685,34 @@ impl OpenAiResponsesCodec {
 							});
 						}
 					},
-					ContentPart::ToolResult { call, content: result, .. } => {
+					ContentPart::ToolResult { call, name, content: result, .. } => {
 						if !content.is_empty() {
 							input.push(ResponsesInputItem::message(role, mem::take(&mut content)));
 						}
 						let output =
 							encode_tool_result_output(result, supports_images, supports_detail_original)?;
+						let call_id = Str::new(call.as_str());
+						if context.policy.tool.strict_responses_pairing == Some(true)
+							&& !known_call_ids.contains(&call_id)
+						{
+							let tool = name.as_deref().unwrap_or("tool");
+							let note = sf!(
+								"[Orphan {tool} result; call_id={}]: {}",
+								call.as_str(),
+								orphan_tool_result_text(&output)
+							);
+							input.push(ResponsesInputItem::message(ResponsesRole::Assistant, vec![
+								ResponsesContent::input_text(note),
+							]));
+							continue;
+						}
 						input.push(ResponsesInputItem {
 							kind: Some(ResponsesInputItemKind::FunctionCallOutput),
 							id: None,
 							role: None,
 							content: ResponsesInputContent::default(),
 							name: None,
-							call_id: Some(Str::new(call.as_str())),
+							call_id: Some(call_id),
 							arguments: None,
 							input: None,
 							output: Some(output),
@@ -2664,6 +2728,19 @@ impl OpenAiResponsesCodec {
 						});
 					},
 					ContentPart::CachePoint(retention) => {
+						if context.policy.cache.supports_breakpoints == Some(true) {
+							let breakpoint = ResponsesPromptCacheBreakpoint { mode: sf!("explicit") };
+							if let Some(last) = content.last_mut() {
+								last.prompt_cache_breakpoint = Some(breakpoint);
+								has_prompt_cache_breakpoint = true;
+							} else if let Some(parts) =
+								input.last_mut().and_then(|item| item.content.parts_mut())
+								&& let Some(last) = parts.last_mut()
+							{
+								last.prompt_cache_breakpoint = Some(breakpoint);
+								has_prompt_cache_breakpoint = true;
+							}
+						}
 						let kind = match retention {
 							CacheRetention::Request | CacheRetention::Session | CacheRetention::Short => {
 								"ephemeral"
@@ -2718,6 +2795,7 @@ impl OpenAiResponsesCodec {
 
 		let apply_patch = context.policy.tool.apply_patch;
 		let flatten_root_unions = context.policy.tool.flatten_root_unions == Some(true);
+		let reject_root_object_union = context.policy.tool.reject_root_object_union == Some(true);
 		// Tools whose schemas still carry a root union the route rejects
 		// (xAI exclusive-required `anyOf`) are quarantined: the request
 		// proceeds without them, and a forced choice naming one is cleared
@@ -2744,7 +2822,13 @@ impl OpenAiResponsesCodec {
 								return None;
 							}
 						}
-						(ResponsesToolKind::Function, Some(schema), Some(*strict), None)
+						if reject_root_object_union && openai_chat::leftover_root_object_union(&schema) {
+							quarantined_tools.push(tool.name.clone());
+							return None;
+						}
+						let strict =
+							(context.policy.tool.supports_strict_mode != Some(false)).then_some(*strict);
+						(ResponsesToolKind::Function, Some(schema), strict, None)
 					},
 					ToolInputConstraint::JsonSchema { .. } => {
 						(ResponsesToolKind::Custom, None, None, None)
@@ -2921,12 +3005,12 @@ impl OpenAiResponsesCodec {
 				});
 				None
 			},
-			Some(ResponsesToolChoice::Named(_)) if context.policy.tool.named_choice == Some(false) => {
-				adjustments.push(ResponsesAdjustment::Dropped {
-					field:  sf!("tool_choice"),
-					reason: sf!("route policy rejects named tool choice"),
-				});
-				None
+			Some(ResponsesToolChoice::Named(named))
+				if context.policy.tool.named_choice == Some(false) =>
+			{
+				tools.retain(|tool| tool.name.as_ref() == named.name.as_ref());
+				(!tools.is_empty())
+					.then_some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required))
 			},
 			other => other,
 		};
@@ -2936,58 +3020,72 @@ impl OpenAiResponsesCodec {
 		// authoritative.
 		let tool_choice = match tool_choice {
 			Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto))
-				if context.policy.tool.disable_reasoning_on_choice == Some(true)
+				if (context.policy.tool.disable_reasoning_on_choice == Some(true)
+					|| context.policy.tool.disable_reasoning_on_forced_choice == Some(true))
 					&& matches!(&request.reasoning, Setting::Require(_) | Setting::Prefer(_)) =>
 			{
 				None
 			},
 			other => other,
 		};
-		let reasoning =
-			match &request.reasoning {
-				Setting::Unset => None,
-				Setting::Require(value) | Setting::Prefer(value) => {
-					if value.max_tokens.is_some() {
-						adjustments.push(ResponsesAdjustment::Dropped {
-							field:  sf!("reasoning.max_tokens"),
-							reason: sf!("Responses accepts qualitative effort only"),
-						});
-					}
-					// Routes without an effort dial (grok-build,
-					// grok-code-fast, …) 400 when `reasoning.effort` is
-					// present; policy omits the field while keeping the
-					// reasoning object itself.
-					let effort = if context.policy.reasoning.omit_effort == Some(true) {
-						None
-					} else {
-						value
-							.effort
-							.map(|effort| wire_reasoning_effort(context, effort))
-					};
-					// api.x.ai rejects `reasoning.summary` for SuperGrok and
-					// the paid key alike; the wire omits the field instead of
-					// filling `auto`.
-					let summary = if context.policy.reasoning.supports_summary == Some(false) {
-						None
-					} else {
-						self
-							.options
-							.reasoning_summary
-							.clone()
-							.or_else(|| match value.visibility {
-								ReasoningVisibility::Hidden => Some(None),
-								ReasoningVisibility::Summary | ReasoningVisibility::Visible => {
-									Some(Some(sf!("auto")))
-								},
-							})
-					};
-					// An all-omitted reasoning object carries no wire
-					// information; no-dial routes send no `reasoning` at all.
-					let mode = self.options.reasoning_mode.clone();
-					(effort.is_some() || summary.is_some() || mode.is_some())
-						.then(|| ResponsesReasoning { effort, summary, mode, context: None })
-				},
-			};
+		let reasoning = match &request.reasoning {
+			Setting::Unset => None,
+			Setting::Require(value) | Setting::Prefer(value)
+				if context.policy.reasoning.supports_params != Some(false) =>
+			{
+				if value.max_tokens.is_some() {
+					adjustments.push(ResponsesAdjustment::Dropped {
+						field:  sf!("reasoning.max_tokens"),
+						reason: sf!("Responses accepts qualitative effort only"),
+					});
+				}
+				// Routes without an effort dial (grok-build,
+				// grok-code-fast, …) 400 when `reasoning.effort` is
+				// present; policy omits the field while keeping the
+				// reasoning object itself.
+				let effort = if context.policy.reasoning.omit_effort == Some(true) {
+					None
+				} else {
+					value
+						.effort
+						.map(|effort| wire_reasoning_effort(context, effort))
+				};
+				// api.x.ai rejects `reasoning.summary` for SuperGrok and
+				// the paid key alike; the wire omits the field instead of
+				// filling `auto`.
+				let summary = if context.policy.reasoning.supports_summary == Some(false) {
+					None
+				} else {
+					self
+						.options
+						.reasoning_summary
+						.clone()
+						.or_else(|| match value.visibility {
+							ReasoningVisibility::Hidden => Some(None),
+							ReasoningVisibility::Summary | ReasoningVisibility::Visible => {
+								Some(Some(sf!("auto")))
+							},
+						})
+				};
+				// An all-omitted reasoning object carries no wire
+				// information; no-dial routes send no `reasoning` at all.
+				let mode = self.options.reasoning_mode.clone();
+				let reasoning_context = self.options.reasoning_context.clone();
+				(effort.is_some() || summary.is_some() || mode.is_some() || reasoning_context.is_some())
+					.then(|| ResponsesReasoning { effort, summary, mode, context: reasoning_context })
+			},
+			Setting::Require(_) | Setting::Prefer(_) => None,
+		};
+		if context.policy.reasoning.requires_off_juice_instruction == Some(true)
+			&& matches!(
+				&request.reasoning,
+				Setting::Require(value) | Setting::Prefer(value)
+					if value.effort == Some(ReasoningEffort::Off)
+			) {
+			input.push(ResponsesInputItem::message(ResponsesRole::Developer, vec![
+				ResponsesContent::input_text("# Juice: 0 !important"),
+			]));
+		}
 		let text = {
 			let verbosity = match &request.verbosity {
 				Setting::Unset => None,
@@ -3026,12 +3124,25 @@ impl OpenAiResponsesCodec {
 				.prompt_cache_retention
 				.clone()
 				.or_else(|| match &request.cache_retention {
-					Setting::Unset => None,
-					Setting::Require(CacheRetention::Long) | Setting::Prefer(CacheRetention::Long) => {
+					Setting::Require(CacheRetention::Long) | Setting::Prefer(CacheRetention::Long)
+						if context.policy.cache.supports_long_retention == Some(true) =>
+					{
 						Some(sf!("24h"))
 					},
-					Setting::Require(_) | Setting::Prefer(_) => Some(sf!("in_memory")),
+					Setting::Unset | Setting::Require(_) | Setting::Prefer(_) => None,
 				});
+		let prompt_cache_options = has_prompt_cache_breakpoint.then(|| {
+			let ttl = context
+				.policy
+				.cache
+				.breakpoint_ttl
+				.map(|ttl| Str::new(<&'static str>::from(ttl)));
+			ResponsesPromptCacheOptions { mode: sf!("explicit"), ttl }
+		});
+		let cache_control = (context.policy.cache.control_format
+			== Some(CacheControlFormat::Anthropic)
+			&& !matches!(request.cache_retention, Setting::Unset))
+		.then(|| ResponsesCacheControl { kind: sf!("ephemeral") });
 		let prompt_cache_key = if context.route.capability_limits.disable_prompt_caching {
 			None
 		} else {
@@ -3077,7 +3188,8 @@ impl OpenAiResponsesCodec {
 		// xAI `/v1/responses` rejects presence/frequency penalties for every
 		// Grok model; policy-conformant lowering omits them so configured
 		// penalties do not fail the route.
-		let penalties_supported = context.policy.structured.penalties != Some(false);
+		let penalties_supported = context.policy.structured.penalties != Some(false)
+			&& context.policy.structured.penalty_and_stop_params != Some(false);
 		let include = {
 			let mut values = self.options.include.clone();
 			// Encrypted reasoning is requested when the request preserves
@@ -3096,6 +3208,20 @@ impl OpenAiResponsesCodec {
 			}
 			values
 		};
+		let max_output_tokens = request.max_output_tokens.or_else(|| {
+			(context.policy.context.always_send_max_tokens == Some(true)).then(|| {
+				context
+					.policy_model
+					.and_then(|model| model.limits.maximum_output_tokens)
+					.or(context.route.capability_limits.maximum_output_tokens)
+					.unwrap_or(128_000)
+			})
+		});
+		let stream_options = (context.policy.streaming.supports_obfuscation_opt_out == Some(true))
+			.then(|| ResponsesStreamOptions {
+				include_obfuscation:        Some(false),
+				reasoning_summary_delivery: None,
+			});
 		let previous_response_id = if self.options.stateful {
 			continuation_id
 		} else {
@@ -3117,6 +3243,8 @@ impl OpenAiResponsesCodec {
 				previous_response_id,
 				prompt_cache_key,
 				prompt_cache_retention,
+				prompt_cache_options,
+				cache_control,
 				include,
 				tools,
 				additional_tools: Vec::new(),
@@ -3132,11 +3260,11 @@ impl OpenAiResponsesCodec {
 				frequency_penalty: penalties_supported
 					.then_some(request.sampling.frequency_penalty)
 					.flatten(),
-				max_output_tokens: request.max_output_tokens,
+				max_output_tokens,
 				service_tier,
 				metadata: self.options.metadata.clone(),
 				client_metadata: None,
-				stream_options: None,
+				stream_options,
 			},
 			adjustments,
 		})
@@ -3209,6 +3337,28 @@ fn supports_tool_result_images(context: &EncodeContext<'_>) -> bool {
 				.is_some_and(|modalities| modalities.contains(ModalityBits::IMAGE))
 		},
 	)
+}
+
+fn orphan_tool_result_text(output: &ResponsesToolOutput) -> Str {
+	match output {
+		ResponsesToolOutput::Text(text) => text.clone(),
+		ResponsesToolOutput::Computer(_) => sf!("[computer screenshot omitted]"),
+		ResponsesToolOutput::Multimodal(parts) => {
+			let mut text = String::new();
+			for part in parts {
+				match part {
+					ResponsesToolOutputPart::InputText { text: part } => text.push_str(part),
+					ResponsesToolOutputPart::InputImage { .. } => {
+						if !text.is_empty() {
+							text.push('\n');
+						}
+						text.push_str("[image omitted]");
+					},
+				}
+			}
+			Str::new(text)
+		},
+	}
 }
 
 fn encode_tool_result_output(
@@ -3383,6 +3533,7 @@ fn encode_media_content(
 				file_url: None,
 				filename: None,
 				file_id: None,
+				prompt_cache_breakpoint: None,
 			})
 		},
 		MediaInput::Remote { uri, name, .. } => Ok(ResponsesContent {
@@ -3394,6 +3545,7 @@ fn encode_media_content(
 			file_url: (!image).then(|| uri.clone()),
 			filename: (!image).then(|| name.clone()).flatten(),
 			file_id: None,
+			prompt_cache_breakpoint: None,
 		}),
 		MediaInput::Stored(_) | MediaInput::Body { .. } => {
 			Err(ResponsesEncodeError::UnresolvedStoredMedia)
@@ -3629,6 +3781,13 @@ impl Decoder for ResponsesDecoderAdapter {
 		}
 		Ok(())
 	}
+}
+
+fn prompt_cache_session_header(
+	header: Option<crate::catalog::policy::PromptCacheSessionHeader>,
+	value: Option<Str>,
+) -> Option<super::RequestHeader> {
+	Some(super::RequestHeader { name: Str::new(<&'static str>::from(header?)), value: value? })
 }
 
 fn encoding_error(code: &'static str) -> Error {
@@ -3928,6 +4087,18 @@ impl Codec for OpenAiResponsesCodec {
 		let body = serde_json::to_vec(&encoded.request)
 			.map(Bytes::from)
 			.map_err(|_| encoding_error("responses_request_serialization"))?;
+		let mut headers = vec![
+			super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
+			super::RequestHeader { name: sf!("accept"), value: sf!("text/event-stream") },
+		];
+		if let Some(header) = prompt_cache_session_header(
+			context.policy.headers.prompt_cache_session,
+			context
+				.session
+				.and_then(|session| session.prompt_cache_affinity.clone()),
+		) {
+			headers.push(header);
+		}
 		Ok(EncodedRequest {
 			operation:   OperationKind::Chat,
 			method:      RequestMethod::Post,
@@ -3939,11 +4110,7 @@ impl Codec for OpenAiResponsesCodec {
 					.base_url
 					.as_str(),
 			),
-			headers:     vec![
-				super::RequestHeader { name: sf!("content-type"), value: sf!("application/json") },
-				super::RequestHeader { name: sf!("accept"), value: sf!("text/event-stream") },
-			]
-			.into_boxed_slice(),
+			headers:     headers.into_boxed_slice(),
 			body:        BodySource::Bytes(body),
 			framing:     FramingProtocol::Sse,
 			bounds:      SizeBounds {
@@ -4600,6 +4767,288 @@ mod tests {
 	) -> EncodedResponses {
 		try_encode_with_options(policy, OpenAiResponsesOptions::default(), build)
 			.expect("policy request encodes")
+	}
+
+	#[test]
+	fn always_send_max_tokens_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.context.always_send_max_tokens = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| empty_chat_request());
+		assert!(encoded.request.max_output_tokens.is_some());
+	}
+
+	#[test]
+	fn cache_control_format_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.cache.control_format = Some(policy::CacheControlFormat::Anthropic);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.cache_retention = Setting::Require(crate::call::CacheRetention::Short);
+			request
+		});
+		assert_eq!(
+			encoded.request.cache_control,
+			Some(super::ResponsesCacheControl { kind: sf!("ephemeral") })
+		);
+	}
+
+	#[test]
+	fn disable_reasoning_on_forced_tool_choice_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.disable_reasoning_on_forced_choice = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.reasoning = Setting::Require(ReasoningRequest {
+				visibility:          ReasoningVisibility::Visible,
+				effort:              Some(ReasoningEffort::Medium),
+				max_tokens:          None,
+				preserve_signatures: false,
+			});
+			request.tool_choice = Setting::Require(ToolChoice::Auto);
+			request
+		});
+		assert_eq!(encoded.request.tool_choice, None);
+	}
+
+	#[test]
+	fn prompt_cache_session_header_matches_pi_request_shape() {
+		let header = super::prompt_cache_session_header(
+			Some(policy::PromptCacheSessionHeader::XGrokConversationId),
+			Some(sf!("conversation-1")),
+		)
+		.expect("session header");
+		assert_eq!(header.name, "x-grok-conv-id");
+		assert_eq!(header.value, "conversation-1");
+	}
+
+	#[test]
+	fn prompt_cache_breakpoint_ttl_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.cache.supports_breakpoints = Some(true);
+		policy.cache.breakpoint_ttl = Some(policy::PromptCacheBreakpointTtl::ThirtyMinutes);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.messages = Arc::from([Message {
+				role:    Role::User,
+				content: Arc::from([
+					ContentPart::Text { text: sf!("stable"), proof: None },
+					ContentPart::CachePoint(crate::call::CacheRetention::Short),
+				]),
+				name:    None,
+			}]);
+			request
+		});
+		let options = encoded.request.prompt_cache_options.expect("cache options");
+		assert_eq!(options.mode, "explicit");
+		assert_eq!(options.ttl.as_deref(), Some("30m"));
+	}
+
+	#[test]
+	fn supports_prompt_cache_breakpoints_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.cache.supports_breakpoints = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.messages = Arc::from([Message {
+				role:    Role::User,
+				content: Arc::from([
+					ContentPart::Text { text: sf!("stable"), proof: None },
+					ContentPart::CachePoint(crate::call::CacheRetention::Short),
+				]),
+				name:    None,
+			}]);
+			request
+		});
+		let parts = encoded.request.input[0]
+			.content
+			.parts()
+			.expect("typed content");
+		assert_eq!(
+			parts[0]
+				.prompt_cache_breakpoint
+				.as_ref()
+				.map(|breakpoint| breakpoint.mode.as_str()),
+			Some("explicit")
+		);
+	}
+
+	#[test]
+	fn reject_root_object_union_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.reject_root_object_union = Some(true);
+		let schema = serde_json::from_str(
+			r#"{"type":"object","anyOf":[{"type":"object","properties":{"a":{"type":"string"}}},{"type":"string"}]}"#,
+		)
+		.expect("schema");
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool(ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(schema),
+				strict:     true,
+			})
+		});
+		assert!(encoded.request.tools.is_empty());
+	}
+
+	#[test]
+	fn requires_reasoning_off_juice_instruction_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.reasoning.requires_off_juice_instruction = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.reasoning = Setting::Require(ReasoningRequest {
+				visibility:          ReasoningVisibility::Hidden,
+				effort:              Some(ReasoningEffort::Off),
+				max_tokens:          None,
+				preserve_signatures: false,
+			});
+			request
+		});
+		assert!(encoded.request.input.iter().any(|item| {
+			item.content.parts().is_some_and(|parts| {
+				parts
+					.iter()
+					.any(|part| part.text.as_deref() == Some("# Juice: 0 !important"))
+			})
+		}));
+	}
+
+	#[test]
+	fn strict_responses_pairing_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.strict_responses_pairing = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool_result(vec![ToolResultContent::Text(sf!("orphaned"))])
+		});
+		assert_eq!(encoded.request.input[0].role, Some(ResponsesRole::Assistant));
+		assert!(
+			encoded.request.input[0]
+				.content
+				.parts()
+				.is_some_and(|parts| parts[0].text.as_deref().is_some_and(|text| {
+					text.starts_with("[Orphan read result; call_id=call_read]: orphaned")
+				}))
+		);
+	}
+
+	#[test]
+	fn strip_image_input_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.image.strip_input = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.messages = Arc::from([Message {
+				role:    Role::User,
+				content: Arc::from([
+					ContentPart::Text { text: sf!("describe"), proof: None },
+					ContentPart::Image(MediaInput::Bytes {
+						media_type: sf!("image/png"),
+						data:       Bytes::from_static(b"png"),
+					}),
+				]),
+				name:    None,
+			}]);
+			request
+		});
+		let parts = encoded.request.input[0]
+			.content
+			.parts()
+			.expect("typed content");
+		assert_eq!(parts.len(), 1);
+		assert_eq!(parts[0].kind, super::ResponsesContentKind::InputText);
+	}
+
+	#[test]
+	fn supports_long_prompt_cache_retention_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.cache.supports_long_retention = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.cache_retention = Setting::Require(crate::call::CacheRetention::Long);
+			request
+		});
+		assert_eq!(encoded.request.prompt_cache_retention.as_deref(), Some("24h"));
+	}
+
+	#[test]
+	fn supports_named_tool_choice_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.named_choice = Some(false);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = request_with_tool(ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(
+					serde_json::from_str(r#"{"type":"object"}"#).expect("schema"),
+				),
+				strict:     false,
+			});
+			request.tool_choice = Setting::Require(ToolChoice::Named(sf!("match_input")));
+			request
+		});
+		assert!(matches!(
+			encoded.request.tool_choice,
+			Some(super::ResponsesToolChoice::Mode(super::ResponsesToolChoiceMode::Required))
+		));
+		assert_eq!(encoded.request.tools.len(), 1);
+		assert_eq!(encoded.request.tools[0].name.as_deref(), Some("match_input"));
+	}
+
+	#[test]
+	fn supports_obfuscation_opt_out_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.streaming.supports_obfuscation_opt_out = Some(true);
+		let encoded = encode_with_policy(&policy, |_, _| empty_chat_request());
+		assert_eq!(
+			encoded
+				.request
+				.stream_options
+				.and_then(|options| options.include_obfuscation),
+			Some(false)
+		);
+	}
+
+	#[test]
+	fn supports_penalty_and_stop_params_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.structured.penalty_and_stop_params = Some(false);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.sampling.presence_penalty = Some(0.5);
+			request.sampling.frequency_penalty = Some(0.25);
+			request
+		});
+		assert_eq!(encoded.request.presence_penalty, None);
+		assert_eq!(encoded.request.frequency_penalty, None);
+	}
+
+	#[test]
+	fn supports_reasoning_params_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.reasoning.supports_params = Some(false);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			let mut request = empty_chat_request();
+			request.reasoning = Setting::Require(ReasoningRequest {
+				visibility:          ReasoningVisibility::Visible,
+				effort:              Some(ReasoningEffort::Medium),
+				max_tokens:          None,
+				preserve_signatures: false,
+			});
+			request
+		});
+		assert!(encoded.request.reasoning.is_none());
+	}
+
+	#[test]
+	fn supports_strict_mode_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::baseline();
+		policy.tool.supports_strict_mode = Some(false);
+		let encoded = encode_with_policy(&policy, |_, _| {
+			request_with_tool(ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(
+					serde_json::from_str(r#"{"type":"object"}"#).expect("schema"),
+				),
+				strict:     true,
+			})
+		});
+		assert_eq!(encoded.request.tools[0].strict, None);
 	}
 
 	/// First-party xAI `/v1/responses` wire policy: no summary, no penalties,

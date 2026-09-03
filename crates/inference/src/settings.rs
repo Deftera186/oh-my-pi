@@ -9,13 +9,11 @@ use omp_catalog::{
 	ModelKey, ProviderId,
 	settings::{CacheRetentionSetting, FallbackChains},
 };
+use omp_con::{Ctx, Kv, Value};
 use omp_core::Str;
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString, IntoStaticStr};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use strum::{Display, EnumString, IntoStaticStr, VariantNames};
 
 use crate::{
 	Call,
@@ -23,8 +21,6 @@ use crate::{
 	layer::retry::RetryBackoff,
 	receipt::ExecutionBudget,
 };
-
-const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 
 /// Behavior after a fallback route succeeds.
 #[derive(
@@ -39,6 +35,7 @@ const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive, const_into_str)]
@@ -63,6 +60,7 @@ pub enum FallbackRevertPolicy {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case", ascii_case_insensitive, const_into_str)]
@@ -222,43 +220,28 @@ impl RetrySettings {
 	}
 }
 
-impl SettingsDomain for RetrySettings {
-	const DOMAIN: &'static str = "retry";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		field("retry.enabled", "Retry Enabled", SettingKind::Boolean, 10),
-		field("retry.max_retries", "Maximum Retries", SettingKind::Integer, 20),
-		field("retry.base_delay_ms", "Base Retry Delay", SettingKind::Integer, 30),
-		FieldDescriptor {
-			path:        "retry.max_delay_ms",
-			label:       "Maximum Retry Delay",
-			description: "Largest retry wait in milliseconds; 0 disables the cap.",
-			kind:        SettingKind::Integer,
-			scopes:      PERSISTED,
-			order:       40,
-			options:     None,
-			condition:   None,
-			secret:      false,
-		},
-		field("retry.model_fallback", "Model Fallback", SettingKind::Boolean, 50),
-		field("retry.usage_aware_fallback", "Usage-Aware Fallback", SettingKind::Boolean, 60),
-		field("retry.usage_reserve_pct", "Usage Reserve", SettingKind::Integer, 70),
-		field(
-			"retry.usage_reserve_policy",
-			"Usage Reserve Policy",
-			SettingKind::Enum(&["confirm", "auto", "fail-closed"]),
-			80,
-		),
-		field("retry.fallback_chains", "Fallback Chains", SettingKind::Table, 90),
-		field(
-			"retry.fallback_revert",
-			"Fallback Revert",
-			SettingKind::Enum(&["cooldown-expiry", "never"]),
-			100,
-		),
-		field("retry.server_side_fallback", "Server-Side Fallback", SettingKind::Boolean, 110),
-	];
+impl RetrySettings {
+	/// Projects retry and fallback policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			enabled:              AI_RETRY_ENABLED.get(ctx),
+			max_retries:          AI_RETRY_MAX_RETRIES.get(ctx),
+			base_delay_ms:        u64::from(AI_RETRY_BASE_DELAY_MS.get(ctx)),
+			max_delay_ms:         u64::from(AI_RETRY_MAX_DELAY_MS.get(ctx)),
+			model_fallback:       AI_RETRY_MODEL_FALLBACK.get(ctx),
+			usage_aware_fallback: AI_RETRY_USAGE_AWARE_FALLBACK.get(ctx),
+			usage_reserve_pct:    AI_RETRY_USAGE_RESERVE_PCT.get(ctx),
+			usage_reserve_policy: AI_RETRY_USAGE_RESERVE_POLICY.get(ctx),
+			fallback_chains:      deserialize_table(AI_RETRY_FALLBACK_CHAINS.get(ctx)),
+			fallback_revert:      AI_RETRY_FALLBACK_REVERT.get(ctx),
+			server_side_fallback: AI_RETRY_SERVER_SIDE_FALLBACK.get(ctx),
+		}
+	}
 
-	fn validate(&self) -> Result<(), ValidationError> {
+	/// Reports whether all cross-variable retry invariants hold.
+	#[must_use]
+	pub fn validate(&self) -> bool {
 		let chains_valid = self.fallback_chains.iter().all(|(key, values)| {
 			!key.is_empty()
 				&& !values.is_empty()
@@ -266,16 +249,11 @@ impl SettingsDomain for RetrySettings {
 					!value.is_empty() && values[..index].iter().all(|prior| prior != value)
 				})
 		});
-		if self.max_retries <= 100
+		self.max_retries <= 100
 			&& (self.max_delay_ms == 0 || self.base_delay_ms <= self.max_delay_ms)
 			&& self.max_delay_ms <= 3_600_000
 			&& self.usage_reserve_pct <= 100
 			&& chains_valid
-		{
-			Ok(())
-		} else {
-			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
-		}
 	}
 }
 
@@ -329,6 +307,7 @@ impl Default for SamplingSettings {
 	IntoStaticStr,
 	PartialEq,
 	Serialize,
+	VariantNames,
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase", ascii_case_insensitive, const_into_str)]
@@ -341,6 +320,10 @@ pub enum TextVerbositySetting {
 	/// Detailed output.
 	High,
 }
+
+omp_con::con_enum!(FallbackRevertPolicy);
+omp_con::con_enum!(UsageReservePolicy);
+omp_con::con_enum!(TextVerbositySetting);
 
 impl SamplingSettings {
 	/// Installs defaults on a chat request while preserving every
@@ -391,40 +374,35 @@ impl SamplingSettings {
 	}
 }
 
-impl SettingsDomain for SamplingSettings {
-	const DOMAIN: &'static str = "sampling";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		field("sampling.temperature", "Temperature", SettingKind::Number, 10),
-		field("sampling.top_p", "Top P", SettingKind::Number, 20),
-		field("sampling.top_k", "Top K", SettingKind::Integer, 30),
-		field("sampling.min_p", "Min P", SettingKind::Number, 40),
-		field("sampling.presence_penalty", "Presence Penalty", SettingKind::Number, 50),
-		field("sampling.frequency_penalty", "Frequency Penalty", SettingKind::Number, 60),
-		field("sampling.repetition_penalty", "Repetition Penalty", SettingKind::Number, 70),
-		field(
-			"sampling.verbosity",
-			"Text Verbosity",
-			SettingKind::Enum(&["low", "medium", "high"]),
-			80,
-		),
-	];
+impl SamplingSettings {
+	/// Projects sampling defaults from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			temperature:        AI_SAMPLING_TEMPERATURE.get(ctx),
+			top_p:              AI_SAMPLING_TOP_P.get(ctx),
+			top_k:              AI_SAMPLING_TOP_K.get(ctx),
+			min_p:              AI_SAMPLING_MIN_P.get(ctx),
+			presence_penalty:   AI_SAMPLING_PRESENCE_PENALTY.get(ctx),
+			frequency_penalty:  AI_SAMPLING_FREQUENCY_PENALTY.get(ctx),
+			repetition_penalty: AI_SAMPLING_REPETITION_PENALTY.get(ctx),
+			verbosity:          AI_SAMPLING_VERBOSITY.get(ctx),
+		}
+	}
 
-	fn validate(&self) -> Result<(), ValidationError> {
+	/// Reports whether all cross-variable sampling invariants hold.
+	#[must_use]
+	pub fn validate(&self) -> bool {
 		let probability = |value: f32| value == -1.0 || (0.0..=1.0).contains(&value);
 		let finite =
 			[self.temperature, self.presence_penalty, self.frequency_penalty, self.repetition_penalty]
 				.into_iter()
 				.all(f32::is_finite);
-		if finite
+		finite
 			&& self.temperature >= -1.0
 			&& probability(self.top_p)
 			&& probability(self.min_p)
 			&& self.top_k >= -1
-		{
-			Ok(())
-		} else {
-			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
-		}
 	}
 }
 
@@ -484,18 +462,23 @@ impl ProviderRuntimeSettings {
 	}
 }
 
-impl SettingsDomain for ProviderRuntimeSettings {
-	const DOMAIN: &'static str = "provider_runtime";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		field("provider_runtime.max_in_flight", "Maximum In-Flight Requests", SettingKind::Table, 10),
-		field("provider_runtime.max_queued", "Maximum Queued Requests", SettingKind::Integer, 20),
-		field("provider_runtime.timeout_seconds", "Transport Timeout", SettingKind::Integer, 30),
-		field("provider_runtime.call_timeout_seconds", "Call Timeout", SettingKind::Integer, 40),
-		field("provider_runtime.bedrock_guardrails", "Bedrock Guardrails", SettingKind::Table, 50),
-	];
+impl ProviderRuntimeSettings {
+	/// Projects provider admission and timeout policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			max_in_flight:        deserialize_table(AI_PROVIDER_MAX_IN_FLIGHT.get(ctx)),
+			max_queued:           AI_PROVIDER_MAX_QUEUED.get(ctx) as usize,
+			timeout_seconds:      u64::from(AI_PROVIDER_TIMEOUT_SECONDS.get(ctx)),
+			call_timeout_seconds: u64::from(AI_PROVIDER_CALL_TIMEOUT_SECONDS.get(ctx)),
+			bedrock_guardrails:   deserialize_table(AI_PROVIDER_BEDROCK_GUARDRAILS.get(ctx)),
+		}
+	}
 
-	fn validate(&self) -> Result<(), ValidationError> {
-		if self.max_queued <= 100_000
+	/// Reports whether all cross-variable provider runtime invariants hold.
+	#[must_use]
+	pub fn validate(&self) -> bool {
+		self.max_queued <= 100_000
 			&& self.timeout_seconds > 0
 			&& self.timeout_seconds <= 3_600
 			&& self.call_timeout_seconds <= 86_400
@@ -507,11 +490,7 @@ impl SettingsDomain for ProviderRuntimeSettings {
 				!provider.trim().is_empty()
 					&& !guardrail.identifier.trim().is_empty()
 					&& !guardrail.version.trim().is_empty()
-			}) {
-			Ok(())
-		} else {
-			Err(ValidationError::DomainInvariant { domain: Self::DOMAIN })
-		}
+			})
 	}
 }
 
@@ -529,6 +508,17 @@ pub struct InferenceSettings {
 }
 
 impl InferenceSettings {
+	/// Projects the complete inference policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			retry:     RetrySettings::from_con(ctx),
+			sampling:  SamplingSettings::from_con(ctx),
+			providers: ProviderRuntimeSettings::from_con(ctx),
+			model:     omp_catalog::settings::ModelSettings::from_con(ctx),
+		}
+	}
+
 	/// Applies budget projections before side-effect-free planning.
 	pub fn apply_planning_call(&self, call: &mut Call) {
 		self.retry.apply_budget(&mut call.budget);
@@ -576,40 +566,333 @@ impl InferenceSettings {
 	}
 }
 
-const fn field(
-	path: &'static str,
-	label: &'static str,
-	kind: SettingKind,
-	order: u16,
-) -> FieldDescriptor {
-	FieldDescriptor {
-		path,
-		label,
-		description: "Runtime-owned inference policy.",
-		kind,
-		scopes: PERSISTED,
-		order,
-		options: None,
-		condition: None,
-		secret: false,
-	}
-}
-
 fn nonnegative(value: f32) -> Option<f32> {
 	(value >= 0.0).then_some(value)
 }
 
-/// Settings domains owned by the inference crate.
-pub const SETTINGS_CONTRIBUTION: omp_settings::SettingsContribution =
-	omp_settings::SettingsContribution {
-		domains:     &[
-			DomainRegistration::of::<RetrySettings>(),
-			DomainRegistration::of::<SamplingSettings>(),
-			DomainRegistration::of::<ProviderRuntimeSettings>(),
-			DomainRegistration::of::<crate::search_settings::WebSearchSettings>(),
-		],
-		normalizers: &[],
+fn json_to_con(value: serde_json::Value) -> Option<Value> {
+	match value {
+		serde_json::Value::Null => None,
+		serde_json::Value::Bool(value) => Some(Value::Bool(value)),
+		serde_json::Value::Number(value) => value
+			.as_i64()
+			.map(Value::Int)
+			.or_else(|| value.as_f64().map(Value::Float)),
+		serde_json::Value::String(value) => Some(Value::Str(Str::from(value))),
+		serde_json::Value::Array(values) => values
+			.into_iter()
+			.map(json_to_con)
+			.collect::<Option<Vec<_>>>()
+			.map(Value::List),
+		serde_json::Value::Object(values) => values
+			.into_iter()
+			.map(|(key, value)| Some((Str::from(key), json_to_con(value)?)))
+			.collect::<Option<Vec<_>>>()
+			.map(|values| Value::Kv(Kv(values))),
+	}
+}
+
+fn con_to_json(value: Value) -> serde_json::Value {
+	match value {
+		Value::Bool(value) => serde_json::Value::Bool(value),
+		Value::Int(value) => serde_json::Value::Number(value.into()),
+		Value::Float(value) => serde_json::Number::from_f64(value)
+			.map_or(serde_json::Value::Null, serde_json::Value::Number),
+		Value::Str(value) | Value::Enum(value) => serde_json::Value::String(value.into()),
+		Value::Duration(value) => serde_json::Value::String(value.to_string()),
+		Value::List(values) => {
+			serde_json::Value::Array(values.into_iter().map(con_to_json).collect())
+		},
+		Value::Kv(values) => serde_json::Value::Object(
+			values
+				.0
+				.into_iter()
+				.map(|(key, value)| (key.into(), con_to_json(value)))
+				.collect(),
+		),
+	}
+}
+
+fn serialize_table<T: Serialize>(value: &T) -> Kv {
+	match json_to_con(serde_json::to_value(value).expect("settings table serializes")) {
+		Some(Value::Kv(value)) => value,
+		_ => panic!("settings table must serialize as an object"),
+	}
+}
+
+fn try_deserialize_table<T: DeserializeOwned>(value: Kv) -> Option<T> {
+	serde_json::from_value(con_to_json(Value::Kv(value))).ok()
+}
+
+fn deserialize_table<T: DeserializeOwned>(value: Kv) -> T {
+	try_deserialize_table(value).expect("convar table was validated before commit")
+}
+
+fn invalid(reason: &'static str) -> Result<(), Str> {
+	Err(Str::new_static(reason))
+}
+
+fn validate_retry_chains(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	let Some(chains) = try_deserialize_table::<FallbackChains>(value.clone()) else {
+		return invalid("fallback chains must map selectors to non-empty selector lists");
 	};
+	if chains.iter().all(|(key, values)| {
+		!key.is_empty()
+			&& !values.is_empty()
+			&& values.iter().enumerate().all(|(index, value)| {
+				!value.is_empty() && values[..index].iter().all(|prior| prior != value)
+			})
+	}) {
+		Ok(())
+	} else {
+		invalid("fallback chains must map selectors to non-empty unique selector lists")
+	}
+}
+
+fn validate_max_in_flight(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	let Some(limits) = try_deserialize_table::<BTreeMap<Str, usize>>(value.clone()) else {
+		return invalid("provider limits must map provider names to integers");
+	};
+	if limits
+		.iter()
+		.all(|(provider, limit)| !provider.is_empty() && *limit <= 100_000)
+	{
+		Ok(())
+	} else {
+		invalid("provider limits require non-empty names and values at most 100000")
+	}
+}
+
+fn validate_bedrock_guardrails(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	let Some(guardrails) = try_deserialize_table::<
+		BTreeMap<Str, crate::codec::bedrock::BedrockGuardrail>,
+	>(value.clone()) else {
+		return invalid("Bedrock guardrails must be keyed configuration blocks");
+	};
+	if guardrails.iter().all(|(provider, guardrail)| {
+		!provider.trim().is_empty()
+			&& !guardrail.identifier.trim().is_empty()
+			&& !guardrail.version.trim().is_empty()
+	}) {
+		Ok(())
+	} else {
+		invalid("Bedrock guardrails require non-empty provider, identifier, and version")
+	}
+}
+
+fn validate_finite(_: &Ctx, value: &f32) -> Result<(), Str> {
+	if value.is_finite() {
+		Ok(())
+	} else {
+		invalid("sampling value must be finite")
+	}
+}
+
+fn validate_retry_base(ctx: &Ctx, value: &u32) -> Result<(), Str> {
+	let maximum = AI_RETRY_MAX_DELAY_MS.get(ctx);
+	if maximum == 0 || *value <= maximum {
+		Ok(())
+	} else {
+		invalid("base retry delay must not exceed the maximum retry delay")
+	}
+}
+
+fn validate_retry_max(ctx: &Ctx, value: &u32) -> Result<(), Str> {
+	if *value == 0 || AI_RETRY_BASE_DELAY_MS.get(ctx) <= *value {
+		Ok(())
+	} else {
+		invalid("maximum retry delay must be zero or at least the base retry delay")
+	}
+}
+
+omp_con::var! {
+	/// Enables transport and model fallback recovery.
+	pub static AI_RETRY_ENABLED = ai_retry_enabled: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+	/// Maximum retries after the first attempt.
+	pub static AI_RETRY_MAX_RETRIES = ai_retry_max_retries: u32 {
+		default: 10,
+		min: 0,
+		max: 100,
+		flags: archive | inherit,
+	};
+	/// First exponential retry ceiling in milliseconds.
+	pub static AI_RETRY_BASE_DELAY_MS = ai_retry_base_delay_ms: u32 {
+		default: 500,
+		min: 0,
+		max: 3_600_000,
+		validate: validate_retry_base,
+		flags: archive | inherit,
+	};
+	/// Largest accepted retry delay in milliseconds; zero disables the cap.
+	pub static AI_RETRY_MAX_DELAY_MS = ai_retry_max_delay_ms: u32 {
+		default: 300_000,
+		min: 0,
+		max: 3_600_000,
+		validate: validate_retry_max,
+		flags: archive | inherit,
+	};
+	/// Enables model fallback candidates.
+	pub static AI_RETRY_MODEL_FALLBACK = ai_retry_model_fallback: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+	/// Enables quota-aware preflight fallback.
+	pub static AI_RETRY_USAGE_AWARE_FALLBACK = ai_retry_usage_aware_fallback: bool {
+		default: false,
+		flags: archive | inherit,
+	};
+	/// Remaining quota percentage held in reserve.
+	pub static AI_RETRY_USAGE_RESERVE_PCT = ai_retry_usage_reserve_pct: u8 {
+		default: 10,
+		min: 0,
+		max: 100,
+		flags: archive | inherit,
+	};
+	/// Action when every account is inside the reserve.
+	pub static AI_RETRY_USAGE_RESERVE_POLICY = ai_retry_usage_reserve_policy: UsageReservePolicy {
+		default: UsageReservePolicy::Confirm,
+		flags: archive | inherit,
+	};
+	/// Exact model/provider fallback chains.
+	pub static AI_RETRY_FALLBACK_CHAINS = ai_retry_fallback_chains: Kv {
+		default: serialize_table(&FallbackChains::new()),
+		validate: validate_retry_chains,
+		flags: archive | inherit,
+	};
+	/// Primary reversion behavior after fallback.
+	pub static AI_RETRY_FALLBACK_REVERT = ai_retry_fallback_revert: FallbackRevertPolicy {
+		default: FallbackRevertPolicy::CooldownExpiry,
+		flags: archive | inherit,
+	};
+	/// Enables the explicit Anthropic server-side safety fallback header.
+	pub static AI_RETRY_SERVER_SIDE_FALLBACK = ai_retry_server_side_fallback: bool {
+		default: false,
+		flags: archive | inherit,
+	};
+	/// Default sampling temperature; negative preserves provider default.
+	pub static AI_SAMPLING_TEMPERATURE = ai_sampling_temperature: f32 {
+		default: -1.0,
+		min: -1.0,
+		validate: validate_finite,
+		flags: archive | inherit,
+	};
+	/// Default nucleus cutoff; negative preserves provider default.
+	pub static AI_SAMPLING_TOP_P = ai_sampling_top_p: f32 {
+		default: -1.0,
+		min: -1.0,
+		max: 1.0,
+		validate: validate_finite,
+		flags: archive | inherit,
+	};
+	/// Default top-k bound; negative preserves provider default.
+	pub static AI_SAMPLING_TOP_K = ai_sampling_top_k: i32 {
+		default: -1,
+		min: -1,
+		flags: archive | inherit,
+	};
+	/// Default minimum probability cutoff; negative preserves provider default.
+	pub static AI_SAMPLING_MIN_P = ai_sampling_min_p: f32 {
+		default: -1.0,
+		min: -1.0,
+		max: 1.0,
+		validate: validate_finite,
+		flags: archive | inherit,
+	};
+	/// Default presence penalty; negative preserves provider default.
+	pub static AI_SAMPLING_PRESENCE_PENALTY = ai_sampling_presence_penalty: f32 {
+		default: -1.0,
+		validate: validate_finite,
+		flags: archive | inherit,
+	};
+	/// Default frequency penalty; negative preserves provider default.
+	pub static AI_SAMPLING_FREQUENCY_PENALTY = ai_sampling_frequency_penalty: f32 {
+		default: -1.0,
+		validate: validate_finite,
+		flags: archive | inherit,
+	};
+	/// Default repetition penalty; negative preserves provider default.
+	pub static AI_SAMPLING_REPETITION_PENALTY = ai_sampling_repetition_penalty: f32 {
+		default: -1.0,
+		validate: validate_finite,
+		flags: archive | inherit,
+	};
+	/// Default response verbosity.
+	pub static AI_SAMPLING_VERBOSITY = ai_sampling_verbosity: TextVerbositySetting {
+		default: TextVerbositySetting::Medium,
+		flags: archive | inherit,
+	};
+	/// Maximum concurrent requests keyed by provider id.
+	pub static AI_PROVIDER_MAX_IN_FLIGHT = ai_provider_max_in_flight: Kv {
+		default: serialize_table(&BTreeMap::<Str, usize>::new()),
+		validate: validate_max_in_flight,
+		flags: archive | inherit,
+	};
+	/// Maximum queued callers per provider before backpressure fails fast.
+	pub static AI_PROVIDER_MAX_QUEUED = ai_provider_max_queued: u32 {
+		default: 64,
+		min: 0,
+		max: 100_000,
+		flags: archive | inherit,
+	};
+	/// Per-transport-attempt timeout in seconds.
+	pub static AI_PROVIDER_TIMEOUT_SECONDS = ai_provider_timeout_seconds: u32 {
+		default: 300,
+		min: 1,
+		max: 3_600,
+		flags: archive | inherit,
+	};
+	/// Overall logical-call timeout in seconds; zero preserves caller deadlines.
+	pub static AI_PROVIDER_CALL_TIMEOUT_SECONDS = ai_provider_call_timeout_seconds: u32 {
+		default: 0,
+		min: 0,
+		max: 86_400,
+		flags: archive | inherit,
+	};
+	/// Bedrock guardrail policy keyed by provider id.
+	pub static AI_PROVIDER_BEDROCK_GUARDRAILS = ai_provider_bedrock_guardrails: Kv {
+		default: serialize_table(&BTreeMap::<Str, crate::codec::bedrock::BedrockGuardrail>::new()),
+		validate: validate_bedrock_guardrails,
+		flags: archive | inherit,
+	};
+}
+
+/// One-shot migration map from reflected TOML paths to convar names.
+pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
+	("retry.enabled", "ai_retry_enabled"),
+	("retry.max_retries", "ai_retry_max_retries"),
+	("retry.base_delay_ms", "ai_retry_base_delay_ms"),
+	("retry.max_delay_ms", "ai_retry_max_delay_ms"),
+	("retry.model_fallback", "ai_retry_model_fallback"),
+	("retry.usage_aware_fallback", "ai_retry_usage_aware_fallback"),
+	("retry.usage_reserve_pct", "ai_retry_usage_reserve_pct"),
+	("retry.usage_reserve_policy", "ai_retry_usage_reserve_policy"),
+	("retry.fallback_chains", "ai_retry_fallback_chains"),
+	("retry.fallback_revert", "ai_retry_fallback_revert"),
+	("retry.server_side_fallback", "ai_retry_server_side_fallback"),
+	("sampling.temperature", "ai_sampling_temperature"),
+	("sampling.top_p", "ai_sampling_top_p"),
+	("sampling.top_k", "ai_sampling_top_k"),
+	("sampling.min_p", "ai_sampling_min_p"),
+	("sampling.presence_penalty", "ai_sampling_presence_penalty"),
+	("sampling.frequency_penalty", "ai_sampling_frequency_penalty"),
+	("sampling.repetition_penalty", "ai_sampling_repetition_penalty"),
+	("sampling.verbosity", "ai_sampling_verbosity"),
+	("provider_runtime.max_in_flight", "ai_provider_max_in_flight"),
+	("provider_runtime.max_queued", "ai_provider_max_queued"),
+	("provider_runtime.timeout_seconds", "ai_provider_timeout_seconds"),
+	("provider_runtime.call_timeout_seconds", "ai_provider_call_timeout_seconds"),
+	("provider_runtime.bedrock_guardrails", "ai_provider_bedrock_guardrails"),
+	("web_search.order", "ai_search_order"),
+	("web_search.exclusions", "ai_search_exclusions"),
+	("web_search.timeout_seconds", "ai_search_timeout_seconds"),
+	("web_search.searxng_endpoint", "ai_search_searxng_endpoint"),
+	("web_search.gemini_model", "ai_search_gemini_model"),
+	("web_search.antigravity_mode", "ai_search_antigravity_mode"),
+	("web_search.perplexity_responses", "ai_search_perplexity_responses"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -619,7 +902,7 @@ mod tests {
 	fn zero_max_retry_delay_is_a_valid_uncapped_sentinel() {
 		let settings =
 			RetrySettings { base_delay_ms: 500, max_delay_ms: 0, ..RetrySettings::default() };
-		assert!(settings.validate().is_ok());
+		assert!(settings.validate());
 		assert_eq!(settings.backoff().maximum, Duration::ZERO);
 	}
 	#[test]
@@ -643,6 +926,101 @@ mod tests {
 		let planned_budget = call.budget.clone();
 		settings.apply_call(&mut call);
 		assert_eq!(call.budget, planned_budget, "late request projection cannot mutate budget");
+	}
+
+	#[test]
+	fn from_con_projects_typed_overrides() {
+		let ctx = Ctx::new();
+		AI_RETRY_MAX_RETRIES.set(&ctx, 3).expect("set retry limit");
+		AI_SAMPLING_VERBOSITY
+			.set(&ctx, TextVerbositySetting::High)
+			.expect("set verbosity");
+		let settings = InferenceSettings::from_con(&ctx);
+		assert_eq!(settings.retry.max_retries, 3);
+		assert_eq!(settings.sampling.verbosity, TextVerbositySetting::High);
+		assert!(settings.retry.validate());
+		assert!(settings.sampling.validate());
+		assert!(settings.providers.validate());
+	}
+
+	#[test]
+	fn vars_declare_every_former_schema_field() {
+		use crate::search_settings::*;
+
+		let old_fields = [
+			"retry.enabled",
+			"retry.max_retries",
+			"retry.base_delay_ms",
+			"retry.max_delay_ms",
+			"retry.model_fallback",
+			"retry.usage_aware_fallback",
+			"retry.usage_reserve_pct",
+			"retry.usage_reserve_policy",
+			"retry.fallback_chains",
+			"retry.fallback_revert",
+			"retry.server_side_fallback",
+			"sampling.temperature",
+			"sampling.top_p",
+			"sampling.top_k",
+			"sampling.min_p",
+			"sampling.presence_penalty",
+			"sampling.frequency_penalty",
+			"sampling.repetition_penalty",
+			"sampling.verbosity",
+			"provider_runtime.max_in_flight",
+			"provider_runtime.max_queued",
+			"provider_runtime.timeout_seconds",
+			"provider_runtime.call_timeout_seconds",
+			"provider_runtime.bedrock_guardrails",
+			"web_search.order",
+			"web_search.exclusions",
+			"web_search.timeout_seconds",
+			"web_search.searxng_endpoint",
+			"web_search.gemini_model",
+			"web_search.antigravity_mode",
+			"web_search.perplexity_responses",
+		];
+		let vars = [
+			AI_RETRY_ENABLED.name(),
+			AI_RETRY_MAX_RETRIES.name(),
+			AI_RETRY_BASE_DELAY_MS.name(),
+			AI_RETRY_MAX_DELAY_MS.name(),
+			AI_RETRY_MODEL_FALLBACK.name(),
+			AI_RETRY_USAGE_AWARE_FALLBACK.name(),
+			AI_RETRY_USAGE_RESERVE_PCT.name(),
+			AI_RETRY_USAGE_RESERVE_POLICY.name(),
+			AI_RETRY_FALLBACK_CHAINS.name(),
+			AI_RETRY_FALLBACK_REVERT.name(),
+			AI_RETRY_SERVER_SIDE_FALLBACK.name(),
+			AI_SAMPLING_TEMPERATURE.name(),
+			AI_SAMPLING_TOP_P.name(),
+			AI_SAMPLING_TOP_K.name(),
+			AI_SAMPLING_MIN_P.name(),
+			AI_SAMPLING_PRESENCE_PENALTY.name(),
+			AI_SAMPLING_FREQUENCY_PENALTY.name(),
+			AI_SAMPLING_REPETITION_PENALTY.name(),
+			AI_SAMPLING_VERBOSITY.name(),
+			AI_PROVIDER_MAX_IN_FLIGHT.name(),
+			AI_PROVIDER_MAX_QUEUED.name(),
+			AI_PROVIDER_TIMEOUT_SECONDS.name(),
+			AI_PROVIDER_CALL_TIMEOUT_SECONDS.name(),
+			AI_PROVIDER_BEDROCK_GUARDRAILS.name(),
+			AI_SEARCH_ORDER.name(),
+			AI_SEARCH_EXCLUSIONS.name(),
+			AI_SEARCH_TIMEOUT_SECONDS.name(),
+			AI_SEARCH_SEARXNG_ENDPOINT.name(),
+			AI_SEARCH_GEMINI_MODEL.name(),
+			AI_SEARCH_ANTIGRAVITY_MODE.name(),
+			AI_SEARCH_PERPLEXITY_RESPONSES.name(),
+		];
+		assert_eq!(
+			LEGACY_CONVAR_MAPPINGS,
+			old_fields
+				.into_iter()
+				.zip(vars)
+				.collect::<Vec<_>>()
+				.as_slice()
+		);
 	}
 
 	#[test]

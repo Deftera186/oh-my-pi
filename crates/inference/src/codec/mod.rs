@@ -968,28 +968,30 @@ impl fmt::Debug for Cancellation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransportAttempt {
 	/// Logical request identity.
-	pub request_id:    RequestId,
+	pub request_id:          RequestId,
 	/// Provider selected for this attempt.
-	pub provider:      ProviderId,
+	pub provider:            ProviderId,
 	/// Normalized model selected for this attempt.
-	pub model:         Option<ModelKey>,
+	pub model:               Option<ModelKey>,
 	/// Catalog API/codec family selected for this attempt.
-	pub api:           Str,
+	pub api:                 Str,
 	/// Route selected for this attempt.
-	pub route:         RouteId,
+	pub route:               RouteId,
 	/// Account selected without credential material.
-	pub account:       Option<AccountId>,
+	pub account:             Option<AccountId>,
 	/// Principal selected for affinity.
-	pub principal:     Option<PrincipalId>,
+	pub principal:           Option<PrincipalId>,
 	/// Zero-based attempt index.
-	pub index:         u32,
+	pub index:               u32,
 	/// Whether events remain provisional behind an output gate.
-	pub provisional:   bool,
+	pub provisional:         bool,
 	/// Attempt-local timeout after composing the call deadline, remaining
 	/// execution budget, and transport bound.
-	pub timeout:       Duration,
+	pub timeout:             Duration,
+	/// Maximum wait after response headers for the first decoded commit event.
+	pub first_event_timeout: Option<Duration>,
 	/// Maximum sanitized capture bytes for observability or cassettes.
-	pub capture_limit: u64,
+	pub capture_limit:       u64,
 }
 
 /// Sanitized provider response facts offered before stream decoding.

@@ -166,7 +166,7 @@ where
 			});
 			let guard_reasoning = plan
 				.as_ref()
-				.is_some_and(|plan| plan.wire_policy.reasoning.loop_guard == Some(true));
+				.is_some_and(|plan| semantic_loop_guard_enabled(&plan.wire_policy));
 			response.events = Some(Box::pin(async_stream::stream! {
 				let mut completion: Option<RawCompletion> = None;
 				let mut empty = empty_policy.map(|policy| EmptyCompletionStage::new(policy, output_context.attempts().saturating_sub(1)));
@@ -371,6 +371,10 @@ fn project_discovery(
 		error
 	})
 }
+fn semantic_loop_guard_enabled(policy: &omp_catalog::WirePolicy) -> bool {
+	policy.reasoning.loop_guard_profile.is_some()
+}
+
 fn observe_reasoning(
 	guard: &mut Option<ReasoningStallGuard>,
 	thinking_repetition: &mut AttemptRepetitionGuard,
@@ -763,6 +767,20 @@ mod tests {
 				})),
 			},
 		}
+	}
+
+	#[test]
+	fn thinking_loop_guard_matches_pi_behavior() {
+		let mut policy = omp_catalog::WirePolicy::baseline();
+		policy.reasoning.loop_guard_profile = None;
+		assert!(!semantic_loop_guard_enabled(&policy));
+
+		policy.reasoning.loop_guard_profile = Some(omp_catalog::ThinkingLoopGuardProfile::Gemini);
+		assert!(semantic_loop_guard_enabled(&policy));
+		policy.reasoning.loop_guard_profile = Some(omp_catalog::ThinkingLoopGuardProfile::DeepSeek);
+		assert!(semantic_loop_guard_enabled(&policy));
+		policy.reasoning.loop_guard_profile = Some(omp_catalog::ThinkingLoopGuardProfile::Xai);
+		assert!(semantic_loop_guard_enabled(&policy));
 	}
 
 	#[test]

@@ -485,11 +485,7 @@ impl RouteComposer for ProductionRouteComposer {
 										"local-route-not-constructed-for-current-platform-or-feature",
 									)
 								},
-								|reason| RouteUnavailable {
-									route: route.id.clone(),
-									reason,
-									operation: None,
-								},
+								|reason| RouteUnavailable::new(route.id.clone(), reason, None),
 							)
 					})?;
 				(
@@ -536,18 +532,23 @@ impl RouteComposer for ProductionRouteComposer {
 		let operation = operation_policy(&binding, advertised);
 		let codec = Arc::new(RouteCodecSet::for_route(route, advertised, binding, discovery)?);
 		let recovery = if advertised.contains_kind(OperationKind::DiscoverModels) {
-			let projector = match self
-				.dependencies
-				.discovery_projectors
-				.get(&route.id)
-				.cloned()
-			{
-				Some(projector) => projector,
-				None => Arc::new(
-					CatalogDiscoveryProjector::for_route(catalog, route)
-						.map_err(|_| unavailable(route, "catalog-discovery-projector-invalid"))?,
-				),
-			};
+			let projector =
+				match self
+					.dependencies
+					.discovery_projectors
+					.get(&route.id)
+					.cloned()
+				{
+					Some(projector) => projector,
+					None => Arc::new(CatalogDiscoveryProjector::for_route(catalog, route).map_err(
+						|source| RouteUnavailable::CatalogDiscoveryProjector {
+							route: route.id.clone(),
+							reason: ReasonId(sf!("catalog-discovery-projector-invalid")),
+							operation: None,
+							source,
+						},
+					)?),
+				};
 			RecoveryLayer::new(projector)
 		} else {
 			RecoveryLayer::without_discovery()
@@ -582,8 +583,15 @@ impl RouteComposer for ProductionRouteComposer {
 						.map_or_else(|| sf!("us-east-1"), Str::new)
 				})
 			});
-		let runtime_auth = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
-			.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+		let runtime_auth =
+			AuthSpec::from_catalog(auth, oauth, signing_region.clone()).map_err(|source| {
+				RouteUnavailable::CatalogAuthSpec {
+					route: route.id.clone(),
+					reason: ReasonId(sf!("catalog-auth-spec-invalid")),
+					operation: None,
+					source,
+				}
+			})?;
 		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
 		if matches!(route.codec.as_str(), "anthropic" | "bedrock-converse" | "search-perplexity") {
 			let provider = catalog
@@ -611,8 +619,15 @@ impl RouteComposer for ProductionRouteComposer {
 					continue;
 				}
 				let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
-				let runtime = AuthSpec::from_catalog(auth, oauth, signing_region.clone())
-					.map_err(|_| unavailable(route, "catalog-auth-spec-invalid"))?;
+				let runtime =
+					AuthSpec::from_catalog(auth, oauth, signing_region.clone()).map_err(|source| {
+						RouteUnavailable::CatalogAuthSpec {
+							route: route.id.clone(),
+							reason: ReasonId(sf!("catalog-auth-spec-invalid")),
+							operation: None,
+							source,
+						}
+					})?;
 				if matches!(route.codec.as_str(), "bedrock-converse" | "search-perplexity") {
 					auth_specs.insert(0, (auth_id.clone(), runtime));
 				} else {
@@ -975,32 +990,36 @@ fn discovery_codec(
 		.discovery_spec(discovery)
 		.ok_or_else(|| unavailable(route, "catalog-discovery-spec-missing"))?;
 	let codec: Arc<dyn Codec> = match spec.kind {
-		DiscoveryKind::OpenAiModels => Arc::new(
-			OpenAiModelsDiscoveryCodec::from_spec(spec)
-				.map_err(|_| unavailable(route, "openai-models-discovery-codec-invalid"))?,
-		),
-		DiscoveryKind::OllamaTags => Arc::new(
-			OllamaTagsDiscoveryCodec::from_spec(spec)
-				.map_err(|_| unavailable(route, "ollama-tags-discovery-codec-invalid"))?,
-		),
-		DiscoveryKind::AccountModels => Arc::new(
-			AccountModelsDiscoveryCodec::from_spec(spec)
-				.map_err(|_| unavailable(route, "account-models-discovery-codec-invalid"))?,
-		),
-		DiscoveryKind::GoogleModels => Arc::new(
-			GoogleModelsDiscoveryCodec::from_spec(spec)
-				.map_err(|_| unavailable(route, "google-models-discovery-codec-invalid"))?,
-		),
+		DiscoveryKind::OpenAiModels => {
+			Arc::new(OpenAiModelsDiscoveryCodec::from_spec(spec).map_err(|source| {
+				discovery_codec_unavailable(route, "openai-models-discovery-codec-invalid", source)
+			})?)
+		},
+		DiscoveryKind::OllamaTags => {
+			Arc::new(OllamaTagsDiscoveryCodec::from_spec(spec).map_err(|source| {
+				discovery_codec_unavailable(route, "ollama-tags-discovery-codec-invalid", source)
+			})?)
+		},
+		DiscoveryKind::AccountModels => {
+			Arc::new(AccountModelsDiscoveryCodec::from_spec(spec).map_err(|source| {
+				discovery_codec_unavailable(route, "account-models-discovery-codec-invalid", source)
+			})?)
+		},
+		DiscoveryKind::GoogleModels => {
+			Arc::new(GoogleModelsDiscoveryCodec::from_spec(spec).map_err(|source| {
+				discovery_codec_unavailable(route, "google-models-discovery-codec-invalid", source)
+			})?)
+		},
 		DiscoveryKind::Specialized => {
 			if !binding
 				.supported
 				.contains_kind(OperationKind::DiscoverModels)
 			{
-				return Err(RouteUnavailable {
-					route:     route.id.clone(),
-					reason:    ReasonId(sf!("specialized-discovery-codec-not-implemented")),
-					operation: Some(OperationKind::DiscoverModels),
-				});
+				return Err(RouteUnavailable::new(
+					route.id.clone(),
+					ReasonId(sf!("specialized-discovery-codec-not-implemented")),
+					Some(OperationKind::DiscoverModels),
+				));
 			}
 			binding.primary.clone()
 		},
@@ -1062,11 +1081,11 @@ impl RouteCodecSet {
 				continue;
 			}
 			if !binding.supported.contains_kind(operation) {
-				return Err(RouteUnavailable {
-					route:     route.id.clone(),
-					reason:    ReasonId(sf!("advertised-operation-codec-not-implemented")),
-					operation: Some(operation),
-				});
+				return Err(RouteUnavailable::new(
+					route.id.clone(),
+					ReasonId(sf!("advertised-operation-codec-not-implemented")),
+					Some(operation),
+				));
 			}
 			operations[operation as usize] = Some(if operation == OperationKind::DiscoverModels {
 				discovery
@@ -1471,6 +1490,11 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 				provisional,
 				capture_limit: call.budget.max_staging_bytes,
 				timeout,
+				first_event_timeout: plan
+					.wire_policy
+					.streaming
+					.watchdog
+					.and_then(omp_catalog::StreamWatchdog::first_event_timeout),
 			},
 		})
 	}
@@ -2114,10 +2138,19 @@ impl SemanticPolicy<Call> for CanonicalSemantic {
 }
 
 fn unavailable(route: &RouteDef, reason: &'static str) -> RouteUnavailable {
-	RouteUnavailable {
-		route:     route.id.clone(),
-		reason:    ReasonId(Str::new(reason)),
-		operation: None,
+	RouteUnavailable::new(route.id.clone(), ReasonId(Str::new(reason)), None)
+}
+
+fn discovery_codec_unavailable(
+	route: &RouteDef,
+	reason: &'static str,
+	source: Error,
+) -> RouteUnavailable {
+	RouteUnavailable::DiscoveryCodec {
+		route: route.id.clone(),
+		reason: ReasonId(Str::new(reason)),
+		operation: Some(OperationKind::DiscoverModels),
+		source,
 	}
 }
 
@@ -2211,6 +2244,7 @@ mod tests {
 			google_cca::AntigravityFingerprint,
 		},
 		id::{AccountId, ConversationId, PrincipalId, RequestId, Revision},
+		operation::discovery::CatalogDiscoveryProjectorError,
 		plan::{
 			CapabilityAvailability, ExecutionPlan, FallbackScope, ReplayPlan, RouteHealth,
 			RuntimeRouteEvidence,
@@ -2246,6 +2280,45 @@ mod tests {
 			self.calls.fetch_add(1, Ordering::Relaxed);
 			let result = self.result.clone();
 			Box::pin(async move { result })
+		}
+	}
+
+	#[test]
+	fn route_unavailable_preserves_typed_projector_source() {
+		let unavailable = RouteUnavailable::CatalogDiscoveryProjector {
+			route:     RouteId::from("openai"),
+			reason:    ReasonId(sf!("catalog-discovery-projector-invalid")),
+			operation: None,
+			source:    CatalogDiscoveryProjectorError::ProviderDiscoveryDefaultsMissing,
+		};
+		let source = std::error::Error::source(&unavailable).expect("typed source");
+		assert!(
+			source
+				.downcast_ref::<CatalogDiscoveryProjectorError>()
+				.is_some(),
+			"route-unavailable source must remain the concrete projector error",
+		);
+		let planning = crate::registry::route_unavailable_error(&unavailable, OperationKind::Chat);
+		let source = std::error::Error::source(&planning).expect("planning error typed source");
+		assert!(
+			source
+				.downcast_ref::<CatalogDiscoveryProjectorError>()
+				.is_some(),
+			"planning error must preserve the concrete projector source",
+		);
+	}
+
+	#[test]
+	fn bundled_openai_and_openrouter_discovery_projectors_construct() {
+		let catalog = Catalog::embedded();
+		for provider in ["openai", "openrouter"] {
+			let route = catalog
+				.routes()
+				.iter()
+				.find(|route| route.provider.as_str() == provider && route.discovery.is_some())
+				.unwrap_or_else(|| panic!("{provider} discovery route"));
+			CatalogDiscoveryProjector::for_route(catalog, route)
+				.unwrap_or_else(|source| panic!("{provider} projector: {source}"));
 		}
 	}
 

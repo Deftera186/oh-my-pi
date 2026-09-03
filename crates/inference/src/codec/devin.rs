@@ -546,7 +546,7 @@ impl DevinCodec {
 			request_type: ChatMessageRequestType::Cascade as i32,
 			configuration: Some(configuration),
 			tools,
-			disable_parallel_tool_calls: true,
+			disable_parallel_tool_calls: !context.policy.tool.supports_parallel_calls.unwrap_or(false),
 			tool_choice: Some(ChatToolChoice { choice: Some(choice) }),
 			system_prompt_cache_options: Some(PromptCacheOptions {
 				r#type: CacheControlType::Ephemeral as i32,
@@ -1051,6 +1051,8 @@ pub const fn discovery_rpc_path() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use serde::Deserialize;
 	use wire::exa::codeium_common_pb::ModelUsageStats;
 
@@ -1238,6 +1240,53 @@ mod tests {
 		assert_eq!(headers.get("user-agent").map(Str::as_str), Some("connect-go/1.18.1 (go1.26.3)"));
 		assert!(!headers.contains_key("content-encoding"));
 		assert_eq!(MAX_CONNECT_FRAME_BYTES, 16 * 1024 * 1024);
+	}
+
+	#[test]
+	fn supports_parallel_tool_calls_matches_pi_request_shape() {
+		let target = omp_catalog::WireTarget {
+			route:      omp_catalog::RouteId::from("devin"),
+			codec:      omp_catalog::CodecId::from("devin"),
+			endpoint:   omp_catalog::EndpointSpec {
+				base_url:    sf!("https://api.devin.ai"),
+				region:      None,
+				api_version: None,
+			},
+			wire_model: omp_catalog::WireModelId::new("model"),
+		};
+		let request = ChatRequest {
+			messages:          Arc::from([]),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Unset,
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Default::default(),
+			max_output_tokens: None,
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       Default::default(),
+		};
+		let session = CascadeSession::new("cascade", "execution");
+		let mut policy = omp_catalog::WirePolicy::baseline();
+		policy.tool.supports_parallel_calls = Some(true);
+		let context =
+			EncodeContext { target: Some(&target), policy: &policy, ..EncodeContext::default() };
+		let encoded = DevinCodec::new()
+			.encode_chat(&context, &request, &session)
+			.expect("Devin chat request");
+		assert!(!encoded.disable_parallel_tool_calls);
+
+		policy.tool.supports_parallel_calls = Some(false);
+		let context =
+			EncodeContext { target: Some(&target), policy: &policy, ..EncodeContext::default() };
+		let encoded = DevinCodec::new()
+			.encode_chat(&context, &request, &session)
+			.expect("Devin chat request");
+		assert!(encoded.disable_parallel_tool_calls);
 	}
 
 	#[test]

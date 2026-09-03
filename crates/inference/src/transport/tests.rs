@@ -206,17 +206,18 @@ fn request(
 		cancel,
 		response_hooks: Default::default(),
 		attempt: TransportAttempt {
-			request_id:    RequestId::new("request"),
-			provider:      ProviderId::new("provider"),
-			model:         Some(omp_catalog::ModelKey::new("model")),
-			api:           sf!("test"),
-			route:         RouteId::new("route"),
-			account:       None,
-			principal:     None,
-			index:         0,
-			provisional:   false,
-			timeout:       time::Duration::from_secs(5),
-			capture_limit: 10,
+			request_id:          RequestId::new("request"),
+			provider:            ProviderId::new("provider"),
+			model:               Some(omp_catalog::ModelKey::new("model")),
+			api:                 sf!("test"),
+			route:               RouteId::new("route"),
+			account:             None,
+			principal:           None,
+			index:               0,
+			provisional:         false,
+			timeout:             time::Duration::from_secs(5),
+			first_event_timeout: None,
+			capture_limit:       10,
 		},
 	}
 }
@@ -1191,6 +1192,238 @@ async fn websocket_upgrade_sends_initial_frame_before_first_decodable_event() {
 	assert_eq!(captures.len(), 1);
 	assert_eq!(captures[0].frames.len(), 1);
 	assert_eq!(captures[0].frames[0].redaction, Bytes::from_static(b"<redacted>"));
+}
+
+#[tokio::test]
+async fn stream_first_event_timeout_ms_matches_pi_behavior() {
+	let listener = TcpListener::bind("127.0.0.1:0")
+		.await
+		.expect("bind fixture");
+	let address = listener.local_addr().expect("fixture address");
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.expect("accept fixture");
+		let mut request = [0_u8; 1024];
+		let _ = socket.read(&mut request).await.expect("read request");
+		socket
+			.write_all(
+				b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+			)
+			.await
+			.expect("write headers");
+		future::pending::<()>().await;
+	});
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/stall");
+	call.attempt.timeout = time::Duration::from_secs(5);
+	call.attempt.first_event_timeout = Some(time::Duration::from_millis(10));
+	let error = service.call(call).await.err().expect("first-event timeout");
+	assert_eq!(error.kind, ErrorKind::DeadlineExceeded);
+	assert_eq!(error.phase, ErrorPhase::Handshake);
+	assert!(!error.committed);
+	assert_eq!(error.receipt().attempts.len(), 1);
+	// The watchdog is a typed local timeout naming the awaited milestone and
+	// the time spent; it never masquerades as a wire protocol violation.
+	let Some(ErrorDetail::Timeout { scope, elapsed_ms }) = error.detail_ref() else {
+		panic!("watchdog must surface a typed timeout, got {:?}", error.detail_ref());
+	};
+	assert_eq!(scope.0.as_str(), "stream.first-event-timeout");
+	assert!(*elapsed_ms >= 10, "elapsed {elapsed_ms} ms must cover the 10 ms watchdog");
+	let rendered = error.to_string();
+	assert!(rendered.contains("timed out after"), "{rendered}");
+	assert!(!rendered.contains("protocol violation"), "{rendered}");
+	server.abort();
+}
+
+#[tokio::test]
+async fn anthropic_stream_closed_before_output_is_precommit_retryable_with_elapsed_evidence() {
+	// Anthropic answered 200, sent `message_start` and keep-alive pings, then
+	// closed the chunked body cleanly without `message_stop`. Nothing reached
+	// the caller: the failure must be pre-commit, replayable on the same
+	// route, and carry how long the body lived and how many frames it had.
+	let listener = TcpListener::bind("127.0.0.1:0")
+		.await
+		.expect("bind fixture");
+	let address = listener.local_addr().expect("fixture address");
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.expect("accept fixture");
+		let mut request = [0_u8; 4096];
+		let _ = socket.read(&mut request).await.expect("read request");
+		socket
+			.write_all(
+				b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+			)
+			.await
+			.expect("write headers");
+		for frame in [
+			&b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":22029,\"output_tokens\":1}}}\n\n"[..],
+			&b"event: ping\ndata: {\"type\":\"ping\"}\n\n"[..],
+			&b"event: ping\ndata: {\"type\":\"ping\"}\n\n"[..],
+		] {
+			socket
+				.write_all(format!("{:x}\r\n", frame.len()).as_bytes())
+				.await
+				.expect("write chunk size");
+			socket.write_all(frame).await.expect("write chunk");
+			socket.write_all(b"\r\n").await.expect("write chunk end");
+			time::sleep(time::Duration::from_millis(5)).await;
+		}
+		socket
+			.write_all(b"0\r\n\r\n")
+			.await
+			.expect("write terminating chunk");
+		socket.shutdown().await.expect("close fixture");
+	});
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		crate::codec::anthropic::AnthropicWireDecoder::direct(),
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/v1/messages");
+	call.encoded.framing = FramingProtocol::Sse;
+	call.encoded.bounds =
+		SizeBounds { request_body: 1024, frame: 65_536, response: 65_536 };
+	let error = service
+		.call(call)
+		.await
+		.err()
+		.expect("closed before output");
+	assert_eq!(error.kind, ErrorKind::StreamCorruption);
+	assert_eq!(error.phase, ErrorPhase::Handshake);
+	assert_eq!(error.status, Some(200));
+	assert!(!error.committed, "no output reached the caller");
+	assert!(
+		matches!(error.action, RetryAction::SameRoute { .. }),
+		"pre-output truncation must replay on the same route, got {:?}",
+		error.action
+	);
+	let Some(ErrorDetail::StreamEnded { reason, elapsed_ms, frames }) = error.detail_ref() else {
+		panic!("body end must carry stream-end evidence, got {:?}", error.detail_ref());
+	};
+	assert_eq!(reason.0.as_str(), "anthropic.sse.truncated_before_output");
+	assert_eq!(*frames, 3, "message_start plus two pings were decoded");
+	assert!(*elapsed_ms >= 10, "elapsed {elapsed_ms} ms must span the paced fixture");
+	let rendered = error.to_string();
+	assert!(rendered.contains("stream ended after"), "{rendered}");
+	assert!(rendered.contains("3 frame(s)"), "{rendered}");
+	assert!(!rendered.contains("protocol violation"), "{rendered}");
+	let receipt = error.receipt().attempts.last().expect("attempt receipt");
+	assert_eq!(receipt.outcome, AttemptOutcome::FailedPreCommit);
+	server.await.expect("fixture server");
+}
+
+/// Anthropic honours the Claude Code profile's `accept-encoding` and gzips the
+/// SSE stream. The transport must decode it before framing; the undecoded
+/// body previously read as `truncated_before_output` and was silently retried
+/// for minutes (owner's `omp chat` stall).
+#[tokio::test]
+async fn gzip_encoded_anthropic_stream_decodes_to_a_completion() {
+	use std::io::Write as _;
+	let listener = TcpListener::bind("127.0.0.1:0")
+		.await
+		.expect("bind fixture");
+	let address = listener.local_addr().expect("fixture address");
+	let body = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+	let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+	encoder.write_all(body).expect("gzip body");
+	let wire = encoder.finish().expect("finish gzip");
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.expect("accept fixture");
+		let mut request = [0_u8; 4096];
+		let _ = socket.read(&mut request).await.expect("read request");
+		socket
+			.write_all(
+				b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n\r\n",
+			)
+			.await
+			.expect("write headers");
+		// Split the compressed bytes mid-member so the decoder must buffer state
+		// across chunks exactly like a paced provider stream.
+		for chunk in wire.chunks(7) {
+			socket
+				.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+				.await
+				.expect("write chunk size");
+			socket.write_all(chunk).await.expect("write chunk");
+			socket.write_all(b"\r\n").await.expect("write chunk end");
+		}
+		socket
+			.write_all(b"0\r\n\r\n")
+			.await
+			.expect("write terminating chunk");
+		socket.shutdown().await.expect("close fixture");
+	});
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		crate::codec::anthropic::AnthropicWireDecoder::direct(),
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/v1/messages");
+	call.encoded.framing = FramingProtocol::Sse;
+	call.encoded.bounds = SizeBounds { request_body: 1024, frame: 65_536, response: 65_536 };
+	let response = service
+		.call(call)
+		.await
+		.expect("gzip stream handshakes");
+	let mut events = response.events.expect("ordinary event stream");
+	let mut text = String::new();
+	let mut completed = false;
+	while let Some(event) = events.next().await {
+		match event.expect("decoded event") {
+			RawEvent::Chat(ChatEvent::TextDelta { text: delta, .. }) => text.push_str(&delta),
+			RawEvent::Completion(completion) => {
+				assert_eq!(completion.reason, FinishReason::Stop);
+				completed = true;
+			},
+			_ => {},
+		}
+	}
+	assert_eq!(text, "pong");
+	assert!(completed, "message_stop must complete the decoded stream");
+	server.await.expect("fixture server");
+}
+
+#[tokio::test]
+async fn unsupported_content_encoding_fails_closed_without_retry() {
+	let listener = TcpListener::bind("127.0.0.1:0")
+		.await
+		.expect("bind fixture");
+	let address = listener.local_addr().expect("fixture address");
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.expect("accept fixture");
+		let mut request = [0_u8; 4096];
+		let _ = socket.read(&mut request).await.expect("read request");
+		socket
+			.write_all(
+				b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: compress\r\ncontent-length: 0\r\n\r\n",
+			)
+			.await
+			.expect("write headers");
+		socket.shutdown().await.expect("close fixture");
+	});
+	let mut service = HttpTransport::new();
+	service.ready().await.expect("http ready");
+	let mut call = request(
+		BodySource::Bytes(Bytes::from_static(b"request")),
+		EmitDecoder,
+		Cancellation::default(),
+	);
+	call.encoded.uri = sf!("http://{address}/v1/messages");
+	let error = service.call(call).await.err().expect("unsupported encoding fails");
+	assert_eq!(error.kind, ErrorKind::Protocol);
+	assert_eq!(error.phase, ErrorPhase::Handshake);
+	assert_eq!(error.action, RetryAction::Never);
+	assert!(!error.committed);
+	server.await.expect("fixture server");
 }
 
 #[tokio::test]

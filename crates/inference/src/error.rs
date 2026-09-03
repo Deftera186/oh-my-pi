@@ -13,7 +13,7 @@ use crate::{
 	answer::{AnswerKind, SearchFailureKind, SearchProviderFailure},
 	catalog::{OperationKind, ProviderId, RouteId},
 	id::RequestId,
-	operation::MediaOperationError,
+	operation::{MediaOperationError, discovery::CatalogDiscoveryProjectorError},
 	receipt::{ExecutionReceipt, ReasonId},
 };
 
@@ -357,6 +357,26 @@ pub enum ErrorDetail {
 		/// Typed protocol reason.
 		reason: ReasonId,
 	},
+	/// A local watchdog or attempt deadline elapsed before the awaited wire
+	/// milestone.
+	#[error("timed out after {elapsed_ms} ms waiting for {}", .scope.0)]
+	Timeout {
+		/// Typed milestone that was being awaited.
+		scope:      ReasonId,
+		/// Wall-clock milliseconds since the attempt started.
+		elapsed_ms: u64,
+	},
+	/// The provider closed a successful response body before its terminal
+	/// envelope.
+	#[error("stream ended after {elapsed_ms} ms and {frames} frame(s) without a terminal event ({})", .reason.0)]
+	StreamEnded {
+		/// Codec-owned truncation reason.
+		reason:     ReasonId,
+		/// Wall-clock milliseconds since the attempt started.
+		elapsed_ms: u64,
+		/// Decoded wire frames observed before the body ended.
+		frames:     u64,
+	},
 	/// An order-matched replay requested an exchange beyond the cassette.
 	#[error("cassette miss at request {request_index}; only {recorded} exchanges were recorded")]
 	CassetteMiss {
@@ -421,6 +441,20 @@ impl ErrorDetail {
 		Self::Protocol { reason }
 	}
 
+	/// Records an elapsed local deadline and the milestone it was awaiting.
+	pub fn timeout(scope: ReasonId, elapsed: Duration) -> Self {
+		Self::Timeout { scope, elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX) }
+	}
+
+	/// Records a provider body that ended before its terminal envelope.
+	pub fn stream_ended(reason: ReasonId, elapsed: Duration, frames: u64) -> Self {
+		Self::StreamEnded {
+			reason,
+			elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+			frames,
+		}
+	}
+
 	/// Records an order-matched cassette miss.
 	pub const fn cassette_miss(request_index: usize, recorded: usize) -> Self {
 		Self::CassetteMiss { request_index, recorded }
@@ -446,9 +480,10 @@ impl ErrorDetail {
 /// remains cheap to return.
 #[derive(Clone)]
 struct ErrorEvidence {
-	receipt: ExecutionReceipt,
-	detail:  Option<ErrorDetail>,
-	source:  Option<MediaOperationError>,
+	receipt:          ExecutionReceipt,
+	detail:           Option<ErrorDetail>,
+	media_source:     Option<MediaOperationError>,
+	projector_source: Option<CatalogDiscoveryProjectorError>,
 }
 
 /// Concrete, cloneable, secret-free inference error.
@@ -486,6 +521,8 @@ impl fmt::Debug for Error {
 			ErrorDetail::Capability { .. } => "Capability",
 			ErrorDetail::Replay { .. } => "Replay",
 			ErrorDetail::Protocol { .. } => "Protocol",
+			ErrorDetail::Timeout { .. } => "Timeout",
+			ErrorDetail::StreamEnded { .. } => "StreamEnded",
 			ErrorDetail::CassetteMiss { .. } => "CassetteMiss",
 			ErrorDetail::Provider { .. } => "Provider",
 			ErrorDetail::SearchFailures { .. } => "SearchFailures",
@@ -532,7 +569,12 @@ impl Error {
 			status: None,
 			code: None,
 			committed: false,
-			evidence: Box::new(ErrorEvidence { receipt, detail: None, source: None }),
+			evidence: Box::new(ErrorEvidence {
+				receipt,
+				detail: None,
+				media_source: None,
+				projector_source: None,
+			}),
 		}
 	}
 
@@ -622,7 +664,13 @@ impl Error {
 	}
 
 	pub(crate) fn typed_source(mut self, source: MediaOperationError) -> Self {
-		self.evidence.source = Some(source);
+		self.evidence.media_source = Some(source);
+		self
+	}
+
+	/// Attaches the typed catalog discovery construction failure.
+	pub(crate) fn projector_source(mut self, source: CatalogDiscoveryProjectorError) -> Self {
+		self.evidence.projector_source = Some(source);
 		self
 	}
 
@@ -666,9 +714,12 @@ impl Display for Error {
 
 impl error::Error for Error {
 	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+		if let Some(source) = self.evidence.projector_source.as_ref() {
+			return Some(source);
+		}
 		self
 			.evidence
-			.source
+			.media_source
 			.as_ref()
 			.map(|source| source as &(dyn error::Error + 'static))
 	}

@@ -33,7 +33,7 @@ pub struct SystemCredentialEnvironment;
 
 impl CredentialEnvironment for SystemCredentialEnvironment {
 	fn read(&self, name: &str) -> Result<Option<SecretString>, CredentialError> {
-		if !name.starts_with("OMP_") {
+		if name.is_empty() {
 			return Err(CredentialError::InvalidSource);
 		}
 		match env::var(name) {
@@ -118,8 +118,9 @@ pub enum CredentialBrokerError {
 	/// An authenticated catalog record has no declared acquisition source.
 	#[error("catalog authentication specification has no credential source")]
 	MissingSource(AuthSpecId),
-	/// A credential environment source contains an empty or non-OMP name.
-	#[error("catalog credential environment source is invalid")]
+	/// A credential environment source is empty or does not lead with an OMP
+	/// name.
+	#[error("catalog credential environment source must lead with an OMP_* name")]
 	InvalidEnvironment(AuthSpecId),
 	/// The selected provider does not exist in the catalog.
 	#[error("invocation credential override names an unknown provider")]
@@ -160,18 +161,21 @@ impl CredentialBroker {
 				use omp_catalog::provider::CredentialSourceSpec as CatalogSource;
 				let source = match source {
 					CatalogSource::Environment { ordered_names } => {
-						if ordered_names.is_empty()
-							|| ordered_names.iter().any(|name| !name.starts_with("OMP_"))
+						if ordered_names
+							.first()
+							.is_none_or(|name| !name.starts_with("OMP_"))
 						{
 							return Err(CredentialBrokerError::InvalidEnvironment(auth.id.clone()));
 						}
 						BrokerSource::Environment(ordered_names.clone())
 					},
 					CatalogSource::BasicEnvironment { username_names, password_names } => {
-						if username_names.is_empty()
-							|| password_names.is_empty()
-							|| username_names.iter().any(|name| !name.starts_with("OMP_"))
-							|| password_names.iter().any(|name| !name.starts_with("OMP_"))
+						if username_names
+							.first()
+							.is_none_or(|name| !name.starts_with("OMP_"))
+							|| password_names
+								.first()
+								.is_none_or(|name| !name.starts_with("OMP_"))
 						{
 							return Err(CredentialBrokerError::InvalidEnvironment(auth.id.clone()));
 						}
@@ -347,32 +351,64 @@ impl CredentialBroker {
 		}
 	}
 
+	/// Reads the first declared name that is set, tracing every miss.
+	///
+	/// Returns the name that produced the secret so the lease can be
+	/// attributed without exposing the value.
+	fn read_environment<'n>(
+		&self,
+		names: &'n [Str],
+		spec: &AuthSpecId,
+	) -> Result<Option<(&'n Str, SecretString)>, CredentialError> {
+		for name in names {
+			match self.environment.read(name)? {
+				Some(secret) => {
+					tracing::debug!(spec = %spec, variable = %name, "credential environment variable set");
+					return Ok(Some((name, secret)));
+				},
+				None => {
+					tracing::debug!(spec = %spec, variable = %name, "credential environment variable unset");
+				},
+			}
+		}
+		Ok(None)
+	}
+
+	/// Lease identity for an environment credential.
+	///
+	/// Brokered routes (no durable account selected) carry no identity, so the
+	/// lease is attributed to the environment and the variable that produced
+	/// it; an explicit account/principal from a selected record is kept.
+	fn environment_meta(need: &CredentialNeed, variable: &Str) -> LeaseMeta {
+		let account = need
+			.account
+			.clone()
+			.unwrap_or_else(|| AccountId::from(ENVIRONMENT_TAG));
+		let principal = need
+			.principal
+			.clone()
+			.unwrap_or_else(|| PrincipalId::from(variable.as_str()));
+		LeaseMeta { account, principal, generation: 0, expires_at: None }
+	}
+
 	fn environment_lease(
 		&self,
 		names: &[Str],
 		need: &CredentialNeed,
 		kind: CredentialKind,
 	) -> Result<CredentialLease, CredentialError> {
-		for name in names {
-			let Some(secret) = self.environment.read(name)? else {
-				continue;
-			};
-			let account = need.account.clone().ok_or(CredentialError::InvalidSource)?;
-			let principal = need
-				.principal
-				.clone()
-				.ok_or(CredentialError::InvalidSource)?;
-			let meta = LeaseMeta { account, principal, generation: 0, expires_at: None };
-			let lease = match kind {
-				CredentialKind::ApiKey => CredentialLease::api_key(meta, secret),
-				CredentialKind::Basic => return Err(CredentialError::InvalidSource),
-				CredentialKind::Bearer => CredentialLease::bearer(meta, secret),
-				CredentialKind::SessionToken => CredentialLease::session_token(meta, secret),
-				CredentialKind::AwsSigV4 => return Err(CredentialError::InvalidSource),
-			};
-			return Ok(lease.with_source_tag(sf!(ENVIRONMENT_TAG)));
-		}
-		Err(CredentialError::Unavailable)
+		let Some((variable, secret)) = self.read_environment(names, &need.spec)? else {
+			return Err(CredentialError::Unavailable);
+		};
+		let meta = Self::environment_meta(need, variable);
+		let lease = match kind {
+			CredentialKind::ApiKey => CredentialLease::api_key(meta, secret),
+			CredentialKind::Basic => return Err(CredentialError::InvalidSource),
+			CredentialKind::Bearer => CredentialLease::bearer(meta, secret),
+			CredentialKind::SessionToken => CredentialLease::session_token(meta, secret),
+			CredentialKind::AwsSigV4 => return Err(CredentialError::InvalidSource),
+		};
+		Ok(lease.with_source_tag(sf!(ENVIRONMENT_TAG)))
 	}
 
 	fn basic_environment_lease(
@@ -381,22 +417,13 @@ impl CredentialBroker {
 		password_names: &[Str],
 		need: &CredentialNeed,
 	) -> Result<CredentialLease, CredentialError> {
-		let read_first = |names: &[Str]| {
-			for name in names {
-				if let Some(secret) = self.environment.read(name)? {
-					return Ok(secret);
-				}
-			}
-			Err(CredentialError::Unavailable)
+		let Some((variable, username)) = self.read_environment(username_names, &need.spec)? else {
+			return Err(CredentialError::Unavailable);
 		};
-		let username = read_first(username_names)?;
-		let password = read_first(password_names)?;
-		let account = need.account.clone().ok_or(CredentialError::InvalidSource)?;
-		let principal = need
-			.principal
-			.clone()
-			.ok_or(CredentialError::InvalidSource)?;
-		let meta = LeaseMeta { account, principal, generation: 0, expires_at: None };
+		let Some((_, password)) = self.read_environment(password_names, &need.spec)? else {
+			return Err(CredentialError::Unavailable);
+		};
+		let meta = Self::environment_meta(need, variable);
 		Ok(CredentialLease::basic(meta, username, password).with_source_tag(sf!(ENVIRONMENT_TAG)))
 	}
 
@@ -765,7 +792,7 @@ mod tests {
 	impl CredentialEnvironment for OrderedEnvironment {
 		fn read(&self, name: &str) -> Result<Option<SecretString>, CredentialError> {
 			self.calls.lock().push(name.into());
-			Ok((name == "OMP_SECOND").then(|| SecretString::from("secret".to_owned())))
+			Ok((name == "ANTHROPIC_API_KEY").then(|| SecretString::from("secret".to_owned())))
 		}
 	}
 
@@ -777,7 +804,7 @@ mod tests {
 			plans:       Arc::new(BTreeMap::from([(spec.clone(), BrokerPlan {
 				kind:    CredentialKind::ApiKey,
 				sources: vec![BrokerSource::Environment(
-					vec![sf!("OMP_FIRST"), sf!("OMP_SECOND")].into_boxed_slice(),
+					vec![sf!("OMP_ANTHROPIC_API_KEY"), sf!("ANTHROPIC_API_KEY")].into_boxed_slice(),
 				)]
 				.into_boxed_slice(),
 			})])),
@@ -795,7 +822,48 @@ mod tests {
 			.await
 			.expect("second source");
 		assert_eq!(lease.kind(), CredentialKind::ApiKey);
-		assert_eq!(*environment.calls.lock(), vec![sf!("OMP_FIRST"), sf!("OMP_SECOND")]);
+		assert_eq!(*environment.calls.lock(), vec![
+			sf!("OMP_ANTHROPIC_API_KEY"),
+			sf!("ANTHROPIC_API_KEY")
+		]);
 		assert!(!format!("{broker:?} {lease:?}").contains("secret"));
+	}
+
+	/// Route execution with no durable account selects a brokered identity
+	/// (`account: None`); a vendor environment name must still yield a lease.
+	#[tokio::test]
+	async fn brokered_need_without_account_leases_vendor_environment_name() {
+		let spec = AuthSpecId::new("ordered");
+		let environment = Arc::new(OrderedEnvironment { calls: Mutex::new(Vec::new()) });
+		let broker = CredentialBroker {
+			plans:       Arc::new(BTreeMap::from([(spec.clone(), BrokerPlan {
+				kind:    CredentialKind::ApiKey,
+				sources: vec![BrokerSource::Environment(
+					vec![sf!("OMP_ANTHROPIC_API_KEY"), sf!("ANTHROPIC_API_KEY")].into_boxed_slice(),
+				)]
+				.into_boxed_slice(),
+			})])),
+			environment: environment.clone(),
+			engines:     CredentialBrokerEngines::default(),
+			invocation:  None,
+		};
+		let lease = broker
+			.lease(CredentialNeed {
+				spec,
+				account: None,
+				principal: None,
+				valid_after: SystemTime::UNIX_EPOCH,
+			})
+			.await
+			.expect("brokered environment lease");
+		assert_eq!(lease.kind(), CredentialKind::ApiKey);
+		assert_eq!(lease.scalar_secret().expect("scalar key").expose_secret(), "secret");
+		assert_eq!(lease.source_tag(), Some(ENVIRONMENT_TAG));
+		assert_eq!(lease.meta().account.as_str(), ENVIRONMENT_TAG);
+		assert_eq!(lease.meta().principal.as_str(), "ANTHROPIC_API_KEY");
+		assert_eq!(*environment.calls.lock(), vec![
+			sf!("OMP_ANTHROPIC_API_KEY"),
+			sf!("ANTHROPIC_API_KEY")
+		]);
 	}
 }

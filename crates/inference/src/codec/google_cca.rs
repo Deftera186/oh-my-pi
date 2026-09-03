@@ -1,6 +1,9 @@
 //! Typed Cloud Code Assist envelopes, discovery shapes, and stream adapter.
 
-use std::{collections::BTreeMap, mem, str};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	mem, str,
+};
 
 use bytes::Bytes;
 use omp_catalog::{
@@ -17,6 +20,7 @@ use super::gemini::{
 	GenerateContentResponse, GoogleCodecError, GoogleCodecErrorKind, GoogleContent,
 	GoogleDecodedEvent, GoogleErrorDetail, GoogleFunctionCallingConfig, GoogleFunctionCallingMode,
 	GoogleProofScope, GoogleRequestOptions, GoogleThinkingPolicy, GoogleToolConfig, GoogleWireError,
+	InlineToolDescriptorsMode,
 };
 use crate::{
 	body::BodySource,
@@ -100,8 +104,9 @@ pub struct AntigravityRequestMetadata {
 	pub last_step_index:              Option<u64>,
 	/// Explicit model enum supplied by catalog policy.
 	pub model_enum:                   Option<Str>,
-	/// Whether the conversation has used a Claude-routed model.
-	pub used_claude:                  bool,
+	/// Catalog-selected string label describing Claude use for billing and
+	/// trajectory accounting.
+	pub used_claude:                  Str,
 	/// Whether Antigravity's `VALIDATED` function-calling mode is required.
 	pub validated_tool_config:        bool,
 	/// Whether planning intentionally appends the forced-tool directive.
@@ -211,7 +216,7 @@ pub fn wrap_antigravity_request(
 			}],
 		});
 	}
-	let used_claude: Str = metadata.used_claude.to_string().into();
+	let used_claude = metadata.used_claude.clone();
 	AntigravityRequestEnvelope {
 		model,
 		project,
@@ -373,14 +378,6 @@ fn is_release_triple(value: &str) -> bool {
 	component() && component() && component() && parts.next().is_none()
 }
 
-/// Returns whether a CCA wire id addresses an Anthropic model.
-///
-/// Antigravity exposes Claude under `claude-*` wire ids; the id prefix is the
-/// only per-model signal available at encode time.
-fn is_claude_wire_model(wire_model: &str) -> bool {
-	wire_model.len() >= 6 && wire_model.as_bytes()[..6].eq_ignore_ascii_case(b"claude")
-}
-
 /// Explicit Antigravity lowering policy supplied by catalog/route composition.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AntigravityPolicy {
@@ -455,7 +452,7 @@ impl GoogleCcaCodec {
 		}
 	}
 
-	fn request_headers(&self, model: &str) -> Box<[RequestHeader]> {
+	fn request_headers(&self, model: &str, claude_thinking_beta: bool) -> Box<[RequestHeader]> {
 		let user_agent = self.gemini_cli_coordinates.as_ref().map_or_else(
 			|| self.headers.user_agent.clone(),
 			|(platform, arch)| {
@@ -470,8 +467,8 @@ impl GoogleCcaCodec {
 		if let Some(value) = &self.headers.client_metadata {
 			headers.push(RequestHeader::new(sf!("client-metadata"), value.clone()));
 		}
-		if let Some(value) = &self.headers.anthropic_beta {
-			headers.push(RequestHeader::new(sf!("anthropic-beta"), value.clone()));
+		if claude_thinking_beta {
+			headers.push(RequestHeader::new_static("anthropic-beta", CLAUDE_THINKING_BETA));
 		}
 		if let Some(value) = &self.headers.quota_project {
 			headers.push(RequestHeader::new(sf!("x-goog-user-project"), value.clone()));
@@ -596,12 +593,19 @@ impl Codec for GoogleCcaCodec {
 				provider: context.route.provider.clone(),
 				codec:    target.codec.clone(),
 			}),
-			// Antigravity's Claude routes reject thought parts lacking a
-			// continuation proof with HTTP 400 (session resume, model switch), so
-			// unsigned reasoning is dropped instead of replayed. The wire-id check
-			// mirrors the reference client; Gemini routes accept unsigned thoughts.
-			drop_unsigned_reasoning: self.flavor == CcaFlavor::Antigravity
-				&& is_claude_wire_model(target.wire_model.as_str()),
+			drop_unsigned_reasoning: context.policy.reasoning.drop_unsigned == Some(true),
+			supports_function_part_id: context.policy.tool.supports_function_part_id,
+			requires_skip_thought_signature: context.policy.tool.requires_skip_thought_signature
+				== Some(true),
+			multimodal_function_response: context.policy.image.multimodal_function_response,
+			strip_image_input: context.policy.image.strip_input == Some(true),
+			cca_legacy_parameters_schema: context.policy.tool.cca_legacy_parameters_schema,
+			inline_tool_descriptors: if context.policy.tool.cca_legacy_parameters_schema == Some(true)
+			{
+				InlineToolDescriptorsMode::Off
+			} else {
+				InlineToolDescriptorsMode::Auto
+			},
 			..GoogleRequestOptions::default()
 		};
 		let projection = self
@@ -641,8 +645,14 @@ impl Codec for GoogleCcaCodec {
 					last_execution_id: None,
 					last_step_index: None,
 					model_enum: policy.model_enum.clone(),
-					used_claude: policy.used_claude,
-					validated_tool_config: policy.validated_tool_config,
+					used_claude: context
+						.policy
+						.usage
+						.antigravity_label
+						.clone()
+						.unwrap_or_else(|| policy.used_claude.to_string().into()),
+					validated_tool_config: policy.validated_tool_config
+						|| context.policy.tool.antigravity_claude_mode == Some(true),
 					append_forced_tool_directive: policy.append_forced_tool_directive,
 					max_output_tokens: policy.max_output_tokens,
 				};
@@ -666,7 +676,10 @@ impl Codec for GoogleCcaCodec {
 				STREAM_GENERATE_PATH,
 			)
 			.into(),
-			headers:     self.request_headers(target.wire_model.as_str()),
+			headers:     self.request_headers(
+				target.wire_model.as_str(),
+				context.policy.headers.claude_thinking_beta == Some(true),
+			),
 			body:        BodySource::Bytes(Bytes::from(body)),
 			framing:     FramingProtocol::Sse,
 			bounds:      SizeBounds {
@@ -689,9 +702,16 @@ impl Codec for GoogleCcaCodec {
 			}));
 		}
 		if context.operation == OperationKind::Chat
-			&& matches!(context.operation_call, OperationCall::Chat(_))
+			&& let OperationCall::Chat(request) = context.operation_call
 		{
-			return Ok(Box::new(CanonicalCcaDecoder::default()));
+			let tool_names = request.tools.iter().map(|tool| tool.name.clone()).collect();
+			return Ok(Box::new(CanonicalCcaDecoder {
+				inner:     CcaDecoder::new(
+					context.policy.streaming.flash_leak_workaround == Some(true),
+					tool_names,
+				),
+				canonical: CanonicalGeminiDecoder::default(),
+			}));
 		}
 		Err(
 			cca_decode_error(
@@ -1015,6 +1035,23 @@ pub struct CcaDecoder {
 }
 
 impl CcaDecoder {
+	/// Creates a decoder with catalog-selected Flash planning-leak recovery.
+	pub fn new(flash_leak_workaround: bool, tool_names: BTreeSet<Str>) -> Self {
+		let tool_markers = tool_names
+			.into_iter()
+			.filter_map(|name| serde_json::to_string(name.as_str()).ok().map(Str::from))
+			.collect();
+		Self {
+			gemini:    GeminiDecoder::default(),
+			visible:   CcaVisibleTextFilter {
+				flash_leak_workaround,
+				tool_markers,
+				..CcaVisibleTextFilter::default()
+			},
+			completed: false,
+		}
+	}
+
 	/// Decodes one complete CCA SSE data field.
 	pub fn push_json(&mut self, data: &[u8]) -> Result<Vec<GoogleDecodedEvent>, GoogleCodecError> {
 		if self.completed || data.is_empty() {
@@ -1073,10 +1110,12 @@ enum VisibleMode {
 
 #[derive(Debug, Default)]
 struct CcaVisibleTextFilter {
-	mode:              VisibleMode,
-	pending:           String,
-	pending_index:     u32,
-	pending_signature: Option<Str>,
+	mode:                  VisibleMode,
+	pending:               String,
+	pending_index:         u32,
+	pending_signature:     Option<Str>,
+	flash_leak_workaround: bool,
+	tool_markers:          BTreeSet<Str>,
 }
 
 impl CcaVisibleTextFilter {
@@ -1107,7 +1146,7 @@ impl CcaVisibleTextFilter {
 	}
 
 	fn consume_planning_prefix(&mut self, output: &mut Vec<GoogleDecodedEvent>) -> bool {
-		if !self.pending.starts_with('{') {
+		if !self.flash_leak_workaround || !self.pending.trim_start().starts_with('{') {
 			self.mode = VisibleMode::Text;
 			return true;
 		}
@@ -1119,9 +1158,26 @@ impl CcaVisibleTextFilter {
 		struct PlanningProbe {
 			thought: Option<Box<RawValue>>,
 			call:    Option<Box<RawValue>>,
+			#[serde(rename = "_i")]
+			intent:  Option<Box<RawValue>>,
+			paths:   Option<Box<RawValue>>,
+			command: Option<Box<RawValue>>,
+			path:    Option<Box<RawValue>>,
+			content: Option<Box<RawValue>>,
 		}
-		let planning = serde_json::from_str::<PlanningProbe>(candidate)
-			.is_ok_and(|probe| probe.thought.is_some() || probe.call.is_some());
+		let typed_planning = serde_json::from_str::<PlanningProbe>(candidate).is_ok_and(|probe| {
+			probe.thought.is_some()
+				|| probe.call.is_some()
+				|| probe.intent.is_some()
+				|| probe.paths.is_some()
+				|| probe.command.is_some()
+				|| (probe.path.is_some() && probe.content.is_some())
+		});
+		let named_tool = self
+			.tool_markers
+			.iter()
+			.any(|marker| candidate.contains(marker.as_str()));
+		let planning = typed_planning || named_tool;
 		if planning {
 			self.pending.drain(..end);
 			if self.pending.is_empty() {
@@ -1216,7 +1272,11 @@ impl CcaVisibleTextFilter {
 	}
 
 	fn finish(&mut self, output: &mut Vec<GoogleDecodedEvent>) {
-		if matches!(self.mode, VisibleMode::PlanningPrefix) && self.pending.starts_with('{') {
+		if matches!(self.mode, VisibleMode::PlanningPrefix)
+			&& self.flash_leak_workaround
+			&& self.pending.trim_start().starts_with('{')
+			&& planning_leak_signature(&self.pending, &self.tool_markers)
+		{
 			self.pending.clear();
 			self.pending_signature = None;
 			return;
@@ -1227,6 +1287,17 @@ impl CcaVisibleTextFilter {
 
 fn cca_discovery_error(kind: ErrorKind, phase: ErrorPhase, code: &'static str) -> Error {
 	Error::new(kind, phase, RetryAction::Never, ExecutionReceipt::default()).code(Str::new(code))
+}
+
+fn planning_leak_signature(value: &str, tool_markers: &BTreeSet<Str>) -> bool {
+	value.contains(r#""thought""#)
+		|| value.contains(r#""_i""#)
+		|| value.contains(r#""paths""#)
+		|| value.contains(r#""command""#)
+		|| (value.contains(r#""path""#) && value.contains(r#""content""#))
+		|| tool_markers
+			.iter()
+			.any(|marker| value.contains(marker.as_str()))
 }
 
 fn longest_suffix_prefix(value: &str, marker: &str) -> usize {
@@ -1367,7 +1438,10 @@ mod tests {
 			negotiation:       Default::default(),
 		};
 		let projected = GeminiCodec::cloud_code_assist(None)
-			.project(&request, &GoogleRequestOptions::default())
+			.project(&request, &GoogleRequestOptions {
+				supports_function_part_id: Some(true),
+				..GoogleRequestOptions::default()
+			})
 			.expect("parallel function responses project");
 		assert_eq!(projected.request.contents.len(), 1);
 		assert_eq!(projected.request.contents[0].parts.len(), 2);
@@ -1428,7 +1502,7 @@ mod tests {
 			last_execution_id:            Some("execution-before".into()),
 			last_step_index:              Some(1),
 			model_enum:                   Some("MODEL_PLACEHOLDER_M20".into()),
-			used_claude:                  false,
+			used_claude:                  sf!("false"),
 			validated_tool_config:        true,
 			append_forced_tool_directive: false,
 			max_output_tokens:            Some(65_536),
@@ -1677,8 +1751,8 @@ mod tests {
 	}
 
 	#[test]
-	fn antigravity_leaks_are_removed_and_thinking_tags_healed() {
-		let mut decoder = CcaDecoder::default();
+	fn flash_stream_leak_workaround_matches_pi_request_shape() {
+		let mut decoder = CcaDecoder::new(true, BTreeSet::from([sf!("read")]));
 		let frames: [&[u8]; 5] = [
 			br#"{"response":{"candidates":[{"content":{"parts":[{"text":"{\"tho"}]}}]}}"#,
 			br#"{"response":{"candidates":[{"content":{"parts":[{"text":"ught\":\"secret\",\"call\":\"read\"}visible"}]}}]}}"#,
@@ -1706,6 +1780,15 @@ mod tests {
 			.collect::<String>();
 		assert_eq!(text, "visible before  after");
 		assert_eq!(thinking, "healed secret");
+
+		let mut disabled = CcaDecoder::default();
+		let visible = disabled
+			.push_json(frames[0])
+			.expect("disabled workaround preserves the response");
+		assert!(matches!(
+			visible.as_slice(),
+			[GoogleDecodedEvent::Text { text, .. }] if text.as_str() == r#"{"tho"#
+		));
 	}
 
 	#[test]
@@ -1819,6 +1902,81 @@ mod tests {
 	}
 
 	#[test]
+	fn antigravity_claude_tool_mode_matches_pi_request_shape() {
+		let envelope = wrap_antigravity_request(
+			GenerateContentRequest::default(),
+			sf!("wire-model"),
+			sf!("project"),
+			&AntigravityRequestMetadata {
+				trajectory_id:                sf!("trajectory"),
+				request_id:                   sf!("request"),
+				session_id:                   None,
+				last_execution_id:            None,
+				last_step_index:              None,
+				model_enum:                   None,
+				used_claude:                  sf!("true"),
+				validated_tool_config:        true,
+				append_forced_tool_directive: false,
+				max_output_tokens:            None,
+			},
+		);
+		let config = envelope
+			.request
+			.generate
+			.tool_config
+			.expect("policy forces tool config without declared tools");
+		assert_eq!(config.function_calling_config.mode, GoogleFunctionCallingMode::Validated,);
+		assert!(
+			config
+				.function_calling_config
+				.allowed_function_names
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn antigravity_usage_label_matches_pi_request_shape() {
+		let envelope = wrap_antigravity_request(
+			GenerateContentRequest::default(),
+			sf!("wire-model"),
+			sf!("project"),
+			&AntigravityRequestMetadata {
+				trajectory_id:                sf!("trajectory"),
+				request_id:                   sf!("request"),
+				session_id:                   None,
+				last_execution_id:            None,
+				last_step_index:              None,
+				model_enum:                   None,
+				used_claude:                  sf!("catalog-label"),
+				validated_tool_config:        false,
+				append_forced_tool_directive: false,
+				max_output_tokens:            None,
+			},
+		);
+		assert_eq!(envelope.request.labels.used_claude, "catalog-label");
+		assert_eq!(envelope.request.labels.used_claude_conservative, "catalog-label",);
+	}
+
+	#[test]
+	fn claude_thinking_beta_header_matches_pi_request_shape() {
+		let codec = GoogleCcaCodec::antigravity(
+			None,
+			CcaHeaders::antigravity(&AntigravityFingerprint::default(), false, None),
+			AntigravityPolicy::default(),
+		);
+		let enabled = codec.request_headers("wire-model", true);
+		assert!(enabled.iter().any(|header| {
+			header.name.as_str() == "anthropic-beta" && header.value.as_str() == CLAUDE_THINKING_BETA
+		}));
+		let disabled = codec.request_headers("wire-model", false);
+		assert!(
+			!disabled
+				.iter()
+				.any(|header| header.name.as_str() == "anthropic-beta")
+		);
+	}
+
+	#[test]
 	fn antigravity_headers_and_forced_tool_directive_use_explicit_policy() {
 		let headers = CcaHeaders::antigravity(
 			&AntigravityFingerprint::default(),
@@ -1843,7 +2001,7 @@ mod tests {
 				last_execution_id:            None,
 				last_step_index:              None,
 				model_enum:                   None,
-				used_claude:                  false,
+				used_claude:                  sf!("false"),
 				validated_tool_config:        false,
 				append_forced_tool_directive: true,
 				max_output_tokens:            None,
@@ -1862,7 +2020,7 @@ mod tests {
 	#[test]
 	fn route_safe_gemini_cli_header_uses_selected_wire_model() {
 		let codec = GoogleCcaCodec::gemini_cli_for_route(None, "darwin", "arm64");
-		let headers = codec.request_headers("gemini-selected");
+		let headers = codec.request_headers("gemini-selected", false);
 		let user_agent = headers
 			.iter()
 			.find(|header| header.name.as_str() == "user-agent")
@@ -1973,13 +2131,5 @@ mod tests {
 		assert_eq!(parts[1].thought, Some(true));
 		assert_eq!(parts[1].text.as_deref(), Some("unsigned reasoning"));
 		assert_eq!(parts[1].thought_signature, None);
-	}
-
-	#[test]
-	fn claude_wire_ids_match_case_insensitively() {
-		assert!(is_claude_wire_model("claude-sonnet-4-6"));
-		assert!(is_claude_wire_model("Claude-Opus-4-6"));
-		assert!(!is_claude_wire_model("gemini-3.7-flash-low"));
-		assert!(!is_claude_wire_model("clau"));
 	}
 }

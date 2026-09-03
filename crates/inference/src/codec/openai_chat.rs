@@ -155,6 +155,12 @@ pub struct OpenAiChatProfile {
 	/// Whether this route disables reasoning when a tool choice is present
 	/// (census `disable_reasoning_on_tool_choice`).
 	pub disable_reasoning_on_tool_choice: bool,
+	/// Whether forced and named tool choices disable reasoning for the turn.
+	pub disable_reasoning_on_forced_choice: bool,
+	/// Whether tool results must carry the originating function name.
+	pub requires_tool_result_name: bool,
+	/// Whether user input after tool results needs an assistant bridge.
+	pub requires_assistant_after_tool_result: bool,
 	/// Tool strictness projection.
 	pub tool_strict: ToolStrictWire,
 	/// Whether object-root tool-parameter unions are flattened or withheld.
@@ -163,6 +169,16 @@ pub struct OpenAiChatProfile {
 	pub tool_id: ToolIdWireProfile,
 	/// Reasoning request shape.
 	pub reasoning: ReasoningWireFormat,
+	/// Whether native reasoning request parameters are accepted.
+	pub supports_reasoning_params: bool,
+	/// Whether Qwen templates preserve historical thinking.
+	pub qwen_preserve_thinking: bool,
+	/// Whether Kimi's thinking object retains all thinking.
+	pub thinking_keep: bool,
+	/// Whether historical reasoning content is replayed.
+	pub replay_reasoning_content: bool,
+	/// Whether reasoning history is demoted into assistant text.
+	pub requires_thinking_as_text: bool,
 	/// Explicit reasoning-off operation.
 	pub reasoning_disable: Option<CatalogReasoningDisableMode>,
 	/// Static Venice request controls merged with turn-specific controls.
@@ -182,6 +198,12 @@ pub struct OpenAiChatProfile {
 	pub reasoning_history: ReasoningHistoryField,
 	/// Whether provider-scoped continuation proofs may be replayed.
 	pub reasoning_proofs: bool,
+	/// Whether cumulative reasoning snapshots are converted to deltas.
+	pub reasoning_deltas_cumulative: bool,
+	/// Whether an empty length finish is a context exhaustion error.
+	pub empty_length_finish_is_context_error: bool,
+	/// Whether DeepSeek chat-template markers are stripped from text.
+	pub strip_deepseek_special_tokens: bool,
 	/// Hosted-tool shape.
 	pub hosted_tools: HostedToolWireFormat,
 	/// Request body size bound.
@@ -209,10 +231,18 @@ impl Default for OpenAiChatProfile {
 			forced_tool_choice: true,
 			thinking_tool_choice_conflict: ThinkingToolChoiceConflict::None,
 			disable_reasoning_on_tool_choice: false,
+			disable_reasoning_on_forced_choice: false,
+			requires_tool_result_name: false,
+			requires_assistant_after_tool_result: false,
 			tool_strict: ToolStrictWire::Mixed,
 			flatten_root_unions: false,
 			tool_id: ToolIdWireProfile::Preserve,
 			reasoning: ReasoningWireFormat::OpenAiEffort,
+			supports_reasoning_params: true,
+			qwen_preserve_thinking: false,
+			thinking_keep: false,
+			replay_reasoning_content: true,
+			requires_thinking_as_text: false,
 			reasoning_disable: None,
 			venice_parameters: None,
 			supports_images: true,
@@ -220,6 +250,9 @@ impl Default for OpenAiChatProfile {
 			template_effort_top_level_only: false,
 			reasoning_history: ReasoningHistoryField::ReasoningContent,
 			reasoning_proofs: false,
+			reasoning_deltas_cumulative: false,
+			empty_length_finish_is_context_error: false,
+			strip_deepseek_special_tokens: false,
 			hosted_tools: HostedToolWireFormat::Unsupported,
 			max_request_bytes: 16 * 1024 * 1024,
 			max_frame_bytes: 16 * 1024 * 1024,
@@ -248,6 +281,10 @@ impl OpenAiChatProfile {
 		if let Some(value) = policy.structured.stop_sequences {
 			self.stop_sequences = value;
 		}
+		if let Some(value) = policy.structured.penalty_and_stop_params {
+			self.penalties = value;
+			self.stop_sequences = value;
+		}
 		if let Some(value) = policy.usage.in_streaming {
 			self.streaming_usage = value;
 		}
@@ -269,6 +306,15 @@ impl OpenAiChatProfile {
 		if let Some(value) = policy.tool.disable_reasoning_on_choice {
 			self.disable_reasoning_on_tool_choice = value;
 		}
+		if let Some(value) = policy.tool.disable_reasoning_on_forced_choice {
+			self.disable_reasoning_on_forced_choice = value;
+		}
+		if let Some(value) = policy.tool.requires_result_name {
+			self.requires_tool_result_name = value;
+		}
+		if let Some(value) = policy.tool.requires_assistant_after_result {
+			self.requires_assistant_after_tool_result = value;
+		}
 		if let Some(value) = policy.context.max_tokens_field {
 			self.max_tokens_field = match value {
 				CatalogMaxTokensField::MaxTokens => MaxTokensField::MaxTokens,
@@ -283,7 +329,13 @@ impl OpenAiChatProfile {
 				ToolStrictMode::None => ToolStrictWire::Unsupported,
 			};
 		}
+		if matches!(policy.tool.supports_strict_mode, Some(false)) {
+			self.tool_strict = ToolStrictWire::Unsupported;
+		}
 		if let Some(value) = policy.tool.flatten_root_unions {
+			self.flatten_root_unions = value;
+		}
+		if let Some(value) = policy.tool.reject_root_object_union {
 			self.flatten_root_unions = value;
 		}
 		if let Some(value) = policy.tool.id_profile {
@@ -292,6 +344,12 @@ impl OpenAiChatProfile {
 				CatalogToolCallIdProfile::OpenAi40 => ToolIdWireProfile::OpenAi40,
 				CatalogToolCallIdProfile::Mistral9Alnum => ToolIdWireProfile::Mistral9,
 			};
+		}
+		if matches!(policy.tool.uses_openai_id_limit, Some(true)) {
+			self.tool_id = ToolIdWireProfile::OpenAi40;
+		}
+		if matches!(policy.tool.requires_mistral_ids, Some(true)) {
+			self.tool_id = ToolIdWireProfile::Mistral9;
 		}
 		if let Some(value) = policy.reasoning.wire_format {
 			self.reasoning = match value {
@@ -317,8 +375,35 @@ impl OpenAiChatProfile {
 		if let Some(value) = policy.reasoning.template_reasoning_effort {
 			self.template_reasoning_effort = value;
 		}
+		if let Some(value) = policy.reasoning.supports_params {
+			self.supports_reasoning_params = value;
+		}
+		if let Some(value) = policy.reasoning.qwen_preserve_thinking {
+			self.qwen_preserve_thinking = value;
+		}
+		if let Some(value) = policy.reasoning.keep {
+			self.thinking_keep = value;
+		}
+		if let Some(value) = policy.reasoning.replay_content {
+			self.replay_reasoning_content = value;
+		}
+		if let Some(value) = policy.reasoning.requires_thinking_as_text {
+			self.requires_thinking_as_text = value;
+		}
 		if let Some(value) = policy.reasoning.include_encrypted {
 			self.reasoning_proofs = value;
+		}
+		if let Some(value) = policy.streaming.reasoning_deltas_cumulative {
+			self.reasoning_deltas_cumulative = value;
+		}
+		if let Some(value) = policy.streaming.empty_length_finish_is_context_error {
+			self.empty_length_finish_is_context_error = value;
+		}
+		if let Some(value) = policy.streaming.strip_deepseek_special_tokens {
+			self.strip_deepseek_special_tokens = value;
+		}
+		if let Some(value) = policy.image.strip_input {
+			self.supports_images = !value;
 		}
 	}
 }
@@ -386,7 +471,7 @@ impl OpenAiChatCodec {
 
 	/// Creates a fresh sans-I/O decoder for one Chat Completions response.
 	pub fn chat_decoder(&self) -> OpenAiChatDecoder {
-		OpenAiChatDecoder::default()
+		OpenAiChatDecoder::from_profile(&self.profile)
 	}
 
 	/// Returns the exact route-policy-adjusted response frame bound.
@@ -403,7 +488,18 @@ impl OpenAiChatCodec {
 		let mut tool_choice =
 			lower_tool_choice(&self.profile, &mut tools, &request.tool_choice, &withheld)?;
 		let response_format = lower_output(&request.output)?;
-		let reasoning = lower_reasoning(&self.profile, &request.reasoning)?;
+		if !self.profile.supports_reasoning_params && !matches!(request.reasoning, Setting::Unset) {
+			return Err(capability_error());
+		}
+		let forced_choice = matches!(
+			tool_choice,
+			Some(WireToolChoice::Mode(ToolChoiceMode::Required) | WireToolChoice::Named { .. })
+		);
+		let reasoning = if self.profile.disable_reasoning_on_forced_choice && forced_choice {
+			lower_reasoning(&self.profile, &Setting::Unset)?
+		} else {
+			lower_reasoning(&self.profile, &request.reasoning)?
+		};
 		// The gateway disables thinking whenever a tool-choice selector is
 		// present. `auto` is the provider default and can be omitted without
 		// changing tool semantics, so reasoning survives; forced and named
@@ -499,6 +595,9 @@ impl OpenAiChatCodec {
 			reasoning: reasoning.openrouter,
 			thinking: reasoning.zai,
 			enable_thinking: reasoning.qwen,
+			preserve_thinking: (self.profile.qwen_preserve_thinking
+				&& self.profile.reasoning == ReasoningWireFormat::Qwen)
+				.then_some(true),
 			chat_template_kwargs: reasoning.chat_template,
 			venice_parameters: reasoning.venice,
 			service_tier,
@@ -573,7 +672,9 @@ impl Codec for OpenAiChatCodec {
 		{
 			return Err(encoding_error(ErrorKind::InvalidRequest));
 		}
-		Ok(Box::new(self.chat_decoder()))
+		let mut selected = self.clone();
+		selected.profile.apply_policy(context.policy);
+		Ok(Box::new(selected.chat_decoder()))
 	}
 }
 
@@ -655,6 +756,8 @@ struct WireRequest {
 	thinking:              Option<ZaiThinking>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	enable_thinking:       Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	preserve_thinking:     Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	chat_template_kwargs:  Option<ChatTemplateKwargs>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -855,6 +958,14 @@ struct ZaiThinking {
 	r#type: ThinkingType,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	effort: Option<WireEffort>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	keep:   Option<ThinkingKeep>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ThinkingKeep {
+	All,
 }
 
 #[derive(Serialize)]
@@ -866,11 +977,13 @@ enum ThinkingType {
 #[derive(Serialize)]
 struct ChatTemplateKwargs {
 	#[serde(skip_serializing_if = "Option::is_none")]
-	enable_thinking:  Option<bool>,
+	enable_thinking:   Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	thinking:         Option<bool>,
+	thinking:          Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	reasoning_effort: Option<WireEffort>,
+	reasoning_effort:  Option<WireEffort>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	preserve_thinking: Option<bool>,
 }
 #[derive(Clone, Copy, Serialize)]
 struct WireVeniceParameters {
@@ -918,6 +1031,25 @@ fn lower_messages(
 	let messages = merge_assistant_runs(messages);
 	let mut lowered = Vec::new();
 	for message in messages.iter() {
+		if profile.requires_assistant_after_tool_result
+			&& matches!(message.role, Role::User | Role::Developer)
+			&& lowered
+				.last()
+				.is_some_and(|message: &WireMessage| message.role == WireRole::Tool)
+		{
+			lowered.push(WireMessage {
+				role:              WireRole::Assistant,
+				content:           Some(NullableContent::Text(sf!(
+					"I have processed the tool results."
+				))),
+				name:              None,
+				tool_call_id:      None,
+				tool_calls:        None,
+				reasoning_content: None,
+				reasoning_text:    None,
+				reasoning_details: None,
+			});
+		}
 		let role = match message.role {
 			Role::System => profile.system_role,
 			Role::Developer if profile.system_role == WireRole::Developer => WireRole::Developer,
@@ -937,7 +1069,10 @@ fn lower_messages(
 						content,
 						profile.supports_images,
 					)?)),
-					name: name.clone().or_else(|| message.name.clone()),
+					name: profile
+						.requires_tool_result_name
+						.then(|| name.clone().or_else(|| message.name.clone()))
+						.flatten(),
 					tool_call_id: Some(project_call_id(profile.tool_id, call.as_str())),
 					tool_calls: None,
 					reasoning_content: None,
@@ -997,8 +1132,18 @@ fn lower_messages(
 				other => ordinary.push(other.clone()),
 			}
 		}
-		let content = lower_content(&ordinary, profile.supports_images)?;
-		let (reasoning_content, reasoning_text) = if reasoning.is_empty() {
+		let (reasoning_content, reasoning_text) = if reasoning.is_empty()
+			|| !profile.replay_reasoning_content
+			|| profile.requires_thinking_as_text
+		{
+			if profile.requires_thinking_as_text && !reasoning.is_empty() {
+				let prefix = sf!("<think>{reasoning}</think> ");
+				if let Some(ContentPart::Text { text, .. }) = ordinary.first_mut() {
+					*text = sf!("{prefix}{text}");
+				} else {
+					ordinary.insert(0, ContentPart::Text { text: prefix, proof: None });
+				}
+			}
 			(None, None)
 		} else {
 			match profile.reasoning_history {
@@ -1007,6 +1152,7 @@ fn lower_messages(
 				ReasoningHistoryField::Unsupported => return Err(capability_error()),
 			}
 		};
+		let content = lower_content(&ordinary, profile.supports_images)?;
 		lowered.push(WireMessage {
 			role,
 			content: Some(content),
@@ -1253,9 +1399,6 @@ fn lower_tools(
 		let (strict, normalize) = match profile.tool_strict {
 			ToolStrictWire::Mixed => (Some(declared_strict), declared_strict),
 			ToolStrictWire::All => (Some(true), true),
-			ToolStrictWire::Unsupported if declared_strict => {
-				return Err(tool_capability_error("openai.chat.tools.strict_unsupported"));
-			},
 			ToolStrictWire::Unsupported => (None, false),
 		};
 		let flattened = if profile.flatten_root_unions {
@@ -1525,7 +1668,14 @@ fn lower_reasoning(
 				openrouter:    None,
 				zai:           None,
 				qwen:          None,
-				chat_template: None,
+				chat_template: profile
+					.qwen_preserve_thinking
+					.then_some(ChatTemplateKwargs {
+						enable_thinking:   None,
+						thinking:          None,
+						reasoning_effort:  None,
+						preserve_thinking: Some(true),
+					}),
 				venice:        lower_venice_parameters(profile, false),
 			});
 		},
@@ -1572,7 +1722,11 @@ fn lower_reasoning(
 		ReasoningWireFormat::Zai => ReasoningFields {
 			effort: None,
 			openrouter: None,
-			zai: Some(ZaiThinking { r#type: ThinkingType::Enabled, effort }),
+			zai: Some(ZaiThinking {
+				r#type: ThinkingType::Enabled,
+				effort,
+				keep: profile.thinking_keep.then_some(ThinkingKeep::All),
+			}),
 			qwen: None,
 			chat_template: None,
 			venice,
@@ -1591,9 +1745,10 @@ fn lower_reasoning(
 					.then_some(template_effort)
 					.flatten()
 					.map(|effort| ChatTemplateKwargs {
-						enable_thinking:  None,
-						thinking:         None,
-						reasoning_effort: Some(effort),
+						enable_thinking:   None,
+						thinking:          None,
+						reasoning_effort:  Some(effort),
+						preserve_thinking: profile.qwen_preserve_thinking.then_some(true),
 					}),
 				venice,
 			}
@@ -1607,9 +1762,10 @@ fn lower_reasoning(
 			zai: None,
 			qwen: None,
 			chat_template: Some(ChatTemplateKwargs {
-				enable_thinking:  Some(true),
-				thinking:         None,
-				reasoning_effort: None,
+				enable_thinking:   Some(true),
+				thinking:          None,
+				reasoning_effort:  None,
+				preserve_thinking: profile.qwen_preserve_thinking.then_some(true),
 			}),
 			venice,
 		},
@@ -1619,12 +1775,13 @@ fn lower_reasoning(
 			zai: None,
 			qwen: None,
 			chat_template: Some(ChatTemplateKwargs {
-				enable_thinking:  Some(true),
-				thinking:         None,
-				reasoning_effort: profile
+				enable_thinking:   Some(true),
+				thinking:          None,
+				reasoning_effort:  profile
 					.template_reasoning_effort
 					.then_some(effort)
 					.flatten(),
+				preserve_thinking: profile.qwen_preserve_thinking.then_some(true),
 			}),
 			venice,
 		},
@@ -1634,11 +1791,12 @@ fn lower_reasoning(
 			zai: None,
 			qwen: None,
 			chat_template: Some(ChatTemplateKwargs {
-				enable_thinking:  None,
-				thinking:         Some(reasoning.effort != Some(ReasoningEffort::Off)),
-				reasoning_effort: (reasoning.effort != Some(ReasoningEffort::Off))
+				enable_thinking:   None,
+				thinking:          Some(reasoning.effort != Some(ReasoningEffort::Off)),
+				reasoning_effort:  (reasoning.effort != Some(ReasoningEffort::Off))
 					.then_some(effort)
 					.flatten(),
+				preserve_thinking: profile.qwen_preserve_thinking.then_some(true),
 			}),
 			venice,
 		},
@@ -1740,19 +1898,23 @@ fn lower_adapter(
 /// Incremental typed Chat Completions decoder.
 #[derive(Default)]
 pub struct OpenAiChatDecoder {
-	choices:    BTreeMap<u32, ChoiceState>,
+	choices: BTreeMap<u32, ChoiceState>,
 	next_block: u32,
-	usage:      Usage,
-	done:       bool,
-	committed:  bool,
+	usage: Usage,
+	done: bool,
+	committed: bool,
+	reasoning_deltas_cumulative: bool,
+	empty_length_finish_is_context_error: bool,
+	strip_deepseek_special_tokens: bool,
 }
 
 #[derive(Default)]
 struct ChoiceState {
-	text_block:     Option<u32>,
-	thinking_block: Option<u32>,
-	tools:          BTreeMap<u32, PendingTool>,
-	finish:         Option<FinishReason>,
+	text_block:              Option<u32>,
+	thinking_block:          Option<u32>,
+	tools:                   BTreeMap<u32, PendingTool>,
+	finish:                  Option<FinishReason>,
+	last_reasoning_snapshot: Str,
 }
 
 struct PendingTool {
@@ -1809,6 +1971,15 @@ impl Decoder for OpenAiChatDecoder {
 }
 
 impl OpenAiChatDecoder {
+	fn from_profile(profile: &OpenAiChatProfile) -> Self {
+		Self {
+			reasoning_deltas_cumulative: profile.reasoning_deltas_cumulative,
+			empty_length_finish_is_context_error: profile.empty_length_finish_is_context_error,
+			strip_deepseek_special_tokens: profile.strip_deepseek_special_tokens,
+			..Self::default()
+		}
+	}
+
 	fn decode_choice(&mut self, choice: WireChoice, emit: &mut dyn FnMut(RawEvent)) {
 		let index = choice.index;
 		let mut state = self.choices.remove(&index).unwrap_or_default();
@@ -1830,24 +2001,41 @@ impl OpenAiChatDecoder {
 			.reasoning_content
 			.or(payload.reasoning_text)
 			.or(payload.reasoning);
-		if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-			let block = *state
-				.thinking_block
-				.get_or_insert_with(|| self.start_block(BlockKind::Thinking, emit));
-			emit(RawEvent::Chat(ChatEvent::ThinkingDelta { index: block, text: reasoning }));
-			self.committed = true;
+		if let Some(mut reasoning) = reasoning.filter(|text| !text.is_empty()) {
+			if self.reasoning_deltas_cumulative {
+				let previous = state.last_reasoning_snapshot.as_str();
+				if reasoning.starts_with(previous) {
+					let delta = reasoning.as_str()[previous.len()..].to_owned();
+					state.last_reasoning_snapshot = reasoning;
+					reasoning = Str::new(delta);
+				} else {
+					state.last_reasoning_snapshot = reasoning.clone();
+				}
+			}
+			if !reasoning.is_empty() {
+				let block = *state
+					.thinking_block
+					.get_or_insert_with(|| self.start_block(BlockKind::Thinking, emit));
+				emit(RawEvent::Chat(ChatEvent::ThinkingDelta { index: block, text: reasoning }));
+				self.committed = true;
+			}
 		}
-		if let Some(content) = payload
+		if let Some(mut content) = payload
 			.content
 			.map(WireDeltaContent::into_text)
 			.or(payload.text)
 			&& !content.is_empty()
 		{
-			let block = *state
-				.text_block
-				.get_or_insert_with(|| self.start_block(BlockKind::Text, emit));
-			emit(RawEvent::Chat(ChatEvent::TextDelta { index: block, text: content }));
-			self.committed = true;
+			if self.strip_deepseek_special_tokens {
+				content = strip_deepseek_tokens(content.as_str());
+			}
+			if !content.is_empty() {
+				let block = *state
+					.text_block
+					.get_or_insert_with(|| self.start_block(BlockKind::Text, emit));
+				emit(RawEvent::Chat(ChatEvent::TextDelta { index: block, text: content }));
+				self.committed = true;
+			}
 		}
 		if let Some(refusal) = payload.refusal.filter(|text| !text.is_empty()) {
 			let block = *state
@@ -1957,6 +2145,21 @@ impl OpenAiChatDecoder {
 		{
 			self.done = true;
 			return Err(incomplete_stream_error());
+		}
+		if self.empty_length_finish_is_context_error
+			&& !self.committed
+			&& self
+				.choices
+				.values()
+				.any(|state| state.finish == Some(FinishReason::Length))
+		{
+			self.done = true;
+			return Err(Error::new(
+				ErrorKind::ContextOverflow,
+				ErrorPhase::Streaming,
+				RetryAction::Never,
+				ExecutionReceipt::default(),
+			));
 		}
 		let mut finish = FinishReason::Stop;
 		let committed = self.committed;
@@ -2125,6 +2328,31 @@ enum WireFunctionArguments {
 	Text(Str),
 	Object(serde_json::Map<String, Value>),
 }
+fn strip_deepseek_tokens(text: &str) -> Str {
+	let mut output = String::with_capacity(text.len());
+	let mut rest = text;
+	while let Some(start) = rest.find('<') {
+		output.push_str(&rest[..start]);
+		let candidate = &rest[start..];
+		let opening = candidate.starts_with("<|") || candidate.starts_with("<｜");
+		let ending = candidate
+			.find("|>")
+			.map(|end| (end, "|>".len()))
+			.or_else(|| candidate.find("｜>").map(|end| (end, "｜>".len())));
+		if opening
+			&& let Some((end, ending_len)) = ending
+			&& end <= 68
+		{
+			rest = &candidate[end + ending_len..];
+			continue;
+		}
+		output.push('<');
+		rest = &candidate[1..];
+	}
+	output.push_str(rest);
+	Str::new(output)
+}
+
 fn merge_streaming_argument_objects(
 	accumulated: &mut serde_json::Map<String, Value>,
 	fragment: serde_json::Map<String, Value>,
@@ -2637,10 +2865,6 @@ fn capability_error() -> Error {
 	)
 }
 
-fn tool_capability_error(reason: &'static str) -> Error {
-	capability_error().code(sf!(reason))
-}
-
 fn encoding_error(kind: ErrorKind) -> Error {
 	Error::new(kind, ErrorPhase::Encoding, RetryAction::Never, ExecutionReceipt::default())
 }
@@ -2890,12 +3114,14 @@ mod tests {
 	}
 
 	#[test]
-	fn flatten_profile_flattens_exclusive_required_root_union() {
-		let envelope = encode_union_request(
-			&flatten_codec(),
-			Arc::from([coverage_tool(), good_tool()]),
-			Setting::Unset,
-		);
+	fn reject_root_object_union_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.reject_root_object_union = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let codec = OpenAiChatCodec::new(profile, None);
+		let envelope =
+			encode_union_request(&codec, Arc::from([coverage_tool(), good_tool()]), Setting::Unset);
 		assert_eq!(tool_names(&envelope), ["mcp__codebase_memory_check_index_coverage", "read_file"]);
 		assert!(envelope.tools[0].function.parameters.get("anyOf").is_none());
 		assert!(
@@ -4011,6 +4237,409 @@ mod tests {
 		assert_eq!(wire["enable_thinking"], true);
 		assert_eq!(wire["reasoning_effort"], "medium");
 		assert!(wire.get("chat_template_kwargs").is_none());
+	}
+
+	#[test]
+	fn supports_usage_in_streaming_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.usage.in_streaming = Some(false);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &request(Arc::from([text_message("hello")])))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert!(wire.get("stream_options").is_none());
+	}
+
+	#[test]
+	fn supports_multiple_system_messages_matches_pi_request_shape() {
+		let messages = Arc::from([
+			Message {
+				role:    Role::System,
+				content: Arc::from([ContentPart::Text { text: "one".into(), proof: None }]),
+				name:    None,
+			},
+			Message {
+				role:    Role::System,
+				content: Arc::from([ContentPart::Text { text: "two".into(), proof: None }]),
+				name:    None,
+			},
+		]);
+		let mut policy = policy::WirePolicy::overrides();
+		policy.role.multiple_system_messages = Some(false);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &request(messages))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["messages"].as_array().expect("messages").len(), 1);
+		assert_eq!(wire["messages"][0]["content"], "one\n\ntwo");
+	}
+
+	fn reasoning_history_request() -> ChatRequest {
+		request(Arc::from([Message {
+			role:    Role::Assistant,
+			content: Arc::from([
+				ContentPart::Reasoning { text: "thought".into(), proof: None },
+				ContentPart::Text { text: "answer".into(), proof: None },
+			]),
+			name:    None,
+		}]))
+	}
+
+	#[test]
+	fn replay_reasoning_content_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.reasoning.replay_content = Some(false);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &reasoning_history_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert!(wire["messages"][0].get("reasoning_content").is_none());
+	}
+
+	#[test]
+	fn requires_thinking_as_text_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.reasoning.requires_thinking_as_text = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &reasoning_history_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["messages"][0]["content"], "<think>thought</think> answer");
+		assert!(wire["messages"][0].get("reasoning_content").is_none());
+	}
+
+	#[test]
+	fn qwen_preserve_thinking_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.reasoning.qwen_preserve_thinking = Some(true);
+		let mut profile =
+			OpenAiChatProfile { reasoning: ReasoningWireFormat::Qwen, ..Default::default() };
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &request(Arc::from([text_message("hello")])))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["preserve_thinking"], true);
+		assert_eq!(wire["chat_template_kwargs"]["preserve_thinking"], true);
+	}
+
+	#[test]
+	fn thinking_keep_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.reasoning.keep = Some(true);
+		let mut profile =
+			OpenAiChatProfile { reasoning: ReasoningWireFormat::Zai, ..Default::default() };
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &thinking_request(ReasoningEffort::High))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["thinking"]["keep"], "all");
+	}
+
+	#[test]
+	fn supports_penalty_and_stop_params_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.structured.penalty_and_stop_params = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let mut request = request(Arc::from([text_message("hello")]));
+		request.sampling.presence_penalty = Some(0.25);
+		request.sampling.stop = Arc::from(["END".into()]);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &request)
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["presence_penalty"], 0.25);
+		assert_eq!(wire["stop"][0], "END");
+	}
+
+	#[test]
+	fn supports_reasoning_params_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.reasoning.supports_params = Some(false);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let error = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &thinking_request(ReasoningEffort::Low))
+			.expect_err("unsupported reasoning parameters fail locally");
+		assert_eq!(error.kind, ErrorKind::CapabilityMismatch);
+	}
+
+	#[test]
+	fn strip_image_input_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.image.strip_input = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let message = Message {
+			role:    Role::User,
+			content: Arc::from([
+				ContentPart::Text { text: "look".into(), proof: None },
+				ContentPart::Image(MediaInput::Remote {
+					uri:        "https://example.test/image.png".into(),
+					media_type: Some("image/png".into()),
+					name:       None,
+				}),
+			]),
+			name:    None,
+		};
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &request(Arc::from([message])))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(
+			wire["messages"][0]["content"][1]["text"],
+			"[image omitted: model does not support vision]"
+		);
+	}
+
+	fn tool_history_request(id: &str) -> ChatRequest {
+		request(Arc::from([Message {
+			role:    Role::Assistant,
+			content: Arc::from([ContentPart::ToolCall {
+				call:      crate::id::ToolCallId::new(id),
+				name:      "lookup".into(),
+				arguments: OpaqueJson::new(serde_json::json!({"q": "x"})),
+				proof:     None,
+			}]),
+			name:    None,
+		}]))
+	}
+
+	#[test]
+	fn uses_openai_tool_call_id_limit_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.uses_openai_id_limit = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat(
+				"model",
+				&tool_history_request("call.with spaces/and punctuation that is much too long"),
+			)
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		let id = wire["messages"][0]["tool_calls"][0]["id"]
+			.as_str()
+			.expect("id");
+		assert!(id.len() <= 40);
+		assert!(
+			id.chars()
+				.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+		);
+	}
+
+	#[test]
+	fn requires_mistral_tool_ids_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.requires_mistral_ids = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &tool_history_request("invalid-id"))
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		let id = wire["messages"][0]["tool_calls"][0]["id"]
+			.as_str()
+			.expect("id");
+		assert_eq!(id.len(), 9);
+		assert!(id.chars().all(|ch| ch.is_ascii_alphanumeric()));
+	}
+
+	fn forced_tool_request() -> ChatRequest {
+		let mut request = thinking_request(ReasoningEffort::High);
+		request.tools = Arc::from([ToolDefinition {
+			name:        "lookup".into(),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(serde_json::json!({
+					"type": "object",
+					"properties": {"q": {"type": "string"}}
+				})),
+				strict:     true,
+			},
+		}]);
+		request.tool_choice = Setting::Require(ToolChoice::Named("lookup".into()));
+		request
+	}
+
+	#[test]
+	fn supports_strict_mode_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.supports_strict_mode = Some(false);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &forced_tool_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert!(wire["tools"][0]["function"].get("strict").is_none());
+	}
+
+	#[test]
+	fn tool_strict_mode_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.strict_mode = Some(policy::ToolStrictMode::AllStrict);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &forced_tool_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["tools"][0]["function"]["strict"], true);
+		assert_eq!(wire["tools"][0]["function"]["parameters"]["additionalProperties"], false);
+	}
+
+	#[test]
+	fn supports_named_tool_choice_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.named_choice = Some(false);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &forced_tool_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["tool_choice"], "required");
+	}
+
+	#[test]
+	fn disable_reasoning_on_forced_tool_choice_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.disable_reasoning_on_forced_choice = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &forced_tool_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert!(wire.get("reasoning_effort").is_none());
+		assert!(wire.get("reasoning").is_none());
+		assert!(wire.get("thinking").is_none());
+	}
+
+	fn tool_result_then_user_request() -> ChatRequest {
+		request(Arc::from([
+			Message {
+				role:    Role::Tool,
+				content: Arc::from([ContentPart::ToolResult {
+					call:     crate::id::ToolCallId::new("call_123"),
+					name:     Some("read".into()),
+					content:  Arc::from([ToolResultContent::Text("done".into())]),
+					is_error: false,
+				}]),
+				name:    None,
+			},
+			text_message("continue"),
+		]))
+	}
+
+	#[test]
+	fn requires_tool_result_name_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.requires_result_name = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &tool_result_then_user_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["messages"][0]["name"], "read");
+	}
+
+	#[test]
+	fn requires_assistant_after_tool_result_matches_pi_request_shape() {
+		let mut policy = policy::WirePolicy::overrides();
+		policy.tool.requires_assistant_after_result = Some(true);
+		let mut profile = OpenAiChatProfile::default();
+		profile.apply_policy(&policy);
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("model", &tool_result_then_user_request())
+			.expect("request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+		assert_eq!(wire["messages"][1]["role"], "assistant");
+		assert_eq!(wire["messages"][1]["content"], "I have processed the tool results.");
+		assert_eq!(wire["messages"][2]["role"], "user");
+	}
+
+	#[test]
+	fn reasoning_deltas_may_be_cumulative_matches_pi_request_shape() {
+		let profile = OpenAiChatProfile { reasoning_deltas_cumulative: true, ..Default::default() };
+		let mut decoder = OpenAiChatCodec::new(profile, None).chat_decoder();
+		let mut events = Vec::new();
+		for data in [
+			br#"{"choices":[{"index":0,"delta":{"reasoning_content":"abc"}}]}"#.as_slice(),
+			br#"{"choices":[{"index":0,"delta":{"reasoning_content":"abcdef"}}]}"#.as_slice(),
+		] {
+			decoder
+				.push(
+					Frame::Sse(SseEvent { name: None, data: Bytes::copy_from_slice(data) }),
+					&mut |event| events.push(event),
+				)
+				.expect("chunk decodes");
+		}
+		let deltas: Vec<_> = events
+			.into_iter()
+			.filter_map(|event| match event {
+				RawEvent::Chat(ChatEvent::ThinkingDelta { text, .. }) => Some(text),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(deltas, ["abc", "def"]);
+	}
+
+	#[test]
+	fn strip_deepseek_special_tokens_matches_pi_request_shape() {
+		let profile = OpenAiChatProfile { strip_deepseek_special_tokens: true, ..Default::default() };
+		let mut decoder = OpenAiChatCodec::new(profile, None).chat_decoder();
+		let mut events = Vec::new();
+		decoder
+			.push(
+				Frame::Sse(SseEvent {
+					name: None,
+					data: Bytes::copy_from_slice(
+						r#"{"choices":[{"index":0,"delta":{"content":"<｜DSML｜>answer"}}]}"#.as_bytes(),
+					),
+				}),
+				&mut |event| events.push(event),
+			)
+			.expect("chunk decodes");
+		assert!(events.iter().any(|event| matches!(
+			event,
+			RawEvent::Chat(ChatEvent::TextDelta { text, .. }) if text.as_str() == "answer"
+		)));
+	}
+
+	#[test]
+	fn empty_length_finish_is_context_error_matches_pi_request_shape() {
+		let profile =
+			OpenAiChatProfile { empty_length_finish_is_context_error: true, ..Default::default() };
+		let mut decoder = OpenAiChatCodec::new(profile, None).chat_decoder();
+		let mut events = Vec::new();
+		decoder
+			.push(
+				Frame::Sse(SseEvent {
+					name: None,
+					data: Bytes::from_static(
+						br#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+					),
+				}),
+				&mut |event| events.push(event),
+			)
+			.expect("chunk decodes");
+		let error = decoder
+			.finish(&mut |event| events.push(event))
+			.expect_err("context error");
+		assert_eq!(error.kind, ErrorKind::ContextOverflow);
 	}
 
 	#[test]

@@ -83,6 +83,15 @@ pub enum CodexRequestError {
 	MissingItemIdentity,
 }
 
+fn apply_all_turns_context_policy(request: &mut ResponsesRequest, supported: bool) {
+	if !supported
+		&& let Some(reasoning) = request.reasoning.as_mut()
+		&& reasoning.context.as_deref() == Some("all_turns")
+	{
+		reasoning.context = None;
+	}
+}
+
 /// Applies the Codex full Responses contract and optional Responses Lite
 /// rewrite.
 pub fn transform_codex_request(
@@ -107,6 +116,7 @@ pub fn transform_codex_request(
 	}
 	if concurrent_summaries {
 		request.stream_options = Some(ResponsesStreamOptions {
+			include_obfuscation:        None,
 			reasoning_summary_delivery: Some(sf!("sequential_cutoff")),
 		});
 	}
@@ -1007,6 +1017,12 @@ impl Codec for OpenAiCodexCodec {
 			.unwrap_or(self.options.responses_lite);
 		transform_codex_request(&mut request, responses_lite, self.options.concurrent_summaries)
 			.map_err(|_| fail("invalid_codex_responses_lite_request"))?;
+		if !responses_lite {
+			apply_all_turns_context_policy(
+				&mut request,
+				context.policy.reasoning.supports_all_turns_context == Some(true),
+			);
+		}
 		let transport = self
 			.options
 			.transport
@@ -1098,7 +1114,7 @@ mod tests {
 	use super::{
 		CodexContinuationState, CodexFallbackEvidence, CodexFrameDisposition, CodexFrameRouter,
 		CodexModelsDecoder, CodexReplaySafety, CodexResponseCreate, CodexWebSocketFailure,
-		CodexWebSocketProtocolError,
+		CodexWebSocketProtocolError, apply_all_turns_context_policy,
 		apply_codex_residency_header as super_apply_codex_residency_header, classify_codex_fallback,
 		transform_codex_request,
 	};
@@ -1138,6 +1154,38 @@ mod tests {
 		transform_codex_request(&mut request, true, false).expect("Responses Lite rewrite");
 		assert_eq!(request, expected);
 	}
+	#[test]
+	fn supports_all_turns_reasoning_context_matches_pi_request_shape() {
+		let mut request: ResponsesRequest = serde_json::from_str(include_str!(
+			"../../../../fixtures/llm-oracle/openai/codex/request.responses_lite.json"
+		))
+		.expect("typed request fixture");
+		transform_codex_request(&mut request, true, false).expect("Responses Lite rewrite");
+		let reasoning = request.reasoning.as_mut().expect("reasoning fixture");
+		reasoning.context = Some(Str::new_static("all_turns"));
+		apply_all_turns_context_policy(&mut request, false);
+		assert_eq!(
+			request
+				.reasoning
+				.as_ref()
+				.and_then(|value| value.context.as_deref()),
+			None
+		);
+		request
+			.reasoning
+			.as_mut()
+			.expect("reasoning fixture")
+			.context = Some(Str::new_static("all_turns"));
+		apply_all_turns_context_policy(&mut request, true);
+		assert_eq!(
+			request
+				.reasoning
+				.as_ref()
+				.and_then(|value| value.context.as_deref()),
+			Some("all_turns")
+		);
+	}
+
 	#[test]
 	fn residency_header_is_applied_only_for_claimed_regions() {
 		let account = AccountRoutingContext {

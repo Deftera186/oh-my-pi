@@ -62,6 +62,7 @@ use crate::{
 			MAX_BROWSER_BODY_BYTES as BROWSER_MAX_BROWSER_BODY_BYTES, MAX_BROWSER_DEADLINE,
 		},
 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
+		encoding::ContentDecoder,
 		proxy,
 	},
 };
@@ -669,7 +670,7 @@ async fn execute(
 		},
 		() = sleep_until(deadline) => {
 			transport.cancel.cancel();
-			return Err(record_failure(deadline_exceeded(false), &attempt, &evidence, None, None, started, false));
+			return Err(record_failure(deadline_exceeded(false, started, "request.body-open"), &attempt, &evidence, None, None, started, false));
 		},
 	};
 	let request = if transport
@@ -682,6 +683,7 @@ async fn execute(
 			transport.encoded.bounds.request_body,
 			&transport.cancel,
 			deadline,
+			started,
 		)
 		.await
 		.map_err(|error| record_failure(error, &attempt, &evidence, None, None, started, false))?;
@@ -772,15 +774,34 @@ async fn execute(
 		},
 		() = sleep_until(deadline) => {
 			transport.cancel.cancel();
-			return Err(record_failure(deadline_exceeded(false), &attempt, &evidence, None, None, started, false));
+			return Err(record_failure(deadline_exceeded(false, started, "response.headers"), &attempt, &evidence, None, None, started, false));
 		},
 	};
 	let (parts, incoming) = response.into_parts();
 	let status = parts.status.as_u16();
 	let provider_request_id = request_id(&parts.headers);
+	tracing::debug!(
+		status,
+		provider_request_id = provider_request_id.as_deref(),
+		content_type = header_str(&parts.headers, &header::CONTENT_TYPE),
+		content_encoding = header_str(&parts.headers, &header::CONTENT_ENCODING),
+		"provider response headers"
+	);
 	emit_provider_response(&transport, status, &parts.headers, provider_request_id.clone());
 	let headers = sanitize_headers(&parts.headers);
 	let concurrency_admission = concurrency_admission_rejection(&parts.headers);
+	let content = ContentDecoder::from_headers(&parts.headers).map_err(|unsupported| {
+		tracing::warn!(encoding = %unsupported.value, "provider response uses an unsupported content-encoding");
+		record_failure(
+			protocol_error(ErrorPhase::Handshake, false, "content-encoding-unsupported"),
+			&attempt,
+			&evidence,
+			Some(status),
+			provider_request_id.as_ref(),
+			started,
+			false,
+		)
+	})?;
 	let capture = Arc::new(Mutex::new(HttpCapture {
 		attempt: transport.attempt.index,
 		status,
@@ -799,6 +820,8 @@ async fn execute(
 			response_limit.min(MAX_PROVIDER_ERROR_BODY_BYTES as u64),
 			&transport.cancel,
 			deadline,
+			started,
+			content,
 		)
 		.await
 		.map_err(|error| {
@@ -855,11 +878,37 @@ async fn execute(
 		deadline,
 		started,
 		browser_retry,
+		content,
 	);
 	let mut event_stream: RawEventStream = Box::pin(event_stream);
+	let watchdog_deadline = attempt
+		.first_event_timeout
+		.map(|timeout| Instant::now() + timeout);
+	let first_event_deadline = watchdog_deadline.map_or(deadline, |watchdog| watchdog.min(deadline));
 	let mut preamble = VecDeque::new();
 	let first_visible = loop {
-		match event_stream.next().await {
+		let next = tokio::select! {
+			event = event_stream.next() => event,
+			() = sleep_until(first_event_deadline) => {
+				transport.cancel.cancel();
+				let scope = if watchdog_deadline.is_some_and(|watchdog| watchdog <= deadline) {
+					"stream.first-event-timeout"
+				} else {
+					"stream.first-event"
+				};
+				let error = deadline_exceeded(false, started, scope);
+				return Err(record_failure(
+					error,
+					&attempt,
+					&evidence,
+					Some(status),
+					provider_request_id.as_ref(),
+					started,
+					false,
+				));
+			},
+		};
+		match next {
 			Some(Ok(event)) if is_commit_candidate(&event) => break event,
 			Some(Ok(event)) => preamble.push_back(event),
 			Some(Err(error)) => {
@@ -1089,6 +1138,7 @@ async fn collect_request_body(
 	limit: u64,
 	cancel: &Cancellation,
 	deadline: Instant,
+	started: Instant,
 ) -> Result<Bytes, Error> {
 	let capacity = usize::try_from(limit.min(64 * 1024)).unwrap_or(64 * 1024);
 	let mut output = BytesMut::with_capacity(capacity);
@@ -1098,7 +1148,7 @@ async fn collect_request_body(
 			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
 			() = sleep_until(deadline) => {
 				cancel.cancel();
-				return Err(deadline_exceeded(false));
+				return Err(deadline_exceeded(false, started, "request.body-collect"));
 			},
 		};
 		match next {
@@ -1120,19 +1170,28 @@ async fn collect_error_response_body(
 	limit: u64,
 	cancel: &Cancellation,
 	deadline: Instant,
+	started: Instant,
+	mut content: ContentDecoder,
 ) -> Result<Bytes, Error> {
 	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 	let mut output = BytesMut::with_capacity(limit.min(8 * 1024));
+	let corrupt = || protocol_error(ErrorPhase::Handshake, false, "content-encoding-corrupt");
 	while output.len() < limit {
 		let next = tokio::select! {
 			next = incoming.frame() => next,
 			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
 			() = sleep_until(deadline) => {
 				cancel.cancel();
-				return Err(deadline_exceeded(false));
+				return Err(deadline_exceeded(false, started, "response.error-body"));
 			},
 		};
 		let Some(next) = next else {
+			// A truncated compressed error body still classifies by status; keep
+			// whatever decoded so far.
+			if let Ok(tail) = content.finish() {
+				let remaining = limit.saturating_sub(output.len());
+				output.extend_from_slice(&tail[..tail.len().min(remaining)]);
+			}
 			break;
 		};
 		let frame = next
@@ -1140,10 +1199,15 @@ async fn collect_error_response_body(
 		let Ok(chunk) = frame.into_data() else {
 			continue;
 		};
+		let chunk = content.push(chunk).map_err(|_| corrupt())?;
 		let remaining = limit.saturating_sub(output.len());
 		output.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
 	}
 	Ok(output.freeze())
+}
+
+fn header_str<'h>(headers: &'h HeaderMap, name: &HeaderName) -> Option<&'h str> {
+	headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn classify_http_error(status: u16, body: &[u8]) -> Error {
@@ -1289,10 +1353,10 @@ fn browser_retry_request(
 	}))
 }
 
-fn browser_fetch_error(error: BrowserFetchError) -> Error {
+fn browser_fetch_error(error: BrowserFetchError, started: Instant) -> Error {
 	match error {
 		BrowserFetchError::Cancelled => cancelled(false),
-		BrowserFetchError::TimedOut => deadline_exceeded(false),
+		BrowserFetchError::TimedOut => deadline_exceeded(false, started, "browser.fetch"),
 		BrowserFetchError::Unavailable | BrowserFetchError::Navigation => {
 			connectivity(ErrorPhase::Handshake, false, "browser-fetch-unavailable")
 		},
@@ -1321,6 +1385,7 @@ fn decode_stream(
 	deadline: Instant,
 	started: Instant,
 	browser_retry: Option<(Arc<dyn BrowserFetch>, BrowserFetchRequest)>,
+	mut content: ContentDecoder,
 ) -> impl Stream<Item = Result<RawEvent, Error>> + Send + 'static {
 	async_stream::stream! {
 		let mut guard = CancelOnDrop::new(cancel.clone());
@@ -1338,11 +1403,95 @@ fn decode_stream(
 				},
 				() = sleep_until(deadline) => {
 					cancel.cancel();
-					yield Err(record_failure(deadline_exceeded(emitted), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+					yield Err(record_failure(deadline_exceeded(emitted, started, "stream.body"), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 					break;
 				},
 			};
-			let Some(next) = next else {
+			let mut ended = false;
+			let chunk = match next {
+				None => {
+					ended = true;
+					match content.finish() {
+						Ok(tail) => tail,
+						Err(_) => {
+							let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "content-encoding-truncated");
+							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+							break;
+						},
+					}
+				},
+				Some(Err(_)) => {
+					let error = connectivity(
+						if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake },
+						emitted,
+						"http-response-body",
+					);
+					yield Err(record_failure(
+						error,
+						&attempt,
+						&evidence,
+						Some(status),
+						provider_request_id.as_ref(),
+						started,
+						emitted,
+					));
+					break;
+				},
+				Some(Ok(body_frame)) => {
+					let Ok(chunk) = body_frame.into_data() else { continue };
+					match content.push(chunk) {
+						Ok(decoded) => decoded,
+						Err(_) => {
+							let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "content-encoding-corrupt");
+							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+							break;
+						},
+					}
+				},
+			};
+			if !chunk.is_empty() {
+				response_bytes = response_bytes.saturating_add(chunk.len() as u64);
+				if response_bytes > response_limit {
+					let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "response-body-limit");
+					yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+					break;
+				}
+				let frames = match framer.push(chunk) {
+					Ok(frames) => frames,
+					Err(error) => {
+						yield Err(record_failure(framing_error(error, emitted), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+						break;
+					},
+				};
+				for frame in frames {
+					capture_http_frame(&capture, ordinal, &frame, &mut capture_remaining);
+					ordinal += 1;
+					let mut events = VecDeque::new();
+					if let Err(error) = decoder.push(frame, &mut |event| events.push_back(event)) {
+						yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+						return;
+					}
+					for event in events {
+						match event {
+							RawEvent::Failure(error) => {
+								yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+								return;
+							},
+							event => {
+								emitted |= is_commit_candidate(&event);
+								yield Ok(event);
+							},
+						}
+					}
+					if decoder.is_complete() {
+						// A provider terminal envelope owns response completion even
+						// when a broken keep-alive leaves the HTTP body open.
+						guard.disarm();
+						break 'response;
+					}
+				}
+			}
+			if ended {
 				match framer.finish() {
 					Ok(frames) => {
 						for frame in frames {
@@ -1377,6 +1526,7 @@ fn decode_stream(
 					Ok(()) => for event in events {
 						match event {
 							RawEvent::Failure(error) => {
+								let error = stream_ended(error, started, ordinal);
 								yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 								return;
 							},
@@ -1387,6 +1537,7 @@ fn decode_stream(
 						}
 					},
 					Err(error) => {
+						let error = stream_ended(error, started, ordinal);
 						let Some((browser, request)) =
 							browser_retry.filter(|_| !emitted && decoder.prepare_browser_retry())
 						else {
@@ -1397,7 +1548,7 @@ fn decode_stream(
 						let response = match browser.fetch(request, cancel.clone()).await {
 							Ok(response) => response,
 							Err(failure) => {
-								yield Err(record_failure(browser_fetch_error(failure), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+								yield Err(record_failure(browser_fetch_error(failure, started), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
 								guard.disarm();
 								break;
 							},
@@ -1435,64 +1586,6 @@ fn decode_stream(
 				}
 				guard.disarm();
 				break;
-			};
-			let Ok(body_frame) = next else {
-				let error = connectivity(
-					if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake },
-					emitted,
-					"http-response-body",
-				);
-				yield Err(record_failure(
-					error,
-					&attempt,
-					&evidence,
-					Some(status),
-					provider_request_id.as_ref(),
-					started,
-					emitted,
-				));
-				break;
-			};
-			let Ok(chunk) = body_frame.into_data() else { continue };
-			response_bytes = response_bytes.saturating_add(chunk.len() as u64);
-			if response_bytes > response_limit {
-				let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "response-body-limit");
-				yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
-				break;
-			}
-			let frames = match framer.push(chunk) {
-				Ok(frames) => frames,
-				Err(error) => {
-					yield Err(record_failure(framing_error(error, emitted), &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
-					break;
-				},
-			};
-			for frame in frames {
-				capture_http_frame(&capture, ordinal, &frame, &mut capture_remaining);
-				ordinal += 1;
-				let mut events = VecDeque::new();
-				if let Err(error) = decoder.push(frame, &mut |event| events.push_back(event)) {
-					yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
-					return;
-				}
-				for event in events {
-					match event {
-						RawEvent::Failure(error) => {
-							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
-							return;
-						},
-						event => {
-							emitted |= is_commit_candidate(&event);
-							yield Ok(event);
-						},
-					}
-				}
-				if decoder.is_complete() {
-					// A provider terminal envelope owns response completion even
-					// when a broken keep-alive leaves the HTTP body open.
-					guard.disarm();
-					break 'response;
-				}
 			}
 		}
 	}
@@ -1722,7 +1815,9 @@ pub(crate) fn record_failure(
 	error
 }
 
-fn deadline_exceeded(committed: bool) -> Error {
+/// Builds the typed local-deadline failure for one attempt, naming the wire
+/// milestone that was being awaited and the wall-clock time spent on it.
+fn deadline_exceeded(committed: bool, started: Instant, scope: &'static str) -> Error {
 	Error::new(
 		ErrorKind::DeadlineExceeded,
 		if committed {
@@ -1734,6 +1829,19 @@ fn deadline_exceeded(committed: bool) -> Error {
 		ExecutionReceipt::default(),
 	)
 	.committed(committed)
+	.detail(ErrorDetail::timeout(ReasonId::new_static(scope), started.elapsed()))
+}
+
+/// Re-frames a codec truncation raised at body end as provider stream-end
+/// evidence: how long the response lived and how many frames it carried.
+fn stream_ended(error: Error, started: Instant, frames: u64) -> Error {
+	match error.detail_ref() {
+		Some(ErrorDetail::Protocol { reason }) => {
+			let reason = reason.clone();
+			error.detail(ErrorDetail::stream_ended(reason, started.elapsed(), frames))
+		},
+		_ => error,
+	}
 }
 
 fn cancelled(committed: bool) -> Error {

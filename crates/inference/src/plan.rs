@@ -235,8 +235,21 @@ pub const FORCED_CALL_DIRECTIVE: &str =
 pub struct ForcedCallCaps {
 	/// Native tool-call capabilities declared by the selected route.
 	pub features:       omp_catalog::ToolFeatureBits,
+	/// Whether this exact wire dialect accepts a forced selector.
+	pub forced_choice:  Option<bool>,
 	/// Provider-declared price of setting native `tool_choice`.
 	pub native_penalty: Option<Penalty>,
+}
+
+impl ForcedCallCaps {
+	/// Builds ladder capabilities from route features and compiled wire policy.
+	pub fn from_wire_policy(
+		features: omp_catalog::ToolFeatureBits,
+		native_penalty: Option<Penalty>,
+		policy: &WirePolicy,
+	) -> Self {
+		Self { features, forced_choice: policy.tool.forced_choice, native_penalty }
+	}
 }
 
 /// Chosen forced-call enforcement rung for one attempt.
@@ -272,14 +285,15 @@ pub fn forced_call_ladder(
 			escalation:    None,
 		};
 	}
-	let native_supported = match choice {
-		Setting::Require(ToolChoice::Named(_)) | Setting::Prefer(ToolChoice::Named(_)) => caps
-			.features
-			.contains(omp_catalog::ToolFeatureBits::NAMED_CHOICE),
-		_ => caps
-			.features
-			.contains(omp_catalog::ToolFeatureBits::REQUIRED_CHOICE),
-	};
+	let native_supported = caps.forced_choice != Some(false)
+		&& match choice {
+			Setting::Require(ToolChoice::Named(_)) | Setting::Prefer(ToolChoice::Named(_)) => caps
+				.features
+				.contains(omp_catalog::ToolFeatureBits::NAMED_CHOICE),
+			_ => caps
+				.features
+				.contains(omp_catalog::ToolFeatureBits::REQUIRED_CHOICE),
+		};
 	let escalation =
 		(non_compliant && escalations_left != 0 && native_supported && caps.native_penalty.is_some())
 			.then(|| Adjustment::Escalated {
@@ -894,6 +908,7 @@ mod tests {
 		let choice = CallSetting::Require(CallToolChoice::Named(sf!("lookup")));
 		let caps = ForcedCallCaps {
 			features:       omp_catalog::ToolFeatureBits::NAMED_CHOICE,
+			forced_choice:  Some(true),
 			native_penalty: Some(Penalty::CacheInvalidated),
 		};
 		let soft = forced_call_ladder(&choice, caps.clone(), false, 1);
@@ -906,5 +921,25 @@ mod tests {
 			escalated.escalation,
 			Some(Adjustment::Escalated { penalty: Penalty::CacheInvalidated, .. })
 		));
+	}
+
+	#[test]
+	fn supports_forced_tool_choice_matches_pi_behavior() {
+		let choice = CallSetting::Require(CallToolChoice::Named(sf!("lookup")));
+		let mut policy = WirePolicy::baseline();
+		policy.tool.forced_choice = Some(false);
+		let decision = forced_call_ladder(
+			&choice,
+			ForcedCallCaps::from_wire_policy(
+				omp_catalog::ToolFeatureBits::NAMED_CHOICE,
+				None,
+				&policy,
+			),
+			true,
+			1,
+		);
+		assert!(decision.soft_prompt);
+		assert!(!decision.native_choice);
+		assert_eq!(decision.escalation, None);
 	}
 }

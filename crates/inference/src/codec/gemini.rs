@@ -46,6 +46,10 @@ use crate::{
 pub const GENERATIVE_LANGUAGE_BASE: &str = "https://generativelanguage.googleapis.com";
 /// Public Generative Language streaming path suffix.
 pub const GENERATIVE_LANGUAGE_STREAM_PATH: &str = ":streamGenerateContent?alt=sse";
+const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+const NON_VISION_IMAGE_PLACEHOLDER: &str = "[image omitted: model does not support vision]";
+const TOOL_RESULT_IMAGE_LABEL: &str = "Tool result image:";
+const TOOL_RESULT_IMAGE_REFERENCE: &str = "(see attached image)";
 
 /// `GenerateContent` endpoint behavior that affects the JSON body.
 #[derive(Clone, Copy, Debug, Default, Eq, IntoStaticStr, PartialEq)]
@@ -62,20 +66,6 @@ pub enum GoogleEndpointKind {
 	/// keys.
 	#[strum(serialize = "v1internal")]
 	CloudCodeAssist,
-}
-
-impl GoogleEndpointKind {
-	const fn preserves_function_ids(self) -> bool {
-		!matches!(self, Self::Vertex)
-	}
-
-	const fn schema_key(self) -> GoogleSchemaKey {
-		if matches!(self, Self::CloudCodeAssist) {
-			GoogleSchemaKey::Parameters
-		} else {
-			GoogleSchemaKey::ParametersJsonSchema
-		}
-	}
 }
 
 #[derive(Clone, Copy)]
@@ -117,26 +107,37 @@ impl InlineToolDescriptorsMode {
 #[derive(Clone, Debug, Default)]
 pub struct GoogleRequestOptions {
 	/// Existing Google cached-content resource name.
-	pub cached_content:          Option<Str>,
+	pub cached_content:                  Option<Str>,
 	/// Explicit safety policy. An empty list means no safetySettings field.
-	pub safety_settings:         Vec<GoogleSafetySetting>,
+	pub safety_settings:                 Vec<GoogleSafetySetting>,
 	/// Explicit output modalities.
-	pub response_modalities:     Vec<Str>,
+	pub response_modalities:             Vec<Str>,
 	/// Whether the Google Search hosted tool is enabled.
-	pub google_search:           bool,
+	pub google_search:                   bool,
 	/// Whether the code-execution hosted tool is enabled.
-	pub code_execution:          bool,
+	pub code_execution:                  bool,
 	/// Selected wire identity required whenever historical continuation proofs
 	/// are present.
-	pub proof_scope:             Option<GoogleProofScope>,
+	pub proof_scope:                     Option<GoogleProofScope>,
 	/// Whether assistant reasoning without a continuation proof is omitted from
 	/// the wire request instead of sent as an unsigned thought part.
-	pub drop_unsigned_reasoning: bool,
+	pub drop_unsigned_reasoning:         bool,
+	/// Whether function calls and results carry their canonical call ID.
+	pub supports_function_part_id:       Option<bool>,
+	/// Whether unsigned historical function calls carry Google's validation
+	/// bypass sentinel.
+	pub requires_skip_thought_signature: bool,
+	/// Whether tool-result media is nested in `functionResponse.parts`.
+	pub multimodal_function_response:    Option<bool>,
+	/// Whether image inputs are replaced by the non-vision placeholder.
+	pub strip_image_input:               bool,
+	/// Whether function declarations use CCA's legacy `parameters` key.
+	pub cca_legacy_parameters_schema:    Option<bool>,
 	/// Legacy typed remote-file substitutions keyed by `(message index, part
 	/// index)`.
-	pub remote_files:            BTreeMap<(usize, usize), GoogleFileData>,
+	pub remote_files:                    BTreeMap<(usize, usize), GoogleFileData>,
 	/// Inline descriptor optimization mode.
-	pub inline_tool_descriptors: InlineToolDescriptorsMode,
+	pub inline_tool_descriptors:         InlineToolDescriptorsMode,
 }
 
 /// One explicit Google harm-policy entry.
@@ -719,6 +720,7 @@ impl GeminiCodec {
 		let mut output = GenerateContentRequest::default();
 		let mut adjustments = Vec::new();
 		let mut system_parts = Vec::new();
+		let mut pending_tool_images = Vec::new();
 		for (message_index, message) in request.messages.iter().enumerate() {
 			self.project_message(
 				message,
@@ -726,9 +728,11 @@ impl GeminiCodec {
 				options,
 				&mut system_parts,
 				&mut output.contents,
+				&mut pending_tool_images,
 				&mut adjustments,
 			)?;
 		}
+		flush_tool_images(&mut output.contents, &mut pending_tool_images);
 		if options.inline_tool_descriptors.enabled_for_gemini() && !request.tools.is_empty() {
 			system_parts.push(GooglePart {
 				text: Some(inline_tool_guidance(&request.tools)?),
@@ -883,8 +887,12 @@ impl GeminiCodec {
 		options: &GoogleRequestOptions,
 		system_parts: &mut Vec<GooglePart>,
 		contents: &mut Vec<GoogleContent>,
+		pending_tool_images: &mut Vec<GooglePart>,
 		adjustments: &mut Vec<GoogleAdjustment>,
 	) -> Result<(), GoogleCodecError> {
+		if !matches!(message.role, Role::Tool) {
+			flush_tool_images(contents, pending_tool_images);
+		}
 		if message.name.is_some() {
 			adjustments.push(GoogleAdjustment::new_static(
 				"thread.message.name",
@@ -925,6 +933,15 @@ impl GeminiCodec {
 			{
 				continue;
 			}
+			if options.strip_image_input && matches!(part, ContentPart::Image(_)) {
+				if !parts
+					.iter()
+					.any(|part| part.text.as_deref() == Some(NON_VISION_IMAGE_PLACEHOLDER))
+				{
+					parts.push(text_part(sf!(NON_VISION_IMAGE_PLACEHOLDER)));
+				}
+				continue;
+			}
 			if matches!(
 				part,
 				ContentPart::Image(MediaInput::Bytes { data, .. })
@@ -955,7 +972,19 @@ impl GeminiCodec {
 		} else {
 			"user"
 		};
-		append_content(contents, Str::new(role), parts, matches!(message.role, Role::Tool));
+		let function_response = matches!(message.role, Role::Tool);
+		if function_response && options.multimodal_function_response != Some(true) {
+			let mut trailing = Vec::new();
+			for part in &mut parts {
+				if let Some(response) = &mut part.function_response {
+					trailing.append(&mut response.parts);
+				}
+			}
+			append_content(contents, Str::new(role), parts, true);
+			pending_tool_images.extend(trailing);
+		} else {
+			append_content(contents, Str::new(role), parts, function_response);
+		}
 		Ok(())
 	}
 
@@ -987,21 +1016,27 @@ impl GeminiCodec {
 			ContentPart::Image(media) | ContentPart::Audio(media) | ContentPart::Document(media) => {
 				project_media(media, options.remote_files.get(&(message_index, part_index)))
 			},
-			ContentPart::ToolCall { call, name, arguments, proof } => Ok(GooglePart {
-				function_call: Some(GoogleFunctionCall {
-					id:   self
-						.endpoint
-						.preserves_function_ids()
-						.then(|| Str::new(call.as_str())),
-					name: name.clone(),
-					args: opaque_raw(arguments, "tool arguments")?,
-				}),
-				thought_signature: proof
+			ContentPart::ToolCall { call, name, arguments, proof } => {
+				let thought_signature = proof
 					.as_ref()
 					.map(|proof| proof_string(proof, options))
-					.transpose()?,
-				..GooglePart::default()
-			}),
+					.transpose()?
+					.or_else(|| {
+						options
+							.requires_skip_thought_signature
+							.then(|| sf!(SKIP_THOUGHT_SIGNATURE))
+					});
+				Ok(GooglePart {
+					function_call: Some(GoogleFunctionCall {
+						id:   (options.supports_function_part_id == Some(true))
+							.then(|| Str::new(call.as_str())),
+						name: name.clone(),
+						args: opaque_raw(arguments, "tool arguments")?,
+					}),
+					thought_signature,
+					..GooglePart::default()
+				})
+			},
 			ContentPart::ToolResult { call, name, content, is_error } => {
 				let name = name.clone().ok_or_else(|| {
 					GoogleCodecError::encoding(
@@ -1013,12 +1048,11 @@ impl GeminiCodec {
 						"Google functionResponse requires the original non-empty tool name",
 					));
 				}
-				let (response, parts) = tool_response_raw(content, *is_error)?;
+				let (response, parts) =
+					tool_response_raw(content, *is_error, options.strip_image_input)?;
 				Ok(GooglePart {
 					function_response: Some(GoogleFunctionResponse {
-						id: self
-							.endpoint
-							.preserves_function_ids()
+						id: (options.supports_function_part_id == Some(true))
 							.then(|| Str::new(call.as_str())),
 						name,
 						response,
@@ -1065,7 +1099,12 @@ impl GeminiCodec {
 					if options.inline_tool_descriptors.enabled_for_gemini() {
 						(None, None, None)
 					} else {
-						match self.endpoint.schema_key() {
+						let key = if options.cca_legacy_parameters_schema == Some(true) {
+							GoogleSchemaKey::Parameters
+						} else {
+							GoogleSchemaKey::ParametersJsonSchema
+						};
+						match key {
 							GoogleSchemaKey::Parameters => (None, Some(schema), tool.description.clone()),
 							GoogleSchemaKey::ParametersJsonSchema => {
 								(Some(schema), None, tool.description.clone())
@@ -1425,6 +1464,7 @@ fn wire_function_arguments(args: &RawValue) -> Result<(Bytes, bool), GoogleCodec
 fn tool_response_raw(
 	content: &[ToolResultContent],
 	is_error: bool,
+	strip_image_input: bool,
 ) -> Result<(Box<RawValue>, Vec<GooglePart>), GoogleCodecError> {
 	let mut text = String::new();
 	let mut json = None;
@@ -1445,13 +1485,26 @@ fn tool_response_raw(
 				}
 				json = Some(opaque_raw(value, "tool response")?);
 			},
-			ToolResultContent::Image(media) | ToolResultContent::Document(media) => {
+			ToolResultContent::Image(media) => {
+				if strip_image_input {
+					if !text.is_empty() {
+						text.push('\n');
+					}
+					text.push_str(NON_VISION_IMAGE_PLACEHOLDER);
+				} else {
+					parts.push(project_media(media, None)?);
+				}
+			},
+			ToolResultContent::Document(media) => {
 				parts.push(project_media(media, None)?);
 			},
 		}
 	}
 	let result = match &json {
 		Some(value) => ToolResponseValue::Json(value.as_ref()),
+		None if text.is_empty() && !parts.is_empty() => {
+			ToolResponseValue::Text(TOOL_RESULT_IMAGE_REFERENCE)
+		},
 		None => ToolResponseValue::Text(text.as_str()),
 	};
 	#[derive(Serialize)]
@@ -1474,6 +1527,16 @@ enum ToolResponseValue<'a> {
 	Text(&'a str),
 	Json(&'a RawValue),
 }
+fn flush_tool_images(contents: &mut Vec<GoogleContent>, pending: &mut Vec<GooglePart>) {
+	if pending.is_empty() {
+		return;
+	}
+	let mut parts = Vec::with_capacity(pending.len().saturating_add(1));
+	parts.push(text_part(sf!(TOOL_RESULT_IMAGE_LABEL)));
+	parts.append(pending);
+	contents.push(GoogleContent { role: sf!("user"), parts });
+}
+
 fn append_content(
 	contents: &mut Vec<GoogleContent>,
 	role: Str,
@@ -2172,6 +2235,19 @@ impl Codec for GeminiCodec {
 				provider: context.route.provider.clone(),
 				codec:    target.codec.clone(),
 			}),
+			drop_unsigned_reasoning: context.policy.reasoning.drop_unsigned == Some(true),
+			supports_function_part_id: context.policy.tool.supports_function_part_id,
+			requires_skip_thought_signature: context.policy.tool.requires_skip_thought_signature
+				== Some(true),
+			multimodal_function_response: context.policy.image.multimodal_function_response,
+			strip_image_input: context.policy.image.strip_input == Some(true),
+			cca_legacy_parameters_schema: context.policy.tool.cca_legacy_parameters_schema,
+			inline_tool_descriptors: if context.policy.tool.cca_legacy_parameters_schema == Some(true)
+			{
+				InlineToolDescriptorsMode::Off
+			} else {
+				InlineToolDescriptorsMode::Auto
+			},
 			..GoogleRequestOptions::default()
 		};
 		let projection = self
@@ -2318,6 +2394,19 @@ fn encode_google_count_tokens(
 				provider: context.route.provider.clone(),
 				codec:    target.codec.clone(),
 			}),
+			drop_unsigned_reasoning: context.policy.reasoning.drop_unsigned == Some(true),
+			supports_function_part_id: context.policy.tool.supports_function_part_id,
+			requires_skip_thought_signature: context.policy.tool.requires_skip_thought_signature
+				== Some(true),
+			multimodal_function_response: context.policy.image.multimodal_function_response,
+			strip_image_input: context.policy.image.strip_input == Some(true),
+			cca_legacy_parameters_schema: context.policy.tool.cca_legacy_parameters_schema,
+			inline_tool_descriptors: if context.policy.tool.cca_legacy_parameters_schema == Some(true)
+			{
+				InlineToolDescriptorsMode::Off
+			} else {
+				InlineToolDescriptorsMode::Auto
+			},
 			..GoogleRequestOptions::default()
 		})
 		.map_err(|error| error.into_inference(false))?;
@@ -3163,6 +3252,194 @@ mod tests {
 		}
 	}
 
+	fn tool_call_message() -> Message {
+		Message {
+			role:    Role::Assistant,
+			content: vec![ContentPart::ToolCall {
+				call:      ToolCallId::new("call-1"),
+				name:      sf!("read"),
+				arguments: opaque(r#"{"path":"note.txt"}"#),
+				proof:     None,
+			}]
+			.into(),
+			name:    None,
+		}
+	}
+
+	#[test]
+	fn cca_legacy_parameters_schema_matches_pi_request_shape() {
+		let mut request = empty_chat_request();
+		request.tools = vec![ToolDefinition {
+			name:        sf!("read"),
+			description: Some(sf!("Read a file")),
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: opaque(r#"{"type":"object","properties":{"path":{"type":"string"}}}"#),
+				strict:     false,
+			},
+		}]
+		.into();
+		let projection = GeminiCodec::cloud_code_assist(None)
+			.project(&request, &GoogleRequestOptions {
+				inline_tool_descriptors: InlineToolDescriptorsMode::Off,
+				cca_legacy_parameters_schema: Some(true),
+				..Default::default()
+			})
+			.expect("CCA tool projects");
+		let declaration = &projection.request.tools[0].function_declarations[0];
+		assert!(declaration.parameters.is_some());
+		assert!(declaration.parameters_json_schema.is_none());
+	}
+
+	#[test]
+	fn drop_unsigned_thinking_matches_pi_request_shape() {
+		let mut request = empty_chat_request();
+		request.messages = vec![Message {
+			role:    Role::Assistant,
+			content: vec![ContentPart::Reasoning { text: sf!("unsigned plan"), proof: None }].into(),
+			name:    None,
+		}]
+		.into();
+		let projection = GeminiCodec::cloud_code_assist(None)
+			.project(&request, &GoogleRequestOptions {
+				drop_unsigned_reasoning: true,
+				..Default::default()
+			})
+			.expect("unsigned reasoning is safely omitted");
+		assert!(projection.request.contents.is_empty());
+	}
+
+	#[test]
+	fn requires_skip_thought_signature_matches_pi_request_shape() {
+		let mut request = empty_chat_request();
+		request.messages = vec![tool_call_message()].into();
+		let projection = GeminiCodec::generative_language(None)
+			.project(&request, &GoogleRequestOptions {
+				requires_skip_thought_signature: true,
+				..Default::default()
+			})
+			.expect("unsigned tool call projects");
+		assert_eq!(
+			projection.request.contents[0].parts[0]
+				.thought_signature
+				.as_deref(),
+			Some(SKIP_THOUGHT_SIGNATURE),
+		);
+	}
+
+	#[test]
+	fn supports_function_part_id_matches_pi_request_shape() {
+		let mut request = empty_chat_request();
+		request.messages = vec![tool_call_message()].into();
+		let projection = GeminiCodec::vertex(None)
+			.project(&request, &GoogleRequestOptions {
+				supports_function_part_id: Some(true),
+				..Default::default()
+			})
+			.expect("function ID projects from policy");
+		assert_eq!(
+			projection.request.contents[0].parts[0]
+				.function_call
+				.as_ref()
+				.and_then(|call| call.id.as_deref()),
+			Some("call-1"),
+		);
+
+		let omitted = GeminiCodec::generative_language(None)
+			.project(&request, &GoogleRequestOptions {
+				supports_function_part_id: Some(false),
+				..Default::default()
+			})
+			.expect("unsupported function ID is omitted");
+		assert!(
+			omitted.request.contents[0].parts[0]
+				.function_call
+				.as_ref()
+				.expect("function call")
+				.id
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn strip_image_input_matches_pi_request_shape() {
+		let mut request = empty_chat_request();
+		request.messages = vec![Message {
+			role:    Role::User,
+			content: vec![
+				ContentPart::Text { text: sf!("inspect"), proof: None },
+				ContentPart::Image(MediaInput::Bytes {
+					media_type: sf!("image/png"),
+					data:       Bytes::from_static(&[1, 2, 3]),
+				}),
+			]
+			.into(),
+			name:    None,
+		}]
+		.into();
+		let projection = GeminiCodec::generative_language(None)
+			.project(&request, &GoogleRequestOptions { strip_image_input: true, ..Default::default() })
+			.expect("image is replaced");
+		let parts = &projection.request.contents[0].parts;
+		assert_eq!(parts.len(), 2);
+		assert_eq!(parts[1].text.as_deref(), Some(NON_VISION_IMAGE_PLACEHOLDER));
+		assert!(parts[1].inline_data.is_none());
+	}
+
+	#[test]
+	fn multimodal_function_response_matches_pi_request_shape() {
+		let mut request = empty_chat_request();
+		request.messages = vec![Message {
+			role:    Role::Tool,
+			content: vec![ContentPart::ToolResult {
+				call:     ToolCallId::new("call-1"),
+				name:     Some(sf!("read")),
+				content:  vec![ToolResultContent::Image(MediaInput::Bytes {
+					media_type: sf!("image/png"),
+					data:       Bytes::from_static(&[1, 2, 3]),
+				})]
+				.into(),
+				is_error: false,
+			}]
+			.into(),
+			name:    None,
+		}]
+		.into();
+
+		let nested = GeminiCodec::generative_language(None)
+			.project(&request, &GoogleRequestOptions {
+				multimodal_function_response: Some(true),
+				..Default::default()
+			})
+			.expect("multimodal result projects");
+		let response = nested.request.contents[0].parts[0]
+			.function_response
+			.as_ref()
+			.expect("function response");
+		assert_eq!(response.parts.len(), 1);
+		assert_eq!(response.response.get(), r#"{"output":"(see attached image)"}"#);
+
+		let legacy = GeminiCodec::generative_language(None)
+			.project(&request, &GoogleRequestOptions {
+				multimodal_function_response: Some(false),
+				..Default::default()
+			})
+			.expect("legacy image result projects");
+		assert!(
+			legacy.request.contents[0].parts[0]
+				.function_response
+				.as_ref()
+				.expect("function response")
+				.parts
+				.is_empty()
+		);
+		assert_eq!(legacy.request.contents[1].role, "user");
+		assert_eq!(
+			legacy.request.contents[1].parts[0].text.as_deref(),
+			Some(TOOL_RESULT_IMAGE_LABEL),
+		);
+		assert!(legacy.request.contents[1].parts[1].inline_data.is_some());
+	}
+
 	#[test]
 	fn schema_normalization_matches_oracle() {
 		#[derive(Deserialize)]
@@ -3824,21 +4101,6 @@ mod tests {
 			.and_then(|generation| generation.thinking_config)
 			.expect("thinking config");
 		assert_eq!(thinking.thinking_level.as_deref(), Some("LOW"));
-	}
-
-	#[test]
-	fn vertex_strips_function_ids() {
-		let call = GoogleFunctionCall {
-			id:   Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
-			name: "lookup".into(),
-			args: RawValue::from_string(r#"{"q":"oracle"}"#.into()).expect("raw arguments"),
-		};
-		let mut part = GooglePart { function_call: Some(call), ..GooglePart::default() };
-		if !GoogleEndpointKind::Vertex.preserves_function_ids() {
-			part.function_call.as_mut().expect("call").id = None;
-		}
-		let encoded = serde_json::to_string(&part).expect("part serializes");
-		assert_eq!(encoded, r#"{"functionCall":{"name":"lookup","args":{"q":"oracle"}}}"#);
 	}
 
 	#[test]

@@ -5,6 +5,7 @@ pub mod capture;
 pub mod cassette;
 pub mod connect;
 pub mod custom;
+pub mod encoding;
 pub mod eventstream;
 pub mod frame;
 pub mod http;
