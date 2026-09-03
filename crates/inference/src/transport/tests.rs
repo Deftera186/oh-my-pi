@@ -1369,11 +1369,9 @@ async fn gzip_encoded_anthropic_stream_decodes_to_a_completion() {
 	);
 	call.encoded.uri = sf!("http://{address}/v1/messages");
 	call.encoded.framing = FramingProtocol::Sse;
-	call.encoded.bounds = SizeBounds { request_body: 1024, frame: 65_536, response: 65_536 };
-	let response = service
-		.call(call)
-		.await
-		.expect("gzip stream handshakes");
+	call.encoded.bounds =
+		SizeBounds { request_body: 1024, frame: 65_536, response: 65_536 };
+	let response = service.call(call).await.expect("gzip stream handshakes");
 	let mut events = response.events.expect("ordinary event stream");
 	let mut text = String::new();
 	let mut completed = false;
@@ -1418,7 +1416,11 @@ async fn unsupported_content_encoding_fails_closed_without_retry() {
 		Cancellation::default(),
 	);
 	call.encoded.uri = sf!("http://{address}/v1/messages");
-	let error = service.call(call).await.err().expect("unsupported encoding fails");
+	let error = service
+		.call(call)
+		.await
+		.err()
+		.expect("unsupported encoding fails");
 	assert_eq!(error.kind, ErrorKind::Protocol);
 	assert_eq!(error.phase, ErrorPhase::Handshake);
 	assert_eq!(error.action, RetryAction::Never);

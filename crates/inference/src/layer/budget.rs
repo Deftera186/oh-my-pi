@@ -285,6 +285,7 @@ where
 			);
 		}
 		let context = ExecutionContext::new(call.budget.clone());
+		context.set_retry_sink(call.response_hooks.retry_sink());
 		let result = context
 			.checkpoint(ErrorPhase::Readiness)
 			.and_then(|()| self.ledger.admit(&call, &context));

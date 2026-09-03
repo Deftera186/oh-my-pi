@@ -1100,14 +1100,32 @@ pub trait ProviderResponseObserver: provider_hooks::ProviderHookObserver {
 	fn observe_credential_disabled(&self, _observation: CredentialDisabledObservation) {}
 }
 
-/// Clone-cheap optional provider request/response hook sink.
+/// Clone-cheap optional provider request/response hook sink, plus the
+/// caller's retry observer (the transport retry layer publishes
+/// [`crate::layer::retry::RetryNotice`]s to it before each backoff wait).
 #[derive(Clone, Default)]
-pub struct ProviderResponseHooks(Option<Arc<dyn ProviderResponseObserver>>);
+pub struct ProviderResponseHooks(
+	Option<Arc<dyn ProviderResponseObserver>>,
+	Option<crate::layer::retry::RetrySink>,
+);
 
 impl ProviderResponseHooks {
 	/// Wraps one session hook sink.
 	pub fn new(observer: Arc<dyn ProviderResponseObserver>) -> Self {
-		Self(Some(observer))
+		Self(Some(observer), None)
+	}
+
+	/// Returns these hooks with a retry observer installed.
+	#[must_use]
+	pub fn with_retry_sink(mut self, sink: crate::layer::retry::RetrySink) -> Self {
+		self.1 = Some(sink);
+		self
+	}
+
+	/// The caller's retry observer, if one was installed.
+	#[must_use]
+	pub fn retry_sink(&self) -> Option<crate::layer::retry::RetrySink> {
+		self.1.clone()
 	}
 
 	/// Returns the subscription bitmap bit.
@@ -1244,6 +1262,7 @@ impl fmt::Debug for ProviderResponseHooks {
 		formatter
 			.debug_tuple("ProviderResponseHooks")
 			.field(&self.0.is_some())
+			.field(&self.1.is_some())
 			.finish()
 	}
 }

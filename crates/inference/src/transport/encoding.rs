@@ -167,8 +167,16 @@ mod tests {
 
 	#[test]
 	fn absent_and_identity_encodings_pass_through() {
-		assert!(ContentDecoder::from_headers(&HeaderMap::new()).unwrap().is_identity());
-		assert!(ContentDecoder::from_headers(&headers("identity")).unwrap().is_identity());
+		assert!(
+			ContentDecoder::from_headers(&HeaderMap::new())
+				.unwrap()
+				.is_identity()
+		);
+		assert!(
+			ContentDecoder::from_headers(&headers("identity"))
+				.unwrap()
+				.is_identity()
+		);
 		let mut decoder = ContentDecoder::Identity;
 		assert_eq!(decoder.push(Bytes::from_static(b"abc")).unwrap(), Bytes::from_static(b"abc"));
 		assert!(decoder.finish().unwrap().is_empty());
@@ -208,7 +216,9 @@ mod tests {
 	fn truncated_gzip_body_fails_at_finish() {
 		let wire = gzip(b"data: {\"type\":\"ping\"}\n\n".repeat(32).as_slice());
 		let mut decoder = ContentDecoder::from_headers(&headers("gzip")).unwrap();
-		let _ = decoder.push(Bytes::copy_from_slice(&wire[..wire.len() / 2])).unwrap();
+		let _ = decoder
+			.push(Bytes::copy_from_slice(&wire[..wire.len() / 2]))
+			.unwrap();
 		assert!(decoder.finish().is_err());
 	}
 

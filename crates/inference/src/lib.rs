@@ -57,6 +57,7 @@ pub use layer::{
 	budget::{InferenceBudget, InferenceBudgetPolicy, InferenceLedger},
 	hook::{HookHandle, NoHookHandle},
 	recover::{DiscoveryProjector, RecoveryLayer},
+	retry::{RetryNotice, RetrySink},
 };
 pub use omp_catalog::{
 	capability::*,

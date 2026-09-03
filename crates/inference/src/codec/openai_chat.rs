@@ -1263,23 +1263,11 @@ fn validate_thinking_selection(
 		return Err(capability_error());
 	}
 	if let Some(effort) = reasoning.effort
-		&& canonical_thinking_effort(effort) != selection.effort
+		&& ThinkingEffort::from(effort) != selection.effort
 	{
 		return Err(capability_error());
 	}
 	Ok(())
-}
-
-const fn canonical_thinking_effort(effort: ReasoningEffort) -> ThinkingEffort {
-	match effort {
-		ReasoningEffort::Off => ThinkingEffort::Off,
-		ReasoningEffort::Minimal => ThinkingEffort::Minimal,
-		ReasoningEffort::Low => ThinkingEffort::Low,
-		ReasoningEffort::Medium => ThinkingEffort::Medium,
-		ReasoningEffort::High => ThinkingEffort::High,
-		ReasoningEffort::Xhigh => ThinkingEffort::XHigh,
-		ReasoningEffort::Max => ThinkingEffort::Max,
-	}
 }
 
 fn proof_detail(value: &[u8], id: Option<Str>) -> WireReasoningReplay {

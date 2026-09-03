@@ -20,8 +20,7 @@ use crate::{
 	},
 	catalog::{
 		Availability, CodecId, ModelKey, OperationBits, OperationKind, PolicyModel, PriceUnit,
-		ProviderId, ReasoningEffort, RouteId, ThinkingEffort, ThinkingPolicy, WireTarget,
-		clamp_thinking_effort,
+		ProviderId, RouteId, ThinkingEffort, ThinkingPolicy, WireTarget, clamp_thinking_effort,
 	},
 	error::{Error, ErrorDetail, ErrorKind},
 	plan::{
@@ -1187,19 +1186,7 @@ fn chat_thinking_effort(
 			"thinking-policy-unavailable",
 		));
 	}
-	Ok(requested.map(reasoning_to_thinking))
-}
-
-const fn reasoning_to_thinking(effort: ReasoningEffort) -> ThinkingEffort {
-	match effort {
-		ReasoningEffort::Off => ThinkingEffort::Off,
-		ReasoningEffort::Minimal => ThinkingEffort::Minimal,
-		ReasoningEffort::Low => ThinkingEffort::Low,
-		ReasoningEffort::Medium => ThinkingEffort::Medium,
-		ReasoningEffort::High => ThinkingEffort::High,
-		ReasoningEffort::Xhigh => ThinkingEffort::XHigh,
-		ReasoningEffort::Max => ThinkingEffort::Max,
-	}
+	Ok(requested.map(ThinkingEffort::from))
 }
 
 fn model_less_route_is_candidate(

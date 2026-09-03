@@ -3,18 +3,42 @@
 
 use std::{
 	future, mem,
+	sync::Arc,
 	task::{Context, Poll},
 	time,
 };
 
+use omp_core::Str;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tower::{Layer, Service};
 
 use crate::{
 	body::RetryDecision,
-	error::{Error, ErrorPhase, RetryAction},
+	error::{Error, ErrorKind, ErrorPhase, RetryAction},
 	layer::{ExecutionContext, LayerCall},
 };
+
+/// A same-route retry the transport layer is about to wait for.
+///
+/// Published through the call's retry sink before the backoff sleep starts,
+/// so an interactive host can show pi's `Retrying (X/Y) in Zs…` countdown.
+/// The notice is ephemeral: it is never journaled and never affects replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryNotice {
+	/// One-based index of the attempt about to run.
+	pub attempt:      u32,
+	/// Total attempts the policy allows on this route.
+	pub max_attempts: u32,
+	/// Backoff the layer waits before the attempt.
+	pub delay:        time::Duration,
+	/// Classification of the failure being retried.
+	pub kind:         ErrorKind,
+	/// Human-readable failure summary.
+	pub message:      Str,
+}
+
+/// Clone-cheap observer for [`RetryNotice`]s.
+pub type RetrySink = Arc<dyn Fn(RetryNotice) + Send + Sync>;
 
 /// Full-jitter exponential backoff policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +208,15 @@ where
 						"provider request failed; retrying same route"
 					);
 				}
+				// pi `auto_retry_start`: `attempt` counts retries (1 = first retry)
+				// against `maxAttempts` = the retry cap, never the initial try.
+				request.context.notify_retry(RetryNotice {
+					attempt:      retry_attempt,
+					max_attempts: max_retries,
+					delay,
+					kind:         error.kind,
+					message:      Str::new(error.to_string()),
+				});
 				if !delay.is_zero() {
 					wait_retry_delay(request.context.clone(), delay).await?;
 				}
@@ -262,7 +295,7 @@ mod tests {
 	use futures::future::{Ready, ready};
 	use tower::Service;
 
-	use super::{RetryBackoff, TransportRetryService, full_jitter_delay};
+	use super::{RetryBackoff, RetryNotice, RetrySink, TransportRetryService, full_jitter_delay};
 	use crate::{
 		body::{AttemptBodyEvidence, Replayability, RetryDecision, RetryDecisionReason},
 		error::{Error, ErrorKind, ErrorPhase, RetryAction},
@@ -578,6 +611,54 @@ mod tests {
 		assert_eq!(context.receipt().attempts.len(), 1);
 		assert_eq!(context.receipt().usage.input_tokens, 1);
 		assert_eq!(context.receipt().cost.micro_usd, 1);
+	}
+
+	#[tokio::test]
+	async fn retry_notice_reaches_the_installed_sink_before_the_wait() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let notices = Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let context = context();
+		let sink: RetrySink = {
+			let notices = notices.clone();
+			Arc::new(move |notice: RetryNotice| notices.lock().push(notice))
+		};
+		context.set_retry_sink(Some(sink));
+		let mut service = TransportRetryService {
+			inner:       FailThenSuccess { calls, body: replayable() },
+			max_retries: 3,
+			backoff:     RetryBackoff::ZERO,
+		};
+		futures::future::poll_fn(|cx| service.poll_ready(cx))
+			.await
+			.unwrap();
+		service
+			.call(LayerCall { payload: (), context: context.clone() })
+			.await
+			.unwrap();
+		let notices = notices.lock();
+		assert_eq!(notices.len(), 1, "one retry, one notice");
+		assert_eq!(notices[0].attempt, 1);
+		assert_eq!(notices[0].max_attempts, 3);
+		assert_eq!(notices[0].kind, ErrorKind::Connectivity);
+		assert_eq!(notices[0].delay, Duration::ZERO);
+	}
+
+	#[tokio::test]
+	async fn silent_context_retries_without_a_sink() {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let mut service = TransportRetryService {
+			inner:       FailThenSuccess { calls: calls.clone(), body: replayable() },
+			max_retries: 1,
+			backoff:     RetryBackoff::ZERO,
+		};
+		futures::future::poll_fn(|cx| service.poll_ready(cx))
+			.await
+			.unwrap();
+		service
+			.call(LayerCall { payload: (), context: context() })
+			.await
+			.unwrap();
+		assert_eq!(calls.load(Ordering::SeqCst), 2);
 	}
 
 	#[tokio::test]

@@ -27,7 +27,7 @@ use crate::{
 		ModalityBits, OperationKind, ProviderId, ReasoningEffort, RouteId, ThinkingEffort,
 		policy::{
 			ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
-			ImageEncodingFormat,
+			ImageEncodingFormat, ReasoningDisableMode,
 		},
 	},
 	error::{Error, ErrorKind, RetryAction},
@@ -3039,34 +3039,47 @@ impl OpenAiResponsesCodec {
 						reason: sf!("Responses accepts qualitative effort only"),
 					});
 				}
+				// The planner's selection is the canonical effort already
+				// clamped to the catalog ladder; the raw request only
+				// stands in when no plan exists (ADR 0022: one request).
+				let effort = value.effort.map(|requested| {
+					context
+						.thinking_selection
+						.map_or_else(|| ThinkingEffort::from(requested), |selection| selection.effort)
+				});
+				// `none` is a wire value only where the catalog spells it
+				// (`reasoning-disable-mode "none-effort"` or an explicit
+				// off spelling); gpt-5 400s on it. Elsewhere reasoning-off
+				// sends no effort and no summary, exactly like pi.
+				let suppressed_off =
+					effort == Some(ThinkingEffort::Off) && !off_is_spelled_on_the_wire(context);
 				// Routes without an effort dial (grok-build,
 				// grok-code-fast, …) 400 when `reasoning.effort` is
 				// present; policy omits the field while keeping the
 				// reasoning object itself.
-				let effort = if context.policy.reasoning.omit_effort == Some(true) {
+				let effort = if context.policy.reasoning.omit_effort == Some(true) || suppressed_off {
 					None
 				} else {
-					value
-						.effort
-						.map(|effort| wire_reasoning_effort(context, effort))
+					effort.map(|effort| wire_reasoning_effort(context, effort))
 				};
 				// api.x.ai rejects `reasoning.summary` for SuperGrok and
 				// the paid key alike; the wire omits the field instead of
 				// filling `auto`.
-				let summary = if context.policy.reasoning.supports_summary == Some(false) {
-					None
-				} else {
-					self
-						.options
-						.reasoning_summary
-						.clone()
-						.or_else(|| match value.visibility {
-							ReasoningVisibility::Hidden => Some(None),
-							ReasoningVisibility::Summary | ReasoningVisibility::Visible => {
-								Some(Some(sf!("auto")))
-							},
-						})
-				};
+				let summary =
+					if context.policy.reasoning.supports_summary == Some(false) || suppressed_off {
+						None
+					} else {
+						self
+							.options
+							.reasoning_summary
+							.clone()
+							.or_else(|| match value.visibility {
+								ReasoningVisibility::Hidden => Some(None),
+								ReasoningVisibility::Summary | ReasoningVisibility::Visible => {
+									Some(Some(sf!("auto")))
+								},
+							})
+					};
 				// An all-omitted reasoning object carries no wire
 				// information; no-dial routes send no `reasoning` at all.
 				let mode = self.options.reasoning_mode.clone();
@@ -3271,6 +3284,28 @@ impl OpenAiResponsesCodec {
 	}
 }
 
+/// Reports whether the catalog gives reasoning-off a wire spelling on this
+/// route: `reasoning-disable-mode "none-effort"` or an explicit `off` entry in
+/// either effort map, and never while the thinking policy suppresses the
+/// control when off.
+fn off_is_spelled_on_the_wire(context: &EncodeContext<'_>) -> bool {
+	if context
+		.thinking_selection
+		.is_some_and(|selection| selection.suppress_when_off)
+	{
+		return false;
+	}
+	context.policy.reasoning.disable_mode == Some(ReasoningDisableMode::NoneEffort)
+		|| context
+			.thinking_selection
+			.is_some_and(|selection| selection.native_effort.is_some())
+		|| context
+			.policy
+			.reasoning
+			.effort_map
+			.contains_key(&ThinkingEffort::Off)
+}
+
 /// Maps a canonical effort through the route's native spelling override.
 ///
 /// The planner's `ThinkingSelection` wins; the wire policy's `effort_map`
@@ -3278,15 +3313,15 @@ impl OpenAiResponsesCodec {
 /// back to the canonical projection.
 fn wire_reasoning_effort(
 	context: &EncodeContext<'_>,
-	effort: ReasoningEffort,
+	effort: ThinkingEffort,
 ) -> ResponsesReasoningEffort {
 	let canonical = match effort {
-		ReasoningEffort::Off => ResponsesReasoningEffort::None,
-		ReasoningEffort::Minimal => ResponsesReasoningEffort::Minimal,
-		ReasoningEffort::Low => ResponsesReasoningEffort::Low,
-		ReasoningEffort::Medium => ResponsesReasoningEffort::Medium,
-		ReasoningEffort::High => ResponsesReasoningEffort::High,
-		ReasoningEffort::Xhigh | ReasoningEffort::Max => ResponsesReasoningEffort::Xhigh,
+		ThinkingEffort::Off => ResponsesReasoningEffort::None,
+		ThinkingEffort::Minimal => ResponsesReasoningEffort::Minimal,
+		ThinkingEffort::Low => ResponsesReasoningEffort::Low,
+		ThinkingEffort::Medium => ResponsesReasoningEffort::Medium,
+		ThinkingEffort::High => ResponsesReasoningEffort::High,
+		ThinkingEffort::XHigh | ThinkingEffort::Max => ResponsesReasoningEffort::Xhigh,
 	};
 	if let Some(native) = context
 		.thinking_selection
@@ -3294,20 +3329,11 @@ fn wire_reasoning_effort(
 	{
 		return parse_reasoning_effort(native).unwrap_or(canonical);
 	}
-	let thinking = match effort {
-		ReasoningEffort::Off => ThinkingEffort::Off,
-		ReasoningEffort::Minimal => ThinkingEffort::Minimal,
-		ReasoningEffort::Low => ThinkingEffort::Low,
-		ReasoningEffort::Medium => ThinkingEffort::Medium,
-		ReasoningEffort::High => ThinkingEffort::High,
-		ReasoningEffort::Xhigh => ThinkingEffort::XHigh,
-		ReasoningEffort::Max => ThinkingEffort::Max,
-	};
 	context
 		.policy
 		.reasoning
 		.effort_map
-		.get(&thinking)
+		.get(&effort)
 		.and_then(|value| parse_reasoning_effort(value))
 		.unwrap_or(canonical)
 }
@@ -4718,6 +4744,15 @@ mod tests {
 		options: OpenAiResponsesOptions,
 		build: impl FnOnce(&RouteDef, &WireTarget) -> ChatRequest,
 	) -> Result<EncodedResponses, ResponsesEncodeError> {
+		try_encode_with_thinking(policy, options, None, build)
+	}
+
+	fn try_encode_with_thinking(
+		policy: &policy::WirePolicy,
+		options: OpenAiResponsesOptions,
+		thinking: Option<(&omp_catalog::ThinkingPolicy, &omp_catalog::ThinkingSelection)>,
+		build: impl FnOnce(&RouteDef, &WireTarget) -> ChatRequest,
+	) -> Result<EncodedResponses, ResponsesEncodeError> {
 		let catalog = Catalog::embedded();
 		let model = catalog
 			.models()
@@ -4756,6 +4791,8 @@ mod tests {
 			route,
 			target: Some(&target),
 			policy,
+			thinking_policy: thinking.map(|(policy, _)| policy),
+			thinking_selection: thinking.map(|(_, selection)| selection),
 			..EncodeContext::default()
 		};
 		OpenAiResponsesCodec::new(options).encode_chat(&context, &request)
@@ -5171,6 +5208,66 @@ mod tests {
 				.iter()
 				.any(|value| value == "reasoning.encrypted_content")
 		);
+	}
+
+	fn reasoning_request(effort: ReasoningEffort) -> ChatRequest {
+		let mut request = empty_chat_request();
+		request.reasoning = Setting::Prefer(ReasoningRequest {
+			visibility:          ReasoningVisibility::Visible,
+			effort:              Some(effort),
+			max_tokens:          None,
+			preserve_signatures: true,
+		});
+		request
+	}
+
+	/// Encodes `effort` against a gpt-5-shaped ladder (`minimal..high`, off
+	/// allowed, no `reasoning-disable-mode`) through the planner's resolution.
+	fn encode_on_four_tier_ladder(
+		policy: &policy::WirePolicy,
+		effort: ReasoningEffort,
+	) -> Option<serde_json::Value> {
+		let thinking = omp_catalog::ThinkingPolicy::new(omp_catalog::ThinkingMode::Effort, [
+			ThinkingEffort::Minimal,
+			ThinkingEffort::Low,
+			ThinkingEffort::Medium,
+			ThinkingEffort::High,
+		])
+		.expect("valid ladder");
+		let selection = omp_catalog::ThinkingRouting::default()
+			.resolve(&thinking, Some(effort.into()), omp_catalog::WireModelId::from_ref("gpt-5"))
+			.expect("ladder resolves every canonical effort");
+		let encoded = try_encode_with_thinking(
+			policy,
+			OpenAiResponsesOptions::default(),
+			Some((&thinking, &selection)),
+			|_, _| reasoning_request(effort),
+		)
+		.expect("request encodes");
+		encoded
+			.request
+			.reasoning
+			.as_ref()
+			.map(|reasoning| serde_json::to_value(reasoning).expect("reasoning serializes"))
+	}
+
+	#[test]
+	fn effort_outside_catalog_efforts_is_clamped_not_sent() {
+		// pi: `reasoning.effort` is the catalog-mapped effort, and `none` is
+		// only a wire value where `reasoning-disable-mode "none-effort"`
+		// says so (gpt-5.6); gpt-5 400s on it. Above the ladder clamps to
+		// the ceiling; off sends no effort and no summary at all.
+		let policy = policy::WirePolicy::baseline();
+		let xhigh = encode_on_four_tier_ladder(&policy, ReasoningEffort::Xhigh).expect("reasoning");
+		assert_eq!(xhigh.get("effort"), Some(&serde_json::json!("high")));
+		assert_eq!(xhigh.get("summary"), Some(&serde_json::json!("auto")));
+		let off = encode_on_four_tier_ladder(&policy, ReasoningEffort::Off);
+		assert_eq!(off, None, "reasoning-off without a catalog spelling sends nothing");
+
+		let mut none_effort = policy::WirePolicy::baseline();
+		none_effort.reasoning.disable_mode = Some(policy::ReasoningDisableMode::NoneEffort);
+		let off = encode_on_four_tier_ladder(&none_effort, ReasoningEffort::Off).expect("reasoning");
+		assert_eq!(off.get("effort"), Some(&serde_json::json!("none")));
 	}
 
 	#[test]

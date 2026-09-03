@@ -156,6 +156,11 @@ where
 		&self.planner
 	}
 
+	/// Borrows the metadata used by subsequent side-effect-free plans.
+	pub const fn call_meta(&self) -> &CallMeta {
+		&self.meta
+	}
+
 	/// Replaces metadata used by subsequent side-effect-free plans.
 	pub fn set_call_meta(&mut self, meta: CallMeta) {
 		self.meta = meta;

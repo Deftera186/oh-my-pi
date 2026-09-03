@@ -105,6 +105,7 @@ struct ExecutionState {
 	session_completion:      Mutex<Option<Arc<dyn session::SessionCompletion>>>,
 	attempt_started:         Mutex<Vec<Instant>>,
 	structured_output_valid: AtomicBool,
+	retry_sink:              Mutex<Option<retry::RetrySink>>,
 }
 
 impl ExecutionContext {
@@ -136,7 +137,23 @@ impl ExecutionContext {
 			session_completion: Mutex::new(None),
 			attempt_started: Mutex::new(Vec::new()),
 			structured_output_valid: AtomicBool::new(false),
+			retry_sink: Mutex::new(None),
 		}))
+	}
+
+	/// Installs the observer that receives same-route retry notices for this
+	/// execution; `None` leaves retries silent.
+	pub fn set_retry_sink(&self, sink: Option<retry::RetrySink>) {
+		*self.0.retry_sink.lock() = sink;
+	}
+
+	/// Publishes one retry notice to the installed observer, if any. The sink
+	/// is invoked outside the lock so it may re-enter the context.
+	pub fn notify_retry(&self, notice: retry::RetryNotice) {
+		let sink = self.0.retry_sink.lock().clone();
+		if let Some(sink) = sink {
+			sink(notice);
+		}
 	}
 
 	/// Returns the immutable configured budget.
