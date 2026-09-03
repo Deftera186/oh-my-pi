@@ -27,6 +27,9 @@ pub enum HeadlessError {
 	/// Artifact storage could not be opened.
 	#[error("artifact storage operation failed")]
 	Blob(#[from] omp_journal::blob::Error),
+	/// `sv_interrupt_grace` does not fit the platform timer.
+	#[error("configured interrupt grace is not representable")]
+	InterruptGrace(#[from] omp_core::DurationError),
 	/// The requested model selector was not present in the catalog.
 	#[error("unknown model `{selector}`")]
 	UnknownModel {

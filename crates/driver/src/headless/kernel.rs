@@ -96,23 +96,63 @@ impl ProductionInference {
 			self.client.set_call_meta(meta);
 			self.model = key;
 		}
-		let thinking = omp_con::AI_THINKING.get(&self.con);
-		let reasons = self
-			.catalog
-			.model(&self.model)
-			.is_some_and(|spec| spec.thinking.is_some());
-		if reasons
-			&& let Ok(effort) = thinking.as_str().parse::<omp_catalog::ReasoningEffort>()
-			&& matches!(request.reasoning, omp_inference::Setting::Unset)
-		{
-			request.reasoning = omp_inference::Setting::Prefer(omp_inference::ReasoningRequest {
-				visibility:          omp_inference::ReasoningVisibility::Visible,
-				effort:              Some(effort),
-				max_tokens:          None,
-				preserve_signatures: true,
-			});
+		if matches!(request.reasoning, omp_inference::Setting::Unset) {
+			let thinking = omp_con::AI_THINKING.get(&self.con);
+			request.reasoning = convar_reasoning(self.catalog.as_ref(), &self.model, &thinking);
 		}
 	}
+}
+
+/// Translates the `ai_thinking` convar into the canonical reasoning request
+/// the catalog allows for `model` (ADR 0017: code branches on compiled
+/// capabilities, never on model names).
+///
+/// The model's thinking policy and routing decide through
+/// [`omp_catalog::ThinkingRouting::resolve`]: an effort above the ladder
+/// clamps to the model ceiling, one between rungs clamps down, and `off` on a
+/// model that cannot stop reasoning falls back to the catalog's default level
+/// (or stays unset so the router applies `ai_default_thinking`). Models
+/// without a thinking policy never carry a reasoning request; codecs then
+/// spell the resolved effort per route (ADR 0022: one canonical request).
+fn convar_reasoning(
+	catalog: &omp_catalog::snapshot::Catalog,
+	model: &omp_catalog::ModelKey<str>,
+	thinking: &str,
+) -> omp_inference::Setting<omp_inference::ReasoningRequest> {
+	let Some(spec) = catalog.model(model) else {
+		return omp_inference::Setting::Unset;
+	};
+	let Some(policy) = spec
+		.thinking
+		.as_ref()
+		.and_then(|id| catalog.thinking_policy(id))
+	else {
+		return omp_inference::Setting::Unset;
+	};
+	let requested = match thinking.parse::<omp_catalog::ReasoningEffort>() {
+		Ok(effort) => omp_catalog::ThinkingEffort::from(effort),
+		Err(_) => {
+			tracing::warn!(value = thinking, "ai_thinking is not a reasoning effort; ignored");
+			return omp_inference::Setting::Unset;
+		},
+	};
+	let wire_model = omp_catalog::WireModelId::from_ref(model.as_str());
+	let effort = match spec
+		.thinking_routing
+		.resolve(policy, Some(requested), wire_model)
+	{
+		Ok(selection) => selection.effort,
+		Err(_) => match policy.default_level {
+			Some(level) => level,
+			None => return omp_inference::Setting::Unset,
+		},
+	};
+	omp_inference::Setting::Prefer(omp_inference::ReasoningRequest {
+		visibility:          omp_inference::ReasoningVisibility::Visible,
+		effort:              Some(effort.into()),
+		max_tokens:          None,
+		preserve_signatures: true,
+	})
 }
 
 #[derive(Clone)]
@@ -169,8 +209,28 @@ impl ExternalToolExecutor for EnvToolExecutor {
 				});
 				return;
 			}
+			// ADR 0011: the stop request is forwarded to the environment, which
+			// interrupts the unit (TERM, `sv_interrupt_grace`, KILL) and reports
+			// the unit's own verdict; the dispatcher bounds how long that report
+			// may take. Dropping this stream cancels the request as well.
+			let mut interrupted = false;
 			loop {
-				match invocation.next_event().await {
+				let next = tokio::select! {
+					biased;
+					() = request.cancellation.cancelled(), if !interrupted => {
+						interrupted = true;
+						if let Err(source) = invocation.interrupt(Str::new_static("interrupted")).await {
+							tracing::warn!(%source, call_id = %request.call_id, "environment tool interrupt failed");
+							yield ExternalDispatchEvent::Aborted(Abort::EffectsUnknown {
+								reason: Str::new_static("environment tool interrupt failed"),
+							});
+							return;
+						}
+						continue;
+					},
+					next = invocation.next_event() => next,
+				};
+				match next {
 					Ok(Some(omp_env::InvocationEvent::Accepted(_))) => {},
 					Ok(Some(omp_env::InvocationEvent::Admission(query))) => {
 						if let Err(source) = invocation.admit(omp_env::frame::Admission {
@@ -290,6 +350,15 @@ impl omp_agent::Inference for ProductionInference {
 		self.apply_convars(&mut request);
 		self.client.execute(request)
 	}
+
+	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
+		// Both the launch metadata (the base every `ai_model` re-target copies)
+		// and the client's live copy carry the sink.
+		self.meta.response_hooks = self.meta.response_hooks.clone().with_retry_sink(sink);
+		let mut live = self.client.call_meta().clone();
+		live.response_hooks = self.meta.response_hooks.clone();
+		self.client.set_call_meta(live);
+	}
 }
 
 /// Inference selected by one headless invocation.
@@ -316,6 +385,36 @@ impl ComposedInference {
 			Self::Gateway { _environment, .. } => _environment.client(),
 		}
 	}
+
+	/// Borrows the project environment retained by this composition (MCP
+	/// inspection, extension reload).
+	#[must_use]
+	pub const fn environment(&self) -> &omp_envd::ProjectEnvironment {
+		match self {
+			Self::Production(inference) => &inference._environment,
+			Self::Gateway { _environment, .. } => _environment,
+		}
+	}
+
+	/// Borrows the production authentication and usage stack; `None` behind
+	/// a remote gateway, whose credentials live on the gateway host.
+	#[must_use]
+	pub const fn production_stack(&self) -> Option<&ProductionStack> {
+		match self {
+			Self::Production(inference) => Some(&inference._stack),
+			Self::Gateway { .. } => None,
+		}
+	}
+
+	/// Catalog snapshot the composition routes through; `None` behind a
+	/// remote gateway.
+	#[must_use]
+	pub const fn catalog(&self) -> Option<&Arc<omp_catalog::snapshot::Catalog>> {
+		match self {
+			Self::Production(inference) => Some(&inference.catalog),
+			Self::Gateway { .. } => None,
+		}
+	}
 }
 
 impl omp_agent::Inference for ComposedInference {
@@ -328,6 +427,13 @@ impl omp_agent::Inference for ComposedInference {
 				Self::Production(inference) => inference.chat(request).await,
 				Self::Gateway { inference, .. } => inference.chat(request).await,
 			}
+		}
+	}
+
+	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
+		match self {
+			Self::Production(inference) => inference.install_retry_sink(sink),
+			Self::Gateway { inference, .. } => inference.install_retry_sink(sink),
 		}
 	}
 }
@@ -492,7 +598,14 @@ pub async fn compose_kernel(
 
 	let prompt = CanonicalPromptSource;
 	let spill = omp_journal::blob::BlobStore::open(data_dir.join("artifacts"))?;
-	let policy = DispatchPolicy::new(spill);
+	// The environment applies `sv_interrupt_grace` between TERM and KILL; the
+	// dispatcher grants that courtesy plus one second for the unit's verdict
+	// to travel back before it forces the call closed as effects-unknown.
+	let unit_grace = omp_envd::host_settings::SV_INTERRUPT_GRACE
+		.get(&ctx)
+		.to_std()?;
+	let policy = DispatchPolicy::new(spill)
+		.with_interrupt_grace(unit_grace.saturating_add(Duration::from_secs(1)));
 	let mut kernel = Kernel::new(inference, registry, policy, prompt)
 		.with_director_registry(director_registry)
 		.with_external_executor(external)
@@ -530,6 +643,121 @@ pub async fn compose_kernel(
 			.with_session_tool(Arc::new(crate::subagent::hub::HubSessionTool::new()));
 	}
 	Ok((kernel, session, prompt))
+}
+
+/// Facts fixed at composition that in-chat session switches (`/new`,
+/// `/resume`, `/fork`, `/drop`) reuse: where journals live, which project
+/// and model the prompt facts name, and the live-session routing index the
+/// switched-in session registers with.
+#[derive(Clone)]
+pub struct SessionHome {
+	/// Directory holding this project's `.oms` journals.
+	pub sessions_dir: PathBuf,
+	/// Canonical project root recorded in prompt facts.
+	pub project_root: PathBuf,
+	/// Resolved model key recorded in prompt facts.
+	pub model:        Str,
+	/// Process-local live-session routing authority.
+	pub live:         Arc<crate::sessions::SessionRegistry>,
+	/// The kernel's upward mailbox, shared by every session it drives.
+	pub up:           flume::Sender<omp_agent::Up>,
+}
+
+impl SessionHome {
+	/// Resolves the session directory exactly as [`compose_kernel`] does.
+	pub fn new(
+		data_dir: &Path,
+		project_root: &Path,
+		options: &KernelOptions,
+		model: Str,
+		up: flume::Sender<omp_agent::Up>,
+	) -> Result<Self, HeadlessError> {
+		let project_root = fs::canonicalize(project_root)?;
+		let state_dir = omp_env::project_state::directory(data_dir, &project_root)?;
+		let sessions_dir = options
+			.sessions_dir
+			.clone()
+			.unwrap_or_else(|| state_dir.join("sessions"));
+		fs::create_dir_all(&sessions_dir)?;
+		let live = options
+			.sessions
+			.clone()
+			.unwrap_or_else(|| Arc::new(crate::sessions::SessionRegistry::new()));
+		Ok(Self { sessions_dir, project_root, model, live, up })
+	}
+
+	/// Path of a fresh journal in the session directory.
+	#[must_use]
+	pub fn fresh_path(&self) -> PathBuf {
+		self.sessions_dir.join(format!("{}.oms", Ulid::generate()))
+	}
+
+	/// Creates a new journal at `path` (or a fresh one), installs the prompt
+	/// facts, and registers it as the live session.
+	pub fn create(&self, path: Option<PathBuf>) -> Result<Session, HeadlessError> {
+		let path = path.unwrap_or_else(|| self.fresh_path());
+		if let Some(parent) = path.parent() {
+			fs::create_dir_all(parent)?;
+		}
+		let mut session = Session::create(&path, ComponentRegistry::standard())?;
+		install_prompt_facts(&mut session, &self.project_root, self.model.as_str())?;
+		self.register(&session);
+		Ok(session)
+	}
+
+	/// Opens an existing journal and registers it as the live session.
+	pub fn open(&self, path: &Path) -> Result<Session, HeadlessError> {
+		let path = resolve_session_path(&self.sessions_dir, path);
+		let session = Session::open(&path, ComponentRegistry::standard())?;
+		self.register(&session);
+		Ok(session)
+	}
+
+	/// Copies `source` to a fresh journal and opens the copy: the whole
+	/// branch tree travels with the fork (the journal is the tree).
+	pub fn fork(&self, source: &Path) -> Result<Session, HeadlessError> {
+		let path = self.fresh_path();
+		fs::copy(source, &path)?;
+		self.open(&path)
+	}
+
+	/// Registers (or re-registers) `session` under its journal stem.
+	pub fn register(&self, session: &Session) {
+		let id = session
+			.journal_path()
+			.file_stem()
+			.and_then(|name| name.to_str())
+			.map_or_else(|| Str::new(Ulid::generate().to_string()), Str::new);
+		self.live.register(id.clone(), crate::sessions::KernelHandle {
+			id:       crate::sessions::SessionId::new(id.clone()),
+			name:     id,
+			up:       self.up.clone(),
+			snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
+		});
+	}
+
+	/// Removes `session`'s journal from the live index (before its file is
+	/// deleted or the process switches away).
+	pub fn unregister(&self, session: &Session) {
+		if let Some(id) = session
+			.journal_path()
+			.file_stem()
+			.and_then(|name| name.to_str())
+		{
+			self.live.remove(crate::sessions::SessionId::from_ref(id));
+		}
+	}
+}
+
+/// Resolves a session selector the way `--resume` does: a bare id is a
+/// stem in the session directory, anything with a directory or extension
+/// is a path.
+fn resolve_session_path(sessions_dir: &Path, path: &Path) -> PathBuf {
+	if path.components().count() > 1 || path.extension().is_some() {
+		path.to_path_buf()
+	} else {
+		sessions_dir.join(path).with_extension("oms")
+	}
 }
 
 fn resolve_model_selector(
@@ -600,4 +828,170 @@ fn install_prompt_facts(
 		}],
 	})?;
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use omp_catalog::{
+		ModelKey, ReasoningEffort, ThinkingEffort, ThinkingPolicy, WireTarget, snapshot::Catalog,
+	};
+	use omp_inference::{
+		ChatRequest, NegotiationPolicy, RequestId, Sampling, Setting,
+		codec::{
+			EncodeContext,
+			openai_responses::{OpenAiResponsesCodec, OpenAiResponsesOptions},
+		},
+	};
+
+	use super::convar_reasoning;
+
+	const GPT5: &str = "openai/gpt-5";
+
+	fn gpt5_policy(catalog: &Catalog) -> &ThinkingPolicy {
+		let spec = catalog
+			.model(ModelKey::from_ref(GPT5))
+			.expect("embedded gpt-5");
+		catalog
+			.thinking_policy(spec.thinking.as_ref().expect("gpt-5 reasons"))
+			.expect("gpt-5 thinking policy")
+	}
+
+	fn effort(setting: &Setting<omp_inference::ReasoningRequest>) -> Option<ReasoningEffort> {
+		match setting {
+			Setting::Unset => None,
+			Setting::Require(value) | Setting::Prefer(value) => value.effort,
+		}
+	}
+
+	/// Lowers the convar-derived request for gpt-5 through the planner's
+	/// thinking resolution and the Responses codec, exactly as a live call
+	/// would, and returns the serialized `reasoning` object.
+	fn gpt5_wire_reasoning(catalog: &Catalog, thinking: &str) -> Option<serde_json::Value> {
+		let key = ModelKey::from_ref(GPT5);
+		let spec = catalog.model(key).expect("embedded gpt-5");
+		let policy = gpt5_policy(catalog);
+		let route = spec
+			.routes
+			.iter()
+			.filter_map(|route| catalog.route(route))
+			.find(|route| route.codec.as_str() == "openai-responses")
+			.expect("gpt-5 Responses route");
+		let wire_model = spec
+			.wire_ids
+			.iter()
+			.find(|(candidate, _)| candidate == &route.id)
+			.expect("gpt-5 wire id")
+			.1
+			.clone();
+		let wire_policy = catalog
+			.wire_policy(&spec.wire_policy)
+			.expect("gpt-5 wire policy");
+		let request = ChatRequest {
+			messages:          Arc::from([]),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Unset,
+			output:            Setting::Unset,
+			reasoning:         convar_reasoning(catalog, key, thinking),
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Sampling::default(),
+			max_output_tokens: None,
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+		};
+		let selection = effort(&request.reasoning).map(|effort| {
+			spec
+				.thinking_routing
+				.resolve(policy, Some(effort.into()), &wire_model)
+				.expect("convar effort resolves against the catalog")
+		});
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		};
+		let request_id = RequestId::new("convar-thinking");
+		let context = EncodeContext {
+			request_id: &request_id,
+			route,
+			target: Some(&target),
+			policy: wire_policy,
+			thinking_policy: Some(policy),
+			thinking_selection: selection.as_ref(),
+			..EncodeContext::default()
+		};
+		let encoded = OpenAiResponsesCodec::new(OpenAiResponsesOptions::default())
+			.encode_chat(&context, &request)
+			.expect("gpt-5 request encodes");
+		encoded
+			.request
+			.reasoning
+			.as_ref()
+			.map(|reasoning| serde_json::to_value(reasoning).expect("reasoning serializes"))
+	}
+
+	#[test]
+	fn ai_thinking_off_never_sends_none_to_a_model_without_off() {
+		let catalog = Catalog::embedded();
+		let policy = gpt5_policy(catalog);
+		assert!(
+			!policy.efforts.contains(&ThinkingEffort::Off)
+				&& policy.efforts.contains(&ThinkingEffort::Minimal),
+			"gpt-5 ladder is minimal..high with no wire `none`: {:?}",
+			policy.efforts
+		);
+		let reasoning = gpt5_wire_reasoning(catalog, "off");
+		let effort = reasoning
+			.as_ref()
+			.and_then(|reasoning| reasoning.get("effort"))
+			.cloned();
+		assert_eq!(effort, None, "reasoning-off must not spell an effort: {reasoning:?}");
+	}
+
+	#[test]
+	fn ai_thinking_above_the_ladder_clamps_to_the_catalog_ceiling() {
+		let catalog = Catalog::embedded();
+		let request = convar_reasoning(catalog, ModelKey::from_ref(GPT5), "xhigh");
+		assert_eq!(effort(&request), Some(ReasoningEffort::High));
+		let reasoning = gpt5_wire_reasoning(catalog, "xhigh").expect("reasoning object");
+		assert_eq!(reasoning.get("effort"), Some(&serde_json::json!("high")));
+	}
+
+	#[test]
+	fn ai_thinking_off_on_a_model_that_requires_effort_uses_the_catalog_default() {
+		let catalog = Catalog::embedded();
+		let (spec, policy) = catalog
+			.models()
+			.iter()
+			.find_map(|spec| {
+				let policy = catalog.thinking_policy(spec.thinking.as_ref()?)?;
+				(policy.requires_effort == Some(true)).then_some((spec, policy))
+			})
+			.expect("embedded catalog has a model that cannot stop reasoning");
+		assert!(!policy.supports(ThinkingEffort::Off));
+		let request = convar_reasoning(catalog, &spec.key, "off");
+		assert_eq!(
+			effort(&request),
+			policy.default_level.map(ReasoningEffort::from),
+			"{}: off falls back to the catalog default level",
+			spec.key
+		);
+	}
+
+	#[test]
+	fn ai_thinking_without_a_thinking_policy_leaves_reasoning_unset() {
+		let catalog = Catalog::embedded();
+		let spec = catalog
+			.models()
+			.iter()
+			.find(|spec| spec.thinking.is_none())
+			.expect("embedded catalog has a non-reasoning model");
+		assert!(matches!(convar_reasoning(catalog, &spec.key, "high"), Setting::Unset));
+	}
 }

@@ -130,6 +130,36 @@ pub struct StoredSession {
 	pub created:    Str,
 	/// Journal file modification time in Unix milliseconds.
 	pub updated_ms: u64,
+	/// First line of the first user prompt, when the session has one.
+	pub title:      Option<Str>,
+}
+
+impl StoredSession {
+	/// Human label for pickers and the welcome box: the first prompt's first
+	/// line, else the session id.
+	#[must_use]
+	pub fn display_name(&self) -> Str {
+		self.title.clone().unwrap_or_else(|| self.id.clone())
+	}
+}
+
+/// First non-empty line of the earliest `msg.user@1` entry, control
+/// characters stripped.
+fn first_prompt_title(entries: &[omp_journal::Entry]) -> Option<Str> {
+	let user = omp_journal::Kind::known(omp_journal::KindName::MsgUser);
+	entries
+		.iter()
+		.filter(|entry| entry.kind == user)
+		.find_map(|entry| {
+			let payload: omp_journal::data::MsgUser = serde_json::from_str(entry.data.as_str()).ok()?;
+			let line = payload.text.lines().next()?;
+			let clean = line
+				.chars()
+				.filter(|character| !character.is_control())
+				.collect::<String>();
+			let clean = clean.trim();
+			(!clean.is_empty()).then(|| Str::new(clean))
+		})
 }
 
 /// Disposable in-memory lookup rebuilt by scanning `.oms` genesis frames.
@@ -180,12 +210,14 @@ impl SessionIndex {
 				.as_millis()
 				.try_into()
 				.unwrap_or(u64::MAX);
+			let title = first_prompt_title(&entries);
 			rows.insert(Str::new(stem), StoredSession {
 				id: Str::new(stem),
 				path,
 				cwd: payload.cwd,
 				created: payload.created,
 				updated_ms,
+				title,
 			});
 		}
 		*self.by_id.write() = rows;
@@ -208,6 +240,16 @@ impl SessionIndex {
 				.cmp(&left.updated_ms)
 				.then_with(|| left.id.cmp(&right.id))
 		});
+		rows
+	}
+
+	/// The newest `limit` sessions other than the journal at `exclude`, for
+	/// the welcome box's recent-session rows.
+	#[must_use]
+	pub fn recent(&self, exclude: Option<&Path>, limit: usize) -> Vec<StoredSession> {
+		let mut rows = self.list();
+		rows.retain(|row| exclude.is_none_or(|exclude| row.path != exclude));
+		rows.truncate(limit);
 		rows
 	}
 }
@@ -244,5 +286,73 @@ impl SessionAuthority for SessionRegistry {
 			.into_iter()
 			.map(|handle| handle.endpoint())
 			.collect()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::{Duration, SystemTime};
+
+	use omp_journal::{EntryDraft, Journal, Kind, KindName};
+
+	use super::*;
+
+	fn write_journal(root: &Path, stem: &str, prompt: Option<&str>, age: Duration) -> PathBuf {
+		let path = root.join(format!("{stem}.{}", omp_journal::FILE_EXTENSION));
+		let mut journal = Journal::create(&path).expect("create journal");
+		let genesis = journal
+			.append(EntryDraft {
+				kind:  Kind::known(KindName::Journal),
+				by:    None,
+				prior: None,
+				label: None,
+				data:  Str::new(r#"{"version":1,"cwd":"/w","created":"2026-01-01T00:00:00Z"}"#),
+			})
+			.expect("genesis");
+		if let Some(prompt) = prompt {
+			let payload = serde_json::json!({ "text": prompt }).to_string();
+			journal
+				.append(EntryDraft {
+					kind:  Kind::known(KindName::MsgUser),
+					by:    Some(genesis.id),
+					prior: None,
+					label: None,
+					data:  Str::new(payload),
+				})
+				.expect("prompt");
+		}
+		drop(journal);
+		let modified = SystemTime::now() - age;
+		fs::File::options()
+			.write(true)
+			.open(&path)
+			.expect("reopen")
+			.set_modified(modified)
+			.expect("set mtime");
+		path
+	}
+
+	#[test]
+	fn recent_orders_newest_first_and_excludes_the_open_journal() {
+		let scratch = tempfile::tempdir().expect("tempdir");
+		let root = scratch.path();
+		let oldest = write_journal(root, "old", Some("  Fix the parser\nsecond line"), Duration::from_secs(300));
+		let current = write_journal(root, "current", Some("live prompt"), Duration::from_secs(0));
+		let middle = write_journal(root, "mid", None, Duration::from_secs(60));
+		let control = write_journal(root, "ctl", Some("\u{7}\t\n"), Duration::from_secs(120));
+
+		let index = SessionIndex::open(root).expect("index");
+		let recent = index.recent(Some(&current), 2);
+		assert_eq!(
+			recent.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+			[middle.clone(), control.clone()]
+		);
+		assert_eq!(recent[0].display_name().as_str(), "mid", "no prompt falls back to the id");
+		assert_eq!(recent[1].display_name().as_str(), "ctl", "control-only prompt falls back to the id");
+
+		let all = index.recent(Some(&current), 8);
+		assert_eq!(all.iter().map(|row| row.path.clone()).collect::<Vec<_>>(), [middle, control, oldest]);
+		assert_eq!(all[2].display_name().as_str(), "Fix the parser");
+		assert!(index.recent(None, 8).iter().any(|row| row.path == current));
 	}
 }
