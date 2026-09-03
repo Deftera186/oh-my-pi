@@ -9,6 +9,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
+import { subprocessToolRegistry } from "@oh-my-pi/pi-coding-agent/task/subprocess-tool-registry";
 import { arrayValuedLabels } from "../../src/task/yield-assembly";
 
 function createSession(overrides: Partial<ToolSession> = {}): ToolSession {
@@ -115,6 +116,31 @@ describe("YieldTool", () => {
 			status: "success",
 			error: undefined,
 		});
+	});
+
+	it("defers steering for every terminal yield, including array-typed error submissions", async () => {
+		const handler = subprocessToolRegistry.getHandler("yield");
+		if (!handler?.shouldTerminate) throw new Error("yield subprocess handler must register shouldTerminate");
+		const shouldTerminate = handler.shouldTerminate;
+		const cases: Array<{ label: string; args: Record<string, unknown> }> = [
+			{ label: "array-typed error", args: { type: ["findings"], result: { error: "blocked" } } },
+			{ label: "array-typed success section", args: { type: ["findings"], result: { data: "one finding" } } },
+			{ label: "string-typed terminal success", args: { type: "summary", result: { data: { ok: true } } } },
+			{ label: "untyped terminal success", args: { result: { data: { ok: true } } } },
+		];
+		for (const { label, args } of cases) {
+			const tool = new YieldTool(createSession());
+			const result = await tool.execute(`call-${label}`, args as never);
+			const terminal = shouldTerminate({
+				toolName: "yield",
+				toolCallId: `call-${label}`,
+				result: { content: result.content, details: result.details },
+				isError: result.isError,
+			});
+			// A queued steering skip must fire only for a call the registry treats
+			// as non-terminal — otherwise the parent never receives the outcome.
+			expect({ label, defer: tool.deferSteering(args) }).toEqual({ label, defer: terminal });
+		}
 	});
 
 	it("accepts aborted payload with error only", async () => {
