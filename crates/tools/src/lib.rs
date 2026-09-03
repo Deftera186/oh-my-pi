@@ -32,6 +32,7 @@ const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 	BuiltinToolIdentity { name: "bash", hidden: false },
 	BuiltinToolIdentity { name: "eval", hidden: false },
 	BuiltinToolIdentity { name: "todo", hidden: false },
+	BuiltinToolIdentity { name: "task", hidden: false },
 	BuiltinToolIdentity { name: "ask", hidden: false },
 	BuiltinToolIdentity { name: "hub", hidden: false },
 	BuiltinToolIdentity { name: "github", hidden: false },
@@ -84,7 +85,6 @@ pub mod staging;
 /// `if`, and `match` control flow (see [`render::view`]).
 pub use omp_macros::view;
 pub use render::{BuiltinRendererIdentities, live_renderers, register_builtin_renderers};
-pub use settings::SETTINGS_CONTRIBUTION;
 
 /// Revisioned project debugger tool.
 pub mod debug;
@@ -130,6 +130,8 @@ pub mod shell;
 pub mod shell_intercept;
 /// Internal-resource URI scanner used before environment execution.
 pub mod shell_uri;
+/// Child-agent runs over an injected host-side spawner.
+pub mod task;
 /// Private no-op reasoning scratch notes.
 pub mod think;
 /// Phased session task tracking.

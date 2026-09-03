@@ -352,8 +352,20 @@ pub struct Payload {
 }
 
 /// Formatting requested of the document transaction coordinator.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::EnumString,
+	strum::IntoStaticStr,
+	strum::VariantNames,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum FormatPolicy {
 	/// Never invoke a formatter.
 	Disabled,
@@ -369,6 +381,8 @@ impl Default for FormatPolicy {
 		Self::BestEffort
 	}
 }
+
+omp_con::con_enum!(FormatPolicy);
 
 /// Stale-base behavior requested of the transaction coordinator.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -459,6 +459,16 @@ fn fixture_path(relative: &str) -> PathBuf {
 	Path::new(FIXTURE_ROOT).join(relative)
 }
 
+#[tokio::test]
+async fn protocol_intent_is_not_deserialized_as_a_read_parameter() {
+	let sources = Sources::default();
+	sources.file("intent.txt", "intent survives");
+	assert_eq!(
+		text(sources, r#"{"i":"Reading intent fixture","path":"intent.txt:raw"}"#,).await,
+		"intent survives",
+	);
+}
+
 #[test]
 fn generated_schema_is_semantically_the_pi_read_schema() {
 	let tool = read::tool(Sources::default(), Blobs::default());
@@ -474,11 +484,15 @@ fn generated_schema_is_semantically_the_pi_read_schema() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["path"],
+			"required": ["i", "path"],
 			"properties": {
 				"path": {
 					"type": "string",
 					"description": "Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."
+				},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
 				}
 			}
 		})

@@ -179,10 +179,14 @@ fn generated_schema_definition_and_revision_are_exact() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["path", "content"],
+			"required": ["i", "path", "content"],
 			"properties": {
 				"path": {"type": "string", "description": "file path"},
-				"content": {"type": "string", "description": "file content"}
+				"content": {"type": "string", "description": "file content"},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
+				}
 			}
 		})
 	);

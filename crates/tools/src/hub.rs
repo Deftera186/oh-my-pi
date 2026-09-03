@@ -222,8 +222,13 @@ pub struct Fault {
 	pub message: Str,
 }
 
-/// Injected app composition over the agent broker, job board, and env process
-/// host.
+/// Injected host composition over authoritative session trees, the runtime job
+/// index, and the environment process host.
+///
+/// Peer and job implementations must read `<meta><jobs>` and write peer
+/// messages as target-session `<queues><steering>` patches. The backend may
+/// cache handles for execution, but must rebuild that index from the DOM after
+/// open or rewind; it must not maintain a second durable peer/job registry.
 ///
 /// `execute` owns the multi-source wait race. It must check the bounded inbox
 /// before subscribing, preserve unrelated FIFO messages, prioritize a peer
@@ -237,8 +242,8 @@ pub struct Fault {
 /// queued facts.
 pub trait HubBackend: Send + Sync + 'static {
 	/// Executes one fully validated request for an authenticated invocation
-	/// owner. The backend resolves that owner to its broker inbox, job board,
-	/// completion lease, and environment process client.
+	/// owner. The backend resolves that owner to its session queues, DOM-derived
+	/// job board, completion lease, and environment process client.
 	fn execute<'a>(
 		&'a self,
 		caller_id: &'a str,
@@ -308,28 +313,32 @@ pub struct Hub<B> {
 	spec:    ToolSpec,
 }
 
+/// Returns the canonical `hub@1` declaration shared by registry advertisement
+/// and session-owned execution.
+#[must_use]
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("hub"),
+		rev:             Rev { family: Default::default(), n: 1 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
+		},
+		effects:         Effects::default(),
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("hub.rs"),
+		)
+		.into(),
+	}
+}
+
 /// Constructs `hub@1` over the per-agent broker/process composition.
 pub fn tool<B: HubBackend>(backend: B) -> Hub<B> {
-	Hub {
-		backend,
-		spec: ToolSpec {
-			name:            sf!("hub"),
-			rev:             Rev { family: Default::default(), n: 1 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects::default(),
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("hub.rs"),
-			)
-			.into(),
-		},
-	}
+	Hub { backend, spec: spec() }
 }
 
 impl<B: HubBackend> Tool for Hub<B> {

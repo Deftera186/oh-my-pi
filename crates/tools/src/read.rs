@@ -625,7 +625,7 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 				Err(ParamError::Interrupted(interrupt)) => { yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }); return; },
 				Err(ParamError::Protocol(reason)) => { yield Ev::Args(protocol_issue(reason)); return; },
 			};
-			let params: Params = if let Ok(value) = serde_json::from_str(&raw) { value } else { yield Ev::Args(args_issue()); return; };
+			let params: Params = if let Ok(value) = omp_tool::decode_params(&raw) { value } else { yield Ev::Args(args_issue()); return; };
 			match incoming.committed().await {
 				Ok(_) => {},
 				Err(CommitError::Aborted) => { yield Ev::Aborted(Abort::InputDropped); return; },

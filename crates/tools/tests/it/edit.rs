@@ -219,9 +219,13 @@ fn generated_schema_is_semantically_the_pi_edit_schema() {
 		serde_json::json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["input"],
+			"required": ["i", "input"],
 			"properties": {
-				"input": {"type": "string"}
+				"input": {"type": "string"},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
+				}
 			}
 		})
 	);

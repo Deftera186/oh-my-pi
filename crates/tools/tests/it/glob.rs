@@ -162,6 +162,7 @@ fn schema_and_defaults_are_exact() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
+			"required": ["i"],
 			"properties": {
 				"path": {
 					"type": "string",
@@ -178,6 +179,10 @@ fn schema_and_defaults_are_exact() {
 				"limit": {
 					"type": "number",
 					"description": "max results"
+				},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
 				}
 			}
 		})

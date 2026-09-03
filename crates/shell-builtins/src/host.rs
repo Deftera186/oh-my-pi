@@ -25,10 +25,12 @@
 use std::{
 	cell::Cell,
 	ffi::OsString,
+	future::Future,
 	io::{self, BufWriter, LineWriter, Read, Write},
 	marker::PhantomData,
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
+	pin::Pin,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -39,6 +41,7 @@ use std::{
 use std::{ffi::OsStr, os::fd};
 
 use im::HashMap;
+use omp_core::Str;
 use omp_shell_engine::{
 	Error, ExecutionContext, ExecutionResult, PathPolicy, ProcessScope, ShellExtensions,
 	SpawnObserver, SpawnWrapper,
@@ -49,6 +52,73 @@ use omp_shell_engine::{
 #[cfg(test)]
 use omp_shell_engine::{OpenRequest, PathAccess, PathDenied};
 use parking_lot::Mutex;
+use serde_json::Value;
+
+/// A boxed dynamic-device host operation.
+///
+/// Device discovery and invocation are cold I/O boundaries, so one boxed
+/// future per shell command keeps the host trait object-safe without affecting
+/// interpreter hot paths.
+pub type DynFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DynFault>> + Send + 'a>>;
+
+/// One live operation advertised by the dynamic-device host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynDevice {
+	/// Canonical `namespace/tool` invocation name.
+	pub name:        Str,
+	/// Concise operation description used for discovery search.
+	pub description: Option<Str>,
+}
+
+/// The JSON schema and documentation for one dynamic operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynSchema {
+	/// Canonical `namespace/tool` invocation name.
+	pub name:        Str,
+	/// Concise operation description.
+	pub description: Option<Str>,
+	/// JSON Schema describing the operation's argument object.
+	pub schema:      Value,
+}
+
+/// A successful dynamic operation result.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DynOutput {
+	/// Plain text written directly to stdout.
+	Text(Str),
+	/// Structured output serialized as JSON on stdout.
+	Json(Value),
+}
+
+/// A host-reported operation fault rendered by the builtin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynFault {
+	/// User-facing fault detail.
+	pub message: Str,
+}
+
+impl DynFault {
+	/// Creates a fault from host-owned diagnostic text.
+	pub fn new(message: impl Into<Str>) -> Self {
+		Self { message: message.into() }
+	}
+}
+
+/// Environment capability behind the stable in-process `dyn` builtin.
+///
+/// Implementations own their catalogs and invocation authority. The shell only
+/// maps JSON schemas to CLI arguments; it never mutates the model-facing tool
+/// roster or starts an external command.
+pub trait DynHost: Send + Sync + 'static {
+	/// Returns the complete live catalog.
+	fn list(&self) -> DynFuture<'_, Vec<DynDevice>>;
+
+	/// Returns the current schema for one exact live operation.
+	fn schema(&self, name: &str) -> DynFuture<'_, DynSchema>;
+
+	/// Invokes one operation with schema-shaped JSON arguments.
+	fn call(&self, name: &str, args: Value) -> DynFuture<'_, DynOutput>;
+}
 
 /// A command-line utility implemented as a shell builtin.
 ///

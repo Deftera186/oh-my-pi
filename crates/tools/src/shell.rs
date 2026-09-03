@@ -1312,10 +1312,10 @@ mod tests {
 		);
 		let limits = ToolAssemblyLimits::default();
 		let valid = [
-			serde_json::json!({"command": "echo hi"}),
-			serde_json::json!({"command": "echo hi", "async": false}),
-			serde_json::json!({"command": "sleep 5", "async": true}),
-			serde_json::json!({"command": "make", "timeout": 0}),
+			serde_json::json!({"i": "Running shell command", "command": "echo hi"}),
+			serde_json::json!({"i": "Running shell command", "command": "echo hi", "async": false}),
+			serde_json::json!({"i": "Starting background process", "command": "sleep 5", "async": true}),
+			serde_json::json!({"i": "Running build", "command": "make", "timeout": 0}),
 		];
 		for arguments in valid {
 			assert!(
@@ -1326,7 +1326,7 @@ mod tests {
 		assert!(
 			validate_schema(
 				&schema,
-				&serde_json::json!({"command": "sleep 5", "async": true, "name": "caller-owned"}),
+				&serde_json::json!({"i": "Starting background process", "command": "sleep 5", "async": true, "name": "caller-owned"}),
 				true,
 				limits,
 			)

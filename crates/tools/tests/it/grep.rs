@@ -182,7 +182,7 @@ fn schema_is_exactly_the_pi_grep_schema() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["pattern"],
+			"required": ["i", "pattern"],
 			"properties": {
 				"pattern": {"type": "string", "description": "regex pattern"},
 				"path": {
@@ -194,6 +194,10 @@ fn schema_is_exactly_the_pi_grep_schema() {
 				"skip": {
 					"type": ["number", "null"],
 					"description": "files to skip before collecting results — use to paginate when the prior call hit the file limit"
+				},
+				"i": {
+					"type": "string",
+					"description": "Short present-participle intent for this call."
 				}
 			}
 		})

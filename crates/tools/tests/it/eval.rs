@@ -222,7 +222,7 @@ fn constructed_tool_spec_has_exact_python_only_schema() {
 		json!({
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["language", "code"],
+			"required": ["i", "language", "code"],
 			"properties": {
 				"language": {
 					"type": "string",
@@ -266,6 +266,10 @@ fn constructed_tool_spec_has_exact_python_only_schema() {
 									{"type": "null"}
 								],
 								"description": "Select a persistent kernel or an isolated one-shot process."
+							},
+							"i": {
+								"type": "string",
+								"description": "Short present-participle intent for this call."
 							}}
 		})
 	);

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use omp_shell_engine::builtins::{self, builtin};
 
 #[allow(
@@ -5,6 +7,17 @@ use omp_shell_engine::builtins::{self, builtin};
 	reason = "this module intentionally registers every sibling builtin"
 )]
 use super::*;
+use crate::host::DynHost;
+
+/// Returns the in-process `dyn` builtin bound to `host`.
+///
+/// The registration stays fixed while the host's catalog remains live, so
+/// discovery never mutates the model-facing tool roster.
+pub fn dyn_builtin<SE: omp_shell_engine::ShellExtensions>(
+	host: Arc<dyn DynHost>,
+) -> builtins::Registration<SE> {
+	r#dyn::registration(host)
+}
 
 /// Returns every in-process command-line utility builtin as
 /// `(name, registration)` pairs.

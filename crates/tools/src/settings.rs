@@ -1,15 +1,8 @@
-//! Typed settings owned by the file-tool runtime.
+//! Typed convars owned by the file-tool runtime.
 
-use omp_settings::{
-	DomainRegistration, FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
-};
+use omp_con::Ctx;
 use serde::{Deserialize, Serialize};
 
-const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
-/// Scope set matching the app root `images.*` registration
-/// (runtime-overridable).
-const PERSISTED_RUNTIME: &[SettingScope] =
-	&[SettingScope::Global, SettingScope::Project, SettingScope::Runtime];
 /// Default number of prior diagnostic identities retained for deduplication.
 pub const DEFAULT_DIAGNOSTIC_HISTORY_CAPACITY: usize = 1_024;
 /// Default maximum diagnostics retained in one committed batch.
@@ -33,6 +26,14 @@ impl Default for FetchSettings {
 	}
 }
 
+impl FetchSettings {
+	/// Projects the current fetch policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self { enabled: SV_FETCH_ENABLED.get(ctx) }
+	}
+}
+
 /// Image handling policy applied by read.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -47,12 +48,28 @@ impl Default for ImageSettings {
 	}
 }
 
+impl ImageSettings {
+	/// Projects the current image policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self { auto_resize: SV_IMAGES_AUTO_RESIZE.get(ctx) }
+	}
+}
+
 /// Text presentation policy applied by read.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ReadSettings {
 	/// Whether Markdown reads carry rendered-Markdown presentation metadata.
 	pub render_markdown: bool,
+}
+
+impl ReadSettings {
+	/// Projects the current read presentation policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self { render_markdown: CL_READ_RENDER_MARKDOWN.get(ctx) }
+	}
 }
 
 /// LSP policy captured once for a file-tool invocation.
@@ -86,6 +103,28 @@ impl Default for LspFileSettings {
 	}
 }
 
+impl LspFileSettings {
+	/// Projects the current LSP file policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			format_on_write:              SV_LSP_FORMAT_ON_WRITE.get(ctx),
+			diagnostics_on_write:         SV_LSP_DIAGNOSTICS_ON_WRITE.get(ctx),
+			diagnostics_on_edit:          SV_LSP_DIAGNOSTICS_ON_EDIT.get(ctx),
+			diagnostics_deduplicate:      SV_LSP_DIAGNOSTICS_DEDUPLICATE.get(ctx),
+			diagnostics_history_capacity: SV_LSP_DIAGNOSTICS_HISTORY_CAPACITY.get(ctx) as usize,
+			max_diagnostics_per_batch:    SV_LSP_MAX_DIAGNOSTICS_PER_BATCH.get(ctx) as usize,
+		}
+	}
+
+	/// Reports whether all LSP policy bounds hold.
+	#[must_use]
+	pub fn validate(&self) -> bool {
+		(1..=MAX_DIAGNOSTIC_HISTORY_CAPACITY).contains(&self.diagnostics_history_capacity)
+			&& (1..=MAX_DIAGNOSTICS_PER_BATCH).contains(&self.max_diagnostics_per_batch)
+	}
+}
+
 /// Complete immutable file-tool policy projection.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
@@ -100,155 +139,135 @@ pub struct FileToolSettings {
 	pub lsp:    LspFileSettings,
 }
 
-impl SettingsDomain for FetchSettings {
-	const DOMAIN: &'static str = "fetch";
-	const FIELDS: &'static [FieldDescriptor] =
-		&[field("fetch.enabled", "Read URLs", "Allow read to fetch HTTP(S) resources.", 10)];
-}
-
-impl SettingsDomain for ImageSettings {
-	const DOMAIN: &'static str = "images";
-	const FIELDS: &'static [FieldDescriptor] = &[FieldDescriptor {
-		scopes: PERSISTED_RUNTIME,
-		..field(
-			"images.autoResize",
-			"Auto-resize images",
-			"Resize oversized images before model delivery.",
-			10,
-		)
-	}];
-}
-
-impl SettingsDomain for ReadSettings {
-	const DOMAIN: &'static str = "read";
-	const FIELDS: &'static [FieldDescriptor] = &[field(
-		"read.renderMarkdown",
-		"Render Markdown",
-		"Present Markdown reads as rendered Markdown.",
-		10,
-	)];
-}
-
-impl SettingsDomain for LspFileSettings {
-	const DOMAIN: &'static str = "lsp";
-	const FIELDS: &'static [FieldDescriptor] = &[
-		field(
-			"lsp.formatOnWrite",
-			"Format on write",
-			"Format supported documents after a whole-file write.",
-			10,
-		),
-		field(
-			"lsp.diagnosticsOnWrite",
-			"Diagnostics on write",
-			"Return diagnostics bound to the committed write revision.",
-			20,
-		),
-		field(
-			"lsp.diagnosticsOnEdit",
-			"Diagnostics on edit",
-			"Return diagnostics bound to the committed edit revision.",
-			30,
-		),
-		field(
-			"lsp.diagnosticsDeduplicate",
-			"Deduplicate diagnostics",
-			"Suppress diagnostics already surfaced for the same file.",
-			40,
-		),
-		integer_field(
-			"lsp.diagnosticsHistoryCapacity",
-			"Diagnostic history capacity",
-			"Bound the per-runtime diagnostic identity history.",
-			50,
-		),
-		integer_field(
-			"lsp.maxDiagnosticsPerBatch",
-			"Maximum diagnostics per batch",
-			"Bound diagnostics attached to one committed revision.",
-			60,
-		),
-	];
-
-	fn validate(&self) -> Result<(), ValidationError> {
-		if !(1..=MAX_DIAGNOSTIC_HISTORY_CAPACITY).contains(&self.diagnostics_history_capacity)
-			|| !(1..=MAX_DIAGNOSTICS_PER_BATCH).contains(&self.max_diagnostics_per_batch)
-		{
-			return Err(ValidationError::DomainInvariant { domain: Self::DOMAIN });
+impl FileToolSettings {
+	/// Projects all file-tool policy from the control plane.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			fetch:  FetchSettings::from_con(ctx),
+			images: ImageSettings::from_con(ctx),
+			read:   ReadSettings::from_con(ctx),
+			lsp:    LspFileSettings::from_con(ctx),
 		}
-		Ok(())
 	}
 }
 
-const fn field(
-	path: &'static str,
-	label: &'static str,
-	description: &'static str,
-	order: u16,
-) -> FieldDescriptor {
-	FieldDescriptor {
-		path,
-		label,
-		description,
-		kind: SettingKind::Boolean,
-		scopes: PERSISTED,
-		order,
-		options: None,
-		condition: None,
-		secret: false,
-	}
-}
-
-const fn integer_field(
-	path: &'static str,
-	label: &'static str,
-	description: &'static str,
-	order: u16,
-) -> FieldDescriptor {
-	FieldDescriptor { kind: SettingKind::Integer, ..field(path, label, description, order) }
-}
-
-/// Settings domains owned by the tools crate.
-pub const SETTINGS_CONTRIBUTION: omp_settings::SettingsContribution =
-	omp_settings::SettingsContribution {
-		domains:     &[
-			DomainRegistration::of::<FetchSettings>(),
-			DomainRegistration::of::<ImageSettings>(),
-			DomainRegistration::of::<ReadSettings>(),
-			DomainRegistration::of::<LspFileSettings>(),
-		],
-		normalizers: &[],
+omp_con::var! {
+	/// Allow read to fetch HTTP(S) resources.
+	pub static SV_FETCH_ENABLED = sv_fetch_enabled: bool {
+		default: true,
+		flags: archive | inherit | replicated,
 	};
+	/// Resize oversized images before model delivery.
+	pub static SV_IMAGES_AUTO_RESIZE = sv_images_auto_resize: bool {
+		default: true,
+		flags: archive | session | inherit | replicated,
+	};
+	/// Present Markdown reads as rendered Markdown.
+	pub static CL_READ_RENDER_MARKDOWN = cl_read_render_markdown: bool {
+		default: false,
+		flags: archive | inherit,
+	};
+	/// Format supported documents after a whole-file write.
+	pub static SV_LSP_FORMAT_ON_WRITE = sv_lsp_format_on_write: bool {
+		default: false,
+		flags: archive | inherit | replicated,
+	};
+	/// Return diagnostics bound to the committed write revision.
+	pub static SV_LSP_DIAGNOSTICS_ON_WRITE = sv_lsp_diagnostics_on_write: bool {
+		default: true,
+		flags: archive | inherit | replicated,
+	};
+	/// Return diagnostics bound to the committed edit revision.
+	pub static SV_LSP_DIAGNOSTICS_ON_EDIT = sv_lsp_diagnostics_on_edit: bool {
+		default: false,
+		flags: archive | inherit | replicated,
+	};
+	/// Suppress diagnostics already surfaced for the same file.
+	pub static SV_LSP_DIAGNOSTICS_DEDUPLICATE = sv_lsp_diagnostics_deduplicate: bool {
+		default: true,
+		flags: archive | inherit | replicated,
+	};
+	/// Bound the per-runtime diagnostic identity history.
+	pub static SV_LSP_DIAGNOSTICS_HISTORY_CAPACITY = sv_lsp_diagnostics_history_capacity: u32 {
+		default: DEFAULT_DIAGNOSTIC_HISTORY_CAPACITY as u32,
+		min: 1,
+		max: MAX_DIAGNOSTIC_HISTORY_CAPACITY as u32,
+		flags: archive | inherit | replicated,
+	};
+	/// Bound diagnostics attached to one committed revision.
+	pub static SV_LSP_MAX_DIAGNOSTICS_PER_BATCH = sv_lsp_max_diagnostics_per_batch: u32 {
+		default: DEFAULT_DIAGNOSTICS_PER_BATCH as u32,
+		min: 1,
+		max: MAX_DIAGNOSTICS_PER_BATCH as u32,
+		flags: archive | inherit | replicated,
+	};
+}
+
+/// One-shot migration map from reflected TOML paths to convar names.
+pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
+	("fetch.enabled", "sv_fetch_enabled"),
+	("images.autoResize", "sv_images_auto_resize"),
+	("read.renderMarkdown", "cl_read_render_markdown"),
+	("lsp.formatOnWrite", "sv_lsp_format_on_write"),
+	("lsp.diagnosticsOnWrite", "sv_lsp_diagnostics_on_write"),
+	("lsp.diagnosticsOnEdit", "sv_lsp_diagnostics_on_edit"),
+	("lsp.diagnosticsDeduplicate", "sv_lsp_diagnostics_deduplicate"),
+	("lsp.diagnosticsHistoryCapacity", "sv_lsp_diagnostics_history_capacity"),
+	("lsp.maxDiagnosticsPerBatch", "sv_lsp_max_diagnostics_per_batch"),
+];
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsCatalog, SettingsSnapshot};
-
 	use super::*;
 
-	const CATALOG: SettingsCatalog =
-		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
-
 	#[test]
-	fn projects_defaults_and_links_registration() {
-		let snapshot =
-			SettingsSnapshot::isolated(FetchSettings::default(), CATALOG).expect("snapshot");
-		let projection = snapshot.project::<FetchSettings>().expect("projection");
-		assert!(projection.get().enabled);
-		assert_eq!(
-			SETTINGS_CONTRIBUTION
-				.domains
-				.iter()
-				.map(|domain| domain.descriptor().name)
-				.collect::<Vec<_>>(),
-			["fetch", "images", "read", "lsp"],
-		);
+	fn projects_defaults_and_ctx_override() {
+		let ctx = Ctx::new();
+		SV_FETCH_ENABLED.set(&ctx, false).expect("set fetch policy");
+		let projection = FileToolSettings::from_con(&ctx);
+		assert!(!projection.fetch.enabled);
+		assert!(projection.lsp.validate());
 	}
 
 	#[test]
 	fn rejects_unbounded_diagnostic_policy() {
 		let settings =
 			LspFileSettings { diagnostics_history_capacity: 0, ..LspFileSettings::default() };
-		assert!(settings.validate().is_err());
+		assert!(!settings.validate());
+	}
+
+	#[test]
+	fn vars_declare_every_former_schema_field() {
+		let old_fields = [
+			"fetch.enabled",
+			"images.autoResize",
+			"read.renderMarkdown",
+			"lsp.formatOnWrite",
+			"lsp.diagnosticsOnWrite",
+			"lsp.diagnosticsOnEdit",
+			"lsp.diagnosticsDeduplicate",
+			"lsp.diagnosticsHistoryCapacity",
+			"lsp.maxDiagnosticsPerBatch",
+		];
+		let vars = [
+			SV_FETCH_ENABLED.name(),
+			SV_IMAGES_AUTO_RESIZE.name(),
+			CL_READ_RENDER_MARKDOWN.name(),
+			SV_LSP_FORMAT_ON_WRITE.name(),
+			SV_LSP_DIAGNOSTICS_ON_WRITE.name(),
+			SV_LSP_DIAGNOSTICS_ON_EDIT.name(),
+			SV_LSP_DIAGNOSTICS_DEDUPLICATE.name(),
+			SV_LSP_DIAGNOSTICS_HISTORY_CAPACITY.name(),
+			SV_LSP_MAX_DIAGNOSTICS_PER_BATCH.name(),
+		];
+		assert_eq!(
+			LEGACY_CONVAR_MAPPINGS,
+			old_fields
+				.into_iter()
+				.zip(vars)
+				.collect::<Vec<_>>()
+				.as_slice()
+		);
 	}
 }
