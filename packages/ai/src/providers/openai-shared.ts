@@ -21,6 +21,7 @@ import {
 	removeBlankCoreWeaveProjectHeaders,
 } from "@oh-my-pi/pi-catalog/wire/coreweave";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
+import { opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	classifyJsonPrefix,
@@ -173,6 +174,8 @@ export interface OpenAIRequestSetupOptions {
 	};
 	openAISessionId?: string;
 	promptCacheSessionId?: string;
+	/** Stable per-conversation session id for OpenCode Go/Zen routing headers. */
+	opencodeSessionId?: string;
 }
 
 export interface OpenAIRequestSetup {
@@ -313,6 +316,16 @@ export function resolveOpenAIRequestSetup(
 	}
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);
+	}
+	// OpenCode Go/Zen require a stable per-conversation `x-opencode-session` on
+	// inference requests and error header-less callers; `x-opencode-client`
+	// attributes the request for upstream stats. Defaults only — explicit
+	// user/config headers of the same name already sit in `headers` and win.
+	if (model.provider === "opencode-go" || model.provider === "opencode-zen") {
+		const routing = opencodeRoutingHeaders(options.opencodeSessionId);
+		for (const name in routing) {
+			setHeaderIfAbsent(headers, name, routing[name]);
+		}
 	}
 
 	if (options.defaultBaseUrl !== undefined) {

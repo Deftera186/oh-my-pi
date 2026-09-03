@@ -5,6 +5,7 @@
 ### Fixed
 
 - Anthropic and OpenRouter 402 credit-exhaustion errors ("would exceed your available credits", "Insufficient credits") now switch to a sibling account instead of stopping the turn with a retry hint.
+- OpenCode Go/Zen requests now send the required `x-opencode-session` (stable per conversation) and `x-opencode-client: omp` routing headers, so inference keeps working after OpenCode began rejecting header-less callers; explicit `headers` config still overrides them ([#10653](https://github.com/can1357/oh-my-pi/issues/10653)).
 
 ## [18.1.5] - 2026-09-03
 

@@ -447,6 +447,7 @@ const streamOpenAIResponsesOnce = (
 				messages: context.messages,
 				openAISessionId: routingSessionId,
 				promptCacheSessionId,
+				opencodeSessionId: options?.sessionId,
 			});
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);

@@ -407,7 +407,13 @@ function buildCompactionV2Headers(
 					"content-type": "application/json",
 					...resolveOpenAIRequestSetup(
 						{ provider: model.provider, id: model.id, baseUrl: model.baseUrl, headers: model.headers },
-						{ apiKey, messages: [], openAISessionId: routingSessionId, promptCacheSessionId },
+						{
+							apiKey,
+							messages: [],
+							openAISessionId: routingSessionId,
+							promptCacheSessionId,
+							opencodeSessionId: request.sessionId,
+						},
 					).headers,
 				};
 	if (api === "openai-codex-responses" || model.provider === "openai-codex") {
