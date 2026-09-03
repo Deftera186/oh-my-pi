@@ -377,6 +377,161 @@ impl ExternalToolExecutor for ScriptedExternal {
 	}
 }
 
+/// An external unit that either settles once its cancellation token fires
+/// (a shell whose process group the environment kills) or never settles at
+/// all (a unit that ignores the stop request).
+struct StuckExternal {
+	honors_cancel: bool,
+	started:       Arc<tokio::sync::Notify>,
+}
+
+impl ExternalToolExecutor for StuckExternal {
+	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
+		let honors_cancel = self.honors_cancel;
+		let started = Arc::clone(&self.started);
+		Box::pin(async_stream::stream! {
+			started.notify_one();
+			request.cancellation.cancelled().await;
+			if honors_cancel {
+				yield ExternalDispatchEvent::Aborted(omp_tool::Abort::Interrupted {
+					reason: Str::new_static("bash command was cancelled"),
+				});
+			} else {
+				std::future::pending::<()>().await;
+			}
+		})
+	}
+}
+
+fn worker_registry() -> Arc<omp_tool::Registry> {
+	let mut tools = omp_tool::Registry::new();
+	tools
+		.register_worker(tool_spec("worker", 1), Presentation::Slot, Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::new_static("omp-agent/tests"),
+			replaces:   None,
+		})
+		.expect("worker registers");
+	Arc::new(tools)
+}
+
+/// The journaled `tool.result@1` abort kind for `call_id`, after proving the
+/// aborted result projects to the model.
+fn abort_kind(session: &omp_session::Session, call_id: &str) -> String {
+	let projected = project_thread(session.dom())
+		.into_iter()
+		.find_map(|item| match item.kind? {
+			item::Kind::ToolResult(result) if result.call_id == call_id => Some(result),
+			_ => None,
+		})
+		.expect("aborted result projects");
+	assert!(projected.is_error);
+	let journal = std::fs::read_to_string(session.journal_path()).expect("journal reads");
+	let line = journal
+		.lines()
+		.skip_while(|line| *line != "event: tool.result@1")
+		.find(|line| line.starts_with("data: "))
+		.expect("tool.result@1 data");
+	let data: serde_json::Value =
+		serde_json::from_str(&line["data: ".len()..]).expect("tool.result@1 json");
+	data["fault"]["value"]["abort"]["kind"]
+		.as_str()
+		.unwrap_or_else(|| panic!("abort kind missing: {data}"))
+		.to_owned()
+}
+
+#[tokio::test]
+async fn interrupt_kills_a_running_shell_tool_and_settles_aborted() {
+	// A mutating tool's commit token is session-only, but ctrl+c (turn
+	// interrupt) must still stop it: the executor receives the stop request
+	// and its own verdict settles the call within a tick.
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let tools = worker_registry();
+	let identity = tools.resolved_identity("worker").expect("worker identity");
+	let started = Arc::new(tokio::sync::Notify::new());
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store"))
+			.with_interrupt_grace(Duration::from_millis(300)),
+	)
+	.with_external_executor(Arc::new(StuckExternal {
+		honors_cancel: true,
+		started:       Arc::clone(&started),
+	}));
+	let mut session = session(&directory.path().join("killed.oms"));
+	let (entry, args) = call(&mut session, &identity, "shell-1");
+	let turn = CancelTree::new().begin_turn();
+	let cancellation = turn.foreground_mutation();
+	let report = {
+		let dispatch = dispatcher.dispatch(
+			&mut session,
+			request(entry, identity.clone(), args, ToolCancellation::Foreground(cancellation), false),
+		);
+		tokio::pin!(dispatch);
+		tokio::select! {
+			() = started.notified() => {},
+			result = &mut dispatch => panic!("dispatch settled before the unit started: {result:?}"),
+		}
+		turn.cancel_turn();
+		tokio::time::timeout(Duration::from_millis(200), &mut dispatch)
+			.await
+			.expect("interrupted shell settles within a tick")
+			.expect("abort journals a terminal")
+	};
+	assert!(report.is_error);
+	assert!(report.detached.is_none());
+	assert_eq!(abort_kind(&session, "shell-1"), "interrupted");
+	assert_journal_cause(&session, entry);
+
+	// A unit that ignores the stop request is forced closed after the bounded
+	// grace and recorded as uncertainty, never left hanging (ADR 0011).
+	let started = Arc::new(tokio::sync::Notify::new());
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store"))
+			.with_interrupt_grace(Duration::from_millis(300)),
+	)
+	.with_external_executor(Arc::new(StuckExternal {
+		honors_cancel: false,
+		started:       Arc::clone(&started),
+	}));
+	let mut stuck = support::session(&directory.path().join("stuck.oms"));
+	let (entry, args) = call(&mut stuck, &identity, "shell-2");
+	let turn = CancelTree::new().begin_turn();
+	let interrupted_at;
+	let report = {
+		let dispatch = dispatcher.dispatch(
+			&mut stuck,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::Foreground(turn.foreground_mutation()),
+				false,
+			),
+		);
+		tokio::pin!(dispatch);
+		tokio::select! {
+			() = started.notified() => {},
+			result = &mut dispatch => panic!("dispatch settled before the unit started: {result:?}"),
+		}
+		interrupted_at = std::time::Instant::now();
+		turn.cancel_turn();
+		tokio::time::timeout(Duration::from_secs(2), &mut dispatch)
+			.await
+			.expect("stuck unit is forced closed within the grace")
+			.expect("forced abort journals a terminal")
+	};
+	let elapsed = interrupted_at.elapsed();
+	assert!(
+		elapsed >= Duration::from_millis(250),
+		"forced termination waited for the grace: {elapsed:?}"
+	);
+	assert!(report.is_error);
+	assert_eq!(abort_kind(&stuck, "shell-2"), "effects_unknown");
+	assert_journal_cause(&stuck, entry);
+}
+
 #[tokio::test]
 async fn worker_routed_tools_use_the_injected_external_executor() {
 	let directory = tempfile::tempdir().expect("temporary directory");

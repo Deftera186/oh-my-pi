@@ -9,7 +9,7 @@ use omp_inference::{
 	ChatEvent, ChatRequest, ContentPart, MediaInput, Message, OpaqueJson, Role, Setting, ToolChoice,
 	ToolInputConstraint, ToolResultContent,
 };
-use omp_journal::EntryId;
+use omp_journal::{EntryId, data::Compaction};
 
 use crate::director::{BoxFut, Director, DirectorError, MutDirectorCx, Prepared};
 
@@ -26,19 +26,30 @@ const SUMMARY_INSTRUCTION: &str = include_str!("../../prompts/compaction/handoff
 pub struct CompactionDirector {
 	focus:  Option<Str>,
 	manual: bool,
+	/// Journaled `method` for a manual run (`manual`, `handoff`); `None`
+	/// uses the automatic/manual default.
+	method: Option<Str>,
 }
 
 impl CompactionDirector {
 	/// Creates the standard automatic compaction director.
 	#[must_use]
 	pub const fn new() -> Self {
-		Self { focus: None, manual: false }
+		Self { focus: None, manual: false, method: None }
 	}
 
 	/// Creates a one-shot manual compaction request with optional summary focus.
 	#[must_use]
 	pub const fn manual(focus: Option<Str>) -> Self {
-		Self { focus, manual: true }
+		Self { focus, manual: true, method: None }
+	}
+
+	/// Labels the journaled compaction method (`/handoff` journals
+	/// `handoff` so the transcript divider reads "handed-off").
+	#[must_use]
+	pub fn with_method(mut self, method: impl Into<Str>) -> Self {
+		self.method = Some(method.into());
+		self
 	}
 
 	async fn compact(
@@ -72,8 +83,19 @@ impl CompactionDirector {
 		if summary.trim().is_empty() {
 			return Err(DirectorError::EmptyCompactionSummary);
 		}
+		let tokens_before = estimate_request_tokens(request);
+		let tokens_after = estimate_text_tokens(summary.as_str());
 		let blob = cx.blobs.put(summary.as_bytes())?;
-		cx.session.compaction(blob, boundary)?;
+		cx.session.compaction(Compaction {
+			summary: blob,
+			boundary,
+			method: Some(self.method.clone().unwrap_or_else(|| {
+				Str::new_static(if self.manual { "manual" } else { "auto" })
+			})),
+			tokens_before: Some(tokens_before),
+			tokens_after: Some(tokens_after),
+			warning: None,
+		})?;
 		Ok(Prepared::Rebuild)
 	}
 }
@@ -204,6 +226,15 @@ fn estimate_request_tokens(request: &ChatRequest) -> u64 {
 	});
 	message_bytes
 		.saturating_add(tool_bytes)
+		.div_ceil(BYTES_PER_TOKEN)
+}
+
+/// Tokens the summary occupies once it replaces the hidden history: its
+/// bytes plus one message overhead, at the same bytes-per-token estimate as
+/// the request side.
+fn estimate_text_tokens(text: &str) -> u64 {
+	u64_len(text.len())
+		.saturating_add(MESSAGE_OVERHEAD_TOKENS.saturating_mul(BYTES_PER_TOKEN))
 		.div_ceil(BYTES_PER_TOKEN)
 }
 

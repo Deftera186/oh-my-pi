@@ -10,7 +10,7 @@ use std::{
 use flume::Receiver;
 use futures::{Stream, StreamExt as _};
 use omp_core::{FastHashMap, Str, sf};
-use omp_dom::Handle;
+use omp_dom::{Handle, KnownTag, PropId, Sid, Tag};
 use omp_journal::{
 	EntryId,
 	blob::{BlobRef, BlobStore},
@@ -44,9 +44,11 @@ pub enum ToolCancellation {
 }
 
 impl ToolCancellation {
-	fn token(&self) -> CancellationToken {
+	/// Host stop request for this call: turn interruption or session
+	/// cancellation for every scope.
+	fn interrupt_token(&self) -> CancellationToken {
 		match self {
-			Self::Foreground(scope) => scope.token(),
+			Self::Foreground(scope) => scope.interrupt_token(),
 			Self::ReadOnly(scope) => scope.token(),
 			Self::Background(scope) => scope.token(),
 		}
@@ -62,20 +64,32 @@ pub struct DispatchPolicy {
 	pub max_line_bytes:   usize,
 	/// Maximum time a call may block the turn.
 	pub blocking_limit:   Duration,
+	/// Bounded wait after a stop request before a call that has not settled
+	/// is forcibly terminated and journaled as effects-unknown (ADR 0011).
+	/// Execution units apply their own courtesy grace inside this bound.
+	pub interrupt_grace:  Duration,
 	/// Content-addressed store for complete spilled output.
 	pub spill:            BlobStore,
 }
 
 impl DispatchPolicy {
-	/// Creates the standard 64 KiB / 512-byte / 30-second policy.
+	/// Creates the standard 64 KiB / 512-byte / 30-second / 1-second policy.
 	#[must_use]
 	pub const fn new(spill: BlobStore) -> Self {
 		Self {
 			max_output_bytes: 64 * 1024,
 			max_line_bytes: 512,
 			blocking_limit: Duration::from_secs(30),
+			interrupt_grace: Duration::from_secs(1),
 			spill,
 		}
+	}
+
+	/// Replaces the bounded settle window granted after a stop request.
+	#[must_use]
+	pub const fn with_interrupt_grace(mut self, interrupt_grace: Duration) -> Self {
+		self.interrupt_grace = interrupt_grace;
+		self
 	}
 
 	/// Replaces central limits while retaining the selected blob store.
@@ -140,6 +154,9 @@ pub struct ExternalDispatchRequest {
 	pub route:          ToolRoute,
 	/// Maximum time the invocation may block this turn.
 	pub blocking_limit: Duration,
+	/// Turn/session cancellation the executor must honor (ADR 0011): once
+	/// cancelled, the invocation is interrupted and settles aborted.
+	pub cancellation:   CancellationToken,
 }
 
 /// One state mutation produced by an externally routed tool executor.
@@ -221,6 +238,125 @@ pub trait SessionTool: Send + Sync {
 	fn spec(&self) -> &ToolSpec;
 	/// Executes one committed call against the authoritative session.
 	fn call<'a>(&'a self, cx: SessionToolCx<'a>, args: Box<RawValue>) -> SessionToolFuture<'a>;
+}
+
+/// Live ordered output of one dispatched call (ADR 0008 tool output
+/// streaming).
+///
+/// A tool update carrying `sequence` and `data` is an ordered output frame
+/// (`omp_tools::shell::Update`, eval process frames). The dispatcher binds a
+/// DOM text stream to the call's `<result>` text at the first frame, appends
+/// each frame's bytes as UTF-8 in sequence order, and closes the stream
+/// before the terminal, so a running card reads the whole output in O(Δ)
+/// per frame and replay reproduces it byte for byte. The typed update still
+/// journals the frame's metadata; its bytes live only in the stream.
+#[derive(Default)]
+struct OutputStream {
+	sid:   Option<Sid>,
+	/// Highest sequence appended; stale or duplicate frames are dropped.
+	last:  Option<u64>,
+	/// Bytes of a UTF-8 sequence split across frames, completed by the next.
+	carry: Vec<u8>,
+}
+
+impl OutputStream {
+	/// Reads the frame's ordering and bytes when `value` is an output frame.
+	fn frame(value: &serde_json::Value) -> Option<(u64, Vec<u8>)> {
+		let sequence = value.get("sequence")?.as_u64()?;
+		let bytes = match value.get("data")? {
+			serde_json::Value::String(text) => text.as_bytes().to_vec(),
+			serde_json::Value::Array(items) => items
+				.iter()
+				.filter_map(serde_json::Value::as_u64)
+				.filter_map(|byte| u8::try_from(byte).ok())
+				.collect(),
+			_ => return None,
+		};
+		Some((sequence, bytes))
+	}
+
+	/// Decodes a frame's bytes, carrying an incomplete trailing sequence to
+	/// the next frame instead of replacing it.
+	fn decode(&mut self, bytes: &[u8]) -> String {
+		let mut buffer = std::mem::take(&mut self.carry);
+		buffer.extend_from_slice(bytes);
+		let text = match std::str::from_utf8(&buffer) {
+			Ok(text) => text.to_owned(),
+			Err(error) if error.error_len().is_none() => {
+				let valid = error.valid_up_to();
+				let text = String::from_utf8_lossy(&buffer[..valid]).into_owned();
+				buffer.drain(..valid);
+				self.carry = buffer;
+				return text;
+			},
+			Err(_) => String::from_utf8_lossy(&buffer).into_owned(),
+		};
+		buffer.clear();
+		self.carry = buffer;
+		text
+	}
+
+	/// Appends one frame in order; returns the update with its bytes
+	/// removed so they are not journaled twice.
+	fn push(
+		&mut self,
+		session: &mut Session,
+		call: EntryId,
+		mut value: serde_json::Value,
+		sequence: u64,
+		bytes: &[u8],
+	) -> Result<Box<RawValue>, DispatchError> {
+		if self.last.is_none_or(|last| sequence > last) {
+			self.last = Some(sequence);
+			let sid = match self.sid {
+				Some(sid) => sid,
+				None => {
+					let sid = session.stream_open(result_handle(session, call)?, PropId::Text.into())?;
+					self.sid = Some(sid);
+					sid
+				},
+			};
+			let text = self.decode(bytes);
+			if !text.is_empty() {
+				session.stream_append(sid, &text)?;
+			}
+		}
+		if let Some(data) = value.get_mut("data") {
+			*data = match data {
+				serde_json::Value::String(_) => serde_json::Value::String(String::new()),
+				_ => serde_json::Value::Array(Vec::new()),
+			};
+		}
+		Ok(serde_json::value::to_raw_value(&value)?)
+	}
+
+	/// Closes the stream, flushing any dangling partial sequence lossily.
+	fn close(&mut self, session: &mut Session) -> Result<(), DispatchError> {
+		let Some(sid) = self.sid.take() else {
+			return Ok(());
+		};
+		if !self.carry.is_empty() {
+			let tail = String::from_utf8_lossy(&self.carry).into_owned();
+			self.carry.clear();
+			session.stream_append(sid, &tail)?;
+		}
+		session.stream_close(sid)?;
+		Ok(())
+	}
+}
+
+/// The `<result>` element of a live call.
+fn result_handle(session: &Session, call: EntryId) -> Result<Handle, DispatchError> {
+	let element = session.call_handle(call)?;
+	let dom = session.dom();
+	dom.children(element)
+		.iter()
+		.copied()
+		.find(|child| {
+			dom.get(*child)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Result))
+		})
+		.ok_or(DispatchError::Session(SessionError::UnknownCall { id: call }))
 }
 
 /// Durable result of one dispatched invocation.
@@ -357,7 +493,8 @@ impl Dispatcher {
 		if let Some(tool) = self.session_tools.get(&request.identity.name).cloned() {
 			self.jobs.rebuild(session);
 			let call = session.call_handle(request.call)?;
-			let cancel = BackgroundToolCancellation::from_token(request.cancellation.token());
+			let cancel =
+				BackgroundToolCancellation::from_token(request.cancellation.interrupt_token());
 			let outcome = tool
 				.call(
 					SessionToolCx {
@@ -381,7 +518,19 @@ impl Dispatcher {
 				CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
 			};
 			let outcome = serde_json::value::to_raw_value(&outcome)?;
-			return self.finish_external(session, &request, outcome, parts, is_error);
+			let mut output = OutputStream::default();
+			return self.finish_external(session, &request, outcome, parts, is_error, &mut output);
+		}
+		let mut output = OutputStream::default();
+		let interrupt = request.cancellation.interrupt_token();
+		if interrupt.is_cancelled() {
+			// A stop already requested never starts new work.
+			return self.commit_abort(
+				session,
+				&request,
+				Abort::Interrupted { reason: Str::new_static("tool execution cancelled") },
+				&mut output,
+			);
 		}
 		let (feed, params) = IncomingParams::channel();
 		feed
@@ -409,6 +558,7 @@ impl Dispatcher {
 			args: request.args.clone(),
 			route,
 			blocking_limit: self.policy.blocking_limit,
+			cancellation: interrupt.clone(),
 		};
 		let mut task = tokio::spawn(async move {
 			if let Some(external) = external {
@@ -428,31 +578,44 @@ impl Dispatcher {
 			}
 			Ok::<_, RegistryError>(())
 		});
-		let token = request.cancellation.token();
 		let deadline = tokio::time::sleep(self.policy.blocking_limit);
 		tokio::pin!(deadline);
+		// ADR 0011 ladder: the stop request asks the unit to settle
+		// cooperatively (an in-process tool sees the interrupt on its feed; an
+		// external unit sees its cancellation token), the grace bounds how
+		// long its own verdict may take, and expiry forces termination
+		// recorded as uncertainty rather than a missing event.
+		let grace = tokio::time::sleep(self.policy.interrupt_grace);
+		tokio::pin!(grace);
+		let mut interrupting = false;
 		let mut closed = false;
 		loop {
 			tokio::select! {
 				biased;
-				() = token.cancelled() => {
+				() = interrupt.cancelled(), if !interrupting => {
+					interrupting = true;
+					grace.as_mut().reset(tokio::time::Instant::now() + self.policy.interrupt_grace);
 					let _ = feed.interrupt(Interrupt {
 						class: Str::new_static(Interrupt::ESCAPE),
 						reason: Str::new_static("tool execution cancelled"),
 					});
+				},
+				() = &mut grace, if interrupting => {
 					task.abort();
 					let _ = task.await;
-					return self.commit_abort(session, &request, Abort::Interrupted {
-						reason: Str::new_static("tool execution cancelled"),
-					});
+					return self.commit_abort(session, &request, Abort::EffectsUnknown {
+						reason: Str::new_static(
+							"tool execution cancelled; the call did not settle within the interrupt grace and was terminated",
+						),
+					}, &mut output);
 				},
-				() = &mut deadline => {
+				() = &mut deadline, if !interrupting => {
 					let job = timeout_job(&request.identity);
 					let outcome = detached_outcome(&job)?;
 					let prompt = vec![Part::Text {
 						text: sf!("detached job {}", job.id),
 					}];
-					self.commit_terminal(session, &request, outcome, prompt, false)?;
+					self.commit_terminal(session, &request, outcome, prompt, false, &mut output)?;
 					return Ok(DispatchReport {
 						is_error: false,
 						spilled: None,
@@ -468,10 +631,10 @@ impl Dispatcher {
 									std::io::ErrorKind::InvalidData,
 									source,
 								)))?)?;
-							self.commit_update(session, &request, update)?;
+							self.commit_update(session, &request, update, &mut output)?;
 						},
 						Some(DispatchEvent::Native(Ok(ErasedEv::Done(outcome)))) => {
-							let report = self.finish(session, &request, outcome)?;
+							let report = self.finish(session, &request, outcome, &mut output)?;
 							let _ = task.await?;
 							return Ok(report);
 						},
@@ -481,20 +644,21 @@ impl Dispatcher {
 							return Err(error.into());
 						},
 						Some(DispatchEvent::External(ExternalDispatchEvent::Update(update))) => {
-							self.commit_update(session, &request, update)?;
+							self.commit_update(session, &request, update, &mut output)?;
 						},
 						Some(DispatchEvent::External(ExternalDispatchEvent::Done {
 							outcome,
 							parts,
 							is_error,
 						})) => {
-							let report =
-								self.finish_external(session, &request, outcome, parts, is_error)?;
+							let report = self.finish_external(
+								session, &request, outcome, parts, is_error, &mut output,
+							)?;
 							let _ = task.await?;
 							return Ok(report);
 						},
 						Some(DispatchEvent::External(ExternalDispatchEvent::Aborted(abort))) => {
-							let report = self.commit_abort(session, &request, abort)?;
+							let report = self.commit_abort(session, &request, abort, &mut output)?;
 							let _ = task.await?;
 							return Ok(report);
 						},
@@ -509,14 +673,14 @@ impl Dispatcher {
 								let update = RawValue::from_string(
 									String::from_utf8_lossy(&update).into_owned(),
 								)?;
-								self.commit_update(session, &request, update)?;
+								self.commit_update(session, &request, update, &mut output)?;
 							},
 							DispatchEvent::Native(Ok(ErasedEv::Done(outcome))) => {
-								return self.finish(session, &request, outcome);
+								return self.finish(session, &request, outcome, &mut output);
 							},
 							DispatchEvent::Native(Err(error)) => return Err(error.into()),
 							DispatchEvent::External(ExternalDispatchEvent::Update(update)) => {
-								self.commit_update(session, &request, update)?;
+								self.commit_update(session, &request, update, &mut output)?;
 							},
 							DispatchEvent::External(ExternalDispatchEvent::Done {
 								outcome,
@@ -529,14 +693,15 @@ impl Dispatcher {
 									outcome,
 									parts,
 									is_error,
+									&mut output,
 								);
 							},
 							DispatchEvent::External(ExternalDispatchEvent::Aborted(abort)) => {
-								return self.commit_abort(session, &request, abort);
+								return self.commit_abort(session, &request, abort, &mut output);
 							},
 						}
 					}
-					return self.commit_abort(session, &request, Abort::MissingOutcome);
+					return self.commit_abort(session, &request, Abort::MissingOutcome, &mut output);
 				},
 			}
 		}
@@ -547,6 +712,7 @@ impl Dispatcher {
 		session: &mut Session,
 		request: &DispatchRequest,
 		outcome: ErasedOutcome,
+		output: &mut OutputStream,
 	) -> Result<DispatchReport, DispatchError> {
 		match outcome {
 			ErasedOutcome::Detached(job) => {
@@ -557,6 +723,7 @@ impl Dispatcher {
 					raw,
 					vec![Part::Text { text: sf!("detached job {}", job.id) }],
 					false,
+					output,
 				)?;
 				Ok(DispatchReport {
 					is_error:      false,
@@ -588,7 +755,7 @@ impl Dispatcher {
 							"lines_clamped": bounded.lines_clamped,
 						}
 					}))?;
-					self.commit_update(session, request, diag)?;
+					self.commit_update(session, request, diag, output)?;
 				}
 				let raw =
 					RawValue::from_string(String::from_utf8(verdict.to_vec()).map_err(|source| {
@@ -597,7 +764,14 @@ impl Dispatcher {
 							source,
 						))
 					})?)?;
-				self.commit_terminal(session, request, raw, bounded.parts, projected.is_error)?;
+				self.commit_terminal(
+					session,
+					request,
+					raw,
+					bounded.parts,
+					projected.is_error,
+					output,
+				)?;
 				Ok(DispatchReport {
 					is_error:      projected.is_error,
 					spilled:       bounded.spilled,
@@ -615,6 +789,7 @@ impl Dispatcher {
 		outcome: Box<RawValue>,
 		parts: Vec<Part>,
 		is_error: bool,
+		output: &mut OutputStream,
 	) -> Result<DispatchReport, DispatchError> {
 		let bounded = bound_parts(&parts, request.options, &self.policy)?;
 		if let Some(artifact) = bounded.spilled {
@@ -625,9 +800,9 @@ impl Dispatcher {
 					"lines_clamped": bounded.lines_clamped,
 				}
 			}))?;
-			self.commit_update(session, request, diag)?;
+			self.commit_update(session, request, diag, output)?;
 		}
-		self.commit_terminal(session, request, outcome, bounded.parts, is_error)?;
+		self.commit_terminal(session, request, outcome, bounded.parts, is_error, output)?;
 		Ok(DispatchReport {
 			is_error,
 			spilled: bounded.spilled,
@@ -641,10 +816,16 @@ impl Dispatcher {
 		session: &mut Session,
 		request: &DispatchRequest,
 		abort: Abort,
+		output: &mut OutputStream,
 	) -> Result<DispatchReport, DispatchError> {
-		let verdict =
-			serde_json::to_vec(&CallOutcome::<serde_json::Value, serde_json::Value>::aborted(abort))?;
-		self.finish(session, request, ErasedOutcome::Done { verdict: verdict.into(), useless: false })
+		// An abort is harness-owned: its projection never depends on the tool
+		// or its route, so external units settle exactly like native ones.
+		let parts = vec![Part::Text { text: abort.render() }];
+		let outcome = serde_json::value::to_raw_value(&CallOutcome::<
+			serde_json::Value,
+			serde_json::Value,
+		>::aborted(abort))?;
+		self.finish_external(session, request, outcome, parts, true, output)
 	}
 
 	fn commit_update(
@@ -652,7 +833,13 @@ impl Dispatcher {
 		session: &mut Session,
 		request: &DispatchRequest,
 		update: Box<RawValue>,
+		output: &mut OutputStream,
 	) -> Result<(), DispatchError> {
+		let value: serde_json::Value = serde_json::from_str(update.get())?;
+		let update = match OutputStream::frame(&value) {
+			Some((sequence, bytes)) => output.push(session, request.call, value, sequence, &bytes)?,
+			None => update,
+		};
 		session.call_update(request.call, update)?;
 		self
 			.events
@@ -667,7 +854,9 @@ impl Dispatcher {
 		outcome: Box<RawValue>,
 		parts: Vec<Part>,
 		is_error: bool,
+		output: &mut OutputStream,
 	) -> Result<(), DispatchError> {
+		output.close(session)?;
 		let parts = serde_json::value::to_raw_value(&parts)?;
 		if is_error {
 			session.fail_projected(request.call, outcome, parts)?;

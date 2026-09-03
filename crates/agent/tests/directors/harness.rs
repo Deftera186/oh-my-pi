@@ -79,7 +79,7 @@ impl Harness {
 			let outcome = RawValue::from_string("{}".to_owned()).expect("raw result");
 			self.session.settle(id, outcome).expect("tool result");
 		}
-		self.session.receipt(0, tokens, 0).expect("receipt");
+		self.session.receipt(omp_journal::data::TurnReceipt::tokens(0, tokens, 0)).expect("receipt");
 		self.session.assistant_end("stop").expect("assistant end");
 		let view = TurnView {
 			turn,

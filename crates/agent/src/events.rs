@@ -1,6 +1,6 @@
 //! Observer-facing notifications derived while journal entries are committed.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use omp_core::Str;
 use omp_inference::{ContentPart, Message};
@@ -14,6 +14,32 @@ use parking_lot::Mutex;
 pub enum KernelEvent {
 	/// An inference response selected its concrete route.
 	InferenceStarted,
+	/// The transport layer is about to wait `delay` before same-route retry
+	/// `attempt` of `max_attempts` (pi `auto_retry_start`). Pre-commit and
+	/// replay-irrelevant, so it is never journaled.
+	InferenceRetry {
+		/// One-based retry number.
+		attempt:      u32,
+		/// Retry cap on this route.
+		max_attempts: u32,
+		/// Backoff before the retry.
+		delay:        Duration,
+		/// Human-readable failure summary.
+		reason:       Str,
+	},
+	/// Cumulative provider usage observed mid-stream; ephemeral.
+	Usage {
+		/// Output tokens so far.
+		output_tokens:    u64,
+		/// Reasoning tokens so far.
+		reasoning_tokens: u64,
+	},
+	/// One explicit turn returned control (pi `agent_end`); the journal
+	/// carries the durable outcome, this only wakes hosts promptly.
+	TurnEnded {
+		/// Why the kernel stopped.
+		stop: crate::TurnStop,
+	},
 	/// Visible assistant text arrived.
 	TextDelta(Str),
 	/// Assistant reasoning text arrived.

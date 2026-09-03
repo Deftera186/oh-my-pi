@@ -81,6 +81,18 @@ async fn user_turn_journals_assistant_text_in_the_explicit_turn() {
 		1
 	);
 	assert_eq!(prop_text(&session, "body turn assistant", PropId::Text), "pong");
+	// pi's usage row needs TTFT and duration on the receipt; both are
+	// kernel-clock measurements the projection cannot derive later.
+	let usage = session
+		.dom()
+		.select("body turn usage")
+		.expect("selector")
+		.next()
+		.expect("receipt materializes");
+	let usage = session.dom().get(usage).expect("usage node");
+	assert!(matches!(usage.prop(&PropKey::from(PropId::DurationMs)), Some(omp_dom::Value::Int(_))));
+	assert!(matches!(usage.prop(&PropKey::from(PropId::TtftMs)), Some(omp_dom::Value::Int(_))));
+	assert!(matches!(usage.prop(&PropKey::from(PropId::CacheRead)), Some(omp_dom::Value::Int(0))));
 
 	drop(session);
 	let entries = journal_entries(&journal_path);
@@ -139,6 +151,7 @@ async fn tool_call_round_settles_in_the_dom_then_runs_second_inference() {
 		KernelEvent::ToolSettled { call_id: Str::new_static("echo-1"), is_error: false },
 		KernelEvent::InferenceStarted,
 		KernelEvent::TextDelta(Str::new_static("hello from tool")),
+		KernelEvent::TurnEnded { stop: TurnStop::Completed },
 	]);
 	let requests = requests.lock();
 	assert_eq!(requests.len(), 2);

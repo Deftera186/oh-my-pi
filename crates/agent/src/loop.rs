@@ -10,7 +10,7 @@ use omp_inference::{
 	Message as InferenceMessage, NegotiationPolicy, Planner, SafetySetting, Sampling, Setting,
 	Usage,
 };
-use omp_journal::{EntryId, blob::BlobRef};
+use omp_journal::{EntryId, blob::BlobRef, data::TurnReceipt};
 use omp_proto::thread::v1::{Item, Message, Part as ThreadPart, Role, item, part};
 use omp_session::{Session, SessionError, project_thread};
 use omp_tool::{LoweringCaps, Registry, RegistryError, ToolIdentity};
@@ -20,14 +20,14 @@ use tokio_util::sync::CancellationToken;
 use tower::Service;
 
 use crate::{
-	CancelTree, DirectorCx, DirectorError, DirectorRegistry, DirectorStack, DispatchError,
+	CancelTree, Director as _, DirectorCx, DirectorError, DirectorRegistry, DirectorStack, DispatchError,
 	DispatchOptions, DispatchPolicy, DispatchRequest, Dispatcher, ExternalToolExecutor, KernelEvent,
 	LiveComponent, LiveComponentError, LoopDecision, MutDirectorCx, Prepared, RouteFacts,
 	SessionTool, ToolCancellation, TurnView, Up,
 	directors::compaction::CompactionDirector,
 	steering::{
 		EMPTY_OUTPUT_RETRY_CAP, append_empty_output_cap_notice, append_empty_output_retry,
-		append_error_notice, append_notice, append_steering,
+		append_error_notice, append_interrupt_notice, append_notice, append_steering,
 	},
 };
 
@@ -65,6 +65,13 @@ pub trait Inference: Send {
 		&mut self,
 		request: ChatRequest,
 	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send;
+
+	/// Installs the observer that receives same-route retry notices for
+	/// every subsequent chat. Inference stacks without a retry layer keep the
+	/// default no-op.
+	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
+		let _ = sink;
+	}
 }
 
 impl<S, P> Inference for Client<S, P>
@@ -82,6 +89,12 @@ where
 		request: ChatRequest,
 	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
 		self.execute(request)
+	}
+
+	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
+		let mut meta = self.call_meta().clone();
+		meta.response_hooks = meta.response_hooks.with_retry_sink(sink);
+		self.set_call_meta(meta);
 	}
 }
 
@@ -102,6 +115,9 @@ pub enum TurnStop {
 	Cancelled,
 	/// Steering was consumed at a safe point before yielding.
 	Steered,
+	/// The turn ended in a journaled error notice (only reported through
+	/// [`KernelEvent::TurnEnded`]; `run_turn` returns the error itself).
+	Failed,
 }
 
 /// Durable summary of one explicit turn.
@@ -224,13 +240,25 @@ impl<C> Kernel<C> {
 	/// Constructs a kernel with the standard Director registry.
 	#[must_use]
 	pub fn new(
-		client: C,
+		mut client: C,
 		registry: Arc<Registry>,
 		policy: DispatchPolicy,
 		prompt: impl PromptSource + 'static,
-	) -> Self {
+	) -> Self
+	where
+		C: Inference,
+	{
 		let (mailbox_tx, mailbox_rx) = flume::unbounded();
 		let events = crate::events::KernelEvents::default();
+		let retry_events = events.clone();
+		client.install_retry_sink(Arc::new(move |notice: omp_inference::RetryNotice| {
+			retry_events.publish(KernelEvent::InferenceRetry {
+				attempt:      notice.attempt,
+				max_attempts: notice.max_attempts,
+				delay:        notice.delay,
+				reason:       notice.message,
+			});
+		}));
 		Self {
 			client,
 			dispatcher: Dispatcher::new(registry, policy).with_events(events.clone()),
@@ -379,10 +407,40 @@ impl<C: Inference> Kernel<C> {
 		let result = self
 			.run_turn_body(session, turn, &turn_cancel, &control)
 			.await;
-		if let Err(error) = &result {
-			self.journal_turn_failure(session, turn, error);
+		match &result {
+			Err(error) => self.journal_turn_failure(session, turn, error),
+			Ok(outcome) if outcome.stop == TurnStop::Cancelled => {
+				self.journal_turn_interrupt(session, turn);
+			},
+			Ok(_) => {},
 		}
+		self.events.publish(KernelEvent::TurnEnded {
+			stop: match &result {
+				Ok(outcome) => outcome.stop,
+				Err(_) => TurnStop::Failed,
+			},
+		});
 		result
+	}
+
+	/// Records an interrupted turn in the tree (ADR 0004: lifecycle derives
+	/// from the tree): an open assistant closes with `cancelled` and the turn
+	/// ends with `<notice kind=warn>`, never a receipt or a false completion.
+	fn journal_turn_interrupt(&mut self, session: &mut Session, turn: Handle) {
+		match session.assistant_end("cancelled") {
+			Ok(_) => {
+				if let Err(error) = self.apply_live_components(session) {
+					tracing::warn!(?error, "live Components failed after an assistant interrupt close");
+				}
+			},
+			Err(SessionError::NoActiveAssistant) => {},
+			Err(journal) => {
+				tracing::warn!(error = ?journal, "failed to close the assistant after an interrupt");
+			},
+		}
+		if let Err(journal) = append_interrupt_notice(session, turn) {
+			tracing::warn!(error = ?journal, "failed to journal the turn interrupt notice");
+		}
 	}
 
 	fn journal_turn_failure(&mut self, session: &mut Session, turn: Handle, error: &KernelError) {
@@ -446,9 +504,10 @@ impl<C: Inference> Kernel<C> {
 			}
 			let director_cx = DirectorCx::new(turn, &route);
 			directors.prepare_inference(session.dom(), &director_cx, &mut request);
+			let request_started = Instant::now();
 			let stream = self.client.chat(request).await?;
 			let mut driven = self
-				.drive_inference(session, stream, control, turn_cancel)
+				.drive_inference(session, stream, control, turn_cancel, request_started)
 				.await?;
 			tokens_in = tokens_in.saturating_add(driven.usage.input_tokens);
 			tokens_out = tokens_out.saturating_add(driven.usage.output_tokens);
@@ -456,7 +515,7 @@ impl<C: Inference> Kernel<C> {
 			if driven.cancelled {
 				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
-			let streamed_steering = std::mem::take(&mut driven.steering);
+			let mut streamed_steering = std::mem::take(&mut driven.steering);
 			for call in driven.calls {
 				let cancellation = tool_cancellation(
 					self.dispatcher.registry(),
@@ -464,17 +523,44 @@ impl<C: Inference> Kernel<C> {
 					turn_cancel,
 				)?;
 				let call_id = call.call_id;
-				let report = self
-					.dispatcher
-					.dispatch(session, DispatchRequest {
+				// The mailbox stays live while a tool runs: an interrupt cancels
+				// the turn scope the tool observes (pi aborts running tools on
+				// ctrl+c) instead of waiting for the tool to finish on its own.
+				let mut approvals = Vec::new();
+				let report = {
+					let dispatch = self.dispatcher.dispatch(session, DispatchRequest {
 						identity: call.identity,
 						call_id: call_id.clone(),
 						call: call.entry,
 						options: DispatchOptions::from_args(&call.args),
 						args: call.args,
 						cancellation,
-					})
-					.await?;
+					});
+					tokio::pin!(dispatch);
+					loop {
+						tokio::select! {
+							biased;
+							report = &mut dispatch => break report?,
+							() = control.cancelled() => turn_cancel.cancel_turn(),
+							message = self.mailbox_rx.recv_async() => match message {
+								Ok(Up::Interrupt) => turn_cancel.cancel_turn(),
+								Ok(Up::Cancel) => {
+									self.cancel.cancel_session();
+									turn_cancel.cancel_turn();
+								},
+								Ok(Up::Steer(text)) => streamed_steering.push(text),
+								Ok(Up::Unqueue(reply)) => {
+									let _ = reply.send(std::mem::take(&mut streamed_steering));
+								},
+								Ok(Up::Approve { id, decision }) => approvals.push((id, decision)),
+								Ok(Up::Env(_)) | Err(_) => {},
+							},
+						}
+					}
+				};
+				for (id, decision) in approvals {
+					let _ = crate::ApprovalBook::new().decide(session, id.as_str(), decision);
+				}
 				self.apply_live_components(session)?;
 				self
 					.events
@@ -580,6 +666,7 @@ impl<C: Inference> Kernel<C> {
 		mut stream: ChatStream,
 		control: &RunControl,
 		turn_cancel: &crate::TurnCancellation,
+		request_started: Instant,
 	) -> Result<DrivenInference, KernelError> {
 		let mut assistant = None;
 		let mut content_streams = FastHashMap::<u32, u32>::default();
@@ -591,6 +678,9 @@ impl<C: Inference> Kernel<C> {
 		let mut call_ids = Vec::new();
 		let mut completed = false;
 		let mut steering = Vec::new();
+		// pi `message.ttft`: first visible or reasoning byte (or the first
+		// streamed tool-call fragment) after the request left the kernel.
+		let mut first_token: Option<Instant> = None;
 		let fold: Result<Fold, KernelError> = async {
 			loop {
 				let signal = tokio::select! {
@@ -606,6 +696,10 @@ impl<C: Inference> Kernel<C> {
 					},
 					StreamSignal::Control(Some(Up::Steer(text))) => {
 						steering.push(text);
+						continue;
+					},
+					StreamSignal::Control(Some(Up::Unqueue(reply))) => {
+						let _ = reply.send(std::mem::take(&mut steering));
 						continue;
 					},
 					StreamSignal::Control(Some(Up::Interrupt)) => {
@@ -657,6 +751,7 @@ impl<C: Inference> Kernel<C> {
 						BlockKind::ToolCall | BlockKind::Artifact => {},
 					},
 					ChatEvent::TextDelta { index, text: delta } => {
+						first_token.get_or_insert_with(Instant::now);
 						let sid =
 							content_sid(session, assistant, &mut content_streams, index, PropId::Text)?;
 						session.stream_append(sid, delta.as_str())?;
@@ -665,6 +760,7 @@ impl<C: Inference> Kernel<C> {
 						text.push_str(delta.as_str());
 					},
 					ChatEvent::ThinkingDelta { index, text: delta } => {
+						first_token.get_or_insert_with(Instant::now);
 						let sid = content_sid(
 							session,
 							assistant,
@@ -677,6 +773,7 @@ impl<C: Inference> Kernel<C> {
 						self.events.publish(KernelEvent::ThinkingDelta(delta));
 					},
 					ChatEvent::ToolCallStarted { index, id, name } => {
+						first_token.get_or_insert_with(Instant::now);
 						let identity = self
 							.dispatcher
 							.registry()
@@ -745,7 +842,13 @@ impl<C: Inference> Kernel<C> {
 						});
 						ready.push(ReadyCall { entry, identity, call_id, args });
 					},
-					ChatEvent::Usage(update) => usage = update.usage,
+					ChatEvent::Usage(update) => {
+						usage = update.usage;
+						self.events.publish(KernelEvent::Usage {
+							output_tokens:    usage.output_tokens,
+							reasoning_tokens: usage.reasoning_tokens,
+						});
+					},
 					ChatEvent::Completed(completion) => {
 						close_streams(session, &mut content_streams)?;
 						self.apply_live_components(session)?;
@@ -753,11 +856,12 @@ impl<C: Inference> Kernel<C> {
 						usage = completion.usage;
 						session.assistant_end(stop_reason.clone())?;
 						self.apply_live_components(session)?;
-						session.receipt(
-							usage.input_tokens,
-							usage.output_tokens,
+						session.receipt(receipt_facts(
+							&usage,
 							cost_nano_usd(&completion),
-						)?;
+							request_started,
+							first_token,
+						))?;
 						self.apply_live_components(session)?;
 						completed = true;
 						break Ok(Fold::Ended);
@@ -801,7 +905,12 @@ impl<C: Inference> Kernel<C> {
 		.await;
 		match fold {
 			Ok(Fold::Ended) => {},
-			Ok(Fold::Cancelled) => return Ok(DrivenInference::cancelled(text, usage)),
+			Ok(Fold::Cancelled) => {
+				// The reveal stopped mid-stream: close its open text streams so
+				// the tree never carries a dangling stream past the interrupt.
+				close_streams(session, &mut content_streams)?;
+				return Ok(DrivenInference::cancelled(text, usage));
+			},
 			Err(error) => {
 				// The stream failed mid-reveal: close its open text streams so the
 				// tree never carries a dangling stream, then surface the failure.
@@ -816,7 +925,7 @@ impl<C: Inference> Kernel<C> {
 			self.apply_live_components(session)?;
 			session.assistant_end("stream_closed")?;
 			self.apply_live_components(session)?;
-			session.receipt(usage.input_tokens, usage.output_tokens, 0)?;
+			session.receipt(receipt_facts(&usage, 0, request_started, first_token))?;
 			self.apply_live_components(session)?;
 		}
 		Ok(DrivenInference {
@@ -860,6 +969,9 @@ impl<C: Inference> Kernel<C> {
 		while let Ok(message) = self.mailbox_rx.try_recv() {
 			match message {
 				Up::Steer(text) => drained.items.push(text),
+				Up::Unqueue(reply) => {
+					let _ = reply.send(std::mem::take(&mut drained.items));
+				},
 				Up::Interrupt => {
 					turn.cancel_turn();
 					drained.cancelled = true;
@@ -888,6 +1000,38 @@ impl<C: Inference> Kernel<C> {
 			}
 		}
 		drained
+	}
+
+	/// Runs the manual compaction path between turns (`/compact`,
+	/// `/handoff`): summarizes the projected history through the
+	/// [`CompactionDirector`] and journals a `compaction@1` labeled
+	/// `method`. Returns whether a compaction landed (an empty session
+	/// projects nothing to summarize and journals nothing).
+	pub async fn compact(
+		&mut self,
+		session: &mut Session,
+		focus: Option<Str>,
+		method: &'static str,
+	) -> Result<bool, KernelError> {
+		let Ok(turn) = current_turn(session) else {
+			return Ok(false);
+		};
+		let request = self.build_request(session)?;
+		let director = CompactionDirector::manual(focus).with_method(method);
+		let route = self.route;
+		let prepared = {
+			let mut cx = MutDirectorCx {
+				session,
+				inference: &mut self.client,
+				blobs: &self.dispatcher.policy().spill,
+				route: &route,
+				turn,
+				director: None,
+			};
+			director.before_inference(&mut cx, &request).await?
+		};
+		self.apply_live_components(session)?;
+		Ok(prepared == Prepared::Rebuild)
 	}
 }
 
@@ -1051,6 +1195,27 @@ fn finish_reason(reason: &FinishReason) -> Str {
 		FinishReason::ContentFilter => Str::new_static("content_filter"),
 		FinishReason::Cancelled => Str::new_static("cancelled"),
 		FinishReason::Other(reason) => reason.clone(),
+	}
+}
+
+/// The `turn.receipt@1` payload for one completed inference: provider usage
+/// plus the kernel-clock timings pi's usage row shows (TTFT, duration →
+/// tok/s).
+fn receipt_facts(
+	usage: &Usage,
+	cost_nano_usd: u64,
+	request_started: Instant,
+	first_token: Option<Instant>,
+) -> TurnReceipt {
+	let millis = |elapsed: std::time::Duration| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+	TurnReceipt {
+		tokens_in: usage.input_tokens,
+		tokens_out: usage.output_tokens,
+		cost_nano_usd,
+		cache_read: usage.cache_read_tokens,
+		cache_write: usage.cache_write_tokens,
+		ttft_ms: first_token.map(|at| millis(at.duration_since(request_started))),
+		duration_ms: Some(millis(request_started.elapsed())),
 	}
 }
 

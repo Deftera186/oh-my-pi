@@ -1,8 +1,15 @@
 //! Hierarchical cancellation for sessions, turns, and tool executions.
 //!
-//! Turn interruption never reaches an in-flight foreground mutation. Only
-//! session cancellation can stop that scope, preventing partially applied
-//! mutations from being reported as a clean turn interrupt.
+//! Every tool scope carries two views of one stop (ADR 0011):
+//!
+//! - the *commit* token is what the tool's own atomic mutation observes. For a
+//!   foreground mutation it is session-only: a turn interrupt never tears an
+//!   in-flight commit in half, so a partially applied mutation is never
+//!   reported as a clean interrupt;
+//! - the *interrupt* token is the host's stop request. It fires on turn
+//!   interruption or session cancellation for every scope, and the dispatcher
+//!   answers it with cooperative settlement, a bounded grace, then forced
+//!   termination journaled as uncertainty.
 
 use tokio_util::sync::CancellationToken;
 
@@ -51,8 +58,8 @@ pub struct TurnCancellation {
 }
 
 impl TurnCancellation {
-	/// Interrupts this turn and its interruptible tools, but not an in-flight
-	/// foreground mutation.
+	/// Interrupts this turn: every tool scope's interrupt token fires, while
+	/// an in-flight foreground mutation keeps its session-only commit token.
 	pub fn cancel_turn(&self) {
 		self.turn.cancel();
 	}
@@ -64,10 +71,14 @@ impl TurnCancellation {
 		self.turn.is_cancelled()
 	}
 
-	/// Issues the session-only scope available to foreground mutations.
+	/// Issues the foreground-mutation scope: a session-only commit token plus
+	/// this turn's interrupt token.
 	#[must_use]
 	pub fn foreground_mutation(&self) -> ForegroundMutationCancellation {
-		ForegroundMutationCancellation { token: self.session.clone() }
+		ForegroundMutationCancellation {
+			commit:    self.session.clone(),
+			interrupt: self.turn.child_token(),
+		}
 	}
 
 	/// Issues a turn-scoped child token for a read-only tool.
@@ -83,23 +94,37 @@ impl TurnCancellation {
 	}
 }
 
-/// Session-only cancellation issued to a foreground mutating tool.
+/// Cancellation issued to a foreground mutating tool.
 #[derive(Clone, Debug)]
 pub struct ForegroundMutationCancellation {
-	token: CancellationToken,
+	commit:    CancellationToken,
+	interrupt: CancellationToken,
 }
 
 impl ForegroundMutationCancellation {
-	/// Returns the session cancellation token.
+	/// Returns the session-only commit token the mutation observes.
 	#[must_use]
 	pub fn token(&self) -> CancellationToken {
-		self.token.clone()
+		self.commit.clone()
+	}
+
+	/// Returns the host stop request: turn interruption or session
+	/// cancellation.
+	#[must_use]
+	pub fn interrupt_token(&self) -> CancellationToken {
+		self.interrupt.clone()
 	}
 
 	/// Reports whether the owning session was cancelled.
 	#[must_use]
 	pub fn is_cancelled(&self) -> bool {
-		self.token.is_cancelled()
+		self.commit.is_cancelled()
+	}
+
+	/// Reports whether the host requested a stop.
+	#[must_use]
+	pub fn is_interrupted(&self) -> bool {
+		self.interrupt.is_cancelled()
 	}
 }
 

@@ -4,8 +4,7 @@
 
 use omp_agent::{
 	BoxFut, Director, DirectorError, DirectorRegistry, DirectorStack, DispatchPolicy, Inference,
-	Kernel, KernelError, MutDirectorCx, Prepared, PromptSource, RunControl, StaticPrompt,
-	TurnInput,
+	Kernel, KernelError, MutDirectorCx, Prepared, PromptSource, RunControl, StaticPrompt, TurnInput,
 };
 use omp_core::Str;
 use omp_dom::{PropId, PropKey, Value};

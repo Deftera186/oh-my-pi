@@ -787,3 +787,19 @@ mod tests {
 		assert!(composer.height() < tall, "the attachment card band is gone");
 	}
 }
+#[cfg(test)]
+mod dbg_tests {
+	use super::*;
+	#[test]
+	fn dbg_gap() {
+		let mut composer = Composer::new(60, UiContext::default(), StatusFacts::default(), vec![], None);
+		for c in "hi".chars() { composer.key(Key::Char(c)); }
+		eprintln!("A {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
+		composer.set_status_row_occupied(true);
+		eprintln!("B {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
+		composer.set_status_row_occupied(false);
+		eprintln!("C {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
+		composer.set_plan_mode(true);
+		eprintln!("D {:?} h={}", omp_tui::frame_text(composer.frame()).lines().collect::<Vec<_>>(), composer.height());
+	}
+}

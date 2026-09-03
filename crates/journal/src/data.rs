@@ -156,7 +156,7 @@ impl<'de> Deserialize<'de> for ToolResult {
 }
 
 /// `turn.receipt@1` payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReceipt {
 	/// Input token count.
 	pub tokens_in:     u64,
@@ -164,6 +164,41 @@ pub struct TurnReceipt {
 	pub tokens_out:    u64,
 	/// Cost in billionths of a US dollar.
 	pub cost_nano_usd: u64,
+	/// Prompt-cache tokens read; absent in journals written before the field
+	/// existed.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub cache_read:    u64,
+	/// Prompt-cache tokens written.
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub cache_write:   u64,
+	/// Milliseconds from request start to the first streamed token, measured
+	/// on the kernel's clock.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ttft_ms:       Option<u64>,
+	/// Milliseconds from request start to completion.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub duration_ms:   Option<u64>,
+}
+
+impl TurnReceipt {
+	/// A receipt carrying only token and cost totals.
+	#[must_use]
+	pub const fn tokens(tokens_in: u64, tokens_out: u64, cost_nano_usd: u64) -> Self {
+		Self {
+			tokens_in,
+			tokens_out,
+			cost_nano_usd,
+			cache_read: 0,
+			cache_write: 0,
+			ttft_ms: None,
+			duration_ms: None,
+		}
+	}
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref, reason = "serde skip predicate signature")]
+const fn is_zero(value: &u64) -> bool {
+	*value == 0
 }
 
 /// `patch@1` payload.
@@ -177,7 +212,29 @@ pub struct Patch {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Compaction {
 	/// Content-addressed summary.
-	pub summary:  BlobRef,
+	pub summary:       BlobRef,
 	/// Last entry hidden by the summary.
-	pub boundary: EntryId,
+	pub boundary:      EntryId,
+	/// Maintenance method that produced the summary (`auto`, `remote`, `soft`,
+	/// `handoff`, `snapcompact`, `shake`, `branch`); absent for legacy
+	/// entries, which render as plain compaction.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub method:        Option<Str>,
+	/// Estimated context tokens before the step.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tokens_before: Option<u64>,
+	/// Estimated context tokens after the step.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tokens_after:  Option<u64>,
+	/// Dead-end warning stamped by a progress guard.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub warning:       Option<Str>,
+}
+
+impl Compaction {
+	/// A compaction with no method or token facts.
+	#[must_use]
+	pub const fn new(summary: BlobRef, boundary: EntryId) -> Self {
+		Self { summary, boundary, method: None, tokens_before: None, tokens_after: None, warning: None }
+	}
 }

@@ -13,6 +13,9 @@ const EMPTY_OUTPUT_CAP_NOTICE: &str =
 pub enum Up {
 	/// Adds a user steering aside at the next safe point.
 	Steer(Str),
+	/// Hands back every steering aside not yet consumed at a safe point (pi
+	/// `app.message.dequeue`): the host restores them to its composer.
+	Unqueue(flume::Sender<Vec<Str>>),
 	/// Interrupts the current inference/tool turn while preserving mutations.
 	Interrupt,
 	/// Cancels the whole session and every execution scope.
@@ -80,6 +83,19 @@ pub(crate) fn append_error_notice(
 	text: Str,
 ) -> Result<(), SessionError> {
 	append_notice_with_kind(session, turn, text, Str::new_static("error"))
+}
+
+/// Appends the `<notice kind=warn>` that ends an interrupted turn.
+pub(crate) fn append_interrupt_notice(
+	session: &mut Session,
+	turn: Handle,
+) -> Result<(), SessionError> {
+	append_notice_with_kind(
+		session,
+		turn,
+		Str::new_static("Turn interrupted"),
+		Str::new_static("warn"),
+	)
 }
 
 pub(crate) fn append_empty_output_retry(

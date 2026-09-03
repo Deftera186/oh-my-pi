@@ -79,7 +79,16 @@ fn fixture_session_projects_expected_block_sequence() {
 	assert_eq!(blocks[1].text, "considering");
 	assert_eq!(blocks[2].text, "answer");
 	assert!(blocks[3].text.contains("hello from fixture"));
-	assert_eq!(blocks[4].text, "tokens 12 in / 7 out");
+	// pi usage row: `YYYY-MM-DD HH:mm:ss  ⏱Δ<wait>  ⤵ <in>  ⤴ <out>` (USG-01..03).
+	let usage = blocks[4].text.as_str();
+	let mut parts = usage.split("  ");
+	let stamp = parts.next().expect("timestamp part");
+	assert_eq!(stamp.len(), 19, "{usage}");
+	assert!(stamp.as_bytes()[4] == b'-' && stamp.as_bytes()[10] == b' ', "{usage}");
+	let rest = parts.collect::<Vec<_>>();
+	assert!(rest.iter().any(|part| part.contains('Δ')), "{usage}");
+	assert!(rest.iter().any(|part| part.ends_with(" 12")), "{usage}");
+	assert!(rest.iter().any(|part| part.ends_with(" 7")), "{usage}");
 }
 
 #[test]
