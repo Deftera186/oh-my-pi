@@ -15,11 +15,11 @@ pub const DEFAULT_BINDS_NAME: &str = "default-binds.cfg";
 
 /// pi app keybinding id → console command bound by [`DEFAULT_BINDS`].
 ///
-/// pi ids with no omp command (agent hub, session-picker-local keys, tree
-/// selector folds, speech/live voice, dequeue of a kernel-journaled steer)
-/// are absent: nothing in the new chat host implements them yet, and a
-/// migrated `keybindings.toml` entry for one is dropped rather than bound to
-/// a no-op.
+/// Session-picker-local keys (`app.session.togglePath` …) and tree-selector
+/// folds are panel chords, lowered by `omp_chat::overlays::PanelAction`
+/// inside the open panel rather than bound globally, so they are absent; a
+/// migrated `keybindings.toml` entry for one is dropped rather than bound
+/// to a no-op.
 pub const PI_ACTIONS: &[(&str, &str)] = &[
 	("app.interrupt", "cl_interrupt"),
 	("app.clear", "cl_clear"),
@@ -39,6 +39,19 @@ pub const PI_ACTIONS: &[(&str, &str)] = &[
 	("app.retry", "cl_retry"),
 	("app.plan.toggle", "cl_plan_toggle"),
 	("app.history.search", "cl_history_search"),
+	("app.message.dequeue", "cl_dequeue"),
+	("app.clipboard.pasteImage", "cl_paste_image"),
+	("app.clipboard.pasteTextRaw", "cl_paste_raw"),
+	("app.clipboard.copyLine", "cl_copy_line"),
+	("app.clipboard.copyPrompt", "cl_copy_prompt"),
+	("app.agents.hub", "agents"),
+	("app.session.observe", "hub"),
+	("app.session.new", "new"),
+	("app.session.tree", "tree"),
+	("app.session.fork", "fork"),
+	("app.session.resume", "resume"),
+	("app.stt.toggle", "cl_stt_toggle"),
+	("app.live.toggle", "live"),
 ];
 
 /// Drops the bare `unbindall` reset that the pre-baseline `dump` wrote at the

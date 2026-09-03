@@ -901,7 +901,7 @@ fn read_catalog(state: &StatePaths) -> miette::Result<SignedIndex> {
 	SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))
 }
 
-pub(super) fn installed_views(state: &StatePaths) -> miette::Result<Vec<InstalledExtensionView>> {
+pub(crate) fn installed_views(state: &StatePaths) -> miette::Result<Vec<InstalledExtensionView>> {
 	let client =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
 	let workspace =

@@ -61,13 +61,21 @@ pub async fn run(args: UsageArgs) -> miette::Result<()> {
 	Ok(())
 }
 
-struct QuotaSnapshot {
-	rows:           Vec<Value>,
-	reports:        Vec<UsageReport>,
-	refresh_errors: Vec<String>,
+/// Durable quota rows merged with one fresh refresh per account.
+pub(crate) struct QuotaSnapshot {
+	/// One JSON row per `(provider, account, window)`: `provider`,
+	/// `account` (masked), `window`, `label`, `consumed`, `limit`,
+	/// `remaining`, `resetAtMs`, `observedAtMs`, `fresh`.
+	pub(crate) rows:           Vec<Value>,
+	/// Fresh provider reports, one per refreshed account.
+	pub(crate) reports:        Vec<UsageReport>,
+	/// Refresh failures, one line per account.
+	pub(crate) refresh_errors: Vec<String>,
 }
 
-async fn collect_quota(
+/// Loads durable quota windows and refreshes every stored account with a
+/// 20 s deadline each (the chat `/usage` dashboard and the CLI share it).
+pub(crate) async fn collect_quota(
 	data_dir: &Path,
 	provider: Option<&ProviderId>,
 	account: Option<&AccountId>,
@@ -288,7 +296,8 @@ fn quantity_value(quantity: UsageQuantity) -> f64 {
 	quantity.units as f64 / 10_f64.powi(i32::from(quantity.decimal_exponent))
 }
 
-fn mask(value: &str) -> String {
+/// Masks an account id to its first and last four characters.
+pub(crate) fn mask(value: &str) -> String {
 	if value.len() <= 8 {
 		return "********".to_owned();
 	}

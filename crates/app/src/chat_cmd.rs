@@ -92,6 +92,9 @@ pub(crate) async fn run(
 		return Err(miette!("--api-key requires a model to be specified via --model or --models"));
 	}
 
+	// Live-session routing index shared by the kernel, its subagents, and
+	// the in-chat session switches (`/new`, `/resume`, `/fork`, `/drop`).
+	let live_sessions = Arc::new(omp_driver::sessions::SessionRegistry::new());
 	let gateway = match args.gateway.as_ref() {
 		Some(endpoint) => Some(endpoint.connect().await.into_diagnostic()?),
 		None => None,
@@ -125,7 +128,7 @@ pub(crate) async fn run(
 					})
 				}),
 			gateway,
-			sessions: None,
+			sessions: Some(Arc::clone(&live_sessions)),
 			session_name: None,
 			tool_registry: None,
 		},
@@ -135,7 +138,9 @@ pub(crate) async fn run(
 	let ephemeral_path = args
 		.no_session
 		.then(|| session.journal_path().to_path_buf());
-	let (snapshot, dom_events) = session.subscribe();
+	// The host's one DOM channel: the controller relays every live session's
+	// subscription onto it and publishes one `Reset` per session switch.
+	let (relay_tx, dom_events) = flume::unbounded();
 	let kernel_events = kernel.subscribe();
 	let up = kernel.mailbox();
 	let (commands, command_rx) = flume::unbounded();
@@ -160,9 +165,8 @@ pub(crate) async fn run(
 	// ctrl+p): catalog facts projected once at launch, never journaled.
 	let models = crate::pickers::model_rows(catalog.as_ref(), &model_settings);
 	let cycle = {
-		let key_of = |key: &Option<omp_catalog::ModelKey>| {
-			key.as_ref().map(|key| Str::new(key.as_str()))
-		};
+		let key_of =
+			|key: &Option<omp_catalog::ModelKey>| key.as_ref().map(|key| Str::new(key.as_str()));
 		let by_role = [
 			("smol", key_of(&launch_roles.smol)),
 			("default", Some(model.clone())),
@@ -180,13 +184,95 @@ pub(crate) async fn run(
 			})
 			.collect::<Vec<_>>()
 	};
-	// Observer-local git fact for the status band; a missing or detached
-	// checkout simply hides the segment.
-	let branch = omp_vcs::git::GitRepo::discover(&project)
-		.ok()
-		.flatten()
-		.and_then(|repo| repo.current_branch().ok().flatten())
-		.map(Str::from);
+	// Welcome-box facts: the previous sessions of this project (same
+	// directory the kernel opened its journal in) and the language-server
+	// roster the Environment discovers for it. Observer-local, never journaled.
+	let welcome = {
+		let sessions_dir = match args.session_dir.clone() {
+			Some(dir) => dir,
+			None => omp_env::project_state::directory(&data_dir, &project)
+				.into_diagnostic()?
+				.join("sessions"),
+		};
+		let recent = crate::welcome_facts::recent_sessions(&sessions_dir, session.journal_path());
+		// The Environment's supervisor owns the live roster; a slow or absent
+		// daemon degrades to the configuration projection rather than
+		// delaying the first frame.
+		let lsp = if omp_envd::lsp_settings::SV_LSP_ENABLED.get(&ctx) {
+			let live = tokio::time::timeout(
+				crate::welcome_facts::LSP_STATUS_BUDGET,
+				kernel.inference().environment_client().lsp_status(false),
+			)
+			.await;
+			match live {
+				Ok(Ok(status)) => crate::welcome_facts::lsp_from_status(&status),
+				Ok(Err(error)) => {
+					tracing::debug!(%error, "lsp roster unavailable; projecting configuration");
+					crate::welcome_facts::lsp_servers(&project, Some(&data_dir))
+				},
+				Err(_) => {
+					tracing::debug!("lsp roster timed out; projecting configuration");
+					crate::welcome_facts::lsp_servers(&project, Some(&data_dir))
+				},
+			}
+		} else {
+			Vec::new()
+		};
+		omp_chat::welcome::WelcomeFacts { recent, lsp }
+	};
+	// Application feeds behind the dashboards and account commands: engines
+	// stay here, the actor only reads rows (ADR 0005).
+	let live_journal =
+		Arc::new(parking_lot::RwLock::new(session.journal_path().to_path_buf()));
+	let services: Arc<dyn omp_chat::overlays::Services> = {
+		let composed = kernel.inference();
+		let environment = composed.environment();
+		let state_dir = omp_env::project_state::directory(&data_dir, &project).into_diagnostic()?;
+		Arc::new(crate::chat_services::AppServices::new(crate::chat_services::ServiceState {
+			data_dir: data_dir.clone(),
+			project: project.clone(),
+			sessions_dir: args
+				.session_dir
+				.clone()
+				.unwrap_or_else(|| state_dir.join("sessions")),
+			state_dir,
+			journal: session.journal_path().to_path_buf(),
+			live_journal: Arc::clone(&live_journal),
+			model: model.clone(),
+			catalog: composed.catalog().cloned(),
+			registry: Arc::clone(kernel.tool_registry()),
+			con: Arc::clone(&ctx),
+			mcp: environment.mcp_inspector(),
+			reload: environment.extension_reload_handle(),
+			memory: environment.memory_runtime(),
+			stack: composed
+				.production_stack()
+				.map(crate::chat_services::StackHandles::from_stack),
+			runtime: tokio::runtime::Handle::current(),
+		}))
+	};
+	let home = omp_driver::headless::kernel::SessionHome::new(
+		&data_dir,
+		&project,
+		&omp_driver::headless::kernel::KernelOptions {
+			sessions_dir: args.session_dir.clone(),
+			sessions: Some(Arc::clone(&live_sessions)),
+			..omp_driver::headless::kernel::KernelOptions::default()
+		},
+		model.clone(),
+		up.clone(),
+	)
+	.into_diagnostic()?;
+	let (controller, snapshot) = crate::chat_control::Controller::new(
+		kernel,
+		session,
+		home,
+		relay_tx,
+		Arc::clone(&ctx),
+		Arc::clone(&live_journal),
+		data_dir.clone(),
+		ephemeral_path.clone(),
+	);
 	let options = omp_chat::HostOptions {
 		snapshot,
 		dom_events,
@@ -199,7 +285,9 @@ pub(crate) async fn run(
 		cycle,
 		resize_policy,
 		model: model_badge,
-		branch,
+		project: project.clone(),
+		welcome,
+		services,
 		ui: omp_tui::UiContext::default(),
 	};
 	if !args.prompt.is_empty() {
@@ -215,94 +303,7 @@ pub(crate) async fn run(
 			.into_diagnostic()?;
 	}
 
-	let controller = async move {
-		let mut quit = false;
-		// pi `app.plan.toggle` arriving mid-turn applies once the turn ends.
-		let mut pending_plan: Option<bool> = None;
-		while let Ok(command) = command_rx.recv_async().await {
-			let input = match command {
-				omp_chat::HostCommand::PlanMode { engage } => {
-					set_plan_mode(&mut session, engage).into_diagnostic()?;
-					continue;
-				},
-				omp_chat::HostCommand::Submit(text) => {
-					omp_agent::TurnInput { text, attachments: Vec::new() }
-				},
-				omp_chat::HostCommand::SubmitWithAttachments { text, attachments } => {
-					omp_agent::TurnInput { text, attachments }
-				},
-				omp_chat::HostCommand::Steer(text) => {
-					let _ = up.send(omp_agent::Up::Steer(text));
-					continue;
-				},
-				omp_chat::HostCommand::Interrupt => {
-					let _ = up.send(omp_agent::Up::Interrupt);
-					continue;
-				},
-				omp_chat::HostCommand::Approve { id, decision } => {
-					let _ = up.send(omp_agent::Up::Approve { id, decision });
-					continue;
-				},
-				omp_chat::HostCommand::Overlay { .. } => continue,
-				omp_chat::HostCommand::Quit => {
-					session.process_exit().into_diagnostic()?;
-					break;
-				},
-			};
-			let failure = {
-				let mut failure = None;
-				let turn = kernel.run_turn(&mut session, input, omp_agent::RunControl::default());
-				tokio::pin!(turn);
-				loop {
-					tokio::select! {
-						result = &mut turn => {
-							failure = result.err();
-							break;
-						},
-						command = command_rx.recv_async() => match command {
-							Ok(omp_chat::HostCommand::Submit(text) | omp_chat::HostCommand::Steer(text)) => {
-								let _ = up.send(omp_agent::Up::Steer(text));
-							},
-							Ok(omp_chat::HostCommand::SubmitWithAttachments { text, .. }) => {
-								let _ = up.send(omp_agent::Up::Steer(text));
-							},
-							Ok(omp_chat::HostCommand::Interrupt) => {
-								let _ = up.send(omp_agent::Up::Interrupt);
-							},
-							Ok(omp_chat::HostCommand::Approve { id, decision }) => {
-								let _ = up.send(omp_agent::Up::Approve { id, decision });
-							},
-							Ok(omp_chat::HostCommand::Quit) | Err(_) => {
-								let _ = up.send(omp_agent::Up::Cancel);
-								quit = true;
-							},
-							Ok(omp_chat::HostCommand::Overlay { .. }) => {},
-							Ok(omp_chat::HostCommand::PlanMode { engage }) => pending_plan = Some(engage),
-						},
-					}
-					if quit {
-						failure = turn.await.err();
-						break;
-					}
-				}
-				failure
-			};
-			if let Some(error) = failure {
-				// The kernel journals the failure as a `<notice kind=error>` before
-				// returning; the host renders it and the composer stays live (pi
-				// keeps the session open on a failed turn).
-				record_turn_failure(&mut session, &error).into_diagnostic()?;
-			}
-			if let Some(engage) = pending_plan.take() {
-				set_plan_mode(&mut session, engage).into_diagnostic()?;
-			}
-			if quit {
-				session.process_exit().into_diagnostic()?;
-				break;
-			}
-		}
-		Ok::<(), miette::Report>(())
-	};
+	let controller = controller.run(command_rx);
 
 	#[cfg(feature = "gui")]
 	if presentation == ChatPresentation::Gui {
@@ -343,7 +344,7 @@ pub(crate) async fn run(
 /// pi `app.plan.toggle`: engages the plan Director (ADR 0015 `<meta>
 /// <directors>` element) or exits it by removing its frame, between turns.
 #[cfg(any(unix, windows))]
-fn set_plan_mode(
+pub(crate) fn set_plan_mode(
 	session: &mut omp_session::Session,
 	engage: bool,
 ) -> Result<(), omp_agent::DirectorError> {
@@ -355,7 +356,7 @@ fn set_plan_mode(
 	if engage && !engaged {
 		stack.engage(
 			session,
-			Box::new(omp_agent::directors::plan::Plan::new("local://plans/current.md")),
+			Box::new(omp_agent::directors::plan::Plan::new(omp_chat::commands::plan::DEFAULT_PLAN)),
 		)?;
 		return Ok(());
 	}
@@ -394,7 +395,7 @@ fn set_plan_mode(
 /// turn: a no-op when the kernel already journaled one, otherwise the error
 /// chain is appended and any open assistant is closed.
 #[cfg(any(unix, windows))]
-fn record_turn_failure(
+pub(crate) fn record_turn_failure(
 	session: &mut omp_session::Session,
 	error: &omp_agent::KernelError,
 ) -> Result<(), omp_session::SessionError> {

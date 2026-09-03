@@ -4,12 +4,19 @@
 
 pub mod acp_mode;
 pub mod audio_coordinator;
+/// Push-to-talk capture and recognition for `omp chat`.
+pub mod chat_voice;
 pub mod auth_broker_cmd;
 pub mod auth_cli;
 pub mod auth_gateway_cmd;
 pub mod bench_cmd;
 pub mod browser_relay_cmd;
 pub mod chat_cmd;
+/// Session-owning controller behind `omp chat`.
+#[cfg(any(unix, windows))]
+pub(crate) mod chat_control;
+/// Application feeds behind the chat host's dashboards and account commands.
+pub mod chat_services;
 pub mod cleanse_cmd;
 pub mod cli;
 pub mod commit_cmd;
@@ -73,6 +80,7 @@ pub mod update_cmd;
 pub mod usage_cmd;
 pub mod usage_error;
 pub mod voice;
+pub mod welcome_facts;
 pub mod worktree_cmd;
 
 use std::{

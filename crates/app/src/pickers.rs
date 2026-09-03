@@ -20,9 +20,7 @@ pub fn model_rows(catalog: &Catalog, settings: &ModelSettings) -> Vec<ModelRow> 
 		catalog
 			.models()
 			.iter()
-			.filter(|model| {
-				!admitted || model_selector_allowed(catalog, settings, model.key.as_str())
-			})
+			.filter(|model| !admitted || model_selector_allowed(catalog, settings, model.key.as_str()))
 			.map(|model| {
 				let (provider_id, provider) = model
 					.routes

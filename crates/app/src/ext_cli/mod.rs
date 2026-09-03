@@ -1131,7 +1131,7 @@ fn unlink(state: &StatePaths, id: &str, json: bool) -> miette::Result<()> {
 	Ok(())
 }
 
-fn enable(state: &StatePaths, id: &str, enabled: bool) -> miette::Result<()> {
+pub(crate) fn enable(state: &StatePaths, id: &str, enabled: bool) -> miette::Result<()> {
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
 	if enabled && state.client_lock.exists() {
@@ -2110,7 +2110,7 @@ fn where_paths(state: &StatePaths, args: ExtWhereArgs, json: bool) -> miette::Re
 }
 
 #[derive(Clone)]
-struct StatePaths {
+pub(crate) struct StatePaths {
 	data_dir:            PathBuf,
 	project:             PathBuf,
 	project_state:       PathBuf,
@@ -2137,7 +2137,7 @@ struct StatePaths {
 }
 
 impl StatePaths {
-	fn new(data_dir: &Path, project: &Path) -> Self {
+	pub(crate) fn new(data_dir: &Path, project: &Path) -> Self {
 		let project = project
 			.canonicalize()
 			.unwrap_or_else(|_| project.to_path_buf());
@@ -2195,7 +2195,7 @@ impl StatePaths {
 		self.plugin_root(scope).join("installed_plugins.json")
 	}
 
-	fn scoped(&self, scope: Scope) -> Self {
+	pub(crate) fn scoped(&self, scope: Scope) -> Self {
 		match scope {
 			Scope::User => self.clone(),
 			Scope::Project => {
