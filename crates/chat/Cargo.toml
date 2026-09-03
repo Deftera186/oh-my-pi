@@ -13,19 +13,25 @@ workspace = true
 
 [dependencies]
 flume.workspace = true
+jiff.workspace = true
+notify.workspace = true
 omp-agent.workspace = true
 omp-con.workspace = true
 omp-core.workspace = true
 omp-dom.workspace = true
+omp-inference.workspace = true
 omp-journal.workspace = true
 omp-session.workspace = true
 omp-tui.workspace = true
 omp-tools.workspace = true
+omp-vcs.workspace = true
+omp-voice.workspace = true
 omp-walker.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
+strum.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
