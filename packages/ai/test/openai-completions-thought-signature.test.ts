@@ -91,8 +91,8 @@ async function expectThoughtSignatureRoundTrip(signature: SignatureShape): Promi
 	const toolCall = findToolCall([assistant]);
 	const capturedSignature =
 		signature.type === "tool"
-			? JSON.stringify({ [signature.namespace]: { thought_signature: "opaque-signature" } })
-			: JSON.stringify({ [signature.field]: "opaque-signature" });
+			? JSON.stringify({ perCall: { [signature.namespace]: { thought_signature: "opaque-signature" } } })
+			: JSON.stringify({ message: { [signature.field]: "opaque-signature" } });
 
 	expect(toolCall.thoughtSignature).toBe(capturedSignature);
 
@@ -154,5 +154,73 @@ describe("OpenAI-compatible Gemini thought signatures", () => {
 
 	it("round-trips a message-level thought_signature alias", async () => {
 		await expectThoughtSignatureRoundTrip({ type: "message", field: "thought_signature" });
+	});
+
+	it("preserves both extra_content and a message-level signature together", async () => {
+		const payloads: unknown[] = [];
+		let requestIndex = 0;
+		const fetchMock: FetchImpl = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				if (typeof init?.body === "string") payloads.push(JSON.parse(init.body));
+				if (requestIndex++ === 0) {
+					return sseResponse(
+						{
+							role: "assistant",
+							thinking_signature: "message-sig",
+							tool_calls: [
+								{
+									index: 0,
+									id: "call_1",
+									type: "function",
+									function: { name: "read", arguments: '{"path":"README.md"}' },
+									extra_content: { google: { thought_signature: "per-call-sig" } },
+								},
+							],
+						},
+						"tool_calls",
+					);
+				}
+				return sseResponse({ role: "assistant", content: "done" }, "stop");
+			},
+			{ preconnect: fetch.preconnect },
+		);
+
+		const assistant = await streamOpenAICompletions(
+			model,
+			{ messages: [userMessage] },
+			{ apiKey: "test-key", fetch: fetchMock },
+		).result();
+		const toolCall = findToolCall([assistant]);
+		const toolResult: Message = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "README contents" }],
+			isError: false,
+			timestamp: 2,
+		};
+		await streamOpenAICompletions(
+			model,
+			{ messages: [userMessage, assistant, toolResult] },
+			{ apiKey: "test-key", fetch: fetchMock },
+		).result();
+
+		const replayPayload = payloads[1];
+		if (typeof replayPayload !== "object" || replayPayload === null) {
+			throw new Error("continuation payload missing");
+		}
+		const replayMessages = Reflect.get(replayPayload, "messages");
+		if (!Array.isArray(replayMessages)) throw new Error("continuation messages missing");
+		const replayedAssistant = replayMessages.find(
+			message => typeof message === "object" && message !== null && Reflect.get(message, "role") === "assistant",
+		);
+		if (typeof replayedAssistant !== "object" || replayedAssistant === null) {
+			throw new Error("replayed assistant message missing");
+		}
+		expect(replayedAssistant).toMatchObject({
+			role: "assistant",
+			thinking_signature: "message-sig",
+			tool_calls: [{ id: "call_1", extra_content: { google: { thought_signature: "per-call-sig" } } }],
+		});
 	});
 });
