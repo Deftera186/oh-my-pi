@@ -1,3 +1,4 @@
+#![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 //! Subscription masks and the per-invocation hook decision procedure.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,10 +8,105 @@ use flume::Receiver;
 use omp_core::{Str, sf};
 use omp_proto::toolhost::v1::HookEventId;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use smallvec::SmallVec;
+use strum::{Display, EnumString, IntoStaticStr};
 
-use crate::{ApprovalSpec, HookDecision, HookPhase};
+use crate::ApprovalSpec;
+
+/// Ordered stage in the hook decision procedure.
+#[allow(missing_docs, reason = "strum IntoStaticStr generates undocumented as_str")]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
+)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", const_into_str)]
+pub enum HookPhase {
+	/// Pure, deterministic deny-only checks.
+	Precheck  = 0,
+	/// Totally ordered request transformations.
+	Transform = 1,
+	/// Parallel, budgeted review.
+	Review    = 2,
+	/// Approval requirements and final admission votes.
+	Approval  = 3,
+	/// Asynchronous observation after the outcome is fixed.
+	Observe   = 4,
+}
+
+impl HookPhase {
+	/// Every hook phase in decision-procedure order.
+	pub const ALL: [Self; 5] =
+		[Self::Precheck, Self::Transform, Self::Review, Self::Approval, Self::Observe];
+
+	/// Returns the stable zero-based position in the hook procedure.
+	pub const fn ordinal(self) -> u8 {
+		self as u8
+	}
+}
+
+/// Canonical answer returned by a gateable hook.
+#[allow(missing_docs, reason = "strum IntoStaticStr generates undocumented as_str")]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Display,
+	EnumString,
+	Eq,
+	Hash,
+	IntoStaticStr,
+	PartialEq,
+	Serialize,
+)]
+#[repr(u8)]
+#[serde(rename_all = "PascalCase")]
+#[strum(serialize_all = "PascalCase", const_into_str)]
+pub enum HookDecision {
+	/// Cast an affirmative vote.
+	Allow           = 0,
+	/// Refuse the operation.
+	Deny            = 1,
+	/// Replace or patch the mutable request fields.
+	Modify          = 2,
+	/// Abstain without changing the procedure.
+	Defer           = 3,
+	/// Ask Core to create or merge a durable approval requirement.
+	RequireApproval = 4,
+}
+
+impl HookDecision {
+	/// Every hook decision arm in canonical vocabulary order.
+	pub const ALL: [Self; 5] =
+		[Self::Allow, Self::Deny, Self::Modify, Self::Defer, Self::RequireApproval];
+
+	/// Returns whether this decision is legal in `phase`.
+	pub const fn is_legal_in(self, phase: HookPhase) -> bool {
+		matches!(
+			(phase, self),
+			(HookPhase::Precheck, Self::Deny | Self::Defer)
+				| (HookPhase::Transform, Self::Modify | Self::Defer)
+				| (HookPhase::Review, Self::Allow | Self::Deny | Self::Defer)
+				| (HookPhase::Approval, Self::Allow | Self::Deny | Self::Defer | Self::RequireApproval)
+				| (HookPhase::Observe, Self::Defer)
+		)
+	}
+}
 
 /// The number of atomic words needed by the stable hook catalog through ordinal
 /// 127.
@@ -911,6 +1007,7 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	use bytes::Bytes;
+	use omp_core::sf;
 	use omp_proto::toolhost::v1::HookEventId;
 
 	use super::{

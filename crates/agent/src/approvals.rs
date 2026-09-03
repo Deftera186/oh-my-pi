@@ -1,24 +1,24 @@
-//! Core-owned durable approval ticket state.
+//! Durable approval prompts backed by the authoritative session DOM.
 
 use std::{
-	collections::BTreeMap,
+	str::FromStr,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
-	time::{Duration, Instant},
+	time::Duration,
 };
 
-use flume::Receiver;
 use omp_core::{Str, sf};
+use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
+use omp_session::{Session, SessionError, components::prompts::prompts_handle};
 use parking_lot::Mutex;
-use serde_json::Value;
-use tokio::{sync::oneshot, time};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
+use tokio::time;
 
-use crate::hooks::{HookGate, notify_json};
-
-/// One requirement merged into an invocation's single approval ticket.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One requirement merged into an invocation's approval prompt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalSpec {
 	/// Short user-visible description.
 	pub title:         Str,
@@ -30,13 +30,13 @@ pub struct ApprovalSpec {
 	pub kind:          Str,
 	/// Offered grant scopes in strictness order.
 	pub scopes:        Vec<Str>,
-	/// Optional timeout default; Core never invents one.
+	/// Optional timeout default; the kernel never invents one.
 	pub default:       Option<bool>,
 	/// Requested approver route.
 	pub route:         Str,
 	/// Optional named external approver.
 	pub approver:      Option<Str>,
-	/// Maximum wait in milliseconds.
+	/// Maximum wait in milliseconds; zero means no timeout.
 	pub timeout_ms:    u64,
 	/// Unreachable-route behavior.
 	pub unreachable:   Str,
@@ -48,12 +48,89 @@ pub struct ApprovalSpec {
 	pub evidence:      Vec<Str>,
 }
 
-/// Durable state of an approval ticket.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+/// Granted lifetime of an approval decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalScope {
+	/// This operation only.
+	Once,
+	/// This call only.
+	Call,
+	/// The current turn.
+	Turn,
+	/// The current session.
+	Session,
+	/// Persisted policy.
+	Persist,
+	/// A forward-compatible host-defined scope.
+	Custom(Str),
+}
+
+impl ApprovalScope {
+	/// Returns the stable wire spelling.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Once => "once",
+			Self::Call => "call",
+			Self::Turn => "turn",
+			Self::Session => "session",
+			Self::Persist => "persist",
+			Self::Custom(value) => value.as_str(),
+		}
+	}
+}
+
+impl FromStr for ApprovalScope {
+	type Err = core::convert::Infallible;
+
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		Ok(match value {
+			"once" => Self::Once,
+			"call" => Self::Call,
+			"turn" => Self::Turn,
+			"session" => Self::Session,
+			"persist" => Self::Persist,
+			other => Self::Custom(Str::new(other)),
+		})
+	}
+}
+
+impl Serialize for ApprovalScope {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_str(self.as_str())
+	}
+}
+
+impl<'de> Deserialize<'de> for ApprovalScope {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let value = Str::deserialize(deserializer)?;
+		Ok(Self::from_str(value.as_str()).expect("approval scope parsing is infallible"))
+	}
+}
+
+/// Durable state of an approval prompt.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-#[repr(u8)]
 pub enum TicketState {
-	/// Awaiting a single idempotent answer.
+	/// Awaiting one idempotent answer.
 	Pending,
 	/// Answered exactly once.
 	Decided,
@@ -61,10 +138,21 @@ pub enum TicketState {
 	Withdrawn,
 }
 
-/// The source that supplied an approval result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+/// Source that supplied an approval result.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-#[repr(u8)]
 pub enum ApprovalSource {
 	/// A local user answered.
 	User,
@@ -72,23 +160,23 @@ pub enum ApprovalSource {
 	External,
 	/// A parent agent answered.
 	Forwarded,
-	/// The frozen turn configuration pre-answered the ticket.
+	/// Frozen configuration pre-answered the prompt.
 	Config,
-	/// An authorized policy extension answered.
+	/// An authorized extension answered.
 	Extension,
 	/// An explicit timeout default answered.
 	Timeout,
-	/// An unreachable-route policy answered.
+	/// The requested route was unavailable.
 	Unavailable,
 }
 
-/// One idempotent durable approval result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One idempotent approval result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalDecision {
-	/// Whether all merged reasons are approved.
+	/// Whether every merged requirement is approved.
 	pub approved:   bool,
-	/// Granted policy scope.
-	pub scope:      Str,
+	/// Granted lifetime.
+	pub scope:      ApprovalScope,
 	/// Source of the answer.
 	pub source:     ApprovalSource,
 	/// Optional authenticated decider.
@@ -99,501 +187,239 @@ pub struct ApprovalDecision {
 	pub audited:    bool,
 }
 
-/// Core-owned ticket, independent of an extension coroutine lifetime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Journal-derived approval prompt projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalTicket {
-	/// Stable idempotency key for approvers.
+	/// Stable idempotency key.
 	pub ticket_id:     Str,
-	/// Invocation this ticket blocks, if any.
+	/// Invocation this prompt blocks, if any.
 	pub invocation_id: Option<Str>,
-	/// Every unresolved hook requirement in filing order.
+	/// Every unresolved requirement in filing order.
 	pub reasons:       Vec<ApprovalSpec>,
 	/// Current durable state.
 	pub state:         TicketState,
-	/// Set only once `state` becomes `Decided`.
+	/// Present only after a decision.
 	pub decision:      Option<ApprovalDecision>,
 	/// Journal-clock epoch milliseconds at filing.
 	pub created_at_ms: u64,
 }
 
-impl ApprovalTicket {
-	/// Converts this ticket to the typed transcript payload filed on creation or
-	/// merge.
-	pub fn filed_record(&self) -> omp_storage::transcript::ApprovalTicketFiled {
-		omp_storage::transcript::ApprovalTicketFiled {
-			ticket_id:     self.ticket_id.clone(),
-			invocation_id: self.invocation_id.clone(),
-			reasons:       self
-				.reasons
-				.iter()
-				.map(|reason| omp_storage::transcript::ApprovalReason {
-					title:         reason.title.clone(),
-					body:          reason.body.clone(),
-					subject:       reason.subject.clone(),
-					kind:          reason.kind.clone(),
-					scopes:        reason.scopes.clone(),
-					default:       reason.default,
-					route:         reason.route.clone(),
-					approver:      reason.approver.clone(),
-					timeout_ms:    reason.timeout_ms,
-					unreachable:   reason.unreachable.clone(),
-					require_human: reason.require_human,
-					pattern:       reason.pattern.clone(),
-					evidence:      reason.evidence.clone(),
-				})
-				.collect(),
-			created_at_ms: self.created_at_ms,
-		}
-	}
-
-	/// Converts a terminal decision or withdrawal to its typed transcript
-	/// payload.
-	pub fn decision_record(&self) -> Option<omp_storage::transcript::ApprovalDecided> {
-		let state = match self.state {
-			TicketState::Pending => return None,
-			state => sf!(<&'static str>::from(state)),
-		};
-		let decision = self.decision.as_ref();
-		Some(omp_storage::transcript::ApprovalDecided {
-			ticket_id: self.ticket_id.clone(),
-			state,
-			approved: decision.map(|value| value.approved),
-			scope: decision.map(|value| value.scope.clone()),
-			source: decision.map(|value| sf!(<&'static str>::from(value.source))),
-			decided_by: decision.and_then(|value| value.decided_by.clone()),
-			reason: decision.and_then(|value| value.reason.clone()),
-			audited: decision.is_some_and(|value| value.audited),
-		})
-	}
+/// Approval DOM operation failure.
+#[derive(Debug, Error)]
+pub enum ApprovalError {
+	/// Session persistence or DOM mutation failed.
+	#[error(transparent)]
+	Session(#[from] SessionError),
+	/// The canonical prompts subtree is absent.
+	#[error("session prompts component is absent")]
+	MissingPrompts,
+	/// The requested ticket does not exist.
+	#[error("approval ticket {id} does not exist")]
+	UnknownTicket {
+		/// Missing ticket id.
+		id: Str,
+	},
+	/// Stored prompt JSON is malformed.
+	#[error("approval prompt state is malformed")]
+	Malformed(#[from] serde_json::Error),
 }
 
-fn approval_source_from_name(source: &str) -> Option<ApprovalSource> {
-	Some(match source {
-		"user" => ApprovalSource::User,
-		"external" => ApprovalSource::External,
-		"forwarded" => ApprovalSource::Forwarded,
-		"config" => ApprovalSource::Config,
-		"extension" => ApprovalSource::Extension,
-		"timeout" => ApprovalSource::Timeout,
-		"unavailable" => ApprovalSource::Unavailable,
-		_ => return None,
-	})
-}
-
-/// In-memory index reconstructed from `ApprovalTicketFiled` and
-/// `ApprovalDecided` journal entries.
-pub struct ApprovalBook {
-	next_id:       AtomicU64,
-	ticket_prefix: Str,
-	tickets:       Mutex<BTreeMap<Str, ApprovalTicket>>,
-	by_invocation: Mutex<BTreeMap<Str, Str>>,
-}
-
-/// Awaitable host dispatch for durable approval tickets.
+/// Stateless runtime index over `<queues><prompts>`.
 ///
-/// Each request owns a one-shot response. Dropping the host inbox, dropping a
-/// received request without answering, or timing out resolves through the
-/// ticket's declared policy instead of leaving the invocation suspended.
-#[derive(Clone)]
-pub struct ApprovalRoute {
-	book:      Arc<ApprovalBook>,
-	tx:        flume::Sender<ApprovalRequest>,
-	hook_gate: Option<Arc<HookGate>>,
-}
-
-/// Host-facing receiving half of an [`ApprovalRoute`].
-pub struct ApprovalInbox {
-	rx: Receiver<ApprovalRequest>,
-}
-
-/// One pending approval delivered to a host.
-pub struct ApprovalRequest {
-	/// Durable ticket awaiting a decision.
-	pub ticket: ApprovalTicket,
-	reply:      oneshot::Sender<ApprovalDecision>,
-}
-
-impl ApprovalRequest {
-	/// Answers this request. The route's durable first-decision rule remains
-	/// authoritative if a timeout or another host has already settled it.
-	pub fn respond(self, decision: ApprovalDecision) -> Result<(), ApprovalDecision> {
-		self.reply.send(decision)
-	}
-}
-
-impl ApprovalInbox {
-	/// Receives the next pending approval request.
-	pub async fn recv(&self) -> Result<ApprovalRequest, flume::RecvError> {
-		self.rx.recv_async().await
-	}
-
-	/// Attempts to receive a pending request without waiting.
-	pub fn try_recv(&self) -> Result<ApprovalRequest, flume::TryRecvError> {
-		self.rx.try_recv()
-	}
-}
-
-impl ApprovalRoute {
-	/// Creates a route and its single host inbox.
-	pub fn new(book: Arc<ApprovalBook>, hook_gate: Option<Arc<HookGate>>) -> (Self, ApprovalInbox) {
-		let (tx, rx) = flume::unbounded();
-		(Self { book, tx, hook_gate }, ApprovalInbox { rx })
-	}
-
-	/// Files, dispatches, and awaits one durable approval ticket.
-	///
-	/// Cancellation withdraws the pending ticket. An unreachable host denies
-	/// by default and only approves when every merged requirement explicitly
-	/// declares a fail-open unreachable policy. Timeout defaults are honored
-	/// only when every requirement supplies the same default.
-	pub async fn request(
-		&self,
-		invocation_id: Option<Str>,
-		reasons: Vec<ApprovalSpec>,
-		created_at_ms: u64,
-	) -> ApprovalTicket {
-		let ticket = self.book.file(invocation_id, reasons, created_at_ms);
-		if ticket.state != TicketState::Pending {
-			return ticket;
-		}
-		let requested_at = Instant::now();
-		self.notify_requested(&ticket);
-		let _guard = self
-			.book
-			.guard(ticket.ticket_id.as_str())
-			.expect("newly filed approval ticket exists");
-		let (reply, response) = oneshot::channel();
-		let timeout_ms = ticket
-			.reasons
-			.iter()
-			.map(|reason| reason.timeout_ms)
-			.filter(|timeout| *timeout != 0)
-			.min();
-		if self
-			.tx
-			.send(ApprovalRequest { ticket: ticket.clone(), reply })
-			.is_err()
-		{
-			let resolved = self.resolve_unreachable(&ticket, "approval host disconnected");
-			self.notify_resolved(&resolved, requested_at.elapsed());
-			return resolved;
-		}
-		let decision = match timeout_ms {
-			Some(timeout_ms) => {
-				match time::timeout(Duration::from_millis(timeout_ms), response).await {
-					Ok(Ok(decision)) => decision,
-					Ok(Err(_)) => {
-						let resolved =
-							self.resolve_unreachable(&ticket, "approval host became unreachable");
-						self.notify_resolved(&resolved, requested_at.elapsed());
-						return resolved;
-					},
-					Err(_) => timeout_decision(&ticket),
-				}
-			},
-			None => match response.await {
-				Ok(decision) => decision,
-				Err(_) => {
-					let resolved = self.resolve_unreachable(&ticket, "approval host became unreachable");
-					self.notify_resolved(&resolved, requested_at.elapsed());
-					return resolved;
-				},
-			},
-		};
-		let resolved = self
-			.book
-			.decide(ticket.ticket_id.as_str(), decision)
-			.expect("dispatched approval ticket exists");
-		self.notify_resolved(&resolved, requested_at.elapsed());
-		resolved
-	}
-
-	fn notify_requested(&self, ticket: &ApprovalTicket) {
-		notify_json(
-			omp_proto::toolhost::v1::HookEventId::HookEventToolApprovalRequested,
-			self.hook_gate.as_deref(),
-			|| {
-				let target = approval_target(ticket);
-				serde_json::json!({
-					"call_id": ticket.invocation_id,
-					"ticket_id": ticket.ticket_id,
-					"target": target,
-					"reasons": ticket.reasons.iter().map(|reason| reason.title.as_str()).collect::<Vec<_>>(),
-					"requested_by": ticket.reasons.iter().find_map(|reason| reason.approver.as_deref()).unwrap_or("core"),
-				})
-			},
-		);
-	}
-
-	fn notify_resolved(&self, ticket: &ApprovalTicket, waited: Duration) {
-		notify_json(
-			omp_proto::toolhost::v1::HookEventId::HookEventToolApprovalResolved,
-			self.hook_gate.as_deref(),
-			|| {
-				let decision = ticket.decision.as_ref();
-				let resolved_by = decision
-					.and_then(|decision| decision.decided_by.as_deref())
-					.or_else(|| decision.map(|decision| <&'static str>::from(decision.source)))
-					.unwrap_or("core");
-				serde_json::json!({
-					"call_id": ticket.invocation_id,
-					"ticket_id": ticket.ticket_id,
-					"target": approval_target(ticket),
-					"approved": decision.is_some_and(|decision| decision.approved),
-					"reason": decision.and_then(|decision| decision.reason.as_deref()),
-					"resolved_by": resolved_by,
-					"waited": format!("{}ms", waited.as_millis()),
-				})
-			},
-		);
-	}
-
-	fn resolve_unreachable(&self, ticket: &ApprovalTicket, reason: &'static str) -> ApprovalTicket {
-		let approved = !ticket.reasons.is_empty()
-			&& ticket
-				.reasons
-				.iter()
-				.all(|spec| matches!(spec.unreachable.as_str(), "allow" | "approve" | "fail_open"));
-		let decision = ApprovalDecision {
-			approved,
-			scope: sf!("once"),
-			source: ApprovalSource::Unavailable,
-			decided_by: None,
-			reason: Some(sf!(reason)),
-			audited: approved,
-		};
-		self
-			.book
-			.decide(ticket.ticket_id.as_str(), decision)
-			.expect("dispatched approval ticket exists")
-	}
-}
-fn approval_target(ticket: &ApprovalTicket) -> Value {
-	let Some(reason) = ticket.reasons.first() else {
-		return serde_json::json!({"kind": "core", "name": "approval", "rev": "1", "args": {}});
-	};
-	serde_json::json!({
-		"kind": "core",
-		"name": reason.kind,
-		"rev": "1",
-		"args": {"subject": reason.subject},
-	})
-}
-
-fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
-	let mut defaults = ticket.reasons.iter().map(|reason| reason.default);
-	let first = defaults.next().flatten();
-	let approved = first.is_some() && defaults.all(|value| value == first) && first == Some(true);
-	ApprovalDecision {
-		approved,
-		scope: sf!("once"),
-		source: ApprovalSource::Timeout,
-		decided_by: None,
-		reason: Some(sf!("approval request timed out")),
-		audited: approved,
-	}
-}
-/// Invocation-owned guard that withdraws an unanswered ticket on drop.
-#[must_use]
-pub struct ApprovalGuard<'a> {
-	book:      &'a ApprovalBook,
-	ticket_id: Str,
-}
-
-impl Drop for ApprovalGuard<'_> {
-	fn drop(&mut self) {
-		let _ = self.book.withdraw(self.ticket_id.as_str());
-	}
+/// Every lookup is rebuilt from the DOM; this value owns only an id prefix and
+/// can never disagree with replayed session state.
+pub struct ApprovalBook {
+	prefix: Str,
 }
 
 impl ApprovalBook {
-	/// Creates an empty Core ticket index.
+	/// Creates the ordinary approval family.
+	#[must_use]
 	pub const fn new() -> Self {
-		Self {
-			next_id:       AtomicU64::new(1),
-			ticket_prefix: Str::new_static("approval"),
-			tickets:       Mutex::new(BTreeMap::new()),
-			by_invocation: Mutex::new(BTreeMap::new()),
-		}
+		Self { prefix: Str::new_static("approval") }
 	}
 
-	/// Creates an empty Core ticket index with a disjoint durable id namespace.
-	///
-	/// This is reserved for Core-owned approval families that share a session
-	/// journal with ordinary invocation tickets.
+	/// Creates a disjoint approval id family.
+	#[must_use]
 	pub fn with_prefix(prefix: impl Into<Str>) -> Self {
-		Self {
-			next_id:       AtomicU64::new(1),
-			ticket_prefix: prefix.into(),
-			tickets:       Mutex::new(BTreeMap::new()),
-			by_invocation: Mutex::new(BTreeMap::new()),
-		}
+		Self { prefix: prefix.into() }
 	}
 
-	/// Files or merges requirements into the one ticket for an invocation.
-	pub fn file(
+	/// Opens one prompt in the session tree.
+	pub fn open(
 		&self,
+		session: &mut Session,
+		spec: ApprovalSpec,
+	) -> Result<ApprovalTicket, ApprovalError> {
+		self.open_for(session, None, vec![spec], epoch_millis())
+	}
+
+	/// Opens or merges the prompt for an invocation.
+	pub fn open_for(
+		&self,
+		session: &mut Session,
 		invocation_id: Option<Str>,
 		reasons: Vec<ApprovalSpec>,
 		created_at_ms: u64,
-	) -> ApprovalTicket {
-		if let Some(invocation_id) = &invocation_id
-			&& let Some(ticket_id) = self.by_invocation.lock().get(invocation_id).cloned()
-		{
-			let mut tickets = self.tickets.lock();
-			let ticket = tickets
-				.get_mut(&ticket_id)
-				.expect("invocation ticket index stays coherent");
-			if ticket.state == TicketState::Pending {
-				ticket.reasons.extend(reasons);
-			}
-			return ticket.clone();
+	) -> Result<ApprovalTicket, ApprovalError> {
+		let existing = invocation_id.as_deref().and_then(|invocation_id| {
+			tickets(session).find(|(_, ticket)| {
+				ticket.invocation_id.as_deref() == Some(invocation_id)
+					&& ticket.state == TicketState::Pending
+			})
+		});
+		if let Some((handle, mut ticket)) = existing {
+			ticket.reasons.extend(reasons);
+			let encoded = serde_json::to_string(&ticket)?;
+			session.patch(Txn {
+				cause: session.head().ok_or(ApprovalError::MissingPrompts)?,
+				label: Some(Str::new_static("approval.merge")),
+				ops:   vec![Op::Set {
+					h:     handle,
+					prop:  custom("ticket"),
+					value: Value::Str(Str::new(encoded)),
+				}],
+			})?;
+			return Ok(ticket);
 		}
-		let ticket_id =
-			sf!("{}-{}", self.ticket_prefix, self.next_id.fetch_add(1, Ordering::Relaxed));
+
+		let prompts = prompts_handle(session.dom()).ok_or(ApprovalError::MissingPrompts)?;
+		let ticket_id = sf!("{}-{}", self.prefix, session.dom().high_water().saturating_add(1));
 		let ticket = ApprovalTicket {
 			ticket_id: ticket_id.clone(),
-			invocation_id: invocation_id.clone(),
+			invocation_id,
 			reasons,
 			state: TicketState::Pending,
 			decision: None,
 			created_at_ms,
 		};
-		if let Some(invocation_id) = invocation_id {
-			self
-				.by_invocation
-				.lock()
-				.insert(invocation_id, ticket_id.clone());
+		let encoded = serde_json::to_string(&ticket)?;
+		let first = ticket.reasons.first();
+		let mut node = NodeSpec::new(KnownTag::Prompt)
+			.with_prop(PropId::Kind, Value::Str(Str::new_static("approval")))
+			.with_prop(PropId::Id, Value::Str(ticket_id))
+			.with_prop(PropId::Status, Value::Str(Str::new_static("pending")))
+			.with_prop(custom("ticket"), Value::Str(Str::new(encoded)));
+		if let Some(spec) = first {
+			node = node
+				.with_prop(PropId::Label, Value::Str(spec.title.clone()))
+				.with_prop(PropId::Detail, Value::Str(spec.body.clone()))
+				.with_prop(custom("subject"), Value::Str(spec.subject.clone()))
+				.with_prop(
+					custom("scope"),
+					Value::Str(spec.scopes.first().cloned().unwrap_or_else(|| sf!("once"))),
+				)
+				.with_prop(
+					custom("timeout-ms"),
+					Value::Int(i64::try_from(spec.timeout_ms).unwrap_or(i64::MAX)),
+				);
 		}
-		self.tickets.lock().insert(ticket_id, ticket.clone());
-		ticket
+		session.patch(Txn {
+			cause: session.head().ok_or(ApprovalError::MissingPrompts)?,
+			label: Some(Str::new_static("approval.open")),
+			ops:   vec![Op::Ins {
+				parent: prompts,
+				after: session.dom().children(prompts).last().copied(),
+				node,
+			}],
+		})?;
+		Ok(ticket)
 	}
 
-	/// Applies an idempotent answer. The first answer wins permanently.
-	pub fn decide(&self, ticket_id: &str, decision: ApprovalDecision) -> Option<ApprovalTicket> {
-		let mut tickets = self.tickets.lock();
-		let ticket = tickets.get_mut(ticket_id)?;
+	/// Applies an idempotent first decision to a prompt.
+	pub fn decide(
+		&self,
+		session: &mut Session,
+		ticket_id: &str,
+		decision: ApprovalDecision,
+	) -> Result<ApprovalTicket, ApprovalError> {
+		let (handle, mut ticket) = find_ticket(session, ticket_id)?;
 		if ticket.state == TicketState::Pending {
 			ticket.state = TicketState::Decided;
-			ticket.decision = Some(decision);
+			ticket.decision = Some(decision.clone());
+			let encoded = serde_json::to_string(&ticket)?;
+			let decision_json = serde_json::to_string(&decision)?;
+			session.patch(Txn {
+				cause: session.head().ok_or(ApprovalError::MissingPrompts)?,
+				label: Some(Str::new_static("approval.decide")),
+				ops:   vec![
+					Op::Set {
+						h:     handle,
+						prop:  PropId::Status.into(),
+						value: Value::Str(sf!("decided")),
+					},
+					Op::Set {
+						h:     handle,
+						prop:  custom("ticket"),
+						value: Value::Str(Str::new(encoded)),
+					},
+					Op::Set {
+						h:     handle,
+						prop:  custom("decision"),
+						value: Value::Str(Str::new(decision_json)),
+					},
+					Op::Set {
+						h:     handle,
+						prop:  custom("approved"),
+						value: Value::Bool(decision.approved),
+					},
+					Op::Set {
+						h:     handle,
+						prop:  custom("scope"),
+						value: Value::Str(Str::new(decision.scope.as_str())),
+					},
+					Op::Set {
+						h:     handle,
+						prop:  custom("source"),
+						value: Value::Str(sf!(<&'static str>::from(decision.source))),
+					},
+				],
+			})?;
 		}
-		Some(ticket.clone())
+		Ok(ticket)
 	}
 
-	/// Marks an unanswered ticket withdrawn when its invocation guard drops.
-	pub fn withdraw(&self, ticket_id: &str) -> Option<ApprovalTicket> {
-		let mut tickets = self.tickets.lock();
-		let ticket = tickets.get_mut(ticket_id)?;
+	/// Withdraws an unanswered prompt.
+	pub fn withdraw(
+		&self,
+		session: &mut Session,
+		ticket_id: &str,
+	) -> Result<ApprovalTicket, ApprovalError> {
+		let (handle, mut ticket) = find_ticket(session, ticket_id)?;
 		if ticket.state == TicketState::Pending {
 			ticket.state = TicketState::Withdrawn;
+			let encoded = serde_json::to_string(&ticket)?;
+			session.patch(Txn {
+				cause: session.head().ok_or(ApprovalError::MissingPrompts)?,
+				label: Some(Str::new_static("approval.withdraw")),
+				ops:   vec![
+					Op::Set {
+						h:     handle,
+						prop:  PropId::Status.into(),
+						value: Value::Str(sf!("withdrawn")),
+					},
+					Op::Set {
+						h:     handle,
+						prop:  custom("ticket"),
+						value: Value::Str(Str::new(encoded)),
+					},
+				],
+			})?;
 		}
-		Some(ticket.clone())
+		Ok(ticket)
 	}
 
-	/// Returns pending tickets in filing order.
-	/// Returns one ticket by its authenticated durable identity.
-	pub fn ticket(&self, ticket_id: &str) -> Option<ApprovalTicket> {
-		self.tickets.lock().get(ticket_id).cloned()
+	/// Rebuilds one ticket from the authoritative DOM.
+	pub fn ticket(&self, session: &Session, ticket_id: &str) -> Option<ApprovalTicket> {
+		tickets(session)
+			.find_map(|(_, ticket)| (ticket.ticket_id.as_str() == ticket_id).then_some(ticket))
 	}
 
-	/// Returns pending tickets in filing order.
-	pub fn pending(&self) -> Vec<ApprovalTicket> {
-		self
-			.tickets
-			.lock()
-			.values()
-			.filter(|ticket| ticket.state == TicketState::Pending)
-			.cloned()
+	/// Rebuilds pending tickets in tree order.
+	pub fn pending(&self, session: &Session) -> Vec<ApprovalTicket> {
+		tickets(session)
+			.filter_map(|(_, ticket)| (ticket.state == TicketState::Pending).then_some(ticket))
 			.collect()
-	}
-
-	/// Restores a filed ticket from its typed durable record during session
-	/// replay.
-	pub fn restore_filed(&self, filed: omp_storage::transcript::ApprovalTicketFiled) {
-		let ticket = ApprovalTicket {
-			ticket_id:     filed.ticket_id.clone(),
-			invocation_id: filed.invocation_id.clone(),
-			reasons:       filed
-				.reasons
-				.into_iter()
-				.map(|reason| ApprovalSpec {
-					title:         reason.title,
-					body:          reason.body,
-					subject:       reason.subject,
-					kind:          reason.kind,
-					scopes:        reason.scopes,
-					default:       reason.default,
-					route:         reason.route,
-					approver:      reason.approver,
-					timeout_ms:    reason.timeout_ms,
-					unreachable:   reason.unreachable,
-					require_human: reason.require_human,
-					pattern:       reason.pattern,
-					evidence:      reason.evidence,
-				})
-				.collect(),
-			state:         TicketState::Pending,
-			decision:      None,
-			created_at_ms: filed.created_at_ms,
-		};
-		if let Some(invocation_id) = ticket.invocation_id.clone() {
-			self
-				.by_invocation
-				.lock()
-				.insert(invocation_id, ticket.ticket_id.clone());
-		}
-		if let Some(sequence) = ticket
-			.ticket_id
-			.as_str()
-			.strip_prefix(self.ticket_prefix.as_str())
-			.and_then(|value| value.strip_prefix('-'))
-			.and_then(|value| value.parse::<u64>().ok())
-		{
-			self
-				.next_id
-				.fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
-		}
-		self.tickets.lock().insert(ticket.ticket_id.clone(), ticket);
-	}
-
-	/// Restores a terminal ticket decision or withdrawal during session replay.
-	pub fn restore_decision(&self, decided: omp_storage::transcript::ApprovalDecided) {
-		let mut tickets = self.tickets.lock();
-		let Some(ticket) = tickets.get_mut(decided.ticket_id.as_str()) else {
-			return;
-		};
-		if decided.state.as_str() == "withdrawn" {
-			ticket.state = TicketState::Withdrawn;
-			return;
-		}
-		let Some((approved, scope, source)) = decided
-			.approved
-			.zip(decided.scope)
-			.zip(decided.source)
-			.and_then(|((approved, scope), source)| {
-				approval_source_from_name(source.as_str()).map(|source| (approved, scope, source))
-			})
-		else {
-			return;
-		};
-		ticket.state = TicketState::Decided;
-		ticket.decision = Some(ApprovalDecision {
-			approved,
-			scope,
-			source,
-			decided_by: decided.decided_by,
-			reason: decided.reason,
-			audited: decided.audited,
-		});
-	}
-
-	/// Returns a guard which withdraws this ticket unless it is decided first.
-	pub fn guard(&self, ticket_id: &str) -> Option<ApprovalGuard<'_>> {
-		self
-			.tickets
-			.lock()
-			.contains_key(ticket_id)
-			.then(|| ApprovalGuard { book: self, ticket_id: Str::new(ticket_id) })
 	}
 }
 
@@ -603,174 +429,247 @@ impl Default for ApprovalBook {
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use std::sync::Arc;
+fn custom(name: &'static str) -> PropKey {
+	PropKey::Custom(Str::new_static(name))
+}
 
-	use omp_proto::toolhost::v1::HookEventId;
-	use serde_json::Value;
+fn tickets(session: &Session) -> impl Iterator<Item = (Handle, ApprovalTicket)> + '_ {
+	let prompts = prompts_handle(session.dom());
+	prompts
+		.into_iter()
+		.flat_map(|prompts| session.dom().children(prompts).iter().copied())
+		.filter_map(|handle| {
+			let node = session.dom().get(handle)?;
+			if node.tag != Tag::Known(KnownTag::Prompt)
+				|| node
+					.prop(&PropKey::from(PropId::Kind))
+					.and_then(Value::as_str)
+					!= Some("approval")
+			{
+				return None;
+			}
+			let encoded = node.prop(&custom("ticket")).and_then(Value::as_str)?;
+			serde_json::from_str(encoded)
+				.ok()
+				.map(|ticket| (handle, ticket))
+		})
+}
 
-	use super::{
-		ApprovalBook, ApprovalDecision, ApprovalRoute, ApprovalSource, ApprovalSpec, TicketState,
-	};
-	use crate::{HookPhase, OnFailure, SourceRef, Subscription, When};
+fn find_ticket(
+	session: &Session,
+	ticket_id: &str,
+) -> Result<(Handle, ApprovalTicket), ApprovalError> {
+	tickets(session)
+		.find(|(_, ticket)| ticket.ticket_id.as_str() == ticket_id)
+		.ok_or_else(|| ApprovalError::UnknownTicket { id: Str::new(ticket_id) })
+}
 
-	fn subscription(event: HookEventId, id: u32) -> Subscription {
-		Subscription {
-			host: sf!("test"),
-			source: SourceRef {
-				layer:        0,
-				publisher:    sf!("test"),
-				extension_id: sf!("approval-observer"),
+fn epoch_millis() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Cloneable request/reply route between environment policy and the host actor.
+#[derive(Clone)]
+pub struct ApprovalRoute {
+	inner: Arc<RouteInner>,
+}
+
+struct RouteInner {
+	next_id:   AtomicU64,
+	tx:        flume::Sender<ApprovalRequest>,
+	pending:   Mutex<std::collections::BTreeMap<Str, PendingRequest>>,
+	#[allow(dead_code, reason = "hook dispatch is wired by the extension registrar")]
+	hook_gate: Option<Arc<crate::HookGate>>,
+}
+
+#[derive(Clone)]
+struct PendingRequest {
+	ticket: ApprovalTicket,
+	reply:  flume::Sender<ApprovalDecision>,
+}
+
+/// Host-facing receiving half of an approval route.
+pub struct ApprovalInbox {
+	rx: flume::Receiver<ApprovalRequest>,
+}
+
+/// One pending approval delivered to the host actor.
+pub struct ApprovalRequest {
+	/// Prompt awaiting a decision.
+	pub ticket: ApprovalTicket,
+	reply:      flume::Sender<ApprovalDecision>,
+}
+
+impl ApprovalRequest {
+	/// Answers the request. The first response wins.
+	pub fn respond(self, decision: ApprovalDecision) -> Result<(), ApprovalDecision> {
+		self
+			.reply
+			.try_send(decision)
+			.map_err(|error| error.into_inner())
+	}
+}
+
+impl ApprovalInbox {
+	/// Receives the next pending request.
+	pub async fn recv(&self) -> Result<ApprovalRequest, flume::RecvError> {
+		self.rx.recv_async().await
+	}
+
+	/// Attempts to receive a request without waiting.
+	pub fn try_recv(&self) -> Result<ApprovalRequest, flume::TryRecvError> {
+		self.rx.try_recv()
+	}
+}
+
+impl ApprovalRoute {
+	/// Creates a route and its single host inbox.
+	#[must_use]
+	pub fn new(
+		_book: Arc<ApprovalBook>,
+		hook_gate: Option<Arc<crate::HookGate>>,
+	) -> (Self, ApprovalInbox) {
+		let (tx, rx) = flume::unbounded();
+		(
+			Self {
+				inner: Arc::new(RouteInner {
+					next_id: AtomicU64::new(1),
+					tx,
+					pending: Mutex::new(std::collections::BTreeMap::new()),
+					hook_gate,
+				}),
 			},
-			id,
-			event,
-			phase: HookPhase::Observe,
-			order: 0,
-			on_failure: OnFailure::Defer,
-			when: When::default(),
-		}
-	}
-	fn spec() -> ApprovalSpec {
-		ApprovalSpec {
-			title:         sf!("Run"),
-			body:          sf!("run"),
-			subject:       sf!("cmd"),
-			kind:          sf!("exec"),
-			scopes:        vec![sf!("once")],
-			default:       None,
-			route:         sf!("local"),
-			approver:      None,
-			timeout_ms:    1,
-			unreachable:   sf!("fail_closed"),
-			require_human: false,
-			pattern:       None,
-			evidence:      Vec::new(),
-		}
-	}
-	#[test]
-	fn scoped_ticket_prefixes_do_not_collide_with_invocation_tickets() {
-		let ordinary = ApprovalBook::new().file(None, vec![spec()], 1);
-		let extension = ApprovalBook::with_prefix("extension-approval").file(None, vec![spec()], 1);
-		assert_eq!(ordinary.ticket_id.as_str(), "approval-1");
-		assert_eq!(extension.ticket_id.as_str(), "extension-approval-1");
-		let restored = ApprovalBook::with_prefix("extension-approval");
-		restored.restore_filed(extension.filed_record());
-		assert_eq!(restored.file(None, vec![spec()], 2).ticket_id.as_str(), "extension-approval-2");
+			ApprovalInbox { rx },
+		)
 	}
 
-	#[test]
-	fn tickets_merge_answer_idempotently_and_withdraw() {
-		let book = ApprovalBook::new();
-		let ticket = book.file(Some(sf!("i")), vec![spec()], 1);
-		assert_eq!(book.file(Some(sf!("i")), vec![spec()], 2).reasons.len(), 2);
-		let decision = ApprovalDecision {
-			approved:   true,
-			scope:      sf!("once"),
-			source:     ApprovalSource::User,
-			decided_by: None,
-			reason:     None,
-			audited:    false,
+	/// Files, dispatches, and awaits one approval prompt.
+	pub async fn request(
+		&self,
+		invocation_id: Option<Str>,
+		reasons: Vec<ApprovalSpec>,
+		created_at_ms: u64,
+	) -> ApprovalTicket {
+		let ticket_id = sf!("approval-{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+		let mut ticket = ApprovalTicket {
+			ticket_id: ticket_id.clone(),
+			invocation_id,
+			reasons,
+			state: TicketState::Pending,
+			decision: None,
+			created_at_ms,
 		};
-		assert_eq!(
-			book
-				.decide(ticket.ticket_id.as_str(), decision.clone())
-				.unwrap()
-				.decision,
-			Some(decision)
-		);
-		assert_eq!(book.withdraw(ticket.ticket_id.as_str()).unwrap().state, TicketState::Decided);
-		let withdrawn = book.file(Some(sf!("j")), vec![spec()], 3);
-		assert_eq!(
-			book.withdraw(withdrawn.ticket_id.as_str()).unwrap().state,
-			TicketState::Withdrawn
-		);
-	}
-	#[test]
-	fn guard_withdraws_unanswered_ticket() {
-		let book = ApprovalBook::new();
-		let ticket = book.file(Some(sf!("guarded")), vec![spec()], 1);
+		let (reply, response) = flume::bounded(1);
+		self
+			.inner
+			.pending
+			.lock()
+			.insert(ticket_id.clone(), PendingRequest {
+				ticket: ticket.clone(),
+				reply:  reply.clone(),
+			});
+		let timeout_ms = ticket
+			.reasons
+			.iter()
+			.map(|reason| reason.timeout_ms)
+			.filter(|value| *value != 0)
+			.min();
+		if self
+			.inner
+			.tx
+			.send(ApprovalRequest { ticket: ticket.clone(), reply })
+			.is_err()
 		{
-			let _guard = book.guard(ticket.ticket_id.as_str()).unwrap();
+			let decision = unreachable_decision(&ticket, "approval host disconnected");
+			ticket.state = TicketState::Decided;
+			ticket.decision = Some(decision);
+			self.inner.pending.lock().remove(&ticket_id);
+			return ticket;
 		}
-		assert!(book.pending().is_empty());
-	}
-
-	#[tokio::test]
-	async fn route_suspends_then_resumes_with_first_decision() {
-		let book = Arc::new(ApprovalBook::new());
-		let (route, inbox) = ApprovalRoute::new(Arc::clone(&book), None);
-		let request = route.request(Some(sf!("routed")), vec![spec()], 1);
-		let answer = async {
-			let pending = inbox.recv().await.unwrap();
-			pending
-				.respond(ApprovalDecision {
-					approved:   true,
-					scope:      sf!("once"),
-					source:     ApprovalSource::User,
-					decided_by: None,
-					reason:     None,
-					audited:    false,
-				})
-				.unwrap();
-		};
-		let (ticket, ()) = tokio::join!(request, answer);
-		assert_eq!(ticket.state, TicketState::Decided);
-		assert!(ticket.decision.unwrap().approved);
-		assert!(book.pending().is_empty());
-	}
-
-	#[tokio::test]
-	async fn route_fails_closed_when_host_is_lost() {
-		let book = Arc::new(ApprovalBook::new());
-		let (route, inbox) = ApprovalRoute::new(book, None);
-		drop(inbox);
-		let ticket = route.request(Some(sf!("lost")), vec![spec()], 1).await;
-		let decision = ticket.decision.unwrap();
-		assert!(!decision.approved);
-		assert_eq!(decision.source, ApprovalSource::Unavailable);
-		assert!(decision.reason.unwrap().contains("disconnected"));
-	}
-	#[tokio::test]
-	async fn route_emits_requested_and_resolved_through_subscribed_gate() {
-		let (gate, dispatches) = crate::HookGate::channel();
-		gate
-			.subscribe("test", [
-				subscription(HookEventId::HookEventToolApprovalRequested, 28),
-				subscription(HookEventId::HookEventToolApprovalResolved, 29),
-			])
-			.unwrap();
-		let book = Arc::new(ApprovalBook::new());
-		let (route, inbox) = ApprovalRoute::new(book, Some(Arc::new(gate)));
-		let request = route.request(Some(sf!("call-1")), vec![spec()], 1);
-		let answer = async {
-			inbox
-				.recv()
+		let decision = match timeout_ms {
+			Some(timeout_ms) => {
+				match time::timeout(Duration::from_millis(timeout_ms), response.recv_async()).await {
+					Ok(Ok(decision)) => decision,
+					Ok(Err(_)) => unreachable_decision(&ticket, "approval host became unreachable"),
+					Err(_) => timeout_decision(&ticket),
+				}
+			},
+			None => response
+				.recv_async()
 				.await
-				.unwrap()
-				.respond(ApprovalDecision {
-					approved:   true,
-					scope:      sf!("once"),
-					source:     ApprovalSource::User,
-					decided_by: Some(sf!("operator")),
-					reason:     Some(sf!("approved")),
-					audited:    false,
-				})
-				.unwrap();
+				.unwrap_or_else(|_| unreachable_decision(&ticket, "approval host became unreachable")),
 		};
-		let (ticket, ()) = tokio::join!(request, answer);
-		assert!(ticket.decision.unwrap().approved);
-		let requested = dispatches.try_recv().unwrap();
-		let resolved = dispatches.try_recv().unwrap();
-		assert_eq!(requested.event, HookEventId::HookEventToolApprovalRequested);
-		assert_eq!(resolved.event, HookEventId::HookEventToolApprovalResolved);
-		let requested: Value = serde_json::from_slice(&requested.payload).unwrap();
-		let resolved: Value = serde_json::from_slice(&resolved.payload).unwrap();
-		assert_eq!(requested["call_id"], "call-1");
-		assert_eq!(requested["target"]["name"], "exec");
-		assert_eq!(requested["reasons"], serde_json::json!(["Run"]));
-		assert_eq!(resolved["approved"], true);
-		assert_eq!(resolved["resolved_by"], "operator");
-		assert!(dispatches.try_recv().is_err());
+		self.inner.pending.lock().remove(&ticket_id);
+		ticket.state = TicketState::Decided;
+		ticket.decision = Some(decision);
+		ticket
+	}
+
+	/// Returns a currently dispatched prompt.
+	#[must_use]
+	pub fn ticket(&self, ticket_id: &str) -> Option<ApprovalTicket> {
+		self
+			.inner
+			.pending
+			.lock()
+			.get(ticket_id)
+			.map(|pending| pending.ticket.clone())
+	}
+
+	/// Returns every currently dispatched prompt in filing order.
+	#[must_use]
+	pub fn pending(&self) -> Vec<ApprovalTicket> {
+		self
+			.inner
+			.pending
+			.lock()
+			.values()
+			.map(|request| request.ticket.clone())
+			.filter(|ticket| ticket.state == TicketState::Pending)
+			.collect()
+	}
+
+	/// Sends a decision to a currently dispatched prompt.
+	pub fn decide(&self, ticket_id: &str, decision: ApprovalDecision) -> Option<ApprovalTicket> {
+		let mut pending = self.inner.pending.lock();
+		let request = pending.get_mut(ticket_id)?;
+		if request.reply.try_send(decision.clone()).is_err() {
+			return Some(request.ticket.clone());
+		}
+		request.ticket.state = TicketState::Decided;
+		request.ticket.decision = Some(decision);
+		Some(request.ticket.clone())
+	}
+}
+
+fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
+	let mut defaults = ticket.reasons.iter().map(|reason| reason.default);
+	let first = defaults.next().flatten();
+	let approved = first.is_some() && defaults.all(|value| value == first) && first == Some(true);
+	ApprovalDecision {
+		approved,
+		scope: ApprovalScope::Once,
+		source: ApprovalSource::Timeout,
+		decided_by: None,
+		reason: Some(sf!("approval request timed out")),
+		audited: approved,
+	}
+}
+
+fn unreachable_decision(ticket: &ApprovalTicket, reason: &'static str) -> ApprovalDecision {
+	let approved = !ticket.reasons.is_empty()
+		&& ticket
+			.reasons
+			.iter()
+			.all(|spec| matches!(spec.unreachable.as_str(), "allow" | "approve" | "fail_open"));
+	ApprovalDecision {
+		approved,
+		scope: ApprovalScope::Once,
+		source: ApprovalSource::Unavailable,
+		decided_by: None,
+		reason: Some(Str::new_static(reason)),
+		audited: approved,
 	}
 }

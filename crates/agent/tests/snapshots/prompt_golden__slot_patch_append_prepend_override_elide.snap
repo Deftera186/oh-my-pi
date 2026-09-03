@@ -10,7 +10,7 @@ expression: snapshot
     },
     GoldenItem {
         index: 1,
-        band: "epochal",
+        band: "dynamic",
         text: "pre-base-post",
     },
 ]
