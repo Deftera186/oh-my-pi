@@ -12,12 +12,24 @@
 export const OPENCODE_CLIENT_ID = "omp";
 
 /**
- * Routing headers for an OpenCode inference request. `x-opencode-session` is
- * emitted only when a stable session id is available; `x-opencode-client` is
- * always present.
+ * Process-stable fallback session id for direct `pi-ai` callers that omit
+ * `sessionId`. The gateway rejects inference requests without
+ * `x-opencode-session`, so the header must always be present; a single id per
+ * process keeps such calls grouped as one conversation and distinct across
+ * processes. Lazily minted so importing this module allocates nothing.
+ */
+let fallbackSessionId: string | undefined;
+
+/**
+ * Routing headers for an OpenCode inference request. `x-opencode-session`
+ * carries the caller's stable per-conversation id, falling back to a
+ * process-stable id when none is supplied so the required header is never
+ * omitted; `x-opencode-client` attributes the caller.
  */
 export function opencodeRoutingHeaders(sessionId: string | undefined): Record<string, string> {
-	const headers: Record<string, string> = { "x-opencode-client": OPENCODE_CLIENT_ID };
-	if (sessionId) headers["x-opencode-session"] = sessionId;
-	return headers;
+	fallbackSessionId ??= crypto.randomUUID();
+	return {
+		"x-opencode-client": OPENCODE_CLIENT_ID,
+		"x-opencode-session": sessionId || fallbackSessionId,
+	};
 }

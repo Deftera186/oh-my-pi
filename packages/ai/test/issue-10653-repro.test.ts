@@ -186,4 +186,25 @@ describe("issue #10653 — OpenCode routing headers", () => {
 		expect(captured?.get("x-opencode-client")).toBe("pi");
 		expect(captured?.get("x-opencode-session")).toBe("user-pinned");
 	});
+
+	it("still sends a non-empty x-opencode-session when the caller omits sessionId", async () => {
+		const capture = async () => {
+			let captured: Headers | undefined;
+			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+				captured = new Headers(init?.headers);
+				return stubJson(400);
+			}) as typeof fetch;
+			await streamOpenAICompletions(GO_OPENAI_MODEL, CONTEXT, { apiKey: "sk-go-test", fetch: fetchMock }).result();
+			return captured;
+		};
+
+		const first = await capture();
+		const second = await capture();
+		const fallback = first?.get("x-opencode-session");
+		expect(fallback).toBeTruthy();
+		expect(first?.get("x-opencode-client")).toBe("omp");
+		// The fallback identity is process-stable so a session-less caller's
+		// turns route as one conversation.
+		expect(second?.get("x-opencode-session")).toBe(fallback);
+	});
 });
