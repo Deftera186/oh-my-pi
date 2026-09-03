@@ -37,7 +37,11 @@ pub struct Entry {
 
 impl Entry {
 	fn new(path: &str, directory: bool) -> Self {
-		let path = if directory { sf!("{path}/") } else { Str::new(path) };
+		let path = if directory {
+			sf!("{path}/")
+		} else {
+			Str::new(path)
+		};
 		let lower = Str::new(&path.to_ascii_lowercase());
 		Self { path, lower, directory }
 	}
@@ -105,7 +109,14 @@ impl ProjectFiles {
 			// pi: a bare `@` lists the root directory.
 			let mut top: SmallVec<&Entry, 8> = entries
 				.iter()
-				.filter(|entry| entry.path.trim_end_matches('/').as_bytes().iter().all(|byte| *byte != b'/'))
+				.filter(|entry| {
+					entry
+						.path
+						.trim_end_matches('/')
+						.as_bytes()
+						.iter()
+						.all(|byte| *byte != b'/')
+				})
 				.collect();
 			top.sort_by(|a, b| a.lower.cmp(&b.lower));
 			top.truncate(MAX_ROWS);

@@ -111,10 +111,9 @@ pub(crate) fn token_end(text: &str, cursor: usize) -> usize {
 /// Whether `at` starts a token: text start, or preceded by whitespace or
 /// one of pi's opening boundary characters (`"'`(<=`).
 pub(crate) fn is_token_start(text: &str, at: usize) -> bool {
-	text[..at]
-		.chars()
-		.next_back()
-		.is_none_or(|previous| previous.is_whitespace() || matches!(previous, '"' | '\'' | '`' | '(' | '<' | '='))
+	text[..at].chars().next_back().is_none_or(|previous| {
+		previous.is_whitespace() || matches!(previous, '"' | '\'' | '`' | '(' | '<' | '=')
+	})
 }
 
 /// pi `fuzzyMatch` (subsequence) + `fuzzyScore`: exact 100, prefix 80,

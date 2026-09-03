@@ -48,6 +48,8 @@ macro_rules! for_each_prop {
 			Bleed("bleed") => bleed: bool [default bool = false; "Reports whether the background extends through the border."];
 			/// Excludes the subtree's text from host-driven selection and copy.
 			NoSelect("noselect") => noselect: bool [default bool = false; "Reports whether the subtree opts out of host text selection."];
+			/// Terminal shell-integration zone the component's rows form (`prompt`: OSC 133 prompt zone).
+			Zone("zone") => zone: Str;
 			/// Display title for a container or step.
 			Title("title") => title: Str [ref Str; "Returns the user-facing component title."];
 			/// Horizontal placement of the border title.
@@ -171,6 +173,8 @@ macro_rules! for_each_prop {
 			Match("match") => match_pattern: Str;
 			/// Image or external content source.
 			Src("src") => src: Str;
+			/// Source file path whose extension selects diff syntax highlighting.
+			Path("path") => path: Str [ref Str; "Returns the source file path used to infer a language."];
 			/// Leading icon name.
 			Icon("icon") => icon: Str;
 			/// Compact status label.
@@ -250,6 +254,8 @@ macro_rules! for_each_component {
 			radio => Radio;
 			segmented => Segmented;
 			checkbox => Checkbox;
+			spinner => Spinner;
+			strike => Strike;
 			status => Status;
 			input => Input;
 			button => Button;
@@ -262,6 +268,7 @@ macro_rules! for_each_component {
 			qr => Qr;
 			time => Time;
 			img => Img;
+			diff => DiffView;
 			logo => Logo;
 			editor => EditorPane;
 			wizard => Wizard;
@@ -486,10 +493,30 @@ pub enum PropId {
 	TokensOut,
 	/// Cost in nano-US dollars.
 	CostNanoUsd,
+	/// Prompt-cache tokens read.
+	CacheRead,
+	/// Prompt-cache tokens written.
+	CacheWrite,
+	/// Milliseconds from request start to the first streamed token.
+	TtftMs,
+	/// Milliseconds from request start to completion.
+	DurationMs,
 	/// Compaction boundary.
 	Boundary,
 	/// Content-addressed summary.
 	Summary,
+	/// Maintenance method that produced a summary (compaction, handoff, …).
+	Method,
+	/// Context tokens before a maintenance step.
+	TokensBefore,
+	/// Context tokens after a maintenance step.
+	TokensAfter,
+	/// Human-readable warning attached to an element.
+	Warning,
+	/// Message author attribution (a collaboration guest, an agent).
+	Author,
+	/// Whether a user message was synthesized by an agent rather than typed.
+	Synthetic,
 	/// Turn ordinal.
 	Turn,
 	/// Element ordinal.

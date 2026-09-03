@@ -10,8 +10,18 @@ use super::is_token_start;
 
 /// Candidate kinds, in pi's display order.
 const KINDS: [Kind; 2] = [
-	Kind { qualifier: "pr", label: "PR", description: "GitHub pull request", icon: Icon::Pr },
-	Kind { qualifier: "issue", label: "Issue", description: "GitHub issue", icon: Icon::Issue },
+	Kind {
+		qualifier:   "pr",
+		label:       "PR",
+		description: "GitHub pull request",
+		icon:        Icon::Pr,
+	},
+	Kind {
+		qualifier:   "issue",
+		label:       "Issue",
+		description: "GitHub issue",
+		icon:        Icon::Issue,
+	},
 ];
 
 #[derive(Clone, Copy)]
@@ -40,16 +50,22 @@ pub fn ref_context(text: &str, cursor: usize) -> Option<RefContext> {
 	let before = text.get(..cursor)?;
 	let hash = before.rfind('#')?;
 	let digits = &before[hash + 1..];
-	if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) || digits.starts_with('0')
+	if digits.is_empty()
+		|| !digits.bytes().all(|byte| byte.is_ascii_digit())
+		|| digits.starts_with('0')
 	{
 		return None;
 	}
 	let head = &before[..hash];
 	let word_end = head.trim_end_matches(char::is_whitespace).len();
 	let qualified = word_end < head.len();
+	// The boundary before the qualifier word may be a multibyte glyph (a
+	// nerd-font chip such as `\u{f15c} #1`), so step past its whole encoding.
 	let word_start = head[..word_end]
-		.rfind(|character: char| !character.is_ascii_alphabetic())
-		.map_or(0, |at| at + 1);
+		.char_indices()
+		.rev()
+		.find(|(_, character)| !character.is_ascii_alphabetic())
+		.map_or(0, |(at, character)| at + character.len_utf8());
 	let word = &head[word_start..word_end];
 	let qualifier = match (qualified, word.to_ascii_lowercase().as_str()) {
 		(true, "pr" | "pull") if is_token_start(text, word_start) => Some("pr"),
@@ -60,7 +76,11 @@ pub fn ref_context(text: &str, cursor: usize) -> Option<RefContext> {
 		return None;
 	}
 	Some(RefContext {
-		start: if qualifier.is_some() { word_start } else { hash },
+		start: if qualifier.is_some() {
+			word_start
+		} else {
+			hash
+		},
 		qualifier,
 		number: Str::new(digits),
 	})
@@ -74,7 +94,11 @@ impl EditorCompletion for GithubRefs {
 		let context = ref_context(text, cursor)?;
 		let items = KINDS
 			.iter()
-			.filter(|kind| context.qualifier.is_none_or(|wanted| wanted == kind.qualifier))
+			.filter(|kind| {
+				context
+					.qualifier
+					.is_none_or(|wanted| wanted == kind.qualifier)
+			})
 			.map(|kind| {
 				Suggestion::new(
 					sf!("{}://{} ", kind.qualifier, context.number),
@@ -121,5 +145,17 @@ mod tests {
 		assert!(refs.suggest("#copy", 5).is_none());
 		assert!(refs.suggest("#012", 4).is_none());
 		assert!(refs.suggest("#", 1).is_none());
+	}
+
+	/// A collapsed-paste chip (`<nerd glyph> #1`) puts a three-byte glyph
+	/// right before the `#`: the qualifier scan must land on a char boundary.
+	#[test]
+	fn multibyte_glyph_before_the_hash_never_panics() {
+		let mut refs = GithubRefs;
+		let chip = "\u{f15c} #1";
+		let suggestions = refs.suggest(chip, chip.len()).expect("standalone #1 still offers rows");
+		assert_eq!(suggestions.range, 4..chip.len());
+		assert!(refs.suggest("\u{f15c}#1", "\u{f15c}#1".len()).is_none());
+		assert!(refs.suggest("日本 pr #1", "日本 pr #1".len()).is_some());
 	}
 }

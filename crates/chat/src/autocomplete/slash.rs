@@ -32,8 +32,7 @@ const ICONS: [(&str, Icon); 14] = [
 /// Builds the slash palette from `con`'s statically registered commands.
 #[must_use]
 pub fn roster(con: &Arc<Ctx>) -> Vec<Command> {
-	con
-		.items()
+	con.items()
 		.filter_map(|item| match item {
 			RegItem::Cmd(spec) => Some(spec),
 			RegItem::Var(_) | RegItem::Action(_) => None,
@@ -55,8 +54,7 @@ pub fn roster(con: &Arc<Ctx>) -> Vec<Command> {
 					line.push(' ');
 					line.push_str(partial);
 					let cursor = line.len();
-					con
-						.complete(line.as_str(), cursor)
+					con.complete(line.as_str(), cursor)
 						.into_iter()
 						.map(|suggestion| CommandArgument {
 							value:       suggestion.text,

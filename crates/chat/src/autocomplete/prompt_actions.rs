@@ -138,7 +138,10 @@ impl EditorCompletion for PromptActions {
 			.enumerate()
 			.filter_map(|(index, definition)| {
 				let mut searchable = String::with_capacity(
-					definition.label.len() + definition.description.len() + definition.keywords.len() + 2,
+					definition.label.len()
+						+ definition.description.len()
+						+ definition.keywords.len()
+						+ 2,
 				);
 				searchable.push_str(definition.label);
 				searchable.push(' ');
@@ -177,7 +180,9 @@ impl EditorCompletion for PromptActions {
 		else {
 			return;
 		};
-		self.pending.set(Some((definition.build)(Str::new(replaced))));
+		self
+			.pending
+			.set(Some((definition.build)(Str::new(replaced))));
 	}
 }
 

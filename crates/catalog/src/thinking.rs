@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 use strum::{Display, EnumString, IntoStaticStr, VariantNames};
 
 use crate::{
+	capability::ReasoningEffort,
 	id::{ThinkingPolicyId, WireModelId},
 	policy::content_id,
 };
@@ -79,6 +80,34 @@ impl ThinkingEffort {
 			Self::Max => ("max", "Maximum reasoning the model supports"),
 		};
 		ThinkingEffortMetadata { effort: self, label, description }
+	}
+}
+
+impl From<ReasoningEffort> for ThinkingEffort {
+	fn from(effort: ReasoningEffort) -> Self {
+		match effort {
+			ReasoningEffort::Off => Self::Off,
+			ReasoningEffort::Minimal => Self::Minimal,
+			ReasoningEffort::Low => Self::Low,
+			ReasoningEffort::Medium => Self::Medium,
+			ReasoningEffort::High => Self::High,
+			ReasoningEffort::Xhigh => Self::XHigh,
+			ReasoningEffort::Max => Self::Max,
+		}
+	}
+}
+
+impl From<ThinkingEffort> for ReasoningEffort {
+	fn from(effort: ThinkingEffort) -> Self {
+		match effort {
+			ThinkingEffort::Off => Self::Off,
+			ThinkingEffort::Minimal => Self::Minimal,
+			ThinkingEffort::Low => Self::Low,
+			ThinkingEffort::Medium => Self::Medium,
+			ThinkingEffort::High => Self::High,
+			ThinkingEffort::XHigh => Self::Xhigh,
+			ThinkingEffort::Max => Self::Max,
+		}
 	}
 }
 
