@@ -1,8 +1,8 @@
 //! Canonical native storage roots and the owner's private data directory.
 //!
-//! Configuration remains in the native `OMP_CONFIG_DIR`/`~/.omp` authority;
-//! mutable application data is split by XDG purpose so caches can be discarded
-//! without losing durable state.
+//! Configuration lives in the owner's `~/.o2` directory (`OMP_CONFIG_DIR`
+//! overrides it; see [`config_dir`]); mutable application data is split by
+//! XDG purpose so caches can be discarded without losing durable state.
 //!
 //! ```no_run
 //! let data = omp_core::dirs::data_dir(None)?;
@@ -82,6 +82,22 @@ pub fn selected_profile() -> Option<&'static str> {
 		.and_then(|profile| profile.as_deref())
 }
 
+/// Default configuration directory name under the owner's home.
+///
+/// Pinned by the owner: user configuration (`config.cfg`, agent assets, cfg
+/// scripts) lives in `~/.o2`, never in the data or XDG config roots.
+pub const CONFIG_DIR_NAME: &str = ".o2";
+
+/// Resolves the owner's configuration directory.
+///
+/// `OMP_CONFIG_DIR` wins when set and non-empty; otherwise `<home>/.o2`.
+#[must_use]
+pub fn config_dir(home: &Path) -> PathBuf {
+	env::var_os("OMP_CONFIG_DIR")
+		.filter(|value| !value.is_empty())
+		.map_or_else(|| home.join(CONFIG_DIR_NAME), PathBuf::from)
+}
+
 /// Failure to resolve the owner's private data directory.
 #[derive(Clone, Copy, Debug, Error)]
 pub enum DataDirError {
@@ -110,4 +126,22 @@ pub fn data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, DataDirError> {
 		native_directories(&home).data
 	};
 	Ok(selected_profile().map_or(base.clone(), |profile| base.join("profiles").join(profile)))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::Path;
+
+	use super::{CONFIG_DIR_NAME, config_dir};
+
+	#[test]
+	fn config_dir_defaults_to_dot_o2_under_home() {
+		// The env override is process-global; this test only asserts the
+		// pinned default when it is absent.
+		if std::env::var_os("OMP_CONFIG_DIR").is_some_and(|value| !value.is_empty()) {
+			return;
+		}
+		assert_eq!(CONFIG_DIR_NAME, ".o2");
+		assert_eq!(config_dir(Path::new("/home/owner")), Path::new("/home/owner/.o2"));
+	}
 }
