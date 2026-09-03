@@ -3268,6 +3268,13 @@ export class AgentSession {
 				return;
 			}
 			if (unexpectedStopOutcome === "terminal") {
+				// agent-core finalizes `message_end` and `agent_end.messages` as
+				// separate objects. Propagate the synthetic cap failure into the
+				// public terminal event so RPC/ACP/notification consumers see it.
+				if (fallbackAssistant) {
+					fallbackAssistant.stopReason = msg.stopReason;
+					fallbackAssistant.errorMessage = msg.errorMessage;
+				}
 				// The retry cap already marked the turn as an error and emitted
 				// auto_retry_end. Skip the retry/fallback gates below so the
 				// advertised terminal cap never switches models or issues another

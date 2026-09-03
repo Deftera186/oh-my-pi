@@ -285,8 +285,10 @@ describe("AgentSession unexpected stop guard", () => {
 			},
 		);
 		let retryEnd: Extract<AgentSessionEvent, { type: "auto_retry_end" }> | undefined;
+		let terminalAgentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEnd = event;
+			if (event.type === "agent_end" && event.isTerminal) terminalAgentEnd = event;
 		});
 
 		await session.prompt("do the thing");
@@ -297,6 +299,10 @@ describe("AgentSession unexpected stop guard", () => {
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(3);
 		expect(warnSpy).toHaveBeenCalled();
 		expect(session.getLastAssistantMessage()).toMatchObject({
+			stopReason: "error",
+			errorMessage: expect.stringContaining("stopped unexpectedly after 3 recovery retries"),
+		});
+		expect(terminalAgentEnd?.messages.findLast(message => message.role === "assistant")).toMatchObject({
 			stopReason: "error",
 			errorMessage: expect.stringContaining("stopped unexpectedly after 3 recovery retries"),
 		});
