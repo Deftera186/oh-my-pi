@@ -6,14 +6,16 @@
  * notice: enforced starting 2026-09). Because the header-less caller is OMP's
  * own outbound request layer, users cannot add it on their side.
  *
- * Root cause: neither the OpenAI-family request setup
- * (`resolveOpenAIRequestSetup`) nor the Anthropic client builder
- * (`buildAnthropicClientOptions`) attached OpenCode routing headers. The fix
- * sends `x-opencode-session: <sessionId>` and `x-opencode-client: omp` as
- * defaults on both transports, with explicit user/config `headers` winning.
+ * Root cause: the OpenAI-family request setup
+ * (`resolveOpenAIRequestSetup`), Anthropic client builder
+ * (`buildAnthropicClientOptions`), and Google transport (`streamGoogle`) did
+ * not attach OpenCode routing headers. The fix sends `x-opencode-session:
+ * <sessionId>` and `x-opencode-client: omp` as defaults on every transport,
+ * with explicit user/config `headers` winning.
  */
 import { describe, expect, it } from "bun:test";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type { Context, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
@@ -44,6 +46,19 @@ const ZEN_ANTHROPIC_MODEL: Model<"anthropic-messages"> = buildModel({
 	contextWindow: 200_000,
 	maxTokens: 8_192,
 } as ModelSpec<"anthropic-messages">);
+
+const ZEN_GOOGLE_MODEL: Model<"google-generative-ai"> = buildModel({
+	id: "gemini-3-pro-preview",
+	name: "Gemini 3 Pro Preview",
+	api: "google-generative-ai",
+	provider: "opencode-zen",
+	baseUrl: "https://opencode.ai/zen/v1",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1_000_000,
+	maxTokens: 65_536,
+} as ModelSpec<"google-generative-ai">);
 
 const GO_RESPONSES_MODEL: Model<"openai-responses"> = buildModel({
 	id: "deepseek-v4-flash",
@@ -117,6 +132,41 @@ describe("issue #10653 — OpenCode routing headers", () => {
 
 		expect(captured?.get("x-opencode-session")).toBe("conv-resp-456");
 		expect(captured?.get("x-opencode-client")).toBe("omp");
+	});
+
+	it("attaches x-opencode-session + x-opencode-client on opencode-zen Google requests", async () => {
+		let captured: Headers | undefined;
+		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+			captured = new Headers(init?.headers);
+			return stubJson(400);
+		}) as typeof fetch;
+
+		await streamGoogle(ZEN_GOOGLE_MODEL, CONTEXT, {
+			apiKey: "sk-zen-test",
+			sessionId: "conv-google-789",
+			fetch: fetchMock,
+		}).result();
+
+		expect(captured?.get("x-opencode-session")).toBe("conv-google-789");
+		expect(captured?.get("x-opencode-client")).toBe("omp");
+	});
+
+	it("lets explicit Google headers override OpenCode routing defaults", async () => {
+		let captured: Headers | undefined;
+		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+			captured = new Headers(init?.headers);
+			return stubJson(400);
+		}) as typeof fetch;
+
+		await streamGoogle(ZEN_GOOGLE_MODEL, CONTEXT, {
+			apiKey: "sk-zen-test",
+			sessionId: "conv-google-789",
+			headers: { "x-opencode-client": "pi", "x-opencode-session": "user-google" },
+			fetch: fetchMock,
+		}).result();
+
+		expect(captured?.get("x-opencode-client")).toBe("pi");
+		expect(captured?.get("x-opencode-session")).toBe("user-google");
 	});
 
 	it("lets an explicit user header override the default x-opencode-client", async () => {

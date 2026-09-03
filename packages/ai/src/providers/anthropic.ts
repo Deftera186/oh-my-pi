@@ -8,7 +8,7 @@ import { mapEffortToAnthropicAdaptiveEffort } from "@oh-my-pi/pi-catalog/model-t
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
-import { opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
+import { isOpenCodeProvider, opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	getInstallId,
@@ -3339,7 +3339,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		// on inference requests and errors header-less callers; `x-opencode-client`
 		// attributes the request for upstream stats. Defaults only — user/model
 		// headers already merged into `defaultHeaders` win.
-		if (model.provider === "opencode-go" || model.provider === "opencode-zen") {
+		if (isOpenCodeProvider(model.provider)) {
 			const routing = opencodeRoutingHeaders(claudeCodeSessionId);
 			for (const name in routing) {
 				if (getHeaderCaseInsensitive(defaultHeaders, name) === undefined) defaultHeaders[name] = routing[name];

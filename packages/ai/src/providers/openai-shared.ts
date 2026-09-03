@@ -21,7 +21,7 @@ import {
 	removeBlankCoreWeaveProjectHeaders,
 } from "@oh-my-pi/pi-catalog/wire/coreweave";
 import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copilot";
-import { opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
+import { isOpenCodeProvider, opencodeRoutingHeaders } from "@oh-my-pi/pi-catalog/wire/opencode";
 import {
 	$env,
 	classifyJsonPrefix,
@@ -321,7 +321,7 @@ export function resolveOpenAIRequestSetup(
 	// inference requests and error header-less callers; `x-opencode-client`
 	// attributes the request for upstream stats. Defaults only — explicit
 	// user/config headers of the same name already sit in `headers` and win.
-	if (model.provider === "opencode-go" || model.provider === "opencode-zen") {
+	if (isOpenCodeProvider(model.provider)) {
 		const routing = opencodeRoutingHeaders(options.opencodeSessionId);
 		for (const name in routing) {
 			setHeaderIfAbsent(headers, name, routing[name]);
