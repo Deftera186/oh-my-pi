@@ -1,11 +1,5 @@
-//! Application-owned durable subagent supervision and settings.
+//! Journal-first subagent composition and session-owned tools.
 
-pub mod advisor_child;
-pub mod artifacts;
-pub mod output;
-pub mod prewalk;
-pub mod prompt;
+pub mod hub;
 pub mod settings;
-pub mod snapshot;
-pub mod supervisor;
-pub mod yield_driver;
+pub mod spawn;

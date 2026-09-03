@@ -6,7 +6,6 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use omp_core::Str;
-use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain};
 use omp_walker::WalkRequest;
 
 use super::{
@@ -17,6 +16,20 @@ use super::{
 	rules::{self, RuleSource},
 	skills::{self, SkillDiscoverySettings, SkillSource},
 };
+use crate::settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain};
+
+omp_con::var! {
+	/// Enables read-only repository-surface foreign content imports.
+	pub static SV_FOREIGN_CONTENT_ENABLED = sv_foreign_content_enabled: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+	/// Allowed foreign repository content families.
+	pub static SV_FOREIGN_CONTENT_FAMILIES = sv_foreign_content_families: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+}
 
 /// Native settings projection for repo-surface foreign content families.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -33,6 +46,18 @@ impl Default for ForeignContentSettings {
 		Self { enabled: true, enabled_families: BTreeSet::new() }
 	}
 }
+
+impl ForeignContentSettings {
+	/// Resolves foreign-content discovery policy from the process console.
+	#[must_use]
+	pub fn from_con(ctx: &omp_con::Ctx) -> Self {
+		Self {
+			enabled:          SV_FOREIGN_CONTENT_ENABLED.get(ctx),
+			enabled_families: SV_FOREIGN_CONTENT_FAMILIES.get(ctx).into_iter().collect(),
+		}
+	}
+}
+
 const FOREIGN_SCOPES: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 
 impl SettingsDomain for ForeignContentSettings {

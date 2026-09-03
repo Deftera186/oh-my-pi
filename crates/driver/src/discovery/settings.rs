@@ -1,10 +1,13 @@
 //! Layered settings projection owned by the discovery runtime.
 
+use omp_con::{Kv, Value};
 use omp_core::Str;
-use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use serde::{Deserialize, Serialize};
 
 use super::manifest::CapabilityKind;
+use crate::settings::{
+	FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
+};
 
 const PERSISTED: &[SettingScope] = &[SettingScope::Global, SettingScope::Project];
 
@@ -15,6 +18,24 @@ pub struct BuiltinShadow {
 	pub kind: CapabilityKind,
 	/// Stable capability key claimed by user configuration.
 	pub key:  Str,
+}
+
+omp_con::var! {
+	/// Discovery providers disabled across every capability.
+	pub static SV_DISCOVERY_DISABLED_PROVIDERS = sv_discovery_disabled_providers: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+	/// Individual discovery sources disabled without disabling their provider.
+	pub static SV_DISCOVERY_DISABLED_SOURCES = sv_discovery_disabled_sources: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+	/// Explicit user claims over bundled capability names.
+	pub static SV_DISCOVERY_BUILTIN_SHADOWS = sv_discovery_builtin_shadows: Vec<Kv> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
 }
 
 /// Layered discovery provider, source, and built-in-shadow policy.
@@ -32,6 +53,31 @@ pub struct DiscoverySettings {
 }
 
 impl DiscoverySettings {
+	/// Resolves discovery policy from the process console context.
+	#[must_use]
+	pub fn from_con(ctx: &omp_con::Ctx) -> Self {
+		let builtin_shadows = SV_DISCOVERY_BUILTIN_SHADOWS
+			.get(ctx)
+			.into_iter()
+			.filter_map(|entry| {
+				let kind = match entry.get("kind")? {
+					Value::Str(value) | Value::Enum(value) => value.parse().ok()?,
+					_ => return None,
+				};
+				let key = match entry.get("key")? {
+					Value::Str(value) | Value::Enum(value) => value.clone(),
+					_ => return None,
+				};
+				Some(BuiltinShadow { kind, key })
+			})
+			.collect();
+		Self {
+			disabled_providers: SV_DISCOVERY_DISABLED_PROVIDERS.get(ctx),
+			disabled_sources: SV_DISCOVERY_DISABLED_SOURCES.get(ctx),
+			builtin_shadows,
+		}
+	}
+
 	/// Returns whether the provider is enabled by the immutable projection.
 	pub fn provider_enabled(&self, provider_id: &str) -> bool {
 		!self
@@ -112,34 +158,27 @@ impl SettingsDomain for DiscoverySettings {
 
 #[cfg(test)]
 mod tests {
-	use omp_settings::{SettingsCatalog, SettingsSnapshot};
-
 	use super::*;
-
-	const CATALOG: SettingsCatalog =
-		SettingsCatalog::new(&[&omp_settings::SETTINGS_CONTRIBUTION, &crate::SETTINGS_CONTRIBUTION]);
 
 	#[test]
 	fn discovery_settings_projection_is_typed() {
-		let configured = DiscoverySettings {
-			disabled_providers: vec!["foreign-content".into()],
-			disabled_sources:   vec!["project-rules".into()],
-			builtin_shadows:    vec![BuiltinShadow {
-				kind: CapabilityKind::Skills,
-				key:  "rust".into(),
-			}],
-		};
-		let snapshot = SettingsSnapshot::isolated(configured, CATALOG).expect("isolated settings");
-		let projection = snapshot
-			.project::<DiscoverySettings>()
-			.expect("typed projection");
-		assert!(!projection.get().provider_enabled("foreign-content"));
-		assert!(!projection.get().source_enabled("project-rules"));
-		assert!(
-			projection
-				.get()
-				.shadows_builtin(CapabilityKind::Skills, "rust")
-		);
+		let ctx = omp_con::Ctx::new();
+		SV_DISCOVERY_DISABLED_PROVIDERS
+			.set(&ctx, vec!["foreign-content".into()])
+			.expect("provider setting");
+		SV_DISCOVERY_DISABLED_SOURCES
+			.set(&ctx, vec!["project-rules".into()])
+			.expect("source setting");
+		SV_DISCOVERY_BUILTIN_SHADOWS
+			.set(&ctx, vec![Kv(vec![
+				("kind".into(), Value::Str("skills".into())),
+				("key".into(), Value::Str("rust".into())),
+			])])
+			.expect("shadow setting");
+		let settings = DiscoverySettings::from_con(&ctx);
+		assert!(!settings.provider_enabled("foreign-content"));
+		assert!(!settings.source_enabled("project-rules"));
+		assert!(settings.shadows_builtin(CapabilityKind::Skills, "rust"));
 	}
 
 	#[test]

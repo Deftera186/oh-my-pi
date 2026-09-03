@@ -8,7 +8,6 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_settings::{FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError};
 use omp_walker::{FollowLinks, WalkRequest};
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +17,9 @@ use super::{
 		CapabilityPayload, DiscoveredCapability, SkillFrontmatter, SkillPayload, SourceProvenance,
 		SourceScope,
 	},
+};
+use crate::settings::{
+	FieldDescriptor, SettingKind, SettingScope, SettingsDomain, ValidationError,
 };
 
 /// Provenance for a skill discovery root.
@@ -64,6 +66,44 @@ pub struct SkillSource {
 	pub kind:                SkillSourceKind,
 }
 
+omp_con::var! {
+	/// Enables skill discovery and invocation.
+	pub static SV_SKILLS_ENABLED = sv_skills_enabled: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+	/// Source IDs excluded before skill names claim precedence.
+	pub static SV_SKILLS_DISABLED_SOURCES = sv_skills_disabled_sources: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+	/// Optional skill-name inclusion globs.
+	pub static SV_SKILLS_INCLUDE = sv_skills_include: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+	/// Skill-name exclusion globs.
+	pub static SV_SKILLS_IGNORE = sv_skills_ignore: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+	/// Explicit skill names disabled before collision handling.
+	pub static SV_SKILLS_DISABLED = sv_skills_disabled: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+	/// Enables repo-surface third-party skill families.
+	pub static SV_SKILLS_THIRD_PARTY_ENABLED = sv_skills_third_party_enabled: bool {
+		default: true,
+		flags: archive | inherit,
+	};
+	/// Additional native authored skill roots.
+	pub static SV_SKILLS_CUSTOM_DIRECTORIES = sv_skills_custom_directories: Vec<Str> {
+		default: Vec::new(),
+		flags: archive | inherit,
+	};
+}
+
 /// Settings projection applied before skill names claim precedence.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -95,6 +135,26 @@ impl Default for SkillDiscoverySettings {
 			disabled_skills:     BTreeSet::new(),
 			third_party_enabled: true,
 			custom_directories:  Vec::new(),
+		}
+	}
+}
+
+impl SkillDiscoverySettings {
+	/// Resolves skill discovery policy from the process console context.
+	#[must_use]
+	pub fn from_con(ctx: &omp_con::Ctx) -> Self {
+		Self {
+			enabled:             SV_SKILLS_ENABLED.get(ctx),
+			disabled_sources:    SV_SKILLS_DISABLED_SOURCES.get(ctx).into_iter().collect(),
+			include:             SV_SKILLS_INCLUDE.get(ctx),
+			ignore:              SV_SKILLS_IGNORE.get(ctx),
+			disabled_skills:     SV_SKILLS_DISABLED.get(ctx).into_iter().collect(),
+			third_party_enabled: SV_SKILLS_THIRD_PARTY_ENABLED.get(ctx),
+			custom_directories:  SV_SKILLS_CUSTOM_DIRECTORIES
+				.get(ctx)
+				.into_iter()
+				.map(|path| PathBuf::from(path.as_str()))
+				.collect(),
 		}
 	}
 }

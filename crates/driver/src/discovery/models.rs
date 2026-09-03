@@ -17,6 +17,23 @@ use omp_catalog::{
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use toml::{de, ser};
+
+fn atomic_replace(path: &Path, contents: &str) -> io::Result<()> {
+	let mut temporary = path.as_os_str().to_owned();
+	temporary.push(format!(".tmp-{}", std::process::id()));
+	let temporary = PathBuf::from(temporary);
+	let result = (|| {
+		let file = fs::File::create(&temporary)?;
+		io::Write::write_all(&mut &file, contents.as_bytes())?;
+		file.sync_all()?;
+		fs::rename(&temporary, path)
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temporary);
+	}
+	result
+}
+
 /// Native model configuration. TOML is OMP's native serialization.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ModelsConfig {
@@ -169,7 +186,7 @@ pub fn load_or_import_legacy(
 		.map(|(name, yaml)| (directory.join(name), yaml))
 		.find(|(path, _)| path.exists())
 	else {
-		omp_settings::io::atomic_replace(&marker, "revision = 1\n")?;
+		atomic_replace(&marker, "revision = 1\n")?;
 		return Ok(None);
 	};
 	let text = fs::read_to_string(&path)?;
@@ -178,7 +195,7 @@ pub fn load_or_import_legacy(
 	} else {
 		omp_slopjson::from_str(&text)?
 	};
-	omp_settings::io::atomic_replace(&native, &toml::to_string_pretty(&config)?)?;
+	atomic_replace(&native, &toml::to_string_pretty(&config)?)?;
 	let backup = path.with_file_name(format!(
 		"{}.pre-omp-migration.bak",
 		path
@@ -191,7 +208,7 @@ pub fn load_or_import_legacy(
 		backup,
 		source,
 	})?;
-	omp_settings::io::atomic_replace(
+	atomic_replace(
 		&marker,
 		if yaml {
 			"revision = 1\nsource = \"legacy-yaml\"\n"
@@ -767,9 +784,6 @@ pub enum ModelsConfigError {
 	/// Native TOML encoding failed.
 	#[error(transparent)]
 	Encode(#[from] ser::Error),
-	/// Atomic persistence failed.
-	#[error(transparent)]
-	Persist(#[from] omp_settings::io::SettingsIoError),
 	/// A legacy source backup failed.
 	#[error("failed to back up model config {path} to {backup}")]
 	Backup {

@@ -64,24 +64,6 @@ pub enum CommitError {
 		#[source]
 		source:   Box<crate::registry::RegistryError>,
 	},
-	/// Project settings could not be opened.
-	#[error("commit settings for {project:?} could not be opened")]
-	SettingsManager {
-		/// Project whose settings were requested.
-		project: PathBuf,
-		/// Typed settings-manager failure.
-		#[source]
-		source:  omp_settings::manager::SettingsManagerError,
-	},
-	/// Project model settings could not be projected.
-	#[error("commit model settings for {project:?} could not be projected")]
-	SettingsSnapshot {
-		/// Project whose model settings were requested.
-		project: PathBuf,
-		/// Typed settings projection failure.
-		#[source]
-		source:  omp_settings::SnapshotError,
-	},
 	/// The requested commit model selector could not be resolved.
 	#[error("commit model selector {selector} could not be resolved")]
 	ModelSelection {
@@ -145,17 +127,19 @@ impl CommitGenerator {
 		project: &Path,
 		model_override: Option<&str>,
 	) -> Result<Self, CommitError> {
-		let settings = omp_settings::manager::SettingsManager::open(
-			omp_settings::manager::SettingsPaths::discover(data_dir, Some(project)),
-			crate::SETTINGS_CATALOG,
-		)
-		.map_err(|source| CommitError::SettingsManager { project: project.to_owned(), source })?;
+		Self::production_from_con(data_dir, project, model_override, Arc::new(omp_con::Ctx::new()))
+			.await
+	}
+
+	/// Composes the production registry from an existing process console.
+	pub async fn production_from_con(
+		data_dir: &Path,
+		project: &Path,
+		model_override: Option<&str>,
+		ctx: Arc<omp_con::Ctx>,
+	) -> Result<Self, CommitError> {
 		let home = env::var_os("HOME").map_or_else(|| project.to_owned(), Into::into);
-		let model_settings = settings
-			.snapshot()
-			.project::<omp_catalog::settings::ModelSettings>()
-			.map_err(|source| CommitError::SettingsSnapshot { project: project.to_owned(), source })?
-			.get()
+		let model_settings = omp_catalog::settings::ModelSettings::from_con(ctx.as_ref())
 			.resolve_path_scopes(project, &home);
 		let catalog = crate::registry::production_catalog(data_dir).map_err(|source| {
 			CommitError::Registry { data_dir: data_dir.to_owned(), source: Box::new(source) }
@@ -167,10 +151,11 @@ impl CommitGenerator {
 			selector,
 		)
 		.map_err(|source| CommitError::ModelSelection { selector: Str::from(selector), source })?;
-		let inference = crate::registry::production_inference(
+		let inference = crate::registry::production_inference_for_session(
 			data_dir,
 			Arc::new(omp_tool::Registry::new()),
 			Some(project),
+			crate::registry::InferenceSessionOverrides { con: Some(ctx), ..Default::default() },
 		)
 		.await
 		.map_err(|source| CommitError::Registry {

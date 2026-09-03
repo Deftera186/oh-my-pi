@@ -1,5 +1,3 @@
-//! Production collaboration bridges between domain owners and the OMP wire.
+//! Replica-backed collaboration session ownership.
 
-pub mod host_bridge;
-pub mod remote_admission;
 pub mod session;

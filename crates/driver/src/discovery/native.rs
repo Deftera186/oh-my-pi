@@ -17,7 +17,7 @@ use thiserror::Error;
 use super::{
 	containment::contained_existing,
 	manifest::{
-		CapabilityPayload, ContextPayload, DiscoveredCapability, ExtensionGrantFacts,
+		AgentPayload, CapabilityPayload, ContextPayload, DiscoveredCapability, ExtensionGrantFacts,
 		ExtensionPayload, HookPayload, HookPhase, InstructionPayload, PromptPayload,
 		PythonWorkerDeclaration, SettingsPayload, SourceProvenance, SourceScope, SystemPromptPayload,
 		ThemePayload, ToolHandlerDeclaration, ToolPayload,
@@ -118,10 +118,7 @@ pub struct NativeRoots {
 /// Resolves the native user config root. `OMP_PROFILE` scopes profiles without
 /// changing the project `.omp` convention.
 pub fn user_config_root(home: &Path) -> PathBuf {
-	let base = env::var_os("OMP_CONFIG_DIR")
-		.filter(|value| !value.is_empty())
-		.map(PathBuf::from)
-		.unwrap_or_else(|| home.join(".omp"));
+	let base = omp_core::dirs::config_dir(home);
 	let profile = omp_core::dirs::selected_profile()
 		.map(str::to_owned)
 		.or_else(|| {
@@ -660,6 +657,7 @@ fn load_root(
 		("prompts", CapabilityFileKind::Prompt),
 		("instructions", CapabilityFileKind::Instruction),
 		("commands", CapabilityFileKind::Command),
+		("agents", CapabilityFileKind::Agent),
 	] {
 		load_markdown_dir(root, directory, kind, source_id.clone(), scope, output);
 	}
@@ -828,6 +826,7 @@ enum CapabilityFileKind {
 	Prompt,
 	Instruction,
 	Command,
+	Agent,
 }
 
 fn load_markdown_dir(
@@ -893,6 +892,11 @@ fn load_markdown_dir(
 				};
 				CapabilityPayload::SlashCommands(command)
 			},
+			CapabilityFileKind::Agent => CapabilityPayload::Agents(AgentPayload {
+				name:    name.clone(),
+				path:    path.clone(),
+				content: Str::from(content),
+			}),
 		};
 		output.declarations.push(DiscoveredCapability::keyed(
 			name,

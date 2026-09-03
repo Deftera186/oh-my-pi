@@ -131,9 +131,11 @@ mod tests {
 
 	#[test]
 	fn omits_scope_for_cross_cutting_changes() {
-		let diff = "diff --git a/packages/core/a.ts b/packages/core/a.ts\n+a\n\tdiff --git \
-		            a/packages/ui/b.ts b/packages/ui/b.ts\n+b\n\tdiff --git a/packages/api/c.ts \
-		            b/packages/api/c.ts\n+c";
+		let diff = concat!(
+			"diff --git a/packages/core/a.ts b/packages/core/a.ts\n+a\n",
+			"diff --git a/packages/ui/b.ts b/packages/ui/b.ts\n+b\n",
+			"diff --git a/packages/api/c.ts b/packages/api/c.ts\n+c",
+		);
 		assert_eq!(infer_scope(diff), None);
 	}
 
