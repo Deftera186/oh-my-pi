@@ -77,6 +77,7 @@ impl EnvHarness {
 				scratch.state(),
 				Registry::new(),
 				ext_host_config,
+				&omp_con::Ctx::new(),
 				RegistryBridges::default(),
 			)
 			.await

@@ -119,6 +119,7 @@ impl ChildEnvironment {
 				state.path(),
 				Registry::new(),
 				config,
+				&omp_con::Ctx::new(),
 				RegistryBridges::default(),
 			)
 			.await
