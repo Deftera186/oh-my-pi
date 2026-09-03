@@ -29,7 +29,7 @@ pub use incoming::{
 	CommitError, FinalizedArgs, IncomingCursor, IncomingParams, Interrupt, InterruptWaitError,
 	InterruptibleParams, InvocationEvent, InvocationFeed, InvocationSendError, ParamError,
 };
-use omp_core::{Hash32, InvocationPhase, SparseMap, Str};
+use omp_core::{Hash32, InvocationPhase, SparseMap, Str, sf};
 pub use omp_proto::inference::v1::{Fallback, InvokeInput};
 use omp_proto::policy::v1;
 pub use omp_slopjson::{PullMode, Pulled, PulledKind, PulledValueKind};
@@ -1527,6 +1527,18 @@ pub enum Abort {
 }
 
 impl Abort {
+	/// Renders the harness-owned model-facing text for an aborted call.
+	#[must_use]
+	pub fn render(&self) -> Str {
+		match self {
+			Self::Skipped { reason } => sf!("skipped: {reason}"),
+			Self::Interrupted { reason } => sf!("interrupted: {reason}"),
+			Self::EffectsUnknown { reason } => sf!("aborted with effects unknown: {reason}"),
+			Self::InputDropped => sf!("aborted: invocation input dropped before commit"),
+			Self::MissingOutcome => sf!("aborted: executor ended without a terminal outcome"),
+		}
+	}
+
 	/// Returns the coarse class implied by this owner-reported reason.
 	pub const fn kind(&self) -> AbortKind {
 		match self {

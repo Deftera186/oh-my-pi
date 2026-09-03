@@ -1287,7 +1287,7 @@ impl HostTool {
 			},
 			CallOutcome::Aborted { abort, .. } => {
 				return Ok(ProjectedVerdict {
-					parts:    vec![Part::Text { text: render_abort(&abort) }].into(),
+					parts:    vec![Part::Text { text: abort.render() }].into(),
 					is_error: true,
 					useless:  false,
 				});
@@ -1468,7 +1468,7 @@ impl<T: Tool> Registered<T> {
 				useless:  false,
 			},
 			CallOutcome::Aborted { abort, .. } => ProjectedVerdict {
-				parts:    vec![Part::Text { text: render_abort(abort) }].into(),
+				parts:    vec![Part::Text { text: abort.render() }].into(),
 				is_error: true,
 				useless:  false,
 			},
@@ -3069,20 +3069,6 @@ fn render_arg_issue(issue: &ArgIssue) -> Str {
 		text.push_str(example);
 	}
 	Str::new(text)
-}
-
-fn render_abort(abort: &Abort) -> Str {
-	match abort {
-		Abort::Skipped { reason } => sf!("skipped: {reason}"),
-		Abort::Interrupted { reason } => sf!("interrupted: {reason}"),
-		Abort::EffectsUnknown { reason } => {
-			sf!("aborted with effects unknown: {reason}")
-		},
-		Abort::InputDropped => sf!("aborted: invocation input dropped before commit"),
-		Abort::MissingOutcome => {
-			sf!("aborted: executor ended without a terminal outcome")
-		},
-	}
 }
 
 fn host_tool_stream<'a>(
