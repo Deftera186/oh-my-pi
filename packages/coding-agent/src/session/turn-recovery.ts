@@ -488,7 +488,8 @@ export class TurnRecovery {
 				await this.#host.emitSessionEvent({
 					type: "retry_fallback_succeeded",
 					model:
-						this.#lastServed?.attribution.selector ?? formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+						this.#lastServed?.attribution.selector ??
+						formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
 					role: this.#activeRetryFallback.role,
 				});
 			}
