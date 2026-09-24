@@ -4910,6 +4910,73 @@ describe("AgentSession retry fallback", () => {
 		}
 	});
 
+	it("stops restoring a primary that keeps failing after its cooldown expires", async () => {
+		// A hintless 429 (no retry-after timing, e.g. a daily free-tier cap
+		// worded as a plain rate limit) suppresses the primary for only the
+		// short RATE_LIMIT heuristic. With cooldown-expiry revert the session
+		// then restores the still-dead primary on every later prompt and falls
+		// forward again — an unbounded revert/fail/fallback ping-pong that no
+		// retry budget bounds, because each model switch resets the attempt
+		// count. Restores of a primary that never serves must trip a circuit
+		// breaker instead of looping forever.
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				mock.push(
+					model.id === fallbackModel.id
+						? { content: ["the fallback did the work"] }
+						: { throw: "429 Rate limit exceeded. Please try again later." },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 2,
+			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+			"retry.fallbackRevertPolicy": "cooldown-expiry",
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const primarySelector = `${primaryModel.provider}/${primaryModel.id}`;
+		const fallbackSelector = `${fallbackModel.provider}/${fallbackModel.id}`;
+
+		// Six prompts, each past the 30s RATE_LIMIT heuristic suppression, so a
+		// restore is eligible every time. Unbounded revert would request the
+		// primary on all six; the circuit breaker must stop after a few.
+		for (let prompt = 0; prompt < 6; prompt += 1) {
+			now += 31_000;
+			await session.prompt(`Prompt ${prompt} with an expired primary cooldown`);
+			await session.waitForIdle();
+		}
+
+		const primaryRequests = requestedModels.filter(model => model === primarySelector);
+		expect(primaryRequests.length).toBeLessThanOrEqual(4);
+		expect(requestedModels.at(-1)).toBe(fallbackSelector);
+		expect(session.model?.provider).toBe(fallbackModel.provider);
+		expect(session.model?.id).toBe(fallbackModel.id);
+	});
+
 	it("reports a Fireworks Fast degrade as fallback-routed even though it arms no chain", async () => {
 		const fastModel = getBundledModel("fireworks", "kimi-k2.6-fast");
 		if (!fastModel) throw new Error("Expected the bundled Fireworks Fast model to exist");
