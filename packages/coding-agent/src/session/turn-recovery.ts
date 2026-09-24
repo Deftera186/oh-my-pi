@@ -473,12 +473,25 @@ export class TurnRecovery {
 		// permanently unproven, hiding it from observers for the whole session.
 		if (this.#activeRetryFallback && !this.#activeRetryFallback.served && model) {
 			this.#activeRetryFallback.served = true;
-			await this.#host.emitSessionEvent({
-				type: "retry_fallback_succeeded",
-				model:
-					this.#lastServed?.attribution.selector ?? formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
-				role: this.#activeRetryFallback.role,
-			});
+			if (
+				sameRetryFallbackBaseSelector(
+					formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+					this.#activeRetryFallback.originalSelector,
+					this.#host.modelRegistry,
+				)
+			) {
+				// The restored original served: it is healthy again, so a later
+				// outage starts a fresh restore count. This is a primary
+				// recovery, not a fallback success, so no event is emitted.
+				this.#activeRetryFallback.failedRestores = 0;
+			} else {
+				await this.#host.emitSessionEvent({
+					type: "retry_fallback_succeeded",
+					model:
+						this.#lastServed?.attribution.selector ?? formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+					role: this.#activeRetryFallback.role,
+				});
+			}
 		}
 		if (this.#retryAttempt === 0) {
 			return;
@@ -2158,7 +2171,13 @@ export class TurnRecovery {
 		const currentModel = this.#host.model();
 		if (!currentModel) return false;
 		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
-		if (currentSelector === originalSelector.raw) {
+		if (
+			currentSelector === originalSelector.raw ||
+			sameRetryFallbackBaseSelector(currentSelector, originalSelectorRaw, this.#host.modelRegistry)
+		) {
+			// Already on the original model (the raw-string case is exact level
+			// included): restoring again would swap onto the same model and
+			// re-apply a stale thinking level, clobbering explicit user changes.
 			if (!this.isRetryFallbackSelectorSuppressed(originalSelector)) {
 				this.clearActiveRetryFallback();
 			}
@@ -2204,7 +2223,7 @@ export class TurnRecovery {
 			originalThinkingLevel: restoreOriginalThinkingLevel,
 			lastAppliedFallbackThinkingLevel: thinkingToApply,
 			pinned: false,
-			served: true,
+			served: false,
 			failedRestores,
 		};
 		await this.#host.syncAfterModelChange(previousEditMode);

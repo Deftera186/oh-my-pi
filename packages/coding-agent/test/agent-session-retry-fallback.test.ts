@@ -4971,8 +4971,11 @@ describe("AgentSession retry fallback", () => {
 		}
 
 		const primaryRequests = requestedModels.filter(model => model === primarySelector);
-		expect(primaryRequests.length).toBeLessThanOrEqual(4);
+		// Exactly 1 initial attempt + 3 bounded restores; the last two prompts
+		// never touch the primary again.
+		expect(primaryRequests).toHaveLength(4);
 		expect(requestedModels.at(-1)).toBe(fallbackSelector);
+		expect(requestedModels.at(-2)).toBe(fallbackSelector);
 		expect(session.model?.provider).toBe(fallbackModel.provider);
 		expect(session.model?.id).toBe(fallbackModel.id);
 	});
@@ -5505,8 +5508,8 @@ describe("AgentSession retry fallback", () => {
 		}
 
 		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
 		const agent = createFallbackAgent(primaryModel, requestedModels, { retryAfterMs: 200 });
-
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
@@ -5524,9 +5527,13 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 			thinkingLevel: Effort.High,
 		});
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") {
+				fallbackAppliedEvents.push(event);
+			}
+		});
 		let now = Date.now();
 		vi.spyOn(Date, "now").mockImplementation(() => now);
-
 		await session.prompt("First prompt triggers bare-selector fallback");
 		await session.waitForIdle();
 		expect(requestedModels).toEqual([
@@ -5534,9 +5541,6 @@ describe("AgentSession retry fallback", () => {
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
 		expect(session.model?.provider).toBe(fallbackModel.provider);
-		expect(session.model?.id).toBe(fallbackModel.id);
-		expect(session.thinkingLevel).toBeUndefined();
-
 		session.setThinkingLevel(Effort.Low);
 		now += 240;
 		await session.prompt("Second prompt should restore model but preserve user thinking change");
@@ -5546,6 +5550,18 @@ describe("AgentSession retry fallback", () => {
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
 		]);
+		expect(session.model?.provider).toBe(primaryModel.provider);
+		expect(session.model?.id).toBe(primaryModel.id);
+		expect(session.thinkingLevel).toBeUndefined();
+
+		// A third prompt past the cooldown must not restore onto the model the
+		// session is already on: that redundant restore would re-apply the stale
+		// recorded level and clobber the explicit user change above.
+		expect(fallbackAppliedEvents).toHaveLength(1);
+		now += 240;
+		await session.prompt("Third prompt must not re-restore the active primary");
+		await session.waitForIdle();
+		expect(fallbackAppliedEvents).toHaveLength(1);
 		expect(session.model?.provider).toBe(primaryModel.provider);
 		expect(session.model?.id).toBe(primaryModel.id);
 		expect(session.thinkingLevel).toBeUndefined();
